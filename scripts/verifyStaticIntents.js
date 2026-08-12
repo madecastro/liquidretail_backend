@@ -174,8 +174,14 @@ for (const intentKey of intents) {
       const posHit = bodyOnly.match(POSITION_RE);
       falsy(`${label} no layout prescription`, !!posHit);
 
-      check(`${label} density <= ${policy.maxTextElements}`,
-        r.text.length <= policy.maxTextElements, true);
+      // CTA BUTTON is excluded from the density count (2026-08-13, mirrors
+      // applyDensity) — it is a short pill label, not prose, and is never
+      // itself sacrificed. Counting it here would re-encode the same wrong
+      // assumption the product code just stopped making: that a 2-3 word
+      // button costs the same "slot" as a headline.
+      const proseCount = r.text.filter(([role]) => role !== 'CTA BUTTON').length;
+      check(`${label} density <= ${policy.maxTextElements} (prose only, CTA excluded)`,
+        proseCount <= policy.maxTextElements, true);
 
       // An empty text list must NOT emit a "set this text" heading above nothing
       // — that is the v1 defect (an instruction pointing at an empty slot).
@@ -421,16 +427,20 @@ const countEmittedStrings = (prompt) => {
     check(`E5 brand_led/${surface} count <= maxTextElements`,
       n <= SURFACE_POLICY[surface].maxTextElements, true);
   }
-  // Stories: drawCta true (2026-08-12). Budget 3 → SUBHEAD sacrificed, CTA kept.
+  // Stories: SURFACE_POLICY.drawCta false — owner-stated and REAFFIRMED
+  // 2026-08-13, Instagram supplies the link sticker. No CTA in the density
+  // budget means nothing has to be sacrificed for it: budget 3 buys BRAND
+  // LINE + SUBHEAD + TRUST MARK in full.
   {
     const r = buildPrompt({ intentKey: 'brand_led', data: full, product: PRODUCT, surface: 'meta_stories_9_16' });
     const n = countEmittedStrings(r.prompt);
     const textBlock = (r.prompt || '').split('SET EXACTLY THESE STRINGS')[1]?.split('Set no other words')[0] || '';
-    check('E5 brand_led/meta_stories_9_16 emits 3 strings (SUBHEAD sacrificed, CTA kept)', n, 3);
+    check('E5 brand_led/meta_stories_9_16 emits 3 strings (no CTA — platform sticker)', n, 3);
     check('E5 brand_led/meta_stories_9_16 count <= maxTextElements',
       n <= SURFACE_POLICY.meta_stories_9_16.maxTextElements, true);
-    truthy('E5 brand_led/meta_stories_9_16 CTA present', CTA_RE.test(textBlock));
-    falsy('E5 brand_led/meta_stories_9_16 SUBHEAD dropped', /subhead ->/i.test(textBlock));
+    truthy('E5 brand_led/meta_stories_9_16 CTA ABSENT — Stories link sticker', !CTA_RE.test(textBlock));
+    truthy('E5 brand_led/meta_stories_9_16 SUBHEAD kept (nothing sacrificed without a CTA)',
+      /subhead ->/i.test(textBlock));
   }
   // PMax: Phase B intent-aware suppress for brand_led. Emits 3 (CTA stripped).
   {

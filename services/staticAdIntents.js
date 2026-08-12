@@ -376,21 +376,30 @@ function describeSurfaces() {
  *     meta_reels_9_16 as kinds:["video"] — Reels takes no static image here.
  *     v1 shipped a Reels block inside every static intent, which was wrong.
  *
- *  2. WHO SUPPLIES THE CTA. PMax (flag on) suppresses a burned-in button for
- *     non-conversion intents because Google draws its own. Meta Stories used
- *     to do the same (link sticker / reply bar). That is now a measured
- *     defect: run_1786555875841_2ddf9739 delivered Stories with no CTA
- *     while 1:1 and 1.91:1 both painted "Shop the Cruiser". Diagnosis was
- *     (a) never requested — SURFACE_POLICY.drawCta was false, so buildPrompt
- *     stripped CTA BUTTON and absences forbade a button. The 9:16 safe box
- *     is not the squeeze (usable height ~1334px vs 1:1's ~901px). drawCta
- *     is therefore true on every live Meta static, including Stories. The
- *     platform reserve still keeps copy out of the reply bar; it does not
- *     replace the in-image button.
+ *  2. WHO SUPPLIES THE CTA. Where the ad unit provides its own link affordance,
+ *     drawing a button into the pixels duplicates it and burns the reserved band.
+ *
+ *     ⚠️ STORIES drawCta:false IS DELIBERATE AND OWNER-REAFFIRMED (2026-08-13).
+ *     Do not "fix" it. It was flipped to true on 2026-08-12 because the audit
+ *     of run_1786555875841_2ddf9739 read the absent button as a defect — Stories
+ *     shipped no CTA while 1:1 and 1.91:1 both painted "Shop the Cruiser". The
+ *     owner then confirmed the original reasoning stands: Stories supplies its
+ *     own link sticker, so an in-image button is a DUPLICATE, not a fix. Flip
+ *     reverted.
+ *
+ *     KEEP THIS MEASUREMENT even though the decision went the other way, so the
+ *     next reader does not re-run it: the 9:16 safe box is NOT why the button is
+ *     absent. Stories generates at 1152x2048 with a 17.5%..82.5% box —
+ *     ~1331px of usable height, against ~901px on the 1:1 that DOES draw one.
+ *     Stories has ~48% more room. The button is absent because this policy says
+ *     so (buildPrompt strips the CTA BUTTON row and `absences` forbids it), and
+ *     for no other reason. If Stories ever needs a burned-in CTA, the change is
+ *     here — not in the geometry.
  *
  * CONFIDENCE, stated so it can be corrected rather than inherited:
  *   - reels video-only ....... from platformFormats.kinds (authoritative here)
- *   - stories in-image CTA ... owner-observed defect 2026-08-12; see above
+ *   - stories link sticker ... owner-stated, and REAFFIRMED 2026-08-13 after a
+ *     round-trip through the opposite conclusion
  *   - pmax platform CTA ...... the platform draws its own CTA on most
  *     placements; the SURFACE_POLICY.drawCta:true values below are the
  *     Phase A / flag-off baseline. With PMAX_STATIC_PLATFORM_NOTES on,
@@ -410,7 +419,8 @@ const SURFACE_POLICY = {
   meta_feed_1_1:     { static: true,  drawCta: true,  maxTextElements: 4 },
   meta_feed_4_5:     { static: true,  drawCta: true,  maxTextElements: 4 },
   meta_reels_9_16:   { static: false, skipReason: 'kinds:["video"] — Reels takes no static image' },
-  meta_stories_9_16: { static: true,  drawCta: true,  maxTextElements: 3 },
+  meta_stories_9_16: { static: true,  drawCta: false, maxTextElements: 3,
+                       ctaNote: 'the platform supplies the link affordance' },
   pmax_16_9:         { static: true,  drawCta: true,  maxTextElements: 4 },
   // Phase A live PMax statics. drawCta:true is the SURFACE default and the
   // flag-off baseline; with PMAX_STATIC_PLATFORM_NOTES on, resolveDrawCta
@@ -500,8 +510,9 @@ function resolvePlatformNotes(surfaceKey, { preserve = false } = {}) {
 /**
  * Effective drawCta for a surface + resolved intent.
  *
- * Meta keeps SURFACE_POLICY.drawCta exactly — every live Meta static
- * (including Stories) stamps true. Do not rewrite Meta.
+ * Meta keeps SURFACE_POLICY.drawCta exactly — Stories stamps false with
+ * ctaNote 'the platform supplies the link affordance', and the absences /
+ * density path keys on that boolean. Do not rewrite Meta.
  *
  * PMax, flag ON only: the platform supplies the CTA affordance on most
  * placements, so a burned-in button is usually redundant — same *mechanism*
@@ -786,13 +797,31 @@ function resolveIntent(requested, d) {
   return { key: null, spec: null, why: 'no intent eligible' };
 }
 
-/** Enforce the density budget by sacrificing the least valuable element first. */
+/**
+ * Enforce the density budget by sacrificing the least valuable element first.
+ *
+ * CTA BUTTON DOES NOT CONSUME A BUDGET SLOT — owner correction, 2026-08-13.
+ * maxTextElements encodes "it should really be more about the image": a count
+ * of how much PROSE a surface can carry before it hurts the photo. A CTA is a
+ * short pill label, not prose, and it is already never itself sacrificed
+ * (excluded from SACRIFICE_ORDER below). Counting it toward the same budget
+ * meant a 2-3 word button forced a real copy line out to make room for it —
+ * measured directly: {BRAND LINE, SUBHEAD, TRUST MARK, CTA} on a budget-3
+ * surface dropped SUBHEAD, even though the button occupies a fraction of a
+ * headline's footprint. It is exactly the mechanism that produced the 2026-08
+ * Stories regression (drawCta flipped on, budget 3, SUBHEAD dropped to fit the
+ * button) — CTA staying OUT of the count means that class of bug cannot recur
+ * on any surface, not just the one that got manually checked.
+ */
 function applyDensity(text, spec, policy) {
   const kept = text.slice();
   const dropped = [];
   const budget = policy.maxTextElements ?? Infinity;
+  // Prose count for the budget check — CTA is present in `kept`/rendered
+  // output the whole time; it just never counts against or displaces prose.
+  const proseCount = (list) => list.filter(([r]) => r !== 'CTA BUTTON').length;
   for (const role of SACRIFICE_ORDER) {
-    if (kept.length <= budget) break;
+    if (proseCount(kept) <= budget) break;
     if (spec.core.includes(role)) continue;
     const i = kept.findIndex(([r]) => r === role);
     if (i === -1) continue;

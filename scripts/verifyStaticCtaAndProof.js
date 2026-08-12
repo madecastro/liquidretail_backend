@@ -74,7 +74,8 @@ const {
   buildPrompt,
   resolveIntent,
   computeSurface,
-  resolveDrawCta
+  resolveDrawCta,
+  applyDensity
 } = require('../services/staticAdIntents');
 const { buildIntentData } = require('../services/directImageRenderService');
 const rd = require('../services/ratingDisplay');
@@ -147,22 +148,55 @@ ok('A0 live Meta static fanout is the three Meta image surfaces', () => {
     ['meta_feed_1_1', 'meta_feed_4_5', 'meta_stories_9_16'].sort());
 });
 
-ok('A0b Stories policy draws a CTA (the delivered defect)', () => {
+// ⚠️ STORIES DRAWS NO IN-IMAGE CTA, AND THAT IS THE DECISION — owner-reaffirmed
+// 2026-08-13. Stories supplies its own link sticker, so a burned-in button is a
+// DUPLICATE that also burns the reserved band.
+//
+// This assertion was briefly inverted (drawCta:true) after the audit of
+// run_1786555875841_2ddf9739 read the absent button as a defect. The owner
+// confirmed the original reasoning stands. It is pinned in THIS direction now
+// so the round trip does not happen a third time.
+//
+// The geometry is deliberately NOT the reason and must not be cited as one:
+// Stories has ~1331px of usable height against the 1:1's ~901px — 48% MORE
+// room. A0c measures that, so a future reader cannot mistake policy for a
+// squeeze.
+ok('A0b [OWNER] Stories draws NO in-image CTA — the platform supplies the sticker', () => {
   assert.strictEqual(SURFACE_POLICY.meta_stories_9_16.static, true);
-  assert.strictEqual(SURFACE_POLICY.meta_stories_9_16.drawCta, true,
-    'drawCta:false is the delivered 9:16 defect — the prompt never asked');
+  assert.strictEqual(SURFACE_POLICY.meta_stories_9_16.drawCta, false,
+    'Stories link sticker is owner-stated and reaffirmed — an in-image button duplicates it');
+  assert.ok(/link affordance/i.test(SURFACE_POLICY.meta_stories_9_16.ctaNote || ''),
+    'the ctaNote is the reason-of-record; losing it is how this got "fixed" once already');
+});
+
+ok('A0c [DIAGNOSTIC] Stories is not CTA-less for lack of room', () => {
+  // Recorded so nobody re-derives it. If Stories is ever given a burned-in CTA,
+  // the change belongs in SURFACE_POLICY — the safe box was never the blocker.
+  const st = computeSurface('meta_stories_9_16');
+  const sq = computeSurface('meta_feed_1_1');
+  const usable = (s) => {
+    const [, h] = String(s.generate).split('x').map(Number);
+    return Math.round(h * (s.box.bottom - s.box.top) / 100);
+  };
+  assert.ok(usable(st) > usable(sq),
+    `Stories usable height ${usable(st)}px must exceed the 1:1's ${usable(sq)}px — `
+    + 'if this ever flips, the "no room" theory becomes worth revisiting');
 });
 
 for (const surface of LIVE_META_STATIC) {
   for (const intentKey of ['social_proof_led', 'objection_resolved', 'product_first_lifestyle', 'brand_led']) {
-    ok(`A1 ${surface}/${intentKey} resolveDrawCta is true`, () => {
+    // Stories is the deliberate exception; the other two live Meta statics draw one.
+    const expected = surface !== 'meta_stories_9_16';
+    ok(`A1 ${surface}/${intentKey} resolveDrawCta is ${expected}`, () => {
       const policy = SURFACE_POLICY[surface];
-      assert.strictEqual(resolveDrawCta({ surfaceKey: surface, policy, intentKey }), true);
+      assert.strictEqual(resolveDrawCta({ surfaceKey: surface, policy, intentKey }), expected);
     });
   }
 }
 
-for (const surface of LIVE_META_STATIC) {
+// Feed surfaces request the button. Stories is asserted separately, in the
+// opposite direction, because its absence is the DECISION rather than a gap.
+for (const surface of LIVE_META_STATIC.filter((s) => s !== 'meta_stories_9_16')) {
   ok(`A2 ${surface} prompt REQUESTS the CTA string (social_proof_led + RICH)`, () => {
     const r = buildPrompt({
       intentKey: 'social_proof_led', data: RICH, product: PRODUCT, surface
@@ -178,16 +212,33 @@ for (const surface of LIVE_META_STATIC) {
   });
 }
 
-ok('A2b [THE BUG] Stories 9:16 specifically keeps CTA on the production residual intent', () => {
-  // The delivered 9:16 ad ran objection_resolved (fell back) and still
-  // shipped text=1. That combination must now keep the button.
+ok('A2s [OWNER] Stories prompt does NOT request a CTA, and says so in absences', () => {
+  // Both halves matter and they must agree. Stripping the role without the
+  // absence line is the empty-slot defect that produced a fabricated quote in
+  // v1: the model sees a gap and fills it.
+  const r = buildPrompt({
+    intentKey: 'social_proof_led', data: RICH, product: PRODUCT, surface: 'meta_stories_9_16'
+  });
+  assert.ok(r.prompt, `no prompt: ${r.error || r.skipped}`);
+  assert.ok(!textRoles(r).includes('CTA BUTTON'),
+    `Stories asked for a CTA BUTTON; roles: ${textRoles(r).join(',')}`);
+  assert.ok(/no CTA button/i.test(r.prompt),
+    'Stories must FORBID the button in absences, not merely omit the role');
+  assert.strictEqual(r.policy.drawCta, false);
+});
+
+ok('A2b Stories 9:16 on the production residual intent: quote yes, CTA no', () => {
+  // This is the exact combination the delivered ad ran — social_proof_led
+  // falling back to objection_resolved. The DESCENT is what this pins; the
+  // absent button is policy (the platform draws the sticker), not a gap.
   const r = buildPrompt({
     intentKey: 'social_proof_led', data: QUOTE_ONLY, product: PRODUCT, surface: 'meta_stories_9_16'
   });
   assert.strictEqual(r.resolved.key, 'objection_resolved');
-  assert.ok(textRoles(r).includes('CTA BUTTON'),
-    `stories 9:16 kept ${textRoles(r).join(',')} — CTA missing is the delivered defect`);
-  assert.ok(textRoles(r).includes('CUSTOMER QUOTE'));
+  assert.ok(textRoles(r).includes('CUSTOMER QUOTE'),
+    `stories 9:16 kept ${textRoles(r).join(',')} — the quote is this intent's core`);
+  assert.ok(!textRoles(r).includes('CTA BUTTON'),
+    'Stories must not burn in a button — Instagram supplies the link sticker');
 });
 
 ok('A3 CTA is not in SACRIFICE_ORDER — density cannot drop the button', () => {
@@ -195,7 +246,42 @@ ok('A3 CTA is not in SACRIFICE_ORDER — density cannot drop the button', () => 
     'putting CTA in SACRIFICE_ORDER lets Stories budget 3 drop the button');
 });
 
-ok('A3b Stories brand_led keeps CTA and sacrifices SUBHEAD', () => {
+// ── A3c: CTA must not DISPLACE real copy either — owner correction, 2026-08-13.
+// A3 protects the button FROM being dropped. It does nothing about the button
+// eating a slot and forcing something ELSE out — which is the exact mechanism
+// class behind the earlier Stories regression (drawCta:true + budget:3 pushed
+// SUBHEAD out). Live today, not hypothetical: pmax_landscape_1_91_1 is
+// budget-3 and draws a CTA for objection_resolved/conversion.
+ok('A3c [OWNER] a CTA never displaces prose on a tight budget', () => {
+  const text = [
+    ['BRAND LINE', 'Allbirds'], ['SUBHEAD', 'Every tide.'],
+    ['TRUST MARK', '4.8 / 2,667'], ['CTA BUTTON', 'Shop Now']
+  ];
+  const { kept, dropped } = applyDensity(text, { core: ['BRAND LINE'] }, { maxTextElements: 3 });
+  assert.deepStrictEqual(dropped, [],
+    `budget 3 + 3 prose roles + a CTA dropped ${JSON.stringify(dropped)} — the button is costing a real copy slot`);
+  assert.ok(kept.some(([r]) => r === 'CTA BUTTON'), 'the CTA itself must still render');
+  assert.ok(kept.some(([r]) => r === 'SUBHEAD'),
+    'SUBHEAD must survive alongside the CTA — this is the exact class that broke Stories');
+});
+
+ok('A3d prose still respects its own budget — CTA exclusion is not a blank cheque', () => {
+  // Four real copy roles on a budget-3 surface, no CTA in play at all: the
+  // budget must still bite. A3c proves CTA is free; this proves everything
+  // ELSE still costs a slot as before.
+  const text = [
+    ['BRAND LINE', 'Allbirds'], ['SUBHEAD', 'Every tide.'],
+    ['TRUST MARK', '4.8 / 2,667'], ['RATING', '4.8']
+  ];
+  const { kept, dropped } = applyDensity(text, { core: ['BRAND LINE'] }, { maxTextElements: 3 });
+  assert.strictEqual(kept.length, 3, `expected exactly 3 kept, got ${kept.length}`);
+  assert.ok(dropped.length >= 1, 'four prose roles on a budget-3 surface must still sacrifice one');
+});
+
+ok('A3b Stories brand_led spends its budget on copy, not a duplicate button', () => {
+  // With no burned-in CTA, Stories' budget of 3 buys real copy. That is the
+  // POINT of the sticker policy, not a side effect: the reserved band stays
+  // clear and the three slots go to the message.
   const r = buildPrompt({
     intentKey: 'brand_led',
     data: { headline: 'Walk lighter.', subhead: 'Wool, all day.', rating: '4.8', cta: CTA },
@@ -203,10 +289,10 @@ ok('A3b Stories brand_led keeps CTA and sacrifices SUBHEAD', () => {
     surface: 'meta_stories_9_16'
   });
   const roles = textRoles(r);
-  assert.ok(roles.includes('CTA BUTTON'), `kept ${roles.join(',')}`);
-  assert.ok(roles.includes('BRAND LINE'));
-  assert.ok(!roles.includes('SUBHEAD'), 'SUBHEAD should yield to the density budget');
-  assert.ok(roles.length <= SURFACE_POLICY.meta_stories_9_16.maxTextElements);
+  assert.ok(!roles.includes('CTA BUTTON'), `Stories asked for a button; kept ${roles.join(',')}`);
+  assert.ok(roles.includes('BRAND LINE'), `BRAND LINE is brand_led's core; kept ${roles.join(',')}`);
+  assert.ok(roles.length <= SURFACE_POLICY.meta_stories_9_16.maxTextElements,
+    `${roles.length} roles exceeds the density budget of ${SURFACE_POLICY.meta_stories_9_16.maxTextElements}`);
 });
 
 for (const surface of LIVE_STATIC) {
