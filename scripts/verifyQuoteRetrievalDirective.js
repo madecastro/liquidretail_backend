@@ -46,7 +46,8 @@ const {
   screenAdUsableSentiment,
   loadSentimentJudge,
   pickBestRating,
-  RATING_MIN_CREDIBLE_REVIEWS
+  RATING_MIN_CREDIBLE_REVIEWS,
+  RATING_MIN_SAMPLE_ANY
 } = require('../services/providers/geminiSearchProvider');
 const { preserveBrandReviewNumbers } = require('../services/brandEnrichmentService');
 
@@ -744,17 +745,62 @@ check('N3 a thin high rating cannot beat a big one (the literal-rule trap)', () 
   assert.strictEqual(r.rating, 4.58, `a 3-review 5.0 must not win, got ${r.rating}`);
   assert.ok(RATING_MIN_CREDIBLE_REVIEWS >= 25, 'the sample floor must be meaningful');
 });
-check('N3b a thin 5.0 must not beat a big LOW rating either (what the floor is for)', () => {
-  // The case the previous version of N3 missed, and a mutation removing the sample floor
-  // slipped straight through it: when the thin candidate is the ONLY one above the star
-  // floor, count-descending cannot save us — without the sample floor, "5.0 stars" from
-  // three reviews becomes the printed rating for the whole brand.
+check('N3b BELOW 50 REVIEWS, MORE STARS WINS — even from a thin sample', () => {
+  // POLICY REVERSED 2026-08-12 by explicit owner directive: *"dont go with the larger
+  // sample go with the more stars, always for under 50!"* This check previously asserted
+  // the OPPOSITE — that a 3-review 5.0 must lose to a 20,000-review 3.0 — and that guard
+  // is what left Pelagic on an unprintable 3.2 when a 4.5 was available.
+  //
+  // The consequence is deliberate and worth stating where it will be read: a 5.0 computed
+  // from three reviews now outranks a 3.0 from twenty thousand, and 5.0 clears the display
+  // floor, so it PRINTS. RATING_MIN_SAMPLE_ANY is the lever if that ever needs bounding.
   const r = quiet(() => pickBestRating([
     { source: 'tiny.com', rating: 5.0, reviewCount: 3 },
     { source: 'big.com',  rating: 3.0, reviewCount: 20000 },
   ]));
-  assert.strictEqual(r.rating, 3.0, `a 3-review 5.0 must not become the brand rating, got ${r.rating}`);
-  assert.strictEqual(r.reviewCount, 20000);
+  assert.strictEqual(r.rating, 5.0, `more stars must win below the credible floor, got ${r.rating}`);
+  assert.strictEqual(r.ratingSource, 'tiny.com');
+  assert.strictEqual(RATING_MIN_SAMPLE_ANY, 1,
+    'the absolute floor stays off by default — the owner asked for stars, always, under 50');
+});
+check('N3c the real Pelagic set — 4.5/11 beats 3.2/22 and becomes printable', () => {
+  // The case that prompted the directive. Under the old rule the larger sample won and
+  // the brand showed no stars at all; 3.2 is under the 4.39 display floor.
+  const r = quiet(() => pickBestRating([
+    { source: 'WorthEPenny', rating: 3.2, reviewCount: 22 },
+    { source: 'Tenere',      rating: 4.5, reviewCount: 11 },
+    { source: 'Trustpilot',  rating: 3.2, reviewCount: 1 },
+  ]));
+  assert.strictEqual(r.rating, 4.5, `got ${r.rating}`);
+  assert.strictEqual(r.reviewCount, 11, 'and the count comes from that same source');
+  const { formatDisplayRating, RATING_STAR_MIN } = require('../services/ratingDisplay');
+  assert.strictEqual(formatDisplayRating(r.rating, { starMin: RATING_STAR_MIN }), '4.5',
+    'the whole point of the directive: this brand can now print stars');
+});
+check('N3e two sub-50 candidates: MORE STARS wins even with fewer reviews', () => {
+  // The shape that actually distinguishes the two tiers, and the only one that fails when
+  // the credible-sample floor is removed. Every other fixture gives the same answer either
+  // way, because a thin candidate rarely also has the most reviews — so a mutation
+  // deleting the floor passed the whole section untouched until this case existed.
+  //
+  // 4.9 from 40 vs 4.5 from 45: both under 50, and the higher rating has FEWER reviews.
+  // Stars-first (the directive) picks 4.9. Largest-sample picks 4.5.
+  const r = quiet(() => pickBestRating([
+    { source: 'fewer.com', rating: 4.9, reviewCount: 40 },
+    { source: 'more.com',  rating: 4.5, reviewCount: 45 },
+  ]));
+  assert.strictEqual(r.rating, 4.9, `stars must win under 50 reviews, got ${r.rating}`);
+  assert.strictEqual(r.reviewCount, 40, 'and the count travels with it');
+  assert.strictEqual(r.ratingSource, 'fewer.com');
+});
+check('N3d a CREDIBLE sample still beats a thinner higher one (tier 1 intact)', () => {
+  // The directive is scoped to "under 50". Above it, the owner's original rule stands:
+  // most reviews wins, so a 4.9 from 60 must not displace a 4.58 from 15,626.
+  const r = quiet(() => pickBestRating([
+    { source: 'big.com',  rating: 4.58, reviewCount: 15626 },
+    { source: 'thin.com', rating: 4.9,  reviewCount: 60 },
+  ]));
+  assert.strictEqual(r.rating, 4.58, `the big credible sample must still win, got ${r.rating}`);
 });
 check('N5b the winner keeps ITS OWN count even when another source has more', () => {
   // Atomicity, in the one shape that can actually catch a borrowed count: the chosen
@@ -769,12 +815,17 @@ check('N5b the winner keeps ITS OWN count even when another source has more', ()
     'the count must come from the 4.6 source, not be borrowed from the 50,000-review one');
   assert.strictEqual(r.ratingSource, 'good.com');
 });
-check('N4 when nothing can print, the largest sample is still returned', () => {
+check('N4 with no credible sample, something is still returned — now the highest rating', () => {
   // Not cosmetic: the Director reads the rating and summary as internal signal even when
   // no stars are typeset, so returning null here would lose real information.
+  //
+  // WHICH one changed with the 2026-08-12 directive. This used to assert the largest
+  // sample (2.5 from 126); below the credible floor the rule is now stars-first, so the
+  // 3.8 from 28 wins. Neither prints — both are under the 4.39 display floor — so this is
+  // about what the Director is told, not about pixels.
   const r = quiet(() => pickBestRating(VUORI_REAL.slice(1)));
-  assert.strictEqual(r.rating, 2.5);
-  assert.strictEqual(r.reviewCount, 126, 'the biggest honest sample, not the flattering one');
+  assert.strictEqual(r.rating, 3.8, `stars-first below the floor, got ${r.rating}`);
+  assert.strictEqual(r.reviewCount, 28, 'and the count comes from that same source');
 });
 check('N5 the pair stays atomic — rating and count from the SAME source', () => {
   // The mirror of the preserveBrandReviewNumbers rule. Mixing a rating from one site

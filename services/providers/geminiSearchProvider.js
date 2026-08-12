@@ -232,6 +232,24 @@ function completeSentencesOnly(q, label) {
  * Env-tunable, validated, because a "5.0 stars" badge computed from three reviews is a
  * number, not evidence.
  */
+/**
+ * An absolute floor on how thin an aggregate may be before it is ignored ENTIRELY —
+ * distinct from RATING_MIN_CREDIBLE_REVIEWS, which only decides tier.
+ *
+ * Defaults to 1, i.e. no extra floor, because the owner's rule for the sub-50 tier is
+ * "more stars, always". This knob is the single lever if a 3-review 5.0 ever prints on
+ * an ad and that turns out to be a problem: no code change, one env var.
+ */
+const RATING_MIN_SAMPLE_ANY = (() => {
+  const raw = process.env.RATING_MIN_SAMPLE_ANY;
+  const n = Number(raw);
+  if (raw != null && raw !== '' && Number.isInteger(n) && n >= 1 && n <= 100000) return n;
+  if (raw != null && raw !== '') {
+    console.warn(`   ⚠️  RATING_MIN_SAMPLE_ANY="${raw}" is not an integer in 1..100000 — using 1`);
+  }
+  return 1;
+})();
+
 const RATING_MIN_CREDIBLE_REVIEWS = (() => {
   const raw = process.env.RATING_MIN_CREDIBLE_REVIEWS;
   const n = Number(raw);
@@ -255,18 +273,25 @@ const RATING_MIN_CREDIBLE_REVIEWS = (() => {
  * OWNER DECISION 2026-08-11, verbatim: *"prefer the highest number of stars with the
  * most reviews, in this case 4.58 with 15K reviews should absolutely win"*.
  *
- * Ranked, in order:
- *   1. CLEARS THE DISPLAY FLOOR and has a credible sample. Only a rating above
- *      RATING_STAR_MIN can ever be typeset, so a 2.5 is not a candidate for the
- *      decision the owner is actually making; and the sample floor is what stops
- *      "5.0★ from 3 reviews" beating "4.58★ from 15,626", which the owner's rule read
- *      literally would otherwise do.
- *   2. MOST REVIEWS. Within the printable set, the biggest sample wins — that is the
- *      "with the most reviews" half, and it is why 4.58/15,626 beats a thin 4.7.
- *   3. HIGHEST RATING, as the tie-break.
- * If nothing clears the floor, the largest sample is returned anyway: it is the honest
- * summary of the brand, it is used as internal signal by the Director, and it prints no
- * stars regardless.
+ * TWO TIERS, and the owner set the rule for each one.
+ *
+ * TIER 1 — anything that clears the display floor AND has a credible sample
+ * (RATING_MIN_CREDIBLE_REVIEWS). Ranked by MOST REVIEWS, then highest rating. This is
+ * the "4.58 with 15K reviews should absolutely win" case: a big sample above the floor
+ * beats a thinner one, so a 4.7 from 60 reviews does not outrank a 4.58 from 15,626.
+ *
+ * TIER 2 — nothing reached a credible sample. Ranked by HIGHEST RATING, then count.
+ * Owner directive 2026-08-12, verbatim: *"dont go with the larger sample go with the
+ * more stars, always for under 50!"* So on Pelagic, 4.5★/11 (Tenere) now beats 3.2★/22
+ * (WorthEPenny) — where the previous rule took the larger sample and left the brand with
+ * an unprintable 3.2.
+ *
+ * ⚠️ WHAT THIS DELIBERATELY ACCEPTS. Tier 2 ranks on stars with no regard for sample
+ * size, so a 5.0 computed from 3 reviews outranks a 3.0 from 20,000 — and 5.0 clears
+ * the display floor, so it PRINTS. That was previously blocked here and the owner
+ * overrode it knowingly. RATING_MIN_SAMPLE_ANY exists for the day that becomes a
+ * problem: set it to 5 or 10 and aggregates thinner than that are ignored outright. It
+ * defaults to 1 (no extra floor) so today's behaviour is exactly what was asked for.
  *
  * NOTE, PLAINLY: this can select a brand's SELF-REPORTED site aggregate over a lower
  * third-party one. That is the owner's explicit call. `ratingSource` records which site
@@ -282,7 +307,11 @@ function pickBestRating(candidates) {
         ? Math.floor(c.reviewCount) : null,
       source: (typeof c?.source === 'string' && c.source.trim()) ? c.source.trim() : null
     }))
-    .filter((c) => c.rating != null);
+    .filter((c) => c.rating != null)
+    // Absolute floor — see RATING_MIN_SAMPLE_ANY. A candidate with no count at all is
+    // kept: "4.5 stars, count not visible" is still the best signal we have, and it
+    // cannot be judged against a threshold it has no value for.
+    .filter((c) => c.reviewCount == null || c.reviewCount >= RATING_MIN_SAMPLE_ANY);
   if (!rows.length) return { rating: null, reviewCount: null, ratingSource: null, ratingCandidates: [] };
 
   let starMin = 4.39;
@@ -291,13 +320,20 @@ function pickBestRating(candidates) {
     if (typeof RATING_STAR_MIN === 'number') starMin = RATING_STAR_MIN;
   } catch (_) { /* fall back to the documented default */ }
 
-  const printable = (c) => c.rating > starMin && (c.reviewCount || 0) >= RATING_MIN_CREDIBLE_REVIEWS;
+  const credible = (c) => c.rating > starMin && (c.reviewCount || 0) >= RATING_MIN_CREDIBLE_REVIEWS;
+  const anyTier1 = rows.some(credible);
   const ranked = rows.slice().sort((a, b) => {
-    const pa = printable(a), pb = printable(b);
+    const pa = credible(a), pb = credible(b);
     if (pa !== pb) return pa ? -1 : 1;
     const ca = a.reviewCount || 0, cb = b.reviewCount || 0;
-    if (ca !== cb) return cb - ca;
-    return b.rating - a.rating;
+    if (anyTier1) {
+      // TIER 1 present: biggest credible sample wins, rating breaks ties.
+      if (ca !== cb) return cb - ca;
+      return b.rating - a.rating;
+    }
+    // TIER 2 only: MORE STARS WINS, count merely breaks ties. Owner directive.
+    if (a.rating !== b.rating) return b.rating - a.rating;
+    return cb - ca;
   });
   const winner = ranked[0];
   if (rows.length > 1) {
@@ -1132,6 +1168,7 @@ module.exports = {
   loadSentimentJudge,
   pickBestRating,
   RATING_MIN_CREDIBLE_REVIEWS,
+  RATING_MIN_SAMPLE_ANY,
   GROUNDED_PASS1_CONFIG,
   GROUNDED_PASS2_MAX_TOKENS,
   GROUNDED_CALL_TIMEOUT_MS,
