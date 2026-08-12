@@ -57,7 +57,7 @@ const LOG = '⭐';
 // best of what the page had, not the first N in document order.
 const MAX_QUOTES = Math.max(
   1,
-  parseInt(process.env.PRODUCT_REVIEWS_MAX_QUOTES, 10) || 10
+  parseInt(process.env.PRODUCT_REVIEWS_MAX_QUOTES, 10) || 30
 );
 
 // A quote must clear this star rating to be treated as positive. Applies

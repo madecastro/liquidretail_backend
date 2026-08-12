@@ -802,12 +802,6 @@ async function buildMetaForAd(ad, brand, opts = {}) {
       scopeMedia = await loadQuoteScopeMedia(ad.mediaId);
     } catch { /* seed labels optional; gate still has product name */ }
   }
-  layoutInput = gateLayoutInputQuotes(layoutInput, {
-    productAttached: !!ad.productId,
-    productTitle: layoutInput?.input?.product?.name || null,
-    extraText: layoutInput?.input?.product?.name || null,
-    media: scopeMedia
-  });
 
   let catalogProduct = null;
   if (ad.productId) {
@@ -835,9 +829,55 @@ async function buildMetaForAd(ad, brand, opts = {}) {
       // fallback below never ran either, so the count was unreachable from any
       // source. Same silent-`.select()` class as the Brand `description` bug —
       // now pinned for CatalogProduct too by scripts/verifyBrandFieldNames.js.
-      catalogProduct = await CatalogProduct.findById(ad.productId).select('title description price rating productReviews imageUrl titleStyleSpec categoryRef').lean();
+      //
+      // recentQuoteKeys + lastQuoteRunId + lastQuoteFingerprint: rotation
+      // memory (QUOTE_ROTATION_MEMORY). Loaded here so rotation can run
+      // BEFORE the provenance gate, matching the static path. MUST stay
+      // declared on catalogProductSchema. lastQuoteFingerprint is the
+      // replay key — siblings must not re-hash a different-length pool.
+      catalogProduct = await CatalogProduct.findById(ad.productId).select('title description price rating productReviews imageUrl titleStyleSpec categoryRef recentQuoteKeys lastQuoteRunId lastQuoteFingerprint').lean();
     } catch { /* optional */ }
   }
+
+  // VIDEO_QUOTE_ROTATION (default false): same helper static uses, same
+  // same-tier + quality-floor + render-gate guards. Flag-off returns the
+  // input object unchanged — byte-identity for the path that has always
+  // burned primary_quote.snippet. Rotate BEFORE the gate so the gate still
+  // has the final word; rotation itself refuses lines the gate would drop
+  // so flag-on cannot lose a testimonial flag-off would have printed.
+  {
+    const rot = require('./quoteRotationService');
+    const runId = rot.campaignRunIdFromAd(ad);
+    const rotateScope = {
+      productAttached: !!ad.productId,
+      productTitle: layoutInput?.input?.product?.name || catalogProduct?.title || null,
+      extraText: layoutInput?.input?.product?.name || null,
+      media: scopeMedia
+    };
+    layoutInput = rot.rotateLayoutInputQuote(layoutInput, runId, {
+      recentKeys: catalogProduct?.recentQuoteKeys,
+      lastRunId: catalogProduct?.lastQuoteRunId,
+      lastFingerprint: catalogProduct?.lastQuoteFingerprint,
+      scope: rotateScope
+    });
+    const rotation = layoutInput && layoutInput._quoteRotation;
+    if (catalogProduct && (catalogProduct._id || ad.productId) && runId
+        && rotation && rotation.poolSize >= 2 && rotation.fingerprint && !rotation.lockedSameRun) {
+      rot.persistQuoteChoice(catalogProduct._id || ad.productId, {
+        fingerprint: rotation.fingerprint,
+        campaignRunId: runId,
+        wrapped: rotation.wrapped
+      });
+    }
+    if (layoutInput && layoutInput._quoteRotation) delete layoutInput._quoteRotation;
+  }
+
+  layoutInput = gateLayoutInputQuotes(layoutInput, {
+    productAttached: !!ad.productId,
+    productTitle: layoutInput?.input?.product?.name || null,
+    extraText: layoutInput?.input?.product?.name || null,
+    media: scopeMedia
+  });
 
   // Catalog media list — the productOnlyImageUrl cascade reads from
   // the pre-picked `catalogMediaProductOnly` context doc (first Media
