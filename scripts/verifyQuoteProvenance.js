@@ -572,8 +572,13 @@ const GROUNDED = {
     /ANONYMOUS_PRINT_ORIGINS[\s\S]*?llm-web/.test(src));
   check('P6-revert surface: toPrintable deletes byline fields (not just a comment)',
     /delete out\[f\]/.test(src) || /for\s*\(.*BYLINE_FIELDS/.test(src));
+  // The GUARANTEE is that directImage uses the gate's RETURN VALUE — a sanitized copy —
+  // rather than testing a boolean and then printing the original object, which is how a
+  // stripped byline could re-surface. It was pinned by matching the ARGUMENT spelling
+  // (`proof.primary_quote`), which broke the moment the argument legitimately became the
+  // rotation's choice. Pin the assignment, which is the thing that actually matters.
   check('P6-revert surface: directImage uses toPrintable return value',
-    /toPrintableCustomerQuote\s*\(\s*proof\.primary_quote\s*\)/.test(
+    /const\s+quote\s*=\s*toPrintableCustomerQuote\s*\(/.test(
       fs.readFileSync(path.join(__dirname, '../services/directImageRenderService.js'), 'utf8')
     ));
   check('P6-revert surface: layout pool maps toPrintable (not boolean filter alone)',

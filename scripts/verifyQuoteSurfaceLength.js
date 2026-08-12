@@ -289,6 +289,95 @@ check('S14 a neutral-but-real full quote is NOT refused (the gate is targeted)',
     'the unabridged, already-judged text must still print');
 });
 
+console.log('R. Quote rotation — same on every size, different on every run');
+
+// Owner 2026-08-11: "I don't need diversity between sizes, but I do want more diversity
+// on generate… I want to make sure all the sizes are the same, however I want to try to
+// get more diversity on subsequent generations."
+const { selectRotatedQuote, rotationHash } = require('../services/directImageRenderService');
+const rq = (text, tier) => ({ text, tier: tier || 'product', origin: 'scraped', verbatim: true });
+const ROT_PROOF = {
+  primary_quote: rq('I bought these in March and have worn them weekly since — still soft, still hold their shape.'),
+  secondary_quotes: [
+    rq('I absolutely love these joggers, the fabric is buttery soft and they survived six months of washes.'),
+    rq('The quality is amazing and the pair I have feel like second skin.'),
+    rq('Love it, great product.'),                                // generic praise
+    rq('These are so comfortable I wear them to work.', 'brand'), // wrong tier
+  ],
+};
+
+check('R1 every SIZE in one run gets the same quote', () => {
+  // The sizes each build their own layout artifact, so agreement has to come from the
+  // input (the run id), not from luck.
+  const run = 'run_1786443391708_874c5eea';
+  const picks = ['1:1', '4:5', '9:16', '1.91:1'].map(() => selectRotatedQuote(ROT_PROOF, run).text);
+  assert.strictEqual(new Set(picks).size, 1, `sizes disagreed: ${JSON.stringify(picks)}`);
+});
+check('R2 different runs move through the pool', () => {
+  const texts = ['run_A','run_B','run_C','run_D','run_E','run_F'].map(r => selectRotatedQuote(ROT_PROOF, r).text);
+  assert.ok(new Set(texts).size >= 2, 'rotation must actually vary across runs');
+});
+check('R3 rotation NEVER crosses the tier cascade', () => {
+  // secondary_quotes spans every tier; on a product ad a brand-tier quote is the LAST
+  // resort, so rotating onto one would quietly demote the proof.
+  const brandText = 'These are so comfortable I wear them to work.';
+  for (let i = 0; i < 60; i++) {
+    assert.notStrictEqual(selectRotatedQuote(ROT_PROOF, `run_${i}`).text, brandText,
+      'a brand-tier quote must never be rotated onto a product-tier primary');
+  }
+});
+check('R4 rotation NEVER goes downhill onto weaker praise', () => {
+  const generic = 'Love it, great product.';
+  for (let i = 0; i < 60; i++) {
+    assert.notStrictEqual(selectRotatedQuote(ROT_PROOF, `run_${i}`).text, generic,
+      'variety is not worth printing a weaker quote');
+  }
+  // And with nothing better beside it, the primary simply stays.
+  const thin = { primary_quote: ROT_PROOF.primary_quote, secondary_quotes: [rq(generic)] };
+  assert.strictEqual(selectRotatedQuote(thin, 'run_X').text, ROT_PROOF.primary_quote.text);
+});
+check('R5 no run id, or rotation off, is exactly the old behaviour', () => {
+  assert.strictEqual(selectRotatedQuote(ROT_PROOF, null).text, ROT_PROOF.primary_quote.text,
+    'without a generation identity there is nothing to key on');
+  const prev = process.env.STATIC_QUOTE_ROTATION;
+  process.env.STATIC_QUOTE_ROTATION = 'false';
+  try {
+    assert.strictEqual(selectRotatedQuote(ROT_PROOF, 'run_A').text, ROT_PROOF.primary_quote.text,
+      'the kill switch must restore the primary exactly');
+  } finally {
+    if (prev === undefined) delete process.env.STATIC_QUOTE_ROTATION; else process.env.STATIC_QUOTE_ROTATION = prev;
+  }
+});
+check('R6 the index is deterministic — no clock, no randomness', () => {
+  // If this were seeded from Date or Math.random, two sizes rendered a second apart
+  // would disagree, which is the one thing the owner asked NOT to happen.
+  for (const k of ['run_A', 'run_zzz', '', 'run_1786443391708_874c5eea']) {
+    assert.strictEqual(rotationHash(k), rotationHash(k), 'hash must be stable');
+    assert.ok(Number.isInteger(rotationHash(k)) && rotationHash(k) >= 0, 'must be a non-negative integer');
+  }
+  const src = fs.readFileSync(path.join(__dirname, '..', 'services', 'directImageRenderService.js'), 'utf8');
+  const region = src.slice(src.indexOf('function rotationHash'), src.indexOf('function buildIntentData'));
+  assert.ok(!/Math\.random|Date\.now|new Date/.test(region),
+    'rotation must not depend on time or randomness — the sizes would stop agreeing');
+});
+check('R7 a rotated quote still faces every gate the primary faced', () => {
+  // Rotation picks WHICH quote; it must not become a way around provenance. An
+  // llm-web quote carries a byline that must never print, so the gate runs after.
+  const src = fs.readFileSync(path.join(__dirname, '..', 'services', 'directImageRenderService.js'), 'utf8');
+  // COMMENTS STRIPPED — buildIntentData opens with a comment block that NAMES
+  // toPrintableCustomerQuote, so a raw-source ordering check reads the explanation as
+  // the call and fails on correct code. Third time this trap has bitten today; only
+  // executable lines count.
+  const region = src.slice(src.indexOf('function buildIntentData'), src.indexOf('async function resolveConcept'))
+    .split('\n')
+    .filter((l) => { const t = l.trim(); return !t.startsWith('//') && !t.startsWith('*') && !t.startsWith('/*'); })
+    .join('\n');
+  const rot = region.indexOf('selectRotatedQuote');
+  const gate = region.indexOf('toPrintableCustomerQuote');
+  assert.ok(rot !== -1 && gate !== -1 && rot < gate,
+    'the provenance gate must run on whatever rotation chose, not on the original primary');
+});
+
 console.log('V. The video snippet cap is untouched');
 
 check('V1 quoteSnippetService still caps at 50 for the 3s overlay', () => {

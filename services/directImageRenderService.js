@@ -759,7 +759,90 @@ function intentForTemplate(template) {
  *     so rendering it alongside the rating states the same fact twice and the
  *     owner's density rule sacrifices it first anyway.
  */
-function buildIntentData({ concept, layoutInput, brand, product = null, cta }) {
+/**
+ * QUOTE ROTATION — the same testimonial on every SIZE, a different one on every RUN.
+ *
+ * Owner, 2026-08-11: *"I don't need diversity between sizes, but I do want more
+ * diversity on generate… I want to make sure all the sizes are the same, however I want
+ * to try to get more diversity on subsequent generations."*
+ *
+ * Before this, quote selection was intent-blind AND run-blind: pickStrongestQuote
+ * returns THE top-scoring quote, the layout artifact is cached, and every ad built from
+ * it read the same stored primary_quote. A brand with nine good quotes printed one of
+ * them, for ever.
+ *
+ * `campaignRunId` is exactly the identity needed — it is constant across every size in
+ * one generation and changes on the next — so the index is derived from it and nothing
+ * else. No counter to persist, no extra query, no cache-key change: the pool already
+ * rides in the artifact as `secondary_quotes`.
+ *
+ * TWO GUARDS, both load-bearing:
+ *
+ *  1. NEVER CROSSES A TIER. `secondary_quotes` is assembled from ALL tiers
+ *     (layoutInputService: product + category + brand + comment), and the tier cascade
+ *     is a strict precedence — on a product ad a brand-tier quote is the last resort, so
+ *     rotating onto one would quietly demote the proof. Rotation is confined to the tier
+ *     the primary already won.
+ *  2. NEVER ROTATES DOWNHILL. Candidates must clear the PREFERRED quality floor on their
+ *     own merits (clearsQualityFloor, not pickStrongestQuote — the latter now answers
+ *     "is anything printable", which includes generic praise as a floor case). Variety
+ *     is worth having; it is not worth printing a weaker quote to get it.
+ *
+ * Ordered by score before indexing, so index 0 is exactly today's behaviour and a
+ * single-candidate pool is unchanged. The index is a hash, not a counter, which means
+ * consecutive runs can land on the same quote with probability 1/N — with a 9-quote pool
+ * that is ~11%. Stated rather than hidden: eliminating it entirely needs persisted
+ * per-brand state, which is not worth a write on every generation.
+ */
+function rotationEnabled() {
+  return process.env.STATIC_QUOTE_ROTATION !== 'false';
+}
+
+/** Stable non-negative 32-bit hash. Deterministic across processes — Math.random and
+ *  Date are deliberately absent so the same run always resolves the same quote, which
+ *  is what keeps the sizes in agreement. */
+function rotationHash(key) {
+  const s = String(key || '');
+  let h = 2166136261;
+  for (let i = 0; i < s.length; i++) {
+    h ^= s.charCodeAt(i);
+    h = Math.imul(h, 16777619);
+  }
+  return (h >>> 0);
+}
+
+function selectRotatedQuote(proof, campaignRunId) {
+  const primary = proof?.primary_quote || null;
+  if (!primary || !primary.text) return primary;
+  if (!rotationEnabled() || !campaignRunId) return primary;
+
+  const { clearsQualityFloor } = require('./layoutInputService');
+  const tier = primary.tier || null;
+  const seen = new Set();
+  const pool = [primary, ...(Array.isArray(proof.secondary_quotes) ? proof.secondary_quotes : [])]
+    .filter((q) => q && String(q.text || '').trim())
+    .filter((q) => (q.tier || null) === tier)          // guard 1: stay in the winning tier
+    .filter((q) => {
+      const k = String(q.text).trim();
+      if (seen.has(k)) return false;
+      seen.add(k);
+      return true;
+    })
+    .filter((q) => clearsQualityFloor(q.text));        // guard 2: never rotate downhill
+
+  if (pool.length < 2) return primary;
+  // Stable order so the index means the same thing on every size and every run.
+  const { scoreQuote } = require('./layoutInputService');
+  pool.sort((a, b) => (scoreQuote(b.text) - scoreQuote(a.text)) || (a.text < b.text ? -1 : 1));
+  const idx = rotationHash(campaignRunId) % pool.length;
+  const picked = pool[idx];
+  if (picked !== primary) {
+    console.log(`   · quote rotation: run ${campaignRunId} → candidate ${idx + 1}/${pool.length} (tier=${tier || 'unstamped'})`);
+  }
+  return picked;
+}
+
+function buildIntentData({ concept, layoutInput, brand, product = null, cta, campaignRunId = null }) {
   // Dual-read v3 copy / v2 copy_picks. Never invent a headline from product name.
   const copy = renderableCopy(concept);
   const proof = layoutInput?.social_proof || {};
@@ -768,11 +851,14 @@ function buildIntentData({ concept, layoutInput, brand, product = null, cta }) {
   // llm-web quotes arrive with author/source fields that must never print, and
   // the gate strips them structurally so this path cannot re-surface a byline
   // by forgetting to clear author_name.
-  const quote = toPrintableCustomerQuote(proof.primary_quote);
-  if (proof.primary_quote && !quote) {
+  // Rotate BEFORE the provenance gate so the gate still has the final word on whatever
+  // rotation chose — a rotated quote is not exempt from anything the primary faced.
+  const rotated = selectRotatedQuote(proof, campaignRunId);
+  const quote = toPrintableCustomerQuote(rotated);
+  if (rotated && !quote) {
     console.log(
-      `🔒 direct-image: quote withheld (tier=${proof.primary_quote.tier || 'unstamped'} ` +
-      `origin=${proof.primary_quote.origin || 'unstamped'}) — rendering this ad with no testimonial`
+      `🔒 direct-image: quote withheld (tier=${rotated.tier || 'unstamped'} ` +
+      `origin=${rotated.origin || 'unstamped'}) — rendering this ad with no testimonial`
     );
   }
 
@@ -1470,7 +1556,9 @@ async function renderDirectImage(callArgs = {}) {
     layoutInput: effectiveLayout.input || {},
     brand: resolvedBrand,
     product: resolvedProduct,
-    cta: effectiveLayout.input?.cta?.text
+    cta: effectiveLayout.input?.cta?.text,
+    // Same quote on every size of this run, a different one next run.
+    campaignRunId
   });
   // Lifestyle/UGC scene preserve — intent still owns copy; only the scene
   // fidelity opening swaps when the flag is on (staticAdIntents).
@@ -1798,6 +1886,8 @@ async function renderDirectImage(callArgs = {}) {
 }
 
 module.exports = {
+  selectRotatedQuote,
+  rotationHash,
   // Exported for the offline harness. renderDirectImage is the only entry point
   // the render path uses.
   // finishPlate is the exception: the recovery path is a SECOND legitimate caller
