@@ -183,15 +183,20 @@ for (const fmt of PRE_EXISTING_FORMATS) {
       + 're-billing an Omni master (~$1.00-1.20 per product)');
 }
 
-// C1b: the SAME scoping trap, second occurrence. `funnelStage` was added to
-// the digest unscoped, so any ad carrying a stage hashed differently — and the
-// Director already emits routing.funnel_stage on PMax rounds, leaving the
-// field one wiring change from a Meta video ad. Pinned per-format, like C1.
+// C1b: the money guard is NULL-ONLY, not format-scoped. Pre-existing
+// Meta/legacy rows store funnelStage=null, so appending the part only
+// when set cannot change a stored master digest. A set stage MUST
+// change the hash — that is how Meta/PMax intent variants stop
+// collapsing onto the master on the unique index.
 for (const fmt of PRE_EXISTING_FORMATS) {
-  check(`C1b [MONEY] funnelStage does NOT alter the digest for pre-existing format ${fmt}`,
+  check(`C1b [MONEY] funnelStage:null does NOT alter the digest for pre-existing format ${fmt}`,
     digest({ ...baseArgs, platformFormat: fmt })
-      === digest({ ...baseArgs, platformFormat: fmt, funnelStage: 'awareness' }),
-    'an unscoped stage re-mints every stored Meta digest and re-bills the campaign');
+      === digest({ ...baseArgs, platformFormat: fmt, funnelStage: null }),
+    'pushing a null/empty funnel part re-mints every stored digest and re-bills Omni');
+  check(`C1b2 [MONEY] a SET funnelStage DOES alter the digest for ${fmt} (variants must not collapse)`,
+    digest({ ...baseArgs, platformFormat: fmt })
+      !== digest({ ...baseArgs, platformFormat: fmt, funnelStage: 'awareness' }),
+    'a set stage that hashes like the master is silently dropped by insertMany');
 }
 
 check('C1c funnelStage IS identity for Google video (3 variants must not collapse)',
@@ -242,8 +247,9 @@ if (typeof resolveDeriveFromMaster === 'function') {
   // meta_reels_9_16 are now produced by cropping or retitling the Stories
   // master, so they MUST route to the derive path; they still belong in
   // PRE_EXISTING_FORMATS because their digests must stay unaffected by
-  // duration/funnelStage. Conflating the two lists is what made this check
-  // fail, and it would have been the wrong fix to widen the gate instead.
+  // duration and by funnelStage:null. A SET stage is identity (C1b2).
+  // Conflating the two lists is what made this check fail, and it would
+  // have been the wrong fix to widen the gate instead.
   const STILL_BILLABLE_FORMATS = ['meta_stories_9_16', 'pmax_16_9', MASTER_9_16, MASTER_16_9];
   for (const fmt of STILL_BILLABLE_FORMATS) {
     check(`D4 billable master format ${fmt} is NOT routed to the derive path`,

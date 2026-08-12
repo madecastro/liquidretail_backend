@@ -202,14 +202,14 @@ check('F1 mixed-run masters are all distinct platformFormats', () => {
   assert.strictEqual(new Set(m).size, m.length, `duplicate masters: ${JSON.stringify(m)}`);
 });
 
-// ── 7. PMax funnel variants stay scoped to PMax ──────────────────────────
+// ── 7. Funnel variants are platform-agnostic and MUST stay free ──────────
 // Widening isGoogleVideoMasterRun for mixed runs also opened the funnel-mint
-// loop to whatever else was in masterFormats. A Meta funnel row is worse than
-// wasteful: funnelStage is not part of a Meta identity digest, so the rows
-// collapse onto the Meta master and are swallowed — but resolveDeriveFromMaster
-// returns NULL for a Meta platformFormat even with a funnelStage set, so any
-// that ever did insert would take the BILLABLE Omni path rather than the free
-// retitle. These pin the two properties that keep that shut.
+// loop to whatever else was in masterFormats. That used to be a money hole
+// because (a) funnelStage was not part of a Meta identity digest, so the
+// rows collapsed onto the master, and (b) resolveDeriveFromMaster returned
+// null for a Meta+stage row, so any that DID insert would have billed Omni.
+// Both properties flipped together: a set stage is now identity on every
+// format, and Meta+stage fail-closes to the Stories plate.
 check('G1 funnel stage is identity for a Google master (variants can coexist)', () => {
   const base  = svc.computeDeterministicVideoDigest({
     campaignId: 'c1', productId: 'p1', mediaId: 'm1',
@@ -222,30 +222,33 @@ check('G1 funnel stage is identity for a Google master (variants can coexist)', 
   assert.notStrictEqual(base, aware, 'Google funnel variants collide with their master');
 });
 
-check('G2 funnel stage is NOT identity for Meta — which is why Meta must never be minted', () => {
+check('G2 [MONEY] funnel stage IS identity for Meta (null-stage master unchanged)', () => {
   const base  = svc.computeDeterministicVideoDigest({
     campaignId: 'c1', productId: 'p1', mediaId: 'm1',
     platformFormat: 'meta_stories_9_16', funnelStage: null
+  });
+  const omit = svc.computeDeterministicVideoDigest({
+    campaignId: 'c1', productId: 'p1', mediaId: 'm1',
+    platformFormat: 'meta_stories_9_16'
   });
   const aware = svc.computeDeterministicVideoDigest({
     campaignId: 'c1', productId: 'p1', mediaId: 'm1',
     platformFormat: 'meta_stories_9_16', funnelStage: 'awareness'
   });
-  assert.strictEqual(
+  assert.strictEqual(base, omit, 'funnelStage:null shifted a Meta master digest — next Generate re-bills Omni');
+  assert.notStrictEqual(
     base, aware,
-    'Meta digest started honouring funnelStage — if that is intentional, the funnel '
-    + 'loop scoping and resolveDeriveFromMaster fail-closed behaviour must be revisited together'
+    'Meta digest still ignores a set funnelStage — intent variants collapse onto the master'
   );
 });
 
-check('G3 a Meta funnel row would take the BILLABLE path — the reason for the scope filter', () => {
+check('G3 [MONEY] a Meta funnel row fail-closes to the Stories plate (never Omni)', () => {
   const derive = svc.resolveDeriveFromMaster({
     platformFormat: 'meta_stories_9_16', funnelStage: 'awareness', renderRoute: 'veo'
   });
   assert.strictEqual(
-    derive, null,
-    'Meta+funnelStage now resolves a master; if so the billable-path risk is gone and '
-    + 'this check should be re-derived rather than deleted'
+    derive, 'meta_stories_9_16',
+    'Meta+funnelStage is still billable — a dropped deriveFromMaster would re-open Omni'
   );
 });
 
@@ -357,71 +360,82 @@ const SRC = require('fs').readFileSync(
   'utf8'
 );
 
-check('H1 funnel mint iterates a Google-filtered master list, not masterFormats', () => {
+check('H1 mixed-run PMax funnel mint stays scoped to Google masters', () => {
+  // Behavioural: a mixed plan must not stamp a PMax-style same-format
+  // deriveFromMaster on the Meta master (that would be the old unscoped
+  // loop). Meta variants derive from META_VIDEO_MASTER_KEY and live in
+  // their own block.
+  const prev = process.env.PMAX_FUNNEL_VARIANTS;
+  process.env.PMAX_FUNNEL_VARIANTS = 'true';
+  const mixed = svc.planDeterministicVideoAds([
+    'meta_stories_9_16', 'pmax_video_9_16', 'pmax_video_16_9'
+  ]);
+  const metaStaged = mixed.filter((p) =>
+    p.platformFormat === 'meta_stories_9_16' && p.funnelStage);
+  const pmaxStaged = mixed.filter((p) =>
+    (p.platformFormat === 'pmax_video_9_16' || p.platformFormat === 'pmax_video_16_9')
+    && p.funnelStage);
+  assert.ok(metaStaged.length > 0, 'mixed run dropped Meta intent variants');
   assert.ok(
-    /const\s+funnelMasters\s*=\s*masterFormats\.filter\(\s*\(f\)\s*=>\s*GOOGLE_VIDEO_MASTER_SET\.has\(f\)\s*\)/.test(SRC),
-    'funnelMasters filter is gone — the funnel loop can mint Meta funnel rows on a mixed run, '
-    + 'and resolveDeriveFromMaster returns null for those, which is the billable Omni path'
+    metaStaged.every((p) => p.deriveFromMaster === 'meta_stories_9_16' && p.billable === false),
+    'a Meta funnel row in a mixed run is missing deriveFromMaster — that is the Omni path'
   );
   assert.ok(
-    /for\s*\(const\s+fmt\s+of\s+funnelMasters\)/.test(SRC),
-    'the funnel loop no longer iterates funnelMasters'
+    pmaxStaged.every((p) => p.deriveFromMaster === p.platformFormat && p.billable === false),
+    'a PMax funnel row in a mixed run is missing same-format deriveFromMaster'
   );
   assert.ok(
-    !/if\s*\(isPmaxFunnelVariantsEnabled\(\)\)\s*\{\s*for\s*\(const\s+fmt\s+of\s+masterFormats\)/.test(SRC),
-    'the funnel loop iterates masterFormats directly again'
+    /GOOGLE_VIDEO_MASTER_SET\.has\(f\)/.test(SRC),
+    'the Google-only funnelMasters filter is gone — Meta rows could be minted twice'
   );
+  if (prev == null) delete process.env.PMAX_FUNNEL_VARIANTS;
+  else process.env.PMAX_FUNNEL_VARIANTS = prev;
 });
 
 check('H3 [MONEY] every Meta derivative is minted WITH deriveFromMaster', () => {
-  // The single most expensive line in the Meta fan-out. These rows are free
-  // ONLY because they carry deriveFromMaster, which routes them through
-  // renderDeriveOnlyVideoAd. Verified by mutation that the behavioural checks
-  // above CANNOT see this — the mint is inside expandWizardJob's async
-  // expansion — hence a source pin.
-  //
-  // Re-pointed 2026-08-11 at the surviving mint. TWO blocks used to do this:
-  // one ungated (PR #181) and one flag-gated (PR #173), each pinned by a
-  // different harness, which is exactly why neither caught the other. The
-  // ungated copy is gone; this now pins the flag-gated one.
+  const prev = process.env.PMAX_FUNNEL_VARIANTS;
+  process.env.PMAX_FUNNEL_VARIANTS = 'true';
+  const plan = svc.planDeterministicVideoAds(['meta_stories_9_16']);
+  const derives = plan.filter((p) => p.platformFormat !== 'meta_stories_9_16'
+    || p.funnelStage);
+  assert.ok(derives.length > 0, 'Meta plan has no free rows');
+  for (const row of derives) {
+    assert.strictEqual(
+      row.deriveFromMaster, 'meta_stories_9_16',
+      `${row.platformFormat}:${row.funnelStage} missing deriveFromMaster — that row would bill Omni`
+    );
+    assert.strictEqual(row.billable, false, `${row.platformFormat}:${row.funnelStage} marked billable`);
+  }
   assert.ok(
-    /if\s*\(isMetaVideoMasterRun\(masterFormats\)\s*&&\s*isMetaVideoDerivativesEnabled\(\)\)/.test(SRC),
-    'the Meta derivative mint is no longer gated on (source master present AND flag on)'
-  );
-  assert.ok(
-    /for\s*\(const\s+fmt\s+of\s+META_VIDEO_DERIVE_KEYS\)/.test(SRC),
-    'the Meta derivative loop is gone'
+    /for \(const fmt of META_VIDEO_DERIVE_KEYS\)/.test(SRC),
+    'the Meta derivative loop is gone from the planner'
   );
   assert.ok(
     /deriveFromMaster:\s*META_VIDEO_DERIVE_MAP\[fmt\]/.test(SRC),
-    'MONEY: Meta derivatives are minted without deriveFromMaster — each one becomes a '
-    + 'billable Omni submit instead of a free crop'
+    'MONEY: Meta derivatives are minted without deriveFromMaster'
   );
+  if (prev == null) delete process.env.PMAX_FUNNEL_VARIANTS;
+  else process.env.PMAX_FUNNEL_VARIANTS = prev;
 });
 
-check('H3b there is exactly ONE Meta derivative mint block', () => {
-  // The duplicate cost nothing (identical digests collided on the unique
-  // index) but it broke the META_VIDEO_DERIVATIVES kill switch — the ungated
-  // copy minted regardless — and double-counted the dry run, so a Meta run
-  // quoted 7 delivered creatives against 4 real ones.
-  const mints = SRC.match(/deriveFromMaster:\s*META_VIDEO_DERIVE_MAP\[fmt\]/g) || [];
-  assert.strictEqual(
-    mints.length, 1,
-    `expected exactly one Meta derivative mint, found ${mints.length} — a second one silently `
-    + 'bypasses the kill switch and inflates the dry-run estimate'
-  );
+check('H3b there is no second ungated Meta derivative mint', () => {
+  // TWO gated loops inside the planner are expected (unstaged derives +
+  // staged variants). What must not come back is the removed ungated
+  // expandWizardJob copy that bypassed META_VIDEO_DERIVATIVES.
   assert.ok(
     !/const\s+metaDeriveSource\s*=/.test(SRC),
     'the removed ungated Meta mint block is back'
   );
+  assert.ok(
+    /const videoPlan = planDeterministicVideoAds\(masterFormats\)/.test(SRC),
+    'expandWizardJob is not iterating the planner — a second handwritten mint can return'
+  );
 });
 
-check('H4 the Meta dry-run count is added ONCE, behind the same flag as the mint', () => {
-  const terms = SRC.match(/dryDetPerProduct\s*\+=\s*META_VIDEO_DERIVE_KEYS\.length/g) || [];
-  assert.strictEqual(
-    terms.length, 1,
-    `Meta derivatives counted ${terms.length}x in the dry run — the operator's delivered `
-    + 'estimate drifts from what the mint actually produces'
+check('H4 the Meta dry-run count cannot drift from the mint', () => {
+  assert.ok(
+    /const dryPlan = planDeterministicVideoAds\(dryMasterFormats\)/.test(SRC),
+    'dry-run no longer shares the planner with the live mint'
   );
   assert.ok(
     !/dryMetaDerives/.test(SRC),
@@ -429,14 +443,18 @@ check('H4 the Meta dry-run count is added ONCE, behind the same flag as the mint
   );
 });
 
-check('H2 dry-run funnel count is scoped to Google masters too', () => {
+check('H2 dry-run count uses the same planner as the live mint', () => {
   assert.ok(
-    /const\s+dryFunnelMasters\s*=\s*dryMasterFormats\.filter\(\s*\(f\)\s*=>\s*GOOGLE_VIDEO_MASTER_SET\.has\(f\)\s*\)/.test(SRC),
-    'dry-run funnel count is not Google-scoped — it will over-quote delivered ads on a mixed run'
+    /const dryPlan = planDeterministicVideoAds\(dryMasterFormats\)/.test(SRC),
+    'dry-run no longer calls the planner — delivered/billable will drift from the mint'
   );
   assert.ok(
-    !/PMAX_FUNNEL_STAGES\.length\s*\*\s*\(dryMasterFormats\.length\s*\+\s*1\)/.test(SRC),
-    'dry-run still multiplies funnel stages by the unscoped master count'
+    /const dryDetPerProduct = dryPlan\.length/.test(SRC),
+    'dry-run is not using dryPlan.length'
+  );
+  assert.ok(
+    /for \(const item of videoPlan\)/.test(SRC),
+    'expandWizardJob is not iterating the planner — live mint and dry-run can drift'
   );
 });
 

@@ -418,7 +418,12 @@ ok('F8 expandDeterministicVideo forwards generationRunId (video leftovers need a
   const re = /expandDeterministicVideo\(\{/g;
   let m;
   while ((m = re.exec(genSrc))) calls.push(m.index);
-  assert.ok(calls.length >= 5, `expected ≥5 expandDeterministicVideo calls, found ${calls.length}`);
+  // One call site is correct — expandWizardJob iterates planDeterministicVideoAds
+  // rather than unrolling a mint loop per surface. A second handwritten call
+  // is how the Meta derivatives got minted twice (PR #183).
+  assert.ok(calls.length >= 1, `expected ≥1 expandDeterministicVideo call, found ${calls.length}`);
+  assert.ok(calls.length <= 2,
+    `expected the planner loop plus at most one other call, found ${calls.length} — a second handwritten mint silently bypasses the kill switch`);
   for (const idx of calls) {
     const block = genSrc.slice(idx, idx + 800);
     assert.ok(/generationRunId/.test(block),

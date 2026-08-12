@@ -6,15 +6,17 @@
  * WHY THIS EXISTS
  * ---------------
  * A PMax video run delivers, per product: 2 billable Omni masters (9:16 +
- * 16:9), 1 FREE 1:1 crop of the 9:16, and 3 funnel re-titles per surface —
- * 12 deliverables, 2 of which cost money. Four products therefore preview as
- * "48 creatives" while charging for 8 Omni submits.
+ * 16:9), 1 FREE 1:1 crop of the 9:16 (the unstaged row IS awareness), and
+ * consideration + conversion retitles of each of the 3 surfaces —
+ * 9 deliverables, 2 of which cost money. Four products therefore preview as
+ * "36 creatives" while charging for 8 Omni submits.
  *
- * The wizard showed only the 48. That is survivable on the hand-picked flow,
- * where the operator built the selection themselves. It is NOT survivable on
- * the express "Quick generate — use defaults" button, where one click can
- * commit a run the operator never itemised: 48 is indistinguishable from a
- * ~6x larger bill, and the honest answer (8 masters) is not on screen.
+ * The wizard showed only the delivered count. That is survivable on the
+ * hand-picked flow, where the operator built the selection themselves. It
+ * is NOT survivable on the express "Quick generate — use defaults" button,
+ * where one click can commit a run the operator never itemised: 36 is
+ * indistinguishable from a several-x larger bill, and the honest answer
+ * (8 masters) is not on screen.
  *
  * THE INVARIANT, and the direction that matters: billable must never be
  * LARGER than what the run can actually charge for, and free derivations must
@@ -56,8 +58,8 @@ check('B1 the preview entry point is exported', typeof svc.expandWizardJob === '
   check('B1 billable reports videoMasters', /videoMasters:/.test(src));
   check('B1 billable reports freeDerived', /freeDerived:/.test(src),
     'without this the free re-titles are indistinguishable from paid masters');
-  check('B1 billable masters derive from the master list, not the delivered total',
-    /billableVideoMastersPerProduct\s*=\s*dryMasterFormats\.length/.test(src),
+  check('B1 billable masters derive from the planner\'s billable flag, not the delivered total',
+    /billableVideoMastersPerProduct\s*=\s*dryPlan\.filter\(\s*\(p\)\s*=>\s*p\.billable\s*\)\.length/.test(src),
     'billable must be computed from paid masters only');
 }
 
@@ -76,20 +78,30 @@ check('B2 GOOGLE_VIDEO_MASTERS is exactly the two paid masters',
 {
   const PRODUCTS = 4;
   const masters = GOOGLE_VIDEO_MASTERS.length;          // 2 billable
-  const stages = (PMAX_FUNNEL_STAGES || []).length;      // 3 free re-titles
-  const perProductDelivered = masters + 1 + stages * (masters + 1);
+  // Awareness is the unstaged row. Variants are consideration + conversion.
+  const variantStages = (PMAX_FUNNEL_STAGES || []).filter((s) => s !== 'awareness').length;
+  const perProductDelivered = masters + 1 + variantStages * (masters + 1);
   const delivered = PRODUCTS * perProductDelivered;
   const billable = PRODUCTS * masters;
 
-  check('B3 delivered count matches the observed wizard number (48 for 4 products)',
-    delivered === 48, `computed ${delivered} from masters=${masters} stages=${stages}`);
+  check('B3 delivered count matches the planner (36 for 4 products = 9×4)',
+    delivered === 36, `computed ${delivered} from masters=${masters} variantStages=${variantStages}`);
   check('B3 billable is far smaller than delivered',
     billable === 8 && billable < delivered,
     `billable=${billable} delivered=${delivered}`);
   check('B3 free derivations are the remainder, never billable',
-    delivered - billable === 40, `free=${delivered - billable}`);
+    delivered - billable === 28, `free=${delivered - billable}`);
   // The direction that matters: under-counting bills a surprise.
   check('B3 billable never exceeds delivered', billable <= delivered);
+  // Cross-check against the live planner so this arithmetic cannot drift.
+  const prev = process.env.PMAX_FUNNEL_VARIANTS;
+  process.env.PMAX_FUNNEL_VARIANTS = 'true';
+  const plan = svc.planDeterministicVideoAds(['pmax_video_9_16', 'pmax_video_16_9']);
+  check('B3 planner agrees with the independent arithmetic (9/2 per product)',
+    plan.length === perProductDelivered && plan.filter((p) => p.billable).length === masters,
+    `plan=${plan.length} billable=${plan.filter((p) => p.billable).length}`);
+  if (prev == null) delete process.env.PMAX_FUNNEL_VARIANTS;
+  else process.env.PMAX_FUNNEL_VARIANTS = prev;
 }
 
 const total = passed + failures.length;

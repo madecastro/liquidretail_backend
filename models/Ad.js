@@ -276,11 +276,14 @@ const adSchema = new mongoose.Schema({
   // I6 (a receipted legacy row does not).
   // Declared so Mongoose strict mode persists the marker.
   deriveFromMaster:   { type: String, default: null },
-  // Funnel-stage retitle (Google PMax). When set, this Ad is a FREE
-  // Remotion re-title of an already-paid master plate (or of the free
-  // 1:1 derive plate) using remotion/presets/canonical-<stage>-pmax10.json.
-  // Absent/null = today's single-title behaviour. NEVER billable on its
-  // own — routes via resolveDeriveFromMaster → renderDeriveOnlyVideoAd.
+  // Funnel-stage retitle (PMax AND Meta video). When set, this Ad is a
+  // FREE Remotion re-title of an already-paid master plate (or of a free
+  // derive plate). PMax uses remotion/presets/canonical-<stage>-pmax10.json;
+  // Meta uses the generic 8s canonical-<stage>.json. Absent/null = the
+  // unstaged row, which IS awareness — masters never carry a stage, so
+  // their identity digest stays byte-identical to every pre-existing
+  // row. NEVER billable on its own — routes via resolveDeriveFromMaster
+  // → renderDeriveOnlyVideoAd.
   funnelStage: {
     type:    String,
     enum:    ['awareness', 'consideration', 'conversion', null],
