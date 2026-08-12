@@ -40,11 +40,20 @@ const SPEC = Object.freeze({
   },
   VEO_TITLING_CONCURRENCY: {
     env: 'VEO_TITLING_CONCURRENCY',
+    default: 48,
+    min: 1,
+    max: 64,
+    ceiling: 'SELF-IMPOSED',
+    why: 'How many ads may be INSIDE the titling call at once. 4 -> 48 (owner-directed 2026-08-13) and the note below is rewritten because the old one was wrong about what this bounds. It said "simultaneous Remotion titling renders", but remotionRenderService ran a concurrency-1 promise CHAIN, so only ever ONE render happened regardless of this number — the other permit holders sat idle. That is the whole explanation for the measured 926s / 83%-idle titling tail on a 20-ad run: 13 renders strictly back to back. What this permit actually bounds is the CHEAP prep half — buildMetaForAd, the copy cascade, product/category reads, font resolution. Those are Mongo/disk, not memory-heavy, so a wide value is safe and 48 matches RENDER_CONCURRENCY in being deliberately non-binding. THE MEMORY GUARD IS NOW REMOTION_QUEUE_CONCURRENCY, which is the number to move carefully. One caveat that survives the rewrite: ~$0.02 of billable face-detection vision runs inside this permit per ad (basePlateCropService), so a wide value bursts those calls concurrently — same total spend, higher instantaneous rate.'
+  },
+
+  REMOTION_QUEUE_CONCURRENCY: {
+    env: 'REMOTION_QUEUE_CONCURRENCY',
     default: 4,
     min: 1,
     max: 16,
     ceiling: 'SELF-IMPOSED',
-    why: 'Simultaneous Remotion titling renders (headless Chrome + ffmpeg) in THIS process. THIS is the knob the old VEO_CONCURRENCY=4 was really protecting, so 4 is deliberately unchanged — the split must not raise local memory pressure on its first outing. Failure mode if raised blind is NOT a provider 429: it is CPU/RAM exhaustion -> Render autoscale (60% CPU+mem) -> process replacement -> a stranded paid Omni master (~$1.00 each), which is the exact leak bootRecoveryService exists to clean up. One measured titling render = 76.2s, and 1080p is 2.25x the pixels of 720p with no measurement behind it. Per-process (Semaphore is in-process), which is the right shape for a MEMORY guard since memory is per-instance. Measure RSS on the web service before raising.'
+    why: 'Simultaneous Remotion renders — headless Chrome page + ffmpeg 1080p encode, IN the web process. This is the real titling limit and inherits the caution the old VEO_TITLING_CONCURRENCY note carried: the failure mode is not a provider 429, it is RSS exhaustion -> Render autoscale (60% CPU+mem) -> process replacement -> a paid Omni master stranded mid-titling (~$1.00 each). Default 4 is a 4x throughput win over the serial chain it replaces (926s tail -> ~230s projected) and is NOT arbitrary: 4 is the value the combined VEO_CONCURRENCY carried when it ran submit+poll AND Remotion in one lane, so it is the only concurrency this process has actually survived. It is still not an RSS MEASUREMENT. Raise one step at a time against the web service memory graph across a full run; 1080p is 2.25x the pixels of 720p and one measured render is 76.2s.'
   },
   MAX_CREATIVES_PER_RUN: {
     env: 'MAX_CREATIVES_PER_RUN',

@@ -102,17 +102,35 @@ console.log('\nVEO SUBMIT/TITLING SPLIT\n');
 
   // ── B. The knobs ────────────────────────────────────────────────────────
   check('B1 VEO_TITLING_CONCURRENCY exists as its own knob', !!SPEC.VEO_TITLING_CONCURRENCY);
-  check('B2 [SAFETY] titling default is still 4 — identical to the old combined '
-      + 'VEO_CONCURRENCY, so the split cannot raise local memory pressure on its first outing',
-    SPEC.VEO_TITLING_CONCURRENCY.default === 4 && CONC.VEO_TITLING_CONCURRENCY === 4);
-  check('B3 the lane (submit+poll) is now wider than titling — otherwise the split '
-      + 'bought nothing', CONC.VEO_CONCURRENCY > CONC.VEO_TITLING_CONCURRENCY);
+  // B2/B3/B5 RE-POINTED, not relaxed. Their intent — "the memory-bound knob is
+  // small and honestly documented" — is unchanged; the knob it names moved.
+  //
+  // VEO_TITLING_CONCURRENCY never actually bounded Remotion renders.
+  // remotionRenderService ran a concurrency-1 promise chain, so ONE render
+  // happened regardless of this number and the other permit holders idled. That
+  // is the measured 926s / 83%-idle titling tail. The permit is now wide (48,
+  // owner-directed) and bounds only cheap prep; REMOTION_QUEUE_CONCURRENCY is
+  // the real memory guard, so that is what these now protect.
+  check('B2 [SAFETY] the MEMORY-BOUND render pool stays small — 4 is the only '
+      + 'concurrency this process has actually survived (the old combined VEO_CONCURRENCY)',
+    SPEC.REMOTION_QUEUE_CONCURRENCY
+    && SPEC.REMOTION_QUEUE_CONCURRENCY.default === 4
+    && CONC.REMOTION_QUEUE_CONCURRENCY === 4);
+  check('B2b [SAFETY] the render pool can never be configured above the documented ceiling',
+    SPEC.REMOTION_QUEUE_CONCURRENCY && SPEC.REMOTION_QUEUE_CONCURRENCY.max <= 16);
+  check('B3 the memory-bound pool is the NARROWEST video knob — the cheap permit and '
+      + 'the submit/poll lane may both run wider, the renderer may not',
+    CONC.REMOTION_QUEUE_CONCURRENCY <= CONC.VEO_TITLING_CONCURRENCY
+    && CONC.REMOTION_QUEUE_CONCURRENCY <= CONC.VEO_CONCURRENCY);
   check('B4 the lane stays within MAX_CREATIVES_PER_RUN — going non-binding is a '
       + 'separate, measured decision', CONC.VEO_CONCURRENCY <= CONC.MAX_CREATIVES_PER_RUN);
-  check('B5 the titling knob documents the REAL failure mode (memory/process death), '
+  check('B5 the RENDER POOL knob documents the REAL failure mode (memory/process death), '
       + 'not a provider 429 — the mis-documentation is what made the old number look safe to raise',
-    /CPU\/RAM|memory/i.test(SPEC.VEO_TITLING_CONCURRENCY.why)
-    && /NOT a provider 429|not a provider 429/i.test(SPEC.VEO_TITLING_CONCURRENCY.why));
+    /CPU\/RAM|RSS|memory/i.test(SPEC.REMOTION_QUEUE_CONCURRENCY.why)
+    && /NOT a provider 429|not a provider 429/i.test(SPEC.REMOTION_QUEUE_CONCURRENCY.why));
+  check('B5b the titling permit no longer CLAIMS to bound Remotion renders — that '
+      + 'stale sentence is what hid a serial queue behind a number that read as 4-wide',
+    !/^Simultaneous Remotion titling renders/.test(SPEC.VEO_TITLING_CONCURRENCY.why));
 
   // ── B6/B7 — THE SHADOWING TRAP, and it bit this very change ──────────────
   // config/defaults.env is dotenv-loaded into process.env at boot, and
@@ -134,10 +152,15 @@ console.log('\nVEO SUBMIT/TITLING SPLIT\n');
   check('B7 [TRAP] defaults.env agrees with the SPEC defaults — a SPEC-only change '
       + 'is silently shadowed by this file and never reaches production',
     envNum('VEO_CONCURRENCY') === SPEC.VEO_CONCURRENCY.default
-    && envNum('VEO_TITLING_CONCURRENCY') === SPEC.VEO_TITLING_CONCURRENCY.default,
+    && envNum('VEO_TITLING_CONCURRENCY') === SPEC.VEO_TITLING_CONCURRENCY.default
+    // The new memory knob is the one it would hurt most to leave shadowed: a
+    // SPEC bump that never reaches prod would read as "we raised throughput"
+    // while the file still pins the pool.
+    && envNum('REMOTION_QUEUE_CONCURRENCY') === SPEC.REMOTION_QUEUE_CONCURRENCY.default,
     `file=${envNum('VEO_CONCURRENCY')}/${envNum('VEO_TITLING_CONCURRENCY')} spec=${SPEC.VEO_CONCURRENCY.default}/${SPEC.VEO_TITLING_CONCURRENCY.default}`);
-  check('B8 the split still holds in the FILE values, which are what actually run',
-    envNum('VEO_CONCURRENCY') > envNum('VEO_TITLING_CONCURRENCY'));
+  check('B8 the render pool is the narrowest in the FILE values, which are what actually run',
+    envNum('REMOTION_QUEUE_CONCURRENCY') <= envNum('VEO_TITLING_CONCURRENCY')
+    && envNum('REMOTION_QUEUE_CONCURRENCY') <= envNum('VEO_CONCURRENCY'));
 
   // ── C. Wiring in the veo lane ───────────────────────────────────────────
   check('C1 routes/ads.js builds a titling semaphore from the knob',

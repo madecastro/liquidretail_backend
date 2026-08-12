@@ -206,12 +206,33 @@ const MAX_CREATIVES_PER_RUN = CONC.MAX_CREATIVES_PER_RUN;
 
 // MODULE-LEVEL ON PURPOSE — one permit pool for the whole process, not one per
 // campaign run. A per-run semaphore would let two concurrent runs each open
-// VEO_TITLING_CONCURRENCY Remotion renders, which is precisely the memory
-// blow-up the permit exists to prevent. See services/semaphore.js for why
-// in-process is the correct scope for a memory guard (and the wrong one for a
-// provider rate limit).
+// VEO_TITLING_CONCURRENCY slots. See services/semaphore.js for why in-process
+// is the correct scope for a memory guard (and the wrong one for a provider
+// rate limit).
+//
+// WHAT THIS BOUNDS, CORRECTED. It used to be described as the cap on
+// simultaneous Remotion renders. It never was — remotionRenderService ran a
+// concurrency-1 promise chain, so one render happened regardless. This permit
+// bounds the CHEAP prep half (copy cascade, Mongo reads, font resolution); the
+// memory guard is REMOTION_QUEUE_CONCURRENCY inside that service.
 const { Semaphore } = require('../services/semaphore');
 const veoTitlingSemaphore = new Semaphore(CONC.VEO_TITLING_CONCURRENCY, 'veo-titling');
+
+// Live titling queue depth, read from the pool that ads ACTUALLY wait in.
+//
+// DIAGNOSTICS MUST BE TRUE OR THEY COST MORE THAN THEY GIVE (owner rule): a
+// stage line reading "0 ahead" while an ad sits twelfth in line does not merely
+// under-inform, it actively misdirects whoever is debugging a slow run. Lazy
+// require keeps this route file free of Remotion's load cost at boot, and the
+// fallback means a require failure degrades the message rather than the render.
+function titlingQueueDepth() {
+  try {
+    // eslint-disable-next-line global-require
+    return require('../services/remotionRenderService').renderQueueStats();
+  } catch {
+    return { concurrency: 1, active: 0, waiting: 0 };
+  }
+}
 
 // POST /api/ads/preview
 // Same body as /generate. Runs the entire seed assembly + cartesian +
@@ -1824,9 +1845,12 @@ async function renderDeriveOnlyVideoAd({
   if (brandDoc) {
     try {
       const { renderBrandScriptAndSave } = require('../services/brandScriptExecutor');
-      const waitingFor = veoTitlingSemaphore.waiting;
-      if (waitingFor > 0 || veoTitlingSemaphore.available === 0) {
-        adStage(adId, `queued for titling (${waitingFor} ahead)`);
+      // Depth from the render pool, not this semaphore — see the note on the
+      // master path. A diagnostic that reports 0 while twelve ads are ahead is
+      // worse than no diagnostic: it sends the reader looking somewhere else.
+      const q = titlingQueueDepth();
+      if (q.waiting > 0 || q.active >= q.concurrency) {
+        adStage(adId, `queued for titling (${q.waiting} ahead)`);
       }
       const chromeOut = await veoTitlingSemaphore.withPermit(async () => {
         adStage(adId, `titling ${adFinal.aspectRatio || ad.aspectRatio || '1:1'} (derive-only)`);
@@ -2242,9 +2266,17 @@ async function renderOneInner(run, job, adId, index, renderToken) {
           // and already persisted (status:'draft' + veoVideoUrl, stamped above),
           // so queueing here risks nothing but latency — and an ad waiting for a
           // titling permit is reaper-safe for exactly that reason.
-          const waitingFor = veoTitlingSemaphore.waiting;
-          if (waitingFor > 0 || veoTitlingSemaphore.available === 0) {
-            adStage(adId, `queued for titling (${waitingFor} ahead)`);
+          //
+          // DEPTH COMES FROM THE RENDER POOL, NOT THIS SEMAPHORE. It used to read
+          // veoTitlingSemaphore.waiting, which was right while the permit (4) was
+          // the narrowest thing in the path. It no longer is: the permit is now
+          // wide (48) and bounds only cheap prep, while the real wait is
+          // remotionRenderService's bounded pool. Left as it was, this line would
+          // report "0 ahead" for an ad genuinely twelfth in line — silently
+          // deleting the one number that makes a slow run legible.
+          const q = titlingQueueDepth();
+          if (q.waiting > 0 || q.active >= q.concurrency) {
+            adStage(adId, `queued for titling (${q.waiting} ahead)`);
           }
           const chromeOut = await veoTitlingSemaphore.withPermit(async () => {
             // Titling names its target aspect: this is the stage that face-crops
