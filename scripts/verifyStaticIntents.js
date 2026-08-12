@@ -421,15 +421,24 @@ const countEmittedStrings = (prompt) => {
     check(`E5 brand_led/${surface} count <= maxTextElements`,
       n <= SURFACE_POLICY[surface].maxTextElements, true);
   }
-  // Stories: SURFACE_POLICY.drawCta false. PMax: Phase B intent-aware
-  // suppress for brand_led. Both emit 3 (CTA stripped).
-  const threeStringSurfaces = ['meta_stories_9_16', 'pmax_16_9'];
-  for (const surface of threeStringSurfaces) {
-    const r = buildPrompt({ intentKey: 'brand_led', data: full, product: PRODUCT, surface });
+  // Stories: drawCta true (2026-08-12). Budget 3 → SUBHEAD sacrificed, CTA kept.
+  {
+    const r = buildPrompt({ intentKey: 'brand_led', data: full, product: PRODUCT, surface: 'meta_stories_9_16' });
     const n = countEmittedStrings(r.prompt);
-    check(`E5 brand_led/${surface} emits 3 strings (CTA stripped)`, n, 3);
-    check(`E5 brand_led/${surface} count <= maxTextElements`,
-      n <= SURFACE_POLICY[surface].maxTextElements, true);
+    const textBlock = (r.prompt || '').split('SET EXACTLY THESE STRINGS')[1]?.split('Set no other words')[0] || '';
+    check('E5 brand_led/meta_stories_9_16 emits 3 strings (SUBHEAD sacrificed, CTA kept)', n, 3);
+    check('E5 brand_led/meta_stories_9_16 count <= maxTextElements',
+      n <= SURFACE_POLICY.meta_stories_9_16.maxTextElements, true);
+    truthy('E5 brand_led/meta_stories_9_16 CTA present', CTA_RE.test(textBlock));
+    falsy('E5 brand_led/meta_stories_9_16 SUBHEAD dropped', /subhead ->/i.test(textBlock));
+  }
+  // PMax: Phase B intent-aware suppress for brand_led. Emits 3 (CTA stripped).
+  {
+    const r = buildPrompt({ intentKey: 'brand_led', data: full, product: PRODUCT, surface: 'pmax_16_9' });
+    const n = countEmittedStrings(r.prompt);
+    check('E5 brand_led/pmax_16_9 emits 3 strings (CTA stripped)', n, 3);
+    check('E5 brand_led/pmax_16_9 count <= maxTextElements',
+      n <= SURFACE_POLICY.pmax_16_9.maxTextElements, true);
   }
 }
 

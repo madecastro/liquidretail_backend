@@ -337,8 +337,9 @@ function geometryBlock(s) {
       : `The platform covers the top ${s.platformReservePx.top}px and bottom ${s.platformReservePx.bottom}px of the frame with its own interface.`);
   }
   // Element-agnostic on purpose. Naming "the CTA" here asserted a CTA exists,
-  // which on Stories (platform supplies it) contradicted the absence list — the
-  // same empty-slot defect that produced a fabricated quote in v1.
+  // which contradicted the absence list on any surface that strips it (PMax
+  // non-conversion today; Stories historically) — the same empty-slot defect
+  // that produced a fabricated quote in v1.
   lines.push(`EVERY element you render other than the photograph itself must sit inside the box from ${s.box.left}% to ${s.box.right}% of width and ${s.box.top}% to ${s.box.bottom}% of height. The photograph should still fill the whole frame edge to edge.`);
   return lines.join(' ');
 }
@@ -375,12 +376,21 @@ function describeSurfaces() {
  *     meta_reels_9_16 as kinds:["video"] — Reels takes no static image here.
  *     v1 shipped a Reels block inside every static intent, which was wrong.
  *
- *  2. WHO SUPPLIES THE CTA. Where the ad unit provides its own link affordance,
- *     drawing a button into the pixels duplicates it and burns the reserved band.
+ *  2. WHO SUPPLIES THE CTA. PMax (flag on) suppresses a burned-in button for
+ *     non-conversion intents because Google draws its own. Meta Stories used
+ *     to do the same (link sticker / reply bar). That is now a measured
+ *     defect: run_1786555875841_2ddf9739 delivered Stories with no CTA
+ *     while 1:1 and 1.91:1 both painted "Shop the Cruiser". Diagnosis was
+ *     (a) never requested — SURFACE_POLICY.drawCta was false, so buildPrompt
+ *     stripped CTA BUTTON and absences forbade a button. The 9:16 safe box
+ *     is not the squeeze (usable height ~1334px vs 1:1's ~901px). drawCta
+ *     is therefore true on every live Meta static, including Stories. The
+ *     platform reserve still keeps copy out of the reply bar; it does not
+ *     replace the in-image button.
  *
  * CONFIDENCE, stated so it can be corrected rather than inherited:
  *   - reels video-only ....... from platformFormats.kinds (authoritative here)
- *   - stories link sticker ... owner-stated; bottom 250px is the reply bar
+ *   - stories in-image CTA ... owner-observed defect 2026-08-12; see above
  *   - pmax platform CTA ...... the platform draws its own CTA on most
  *     placements; the SURFACE_POLICY.drawCta:true values below are the
  *     Phase A / flag-off baseline. With PMAX_STATIC_PLATFORM_NOTES on,
@@ -400,8 +410,7 @@ const SURFACE_POLICY = {
   meta_feed_1_1:     { static: true,  drawCta: true,  maxTextElements: 4 },
   meta_feed_4_5:     { static: true,  drawCta: true,  maxTextElements: 4 },
   meta_reels_9_16:   { static: false, skipReason: 'kinds:["video"] — Reels takes no static image' },
-  meta_stories_9_16: { static: true,  drawCta: false, maxTextElements: 3,
-                       ctaNote: 'the platform supplies the link affordance' },
+  meta_stories_9_16: { static: true,  drawCta: true,  maxTextElements: 3 },
   pmax_16_9:         { static: true,  drawCta: true,  maxTextElements: 4 },
   // Phase A live PMax statics. drawCta:true is the SURFACE default and the
   // flag-off baseline; with PMAX_STATIC_PLATFORM_NOTES on, resolveDrawCta
@@ -491,15 +500,16 @@ function resolvePlatformNotes(surfaceKey, { preserve = false } = {}) {
 /**
  * Effective drawCta for a surface + resolved intent.
  *
- * Meta keeps SURFACE_POLICY.drawCta exactly — Stories already stamps false with
- * ctaNote 'the platform supplies the link affordance', and the absences /
- * density path keys on that boolean. Do not rewrite Meta.
+ * Meta keeps SURFACE_POLICY.drawCta exactly — every live Meta static
+ * (including Stories) stamps true. Do not rewrite Meta.
  *
  * PMax, flag ON only: the platform supplies the CTA affordance on most
- * placements, so a burned-in button is usually redundant — same reasoning as
- * meta_stories_9_16. Exception: conversion-flavoured creatives
- * (objection_resolved, what ai_promotional maps to) still want the in-image
- * CTA. Flag OFF restores the Phase A per-surface boolean (all pmax_* true).
+ * placements, so a burned-in button is usually redundant — same *mechanism*
+ * Stories used to use (strip before applyDensity + absence line). Stories
+ * itself now draws the button (2026-08-12 delivered-ad defect). Exception:
+ * conversion-flavoured creatives (objection_resolved, what ai_promotional
+ * maps to) still want the in-image CTA. Flag OFF restores the Phase A
+ * per-surface boolean (all pmax_* true).
  */
 function resolveDrawCta({ surfaceKey, policy, intentKey }) {
   if (!policy) return true;
@@ -706,8 +716,9 @@ const INTENTS = {
    *
    * Density already fits the maximum case: max 4 elements (BRAND LINE + SUBHEAD
    * + TRUST MARK + CTA); feed 1:1 / 4:5 and pmax budget 4 → fits; stories
-   * budget 3 with drawCta:false strips CTA before applyDensity → 3 → fits.
-   * Nothing is sacrificed in the maximum case.
+   * budget 3 sacrifices SUBHEAD (supporting copy, in SACRIFICE_ORDER) and
+   * keeps CTA — 3 → fits. CTA is not in SACRIFICE_ORDER, so a Stories surface
+   * cannot drop the button to make room for a subhead.
    */
   brand_led: {
     priority: 3.5,
@@ -1200,11 +1211,11 @@ function buildPrompt({ intentKey, data, product, surface, seedStyle = null, vari
   const s = computeSurface(surface);
 
   /**
-   * Zero surviving text is legitimate — Stories with no proof data and a
-   * platform-supplied link is just a product image. But emitting the "SET
-   * EXACTLY THIS TEXT" heading above an empty list recreates the v1 defect
-   * exactly: an instruction pointing at a slot with nothing in it. State the
-   * absence of text as a positive instruction instead.
+   * Zero surviving text is legitimate — a surface that strips CTA (PMax
+   * non-conversion) with no proof data is just a product image. But emitting
+   * the "SET EXACTLY THIS TEXT" heading above an empty list recreates the v1
+   * defect exactly: an instruction pointing at a slot with nothing in it.
+   * State the absence of text as a positive instruction instead.
    */
   /**
    * The role name goes BEFORE an arrow and is declared non-printing, because
