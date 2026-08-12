@@ -150,6 +150,23 @@ const PMAX_VIDEO_DERIVE_SOURCE = 'pmax_video_9_16';
 // PMax floor per Google spec (Omni ceiling is also 10s). Meta default
 // stays provider-default (8s via Omni caps) — 8→10 Meta ships separately.
 const GOOGLE_PMAX_VIDEO_DURATION_SEC = 10;
+
+// ── Meta free derivation ────────────────────────────────────────────────
+// The Meta pipeline is ONE billable 9:16 Omni submit plus free crops of it.
+// This is the source master and the surfaces derived from it.
+//
+// Every entry must be a shape a 9:16 frame can actually yield:
+//   meta_feed_1_1   1:1  — square window inside portrait
+//   meta_feed_4_5   4:5  — taller window inside portrait
+//   meta_reels_9_16 9:16 — same aspect, so the crop is a full-frame no-op
+//                          and only the TITLING differs (Reels reserves 204px
+//                          against Stories' 250) — a retitle, exactly like the
+//                          PMax funnel variants.
+// The master itself is deliberately absent: it is queued as the billable ad.
+// Adding a wider-than-portrait surface here would be cropping up, which the
+// crop service cannot honestly do.
+const META_VIDEO_DERIVE_SOURCE = 'meta_stories_9_16';
+const META_VIDEO_DERIVATIVES = ['meta_feed_1_1', 'meta_feed_4_5', 'meta_reels_9_16'];
 // Meta's default clip length, owner decision 2026-08-11 (was the provider
 // default of 8s). See resolveVideoDurationForFormat for why this is NOT a
 // re-mint and how to revert it without a deploy.
@@ -936,6 +953,46 @@ async function expandWizardJob({
           excludePairings
         }));
       }
+      // ── META free derivatives off the paid 9:16 master ───────────────
+      // The Meta pipeline has always been specified as ONE billable 9:16
+      // submit plus free crops of it (CLAUDE.md §00; META_VIDEO_FANOUT's own
+      // comment). Only the master was ever queued — the fan-out was left as
+      // "Phase 3 intent" because there was no free-derivation path. PMax
+      // built that path, and it is platform-agnostic: resolveDeriveFromMaster
+      // honours ANY explicit deriveFromMaster, and basePlateCropService's
+      // TARGET_BY_FORMAT already covers square (1:1) and feed (4:5). So this
+      // is the intent finally wired up, not a new capability.
+      //
+      // ⚠️ ZERO Omni submits. Every ad below carries deriveFromMaster, which
+      // routes it through renderDeriveOnlyVideoAd. Dropping that field turns
+      // three free crops into three ~$0.90 charges per product.
+      //
+      // ⚠️ ONLY from the 9:16 master. A 4:5 or 1:1 window fits inside a
+      // portrait frame, so those crops are honest; deriving them from, say, a
+      // 1:1 master would be cropping up. If the operator hand-picked a single
+      // non-9:16 Meta surface in Advanced, that stays exactly as it was —
+      // one ad, its own aspect, no derivatives.
+      const metaDeriveSource = masterFormats.find((f) => f === META_VIDEO_DERIVE_SOURCE);
+      if (metaDeriveSource) {
+        for (const fmt of META_VIDEO_DERIVATIVES) {
+          detParts.push(await expandDeterministicVideo({
+            campaignId, brandId, campaignKind, productIds,
+            seedMediaIds,
+            seedPicks,
+            ctaText, ctaUrl, ctaUrlParams,
+            platformFormat: fmt,
+            videoDurationSec: resolveVideoDurationForFormat(fmt, videoDurationSec),
+            videoPromptGuidance, videoPromptRaw,
+            excludePairings,
+            // The whole reason this is free. meta_reels_9_16 is the same
+            // aspect as its source, so its crop is a no-op skip and only the
+            // titling differs — Reels reserves 204px where Stories reserves
+            // 250 — which is exactly the PMax funnel-variant shape.
+            deriveFromMaster: metaDeriveSource
+          }));
+        }
+      }
+
       if (googleRun) {
         // WHY this is NOT billable: pmax_video_1_1 is face-safe crop +
         // Remotion retitle of the paid 9:16 master. Hidden Omni submit
@@ -1073,7 +1130,8 @@ async function expandWizardJob({
 
   // Dry-run estimate for deterministic + concept paths (no Director LLM).
   // Deterministic:
-  //   Meta  → 1 video ad/product (master only)
+  //   Meta  → 9:16 master + 3 free derivatives (1:1, 4:5, Reels retitle)
+  //           = 4 ads/product, of which 1 is a billable Omni submit
   //   Google → masters (2) + derive-only 1:1 (1) = 3 ads/product
   //            of which 2 are billable Omni submits
   // Director: VEO_ADS_PER_PRODUCT_CAP when on.
@@ -1098,9 +1156,16 @@ async function expandWizardJob({
       ? detVideoMasterFormats
       : [videoPlatformFormat].filter((f) => f && f !== PMAX_VIDEO_DERIVE_ONLY);
     const dryGoogle = isGoogleVideoMasterRun(dryMasterFormats);
+    // Meta's free derivatives ride along whenever its 9:16 master is queued —
+    // same condition the live path uses. Omitting them here would under-report
+    // delivery by three ads per product, which reads to the operator as "Meta
+    // gives you one video" and is the very gap this change closes.
+    const dryMetaDerives = dryMasterFormats.includes(META_VIDEO_DERIVE_SOURCE)
+      ? META_VIDEO_DERIVATIVES.length
+      : 0;
     // base: masters + (1 derive-only 1:1 when Google)
     // variants ON: + 3 per master + 3 for the 1:1 = +3*(masters+1)
-    let dryDetPerProduct = dryMasterFormats.length + (dryGoogle ? 1 : 0);
+    let dryDetPerProduct = dryMasterFormats.length + (dryGoogle ? 1 : 0) + dryMetaDerives;
     // Funnel variants are counted against the GOOGLE masters only, mirroring
     // the live mint's `funnelMasters` filter. On a mixed Meta+PMax run
     // `dryMasterFormats.length` includes the Meta master, and using it here
