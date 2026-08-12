@@ -76,6 +76,7 @@ const {
   computeRequestFingerprint, renderClaimFingerprint,
   buildUnclaimedNotice
 } = require('../services/generationGate');
+const { buildTerminalDoneFilter } = require('../services/campaignRunGuards');
 
 // Operator-facing gate for a multi-select format list (preset 'explicit'),
 // shared by /preview + /generate.
@@ -1544,8 +1545,15 @@ async function runRenderLoop(run, job, adIds, renderToken) {
     );
   }
 
+  // Status-guarded. The reaper (worker.js reapOrphans) flips a silent
+  // running run to 'failed' after REAP_STALE_MIN. Without a status
+  // predicate this write races that update and resurrects a reaped run
+  // as 'done'. Allow-list is the in-flight CampaignRun statuses
+  // (preparing, running) — the enum has no 'cancelled' (operator stop
+  // is OperationRun.status='cancelled' via progressService; this
+  // collection still lands on 'done').
   await CampaignRun.updateOne(
-    { _id: run._id },
+    buildTerminalDoneFilter(run._id),
     { status: 'done', completedAt: new Date() }
   );
   const totalMs = Date.now() - t0;

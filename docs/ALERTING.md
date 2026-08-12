@@ -181,7 +181,8 @@ Non-secret, all in `config/defaults.env`, all overridable per-service:
 | `ALERT_RATE_LIMIT_MAX` | `20` | Hard ceiling per minute, independent of dedupe |
 | `ALERT_WATCHDOG_INTERVAL_MIN` | `5` | Health-sweep cadence |
 | `ALERT_RENDERING_STALE_MIN` | `12` | **Keep below `REAP_STALE_MIN` (15)** |
-| `ALERT_RUN_STALE_MIN` | `45` | A 20-ad video batch legitimately runs a long time |
+| `ALERT_RUN_STALE_MIN` | `45` | AGE noise filter only — a 20-ad video batch legitimately runs a long time |
+| `ALERT_RUN_SILENCE_MIN` | `12` | SILENCE trigger. **Keep strictly below `REAP_STALE_MIN` (15)** — at/above 15 the reaper empties the set |
 | `ALERT_DETECT_BACKLOG_COUNT` / `_MIN` | `25` / `20` | Both must trip |
 | `ALERT_HOURLY_SPEND_USD` | `25` | See spend note below |
 | `ALERT_EXIT_FLUSH_MS` | `2500` | Bounded window to deliver one message before exit (code default; not in `defaults.env`) |
