@@ -31,22 +31,31 @@ const { extractBreadcrumb } = require('../services/breadcrumbParser');
 
 let passed = 0;
 let failed = 0;
+const queue = [];
 
+// Enqueue only — run sequentially in main() so async check bodies can
+// await mapJsonLdProduct / mapOgProduct without racing the summary.
 function check(name, fn) {
-  try {
-    fn();
-    passed += 1;
-    console.log(`✓ ${name}`);
-  } catch (err) {
-    failed += 1;
-    const msg = err && err.message ? err.message : String(err);
-    console.log(`✗ ${name}: ${msg}`);
+  queue.push([name, fn]);
+}
+
+async function runQueue() {
+  for (const [name, fn] of queue) {
+    try {
+      await fn();
+      passed += 1;
+      console.log(`✓ ${name}`);
+    } catch (err) {
+      failed += 1;
+      const msg = err && err.message ? err.message : String(err);
+      console.log(`✗ ${name}: ${msg}`);
+    }
   }
 }
 
 // ── parseRobotsForSitemaps ─────────────────────────────────────────
 
-check('parseRobotsForSitemaps: multiple Sitemap lines in order', () => {
+check('parseRobotsForSitemaps: multiple Sitemap lines in order', async () => {
   const text = [
     'User-agent: *',
     'Disallow: /cart',
@@ -62,7 +71,7 @@ check('parseRobotsForSitemaps: multiple Sitemap lines in order', () => {
   ]);
 });
 
-check('parseRobotsForSitemaps: Crawl-delay under matching UA block', () => {
+check('parseRobotsForSitemaps: Crawl-delay under matching UA block', async () => {
   const text = [
     'User-agent: Googlebot',
     'Crawl-delay: 10',
@@ -79,20 +88,20 @@ check('parseRobotsForSitemaps: Crawl-delay under matching UA block', () => {
   assert.equal(specific.crawlDelayMs, 10000);
 });
 
-check('parseRobotsForSitemaps: no Sitemap lines → empty', () => {
+check('parseRobotsForSitemaps: no Sitemap lines → empty', async () => {
   const r = parseRobotsForSitemaps('User-agent: *\nDisallow: /');
   assert.deepEqual(r.sitemaps, []);
   assert.equal(r.crawlDelayMs, 0);
 });
 
-check('parseRobotsForSitemaps: null/empty text → empty', () => {
+check('parseRobotsForSitemaps: null/empty text → empty', async () => {
   assert.deepEqual(parseRobotsForSitemaps(null).sitemaps, []);
   assert.deepEqual(parseRobotsForSitemaps('').sitemaps, []);
 });
 
 // ── parseSitemapXml ────────────────────────────────────────────────
 
-check('parseSitemapXml: <sitemapindex> → type index', () => {
+check('parseSitemapXml: <sitemapindex> → type index', async () => {
   const xml = `<?xml version="1.0"?>
     <sitemapindex xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
       <sitemap>
@@ -111,7 +120,7 @@ check('parseSitemapXml: <sitemapindex> → type index', () => {
   assert.equal(r.entries[1].lastmod, null);
 });
 
-check('parseSitemapXml: <urlset> → type urlset with loc+lastmod', () => {
+check('parseSitemapXml: <urlset> → type urlset with loc+lastmod', async () => {
   const xml = `<?xml version="1.0"?>
     <urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
       <url>
@@ -130,7 +139,7 @@ check('parseSitemapXml: <urlset> → type urlset with loc+lastmod', () => {
   assert.equal(r.entries[0].lastmod, '2024-06-01T12:00:00Z');
 });
 
-check('parseSitemapXml: malformed/empty → empty urlset, no throw', () => {
+check('parseSitemapXml: malformed/empty → empty urlset, no throw', async () => {
   assert.deepEqual(parseSitemapXml(null), { type: 'urlset', entries: [] });
   assert.deepEqual(parseSitemapXml(''), { type: 'urlset', entries: [] });
   assert.deepEqual(parseSitemapXml('not xml at all'), { type: 'urlset', entries: [] });
@@ -139,8 +148,8 @@ check('parseSitemapXml: malformed/empty → empty urlset, no throw', () => {
 
 // ── mapJsonLdProduct: MONEY + offers shapes ────────────────────────
 
-check('mapJsonLdProduct: price stays MAJOR units ("1499.00"→1499)', () => {
-  const p = mapJsonLdProduct({
+check('mapJsonLdProduct: price stays MAJOR units ("1499.00"→1499)', async () => {
+  const p = await mapJsonLdProduct({
     '@type': 'Product',
     name: 'Sectional Sofa',
     sku: 'SOFA-1',
@@ -154,14 +163,14 @@ check('mapJsonLdProduct: price stays MAJOR units ("1499.00"→1499)', () => {
   assert.equal(p.availability, 'in stock');
 });
 
-check('mapJsonLdProduct: offers single vs array vs AggregateOffer.lowPrice', () => {
-  const single = mapJsonLdProduct({
+check('mapJsonLdProduct: offers single vs array vs AggregateOffer.lowPrice', async () => {
+  const single = await mapJsonLdProduct({
     '@type': 'Product', sku: 'A', name: 'A',
     offers: { '@type': 'Offer', price: '10.00', priceCurrency: 'USD' }
   }, 'https://ex.com/a');
   assert.equal(single.price, 10);
 
-  const arr = mapJsonLdProduct({
+  const arr = await mapJsonLdProduct({
     '@type': 'Product', sku: 'B', name: 'B',
     offers: [
       { '@type': 'Offer', price: '30.00', priceCurrency: 'USD' },
@@ -171,15 +180,15 @@ check('mapJsonLdProduct: offers single vs array vs AggregateOffer.lowPrice', () 
   // min price when multiple Offers
   assert.equal(arr.price, 20);
 
-  const agg = mapJsonLdProduct({
+  const agg = await mapJsonLdProduct({
     '@type': 'Product', sku: 'C', name: 'C',
     offers: { '@type': 'AggregateOffer', lowPrice: '99.50', highPrice: '150', priceCurrency: 'USD' }
   }, 'https://ex.com/c');
   assert.equal(agg.price, 99.5);
 });
 
-check('mapJsonLdProduct: image string vs array; protocol-relative absolutized', () => {
-  const one = mapJsonLdProduct({
+check('mapJsonLdProduct: image string vs array; protocol-relative absolutized', async () => {
+  const one = await mapJsonLdProduct({
     '@type': 'Product', sku: 'IMG1', name: 'Img',
     image: '//cdn.example.com/a.jpg',
     offers: { price: '1.00', priceCurrency: 'USD' }
@@ -187,7 +196,7 @@ check('mapJsonLdProduct: image string vs array; protocol-relative absolutized', 
   assert.equal(one.imageUrl, 'https://cdn.example.com/a.jpg');
   assert.deepEqual(one.additionalImages, []);
 
-  const many = mapJsonLdProduct({
+  const many = await mapJsonLdProduct({
     '@type': 'Product', sku: 'IMG2', name: 'Img2',
     image: [
       'https://cdn.example.com/1.jpg',
@@ -207,39 +216,39 @@ check('mapJsonLdProduct: image string vs array; protocol-relative absolutized', 
   assert.equal(many.additionalImages[4], 'https://cdn.example.com/6.jpg');
 });
 
-check('mapJsonLdProduct: availability URL variants', () => {
-  const inStock = mapJsonLdProduct({
+check('mapJsonLdProduct: availability URL variants', async () => {
+  const inStock = await mapJsonLdProduct({
     '@type': 'Product', sku: 'S1', name: 'S',
     offers: { availability: 'http://schema.org/InStock', price: '5' }
   }, 'https://ex.com/s1');
   assert.equal(inStock.availability, 'in stock');
 
-  const pre = mapJsonLdProduct({
+  const pre = await mapJsonLdProduct({
     '@type': 'Product', sku: 'S2', name: 'S',
     offers: { availability: 'https://schema.org/PreOrder', price: '5' }
   }, 'https://ex.com/s2');
   assert.equal(pre.availability, 'in stock');
 
-  const out = mapJsonLdProduct({
+  const out = await mapJsonLdProduct({
     '@type': 'Product', sku: 'S3', name: 'S',
     offers: { availability: 'https://schema.org/OutOfStock', price: '5' }
   }, 'https://ex.com/s3');
   assert.equal(out.availability, 'out of stock');
 
-  const sold = mapJsonLdProduct({
+  const sold = await mapJsonLdProduct({
     '@type': 'Product', sku: 'S4', name: 'S',
     offers: { availability: 'https://schema.org/SoldOut', price: '5' }
   }, 'https://ex.com/s4');
   assert.equal(sold.availability, 'out of stock');
 });
 
-check('mapJsonLdProduct: missing sku → deterministic id from /pdp-x-123 and /p123', () => {
-  const a = mapJsonLdProduct({
+check('mapJsonLdProduct: missing sku → deterministic id from /pdp-x-123 and /p123', async () => {
+  const a = await mapJsonLdProduct({
     '@type': 'Product', name: 'Chair',
     offers: { price: '100', priceCurrency: 'USD' },
     image: 'https://cdn.example.com/c.jpg'
   }, 'https://shop.example.com/furniture/pdp-x-123');
-  const b = mapJsonLdProduct({
+  const b = await mapJsonLdProduct({
     '@type': 'Product', name: 'Chair',
     offers: { price: '100', priceCurrency: 'USD' },
     image: 'https://cdn.example.com/c.jpg'
@@ -250,15 +259,15 @@ check('mapJsonLdProduct: missing sku → deterministic id from /pdp-x-123 and /p
   assert.equal(a.externalId, b.externalId);
 });
 
-check('mapJsonLdProduct: brand object vs string', () => {
-  const obj = mapJsonLdProduct({
+check('mapJsonLdProduct: brand object vs string', async () => {
+  const obj = await mapJsonLdProduct({
     '@type': 'Product', sku: 'BR1', name: 'X',
     brand: { '@type': 'Brand', name: 'Acme Home' },
     offers: { price: '9' }
   }, 'https://ex.com/br1');
   assert.equal(obj.brand, 'Acme Home');
 
-  const str = mapJsonLdProduct({
+  const str = await mapJsonLdProduct({
     '@type': 'Product', sku: 'BR2', name: 'Y',
     brand: 'Plain Brand',
     offers: { price: '9' }
@@ -266,21 +275,21 @@ check('mapJsonLdProduct: brand object vs string', () => {
   assert.equal(str.brand, 'Plain Brand');
 });
 
-check('mapJsonLdProduct: two nodes same sku → same externalId', () => {
-  const n1 = mapJsonLdProduct({ '@type': 'Product', sku: 'DUP-9', name: 'One', offers: { price: '1' } }, 'https://ex.com/a');
-  const n2 = mapJsonLdProduct({ '@type': 'Product', sku: 'DUP-9', name: 'Two', offers: { price: '2' } }, 'https://ex.com/b');
+check('mapJsonLdProduct: two nodes same sku → same externalId', async () => {
+  const n1 = await mapJsonLdProduct({ '@type': 'Product', sku: 'DUP-9', name: 'One', offers: { price: '1' } }, 'https://ex.com/a');
+  const n2 = await mapJsonLdProduct({ '@type': 'Product', sku: 'DUP-9', name: 'Two', offers: { price: '2' } }, 'https://ex.com/b');
   assert.equal(n1.externalId, n2.externalId);
   assert.equal(n1.externalId, 'DUP-9');
 });
 
-check('extractNumericIdFromUrl: pdp-x and pN collapse', () => {
+check('extractNumericIdFromUrl: pdp-x and pN collapse', async () => {
   assert.equal(extractNumericIdFromUrl('https://ex.com/pdp-x-45678'), '45678');
   assert.equal(extractNumericIdFromUrl('https://ex.com/path/p45678'), '45678');
 });
 
 // ── validateProduct ────────────────────────────────────────────────
 
-check('validateProduct: valid full product', () => {
+check('validateProduct: valid full product', async () => {
   const v = validateProduct({
     externalId: '1',
     title: 'Sofa',
@@ -291,13 +300,13 @@ check('validateProduct: valid full product', () => {
   assert.deepEqual(v.missing, []);
 });
 
-check('validateProduct: missing title → invalid + [title]', () => {
+check('validateProduct: missing title → invalid + [title]', async () => {
   const v = validateProduct({ externalId: '1', title: '', price: 10 });
   assert.equal(v.valid, false);
   assert.ok(v.missing.includes('title'));
 });
 
-check('validateProduct: title+image, no price → valid', () => {
+check('validateProduct: title+image, no price → valid', async () => {
   const v = validateProduct({
     externalId: '1',
     title: 'Lamp',
@@ -306,13 +315,13 @@ check('validateProduct: title+image, no price → valid', () => {
   assert.equal(v.valid, true);
 });
 
-check('validateProduct: missing externalId → invalid', () => {
+check('validateProduct: missing externalId → invalid', async () => {
   const v = validateProduct({ title: 'X', price: 5 });
   assert.equal(v.valid, false);
   assert.ok(v.missing.includes('externalId'));
 });
 
-check('validateProduct: title only (no price, no image) → invalid', () => {
+check('validateProduct: title only (no price, no image) → invalid', async () => {
   const v = validateProduct({ externalId: '1', title: 'Only title' });
   assert.equal(v.valid, false);
   assert.ok(v.missing.includes('price') || v.missing.includes('imageUrl'));
@@ -320,7 +329,7 @@ check('validateProduct: title only (no price, no image) → invalid', () => {
 
 // ── extractJsonLdProducts ──────────────────────────────────────────
 
-check('extractJsonLdProducts: two blocks, @graph, non-Product filtered', () => {
+check('extractJsonLdProducts: two blocks, @graph, non-Product filtered', async () => {
   const html = `
     <html><head>
     <script type="application/ld+json">
@@ -345,7 +354,7 @@ check('extractJsonLdProducts: two blocks, @graph, non-Product filtered', () => {
   assert.deepEqual(names, ['Direct Chair', 'Graph Sofa']);
 });
 
-check('extractJsonLdProducts: trailing comma still parsed', () => {
+check('extractJsonLdProducts: trailing comma still parsed', async () => {
   const html = `
     <script type="application/ld+json">
     {
@@ -368,8 +377,8 @@ check('extractJsonLdProducts: trailing comma still parsed', () => {
 // `74&quot;` and JSON.parse keeps it verbatim. Every human-readable field
 // must come out decoded. Real Living Spaces markup below.
 
-check('mapJsonLdProduct: &quot; in name → real inch mark in title', () => {
-  const p = mapJsonLdProduct({
+check('mapJsonLdProduct: &quot; in name → real inch mark in title', async () => {
+  const p = await mapJsonLdProduct({
     '@type': 'Product',
     name: 'Austen Black 74&quot; Wide Wood TV Stand | Doors | Shelves',
     sku: '318153',
@@ -378,8 +387,8 @@ check('mapJsonLdProduct: &quot; in name → real inch mark in title', () => {
   assert.equal(p.title, 'Austen Black 74" Wide Wood TV Stand | Doors | Shelves');
 });
 
-check('mapJsonLdProduct: &amp; / &#x2B; / &#x201D; in name decoded', () => {
-  const p = mapJsonLdProduct({
+check('mapJsonLdProduct: &amp; / &#x2B; / &#x201D; in name decoded', async () => {
+  const p = await mapJsonLdProduct({
     '@type': 'Product',
     name: 'Paulina Black &amp; Grey 71&quot; Stand By Berkus &#x2B; Brent 100&#x201D;',
     sku: '341970',
@@ -388,8 +397,8 @@ check('mapJsonLdProduct: &amp; / &#x2B; / &#x201D; in name decoded', () => {
   assert.equal(p.title, 'Paulina Black & Grey 71" Stand By Berkus + Brent 100”');
 });
 
-check('mapJsonLdProduct: brand + category + review text decoded', () => {
-  const p = mapJsonLdProduct({
+check('mapJsonLdProduct: brand + category + review text decoded', async () => {
+  const p = await mapJsonLdProduct({
     '@type': 'Product',
     name: 'Chair',
     sku: 'C-1',
@@ -408,18 +417,18 @@ check('mapJsonLdProduct: brand + category + review text decoded', () => {
   assert.equal(p.productReviews.quotes[0].author, 'Dana + Sam');
 });
 
-check('mapJsonLdProduct: description shipped as ESCAPED markup → plain text', () => {
+check('mapJsonLdProduct: description shipped as ESCAPED markup → plain text', async () => {
   // Living Spaces puts "&lt;div&gt;Introducing the Austen Black 74&quot; …"
   // in Product.description. Tags only become strippable after decoding.
-  const p = mapJsonLdProduct({
+  const p = await mapJsonLdProduct({
     '@type': 'Product', name: 'Austen', sku: 'A-1', offers: { price: '750' },
     description: '&lt;div&gt;Austen Black 74&quot; TV Stand.&lt;/div&gt;&#xA;&lt;ul&gt;&lt;li&gt;74&quot; wide&lt;/li&gt;&lt;/ul&gt;'
   }, 'https://ex.com/a1');
   assert.equal(p.description, 'Austen Black 74" TV Stand. 74" wide');
 });
 
-check('mapJsonLdProduct: unescaped JSON name is untouched (no double-decode)', () => {
-  const p = mapJsonLdProduct({
+check('mapJsonLdProduct: unescaped JSON name is untouched (no double-decode)', async () => {
+  const p = await mapJsonLdProduct({
     '@type': 'Product', name: 'Cover for 33" Grill &amp; Cart', sku: 'G-1',
     offers: { price: '10' }
   }, 'https://ex.com/g1');
@@ -428,17 +437,17 @@ check('mapJsonLdProduct: unescaped JSON name is untouched (no double-decode)', (
   assert.equal(p.title, 'Cover for 33" Grill & Cart');
 });
 
-check('mapOgProduct: og:title entities decoded', () => {
+check('mapOgProduct: og:title entities decoded', async () => {
   const html = `
     <meta property="og:title" content="Kabria Cocoa 96&quot; Fireplace TV Stand &amp; Piers" />
     <meta property="og:url" content="https://shop.example.com/pdp/p4242" />
     <meta property="og:image" content="https://cdn.example.com/og.jpg" />
   `;
-  const p = mapOgProduct(html, 'https://shop.example.com/pdp/p4242');
+  const p = await mapOgProduct(html, 'https://shop.example.com/pdp/p4242');
   assert.equal(p.title, 'Kabria Cocoa 96" Fireplace TV Stand & Piers');
 });
 
-check('mapOgProduct: apostrophe inside a double-quoted content is NOT truncated', () => {
+check('mapOgProduct: apostrophe inside a double-quoted content is NOT truncated', async () => {
   // The old `["']([^"']+)["']` pattern stopped at the inner apostrophe and
   // returned "Nate" — the whole title after it was silently dropped.
   const html = `
@@ -446,42 +455,42 @@ check('mapOgProduct: apostrophe inside a double-quoted content is NOT truncated'
     <meta property="og:url" content="https://shop.example.com/pdp/p777" />
     <meta property="og:image" content="https://cdn.example.com/a.jpg" />
   `;
-  const p = mapOgProduct(html, 'https://shop.example.com/pdp/p777');
+  const p = await mapOgProduct(html, 'https://shop.example.com/pdp/p777');
   assert.equal(p.title, 'Nate\'s 33" Round Drink Table');
 });
 
-check('mapOgProduct: single-quoted content attribute holding a double quote', () => {
+check('mapOgProduct: single-quoted content attribute holding a double quote', async () => {
   const html = `
     <meta property='og:title' content='36" Bar Stool' />
     <meta property='og:url' content='https://shop.example.com/pdp/p888' />
     <meta property='og:image' content='https://cdn.example.com/b.jpg' />
   `;
-  const p = mapOgProduct(html, 'https://shop.example.com/pdp/p888');
+  const p = await mapOgProduct(html, 'https://shop.example.com/pdp/p888');
   assert.equal(p.title, '36" Bar Stool');
 });
 
-check('mapOgProduct: content-before-property attribute order still matches', () => {
+check('mapOgProduct: content-before-property attribute order still matches', async () => {
   const html = `
     <meta content="Reversed Order Sofa" property="og:title">
     <meta content="https://shop.example.com/pdp/p555" property="og:url">
     <meta content="https://cdn.example.com/c.jpg" property="og:image">
   `;
-  const p = mapOgProduct(html, 'https://shop.example.com/pdp/p555');
+  const p = await mapOgProduct(html, 'https://shop.example.com/pdp/p555');
   assert.equal(p.title, 'Reversed Order Sofa');
   assert.equal(p.externalId, '555');
 });
 
-check('mapOgProduct: name= (not property=) meta is accepted', () => {
+check('mapOgProduct: name= (not property=) meta is accepted', async () => {
   const html = `
     <meta name="og:title" content="Name Attr Sofa">
     <meta name="og:url" content="https://shop.example.com/pdp/p556">
     <meta name="og:image" content="https://cdn.example.com/d.jpg">
   `;
-  const p = mapOgProduct(html, 'https://shop.example.com/pdp/p556');
+  const p = await mapOgProduct(html, 'https://shop.example.com/pdp/p556');
   assert.equal(p.title, 'Name Attr Sofa');
 });
 
-check('breadcrumb: entity-encoded names and separators decoded', () => {
+check('breadcrumb: entity-encoded names and separators decoded', async () => {
   const list = `<script type="application/ld+json">${JSON.stringify({
     '@type': 'BreadcrumbList',
     itemListElement: [
@@ -500,12 +509,12 @@ check('breadcrumb: entity-encoded names and separators decoded', () => {
   assert.deepEqual(extractBreadcrumb(cat).breadcrumb, ['Furniture', 'Living Room', 'Sofas']);
 });
 
-check('extractProductIdFromHtml: value with an apostrophe-bearing sibling attr', () => {
+check('extractProductIdFromHtml: value with an apostrophe-bearing sibling attr', async () => {
   const html = '<meta itemprop="productID" content="108724" data-note="Nate\'s pick" />';
   assert.equal(extractProductIdFromHtml(html), '108724');
 });
 
-check('mapOgProduct: og tags → partial product', () => {
+check('mapOgProduct: og tags → partial product', async () => {
   const html = `
     <meta property="og:title" content="OG Sofa" />
     <meta property="og:image" content="https://cdn.example.com/og.jpg" />
@@ -513,7 +522,7 @@ check('mapOgProduct: og tags → partial product', () => {
     <meta property="product:price:amount" content="249.00" />
     <meta property="product:price:currency" content="USD" />
   `;
-  const p = mapOgProduct(html, 'https://shop.example.com/pdp/p999');
+  const p = await mapOgProduct(html, 'https://shop.example.com/pdp/p999');
   assert.ok(p);
   assert.equal(p.title, 'OG Sofa');
   assert.equal(p.price, 249);
@@ -524,102 +533,103 @@ check('mapOgProduct: og tags → partial product', () => {
 
 // ── slug detection + on-page id recovery (URL id isn't always clean) ──
 
-check('looksLikeSlug: pure numeric id → not a slug', () => {
+check('looksLikeSlug: pure numeric id → not a slug', async () => {
   assert.equal(looksLikeSlug('108724'), false);
 });
-check('looksLikeSlug: compact alphanumeric SKU → not a slug', () => {
+check('looksLikeSlug: compact alphanumeric SKU → not a slug', async () => {
   assert.equal(looksLikeSlug('WC-108724'), false);
   assert.equal(looksLikeSlug('SKU12345'), false);
 });
-check('looksLikeSlug: multi-word name → slug', () => {
+check('looksLikeSlug: multi-word name → slug', async () => {
   assert.equal(looksLikeSlug('willow-creek-ii-dresser'), true);
   assert.equal(looksLikeSlug('blue mid century modern sofa'), true);
 });
-check('looksLikeSlug: two-word compact → not a slug (threshold 3)', () => {
+check('looksLikeSlug: two-word compact → not a slug (threshold 3)', async () => {
   assert.equal(looksLikeSlug('blue-shirt'), false);
 });
-check('looksLikeSlug: null/empty → false', () => {
+check('looksLikeSlug: null/empty → false', async () => {
   assert.equal(looksLikeSlug(null), false);
   assert.equal(looksLikeSlug(''), false);
 });
 
-check('extractProductIdFromHtml: meta itemprop=productID', () => {
+check('extractProductIdFromHtml: meta itemprop=productID', async () => {
   const html = '<meta itemprop="productID" content="108724" />';
   assert.equal(extractProductIdFromHtml(html), '108724');
 });
-check('extractProductIdFromHtml: scoped to meta itemprop=productID only (no inline JSON/data-*)', () => {
+check('extractProductIdFromHtml: scoped to meta itemprop=productID only (no inline JSON/data-*)', async () => {
   // Broad inline-JSON / data-* scanning was removed (could grab a related
   // product's id). Only the canonical main-product meta is trusted.
   assert.equal(extractProductIdFromHtml('window.__P = {"productId":"778812"};'), null);
   assert.equal(extractProductIdFromHtml('<div data-product-id="SKU-5599">x</div>'), null);
 });
-check('extractProductIdFromHtml: nothing usable → null', () => {
+check('extractProductIdFromHtml: nothing usable → null', async () => {
   assert.equal(extractProductIdFromHtml('<html><body>no ids</body></html>'), null);
 });
 
 // ── FEED ID: externalId = Shopify/GMC feed `id` (sku→productID→offers.sku),
 //    NEVER mpn/gtin (those repeat across variants → would merge products) ──
-check('feed id: sku is authoritative — used even when slug-y (it IS the feed id)', () => {
+check('feed id: sku is authoritative — used even when slug-y (it IS the feed id)', async () => {
   const node = {
     '@type': 'Product', name: 'Willow Creek II Dresser',
     sku: 'willow-creek-ii-dresser', mpn: '108724', gtin13: '0885308312345',
     offers: { price: '499.00', priceCurrency: 'USD' }, image: 'https://cdn.example.com/a.jpg'
   };
-  const p = mapJsonLdProduct(node, 'https://s.com/pdp-willow-creek-ii-dresser-108724');
+  const p = await mapJsonLdProduct(node, 'https://s.com/pdp-willow-creek-ii-dresser-108724');
   assert.equal(p.externalId, 'willow-creek-ii-dresser'); // sku, NOT mpn/gtin/url
   assert.equal(p.mpn, '108724');                          // mpn stored as its own field
 });
-check('feed id: shared mpn/gtin across two variants does NOT collide (distinct skus win)', () => {
-  const oak = mapJsonLdProduct({ '@type': 'Product', name: 'Dresser Oak', sku: 'wc-oak', mpn: '108724', gtin: '0885308312345', offers: { price: '1' }, image: 'x' }, 'https://s.com/p1');
-  const wal = mapJsonLdProduct({ '@type': 'Product', name: 'Dresser Walnut', sku: 'wc-walnut', mpn: '108724', gtin: '0885308312345', offers: { price: '1' }, image: 'x' }, 'https://s.com/p2');
+check('feed id: shared mpn/gtin across two variants does NOT collide (distinct skus win)', async () => {
+  const oak = await mapJsonLdProduct({ '@type': 'Product', name: 'Dresser Oak', sku: 'wc-oak', mpn: '108724', gtin: '0885308312345', offers: { price: '1' }, image: 'x' }, 'https://s.com/p1');
+  const wal = await mapJsonLdProduct({ '@type': 'Product', name: 'Dresser Walnut', sku: 'wc-walnut', mpn: '108724', gtin: '0885308312345', offers: { price: '1' }, image: 'x' }, 'https://s.com/p2');
   assert.notEqual(oak.externalId, wal.externalId);  // no merge
 });
-check('feed id: falls back to productID then offers.sku when no sku', () => {
-  assert.equal(mapJsonLdProduct({ '@type': 'Product', name: 'X', productID: 'PID-9', offers: { price: '1' }, image: 'x' }, 'https://s.com/x').externalId, 'PID-9');
-  assert.equal(mapJsonLdProduct({ '@type': 'Product', name: 'X', offers: { sku: 'OFF-7', price: '1' }, image: 'x' }, 'https://s.com/x').externalId, 'OFF-7');
+check('feed id: falls back to productID then offers.sku when no sku', async () => {
+  // Parens required: `await f().prop` is `(await f().prop)`, not `(await f()).prop`.
+  assert.equal((await mapJsonLdProduct({ '@type': 'Product', name: 'X', productID: 'PID-9', offers: { price: '1' }, image: 'x' }, 'https://s.com/x')).externalId, 'PID-9');
+  assert.equal((await mapJsonLdProduct({ '@type': 'Product', name: 'X', offers: { sku: 'OFF-7', price: '1' }, image: 'x' }, 'https://s.com/x')).externalId, 'OFF-7');
 });
-check('feed id: no structured id + url has no strict id → null (skipped)', () => {
-  const p = mapJsonLdProduct({ '@type': 'Product', name: 'X', offers: { price: '1' }, image: 'x' }, 'https://s.com/no-numbers-here');
+check('feed id: no structured id + url has no strict id → null (skipped)', async () => {
+  const p = await mapJsonLdProduct({ '@type': 'Product', name: 'X', offers: { price: '1' }, image: 'x' }, 'https://s.com/no-numbers-here');
   assert.equal(p, null);
 });
-check('feed id: url last-resort uses strict /p{id}, and same product across two URL schemes collapses', () => {
-  const a = mapJsonLdProduct({ '@type': 'Product', name: 'X', offers: { price: '1' }, image: 'x' }, 'https://s.com/pdp-sofa-108724');
-  const b = mapJsonLdProduct({ '@type': 'Product', name: 'X', offers: { price: '1' }, image: 'x' }, 'https://s.com/departments/x/p108724');
+check('feed id: url last-resort uses strict /p{id}, and same product across two URL schemes collapses', async () => {
+  const a = await mapJsonLdProduct({ '@type': 'Product', name: 'X', offers: { price: '1' }, image: 'x' }, 'https://s.com/pdp-sofa-108724');
+  const b = await mapJsonLdProduct({ '@type': 'Product', name: 'X', offers: { price: '1' }, image: 'x' }, 'https://s.com/departments/x/p108724');
   assert.equal(a.externalId, '108724');
   assert.equal(b.externalId, '108724');
 });
-check('feed id: bare trailing YEAR in a listing url is NOT taken as an id', () => {
+check('feed id: bare trailing YEAR in a listing url is NOT taken as an id', async () => {
   assert.equal(extractNumericIdFromUrl('https://s.com/pdp-holiday-catalog-2024'), null);
 });
 
 // ── MONEY ──
-check('price: locale decimal-comma stays major units ("1.499,00"→1499, "1499,00"→1499)', () => {
-  const eu = mapJsonLdProduct({ '@type': 'Product', name: 'X', sku: 'A', offers: { price: '1.499,00', priceCurrency: 'EUR' }, image: 'x' }, 'https://s.com/x');
+check('price: locale decimal-comma stays major units ("1.499,00"→1499, "1499,00"→1499)', async () => {
+  const eu = await mapJsonLdProduct({ '@type': 'Product', name: 'X', sku: 'A', offers: { price: '1.499,00', priceCurrency: 'EUR' }, image: 'x' }, 'https://s.com/x');
   assert.equal(eu.price, 1499);
-  const eu2 = mapJsonLdProduct({ '@type': 'Product', name: 'X', sku: 'B', offers: { price: '1499,00' }, image: 'x' }, 'https://s.com/x');
+  const eu2 = await mapJsonLdProduct({ '@type': 'Product', name: 'X', sku: 'B', offers: { price: '1499,00' }, image: 'x' }, 'https://s.com/x');
   assert.equal(eu2.price, 1499);
 });
-check('price: non-numeric junk ("Call for Price") → null, never $0', () => {
-  const p = mapJsonLdProduct({ '@type': 'Product', name: 'X', sku: 'A', offers: { price: 'Call for Price' }, image: 'https://x/i.jpg' }, 'https://s.com/x');
+check('price: non-numeric junk ("Call for Price") → null, never $0', async () => {
+  const p = await mapJsonLdProduct({ '@type': 'Product', name: 'X', sku: 'A', offers: { price: 'Call for Price' }, image: 'https://x/i.jpg' }, 'https://s.com/x');
   assert.equal(p.price, null);
 });
-check('price: a $0 offer never beats a real one in an array', () => {
-  const p = mapJsonLdProduct({ '@type': 'Product', name: 'X', sku: 'A', offers: [{ price: '0.00' }, { price: '20.00' }], image: 'x' }, 'https://s.com/x');
+check('price: a $0 offer never beats a real one in an array', async () => {
+  const p = await mapJsonLdProduct({ '@type': 'Product', name: 'X', sku: 'A', offers: [{ price: '0.00' }, { price: '20.00' }], image: 'x' }, 'https://s.com/x');
   assert.equal(p.price, 20);
 });
-check('price: all-$0 offers → price null (no fake $0 stored)', () => {
-  const p = mapJsonLdProduct({ '@type': 'Product', name: 'X', sku: 'A', offers: [{ price: '0.00' }], image: 'https://x/i.jpg' }, 'https://s.com/x');
+check('price: all-$0 offers → price null (no fake $0 stored)', async () => {
+  const p = await mapJsonLdProduct({ '@type': 'Product', name: 'X', sku: 'A', offers: [{ price: '0.00' }], image: 'https://x/i.jpg' }, 'https://s.com/x');
   assert.equal(p.price, null);
 });
 
 // ── category array ──
-check('category: breadcrumb array → most-specific leaf string', () => {
-  const p = mapJsonLdProduct({ '@type': 'Product', name: 'X', sku: 'A', category: ['Furniture', 'Living Room', 'Sofas'], offers: { price: '1' }, image: 'x' }, 'https://s.com/x');
+check('category: breadcrumb array → most-specific leaf string', async () => {
+  const p = await mapJsonLdProduct({ '@type': 'Product', name: 'X', sku: 'A', category: ['Furniture', 'Living Room', 'Sofas'], offers: { price: '1' }, image: 'x' }, 'https://s.com/x');
   assert.equal(p.category, 'Sofas');
 });
 
 // ── breadcrumb capture (in-scan, reused by resolver) ──
-check('breadcrumb: BreadcrumbList → names, nav-chrome ("Home") stripped', () => {
+check('breadcrumb: BreadcrumbList → names, nav-chrome ("Home") stripped', async () => {
   const html = `<script type="application/ld+json">${JSON.stringify({
     '@type': 'BreadcrumbList',
     itemListElement: [
@@ -632,7 +642,7 @@ check('breadcrumb: BreadcrumbList → names, nav-chrome ("Home") stripped', () =
   assert.deepEqual(r.breadcrumb, ['Mens', 'Tops']);
   assert.equal(r.source, 'breadcrumbList');
 });
-check('breadcrumb: falls back to Product.category "A > B > C" string', () => {
+check('breadcrumb: falls back to Product.category "A > B > C" string', async () => {
   const html = `<script type="application/ld+json">${JSON.stringify({
     '@type': 'Product', name: 'X', category: 'Apparel > Mens > Shirts'
   })}</script>`;
@@ -640,13 +650,13 @@ check('breadcrumb: falls back to Product.category "A > B > C" string', () => {
   assert.deepEqual(r.breadcrumb, ['Apparel', 'Mens', 'Shirts']);
   assert.equal(r.source, 'productCategory');
 });
-check('breadcrumb: no structured data → null (resolver leaves it to inference)', () => {
+check('breadcrumb: no structured data → null (resolver leaves it to inference)', async () => {
   assert.equal(extractBreadcrumb('<html><body>no schema here</body></html>'), null);
 });
 
 // ── productish scoring (sitemap ranking heuristic) ─────────────────
 
-check('productish: fanatics +p-<digits> scores > 0 (regression)', () => {
+check('productish: fanatics +p-<digits> scores > 0 (regression)', async () => {
   // Full measured shape (8-digit p-id).
   const full = 'https://www.fanatics.com/nfl/tom-brady-tampa-bay-buccaneers/tom-brady-tampa-bay-buccaneers-nike-game-jersey-pewter/o-2422+t-09479237+p-12345678';
   assert.ok(scoreProductish(full) > 0, `expected > 0, got ${scoreProductish(full)}`);
@@ -657,25 +667,25 @@ check('productish: fanatics +p-<digits> scores > 0 (regression)', () => {
   assert.ok(scoreProductish(short) > 0, `fanatics short +p-123 expected > 0, got ${scoreProductish(short)}`);
 });
 
-check('productish: Shopify /products/foo-bar scores > 0', () => {
+check('productish: Shopify /products/foo-bar scores > 0', async () => {
   const loc = 'https://example.com/products/foo-bar';
   assert.ok(scoreProductish(loc) > 0);
   assert.equal(isProductish(loc), true);
 });
 
-check('productish: /p123 and /p-123 still score > 0', () => {
+check('productish: /p123 and /p-123 still score > 0', async () => {
   assert.ok(scoreProductish('https://example.com/p123') > 0);
   assert.ok(scoreProductish('https://example.com/p-12345') > 0);
 });
 
-check('productish: listing/nav URLs score ≤ 0', () => {
+check('productish: listing/nav URLs score ≤ 0', async () => {
   assert.ok(scoreProductish('https://example.com/collections/all') <= 0);
   assert.ok(scoreProductish('https://example.com/cart') <= 0);
   assert.ok(scoreProductish('https://example.com/blogs/news') <= 0);
   assert.ok(scoreProductish('https://example.com/search?q=x') <= 0);
 });
 
-check('productish: product URL outranks collection URL via rankLoc', () => {
+check('productish: product URL outranks collection URL via rankLoc', async () => {
   const product = 'https://example.com/products/foo-bar';
   const collection = 'https://example.com/collections/all';
   assert.ok(rankLoc(product) < rankLoc(collection),
@@ -689,7 +699,7 @@ check('productish: product URL outranks collection URL via rankLoc', () => {
 // BACK of the queue and drop them on any store that hits MAX_SITEMAP_URLS or the
 // product cap. The listing demotion must stay suppressed when a strong product
 // signal is present.
-check('productish: collection-scoped Shopify PDP stays product-ish', () => {
+check('productish: collection-scoped Shopify PDP stays product-ish', async () => {
   for (const loc of [
     'https://example.com/collections/all/products/blue-serum',
     'https://example.com/collections/skincare/products/retinol-24'
@@ -708,7 +718,7 @@ check('productish: collection-scoped Shopify PDP stays product-ish', () => {
 
 // No URL that the OLD boolean heuristic called product-ish may become
 // non-product-ish — ranking regressions only bite at cap, so they are silent.
-check('productish: no regression vs the old PRODUCTISH_RE boolean', () => {
+check('productish: no regression vs the old PRODUCTISH_RE boolean', async () => {
   const OLD_PRODUCTISH_RE = /product|pdp|item|catalog|\/p\d/i;
   const corpus = [
     'https://example.com/products/blue-serum',
@@ -726,7 +736,7 @@ check('productish: no regression vs the old PRODUCTISH_RE boolean', () => {
   }
 });
 
-check('productish: null / empty / non-string do not throw', () => {
+check('productish: null / empty / non-string do not throw', async () => {
   assert.equal(scoreProductish(null), 0);
   assert.equal(scoreProductish(''), 0);
   assert.equal(scoreProductish(undefined), 0);
@@ -735,7 +745,7 @@ check('productish: null / empty / non-string do not throw', () => {
   assert.equal(isProductish(''), false);
 });
 
-check('productish: ordering-stability — every positive-score loc precedes non-positive', () => {
+check('productish: ordering-stability — every positive-score loc precedes non-positive', async () => {
   const locs = [
     'https://example.com/collections/all',
     'https://example.com/products/alpha',
@@ -761,6 +771,14 @@ check('productish: ordering-stability — every positive-score loc precedes non-
 
 // ── summary ────────────────────────────────────────────────────────
 
-const total = passed + failed;
-console.log(`${passed}/${total} checks passed`);
-process.exit(failed ? 1 : 0);
+async function main() {
+  await runQueue();
+  const total = passed + failed;
+  console.log(`${passed}/${total} checks passed`);
+  process.exit(failed ? 1 : 0);
+}
+
+main().catch((err) => {
+  console.error(err && err.stack ? err.stack : err);
+  process.exit(1);
+});
