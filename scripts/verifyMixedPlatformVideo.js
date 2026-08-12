@@ -240,6 +240,78 @@ check('G3 a Meta funnel row would take the BILLABLE path — the reason for the 
   );
 });
 
+// ── 7b. META free derivatives ────────────────────────────────────────────
+// The Meta pipeline is ONE billable 9:16 submit plus free crops of it. The
+// crops were specified from the start and only became buildable when PMax's
+// derive path landed. The money invariant is that they carry deriveFromMaster
+// — without it, three free crops become three ~$0.90 charges per product.
+
+check('I1 Meta derivatives never appear as billable masters', () => {
+  const m = queuedMasters(META_VIDEO_TICKS);
+  for (const d of ['meta_feed_1_1', 'meta_feed_4_5', 'meta_reels_9_16']) {
+    // The only Meta key that may bill is whichever single master survives the
+    // clamp; a derivative must never be queued as a second paid submit.
+    if (m.includes(d)) {
+      assert.strictEqual(
+        m.length, 1,
+        `${d} queued alongside another master — that is a second billable submit`
+      );
+    }
+  }
+  assert.strictEqual(m.length, 1, `Meta must bill exactly one master, got ${JSON.stringify(m)}`);
+});
+
+check('I2 every Meta derivative is a shape a 9:16 frame can actually yield', () => {
+  const src = pf.aspectRatioForPlatformFormat('meta_stories_9_16');
+  assert.strictEqual(src, '9:16');
+  // A derivative must be no WIDER than its source; cropping up is dishonest.
+  const srcRatio = 9 / 16;
+  for (const d of ['meta_feed_1_1', 'meta_feed_4_5', 'meta_reels_9_16']) {
+    const a = pf.aspectRatioForPlatformFormat(d);
+    const [w, h] = a.split(':').map(Number);
+    assert.ok(
+      (w / h) >= srcRatio - 1e-9,
+      `${d} (${a}) is narrower than its 9:16 source — not derivable`
+    );
+    assert.ok(
+      (w / h) <= 1 + 1e-9,
+      `${d} (${a}) is wider than square; a portrait master cannot yield it`
+    );
+  }
+});
+
+check('I3 each Meta derivative digests distinctly from the master — no index collapse', () => {
+  const base = { campaignId: 'c1', productId: 'p1', mediaId: 'm1' };
+  const master = svc.computeDeterministicVideoDigest({ ...base, platformFormat: 'meta_stories_9_16' });
+  const seen = new Set([master]);
+  for (const d of ['meta_feed_1_1', 'meta_feed_4_5', 'meta_reels_9_16']) {
+    const dig = svc.computeDeterministicVideoDigest({ ...base, platformFormat: d });
+    assert.ok(!seen.has(dig), `${d} collides with an earlier Meta video digest — it would not insert`);
+    seen.add(dig);
+  }
+});
+
+check('I4 a Meta derivative routes FREE when it carries deriveFromMaster', () => {
+  const derive = svc.resolveDeriveFromMaster({
+    platformFormat: 'meta_feed_1_1',
+    deriveFromMaster: 'meta_stories_9_16',
+    renderRoute: 'veo'
+  });
+  assert.strictEqual(
+    derive, 'meta_stories_9_16',
+    'a Meta derivative did not resolve a master — it would take the BILLABLE Omni path'
+  );
+});
+
+check('I5 a Meta derivative WITHOUT the marker is billable — why the field is load-bearing', () => {
+  const derive = svc.resolveDeriveFromMaster({ platformFormat: 'meta_feed_1_1', renderRoute: 'veo' });
+  assert.strictEqual(
+    derive, null,
+    'bare Meta feed formats now self-derive; if intentional, the fan-out no longer needs '
+    + 'deriveFromMaster and this check should be re-derived rather than deleted'
+  );
+});
+
 // ── 8. SOURCE PINS for the funnel-mint scoping ───────────────────────────
 // The funnel loop lives inside expandWizardJob's async expansion path, which
 // this offline harness cannot execute (it mints Ads against Mongo). Verified
@@ -266,6 +338,45 @@ check('H1 funnel mint iterates a Google-filtered master list, not masterFormats'
   assert.ok(
     !/if\s*\(isPmaxFunnelVariantsEnabled\(\)\)\s*\{\s*for\s*\(const\s+fmt\s+of\s+masterFormats\)/.test(SRC),
     'the funnel loop iterates masterFormats directly again'
+  );
+});
+
+check('H3 [MONEY] every Meta derivative is minted WITH deriveFromMaster', () => {
+  // The single most expensive line in this change. The Meta derivatives are
+  // free ONLY because they carry deriveFromMaster, which routes them through
+  // renderDeriveOnlyVideoAd; without it resolveDeriveFromMaster returns null
+  // (pinned by I5) and all three take the billable Omni path — three extra
+  // ~$0.90 submits per product, on the default "All Meta video" flow.
+  //
+  // Verified by mutation that the behavioural checks above CANNOT see this:
+  // the mint is inside expandWizardJob's async expansion, so deleting the
+  // field leaves 29/29 green. Hence a source pin.
+  assert.ok(
+    /const\s+metaDeriveSource\s*=\s*masterFormats\.find\(\s*\(f\)\s*=>\s*f\s*===\s*META_VIDEO_DERIVE_SOURCE\s*\)/.test(SRC),
+    'the Meta derive source lookup is gone'
+  );
+  assert.ok(
+    /for\s*\(const\s+fmt\s+of\s+META_VIDEO_DERIVATIVES\)/.test(SRC),
+    'the Meta derivative loop is gone'
+  );
+  assert.ok(
+    /deriveFromMaster:\s*metaDeriveSource/.test(SRC),
+    'MONEY: Meta derivatives are minted without deriveFromMaster — each one is now a '
+    + 'billable Omni submit instead of a free crop'
+  );
+});
+
+check('H4 Meta derivatives are gated on the 9:16 master being in the run', () => {
+  // Deriving 1:1/4:5 from a non-portrait master would be cropping up. The
+  // gate is the `.find(f => f === META_VIDEO_DERIVE_SOURCE)` above plus the
+  // truthiness check on it; assert the constant still names the 9:16 master.
+  assert.strictEqual(
+    pf.aspectRatioForPlatformFormat('meta_stories_9_16'), '9:16',
+    'META_VIDEO_DERIVE_SOURCE no longer names a 9:16 surface'
+  );
+  assert.ok(
+    /if\s*\(metaDeriveSource\)\s*\{/.test(SRC),
+    'the Meta derivative mint is no longer gated on the 9:16 master being present'
   );
 });
 

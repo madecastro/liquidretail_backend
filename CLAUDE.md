@@ -32,8 +32,13 @@ one.** Owner, verbatim: *"We are no longer using ANY other generation pathways
 for video or static ads … we are not using any other generation pathways for
 catalog based product ads."*
 
-**VIDEO (Meta)** — one billable generation (9:16 master); other Meta surfaces are
-free crop/retitle **intent** (Phase 3 queue fan-out not live — see step 3).
+**VIDEO (Meta)** — one billable generation (9:16 master) plus **three FREE
+derivatives** of it: feed 1:1, feed 4:5, and a Reels 9:16 retitle. Four Meta
+video Ads per product, **one** Omni submit. The fan-out was documented as
+"Phase 3 intent" from 2026-08-02 until 2026-08-11, when PMax's derive path
+(`deriveFromMaster` → `renderDeriveOnlyVideoAd`) made it buildable — it is
+platform-agnostic, so this is the original intent finally wired up, not a new
+capability.
 **VIDEO (Google PMax, Phase A)** — **two** billable Omni masters (9:16 + 16:9)
 plus one free derive-only 1:1 crop of the 9:16 master — see §2 and
 `docs/PIPELINES.md` §6. Do not apply the Meta one-master rule to `google_video`.
@@ -45,11 +50,16 @@ plus one free derive-only 1:1 crop of the 9:16 master — see §2 and
    only). See §2 — everything named `veo*` is this Omni pipeline under a legacy
    name.
 3. **Crop** for non-9:16 targets via `videoCropUrl` + `basePlateCropService`
-   (face-anchored) at titling time — never a second Omni submit. **Phase 3
-   multi-surface fan-out is not the queue path yet:** `META_VIDEO_FANOUT`
-   (Reels retitle + feed 1:1 + 4:5) is documented as free derivation intent
-   (`platformFormats.js`); `resolvePreset('meta_video')` still returns
-   the master only. Do not reintroduce four video Ads = four submits.
+   (face-anchored) at titling time — never a second Omni submit. **The Meta
+   fan-out IS the queue path as of 2026-08-11:** `resolvePreset('meta_video')`
+   still returns the master only (that is the BILLABLE list and must not
+   change), and `expandWizardJob` then mints `META_VIDEO_DERIVATIVES`
+   (`meta_feed_1_1`, `meta_feed_4_5`, `meta_reels_9_16`) each carrying
+   `deriveFromMaster: 'meta_stories_9_16'`. ⚠️ **Four video Ads, ONE submit.**
+   The old warning still stands in its real form: four ads is correct, four
+   *submits* is the money bug. The `deriveFromMaster` field is the entire
+   difference — dropping it turns three free crops into three ~$0.90 charges
+   per product. Pinned by `scripts/verifyMixedPlatformVideo.js` H3.
 4. **Title each surface appropriately** — burned into the delivered file, using
    that surface's own safe zone. Reels (204) and Stories (250) differ and must
    not share one entry. **Untitled is not success:** after the master lands the
@@ -366,13 +376,17 @@ Video never launches a browser.
   `resolvePreset('meta_static')` / `META_STATIC_FANOUT` = three Meta sizes =
   three image submits (`platformFormats.js:405`, `:576-583`). Cannot crop one
   static plate cheaply — text is burned in-model (`:400-403`).
-- **Video (Meta): ONE Omni 9:16 master per product on the live presets — not
-  one per aspect.** `resolvePreset('meta_video'|'meta_all')` returns
-  `videoFormats: [META_VIDEO_MASTER]` only (`platformFormats.js`);
-  `expandDeterministicVideo` queues one Ad per product. Non-9:16 *Ads* (if any)
-  still generate at Omni 9:16 then face-crop at titling (`basePlateCropService`);
-  free multi-surface derivation from one master is **Phase 3 intent**, not a
-  second billable submit (`platformFormats.js` `META_VIDEO_FANOUT`). **The older
+- **Video (Meta): ONE Omni 9:16 master per product — and FOUR Ads.**
+  `resolvePreset('meta_video'|'meta_all')` returns
+  `videoFormats: [META_VIDEO_MASTER]` only (`platformFormats.js`) — that is the
+  billable list and must stay length 1. `expandWizardJob` then mints three FREE
+  derivative Ads (`META_VIDEO_DERIVATIVES`: feed 1:1, feed 4:5, Reels retitle),
+  each carrying `deriveFromMaster: 'meta_stories_9_16'` so they route through
+  `renderDeriveOnlyVideoAd` and never reach Omni. Gated on the 9:16 master
+  actually being in the run — a 1:1 or 4:5 window fits inside a portrait frame,
+  so those crops are honest, but deriving them from a squarer master would be
+  cropping up. An operator hand-picking a single non-9:16 Meta surface in
+  Advanced still gets exactly one Ad at its own aspect, unchanged. **The older
   claim in this file — that `identityDigest` made 1:1 + 4:5 + 9:16 = three
   separate video submits — was true for non-preset multi-aspect video queues
   (measured in prod 2026-08-01) and is a money bug if reintroduced; it is not
@@ -553,6 +567,28 @@ Video never launches a browser.
   explicitly-selected non-Omni models.
 
 ### Known open (do not claim fixed)
+
+- **The free Meta crops can be silently swallowed on a campaign that already
+  has an ad of that format.** `computeDeterministicVideoDigest` includes
+  `platformFormat` but NOT `deriveFromMaster`, so a derivative minted for
+  `meta_feed_1_1` hashes identically to a **pre-existing billable**
+  `meta_feed_1_1` video ad with the same (campaign, product, refs, CTA,
+  prompts). `insertMany` swallows the duplicate-key error and the crop is
+  simply not created — the operator keeps the older independent ad instead.
+  Unlike the PMax keys, these three Meta formats have **history**: any earlier
+  Advanced single-surface pick, and the measured 2026-08-01 multi-aspect Meta
+  bug, minted them as real billable rows.
+  **This is not a spend regression** — nothing new bills; the free extra is
+  just absent. **Do NOT "fix" it by adding `deriveFromMaster` or a run id to
+  the Meta digest:** that re-keys every pre-existing Meta video ad, and because
+  the digest deliberately omits `generationRunId` the `(campaignId,
+  identityDigest)` unique index is the ONLY guard against a repeat Generate
+  re-billing Omni — the same trap §2 records for the 8s→10s duration change.
+  A re-mint of the Meta video corpus is a costed, flagged decision, never a
+  side effect. Related pre-existing hazard, unchanged by this work: a stranded
+  `queued` historical row of one of those formats is still claimable by
+  `selectAdsForRun` (product-scoped, not new-ad-scoped) and would bill on that
+  claim.
 
 - ~~**PMax YouTube safe zones are DECLARED but NOT WIRED**~~ — **CLOSED Phase B
   (2026-08-11).** Zones resolve per `platformFormat`
