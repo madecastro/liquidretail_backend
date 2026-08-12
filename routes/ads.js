@@ -1733,6 +1733,28 @@ async function renderDeriveOnlyVideoAd({
         .replace(/\.(mp4|mov|webm|m4v)(\?.*)?$/i, '.jpg$2')
     : null;
 
+  // INHERIT THE MASTER'S FACE DETECTION (2026-08-12). Every derive-only ad —
+  // the free 1:1 crop and all three funnel retitles — points at the master's
+  // exact veoVideoUrl, yet each was starting with basePlate:null and paying
+  // basePlateCropService for a fresh vision pass (~$0.02) on footage the
+  // master had already analysed. On a PMax run that is 4x the same detection
+  // per master, for identical boxes.
+  //
+  // Sharing is safe BY THE CACHE'S OWN CONTRACT, not by assumption:
+  //   - ensureFaceDetectionForKeepOut accepts any entry whose sourceUrl equals
+  //     the ad's current veoVideoUrl — and we assign that same URL below — and
+  //     its comment states face boxes are "in SOURCE fraction space —
+  //     independent of titling format".
+  //   - the format-SPECIFIC part cannot leak: cropRect is only honoured when
+  //     cached.format === the format being titled, so a 9:16 master's rect is
+  //     ignored by a 1:1 derive, which recomputes its own crop as today.
+  // Guarded on the master's entry actually being bound to this URL, so a
+  // regenerated master with a stale plate is never inherited.
+  const inheritedBasePlate =
+    master.basePlate && master.basePlate.sourceUrl === veoVideoUrl
+      ? master.basePlate
+      : null;
+
   // Load brand for titling (same projection as the master path).
   const sourceMedia = await Media.findById(ad.mediaId)
     .select('fileType fileUrl brandId').lean();
@@ -1765,7 +1787,11 @@ async function renderDeriveOnlyVideoAd({
         renderedAt:         new Date(),
         updatedAt:          new Date(),
         renderStage:        `derive-only plate from ${deriveFromFmt}`,
-        renderStageAt:      new Date()
+        renderStageAt:      new Date(),
+        // Only written when the master's entry is bound to this same URL; a
+        // spread of {} leaves the field untouched (null) and titling detects
+        // exactly as it does today.
+        ...(inheritedBasePlate ? { basePlate: inheritedBasePlate } : {})
       },
       $inc: { renderAttempts: 1 }
     }
