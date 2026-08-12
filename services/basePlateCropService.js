@@ -163,6 +163,177 @@ function decideBasePlateCrop({ format, platformFormat, sourceUrl, sourceW, sourc
   return { action: 'crop', target, rect };
 }
 
+// ── split-panel drift (PMax 16:9 split-stage; PMAX_SPLIT_VIDEO) ─────────────────────────────────
+//
+// decideBasePlateCrop (above) answers "crop a master TO an aspect" — a different question from
+// what follows. The PMax 16:9 split unit renders a 1920x1080 master that is ALREADY 16:9: the
+// product is seeded into a vertical band on ONE side and the video model generatively extends the
+// rest. Nothing needs cropping; what needs checking is whether the FINISHED render kept the
+// subject out of the OTHER side, which is about to carry composited ad copy. That is containment
+// inside an already-correct frame, not a crop decision, so it gets its own pure function rather
+// than a new parameter bolted onto decideBasePlateCrop (which would make that function answer two
+// unrelated questions depending on which caller invoked it).
+//
+// COST: zero NEW vision calls. detectClipBoxes(...) is already run — and billed (~$0.02) — on the
+// titling path for every ad (see detectionExtras below, and resolveBasePlateVideoUrl's `det` call).
+// Its per-frame subject boxes carry the FULL box (left/top/right/bottom), but every consumer today
+// — decideBasePlateCrop, computeGravityCropRect, the face keep-out path — reduces them to their
+// VERTICAL extent only (head/subject top-bottom) because every existing target is a portrait or
+// square crop, where the horizontal extent never mattered. The horizontal signal has been sitting
+// in already-paid-for detection output, unused. This function is the first consumer of it.
+
+/**
+ * Valid values for `panelSide`. Exported so the harness enumerates the real vocabulary instead of
+ * re-typing the string literals, and so a future caller cannot silently pass a third value that
+ * both this function's `switch`-free lookup AND a hand-rolled caller check would need to agree on.
+ */
+const SPLIT_PANEL_SIDES = Object.freeze(['west', 'east']);
+
+/**
+ * Panel side -> the horizontal interval (normalized 0..1) the copy panel OCCUPIES.
+ *
+ * THE INVERSION TRAP THIS TABLE EXISTS TO AVOID: 'west' reads as "the panel is on the west/left",
+ * which is correct, but the SUBJECT's safe region is the opposite side (east/right) — a hand-rolled
+ * `if (panelSide === 'west') return box.left > threshold` is one `<`/`>` typo away from checking the
+ * wrong side, and that typo would silently pass every "obviously safe" fixture where the subject
+ * sits in the middle of its own half (only a near-boundary case would ever expose it). Encoding
+ * the panel's own OCCUPIED interval as data — not the subject's derived safe side — means the
+ * overlap math below is one formula for both sides (the subject is safe wherever it does NOT
+ * overlap the panel's interval), and there is nothing left to invert once this table is right.
+ * scripts/verifyPmaxSplitDrift.js's mirror-sweep check (same geometry, flipped panelSide, opposite
+ * verdict) is the regression guard for this table specifically.
+ */
+const PANEL_INTERVAL_BY_SIDE = Object.freeze({
+  west: (panelWidthFrac) => ({ start: 0, end: panelWidthFrac }),
+  east: (panelWidthFrac) => ({ start: 1 - panelWidthFrac, end: 1 }),
+});
+
+/**
+ * Drift tolerance, as a FRACTION OF THE PANEL'S OWN WIDTH (not of the frame). Exported so the
+ * harness pins fixtures against the real constant instead of duplicating the literal.
+ *
+ * FRACTION OF PANEL WIDTH, NOT FRAME WIDTH: panelWidthFrac itself will vary by layout, and an
+ * absolute (frame-relative) grace band would give a narrow copy column a disproportionately large
+ * allowance relative to its own size. Scaling by the panel's own width keeps "a graze" meaning the
+ * same relative intrusion regardless of how wide the split happens to be.
+ *
+ * WHY 0.06: the subject box comes from the same vision detection as faceSafeCrop's head box, whose
+ * FACE_MARGIN_FRAC (services/faceSafeCrop.js) uses the identical value for the identical reason —
+ * a detected box edge is the model's best guess at a boundary, not a hard pixel line, and a real
+ * product's cast shadow, reflection or motion-blurred edge routinely grazes a few percent past the
+ * "true" silhouette without the product actually having moved into the panel. 6% of the panel's own
+ * width absorbs that noise. It does not need to be large to also catch genuine drift: a subject
+ * actually pushed INTO the panel (as opposed to grazing its inner edge) overlaps by a large fraction
+ * of the panel's width, not a single-digit-percent sliver — see the 'grazing' vs 'squarely inside'
+ * fixtures in scripts/verifyPmaxSplitDrift.js, which pin the boundary on both sides of this constant.
+ */
+const DEFAULT_DRIFT_TOLERANCE_FRAC = 0.06;
+
+/**
+ * A frame's subject box we are willing to do arithmetic with, else null. Same defensive shape as
+ * faceSafeCrop's usableBox / this file's parseBox — boxes arrive from a vision model by way of
+ * detectClipBoxes' per-frame `results`, so every field must be re-validated here independently of
+ * whatever validation ran upstream (a stale/replayed frame array is untrusted input to THIS
+ * function, not just to whatever produced it).
+ */
+function usableSplitFrameBox(b) {
+  if (!b || typeof b !== 'object' || Array.isArray(b)) return null;
+  const { left, top, right, bottom } = b;
+  if (![left, top, right, bottom].every(Number.isFinite)) return null;
+  if (right <= left || bottom <= top) return null; // inverted/degenerate box ("x2 < x1") — garbage
+  return b;
+}
+
+/**
+ * Did the rendered subject drift into the copy panel on a PMax 16:9 split-stage master? Pure — no
+ * I/O, mirrors decideBasePlateCrop's shape and place in this file.
+ *
+ * @param {object} a
+ * @param {Array<object|null>} a.frameBoxes  per-frame SUBJECT boxes (normalized left/top/right/
+ *   bottom), same array detectClipBoxes already builds internally before reducing it to a union —
+ *   one entry per sampled frame, null where that frame's detection failed.
+ * @param {'west'|'east'} a.panelSide  which side the COPY PANEL occupies (see PANEL_INTERVAL_BY_SIDE
+ *   — read its comment before touching this parameter's handling).
+ * @param {number} a.panelWidthFrac  panel width as a fraction (0,1) of the 1920x1080 frame width.
+ * @param {number} [a.tolerance]  overlap tolerance, fraction of panelWidthFrac. Defaults to
+ *   DEFAULT_DRIFT_TOLERANCE_FRAC when omitted or not a finite number >= 0 — an invalid tolerance is
+ *   a caller bug, not a reason to refuse a verdict altogether, so unlike panelSide/panelWidthFrac it
+ *   degrades to the documented default rather than making the whole call undecidable.
+ *
+ * @returns {{drifted: false} | {drifted: true, reason: string, worstOverlapFrac: number, atFrame: number}
+ *          | {drifted: null, reason: string}}
+ *   drifted:false  — every usable frame's subject box stayed clear of the panel (within tolerance).
+ *   drifted:true   — reason is `subject-in-${panelSide}-panel`; worstOverlapFrac/atFrame identify
+ *                    the WORST sampled frame (see below), not the first one that tripped.
+ *   drifted:null   — undecidable: bad panelSide/panelWidthFrac, or every frame was missing/garbage.
+ *
+ * WHY THE WORST FRAME, NOT THE FIRST: the seed-time gate upstream (the composed seed places the
+ * subject on its side BEFORE generation) can only ever see frame zero's intent, not what the video
+ * model does with it. Drift is a mid-clip failure mode — the model wanders as the clip progresses —
+ * so a verdict based on only the first (or an average of all) sampled frame(s) would systematically
+ * miss the exact case this function exists to catch. Every usable frame is evaluated and the worst
+ * (maximum overlap) wins, full stop; scripts/verifyPmaxSplitDrift.js pins this against a fixture
+ * where only a LATE frame drifts.
+ *
+ * WHY UNDECIDABLE (null) RATHER THAN A DEFAULT true/false WHEN EVIDENCE IS MISSING: the two wrong
+ * answers are not equally bad. A false "safe" ships copy composited on top of the product on an
+ * already-billed render — the exact defect this stage exists to prevent. A false "drifted" only
+ * costs a less-adventurous centred layout for one ad. That asymmetry means "no usable evidence"
+ * must never silently collapse to "no problem" (drifted:false) OR quietly default to a hardcoded
+ * fallback verdict inside this function — it is reported honestly as null, and the CALLER decides.
+ * Documented default for callers: treat drifted:null the SAME as drifted:true (fall back to the
+ * centred layout) — same reasoning as decideBasePlateCrop's `no-face-quorum` skip a few lines up in
+ * this file: the safe/cheap wrong answer is preferred over the billable/expensive wrong answer.
+ * This function does not enforce that default itself because a caller may have another signal
+ * (e.g. a second detection pass, an operator override) that legitimately breaks the tie differently.
+ *
+ * Total function: every branch returns a plain object: never throws, never returns a bare boolean.
+ */
+function decideSplitPanelDrift({ frameBoxes, panelSide, panelWidthFrac, tolerance } = {}) {
+  try {
+    // Cheap, I/O-free gates first — same ordering principle as preGateBasePlateCrop: fail on the
+    // config that's wrong regardless of what the frames say, before spending any per-frame work.
+    const interval = SPLIT_PANEL_SIDES.includes(panelSide) ? PANEL_INTERVAL_BY_SIDE[panelSide] : null;
+    if (!interval) return { drifted: null, reason: `bad-panel-side:${panelSide}` };
+    if (!Number.isFinite(panelWidthFrac) || panelWidthFrac <= 0 || panelWidthFrac >= 1) {
+      return { drifted: null, reason: `bad-panel-width-frac:${panelWidthFrac}` };
+    }
+    if (!Array.isArray(frameBoxes)) return { drifted: null, reason: 'frame-boxes-not-array' };
+
+    const tol = Number.isFinite(tolerance) && tolerance >= 0 ? tolerance : DEFAULT_DRIFT_TOLERANCE_FRAC;
+    const { start, end } = interval(panelWidthFrac);
+
+    let worstOverlapFrac = -Infinity;
+    let atFrame = -1;
+    let usableFrames = 0;
+
+    for (let i = 0; i < frameBoxes.length; i++) {
+      const box = usableSplitFrameBox(frameBoxes[i]);
+      if (!box) continue; // missing/garbage frame — contributes no evidence either way, not a "safe" vote
+      usableFrames++;
+      // Overlap of the subject box with the panel's OWN interval [start,end] — the same formula
+      // for both sides because `interval` already encodes which side that is (see the table above).
+      const overlapWidth = Math.max(0, Math.min(box.right, end) - Math.max(box.left, start));
+      const overlapFrac = overlapWidth / panelWidthFrac;
+      if (overlapFrac > worstOverlapFrac) {
+        worstOverlapFrac = overlapFrac;
+        atFrame = i;
+      }
+    }
+
+    if (usableFrames === 0) return { drifted: null, reason: 'no-usable-frames' };
+
+    if (worstOverlapFrac > tol) {
+      return { drifted: true, reason: `subject-in-${panelSide}-panel`, worstOverlapFrac, atFrame };
+    }
+    return { drifted: false };
+  } catch (err) {
+    // Total function contract — an unexpected shape must degrade to undecidable, never throw into
+    // an orchestrator that (per the docs above) is expected to treat null as "assume drifted".
+    return { drifted: null, reason: `internal-error:${err?.message?.slice(0, 80)}` };
+  }
+}
+
 // ── detection half (I/O) ───────────────────────────────────────────────────────────────────────
 
 /**
@@ -600,6 +771,9 @@ module.exports = {
   ensureFaceDetectionForKeepOut,
   decideBasePlateCrop,       // pure — for the harness
   preGateBasePlateCrop,      // pure — for the harness
+  decideSplitPanelDrift,     // pure — PMax 16:9 split-stage post-render containment check
+  SPLIT_PANEL_SIDES,         // for the harness
+  DEFAULT_DRIFT_TOLERANCE_FRAC, // for the harness
   TARGET_BY_FORMAT,
   DETECT_SYSTEM_PROMPT,      // for the harness (headwear sentence asserted)
   FACE_KEEPOUT_ENABLED,      // for the harness
