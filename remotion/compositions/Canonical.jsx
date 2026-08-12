@@ -14,14 +14,20 @@ import React, { useMemo } from 'react';
 import { AbsoluteFill, useCurrentFrame, useVideoConfig } from 'remotion';
 import { BasePlate } from '../components/BasePlate.jsx';
 import { useBrandFonts } from '../components/FontLoader.jsx';
-import { SLOT_RENDERERS } from '../components/slotRenderers.jsx';
+import { SLOT_RENDERERS, baseSize } from '../components/slotRenderers.jsx';
 import { slotEnvelope, slotProgress, specTimeScale } from '../lib/timing.js';
 import { stackContainerStyle, panelColumnStyle, resolveSafeZone, resolveSafeZoneKey } from '../lib/safeZones.js';
 import { contrastToken } from '../lib/tokens.js';
 import { resolveSlotContent } from '../lib/slotContent.js';
 import { decideInkOnLight, worstCaseInkForBand, usesWorstCaseInk } from '../lib/plateHints.js';
 // Re-export pure resolver for offline harnesses (same decision as render).
-export { resolveSlotContent, resolveSlotContentCore, truncateWordSafe } from '../lib/slotContent.js';
+export {
+  resolveSlotContent,
+  resolveSlotContentCore,
+  truncateWordSafe,
+  deriveCharCap,
+  TEXT_CHAR_CAP,
+} from '../lib/slotContent.js';
 export { decideInkOnLight, worstCaseInkForBand, usesWorstCaseInk } from '../lib/plateHints.js';
 
 const BAND_FOR_ANCHOR = { top: 'top', upperThird: 'top', center: 'middle', lowerThird: 'bottom', bottom: 'bottom' };
@@ -385,7 +391,46 @@ export const Canonical = ({ format = 'feed', safeZoneKey = null, platformFormat 
                 // Same-anchor same-phase slots stack as a flex column (container
                 // gap). Empty siblings drop out — e.g. proof falls back to
                 // claim+rating when quote is gated empty (visibleWhenEmpty).
-                const content = resolveSlotContent(rawSlot, meta, allSlots);
+                // Cap context for deriveCharCap (width×lines/font model):
+                // live canvas dims, slot maxWidthPct, treatment maxLines,
+                // rendered font px (same baseSize the TextSlot paints), and
+                // panel column width when split-stage is on. usableWidthPx
+                // is canvas-relative (maxWidthPct×W), min'd with the panel
+                // when present — same arithmetic videoHeadlineService
+                // documents (0.46×1920, 0.9×1080). Absent panelBox → no
+                // panel fields; format-only still derives via defaults.
+                const t = rawSlot.treatment || {};
+                const maxWidthPct = rawSlot.position?.maxWidthPct;
+                const panelW = panelBox
+                  ? (width - panelBox.left - panelBox.right)
+                  : null;
+                let usableWidthPx = null;
+                if (Number.isFinite(maxWidthPct) && maxWidthPct > 0) {
+                  const fromPct = maxWidthPct * width;
+                  usableWidthPx = panelW != null && panelW > 0
+                    ? Math.min(fromPct, panelW)
+                    : fromPct;
+                } else if (panelW != null && panelW > 0) {
+                  // No authored maxWidthPct — text fills the panel column.
+                  // Documented fallback; Canonical landscape slots always
+                  // carry maxWidthPct:0.46 in canonical.json.
+                  usableWidthPx = panelW;
+                }
+                const capCtx = {
+                  format,
+                  canvasWidth: width,
+                  maxWidthPct: Number.isFinite(maxWidthPct) ? maxWidthPct : null,
+                  usableWidthPx,
+                  maxLines: Number.isFinite(t.maxLines) ? t.maxLines : null,
+                  fontPx: baseSize(rawSlot.key, format, t.sizeScale),
+                  sizeScale: Number.isFinite(t.sizeScale) ? t.sizeScale : null,
+                  panelColumn: !!panelBox,
+                  panelSide: panelBox ? panelSide : null,
+                  panelWidthFrac: panelW != null && width > 0
+                    ? panelW / width
+                    : null,
+                };
+                const content = resolveSlotContent(rawSlot, meta, allSlots, capCtx);
                 if (content == null) return null;
                 const Renderer = SLOT_RENDERERS[rawSlot.key];
                 if (!Renderer) return null;
