@@ -2087,6 +2087,119 @@ async function reframeReferenceForAspect({ media, sourceUrl, aspectRatio, brand,
           console.warn(`⚠️  reframeReferenceForAspect[${aspectKey}]: outpaint failed — ${err.message}`);
         }
 
+        // 6a0. SPLIT COPY-HALF DENSITY GATE (2026-08-12).
+        //
+        // MONEY: the extended seed just cost ~$0.08; the video master that
+        // consumes it costs ~$0.90–$1.20. A ~$0.01–0.02 vision pass that stops
+        // a busy panel from becoming a master is overwhelmingly worth it.
+        // Standing NO-SCRIM rule (owner 2026-08-12) means we cannot rescue a
+        // busy panel with a shade behind the type later — catch it here, once.
+        //
+        // Scope: ONLY the split path, and ONLY after a successful generative
+        // outfill. Every other caller of reframeReferenceForAspect is inert —
+        // no vision call, no behaviour change. Gated on `splitSide` so a
+        // missing/null subjectSide cannot reach analyzeOverlayZones.
+        //
+        // Failure discipline mirrors buildReferenceImages' per-item catch
+        // (2026-08-04): a $0.01 advisory must NEVER hard-fail a run that
+        // already paid for the seed. Vision throws / junk / undecidable all
+        // degrade to the deterministic brand_panel (flat brand colour via
+        // websiteBackgroundHex + padSolidBuffer gravity) and the run continues.
+        // At most ONE retry, and that retry is the free brand_panel — never a
+        // second vision call (looping a cheap advisory into unbounded cost).
+        if (resultUrl && splitSide) {
+          let densityOk = false;
+          try {
+            const { analyzeOverlayZones } = require('./overlayZoneService');
+            const {
+              isCopyHalfCalm,
+              copyPanelRectForSubjectSide
+            } = require('./pmaxSplitStrategy');
+            const zones = await analyzeOverlayZones({
+              imageUrl: resultUrl,
+              label: `split-density[${aspectKey}]`,
+              ratio: aspectRatio
+            });
+            const panelRectPct = copyPanelRectForSubjectSide(splitSide);
+            const verdict = isCopyHalfCalm({
+              densityGrid: zones?.densityGrid,
+              restrictions: zones?.restrictions,
+              panelRectPct
+            });
+            if (verdict.calm === true) {
+              densityOk = true;
+              console.log(
+                `   ✅ split-density[${aspectKey}]: copy half calm ` +
+                `(mean=${Number(verdict.mean).toFixed(2)} peak=${Number(verdict.peak).toFixed(2)}) — keeping outfill`
+              );
+            } else {
+              // false OR null (undecidable) — both degrade. Asymmetry is
+              // intentional: false calm ships unreadable copy on a ~$1 master;
+              // false not-calm only costs a brand-panel swap.
+              const detail = verdict.calm === false
+                ? `${verdict.reason}` +
+                  (verdict.offendingClassification
+                    ? ` class=${verdict.offendingClassification}`
+                    : '') +
+                  (verdict.worstCell
+                    ? ` worst=${JSON.stringify(verdict.worstCell)}`
+                    : '')
+                : `undecidable:${verdict.reason || 'unknown'}`;
+              console.warn(
+                `   ⚠️  split-density[${aspectKey}]: ${detail} — ` +
+                `degrading to brand_panel (no scrim rescue; gate ~$0.01–0.02 vs master ~$0.90–1.20)`
+              );
+            }
+          } catch (err) {
+            // Advisory failure must not kill the run — same shape as the
+            // buildReferenceImages per-item catch. Degrade and continue.
+            console.warn(
+              `   ⚠️  split-density[${aspectKey}]: gate failed ` +
+              `(${err?.message || err}) — degrading to brand_panel, run continues`
+            );
+          }
+
+          if (!densityOk) {
+            // ONE free brand_panel swap. Source is the original product
+            // bytes (srcNorm), not the busy outfill — the whole point is a
+            // flat brand-colour half opposite the subject.
+            try {
+              const { websiteBackgroundHex } = require('../utils/websiteBackground');
+              const hex = websiteBackgroundHex(brand);
+              const panelBuf = await padSolidBuffer(srcNorm.buffer, W, H, hex, splitSide);
+              const fitted = panelBuf
+                ? await fitBufferForCloudinary(panelBuf, `split-brand-panel[${aspectKey}]`)
+                : null;
+              if (fitted) {
+                const up = await uploadBufferToCloudinary(fitted, { folder: 'liquidretail/reframes' });
+                const url = up.secure_url || up.url;
+                if (url) {
+                  resultUrl = url;
+                  method = 'brand_panel-density-fallback';
+                  console.log(
+                    `   🎨 split-density[${aspectKey}]: brand_panel ready ` +
+                    `(#${hex}, gravity=${splitSide})`
+                  );
+                }
+              }
+              if (method !== 'brand_panel-density-fallback') {
+                // Brand panel itself failed. Keep the outfill rather than
+                // return nothing — the pipeline still needs a seed URL, and
+                // a possibly-busy panel beats a hard fail after money spent.
+                console.warn(
+                  `   ⚠️  split-density[${aspectKey}]: brand_panel unavailable — ` +
+                  `keeping outfill rather than failing the run`
+                );
+              }
+            } catch (err) {
+              console.warn(
+                `   ⚠️  split-density[${aspectKey}]: brand_panel failed ` +
+                `(${err?.message || err}) — keeping outfill, run continues`
+              );
+            }
+          }
+        }
+
         // 6a. Drop the normalized-source mirror IF we made one (opaque, correctly
         //     oriented sources are handed to Atlas by their original URL and have
         //     nothing to clean up). The mirror exists only so the model could
