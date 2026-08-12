@@ -49,22 +49,88 @@ router.get('/', async (req, res) => {
     const filter = { brandId };
     if (req.query.platform) filter.platform = req.query.platform;
     if (req.query.status)   filter.status   = req.query.status;
+    // Optional kind filter — the UGC wizard's Step 3 passes this so
+    // the Brand path only surfaces brand-kind campaigns and the
+    // Product / Promotional paths only surface those kinds. Category
+    // path deliberately does NOT pass kind — it intersection-filters
+    // on products (see intersectCategoryIds below), so a kind='product'
+    // campaign whose SKUs live in the picked category is a valid hit.
+    if (req.query.kind) filter.kind = String(req.query.kind);
+
+    // UGC-attach intersection (2026-08-12). The wizard passes one of:
+    //   intersectProductIds=a,b,c    — Product / Promotional path
+    //   intersectCategoryIds=x,y     — Category path
+    // For every returned campaign we compute intersectionCount =
+    // |campaign.matchedProductIds ∩ resolvedProductIds|. Category ids
+    // resolve to product ids via CatalogProduct.categoryRef first.
+    // filterEmptyIntersection=true (Category path) DROPS campaigns
+    // with zero intersection so the list is empty when nothing matches.
+    const intersectProductIds = (req.query.intersectProductIds || '')
+      .split(',').map(s => s.trim()).filter(Boolean);
+    const intersectCategoryIds = (req.query.intersectCategoryIds || '')
+      .split(',').map(s => s.trim()).filter(Boolean);
+    const filterEmptyIntersection = req.query.filterEmptyIntersection === 'true';
+
+    let resolvedIntersectProductIds = intersectProductIds.map(String);
+    if (intersectCategoryIds.length) {
+      const catOids = intersectCategoryIds
+        .filter(id => mongoose.isValidObjectId(id))
+        .map(id => new mongoose.Types.ObjectId(String(id)));
+      if (catOids.length) {
+        const prods = await CatalogProduct.find({
+          brandId,
+          categoryRef: { $in: catOids }
+        }).select('_id').lean();
+        // Merge with any explicit product ids (both params can coexist
+        // for a future path that wants both category + specific SKUs).
+        const merged = new Set(resolvedIntersectProductIds);
+        for (const p of prods) merged.add(String(p._id));
+        resolvedIntersectProductIds = [...merged];
+      }
+    }
 
     const rows = await Campaign.find(tenantFilter(req, filter))
       .select('platform externalId name status objective budget schedule productSetIds matchedProductIds mediaIds kind insights adSets lastSyncedAt firstSeenAt promotionalDetails')
       .sort({ lastSyncedAt: -1 })
       .lean();
 
+    // Compute intersectionCount per campaign. Cheap — matchedProductIds
+    // is a stored array, no extra query. Sort by intersection DESC so
+    // the caller sees relevant campaigns first without further work.
+    const intersectSet = resolvedIntersectProductIds.length
+      ? new Set(resolvedIntersectProductIds)
+      : null;
+    const withIntersection = rows.map(c => {
+      const matched = (c.matchedProductIds || []).map(String);
+      const inter = intersectSet
+        ? matched.filter(id => intersectSet.has(id)).length
+        : 0;
+      return { doc: c, intersectionCount: inter };
+    });
+    if (filterEmptyIntersection && intersectSet) {
+      // Category path — only keep rows with a real hit. Empty state is
+      // a valid outcome (operator sees zero campaigns to choose from).
+      for (let i = withIntersection.length - 1; i >= 0; i--) {
+        if (withIntersection[i].intersectionCount === 0) withIntersection.splice(i, 1);
+      }
+    }
+    if (intersectSet) {
+      // Rank by intersection DESC, then keep the existing lastSyncedAt
+      // order as a stable tiebreak (rows was already sorted that way).
+      withIntersection.sort((a, b) => b.intersectionCount - a.intersectionCount);
+    }
+    const filteredRows = withIntersection.map(w => ({ ...w.doc, _intersectionCount: w.intersectionCount }));
+
     // Generated-ad count per campaign (ads tied to the campaign via
     // Ad.campaignId, includes drafts/live/archived but excludes
     // orphan ads where Ad.campaignId is null after an unlink).
     // Single aggregate keeps it cheap regardless of campaign count.
-    const renderedAdCounts = rows.length === 0
+    const renderedAdCounts = filteredRows.length === 0
       ? new Map()
-      : await aggregateAdCounts(rows.map(c => c._id), brandId);
+      : await aggregateAdCounts(filteredRows.map(c => c._id), brandId);
 
     res.json({
-      campaigns: rows.map(c => ({
+      campaigns: filteredRows.map(c => ({
         id:            String(c._id),
         platform:      c.platform,
         externalId:    c.externalId,
@@ -76,6 +142,10 @@ router.get('/', async (req, res) => {
         schedule:      c.schedule || null,
         productSetIds: c.productSetIds || [],
         matchedProductCount: (c.matchedProductIds || []).length,
+        // UGC-attach intersection count (2026-08-12). 0 unless the
+        // caller passed intersectProductIds / intersectCategoryIds.
+        // Frontend uses this to badge "X of Y matched" on Step 3 rows.
+        intersectionCount:   c._intersectionCount || 0,
         mediaCount:    (c.mediaIds || []).length,
         adSetCount:    (c.adSets || []).length,
         // Sum of platform-side ad-set ads (synced campaigns) — left
