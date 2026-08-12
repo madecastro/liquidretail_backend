@@ -78,7 +78,56 @@ async function extractFrames(platePath, times, outDir) {
   return frames;
 }
 
-async function analyzeFrameBands(framePath) {
+// Horizontal span of text stacks — default full-width sample (mirrors
+// stackContainerStyle safe left/right ~0.075). Split-stage may narrow this
+// via resolveBandXRange so ink is scored on the panel the copy actually sits
+// on, not diluted by the product half.
+const BAND_X0 = 0.08;
+const BAND_X1 = 0.92;
+// Must match remotion/lib/safeZones.js PANEL_CENTER_GUTTER_FRAC — duplicated
+// (not imported) because plateIntel is CJS and safeZones is the ESM remotion
+// island. Harness pins both stay equal.
+const PANEL_CENTER_GUTTER_FRAC = 0.04;
+
+/**
+ * Horizontal sample range for band luminance/busyness.
+ *
+ * Absent / null / unknown panelSide → [BAND_X0, BAND_X1] byte-identical to
+ * the pre-split loop bounds (inertness contract for non-split ads).
+ * west → left half only; east → right half only (each trimmed by half the
+ * center gutter so the sample stays inside the reserved copy column).
+ *
+ * Pure / total: never throws; bad input falls back to the full-width range
+ * rather than inventing a column (fail-open on the sampling path — wrong-half
+ * ink is worse than a slightly diluted full-width read only when the prop
+ * is malformed, which should not reach here).
+ *
+ * @param {{ panelSide?: string|null, xRange?: [number, number]|null }} [opts]
+ * @returns {{ x0: number, x1: number }}
+ */
+function resolveBandXRange(opts = {}) {
+  // Explicit xRange wins (fractions 0..1) — for callers that already resolved
+  // a column box. Must be finite and ordered or we ignore it.
+  const xr = opts.xRange;
+  if (Array.isArray(xr) && xr.length === 2
+      && Number.isFinite(xr[0]) && Number.isFinite(xr[1])
+      && xr[1] > xr[0]) {
+    return { x0: Math.max(0, xr[0]), x1: Math.min(1, xr[1]) };
+  }
+  const side = opts.panelSide;
+  if (side === 'west') {
+    // Copy column is left of mid − half gutter. Still inset from the outer
+    // edge by BAND_X0 so we do not sample the extreme left chrome strip.
+    return { x0: BAND_X0, x1: Math.min(BAND_X1, 0.5 - PANEL_CENTER_GUTTER_FRAC / 2) };
+  }
+  if (side === 'east') {
+    return { x0: Math.max(BAND_X0, 0.5 + PANEL_CENTER_GUTTER_FRAC / 2), x1: BAND_X1 };
+  }
+  // Absent, null, '', 'up', etc. → full-width (today's path).
+  return { x0: BAND_X0, x1: BAND_X1 };
+}
+
+async function analyzeFrameBands(framePath, opts = {}) {
   const sharp = require('sharp');
   // 160px tall keeps band strips ≥ ~20 rows after the tightened BANDS
   // geometry (top band is only 0.14 of H); 96 left too few rows for a
@@ -87,6 +136,11 @@ async function analyzeFrameBands(framePath) {
   const { data, info } = await img.raw().toBuffer({ resolveWithObject: true });
   const H = info.height;
   const W = info.width;
+  // Default full width; panelSide / xRange narrows to the copy column so a
+  // split-stage product half cannot dilute the ink vote (2026-08-12).
+  const { x0, x1 } = resolveBandXRange(opts);
+  const xLo = Math.floor(W * x0);
+  const xHi = Math.ceil(W * x1);
   const bands = {};
   for (const [band, [y0, y1]] of Object.entries(BANDS)) {
     const rows = [Math.floor(y0 * H), Math.ceil(y1 * H)];
@@ -94,8 +148,7 @@ async function analyzeFrameBands(framePath) {
     let sum = 0;
     let sumSq = 0;
     for (let y = rows[0]; y < rows[1]; y++) {
-      // Horizontal span mirrors stackContainerStyle safe left/right (~0.075).
-      for (let x = Math.floor(W * 0.08); x < Math.ceil(W * 0.92); x++) {
+      for (let x = xLo; x < xHi; x++) {
         const v = data[y * W + x] / 255;
         values.push(v);
         sum += v;
@@ -182,7 +235,7 @@ function resolveTitlePlacementMode({ placementMode = null, brand = null } = {}) 
  * white-on-white title text. Scan depth (not whether it runs at all)
  * is controlled by TITLE_PLATE_SCAN ('basic' default | 'gemini' | 'off').
  */
-async function analyzePlate(platePath, { durationSec = 8, isImage = false } = {}) {
+async function analyzePlate(platePath, { durationSec = 8, isImage = false, panelSide = null, xRange = null } = {}) {
   const mode = (process.env.TITLE_PLATE_SCAN || 'basic').toLowerCase();
   if (mode === 'off') return null;
   const tmpDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'platescan_'));
@@ -205,10 +258,12 @@ async function analyzePlate(platePath, { durationSec = 8, isImage = false } = {}
       : await extractFrames(platePath, times, tmpDir);
     if (!frames.length) return null;
 
+    // panelSide / xRange optional — absent keeps full-width sampling (inert).
+    const bandOpts = { panelSide, xRange };
     const hints = { samples: [] };
     for (const f of frames) {
       try {
-        hints.samples.push({ atSec: f.atSec, bands: await analyzeFrameBands(f.path) });
+        hints.samples.push({ atSec: f.atSec, bands: await analyzeFrameBands(f.path, bandOpts) });
       } catch (e) {
         console.warn(`🔎 plateIntel: band analysis @${f.atSec}s failed (${e.message})`);
       }
@@ -247,10 +302,6 @@ async function analyzePlate(platePath, { durationSec = 8, isImage = false } = {}
 
 /** Fraction of band area a face must cover before the band is flagged avoid. */
 const FACE_BAND_OVERLAP_THRESHOLD = 0.20;
-
-// Horizontal span of text stacks — matches analyzeFrameBands safe left/right.
-const BAND_X0 = 0.08;
-const BAND_X1 = 0.92;
 
 /**
  * Intersection area of two axis-aligned rects, as a fraction of `band`'s area.
@@ -414,6 +465,9 @@ module.exports = {
   resolveTitlePlacementMode,
   BAND_FOR_ANCHOR,
   BANDS,
+  BAND_X0,
+  BAND_X1,
+  resolveBandXRange,
   applyFaceKeepOut,
   bandFaceOverlapFrac,
   mapSourceFaceToPlate,
