@@ -1230,6 +1230,67 @@ const CAPABILITIES = [
     }
   },
 
+  // ── Shot-style classifier — agent-triggered re-classify (2026-08-13)
+
+  {
+    id:       'catalog.classifyImages',
+    title:    'Classify catalog product images',
+    describe: 'Runs the free (sharp-only) shot-style classifier (packshot / lifestyle / on-model / ...) for a subset of CatalogProducts and persists results onto CatalogProduct.imageShotStyles (URL-keyed). Same engine every ingest loop runs post-upsert — use to re-classify without a full re-sync. Two shapes: productIds[] explicit OR filter DSL (categoryRefs, source, draft, productIds, lastSyncedBefore). force:true bypasses the "URL already classified" skip and re-fetches every image. Cap: 500 products per call. Free (no LLM, no external API). Requires operator confirmation.',
+    tier:     1,
+    scope:    'brand',
+    args: {
+      type: 'object',
+      required: ['brandId'],
+      properties: {
+        brandId:    { type: 'string', description: 'Brand ObjectId.' },
+        productIds: { type: 'array', items: { type: 'string' }, maxItems: 500, description: 'Explicit product ids. Mutually exclusive with filter.' },
+        filter: {
+          type: 'object',
+          description: 'Same DSL as catalog.bulkPatchProducts / bulkDeleteProducts. Mutually exclusive with productIds.',
+          properties: {
+            category:         { type: 'string' },
+            categoryRefs:     { type: 'array', items: { type: 'string' } },
+            source:           { type: 'string' },
+            draft:            { type: 'boolean' },
+            lastSyncedBefore: { type: 'string', description: 'ISO date.' },
+            productIds:       { type: 'array', items: { type: 'string' } }
+          },
+          additionalProperties: false
+        },
+        force: { type: 'boolean', description: 'False (default) = skip URLs already in imageShotStyles. True = re-fetch + re-classify every URL.' }
+      },
+      additionalProperties: false
+    },
+    execute: {
+      kind:    'service',
+      service: './capabilityExecutors/catalogClassifyImages',
+      method:  'run'
+    }
+  },
+
+  {
+    id:       'media.classifyImage',
+    title:    'Classify media image (UGC / single Media)',
+    describe: 'Runs the shot-style classifier for one Media doc or a bulk set of Media ids, writing Media.technicalInsights.shotStyle. Single: {mediaId}. Bulk: {brandId, mediaIds[]}. Skips non-image / soft-deleted / URL-less rows automatically. force:true bypasses shouldApplyStoredShot\'s first-write-only guard, overwriting an existing shotStyle. Cap: 500 media per call. Free (sharp-only). Requires operator confirmation.',
+    tier:     1,
+    scope:    'brand',
+    args: {
+      type: 'object',
+      properties: {
+        mediaId:  { type: 'string', description: 'Single-Media shape — Media ObjectId. Mutually exclusive with mediaIds/brandId.' },
+        brandId:  { type: 'string', description: 'Bulk shape — required with mediaIds. Scopes the read to this brand for safety.' },
+        mediaIds: { type: 'array', items: { type: 'string' }, maxItems: 500, description: 'Bulk shape — Media ObjectIds. Requires brandId.' },
+        force:    { type: 'boolean', description: 'False (default) = respect shouldApplyStoredShot (first-write-only). True = overwrite an existing shotStyle.' }
+      },
+      additionalProperties: false
+    },
+    execute: {
+      kind:    'service',
+      service: './capabilityExecutors/mediaClassifyImage',
+      method:  'run'
+    }
+  },
+
   // ── Phase 6: Detection + layouts — T0 read ───────────────────────
 
   {
