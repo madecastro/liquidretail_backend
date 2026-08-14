@@ -1910,6 +1910,92 @@ async function ensureCatalogProductForMatch(match, ctx) {
     }
   }
 
+  // 2c. D1 — token-Jaccard fuzzy tier. Measured 2026-08-13: only 4/31
+  // product_match outcomes linked to a catalog row (13%). The remaining
+  // 87% had identify.productName that didn't exactly OR subset-match any
+  // catalog title (marketing verbiage on one side, SKU code on the other,
+  // etc.). Fuzzy overlap catches the middle band.
+  //
+  // Guardrails against catalog pollution:
+  //   • brandsMatchLoose required — competitor titles won't link into
+  //     this brand's catalog even if tokens overlap
+  //   • score ≥ SKU_LINK_FUZZY_MIN_SCORE (default 0.6) — 60% of the
+  //     shorter side's tokens must appear on the longer side
+  //   • shared ≥ 3 — two-token accidents like "denim jacket" can't win
+  //   • synced rows preferred over detect-identified on tie
+  //
+  // D2 tiebreak: when multiple fuzzy candidates score within
+  // SKU_LINK_FUZZY_TIE_BAND of the leader, use the pre-computed visual
+  // score on match.query.productCrop.croppedImageUrl vs. candidate hero
+  // image as tiebreaker. Bounded — only fires on ties, capped at
+  // SKU_LINK_FUZZY_VISUAL_MAX candidates.
+  const FUZZY_MIN_SCORE  = Math.max(0.3, Math.min(1, parseFloat(process.env.SKU_LINK_FUZZY_MIN_SCORE) || 0.6));
+  const FUZZY_TIE_BAND   = Math.max(0.01, Math.min(0.5, parseFloat(process.env.SKU_LINK_FUZZY_TIE_BAND) || 0.1));
+  const FUZZY_VISUAL_MAX = Math.max(2, parseInt(process.env.SKU_LINK_FUZZY_VISUAL_MAX, 10) || 4);
+  const FUZZY_ENABLED    = process.env.SKU_LINK_FUZZY_ENABLED !== 'false';
+  const brandOk          = !identBrand || !activeBrand || brandsMatchLoose(identBrand, activeBrand);
+  if (FUZZY_ENABLED && normalizedQuery && brandOk) {
+    const candidates = await CatalogProduct.find({
+      brandId: ctx.brandId,
+      draft:   { $ne: true }
+    }).select('_id title source normalizedTitle imageUrl').lean();
+
+    const scored = [];
+    for (const row of candidates) {
+      const { score, shared } = titleSimilarity(row.normalizedTitle || row.title, ident.productName);
+      if (shared < 3 || score < FUZZY_MIN_SCORE || score >= 1.0) continue;   // subset tier already caught score=1
+      scored.push({ row, score, shared });
+    }
+    if (scored.length) {
+      scored.sort((a, b) => (b.score - a.score) || (b.shared - a.shared));
+      const leader = scored[0];
+      const tieBand = scored.filter(s => (leader.score - s.score) <= FUZZY_TIE_BAND);
+
+      let picked = leader;
+      let tieBreak = null;
+      if (tieBand.length > 1) {
+        // D2 — visual tiebreak. Use the refined crop URL threaded through
+        // by buildPerProductProviderMatchRecord (match.query.productCrop
+        // .croppedImageUrl). Bounded; degrades silently to token-tiebreak
+        // on any visual failure.
+        const cropUrl = match.query?.productCrop?.croppedImageUrl;
+        if (cropUrl) {
+          const pool = tieBand.slice(0, FUZZY_VISUAL_MAX);
+          try {
+            const visuals = await Promise.all(pool.map(s =>
+              compareUgcCropToCatalogProduct(cropUrl, s.row)
+                .catch(err => {
+                  console.warn(`   ⚠️  D2 visual tiebreak threw: ${err.message}`);
+                  return null;
+                })
+            ));
+            let bestV = null;
+            for (let i = 0; i < pool.length; i++) {
+              const v = visuals[i];
+              const vs = v?.isMatch ? Number(v.score || 0) : 0;
+              if (vs > 0 && (!bestV || vs > bestV.vs)) bestV = { s: pool[i], vs };
+            }
+            if (bestV) {
+              picked = bestV.s;
+              tieBreak = `visual=${bestV.vs.toFixed(2)}`;
+            }
+          } catch (err) {
+            console.warn(`   ⚠️  D2 tiebreak pool failed: ${err.message}`);
+          }
+        }
+        // Fallback tiebreak: prefer synced rows over detect-identified.
+        if (!tieBreak) {
+          const isSynced = (r) => r.source !== 'detect-identified';
+          const synced = tieBand.find(s => isSynced(s.row));
+          if (synced) { picked = synced; tieBreak = 'synced-preferred'; }
+        }
+      }
+
+      console.log(`   · ensureCatalogProduct[${match.productIndex || 'primary'}]: fuzzy title match score=${picked.score.toFixed(2)} shared=${picked.shared} pool=${scored.length}${tieBreak ? ` tiebreak=${tieBreak}` : ''} (source=${picked.row.source}) → ${picked.row._id} "${picked.row.title}"`);
+      return picked.row._id;
+    }
+  }
+
   // Brand-mismatch guard — gates NEW row creation only. Existing rows above
   // are returned regardless so FK propagation works on subsequent runs.
   if (identBrand && activeBrand && !brandsMatchLoose(identBrand, activeBrand)) {
@@ -2089,6 +2175,50 @@ async function loadCatalogRefinedCropUrls(catalogProductId) {
   return urls;
 }
 
+// C1 — visual-only fallback pool size when text signals are absent.
+// Measured 2026-08-13: 100% of catalog match artifacts had NULL
+// catalogVisualScore because the visual matcher was gated behind text
+// candidates, and UGC lifestyle shots have zero OCR text and rarely
+// contain SKU tokens in captions. Bounded top-K keeps Gemini Vision
+// spend proportional to run count (each call ~$0.0015; K=8 × ~20 UGC
+// runs/day ≈ $0.24/day).
+const CATALOG_VISUAL_ONLY_TOPK = Math.max(1, parseInt(process.env.CATALOG_VISUAL_ONLY_TOPK, 10) || 8);
+
+// Pull up to topK candidate CatalogProducts for visual scoring when
+// text search returned nothing. Category-scoped when we have a refined
+// category enum; falls back to brand-wide. Deliberately non-fatal —
+// any failure returns [] and the caller degrades to the old zero-return.
+async function fetchVisualOnlyCandidates({ brandId, category, topK }) {
+  if (!brandId) return [];
+  const baseQuery = {
+    brandId,
+    draft:            { $ne: true },
+    isPrimaryVariant: { $ne: false },
+    imageUrl:         { $exists: true, $ne: '' }
+  };
+  try {
+    if (category) {
+      const subtreeIds = await getCoarseSubtreeIds({ brandId, enumCategory: category });
+      if (subtreeIds.length) {
+        const scoped = await CatalogProduct
+          .find({ ...baseQuery, categoryRef: { $in: subtreeIds } })
+          .limit(topK)
+          .select('_id title imageUrl category brand')
+          .lean();
+        if (scoped.length) return scoped;
+      }
+    }
+    return await CatalogProduct
+      .find(baseQuery)
+      .limit(topK)
+      .select('_id title imageUrl category brand')
+      .lean();
+  } catch (err) {
+    console.warn(`   ⚠️  fetchVisualOnlyCandidates failed: ${err.message}`);
+    return [];
+  }
+}
+
 async function catalogFirstMatchOneRefined(refined, { brandId, caption, textDetected, comments }) {
   if (!brandId || !refined) return { combinedScore: 0, catalogMatch: null, visualResult: null };
 
@@ -2100,8 +2230,51 @@ async function catalogFirstMatchOneRefined(refined, { brandId, caption, textDete
     comments,
     topK: 3
   });
+
+  // C1 — visual-only fallback when text finds nothing. Previously
+  // returned zero here, which is why every catalog match artifact in
+  // the 2026-08-13 sample had NULL catalogVisualScore. Falls back to a
+  // category-scoped candidate pull and lets Gemini Vision arbitrate on
+  // the refined crop directly.
   if (!textCandidates.length) {
-    return { combinedScore: 0, catalogMatch: null, visualResult: null };
+    if (!refined.croppedImageUrl) {
+      return { combinedScore: 0, catalogMatch: null, visualResult: null };
+    }
+    const visualCandidates = await fetchVisualOnlyCandidates({
+      brandId,
+      category: refined.category || null,
+      topK:     CATALOG_VISUAL_ONLY_TOPK
+    });
+    if (!visualCandidates.length) {
+      return { combinedScore: 0, catalogMatch: null, visualResult: null };
+    }
+    const visualResults = await Promise.all(visualCandidates.map(p =>
+      compareUgcCropToCatalogProduct(refined.croppedImageUrl, p)
+        .catch(err => {
+          console.warn(`   ⚠️  visualCatalogMatch (fallback) threw: ${err.message}`);
+          return null;
+        })
+    ));
+    let bestV = null;
+    for (let i = 0; i < visualCandidates.length; i++) {
+      const p = visualCandidates[i];
+      const v = visualResults[i];
+      const score = v?.isMatch ? Number(v.score || 0) : 0;
+      if (!bestV || score > bestV.combinedScore) {
+        bestV = {
+          catalogMatch:  { product: p, textScore: 0, matchedTerm: null, matchedSrcs: [] },
+          visualResult:  v,
+          textScore:     0,
+          visualScore:   score,
+          combinedScore: score
+        };
+      }
+    }
+    if (!bestV || bestV.combinedScore === 0) {
+      return { combinedScore: 0, catalogMatch: null, visualResult: null };
+    }
+    console.log(`   · catalog-first[${refined.id}] (visual-only fallback): visual=${bestV.visualScore.toFixed(2)} pool=${visualCandidates.length} → "${bestV.catalogMatch.product.title}"`);
+    return bestV;
   }
 
   // Visual scoring per text candidate: compare the UGC refined crop

@@ -1337,6 +1337,49 @@ const CAPABILITIES = [
     }
   },
 
+  {
+    id:       'detect.inspect',
+    title:    'Inspect a DetectRun',
+    describe: 'Return a compact dump of a DetectRun and its per-stage artifacts — status, stageTimings, flags (yoloFailed / yoloDownscaled / yoloFallbackSynth), YOLO + refined product counts + bboxes, subjects, crops+winners, ProductMatchArtifact outcomes with linked catalog titles. Read-only, tenant-scoped. Pass either {runId} for a specific run or {mediaId} for the most recent run on that media (latest:false lists up to 5 runs). Answers "why did this detect fail?" without falling through to shell diagnostics.',
+    tier:     0,
+    scope:    'brand',
+    args: {
+      type: 'object',
+      properties: {
+        runId:   { type: 'string', description: 'DetectRun ObjectId.' },
+        mediaId: { type: 'string', description: 'Media ObjectId. Ignored if runId is set.' },
+        latest:  { type: 'boolean', description: 'When mediaId is used: true (default) returns most recent; false returns up to 5.' }
+      },
+      additionalProperties: false
+    },
+    execute: {
+      kind:    'service',
+      service: './capabilityExecutors/detectInspect',
+      method:  'run'
+    }
+  },
+
+  {
+    id:       'detect.rematchCatalogProduct',
+    title:    'Rematch detect on a catalog-product Media',
+    describe: 'Enqueue a fresh DetectRun for a Media whose source is \'catalog-product\'. Companion to detect.rematch, which refuses catalog wrappers on the grounds they are pipeline-internal — that refusal is stale given catalog-source is 62% of detect traffic and accounted for 100% of the yoloFailed=true rows in the 2026-08-13 sample. Priority 1. Requires operator confirmation.',
+    tier:     2,
+    scope:    'brand',
+    args: {
+      type: 'object',
+      required: ['mediaId'],
+      properties: {
+        mediaId: { type: 'string', description: 'Media ObjectId — must have source \'catalog-product\'.' }
+      },
+      additionalProperties: false
+    },
+    execute: {
+      kind:    'service',
+      service: './capabilityExecutors/detectRematchCatalogProduct',
+      method:  'run'
+    }
+  },
+
   // ── Phase 10: Sales demos — T1 CRUD + abort ───────────────────────
 
   {

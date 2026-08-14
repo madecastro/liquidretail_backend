@@ -136,7 +136,7 @@ async function runImagePipeline(run, media, buffer, sourceUrlOverride = null) {
   // ── Phase 1: detect fan-out ──
   await setRunPhase(run, 'detect-fanout');
   const [yoloRes, subjectsRes] = await Promise.allSettled([
-    runYoloChain(run, buffer, media, sourceUrl),
+    runYoloChain(run, buffer, media, sourceUrl, { imgW, imgH }),
     runSubjectsTextChain(run, sourceUrl, media)
   ]);
   if (yoloRes.status === 'rejected') {
@@ -501,7 +501,7 @@ async function runCatalogProductPipeline(run, media, buffer) {
   // (catalog metadata is the source of truth for brand/category/label).
   await setRunPhase(run, 'detect-fanout');
   const [yoloRes, subjectsRes] = await Promise.allSettled([
-    runYoloChain(run, buffer, media, sourceUrl, { skipIdentify: true }),
+    runYoloChain(run, buffer, media, sourceUrl, { skipIdentify: true, imgW, imgH }),
     runSubjectsTextChain(run, sourceUrl, media)
   ]);
   if (yoloRes.status === 'rejected') {
@@ -640,6 +640,38 @@ async function runCatalogProductPipeline(run, media, buffer) {
     })
     .catch(err => console.warn(`   ⚠️  catalog-product lazy enrichment failed for media ${media._id}: ${err.message}`));
 
+  // E1 — back-link Media.matchedProducts to the catalog product this
+  // wrapper Media represents. Catalog-source runs skip the match phase
+  // entirely (SKU is source-of-truth), which used to leave
+  // Media.matchedProducts empty on 100% of catalog Media even though
+  // metadata.catalogProductId was populated. Consumers reading
+  // matchedProducts (Media Library, alt seed paths) went blind on the
+  // brand's own catalog rows. Restores the Media-keyed schema invariant.
+  const cpId = media.metadata?.catalogProductId;
+  if (cpId) {
+    try {
+      // Idempotent: remove any prior detect-derived entry for this
+      // same catalog product, then insert the fresh one. Operator
+      // entries (source:'operator') are preserved by the source filter.
+      await Media.updateOne(
+        { _id: media._id },
+        { $pull: { matchedProducts: { source: 'detect', catalogProductId: cpId } } }
+      );
+      await Media.updateOne(
+        { _id: media._id },
+        { $push: { matchedProducts: {
+            catalogProductId: cpId,
+            matchKind:        'catalog',
+            outcome:          'product_match',
+            confidence:       1.0,
+            source:           'detect'
+        } } }
+      );
+    } catch (err) {
+      console.warn(`   ⚠️  catalog-product back-link failed for media ${media._id}: ${err.message}`);
+    }
+  }
+
   console.log(`📦 catalog-product detect (${isHero ? 'hero' : 'alt'}) done — YOLO=${products.length}, refined=${refinedProducts.length}, subjects=${subjects.length}, judge=${judge ? 'yes' : 'skipped'}`);
 }
 
@@ -651,6 +683,34 @@ async function runCatalogProductPipeline(run, media, buffer) {
 //  race on save().
 // ──────────────────────────────────────────────────────────────
 
+// Env knobs for A3 (downscale) — YOLO_DOWNSCALE_ENABLED gates the resize;
+// YOLO_MAX_INPUT_WIDTH is the ceiling. Default 1600 keeps catalog product
+// plates (typically 1999×2372) safely inside the axios 120s client
+// timeout — measured p90 dropped from 136s to well below the limit when
+// tile count halved from 12→6. Off by default for UGC where fine-detail
+// recall (small logos, spec labels) matters; catalog callers opt in via
+// options.downscale.
+const YOLO_DOWNSCALE_ENABLED = process.env.YOLO_DOWNSCALE_ENABLED !== 'false';
+const YOLO_MAX_INPUT_WIDTH   = Math.max(512, parseInt(process.env.YOLO_MAX_INPUT_WIDTH, 10) || 1600);
+
+// Best-effort downscale before YOLO submit. Returns the same buffer on
+// any failure — never blocks the pipeline over a resize issue.
+async function maybeDownscaleForYolo(buffer, imgW) {
+  if (!YOLO_DOWNSCALE_ENABLED) return { buffer, resized: false };
+  if (!imgW || imgW <= YOLO_MAX_INPUT_WIDTH) return { buffer, resized: false };
+  try {
+    const sharp = require('sharp');
+    const resized = await sharp(buffer)
+      .resize({ width: YOLO_MAX_INPUT_WIDTH, withoutEnlargement: true })
+      .jpeg({ quality: 85 })
+      .toBuffer();
+    return { buffer: resized, resized: true, fromWidth: imgW, toWidth: YOLO_MAX_INPUT_WIDTH };
+  } catch (err) {
+    console.warn(`   ⚠️  YOLO downscale failed (${err.message}) — sending original buffer`);
+    return { buffer, resized: false };
+  }
+}
+
 async function runYoloChain(run, buffer, media, sourceUrlOverride = null, options = {}) {
   const refineSourceUrl = sourceUrlOverride || media.fileUrl;
   // skipIdentify: catalog-product images already know their SKU from the
@@ -659,9 +719,19 @@ async function runYoloChain(run, buffer, media, sourceUrlOverride = null, option
   // would just disagree with the source-of-truth catalog metadata).
   // refineDetectionCrops then treats every detection as a survivor.
   const skipIdentify = !!options.skipIdentify;
+  // imgW/imgH passed in from the outer pipeline (computed via sharp
+  // BEFORE this chain runs). Used by A3 downscale + A4 fallback bbox.
+  const imgW = options.imgW || null;
+  const imgH = options.imgH || null;
   const products = await timeStage(run, 'yolo', async () => {
     try {
-      const yolo = await detectMultipleProducts(buffer);
+      const { buffer: yoloBuffer, resized, fromWidth, toWidth } = await maybeDownscaleForYolo(buffer, imgW);
+      if (resized) {
+        console.log(`   · YOLO downscale: ${fromWidth}px → ${toWidth}px (A3)`);
+        run.flags = run.flags || {};
+        run.flags.yoloDownscaled = { from: fromWidth, to: toWidth };
+      }
+      const yolo = await detectMultipleProducts(yoloBuffer);
       console.log(`🔍 YOLO: ${yolo.detections.length} product(s)`);
       // Bbox-dedup before identify so the dual-engine call only runs
       // on distinct objects. YOLO sometimes returns two overlapping
@@ -673,6 +743,21 @@ async function runYoloChain(run, buffer, media, sourceUrlOverride = null, option
       if (dropped > 0) {
         console.log(`   · YOLO bbox-dedup: collapsed ${dropped} overlapping detection(s) (${deduped.length} kept)`);
       }
+      // A3 rescale: coords returned by YOLO are relative to the (possibly
+      // downscaled) buffer we sent. Rescale bboxes back to the source
+      // image's pixel space so crop-refine, safeRect, smart-crops, and
+      // catalog-side crop URLs all land on the right region.
+      if (resized && fromWidth && toWidth && fromWidth !== toWidth) {
+        const scale = fromWidth / toWidth;
+        for (const d of deduped) {
+          d.x1 = Math.round((d.x1 || 0) * scale);
+          d.y1 = Math.round((d.y1 || 0) * scale);
+          d.x2 = Math.round((d.x2 || 0) * scale);
+          d.y2 = Math.round((d.y2 || 0) * scale);
+          d.imgWidth  = imgW || d.imgWidth;
+          d.imgHeight = imgH || d.imgHeight;
+        }
+      }
       return deduped;
     } catch (err) {
       // Stamp a non-fatal flag so the rematch endpoint can target
@@ -683,6 +768,31 @@ async function runYoloChain(run, buffer, media, sourceUrlOverride = null, option
       run.flags = run.flags || {};
       run.flags.yoloFailed = true;
       run.flags.yoloError  = err.message || 'yolo call failed';
+      if (err.yoloKind) run.flags.yoloErrorKind = err.yoloKind;
+      // A4 — YOLO fallback bbox. Return one synthesized "full-image"
+      // detection so downstream identify + match still fires; recovers
+      // brand-level attribution on the 23% of runs that previously
+      // produced ZERO ProductMatchArtifacts (measured 2026-08-13).
+      // Only fires on catalog/image paths where imgW/imgH are known —
+      // the buffer may be a video, in which case a full-image bbox is
+      // meaningless and we fall back to the old empty-array behavior.
+      if (imgW && imgH && media.fileType === 'image') {
+        run.flags.yoloFallbackSynth = true;
+        return [{
+          id:           'p1',
+          cropBuffer:   buffer,           // full source; refine will re-crop
+          confidence:   0.1,
+          x1:           0,
+          y1:           0,
+          x2:           imgW,
+          y2:           imgH,
+          className:    'object',
+          imgWidth:     imgW,
+          imgHeight:    imgH,
+          firstSeenSec: null,
+          _synthesized: true
+        }];
+      }
       return [];
     }
   });

@@ -38,6 +38,26 @@ function isTransientYoloError(err) {
   return false;
 }
 
+// Classify an axios failure into a short kind so run.flags.yoloError
+// carries enough detail to distinguish "microservice OOM'd" from
+// "client-side timeout while microservice kept working" post-hoc.
+// Previously every failure collapsed to the literal string
+// "Object detection failed", which made 23% of runs indistinguishable
+// from each other in the DetectRun flags.
+function classifyYoloError(err) {
+  const code = err?.code;
+  const status = err?.response?.status;
+  if (code === 'ECONNABORTED') return 'client-timeout';
+  if (code === 'ECONNRESET')   return 'conn-reset';
+  if (code === 'ETIMEDOUT')    return 'conn-timeout';
+  if (typeof status === 'number') {
+    if (status >= 500) return `http-${status}`;
+    if (status >= 400) return `http-${status}`;
+  }
+  if (typeof err?.message === 'string' && /timeout/i.test(err.message)) return 'client-timeout';
+  return code ? String(code).toLowerCase() : 'unknown';
+}
+
 async function _callYolo(url, form) {
   let lastErr = null;
   for (let attempt = 0; attempt <= YOLO_RETRY_ATTEMPTS; attempt++) {
@@ -80,15 +100,21 @@ async function _callYolo(url, form) {
       const detail = err.response?.data || err.message;
       // Non-transient failures (4xx, parse errors, etc.) → fail fast
       if (!isTransientYoloError(err)) {
-        console.error('❌ YOLO detection failed (non-transient):', detail);
-        throw new Error('Object detection failed');
+        const kind = classifyYoloError(err);
+        console.error(`❌ YOLO detection failed (non-transient, ${kind}):`, detail);
+        const e = new Error(`yolo:${kind}: ${err.message || 'call failed'}`);
+        e.yoloKind = kind;
+        throw e;
       }
       console.warn(`⚠️  YOLO transient failure (attempt ${attempt + 1}): ${err.code || err.message}`);
       // Loop to retry; if attempts exhausted, fall through to throw below.
     }
   }
-  console.error('❌ YOLO detection failed after retries:', lastErr?.code || lastErr?.message);
-  throw new Error('Object detection failed');
+  const kind = classifyYoloError(lastErr);
+  console.error(`❌ YOLO detection failed after retries (${kind}):`, lastErr?.code || lastErr?.message);
+  const e = new Error(`yolo:${kind}: ${lastErr?.message || 'retries exhausted'}`);
+  e.yoloKind = kind;
+  throw e;
 }
 
 module.exports = { detectMultipleProducts, detectFromVideo };

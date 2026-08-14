@@ -67,11 +67,11 @@ const SPEC = Object.freeze({
   // ── Worker process ──────────────────────────────────────────────────
   WORKER_CONCURRENCY: {
     env: 'WORKER_CONCURRENCY',
-    default: 5,
+    default: 8,
     min: 1,
     max: 100,
     ceiling: 'SELF-IMPOSED',
-    why: 'Parallel DetectRun/Job polling loops inside the worker process. I/O-bound; Mongo pool scales with it.'
+    why: 'Parallel DetectRun/Job polling loops inside the worker process. I/O-bound; Mongo pool scales with it. Raised 5→8 on 2026-08-14 (deferred YOLO plan step #1).'
   },
 
   // ── Atlas video submit pacing ───────────────────────────────────────
