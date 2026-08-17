@@ -42,12 +42,23 @@ const { concurrency: CONC, logConcurrencyConfig } = require('./services/concurre
 const CONCURRENCY = CONC.WORKER_CONCURRENCY;
 logConcurrencyConfig();
 
+// Shared with routes/ads.js — see services/staleness.js for why these are not
+// parsed inline. Must be required above the const declarations that call them.
+const { reapStaleMin, prepareStaleMin } = require('./services/staleness');
+
 // Orphan reaper tuning. STALE_MIN is the threshold past which a claimed
 // (status: 'processing' / 'rendering' / 'running') doc is presumed
 // abandoned — the original holder died without releasing it. Conservative
 // 15 min default so legitimately slow work isn't reaped mid-flight.
 // REAP_INTERVAL_MIN drives the periodic sweep alongside the startup pass.
-const REAP_STALE_MIN     = Math.max(1, parseInt(process.env.REAP_STALE_MIN, 10)     || 15);
+//
+// REAP_STALE_MIN is parsed by services/staleness.js, NOT inline here: the web
+// process's concurrency gate keys off the same bound (routes/ads.js), and this
+// file and that one used to parse it two different ways — agreeing on every
+// input except a negative value, where this side resolved to 1 and handed the
+// reaper a ONE-MINUTE threshold. Read it once at boot, as before, so the value
+// stays fixed for the process lifetime.
+const REAP_STALE_MIN     = reapStaleMin();
 const REAP_INTERVAL_MIN  = Math.max(1, parseInt(process.env.REAP_INTERVAL_MIN, 10)  || 5);
 // A 'preparing' CampaignRun NEVER heartbeats — no write to the row exists
 // anywhere between mint (routes/ads.js POST /generate) and the flip to
@@ -72,8 +83,10 @@ const REAP_INTERVAL_MIN  = Math.max(1, parseInt(process.env.REAP_INTERVAL_MIN, 1
 // window can never resurrect itself regardless of whether this ever ticks.
 // So this var only decides when a dead-looking row gets stamped 'failed'
 // for visibility; raising it costs nothing but a longer-lived alert.
-// Separate name from REAP_STALE_MIN so it can still be tuned on its own.
-const PREPARE_STALE_MIN  = Math.max(1, parseInt(process.env.PREPARE_STALE_MIN, 10)  || 15);
+// Separate name from REAP_STALE_MIN so it can still be tuned on its own —
+// but the same parser (services/staleness.js), so a nonsense value falls back
+// to the documented default here too instead of clamping to 1 minute.
+const PREPARE_STALE_MIN  = prepareStaleMin();
 
 // Health sweep → Slack (services/backlogWatchdog.js). Separate cadence
 // from the reaper so the thresholds can be tuned independently.

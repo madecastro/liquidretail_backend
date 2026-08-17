@@ -77,6 +77,7 @@ const {
   buildUnclaimedNotice
 } = require('../services/generationGate');
 const { buildTerminalDoneFilter, buildRunningFlipFilter } = require('../services/campaignRunGuards');
+const { reapStaleMin } = require('../services/staleness');
 
 // Operator-facing gate for a multi-select format list (preset 'explicit'),
 // shared by /preview + /generate.
@@ -515,22 +516,24 @@ router.post('/generate', async (req, res) => {
     // is REAP_STALE_MIN, the same one worker.js uses to reclaim stuck ads, so the
     // two cannot drift into disagreeing about what "stale" means.
     //
-    // CLAMPED — adversarial review found this var is now load-bearing for
+    // PARSED IN ONE PLACE — services/staleness.js. This var is load-bearing for
     // whether generation succeeds AT ALL (buildRunningFlipFilter's age guard),
-    // not just for duplicate-detection leniency. `Number(process.env.X || 15)`
-    // looks safe but is the exact trap CLAUDE.md documents for PMAX_PROOF_*:
-    // a non-empty string is truthy even when it parses to something useless —
-    // '0', whitespace, or a negative value all skip the `|| 15` fallback and
+    // not just for duplicate-detection leniency: '0', whitespace or a negative
     // collapse the flip's startedAt guard to `>= now` (or a future instant),
-    // which NO real run's startedAt can ever satisfy. That silently turns
-    // every single Generate into "pay for Director/Judge, claim ads, discard
-    // everything" — a total, silent generation outage, not a weakened gate.
-    // REAP_STALE_MIN lives dashboard-only (not in config/defaults.env), which
-    // is exactly where "set it to 0 to disable staleness" is the intuitive
-    // and catastrophic move. Same clamp idiom as services/atlasImageService.js
-    // positiveTimeout().
-    const staleMinRaw = Number(process.env.REAP_STALE_MIN);
-    const staleMin = Number.isFinite(staleMinRaw) && staleMinRaw > 0 ? staleMinRaw : 15;
+    // which NO real run's startedAt can satisfy — turning every Generate into
+    // "pay for Director/Judge, claim ads, discard everything", a total silent
+    // generation outage. REAP_STALE_MIN is dashboard-only (not in
+    // config/defaults.env), which is exactly where "set it to 0 to disable
+    // staleness" is the intuitive and catastrophic move.
+    //
+    // It is read through the shared parser rather than clamped inline because
+    // worker.js's reaper keys off the SAME bound, and the two used to parse it
+    // differently — agreeing on every input except a negative, where the worker
+    // resolved to 1 and got a ONE-MINUTE threshold, i.e. reaping live work
+    // mid-render. The comment directly above states the invariant ("the two
+    // cannot drift into disagreeing about what stale means"); one parser is
+    // what actually enforces it.
+    const staleMin = reapStaleMin();
 
     // The fingerprint is built from the PARSED values, not raw req.body, so the
     // hash sees exactly what the expansion will (parsedVideoDurationSec, the

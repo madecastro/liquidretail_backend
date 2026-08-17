@@ -298,9 +298,28 @@ ok('D7 flip.matchedCount is read defensively against other Mongo result shapes, 
 // existing REAP_STALE_MIN pattern (env override, floor of 1, default 15).
 // Its value no longer carries money risk either way (see buildRunningFlipFilter),
 // so this only pins that it stays a well-formed, boundable knob.
-ok('E1 PREPARE_STALE_MIN parses env with Math.max(1, ...) and a 15-minute default', () => {
-  const m = workerSrc.match(/const PREPARE_STALE_MIN\s*=\s*Math\.max\(1,\s*parseInt\(process\.env\.PREPARE_STALE_MIN,\s*10\)\s*\|\|\s*15\)/);
-  assert.ok(m, 'PREPARE_STALE_MIN must follow the same env/floor/default shape as REAP_STALE_MIN');
+ok('E1 PREPARE_STALE_MIN comes from the shared parser with a 15-minute default', () => {
+  // REWRITTEN: this used to pin `Math.max(1, parseInt(env,10) || 15)` — which
+  // ENSHRINED THE BUG. That idiom maps a negative to 1, handing the reaper a
+  // ONE-MINUTE staleness threshold (it would sweep runs a minute old, i.e.
+  // reap live work mid-render), and it disagreed with the web side's parse of
+  // the same class of value. Both processes now read services/staleness.js.
+  // Asserted by BEHAVIOUR, not by shape, so no idiom can be "right-looking".
+  const staleness = require('../services/staleness');
+  assert.ok(/prepareStaleMin\(\)/.test(workerSrc), 'worker.js must call prepareStaleMin()');
+  assert.strictEqual(staleness.PREPARE_STALE_MIN_DEFAULT, 15, 'default must stay 15 minutes');
+  const prev = process.env.PREPARE_STALE_MIN;
+  try {
+    for (const bad of ['', '   ', '0', '-5', 'abc']) {
+      process.env.PREPARE_STALE_MIN = bad;
+      assert.strictEqual(staleness.prepareStaleMin(), 15,
+        `nonsense value ${JSON.stringify(bad)} must fall back to 15, never clamp to 1`);
+    }
+    process.env.PREPARE_STALE_MIN = '45';
+    assert.strictEqual(staleness.prepareStaleMin(), 45, 'a legitimate override must be honoured');
+  } finally {
+    if (prev === undefined) delete process.env.PREPARE_STALE_MIN; else process.env.PREPARE_STALE_MIN = prev;
+  }
 });
 
 // ── Group F — adversarial-review round 2 findings.
@@ -338,8 +357,25 @@ ok('F1a the clamp survives every malformed REAP_STALE_MIN value adversarial revi
 ok('F1b the real routes/ads.js staleMin computation uses the fixed clamp idiom, not the naive one', () => {
   assert.ok(!/const staleMin = Number\(process\.env\.REAP_STALE_MIN \|\| 15\)/.test(adsSrc),
     'the naive `Number(env || 15)` form must not return — it is truthy-string-shaped, not numeric-shaped');
-  assert.ok(/Number\.isFinite\(staleMinRaw\)\s*&&\s*staleMinRaw\s*>\s*0\s*\?\s*staleMinRaw\s*:\s*15/.test(adsSrc),
-    'routes/ads.js must clamp staleMin with Number.isFinite(..) && .. > 0 ? .. : 15, matching services/atlasImageService.js positiveTimeout()');
+  // The clamp moved OUT of routes/ads.js into services/staleness.js, so that
+  // the worker's reaper and this gate cannot parse the same bound differently
+  // (they did: a negative gave the worker 1 and the web 15). Assert the wiring
+  // plus the actual behaviour, not the literal inline shape.
+  assert.ok(/require\(['"]\.\.\/services\/staleness['"]\)/.test(adsSrc),
+    'routes/ads.js must read the bound through services/staleness.js');
+  assert.ok(/const staleMin = reapStaleMin\(\)/.test(adsSrc),
+    'routes/ads.js must assign staleMin from reapStaleMin()');
+  const { reapStaleMin } = require('../services/staleness');
+  const prevReap = process.env.REAP_STALE_MIN;
+  try {
+    for (const bad of ['', '   ', '0', '-5']) {
+      process.env.REAP_STALE_MIN = bad;
+      assert.ok(reapStaleMin() > 0,
+        `a staleMin of <= 0 from ${JSON.stringify(bad)} makes startedAt >= now unsatisfiable — every Generate would be discarded`);
+    }
+  } finally {
+    if (prevReap === undefined) delete process.env.REAP_STALE_MIN; else process.env.REAP_STALE_MIN = prevReap;
+  }
 });
 
 // F2: buildRunningFlipFilter keys on startedAt while the gate keys on
