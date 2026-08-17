@@ -1769,6 +1769,12 @@ async function findCatalogMatchByText({
   caption,
   textDetected = [],
   comments     = [],
+  refinedLabel = null,          // P1 (2026-08-17) — the refined product's own CV label
+                                //   ("Blue denim jeans"). Without this, every refined
+                                //   product on the same Media scores against the SAME
+                                //   scene-level signals and collapses to the same
+                                //   catalog target. Weighted above OCR — direct CV claim.
+  refinedBrand = null,          // P1 — brand pulled off the refined product (broader claim)
   topK         = 3
 }) {
   if (!brandId) return [];
@@ -1783,9 +1789,22 @@ async function findCatalogMatchByText({
     } catch (_) { /* non-fatal — fall through with brandName=null */ }
   }
 
-  // Build text-only signal list. Highest weight on OCR text (printed on
-  // the product itself = SKU-grade signal); caption next; comments last.
+  // Build text signal list. Weights (post-P1 2026-08-17):
+  //   1.1 — refined-label (the CV lane's direct per-product claim; ABOVE
+  //         OCR because OCR is scene-level while this is per-crop)
+  //   1.0 — OCR text printed on the product itself
+  //   0.9 — caption
+  //   0.7 — comments
+  //   0.5 — refined-brand (broader claim; helps rank when label is generic)
+  // Per-product signals (label, brand) are what let 10 refined products
+  // in the same frame resolve to 10 different catalog candidates instead
+  // of all collapsing to the same top-K. Measured 2026-08-17 on an
+  // Allbirds test run: 10/10 refined products landed on the same
+  // catalog product before this change.
   const signals = [];
+  if (refinedLabel && String(refinedLabel).trim()) {
+    signals.push({ text: String(refinedLabel), weight: 1.1, src: 'refined-label' });
+  }
   for (const t of (textDetected || []).slice(0, 12)) {
     const txt = typeof t === 'string' ? t : t?.content;
     const conf = typeof t === 'object' ? Number(t?.confidence) : 1;
@@ -1801,6 +1820,9 @@ async function findCatalogMatchByText({
     if (typeof txt === 'string' && txt.trim()) {
       signals.push({ text: expandBrandHandle(txt, brandName), weight: 0.7, src: 'comment' });
     }
+  }
+  if (refinedBrand && String(refinedBrand).trim()) {
+    signals.push({ text: String(refinedBrand), weight: 0.5, src: 'refined-brand' });
   }
   if (!signals.length) return [];
 
@@ -2458,6 +2480,11 @@ async function catalogFirstMatchOneRefined(refined, { brandId, brandName = null,
     caption,
     textDetected,
     comments,
+    // P1 (2026-08-17) — per-product signals so 10 refined products in the
+    // same frame don't all collapse to the same catalog candidate on
+    // identical scene-level scores.
+    refinedLabel: refined.label || null,
+    refinedBrand: refined.brand || null,
     topK: 3
   });
 
