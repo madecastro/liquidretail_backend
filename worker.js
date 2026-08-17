@@ -49,6 +49,31 @@ logConcurrencyConfig();
 // REAP_INTERVAL_MIN drives the periodic sweep alongside the startup pass.
 const REAP_STALE_MIN     = Math.max(1, parseInt(process.env.REAP_STALE_MIN, 10)     || 15);
 const REAP_INTERVAL_MIN  = Math.max(1, parseInt(process.env.REAP_INTERVAL_MIN, 10)  || 5);
+// A 'preparing' CampaignRun NEVER heartbeats — no write to the row exists
+// anywhere between mint (routes/ads.js POST /generate) and the flip to
+// 'running' (after expandWizardJob + claim), so updatedAt === startedAt for
+// the entire expansion. Unlike REAP_STALE_MIN above (safe on updatedAt,
+// because every per-ad $inc during a live 'running' batch proves liveness),
+// this threshold is unavoidably "time since mint".
+//
+// HYGIENE ONLY — NOT the money guard. Adversarial review caught that this
+// var cannot safely be the thing standing between a slow expansion and a
+// double bill: this sweep runs on a 5-minute cadence (or longer if the
+// worker is down) and its actual worst-case legitimate wait is far above 15
+// — the Director round alone can burn up to 2 paid attempts x
+// (TIMEOUT_MS=120s + retries with backoff) = ~12 min
+// (services/atlasLlmService.js MAX_ATTEMPTS/BACKOFF_MS/TIMEOUT_MS,
+// services/aiCreativeDirectorService.js "worst case stays TWO"), plus the
+// Judge call on top — ~18-20 min is a realistic healthy ceiling, not a
+// crash. The actual money guard is the age check inside
+// buildRunningFlipFilter (services/campaignRunGuards.js), which is keyed on
+// the concurrency gate's OWN staleMin (REAP_STALE_MIN) and is fully
+// independent of this sweep's cadence — a run that outlives the gate's
+// window can never resurrect itself regardless of whether this ever ticks.
+// So this var only decides when a dead-looking row gets stamped 'failed'
+// for visibility; raising it costs nothing but a longer-lived alert.
+// Separate name from REAP_STALE_MIN so it can still be tuned on its own.
+const PREPARE_STALE_MIN  = Math.max(1, parseInt(process.env.PREPARE_STALE_MIN, 10)  || 15);
 
 // Health sweep → Slack (services/backlogWatchdog.js). Separate cadence
 // from the reaper so the thresholds can be tuned independently.
@@ -57,6 +82,7 @@ const WATCHDOG_INTERVAL_MIN = Math.max(1, parseInt(process.env.ALERT_WATCHDOG_IN
 const alerts = require('./services/alertService');
 // Receipt guard for every rendering->queued requeue — see services/spendReceipt.js.
 const { receiptFree, HAS_RECEIPT } = require('./services/spendReceipt');
+const { buildStalePreparingFilter } = require('./services/campaignRunGuards');
 
 // Mongoose default pool is 100 max. With 50+ concurrent workers each
 // firing several queries per pipeline stage, we want a roomy pool to
@@ -244,14 +270,54 @@ async function reapOrphans() {
     { $set: { status: 'failed', completedAt: new Date() } }
   );
 
+  // CampaignRun stuck in 'preparing' → mark 'failed'. Distinct from the sweep
+  // above: this covers a run that died BEFORE it ever reached 'running' — the
+  // one AUTO-REMEDIATION gap nothing else in this codebase closes.
+  // `expandWizardJob` (Director + Judge, then the atomic Ad claim) makes zero
+  // writes to the CampaignRun row, so a web instance replaced mid-expansion
+  // (deploy, autoscale, or crash) leaves the row exactly as minted:
+  // status:'preparing', total:0, updatedAt frozen at startedAt — forever,
+  // since nothing else RESOLVES this (backlogWatchdog.js already ALERTS on
+  // stale 'preparing' rows — buildStalledRunFilter's status $in explicitly
+  // includes it — but alerting is not remediation; the SIGTERM handler's
+  // in-flight registry isn't populated until AFTER this same flip, so
+  // persistOrphans sees zero in-flight work and never touches it either).
+  //
+  // Money-safe, but NOT because of this sweep — see buildRunningFlipFilter's
+  // comment (services/campaignRunGuards.js) for the actual guard, which is
+  // independent of whether this has run at all. What this sweep does is
+  // purely visibility/hygiene: stamp a dead-looking row 'failed' so it stops
+  // showing up as a silent no-op. Any Ad claimed before the running-flip is
+  // receipt-free by construction — no veoPredictionId, no
+  // imageGeneration.predictionId — so the existing receipt-aware Ad sweep
+  // above already releases those back to 'queued' regardless of this sweep's
+  // timing. What IS already spent (Director/Judge LLM cost) is not
+  // recoverable by a reaper and this sweep does not try.
+  const preps = await CampaignRun.updateMany(
+    buildStalePreparingFilter({ now: Date.now(), staleMin: PREPARE_STALE_MIN }),
+    {
+      $set: { status: 'failed', completedAt: new Date() },
+      $push: { errors: {
+        index: 0, stage: 'expand',
+        // Observation only, not a diagnosis: at this threshold the far more
+        // likely cause is the Director/Judge retry ladder simply taking
+        // longer than expected (see PREPARE_STALE_MIN's comment above for
+        // the real worst-case math), not an instance replacement. Do not
+        // assert a cause an operator would go hunting deploy logs for.
+        message: `expansion never completed — no CampaignRun write in ${PREPARE_STALE_MIN}m after mint`
+      } }
+    }
+  );
+
   const nDetects = detects.modifiedCount || 0;
   const nAds     = ads.modifiedCount     || 0;
   const nRuns    = runs.modifiedCount    || 0;
-  const total = nDetects + nAds + nRuns;
+  const nPreps   = preps.modifiedCount   || 0;
+  const total = nDetects + nAds + nRuns + nPreps;
   if (total > 0) {
     console.log(
-      `🧹 reaped: ${nDetects} DetectRun · ${nAds} Ad · ${nRuns} CampaignRun ` +
-      `(stale > ${REAP_STALE_MIN}m)`
+      `🧹 reaped: ${nDetects} DetectRun · ${nAds} Ad · ${nRuns} CampaignRun(running) · ` +
+      `${nPreps} CampaignRun(preparing) (stale > ${REAP_STALE_MIN}m / ${PREPARE_STALE_MIN}m)`
     );
 
     // THE "work got dropped" alert. Reaping an Ad or a CampaignRun means a
@@ -261,19 +327,24 @@ async function reapOrphans() {
     // POST /api/ads/generate and POST /api/ads/runs), so somebody has to
     // press "Generate more" or that work never resumes. Reaping only
     // DetectRuns is benign — the worker re-claims those itself — so that
-    // case stays at warn.
-    const dropped = nAds + nRuns;
+    // case stays at warn. A 'preparing' reap holds no claimed Ads (see the
+    // comment above the sweep) so it is a lost EXPANSION, not lost render
+    // work — counted into `dropped` anyway because the outcome an operator
+    // cares about is the same: this Generate produced nothing and needs a
+    // manual re-run.
+    const dropped = nAds + nRuns + nPreps;
     alerts.notifyAsync({
       level: dropped > 0 ? 'error' : 'warn',
       title: dropped > 0
-        ? `Dropped work reclaimed — ${nAds} ad(s), ${nRuns} run(s)`
+        ? `Dropped work reclaimed — ${nAds} ad(s), ${nRuns + nPreps} run(s)`
         : `Reclaimed ${nDetects} stale detect run(s)`,
       key: 'reaper:reaped',
       fields: {
         'ads reset to queued': nAds || undefined,
         'runs marked failed':  nRuns || undefined,
+        'runs failed (never started rendering)': nPreps || undefined,
         'detect runs requeued': nDetects || undefined,
-        'stale threshold':     `${REAP_STALE_MIN}m`,
+        'stale threshold':     `${REAP_STALE_MIN}m running / ${PREPARE_STALE_MIN}m preparing`,
         ...(nAds > 0 ? { 'action needed': 'ads sit in queued until someone re-runs the campaign' } : {})
       }
     });

@@ -387,8 +387,11 @@ ok('E2 ads.js IMPORTS buildTerminalDoneFilter (a call without an import is a Ref
     ? adsRaw.slice(0, adsRaw.indexOf("require('../services/campaignRunGuards')") + 80)
     : adsRaw));
   // Destructure pin — the unbound-identifier incident: a call without
-  // the binding shipped to prod with a green source-text harness.
-  assert.ok(/\{\s*buildTerminalDoneFilter\s*\}/.test(adsRaw),
+  // the binding shipped to prod with a green source-text harness. Matches
+  // buildTerminalDoneFilter destructured alone OR alongside sibling names
+  // from the same require (e.g. buildRunningFlipFilter) — the invariant is
+  // "this identifier is bound", not "this is the only identifier bound".
+  assert.ok(/\{[^}]*\bbuildTerminalDoneFilter\b[^}]*\}\s*=\s*require\(\s*['"]\.\.\/services\/campaignRunGuards['"]\s*\)/.test(adsRaw),
     'buildTerminalDoneFilter must be destructured from that require');
 });
 

@@ -76,7 +76,7 @@ const {
   computeRequestFingerprint, renderClaimFingerprint,
   buildUnclaimedNotice
 } = require('../services/generationGate');
-const { buildTerminalDoneFilter } = require('../services/campaignRunGuards');
+const { buildTerminalDoneFilter, buildRunningFlipFilter } = require('../services/campaignRunGuards');
 
 // Operator-facing gate for a multi-select format list (preset 'explicit'),
 // shared by /preview + /generate.
@@ -1010,8 +1010,19 @@ router.post('/generate', async (req, res) => {
           unclaimed: unclaimedAtStart
         });
 
-        await CampaignRun.updateOne(
-          { _id: run._id },
+        // COMPARE-AND-SWAP, keyed on status:'preparing' AND age. THIS is the
+        // money guard — see buildRunningFlipFilter's comment for why a bare
+        // status check is not enough on its own: the concurrency gate above
+        // stops honoring a 'preparing'/'running' run's exclusivity once it is
+        // older than staleMin (REAP_STALE_MIN), on every request, independent
+        // of whether the worker's reaper has actually ticked. Passing the
+        // SAME staleMin here means this flip refuses at the identical instant
+        // the gate already stopped counting this run as active — closing the
+        // window a bare status guard would leave open (a duplicate sails
+        // through as "not active", bills a sibling run, and this one's slow
+        // expansion finishes minutes later and would otherwise flip anyway).
+        const flip = await CampaignRun.updateOne(
+          buildRunningFlipFilter(run._id, { now: Date.now(), staleMin }),
           { $set: {
             total: adIds.length,
             status: 'running',
@@ -1020,6 +1031,42 @@ router.post('/generate', async (req, res) => {
             ...(unclaimedNotice ? { notice: unclaimedNotice } : {})
           } }
         );
+        // Defensive on the result shape, not just the value: this repo does
+        // not trust matchedCount blindly elsewhere either (see
+        // services/runFeedService.js's modifiedCount ?? nModified) — a
+        // driver/mongoose version that ever reverted to the old {n,nModified}
+        // shape would make `!flip.matchedCount` true for EVERY run, silently
+        // discarding all generation. Recompute conservatively.
+        const flipMatched = flip.matchedCount ?? flip.nModified ?? flip.n ?? 0;
+        if (!flipMatched) {
+          // Either reaped (status no longer 'preparing') or aged past
+          // staleMin while still 'preparing' (the gate-window case above —
+          // this run may still get marked 'failed' by the reaper later, but
+          // it must not render regardless). The Ads we just claimed are
+          // receipt-free by construction — the first billable submit happens
+          // inside runRenderLoop, which we are about to skip — so release
+          // them back to 'queued' rather than stranding them in 'rendering'
+          // with no run that will ever render them.
+          //
+          // Clear renderStage/renderStageAt on release: adStage() writes it
+          // unconditionally on every render attempt and NOTHING ever clears
+          // it, so an ad recycled from an earlier reap-and-reclaim cycle
+          // would otherwise still carry a stale non-null renderStage here —
+          // and services/strandedRunSweeper.js auto-requeues exactly that
+          // shape (status:'queued' + campaignRunIds of a 'failed' run +
+          // renderStage set) into a REAL billable re-render with no operator
+          // click. A freshly-claimed ad has no renderStage yet, so this is a
+          // no-op for the common case and a real guard for the recycled one.
+          console.warn(
+            `⚠️  [campaignRun ${runId}] lost the running-flip CAS (reaped, superseded, or aged past ${staleMin}m) — ` +
+            `releasing ${adIds.length} claimed ad(s) back to queued without rendering`
+          );
+          await Ad.updateMany(
+            receiptFree({ _id: { $in: adIds }, status: 'rendering', campaignRunIds: runId }),
+            { $set: { status: 'queued', updatedAt: new Date(), renderStage: null, renderStageAt: null } }
+          ).catch(() => {});
+          return;
+        }
 
         await runRenderLoop(run, { ...job, platformFormat }, adIds, renderToken);
       } catch (err) {
