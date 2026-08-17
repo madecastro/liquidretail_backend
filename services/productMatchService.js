@@ -1743,6 +1743,41 @@ function expandTokensWithSynonyms(tokenSet) {
   return out;
 }
 
+// ── V2 — sub-class inference from a refined label (2026-08-17) ──────
+// Coarse categoryRef (e.g. 'apparel') scopes the catalog pool but keeps
+// jeans + shoes + shirts in the same bucket. Measured live: a "Blue
+// denim jeans" refined label matched an Allbirds sneaker catalog row
+// with score 0.95 because the pool contained both classes. Deriving a
+// sub-class from refined.label lets us filter the pool BEFORE scoring
+// so the visual matcher never has to arbitrate class-mismatched pairs.
+//
+// The map is intentionally shallow — same groups as SYNONYM_GROUPS but
+// used for pool filtering, not signal expansion. Kill switch
+// SKU_SUB_CLASS_FILTER_ENABLED disables the filter.
+const SKU_SUB_CLASS_FILTER_ENABLED = process.env.SKU_SUB_CLASS_FILTER_ENABLED !== 'false';
+
+function inferSubClassFromText(text) {
+  if (!text) return null;
+  const tokens = tokenize(String(text));
+  for (const t of tokens) {
+    const g = TOKEN_TO_SYNONYM_GROUP.get(t);
+    if (g) return g;                     // e.g. '~syn:jacket', '~syn:shoe'
+  }
+  return null;
+}
+
+// Does the row's title+description tokens contain ANY token from the
+// synonym group `subClass`? If yes, the row is in-class. Falls back to
+// "match" when subClass is null so callers can pass unconditionally.
+function rowMatchesSubClass(row, subClass) {
+  if (!subClass) return true;
+  const words = new Set(tokenize(`${row.title || ''} ${row.description || ''}`));
+  for (const t of words) {
+    if (TOKEN_TO_SYNONYM_GROUP.get(t) === subClass) return true;
+  }
+  return false;
+}
+
 // ── T1 — brand-handle expansion (2026-08-17) ─────────────────────────
 // UGC captions typically compress the brand into a single social handle:
 // `@marinelayer` tokenizes to `marinelayer`, but every product title is
@@ -1876,6 +1911,26 @@ async function findCatalogMatchByText({
       .lean();
   }
   if (!rows.length) return [];
+
+  // V2 — narrow the pool by inferred sub-class from refined.label. Cheap
+  // string test on the already-fetched rows; falls through to the full
+  // pool if the filter removes everything (better a broader match than
+  // no match). Skipped when no refined.label or the label doesn't map
+  // to any known sub-class.
+  if (SKU_SUB_CLASS_FILTER_ENABLED && refinedLabel) {
+    const subClass = inferSubClassFromText(refinedLabel);
+    if (subClass) {
+      const narrowed = rows.filter(r => rowMatchesSubClass(r, subClass));
+      if (narrowed.length) {
+        if (narrowed.length !== rows.length) {
+          console.log(`   · catalog text search: sub-class filter "${subClass}" (from label "${refinedLabel}") narrowed pool ${rows.length} → ${narrowed.length}`);
+        }
+        rows = narrowed;
+      } else {
+        console.log(`   · catalog text search: sub-class filter "${subClass}" removed all rows; keeping broader pool of ${rows.length}`);
+      }
+    }
+  }
 
   const cat = category ? String(category).toLowerCase().trim() : null;
   const scored = [];
@@ -2546,25 +2601,51 @@ async function catalogFirstMatchOneRefined(refined, { brandId, brandName = null,
       })
   ));
 
-  let best = null;
+  // V3 (2026-08-17) — synced-preferred tiebreak. When multiple candidates
+  // score within SKU_CATALOG_FIRST_TIE_BAND of the leader, prefer synced
+  // rows (source !== 'detect-identified') over detect-identified ghosts.
+  // Extends the tiebreak already in ensureCatalogProductForMatch D1 tier
+  // to the catalog-first winner selection. Kill switch
+  // CATALOG_FIRST_PREFER_SYNCED=false disables the preference.
+  const CATALOG_FIRST_TIE_BAND       = Math.max(0.01, Math.min(0.3, parseFloat(process.env.SKU_CATALOG_FIRST_TIE_BAND) || 0.05));
+  const CATALOG_FIRST_PREFER_SYNCED  = process.env.CATALOG_FIRST_PREFER_SYNCED !== 'false';
+  const isSynced = (row) => row?.source !== 'detect-identified';
+
+  const scoredCandidates = [];
   for (let i = 0; i < textCandidates.length; i++) {
     const cand = textCandidates[i];
     const visual = visualResults[i];
     const visualScore = visual?.isMatch ? Number(visual.score || 0) : 0;
     const combined = Math.max(cand.textScore, visualScore);
-    if (!best || combined > best.combinedScore) {
-      best = {
-        catalogMatch: cand,
-        visualResult: visual,
-        textScore:    cand.textScore,
-        visualScore,
-        combinedScore: combined
-      };
+    scoredCandidates.push({
+      catalogMatch: cand,
+      visualResult: visual,
+      textScore:    cand.textScore,
+      visualScore,
+      combinedScore: combined
+    });
+  }
+  if (!scoredCandidates.length) {
+    return { combinedScore: 0, catalogMatch: null, visualResult: null };
+  }
+  scoredCandidates.sort((a, b) => b.combinedScore - a.combinedScore);
+  let best = scoredCandidates[0];
+  let tieBreak = null;
+  if (CATALOG_FIRST_PREFER_SYNCED && scoredCandidates.length > 1) {
+    const inBand = scoredCandidates.filter(c => (best.combinedScore - c.combinedScore) <= CATALOG_FIRST_TIE_BAND);
+    if (inBand.length > 1) {
+      const syncedInBand = inBand.find(c => isSynced(c.catalogMatch.product));
+      if (syncedInBand && !isSynced(best.catalogMatch.product)) {
+        best = syncedInBand;
+        tieBreak = `synced-preferred (Δ<=${CATALOG_FIRST_TIE_BAND.toFixed(2)} band)`;
+      }
     }
   }
 
-  if (!best) return { combinedScore: 0, catalogMatch: null, visualResult: null };
-  console.log(`   · catalog-first[${refined.id}]: text=${best.textScore.toFixed(2)} visual=${best.visualScore.toFixed(2)} combined=${best.combinedScore.toFixed(2)} → "${best.catalogMatch.product.title}"`);
+  if (best.combinedScore === 0) {
+    return { combinedScore: 0, catalogMatch: null, visualResult: null };
+  }
+  console.log(`   · catalog-first[${refined.id}]: text=${best.textScore.toFixed(2)} visual=${best.visualScore.toFixed(2)} combined=${best.combinedScore.toFixed(2)}${tieBreak ? ` [${tieBreak}]` : ''} → "${best.catalogMatch.product.title}" (source=${best.catalogMatch.product.source})`);
   return best;
 }
 

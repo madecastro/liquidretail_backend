@@ -49,6 +49,20 @@ async function compareCropToCandidate({ cropImageUrl, candidate }) {
     `brand line, same color/pattern, same size/cut/style. Variations within the same ` +
     `product family that are clearly different SKUs (e.g. different colorways) should ` +
     `be marked NOT a match.\n\n` +
+    // V1 (2026-08-17) — category-class guard. Measured live: Gemini
+    // returned isMatch:true score:0.95 comparing a blue-jeans crop to
+    // an Allbirds sneaker product image. The prompt asked "same SKU?"
+    // in isolation, so the model wandered when neither image matched
+    // any known SKU. Add an explicit categorical reject.
+    `HARD REJECT — before deciding same-SKU, verify the two images depict ` +
+    `the SAME PRODUCT CLASS. If the target shows one class (e.g. footwear, ` +
+    `apparel, bag, headwear, accessory, food/beverage, skincare, makeup, ` +
+    `hardware) and the candidate shows a different class, return isMatch=false ` +
+    `and score<=0.2 REGARDLESS of any visual similarity in shape, color, or ` +
+    `background. A sneaker is not a pair of jeans; a bag is not a hat; a ` +
+    `bottle is not a jar. Only within-class comparisons are eligible for a ` +
+    `positive match. Cite the target's class and the candidate's class in ` +
+    `your reasoning when they differ.\n\n` +
     titleLine +
     `Return JSON only — no prose:\n` +
     `{\n` +
