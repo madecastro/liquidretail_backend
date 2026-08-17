@@ -25,6 +25,19 @@ superseded and discarded.** The per-file verdicts, so nobody re-derives them:
 | `scripts/mintTestToken.js` (untracked) | **STILL UNLANDED** | see NEXT-SESSION PROMPT |
 | `scripts/backlogStats.js`, `scripts/diagnoseCatalogIngestPath.js` | **left untracked** | local diagnostics, nothing depends on them |
 
+**MERGED + DEPLOYED 2026-08-17.** #201 (`dca796a9`) and #202 landed; main is `a67e00dc` and BOTH
+Render services (web `srv-d1vuktqli9vc73ft07ng`, worker `srv-d8128c1o3t8c73e8kb30`) went **live on
+`a67e00dc`** at 22:09–22:10 UTC. `/api/health` OK. Full suite on merged main: **132 pass / 1 fail**
+by exit code, the one failure being `verifyAgentRegistry` (the tier-4 `estimateUsd` gap, owned by a
+separate session — not from this work).
+
+**The Director leak was real and is now quantified.** Render logs for the 5 days before the deploy
+carry **12 `directorRound: payload rejected, re-asking once` lines**, ~11 of them
+`concepts[N].copy contains pricing or discount language`. Every one of those is a second PAID
+Director call spent discovering a rule the prompt never stated. That is the recurring cost #201
+removes; if any such line appears on a round minted after `a67e00dc`, the fix is not working and
+that is the signal to look for.
+
 **The 3 RED harnesses were a stale-tree artifact, not open defects.** All three pass on `origin/main`
 as-is — measured this session: `verifyMixedPlatformVideo` **33/33** (G1 and the money-relevant H3b
 included), `verifyPmaxVideoExpansion` **73**, `verifyPmaxFunnelVariants` **166/0**. So the "116 pass /
