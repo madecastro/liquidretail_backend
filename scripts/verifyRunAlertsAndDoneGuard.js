@@ -258,12 +258,18 @@ ok('B9 explicit mins land in the filter (helper must not ignore its args)', () =
 // Read both from source / config. Hardcoding 12 < 15 here would let a
 // future edit cross the boundary and recreate the empty set.
 
-function parseReapDefault(workerSrc) {
-  const m = workerSrc.match(
-    /REAP_STALE_MIN\s*=\s*Math\.max\(\s*1\s*,\s*parseInt\(\s*process\.env\.REAP_STALE_MIN\s*,\s*10\s*\)\s*\|\|\s*(\d+)\s*\)/
-  );
-  assert.ok(m, 'could not parse REAP_STALE_MIN default from worker.js');
-  return Number(m[1]);
+function parseReapDefault(_workerSrc) {
+  // Read the DEFAULT from services/staleness.js rather than regexing worker.js.
+  // This used to match the old inline `Math.max(1, parseInt(env,10) || 15)`,
+  // which no longer exists: both processes now share one parser precisely
+  // because that idiom disagreed with the web side on a negative value
+  // (worker resolved to 1 — a one-minute reap threshold that sweeps live work).
+  // Reading the exported constant is also strictly stronger than a source
+  // regex: it cannot pass against a shape that merely LOOKS right.
+  const { REAP_STALE_MIN_DEFAULT } = require('../services/staleness');
+  assert.ok(Number.isFinite(REAP_STALE_MIN_DEFAULT) && REAP_STALE_MIN_DEFAULT > 0,
+    'staleness.js must export a positive finite REAP_STALE_MIN_DEFAULT');
+  return REAP_STALE_MIN_DEFAULT;
 }
 
 function parseSilenceDefault(wdSrc) {
