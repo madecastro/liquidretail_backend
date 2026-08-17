@@ -148,10 +148,44 @@ check('A2 social_proof_led AND brand_led both described; brand_led is last resor
   assert.ok(p.includes('DEFAULT OF LAST RESORT'),
     'brand_led must be framed as last resort — it is the silent default downstream');
 });
-check('A3 every enum member gets a criterion', () => {
-  const p = withProof();
+// AMENDED 2026-08-12: this used to iterate the full CREATIVE_STYLES_ENUM. That
+// invariant ("the menu is the enum") was deliberately broken when `promotional`
+// became opt-in — it is now offered only when Campaign.kind === 'promotional',
+// on BOTH the prompt menu and the response-schema enum. See
+// scripts/verifyPromotionalOptIn.js for the full contract.
+//
+// The check is retained in its stronger form rather than deleted: every style
+// the run is ALLOWED to emit must still carry a criterion line, and a style it
+// is NOT allowed to emit must NOT be advertised. Advertising an unselectable
+// style is the exact defect that cost a paid Director round on 2026-08-12.
+//
+// SCOPE — do not mistake this for a policy guard. A3 derives `allowed` from the
+// same creativeStylesFor() the prompt builder uses, so it verifies MENU/HELPER
+// AGREEMENT and nothing more. Gutting creativeStylesFor to return the full enum
+// leaves A3 green (measured), because both sides move together. The POLICY
+// assertion — that promotional is withheld unless Campaign.kind==='promotional'
+// — lives in scripts/verifyPromotionalOptIn.js groups A/B/C, which fails 10
+// checks on exactly that mutation. Keep both; neither covers the other.
+check('A3 every ALLOWED style gets a criterion, and no disallowed style is advertised', () => {
+  const p = withProof();                         // campaignKind omitted => promotional withheld
+  const allowed = director.creativeStylesFor(null);
+  for (const style of allowed) {
+    assert.ok(p.includes(`    ${style} — `), `no criterion line for allowed style ${style}`);
+  }
+  for (const style of director.CREATIVE_STYLES_ENUM.filter((s) => !allowed.includes(s))) {
+    assert.ok(!p.includes(`    ${style} — `),
+      `${style} is advertised in the menu but is not selectable for this run`);
+  }
+});
+check('A3b the opt-in path restores the promotional criterion', () => {
+  const p = director.buildPromptRound({
+    inputSummary: SHAPES['product rating'], creativeIntent: 'conversion',
+    platformFormat: 'meta_feed_1_1', universe: UNIVERSE, roundIndex: 0, avoidList: [],
+    campaignKind: 'promotional'
+  });
+  const sys = typeof p === 'string' ? p : p.system;
   for (const style of director.CREATIVE_STYLES_ENUM) {
-    assert.ok(p.includes(`    ${style} — `), `no criterion line for ${style}`);
+    assert.ok(sys.includes(`    ${style} — `), `no criterion line for ${style} on a promotional campaign`);
   }
 });
 check('A4 diversity rule includes creative_style as a variety axis', () => {

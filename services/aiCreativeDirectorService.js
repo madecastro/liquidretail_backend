@@ -1847,6 +1847,41 @@ const CREATIVE_STYLES_ENUM = Object.freeze([
   'brand_led', 'ugc_led', 'social_proof_led', 'editorial', 'promotional'
 ]);
 
+// PROMOTIONAL IS OPT-IN (owner directive 2026-08-12: "strip promotional
+// campaigns being generated at all unless specifically requested").
+//
+// The style was reachable on EVERY run, and picking it was a trap: the copy it
+// asks for — an offer, a price, an urgency number — is exactly what
+// validateDirectorPayload rejects unconditionally (the pricing scan). A round
+// that chose it burned a second paid Director call to be told a rule the prompt
+// never stated. Removing the contradiction in the prompt text fixed the wording;
+// this removes the reachability, which is the actual ask.
+//
+// "Specifically requested" == Campaign.kind === 'promotional' (models/Campaign.js
+// :183). That is the same field gating Campaign.promotionalDetails, whose own
+// comment reads "Only consulted when kind='promotional'" — so this narrowing
+// follows the schema's existing contract rather than inventing a second signal.
+//
+// NARROW THE MENU, NEVER HARD-REJECT AFTER THE FACT. This deliberately mirrors
+// feedOutputShapesForUniverse: the value must be withheld from BOTH the prompt
+// line and the response-schema enum, or the model is offered a style the
+// validator then throws a paid round away for. Same failure this is fixing.
+const PROMOTIONAL_STYLE = 'promotional';
+
+function isPromotionalStyleEnabled(campaignKind) {
+  if (String(process.env.DIRECTOR_PROMOTIONAL_STYLE || '').trim().toLowerCase() === 'always') return true;
+  return campaignKind === 'promotional';
+}
+
+// The styles a given run may actually emit. Order is preserved from
+// CREATIVE_STYLES_ENUM so the prompt menu and the schema enum stay comparable
+// by eye and by grep.
+function creativeStylesFor(campaignKind) {
+  return isPromotionalStyleEnabled(campaignKind)
+    ? [...CREATIVE_STYLES_ENUM]
+    : CREATIVE_STYLES_ENUM.filter((s) => s !== PROMOTIONAL_STYLE);
+}
+
 const FEED_OUTPUT_SHAPES = Object.freeze([
   'static_single',   // single hero image, chrome around it
   'static_collage',  // 2-4 images in an asymmetric arrangement (overlapping, off-grid)
@@ -2247,10 +2282,13 @@ async function directConceptsRound({
     inputSummary, creativeIntent, platformFormat,
     universe: compressedUniverse,
     roundIndex, avoidList,
-    derivedVoice, creativeBrief
+    derivedVoice, creativeBrief, campaignKind
   });
   const promptHash = sha256(system + '\n' + user);
-  const responseSchema = buildResponseSchemaRound(seededUniverse, platformFormat);
+  // campaignKind MUST be passed to both builders. Handing it to only one
+  // desynchronises the menu from the enum, which is the self-contradictory-prompt
+  // failure this whole change exists to remove.
+  const responseSchema = buildResponseSchemaRound(seededUniverse, platformFormat, campaignKind);
 
   // OpenAI multimodal user content: text + image_url parts.
   const userContent = visionImages.length
@@ -2556,7 +2594,13 @@ function renderCampaignBriefBlock(brief, productName = null) {
   return lines.join('\n');
 }
 
-function buildPromptRound({ inputSummary, creativeIntent, platformFormat, universe, roundIndex, avoidList, derivedVoice = null, creativeBrief = null }) {
+function buildPromptRound({ inputSummary, creativeIntent, platformFormat, universe, roundIndex, avoidList, derivedVoice = null, creativeBrief = null, campaignKind = null }) {
+  // Must agree with buildResponseSchemaRound's enum for the same run — see the
+  // creativeStylesFor comment. Defaulting campaignKind to null means an omitted
+  // argument withholds promotional, which is the safe direction: a style that is
+  // absent costs a missed option, a style that is offered but unrenderable costs
+  // a paid round.
+  const allowedStyles = creativeStylesFor(campaignKind);
   const formatConstraints = buildFormatConstraints(platformFormat);
   const brandVoiceBlock   = renderBrandVoiceBlock(derivedVoice);
   const campaignBriefBlock = renderCampaignBriefBlock(creativeBrief, inputSummary?.product_signal?.name || null);
@@ -2728,7 +2772,22 @@ function buildPromptRound({ inputSummary, creativeIntent, platformFormat, univer
     `    ugc_led           → a quote or a top_comment, in the reviewer's/creator's own register — first person, casual, unpolished. Not marketing voice.`,
     `    editorial         → product_signal.specs. Name ONE concrete fact (fabric, construction, weight, dimension, care) and build the line on it. A specific verb about a real property beats two adjectives. This is the style that should read as reported, not sold.`,
     `    brand_led         → brand_signal (tone, summary, tagline). This is the ONLY style that should lean on brand voice — it is the fallback of last resort for every other style, not their first move.`,
-    `    promotional       → the offer plus one hard fact: price / availability from product_signal, or a spec. Verbs first, numbers visible.`,
+    ...(allowedStyles.includes(PROMOTIONAL_STYLE) ? [
+      `    promotional       → urgency or scarcity grounded in the PRODUCT — a limited colourway, a seasonal window, a use-case moment — plus one hard fact from product_signal (a spec, a material, availability). Verbs first. NOT a price and NOT a discount: this style is subject to the pricing ban below exactly like every other.`
+    ] : []),
+    // PRICING BAN — the prompt half of a rule that was previously enforced in
+    // silence. validateDirectorPayload rejects the WHOLE round on any currency
+    // amount, "N% off", or the words discount / sale / savings, and that check
+    // is unconditional — no flag, no campaign-kind exemption. Until 2026-08-12
+    // the prompt never stated it, while the `promotional` style above actively
+    // demanded "the offer plus ... price / availability ... numbers visible" —
+    // so a round that picked that style was instructed to produce precisely
+    // what the validator throws away. Measured cost on the 2026-08-12 live run:
+    // one extra paid Director call, 19.1s, spent being told a rule nobody had
+    // written down. Both halves are load-bearing: state the ban AND remove the
+    // instruction that contradicts it, or the round is self-contradictory in
+    // the same way §00's PR #61 video prompt was.
+    `- NO PRICING OR DISCOUNT LANGUAGE, in any copy field, on any concept. Copy containing a currency amount ("$40", "£29", "€35"), a percentage-off claim ("20% off"), or the words "discount", "sale" or "savings" is REJECTED and the ENTIRE round is re-asked — it is not salvaged per concept. Sell on the product, the proof, or the spec; never on the price.`,
     `- DO NOT ground two concepts in the SAME item. If two concepts are both proof-led, they must quote DIFFERENT reviews from the pool. If the pool has only one usable quote, the second concept must switch source — a spec, or brand voice — rather than restate the same quote.`,
     // Counterweight to "THIN DATA IS NOT A STOP" below, which correctly tells
     // the model it may null an UNGROUNDED role. Read alone, that instruction
@@ -2819,8 +2878,10 @@ function buildPromptRound({ inputSummary, creativeIntent, platformFormat, univer
     `    social_proof_led — the visual anchor IS proof: a star rating, a review count, a customer quote, or a creator comment. Pick this whenever social_proof_signal carries a usable rating, primary_quote, or top_comment${directorProofMenuEnabled() ? ' (or any proof_options entry)' : ''}. Proof is the highest-converting angle available and is currently the most under-used style — reach for it when the data is there.`,
     `    ugc_led — a creator/UGC image is the hero and the concept leans on its authenticity rather than on a claim.`,
     `    editorial — magazine-style art direction; composition and typography carry the ad, with no proof or offer as the anchor.`,
-    `    promotional — an offer, price, urgency, or a specific objection being dissolved is the headline.`,
-    `    brand_led — brand voice / tagline / positioning carries it. This is the DEFAULT OF LAST RESORT: pick it only when there is no usable proof, no UGC hero, no offer, and no editorial angle. Do not pick it out of habit.`,
+    ...(allowedStyles.includes(PROMOTIONAL_STYLE) ? [
+      `    promotional — urgency, scarcity, or a specific objection being dissolved is the headline. Grounded in the product (a limited run, a seasonal window, a fit worry answered) — never in a price or a discount, which are banned outright above.`
+    ] : []),
+    `    brand_led — brand voice / tagline / positioning carries it. This is the DEFAULT OF LAST RESORT: pick it only when there is no usable proof, no UGC hero, or no editorial angle. Do not pick it out of habit.`,
     ``,
     formatConstraints,
     ``,
@@ -3003,7 +3064,13 @@ function extractFirstBalancedObject(text) {
   return balancedSpanFrom(s, s.indexOf('{'));
 }
 
-function buildResponseSchemaRound(seededUniverse, platformFormat = 'meta_feed_1_1') {
+function buildResponseSchemaRound(seededUniverse, platformFormat = 'meta_feed_1_1', campaignKind = null) {
+  // Transport-level half of the promotional narrowing. buildPromptRound withholds
+  // the style from the MENU; this withholds it from the ENUM, so a model that
+  // ignores the prompt still cannot emit it. Both halves are required — schema
+  // alone leaves the prompt advertising an unselectable style, prompt alone
+  // leaves the model free to emit one.
+  const allowedStyles = creativeStylesFor(campaignKind);
   // We don't enum-constrain media_id to the universe IDs here — strict
   // mode's enum is fine in principle but the universe IDs are a string
   // set that changes per call. validateConceptsRound enforces the
@@ -3106,7 +3173,7 @@ function buildResponseSchemaRound(seededUniverse, platformFormat = 'meta_feed_1_
       comment_priority:  { type: 'string', enum: ['high', 'medium', 'low', 'absent'] },
       stat_priority:     { type: 'string', enum: ['high', 'medium', 'low', 'absent'] },
       cta_emphasis:      { type: 'string', enum: ['primary', 'secondary', 'minimal', 'absent'] },
-      creative_style:    { type: 'string', enum: [...CREATIVE_STYLES_ENUM] },
+      creative_style:    { type: 'string', enum: [...allowedStyles] },
       recommended_components: {
         type: 'object',
         additionalProperties: false,
@@ -3361,6 +3428,7 @@ module.exports = {
   AVAILABLE_ARCHETYPES,
   CREATIVE_RULES,
   CREATIVE_STYLES_ENUM,
+  creativeStylesFor,
   FEED_OUTPUT_SHAPES,
   feedOutputShapesForUniverse,
   MULTI_PICK_FEED_SHAPES,
