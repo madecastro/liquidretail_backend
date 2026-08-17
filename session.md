@@ -5,6 +5,61 @@ lines of chronological accretion; it is now organised by *what is true* rather t
 *what happened when*. History is compressed at the bottom — anything not listed there
 was judged superseded and dropped **deliberately**, not lost.
 
+## 2026-08-17 — THE AUG-12 DIRTY TREE IS RESOLVED. Do not re-do this forensics.
+
+The `liquidretail_backend` checkout sat on branch `feat/video-intent-variants`, **26 commits behind
+`origin/main`**, with 6 modified + 5 untracked files from 2026-08-12 and a handoff claiming
+"3 harnesses RED, 116 pass / 3 fail". All of it is now adjudicated. **One item landed, the rest was
+superseded and discarded.** The per-file verdicts, so nobody re-derives them:
+
+| Aug-12 item | Verdict | Why |
+|---|---|---|
+| `services/aiCreativeDirectorService.js` | **LANDED — PR #201** | Director pricing-ban + promotional opt-in. Genuinely absent from main. |
+| `config/defaults.env` → `DIRECTOR_PROMOTIONAL_STYLE=` | **LANDED — PR #201** | ditto |
+| `scripts/verifyPromotionalOptIn.js` (new, 31 checks) | **LANDED — PR #201** | ditto |
+| `scripts/verifySocialProofRestoration.js` (A3/A3b) | **LANDED — PR #201** | **Had to** land with it; see below |
+| `services/campaignAdsGenerationService.js` | **DISCARDED** | Earlier hand implementation of what `b85cad5b` (#197) shipped |
+| `services/concurrency.js` | **DISCARDED** | main moved 2026-08-13; tree would delete `REMOTION_QUEUE_CONCURRENCY` |
+| `scripts/verifyConcurrencyConfig.js` | **DISCARDED** | edit of the pre-#186 harness; would delete Remotion coverage |
+| `config/defaults.env` → `RENDER_CONCURRENCY=48`, `MAX_CREATIVES_PER_RUN=100` | **PENDING owner decision** | see NEXT-SESSION PROMPT |
+| `scripts/mintTestToken.js` (untracked) | **STILL UNLANDED** | see NEXT-SESSION PROMPT |
+| `scripts/backlogStats.js`, `scripts/diagnoseCatalogIngestPath.js` | **left untracked** | local diagnostics, nothing depends on them |
+
+**The 3 RED harnesses were a stale-tree artifact, not open defects.** All three pass on `origin/main`
+as-is — measured this session: `verifyMixedPlatformVideo` **33/33** (G1 and the money-relevant H3b
+included), `verifyPmaxVideoExpansion` **73**, `verifyPmaxFunnelVariants` **166/0**. So the "116 pass /
+3 fail" figure in `HANDOFF-2026-08-12-generation-audit.md` describes a 26-commit-stale base and
+**should not be treated as an open-defect list**.
+
+**H3b's money defect is FIXED on main.** The tree carried a *second* Meta derivative mint block
+(`expandWizardJob` hand-writing rows) that bypassed the kill switch and inflated the dry-run
+estimate. Main has exactly one mint site: `planDeterministicVideoAds`, iterated once by
+`expandWizardJob`. The tree was additionally **worse** in two ways — its dry-run added 3 PMax stages
+while the mint loop only ran 2 (over-counting delivered ads), and its Meta intent mint was not gated
+on `META_VIDEO_DERIVATIVES`, so flag-off still minted staged crop variants.
+
+**Why the A3 coupling matters** (this will bite whoever next edits the Director style menu):
+`verifySocialProofRestoration` A3 used to assert *"every enum member gets a criterion"*. Promotional
+opt-in deliberately breaks that invariant, so **A3 fails with `no criterion line for promotional` the
+instant the Director fix lands**. It is now the stronger form — every ALLOWED style carries a
+criterion AND no disallowed style is advertised. Note the scope split, which is easy to get wrong:
+gutting `creativeStylesFor` to return the full enum leaves **A3 green** (both sides move together —
+it pins menu/helper *agreement*), and is caught instead by `verifyPromotionalOptIn` groups A/B/C,
+which fail 10 checks on exactly that mutation. **Neither harness covers the other; keep both.**
+
+### Two traps that cost real time here
+
+1. **`NODE_PATH` is mandatory in a backend worktree.** `node_modules` is tracked in this repo but the
+   committed copy is **incomplete**; a fresh worktree throws `MODULE_NOT_FOUND` on harnesses that
+   looked like real failures (`verifyPmaxVideoExpansion`, `verifyPmaxFunnelVariants`,
+   `verifyLogoSilhouette`). Run with
+   `NODE_PATH=/Volumes/Sayulita/Projects/RS/liquidretail_backend/node_modules`. **Do not symlink it.**
+2. **The full suite is 126 pass / 7 fail on CLEAN `origin/main`.** Those 7
+   (`verifyAdVisionQc`, `verifyAgentRegistry`, `verifyChargePointLedger`, `verifyDirectorRoundPersist`,
+   `verifyLogoSilhouette`, `verifyShopifyLadderBlocks`, `verifyVideoRetryOnUnbilledFailure`) are
+   pre-existing or environmental (DB/network/missing module), **not** caused by any current branch.
+   Always control-run them on clean main before blaming your change.
+
 ## 2026-08-12 — rating provenance (Gemini must commit; sourced wins when flagged, never at the cost of printability)
 
 Owner: *"Let's ask gemini to always get provenance, and yes scraped is better
@@ -134,7 +189,49 @@ different question ("where are the heads"). Real savings when keep-out is
 off, or when a sibling/master already stamped `facesComputed`.
 ## NEXT-SESSION PROMPT
 
-<!-- empty — last next-session prompt was consumed -->
+**2026-08-17 — two items survive the Aug-12 tree cleanup. Both need an owner decision, neither is
+started.** Full forensics in the 2026-08-17 section at the top of this file; do not re-derive it.
+
+### 1. `RENDER_CONCURRENCY` 24→48 and `MAX_CREATIVES_PER_RUN` 20→100 — owner-directed 2026-08-12, never landed
+
+The original rationale: *"expandWizardJob mints the full promised set but selectAdsForRun claimed only
+20, and queued ads never auto-drain — a measured Everything (Meta+PMax) run minted 34 and stranded 14
+statics in queued forever while the wizard promised 34."*
+
+**That rationale is now half-obsolete.** `2284f8ec` (#189) closed the leftover hole a different way —
+honest `mintedTotal` notice plus a 24h archive. The mint-vs-claim **gap is still real** on main (mint
+200-class, claim 20), so raising the cap remains a legitimate *product* choice ("one Generate renders
+the whole kit"), but it is no longer the only fix for stranded ads.
+
+**It cannot be a silent env bump. Four things block it:**
+
+- `scripts/verifyNoStrandedQueued.js:468` — **F13 `MAX_CREATIVES_PER_RUN was not raised (that hides the
+  symptom)`**. Raising the cap fails this by design. It must be deliberately rewritten, with an
+  argument for why a cap raise is no longer symptom-hiding now that claim ≥ typical mint.
+- `scripts/verifyConcurrencyConfig.js:78-80` — asserts `RENDER_CONCURRENCY is 24` **and**
+  `RENDER >= MAX_CREATIVES_PER_RUN`. 48/100 fails both. Note 48 < 100, so the relationship inverts;
+  the tree's replacement label was *"a wave size under the run cap, not non-binding"*.
+- **Do not port the tree's `verifyConcurrencyConfig.js`** — it is a pre-#186 edit that would delete
+  main's `REMOTION_QUEUE_CONCURRENCY` coverage and re-pin `VEO_TITLING_CONCURRENCY` to 4 (main is 48,
+  and `12 > 48` is false, so the tree's veo-split assertion would fail outright). Write a fresh delta
+  on main's A-block and **keep every Remotion assertion**.
+- **The Aug-12 tree contained the exact config lie the A-block exists to catch**: `defaults.env` said
+  `RENDER_CONCURRENCY=48` while `concurrency.js` `SPEC.default` stayed **24**. If these values land,
+  move the file **and** the code default together (CLAUDE.md §4a).
+
+**MONEY:** per-ad price does not change — only in-flight depth, wall-clock and burst rate. But check
+`ALERT_HOURLY_SPEND_USD` (25) against a real 100-ad CostLog hour, re-tune `ALERT_RUN_STALE_MIN` (45,
+tuned against a 20-ad batch), and note `REMOTION_QUEUE_CONCURRENCY=4` runs Remotion **in the web
+process** — a 100-ad wave's RSS behaviour has never been measured.
+
+### 2. `scripts/mintTestToken.js` is untracked, and the `ui-smoke` skill depends on it
+
+It exists **only** in the local checkout — absent from `origin/main`. `ui-smoke` uses it as the
+offline JWT signer *and* as the marker `repo-paths.js` validates the backend root against, so the QA
+harness cannot run on a fresh clone. Committing it is consistent with the skill's own documented
+design (it deliberately has no HTTP token endpoint; an offline signer needs the Render credentials,
+which is already the trust boundary) — but it is a **token-signing script**, so it is the owner's call.
+The file is preserved in the local checkout meanwhile; landing it is a one-file commit.
 
 ## 2026-08-12 — stale-run alert + terminal done guard (branch `fix/stale-run-and-done-guard`)
 
