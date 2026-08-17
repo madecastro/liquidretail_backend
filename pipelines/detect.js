@@ -82,7 +82,20 @@ async function processDetectRun(run) {
 
   run.stageTimings = {};
 
-  if (media.source === 'catalog-product') {
+  // Rescore-only branch: reuse prior DetectionArtifact + CropArtifact
+  // and re-run ONLY the match phase against current code. 10× cheaper
+  // than a full rerun (no YOLO, no identify, no crops, no subjects/text
+  // recompute). Meant for reprocessing historical runs against a
+  // matcher-code improvement — e.g. adbadba's reasoner realignment +
+  // text-scorer overhaul + semantic tier. Enqueued via
+  // match.rescoreOnly capability. Refuses catalog-source Media (they
+  // skip matching entirely by design).
+  if (run.flags?.rescoreOnly) {
+    if (media.source === 'catalog-product') {
+      throw new Error('catalog-product media do not run the match chain; rescore-only is not applicable');
+    }
+    await processRescoreOnly(run, media, buffer);
+  } else if (media.source === 'catalog-product') {
     // Catalog images are clean, isolated, single-product. Skip the
     // YOLO/identify/match chain (we already know what the product is)
     // and run a trimmed pipeline focused on building ad-ready crops.
@@ -709,6 +722,110 @@ async function maybeDownscaleForYolo(buffer, imgW) {
     console.warn(`   ⚠️  YOLO downscale failed (${err.message}) — sending original buffer`);
     return { buffer, resized: false };
   }
+}
+
+// ──────────────────────────────────────────────────────────────
+//  Rescore-only path — reuse prior DetectionArtifact + CropArtifact
+//  and re-run ONLY the match phase against current code.
+//
+//  Purpose: reprocess historical runs against a matcher-code
+//  improvement without paying for YOLO / identify / crops again.
+//  Cost: ~$0.005 per run (Gemini vision candidate scoring only) vs
+//  ~$0.05 for a full rerun. ~5-10s wall clock vs 30-60s.
+//
+//  Data flow:
+//    1. Load the latest OTHER completed DetectRun for this Media
+//    2. Load its DetectionArtifact + CropArtifact
+//    3. Reuse refinedProducts / subjects / text / primarySubjectDesc
+//    4. Persist a fresh DetectionArtifact + CropArtifact tied to the
+//       current run._id (mirrors of the prior; keeps referential
+//       integrity for Media.latestArtifacts)
+//    5. Run only runProductMatchChain
+//    6. Update Media.latestArtifacts.match/matches to point at fresh docs
+//
+//  Refuses when no prior completed run exists — the caller (executor)
+//  is expected to check first.
+// ──────────────────────────────────────────────────────────────
+async function processRescoreOnly(run, media, buffer) {
+  await setRunPhase(run, 'detect-fanout');
+
+  // Look up the most recent OTHER completed run for this Media.
+  const priorRun = await require('../models/DetectRun').findOne({
+    mediaId: media._id,
+    status:  'completed',
+    _id:     { $ne: run._id }
+  }).sort({ createdAt: -1 }).lean();
+  if (!priorRun) {
+    throw new Error('no prior completed DetectRun to rescore from — run a full detect.rematch first');
+  }
+  const priorDet  = await DetectionArtifact.findOne({ runId: priorRun._id }).lean();
+  if (!priorDet) {
+    throw new Error(`prior run ${priorRun._id} has no DetectionArtifact — full rerun required`);
+  }
+  const priorCrop = await CropArtifact.findOne({ runId: priorRun._id }).lean();
+
+  console.log(`♻️  rescore-only: reusing DetectionArtifact from prior run ${priorRun._id}`);
+
+  // Mirror the prior detection into a fresh doc for run._id. Keeps
+  // Media.latestArtifacts pointer-consistent when the new run is
+  // eventually the "latest" by createdAt.
+  const detectionDoc = await DetectionArtifact.create({
+    mediaId:            media._id,
+    runId:              run._id,
+    advertiserId:       media.advertiserId,
+    brandId:            media.brandId,
+    type:               priorDet.type || 'image',
+    width:              priorDet.width,
+    height:             priorDet.height,
+    imageUrl:           priorDet.imageUrl,
+    yoloProducts:       priorDet.yoloProducts       || [],
+    refinedProducts:    priorDet.refinedProducts    || [],
+    subjects:           priorDet.subjects           || [],
+    text:               priorDet.text               || [],
+    background:         priorDet.background         || null,
+    primarySubjectId:   priorDet.primarySubjectId   || null,
+    primarySubjectDesc: priorDet.primarySubjectDesc || null,
+    safeRect:           priorDet.safeRect           || null
+  });
+  const cropDoc = priorCrop
+    ? await CropArtifact.create({
+        mediaId:      media._id,
+        runId:        run._id,
+        advertiserId: media.advertiserId,
+        brandId:      media.brandId,
+        smartCrops:   priorCrop.smartCrops || {},
+        judge:        priorCrop.judge || {},
+        winners:      priorCrop.winners || {}
+      })
+    : null;
+
+  // Copy the prior YOLO downscale flag so the yoloDownscaled telemetry
+  // stays consistent across the rescored run's history.
+  if (priorRun.flags?.yoloDownscaled) {
+    run.flags = run.flags || {};
+    run.flags.yoloDownscaled = priorRun.flags.yoloDownscaled;
+  }
+
+  await setRunPhase(run, 'enrich-fanout');
+  const products         = priorDet.yoloProducts       || [];
+  const refinedProducts  = priorDet.refinedProducts    || [];
+  const primarySubjectDesc = priorDet.primarySubjectDesc || null;
+  const text             = priorDet.text || [];
+  const sourceImageUrl   = priorDet.imageUrl || media.fileUrl;
+
+  const matchRes = await runProductMatchChain(run, media, sourceImageUrl, products, primarySubjectDesc, text, refinedProducts);
+
+  await setRunPhase(run, 'finalize');
+  await updateMediaLatestArtifacts(media, {
+    detection: detectionDoc._id,
+    crops:     cropDoc?._id || null,
+    match:     matchRes?.matchDoc?._id || null,
+    matches:   (matchRes?.matchDocs || []).map(d => d._id)
+    // extended + overlayZones untouched — the prior run's copies stay
+    // valid; no need to overwrite them from a rescore.
+  });
+
+  console.log(`♻️  rescore-only complete for media ${media._id} — reused prior detect, wrote ${(matchRes?.matchDocs || []).length} fresh ProductMatchArtifact(s)`);
 }
 
 async function runYoloChain(run, buffer, media, sourceUrlOverride = null, options = {}) {

@@ -1380,6 +1380,75 @@ const CAPABILITIES = [
     }
   },
 
+  {
+    id:       'detect.listFailedRuns',
+    title:    'List DetectRuns that failed',
+    describe: 'Enumerate DetectRuns under a brand that produced a bad outcome — yoloFailed=true, run.error present, run.status=failed, or completed-but-zero-strong-match. Returns runId + mediaId + flags + recommended rematch capability per row, so the agent can then feed them into detect.rematch / detect.rematchCatalogProduct / match.rescoreOnly. Read-only, tenant-scoped. Default window is 7 days; cap 50 rows (hard cap 200).',
+    tier:     0,
+    scope:    'brand',
+    args: {
+      type: 'object',
+      required: ['brandId'],
+      properties: {
+        brandId:    { type: 'string', description: 'Brand ObjectId.' },
+        kind:       { type: 'string', enum: ['yolo-failed', 'error', 'no-strong-match', 'all-failures'], description: 'Which failure class to enumerate. Default \'all-failures\'.' },
+        sinceHours: { type: 'integer', minimum: 1, maximum: 2160, description: 'Look-back window in hours (default 168 = 7 days, max 2160 = 90 days).' },
+        limit:      { type: 'integer', minimum: 1, maximum: 200, description: 'Row cap (default 50, hard cap 200).' }
+      },
+      additionalProperties: false
+    },
+    execute: {
+      kind:    'service',
+      service: './capabilityExecutors/detectListFailedRuns',
+      method:  'run'
+    }
+  },
+
+  {
+    id:       'detect.rematchByProduct',
+    title:    'Rematch detect for all Media tied to one CatalogProduct',
+    describe: 'Given a catalogProductId, enqueue rematches for every Media that IS the product (source=catalog-product with metadata.catalogProductId) or that matched it (matchedProducts.catalogProductId). Priority 1, trigger=manual-rematch. Fan-out capped (default 25, hard cap 100). In-flight runs are counted as skipped, not re-enqueued. Fires the full pipeline per Media — use match.rescoreOnly for cheap rescore-only reruns if only matching code has changed. Requires operator confirmation.',
+    tier:     2,
+    scope:    'brand',
+    args: {
+      type: 'object',
+      required: ['catalogProductId'],
+      properties: {
+        catalogProductId:     { type: 'string', description: 'CatalogProduct ObjectId.' },
+        includeCatalogSource: { type: 'boolean', description: 'When true (default), also rematch the catalog wrapper Media (rebuilds crops/overlay zones on the product\'s own hero + alt images).' },
+        maxMedia:             { type: 'integer', minimum: 1, maximum: 100, description: 'Fan-out cap (default 25). Runs refuse if more Media than this would be enqueued — narrow scope or raise the cap explicitly.' }
+      },
+      additionalProperties: false
+    },
+    execute: {
+      kind:    'service',
+      service: './capabilityExecutors/detectRematchByProduct',
+      method:  'run'
+    }
+  },
+
+  {
+    id:       'match.rescoreOnly',
+    title:    'Re-run only the match phase against current code',
+    describe: 'Enqueue a DetectRun with flags.rescoreOnly=true. The worker reuses the prior DetectionArtifact + CropArtifact and re-runs ONLY findPerProductMatches, writing fresh ProductMatchArtifact rows. ~5-10s wall clock vs 30-60s; ~$0.005 spend vs ~$0.05. Meant for reprocessing historical runs against a matcher-code improvement (e.g. the adbadba reasoner + text-scorer overhaul) without paying for YOLO / identify / crops again. Refuses catalog-product Media (they skip matching by design). Refuses when no prior completed DetectRun exists. Priority 1.',
+    tier:     2,
+    scope:    'brand',
+    args: {
+      type: 'object',
+      required: ['mediaId'],
+      properties: {
+        mediaId: { type: 'string', description: 'Media ObjectId.' },
+        runId:   { type: 'string', description: 'Optional prior DetectRun ObjectId. Currently ignored by the pipeline (always uses latest prior completed run) but accepted for API stability.' }
+      },
+      additionalProperties: false
+    },
+    execute: {
+      kind:    'service',
+      service: './capabilityExecutors/matchRescoreOnly',
+      method:  'run'
+    }
+  },
+
   // ── Phase 10: Sales demos — T1 CRUD + abort ───────────────────────
 
   {
