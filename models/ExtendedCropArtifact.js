@@ -24,6 +24,10 @@ const extendedCropArtifactSchema = new mongoose.Schema({
   // shape: { '9:16': { candidateId, source: 'judge' }, '1.91:1': {...} }
 
   createdAt: { type: Date, default: Date.now }
+}, {
+  // `errors` is on Mongoose's reserved-pathname list — same trap as
+  // ProductMatchArtifact. Runtime works; suppress the boot warning.
+  suppressReservedKeysWarning: true
 });
 
 module.exports = mongoose.model('ExtendedCropArtifact', extendedCropArtifactSchema);

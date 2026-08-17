@@ -151,7 +151,13 @@ const campaignRunSchema = new mongoose.Schema({
 
   startedAt:    { type: Date, default: Date.now },
   completedAt:  { type: Date, default: null }
-}, { timestamps: true });
+}, {
+  timestamps: true,
+  // `errors` is a Mongoose reserved pathname (Document.prototype has an
+  // .errors property). Runtime works; this just silences the boot log
+  // warning.
+  suppressReservedKeysWarning: true
+});
 
 campaignRunSchema.index({ brandId: 1, createdAt: -1 });
 // The /generate concurrency gate runs this exact shape twice per request

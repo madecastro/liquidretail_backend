@@ -82,6 +82,12 @@ const productMatchArtifactSchema = new mongoose.Schema({
   catalogMatch:     mongoose.Schema.Types.Mixed,
 
   createdAt: { type: Date, default: Date.now }
+}, {
+  // `errors` is on Mongoose's reserved-pathname list (Document.prototype
+  // has an .errors property). The field works at runtime; only the
+  // startup warning fires. Suppressed here because rename would need
+  // every read path across the codebase touched.
+  suppressReservedKeysWarning: true
 });
 
 module.exports = mongoose.model('ProductMatchArtifact', productMatchArtifactSchema);
