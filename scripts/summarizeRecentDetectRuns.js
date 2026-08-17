@@ -94,6 +94,42 @@ function fmtMs(ms) {
     for (const k of Object.keys(errors)) console.log(`    "${k}" × ${errors[k]}`);
   }
 
+  // 2026-08-17 — per-stage silent failure flags. Populated by
+  // pipelines/detect.js stampStageFailure / persistLateStageFailure.
+  // Pre-2026-08-17 runs will show zero for every stage flag — the code
+  // wasn't stamping them then. Anything > 0 within the deploy window is
+  // a real signal.
+  const STAGE_FLAG_NAMES = [
+    'judge', 'judgeExtended', 'refine', 'subjects',
+    'identifyGpt', 'identifyGemini',
+    'extended', 'overlay', 'derivations', 'lazyEnrichment',
+    'dims', 'match'
+  ];
+  console.log('\n── per-stage silent failures (shipped 2026-08-17) ──');
+  const stageCounts = {};
+  const stageSampleErrors = {};
+  for (const n of STAGE_FLAG_NAMES) { stageCounts[n] = 0; stageSampleErrors[n] = []; }
+  let anyStageFailure = 0;
+  for (const r of runs) {
+    let hit = false;
+    for (const n of STAGE_FLAG_NAMES) {
+      if (r.flags?.[`${n}Failed`]) {
+        stageCounts[n]++;
+        hit = true;
+        if (stageSampleErrors[n].length < 3 && r.flags?.[`${n}Error`]) {
+          stageSampleErrors[n].push(r.flags[`${n}Error`].slice(0, 80));
+        }
+      }
+    }
+    if (hit) anyStageFailure++;
+  }
+  console.log(`  runs with ≥1 stage failure : ${anyStageFailure} / ${runs.length}  (${(anyStageFailure / runs.length * 100).toFixed(1)}%)`);
+  for (const n of STAGE_FLAG_NAMES) {
+    if (stageCounts[n] === 0) continue;
+    console.log(`  ${n.padEnd(18)} ${stageCounts[n]} (${(stageCounts[n] / runs.length * 100).toFixed(1)}%)`);
+    for (const e of stageSampleErrors[n]) console.log(`      "${e}"`);
+  }
+
   console.log('\n── run wall clock ──');
   if (wallClocks.length) {
     console.log(`  p50 ${fmtMs(pct(wallClocks, 0.5))}  p90 ${fmtMs(pct(wallClocks, 0.9))}  p99 ${fmtMs(pct(wallClocks, 0.99))}  max ${fmtMs(Math.max(...wallClocks))}`);

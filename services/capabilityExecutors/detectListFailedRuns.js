@@ -28,7 +28,51 @@ const Media = require('../../models/Media');
 const MAX_LIMIT   = 200;
 const DEFAULT_LIMIT = 50;
 
-const KINDS = new Set(['yolo-failed', 'error', 'no-strong-match', 'all-failures']);
+// Kinds — direct flag-hits use flags.<name>Failed on DetectRun.
+// The 2026-08-17 observability pass added the non-YOLO stamps:
+// judge, judgeExtended, refine, subjects, identifyGpt, identifyGemini,
+// extended, overlay, derivations, lazyEnrichment, dims, match.
+// 'stage-failed' is a union of all non-YOLO stage flags for the
+// operator who just wants "any silent failure" without picking a stage.
+const STAGE_FLAG_NAMES = [
+  'judge', 'judgeExtended', 'refine', 'subjects',
+  'identifyGpt', 'identifyGemini',
+  'extended', 'overlay', 'derivations', 'lazyEnrichment',
+  'dims', 'match'
+];
+const STAGE_KINDS = new Set([
+  'judge-failed', 'judge-extended-failed', 'refine-failed', 'subjects-failed',
+  'identify-failed',    // union of gpt + gemini
+  'extended-failed', 'overlay-failed', 'derivations-failed',
+  'lazy-enrichment-failed', 'dims-failed', 'match-failed',
+  'stage-failed'        // union of ALL of the above
+]);
+const KINDS = new Set([
+  'yolo-failed', 'error', 'no-strong-match', 'all-failures',
+  ...STAGE_KINDS
+]);
+
+// Kind → Mongo query filter on flags.<name>Failed
+function stageFlagQueryFor(kind) {
+  switch (kind) {
+    case 'judge-failed':          return { 'flags.judgeFailed':          true };
+    case 'judge-extended-failed': return { 'flags.judgeExtendedFailed':  true };
+    case 'refine-failed':         return { 'flags.refineFailed':         true };
+    case 'subjects-failed':       return { 'flags.subjectsFailed':       true };
+    case 'identify-failed':       return { $or: [
+      { 'flags.identifyGptFailed':    true },
+      { 'flags.identifyGeminiFailed': true }
+    ] };
+    case 'extended-failed':       return { 'flags.extendedFailed':       true };
+    case 'overlay-failed':        return { 'flags.overlayFailed':        true };
+    case 'derivations-failed':    return { 'flags.derivationsFailed':    true };
+    case 'lazy-enrichment-failed':return { 'flags.lazyEnrichmentFailed': true };
+    case 'dims-failed':           return { 'flags.dimsFailed':           true };
+    case 'match-failed':          return { 'flags.matchFailed':          true };
+    case 'stage-failed':          return { $or: STAGE_FLAG_NAMES.map(n => ({ [`flags.${n}Failed`]: true })) };
+    default: return null;
+  }
+}
 
 async function run({ req, args }) {
   if (!req?.advertiserId) {
@@ -70,6 +114,12 @@ async function run({ req, args }) {
     runs = await DetectRun.find(yoloFailedQuery).sort({ createdAt: -1 }).limit(limit).lean();
   } else if (kind === 'error') {
     runs = await DetectRun.find(errorQuery).sort({ createdAt: -1 }).limit(limit).lean();
+  } else if (STAGE_KINDS.has(kind)) {
+    // Direct flag hits — shipped 2026-08-17 with the observability pass.
+    runs = await DetectRun.find({ ...baseQuery, ...stageFlagQueryFor(kind) })
+      .sort({ createdAt: -1 })
+      .limit(limit)
+      .lean();
   } else if (kind === 'no-strong-match' || kind === 'all-failures') {
     // For no-strong-match / all-failures, we need to look at completed
     // runs and filter by whether any ProductMatchArtifact has outcome
@@ -77,12 +127,14 @@ async function run({ req, args }) {
     // wider than `limit` because the strong-match filter is applied
     // post-load.
     const candidateWindow = Math.min(MAX_LIMIT * 3, limit * 5);
+    const anyStageFlagOr = STAGE_FLAG_NAMES.map(n => ({ [`flags.${n}Failed`]: true }));
     const q = kind === 'all-failures'
       ? { ...baseQuery, $or: [
           { 'flags.yoloFailed': true },
           { error: { $exists: true, $ne: null } },
           { status: 'failed' },
-          { status: 'completed' }   // completed runs subject to no-strong-match filter below
+          { status: 'completed' },     // completed runs subject to no-strong-match filter below
+          ...anyStageFlagOr
         ] }
       : { ...baseQuery, status: 'completed' };
     const candidates = await DetectRun.find(q).sort({ createdAt: -1 }).limit(candidateWindow).lean();
@@ -95,13 +147,15 @@ async function run({ req, args }) {
     }).select('runId').lean();
     const strongByRun = new Set(strong.map(m => String(m.runId)));
 
+    const hasAnyStageFlag = (r) => STAGE_FLAG_NAMES.some(n => r.flags?.[`${n}Failed`]);
     const filtered = candidates.filter(r => {
       if (kind === 'no-strong-match') {
         return r.status === 'completed' && !strongByRun.has(String(r._id));
       }
-      // all-failures — include yoloFailed/error/failed unconditionally,
-      // completed only if no strong match
+      // all-failures — include yoloFailed/error/failed/any-stage-flag
+      // unconditionally, completed only if no strong match
       if (r.flags?.yoloFailed || r.error || r.status === 'failed') return true;
+      if (hasAnyStageFlag(r)) return true;
       if (r.status === 'completed' && !strongByRun.has(String(r._id))) return true;
       return false;
     });
@@ -136,13 +190,25 @@ async function run({ req, args }) {
           trigger:   r.trigger,
           createdAt: r.createdAt,
           completedAt: r.completedAt || null,
-          flags: {
-            yoloFailed:       !!r.flags?.yoloFailed,
-            yoloError:        r.flags?.yoloError || null,
-            yoloErrorKind:    r.flags?.yoloErrorKind || null,
-            yoloFallbackSynth: !!r.flags?.yoloFallbackSynth,
-            yoloDownscaled:   r.flags?.yoloDownscaled || null
-          },
+          flags: (() => {
+            const out = {
+              yoloFailed:       !!r.flags?.yoloFailed,
+              yoloError:        r.flags?.yoloError || null,
+              yoloErrorKind:    r.flags?.yoloErrorKind || null,
+              yoloFallbackSynth: !!r.flags?.yoloFallbackSynth,
+              yoloDownscaled:   r.flags?.yoloDownscaled || null
+            };
+            // 2026-08-17 observability pass — surface any non-YOLO stage
+            // flag that fired. Only include when actually set to keep
+            // response tight.
+            for (const n of STAGE_FLAG_NAMES) {
+              if (r.flags?.[`${n}Failed`]) {
+                out[`${n}Failed`] = true;
+                if (r.flags?.[`${n}Error`]) out[`${n}Error`] = r.flags[`${n}Error`];
+              }
+            }
+            return out;
+          })(),
           error:      r.error || null,
           errorStage: r.errorStage || null,
           media: m ? {

@@ -147,6 +147,7 @@ async function runImagePipeline(run, media, buffer, sourceUrlOverride = null) {
     imgH = meta.height || imgH;
   } catch (err) {
     console.warn(`   ⚠️  sharp metadata failed for ${media._id}: ${err.message} — using ${imgW}x${imgH}`);
+    stampStageFailure(run, 'dims', err);
   }
 
   // ── Phase 1: detect fan-out ──
@@ -161,7 +162,10 @@ async function runImagePipeline(run, media, buffer, sourceUrlOverride = null) {
     run.flags.yoloFailed = true;
     run.flags.yoloError  = yoloRes.reason?.message || 'chain rejected';
   }
-  if (subjectsRes.status === 'rejected') console.warn('⚠️  Subjects/text chain rejected:', subjectsRes.reason?.message);
+  if (subjectsRes.status === 'rejected') {
+    console.warn('⚠️  Subjects/text chain rejected:', subjectsRes.reason?.message);
+    stampStageFailure(run, 'subjects', subjectsRes.reason);
+  }
 
   const yoloChainOut = yoloRes.status === 'fulfilled'
     ? yoloRes.value
@@ -203,7 +207,11 @@ async function runImagePipeline(run, media, buffer, sourceUrlOverride = null) {
   const judge = await timeStage(run, 'judge', async () => {
     try {
       return await judgeDetections({ imageUrl: sourceUrl, products, subjects, text, crops, safeRect });
-    } catch (err) { console.warn('⚠️  Judge:', err.message); return null; }
+    } catch (err) {
+      console.warn('⚠️  Judge:', err.message);
+      stampStageFailure(run, 'judge', err);
+      return null;
+    }
   });
 
   const primarySubjectId   = resolvePrimarySubjectId(subjects, judge);
@@ -286,6 +294,7 @@ async function runImagePipeline(run, media, buffer, sourceUrlOverride = null) {
   const matchRes = await runProductMatchChain(run, media, sourceUrl, products, primarySubjectDesc, text, refinedProducts)
     .catch(err => {
       console.warn('⚠️  Product match chain rejected:', err.message);
+      stampStageFailure(run, 'match', err);
       return null;
     });
   const { productMatches, matchDoc, matchDocs } = matchRes || { productMatches: null, matchDoc: null, matchDocs: [] };
@@ -330,10 +339,13 @@ async function runImagePipeline(run, media, buffer, sourceUrlOverride = null) {
         extended:     extendedDoc?._id,
         overlayZones: overlayDoc?._id
       });
-      await applyMediaLibraryDerivations(media, buffer, overlayDoc, productMatches);
+      await applyMediaLibraryDerivations(media, buffer, overlayDoc, productMatches, run._id);
       console.log(`🎨 lazy enrichment landed for media ${media._id}`);
     })
-    .catch(err => console.warn(`   ⚠️  lazy enrichment failed for media ${media._id}: ${err.message}`));
+    .catch(err => {
+      console.warn(`   ⚠️  lazy enrichment failed for media ${media._id}: ${err.message}`);
+      persistLateStageFailure(run._id, 'lazyEnrichment', err);
+    });
 }
 
 // ──────────────────────────────────────────────────────────────
@@ -507,6 +519,7 @@ async function runCatalogProductPipeline(run, media, buffer) {
     imgH = meta.height || imgH;
   } catch (err) {
     console.warn(`   ⚠️  sharp metadata failed for catalog ${media._id}: ${err.message} — using ${imgW}x${imgH}`);
+    stampStageFailure(run, 'dims', err);
   }
 
   // ── Phase 1: detect fan-out — YOLO (skip identify) ‖ subjects/text ──
@@ -528,6 +541,7 @@ async function runCatalogProductPipeline(run, media, buffer) {
   }
   if (subjectsRes.status === 'rejected') {
     console.warn('⚠️  Catalog subjects/text chain rejected:', subjectsRes.reason?.message);
+    stampStageFailure(run, 'subjects', subjectsRes.reason);
   }
 
   const yoloChainOut = yoloRes.status === 'fulfilled'
@@ -573,7 +587,11 @@ async function runCatalogProductPipeline(run, media, buffer) {
     judge = await timeStage(run, 'judge', async () => {
       try {
         return await judgeDetections({ imageUrl: sourceUrl, products, subjects, text, crops, safeRect });
-      } catch (err) { console.warn('⚠️  Catalog-path judge:', err.message); return null; }
+      } catch (err) {
+        console.warn('⚠️  Catalog-path judge:', err.message);
+        stampStageFailure(run, 'judge', err);
+        return null;
+      }
     });
   }
 
@@ -651,10 +669,13 @@ async function runCatalogProductPipeline(run, media, buffer) {
         extended:     extendedDoc?._id,
         overlayZones: overlayDoc?._id
       });
-      await applyMediaLibraryDerivations(media, buffer, overlayDoc, null);
+      await applyMediaLibraryDerivations(media, buffer, overlayDoc, null, run._id);
       console.log(`🎨 catalog-product lazy enrichment landed for media ${media._id}`);
     })
-    .catch(err => console.warn(`   ⚠️  catalog-product lazy enrichment failed for media ${media._id}: ${err.message}`));
+    .catch(err => {
+      console.warn(`   ⚠️  catalog-product lazy enrichment failed for media ${media._id}: ${err.message}`);
+      persistLateStageFailure(run._id, 'lazyEnrichment', err);
+    });
 
   // E1 — back-link Media.matchedProducts to the catalog product this
   // wrapper Media represents. Catalog-source runs skip the match phase
@@ -936,11 +957,13 @@ async function runYoloChain(run, buffer, media, sourceUrlOverride = null, option
       const hints = { brand: media.metadata?.brand, category: media.metadata?.category };
       const tasks = [identifyYoloDetections(products, hints).catch(err => {
         console.warn('⚠️  GPT yolo-identify:', err.message);
+        stampStageFailure(run, 'identifyGpt', err);
         return null;
       })];
       if (isGeminiIdentifyEnabled()) {
         tasks.push(identifyYoloDetectionsGemini(products, hints).catch(err => {
           console.warn('⚠️  Gemini yolo-identify:', err.message);
+          stampStageFailure(run, 'identifyGemini', err);
           return null;
         }));
       } else {
@@ -993,6 +1016,7 @@ async function runYoloChain(run, buffer, media, sourceUrlOverride = null, option
         return refined;
       } catch (err) {
         console.warn('⚠️  crop-refine:', err.message);
+        stampStageFailure(run, 'refine', err);
         return [];
       }
     });
@@ -1062,6 +1086,7 @@ async function runSubjectsTextChain(run, imageUrl, media) {
       };
     } catch (err) {
       console.warn('⚠️  Subject/text:', err.message);
+      stampStageFailure(run, 'subjects', err);
       return emptySubjectsText();
     }
   });
@@ -1115,6 +1140,7 @@ async function runProductMatchChain(run, media, sourceImageUrl, products, primar
       return result;
     } catch (err) {
       console.warn('⚠️  Product match:', err.message);
+      stampStageFailure(run, 'match', err);
       return null;
     }
   });
@@ -1364,7 +1390,12 @@ async function runExtendedAndOverlayChain(run, media, sourceImageUrl, sourceVide
         extendedErrors = errors;
         const totalCandidates = Object.values(extendedCandidates).reduce((a, arr) => a + arr.length, 0);
         console.log(`🖼️   Extended crops${isVideo ? ' (video)' : ''}: ${totalCandidates} candidate(s) across ${Object.keys(extendedCandidates).length} ratios`);
-      } catch (err) { console.warn('⚠️  Extended crops:', err.message); }
+      } catch (err) {
+        console.warn('⚠️  Extended crops:', err.message);
+        stampStageFailure(run, 'extended', err);
+        // Lazy path — run.save has already fired, so mirror onto the persisted doc.
+        persistLateStageFailure(run._id, 'extended', err);
+      }
     });
 
     const totalCandidates = Object.values(extendedCandidates).reduce((a, arr) => a + arr.length, 0);
@@ -1377,7 +1408,11 @@ async function runExtendedAndOverlayChain(run, media, sourceImageUrl, sourceVide
             text,
             primarySubject: primarySubjectDesc
           });
-        } catch (err) { console.warn('⚠️  Judge extended:', err.message); }
+        } catch (err) {
+          console.warn('⚠️  Judge extended:', err.message);
+          stampStageFailure(run, 'judgeExtended', err);
+          persistLateStageFailure(run._id, 'judgeExtended', err);
+        }
       });
     }
   }
@@ -1408,7 +1443,11 @@ async function runExtendedAndOverlayChain(run, media, sourceImageUrl, sourceVide
           sourceImageUrl, crops, judge, extendedCrops: extendedCandidates,
           forbiddenRectsPct
         });
-      } catch (err) { console.warn('⚠️  Overlay zones:', err.message); }
+      } catch (err) {
+        console.warn('⚠️  Overlay zones:', err.message);
+        stampStageFailure(run, 'overlay', err);
+        persistLateStageFailure(run._id, 'overlay', err);
+      }
     });
   }
 
@@ -1431,6 +1470,50 @@ async function setRunPhase(run, phase) {
   run.stage = phase;
   await run.save();
   console.log(`   ⇒ phase: ${phase}`);
+}
+
+// Stamp a non-fatal stage failure onto run.flags so it's queryable
+// post-hoc via detect.listFailedRuns / DetectRun.flags.<name>Failed
+// without needing to grep logs. Same idiom as yoloFailed. `name`
+// should be short + camelCase and match the enum in the
+// detect.listFailedRuns capability: judge, judgeExtended, refine,
+// match, subjects, identifyGpt, identifyGemini, extended, overlay,
+// derivations, lazyEnrichment, dims, denorm, mirror.
+//
+// Silent in-catch failures used to leave zero trace on the DetectRun,
+// so a run where (say) Judge Gemini call 500'd would land at
+// status:completed with no flag and no error — invisible to any
+// post-hoc analysis that isn't tailing the live log. Measured
+// 2026-08-17: 100% of non-YOLO catch blocks were unflagged.
+function stampStageFailure(run, name, err) {
+  if (!run || !name) return;
+  run.flags = run.flags || {};
+  run.flags[`${name}Failed`] = true;
+  const msg = err?.message || String(err || 'unknown');
+  run.flags[`${name}Error`] = msg.slice(0, 200);
+}
+
+// Companion for LAZY paths that fire AFTER run.status='completed' has
+// already been persisted — extended-crops + overlay-zones + media
+// library derivations. run.save() has already fired, so mutating
+// run.flags in-memory doesn't reach Mongo. Direct updateOne writes
+// the flag onto the persisted doc. Best-effort — a failure here is
+// itself non-fatal.
+async function persistLateStageFailure(runId, name, err) {
+  if (!runId || !name) return;
+  try {
+    const DetectRun = require('../models/DetectRun');
+    const msg = err?.message || String(err || 'unknown');
+    await DetectRun.updateOne(
+      { _id: runId },
+      { $set: {
+          [`flags.${name}Failed`]: true,
+          [`flags.${name}Error`]:  msg.slice(0, 200)
+      } }
+    );
+  } catch (e) {
+    console.warn(`   ⚠️  persistLateStageFailure(${name}): ${e.message}`);
+  }
 }
 
 // Sub-stage timing wrapper. Records elapsed ms in run.stageTimings under
@@ -1617,7 +1700,7 @@ function resolvePrimarySubjectDesc(subjects, judge) {
 // All sub-steps are best-effort — a missing buffer, missing overlay
 // artifact, or heuristic failure only suppresses the dependent metric,
 // never fails the run.
-async function applyMediaLibraryDerivations(media, sourceBuffer, overlayDoc, productMatches) {
+async function applyMediaLibraryDerivations(media, sourceBuffer, overlayDoc, productMatches, runId = null) {
   try {
     // 1. Focus — Laplacian variance on the source buffer
     let focus = null;
@@ -1701,6 +1784,7 @@ async function applyMediaLibraryDerivations(media, sourceBuffer, overlayDoc, pro
     console.log(`📊 ad-readiness: ${suitability.score.toFixed(1)}/10 (✓${positives} ⚠${cautions} ✗${negatives})${focus ? ` focus=${focus.focusBucket}` : ''}${brightnessAvg != null ? ` bright=${brightnessAvg.toFixed(2)}` : ''}${densityAvg != null ? ` density=${densityAvg.toFixed(2)}` : ''}`);
   } catch (err) {
     console.warn(`   ⚠️  media-library derivations failed (non-fatal): ${err.message}`);
+    if (runId) persistLateStageFailure(runId, 'derivations', err);
   }
 }
 

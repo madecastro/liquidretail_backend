@@ -1383,7 +1383,7 @@ const CAPABILITIES = [
   {
     id:       'detect.listFailedRuns',
     title:    'List DetectRuns that failed',
-    describe: 'Enumerate DetectRuns under a brand that produced a bad outcome — yoloFailed=true, run.error present, run.status=failed, or completed-but-zero-strong-match. Returns runId + mediaId + flags + recommended rematch capability per row, so the agent can then feed them into detect.rematch / detect.rematchCatalogProduct / match.rescoreOnly. Read-only, tenant-scoped. Default window is 7 days; cap 50 rows (hard cap 200).',
+    describe: 'Enumerate DetectRuns under a brand that produced a bad outcome. Kinds: (a) core failure classes — yolo-failed / error / no-strong-match / all-failures; (b) per-stage flags shipped with the 2026-08-17 observability pass — judge-failed / judge-extended-failed / refine-failed / subjects-failed / identify-failed (gpt or gemini) / extended-failed / overlay-failed / derivations-failed / lazy-enrichment-failed / dims-failed / match-failed; (c) stage-failed as a union of every (b) kind. Returns runId + mediaId + flags + recommended rematch capability per row. Read-only, tenant-scoped. Default window 7 days; cap 50 (hard 200).',
     tier:     0,
     scope:    'brand',
     args: {
@@ -1391,7 +1391,12 @@ const CAPABILITIES = [
       required: ['brandId'],
       properties: {
         brandId:    { type: 'string', description: 'Brand ObjectId.' },
-        kind:       { type: 'string', enum: ['yolo-failed', 'error', 'no-strong-match', 'all-failures'], description: 'Which failure class to enumerate. Default \'all-failures\'.' },
+        kind:       { type: 'string', enum: [
+          'yolo-failed', 'error', 'no-strong-match', 'all-failures',
+          'judge-failed', 'judge-extended-failed', 'refine-failed', 'subjects-failed',
+          'identify-failed', 'extended-failed', 'overlay-failed', 'derivations-failed',
+          'lazy-enrichment-failed', 'dims-failed', 'match-failed', 'stage-failed'
+        ], description: 'Which failure class to enumerate. Default \'all-failures\' (union of yolo/error/no-strong-match + every per-stage flag).' },
         sinceHours: { type: 'integer', minimum: 1, maximum: 2160, description: 'Look-back window in hours (default 168 = 7 days, max 2160 = 90 days).' },
         limit:      { type: 'integer', minimum: 1, maximum: 200, description: 'Row cap (default 50, hard cap 200).' }
       },
