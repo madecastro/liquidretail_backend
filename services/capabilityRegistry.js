@@ -39,6 +39,25 @@ const VALID_TIERS   = new Set([0, 1, 2, 3, 4]);
 const VALID_SCOPES  = new Set(['ad', 'brand', 'advertiser', 'product', 'campaign', 'global']);
 const VALID_KINDS   = new Set(['service']);   // 'route' reserved for later
 
+// ── Detect-pipeline cost basis (Tier 2 rematch / rescore estimators) ──
+//
+// Planning-grade FLOOR-to-upper-bound figures for spendGuard, not
+// billing truth — the authoritative charge is always the reconciled
+// CostLog row written after the run settles. Grounded in the repo's
+// own published per-run figures (services/capabilityExecutors/
+// matchRescoreOnly.js: "~$0.005 spend vs ~$0.05" for rescore-only vs a
+// full rerun), NOT quoted from an Atlas base_price — see CLAUDE.md §2
+// on why base_price is not the charge.
+//
+// Rounded UP on purpose. spendGuard rejects when spent + estimate >
+// cap, so overestimating fails safe (an early block the operator can
+// see and raise) while underestimating silently lets a fan-out breach
+// the daily cap.
+const DETECT_FULL_RUN_USD     = 0.05;   // full pipeline on one Media
+const DETECT_RESCORE_ONLY_USD = 0.01;   // ~$0.005 measured, rounded up
+const DETECT_REMATCH_DEFAULT_FANOUT = 25;   // maxMedia default
+const DETECT_REMATCH_MAX_FANOUT     = 100;  // maxMedia hard cap
+
 // ═══════════════════════════════════════════════════════════════════
 // THE MANIFEST
 // ═══════════════════════════════════════════════════════════════════
@@ -1108,7 +1127,7 @@ const CAPABILITIES = [
   {
     id:       'catalog.bulkDeleteProducts',
     title:    'Delete multiple catalog products',
-    describe: 'Two shapes: (1) productIds:[...] — explicit ids for surgical removal; (2) filter — every product matching the DSL. hardDelete:true runs cascade cleanup + Mongo deleteMany (irreversible). Default is soft — sets deletedAt=now on every match. Cascade runs in BOTH modes (Campaign.matchedProductIds pull, Media.matchedProducts pull, Ad.productId unset). Cap: 500 rows per call — the filter branch COUNTS first and refuses if the resolved set exceeds the cap (no partial deletes on filter typos). TIER 4 — bulk delete can nuke thousands of rows on a typo, so operator must confirm with the phrase gate.',
+    describe: 'Two shapes: (1) productIds:[...] — explicit ids for surgical removal; (2) filter — every product matching the DSL. hardDelete:true runs cascade cleanup + Mongo deleteMany (irreversible). Default is soft — sets deletedAt=now on every match. Cascade runs in BOTH modes (Campaign.matchedProductIds pull, Media.matchedProducts pull, Ad.productId unset). Cap: 500 rows per call — resolution COUNTS first and refuses if the resolved set exceeds the cap (no partial deletes on filter typos), re-checked at execute time. TIER 4 two-phase workflow — bulk delete can nuke thousands of rows on a typo, so on invocation you receive a PLAN showing the resolved blast radius (how many rows, a sample of which, and whether it is reversible); the operator must confirm before anything is mutated. Non-billable.',
     tier:     4,
     scope:    'brand',
     args: {
@@ -1134,11 +1153,20 @@ const CAPABILITIES = [
       },
       additionalProperties: false
     },
+    // Two-phase Tier 4 — the executor exports preview() + execute()
+    // instead of a single method. Names are locked by the endpoint's
+    // gate logic (routes/agent.js splitByGate, which buckets on
+    // execute.workflow === true, NOT on tier).
     execute: {
       kind:    'service',
       service: './capabilityExecutors/catalogBulkDeleteProducts',
-      method:  'run'
-    }
+      workflow: true
+    },
+    // Non-billable — pure Mongo writes, no model/LLM call. Declared
+    // explicitly to satisfy the validateManifest tier ≥ 2 estimateUsd
+    // rule. Not cosmetic: spendGuard fails CLOSED on a missing
+    // estimator, so without this the capability is refused at dispatch.
+    estimateUsd: 0
   },
 
   // ── Category CRUD parity with CatalogProduct (2026-08-12) ────────
@@ -1197,7 +1225,7 @@ const CAPABILITIES = [
   {
     id:       'catalog.bulkDeleteCategories',
     title:    'Delete multiple categories',
-    describe: 'Two shapes: categoryIds:[...] explicit OR filter DSL {categoryIds, breadcrumbKeys, depth, hasProducts, hasNoProducts}. hasNoProducts is the "stale category cleanup" filter — matches categories with no live products pointing at them. cascade=true expands each target to its subtree; without it, targets with children are REFUSED (reported in response, not fatal — the safe ones still delete). hardDelete=true runs Mongo deleteMany after cascade. Cap: 500 rows per call (post-expansion). T4 — bulk delete can nuke the whole picker, requires operator confirmation.',
+    describe: 'Two shapes: categoryIds:[...] explicit OR filter DSL {categoryIds, breadcrumbKeys, depth, hasProducts, hasNoProducts}. hasNoProducts is the "stale category cleanup" filter — matches categories with no live products pointing at them. cascade=true expands each target to its subtree; without it, targets with children are REFUSED (reported in response, not fatal — the safe ones still delete). hardDelete=true runs Mongo deleteMany after cascade. Cap: 500 rows per call (post-expansion), re-checked at execute time. T4 two-phase workflow — bulk delete can nuke the whole picker, so on invocation you receive a PLAN showing the resolved write set (count, how many extra came from cascade descendant expansion, which targets were refused, reversible or not); the operator must confirm before anything is mutated. Non-billable.',
     tier:     4,
     scope:    'brand',
     args: {
@@ -1223,11 +1251,16 @@ const CAPABILITIES = [
       },
       additionalProperties: false
     },
+    // Two-phase Tier 4 — executor exports preview() + execute(). See
+    // catalog.bulkDeleteProducts for the full rationale.
     execute: {
       kind:    'service',
       service: './capabilityExecutors/catalogBulkDeleteCategories',
-      method:  'run'
-    }
+      workflow: true
+    },
+    // Non-billable — pure Mongo writes. Required by the tier ≥ 2 rule;
+    // spendGuard fails CLOSED without it.
+    estimateUsd: 0
   },
 
   // ── Shot-style classifier — agent-triggered re-classify (2026-08-13)
@@ -1377,7 +1410,12 @@ const CAPABILITIES = [
       kind:    'service',
       service: './capabilityExecutors/detectRematchCatalogProduct',
       method:  'run'
-    }
+    },
+    // One Media, full detect pipeline (YOLO → identify → crops →
+    // match). Required by the tier ≥ 2 rule; spendGuard fails CLOSED
+    // on a missing estimator, so without this the capability is
+    // refused at dispatch rather than running uncosted.
+    estimateUsd: DETECT_FULL_RUN_USD
   },
 
   {
@@ -1429,6 +1467,20 @@ const CAPABILITIES = [
       kind:    'service',
       service: './capabilityExecutors/detectRematchByProduct',
       method:  'run'
+    },
+    // FAN-OUT — the only estimator here that varies with args. Cost is
+    // (Media enqueued) × a full detect run, and the executor REFUSES
+    // the whole call if more Media than `maxMedia` would be enqueued,
+    // so that cap is a hard bound on real spend and therefore the
+    // honest upper bound. Static bound rather than a live count,
+    // matching catalog.generateLifestyleImages: overestimating fails
+    // safe, underestimating lets a 100-Media fan-out breach the cap.
+    estimateUsd: (args) => {
+      const raw = Number(args?.maxMedia);
+      const fanout = Number.isFinite(raw) && raw > 0
+        ? Math.min(raw, DETECT_REMATCH_MAX_FANOUT)
+        : DETECT_REMATCH_DEFAULT_FANOUT;
+      return fanout * DETECT_FULL_RUN_USD;
     }
   },
 
@@ -1451,7 +1503,12 @@ const CAPABILITIES = [
       kind:    'service',
       service: './capabilityExecutors/matchRescoreOnly',
       method:  'run'
-    }
+    },
+    // Rescore-only — reuses the prior DetectionArtifact + CropArtifact
+    // and re-runs just findPerProductMatches, so it skips the
+    // expensive YOLO / identify / crop stages. An order of magnitude
+    // under a full rerun (DETECT_FULL_RUN_USD).
+    estimateUsd: DETECT_RESCORE_ONLY_USD
   },
 
   // ── Phase 10: Sales demos — T1 CRUD + abort ───────────────────────
