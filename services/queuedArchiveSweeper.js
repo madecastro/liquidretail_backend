@@ -35,6 +35,7 @@ const CampaignRun = require('../models/CampaignRun');
 // THE spend-receipt helper. Do not re-implement — a call site that used this
 // without importing it shipped a broken money guard to production (CLAUDE.md §4).
 const { receiptFree } = require('./spendReceipt');
+const alerts      = require('./alertService');
 
 const truthy = (v, dflt) => {
   if (v === undefined || v === null || String(v).trim() === '') return dflt;
@@ -184,7 +185,9 @@ async function sweepQueuedLeftovers() {
     try {
       ads = await Ad.find(buildQueuedArchiveFilter({ terminalRunIds, olderThan }))
         .sort({ queuedAt: 1 })
-        .select('_id')
+        // brandId/campaignRunIds are for the operator notice only — they never
+        // affect what is archived. The write filter re-derives its own guards.
+        .select('_id brandId campaignRunIds')
         .limit(maxAds())
         .lean();
     } catch (err) {
@@ -241,6 +244,60 @@ async function sweepQueuedLeftovers() {
       `🗃️  queuedArchive: archived ${out.archived} leftover queued ad(s) ` +
       `(inert, receipt-free, run terminal or unstamped, older than ${afterHours()}h)`
     );
+
+    // OPERATOR NOTICE. Until now this pass was entirely silent: ads left the
+    // operator's queue and nobody was told. That is defensible only while the
+    // rows are worthless, and "worthless" is precisely what the guards above
+    // enforce — so the notice must SAY that rather than imply an interruption.
+    //
+    // WORD IT TRUTHFULLY. It is tempting to phrase this as "generation was
+    // interrupted / in-progress ads were removed". That would be FALSE for
+    // everything this pass can touch: receiptFree() excludes any ad carrying a
+    // spend receipt, and the filters additionally require renderUrl empty and
+    // renderAttempts 0. An ad that started or was billed is unreachable from
+    // here by construction. Claiming otherwise would send the operator hunting
+    // for lost paid work that does not exist — a false alarm is a worse defect
+    // than silence, because it burns the channel's credibility.
+    //
+    // NEVER let Slack break the sweep. notifyAsync is fire-and-forget (same
+    // reason adVisionQcService uses it on the paid path), and the whole block
+    // is wrapped: the archive has already been committed by this point, so a
+    // transport failure must not surface as a sweep failure or a retry.
+    try {
+      const byBrand = new Map();
+      const runIds  = new Set();
+      for (const a of unique) {
+        const b = String(a.brandId || 'unknown');
+        byBrand.set(b, (byBrand.get(b) || 0) + 1);
+        for (const r of (a.campaignRunIds || [])) runIds.add(String(r));
+      }
+      // considered vs archived can differ: the write re-applies the money
+      // guards, so an ad that gained a receipt between read and write is
+      // correctly left alone. Report both rather than implying they match.
+      const partial = out.considered > out.archived
+        ? ` ${out.considered - out.archived} candidate(s) were left alone because the write-time money guard still matched them.`
+        : '';
+      alerts.notifyAsync({
+        level: 'warn',
+        title: `Queued leftovers archived — ${out.archived} ad(s)`,
+        detail:
+          `${out.archived} queued ad(s) were archived. They NEVER STARTED and were NEVER BILLED — ` +
+          `no spend receipt, no renderUrl, zero render attempts. These are mint-vs-claim ` +
+          `leftovers: the run minted more ads than it claimed, and the remainder sat in ` +
+          `'queued' after their run reached a terminal state (or carried no run at all). ` +
+          `Nothing in progress or paid for was touched.${partial}`,
+        fields: {
+          archived:   String(out.archived),
+          considered: String(out.considered),
+          brands:     [...byBrand.entries()].map(([b, n]) => `${b} (${n})`).join(', ') || '—',
+          owningRuns: [...runIds].slice(0, 10).join(', ') || 'none (unstamped leftovers)',
+          olderThanH: String(afterHours())
+        },
+        key: 'queued-archive-sweep'
+      });
+    } catch (err) {
+      console.warn(`⚠️  queuedArchive: operator notice failed (archive already committed) — ${err.message}`);
+    }
   }
   return out;
 }
