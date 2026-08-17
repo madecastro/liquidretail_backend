@@ -12,7 +12,12 @@
 //
 //   detect-fanout (Promise.allSettled)
 //     image:  [yolo → yolo-identify]  ‖  [subjects-text]
-//     video:  [yolo-video → yolo-identify → subjects-text(hero)]  ‖  [transcribe → ner]
+//     video:  [yolo-video (hero-frame) → image pipeline on the hero JPEG]
+//              — whisper transcription + NER were removed 2026-08-17;
+//              captions are surface-level, the visual hero carries more
+//              product signal (services/whisperService + nerService
+//              retained for standalone use elsewhere, but not called from
+//              this pipeline).
 //
 //   crop-judge (sequential — judge depends on YOLO + subjects + crops)
 //     smart-crops → judge → CropArtifact persist
@@ -35,8 +40,6 @@ const { detectSubjectsAndText } = require('../services/subjectTextService');
 const { generateSmartCrops, computeSafeRect } = require('../services/smartCropService');
 const { judgeDetections, judgeExtendedCrops } = require('../services/judgeService');
 const { generateExtendedCrops } = require('../services/extendedCropsService');
-const { transcribeAudio } = require('../services/whisperService');
-const { extractEntities } = require('../services/nerService');
 const { findProductMatches, findPerProductMatches } = require('../services/productMatchService');
 const { analyzeOverlayZones } = require('../services/overlayZoneService');
 const { computeFocus } = require('../services/imageQualityService');
@@ -890,10 +893,19 @@ async function runYoloChain(run, buffer, media, sourceUrlOverride = null, option
       // detection so downstream identify + match still fires; recovers
       // brand-level attribution on the 23% of runs that previously
       // produced ZERO ProductMatchArtifacts (measured 2026-08-13).
-      // Only fires on catalog/image paths where imgW/imgH are known —
-      // the buffer may be a video, in which case a full-image bbox is
-      // meaningless and we fall back to the old empty-array behavior.
-      if (imgW && imgH && media.fileType === 'image') {
+      //
+      // Fires when:
+      //   1. imgW/imgH are known (from the outer pipeline via options)
+      //   2. AND either the source is an image, OR a video-hero-frame
+      //      pass (media.fileType='video' but the video pipeline handed
+      //      us a hero JPEG via sourceUrlOverride, so `buffer` IS an
+      //      image). Broadened 2026-08-17 — previously only images,
+      //      which meant a YOLO timeout on a video hero still produced
+      //      zero refined products and zero downstream matches.
+      // Skipped on raw video buffers where a full-image bbox is
+      // meaningless (buffer is the .mp4, not a still).
+      const isHeroFrameOfVideo = media.fileType === 'video' && !!sourceUrlOverride;
+      if (imgW && imgH && (media.fileType === 'image' || isHeroFrameOfVideo)) {
         run.flags.yoloFallbackSynth = true;
         return [{
           id:           'p1',
@@ -1062,26 +1074,6 @@ function emptySubjectsText() {
     contentNature: 'unknown', contentNatureConfidence: 0, contentNatureReason: null,
     shotType: 'unknown', shotTypeConfidence: 0, shotTypeReason: null
   };
-}
-
-async function runTranscribeNerChain(run, buffer, media) {
-  let transcript = null;
-  let entities = [];
-  await timeStage(run, 'transcribe', async () => {
-    try {
-      transcript = await transcribeAudio(buffer, media.fileName);
-      if (transcript) console.log(`🎙️  Transcript: ${transcript.segments.length} segments, ${transcript.duration.toFixed(1)}s`);
-    } catch (err) { console.warn('⚠️  Transcription:', err.message); }
-  });
-  if (transcript) {
-    await timeStage(run, 'ner', async () => {
-      try {
-        entities = await extractEntities(transcript);
-        console.log(`🏷️  NER: ${entities.length} entities`);
-      } catch (err) { console.warn('⚠️  NER:', err.message); }
-    });
-  }
-  return { transcript, entities };
 }
 
 async function runProductMatchChain(run, media, sourceImageUrl, products, primarySubjectDesc, text, refinedProducts = []) {
@@ -1521,18 +1513,23 @@ function buildCloudinaryCropUrl(videoUrl, crop) {
 //     ]
 //   }
 //
-// TODO — video-specific refinements. Currently both the image and video
-// pipelines run this stage identically against a single still (hero frame for
-// video), which means zones are derived from a single moment in time and can
-// collide with the subject later in the clip. In priority order:
-//   A. Pass the cross-frame `safeRect` (already computed on video jobs — union
-//      of YOLO detections across frames + primary GPT subjects) into the
-//      Gemini prompt as an explicit forbidden rect. Eliminates the worst
-//      class of failure (overlay ends up under the subject mid-playback).
-//   B. Multi-frame analysis. Sample 3 frames (start / middle / end) per
-//      ratio, union the forbidden rects, intersect the safe zones.
-//   C. Analyze the actually-rendered self-underlay video. Use Cloudinary
-//      `so_<sec>` transform to extract N frames from the composed output URL.
+// Video handling: this stage still analyzes a single still (hero frame),
+// but callers now pass a `forbiddenRectsPct` array via runExtendedAndOverlayChain
+// → buildVideoForbiddenRects. That array carries the cross-frame safeRect
+// (union of YOLO first-seen bounds + subjects + text across the clip)
+// plus Reels-specific platform-UI bands (top ~6% audio chip, bottom ~22%
+// caption strip, right ~12% action column). Gemini gets them as hard rules
+// via the prompt, so the worst class of failure (overlay ends up under the
+// subject mid-playback OR under IG chrome at runtime) is closed by
+// construction. See buildVideoForbiddenRects for the exact envelopes.
+//
+// Still open:
+//   - Multi-frame analysis. Sample 3 frames (start / middle / end) per
+//     ratio, union the forbidden rects, intersect the safe zones. ~3×
+//     Gemini calls per video; cost/benefit unmeasured.
+//   - Analyze the actually-rendered self-underlay video. Use Cloudinary
+//     `so_<sec>` transform to extract N frames from the composed output
+//     URL. Cheap, but serializes compose→analyze which is currently parallel.
 async function runOverlayZoneAnalysis({ sourceImageUrl, crops, judge, extendedCrops, forbiddenRectsPct }) {
   const inputs = pickOverlayZoneInputs({ sourceImageUrl, crops, judge, extendedCrops });
   if (!inputs.length) return {};
