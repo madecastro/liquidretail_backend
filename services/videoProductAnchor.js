@@ -40,6 +40,41 @@ function isVideoProductAnchorEnabled() {
   return process.env.VIDEO_PRODUCT_ANCHOR === 'true';
 }
 
+/**
+ * VIDEO_ANCHOR_REQUIRE_MATCH (default false).
+ *
+ * Owner directive 2026-08-12: "for UGC, we should wait until it has been
+ * attached to a product, UGC that doesn't have a product attached can't use
+ * this method."
+ *
+ * Today the anchor fires on ANY resolvable region and relies on token overlap
+ * between the product title and a detected label failing "naturally" at the
+ * weak tiers. That makes the guarantee ACCIDENTAL. bestOverlapCandidate needs
+ * no attachment at all — one shared token ("pant" in "Track Pant" vs a
+ * detected "pants") is enough, on a Media that was never matched to this SKU.
+ * So a brand_match post could be told to hold a garment that is not the
+ * advertised one.
+ *
+ * Flag on: an anchor requires a CONFIDENT attachment (see attachmentTierForProduct).
+ */
+function videoAnchorRequireMatchEnabled() {
+  return process.env.VIDEO_ANCHOR_REQUIRE_MATCH === 'true';
+}
+
+/**
+ * VIDEO_SUBJECT_HOLD (default false).
+ *
+ * Owner directive 2026-08-12: "when there is no product obviously called out,
+ * we should ensure the face is shown and the picture doesn't change very much."
+ *
+ * The complement of the gate above: with no confident product there is nothing
+ * to reframe TOWARD, so instead of letting the camera hunt for one, hold the
+ * composition on the person.
+ */
+function videoSubjectHoldEnabled() {
+  return process.env.VIDEO_SUBJECT_HOLD === 'true';
+}
+
 const STOPWORDS = new Set([
   'the', 'a', 'an', 'in', 'on', 'and', 'for', 'with', 'from', 'this', 'that',
   'our', 'your', 'their', 'its', 'are', 'was', 'were', 'has', 'have', 'had',
@@ -296,15 +331,65 @@ function bestOverlapCandidate(title, candidates) {
 }
 
 /**
+ * How confidently is this Media attached to this product?
+ *
+ * Reads the SAME `matchedProducts` entries exactMatchCandidate uses to pick the
+ * box, so the tier can never disagree with the region we chose. Deliberately
+ * NOT `Ad.matchTier`: that field is not in scope here (buildVeoPrompt takes no
+ * `ad`), and more importantly the per-link `outcome` is the confidence of the
+ * exact link the box came from, where Ad.matchTier describes the seed as a whole.
+ *
+ * `Media.matchedProducts[].outcome` is only ever 'product_match' or
+ * 'product_category' (models/Media.js:109-113) — 'brand_match' and 'brand_only'
+ * live on Ad alone and are never mirrored here, so a brand-matched seed simply
+ * has NO entry for this product and lands on 'none'.
+ *
+ * @returns {'product_match'|'product_category'|'none'}
+ */
+function attachmentTierForProduct({ ad, product, media } = {}) {
+  const pid = productIdOf({ ad, product });
+  if (!pid) return 'none';
+  const matches = Array.isArray(media?.matchedProducts) ? media.matchedProducts : [];
+  const hits = matches.filter((m) => m
+    && m.catalogProductId != null
+    && String(m.catalogProductId) === pid);
+  if (!hits.length) return 'none';
+  if (hits.some((m) => m.outcome === 'product_match')) return 'product_match';
+  return 'product_category';
+}
+
+/**
  * Pure. Pick the subject/refined box for this ad's product.
+ *
+ * VIDEO_ANCHOR_REQUIRE_MATCH on → only a 'product_match' attachment may anchor.
+ * That kills BOTH weak paths: a 'product_category' link (we matched the class,
+ * not the SKU — anchoring risks holding a different item of the same kind) and
+ * the attachment-free bestOverlapCandidate guess.
+ *
+ * ⚠️ SCOPE, stated because it is a real boundary and not an oversight: the tier
+ * is evidenced by UGC-shaped `matchedProducts` entries. CATALOG media carries no
+ * such entry (it is linked by CatalogProduct.imageMediaId / metadata.feedIndex),
+ * so under this flag a catalog seed resolves to 'none' and cannot anchor. That
+ * is correct TODAY because shouldUseLifestyleVideoPrompt requires
+ * variantKind === 'ugc', so catalog media never reaches the anchor at all.
+ * Whoever lands VIDEO_LIFESTYLE_CATALOG must extend attachmentTierForProduct
+ * with the catalog case BEFORE flipping that flag, or catalog lifestyle video
+ * silently loses its product anchor. Pinned by verifyVideoSubjectHold C7.
+ *
  * @returns {{ label: string, region: string, box: object } | null}
  */
 function productRegionForAd({ ad, product, media } = {}) {
   const title = String(product?.title || ad?.productTitle || '').trim();
   const all = collectCandidates(media);
   const fallback = collectCandidates(media, { excludePerson: true });
+  const strict = videoAnchorRequireMatchEnabled();
+  if (strict && attachmentTierForProduct({ ad, product, media }) !== 'product_match') {
+    return null;
+  }
   const exact = exactMatchCandidate({ ad, product, media }, all);
-  const winner = exact || bestOverlapCandidate(title, fallback);
+  // Strict mode refuses the overlap guess outright — a shared title token is
+  // not an attachment. Flag-off keeps the historical `exact || overlap` cascade.
+  const winner = strict ? exact : (exact || bestOverlapCandidate(title, fallback));
   if (!winner) return null;
   // Full-frame guard: an anchor to "center" that covers the whole plate
   // reinforces nothing.
@@ -341,6 +426,62 @@ function buildProductAnchorBlock({ label, region } = {}) {
     `It must remain fully in frame for the entire duration. ` +
     `Any push-in moves TOWARD it, never away. ` +
     `Faces may leave the frame; the product may not.`;
+  if (block.length > ANCHOR_BLOCK_MAX_CHARS) return block.slice(0, ANCHOR_BLOCK_MAX_CHARS);
+  return block;
+}
+
+/**
+ * Pure. The person to hold on when no product is confidently called out.
+ *
+ * Picks the LARGEST person-like box among Media.subjects / refinedProducts.
+ * Largest, not most-confident: the hold is about composition, and the dominant
+ * figure is the one the frame is already built around.
+ *
+ * ⚠️ THIS IS NOT A FACE BOX, and the distinction is load-bearing. There is NO
+ * face field on Media — verified against models/Media.js. Faces are computed by
+ * a vision call inside basePlateCropService and persisted on `Ad.basePlate
+ * .faceSamples`, which happens at CROP time, i.e. after the video already
+ * exists. So at prompt-build time the tightest thing available is a person
+ * subject box. The block below therefore asks for the face to STAY in frame
+ * (a motion constraint the model can honour from the seed it is given) rather
+ * than claiming to know where the face is.
+ *
+ * Deliberately NO FULL_FRAME_AREA guard: a person filling the plate is the
+ * normal UGC case and is exactly when "hold the composition" is right. The
+ * full-frame guard exists for product anchors, where "push toward the whole
+ * frame" reinforces nothing.
+ *
+ * @returns {{ label: string, region: string, box: object } | null}
+ */
+function subjectHoldRegionForMedia(media) {
+  const people = collectCandidates(media).filter((c) => isPersonLike({ label: c.label }));
+  if (!people.length) return null;
+  let best = null;
+  for (const c of people) {
+    if (!best || c.area > best.area) best = c;
+  }
+  if (!best) return null;
+  const region = namedRegionFromBbox(best.box, media);
+  if (!region) return null;
+  if (/\d/.test(region) && /px|coord|,/.test(region)) return null;
+  return { label: sanitizeLabel(best.label), region, box: best.box };
+}
+
+/**
+ * ONE lifestyle-prompt block for the no-confident-product case. ≤400 chars.
+ *
+ * Says what NOT to do first, because the failure being fixed is the camera
+ * hunting for a product it cannot identify and pushing into the wrong thing.
+ */
+function buildSubjectHoldBlock({ label, region } = {}) {
+  const reg = String(region || '').trim();
+  if (!reg || /\d{2,}/.test(reg)) return null;
+  const who = sanitizeLabel(label);
+  const block =
+    `SUBJECT HOLD: No specific product is identified in this frame, so do not ` +
+    `single one out or reframe toward one. Keep ${who} at the ${reg} — face and ` +
+    `upper body fully in frame — for the entire duration. Hold the composition: ` +
+    `no push-in, no reframing, no travel. Ambient motion only (fabric, hair, light, breath).`;
   if (block.length > ANCHOR_BLOCK_MAX_CHARS) return block.slice(0, ANCHOR_BLOCK_MAX_CHARS);
   return block;
 }
@@ -388,6 +529,11 @@ function chooseProductFirstCrop({
 
 module.exports = {
   isVideoProductAnchorEnabled,
+  videoAnchorRequireMatchEnabled,
+  videoSubjectHoldEnabled,
+  attachmentTierForProduct,
+  subjectHoldRegionForMedia,
+  buildSubjectHoldBlock,
   productRegionForAd,
   namedRegionFromBbox,
   normalizeBbox,
