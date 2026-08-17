@@ -78,6 +78,23 @@ function buildStalePreparingFilter({ now, staleMin }) {
  * of reaper cadence. `staleMin` is optional only so the pure-logic tests can
  * exercise the bare status guard in isolation; every real caller must pass
  * it.
+ *
+ * INCIDENTAL BUT LOAD-BEARING: this filter keys on `startedAt`; the gate
+ * (routes/ads.js) keys on `createdAt`. That is safe only because
+ * `startedAt <= createdAt` always holds — `startedAt` is set by JS at
+ * CampaignRun.create() (routes/ads.js) plus a schema default of `Date.now`
+ * (models/CampaignRun.js), while `createdAt` is stamped by mongoose
+ * `timestamps` at the same save, a few ms later. So this flip goes stale
+ * marginally BEFORE the gate stops honoring the run's exclusivity — the
+ * safe direction. Nothing in this codebase ever rewrites `startedAt` after
+ * mint (verified: every write is inside a CampaignRun.create() call, never
+ * a $set on an existing doc — see scripts/verifyPreparingReap.js Group F).
+ * If that ever changes — a retry/resume path that bumps `startedAt` — this
+ * ordering inverts and the double-spend window silently reopens with
+ * nothing here to catch it. Adversarial review flagged this as real but
+ * incidental; if `startedAt` ever needs to move, key this filter on
+ * `createdAt` instead, matching the gate exactly rather than relying on
+ * the ordering.
  */
 function buildRunningFlipFilter(runDocId, { now, staleMin } = {}) {
   const filter = { _id: runDocId, status: 'preparing' };

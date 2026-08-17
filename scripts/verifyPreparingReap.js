@@ -303,6 +303,61 @@ ok('E1 PREPARE_STALE_MIN parses env with Math.max(1, ...) and a 15-minute defaul
   assert.ok(m, 'PREPARE_STALE_MIN must follow the same env/floor/default shape as REAP_STALE_MIN');
 });
 
+// ── Group F — adversarial-review round 2 findings.
+//
+// F1: REAP_STALE_MIN's gate-side parse (routes/ads.js) is now load-bearing
+// for whether ANY generation succeeds (buildRunningFlipFilter's age guard),
+// not just for duplicate-detection leniency. The naive `Number(env || 15)`
+// idiom checks the RAW STRING's truthiness before parsing, so '0',
+// whitespace, or a negative value all skip the `|| 15` fallback (they are
+// non-empty strings, hence truthy) and collapse the flip's startedAt guard
+// to `>= now` (or a future instant) — which NO real run can ever satisfy.
+// That is a silent, total generation outage: every claim succeeds, every
+// flip fails, every ad is quietly released. This mirrors the same env-
+// parsing trap CLAUDE.md documents for PMAX_PROOF_* ("blank env is 0, not
+// NaN") — and REAP_STALE_MIN lives dashboard-only (not in
+// config/defaults.env), exactly where a human might "set it to 0 to
+// disable staleness", the intuitive and catastrophic move.
+//
+// This re-implements the fixed formula (not the buggy one) as a plain JS
+// mirror — same posture as E1 above — and separately pins that the real
+// source uses the SAME clamp idiom already established in this repo
+// (services/atlasImageService.js positiveTimeout).
+function clampStaleMin(rawEnvValue) {
+  const parsed = Number(rawEnvValue);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : 15;
+}
+ok('F1a the clamp survives every malformed REAP_STALE_MIN value adversarial review tried', () => {
+  assert.strictEqual(clampStaleMin(undefined), 15, 'unset must default to 15');
+  assert.strictEqual(clampStaleMin('0'), 15, "the string '0' must NOT collapse the guard to a no-op");
+  assert.strictEqual(clampStaleMin('  '), 15, 'whitespace must NOT collapse the guard to a no-op');
+  assert.strictEqual(clampStaleMin('-5'), 15, 'a negative value must NOT collapse the guard to a no-op');
+  assert.strictEqual(clampStaleMin('abc'), 15, 'a non-numeric value must NOT produce an Invalid Date query');
+  assert.strictEqual(clampStaleMin('30'), 30, 'a legitimate override must still be honored');
+});
+ok('F1b the real routes/ads.js staleMin computation uses the fixed clamp idiom, not the naive one', () => {
+  assert.ok(!/const staleMin = Number\(process\.env\.REAP_STALE_MIN \|\| 15\)/.test(adsSrc),
+    'the naive `Number(env || 15)` form must not return — it is truthy-string-shaped, not numeric-shaped');
+  assert.ok(/Number\.isFinite\(staleMinRaw\)\s*&&\s*staleMinRaw\s*>\s*0\s*\?\s*staleMinRaw\s*:\s*15/.test(adsSrc),
+    'routes/ads.js must clamp staleMin with Number.isFinite(..) && .. > 0 ? .. : 15, matching services/atlasImageService.js positiveTimeout()');
+});
+
+// F2: buildRunningFlipFilter keys on startedAt while the gate keys on
+// createdAt — safe today only because startedAt is always set at
+// CampaignRun.create() and NEVER rewritten afterward (startedAt <=
+// createdAt by construction, a few ms apart). This scans for the one thing
+// that would silently invert that ordering: a $set block anywhere that
+// touches startedAt on an EXISTING doc. A future retry/resume path adding
+// `$set: { startedAt: ... }` would reopen the double-spend window with
+// nothing else here to catch it.
+ok('F2 nothing ever $sets startedAt on an existing CampaignRun (only CampaignRun.create() may set it)', () => {
+  assert.ok(!/\$set:\s*\{[^}]*\bstartedAt\b/.test(adsSrc),
+    'found a $set block touching startedAt in routes/ads.js — this inverts the startedAt<=createdAt ordering ' +
+    'buildRunningFlipFilter relies on (see its JSDoc); key the flip on createdAt instead if this is intentional');
+  assert.ok(!/\$set:\s*\{[^}]*\bstartedAt\b/.test(workerSrc),
+    'found a $set block touching startedAt in worker.js — same risk as above');
+});
+
 if (process.exitCode) {
   console.log(`\n❌ verifyPreparingReap: failures above (${checks} passed)`);
 } else {
