@@ -189,10 +189,18 @@ different question ("where are the heads"). Real savings when keep-out is
 off, or when a sibling/master already stamped `facesComputed`.
 ## NEXT-SESSION PROMPT
 
-**2026-08-17 — two items survive the Aug-12 tree cleanup. Both need an owner decision, neither is
-started.** Full forensics in the 2026-08-17 section at the top of this file; do not re-derive it.
+<!-- Both 2026-08-17 items are now DECIDED. Nothing here is blocking; §1 is kept as the
+     rationale record for a values change the owner may revisit. -->
 
-### 1. `RENDER_CONCURRENCY` 24→48 and `MAX_CREATIVES_PER_RUN` 20→100 — owner-directed 2026-08-12, never landed
+**2026-08-17 — the Aug-12 tree is fully resolved. Both survivors were decided the same day.**
+Full forensics in the 2026-08-17 section at the top of this file; do not re-derive it.
+
+- **§1 concurrency 48/100 — DROPPED (owner decision, 2026-08-17).** Not landed, deliberately. Keep
+  the section below as the record if it is ever revisited: it holds the exact values, the four
+  blockers, and the money notes. Do **not** treat it as a pending task.
+- **§2 `mintTestToken.js` — LANDED, PR #202** (owner approved 2026-08-17 after review).
+
+### 1. `RENDER_CONCURRENCY` 24→48 and `MAX_CREATIVES_PER_RUN` 20→100 — DROPPED 2026-08-17, record only
 
 The original rationale: *"expandWizardJob mints the full promised set but selectAdsForRun claimed only
 20, and queued ads never auto-drain — a measured Everything (Meta+PMax) run minted 34 and stranded 14
@@ -224,9 +232,9 @@ the whole kit"), but it is no longer the only fix for stranded ads.
 tuned against a 20-ad batch), and note `REMOTION_QUEUE_CONCURRENCY=4` runs Remotion **in the web
 process** — a 100-ad wave's RSS behaviour has never been measured.
 
-### 2. `scripts/mintTestToken.js` is untracked, and the `ui-smoke` skill depends on it
+### 2. `scripts/mintTestToken.js` — LANDED 2026-08-17 (PR #202)
 
-It exists **only** in the local checkout — absent from `origin/main`. `ui-smoke` uses it as the
+Landed in PR #202 after review. It had existed **only** in the local checkout — absent from `origin/main`. `ui-smoke` uses it as the
 offline JWT signer *and* as the marker `repo-paths.js` validates the backend root against, so the QA
 harness cannot run on a fresh clone. Committing it is consistent with the skill's own documented
 design (it deliberately has no HTTP token endpoint; an offline signer needs the Render credentials,
