@@ -439,6 +439,61 @@ if (cap) {
     `validateManifest rejects Tier ≥ 2 without estimateUsd (got: ${problems.join(' / ')})`);
 }
 
+// ── A function estimateUsd must actually RETURN a usable number ───────
+//
+// validateManifest only checks `typeof estimateUsd === 'function'` — it
+// never CALLS it. So an estimator that returns a negative, NaN, or that
+// throws passes manifest validation cleanly, while spendGuard's
+// estimateFor() rejects the value at runtime and fails CLOSED. The
+// capability is then permanently un-dispatchable and NOTHING reports
+// it: the same "declared but silently dead" class as the five entries
+// that were missing estimateUsd outright. A source-text regex cannot
+// see a wrong return value, so this has to be checked by INVOCATION.
+async function checkFunctionEstimators() {
+  const fnCaps = registry.CAPABILITIES.filter((c) => typeof c.estimateUsd === 'function');
+  assert(fnCaps.length > 0,
+    `at least one capability uses a function estimateUsd (guard stays meaningful)`);
+
+  for (const c of fnCaps) {
+    let val;
+    try {
+      val = await c.estimateUsd({});
+    } catch (err) {
+      val = `THREW: ${err.message}`;
+    }
+    assert(typeof val === 'number' && Number.isFinite(val) && val >= 0,
+      `${c.id}: estimateUsd({}) returns a finite number >= 0 (got ${JSON.stringify(val)})`);
+  }
+
+  // detect.rematchByProduct is the money-relevant arithmetic: cost
+  // scales with the fan-out, and the estimate must never land UNDER
+  // what the executor could actually enqueue. Both sides of each
+  // comparison use the same multiplication order, so float
+  // representation cannot make these flaky.
+  const fan = registry.capabilityById('detect.rematchByProduct');
+  if (fan && typeof fan.estimateUsd === 'function') {
+    const at = async (args) => fan.estimateUsd(args);
+    assert(await at({}) === 25 * 0.05,
+      `detect.rematchByProduct: default fan-out estimate = 25 × full-run`);
+    assert(await at({ maxMedia: 100 }) === 100 * 0.05,
+      `detect.rematchByProduct: maxMedia=100 estimate = 100 × full-run`);
+    // Schema caps maxMedia at 100. An out-of-range value must CLAMP,
+    // not scale linearly, or a bogus arg inflates the estimate past
+    // anything the executor could spend and blocks the cap for nothing.
+    assert(await at({ maxMedia: 5000 }) === 100 * 0.05,
+      `detect.rematchByProduct: over-max maxMedia clamps to the hard cap`);
+    assert(await at({ maxMedia: 1 }) === 0.05,
+      `detect.rematchByProduct: maxMedia=1 estimate = one full run`);
+    // Junk must not yield NaN/0 — NaN fails closed (silent outage) and
+    // 0 would wave a real fan-out straight past the spend cap.
+    for (const bad of [{ maxMedia: 'abc' }, { maxMedia: -5 }, { maxMedia: null }]) {
+      const v = await at(bad);
+      assert(typeof v === 'number' && Number.isFinite(v) && v > 0,
+        `detect.rematchByProduct: junk maxMedia ${JSON.stringify(bad.maxMedia)} falls back to a sane positive estimate (got ${v})`);
+    }
+  }
+}
+
 // spendGuard.check contract — ok:false when capability lacks estimator;
 // ok:false with reason when projected exceeds cap; ok:true otherwise.
 const guard = require('../services/spendGuard');
@@ -2581,6 +2636,7 @@ async function checkT0SmokeSuite() {
   await checkProductsWithoutAds();
   await checkMediaAssignmentExecutors();
   await checkT0SmokeSuite();
+  await checkFunctionEstimators();
   console.log(`\n${passed + failed} checks — ${passed} passed, ${failed} failed`);
   process.exit(failed === 0 ? 0 : 1);
 })();
