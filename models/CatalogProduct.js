@@ -101,6 +101,17 @@ const catalogProductSchema = new mongoose.Schema({
   // rows for the same SKU. Indexed for fast (brandId, normalizedTitle)
   // lookups.
   normalizedTitle: { type: String, default: null, index: true },
+  // T3 (2026-08-17) — text-embedding vector of the title (and description
+  // where present) via services/textEmbeddingService. Computed lazily
+  // when the row is first read into findCatalogMatchByText; used as
+  // the semantic-similarity signal alongside the token-overlap score
+  // (max of the two wins). ~1536 floats for text-embedding-3-small;
+  // ~6KB per row on disk. Kill switch CATALOG_TEXT_EMBEDDING_ENABLED
+  // disables both the write and read paths.
+  titleEmbedding:        { type: [Number], default: null, select: false },
+  titleEmbeddingModel:   { type: String,   default: null, select: false },
+  titleEmbeddingSource:  { type: String,   default: null, select: false }, // digest of the input text — invalidates on title/description change
+  titleEmbeddingAt:      { type: Date,     default: null, select: false },
   description:  String,
   brand:        String,    // Meta's "brand" field (often the brand name)
   category:     String,    // Meta's category string (taxonomy varies)

@@ -44,6 +44,7 @@ const { findOrCreateCategoryTree } = require('../models/Category');    // Phase 
 const Brand           = require('../models/Brand');
 const { normalizeTitle, titleSimilarity } = require('../utils/titleNormalize');
 const { normalizeBrandName } = require('../models/Brand');
+const textEmbedding = require('./textEmbeddingService');   // T3 — semantic similarity tier
 const CatalogProduct     = require('../models/CatalogProduct');
 const Media              = require('../models/Media');
 const DetectionArtifact  = require('../models/DetectionArtifact');
@@ -68,13 +69,30 @@ const PROVIDERS = [
 //                 YOLO+GPT is the authoritative product oracle (Gemini
 //                 search returns matches for ANY query). Below 0.7 → no
 //                 product, regardless of Gemini.
-// HIGH_CONFIDENCE — single-source confidence to call a product_match.
-// CATEGORY_BAND  — when at least one signal lands in (LOW, HIGH) range
-//                 we fall back to product_category.
+// HIGH_CONFIDENCE — DUAL-ENGINE + CATALOG threshold. YOLO+GPT reconciled
+//                 confidence to promote a match to product_match, and the
+//                 catalog-first combined score to declare a winner and
+//                 short-circuit providers. Vision + text agree at 0.80.
+// REASONER_*     — Per-product REASONER thresholds. The reasoner's own
+//                 guide names 0.70-0.89 as "high" and 0.50-0.69 as
+//                 "medium"; we align the decision tree to that shape.
+//                 Previously overloaded HIGH_CONFIDENCE (0.80) as the
+//                 reasoner cut too — measured 2026-08-13: 126/166 UGC
+//                 matches landed in brand_match, and reasoner rows at
+//                 cert 0.70-0.79 were being demoted from "high" to
+//                 product_category (or worse to brand_match if URL guard
+//                 fired), which is what the reasoner's own guide would
+//                 have called product_match. Split constants close the
+//                 gap; kill switch REASONER_ALIGNED_BANDS=false restores
+//                 the pre-2026-08-17 code (HIGH_CONFIDENCE for reasoner).
 const PRODUCT_FLOOR    = 0.70;
 const HIGH_CONFIDENCE  = 0.80;
-const CATEGORY_LOWER   = 0.69;   // > 0.69 (i.e. ≥ 0.70 effectively)
-const CATEGORY_UPPER   = 0.79;   // ≤ 0.79
+const CATEGORY_LOWER   = 0.69;   // > 0.69 (i.e. ≥ 0.70 effectively) — DUAL-ENGINE band
+const CATEGORY_UPPER   = 0.79;   // ≤ 0.79 — DUAL-ENGINE band
+const REASONER_ALIGNED_BANDS = process.env.REASONER_ALIGNED_BANDS !== 'false';
+const REASONER_PRODUCT_MATCH_MIN = REASONER_ALIGNED_BANDS ? 0.70 : 0.80;
+const REASONER_CATEGORY_LOWER    = REASONER_ALIGNED_BANDS ? 0.49 : 0.69;
+const REASONER_CATEGORY_UPPER    = REASONER_ALIGNED_BANDS ? 0.69 : 0.79;
 
 async function findProductMatches({
   brand, category, caption, primarySubject, textDetected, imageUrl,
@@ -395,14 +413,16 @@ async function runPerProductReasoner(provResult, refined, ctx) {
 //                         (vision-based, often more confident at the
 //                         broader claim than the reasoner is at the SKU)
 //
-// Decision tree:
-//   reasoner.certainty ≥ HIGH_CONFIDENCE  → product_match (SKU-level hit)
-//   reasoner.certainty in mid AND refined ≥ HIGH_CONFIDENCE
+// Decision tree (post-2026-08-17 realignment):
+//   reasoner.certainty ≥ REASONER_PRODUCT_MATCH_MIN (0.70)
+//                                          → product_match (SKU-level hit)
+//   reasoner in category band AND refined ≥ HIGH_CONFIDENCE (0.80)
 //                                          → product_match using REFINED
 //                                            label (broader claim still
 //                                            confident; SKU stays as
 //                                            secondary evidence)
-//   reasoner.certainty in mid              → product_category
+//   reasoner in REASONER_CATEGORY band (0.50-0.70)
+//                                          → product_category
 //   else                                   → brand_match
 //
 // Also enforces:
@@ -432,7 +452,7 @@ function buildPerProductProviderMatchRecord(refined, provResult, ident, ctx) {
 
   const cert = cleanedIdent?.certainty || 0;
   let outcome, winner, outcomeReasoning;
-  if (cleanedIdent?.productName && cert >= HIGH_CONFIDENCE) {
+  if (cleanedIdent?.productName && cert >= REASONER_PRODUCT_MATCH_MIN) {
     outcome = 'product_match';
     winner  = 'gemini';
     outcomeReasoning = `per-product reasoner identified "${cleanedIdent.productName}" at ${(cert * 100).toFixed(0)}% certainty`;
@@ -451,7 +471,7 @@ function buildPerProductProviderMatchRecord(refined, provResult, ident, ctx) {
       certaintyLabel: 'high',
       reasoning:   `Refined identification used (dual-engine ${(refinedCert * 100).toFixed(0)}% beat reasoner SKU at ${(cert * 100).toFixed(0)}%)`
     };
-  } else if (cleanedIdent?.productName && cert > CATEGORY_LOWER && cert <= CATEGORY_UPPER) {
+  } else if (cleanedIdent?.productName && cert > REASONER_CATEGORY_LOWER && cert <= REASONER_CATEGORY_UPPER) {
     outcome = 'product_category';
     winner  = 'gemini';
     outcomeReasoning = `per-product reasoner: mid-confidence (${(cert * 100).toFixed(0)}%); falling back to brand collection page`;
@@ -601,12 +621,15 @@ async function findPerProductMatches(args) {
     }
   }
 
-  // Phase 1.7 — per-refined-product catalog-first (text + visual)
+  // Phase 1.7 — per-refined-product catalog-first (text + visual).
+  // `brand` here is the args.brand string (Brand.name) resolved by the
+  // dispatcher; we forward it as brandName so T1 handle-expansion in
+  // findCatalogMatchByText doesn't have to re-fetch it per call.
   let perRefinedCatalog = [];
   let anyCatalogWinner  = false;
   if (refinedProducts.length && brandId) {
     perRefinedCatalog = await Promise.all(refinedProducts.map(rp =>
-      catalogFirstMatchOneRefined(rp, { brandId, caption, textDetected })
+      catalogFirstMatchOneRefined(rp, { brandId, brandName: brand || null, caption, textDetected })
         .catch(err => {
           console.warn(`   ⚠️  catalog-first[${rp.id}]: ${err.message}`);
           return { combinedScore: 0, catalogMatch: null, visualResult: null };
@@ -1671,8 +1694,77 @@ async function findCatalogMatch({
 // Returns top-K candidates sorted by textScore desc, instead of a single
 // best match. Visual catalog matching (visualCatalogMatchService) then
 // arbitrates among them per refined product.
+// ── T2 — synonym groups (2026-08-17) ────────────────────────────────
+// findCatalogMatchByText used to compare tokens literally, so "sweater"
+// never matched "pullover" or "knit". A caption reading "cozy in my
+// pullover" against a product titled "Marine Layer Cotton Sweater"
+// scored zero shared tokens even though they're the same object class.
+// Each group adds a synthetic token `~syn:<group>` to both sides during
+// tokenization, so any two members become interchangeable for the token
+// overlap calculation. Groups are apparel-first (62% of measured
+// traffic) with beauty + food-beverage added.
+//
+// Kill switch: SKU_TEXT_SYNONYMS_ENABLED=false disables the expansion
+// (both sides fall back to literal tokens). Env-tunable so a bad
+// synonym pairing can be dropped without a deploy.
+const SKU_TEXT_SYNONYMS_ENABLED = process.env.SKU_TEXT_SYNONYMS_ENABLED !== 'false';
+const SKU_TEXT_SCORE_FLOOR = Math.max(0.10, Math.min(0.60, parseFloat(process.env.SKU_TEXT_SCORE_FLOOR) || 0.25));
+const SKU_TEXT_CATEGORY_BOOST = Math.max(0.05, Math.min(0.40, parseFloat(process.env.SKU_TEXT_CATEGORY_BOOST) || 0.20));
+
+const SYNONYM_GROUPS = {
+  jacket:    ['jacket', 'coat', 'chore', 'shacket', 'blazer', 'parka', 'anorak', 'puffer', 'bomber', 'moto', 'trench', 'peacoat', 'windbreaker'],
+  denim:     ['denim', 'jean', 'jeans'],
+  knit:      ['sweater', 'pullover', 'cardigan', 'knit', 'jumper', 'hoodie', 'sweatshirt', 'crewneck'],
+  shirt:     ['shirt', 'buttondown', 'button', 'tee', 'top', 'blouse', 'tunic', 'henley', 'polo', 'flannel', 'oxford'],
+  pants:     ['pants', 'trousers', 'chino', 'cargo', 'joggers', 'sweatpants', 'leggings', 'slacks'],
+  shorts:    ['shorts', 'short', 'bermudas'],
+  dress:     ['dress', 'gown', 'midi', 'mini', 'maxi', 'frock'],
+  skirt:     ['skirt', 'kilt'],
+  bag:       ['bag', 'tote', 'backpack', 'purse', 'satchel', 'clutch', 'crossbody', 'duffel', 'weekender'],
+  shoe:      ['shoe', 'sneaker', 'boot', 'sandal', 'loafer', 'heel', 'flat', 'mule', 'slipper', 'trainer'],
+  hat:       ['hat', 'cap', 'beanie', 'fedora', 'bucket', 'snapback'],
+  swim:      ['swim', 'swimsuit', 'bikini', 'trunks', 'boardshorts', 'onepiece'],
+  skincare:  ['serum', 'moisturizer', 'cleanser', 'toner', 'cream', 'lotion', 'essence', 'balm', 'oil', 'gel'],
+  makeup:    ['lipstick', 'gloss', 'mascara', 'foundation', 'blush', 'palette', 'concealer', 'liner', 'bronzer'],
+  food:      ['sauce', 'chili', 'dressing', 'condiment', 'seasoning', 'spice', 'marinade'],
+  beverage:  ['tea', 'coffee', 'soda', 'juice', 'kombucha', 'beer', 'wine', 'espresso']
+};
+const TOKEN_TO_SYNONYM_GROUP = new Map();
+for (const [group, tokens] of Object.entries(SYNONYM_GROUPS)) {
+  for (const t of tokens) TOKEN_TO_SYNONYM_GROUP.set(t, `~syn:${group}`);
+}
+function expandTokensWithSynonyms(tokenSet) {
+  if (!SKU_TEXT_SYNONYMS_ENABLED) return tokenSet;
+  const out = new Set(tokenSet);
+  for (const t of tokenSet) {
+    const g = TOKEN_TO_SYNONYM_GROUP.get(t);
+    if (g) out.add(g);
+  }
+  return out;
+}
+
+// ── T1 — brand-handle expansion (2026-08-17) ─────────────────────────
+// UGC captions typically compress the brand into a single social handle:
+// `@marinelayer` tokenizes to `marinelayer`, but every product title is
+// `Marine Layer …` (two tokens). Zero-overlap even when the caption
+// clearly names the brand. This inserts spaces at the brand-name
+// boundary before tokenization: `marinelayer` → `marine layer`. Only
+// fires for brands whose display name has ≥ 2 tokens.
+function expandBrandHandle(text, brandName) {
+  if (!brandName || !text) return text;
+  const brandTokens = String(brandName)
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, ' ')
+    .trim().split(/\s+/).filter(Boolean);
+  if (brandTokens.length < 2) return text;
+  const compound = brandTokens.join('');
+  // Word boundary is /\b/, case-insensitive, replace with spaced form.
+  return String(text).replace(new RegExp(`\\b${compound}\\b`, 'gi'), brandTokens.join(' '));
+}
+
 async function findCatalogMatchByText({
   brandId,
+  brandName    = null,          // T1 — optional; when set, brand handle in caption expands
   category,                     // optional category filter
   caption,
   textDetected = [],
@@ -1680,6 +1772,16 @@ async function findCatalogMatchByText({
   topK         = 3
 }) {
   if (!brandId) return [];
+
+  // Lazily resolve brand name if the caller didn't pass one — needed
+  // for T1 brand-handle expansion in captions. One lookup per call is
+  // fine (Brand doc is small + cached by Mongoose in-process).
+  if (!brandName) {
+    try {
+      const b = await Brand.findById(brandId).select('name').lean();
+      if (b?.name) brandName = b.name;
+    } catch (_) { /* non-fatal — fall through with brandName=null */ }
+  }
 
   // Build text-only signal list. Highest weight on OCR text (printed on
   // the product itself = SKU-grade signal); caption next; comments last.
@@ -1692,12 +1794,12 @@ async function findCatalogMatchByText({
     }
   }
   if (caption && String(caption).trim()) {
-    signals.push({ text: String(caption), weight: 0.9, src: 'caption' });
+    signals.push({ text: expandBrandHandle(String(caption), brandName), weight: 0.9, src: 'caption' });
   }
   for (const c of (comments || []).slice(0, 10)) {
     const txt = typeof c === 'string' ? c : c?.text;
     if (typeof txt === 'string' && txt.trim()) {
-      signals.push({ text: txt, weight: 0.7, src: 'comment' });
+      signals.push({ text: expandBrandHandle(txt, brandName), weight: 0.7, src: 'comment' });
     }
   }
   if (!signals.length) return [];
@@ -1730,7 +1832,7 @@ async function findCatalogMatchByText({
       const filtered = await CatalogProduct
         .find({ ...baseQuery, categoryRef: { $in: subtreeIds } })
         .limit(500)
-        .select('title description category brand price currency imageUrl productUrl externalId source')
+        .select('title description category brand price currency imageUrl productUrl externalId source +titleEmbedding +titleEmbeddingModel +titleEmbeddingSource +titleEmbeddingAt')
         .lean();
       if (filtered.length >= 3) {
         rows = filtered;
@@ -1758,17 +1860,25 @@ async function findCatalogMatchByText({
 
   for (const row of rows) {
     const haystack = (`${row.title || ''} ${row.description || ''}`).toLowerCase();
-    const haystackTokens = new Set(tokenize(haystack));
+    // T2 — synonym-expand both sides so knit↔sweater↔pullover etc.
+    // count as shared via the synthetic ~syn:<group> tokens.
+    const haystackTokens = expandTokensWithSynonyms(new Set(tokenize(haystack)));
     if (!haystackTokens.size) continue;
 
     let totalWeight = 0, matchedWeight = 0;
     const matchedSrcs = new Set();
     for (const sig of signals) {
-      const sigTokens = new Set(tokenize(sig.text));
+      const sigTokens = expandTokensWithSynonyms(new Set(tokenize(sig.text)));
       if (!sigTokens.size) continue;
       let shared = 0;
       for (const t of sigTokens) if (haystackTokens.has(t)) shared++;
-      const overlap = shared / sigTokens.size;
+      // T1 — min-denominator instead of /sigTokens.size. Previously a
+      // 12-token caption with 3 shared tokens scored 3/12 = 0.25 even
+      // when all three ("marine layer jacket") uniquely identified the
+      // product. Using min(signal, haystack) removes the "long caption"
+      // penalty while keeping short-signal short-haystack calibration.
+      const denom = Math.min(sigTokens.size, haystackTokens.size);
+      const overlap = denom > 0 ? shared / denom : 0;
       totalWeight   += sig.weight;
       matchedWeight += sig.weight * overlap;
       if (shared > 0) matchedSrcs.add(sig.src);
@@ -1776,20 +1886,139 @@ async function findCatalogMatchByText({
     if (!totalWeight) continue;
     let textScore = matchedWeight / totalWeight;
 
+    // T2 — category boost raised 0.10 → SKU_TEXT_CATEGORY_BOOST
+    // (default 0.20). Category is a strong signal on its own; the
+    // prior 0.10 was too small to move a mid-tier match across the
+    // floor.
     if (cat && row.category) {
       const rc = String(row.category).toLowerCase().trim();
       if (rc === cat || rc.includes(cat) || cat.includes(rc)) {
-        textScore = Math.min(1, textScore + 0.10);
+        textScore = Math.min(1, textScore + SKU_TEXT_CATEGORY_BOOST);
       }
     }
 
-    if (textScore >= 0.30) {
+    // T1/T2 — floor lowered 0.30 → SKU_TEXT_SCORE_FLOOR (default 0.25)
+    // now that scoring is calibrated better (min-denominator +
+    // synonyms). Env-tunable.
+    if (textScore >= SKU_TEXT_SCORE_FLOOR) {
       scored.push({
         product:     row,
         textScore,
         reasoning:   `weighted token overlap (${matchedSrcs.size} signal type(s) hit: ${[...matchedSrcs].join(', ')})`,
         signalsUsed: [...matchedSrcs]
       });
+    }
+  }
+
+  // ── T3 — semantic embedding tier ─────────────────────────────────
+  // Token overlap misses paraphrases ("sweater" ↔ "pullover" beyond
+  // the T2 synonym list, "denim" ↔ "raw indigo canvas", etc.). We
+  // fetch (or reuse cached) title embeddings for every candidate row,
+  // score the signal blob against each, and take max(textScore,
+  // embScore * SKU_TEXT_EMBEDDING_WEIGHT). Bounded — the query is
+  // limited to at most SKU_TEXT_EMBEDDING_TOPN rows above a
+  // SKU_TEXT_EMBEDDING_FLOOR similarity, and cached embeddings are
+  // written back to CatalogProduct.titleEmbedding so we pay per-SKU
+  // once. Kill switch CATALOG_TEXT_EMBEDDING_ENABLED (default off
+  // until measured live).
+  if (textEmbedding.isEnabled()) {
+    try {
+      const EMBEDDING_TOPN     = Math.max(5, parseInt(process.env.SKU_TEXT_EMBEDDING_TOPN, 10) || 30);
+      const EMBEDDING_FLOOR    = Math.max(0.30, Math.min(0.95, parseFloat(process.env.SKU_TEXT_EMBEDDING_FLOOR) || 0.55));
+      const EMBEDDING_WEIGHT   = Math.max(0.10, Math.min(1.0, parseFloat(process.env.SKU_TEXT_EMBEDDING_WEIGHT) || 0.85));
+
+      // Signal blob: concatenate all non-empty signals into one query
+      // string. Weighted priority is already encoded via the token
+      // scorer — for the semantic pass we treat the signals as one
+      // paragraph, since the embedding model already handles internal
+      // token weighting. Skip when there's no useful signal.
+      const signalBlob = signals.map(s => String(s.text || '').trim()).filter(Boolean).join(' \n ').trim();
+      if (signalBlob) {
+        // Which rows need a fresh embedding? Only compute for rows
+        // that are candidates or plausible candidates — cap at
+        // EMBEDDING_TOPN to bound spend. Prefer rows that already
+        // have SOME token overlap (any matchedSrcs) before rows with
+        // zero token overlap; falling back to the first N when all
+        // are zero-overlap.
+        const priorityRows = rows.slice(0, EMBEDDING_TOPN);
+        const needFetch = [];
+        const cached = new Map(); // rowId → embedding vector
+        for (const r of priorityRows) {
+          const embSource = `${r.title || ''} ${r.description || ''}`.slice(0, 4000);
+          const wantDigest = textEmbedding.digestOf(embSource);
+          if (r.titleEmbedding && r.titleEmbeddingSource === wantDigest) {
+            cached.set(String(r._id), r.titleEmbedding);
+          } else {
+            needFetch.push({ row: r, embSource, digest: wantDigest });
+          }
+        }
+
+        // One embedding call for the signal + one for every stale row.
+        const inputs = [signalBlob, ...needFetch.map(n => n.embSource)];
+        const embRes = await textEmbedding.embed(
+          { service: 'productMatchService', purposeTag: 'text-catalog-match' },
+          inputs
+        );
+        const vectors = embRes.embeddings || [];
+        const signalVec = vectors[0];
+        if (signalVec) {
+          // Persist the fresh row embeddings back to Mongo — best-effort,
+          // non-blocking for the match itself.
+          if (needFetch.length) {
+            const now = new Date();
+            const model = embRes.model;
+            const bulk = needFetch.map((n, i) => {
+              const vec = vectors[i + 1];
+              cached.set(String(n.row._id), vec);
+              return {
+                updateOne: {
+                  filter: { _id: n.row._id },
+                  update: { $set: {
+                    titleEmbedding:       vec,
+                    titleEmbeddingModel:  model,
+                    titleEmbeddingSource: n.digest,
+                    titleEmbeddingAt:     now
+                  } }
+                }
+              };
+            }).filter(op => Array.isArray(op.updateOne.update.$set.titleEmbedding));
+            if (bulk.length) {
+              CatalogProduct.bulkWrite(bulk).catch(err =>
+                console.warn(`   ⚠️  titleEmbedding bulk persist failed: ${err.message}`));
+            }
+          }
+
+          // Score every priority row and merge into `scored`.
+          const alreadyScoredIds = new Set(scored.map(s => String(s.product._id)));
+          for (const r of priorityRows) {
+            const vec = cached.get(String(r._id));
+            if (!vec) continue;
+            const sim = textEmbedding.cosine(signalVec, vec);
+            if (sim < EMBEDDING_FLOOR) continue;
+            const embScore = Math.min(1, Math.max(0, sim * EMBEDDING_WEIGHT));
+            // If already scored via tokens, upgrade its score to max
+            // of the two; otherwise add it as a semantic-only match.
+            const existing = scored.find(s => String(s.product._id) === String(r._id));
+            if (existing) {
+              if (embScore > existing.textScore) {
+                existing.textScore = embScore;
+                existing.reasoning = `${existing.reasoning}; semantic sim=${sim.toFixed(2)}`;
+                if (!existing.signalsUsed.includes('embedding')) existing.signalsUsed.push('embedding');
+              }
+            } else if (embScore >= SKU_TEXT_SCORE_FLOOR) {
+              scored.push({
+                product:     r,
+                textScore:   embScore,
+                reasoning:   `semantic sim=${sim.toFixed(2)} (no token overlap)`,
+                signalsUsed: ['embedding']
+              });
+              alreadyScoredIds.add(String(r._id));
+            }
+          }
+        }
+      }
+    } catch (err) {
+      console.warn(`   ⚠️  T3 embedding tier failed (falling back to token-only): ${err.message}`);
     }
   }
 
@@ -2219,11 +2448,12 @@ async function fetchVisualOnlyCandidates({ brandId, category, topK }) {
   }
 }
 
-async function catalogFirstMatchOneRefined(refined, { brandId, caption, textDetected, comments }) {
+async function catalogFirstMatchOneRefined(refined, { brandId, brandName = null, caption, textDetected, comments }) {
   if (!brandId || !refined) return { combinedScore: 0, catalogMatch: null, visualResult: null };
 
   const textCandidates = await findCatalogMatchByText({
     brandId,
+    brandName,
     category: refined.category || null,
     caption,
     textDetected,

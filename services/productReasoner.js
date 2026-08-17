@@ -53,27 +53,59 @@ async function identifyProduct({
     `${i + 1}. [${e.provider}] ${e.title}\n   retailer: ${e.retailer}\n   url: ${e.url}${e.priceHint ? `\n   price: ${e.priceHint}` : ''}${e.snippet ? `\n   snippet: ${e.snippet.slice(0, 200)}` : ''}`
   ).join('\n\n');
 
-  const hintsBlock = [];
-  if (brand)          hintsBlock.push(`Brand (user-provided): ${brand}`);
-  if (category)       hintsBlock.push(`Category (user-provided): ${category}`);
-  if (caption)        hintsBlock.push(`Caption (user-provided): "${caption}"`);
-  if (primarySubject) hintsBlock.push(`Visual description from computer vision: ${primarySubject}`);
-  if (textDetected.length) hintsBlock.push(`Text visible on the product: ${textDetected.slice(0, 10).map(t => `"${t}"`).join(', ')}`);
+  // ── Evidence blocks (2026-08-17 rewrite) ──────────────────────────
+  //
+  // Prior version put every signal into a single USER / VISION HINTS
+  // block positioned below WEB SEARCH EVIDENCE. Measured over 500 UGC
+  // matches on 2026-08-13: 76% landed in brand_match, with the model
+  // treating captions and OCR text as background instead of as
+  // first-class evidence. This split lifts them into their own
+  // evidence categories the model is told to weight explicitly.
+  //
+  // VISION SIGNALS are hints (what CV saw). CAPTION + OCR are stronger
+  // — direct authorial signal from the source content. The old
+  // "user-provided" framing implied they were untrusted; now they are
+  // named evidence categories with weight instructions in the task.
+  const visionHints = [];
+  if (brand)          visionHints.push(`Brand (context): ${brand}`);
+  if (category)       visionHints.push(`Category (context): ${category}`);
+  if (primarySubject) visionHints.push(`Vision label: ${primarySubject}`);
+
+  const captionBlock = caption && String(caption).trim()
+    ? `CAPTION (posted alongside the image, first-class evidence):\n"${String(caption).trim()}"`
+    : null;
+
+  const ocrBlock = textDetected.length
+    ? `VISIBLE TEXT ON PRODUCT (OCR — SKU-grade signal when present):\n${textDetected.slice(0, 10).map(t => `- "${t}"`).join('\n')}`
+    : null;
 
   const prompt =
-    `You are identifying a specific product from a brand's catalog based on image-derived hints ` +
-    `and web search evidence. Triangulate across all signals and return a single best-match identification.\n\n` +
-    `USER / VISION HINTS:\n${hintsBlock.join('\n')}\n\n` +
+    `You are identifying a specific product from a brand's catalog. Multiple evidence streams are available; ` +
+    `use them together and return a single best-match identification.\n\n` +
+    `VISION SIGNALS:\n${visionHints.join('\n')}\n\n` +
+    (captionBlock ? `${captionBlock}\n\n` : '') +
+    (ocrBlock ? `${ocrBlock}\n\n` : '') +
     `WEB SEARCH EVIDENCE (${trimmed.length} results, 1-indexed):\n${evidenceBlock}\n\n` +
-    `TASK: Identify the specific product. Prefer the brand's own site as the authoritative source ` +
-    `(e.g. ubeauty.com for U Beauty) when available. Then rank major retailers (Sephora, Nordstrom, etc.) ` +
-    `over generic marketplaces. Only include evidence whose URL actually supports the identification.\n\n` +
-    `CERTAINTY GUIDE:\n` +
-    `  0.90–1.00 (high)    : brand site + at least one major retailer both show this exact product\n` +
-    `  0.70–0.89 (high)    : multiple retailers agree; visible labels match product name\n` +
+    `TASK — how to weigh the evidence (be decisive, not defensive):\n` +
+    `  1. If the CAPTION or OCR text names a product on the brand, that is STRONG evidence on its own —\n` +
+    `     independent of web hit count. A caption like "@brand chore jacket in indigo" identifies the SKU.\n` +
+    `  2. Look at the attached IMAGE and cross-reference against retailer thumbnails in the evidence list.\n` +
+    `     If the crop and a thumbnail depict the same object, cite that evidenceIndex as "strong".\n` +
+    `  3. Any URL that resolves to a product page (retailer OR brand — e.g. /products/, /dp/, /p/) is\n` +
+    `     authoritative for identification. Do NOT downweight retailer product pages relative to brand.com;\n` +
+    `     they name the SAME SKU. The brand's own site is a tiebreaker, not a requirement.\n` +
+    `  4. Editorial URLs (/blog/, /pages/, /collections/) are brand-level evidence — never product-level.\n` +
+    `  5. When multiple signals converge on the same identification, add them; do not average them down.\n\n` +
+    `Only include evidence whose URL actually supports the identification.\n\n` +
+    `CERTAINTY GUIDE (align to the strongest evidence, don't hedge for missing weaker signals):\n` +
+    `  0.90–1.00 (high)    : caption/OCR names it AND at least one product-page URL confirms\n` +
+    `  0.70–0.89 (high)    : product-page URL(s) match; OR caption/OCR names it; OR image↔thumbnail match\n` +
     `  0.50–0.69 (medium)  : one credible source matches; or retailer consensus with partial label match\n` +
-    `  0.25–0.49 (low)     : plausible match, weak evidence (thumbnails only, or mixed signals)\n` +
-    `  0.00–0.24 (unknown) : cannot identify confidently\n\n` +
+    `  0.25–0.49 (low)     : plausible match, weak evidence (brand-level only, no product-page URL)\n` +
+    `  0.00–0.24 (unknown) : truly nothing to work with\n\n` +
+    `When a plausible identification exists, name it and let the certainty score reflect residual doubt. ` +
+    `Do NOT default to null productName when evidence supports a candidate — that is fabrication avoidance ` +
+    `taken too far. Fabrication protection is the URL-type guard downstream; your job here is to identify.\n\n` +
     `Return ONLY JSON:\n` +
     `{\n` +
     `  "productName": "exact product name as the brand lists it, e.g. 'The SUPER Hydrator'",\n` +
@@ -81,8 +113,8 @@ async function identifyProduct({
     `  "brand": "confirmed brand name",\n` +
     `  "certainty": 0.00-1.00,\n` +
     `  "certaintyLabel": "high" | "medium" | "low" | "unknown",\n` +
-    `  "reasoning": "2-3 sentences explaining the identification, naming which evidence items were decisive (by 1-indexed number)",\n` +
-    `  "primaryUrl": "the single best URL from the evidence (brand site preferred)",\n` +
+    `  "reasoning": "2-3 sentences explaining the identification, naming which evidence items were decisive (by 1-indexed number). Cite the caption/OCR/image-match if used.",\n` +
+    `  "primaryUrl": "the single best product-page URL from the evidence",\n` +
     `  "primaryRetailer": "domain of the primaryUrl",\n` +
     `  "primaryThumbnail": "thumbnail url from one of the evidence items, or null",\n` +
     `  "evidenceIndices": [\n` +
@@ -93,7 +125,13 @@ async function identifyProduct({
   const messages = [
     {
       role: 'system',
-      content: 'You are a precise product identification assistant. You read visible labels, brand marks, and web evidence to identify the specific SKU a user is looking at. You are conservative — if evidence is weak, you say so via the certainty score rather than inventing a product.'
+      content:
+        'You are a precise product identification assistant. You read captions, visible labels, brand marks, ' +
+        'attached images, and web evidence to identify the specific SKU a user is looking at. You are decisive: ' +
+        'when the available evidence supports a plausible identification, name the product and use the certainty ' +
+        'score to reflect residual uncertainty. Do not default to unnamed when a plausible identification exists — ' +
+        'fabrication protection is enforced downstream by URL and brand-mismatch guards. Under-attribution costs ' +
+        'the same as over-attribution here; the certainty score is the honest signal for callers.'
     },
     {
       role: 'user',
