@@ -137,6 +137,7 @@ Covered by `scripts/verifyRunFeed.js` (offline; revert-proves the never-escape a
 | `<role> crashed — unhandledRejection` | fatal | `processAlerts` | Same. On Node 20 this is fatal by default, and before this work there were **no** handlers at all |
 | `<role> shutting down with N ad(s) in flight` | error | `processAlerts` | SIGTERM during a batch — those N ads are about to be orphaned. The single most useful alert here |
 | `Dropped work reclaimed — N ad(s), M run(s)` | error | reaper, `worker.js` | Work was dropped and reset. **Those ads now sit in `queued` until someone re-runs the campaign** |
+| `Stranded generation reclaimed — run …` / `N stranded generation(s) reclaimed` | warn | reaper, `worker.js` | **New** — dedicated per-run detail for the `preparing`-reap arm above: names the run id, campaign, age, and how many minted ads sit `queued` (drainable). See *Preparing-reap notice* below |
 | `N ad(s) stuck rendering` | error | watchdog | Wedged past `ALERT_RENDERING_STALE_MIN`, deliberately **before** the 15-min reap so the evidence is intact |
 | `N campaign run(s) not progressing` | error | watchdog | `running` past `ALERT_RUN_STALE_MIN` |
 | `Detect queue backing up — N queued` | warn | watchdog | The worker's own queue is growing → worker wedged |
@@ -144,11 +145,74 @@ Covered by `scripts/verifyRunFeed.js` (offline; revert-proves the never-escape a
 | `Video generation failed` | error | `routes/ads.js` | Atlas prediction failed or timed out |
 | `Campaign run finished with N failed ad(s)` | warn/error | `runRenderLoop` | Escalates to error when **every** ad failed |
 | `Campaign run crashed …` | error | `routes/ads.js` | The loop itself threw |
+| `Claim anomaly — run … released` | **fatal** | `routes/ads.js` `/generate` | **New** — `claimAdsForRun`'s updateMany reported a write but the ownership re-read came back empty (should never fire). Ads released to `queued`, run marked `failed`. Sent to the fatal/alert channel, **never** the per-run status feed. See *Claim-anomaly alert* below |
 
 **Deliberately not alerted:** a nonzero count of `queued` Ads.
 `expandWizardJob` routinely queues more creatives than
 `MAX_CREATIVES_PER_RUN` (1000, effectively uncapped) drains in one run, so that count is normal
 inventory, not a fault. It is carried as *context* on the alerts above.
+
+### Run-completion per-kind summary (per-run status feed, not a separate alert)
+
+`runRenderLoop`'s final `runFeed.finishRun(...)` call now carries a
+`summaryLines` array (`slackVerbosity.buildRunCompletionSummaryLines`,
+`services/slackRunVerbosity.js`) rendered into the run's parent Slack
+message, after the `finished — N✓/M✗/K⊘ · elapsed` line and before the
+grouped failure reasons. Up to three lines, each printed only when there is
+something to say:
+
+1. **Minted vs. claimed**, only when they differ: `minted 40, claimed 25 —
+   15 queued (drainable via "Generate more")`. Reuses `CampaignRun.mintedTotal`
+   / `unclaimedAtStart` — already persisted at claim time — never recomputed.
+2. **Per-kind breakdown**: `12 static delivered / 1 failed, 3 video masters
+   delivered (billable) / 6 free derivatives / 1 failed`. Kind is derived from
+   the claimed ads' `renderRoute` (`'veo'` vs other) + `deriveFromMaster`
+   (billable master vs free derivative); outcome from final `Ad.status`
+   (`'failed'` vs `'draft'`/`'live'`).
+3. **Spend**, only when cheaply available: `reconciled spend $1.80` from
+   `CostLog` rows for this run's claimed `adId`s with `costSource:'actual'`.
+   If only `costSource:'estimated'` rows exist, the line says `est. spend
+   $X.XX` explicitly — **never** presented as settled, and `base_price` /
+   the estimate formula are never quoted as spend (CLAUDE.md §2).
+
+### Preparing-reap notice (`worker.js` reapOrphans, `level: warn`)
+
+The `preparing`-reap sweep (`PREPARE_STALE_MIN`, 30m) used to only feed a
+count into the generic `Dropped work reclaimed` alert above. It now also
+fires a dedicated notice, one per reap tick, naming **every** run it just
+stamped `failed`: run id, campaign id, age (minutes since mint), and how
+many of that run's minted ads sit `status:'queued'` — i.e. **drainable**.
+Wording is deliberately never "lost" or "deleted" (PR #204 truthful-wording
+rule): a `preparing` run holds no claimed ads by construction (expansion
+never reached the claim step), so its minted ads — if any — are intact and
+queued. The detail line always states the drain path verbatim: *"Generate
+more on the Ads/Campaigns page renders them; the 24h archive sweep parks
+them otherwise."* Built by `slackVerbosity.buildPreparingReapNotice`.
+
+### Claim-anomaly alert (`routes/ads.js` `/generate`, `level: fatal`)
+
+`claimAdsForRun`'s anomaly branch (`updateMany` reports `modifiedCount > 0`
+but the ownership re-read returns nothing — should never fire under primary
+reads + acknowledged writes) used to only `console.error`. `/generate`'s
+background task now also sends a Slack alert — `slackVerbosity.
+buildClaimAnomalyAlert` — naming the run, campaign, how many ads were
+selected for claim, the write's `modifiedCount`, and that the ads were
+released back to `queued`. Sent at `level: 'fatal'` via `alertService`
+(the fatal/alert channel, falling back to `SLACK_ALERT_CHANNEL` if
+`SLACK_ALERT_CHANNEL_FATAL` is unset) — **not** the per-run status feed,
+because this is the rare "should never happen" case, not routine progress.
+`/runs`' anomaly branch (pre-existing, unchanged here) still only logs;
+extending it is a candidate follow-up, not bundled in this change.
+
+### Uncap context line (per-run status feed)
+
+`MAX_CREATIVES_PER_RUN` moved from 20 to 1000 (effectively uncapped,
+2026-08-18). Below the old cap of 20, the run-feed's `run start — N ad(s)`
+thread line is byte-identical to before. Above it, `slackVerbosity.
+buildRunStartLine` appends an `— uncapped batch` marker plus the static/video
+mix, e.g. `run start — 39 ad(s) — uncapped batch (24 static + 15 video)`, so
+a big uncapped batch is visible in the thread rather than looking like
+routine traffic.
 
 ## Failure payload — lockstep with render-activity
 
@@ -285,11 +349,24 @@ as "what we recorded", not "what we were charged".
 
 ```bash
 node scripts/verifySlackAlert.js
+node scripts/verifySlackRunVerbosity.js
 ```
 
-Covers: unconfigured silence, `ok:false` on 200 as failed send (dedupe +
-tally), 429 non-blocking, dedupe fold, rate limit, `xoxb-` redaction,
-balanced fences at the size limit.
+`verifySlackAlert.js` covers: unconfigured silence, `ok:false` on 200 as
+failed send (dedupe + tally), 429 non-blocking, dedupe fold, rate limit,
+`xoxb-` redaction, balanced fences at the size limit.
+
+`verifySlackRunVerbosity.js` covers the four enhancements above (all pure —
+no DB, no network): per-kind counts for the completion summary (revert-proven
+against a delivered/failed field swap), minted-vs-claimed + reconciled/est.
+spend formatting, the uncap context line's byte-identical-below-threshold
+guarantee, and wording truthfulness on the preparing-reap notice (revert-proven
+against a "lost"/"deleted" mutation). A structural section (`G`) asserts the
+real call sites in `routes/ads.js` / `worker.js` / `services/runFeedService.js`:
+the claim-anomaly alert is `alerts.notifyAsync` at `level:'fatal'` and never
+`runFeed.*` (revert-proven), and none of the new notify/runFeed calls in the
+render-loop or reap regions are `await`ed (revert-proven, comment-stripped
+before scanning).
 
 ## Known gap this does not close
 

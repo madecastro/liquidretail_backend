@@ -34,6 +34,12 @@
 
 const os = require('os');
 const { stageBase, formatElapsed } = require('./adStage');
+// Pure message builders — no Mongo/network at require-time (see that
+// module's header). buildRunStartLine feeds the uncap context line;
+// finishRun's extra completion-summary lines are built by the CALLER
+// (routes/ads.js) via buildRunCompletionSummaryLines and simply rendered
+// here, since only the caller has the claimed ads' final kind/outcome mix.
+const { buildRunStartLine } = require('./slackRunVerbosity');
 
 // ── config (lazy, so tests can flip env between cases) ────────────────────
 const BOT_TOKEN = () => (process.env.SLACK_BOT_TOKEN || '').trim();
@@ -284,6 +290,13 @@ function buildParentText(state, live) {
   const lines = [head, `    ${countLine}`];
   if (nowLine) lines.push(`    ${nowLine}`);
   if (state.finished && state.finishSummary) lines.push(`    ${state.finishSummary}`);
+  // Per-kind completion summary (minted-vs-claimed gap / static+video
+  // delivered-failed breakdown / reconciled-or-est. spend) — see finishRun.
+  // Placed before finishReasons: this is the WHAT (counts by kind), the
+  // reasons below are the WHY (grouped failure causes).
+  if (state.finished && Array.isArray(state.finishExtraLines)) {
+    for (const l of state.finishExtraLines) lines.push(`    ${l}`);
+  }
   // One line per DISTINCT reason, most common first. Grouped because a
   // 20-ad run that fails identically 20 times is one fact, not twenty.
   if (state.finished && Array.isArray(state.finishReasons)) {
@@ -585,10 +598,19 @@ function startRun(opts = {}) {
         })
         .catch(() => {});
     }
-    // Lifecycle event into the ring (not a poll tick).
+    // Lifecycle event into the ring (not a poll tick). Below the old
+    // MAX_CREATIVES_PER_RUN cap of 20 this is byte-identical to the
+    // historical text; above it, buildRunStartLine appends the uncap
+    // marker + static/video mix so a big uncapped batch is visible in the
+    // thread (CLAUDE.md §2 — MAX_CREATIVES_PER_RUN is 1000, effectively
+    // uncapped, since 2026-08-18).
     st.ring.push({
       t: _now(),
-      stage: `run start — ${st.total} ad(s)`,
+      stage: buildRunStartLine({
+        total: st.total,
+        staticCount: opts.staticCount,
+        veoCount: opts.veoCount
+      }),
       adId: null,
       meta: {}
     });
@@ -629,6 +651,14 @@ function finishRun(opts = {}) {
     st.finishSummary = st.cancelled
       ? `stopped — ${ok}✓ / ${fail}✗ / ${skip}⊘ · ${formatElapsed(ms)}`
       : `finished — ${ok}✓ / ${fail}✗ / ${skip}⊘ · ${formatElapsed(ms)}`;
+    // Per-kind completion summary (minted-vs-claimed gap, static/video
+    // delivered/failed breakdown, reconciled-or-est. spend) — built by the
+    // CALLER via slackVerbosity.buildRunCompletionSummaryLines and just
+    // rendered here. Capped defensively; this module never trusts a
+    // caller's array length.
+    st.finishExtraLines = Array.isArray(opts.summaryLines)
+      ? opts.summaryLines.filter((l) => typeof l === 'string' && l).slice(0, 6)
+      : null;
     // WHY a run failed, not just how many. Until 2026-08-05 this summary said
     // "10✓ / 2✗" and nothing else, so the only way to learn that two ads were
     // rejected for CONTENT POLICY — deterministic, and never going to succeed on

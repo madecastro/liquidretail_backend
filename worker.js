@@ -129,6 +129,9 @@ const alerts = require('./services/alertService');
 // Receipt guard for every rendering->queued requeue — see services/spendReceipt.js.
 const { receiptFree, HAS_RECEIPT } = require('./services/spendReceipt');
 const { buildStalePreparingFilter } = require('./services/campaignRunGuards');
+// Pure Slack-message builder for the preparing-reap notice below — see
+// services/slackRunVerbosity.js header (no Mongo/network at require-time).
+const { buildPreparingReapNotice } = require('./services/slackRunVerbosity');
 
 // Mongoose default pool is 100 max. With 50+ concurrent workers each
 // firing several queries per pipeline stage, we want a roomy pool to
@@ -341,8 +344,22 @@ async function reapOrphans() {
   // above already releases those back to 'queued' regardless of this sweep's
   // timing. What IS already spent (Director/Judge LLM cost) is not
   // recoverable by a reaper and this sweep does not try.
+  // Captured BEFORE the updateMany, same `now` snapshot passed to BOTH
+  // calls (below) so the two filters are byte-identical — no race between
+  // "which rows did we read" and "which rows did we flip" — so the
+  // dedicated Slack notice below can name which runs these were.
+  // updateMany's modifiedCount alone cannot say run id / campaign / age.
+  // Bounded (.limit) because this is a rare hygiene event, not a hot path.
+  const stalePreparingNow = Date.now();
+  const stalePrepsDocs = await CampaignRun.find(
+    buildStalePreparingFilter({ now: stalePreparingNow, staleMin: PREPARE_STALE_MIN })
+  )
+    .select('runId campaignId startedAt')
+    .limit(20)
+    .lean()
+    .catch(() => []);
   const preps = await CampaignRun.updateMany(
-    buildStalePreparingFilter({ now: Date.now(), staleMin: PREPARE_STALE_MIN }),
+    buildStalePreparingFilter({ now: stalePreparingNow, staleMin: PREPARE_STALE_MIN }),
     {
       $set: { status: 'failed', completedAt: new Date() },
       $push: { errors: {
@@ -396,6 +413,43 @@ async function reapOrphans() {
         ...(nAds > 0 ? { 'action needed': 'ads sit in queued until someone re-runs the campaign' } : {})
       }
     });
+  }
+
+  // Dedicated preparing-reap notice — the aggregate alert above only counts
+  // 'runs failed (never started rendering)'; it names no run, no campaign,
+  // no age, and no drain path, so an operator seeing only a count has no way
+  // to act on it. Every run named here holds NO claimed ads (expansion never
+  // reached the claim step — see the sweep's own comment above), so the
+  // minted ads (if any) are intact and sitting 'queued', not lost.
+  // Independent of `total` above (own try/catch) so a lookup failure here
+  // can never suppress the aggregate alert or take down the reaper.
+  if (stalePrepsDocs.length) {
+    try {
+      const nowMs = Date.now();
+      const runsDetail = await Promise.all(stalePrepsDocs.map(async (r) => {
+        const drainableCount = await Ad.countDocuments({
+          campaignRunIds: r.runId,
+          status: 'queued'
+        }).catch(() => 0);
+        const ageMin = Math.round((nowMs - new Date(r.startedAt).getTime()) / 60000);
+        return {
+          runId: r.runId,
+          campaignId: r.campaignId ? String(r.campaignId) : null,
+          ageMin,
+          drainableCount
+        };
+      }));
+      const notice = buildPreparingReapNotice({ runs: runsDetail, staleMin: PREPARE_STALE_MIN });
+      alerts.notifyAsync({
+        level: 'warn',
+        title: notice.title,
+        key: 'reaper:preparing-reap',
+        fields: notice.fields,
+        detail: notice.detail
+      });
+    } catch (err) {
+      console.warn(`⚠️  preparing-reap notice failed (non-fatal): ${err.message}`);
+    }
   }
 
   // OperationRun (unified progress rows): stale-heartbeat runs from
