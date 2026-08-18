@@ -1194,7 +1194,7 @@ volume.
 
 #### Run selection (`selectAdsForRun`)
 
-Tiered drain so the guaranteed baseline videos render before optional variants fill `MAX_CREATIVES_PER_RUN`:
+Tiered drain so the guaranteed baseline videos render before optional variants fill `MAX_CREATIVES_PER_RUN` (1000 — effectively uncapped since 2026-08-18, so tier order no longer starves statics):
 
 0. **Tier 0 — deterministic videos first:** `status: queued`, `conceptId: null`, `judgeRank: null`, `renderRoute: 'veo'`, FIFO `queuedAt`.
 1. **Tier 1 — judged concepts:** `judgeRank != null`, sort `judgeRank` ASC.
@@ -1470,7 +1470,7 @@ Single resolver: `services/concurrency.js` (frozen `concurrency` object; boot lo
 | `WORKER_CONCURRENCY` | **5** | SELF — DetectRun / job poll workers |
 | `RENDER_CONCURRENCY` | **8** | SELF — in-flight static/image ads per run. File raised 4→8 (2026-08-02): unpaced `gpt-image-2/edit` measured clean (85s wall, zero 429s). **Became live in prod on 2026-08-03** when the Render dashboard pin of 4 was deleted as part of the secrets-only migration (dotenv never overrides an already-set var — the file change alone did not move prod for a day). Doubling was a consequence of that cleanup, not a separate tuning decision. **Was also falsely documented as "Puppeteer pool"** — the live pool is direct-image Atlas submits |
 | `VEO_CONCURRENCY` | **4** | SELF — in-flight video ads per run. Raised 1→4 (2026-08-02) as an Omni probe. **Was falsely documented as "keep at 1 — provider 429s"**; that belonged to retired direct-Veo + Grok 1 RPS, not Omni. Re-measure before >4 |
-| `MAX_CREATIVES_PER_RUN` | 20 | SELF — ads claimed into one `CampaignRun` |
+| `MAX_CREATIVES_PER_RUN` | 1000 (effectively uncapped, owner 2026-08-18) | SELF — ads claimed into one `CampaignRun` |
 | `ATLAS_SUBMIT_SPACING_MS` | 1200 | SELF — same-model **video** submit spacing only; image submits unpaced |
 | `GROK_MAX_RPS` | 1 | **PROVIDER** — env may lower, cannot raise above 1; floors Grok slug spacing independent of `VEO_CONCURRENCY` |
 | `CATALOG_ENRICHMENT_CONCURRENCY` | 6 | SELF — enrich auto + full path |

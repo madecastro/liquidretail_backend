@@ -27,9 +27,10 @@
 // is global. Do not reuse this for one.
 //
 // No timeout and no queue cap: a permit is always released in a `finally`, and the
-// callers are a bounded per-run dispatch (MAX_CREATIVES_PER_RUN=20), so the waiter
-// list cannot grow without bound. Adding a timeout would mean *proceeding without a
-// permit*, which defeats the guard at exactly the moment it matters.
+// callers are a bounded per-run dispatch (MAX_CREATIVES_PER_RUN=1000), so the waiter
+// list is bounded by the run claim — larger than the old 20, still finite. Adding a
+// timeout would mean *proceeding without a permit*, which defeats the guard at
+// exactly the moment it matters.
 
 class Semaphore {
   constructor(permits, name = 'semaphore') {
