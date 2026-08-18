@@ -384,8 +384,27 @@ ok('F3d empty-runId arm skips campaigns with a preparing/running run', () => {
   assert.ok(/status:\s*\{\s*\$in:\s*\[\s*'preparing'\s*,\s*'running'\s*\]\s*\}/.test(sweepSrc));
 });
 ok('F4 write is status:archived — never a delete, never failed/queued flip', () => {
-  assert.ok(/status:\s*['"]archived['"]/.test(sweepSrc));
+  // UPDATED 2026-08-18. The literal `status: 'archived'` moved out of this
+  // file: the write now goes through the shared archiveAdsReleasingDigest()
+  // helper, which performs the status flip AND releases the row's
+  // identityDigest (an archived row otherwise squats its slot on the
+  // non-partial (campaignId, identityDigest) unique index forever, so a
+  // never-billed video identity could never be re-minted). The intent of this
+  // check is unchanged — archive, never delete, never a queued/failed flip —
+  // so assert the CALL here and the literal in the helper it delegates to.
+  const helperRaw = fs.readFileSync(path.join(ROOT, 'services', 'adArchiveDigest.js'), 'utf8');
+  assert.ok(/archiveAdsReleasingDigest\(\s*\n?\s*Ad,/.test(sweepSrc),
+    'the sweep write must go through archiveAdsReleasingDigest(Ad, …)');
+  assert.ok(/require\(\s*['"]\.\/adArchiveDigest['"]\s*\)/.test(sweepRaw),
+    'queuedArchiveSweeper must REQUIRE the helper, not just name it (the unbound-identifier incident)');
+  assert.ok(/status:\s*\{\s*\$literal:\s*['"]archived['"]\s*\}/.test(helperRaw),
+    'the shared helper must still write status archived');
   assert.ok(!/deleteMany|deleteOne|findOneAndDelete/.test(sweepSrc));
+  // No queued/failed FLIP: the sweeper may only ever call the archive helper.
+  // (`status: 'queued'` appears in this file as a read FILTER, which is
+  // correct and must stay — hence the check is on the write, not the string.)
+  assert.ok(!/restoreAdsRestoringDigest|restoreOneRestoringDigest/.test(sweepSrc),
+    'the sweep must never un-archive anything');
 });
 ok('F5 sweep is bounded per pass', () => {
   assert.ok(/\.limit\(maxAds\(\)\)/.test(sweepSrc));

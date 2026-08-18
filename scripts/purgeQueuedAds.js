@@ -46,6 +46,21 @@ const mongoose = require('mongoose');
 
 const Ad          = require('../models/Ad');
 const CampaignRun = require('../models/CampaignRun');
+// THE archive / restore writes — one definition, shared with the Stop handler,
+// the 24h sweeper and the ad.archive / ad.restore capabilities. They move the
+// row's identityDigest to/from preArchiveIdentityDigest so an archived
+// NEVER-BILLED identity stops squatting its slot on the (campaignId,
+// identityDigest) unique index. Never hand-roll a $set here — --restore in
+// particular puts rows back into 'queued', where selectAdsForRun can claim and
+// BILL them, so a row must never re-enter the queue carrying a tombstone.
+const {
+  archiveAdsReleasingDigest,
+  restoreOneRestoringDigest,
+  isDigestCollisionError,
+  restoreTookEffect,
+  DIGEST_COLLISION_MESSAGE,
+  UNRESTORABLE_TOMBSTONE_MESSAGE
+} = require('../services/adArchiveDigest');
 
 const args = process.argv.slice(2);
 const DRY      = !args.includes('--apply');
@@ -147,8 +162,39 @@ async function main() {
     const filter = buildFilter('archived');
     const n = await report(filter, "Archived ads that would be returned to 'queued'");
     if (!DRY && n) {
-      const r = await Ad.updateMany(filter, { $set: { status: 'queued', updatedAt: new Date() } });
-      console.log(`\nrestored ${r.modifiedCount} ad(s) to 'queued'`);
+      // Per-row, so one identity collision does not abort the whole restore.
+      // A collision means a later Generate already re-minted that identity
+      // while the row sat archived — the row stays archived and is reported.
+      const rows = await Ad.find(filter).select('_id').lean();
+      let restored = 0;
+      const collided = [];
+      const unrecoverable = [];
+      for (const row of rows) {
+        let doc;
+        try {
+          doc = await restoreOneRestoringDigest(
+            Ad, { _id: row._id }, { status: 'queued', queryOptions: { new: true, lean: true } }
+          );
+        } catch (err) {
+          if (isDigestCollisionError(err)) { collided.push(String(row._id)); continue; }
+          throw err;
+        }
+        // modifiedCount alone would count a REFUSED restore as a success: the
+        // stage leaves a tombstoned row with no saved digest at 'archived' on
+        // purpose, because a 'queued' row is claimable and billable and must
+        // never carry a placeholder identity. Check the status, not the count.
+        if (restoreTookEffect(doc, 'queued')) restored += 1;
+        else unrecoverable.push(String(row._id));
+      }
+      console.log(`\nrestored ${restored} ad(s) to 'queued'`);
+      if (collided.length) {
+        console.log(`⚠️  ${collided.length} ad(s) left archived — ${DIGEST_COLLISION_MESSAGE}`);
+        console.log(`    ${collided.slice(0, 20).join(', ')}${collided.length > 20 ? ' …' : ''}`);
+      }
+      if (unrecoverable.length) {
+        console.log(`⚠️  ${unrecoverable.length} ad(s) left archived — ${UNRESTORABLE_TOMBSTONE_MESSAGE}`);
+        console.log(`    ${unrecoverable.slice(0, 20).join(', ')}${unrecoverable.length > 20 ? ' …' : ''}`);
+      }
     }
     await finish();
     return;
@@ -203,8 +249,7 @@ async function main() {
       const r = await Ad.deleteMany(queuedFilter);
       deleted += r.deletedCount || 0;
     } else {
-      const r = await Ad.updateMany(queuedFilter,
-        { $set: { status: 'archived', updatedAt: new Date() } });
+      const r = await archiveAdsReleasingDigest(Ad, queuedFilter);
       archived += r.modifiedCount || 0;
     }
   }
@@ -213,8 +258,7 @@ async function main() {
       const r = await Ad.deleteMany(stuckFilter);
       deleted += r.deletedCount || 0;
     } else {
-      const r = await Ad.updateMany(stuckFilter,
-        { $set: { status: 'archived', updatedAt: new Date() } });
+      const r = await archiveAdsReleasingDigest(Ad, stuckFilter);
       archived += r.modifiedCount || 0;
     }
   }

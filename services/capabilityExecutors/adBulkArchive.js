@@ -13,6 +13,12 @@
 const mongoose = require('mongoose');
 const Ad = require('../../models/Ad');
 const Brand = require('../../models/Brand');
+// THE archive write — one definition, imported by every archive site. It also
+// releases each row's identityDigest, but only for rows proven receipt-free
+// with no renderUrl (guarded per document inside the helper), so a paid
+// identity keeps the unique-index protection that stops it being re-billed.
+// See services/adArchiveDigest.js.
+const { archiveAdsReleasingDigest } = require('../adArchiveDigest');
 
 const MAX_BATCH = 50;
 
@@ -72,10 +78,7 @@ async function run({ req, args }) {
   }
 
   if (toArchive.length > 0) {
-    await Ad.updateMany(
-      { _id: { $in: toArchive } },
-      { $set: { status: 'archived', updatedAt: new Date() } }
-    );
+    await archiveAdsReleasingDigest(Ad, { _id: { $in: toArchive } });
   }
 
   const archived = outcomes.filter((o) => o.status === 'archived').length;

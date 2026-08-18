@@ -256,20 +256,36 @@ const loopSrc = adsSrc.slice(adsSrc.indexOf('async function runRenderLoop'),
                              adsSrc.indexOf('async function renderOne'));
 
 check('Stop: cancelled ads are ARCHIVED, never returned to the queue', () => {
-  assert.ok(/status: 'archived'/.test(loopSrc),
-    'cancellation should archive unrendered ads');
+  // The literal `status: 'archived'` moved out of this file on 2026-08-18:
+  // every archive site now goes through the shared
+  // archiveAdsReleasingDigest() helper, which performs the status flip AND
+  // releases a never-billed row's identityDigest. Assert the CALL, not the
+  // string it used to contain.
+  assert.ok(/archiveAdsReleasingDigest\(\s*\n?\s*Ad,/.test(loopSrc),
+    'cancellation should archive unrendered ads via the shared archive helper');
   assert.ok(!/\$set: \{ status: 'queued'/.test(loopSrc),
     're-queueing on cancel is the bug: cancelled work reappears and bills on the next Generate');
 });
 
-check('Stop: the campaign backlog behind the run is archived too', () => {
-  // Without this, Stop only pauses — the next Generate drains the leftovers.
-  // Either source for the campaign id is correct — run.campaignId is required
-  // on the CampaignRun schema, job.campaignId comes from expandWizardJob's
-  // return. Pinning the assertion to one spelling tested the wording, not the
-  // behaviour.
-  assert.ok(/campaignId: (?:run|job)\.campaignId, status: 'queued'/.test(loopSrc),
-    'cancel should also clear the campaign\'s remaining queued inventory');
+check("Stop: the backlog archive is scoped to THIS RUN, not the whole campaign", () => {
+  // CORRECTED 2026-08-18. This check used to assert the OPPOSITE — it pinned
+  // `campaignId: run.campaignId, status: 'queued'`, i.e. archive every queued
+  // ad on the campaign. Owner ruled that a bug: other runs' queued rows, and
+  // mint leftovers waiting for a "Generate more", were destroyed by stopping
+  // an unrelated run. Ownership is campaignRunIds (stamped at mint by
+  // mintedCampaignRunIds, $addToSet'd at claim), so the backlog filter must be
+  // run-scoped and must NOT be campaign-scoped.
+  // The filter itself is a pure exported builder (so a harness can evaluate
+  // the real query); assert the call here and the shape there.
+  assert.ok(/buildStopBacklogArchiveFilter\(\{ runId: run\.runId \}\)/.test(loopSrc),
+    "cancel should archive only the stopping run's own queued backlog");
+  assert.ok(!/campaignId: (?:run|job)\.campaignId, status: 'queued'/.test(loopSrc),
+    'campaign-wide backlog archiving on Stop destroys other runs\' pending work');
+  const f = require('../services/adArchiveDigest')
+    .buildStopBacklogArchiveFilter({ runId: 'run_x' });
+  assert.equal(f.campaignRunIds, 'run_x');
+  assert.equal(f.status, 'queued');
+  assert.ok(!('campaignId' in f), 'the backlog filter must not be campaign-scoped');
 });
 
 check('Stop: the cancel check is AWAITED before more work is claimed', () => {

@@ -221,6 +221,30 @@ const adSchema = new mongoose.Schema({
   // unique per campaign.
   identityDigest: { type: String, required: true, index: true },
 
+  // THE RELEASED DIGEST of an archived, never-billed row. Null on every other
+  // ad. Written ONLY by services/adArchiveDigest.js.
+  //
+  // WHY. The (campaignId, identityDigest) unique index is not partial —
+  // partialFilterExpression cannot express `status != 'archived'` — so an
+  // archived row occupied its identity slot forever. Video digests
+  // deliberately omit generationRunId (CLAUDE.md §2: that omission is THE
+  // money guard against a repeat Generate re-billing a paid Omni master), so
+  // an archived never-billed video could never be re-minted: insertMany hit
+  // 11000, swallowed it, and the crop simply never appeared.
+  //
+  // On archive, a row proven receipt-free with no renderUrl has its digest
+  // moved HERE and `identityDigest` replaced with `archived:<_id>` — unique by
+  // construction. On restore the move is reversed. A row holding a spend
+  // receipt or a renderUrl is archived WITHOUT releasing anything: the index
+  // exists to protect PAID identities and that protection is untouched.
+  //
+  // MUST STAY DECLARED. Mongoose strict mode silently drops writes to
+  // UNDECLARED paths (CLAUDE.md §4 — this repo already lost
+  // renderError.predictionId that way). If this declaration is removed the
+  // tombstone still lands, the original digest does NOT, and the ad becomes
+  // unrestorable. Pinned by scripts/verifyArchiveDigestRelease.js.
+  preArchiveIdentityDigest: { type: String, default: null },
+
   // For raffle campaigns with multiple prize media (Option B per-media
   // variants), this stamps WHICH prize Media this ad's render should
   // use as its hero. Null on non-raffle ads. The first prize media
