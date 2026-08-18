@@ -106,9 +106,19 @@ const REAP_INTERVAL_MIN  = Math.max(1, parseInt(process.env.REAP_INTERVAL_MIN, 1
 //
 // 30 clears the ~18-20 min ceiling with headroom. Separate name from
 // REAP_STALE_MIN so RUNNING runs and Ads keep the 15-minute claimed-doc window
-// — raising THAT would delay orphan requeue, which is a different and unwanted
-// trade — but the same parser (services/staleness.js), so a nonsense value
-// falls back to the documented default here too instead of clamping to 1 min.
+// on updatedAt — raising THAT would delay orphan requeue for every claimed doc,
+// a different and unwanted trade. This knob cannot reach those sweeps, so
+// nothing holding claimed work waits longer than before; what waits longer is a
+// wedged EXPANSION, which holds no claimed ads and no recoverable spend (see
+// the sweep's own comment below). Same parser (services/staleness.js), so a
+// nonsense value falls back to the documented default instead of clamping to 1.
+//
+// NOTE the clock difference, because it is easy to conflate the two windows:
+// this one is MINT AGE (startedAt — a preparing run never writes to its row),
+// while REAP_STALE_MIN is SILENCE (updatedAt, refreshed by every per-ad $inc).
+// The gate's two arms mirror exactly that split; keying its running arm on mint
+// age instead was a confirmed double-bill P0 (2026-08-18) — see
+// services/campaignRunGuards.js buildActiveRunsFilter.
 const PREPARE_STALE_MIN  = prepareStaleMin();
 
 // Health sweep → Slack (services/backlogWatchdog.js). Separate cadence

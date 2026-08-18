@@ -117,6 +117,33 @@
 //  15. Re-inline either activeRuns query in routes/ads.js instead of using
 //      the shared builder
 //        → G7 fails (the pre-check and the race re-read would drift)
+//  16. Key buildActiveRunsFilter's RUNNING arm on createdAt instead of
+//      updatedAt — the CONFIRMED P0 of 2026-08-18 (see part 5 below)
+//        → G5, G5b, G5d fail
+//
+//   5. THE SECOND ADVERSARIAL ROUND (2026-08-18) — and it found a live money
+//      hole that raising the preparing window MADE REACHABLE. The gate's
+//      running arm keyed on createdAt (mint age). Timeline:
+//        t=0    A minted preparing; gate's preparing arm blocks duplicates.
+//        t=18   expansion finishes, the flip now SUCCEEDS (part 4's fix),
+//               status becomes 'running', createdAt still t=0, and
+//               runRenderLoop begins submitting BILLABLE statics.
+//        t=18+ε duplicate /generate: preparing arm misses on status, running
+//               arm misses because createdAt is 18 > 15. Gate sees nothing,
+//               admits the duplicate silently, and it bills too. Static
+//               identityDigest is scoped by generationRunId, so the unique
+//               index does not save this — CLAUDE.md §2 says this gate is the
+//               ONLY double-click protection for static.
+//      Before part 4 the t=18 flip LOST its CAS, so only one side ever billed;
+//      the newly-legal 15-30min flip band is exactly the blind band. The same
+//      blindness ALSO pre-existed for fast expansions whose batch outlives
+//      t=15, which matters much more now MAX_CREATIVES_PER_RUN is effectively
+//      uncapped. Fixed by keying the running arm on updatedAt, so gate
+//      visibility means "the reaper would spare it" — same number, same clock,
+//      same meaning as worker.js's running sweep. Verified against mongoose
+//      7.8.7 that a bare $inc on a timestamps:true schema really does get
+//      $set:{updatedAt} injected, which is what makes per-ad completions a
+//      heartbeat. Pinned by G5/G5b/G5c/G5d.
 //
 //   node scripts/verifyPreparingReap.js
 
@@ -243,8 +270,9 @@ ok('C4 WITH staleMin, a run still within the gate\'s window matches — real cal
   assert.strictEqual(matches(doc, filter), true);
 });
 ok('C5 THE FIX: a run aged past staleMin does NOT match even though status is still preparing — ' +
-   'this is the exact window adversarial review found (gate stops blocking duplicates at staleMin, ' +
-   'a bare status guard would still let this run flip minutes later and double-bill)', () => {
+   'this is the exact window adversarial review found (the gate\'s PREPARING arm stops blocking ' +
+   'duplicates at that same window, and a bare status guard would still let this run flip minutes ' +
+   'later and double-bill)', () => {
   const filter = buildRunningFlipFilter(RUN_ID, { now: NOW, staleMin: STALE_MIN });
   const doc = { _id: RUN_ID, status: 'preparing', startedAt: minAgo(20) };
   assert.strictEqual(matches(doc, filter), false);
@@ -405,17 +433,26 @@ ok('E3 config/defaults.env declares PREPARE_STALE_MIN and it AGREES with the cod
 
 // ── Group F — adversarial-review round 2 findings.
 //
-// F1: REAP_STALE_MIN's gate-side parse (routes/ads.js) is now load-bearing
-// for whether ANY generation succeeds (buildRunningFlipFilter's age guard),
-// not just for duplicate-detection leniency. The naive `Number(env || 15)`
+// F1: the gate-side parse in routes/ads.js must never regress to the naive
+// idiom. CORRECTED 2026-08-18: this header used to say REAP_STALE_MIN was
+// load-bearing for whether ANY generation succeeds via
+// buildRunningFlipFilter's age guard. That is no longer true — the flip is fed
+// PREPARE_STALE_MIN (see D4/G0), so the "total generation outage" failure mode
+// belongs to that var now. REAP_STALE_MIN is still load-bearing, but for the
+// OTHER money direction: it bounds the gate's running arm, so a nonsense value
+// blinds the gate to in-flight runs that are actively billing and admits a
+// silent duplicate. Both vars go through the same parser and the checks below
+// exercise it, which is why they still live here. The naive `Number(env || 15)`
 // idiom checks the RAW STRING's truthiness before parsing, so '0',
 // whitespace, or a negative value all skip the `|| 15` fallback (they are
-// non-empty strings, hence truthy) and collapse the flip's startedAt guard
-// to `>= now` (or a future instant) — which NO real run can ever satisfy.
-// That is a silent, total generation outage: every claim succeeds, every
-// flip fails, every ad is quietly released. This mirrors the same env-
-// parsing trap CLAUDE.md documents for PMAX_PROOF_* ("blank env is 0, not
-// NaN") — and REAP_STALE_MIN lives dashboard-only (not in
+// non-empty strings, hence truthy) and collapse whichever guard consumes them
+// to `>= now` (or a future instant) — which no real run can ever satisfy. On
+// the PREPARE_STALE_MIN side that is a silent, total generation outage (every
+// claim succeeds, every flip fails, every ad is quietly released); on the
+// REAP_STALE_MIN side it empties the gate's running arm, so every in-flight
+// billing run becomes invisible and duplicates are admitted silently. This
+// mirrors the same env-parsing trap CLAUDE.md documents for PMAX_PROOF_*
+// ("blank env is 0, not NaN") — and REAP_STALE_MIN lives dashboard-only (not in
 // config/defaults.env), exactly where a human might "set it to 0 to
 // disable staleness", the intuitive and catastrophic move.
 //
@@ -498,8 +535,73 @@ ok('F2 nothing ever $sets startedAt on an existing CampaignRun (only CampaignRun
 // at a swept set of ages, so they fail if the two windows are ever fed
 // different values — including by a future caller that passes reapStaleMin() to
 // one of them again.
-const G_PREP_MIN = 30;
-const G_RUN_MIN  = 15;
+// ── LIVE WIRING EXTRACTION ────────────────────────────────────────────────
+//
+// G1-G3 used to be driven by hardcoded constants, which Grok's honesty audit
+// correctly flagged as too weak: feeding the pure functions a literal 30 proves
+// the FUNCTIONS are coherent but says nothing about what routes/ads.js actually
+// passes them, so a live mis-wire (flip fed `staleMin`) sailed past G1/G2/G3 and
+// only D4 caught it. These now resolve the real values by reading the live call
+// sites, mapping each parameter to the local binding it receives and each
+// binding to the parser that produces it, then calling the REAL parser. A
+// swap, a rename, or a default change all flow through into the assertions.
+// Extraction is deliberately NON-THROWING at module scope. An earlier draft
+// asserted here, so a live mis-wire (the flip fed a bare `staleMin`) made the
+// binding unreadable and crashed the whole file before Group G could report —
+// the mutation was "caught" only as a stack trace. Failing to read the wiring
+// is itself a finding, so it is recorded and surfaced by G0 as a normal check.
+function liveBindingFor(paramPattern) {
+  const m = adsSrc.match(paramPattern);
+  return m ? m[1] : null;
+}
+function liveParserFor(binding) {
+  if (!binding) return null;
+  const m = adsSrc.match(new RegExp(`const\\s+${binding}\\s*=\\s*(\\w+)\\(\\)`));
+  return m ? m[1] : null;
+}
+const staleness = require('../services/staleness');
+const PARSERS = {
+  reapStaleMin:    staleness.reapStaleMin,
+  prepareStaleMin: staleness.prepareStaleMin
+};
+// What the FLIP is actually fed, and what each GATE arm is actually fed.
+const flipBinding = liveBindingFor(
+  /buildRunningFlipFilter\(run\._id,\s*\{\s*now:\s*Date\.now\(\),\s*staleMin:\s*(\w+)\s*\}\)/);
+const gatePrepBinding = liveBindingFor(/preparingStaleMin:\s*(\w+)/);
+const gateRunBinding  = liveBindingFor(/runningStaleMin:\s*(\w+)/);
+// Resolve to the number production runs. Falls back to the documented default
+// ONLY so the rest of Group G can still execute and report; G0 is what fails
+// when the wiring itself is unreadable or wrong.
+const resolveLive = (binding, fallback) => {
+  const parser = liveParserFor(binding);
+  return PARSERS[parser] ? PARSERS[parser]() : fallback;
+};
+const G_PREP_MIN = resolveLive(gatePrepBinding, staleness.PREPARE_STALE_MIN_DEFAULT);
+const G_RUN_MIN  = resolveLive(gateRunBinding,  staleness.REAP_STALE_MIN_DEFAULT);
+const G_FLIP_MIN = resolveLive(flipBinding,     staleness.REAP_STALE_MIN_DEFAULT);
+
+ok('G0 [LIVE WIRING] the flip and the gate\'s preparing arm are fed the SAME parser, and running is fed the other', () => {
+  assert.ok(flipBinding,
+    'could not read what the live flip call site is fed — either it no longer passes ' +
+    '{ now, staleMin: <binding> } (D4 covers that) or this check needs re-anchoring');
+  assert.ok(gatePrepBinding && gateRunBinding,
+    'could not read the live buildActiveRunsFilter arm wiring out of routes/ads.js — re-anchor');
+  assert.strictEqual(liveParserFor(flipBinding), 'prepareStaleMin',
+    `the flip is fed \`${flipBinding}\` (from ${liveParserFor(flipBinding)}()) — it must come from prepareStaleMin()`);
+  assert.strictEqual(liveParserFor(gatePrepBinding), 'prepareStaleMin',
+    "the gate's preparing arm must come from prepareStaleMin()");
+  assert.strictEqual(liveParserFor(gateRunBinding), 'reapStaleMin',
+    "the gate's running arm must come from reapStaleMin() — the claimed-doc window");
+  assert.strictEqual(flipBinding, gatePrepBinding,
+    `the flip (${flipBinding}) and the gate's preparing arm (${gatePrepBinding}) must be the SAME binding, ` +
+    'so equality is structural rather than two call sites agreeing by convention');
+  assert.notStrictEqual(gatePrepBinding, gateRunBinding,
+    'the two arms must NOT be fed the same binding — that collapses the split this change exists to make');
+  assert.strictEqual(G_FLIP_MIN, G_PREP_MIN,
+    'the live flip window and the live gate preparing window must resolve to the same number');
+  assert.ok(G_PREP_MIN > G_RUN_MIN,
+    `live values: preparing=${G_PREP_MIN} running=${G_RUN_MIN} — preparing must be the longer window`);
+});
 // Same reaper filter Group B exercises, but at the PREPARING window rather than
 // the Group B fixture's 15 — so G3/G4 assert against the sweep the worker
 // actually runs.
@@ -517,8 +619,10 @@ const preparingRunAged = (ageMin) => ({
   _id: RUN_ID, campaignId: 'camp1', status: 'preparing',
   startedAt: minAgo(ageMin), createdAt: minAgo(ageMin)
 });
+// G_FLIP_MIN, not G_PREP_MIN: the flip is driven by whatever the LIVE flip call
+// site is fed, so a mis-wire changes this value and G1/G2 fail on the real gap.
 const flipAllows  = (ageMin) => matches(preparingRunAged(ageMin),
-  buildRunningFlipFilter(RUN_ID, { now: NOW, staleMin: G_PREP_MIN }));
+  buildRunningFlipFilter(RUN_ID, { now: NOW, staleMin: G_FLIP_MIN }));
 const gateBlocks  = (ageMin) => matches(preparingRunAged(ageMin), gateFilter);
 
 ok('G1 the flip window NEVER outlives the gate window at any age — the double-bill direction is closed', () => {
@@ -549,7 +653,7 @@ ok('G2b [ANTI-VACUITY] G1 is a real constraint: mis-wiring the gate to the RUNNI
   const exposed = [];
   for (let age = 0; age <= 60; age += 1) {
     const canFlip = matches(preparingRunAged(age),
-      buildRunningFlipFilter(RUN_ID, { now: NOW, staleMin: G_PREP_MIN }));
+      buildRunningFlipFilter(RUN_ID, { now: NOW, staleMin: G_FLIP_MIN }));
     if (canFlip && !matches(preparingRunAged(age), misWiredGate)) exposed.push(age);
   }
   assert.ok(exposed.length > 0,
@@ -572,17 +676,100 @@ ok('G4 the guard is still a guard: past the preparing window BOTH the flip and t
   assert.strictEqual(matches(preparingRunAged(31), PREP_FILTER_PREP_WINDOW), true,
     'and the reaper must be willing to stamp it failed for visibility');
 });
-ok('G5 the RUNNING arm is NOT widened — running runs still roll off at the 15m claimed-doc window', () => {
-  const running = (ageMin) => ({
-    _id: 'r2', campaignId: 'camp1', status: 'running',
-    startedAt: minAgo(ageMin), createdAt: minAgo(ageMin)
-  });
-  assert.strictEqual(matches(running(10), gateFilter), true, 'a live running run is in flight');
-  assert.strictEqual(matches(running(20), gateFilter), false,
-    'a running run past REAP_STALE_MIN must roll off at 15 — raising it here would delay orphan requeue, ' +
-    'which is explicitly out of scope for the preparing-window change');
+// A running run, described by the two clocks independently: mint age vs
+// silence. The P0 lived entirely in the gap between them.
+const runningRun = ({ mintAgeMin, silenceMin }) => ({
+  _id: 'r2', campaignId: 'camp1', status: 'running',
+  startedAt: minAgo(mintAgeMin), createdAt: minAgo(mintAgeMin),
+  updatedAt: minAgo(silenceMin)
+});
+
+ok('G5 the RUNNING arm keys on LIVENESS (updatedAt), not mint age — the window VALUE stays REAP_STALE_MIN=15', () => {
+  // REWORKED 2026-08-18. This check previously asserted "a running run past 15
+  // rolls off" while modelling age with createdAt — which PINNED THE P0 as
+  // intended behaviour. The window value is unchanged at 15; the CLOCK is what
+  // was wrong. What must roll off is a run that has gone SILENT for 15 min, not
+  // one that was merely minted 15 min ago.
+  assert.strictEqual(matches(runningRun({ mintAgeMin: 10, silenceMin: 1 }), gateFilter), true,
+    'a young, actively heartbeating run is in flight');
+  assert.strictEqual(matches(runningRun({ mintAgeMin: 120, silenceMin: 1 }), gateFilter), true,
+    'a 2-HOUR-OLD run that beat one minute ago is ALIVE and must stay gate-visible — ' +
+    'this is the cliff the createdAt clock created, and long batches are now the norm ' +
+    '(MAX_CREATIVES_PER_RUN is effectively uncapped)');
+  assert.strictEqual(matches(runningRun({ mintAgeMin: 120, silenceMin: 20 }), gateFilter), false,
+    'a run silent for 20 min is presumed dead and must leave the gate');
+  assert.strictEqual(matches(runningRun({ mintAgeMin: 16, silenceMin: 16 }), gateFilter), false,
+    'and the window VALUE is still 15, not widened');
   assert.strictEqual(matches(preparingRunAged(20), gateFilter), true,
-    'while a PREPARING run of the same age is still in flight — that asymmetry is the whole point');
+    'meanwhile a PREPARING run of 20m mint age is still in flight — that asymmetry is the whole point');
+});
+ok('G5b [P0 TIMELINE] the run that flips at t=18 stays gate-visible the instant it starts billing', () => {
+  // The confirmed money hole, reproduced end to end. Raising the preparing
+  // window is what makes the t=18 flip SUCCEED; if the running arm still keyed
+  // on createdAt, the newly-legal 15-30min flip band would be exactly the band
+  // in which the run is invisible to the gate while runRenderLoop submits
+  // billable statics. A duplicate would then be admitted with no 409 and no
+  // confirm, and static identityDigest is scoped by generationRunId so the
+  // unique index does not catch it — this gate is the only protection.
+  const FLIP_AT = 18;
+  const justFlipped = {
+    _id: RUN_ID, campaignId: 'camp1', status: 'running',
+    startedAt: minAgo(FLIP_AT), createdAt: minAgo(FLIP_AT),
+    updatedAt: minAgo(0)          // the flip's own $set refreshes updatedAt
+  };
+  assert.strictEqual(flipAllows(FLIP_AT), true,
+    'precondition: the 30m preparing window must let an 18m expansion win its flip');
+  assert.strictEqual(matches(justFlipped, gateFilter), true,
+    'THE P0: a run that just flipped at t=18 and is now submitting billable work must still be ' +
+    'visible to the gate — otherwise a duplicate /generate is admitted silently and both bill');
+
+  // And prove it stays visible for as long as it keeps beating, across the
+  // whole newly-legal flip band.
+  for (let flipAge = 15; flipAge <= 30; flipAge += 1) {
+    const beating = {
+      _id: RUN_ID, campaignId: 'camp1', status: 'running',
+      startedAt: minAgo(flipAge), createdAt: minAgo(flipAge), updatedAt: minAgo(1)
+    };
+    assert.strictEqual(matches(beating, gateFilter), true,
+      `a run that flipped at t=${flipAge} and is beating must be gate-visible while it bills`);
+  }
+});
+ok('G5c [ANTI-VACUITY] the OLD createdAt clock really does open that hole', () => {
+  // Guards G5/G5b from passing for the wrong reason. Reconstructs the previous
+  // running arm (createdAt-keyed) and asserts the just-flipped billing run is
+  // invisible to it — i.e. the P0 reproduces on the old code.
+  const oldStyleRunningArm = {
+    campaignId: 'camp1',
+    status: 'running',
+    createdAt: { $gte: new Date(NOW.getTime() - G_RUN_MIN * 60 * 1000) }
+  };
+  const justFlipped = {
+    _id: RUN_ID, campaignId: 'camp1', status: 'running',
+    startedAt: minAgo(18), createdAt: minAgo(18), updatedAt: minAgo(0)
+  };
+  assert.strictEqual(matches(justFlipped, oldStyleRunningArm), false,
+    'if this now MATCHES, the old clock was not actually blind and G5b is testing nothing');
+});
+ok('G5d the gate\'s running arm is the SAME predicate as the worker\'s running reaper — same field, same bound', () => {
+  // The whole justification for 15 on the running arm is "gate-visible iff the
+  // reaper would spare it". That only holds if both test updatedAt. worker.js's
+  // sweep is { status:'running', updatedAt: { $lt: cutoff } }; the gate arm is
+  // its complement. Assert they partition, on real doc shapes.
+  const runningArm = gateFilter.$or.find((a) => a.status === 'running');
+  assert.ok(runningArm.updatedAt && runningArm.updatedAt.$gte,
+    'the gate running arm must bound updatedAt, not createdAt — otherwise it cannot mirror the reaper');
+  assert.ok(!runningArm.createdAt, 'the running arm must NOT also constrain mint age');
+  assert.ok(/status:\s*'running',\s*\n?\s*updatedAt:\s*\{\s*\$lt:/.test(workerSrc)
+    || /'running'[\s\S]{0,200}updatedAt:\s*\{\s*\$lt:/.test(workerSrc),
+  'worker.js\'s running reaper must still key on updatedAt $lt — if it moved, this arm must move with it');
+  const reaperCutoff = new Date(NOW.getTime() - G_RUN_MIN * 60 * 1000);
+  for (const silence of [0, 5, 14, 15, 16, 30]) {
+    const doc = runningRun({ mintAgeMin: 99, silenceMin: silence });
+    const gateSees = matches(doc, gateFilter);
+    const reaperWouldReap = doc.updatedAt < reaperCutoff;
+    assert.strictEqual(gateSees, !reaperWouldReap,
+      `silence ${silence}m: gate-visible (${gateSees}) must be the exact complement of reaper-reaps (${reaperWouldReap})`);
+  }
 });
 ok('G6 buildActiveRunsFilter refuses a nonsense window instead of emitting an arm that matches nothing', () => {
   // A missing/blank/negative minute value would otherwise produce new Date(NaN)
@@ -591,10 +778,18 @@ ok('G6 buildActiveRunsFilter refuses a nonsense window instead of emitting an ar
   for (const bad of [undefined, null, '', '   ', '0', '-5', 'abc']) {
     const f = buildActiveRunsFilter({ campaignId: 'camp1', now: NOW, runningStaleMin: bad, preparingStaleMin: bad });
     for (const arm of f.$or) {
-      const cutoff = arm.createdAt.$gte;
+      // Each arm bounds its OWN clock: preparing→createdAt (mint age),
+      // running→updatedAt (liveness). Read whichever this arm declares, and
+      // require it to declare exactly one.
+      const clocks = ['createdAt', 'updatedAt'].filter((k) => arm[k] !== undefined);
+      assert.strictEqual(clocks.length, 1,
+        `arm ${JSON.stringify(arm.status)} must bound exactly one clock, found ${JSON.stringify(clocks)}`);
+      const cutoff = arm[clocks[0]].$gte;
       assert.ok(cutoff instanceof Date && Number.isFinite(cutoff.getTime()),
         `${JSON.stringify(bad)} produced an Invalid Date cutoff — that arm matches nothing and the gate is half-off`);
     }
+    assert.strictEqual(matches(runningRun({ mintAgeMin: 99, silenceMin: 1 }), f), true,
+      `${JSON.stringify(bad)} must still leave a live, beating running run gate-visible`);
     assert.strictEqual(matches(preparingRunAged(5), f), true,
       `${JSON.stringify(bad)} must fall back to the documented default, still catching a 5m-old preparing run`);
   }

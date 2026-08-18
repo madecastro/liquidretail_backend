@@ -20,12 +20,24 @@
  * already asserted the invariant in a comment ("the two cannot drift into
  * disagreeing about what stale means"); a single parser is what enforces it.
  *
- * The money case is 0 / blank / whitespace / negative: REAP_STALE_MIN keys
- * buildRunningFlipFilter's age guard, so a value that collapses to <= 0 makes
- * `startedAt >= now` unsatisfiable and turns EVERY Generate into "pay for
- * Director + Judge, claim the ads, discard all of them" — a silent total
- * generation outage. It is dashboard-only, which is exactly where "set it to 0
- * to disable" is the intuitive and catastrophic move.
+ * The money case is 0 / blank / whitespace / negative, and BOTH vars have one
+ * (corrected 2026-08-18 — this header used to attribute the flip guard to
+ * REAP_STALE_MIN, which stopped being true when the preparing lifecycle moved
+ * to its own window):
+ *
+ *   PREPARE_STALE_MIN keys buildRunningFlipFilter's age guard, so a value that
+ *     collapses to <= 0 makes `startedAt >= now` unsatisfiable and turns EVERY
+ *     Generate into "pay for Director + Judge, claim the ads, discard all of
+ *     them" — a silent total generation outage.
+ *   REAP_STALE_MIN bounds the concurrency gate's RUNNING arm (and the reapers).
+ *     A value that collapses to <= 0 empties that arm, so a run that is
+ *     actively submitting billable work is invisible to the gate and a
+ *     duplicate /generate is admitted with no 409 and no confirm — a double
+ *     bill rather than an outage.
+ *
+ * REAP_STALE_MIN is dashboard-only and PREPARE_STALE_MIN ships in
+ * config/defaults.env; either is somewhere "set it to 0 to disable" is the
+ * intuitive and catastrophic move.
  *
  * Run: node scripts/verifyStalenessParser.js   (no DB, no network, no key)
  */

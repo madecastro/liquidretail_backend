@@ -17,10 +17,16 @@
 //
 //   preparingStaleMin (PREPARE_STALE_MIN, 30) governs the whole 'preparing'
 //     lifecycle — buildStalePreparingFilter, buildRunningFlipFilter's age
-//     guard, AND the 'preparing' arm of buildActiveRunsFilter.
+//     guard, AND the 'preparing' arm of buildActiveRunsFilter. All three key
+//     on MINT AGE (startedAt/createdAt), because a preparing run never writes
+//     to its own row.
 //   runningStaleMin  (REAP_STALE_MIN, 15) governs claimed work — the Ad
 //     reaper, the 'running' run reaper, and the 'running' arm of
-//     buildActiveRunsFilter.
+//     buildActiveRunsFilter. These key on LIVENESS (updatedAt). The gate's
+//     running arm and the worker's running reaper therefore share BOTH the
+//     number AND the clock, which is what makes "the gate sees it" and "the
+//     reaper would spare it" the same statement. They are not merely tuned to
+//     the same value — they are the same predicate on the same field.
 //
 // THE INVARIANT, stated once here and enforced behaviourally by
 // scripts/verifyPreparingReap.js Group G: the window in which the flip is
@@ -83,10 +89,65 @@ function buildTerminalDoneFilter(id) {
  * the preparing side move to 30 while running stays at 15 — no widening of the
  * running window, no delay to orphan requeue.
  *
+ * ⚠️ THE TWO ARMS USE DIFFERENT CLOCKS, AND THAT IS THE POINT.
+ *
+ *   preparing → createdAt (MINT AGE). A preparing run makes zero writes to its
+ *     own row between mint and the flip, so updatedAt === createdAt for the
+ *     whole expansion. Mint age is its only available clock.
+ *   running   → updatedAt (LIVENESS). A running run heartbeats: every per-ad
+ *     $inc(succeeded|failed|skipped) is an update on a timestamps:true schema,
+ *     so mongoose refreshes updatedAt (verified against mongoose 7.8.7 — a bare
+ *     $inc really does get $set:{updatedAt} injected), and the flip's own $set
+ *     refreshes it too.
+ *
+ * KEYING THE RUNNING ARM ON createdAt WAS A CONFIRMED P0 (found by adversarial
+ * review, 2026-08-18, and it is reachable precisely BECAUSE the preparing window
+ * was raised to 30):
+ *
+ *   t=0     run A minted, preparing. Gate's preparing arm sees it → duplicates 409.
+ *   t=18    expansion finishes; the flip CAS now SUCCEEDS (that is the fix).
+ *           Row becomes status:'running'; createdAt is still t=0.
+ *           runRenderLoop starts submitting BILLABLE statics.
+ *   t=18+ε  duplicate /generate arrives. Preparing arm: status mismatch.
+ *           Running arm on createdAt: 18 > 15 → MISS. The gate sees NO active
+ *           run, admits the duplicate SILENTLY (no 409, no confirm), and it
+ *           mints and bills its own statics. Static ads scope identityDigest by
+ *           generationRunId, so the unique index does not catch it and this gate
+ *           is the ONLY protection (CLAUDE.md §2).
+ *
+ * Before the 15→30 change the t=18 flip LOST its CAS, so only one side ever
+ * billed; raising the window is what makes the 15-30min band newly legal, and
+ * that band is exactly the band a createdAt-keyed running arm is blind to.
+ * The same blindness ALSO pre-existed for fast expansions (flip at t=2, batch
+ * still rendering past t=15 → gate-blind while actively billing), which matters
+ * far more now that MAX_CREATIVES_PER_RUN is effectively uncapped at 1000 and
+ * long batches are the norm. Both are closed by the same one-word change.
+ *
+ * On updatedAt, gate visibility becomes exactly "the reaper would not reap
+ * this": worker.js's running sweep is
+ * `{ status:'running', updatedAt: { $lt: cutoff } }` on the SAME
+ * REAP_STALE_MIN. Same number, same clock, same meaning — alive. A live run
+ * stays visible however old its mint is; a dead one leaves the gate at the
+ * instant the reaper's cutoff passes.
+ *
+ * KNOWN RESIDUAL, pre-existing and NOT introduced here: CampaignRun has no
+ * periodic heartbeat of its own (the 60s setInterval in routes/ads.js beats the
+ * Ad row, not this one), so updatedAt only moves when an ad in the wave
+ * settles. A wave in which every concurrent render stalls near
+ * AI_DIRECT_IMAGE_TIMEOUT_MS (900s ≈ REAP_STALE_MIN) could therefore go quiet
+ * long enough to be reaped while genuinely alive. That is the REAPER's liveness
+ * gap and it is unchanged by this filter — matching the reaper is still strictly
+ * better than the old createdAt arm, which was blind to liveness entirely.
+ *
  * Index note: models/CampaignRun.js declares { campaignId:1, status:1,
- * createdAt:-1 }. Each arm is an exact status equality plus a createdAt range,
- * so both are single contiguous ranges on that compound index — if anything a
- * better fit than the previous $in.
+ * createdAt:-1 }. The preparing arm is an exact status equality plus a
+ * createdAt range — a single contiguous range on that index. The running arm
+ * now ranges on updatedAt, which that index does not cover, so it is a
+ * status-bounded scan of one campaign's runs. Acceptable and deliberate: the
+ * leading campaignId+status keys make the candidate set a single campaign's
+ * running runs (in practice 0-2 rows), and correctness here is worth more than
+ * an index-only probe. Add { campaignId:1, status:1, updatedAt:-1 } if a
+ * campaign ever accumulates enough running rows to matter.
  *
  * Minutes are validated through the SAME parser the env getters use
  * (services/staleness.positiveMinutes) rather than trusted raw: a missing or
@@ -106,8 +167,11 @@ function buildActiveRunsFilter({
   return {
     campaignId,
     $or: [
+      // MINT AGE — a preparing run never writes to its own row.
       { status: 'preparing', createdAt: { $gte: since(preparingStaleMin, PREPARE_STALE_MIN_DEFAULT) } },
-      { status: 'running',   createdAt: { $gte: since(runningStaleMin,   REAP_STALE_MIN_DEFAULT) } }
+      // LIVENESS — must mirror worker.js's running reaper exactly, which keys
+      // on updatedAt. createdAt here was the 2026-08-18 P0; see the JSDoc.
+      { status: 'running',   updatedAt: { $gte: since(runningStaleMin,   REAP_STALE_MIN_DEFAULT) } }
     ]
   };
 }
@@ -165,10 +229,19 @@ function buildStalePreparingFilter({ now, staleMin }) {
  * expansion finally finishes and this flip — checking only {_id,
  * status:'preparing'} — would have succeeded too, billing a second time
  * for the same operator intent. Passing `staleMin` closes this: the flip
- * refuses at the exact instant the gate stopped honoring its exclusivity,
- * regardless of reaper cadence. `staleMin` is optional only so the pure-logic
- * tests can exercise the bare status guard in isolation; every real caller
- * must pass it.
+ * refuses at the exact instant the gate's PREPARING ARM stopped honoring its
+ * exclusivity, regardless of reaper cadence. `staleMin` is optional only so the
+ * pure-logic tests can exercise the bare status guard in isolation; every real
+ * caller must pass it.
+ *
+ * SCOPE OF THAT "exact instant" CLAIM — it is about the PREPARING arm only.
+ * Once this flip succeeds the run is 'running', and the gate tracks it on the
+ * OTHER arm, which keys on updatedAt/liveness rather than mint age. So the
+ * handoff is: preparing-by-mint-age → (flip) → running-by-liveness. Both sides
+ * of that handoff must be continuous, which is why the flip's own $set
+ * refreshes updatedAt and hands the running arm a fresh clock. An earlier
+ * version of this comment claimed the flip and "the gate" agreed full stop;
+ * that overstated it and helped hide the createdAt P0 on the running arm.
  *
  * ⚠️ `staleMin` HERE MEANS THE PREPARING WINDOW (PREPARE_STALE_MIN, 30) — NOT
  * REAP_STALE_MIN. Corrected 2026-08-18, and the correction is the whole point

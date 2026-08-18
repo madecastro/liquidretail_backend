@@ -518,24 +518,39 @@ router.post('/generate', async (req, res) => {
     // ceilings and they are deliberately different numbers — see
     // services/campaignRunGuards.js buildActiveRunsFilter:
     //
-    //   'running'   → REAP_STALE_MIN (15), the same bound worker.js uses to
-    //                 reclaim stuck ads and running runs, so the two cannot
-    //                 drift into disagreeing about what "stale" means.
-    //   'preparing' → PREPARE_STALE_MIN (30), because a preparing run does not
-    //                 heartbeat and its healthy runtime (Director + Judge,
-    //                 ~18-20 min) exceeds 15. This arm MUST equal the window
-    //                 buildRunningFlipFilter enforces below, or a duplicate is
-    //                 admitted while the original can still flip — double bill.
+    //   'running'   → REAP_STALE_MIN (15) on updatedAt — the SAME number and
+    //                 the SAME clock worker.js's running reaper uses, so "the
+    //                 gate sees it" and "the reaper would spare it" are one
+    //                 statement. A live batch heartbeats via every per-ad $inc.
+    //   'preparing' → PREPARE_STALE_MIN (30) on createdAt (mint age), because a
+    //                 preparing run makes no writes at all and its healthy
+    //                 runtime (Director + Judge, ~18-20 min) exceeds 15. This
+    //                 arm MUST equal the window buildRunningFlipFilter enforces
+    //                 below, or a duplicate is admitted while the original can
+    //                 still flip — double bill.
     //
-    // PARSED IN ONE PLACE — services/staleness.js. This var is load-bearing for
-    // whether generation succeeds AT ALL (buildRunningFlipFilter's age guard),
-    // not just for duplicate-detection leniency: '0', whitespace or a negative
-    // collapse the flip's startedAt guard to `>= now` (or a future instant),
-    // which NO real run's startedAt can satisfy — turning every Generate into
-    // "pay for Director/Judge, claim ads, discard everything", a total silent
-    // generation outage. REAP_STALE_MIN is dashboard-only (not in
-    // config/defaults.env), which is exactly where "set it to 0 to disable
-    // staleness" is the intuitive and catastrophic move.
+    // PARSED IN ONE PLACE — services/staleness.js.
+    //
+    // WHAT EACH VAR IS LOAD-BEARING FOR (corrected 2026-08-18 — this block used
+    // to attribute the flip's age guard to REAP_STALE_MIN, which is no longer
+    // true and was the defect):
+    //
+    //   prepareMin (PREPARE_STALE_MIN) — load-bearing for whether generation
+    //     succeeds AT ALL. '0', whitespace or a negative collapse the flip's
+    //     startedAt guard to `>= now` (or a future instant), which NO real run's
+    //     startedAt can satisfy, turning every Generate into "pay for
+    //     Director/Judge, claim ads, discard everything" — a total silent
+    //     generation outage.
+    //   staleMin (REAP_STALE_MIN) — load-bearing for duplicate detection on
+    //     RUNNING runs, and for the Ad/running-run reapers in worker.js. A
+    //     nonsense value here does not break the flip, but it does blind the
+    //     gate to in-flight billing runs, which is a double-bill.
+    //
+    // Both fall back to their documented default rather than being honoured,
+    // which is the whole reason the shared parser exists. REAP_STALE_MIN is
+    // dashboard-only; PREPARE_STALE_MIN ships in config/defaults.env. Either is
+    // somewhere "set it to 0 to disable staleness" is the intuitive and
+    // catastrophic move.
     //
     // It is read through the shared parser rather than clamped inline because
     // worker.js's reaper keys off the SAME bound, and the two used to parse it
@@ -800,9 +815,11 @@ router.post('/generate', async (req, res) => {
     setImmediate(async () => {
       let adIds;
       try {
-        // SELF-STATUS CHECK before spending a cent. The gate only considers
-        // preparing runs younger than PREPARE_STALE_MIN, so a run wedged in
-        // 'preparing' past that window stops holding its products — a sibling
+        // SELF-STATUS CHECK before spending a cent. The gate considers a
+        // preparing run only while it is younger than PREPARE_STALE_MIN by mint
+        // age (a running run is tracked separately, and stays visible for as
+        // long as it keeps heartbeating within REAP_STALE_MIN). So a run wedged
+        // in 'preparing' past that window stops holding its products — a sibling
         // Generate for the SAME
         // products is then allowed. If this run later wakes up and expands
         // anyway, both bill. Re-reading our own status makes that terminal: a run

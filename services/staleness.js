@@ -84,8 +84,15 @@ function positiveMinutes(raw, fallback) {
 /**
  * How long a CLAIMED doc (Ad 'rendering', CampaignRun 'running') may sit
  * untouched before the reaper presumes its holder died — AND the window inside
- * which the concurrency gate still honours a RUNNING run's exclusivity. Those
- * must be the same number; see the module header.
+ * which the concurrency gate still honours a RUNNING run's exclusivity.
+ *
+ * Those two are the same NUMBER and, since 2026-08-18, the same CLOCK: both the
+ * reaper's running sweep and buildActiveRunsFilter's running arm test
+ * `updatedAt >= now - this`. "Untouched" is meant literally — a running run
+ * heartbeats through every per-ad $inc (mongoose refreshes updatedAt on a
+ * timestamps:true schema), so this measures SILENCE, not total runtime. The
+ * gate's running arm keying on createdAt instead was a confirmed double-bill P0;
+ * see buildActiveRunsFilter's JSDoc for the timeline.
  *
  * SCOPE, corrected 2026-08-18: this no longer governs 'preparing' runs. The
  * flip guard and the gate's preparing arm moved to prepareStaleMin() because
@@ -112,6 +119,12 @@ function reapStaleMin() {
  *                                      i.e. how long a preparing run still
  *                                      blocks an identical duplicate request
  *
+ * All three key on MINT AGE. That is forced, not chosen: a preparing run makes
+ * no writes to its own row, so there is no liveness signal to key on. Once the
+ * flip lands the run is tracked by the OTHER window (reapStaleMin) on
+ * updatedAt, and the flip's own $set refreshes that clock so the handoff has
+ * no gap.
+ *
  * WHY (b) AND (c) MUST BE THE SAME NUMBER. Let Wg be how long the gate still
  * counts a preparing run as in-flight, and Wf how long that run may still win
  * its flip. If Wf > Wg there is a live double-bill window: between Wg and Wf
@@ -127,9 +140,13 @@ function reapStaleMin() {
  * stamps a few ms later — see buildRunningFlipFilter's JSDoc. That leans the
  * safe way by milliseconds.)
  *
- * Keeping it a SEPARATE KNOB from reapStaleMin() is what makes 30 affordable:
- * RUNNING-run reaping and the Ad-level reaper stay at 15, so orphan requeue is
- * not delayed. Only the preparing lifecycle moves.
+ * Keeping it a SEPARATE KNOB from reapStaleMin() is what makes 30 affordable.
+ * The Ad-level reaper and the RUNNING-run reaper both stay at 15 on updatedAt,
+ * so no claimed doc waits longer to be requeued than it did before: this knob
+ * cannot reach them. What DOES stay in 'preparing' up to 30 min is a wedged
+ * expansion — and that row holds no claimed ads and no recoverable spend (see
+ * worker.js), so the extra 15 minutes costs visibility latency on an alert,
+ * not delayed recovery of work.
  */
 function prepareStaleMin() {
   return positiveMinutes(process.env.PREPARE_STALE_MIN, PREPARE_STALE_MIN_DEFAULT);

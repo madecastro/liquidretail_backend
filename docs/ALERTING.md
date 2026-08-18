@@ -193,10 +193,21 @@ Non-secret, all in `config/defaults.env`, all overridable per-service:
 There are **two** staleness windows, not one, and only the first is the one
 these alert thresholds are tuned against:
 
-| Window | Default | Governs |
-|---|---|---|
-| `REAP_STALE_MIN` | `15` | **Claimed** work — `Ad` in `rendering`, `CampaignRun` in `running`. Both heartbeat, so 15m of silence really is a dead holder. |
-| `PREPARE_STALE_MIN` | `30` | The **preparing** lifecycle — mint → the `preparing`→`running` flip. Raised from 15 on 2026-08-18: a preparing run makes no writes at all, and its healthy runtime (Director + Judge) is **~18-20 min**, so 15 was failing expansions that were merely finishing. Non-secret, so it lives in `config/defaults.env`. |
+| Window | Default | Clock | Governs |
+|---|---|---|---|
+| `REAP_STALE_MIN` | `15` | `updatedAt` (**silence**) | **Claimed** work — `Ad` in `rendering`, `CampaignRun` in `running`. Both heartbeat, so 15m of silence really is a dead holder. Also bounds the concurrency gate's `running` arm, which uses the same field and bound as the reaper so that "gate-visible" and "the reaper would spare it" are one statement. |
+| `PREPARE_STALE_MIN` | `30` | `createdAt`/`startedAt` (**mint age**) | The **preparing** lifecycle — mint → the `preparing`→`running` flip. Mint age is the only available clock because a preparing run makes no writes to its own row. Raised from 15 on 2026-08-18: the healthy runtime (Director + Judge) is **~18-20 min**, so 15 was failing expansions that were merely finishing. Non-secret, so it lives in `config/defaults.env`. |
+
+The clock column is load-bearing. Keying the gate's `running` arm on mint age
+instead of silence was a confirmed double-bill P0 (a run that flipped at t=18
+was invisible to the gate the moment it started submitting billable work, so a
+duplicate was admitted silently). Note the consequence for alerting: because
+`CampaignRun` has **no periodic heartbeat of its own** — the 60s beat in
+`routes/ads.js` refreshes the `Ad` row, not the run — a run's `updatedAt` only
+moves when an ad in the wave settles. A wave where every concurrent render
+stalls near `AI_DIRECT_IMAGE_TIMEOUT_MS` (900s, ≈ `REAP_STALE_MIN`) can
+therefore look silent while alive. That is a pre-existing reaper liveness gap,
+not something the window change introduced.
 
 `ALERT_RENDERING_STALE_MIN` and `ALERT_RUN_SILENCE_MIN` must stay strictly below
 **`REAP_STALE_MIN`** — unchanged by the preparing bump, which touched neither
