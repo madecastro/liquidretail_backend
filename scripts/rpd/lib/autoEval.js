@@ -207,6 +207,9 @@ async function evalRun(runDir, {
   // pricier model would blow the ceiling silently while the notes still claimed
   // 'ad-vision-qc' — adversarial finding, 2026-08-18. So resolve the EFFECTIVE
   // model, record that, and refuse to spend on an unrecognised one.
+  // Two hops, because resolveQcModel returns the ROLE name unless an env
+  // override is set, and the role only becomes a real slug via atlasModelMap.
+  // Checking the role string alone refused every normal run (measured).
   let effectiveModel = model;
   if (!deps.model) {
     try {
@@ -214,10 +217,16 @@ async function evalRun(runDir, {
       if (typeof resolveQcModel === 'function') effectiveModel = resolveQcModel() || model;
     } catch { /* keep the role name */ }
   }
+  let resolvedSlug = effectiveModel;
+  try {
+    const { resolveModel } = require('../../../services/atlasModelMap');
+    const r = resolveModel(effectiveModel);
+    if (r && r.atlas) resolvedSlug = r.atlas;
+  } catch { /* fall back to whatever we have */ }
   const CALIBRATED = /gemini-2\.5-(pro|flash)/;
-  if (!deps.chatCompletion && !deps.judgeRender && !CALIBRATED.test(String(effectiveModel))) {
+  if (!deps.chatCompletion && !deps.judgeRender && !CALIBRATED.test(String(resolvedSlug))) {
     throw new Error(
-      `rpd eval: the vision model resolves to "${effectiveModel}", which the per-cell budget ceiling ` +
+      `rpd eval: the vision model resolves to "${resolvedSlug}" (role "${effectiveModel}"), which the per-cell budget ceiling ` +
       `(static $${EVAL_COST_CEILING_USD.static} / video $${EVAL_COST_CEILING_USD.video}) was not calibrated for. ` +
       'Unset ATLAS_MODEL_AD_VISION_QC / AD_VISION_QC_MODEL, or measure that model and update ' +
       'EVAL_COST_CEILING_USD deliberately — a ceiling that under-states real spend is not a budget.'
@@ -270,7 +279,7 @@ async function evalRun(runDir, {
       auto: true,
       // The EFFECTIVE model, not the role name: a repointed role must be
       // visible on the verdict that it produced.
-      model: effectiveModel,
+      model: resolvedSlug,
       text: summarizeVerdict(out.verdict)
     });
     cell.autoEval = out.verdict;
@@ -282,7 +291,7 @@ async function evalRun(runDir, {
 
   manifest.autoEval = {
     at: new Date().toISOString(),
-    model: effectiveModel,
+    model: resolvedSlug,
     role: model,
     graded,
     budgetUsd: maxUsd,
