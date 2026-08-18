@@ -31,6 +31,10 @@ const CatalogProduct = require('../models/CatalogProduct');
 const CropArtifact = require('../models/CropArtifact');
 const Campaign     = require('../models/Campaign');
 const CampaignRun  = require('../models/CampaignRun');
+// Read-only here — reconciled per-run spend for the completion summary
+// (slackVerbosity.buildRunCompletionSummaryLines). Never written from this
+// route; costTracker.js owns all CostLog writes.
+const CostLog      = require('../models/CostLog');
 const {
   expandWizardJob,
   selectAdsForRun,
@@ -75,6 +79,12 @@ const alerts   = require('../services/alertService');
 const inFlight = require('../services/inFlight');
 const { adStage } = require('../services/adStage');
 const runFeed  = require('../services/runFeedService');
+// Pure Slack-message builders (run-completion per-kind summary, claim-anomaly
+// alert, uncapped-batch run-start line) — see services/slackRunVerbosity.js
+// header for why these are pulled out of this file: no Mongo/network at
+// require-time, so scripts/verifySlackRunVerbosity.js can assert the real
+// strings without booting the route.
+const slackVerbosity = require('../services/slackRunVerbosity');
 const { tenantFilter, assertBrandInTenant, assertCampaignInTenant } = require('../middleware/tenantHelpers');
 const {
   generationGateDecision, normalizeProductIdList, pickSupersedingRun,
@@ -1034,6 +1044,22 @@ router.post('/generate', async (req, res) => {
           // reliably released, which is the exact lie /runs's anomaly branch
           // exists to avoid.
           console.error(`🚨 [campaignRun ${runId}] ${claim.error}`);
+          // Fire-and-forget, fatal/alert channel (NOT the per-run status
+          // feed — this is the rare "should never fire" claim anomaly, not
+          // routine run progress). alertService.notifyAsync never throws
+          // and is never awaited on this claim path.
+          const anomalyAlert = slackVerbosity.buildClaimAnomalyAlert({
+            runId,
+            campaignId,
+            selectedCount: preClaimCount,
+            modifiedCount: claim.modifiedCount
+          });
+          alerts.notifyAsync({
+            level: 'fatal',
+            title: anomalyAlert.title,
+            key:   `claim-anomaly:${runId}`,
+            fields: anomalyAlert.fields
+          });
           await CampaignRun.updateOne(
             { _id: run._id },
             { status: 'failed', completedAt: new Date(),
@@ -1542,6 +1568,11 @@ async function runRenderLoop(run, job, adIds, renderToken) {
     runId:   run.runId,
     brandId: job.brandId,
     total:   adIds.length,
+    // Kind mix for the uncap context line (slackVerbosity.buildRunStartLine)
+    // — only changes the thread text when total exceeds the old
+    // MAX_CREATIVES_PER_RUN cap of 20; below that it stays byte-identical.
+    staticCount: otherIds.length,
+    veoCount:    veoIds.length,
     adIds
   });
 
@@ -1554,7 +1585,8 @@ async function runRenderLoop(run, job, adIds, renderToken) {
     // Best-effort label enrichment — still fire-and-forget.
     runFeed.startRun({
       runId: run.runId, brandId: job.brandId, brandName: brandDoc.name,
-      total: adIds.length, adIds
+      total: adIds.length, staticCount: otherIds.length, veoCount: veoIds.length,
+      adIds
     });
   }
   const progressRun = await startRun({
@@ -1697,13 +1729,47 @@ async function runRenderLoop(run, job, adIds, renderToken) {
   );
   const totalMs = Date.now() - t0;
   inFlight.untrack(run.runId);
-  const final = await CampaignRun.findById(run._id).select('succeeded skipped failed errors').lean();
+  const final = await CampaignRun.findById(run._id)
+    .select('succeeded skipped failed errors mintedTotal unclaimedAtStart')
+    .lean();
   if (cancelled) await progressRun.markCancelled(`Stopped — ${final?.succeeded || 0} finished, rest skipped`);
   else await progressRun.succeed({ succeeded: final?.succeeded || 0, skipped: final?.skipped || 0, failed: final?.failed || 0 });
   console.log(
     `🎉 [campaignRun ${run.runId}] done in ${totalMs}ms — ` +
     `${final?.succeeded || 0} succeeded · ${final?.skipped || 0} skipped · ${final?.failed || 0} failed${cancelled ? ' (cancelled by operator)' : ''}`
   );
+
+  // Per-kind completion summary for the run feed's final update — CLAUDE.md
+  // §00/§2 money-truthfulness rules apply: never quote base_price/the
+  // estimate formula as spend, and label an estimate as "est." explicitly.
+  // Reuses mintedTotal/unclaimedAtStart already persisted at claim time
+  // (does not recompute them) and derives kind from renderRoute +
+  // deriveFromMaster on the run's own claimed ads. Wrapped in its own
+  // try/catch — a reporting bug here must never surface in the outer
+  // catch, which would re-mark this already-'done' run as 'failed'.
+  let summaryLines = [];
+  try {
+    const [finalAds, costRows] = await Promise.all([
+      Ad.find({ _id: { $in: adIds } }).select('status renderRoute deriveFromMaster').lean(),
+      CostLog.aggregate([
+        { $match: { adId: { $in: adIds } } },
+        { $group: { _id: '$costSource', usd: { $sum: '$costUsd' } } }
+      ]).catch(() => [])
+    ]);
+    const kindCounts = slackVerbosity.summarizeClaimedAdKinds(finalAds);
+    const reconciledUsd = (costRows.find((r) => r._id === 'actual')?.usd) || 0;
+    const estimatedUsd  = (costRows.find((r) => r._id === 'estimated')?.usd) || 0;
+    summaryLines = slackVerbosity.buildRunCompletionSummaryLines({
+      mintedTotal:      final?.mintedTotal || 0,
+      claimedTotal:     adIds.length,
+      unclaimedAtStart: final?.unclaimedAtStart || 0,
+      kindCounts,
+      reconciledUsd,
+      estimatedUsd
+    });
+  } catch (err) {
+    console.warn(`⚠️  [campaignRun ${run.runId}] completion summary failed (non-fatal): ${err.message}`);
+  }
 
   // Slack feed close-out — fire-and-forget. Detached interval posts the
   // final parent update + any remaining thread events.
@@ -1713,7 +1779,8 @@ async function runRenderLoop(run, job, adIds, renderToken) {
     skipped:   final?.skipped || 0,
     failed:    final?.failed || 0,
     totalMs,
-    cancelled
+    cancelled,
+    summaryLines
   });
 
   // Report batches that finished with losses. An operator-cancelled run is
