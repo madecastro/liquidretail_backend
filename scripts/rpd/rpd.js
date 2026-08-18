@@ -21,18 +21,20 @@ const path = require('path');
 
 // OFFLINE-SAFE LEDGER WRITES. The image path (atlasImageService.submitAndPoll)
 // calls recordFlatCost → costTracker.persistCost → CostLog.create at its charge
-// point. That write is already wrapped in a try/catch, but with NO mongoose
-// connection the default `bufferCommands: true` makes it HANG for
-// bufferTimeoutMS (10s) per submit before the catch ever runs — turning a
-// 4-cell static batch into 40s of dead waiting after the money was spent.
-// Failing the write fast lets the existing catch log it and move on, which is
-// the intended behaviour for a harness that keeps its own ledger in
-// manifest.json. Only when we are NOT connecting at all (no DB seed mode).
-if (!process.env.MONGODB_URI) {
-  try {
-    require('mongoose').set('bufferCommands', false);
-  } catch { /* mongoose absent is fine — nothing to disable */ }
-}
+// point. That write is wrapped in a try/catch, but with no mongoose CONNECTION
+// the default `bufferCommands: true` queues it instead of failing: the process
+// then refuses to exit until bufferTimeoutMS (10s) after the last write.
+//
+// GATED ON THE COMMAND, NOT ON MONGODB_URI (adversarial finding, 2026-08-18):
+// keying off the env var was wrong twice over — this repo's `.env` almost
+// always HAS a URI, so the guard never fired on the common run; and when a spec
+// does use DB seed mode we genuinely connect, so real CostLog rows are written
+// and buffering must stay on. What actually matters is whether THIS invocation
+// connects, which only DB seed mode does — and that is a property of the spec,
+// resolved below. Default to no buffering and let dbSeed re-enable it.
+try {
+  require('mongoose').set('bufferCommands', false);
+} catch { /* mongoose absent is fine — nothing to disable */ }
 
 function flag(args, name) {
   return args.some((a) => a === name || a.startsWith(`${name}=`));

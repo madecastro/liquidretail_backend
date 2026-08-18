@@ -261,7 +261,9 @@ function assertBudget(cells, maxUsd) {
   for (const c of submittable) {
     if (c.estUsd == null || !Number.isFinite(c.estUsd)) {
       c.status = 'skipped';
-      c.error = 'no pricing data in MODEL_CAPS — refusing a live submit at an unknown price';
+      // Static cells carry a specific reason (unmeasured quality/size/model);
+      // video cells fall back to the generic MODEL_CAPS message.
+      c.error = c.priceRefusal || 'no pricing data in MODEL_CAPS — refusing a live submit at an unknown price';
     }
   }
   const live = cells.filter((c) => c.status === 'planned');

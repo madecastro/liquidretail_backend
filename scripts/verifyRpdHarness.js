@@ -399,11 +399,15 @@ const codeOnly = (src) => src
     }
   };
 
-  check('S1 allowFallback:false is hardcoded, never spec-controlled', () => {
+  check('S1 allowFallback:false is hardcoded in CODE, never spec-controlled', () => {
     // The default `true` catches an Atlas failure and resubmits to direct
     // OpenAI — a second billable generation on a different model.
-    assert(/allowFallback:\s*false/.test(staticSrc), 'staticRunner must pass allowFallback: false');
-    assert(!/allowFallback:\s*(?!false)[a-zA-Z]/.test(staticSrc), 'allowFallback must not be read from the spec/variant');
+    // codeOnly: the header comment explains this rule and used to satisfy the
+    // check on its own, so deleting the real literal still passed (adversarial
+    // finding). S2 proves delivery; this proves it is not spec-controlled.
+    const code = codeOnly(staticSrc);
+    assert(/allowFallback:\s*false/.test(code), 'staticRunner must pass a literal allowFallback: false');
+    assert(!/allowFallback:\s*(?!false)[a-zA-Z]/.test(code), 'allowFallback must not be read from the spec/variant');
   });
   await checkAsync('S2 allowFallback:false actually reaches the image service', async () => {
     const cells = expandStaticCells(staticSpec);
@@ -422,38 +426,61 @@ const codeOnly = (src) => src
   await checkAsync('S3 a receipt from the callback SURVIVES a later throw (crash mid-poll)', async () => {
     const cells = expandStaticCells(staticSpec);
     const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'rpd-s3-'));
+    // REAL writeManifest, not a no-op: the claim is "reaches manifest.json", and
+    // a stubbed persist proved only an in-memory field (adversarial finding).
     await runStaticCells(cells, {
       runDir: tmp,
-      manifest: { cells },
+      manifest: { name: 's3', cells, observations: [] },
       // Fire the charge-point callback, THEN fail — exactly the window that
       // loses a receipt when the id is only read from the return value.
       edit: async ({ meta }) => { meta.onPredictionId('pred_static_1'); throw new Error('poll died'); },
-      persist: () => {},
       log: { log: () => {}, error: () => {}, warn: () => {} }
     });
     assert.strictEqual(cells[0].status, 'failed');
     assert.deepStrictEqual(cells[0].predictionIds, ['pred_static_1']);
     assert.strictEqual(cells[0].charged, true, 'a submit id means the money committed');
+    const onDisk = JSON.parse(fs.readFileSync(path.join(tmp, 'manifest.json'), 'utf8'));
+    assert.deepStrictEqual(onDisk.cells[0].predictionIds, ['pred_static_1'],
+      'the receipt must be ON DISK, not just on the in-memory cell');
+    fs.rmSync(tmp, { recursive: true, force: true });
   });
   await checkAsync('S4 multiple receipts accumulate (the retry wrapper may resubmit)', async () => {
     const cells = expandStaticCells(staticSpec);
+    const tmp4 = fs.mkdtempSync(path.join(os.tmpdir(), 'rpd-s4-'));
+    const est = cells[0].estUsd;
     await runStaticCells(cells, {
-      runDir: fs.mkdtempSync(path.join(os.tmpdir(), 'rpd-s4-')),
-      manifest: { cells },
+      runDir: tmp4,
+      manifest: { name: 's4', cells, observations: [] },
       edit: async ({ meta }) => {
         meta.onPredictionId('pred_a');
         meta.onPredictionId('pred_a');   // duplicate must not double-record
         meta.onPredictionId('pred_b');
         throw new Error('stop');
       },
-      persist: () => {},
       log: { log: () => {}, error: () => {}, warn: () => {} }
     });
     assert.deepStrictEqual(cells[0].predictionIds, ['pred_a', 'pred_b']);
+    // A SECOND accepted submit is a second billable task. Counting one estimate
+    // for two receipts made the extra charge invisible in the spend line
+    // (adversarial finding) — cost must scale with receipts.
+    assert(Math.abs(cells[0].costUsd - est * 2) < 1e-6,
+      `two receipts must cost ~2x one estimate (got ${cells[0].costUsd} vs ${est})`);
+    const onDisk4 = JSON.parse(fs.readFileSync(path.join(tmp4, 'manifest.json'), 'utf8'));
+    assert.deepStrictEqual(onDisk4.cells[0].predictionIds, ['pred_a', 'pred_b']);
+    fs.rmSync(tmp4, { recursive: true, force: true });
   });
-  check('S5 static prices come from a measured table, never catalog base_price', () => {
-    assert(Number.isFinite(estimateStaticCostUsd('openai/gpt-image-2/edit')));
+  check('S5 static prices are the MEASURED figures, and only for measured arms', () => {
+    // Pin the values: asserting only "is finite" let the table be replaced with
+    // the catalog's 0.01 (measured ~7x low) and still pass (adversarial finding).
+    assert.strictEqual(estimateStaticCostUsd('openai/gpt-image-2/edit'), 0.0718);
+    assert.strictEqual(estimateStaticCostUsd('openai/gpt-image-2-developer/edit'), 0.0359);
     assert.strictEqual(estimateStaticCostUsd('some/unpriced-model'), null);
+    // quality and size both move the real price and are operator-settable, so an
+    // unmeasured combination must be refused rather than priced at the medium
+    // figure (gpt-image-1 is documented low $0.011 / medium $0.042 / high $0.167).
+    assert.strictEqual(estimateStaticCostUsd('openai/gpt-image-2/edit', { quality: 'high' }), null);
+    assert.strictEqual(estimateStaticCostUsd('openai/gpt-image-2/edit', { size: '4096x4096' }), null);
+    assert.strictEqual(estimateStaticCostUsd('openai/gpt-image-2/edit', { quality: 'medium', size: '1024x1024' }), 0.0718);
     // Scan for USAGE, not prose: the file explains in a comment why the catalog
     // figure is unusable, and a naive substring match on that sentence would
     // fail this check for documenting the very rule it enforces.
@@ -461,15 +488,24 @@ const codeOnly = (src) => src
     assert(!/require\([^)]*\)\s*\.\s*buildPriceMap|buildPriceMap\s*[,}]/.test(staticSrc), 'must not import buildPriceMap');
     assert(!/[.[]\s*['"]?base_price/.test(staticSrc), 'must not read a base_price field');
   });
-  check('S5b offline ledger writes fail fast instead of hanging 10s per submit', () => {
-    // The image charge point writes CostLog. With no mongoose connection the
-    // default bufferCommands:true stalls that write for bufferTimeoutMS before
-    // the existing catch runs — after the money is already spent.
-    const cliSrc = read(path.join(RPD, 'rpd.js'));
-    assert(/bufferCommands'?\s*,\s*false|set\('bufferCommands', false\)/.test(cliSrc),
-      'the CLI must disable mongoose command buffering when MONGODB_URI is absent');
-    assert(/if \(!process\.env\.MONGODB_URI\)/.test(cliSrc),
-      'it must be conditional — DB seed mode still needs buffering');
+  check('S5b ledger writes fail fast by default; DB seed mode re-enables buffering', () => {
+    // The image charge point writes CostLog. With no mongoose CONNECTION the
+    // default bufferCommands:true queues that write and holds the process open
+    // for bufferTimeoutMS after the money is spent.
+    // Gating this on MONGODB_URI was wrong twice (adversarial finding): the repo
+    // .env almost always has a URI so the guard never fired, and DB seed mode
+    // genuinely connects and needs buffering. It is now unconditional in the
+    // CLI, and dbSeed — the only path that connects — turns it back on.
+    const cliSrc = codeOnly(read(path.join(RPD, 'rpd.js')));
+    assert(/set\('bufferCommands', false\)/.test(cliSrc), 'the CLI must disable command buffering');
+    assert(!/if \(!process\.env\.MONGODB_URI\)\s*\{\s*try\s*\{\s*require\('mongoose'\)/.test(cliSrc),
+      'it must NOT be gated on MONGODB_URI — that guard never fires on a normal run');
+    const seedSrc = codeOnly(read(path.join(RPD, 'lib', 'dbSeed.js')));
+    assert(/set\('bufferCommands', true\)/.test(seedSrc),
+      'dbSeed connects, so it must restore buffering before querying');
+    const bufIdx = seedSrc.indexOf("set('bufferCommands', true)");
+    const connIdx = seedSrc.indexOf('mongoose.connect(');
+    assert(bufIdx !== -1 && connIdx !== -1 && bufIdx < connIdx, 'restore buffering BEFORE connecting');
   });
   check('S6 an unpriced static model is refused live, not submitted', () => {
     const cells = expandStaticCells({
@@ -506,6 +542,40 @@ const codeOnly = (src) => src
       () => buildForStaticCell({ spec: staticSpec, model: 'm', variant: { id: 'y', blocks: { SCENE_PRESERVE: 'z' } } }),
       /is not present in this prompt/
     );
+  });
+  check('S8b blocks:{} is an error, not a silent baseline', () => {
+    // {} selected the lever, replaced nothing, and reported lever:'blocks' with a
+    // null diff — a baseline masquerading as an arm (adversarial finding).
+    assert.throws(
+      () => buildForStaticCell({ spec: staticSpec, model: 'm', variant: { id: 'e', blocks: {} } }),
+      /replaces nothing/
+    );
+  });
+  await checkAsync('V5 a repointed vision model is refused, not silently over-budget', async () => {
+    // The per-cell ceiling is calibrated for gemini-2.5-pro; ATLAS_MODEL_AD_VISION_QC
+    // can repoint the role at something far pricier (adversarial finding).
+    const { evalRun } = require(path.join(RPD, 'lib', 'autoEval'));
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'rpd-v5-'));
+    const cellDir = path.join(tmp, 'cells', 'c1');
+    fs.mkdirSync(cellDir, { recursive: true });
+    fs.writeFileSync(path.join(cellDir, 'plate.png'), Buffer.from('89504e470d0a1a0a', 'hex'));
+    fs.writeFileSync(path.join(tmp, 'manifest.json'), JSON.stringify({
+      name: 'v5', spec: { seed: { url: 'https://example.test/s.jpg' } },
+      cells: [{ id: 'c1', kind: 'static', status: 'done', localPath: path.join('cells', 'c1', 'plate.png'), notes: [] }],
+      observations: []
+    }));
+    const prev = process.env.ATLAS_MODEL_AD_VISION_QC;
+    process.env.ATLAS_MODEL_AD_VISION_QC = 'anthropic/claude-opus-5-ccmax';
+    try {
+      await assert.rejects(
+        evalRun(tmp, { maxUsd: 1, log: { log: () => {}, warn: () => {}, error: () => {} } }),
+        /not calibrated for/
+      );
+    } finally {
+      if (prev === undefined) delete process.env.ATLAS_MODEL_AD_VISION_QC;
+      else process.env.ATLAS_MODEL_AD_VISION_QC = prev;
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
   });
   check('S9 an intent downgrade is surfaced, never hidden', () => {
     // social_proof_led needs a rating; without one resolveIntent falls back.

@@ -64,6 +64,11 @@ async function resolveSeedFromDb(productId) {
     throw new Error('rpd: productId is required');
   }
   const productOid = productOidFrom(productId);
+  // The CLI disables command buffering so offline ledger writes fail fast
+  // instead of holding the process open. This path DOES connect, so restore the
+  // default — a query issued while the connection is still opening must queue,
+  // not throw.
+  mongoose.set('bufferCommands', true);
   await mongoose.connect(process.env.MONGODB_URI);
   try {
     const product = await CatalogProduct.findById(productOid)

@@ -155,6 +155,16 @@ function buildForStaticCell({ spec, model, variant }) {
     if (!variant.blocks || typeof variant.blocks !== 'object' || Array.isArray(variant.blocks)) {
       throw new Error('rpd: variant.blocks must be an object of {BLOCK_NAME: newText}');
     }
+    // An EMPTY object selected the lever, replaced nothing, and reported
+    // `lever: blocks` with a null diff — a silent baseline masquerading as an
+    // experiment arm (adversarial finding, 2026-08-18). Same class as the
+    // unknown-key error, so it fails the same way.
+    if (!Object.keys(variant.blocks).length) {
+      throw new Error(
+        `rpd: static variant "${variant.id}" sets blocks: {} — that replaces nothing and would report ` +
+        `a baseline prompt as a "blocks" arm. Name a block (${Object.keys(PATCHABLE_BLOCKS).join(', ')}) or drop the lever.`
+      );
+    }
     prompt = applyBlockReplacements(baseline, variant.blocks);
   } else {
     if (!Array.isArray(variant.patch) || variant.patch.length === 0) {

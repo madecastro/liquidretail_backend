@@ -201,6 +201,28 @@ async function evalRun(runDir, {
   // atlasModelMap. Never pass a bare legacy id like gpt-4o here — those are
   // silently rerouted to a different model.
   const model = deps.model || 'ad-vision-qc';
+
+  // The per-cell ceiling below is calibrated for gemini-2.5-pro. That role can
+  // be REPOINTED by env (ATLAS_MODEL_AD_VISION_QC / AD_VISION_QC_MODEL), and a
+  // pricier model would blow the ceiling silently while the notes still claimed
+  // 'ad-vision-qc' — adversarial finding, 2026-08-18. So resolve the EFFECTIVE
+  // model, record that, and refuse to spend on an unrecognised one.
+  let effectiveModel = model;
+  if (!deps.model) {
+    try {
+      const { resolveQcModel } = require('../../../services/adVisionQcService');
+      if (typeof resolveQcModel === 'function') effectiveModel = resolveQcModel() || model;
+    } catch { /* keep the role name */ }
+  }
+  const CALIBRATED = /gemini-2\.5-(pro|flash)/;
+  if (!deps.chatCompletion && !deps.judgeRender && !CALIBRATED.test(String(effectiveModel))) {
+    throw new Error(
+      `rpd eval: the vision model resolves to "${effectiveModel}", which the per-cell budget ceiling ` +
+      `(static $${EVAL_COST_CEILING_USD.static} / video $${EVAL_COST_CEILING_USD.video}) was not calibrated for. ` +
+      'Unset ATLAS_MODEL_AD_VISION_QC / AD_VISION_QC_MODEL, or measure that model and update ' +
+      'EVAL_COST_CEILING_USD deliberately — a ceiling that under-states real spend is not a budget.'
+    );
+  }
   const brandName = (manifest.spec && manifest.spec.titling && manifest.spec.titling.brandName) || null;
   const seedUrl = manifest.spec && manifest.spec.seed ? manifest.spec.seed.url : null;
   if (!seedUrl) throw new Error('rpd eval: the manifest has no seed url to compare against');
@@ -246,7 +268,9 @@ async function evalRun(runDir, {
     cell.notes.push({
       at: new Date().toISOString(),
       auto: true,
-      model,
+      // The EFFECTIVE model, not the role name: a repointed role must be
+      // visible on the verdict that it produced.
+      model: effectiveModel,
       text: summarizeVerdict(out.verdict)
     });
     cell.autoEval = out.verdict;
@@ -258,11 +282,15 @@ async function evalRun(runDir, {
 
   manifest.autoEval = {
     at: new Date().toISOString(),
-    model,
+    model: effectiveModel,
+    role: model,
     graded,
     budgetUsd: maxUsd,
     estimatedSpendUsd: Number(spent.toFixed(4)),
-    note: 'estimatedSpendUsd charges a conservative per-check ceiling, not a settled price'
+    note: 'estimatedSpendUsd charges a per-check CEILING, not a settled price. atlasLlmService may '
+      + 'retry (ATLAS_LLM_MAX_ATTEMPTS) and can fall back to a direct provider, so a single check can '
+      + 'cost more than one call — treat this as an order-of-magnitude bound, and the model gate above '
+      + 'as what keeps it honest.'
   };
   writeManifest(runDir, manifest);
   log.log(`\nrpd eval: graded ${graded}/${targets.length} cell(s), ≤ ~$${spent.toFixed(2)} of eval budget.`);

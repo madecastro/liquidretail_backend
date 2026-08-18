@@ -46,9 +46,38 @@ const STATIC_PRICE_USD = {
   'openai/gpt-image-2-developer/edit': 0.0359
 };
 
-function estimateStaticCostUsd(model) {
+// The measured points are all `quality: 'medium'`, and only at these sizes.
+// ADVERSARIAL FINDING (2026-08-18): the table was keyed on model alone while
+// `quality` and `size` are operator-settable and both move the real price —
+// this repo documents gpt-image-1 at low $0.011 / medium $0.042 / high $0.167,
+// so a `quality: 'high'` cell authorised at the medium figure could settle
+// several times over the cap AFTER the POST. gpt-image-2 at high was never
+// measured. So an estimate is only offered for the arms we actually measured;
+// anything else is priced `null`, which assertBudget turns into a refusal.
+const MEASURED_QUALITY = 'medium';
+const MEASURED_SIZES = new Set(['1024x1024', '1088x1360', '2048x1152', '1152x2048']);
+
+function estimateStaticCostUsd(model, { quality = MEASURED_QUALITY, size = null } = {}) {
   const v = STATIC_PRICE_USD[model];
-  return Number.isFinite(v) ? v : null;
+  if (!Number.isFinite(v)) return null;
+  if (quality !== MEASURED_QUALITY) return null;
+  if (size && !MEASURED_SIZES.has(size)) return null;
+  return v;
+}
+
+// Why a cell was refused a price — surfaced so the operator can fix the spec
+// instead of guessing why a cell was skipped.
+function priceRefusalReason(model, { quality, size }) {
+  if (!Number.isFinite(STATIC_PRICE_USD[model])) {
+    return `no measured price for ${model} — refusing a live submit at an unknown price ` +
+           `(measured: ${Object.keys(STATIC_PRICE_USD).join(', ')})`;
+  }
+  if (quality !== MEASURED_QUALITY) {
+    return `quality "${quality}" has never been measured for ${model} — only "${MEASURED_QUALITY}" has a ` +
+           'settled figure, and image prices scale steeply with quality, so the budget gate cannot ' +
+           'honestly authorise this. Measure it with one deliberate submit first, then add it to the table.';
+  }
+  return `size ${size} has no measured price — the gate would authorise it at another size's figure`;
 }
 
 function shortModel(model) {
@@ -97,9 +126,12 @@ function expandStaticCells(spec) {
         // WITHOUT the 9:16 video crop — the image model gets the seed as-is and
         // `size` carries the target geometry.
         cell.imageUrls = [spec.seed.url, ...(spec.seed.refs || [])];
-        cell.estUsd = estimateStaticCostUsd(model);
+        cell.estUsd = estimateStaticCostUsd(model, { quality: cell.quality, size: cell.size });
         if (cell.estUsd == null) {
-          cell.priceUnknown = true; // assertBudget turns this into a skip
+          // assertBudget turns a null estimate into a skip; carry the REASON so
+          // the dry run explains itself rather than just refusing.
+          cell.priceUnknown = true;
+          cell.priceRefusal = priceRefusalReason(model, { quality: cell.quality, size: cell.size });
         }
       } catch (err) {
         cell.status = 'skipped';
@@ -140,12 +172,32 @@ async function runStaticCells(submittable, {
             cell.predictionIds.push(id);
             cell.predictionId = id;              // latest, for display
             cell.submittedAt = cell.submittedAt || new Date().toISOString();
-            cell.costUsd = cell.estUsd;
+            // ONE ESTIMATE PER RECEIPT. submitAndPollWithRetry legitimately
+            // re-POSTs on a `predictionFailed` policy (which Atlas states is
+            // refunded), and an earlier version kept a single estimate here —
+            // so a second billable task would have been invisible in the spend
+            // line. Counting per receipt OVER-reports if the refund is real,
+            // which is the safe direction; `resume` reconciles each receipt
+            // against Atlas's settled price afterwards.
+            cell.costUsd = Number((cell.estUsd * cell.predictionIds.length).toFixed(4));
             cell.costSource = 'estimated';
             cell.charged = true;                  // a submit id means money committed
+            if (cell.predictionIds.length > 1) {
+              log.warn(
+                `  ⚠️  ${cell.id}: Atlas accepted a SECOND submit (${id}) after a failed prediction — ` +
+                `${cell.predictionIds.length} receipts now counted. Atlas states failed tasks are refunded; ` +
+                'verify against the settled prices before quoting spend.'
+              );
+            }
             try {
               persist(runDir, manifest);
             } catch (err) {
+              // Same severity as the video path, which ABORTS on this: a billed
+              // id that never reached disk is invisible to `resume`. The
+              // callback cannot throw usefully (atlasImageService swallows it),
+              // so flag the cell and let the caller fail the run after the call
+              // returns.
+              cell.receiptPersistFailed = `${id}: ${err.message}`;
               log.error(
                 `  🚨 rpd: SPEND RECEIPT COULD NOT BE FLUSHED — prediction ${id} for ${cell.id} ` +
                 `is BILLED but not on disk. Record it manually. (${err.message})`
@@ -191,6 +243,15 @@ async function runStaticCells(submittable, {
       cell.status = 'done';
       cell.settledAt = new Date().toISOString();
       persist(runDir, manifest);
+      // A receipt that never reached disk is the one failure the video path
+      // treats as fatal; match it here now that the call has returned and we
+      // can throw meaningfully.
+      if (cell.receiptPersistFailed) {
+        throw new Error(
+          `rpd: a billable receipt for ${cell.id} could not be persisted (${cell.receiptPersistFailed}) — ` +
+          'stopping so the id is not lost. The plate is on disk; record the prediction id before re-running.'
+        );
+      }
       const cost = cell.costSource === 'actual' ? `$${cell.costUsd.toFixed(4)}` : `~$${(cell.costUsd || 0).toFixed(4)} est`;
       log.log(`  ✅ ${cell.id}: done ${cost}`);
     } catch (err) {
