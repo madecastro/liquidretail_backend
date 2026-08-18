@@ -5,6 +5,66 @@ lines of chronological accretion; it is now organised by *what is true* rather t
 *what happened when*. History is compressed at the bottom — anything not listed there
 was judged superseded and dropped **deliberately**, not lost.
 
+## 2026-08-18 — RPD harness: model × prompt A/B outside the Ad pipeline (`scripts/rpd/`)
+
+Branch `claude/rpd-harness`, PR #__. Owner asked for a "rapid product development harness": build
+test ads on the real pipeline primitives, race video models against each other, iterate prompt
+changes (system values / intent prompts) **without a redeploy**, optionally title with the
+production defaults, and publish a gallery with notes to Cloudflare Pages. Agents should be able
+to run it in a bounded loop.
+
+**What landed.** `scripts/rpd/` (CLI + 8 lib modules + example specs + README),
+`scripts/verifyRpdHarness.js` (29 checks, revert-proven ×6), a one-symbol export addition in
+`atlasVideoService` (`submitGeneration` — so the harness bills through the PRODUCTION submit path:
+`pacedModelSubmit`, structured-429-only retry, `maxRedirects:0`), and `.gitignore` for `rpd-runs/`.
+Cells = spec.models × spec.variants. Levers map 1:1 to production: `guidance` (=
+`videoPromptGuidance` prepend), `raw` (= `videoPromptRaw` full replace), `directives`
+(patch-build-restore of `OMNI/GROK/PMAX/LIFESTYLE_DIRECTIVES` — measure a directive change BEFORE
+it is committed), `patch` (find-once string surgery). Baseline is byte-identical to
+`buildVeoPrompt` for the same fixture (pinned). Per-cell telemetry for time forecasting:
+promptBuild, **Cloudinary transform probes** (cold derivation vs warm cache per reference URL —
+the same fetch Atlas pays on the production path), submit round-trip incl. pacing,
+queue→terminal, Atlas's own `executionTime`/`timings`, download ms/bytes, titling stage timings.
+
+**Money model (all pinned).** Dry-run default; `--live` requires `--max-usd`; Σ floor-grade
+estimates ≤ cap before ANY submit; non-finite estimate = unpriced = refused; requested resolution
+must be in the model's enum (a "4K" typo used to be PRICED at the 720p fallback and SUBMITTED
+verbatim); receipts flushed OUTSIDE the submit catch so a persistence failure can never
+reclassify a billed submit as failed (it aborts loudly with the receipt printed); `rpd resume`
+finishes runs free and is structurally incapable of spending; settled Atlas `price` is the
+reported spend. UNVERIFIED `MODEL_CAPS` rates (Grok 1.5/1.0, Veo 3.1) run with a loud warning —
+the README no longer claims they are refused.
+
+**Adversarial review (Grok, high effort) paid for itself again** — 4 money findings in code that
+was already hand-written + 25-checks green: NaN-estimate cap bypass, resolution-typo underpricing,
+two receipt-loss windows (kill between submit-return and flush; persist-throw clobbering a billed
+cell to `failed` where resume ignores it), and a README claim ("unverified pricing is refused")
+the code did not implement. All fixed; `submitCells` was refactored with injectable submit/persist
+so the receipt invariants are FUNCTIONALLY tested, not regex-scanned. Known residual (same as
+prod): an axios timeout after Atlas accepted the POST leaves no id anywhere — unrecoverable at
+this layer.
+
+**Validation run (live, measured).** `rpd-validation-crossfade-ab`: Omni developer i2v, 4s 1080p
+9:16, baseline vs "hard cuts" transitions patch, black RestoMods tee seed. Both cells settled at **$0.45**
+($0.90 total under a $1.50 cap; formula said $0.60 — ~25% over at 4s, same direction as the
+known 10s figure). Telemetry: cold Cloudinary transform 1044ms; submit 76ms vs 1182ms (pacing
+wait visible in the number); queue→terminal 91–122s; downloads ~120ms for 5.9/7.7MB; Atlas
+publishes executionTime=0 on this model (provider-side timings unusable — use queueToTerminalMs).
+MEASURED RESULT: the transitions directive is live-effective — baseline shows mid-crossfade
+ghosting at ~1.2s/~2.5s; the one-line hard-cuts patch removed it in every sampled frame. Both
+arms hallucinated a neck-tag view absent from the seed. Titling chrome validated via the resume
+pass; the titling fixture's placeholder quote/rating defaults were REMOVED the same day (a
+defaulted quote is a fabricated testimonial — proof fields render only when supplied; pinned E8).
+Gallery published: https://94a4fbb8.rs-rpd.pages.dev (project rs-rpd.pages.dev; log: scripts/rpd/LEARNINGS.md)
+
+**When is a cell finished under resume?** Same as run: receipt → terminal-ok → master on disk →
+titling pass (resume runs the same free titling pass; failure keeps the master + records
+`titlingError`). Settled price may lag (`costSource:'estimated'`) without blocking `done`.
+
+**Open / deferred:** DB seed mode (pull a product's real feed-primary seed + refs by productId);
+video-seeded (r2v) cells (skipped honestly today); Cloudinary upload of outputs (Pages serves
+local files fine, ≤25MB/file); wiring `rpd` into a scheduled agent loop.
+
 ## 2026-08-17 — `verifyAgentRegistry` GREEN. Five capabilities were DEAD, not dangerous.
 
 Branch `claude/gallant-almeida-a7fb96`. The red harness on main is fixed; suite is **133 / 0**.

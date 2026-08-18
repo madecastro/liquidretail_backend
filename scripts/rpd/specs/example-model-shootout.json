@@ -1,0 +1,21 @@
+{
+  "name": "example-model-shootout",
+  "notes": "Template: same canonical prompt, two models head-to-head. Replace seed.url with a real Cloudinary product image and run dry first.",
+  "seed": {
+    "url": "https://res.cloudinary.com/reach-social-prod/image/upload/REPLACE_ME.jpg",
+    "productTitle": "Example Product",
+    "refs": [],
+    "brandHex": "#101418"
+  },
+  "aspectRatio": "9:16",
+  "durationSec": 8,
+  "resolution": "1080p",
+  "models": [
+    "google/gemini-omni-flash/image-to-video-developer",
+    "xai/grok-imagine-video-v1.5/image-to-video"
+  ],
+  "variants": [
+    { "id": "baseline" }
+  ],
+  "titling": { "enabled": false }
+}

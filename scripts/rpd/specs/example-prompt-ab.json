@@ -1,0 +1,43 @@
+{
+  "name": "example-prompt-ab",
+  "notes": "Template: one model, four prompt levers vs baseline. Each lever maps to a production mechanism — see scripts/rpd/README.md.",
+  "seed": {
+    "url": "https://res.cloudinary.com/reach-social-prod/image/upload/REPLACE_ME.jpg",
+    "productTitle": "Example Product",
+    "refs": [],
+    "brandHex": "#101418"
+  },
+  "aspectRatio": "9:16",
+  "durationSec": 8,
+  "resolution": "1080p",
+  "models": ["google/gemini-omni-flash/image-to-video-developer"],
+  "variants": [
+    { "id": "baseline" },
+    {
+      "id": "hook-first",
+      "guidance": "HOOK-FIRST: the product must be unmistakably identifiable within the first second; the opening frames carry the whole ad."
+    },
+    {
+      "id": "objective-rewrite",
+      "directives": {
+        "objective": "Objective: Create a premium product commercial using subtle Ken Burns camera moves. Open on the tightest compelling detail and pull back to reveal. Must feel luxury while keeping 100% fidelity to the original product."
+      }
+    },
+    {
+      "id": "no-crossfades",
+      "patch": [
+        {
+          "find": "Transitions: Smooth crossfades only, ~0.25s. No wipes, flashes, or animated transitions.",
+          "replace": "Transitions: Hard cuts only. No crossfades, wipes, flashes, or animated transitions."
+        }
+      ]
+    }
+  ],
+  "titling": {
+    "enabled": false,
+    "preset": "canonical",
+    "platformFormat": "meta_stories_9_16",
+    "brandName": "RPD Test",
+    "copy": { "headline": "Example headline", "ctaText": "Shop now" }
+  }
+}

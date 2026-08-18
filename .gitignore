@@ -8,3 +8,5 @@ services/brandScripts/assets/webfonts/
 services/brandScripts/assets/fonts/*.ttf
 .DS_Store
 .drafts/
+# RPD harness run outputs (videos + galleries — never committed)
+rpd-runs/

@@ -4362,5 +4362,11 @@ module.exports = {
   // Resume-from-receipt. Exported for scripts/verifyVideoResume.js, which pins
   // that neither of these can ever submit.
   peekPrediction,
-  resumeForAd
+  resumeForAd,
+  // BILLABLE. Exported for scripts/rpd (rapid product development harness) so
+  // model/prompt A-B runs reuse THIS submit path — pacedModelSubmit spacing,
+  // structured-429-only retry, maxRedirects:0 — instead of re-implementing a
+  // second billable POST. Any new caller must hold its own budget gate before
+  // calling (rpd's is --live + --max-usd; see scripts/verifyRpdHarness.js).
+  submitGeneration
 };
