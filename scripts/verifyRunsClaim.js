@@ -38,6 +38,12 @@
 //   (d) keep the claimAdsForRun call in /generate but drop only its
 //       `claim.kind === 'anomaly'` branch → I5/I6/I8 fail (I3/I4/I7 still
 //       pass — they pin the call itself, independent of the anomaly handling)
+//   (e) [ADVERSARIAL REVIEW FINDING] revert /generate to the old inline claim
+//       while LEAVING the "Use claimAdsForRun() only:" comment above it in
+//       place → I3-I8 still correctly fail (group I strips comments before
+//       matching, and I3/I8 require `await claimAdsForRun(`, not the bare
+//       identifier a comment can also contain) — a naive uncommented regex
+//       would have false-passed I3 on this exact mutation
 
 const fs = require('fs');
 const path = require('path');
@@ -391,21 +397,37 @@ async function main() {
     const end = src.indexOf('async function claimAdsForRun', start);
     checkTrue('I2 claimAdsForRun is defined after /generate (block below is /generate only)', end > start);
     const block = src.slice(start, end);
+    // COMMENTS STRIPPED before every match below. This whole section pins the
+    // WIRING via source text, and this file's own explanatory comments name
+    // the very things they check for (e.g. "Use claimAdsForRun() only:" would
+    // satisfy a naive /claimAdsForRun\s*\(/ test even if the real call were
+    // deleted — caught in adversarial review of this harness itself, same
+    // lesson as verifyPmaxVideoExpansion.js / verifyNoStrandedQueued.js).
+    const blockCode = block
+      .replace(/\/\*[\s\S]*?\*\//g, '')
+      .split('\n').map((l) => l.replace(/\/\/.*$/, '')).join('\n');
 
     // Live path must invoke claimAdsForRun (not a reimplemented claim).
+    // Matches `await claimAdsForRun(` specifically, not just the bare
+    // identifier — belt and suspenders on top of the comment strip.
     checkTrue(
       'I3 /generate calls claimAdsForRun (same function this harness drives)',
-      /claimAdsForRun\s*\(/.test(block)
+      /await\s+claimAdsForRun\s*\(/.test(blockCode)
     );
 
-    // Explicit anti-regression: the OLD inline claim shape (updateMany with
-    // status:'queued' + $addToSet campaignRunIds, immediately followed by a
-    // hand-rolled ownership re-read) must not reappear inside /generate's own
-    // block. claimAdsForRun's definition sits AFTER `end`, so any match
-    // inside `block` is a genuine second copy, not the shared function.
+    // Explicit anti-regression: the OLD inline claim shape must not reappear
+    // inside /generate's own block, in EITHER of its two possible forms —
+    // the original `$addToSet` write, or a `$push` to campaignRunIds, which
+    // would sneak a second claim path past the narrower check (a $push here
+    // is never legitimate: the shared claimAdsForRun always $addToSet's, so
+    // any $push to this field inside /generate's own code is a reimplemented
+    // write). claimAdsForRun's definition sits AFTER `end`, so any match
+    // inside `blockCode` is a genuine second copy, not the shared function.
     check(
-      'I4 [MONEY] /generate does not inline a second claim (no local status:\'queued\' + $addToSet claim write)',
-      /\$addToSet:\s*\{\s*campaignRunIds:\s*runId\s*\}/.test(block),
+      'I4 [MONEY] /generate does not inline a second claim '
+      + "(no local status:'queued' + $addToSet/$push write on campaignRunIds)",
+      /\$addToSet:\s*\{\s*campaignRunIds:\s*runId\s*\}/.test(blockCode)
+        || /\$push:\s*\{\s*campaignRunIds:/.test(blockCode),
       false
     );
 
@@ -414,19 +436,19 @@ async function main() {
     // is the entire point of this fix.
     checkTrue(
       'I5 /generate branches on claim.kind === \'anomaly\'',
-      /kind\s*===\s*['"]anomaly['"]/.test(block)
+      /kind\s*===\s*['"]anomaly['"]/.test(blockCode)
     );
     checkTrue(
       'I6 the anomaly branch marks the run failed (not done — done is the ordinary empty-claim outcome)',
       (() => {
-        const anomalyAt = block.search(/kind\s*===\s*['"]anomaly['"]/);
+        const anomalyAt = blockCode.search(/kind\s*===\s*['"]anomaly['"]/);
         if (anomalyAt < 0) return false;
         // Scope to the branch's own body: from the `kind === 'anomaly'` test
         // to its closing `return;` (the first one after it) — that is
         // exactly the code this branch executes, no more and no less.
-        const returnAt = block.indexOf('return;', anomalyAt);
+        const returnAt = blockCode.indexOf('return;', anomalyAt);
         if (returnAt < 0) return false;
-        const branchBody = block.slice(anomalyAt, returnAt);
+        const branchBody = blockCode.slice(anomalyAt, returnAt);
         return /status:\s*'failed'/.test(branchBody) && !/status:\s*'done'/.test(branchBody);
       })()
     );
@@ -436,8 +458,8 @@ async function main() {
     // section) would defeat the whole point of routing through the shared fn.
     checkTrue(
       'I7 /generate binds adIds from claim.claimedIds (not the pre-claim selection)',
-      /const\s+claimedIds\s*=\s*claim\.claimedIds/.test(block) &&
-        /adIds\s*=\s*claimedIds/.test(block)
+      /const\s+claimedIds\s*=\s*claim\.claimedIds/.test(blockCode) &&
+        /adIds\s*=\s*claimedIds/.test(blockCode)
     );
 
     // Anomaly resolution must precede the ordinary empty-claim branch in
@@ -446,9 +468,9 @@ async function main() {
     checkTrue(
       'I8 /generate resolves the anomaly branch before the ordinary empty-claim message',
       (() => {
-        const claimAt = block.search(/claimAdsForRun\s*\(/);
-        const anomalyAt = block.search(/kind\s*===\s*['"]anomaly['"]/);
-        const ordinaryAt = block.search(/All selected ads were claimed by a concurrent run/);
+        const claimAt = blockCode.search(/await\s+claimAdsForRun\s*\(/);
+        const anomalyAt = blockCode.search(/kind\s*===\s*['"]anomaly['"]/);
+        const ordinaryAt = blockCode.search(/All selected ads were claimed by a concurrent run/);
         return claimAt >= 0 && anomalyAt > claimAt && ordinaryAt > anomalyAt;
       })()
     );

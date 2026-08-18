@@ -467,9 +467,10 @@ Video never launches a browser.
   `aspect_ratio` enum exactly `['16:9','9:16']`; `duration` enum
   `[4,6,8,10]`. Delivered 16:9: **1920×1080, 10.000s, 240 frames**.
 - **`POST /api/ads/runs` must claim atomically** — same money shape as
-  `/generate`. Use `claimAdsForRun()` only: `status:'queued'` filter, ownership
-  re-read (`campaignRunIds` + `rendering`), `modifiedCount` cross-check, and
-  post-claim requeue on throw (`routes/ads.js:645-750`, `:882-902`). Covered by
+  `/generate`. Use `claimAdsForRun()` only (`routes/ads.js:1172`):
+  `status:'queued'` filter, ownership re-read (`campaignRunIds` + `rendering`),
+  `modifiedCount` cross-check, and post-claim requeue on throw in the `/runs`
+  handler (`routes/ads.js:1286`, catch block `:1438-1457`). Covered by
   `scripts/verifyRunsClaim.js` (75 checks, was 67). Do not inline a second claim path —
   **it already is one, closed 2026-08-18.** `/generate`'s inline claim (former
   `routes/ads.js:978-1016`) had no anomaly branch: when `updateMany` reported
@@ -763,6 +764,22 @@ Video never launches a browser.
   with `deriveWaitAttempts > 0` / `renderAttempts:0` is still swept). The
   `deriveWaitAttempts` field + wait-loop wiring is pinned by
   `scripts/verifyPmaxVideoExpansion.js` (81 checks, group G).
+  **Corollary (resource, not money — adversarial review, same day):**
+  `services/strandedRunSweeper.js`'s `findStranded` re-drives ads a SIGTERM
+  stranded in `'queued'` with a `renderStage` breadcrumb whose minting run
+  went `'failed'`, bounded by `renderAttempts < STRANDED_SWEEP_MAX_ATTEMPTS`
+  (3) — a wait-only derive ad used to age out of THAT filter too, accidentally,
+  once the old `renderAttempts` inflation hit 3. Moving the counter to
+  `deriveWaitAttempts` removed that accidental cap: each `requeueStrandedAds`
+  re-pick mints a fresh `CampaignRun` without ever clearing the ORIGINAL
+  failed run out of `campaignRunIds`, so the sweep would keep re-selecting the
+  same ad every pass — up to `MAX_DERIVE_WAIT_ATTEMPTS` (30) submit-free wait
+  cycles instead of the intended ~3, each holding a `VEO_CONCURRENCY` slot for
+  up to `DERIVE_MASTER_WAIT_MS` (12 min). Fixed in the same change:
+  `findStranded`'s ad filter (now the pure, exported `buildStrandedAdFilter`)
+  also requires `deriveWaitAttempts < STRANDED_SWEEP_MAX_ATTEMPTS`. Pinned by
+  `scripts/verifyStrandedSweep.js` group G (behavioural, against the real
+  exported filter — not a stub).
 - ~~**`veoPredictionId` is a spend receipt that is never resumed**~~ — **CLOSED
   2026-08-04** (PRs #70-#72 + the titling resume). The receipt is now polled for
   free and the paid master collected: `services/bootRecoveryService.js` sweeps

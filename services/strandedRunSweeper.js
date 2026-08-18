@@ -33,8 +33,36 @@
 //   · its run is `failed`                  — the shutdown sweep marked it so
 //   · within STRANDED_SWEEP_MAX_AGE_H      — no resurrecting week-old work
 //   · renderAttempts < STRANDED_SWEEP_MAX_ATTEMPTS — a poisoned ad cannot loop
+//   · deriveWaitAttempts < STRANDED_SWEEP_MAX_ATTEMPTS — see below (2026-08-18)
 // The renderStage + failed-run pair is what separates "a deploy killed this" from
 // "an operator has not pressed go yet".
+//
+// ── WHY deriveWaitAttempts IS A SECOND BOUND HERE, NOT JUST ON THE ARCHIVE
+// SWEEPER (2026-08-18) ────────────────────────────────────────────────────
+// A FREE derive-only video ad (deriveFromMaster set) that is mid-wait for its
+// sibling master when a SIGTERM hits gets requeued to 'queued' by
+// processAlerts.js with renderStage still set and its minting run marked
+// 'failed' — exactly the shape this sweeper exists to re-drive. Before
+// 2026-08-18 the wait/requeue loop (renderDeriveOnlyVideoAd, routes/ads.js)
+// $inc'd renderAttempts on every polite requeue, so after ~STRANDED_SWEEP_
+// MAX_ATTEMPTS cycles it aged out of THIS filter too (accidentally — that
+// inflation was never meant to serve this sweeper, it just happened to).
+// Moving that bookkeeping onto deriveWaitAttempts (so the archive sweeper's
+// renderAttempts:0 guard stays honest — see models/Ad.js) removed that
+// accidental cap: renderAttempts now stays 0 through every wait cycle, so
+// without a bound of its own here `findStranded` would keep re-selecting the
+// SAME ad indefinitely. Each `requeueStrandedAds` re-pick mints a NEW
+// CampaignRun and $addToSet's its id onto campaignRunIds WITHOUT removing the
+// original failed run — so the `campaignRunIds: { $in: failedRuns }` match
+// keeps firing on every sweep pass regardless of how many fresh runs have
+// since gone 'done', all the way up to MAX_DERIVE_WAIT_ATTEMPTS (30) wait
+// cycles instead of the intended ~STRANDED_SWEEP_MAX_ATTEMPTS (3). Each cycle
+// is submit-free (renderDeriveOnlyVideoAd never reaches Omni) but it holds a
+// video-lane slot (VEO_CONCURRENCY) for up to DERIVE_MASTER_WAIT_MS (12 min)
+// — so an unbounded loop is a real resource hazard even though it is not a
+// money hazard. Bounding on deriveWaitAttempts too restores the original
+// intent: the sweeper auto-retries a bounded few times, and beyond that it is
+// left for an explicit "Generate more" (POST /runs) or the 24h archive sweep.
 
 const Ad          = require('../models/Ad');
 const CampaignRun = require('../models/CampaignRun');
@@ -55,6 +83,39 @@ const MAX_ATTEMPTS  = Number(process.env.STRANDED_SWEEP_MAX_ATTEMPTS || 3);
 const REQUEUE_ON    = () => truthy(process.env.STRANDED_SWEEP_REQUEUE, true);
 
 /**
+ * The AD-SIDE half of findStranded's query, extracted to a pure function of
+ * the failed-run ids so a harness can evaluate the REAL filter object against
+ * REAL document shapes — the same pattern queuedArchiveSweeper.
+ * buildQueuedArchiveFilter uses, and for the same reason: stubbing out
+ * Ad.find (as the behavioural section below already did before this) tests
+ * the sweep's PROCESSING logic given a fixed candidate list, never whether
+ * the filter itself would have produced that list.
+ *
+ * BOTH attempt bounds apply independently ($and, since two $or clauses
+ * cannot share one object key): renderAttempts < MAX_ATTEMPTS AND
+ * deriveWaitAttempts < MAX_ATTEMPTS. See the module comment above for why a
+ * wait-only derive ad needs its OWN cap now that deriveWaitAttempts, not
+ * renderAttempts, is what its requeue loop increments — without it, this
+ * filter would keep re-selecting the same ad every sweep pass indefinitely
+ * (each re-pick mints a fresh CampaignRun without ever clearing the original
+ * failed run out of campaignRunIds), holding a video-lane slot for up to
+ * DERIVE_MASTER_WAIT_MS on every re-pick even though nothing is ever billed.
+ */
+function buildStrandedAdFilter({ failedRunIds } = {}) {
+  const ids = (Array.isArray(failedRunIds) ? failedRunIds : []).filter(Boolean);
+  return {
+    status: 'queued',
+    campaignRunIds: { $in: ids },
+    // Work had BEGUN. A freshly minted ad awaiting an operator claim has no stage.
+    renderStage: { $nin: [null, ''] },
+    $and: [
+      { $or: [{ renderAttempts: { $lt: MAX_ATTEMPTS } }, { renderAttempts: { $exists: false } }] },
+      { $or: [{ deriveWaitAttempts: { $lt: MAX_ATTEMPTS } }, { deriveWaitAttempts: { $exists: false } }] }
+    ]
+  };
+}
+
+/**
  * Find ads a restart abandoned. Read-only.
  */
 async function findStranded() {
@@ -67,13 +128,8 @@ async function findStranded() {
     .lean();
   if (!failedRuns.length) return { ads: [], runs: [] };
 
-  const ads = await Ad.find({
-    status: 'queued',
-    campaignRunIds: { $in: failedRuns.map(r => r.runId) },
-    // Work had BEGUN. A freshly minted ad awaiting an operator claim has no stage.
-    renderStage: { $nin: [null, ''] },
-    $or: [{ renderAttempts: { $lt: MAX_ATTEMPTS } }, { renderAttempts: { $exists: false } }]
-  }).limit(MAX_ADS).lean();
+  const ads = await Ad.find(buildStrandedAdFilter({ failedRunIds: failedRuns.map(r => r.runId) }))
+    .limit(MAX_ADS).lean();
 
   return { ads, runs: failedRuns };
 }
@@ -238,6 +294,7 @@ function logSweep(out) {
 module.exports = {
   sweepStrandedRuns,
   findStranded,
+  buildStrandedAdFilter,
   settleUnknownCharges,
   ENABLED,
   REQUEUE_ON,

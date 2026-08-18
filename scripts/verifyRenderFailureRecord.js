@@ -121,13 +121,36 @@ console.log('\nD. the render claim is atomic, and ads heartbeat while rendering'
 // This used to match /generate's own inline claim (`{ _id: { $in: adIds },
 // status: 'queued' }`). 2026-08-18: that inline copy was a second claim path
 // CLAUDE.md §2 forbids — /generate now calls the shared claimAdsForRun
-// (routes/ads.js), whose internal filter uses `selectedIds`, not `adIds`.
-// Matching either name keeps this check meaningful across both the historical
-// inline shape and the current shared one; claimAdsForRun's atomicity itself
-// (and that /generate actually calls it) is covered in depth by
-// scripts/verifyRunsClaim.js groups A-I.
-truthy('routes/ads: the claim filters on status queued',
-  /_id:\s*\{\s*\$in:\s*(?:adIds|selectedIds)\s*\},\s*status:\s*'queued'/.test(adsSrc));
+// (routes/ads.js) instead. A first pass just widened the regex to
+// `(?:adIds|selectedIds)` — but /generate no longer has ANY inline filter at
+// all, so that widened check was satisfied by claimAdsForRun's filter alone
+// and would stay green even if /generate grew a SECOND, non-atomic write
+// (adversarial review finding, same day). Retargeted to pin the LIVE shape
+// precisely: (1) the atomic filter inside claimAdsForRun ITSELF, comment-
+// stripped so a comment mentioning the pattern cannot satisfy it, and
+// (2) an explicit absence check that /generate's own block never resurrects
+// an inline claim (`Ad.updateMany` whose `$set` puts a row INTO 'rendering'
+// outside the shared function — the exact old inline shape). claimAdsForRun's
+// atomicity and that /generate calls it are covered in far more depth by
+// scripts/verifyRunsClaim.js groups A-I; this is a second, independent
+// cross-check from a different harness.
+function stripComments(src) {
+  return src.replace(/\/\*[\s\S]*?\*\//g, '').split('\n').map((l) => l.replace(/\/\/.*$/, '')).join('\n');
+}
+const claimFnStart = adsSrc.indexOf('async function claimAdsForRun(');
+const claimFnEnd   = adsSrc.indexOf("router.post('/runs'", claimFnStart);
+const claimFnBody  = (claimFnStart >= 0 && claimFnEnd > claimFnStart)
+  ? stripComments(adsSrc.slice(claimFnStart, claimFnEnd))
+  : '';
+truthy('routes/ads: claimAdsForRun (shared by /runs, /generate, and the stranded-sweep requeue) filters on status queued',
+  /_id:\s*\{\s*\$in:\s*selectedIds\s*\},\s*status:\s*'queued'/.test(claimFnBody));
+
+const generateStart = adsSrc.indexOf("router.post('/generate'");
+const generateBody  = (generateStart >= 0 && claimFnStart > generateStart)
+  ? stripComments(adsSrc.slice(generateStart, claimFnStart))
+  : '';
+truthy("routes/ads: /generate itself has no resurrected inline claim (no Ad.updateMany whose \$set puts status:'rendering' outside claimAdsForRun)",
+  !/Ad\.updateMany\([\s\S]{0,300}?\$set:\s*\{[^}]*status:\s*'rendering'/.test(generateBody));
 truthy('routes/ads: the run re-reads which ads it actually won',
   /claimedIds/.test(adsSrc));
 truthy('routes/ads: renderOne heartbeats updatedAt while rendering',

@@ -456,7 +456,10 @@ const adSchema = new mongoose.Schema({
   durationMs:         { type: Number, default: null },
 
   // Render diagnostics. renderError is populated when status='failed';
-  // renderAttempts counts every attempt regardless of outcome.
+  // renderAttempts counts every attempt that STARTED a render (submit/
+  // generation actually reached), regardless of outcome — a wait-only cycle
+  // (a derive-only video ad polling for its sibling master, never submitting
+  // anything) counts on deriveWaitAttempts below instead, not here.
   renderError: {
     message: { type: String },
     stage:   { type: String },
