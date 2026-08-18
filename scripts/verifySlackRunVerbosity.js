@@ -208,10 +208,23 @@ checkTrue('C2 gap line contains all three numbers and "drainable"',
 checkTrue('C2b gap line never says lost/deleted',
   typeof gapLine === 'string' && !/lost|deleted/i.test(gapLine));
 
+// MIXED is the normal shape (video reconciles at completion; images settle
+// later), so reporting only the reconciled half UNDER-REPORTS the run. An
+// earlier revision of this check asserted the opposite — that a mixed run must
+// NOT mention "est." — which pinned a ~20% undercount as correct. It must
+// report both, and label them distinctly so an estimate is never read as
+// settled (CLAUDE.md §2).
 const reconLine = formatReconciledSpendLine({ reconciledUsd: 1.8, estimatedUsd: 2.4 });
-checkTrue('C3 reconciled>0 -> "reconciled", never "est.", correct amount',
-  typeof reconLine === 'string' && /reconciled/.test(reconLine) &&
-  !/est\./.test(reconLine) && /\$1\.80/.test(reconLine));
+checkTrue('C3 [MONEY] mixed -> BOTH halves reported, combined figure marked approximate',
+  typeof reconLine === 'string' &&
+  /reconciled/.test(reconLine) && /est\./.test(reconLine) &&
+  /\$1\.80/.test(reconLine) && /\$2\.40/.test(reconLine) &&
+  /~\$4\.20/.test(reconLine));
+
+const reconOnlyLine = formatReconciledSpendLine({ reconciledUsd: 1.8, estimatedUsd: 0 });
+checkTrue('C3b reconciled-only -> "reconciled", never "est.", correct amount',
+  typeof reconOnlyLine === 'string' && /reconciled/.test(reconOnlyLine) &&
+  !/est\./.test(reconOnlyLine) && /\$1\.80/.test(reconOnlyLine));
 
 const estLine = formatReconciledSpendLine({ reconciledUsd: 0, estimatedUsd: 1.2 });
 checkTrue('C4 estimated-only -> explicit "est." label, never bare',
@@ -230,8 +243,16 @@ const summaryLines = buildRunCompletionSummaryLines({
 check('C6 completion summary is 3 ordered lines (minted, kinds, spend)', summaryLines.length, 3);
 checkTrue('C6b line 1 is the minted/claimed gap', /minted 40/.test(summaryLines[0]));
 checkTrue('C6c line 2 is the kind breakdown', /12 static delivered/.test(summaryLines[1]));
-checkTrue('C6d line 3 prefers reconciled over est. when both are present',
-  /reconciled spend \$1\.80/.test(summaryLines[2]) && !/est\./.test(summaryLines[2]));
+// See C3: a mixed run must report BOTH halves. An earlier revision asserted
+// the reconciled half "wins" and no "est." appears, which pinned an
+// undercount of the run's real spend as correct.
+// Fixture is reconciled 1.80 + estimated 99 — deliberately lopsided, because
+// it is exactly the shape that made the old behaviour dangerous: reporting
+// only "$1.80" on a run holding $99 of unsettled spend.
+checkTrue('C6d [MONEY] line 3 reports both halves when both are present',
+  /reconciled \$1\.80/.test(summaryLines[2]) &&
+  /est\. \$99\.00/.test(summaryLines[2]) &&
+  /~\$100\.80/.test(summaryLines[2]));
 
 checkTrue('C7 completion summary never throws on garbage input',
   Array.isArray(buildRunCompletionSummaryLines(null)) && buildRunCompletionSummaryLines(null).length === 0 &&

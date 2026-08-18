@@ -164,6 +164,19 @@ function formatReconciledSpendLine(opts) {
   const o = isPlainObject(opts) ? opts : {};
   const reconciledUsd = num(o.reconciledUsd);
   const estimatedUsd = num(o.estimatedUsd);
+  // MIXED IS THE NORMAL CASE, and reporting only the reconciled half
+  // UNDER-REPORTS the run. Video publishes `price` at completion so those rows
+  // reconcile immediately, while images usually settle later via
+  // scheduleCostReconcile — so a run carrying both is the common shape, not an
+  // edge case. Showing "reconciled spend $2.70" on a run that also holds $0.65
+  // of not-yet-settled image spend reads as the run TOTAL and undercounts it.
+  // Report BOTH with distinct labels so the estimate is never presented as
+  // settled (CLAUDE.md §2), and mark the combined figure "~" so nobody quotes
+  // it as reconciled truth.
+  if (reconciledUsd > 0 && estimatedUsd > 0) {
+    return `spend ~$${(reconciledUsd + estimatedUsd).toFixed(2)} ` +
+      `(reconciled $${reconciledUsd.toFixed(2)} + est. $${estimatedUsd.toFixed(2)})`;
+  }
   if (reconciledUsd > 0) {
     return `reconciled spend $${reconciledUsd.toFixed(2)}`;
   }
