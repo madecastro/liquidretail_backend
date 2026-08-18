@@ -90,6 +90,11 @@ const err500 = () => ({ status: 500, data: { code: 500, msg: 'internal error' } 
 const err400 = () => ({ status: 400, data: { code: 400, msg: 'bad request' } });
 const err401 = () => ({ status: 401, data: { code: 401, msg: 'unauthorized' } });
 const errUnrouted = () => ({ status: 400, data: { code: 400, msg: 'router not found' } });
+const thrownWithCode = (code, message) => {
+  const e = new Error(message);
+  e.code = code;
+  return { throws: e };
+};
 const timeoutThrow = () => {
   const e = new Error('timeout of 75000ms exceeded');
   e.code = 'ECONNABORTED';
@@ -135,8 +140,14 @@ await check('A1 director resolves to the owner-directed 3-link cross-provider or
 });
 
 await check('A2 EVERY other role is a single link identical to resolveModel (unchanged pin)', () => {
-  const others = Object.keys(modelMap.MAP).filter(r => r !== 'director');
-  assert.ok(others.length >= 6, `expected the other roles to still exist, saw ${others.length}`);
+  const others = Object.keys(modelMap.MAP).filter(r => r !== 'director').sort();
+  // ENUMERATED, not `>= 6`. A floor passes while a role quietly disappears from
+  // MAP — and "every other role is unchanged" is meaningless if the harness
+  // cannot say which roles it checked.
+  assert.deepStrictEqual(others, [
+    'ad-vision-qc', 'font-vision', 'gemini-2.5-flash', 'gemini-2.5-pro',
+    'gpt-4.1', 'gpt-4.1-mini', 'gpt-4o', 'gpt-4o-mini', 'review-text',
+  ], 'the MAP role inventory changed — a role was added or removed, confirm its chain behaviour deliberately');
   for (const role of others) {
     const chain = modelMap.resolveChain(role);
     assert.strictEqual(chain.length, 1, `${role} grew a chain — every other role must stay single-link`);
@@ -326,24 +337,92 @@ await check('C4 the wall-clock budget stops the chain from STARTING more work', 
   require('../services/atlasLlmService');
 });
 
-await check('C5 a SINGLE-LINK role keeps the pre-chain behaviour: MAX_ATTEMPTS + full timeout + direct', async () => {
+// ── C5/C6: "every OTHER role is unchanged" — BEHAVIOURALLY, per failure class.
+//
+// The first version of C5 scripted 429 ONLY, and that is exactly why two real
+// regressions shipped invisibly: using the chain's ADVANCES_CHAIN set for the
+// in-link retry decision turned an unrouted-400 from ONE Atlas POST into THREE,
+// and added ECONNREFUSED / ENOTFOUND / EPIPE to the retry set. Both are
+// single-link-role behaviour, and both were green under a 429-only test.
+// Every class the pre-chain predicate distinguished now gets a case, with the
+// EXACT pre-change attempt count asserted.
+const PRE_CHANGE_SINGLE_LINK = [
+  // label,                    scripted failure,                         atlas attempts before the direct twin
+  ['429 rate limit',           () => err429(),                            3],
+  ['5xx upstream',             () => err500(),                            3],
+  ['client timeout',           () => timeoutThrow(),                      3],
+  ['ECONNRESET (transient)',   () => thrownWithCode('ECONNRESET', 'socket hang up'),        3],
+  ['EAI_AGAIN (transient DNS)',() => thrownWithCode('EAI_AGAIN', 'getaddrinfo EAI_AGAIN'),  3],
+  // ↓ the two that regressed. Pre-chain these broke after ONE attempt.
+  ['unrouted 400',             () => errUnrouted(),                       1],
+  ['ECONNREFUSED (hard)',      () => thrownWithCode('ECONNREFUSED', 'connect ECONNREFUSED'), 1],
+  ['ENOTFOUND (dead host)',    () => thrownWithCode('ENOTFOUND', 'getaddrinfo ENOTFOUND'),   1],
+  ['EPIPE (broken pipe)',      () => thrownWithCode('EPIPE', 'write EPIPE'),                 1],
+  // Non-retryable 4xx: one attempt, then the direct twin. Unchanged throughout.
+  ['400 bad request',          () => err400(),                            1],
+  ['401 unauthorized',         () => err401(),                            1],
+];
+
+for (const [label, mk, expectedAtlasAttempts] of PRE_CHANGE_SINGLE_LINK) {
+  // eslint-disable-next-line no-loop-func
+  await check(`C5 single-link role: ${label} → ${expectedAtlasAttempts} Atlas attempt(s) then the direct twin`, async () => {
+    baseEnv();
+    process.env.OPENAI_API_KEY = 'test-openai';
+    const saved = process.env.ATLAS_LLM_BACKOFF_MS;
+    process.env.ATLAS_LLM_BACKOFF_MS = '1';
+    delete require.cache[require.resolve('../services/atlasLlmService')];
+    const llm2 = require('../services/atlasLlmService');
+    // Exactly the expected number of Atlas failures, then a success. Too MANY
+    // attempts consumes the ok200 on an Atlas call (atlasCalls overshoots);
+    // too FEW leaves the direct twin holding a failure and the call throws.
+    // Either deviation is caught.
+    installHttp([...Array(expectedAtlasAttempts).fill(null).map(() => mk()), ok200()]);
+    await llm2.chatCompletion(META, { model: 'gpt-4.1', messages: [], max_tokens: 100 });
+    const atlasCalls = calls.filter(c => c.model === 'openai/gpt-5.6-terra').length;
+    assert.strictEqual(atlasCalls, expectedAtlasAttempts,
+      `${label}: expected ${expectedAtlasAttempts} Atlas attempt(s), saw ${atlasCalls} — ` +
+      `single-link roles must match the PRE-CHAIN predicate exactly`);
+    assert.strictEqual(calls[calls.length - 1].model, 'gpt-4.1',
+      'the direct twin must still get its shot with the ORIGINAL vendor model name');
+    for (const c of calls) {
+      assert.strictEqual(c.timeout, 120000, 'a single-link role must never be time-boxed by the chain tuning');
+    }
+    restoreHttp();
+    if (saved === undefined) delete process.env.ATLAS_LLM_BACKOFF_MS; else process.env.ATLAS_LLM_BACKOFF_MS = saved;
+    delete require.cache[require.resolve('../services/atlasLlmService')];
+    require('../services/atlasLlmService');
+  });
+}
+
+await check('C6 retry and advance are SEPARATE predicates, and they really differ', () => {
+  const { ADVANCES_CHAIN: AC, shouldRetrySameLink, makeLlmError: mk } = llmError;
+  const withCode = (code, transportCode) => mk({
+    code, cause: transportCode ? Object.assign(new Error('x'), { code: transportCode }) : undefined,
+  });
+  // The divergent cases are the whole point of the split. If these ever agree,
+  // someone has collapsed the two predicates back together.
+  assert.ok(AC.has(LLM_ERROR_CODES.LLM_MODEL_UNROUTED), 'unrouted must ADVANCE');
+  assert.ok(!shouldRetrySameLink(withCode(LLM_ERROR_CODES.LLM_MODEL_UNROUTED)),
+    'unrouted must NOT be re-sent — three identical 400s teach nothing');
+  assert.ok(AC.has(LLM_ERROR_CODES.LLM_NETWORK_ERROR), 'a network failure must ADVANCE (another host may answer)');
+  assert.ok(!shouldRetrySameLink(withCode(LLM_ERROR_CODES.LLM_NETWORK_ERROR, 'ECONNREFUSED')),
+    'a refused connection must NOT burn in-link retries');
+  assert.ok(shouldRetrySameLink(withCode(LLM_ERROR_CODES.LLM_NETWORK_ERROR, 'ECONNRESET')),
+    'a reset socket IS transient and must still retry, exactly as before the chain');
+  // And the sets are genuinely not the same object/contents.
+  const advancing = [...AC].sort();
+  const retrying = advancing.filter(c => shouldRetrySameLink(withCode(c, 'ECONNRESET')));
+  assert.notDeepStrictEqual(advancing, retrying,
+    'ADVANCES_CHAIN and shouldRetrySameLink must not be interchangeable — that equality WAS the regression');
+});
+
+await check('C7 the transport code survives classification (shouldRetrySameLink depends on it)', async () => {
   baseEnv();
-  process.env.OPENAI_API_KEY = 'test-openai';
-  const saved = process.env.ATLAS_LLM_BACKOFF_MS;
-  process.env.ATLAS_LLM_BACKOFF_MS = '1';
-  delete require.cache[require.resolve('../services/atlasLlmService')];
-  const llm2 = require('../services/atlasLlmService');
-  installHttp([err429(), err429(), err429(), ok200()]);
-  await llm2.chatCompletion(META, { model: 'gpt-4.1', messages: [], max_tokens: 100 });
-  assert.strictEqual(calls.length, 4, 'three Atlas attempts then the direct fallback — exactly as before the chain');
-  assert.deepStrictEqual(calls.slice(0, 3).map(c => c.model), ['openai/gpt-5.6-terra', 'openai/gpt-5.6-terra', 'openai/gpt-5.6-terra'],
-    'a single-link role must RETRY the same model, not advance');
-  assert.strictEqual(calls[3].model, 'gpt-4.1', 'direct twin uses the ORIGINAL vendor model name');
-  for (const c of calls) assert.strictEqual(c.timeout, 120000, 'a single-link role must not be time-boxed by the chain tuning');
+  installHttp([thrownWithCode('ECONNREFUSED', 'connect ECONNREFUSED 1.2.3.4:443'), err429(), ok200()]);
+  const res = await llm.chatCompletion(META, DIRECTOR_PARAMS());
+  assert.strictEqual(calls.length, 3, 'a refused connection advances immediately, it does not retry in-link');
+  assert.ok(llm.chainOutcome(res).degraded);
   restoreHttp();
-  if (saved === undefined) delete process.env.ATLAS_LLM_BACKOFF_MS; else process.env.ATLAS_LLM_BACKOFF_MS = saved;
-  delete require.cache[require.resolve('../services/atlasLlmService')];
-  require('../services/atlasLlmService');
 });
 
 console.log('\nD. SAMPLING PARAMS — stripped per Claude link, honoured on the OpenAI link');
@@ -525,10 +604,19 @@ await check('F5 Director transport failure alerts FATAL and the fallback notice 
   // Must be USED at the call site, not merely declared — the revert-proof
   // showed a bare /DIRECTOR_TRANSPORT_ALERT_KEY/ scan is satisfied by the
   // const declaration while the alert quietly uses some other key.
-  assert.ok(/notifyAsync\(\{[\s\S]{0,3000}?key:\s*DIRECTOR_TRANSPORT_ALERT_KEY/.test(camp),
+  assert.ok(/notifyAsync\(\{[\s\S]{0,4000}?key:[^\n]*DIRECTOR_TRANSPORT_ALERT_KEY/.test(camp),
     'the per-product catch must fire the alert under the shared, stable key');
   assert.ok(/const DIRECTOR_TRANSPORT_ALERT_KEY = 'director:transport-failure'/.test(camp),
     'the key value is the dedupe identity — changing it silently re-arms every suppressed alert');
+  // The CONTENT class is the other half of the same zero-ads outage and must
+  // page under its OWN key — sharing one key would dedupe a content failure
+  // away behind an unrelated transport page and hand over the wrong remedy.
+  assert.ok(/const DIRECTOR_CONTENT_ALERT_KEY = 'director:content-failure'/.test(camp),
+    'a content failure must have its own dedupe identity');
+  assert.ok(/notifyAsync\(\{[\s\S]{0,4000}?key:[^\n]*DIRECTOR_CONTENT_ALERT_KEY/.test(camp),
+    'the content class must actually be routed to its own key at the call site');
+  assert.ok(/CONTENT_CODES\.has\(llmFail\.code\)/.test(camp),
+    'the split must be driven by the shared CONTENT_CODES set, not a hand-copied code list');
   assert.ok(/level:\s*'fatal'/.test(camp), 'a total static outage is fatal-channel material');
   assert.ok(/minCount:\s*2/.test(camp), 'the owner asked for a "more than once" threshold');
   assert.ok(/ZERO ads/.test(camp), 'the alert must state the consequence in plain words');

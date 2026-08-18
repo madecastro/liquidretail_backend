@@ -31,8 +31,8 @@ const path = require('path');
 const REPO = path.join(__dirname, '..');
 const llmError = require('../services/llmError');
 const {
-  LLM_ERROR_CODES, LLM_ACTIONS, CODE_META, ADVANCES_CHAIN,
-  classifyLlmFailure, makeLlmError, isLlmError, stampLlmAction,
+  LLM_ERROR_CODES, LLM_ACTIONS, CODE_META, ADVANCES_CHAIN, CONTENT_CODES,
+  classifyLlmFailure, makeLlmError, isLlmError, stampLlmAction, adoptLlmFailure,
   formatLlmLogLine, formatChainSummary, extractRequestId,
 } = llmError;
 
@@ -88,17 +88,25 @@ const llmPosters = ALL_JS.filter((f) => {
 
 console.log('\nA. COVERAGE — every module that posts to an LLM endpoint reports coded failures');
 
-check('A1 the scan found the known transports (a scan that finds nothing passes vacuously)', () => {
-  const found = llmPosters.map(rel);
-  for (const must of [
+check('A1 the scan found EXACTLY the expected LLM posters (an inventory, not a floor)', () => {
+  // `>= 6` was a FLOOR, which is not an inventory: it passes while a module
+  // silently drops out of the scan, and a scan that stops seeing a file is
+  // exactly how an unguarded call site comes back. Enumerate instead — a new
+  // LLM-posting module MUST be added here deliberately, which is the moment
+  // someone asks whether it reports coded failures.
+  const EXPECTED = [
     'services/atlasLlmService.js',
     'services/atlasLlmStreamService.js',
     'services/atlasTextService.js',
+    'services/categoryReviewsService.js',
+    'services/productDetailsService.js',
+    'services/providers/geminiSearchProvider.js',
     'services/textEmbeddingService.js',
-  ]) {
-    assert.ok(found.includes(must), `scan missed ${must} — the scanner itself is broken`);
-  }
-  assert.ok(found.length >= 6, `expected >= 6 LLM-posting modules, scan found ${found.length}: ${found.join(', ')}`);
+  ].sort();
+  const found = llmPosters.map(rel).sort();
+  assert.deepStrictEqual(found, EXPECTED,
+    'the LLM-poster inventory changed. If a module was ADDED, wire it to services/llmError.js and list it here. ' +
+    'If one DISAPPEARED, the scanner is broken — do not just delete the line.');
 });
 
 check('A2 every scanned LLM poster IMPORTS the shared taxonomy (not just calls it)', () => {
@@ -152,7 +160,7 @@ console.log('\nB. CLASSES — distinct, reachable, and each one says what to DO'
 
 check('B1 every code has meaning + operatorAction + a derived billable/retryable', () => {
   const codes = Object.keys(LLM_ERROR_CODES);
-  assert.strictEqual(codes.length, 13, `expected 13 codes, saw ${codes.length}`);
+  assert.strictEqual(codes.length, 15, `expected 15 codes, saw ${codes.length}`);
   for (const c of codes) {
     assert.strictEqual(LLM_ERROR_CODES[c], c, `${c}: keys must equal values`);
     const meta = CODE_META[c];
@@ -325,14 +333,51 @@ check('D3 a chain summary reads as ONE sequence with each result', () => {
 check('D4 the ACTION is stamped by control flow, never hardcoded beside a call site', () => {
   // Structural pin for the truthfulness rule: the transport must not build an
   // error with a recovery action baked in — it stamps AFTER the branch runs.
+  //
+  // The first version of this used /makeLlmError\(\{[^}]*action:/ and was a
+  // FALSE PASS waiting to happen: `[^}]*` stops at the FIRST `}`, so any
+  // nested object or template literal before `action:` (and makeLlmError calls
+  // routinely carry both) hid the very thing being checked. Parse the balanced
+  // call instead of pattern-matching across it.
   const src = fs.readFileSync(path.join(REPO, 'services/atlasLlmService.js'), 'utf8');
-  const bakedIn = /makeLlmError\(\{[^}]*action:\s*LLM_ACTIONS\.(ADVANCED_TO_NEXT_LINK|FELL_BACK_TO_DIRECT_PROVIDER|RETRIED_SAME_MODEL)/s;
-  assert.ok(!bakedIn.test(src),
-    'a recovery action must never be set at construction — it would claim a step that had not happened yet');
-  assert.ok(/stampLlmAction\([^,]+,\s*LLM_ACTIONS\.ADVANCED_TO_NEXT_LINK/.test(src),
-    'advancement must be stamped at the branch that advances');
-  assert.ok(/stampLlmAction\([^,]+,\s*LLM_ACTIONS\.EXHAUSTED_CHAIN/.test(src),
-    'give-up must be stamped where the loop actually ran out');
+
+  // Extract each makeLlmError({...}) argument with a brace-depth scan, so a
+  // nested `{` can never truncate the region under inspection.
+  const calls = [];
+  const NEEDLE = 'makeLlmError({';
+  for (let i = src.indexOf(NEEDLE); i >= 0; i = src.indexOf(NEEDLE, i + 1)) {
+    let depth = 0;
+    let end = -1;
+    for (let j = i + NEEDLE.length - 1; j < src.length; j++) {
+      const c = src[j];
+      if (c === '{') depth++;
+      else if (c === '}') { depth--; if (depth === 0) { end = j; break; } }
+    }
+    if (end > 0) calls.push(src.slice(i, end + 1));
+  }
+  assert.ok(calls.length >= 3, `expected several makeLlmError call sites, parsed ${calls.length}`);
+
+  // Prove the parser actually sees nested braces — otherwise this check could
+  // be passing for the same reason the old regex did.
+  assert.ok(calls.some((c) => (c.match(/\{/g) || []).length > 1),
+    'the balanced-call parser found no nested braces at all — it is not doing what this check claims');
+
+  const RECOVERY = ['ADVANCED_TO_NEXT_LINK', 'FELL_BACK_TO_DIRECT_PROVIDER', 'RETRIED_SAME_MODEL'];
+  for (const call of calls) {
+    for (const act of RECOVERY) {
+      assert.ok(!new RegExp(`action:\\s*LLM_ACTIONS\\.${act}`).test(call),
+        `a recovery action (${act}) is set at CONSTRUCTION — it would claim a step that had not happened yet:\n${call.slice(0, 200)}`);
+    }
+  }
+
+  // And the stamps must be real calls, not comments mentioning the constant.
+  const stripComments = src
+    .replace(/\/\*[\s\S]*?\*\//g, '')
+    .replace(/^[ \t]*\/\/.*$/gm, '');
+  for (const act of ['ADVANCED_TO_NEXT_LINK', 'EXHAUSTED_CHAIN', 'FELL_BACK_TO_DIRECT_PROVIDER']) {
+    assert.ok(new RegExp(`stampLlmAction\\([^,]+,\\s*LLM_ACTIONS\\.${act}`).test(stripComments),
+      `${act} must be stamped by a real call at the branch that took it (comments do not count)`);
+  }
 });
 
 console.log('\nE. THE OPERATOR SURFACE — CampaignRun.errors[] through the STRICT schema');
@@ -389,12 +434,140 @@ check('E4 the route stamps the code onto the errors[] entry it pushes', () => {
   assert.ok(/chain:\s*r\.errorChain/.test(block), 'and the chain summary');
 });
 
+console.log('\nG. THE ORIGINAL OUTAGE CLASS — zero-ads Director failures must be CODED');
+
+// Every one of these ends in ZERO STATIC ADS for a product. Before 2026-08-18
+// they all threw plain Errors, so `isLlmError` was false in the per-product
+// dispatcher: none paged, and each recorded `errorCode: null` on
+// CampaignRun.errors[]. Not an edge case — CLAUDE.md records 10 Director round
+// failures to 1 success in 24h from prose responses.
+const DIRECTOR_SRC = fs.readFileSync(path.join(REPO, 'services/aiCreativeDirectorService.js'), 'utf8');
+
+const ZERO_AD_THROWS = [
+  ['Director (round) returned no content',      'LLM_CONTENT_EMPTY'],
+  ['Director (round) response truncated at',    'LLM_CONTENT_TRUNCATED'],
+  ['Director (round) response not JSON',        'LLM_CONTENT_UNPARSEABLE'],
+  ['Director (round) returned no usable concepts', 'LLM_CONTRACT_UNMET'],
+  ['Director returned no content',              'LLM_CONTENT_EMPTY'],
+  ['Director response not JSON',                'LLM_CONTENT_UNPARSEABLE'],
+];
+
+check('G1 every zero-ads Director throw is ADOPTED into the taxonomy', () => {
+  // The messages stay byte-identical (they reach the operator through
+  // CampaignRun.errors[].message, and two are pinned by
+  // verifyDirectorJsonSalvage) — what changed is that the thrown object now
+  // carries a code. So the pin is: every occurrence of the message that is
+  // being THROWN sits inside an adoptLlmFailure(...) call, never bare.
+  //
+  // Deliberately index-based rather than a built regex: escaping a message
+  // that contains parentheses into a dynamic RegExp is exactly the kind of
+  // fiddly construction that silently matches nothing and passes.
+  for (const [msg] of ZERO_AD_THROWS) {
+    let found = 0;
+    for (let i = DIRECTOR_SRC.indexOf(msg); i >= 0; i = DIRECTOR_SRC.indexOf(msg, i + 1)) {
+      // Walk back to the statement that produces this message.
+      const before = DIRECTOR_SRC.slice(Math.max(0, i - 160), i);
+      if (!/throw\s|new Error\(/.test(before)) continue;      // a comment or a log line
+      found++;
+      assert.ok(/adoptLlmFailure\(/.test(before),
+        `"${msg}" is thrown BARE — it will not page and will record errorCode: null:\n    …${before.slice(-120)}`);
+    }
+    assert.ok(found > 0, `"${msg}" no longer appears as a throw — did the message change?`);
+  }
+});
+
+check('G2 each zero-ads failure classifies to a CONTENT code, never a transport one', () => {
+  for (const [, code] of ZERO_AD_THROWS) {
+    assert.ok(CONTENT_CODES.has(code), `${code} must be a content class`);
+    // …and therefore must never advance the fallback chain (a different model
+    // does not fix prompt compliance, and advancing multiplies PAID calls).
+    assert.ok(!ADVANCES_CHAIN.has(code), `${code} must never advance the chain`);
+    assert.strictEqual(CODE_META[code].billable, true, `${code} is an HTTP 200 — the tokens were billed`);
+  }
+  // All four distinct codes are actually referenced by the Director.
+  for (const c of ['LLM_CONTENT_EMPTY', 'LLM_CONTENT_TRUNCATED', 'LLM_CONTENT_UNPARSEABLE', 'LLM_CONTRACT_UNMET']) {
+    assert.ok(DIRECTOR_SRC.includes(c), `the Director never raises ${c} — the taxonomy defines it and nothing uses it`);
+  }
+});
+
+check('G3 adoption makes a plain Error dispatcher-visible WITHOUT changing its message', () => {
+  const original = 'Director (round) returned no usable concepts: two concepts share a headline';
+  const err = new Error(original);
+  const coded = makeLlmError({
+    code: LLM_ERROR_CODES.LLM_CONTRACT_UNMET,
+    action: LLM_ACTIONS.GAVE_UP_PRODUCT,
+    actionDetail: 'gave up this product — no ads are minted for it (video is unaffected)',
+    httpStatus: 200, provider: 'atlas', model: 'openai/gpt-5.6-terra',
+  });
+  adoptLlmFailure(err, coded);
+  assert.strictEqual(err.message, original, 'the operator-facing message must be untouched');
+  assert.strictEqual(isLlmError(err), true, 'the dispatcher branches on isLlmError — this is the whole fix');
+  assert.strictEqual(err.code, LLM_ERROR_CODES.LLM_CONTRACT_UNMET);
+  assert.strictEqual(err.action, LLM_ACTIONS.GAVE_UP_PRODUCT);
+  assert.strictEqual(err.billable, true);
+});
+
+check('G4 adoption NEVER overwrites a more specific classification', () => {
+  // A transport failure that bubbles up through a content-level catch keeps its
+  // own diagnosis — otherwise a 429 would be reported as "unusable output" and
+  // the operator would go tuning prompts during a capacity outage.
+  const transport = makeLlmError({ code: LLM_ERROR_CODES.LLM_RATE_LIMITED, httpStatus: 429 });
+  adoptLlmFailure(transport, makeLlmError({ code: LLM_ERROR_CODES.LLM_CONTENT_EMPTY }));
+  assert.strictEqual(transport.code, LLM_ERROR_CODES.LLM_RATE_LIMITED, 'first classification wins');
+  // And a null classification is a no-op, never a crash.
+  const plain = new Error('x');
+  assert.strictEqual(adoptLlmFailure(plain, null), plain);
+  assert.ok(!plain.llmError);
+  assert.doesNotThrow(() => adoptLlmFailure(null, null));
+});
+
+check('G5 the dispatcher pages content failures under their OWN key, at fatal', () => {
+  const camp = fs.readFileSync(path.join(REPO, 'services/campaignAdsGenerationService.js'), 'utf8');
+  assert.ok(/CONTENT_CODES\.has\(llmFail\.code\)/.test(camp),
+    'the split must read the shared CONTENT_CODES set, not a hand-copied list that drifts');
+  assert.ok(/director:content-failure/.test(camp), 'content failures need their own dedupe identity');
+  assert.ok(/UNUSABLE/.test(camp), 'the content alert must say what is wrong in plain words');
+  // Same severity: the operator impact is identical (zero ads).
+  const levels = camp.match(/level:\s*'fatal'/g) || [];
+  assert.ok(levels.length >= 1, 'a zero-ads outage is fatal-channel material whichever half it is');
+  assert.ok(/minCount:\s*2/.test(camp), 'still the owner\'s "more than once" threshold');
+});
+
+check('G6 the error CODE reaches CampaignRun.errors[] for a content failure too', () => {
+  const camp = fs.readFileSync(path.join(REPO, 'services/campaignAdsGenerationService.js'), 'utf8');
+  // errorCode is derived from the coded error, not from a transport-only branch.
+  assert.ok(/errorCode:\s*llmFail \? llmFail\.code : null/.test(camp),
+    'errorCode must come from the coded error so a content failure stops recording null');
+});
+
 console.log('\nF. DOCS — the code table exists and matches the code');
 
-check('F1 docs/ALERTING.md carries every code with an operator action column', () => {
+check('F1 docs/ALERTING.md carries every code WITH its operator-action column', () => {
+  // A bare `doc.includes(CODE)` was satisfied by any mention anywhere — the
+  // "what to DO" column is the whole point of the table, so pin the ROW.
   const doc = fs.readFileSync(path.join(REPO, 'docs/ALERTING.md'), 'utf8');
+  const rows = doc.split('\n').filter((l) => l.trim().startsWith('|'));
   for (const c of Object.keys(LLM_ERROR_CODES)) {
-    assert.ok(doc.includes(c), `docs/ALERTING.md does not document ${c} — the "what to DO" column is the point`);
+    const row = rows.find((l) => l.includes('`' + c + '`'));
+    assert.ok(row, `docs/ALERTING.md has no table ROW for ${c}`);
+    const cells = row.split('|').map((x) => x.trim()).filter(Boolean);
+    assert.ok(cells.length >= 4,
+      `${c}: row must carry code | means | billable | what-to-DO — got ${cells.length} cells`);
+    const action = cells[cells.length - 1];
+    assert.ok(action.length > 25,
+      `${c}: the "what to DO" cell is empty or a stub (${JSON.stringify(action)})`);
+    // billable must be one of the three real values, not prose.
+    assert.ok(/`(true|false|unknown)`/.test(cells[2]),
+      `${c}: billable cell must be \`true\`/\`false\`/\`unknown\`, got ${JSON.stringify(cells[2])}`);
+  }
+});
+
+check('F2 every code in the docs table is a REAL code (no stale rows)', () => {
+  const doc = fs.readFileSync(path.join(REPO, 'docs/ALERTING.md'), 'utf8');
+  const mentioned = new Set((doc.match(/`LLM_[A-Z_]+`/g) || []).map((m) => m.replace(/`/g, '')));
+  for (const m of mentioned) {
+    assert.ok(Object.prototype.hasOwnProperty.call(LLM_ERROR_CODES, m),
+      `docs/ALERTING.md documents ${m}, which no longer exists in the taxonomy`);
   }
 });
 

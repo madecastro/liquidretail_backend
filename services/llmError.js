@@ -64,7 +64,9 @@ const LLM_ERROR_CODES = Object.freeze({
   LLM_UPSTREAM_ERROR:      'LLM_UPSTREAM_ERROR',
   LLM_NETWORK_ERROR:       'LLM_NETWORK_ERROR',
   LLM_CONTENT_EMPTY:       'LLM_CONTENT_EMPTY',
+  LLM_CONTENT_TRUNCATED:   'LLM_CONTENT_TRUNCATED',
   LLM_CONTENT_UNPARSEABLE: 'LLM_CONTENT_UNPARSEABLE',
+  LLM_CONTRACT_UNMET:      'LLM_CONTRACT_UNMET',
   LLM_REFUSED:             'LLM_REFUSED',
   LLM_UNCLASSIFIED:        'LLM_UNCLASSIFIED'
 });
@@ -163,12 +165,32 @@ const CODE_META = Object.freeze({
     operatorAction:
       'HTTP 200, tokens billed, choices[0].message.content was empty (often finish_reason=length after hidden reasoning ate max_tokens). Raise ATLAS_REASONING_RESERVE_TOKENS or the caller max_tokens. A same-payload retry usually reproduces this; a corrective re-ask with more budget is the designed next step, not a transport retry.'
   }),
+  LLM_CONTENT_TRUNCATED: Object.freeze({
+    retryable: false,
+    // HTTP 200 with real content that stopped mid-object. Tokens were
+    // generated and billed — arguably the most expensive failure class here,
+    // because you pay for the whole truncated response and get nothing.
+    billable: true,
+    meaning: 'ran out of output budget mid-response (tokens billed)',
+    operatorAction:
+      'HTTP 200, finish_reason=length: the model was still writing when the token budget ran out. A "return JSON only" re-ask CANNOT fix this and must not be attempted — raise the caller budget instead (DIRECTOR_ROUND_TOKENS for the Director, ATLAS_REASONING_RESERVE_TOKENS for hidden-reasoning headroom). Distinct from LLM_CONTENT_EMPTY: there content never arrived, here it arrived and was cut off, and only this one names the token lever.'
+  }),
   LLM_CONTENT_UNPARSEABLE: Object.freeze({
     retryable: true,
     billable: true, // HTTP 200, tokens generated
     meaning: 'returned text that did not parse (tokens billed)',
     operatorAction:
       'HTTP 200, tokens billed, body was not the JSON the caller required. Use the existing salvage + one-shot corrective reask (shares the attempt budget — worst case stays two paid Director calls). Do not treat this as a transport failure and do not replay an identical prompt forever.'
+  }),
+  LLM_CONTRACT_UNMET: Object.freeze({
+    retryable: true,
+    // HTTP 200, valid JSON, tokens billed — and then discarded because the
+    // payload did not satisfy the caller's contract. The "paid for it and
+    // threw it away" case.
+    billable: true,
+    meaning: 'returned well-formed output that failed the caller contract (tokens billed)',
+    operatorAction:
+      'The model answered and the JSON parsed, but the payload was unusable (e.g. zero concepts, or every concept missing a required field). Tokens were billed and the result discarded. This is a PROMPT or MODEL-CHOICE problem, not a transport one: check the OUTPUT CONTRACT block and the validator reasons in the log. Retrying the identical prompt against the same model usually reproduces it.'
   }),
   LLM_REFUSED: Object.freeze({
     retryable: true,
@@ -268,6 +290,78 @@ const ADVANCES_CHAIN = Object.freeze(new Set([
   // direct twin might have a key of its own, so this must not stop the walk.
   LLM_ERROR_CODES.LLM_AUTH_MISSING,
 ]));
+
+/**
+ * HTTP-200 classes: the provider answered, tokens were generated and BILLED,
+ * and the response was unusable. Enumerated so "must never advance a chain"
+ * and "is a content problem, not a transport one" are one list instead of a
+ * condition re-derived per call site.
+ *
+ * INVARIANT (pinned): CONTENT_CODES ∩ ADVANCES_CHAIN = ∅. Advancing on bad
+ * content would silently multiply PAID calls for a prompt-compliance problem
+ * that a different model does not reliably fix.
+ */
+const CONTENT_CODES = Object.freeze(new Set([
+  LLM_ERROR_CODES.LLM_CONTENT_EMPTY,
+  LLM_ERROR_CODES.LLM_CONTENT_TRUNCATED,
+  LLM_ERROR_CODES.LLM_CONTENT_UNPARSEABLE,
+  LLM_ERROR_CODES.LLM_CONTRACT_UNMET,
+  LLM_ERROR_CODES.LLM_REFUSED,
+]));
+
+/**
+ * Is another attempt at THIS SAME link worth making?
+ *
+ * ⚠️ THIS IS NOT `ADVANCES_CHAIN`, AND CONFLATING THEM WAS A REAL REGRESSION.
+ * The two answer different questions:
+ *   ADVANCES_CHAIN     — "is a DIFFERENT candidate worth trying?"
+ *   shouldRetrySameLink — "is the SAME model, same payload, worth re-sending?"
+ * A listed-but-unrouted model is the clearest case where they diverge: the
+ * next candidate may well work, but re-asking THIS one buys three identical
+ * 400s and two backoffs. Using the advance-set for both silently added two
+ * extra round trips to every mis-pointed `ATLAS_MODEL_*` and every dead slug —
+ * and this repo has hit exactly that (`openai/gpt-5-nano` is listed in the
+ * catalog and returns "router not found").
+ *
+ * THIS FUNCTION REPRODUCES THE PRE-CHAIN PREDICATE EXACTLY. Before the chain,
+ * atlasLlmService decided with:
+ *     if (err.routerMissing) break;
+ *     if (err.status && !retryableStatus(err.status)) break;   // 429/5xx retry
+ *     if (!err.status && !retryableError(err) && !/timeout/i.test(msg)) break;
+ *   where retryableError = code ∈ {ECONNRESET, ETIMEDOUT, ECONNABORTED, EAI_AGAIN}
+ * Every single-link role (eleven services) depends on that shape, so it is
+ * reproduced term for term rather than approximated.
+ *
+ * WHY THE TRANSPORT CODE IS CONSULTED, and why a pure code-set cannot do this:
+ * `LLM_NETWORK_ERROR` is deliberately one class for the operator, but the old
+ * predicate split it. ECONNRESET and EAI_AGAIN are transient — a reset socket
+ * or a temporary DNS failure really can succeed 3s later. ECONNREFUSED,
+ * ENOTFOUND and EPIPE will not fix themselves on that timescale: the host is
+ * wrong, gone, or closed the pipe. Retrying those burns MAX_ATTEMPTS and two
+ * backoffs to learn nothing, so they skip straight to the fallback — which is
+ * a DIFFERENT HOST and therefore the only thing that could actually help.
+ * Consulting `transportCode` also keeps the no-code case exact: an error whose
+ * message merely mentions "socket hang up" with no `err.code` was NOT retried
+ * before, and is not retried now.
+ */
+const RETRY_TRANSIENT_TRANSPORT_CODES = Object.freeze(['ECONNRESET', 'EAI_AGAIN']);
+
+function shouldRetrySameLink(err) {
+  if (!err) return false;
+  const code = knownCode(err.code || err.llmCode);
+  // 429 and 5xx: the old retryableStatus set, unchanged.
+  if (code === LLM_ERROR_CODES.LLM_RATE_LIMITED) return true;
+  if (code === LLM_ERROR_CODES.LLM_UPSTREAM_ERROR) return true;
+  // Our own deadline: old ETIMEDOUT / ECONNABORTED / /timeout/i message.
+  if (code === LLM_ERROR_CODES.LLM_TIMEOUT) return true;
+  // Transient transport only — see the comment above.
+  if (code === LLM_ERROR_CODES.LLM_NETWORK_ERROR) {
+    return RETRY_TRANSIENT_TRANSPORT_CODES.indexOf(String(err.transportCode || '')) !== -1;
+  }
+  // Everything else — unrouted, 4xx, auth, quota, content, unclassified —
+  // fails identically on a re-send.
+  return false;
+}
 
 const REQUEST_ID_MAX = 200;
 const LOG_TAIL_MAX = 300;
@@ -645,6 +739,10 @@ function makeLlmError(fields) {
       link: asNum(src.link),
       linkCount: asNum(src.linkCount),
       chain: sanitizeChain(src.chain),
+      // The ORIGINAL node/axios code (ECONNABORTED, ENOTFOUND, …), kept
+      // because `err.code` is overwritten with the taxonomy code below.
+      // Taken from an explicit field or lifted off the cause.
+      transportCode: asText(src.transportCode) || (src.cause && asText(src.cause.code)) || null,
       providerMessage: boundText(src.providerMessage, STORED_TEXT_MAX),
       consequence: boundText(src.consequence, STORED_TEXT_MAX)
     };
@@ -664,6 +762,13 @@ function makeLlmError(fields) {
     // but `code` is ALSO where axios/node put transport codes (ECONNABORTED),
     // so anything that must be sure it is reading OUR taxonomy reads llmCode.
     err.llmCode = code;
+    // ⚠️ `err.code` is DELIBERATELY the taxonomy code (callers branch on it),
+    // which OVERWRITES the node/axios transport code. That is a landmine if
+    // the original is simply lost — `shouldRetrySameLink` needs ECONNRESET vs
+    // ECONNREFUSED to reproduce the pre-chain retry set, and an operator
+    // reading a log needs to know which syscall failed. So it is preserved
+    // here rather than discarded, and documented in docs/ALERTING.md.
+    err.transportCode = picked.transportCode;
     err.action = action;
     err.retryable = meta.retryable;
     err.billable = meta.billable;
@@ -702,6 +807,7 @@ function makeLlmError(fields) {
     fallback.llmError = true;
     fallback.code = LLM_ERROR_CODES.LLM_UNCLASSIFIED;
     fallback.llmCode = LLM_ERROR_CODES.LLM_UNCLASSIFIED;
+    fallback.transportCode = null;
     fallback.status = null;
     fallback.action = LLM_ACTIONS.NONE;
     fallback.retryable = CODE_META.LLM_UNCLASSIFIED.retryable;
@@ -726,6 +832,57 @@ function makeLlmError(fields) {
 
 function isLlmError(err) {
   return !!err && err.llmError === true;
+}
+
+/**
+ * Copy a coded classification ONTO an error that already exists.
+ *
+ * WHY THIS EXISTS RATHER THAN "just throw the coded error". Several
+ * caller-facing messages are load-bearing and PINNED by existing harnesses
+ * (`verifyDirectorJsonSalvage` M1/R1 match the literal
+ * `throw new Error(\`Director (round) response not JSON...\`)` source text,
+ * and the wording reaches the operator through CampaignRun.errors[].message).
+ * Rewriting those to route through makeLlmError would either break the pins or
+ * change what an operator reads for no benefit.
+ *
+ * So the failure is CLASSIFIED where it is detected — which is the only place
+ * that knows whether the body was empty, truncated, unparseable or merely
+ * unusable — and the classification is ADOPTED onto the thrown error on its
+ * way out. Message unchanged; `code`, `action`, `billable` and friends gained.
+ *
+ * Never overwrites an error that is already coded (a transport failure that
+ * bubbled through a content-level catch keeps its own, more specific,
+ * diagnosis). Never throws.
+ */
+function adoptLlmFailure(err, coded) {
+  try {
+    if (!err || typeof err !== 'object') return err;
+    if (err.llmError === true) return err;          // already classified — first wins
+    if (!coded || coded.llmError !== true) return err;
+    err.llmError       = true;
+    err.code           = coded.code;
+    err.llmCode        = coded.code;
+    err.action         = coded.action;
+    err.actionDetail   = coded.actionDetail;
+    err.retryable      = coded.retryable;
+    err.billable       = coded.billable;
+    err.provider       = coded.provider;
+    err.model          = coded.model;
+    err.role           = coded.role;
+    err.httpStatus     = coded.httpStatus;
+    err.status         = coded.status;
+    err.transportCode  = coded.transportCode;
+    err.requestId      = coded.requestId;
+    err.elapsedMs      = coded.elapsedMs;
+    err.providerMessage = coded.providerMessage;
+    // baseMessage stays the ADOPTING error's own message, so a later
+    // stampLlmAction rebuilds from the pinned text and not from the
+    // classifier's synthetic sentence.
+    err.baseMessage    = err.baseMessage || err.message;
+    return err;
+  } catch (_) {
+    return err;
+  }
 }
 
 /**
@@ -865,7 +1022,8 @@ function formatLlmLogLine(err) {
 }
 
 module.exports = {
-  LLM_ERROR_CODES, LLM_ACTIONS, ADVANCES_CHAIN,
+  LLM_ERROR_CODES, LLM_ACTIONS, ADVANCES_CHAIN, CONTENT_CODES,
+  shouldRetrySameLink, adoptLlmFailure,
   // Exported so docs/ALERTING.md's code table and the harness read the SAME
   // operator guidance the code carries — a hand-copied table drifts, and a
   // stale "what to do about it" column is worse than none.

@@ -146,7 +146,8 @@ Covered by `scripts/verifyRunFeed.js` (offline; revert-proves the never-escape a
 | `Campaign run finished with N failed ad(s)` | warn/error | `runRenderLoop` | Escalates to error when **every** ad failed |
 | `Campaign run crashed …` | error | `routes/ads.js` | The loop itself threw |
 | `Claim anomaly — run … released` | **fatal** | `routes/ads.js` `/generate` | `claimAdsForRun`'s updateMany reported a write but the ownership re-read came back empty (should never fire). Ads released to `queued`, run marked `failed`. Sent to the fatal/alert channel, **never** the per-run status feed. See *Claim-anomaly alert* below |
-| `Director LLM unreachable — static ad generation is producing ZERO ads` | **fatal** | `campaignAdsGenerationService` per-product catch | Every Director candidate failed. **Fires from the SECOND occurrence** (see *Occurrence thresholds*). Carries the code, the chain summary, and the emergency lever |
+| `Director LLM unreachable — static ad generation is producing ZERO ads` | **fatal** | `campaignAdsGenerationService` per-product catch | Every Director candidate failed at the TRANSPORT level. **Fires from the SECOND occurrence** (see *Occurrence thresholds*). Carries the code, the chain summary, and the emergency lever |
+| `Director LLM output is UNUSABLE — static ad generation is producing ZERO ads` | **fatal** | same catch, `director:content-failure` key | The model ANSWERED (HTTP 200, tokens billed) and the response could not be used — prose instead of JSON, truncated, or zero usable concepts. Same zero-ads impact, **completely different remedy**, so it pages under its own key. Also 2nd-occurrence |
 | `Director served by a FALLBACK model — the primary is unavailable` | warn | `aiCreativeDirectorService.directConceptsRound` | Ads ARE being produced, but by a fallback chain link. Fires on the first occurrence per serving model |
 
 ### Director alerts — added 2026-08-18 after a 20-hour silent outage
@@ -161,11 +162,25 @@ both closed here:
    the one case where the Director was working.
 2. **No alert on degradation.** A Director quietly served by a fallback model
    looked identical to a healthy one in every log and artifact.
+3. **The COMMON failure was still silent after the first fix.** Five Director
+   failures — empty content, truncated response, still-not-JSON after the
+   corrective re-ask, zero usable concepts, and the V2 path's parse failure —
+   threw plain `Error`s, so `isLlmError` was false, none paged, and each landed
+   `code: null` in `CampaignRun.errors[]`. That is not an edge case: this repo
+   measured **10 Director round failures to 1 success in 24h** from prose
+   responses. They now classify (`LLM_CONTENT_*` / `LLM_CONTRACT_UNMET`) and
+   page on the second occurrence like any other zero-ads outage.
+
+**Why a content failure is fatal-channel too.** The remedies differ completely,
+but the operator impact does not: zero static ads for every affected product. A
+Director that answers and will not follow the contract is the same outage
+wearing an HTTP 200. Separate keys keep the two from deduping each other away
+and keep the wrong remedy off the page.
 
 | | Total failure | Fallback served |
 |---|---|---|
 | Level / channel | `fatal` → `SLACK_ALERT_CHANNEL_FATAL` | `warn` → `SLACK_ALERT_CHANNEL` |
-| Dedupe key | `director:transport-failure` (**global**) | `director:fallback-served:<provider>/<model>` |
+| Dedupe key | `director:transport-failure` / `director:content-failure` (**global**) | `director:fallback-served:<provider>/<model>` |
 | Threshold | **2nd occurrence** within `ALERT_THRESHOLD_WINDOW_MIN` | none — first occurrence pages |
 | Delivery | `notifyAsync`, never awaited, cannot throw | same |
 
@@ -246,9 +261,32 @@ tokens were generated, and `unknown` where we genuinely cannot tell.
 | `LLM_UPSTREAM_ERROR` | Provider 5xx | `false` | Safe to retry — there is no image-style running task to probe. If it persists, advance rather than sitting on a down route |
 | `LLM_NETWORK_ERROR` | Reset / refused / DNS / hang-up before any reply | `unknown` | May have been delivered and billed. Check `request_id` before replaying |
 | `LLM_CONTENT_EMPTY` | HTTP 200, empty `message.content` — **tokens billed** | `true` | Usually hidden reasoning eating `max_tokens` (`finish_reason: length`). Raise `ATLAS_REASONING_RESERVE_TOKENS` or the caller budget |
+| `LLM_CONTENT_TRUNCATED` | HTTP 200, content arrived and was **cut off mid-response** — tokens billed | `true` | `finish_reason: length` with real content. A re-ask **cannot** fix an exhausted budget — raise `DIRECTOR_ROUND_TOKENS` (Director) or the caller's `max_tokens`. Distinct from `LLM_CONTENT_EMPTY`: there nothing arrived, here it arrived and stopped |
 | `LLM_CONTENT_UNPARSEABLE` | HTTP 200, body was not the required JSON — **tokens billed** | `true` | Use the salvage + one-shot corrective re-ask. **Never** advance a fallback chain on this |
+| `LLM_CONTRACT_UNMET` | HTTP 200, valid JSON, but the payload failed the caller's contract — tokens billed | `true` | The "paid for it and threw it away" case (e.g. zero usable concepts). A **prompt or model-choice** problem, not a transport one — read the validator reasons in the log. Retrying the identical prompt on the same model usually reproduces it |
 | `LLM_REFUSED` | HTTP 200, the model asked a question instead of answering | `true` | Re-ask once with the OUTPUT CONTRACT reminder; a thin brief will keep refusing and each attempt is paid |
 | `LLM_UNCLASSIFIED` | Matched nothing | `unknown` | Capture status, errCode, `request_id` and the first 200 chars of the body, then **add a real code** — do not guess a retry |
+
+### Two predicates, deliberately separate: retry vs advance
+
+`shouldRetrySameLink(err)` and `ADVANCES_CHAIN.has(code)` answer different
+questions and **must not be collapsed into one**:
+
+| | asks | wrong answer costs |
+|---|---|---|
+| `shouldRetrySameLink` | re-send the **same** model? | wasted round trips against a model that will answer identically |
+| `ADVANCES_CHAIN` | try the **next** candidate? | a healthy provider never reached, or a paid call bought twice |
+
+They genuinely diverge. A listed-but-unrouted 400 **advances** (another
+candidate may route) but must **not** be re-sent — three identical 400s and two
+backoffs teach nothing, and `openai/gpt-5-nano` is a real slug in this catalog
+that does exactly that. `ECONNREFUSED` / `ENOTFOUND` / `EPIPE` likewise advance
+(a different host might answer) but will not fix themselves in 3s, so they skip
+the in-link retry; `ECONNRESET` / `EAI_AGAIN` are transient and do retry.
+
+`shouldRetrySameLink` reproduces the **pre-chain** predicate term for term, so
+the eleven single-link roles behave exactly as they did before the Director
+chain existed. Pinned behaviourally by `verifyDirectorFallbackChain` C5/C6.
 
 ### The `action` — what the system did next
 
@@ -264,6 +302,7 @@ ran (`stampLlmAction`). A code with no action leaves the reader unable to tell
 | `CORRECTIVE_REASK` | Issued the one-shot bad-JSON re-ask (shares the attempt budget) |
 | `SKIPPED_NO_KEY` | Skipped without attempting — no key for that link |
 | `EXHAUSTED_CHAIN` | Every candidate failed. **Transport-level** give-up |
+| `CORRECTIVE_REASK` | Issued the one-shot bad-JSON re-ask (shares the attempt budget) |
 | `GAVE_UP_PRODUCT` | This SKU mints no ads (video is unaffected) |
 | `GAVE_UP_RUN` | The whole run is done |
 
@@ -288,6 +327,14 @@ tried anthropic/claude-sonnet-5 (429, 51.0s) → direct:claude-sonnet-5 (auth_mi
 4. **The thrown object** — `err.code` / `err.llmCode`, `err.action`,
    `err.retryable`, `err.billable`, `err.chain`, `err.chainSummary`, so callers
    branch on a constant instead of regexing message text.
+
+⚠️ **`err.code` is the TAXONOMY code, which overwrites the node/axios transport
+code.** The original is preserved as **`err.transportCode`** (`ECONNABORTED`,
+`ENOTFOUND`, …) — not decoration: `shouldRetrySameLink` needs `ECONNRESET`
+(transient, retry) versus `ECONNREFUSED` (host is wrong or down, do not) to
+reproduce the pre-chain retry set exactly, and an operator reading a log needs
+to know which syscall failed. Use `err.llmCode` when you must be certain you
+are reading the taxonomy and not a transport code.
 
 **Backwards compatibility deliberately preserved** (grep before changing a
 message string): `err.status` is still set alongside `err.httpStatus` because
