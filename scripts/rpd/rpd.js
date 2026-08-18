@@ -100,6 +100,33 @@ async function main() {
     return;
   }
 
+  if (cmd === 'eval') {
+    const runDir = args[0];
+    if (!runDir) throw new Error('usage: rpd eval <runDir> [--eval-max-usd 0.5]');
+    const { evalRun } = require('./lib/autoEval');
+    const { buildGallery } = require('./lib/gallery');
+    const raw = flagValue(args, '--eval-max-usd');
+    const maxUsd = raw != null ? Number(raw) : 0.5;
+    if (!(Number.isFinite(maxUsd) && maxUsd > 0)) {
+      throw new Error('rpd: --eval-max-usd must be a positive number (vision calls are billable)');
+    }
+    await evalRun(runDir, { maxUsd });
+    console.log(`Gallery: ${buildGallery(runDir)}`);
+    return;
+  }
+
+  if (cmd === 'stats') {
+    const { collectStats, formatTable, toCsv } = require('./lib/stats');
+    const outRoot = flagValue(args, '--out') || 'rpd-runs';
+    const rows = collectStats(outRoot);
+    if (!rows.length) {
+      console.log(`rpd stats: no run manifests under ${outRoot}`);
+      return;
+    }
+    console.log(flag(args, '--csv') ? toCsv(rows) : formatTable(rows));
+    return;
+  }
+
   if (cmd === 'gallery') {
     const runDir = args[0];
     if (!runDir) throw new Error('usage: rpd gallery <runDir>');

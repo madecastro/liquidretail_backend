@@ -296,10 +296,15 @@ function renderCellNotes(cell, observations) {
     .filter((o) => o.scope && o.scope === cell.id);
   const all = own.concat(scoped);
   if (!all.length) return '';
+  // An auto verdict is a machine opinion, not an observation — badge it so a
+  // reader never mistakes it for a human's judgement.
   return `<ul class="cell-notes">
-    ${all.map((n) =>
-      `<li><time>${esc(formatWhen(n.at) || '')}</time> ${esc(str(n.text))}</li>`
-    ).join('')}
+    ${all.map((n) => {
+      const badge = n.auto
+        ? `<span class="note-auto" title="${escAttr(`LLM auto-eval${n.model ? ` · ${str(n.model)}` : ''} — verify before trusting`)}">auto-eval</span> `
+        : '';
+      return `<li${n.auto ? ' class="note-is-auto"' : ''}><time>${esc(formatWhen(n.at) || '')}</time> ${badge}${esc(str(n.text))}</li>`;
+    }).join('')}
   </ul>`;
 }
 
@@ -434,6 +439,10 @@ h2 { font-size: 0.85rem; text-transform: uppercase; letter-spacing: 0.06em; colo
 .lever-directives { color: #c4b5fd; }
 .lever-patch { color: var(--warn); }
 .lever-baseline { color: var(--muted); }
+.note-auto { display: inline-block; padding: 0 5px; border-radius: 3px; font-size: 10px;
+  text-transform: uppercase; letter-spacing: 0.04em; background: #1e2b3d; color: #93c5fd;
+  border: 1px solid #2c4a6b; cursor: help; }
+.note-is-auto { color: var(--muted); }
 .chip-intent { color: #c4b5fd; }
 .chip-warn { border-color: #92400e; color: var(--warn); }
 .chip-charged { color: var(--fail); }

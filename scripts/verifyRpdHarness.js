@@ -353,6 +353,238 @@ const read = (p) => fs.readFileSync(p, 'utf8');
     fs.rmSync(tmp, { recursive: true, force: true });
   });
 
+  // ── S. static image cells (v2 — a second billable door) ────────────────
+  console.log('\nS. static image cells');
+  const staticSrc = read(path.join(RPD, 'lib', 'staticRunner.js'));
+  const { expandStaticCells, runStaticCells, estimateStaticCostUsd } =
+    require(path.join(RPD, 'lib', 'staticRunner'));
+  const { buildForStaticCell } = require(path.join(RPD, 'lib', 'staticPrompt'));
+  const intentsMod = require(path.join(__dirname, '..', 'services', 'staticAdIntents'));
+  const staticSpec = {
+    name: 'verify-static',
+    seed: { url: 'https://res.cloudinary.com/x/image/upload/v1/s.jpg', productTitle: 'P' },
+    static: {
+      productDesc: 'a black cotton tee with a circular chest logo',
+      surface: 'meta_feed_1_1',
+      intent: 'brand_led',
+      copy: { headline: 'Better than new.' },
+      models: ['openai/gpt-image-2/edit'],
+      variants: [{ id: 'baseline' }]
+    }
+  };
+
+  check('S1 allowFallback:false is hardcoded, never spec-controlled', () => {
+    // The default `true` catches an Atlas failure and resubmits to direct
+    // OpenAI — a second billable generation on a different model.
+    assert(/allowFallback:\s*false/.test(staticSrc), 'staticRunner must pass allowFallback: false');
+    assert(!/allowFallback:\s*(?!false)[a-zA-Z]/.test(staticSrc), 'allowFallback must not be read from the spec/variant');
+  });
+  await checkAsync('S2 allowFallback:false actually reaches the image service', async () => {
+    const cells = expandStaticCells(staticSpec);
+    let seen = null;
+    await runStaticCells(cells, {
+      runDir: fs.mkdtempSync(path.join(os.tmpdir(), 'rpd-s2-')),
+      manifest: { cells },
+      edit: async (args) => { seen = args; throw new Error('stop after capture'); },
+      persist: () => {},
+      log: { log: () => {}, error: () => {}, warn: () => {} }
+    });
+    assert(seen, 'edit was not called');
+    assert.strictEqual(seen.allowFallback, false);
+    assert.strictEqual(typeof seen.meta.onPredictionId, 'function', 'the receipt callback must be supplied');
+  });
+  await checkAsync('S3 a receipt from the callback SURVIVES a later throw (crash mid-poll)', async () => {
+    const cells = expandStaticCells(staticSpec);
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'rpd-s3-'));
+    await runStaticCells(cells, {
+      runDir: tmp,
+      manifest: { cells },
+      // Fire the charge-point callback, THEN fail — exactly the window that
+      // loses a receipt when the id is only read from the return value.
+      edit: async ({ meta }) => { meta.onPredictionId('pred_static_1'); throw new Error('poll died'); },
+      persist: () => {},
+      log: { log: () => {}, error: () => {}, warn: () => {} }
+    });
+    assert.strictEqual(cells[0].status, 'failed');
+    assert.deepStrictEqual(cells[0].predictionIds, ['pred_static_1']);
+    assert.strictEqual(cells[0].charged, true, 'a submit id means the money committed');
+  });
+  await checkAsync('S4 multiple receipts accumulate (the retry wrapper may resubmit)', async () => {
+    const cells = expandStaticCells(staticSpec);
+    await runStaticCells(cells, {
+      runDir: fs.mkdtempSync(path.join(os.tmpdir(), 'rpd-s4-')),
+      manifest: { cells },
+      edit: async ({ meta }) => {
+        meta.onPredictionId('pred_a');
+        meta.onPredictionId('pred_a');   // duplicate must not double-record
+        meta.onPredictionId('pred_b');
+        throw new Error('stop');
+      },
+      persist: () => {},
+      log: { log: () => {}, error: () => {}, warn: () => {} }
+    });
+    assert.deepStrictEqual(cells[0].predictionIds, ['pred_a', 'pred_b']);
+  });
+  check('S5 static prices come from a measured table, never catalog base_price', () => {
+    assert(Number.isFinite(estimateStaticCostUsd('openai/gpt-image-2/edit')));
+    assert.strictEqual(estimateStaticCostUsd('some/unpriced-model'), null);
+    // Scan for USAGE, not prose: the file explains in a comment why the catalog
+    // figure is unusable, and a naive substring match on that sentence would
+    // fail this check for documenting the very rule it enforces.
+    assert(!/\bbuildPriceMap\b\s*[(,)]/.test(staticSrc), 'must not call buildPriceMap');
+    assert(!/require\([^)]*\)\s*\.\s*buildPriceMap|buildPriceMap\s*[,}]/.test(staticSrc), 'must not import buildPriceMap');
+    assert(!/[.[]\s*['"]?base_price/.test(staticSrc), 'must not read a base_price field');
+  });
+  check('S6 an unpriced static model is refused live, not submitted', () => {
+    const cells = expandStaticCells({
+      ...staticSpec,
+      static: { ...staticSpec.static, models: ['openai/gpt-image-9/edit'] }
+    });
+    assert.strictEqual(cells[0].estUsd, null);
+    const { live } = assertBudget(cells, 10);
+    assert.strictEqual(live.length, 0);
+    assert.strictEqual(cells[0].status, 'skipped');
+  });
+  check('S7 the blocks lever really changes the prompt (exports are immutable strings)', () => {
+    const base = buildForStaticCell({ spec: staticSpec, model: 'openai/gpt-image-2/edit', variant: { id: 'b' } });
+    const patched = buildForStaticCell({
+      spec: staticSpec, model: 'openai/gpt-image-2/edit',
+      variant: { id: 'p', blocks: { PRODUCT_FIDELITY: 'FIDELITY: exact reproduction only.' } }
+    });
+    assert(patched.prompt.includes('FIDELITY: exact reproduction only.'));
+    assert(!patched.prompt.includes(intentsMod.PRODUCT_FIDELITY), 'the original block must be gone');
+    assert.notStrictEqual(patched.prompt, base.prompt);
+    assert(Array.isArray(patched.promptMeta.baselineDiff));
+    // The module constant must be untouched — this lever never mutates.
+    assert.strictEqual(typeof intentsMod.PRODUCT_FIDELITY, 'string');
+    assert(intentsMod.PRODUCT_FIDELITY.length > 100);
+  });
+  check('S8 unknown block, and an absent block, both fail loudly', () => {
+    assert.throws(
+      () => buildForStaticCell({ spec: staticSpec, model: 'm', variant: { id: 'x', blocks: { NOPE: 'y' } } }),
+      /unknown static block "NOPE"/
+    );
+    // SCENE_PRESERVE is not emitted on a packshot prompt: replacing it must be
+    // an error, never a silent no-op reported as an experiment arm.
+    assert.throws(
+      () => buildForStaticCell({ spec: staticSpec, model: 'm', variant: { id: 'y', blocks: { SCENE_PRESERVE: 'z' } } }),
+      /is not present in this prompt/
+    );
+  });
+  check('S9 an intent downgrade is surfaced, never hidden', () => {
+    // social_proof_led needs a rating; without one resolveIntent falls back.
+    const out = buildForStaticCell({
+      spec: { ...staticSpec, static: { ...staticSpec.static, intent: 'social_proof_led' } },
+      model: 'openai/gpt-image-2/edit', variant: { id: 'd' }
+    });
+    assert(out.promptMeta.intentDowngraded, 'the downgrade must be recorded');
+    assert.strictEqual(out.promptMeta.intentDowngraded.requested, 'social_proof_led');
+    assert.notStrictEqual(out.promptMeta.intent, 'social_proof_led');
+  });
+  check('S10 proof-class static copy is never defaulted', () => {
+    const { staticFixture } = require(path.join(RPD, 'lib', 'staticPrompt'));
+    const f = staticFixture({ spec: staticSpec, variant: { id: 'b' } });
+    for (const k of ['rating', 'reviewCount', 'reviewsText', 'quote', 'attribution', 'badge']) {
+      assert(!(k in f.data), `${k} must be absent unless supplied (a defaulted claim is fabricated)`);
+    }
+    assert.strictEqual(f.data.cta, 'SHOP NOW'); // production default, not a claim
+  });
+
+  // ── R. reference-to-video cells ─────────────────────────────────────────
+  console.log('\nR. reference-to-video (r2v) cells');
+  const R2V = 'google/gemini-omni-flash/reference-to-video-developer';
+  check('R1 an image-only seed keeps the honest skip on an r2v model', () => {
+    const cells = expandCells({ ...spec, models: [R2V], variants: [{ id: 'baseline' }] });
+    assert.strictEqual(cells[0].status, 'skipped');
+    assert(/spec\.seed\.videoUrl/.test(cells[0].error));
+  });
+  await checkAsync('R2 the submit receives the cell videoClipUrl, not a hardcoded null', async () => {
+    // Hardcoding null here would send video_clips[0].url: undefined and spend
+    // the flat $1.60 on a body Atlas cannot use.
+    const cell = {
+      id: 'r2', model: R2V, prompt: 'p', imageUrls: ['u'], aspectRatio: '9:16',
+      durationSec: 8, status: 'planned', estUsd: 1.6, charged: false, timings: {},
+      videoClipUrl: 'https://res.cloudinary.com/x/video/upload/so_2,du_8.0/v/c.mp4'
+    };
+    let seen = null;
+    await submitCells([cell], {
+      runDir: '/nowhere', manifest: { cells: [cell] },
+      submit: async (args) => { seen = args; return 'pred_r2v'; },
+      persist: () => {}, log: { log: () => {}, error: () => {}, warn: () => {} }
+    });
+    assert.strictEqual(seen.videoClipUrl, cell.videoClipUrl);
+  });
+
+  // ── V. auto-eval spends only its OWN budget, and never generates ────────
+  console.log('\nV. auto-eval');
+  const evalSrc = read(path.join(RPD, 'lib', 'autoEval.js'));
+  check('V1 autoEval can never submit a generation', () => {
+    assert(!/submitGeneration|editImage|generateVideo|generateImage/.test(evalSrc));
+  });
+  check('V2 the eval budget is separate from the generation cap', () => {
+    const cliSrc = read(path.join(RPD, 'rpd.js'));
+    assert(/--eval-max-usd/.test(cliSrc), 'eval needs its own cap flag');
+    // The eval path must not read --max-usd, or eval spend could consume the
+    // budget the operator set aside for generations.
+    const evalBlock = cliSrc.slice(cliSrc.indexOf("cmd === 'eval'"), cliSrc.indexOf("cmd === 'stats'"));
+    assert(!/--max-usd'/.test(evalBlock), 'the eval command must not read the generation cap');
+  });
+  await checkAsync('V3 a tiny eval budget stops before spending, and grades nothing', async () => {
+    const { evalRun } = require(path.join(RPD, 'lib', 'autoEval'));
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'rpd-v3-'));
+    const cellDir = path.join(tmp, 'cells', 'c1');
+    fs.mkdirSync(cellDir, { recursive: true });
+    fs.writeFileSync(path.join(cellDir, 'plate.png'), Buffer.from('89504e470d0a1a0a', 'hex'));
+    const manifest = {
+      name: 'v3', spec: { seed: { url: 'https://example.test/seed.jpg' } },
+      cells: [{
+        id: 'c1', kind: 'static', status: 'done',
+        localPath: path.join('cells', 'c1', 'plate.png'), notes: []
+      }],
+      observations: []
+    };
+    fs.writeFileSync(path.join(tmp, 'manifest.json'), JSON.stringify(manifest));
+    let called = 0;
+    await evalRun(tmp, {
+      maxUsd: 0.001,
+      deps: { judgeRender: async () => { called++; return { pass: true }; }, chatCompletion: async () => { called++; return {}; } },
+      log: { log: () => {}, warn: () => {}, error: () => {} }
+    });
+    assert.strictEqual(called, 0, 'no billable vision call may fire under an exhausted budget');
+    const after = JSON.parse(fs.readFileSync(path.join(tmp, 'manifest.json'), 'utf8'));
+    assert(!(after.cells[0].notes || []).some((n) => n.auto));
+    fs.rmSync(tmp, { recursive: true, force: true });
+  });
+  await checkAsync('V4 a verdict lands as a badged auto-note and never overwrites human notes', async () => {
+    const { evalRun } = require(path.join(RPD, 'lib', 'autoEval'));
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'rpd-v4-'));
+    const cellDir = path.join(tmp, 'cells', 'c1');
+    fs.mkdirSync(cellDir, { recursive: true });
+    fs.writeFileSync(path.join(cellDir, 'plate.png'), Buffer.from('89504e470d0a1a0a', 'hex'));
+    const manifest = {
+      name: 'v4', spec: { seed: { url: 'https://example.test/seed.jpg' } },
+      cells: [{
+        id: 'c1', kind: 'static', status: 'done',
+        localPath: path.join('cells', 'c1', 'plate.png'),
+        notes: [{ at: 'earlier', text: 'human observation' }]
+      }],
+      observations: []
+    };
+    fs.writeFileSync(path.join(tmp, 'manifest.json'), JSON.stringify(manifest));
+    await evalRun(tmp, {
+      maxUsd: 1,
+      deps: { judgeRender: async () => ({ pass: true, categories: { product_fidelity: 9 }, summary: 'clean' }) },
+      log: { log: () => {}, warn: () => {}, error: () => {} }
+    });
+    const after = JSON.parse(fs.readFileSync(path.join(tmp, 'manifest.json'), 'utf8'));
+    const notes = after.cells[0].notes;
+    assert.strictEqual(notes.length, 2, 'the human note must survive');
+    assert.strictEqual(notes[0].text, 'human observation');
+    assert.strictEqual(notes[1].auto, true);
+    assert(notes[1].model, 'the auto-note must record which model judged');
+    fs.rmSync(tmp, { recursive: true, force: true });
+  });
+
   console.log(`\n${passed} passed, ${failed} failed`);
   process.exit(failed ? 1 : 0);
 })().catch((err) => {
