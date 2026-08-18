@@ -94,7 +94,25 @@ const campaignRunSchema = new mongoose.Schema({
     aspectRatio: String,
     mediaId:    String,
     productId:  String,
-    message:    String
+    message:    String,
+    // ── LLM failure taxonomy (services/llmError.js) ──
+    // DECLARED, not free-form: this schema is STRICT, so an undeclared path is
+    // silently DROPPED on write — the trap that already lost
+    // `renderError.predictionId` (CLAUDE.md §2/§4). Adding the field to the
+    // write site without adding it here would look correct, pass every
+    // source-text harness, and store nothing.
+    //
+    // `code`   — stable UPPER_SNAKE class (LLM_RATE_LIMITED, LLM_TIMEOUT, …).
+    //            Exists because "Atlas 400: bad request" reached the operator
+    //            with no way to tell a param bug from a capacity outage.
+    // `action` — what the system ACTUALLY did next (EXHAUSTED_CHAIN,
+    //            GAVE_UP_PRODUCT, …), so a reader can tell "we recovered"
+    //            from "your ads are gone" without a log dig.
+    // `chain`  — the compact ordered attempt summary, e.g.
+    //            "tried a (429, 51.0s) → b (429, 50.0s) → c (ok, 1.0s)".
+    code:       String,
+    action:     String,
+    chain:      String
   }],
 
   // Per-product expansion outcomes. Written when expandWizardJob finishes
@@ -134,7 +152,12 @@ const campaignRunSchema = new mongoose.Schema({
     }],
     payloadsBeforeCap: Number,
     error:             String,
-    errorName:         String
+    errorName:         String,
+    // Same taxonomy as errors[].code above, on the per-product row the UI
+    // poller returns. Declared for the same strict-schema reason.
+    errorCode:         String,
+    errorAction:       String,
+    errorChain:        String
   }],
 
   requestedBy:  { type: mongoose.Schema.Types.ObjectId, ref: 'User', default: null },

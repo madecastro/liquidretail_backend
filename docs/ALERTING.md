@@ -145,7 +145,155 @@ Covered by `scripts/verifyRunFeed.js` (offline; revert-proves the never-escape a
 | `Video generation failed` | error | `routes/ads.js` | Atlas prediction failed or timed out |
 | `Campaign run finished with N failed ad(s)` | warn/error | `runRenderLoop` | Escalates to error when **every** ad failed |
 | `Campaign run crashed …` | error | `routes/ads.js` | The loop itself threw |
-| `Claim anomaly — run … released` | **fatal** | `routes/ads.js` `/generate` | **New** — `claimAdsForRun`'s updateMany reported a write but the ownership re-read came back empty (should never fire). Ads released to `queued`, run marked `failed`. Sent to the fatal/alert channel, **never** the per-run status feed. See *Claim-anomaly alert* below |
+| `Claim anomaly — run … released` | **fatal** | `routes/ads.js` `/generate` | `claimAdsForRun`'s updateMany reported a write but the ownership re-read came back empty (should never fire). Ads released to `queued`, run marked `failed`. Sent to the fatal/alert channel, **never** the per-run status feed. See *Claim-anomaly alert* below |
+| `Director LLM unreachable — static ad generation is producing ZERO ads` | **fatal** | `campaignAdsGenerationService` per-product catch | Every Director candidate failed. **Fires from the SECOND occurrence** (see *Occurrence thresholds*). Carries the code, the chain summary, and the emergency lever |
+| `Director served by a FALLBACK model — the primary is unavailable` | warn | `aiCreativeDirectorService.directConceptsRound` | Ads ARE being produced, but by a fallback chain link. Fires on the first occurrence per serving model |
+
+### Director alerts — added 2026-08-18 after a 20-hour silent outage
+
+Static ad generation was **100% dead for ~20h** and nothing paged. Two gaps,
+both closed here:
+
+1. **No alert on total failure.** The per-product catch in
+   `campaignAdsGenerationService` only `console.error`'d. The run finished, the
+   operator saw *0 static ads* and no error. The only pre-existing Director
+   alert (`director:contract-warn`) fires for a payload that **parsed** — i.e.
+   the one case where the Director was working.
+2. **No alert on degradation.** A Director quietly served by a fallback model
+   looked identical to a healthy one in every log and artifact.
+
+| | Total failure | Fallback served |
+|---|---|---|
+| Level / channel | `fatal` → `SLACK_ALERT_CHANNEL_FATAL` | `warn` → `SLACK_ALERT_CHANNEL` |
+| Dedupe key | `director:transport-failure` (**global**) | `director:fallback-served:<provider>/<model>` |
+| Threshold | **2nd occurrence** within `ALERT_THRESHOLD_WINDOW_MIN` | none — first occurrence pages |
+| Delivery | `notifyAsync`, never awaited, cannot throw | same |
+
+**The failure key is global, not per-product, and that is deliberate.** A
+gateway outage hits every product; keying per product would turn one fault into
+fifty pages and get the channel muted. The consequence is that the
+`brandId`/`productId`/`campaignId` fields name an **exemplar** — whichever
+product tripped the threshold — while the `chain` line in `detail` is what
+actually identifies the fault.
+
+The message states, in plain words: the consequence (*static ad generation is
+producing ZERO ads for these products; video is unaffected*), what the system
+did (`action`), what a human should do (`operatorAction` for that code), and
+the zero-deploy lever (`ATLAS_MODEL_DIRECTOR`).
+
+**Why `warn` and not `info` for the fallback notice:** `ALERT_MIN_LEVEL`
+defaults to `warn`, so an `info` notice would be muted in production — the same
+silence in a new hat.
+
+## Occurrence thresholds — "alert me if it happens more than once"
+
+`notify({ …, minCount: 2 })` holds the first occurrence of a `key` and delivers
+from the second, inside a rolling `ALERT_THRESHOLD_WINDOW_MIN` window.
+
+This is **not a second dedupe mechanism** — it reuses the same `key` namespace
+and folds held occurrences into the same `suppressed` tally, so the eventual
+delivery carries `+N more (suppressed)` and the operator can see it was the
+second of several rather than an isolated event. Two gates in series:
+
+```
+occurrence threshold  →  dedupe window  →  severity rate limit  →  Slack
+   (minCount)            (15 min)           (20/min low, 60/min high)
+```
+
+Omitting `minCount` (or passing 1) is exactly today's behaviour, so every
+pre-existing caller is unchanged.
+
+**Window = 30 minutes**, and the trade is deliberate:
+
+- *Shorter* and an outage producing one failure per small run never pairs two
+  hits and never pages — the 20-hour silence, again.
+- *Longer* and two unrelated blips days apart get welded into a "recurring"
+  page, which is how a channel loses credibility.
+
+`ALERT_THRESHOLD_WINDOW_MIN=0` **disables the threshold** (every occurrence
+pages), matching `ALERT_DEDUPE_WINDOW_MIN=0`. It deliberately does *not* mean
+"expire instantly" — that reading would make the knob a silent mute switch for
+exactly the alerts someone bothered to set a threshold on.
+
+## LLM error codes — what each one means and what to DO
+
+Every LLM failure now carries a stable `code`, full diagnostic context, and an
+`action` saying what the system actually did next. Owner directive 2026-08-18:
+*"every failure to an LLM call should be reported with a easy to understand and
+complete error code"* and *"and what steps were taken next"*.
+
+Before this, `Atlas 400: {"code":400,"msg":"bad request"}` was all that reached
+an operator — indistinguishable from a capacity outage, which is exactly what
+the real fault turned out to be (**HTTP 429 after ~51 seconds**).
+
+Defined once in **`services/llmError.js`** and imported everywhere; the
+`operatorAction` text below lives in that file's `CODE_META` so this table
+cannot drift from the code (pinned by `scripts/verifyLlmErrorCodes.js` F1).
+
+`billable` answers *"did we pay for this?"* — `false` because failed LLM
+requests are documented as never billed, `true` for HTTP 200 responses whose
+tokens were generated, and `unknown` where we genuinely cannot tell.
+
+| Code | Means | billable | What to DO |
+|---|---|---|---|
+| `LLM_RATE_LIMITED` | HTTP 429 — the provider is capacity-starved on this model | `false` | **Do not raise the timeout** — the 429 already burned ~50s. Let the chain advance to a non-Anthropic link, or set `ATLAS_MODEL_DIRECTOR` to a probed-healthy slug |
+| `LLM_TIMEOUT` | We stopped waiting; no status ever arrived | `unknown` | Check Atlas usage / `request_id` before replaying — this is the ambiguous billing case. Prefer advancing over raising the timeout |
+| `LLM_BAD_REQUEST` | HTTP 400/422 — the request itself was rejected | `false` | Read the provider message. Usual causes: sampling params on Claude 5, `json_schema` on Anthropic, an unaccepted field. Fix the body or the model map — retrying is futile |
+| `LLM_AUTH_MISSING` | **No key was ever configured; nothing was sent** | `false` | Set that provider's key on **both** Render services, or drop the link. This is the code for the silent skip that hid the 2026-08-18 outage |
+| `LLM_AUTH_REJECTED` | HTTP 401/403 — a key was sent and refused | `false` | Replace the key on both services. **Do not rotate** if the body mentions quota/balance — that is the next row and the key is fine |
+| `LLM_QUOTA_EXHAUSTED` | HTTP 402, or a 403 whose body says quota/balance | `false` | Top up the wallet. Outranks a bare 403 so a credit outage is never mishandled as a permissions problem |
+| `LLM_MODEL_UNROUTED` | HTTP 400 `router not found` — listed in the catalog, no router | `false` | Re-point the role (`atlasModelMap` / `ATLAS_MODEL_<ROLE>`) to a slug probed live. `openai/gpt-5-nano` is the canonical example |
+| `LLM_UPSTREAM_ERROR` | Provider 5xx | `false` | Safe to retry — there is no image-style running task to probe. If it persists, advance rather than sitting on a down route |
+| `LLM_NETWORK_ERROR` | Reset / refused / DNS / hang-up before any reply | `unknown` | May have been delivered and billed. Check `request_id` before replaying |
+| `LLM_CONTENT_EMPTY` | HTTP 200, empty `message.content` — **tokens billed** | `true` | Usually hidden reasoning eating `max_tokens` (`finish_reason: length`). Raise `ATLAS_REASONING_RESERVE_TOKENS` or the caller budget |
+| `LLM_CONTENT_UNPARSEABLE` | HTTP 200, body was not the required JSON — **tokens billed** | `true` | Use the salvage + one-shot corrective re-ask. **Never** advance a fallback chain on this |
+| `LLM_REFUSED` | HTTP 200, the model asked a question instead of answering | `true` | Re-ask once with the OUTPUT CONTRACT reminder; a thin brief will keep refusing and each attempt is paid |
+| `LLM_UNCLASSIFIED` | Matched nothing | `unknown` | Capture status, errCode, `request_id` and the first 200 chars of the body, then **add a real code** — do not guess a retry |
+
+### The `action` — what the system did next
+
+Never the intent, always the outcome, stamped by the control flow *after* it
+ran (`stampLlmAction`). A code with no action leaves the reader unable to tell
+"we recovered" from "your ads are gone".
+
+| Action | Means |
+|---|---|
+| `RETRIED_SAME_MODEL` | Re-sent the same slug (attempt N of M) |
+| `ADVANCED_TO_NEXT_LINK` | Moved to the next chain candidate — the link is named |
+| `FELL_BACK_TO_DIRECT_PROVIDER` | Left Atlas for the vendor's own API — provider+model named |
+| `CORRECTIVE_REASK` | Issued the one-shot bad-JSON re-ask (shares the attempt budget) |
+| `SKIPPED_NO_KEY` | Skipped without attempting — no key for that link |
+| `EXHAUSTED_CHAIN` | Every candidate failed. **Transport-level** give-up |
+| `GAVE_UP_PRODUCT` | This SKU mints no ads (video is unaffected) |
+| `GAVE_UP_RUN` | The whole run is done |
+
+The **final** error additionally carries a one-line chain summary so a single
+Slack message tells the whole story:
+
+```
+tried anthropic/claude-sonnet-5 (429, 51.0s) → direct:claude-sonnet-5 (auth_missing, 0.0s)
+  → anthropic/claude-opus-5 (429, 50.0s) → openai/gpt-5.6-terra (ok, 1.0s)
+```
+
+### Where the codes surface
+
+1. **Render logs** — one dense greppable line per failure:
+   `[LLM_RATE_LIMITED] role=director provider=atlas model=anthropic/claude-sonnet-5 status=429 after=51.0s attempt=1/1 link=1/3 request_id=… — is rate-limiting this model; advanced to anthropic/claude-opus-5`
+2. **Slack** — the alerts above carry `code`, `action`, `request_id`,
+   `billable` and the chain, not a truncated `err.message`.
+3. **`CampaignRun.errors[]` and `CampaignRun.perProduct[]`** — `code`, `action`
+   and `chain` are **declared on the strict schema** (`models/CampaignRun.js`).
+   They had to be: an undeclared path is silently dropped, which is how
+   `renderError.predictionId` was lost once already.
+4. **The thrown object** — `err.code` / `err.llmCode`, `err.action`,
+   `err.retryable`, `err.billable`, `err.chain`, `err.chainSummary`, so callers
+   branch on a constant instead of regexing message text.
+
+**Backwards compatibility deliberately preserved** (grep before changing a
+message string): `err.status` is still set alongside `err.httpStatus` because
+`judgeService.js:322-334` branches on it, and the provider's own text still
+appears in `err.message` because that same retry matches
+`/Timeout while downloading/i` against it.
 
 **Deliberately not alerted:** a nonzero count of `queued` Ads.
 `expandWizardJob` routinely queues more creatives than
@@ -242,6 +390,7 @@ Non-secret, all in `config/defaults.env`, all overridable per-service:
 | `ALERTS_ENABLED` | `true` | `false` mutes without unsetting the token |
 | `ALERT_MIN_LEVEL` | `warn` | `info` \| `warn` \| `error` \| `fatal` |
 | `ALERT_DEDUPE_WINDOW_MIN` | `15` | Per-key; repeats are counted and folded into the next delivery (`+7 more since 18:51Z`) |
+| `ALERT_THRESHOLD_WINDOW_MIN` | `30` | Rolling window for `minCount` (the "more than once" gate). `0` **disables** the threshold, it does not mute. Code default; not in `defaults.env` |
 | `ALERT_RATE_LIMIT_MAX` | `20` | Hard ceiling per minute, independent of dedupe |
 | `ALERT_WATCHDOG_INTERVAL_MIN` | `5` | Health-sweep cadence |
 | `ALERT_RENDERING_STALE_MIN` | `12` | **Keep below `REAP_STALE_MIN` (15)** |

@@ -671,9 +671,101 @@ Video never launches a browser.
   that outcome: PR #61 hardened the VIDEO prompt and was rolled back in full
   (§00). Pinned by `scripts/verifyStaticFidelityPrompt.js` (419 checks, both arms,
   revert-proven on three mutations).
+- **THE DIRECTOR NOW HAS A CROSS-PROVIDER FALLBACK CHAIN. Read this before
+  touching `MAP.director` (2026-08-18, owner-directed after a ~20h total
+  static outage).**
+  **Measured live from the production service**, same `ATLAS_API_KEY`,
+  sequential single calls, no concurrency:
+  | slug | result |
+  |---|---|
+  | `anthropic/claude-sonnet-5` (the Director) | **HTTP 429 after ~51 SECONDS** |
+  | `anthropic/claude-opus-5` | **429 after ~50s** |
+  | `anthropic/claude-sonnet-4.5-20250929` | 429 after ~50s |
+  | `anthropic/claude-sonnet-4.6` | 200, but **52s** |
+  | `anthropic/claude-sonnet-5-ccmax` | 200 in 1.7s |
+  | `openai/gpt-5.6-terra` | **200 in 1.0s** |
+  | `google/gemini-2.5-pro` / `-flash` | 200 in 1.7s / 0.7s |
+  Atlas is **capacity-starved on several DIRECT Anthropic routes**. It is NOT
+  our payload (every shape 429'd, including one carrying an invalid
+  temperature that should have 400'd first), NOT the model id (sonnet-5 is
+  live in the catalog), NOT credit (other providers answer instantly on the
+  same key), and NOT the temperature-400 — `rejectsSamplingParams` already
+  covers that and still must.
+  **WHY THE EXISTING FALLBACK DID NOT SAVE US, which is the real lesson:**
+  `MAP.director.direct.provider` was `'anthropic'`, and `DIRECT_KEYS`
+  (`atlasLlmService`) only knows `openai` (`OPENAI_API_KEY`) and `google`
+  (`GEMINI_API_KEY`). **No Render service carries `ANTHROPIC_API_KEY`** (WEB
+  24 vars, WORKER 15 — checked). So the Director's configured fallback was
+  *structurally incapable of firing*, silently, while `layoutInputService`
+  survived the same Atlas errors purely because ITS fallback is google. **A
+  same-provider fallback is not a fallback when the provider is what is
+  down.** A keyless direct twin is now a recorded `LLM_AUTH_MISSING` skip
+  rather than silence.
+  **The chain** (`MAP.director.chain`, owner order: *"fallback to Opus, then
+  go to GPT5.6Terra"*): `anthropic/claude-sonnet-5` →
+  `anthropic/claude-opus-5` → `openai/gpt-5.6-terra`. Opus is 429 today too
+  and **stays in on purpose** — the chain exists so a starved link is skipped
+  in ~50s, not so down models get deleted from the design.
+  **Mechanism, and the constraint that shaped it:** `chain` is an OPT-IN field
+  on a MAP entry, and `resolveChain(role)` returns exactly one link —
+  `resolveModel(role)` — for every role that lacks it. The transport's loop
+  over a one-element list *is* the pre-chain code, so "every other role is
+  unchanged" is structural, not a claim. Pinned by
+  `scripts/verifyDirectorFallbackChain.js` A2/C5.
+  **Fail-fast numbers, justified against the measurements above:** non-final
+  links get ONE Atlas attempt at `CHAIN_LINK_TIMEOUT_MS` (**75s**) — above the
+  ~51s 429 so a starved link still resolves as a *definite, unbilled*
+  rejection rather than an ambiguous timeout, and above the 52s slowest
+  measured success so a slow-but-healthy primary is not abandoned. The final
+  link keeps the full 120s. `CHAIN_BUDGET_MS` (210s) gates *starting* a
+  request, never truncates one in flight. `CHAIN_MAX_ATTEMPTS` (**4**) bounds
+  total upstream requests per call — for the Director exactly 3 Atlas links +
+  1 OpenAI direct twin. **Worst case per Director round is 8 upstream
+  requests** (the round's own corrective re-ask can invoke the transport
+  twice).
+  **What advances the chain: transport failures ONLY** — 429, 5xx, timeout,
+  connection error, and the listed-but-unrouted 400 (`ADVANCES_CHAIN` in
+  `services/llmError.js`). A 400/401/402/403 does **not** advance: it fails
+  identically on the next candidate and would just buy the same answer at
+  another model's price. **A 200 whose CONTENT is bad JSON must NEVER advance**
+  — that is the one-shot corrective re-ask below, and advancing would multiply
+  PAID calls for a prompt-compliance problem.
+  ⚠️ **MONEY — a timeout is the ambiguous one and we advance anyway.** A 429 is
+  a rejection before work began, so advancing costs nothing. A timeout does
+  not prove the upstream stopped, so it may have billed tokens we never saw;
+  advancing can pay twice for one round. Accepted **here only**, because this
+  is a TEXT/LLM call billed per token (~$0.105 a round) against the certainty
+  of ZERO ads, and it is bounded by `CHAIN_MAX_ATTEMPTS`. **This reasoning does
+  not transfer.** The image/video submit rule above is unchanged: a billable
+  POST is replayed only on structured proof of pre-work rejection
+  (`isDefinite429` / `submitRetryDecision`). Nothing in the LLM chain touches it.
+  **`ATLAS_MODEL_DIRECTOR` remains the zero-deploy emergency lever, and it WINS
+  TOTALLY** — it collapses the chain to the one slug named, dropping the
+  fallbacks. An operator reaching for it during an outage is naming what should
+  run right now; silently appending two more paid candidates would make the
+  lever unpredictable exactly when predictability is the point. Cost of that
+  choice: an override pointed at a starved model reinstates the outage until it
+  is changed again.
+  **Known accepted fallback defect:** `gpt-5.6-terra` was the bake-off's
+  ELIMINATED incumbent, specifically for putting the product name in copy
+  against an explicit directive — which `validateDirectorPayload`'s
+  `forbiddenStrings` scan catches. Expect more contract warnings and more
+  corrective re-asks while it serves. Degraded output beats zero ads; the
+  `director:fallback-served` Slack notice exists so nobody mistakes it for
+  normal.
+  **Sampling is deliberately asymmetric across the chain.** The Director asks
+  for `DIRECTOR_ROUND_TEMP=0.45` (chosen for consistency). The two Claude 5
+  links CANNOT honour it — Atlas bare-400s `temperature`/`top_p`/`top_k` on
+  that family, so `rejectsSamplingParams` strips them and those links run at
+  the model default. The OpenAI link DOES honour 0.45. **The fallback therefore
+  runs more deterministically than the primary.** Stated here rather than
+  discovered later.
 - **Director round JSON is not enforced by the gateway (SEPARATE from the
   competitor-mark defect above).** The `director` role maps to
-  `anthropic/claude-sonnet-5-ccmax` (`services/atlasModelMap.js:98`). Atlas
+  `anthropic/claude-sonnet-5` — **the plain route, not `-ccmax`**; the
+  `-ccmax` claim that used to sit here (with a stale `:98` line anchor) was
+  superseded on 2026-08-04, see the ROUTE CHANGED note in
+  `services/atlasModelMap.js`. Atlas
   **silently ignores** `response_format:{type:'json_object'}` for that model —
   probed live 2026-08-04, two arms (flag on / flag off), **both** returned
   conversational prose. Distinct from the already-documented fact that
@@ -1183,6 +1275,40 @@ Full detail in `docs/ATLAS.md` §7 and `docs/CLOUDINARY-VIDEO.md`. Headlines:
   **Route registration order** is what keeps `/formats`, `/video-models`,
   `/veo-prompt-scaffold`, etc. from falling through to `/:id`. Unknown
   non-ObjectId paths 404; unregistered 12-char names still cast and hit `/:id`.
+- **EVERY LLM FAILURE CARRIES A CODE AND AN ACTION — `services/llmError.js`,
+  imported, never re-implemented.** Owner directive 2026-08-18: *"every failure
+  to an LLM call should be reported with a easy to understand and complete
+  error code"* + *"and what steps were taken next"*. Before this, `Atlas 400:
+  {"code":400,"msg":"bad request"}` was all an operator got — it cannot
+  distinguish a param bug from a capacity outage from a missing key, and the
+  real fault was a fourth thing again (429 after ~51s). Thirteen
+  `LLM_*` codes, each with `retryable`, a **derived** `billable`
+  (`false` / `true` / `'unknown'` — a 429 bills nothing, a timeout is
+  genuinely unknown, an HTTP-200 content failure DID bill), and an
+  `operatorAction` saying what a human should do. The `action` is what the
+  system ACTUALLY did next (`EXHAUSTED_CHAIN`, `ADVANCED_TO_NEXT_LINK`,
+  `SKIPPED_NO_KEY`, `GAVE_UP_PRODUCT`, …), stamped by the control flow AFTER
+  it ran via `stampLlmAction` — never hardcoded beside a call site where a
+  later edit makes it a lie. Full code→meaning→what-to-DO table in
+  `docs/ALERTING.md`.
+  **Surfaces in four places**: the Render log line, Slack, `CampaignRun.errors[]`
+  / `.perProduct[]`, and the thrown object. The Mongo ones needed **schema
+  declarations** (`models/CampaignRun.js`) — a strict schema drops an
+  undeclared path in silence, the same trap that lost
+  `renderError.predictionId`.
+  ⚠️ **Two backwards-compat details that look removable and are not:**
+  `makeLlmError` sets **`err.status`** alongside `err.httpStatus` because
+  `judgeService.js:322-334` branches on `err?.status === 400` to retry a
+  Cloudinary CDN race, and it keeps the **provider's own text inside
+  `err.message`** because that same retry matches
+  `/Timeout while downloading/i` against it. Dropping either turns a working
+  retry into dead code with every test still green. `costTracker.js:120`
+  likewise reads `/timeout/i` off `err.message` to pick the CostLog status —
+  `[LLM_TIMEOUT]` satisfies it, a 429's message deliberately does not.
+  **Scope boundary, enforced by `verifyLlmErrorCodes.js` A5:** this taxonomy is
+  for TEXT/chat/embedding endpoints ONLY. `atlasErrorPolicy.js` still owns
+  image/video, where "advancing is free" is FALSE and a replay needs structured
+  proof of pre-work rejection. Do not import one into the other.
 - **Slack, not Telegram. `res.ok` is not delivery.** `SLACK_BOT_TOKEN` is the
   only secret (Render env on **both** services). Channels are committed in
   `config/defaults.env` (non-secret): `SLACK_ALERT_CHANNEL`,
