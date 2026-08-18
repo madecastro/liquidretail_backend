@@ -223,7 +223,74 @@ function releasableExpr(allowRenderingRelease) {
 
 // Fields this module owns. A caller cannot smuggle them in through extraSet —
 // silently letting one through would defeat the whole guard.
-const MANAGED_FIELDS = Object.freeze(['identityDigest', 'preArchiveIdentityDigest', 'status', 'updatedAt']);
+//
+// `wasRendering` is managed for a subtle reason worth stating: passing
+// `extraSet: { wasRendering: false }` would NOT change the archive's own
+// decision (every expression in a `$set` stage is evaluated against the INPUT
+// document), so it would look harmless — but the flag would be cleared on the
+// stored row, a later restore would carry the `false`, and a SECOND archive
+// would then release a BILLED identity. Throw instead.
+const MANAGED_FIELDS = Object.freeze([
+  'identityDigest', 'preArchiveIdentityDigest', 'status', 'updatedAt', 'wasRendering'
+]);
+
+// ── THE REQUEUE-SITE LEDGER ──────────────────────────────────────────────
+// Every site that moves an Ad from 'rendering' back to 'queued' must spread
+// EXACTLY ONE of these into its `$set`. Neither is optional and neither may be
+// implied by omission: a site that stamps nothing is indistinguishable from a
+// site whose author forgot, and that ambiguity is what the ledger removes.
+//
+//   REQUEUE_MARK  — "a billable submit MAY have happened behind this requeue."
+//                   Stamps the durable marker, so the archive helper will never
+//                   free this identity. The safe default.
+//   PRE_DISPATCH  — "no submit can have happened, and control flow PROVES it."
+//                   Deliberately writes nothing. Only for sites where the
+//                   submit code was structurally never entered.
+//
+// WHY EXEMPTIONS EXIST AT ALL. Marking a provably submit-free row is not free:
+// the 24h sweeper then archives it and KEEPS its digest, silently undoing the
+// archive-digest release for exactly the never-billed rows that release was
+// written for. Over-marking is a squatted identity; under-marking is a re-bought
+// ~$0.90 Omni master. The asymmetry still governs — so exempt ONLY on proof,
+// and stamp whenever it is a judgement call.
+const REQUEUE_MARK = Object.freeze({ wasRendering: true });
+const PRE_DISPATCH = Object.freeze({});
+
+/**
+ * The verdict for every requeue site, in ONE place so the next reader does not
+ * re-derive it. scripts/verifyArchiveDigestRelease.js cross-checks this table
+ * against a fresh scan AND pins each exemption's proof structurally, so a site
+ * that later gains a reachable submit path fails the harness.
+ */
+const REQUEUE_SITES = Object.freeze([
+  { file: 'routes/ads.js', site: 'generate:cas-lost-release', verdict: 'PRE_DISPATCH',
+    proof: 'the running-flip CAS fails and the handler `return`s BEFORE `await runRenderLoop(...)`, '
+         + 'which is where the first billable submit lives. Pinned by E15a.' },
+  { file: 'routes/ads.js', site: 'generate:prep-render-crash', verdict: 'REQUEUE_MARK',
+    proof: 'wraps runRenderLoop — a submit may well have happened.' },
+  { file: 'routes/ads.js', site: 'claimAdsForRun:anomaly-release', verdict: 'PRE_DISPATCH',
+    proof: 'inside the claim itself; claimAdsForRun contains no submit call at all. Pinned by E15b.' },
+  { file: 'routes/ads.js', site: 'runs:render-loop-crash', verdict: 'REQUEUE_MARK',
+    proof: 'wraps runRenderLoop — a submit may well have happened.' },
+  { file: 'routes/ads.js', site: 'runs:post-claim-throw', verdict: 'PRE_DISPATCH',
+    proof: 'the outer catch; `setImmediate(runRenderLoop)` is the LAST statement of the try, so no '
+         + 'await follows it and the catch cannot run after the loop began. Pinned by E15c.' },
+  { file: 'routes/ads.js', site: 'renderDeriveOnlyVideoAd:wait-requeue', verdict: 'PRE_DISPATCH',
+    proof: 'the derive path is submit-free by contract (crop + titling only). Pinned by E15d here '
+         + 'and by verifyPmaxVideoExpansion E1.' },
+  { file: 'services/processAlerts.js', site: 'sigterm:orphan-persist', verdict: 'REQUEUE_MARK',
+    proof: 'fires at an arbitrary point in a render; a submit may be in flight.' },
+  { file: 'worker.js', site: 'reaper:stale-rendering', verdict: 'REQUEUE_MARK',
+    proof: 'fires at an arbitrary point in a render; a submit may be in flight.' }
+]);
+
+// WHY THE EXEMPTIONS ARE SAFE ACROSS PASSES, not just within one. A row that
+// was billed in an EARLIER pass can only reach a later claim by having been
+// requeued out of 'rendering' first — and every such path is in the table
+// above, so it already carries the marker (which is never cleared). The four
+// PRE_DISPATCH sites therefore only ever see rows whose CURRENT pass submitted
+// nothing; a billed history is already recorded. That induction is exactly as
+// strong as the scan's completeness, which is why E14's self-probe matters.
 
 /**
  * Wrap caller-supplied values as aggregation LITERALS.
@@ -263,6 +330,26 @@ function buildArchiveSetStage({ extraSet = {}, now = new Date(), allowRenderingR
         '$identityDigest'
       ]
     },
+    // ⚠️ RECORD THE RENDER HISTORY BEFORE IT IS LOST. Archiving erases the
+    // fact that a row was 'rendering', and ad.restore sends a renderUrl-less
+    // archived row back to 'queued' — which is CLAIMABLE and BILLABLE. Without
+    // this, the chain
+    //     rendering (billed, receipt not yet written)
+    //       → archived (digest correctly KEPT, status forgotten)
+    //       → ad.restore → queued, wasRendering false
+    //       → 24h sweeper archives it → digest RELEASED → next Generate re-buys
+    // reopens the very hole the marker exists to close, one step removed.
+    // Stamping here is precise, not blanket: only a row whose INPUT status is
+    // 'rendering' is marked, so mint leftovers (always 'queued') are untouched
+    // and the digest release they exist for is unaffected.
+    //
+    // Omitted entirely when the caller proved pre-dispatch (Stop's undispatched
+    // tail) — marking those would squat an identity nothing ever bought.
+    ...(allowRenderingRelease ? {} : {
+      wasRendering: {
+        $cond: [{ $eq: ['$status', 'rendering'] }, true, { $ifNull: ['$wasRendering', false] }]
+      }
+    }),
     status:    { $literal: 'archived' },
     updatedAt: { $literal: now }
   };
@@ -454,6 +541,9 @@ module.exports = {
   NEVER_RENDERED,
   restoreTookEffect,
   MANAGED_FIELDS,
+  REQUEUE_MARK,
+  PRE_DISPATCH,
+  REQUEUE_SITES,
   tombstoneFor,
   isTombstoneDigest,
   DIGEST_RELEASABLE,

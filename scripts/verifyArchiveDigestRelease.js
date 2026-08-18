@@ -290,13 +290,20 @@ function inertAd(over = {}) {
 // scripts/ — never hardcoded, so a new archive site cannot slip past
 // (CLAUDE.md §4, the receiptFree unbound-identifier incident).
 // ─────────────────────────────────────────────────────────────────────────
+// A `//` strip must not eat a line because it contains `https://`. Requires the
+// slashes to be preceded by start-of-line or a non-`:` character — same
+// stripper shape verifyPmaxVideoExpansion uses, and for the same reason: an
+// over-eager strip silently deletes the very code the scan is looking for.
 function stripComments(src) {
-  return src.replace(/\/\*[\s\S]*?\*\//g, '').split('\n').map((l) => l.replace(/\/\/.*$/, '')).join('\n');
+  return src
+    .replace(/\/\*[\s\S]*?\*\//g, '')
+    .replace(/(^|[^:])\/\/.*$/gm, '$1');
 }
 
+const SKIP_DIRS = new Set(['node_modules', '.git', '.claude', 'worktrees', 'coverage', 'dist', 'build']);
 function walk(dir, out = []) {
   for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
-    if (e.name === 'node_modules' || e.name.startsWith('.')) continue;
+    if (SKIP_DIRS.has(e.name)) continue;
     const p = path.join(dir, e.name);
     if (e.isDirectory()) walk(p, out);
     else if (e.name.endsWith('.js')) out.push(p);
@@ -304,15 +311,12 @@ function walk(dir, out = []) {
   return out;
 }
 
-const SCAN_DIRS = ['services', 'routes', 'scripts'].map((d) => path.join(ROOT, d));
-// ROOT-LEVEL ENTRYPOINTS MATTER. worker.js hosts the 15-minute orphan reaper —
-// a real rendering→queued requeue site — and an earlier version of this scan
-// walked only the three directories above and therefore could not see it. A
-// scan with a blind spot is worse than no scan: it reports green.
-const ROOT_FILES = fs.readdirSync(ROOT, { withFileTypes: true })
-  .filter((e) => e.isFile() && e.name.endsWith('.js'))
-  .map((e) => path.join(ROOT, e.name));
-const FILES = [...SCAN_DIRS.flatMap((d) => (fs.existsSync(d) ? walk(d) : [])), ...ROOT_FILES]
+// WHOLE REPO, not a directory allow-list. Two blind spots were found the hard
+// way: worker.js (root level) hosts the 15-minute orphan reaper, and an
+// allow-list of services/ + routes/ + scripts/ cannot see a new top-level
+// folder (pipelines/, middleware/, utils/) at all. A scan with a blind spot is
+// worse than no scan — it reports green. Exclusions are vendor/VCS only.
+const FILES = walk(ROOT)
   // The verify* harnesses talk ABOUT these patterns; they never write.
   .filter((p) => !path.basename(p).startsWith('verify'));
 const SRC = new Map(FILES.map((p) => [path.relative(ROOT, p), fs.readFileSync(p, 'utf8')]));
@@ -344,12 +348,31 @@ function balanced(src, open) {
   return null;
 }
 
-// Receivers that mean "this write hits the Ad collection". `ads` is the
-// injected model adapter claimAdsForRun takes (routes/ads.js) — a real Ad write
-// wearing a different name, and exactly the kind of indirection a naive
-// `Ad.updateMany` grep misses.
-const AD_RECEIVERS = new Set(['Ad', 'ads']);
-const UPDATE_CALL = /([A-Za-z_$][\w$]*)\s*\.\s*(?:updateOne|updateMany|findOneAndUpdate|bulkWrite)\s*\(/g;
+// WHICH RECEIVERS COUNT AS "the Ad collection".
+//
+// Model-agnostic by default, then Ad-verified: anything that is NOT a known
+// other-model receiver is treated as a possible Ad write. The earlier
+// allow-list of exactly {Ad, ads} could be hidden from by renaming the import
+// (`AdModel.updateMany`, `model.updateMany`,
+// `require('../models/Ad').updateMany`), which is precisely the shape a future
+// unmarked requeue site would take. Denying the models we KNOW are not Ad is
+// the safe direction: a new model name defaults to "check it", not "skip it".
+const NON_AD_RECEIVERS = new Set([
+  'CampaignRun', 'DetectRun', 'Job', 'Brand', 'Campaign', 'Media', 'CatalogProduct',
+  'OperationRun', 'CropArtifact', 'LayoutInputArtifact', 'AiCanvasArtifact',
+  'ProductMatchArtifact', 'CreativeDirectionArtifact', 'AiFullRenderArtifact',
+  'Advertiser', 'User', 'IgPost', 'Category', 'Preset', 'ChargePoint'
+]);
+const isAdReceiver = (name) => !NON_AD_RECEIVERS.has(name);
+// findByIdAndUpdate was absent from the first version, which made
+// services/renderService.js's write invisible to BOTH this scan and E2.
+// The receiver may also be an inline `require('../models/Ad')` rather than a
+// bound identifier — a shape the self-probe proved the first version missed.
+const UPDATE_CALL = new RegExp(
+  '(?:([A-Za-z_$][\\w$]*)|require\\(\\s*[\'"][^\'"]*[\'"]\\s*\\))'
+  + '\\s*\\.\\s*(?:updateOne|updateMany|findOneAndUpdate|findByIdAndUpdate|bulkWrite)\\s*\\(',
+  'g'
+);
 
 /**
  * Every update whose *update document* touches the Ad collection, as
@@ -370,7 +393,8 @@ function adUpdateSites(onlyRel = null) {
     UPDATE_CALL.lastIndex = 0;
     let m;
     while ((m = UPDATE_CALL.exec(s))) {
-      if (!AD_RECEIVERS.has(m[1])) continue;
+      // An inline-require receiver has no captured name; unknown ⇒ check it.
+      if (!isAdReceiver(m[1] || 'require')) continue;
       // Walk the argument list, collecting each top-level `{…}` argument.
       let i = m.index + m[0].length, depth = 0;
       const args = [];
@@ -399,6 +423,33 @@ function adUpdateSites(onlyRel = null) {
     }
   }
   return out;
+}
+
+/**
+ * The update text of a site PLUS the body of any variable it uses as (or
+ * inside) its update document — `const set = { … }; Ad.updateMany(f, { $set: set })`.
+ *
+ * Without this, a requeue site could hide its `status:'queued'` in a variable
+ * and E14 would never see it. E2 already chased this shape for 'archived';
+ * E14 did not, which was the asymmetry review flagged.
+ */
+function siteTextWithPayloads(site) {
+  const src = STRIPPED.get(site.rel) || '';
+  let text = site.update;
+  const names = new Set();
+  for (const m of site.update.matchAll(/\$set:\s*([A-Za-z_$][\w$]*)\s*[,}]/g)) names.add(m[1]);
+  // A whole update document passed by identifier: `Ad.updateMany(filter, upd)`.
+  for (const m of site.update.matchAll(/,\s*([A-Za-z_$][\w$]*)\s*\)/g)) names.add(m[1]);
+  for (const name of names) {
+    const decl = new RegExp(`(?:const|let|var)\\s+${name}\\s*=\\s*\\{`).exec(src);
+    const blk = decl ? balanced(src, decl.index + decl[0].length - 1) : null;
+    if (blk) text += '\n' + blk;
+    // Property assignments after the declaration, e.g. `set.status = 'queued'`.
+    for (const am of src.matchAll(new RegExp(`${name}\\s*(?:\\.|\\[\\s*['"])status['"]?\\s*\\]?\\s*=\\s*[^;]+;`, 'g'))) {
+      text += '\n' + am[0];
+    }
+  }
+  return text;
 }
 
 // ═════════════════════════════════════════════════════════════════════════
@@ -545,7 +596,14 @@ ok('B8 extraSet values are $literal-wrapped — a copy string starting with $ is
   assert.strictEqual(out.copy.headline, '$50 off');
 });
 ok('B9 extraSet cannot smuggle in a managed field', () => {
-  for (const f of ['identityDigest', 'preArchiveIdentityDigest', 'status', 'updatedAt']) {
+  // wasRendering joined the managed set: passing `{ wasRendering: false }`
+  // would NOT change THIS archive's decision (expressions evaluate against the
+  // input doc), so it looks harmless — but it clears the flag on the stored
+  // row, a later restore carries the false, and a SECOND archive then releases
+  // a BILLED identity.
+  assert.deepStrictEqual([...H.MANAGED_FIELDS].sort(),
+    ['identityDigest', 'preArchiveIdentityDigest', 'status', 'updatedAt', 'wasRendering'].sort());
+  for (const f of ['identityDigest', 'preArchiveIdentityDigest', 'status', 'updatedAt', 'wasRendering']) {
     assert.throws(() => buildArchiveSetStage({ extraSet: { [f]: 'x' } }), /managed by this helper/,
       `${f} must be rejected — overriding it defeats the whole guard`);
   }
@@ -759,6 +817,33 @@ ok('C9 every restore surface REPORTS the refusal instead of claiming success', (
   assert.ok(!/modifiedCount/.test(purge.slice(purge.indexOf('if (RESTORE)'), purge.indexOf('const queuedFilter'))),
     'counting modifiedCount would report a refused restore as a success');
 });
+ok('C10 [MONEY] restoring NEVER clears the requeue marker', () => {
+  // A restore puts a row back into circulation — at 'queued' it is claimable
+  // and billable again. If the restore cleared wasRendering, a row that had
+  // been requeued out of a possibly-billed render would look pristine on its
+  // NEXT archive and its identity would be released. The marker is write-once
+  // by design; nothing anywhere clears it.
+  const stage = buildRestoreSetStage({ status: 'queued', now: NOW });
+  assert.ok(!('wasRendering' in stage),
+    'the restore stage must not touch wasRendering at all');
+  for (const target of ['queued', 'draft', 'live']) {
+    const out = applySetStage(buildRestoreSetStage({ status: target, now: NOW }),
+      inertAd({ status: 'archived', wasRendering: true,
+                identityDigest: tombstoneFor(AD_ID), preArchiveIdentityDigest: REAL_DIGEST }));
+    assert.strictEqual(out.wasRendering, true,
+      `restoring to '${target}' must preserve the marker`);
+    assert.strictEqual(out.identityDigest, REAL_DIGEST);
+  }
+  // End to end: rendering → archived → restored to queued → archived again
+  // must STILL keep the digest. This is the chain E14b closes.
+  const a1 = archive(inertAd({ status: 'rendering' }));
+  const r1 = applySetStage(buildRestoreSetStage({ status: 'queued', now: NOW }), a1);
+  assert.strictEqual(r1.wasRendering, true, 'the marker must survive the round trip');
+  const a2 = archive(r1);
+  assert.strictEqual(a2.identityDigest, REAL_DIGEST,
+    'the second archive must not release a possibly-billed identity');
+});
+
 ok('C7 the collision is REACHABLE by construction — a remint takes the freed slot', () => {
   // Archive frees the slot; a later Generate legitimately re-mints the SAME
   // digest on the same campaign. Restoring then puts two rows on one identity,
@@ -1088,23 +1173,99 @@ ok('E14 [SCAN][MONEY] EVERY rendering→queued requeue site stamps the durable m
   // The list is DERIVED by scanning for the write pattern, never hardcoded —
   // that is the whole point. Every `$set` that moves an Ad to status:'queued'
   // must carry the marker.
-  // Receiver-aware so a DetectRun / CampaignRun requeue is not mistaken for an
-  // Ad one, and balanced-brace so a nested object in the update cannot truncate
-  // the match.
+  // Receiver-aware (so a DetectRun requeue is not mistaken for an Ad one),
+  // balanced-brace (so a nested object cannot truncate the match), and
+  // payload-chasing (so a `const set = {…}` cannot hide the status write).
   const sites = adUpdateSites()
-    .filter(({ update }) => /status:\s*['"]queued['"]/.test(update));
+    .map((s) => ({ ...s, text: siteTextWithPayloads(s) }))
+    .filter(({ text }) => /status:\s*['"]queued['"]/.test(text));
   // A scan that finds nothing would pass everything.
   assert.ok(sites.length >= 8,
     `expected ≥8 Ad rendering→queued requeue writes, scan found ${sites.length} — the scan is broken`);
-  const unmarked = sites
-    .filter(({ update }) => !/wasRendering:\s*true/.test(update))
+
+  // EVERY site must make its verdict EXPLICIT. Stamping by omission is
+  // indistinguishable from forgetting, which is the ambiguity the two markers
+  // remove: REQUEUE_MARK ("a submit may sit behind this") or PRE_DISPATCH
+  // ("control flow proves none can").
+  const undeclared = sites
+    .filter(({ text }) => !/\.\.\.REQUEUE_MARK\b/.test(text) && !/\.\.\.PRE_DISPATCH\b/.test(text))
     .map(({ rel }) => rel);
-  assert.deepStrictEqual([...new Set(unmarked)], [],
-    'a requeue site that does not stamp wasRendering:true reopens the billed-but-unstamped hole');
-  // Name the sites in the failure output so a future reader sees the real list
-  // rather than a bare count.
-  assert.ok(new Set(sites.map((s) => s.rel)).size >= 3,
-    `requeue sites should span routes/, services/ and worker.js — found only ${[...new Set(sites.map((s) => s.rel))].join(', ')}`);
+  assert.deepStrictEqual([...new Set(undeclared)], [],
+    'a rendering→queued requeue site declares neither REQUEUE_MARK nor PRE_DISPATCH — ' +
+    'an omitted marker is indistinguishable from a forgotten one');
+
+  // The ledger must describe reality: as many PRE_DISPATCH sites in the code as
+  // the table claims, and as many REQUEUE_MARK sites.
+  const exemptLedger = H.REQUEUE_SITES.filter((r) => r.verdict === 'PRE_DISPATCH').length;
+  const markLedger   = H.REQUEUE_SITES.filter((r) => r.verdict === 'REQUEUE_MARK').length;
+  const exemptCode = sites.filter(({ text }) => /\.\.\.PRE_DISPATCH\b/.test(text)).length;
+  const markCode   = sites.filter(({ text }) => /\.\.\.REQUEUE_MARK\b/.test(text)).length;
+  assert.strictEqual(exemptCode, exemptLedger,
+    `${exemptCode} PRE_DISPATCH site(s) in code vs ${exemptLedger} in the REQUEUE_SITES ledger — ` +
+    'a new exemption must be justified in the ledger, not slipped in');
+  assert.strictEqual(markCode, markLedger,
+    `${markCode} REQUEUE_MARK site(s) in code vs ${markLedger} in the ledger`);
+  assert.strictEqual(H.REQUEUE_SITES.length, sites.length,
+    `the ledger describes ${H.REQUEUE_SITES.length} sites but the scan found ${sites.length}`);
+  for (const row of H.REQUEUE_SITES) {
+    assert.ok(row.proof && row.proof.length > 40,
+      `REQUEUE_SITES entry "${row.site}" has no real proof text`);
+  }
+  // Every file that names a marker must IMPORT it (the receiptFree lesson).
+  for (const [rel, s] of STRIPPED) {
+    if (rel === HELPER_REL) continue;
+    if (!/\.\.\.(?:REQUEUE_MARK|PRE_DISPATCH)\b/.test(s)) continue;
+    assert.ok(/require\(\s*['"][^'"]*adArchiveDigest['"]\s*\)/.test(SRC.get(rel)),
+      `${rel} spreads a requeue marker without requiring adArchiveDigest (ReferenceError at runtime)`);
+  }
+  // And the field must be DECLARED, or Mongoose strict drops every marker write
+  // and the guard silently evaluates false forever.
+  const modelSrc = fs.readFileSync(path.join(ROOT, 'models', 'Ad.js'), 'utf8');
+  assert.ok(/wasRendering:\s*\{\s*type:\s*Boolean,\s*default:\s*false\s*\}/.test(modelSrc),
+    'models/Ad.js must declare wasRendering — an undeclared path is silently dropped (CLAUDE.md §4)');
+  assert.ok(/\$ne:\s*\['\$wasRendering',\s*true\]/.test(SRC.get(HELPER_REL)),
+    'DIGEST_RELEASABLE must refuse a row carrying the requeue marker');
+});
+
+ok('E14a [SELF-PROBE] the requeue scanner can SEE every known hide-shape', () => {
+  // THE ACTUAL DELIVERABLE. `sites.length >= 8` only fails when the scan goes
+  // blind, never when a 9th unmarked site ships in a shape the scanner cannot
+  // parse. Plant each hide-shape review named and assert the scanner finds it.
+  // A scanner that cannot see these is decoration, and E14 would report green
+  // while the hole was wide open.
+  const shapes = {
+    'renamed receiver':        `AdModel.updateMany(f, { $set: { status: 'queued' } });`,
+    'generic receiver':        `model.updateMany(f, { $set: { status: 'queued' } });`,
+    'inline require receiver': `require('../models/Ad').updateMany(f, { $set: { status: 'queued' } });`,
+    'findByIdAndUpdate':       `Ad.findByIdAndUpdate(id, { $set: { status: 'queued' } });`,
+    'findOneAndUpdate':        `Ad.findOneAndUpdate(f, { $set: { status: 'queued' } });`,
+    'nested object first':     `Ad.updateMany(f, { $set: { renderError: { a: { b: 1 } }, status: 'queued' } });`,
+    'variable payload':        `const set = { status: 'queued' };\nAd.updateMany(f, { $set: set });`,
+    'whole-doc variable':      `const upd = { $set: { status: 'queued' } };\nAd.updateMany(f, upd);`,
+    'url on the same line':    `Ad.updateMany(f, { $set: { status: 'queued', src: 'https://x/y' } });`
+  };
+  const saved = new Map(STRIPPED);
+  const savedSrc = new Map(SRC);
+  const misses = [];
+  for (const [name, code] of Object.entries(shapes)) {
+    STRIPPED.clear(); STRIPPED.set('probe.js', stripComments(code));
+    SRC.clear(); SRC.set('probe.js', code);
+    const seen = adUpdateSites()
+      .map((s) => ({ ...s, text: siteTextWithPayloads(s) }))
+      .some(({ text }) => /status:\s*['"]queued['"]/.test(text));
+    if (!seen) misses.push(name);
+  }
+  STRIPPED.clear(); for (const [k, v] of saved) STRIPPED.set(k, v);
+  SRC.clear(); for (const [k, v] of savedSrc) SRC.set(k, v);
+  assert.deepStrictEqual(misses, [],
+    'the scanner is blind to these shapes — an unmarked requeue site could ship in any of them');
+  // The comment stripper must not eat a line because it contains `https://`.
+  assert.ok(/status/.test(stripComments(`const u = 'https://x'; // note\nstatus: 'queued'`)));
+  assert.ok(!/note/.test(stripComments(`x; // note`)), 'the stripper must still remove real comments');
+  // …and the walk must reach a nested subdirectory and the repo root.
+  assert.ok(FILES.some((p) => /services\/capabilityExecutors\//.test(p)), 'walk misses nested dirs');
+  assert.ok(FILES.some((p) => path.basename(p) === 'worker.js'), 'walk misses root-level worker.js');
+  assert.ok(!FILES.some((p) => p.includes('node_modules')), 'walk must skip vendor code');
   // And the field must be DECLARED, or Mongoose strict drops every one of
   // those writes and the guard silently evaluates to false forever.
   const modelSrc = fs.readFileSync(path.join(ROOT, 'models', 'Ad.js'), 'utf8');
@@ -1115,14 +1276,127 @@ ok('E14 [SCAN][MONEY] EVERY rendering→queued requeue site stamps the durable m
     'DIGEST_RELEASABLE must refuse a row carrying the requeue marker');
 });
 
-ok('E14b the archive of Stop\'s undispatched tail must NOT stamp the marker', () => {
-  // Those rows are being ARCHIVED, not requeued — they never return to the
-  // queue, so marking them would be a lie and would pointlessly squat their
-  // identity. The archive stage's managed-field guard already refuses it.
-  assert.throws(() => H.buildArchiveSetStage({ extraSet: { status: 'queued' } }), /managed by this helper/);
-  const helperSrc = STRIPPED.get(HELPER_REL) || fs.readFileSync(path.join(ROOT, HELPER_REL), 'utf8');
-  assert.ok(!/wasRendering:\s*true/.test(helperSrc),
-    'the archive helper must never SET wasRendering — it only reads it');
+ok('E14b [MONEY] archiving RECORDS render history, except where pre-dispatch is proven', () => {
+  // REFINED. Archiving erases the fact that a row was 'rendering', and
+  // ad.restore sends a renderUrl-less archived row back to 'queued' — which is
+  // claimable and billable. So the chain
+  //   rendering (billed, receipt not yet written) → archived (digest correctly
+  //   KEPT) → restore → queued with no marker → sweeper archives → RELEASED
+  // reopens the hole one step removed. The archive stage therefore stamps
+  // wasRendering when the INPUT row is 'rendering'.
+  const fromRendering = archive(inertAd({ status: 'rendering' }));
+  assert.strictEqual(fromRendering.wasRendering, true,
+    'archiving a rendering row must record that it was rendering, or a later restore→queued loses it');
+  assert.strictEqual(fromRendering.identityDigest, REAL_DIGEST, 'and its digest is still kept');
+
+  // PRECISE, not blanket: a queued mint leftover is never marked, so the
+  // digest release this whole change exists for is untouched.
+  const leftover = archive(inertAd({ status: 'queued' }));
+  assert.strictEqual(leftover.wasRendering, false);
+  assert.strictEqual(leftover.identityDigest, tombstoneFor(AD_ID));
+
+  // Stop's undispatched tail proved pre-dispatch, so it must NOT be marked —
+  // marking it would squat an identity nothing ever bought.
+  const stopTail = archive(inertAd({ status: 'rendering' }), { allowRenderingRelease: true });
+  assert.ok(!('wasRendering' in H.buildArchiveSetStage({ allowRenderingRelease: true })),
+    'the pre-dispatch archive must not touch wasRendering at all');
+  assert.strictEqual(stopTail.identityDigest, tombstoneFor(AD_ID));
+
+  // An existing true is never downgraded by an archive.
+  assert.strictEqual(archive(inertAd({ status: 'queued', wasRendering: true })).wasRendering, true);
+  // …and a caller cannot clear it through extraSet.
+  assert.throws(() => H.buildArchiveSetStage({ extraSet: { wasRendering: false } }),
+    /managed by this helper/);
+});
+
+// ── E15 — each PRE_DISPATCH exemption's PROOF, pinned structurally.
+// An exemption is only as good as the control flow that justifies it. These
+// fail the moment a site gains a reachable submit path, which is the whole
+// point: without them "PRE_DISPATCH" is a comment, not a guarantee.
+// Mirrors how E13 pins Stop's single allowRenderingRelease opt-in.
+const SUBMIT_TOKENS = [
+  /veoGenerateForAd\s*\(/, /veoPrepareStoryboard\s*\(/, /atlasVideoService/,
+  /generateForAd\s*\(/, /renderCreative\s*\(/, /ugcVideoPipeline/
+];
+/**
+ * The BODY of a named function.
+ *
+ * Must skip the parameter list first: both of these functions destructure
+ * their arguments (`claimAdsForRun(ads, { selectedIds, runId })`,
+ * `renderDeriveOnlyVideoAd({ run, job, ad, … })`), so a naive "first `{` after
+ * the name" returns the PARAM object — a few dozen characters that contain no
+ * submit token and would make every absence check below vacuously pass.
+ */
+const namedFn = (src, decl) => {
+  const i = src.indexOf(decl);
+  if (i < 0) return null;
+  const paren = src.indexOf('(', i);
+  if (paren < 0) return null;
+  let depth = 0, close = -1;
+  for (let k = paren; k < src.length; k++) {
+    if (src[k] === '(') depth++;
+    else if (src[k] === ')') { depth--; if (depth === 0) { close = k; break; } }
+  }
+  if (close < 0) return null;
+  const open = src.indexOf('{', close);
+  return open < 0 ? null : balanced(src, open);
+};
+
+ok('E15a [PROOF] CAS-lost release is pre-dispatch — it returns BEFORE runRenderLoop', () => {
+  const s = STRIPPED_LATE('routes/ads.js');
+  const rel = s.indexOf('...PRE_DISPATCH, renderStage: null');
+  assert.ok(rel > 0, 'the CAS-lost release no longer declares PRE_DISPATCH');
+  const loopCall = s.indexOf('await runRenderLoop(');
+  assert.ok(loopCall > 0, 'runRenderLoop call not found');
+  assert.ok(rel < loopCall,
+    'the release must precede the only in-band runRenderLoop call — otherwise a submit can precede it');
+  // …and the branch must actually leave the handler, not fall through into it.
+  const between = s.slice(rel, loopCall);
+  assert.ok(/\breturn;/.test(between),
+    'the CAS-lost branch must `return` before runRenderLoop — without it the exemption is false');
+});
+
+ok('E15b [PROOF] claimAdsForRun contains no submit call at all', () => {
+  const s = STRIPPED_LATE('routes/ads.js');
+  const body = namedFn(s, 'async function claimAdsForRun(');
+  assert.ok(body && body.length > 400, 'claimAdsForRun body not found');
+  assert.ok(/\.\.\.PRE_DISPATCH/.test(body), 'the anomaly release no longer declares PRE_DISPATCH');
+  for (const t of SUBMIT_TOKENS) {
+    assert.ok(!t.test(body),
+      `claimAdsForRun now reaches ${t} — its anomaly release must stamp REQUEUE_MARK instead`);
+  }
+});
+
+ok('E15c [PROOF] /runs post-claim throw cannot fire after the render loop starts', () => {
+  const s = STRIPPED_LATE('routes/ads.js');
+  const si = s.indexOf('setImmediate(() => {\n      runRenderLoop(run, job, renderIds, renderToken)');
+  assert.ok(si > 0, 'the /runs setImmediate dispatch was restructured — re-derive the exemption');
+  const rel = s.indexOf('...PRE_DISPATCH', si);
+  assert.ok(rel > 0, 'the /runs post-claim release no longer declares PRE_DISPATCH');
+  // Between the dispatch and the catch that owns the release there must be NO
+  // `await`: an await would yield the event loop, letting runRenderLoop (and a
+  // submit) begin before the catch runs.
+  const catchIdx = s.indexOf('} catch (err) {', si);
+  assert.ok(catchIdx > si && catchIdx < rel, 'the release is not in the catch that follows the dispatch');
+  const between = s.slice(si, catchIdx);
+  const afterDispatch = between.slice(between.indexOf('});', between.indexOf('setImmediate')) );
+  assert.ok(!/\bawait\b/.test(afterDispatch),
+    'an await between setImmediate(runRenderLoop) and the catch lets a submit start first — ' +
+    'this site must then stamp REQUEUE_MARK');
+});
+
+ok('E15d [PROOF] renderDeriveOnlyVideoAd is submit-free (crop + titling only)', () => {
+  const s = STRIPPED_LATE('routes/ads.js');
+  const body = namedFn(s, 'async function renderDeriveOnlyVideoAd(');
+  assert.ok(body && body.length > 1500, 'renderDeriveOnlyVideoAd body not found');
+  assert.ok(/\.\.\.PRE_DISPATCH/.test(body), 'the derive wait-requeue no longer declares PRE_DISPATCH');
+  for (const t of SUBMIT_TOKENS) {
+    assert.ok(!t.test(body),
+      `renderDeriveOnlyVideoAd now reaches ${t} — a submit on the FREE derive surface, and its ` +
+      'wait-requeue must stamp REQUEUE_MARK');
+  }
+  // Prove the comment-strip left real code, or the absence check is vacuous.
+  assert.ok(/findSiblingMasterAd\s*\(/.test(body), 'stripping erased the body — absence proves nothing');
 });
 
 ok('E13 [SCAN][MONEY] exactly ONE call site opts in to releasing a rendering row\'s digest', () => {

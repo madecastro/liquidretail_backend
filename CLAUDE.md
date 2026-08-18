@@ -840,16 +840,42 @@ Video never launches a browser.
   `rendering` also keeps its digest; the single exception is Stop's
   undispatched tail (`allowRenderingRelease: true`), whose ids come from
   `p.queue.slice(p.next)` — ads the loop provably never handed to a renderer.
-  A second opt-in fails the harness. Note the archive of those rows must NOT
-  set `wasRendering` — they are being archived, not requeued.
+  A second opt-in fails the harness — and Stop's tail is also the one archive
+  that must NOT record the marker, because it is provably pre-dispatch.
+  **ARCHIVING A `rendering` ROW RECORDS THE MARKER (added 2026-08-18, third
+  pass).** Archiving erases the fact that a row was `rendering`, and
+  `ad.restore` sends a `renderUrl`-less archived row back to **`queued`** —
+  claimable and billable. So `rendering (billed, receipt not yet written) →
+  archived (digest correctly kept) → restore → queued with no marker → sweeper
+  archives → RELEASED` reopened the hole one step removed. The archive stage now
+  stamps `wasRendering` when the INPUT row is `rendering`. Precise, not blanket:
+  a `queued` mint leftover is never marked, so the digest release this all
+  exists for is untouched.
+  **WHICH REQUEUE SITES STAMP, AND WHY — the `REQUEUE_SITES` ledger in
+  `services/adArchiveDigest.js` is the single source of truth; do not re-derive
+  it.** Every requeue site spreads exactly one of two exported markers, so a
+  verdict is never implied by omission (an omitted marker is indistinguishable
+  from a forgotten one): `REQUEUE_MARK` = "a billable submit MAY sit behind
+  this"; `PRE_DISPATCH` = "control flow PROVES none can". Four sites are
+  exempt, each with a structural proof pinned by a harness check that fails the
+  moment that site gains a reachable submit path — the CAS-lost release
+  (`return`s before `await runRenderLoop`, E15a), `claimAdsForRun`'s anomaly
+  release (that function contains no submit call at all, E15b), `/runs`' outer
+  catch (`setImmediate(runRenderLoop)` is the LAST statement of the try, so no
+  `await` follows and the catch cannot run after the loop began, E15c), and the
+  derive wait-requeue (submit-free by contract, E15d). **Exempt only on proof;
+  stamp whenever it is a judgement call** — over-marking squats an identity,
+  under-marking re-buys a master, and that asymmetry governs. Exemptions are not
+  free: marking a provably submit-free row makes the 24h sweeper keep its digest,
+  silently undoing the release for exactly the never-billed rows it was written
+  for. **Cross-pass safety** rests on induction: a row billed in an earlier pass
+  can only reach a later claim by having been requeued out of `rendering` first,
+  and every such path is in the ledger, so the marker is already set.
   **Accepted residuals, stated rather than papered over:** (i) rows requeued
   *before* this deploy carry no marker and fall back to `renderStage` alone — a
-  historical sliver that shrinks to zero for new rows; (ii) a derive that
-  entered its wait loop is now marked, so that free 1:1 identity stays squatted
-  — never billed, so release *would* be safe, but keeping it is the correct
-  fail-closed direction; (iii) **no backfill**: rows archived before this change
-  still squat their digests. A second `PATCH → archived` heals one; a backfill
-  script is future work, not this commit.
+  historical sliver that shrinks to zero for new rows; (ii) **no backfill**:
+  rows archived before this change still squat their digests. A second
+  `PATCH → archived` heals one; a backfill script is future work.
   **THREE MORE CLAUSES ON THE GATE, each closing a hole adversarial review
   found — none is decoration.** (a) `wasRendering` false **and**
   `renderAttempts` 0 **and** `renderStage` empty: "receipt-free" cannot see a
@@ -873,8 +899,8 @@ Video never launches a browser.
   identity stayed free to re-mint. The status flip now rides the *same*
   condition, and every restore surface reports the refusal
   (`restoreTookEffect`) instead of counting `modifiedCount` and claiming
-  success. Pinned by `scripts/verifyArchiveDigestRelease.js` (64 checks,
-  revert-proven on 18 mutations).
+  success. Pinned by `scripts/verifyArchiveDigestRelease.js` (70 checks,
+  revert-proven on 25 mutations).
 - **Stop parks the stopping RUN's own tail — not the campaign's
   (fixed 2026-08-18).** `routes/ads.js` ran
   `Ad.updateMany({ campaignId: run.campaignId, status:'queued' }, …archive…)`

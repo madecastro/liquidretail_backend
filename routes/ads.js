@@ -38,7 +38,12 @@ const {
   // scripts/verifyArchiveDigestRelease.js evaluates the REAL query against
   // real document shapes instead of regexing this closure.
   buildStopUndispatchedArchiveFilter,
-  buildStopBacklogArchiveFilter
+  buildStopBacklogArchiveFilter,
+  // Requeue markers. Every rendering→queued write below spreads EXACTLY one:
+  // REQUEUE_MARK when a billable submit may sit behind it, PRE_DISPATCH when
+  // control flow PROVES none can. See the REQUEUE_SITES ledger in that module.
+  REQUEUE_MARK,
+  PRE_DISPATCH
 } = require('../services/adArchiveDigest');
 const { AD_RECENCY_EXPR } = require('../services/adRecencyService');
 const router = express.Router();
@@ -1194,7 +1199,7 @@ router.post('/generate', async (req, res) => {
           // own next pass, but that's minutes later and worth knowing about).
           await Ad.updateMany(
             receiptFree({ _id: { $in: adIds }, status: 'rendering', campaignRunIds: runId }),
-            { $set: { status: 'queued', updatedAt: new Date(), wasRendering: true, renderStage: null, renderStageAt: null } }
+            { $set: { status: 'queued', updatedAt: new Date(), ...PRE_DISPATCH, renderStage: null, renderStageAt: null } }
           ).catch((err) => console.error(
             `❌ [campaignRun ${runId}] failed to release ${adIds.length} claimed ad(s) after losing the CAS: ${err.message}`
           ));
@@ -1215,7 +1220,7 @@ router.post('/generate', async (req, res) => {
         if (adIds && adIds.length) {
           await Ad.updateMany(
             receiptFree({ _id: { $in: adIds }, status: 'rendering' }),
-            { $set: { status: 'queued', updatedAt: new Date(), wasRendering: true } }
+            { $set: { status: 'queued', updatedAt: new Date(), ...REQUEUE_MARK } }
           ).catch(() => {});
         }
         await CampaignRun.updateOne(
@@ -1318,7 +1323,7 @@ async function claimAdsForRun(ads, { selectedIds, runId }) {
     try {
       await ads.updateMany(
         { _id: { $in: selectedIds }, status: 'rendering', campaignRunIds: runId },
-        { $set: { status: 'queued', updatedAt: new Date(), wasRendering: true } }
+        { $set: { status: 'queued', updatedAt: new Date(), ...PRE_DISPATCH } }
       );
     } catch (releaseErr) {
       console.error(
@@ -1519,7 +1524,7 @@ router.post('/runs', express.json(), async (req, res) => {
         });
         Ad.updateMany(
           receiptFree({ _id: { $in: renderIds }, status: 'rendering' }),
-          { $set: { status: 'queued', updatedAt: new Date(), wasRendering: true } }
+          { $set: { status: 'queued', updatedAt: new Date(), ...REQUEUE_MARK } }
         ).catch(() => {});
         CampaignRun.updateOne(
           { _id: run._id },
@@ -1539,7 +1544,7 @@ router.post('/runs', express.json(), async (req, res) => {
       try {
         await Ad.updateMany(
           receiptFree({ _id: { $in: claimedIds }, status: 'rendering' }),
-          { $set: { status: 'queued', updatedAt: new Date(), wasRendering: true } }
+          { $set: { status: 'queued', updatedAt: new Date(), ...PRE_DISPATCH } }
         );
       } catch (requeueErr) {
         console.error(
@@ -2031,7 +2036,7 @@ async function renderDeriveOnlyVideoAd({
       {
         $set: {
           status: 'queued',
-          wasRendering: true,
+          ...PRE_DISPATCH,
           renderStage: stageNote.slice(0, 200),
           renderStageAt: new Date(),
           updatedAt: new Date()
