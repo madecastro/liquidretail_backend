@@ -118,25 +118,47 @@ const STATIC_RECEIPT_FREE = {
   ]
 };
 
-// NEVER ENTERED A RENDER. Two independent markers, both fail-closed, because
-// "receipt-free" alone cannot see a render that was billed and then CRASHED
-// before the receipt was persisted (services/spendReceipt.js's irreducible
-// window). Such a row is requeued to 'queued' by the reaper and can be
-// re-claimed, so it reaches the archive sites looking pristine.
-//   renderAttempts — $inc'd when a render ENDS. >0 ⇒ a render finished or
-//                    failed here before; not a pristine identity.
-//   renderStage    — written by services/adStage.js as a render PROGRESSES
-//                    (and left at its final value afterwards). claimAdsForRun
-//                    does NOT write it, so it is null on a claimed-but-never-
-//                    dispatched row and on every mint leftover — the whole
-//                    population this release exists for — and non-null on
-//                    anything that ever entered a render, including the
-//                    crash-before-receipt case renderAttempts misses.
-// Neither is load-bearing for correctness of the archive itself; both only
-// narrow WHEN a digest may be freed. Over-refusing costs a squatted slot;
-// under-refusing costs a re-billed Omni master.
+// NEVER ENTERED A RENDER. Three markers, in descending order of trust,
+// because "receipt-free" alone cannot see a render that was BILLED and then
+// CRASHED before the receipt was persisted (services/spendReceipt.js's
+// irreducible window: providers charge at SUBMIT, the receipt is written after
+// the POST returns).
+//
+// ⚠️ CORRECTED 2026-08-18 by adversarial review. An earlier version of this
+// comment claimed that window "is only reachable while status:'rendering'".
+// THAT WAS FALSE, and it was the load-bearing claim under the whole design.
+// Every rendering→queued REQUEUE site moves exactly such a row out of
+// 'rendering' with no receipt wait — worker.js's 15-minute reaper,
+// processAlerts' SIGTERM orphan persist, /generate's and /runs' crash
+// handlers, claimAdsForRun's CLAIM ANOMALY release, and /generate's CAS-lost
+// release. Post-requeue the row is `queued` + receipt-free + renderAttempts 0,
+// so NOT_RENDERING no longer applies to it at all.
+//
+//   wasRendering   — THE DURABLE ONE, and the only one that survives the
+//                    crash it exists for. Set by each requeue site's own
+//                    AWAITED write (models/Ad.js declares it). Absent on a
+//                    mint leftover that was never claimed, which is exactly
+//                    the population whose digest we want to free.
+//   renderAttempts — $inc'd when a render ENDS, so a crash mid-submit leaves
+//                    it at 0. Useful, not sufficient.
+//   renderStage    — BEST EFFORT ONLY. services/adStage.js is fire-and-forget
+//                    BY CONTRACT (never awaited, failures swallowed, "a stage
+//                    can be missed under load"), and /generate's CAS-lost
+//                    release deliberately NULLS it. Keep it as belt-and-braces
+//                    — it catches rows requeued BEFORE wasRendering shipped —
+//                    but never rely on it alone.
+//
+// ACCEPTED RESIDUAL: rows requeued before this deploy carry no wasRendering
+// and fall back to renderStage alone. A historical sliver that shrinks to zero
+// for new rows; not worth a migration, and the failure mode needs a lost
+// telemetry write inside a seconds-wide window.
+//
+// None of these is load-bearing for the correctness of the ARCHIVE; they only
+// narrow WHEN a digest may be freed. Over-refusing costs a squatted identity
+// slot. Under-refusing costs a re-bought Omni master. Refuse.
 const NEVER_RENDERED = {
   $and: [
+    { $ne: ['$wasRendering', true] },
     { $in: [{ $ifNull: ['$renderAttempts', 0] }, [0, null]] },
     isEmptyExpr('$renderStage')
   ]
@@ -173,8 +195,15 @@ const DIGEST_RESTORABLE = Object.freeze({
  * genuinely-billed ad is receipt-free. `renderAttempts` does not help — it is
  * `$inc`'d when a render ENDS, not when it starts.
  *
- * That window is only reachable while an ad is `status:'rendering'`. Freeing
- * such a row's digest would let a later Generate re-mint and re-buy a ~$0.90
+ * ⚠️ THIS CLAUSE IS NOT THE WHOLE GUARD, and an earlier version of this comment
+ * wrongly said it was ("that window is only reachable while status:'rendering'").
+ * It is reachable as `queued` too, because every rendering→queued REQUEUE site
+ * moves such a row out of 'rendering' without waiting for a receipt. The
+ * durable guard for that is `wasRendering` in NEVER_RENDERED above; this clause
+ * only covers a row archived while it is STILL rendering. Both are needed.
+ *
+ * While an ad is `status:'rendering'`, freeing its digest would let a later
+ * Generate re-mint and re-buy a ~$0.90
  * Omni master, so the default is: a `rendering` row is archived but KEEPS its
  * digest.
  *

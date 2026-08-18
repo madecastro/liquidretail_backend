@@ -1194,7 +1194,7 @@ router.post('/generate', async (req, res) => {
           // own next pass, but that's minutes later and worth knowing about).
           await Ad.updateMany(
             receiptFree({ _id: { $in: adIds }, status: 'rendering', campaignRunIds: runId }),
-            { $set: { status: 'queued', updatedAt: new Date(), renderStage: null, renderStageAt: null } }
+            { $set: { status: 'queued', updatedAt: new Date(), wasRendering: true, renderStage: null, renderStageAt: null } }
           ).catch((err) => console.error(
             `❌ [campaignRun ${runId}] failed to release ${adIds.length} claimed ad(s) after losing the CAS: ${err.message}`
           ));
@@ -1215,7 +1215,7 @@ router.post('/generate', async (req, res) => {
         if (adIds && adIds.length) {
           await Ad.updateMany(
             receiptFree({ _id: { $in: adIds }, status: 'rendering' }),
-            { $set: { status: 'queued', updatedAt: new Date() } }
+            { $set: { status: 'queued', updatedAt: new Date(), wasRendering: true } }
           ).catch(() => {});
         }
         await CampaignRun.updateOne(
@@ -1318,7 +1318,7 @@ async function claimAdsForRun(ads, { selectedIds, runId }) {
     try {
       await ads.updateMany(
         { _id: { $in: selectedIds }, status: 'rendering', campaignRunIds: runId },
-        { $set: { status: 'queued', updatedAt: new Date() } }
+        { $set: { status: 'queued', updatedAt: new Date(), wasRendering: true } }
       );
     } catch (releaseErr) {
       console.error(
@@ -1519,7 +1519,7 @@ router.post('/runs', express.json(), async (req, res) => {
         });
         Ad.updateMany(
           receiptFree({ _id: { $in: renderIds }, status: 'rendering' }),
-          { $set: { status: 'queued', updatedAt: new Date() } }
+          { $set: { status: 'queued', updatedAt: new Date(), wasRendering: true } }
         ).catch(() => {});
         CampaignRun.updateOne(
           { _id: run._id },
@@ -1539,7 +1539,7 @@ router.post('/runs', express.json(), async (req, res) => {
       try {
         await Ad.updateMany(
           receiptFree({ _id: { $in: claimedIds }, status: 'rendering' }),
-          { $set: { status: 'queued', updatedAt: new Date() } }
+          { $set: { status: 'queued', updatedAt: new Date(), wasRendering: true } }
         );
       } catch (requeueErr) {
         console.error(
@@ -2031,6 +2031,7 @@ async function renderDeriveOnlyVideoAd({
       {
         $set: {
           status: 'queued',
+          wasRendering: true,
           renderStage: stageNote.slice(0, 200),
           renderStageAt: new Date(),
           updatedAt: new Date()

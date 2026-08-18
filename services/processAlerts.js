@@ -109,7 +109,7 @@ async function persistOrphans({ signal, role }) {
       // asset can be recovered for free instead of re-bought.
       Ad.updateMany(
         receiptFree({ campaignRunIds: { $in: s.runIds }, status: 'rendering' }),
-        { $set: { status: 'queued', updatedAt: now } }
+        { $set: { status: 'queued', updatedAt: now, wasRendering: true } }
       ),
       CampaignRun.updateMany(
         { runId: { $in: s.runIds }, status: { $nin: ['done', 'failed'] } },

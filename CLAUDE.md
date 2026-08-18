@@ -815,28 +815,52 @@ Video never launches a browser.
   surfaces as a **409** and the ad stays archived — never swallowed, because a
   restored `queued` row carrying a tombstone would be a fake identity on a
   claimable (billable) row.
-  **THE `status:'rendering'` CARVE-OUT IS LOAD-BEARING, not caution.**
-  "Receipt-free" means "we hold no receipt", NOT "never billed" — providers
-  charge at SUBMIT and the receipt is written after the POST returns, so a
-  genuinely-billed ad is receipt-free for one HTTP round-trip (`spendReceipt.js`
-  documents the same window for requeue). `renderAttempts` cannot close it: it
-  is `$inc`'d when a render **ends**, not when it starts. That window is only
-  reachable while an ad is `rendering`, so **a `rendering` row is archived but
-  keeps its digest** — otherwise an operator archiving an ad mid-submit would
-  free an identity we had just bought. The single exception is Stop's
+  **THE BILLED-BUT-UNSTAMPED WINDOW IS THE HARD PART.** "Receipt-free" means
+  "we hold no receipt", NOT "never billed" — providers charge at SUBMIT and the
+  receipt is written after the POST returns, so a genuinely-billed ad is
+  receipt-free for one HTTP round-trip (`spendReceipt.js` documents the same
+  window for requeue). `renderAttempts` cannot close it: it is `$inc`'d when a
+  render **ends**, not when it starts.
+  ⚠️ **An earlier revision of this bullet claimed that window "is only reachable
+  while `status:'rendering'`". THAT WAS FALSE and it was the load-bearing claim
+  under the whole design** (caught in adversarial review, same day). Every
+  `rendering`→`queued` **requeue** site moves exactly such a row out of
+  `rendering` with no receipt wait: `worker.js`'s 15-minute reaper,
+  `processAlerts`' SIGTERM orphan persist, `/generate`'s and `/runs`' crash
+  handlers, `claimAdsForRun`'s CLAIM ANOMALY release, and `/generate`'s CAS-lost
+  release — which **deliberately NULLs `renderStage`**. Post-requeue the row is
+  `queued` + receipt-free + `renderAttempts:0` and looks pristine.
+  So the guard is a **durable marker, `Ad.wasRendering`** (declared; written by
+  each requeue site's own *awaited* write, never cleared). `renderStage` is
+  **best-effort only** and must never be relied on alone —
+  `services/adStage.js` is fire-and-forget *by contract* ("a stage can be
+  missed under load"), so the breadcrumb can simply be absent. A never-claimed
+  mint leftover never enters `rendering`, so the marker stays false and the
+  fix's whole purpose survives. Separately, a row archived while **still**
+  `rendering` also keeps its digest; the single exception is Stop's
   undispatched tail (`allowRenderingRelease: true`), whose ids come from
   `p.queue.slice(p.next)` — ads the loop provably never handed to a renderer.
-  A second opt-in fails the harness.
+  A second opt-in fails the harness. Note the archive of those rows must NOT
+  set `wasRendering` — they are being archived, not requeued.
+  **Accepted residuals, stated rather than papered over:** (i) rows requeued
+  *before* this deploy carry no marker and fall back to `renderStage` alone — a
+  historical sliver that shrinks to zero for new rows; (ii) a derive that
+  entered its wait loop is now marked, so that free 1:1 identity stays squatted
+  — never billed, so release *would* be safe, but keeping it is the correct
+  fail-closed direction; (iii) **no backfill**: rows archived before this change
+  still squat their digests. A second `PATCH → archived` heals one; a backfill
+  script is future work, not this commit.
   **THREE MORE CLAUSES ON THE GATE, each closing a hole adversarial review
-  found — none is decoration.** (a) `renderAttempts` 0 **and** `renderStage`
-  empty: "receipt-free" cannot see a render that was BILLED and then *crashed*
-  before the receipt was persisted, and the reaper requeues that row to
-  `queued` so it reaches every archive site looking pristine. `renderAttempts`
-  alone does not catch it — it is `$inc`'d when a render **ends** — so
-  `renderStage` (written by `adStage` as a render progresses, and **not** by
-  `claimAdsForRun`) is the marker that does. Mint leftovers and
-  claimed-but-undispatched rows have neither, so the target population is
-  unaffected. (b) `imageGeneration` must be null/absent **or an object**
+  found — none is decoration.** (a) `wasRendering` false **and**
+  `renderAttempts` 0 **and** `renderStage` empty: "receipt-free" cannot see a
+  render that was BILLED and then *crashed* before the receipt was persisted,
+  and a requeue site sends that row to `queued` so it reaches every archive
+  site looking pristine. `renderAttempts` alone does not catch it (`$inc`'d
+  when a render **ends**), and `renderStage` alone is best-effort telemetry —
+  `wasRendering` is the durable one, written by each requeue site's own awaited
+  write. Mint leftovers and claimed-but-undispatched rows carry none of the
+  three, so the target population is unaffected.
+  (b) `imageGeneration` must be null/absent **or an object**
   (`$type`): it is `Mixed`, and on a string or array parent
   `$imageGeneration.predictionId` resolves to *missing*, so a bare emptiness
   test would read a real static receipt as "no receipt" and free a paid
@@ -849,8 +873,8 @@ Video never launches a browser.
   identity stayed free to re-mint. The status flip now rides the *same*
   condition, and every restore surface reports the refusal
   (`restoreTookEffect`) instead of counting `modifiedCount` and claiming
-  success. Pinned by `scripts/verifyArchiveDigestRelease.js` (59 checks,
-  revert-proven on 14 mutations).
+  success. Pinned by `scripts/verifyArchiveDigestRelease.js` (64 checks,
+  revert-proven on 18 mutations).
 - **Stop parks the stopping RUN's own tail — not the campaign's
   (fixed 2026-08-18).** `routes/ads.js` ran
   `Ad.updateMany({ campaignId: run.campaignId, status:'queued' }, …archive…)`

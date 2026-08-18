@@ -36,6 +36,20 @@
 // `receiptFree` production incident), which is why group E derives the site
 // list by SCANNING and asserts every site IMPORTS the helper.
 //
+// ── DEFECT 3 (MONEY, found by adversarial review of the first fix). The first
+//    version of this file asserted that the billed-but-receipt-not-yet-written
+//    window "is only reachable while status:'rendering'". FALSE. Every
+//    rendering→queued REQUEUE site moves exactly such a row to 'queued' with no
+//    receipt wait — worker.js's 15-min reaper, processAlerts' SIGTERM orphan
+//    persist, /generate's and /runs' crash handlers, claimAdsForRun's CLAIM
+//    ANOMALY release, and /generate's CAS-lost release, which deliberately
+//    NULLS renderStage. Post-requeue such a row is queued + receipt-free +
+//    renderAttempts 0 + (possibly) no renderStage, and adStage.js is
+//    fire-and-forget BY CONTRACT so the breadcrumb can simply be missing.
+//    Releasing its digest re-opens a ~$0.90 Omni re-buy. The durable guard is
+//    Ad.wasRendering, stamped by each requeue site's own AWAITED write; group
+//    E14 derives that site list by SCANNING so a new site cannot ship unmarked.
+//
 // Revert-prove (each mutation must fail this harness):
 //   1. Bypass the helper at one archive site (e.g. queuedArchiveSweeper writes
 //      `$set: { status: 'archived' }` again)      → E2/E4 fail
@@ -45,6 +59,14 @@
 //                                                  → C1 fails
 //   4. Drop the no-double-wrap clause from DIGEST_RELEASABLE  → B3 fails
 //   5. Remove `preArchiveIdentityDigest` from models/Ad.js    → E8 fails
+//   6. Drop `{ $ne: ['$wasRendering', true] }` from the gate  → B14/E14 fail
+//   7. Any ONE requeue site forgets `wasRendering: true`      → E14 fails
+//   8. Remove the `wasRendering` declaration (strict drops it) → E14 fails
+//   9. Ship a FOURTH mint payload without mintedCampaignRunIds → E9 fails
+//  10. Hide an archive write behind a NESTED-object `$set`     → E2/E4 fail
+//  11. Keep the restoreTookEffect call but drop its ok:false   → C9 fails
+//      (10 and 11 both PASSED the first version of those checks — they are the
+//       reason E2 is balanced-brace/receiver-aware and C9 pins the branch.)
 //
 // Pure + offline: no DB, no network, no API key.
 //   node scripts/verifyArchiveDigestRelease.js
@@ -137,9 +159,23 @@ function evalExpr(expr, doc) {
       if (typeof v === 'string') return 'string';
       if (typeof v === 'number') return Number.isInteger(v) ? 'int' : 'double';
       if (typeof v === 'boolean') return 'bool';
+      // Mongo reports an ObjectId as 'objectId', NOT 'object'. Collapsing the
+      // two would let this interpreter fail OPEN exactly where the server
+      // fails closed (STATIC_RECEIPT_FREE requires $type === 'object'). We
+      // cannot construct a real ObjectId offline, so refuse rather than guess.
+      if (v && v._bsontype) {
+        throw new Error(`evaluator: BSON ${v._bsontype} has no offline $type mapping — Mongo would say '${String(v._bsontype).charAt(0).toLowerCase()}${String(v._bsontype).slice(1)}', not 'object'`);
+      }
       return 'object';
     }
-    case '$concat': return A().map((v) => (v === null || v === undefined ? null : String(v))).join('');
+    // Mongo's $concat returns NULL if ANY operand is null/missing — it does not
+    // coerce to ''. Getting this wrong would make the tombstone look well-formed
+    // here while the server wrote null.
+    case '$concat': {
+      const parts = A();
+      if (parts.some((v) => v === null || v === undefined)) return null;
+      return parts.map(String).join('');
+    }
     case '$toString': { const [v] = A(); return v === null || v === undefined ? null : String(v); }
     case '$substrCP': {
       const [s, start, len] = A();
@@ -239,6 +275,11 @@ function inertAd(over = {}) {
     veoPredictionId: null,
     imageGeneration: { predictionId: null },
     campaignRunIds: ['run_stopping'],
+    // Schema defaults for the three "never entered a render" markers. A mint
+    // leftover that was never claimed looks exactly like this.
+    wasRendering: false,
+    renderAttempts: 0,
+    renderStage: null,
     ...over
   };
 }
@@ -264,7 +305,14 @@ function walk(dir, out = []) {
 }
 
 const SCAN_DIRS = ['services', 'routes', 'scripts'].map((d) => path.join(ROOT, d));
-const FILES = SCAN_DIRS.flatMap((d) => (fs.existsSync(d) ? walk(d) : []))
+// ROOT-LEVEL ENTRYPOINTS MATTER. worker.js hosts the 15-minute orphan reaper —
+// a real rendering→queued requeue site — and an earlier version of this scan
+// walked only the three directories above and therefore could not see it. A
+// scan with a blind spot is worse than no scan: it reports green.
+const ROOT_FILES = fs.readdirSync(ROOT, { withFileTypes: true })
+  .filter((e) => e.isFile() && e.name.endsWith('.js'))
+  .map((e) => path.join(ROOT, e.name));
+const FILES = [...SCAN_DIRS.flatMap((d) => (fs.existsSync(d) ? walk(d) : [])), ...ROOT_FILES]
   // The verify* harnesses talk ABOUT these patterns; they never write.
   .filter((p) => !path.basename(p).startsWith('verify'));
 const SRC = new Map(FILES.map((p) => [path.relative(ROOT, p), fs.readFileSync(p, 'utf8')]));
@@ -284,6 +332,73 @@ function STRIPPED_LATE(rel) {
   const s = STRIPPED.get(rel);
   assert.ok(s, `${rel} missing from the scan`);
   return s;
+}
+
+/** Slice the balanced `{ … }` starting at `open`, or null if unterminated. */
+function balanced(src, open) {
+  let depth = 0;
+  for (let i = open; i < src.length; i++) {
+    if (src[i] === '{') depth++;
+    else if (src[i] === '}') { depth--; if (depth === 0) return src.slice(open, i + 1); }
+  }
+  return null;
+}
+
+// Receivers that mean "this write hits the Ad collection". `ads` is the
+// injected model adapter claimAdsForRun takes (routes/ads.js) — a real Ad write
+// wearing a different name, and exactly the kind of indirection a naive
+// `Ad.updateMany` grep misses.
+const AD_RECEIVERS = new Set(['Ad', 'ads']);
+const UPDATE_CALL = /([A-Za-z_$][\w$]*)\s*\.\s*(?:updateOne|updateMany|findOneAndUpdate|bulkWrite)\s*\(/g;
+
+/**
+ * Every update whose *update document* touches the Ad collection, as
+ * { rel, receiver, update } — `update` being the balanced `{…}` of the update
+ * argument, whether or not it uses `$set`.
+ *
+ * Deliberately structural rather than regex-over-the-line: the two shapes that
+ * defeat a flat regex are a NESTED object inside the update (`[^{}]*` stops at
+ * the first inner brace) and the two-argument indirection
+ * `Ad.updateOne(filter, { $set: set })` where the payload is built elsewhere.
+ * Both are caught here.
+ */
+function adUpdateSites(onlyRel = null) {
+  const out = [];
+  for (const [rel, s] of STRIPPED) {
+    if (rel === HELPER_REL) continue;
+    if (onlyRel && rel !== onlyRel) continue;
+    UPDATE_CALL.lastIndex = 0;
+    let m;
+    while ((m = UPDATE_CALL.exec(s))) {
+      if (!AD_RECEIVERS.has(m[1])) continue;
+      // Walk the argument list, collecting each top-level `{…}` argument.
+      let i = m.index + m[0].length, depth = 0;
+      const args = [];
+      for (; i < s.length; i++) {
+        const c = s[i];
+        if (c === '(') depth++;
+        else if (c === ')') { if (depth === 0) break; depth--; }
+        else if (c === '[') depth++;
+        else if (c === ']') depth--;
+        else if (c === '{' && depth === 0) {
+          const blk = balanced(s, i);
+          if (!blk) break;
+          args.push(blk);
+          i += blk.length - 1;
+        }
+      }
+      // arg[0] is the filter; anything after it is the update document.
+      for (const a of args.slice(1)) out.push({ rel, receiver: m[1], update: a });
+      // A payload passed by identifier (`Ad.updateOne(f, { $set: set })` where
+      // `set` is built above) still shows up as an update arg containing the
+      // identifier; record the variable name so callers can chase it.
+      if (args.length < 2) {
+        const tail = s.slice(m.index, i + 1);
+        out.push({ rel, receiver: m[1], update: tail, indirect: true });
+      }
+    }
+  }
+  return out;
 }
 
 // ═════════════════════════════════════════════════════════════════════════
@@ -318,6 +433,19 @@ ok('A3b evaluator: $type / $in match Mongo semantics for the shapes we gate on',
   assert.strictEqual(evalExpr({ $type: '$a' }, { a: {} }), 'object');
   assert.strictEqual(evalExpr({ $in: ['$a', ['x', 'y']] }, { a: 'y' }), true);
   assert.strictEqual(evalExpr({ $in: ['$a', ['x']] }, { a: 'z' }), false);
+  // A BSON value must REFUSE rather than be reported as 'object' — Mongo says
+  // 'objectId', and collapsing the two would fail OPEN where the server fails
+  // closed (STATIC_RECEIPT_FREE demands $type === 'object').
+  assert.throws(() => evalExpr({ $type: '$a' }, { a: { _bsontype: 'ObjectId' } }),
+    /no offline \$type mapping/);
+});
+ok('A3c evaluator: $concat returns NULL on a null operand, exactly like Mongo', () => {
+  // Mongo does NOT coerce null to ''. Getting this wrong would show a
+  // well-formed tombstone here while the server actually wrote null — and a
+  // null identityDigest on a second archived row fails the unique index.
+  assert.strictEqual(evalExpr({ $concat: ['a', null] }, {}), null);
+  assert.strictEqual(evalExpr({ $concat: ['a', '$missing'] }, {}), null);
+  assert.strictEqual(evalExpr({ $concat: ['a', '$b'] }, { b: 'c' }), 'ac');
 });
 ok('A4 evaluator refuses an operator it does not implement', () => {
   assert.throws(() => evalExpr({ $gte: [1, 2] }, {}), /does not implement/);
@@ -460,21 +588,67 @@ ok('B12 [MONEY] a non-object imageGeneration fails CLOSED, never "no receipt"', 
 });
 ok('B13 [MONEY] a row that ever ENTERED a render keeps its digest (billed-then-crashed)', () => {
   // "Receipt-free" cannot see a render that was BILLED and then crashed before
-  // the receipt was persisted; the reaper requeues that row to 'queued', so it
-  // reaches the archive sites looking pristine. Two independent markers refuse
-  // it. renderAttempts alone is not enough — it is $inc'd when a render ENDS,
-  // so a crash leaves it at 0; renderStage is what catches that case.
+  // the receipt was persisted; a requeue site sends that row back to 'queued',
+  // so it reaches the archive sites looking pristine. Three markers refuse it.
+  // renderAttempts alone is not enough — it is $inc'd when a render ENDS, so a
+  // crash leaves it at 0.
   assert.strictEqual(archive(inertAd({ renderAttempts: 1 })).identityDigest, REAL_DIGEST);
   assert.strictEqual(
     archive(inertAd({ renderAttempts: 0, renderStage: 'master video generation' })).identityDigest,
     REAL_DIGEST,
-    'a crash mid-submit leaves renderAttempts 0 — renderStage is the only marker left');
+    'a crash mid-submit leaves renderAttempts 0 — the stage breadcrumb is the fallback');
   // The target population — mint leftovers and claimed-but-never-dispatched
-  // rows — has neither marker. claimAdsForRun does not write renderStage.
+  // rows — has none of the markers. claimAdsForRun does not write renderStage.
   assert.strictEqual(archive(inertAd({ renderAttempts: 0, renderStage: null })).identityDigest,
     tombstoneFor(AD_ID));
-  const bare = inertAd(); delete bare.renderAttempts; delete bare.renderStage;
+  const bare = inertAd(); delete bare.renderAttempts; delete bare.renderStage; delete bare.wasRendering;
   assert.strictEqual(archive(bare).identityDigest, tombstoneFor(AD_ID));
+});
+ok('B14 [MONEY][THE HOLE] a REQUEUED row keeps its digest even when it looks pristine', () => {
+  // THE HOLE adversarial review found, and the reason wasRendering exists.
+  //
+  // The earlier design claimed the billed-but-receipt-not-yet-written window
+  // "is only reachable while status:'rendering'". FALSE — every requeue site
+  // (worker.js's reaper, processAlerts' SIGTERM orphan persist, /generate's and
+  // /runs' crash handlers, claimAdsForRun's CLAIM ANOMALY release, /generate's
+  // CAS-lost release) moves exactly such a row to 'queued' with no receipt
+  // wait. Post-requeue it is: queued, receipt-free (the POST may have charged),
+  // renderAttempts 0 (only $inc'd when a render ENDS) — and renderStage may be
+  // ABSENT, because services/adStage.js is fire-and-forget by contract and
+  // /generate's CAS-lost release deliberately NULLS it.
+  //
+  // This is that exact document. Without wasRendering it releases the digest of
+  // a PAID identity and the next Generate re-mints and re-buys it.
+  const requeuedAfterCrash = inertAd({
+    status: 'queued',            // NOT_RENDERING no longer applies
+    wasRendering: true,          // …the durable marker is the only guard left
+    renderAttempts: 0,           // $inc'd only when a render ENDS
+    renderStage: null,           // telemetry write lost, or nulled by the CAS release
+    renderStageAt: null,
+    veoPredictionId: null,       // receipt lands AFTER the POST returns
+    renderUrl: null
+  });
+  const out = archive(requeuedAfterCrash);
+  assert.strictEqual(out.status, 'archived', 'the archive itself must still happen');
+  assert.strictEqual(out.identityDigest, REAL_DIGEST,
+    'releasing this identity lets the next Generate re-buy a ~$0.90 Omni master we already paid for');
+  assert.strictEqual(out.preArchiveIdentityDigest, null);
+  // The opt-in for Stop's undispatched tail must NOT override the marker —
+  // that opt-in is only about status:'rendering', not about requeue history.
+  assert.strictEqual(
+    archive(requeuedAfterCrash, { allowRenderingRelease: true }).identityDigest, REAL_DIGEST,
+    'allowRenderingRelease must not smuggle a requeued row past the durable marker');
+});
+ok('B14b a never-claimed mint leftover has no marker and STILL releases (the fix survives)', () => {
+  // The guard must not swallow the population the whole change exists for: the
+  // 345 measured prod leftovers were minted and never claimed, so they never
+  // entered 'rendering' and no requeue site ever touched them.
+  for (const shape of [{ wasRendering: false }, {}]) {
+    const doc = inertAd(shape);
+    if (!('wasRendering' in shape)) delete doc.wasRendering;
+    assert.strictEqual(archive(doc).identityDigest, tombstoneFor(AD_ID),
+      `a mint leftover (${JSON.stringify(shape)}) must still have its identity freed`);
+  }
 });
 ok('B10 the archive update is an AGGREGATION PIPELINE (a plain $set cannot see $_id)', () => {
   const p = buildArchivePipeline({ now: NOW });
@@ -561,8 +735,24 @@ ok('C9 every restore surface REPORTS the refusal instead of claiming success', (
   assert.ok(/restoreTookEffect\(ad,\s*targetStatus\)/.test(patch) && /identity-digest-unrecoverable/.test(patch),
     'PATCH must 409 when the restore was refused');
   const exec = STRIPPED_LATE('services/capabilityExecutors/adRestore.js');
-  assert.ok(/restoreTookEffect\(restored,\s*restoredStatus\)/.test(exec) && /ok:\s*false/.test(exec),
-    'ad.restore must return ok:false when the restore was refused');
+  // STRENGTHENED after review: a bare `/ok:\s*false/` is satisfied by the
+  // file's UNRELATED refusals (no advertiser scope, bad ObjectId, not found),
+  // so it stayed green even with the restoreTookEffect branch deleted. Pin the
+  // refusal BRANCH: the guard and its ok:false must be the same statement.
+  // Balanced-brace, not a lazy regex: a `}` inside the template literal
+  // (`${rawAdId}`) truncates `[\s\S]*?\}` before the code field, which made an
+  // earlier version of this check pass on half the branch.
+  const gm = /if\s*\(\s*!restoreTookEffect\(\s*restored\s*,\s*restoredStatus\s*\)\s*\)\s*\{/.exec(exec);
+  assert.ok(gm, 'ad.restore has no `if (!restoreTookEffect(restored, restoredStatus))` refusal branch');
+  const body = balanced(exec, gm.index + gm[0].length - 1);
+  assert.ok(body, 'the refusal branch is unterminated');
+  assert.ok(/ok:\s*false/.test(body),
+    'the restoreTookEffect branch must itself return ok:false, not fall through to success');
+  assert.ok(/identity-digest-unrecoverable/.test(body),
+    'the refusal must carry a machine-readable code so a host can map it to a 409');
+  // …and the success return must be UNREACHABLE without passing that guard.
+  assert.ok(exec.indexOf('ok: true') > exec.indexOf('restoreTookEffect'),
+    'the refusal branch must precede the ok:true return');
   const purge = STRIPPED_LATE('scripts/purgeQueuedAds.js');
   assert.ok(/restoreTookEffect\(doc,\s*'queued'\)/.test(purge),
     'purgeQueuedAds --restore must check the status, not modifiedCount');
@@ -679,20 +869,44 @@ ok('E1 the helper is the ONE definition — nothing else declares these function
   }
 });
 
-ok('E2 [SCAN] no file outside the helper writes status:"archived" with a bare $set', () => {
+ok('E2 [SCAN] no file outside the helper writes status:"archived" on an Ad', () => {
+  // STRENGTHENED after review. The first version used
+  // `/\$set:\s*\{[^{}]*status:\s*['"]archived['"]/`, which a squatting archive
+  // write could hide from two ways:
+  //   · a NESTED object anywhere before `status` — `[^{}]*` stops at the first
+  //     inner brace, so `{ $set: { renderError: { … }, status: 'archived' } }`
+  //     never matched;
+  //   · the two-argument indirection `Ad.updateOne(filter, { $set: set })`
+  //     where `set` is assembled further up.
+  // adUpdateSites() is balanced-brace and receiver-aware, and the indirect case
+  // is chased through the payload variable below.
   const offenders = [];
-  for (const [rel, s] of STRIPPED) {
-    if (rel === HELPER_REL) continue;
-    // A `$set` whose object literal contains status:'archived' — i.e. the
-    // hand-rolled archive write this change replaced everywhere.
-    const re = /\$set:\s*\{[^{}]*status:\s*['"]archived['"]/g;
-    if (re.test(s)) offenders.push(rel);
-    // Same thing as a bare update document (mongoose allows $set-less updates).
-    const re2 = /update(?:One|Many)\(\s*[^;]{0,400}?\{\s*status:\s*['"]archived['"]/g;
-    if (re2.test(s)) offenders.push(rel);
+  for (const site of adUpdateSites()) {
+    if (/status:\s*['"]archived['"]/.test(site.update)) { offenders.push(site.rel); continue; }
+    // Indirection: the update document is (or contains) a bare identifier.
+    // Resolve every `<name> = { … }` / `<name>.status = 'archived'` in that
+    // file and check whether the payload can carry an archive.
+    for (const idm of site.update.matchAll(/\$set:\s*([A-Za-z_$][\w$]*)\s*[,}]/g)) {
+      const name = idm[1];
+      const src = STRIPPED.get(site.rel);
+      const decl = new RegExp(`(?:const|let|var)\\s+${name}\\s*=\\s*\\{`).exec(src);
+      const blk = decl ? balanced(src, decl.index + decl[0].length - 1) : null;
+      if (blk && /status:\s*['"]archived['"]/.test(blk)) offenders.push(site.rel);
+      if (new RegExp(`${name}\\.status\\s*=\\s*['"]archived['"]`).test(src)) offenders.push(site.rel);
+      if (new RegExp(`${name}\\[\\s*['"]status['"]\\s*\\]\\s*=\\s*['"]archived['"]`).test(src)) offenders.push(site.rel);
+    }
   }
   assert.deepStrictEqual([...new Set(offenders)], [],
     'every archive write must go through services/adArchiveDigest.js — a bypassed site leaves that identity slot squatted forever');
+  // Prove the scanner can SEE both evasions, or this check is decoration.
+  const probe = new Map([['probe.js', `
+    Ad.updateOne({ _id: 1 }, { $set: { renderError: { a: { b: 1 } }, status: 'archived' } });
+  `]]);
+  const saved = new Map(STRIPPED);
+  STRIPPED.clear(); for (const [k, v] of probe) STRIPPED.set(k, v);
+  const caught = adUpdateSites().some((s) => /status:\s*['"]archived['"]/.test(s.update));
+  STRIPPED.clear(); for (const [k, v] of saved) STRIPPED.set(k, v);
+  assert.ok(caught, 'the scanner cannot see a nested-object $set — it would miss a real bypass');
 });
 
 ok('E3 [SCAN] every file that USES a helper function also REQUIRES the helper', () => {
@@ -809,8 +1023,27 @@ ok('E9 the OWNERSHIP premise still holds — the mint stamps campaignRunIds', ()
   // own leftovers — so pin the premise, not just the filter.
   const genSrc = STRIPPED.get('services/campaignAdsGenerationService.js');
   assert.ok(/function mintedCampaignRunIds/.test(genSrc));
-  const uses = genSrc.match(/campaignRunIds:\s*mintedCampaignRunIds\(generationRunId\)/g) || [];
-  assert.ok(uses.length >= 3, `expected ≥3 mint sites stamping the owning run, found ${uses.length}`);
+  // STRENGTHENED after review: a COUNT (>=3) cannot notice a FOURTH mint site
+  // shipping unstamped — it just keeps passing. Enumerate every payload that
+  // reaches an Ad insert and require each one to stamp the owning run.
+  //
+  // Payloads are pushed onto arrays and bulk-inserted, so the structural anchor
+  // is the payload literal itself: any object literal carrying BOTH the
+  // required-at-insert `identityDigest` and `brandId` is an Ad insert payload.
+  const payloads = [];
+  for (const m of genSrc.matchAll(/(?:payloads\.push\(|const payload\s*=\s*)\{/g)) {
+    const blk = balanced(genSrc, m.index + m[0].length - 1);
+    if (blk) payloads.push(blk);
+  }
+  assert.ok(payloads.length >= 3,
+    `expected ≥3 Ad insert payload sites in the generation service, found ${payloads.length} — the scan is broken`);
+  const unstamped = payloads.filter((p) => !/campaignRunIds:\s*mintedCampaignRunIds\(generationRunId\)/.test(p));
+  assert.strictEqual(unstamped.length, 0,
+    `${unstamped.length} of ${payloads.length} Ad insert payload(s) do not stamp mintedCampaignRunIds(generationRunId) — ` +
+    'leftovers from that path are invisible to Stop\'s ownership filter AND to the 24h sweeper\'s owned arm');
+  // Belt and braces: no payload may mint with a hardcoded empty owner list.
+  assert.ok(!/campaignRunIds:\s*\[\s*\]/.test(genSrc),
+    'a payload mints with campaignRunIds:[] — that row can never be attributed to its run');
   assert.ok(/\$addToSet:\s*\{\s*campaignRunIds:\s*runId\s*\}/.test(STRIPPED.get('routes/ads.js')),
     'the claim must $addToSet the claiming run, or claim-ownership is invisible to Stop');
   // Stop keys the backlog filter on `run.runId`; the mint stamps whatever is
@@ -843,6 +1076,53 @@ ok('E11 the sweeper still archives through the helper (and never deletes)', () =
   assert.ok(/archiveAdsReleasingDigest\(\s*\n?\s*Ad,\s*\n?\s*buildQueuedArchiveWriteFilter\(/.test(s),
     'the sweep write must keep its money-guarded write filter AND go through the helper');
   assert.ok(!/deleteMany|deleteOne/.test(s));
+});
+
+ok('E14 [SCAN][MONEY] EVERY rendering→queued requeue site stamps the durable marker', () => {
+  // THE CHECK THAT KEEPS THE HOLE CLOSED. A new requeue site that forgets
+  // `wasRendering: true` silently reopens it: that row lands in 'queued'
+  // receipt-free with renderAttempts 0 and possibly no renderStage (adStage is
+  // fire-and-forget BY CONTRACT), so the archive helper would free the identity
+  // of an ad the provider may already have charged for.
+  //
+  // The list is DERIVED by scanning for the write pattern, never hardcoded —
+  // that is the whole point. Every `$set` that moves an Ad to status:'queued'
+  // must carry the marker.
+  // Receiver-aware so a DetectRun / CampaignRun requeue is not mistaken for an
+  // Ad one, and balanced-brace so a nested object in the update cannot truncate
+  // the match.
+  const sites = adUpdateSites()
+    .filter(({ update }) => /status:\s*['"]queued['"]/.test(update));
+  // A scan that finds nothing would pass everything.
+  assert.ok(sites.length >= 8,
+    `expected ≥8 Ad rendering→queued requeue writes, scan found ${sites.length} — the scan is broken`);
+  const unmarked = sites
+    .filter(({ update }) => !/wasRendering:\s*true/.test(update))
+    .map(({ rel }) => rel);
+  assert.deepStrictEqual([...new Set(unmarked)], [],
+    'a requeue site that does not stamp wasRendering:true reopens the billed-but-unstamped hole');
+  // Name the sites in the failure output so a future reader sees the real list
+  // rather than a bare count.
+  assert.ok(new Set(sites.map((s) => s.rel)).size >= 3,
+    `requeue sites should span routes/, services/ and worker.js — found only ${[...new Set(sites.map((s) => s.rel))].join(', ')}`);
+  // And the field must be DECLARED, or Mongoose strict drops every one of
+  // those writes and the guard silently evaluates to false forever.
+  const modelSrc = fs.readFileSync(path.join(ROOT, 'models', 'Ad.js'), 'utf8');
+  assert.ok(/wasRendering:\s*\{\s*type:\s*Boolean,\s*default:\s*false\s*\}/.test(modelSrc),
+    'models/Ad.js must declare wasRendering — an undeclared path is silently dropped (CLAUDE.md §4)');
+  // The gate must actually consult it.
+  assert.ok(/\$ne:\s*\['\$wasRendering',\s*true\]/.test(SRC.get(HELPER_REL)),
+    'DIGEST_RELEASABLE must refuse a row carrying the requeue marker');
+});
+
+ok('E14b the archive of Stop\'s undispatched tail must NOT stamp the marker', () => {
+  // Those rows are being ARCHIVED, not requeued — they never return to the
+  // queue, so marking them would be a lie and would pointlessly squat their
+  // identity. The archive stage's managed-field guard already refuses it.
+  assert.throws(() => H.buildArchiveSetStage({ extraSet: { status: 'queued' } }), /managed by this helper/);
+  const helperSrc = STRIPPED.get(HELPER_REL) || fs.readFileSync(path.join(ROOT, HELPER_REL), 'utf8');
+  assert.ok(!/wasRendering:\s*true/.test(helperSrc),
+    'the archive helper must never SET wasRendering — it only reads it');
 });
 
 ok('E13 [SCAN][MONEY] exactly ONE call site opts in to releasing a rendering row\'s digest', () => {

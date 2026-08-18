@@ -288,7 +288,7 @@ async function reapOrphans() {
   // duplicate charge. Never trade money for tidiness here.
   const ads = await Ad.updateMany(
     receiptFree({ status: 'rendering', updatedAt: { $lt: cutoff } }),
-    { $set: { status: 'queued', updatedAt: new Date() } }
+    { $set: { status: 'queued', updatedAt: new Date(), wasRendering: true } }
   );
 
   // Count what we deliberately did NOT requeue, so "why is this ad still
