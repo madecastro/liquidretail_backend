@@ -173,8 +173,14 @@ function renderMatrix({ variants, models, byKey, spec, observations, runDir }) {
       const cell = byKey.get(cellKey(model, vid));
       return `<td class="cell-td">${renderCell(cell, { variant, model, spec, observations, runDir })}</td>`;
     }).join('');
-    return `<tr>
-      <th class="row-label" title="${escAttr(vid)}">${esc(vid)}</th>
+    // Sync-play the whole row: comparing motion between arms is the entire
+    // point of a video A/B, and hitting play on each cell by hand desynchronises
+    // them. Rendered only when the row has more than one column to compare.
+    const playAll = models.length > 1
+      ? `<button type="button" class="play-row" data-variant="${escAttr(vid)}" title="play every video in this row from the start">▶ play row</button>`
+      : '';
+    return `<tr data-variant-row="${escAttr(vid)}">
+      <th class="row-label" title="${escAttr(vid)}">${esc(vid)}${playAll ? `<br>${playAll}` : ''}</th>
       ${tds}
     </tr>`;
   }).join('');
@@ -388,6 +394,21 @@ function zoomScript() {
   document.addEventListener('keydown', function (e) {
     if (e.key === 'Escape') { ov.hidden = true; img.removeAttribute('src'); }
   });
+  // Sync-play a variant row: rewind every video in it, then start them together.
+  document.addEventListener('click', function (e) {
+    var b = e.target;
+    if (!b.classList || !b.classList.contains('play-row')) return;
+    var row = b.closest('tr');
+    if (!row) return;
+    var vids = row.querySelectorAll('video');
+    for (var i = 0; i < vids.length; i++) {
+      try { vids[i].pause(); vids[i].currentTime = 0; } catch (err) { /* not seekable yet */ }
+    }
+    for (var j = 0; j < vids.length; j++) {
+      var p = vids[j].play();
+      if (p && p.catch) p.catch(function () { /* autoplay policy — the click satisfies it */ });
+    }
+  });
 })();
 </script>`;
 }
@@ -439,6 +460,9 @@ h2 { font-size: 0.85rem; text-transform: uppercase; letter-spacing: 0.06em; colo
 .lever-directives { color: #c4b5fd; }
 .lever-patch { color: var(--warn); }
 .lever-baseline { color: var(--muted); }
+.play-row { margin-top: 6px; background: var(--surface-2); color: var(--ink); border: 1px solid var(--line);
+  border-radius: 4px; padding: 2px 7px; font-size: 11px; cursor: pointer; }
+.play-row:hover { border-color: var(--accent); }
 .note-auto { display: inline-block; padding: 0 5px; border-radius: 3px; font-size: 10px;
   text-transform: uppercase; letter-spacing: 0.04em; background: #1e2b3d; color: #93c5fd;
   border: 1px solid #2c4a6b; cursor: help; }
