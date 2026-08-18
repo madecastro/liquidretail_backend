@@ -618,6 +618,17 @@ function summarySnippet(s, maxLen = 200) {
 
 const MODEL = process.env.GEMINI_SEARCH_MODEL || 'gemini-2.5-flash';
 const ENDPOINT = `https://generativelanguage.googleapis.com/v1beta/models/${MODEL}:generateContent`;
+// ONE shared LLM error taxonomy — services/llmError.js. Imported, not
+// re-implemented per call site. Every LLM failure in this file is REPORTED
+// with a stable code, the provider/model/status/request_id context, and the
+// action the system actually took next — so a Render log at 2am distinguishes
+// "rate limited", "timed out", "no key" and "bad request", which all used to
+// print as one indistinguishable `err.message`.
+const {
+  LLM_ERROR_CODES, LLM_ACTIONS, classifyLlmFailure, makeLlmError,
+  extractRequestId, formatLlmLogLine,
+} = require('../llmError');
+
 const PROVIDER_NAME = 'gemini-search';
 
 function isEnabled() { return !!process.env.GEMINI_API_KEY; }
@@ -669,7 +680,17 @@ async function trackedGenerate({ stage, purposeTag, grounded, ledger }, body, ti
 }
 
 async function match({ brand, category, caption, primarySubject, textDetected = [], cropImageUrl = null }) {
-  if (!isEnabled()) throw new Error('GEMINI_API_KEY not set');
+  if (!isEnabled()) {
+    // AUTH_MISSING is its own code and its own operator action: nothing was
+    // sent, nothing was billed, and the fix is configuration — not a retry.
+    throw makeLlmError({
+      code: LLM_ERROR_CODES.LLM_AUTH_MISSING,
+      provider: 'google', model: MODEL, role: 'gemini-search-match',
+      providerMessage: 'GEMINI_API_KEY not set',
+      action: LLM_ACTIONS.SKIPPED_NO_KEY,
+      actionDetail: 'skipped without attempting — set GEMINI_API_KEY on this service',
+    });
+  }
 
   const queryParts = [];
   if (brand)          queryParts.push(`Brand: ${brand}`);
@@ -782,7 +803,17 @@ function extractDomain(url) {
 // → { breadcrumb: 'Mens > Performance Shirts > Long Sleeve',
 //     url: 'https://pelagicgear.com/collections/mens-long-sleeve-performance' }
 async function lookupBrandCategoryUrl({ brandUrl, brandName, label, category }) {
-  if (!isEnabled()) throw new Error('GEMINI_API_KEY not set');
+  if (!isEnabled()) {
+    // AUTH_MISSING is its own code and its own operator action: nothing was
+    // sent, nothing was billed, and the fix is configuration — not a retry.
+    throw makeLlmError({
+      code: LLM_ERROR_CODES.LLM_AUTH_MISSING,
+      provider: 'google', model: MODEL, role: 'brand-category-lookup',
+      providerMessage: 'GEMINI_API_KEY not set',
+      action: LLM_ACTIONS.SKIPPED_NO_KEY,
+      actionDetail: 'skipped without attempting — set GEMINI_API_KEY on this service',
+    });
+  }
   if (!brandUrl && !brandName) return null;
 
   const t0 = Date.now();
@@ -817,7 +848,18 @@ async function lookupBrandCategoryUrl({ brandUrl, brandName, label, category }) 
       { timeout: GROUNDED_CALL_TIMEOUT_MS }
     );
   } catch (err) {
-    console.warn(`   ⚠️  brand-category lookup failed: ${err.message}`);
+    console.warn(formatLlmLogLine(makeLlmError({
+      code: classifyLlmFailure({
+        httpStatus: err.response?.status, errCode: err.code, message: err.message,
+        body: err.response?.data,
+      }),
+      provider: 'google', model: MODEL, role: 'brand-category-lookup',
+      httpStatus: err.response?.status ?? null,
+      requestId: extractRequestId(err.response?.data, err.response?.headers),
+      providerMessage: err.response?.data?.error?.message || err.message,
+      action: LLM_ACTIONS.GAVE_UP_PRODUCT,
+      actionDetail: 'returned null — the brand category URL is unresolved; the caller continues without it',
+    })));
     return null;
   }
 
@@ -853,7 +895,17 @@ async function lookupBrandCategoryUrl({ brandUrl, brandName, label, category }) 
 // run a second plain call with responseMimeType: application/json to
 // structure the narrative into typed fields.
 async function lookupBrandReviews({ brandName, brandUrl, brandId = null }) {
-  if (!isEnabled()) throw new Error('GEMINI_API_KEY not set');
+  if (!isEnabled()) {
+    // AUTH_MISSING is its own code and its own operator action: nothing was
+    // sent, nothing was billed, and the fix is configuration — not a retry.
+    throw makeLlmError({
+      code: LLM_ERROR_CODES.LLM_AUTH_MISSING,
+      provider: 'google', model: MODEL, role: 'brand-reviews',
+      providerMessage: 'GEMINI_API_KEY not set',
+      action: LLM_ACTIONS.SKIPPED_NO_KEY,
+      actionDetail: 'skipped without attempting — set GEMINI_API_KEY on this service',
+    });
+  }
   if (!brandName) return null;
 
   const t0 = Date.now();
@@ -895,7 +947,18 @@ async function lookupBrandReviews({ brandName, brandUrl, brandId = null }) {
       GROUNDED_CALL_TIMEOUT_MS
     );
   } catch (err) {
-    console.warn(`   ⚠️  brand-reviews search failed: ${err.message}`);
+    console.warn(formatLlmLogLine(makeLlmError({
+      code: classifyLlmFailure({
+        httpStatus: err.response?.status, errCode: err.code, message: err.message,
+        body: err.response?.data,
+      }),
+      provider: 'google', model: MODEL, role: 'brand-reviews',
+      httpStatus: err.response?.status ?? null,
+      requestId: extractRequestId(err.response?.data, err.response?.headers),
+      providerMessage: err.response?.data?.error?.message || err.message,
+      action: LLM_ACTIONS.GAVE_UP_PRODUCT,
+      actionDetail: 'returned null — no brand review signal for this brand; the caller continues without it',
+    })));
     return null;
   }
 
@@ -1040,7 +1103,18 @@ async function lookupBrandReviews({ brandName, brandUrl, brandId = null }) {
       GROUNDED_CALL_TIMEOUT_MS
     );
   } catch (err) {
-    console.warn(`   ⚠️  brand-reviews structuring failed: ${err.message}`);
+    console.warn(formatLlmLogLine(makeLlmError({
+      code: classifyLlmFailure({
+        httpStatus: err.response?.status, errCode: err.code, message: err.message,
+        body: err.response?.data,
+      }),
+      provider: 'google', model: MODEL, role: 'brand-reviews-structuring',
+      httpStatus: err.response?.status ?? null,
+      requestId: extractRequestId(err.response?.data, err.response?.headers),
+      providerMessage: err.response?.data?.error?.message || err.message,
+      action: LLM_ACTIONS.GAVE_UP_PRODUCT,
+      actionDetail: 'returned a partial result — narrative summary kept, quotes/rating/count dropped',
+    })));
     return { quotes: [], rating: null, reviewCount: null, summary: summarySnippet(narrative), source: PROVIDER_NAME };
   }
 
@@ -1082,7 +1156,17 @@ async function lookupBrandReviews({ brandName, brandUrl, brandId = null }) {
 // plain Gemini call structures it as JSON. Shape mirrors
 // lookupBrandReviews so caller code can use identical render logic.
 async function lookupProductReviews({ productName, brandName, productUrl, brandId = null, productId = null }) {
-  if (!isEnabled()) throw new Error('GEMINI_API_KEY not set');
+  if (!isEnabled()) {
+    // AUTH_MISSING is its own code and its own operator action: nothing was
+    // sent, nothing was billed, and the fix is configuration — not a retry.
+    throw makeLlmError({
+      code: LLM_ERROR_CODES.LLM_AUTH_MISSING,
+      provider: 'google', model: MODEL, role: 'product-reviews',
+      providerMessage: 'GEMINI_API_KEY not set',
+      action: LLM_ACTIONS.SKIPPED_NO_KEY,
+      actionDetail: 'skipped without attempting — set GEMINI_API_KEY on this service',
+    });
+  }
   if (!productName) return null;
 
   const t0 = Date.now();
@@ -1124,7 +1208,18 @@ async function lookupProductReviews({ productName, brandName, productUrl, brandI
       GROUNDED_CALL_TIMEOUT_MS
     );
   } catch (err) {
-    console.warn(`   ⚠️  product-reviews search failed: ${err.message}`);
+    console.warn(formatLlmLogLine(makeLlmError({
+      code: classifyLlmFailure({
+        httpStatus: err.response?.status, errCode: err.code, message: err.message,
+        body: err.response?.data,
+      }),
+      provider: 'google', model: MODEL, role: 'product-reviews',
+      httpStatus: err.response?.status ?? null,
+      requestId: extractRequestId(err.response?.data, err.response?.headers),
+      providerMessage: err.response?.data?.error?.message || err.message,
+      action: LLM_ACTIONS.GAVE_UP_PRODUCT,
+      actionDetail: 'returned null — no product review signal for this SKU; the caller continues without it',
+    })));
     return null;
   }
 
@@ -1256,7 +1351,18 @@ async function lookupProductReviews({ productName, brandName, productUrl, brandI
       GROUNDED_CALL_TIMEOUT_MS
     );
   } catch (err) {
-    console.warn(`   ⚠️  product-reviews structuring failed: ${err.message}`);
+    console.warn(formatLlmLogLine(makeLlmError({
+      code: classifyLlmFailure({
+        httpStatus: err.response?.status, errCode: err.code, message: err.message,
+        body: err.response?.data,
+      }),
+      provider: 'google', model: MODEL, role: 'product-reviews-structuring',
+      httpStatus: err.response?.status ?? null,
+      requestId: extractRequestId(err.response?.data, err.response?.headers),
+      providerMessage: err.response?.data?.error?.message || err.message,
+      action: LLM_ACTIONS.GAVE_UP_PRODUCT,
+      actionDetail: 'returned a partial result — narrative summary kept, quotes/rating/count dropped',
+    })));
     return { quotes: [], rating: null, reviewCount: null, summary: summarySnippet(narrative), source: PROVIDER_NAME };
   }
 

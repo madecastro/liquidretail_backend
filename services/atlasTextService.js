@@ -9,6 +9,11 @@
 
 const axios = require('axios');
 const { rejectsSamplingParams, stripSamplingParams } = require('./atlasModelMap');
+// ONE shared LLM error taxonomy — services/llmError.js. Imported, not copied.
+const {
+  LLM_ERROR_CODES, LLM_ACTIONS, classifyLlmFailure, makeLlmError,
+  extractRequestId, formatLlmLogLine, stampLlmAction,
+} = require('./llmError');
 
 // Text uses /v1 (no /api prefix). Video endpoints live under /api/v1,
 // so ATLAS_BASE_URL (which the video service uses) is wrong for chat
@@ -36,7 +41,17 @@ function buildTextBody({ model, messages, temperature, maxTokens }) {
 
 function apiKey() {
   const k = process.env.ATLAS_API_KEY;
-  if (!k) throw new Error('ATLAS_API_KEY is not set — cannot call Atlas Cloud');
+  if (!k) {
+    // AUTH_MISSING is its own code: nothing was sent, nothing was billed, and
+    // the fix is configuration — not a retry and not a key rotation.
+    throw makeLlmError({
+      code: LLM_ERROR_CODES.LLM_AUTH_MISSING,
+      provider: 'atlas',
+      providerMessage: 'ATLAS_API_KEY is not set — cannot call Atlas Cloud',
+      action: LLM_ACTIONS.SKIPPED_NO_KEY,
+      actionDetail: 'skipped without attempting — set ATLAS_API_KEY on this service',
+    });
+  }
   return k;
 }
 
@@ -105,15 +120,32 @@ async function generate({
       const bodyStr = typeof body === 'string'
         ? body.slice(0, 500)
         : body != null ? JSON.stringify(body).slice(0, 500) : '(no body)';
-      lastErr = err;
+      // Already coded (apiKey() above) — never re-wrap, or the AUTH_MISSING
+      // diagnosis degrades into an unclassified transport failure.
+      const coded = err && err.llmError ? err : makeLlmError({
+        code: classifyLlmFailure({
+          httpStatus: status, errCode: err.code, message: err.message, body,
+        }),
+        provider: 'atlas', model, role: model,
+        httpStatus: status == null ? null : status,
+        requestId: extractRequestId(body, err.response?.headers),
+        elapsedMs: ms, attempt, attemptsMax: MAX_ATTEMPTS,
+        providerMessage: bodyStr,
+        cause: err,
+      });
+      lastErr = coded;
       if (attempt < MAX_ATTEMPTS && shouldRetry(err)) {
         const backoffMs = 3000 * attempt; // 3s, 6s
-        console.warn(`⚠️  atlasText: attempt ${attempt}/${MAX_ATTEMPTS} FAILED in ${ms}ms status=${status || 'network'} code=${err.code || '?'} — retrying in ${backoffMs}ms`);
+        stampLlmAction(coded, LLM_ACTIONS.RETRIED_SAME_MODEL,
+          `retrying the same model in ${backoffMs}ms (attempt ${attempt + 1} of ${MAX_ATTEMPTS})`);
+        console.warn(formatLlmLogLine(coded));
         await sleep(backoffMs);
         continue;
       }
-      console.error(`❌ atlasText: FAILED (final attempt ${attempt}/${MAX_ATTEMPTS}) in ${ms}ms status=${status || 'network'} code=${err.code || '?'} body=${bodyStr}`);
-      throw err;
+      stampLlmAction(coded, LLM_ACTIONS.EXHAUSTED_CHAIN,
+        `gave up after ${attempt} of ${MAX_ATTEMPTS} attempts — this transport has no fallback link`);
+      console.error(formatLlmLogLine(coded));
+      throw coded;
     }
   }
   if (!res) throw lastErr || new Error('atlasText: exhausted retries with no response');
@@ -124,8 +156,17 @@ async function generate({
   const outputChars = text?.length || 0;
   console.log(`🧠 atlasText: OK in ${ms}ms outputChars=${outputChars} finishReason=${choice?.finish_reason || '?'} model=${res.data?.model || '?'}`);
   if (!text) {
-    console.warn(`⚠️  atlasText: empty content — full response head: ${JSON.stringify(res.data).slice(0, 500)}`);
-    throw new Error('Atlas returned no message content');
+    // HTTP 200 with nothing usable: tokens were generated and BILLED, which
+    // is why this is a CONTENT code and not a transport one. Commonly hidden
+    // reasoning eating max_tokens (finish_reason 'length').
+    throw makeLlmError({
+      code: LLM_ERROR_CODES.LLM_CONTENT_EMPTY,
+      provider: 'atlas', model: res.data?.model || model, role: model,
+      httpStatus: 200, elapsedMs: ms,
+      providerMessage: `finish_reason=${choice?.finish_reason || '?'} head=${JSON.stringify(res.data).slice(0, 300)}`,
+      action: LLM_ACTIONS.EXHAUSTED_CHAIN,
+      actionDetail: 'gave up — a 200 with no content is not retried here; raise the token budget',
+    });
   }
   return {
     text,

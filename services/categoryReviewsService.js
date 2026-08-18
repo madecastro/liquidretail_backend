@@ -35,6 +35,17 @@ const {
 } = require('./providers/geminiSearchProvider');
 
 const GEMINI_MODEL = process.env.GEMINI_SEARCH_MODEL || 'gemini-2.5-flash';
+// ONE shared LLM error taxonomy — services/llmError.js. Imported, not
+// re-implemented per call site. Every LLM failure in this file is REPORTED
+// with a stable code, the provider/model/status/request_id context, and the
+// action the system actually took next — so a Render log at 2am distinguishes
+// "rate limited", "timed out", "no key" and "bad request", which all used to
+// print as one indistinguishable `err.message`.
+const {
+  LLM_ERROR_CODES, LLM_ACTIONS, classifyLlmFailure, makeLlmError,
+  extractRequestId, formatLlmLogLine,
+} = require('./llmError');
+
 const ENDPOINT     = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent`;
 const TTL_MS       = 30 * 24 * 60 * 60 * 1000;  // 30 days
 
@@ -225,7 +236,18 @@ async function fetchCategoryReviews({ brandName, brandUrl, breadcrumb }) {
       { timeout: GROUNDED_CALL_TIMEOUT_MS }   // padded: a timeout throws away a call already paid for
     );
   } catch (err) {
-    console.warn(`   ⚠️  categoryReviews search failed: ${err.message}`);
+    console.warn(formatLlmLogLine(makeLlmError({
+      code: classifyLlmFailure({
+        httpStatus: err.response?.status, errCode: err.code, message: err.message,
+        body: err.response?.data,
+      }),
+      provider: 'google', model: GEMINI_MODEL, role: 'category-reviews',
+      httpStatus: err.response?.status ?? null,
+      requestId: extractRequestId(err.response?.data, err.response?.headers),
+      providerMessage: err.response?.data?.error?.message || err.message,
+      action: LLM_ACTIONS.GAVE_UP_PRODUCT,
+      actionDetail: 'returned null — no category review signal; the caller continues without it',
+    })));
     return null;
   }
 
@@ -277,7 +299,18 @@ async function fetchCategoryReviews({ brandName, brandUrl, breadcrumb }) {
       { timeout: GROUNDED_CALL_TIMEOUT_MS }   // padded: a timeout throws away a call already paid for
     );
   } catch (err) {
-    console.warn(`   ⚠️  categoryReviews structuring failed: ${err.message}`);
+    console.warn(formatLlmLogLine(makeLlmError({
+      code: classifyLlmFailure({
+        httpStatus: err.response?.status, errCode: err.code, message: err.message,
+        body: err.response?.data,
+      }),
+      provider: 'google', model: GEMINI_MODEL, role: 'category-reviews-structuring',
+      httpStatus: err.response?.status ?? null,
+      requestId: extractRequestId(err.response?.data, err.response?.headers),
+      providerMessage: err.response?.data?.error?.message || err.message,
+      action: LLM_ACTIONS.GAVE_UP_PRODUCT,
+      actionDetail: 'returned a partial result — narrative summary kept, quotes/rating/count dropped',
+    })));
     return { quotes: [], rating: null, reviewCount: null, summary: firstSentences(narrative, 2), sources: sourceDomains };
   }
 
