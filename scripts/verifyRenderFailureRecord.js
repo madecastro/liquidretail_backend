@@ -118,8 +118,16 @@ truthy('routes/ads: the crash path reads err.cause too',
 
 // ── D. the claim is a claim ───────────────────────────────────────────
 console.log('\nD. the render claim is atomic, and ads heartbeat while rendering');
+// This used to match /generate's own inline claim (`{ _id: { $in: adIds },
+// status: 'queued' }`). 2026-08-18: that inline copy was a second claim path
+// CLAUDE.md §2 forbids — /generate now calls the shared claimAdsForRun
+// (routes/ads.js), whose internal filter uses `selectedIds`, not `adIds`.
+// Matching either name keeps this check meaningful across both the historical
+// inline shape and the current shared one; claimAdsForRun's atomicity itself
+// (and that /generate actually calls it) is covered in depth by
+// scripts/verifyRunsClaim.js groups A-I.
 truthy('routes/ads: the claim filters on status queued',
-  /_id:\s*\{\s*\$in:\s*adIds\s*\},\s*status:\s*'queued'/.test(adsSrc));
+  /_id:\s*\{\s*\$in:\s*(?:adIds|selectedIds)\s*\},\s*status:\s*'queued'/.test(adsSrc));
 truthy('routes/ads: the run re-reads which ads it actually won',
   /claimedIds/.test(adsSrc));
 truthy('routes/ads: renderOne heartbeats updatedAt while rendering',

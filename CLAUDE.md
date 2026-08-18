@@ -416,7 +416,8 @@ Video never launches a browser.
   fallback. Wait in-render for the plate (`DERIVE_MASTER_WAIT_MS` /
   `DERIVE_MASTER_POLL_MS`); do not requeue (stranded `queued` never auto-drains
   and a second Generate short-circuits as "Nothing to render"). Pinned by
-  `scripts/verifyPmaxVideoExpansion.js` (54 checks).
+  `scripts/verifyPmaxVideoExpansion.js` (81 checks, was 54 — the count had
+  already drifted from earlier sessions' F1-F6c additions before this fix).
 - **Duration on the video identity digest is Google-only.
   `funnelStage` is not.**
   `computeDeterministicVideoDigest` keeps prefix `det-video:v1` and appends
@@ -469,7 +470,16 @@ Video never launches a browser.
   `/generate`. Use `claimAdsForRun()` only: `status:'queued'` filter, ownership
   re-read (`campaignRunIds` + `rendering`), `modifiedCount` cross-check, and
   post-claim requeue on throw (`routes/ads.js:645-750`, `:882-902`). Covered by
-  `scripts/verifyRunsClaim.js` (67 checks). Do not inline a second claim path.
+  `scripts/verifyRunsClaim.js` (75 checks, was 67). Do not inline a second claim path —
+  **it already is one, closed 2026-08-18.** `/generate`'s inline claim (former
+  `routes/ads.js:978-1016`) had no anomaly branch: when `updateMany` reported
+  `modifiedCount > 0` but the ownership re-read came back empty (concurrent
+  interference), `/runs` releases and fails honestly, but `/generate` folded
+  that shape into the ordinary "claimed by a concurrent run" outcome with no
+  release — the ads sat `status:'rendering'` until the 15-min reaper.
+  `/generate` now calls the same `claimAdsForRun()` /runs and the
+  stranded-sweep requeue use, so the anomaly release is shared, not
+  duplicated. Extended `scripts/verifyRunsClaim.js` pins the wiring.
 - **The `/generate` gate is keyed on the REQUEST FINGERPRINT, not on products
   (owner directive 2026-08-10). It is the ONLY double-click protection for
   STATIC, and the atomic claim does NOT back it up.** Each static expansion mints
@@ -735,10 +745,24 @@ Video never launches a browser.
   (default 24) a leftover whose minting run is terminal moves to
   `status:'archived'` so a later Generate cannot claim and bill it.
   Receipt-holding / `renderUrl` / `renderAttempts > 0` rows are refused.
+  **`renderAttempts` must mean actual render attempts, not polling** — a FREE
+  derive-only video ad (`deriveFromMaster` set) that waits in-render for its
+  master and requeues on expiry used to `$inc renderAttempts` on that requeue
+  (`routes/ads.js` `renderDeriveOnlyVideoAd`), which made a wait-only ad that
+  never submitted or billed anything look identical to one that had actually
+  attempted and failed — permanently `renderAttempts > 0` and therefore
+  permanently invisible to this sweeper. Fixed 2026-08-18: the wait/requeue
+  loop and its `MAX_DERIVE_WAIT_ATTEMPTS` bound now count on a dedicated
+  `deriveWaitAttempts` field (`models/Ad.js`); `renderAttempts` stays 0 for an
+  ad that only ever waited. The sweeper's `renderAttempts:0` guard itself is
+  unchanged — the fix is upstream, not a loosened guard.
   `CampaignRun.total` stays the claim count (progress denominator);
   `mintedTotal` / `unclaimedAtStart` / `notice.code='minted-ads-unclaimed'`
-  are how the operator sees the gap. Pinned by
-  `scripts/verifyNoStrandedQueued.js`.
+  are how the operator sees the gap. Sweep itself pinned by
+  `scripts/verifyNoStrandedQueued.js` (52 checks, incl. C4b: a derive-wait ad
+  with `deriveWaitAttempts > 0` / `renderAttempts:0` is still swept). The
+  `deriveWaitAttempts` field + wait-loop wiring is pinned by
+  `scripts/verifyPmaxVideoExpansion.js` (81 checks, group G).
 - ~~**`veoPredictionId` is a spend receipt that is never resumed**~~ — **CLOSED
   2026-08-04** (PRs #70-#72 + the titling resume). The receipt is now polled for
   free and the paid master collected: `services/bootRecoveryService.js` sweeps

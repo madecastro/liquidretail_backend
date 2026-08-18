@@ -447,6 +447,77 @@ check('F6c the dependent lookup fails CLOSED (keeps the asset when it cannot pro
   /masterOfLiveDerive = true;/.test(adsSrc),
   'a failed lookup must keep a paid plate, not destroy it');
 
+// ── G. deriveWaitAttempts: the wait/requeue loop must not pollute
+//      renderAttempts (2026-08-18 fix) ──────────────────────────────────
+//
+// WHY. A FREE derive-only video ad that waits in-render for its master and
+// requeues on expiry (F5 above) used to $inc renderAttempts on that requeue.
+// services/queuedArchiveSweeper's `renderAttempts:0` guard exists to prove a
+// leftover queued ad NEVER STARTED before archiving it — so a wait-only ad
+// that had inflated renderAttempts became permanently invisible to that
+// sweeper, even though it never submitted or billed anything. The fix moves
+// the wait loop's own bookkeeping onto a dedicated `deriveWaitAttempts`
+// field; renderAttempts stays 0 for an ad that only ever waited.
+//
+// REVERT-PROOF RECIPE (each must fail this section):
+//   8. Change the polite-requeue $inc back to renderAttempts       → G2
+//   9. Change the wait-exhausted terminal $inc back to renderAttempts → G3
+//   10. Repoint the `attempts` bound-check read back to renderAttempts → G4
+//   11. Drop the deriveWaitAttempts field declaration from models/Ad.js → G1
+if (deriveBody) {
+  // Behavioural, not source-text: require the REAL Mongoose model and read
+  // its compiled schema paths. A commented-out declaration still matches a
+  // naive `deriveWaitAttempts:\s*\{...\}` regex against the raw source —
+  // caught while writing this check (it false-passed against `//
+  // deriveWaitAttempts: { type: Number, default: 0 },`). Asking the schema
+  // itself is the only way to prove the field is actually declared, not
+  // merely mentioned.
+  const Ad = require(path.join(ROOT, 'models/Ad'));
+  const waitPath = Ad.schema.path('deriveWaitAttempts');
+  check('G1 models/Ad.js declares deriveWaitAttempts (Mongoose strict silently drops undeclared writes)',
+    !!waitPath && waitPath.instance === 'Number',
+    'an undeclared field is silently dropped on save — the counter would never actually persist');
+  check('G1b deriveWaitAttempts defaults to 0 (matches renderAttempts convention)',
+    !!waitPath && waitPath.defaultValue === 0);
+
+  const deriveCodeG = stripComments(deriveBody);
+  const waitIncs = (deriveCodeG.match(/\$inc:\s*\{\s*deriveWaitAttempts:\s*1\s*\}/g) || []).length;
+  const renderIncs = (deriveCodeG.match(/\$inc:\s*\{\s*renderAttempts:\s*1\s*\}/g) || []).length;
+
+  check('G2/G3 the wait loop increments deriveWaitAttempts exactly twice (requeue + exhausted-terminal)',
+    waitIncs === 2,
+    `found ${waitIncs} — the polite requeue and the MAX_DERIVE_WAIT_ATTEMPTS terminal branch must both use deriveWaitAttempts`);
+
+  check('G3b renderAttempts is untouched by the wait loop — only the honest-failure (no master) and success branches still use it',
+    renderIncs === 2,
+    `found ${renderIncs} $inc renderAttempts sites in renderDeriveOnlyVideoAd — expected exactly 2 ` +
+    '(master-absent/failed honest failure, and the settled-derive success stamp); a 3rd or 4th means the ' +
+    'wait loop is inflating renderAttempts again');
+
+  check('G4 [MONEY] the MAX_DERIVE_WAIT_ATTEMPTS bound reads deriveWaitAttempts, not renderAttempts',
+    /const\s+attempts\s*=\s*Number\(\s*ad\.deriveWaitAttempts\s*\)\s*\|\|\s*0/.test(deriveBody),
+    'reading renderAttempts here means a genuinely-rendered-and-failed ad and a merely-waiting ad share ' +
+    'one exhaustion budget, and the bound stops matching what MAX_DERIVE_WAIT_ATTEMPTS documents');
+
+  check('G4b the bound-check variable is never re-derived from renderAttempts elsewhere in the function',
+    !/Number\(\s*ad\.renderAttempts\s*\)/.test(deriveCodeG),
+    'a second, un-migrated read of renderAttempts would make G4 pass while the real bound still uses the old field');
+}
+
+// G5: the sweeper's own guard must stay untouched — the fix is upstream
+// (stop polluting the counter), never a loosened guard. The sweeper must
+// still key its money guard on renderAttempts and must not reference
+// deriveWaitAttempts at all — if it did, that would be a DIFFERENT kind of
+// change (widening what counts as "inert"), not this fix.
+{
+  const sweepSrc = fs.readFileSync(path.join(ROOT, 'services/queuedArchiveSweeper.js'), 'utf8');
+  check('G5 queuedArchiveSweeper still keys its guard on renderAttempts:0 (unweakened)',
+    (sweepSrc.match(/\{\s*renderAttempts:\s*0\s*\},\s*\{\s*renderAttempts:\s*null\s*\}/g) || []).length >= 2,
+    'the renderAttempts:0 guard is the invariant this whole fix protects — it must not change');
+  check('G5b queuedArchiveSweeper does not reference deriveWaitAttempts (fix is upstream, not a guard change)',
+    !/deriveWaitAttempts/.test(sweepSrc));
+}
+
 // ── Report ─────────────────────────────────────────────────────────────
 const total = passed + failures.length;
 if (failures.length) {

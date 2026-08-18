@@ -499,6 +499,21 @@ const adSchema = new mongoose.Schema({
     atlasCode:    { type: Number, default: null }
   },
   renderAttempts: { type: Number, default: 0 },
+  // A FREE derive-only video ad (deriveFromMaster set) waits IN-RENDER for
+  // its sibling master's plate (renderDeriveOnlyVideoAd, routes/ads.js) and
+  // requeues to 'queued' if the wait expires — it never submits anything,
+  // never bills. That requeue used to $inc renderAttempts, which meant a
+  // wait-only ad looked identical to one that had genuinely rendered and
+  // failed. services/queuedArchiveSweeper's `renderAttempts:0` guard exists
+  // specifically to prove "this row never started, never billed" before
+  // archiving a leftover queued ad — so a derive-wait ad that merely polled
+  // and requeued became permanently invisible to that sweeper (renderAttempts
+  // > 0 forever) even though it started nothing and cost nothing. Declared
+  // here so the write is not silently dropped by Mongoose strict mode (see
+  // the titlingResumeState note above — undeclared paths vanish on save).
+  // renderAttempts keeps meaning "actual render attempts"; this field is the
+  // ONLY thing the derive-wait loop increments.
+  deriveWaitAttempts: { type: Number, default: 0 },
 
   // ── Copy snapshot — filled at render time ────────────────────────
   // Cached resolution of the LayoutInputArtifact's derived copy so
