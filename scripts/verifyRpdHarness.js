@@ -54,20 +54,46 @@ async function checkAsync(name, fn) {
 const RPD = path.join(__dirname, 'rpd');
 const read = (p) => fs.readFileSync(p, 'utf8');
 
+// Source with comments removed. Every "this file must not mention X" check runs
+// against THIS, not the raw text: otherwise a comment explaining an invariant
+// violates it, and the only way to pass is to stop documenting the rule — which
+// is exactly backwards. (Bit twice: S5 and B3.)
+const codeOnly = (src) => src
+  .replace(/\/\*[\s\S]*?\*\//g, ' ')
+  .split('\n')
+  .map((line) => {
+    // Strip a trailing // comment, but not inside a string or a URL (`://`).
+    const m = line.match(/(^|[^:'"`\\])\/\/.*$/);
+    return m ? line.slice(0, m.index + m[1].length) : line;
+  })
+  .join('\n');
+
 (async () => {
   // ── B. resume path cannot spend (source scans + import-resolves) ──────
   console.log('\nB. resume path is structurally incapable of spending');
   const resumeSrc = read(path.join(RPD, 'lib', 'resume.js'));
   const pollSrc = read(path.join(RPD, 'lib', 'atlasPoll.js'));
   check('B1 resume.js never references submitGeneration or generateVideo', () => {
-    assert(!/submitGeneration|generateVideo|buildSubmissionBody/.test(resumeSrc));
+    assert(!/submitGeneration|generateVideo|buildSubmissionBody/.test(codeOnly(resumeSrc)));
   });
   check('B2 atlasPoll.js never POSTs (no axios.post, no submit reference)', () => {
-    assert(!/axios\.post|submitGeneration|generateVideo/.test(pollSrc));
+    assert(!/axios\.post|submitGeneration|generateVideo/.test(codeOnly(pollSrc)));
   });
-  check('B3 resume.js requires only manifest + atlasPoll', () => {
+  check('B3 resume.js pulls in nothing billable, and only the free image read', () => {
+    // Not a require COUNT (that broke the moment static recovery was added and
+    // told us nothing about spend). The real invariant: every module resume
+    // touches is free, and the one billable service it reaches into is
+    // destructured down to a single free GET.
     const reqs = [...resumeSrc.matchAll(/require\(['"]([^'"]+)['"]\)/g)].map((m) => m[1]);
-    assert.deepStrictEqual(reqs.sort(), ['./atlasPoll', './manifest']);
+    const allowed = new Set(['fs', 'path', './manifest', './atlasPoll', '../../../services/atlasImageService']);
+    for (const r of reqs) assert(allowed.has(r), `resume.js must not require ${r}`);
+    // If it reaches atlasImageService, it may take ONLY peekImagePrediction.
+    const imgImports = [...resumeSrc.matchAll(/const\s*\{([^}]*)\}\s*=\s*require\([^)]*atlasImageService[^)]*\)/g)]
+      .flatMap((m) => m[1].split(',').map((s) => s.trim()).filter(Boolean));
+    if (imgImports.length) assert.deepStrictEqual(imgImports, ['peekImagePrediction']);
+    // And no billable symbol may appear anywhere in the file.
+    assert(!/\b(editImage|generateImage|submitAndPoll|submitGeneration|uploadBuffer)\b/.test(codeOnly(resumeSrc)),
+      'resume.js must not reference any billable entry point');
   });
   check('B4 modules import-resolve (regex cannot see unbound identifiers)', () => {
     const { resumeRun } = require(path.join(RPD, 'lib', 'resume'));
@@ -529,7 +555,7 @@ const read = (p) => fs.readFileSync(p, 'utf8');
   console.log('\nV. auto-eval');
   const evalSrc = read(path.join(RPD, 'lib', 'autoEval.js'));
   check('V1 autoEval can never submit a generation', () => {
-    assert(!/submitGeneration|editImage|generateVideo|generateImage/.test(evalSrc));
+    assert(!/submitGeneration|editImage|generateVideo|generateImage/.test(codeOnly(evalSrc)));
   });
   check('V2 the eval budget is separate from the generation cap', () => {
     const cliSrc = read(path.join(RPD, 'rpd.js'));
