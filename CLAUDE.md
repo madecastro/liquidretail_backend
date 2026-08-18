@@ -618,6 +618,17 @@ Video never launches a browser.
   `queued` historical row of one of those formats is still claimable by
   `selectAdsForRun` (product-scoped, not new-ad-scoped) and would bill on that
   claim.
+  **AMENDED 2026-08-18 — one arm of this is now CLOSED, the main one is
+  not.** The collision described above is against a **live** row and still
+  swallows the crop; nothing there changed. What *did* change is the
+  **archived** arm, which used to be permanent: once a never-billed crop was
+  archived (by Stop or the 24h sweeper) its digest stayed occupied forever, so
+  the identity could never be minted again by any future Generate. Archiving
+  now releases the digest of a receipt-free / `renderUrl`-empty row (see the
+  archive bullet above), so that arm self-heals. **This is still NOT licence
+  to add `deriveFromMaster` or a run id to the Meta video digest** — that
+  re-keys every pre-existing Meta video ad and re-opens the Omni re-bill, and
+  the fix above deliberately does nothing to digest computation.
 
 - ~~**PMax YouTube safe zones are DECLARED but NOT WIRED**~~ — **CLOSED Phase B
   (2026-08-11).** Zones resolve per `platformFormat`
@@ -780,6 +791,137 @@ Video never launches a browser.
   also requires `deriveWaitAttempts < STRANDED_SWEEP_MAX_ATTEMPTS`. Pinned by
   `scripts/verifyStrandedSweep.js` group G (behavioural, against the real
   exported filter — not a stub).
+  **ARCHIVING NOW RELEASES THE IDENTITY DIGEST, and that is a money
+  invariant in its own right (2026-08-18).** `adSchema.index({campaignId,
+  identityDigest},{unique:true})` is **not** partial — `partialFilterExpression`
+  cannot express `status != 'archived'` — so an archived row used to squat its
+  identity slot forever. Because the video digest deliberately omits
+  `generationRunId` (that omission is THE guard against a repeat Generate
+  re-billing a paid Omni master, above), a never-billed archived video identity
+  could **never be re-minted**: `insertMany` hit 11000, swallowed it, and the
+  ad was simply absent. Now every archive site goes through **one** helper,
+  `services/adArchiveDigest.js` — imported, never re-implemented (same rule as
+  `resolveDeriveFromMaster` / `receiptFree`, §4). It is an aggregation-pipeline
+  `updateMany` so the tombstone is derived per row: `identityDigest` moves to
+  the declared `Ad.preArchiveIdentityDigest` and is replaced by
+  `archived:<_id>`, unique by construction. **The release is gated PER
+  DOCUMENT on receipt-free + `renderUrl` empty.** That is the whole safety
+  argument: the index exists to stop a **PAID** identity being re-bought, and a
+  never-billed identity *should* be re-mintable. An archive of a delivered or
+  receipt-holding ad (operator PATCH, `ad.archive`, `ad.bulkArchive`) still
+  happens but **keeps its digest**, so paid identities stay protected. Restore
+  (`PATCH` → draft/live, `ad.restore`, `purgeQueuedAds --restore`) hands the
+  digest back; if a repeat Generate already took the freed slot the 11000
+  surfaces as a **409** and the ad stays archived — never swallowed, because a
+  restored `queued` row carrying a tombstone would be a fake identity on a
+  claimable (billable) row.
+  **THE BILLED-BUT-UNSTAMPED WINDOW IS THE HARD PART.** "Receipt-free" means
+  "we hold no receipt", NOT "never billed" — providers charge at SUBMIT and the
+  receipt is written after the POST returns, so a genuinely-billed ad is
+  receipt-free for one HTTP round-trip (`spendReceipt.js` documents the same
+  window for requeue). `renderAttempts` cannot close it: it is `$inc`'d when a
+  render **ends**, not when it starts.
+  ⚠️ **An earlier revision of this bullet claimed that window "is only reachable
+  while `status:'rendering'`". THAT WAS FALSE and it was the load-bearing claim
+  under the whole design** (caught in adversarial review, same day). Every
+  `rendering`→`queued` **requeue** site moves exactly such a row out of
+  `rendering` with no receipt wait: `worker.js`'s 15-minute reaper,
+  `processAlerts`' SIGTERM orphan persist, `/generate`'s and `/runs`' crash
+  handlers, `claimAdsForRun`'s CLAIM ANOMALY release, and `/generate`'s CAS-lost
+  release — which **deliberately NULLs `renderStage`**. Post-requeue the row is
+  `queued` + receipt-free + `renderAttempts:0` and looks pristine.
+  So the guard is a **durable marker, `Ad.wasRendering`** (declared; written by
+  each requeue site's own *awaited* write, never cleared). `renderStage` is
+  **best-effort only** and must never be relied on alone —
+  `services/adStage.js` is fire-and-forget *by contract* ("a stage can be
+  missed under load"), so the breadcrumb can simply be absent. A never-claimed
+  mint leftover never enters `rendering`, so the marker stays false and the
+  fix's whole purpose survives. Separately, a row archived while **still**
+  `rendering` also keeps its digest; the single exception is Stop's
+  undispatched tail (`allowRenderingRelease: true`), whose ids come from
+  `p.queue.slice(p.next)` — ads the loop provably never handed to a renderer.
+  A second opt-in fails the harness — and Stop's tail is also the one archive
+  that must NOT record the marker, because it is provably pre-dispatch.
+  **ARCHIVING A `rendering` ROW RECORDS THE MARKER (added 2026-08-18, third
+  pass).** Archiving erases the fact that a row was `rendering`, and
+  `ad.restore` sends a `renderUrl`-less archived row back to **`queued`** —
+  claimable and billable. So `rendering (billed, receipt not yet written) →
+  archived (digest correctly kept) → restore → queued with no marker → sweeper
+  archives → RELEASED` reopened the hole one step removed. The archive stage now
+  stamps `wasRendering` when the INPUT row is `rendering`. Precise, not blanket:
+  a `queued` mint leftover is never marked, so the digest release this all
+  exists for is untouched.
+  **WHICH REQUEUE SITES STAMP, AND WHY — the `REQUEUE_SITES` ledger in
+  `services/adArchiveDigest.js` is the single source of truth; do not re-derive
+  it.** Every requeue site spreads exactly one of two exported markers, so a
+  verdict is never implied by omission (an omitted marker is indistinguishable
+  from a forgotten one): `REQUEUE_MARK` = "a billable submit MAY sit behind
+  this"; `PRE_DISPATCH` = "control flow PROVES none can". Four sites are
+  exempt, each with a structural proof pinned by a harness check that fails the
+  moment that site gains a reachable submit path — the CAS-lost release
+  (`return`s before `await runRenderLoop`, E15a), `claimAdsForRun`'s anomaly
+  release (that function contains no submit call at all, E15b), `/runs`' outer
+  catch (`setImmediate(runRenderLoop)` is the LAST statement of the try, so no
+  `await` follows and the catch cannot run after the loop began, E15c), and the
+  derive wait-requeue (submit-free by contract, E15d). **Exempt only on proof;
+  stamp whenever it is a judgement call** — over-marking squats an identity,
+  under-marking re-buys a master, and that asymmetry governs. Exemptions are not
+  free: marking a provably submit-free row makes the 24h sweeper keep its digest,
+  silently undoing the release for exactly the never-billed rows it was written
+  for. **Cross-pass safety** rests on induction: a row billed in an earlier pass
+  can only reach a later claim by having been requeued out of `rendering` first,
+  and every such path is in the ledger, so the marker is already set.
+  **Accepted residuals, stated rather than papered over:** (i) rows requeued
+  *before* this deploy carry no marker and fall back to `renderStage` alone — a
+  historical sliver that shrinks to zero for new rows; (ii) **no backfill**:
+  rows archived before this change still squat their digests. A second
+  `PATCH → archived` heals one; a backfill script is future work.
+  **THREE MORE CLAUSES ON THE GATE, each closing a hole adversarial review
+  found — none is decoration.** (a) `wasRendering` false **and**
+  `renderAttempts` 0 **and** `renderStage` empty: "receipt-free" cannot see a
+  render that was BILLED and then *crashed* before the receipt was persisted,
+  and a requeue site sends that row to `queued` so it reaches every archive
+  site looking pristine. `renderAttempts` alone does not catch it (`$inc`'d
+  when a render **ends**), and `renderStage` alone is best-effort telemetry —
+  `wasRendering` is the durable one, written by each requeue site's own awaited
+  write. Mint leftovers and claimed-but-undispatched rows carry none of the
+  three, so the target population is unaffected.
+  (b) `imageGeneration` must be null/absent **or an object**
+  (`$type`): it is `Mixed`, and on a string or array parent
+  `$imageGeneration.predictionId` resolves to *missing*, so a bare emptiness
+  test would read a real static receipt as "no receipt" and free a paid
+  identity. Deliberately stricter than `spendReceipt.js`'s query-side clause —
+  this expression can only fail closed. (c) **A tombstone may never sit on a
+  non-archived row.** The digest restore is a `$cond`, so an unconditional
+  `status` flip beside it let a tombstoned row with an empty
+  `preArchiveIdentityDigest` reach `queued` carrying `archived:<_id>` as its
+  live identity — claimable and billable under a placeholder while the real
+  identity stayed free to re-mint. The status flip now rides the *same*
+  condition, and every restore surface reports the refusal
+  (`restoreTookEffect`) instead of counting `modifiedCount` and claiming
+  success. Pinned by `scripts/verifyArchiveDigestRelease.js` (70 checks,
+  revert-proven on 25 mutations).
+- **Stop parks the stopping RUN's own tail — not the campaign's
+  (fixed 2026-08-18).** `routes/ads.js` ran
+  `Ad.updateMany({ campaignId: run.campaignId, status:'queued' }, …archive…)`
+  and the comment above it asserted campaign-wide was intentional. It was a
+  bug (owner-ruled): a campaign is not a run, other runs mint rows that sit
+  `queued` awaiting their own claim, and `expandWizardJob` deliberately mints
+  more than a run claims so "Generate more" can drain the rest — Stopping run A
+  destroyed run B's pending work and every mint leftover on the campaign. Both
+  Stop writes are now built by pure exported filters
+  (`buildStopBacklogArchiveFilter` / `buildStopUndispatchedArchiveFilter` in
+  `services/adArchiveDigest.js`, so a harness evaluates the REAL query).
+  **Ownership is `campaignRunIds`** — the minting run is stamped there at
+  insert by `mintedCampaignRunIds(generationRunId)` and the claim `$addToSet`s
+  the claiming run. There is **no persisted `generationRunId` field on Ad**;
+  it is a digest input and the source of `campaignRunIds[0]`, nothing more —
+  do not write a filter against it. Missing `runId` **fails closed**
+  (`{campaignRunIds: undefined}` is stripped by the driver, leaving
+  `{status:'queued'}` = every queued ad in the database). Both writes also
+  re-assert `receiptFree()` + `renderUrl` empty; a receipt-holding row is
+  deliberately left in `rendering` so `bootRecoveryService` can still collect
+  the master we paid for.
 - ~~**`veoPredictionId` is a spend receipt that is never resumed**~~ — **CLOSED
   2026-08-04** (PRs #70-#72 + the titling resume). The receipt is now polled for
   free and the paid master collected: `services/bootRecoveryService.js` sweeps
@@ -1288,8 +1430,9 @@ not as a separate tuning decision. Re-measure before going higher
 - Commit/push **only when asked**. Feature branches only; never push to `main`
   without explicit permission.
 - Before pushing non-trivial changes: run **`npm run lint`**, `node --check` the
-  touched files, and run the relevant `scripts/verify*.js` harness (**101 scripts**
-  as of the concept-expansion binding fix). Add a harness for money/security-critical
+  touched files, and run the relevant `scripts/verify*.js` harness (**138 scripts**
+  as of the archive-digest release, 2026-08-18 — the "101" this line carried was
+  stale by 37). Add a harness for money/security-critical
   logic, and **revert-prove it** — back the fix out and confirm the test fails. A test
   that cannot fail is not a test.
 - **`npm run lint` is not optional, and it is not a style check.** It enables exactly

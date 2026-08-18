@@ -35,6 +35,12 @@ const CampaignRun = require('../models/CampaignRun');
 // THE spend-receipt helper. Do not re-implement — a call site that used this
 // without importing it shipped a broken money guard to production (CLAUDE.md §4).
 const { receiptFree } = require('./spendReceipt');
+// THE archive write — one definition, imported by every archive site. It
+// performs the status flip AND releases the row's identity digest so a later
+// Generate can re-mint a never-billed video identity (the unique index on
+// (campaignId, identityDigest) is not partial, so an archived row otherwise
+// squats its slot forever). Do not hand-roll a $set here.
+const { archiveAdsReleasingDigest } = require('./adArchiveDigest');
 const alerts      = require('./alertService');
 
 const truthy = (v, dflt) => {
@@ -229,9 +235,15 @@ async function sweepQueuedLeftovers() {
   if (!unique.length) return out;
 
   try {
-    const res = await Ad.updateMany(
-      buildQueuedArchiveWriteFilter(unique.map((a) => a._id)),
-      { $set: { status: 'archived', updatedAt: new Date() } }
+    // status:'archived' + digest release, in one per-document pipeline update.
+    // The write filter already re-asserts receipt-free / renderUrl-empty /
+    // renderAttempts-0; the helper re-asserts the money predicates a SECOND
+    // time per row before it frees anything (defense in depth — the same
+    // rows are reachable from operator-driven archive sites that legitimately
+    // touch paid work).
+    const res = await archiveAdsReleasingDigest(
+      Ad,
+      buildQueuedArchiveWriteFilter(unique.map((a) => a._id))
     );
     out.archived = Number(res && res.modifiedCount) || 0;
   } catch (err) {

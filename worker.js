@@ -128,6 +128,10 @@ const WATCHDOG_INTERVAL_MIN = Math.max(1, parseInt(process.env.ALERT_WATCHDOG_IN
 const alerts = require('./services/alertService');
 // Receipt guard for every rendering->queued requeue — see services/spendReceipt.js.
 const { receiptFree, HAS_RECEIPT } = require('./services/spendReceipt');
+// Requeue marker — the reaper fires at an arbitrary point in a render, so a
+// billable submit may be in flight behind it. REQUEUE_MARK, never
+// PRE_DISPATCH. See the REQUEUE_SITES ledger in services/adArchiveDigest.js.
+const { REQUEUE_MARK } = require('./services/adArchiveDigest');
 const { buildStalePreparingFilter } = require('./services/campaignRunGuards');
 // Pure Slack-message builder for the preparing-reap notice below — see
 // services/slackRunVerbosity.js header (no Mongo/network at require-time).
@@ -288,7 +292,7 @@ async function reapOrphans() {
   // duplicate charge. Never trade money for tidiness here.
   const ads = await Ad.updateMany(
     receiptFree({ status: 'rendering', updatedAt: { $lt: cutoff } }),
-    { $set: { status: 'queued', updatedAt: new Date() } }
+    { $set: { status: 'queued', updatedAt: new Date(), ...REQUEUE_MARK } }
   );
 
   // Count what we deliberately did NOT requeue, so "why is this ad still

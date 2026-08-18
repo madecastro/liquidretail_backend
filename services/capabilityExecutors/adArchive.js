@@ -9,6 +9,11 @@
 const mongoose = require('mongoose');
 const Ad = require('../../models/Ad');
 const Brand = require('../../models/Brand');
+// THE archive write — one definition, imported by every archive site. Never a
+// bare $set: the helper also releases the row's identityDigest so an archived
+// NEVER-BILLED identity stops squatting its slot on the (campaignId,
+// identityDigest) unique index. See services/adArchiveDigest.js.
+const { archiveAdsReleasingDigest } = require('../adArchiveDigest');
 
 async function run({ req, args }) {
   if (!req?.advertiserId) {
@@ -43,11 +48,18 @@ async function run({ req, args }) {
   // rendering/queued ads can be archived — it just hides them from
   // active views. The queue drain skips archived rows, so this is
   // effectively a soft-cancel too. Deliberately no status-set gate.
+  //
+  // ⚠️ MONEY — and why there is deliberately no receipt filter here either.
+  // This capability MUST be able to archive a delivered or paid ad; that is
+  // the operator's whole intent. So unlike the Stop handler and the 24h
+  // sweeper, the filter carries no receipt-free / renderUrl guard. The digest
+  // release is guarded instead PER DOCUMENT inside archiveAdsReleasingDigest:
+  // a row holding a spend receipt or a renderUrl is archived normally and
+  // KEEPS its identityDigest, so the unique index goes on protecting that paid
+  // identity from being re-minted and re-billed. Only a never-billed,
+  // never-delivered row has its slot freed. Reversible via ad.restore.
   const priorStatus = ad.status;
-  await Ad.updateOne(
-    { _id: ad._id },
-    { $set: { status: 'archived', updatedAt: new Date() } }
-  );
+  await archiveAdsReleasingDigest(Ad, { _id: ad._id });
 
   return {
     ok: true,

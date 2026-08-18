@@ -21,6 +21,30 @@ const jwt = require('jsonwebtoken');
 const mongoose = require('mongoose');
 // Receipt guard — a requeue must never re-submit work we have paid for.
 const { receiptFree } = require('../services/spendReceipt');
+// THE archive / restore writes — one definition, imported by every site that
+// moves an Ad into or out of status:'archived'. They also move the row's
+// identityDigest to/from preArchiveIdentityDigest, so an archived NEVER-BILLED
+// identity stops squatting its slot on the (campaignId, identityDigest) unique
+// index. Never hand-roll a $set for these. See services/adArchiveDigest.js.
+const {
+  archiveAdsReleasingDigest,
+  archiveOneReleasingDigest,
+  restoreOneRestoringDigest,
+  isDigestCollisionError,
+  DIGEST_COLLISION_MESSAGE,
+  restoreTookEffect,
+  UNRESTORABLE_TOMBSTONE_MESSAGE,
+  // The two Stop-handler archive filters. Pure + exported so
+  // scripts/verifyArchiveDigestRelease.js evaluates the REAL query against
+  // real document shapes instead of regexing this closure.
+  buildStopUndispatchedArchiveFilter,
+  buildStopBacklogArchiveFilter,
+  // Requeue markers. Every rendering→queued write below spreads EXACTLY one:
+  // REQUEUE_MARK when a billable submit may sit behind it, PRE_DISPATCH when
+  // control flow PROVES none can. See the REQUEUE_SITES ledger in that module.
+  REQUEUE_MARK,
+  PRE_DISPATCH
+} = require('../services/adArchiveDigest');
 const { AD_RECENCY_EXPR } = require('../services/adRecencyService');
 const router = express.Router();
 
@@ -1175,7 +1199,7 @@ router.post('/generate', async (req, res) => {
           // own next pass, but that's minutes later and worth knowing about).
           await Ad.updateMany(
             receiptFree({ _id: { $in: adIds }, status: 'rendering', campaignRunIds: runId }),
-            { $set: { status: 'queued', updatedAt: new Date(), renderStage: null, renderStageAt: null } }
+            { $set: { status: 'queued', updatedAt: new Date(), ...PRE_DISPATCH, renderStage: null, renderStageAt: null } }
           ).catch((err) => console.error(
             `❌ [campaignRun ${runId}] failed to release ${adIds.length} claimed ad(s) after losing the CAS: ${err.message}`
           ));
@@ -1196,7 +1220,7 @@ router.post('/generate', async (req, res) => {
         if (adIds && adIds.length) {
           await Ad.updateMany(
             receiptFree({ _id: { $in: adIds }, status: 'rendering' }),
-            { $set: { status: 'queued', updatedAt: new Date() } }
+            { $set: { status: 'queued', updatedAt: new Date(), ...REQUEUE_MARK } }
           ).catch(() => {});
         }
         await CampaignRun.updateOne(
@@ -1299,7 +1323,7 @@ async function claimAdsForRun(ads, { selectedIds, runId }) {
     try {
       await ads.updateMany(
         { _id: { $in: selectedIds }, status: 'rendering', campaignRunIds: runId },
-        { $set: { status: 'queued', updatedAt: new Date() } }
+        { $set: { status: 'queued', updatedAt: new Date(), ...PRE_DISPATCH } }
       );
     } catch (releaseErr) {
       console.error(
@@ -1500,7 +1524,7 @@ router.post('/runs', express.json(), async (req, res) => {
         });
         Ad.updateMany(
           receiptFree({ _id: { $in: renderIds }, status: 'rendering' }),
-          { $set: { status: 'queued', updatedAt: new Date() } }
+          { $set: { status: 'queued', updatedAt: new Date(), ...REQUEUE_MARK } }
         ).catch(() => {});
         CampaignRun.updateOne(
           { _id: run._id },
@@ -1520,7 +1544,7 @@ router.post('/runs', express.json(), async (req, res) => {
       try {
         await Ad.updateMany(
           receiptFree({ _id: { $in: claimedIds }, status: 'rendering' }),
-          { $set: { status: 'queued', updatedAt: new Date() } }
+          { $set: { status: 'queued', updatedAt: new Date(), ...PRE_DISPATCH } }
         );
       } catch (requeueErr) {
         console.error(
@@ -1679,25 +1703,63 @@ async function runRenderLoop(run, job, adIds, renderToken) {
     // so archived ads are invisible to every future run while staying
     // inspectable, and reversible in bulk.
     //
-    // Two scopes, because "no more generation happens" means both: this run's
-    // unclaimed tail, AND the campaign's remaining queued backlog that a
-    // subsequent Generate would otherwise drain.
+    // Two scopes, and BOTH are scoped to THIS RUN — corrected 2026-08-18.
+    //
+    //   1. this run's claimed-but-never-dispatched tail (status:'rendering',
+    //      bulk-flipped at claim time), and
+    //   2. this run's OWN minted-but-unclaimed backlog (status:'queued').
+    //
+    // ⚠️ THIS COMMENT USED TO ASSERT THE OPPOSITE and the code matched it: the
+    // backlog write was `{ campaignId, status: 'queued' }` — EVERY queued ad on
+    // the campaign — justified as "no more generation happens". That was wrong.
+    // A campaign is not a run. Other runs mint their own rows and leave them
+    // queued while they wait for their own claim, and expandWizardJob
+    // deliberately mints more than a run claims so the operator can drain the
+    // rest with "Generate more" (POST /runs). Stopping run A therefore silently
+    // destroyed run B's pending work and every mint leftover on the campaign.
+    // Owner ruled this a bug 2026-08-18: Stop parks the stopping run's own
+    // tail, nothing else. Leftovers nobody claims are not orphaned by this —
+    // services/queuedArchiveSweeper parks them after QUEUED_ARCHIVE_AFTER_H.
+    //
+    // OWNERSHIP IS `campaignRunIds`, and one membership test covers both kinds
+    // of ownership. The minting run is stamped into campaignRunIds AT MINT
+    // (campaignAdsGenerationService.mintedCampaignRunIds(generationRunId)) and
+    // a claim $addToSet's the claiming run (claimAdsForRun). There is no
+    // separate persisted `generationRunId` path on Ad to test — it is a digest
+    // input and the source of campaignRunIds[0], never its own field. Pinned by
+    // scripts/verifyArchiveDigestRelease.js, which asserts the mint still
+    // stamps it, so this filter cannot quietly stop covering mint leftovers.
+    //
+    // MONEY GUARDS ON BOTH WRITES (defense in depth, same pattern as #189/#204,
+    // and required by the digest release the archive helper performs): both
+    // filters are built by receiptFree()-composing pure functions in
+    // services/adArchiveDigest.js, which the harness evaluates directly. A
+    // receipt-holding row is deliberately LEFT in 'rendering' rather than
+    // archived: honest (the outcome is unknown until the receipt is polled),
+    // still visible to ALERT_RENDERING_STALE_MIN, and still recoverable for
+    // free by bootRecoveryService instead of hidden in 'archived'.
     //
     // Renders already in flight cannot be recalled — a dispatched image or
     // video call is already paid for — so those finish and are kept.
     let archivedThisRun = 0;
     const remaining = pools.flatMap((p) => p.queue.slice(p.next).map((q) => q.adId));
     if (remaining.length) {
-      const r = await Ad.updateMany(
-        { _id: { $in: remaining }, status: 'rendering' },
-        { $set: { status: 'archived', updatedAt: new Date() } }
+      const r = await archiveAdsReleasingDigest(
+        Ad,
+        buildStopUndispatchedArchiveFilter({ adIds: remaining }),
+        // THE ONLY caller allowed to free the digest of a status:'rendering'
+        // row. `remaining` is `p.queue.slice(p.next)` — ads this loop provably
+        // never handed to a renderer — so no billable submit can be in flight
+        // and the receipt-free/receipt-not-yet-written window cannot apply.
+        // Every other archive site leaves a 'rendering' row's digest alone.
+        { allowRenderingRelease: true }
       ).catch(() => null);
       archivedThisRun = r?.modifiedCount || 0;
       await CampaignRun.updateOne({ _id: run._id }, { $inc: { skipped: remaining.length } }).catch(() => {});
     }
-    const backlog = await Ad.updateMany(
-      { campaignId: run.campaignId, status: 'queued' },
-      { $set: { status: 'archived', updatedAt: new Date() } }
+    const backlog = await archiveAdsReleasingDigest(
+      Ad,
+      buildStopBacklogArchiveFilter({ runId: run.runId })
     ).catch(() => null);
     const archivedBacklog = backlog?.modifiedCount || 0;
     // Recorded on the run's own error log rather than as new top-level
@@ -1708,11 +1770,11 @@ async function runRenderLoop(run, job, adIds, renderToken) {
       { $push: { errors: {
           index: -1,
           stage: 'cancel',
-          message: `Stopped by operator — ${archivedThisRun + archivedBacklog} pending ad(s) archived, not re-queued`
+          message: `Stopped by operator — ${archivedThisRun + archivedBacklog} of THIS RUN's pending ad(s) archived, not re-queued. Other runs' queued work on this campaign is untouched.`
       } } }
     ).catch(() => {});
     console.log(
-      `🛑 [campaignRun ${run.runId}] stopped by operator — archived ${archivedThisRun} unclaimed + ${archivedBacklog} backlog ad(s); in-flight renders finish`
+      `🛑 [campaignRun ${run.runId}] stopped by operator — archived ${archivedThisRun} undispatched + ${archivedBacklog} of this run's own queued backlog; other runs' queued ads untouched; in-flight renders finish`
     );
   }
 
@@ -1974,6 +2036,7 @@ async function renderDeriveOnlyVideoAd({
       {
         $set: {
           status: 'queued',
+          ...PRE_DISPATCH,
           renderStage: stageNote.slice(0, 200),
           renderStageAt: new Date(),
           updatedAt: new Date()
@@ -3773,12 +3836,75 @@ router.patch('/:id', express.json(), async (req, res) => {
       }
     }
 
-    const ad = await Ad.findOneAndUpdate(
-      { _id: req.params.id, brandId },
-      { $set: update },
-      { new: true }
-    ).lean();
+    // ── IDENTITY-DIGEST RELEASE / RESTORE ────────────────────────────────
+    // A status flip through this route is one of the archive sites, so it goes
+    // through services/adArchiveDigest.js like every other one — never a bare
+    // $set. Two directions, and both are single atomic writes so a copy edit in
+    // the same request cannot be lost:
+    //
+    //   → 'archived'  release the digest to a per-row `archived:<_id>`
+    //                 tombstone, but ONLY for a row proven receipt-free with no
+    //                 renderUrl. The helper enforces that per document, which is
+    //                 what makes it safe to route THIS site through it: an
+    //                 operator archiving a delivered or paid ad is legitimate,
+    //                 and such a row keeps its digest so the unique index goes
+    //                 on protecting that paid identity from a re-bill.
+    //   → 'draft'/'live'  hand the digest back. If a repeat Generate re-minted
+    //                 the identity while this ad sat archived — exactly what
+    //                 releasing the slot is FOR — the unique index rejects the
+    //                 write with 11000. That is a 409, not a swallow: keeping
+    //                 the tombstone as a live digest would put a fake identity
+    //                 on an ad the operator believes is restored.
+    //
+    // Copy-only edits keep the plain $set path — no digest movement, no
+    // pipeline, byte-identical behaviour to before this change.
+    const targetStatus = hasStatus ? body.status : null;
+    // `update` already carries status + updatedAt; the helper owns both, so
+    // hand it only the copy paths.
+    const extraSet = { ...update };
+    delete extraSet.status;
+    delete extraSet.updatedAt;
+
+    let ad;
+    try {
+      if (targetStatus === 'archived') {
+        ad = await archiveOneReleasingDigest(
+          Ad,
+          { _id: req.params.id, brandId },
+          { extraSet, now: update.updatedAt, queryOptions: { new: true, lean: true } }
+        );
+      } else if (targetStatus) {
+        ad = await restoreOneRestoringDigest(
+          Ad,
+          { _id: req.params.id, brandId },
+          { status: targetStatus, extraSet, now: update.updatedAt, queryOptions: { new: true, lean: true } }
+        );
+      } else {
+        ad = await Ad.findOneAndUpdate(
+          { _id: req.params.id, brandId },
+          { $set: update },
+          { new: true }
+        ).lean();
+      }
+    } catch (err) {
+      if (isDigestCollisionError(err)) {
+        return res.status(409).json({ error: DIGEST_COLLISION_MESSAGE, code: 'identity-digest-taken' });
+      }
+      throw err;
+    }
     if (!ad) return res.status(404).json({ error: 'ad not found' });
+    // A tombstoned row with no saved digest is deliberately left archived by
+    // the restore stage rather than flipped with a placeholder identity on it.
+    // Report that instead of returning a doc whose status is not what was asked
+    // for — a silent no-op here is how an operator ends up trusting a restore
+    // that did not happen.
+    if (targetStatus && targetStatus !== 'archived' && !restoreTookEffect(ad, targetStatus)) {
+      return res.status(409).json({
+        error: UNRESTORABLE_TOMBSTONE_MESSAGE,
+        code:  'identity-digest-unrecoverable',
+        ad:    projectAd(ad, /* full */ true)
+      });
+    }
     res.json({ ad: projectAd(ad, /* full */ true) });
   } catch (err) {
     console.error('ad patch failed:', err);
@@ -4279,6 +4405,11 @@ function projectAd(ad, full = false, extras = {}) {
     base.layoutInputArtifactId = ad.layoutInputArtifactId ? String(ad.layoutInputArtifactId) : null;
     base.cloudinaryPublicId    = ad.cloudinaryPublicId;
     base.identityDigest        = ad.identityDigest;
+    // An archived, never-billed row carries an `archived:<_id>` tombstone in
+    // identityDigest so its real identity is free to be re-minted. Surface the
+    // released digest alongside it — a generation inspector that showed only
+    // the tombstone would misreport this ad's identity as a new one.
+    base.preArchiveIdentityDigest = ad.preArchiveIdentityDigest || null;
     base.renderError           = ad.renderError || null;
     base.renderAttempts        = ad.renderAttempts || 0;
   }

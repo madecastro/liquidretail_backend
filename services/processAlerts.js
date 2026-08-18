@@ -30,6 +30,10 @@ const inFlight = require('./inFlight');
 // SIGTERM, so losing this import silently disables both the requeue and the
 // run-failure diagnostic (ReferenceError aborts the Promise.all array eval).
 const { receiptFree } = require('./spendReceipt');
+// Requeue marker — this orphan persist fires at an arbitrary point in a render,
+// so a billable submit may be in flight behind it. REQUEUE_MARK, never
+// PRE_DISPATCH. See the REQUEUE_SITES ledger in services/adArchiveDigest.js.
+const { REQUEUE_MARK } = require('./adArchiveDigest');
 
 const FLUSH_MS = () => Math.max(250, Math.min(parseInt(process.env.ALERT_EXIT_FLUSH_MS || '2500', 10), 10000));
 
@@ -109,7 +113,7 @@ async function persistOrphans({ signal, role }) {
       // asset can be recovered for free instead of re-bought.
       Ad.updateMany(
         receiptFree({ campaignRunIds: { $in: s.runIds }, status: 'rendering' }),
-        { $set: { status: 'queued', updatedAt: now } }
+        { $set: { status: 'queued', updatedAt: now, ...REQUEUE_MARK } }
       ),
       CampaignRun.updateMany(
         { runId: { $in: s.runIds }, status: { $nin: ['done', 'failed'] } },

@@ -221,6 +221,60 @@ const adSchema = new mongoose.Schema({
   // unique per campaign.
   identityDigest: { type: String, required: true, index: true },
 
+  // THE RELEASED DIGEST of an archived, never-billed row. Null on every other
+  // ad. Written ONLY by services/adArchiveDigest.js.
+  //
+  // WHY. The (campaignId, identityDigest) unique index is not partial —
+  // partialFilterExpression cannot express `status != 'archived'` — so an
+  // archived row occupied its identity slot forever. Video digests
+  // deliberately omit generationRunId (CLAUDE.md §2: that omission is THE
+  // money guard against a repeat Generate re-billing a paid Omni master), so
+  // an archived never-billed video could never be re-minted: insertMany hit
+  // 11000, swallowed it, and the crop simply never appeared.
+  //
+  // On archive, a row proven receipt-free with no renderUrl has its digest
+  // moved HERE and `identityDigest` replaced with `archived:<_id>` — unique by
+  // construction. On restore the move is reversed. A row holding a spend
+  // receipt or a renderUrl is archived WITHOUT releasing anything: the index
+  // exists to protect PAID identities and that protection is untouched.
+  //
+  // MUST STAY DECLARED. Mongoose strict mode silently drops writes to
+  // UNDECLARED paths (CLAUDE.md §4 — this repo already lost
+  // renderError.predictionId that way). If this declaration is removed the
+  // tombstone still lands, the original digest does NOT, and the ad becomes
+  // unrestorable. Pinned by scripts/verifyArchiveDigestRelease.js.
+  preArchiveIdentityDigest: { type: String, default: null },
+
+  // DURABLE "this row has been in status:'rendering' and came back" marker.
+  // Written by every rendering→queued REQUEUE site, as part of that site's own
+  // awaited write. Never cleared.
+  //
+  // ⚠️ WHY IT EXISTS, and why renderStage could not do this job. Providers
+  // charge at SUBMIT and services/spendReceipt.js's receipt is written AFTER
+  // the POST returns, so a genuinely-billed ad is receipt-free for one HTTP
+  // round-trip. If the process is SIGKILLed inside that window the row is
+  // requeued to 'queued' by the reaper / orphan-persist / a crash handler and
+  // then looks pristine: receipt-free, renderAttempts 0 (that counter is
+  // $inc'd when a render ENDS, not when it starts), and status no longer
+  // 'rendering'. Releasing such a row's identityDigest on archive would let a
+  // later Generate re-mint and RE-BUY a master we already paid for.
+  //
+  // `renderStage` is NOT a sufficient guard: services/adStage.js is
+  // fire-and-forget BY CONTRACT (never awaited, errors swallowed), so the
+  // breadcrumb can simply be missing — and routes/ads.js's CAS-lost release
+  // deliberately NULLS it. This field is set by awaited writes on the requeue
+  // path itself, so it survives exactly the crash that loses the other two.
+  //
+  // A mint leftover that was never claimed never enters 'rendering', so this
+  // stays false and its digest is still releasable — the archive fix's whole
+  // purpose survives. Pinned by scripts/verifyArchiveDigestRelease.js, which
+  // scans for the requeue sites rather than hardcoding them.
+  //
+  // MUST STAY DECLARED — Mongoose strict silently drops writes to undeclared
+  // paths (CLAUDE.md §4), which would make every requeue site a no-op here and
+  // reopen the hole invisibly.
+  wasRendering: { type: Boolean, default: false },
+
   // For raffle campaigns with multiple prize media (Option B per-media
   // variants), this stamps WHICH prize Media this ad's render should
   // use as its hero. Null on non-raffle ads. The first prize media
