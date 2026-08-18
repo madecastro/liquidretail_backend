@@ -8,6 +8,13 @@ description: Run rapid product development (RPD) experiments — A/B video model
 The harness lives at `scripts/rpd/` (read its `README.md` for full detail). It runs entirely from
 this checkout — **no deploy, no Mongo, no Ad rows, no CostLog**. Cells = `models × variants`.
 
+Deep guides in this skill (read the one the task needs):
+- `references/spec-authoring.md` — full spec schema, all four prompt levers with their exact
+  production mappings, directive keys, titling copy rules, matrix patterns that work.
+- `references/operations.md` — credentials per person, exact money semantics with measured
+  price points, resume/finished semantics, the telemetry fields with reference numbers for
+  time forecasting, the sharing checklist, and the agent-loop recipe.
+
 ## The safety contract (do not improvise around it)
 
 - **Dry-run is the default.** `--live` is the only billable door and **requires `--max-usd N`**.
