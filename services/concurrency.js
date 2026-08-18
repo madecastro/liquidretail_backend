@@ -28,7 +28,7 @@ const SPEC = Object.freeze({
     min: 1,
     max: 64,
     ceiling: 'SELF-IMPOSED',
-    why: 'In-flight static/image ads per campaign run. 4→8 (2026-08-02): image submits are unpaced and 8 concurrent openai/gpt-image-2/edit measured clean (85s wall, zero 429s). 8→24 (2026-08-04, owner-directed: renders should all go to Atlas at once). MAX_CREATIVES_PER_RUN=20, so 24 makes this gate non-binding for a full run. Spend is unchanged — the submit COUNT is fixed by the ad count, only the rate moves. Unmeasured above 8: watch for 429 backoff on the first full-size run.'
+    why: 'In-flight static/image ads per campaign run. 4→8 (2026-08-02): image submits are unpaced and 8 concurrent openai/gpt-image-2/edit measured clean (85s wall, zero 429s). 8→24 (2026-08-04, owner-directed: renders should all go to Atlas at once). 24 is now a WAVE SIZE under the run cap (in-flight bound; a full claim renders in waves), no longer non-binding. Spend is unchanged — the submit COUNT is fixed by the ad count, only the rate moves. Unmeasured above 8: watch for 429 backoff on the first full-size run.'
   },
   VEO_CONCURRENCY: {
     env: 'VEO_CONCURRENCY',
@@ -36,7 +36,7 @@ const SPEC = Object.freeze({
     min: 1,
     max: 32,
     ceiling: 'SELF-IMPOSED',
-    why: 'In-flight video ads per campaign run — now the SUBMIT+POLL half only. Raised 1→4 (2026-08-02) as a probe; 4→12 (2026-08-05) once titling moved behind its own permit (VEO_TITLING_CONCURRENCY). The 4 was never really about Omni: this lane also ran Remotion renderMedia (headless Chrome + ffmpeg, 1080p) IN-PROCESS, so the number was pinned to what local RAM/CPU could take, while being documented against Omni RPS. Splitting them lets the idle half (an Omni poll is ~2min of waiting; measured p50 117s / p99 247s) run wide without touching the memory-bound half. Omni RPS remains unpublished and no Omni 429 has ever been recorded; submit RATE is still governed by pacedModelSubmit + ATLAS_SUBMIT_SPACING_MS, and Grok stays <=1 RPS via GROK_MAX_RPS regardless of this value. Kept under MAX_CREATIVES_PER_RUN=20 deliberately — going non-binding here is a separate, measured decision.'
+    why: 'In-flight video ads per campaign run — now the SUBMIT+POLL half only. Raised 1→4 (2026-08-02) as a probe; 4→12 (2026-08-05) once titling moved behind its own permit (VEO_TITLING_CONCURRENCY). The 4 was never really about Omni: this lane also ran Remotion renderMedia (headless Chrome + ffmpeg, 1080p) IN-PROCESS, so the number was pinned to what local RAM/CPU could take, while being documented against Omni RPS. Splitting them lets the idle half (an Omni poll is ~2min of waiting; measured p50 117s / p99 247s) run wide without touching the memory-bound half. Omni RPS remains unpublished and no Omni 429 has ever been recorded; submit RATE is still governed by pacedModelSubmit + ATLAS_SUBMIT_SPACING_MS, and Grok stays <=1 RPS via GROK_MAX_RPS regardless of this value. 12 bounds in-flight video submits/polls per run — a wave size under the effectively-uncapped claim.'
   },
   VEO_TITLING_CONCURRENCY: {
     env: 'VEO_TITLING_CONCURRENCY',
@@ -57,11 +57,11 @@ const SPEC = Object.freeze({
   },
   MAX_CREATIVES_PER_RUN: {
     env: 'MAX_CREATIVES_PER_RUN',
-    default: 20,
+    default: 1000,
     min: 1,
-    max: 200,
+    max: 1000,
     ceiling: 'SELF-IMPOSED',
-    why: 'Hard cap on ads claimed into one CampaignRun. Cartesian product×template×ratio expansion.'
+    why: 'Effectively uncapped by owner directive 2026-08-18 ("immediately remove the cap"); 1000 is a sanity ceiling, not a product cap. The prior 20 starved statics once PR #197 made an Everything run mint 21 videos/product — selectAdsForRun drains the video tier first, so tier 0 alone filled the whole claim and the operator\'s statics never rendered.'
   },
 
   // ── Worker process ──────────────────────────────────────────────────

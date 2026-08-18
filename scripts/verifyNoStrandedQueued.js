@@ -465,8 +465,20 @@ ok('F12 sweep is kill-switchable and bounded', () => {
   assert.strictEqual(typeof ENABLED, 'function');
   assert.ok(maxAds() >= 1);
 });
-ok('F13 MAX_CREATIVES_PER_RUN was not raised (that hides the symptom)', () => {
-  assert.ok(/MAX_CREATIVES_PER_RUN=20/.test(defaultsSrc));
+// F13 originally pinned MAX_CREATIVES_PER_RUN=20 because raising the cap HID
+// the mint-vs-claim gap while leftovers still stranded. That gap is now
+// closed differently: claim >= mint for any realistic run (1000 is a sanity
+// ceiling, not a product cap — owner directive 2026-08-18, "immediately
+// remove the cap"), PLUS the honest mintedTotal / unclaimedAtStart notice
+// (#189) and the 24h archive sweep remain as the net for pathological cases.
+// The 20-cap had itself become a defect (owner-visible: Everything runs
+// delivered zero statics after PR #197 tripled per-product video mints and
+// the video-first claim tier filled the whole budget). Anchored regex so a
+// value like =20 or =2 cannot pass by substring accident.
+ok('F13 MAX_CREATIVES_PER_RUN is effectively uncapped (claim >= any realistic mint)', () => {
+  const m = defaultsSrc.match(/^MAX_CREATIVES_PER_RUN=(\d+)$/m);
+  assert.ok(m, 'MAX_CREATIVES_PER_RUN assignment missing from defaults.env');
+  assert.ok(Number(m[1]) >= 200, `MAX_CREATIVES_PER_RUN=${m[1]} is not effectively uncapped`);
 });
 ok('F14 sweeper does not require routes/ads (no boot-time cycle, no render loop)', () => {
   assert.ok(!/routes\/ads/.test(sweepSrc));

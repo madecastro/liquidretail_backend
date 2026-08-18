@@ -147,7 +147,7 @@ Covered by `scripts/verifyRunFeed.js` (offline; revert-proves the never-escape a
 
 **Deliberately not alerted:** a nonzero count of `queued` Ads.
 `expandWizardJob` routinely queues more creatives than
-`MAX_CREATIVES_PER_RUN` (20) drains in one run, so that count is normal
+`MAX_CREATIVES_PER_RUN` (1000, effectively uncapped) drains in one run, so that count is normal
 inventory, not a fault. It is carried as *context* on the alerts above.
 
 ## Failure payload — lockstep with render-activity
@@ -264,9 +264,11 @@ POST) and is deliberately not bundled here.
 
 Interim mitigations, cheapest first:
 
-1. **Run video batches smaller.** `MAX_CREATIVES_PER_RUN=20` at concurrent
-   Omni still leaves a long exposure window on the web process. Lower it
-   and each loss is smaller.
+1. **Watch request size, not a run cap.** `MAX_CREATIVES_PER_RUN` is 1000
+   (effectively removed, owner 2026-08-18), so batch size is governed by the
+   request itself; `ALERT_HOURLY_SPEND_USD=25` is the operator's tripwire for
+   oversized runs. Concurrent Omni still leaves a long exposure window on the
+   web process — request smaller batches and each loss is smaller.
 2. **Pin the web service to one instance** (autoscaling `max: 1`) so
    scale-in stops being a cause. Deploys still are.
 3. Deploy when nothing is rendering — now observable, because SIGTERM alerts

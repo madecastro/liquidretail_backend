@@ -22,7 +22,7 @@
 //
 // Deliberately NOT alerted on: a nonzero count of 'queued' Ads. That is
 // normal inventory — expandWizardJob routinely queues more creatives than
-// MAX_CREATIVES_PER_RUN (20) drains in one run, so alerting on it would
+// MAX_CREATIVES_PER_RUN (1000) drains in one run, so alerting on it would
 // fire constantly. Queue depth is carried as CONTEXT on the alerts above
 // instead.
 //

@@ -71,13 +71,16 @@ for (const k of ENV_KEYS) {
 require('dotenv').config({ path: path.join(__dirname, '..', 'config', 'defaults.env') });
 const fromDefaults = resolveAll();
 // 8 -> 24 on 2026-08-04 (owner: renders should all go to Atlas at once).
-// MAX_CREATIVES_PER_RUN is 20, so this gate is now non-binding for a full run —
-// every static ad submits together. Pinned so the file and the code default
-// cannot drift apart: a disagreement between them is the exact "silent config
-// lie" CLAUDE.md 4a warns about.
+// Then MAX_CREATIVES_PER_RUN was 20, so 24 made this gate non-binding.
+// 2026-08-18 uncap: MAX_CREATIVES_PER_RUN is 1000 (effectively uncapped), so
+// 24 is a WAVE SIZE under the run cap — a full claim renders in waves.
+// Pinned so the file and the code default cannot drift apart: a disagreement
+// between them is the exact "silent config lie" CLAUDE.md 4a warns about.
 check('A defaults.env RENDER_CONCURRENCY is 24', fromDefaults.RENDER_CONCURRENCY, 24);
-check('A RENDER_CONCURRENCY exceeds MAX_CREATIVES_PER_RUN, so a full run fires at once',
-  fromDefaults.RENDER_CONCURRENCY >= fromDefaults.MAX_CREATIVES_PER_RUN, true);
+check('A RENDER_CONCURRENCY is a wave size under the run cap (claim renders in waves)',
+  fromDefaults.RENDER_CONCURRENCY <= fromDefaults.MAX_CREATIVES_PER_RUN, true);
+check('A defaults.env MAX_CREATIVES_PER_RUN is 1000 (effectively uncapped, owner 2026-08-18)',
+  fromDefaults.MAX_CREATIVES_PER_RUN, 1000);
 // VEO_CONCURRENCY 4 -> 12 on 2026-08-05, when the veo lane's two halves were
 // split. It now gates the SUBMIT+POLL half only (remote, idle — an Omni poll is
 // ~2min of waiting, measured p50 117s / p99 247s). The Remotion titling half —

@@ -93,7 +93,7 @@ superseded and discarded.** The per-file verdicts, so nobody re-derives them:
 | `services/campaignAdsGenerationService.js` | **DISCARDED** | Earlier hand implementation of what `b85cad5b` (#197) shipped |
 | `services/concurrency.js` | **DISCARDED** | main moved 2026-08-13; tree would delete `REMOTION_QUEUE_CONCURRENCY` |
 | `scripts/verifyConcurrencyConfig.js` | **DISCARDED** | edit of the pre-#186 harness; would delete Remotion coverage |
-| `config/defaults.env` → `RENDER_CONCURRENCY=48`, `MAX_CREATIVES_PER_RUN=100` | **PENDING owner decision** | see NEXT-SESSION PROMPT |
+| `config/defaults.env` → `RENDER_CONCURRENCY=48`, `MAX_CREATIVES_PER_RUN=100` | **DECIDED — dropped 2026-08-17, then cap SUPERSEDED 2026-08-18** | cap is now 1000 (owner: "immediately remove the cap"); see NEXT-SESSION PROMPT §1 |
 | `scripts/mintTestToken.js` (untracked) | **STILL UNLANDED** | see NEXT-SESSION PROMPT |
 | `scripts/backlogStats.js`, `scripts/diagnoseCatalogIngestPath.js` | **left untracked** | local diagnostics, nothing depends on them |
 
@@ -287,6 +287,15 @@ Full forensics in the 2026-08-17 section at the top of this file; do not re-deri
 - **§2 `mintTestToken.js` — LANDED, PR #202** (owner approved 2026-08-17 after review).
 
 ### 1. `RENDER_CONCURRENCY` 24→48 and `MAX_CREATIVES_PER_RUN` 20→100 — DROPPED 2026-08-17, record only
+
+**SUPERSEDED 2026-08-18 (owner directive: "immediately remove the cap on max creatives per run")** —
+`MAX_CREATIVES_PER_RUN` is now **1000** (effectively uncapped), landed via branch
+`fix/uncap-max-creatives-per-run`. The 2026-08-17 drop decision predated PR #197's video-count
+tripling, which made an Everything run mint 21 videos/product — so `selectAdsForRun`'s video-first
+tier 0 filled the whole 20-cap and delivered ZERO statics, the live owner-reported bug this
+reverses. `RENDER_CONCURRENCY` stays 24 (now a wave size, no longer non-binding); F13 in
+`verifyNoStrandedQueued` and `verifyConcurrencyConfig`'s relational check were deliberately
+rewritten in the same commit.
 
 The original rationale: *"expandWizardJob mints the full promised set but selectAdsForRun claimed only
 20, and queued ads never auto-drain — a measured Everything (Meta+PMax) run minted 34 and stranded 14
