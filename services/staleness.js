@@ -22,12 +22,14 @@
 // value. Fractional minutes are harmless either way; not truncating is simply
 // more honest about what the operator typed.
 //
-// The gate/flip money guard in routes/ads.js (see services/campaignRunGuards.js
-// buildRunningFlipFilter) and the reaper in worker.js both key off this bound,
-// and routes/ads.js's own comment states the invariant plainly: it is "the same
-// one worker.js uses to reclaim stuck ads, so the two cannot drift into
-// disagreeing about what stale means". Two parsers is exactly that drift, so
-// there is now one.
+// The gate/flip money guards in routes/ads.js (see services/campaignRunGuards.js
+// buildRunningFlipFilter and buildActiveRunsFilter) and the reaper in worker.js
+// all key off these bounds, and routes/ads.js's own comment states the invariant
+// plainly: it is "the same one worker.js uses to reclaim stuck ads, so the two
+// cannot drift into disagreeing about what stale means". Two parsers is exactly
+// that drift, so there is one. Note that "one parser" is a separate guarantee
+// from "one value": there are deliberately TWO values (below), and the money
+// invariant is that every PREPARING-scoped consumer reads the same one of them.
 //
 // PARSE SEMANTICS, and why `Number(x || fallback)` is the wrong shape. That
 // idiom tests the RAW STRING's truthiness before parsing, so any non-empty
@@ -42,8 +44,27 @@
 // re-read without re-requiring the module. Callers that want a value fixed for
 // the process lifetime (worker.js does) simply call once at boot.
 
+// TWO WINDOWS, TWO LIFECYCLES — and they are deliberately different numbers.
+//
+//   REAP_STALE_MIN (15)    — the CLAIMED-DOC window. An Ad in 'rendering' or a
+//                            CampaignRun in 'running' heartbeats (per-ad $inc),
+//                            so 15m of silence really does mean the holder died.
+//                            Raising it would only delay orphan requeue.
+//
+//   PREPARE_STALE_MIN (30) — the PREPARING-LIFECYCLE window. A 'preparing'
+//                            CampaignRun makes ZERO writes between mint and the
+//                            'running' flip, so this is not "silence", it is
+//                            "time since mint" against a job with a genuinely
+//                            long healthy runtime. worker.js's own arithmetic
+//                            puts a healthy expansion at ~18-20 min (Director's
+//                            2 paid attempts x (120s timeout + backoff) ≈ 12
+//                            min, plus the Judge call). At 15 the system was
+//                            reaping — and refusing the flip of — expansions
+//                            that were merely finishing normally: the operator
+//                            saw a crashed run and the ads went back to queued.
+//                            30 clears the documented ceiling with headroom.
 const REAP_STALE_MIN_DEFAULT = 15;
-const PREPARE_STALE_MIN_DEFAULT = 15;
+const PREPARE_STALE_MIN_DEFAULT = 30;
 
 /**
  * Parse a "minutes" env var. Anything that is not a finite POSITIVE number —
@@ -61,22 +82,71 @@ function positiveMinutes(raw, fallback) {
 }
 
 /**
- * How long a claimed doc (Ad 'rendering', CampaignRun 'running') may sit
+ * How long a CLAIMED doc (Ad 'rendering', CampaignRun 'running') may sit
  * untouched before the reaper presumes its holder died — AND the window inside
- * which the concurrency gate still honours a run's exclusivity over its
- * products. Those must be the same number; see the module header.
+ * which the concurrency gate still honours a RUNNING run's exclusivity.
+ *
+ * Those two are the same NUMBER and, since 2026-08-18, the same CLOCK: both the
+ * reaper's running sweep and buildActiveRunsFilter's running arm test
+ * `updatedAt >= now - this`. "Untouched" is meant literally — a running run
+ * heartbeats through every per-ad $inc (mongoose refreshes updatedAt on a
+ * timestamps:true schema), so this measures SILENCE, not total runtime. The
+ * gate's running arm keying on createdAt instead was a confirmed double-bill P0;
+ * see buildActiveRunsFilter's JSDoc for the timeline.
+ *
+ * SCOPE, corrected 2026-08-18: this no longer governs 'preparing' runs. The
+ * flip guard and the gate's preparing arm moved to prepareStaleMin() because
+ * this window (15) is shorter than a healthy expansion (~18-20 min), so it was
+ * failing runs that were merely finishing. Do NOT raise this to "fix" that —
+ * it would delay orphan requeue for every Ad and every running run, which is a
+ * different and unwanted trade. See prepareStaleMin() below.
  */
 function reapStaleMin() {
   return positiveMinutes(process.env.REAP_STALE_MIN, REAP_STALE_MIN_DEFAULT);
 }
 
 /**
- * How long a CampaignRun may sit in 'preparing' before the reaper stamps it
- * failed. Hygiene only — NOT a money guard (see worker.js's comment and
- * services/campaignRunGuards.js buildRunningFlipFilter for what actually
- * prevents the double-spend). Deliberately a separate knob from
- * reapStaleMin(): expansion's legitimate worst case is far longer than a
- * render heartbeat gap, so the two want independent tuning.
+ * THE PREPARING-LIFECYCLE WINDOW. One value, three consumers, and they MUST
+ * agree — this is a money invariant, not a tuning preference.
+ *
+ *   (a) worker.js reapOrphans()      — stamps a stale 'preparing' run failed
+ *                                      (buildStalePreparingFilter)
+ *   (b) the 'preparing'→'running' CAS — buildRunningFlipFilter's age guard
+ *                                      (routes/ads.js), i.e. how long a run
+ *                                      may still claim its own expansion
+ *   (c) the concurrency gate          — the PREPARING arm of
+ *                                      buildActiveRunsFilter (routes/ads.js),
+ *                                      i.e. how long a preparing run still
+ *                                      blocks an identical duplicate request
+ *
+ * All three key on MINT AGE. That is forced, not chosen: a preparing run makes
+ * no writes to its own row, so there is no liveness signal to key on. Once the
+ * flip lands the run is tracked by the OTHER window (reapStaleMin) on
+ * updatedAt, and the flip's own $set refreshes that clock so the handoff has
+ * no gap.
+ *
+ * WHY (b) AND (c) MUST BE THE SAME NUMBER. Let Wg be how long the gate still
+ * counts a preparing run as in-flight, and Wf how long that run may still win
+ * its flip. If Wf > Wg there is a live double-bill window: between Wg and Wf
+ * the gate no longer sees the original run, so a duplicate request sails
+ * through as "not a duplicate" and bills a fresh generation — and then the
+ * original's slow expansion finishes and ITS flip still succeeds, billing a
+ * second time for one operator intent. So safety requires Wf <= Wg, and there
+ * is no reason to want Wf < Wg (that only throws away legitimate flips the
+ * gate was still protecting). Hence Wf == Wg, both read from HERE.
+ *
+ * (The one intentional sliver of Wf < Wg is structural, not a tuning choice:
+ * the flip keys on `startedAt` and the gate on `createdAt`, which mongoose
+ * stamps a few ms later — see buildRunningFlipFilter's JSDoc. That leans the
+ * safe way by milliseconds.)
+ *
+ * Keeping it a SEPARATE KNOB from reapStaleMin() is what makes 30 affordable.
+ * The Ad-level reaper and the RUNNING-run reaper both stay at 15 on updatedAt,
+ * so no claimed doc waits longer to be requeued than it did before: this knob
+ * cannot reach them. What DOES stay in 'preparing' up to 30 min is a wedged
+ * expansion — and that row holds no claimed ads and no recoverable spend (see
+ * worker.js), so the extra 15 minutes costs visibility latency on an alert,
+ * not delayed recovery of work.
  */
 function prepareStaleMin() {
   return positiveMinutes(process.env.PREPARE_STALE_MIN, PREPARE_STALE_MIN_DEFAULT);

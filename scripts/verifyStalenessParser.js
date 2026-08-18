@@ -20,12 +20,24 @@
  * already asserted the invariant in a comment ("the two cannot drift into
  * disagreeing about what stale means"); a single parser is what enforces it.
  *
- * The money case is 0 / blank / whitespace / negative: REAP_STALE_MIN keys
- * buildRunningFlipFilter's age guard, so a value that collapses to <= 0 makes
- * `startedAt >= now` unsatisfiable and turns EVERY Generate into "pay for
- * Director + Judge, claim the ads, discard all of them" — a silent total
- * generation outage. It is dashboard-only, which is exactly where "set it to 0
- * to disable" is the intuitive and catastrophic move.
+ * The money case is 0 / blank / whitespace / negative, and BOTH vars have one
+ * (corrected 2026-08-18 — this header used to attribute the flip guard to
+ * REAP_STALE_MIN, which stopped being true when the preparing lifecycle moved
+ * to its own window):
+ *
+ *   PREPARE_STALE_MIN keys buildRunningFlipFilter's age guard, so a value that
+ *     collapses to <= 0 makes `startedAt >= now` unsatisfiable and turns EVERY
+ *     Generate into "pay for Director + Judge, claim the ads, discard all of
+ *     them" — a silent total generation outage.
+ *   REAP_STALE_MIN bounds the concurrency gate's RUNNING arm (and the reapers).
+ *     A value that collapses to <= 0 empties that arm, so a run that is
+ *     actively submitting billable work is invisible to the gate and a
+ *     duplicate /generate is admitted with no 409 and no confirm — a double
+ *     bill rather than an outage.
+ *
+ * REAP_STALE_MIN is dashboard-only and PREPARE_STALE_MIN ships in
+ * config/defaults.env; either is somewhere "set it to 0 to disable" is the
+ * intuitive and catastrophic move.
  *
  * Run: node scripts/verifyStalenessParser.js   (no DB, no network, no key)
  */
@@ -70,8 +82,34 @@ ok('B2 a fractional value is NOT truncated (old worker parseInt gave 7)', () => 
   withEnv('REAP_STALE_MIN', '7.9', () => assert.strictEqual(staleness.reapStaleMin(), 7.9));
 });
 ok('B3 PREPARE_STALE_MIN is an independent knob, same guarantees', () => {
-  withEnv('PREPARE_STALE_MIN', '0', () => assert.strictEqual(staleness.prepareStaleMin(), 15));
+  // Default is 30, NOT 15 (raised 2026-08-18). The two windows are deliberately
+  // different numbers: 15 is the CLAIMED-doc heartbeat window (Ad 'rendering',
+  // CampaignRun 'running'), while a 'preparing' run never heartbeats and has a
+  // documented healthy runtime of ~18-20 min. Keying the preparing lifecycle on
+  // 15 was failing expansions that were merely finishing. Asserted against the
+  // exported constant rather than a literal so this cannot silently drift from
+  // the value the code actually ships.
+  assert.strictEqual(staleness.PREPARE_STALE_MIN_DEFAULT, 30,
+    'preparing window must clear the ~18-20min healthy expansion ceiling');
+  withEnv('PREPARE_STALE_MIN', '0', () =>
+    assert.strictEqual(staleness.prepareStaleMin(), staleness.PREPARE_STALE_MIN_DEFAULT));
   withEnv('PREPARE_STALE_MIN', '45', () => assert.strictEqual(staleness.prepareStaleMin(), 45));
+});
+ok('B4 the two windows are SEPARATE — raising preparing must not have moved the claimed-doc window', () => {
+  // The whole affordability argument for 30 is that RUNNING runs and Ads keep
+  // 15: raising REAP_STALE_MIN too would delay orphan requeue for every claimed
+  // doc. If someone "simplifies" these back into one constant, this fails.
+  assert.strictEqual(staleness.REAP_STALE_MIN_DEFAULT, 15, 'claimed-doc window must stay 15');
+  assert.ok(staleness.PREPARE_STALE_MIN_DEFAULT > staleness.REAP_STALE_MIN_DEFAULT,
+    'the preparing window is longer than the claimed-doc window by design, not by accident');
+  withEnv('PREPARE_STALE_MIN', '99', () => {
+    assert.strictEqual(staleness.reapStaleMin(), 15,
+      'PREPARE_STALE_MIN must not leak into reapStaleMin() — separate env vars, separate lifecycles');
+  });
+  withEnv('REAP_STALE_MIN', '99', () => {
+    assert.strictEqual(staleness.prepareStaleMin(), 30,
+      'REAP_STALE_MIN must not leak into prepareStaleMin()');
+  });
 });
 
 // ── C. THE REGRESSION THIS FIXES: the two old idioms disagreed ──

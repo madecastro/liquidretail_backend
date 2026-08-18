@@ -67,25 +67,58 @@ const REAP_INTERVAL_MIN  = Math.max(1, parseInt(process.env.REAP_INTERVAL_MIN, 1
 // because every per-ad $inc during a live 'running' batch proves liveness),
 // this threshold is unavoidably "time since mint".
 //
-// HYGIENE ONLY — NOT the money guard. Adversarial review caught that this
-// var cannot safely be the thing standing between a slow expansion and a
-// double bill: this sweep runs on a 5-minute cadence (or longer if the
-// worker is down) and its actual worst-case legitimate wait is far above 15
-// — the Director round alone can burn up to 2 paid attempts x
-// (TIMEOUT_MS=120s + retries with backoff) = ~12 min
+// THIS SWEEP is hygiene. THIS VAR IS NOT — corrected 2026-08-18, because the
+// previous version of this comment drew the line in the wrong place and a real
+// defect hid behind it for three PRs.
+//
+// What is true, and unchanged: the SWEEP below cannot be the thing standing
+// between a slow expansion and a double bill. It runs on a 5-minute cadence
+// (or never, if the worker is down), so nothing may depend on it having
+// ticked. All it does is stamp a dead-looking row 'failed' for visibility.
+//
+// What the old comment got wrong: it concluded from that "so raising this var
+// costs nothing but a longer-lived alert". PREPARE_STALE_MIN is not read only
+// by this sweep. It is the PREPARING-LIFECYCLE WINDOW, and routes/ads.js reads
+// the same getter for two money-facing decisions:
+//
+//   * buildRunningFlipFilter's age guard — how long a run may still win its
+//     own 'preparing'→'running' CAS;
+//   * the 'preparing' arm of buildActiveRunsFilter — how long that run still
+//     blocks an identical duplicate request at the concurrency gate.
+//
+// Those two must stay equal (services/campaignRunGuards.js module header has
+// the inequality and why the other direction double-bills), so this value is
+// load-bearing in both directions, not free to raise.
+//
+// WHY IT IS NOW 30 AND WAS WRONG AT 15. The arithmetic the old comment already
+// contained is the argument: the Director round alone can burn up to 2 paid
+// attempts x (TIMEOUT_MS=120s + retries with backoff) = ~12 min
 // (services/atlasLlmService.js MAX_ATTEMPTS/BACKOFF_MS/TIMEOUT_MS,
-// services/aiCreativeDirectorService.js "worst case stays TWO"), plus the
-// Judge call on top — ~18-20 min is a realistic healthy ceiling, not a
-// crash. The actual money guard is the age check inside
-// buildRunningFlipFilter (services/campaignRunGuards.js), which is keyed on
-// the concurrency gate's OWN staleMin (REAP_STALE_MIN) and is fully
-// independent of this sweep's cadence — a run that outlives the gate's
-// window can never resurrect itself regardless of whether this ever ticks.
-// So this var only decides when a dead-looking row gets stamped 'failed'
-// for visibility; raising it costs nothing but a longer-lived alert.
-// Separate name from REAP_STALE_MIN so it can still be tuned on its own —
-// but the same parser (services/staleness.js), so a nonsense value falls back
-// to the documented default here too instead of clamping to 1 minute.
+// services/aiCreativeDirectorService.js "worst case stays TWO"), plus the Judge
+// call on top — **~18-20 min is a realistic healthy ceiling, not a crash**. The
+// flip guard was keyed on REAP_STALE_MIN (15), i.e. BELOW that ceiling. So an
+// expansion finishing at T=18 min lost its own CAS: the ads it had just claimed
+// were released back to 'queued', the run was stamped 'failed', and the
+// operator was shown a crash that never happened. The old comment said this var
+// was "hygiene only" and therefore safe at 15 — but the 15 that mattered was
+// the flip's, and it was the same documented default, so the contradiction with
+// the ceiling written two paragraphs above never got noticed.
+//
+// 30 clears the ~18-20 min ceiling with headroom. Separate name from
+// REAP_STALE_MIN so RUNNING runs and Ads keep the 15-minute claimed-doc window
+// on updatedAt — raising THAT would delay orphan requeue for every claimed doc,
+// a different and unwanted trade. This knob cannot reach those sweeps, so
+// nothing holding claimed work waits longer than before; what waits longer is a
+// wedged EXPANSION, which holds no claimed ads and no recoverable spend (see
+// the sweep's own comment below). Same parser (services/staleness.js), so a
+// nonsense value falls back to the documented default instead of clamping to 1.
+//
+// NOTE the clock difference, because it is easy to conflate the two windows:
+// this one is MINT AGE (startedAt — a preparing run never writes to its row),
+// while REAP_STALE_MIN is SILENCE (updatedAt, refreshed by every per-ad $inc).
+// The gate's two arms mirror exactly that split; keying its running arm on mint
+// age instead was a confirmed double-bill P0 (2026-08-18) — see
+// services/campaignRunGuards.js buildActiveRunsFilter.
 const PREPARE_STALE_MIN  = prepareStaleMin();
 
 // Health sweep → Slack (services/backlogWatchdog.js). Separate cadence
@@ -300,7 +333,9 @@ async function reapOrphans() {
   // comment (services/campaignRunGuards.js) for the actual guard, which is
   // independent of whether this has run at all. What this sweep does is
   // purely visibility/hygiene: stamp a dead-looking row 'failed' so it stops
-  // showing up as a silent no-op. Any Ad claimed before the running-flip is
+  // showing up as a silent no-op. (The VALUE it uses is money-facing even
+  // though this sweep is not — PREPARE_STALE_MIN is shared with the flip guard
+  // and the gate's preparing arm. See its declaration above.) Any Ad claimed before the running-flip is
   // receipt-free by construction — no veoPredictionId, no
   // imageGeneration.predictionId — so the existing receipt-aware Ad sweep
   // above already releases those back to 'queued' regardless of this sweep's

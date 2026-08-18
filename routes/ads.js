@@ -76,8 +76,10 @@ const {
   computeRequestFingerprint, renderClaimFingerprint,
   buildUnclaimedNotice
 } = require('../services/generationGate');
-const { buildTerminalDoneFilter, buildRunningFlipFilter } = require('../services/campaignRunGuards');
-const { reapStaleMin } = require('../services/staleness');
+const {
+  buildTerminalDoneFilter, buildRunningFlipFilter, buildActiveRunsFilter
+} = require('../services/campaignRunGuards');
+const { reapStaleMin, prepareStaleMin } = require('../services/staleness');
 
 // Operator-facing gate for a multi-select format list (preset 'explicit'),
 // shared by /preview + /generate.
@@ -511,20 +513,44 @@ router.post('/generate', async (req, res) => {
     // it) and that duplicate STATIC sets are owner-sanctioned creative rather
     // than a double charge.
     //
-    // Stale runs are not allowed to lock a campaign forever: a 'preparing' or
-    // 'running' row older than the render ceiling is treated as dead. That bound
-    // is REAP_STALE_MIN, the same one worker.js uses to reclaim stuck ads, so the
-    // two cannot drift into disagreeing about what "stale" means.
+    // Stale runs are not allowed to lock a campaign forever: an in-flight row
+    // older than its lifecycle's ceiling is treated as dead. There are TWO such
+    // ceilings and they are deliberately different numbers — see
+    // services/campaignRunGuards.js buildActiveRunsFilter:
     //
-    // PARSED IN ONE PLACE — services/staleness.js. This var is load-bearing for
-    // whether generation succeeds AT ALL (buildRunningFlipFilter's age guard),
-    // not just for duplicate-detection leniency: '0', whitespace or a negative
-    // collapse the flip's startedAt guard to `>= now` (or a future instant),
-    // which NO real run's startedAt can satisfy — turning every Generate into
-    // "pay for Director/Judge, claim ads, discard everything", a total silent
-    // generation outage. REAP_STALE_MIN is dashboard-only (not in
-    // config/defaults.env), which is exactly where "set it to 0 to disable
-    // staleness" is the intuitive and catastrophic move.
+    //   'running'   → REAP_STALE_MIN (15) on updatedAt — the SAME number and
+    //                 the SAME clock worker.js's running reaper uses, so "the
+    //                 gate sees it" and "the reaper would spare it" are one
+    //                 statement. A live batch heartbeats via every per-ad $inc.
+    //   'preparing' → PREPARE_STALE_MIN (30) on createdAt (mint age), because a
+    //                 preparing run makes no writes at all and its healthy
+    //                 runtime (Director + Judge, ~18-20 min) exceeds 15. This
+    //                 arm MUST equal the window buildRunningFlipFilter enforces
+    //                 below, or a duplicate is admitted while the original can
+    //                 still flip — double bill.
+    //
+    // PARSED IN ONE PLACE — services/staleness.js.
+    //
+    // WHAT EACH VAR IS LOAD-BEARING FOR (corrected 2026-08-18 — this block used
+    // to attribute the flip's age guard to REAP_STALE_MIN, which is no longer
+    // true and was the defect):
+    //
+    //   prepareMin (PREPARE_STALE_MIN) — load-bearing for whether generation
+    //     succeeds AT ALL. '0', whitespace or a negative collapse the flip's
+    //     startedAt guard to `>= now` (or a future instant), which NO real run's
+    //     startedAt can satisfy, turning every Generate into "pay for
+    //     Director/Judge, claim ads, discard everything" — a total silent
+    //     generation outage.
+    //   staleMin (REAP_STALE_MIN) — load-bearing for duplicate detection on
+    //     RUNNING runs, and for the Ad/running-run reapers in worker.js. A
+    //     nonsense value here does not break the flip, but it does blind the
+    //     gate to in-flight billing runs, which is a double-bill.
+    //
+    // Both fall back to their documented default rather than being honoured,
+    // which is the whole reason the shared parser exists. REAP_STALE_MIN is
+    // dashboard-only; PREPARE_STALE_MIN ships in config/defaults.env. Either is
+    // somewhere "set it to 0 to disable staleness" is the intuitive and
+    // catastrophic move.
     //
     // It is read through the shared parser rather than clamped inline because
     // worker.js's reaper keys off the SAME bound, and the two used to parse it
@@ -534,6 +560,12 @@ router.post('/generate', async (req, res) => {
     // cannot drift into disagreeing about what stale means"); one parser is
     // what actually enforces it.
     const staleMin = reapStaleMin();
+    // The PREPARING-lifecycle window. Read once here and handed to BOTH the
+    // gate's preparing arm and the flip's age guard, so the two are equal by
+    // construction rather than by two call sites agreeing on a constant.
+    // Everything the outage note above says about '0'/blank/negative applies to
+    // this var identically — same parser, same fail-to-default behaviour.
+    const prepareMin = prepareStaleMin();
 
     // The fingerprint is built from the PARSED values, not raw req.body, so the
     // hash sees exactly what the expansion will (parsedVideoDurationSec, the
@@ -578,11 +610,12 @@ router.post('/generate', async (req, res) => {
     });
     const ackRunId = confirmDuplicate && acknowledgedRunId ? String(acknowledgedRunId) : null;
 
-    const activeRuns = await CampaignRun.find({
+    const activeRuns = await CampaignRun.find(buildActiveRunsFilter({
       campaignId,
-      status: { $in: ['preparing', 'running'] },
-      createdAt: { $gte: new Date(Date.now() - staleMin * 60 * 1000) }
-    }).select('runId status createdAt requestedProductIds requestFingerprint').lean();
+      now: Date.now(),
+      runningStaleMin:   staleMin,
+      preparingStaleMin: prepareMin
+    })).select('runId status createdAt requestedProductIds requestFingerprint').lean();
 
     // The most recent FINISHED run making this exact request, for the
     // "you already ran this" notice. Bounded by DUPLICATE_LOOKBACK_MIN (default
@@ -709,11 +742,14 @@ router.post('/generate', async (req, res) => {
     // still aborts here.
     const superseding = pickSupersedingRun({
       selfRun: { runId, createdAt: run.createdAt },
-      activeRuns: await CampaignRun.find({
+      // Same filter builder as the pre-check above — the race check must see
+      // the SAME population the pre-check did, or it protects a different set.
+      activeRuns: await CampaignRun.find(buildActiveRunsFilter({
         campaignId,
-        status: { $in: ['preparing', 'running'] },
-        createdAt: { $gte: new Date(Date.now() - staleMin * 60 * 1000) }
-      }).select('runId status createdAt requestedProductIds requestFingerprint').lean(),
+        now: Date.now(),
+        runningStaleMin:   staleMin,
+        preparingStaleMin: prepareMin
+      })).select('runId status createdAt requestedProductIds requestFingerprint').lean(),
       fingerprint: requestFingerprint,
       requestedProductIds: productIds,
       acknowledgedRunId: ackRunId
@@ -779,9 +815,12 @@ router.post('/generate', async (req, res) => {
     setImmediate(async () => {
       let adIds;
       try {
-        // SELF-STATUS CHECK before spending a cent. The gate only considers runs
-        // younger than REAP_STALE_MIN, so a run wedged in 'preparing' past that
-        // window stops holding its products — a sibling Generate for the SAME
+        // SELF-STATUS CHECK before spending a cent. The gate considers a
+        // preparing run only while it is younger than PREPARE_STALE_MIN by mint
+        // age (a running run is tracked separately, and stays visible for as
+        // long as it keeps heartbeating within REAP_STALE_MIN). So a run wedged
+        // in 'preparing' past that window stops holding its products — a sibling
+        // Generate for the SAME
         // products is then allowed. If this run later wakes up and expands
         // anyway, both bill. Re-reading our own status makes that terminal: a run
         // whose row was reaped, failed, or superseded aborts instead of minting.
@@ -1032,16 +1071,25 @@ router.post('/generate', async (req, res) => {
         // COMPARE-AND-SWAP, keyed on status:'preparing' AND age. THIS is the
         // money guard — see buildRunningFlipFilter's comment for why a bare
         // status check is not enough on its own: the concurrency gate above
-        // stops honoring a 'preparing'/'running' run's exclusivity once it is
-        // older than staleMin (REAP_STALE_MIN), on every request, independent
-        // of whether the worker's reaper has actually ticked. Passing the
-        // SAME staleMin here means this flip refuses at the identical instant
-        // the gate already stopped counting this run as active — closing the
-        // window a bare status guard would leave open (a duplicate sails
-        // through as "not active", bills a sibling run, and this one's slow
-        // expansion finishes minutes later and would otherwise flip anyway).
+        // stops honoring a 'preparing' run's exclusivity once it is older than
+        // prepareMin, on every request, independent of whether the worker's
+        // reaper has actually ticked. Passing the SAME prepareMin here means
+        // this flip refuses at the identical instant the gate already stopped
+        // counting this run as active — closing the window a bare status guard
+        // would leave open (a duplicate sails through as "not active", bills a
+        // sibling run, and this one's slow expansion finishes minutes later
+        // and would otherwise flip anyway).
+        //
+        // ⚠️ prepareMin, NOT staleMin. This used to pass staleMin
+        // (REAP_STALE_MIN, 15) and that was the defect: 15 is the heartbeat
+        // window for CLAIMED work, but a preparing run does not heartbeat and
+        // its healthy runtime is ~18-20 min (worker.js). Expansions that
+        // finished normally at T=18 lost this CAS and were reported to the
+        // operator as crashes. The guard stays; the window it uses is now the
+        // preparing one, and the gate's preparing arm above reads the SAME
+        // variable so the two cannot disagree.
         const flip = await CampaignRun.updateOne(
-          buildRunningFlipFilter(run._id, { now: Date.now(), staleMin }),
+          buildRunningFlipFilter(run._id, { now: Date.now(), staleMin: prepareMin }),
           { $set: {
             total: adIds.length,
             status: 'running',
@@ -1059,7 +1107,7 @@ router.post('/generate', async (req, res) => {
         const flipMatched = flip.matchedCount ?? flip.nModified ?? flip.n ?? 0;
         if (!flipMatched) {
           // Either reaped (status no longer 'preparing') or aged past
-          // staleMin while still 'preparing' (the gate-window case above —
+          // prepareMin while still 'preparing' (the gate-window case above —
           // this run may still get marked 'failed' by the reaper later, but
           // it must not render regardless). The Ads we just claimed are
           // receipt-free by construction — the first billable submit happens
@@ -1077,7 +1125,7 @@ router.post('/generate', async (req, res) => {
           // click. A freshly-claimed ad has no renderStage yet, so this is a
           // no-op for the common case and a real guard for the recycled one.
           console.warn(
-            `⚠️  [campaignRun ${runId}] lost the running-flip CAS (reaped, superseded, or aged past ${staleMin}m) — ` +
+            `⚠️  [campaignRun ${runId}] lost the running-flip CAS (reaped, superseded, or aged past ${prepareMin}m) — ` +
             `releasing ${adIds.length} claimed ad(s) back to queued without rendering`
           );
           // Logged, not silently swallowed: the warn above already claims the
