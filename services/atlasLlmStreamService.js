@@ -27,6 +27,12 @@
 const axios = require('axios');
 const { recordFlatCost, MODEL_RATES } = require('./costTracker');
 const { resolveModel, rejectsSamplingParams, stripSamplingParams } = require('./atlasModelMap');
+// ONE shared LLM error taxonomy — services/llmError.js. Imported, not
+// re-implemented: a private copy of "what kind of failure is this" per
+// transport is exactly the drift this module exists to prevent.
+const {
+  LLM_ERROR_CODES, LLM_ACTIONS, classifyLlmFailure, makeLlmError, extractRequestId,
+} = require('./llmError');
 
 const ATLAS_CHAT_URL = (process.env.ATLAS_TEXT_BASE_URL || 'https://api.atlascloud.ai/v1') + '/chat/completions';
 const TIMEOUT_MS = Number(process.env.ATLAS_LLM_STREAM_TIMEOUT_MS || 120_000);
@@ -114,7 +120,16 @@ async function* parseSSE(stream) {
  */
 async function* streamChatCompletion(meta, params, opts = {}) {
   if (!isConfigured()) {
-    throw new Error('atlasLlmStream: ATLAS_API_KEY not configured');
+    // AUTH_MISSING, not a generic failure. "We never had a key" and "the key
+    // was rejected" are different operator actions, and conflating them is
+    // how the Director's Anthropic fallback stayed silently unreachable.
+    throw makeLlmError({
+      code: LLM_ERROR_CODES.LLM_AUTH_MISSING,
+      provider: 'atlas', role: params && params.model,
+      providerMessage: 'atlasLlmStream: ATLAS_API_KEY not configured',
+      action: LLM_ACTIONS.SKIPPED_NO_KEY,
+      actionDetail: 'skipped without attempting — the stream transport has no direct-provider fallback, so the caller gets nothing',
+    });
   }
   if (!params?.model) throw new Error('atlasLlmStream: params.model required');
   if (params.stream === false) throw new Error('atlasLlmStream: params.stream must be true or unset');
@@ -161,7 +176,22 @@ async function* streamChatCompletion(meta, params, opts = {}) {
       if (Buffer.concat(chunks).length > 4096) break;
     }
     const text = Buffer.concat(chunks).toString('utf8');
-    throw new Error(`atlasLlmStream: Atlas ${res.status}: ${text.slice(0, 400)}`);
+    let parsedBody = null;
+    try { parsedBody = JSON.parse(text); } catch (_) { parsedBody = null; }
+    throw makeLlmError({
+      code: classifyLlmFailure({ httpStatus: res.status, message: text, body: parsedBody }),
+      provider: 'atlas', model: atlas, role: params.model,
+      httpStatus: res.status,
+      requestId: extractRequestId(parsedBody, res.headers),
+      elapsedMs: Date.now() - t0,
+      attempt: 1, attemptsMax: 1,
+      providerMessage: text.slice(0, 400),
+      // TRUTHFUL: this transport has no retry and no fallback chain. Saying
+      // anything else here would be the "reported a recovery that did not
+      // happen" failure the taxonomy forbids.
+      action: LLM_ACTIONS.EXHAUSTED_CHAIN,
+      actionDetail: 'gave up — the streaming transport has no retry and no fallback link',
+    });
   }
 
   // Yield chunks and remember the last-seen usage (some providers ship

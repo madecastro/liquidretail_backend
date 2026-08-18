@@ -107,7 +107,80 @@ const MAP = Object.freeze({
   // The 'name'-missing arm matches the `concepts[0].name is missing` warnings
   // production logged. Same model family the 2026-07-31 bake-off picked —
   // this drops the agent wrapper, not the model.
-  'director':         { atlas: 'anthropic/claude-sonnet-5', direct: { provider: 'anthropic', model: 'claude-sonnet-5' } },
+  //
+  // ── CROSS-PROVIDER FALLBACK CHAIN (added 2026-08-18, owner directive) ──
+  //
+  // THE OUTAGE THIS EXISTS FOR. Static ad generation ran at a 100% failure
+  // rate for ~20h. Probed live from the production service, same
+  // ATLAS_API_KEY, sequential single calls, no concurrency:
+  //   anthropic/claude-sonnet-5           -> HTTP 429 after ~51 SECONDS
+  //   anthropic/claude-opus-5             -> HTTP 429 after ~50s
+  //   anthropic/claude-sonnet-4.5-2025…   -> HTTP 429 after ~50s
+  //   anthropic/claude-sonnet-4.6         -> 200, but 52s
+  //   anthropic/claude-sonnet-5-ccmax     -> 200 in 1.7s
+  //   openai/gpt-5.6-terra                -> 200 in 1.0s
+  //   google/gemini-2.5-pro / -flash      -> 200 in 1.7s / 0.7s
+  // So Atlas is CAPACITY-STARVED on several direct Anthropic routes. Not our
+  // payload (every shape 429'd, including one with an invalid temperature that
+  // should have 400'd first), not the model id (sonnet-5 is live in the
+  // catalog), not credit (other providers answer instantly on the same key),
+  // and not the temperature-400 (rejectsSamplingParams already covers it).
+  //
+  // WHY THE EXISTING `direct` FALLBACK DID NOT SAVE US, and this is the whole
+  // lesson: `direct.provider === 'anthropic'` has NO KEY. DIRECT_KEYS in
+  // atlasLlmService only knows openai (OPENAI_API_KEY) and google
+  // (GEMINI_API_KEY), and neither Render service carries ANTHROPIC_API_KEY
+  // (WEB 24 vars, WORKER 15 — checked). So the Director's configured fallback
+  // was structurally incapable of firing, silently, while layoutInputService
+  // survived the same Atlas errors purely because ITS fallback is google.
+  // A same-provider fallback is not a fallback when the provider is the thing
+  // that is down — hence a chain that SPANS providers.
+  //
+  // ORDER — owner directive, verbatim: "let's fallback to Opus, then go to
+  // GPT5.6Terra". opus-5 is ALSO 429 today; it stays in the chain on purpose,
+  // because the chain exists precisely so a starved link is skipped in ~50s
+  // rather than removed from the design. Quality order matches the
+  // 2026-07-31 blind bake-off (sonnet-5 > opus-5 > gpt-5.6-terra).
+  //
+  // Each link keeps its own `direct` twin with the ORIGINAL vendor model name,
+  // same operator directive as every other row. Two of the three are inert
+  // until ANTHROPIC_API_KEY exists; that is honest, and the transport skips a
+  // keyless direct twin for free (no request, no latency).
+  //
+  // openai/gpt-5.6-terra is NOT a fresh id from memory — it is the same slug
+  // the 'gpt-4.1'/'gpt-4o' rows below already resolve to (verified routable
+  // 2026-07-21 with a real chat probe) and the owner re-probed it live today.
+  // Its direct twin is 'gpt-4.1' for the same reason: that pair is already in
+  // this file and already known good on api.openai.com.
+  //
+  // SAMPLING, and this is deliberately asymmetric — see (c) in the transport:
+  // the Director asks for temperature 0.45 (chosen for CONSISTENCY, not
+  // creativity — see DIRECTOR_ROUND_TEMP). The two Claude 5 links CANNOT
+  // honour it: Atlas bare-400s temperature/top_p/top_k on that family, so
+  // rejectsSamplingParams strips them and those links run at the model's own
+  // default. The OpenAI link DOES honour 0.45. So the fallback link runs MORE
+  // deterministically than the primary. That is a real behavioural difference
+  // and it is stated here rather than discovered later.
+  //
+  // KNOWN, ACCEPTED FALLBACK DEFECT: terra was the bake-off's eliminated
+  // incumbent, specifically for setting the product name in all three concepts
+  // against an explicit directive. validateDirectorPayload's `forbiddenStrings`
+  // scan catches exactly that, so a terra-served round is likelier to burn its
+  // one corrective re-ask and to emit a 'director:contract-warn'. Degraded
+  // output beats zero ads — that is the trade, and the fallback-served Slack
+  // notice exists so nobody mistakes it for normal.
+  //
+  // A FOURTH LINK (google/gemini-2.5-pro, measured 1.7s, key present) is one
+  // line away and deliberately NOT added: the owner named a three-link order,
+  // and every extra link raises the worst-case paid-attempt count.
+  'director':         {
+    atlas: 'anthropic/claude-sonnet-5', direct: { provider: 'anthropic', model: 'claude-sonnet-5' },
+    chain: [
+      { atlas: 'anthropic/claude-sonnet-5', direct: { provider: 'anthropic', model: 'claude-sonnet-5' } },
+      { atlas: 'anthropic/claude-opus-5',   direct: { provider: 'anthropic', model: 'claude-opus-5'   } },
+      { atlas: 'openai/gpt-5.6-terra',      direct: { provider: 'openai',    model: 'gpt-4.1'         } },
+    ],
+  },
 
   'gpt-4.1':          { atlas: 'openai/gpt-5.6-terra', direct: { provider: 'openai', model: 'gpt-4.1' } },
   'gpt-4.1-mini':     { atlas: 'openai/gpt-5.6-luna',  direct: { provider: 'openai', model: 'gpt-4.1-mini' } },
@@ -204,19 +277,66 @@ function stripSamplingParams(body) {
  * Resolve a legacy model id (or an already-prefixed Atlas slug) to
  * { atlas, direct }. Unknown ids pass through unchanged as the atlas id
  * (with a same-id openai direct fallback only when un-prefixed).
+ *
+ * This is the PRIMARY LINK ONLY. A role that declares a cross-provider
+ * `chain` still resolves here to its head, so every existing caller
+ * (atlasLlmStreamService, the harnesses) is unchanged. Callers that want the
+ * whole chain ask for it by name — see resolveChain.
  */
 function resolveModel(id) {
   const entry = MAP[id];
   if (entry) {
     const override = process.env[envKeyFor(id)];
-    return override ? { ...entry, atlas: override } : entry;
+    if (!override) return entry;
+    // An override must not drag a contradicting `chain` along with it. The
+    // operator named ONE model; returning the role's chain beside it would
+    // silently re-add paid attempts against models they just overrode away.
+    const out = { ...entry, atlas: override };
+    delete out.chain;
+    return out;
   }
   if (id && id.includes('/')) return { atlas: id, direct: null }; // already an Atlas slug
   return { atlas: id, direct: id ? { provider: 'openai', model: id } : null };
 }
 
+/**
+ * The ORDERED list of candidates for a role: [{ atlas, direct }, …].
+ *
+ * Every role that does NOT declare `chain` returns exactly one link, whose
+ * contents are `resolveModel(id)` — so the transport's chain loop over a
+ * one-element list is, by construction, the behaviour those roles have today.
+ * That equivalence is the reason `chain` is an OPT-IN field on the entry
+ * rather than a second Director-specific code path: one mechanism, one loop,
+ * and the "every other role is unchanged" claim is structural instead of
+ * something a reviewer has to re-derive per role.
+ *
+ * ENV OVERRIDE PRECEDENCE (documented choice, not an accident):
+ *   ATLAS_MODEL_<ROLE> WINS TOTALLY and collapses the chain to ONE link.
+ * Reasoning: the override is the zero-deploy emergency lever. An operator
+ * reaching for it during an outage is naming the model they want to run RIGHT
+ * NOW; quietly appending two more models — each a paid attempt and up to ~50s
+ * of 429 latency — would make the lever less predictable exactly when
+ * predictability is the point. The cost of this choice, stated plainly: an
+ * override pointed at a starved model reinstates the outage until it is
+ * changed again, which takes about thirty seconds in the Render dashboard.
+ */
+function resolveChain(id) {
+  const entry = MAP[id];
+  if (entry) {
+    const override = process.env[envKeyFor(id)];
+    if (override) return [{ atlas: override, direct: entry.direct || null }];
+    if (Array.isArray(entry.chain) && entry.chain.length) {
+      return entry.chain.map((l) => ({ atlas: l.atlas, direct: l.direct || null }));
+    }
+  }
+  const head = resolveModel(id);
+  return [{ atlas: head.atlas, direct: head.direct || null }];
+}
+
 module.exports = {
   resolveModel,
+  resolveChain,
+  envKeyFor,
   MAP,
   rejectsSamplingParams,
   stripSamplingParams,

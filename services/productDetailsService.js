@@ -27,6 +27,17 @@ const CatalogProduct = require('../models/CatalogProduct');
 
 const ENDPOINT = 'https://serpapi.com/search.json';
 const COUNTRY  = process.env.SERPAPI_COUNTRY || 'us';
+// ONE shared LLM error taxonomy — services/llmError.js. Imported, not
+// re-implemented per call site. Every LLM failure in this file is REPORTED
+// with a stable code, the provider/model/status/request_id context, and the
+// action the system actually took next — so a Render log at 2am distinguishes
+// "rate limited", "timed out", "no key" and "bad request", which all used to
+// print as one indistinguishable `err.message`.
+const {
+  LLM_ERROR_CODES, LLM_ACTIONS, classifyLlmFailure, makeLlmError,
+  extractRequestId, formatLlmLogLine,
+} = require('./llmError');
+
 const GEMINI_MODEL = process.env.GEMINI_SEARCH_MODEL || 'gemini-2.5-flash';
 const TTL_MS   = 30 * 24 * 60 * 60 * 1000;   // 30 days — matches productReviews/brandReviews
 
@@ -323,8 +334,19 @@ async function fetchReviewSummary({ productName, brand, variant }) {
     console.log(`   ✓ gemini-reviews: ${summary.length}ch summary, ${sources.length} source(s) in ${Date.now() - t0}ms`);
     return { summary, sources, queries };
   } catch (err) {
-    const detail = err.response?.data?.error?.message || err.message;
-    console.warn(`   ⚠️  gemini-reviews failed in ${Date.now() - t0}ms: ${detail}`);
+    console.warn(formatLlmLogLine(makeLlmError({
+      code: classifyLlmFailure({
+        httpStatus: err.response?.status, errCode: err.code, message: err.message,
+        body: err.response?.data,
+      }),
+      provider: 'google', model: GEMINI_MODEL, role: 'product-review-summary',
+      httpStatus: err.response?.status ?? null,
+      requestId: extractRequestId(err.response?.data, err.response?.headers),
+      elapsedMs: Date.now() - t0,
+      providerMessage: err.response?.data?.error?.message || err.message,
+      action: LLM_ACTIONS.GAVE_UP_PRODUCT,
+      actionDetail: 'returned null — this product ships without a review summary; the rest of the shopping fetch is unaffected',
+    })));
     return null;
   }
 }

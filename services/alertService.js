@@ -62,6 +62,31 @@ const MIN_LEVEL = () => LEVELS[String(process.env.ALERT_MIN_LEVEL || 'warn').toL
 const DEDUPE_WINDOW_MS = () =>
   Math.max(0, parseInt(process.env.ALERT_DEDUPE_WINDOW_MIN || '15', 10)) * 60 * 1000;
 
+// Occurrence THRESHOLD — the inverse end of the same problem dedupe solves.
+//
+// Dedupe answers "this already fired, do not spam". A threshold answers the
+// owner's other question: "if it happens MORE THAN ONCE, alert me" — i.e.
+// hold the FIRST occurrence and page from the second. Opt-in per call via
+// `minCount`; omitted or 1 means today's behaviour, so every existing caller
+// is unchanged by construction.
+//
+// This is NOT a second dedupe. It reuses the SAME `key` and folds its held
+// occurrences into the SAME `suppressed` tally, so a threshold-held hit shows
+// up in the eventual "+N more (suppressed)" line instead of vanishing. One key
+// namespace, one tally, two gates in series: threshold, then dedupe.
+//
+// WINDOW — 30 minutes, and the choice is a trade between two failure modes:
+//   • too short: an outage that produces one failure per run (a small
+//     single-product run every ~20 min) never pairs two hits and never pages,
+//     which is exactly the 20-hour silence this exists to end.
+//   • too long: two genuinely unrelated blips days apart get welded into a
+//     "recurring" page and the channel loses credibility.
+// 30 min pairs anything inside the same working sitting — including the batch
+// case, where a multi-product run trips the second occurrence within seconds —
+// without reaching across a day.
+const THRESHOLD_WINDOW_MS = () =>
+  Math.max(0, parseInt(process.env.ALERT_THRESHOLD_WINDOW_MIN || '30', 10)) * 60 * 1000;
+
 // Absolute ceiling on outbound messages, independent of dedupe — protects
 // the channel (and Slack's own rate limits) if something goes wrong
 // in a tight loop with varying keys.
@@ -109,6 +134,7 @@ const ICON = { info: 'ℹ️', warn: '⚠️', error: '❌', fatal: '🔥' };
 // database being reachable — a Mongo outage is exactly when alerts matter.
 const lastSentAt   = new Map(); // key → epoch ms of last delivery
 const suppressed   = new Map(); // key → { count, since }
+const occurrences  = new Map(); // key → { count, since } — threshold gate only
 let   windowStart  = 0;
 let   windowCount  = 0;       // low-severity (info/warn) deliveries this window
 let   highWindowCount = 0;    // high-severity (error/fatal) deliveries this window
@@ -210,6 +236,12 @@ function pruneDedupeState(now) {
       suppressed.delete(k);
     }
   }
+  // Threshold bookkeeping ages out on its OWN window, which is independent of
+  // the dedupe window (an operator may widen one without the other).
+  const twin = THRESHOLD_WINDOW_MS();
+  for (const [k, rec] of occurrences) {
+    if (twin > 0 && now - rec.since > twin) occurrences.delete(k);
+  }
   // Hard cap regardless of window (Map preserves insertion order, so the
   // head is the oldest).
   while (lastSentAt.size > MAX_TRACKED_KEYS) {
@@ -219,6 +251,9 @@ function pruneDedupeState(now) {
   }
   while (suppressed.size > MAX_TRACKED_KEYS) {
     suppressed.delete(suppressed.keys().next().value);
+  }
+  while (occurrences.size > MAX_TRACKED_KEYS) {
+    occurrences.delete(occurrences.keys().next().value);
   }
 }
 
@@ -336,9 +371,12 @@ function buildMessage({ lvl, title, fields, detail, held }) {
  * @param {string} [o.detail] free text (stack, message, diagnostic) — escaped for mrkdwn
  * @param {object} [o.fields] key→value lines rendered under the title
  * @param {string} [o.key]    dedupe key; defaults to level+title
+ * @param {number} [o.minCount] deliver only from the Nth occurrence of `key`
+ *                 inside ALERT_THRESHOLD_WINDOW_MIN. Omitted/1 = today's
+ *                 behaviour. Use 2 for "alert me if it happens more than once".
  * @returns {Promise<boolean>} true if a message was actually delivered
  */
-async function notify({ level = 'warn', title, detail, fields, key } = {}) {
+async function notify({ level = 'warn', title, detail, fields, key, minCount } = {}) {
   try {
     if (!ENABLED()) return false;
 
@@ -363,6 +401,33 @@ async function notify({ level = 'warn', title, detail, fields, key } = {}) {
     const last = lastSentAt.get(dedupeKey);
 
     pruneDedupeState(now);
+
+    // ── threshold gate (runs BEFORE dedupe) ──
+    // Order matters: counting has to happen on every occurrence, including
+    // ones dedupe would later drop, or a burst that opens with a delivery
+    // would leave the counter permanently under the threshold.
+    const min = Math.max(1, parseInt(minCount, 10) || 1);
+    const twin = THRESHOLD_WINDOW_MS();
+    // ALERT_THRESHOLD_WINDOW_MIN=0 DISABLES the threshold (every occurrence
+    // pages), matching how ALERT_DEDUPE_WINDOW_MIN=0 disables dedupe. Chosen
+    // over "0 = expire instantly" because that reading would make the knob a
+    // silent mute switch for exactly the alerts someone set a threshold on —
+    // the operator would believe they had loosened suppression and would in
+    // fact have turned the page off.
+    if (min > 1 && twin > 0) {
+      const prevOcc = occurrences.get(dedupeKey);
+      const stale = !prevOcc || (now - prevOcc.since >= twin);
+      const rec = stale ? { count: 1, since: now } : { count: prevOcc.count + 1, since: prevOcc.since };
+      occurrences.set(dedupeKey, rec);
+      if (rec.count < min) {
+        // Held, not lost: fold it into the same tally dedupe uses so the
+        // eventual delivery says "+N more (suppressed)" and the operator can
+        // see this was the second of several, not an isolated event.
+        const p = suppressed.get(dedupeKey) || { count: 0, since: now };
+        suppressed.set(dedupeKey, { count: p.count + 1, since: p.since });
+        return false;
+      }
+    }
 
     if (win > 0 && last && now - last < win) {
       const prev = suppressed.get(dedupeKey) || { count: 0, since: now };
@@ -427,6 +492,7 @@ const isConfigured = () => Boolean(BOT_TOKEN() && CHANNEL() && ENABLED());
 function _resetState() {
   lastSentAt.clear();
   suppressed.clear();
+  occurrences.clear();
   windowStart = 0;
   windowCount = 0;
   highWindowCount = 0;
@@ -441,7 +507,8 @@ module.exports = {
   // exported for unit tests
   _esc: esc, _clip: clip, _safeEsc: safeEsc, _redact: redact,
   _buildMessage: buildMessage, _resetState, _LEVELS: LEVELS,
-  _stateSize: () => ({ lastSentAt: lastSentAt.size, suppressed: suppressed.size }),
+  _stateSize: () => ({ lastSentAt: lastSentAt.size, suppressed: suppressed.size, occurrences: occurrences.size }),
+  _THRESHOLD_WINDOW_MS: THRESHOLD_WINDOW_MS,
   _resetRateWindow: () => {
     windowStart = 0;
     windowCount = 0;

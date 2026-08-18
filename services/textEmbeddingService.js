@@ -16,6 +16,35 @@
 const axios = require('axios');
 const crypto = require('crypto');
 const { trackLlmCall } = require('./costTracker');
+// ONE shared LLM error taxonomy — services/llmError.js. Imported, not copied.
+const {
+  LLM_ERROR_CODES, LLM_ACTIONS, classifyLlmFailure, makeLlmError, extractRequestId,
+} = require('./llmError');
+
+/**
+ * Non-200 from either embedding endpoint → a coded error.
+ * Defined ONCE for both the Atlas call and the OpenAI direct fallback so the
+ * two cannot drift on classification (same reason the chat transport has
+ * `codedHttpError`).
+ *
+ * ACTION is stated truthfully per site by the caller of this helper — the
+ * Atlas failure really does fall back to OpenAI; the OpenAI failure really is
+ * the end of the line, and matching (productMatchService) then continues
+ * token-only rather than failing.
+ */
+function codedEmbedError(r, provider, model, elapsedMs, action, actionDetail) {
+  const providerMessage = JSON.stringify(r.data ?? '').slice(0, 200);
+  return makeLlmError({
+    code: classifyLlmFailure({ httpStatus: r.status, message: providerMessage, body: r.data }),
+    provider, model, role: 'text-embedding',
+    httpStatus: r.status,
+    requestId: extractRequestId(r.data, r.headers),
+    elapsedMs, attempt: 1, attemptsMax: 1,
+    providerMessage,
+    action: action || LLM_ACTIONS.NONE,
+    actionDetail,
+  });
+}
 
 const ATLAS_EMBED_URL = (process.env.ATLAS_TEXT_BASE_URL || 'https://api.atlascloud.ai/v1') + '/embeddings';
 const OPENAI_EMBED_URL = 'https://api.openai.com/v1/embeddings';
@@ -73,6 +102,7 @@ async function embed(meta, input) {
 
   // ── Atlas primary ──
   let lastErr = null;
+  const atlasT0 = Date.now();
   if (isConfigured()) {
     try {
       const res = await trackLlmCall(
@@ -80,9 +110,9 @@ async function embed(meta, input) {
         async () => {
           const r = await post(ATLAS_EMBED_URL, process.env.ATLAS_API_KEY, body);
           if (r.status !== 200) {
-            const e = new Error(`Atlas embed ${r.status}: ${JSON.stringify(r.data).slice(0, 200)}`);
-            e.status = r.status;
-            throw e;
+            throw codedEmbedError(r, 'atlas', MODEL_ID, Date.now() - atlasT0,
+              LLM_ACTIONS.FELL_BACK_TO_DIRECT_PROVIDER,
+              'fell back to the direct OpenAI embeddings endpoint');
           }
           return r.data;
         }
@@ -99,14 +129,27 @@ async function embed(meta, input) {
 
   // ── OpenAI direct fallback ──
   const key = directKey();
-  if (!key) throw lastErr || new Error('no ATLAS_API_KEY and no OPENAI_API_KEY for embeddings');
+  if (!key) {
+    throw lastErr || makeLlmError({
+      code: LLM_ERROR_CODES.LLM_AUTH_MISSING,
+      provider: 'atlas', model: MODEL_ID,
+      providerMessage: 'no ATLAS_API_KEY and no OPENAI_API_KEY for embeddings',
+      action: LLM_ACTIONS.SKIPPED_NO_KEY,
+      actionDetail: 'skipped without attempting — the T3 embedding tier is off until a key exists (matching falls back to token-only)',
+    });
+  }
+  const directT0 = Date.now();
   console.warn(`🌐 textEmbedding: falling back to direct openai/${DIRECT_MODEL_ID} (${lastErr?.message?.slice(0, 120) || 'no atlas'})`);
   const directBody = { ...body, model: DIRECT_MODEL_ID };
   const res = await trackLlmCall(
     { ...meta, provider: 'openai', model: DIRECT_MODEL_ID, purpose: (meta?.purpose || meta?.purposeTag || '') + ':direct-fallback' },
     async () => {
       const r = await post(OPENAI_EMBED_URL, key, directBody);
-      if (r.status !== 200) throw new Error(`direct openai embed ${r.status}: ${JSON.stringify(r.data).slice(0, 200)}`);
+      if (r.status !== 200) {
+        throw codedEmbedError(r, 'openai', DIRECT_MODEL_ID, Date.now() - directT0,
+          LLM_ACTIONS.EXHAUSTED_CHAIN,
+          'gave up — both embedding endpoints failed; the caller degrades to token-only matching');
+      }
       return r.data;
     }
   );

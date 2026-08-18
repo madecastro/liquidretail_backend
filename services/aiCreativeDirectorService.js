@@ -30,7 +30,14 @@ const alerts = require('./alertService');
 const { trackLlmCall, recordCacheHit } = require('./costTracker');
 const { conceptField, conceptMediaPicks } = require('./conceptProjection');
 
-const { chatCompletion } = require('./atlasLlmService');
+const { chatCompletion, chainOutcome } = require('./atlasLlmService');
+// ONE shared LLM error taxonomy — see services/llmError.js. Imported, never
+// re-implemented per call site (CLAUDE.md §4 records three production
+// incidents from a helper that was called but not imported; `npm run lint`'s
+// no-undef is the net that catches the next one).
+const {
+  LLM_ERROR_CODES, LLM_ACTIONS, makeLlmError, stampLlmAction, formatLlmLogLine,
+} = require('./llmError');
 const { usableProofCommentsOrNone } = require('./quoteSnippetService');
 const {
   toPrintableCustomerQuote,
@@ -2348,6 +2355,52 @@ async function directConceptsRound({
       }
     );
 
+    // ── DEGRADED-BUT-WORKING must not be invisible ────────────────────────
+    // This is the lower-severity half of the 2026-08-18 alerting work. The
+    // outage stayed silent for ~20h partly because there was no signal
+    // BETWEEN "fine" and "zero ads": a Director quietly served by a fallback
+    // model looks identical to a healthy one in every log and every artifact.
+    //
+    // WARN, not info — ALERT_MIN_LEVEL defaults to 'warn', so an info notice
+    // would be muted in production, which is the same silence in a new hat.
+    // WARN, not fatal — ads ARE being produced; this routes to the normal
+    // channel and leaves the fatal channel for the total outage.
+    //
+    // Keyed per serving model so a switch from opus to terra announces
+    // itself, and deduped by the standard 15-minute window so a 50-product
+    // run pages once with "+N more" rather than fifty times.
+    const chainInfo = chainOutcome(completion);
+    if (chainInfo && chainInfo.degraded) {
+      alerts.notifyAsync({
+        level: 'warn',
+        title: 'Director served by a FALLBACK model — the primary is unavailable',
+        detail:
+          `${chainInfo.summary}\n\n` +
+          `Ads ARE still being produced, by ${chainInfo.servedBy.provider}/${chainInfo.servedBy.model} ` +
+          `instead of ${chainInfo.primary}. Quality is expected to be lower: the fallback links rank ` +
+          `below the primary in the 2026-07-31 bake-off, and openai/gpt-5.6-terra specifically was ` +
+          `eliminated for putting the product name in ad copy against an explicit directive — expect ` +
+          `more contract warnings and more corrective re-asks while it is serving.\n` +
+          `Investigate Atlas capacity on ${chainInfo.primary} before treating this as normal.`,
+        fields: {
+          primary:   chainInfo.primary,
+          servedBy:  `${chainInfo.servedBy.provider}/${chainInfo.servedBy.model}`,
+          link:      `${chainInfo.link} of ${chainInfo.linkCount}`,
+          viaDirect: String(chainInfo.viaDirect),
+          took:      `${chainInfo.elapsedMs}ms`,
+          brandId:   String(brandId || '-'),
+          productId: String(productId || '-'),
+          campaignId: String(campaignId || '-'),
+        },
+        key: `director:fallback-served:${chainInfo.servedBy.provider}/${chainInfo.servedBy.model}`,
+      });
+      console.warn(
+        `🎭 directorRound[r${roundIndex}]: DEGRADED — served by ` +
+        `${chainInfo.servedBy.provider}/${chainInfo.servedBy.model} instead of ${chainInfo.primary} ` +
+        `(${chainInfo.summary})`
+      );
+    }
+
     raw = completion.choices?.[0]?.message?.content;
     if (!raw) throw new Error('Director (round) returned no content');
     // Atlas SILENTLY IGNORES response_format:{type:'json_object'} on the
@@ -2368,12 +2421,39 @@ async function directConceptsRound({
       // ONE corrective budget shared with the schema-validation re-ask below
       // (`attempt >= 1`). Parse-retry and validation-retry must not stack into
       // four paid Director calls — worst case stays TWO, as it was before.
+      //
+      // CONTENT-CLASS failure, deliberately kept OUT of the transport's
+      // taxonomy of transport failures: this is an HTTP 200 whose tokens were
+      // generated and BILLED. It must never advance the fallback chain (a
+      // different model does not fix prompt compliance) — pinned by
+      // verifyDirectorFallbackChain B4. It is coded and logged all the same,
+      // so a Render log at 2am distinguishes "the model answered badly" from
+      // "the model was unreachable", which used to look identical.
+      const contentErr = makeLlmError({
+        code: LLM_ERROR_CODES.LLM_CONTENT_UNPARSEABLE,
+        role: DIRECTOR_ROUND_MODEL,
+        provider: chainInfo ? chainInfo.servedBy.provider : 'atlas',
+        model: chainInfo ? chainInfo.servedBy.model : null,
+        httpStatus: 200,
+        elapsedMs: Date.now() - t0,
+        attempt: attempt + 1,
+        providerMessage: err.message,
+      });
+      // The give-up / re-ask decision is ONE condition, read once, so the
+      // logged action can never disagree with the branch that runs.
+      const giveUp = attempt >= 1;
+      stampLlmAction(
+        contentErr,
+        giveUp ? LLM_ACTIONS.GAVE_UP_PRODUCT : LLM_ACTIONS.CORRECTIVE_REASK,
+        giveUp
+          ? 'gave up this product — the corrective re-ask also failed, so no ads are minted for it (video is unaffected)'
+          : 'response not JSON, re-asking once — the one-shot corrective re-ask shares the attempt budget, so worst case stays two paid Director calls'
+      );
+      if (giveUp) console.error(formatLlmLogLine(contentErr));
+      else console.warn(formatLlmLogLine(contentErr));
       if (attempt >= 1) {
         throw new Error(`Director (round) response not JSON: ${err.message}`);
       }
-      console.warn(
-        `🎭 directorRound[r${roundIndex}]: response not JSON, re-asking once — ${err.message}`
-      );
       messages.push({ role: 'assistant', content: raw });
       messages.push({
         role: 'user',

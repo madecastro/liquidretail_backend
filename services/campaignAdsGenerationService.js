@@ -59,6 +59,17 @@ const {
 } = require('./perProductReasons');
 const { conceptField, conceptMediaPicks } = require('./conceptProjection');
 const alertService = require('./alertService');
+// ONE shared LLM error taxonomy — see services/llmError.js. Imported, never
+// re-implemented (CLAUDE.md §4: a harness proving a call is WRITTEN does not
+// prove it RESOLVES; `npm run lint`'s no-undef is the net).
+const {
+  LLM_ACTIONS, CODE_META: LLM_CODE_META, isLlmError, stampLlmAction, formatLlmLogLine,
+} = require('./llmError');
+
+// Stable, GLOBAL dedupe/threshold key for the Director transport page.
+// Global on purpose: a gateway outage hits every product, and 50 pages for
+// one fault is how a channel gets muted. See the alert site for the trade.
+const DIRECTOR_TRANSPORT_ALERT_KEY = 'director:transport-failure';
 
 // Cast a string/ObjectId to ObjectId. Required when querying
 // metadata.catalogProductId (Mixed type) — Mongoose doesn't auto-cast
@@ -3805,13 +3816,88 @@ async function runConceptDrivenExpansion({
       //
       // Still return rather than rethrow: one product blowing up must not abort
       // the siblings mid-Promise.all, which would change who gets billed.
-      console.error(`📦 conceptDriven[${productTag}]: failed (${err.message})`);
+      //
+      // ── THIS CATCH IS WHERE THE 2026-08-18 OUTAGE HID ─────────────────
+      // For ~20h every Director round 429'd, every product landed here, and
+      // the ONLY trace was the console.error below. The run finished, the
+      // operator saw "0 static ads" with no error, and nothing paged.
+      //
+      // A coded LLM error (services/llmError.js) is now distinguishable from
+      // any other per-product fault, so the transport class can page without
+      // turning every unrelated expansion bug into a fatal Slack message.
+      const llmFail = isLlmError(err) ? err : null;
+      if (llmFail) {
+        // TRUTHFUL ACTION, stamped at the layer that knows the consequence.
+        // The transport said EXHAUSTED_CHAIN — true, but it cannot see
+        // products. THIS layer can: the product is done, it mints no ads.
+        stampLlmAction(llmFail, LLM_ACTIONS.GAVE_UP_PRODUCT,
+          'gave up this product — no ads were minted for it (video is unaffected)');
+        console.error(formatLlmLogLine(llmFail));
+        if (llmFail.chainSummary) {
+          console.error(`📦 conceptDriven[${productTag}]: ${llmFail.chainSummary}`);
+        }
+
+        // ── the page ──
+        // FATAL: a Director transport outage is a TOTAL static outage, not a
+        // degraded one — every product in every run produces zero ads. That
+        // is fatal-channel material per docs/ALERTING.md's severity table.
+        //
+        // minCount 2 is the owner's "if it happens more than once" threshold,
+        // implemented with alertService's own occurrence gate (not a second
+        // dedupe): the first failure is HELD and folded into the eventual
+        // "+N more (suppressed)" line, the second pages.
+        //
+        // The key is deliberately GLOBAL, not per-product. The failure is a
+        // gateway outage, so a 50-product run must produce ONE page carrying
+        // "+49 more", never 50. Consequence: the ids in `fields` are an
+        // EXEMPLAR — the product that happened to trip the threshold — while
+        // `detail` carries the chain, which is the part that identifies the
+        // fault. Fire-and-forget: notifyAsync returns nothing to await, so an
+        // alert can never block or throw into a billable expansion.
+        alertService.notifyAsync({
+          level: 'fatal',
+          title: 'Director LLM unreachable — static ad generation is producing ZERO ads',
+          detail:
+            `${llmFail.chainSummary || '(no chain recorded)'}\n\n` +
+            `CONSEQUENCE: static ad generation is producing ZERO ads for these products. ` +
+            `Video is unaffected — it does not use the Director.\n` +
+            `WHAT THE SYSTEM DID: ${llmFail.actionDetail || 'gave up'}.\n` +
+            `WHAT TO DO: ${LLM_CODE_META[llmFail.code] ? LLM_CODE_META[llmFail.code].operatorAction : 'see services/llmError.js'}\n` +
+            `EMERGENCY LEVER: set ATLAS_MODEL_DIRECTOR=<a slug probed healthy> on both Render ` +
+            `services to re-point the Director with no deploy. It replaces the whole chain.`,
+          fields: {
+            code:       llmFail.code,
+            action:     llmFail.action,
+            model:      llmFail.model || '-',
+            provider:   llmFail.provider || '-',
+            status:     llmFail.httpStatus == null ? 'none' : String(llmFail.httpStatus),
+            request_id: llmFail.requestId || '-',
+            billable:   String(llmFail.billable),
+            brandId:    String(brandId || '-'),
+            productId:  String(productId || '-'),
+            campaignId: String(campaignId || '-'),
+          },
+          key: DIRECTOR_TRANSPORT_ALERT_KEY,
+          minCount: 2,
+        });
+      } else {
+        console.error(`📦 conceptDriven[${productTag}]: failed (${err.message})`);
+      }
+
       return {
         productId,
         payloads: [],
         skipped: PER_PRODUCT_REASON.ERROR,
         error: err && err.message ? err.message : String(err),
-        errorName: (err && err.constructor && err.constructor.name) || 'Error'
+        errorName: (err && err.constructor && err.constructor.name) || 'Error',
+        // Machine-readable so the operator sees a CLASS, not just prose.
+        // Threaded through perProductReasons → routes/ads.js →
+        // CampaignRun.errors[] (schema extended in the same commit — a strict
+        // schema silently DROPS an undeclared path, the trap that already lost
+        // renderError.predictionId once).
+        errorCode:    llmFail ? llmFail.code : null,
+        errorAction:  llmFail ? llmFail.action : null,
+        errorChain:   llmFail ? (llmFail.chainSummary || null) : null,
       };
     }
   }));

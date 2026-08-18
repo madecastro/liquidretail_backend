@@ -227,6 +227,12 @@ function normalizePerProductEntry(raw, nameById = {}) {
     if (reason === REASON.ERROR) {
       if (raw.error) entry.error = String(raw.error);
       if (raw.errorName) entry.errorName = String(raw.errorName);
+      // LLM failure taxonomy (services/llmError.js). Copied here or it never
+      // reaches CampaignRun.perProduct — this normaliser is the only writer,
+      // and a field it does not copy is a field the operator never sees.
+      if (raw.errorCode) entry.errorCode = String(raw.errorCode);
+      if (raw.errorAction) entry.errorAction = String(raw.errorAction);
+      if (raw.errorChain) entry.errorChain = String(raw.errorChain);
     }
 
     return entry;

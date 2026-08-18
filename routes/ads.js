@@ -937,11 +937,23 @@ router.post('/generate', async (req, res) => {
           r && (r.reason === PER_PRODUCT_REASON.ERROR || r.skipped === 'error' ||
                 (r.skipped === true && r.reason === PER_PRODUCT_REASON.ERROR))
         );
+        // The LLM taxonomy fields (services/llmError.js) ride along so the
+        // operator sees a CLASS and an OUTCOME, not just prose. Before this,
+        // "Atlas 400: bad request" was all that reached them — indistinguishable
+        // from a capacity outage, which is how a 20-hour Director outage read
+        // as an ordinary bad request. `undefined` (not null) for the absent
+        // case so Mongoose omits the path instead of storing an empty string.
+        // The three names are DECLARED on the strict schema in
+        // models/CampaignRun.js — undeclared paths are dropped in silence.
         const errorEntries = productErrors.map((r, i) => ({
           index: i,
           stage: 'expand',
           productId: r.productId || undefined,
-          message: `${r.errorName || 'Error'}: ${r.error || r.message || 'unknown error'}` +
+          code:   r.errorCode || undefined,
+          action: r.errorAction || undefined,
+          chain:  r.errorChain || undefined,
+          message: `${r.errorCode ? `[${r.errorCode}] ` : ''}` +
+                   `${r.errorName || 'Error'}: ${r.error || r.message || 'unknown error'}` +
                    (r.productId ? ` (product=${r.productId})` : '')
         }));
 
