@@ -144,11 +144,13 @@ JSON file. Cells = `models` × `variants`. Per-variant overrides (`durationSec`,
 ## CLI
 
 ```text
-node scripts/rpd/rpd.js run <spec.json> [--live --max-usd N] [--out rpd-runs]
+node scripts/rpd/rpd.js run <spec.json> [--live --max-usd N] [--out rpd-runs] [--upload]
 node scripts/rpd/rpd.js resume <runDir>
+node scripts/rpd/rpd.js eval <runDir> [--eval-max-usd 0.5]
+node scripts/rpd/rpd.js stats [--out rpd-runs] [--csv]
 node scripts/rpd/rpd.js gallery <runDir>
 node scripts/rpd/rpd.js note <runDir> <cellId|run> "text"
-node scripts/rpd/rpd.js publish <runDir> [--project rs-rpd]
+node scripts/rpd/rpd.js publish <runDir> [--project rs-rpd] [--no-slack]
 node scripts/rpd/rpd.js models
 ```
 
@@ -159,6 +161,8 @@ node scripts/rpd/rpd.js models
 | `gallery <runDir>` | Rebuild `index.html` from `manifest.json`. | No |
 | `note <runDir> <cellId\|run> "text"` | Append an observation on a cell or the whole run; persist on the manifest; rebuild gallery. | No |
 | `publish <runDir> [--project rs-rpd]` | `npx --yes wrangler pages deploy`. Creates the Pages project on first 404. | No (Cloudflare only) |
+| `eval <runDir>` | Vision-grade settled cells into badged auto-notes. Own cap, `--eval-max-usd` (default $0.50). | Yes — vision LLM, ~$0.01–0.03/cell |
+| `stats` | Aggregate every run manifest: settled cost + latency percentiles per model/duration/size. `--csv` for a spreadsheet. | No |
 | `models` | Print `MODEL_CAPS` + `estimateRenderCostUsd` table. | No |
 
 ---
@@ -283,6 +287,121 @@ npx wrangler pages project create <p> --production-branch main
 Prints the Pages URL. **522 for ~2 minutes after deploy is expected propagation**, not a bad upload.
 
 ---
+
+---
+
+## Static (image) experiments
+
+A spec may carry a `static` section, a video section (`models` + `variants`), or **both** — one
+budget gate covers all cells.
+
+```json
+"static": {
+  "surface": "meta_feed_1_1",
+  "intent": "brand_led",
+  "productDesc": "a black cotton crew-neck tee with a circular grey chest logo",
+  "copy": { "headline": "Better than new.", "cta": "SHOP NOW" },
+  "models": ["openai/gpt-image-2/edit", "openai/gpt-image-2-developer/edit"],
+  "variants": [
+    { "id": "baseline" },
+    { "id": "tighter-fidelity", "blocks": { "PRODUCT_FIDELITY": "…replacement block…" } },
+    { "id": "rewrite", "raw": "…full replacement prompt…" },
+    { "id": "surgical", "patch": [{ "find": "…", "replace": "…" }] }
+  ]
+}
+```
+
+Baseline is production-identical `staticAdIntents.buildPrompt` output. Levers:
+
+| lever | production equivalent |
+|---|---|
+| *(none)* | the canonical intent prompt |
+| `raw` | `Ad.imagePromptRaw` — full replace (≤40000 chars) |
+| `blocks` | a **code change to a canonical block** (`PRODUCT_FIDELITY`, `SCENE_PRESERVE`, `SCENE_PRESERVE_EDGE_EXTEND`) |
+| `patch` | surgical find-once edit of the finished prompt |
+
+**Why static uses `blocks` and video uses `directives`:** video's directive sets are objects, so
+patching a property mutates the binding the builder reads. The static blocks are module-scope
+`const` **strings** read lexically — assigning to the export changes nothing the builder sees, and
+the cell would silently render the baseline while claiming otherwise. `blocks` therefore does an
+exact whole-block substitution of the finished prompt, and **errors loudly** if the block is not
+present (e.g. `STATIC_PROMPT_FIDELITY_HARDENING=false` routes to the legacy paragraph instead).
+
+**Intent downgrades are surfaced, not hidden.** `resolveIntent` falls back when an intent's data
+is missing — ask for `social_proof_led` with no rating and you get `product_first_lifestyle`. That
+appears in the dry run, in `promptMeta.intentDowngraded`, and as a gallery badge, because an arm
+labelled with the requested intent that rendered a different one is a broken comparison.
+
+Static money notes: `allowFallback:false` is hardcoded (the default resubmits to direct OpenAI — a
+second billable generation on a different model); prices come from a **measured** table
+(`gpt-image-2/edit` $0.0718, `-developer/edit` $0.0359) because the catalog `base_price` measures
+~7× low; an unlisted model is refused live. The `-developer` variant is cheaper but production
+stays off it (~16% hard-fail rate) — fine for an experiment, just know the arms may differ in
+reliability as well as quality.
+
+## Seeding from the catalog (`seed.productId`)
+
+Instead of pasting a URL, name a product:
+
+```json
+"seed": { "productId": "6a6624b95f5af85a46562ded" }
+```
+
+Requires `MONGODB_URI` (read-only). Resolves the merchant-feed primary image by the **live**
+production rule (`CatalogProduct.imageMediaId` pointer → `metadata.feedIndex === 0`; videos and
+empty URLs rejected), plus the next two catalog refs in feed order, the product title, and the
+brand's `websiteBackground` as the crop pad hex. **The resolved values are stamped into the
+manifest**, so `resume` / `gallery` / `publish` never touch the database. A product with no usable
+still is a hard error — the harness never triggers a materialize/detect run.
+
+## Video-seeded (reference-to-video) cells
+
+Add `seed.videoUrl` (Cloudinary `/video/upload/` preferred) and reference-to-video models stop
+being skipped. The clip URL is built with the same production expression
+(`so_2,du_N,c_fill,ar_*`, raw URL as fallback). A pre-submit `ffprobe` refuses a source longer
+than the schema's documented 30s ceiling — production does not check this, and an r2v submit is a
+flat $1.60. An unprobeable seed warns rather than refusing (matching production).
+
+## Auto-eval
+
+`rpd eval <runDir>` grades every settled cell and writes a badged auto-note:
+
+- **Statics** reuse the production judge (`adVisionQcService.judgeRender`), so harness verdicts are
+  directly comparable with production QC.
+- **Video** extracts 4 frames (ffmpeg) and sends seed + frames through the same `ad-vision-qc`
+  model role with a rubric covering seed fidelity, hallucinated parts, transition artifacts and
+  text legibility.
+
+Verdicts are **advisory**: badged "auto-eval — verify before trusting", never overwriting a human
+note, never gating anything. Vision calls are billable and have their **own** cap
+(`--eval-max-usd`, default $0.50) so eval can never consume generation budget; exhausting it stops
+cleanly and reports how many cells were left.
+
+## Nightly loop
+
+`scripts/rpd/loop/nightly.sh` runs one bounded batch per night: dry-run → live under `--max-usd`
+(default $2) → resume if any receipt is unsettled → eval → publish → Slack → append a LEARNINGS
+row. **Idempotent per day** via a stamp file claimed *before* spending, because launchd re-fires
+missed jobs on wake and "catch up" must never mean "generate twice".
+
+`scripts/rpd/loop/nightly-spec.json` **is the queue**: add a variant by PR and tonight's run tests
+it against the baseline. Remove variants once their learning is in LEARNINGS.md.
+
+Credentials come from the environment or `~/.rpd-nightly.env` (chmod 600), never from the script.
+
+## Gallery access (one-time human step)
+
+`rs-rpd.pages.dev` deployments are readable by anyone holding the URL. To require an org email
+login, enable Cloudflare Access — this needs one dashboard click that no API token can perform:
+
+1. https://dash.cloudflare.com → **Zero Trust** → click **Enable Access** (one time, free tier
+   covers 50 users).
+2. **Access → Applications → Add self-hosted**, domain `rs-rpd.pages.dev` (include
+   `*.rs-rpd.pages.dev` for per-deployment URLs).
+3. Policy: *Allow* → *Emails ending in* `@reach-social.io` (add individual addresses as needed).
+
+Until that is done, treat gallery URLs as shareable-but-unlisted and don't put anything in a
+gallery you would not want forwarded.
 
 ## Agents running this in a loop
 

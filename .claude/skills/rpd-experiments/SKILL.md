@@ -35,9 +35,25 @@ node scripts/rpd/rpd.js models                     # slugs, caps, floor estimate
 node scripts/rpd/rpd.js run spec.json              # FREE: prompts, bodies, estimates, gallery
 node scripts/rpd/rpd.js run spec.json --live --max-usd <N>   # billable, hard-capped
 node scripts/rpd/rpd.js resume <runDir>            # finish interrupted runs (free)
+node scripts/rpd/rpd.js eval <runDir>              # vision-grade cells (own cap: --eval-max-usd)
+node scripts/rpd/rpd.js stats                      # cost + latency across all runs (--csv)
 node scripts/rpd/rpd.js note <runDir> <cellId|run> "observation"
-node scripts/rpd/rpd.js publish <runDir> --project rs-rpd    # Cloudflare Pages URL
+node scripts/rpd/rpd.js publish <runDir> --project rs-rpd    # Cloudflare Pages URL + Slack
 ```
+
+**Both media types.** A spec can carry a video section (`models` + `variants`), a `static` section
+(image ads — cheap, ~$0.04-0.07/cell, so iterate here first), or both under one budget gate.
+Static levers are `raw` / `blocks` / `patch` (see `references/spec-authoring.md`); `blocks` replaces
+a whole canonical prompt block, which is how you measure a proposed change to
+`staticAdIntents` before anyone commits it.
+
+**Seed from the catalog** with `seed": {"productId": "..."}` (needs `MONGODB_URI`, read-only) —
+resolves the merchant-feed primary + 2 refs by the live production rule and stamps them into the
+manifest. **Reference-to-video** models run when `seed.videoUrl` is set.
+
+**Queue an experiment for tonight** by adding a variant to
+`scripts/rpd/loop/nightly-spec.json` via PR — the nightly loop ($2 cap) tests it, grades it,
+publishes it, and appends a LEARNINGS row.
 
 Specs: start from `scripts/rpd/specs/*.json`. Seed images should be Cloudinary URLs (they get
 the production 720-short-edge `c_fill,g_auto` crop; anything else is sent unresized). Prompt
