@@ -27,6 +27,7 @@
 
 const fs = require('fs');
 const path = require('path');
+const { spawnSync } = require('child_process');
 const {
   MODEL_CAPS,
   capsFor,
@@ -34,6 +35,7 @@ const {
   estimateRenderCostUsd,
   buildSubmissionBody,
   cropImageUrlForAspect,
+  buildVideoSegmentUrl,
   submitGeneration
 } = require('../../../services/atlasVideoService');
 const { buildForCell } = require('./promptVariants');
@@ -55,7 +57,12 @@ function loadSpec(specPath) {
   if (!spec.name || !/^[a-z0-9][a-z0-9-_]*$/i.test(spec.name)) {
     throw new Error('rpd: spec.name is required (letters/digits/dashes only — it becomes the run directory)');
   }
-  if (!spec.seed || !spec.seed.url) throw new Error('rpd: spec.seed.url is required');
+  if (!spec.seed || !spec.seed.url) {
+    throw new Error(
+      'rpd: spec.seed.url is required (the still; it is images[0] and the gallery thumb). ' +
+      'Reference-to-video models additionally need spec.seed.videoUrl.'
+    );
+  }
   if (!Array.isArray(spec.models) || spec.models.length === 0) throw new Error('rpd: spec.models must be a non-empty array');
   if (!Array.isArray(spec.variants) || spec.variants.length === 0) throw new Error('rpd: spec.variants must be a non-empty array');
   const ids = new Set();
@@ -94,6 +101,31 @@ function prepareImageUrls(spec, variant, aspectRatio) {
   return { imageUrls: prepared, warnings };
 }
 
+// Source-duration guard for reference-to-video seeds. The Atlas r2v schema
+// documents a ≤30s source asset (live-verified 2026-07-21) and PRODUCTION DOES
+// NOT CHECK IT — `Media.durationSec` is never read before submit. An r2v submit
+// is a flat $1.60, so a cheap local ffprobe before spending is worth it.
+// Returns { seconds } | { seconds: null, reason } — unknown is NOT a refusal
+// (that would make the harness stricter than production over a missing binary),
+// it is a warning the operator sees in the dry run.
+function probeVideoDurationSec(url) {
+  try {
+    const res = spawnSync('ffprobe', [
+      '-v', 'error', '-show_entries', 'format=duration',
+      '-of', 'default=noprint_wrappers=1:nokey=1', url
+    ], { encoding: 'utf8', timeout: 30_000 });
+    if (res.error || res.status !== 0) {
+      return { seconds: null, reason: res.error ? res.error.message : `ffprobe exit ${res.status}` };
+    }
+    const n = Number(String(res.stdout || '').trim());
+    return Number.isFinite(n) && n > 0 ? { seconds: n } : { seconds: null, reason: 'unparseable duration' };
+  } catch (err) {
+    return { seconds: null, reason: err.message };
+  }
+}
+
+const R2V_MAX_SOURCE_SEC = 30;
+
 // Expand spec → cells with prompts, bodies and estimates. Pure + free — this
 // IS the dry run; live mode just carries on to submit the same cells.
 function expandCells(spec) {
@@ -108,11 +140,34 @@ function expandCells(spec) {
         notes: [], charged: false
       };
       try {
+        // Reference-to-video models need a video seed. With `seed.videoUrl`
+        // present they are runnable; without it the skip stays honest (an
+        // image-only r2v submit would spend $1.60 on `url: undefined`).
+        let videoClipUrl = null;
         if (caps.requiresVideoSeed) {
-          cell.status = 'skipped';
-          cell.error = 'model requires a video seed (reference-to-video) — the harness only supplies image seeds today';
-          cells.push(cell);
-          continue;
+          const videoSeed = spec.seed.videoUrl || null;
+          if (!videoSeed) {
+            cell.status = 'skipped';
+            cell.error = 'model requires a video seed (reference-to-video) — add spec.seed.videoUrl';
+            cells.push(cell);
+            continue;
+          }
+          const probe = probeVideoDurationSec(videoSeed);
+          if (probe.seconds != null && probe.seconds > R2V_MAX_SOURCE_SEC) {
+            cell.status = 'skipped';
+            cell.error =
+              `video seed is ${probe.seconds.toFixed(1)}s — the r2v schema documents a ` +
+              `≤${R2V_MAX_SOURCE_SEC}s source asset, and this model is a flat $1.60 per submit`;
+            cells.push(cell);
+            continue;
+          }
+          cell.videoSeedDurationSec = probe.seconds;
+          if (probe.seconds == null) {
+            cell.seedWarnings = [
+              `could not probe the video seed duration (${probe.reason}) — the r2v schema wants ` +
+              `≤${R2V_MAX_SOURCE_SEC}s; production does not check this either`
+            ];
+          }
         }
         if (Array.isArray(caps.supportedAspectRatios) && !caps.supportedAspectRatios.includes(aspectRatio)) {
           cell.status = 'skipped';
@@ -127,9 +182,17 @@ function expandCells(spec) {
         const { prompt, promptMeta } = buildForCell({ spec, model, caps, variant: { ...variant, durationSec } });
         cell.timings = { promptBuildMs: Date.now() - pb0 };
         const { imageUrls, warnings } = prepareImageUrls(spec, variant, aspectRatio);
+        if (caps.requiresVideoSeed) {
+          // Same expression production uses (generateForAd): the Cloudinary
+          // rewrite when possible (so_2,du_N,c_fill,ar_*), else the raw URL and
+          // let Atlas trim via start/ends.
+          videoClipUrl = buildVideoSegmentUrl(spec.seed.videoUrl, aspectRatio, durationSec)
+            || spec.seed.videoUrl;
+          cell.videoClipUrl = videoClipUrl;
+        }
         const body = buildSubmissionBody({
           model, prompt, imageUrls, aspectRatio, caps,
-          videoClipUrl: null, durationSec
+          videoClipUrl, durationSec
         });
         // Resolution allowlist (adversarial finding 2): an unknown string
         // (e.g. "4K", "2160p") would be priced at the 720p fallback but
@@ -146,7 +209,7 @@ function expandCells(spec) {
         cell.durationSec = body.duration || durationSec;
         cell.resolution = body.resolution || null;
         cell.imageUrls = imageUrls;
-        cell.seedWarnings = warnings;
+        cell.seedWarnings = [...(cell.seedWarnings || []), ...warnings];
         cell.body = body;
         cell.estUsd = estimateRenderCostUsd({
           model, durationSec: cell.durationSec, resolution: cell.resolution
@@ -215,13 +278,16 @@ async function submitCells(submittable, { runDir, manifest, submit = submitGener
     const sub0 = Date.now();
     try {
       const caps = capsFor(cell.model);
+      // videoClipUrl MUST come from the cell: hardcoding null here would send
+      // `video_clips[0].url: undefined` on a reference-to-video model and spend
+      // its flat $1.60 on a body Atlas cannot use. Pinned by verifyRpdHarness.
       predictionId = await submit({
         model: cell.model,
         prompt: cell.prompt,
         imageUrls: cell.imageUrls,
         aspectRatio: cell.aspectRatio,
         caps,
-        videoClipUrl: null,
+        videoClipUrl: cell.videoClipUrl || null,
         durationSec: cell.durationSec
       });
     } catch (err) {

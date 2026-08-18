@@ -229,6 +229,28 @@ async function submitAndPoll(model, params, meta = {}, { timeoutMs = TIMEOUT_MS 
     throw err;                       // no predictionId => wrapper may resubmit
   }
   const id = submit.data.data.id;
+  // ── CHARGE POINT, PART 0: HAND THE RECEIPT TO A NON-AD CALLER ─────────────
+  // `meta.adId` callers get their receipt persisted below. A caller with NO ad
+  // row (scripts/rpd — the experiment harness) has nowhere for that write to
+  // go, and editImage() only returns `submission.predictionId` after the poll
+  // completes, so a crash mid-poll left the harness holding a paid prediction
+  // it could not name. This optional callback closes that window at the same
+  // instant the money commits.
+  //
+  // Contract, deliberately narrow: SYNCHRONOUS, best-effort, never awaited, and
+  // wrapped — a bookkeeping callback must not be able to fail a generation that
+  // has already been paid for (identical reasoning to the receipt write below).
+  // It is passed the id only; it must not be able to influence the poll.
+  if (typeof meta.onPredictionId === 'function') {
+    try {
+      meta.onPredictionId(id);
+    } catch (err) {
+      console.warn(
+        `   ⚠️  atlasImage: onPredictionId callback threw for predictionId=${id} ` +
+        `(${err.message}) — the caller may not have recorded this billable submit`
+      );
+    }
+  }
   // ── CHARGE POINT ──────────────────────────────────────────────────────────
   // The submit returned an id, so Atlas has accepted a BILLABLE job. The money is
   // committed HERE, whatever happens to the poll, the crop, or the upload — so the
