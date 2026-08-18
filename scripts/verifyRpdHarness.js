@@ -435,6 +435,16 @@ const read = (p) => fs.readFileSync(p, 'utf8');
     assert(!/require\([^)]*\)\s*\.\s*buildPriceMap|buildPriceMap\s*[,}]/.test(staticSrc), 'must not import buildPriceMap');
     assert(!/[.[]\s*['"]?base_price/.test(staticSrc), 'must not read a base_price field');
   });
+  check('S5b offline ledger writes fail fast instead of hanging 10s per submit', () => {
+    // The image charge point writes CostLog. With no mongoose connection the
+    // default bufferCommands:true stalls that write for bufferTimeoutMS before
+    // the existing catch runs — after the money is already spent.
+    const cliSrc = read(path.join(RPD, 'rpd.js'));
+    assert(/bufferCommands'?\s*,\s*false|set\('bufferCommands', false\)/.test(cliSrc),
+      'the CLI must disable mongoose command buffering when MONGODB_URI is absent');
+    assert(/if \(!process\.env\.MONGODB_URI\)/.test(cliSrc),
+      'it must be conditional — DB seed mode still needs buffering');
+  });
   check('S6 an unpriced static model is refused live, not submitted', () => {
     const cells = expandStaticCells({
       ...staticSpec,

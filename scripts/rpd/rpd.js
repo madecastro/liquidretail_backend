@@ -19,6 +19,21 @@ require('dotenv').config({ path: require('path').join(__dirname, '..', '..', 'co
 
 const path = require('path');
 
+// OFFLINE-SAFE LEDGER WRITES. The image path (atlasImageService.submitAndPoll)
+// calls recordFlatCost → costTracker.persistCost → CostLog.create at its charge
+// point. That write is already wrapped in a try/catch, but with NO mongoose
+// connection the default `bufferCommands: true` makes it HANG for
+// bufferTimeoutMS (10s) per submit before the catch ever runs — turning a
+// 4-cell static batch into 40s of dead waiting after the money was spent.
+// Failing the write fast lets the existing catch log it and move on, which is
+// the intended behaviour for a harness that keeps its own ledger in
+// manifest.json. Only when we are NOT connecting at all (no DB seed mode).
+if (!process.env.MONGODB_URI) {
+  try {
+    require('mongoose').set('bufferCommands', false);
+  } catch { /* mongoose absent is fine — nothing to disable */ }
+}
+
 function flag(args, name) {
   return args.some((a) => a === name || a.startsWith(`${name}=`));
 }
@@ -148,10 +163,32 @@ async function main() {
 
   if (cmd === 'publish') {
     const runDir = args[0];
-    if (!runDir) throw new Error('usage: rpd publish <runDir> [--project rs-rpd]');
+    if (!runDir) throw new Error('usage: rpd publish <runDir> [--project rs-rpd] [--no-slack]');
     const { publishRun } = require('./lib/publish');
     const project = flagValue(args, '--project') || 'rs-rpd';
-    publishRun(runDir, { project });
+    const { url } = publishRun(runDir, { project });
+
+    // Announce it. Opt-in by env (RPD_SLACK_CHANNEL + SLACK_BOT_TOKEN): a
+    // published gallery nobody hears about is a learning nobody shares. Never
+    // fatal — the deploy already succeeded by this point.
+    if (url && !flag(args, '--no-slack')) {
+      const { readManifest } = require('./lib/manifest');
+      const { postExperiment } = require('./lib/slack');
+      try {
+        const manifest = readManifest(runDir);
+        const runNote = (manifest.observations || []).find((o) => !o.scope || o.scope === 'run');
+        const res = await postExperiment({
+          runName: manifest.name,
+          galleryUrl: url,
+          cells: manifest.cells || [],
+          takeaway: runNote ? runNote.text : null
+        });
+        if (res.ok) console.log('Posted to Slack.');
+        else if (!/not configured/.test(res.error || '')) console.warn(`Slack: ${res.error}`);
+      } catch (err) {
+        console.warn(`Slack: ${err.message}`);
+      }
+    }
     return;
   }
 

@@ -1,0 +1,29 @@
+{
+  "name": "nightly-candidates",
+  "notes": "Tonight's queued prompt candidates. THIS FILE IS HOW YOU QUEUE AN EXPERIMENT: add a variant by PR and the next nightly run tests it against the baseline. Keep it small — the loop runs under a $2 cap. Remove variants once their learning is recorded in LEARNINGS.md.",
+  "seed": {
+    "url": "https://res.cloudinary.com/reach-social-prod/image/upload/v1781209009/liquidretail/ai_image_reference_seeds/product-1781209009516-101-uy7t9esk.png",
+    "productTitle": "RestoMods Classic Logo Tee",
+    "refs": [],
+    "brandHex": "#111111"
+  },
+  "aspectRatio": "9:16",
+  "durationSec": 4,
+  "resolution": "1080p",
+  "seedHasText": true,
+  "models": ["google/gemini-omni-flash/image-to-video-developer"],
+  "variants": [
+    { "id": "baseline" }
+  ],
+  "static": {
+    "surface": "meta_feed_1_1",
+    "intent": "brand_led",
+    "productDesc": "a black cotton crew-neck tee with a circular grey chest logo reading RestoMods",
+    "copy": { "headline": "Better than new.", "cta": "SHOP NOW" },
+    "models": ["openai/gpt-image-2/edit"],
+    "variants": [
+      { "id": "baseline" }
+    ]
+  },
+  "titling": { "enabled": false }
+}
