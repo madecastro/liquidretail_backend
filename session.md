@@ -7,7 +7,7 @@ was judged superseded and dropped **deliberately**, not lost.
 
 ## 2026-08-18 — RPD harness: model × prompt A/B outside the Ad pipeline (`scripts/rpd/`)
 
-Branch `claude/rpd-harness`, PR #__. Owner asked for a "rapid product development harness": build
+Branch `claude/rpd-harness`, PR #210. Owner asked for a "rapid product development harness": build
 test ads on the real pipeline primitives, race video models against each other, iterate prompt
 changes (system values / intent prompts) **without a redeploy**, optionally title with the
 production defaults, and publish a gallery with notes to Cloudflare Pages. Agents should be able
