@@ -205,10 +205,14 @@ function renderCell(cell, ctx) {
   const pred = str(cell.predictionId);
   const latency = formatLatency(cell.latencyMs);
 
+  const isStatic = cell.kind === 'static';
   const chips = [
     chip(shortModel(cell.model || ctx.model), 'chip-model', cell.model || ctx.model),
-    chip(duration, 'chip-dur'),
-    chip(resolution, 'chip-res'),
+    isStatic ? chip(str(cell.size), 'chip-res') : chip(duration, 'chip-dur'),
+    isStatic ? chip(str(cell.intent), 'chip-intent') : chip(resolution, 'chip-res'),
+    cell.intentDowngraded
+      ? `<span class="chip chip-warn" title="${escAttr(`requested ${cell.intentDowngraded.requested}`)}">intent downgraded from ${esc(cell.intentDowngraded.requested)}</span>`
+      : '',
     costChip(cell),
     latency ? chip(latency, 'chip-lat') : '',
     pred ? `<span class="chip chip-pred" title="${escAttr(pred)}">${esc(pred)}</span>` : '',
@@ -220,6 +224,10 @@ function renderCell(cell, ctx) {
   let body;
   if (failed) {
     body = `<div class="cell-error" role="alert">${esc(str(cell.error) || status)}</div>`;
+  } else if (cell.kind === 'static' && videoSrc) {
+    // Static cells are plates, not clips — an <img> (click to open full size).
+    body = `<a href="${escAttr(videoSrc)}" target="_blank" rel="noopener noreferrer">` +
+           `<img class="cell-plate" src="${escAttr(videoSrc)}" alt="${escAttr(str(cell.id))}" loading="lazy"></a>`;
   } else if (videoSrc) {
     body = `<video class="cell-video" controls loop muted playsinline preload="metadata" src="${escAttr(videoSrc)}"></video>`;
   } else if (status === 'submitted' || status === 'processing' || status === 'submitting') {
@@ -426,6 +434,8 @@ h2 { font-size: 0.85rem; text-transform: uppercase; letter-spacing: 0.06em; colo
 .lever-directives { color: #c4b5fd; }
 .lever-patch { color: var(--warn); }
 .lever-baseline { color: var(--muted); }
+.chip-intent { color: #c4b5fd; }
+.chip-warn { border-color: #92400e; color: var(--warn); }
 .chip-charged { color: var(--fail); }
 .chip-uncharged { color: var(--muted); }
 .obs-run { margin: 16px 0 8px; }
@@ -459,6 +469,8 @@ table.matrix td.cell-td { vertical-align: top; min-width: 280px; max-width: 420p
 .cell { padding: 10px; }
 .chips { display: flex; flex-wrap: wrap; gap: 4px; margin-bottom: 8px; }
 .cell-video { display: block; width: 100%; max-height: 520px; background: #000; }
+.cell-plate { display: block; width: 100%; height: auto; max-height: 520px; object-fit: contain;
+  background: #000; border: 1px solid var(--line); cursor: zoom-in; }
 .cell-error { background: #3f1212; color: #fecaca; border: 1px solid #7f1d1d; padding: 12px;
   border-radius: 6px; white-space: pre-wrap; word-break: break-word; font-size: 13px; }
 .cell-pending, .cell-empty { color: var(--muted); padding: 24px 8px; text-align: center; }
@@ -556,10 +568,15 @@ function tally(cells) {
   };
 }
 
+// Prefer the titled render, then the local file. An uploaded (Cloudinary) URL
+// is the fallback when the local file is gone — a mirrored run stays viewable
+// after the run directory is deleted.
 function pickVideoSrc(cell, runDir) {
   const raw = firstStr(cell.titledPath, cell.localPath);
-  if (!raw) return '';
-  return toRelative(raw, runDir);
+  const rel = raw ? toRelative(raw, runDir) : '';
+  if (rel) return rel;
+  const uploaded = firstStr(cell.titledUploadedUrl, cell.uploadedUrl);
+  return /^https?:\/\//i.test(uploaded) ? uploaded : '';
 }
 
 function toRelative(p, runDir) {

@@ -57,23 +57,39 @@ function loadSpec(specPath) {
   if (!spec.name || !/^[a-z0-9][a-z0-9-_]*$/i.test(spec.name)) {
     throw new Error('rpd: spec.name is required (letters/digits/dashes only — it becomes the run directory)');
   }
-  if (!spec.seed || !spec.seed.url) {
+  if (!spec.seed || (!spec.seed.url && !spec.seed.productId)) {
     throw new Error(
-      'rpd: spec.seed.url is required (the still; it is images[0] and the gallery thumb). ' +
+      'rpd: spec.seed needs either `url` (the still — images[0] and the gallery thumb) or ' +
+      '`productId` (DB seed mode: resolves the merchant-feed primary + refs). ' +
       'Reference-to-video models additionally need spec.seed.videoUrl.'
     );
   }
-  if (!Array.isArray(spec.models) || spec.models.length === 0) throw new Error('rpd: spec.models must be a non-empty array');
-  if (!Array.isArray(spec.variants) || spec.variants.length === 0) throw new Error('rpd: spec.variants must be a non-empty array');
-  const ids = new Set();
-  for (const v of spec.variants) {
-    if (!v.id || !/^[a-z0-9][a-z0-9-_]*$/i.test(v.id)) throw new Error('rpd: every variant needs an id (letters/digits/dashes)');
-    if (ids.has(v.id)) throw new Error(`rpd: duplicate variant id "${v.id}"`);
-    ids.add(v.id);
+  // A spec may carry a video section, a static section, or both.
+  const hasVideo = Array.isArray(spec.models) && spec.models.length > 0;
+  const hasStatic = !!(spec.static && Array.isArray(spec.static.variants) && spec.static.variants.length);
+  if (!hasVideo && !hasStatic) {
+    throw new Error('rpd: nothing to run — provide spec.models + spec.variants (video) and/or spec.static.variants');
   }
-  for (const m of spec.models) {
-    if (!MODEL_CAPS[m]) {
-      throw new Error(`rpd: unknown model "${m}". Registered:\n  ${Object.keys(MODEL_CAPS).join('\n  ')}`);
+  if (hasVideo) {
+    if (!Array.isArray(spec.variants) || spec.variants.length === 0) throw new Error('rpd: spec.variants must be a non-empty array');
+    const ids = new Set();
+    for (const v of spec.variants) {
+      if (!v.id || !/^[a-z0-9][a-z0-9-_]*$/i.test(v.id)) throw new Error('rpd: every variant needs an id (letters/digits/dashes)');
+      if (ids.has(v.id)) throw new Error(`rpd: duplicate variant id "${v.id}"`);
+      ids.add(v.id);
+    }
+    for (const m of spec.models) {
+      if (!MODEL_CAPS[m]) {
+        throw new Error(`rpd: unknown video model "${m}". Registered:\n  ${Object.keys(MODEL_CAPS).join('\n  ')}`);
+      }
+    }
+  }
+  if (hasStatic) {
+    const sids = new Set();
+    for (const v of spec.static.variants) {
+      if (!v.id || !/^[a-z0-9][a-z0-9-_]*$/i.test(v.id)) throw new Error('rpd: every static variant needs an id');
+      if (sids.has(v.id)) throw new Error(`rpd: duplicate static variant id "${v.id}"`);
+      sids.add(v.id);
     }
   }
   return spec;
@@ -130,6 +146,7 @@ const R2V_MAX_SOURCE_SEC = 30;
 // IS the dry run; live mode just carries on to submit the same cells.
 function expandCells(spec) {
   const cells = [];
+  if (!Array.isArray(spec.models) || !Array.isArray(spec.variants)) return cells;
   for (const model of spec.models) {
     const caps = capsFor(model);
     for (const variant of spec.variants) {
@@ -322,14 +339,41 @@ async function submitCells(submittable, { runDir, manifest, submit = submitGener
   }
 }
 
-async function runSpec(specPath, { live = false, maxUsd = null, outRoot = 'rpd-runs' } = {}) {
+async function runSpec(specPath, { live = false, maxUsd = null, outRoot = 'rpd-runs', upload = false } = {}) {
   const spec = loadSpec(specPath);
+
+  // DB seed mode: resolve the merchant-feed primary + refs from a productId and
+  // STAMP them onto the spec, so the manifest is self-describing and every later
+  // command (resume/gallery/publish) works with no database.
+  if (spec.seed.productId) {
+    const { resolveSeedFromDb } = require('./dbSeed');
+    const resolved = await resolveSeedFromDb(spec.seed.productId);
+    spec.seed.url = resolved.url;
+    if (!spec.seed.refs || !spec.seed.refs.length) spec.seed.refs = resolved.refs;
+    spec.seed.productTitle = spec.seed.productTitle || resolved.productTitle;
+    spec.seed.brandHex = spec.seed.brandHex || resolved.brandHex;
+    if (spec.titling && !spec.titling.brandName) spec.titling.brandName = resolved.brandName;
+    spec.seed.resolvedFromDb = {
+      productId: String(spec.seed.productId),
+      at: new Date().toISOString(),
+      refCount: resolved.refs.length
+    };
+    console.log(
+      `📦 DB seed: ${resolved.productTitle || '(untitled)'} — seed + ${resolved.refs.length} ref(s), ` +
+      `brandHex ${resolved.brandHex}`
+    );
+  }
 
   // Spec resolution override must be in env BEFORE bodies are built —
   // buildSubmissionBody reads ATLAS_VIDEO_RESOLUTION for omni shapes.
   if (spec.resolution) process.env.ATLAS_VIDEO_RESOLUTION = spec.resolution;
 
   const cells = expandCells(spec);
+  // Static (image) cells live in the same manifest and share the budget gate.
+  if (spec.static) {
+    const { expandStaticCells } = require('./staticRunner');
+    cells.push(...expandStaticCells(spec));
+  }
   const manifest = {
     name: spec.name,
     notes: spec.notes || null,
@@ -349,7 +393,13 @@ async function runSpec(specPath, { live = false, maxUsd = null, outRoot = 'rpd-r
   for (const c of cells) {
     const est = Number.isFinite(c.estUsd) ? `~${fmtUsd(c.estUsd)}` : 'no estimate';
     const unverified = c.pricingUnverified ? '  ⚠️ UNVERIFIED RATE — settled price may differ in either direction' : '';
-    console.log(`  [${c.status}] ${c.id}  ${c.durationSec || '-'}s ${c.resolution || ''} ${est}${unverified}${c.error ? `  (${c.error})` : ''}`);
+    const shape = c.kind === 'static'
+      ? `${c.size || '-'} ${c.intent || ''}`
+      : `${c.durationSec || '-'}s ${c.resolution || ''}`;
+    console.log(`  [${c.status}] ${c.id}  ${shape} ${est}${unverified}${c.error ? `  (${c.error})` : ''}`);
+    if (c.intentDowngraded) {
+      console.log(`      ⚠️  intent downgraded ${c.intentDowngraded.requested} → ${c.intentDowngraded.resolved} (its data is absent)`);
+    }
     for (const w of c.seedWarnings || []) console.log(`      ⚠️  ${w}`);
   }
 
@@ -384,7 +434,17 @@ async function runSpec(specPath, { live = false, maxUsd = null, outRoot = 'rpd-r
   }
   writeManifest(runDir, manifest);
 
-  await submitCells(submittable, { runDir, manifest });
+  // Video cells: submit (receipt) then poll separately. Static cells: the image
+  // service bundles submit+poll, so they run through their own runner and are
+  // already settled when it returns.
+  await submitCells(submittable.filter((c) => c.kind !== 'static'), { runDir, manifest });
+
+  const staticSubmittable = submittable.filter((c) => c.kind === 'static');
+  if (staticSubmittable.length) {
+    const { runStaticCells } = require('./staticRunner');
+    console.log(`\nGenerating ${staticSubmittable.length} static plate(s)…`);
+    await runStaticCells(staticSubmittable, { runDir, manifest });
+  }
 
   // Poll everything concurrently — polls are free.
   const pending = cells.filter((c) => c.status === 'submitted');
@@ -400,6 +460,17 @@ async function runSpec(specPath, { live = false, maxUsd = null, outRoot = 'rpd-r
     const cost = cell.costSource === 'actual' ? fmtUsd(cell.costUsd) : `~${fmtUsd(cell.costUsd)} est`;
     console.log(`  ${cell.status === 'done' ? '✅' : '❌'} ${cell.id}: ${cell.status} ${cost}${cell.error ? ` (${cell.error})` : ''}`);
   }));
+
+  // Optional Cloudinary mirror. Runs AFTER settle and can never un-settle a
+  // paid cell (uploadCellOutputs never throws).
+  if (upload) {
+    const { uploadCellOutputs } = require('./upload');
+    for (const cell of cells.filter((c) => c.status === 'done' && c.localPath)) {
+      const res = await uploadCellOutputs(runDir, cell, spec.name);
+      if (!res.ok) console.warn(`  ⚠️  ${cell.id}: upload — ${res.errors.join('; ')}`);
+      writeManifest(runDir, manifest);
+    }
+  }
 
   // Spend line: settled truth + every receipt still carrying an estimate.
   // A cell with a predictionId has been billed (or is being billed) whatever

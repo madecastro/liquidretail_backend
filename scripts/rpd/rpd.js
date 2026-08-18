@@ -77,7 +77,8 @@ async function main() {
     const live = flag(args, '--live');
     const maxUsd = flagValue(args, '--max-usd') != null ? Number(flagValue(args, '--max-usd')) : null;
     const outRoot = flagValue(args, '--out') || 'rpd-runs';
-    const { runDir, manifest } = await runSpec(specPath, { live, maxUsd, outRoot });
+    const upload = flag(args, '--upload');
+    const { runDir, manifest } = await runSpec(specPath, { live, maxUsd, outRoot, upload });
 
     // Optional titling pass over settled masters (spec.titling.enabled).
     if (live) await titlePass(runDir, manifest);
