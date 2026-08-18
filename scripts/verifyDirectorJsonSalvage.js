@@ -201,8 +201,42 @@ checkTrue('R5 truncation stays a DISTINCT hard failure (a re-ask cannot fix it)'
 
 // The parse-failure branch must be gated on the SAME `attempt >= 1` budget as
 // the validation re-ask. Two independent budgets would allow 4 paid calls.
-const parseGate = /if \(attempt >= 1\) \{\s*throw new Error\(`Director \(round\) response not JSON/;
-checkTrue('M1 parse retry is gated on the shared attempt budget', parseGate.test(SRC));
+//
+// REWRITTEN 2026-08-18 — and the first rewrite was WRONG, which is worth
+// recording. The original pattern required byte-adjacency:
+//     /if \(attempt >= 1\) \{\s*throw new Error\(`Director \(round\) response not JSON/
+// That blocked giving this failure an LLM error code (`adoptLlmFailure(...)`),
+// which is what makes a zero-ads content failure page instead of vanishing.
+// The obvious loosening — allow up to 200 chars between the gate and the throw
+// — was caught by its own revert-proof: a mutation that CLOSED the gate and
+// moved the throw immediately after it still matched, so the pin no longer
+// pinned anything. Proximity is not containment.
+//
+// So: find the gate, walk its braces, and require the throw to be INSIDE the
+// block. Immune to a wrapper call, and fails the moment the throw escapes.
+function gateBodyFor(src, gate) {
+  const at = src.indexOf(gate);
+  if (at < 0) return null;
+  let depth = 0;
+  for (let i = at + gate.length - 1; i < src.length; i++) {
+    if (src[i] === '{') depth++;
+    else if (src[i] === '}') { depth--; if (depth === 0) return src.slice(at, i + 1); }
+  }
+  return null;
+}
+const parseGateBody = gateBodyFor(SRC, 'if (attempt >= 1) {');
+checkTrue('M1 parse retry is gated on the shared attempt budget',
+  !!parseGateBody && /`Director \(round\) response not JSON/.test(parseGateBody),
+  parseGateBody ? 'gate found but the throw is not inside it' : 'no `if (attempt >= 1) {` gate at all');
+
+// And the throw must exist exactly once overall — a second site outside the
+// gate would double the ceiling while the check above still passed.
+// Count THROW SITES, not mentions: the string also appears in the comment that
+// explains this pin, and a naive count reads that as a second throw.
+const parseThrows = (SRC.match(/throw [\s\S]{0,160}?`Director \(round\) response not JSON/g) || []).length;
+checkTrue('M1b exactly one parse-failure throw site (a second would double the ceiling)',
+  parseThrows === 1, `found ${parseThrows}`);
+
 checkTrue('M2 validation retry still breaks at the same budget',
   /if \(!reasons\.length \|\| attempt >= 1\) break;/.test(SRC));
 

@@ -63,13 +63,19 @@ const alertService = require('./alertService');
 // re-implemented (CLAUDE.md §4: a harness proving a call is WRITTEN does not
 // prove it RESOLVES; `npm run lint`'s no-undef is the net).
 const {
-  LLM_ACTIONS, CODE_META: LLM_CODE_META, isLlmError, stampLlmAction, formatLlmLogLine,
+  LLM_ACTIONS, CODE_META: LLM_CODE_META, CONTENT_CODES,
+  isLlmError, stampLlmAction, formatLlmLogLine,
 } = require('./llmError');
 
 // Stable, GLOBAL dedupe/threshold key for the Director transport page.
 // Global on purpose: a gateway outage hits every product, and 50 pages for
 // one fault is how a channel gets muted. See the alert site for the trade.
 const DIRECTOR_TRANSPORT_ALERT_KEY = 'director:transport-failure';
+// The other half of the same outage: the LLM answers, and its output is
+// unusable (prose instead of JSON, truncated, or zero usable concepts). Same
+// zero-ads consequence, completely different remedy — so it pages under its
+// own key rather than being deduped away behind a transport page.
+const DIRECTOR_CONTENT_ALERT_KEY = 'director:content-failure';
 
 // Cast a string/ObjectId to ObjectId. Required when querying
 // metadata.catalogProductId (Mixed type) — Mongoose doesn't auto-cast
@@ -3830,17 +3836,34 @@ async function runConceptDrivenExpansion({
         // TRUTHFUL ACTION, stamped at the layer that knows the consequence.
         // The transport said EXHAUSTED_CHAIN — true, but it cannot see
         // products. THIS layer can: the product is done, it mints no ads.
-        stampLlmAction(llmFail, LLM_ACTIONS.GAVE_UP_PRODUCT,
-          'gave up this product — no ads were minted for it (video is unaffected)');
+        // Only stamp if the detecting layer has not already said something more
+        // specific. The Director's content sites name the actual lever ("raise
+        // DIRECTOR_ROUND_TOKENS", "the payload parsed but held no usable
+        // concept"); flattening those to a generic give-up here would throw
+        // away the most useful sentence in the alert.
+        if (llmFail.action !== LLM_ACTIONS.GAVE_UP_PRODUCT) {
+          stampLlmAction(llmFail, LLM_ACTIONS.GAVE_UP_PRODUCT,
+            'gave up this product — no ads were minted for it (video is unaffected)');
+        }
         console.error(formatLlmLogLine(llmFail));
         if (llmFail.chainSummary) {
           console.error(`📦 conceptDriven[${productTag}]: ${llmFail.chainSummary}`);
         }
 
         // ── the page ──
-        // FATAL: a Director transport outage is a TOTAL static outage, not a
-        // degraded one — every product in every run produces zero ads. That
-        // is fatal-channel material per docs/ALERTING.md's severity table.
+        // TWO fatal classes, one severity, DIFFERENT keys and titles.
+        //
+        // FATAL for both: operator impact is identical — every product in
+        // every run produces zero static ads. A Director that answers but
+        // will not follow the contract is not "degraded", it is the same
+        // outage wearing a 200. Fatal-channel material per docs/ALERTING.md.
+        //
+        // SEPARATE KEYS because the REMEDIES have nothing in common:
+        //   transport → Atlas capacity / keys / the ATLAS_MODEL_DIRECTOR lever
+        //   content   → the prompt, the token budget, or the serving model
+        // Folding them under one key would dedupe a content failure away
+        // behind an unrelated transport page for the whole window, and hand
+        // the operator the wrong remedy for the one that got through.
         //
         // minCount 2 is the owner's "if it happens more than once" threshold,
         // implemented with alertService's own occurrence gate (not a second
@@ -3854,11 +3877,16 @@ async function runConceptDrivenExpansion({
         // `detail` carries the chain, which is the part that identifies the
         // fault. Fire-and-forget: notifyAsync returns nothing to await, so an
         // alert can never block or throw into a billable expansion.
+        const isContentFailure = CONTENT_CODES.has(llmFail.code);
         alertService.notifyAsync({
           level: 'fatal',
-          title: 'Director LLM unreachable — static ad generation is producing ZERO ads',
+          title: isContentFailure
+            ? 'Director LLM output is UNUSABLE — static ad generation is producing ZERO ads'
+            : 'Director LLM unreachable — static ad generation is producing ZERO ads',
           detail:
-            `${llmFail.chainSummary || '(no chain recorded)'}\n\n` +
+            (isContentFailure
+              ? `The model ANSWERED (HTTP 200, tokens billed) and the response could not be used.\n`
+              : `${llmFail.chainSummary || '(no chain recorded)'}\n`) + '\n' +
             `CONSEQUENCE: static ad generation is producing ZERO ads for these products. ` +
             `Video is unaffected — it does not use the Director.\n` +
             `WHAT THE SYSTEM DID: ${llmFail.actionDetail || 'gave up'}.\n` +
@@ -3877,7 +3905,7 @@ async function runConceptDrivenExpansion({
             productId:  String(productId || '-'),
             campaignId: String(campaignId || '-'),
           },
-          key: DIRECTOR_TRANSPORT_ALERT_KEY,
+          key: isContentFailure ? DIRECTOR_CONTENT_ALERT_KEY : DIRECTOR_TRANSPORT_ALERT_KEY,
           minCount: 2,
         });
       } else {

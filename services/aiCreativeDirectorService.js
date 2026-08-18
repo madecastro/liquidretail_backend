@@ -37,6 +37,7 @@ const { chatCompletion, chainOutcome } = require('./atlasLlmService');
 // no-undef is the net that catches the next one).
 const {
   LLM_ERROR_CODES, LLM_ACTIONS, makeLlmError, stampLlmAction, formatLlmLogLine,
+  adoptLlmFailure,
 } = require('./llmError');
 const { usableProofCommentsOrNone } = require('./quoteSnippetService');
 const {
@@ -534,11 +535,30 @@ async function directConcepts({
   const elapsedMs = Date.now() - t0;
 
   const raw = completion.choices?.[0]?.message?.content;
-  if (!raw) throw new Error('Director returned no content');
+  if (!raw) {
+    throw adoptLlmFailure(new Error('Director returned no content'), makeLlmError({
+      code: LLM_ERROR_CODES.LLM_CONTENT_EMPTY,
+      role: MODEL_ID, provider: 'atlas', httpStatus: 200, elapsedMs: Date.now() - t0,
+      action: LLM_ACTIONS.GAVE_UP_PRODUCT,
+      actionDetail: 'gave up this product — no ads are minted for it (video is unaffected)',
+    }));
+  }
 
   let parsed;
   try { parsed = JSON.parse(raw); }
-  catch (err) { throw new Error(`Director response not JSON: ${err.message}`); }
+  catch (err) {
+    // Same content class as the round path. This V2 route has NO salvage and
+    // NO corrective re-ask (that is the round path's OUTPUT CONTRACT work), so
+    // one bad body is terminal here — say so in the action rather than letting
+    // it read like the round path's recoverable case.
+    throw adoptLlmFailure(new Error(`Director response not JSON: ${err.message}`), makeLlmError({
+      code: LLM_ERROR_CODES.LLM_CONTENT_UNPARSEABLE,
+      role: MODEL_ID, provider: 'atlas', httpStatus: 200, elapsedMs: Date.now() - t0,
+      providerMessage: err.message,
+      action: LLM_ACTIONS.GAVE_UP_PRODUCT,
+      actionDetail: 'gave up this product — the V2 path has no salvage or corrective re-ask',
+    }));
+  }
 
   const warnings = validateConcepts(parsed.concepts || []);
 
@@ -2326,6 +2346,43 @@ async function directConceptsRound({
   // Path matches the one renderCampaignBriefBlock already reads, and optional
   // chaining keeps a missing signal from throwing.
   const forbiddenStrings = [inputSummary?.product_signal?.name].filter(Boolean);
+
+  // ── CONTENT-FAILURE CLASSIFICATION SLOT ───────────────────────────────
+  //
+  // WHY A SLOT AND NOT `throw makeLlmError(...)` AT EACH SITE. Five failures
+  // below end in ZERO STATIC ADS for the product, and every one threw a PLAIN
+  // Error — so `isLlmError` was false in the per-product dispatcher, none
+  // paged, and every one recorded `errorCode: null` on CampaignRun.errors[].
+  // That is the COMMON case, not an edge: CLAUDE.md records 10 Director round
+  // failures to 1 success in 24h from prose responses.
+  //
+  // The obvious fix — replacing each `new Error(...)` with a coded error —
+  // breaks two things worth keeping. `verifyDirectorJsonSalvage` M1/M1b/R1 pin
+  // the parse-failure throw site (they are the money pins that keep the
+  // corrective re-ask on ONE shared budget, worst case two paid calls), and
+  // each message reaches the operator verbatim through
+  // CampaignRun.errors[].message. So the failure is CLASSIFIED here, where the
+  // detecting branch knows whether the body was empty, truncated, unparseable
+  // or merely unusable, and the classification is ADOPTED onto the thrown
+  // error on the way out (see the catch at the end of this function).
+  // Message unchanged; code, action and billable gained.
+  let contentFailure = null;
+  // Set on every loop iteration; read after the loop too (the contract-unmet
+  // site is post-loop), so it must outlive the iteration that set it.
+  let servedByModel = null;
+  const classifyContent = (code, actionDetail, extra = {}) => {
+    contentFailure = makeLlmError({
+      code,
+      role: DIRECTOR_ROUND_MODEL,
+      provider: 'atlas',
+      httpStatus: 200,                 // every one of these IS a 200 — billed
+      action: LLM_ACTIONS.GAVE_UP_PRODUCT,
+      actionDetail,
+      ...extra,
+    });
+    return contentFailure;
+  };
+
   let completion, raw, parsed, reasons = [];
   let attempt = 0;
   const messages = [
@@ -2370,6 +2427,7 @@ async function directConceptsRound({
     // itself, and deduped by the standard 15-minute window so a 50-product
     // run pages once with "+N more" rather than fifty times.
     const chainInfo = chainOutcome(completion);
+    servedByModel = chainInfo ? chainInfo.servedBy.model : null;
     if (chainInfo && chainInfo.degraded) {
       alerts.notifyAsync({
         level: 'warn',
@@ -2402,7 +2460,14 @@ async function directConceptsRound({
     }
 
     raw = completion.choices?.[0]?.message?.content;
-    if (!raw) throw new Error('Director (round) returned no content');
+    if (!raw) {
+      classifyContent(
+        LLM_ERROR_CODES.LLM_CONTENT_EMPTY,
+        'gave up this product — no ads are minted for it (video is unaffected)',
+        { model: servedByModel, elapsedMs: Date.now() - t0 }
+      );
+      throw adoptLlmFailure(new Error('Director (round) returned no content'), contentFailure);
+    }
     // Atlas SILENTLY IGNORES response_format:{type:'json_object'} on the
     // Anthropic director model — probed live 2026-08-04, both with and without
     // the flag, and both returned conversational prose. So the JSON contract is
@@ -2416,7 +2481,17 @@ async function directConceptsRound({
       // cannot fix a response that ran out of tokens, and the message names
       // the actual lever.
       if (completion.choices?.[0]?.finish_reason === 'length') {
-        throw new Error(`Director (round) response truncated at ${DIRECTOR_ROUND_TOKENS} tokens — raise DIRECTOR_ROUND_TOKENS`);
+        // Its OWN code, not CONTENT_EMPTY: content arrived and was cut off, the
+        // tokens were billed in full, and the lever is DIRECTOR_ROUND_TOKENS —
+        // a "return JSON only" re-ask cannot buy back an exhausted budget.
+        classifyContent(
+          LLM_ERROR_CODES.LLM_CONTENT_TRUNCATED,
+          `gave up this product — a re-ask cannot fix an exhausted token budget; raise DIRECTOR_ROUND_TOKENS (currently ${DIRECTOR_ROUND_TOKENS})`,
+          { model: servedByModel, elapsedMs: Date.now() - t0 }
+        );
+        throw adoptLlmFailure(
+          new Error(`Director (round) response truncated at ${DIRECTOR_ROUND_TOKENS} tokens — raise DIRECTOR_ROUND_TOKENS`),
+          contentFailure);
       }
       // ONE corrective budget shared with the schema-validation re-ask below
       // (`attempt >= 1`). Parse-retry and validation-retry must not stack into
@@ -2451,8 +2526,14 @@ async function directConceptsRound({
       );
       if (giveUp) console.error(formatLlmLogLine(contentErr));
       else console.warn(formatLlmLogLine(contentErr));
+      // Hand the already-built classification to the adopt-on-exit slot, so
+      // the plain Error below (whose exact text is pinned) still reaches the
+      // dispatcher coded. `contentErr` already carries the right code and the
+      // GAVE_UP_PRODUCT stamp for this branch.
+      if (giveUp) contentFailure = contentErr;
       if (attempt >= 1) {
-        throw new Error(`Director (round) response not JSON: ${err.message}`);
+        throw adoptLlmFailure(
+          new Error(`Director (round) response not JSON: ${err.message}`), contentFailure);
       }
       messages.push({ role: 'assistant', content: raw });
       messages.push({
@@ -2498,7 +2579,20 @@ async function directConceptsRound({
   const usable = Array.isArray(parsed?.concepts) && parsed.concepts.length > 0;
   if (reasons.length) {
     if (!usable) {
-      throw new Error(`Director (round) returned no usable concepts: ${reasons.join('; ')}`);
+      // Parsed fine, tokens billed, payload discarded — LLM_CONTRACT_UNMET,
+      // deliberately NOT an UNPARSEABLE (the JSON was valid; the CONTRACT was
+      // not met, and the lever is the prompt, not the parser).
+      classifyContent(
+        LLM_ERROR_CODES.LLM_CONTRACT_UNMET,
+        'gave up this product — the payload parsed but held no usable concept, so no ads are minted for it (video is unaffected)',
+        {
+          model: servedByModel,
+          providerMessage: reasons.slice(0, 4).join('; '),
+        }
+      );
+      throw adoptLlmFailure(
+        new Error(`Director (round) returned no usable concepts: ${reasons.join('; ')}`),
+        contentFailure);
     }
     console.warn(
       `🎭 directorRound[r${roundIndex}]: proceeding with ${parsed.concepts.length} concept(s) ` +

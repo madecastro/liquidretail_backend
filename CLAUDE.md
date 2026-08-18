@@ -1281,7 +1281,7 @@ Full detail in `docs/ATLAS.md` §7 and `docs/CLOUDINARY-VIDEO.md`. Headlines:
   error code"* + *"and what steps were taken next"*. Before this, `Atlas 400:
   {"code":400,"msg":"bad request"}` was all an operator got — it cannot
   distinguish a param bug from a capacity outage from a missing key, and the
-  real fault was a fourth thing again (429 after ~51s). Thirteen
+  real fault was a fourth thing again (429 after ~51s). **Fifteen**
   `LLM_*` codes, each with `retryable`, a **derived** `billable`
   (`false` / `true` / `'unknown'` — a 429 bills nothing, a timeout is
   genuinely unknown, an HTTP-200 content failure DID bill), and an
@@ -1309,6 +1309,59 @@ Full detail in `docs/ATLAS.md` §7 and `docs/CLOUDINARY-VIDEO.md`. Headlines:
   for TEXT/chat/embedding endpoints ONLY. `atlasErrorPolicy.js` still owns
   image/video, where "advancing is free" is FALSE and a replay needs structured
   proof of pre-work rejection. Do not import one into the other.
+  **`err.code` IS THE TAXONOMY CODE AND IT OVERWRITES THE AXIOS ONE.** The
+  original survives as **`err.transportCode`** — load-bearing, not a courtesy:
+  `shouldRetrySameLink` needs `ECONNRESET` (transient → retry) apart from
+  `ECONNREFUSED` (host wrong/down → do not) to reproduce the pre-chain retry
+  set. `err.llmCode` is the unambiguous alias when you must be sure which you
+  are reading.
+- **RETRY-THIS-LINK AND ADVANCE-TO-NEXT-LINK ARE TWO PREDICATES. Do not collapse
+  them (2026-08-18, second pass — this was a shipped regression).** The first
+  chain implementation used `ADVANCES_CHAIN` for both, which changed behaviour
+  for the ELEVEN single-link roles (layoutInput, judge, enrichment, vision, …):
+  a listed-but-unrouted 400 went from **one** Atlas POST (pre-chain broke on
+  `err.routerMissing`) to **three plus two backoffs**, and `ECONNREFUSED` /
+  `ENOTFOUND` / `EPIPE` — absent from the old four-code `retryableError` set —
+  started burning `MAX_ATTEMPTS` on failures that do not fix themselves in 3s.
+  Neither is a money bug (LLM failures are unbilled) but both are latency on
+  every mis-pointed `ATLAS_MODEL_*` and every dead slug, and this repo HAS a
+  dead slug (`openai/gpt-5-nano`, listed, "router not found").
+  `shouldRetrySameLink(err)` in `services/llmError.js` now reproduces the
+  pre-chain predicate **term for term** — including the no-`err.code` case,
+  which is why it consults `transportCode` rather than being a pure code set.
+  `ADVANCES_CHAIN` keeps its own, wider job: a different candidate may route or
+  may live on a different host. Pinned BEHAVIOURALLY, per failure class, with
+  exact pre-change attempt counts, by `verifyDirectorFallbackChain.js` C5/C6/C7
+  — the original C5 scripted 429 only, which is precisely why both deltas were
+  invisible to a green suite.
+- **THE ZERO-ADS DIRECTOR FAILURES ARE CODED — do not let a new one throw a bare
+  `Error` (2026-08-18, second pass).** Five failures end in zero static ads for
+  a product: empty content, truncated response (`finish_reason === 'length'`),
+  still-not-JSON after the corrective re-ask, zero usable concepts, and the V2
+  path's parse failure. All five threw plain `Error`s, so `isLlmError` was false
+  in the per-product dispatcher — **none paged and every one recorded
+  `errorCode: null`** on `CampaignRun.errors[]`. That is the COMMON case, not an
+  edge: this file records 10 Director round failures to 1 success in 24h from
+  prose responses. They now classify as `LLM_CONTENT_EMPTY` /
+  `LLM_CONTENT_TRUNCATED` / `LLM_CONTENT_UNPARSEABLE` / `LLM_CONTRACT_UNMET` and
+  page on the 2nd occurrence under their own key `director:content-failure`.
+  **Fatal, same as the transport half** — the operator impact is identical
+  (zero ads); a Director that answers and will not follow the contract is the
+  same outage wearing an HTTP 200. **Separate key** because the remedies share
+  nothing (Atlas capacity / keys / the model lever vs the prompt, the token
+  budget, or the serving model), and one key would dedupe a content failure away
+  behind an unrelated transport page.
+  **Mechanism — `adoptLlmFailure(new Error(pinnedMessage), coded)`, not
+  `throw makeLlmError(...)`.** Two reasons, both load-bearing: the messages
+  reach the operator verbatim through `CampaignRun.errors[].message`, and
+  `verifyDirectorJsonSalvage` M1/M1b pin the parse-failure throw site as the
+  money bound that keeps the corrective re-ask on ONE shared budget (worst case
+  two paid Director calls). Classify where the failure is DETECTED — only that
+  branch knows empty from truncated from unusable — and adopt on the way out.
+  ⚠️ **These must still never advance the fallback chain** (`CONTENT_CODES ∩
+  `ADVANCES_CHAIN` = ∅, pinned): a different model does not fix prompt
+  compliance, and advancing multiplies PAID calls. Pinned by
+  `verifyLlmErrorCodes.js` group G.
 - **Slack, not Telegram. `res.ok` is not delivery.** `SLACK_BOT_TOKEN` is the
   only secret (Render env on **both** services). Channels are committed in
   `config/defaults.env` (non-secret): `SLACK_ALERT_CHANNEL`,

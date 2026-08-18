@@ -32,7 +32,7 @@ const { resolveModel, resolveChain, rejectsSamplingParams, stripSamplingParams }
 const {
   LLM_ERROR_CODES, LLM_ACTIONS, ADVANCES_CHAIN,
   classifyLlmFailure, makeLlmError, formatLlmLogLine, formatChainSummary, extractRequestId,
-  stampLlmAction,
+  stampLlmAction, shouldRetrySameLink,
 } = require('./llmError');
 
 const ATLAS_CHAT_URL = (process.env.ATLAS_TEXT_BASE_URL || 'https://api.atlascloud.ai/v1') + '/chat/completions';
@@ -123,11 +123,14 @@ function isConfigured() {
 }
 
 // `retryableStatus` / `retryableError` used to live here. They are GONE, not
-// moved: the same two questions are now answered by classifyLlmFailure() +
-// ADVANCES_CHAIN in services/llmError.js, so there is exactly one definition
-// of "is this failure worth another shot" for every LLM transport instead of
-// a private copy per file. Re-adding a local predicate here would recreate the
-// drift this consolidation exists to prevent.
+// moved: both questions are answered in services/llmError.js, by TWO separate
+// predicates that must not be confused —
+//   shouldRetrySameLink(err) — "re-send the SAME model?"  (the old pair)
+//   ADVANCES_CHAIN.has(code) — "try the NEXT candidate?"  (new with the chain)
+// One definition each, for every LLM transport, instead of a private copy per
+// file. Collapsing them back into one predicate is not a simplification: it
+// silently added two round trips to every unrouted slug and every refused
+// connection, which is the regression this split exists to undo.
 //
 // Property name carrying the chain outcome on a SUCCESSFUL response.
 const LLM_CHAIN_PROP = '__llmChain';
@@ -206,6 +209,10 @@ function codedThrownError({ err, provider, model, role, elapsedMs, attempt, atte
     code, provider, model, role, httpStatus: null,
     elapsedMs, attempt, attemptsMax, link, linkCount,
     providerMessage: err && err.message,
+    // The node/axios code must survive classification — shouldRetrySameLink
+    // needs ECONNRESET (retry) vs ECONNREFUSED (do not) to reproduce the
+    // pre-chain retry set, and `err.code` is about to become the taxonomy code.
+    transportCode: err && err.code,
     cause: err,
     action: LLM_ACTIONS.NONE,
   });
@@ -349,14 +356,25 @@ async function chatCompletion(meta, params) {
           });
           lastErr = atlasErr;
           record({ provider: 'atlas', model: atlasId, code: atlasErr.code, httpStatus: atlasErr.httpStatus, ms: Date.now() - t0, ok: false });
-          // A failure that does not advance the chain also does not deserve a
-          // retry against the same model: 400/401/402/403 fail identically
-          // however many times we ask. Break here and let the DIRECT twin
-          // have its shot with the caller's original params — the Atlas body
-          // is not the direct body (mapped model, reasoning_effort, padded
-          // max_tokens), so a gateway validation error does not prove the
-          // caller's request is bad. Unchanged from the pre-chain code.
-          if (!ADVANCES_CHAIN.has(atlasErr.code)) break;
+          // ⚠️ RETRY and ADVANCE ARE DIFFERENT QUESTIONS. This line used to ask
+          // ADVANCES_CHAIN — which conflated them and was a real regression for
+          // the eleven SINGLE-LINK roles:
+          //   • a listed-but-unrouted 400 advances (the next candidate may
+          //     route) but must NOT be re-sent (three identical 400s and two
+          //     backoffs, then the fallback). Pre-chain code broke immediately
+          //     on `err.routerMissing`; using the advance-set here silently
+          //     added two round trips to every mis-pointed ATLAS_MODEL_* and
+          //     every dead slug — and `openai/gpt-5-nano` is exactly that.
+          //   • ECONNREFUSED / ENOTFOUND / EPIPE likewise advance (a different
+          //     host might answer) but will not fix themselves in 3s, and the
+          //     pre-chain retry set deliberately excluded them.
+          // `shouldRetrySameLink` reproduces the pre-chain predicate term for
+          // term; see its comment in services/llmError.js. Break here and let
+          // the DIRECT twin have its shot with the caller's original params —
+          // the Atlas body is not the direct body (mapped model,
+          // reasoning_effort, padded max_tokens), so a gateway validation error
+          // does not prove the caller's request is bad.
+          if (!shouldRetrySameLink(atlasErr)) break;
           if (attempt < linkAttempts) {
             stampLlmAction(atlasErr, LLM_ACTIONS.RETRIED_SAME_MODEL,
               `retrying ${atlasId} (attempt ${attempt + 1} of ${linkAttempts})`);
