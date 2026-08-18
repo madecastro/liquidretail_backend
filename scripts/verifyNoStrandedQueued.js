@@ -218,6 +218,22 @@ ok('C3 an ad with a renderUrl is never selected (something was delivered)', () =
 ok('C4 an ad with renderAttempts > 0 is never selected (work began)', () => {
   assert.strictEqual(matches(leftover({ renderAttempts: 1 }), FILTER), false);
 });
+ok('C4b [THE FIX, 2026-08-18] a derive-only ad that only WAITED (deriveWaitAttempts > 0, ' +
+   'renderAttempts still 0) IS selected — waiting is not "work began"', () => {
+  // renderDeriveOnlyVideoAd's wait/requeue loop (routes/ads.js) used to $inc
+  // renderAttempts on every polite requeue, so a FREE derive ad that merely
+  // polled for its sibling master and never submitted or billed anything
+  // became permanently invisible to this exact filter (C4 above) once its
+  // run went terminal. The fix moved that bookkeeping onto a dedicated
+  // deriveWaitAttempts field (models/Ad.js) that this filter does not (and
+  // must not) look at — renderAttempts:0 is still the only signal "never
+  // started", and a derive-wait ad now honestly satisfies it.
+  assert.strictEqual(
+    matches(leftover({ deriveWaitAttempts: 7 }), FILTER),
+    true,
+    'a derive-only ad that waited 7 times and never rendered must stay sweepable'
+  );
+});
 ok('C5 already-archived / rendering / draft / failed / live are out of scope', () => {
   for (const status of ['archived', 'rendering', 'draft', 'failed', 'live']) {
     assert.strictEqual(matches(leftover({ status }), FILTER), false, `status '${status}' must not be swept`);

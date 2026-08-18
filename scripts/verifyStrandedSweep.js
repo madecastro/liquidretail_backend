@@ -213,6 +213,93 @@ check('D4 the first tick is delayed — on a deploy THIS process just replaced t
         + 'finish" does not mean "no money unaccounted"',
       asked > 0 && out3.chargesSettled > 0, `asked=${asked} settled=${out3.chargesSettled}`);
 
+    // ── G. [RESOURCE] buildStrandedAdFilter — the REAL filter, not a stub ──
+    // 2026-08-18: a wait-only derive video ad's requeue loop moved its
+    // bookkeeping off renderAttempts onto deriveWaitAttempts (so the archive
+    // sweeper's renderAttempts:0 guard stays honest). That accidentally
+    // removed this sweeper's only cap on such an ad — every re-pick mints a
+    // fresh CampaignRun without ever clearing the ORIGINAL failed run out of
+    // campaignRunIds, so the $in match keeps firing every pass regardless of
+    // how many since-completed runs pile up. Section E above stubs Ad.find
+    // entirely, so it tests the PROCESSING logic given a fixed candidate list
+    // — never whether the filter itself would have produced that list. These
+    // checks evaluate the actual exported filter object against real document
+    // shapes, the same way scripts/verifyNoStrandedQueued.js pins
+    // buildQueuedArchiveFilter.
+    {
+      // Same tiny Mongo matcher as verifyNoStrandedQueued.js — deliberately
+      // narrow (throws on an operator it does not implement) so a future
+      // operator added to the query cannot be silently mis-evaluated.
+      function matchOp(value, cond) {
+        if (cond !== null && typeof cond === 'object' && !Array.isArray(cond)) {
+          for (const [op, operand] of Object.entries(cond)) {
+            if (op === '$lt') { if (!(value != null && value < operand)) return false; }
+            else if (op === '$in') {
+              if (Array.isArray(value)) { if (!value.some((v) => operand.includes(v))) return false; }
+              else if (!operand.includes(value)) return false;
+            } else if (op === '$nin') {
+              if (Array.isArray(value)) { if (value.some((v) => operand.includes(v))) return false; }
+              else if (operand.includes(value)) return false;
+            } else if (op === '$exists') {
+              const exists = value !== undefined;
+              if (operand ? !exists : exists) return false;
+            } else {
+              throw new Error(`matcher does not implement operator ${op}`);
+            }
+          }
+          return true;
+        }
+        return value === cond;
+      }
+      function matches(doc, filter) {
+        for (const [key, cond] of Object.entries(filter)) {
+          if (key === '$or') { if (!cond.some((sub) => matches(doc, sub))) return false; }
+          else if (key === '$and') { if (!cond.every((sub) => matches(doc, sub))) return false; }
+          else if (!matchOp(doc[key], cond)) return false;
+        }
+        return true;
+      }
+
+      const FAILED_RUN_IDS = ['run_failed_1'];
+      const F = sweeper.buildStrandedAdFilter({ failedRunIds: FAILED_RUN_IDS });
+      const stranded = (over = {}) => ({
+        status: 'queued',
+        campaignRunIds: ['run_failed_1'],
+        renderStage: 'derive-only: waiting for master pmax_video_9_16 (attempt 2/30)',
+        renderAttempts: 0,
+        deriveWaitAttempts: 0,
+        ...over
+      });
+
+      check('G1 [THE BUG] renderAttempts:0 alone used to mean "eligible forever" — '
+          + 'a wait-only derive ad with deriveWaitAttempts already at the bound is '
+          + 'NOT selected (deriveWaitAttempts: MAX_ATTEMPTS must exclude it)',
+        matches(stranded({ deriveWaitAttempts: sweeper.MAX_ATTEMPTS }), F) === false,
+        'without this bound the sweeper would keep re-picking a wait-only ad up to '
+        + 'MAX_DERIVE_WAIT_ATTEMPTS (30) cycles instead of stopping at MAX_ATTEMPTS');
+      check('G1b a derive ad one BELOW the bound is still selected (the cap is not off by one)',
+        matches(stranded({ deriveWaitAttempts: sweeper.MAX_ATTEMPTS - 1 }), F) === true);
+      check('G2 the EXISTING renderAttempts bound still independently excludes a poisoned ad',
+        matches(stranded({ renderAttempts: sweeper.MAX_ATTEMPTS }), F) === false);
+      check('G3 a missing deriveWaitAttempts field counts as 0 (legacy / non-derive ads are unaffected)',
+        (() => {
+          const doc = stranded();
+          delete doc.deriveWaitAttempts;
+          return matches(doc, F) === true;
+        })());
+      check('G4 an ordinary render-path ad (renderAttempts under bound, no deriveWaitAttempts at all) is still selected',
+        (() => {
+          const doc = stranded({ renderAttempts: 1 });
+          delete doc.deriveWaitAttempts;
+          return matches(doc, F) === true;
+        })());
+      check('G5 an ad from a run NOT in the failed set is not selected (scope unchanged by this fix)',
+        matches(stranded({ campaignRunIds: ['run_other'] }), F) === false);
+      check('G6 [WIRING] findStranded uses buildStrandedAdFilter for its Ad.find call — '
+          + 'source-level, because G1-G5 would otherwise be testing a copy',
+        /Ad\.find\(buildStrandedAdFilter\(/.test(sweepSrc));
+    }
+
   // ── Revert-proof (manual, per CLAUDE.md §5) ────────────────────────────
   // 1. Push every ad to stillNeedRender regardless of receipt -> B2/E2 fail (the
   //    re-buy-what-we-own regression).
@@ -221,6 +308,7 @@ check('D4 the first tick is delayed — on a deploy THIS process just replaced t
   // 4. Drop the renderStage predicate -> A1 fails (sweeping ads an operator never
   //    asked to render).
   // 5. Render selectedIds instead of claim.renderIds -> C2 fails.
+  // 6. Drop the deriveWaitAttempts bound from buildStrandedAdFilter -> G1/G1b fail.
   // Each verified by hand before shipping this harness.
 
   if (failures.length) {

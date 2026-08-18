@@ -52,8 +52,13 @@ const ugcVideoPipeline = require('../services/ugcVideoPipeline');
 
 // Derive-only 1:1 ads requeue while their 9:16 master is still in flight.
 // Bound waits so a permanently-missing master cannot spin forever across
-// /runs claims. Each claim→wait→requeue cycle counts as one attempt
-// (renderAttempts). ~30 cycles is generous vs a ~2–4 min Omni master.
+// /runs claims. Each claim→wait→requeue cycle counts as one attempt on
+// `deriveWaitAttempts` — a SEPARATE counter from `renderAttempts` (models/Ad.js).
+// Waiting never submits or renders anything, so it must not inflate
+// renderAttempts: services/queuedArchiveSweeper's `renderAttempts:0` guard
+// uses that field to prove a queued leftover never started, and a wait-only
+// requeue that bumped renderAttempts made itself permanently unsweepable.
+// ~30 cycles is generous vs a ~2–4 min Omni master.
 const MAX_DERIVE_WAIT_ATTEMPTS = 30;
 // In-render wait for the sibling master's plate. An Omni master settles in
 // roughly 2 minutes; 12 minutes leaves generous headroom for a slow poll
@@ -1001,37 +1006,46 @@ router.post('/generate', async (req, res) => {
           return;
         }
 
-        // ATOMIC CLAIM. `status: 'queued'` in the filter is load-bearing and
-        // is what makes this a claim rather than an announcement.
-        //
-        // selectAdsForRun reads queued ads, and this write marked them
-        // rendering — with no status condition. Between the read and the write
-        // another Generate could select the SAME ad and claim it too, and both
-        // runs would then render it. Atlas bills image generation ON SUBMIT, so
-        // that is a straight double charge for one ad, with the second result
-        // overwriting the first. Two operators pressing Generate at once, or a
-        // double-clicked button, is all it took.
-        //
-        // Conditioning on 'queued' means the loser's update matches nothing for
-        // that ad, so exactly one run can own it.
-        await Ad.updateMany(
-          { _id: { $in: adIds }, status: 'queued' },
+        // ATOMIC CLAIM — same money shape as /runs. Use claimAdsForRun() only:
+        // status:'queued' filter, ownership re-read, modifiedCount cross-check,
+        // and anomaly release on a claim that cannot be confirmed. Do not
+        // inline a second claim path here (CLAUDE.md §2) — this route used to,
+        // and the inline copy had no anomaly branch: if updateMany reported a
+        // write but the ownership re-read came back empty (concurrent
+        // interference), these ads sat 'rendering' forever, undistinguishable
+        // from the ordinary "claimed by another run" outcome, until the
+        // 15-minute reaper found them. claimAdsForRun is the SAME function
+        // POST /api/ads/runs and the stranded-sweep requeue call, so a fix to
+        // the claim sequence only has to happen once.
+        const preClaimCount = adIds.length;
+        const claim = await claimAdsForRun(
           {
-            $addToSet: { campaignRunIds: runId },
-            $set:      { status: 'rendering', updatedAt: new Date() }
-          }
+            updateMany: (filter, update) => Ad.updateMany(filter, update),
+            find: (filter) => Ad.find(filter).select('_id').lean()
+          },
+          { selectedIds: adIds, runId }
         );
 
-        // Re-read what we ACTUALLY won. updateMany's modifiedCount cannot tell
-        // us WHICH ids were claimed, and rendering an ad this run does not own
-        // is the double-charge we just closed.
-        const claimed = await Ad.find({ _id: { $in: adIds }, status: 'rendering', campaignRunIds: runId })
-          .select('_id')
-          .lean();
-        const claimedIds = claimed.map(a => a._id);
-        if (claimedIds.length !== adIds.length) {
+        if (claim.kind === 'anomaly') {
+          // claimAdsForRun already attempted the release (best-effort) back to
+          // 'queued'. Report this honestly as a failed run — folding it into
+          // the ordinary empty-claim outcome below would tell the operator
+          // "claimed by another run" when nothing was actually claimed OR
+          // reliably released, which is the exact lie /runs's anomaly branch
+          // exists to avoid.
+          console.error(`🚨 [campaignRun ${runId}] ${claim.error}`);
+          await CampaignRun.updateOne(
+            { _id: run._id },
+            { status: 'failed', completedAt: new Date(),
+              $push: { errors: { index: 0, stage: 'claim', message: claim.error } } }
+          );
+          return;
+        }
+
+        const claimedIds = claim.claimedIds;
+        if (claimedIds.length !== preClaimCount) {
           console.warn(
-            `⚠️  [campaignRun ${runId}] claimed ${claimedIds.length}/${adIds.length} ad(s) — ` +
+            `⚠️  [campaignRun ${runId}] claimed ${claimedIds.length}/${preClaimCount} ad(s) — ` +
             `the rest were taken by a concurrent run`
           );
         }
@@ -1174,14 +1188,18 @@ router.post('/generate', async (req, res) => {
 });
 
 // ── claimAdsForRun ────────────────────────────────────────────────────
-// THE claim sequence for POST /runs. Live handler and offline harness
-// both call this function. Data access is injected so the harness can
-// drive the exact same code path with an in-memory fake — not a parallel
-// model that drifts from production.
+// THE claim sequence for POST /runs, POST /generate, and the stranded-sweep
+// requeue (services/strandedRunSweeper via requeueStrandedAds below). Every
+// live caller and the offline harness call this ONE function — CLAUDE.md §2:
+// "Use claimAdsForRun() only ... do not inline a second claim path." /generate
+// used to inline its own copy with no anomaly branch; it now calls this
+// instead. Data access is injected so the harness can drive the exact same
+// code path with an in-memory fake — not a parallel model that drifts from
+// production.
 //
 // Sequence (do not reorder; 422/anomaly before any 202):
 //   1. Atomic updateMany with status:'queued' (load-bearing — Atlas bills
-//      on submit; without this filter two concurrent /runs both render).
+//      on submit; without this filter two concurrent claimers both render).
 //   2. Ownership re-read: status:'rendering' + campaignRunIds: runId.
 //   3. modifiedCount vs re-read cross-check (anomaly → release + error).
 //   4. Outcome: empty → 422; won → claimed set as renderIds/total.
@@ -1828,7 +1846,9 @@ async function renderDeriveOnlyVideoAd({
       adStage(adId, `derive-only: waiting for master ${deriveFromFmt} plate`);
     }
   }
-  const attempts = Number(ad.renderAttempts) || 0;
+  // deriveWaitAttempts, NOT renderAttempts — waiting never submits or
+  // renders anything (see MAX_DERIVE_WAIT_ATTEMPTS comment above).
+  const attempts = Number(ad.deriveWaitAttempts) || 0;
 
   // Master settled = holds a paid plate URL. status may be draft (post-
   // master, pre/post-titling), live, or even failed-after-titling with
@@ -1856,7 +1876,13 @@ async function renderDeriveOnlyVideoAd({
             renderStageAt: new Date(),
             updatedAt: new Date()
           },
-          $inc: { renderAttempts: 1 }
+          // Final tick of the SAME bounded wait loop, not a render attempt —
+          // deriveWaitAttempts, not renderAttempts. This is a terminal write
+          // (status:'failed'), so it does not touch the sweeper's guard
+          // either way, but keeping it on the wait counter is what makes
+          // "renderAttempts == 0" honestly mean "never started" for an ad
+          // that only ever polled for its master.
+          $inc: { deriveWaitAttempts: 1 }
         }
       );
       await CampaignRun.updateOne(
@@ -1885,7 +1911,15 @@ async function renderDeriveOnlyVideoAd({
           renderStageAt: new Date(),
           updatedAt: new Date()
         },
-        $inc: { renderAttempts: 1 }
+        // deriveWaitAttempts, NOT renderAttempts. This row goes back to
+        // 'queued' having never submitted or rendered anything — bumping
+        // renderAttempts here is exactly the bug: services/queuedArchiveSweeper
+        // trusts renderAttempts:0 to mean "never started" before archiving a
+        // stale leftover, so a wait-only requeue that inflated it made the ad
+        // permanently unsweepable even though it never started and never
+        // billed. deriveWaitAttempts (models/Ad.js) is a dedicated counter for
+        // exactly this loop; MAX_DERIVE_WAIT_ATTEMPTS above reads it too.
+        $inc: { deriveWaitAttempts: 1 }
       }
     );
     // Count as skipped for this run (will reappear on a subsequent claim).

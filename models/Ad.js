@@ -456,7 +456,10 @@ const adSchema = new mongoose.Schema({
   durationMs:         { type: Number, default: null },
 
   // Render diagnostics. renderError is populated when status='failed';
-  // renderAttempts counts every attempt regardless of outcome.
+  // renderAttempts counts every attempt that STARTED a render (submit/
+  // generation actually reached), regardless of outcome — a wait-only cycle
+  // (a derive-only video ad polling for its sibling master, never submitting
+  // anything) counts on deriveWaitAttempts below instead, not here.
   renderError: {
     message: { type: String },
     stage:   { type: String },
@@ -499,6 +502,21 @@ const adSchema = new mongoose.Schema({
     atlasCode:    { type: Number, default: null }
   },
   renderAttempts: { type: Number, default: 0 },
+  // A FREE derive-only video ad (deriveFromMaster set) waits IN-RENDER for
+  // its sibling master's plate (renderDeriveOnlyVideoAd, routes/ads.js) and
+  // requeues to 'queued' if the wait expires — it never submits anything,
+  // never bills. That requeue used to $inc renderAttempts, which meant a
+  // wait-only ad looked identical to one that had genuinely rendered and
+  // failed. services/queuedArchiveSweeper's `renderAttempts:0` guard exists
+  // specifically to prove "this row never started, never billed" before
+  // archiving a leftover queued ad — so a derive-wait ad that merely polled
+  // and requeued became permanently invisible to that sweeper (renderAttempts
+  // > 0 forever) even though it started nothing and cost nothing. Declared
+  // here so the write is not silently dropped by Mongoose strict mode (see
+  // the titlingResumeState note above — undeclared paths vanish on save).
+  // renderAttempts keeps meaning "actual render attempts"; this field is the
+  // ONLY thing the derive-wait loop increments.
+  deriveWaitAttempts: { type: Number, default: 0 },
 
   // ── Copy snapshot — filled at render time ────────────────────────
   // Cached resolution of the LayoutInputArtifact's derived copy so
