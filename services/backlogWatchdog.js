@@ -204,11 +204,23 @@ function buildStalledRunFilter({ now, ageMin, silenceMin } = {}) {
   return {
     // 'preparing' IS INCLUDED, and it is the arm that was actually missing.
     //
-    // The reaper only matches status:'running', so a run that dies during
-    // EXPANSION — the Director round, the mint — never leaves 'preparing'.
-    // Nothing reaps it and, until this line, nothing alerted on it either:
+    // Historically the reaper only matched status:'running', so a run that died
+    // during EXPANSION — the Director round, the mint — never left 'preparing'.
+    // Nothing reaped it and, until this line, nothing alerted on it either:
     // this filter was 'running'-only, so the one state with no reaper was also
     // the one state with no warning.
+    //
+    // AMENDED 2026-08-18: worker.js reapOrphans() DOES now sweep 'preparing'
+    // (campaignRunGuards.buildStalePreparingFilter, at PREPARE_STALE_MIN = 30),
+    // so the "nothing reaps it" half is no longer true. The consequence for
+    // THIS filter is that its preparing arm is now largely a structurally empty
+    // set: the binding trigger for a preparing row is the 45m AGE test (its
+    // updatedAt never moves off startedAt, so the 12m silence test is always
+    // satisfied first), and the reaper rewrites the row to 'failed' at 30.
+    // Deliberately left as-is — RUN_STALE_MIN's comment above records it as
+    // tuned against video batch duration, not against a reaper window, so
+    // retuning it is a separate decision needing its own measurement. Same
+    // empty-set failure mode the RUN_SILENCE_MIN note below guards against.
     //
     // MEASURED 2026-08-13: eight such runs in production, the oldest 8.3 days
     // old, every one with total=0 / succeeded=0 / failed=0 and updatedAt never

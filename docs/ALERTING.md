@@ -181,12 +181,40 @@ Non-secret, all in `config/defaults.env`, all overridable per-service:
 | `ALERT_RATE_LIMIT_MAX` | `20` | Hard ceiling per minute, independent of dedupe |
 | `ALERT_WATCHDOG_INTERVAL_MIN` | `5` | Health-sweep cadence |
 | `ALERT_RENDERING_STALE_MIN` | `12` | **Keep below `REAP_STALE_MIN` (15)** |
-| `ALERT_RUN_STALE_MIN` | `45` | AGE noise filter only — a 20-ad video batch legitimately runs a long time |
+| `ALERT_RUN_STALE_MIN` | `45` | AGE noise filter only — a 20-ad video batch legitimately runs a long time. Also the effective trigger for the filter's `preparing` arm (see note) |
 | `ALERT_RUN_SILENCE_MIN` | `12` | SILENCE trigger. **Keep strictly below `REAP_STALE_MIN` (15)** — at/above 15 the reaper empties the set |
 | `ALERT_DETECT_BACKLOG_COUNT` / `_MIN` | `25` / `20` | Both must trip |
 | `ALERT_HOURLY_SPEND_USD` | `25` | See spend note below |
 | `ALERT_EXIT_FLUSH_MS` | `2500` | Bounded window to deliver one message before exit (code default; not in `defaults.env`) |
 | `ALERT_SEND_TIMEOUT_MS` | `8000` | Abort a hung Slack POST (code default; not in `defaults.env`) |
+
+### The two reaper windows, and what they mean for these thresholds
+
+There are **two** staleness windows, not one, and only the first is the one
+these alert thresholds are tuned against:
+
+| Window | Default | Governs |
+|---|---|---|
+| `REAP_STALE_MIN` | `15` | **Claimed** work — `Ad` in `rendering`, `CampaignRun` in `running`. Both heartbeat, so 15m of silence really is a dead holder. |
+| `PREPARE_STALE_MIN` | `30` | The **preparing** lifecycle — mint → the `preparing`→`running` flip. Raised from 15 on 2026-08-18: a preparing run makes no writes at all, and its healthy runtime (Director + Judge) is **~18-20 min**, so 15 was failing expansions that were merely finishing. Non-secret, so it lives in `config/defaults.env`. |
+
+`ALERT_RENDERING_STALE_MIN` and `ALERT_RUN_SILENCE_MIN` must stay strictly below
+**`REAP_STALE_MIN`** — unchanged by the preparing bump, which touched neither
+`Ad` reaping nor `running`-run reaping.
+
+**No alert arm keys on preparing age**, so nothing here was re-tuned.
+`buildStalledRunFilter` (`services/backlogWatchdog.js`) does *include*
+`status:'preparing'` in its `$in`, but its triggers are `ALERT_RUN_STALE_MIN`
+(45, on `startedAt`) and `ALERT_RUN_SILENCE_MIN` (12, on `updatedAt`) — and for a
+preparing row `updatedAt === startedAt`, so the binding constraint is the **45m
+age**. That sits above the preparing reaper at either 15 or 30, meaning the
+worker stamps such a row `failed` before the alert's age test can ever pass.
+**Known open, pre-existing, and deliberately not changed here:** that arm is
+therefore close to a structurally empty set, the same failure mode the
+`ALERT_RUN_SILENCE_MIN < REAP_STALE_MIN` rule exists to prevent. It was already
+true at 15 and is no more true at 30, and `ALERT_RUN_STALE_MIN`'s own comment
+records it as tuned against video batch duration — not against a reaper window —
+so retuning it is a separate, deliberate decision with its own measurement.
 
 ### Spend note
 

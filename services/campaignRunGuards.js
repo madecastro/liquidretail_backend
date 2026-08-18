@@ -10,11 +10,48 @@
 // operator stop is OperationRun.status='cancelled' via progressService
 // (STATUSES = running|succeeded|failed|cancelled|cancelling). A
 // CampaignRun that finishes after an operator stop still lands on 'done'.
+//
+// ── THE PREPARING/RUNNING WINDOW SPLIT (2026-08-18) ────────────────────────
+//
+// Two staleness windows live here, and mixing them up costs money:
+//
+//   preparingStaleMin (PREPARE_STALE_MIN, 30) governs the whole 'preparing'
+//     lifecycle — buildStalePreparingFilter, buildRunningFlipFilter's age
+//     guard, AND the 'preparing' arm of buildActiveRunsFilter.
+//   runningStaleMin  (REAP_STALE_MIN, 15) governs claimed work — the Ad
+//     reaper, the 'running' run reaper, and the 'running' arm of
+//     buildActiveRunsFilter.
+//
+// THE INVARIANT, stated once here and enforced behaviourally by
+// scripts/verifyPreparingReap.js Group G: the window in which the flip is
+// still allowed must not exceed the window in which the gate still counts
+// that preparing run as in-flight. If the flip outlives the gate, a duplicate
+// request is admitted while the original can still flip — two billed
+// generations for one operator intent. Both therefore read the SAME
+// preparingStaleMin, so the relationship is equality by construction rather
+// than two numbers someone has to remember to keep in step.
+//
+// Why 30 and not 15: PREPARE_STALE_MIN used to be 15, which is BELOW the
+// system's own documented healthy expansion ceiling (~18-20 min — see
+// worker.js and services/staleness.js). An expansion finishing at T=18 min
+// therefore lost its own flip, the claimed ads were released back to queued,
+// and the run read 'failed' to the operator. Nothing was double-billed, but
+// perfectly good runs were being thrown away.
 
 // In-flight statuses that may legally transition to 'done'. Terminal
 // 'failed' (reaper) and 'done' must stay put; an allow-list (not a
 // $nin of guessed names) is what keeps a future 'cancelled' on this
 // collection from being flipped back to 'done'.
+// The ONE staleness parser (services/staleness.js). Required here only for
+// positiveMinutes() + the two documented defaults, so buildActiveRunsFilter can
+// refuse a nonsense window instead of emitting `new Date(NaN)`. This module
+// stays pure — it reads no process.env of its own.
+const {
+  positiveMinutes,
+  REAP_STALE_MIN_DEFAULT,
+  PREPARE_STALE_MIN_DEFAULT
+} = require('./staleness');
+
 const DONE_ELIGIBLE_STATUSES = Object.freeze(['preparing', 'running']);
 
 /**
@@ -26,8 +63,65 @@ function buildTerminalDoneFilter(id) {
 }
 
 /**
- * worker.js reapOrphans() — CampaignRuns stuck in 'preparing'. HYGIENE ONLY,
- * NOT the money guard — see buildRunningFlipFilter below for that.
+ * The concurrency gate's in-flight set (routes/ads.js POST /api/ads/generate).
+ * Extracted for two reasons, both load-bearing:
+ *
+ *   1. It is used TWICE — the pre-check before generationGateDecision, and the
+ *      mint-then-verify re-read fed to pickSupersedingRun. Those two must see
+ *      the SAME population or the race check protects a different set than the
+ *      pre-check did. Inline duplication is how that drifts.
+ *   2. The 'preparing' arm's bound is half of the coherence invariant in the
+ *      module header, so it has to be something a harness can evaluate against
+ *      real document shapes rather than regex out of a 4000-line route file.
+ *
+ * TWO ARMS, NOT ONE $in. This used to be a single
+ * `{ status: { $in: ['preparing','running'] }, createdAt: { $gte: now - REAP } }`,
+ * which forced both lifecycles onto the 15-minute claimed-doc window. That is
+ * what made the preparing lifecycle incoherent: the flip guard needed to reach
+ * ~18-20 min to cover a healthy expansion, but any value above the gate's own
+ * window opens the double-bill described in the header. Splitting the arms lets
+ * the preparing side move to 30 while running stays at 15 — no widening of the
+ * running window, no delay to orphan requeue.
+ *
+ * Index note: models/CampaignRun.js declares { campaignId:1, status:1,
+ * createdAt:-1 }. Each arm is an exact status equality plus a createdAt range,
+ * so both are single contiguous ranges on that compound index — if anything a
+ * better fit than the previous $in.
+ *
+ * Minutes are validated through the SAME parser the env getters use
+ * (services/staleness.positiveMinutes) rather than trusted raw: a missing or
+ * nonsense value would otherwise produce `new Date(NaN)` and an arm that
+ * matches nothing, i.e. a silently disabled half of the duplicate gate. This is
+ * not a second parser — it is the one parser, called with an explicit fallback.
+ */
+function buildActiveRunsFilter({
+  campaignId,
+  now,
+  runningStaleMin,
+  preparingStaleMin
+} = {}) {
+  const t = now instanceof Date ? now.getTime() : (Number(now) || Date.now());
+  const since = (min, fallback) =>
+    new Date(t - positiveMinutes(min, fallback) * 60 * 1000);
+  return {
+    campaignId,
+    $or: [
+      { status: 'preparing', createdAt: { $gte: since(preparingStaleMin, PREPARE_STALE_MIN_DEFAULT) } },
+      { status: 'running',   createdAt: { $gte: since(runningStaleMin,   REAP_STALE_MIN_DEFAULT) } }
+    ]
+  };
+}
+
+/**
+ * worker.js reapOrphans() — CampaignRuns stuck in 'preparing'. Keyed on
+ * PREPARE_STALE_MIN, the same preparing-lifecycle window the flip guard and
+ * the gate's preparing arm use (module header).
+ *
+ * VISIBILITY, not the money guard — see buildRunningFlipFilter below for that.
+ * The distinction still holds after the 15→30 change: this sweep decides when a
+ * dead-looking row gets stamped 'failed' so it stops reading as a silent no-op;
+ * the flip's own age check is what makes a slow run unable to resurrect itself,
+ * and it works whether or not this sweep has ever ticked.
  *
  * A 'preparing' run never heartbeats: expandWizardJob (Director + Judge,
  * then the atomic Ad claim) makes ZERO writes to the CampaignRun row before
@@ -60,24 +154,35 @@ function buildStalePreparingFilter({ now, staleMin }) {
  * THIS is the actual money guard, not the reaper sweep above.
  *
  * `status:'preparing'` alone is necessary but not sufficient. Adversarial
- * review caught the gap: the concurrency gate (routes/ads.js) stops treating
- * a 'preparing'/'running' run as active once its `createdAt` is older than
- * `REAP_STALE_MIN` (the SAME const the gate already uses, by the same
- * repo convention documented there — "the two cannot drift into disagreeing
- * about what stale means"). That gate check fires on every request,
- * independent of whether the worker's reaper has actually ticked. So
- * without an age check HERE too, a run whose expansion is merely slow (not
- * dead) can outlive the gate's window — a duplicate request then sails
- * through as "not a duplicate" (the stale row is invisible to the gate),
+ * review caught the gap: the concurrency gate (routes/ads.js, via
+ * buildActiveRunsFilter above) stops treating a 'preparing' run as active once
+ * its `createdAt` is older than the preparing window. That gate check fires on
+ * every request, independent of whether the worker's reaper has actually
+ * ticked. So without an age check HERE too, a run whose expansion is merely
+ * slow (not dead) can outlive the gate's window — a duplicate request then
+ * sails through as "not a duplicate" (the stale row is invisible to the gate),
  * a sibling run bills a fresh generation, and MINUTES LATER the original's
  * expansion finally finishes and this flip — checking only {_id,
  * status:'preparing'} — would have succeeded too, billing a second time
- * for the same operator intent. Passing `staleMin` (the gate's own
- * REAP_STALE_MIN) closes this: the flip refuses once the run has aged past
- * the exact instant the gate stopped honoring its exclusivity, regardless
- * of reaper cadence. `staleMin` is optional only so the pure-logic tests can
- * exercise the bare status guard in isolation; every real caller must pass
- * it.
+ * for the same operator intent. Passing `staleMin` closes this: the flip
+ * refuses at the exact instant the gate stopped honoring its exclusivity,
+ * regardless of reaper cadence. `staleMin` is optional only so the pure-logic
+ * tests can exercise the bare status guard in isolation; every real caller
+ * must pass it.
+ *
+ * ⚠️ `staleMin` HERE MEANS THE PREPARING WINDOW (PREPARE_STALE_MIN, 30) — NOT
+ * REAP_STALE_MIN. Corrected 2026-08-18, and the correction is the whole point
+ * of this change. The original wiring passed the gate's REAP_STALE_MIN (15) and
+ * argued that was right because both sides used one const. The reasoning about
+ * *agreement* was sound; the *value* was not. 15 is the claimed-doc heartbeat
+ * window, and a 'preparing' run does not heartbeat — its legitimate runtime is
+ * the Director + Judge ladder, which worker.js's own arithmetic puts at ~18-20
+ * min. So a perfectly healthy expansion finishing at T=18 lost its own flip:
+ * ads released back to 'queued', run stamped 'failed', operator shown a crash
+ * that never happened. The fix is not to drop the guard (that reopens the
+ * double-spend) but to key BOTH the guard and the gate's preparing arm on the
+ * preparing window. See the module header for the inequality that makes
+ * "both", rather than "either", the load-bearing word.
  *
  * INCIDENTAL BUT LOAD-BEARING: this filter keys on `startedAt`; the gate
  * (routes/ads.js) keys on `createdAt`. That is safe only because
@@ -108,6 +213,7 @@ function buildRunningFlipFilter(runDocId, { now, staleMin } = {}) {
 module.exports = {
   DONE_ELIGIBLE_STATUSES,
   buildTerminalDoneFilter,
+  buildActiveRunsFilter,
   buildStalePreparingFilter,
   buildRunningFlipFilter
 };

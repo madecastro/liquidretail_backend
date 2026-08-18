@@ -70,8 +70,34 @@ ok('B2 a fractional value is NOT truncated (old worker parseInt gave 7)', () => 
   withEnv('REAP_STALE_MIN', '7.9', () => assert.strictEqual(staleness.reapStaleMin(), 7.9));
 });
 ok('B3 PREPARE_STALE_MIN is an independent knob, same guarantees', () => {
-  withEnv('PREPARE_STALE_MIN', '0', () => assert.strictEqual(staleness.prepareStaleMin(), 15));
+  // Default is 30, NOT 15 (raised 2026-08-18). The two windows are deliberately
+  // different numbers: 15 is the CLAIMED-doc heartbeat window (Ad 'rendering',
+  // CampaignRun 'running'), while a 'preparing' run never heartbeats and has a
+  // documented healthy runtime of ~18-20 min. Keying the preparing lifecycle on
+  // 15 was failing expansions that were merely finishing. Asserted against the
+  // exported constant rather than a literal so this cannot silently drift from
+  // the value the code actually ships.
+  assert.strictEqual(staleness.PREPARE_STALE_MIN_DEFAULT, 30,
+    'preparing window must clear the ~18-20min healthy expansion ceiling');
+  withEnv('PREPARE_STALE_MIN', '0', () =>
+    assert.strictEqual(staleness.prepareStaleMin(), staleness.PREPARE_STALE_MIN_DEFAULT));
   withEnv('PREPARE_STALE_MIN', '45', () => assert.strictEqual(staleness.prepareStaleMin(), 45));
+});
+ok('B4 the two windows are SEPARATE — raising preparing must not have moved the claimed-doc window', () => {
+  // The whole affordability argument for 30 is that RUNNING runs and Ads keep
+  // 15: raising REAP_STALE_MIN too would delay orphan requeue for every claimed
+  // doc. If someone "simplifies" these back into one constant, this fails.
+  assert.strictEqual(staleness.REAP_STALE_MIN_DEFAULT, 15, 'claimed-doc window must stay 15');
+  assert.ok(staleness.PREPARE_STALE_MIN_DEFAULT > staleness.REAP_STALE_MIN_DEFAULT,
+    'the preparing window is longer than the claimed-doc window by design, not by accident');
+  withEnv('PREPARE_STALE_MIN', '99', () => {
+    assert.strictEqual(staleness.reapStaleMin(), 15,
+      'PREPARE_STALE_MIN must not leak into reapStaleMin() — separate env vars, separate lifecycles');
+  });
+  withEnv('REAP_STALE_MIN', '99', () => {
+    assert.strictEqual(staleness.prepareStaleMin(), 30,
+      'REAP_STALE_MIN must not leak into prepareStaleMin()');
+  });
 });
 
 // ── C. THE REGRESSION THIS FIXES: the two old idioms disagreed ──
