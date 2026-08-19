@@ -537,6 +537,21 @@ async function renderStage(args) {
       wrapped.atlasCode    = err.atlasCode ?? null;
       wrapped.alertLevel   = err.alertLevel;
       wrapped.alertKey     = err.alertKey;
+      // Stable classification (services/atlasErrorPolicy.js's IMAGE_* codes),
+      // carried the same way predictionId/charged/atlasCode are above — the
+      // policy object rides on `err.policy` (atlasImageService.js), and
+      // without pulling `.code`/`.retryable` out HERE they are lost at exactly
+      // the point buildErrorEntry() (routes/ads.js) needs them to populate
+      // CampaignRun.errors[].code / Ad.renderError.code. Added 2026-08-19 so a
+      // moderation rejection ("18/18 statics failed, all IMAGE_MODERATION_
+      // BLOCKED") is distinguishable from a bug/outage instead of reading as
+      // one more generic render failure.
+      wrapped.code         = err.policy?.code || null;
+      // `failed()` below used to hardcode retryable as "true unless this is a
+      // 'validate' stage" — a lie for anything classified `give-up` (a
+      // moderation rejection IS one). Prefer the real classification when we
+      // have it; `failed()` still falls back to the old heuristic otherwise.
+      wrapped.retryable    = typeof err.policy?.retryable === 'boolean' ? err.policy.retryable : undefined;
       // Vision QC double-fail attaches the verdict so routes can persist
       // discarded (already-paid) render URLs on the failed Ad.
       wrapped.visionQc     = err.visionQc || null;
@@ -1473,7 +1488,16 @@ function failed(jobId, stage, err) {
     error: {
       stage,
       message:   err.message || String(err),
-      retryable: stage !== 'validate',  // validate failures are surfaced as 'skipped' separately
+      // Stable IMAGE_* classification code (atlasErrorPolicy.js), when the
+      // failure went through that classifier — null for stages it never
+      // reaches (validate, upload, persist). Read by routes/ads.js's
+      // buildErrorEntry() to populate CampaignRun.errors[].code.
+      code:      err.code || null,
+      // Prefer the real classification (moderationBlocked -> false, a 429 ->
+      // true, ...) over the old blanket "true unless validate" guess — that
+      // guess told an operator a moderation rejection ("identical retry is
+      // futile") was retryable, which is exactly backwards.
+      retryable: typeof err.retryable === 'boolean' ? err.retryable : (stage !== 'validate'),
       // Carry the provider handle through. Atlas bills on submit and keeps the
       // asset for days, so a render we abandoned — a poll timeout, or a deploy
       // or autoscale killing the loop mid-batch — is an image we ALREADY PAID
@@ -1533,4 +1557,11 @@ function buildPosterFromComposite(compositeUrl) {
     .replace(/\.(mp4|mov|webm|m4v)(\?.*)?$/i, '.jpg$2');
 }
 
-module.exports = { renderCreative, composeVideoOutput, deriveStage };
+module.exports = {
+  renderCreative, composeVideoOutput, deriveStage,
+  // Exported so scripts/verifyModerationSeedFallback.js can assert the
+  // SERIALISED failure shape (code/retryable) by calling the real function,
+  // rather than regexing the object literal — same rationale as
+  // routes/ads.js's projectAd export.
+  failed
+};

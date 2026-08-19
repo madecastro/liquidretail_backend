@@ -95,14 +95,24 @@ const campaignRunSchema = new mongoose.Schema({
     mediaId:    String,
     productId:  String,
     message:    String,
-    // ── LLM failure taxonomy (services/llmError.js) ──
+    // ── LLM failure taxonomy (services/llmError.js) — AND, since 2026-08-19,
+    // the image/video equivalent (services/atlasErrorPolicy.js's IMAGE_*
+    // codes, e.g. IMAGE_MODERATION_BLOCKED). Both taxonomies write into the
+    // SAME plain-String fields below — they are unconstrained (no Mongoose
+    // enum), and the two are already namespace-disjoint (LLM_* vs IMAGE_*),
+    // so one render-failure row and one LLM-failure row never collide on
+    // meaning. A direct-image render failure's `stage` is always 'render'
+    // (or 'upload'/'crash'), never a Director/LLM stage, so a reader can
+    // still tell which taxonomy produced a given code without a lookup.
+    //
     // DECLARED, not free-form: this schema is STRICT, so an undeclared path is
     // silently DROPPED on write — the trap that already lost
     // `renderError.predictionId` (CLAUDE.md §2/§4). Adding the field to the
     // write site without adding it here would look correct, pass every
     // source-text harness, and store nothing.
     //
-    // `code`   — stable UPPER_SNAKE class (LLM_RATE_LIMITED, LLM_TIMEOUT, …).
+    // `code`   — stable UPPER_SNAKE class (LLM_RATE_LIMITED, LLM_TIMEOUT, …
+    //            or IMAGE_MODERATION_BLOCKED, IMAGE_RATE_LIMITED, …).
     //            Exists because "Atlas 400: bad request" reached the operator
     //            with no way to tell a param bug from a capacity outage.
     // `action` — what the system ACTUALLY did next (EXHAUSTED_CHAIN,
@@ -110,9 +120,39 @@ const campaignRunSchema = new mongoose.Schema({
     //            from "your ads are gone" without a log dig.
     // `chain`  — the compact ordered attempt summary, e.g.
     //            "tried a (429, 51.0s) → b (429, 50.0s) → c (ok, 1.0s)".
+    //            Image/video failures leave this null — there is no
+    //            multi-link fallback chain on that path, only the seed
+    //            fallback recorded on `seedFallbacks` below.
     code:       String,
     action:     String,
     chain:      String
+  }],
+
+  // Cross-creative coordination for the moderation seed-fallback mitigation
+  // (services/moderationSeedFallback.js, added 2026-08-19 for the incident
+  // where one flagged catalog photo failed 18/18 statics for a product).
+  // Best-effort only — a read/write failure here just costs one more wasted
+  // primary-seed attempt on a later creative for the same product, exactly
+  // the pre-fallback behaviour; nothing downstream requires this array to be
+  // complete, race-free, or even present.
+  seedFallbacks: [{
+    _id:             false,
+    productId:       String,
+    // The seed this run started with for this product (CatalogProduct's
+    // merchant-feed-order default, or the Ad's Director-picked media) —
+    // recorded so an operator can see WHAT was swapped away from, per the
+    // "never silently downgrade quality" requirement.
+    originalMediaId: String,
+    // The first alternate catalog image this run proved clears moderation
+    // for this product, if any. A creative that starts AFTER this is written
+    // reads it and skips straight to it, never re-paying to rediscover it.
+    resolvedMediaId: String,
+    // Every catalog image id this run has proven moderation-blocked for this
+    // product, so a later creative never retries a candidate already known
+    // bad. Deliberately NOT deduped-on-write (a rare concurrent double-append
+    // is harmless); readers dedupe.
+    blocked:         [String],
+    at:              Date
   }],
 
   // Per-product expansion outcomes. Written when expandWizardJob finishes
