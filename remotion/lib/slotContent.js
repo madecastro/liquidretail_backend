@@ -21,6 +21,37 @@ export function truncateWordSafe(str, maxLen) {
   return out.length < s.length ? `${out}…` : out;
 }
 
+// Fit an already display-cleaned PRODUCT NAME to a character cap by
+// dropping LEADING descriptive words one at a time — never the trailing
+// core noun phrase — before ever falling back to a tail ellipsis.
+//
+// A catalog product title reads as "[modifiers] [core noun]" ("Vintage
+// Oversized Denim Jacket"): the noun at the END is what actually identifies
+// the product on screen, so when the string must shrink further, shed
+// adjectives from the front first ("Oversized Denim Jacket", then "Denim
+// Jacket", …) rather than clamp the tail and lose the noun to an ellipsis
+// ("Vintage Oversized Denim…" — reads as broken, and the shopper never sees
+// what the product actually IS). Every candidate is a whole real phrase, at
+// a word boundary, with no ellipsis — this beats truncateWordSafe's tail
+// cut whenever a shorter true phrase exists that fits.
+//
+// Tries the FEWEST possible words to drop (checks 1, then 2, then 3, …) so
+// it never over-shortens past what the box actually requires. Only when
+// even the single last word alone still exceeds the cap (or the name was
+// always a single word) does this fall back to truncateWordSafe's tail-cut
+// ellipsis — the true last resort, unavoidable when no whole-word phrase
+// fits at all.
+export function fitProductNameToCap(str, maxLen) {
+  const s = String(str ?? '').replace(/\s+/g, ' ').trim();
+  if (!maxLen || maxLen < 1 || s.length <= maxLen) return s;
+  const words = s.split(' ');
+  for (let drop = 1; drop < words.length; drop++) {
+    const candidate = words.slice(drop).join(' ');
+    if (candidate.length <= maxLen) return candidate;
+  }
+  return truncateWordSafe(s, maxLen);
+}
+
 // Per-slot character caps for on-screen text. productName is the one that
 // previously printed mid-word SKU titles on the close phase ("…(Dark…").
 //
@@ -587,7 +618,16 @@ export function resolveSlotContentCore(slot, meta, ctx = null) {
         if (Object.keys(enrich).length > 0) capCtx = { ...ctx, ...enrich };
       }
       const charCap = deriveCharCap(slot.key, capCtx);
-      return charCap ? truncateWordSafe(raw, charCap) : raw;
+      if (!charCap) return raw;
+      // productName gets the noun-preserving fitter (drop leading modifiers
+      // before ever clamping the tail) — every other slot (quote, headline,
+      // …) keeps the plain tail-safe cap unchanged. A customer quote or a
+      // Director headline is not "[modifiers][noun]" shaped, and PR #250
+      // depends on the quote's OPENING clause surviving untouched — this
+      // must stay scoped to productName alone.
+      return slot.key === 'productName'
+        ? fitProductNameToCap(raw, charCap)
+        : truncateWordSafe(raw, charCap);
     }
   }
   return null;
