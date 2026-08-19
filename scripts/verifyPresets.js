@@ -716,7 +716,17 @@ console.log('\nexplicit — operator multi-select');
     const r = ex([], [...LIVE_META, ...LIVE_PMAX_VIDEO]);
     eq('  explicit Meta+PMax video → 1 Meta master + 2 Google masters',
       r.videoFormats, [pf.META_VIDEO_MASTER, ...GOOGLE_VIDEO_MASTERS_EXPECTED]);
-    check('  that is exactly 3 billable video submits, not 7 ticks', r.videoFormats.length === 3);
+    // ⚠️ THIS IS A SURFACE COUNT, NOT A BILL. It says the resolver collapses
+    // 7 ticks down to 3 video surfaces — it does NOT say three Omni submits.
+    // How many of those three are billable is planDeterministicVideoAds's
+    // decision: under the shared 9:16 master (owner directive 2026-08-18) the
+    // mixed run bills TWO, because pmax_video_9_16 becomes a free derive of
+    // the Meta Stories plate while keeping its own surface and its own Ad row.
+    // Do NOT "fix" a 3-vs-2 discrepancy by deleting the PMax 9:16 surface
+    // here: isGoogleVideoMasterRun keys on its PRESENCE in this list, so
+    // removing it also stops pmax_video_1_1 being minted at all.
+    check('  that is exactly 3 video surfaces, not 7 ticks (billable count is the planner\'s job)',
+      r.videoFormats.length === 3);
     check('  and it still excludes the derive-only key',
       !r.videoFormats.includes('pmax_video_1_1'));
   }

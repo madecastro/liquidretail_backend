@@ -380,9 +380,25 @@ check('H1 mixed-run PMax funnel mint stays scoped to Google masters', () => {
     metaStaged.every((p) => p.deriveFromMaster === 'meta_stories_9_16' && p.billable === false),
     'a Meta funnel row in a mixed run is missing deriveFromMaster — that is the Omni path'
   );
+  // A PMax funnel row retitles the plate that was actually PAID FOR, which
+  // is NOT always its own format. Under the shared 9:16 master (owner
+  // directive 2026-08-18) the portrait family rides the Meta Stories plate,
+  // so pmax_video_9_16 staged rows carry deriveFromMaster='meta_stories_9_16'
+  // while pmax_video_16_9 still points at itself. Both are free; what this
+  // pins is that the target is a REAL master in the plan, never the row's
+  // own format by reflex — pointing a staged row at a format that is itself
+  // a derive is the "derivative of a derivative" hang.
+  const trueMasters = new Set(
+    mixed.filter((p) => !p.deriveFromMaster).map((p) => p.platformFormat)
+  );
   assert.ok(
-    pmaxStaged.every((p) => p.deriveFromMaster === p.platformFormat && p.billable === false),
-    'a PMax funnel row in a mixed run is missing same-format deriveFromMaster'
+    pmaxStaged.every((p) => p.billable === false),
+    'a PMax funnel row in a mixed run is marked billable'
+  );
+  assert.ok(
+    pmaxStaged.every((p) => trueMasters.has(p.deriveFromMaster)),
+    'a PMax funnel row derives from something that is not a paid master in this plan: '
+      + JSON.stringify(pmaxStaged.map((p) => `${p.platformFormat}<-${p.deriveFromMaster}`))
   );
   assert.ok(
     /GOOGLE_VIDEO_MASTER_SET\.has\(f\)/.test(SRC),
