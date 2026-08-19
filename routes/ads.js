@@ -2618,7 +2618,7 @@ async function renderOneInner(run, job, adId, index, renderToken) {
         // the existing poll tick). This outer label is the pre-enter marker
         // so a stall before the service even runs is still visible.
         adStage(adId, `master video generation (${ad.aspectRatio || '9:16'})`);
-        const veoResult = await veoGenerateForAd({ ad, storyboard });
+        const veoResult = await veoGenerateForAd({ ad, storyboard, campaignRunId: run.runId });
         if (veoResult.skipped) {
           // Previously re-queued forever with no reason on the Ad — the board
           // showed "rendering" until the reaper, and the next Generate billed
@@ -2820,6 +2820,62 @@ async function renderOneInner(run, job, adId, index, renderToken) {
       // .message, and a synchronous throw HERE would skip the CampaignRun/
       // Ad failure bookkeeping below, wedging the ad in 'rendering'.
       const vmsg = String((err && err.message) || err);
+
+      // ── UNSETTLED AT TIMEOUT — NOT a confirmed failure (2026-08-19) ──────
+      // atlasVideoService.pollPrediction sets err.unsettledAtTimeout when our
+      // poll budget ran out and a final free peek STILL could not confirm
+      // whether Atlas ever finished the job (incident run_1787119100250_eef4d871:
+      // two predictions still 'processing' 14-25+ min after submit — raising
+      // the poll budget would not have helped and would only have held a
+      // render slot longer). Money is already spent (veoPredictionId was
+      // stamped at the charge point before polling began), so this must NOT
+      // be marked 'failed' — that would sever the ad from
+      // services/bootRecoveryService's periodic sweep (worker.js recoverTick),
+      // which keys on status:'rendering' + a spend receipt. Leaving status
+      // untouched (it is still 'rendering' from the claim) keeps the receipt
+      // discoverable: the sweep will keep polling this same free GET until
+      // Atlas settles, then either collect the asset for $0 (recovered) or
+      // reconcile the ledger to a confirmed non-charge — never both write it
+      // off AND leave the estimate standing, which is what happened before.
+      // $inc skipped (not failed) on the run for the same reason the derive-
+      // wait path does: the outcome is deferred, not decided.
+      if (err.unsettledAtTimeout) {
+        alerts.notifyAsync({
+          level:  'warn',
+          title:  'Video master unsettled at poll timeout — awaiting reconciliation',
+          key:    `video-unsettled:${vmsg.slice(0, 60)}`,
+          fields: {
+            ad: String(adId), run: run.runId, brand: job.brandId,
+            predictionId: err.predictionId || null, error: vmsg.slice(0, 300)
+          }
+        });
+        await CampaignRun.updateOne(
+          { _id: run._id },
+          {
+            $inc:  { skipped: 1 },
+            $push: { errors: buildErrorEntry(creative, index, 'veo-unsettled', err) }
+          }
+        );
+        await Ad.updateOne(
+          { _id: adId, status: 'rendering' },
+          {
+            $set: {
+              // status intentionally NOT set — stays 'rendering' so the
+              // already-stamped veoPredictionId receipt stays visible to
+              // bootRecoveryService. Do not flip status to the failed value here.
+              renderStage:            `veo unsettled at timeout — awaiting reconciliation (pred=${err.predictionId || '?'})`.slice(0, 200),
+              renderStageAt:          new Date(),
+              'renderError.message':  vmsg,
+              'renderError.stage':    'veo-unsettled',
+              'renderError.at':       new Date(),
+              updatedAt:              new Date()
+            },
+            $inc: { renderAttempts: 1 }
+          }
+        );
+        return;
+      }
+
       alerts.notifyAsync({
         level:  'error',
         title:  'Video generation failed',

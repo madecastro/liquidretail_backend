@@ -157,29 +157,34 @@ checkTrue('N4 resumeForAd delegates to peekPrediction rather than its own reques
     /\{ _id: ad\._id, status: 'rendering' \}[\s\S]{0,200}status: 'draft'/.test(REC));
   checkTrue('O4 the failure write is status-filtered too',
     /\{ _id: ad\._id, status: 'rendering' \}[\s\S]{0,240}status: 'failed'/.test(REC));
-  // O5 REWRITTEN 2026-08-05, and the reason matters more than the check.
+  // O5 REWRITTEN AGAIN 2026-08-19 — the previous version of this check itself
+  // pinned a bug, and its own comment said why it would one day need to.
   //
-  // It used to assert the literal `'renderError.charged': true`, on the rationale
-  // that "a receipt means we were billed". Owner ruling (CLAUDE.md §2): a charge may
-  // NOT be assumed — a receipt proves a SUBMIT, and the authoritative figure is
-  // `price` on the settled prediction. Atlas refunds failed tasks, so receipt-implies-
-  // charged is not sound in general. The IMAGE path now derives the flag from a
-  // confirmed price (scripts/verifyImageResume.js section E).
+  // History: originally asserted the literal `'renderError.charged': true`
+  // ("a receipt means we were billed"). Rewritten 2026-08-05 to assert video
+  // was UNCONDITIONALLY charged=true via a hardcoded ternary, on the stated
+  // premise that "atlasVideoService.peekPrediction does not read price back,
+  // so there is nothing to confirm against". That premise stopped being true
+  // (peekPrediction's failed branch already spread confirmedCharge(data) into
+  // its return — the video path simply never consulted it), and CLAUDE.md §2
+  // measured 5/5 real failed video predictions carry NO price field, i.e. the
+  // hardcoded true permanently overstated spend on every recovered failure.
   //
-  // VIDEO is deliberately unchanged: atlasVideoService.peekPrediction does not read
-  // `price` back, so there is nothing to confirm against, and some video models bill
-  // on completion rather than submit — changing that is its own reviewed change.
-  //
-  // So this now asserts the INTENT (video still ledgers charged) via the derivation,
-  // which is strictly stronger than the old literal: it pins both that the write uses
-  // the derived flag AND that the non-image branch of that derivation is
-  // unconditionally true. A future edit that made video's charge conditional would
-  // fail here instead of silently changing video billing semantics.
-  checkTrue('O5 a resumed VIDEO failure is still ledgered as CHARGED, via the derived flag',
-    /'renderError\.charged':\s*confirmedCharge/.test(REC)
-    && /const confirmedCharge = isImage/.test(REC)
-    // the `: true` branch is the video side of the ternary
-    && /:\s*true;/.test(REC.slice(REC.indexOf('const confirmedCharge'))));
+  // Fixed 2026-08-19: the derivation is now `resolveRecoveredVideoFailureCharge`,
+  // a tri-state read of the SAME confirmed-price field the image path already
+  // uses — imported and called directly here rather than pattern-matched from
+  // source text, because the whole point is to catch a hardcoded regression
+  // that a text scan (as the O5 above was) cannot always tell from the
+  // real thing.
+  checkTrue('O5a resumed video failure derives confirmedCharge from the settled price, not a hardcoded true',
+    rec.resolveRecoveredVideoFailureCharge({ charged: false, priceUsd: 0 }).confirmedCharge === false);
+  checkTrue('O5b a confirmed-charged failure with a real settled price corrects the ledger to it',
+    JSON.stringify(rec.resolveRecoveredVideoFailureCharge({ charged: true, priceUsd: 0.9 }).reconcile) === JSON.stringify({ costUsd: 0.9 }));
+  checkTrue('O5c an UNKNOWN charge state never invents a correction (never guess)',
+    rec.resolveRecoveredVideoFailureCharge({ charged: null, priceUsd: null }).reconcile === null);
+  checkTrue('O5d the failure write reads its charged flag from the derivation, not a literal',
+    /const \{ confirmedCharge, reconcile \} = resolveRecoveredVideoFailureCharge\(r\)/.test(REC)
+    && /'renderError\.charged':\s*confirmedCharge/.test(REC));
   checkTrue('O6 the recovered master rests at draft (the reaper-safe money guard)',
     /status: 'draft'/.test(REC));
   // processing/unknown must be left alone — acting on ignorance writes off a

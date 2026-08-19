@@ -37,7 +37,11 @@
 
 const Ad = require('../models/Ad');
 const { HAS_RECEIPT } = require('./spendReceipt');
-const { resumeForAd } = require('./atlasVideoService');
+// reconcileVideoCostFromTerminal upgrades the video charge-point CostLog row
+// to a settled price the same way a normal (non-recovered) completion does —
+// imported, not re-implemented, so the two paths can never compute the charge
+// differently. See the recovered-master branch below.
+const { resumeForAd, reconcileVideoCostFromTerminal } = require('./atlasVideoService');
 // Static-image counterpart: recoverImageAd peeks (free GET), finishPlate (local
 // crop + logo), Cloudinary upload, optional vision QC. ZERO image submits.
 // See imageRecoveryService header for the money contract.
@@ -65,6 +69,39 @@ const RESUME_MAX_ADS   = Math.max(1, parseInt(process.env.RESUME_MAX_ADS, 10) ||
 
 function enabled() {
   return String(process.env.RESUME_IN_FLIGHT_ON_BOOT ?? 'true').toLowerCase() !== 'false';
+}
+
+/**
+ * Pure decision for a recovered VIDEO prediction that settled FAILED: what to
+ * write as the confirmed-charge flag, and whether the CostLog estimate needs
+ * correcting to the settled figure. Extracted so the money-relevant part is
+ * directly callable/testable (scripts/verifyVideoTimeoutReconcile.js) without
+ * a DB or a fake `resumeForAd` — mirrors atlasVideoService.resolveTimeoutOutcome
+ * / submitRetryDecision's role for other money decisions in this codebase.
+ *
+ * `r` is `resumeForAd`'s return shape for a failed peek: `{ charged, priceUsd,
+ * predictionId, message, ... }`, where `charged` is the SAME tri-state
+ * (true|false|null) atlasVideoService.confirmedCharge produces.
+ *
+ * @param {{charged?:*, priceUsd?:*, predictionId?:string}} r
+ * @returns {{confirmedCharge:boolean, reconcile:{costUsd:number}|null}}
+ */
+function resolveRecoveredVideoFailureCharge(r) {
+  const confirmedCharge = r?.charged === true;
+  if (r?.charged === false) return { confirmedCharge, reconcile: { costUsd: 0 } };
+  // `r.priceUsd != null` FIRST, deliberately, before the Number() coercion:
+  // Number(null) and Number(undefined -> NaN) do not agree, and a bare
+  // Number.isFinite(Number(r.priceUsd)) treats an ABSENT price the same as a
+  // confirmed $0 one (Number(null) === 0, which IS finite). charged:true with
+  // no usable price means "Atlas confirms this was billed but did not tell us
+  // how much" — that must leave the estimate standing, not zero it out.
+  if (r?.charged === true && r?.priceUsd != null && Number.isFinite(Number(r.priceUsd))) {
+    return { confirmedCharge, reconcile: { costUsd: Number(r.priceUsd) } };
+  }
+  // charged === null (unknown), or charged:true with no usable price — leave
+  // the ledger exactly as it is. Absence of evidence is not evidence of
+  // non-charge; do not zero or invent a correction.
+  return { confirmedCharge, reconcile: null };
 }
 
 /**
@@ -249,6 +286,17 @@ async function resumeInFlightAds({
           console.log(
             `   ✅ bootRecovery[${ad._id}]: master recovered from receipt ${r.predictionId} — queued for titling`
           );
+          // COST RECONCILE (2026-08-19). Recovering the asset used to leave the
+          // charge-point CostLog row exactly as it was written at submit —
+          // costSource:'estimated', status:'submitted' — forever. A recovered
+          // master IS a settled prediction (peekPrediction's done branch now
+          // reads `price` back, same as pollPrediction's own success path), so
+          // reconcile it the same way a normal completion would.
+          // reconcileVideoCostFromTerminal is itself fire-and-forget (it never
+          // returns a promise the caller must await) — matches every other
+          // reconcile call on this path: telemetry must never gate or delay the
+          // recovery write above, which has already happened.
+          reconcileVideoCostFromTerminal(r.predictionId, { price: r.price ?? null });
         }
       } catch (err) {
         console.warn(`   ⚠️  bootRecovery[${ad._id}]: recovered but could not persist — ${err.message}`);
@@ -259,25 +307,28 @@ async function resumeInFlightAds({
 
     if (r.state === 'failed') {
       try {
-        // VIDEO failure path only (static images are handled above via
-        // recoverImageAd and never reach here). isImage is always false on
-        // this branch — the ternary is kept so the video charge derivation
-        // stays explicit and pinned by verifyVideoResume O5.
+        // VIDEO failure path. Static receipts never reach this branch (handled
+        // in the image branch above via recoverImageAd).
         //
         // ── CHARGE: CONFIRMED, NOT ASSUMED (owner rule, CLAUDE.md §2) ────────
-        // VIDEO IS UNCHANGED ON PURPOSE. atlasVideoService.peekPrediction does
-        // not read `price` back, so there is nothing to confirm against; some
-        // video models also bill on completion rather than submit. Changing
-        // video's billing semantics is its own reviewed change.
-        //
-        // ⚠️ HONESTY GAP for images (now handled in the image branch above):
-        // models/Ad.js declares `renderError.charged` as Boolean default false,
-        // so "unknown" cannot be represented. Image path never claims true
-        // without Atlas publishing a positive price.
-        const isImage = false; // static receipts never reach this branch
-        const confirmedCharge = isImage
-          ? (r.priceConfirmed === true && Number(r.price) > 0)
-          : true;
+        // FIXED 2026-08-19 — this used to hardcode `confirmedCharge = true` for
+        // every video failure, with a comment claiming "peekPrediction does not
+        // read price back, so there is nothing to confirm against". That is no
+        // longer true (and measured 2026-08-10 in CLAUDE.md §2 that 5/5 FAILED
+        // video predictions carry NO price field — Atlas refunds a failed
+        // generation): peekPrediction's failed branch already spreads
+        // confirmedCharge(data) into its return, so `r.charged` /
+        // `r.priceUsd` are the SAME confirmed-price read the mid-poll branch
+        // uses, just never consulted here. The hardcoded `true` meant a
+        // recovered failed master permanently overstated spend by the full
+        // ~$0.90–1.20 estimate even when Atlas confirms it never billed.
+        // `r.charged` is a TRI-STATE (true|false|null) — null (unknown) leaves
+        // the ledger exactly as it was, matching the "unknown stays unknown"
+        // rule everywhere else in this file.
+        const { confirmedCharge, reconcile } = resolveRecoveredVideoFailureCharge(r);
+        if (reconcile) {
+          reconcileCost({ providerRequestId: r.predictionId, costUsd: reconcile.costUsd }).catch(() => {});
+        }
         await Ad.updateOne(
           { _id: ad._id, status: 'rendering' },
           { $set: {
@@ -337,4 +388,8 @@ async function resumeInFlightAds({
   return out;
 }
 
-module.exports = { resumeInFlightAds, RESUME_STALE_MIN, RESUME_MAX_ADS, enabled };
+module.exports = {
+  resumeInFlightAds, RESUME_STALE_MIN, RESUME_MAX_ADS, enabled,
+  // Money-decision pure function — scripts/verifyVideoTimeoutReconcile.js.
+  resolveRecoveredVideoFailureCharge
+};

@@ -43,7 +43,16 @@ const costLogSchema = new mongoose.Schema({
   // Linkage — so we can join cost back to the artifacts produced
   brandId:                       { type: mongoose.Schema.Types.ObjectId, ref: 'Brand',     index: true, default: null },
   campaignId:                    { type: mongoose.Schema.Types.ObjectId, ref: 'Campaign',  index: true, default: null },
-  campaignRunId:                 { type: mongoose.Schema.Types.ObjectId, ref: 'CampaignRun', index: true, default: null },
+  // STRING, not ObjectId — matches Ad.campaignRunIds ([String],
+  // models/Ad.js) and CampaignRun.runId (String, models/CampaignRun.js), the
+  // identifier every producer actually holds in memory (routes/ads.js's
+  // `run.runId`, `job.campaignRunId`, etc.). It was declared ObjectId
+  // (implying CampaignRun's own `_id`) from the start, which is almost
+  // certainly why every producer skipped writing it rather than resolving an
+  // extra doc per cost row: fixed 2026-08-19 after finding 0 non-null values
+  // across 24,817 existing rows (safe retype — no legacy ObjectId data to
+  // migrate or cast-fail on).
+  campaignRunId:                 { type: String, index: true, default: null },
   adId:                          { type: mongoose.Schema.Types.ObjectId, ref: 'Ad',        index: true, default: null },
   mediaId:                       { type: mongoose.Schema.Types.ObjectId, ref: 'Media',     index: true, default: null },
   productId:                     { type: mongoose.Schema.Types.ObjectId, ref: 'CatalogProduct', index: true, default: null },

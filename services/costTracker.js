@@ -417,12 +417,67 @@ function computeCost(model, usage, visionImages, groundedRequests) {
   };
 }
 
+/**
+ * TRUE cost for one CampaignRun, aggregated directly from CostLog instead of
+ * reconstructed from a time window (the only option before campaignRunId was
+ * populated at the write sites — see CLAUDE.md §2 / session.md 2026-08-19).
+ *
+ * Returns totals split by costSource so a caller can see how much of the
+ * figure is settled (`actual`) vs a pre-settlement estimate (`estimated`) —
+ * collapsing them into one number would hide exactly the gap this function
+ * exists to surface. `none` rows (rejections, refunded failures) are counted
+ * separately and contribute $0 to `totalUsd`.
+ *
+ * Coverage caveat, stated rather than hidden: only rows written AFTER the
+ * campaignRunId threading (2026-08-19) carry it. A run from before that date
+ * returns real but INCOMPLETE totals (whatever subset of its rows happen to
+ * have campaignRunId — normally none), not a false zero; there is no
+ * historical backfill here, since the run id was simply never recorded.
+ *
+ * @param {string} campaignRunId  CampaignRun.runId (the string id, e.g.
+ *   "run_1787119100250_eef4d871") — NOT a Mongo _id. Matches what every
+ *   producer already holds; see the CostLog.campaignRunId schema comment.
+ * @returns {Promise<{
+ *   campaignRunId: string, rows: number,
+ *   totalUsd: number, actualUsd: number, estimatedUsd: number,
+ *   byStage: Array<{stage:string, model:string, n:number, usd:number, costSource:string}>
+ * }>}
+ */
+async function costForRun(campaignRunId) {
+  const out = { campaignRunId, rows: 0, totalUsd: 0, actualUsd: 0, estimatedUsd: 0, byStage: [] };
+  if (!campaignRunId) return out;
+  const rows = await CostLog.find({ campaignRunId })
+    .select('stage model costUsd costSource status')
+    .lean();
+  out.rows = rows.length;
+  const byKey = new Map();
+  for (const r of rows) {
+    const usd = Number(r.costUsd) || 0;
+    out.totalUsd += usd;
+    if (r.costSource === 'actual') out.actualUsd += usd;
+    else if (r.costSource === 'estimated') out.estimatedUsd += usd;
+    const key = `${r.stage || 'unknown'}::${r.model || 'unknown'}::${r.costSource || 'unknown'}`;
+    const entry = byKey.get(key) || { stage: r.stage || 'unknown', model: r.model || 'unknown', costSource: r.costSource || 'unknown', n: 0, usd: 0 };
+    entry.n++;
+    entry.usd += usd;
+    byKey.set(key, entry);
+  }
+  out.totalUsd     = Number(out.totalUsd.toFixed(6));
+  out.actualUsd    = Number(out.actualUsd.toFixed(6));
+  out.estimatedUsd = Number(out.estimatedUsd.toFixed(6));
+  out.byStage = [...byKey.values()]
+    .map((e) => ({ ...e, usd: Number(e.usd.toFixed(6)) }))
+    .sort((a, b) => b.usd - a.usd);
+  return out;
+}
+
 module.exports = {
   trackLlmCall,
   recordCacheHit,
   recordFlatCost,
   finalizeFlatCost,
   reconcileCost,
+  costForRun,
   MODEL_RATES,
   VISION_IMAGE_COST_PER_IMAGE_USD,
   GROUNDED_SEARCH_COST_PER_REQUEST_USD

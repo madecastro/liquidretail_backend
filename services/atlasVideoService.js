@@ -3004,8 +3004,12 @@ async function peekPrediction(predictionId) {
     const url = Array.isArray(raw) ? raw[0] : raw;
     // Completed WITHOUT an output is the genuine "paid for nothing" case and is
     // classified as such rather than silently treated as still-running.
+    // `price` rides along (like pollPrediction's own done branch) so a caller
+    // recovering a master OUTSIDE the main poll loop — bootRecoveryService,
+    // the final-peek-at-deadline branch below — can reconcile the ledger from
+    // this same free GET instead of needing a second one.
     return url
-      ? { state: 'done', videoUrl: url }
+      ? { state: 'done', videoUrl: url, price: data.price ?? null }
       : { state: 'failed', message: 'completed with no output url', policy: 'completedNoOutput' };
   }
   if (TERMINAL_FAILURE_STATUSES.has(status)) {
@@ -3343,51 +3347,146 @@ async function pollPrediction(predictionId, { shouldCancel = null, adId = null, 
       return { url, price: data.price ?? null };
     }
     if (TERMINAL_FAILURE_STATUSES.has(status)) {
-      // Classify before throwing. The image path has routed failures through
-      // atlasErrorPolicy since it was written; this one never did, so a safety
-      // rejection surfaced to the operator as a bare "prediction failed" and
-      // read as a transient fault. Real example, 2026-08-04:
-      //   "Your input or generated content was blocked by safety review."
-      // A moderation block is deterministic — the same prompt and reference
-      // will be blocked again — so it must be NAMED, not retried behind
-      // generic prose. `label` is null for every other class, which keeps the
-      // provider's own wording for anything we have not classified.
-      const providerMsg = data.error || 'unknown';
-      const policy = classify({
-        predictionStatus: status,
-        msg: providerMsg,
-        nsfw: data.has_nsfw_contents ?? null
-      });
-      const heading = policy.label || 'atlasVideo: prediction failed';
-      const err = new Error(`${heading}: ${providerMsg} (id=${predictionId})`);
-      err.atlasPolicy = policy.name;
-      err.terminal    = policy.terminal;
-      // Carry the retry decision to the caller. A retry means a NEW billable
-      // submit, so it cannot be decided here (this function only polls) — but
-      // everything needed to decide it is known here and nowhere else.
-      // `chargeConfirmed` is read from Atlas's own settled record, not inferred
-      // from the policy: the policy says what SHOULD happen, the price says what
-      // DID. generateForAd requires both to agree before it spends again.
-      err.predictionId    = predictionId;
-      err.policyRetryable = policy.retryable === true;
-      err.policyMaxAttempts = policy.maxAttempts || 1;
-      // The policy owns the wait between attempts. Carried here because
-      // generateForAd is the only place that can act on it, and re-classifying
-      // there would rebuild the policy from an error shape it no longer has.
-      // `n` is 0-BASED, matching backoffFor's contract and the image path's
-      // call convention — generateForAd's loop is 1-based and converts.
-      err.policyBackoffFor = (n) => policy.backoffFor(n);
-      const charge = confirmedCharge(data);
-      err.chargeConfirmed = charge.charged;   // true | false | null(unknown)
-      err.chargePriceUsd  = charge.priceUsd;
-      throw err;
+      // Classify before throwing. See buildClassifiedFailureError for why.
+      throw buildClassifiedFailureError(predictionId, status, data);
     }
     const elapsedSec   = Math.round((Date.now() - t0) / 1000);
     const remainingSec = Math.round((MAX_POLL_MS - (Date.now() - t0)) / 1000);
     console.log(`🎬 atlasVideo: polling ${predictionId} — status=${status} (elapsed=${elapsedSec}s, remaining=${remainingSec}s, poll #${pollCount})`);
   }
+
+  // ── DEADLINE REACHED — one FINAL free peek before giving up ─────────────
+  //
+  // WHY (2026-08-19, incident run_1787119100250_eef4d871). The while loop above
+  // gates purely on OUR wall clock, not on Atlas's verdict — so a prediction
+  // that settles at t=601s while our budget is 600s used to be thrown away as
+  // an unclassified timeout, even though the very next GET would have told us
+  // the outcome. Doing that GET here (free, no submit) before surfacing an
+  // error costs nothing and can rescue a render, or — the more important half
+  // — tell the caller definitively whether Atlas has a confirmed verdict yet.
+  //
+  // Three outcomes, and only one of them is an ordinary "done, thrown, forget":
+  //   done      → return success. The deadline was a poll-budget artifact, not
+  //               a real failure; nothing about this render actually failed.
+  //   failed    → same classified error as the mid-loop branch (reuses
+  //               buildClassifiedFailureError so the retry gate in
+  //               generateForAd sees IDENTICAL fields regardless of which
+  //               branch produced them).
+  //   processing/unknown → Atlas genuinely has not told us what happened.
+  //               This is NOT a confirmed failure and must not be treated as
+  //               one: `err.unsettledAtTimeout = true` tells the caller to
+  //               keep the ad's spend receipt (Ad.veoPredictionId, already
+  //               stamped at the charge point) DISCOVERABLE rather than
+  //               writing it off — services/bootRecoveryService's periodic
+  //               sweep (worker.js recoverTick) will keep polling this same
+  //               free GET until Atlas settles, and either collect the asset
+  //               for $0 or reconcile the ledger to the confirmed non-charge.
+  //               mayRetryAfterFailure() already refuses to resubmit this
+  //               shape (policyRetryable is undefined), so this cannot reopen
+  //               the double-charge the charge-point receipt guards against.
+  const finalPeek = await peekPrediction(predictionId);
+  const outcome = resolveTimeoutOutcome(finalPeek, { predictionId, maxPollMs: MAX_POLL_MS, lastError });
+  if (outcome.action === 'success') {
+    const elapsedSec = Math.round((Date.now() - t0) / 1000);
+    console.log(
+      `🎬 atlasVideo: ${predictionId} settled at the deadline (${elapsedSec}s, final peek) — not a real timeout`
+    );
+    return { url: outcome.url, price: outcome.price };
+  }
+  throw outcome.error;
+}
+
+/**
+ * Pure decision for what to do once the poll deadline is reached AND a final
+ * free peek has come back. Extracted so the money-relevant branching (was
+ * this a real failure, or just our clock running out while Atlas kept
+ * working?) is unit-testable without mocking axios — mirrors
+ * submitRetryDecision's role for the submit-replay decision.
+ *
+ * @param {{state:string, videoUrl?:string, price?:*, message?:string, policy?:string, charged?:*, priceUsd?:*}} finalPeek
+ * @param {{predictionId:string, maxPollMs:number, lastError?:*}} ctx
+ * @returns {{action:'success', url:string, price:*} | {action:'throw', error:Error}}
+ */
+function resolveTimeoutOutcome(finalPeek, { predictionId, maxPollMs, lastError = null } = {}) {
+  if (finalPeek.state === 'done') {
+    return { action: 'success', url: finalPeek.videoUrl, price: finalPeek.price ?? null };
+  }
+  if (finalPeek.state === 'failed') {
+    // finalPeek came from peekPrediction, which classifies via the exact same
+    // atlasErrorPolicy.classify() + confirmedCharge() pair as the mid-poll
+    // branch — it already carries policy name + charge fields, just not in
+    // the err shape mayRetryAfterFailure expects, so build that shape
+    // directly from what peek computed rather than re-deriving from a
+    // synthetic "data" object.
+    const err = new Error(finalPeek.message || 'atlasVideo: prediction failed');
+    err.atlasPolicy       = finalPeek.policy || null;
+    err.terminal          = true;
+    err.predictionId      = predictionId;
+    err.policyRetryable   = false; // deadline already reached; never resubmit from this path
+    err.policyMaxAttempts = 1;
+    err.chargeConfirmed   = finalPeek.charged ?? null;
+    err.chargePriceUsd    = finalPeek.priceUsd ?? null;
+    return { action: 'throw', error: err };
+  }
+  // 'processing' or 'unknown' — Atlas genuinely has not told us the outcome.
+  // NOT a confirmed failure: err.unsettledAtTimeout marks it so the caller
+  // (routes/ads.js) keeps the ad's spend receipt discoverable instead of
+  // writing it off as failed. chargeConfirmed stays null (unknown), never
+  // false — absence of evidence is not evidence of non-charge.
   const tail = lastError ? ` Last error: ${lastError.status || 'network'} ${lastError.body || lastError.message}` : '';
-  throw new Error(`atlasVideo: prediction timed out after ${MAX_POLL_MS / 1000}s (id=${predictionId}).${tail}`);
+  const err = new Error(
+    `atlasVideo: prediction timed out after ${maxPollMs / 1000}s (id=${predictionId}) — ` +
+    `still unsettled at Atlas (${finalPeek.state}); receipt preserved for reconciliation.${tail}`
+  );
+  err.predictionId       = predictionId;
+  err.unsettledAtTimeout = true;
+  err.chargeConfirmed    = null;
+  return { action: 'throw', error: err };
+}
+
+/**
+ * Build the classified failure error for a TERMINAL failure status, shared by
+ * the mid-poll branch and the final-peek-at-deadline branch so both paths
+ * hand generateForAd's retry gate (mayRetryAfterFailure) an IDENTICAL error
+ * shape — a caller must not be able to tell which branch produced it.
+ */
+function buildClassifiedFailureError(predictionId, status, data) {
+  // A safety rejection surfaced to the operator as a bare "prediction failed"
+  // and read as a transient fault before this classified. Real example,
+  // 2026-08-04: "Your input or generated content was blocked by safety
+  // review." A moderation block is deterministic — the same prompt and
+  // reference will be blocked again — so it must be NAMED, not retried
+  // behind generic prose. `label` is null for every other class, which keeps
+  // the provider's own wording for anything we have not classified.
+  const providerMsg = data.error || 'unknown';
+  const policy = classify({
+    predictionStatus: status,
+    msg: providerMsg,
+    nsfw: data.has_nsfw_contents ?? null
+  });
+  const heading = policy.label || 'atlasVideo: prediction failed';
+  const err = new Error(`${heading}: ${providerMsg} (id=${predictionId})`);
+  err.atlasPolicy = policy.name;
+  err.terminal    = policy.terminal;
+  // Carry the retry decision to the caller. A retry means a NEW billable
+  // submit, so it cannot be decided here (this function only polls) — but
+  // everything needed to decide it is known here and nowhere else.
+  // `chargeConfirmed` is read from Atlas's own settled record, not inferred
+  // from the policy: the policy says what SHOULD happen, the price says what
+  // DID. generateForAd requires both to agree before it spends again.
+  err.predictionId    = predictionId;
+  err.policyRetryable = policy.retryable === true;
+  err.policyMaxAttempts = policy.maxAttempts || 1;
+  // The policy owns the wait between attempts. Carried here because
+  // generateForAd is the only place that can act on it, and re-classifying
+  // there would rebuild the policy from an error shape it no longer has.
+  // `n` is 0-BASED, matching backoffFor's contract and the image path's
+  // call convention — generateForAd's loop is 1-based and converts.
+  err.policyBackoffFor = (n) => policy.backoffFor(n);
+  const charge = confirmedCharge(data);
+  err.chargeConfirmed = charge.charged;   // true | false | null(unknown)
+  err.chargePriceUsd  = charge.priceUsd;
+  return err;
 }
 
 // ── Submission ────────────────────────────────────────────────────────
@@ -3720,7 +3819,15 @@ async function prepareStoryboard({ ad, operatorPrompt = null, modelOverride = nu
   return { storyboard: null, aspectRatio, model };
 }
 
-async function generateForAd({ ad, operatorPrompt = null, storyboard: precomputedStoryboard = null, modelOverride = null }) {
+async function generateForAd({
+  ad, operatorPrompt = null, storyboard: precomputedStoryboard = null, modelOverride = null,
+  // The string CampaignRun.runId driving THIS render pass — NOT read off
+  // ad.campaignRunIds (that array can hold several runs across an ad's
+  // life; the caller knows which one is spending money right now). Passed
+  // straight through to the charge-point CostLog row so spend is
+  // attributable per run instead of reconstructed from a time window.
+  campaignRunId = null
+}) {
   if (!enabled()) return { skipped: true, reason: 'VIDEO_PROVIDER != atlas or ATLAS_API_KEY missing' };
 
   const media = await Media.findById(ad.mediaId).lean();
@@ -4046,6 +4153,12 @@ async function generateForAd({ ad, operatorPrompt = null, storyboard: precompute
         purposeTag: caps.paramShape,
         brandId:    media.brandId || null,
         campaignId: ad.campaignId || null,
+        // Set at INSERT time only. finalizeFlatCost/reconcileCost below and in
+        // bootRecoveryService all UPDATE this same row keyed on
+        // providerRequestId, so campaignRunId does not need repeating there —
+        // it would be a no-op ($set only overwrites fields it's given, and none
+        // of those call sites pass this one).
+        campaignRunId: campaignRunId || null,
         adId:       ad._id || null,
         mediaId:    media._id || null,
         productId:  ad.productId || null,
@@ -4362,5 +4475,9 @@ module.exports = {
   // Resume-from-receipt. Exported for scripts/verifyVideoResume.js, which pins
   // that neither of these can ever submit.
   peekPrediction,
-  resumeForAd
+  resumeForAd,
+  // Timeout-vs-real-failure decision, and the shared failure-error builder —
+  // both offline-testable. scripts/verifyVideoTimeoutReconcile.js.
+  resolveTimeoutOutcome,
+  buildClassifiedFailureError
 };
