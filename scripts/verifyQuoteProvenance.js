@@ -49,6 +49,15 @@ const {
   resolveMeta, mergeCascades, buildContext, DEFAULT_META_CASCADES
 } = require('../services/metaCascadeResolver');
 
+// QUOTE_PROVENANCE_STRICT now defaults 'true' (2026-08-19, see
+// quoteProvenance.js header). Groups P1-P7 below test the PRINTABLE-ORIGIN /
+// BYLINE / RATING gates, not the noun-scope feature, and were written and
+// pinned against a flag-OFF ambient default — pin it explicitly here so
+// they stay byte-identical to their original intent regardless of which way
+// the default flips in future. P8 (below) opts into strict mode explicitly
+// via withStrictFlag wherever it needs to.
+process.env.QUOTE_PROVENANCE_STRICT = 'false';
+
 let pass = 0;
 const failures = [];
 function check(name, cond, detail) {
@@ -745,11 +754,17 @@ const GROUNDED = {
 // ── P8: QUOTE_PROVENANCE_STRICT — no wrong-product review quotes ─────
 // Live defect 2026-08-12: a Vuori media-driven ad (no CatalogProduct)
 // composited a bomber-jacket review over track-pants + sneakers, and
-// video titling quoted a fragment of the SAME review. Mechanism: brand-
-// pool fallback with no product-type noun check.
+// video titling quoted a fragment of the SAME review. Fixed flag-on, but
+// scoped "product-attached → identity", and flag defaulted OFF.
 //
-// Selection only — quote TEXT is never edited. Flag default false;
-// every check above ran with the flag unset and must stay green.
+// REOPENED + CLOSED 2026-08-19: an art-direction review of a real Vuori
+// PRODUCT-ATTACHED tee ad (run_1787119100250_eef4d871,
+// 6a6624fe5f5af85a46562e38) found the exact same bomber-jacket line cached
+// as that ad's primary_quote — reachable specifically BECAUSE it was
+// product-attached, the one case the 2026-08-12 fix exempted. Flag now
+// defaults 'true', and product-attached is noun-checked like everything
+// else (see quoteProvenance.js header for the full mechanism). Selection
+// only — quote TEXT is never edited.
 const {
   PRODUCT_NOUNS,
   QUOTE_SCOPE_MEDIA_SELECT,
@@ -793,8 +808,10 @@ const GENERIC_Q = {
 
 function withStrictFlag(on, fn) {
   const prev = process.env.QUOTE_PROVENANCE_STRICT;
-  if (on) process.env.QUOTE_PROVENANCE_STRICT = 'true';
-  else delete process.env.QUOTE_PROVENANCE_STRICT;
+  // EXPLICIT 'false', never delete — the flag now defaults true (2026-08-19),
+  // so deleting the var to mean "off" would flip to the new default and mean
+  // "on" instead. This helper must set what it means, not rely on absence.
+  process.env.QUOTE_PROVENANCE_STRICT = on ? 'true' : 'false';
   const restore = () => {
     if (prev === undefined) delete process.env.QUOTE_PROVENANCE_STRICT;
     else process.env.QUOTE_PROVENANCE_STRICT = prev;
@@ -825,8 +842,15 @@ for (const noun of [
 check('P8 PRODUCT_NOUNS does not list adjective short', !PRODUCT_NOUNS.includes('short'));
 check('P8 PRODUCT_NOUNS is frozen', Object.isFrozen(PRODUCT_NOUNS));
 
-// Flag default is off, and reading the env helper agrees.
-check('P8 flag defaults off', quoteProvenanceStrictEnabled() === false);
+// Flag default is ON (2026-08-19). This file pinned the env var 'false' at
+// the very top (to keep P1-P7 byte-identical); delete that override here to
+// observe the REAL default, then restore it immediately.
+{
+  const prev = process.env.QUOTE_PROVENANCE_STRICT;
+  delete process.env.QUOTE_PROVENANCE_STRICT;
+  check('P8 flag defaults ON', quoteProvenanceStrictEnabled() === true);
+  process.env.QUOTE_PROVENANCE_STRICT = prev;
+}
 check('P8 flag-off: the string "false" is off',
   withStrictFlag(false, () => {
     process.env.QUOTE_PROVENANCE_STRICT = 'false';
@@ -963,16 +987,46 @@ withStrictFlag(true, () => {
   });
   check('P8 pick next candidate: none pass → null', dropped === null);
 
-  // Owner 2026-08-12: product-attached keeps last-resort brand pool.
-  // Noun-scope does not run. Identity — same array, same objects.
+  // REVERSED 2026-08-19 (was: product-attached => identity, no noun-scope —
+  // that bypass is exactly what let a bomber-jacket brand quote survive
+  // onto a real Vuori TEE ad, which IS product-attached). Product-attached
+  // now noun-checks the SAME as media-driven, with productTitle folded into
+  // the allowed labels so a quote matching THIS product's own garment type
+  // still passes.
   const attachedPool = [BOMBER_Q, GENERIC_Q];
-  const attached = selectBrandQuotesForScope(attachedPool, {
+
+  // The product genuinely IS a jacket → the bomber line matches and stays.
+  const attachedMatch = selectBrandQuotesForScope(attachedPool, {
     productAttached: true, productTitle: 'Vuori Ripstop Bomber Jacket'
   });
-  check('P8 product-attached keeps the brand pool (last-resort, no noun-scope)',
-    attached === attachedPool && attached.length === 2 && attached[0] === BOMBER_Q);
+  check('P8 product-attached + matching garment title: bomber kept',
+    attachedMatch.length === 2 && attachedMatch[0] === BOMBER_Q);
+
+  // The product is a TEE (the real defect's shape) → the bomber line names
+  // a DIFFERENT garment than the product and must be dropped; the generic
+  // line survives (QUOTE_BRAND_TIER_FALLBACK's last-resort role intact).
+  const attachedMismatch = selectBrandQuotesForScope(attachedPool, {
+    productAttached: true, productTitle: 'Vuori Heavyweight Tee'
+  });
+  check('P8 [THE DEFECT] product-attached + mismatched garment title: bomber dropped',
+    attachedMismatch.length === 1 && attachedMismatch[0] === GENERIC_Q,
+    `got ${attachedMismatch.length} quote(s)`);
+
+  // No product title / labels at all on a product-attached call → a
+  // GENERIC quote (no garment noun) still passes; nothing to compare a
+  // garment-naming quote against, so it is conservatively dropped rather
+  // than guessed at.
+  check('P8 product-attached, no labels at all: generic still kept',
+    selectBrandQuotesForScope([GENERIC_Q], { productAttached: true }).length === 1);
+  check('P8 product-attached, no labels at all: bomber dropped (nothing to match against)',
+    selectBrandQuotesForScope([BOMBER_Q], { productAttached: true }).length === 0);
+
   check('P8 product-attached pick is the first brand-pool quote',
     pickScopedBrandQuote([GENERIC_Q], { productAttached: true }) === GENERIC_Q);
+  check('P8 product-attached pick rescues generic when the bomber mismatches',
+    pickScopedBrandQuote([BOMBER_Q, GENERIC_Q], {
+      productAttached: true, productTitle: 'Vuori Heavyweight Tee'
+    }) === GENERIC_Q);
 });
 
 // Render-time defence: buildIntentData + gateLayoutInputQuotes.
@@ -1020,6 +1074,21 @@ withStrictFlag(true, () => {
   });
   check('P8 static intent KEEPS a brand-tier quote when a product is attached (last-resort)',
     dAttached.quote === GENERIC_QUOTE, `got ${JSON.stringify(dAttached.quote)}`);
+
+  // THE REAL DEFECT, at the buildIntentData level: product-attached AND
+  // the cached primary_quote names a garment that is NOT this product.
+  // This is the exact live shape (a Vuori tee ad whose LayoutInputArtifact
+  // had cached the bomber-jacket line as primary_quote) — must not reach
+  // the prompt as this product's testimonial.
+  const dAttachedMismatch = direct.buildIntentData({
+    concept: { copy_picks: { headline: 'Move freely' } },
+    layoutInput: { social_proof: { primary_quote: BOMBER_Q } },
+    brand: {},
+    product: { _id: 'sku2', title: 'Vuori Heavyweight Tee' },
+    cta: 'SHOP NOW'
+  });
+  check('P8 [THE 2026-08-19 DEFECT] static intent DROPS a bomber quote on a product-attached TEE ad',
+    dAttachedMismatch.quote === undefined, `got ${JSON.stringify(dAttachedMismatch.quote)}`);
 
   // Next-candidate rescue: bomber primary, generic secondary. Media only.
   const dRescue = direct.buildIntentData({
@@ -1070,6 +1139,12 @@ withStrictFlag(true, () => {
   check('P8 video gate KEEPS a brand-tier quote when a product is attached (last-resort)',
     gatedAttached?.input?.social_proof?.primary_quote?.text === GENERIC_QUOTE);
 
+  const gatedAttachedMismatch = gateLayoutInputQuotes({
+    input: { social_proof: { primary_quote: BOMBER_Q } }
+  }, { productAttached: true, productTitle: 'Vuori Heavyweight Tee' });
+  check('P8 [THE 2026-08-19 DEFECT] video gate NULLS a bomber quote on a product-attached TEE ad',
+    gatedAttachedMismatch?.input?.social_proof?.primary_quote === null);
+
   const gatedRescue = gateLayoutInputQuotes({
     input: {
       social_proof: { primary_quote: BOMBER_Q, secondary_quotes: [GENERIC_Q] }
@@ -1117,12 +1192,14 @@ withStrictFlag(true, () => {
     path.join(__dirname, '../services/brandScriptExecutor.js'), 'utf8'
   );
 
-  check('P8-revert: selectBrandQuotesForScope is identity when productAttached',
-    /if\s*\(\s*opts\.productAttached\s*\)\s*return\s*list/.test(provSrc));
+  check('P8-revert [THE 2026-08-19 DEFECT]: selectBrandQuotesForScope has NO productAttached bypass',
+    !/if\s*\(\s*opts\.productAttached\s*\)\s*return\s*list/.test(provSrc));
   check('P8-revert: selectBrandQuotesForScope is gated on quoteProvenanceStrictEnabled',
     /function selectBrandQuotesForScope[\s\S]*?quoteProvenanceStrictEnabled/.test(provSrc));
-  check('P8-revert: applyStrictQuoteScope is identity when productAttached',
-    /if\s*\(\s*opts\.productAttached\s*\)\s*return\s*quote/.test(provSrc));
+  check('P8-revert [THE 2026-08-19 DEFECT]: applyStrictQuoteScope has NO productAttached bypass',
+    !/if\s*\(\s*opts\.productAttached\s*\)\s*return\s*quote/.test(provSrc));
+  check('P8-revert: quoteProvenanceStrictEnabled defaults true (not merely "true" opt-in)',
+    /quoteProvenanceStrictEnabled[\s\S]{0,40}return[\s\S]{0,80}\?\?\s*'true'/.test(provSrc));
   check('P8-revert: adjective short is not generated from shorts',
     /do not add 'short'/.test(provSrc) && !/n === 'pants' \|\| n === 'shorts'/.test(provSrc));
   check('P8-revert: layoutInputService calls selectBrandQuotesForScope',
@@ -1171,7 +1248,17 @@ withStrictFlag(true, () => {
   };
   const brokenEmptiesOnProduct = (quotes, opts) => {
     if (!quoteProvenanceStrictEnabled()) return quotes;
-    if (opts.productAttached) return []; // the rule the owner reversed
+    if (opts.productAttached) return []; // the rule the owner reversed 2026-08-12
+    return quotes.filter((q) => isBrandQuoteAllowedForSeed(q, opts));
+  };
+  // THE 2026-08-19 DEFECT ITSELF, reconstructed: the productAttached bypass
+  // that was just removed from selectBrandQuotesForScope/applyStrictQuoteScope.
+  // This is not a hypothetical — it is byte-for-byte what shipped between
+  // 2026-08-12 and 2026-08-19 and is exactly what let the bomber-jacket
+  // quote reach a real, product-attached Vuori tee ad.
+  const brokenProductAttachedBypass = (quotes, opts) => {
+    if (!quoteProvenanceStrictEnabled()) return quotes;
+    if (opts.productAttached) return quotes; // <- the removed bypass
     return quotes.filter((q) => isBrandQuoteAllowedForSeed(q, opts));
   };
   withStrictFlag(true, () => {
@@ -1184,10 +1271,23 @@ withStrictFlag(true, () => {
       }).length === 0);
 
     const emptied = brokenEmptiesOnProduct([GENERIC_Q], { productAttached: true });
-    check('P8-revert-prove product-attached: emptying the pool is the OLD (rejected) rule',
+    check('P8-revert-prove product-attached: emptying the pool is the OLD (2026-08-12, since reversed) rule',
       emptied.length === 0);
     check('P8-revert-prove product-attached: shipped selector KEEPS the last-resort pool',
       selectBrandQuotesForScope([GENERIC_Q], { productAttached: true }).length === 1);
+
+    // THE DEFECT THIS SESSION FIXED: a mismatched-garment quote on a
+    // product-attached ad. The bypass keeps it (broken); the shipped
+    // selector, noun-checked against the product's own title, drops it.
+    const bypassed = brokenProductAttachedBypass([BOMBER_Q], {
+      productAttached: true, productTitle: 'Vuori Heavyweight Tee'
+    });
+    check('P8-revert-prove [THE 2026-08-19 DEFECT]: the removed bypass KEEPS the bomber on a tee ad',
+      bypassed.length === 1 && bypassed[0] === BOMBER_Q);
+    check('P8-revert-prove [THE 2026-08-19 DEFECT]: the shipped selector REJECTS it',
+      selectBrandQuotesForScope([BOMBER_Q], {
+        productAttached: true, productTitle: 'Vuori Heavyweight Tee'
+      }).length === 0);
 
     check('P8-revert-prove adjective short: a matcher that listed short would fire',
       productNounsIn('short delivery time').length === 0);

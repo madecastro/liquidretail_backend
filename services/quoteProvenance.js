@@ -152,26 +152,57 @@ function isPrintableCustomerQuote(q) {
 }
 
 // ── QUOTE_PROVENANCE_STRICT ──────────────────────────────────────────
-// Selection-only. Never edits quote text. Flag-off (default) is a no-op
-// identity on every helper below so existing callers stay byte-identical.
+// Selection-only. Never edits quote text. Flag-off is a no-op identity on
+// every helper below, so a caller that never opts in stays byte-identical.
 //
 // Live defect (2026-08-12): a media-driven Vuori ad with no CatalogProduct
 // attached fell through to the brand review pool and printed a bomber-jacket
-// quote over a track-pants + sneakers scene. Product-attached ads have the
-// sibling hole: QUOTE_BRAND_TIER_FALLBACK can substitute a brand-pool line
-// when the SKU's own reviews are empty.
+// quote over a track-pants + sneakers scene. Fixed FLAG-ON at the time, but
+// scoped "product-attached → identity" (owner 2026-08-12: "helping vs
+// hurting, not provenance") — and DEFAULT OFF, so the whole mechanism was
+// dormant unless an operator opted in.
 //
-// Rules when the flag is on (owner 2026-08-12: STRICT is MEDIA-DRIVEN ONLY):
-//   1. Product attached → identity. Keep today's QUOTE_BRAND_TIER_FALLBACK
-//      last-resort ("helping vs hurting, not provenance"). Do NOT empty
-//      the brand pool and do NOT noun-check.
-//   2. No product (media-driven / brand ads — the canonical Vuori case)
+// ⚠️ REVERSED 2026-08-19 (art-direction review of run_1787119100250_eef4d871,
+// product 6a6624fe5f5af85a46562e38 — a Vuori tee with zero productReviews of
+// its own). Both scoping choices above turned out to be the SAME hole the
+// 2026-08-12 fix was written for, just reached through the door it left
+// open: this ad IS product-attached (CatalogProduct id set, `product._id`
+// present at render time), so `productAttached: true` bypassed the noun
+// check entirely and the LayoutInputArtifact's cached primary_quote was
+// left holding the bomber-jacket line verbatim (measured directly in Mongo).
+// It happened not to reach the delivered pixels on that run only because
+// `selectRotatedQuote`'s hash(campaignRunId) % pool.length landed on a
+// different, generic candidate for every one of the 18 statics — a lucky
+// modulus, not a guard. A different run id, product, or pool size rotates
+// the SAME contaminated pool onto the bomber line with no defence at all.
+// "Helping vs hurting" does not survive contact with a quote that names a
+// SPECIFIC OTHER garment: that is not weaker proof, it is proof about the
+// wrong item, exactly as damaging on a product ad as on a media-driven one.
+//
+// Rules, now DEFAULT ON:
+//   1. Product attached → noun-checked too, same as media-driven, with the
+//      product's own title/labels added to the allowed set (so a quote
+//      naming THIS product's own garment type — "tee"/"shirt" on a tee ad —
+//      still passes). QUOTE_BRAND_TIER_FALLBACK is unaffected: the brand
+//      tier still only wins last-resort, when product/category/comment are
+//      empty. This only narrows WHICH brand quotes are eligible in that
+//      last-resort slot, never whether the tier itself runs.
+//   2. No product (media-driven / brand ads — the original Vuori case)
 //      → a brand-pool quote that NAMES a product-type noun is kept only
 //      when that noun (singular or plural, case-insensitive) appears in
 //      the seed Media's detected product labels (or an explicit product
 //      title / extraText passed as label text). Else try the next
 //      candidate; if none pass, drop the quote.
-//   3. A quote that names no product-type noun is GENERIC and is kept.
+//   3. A quote that names no product-type noun is GENERIC and is kept —
+//      in both (1) and (2). A generic "I love this brand's quality" line
+//      is not attributed to any garment, so it cannot be attributed to the
+//      WRONG one; withholding it would be provenance theatre, not safety.
+//
+// Kill switch unchanged in shape, flipped in default: QUOTE_PROVENANCE_STRICT
+// (config/defaults.env) now defaults 'true'. Setting it 'false' restores the
+// pre-2026-08-19 identity on every helper below, including the
+// product-attached bypass — a full revert, no deploy needed beyond the env
+// value.
 
 const PRODUCT_NOUNS = Object.freeze([
   'jacket', 'hoodie', 'dress', 'pants', 'jogger', 'shirt', 'tee',
@@ -193,7 +224,7 @@ const NOUN_SYNONYM_GROUPS = Object.freeze([
 const QUOTE_SCOPE_MEDIA_SELECT = 'subjects refinedProducts primarySubjectLabel primarySubjectDesc classification';
 
 function quoteProvenanceStrictEnabled() {
-  return String(process.env.QUOTE_PROVENANCE_STRICT || 'false').toLowerCase() === 'true';
+  return String(process.env.QUOTE_PROVENANCE_STRICT ?? 'true').toLowerCase() !== 'false';
 }
 
 function escapeRe(s) {
@@ -378,15 +409,23 @@ function isBrandQuoteAllowedForSeed(quote, scope = {}) {
 
 /**
  * Brand-pool selector. Flag-off returns the input list unchanged (same
- * array reference when one was passed). Flag-on noun-filters ONLY when
- * no product is attached (media-driven / brand ads). Product-attached
- * ads keep the list as-is so QUOTE_BRAND_TIER_FALLBACK last-resort
- * still works. Never mutates quote objects.
+ * array reference when one was passed).
+ *
+ * Flag-on noun-filters EVERY caller, product-attached or not — reversed
+ * 2026-08-19, see the QUOTE_PROVENANCE_STRICT header above. A quote naming
+ * no product-type noun (GENERIC) always passes, on both branches, so
+ * QUOTE_BRAND_TIER_FALLBACK's last-resort role on a product ad is
+ * unaffected for the common case (a brand-wide compliment with no garment
+ * word). What is newly refused is a brand quote that names a DIFFERENT
+ * specific garment than the one this ad is for — `opts.productTitle`
+ * (already threaded by every caller of this function) is folded into the
+ * allowed label text precisely so a quote about THIS product's own
+ * garment type ("tee"/"shirt" on a tee ad) still passes; only a mismatch
+ * is dropped. Never mutates quote objects.
  */
 function selectBrandQuotesForScope(quotes, opts = {}) {
   const list = Array.isArray(quotes) ? quotes : [];
   if (!quoteProvenanceStrictEnabled()) return list;
-  if (opts.productAttached) return list;
   return list.filter((q) => isBrandQuoteAllowedForSeed(q, opts));
 }
 
@@ -397,19 +436,27 @@ function pickScopedBrandQuote(quotes, opts = {}) {
 
 /**
  * Render-time defence for a single already-chosen quote (cached
- * LayoutInputArtifact / Director copy). Flag-off returns `quote` as-is.
- * Product-attached: identity (last-resort brand fallback stays).
- * Media-driven: drops a brand-tier (or unstamped, treated as brand)
- * quote that fails the noun-scope rule; other tiers pass through.
+ * LayoutInputArtifact / Director copy, or a rotated pick). Flag-off
+ * returns `quote` as-is.
+ *
+ * Product-attached and media-driven are noun-checked THE SAME WAY as of
+ * 2026-08-19 (see the QUOTE_PROVENANCE_STRICT header) — this is the last
+ * gate before a quote reaches the prompt, so it is where the Vuori
+ * bomber-jacket line would have been caught had it reached this function
+ * (it did not, on the measured run, only because rotation never selected
+ * it — see the header). `opts.productTitle` folds the ad's own product
+ * into the allowed set, so a quote naming this product's own garment type
+ * still passes; only a genuinely different garment is dropped.
+ * Non-brand tiers (product/category/comment) pass through unconditionally —
+ * they are already scoped to this product or its media by construction.
  */
 function applyStrictQuoteScope(quote, opts = {}) {
   if (!quoteProvenanceStrictEnabled()) return quote;
   if (!quote) return quote;
-  // Product-attached: do not noun-check and do not drop a stamped
-  // brand-tier last-resort. Owner 2026-08-12: helping vs hurting.
-  if (opts.productAttached) return quote;
   const tier = quote.tier || null;
-  // Media-driven: noun-check brand-tier and unstamped (legacy brand-pool).
+  // Unstamped legacy rows are treated as brand-tier (the historically
+  // riskiest, least-scoped pool) and noun-checked; product/category/comment
+  // tiers are already scoped to this product or its media and pass through.
   if (tier && tier !== 'brand') return quote;
   return isBrandQuoteAllowedForSeed(quote, opts) ? quote : null;
 }
