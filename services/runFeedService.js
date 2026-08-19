@@ -236,7 +236,17 @@ function formatThreadLine(ev) {
   // Optional preview URL (e.g. Cloudinary render, app deep link). Only when
   // present so every existing caller of noteEvent/onStage is unchanged.
   if (meta.previewUrl) bits.push(String(meta.previewUrl));
-  return bits.join('  ');
+  const line = bits.join('  ');
+  // Full vision-QC detail block (adVisionQcService.buildQcSlackDetail) —
+  // verdict, per-category scores + findings, attempt trail/preview. Only
+  // noteQcPassToRunFeed/noteQcFailToRunFeed set this, so every other
+  // existing caller of noteEvent/onStage renders byte-identical to before.
+  // Owner request 2026-08-19: passes must be as visible as failures, not
+  // just a truncated summary — see noteQcPassToRunFeed's docstring for why
+  // this goes through the thread (unmetered) rather than alertQcAccepted
+  // (dead in prod — would exhaust ALERT_RATE_LIMIT_MAX at real ad volume).
+  if (meta.qcDetail) return `${line}\n${meta.qcDetail}`;
+  return line;
 }
 
 function buildParentText(state, live) {

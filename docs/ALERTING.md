@@ -866,6 +866,73 @@ verified via a dev-only fixture harness (`visionqc-harness.html` /
 `src/pages/Ads/__harness__/visionQc.tsx`, same pattern as the existing
 `badge-harness.html`) plus a clean `tsc -b --noEmit` and production build.
 
+### Video vision QC (2026-08-19, second follow-up) — the row above only covered statics
+
+The "Per-ad vision-QC category scores + findings" row was written for the
+STATIC path — `runPostRenderQc` had exactly one call site
+(`directImageRenderService.js`), so video ads always carried `visionQc: null`
+and read as "clean" to every surface in the row above. Closed the same day:
+`adVisionQcService.js` gained `runVideoPostRenderQc` / `judgeVideoRender` /
+`buildVideoVisionUserContent`, wired at `brandScriptExecutor.js`
+`uploadRenderAndStamp` (via `runVideoVisionQcForAd`) — the single choke point
+every video ad's `renderUrl` gets stamped through, for both titling engines
+(remotion + canvas) and the no-chrome skip path. Compares the seed product
+photo against 3 frames sampled from the delivered clip (quartile sampling —
+25/50/75% of `Ad.videoDurationSec`, via the previously-unused
+`videoFrameService.buildFrameUrls`, a Cloudinary `so_<sec>` edge transform —
+no ffmpeg, no local decode) in ONE vision call, using the SAME 4 category
+keys, model, and `PASS_FLOOR` as static QC. Because the shape is identical,
+`summarizeVisionQc` / `projectAd()` / the gallery pill / the run-level
+rollup above need **zero** video-specific code — they already read whatever
+lands on `Ad.visionQc`, image or video.
+
+**Deliberately never regenerates and never fails the ad.** A static regen
+costs ~$0.07 and a corrective prompt can plausibly fix an invented mark; a
+video master costs ~$0.90 and the defect classes this exists to catch
+(hallucinated colourway, garbled on-product branding) are generated INTO
+the clip by the video model — there is no cheap corrective-prompt
+equivalent, and a second $0.90 submit on the same seed is not a reliable
+fix. So `runVideoPostRenderQc.ok` is always `true`: it stamps a failed
+verdict and the ad ships as a normal `draft` (status untouched) so an
+operator sees the FAIL badge before sending that ad to a platform, instead
+of the paid master being silently discarded.
+
+**Verified against a real shipped defect, not a synthetic one.** Run
+`run_1787136860887_654ed621` (Vuori Bone Denim jacket) delivered a video
+rendering the jacket as light-blue denim with a garbled woven neck label —
+`judgeVideoRender` scored it `product_fidelity=0` ("colourway is incorrect
+in all sampled video frames... off-white/cream [vs] light-wash blue denim")
+and `competitor_marks=2` (an invented woven label "absent from the original
+product"). A known-good Allbirds video (correct colourway, correct
+`allbirds` heel wordmark) passed as the negative control
+(`10/10/7/10`, the `7` being a real, legitimate finding — a hard-to-read
+heel wordmark at one frame — not a false positive). Both live calls
+together cost **$0.0475** (`CostLog`, `costSource:'estimated'`, same
+convention as the static path's cost accounting).
+
+Also, per owner request the same day ("I want to see the [vision QC] output
+even if it is approved so I can see what it is looking for and what it
+observes"): `noteQcPassToRunFeed`/`noteQcFailToRunFeed` now attach the full
+`buildQcSlackDetail` block (verdict, per-category scores + findings, single
+clean preview line for a one-attempt verdict) to the run-feed Slack thread
+on BOTH outcomes, not just a truncated summary on pass. Deliberately still
+NOT routed through `alertQcAccepted`/`alertService` — that path is dead in
+production on purpose (see its own docstring): at real ad volume a
+warn-level accept alert per ad would exhaust `ALERT_RATE_LIMIT_MAX` and
+silently drop genuine error/fatal alerts. The run-feed thread
+(`runFeedService.noteEvent`) has its own separate, unmetered transport (own
+bounded ring buffer, own batched Slack posts, no `alertService` dependency
+at all — confirmed structurally, not assumed) so this sidesteps that limit
+entirely.
+
+Pinned by 20 new checks in `scripts/verifyAdVisionQc.js` (extended, not
+duplicated — sections O and P), covering: image order/labelling, the
+never-fails/never-regenerates contract, judge-throw and disabled-flag
+handling, `mediaLabel` title parametrization (`"Static ad"` default
+preserved byte-for-byte, `"Video ad"` for the new path), the
+`videoFrameService.buildFrameUrls` quartile-sampling assumption this relies
+on, and the new run-feed `qcDetail` wiring on both outcomes.
+
 ### Follow-up (2026-08-19): the Director contract-warning gap, closed
 
 `services/aiCreativeDirectorService.js` `directConceptsRound` now returns

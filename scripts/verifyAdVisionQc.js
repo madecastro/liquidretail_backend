@@ -990,6 +990,277 @@ check('B4 judgeRender payload carries visionImages:2 meta (ledger)', async () =>
     assert.match(detail, /https:\/\/app\.example\/ads\?campaignRunId=r1/);
   });
 
+  // ── O. VIDEO post-render vision QC ─────────────────────────────────
+  // Closes the gap where the video pipeline shipped with ZERO vision
+  // inspection while statics were protected — see adVisionQcService.js's
+  // file-header CONTRACT block. Revert: dropping the seed-vs-frames
+  // comparison fails O1; letting a FAIL verdict flip result.ok to false
+  // (the static path's "fail the ad" contract) fails O3 — video must
+  // ALWAYS flag, never fail (master already paid for; see
+  // runVideoPostRenderQc's docstring for the full money reasoning).
+  const SAMPLE_FRAMES = [
+    { timestampSec: 2.5, url: 'https://res.cloudinary.com/x/video/upload/so_2.5,f_jpg/v1/a.jpg' },
+    { timestampSec: 5.0, url: 'https://res.cloudinary.com/x/video/upload/so_5.0,f_jpg/v1/a.jpg' },
+    { timestampSec: 7.5, url: 'https://res.cloudinary.com/x/video/upload/so_7.5,f_jpg/v1/a.jpg' }
+  ];
+
+  check('O1 buildVideoVisionUserContent: seed first, N frames in order, correctly labelled', () => {
+    const content = qc.buildVideoVisionUserContent({
+      originalProductUrl: 'https://cdn.example/seed.jpg',
+      frames: SAMPLE_FRAMES,
+      brandName: 'Vuori'
+    });
+    const imageParts = content.filter((c) => c.type === 'image_url');
+    assert.strictEqual(imageParts.length, 4, 'expected seed + 3 frames');
+    assert.strictEqual(imageParts[0].image_url.url, 'https://cdn.example/seed.jpg');
+    assert.strictEqual(imageParts[1].image_url.url, SAMPLE_FRAMES[0].url);
+    assert.strictEqual(imageParts[3].image_url.url, SAMPLE_FRAMES[2].url);
+    const labels = content.filter((c) => c.type === 'text').map((c) => c.text);
+    assert.ok(labels.some((t) => /ORIGINAL PRODUCT PHOTO/.test(t)));
+    assert.ok(labels.some((t) => /VIDEO FRAME @ t=2\.5s/.test(t)));
+    assert.ok(labels.some((t) => /VIDEO FRAME @ t=7\.5s/.test(t)));
+  });
+
+  check('O1b buildVideoVisionUserContent requires originalProductUrl and frames', () => {
+    assert.throws(() => qc.buildVideoVisionUserContent({ frames: SAMPLE_FRAMES }), /originalProductUrl/);
+    assert.throws(() => qc.buildVideoVisionUserContent({ originalProductUrl: 'x', frames: [] }), /frames/);
+  });
+
+  check('O2 buildVideoVisionUserContent scopes text_defects to product-intrinsic text only', () => {
+    const content = qc.buildVideoVisionUserContent({
+      originalProductUrl: 'https://cdn.example/seed.jpg', frames: SAMPLE_FRAMES, brandName: 'Vuori'
+    });
+    const prompt = content[0].text;
+    assert.match(prompt, /NOT the ad's caption overlay/i);
+    assert.match(prompt, /OUT OF SCOPE/);
+  });
+
+  await checkAsync('O3 video FAIL verdict is flagged, NEVER signalled as "fail the ad" (ok stays true)', async () => {
+    const result = await qc.runVideoPostRenderQc({
+      enabled: true,
+      originalProductUrl: 'https://cdn.example/seed.jpg',
+      frames: SAMPLE_FRAMES,
+      brandName: 'Vuori',
+      deliveredUrl: 'https://cdn.example/delivered.mp4',
+      judgeFn: async () => FAIL_VERDICT
+    });
+    assert.strictEqual(result.ok, true, 'video QC must never signal "fail the ad" — the master is already paid for');
+    assert.strictEqual(result.skipped, false);
+    assert.strictEqual(result.passed, false);
+    assert.strictEqual(result.visionQc.passed, false);
+    assert.strictEqual(result.visionQc.finalAttempt, 1, 'video QC never regenerates — exactly one attempt');
+    assert.strictEqual(result.visionQc.attempts.length, 1);
+    assert.strictEqual(result.visionQc.attempts[0].renderUrl, 'https://cdn.example/delivered.mp4');
+  });
+
+  await checkAsync('O4 video PASS verdict', async () => {
+    const result = await qc.runVideoPostRenderQc({
+      enabled: true,
+      originalProductUrl: 'https://cdn.example/seed.jpg',
+      frames: SAMPLE_FRAMES,
+      judgeFn: async () => PASS_VERDICT
+    });
+    assert.strictEqual(result.ok, true);
+    assert.strictEqual(result.passed, true);
+    assert.strictEqual(result.visionQc.passed, true);
+  });
+
+  await checkAsync('O5 video QC never regenerates even after a fail — no generate()/re-render hook exists to call', async () => {
+    let judgeCalls = 0;
+    const result = await qc.runVideoPostRenderQc({
+      enabled: true,
+      originalProductUrl: 'https://cdn.example/seed.jpg',
+      frames: SAMPLE_FRAMES,
+      judgeFn: async () => { judgeCalls += 1; return FAIL_VERDICT; }
+    });
+    assert.strictEqual(judgeCalls, 1, 'exactly one vision call — video QC has no regeneration budget to spend');
+    assert.strictEqual(result.visionQc.maxRegenerations, 1, 'buildPersistedVerdict shape unchanged (shared with static)');
+  });
+
+  await checkAsync('O6 video judge throw ships uninspected, does not fabricate a verdict', async () => {
+    const result = await qc.runVideoPostRenderQc({
+      enabled: true,
+      originalProductUrl: 'https://cdn.example/seed.jpg',
+      frames: SAMPLE_FRAMES,
+      judgeFn: async () => { throw new Error('atlas vision timeout'); }
+    });
+    assert.strictEqual(result.ok, true);
+    assert.strictEqual(result.skipped, true);
+    assert.strictEqual(result.uninspected, true);
+    assert.match(String(result.visionQc.reason || ''), /atlas vision timeout/);
+  });
+
+  await checkAsync('O7 video QC disabled does not call judge and does not claim passed:true', async () => {
+    let judgeCalls = 0;
+    const result = await qc.runVideoPostRenderQc({
+      enabled: false,
+      originalProductUrl: 'https://cdn.example/seed.jpg',
+      frames: SAMPLE_FRAMES,
+      judgeFn: async () => { judgeCalls += 1; return PASS_VERDICT; }
+    });
+    assert.strictEqual(judgeCalls, 0);
+    assert.strictEqual(result.skipped, true);
+    assert.strictEqual(result.visionQc.disabled, true);
+    assert.strictEqual(result.visionQc.passed, false);
+  });
+
+  await checkAsync('O8 video QC with no originalProductUrl skips rather than inventing a comparison', async () => {
+    const result = await qc.runVideoPostRenderQc({
+      enabled: true, originalProductUrl: null, frames: SAMPLE_FRAMES,
+      judgeFn: async () => PASS_VERDICT
+    });
+    assert.strictEqual(result.skipped, true);
+    assert.match(String(result.visionQc.reason || ''), /original product URL/);
+  });
+
+  await checkAsync('O9 video QC with no sampleable frames skips (e.g. non-Cloudinary source)', async () => {
+    const result = await qc.runVideoPostRenderQc({
+      enabled: true, originalProductUrl: 'https://cdn.example/seed.jpg', frames: [],
+      judgeFn: async () => PASS_VERDICT
+    });
+    assert.strictEqual(result.skipped, true);
+    assert.match(String(result.visionQc.reason || ''), /frames/);
+  });
+
+  check('O10 video QC prompt uses the SAME 4 CATEGORIES keys as static (Ad.visionQc / summarizeVisionQc / gallery UI need no video-specific branch)', () => {
+    const content = qc.buildVideoVisionUserContent({
+      originalProductUrl: 'https://cdn.example/seed.jpg', frames: SAMPLE_FRAMES
+    });
+    for (const key of qc.CATEGORIES) {
+      assert.ok(content[0].text.includes(key), `category ${key} missing from video prompt — surfacing would break`);
+    }
+  });
+
+  check('O11 video alerts/titles are labelled "Video ad", not silently reusing "Static ad" copy', () => {
+    const captured = fakeNotify(() => qc.alertQcFailure({
+      adId: 'vidAd1',
+      visionQc: qc.buildPersistedVerdict({
+        passed: false, finalAttempt: 1,
+        attempts: [{ attempt: 1, pass: false, categories: FAIL_VERDICT.categories, findings: FAIL_VERDICT.findings, summary: FAIL_VERDICT.summary }]
+      }),
+      mediaLabel: 'Video ad'
+    }));
+    assert.match(captured.title, /^Video ad failed vision QC/);
+  });
+
+  check('O12 static alert titles stay byte-identical to before mediaLabel existed (default arg, back-compat)', () => {
+    const captured = fakeNotify(() => qc.alertQcFailure({
+      adId: 'statAd1',
+      visionQc: qc.buildPersistedVerdict({
+        passed: false, finalAttempt: 1,
+        attempts: [{ attempt: 1, pass: false, categories: FAIL_VERDICT.categories, findings: FAIL_VERDICT.findings, summary: FAIL_VERDICT.summary }]
+      })
+    }));
+    assert.strictEqual(captured.title, 'Static ad failed vision QC (no regeneration)');
+  });
+
+  check('O13 videoFrameService.buildFrameUrls: quartile sampling for an 8-10s ad; empty for a non-Cloudinary source', () => {
+    // Anchors the sampling strategy documented in brandScriptExecutor.js's
+    // runVideoVisionQcForAd: reused (not reinvented) quartile sampling,
+    // verified 2026-08-19 to catch a real defect at all three quartiles on
+    // a delivered ad (run run_1787136860887_654ed621).
+    const videoFrameService = require('../services/videoFrameService');
+    const frames = videoFrameService.buildFrameUrls('https://res.cloudinary.com/x/video/upload/v1/a.mp4', 10);
+    assert.strictEqual(frames.length, 3, 'expected quartile sampling (25/50/75%) for a short clip');
+    assert.deepStrictEqual(frames.map((f) => f.timestampSec), [2.5, 5, 7.5]);
+    const none = videoFrameService.buildFrameUrls('https://example.com/not-cloudinary.mp4', 10);
+    assert.strictEqual(none.length, 0, 'non-Cloudinary source must yield zero frames, not a broken URL');
+  });
+
+  // ── P. Verbose PASS output → run-feed thread (owner request 2026-08-19:
+  // "I want to see the output even if it is approved so I can see what it
+  // is looking for and what it observes.") ───────────────────────────
+  // Revert: noteQcPassToRunFeed dropping qcDetail fails P1; formatThreadLine
+  // ignoring meta.qcDetail fails P3; routing passes through
+  // alertQcAccepted/alertService instead of the thread fails H1/H1b (above,
+  // unchanged) AND P5/P6 here.
+  const fakeNoteEvent = (fn) => {
+    const runFeed = require('../services/runFeedService');
+    const original = runFeed.noteEvent;
+    let captured = null;
+    runFeed.noteEvent = (runId, stage, meta) => { captured = { runId, stage, meta }; };
+    try { fn(); } finally { runFeed.noteEvent = original; }
+    return captured;
+  };
+
+  check('P1 noteQcPassToRunFeed sends the FULL category detail, not just a truncated summary', () => {
+    const verdict = qc.buildPersistedVerdict({
+      passed: true, finalAttempt: 1,
+      attempts: [{
+        attempt: 1, pass: true,
+        categories: {
+          competitor_marks: { score: 9, pass: true, findings: [] },
+          product_fidelity: { score: 9, pass: true, findings: ['minor colour shift'] },
+          text_defects: { score: 10, pass: true, findings: [] },
+          layout_safe_box: { score: 10, pass: true, findings: [] }
+        },
+        summary: 'clean', renderUrl: 'https://cdn.example/pass.mp4'
+      }]
+    });
+    const captured = fakeNoteEvent(() => qc.noteQcPassToRunFeed({
+      campaignRunId: 'run1', adId: 'ad1', visionQc: verdict
+    }));
+    assert.ok(captured, 'noteEvent was not called');
+    assert.ok(captured.meta.qcDetail, 'qcDetail missing — pass path is still summary-only');
+    assert.ok(captured.meta.qcDetail.includes('minor colour shift'), 'per-category finding missing from pass detail');
+    assert.ok(captured.meta.qcDetail.includes('product_fidelity'), 'category breakdown missing from pass detail');
+    assert.match(captured.meta.qcDetail, /VERDICT: PASS/);
+  });
+
+  check('P2 noteQcFailToRunFeed also carries the full qcDetail block (thread is a complete audit trail either way)', () => {
+    const verdict = qc.buildPersistedVerdict({
+      passed: false, finalAttempt: 1,
+      attempts: [{ attempt: 1, pass: false, categories: FAIL_VERDICT.categories, findings: FAIL_VERDICT.findings, summary: FAIL_VERDICT.summary, renderUrl: 'https://cdn.example/fail.mp4' }]
+    });
+    const captured = fakeNoteEvent(() => qc.noteQcFailToRunFeed({
+      campaignRunId: 'run1', adId: 'ad2', visionQc: verdict
+    }));
+    assert.ok(captured.meta.qcDetail.includes('competitor_marks'));
+    assert.match(captured.meta.qcDetail, /VERDICT: FAIL/);
+  });
+
+  check('P3 formatThreadLine appends meta.qcDetail as a block after the one-line summary', () => {
+    const runFeed = require('../services/runFeedService');
+    const line = runFeed.formatThreadLine({
+      t: Date.now(), stage: 'vision QC pass', adId: 'aaaaaaaaaaaaaaaaaaaaaaaa',
+      meta: { summary: 'clean', attempt: 1, qcDetail: 'VERDICT: PASS\nproduct_fidelity: 9/10' }
+    });
+    assert.match(line, /attempt=1/);
+    assert.match(line, /VERDICT: PASS/);
+    assert.match(line, /product_fidelity: 9\/10/);
+  });
+
+  check('P4 formatThreadLine is byte-identical when qcDetail is absent (every non-QC caller of noteEvent/onStage unchanged)', () => {
+    const runFeed = require('../services/runFeedService');
+    const line = runFeed.formatThreadLine({
+      t: Date.now(), stage: 'static image generation', adId: 'bbbbbbbbbbbbbbbbbbbbbbbb',
+      meta: { template: 'ai_brand_led', aspectRatio: '1:1' }
+    });
+    assert.ok(!line.includes('\n'), 'a non-QC event must stay single-line');
+  });
+
+  check('P5 noteQcPassToRunFeed does NOT route through alertService even with qcDetail added (rate-limit safe)', () => {
+    const qcSrc = fs.readFileSync(
+      path.join(__dirname, '..', 'services', 'adVisionQcService.js'), 'utf8'
+    );
+    const m = qcSrc.match(/function noteQcPassToRunFeed\([\s\S]*?\n\}/);
+    assert.ok(m, 'noteQcPassToRunFeed not found');
+    assert.ok(!/alertService|notifyAsync|alertQcAccepted/.test(m[0]),
+      'noteQcPassToRunFeed must not touch alertService even with the verbose detail added');
+  });
+
+  check('P6 runFeedService does not require alertService at all — the "thread is unmetered" claim is structural, not assumed', () => {
+    const runFeedSrc = fs.readFileSync(
+      path.join(__dirname, '..', 'services', 'runFeedService.js'), 'utf8'
+    );
+    assert.ok(!/require\(['"]\.\/alertService['"]\)/.test(runFeedSrc),
+      'runFeedService requiring alertService would put the "unmetered thread" claim at risk');
+    // Own, separate rate-limit surface: Slack HTTP 429 handling only
+    // (drop-this-flush, never sleep) — no shared counter with alertService.
+    assert.ok(!/withinRateLimit|rateLimitState|lastSentAt/.test(runFeedSrc),
+      "runFeedService must not reuse alertService's rate-limit primitives");
+  });
+
   // ── report ─────────────────────────────────────────────────────────
   if (failures.length) {
     console.error(`❌ verifyAdVisionQc: ${failures.length} FAILED, ${pass} passed\n`);

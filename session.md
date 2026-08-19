@@ -68,31 +68,44 @@ it clears it back to this placeholder in the same commit that closes it out.)_
 
 *(Replace this whole section, don't append to it, when it goes stale.)*
 
-- Trunk `main` is moving fast — 36+ merges in the last day; always `git fetch` before
-  trusting a SHA here. As of this restructuring landing, `main` was at `3ac2ca85`
-  — **#235 and #236 merged while this change was in flight** (confirming the
-  problem this restructuring exists to fix: #236's own squash-merge included a
-  `session.md` append, which is exactly what conflicted this branch on rebase —
-  see `session.d/2026-08-19_vision-qc-surfacing-closed-last-gap-table-row.md`,
-  archived here rather than lost).
-- Open PRs at the time of this change: **#227** (backend), **#59** (frontend
-  `liquidretail`, companion to #236), plus RPD **#210/#212** (deliberately
-  deferred — do not touch).
+- Trunk `main` is moving fast — always `git fetch` before trusting a SHA here.
+  As of this update, `main` was at `dcca06cb` (the session.md → session.d/
+  restructure itself). **#235, #236, #238 merged** since the previous snapshot
+  below.
+- Open PRs at the time of this update: **#227** (backend, undispatched-tail
+  fix in progress — do not block it), plus RPD **#210/#212** (deliberately
+  deferred — do not touch). New this session: `fix/video-vision-qc` (video
+  post-render vision QC — see `session.d/2026-08-19_video-vision-qc.md`).
 - Offline verify: `for f in scripts/verify*.js; do node "$f" || echo "FAIL $f"; done`
-  (168 scripts as of this change — re-count before quoting, this number has drifted
-  before). `npm run lint` enables exactly one rule, `no-undef` — see `CLAUDE.md` §5
-  for why that one rule matters more than it looks like it should.
-- Known environmental-only failures from a `git worktree` checkout (not a real
-  regression, do not "fix"): `verifyLogoSilhouette.js`, `verifyLogoColorPreservation.js`,
-  `verifyStaticTextInk.js` all `require('node_modules/sharp')`, which no worktree
-  vendors. macOS has no `timeout` binary — a loop that wraps each script in `timeout`
-  will misreport all of them as failed.
+  — **160 scripts** as of this update (re-count before quoting, this number
+  drifts). `npm run lint` enables exactly one rule, `no-undef` — see
+  `CLAUDE.md` §5 for why that one rule matters more than it looks like it
+  should.
+- **Correction to a prior note below**: `verifyLogoSilhouette.js`,
+  `verifyLogoColorPreservation.js`, `verifyStaticTextInk.js` failing in a
+  fresh `git worktree` checkout (all three `require(path.join(__dirname,
+  '..','node_modules','sharp'))`, which `NODE_PATH` cannot rescue — it's a
+  literal path join, not a bare `require`) is **not permanently
+  environmental** — it means that worktree's vendored `node_modules/sharp`
+  is missing its native `@img/sharp-<platform>` + `detect-libc` deps (a
+  `git worktree add` artifact, not a code issue). Verified 2026-08-19:
+  `npm install sharp --no-save --ignore-scripts` from inside the worktree
+  repairs it cleanly (also incidentally pulled in `https-proxy-agent` and
+  `ffmpeg-static`, separately missing in that same worktree) — all three
+  scripts then pass for real. `--no-save` leaves the top-level
+  `package.json`/`package-lock.json` untouched; only
+  `node_modules/.package-lock.json` (npm's own in-tree bookkeeping file,
+  already git-tracked in this repo) shows a diff afterward — do not commit
+  that file, it is a local environment repair, not a source change. macOS
+  still has no `timeout` binary — a loop that wraps each script in `timeout`
+  will misreport all of them as failed regardless of the above.
 - Most recent entries (see `session.d/`, newest by filename date):
+  `2026-08-19_video-vision-qc.md` (video ads now get the same post-render
+  vision QC statics have; `fix/video-vision-qc`),
   `2026-08-19_vision-qc-surfacing-closed-last-gap-table-row.md` (PR #236, merged),
   `2026-08-19_ad-readiness-gate-counted-only-the-legacy-apify-shopify-ingest-source.md`,
   `2026-08-19_two-omni-masters-timed-out-run_1787119100250_eef4d871-the-real-defect.md`,
-  `2026-08-19_run-status-stopped-lying-gap-table-vs-slack-and-the-partial-failure-bu.md`,
-  `2026-08-19_last-direct-gemini-path-swept-grounding-proven-unavailable-on-atlas-un.md`.
+  `2026-08-19_run-status-stopped-lying-gap-table-vs-slack-and-the-partial-failure-bu.md`.
 
 ## KNOWN-OPEN
 

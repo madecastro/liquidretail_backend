@@ -1404,10 +1404,148 @@ function resolveTitlingEngine(brand, ad) {
   */
 }
 
+// ── Post-render VIDEO vision QC ───────────────────────────────────────
+// Closes the gap where the video pipeline shipped with ZERO vision
+// inspection while statics were protected (services/adVisionQcService.js
+// file-header CONTRACT block has the full static-vs-video comparison).
+//
+// Single choke point: called from uploadRenderAndStamp, the tail BOTH
+// titling engines (remotion + canvas) funnel through — so every video ad
+// gets exactly one inspection of its ACTUAL delivered pixels (post-crop,
+// post-titling), regardless of engine, without touching routes/ads.js
+// (heavily contended right now — #227 rebasing, the undispatched-tail fix
+// in progress).
+//
+// Wrapped in try/catch with NOTHING allowed to escape: uploadRenderAndStamp
+// is the single place EVERY video ad's renderUrl gets written, so an
+// uncaught exception here would break video rendering repo-wide, not just
+// QC. Any internal failure degrades to returning null (treated exactly
+// like "QC disabled" by the caller — Ad.visionQc stays unstamped) rather
+// than propagating.
+//
+// Returns a persisted-verdict object (buildPersistedVerdict shape) to merge
+// into Ad.visionQc, or null when QC is disabled/not applicable — mirroring
+// directImageRenderService's early-return-without-stamping so "never
+// inspected" reads the same way (an absent field) across both pipelines.
+async function runVideoVisionQcForAd({ ad, deliveredUrl, brandName = null }) {
+  try {
+    const adVisionQc = require('./adVisionQcService');
+    if (!adVisionQc.isEnabled()) return null;
+
+    const videoFrameService = require('./videoFrameService');
+    const { adStage, noteRenderIssue } = require('./adStage');
+
+    // ORIGINAL product photo — prefer the EXACT reference actually sent to
+    // the video model (veoReferenceImages[0]; models/Ad.js: "pos 0 = seed"),
+    // same "first reference we actually sent" philosophy the static path
+    // uses (directImageRenderService.js). Derive-only ads (cropped from a
+    // sibling master, models/Ad.js `deriveFromMaster`) never populate their
+    // own veoReferenceImages, so fall back to the catalog hero.
+    let originalProductUrl = (Array.isArray(ad.veoReferenceImages) && ad.veoReferenceImages.length)
+      ? ad.veoReferenceImages[0]
+      : null;
+    if (!originalProductUrl && ad.productId) {
+      try {
+        const CatalogProduct = require('../models/CatalogProduct');
+        const prod = await CatalogProduct.findById(ad.productId).select('imageUrl').lean();
+        originalProductUrl = prod?.imageUrl || null;
+      } catch { /* falls through to the skipped verdict below */ }
+    }
+
+    let resolvedBrandName = brandName;
+    if (!resolvedBrandName && ad.brandId) {
+      try {
+        const Brand = require('../models/Brand');
+        const b = await Brand.findById(ad.brandId).select('name').lean();
+        resolvedBrandName = b?.name || null;
+      } catch { /* non-fatal — QC still runs, just with a generic brand label */ }
+    }
+
+    // durationSec: SAME field + fallback basePlateCropService.js already
+    // relies on for the identical buildFrameUrls call (detectClipBoxes) —
+    // do not re-derive with a second convention (e.g. ffprobe).
+    const durationSec = Number(ad.videoDurationSec) > 0 ? Number(ad.videoDurationSec) : 8;
+    // Quartile sampling for our 8-10s ads (videoFrameService.planTimestamps):
+    // 25/50/75% of duration, mid-phase rather than on a cut/fade boundary —
+    // same "mid-phase, not on-boundary" principle previewBrandScript already
+    // uses for its own preview frame indices (see that function's comment).
+    // Verified 2026-08-19 against a real delivered ad (run
+    // run_1787136860887_654ed621, Vuori Bone Denim jacket rendered as light
+    // blue denim with a garbled "VOME" woven neck label): the defect is
+    // visible at EVERY one of these three quartiles, not just the opening
+    // frame — confirming a colourway/brand-mark hallucination in this video
+    // model persists across the clip rather than being a one-frame glitch,
+    // so 3 evidence points is enough without sampling every frame.
+    const frames = videoFrameService.buildFrameUrls(deliveredUrl, durationSec);
+
+    const campaignRunId = (Array.isArray(ad.campaignRunIds) && ad.campaignRunIds.length)
+      ? ad.campaignRunIds[ad.campaignRunIds.length - 1]
+      : null;
+    const appUrl = adVisionQc.buildAppPreviewUrl({
+      campaignRunId, campaignId: ad.campaignId || null, brandId: ad.brandId || null
+    });
+
+    adStage(ad._id, 'vision QC (video)');
+    const qcResult = await adVisionQc.runVideoPostRenderQc({
+      enabled: true,
+      originalProductUrl,
+      frames,
+      brandName: resolvedBrandName,
+      brandId: ad.brandId || null,
+      productId: ad.productId || null,
+      adId: ad._id || null,
+      deliveredUrl
+    });
+
+    if (qcResult.skipped || qcResult.uninspected) {
+      const reason = qcResult.visionQc?.reason || 'vision QC did not inspect this render';
+      console.warn(`   ⚠️  brandScript[ad=${ad._id}]: vision QC (video) skipped — ${reason}`);
+      noteRenderIssue(ad._id, { message: `vision QC (video) skipped: ${reason}`, stage: 'vision-qc' });
+      adVisionQc.alertQcSkipped({
+        adId: ad._id, brandId: ad.brandId, productId: ad.productId,
+        brandName: resolvedBrandName, reason, mediaLabel: 'Video ad'
+      });
+      return qcResult.visionQc;
+    }
+
+    if (!qcResult.passed) {
+      // FLAG, DON'T DISCARD — see adVisionQcService.runVideoPostRenderQc's
+      // docstring for the full money reasoning. The caller (below) still
+      // ships this ad as a normal draft; this only makes the failure loud.
+      adVisionQc.alertQcFailure({
+        adId: ad._id, brandId: ad.brandId, productId: ad.productId,
+        brandName: resolvedBrandName, visionQc: qcResult.visionQc, appUrl,
+        regenerated: false, mediaLabel: 'Video ad'
+      });
+      adVisionQc.noteQcFailToRunFeed({
+        campaignRunId, adId: ad._id, aspectRatio: ad.aspectRatio, platformFormat: ad.platformFormat,
+        visionQc: qcResult.visionQc, previewUrl: deliveredUrl, appUrl
+      });
+      console.warn(
+        `   ⚠️  brandScript[ad=${ad._id}]: vision QC (video) FAILED — flagged on Ad.visionQc, ` +
+        'shipping as draft anyway (master already paid for; see PR description)'
+      );
+    } else {
+      adVisionQc.noteQcPassToRunFeed({
+        campaignRunId, adId: ad._id, aspectRatio: ad.aspectRatio, platformFormat: ad.platformFormat,
+        visionQc: qcResult.visionQc, previewUrl: deliveredUrl, appUrl
+      });
+      console.log(`   ✅ brandScript[ad=${ad._id}]: vision QC (video) pass`);
+    }
+    return qcResult.visionQc;
+  } catch (err) {
+    // MUST NEVER throw into uploadRenderAndStamp — see file comment above.
+    console.warn(
+      `   ⚠️  brandScript[ad=${ad && ad._id}]: vision QC (video) infra error — shipping unstamped: ${err.message}`
+    );
+    return null;
+  }
+}
+
 // Shared tail of both engines: upload the rendered mp4, stamp
 // Ad.renderUrl, clean up. Retains tempDir on failure when
 // BRAND_SCRIPT_RETAIN_TMP is set for post-mortem.
-async function uploadRenderAndStamp({ ad, finalPath, tempDir, timings, titlingSnapshot = null }) {
+async function uploadRenderAndStamp({ ad, finalPath, tempDir, timings, titlingSnapshot = null, brandName = null }) {
   const fs = require('fs');
   const { uploadFileToCloudinary } = require('./cloudinaryService');
   const Ad = require('../models/Ad');
@@ -1448,6 +1586,16 @@ async function uploadRenderAndStamp({ ad, finalPath, tempDir, timings, titlingSn
     }
     // Persist the exact titling used for this render (generation-inspector).
     if (titlingSnapshot) set.titlingSnapshot = titlingSnapshot;
+    // Post-render vision QC — inspects the pixels we are ABOUT TO SHIP
+    // (uploaded.secure_url), same principle as the static path inspecting
+    // its actual render rather than an intermediate buffer. Merged into the
+    // SAME $set/updateOne below so the renderUrl stamp and its QC verdict
+    // commit atomically — no window where a video ad has a renderUrl but a
+    // stale/absent visionQc. Never throws (see runVideoVisionQcForAd);
+    // returns null when QC is disabled, in which case Ad.visionQc is left
+    // untouched, same as the static path's early-return-without-stamping.
+    const videoVisionQc = await runVideoVisionQcForAd({ ad, deliveredUrl: uploaded.secure_url, brandName });
+    if (videoVisionQc) set.visionQc = videoVisionQc;
     await Ad.updateOne(
       { _id: ad._id },
       { $set: set }
@@ -1612,6 +1760,7 @@ async function renderWithRemotionAndSave({ ad, brand, format, presetOverride = n
   }
   return uploadRenderAndStamp({
     ad, finalPath: result.finalPath, tempDir: result.tempDir, timings: result.timings,
+    brandName: brand?.name || null,
     titlingSnapshot: {
       engine: 'remotion',
       format,
@@ -1654,6 +1803,21 @@ async function renderBrandScriptAndSave({ ad, brand, presetOverride = null }) {
       const Ad = require('../models/Ad');
       await Ad.updateOne({ _id: ad._id }, { $unset: { titlingSnapshot: 1 } });
     } catch { /* non-fatal */ }
+    // This path never reaches uploadRenderAndStamp (no chrome to render),
+    // but the ad still SHIPS a delivered video (its raw Grok master, already
+    // stamped as renderUrl upstream at Stage 2.5 in routes/ads.js) — it must
+    // not silently skip vision QC just because there was no titling step.
+    try {
+      const Ad = require('../models/Ad');
+      const videoVisionQc = await runVideoVisionQcForAd({
+        ad, deliveredUrl: ad.veoVideoUrl, brandName: brand?.name || null
+      });
+      if (videoVisionQc) {
+        await Ad.updateOne({ _id: ad._id }, { $set: { visionQc: videoVisionQc } });
+      }
+    } catch (err) {
+      console.warn(`   ⚠️  brandScript[ad=${ad._id}]: vision QC (video, no-chrome path) failed: ${err.message}`);
+    }
     return { skipped: true, reason: 'no-chrome', format: renderer.format };
   }
   if (!ad?.veoVideoUrl) {
