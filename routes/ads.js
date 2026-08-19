@@ -80,6 +80,7 @@ const { assertGeneratablePlatformFormat, resolveExplicitFormats } = require('../
 const { renderCreative }        = require('../services/renderService');
 const { generateForAd: veoGenerateForAd, prepareStoryboard: veoPrepareStoryboard } = require('../services/videoRouter');
 const { buildVideoSegmentUrl, buildPromptScaffold } = require('../services/atlasVideoService');
+const { buildGridPreviewVideoUrl } = require('../services/videoPreviewUrl');
 const ugcVideoPipeline = require('../services/ugcVideoPipeline');
 
 // Derive-only 1:1 ads requeue while their 9:16 master is still in flight.
@@ -4580,6 +4581,12 @@ function projectAd(ad, full = false, extras = {}) {
     photorealUrl:           extras.photorealUrl || null,
     useImageRefAsProduction: !!extras.useImageRefAsProduction,
     posterUrl:          ad.posterUrl,
+    // Downscaled/auto-quality Cloudinary variant for ad-grid tiles — same
+    // master video, ~480px wide instead of the full 1080p render, so a grid
+    // of many ads doesn't stream N full-bitrate masters at once. Detail views
+    // keep using renderUrl untouched. Null for non-video ads / non-Cloudinary
+    // sources (buildGridPreviewVideoUrl falls back to the input then).
+    previewVideoUrl:    ad.kind === 'video' ? buildGridPreviewVideoUrl(ad.renderUrl) : null,
     width:              ad.width,
     height:             ad.height,
     bytes:              ad.bytes,

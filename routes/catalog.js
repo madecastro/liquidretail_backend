@@ -30,6 +30,7 @@ const DetectionArtifact     = require('../models/DetectionArtifact');
 const Ad                    = require('../models/Ad');
 const Campaign              = require('../models/Campaign');
 const { loadPhotorealUrlMap, loadUseImageRefMap } = require('../services/adDisplayUrlService');
+const { buildGridPreviewVideoUrl } = require('../services/videoPreviewUrl');
 const { AD_RECENCY_EXPR } = require('../services/adRecencyService');
 const catalogProductPromoteService = require('../services/catalogProductPromoteService');
 const { catalogSeedFields } = require('../services/catalogImageQuality');
@@ -984,6 +985,9 @@ router.get('/:id/ads-detail', async (req, res) => {
         ? !!useImageRefMap.get(String(a.campaignId))
         : false,
       posterUrl:      a.posterUrl || null,
+      // Same downscaled/auto-quality grid-tile variant /api/ads emits —
+      // keeps this endpoint's thumbnails in lockstep with the flat ads list.
+      previewVideoUrl: a.kind === 'video' ? buildGridPreviewVideoUrl(a.renderUrl || null) : null,
       headline:       a.copy?.headline || null,
       ctaText:        (a.copy && a.copy.cta_text) || a.ctaText || null,
       generatedAt:    (a.renderedAt || a.generatedAt)
