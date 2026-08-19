@@ -2983,7 +2983,12 @@ async function renderOneInner(run, job, adId, index, renderToken) {
         {
           $set: {
             status:      'failed',
-            renderError: { message: err.message || String(err), stage: 'veo', at: new Date() },
+            // code: threaded 2026-08-19 alongside the static path — atlasVideoService's
+            // buildClassifiedFailureError now stamps err.code from the same
+            // atlasErrorPolicy.js taxonomy (e.g. IMAGE_MODERATION_BLOCKED), so a
+            // video master rejected for the same reason as its sibling statics
+            // (one flagged catalog photo) is no longer invisible to this field.
+            renderError: { message: err.message || String(err), stage: 'veo', code: err.code || null, at: new Date() },
             updatedAt:   new Date()
           },
           $inc: { renderAttempts: 1 }
@@ -3091,6 +3096,11 @@ async function renderOneInner(run, job, adId, index, renderToken) {
               predictionId: result.error?.predictionId || null,
               atlasCode:    result.error?.atlasCode ?? null,
               charged:      result.error?.charged === true,
+              // Stable IMAGE_* classification (atlasErrorPolicy.js), when the
+              // failure carried one — e.g. 'IMAGE_MODERATION_BLOCKED'. Lets
+              // the ads UI/API tell a content-policy rejection apart from a
+              // bug or an outage without parsing renderError.message text.
+              code:         result.error?.code || null,
               at:           new Date()
             },
             // Keep vision QC verdict (incl. discarded paid URLs) on failure.
@@ -3131,7 +3141,8 @@ async function renderOneInner(run, job, adId, index, renderToken) {
             at:           new Date(),
             predictionId: err.predictionId || err.cause?.predictionId || null,
             charged:      err.charged === true || err.cause?.charged === true,
-            atlasCode:    err.atlasCode ?? err.cause?.atlasCode ?? null
+            atlasCode:    err.atlasCode ?? err.cause?.atlasCode ?? null,
+            code:         err.code || err.cause?.code || null
           },
           updatedAt:   new Date()
         },
@@ -3158,6 +3169,18 @@ function buildErrorEntry(creative, index, stageHint, errLike) {
   } else {
     message = errLike ? String(errLike) : 'unknown';
   }
+  // Stable classification, when the failure carried one (renderService's
+  // failed() puts services/atlasErrorPolicy.js's IMAGE_* code here for a
+  // render-stage failure — e.g. IMAGE_MODERATION_BLOCKED). Added 2026-08-19
+  // so an operator (or the run-level moderationBlocked rollup below) can
+  // tell "content-policy rejection, identical retry is futile" apart from a
+  // bug or an outage without parsing free text. `code`/`action` are already
+  // declared, unconstrained String fields on CampaignRun.errors[] (added for
+  // the LLM taxonomy) — reused here rather than adding new ones.
+  const code = (errLike && typeof errLike === 'object' && errLike.code) ? String(errLike.code) : null;
+  const action = (errLike && typeof errLike === 'object' && typeof errLike.retryable === 'boolean')
+    ? (errLike.retryable ? 'FAILED_RETRYABLE' : 'GAVE_UP_NO_RETRY')
+    : null;
   return {
     index,
     stage:       errStage,
@@ -3165,7 +3188,26 @@ function buildErrorEntry(creative, index, stageHint, errLike) {
     aspectRatio: creative.aspectRatio,
     mediaId:     creative.mediaId   ? String(creative.mediaId)   : null,
     productId:   creative.productId ? String(creative.productId) : null,
-    message
+    message,
+    code,
+    action
+  };
+}
+
+// Structured "N of this run's failures were content-policy rejections, not a
+// bug" rollup for GET /runs/:runId — pure, no DB access, so a caller passing
+// no errors or none carrying the code gets a clean `null` rather than a
+// zero-count object. See atlasErrorPolicy.js's IMAGE_MODERATION_BLOCKED.
+function buildModerationRollup(errors) {
+  const hits = (Array.isArray(errors) ? errors : [])
+    .filter((e) => e && e.code === 'IMAGE_MODERATION_BLOCKED');
+  if (!hits.length) return null;
+  return {
+    count: hits.length,
+    productIds: [...new Set(hits.map((e) => e.productId).filter(Boolean))],
+    message: `${hits.length} creative${hits.length === 1 ? '' : 's'} rejected by the image ` +
+      'model\'s own safety filter (content-policy match on the reference photo and/or prompt) — ' +
+      'not a bug or an outage, and an identical retry will fail again the same way.'
   };
 }
 
@@ -3258,6 +3300,16 @@ router.get('/runs/:runId', async (req, res) => {
         shippedWithoutQc: shippedWithoutQcCount || 0,
         qcdOnRetry:       qcdOnRetryCount || 0
       },
+      // Structured complement to failureSummary's text-parsed grouping, added
+      // 2026-08-19. failureSummary already surfaces "Model Moderation Error"
+      // as a reason (it strips the wrapper prefix off renderError.message and
+      // groups on the label atlasErrorPolicy already puts there) — this adds
+      // a MACHINE-CHECKABLE signal keyed on the stable IMAGE_MODERATION_
+      // BLOCKED code (buildErrorEntry / renderService.failed()), immune to
+      // any future rewording of that message. null when nothing in this run
+      // was moderation-rejected, so a caller can `if (moderationBlocked)`
+      // rather than checking a count of 0.
+      moderationBlocked: buildModerationRollup(run.errors),
       // Per-product expansion outcomes (why each product queued or skipped).
       // Empty until expandWizardJob finishes; the poller is the source of
       // truth because the 202 response flushes before expansion completes.
@@ -4868,3 +4920,9 @@ module.exports.projectAd = projectAd;
 // a stubbed CatalogProduct.find rather than a source-text check, which
 // cannot see whether the brandId clause actually reaches the query.
 module.exports.resolveOwnedProductIds = resolveOwnedProductIds;
+// MODERATION SURFACING (2026-08-19), exported for behavioural pinning by
+// scripts/verifyModerationSeedFallback.js — a source-text check alone would
+// pass against a reimplementation that kept the name, so the harness calls
+// the real functions.
+module.exports.buildErrorEntry = buildErrorEntry;
+module.exports.buildModerationRollup = buildModerationRollup;

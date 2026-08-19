@@ -3529,6 +3529,16 @@ function buildClassifiedFailureError(predictionId, status, data) {
   const heading = policy.label || 'atlasVideo: prediction failed';
   const err = new Error(`${heading}: ${providerMsg} (id=${predictionId})`);
   err.atlasPolicy = policy.name;
+  // Stable IMAGE_* classification code (atlasErrorPolicy.js — the same
+  // registry the image path uses; it covers video too, hence "IMAGE_" being
+  // the historical name for what is really "Atlas media"). Added 2026-08-19
+  // alongside the static-path fix: without this, a video master rejected for
+  // the SAME reason as its sibling statics (e.g. one flagged catalog photo)
+  // carried only `atlasPolicy` (an internal name, never read by
+  // routes/ads.js) — never `code` — so it never reached
+  // `Ad.renderError.code` or the `GET /runs/:runId` `moderationBlocked`
+  // rollup. Those surfaces silently under-counted a mixed static+video run.
+  err.code        = policy.code;
   err.terminal    = policy.terminal;
   // Carry the retry decision to the caller. A retry means a NEW billable
   // submit, so it cannot be decided here (this function only polls) — but

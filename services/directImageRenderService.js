@@ -42,6 +42,9 @@ const { formatDisplayRating, resolveCoherentSocialProof, brandAttributionLabel }
 // path are how private Director reasoning became art direction on 2026-08-01.
 const { renderableCopy, artDirectionLook, conceptForRender } = require('./conceptProjection');
 const { adStage, noteRenderIssue } = require('./adStage');
+// Moderation-rejection seed fallback (2026-08-19) — see its header for the
+// incident, the cost bound, and why a seed swap (not a bare retry) is safe.
+const moderationSeedFallback = require('./moderationSeedFallback');
 
 /**
  * REVERTED to the plain variant, owner decision 2026-08-03 — same day the switch
@@ -1464,7 +1467,7 @@ function buildIntentData({ concept, layoutInput, brand, product = null, cta, cam
   // headline only; subhead undefined). Flag-on: cascade through layoutInput
   // then brand.tagline so ai_brand_led still has a brand line when Director
   // nulls the headline. Do NOT cascade product name/title or description —
-  // resolvedProduct is .select('title imageUrl rating productReviews recentQuoteKeys lastQuoteRunId lastQuoteFingerprint') so description is not loaded,
+  // resolvedProduct is .select('title imageUrl imageMediaId additionalImageMediaIds rating productReviews recentQuoteKeys lastQuoteRunId lastQuoteFingerprint') so description is not loaded,
   // and the product name is forbidden as ad copy by owner directive and
   // fenced in absences.
   //
@@ -1948,6 +1951,143 @@ function buildQcRetryArgs(originalCallArgs, { correctiveNote, overrideText } = {
   };
 }
 
+/**
+ * Submit the edit call; on a moderation-blocked rejection of the SINGLE
+ * default catalog seed (never the operator/director's explicit multi-image
+ * stack — that is an ordered pick the operator asked for, and silently
+ * swapping one entry would be exactly the "silent quality downgrade" this
+ * feature must not do), try the product's next unblocked catalog image
+ * before giving up. See services/moderationSeedFallback.js's header for the
+ * incident, the live-verified evidence, and the cost bound.
+ *
+ * Coordinates across a run's creatives via CampaignRun.seedFallbacks so
+ * creative #2..N for the same product do not each pay to rediscover the same
+ * doomed primary seed — best-effort only: a coordination read/write failure
+ * just costs one more wasted primary attempt, i.e. exactly today's
+ * behaviour, never a broken render.
+ *
+ * A NON-moderation failure (network, credentials, a genuine prediction
+ * timeout, ...) is not seed-dependent and is rethrown immediately without
+ * touching the fallback budget — a different image cannot fix those, and
+ * trying more candidates would just spend money finding that out.
+ *
+ * @returns {Promise<{result: object, seedFallback: null|object}>}
+ *   `seedFallback` is non-null only when a NON-primary seed produced the
+ *   successful render — the shape callers persist onto
+ *   Ad.imageGeneration.seedFallback so a fallback is always visible, never
+ *   silent.
+ */
+async function submitEditImageWithSeedFallback({
+  refs, imageMeta, prompt, genSize, meta, model, quality, timeoutMs,
+  uploadTimeoutMs, allowProviderFallback, singleSeedEligible, mediaId,
+  resolvedProduct, campaignRunId, productId
+}) {
+  const submit = (r, im) => atlasImage.editImage({
+    model, images: r, imageMeta: im, prompt, size: genSize, quality, meta,
+    timeoutMs, uploadTimeoutMs, allowFallback: allowProviderFallback
+  });
+
+  if (!singleSeedEligible || !moderationSeedFallback.isEnabled() || !resolvedProduct?._id) {
+    return { result: await submit(refs, imageMeta), seedFallback: null };
+  }
+
+  const primaryMediaId = mediaId ? String(mediaId) : null;
+  const { resolvedMediaId, blockedMediaIds } =
+    await moderationSeedFallback.readRunSeedState(campaignRunId, productId);
+  const knownBlocked = new Set(blockedMediaIds.map(String));
+
+  // Ordered candidates for THIS call, bounded at 1 + maxFallbackCandidates()
+  // TOTAL, matching moderationSeedFallback.js's documented cost bound.
+  //
+  // The starting slot is EXACTLY ONE id, not "resolved AND primary" — a
+  // prior FIX here pushed both whenever neither was individually blocked,
+  // which both defeated the coordination (the whole point of a resolved
+  // override is to skip the doomed primary, not submit it anyway) and blew
+  // the stated cap to 1(resolved)+1(primary)+cascade. Prefer a
+  // previously-discovered good seed; only fall back to the primary itself
+  // when there is no known-good override (or it turned out to also be
+  // blocked, per the race note below).
+  const candidateIds = [];
+  if (resolvedMediaId && !knownBlocked.has(resolvedMediaId)) {
+    candidateIds.push(resolvedMediaId);
+  } else if (primaryMediaId && !knownBlocked.has(primaryMediaId)) {
+    candidateIds.push(primaryMediaId);
+  }
+  const exclude = new Set([primaryMediaId, resolvedMediaId, ...knownBlocked, ...candidateIds].filter(Boolean));
+  candidateIds.push(...moderationSeedFallback.nextCandidateIds(resolvedProduct, { excludeMediaIds: [...exclude] }));
+
+  if (!candidateIds.length) {
+    // Every catalog image this run knows about is already blocked for this
+    // product — nothing left to try. Submit the primary anyway so the
+    // failure (and its now-familiar IMAGE_MODERATION_BLOCKED code) surfaces
+    // exactly as it would with the fallback disabled.
+    return { result: await submit(refs, imageMeta), seedFallback: null };
+  }
+
+  let lastErr = null;
+  for (let i = 0; i < candidateIds.length; i++) {
+    const candidateId = candidateIds[i];
+    const isPrimary = candidateId === primaryMediaId;
+    let candidateRefs = refs;
+    let candidateMeta = imageMeta;
+    if (!isPrimary) {
+      // eslint-disable-next-line no-await-in-loop
+      const doc = await Media.findById(candidateId).select('fileUrl').lean();
+      if (!doc?.fileUrl) { lastErr = lastErr || taggedError(`moderation fallback candidate ${candidateId} has no usable file — skipped`, { alertLevel: 'warn', alertKey: 'direct-image:fallback-candidate-unusable' }); continue; } // unusable candidate — try the next one for free
+      // eslint-disable-next-line no-await-in-loop
+      const raw = await optionalImage(doc.fileUrl);
+      // eslint-disable-next-line no-await-in-loop
+      const normalized = raw ? await normalizeReference(raw) : null;
+      if (!normalized) { lastErr = lastErr || taggedError(`moderation fallback candidate ${candidateId} could not be normalised — skipped`, { alertLevel: 'warn', alertKey: 'direct-image:fallback-candidate-unusable' }); continue; }
+      candidateRefs = [normalized];
+      candidateMeta = [{ sourceUrl: doc.fileUrl, role: 'moderation-fallback-seed' }];
+    }
+    try {
+      // eslint-disable-next-line no-await-in-loop
+      const result = await submit(candidateRefs, candidateMeta);
+      if (!isPrimary) {
+        // Fire-and-forget: this is the optimisation, not the correctness —
+        // the render already succeeded regardless of whether this write does.
+        moderationSeedFallback.recordSeedOutcome(campaignRunId, productId, {
+          originalMediaId: primaryMediaId, resolvedMediaId: candidateId
+        }).catch(() => {});
+      }
+      return {
+        result,
+        seedFallback: isPrimary ? null : {
+          used: true,
+          originalMediaId: primaryMediaId,
+          resolvedMediaId: candidateId,
+          reason: 'moderation_blocked',
+          attemptsBeforeSuccess: i + 1
+        }
+      };
+    } catch (err) {
+      lastErr = err;
+      const isModeration = err?.policy?.name === 'moderationBlocked';
+      if (!isModeration) throw err; // not a seed-shaped problem — do not burn more submits
+      // Record a blocked PRIMARY too, not only blocked fallback candidates —
+      // a prior version guarded this on `!isPrimary`, which meant the exact
+      // seed the incident was about never entered `blocked[]`. Every other
+      // creative for this product then re-submitted (and re-paid to
+      // discover) the same doomed primary before reaching an alternate.
+      moderationSeedFallback.recordSeedOutcome(campaignRunId, productId, {
+        originalMediaId: primaryMediaId, blockedMediaId: candidateId
+      }).catch(() => {});
+      // fall through to the next candidate, if any
+    }
+  }
+  // Every candidate was tried (or skipped as unusable) with nothing to show
+  // for it. `lastErr` is only unset if `candidateIds` was non-empty but every
+  // single one was skipped as unusable above — extremely unlikely (it would
+  // need a deleted Media doc for every remaining catalog image) but a bare
+  // `throw null`/`throw undefined` would be far worse than a real Error.
+  throw lastErr || taggedError(
+    'moderation fallback exhausted every candidate without a usable reference',
+    { alertLevel: 'error', alertKey: 'direct-image:fallback-exhausted' }
+  );
+}
+
 async function renderDirectImage(callArgs = {}) {
   // Accept a single object so QC re-entry can spread the original args
   // (buildQcRetryArgs) and never re-list fields by hand.
@@ -1996,7 +2136,7 @@ async function renderDirectImage(callArgs = {}) {
     LayoutInputArtifact.findById(layoutInputArtifactId).select('input brandId productId').lean(),
     resolveConcept({ adConceptArtifactId, adConceptId, expectedProductId: productId }),
     brandId ? Brand.findById(brandId).lean() : null,
-    productId ? CatalogProduct.findById(productId).select('title imageUrl rating productReviews recentQuoteKeys lastQuoteRunId lastQuoteFingerprint').lean() : null,
+    productId ? CatalogProduct.findById(productId).select('title imageUrl imageMediaId additionalImageMediaIds rating productReviews recentQuoteKeys lastQuoteRunId lastQuoteFingerprint').lean() : null,
     // classification + technicalInsights feed resolveSeedStyle for the
     // lifestyle scene-preserve branch (STATIC_LIFESTYLE_PRESERVE).
     // width + height feed seedAspectFromDims → resolveAspectTreatment's
@@ -2053,7 +2193,7 @@ async function renderDirectImage(callArgs = {}) {
       { alertLevel: 'fatal', alertKey: 'direct-image:no-credentials' }
     );
   }
-  const resolvedProduct = product || (effectiveLayout.productId ? await CatalogProduct.findById(effectiveLayout.productId).select('title imageUrl rating productReviews recentQuoteKeys lastQuoteRunId lastQuoteFingerprint').lean() : null);
+  const resolvedProduct = product || (effectiveLayout.productId ? await CatalogProduct.findById(effectiveLayout.productId).select('title imageUrl imageMediaId additionalImageMediaIds rating productReviews recentQuoteKeys lastQuoteRunId lastQuoteFingerprint').lean() : null);
   // Delivery dims are NOT derived here any more: they come from the surface the
   // prompt is built from, a few lines below, so the size Sharp writes and the
   // size the geometry block promised the model cannot disagree.
@@ -2291,10 +2431,32 @@ async function renderDirectImage(callArgs = {}) {
   // above already refuses to reach here with zero references, so this is never
   // asked to invent a product from words alone.
   adStage(adId, `plate submit (${surface})`);
-  const result = await atlasImage.editImage({
-    model: PLATE_EDIT_MODEL, images: refs, imageMeta, prompt, size: genSize,
-    quality: PLATE_QUALITY, meta, timeoutMs: PLATE_TIMEOUT_MS,
-    uploadTimeoutMs: UPLOAD_TIMEOUT_MS, allowFallback: allowProviderFallback
+  // Eligible for seed fallback whenever there is AT MOST ONE reference in
+  // play — never a genuine multi-image stack (orderedIds.length >= 2), which
+  // is a deliberate, ordered pick (operator or Director) whose composition
+  // this feature must not silently rewrite.
+  //
+  // BUG FIXED 2026-08-19 (caught in adversarial review, confirmed against the
+  // real incident data): this used to be `!orderedIds.length`, which is only
+  // true when `referenceMediaIds` arrives EMPTY. But renderService.js's own
+  // fallback (`referenceMediaIds: adDoc.referenceMediaIds.length ? ... :
+  // adDoc.mediaIds`) means the concept-driven static path — the exact path
+  // the incident happened on — ALWAYS forwards `Ad.mediaIds`, and
+  // DIRECTOR_UNIVERSE_TOP_N=1 makes that array exactly ONE element long, not
+  // zero. Verified live against run_1787136860887_654ed621's own Ad
+  // documents: `mediaIds.length === 1`, `referenceMediaIds.length === 0` on
+  // the Ad, which renderService.js turns into a 1-element `orderedIds` here.
+  // Under the old `!orderedIds.length` check that is `false` — the fallback
+  // never engaged on the ONE path it was built for. `<= 1` treats "the
+  // Director's single pick, surfaced through this plumbing" the same as
+  // "no explicit pick at all" (both fall back to the SAME single seed
+  // either way), while still excluding any real 2+ stack.
+  const singleSeedEligible = moderationSeedFallback.isSingleSeedEligible(orderedIds);
+  const { result, seedFallback: seedFallbackInfo } = await submitEditImageWithSeedFallback({
+    refs, imageMeta, prompt, genSize, meta,
+    model: PLATE_EDIT_MODEL, quality: PLATE_QUALITY, timeoutMs: PLATE_TIMEOUT_MS,
+    uploadTimeoutMs: UPLOAD_TIMEOUT_MS, allowProviderFallback,
+    singleSeedEligible, mediaId, resolvedProduct, campaignRunId, productId
   });
   const b64 = result?.data?.[0]?.b64_json;
   if (!b64) throw new Error('direct-image generation returned no image data');
@@ -2333,7 +2495,14 @@ async function renderDirectImage(callArgs = {}) {
     // atlasImageService. Persisted onto the Ad so the inspector never has to
     // re-derive what "should" have been sent.
     imageGeneration: result?.submission
-      ? { ...result.submission, pipeline: DIRECT_IMAGE, stage: 'finished_ad' }
+      ? {
+          ...result.submission, pipeline: DIRECT_IMAGE, stage: 'finished_ad',
+          // Visible, never silent, per requirement: a fallback away from the
+          // product's chosen seed is a real quality decision (a different
+          // catalog photo shipped), not an implementation detail — present
+          // only when submitEditImageWithSeedFallback actually swapped seeds.
+          ...(seedFallbackInfo ? { seedFallback: seedFallbackInfo } : {})
+        }
       : null,
     // Provenance for the inspector. Recorded because the whole reason this
     // pipeline was hard to diagnose is that nothing said which intent ran, what
@@ -2603,5 +2772,11 @@ module.exports = {
   // QC re-entry arg assembly — verifyLifestylePreserve asserts variantKind
   // survives the spread (BLOCKER 3).
   buildQcRetryArgs,
-  renderDirectImage
+  renderDirectImage,
+  // MODERATION SEED FALLBACK (2026-08-19) — exported for behavioural pinning
+  // by scripts/verifyModerationSeedFallback.js. A source-text check alone
+  // would pass against a reimplementation that kept the name, so the harness
+  // calls this real function (with axios stubbed, per the repo's established
+  // require.cache pattern — see scripts/verifyDirectorFallbackChain.js).
+  submitEditImageWithSeedFallback
 };

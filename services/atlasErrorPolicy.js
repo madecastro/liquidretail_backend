@@ -38,6 +38,40 @@
 const LEVELS = ['info', 'warn', 'error', 'fatal'];
 
 /**
+ * Stable classification codes, one per policy below, in the same spirit as
+ * the sibling text/chat/embedding error-classification module's LLM_*
+ * taxonomy — but this file stays its own, separate registry (see
+ * scripts/verifyLlmErrorCodes.js A5, and CLAUDE.md's "Scope boundary" note:
+ * that module is text/chat/embedding ONLY; this one governs BILLABLE
+ * image/video submits, where "advancing is free" reasoning does not apply).
+ * Added 2026-08-19 so a moderation rejection (the incident this was added
+ * for) carries a code an operator or a Slack rollup can match on, instead of
+ * only free-text `why`/`message` prose. Keys equal values, the same
+ * convention that other taxonomy uses, so `Object.keys(IMAGE_ERROR_CODES)`
+ * is a complete enumeration.
+ */
+const IMAGE_ERROR_CODES = Object.freeze({
+  IMAGE_UNAUTHORIZED:          'IMAGE_UNAUTHORIZED',
+  IMAGE_INSUFFICIENT_BALANCE:  'IMAGE_INSUFFICIENT_BALANCE',
+  IMAGE_FORBIDDEN:             'IMAGE_FORBIDDEN',
+  IMAGE_RATE_LIMITED:          'IMAGE_RATE_LIMITED',
+  IMAGE_SERVER_ERROR:          'IMAGE_SERVER_ERROR',
+  IMAGE_UNAVAILABLE:           'IMAGE_UNAVAILABLE',
+  IMAGE_GATEWAY_TIMEOUT:       'IMAGE_GATEWAY_TIMEOUT',
+  IMAGE_PREDICTION_FAILED:     'IMAGE_PREDICTION_FAILED',
+  // The star of the 2026-08-19 incident: 100% of a product's statics failing
+  // because the catalog seed (ordinary apparel photography) tripped the image
+  // model's own safety classifier. See `moderationBlocked` below for the
+  // classification rule and `services/moderationSeedFallback.js` for the
+  // mitigation this code exists to drive.
+  IMAGE_MODERATION_BLOCKED:    'IMAGE_MODERATION_BLOCKED',
+  IMAGE_COMPLETED_NO_OUTPUT:   'IMAGE_COMPLETED_NO_OUTPUT',
+  IMAGE_NETWORK_ERROR:         'IMAGE_NETWORK_ERROR',
+  IMAGE_CLIENT_TIMEOUT:        'IMAGE_CLIENT_TIMEOUT',
+  IMAGE_UNCLASSIFIED:          'IMAGE_UNCLASSIFIED'
+});
+
+/**
  * Action vocabulary:
  *   'retry'        — safe to submit again immediately (after backoff)
  *   'probe'        — outcome unknown; find the existing task before resubmitting
@@ -49,6 +83,7 @@ const POLICIES = Object.freeze({
   unauthorized: {
     match: ({ http, code }) => http === 401 || code === 401,
     charged: false, action: 'fix-config', maxAttempts: 1,
+    code: IMAGE_ERROR_CODES.IMAGE_UNAUTHORIZED,
     alertLevel: 'fatal', alertKey: 'atlas:unauthorized',
     why: 'missing or malformed bearer token — every call will fail identically'
   },
@@ -56,6 +91,7 @@ const POLICIES = Object.freeze({
     match: ({ http, code, msg }) =>
       http === 402 || code === 402 || /insufficient balance|payment required/i.test(msg),
     charged: false, action: 'fix-config', maxAttempts: 1,
+    code: IMAGE_ERROR_CODES.IMAGE_INSUFFICIENT_BALANCE,
     alertLevel: 'fatal', alertKey: 'atlas:insufficient-balance',
     why: 'account balance depleted — an outage, not a bad ad; every render fails until topped up'
   },
@@ -63,6 +99,7 @@ const POLICIES = Object.freeze({
     match: ({ http, code, msg }) =>
       http === 403 || code === 403 || /quota|spending limit|permission denied/i.test(msg),
     charged: false, action: 'fix-config', maxAttempts: 1,
+    code: IMAGE_ERROR_CODES.IMAGE_FORBIDDEN,
     alertLevel: 'fatal', alertKey: 'atlas:forbidden',
     why: 'quota exhausted or key lacks permission — needs billing or a new key'
   },
@@ -72,6 +109,7 @@ const POLICIES = Object.freeze({
     charged: false, action: 'retry', maxAttempts: 5,
     backoffMs: (n) => Math.min(30_000, 1000 * Math.pow(2, n)) + Math.floor(Math.random() * 500),
     respectRetryAfter: true,
+    code: IMAGE_ERROR_CODES.IMAGE_RATE_LIMITED,
     alertLevel: 'warn', alertKey: 'atlas:rate-limited',
     why: 'throttled on RPM/TPM/concurrency — backoff and retry is the documented remedy'
   },
@@ -81,6 +119,7 @@ const POLICIES = Object.freeze({
     // billable, so we must look before we leap.
     charged: null, action: 'probe', maxAttempts: 3,
     backoffMs: (n) => 2000 * (n + 1),
+    code: IMAGE_ERROR_CODES.IMAGE_SERVER_ERROR,
     alertLevel: 'error', alertKey: 'atlas:server-error',
     why: 'internal error; task may still be processing — probe before resubmitting or risk a double charge'
   },
@@ -88,6 +127,7 @@ const POLICIES = Object.freeze({
     match: ({ http, code }) => http === 503 || code === 503,
     charged: false, action: 'wait', maxAttempts: 3,
     backoffMs: (n) => Math.min(120_000, 15_000 * (n + 1)),
+    code: IMAGE_ERROR_CODES.IMAGE_UNAVAILABLE,
     alertLevel: 'error', alertKey: 'atlas:unavailable',
     why: 'service unavailable; documented outages run 30-120 minutes'
   },
@@ -95,6 +135,7 @@ const POLICIES = Object.freeze({
     match: ({ http, code }) => http === 504 || code === 504,
     charged: null, action: 'probe', maxAttempts: 3,
     backoffMs: (n) => 3000 * (n + 1),
+    code: IMAGE_ERROR_CODES.IMAGE_GATEWAY_TIMEOUT,
     alertLevel: 'error', alertKey: 'atlas:gateway-timeout',
     why: 'gateway timed out but the render may have started — verify before resubmitting'
   },
@@ -127,6 +168,7 @@ const POLICIES = Object.freeze({
     // not dollars — a failed generation returns fast (executionTime 0), so the
     // added latency is the backoff, not a poll.
     backoffMs: (n) => Math.min(120_000, 15_000 * Math.pow(3, Math.max(0, n))),
+    code: IMAGE_ERROR_CODES.IMAGE_PREDICTION_FAILED,
     alertLevel: 'warn', alertKey: 'atlas:prediction-failed',
     why: 'Atlas ran and failed; reservation refunded, so a reattempt costs nothing extra'
   },
@@ -169,6 +211,7 @@ const POLICIES = Object.freeze({
     // Deterministic: the same prompt and reference will be blocked again.
     charged: false, action: 'give-up', maxAttempts: 1,
     label: 'Model Moderation Error',
+    code: IMAGE_ERROR_CODES.IMAGE_MODERATION_BLOCKED,
     alertLevel: 'warn', alertKey: 'atlas:moderation',
     why: 'safety filter rejected the input — identical retry is futile; the prompt or reference must change'
   },
@@ -179,6 +222,7 @@ const POLICIES = Object.freeze({
     // one IS chargeable — the rare genuine "paid for nothing" case.
     charged: true, action: 'probe', maxAttempts: 2,
     backoffMs: () => 2000,
+    code: IMAGE_ERROR_CODES.IMAGE_COMPLETED_NO_OUTPUT,
     alertLevel: 'error', alertKey: 'atlas:completed-no-output',
     why: 'reported complete with no outputs — re-read the prediction before paying again'
   },
@@ -190,6 +234,7 @@ const POLICIES = Object.freeze({
       /socket hang up|network|getaddrinfo/i.test(msg),
     charged: null, action: 'probe', maxAttempts: 3,
     backoffMs: (n) => 1500 * (n + 1),
+    code: IMAGE_ERROR_CODES.IMAGE_NETWORK_ERROR,
     alertLevel: 'warn', alertKey: 'atlas:network',
     why: 'transport failed with the request possibly delivered — probe rather than resubmit blindly'
   },
@@ -198,6 +243,7 @@ const POLICIES = Object.freeze({
     // Our deadline, not theirs. Atlas is probably still working and will bill.
     charged: true, action: 'probe', maxAttempts: 2,
     backoffMs: () => 2000,
+    code: IMAGE_ERROR_CODES.IMAGE_CLIENT_TIMEOUT,
     alertLevel: 'warn', alertKey: 'atlas:client-timeout',
     why: 'we stopped waiting; the task is likely still running and already billable'
   }
@@ -228,6 +274,7 @@ const FALLBACK = Object.freeze({
   name: 'unknown',
   charged: null, action: 'probe', maxAttempts: 2,
   backoffMs: (n) => 2000 * (n + 1),
+  code: IMAGE_ERROR_CODES.IMAGE_UNCLASSIFIED,
   alertLevel: 'error', alertKey: 'atlas:unclassified',
   why: 'unrecognised failure shape — treated as outcome-unknown so we never double-charge on a guess'
 });
@@ -269,6 +316,13 @@ function classify({
 function finalize(name, p, ctx, retryAfterSec) {
   return {
     name,
+    // Stable UPPER_SNAKE class (IMAGE_MODERATION_BLOCKED, IMAGE_RATE_LIMITED,
+    // ...) — see IMAGE_ERROR_CODES above. Threaded through
+    // atlasImageService -> renderService -> routes/ads.js's buildErrorEntry
+    // into CampaignRun.errors[].code / Ad.renderError.code, the same
+    // already-declared "LLM failure taxonomy" string fields, reused here for
+    // the image-model equivalent (they are plain, unconstrained Strings).
+    code: p.code || FALLBACK.code,
     charged: p.charged,             // true | false | null (unknown)
     action: p.action,
     retryable: p.action === 'retry' || p.action === 'wait',
@@ -368,4 +422,7 @@ function isPollTransportFailure({ httpStatus, envelopeCode, hasDataObject, isFai
   return httpStatus !== 200;                           // non-200 with zero Atlas signal = transport noise
 }
 
-module.exports = { classify, mayResubmit, retryAfterFrom, isPollTransportFailure, POLICIES, FALLBACK };
+module.exports = {
+  classify, mayResubmit, retryAfterFrom, isPollTransportFailure, POLICIES, FALLBACK,
+  IMAGE_ERROR_CODES
+};
