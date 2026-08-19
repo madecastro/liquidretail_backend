@@ -309,6 +309,18 @@ catalogProductSchema.index({ 'matchedMedia.mediaId': 1 });
 // Tenant-scoped normalized-title lookup for ensureCatalogProductForMatch
 // step 2 (find before create).
 catalogProductSchema.index({ brandId: 1, normalizedTitle: 1 });
+// 2026-08-19 — Generate Ads picker list (routes/catalog.js GET /), the
+// "unmatched rest" segment: find({brandId, deletedAt:null}).sort({lastSyncedAt:-1}).
+// Without this, that query used only the single-field brandId_1 index and
+// fell back to an in-memory blocking SORT stage over every live product in
+// the brand. Confirmed live against production Mongo (Vuori 2, 10,553
+// products): pre-fix, offset=10000 hard-errored with
+// QueryExceededMemoryLimitNoDiskUseAllowed (code 292, blocking sort >32MB);
+// offset=0 examined all 10,553 docs (329ms just for the sort, before any
+// per-row enrichment). Post-fix explain shows IXSCAN+FETCH+LIMIT with
+// exactly `limit` keys/docs examined, no SORT stage — both cases now
+// answer in <500ms regardless of offset.
+catalogProductSchema.index({ brandId: 1, deletedAt: 1, lastSyncedAt: -1 });
 
 catalogProductSchema.pre('save', function(next) {
   if (this.isModified('title') || this.normalizedTitle == null) {

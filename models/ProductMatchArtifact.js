@@ -75,7 +75,15 @@ const productMatchArtifactSchema = new mongoose.Schema({
 
   // ── Catalog provenance ──
   matchSource:      { type: String, index: true },   // 'ig-catalog' | 'gemini-search' | 'both' | null
-  catalogProductId: { type: mongoose.Schema.Types.ObjectId, ref: 'CatalogProduct', default: null },
+  // 2026-08-19 — sparse index added. Two live callers key off this field
+  // directly: GET /api/catalog/:id/matches (routes/catalog.js ~1166,
+  // `ProductMatchArtifact.find({ catalogProductId: { $in: familyIds } })`)
+  // and the catalog list's small "which products have matches" prequery
+  // (routes/catalog.js GET /, replacing the old per-row $lookup on this
+  // field that had no index — see CatalogProduct.js's brandId/deletedAt/
+  // lastSyncedAt index comment for the full profiling trail). Sparse
+  // because most artifacts never resolve to a catalog match (default null).
+  catalogProductId: { type: mongoose.Schema.Types.ObjectId, ref: 'CatalogProduct', default: null, index: true, sparse: true },
   // Snapshot of the matched catalog candidate at run time (title +
   // matchScore) — kept as evidence of WHY this row won. Distinct from
   // catalogProductId which points at the live row.

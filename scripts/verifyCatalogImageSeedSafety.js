@@ -262,19 +262,32 @@ async function main() {
     // / seedIssue themselves are still URL-only — see C6-C8 above.
     check('F2 projectListRow spreads catalogSeedFields(p.imageUrl, p.imageMediaId)', /\.\.\.catalogSeedFields\(p\.imageUrl,\s*p\.imageMediaId\)/.test(routeSrc));
 
-    // F3 — separate, adjacent fix found while live-testing the above:
-    // aggregate()'s raw $match never auto-casts strings to ObjectId, so the
-    // `?ids=` batch-hydration filter (`_id: { $in: [<string ids>] }`) matched
-    // ZERO rows in the aggregation pipeline even though countDocuments(filter)
-    // (find()-style casting) reported the correct `total` — a silent
-    // `products:[]` / `total:1` split. LIVE-VERIFIED against the real
-    // Vuori catalog (brand 6a6624b95f5af85a46562ded, product
-    // 6a66250f5f5af85a46562ea4 "Midweight Rib Sweater | Bone"): before this
-    // fix `GET /api/catalog?...&ids=<id>` returned `products: []`; after,
-    // it returns the row. This is a source-wiring check only (no live DB in
-    // this offline harness) — the real proof is that live HTTP round-trip.
-    check('F3 aggFilter._id.$in is cast to ObjectId before the aggregation (ids= hydration fix)',
-      /aggFilter\._id\.\$in[\s\S]{0,120}map\(id => new mongoose\.Types\.ObjectId\(id\)\)/.test(routeSrc));
+    // F3 — separate, adjacent fix found while live-testing the above (PR
+    // #57-era): aggregate()'s raw $match never auto-casts strings to
+    // ObjectId, so the `?ids=` batch-hydration filter
+    // (`_id: { $in: [<string ids>] }`) matched ZERO rows in the aggregation
+    // pipeline even though countDocuments(filter) (find()-style casting)
+    // reported the correct `total` — a silent `products:[]` / `total:1`
+    // split.
+    //
+    // 2026-08-19 — the GET / list handler no longer runs a single
+    // aggregate() at all (scale fix for the picker 504ing on 10k+ product
+    // brands — see routes/catalog.js's "Scale fix" comment above the
+    // handler and session.md). The `?ids=` filter now flows through
+    // Mongoose find() (schema-based auto-casting, same mechanism
+    // countDocuments already relied on) for both the "matched" and "rest"
+    // segments, so the string/ObjectId mismatch this check pins is now
+    // structurally impossible rather than patched — there is no longer an
+    // `aggFilter` variable or a raw aggregate $match for this path to have
+    // the bug in. Re-verified LIVE against the real Vuori catalog (brand
+    // 6a6624b95f5af85a46562ded) with an id from offset=200+ (deep past any
+    // normal first page): `GET /api/catalog?...&ids=<id>` correctly
+    // returns `products:[<row>], total:1`.
+    const listHandlerSrc = (routeSrc.match(/router\.get\(['"]\/['"],[\s\S]*?\n}\);/) || [''])[0];
+    check('F3 the ids= hydration path wires filter._id = {$in:...} into the list handler',
+      /filter\._id\s*=\s*\{\s*\$in:\s*idsParam/.test(listHandlerSrc));
+    check('F3b …and the list handler resolves rows via find() (schema auto-casts _id.$in), not a raw aggregate() $match',
+      /CatalogProduct\.find\(/.test(listHandlerSrc) && !/aggFilter/.test(listHandlerSrc));
   }
 
   console.log(`\n${pass} pass / ${fail} fail`);
