@@ -56,13 +56,25 @@ function buildText({ runName, cells, takeaway, galleryUrl }) {
   return text.length > TEXT_MAX ? clip(text, TEXT_MAX) : text;
 }
 
+// Send arbitrary text. Exported so callers that are NOT reporting a finished run
+// (e.g. a spend receipt escaping an ephemeral host) do not have to fake a cells
+// array and get a misleading "settled $0.00" line in their message.
+async function postText(text, { channel } = {}) {
+  return sendRaw(text, channel);
+}
+
 async function postExperiment({ channel, runName, galleryUrl, cells, takeaway } = {}) {
+  const text = buildText({ runName, cells, takeaway, galleryUrl });
+  return sendRaw(text, channel);
+}
+
+async function sendRaw(rawText, channel) {
   try {
     const token = String(process.env.SLACK_BOT_TOKEN || '').trim();
     const dest = String(channel || process.env.RPD_SLACK_CHANNEL || '').trim();
     if (!token || !dest) return configuredError();
 
-    const text = buildText({ runName, cells, takeaway, galleryUrl });
+    const text = rawText.length > TEXT_MAX ? clip(rawText, TEXT_MAX) : rawText;
 
     // Copied from services/alertService.js sendSlack (~226-291): Node 20+
     // global fetch, abort on timeout. Token appears only in the header.
@@ -116,4 +128,4 @@ async function postExperiment({ channel, runName, galleryUrl, cells, takeaway } 
   }
 }
 
-module.exports = { postExperiment };
+module.exports = { postExperiment, postText };

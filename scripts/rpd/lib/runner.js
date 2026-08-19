@@ -40,6 +40,7 @@ const {
 } = require('../../../services/atlasVideoService');
 const { buildForCell } = require('./promptVariants');
 const { settleCell, probeUrls } = require('./atlasPoll');
+const { announceReceipt } = require('./receiptEscape');
 const { writeManifest } = require('./manifest');
 
 // MODEL_CAPS carries these rates with an UNVERIFIED comment — the estimate
@@ -328,6 +329,13 @@ async function submitCells(submittable, { runDir, manifest, submit = submitGener
     cell.timings.submitMs = Date.now() - sub0; // includes pacing wait + any structured-429 backoff
     cell.costUsd = cell.estUsd;
     cell.costSource = 'estimated';
+    // Push the receipt OFF the box too (opt-in, hosted runs) — an ephemeral
+    // filesystem discards manifest.json, and a receipt nobody holds is money
+    // that can never be reconciled. Fire-and-forget, never throws.
+    announceReceipt({
+      cellId: cell.id, predictionId, model: cell.model,
+      estUsd: cell.estUsd, runName: manifest && manifest.name
+    });
     try {
       persist(runDir, manifest);
     } catch (err) {
@@ -466,12 +474,16 @@ async function runSpec(specPath, { live = false, maxUsd = null, outRoot = 'rpd-r
   // Optional Cloudinary mirror. Runs AFTER settle and can never un-settle a
   // paid cell (uploadCellOutputs never throws).
   if (upload) {
-    const { uploadCellOutputs } = require('./upload');
+    const { uploadCellOutputs, uploadManifest } = require('./upload');
     for (const cell of cells.filter((c) => c.status === 'done' && c.localPath)) {
       const res = await uploadCellOutputs(runDir, cell, spec.name);
       if (!res.ok) console.warn(`  ⚠️  ${cell.id}: upload — ${res.errors.join('; ')}`);
       writeManifest(runDir, manifest);
     }
+    // The ledger last, so it reflects every uploadedUrl written above.
+    const mres = await uploadManifest(runDir, spec.name);
+    if (mres.ok) console.log(`  ☁️  manifest mirrored: ${mres.url}`);
+    else console.warn(`  ⚠️  manifest not mirrored — ${mres.errors.join('; ')}`);
   }
 
   // Spend line: settled truth + every receipt still carrying an estimate.

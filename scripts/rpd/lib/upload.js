@@ -74,4 +74,27 @@ async function uploadCellOutputs(runDir, cell, runName) {
   }
 }
 
-module.exports = { uploadCellOutputs };
+
+// Mirror the MANIFEST itself, not just the media. On an ephemeral host the run
+// directory dies with the job, and the manifest IS the spend ledger — losing it
+// means the settled prices and receipts are unrecoverable even though the media
+// survived. Cloudinary takes non-media via resourceType 'raw'.
+async function uploadManifest(runDir, runName) {
+  if (!cloudinaryConfigured()) return { ok: false, errors: ['CLOUDINARY_* not configured'] };
+  try {
+    const { uploadFileToCloudinary } = require('../../../services/cloudinaryService');
+    const abs = path.join(runDir, 'manifest.json');
+    const result = await uploadFileToCloudinary(abs, {
+      folder: `liquidretail/rpd/${String(runName || 'untitled')}`,
+      resourceType: 'raw',
+      publicId: 'manifest.json',
+      overwrite: true   // the ledger is rewritten as cells settle; keep one current copy
+    });
+    const url = result && result.secure_url;
+    return url ? { ok: true, url } : { ok: false, errors: ['no secure_url'] };
+  } catch (err) {
+    return { ok: false, errors: [`manifest upload failed: ${err.message || err}`] };
+  }
+}
+
+module.exports = { uploadCellOutputs, uploadManifest };

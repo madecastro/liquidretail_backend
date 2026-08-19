@@ -691,6 +691,55 @@ const codeOnly = (src) => src
     fs.rmSync(tmp, { recursive: true, force: true });
   });
 
+  // ── H. hosted (ephemeral-disk) safety ──────────────────────────────────
+  console.log('\nH. hosted / ephemeral-disk safety');
+  const escSrc = read(path.join(RPD, 'lib', 'receiptEscape.js'));
+  const renderSh = read(path.join(RPD, 'loop', 'render-nightly.sh'));
+  check('H1 receipt escape is opt-in and cannot throw into a billable path', () => {
+    const { receiptEscapeEnabled, announceReceipt } = require(path.join(RPD, 'lib', 'receiptEscape'));
+    const prev = process.env.RPD_RECEIPT_SLACK;
+    try {
+      delete process.env.RPD_RECEIPT_SLACK;
+      assert.strictEqual(receiptEscapeEnabled(), false, 'must default OFF so laptop runs are unchanged');
+      process.env.RPD_RECEIPT_SLACK = '1';
+      assert.strictEqual(receiptEscapeEnabled(), true);
+      // No token/channel configured: must return silently, never throw.
+      const tok = process.env.SLACK_BOT_TOKEN; delete process.env.SLACK_BOT_TOKEN;
+      announceReceipt({ cellId: 'c', predictionId: 'p', model: 'm', estUsd: 1, runName: 'r' });
+      if (tok !== undefined) process.env.SLACK_BOT_TOKEN = tok;
+    } finally {
+      if (prev === undefined) delete process.env.RPD_RECEIPT_SLACK;
+      else process.env.RPD_RECEIPT_SLACK = prev;
+    }
+    // Must not be awaited at either call site — an await would put a Slack
+    // outage on the critical path of a paid submit.
+    for (const f of ['runner.js', 'staticRunner.js']) {
+      const src = codeOnly(read(path.join(RPD, 'lib', f)));
+      assert(/announceReceipt\(/.test(src), `${f} must announce receipts`);
+      assert(!/await\s+announceReceipt/.test(src), `${f} must NOT await announceReceipt`);
+    }
+  });
+  check('H2 the hosted entrypoint fails closed without a way to persist receipts', () => {
+    // Spending on a box whose disk is discarded, with no receipt channel, is
+    // strictly worse than not running: nobody could reconcile the charge.
+    assert(/REFUSING to run/.test(renderSh));
+    for (const v of ['ATLAS_API_KEY', 'CLOUDINARY_API_KEY', 'CLOUDINARY_API_SECRET', 'SLACK_BOT_TOKEN', 'RPD_SLACK_CHANNEL']) {
+      assert(new RegExp(`\\[ -z "\\$\\{${v}:-\\}" \\]`).test(renderSh), `must require ${v}`);
+    }
+    assert(/RPD_RECEIPT_SLACK=1/.test(renderSh), 'must enable receipt escape');
+    assert(/--upload/.test(renderSh), 'must mirror artifacts + ledger off the box');
+  });
+  check('H3 the ledger itself is mirrored, not just the media', () => {
+    const upSrc = codeOnly(read(path.join(RPD, 'lib', 'upload.js')));
+    assert(/uploadManifest/.test(upSrc), 'upload.js must expose a manifest mirror');
+    assert(/resourceType:\s*'raw'/.test(upSrc), 'manifest.json is not media — needs resourceType raw');
+    const runSrc = codeOnly(read(path.join(RPD, 'lib', 'runner.js')));
+    const cellIdx = runSrc.indexOf('uploadCellOutputs(');
+    const manIdx = runSrc.indexOf('uploadManifest(');
+    assert(cellIdx !== -1 && manIdx !== -1 && cellIdx < manIdx,
+      'the ledger must be mirrored AFTER the cells, so it carries their uploadedUrls');
+  });
+
   console.log(`\n${passed} passed, ${failed} failed`);
   process.exit(failed ? 1 : 0);
 })().catch((err) => {

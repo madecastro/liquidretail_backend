@@ -31,6 +31,7 @@ const {
 } = require('../../../services/atlasImageService');
 const { buildForStaticCell } = require('./staticPrompt');
 const { writeManifest } = require('./manifest');
+const { announceReceipt } = require('./receiptEscape');
 
 // MEASURED settled prices (Phase B 2026-08-10/11 + this harness), NOT catalog
 // base_price. Value is the HIGHEST measured size for that model, because the
@@ -182,6 +183,10 @@ async function runStaticCells(submittable, {
             cell.costUsd = Number((cell.estUsd * cell.predictionIds.length).toFixed(4));
             cell.costSource = 'estimated';
             cell.charged = true;                  // a submit id means money committed
+            announceReceipt({
+              cellId: cell.id, predictionId: id, model: cell.model,
+              estUsd: cell.estUsd, runName: manifest && manifest.name
+            });
             if (cell.predictionIds.length > 1) {
               log.warn(
                 `  ⚠️  ${cell.id}: Atlas accepted a SECOND submit (${id}) after a failed prediction — ` +
