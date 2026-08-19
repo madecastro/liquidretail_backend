@@ -81,13 +81,20 @@ plumb `art_direction` / `creative_style` / `archetype` into the camera prompt.
 logs *"canonical directives bypassed"*), and the canonical directives inside
 `buildVeoPrompt`. `buildVeoPrompt` receives **no** Director concept — args are
 `{brand, product, media, layoutInput, sourceMedia, aspectRatio, seedHasText,
-hasProductReference, storyboard, caps, durationSec}`. Director is **off for
-video by default** (`directorVariants` opt-in; wizard "AI DIRECTOR VARIANTS —
-Off"). Even when on, Director does **not** drive the camera prompt or video
-titling (`docs/PIPELINES.md` §6). `meta_video` / `meta_all` use
+hasProductReference, storyboard, caps, durationSec, platformFormat}`. Director
+is **off for video by default** (`directorVariants` opt-in; wizard "AI DIRECTOR
+VARIANTS — Off"). Even when on, Director does **not** drive the camera prompt or
+video titling (`docs/PIPELINES.md` §6). `meta_video` / `meta_all` use
 `expandDeterministicVideo` — one Ad per product, no concept expansion.
 **Current objective: tune the canonical prompt.** Archetype-driven video is
 **deferred, not missing.**
+
+⚠️ **SUPERSEDED IN PART, 2026-08-18 — which prompt Meta gets.** The block above
+still describes the camera-only architecture correctly, but "the canonical
+camera-only prompt" is no longer the `gemini-omni` text for Meta. Meta video
+now selects the **`hook_first`** profile — the same one PMax uses. See the
+standardization note at the end of the PR #61 block below. The `gemini-omni`
+text itself is unchanged and still frozen.
 
 **FULL PR #61 camera-prompt ROLLBACK (owner 2026-08-03, commit `be5b83f`):**
 Commit `134db56` added three camera-prompt changes in
@@ -98,17 +105,65 @@ better."* The three reverted pieces: (1) Scene 3 "RETURN TO THE PRIMARY VIEW"
 primary view; (2) the `subjectContinuity` directive (both `OMNI_DIRECTIVES`
 and `GROK_DIRECTIVES`, plus its `lines.push` in `buildVeoPrompt`); (3) the
 crossfade-vs-long-dissolve policy rewording. **Mechanical acceptance test:**
-the file now differs from `git show 134db56~1:services/veoPromptBuilder.js` in
-exactly **two hunks**, both comment/export only (`OMNI_DIRECTIVES` /
-`GROK_DIRECTIVES` module exports for harnesses + the rollback comment block) —
-**zero prompt-string hunks.** Pinned by `scripts/verifyPostPilotBatch.js`
-(B1–B14); **B14** rebuilds the prompt from the `134db56~1` source out of git
-and asserts byte-identity. **CRITICAL — the restored text is deliberately
-self-contradictory:** `transitions` permits "Smooth crossfades only, ~0.25s"
-while `doNot` bare-bans "dissolves", and a crossfade **is** a short dissolve.
-Owner-confirmed: that contradictory prompt is the version that produced better
-output. **Anyone "fixing" the contradiction is reintroducing the
-regression.** Do not soften, split, or reword either string to resolve it.
+the `OMNI_DIRECTIVES` / `GROK_DIRECTIVES` prompt strings are byte-identical to
+`git show 134db56~1:services/veoPromptBuilder.js` — **zero prompt-string
+hunks.** Pinned by `scripts/verifyPostPilotBatch.js` (B1–B17); **B14** rebuilds
+the prompt from the `134db56~1` source out of git and asserts byte-identity on
+the destination-less path, **B15** asserts the same for every Meta destination
+with the hook-first kill switch **off**. **CRITICAL — the restored text is
+deliberately self-contradictory:** `transitions` permits "Smooth crossfades
+only, ~0.25s" while `doNot` bare-bans "dissolves", and a crossfade **is** a
+short dissolve. Owner-confirmed: that contradictory prompt is the version that
+produced better output. **Anyone "fixing" the contradiction is reintroducing
+the regression.** Do not soften, split, or reword either string to resolve it.
+
+**OWNER-DIRECTED STANDARDIZATION ON TOP OF THAT ROLLBACK (owner 2026-08-18).**
+Verbatim: *"I want to use the PMax prompt for Meta also, and standardize on
+that but maintain a single minting for 9x16 across both formats. Continue to
+mint a 16x9."* This deliberately breaks the byte-identity pin **on the live
+Meta path only**. Read the split below before touching anything here — the
+whole point of this paragraph is that a future session can tell what was
+directed from what would be drift.
+
+| | Status |
+|---|---|
+| `OMNI_DIRECTIVES` / `GROK_DIRECTIVES` **text** | **STILL FROZEN**, still `134db56~1`. Never reword. B1–B13 absence pins unchanged. |
+| Meta prompt with the switch **OFF** | **STILL byte-identical** to `134db56~1`. This is where the rollback guarantee now lives — B15. |
+| Destination-less prompt (scaffold, `aiVideoReferenceService`), either arm | **STILL byte-identical** — B14. |
+| Which profile a **Meta destination** selects with the switch **ON** | **CHANGED, by owner instruction** → `hook_first` (B16/B17). |
+
+Mechanism: the profile formerly called `pmax` is renamed **`hook_first`**
+(`PMAX_DIRECTIVES` → `HOOK_FIRST_DIRECTIVES`; both old names still exported as
+aliases, `'pmax'` still accepted as a profile value). `promptProfileFor` now
+returns it for **any** Meta *or* PMax video destination. The exact delta a Meta
+9:16 ad receives is five edits — HOOK-FIRST sentence appended to `objective`;
+Scene 1's "slow horizontal pan left→right, ~10–15%" replaced by the HOOK
+push-in; "Maintain center framing." → "Maintain centre-safe framing."; a
+centre-safe sentence inserted into `cameraStyle`; a `Frame (9:16 vertical):`
+line Meta never emitted before. **B16 reconstructs that exact delta from the
+`134db56~1` baseline and demands byte equality**, so any reword of either half
+fails loudly with a diff. **B17** pins that Meta 9:16 and PMax 9:16 emit one
+identical prompt — that equality is what lets one 9:16 plate serve both.
+
+**Kill switch — `VIDEO_HOOK_FIRST_PROMPT`, legacy alias `PMAX_VIDEO_DIRECTIVES`,
+default true. EITHER name reading `false` disables**, and that fail-safe OR is
+deliberate, not sloppiness: `config/defaults.env` is loaded by dotenv **without
+override**, so a "new name wins" precedence rule would silently shadow a Render
+dashboard override of the legacy name the moment the new name got a value in
+that file. Pinned by `verifyPmaxPromptOverlay` V2b (including the exact
+defaults.env shape: new=`true` + dashboard legacy=`false` must still kill).
+Flipping it off restores **both** platforms — Meta to the frozen pre-#61 text
+byte-for-byte, PMax to Phase A. Other services must gate on the exported
+**`isHookFirstVideoPromptEnabled()`**, never on an inline `process.env` read
+(the two-name OR is not reproducible by `process.env.X !== 'false'`), and never
+on the two profiles merely *matching* — with the switch off they also match, on
+the frozen Ken Burns pan that PMax Phase B rejected.
+
+One text edit was required for platform-neutrality and is called out here
+because it changes bytes the model sees: the lifestyle branch's two destination
+labels read `HOOK-FIRST (PMax destination)` / `Centre-safe composition (PMax
+destination)`; naming PMax became false on a Meta ad, so both now say
+`(video destination)`. Directive content is otherwise untouched.
 
 **Primary-reference repeat is default OFF** (same day / same reason): both the
 code default (`isRepeatPrimaryReferenceEnabled`, `atlasVideoService.js:829`)

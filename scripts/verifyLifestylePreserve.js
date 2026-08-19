@@ -54,7 +54,11 @@ const ORIG = {
   STATIC_LIFESTYLE_PRESERVE: process.env.STATIC_LIFESTYLE_PRESERVE,
   STATIC_PROMPT_FIDELITY_HARDENING: process.env.STATIC_PROMPT_FIDELITY_HARDENING,
   VIDEO_LIFESTYLE_PROMPT: process.env.VIDEO_LIFESTYLE_PROMPT,
-  PMAX_STATIC_PLATFORM_NOTES: process.env.PMAX_STATIC_PLATFORM_NOTES
+  PMAX_STATIC_PLATFORM_NOTES: process.env.PMAX_STATIC_PLATFORM_NOTES,
+  // Hook-first destination kill switch — both names, so restoreEnv() puts the
+  // process back exactly as it found it after V9 drives the OFF arm.
+  PMAX_VIDEO_DIRECTIVES: process.env.PMAX_VIDEO_DIRECTIVES,
+  VIDEO_HOOK_FIRST_PROMPT: process.env.VIDEO_HOOK_FIRST_PROMPT
 };
 
 function setEnv(key, val) {
@@ -82,9 +86,16 @@ function loadIntents({ preserve, hardening, pmaxNotes } = {}) {
   return require('../services/staticAdIntents');
 }
 
-function loadVeo({ lifestyle } = {}) {
+// pmaxVideo drives the hook-first destination kill switch (owner 2026-08-18:
+// Meta and PMax share one camera prompt). Omitted → left at its ambient value,
+// which is ON by default, preserving every existing caller's behaviour.
+// Written through the LEGACY env name deliberately: it is the name that may be
+// set on the Render dashboard, and exercising it here keeps the backward
+// compatibility path covered by a real test rather than only by a comment.
+function loadVeo({ lifestyle, pmaxVideo } = {}) {
   delete require.cache[VEO_KEY];
   setEnv('VIDEO_LIFESTYLE_PROMPT', lifestyle);
+  setEnv('PMAX_VIDEO_DIRECTIVES', pmaxVideo);
   return require('../services/veoPromptBuilder');
 }
 
@@ -1025,7 +1036,19 @@ console.log('\n=== VIDEO lifestyle directives ===\n');
   }
 }
 
-// V9 — lifestyle + PMax compose (orthogonal, not suppress)
+// V9 — lifestyle + hook-first destination compose (orthogonal, not suppress)
+//
+// UPDATED 2026-08-18 for the owner-directed standardization, verbatim:
+//   "I want to use the PMax prompt for Meta also, and standardize on that but
+//    maintain a single minting for 9x16 across both formats. Continue to mint
+//    a 16x9."
+// This block used to assert `V9 lifestyle+Meta does NOT emit Frame (9:16)`,
+// on the premise that the Frame line was PMax-only destination treatment.
+// Meta video destinations now select the same hook-first profile, so that
+// assertion is false BY DESIGN and has been inverted rather than deleted:
+// the ON arm pins that Meta does emit it, and a new OFF arm pins that the
+// kill switch takes it away again. Both directions still fail on a real
+// regression — the check was not weakened, it was re-pointed.
 {
   const on = loadVeo({ lifestyle: 'true' });
   const pmaxLife = on.buildVeoPrompt({
@@ -1065,12 +1088,59 @@ console.log('\n=== VIDEO lifestyle directives ===\n');
     /Centre-safe|center-safe|central region/i.test(pmaxLife));
   check('V9 lifestyle+PMax emits Frame (9:16)',
     pmaxLife.includes('Frame (9:16 vertical)'));
-  check('V9 lifestyle+Meta does NOT emit Frame (9:16)',
-    !metaLife.includes('Frame (9:16 vertical)'));
+  // Switch ON: Meta lifestyle now takes the same destination treatment as PMax.
+  check('V9 lifestyle+Meta DOES emit Frame (9:16) — owner 2026-08-18 standardization',
+    metaLife.includes('Frame (9:16 vertical)'));
+  check('V9 lifestyle+Meta carries hook-first destination treatment',
+    /HOOK-FIRST|HOOK —/i.test(metaLife));
   check('V9 packshot+PMax still Ken Burns packshot path',
     pmaxPack.includes('Ken Burns') || pmaxPack.includes('product commercial'));
   check('V9 lifestyle+PMax does not re-impose product stays completely static',
     !pmaxLife.includes('product stays completely static'));
+
+  // Platform neutrality: one profile now serves both platforms, so the
+  // destination labels the lifestyle branch injects must not name a platform.
+  // These lines used to read "HOOK-FIRST (PMax destination)" / "Centre-safe
+  // composition (PMax destination)" — literally false on a Meta ad.
+  check('V9 lifestyle+Meta never names PMax in text sent to the model',
+    !/PMax/i.test(metaLife));
+  check('V9 lifestyle+PMax never names Meta in text sent to the model',
+    !/\bMeta\b/i.test(pmaxLife));
+
+  // Kill switch OFF: the destination treatment goes away again on BOTH
+  // platforms. Without this arm the inversion above would be a one-way pin.
+  {
+    const off = loadVeo({ lifestyle: 'true', pmaxVideo: 'false' });
+    const metaLifeOff = off.buildVeoPrompt({
+      product: { title: 'Wool Runner' },
+      seedStyle: 'lifestyle',
+      variantKind: 'ugc',
+      platformFormat: 'meta_reels_9_16',
+      aspectRatio: '9:16',
+      durationSec: 8,
+      hasProductReference: false,
+      caps: { promptByteCap: 20000, paramShape: 'gemini-omni' }
+    });
+    const pmaxLifeOff = off.buildVeoPrompt({
+      product: { title: 'Wool Runner' },
+      seedStyle: 'lifestyle',
+      variantKind: 'ugc',
+      platformFormat: 'pmax_video_9_16',
+      aspectRatio: '9:16',
+      durationSec: 10,
+      hasProductReference: false,
+      caps: { promptByteCap: 20000, paramShape: 'gemini-omni' }
+    });
+    check('V9 switch-OFF lifestyle+Meta drops the Frame (9:16) line again',
+      !metaLifeOff.includes('Frame (9:16 vertical)'));
+    check('V9 switch-OFF lifestyle+Meta drops the hook-first destination inject',
+      !/HOOK-FIRST \(video destination\)/.test(metaLifeOff));
+    check('V9 switch-OFF lifestyle+PMax drops the Frame (9:16) line too (Phase A)',
+      !pmaxLifeOff.includes('Frame (9:16 vertical)'));
+    // Lifestyle itself is untouched by the destination switch.
+    check('V9 switch-OFF lifestyle+Meta still uses the lifestyle directive set',
+      metaLifeOff.includes('Lifestyle motion editor'));
+  }
 }
 
 // V7 — guidance snippets

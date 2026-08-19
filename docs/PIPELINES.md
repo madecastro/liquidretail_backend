@@ -998,14 +998,26 @@ cascade; it IS awareness. Separate 10s PMax *pacing* files selected via
 per-run `presetOverride` (still open — see the reverted 8s→10s re-time
 above) is a different question from stage selection.
 
-#### PMax video directives profile (Phase B)
+#### Hook-first video directives profile (Phase B; standardized onto Meta 2026-08-18)
 
-`services/veoPromptBuilder.js` — new **`PMAX_DIRECTIVES`** profile, same key
-shape as `OMNI_DIRECTIVES`, selected only for PMax destinations via a new
-optional arg to `buildVeoPrompt` (absent → today's Meta behaviour **exactly**).
-Kill switch **`PMAX_VIDEO_DIRECTIVES`** (default **true**).
+`services/veoPromptBuilder.js` — the **`hook_first`** profile (`HOOK_FIRST_DIRECTIVES`),
+same key shape as `OMNI_DIRECTIVES`, selected from the destination passed to
+`buildVeoPrompt` (absent → the frozen `gemini-omni`/`grok` path **exactly**).
+Kill switch **`VIDEO_HOOK_FIRST_PROMPT`**, legacy alias **`PMAX_VIDEO_DIRECTIVES`**
+(default **true**; see the switch semantics below).
 
-Differences from the Meta profile, **and only these**:
+⚠️ **This profile shipped as PMax-only and is no longer PMax-only.** Owner
+2026-08-18, verbatim: *"I want to use the PMax prompt for Meta also, and
+standardize on that but maintain a single minting for 9x16 across both formats.
+Continue to mint a 16x9."* It was named `PMAX_DIRECTIVES` / profile `'pmax'`
+until that date; both old names are still exported as aliases and `'pmax'` is
+still accepted as a profile value, so older call sites keep resolving.
+**`promptProfileFor` now returns `hook_first` for any Meta *or* PMax video
+destination.** The section below was written when Meta was excluded — read
+"differences from the Meta profile" as "differences from the frozen
+`gemini-omni` profile", which is what Meta falls back to when the switch is off.
+
+Differences from the frozen `gemini-omni` profile, **and only these**:
 
 - **HOOK-FIRST** — product identifiable within the first 2 seconds (this
   surface is skipped/scrolled in seconds; the opening frames carry the ad).
@@ -1018,7 +1030,10 @@ Differences from the Meta profile, **and only these**:
 - **Aspect-aware Frame line** — for 16:9: wider establishing framing,
   horizontal rather than vertical camera travel, product in the central band
   with headroom above and below. **`aspectRatio` had never been used in prompt
-  text before** — the PMax profile is the first consumer.
+  text before** — this profile is the first consumer. Only **16:9** and **9:16**
+  have a Frame line; Meta's 1:1 and 4:5 surfaces are free crops of the 9:16
+  master (`deriveFromMaster`) and never build their own prompt, so they simply
+  get no Frame line rather than a wrong one.
 
 Fidelity / noText / physicalAccuracy / productPreservation are **referenced
 from `OMNI_DIRECTIVES`** (not re-authored) so they cannot drift.
@@ -1032,10 +1047,54 @@ from `OMNI_DIRECTIVES`** (not re-authored) so they cannot drift.
    for the PLATFORM_NOTES / geometry contradiction and the blank-env threshold
    parser.
 
-**The frozen Meta camera prompt is untouched**, confirmed two independent ways:
+**The frozen `gemini-omni` camera prompt text is untouched** —
 `scripts/verifyPostPilotBatch.js` **B14** (rebuilds from the pre-PR#61 source
-out of git, byte-identity) still passes, **and** a direct build/byte-compare
-against `git show HEAD:` across both aspects × durations 8 and 10.
+out of git, byte-identity on the destination-less path) still passes.
+
+##### What the 2026-08-18 standardization changed, and what it did not
+
+| | Status |
+|---|---|
+| `OMNI_DIRECTIVES` / `GROK_DIRECTIVES` **text** | **Frozen.** Still `134db56~1`. |
+| Meta prompt, switch **OFF** | **Byte-identical** to `134db56~1` — the surviving PR #61 rollback guarantee (**B15**). |
+| Destination-less prompt, either arm | **Byte-identical** (**B14**). |
+| Meta destination, switch **ON** | **Changed by owner instruction** → `hook_first` (**B16**, **B17**). |
+
+The delta a Meta 9:16 ad receives is exactly five edits: the HOOK-FIRST
+sentence appended to `objective`; Scene 1's "slow horizontal pan left→right,
+~10–15%" replaced by the HOOK push-in; `Maintain center framing.` →
+`Maintain centre-safe framing.`; a centre-safe sentence inserted into
+`cameraStyle`; and the `Frame (9:16 vertical):` line. **B16 reconstructs that
+delta from the `134db56~1` baseline and demands byte equality**, so a reword of
+either half fails with a diff rather than drifting. **B17** pins Meta 9:16 ≡
+PMax 9:16 — the equality that lets one 9:16 plate serve both destinations.
+Measured size: +903 chars (3,581 → 4,488 bytes on a representative packshot),
+against Omni's 20,000-byte cap. Worst realistic Meta prompt measured (lifestyle
+/ UGC + product anchor + burned-in-text clause + 600-char guidance + 200-char
+title at 15s) is **8,990 bytes** — 11 KB of headroom.
+
+**Kill-switch semantics — `VIDEO_HOOK_FIRST_PROMPT`, legacy alias
+`PMAX_VIDEO_DIRECTIVES`, default true. EITHER name reading `false` disables.**
+That fail-safe OR is deliberate: `config/defaults.env` is loaded by dotenv
+**without override**, so a "new name wins" precedence rule would silently
+shadow a Render dashboard override of the legacy name as soon as the new name
+carried a value in that file. Pinned by `verifyPmaxPromptOverlay` **V2b**,
+including the exact production shape (new `true` from defaults.env + dashboard
+legacy `false` must still kill). Flipping it off restores **both** platforms.
+Other services must gate on the exported **`isHookFirstVideoPromptEnabled()`** —
+not on an inline `process.env` read (the two-name OR is not reproducible by
+`process.env.X !== 'false'`), and not on the two profiles merely *matching*,
+because with the switch off they also match, on the frozen Ken Burns pan.
+
+**One platform-neutrality text edit**, called out because it changes bytes the
+model sees: the lifestyle branch's destination labels read `HOOK-FIRST (PMax
+destination)` and `Centre-safe composition (PMax destination)`. Naming PMax is
+false on a Meta ad, so both now read `(video destination)`. Directive content is
+otherwise unchanged. Packshot prompts never contained a platform name.
+
+**Split-stage is unreachable from Meta** twice over: no runtime call site
+threads `subjectSide` (`generateForAd` does not pass it), and `isSplit`
+additionally requires 16:9 while Meta's only video master is 9:16.
 
 #### Director: funnel spread + social-proof hierarchy (Phase B)
 
@@ -1378,7 +1437,8 @@ Non-Cloudinary sources can't be transformed by URL, so they pad locally via `pad
 | `VEO_ADS_PER_PRODUCT_CAP` | `1` | Cap on **concept** video variants only (not deterministic) |
 | `DERIVE_MASTER_WAIT_MS` | `720000` (12 min) | In-render wait ceiling for the derive-only path to see the master's plate (`routes/ads.js`). Do **not** "fix" by requeueing — see [Google PMax video](#google-performance-max-video-phase-a-2026-08-10) |
 | `DERIVE_MASTER_POLL_MS` | `10000` (10s) | Poll interval while waiting for the master plate |
-| `PMAX_VIDEO_DIRECTIVES` | **`true`** | Phase B: PMax destinations use `PMAX_DIRECTIVES` in `veoPromptBuilder` (hook-first, centre-safe, aspect-aware Frame). Meta camera prompt untouched. `false` → Omni/Grok canonical profile for PMax too |
+| `VIDEO_HOOK_FIRST_PROMPT` | **`true`** | **BOTH Meta and PMax** video destinations use `HOOK_FIRST_DIRECTIVES` in `veoPromptBuilder` (hook-first, centre-safe, aspect-aware Frame). Owner standardization 2026-08-18. `false` → frozen Omni/Grok profile for both; Meta returns to the pre-#61 text **byte-for-byte**. Gate other code on `isHookFirstVideoPromptEnabled()` |
+| `PMAX_VIDEO_DIRECTIVES` | **`true`** | **Legacy alias** for the row above (the Phase B name; may be set on the Render dashboard). **Either name reading `false` disables** — fail-safe OR, not precedence, because dotenv loads `defaults.env` without override. Pinned by `verifyPmaxPromptOverlay` V2b |
 | `PMAX_PROOF_STRONG_RATING` | `4.5` | Phase B: interpolated into the PMax-only Director hierarchy (RATING-FIRST vs POPULARITY). Meta never sees it |
 | `PMAX_PROOF_MIN_REVIEW_COUNT` | `100` | Phase B: interpolated "substantial count" floor for the PMax hierarchy. Below this, omit the count |
 | `VEO_USE_GPT_STORYBOARD` | `true` | Storyboard on paths that still use it (not Atlas Ken Burns) |
@@ -1509,7 +1569,7 @@ Versioned with the repo. Feature flags, tuning knobs, public IDs/URLs, Slack cha
 | Director seed window | `DIRECTOR_UNIVERSE_TOP_N=1` |
 | Static regenerate reseed | `REGEN_RESEED_CATALOG_FIRST=true` (default ON; kill switch for catalog-first reseed on regenerate — see §5) |
 | Static direct-image path | `AI_DIRECT_IMAGE_*` (edit model / quality / timeout). `AI_IMAGE_REFERENCE_*` kept **inert** (no live consumer) |
-| PMax Phase B creative knobs | `PMAX_STATIC_PLATFORM_NOTES=true`, `PMAX_VIDEO_DIRECTIVES=true`, `PMAX_PROOF_STRONG_RATING=4.5`, `PMAX_PROOF_MIN_REVIEW_COUNT=100` (prompt text only — not money knobs; Meta byte-identity when static/video flags on or off) |
+| PMax Phase B creative knobs | `PMAX_STATIC_PLATFORM_NOTES=true`, `VIDEO_HOOK_FIRST_PROMPT=true` (legacy alias `PMAX_VIDEO_DIRECTIVES=true`), `PMAX_PROOF_STRONG_RATING=4.5`, `PMAX_PROOF_MIN_REVIEW_COUNT=100` (prompt text only — not money knobs). ⚠️ The Meta-byte-identity claim now holds for the **static** flag and for the **OFF arm** of the video flag only: owner 2026-08-18 standardized the Meta **video** camera prompt onto the hook-first profile |
 | Video (Omni under `veo*` names) | `AI_VEO_FEED`, `AI_VEO_REELS`, `AI_VIDEO_POSTER_ENABLED`, `VIDEO_PROVIDER`, `VEO_USE_GPT_STORYBOARD`, `ATLAS_*`, `VEO_CONCURRENCY=4`, `REPEAT_PRIMARY_REFERENCE=false` |
 | Concurrency | `WORKER_CONCURRENCY`, `RENDER_CONCURRENCY=8` (**live since 2026-08-03** — see above), `VEO_CONCURRENCY=4`, `ATLAS_SUBMIT_SPACING_MS`, `GROK_MAX_RPS`, `MAX_CREATIVES_PER_RUN` — resolved via `services/concurrency.js` |
 | Slack alert channels (non-secret) | `SLACK_ALERT_CHANNEL`, `SLACK_ALERT_CHANNEL_FATAL`, `SLACK_ALERT_CHANNEL_STATUS` (per-run live feed via `runFeedService`) |

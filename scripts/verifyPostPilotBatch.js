@@ -11,7 +11,12 @@
  *              return-to-primary beat (+ its two PRODUCT FIDELITY sentences),
  *              the crossfade-vs-long-dissolve policy, AND the
  *              subjectContinuity directive. The prompt text must match
- *              134db56~1 byte-for-byte (pinned end-to-end by B14).
+ *              134db56~1 byte-for-byte (pinned end-to-end by B14 + B15).
+ *   CHANGE 4 — OWNER-DIRECTED HOOK-FIRST STANDARDIZATION (2026-08-18). Meta
+ *              video now uses the same hook-first camera prompt as PMax.
+ *              B15 keeps the rollback guarantee in the kill-switch-OFF arm,
+ *              B16 pins the exact ON-arm delta, B17 pins that Meta and PMax
+ *              emit one identical prompt. Full note at the B15/B16/B17 block.
  *   CHANGE 3 — primary reference repeat: capability retained but DEFAULT OFF,
  *              so a default request ships exactly 3 distinct refs with nothing
  *              appended. Flag-on behaviour (append when room, not at cap,
@@ -36,6 +41,17 @@
  * directive is itself a hallucination driver. So B1/B2/B3/B8 assert its
  * ABSENCE. Do not "restore" any of these pins: a green run here means the
  * prompt matches the known-good pre-#61 wording.
+ *
+ * ── WHAT IS STILL FROZEN AFTER 2026-08-18 (read before touching anything) ──
+ * The owner standardized Meta onto the PMax hook-first camera prompt. That is
+ * a DELIBERATE, DIRECTED change to which prompt Meta selects — it is NOT a
+ * licence to edit the frozen text itself. Precisely:
+ *   • OMNI_DIRECTIVES text                 — STILL FROZEN, still 134db56~1.
+ *   • Meta prompt with the switch OFF      — STILL byte-identical (B15).
+ *   • Destination-less prompt, either arm  — STILL byte-identical (B14).
+ *   • Which profile a Meta destination picks with the switch ON — CHANGED,
+ *     by owner instruction, to the hook-first profile (B16/B17).
+ * The B1–B13 absence pins apply to the frozen directive set and stay as-is.
  *
  * That revert reinstates a KNOWN, OWNER-CONFIRMED CONTRADICTION: `transitions`
  * permits "Smooth crossfades only, ~0.25s" (pinned by B4) while `doNot`
@@ -424,12 +440,186 @@ let b14SkipReason = null;
               hasProductReference, durationSec, seedHasText, caps,
             };
             const label = `caps=${capName} productRef=${hasProductReference} dur=${durationSec} seedText=${seedHasText}`;
-            check(`B14 built prompt is byte-identical to the 134db56~1 prompt (${label})`,
+            check(`B14 dest=none built prompt is byte-identical to the 134db56~1 prompt (${label})`,
               buildVeoPrompt({ ...args }), oldMod.buildVeoPrompt({ ...args }));
           }
         }
       }
     }
+
+    // ══ B15/B16/B17 — OWNER-DIRECTED STANDARDIZATION, 2026-08-18 ═══════════
+    //
+    // Owner instruction, VERBATIM, so the next reader knows this was directed
+    // and not drift (mirroring how CLAUDE.md §00 records the #61 rollback):
+    //
+    //   "I want to use the PMax prompt for Meta also, and standardize on that
+    //    but maintain a single minting for 9x16 across both formats. Continue
+    //    to mint a 16x9."
+    //
+    // WHY B14 ALONE IS NO LONGER ENOUGH — AND WHY IT DID NOT GO RED.
+    // B14 above passes NO platformFormat. promptProfileFor() only reaches the
+    // hook_first branch when a destination is supplied, so the destination-less
+    // matrix still resolves to gemini-omni and still matches 134db56~1. That is
+    // correct and worth keeping — the scaffold and aiVideoReferenceService really
+    // do call with no destination — but it is NOT the live Meta path. The live
+    // submit passes `platformFormat: ad.platformFormat` (atlasVideoService.js,
+    // generateForAd). So B14 staying green proves nothing about Meta any more,
+    // and treating its green as "no Meta impact" would be exactly backwards.
+    // B15/B16/B17 pin the destination-carrying path that production uses.
+    //
+    // WHAT REMAINS FROZEN: the OFF arm. B15 is the surviving PR #61 rollback
+    // guarantee — with the kill switch off, every Meta destination still emits
+    // the 134db56~1 prompt byte-for-byte. Do not delete or weaken B15; it is the
+    // reason the owner's "the previous output was better" finding is still
+    // recoverable by flipping one env var.
+    //
+    // TRAP (cost a debugging cycle while writing this): the kill switch is read
+    // inside isHookFirstVideoPromptEnabled() at CALL time, not at require time.
+    // Setting the env and re-requiring the module is unnecessary; capturing a
+    // module handle per arm and calling it later is actively WRONG, because both
+    // handles observe whatever the env says at the moment of the call. Set the
+    // env immediately before each buildVeoPrompt call, as below.
+    const HOOK_ENV = 'VIDEO_HOOK_FIRST_PROMPT';
+    const priorHookEnv = process.env[HOOK_ENV];
+    const priorLegacyEnv = process.env.PMAX_VIDEO_DIRECTIVES;
+    const withSwitch = (state, fn) => {
+      // Both names must be neutralised: either one reading 'false' kills.
+      delete process.env.PMAX_VIDEO_DIRECTIVES;
+      process.env[HOOK_ENV] = state;
+      try { return fn(); } finally {
+        if (priorHookEnv === undefined) delete process.env[HOOK_ENV];
+        else process.env[HOOK_ENV] = priorHookEnv;
+        if (priorLegacyEnv === undefined) delete process.env.PMAX_VIDEO_DIRECTIVES;
+        else process.env.PMAX_VIDEO_DIRECTIVES = priorLegacyEnv;
+      }
+    };
+
+    // Every Meta video destination. meta_stories_9_16 is the live master that
+    // actually submits; the other three are the free crop/retitle derives and
+    // are covered so a future minting change that promotes one to a master
+    // cannot silently pick up a different camera prompt.
+    const META_DESTINATIONS = [
+      'meta_stories_9_16', 'meta_reels_9_16', 'meta_feed_4_5', 'meta_feed_1_1',
+    ];
+    const OMNI_CAPS = { promptByteCap: 20000, paramShape: 'gemini-omni' };
+
+    // ── B15: kill switch OFF ⇒ Meta is STILL the frozen pre-#61 prompt ─────
+    for (const dest of META_DESTINATIONS) {
+      for (const hasProductReference of [true, false]) {
+        for (const durationSec of [4, 8, 15]) {
+          for (const seedHasText of [false, true]) {
+            const args = {
+              product: { title: 'Wool Runner' },
+              hasProductReference, durationSec, seedHasText,
+              caps: OMNI_CAPS, aspectRatio: '9:16', platformFormat: dest,
+            };
+            const label = `dest=${dest} productRef=${hasProductReference} dur=${durationSec} seedText=${seedHasText}`;
+            check(`B15 switch=OFF Meta prompt is STILL byte-identical to 134db56~1 — the surviving PR #61 rollback guarantee (${label})`,
+              withSwitch('false', () => buildVeoPrompt({ ...args })),
+              oldMod.buildVeoPrompt({ ...args }));
+          }
+        }
+      }
+    }
+
+    // ── B16: kill switch ON ⇒ Meta gets EXACTLY the documented delta ───────
+    // Reconstructs the expected ON prompt by applying five literal edits to the
+    // frozen 134db56~1 string, then demands byte equality. This is the companion
+    // pin to B15: B15 says "off is unchanged", B16 says "on changed by exactly
+    // this and nothing else". Any reword of the hook-first directives, any extra
+    // injected line, and any drift in the frozen base all fail here with a diff.
+    //
+    // Each edit asserts it matched EXACTLY ONCE before applying. A find-string
+    // that stops matching (because someone reworded the frozen base) reports
+    // itself as not-applied instead of silently producing a passing no-op.
+    const HOOK_OBJECTIVE_ANCHOR =
+      'Objective: Create a premium product commercial using subtle Ken Burns camera moves. ';
+    const HOOK_OBJECTIVE_INSERT =
+      'HOOK-FIRST: this surface is skipped or scrolled past in seconds — the product must be identifiable within the first 2 seconds; the opening frames carry the whole ad. ';
+    const CAMERA_STYLE_ANCHOR =
+      'Camera style: Luxury, slow, elegant, stable. Ease in/out. ';
+    const CENTRE_SAFE_INSERT =
+      'Centre-safe composition: keep the product and any focal detail within the central region of the frame — away from the top and bottom bands and the outer side margins, where the platform overlays UI. ';
+    const FRAME_ANCHOR = 'The product stays completely static. Background:';
+    const FRAME_916_INSERT =
+      'The product stays completely static. Frame (9:16 vertical): vertical-appropriate framing with the product readable upright in portrait. Keep the product in the central region, clear of the top and bottom bands and the right edge where the platform overlays UI. Background:';
+
+    const scene1Frozen = (t1) =>
+      `Scene 1 (0.0–${t1}s): slow horizontal pan left→right, ~10–15% movement. No zoom, rotation, or perspective shift. `;
+    const scene1HookFirst = (t1) =>
+      `Scene 1 (0.0–${t1}s): HOOK — product fully legible and identifiable from the first frame; `
+      + 'the establishing camera move happens WITH the product already reading as the subject, not before it. '
+      + 'Very slow push-in toward the product, ~8–12% movement, product held on the vertical centre line. '
+      + 'No lateral drift toward either side margin. No rotation or perspective shift. '
+      + 'The product must be unmistakable within the first 2.0s. ';
+
+    // Returns { out, notApplied } — notApplied names every edit whose anchor did
+    // not appear exactly once, so a stale expectation FAILS LOUDLY.
+    function applyHookFirstDelta(frozen, durationSec) {
+      const t1 = (Number(durationSec) / 3).toFixed(2);
+      const edits = [
+        ['objective HOOK-FIRST sentence', HOOK_OBJECTIVE_ANCHOR, HOOK_OBJECTIVE_ANCHOR + HOOK_OBJECTIVE_INSERT],
+        ['Scene 1 pan → hook push-in',    scene1Frozen(t1),      scene1HookFirst(t1)],
+        ['Scene 3 centre-safe framing',   'Maintain center framing.', 'Maintain centre-safe framing.'],
+        ['cameraStyle centre-safe',       CAMERA_STYLE_ANCHOR,   CAMERA_STYLE_ANCHOR + CENTRE_SAFE_INSERT],
+        ['Frame (9:16 vertical) line',    FRAME_ANCHOR,          FRAME_916_INSERT],
+      ];
+      let out = frozen;
+      const notApplied = [];
+      for (const [name, find, repl] of edits) {
+        if (out.split(find).length - 1 !== 1) { notApplied.push(name); continue; }
+        out = out.replace(find, repl);
+      }
+      return { out, notApplied };
+    }
+
+    for (const hasProductReference of [true, false]) {
+      for (const durationSec of [4, 8, 15]) {
+        for (const seedHasText of [false, true]) {
+          const args = {
+            product: { title: 'Wool Runner' },
+            hasProductReference, durationSec, seedHasText,
+            caps: OMNI_CAPS, aspectRatio: '9:16',
+            platformFormat: 'meta_stories_9_16',
+          };
+          const label = `productRef=${hasProductReference} dur=${durationSec} seedText=${seedHasText}`;
+          const frozen = oldMod.buildVeoPrompt({ ...args });
+          const { out: expected, notApplied } = applyHookFirstDelta(frozen, durationSec);
+          check(`B16 all five documented hook-first edits still apply to the frozen base (${label})`,
+            notApplied, []);
+          check(`B16 switch=ON Meta prompt equals the frozen prompt plus EXACTLY the documented delta (${label})`,
+            withSwitch('true', () => buildVeoPrompt({ ...args })), expected);
+        }
+      }
+    }
+
+    // ── B17: the standardization itself ────────────────────────────────────
+    // "use the PMax prompt for Meta also, and standardize on that" — at the
+    // same aspect, Meta and PMax must now emit ONE identical camera prompt.
+    // This is what lets the 9:16 plate be minted once and shared.
+    for (const durationSec of [8, 10]) {
+      const shared = {
+        product: { title: 'Wool Runner' },
+        hasProductReference: true, seedHasText: false, durationSec,
+        caps: OMNI_CAPS, aspectRatio: '9:16',
+      };
+      const metaOn = withSwitch('true', () => buildVeoPrompt({ ...shared, platformFormat: 'meta_stories_9_16' }));
+      const pmaxOn = withSwitch('true', () => buildVeoPrompt({ ...shared, platformFormat: 'pmax_video_9_16' }));
+      const frozen = oldMod.buildVeoPrompt({ ...shared });
+      check(`B17 switch=ON Meta 9:16 and PMax 9:16 emit ONE identical camera prompt (dur=${durationSec})`,
+        metaOn, pmaxOn);
+      truthy(`B17 switch=ON Meta 9:16 actually MOVED off the frozen prompt (dur=${durationSec})`,
+        metaOn !== frozen);
+      truthy(`B17 switch=ON Meta 9:16 carries the hook-first opening (dur=${durationSec})`,
+        /HOOK-FIRST/.test(metaOn) && /Scene 1 \(0\.0–[\d.]+s\): HOOK —/.test(metaOn));
+      // Platform-neutrality: one profile serves both platforms, so the text
+      // sent to the model must never name one of them.
+      falsy(`B17 switch=ON Meta prompt never names PMax to the model (dur=${durationSec})`,
+        /PMax/i.test(metaOn));
+      falsy(`B17 switch=ON PMax prompt never names Meta to the model (dur=${durationSec})`,
+        /\bMeta\b/i.test(pmaxOn));
+    }
+
     if (tmpDir) { try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch { /* best effort */ } }
   }
 }
@@ -605,6 +795,8 @@ console.log('   subject continuity + return-to-primary + crossfade policy all pi
 // 134db56~1 baseline is unreachable (shallow clone / rewritten history / tarball).
 if (b14Ran) {
   console.log('   prompt byte-identical to 134db56~1 (owner revert 2026-08-03 — hallucination)');
+  console.log('   · CHANGE 4 hook-first standardization (owner 2026-08-18): switch-OFF Meta still');
+  console.log('     byte-identical to 134db56~1 (B15), switch-ON delta exact (B16), Meta≡PMax (B17)');
 } else {
   console.log(`   ⚠️  byte-identity NOT verified this run — B14 skipped: ${b14SkipReason}`);
   console.log('      keyword pins passed, but "is the old prompt" was NOT proven.');
