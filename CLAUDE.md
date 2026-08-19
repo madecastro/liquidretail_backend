@@ -1694,11 +1694,102 @@ Full detail in `docs/ATLAS.md` §7 and `docs/CLOUDINARY-VIDEO.md`. Headlines:
   only caller, `productMatchService.tryLookupBrandCategoryUrl`, itself had
   zero call sites anywhere in the codebase); category breadcrumbs go
   through `productCategory.enrichProductCategory` instead.
-  **Still open, NOT touched by this pass, real and unledgered by the same
-  trace:** `categoryReviewsService` and `productDetailsService.
-  fetchReviewSummary` both still POST the raw direct endpoint with no
-  `trackLlmCall`. Both are genuinely grounded, so — like `match()` — the
-  fix there is "wrap in a ledgered transport", not "move to Atlas".
+  **THAT REMAINING GAP IS CLOSED (2026-08-19, second pass).**
+  `categoryReviewsService` and `productDetailsService.fetchReviewSummary`
+  were the last two direct, unledgered `generativelanguage` POSTs. Both are
+  genuinely grounded, so — like `match()` — the fix was "wrap in a ledgered
+  transport", NOT "move to Atlas". `trackedGenerate` is now **exported** and
+  is the ONE transport behind all four grounded stages
+  (`brand_reviews`, `product_reviews`, `category_reviews`,
+  `product_review_summary`, plus `gemini_product_match`); both files also
+  dropped their own copies of the REST URL and of
+  `GEMINI_SEARCH_MODEL || 'gemini-2.5-flash'`, so a row's `model` and the
+  same call's error-log `model` can no longer disagree.
+  `categoryReviewsService`'s pass 2 (never grounded) moved to Atlas as a
+  SIBLING of `structureReviewNarrative`, not a call into it: that one asks
+  for a `ratings[]` array and nulls the scalar `rating` when it fills it,
+  while this path reads only `parsed.rating` — reusing it would have nulled
+  the star rating on every category. **Measured live, one real call each:**
+  `category_reviews` `grounded_search` **$0.037387** + `json_structure`
+  (atlas) **$0.004218**, `product_review_summary` **$0.037883** — $0.079488
+  across three rows that previously wrote nothing, grounding 92-94% of each
+  grounded row **measured against the $0.035/request surcharge default that
+  was current at the time.** ⚠️ **That default is GONE as of the SAME DAY**
+  (a separate, deliberate session change — see
+  `GROUNDED_SEARCH_COST_PER_REQUEST_USD` in `services/costTracker.js`):
+  Google's 1,500/day free grounded-prompt allowance comfortably covers
+  measured volume, so the ledgered default is now **$0**, not $0.035. The
+  measurement above is an honest historical record of real API calls under
+  the code as it existed then — do not read it as today's price. What this
+  PR actually guarantees, unaffected by that change, is that
+  `groundedRequests` is correctly declared on every grounded row (feeding
+  both the dollar figure, whatever it currently is, AND the free-allowance
+  alert). Pinned by `scripts/verifyGroundedGeminiLedger.js` (25 checks,
+  revert-proven MECHANICALLY against 30 mutations across three rounds — the
+  matrices are what found two holes in the harness itself: a source regex
+  satisfied by the COMMENT documenting the field it was checking, and a
+  top-level throw that killed the run with zero named failures — plus, on
+  the rebase that surfaced the surcharge-default change above, a rewrite of
+  F0 to read the live rate instead of a hardcoded copy and of F4 to assert
+  the surcharge is additive and correctly gated rather than that it
+  dominates, which stopped being true the moment the default changed).
+  ⚠️ **Two harnesses bound on things this moved and were updated, not
+  loosened:** `verifyQuoteRetrievalDirective` bounded the category pass-1
+  prompt region on `let searchRes` (now `let searchData`, because the
+  ledgered transport resolves the response BODY), and
+  `verifyLlmErrorCodes` A1's LLM-poster INVENTORY legitimately lost both
+  files — they no longer post at all. That check warns that a
+  disappearance usually means the scanner broke; here it did not, so a new
+  **A1b** keeps their coded-failure coverage alive explicitly and fails if
+  either one regains a socket.
+  ⚠️ **Atlas-routing pass 2 does NOT take the direct Google key off that
+  path** — `atlasLlmService` keeps Gemini's OpenAI-compatible surface as
+  the direct twin for this role, and that attempt is itself ledgered
+  (`provider:'google-openai'`). Pinned by the harness's F3.
+  **SECOND ADVERSARIAL PASS, same day, same branch (Grok re-authed
+  mid-session; 4 parallel Grok reviews + 2 Anthropic subagents, every claim
+  hand-verified before acting).** Real, fixed: `reviewCount` was typed
+  `integer` in BOTH the category and provider strict schemas while every
+  reader is `typeof === 'number'` — under strict decode a float would have
+  rejected the WHOLE object (quotes and rating included), worse than the
+  schemaless path it replaced; now `'number'` in both. The pass-2 fallback
+  mislabeled its provider `'atlas'` even when the throw came from the
+  `google-openai` direct twin; now `'unknown'`. **`brandId` was available and
+  dropped at ALL THREE production `fetchProductDetails` call sites**
+  (`CatalogProduct.brandId` is real and required, just never threaded) —
+  now threaded through all three plus both function signatures, guarded by
+  a rewritten, argument-COUNT-based `E9` (name-based checks are fooled by
+  what a caller names its variable). The harness's own `F7` asserted
+  `fetchAndCache` threads `brandId` via a source regex that **matches
+  `brandId: null`** — same `receiptFree`-class lesson, new instance; `F7`
+  now drives the real `fetchAndCache` (exported for this) with
+  Category/Brand stubbed. A genuinely live regex-literal lexer bug —
+  `productDetailsService.js:56`'s `replace(/^['"]|['"]$/g, '')` desyncs a
+  naive quote-tracker for the REST of the file — found by testing my own
+  fix, not by a reviewer; `stripComments`/`fnBody` now share one
+  regex-literal-aware tokenizer. Two dummy-satisfiable source `tools:`
+  regexes removed from E5/E8 (satisfiable by a dead literal while the real
+  call drops the field); `G1`/`F7`/`F8` now own "still asks for grounding"
+  **behaviourally**, off the request as sent through the real production
+  entry points. `fnBody`'s brace-matcher was truncatable by a template
+  literal containing a bare `}` line (Sonnet-subagent-demonstrated); now
+  walks params-then-body over the shared tokenizer. Real, correctly
+  DECLINED and flagged instead: `atlasLlmService.post()` (the shared
+  Atlas + direct-twin transport, **27 files** deep — Director, Judge, Copy,
+  Layout, …) has no `maxRedirects: 0`, confirmed pre-existing, too large a
+  blast radius for a two-file ledger PR — spawned as its own follow-up.
+  Harness now 25 checks, revert-proven by THREE mutation matrices (30
+  mutations total — a third round after rebasing onto current `main`
+  surfaced the surcharge-default change noted above, which needed the
+  harness's own `GROUNDING_PER_CALL`/`F4` fixed the same way). **Re-verified
+  live a second time** after the `reviewCount` schema change (integer→number)
+  — a real Atlas structuring call correctly returned `rating:null,
+  reviewCount:null` (a legitimate "not found" this run, not a decode
+  rejection) and every row still validated against the real CostLog schema.
+  Full 174-script suite green (up from 169 as `main` grew), lint clean, on the
+  branch as rebased. Full narrative in `session.d/2026-08-19_gemini-grounded-
+  cost-ledger-second-pass.md` (`session.md` itself was restructured the same
+  day into per-entry `session.d/` files — see that file's own header).
   Everything else that reads `GEMINI_API_KEY` (`geminiIdentifyService`,
   `visualCatalogMatchService`, `plateIntelService`, `overlayZoneService`,
   `quoteSnippetService`, `layoutInputService`, `metaAdsFontService`) was
