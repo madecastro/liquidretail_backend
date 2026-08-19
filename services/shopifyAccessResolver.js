@@ -61,6 +61,79 @@ function _shopifyMoney(val, fallback) {
   return String(val);
 }
 
+// ── currency verification ───────────────────────────────────────────
+
+// Cross-checks a storefront's REAL currency against the assumption every
+// CatalogProduct.price write depends on: the number is USD major units
+// (see the unit-contract comment on models/CatalogProduct.js). Shopify's
+// public `/meta.json` exposes the store's actual settings currency — no
+// auth, no Apify actor, effectively free — e.g. live-verified 2026-08-18:
+// `za.pelagicgear.com/meta.json` → `{"currency":"ZAR",...}` while
+// `pelagicgear.com/meta.json` → `{"currency":"USD",...}`.
+//
+// Why this exists: Pelagic Gear's `apifyDemo.shopifyUrl` was pointed at
+// the ZA storefront. Apify's Shopify actor returned `currency:"USD"` for
+// that store regardless — it does NOT reliably report the real currency —
+// so every ingested `price` was a correct ZAR number silently mislabeled
+// USD (~19.97-19.99x too high once read as dollars, which is the live
+// USD/ZAR rate, not a cents/dollars unit bug). This check catches that
+// class of misconfiguration BEFORE a caller trusts (or pays Apify to
+// re-fetch) a price under the wrong currency.
+//
+// Contract: only `mismatch:true` is a POSITIVE, confirmed finding — a
+// caller should hard-refuse on that. `verified:false, mismatch:false`
+// means "could not determine" (network error, non-200, no currency key)
+// and callers should treat that as unknown, not as proof of USD — do not
+// silently write `currency:'USD'` off an unverified result.
+async function verifyStoreCurrencyUsd(origin) {
+  if (!origin) return { verified: false, currency: null, mismatch: false, reason: 'no origin' };
+  let base;
+  try {
+    base = new URL(String(origin)).origin;
+  } catch {
+    return { verified: false, currency: null, mismatch: false, reason: 'unparseable origin' };
+  }
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), 10_000);
+  try {
+    let res;
+    try {
+      res = await fetch(`${base}/meta.json`, {
+        method: 'GET',
+        headers: {
+          // A default Node/curl UA gets WAF-blocked on some Shopify fronts —
+          // same gotcha documented for Atlas Cloud in the global CLAUDE.md.
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
+          'Accept': 'application/json'
+        },
+        signal: ctrl.signal,
+        redirect: 'follow'
+      });
+    } finally {
+      clearTimeout(timer);
+    }
+    if (!res.ok) {
+      return { verified: false, currency: null, mismatch: false, reason: `meta.json HTTP ${res.status}` };
+    }
+    let body;
+    try {
+      body = await res.json();
+    } catch {
+      return { verified: false, currency: null, mismatch: false, reason: 'meta.json was not valid JSON' };
+    }
+    const currency = body && typeof body.currency === 'string' ? body.currency.trim().toUpperCase() : null;
+    if (!currency) {
+      return { verified: false, currency: null, mismatch: false, reason: 'meta.json had no currency field' };
+    }
+    if (currency !== 'USD') {
+      return { verified: false, currency, mismatch: true, reason: `store currency is ${currency}, not USD` };
+    }
+    return { verified: true, currency: 'USD', mismatch: false };
+  } catch (err) {
+    return { verified: false, currency: null, mismatch: false, reason: `meta.json fetch failed: ${err.message}` };
+  }
+}
+
 // ── origin / discovery helpers ─────────────────────────────────────
 
 /**
@@ -846,6 +919,7 @@ async function resolveShopifyAccess(brand, { run = null, abortCheck = async () =
 
 module.exports = {
   resolveShopifyAccess,
+  verifyStoreCurrencyUsd,
   // exported for unit tests
   resolveStoreOrigin,
   discoverMyshopifyDomain,

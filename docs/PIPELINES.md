@@ -77,6 +77,61 @@ See `config/defaults.env` and `services/genericCatalogResolver.js` / `httpScrape
 - In-scan breadcrumb stamps → skip post-sync full category crawl ([§2c](#2-post-sync-trio)).
 - Variant-role stamping at end of sync (detect enqueue path) still runs even when image detect is deferred ([§3](#3-per-product-detect--overlay-zones--ad-readiness-deferred-to-ad-time)).
 
+### Price & currency contract — ALL THREE catalog ingest paths (incident 2026-08-18)
+
+**`CatalogProduct.price` is USD MAJOR UNITS as a plain Number** (150 means
+$150.00, not cents) — see the unit-contract comment on `models/CatalogProduct.js`.
+Every writer (`apifyPullService.normalizeShopifyProduct`, this file's
+`genericCatalogResolver`, `shopifyPublicIngestService`'s flat mapper) already
+follows that convention; every reader (`layoutInputService`
+`` `$${cp.price.toFixed(2)}` ``, `renderService.extractCopySnapshot`, Remotion
+`PriceSlot`) assumes it too.
+
+**What went wrong for Pelagic Gear, and why it wasn't a units bug.**
+`Brand.apifyDemo.shopifyUrl` was pointed at `za.pelagicgear.com` — a real,
+independently-operated South-African Shopify store (confirmed live:
+`/meta.json` → `{"currency":"ZAR","country":"ZA"}`), not a presentment
+variant of the US store. Every stored `price` was the CORRECT ZAR list price
+for that store (`torrent-jacket` 2999.00 ZAR, matching exactly), silently
+mislabeled `currency:"USD"` — Apify's `webdatalabs/shopify-product-scraper`
+actor reports `currency:"USD"` for that store regardless of its real
+currency, so the scraped `currency` field cannot be trusted on its own. Read
+as dollars the number was ~19.97-19.99x too high (the live USD/ZAR rate, not
+a `×20` or double-cents defect — there is no such multiplier anywhere on
+this path).
+
+**The fix — `services/shopifyAccessResolver.js#verifyStoreCurrencyUsd`,
+called by both `apifyIngestService.syncBrandShopify` (before the PAID Apify
+call — refuses without spending) and `shopifyPublicIngestService.syncBrandShopifyDirect`
+(before the resolver ladder).** Cross-checks the target storefront's own
+`/meta.json` currency (free, no auth). A CONFIRMED non-USD currency refuses
+the sync outright (`{ok:false, currencyMismatch:true, detectedCurrency}`); an
+INCONCLUSIVE check (network error, no currency field) does not block — only a
+positive, confirmed mismatch does. When confirmed USD, the independently
+verified currency overwrites whatever the source claims, rather than trusting
+it. Pinned by `scripts/verifyCatalogPriceCurrencyGuard.js` (27 checks,
+revert-proven on 4 mutations: guard bypass, negative-number acceptance,
+PriceSlot naive-concat reintroduction, guard-after-ladder reordering).
+
+**Defense in depth on the render side.** `remotion/components/slotRenderers.jsx`
+`PriceSlot` used to do `` `$${raw}` `` — a blind string concat that would
+print e.g. `"$2999"` verbatim for ANY untrusted upstream number (wrong
+currency, stray cents, NaN, negative). It now calls
+`remotion/lib/priceFormat.js#formatBarePriceUsd`, which formats a bare number
+as USD via `Intl.NumberFormat` and returns `null` (renders nothing) rather
+than a number it cannot vouch for — same "on-brand and true, or absent"
+doctrine already applied to the removed "Bestseller" badge literal. **Today
+this slot is unreachable in production** (no live `titleStyleSpec` has a
+visible `price` slot; the static prompt bans price text; the Director prompt
+hard-bans pricing copy) — but a preset with one already exists in the repo
+(`remotion/presets/babyboo-editorial-monochrome.json`), so this was a live
+landmine, not a theoretical one. **The wrong number DID already reach
+operator-visible surfaces before this fix**: `Ad.copy.productPrice` (shown in
+the app UI, frozen at render time — `persistStage`) carried strings like
+`"$2799.00"` for a Squall Jacket that is actually $140.00, on real Pelagic
+Gear `draft`/`failed` ads. This fix does not retroactively correct those
+existing rows — see `session.md` for the residual.
+
 ---
 
 ## 2. Post-sync trio
