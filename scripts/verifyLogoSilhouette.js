@@ -27,7 +27,11 @@
  *   4. Restore `if (meta.hasAlpha)` as the branch condition → B2
  */
 const path = require('path');
-const sharp = require(path.join(__dirname, '..', 'node_modules', 'sharp'));
+// Resolve normally (Node's own node_modules walk, honoring NODE_PATH) instead
+// of a hardcoded __dirname/../node_modules/sharp path — that absolute form
+// bypassed NODE_PATH entirely and always failed in a fresh git worktree,
+// which has no node_modules/sharp of its own (see bin/setup-worktree.sh).
+const sharp = require('sharp');
 const svc = require(path.join(__dirname, '..', 'services', 'directImageRenderService'));
 
 let passed = 0;
