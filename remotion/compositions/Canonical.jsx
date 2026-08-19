@@ -429,6 +429,15 @@ export const Canonical = ({ format = 'feed', safeZoneKey = null, platformFormat 
                   panelWidthFrac: panelW != null && width > 0
                     ? panelW / width
                     : null,
+                  // Already resolved once above (zoneKey) — reuse it rather
+                  // than re-deriving from platformFormat inside slotContent.js,
+                  // so an explicit safeZoneKey prop override stays honored.
+                  // Lets deriveCharCap bound usableWidthPx by the surface's
+                  // OWN safe-zone width when it is narrower than `format`'s
+                  // shared default (reels/verticalYt/landscapeYt/squareYt/
+                  // pmax_video_*) — inert for vertical/feed/square/landscape/
+                  // stories. See resolveSurfaceSafeWidthPx in slotContent.js.
+                  safeZoneKey: zoneKey,
                 };
                 const content = resolveSlotContent(rawSlot, meta, allSlots, capCtx);
                 if (content == null) return null;

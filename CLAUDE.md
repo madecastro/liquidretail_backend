@@ -81,6 +81,28 @@ is unchanged at two.
    2026-08-18 — Reels had been falling through to the shared `vertical` zone
    with no rail reserve), the PMax three→`verticalYt`/`landscapeYt`/`squareYt`.
    Pinned by `scripts/verifyReelsSafeZone.mjs`.
+   ⚠️ **The narrower Reels box shipped a real defect the next day, closed
+   2026-08-19 (measured on a delivered Vuori `meta_reels_9_16`, run
+   run_1787136860887_654ed621): a burned-in customer quote lost its OPENING
+   clause on Reels while the identical Stories render kept it whole.** Two
+   causes, both fixed: (1) `slotContent.js`'s char-cap width model derived
+   `usableWidthPx` from `maxWidthPct × canvasWidth` alone, blind to the
+   surface's own safe-zone insets, so it stayed as generous for Reels'
+   0.775W box as for Stories' 0.85W one — now bounded by the surface's real
+   resolved width whenever it's narrower than the canvas format's shared
+   default (inert for `vertical`/`stories`). (2) The bigger contributor:
+   `stackContainerStyle`'s `lowerThird`/`bottom` anchors used bare
+   `justifyContent:'flex-end'`, which on overflow pushes the WHOLE group
+   toward the floor and lets the excess spill PAST THE TOP, where
+   `overflow:hidden` clips it — the wrong end for a stack whose first item
+   is the quote. Reels kept `bottom:0.35` (tight) while Stories moved to
+   `bottom:0.14` (loose) in the very change that added this zone, so a
+   keep-out-shifted group that used to just fit stopped fitting, on Reels
+   only. Now `safe flex-end` (CSS Box Alignment L3) — falls back to
+   start-alignment on overflow, so any content that must drop is dropped
+   from the END, never the opening. Both pinned by
+   `scripts/verifyReelsSafeZone.mjs` sections G (overflow direction) and H
+   (width measure).
    **What `safeArea` IS for, so nobody deletes it as dead:** it is live on the
    **static image** path — `staticAdIntents.computeSurface` turns it into the
    geometry box in the billable gpt-image-2 prompt and into Sharp logomark

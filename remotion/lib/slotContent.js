@@ -2,6 +2,11 @@
 // Kept free of React/Remotion so offline harnesses can drive the same
 // decision the composition uses (visibleWhenEmpty, bind chains, caps).
 
+// safeZones.js is pure JS/ESM too (no React, no other imports) — importing
+// it here does not add a framework dependency or create a cycle (safeZones.js
+// never imports this module).
+import { SAFE_ZONES, resolveSafeZoneKey } from './safeZones.js';
+
 // Word-safe display cap: never cut mid-word; ellipsis only BETWEEN words.
 // Used for productName (close-phase / endcard lead) and multi-item strings
 // that previously hard-sliced. If no space exists in the first half of the
@@ -177,9 +182,76 @@ export const TEXT_CHAR_FLOOR = {
 const KNOWN_FORMATS = new Set(['vertical', 'feed', 'square', 'landscape']);
 
 /**
+ * Resolve the REAL usable width (px) implied by a surface's OWN safe zone,
+ * for surfaces whose zone is narrower than the shared canvas-format default.
+ *
+ * THE DEFECT THIS CLOSES (2026-08-19). `resolveUsableWidthPx` modeled usable
+ * width as `maxWidthPct × canvasWidth` alone — it never looked at which
+ * safe zone a surface actually resolves to. `meta_reels_9_16` narrowed its
+ * right inset for the IG action rail (0.075→0.15, `remotion/lib/safeZones.js`
+ * `reels`) without narrowing this wrap measure, so the model stayed exactly
+ * as generous for Reels as for `vertical` while the REAL painted box shrank
+ * underneath it (0.85W → 0.775W) — the same modelling gap verticalYt,
+ * landscapeYt, and squareYt already carried. A quote that fits the model's
+ * optimistic estimate can still need more lines than the box was sized for.
+ *
+ * Deliberately a MIN-only, narrower-than-baseline-only correction:
+ *   - `vertical`/`feed`/`square`/`landscape` (no platformFormat/safeZoneKey,
+ *     or one that resolves back to the format's own zone) are UNCHANGED —
+ *     their zone IS the baseline being compared against, so this never
+ *     fires for them. `stories` is also unchanged: its left/right match
+ *     `vertical`'s, so it is never narrower than the baseline either.
+ *   - Only a surface whose OWN resolved zone is genuinely tighter than its
+ *     canvas format's shared zone (reels, verticalYt, landscapeYt, squareYt,
+ *     the pmax_video_* trio) gets bounded tighter than today.
+ * This keeps `scripts/verifyFormatAwareCharCaps.mjs`'s real-delivered-
+ * artifact pins for vertical/landscape byte-identical while closing the gap
+ * for every narrowed surface — the fix is at the measure, not a per-surface
+ * fudge factor.
+ *
+ * @param {object|null|undefined} ctx
+ * @returns {number|null} null when no narrower-than-baseline zone applies
+ *   (stay inert; the caller's existing maxWidthPct/panel math is unaffected)
+ */
+function resolveSurfaceSafeWidthPx(ctx) {
+  if (ctx == null || typeof ctx !== 'object') return null;
+
+  const canvasW = Number.isFinite(ctx.canvasWidth) && ctx.canvasWidth > 0
+    ? ctx.canvasWidth
+    : (KNOWN_FORMATS.has(ctx.format) ? CANVAS_WIDTH_DEFAULT[ctx.format] : null);
+  if (!Number.isFinite(canvasW) || canvasW <= 0) return null;
+
+  const zoneKey = ctx.safeZoneKey
+    || resolveSafeZoneKey({ format: ctx.format, platformFormat: ctx.platformFormat });
+  const zone = SAFE_ZONES[zoneKey];
+  if (!zone || !Number.isFinite(zone.left) || !Number.isFinite(zone.right)) return null;
+  const zoneWidthFrac = 1 - zone.left - zone.right;
+  if (!Number.isFinite(zoneWidthFrac) || zoneWidthFrac <= 0) return null;
+
+  // Baseline: the canvas format's OWN zone — what this surface rendered as
+  // before any platformFormat-specific zone existed for it. No known format
+  // means no baseline to compare against; nothing to gate on, stay inert.
+  if (!KNOWN_FORMATS.has(ctx.format)) return null;
+  const baselineZone = SAFE_ZONES[ctx.format];
+  if (!baselineZone) return null;
+  const baselineWidthFrac = 1 - baselineZone.left - baselineZone.right;
+  if (!Number.isFinite(baselineWidthFrac) || baselineWidthFrac <= 0) return null;
+
+  // Only narrow, never widen, and only strictly narrower than baseline —
+  // equal (stories) or wider stays inert.
+  if (!(zoneWidthFrac < baselineWidthFrac)) return null;
+
+  return zoneWidthFrac * canvasW;
+}
+
+/**
  * Resolve usable width in PIXELS for the text box.
  * Prefers ctx.usableWidthPx (Canonical computes it from dims + container).
- * Else: maxWidthPct × canvasWidth, min'd with panel width when panel is on.
+ * Else: maxWidthPct × canvasWidth, min'd with panel width when panel is on,
+ * and min'd with the surface's OWN safe-zone width when that zone is
+ * narrower than the canvas format's shared default (see
+ * resolveSurfaceSafeWidthPx — inert unless ctx.platformFormat/safeZoneKey
+ * resolves to a genuinely narrower zone).
  * Returns null → caller keeps TEXT_CHAR_CAP (inertness / malformed).
  *
  * @param {object|null|undefined} ctx
@@ -189,7 +261,14 @@ export function resolveUsableWidthPx(ctx) {
   if (ctx == null || typeof ctx !== 'object') return null;
 
   if (Number.isFinite(ctx.usableWidthPx) && ctx.usableWidthPx > 0) {
-    return ctx.usableWidthPx;
+    // Canonical.jsx pre-computes usableWidthPx (maxWidthPct×width, min'd
+    // with panel width) BEFORE calling deriveCharCap — so the surface-safe-
+    // width bound below has to ALSO apply here, not only in the from-parts
+    // path further down, or it would never run on the live render path.
+    const explicitSafeWidthPx = resolveSurfaceSafeWidthPx(ctx);
+    return Number.isFinite(explicitSafeWidthPx) && explicitSafeWidthPx > 0
+      ? Math.min(ctx.usableWidthPx, explicitSafeWidthPx)
+      : ctx.usableWidthPx;
   }
 
   const format = ctx.format;
@@ -240,6 +319,17 @@ export function resolveUsableWidthPx(ctx) {
       // Product of maxWidthPct × panel would double-narrow the left column.
       fromPct = Math.min(fromPct, panelPx);
     }
+  }
+
+  // Bound by the surface's OWN safe zone when it is narrower than the
+  // canvas format's shared default (see resolveSurfaceSafeWidthPx) — inert
+  // for vertical/feed/square/landscape/stories, tightens reels/verticalYt/
+  // landscapeYt/squareYt/pmax_video_* to the box they actually paint into.
+  // Panel columns already intersect the safe zone in panelColumnStyle, so
+  // this is a no-op there (safeWidthPx >= panelPx), not a double-narrow.
+  const safeWidthPx = resolveSurfaceSafeWidthPx(ctx);
+  if (Number.isFinite(safeWidthPx) && safeWidthPx > 0) {
+    fromPct = fromPct == null ? safeWidthPx : Math.min(fromPct, safeWidthPx);
   }
 
   if (fromPct == null || !Number.isFinite(fromPct) || fromPct <= 0) return null;
@@ -340,8 +430,12 @@ export function hasCapContext(ctx) {
  * @param {string} slotKey
  * @param {object|null|undefined} ctx  {
  *   format, canvasWidth, usableWidthPx, maxWidthPct, maxLines, fontPx,
- *   sizeScale, panelColumn, panelSide, panelWidthFrac
- * }
+ *   sizeScale, panelColumn, panelSide, panelWidthFrac, platformFormat,
+ *   safeZoneKey
+ * }  platformFormat/safeZoneKey only ever TIGHTEN usableWidthPx, and only
+ *   when the resolved zone is narrower than the canvas format's shared
+ *   default — see resolveSurfaceSafeWidthPx. Absent (every pre-existing
+ *   caller) → byte-identical to before that field existed.
  * @returns {number|null}  null when the key has no cap (uncapped slot)
  */
 export function deriveCharCap(slotKey, ctx) {

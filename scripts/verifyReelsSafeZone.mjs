@@ -37,6 +37,27 @@
  * reels.right back to 0.075 → the stories-inequality and verticalYt-parity
  * checks go red. Widen vertical.right to 0.15 → the vertical-unchanged checks
  * go red.
+ *
+ * SECTIONS G/H (added 2026-08-19) — the zone this file pins had a real,
+ * SHIPPED consequence: a delivered Vuori `meta_reels_9_16` (run
+ * run_1787136860887_654ed621) lost the OPENING clause of a burned-in customer
+ * quote while the Stories sibling kept it whole, at the SAME timestamp, from
+ * the SAME base plate. Two coordinated fixes, both pinned here:
+ *   G — `stackContainerStyle`'s `bottom`/`lowerThird` anchors now use `safe
+ *       flex-end`, so a group that overflows its box drops content from the
+ *       END, never the opening (CSS Box Alignment L3 "safe" alignment;
+ *       verified against the actual Remotion-bundled Chromium, not just read
+ *       off a spec).
+ *   H — `slotContent.js`'s char-cap width model now bounds `usableWidthPx` by
+ *       the surface's OWN resolved safe-zone width when it is narrower than
+ *       the canvas format's shared default (`resolveSurfaceSafeWidthPx`) —
+ *       inert for `vertical`/`stories`, tightens `reels`/`verticalYt`/
+ *       `landscapeYt`/`squareYt`/`pmax_video_*`.
+ * REVERT-PROOF (G): change `safe flex-end` back to bare `flex-end` on either
+ * anchor → G's overflow-direction checks go red. REVERT-PROOF (H): drop the
+ * `resolveSurfaceSafeWidthPx` bound (or gate it on nothing, un-scoping it from
+ * "narrower than baseline") → H's vertical/stories-inertness checks or its
+ * reels/verticalYt-tightening checks go red.
  */
 
 import {
@@ -44,7 +65,9 @@ import {
   PMAX_VIDEO_SAFE_ZONE_KEY,
   resolveSafeZoneKey,
   resolveSafeZone,
+  stackContainerStyle,
 } from '../remotion/lib/safeZones.js';
+import { deriveCharCap, resolveUsableWidthPx } from '../remotion/lib/slotContent.js';
 
 const failures = [];
 let passed = 0;
@@ -151,6 +174,113 @@ check("F5 format:'vertical' with no platformFormat still → 'vertical'",
 // but if a caller passes it as `format` the lookup must not explode.
 check("F6 format:'reels' passed directly resolves without throwing",
   resolveSafeZoneKey({ format: 'reels' }) === 'reels');
+
+// ── G. Overflow direction: a group that overflows its box drops the END,
+//      never the OPENING (the actual mechanism behind the shipped defect) ──
+{
+  const dims = { width: 1080, height: 1920 };
+  const lowerReels = stackContainerStyle({
+    format: 'vertical', safeZoneKey: 'reels', anchor: 'lowerThird',
+    offsetX: 0, offsetY: 0, ...dims,
+  });
+  const bottomReels = stackContainerStyle({
+    format: 'vertical', safeZoneKey: 'reels', anchor: 'bottom',
+    offsetX: 0, offsetY: 0, ...dims,
+  });
+  const lowerStories = stackContainerStyle({
+    format: 'vertical', safeZoneKey: 'stories', anchor: 'lowerThird',
+    offsetX: 0, offsetY: 0, ...dims,
+  });
+  check("G1 lowerThird justifyContent is 'safe flex-end' (reels)",
+    lowerReels.justifyContent === 'safe flex-end', `got ${JSON.stringify(lowerReels.justifyContent)}`);
+  check("G2 bottom justifyContent is 'safe flex-end' (reels)",
+    bottomReels.justifyContent === 'safe flex-end', `got ${JSON.stringify(bottomReels.justifyContent)}`);
+  check("G3 lowerThird justifyContent is 'safe flex-end' (stories too — not a per-surface fudge)",
+    lowerStories.justifyContent === 'safe flex-end', `got ${JSON.stringify(lowerStories.justifyContent)}`);
+  // The floor invariant (overflow:hidden, bottom inset) must survive —
+  // 'safe' only changes which end drops on overflow, not whether the box
+  // still fails closed against painting under platform chrome.
+  check('G4 lowerThird keeps overflow:hidden (reels)', lowerReels.overflow === 'hidden');
+  check('G5 lowerThird keeps its bottom floor at reels.bottom*height (reels)',
+    Math.abs(lowerReels.bottom - 0.35 * dims.height) < 1e-6,
+    `bottom=${lowerReels.bottom}`);
+  // upperThird/top are untouched — they already clip the SAFE way
+  // (flex-start default; excess overflows the bottom, not the top).
+  const upperReels = stackContainerStyle({
+    format: 'vertical', safeZoneKey: 'reels', anchor: 'upperThird',
+    offsetX: 0, offsetY: 0, ...dims,
+  });
+  check('G6 upperThird has no justifyContent override (still flex-start default)',
+    upperReels.justifyContent === undefined, `got ${JSON.stringify(upperReels.justifyContent)}`);
+}
+
+// ── H. Char-cap width measure: bounded by the REAL safe-zone width for a
+//      surface narrower than its canvas format's shared default; inert for
+//      vertical/stories (extends scripts/verifyFormatAwareCharCaps.mjs's
+//      contract to the platformFormat/safeZoneKey-aware path it didn't
+//      cover) ─────────────────────────────────────────────────────────────
+{
+  // H1-H4: inertness — vertical/stories must be byte-identical to the
+  // format-only baseline (no platformFormat/safeZoneKey signal is the
+  // common case for every pre-existing caller and for canvas-only formats).
+  const vHead = deriveCharCap('headline', { format: 'vertical' });
+  const vHeadWithZone = deriveCharCap('headline', { format: 'vertical', safeZoneKey: 'vertical' });
+  const storiesHead = deriveCharCap('headline', { format: 'vertical', safeZoneKey: 'stories' });
+  const vQuote = deriveCharCap('quote', { format: 'vertical' });
+  const storiesQuote = deriveCharCap('quote', { format: 'vertical', safeZoneKey: 'stories' });
+  check('H1 vertical headline unaffected by an explicit safeZoneKey=vertical',
+    vHeadWithZone === vHead, `withZone=${vHeadWithZone} baseline=${vHead}`);
+  check('H2 stories headline === vertical headline (stories not narrower)',
+    storiesHead === vHead, `stories=${storiesHead} vertical=${vHead}`);
+  check('H3 stories quote === vertical quote (stories not narrower)',
+    storiesQuote === vQuote, `stories=${storiesQuote} vertical=${vQuote}`);
+  check('H4 resolveUsableWidthPx(vertical) unaffected by explicit safeZoneKey=vertical',
+    resolveUsableWidthPx({ format: 'vertical', safeZoneKey: 'vertical', maxWidthPct: 0.9 })
+      === resolveUsableWidthPx({ format: 'vertical', maxWidthPct: 0.9 }));
+
+  // H5-H8: the narrowed surfaces this defect class targets are ACTUALLY
+  // tightened, not just theoretically eligible.
+  const reelsHead = deriveCharCap('headline', { format: 'vertical', platformFormat: 'meta_reels_9_16' });
+  const reelsQuote = deriveCharCap('quote', { format: 'vertical', platformFormat: 'meta_reels_9_16' });
+  const vytHead = deriveCharCap('headline', { format: 'vertical', platformFormat: 'pmax_video_9_16' });
+  check('H5 reels headline < vertical headline', reelsHead < vHead,
+    `reels=${reelsHead} vertical=${vHead}`);
+  check('H6 reels quote < vertical quote', reelsQuote < vQuote,
+    `reels=${reelsQuote} vertical=${vQuote}`);
+  check('H7 reels headline === verticalYt headline (same width fraction, right:0.15 parity)',
+    reelsHead === vytHead, `reels=${reelsHead} verticalYt=${vytHead}`);
+  check('H8 explicit safeZoneKey=reels matches platformFormat=meta_reels_9_16',
+    deriveCharCap('headline', { format: 'vertical', safeZoneKey: 'reels' }) === reelsHead);
+
+  // H9: never below the readable floor even at the tightened width.
+  check('H9 reels quote still >= its readable floor (48)', reelsQuote >= 48, `got ${reelsQuote}`);
+
+  // H10: the EXACT shipped incident — a short quote that never crosses the
+  // cap either way (35 chars < any floor) must reach the DOM unmodified.
+  // This is the regression check for the actual bug: the string-truncation
+  // model alone was NEVER going to catch this one — the width fix is a real,
+  // separate correctness improvement (this section), and the overflow-
+  // direction fix (section G) is what actually stops the opening from being
+  // dropped. Both are required; neither alone would have closed the incident.
+  const SHIPPED_QUOTE = '"cinched at the waist but not tight"';
+  const reelsQuoteCap = deriveCharCap('quote', {
+    format: 'vertical', platformFormat: 'meta_reels_9_16',
+    canvasWidth: 1080, maxWidthPct: 0.92, maxLines: 3, fontPx: 56 * 1.15,
+  });
+  check('H10 the shipped quote string is (correctly) below even the tightened cap',
+    SHIPPED_QUOTE.length < reelsQuoteCap,
+    `len=${SHIPPED_QUOTE.length} cap=${reelsQuoteCap}`);
+
+  // H11: malformed/legacy ctx (no platformFormat, no safeZoneKey) still
+  // never throws and never returns NaN — same fail-closed contract as
+  // resolveUsableWidthPx's existing callers.
+  for (const ctx of [{ format: 'vertical', platformFormat: 'nope-not-real' }, { format: 'vertical', safeZoneKey: 'nope' }]) {
+    let threw = false; let cap;
+    try { cap = deriveCharCap('headline', ctx); } catch (e) { threw = true; cap = e; }
+    check(`H11 no throw on ${JSON.stringify(ctx)}`, !threw);
+    check(`H11 finite cap on ${JSON.stringify(ctx)}`, Number.isFinite(cap), `got ${cap}`);
+  }
+}
 
 const total = passed + failures.length;
 if (failures.length) {
