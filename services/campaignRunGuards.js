@@ -258,6 +258,41 @@ function buildStaleRunningFilter({ now, staleMin }) {
 }
 
 /**
+ * The UPDATE half of buildStaleRunningFilter above — what worker.js's
+ * reapOrphans() actually writes to a run it just decided is dead.
+ *
+ * Until this existed it was `{ status: 'failed', completedAt: new Date() }`
+ * and NOTHING ELSE — no `errors[]` entry. So the run's own header comment
+ * ("Nothing threw. It was still rendering.") was true from the reaper's side
+ * too: an operator looking at GET /api/ads/runs/:id for a reaped run saw
+ * `status:'failed'` with `errors: []`, `failed: 0` — a hard stop with zero
+ * explanation, the exact "operator-blind" gap this run-status work exists to
+ * close. Slack's aggregate `worker.js` alert ("Dropped work reclaimed …")
+ * already says *this class* of thing happened, in a channel; the run poller
+ * itself said nothing. `staleMin` is threaded through (not hardcoded) so the
+ * message states the REAL configured window rather than a number that can
+ * silently drift from REAP_STALE_MIN.
+ *
+ * Exported and pure so a harness can assert the exact `$push` shape reaches
+ * Mongo, the same reasoning buildStaleRunningFilter's own header gives for
+ * extracting the filter — a source-text check cannot prove the write landed.
+ */
+function buildStaleRunningReapUpdate(staleMin) {
+  return {
+    $set: { status: 'failed', completedAt: new Date() },
+    $push: {
+      errors: {
+        index: 0,
+        stage: 'reaper',
+        message: `no update from the render loop for over ${staleMin}m — the process holding ` +
+          'this run likely restarted or stalled; any of its claimed ads were reset to \'queued\' ' +
+          'and need a new "Generate more" to finish'
+      }
+    }
+  };
+}
+
+/**
  * routes/ads.js — the compare-and-swap for the 'preparing' → 'running' flip.
  * THIS is the actual money guard, not the reaper sweep above.
  *
@@ -333,5 +368,6 @@ module.exports = {
   buildActiveRunsFilter,
   buildStalePreparingFilter,
   buildStaleRunningFilter,
+  buildStaleRunningReapUpdate,
   buildRunningFlipFilter
 };
