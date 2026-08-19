@@ -1717,6 +1717,13 @@ async function renderDirectImage(callArgs = {}) {
   const meta = {
     stage: 'direct_image', service: 'directImageRenderService', purposeTag: template || 'untagged',
     brandId: resolvedBrand?._id || brandId || null,
+    // campaignId/campaignRunId were both already parameters of this function
+    // (renderDirectImage) — threaded for run-feed notices and app deep links —
+    // but never made it into the CostLog meta, so every static-image CostLog
+    // row was attributable to a brand/product/ad but not to the run that
+    // caused the spend. Fixed 2026-08-19 alongside the video path.
+    campaignId: campaignId || null,
+    campaignRunId: campaignRunId || null,
     productId: resolvedProduct?._id || productId || null,
     mediaId: mediaId || null,
     adId: adId || null,

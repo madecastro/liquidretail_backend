@@ -450,6 +450,29 @@ Video never launches a browser.
   `base + per-second` as spend for the developer model. `buildPriceMap` yields a
   floor-grade estimate whose only job is to stop a $0.00 row. Any budget, margin
   or per-ad cost claim must come from **reconciled** rows.
+  **A POLL TIMEOUT is a THIRD case, separate from both of the above, closed
+  2026-08-19 (incident run_1787119100250_eef4d871 — two Omni masters timed out
+  at 600s, both still unsettled at Atlas 14-25+ min later).** Before this fix,
+  a timeout threw a bare unclassified Error and `routes/ads.js` always wrote
+  `status:'failed'` — which severed the ad's already-stamped spend receipt
+  (`Ad.veoPredictionId`) from `bootRecoveryService`'s recovery, so a prediction
+  that later completed or settled was written off instead of recovered/
+  reconciled, and the CostLog row stayed at the submit-time estimate forever.
+  Fixed: `pollPrediction` does one final free peek at the deadline before
+  giving up (`resolveTimeoutOutcome`); on a genuinely still-unsettled peek the
+  ad's `status` is left at `'rendering'` (not `'failed'`) so
+  `bootRecoveryService.resumeInFlightAds` — already run periodically from
+  `worker.js`'s `recoverTick`, not boot-only — keeps polling until Atlas
+  settles, then reconciles via the SAME confirmed-price read the image path
+  uses (`resolveRecoveredVideoFailureCharge`, tri-state: confirmed-unbilled →
+  zero the estimate; confirmed-billed with a real price → correct to it;
+  unknown → leave untouched). `MAX_POLL_MS` itself is UNCHANGED (600000) —
+  fresh Omni-only completion data (n=28, Aug 14-19) measures p99=215s/max=215s,
+  so 600s already carries ~2.8x headroom; the incident's two predictions were
+  still unresolved well past any plausible cap, so a bigger number would not
+  have helped and would have held a render slot open longer. Pinned by
+  `scripts/verifyVideoTimeoutReconcile.js`. Full write-up: `session.md`
+  2026-08-19.
 - **Ledger spend at the charge point, not the success point.** A billable submit that
   then fails still costs money. `atlasImageService.chargedError` records it and sets
   `err.charged`, which is the flag telling a caller that a direct-provider fallback

@@ -155,20 +155,36 @@ check('A5 both resume primitives are exported',
   check('E3 [MONEY] bootRecovery does NOT hardcode charged:true for an image — the charged flag '
       + 'itself must be derived from a confirmed price',
     (() => {
-      // Scope to the confirmedCharge ASSIGNMENT on the image failure path.
-      const i = bootSrc.indexOf('const confirmedCharge');
+      // Scope to the IMAGE branch's confirmedCharge ASSIGNMENT specifically —
+      // anchored on `ir.priceConfirmed` (unique to the image derivation), not
+      // the bare string 'const confirmedCharge', which since 2026-08-19 ALSO
+      // appears as a local inside atlasVideoService.resolveRecoveredVideoFailureCharge
+      // (bootRecoveryService.js) and would otherwise be found first, scanning
+      // the wrong declaration entirely.
+      const i = bootSrc.indexOf('const confirmedCharge = ir.priceConfirmed');
       if (i === -1) return false;
       const assignment = bootSrc.slice(i, bootSrc.indexOf(';', i));
       return /priceConfirmed\s*===\s*true/.test(assignment)
-        && /Number\(\s*(?:ir|r)\.price\s*\)\s*>\s*0/.test(assignment);
+        && /Number\(\s*ir\.price\s*\)\s*>\s*0/.test(assignment);
     })());
   check('E4 the unconfirmed case is recorded as UNCONFIRMED in the message, not silently as free',
     /charge UNCONFIRMED/.test(bootSrc));
   check('E5 a confirmed price is reconciled into the ledger (Atlas\'s real figure, not base_price)',
     /reconcileCost\(\{\s*providerRequestId/.test(bootSrc));
-  check('E6 [SCOPE] video billing semantics are left untouched — peekPrediction does not read '
-      + 'price back, so there is nothing to confirm against',
-    /VIDEO IS UNCHANGED ON PURPOSE/.test(bootSrc));
+  // E6 REWRITTEN 2026-08-19. It used to assert VIDEO billing was untouched —
+  // "peekPrediction does not read price back, so there is nothing to confirm
+  // against". That premise was already false when written (peekPrediction's
+  // failed branch already spread confirmedCharge(data) into its return; the
+  // video path just never consulted it) and is fixed now via
+  // resolveRecoveredVideoFailureCharge (scripts/verifyVideoResume.js O5*).
+  // What must actually stay true — and does — is narrower: the IMAGE
+  // derivation above (ir.priceConfirmed / ir.price) is untouched by that fix
+  // and reads its OWN distinct fields, so video's now-correct reconciliation
+  // cannot be mistaken for, or accidentally reuse/duplicate, the image one.
+  check('E6 [SCOPE] the image charge derivation is untouched and reads its OWN fields '
+      + '(ir.priceConfirmed / ir.price) — distinct from video\'s r.charged / r.priceUsd',
+    /const confirmedCharge = ir\.priceConfirmed === true && Number\(ir\.price\) > 0;/.test(bootSrc)
+    && !/resolveRecoveredVideoFailureCharge\(ir\)/.test(bootSrc));
 
   // ── Revert-proof note (manual, per CLAUDE.md §5) ─────────────────────────
   // 1. Delete the charge-point block  -> C1..C6 fail (6).

@@ -378,7 +378,10 @@ check('E3 the CHARGE-POINT row is keyed on the prediction, or nothing is correct
   // Found by adversarial review, not by the first draft of this harness.
   const i = SRC.indexOf("stage:      'atlas_video_render',");
   assert.ok(i > 0, 'charge-point write not found');
-  const window = SRC.slice(i, i + 900);
+  // Widened 2026-08-19 (900 -> 1600): the charge-point object literal grew a
+  // campaignRunId field plus its explanatory comment, pushing status:'submitted'
+  // further from the anchor. Same object literal, same fields, just longer.
+  const window = SRC.slice(i, i + 1600);
   assert.ok(
     /providerRequestId: predictionId/.test(window),
     'charge-point recordFlatCost does not stamp providerRequestId — the retry ledger correction cannot match its row'
