@@ -150,6 +150,14 @@ const SPEC = Object.freeze({
     ceiling: 'SELF-IMPOSED',
     why: 'Parallel Cloudinary destroy calls in deleteManyFromCloudinary. Free tier ~500 ops/hr; modest default avoids cascade-delete storms. Cloudinary paid tiers allow higher.'
   },
+  CATALOG_MATERIALIZE_CONCURRENCY: {
+    env: 'CATALOG_MATERIALIZE_CONCURRENCY',
+    default: 4,
+    min: 1,
+    max: 16,
+    ceiling: 'SELF-IMPOSED',
+    why: 'Parallel materializeMissingHero() calls in catalogMaterializeDrainService — each is one Cloudinary UPLOAD (mirror source imageUrl), the upload-side twin of CLOUDINARY_DELETE_CONCURRENCY and deliberately given the SAME default and the SAME "free tier ~500 ops/hr" caution: this is a bulk-materialize sweep over an entire brand catalog (measured 826 candidates on Pelagic Gear, thousands more queued behind Marine Layer), i.e. exactly the kind of burst the delete limiter already exists to avoid on the other side of the same account-level quota. No vision/LLM spend rides on this path (materializeMissingHero is deliberately hero-only, no DetectRun) so the only cost this knob paces is Cloudinary transfer + our own egress, not money. Raise once measured safe against a real multi-thousand-product brand.'
+  },
   CATEGORY_INFERENCE_DOMAIN_CONCURRENCY: {
     env: 'CATEGORY_INFERENCE_DOMAIN_CONCURRENCY',
     default: 3,

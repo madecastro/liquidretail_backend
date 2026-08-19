@@ -97,10 +97,40 @@ function unusableSeedImageReason(url) {
  * Fields to merge onto a catalog list/detail API row so the frontend picker
  * can render an honest, non-selectable card instead of silently accepting a
  * dead image. `seedIssue` is null when the row is fine.
+ *
+ * `seedUnusable` / `seedIssue` are UNCHANGED by the second argument — they
+ * remain a pure function of the URL only (see the module comment: a
+ * pending-detect row with a real image must never be conflated with a
+ * permanently-unusable one). `imageMediaId` is accepted here only to
+ * compute the two ADDITIONAL fields below, so a caller upgrading to pass it
+ * cannot silently change the meaning of the two existing ones.
+ *
+ * 2026-08-19 — extends the SAME vocabulary (not a parallel one) to answer
+ * the question `seedUnusable` was never meant to answer: "is this card
+ * actually ready to render an ad from RIGHT NOW". A row can have a perfectly
+ * good `imageUrl` (`seedUnusable: false`) and still have no `imageMediaId`
+ * yet — nothing at ingest time materializes it (CATALOG_DETECT_PRECOMPUTE
+ * deferral, see catalogProductDetectService.js), and on a freshly-ingested
+ * brand that is the OVERWHELMING majority of rows, not a rare timing gap.
+ * `pickerBlockReason` names that third state `'materializing'` alongside the
+ * two `seedIssue` already had, so the frontend can render "still preparing"
+ * distinctly from "broken forever" instead of either silently allowing it
+ * (old behavior — the picker never actually gated on imageMediaId, it just
+ * quietly did nothing useful) or lumping it in with a dead seed.
  */
-function catalogSeedFields(imageUrl) {
+function catalogSeedFields(imageUrl, imageMediaId) {
   const seedIssue = unusableSeedImageReason(imageUrl);
-  return { seedUnusable: !!seedIssue, seedIssue };
+  const seedUnusable = !!seedIssue;
+  const pickerBlockReason = seedIssue || (imageMediaId ? null : 'materializing');
+  return {
+    seedUnusable,
+    seedIssue,
+    // True only once a real Media doc backs the row — the picker's honest
+    // "generation ready" bit. False for both 'materializing' and any
+    // seedUnusable reason.
+    pickerReady: !seedUnusable && !!imageMediaId,
+    pickerBlockReason
+  };
 }
 
 module.exports = {

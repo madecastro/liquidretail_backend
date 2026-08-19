@@ -37,7 +37,8 @@ const CANCELLABLE_KINDS = new Set([
   'ad-regenerate',
   'veo-video',
   'ai-layout',
-  'detect'
+  'detect',
+  'catalog-materialize'
 ]);
 
 class CancelledError extends Error {

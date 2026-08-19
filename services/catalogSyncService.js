@@ -376,6 +376,18 @@ async function syncCatalogForCred(cred, run = null) {
     console.warn(`   ⚠️  product-path detect enqueue failed: ${err.message}`);
   }
 
+  // enqueueBrandProductDetects above is deferred-by-default (see its own
+  // comment: CATALOG_DETECT_PRECOMPUTE≠true skips the eager enqueue
+  // entirely), so nothing else here materializes imageMediaId either.
+  // Fire-and-forget bounded backfill closes that gap; idempotent
+  // (findActiveMaterializeDrain) so an overlapping/retried sync never
+  // stacks two sweeps over the same brand.
+  if ((added + updated) > 0) {
+    require('./catalogMaterializeDrainService')
+      .startCatalogMaterializeDrain({ brandId, advertiserId: cred.advertiserId, label: 'Preparing catalog images (post-ingest)' })
+      .catch(err => console.warn(`   ⚠️  catalog materialize drain trigger failed: ${err.message}`));
+  }
+
   // Eager review + commerce enrichment (Phase: catalog-sync-enrichment).
   // Walks the brand's products and fires productReviews + productDetails
   // for any row that's missing them OR has stale (>30d) cache. Both
