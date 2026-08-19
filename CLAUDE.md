@@ -1207,6 +1207,89 @@ Video never launches a browser.
   (`restoreTookEffect`) instead of counting `modifiedCount` and claiming
   success. Pinned by `scripts/verifyArchiveDigestRelease.js` (70 checks,
   revert-proven on 25 mutations).
+- **A LIVE RUN USED TO BE REAPED FOR BEING QUIET — `CampaignRun` now
+  heartbeats (fixed 2026-08-18). Do NOT "simplify" the beat, and do NOT raise
+  `REAP_STALE_MIN` to paper over a recurrence.** `CampaignRun.updatedAt` moved
+  ONLY when an ad SETTLED (the per-ad `$inc {succeeded|failed|skipped}`,
+  refreshed by `timestamps:true`), so the reaper's
+  `{ status:'running', updatedAt: { $lt: now - REAP_STALE_MIN } }` predicate
+  meant "an ad settled recently", not "this run is alive".
+  **MEASURED: `run_1787105727540_e8c94542`** — one product, Meta + PMax
+  "Everything", 39 claimed. `startedAt` 02:15:27Z; 18 statics settled by ~02:21;
+  video titling then ran with **zero** writes to the run row; at **02:36:29Z**
+  the reaper stamped it `failed` with `succeeded 18 · failed 0 · skipped 0 ·
+  total 39 · errors: []` — nothing threw, it was still rendering. In the same
+  tick the **Ad** sweep flipped the run's claimed-but-**undispatched** tail
+  back to `queued` on the identical silence — **9** rows (the 4:5 derive +
+  staged Meta funnel variants), stranded permanently. The operator paid for the
+  masters and got **30 of 39** creatives. *(That those 9 are the undispatched
+  tail is inference from two facts, not a direct observation: the count matches
+  `21 video rows − VEO_CONCURRENCY 12 in flight = 9` exactly, and the only
+  other path that parks a video row in `queued` — `renderDeriveOnlyVideoAd`'s
+  polite wait-requeue — `$inc`s `skipped`, which the run's `skipped: 0` rules
+  out. It matters because it decides the recovery verdict below.)* Newly likely because video is 10s on both platforms and Meta+PMax
+  share ONE 9:16 master, so 15 of 21 video rows queue behind one plate and
+  titling serialises behind `REMOTION_QUEUE_CONCURRENCY` (4) — long silent
+  stretches are now the NORMAL shape of a mixed run.
+  **`services/campaignRunHeartbeat.js`** is the fix: a ~60s ticker started in
+  `runRenderLoop`, writing `$set: { updatedAt, lastHeartbeatAt }` to
+  `{ _id, status:'running' }` and **nothing else** — never `total` (the claim
+  count and the progress denominator), never the outcome counters. It also
+  beats the run's still-`rendering` ads with the SAME shared builders the
+  loop's per-completion write uses, which is what saves the undispatched tail
+  and closes a real double-bill (an ad reaped to `queued` while still sitting
+  in the live in-memory pool is claimable by a concurrent `selectAdsForRun`,
+  and `renderOneInner` has no status guard, so both runs would submit it).
+  **Four things are load-bearing:** (a) the beat is **gated on real in-flight
+  work** (`pools.some(p => p.inflight > 0)`) — an unconditional tick would
+  defeat the reaper and resurrect the wedged-run-lives-forever class it exists
+  to kill, and the timer dies with the process so a replaced instance cannot
+  beat at all; (b) **`RUN_HEARTBEAT_MAX_MS` (4h) caps the total beat lifetime**,
+  because `inflight` is decremented in `renderOne`'s `.finally` and a
+  `renderOne` that NEVER settles would otherwise report work forever and make
+  the run immortal — strictly worse than pre-heartbeat, since the Ad arm would
+  also hold the claimed `rendering` set out of the Ad reaper's reach. 4h is
+  `progressService.MAX_RUN_MS`, the cap already on the SAME run's `ad-batch`
+  `OperationRun`; two heartbeats for one run must not disagree. **This was
+  missing from the first design and adversarial review caught it — do not
+  remove it.** (c) `runHeartbeat.stop()` sits in **both** the `catch` and the
+  `finally` around the pool drain (idempotent), plus `unref()`; the `catch` is
+  dead today (the drain's promises are individually `.catch`'d so `Promise.all`
+  cannot reject) and is kept as an edit guard, which the comment says outright.
+  (d) the interval is derived from the **ONE** shared parser
+  (`services/staleness.reapStaleMin`, PR #207 — do not add a third), capped at
+  60s and divided so ≥5 beats fit inside the window: 15 consecutive missed
+  writes at the documented default. ⚠️ The 5s spin-guard floor and that divisor
+  **conflict below a ~25s window** (`REAP_STALE_MIN < ~0.42`) — documented and
+  pinned as a boundary, not claimed away; the hard-60s Ad beat is already
+  hopeless at such a setting. `REAP_STALE_MIN` stays **15** — it is the
+  claimed-doc window and raising it delays orphan requeue for every Ad and
+  every running run.
+  The running-reap predicate moved out of `worker.js` into the exported
+  `buildStaleRunningFilter` (`services/campaignRunGuards.js`) so the harness
+  evaluates the REAL filter. `CampaignRun.lastHeartbeatAt` is **declared** —
+  strict schema, an undeclared path is dropped in silence. **Read it correctly:**
+  a beat writes it and `updatedAt` at the SAME instant, so on a beating run they
+  are always ~equal and only a *settlement* moves `updatedAt` alone. Fresh
+  `lastHeartbeatAt` = the loop is alive with work in flight; stale/null while
+  `running` = nothing in flight or the process is gone. Whether work is
+  **settling** is `succeeded+failed+skipped` vs `total`, never a date gap. (The
+  first draft asserted the inverse in four files; adversarial review caught it.)
+  Pinned by `scripts/verifyCampaignRunHeartbeat.js` (40 checks, offline,
+  revert-proven on 14 mutations). **Known honest consequence, not re-tuned:**
+  `ALERT_RUN_SILENCE_MIN` (12m on `updatedAt`) can no longer fire for a run
+  whose pool is busy — same shape `ALERT_RENDERING_STALE_MIN` has had since the
+  Ad beat shipped. See `docs/ALERTING.md`.
+  **NOT FIXED BY THIS, and an operator must be told:** the 9 already-stranded
+  rows do **not** qualify for `services/strandedRunSweeper.js`. Its filter
+  requires a `renderStage` breadcrumb (`renderStage: { $nin: [null, ''] }`) to
+  separate "a deploy killed this" from "an operator has not pressed go yet",
+  and a claimed-but-never-dispatched ad has no stage — `REQUEUE_MARK` is
+  `{ wasRendering: true }` and does not add one. So they stay `queued` until
+  someone presses **Generate more** (`POST /api/ads/runs`), or
+  `queuedArchiveSweeper` parks them after `QUEUED_ARCHIVE_AFTER_H` (24). **Do
+  not widen the sweeper to reach them** — that is a money-adjacent change and
+  the breadcrumb requirement is what stops it draining ads nobody claimed.
 - **Stop parks the stopping RUN's own tail — not the campaign's
   (fixed 2026-08-18).** `routes/ads.js` ran
   `Ad.updateMany({ campaignId: run.campaignId, status:'queued' }, …archive…)`
@@ -1823,9 +1906,10 @@ not as a separate tuning decision. Re-measure before going higher
 - Commit/push **only when asked**. Feature branches only; never push to `main`
   without explicit permission.
 - Before pushing non-trivial changes: run **`npm run lint`**, `node --check` the
-  touched files, and run the relevant `scripts/verify*.js` harness (**138 scripts**
-  as of the archive-digest release, 2026-08-18 — the "101" this line carried was
-  stale by 37). Add a harness for money/security-critical
+  touched files, and run the relevant `scripts/verify*.js` harness (**143 `.js`
+  scripts / 151 including `.mjs`** as of the CampaignRun heartbeat, 2026-08-18 —
+  the "101" the header still carries is stale by ~42, and the "138" this line
+  carried counted only part of the tree). Add a harness for money/security-critical
   logic, and **revert-prove it** — back the fix out and confirm the test fails. A test
   that cannot fail is not a test.
 - **`npm run lint` is not optional, and it is not a style check.** It enables exactly
