@@ -14,7 +14,9 @@
     "lint": "eslint .",
     "test": "node scripts/runVerifySuite.js",
     "test:affected": "node scripts/runVerifySuite.js --affected",
-    "setup:worktree": "bash bin/setup-worktree.sh"
+    "setup:worktree": "bash bin/setup-worktree.sh",
+    "check:stale-work": "node scripts/findStaleUncommittedWork.js",
+    "check:rebase": "node scripts/checkRebaseContainment.js"
   },
   "devDependencies": {
     "eslint": "^9.39.5"
