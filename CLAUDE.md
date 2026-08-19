@@ -1531,8 +1531,14 @@ Full detail in `docs/ATLAS.md` §7 and `docs/CLOUDINARY-VIDEO.md`. Headlines:
   `{ok:false, reason:'no websiteUrl'}` was discarded by every fire-and-forget
   caller, so nothing was ever recorded anywhere. Now persisted on the Brand doc
   (`enrichmentSkipReason` / `enrichmentSkippedAt`), cleared the moment enrichment
-  actually proceeds. Full writeup + revert-proof: `session.md` 2026-08-18,
-  `scripts/verifyBrandWebsiteBackfill.js` (26 checks).
+  actually proceeds. **`safeWebsiteOrigin()` also blocks SSRF targets, added
+  2026-08-19 in review** — the CDN denylist stops the wrong-host case, but a
+  candidate can come from SCRAPED `productUrl` data and is then fetched
+  verbatim by three services, so it also rejects private/loopback/link-local
+  IPs (127/8, 10/8, 172.16/12, 192.168/16, 169.254/16 — where cloud metadata
+  lives — plus IPv6 equivalents and IPv4-mapped forms) and non-http(s)
+  schemes. Full writeup + revert-proof: `session.md` 2026-08-18/19,
+  `scripts/verifyBrandWebsiteBackfill.js` (37 checks).
 - **Gate a provider tier on the PRIMARY key, never the fallback.** `wantGpt`
   (`brandEnrichmentService.js`) gated on `OPENAI_API_KEY` while the call itself goes
   through `atlasLlmService.chatCompletion`, whose primary is Atlas and whose direct

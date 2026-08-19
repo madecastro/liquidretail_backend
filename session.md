@@ -160,6 +160,49 @@ begin with, so there was nothing else in production to backfill from `CatalogPro
 majority-vote (the script's fallback path exists for a case that turned out not to be populated
 yet, not one this session confirmed empirically).
 
+**2026-08-19 addendum — SSRF hardening, coordinator review of PR #221 before merge.**
+`safeWebsiteOrigin()`'s CDN/backend denylist blocked the WRONG-host case but not the
+DANGEROUS-host case: `Brand.websiteUrl` can originate from scraped `CatalogProduct.productUrl`
+data (content this app does not control) and is then `axios.get`-ed verbatim, repeatedly, by
+three services — a real, if low-likelihood, SSRF path into cloud metadata / internal
+infrastructure. Added to `services/brandWebsiteBackfill.js`:
+
+- `isPrivateOrLoopbackHost()` — rejects loopback (127.0.0.0/8, `::1`), RFC1918 private ranges
+  (10/8, 172.16/12 — boundary-exact, 172.32.0.0 is correctly NOT collateral damage, 192.168/16),
+  link-local (169.254.0.0/16, which is also where cloud-metadata endpoints live; `fe80::/10`),
+  IPv6 unique-local (`fc00::/7`), `0.0.0.0`, and `localhost`/`*.internal`/`*.local`. Numeric/hex/
+  octal IPv4 obfuscation (`2130706433`, `0x7f000001`, `017700000001`, `127.1`) needed no special
+  handling — Node's `URL` parser canonicalizes all of those to dotted-quad form before this code
+  ever inspects `hostname`. IPv4-mapped IPv6 needed TWO forms handled: the rare dotted
+  (`::ffff:127.0.0.1`) and the form Node actually produces for a literal typed that way,
+  canonical hex-groups (`::ffff:7f00:1`) — decoding the two hex groups back to a dotted quad
+  before recursing was required, or this exact case (caught by testing, not assumed) slipped
+  through as `[::ffff:7f00:1]`, unblocked.
+- `safeWebsiteOrigin()` also now rejects an explicit non-http(s) scheme (`file:`, `javascript:`,
+  `data:`, `gopher:`, `ftp:`) BEFORE the `https://` prepend coercion — without this,
+  `"file:///etc/passwd"` silently became hostname `"file"` (protocol `https:` after the prepend,
+  so it passed every check) rather than failing loud.
+- **A protocol-relative (`//host/path`) special case was written, tested, and then DELETED** —
+  revert-proving it (per the coordinator's ask) proved it dead: prepending `https:` in front of
+  `//host/path` degrades to `https:////host/path`, which the WHATWG parser still resolves to the
+  real `host`, so the private-IP and CDN checks already cover it with no special-casing. Kept as
+  a positive/negative pair in the harness (A19) documenting the mechanism instead of asserting a
+  branch that added test surface with no actual safety.
+- Userinfo/fragment host-confusion (`evil.com@169.254.169.254`, `https://169.254.169.254#evil.com`)
+  needed no special handling either — `new URL()` already separates those from `hostname` before
+  this code ever looks at it.
+
+Extended `scripts/verifyBrandWebsiteBackfill.js` to 37 checks (A11-A20 + one `isPrivateOrLoopbackHost`
+regression guard — a real hostname that merely *starts* with private-range-looking digits, e.g.
+`10.example.com`, must never be judged by a text-prefix match). Revert-proven against 4 mutations
+(the coordinator asked for the denylist and scheme-rejection removals specifically; two more —
+breaking the IPv4-mapped-IPv6 hex decode, and confirming the protocol-relative branch's absence
+doesn't regress anything — were added during this pass). `cdn.shopify.com` blocked but bare
+`shopify.com` not: left as is per the coordinator's own "your call, probably immaterial" —
+it's not a CDN and not a private/loopback target, so it doesn't fit either denylist's actual
+purpose, and blocking it risks false-positiving a legitimate (if unusual) case for no security
+benefit.
+
 ## 2026-08-17 — `verifyAgentRegistry` GREEN. Five capabilities were DEAD, not dangerous.
 
 Branch `claude/gallant-almeida-a7fb96`. The red harness on main is fixed; suite is **133 / 0**.

@@ -40,7 +40,7 @@ const assert = require('node:assert/strict');
 const mongoose = require('mongoose');
 
 const Brand = require('../models/Brand');
-const { safeWebsiteOrigin, backfillBrandWebsiteUrl, BLOCKED_HOST_SUFFIXES } = require('../services/brandWebsiteBackfill');
+const { safeWebsiteOrigin, backfillBrandWebsiteUrl, isPrivateOrLoopbackHost, BLOCKED_HOST_SUFFIXES } = require('../services/brandWebsiteBackfill');
 
 let passed = 0;
 let failed = 0;
@@ -112,6 +112,85 @@ check('A10: a legitimate storefront host is NOT collateral damage from the denyl
   assert.equal(safeWebsiteOrigin('https://www.marinelayer.com'), 'https://www.marinelayer.com');
   assert.equal(safeWebsiteOrigin('https://shopify.com'), 'https://shopify.com'); // NOT cdn.shopify.com
 });
+// SSRF hardening (added 2026-08-19, coordinator review of PR #221) — a
+// candidate can come from SCRAPED CatalogProduct.productUrl data (content
+// this app does not control), and websiteUrl is then axios.get'd verbatim,
+// repeatedly, by three services. A11-A20 pin the private/loopback/link-
+// local denylist and the non-http(s)-scheme rejection.
+
+check('A11: cloud-metadata / link-local (169.254.0.0/16) is REJECTED', () => {
+  assert.equal(safeWebsiteOrigin('http://169.254.169.254/latest/meta-data/'), null);
+  assert.equal(safeWebsiteOrigin('169.254.169.254'), null);
+});
+check('A12: loopback (127.0.0.0/8, incl. short form) is REJECTED', () => {
+  assert.equal(safeWebsiteOrigin('http://127.0.0.1/'), null);
+  assert.equal(safeWebsiteOrigin('http://127.1/'), null); // short-form loopback
+});
+check('A13: RFC1918 private ranges are REJECTED, and the /12 boundary is exact', () => {
+  assert.equal(safeWebsiteOrigin('http://10.0.0.5/'), null);
+  assert.equal(safeWebsiteOrigin('http://192.168.1.1/'), null);
+  assert.equal(safeWebsiteOrigin('http://172.16.0.1/'), null);
+  assert.equal(safeWebsiteOrigin('http://172.31.255.255/'), null);
+  // 172.32.0.0 is OUTSIDE 172.16.0.0/12 — must NOT be collateral damage.
+  assert.equal(safeWebsiteOrigin('http://172.32.0.1/'), 'http://172.32.0.1');
+});
+check('A14: 0.0.0.0 is REJECTED', () => {
+  assert.equal(safeWebsiteOrigin('http://0.0.0.0/'), null);
+});
+check('A15: numeric/hex/octal IPv4 obfuscation is REJECTED (Node canonicalizes to dotted-quad before this code inspects it)', () => {
+  assert.equal(safeWebsiteOrigin('http://2130706433/'), null);   // decimal 127.0.0.1
+  assert.equal(safeWebsiteOrigin('http://0x7f000001/'), null);   // hex 127.0.0.1
+  assert.equal(safeWebsiteOrigin('http://017700000001/'), null); // octal 127.0.0.1
+});
+check('A16: IPv6 loopback / link-local / unique-local / IPv4-mapped forms are REJECTED', () => {
+  assert.equal(safeWebsiteOrigin('http://[::1]/'), null);
+  assert.equal(safeWebsiteOrigin('http://[fe80::1]/'), null);   // fe80::/10
+  assert.equal(safeWebsiteOrigin('http://[fc00::1]/'), null);   // fc00::/7
+  assert.equal(safeWebsiteOrigin('http://[::ffff:127.0.0.1]/'), null); // dotted form
+  // Node canonicalizes ::ffff:169.254.169.254 to the hex-group form
+  // (::ffff:a9fe:a9fe) — isPrivateOrLoopbackHost must decode that, not
+  // just match a dotted-quad string.
+  assert.equal(safeWebsiteOrigin('http://[::ffff:169.254.169.254]/'), null);
+});
+check('A17: userinfo / fragment host-confusion tricks resolve to the REAL host, which still gets checked', () => {
+  // new URL() already separates userinfo/fragment from the actual host —
+  // this pins that safeWebsiteOrigin does not get fooled by trusting the
+  // pre-parse string instead of `url.hostname`.
+  assert.equal(safeWebsiteOrigin('evil.com@169.254.169.254'), null);
+  assert.equal(safeWebsiteOrigin('https://evil.com@169.254.169.254/'), null);
+  assert.equal(safeWebsiteOrigin('https://169.254.169.254#evil.com'), null);
+});
+check('A18: non-http(s) schemes are REJECTED outright, not silently reinterpreted as a hostname', () => {
+  assert.equal(safeWebsiteOrigin('file:///etc/passwd'), null);
+  assert.equal(safeWebsiteOrigin('javascript:alert(1)'), null);
+  assert.equal(safeWebsiteOrigin('data:text/html,x'), null);
+  assert.equal(safeWebsiteOrigin('gopher://evil.com'), null);
+  assert.equal(safeWebsiteOrigin('ftp://evil.com/x'), null);
+});
+check('A19: protocol-relative ("//host/path") needs no special case — it degrades through the https-prepend fallback and still hits every hostname-safety check below', () => {
+  // Revert-prove note: an explicit "reject //... outright" branch was
+  // tried here first and REMOVED after this exact test proved it dead —
+  // prepending "https:" in front of "//host/path" yields "https:////host/path",
+  // which the WHATWG parser still resolves to the real host, so the
+  // private-IP and CDN denylist checks already cover it. A safe host must
+  // still resolve normally (not become collateral damage of a blanket ban).
+  assert.equal(safeWebsiteOrigin('//169.254.169.254/latest'), null);
+  assert.equal(safeWebsiteOrigin('//cdn.shopify.com/x.jpg'), null);
+  assert.equal(safeWebsiteOrigin('//example.com/path'), 'https://example.com');
+});
+check('A20: localhost / .internal / .local hostname conventions are REJECTED', () => {
+  assert.equal(safeWebsiteOrigin('http://localhost:3000/'), null);
+  assert.equal(safeWebsiteOrigin('foo.internal'), null);
+  assert.equal(safeWebsiteOrigin('foo.local'), null);
+  assert.equal(safeWebsiteOrigin('foo.localhost'), null);
+});
+check('isPrivateOrLoopbackHost: a public DNS name that merely starts with digits is NOT an IP literal', () => {
+  // Regression guard for a substring-matching implementation — "10.0.0.5"
+  // is private, but a real hostname must never be judged by a text prefix.
+  assert.equal(isPrivateOrLoopbackHost('10.example.com'), false);
+  assert.equal(isPrivateOrLoopbackHost('169.254.example.com'), false);
+});
+
 check('BLOCKED_HOST_SUFFIXES is exported and non-empty (so a future caller can extend it)', () => {
   assert.ok(Array.isArray(BLOCKED_HOST_SUFFIXES) && BLOCKED_HOST_SUFFIXES.length >= 4);
 });
