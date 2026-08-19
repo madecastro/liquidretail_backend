@@ -227,8 +227,27 @@ function sliceFrom(marker, span) {
   return adsSrc.slice(start, start + span);
 }
 
+// Bounds a route-handler marker at the NEXT top-level route declaration (or
+// EOF) instead of a hand-tuned char count. A fixed span drifts stale the
+// moment the handler grows past it (measured: 4500→6000 one PR ago, when
+// this exact handler grew a visionQcRollup block) — and a span that
+// OVER-reaches past the real handler boundary risks a worse failure mode
+// than "check can't find its target": a positive assertion ("the handler
+// contains X") can pass on code that belongs to a different route entirely,
+// which is a silent, unfalsifiable pass, not a scoping bug that fails loud.
+// Self-maintaining: this never needs re-tuning as router.get('/runs/:runId')
+// grows or shrinks.
+function sliceHandler(marker) {
+  const start = adsSrc.indexOf(marker);
+  if (start === -1) return null;
+  const routeDeclRe = /router\.(get|post|patch|put|delete)\(/g;
+  routeDeclRe.lastIndex = start + marker.length;
+  const next = routeDeclRe.exec(adsSrc);
+  return adsSrc.slice(start, next ? next.index : adsSrc.length);
+}
+
 await ok('D1 GET /runs/:runId actually returns stages, failureSummary, lastHeartbeatAt, updatedAt', () => {
-  const handler = sliceFrom("router.get('/runs/:runId'", 4500);
+  const handler = sliceHandler("router.get('/runs/:runId'");
   assert.ok(handler, 'could not locate the GET /runs/:runId handler to scope this check');
   // Scoped to the res.json({...}) OBJECT LITERAL itself, not merely
   // "somewhere in this handler" — `stages` and `failureSummary` are also
@@ -250,7 +269,7 @@ await ok('D1 GET /runs/:runId actually returns stages, failureSummary, lastHeart
 });
 
 await ok('D2 GET /runs/:runId actually CALLS summarizeInFlightStages and runFeed.summariseFailures (not just imported)', () => {
-  const body = sliceFrom("router.get('/runs/:runId'", 4500);
+  const body = sliceHandler("router.get('/runs/:runId'");
   assert.ok(body);
   assert.match(body, /summarizeInFlightStages\(/, 'must call the shared stage-grouping function, not re-derive its own');
   assert.match(body, /runFeed\.summariseFailures\(/, 'must reuse Slack\'s own failure-grouping function, not a second copy');

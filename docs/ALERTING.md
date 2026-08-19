@@ -769,7 +769,7 @@ transport-specific plumbing around them.
 | Run liveness (`services/campaignRunHeartbeat.js`) | Yes — `CampaignRun.lastHeartbeatAt` | Not returned at all | **Yes** — `lastHeartbeatAt` + `updatedAt`, used for the frontend's "no update in Xm" caution |
 | "Run reaped as stale" reason | N/A — this was the gap | Reaper stamped `status:'failed'` with an **empty** `errors[]` — zero explanation | **Fixed** — `buildStaleRunningReapUpdate` pushes a real `errors[]` entry naming the stale window |
 | "Queued-drain run crashed" reason | N/A — this was the gap | Same empty-`errors[]` gap, different code path (`POST /api/ads/runs`) | **Fixed** — mirrors the prep/render crash handler's `$push` |
-| Per-ad vision-QC category scores + findings (`adVisionQcService.js` alert fields) | Yes — full `Ad.visionQc` | Only via `GET /api/ads/:id/generation-inspector`; render-activity/ads-list get the pass/fail summary only | **Still gap** — not wired into the run poller or gallery cards; the inspector remains the only full view |
+| Per-ad vision-QC category scores + findings (`adVisionQcService.js` alert fields) | Yes — full `Ad.visionQc` | Only via `GET /api/ads/:id/generation-inspector`; render-activity/ads-list get the pass/fail summary only | **Fixed (2026-08-19)** — `GET /api/ads` and `GET /api/ads/:id` now carry a compact `visionQc` on every ad (categories added on the `:id` detail path); `GET /runs/:runId` carries a run-level `visionQcRollup` (shipped-without-QC / QC'd-on-retry counts). The inspector remains the only place for the FULL per-attempt trail (discarded URLs, raw `imageGeneration` payloads) — this closes "was this ad inspected at all", not "show me everything" |
 | Director "payload didn't satisfy the round contract" warning | **No** — console + Slack only, never written to `CampaignRun` | No | **Still gap** — a run with this warning looks clean on the poller |
 | Watchdog "N campaign run(s) not progressing" (age+silence on `preparing`/`running`) | Derived from `CampaignRun` fields, not a new one | No per-run "this has been silent Nm" flag | **Partially addressed** — `lastHeartbeatAt`/`updatedAt` let the frontend flag silence on `'running'`; a `'preparing'` run genuinely has no liveness signal by design (`expandWizardJob` makes zero writes to the row until the flip — see `services/campaignRunGuards.js`), so a stuck-preparing run is still only visible via Slack's watchdog until it ages out via `PREPARE_STALE_MIN` |
 | `alertService` dedupe tally ("+N more since HH:MM") for a repeated failure | In-process map only | No | **Still gap** — a burst of identical failures reads as isolated events on the poller |
@@ -802,6 +802,50 @@ verified state, not that raw pass.
 
 Pinned by `scripts/verifyRunStatusTruthfulness.js` (14 checks, revert-proven on 4
 mutations).
+
+### Vision-QC surfacing (2026-08-19, follow-up)
+
+Closed the "Still gap" row above. Scope was deliberately narrow: expose
+already-persisted `Ad.visionQc` data through more read surfaces — nothing in
+the generation, regeneration, or alerting control flow (`runPostRenderQc`,
+`reportQcVerdict`, `alertQcFailure`/`alertQcAccepted`/`alertQcSkipped`) was
+touched.
+
+- `services/adVisionQcService.js` `summarizeVisionQc(visionQc, {categories})`
+  (pure) — the single shared compact-subset formatter every surface below
+  reuses, so "was this ad inspected" has one derivation, not several that
+  could drift. Compact form: `inspected/passed/skipped/disabled/reason/
+  finalAttempt/regenerated/summary`. `categories:true` adds the FINAL
+  attempt's per-category `{score, pass, findings}` (findings capped at
+  3/category) — the full per-attempt trail (discarded URLs, raw
+  `imageGeneration` payloads) stays inspector-only.
+- `routes/ads.js` `projectAd()`: every ad from `GET /api/ads` (gallery list)
+  and `GET /api/ads/:id` (detail) now carries a `visionQc` field — compact on
+  the list path, upgraded with `categories` on the `:id` detail path.
+- `routes/ads.js` `GET /runs/:runId`: two more cheap `Ad.countDocuments`
+  queries (scoped by `campaignRunIds`, same posture as `queuedRemaining`
+  above) feed a `visionQcRollup: {shippedWithoutQc, qcdOnRetry}` — the
+  run-level "N ads shipped without QC" / "N ads QC'd on retry" signal. No
+  Slack equivalent exists to reuse here (Slack only ever alerts per-ad,
+  never aggregates across a run), so this is the first place either count is
+  aggregated at all.
+- Frontend (`liquidretail`, companion to this pass): a vision-QC pill on the
+  gallery card (shown only for skipped/failed/regenerated — a clean
+  attempt-1 pass stays quiet, same "surface the exceptional case" precedent
+  as the Meta-sync pills), a QC summary block in the ad detail modal, and a
+  `visionQcNote` line on `RunProgress` shown across running/done/failed
+  states whenever the rollup has anything to report — including a run that
+  is otherwise a quiet full success, so "0 failed" can no longer read as
+  "nothing to see here" when ads shipped uninspected.
+
+Pinned by `scripts/verifyAdVisionQcSurfacing.js` (19 checks: pure
+`summarizeVisionQc` behavior, behavioral `projectAd()` calls against the real
+exported function, and source-scan structural checks on the `GET /runs/:runId`
+rollup query + response — revert-proven on the skipped-reads-as-passed and
+missing-rollup-field mutations). Frontend `RunProgress` rollup rendering
+verified via a dev-only fixture harness (`visionqc-harness.html` /
+`src/pages/Ads/__harness__/visionQc.tsx`, same pattern as the existing
+`badge-harness.html`) plus a clean `tsc -b --noEmit` and production build.
 
 ## Known gap this does not close
 

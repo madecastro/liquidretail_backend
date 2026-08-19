@@ -1004,6 +1004,70 @@ function qcFailureTitle(visionQc, { regenerated = null } = {}) {
 }
 
 /**
+ * Compact, API-facing summary of a persisted Ad.visionQc verdict — the
+ * shared subset for GET /api/ads (list), GET /api/ads/:id (detail), and the
+ * run-level rollup on GET /api/ads/runs/:runId. Distinct from
+ * buildQcSlackDetail (Slack's plain-text wall) and from the
+ * generation-inspector's raw Ad.visionQc (every attempt, every discarded
+ * render URL, raw imageGeneration payloads) — those stay screen-specific.
+ * This is the "is this ad's creative trustworthy, and why" answer an
+ * operator needs on a gallery card or detail modal WITHOUT a second trip to
+ * the inspector.
+ *
+ * `inspected` is the one field every caller should gate on: a visionQc that
+ * is `skipped` or `disabled` still returns a summary object (so a badge can
+ * say "not inspected" instead of rendering nothing), but `passed` on those
+ * is always false and must never be read as "this shipped clean."
+ *
+ * @param {object|null} visionQc — Ad.visionQc, exactly as persisted.
+ * @param {object} [opts]
+ * @param {boolean} [opts.categories=false] — include the final attempt's
+ *   per-category {score, pass, findings} (findings capped at 3/category —
+ *   enough to tell an operator WHY without shipping every attempt's full
+ *   findings list, which is what makes the inspector's payload heavy).
+ *   Callers building a compact list/badge should omit this; the detail
+ *   modal should pass true.
+ * @returns {object|null} null only when visionQc itself is null/undefined
+ *   (ad never reached the QC gate at all, e.g. pre-QC historical ads).
+ */
+function summarizeVisionQc(visionQc, { categories = false } = {}) {
+  if (visionQc == null) return null;
+  const attempts = Array.isArray(visionQc.attempts) ? visionQc.attempts : [];
+  const last = attempts[attempts.length - 1] || null;
+  const finalAttempt = Number(visionQc.finalAttempt) || attempts.length || 0;
+  const out = {
+    // Did a real vision-model verdict happen at all? False for both
+    // `skipped` (flag on, QC failed to run — see buildSkippedVerdict) and
+    // `disabled` (flag off, nobody expected it) — an operator scanning a
+    // gallery needs "was this looked at", not just "did it pass".
+    inspected:    !visionQc.skipped && !visionQc.disabled,
+    passed:       !!visionQc.passed,
+    skipped:      !!visionQc.skipped,
+    disabled:     !!visionQc.disabled,
+    reason:       visionQc.reason || null,
+    finalAttempt: finalAttempt || null,
+    // True when the single allowed regeneration actually ran (QC'd on
+    // retry) — same inference qcFailureTitle uses for the Slack title.
+    regenerated:  finalAttempt > 1 || attempts.length > 1,
+    summary:      last?.summary || null
+  };
+  if (categories && last?.categories) {
+    out.categories = CATEGORIES.reduce((acc, key) => {
+      const c = last.categories[key];
+      if (!c) return acc;
+      const findings = Array.isArray(c.findings) ? c.findings : (c.findings ? [c.findings] : []);
+      acc[key] = {
+        score:    c.score ?? null,
+        pass:     !!c.pass,
+        findings: findings.slice(0, 3).map((f) => String(f))
+      };
+      return acc;
+    }, {});
+  }
+  return out;
+}
+
+/**
  * Slack + log helper for terminal QC failure ("rejection"). Fire-and-forget.
  *
  * @param {boolean|null} [regenerated] — when known, overrides attempt-count
@@ -1211,6 +1275,7 @@ module.exports = {
   resolveFrontendOrigin,
   buildAppPreviewUrl,
   qcFailureTitle,
+  summarizeVisionQc,
   reportQcVerdict,
   // I/O
   judgeRender,
