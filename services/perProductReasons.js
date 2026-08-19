@@ -224,6 +224,17 @@ function normalizePerProductEntry(raw, nameById = {}) {
       entry.payloadsBeforeCap = Number(raw.payloadsBeforeCap) || 0;
     }
 
+    // Director round-contract reasons (validateDirectorPayload) — the same
+    // array the 'director:contract-warn' Slack alert already carries
+    // (aiCreativeDirectorService.js directConceptsRound). Independent of
+    // `warning`/`reason`: it describes the ROUND, not this product's skip
+    // status, so it is copied through regardless of `skipped`. Capped at 6
+    // to match the Slack alert's reasons.slice(0, 6) — this is not the place
+    // to carry more detail than the alert that already exists for it.
+    if (Array.isArray(raw.directorContractWarnings) && raw.directorContractWarnings.length) {
+      entry.directorContractWarnings = raw.directorContractWarnings.slice(0, 6).map(String);
+    }
+
     if (reason === REASON.ERROR) {
       if (raw.error) entry.error = String(raw.error);
       if (raw.errorName) entry.errorName = String(raw.errorName);

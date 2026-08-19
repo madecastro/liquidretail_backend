@@ -133,6 +133,18 @@ const campaignRunSchema = new mongoose.Schema({
     // MUST stay separate from `reason` — reason implies skipped:true.
     // Shape owned by services/perProductReasons.js WARNING enum.
     warning:           String,
+    // Director round-contract reasons (validateDirectorPayload) — the SAME
+    // reasons.slice(0,6) array the 'director:contract-warn' Slack alert
+    // already sends (services/aiCreativeDirectorService.js
+    // directConceptsRound). Also non-skip advisory, but kept as its OWN
+    // field rather than overloaded onto `warning` above: `warning` is a
+    // small fixed enum (services/perProductReasons.js WARNING) with a
+    // static human sentence per code, while this is a variable-length list
+    // of free-text validation reasons describing the ROUND, not this
+    // product's catalog picks. Undeclared here would be silently dropped on
+    // $set — same trap as renderError.predictionId (CLAUDE.md §2/§4). See
+    // docs/ALERTING.md "In-app run status vs Slack" gap table.
+    directorContractWarnings: { type: [String], default: undefined },
     mediaId:           String,
     mediaIds:          [String],
     conceptCount:      Number,

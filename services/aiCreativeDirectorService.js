@@ -2675,7 +2675,16 @@ async function directConceptsRound({
     concepts:  parsed.concepts || [],
     roundIndex,
     avoidListCount: avoidList.length,
-    warnings
+    warnings,
+    // Round-contract reasons (validateDirectorPayload), same slice(0,6) the
+    // 'director:contract-warn' Slack alert above already sends. Reaching
+    // this line with reasons.length > 0 means the soft-warning branch ran
+    // (the hard-discard branch above throws instead), so this is never the
+    // zero-usable-concepts case. In memory only until the caller
+    // (campaignAdsGenerationService runConceptDrivenExpansion) threads it
+    // onto the CampaignRun.perProduct row — see docs/ALERTING.md "In-app run
+    // status vs Slack" gap table, "Director … round contract" warning row.
+    contractWarnings: reasons.length ? reasons.slice(0, 6) : []
   };
 }
 
