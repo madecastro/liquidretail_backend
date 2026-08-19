@@ -170,11 +170,21 @@ function installCatalogProductFindStub(CatalogProductModel, rows) {
   CatalogProductModel.find = (filter) => {
     calls.push(filter);
     const wantedIds = new Set((filter?._id?.$in || []).map(String));
-    const wantedBrand = filter?.brandId != null ? String(filter.brandId) : undefined;
-    const matched = rows.filter((r) =>
-      wantedIds.has(String(r._id)) &&
-      (wantedBrand === undefined || String(r.brandId) === wantedBrand)
-    );
+    // Distinguish "no brandId key in the filter at all" (permissive — match
+    // on _id alone) from "brandId key present but null/undefined" (the real
+    // mongodb driver BSON-serializes `undefined` as `null` and sends the key,
+    // so it matches nothing against CatalogProduct.brandId, which is a
+    // required field and never null). A stub that treated the latter as "no
+    // brand clause" would be MORE lenient than production and could mask a
+    // real regression (e.g. brandId silently undefined) as passing.
+    const hasBrandKey = filter != null && Object.prototype.hasOwnProperty.call(filter, 'brandId');
+    const wantedBrand = hasBrandKey && filter.brandId != null ? String(filter.brandId) : undefined;
+    const matched = rows.filter((r) => {
+      if (!wantedIds.has(String(r._id))) return false;
+      if (!hasBrandKey) return true; // caller genuinely didn't scope by brand
+      if (wantedBrand === undefined) return false; // brandId: null/undefined matches nothing real
+      return String(r.brandId) === wantedBrand;
+    });
     return {
       select() { return this; },
       lean: async () => matched.map((r) => ({ _id: r._id, brandId: r.brandId }))
