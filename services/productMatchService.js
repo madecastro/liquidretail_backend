@@ -432,7 +432,7 @@ async function runPerProductReasoner(provResult, refined, ctx) {
 //     get the productName stripped — they're brand-level evidence only.
 //   - brand_match nulls out productName/variant/reasoning/primaryUrl/
 //     primaryThumbnail so consumers don't read fabricated SKUs.
-function buildPerProductProviderMatchRecord(refined, provResult, ident, ctx) {
+function buildPerProductProviderMatchRecord(refined, provResult, ident, ctx, catalogFirstRes = null) {
   const reasonerCert = ident?.certainty || 0;
   const refinedCert  = clampUnit(refined?.confidence ?? 0);
 
@@ -527,8 +527,15 @@ function buildPerProductProviderMatchRecord(refined, provResult, ident, ctx) {
     matchSource:          outcome === 'product_match' ? 'gemini-search' : null,
     catalogProductId:     null,
     catalogMatch:         null,
-    catalogVisualScore:   null,
-    catalogCombinedScore: null,
+    // 2026-08-19 — catalog-first ran on this refined product too (up to
+    // 3 text candidates × 1 visual call each) but its combined score
+    // fell below the 0.80 winner threshold, so the reasoner path took
+    // over. The visual signal it produced is real data — record it so
+    // the per-Media visual-usage analysis isn't invisible. Downstream
+    // consumers that gate on outcome/winner ignore these fields on
+    // reasoner-winner rows; observability tooling reads them.
+    catalogVisualScore:   catalogFirstRes?.visualScore   ?? null,
+    catalogCombinedScore: catalogFirstRes?.combinedScore ?? null,
     providers:            provResult.providers || {},
     errors:               provResult.errors    || {},
     productReviews:       null,                        // enrichment fan-out hydrates
@@ -693,11 +700,15 @@ async function findPerProductMatches(args) {
       }
       const provRes = perProductProviderResults[i];
       if (provRes?.ident?.productName) {
-        matches.push(buildPerProductProviderMatchRecord(rp, provRes.provResult, provRes.ident, args));
+        // Pass catRes so the reasoner-winner record still carries the
+        // catalog-first visual/combined signal for observability
+        // (catalog-first ran, just didn't win). See buildPerProduct
+        // ProviderMatchRecord's inline note.
+        matches.push(buildPerProductProviderMatchRecord(rp, provRes.provResult, provRes.ident, args, catRes));
         return;
       }
       // Fall back to refined-only record (no catalog, no provider hit)
-      matches.push(buildRefinedFallbackRecord(rp, null, args));
+      matches.push(buildRefinedFallbackRecord(rp, null, args, catRes));
     });
   } else if (sceneLevel) {
     // Legacy single-match path: no refinedProducts, just wrap scene-level
@@ -1187,7 +1198,7 @@ function buildSceneLevelMatchRecord(refined, sceneLevel, args) {
   };
 }
 
-function buildRefinedFallbackRecord(refined, sceneLevel, args) {
+function buildRefinedFallbackRecord(refined, sceneLevel, args, catalogFirstRes = null) {
   // Refined product has no catalog hit AND no scene-level identification.
   // Build a minimal record from the refined product's own label/category.
   return {
@@ -1230,8 +1241,11 @@ function buildRefinedFallbackRecord(refined, sceneLevel, args) {
     matchSource:      null,
     catalogProductId: null,
     catalogMatch:     null,
-    catalogVisualScore:   null,
-    catalogCombinedScore: null,
+    // Same rationale as buildPerProductProviderMatchRecord — persist
+    // catalog-first's visual signal even when this refined product
+    // ended in the no-hit fallback path.
+    catalogVisualScore:   catalogFirstRes?.visualScore   ?? null,
+    catalogCombinedScore: catalogFirstRes?.combinedScore ?? null,
     providers:        {},
     errors:           {},
     productReviews:   null

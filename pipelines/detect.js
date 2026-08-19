@@ -1172,8 +1172,10 @@ async function runProductMatchChain(run, media, sourceImageUrl, products, primar
           matchSource:          m.matchSource || null,
           catalogProductId:     m.catalogProductId || null,
           catalogMatch:         m.catalogMatch || null,
-          catalogVisualScore:   m.catalogVisualScore   || null,
-          catalogCombinedScore: m.catalogCombinedScore || null,
+          // ?? not || so a real 0 (Gemini returned isMatch:false) isn't
+          // conflated with null (visual never called). 2026-08-19.
+          catalogVisualScore:   m.catalogVisualScore   ?? null,
+          catalogCombinedScore: m.catalogCombinedScore ?? null,
           categoryId:           m.categoryId || null,          // Phase 2a — FK to Category leaf
           enrichmentTiers:      m.enrichmentTiers || [],      // Phase 1.7b
           recommendedProducts:  m.recommendedProducts || []   // Phase 1.7b
