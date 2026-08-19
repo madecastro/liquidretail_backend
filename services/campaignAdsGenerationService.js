@@ -552,11 +552,44 @@ function isUnifiedNineSixteenMasterEnabled() {
 function isSharedPortraitPlatePromptCoherent() {
   let promptProfileFor;
   let directivesForProfile;
+  let isHookFirstVideoPromptEnabled;
   try {
-    ({ promptProfileFor, directivesForProfile } = require('./veoPromptBuilder'));
+    ({
+      promptProfileFor,
+      directivesForProfile,
+      isHookFirstVideoPromptEnabled
+    } = require('./veoPromptBuilder'));
   } catch (err) {
     return false;
   }
+
+  // ⚠️ THE LOAD-BEARING CONJUNCT — AND PROFILE EQUALITY ALONE IS NOT IT.
+  // MEASURED against the merged prompt lane: with the hook-first switch OFF
+  // both destinations fall through to the SAME `gemini-omni` profile, so an
+  // equality test returns true in BOTH switch states and gates nothing at
+  // all. That is not merely a bad configuration, it is a dead conjunct — and
+  // the state it lets through is the worst one: the operator rolls the camera
+  // standardization back to the frozen Ken Burns prompt and silently keeps a
+  // SHARED master shot with Meta's pan, delivered to YouTube Shorts. That
+  // framing is exactly what PMax Phase B rejected, and the kill switch would
+  // have reverted half the change while leaving the other half running.
+  //
+  // So the question is not "do both destinations agree?" but "did both
+  // destinations get the STANDARDIZED hook-first camera?" — which only the
+  // prompt lane can answer. Imported, never re-implemented: the switch reads
+  // TWO env names (VIDEO_HOOK_FIRST_PROMPT + the legacy PMAX_VIDEO_DIRECTIVES)
+  // with a deliberate fail-safe OR, and duplicating that here is precisely
+  // the drift this whole file argues against.
+  if (typeof isHookFirstVideoPromptEnabled !== 'function') return false;
+  try {
+    if (isHookFirstVideoPromptEnabled() !== true) return false;
+  } catch (err) {
+    return false;
+  }
+
+  // Belt-and-braces below: the switch says the standardization is ON, so the
+  // two destinations must ALSO actually resolve to the same camera. Keeps the
+  // gate honest if a future destination stops being covered by the switch.
   if (typeof promptProfileFor !== 'function') return false;
   // Compare across the caps shapes this pipeline actually runs: the live
   // default model is gemini-omni, and null covers the scaffold / override

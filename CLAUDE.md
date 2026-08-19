@@ -459,7 +459,12 @@ Video never launches a browser.
   PMax's portrait surfaces** — see the shared-portrait bullet below.
 - **Video (MIXED Meta+PMax): ONE shared 9:16 master, not two. TWO billable
   Omni masters per product, not three — $1.80, was $2.70 (owner directive
-  2026-08-18).** A mixed run measured 21 video Ads / 3 distinct
+  2026-08-18).** ⚠️ **CONDITIONAL, and the condition is not cosmetic** — the
+  share only happens when all five conjuncts below hold, and the load-bearing
+  one is that the hook-first camera standardization is ON. With it off a mixed
+  run still bills **3 / $2.70**, by design. Do not quote $1.80 as the
+  unconditional present-tense cost without checking
+  `isHookFirstVideoPromptEnabled()`. A mixed run measured 21 video Ads / 3 distinct
   `veoPredictionId`s. Two of those three were the same portrait plate at
   byte-identical `deliveryDims` (`meta_stories_9_16` and `pmax_video_9_16`
   are both 1080×1920; only `safeArea` differs, and that is a TITLING input
@@ -478,10 +483,11 @@ Video never launches a browser.
     never ask "is there a Meta sibling on this campaign?"** — a previous
     Meta-only run would let a later PMax-only 9:16 adopt that old plate and
     skip its Omni submit. Only the mint knows the run.
-  - **FAILS CLOSED ON FOUR CONJUNCTS**, all required: the
+  - **FAILS CLOSED ON FIVE CONJUNCTS**, all required: the
     `UNIFIED_VIDEO_9_16_MASTER` kill switch; the Meta master minted IN THIS
-    RUN; the PMax portrait master requested IN THIS RUN; and both
-    destinations resolving to the same camera prompt. **On a PMax-only run
+    RUN; the PMax portrait master requested IN THIS RUN; the hook-first camera
+    standardization being ON; and the Meta 10s floor being active. **On a
+    PMax-only run
     `pmax_video_9_16` stays BILLABLE** — a derive whose master never exists
     fails honestly and the run would ship NO 9:16 video at all, which is
     worse than paying $0.90. When in doubt, bill.
@@ -512,10 +518,25 @@ Video never launches a browser.
     failure: if the shared master fails, 15 of the 21 rows fail with it (was
     6 under three masters). That is inherent in "a single minting for 9x16"
     and is owner-directed, not an oversight.
+  - ⚠️ **CONJUNCT 4 IS THE CAMERA SWITCH, NOT "DO THE TWO PROFILES MATCH".**
+    This was got wrong once and the wrong version is seductive. MEASURED
+    against the merged prompt lane: with the standardization OFF both
+    destinations fall through to the SAME `gemini-omni` profile, so a profile
+    -equality test is **TRUE IN BOTH SWITCH STATES** — a dead conjunct that
+    gates nothing, and the state it admits is the worst one (a shared plate
+    shot with Meta's pan, delivered to YouTube Shorts, while the operator
+    believes they rolled the camera back). The gate therefore calls
+    **`veoPromptBuilder.isHookFirstVideoPromptEnabled()`** — imported, never
+    re-implemented, because that switch reads TWO env names
+    (`VIDEO_HOOK_FIRST_PROMPT` + legacy `PMAX_VIDEO_DIRECTIVES`) with a
+    deliberate fail-safe OR. Profile equality is retained only as a SECOND,
+    belt-and-braces conjunct. Pinned by `verifySharedPortraitMaster` F6.
   - Flag off (`UNIFIED_VIDEO_9_16_MASTER=false`) restores the three-master
     mint byte-for-byte, same 21 ads. Pinned by
-    `scripts/verifySharedPortraitMaster.js` (60 checks, revert-proven on nine
-    mutations).
+    `scripts/verifySharedPortraitMaster.js` (86 checks, revert-proven on
+    twelve mutations — including the equality-only gate above, and two
+    checks that were themselves found VACUOUS by revert-proof because they
+    never reached the conjunct they claimed to test).
 - **Video (Google PMax, Phase A 2026-08-10): TWO billable Omni masters per
   product — 9:16 + 16:9 — not one, and not three. Delivered: NINE Ads
   (3 surfaces × 3 intent stages), not 12.** (Standalone `google_video` /

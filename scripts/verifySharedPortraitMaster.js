@@ -24,9 +24,12 @@
  *      PMax video under 10s, so the free 9:16 is a paid-for asset that
  *      cannot be used. Nothing offline can see this; only this harness can
  *      (group E).
- *   4. WRONG CAMERA — the plate is shared while Meta and PMax still ask the
- *      model for different framing, delivering Meta's camera to YouTube
- *      Shorts (group F).
+ *   4. WRONG CAMERA — the plate is shared while it was NOT shot with the
+ *      standardized hook-first camera, delivering Meta's pan to YouTube
+ *      Shorts (group F). Note the subtle form: with the standardization
+ *      switched off both destinations fall back to the SAME frozen profile,
+ *      so "the profiles match" is TRUE in both switch states and is not a
+ *      usable predicate. F6 pins that exact trap.
  *
  * REVERT-PROOF (each mutation individually, all against the real exports):
  *   1. Make resolvePortraitMasterFormat return META unconditionally  → B1/B2
@@ -34,10 +37,12 @@
  *   3. Drop the prompt-coherence conjunct                            → F1
  *   4. Drop the kill-switch conjunct                                 → F3
  *   5. Leave the 1:1 / staged rows pointing at PMAX_VIDEO_DERIVE_SOURCE → D2
- *   6. Remove the durationFormat post-pass                           → E1
- *   7. Drop `item.durationFormat ||` at the expandWizardJob call site → E4
+ *   6. Remove the universal Meta 10s floor                           → E1/E2
+ *   7. Drop the Meta-floor coupling conjunct                          → E3
  *   8. Add a platformFormat==='pmax_video_9_16' branch to
  *      resolveDeriveFromMaster                                       → C3
+ *   9. Gate coherence on profile EQUALITY instead of the hook-first
+ *      switch (vacuous — true in BOTH switch states)                  → F6
  *
  * Offline: no DB, no network, no API key.
  */
@@ -66,10 +71,9 @@ const PMAX_ONLY = [PMAX_9, PMAX_16];
 const META_ONLY = [META_MASTER];
 
 // ── env scaffolding ────────────────────────────────────────────────────
-// The coherence gate is BEHAVIOURAL: it asks veoPromptBuilder whether both
-// portrait destinations resolve to the same camera. PMAX_VIDEO_DIRECTIVES
-// is read at call time, so toggling it here genuinely converges/diverges
-// the two profiles — this is the real mechanism, not a stub.
+// The coherence gate is BEHAVIOURAL: it asks veoPromptBuilder whether the
+// standardized hook-first camera is actually in force. Env is read at call
+// time throughout, so these toggles drive the real code paths.
 function withEnv(vars, fn) {
   const prev = {};
   for (const [k, v] of Object.entries(vars)) {
@@ -85,19 +89,65 @@ function withEnv(vars, fn) {
     }
   }
 }
-// Shared-portrait ACTIVE: prompts converged (the state the prompt lane
-// lands) + funnel variants on, which is the production shape.
-const shared = (fn) => withEnv(
-  { PMAX_VIDEO_DIRECTIVES: 'false', PMAX_FUNNEL_VARIANTS: 'true',
-    META_VIDEO_DERIVATIVES: 'true', UNIFIED_VIDEO_9_16_MASTER: 'true' },
-  fn
-);
-// Shared-portrait INACTIVE via divergent prompts (today's state).
-const unshared = (fn) => withEnv(
-  { PMAX_VIDEO_DIRECTIVES: 'true', PMAX_FUNNEL_VARIANTS: 'true',
-    META_VIDEO_DERIVATIVES: 'true', UNIFIED_VIDEO_9_16_MASTER: 'true' },
-  fn
-);
+// ⚠️ THE PROMPT MODULE IS STUBBED, DELIBERATELY, AND NOT OUT OF LAZINESS.
+// The camera standardization lands in services/veoPromptBuilder.js on its own
+// branch, so which build of that module is on disk depends on merge ORDER. An
+// env-only harness would therefore assert different things before and after
+// that merge — and worse, the ONE env toggle available (PMAX_VIDEO_DIRECTIVES)
+// stopped discriminating the moment the lane landed: with the switch off BOTH
+// destinations fall to `gemini-omni`, so profiles are EQUAL in both states.
+// Stubbing pins the two contracts this file actually depends on, in both
+// positions, no matter what is on disk. The REAL module is still exercised by
+// F2/F5 below, which pin that production imports it by name and that the gate
+// survives it.
+const PROMPT_MODULE = require.resolve(path.join(ROOT, 'services/veoPromptBuilder.js'));
+function withPromptModule(stubExports, fn) {
+  const had = Object.prototype.hasOwnProperty.call(require.cache, PROMPT_MODULE);
+  const prev = require.cache[PROMPT_MODULE];
+  require.cache[PROMPT_MODULE] = {
+    id: PROMPT_MODULE, filename: PROMPT_MODULE, loaded: true, exports: stubExports
+  };
+  try { return fn(); }
+  finally {
+    if (had) require.cache[PROMPT_MODULE] = prev;
+    else delete require.cache[PROMPT_MODULE];
+  }
+}
+// Standardization ON — both portrait destinations get the hook-first camera.
+const HOOK_ON = {
+  isHookFirstVideoPromptEnabled: () => true,
+  promptProfileFor: () => 'hook_first',
+  directivesForProfile: (p) => ({ profile: p })
+};
+// ⚠️ THE HAZARD CONFIGURATION. Standardization rolled back. Both destinations
+// fall through to the SAME frozen `gemini-omni` profile — so the profiles are
+// still EQUAL and an equality-only gate calls this "coherent" and keeps
+// sharing a Ken Burns plate with Meta's pan, delivered to YouTube Shorts.
+// This stub is what makes F6 a real check rather than a restatement of F1.
+const HOOK_OFF_PROFILES_EQUAL = {
+  isHookFirstVideoPromptEnabled: () => false,
+  promptProfileFor: () => 'gemini-omni',
+  directivesForProfile: (p) => ({ profile: p })
+};
+// Standardization on, but a destination escaped it (belt-and-braces arm).
+const HOOK_ON_PROFILES_DIFFER = {
+  isHookFirstVideoPromptEnabled: () => true,
+  promptProfileFor: (caps, o) => (String(o && o.platformFormat).startsWith('pmax_')
+    ? 'hook_first' : 'gemini-omni'),
+  directivesForProfile: (p) => ({ profile: p })
+};
+
+const PROD_ENV = { PMAX_FUNNEL_VARIANTS: 'true', META_VIDEO_DERIVATIVES: 'true',
+  UNIFIED_VIDEO_9_16_MASTER: 'true', META_VIDEO_DURATION_SEC: undefined,
+  VIDEO_HOOK_FIRST_PROMPT: undefined, PMAX_VIDEO_DIRECTIVES: undefined };
+
+// Shared-portrait ACTIVE: the state after the prompt lane lands.
+const shared = (fn) => withPromptModule(HOOK_ON, () => withEnv(PROD_ENV, fn));
+// Shared-portrait INACTIVE — via the rolled-back switch, which is also the
+// hazard above. Every existing "unshared" assertion therefore now doubles as
+// a guard on that configuration.
+const unshared = (fn) =>
+  withPromptModule(HOOK_OFF_PROFILES_EQUAL, () => withEnv(PROD_ENV, fn));
 
 const plan  = (masters) => svc.planDeterministicVideoAds(masters);
 const bill  = (p) => p.filter((r) => r.billable);
@@ -280,14 +330,25 @@ check('A4 [MONEY] resolvePortraitMasterFormat is DEFINED once and CALLED once',
   // ⚠️ THE COUPLING. META_VIDEO_DURATION_SEC=0 is a documented no-deploy
   // revert of the Meta floor. With the floor off the shared plate would be
   // 8s — illegal for PMax — so sharing must REFUSE, not degrade.
-  const floorOff = { META_VIDEO_DURATION_SEC: '0', PMAX_VIDEO_DIRECTIVES: 'false',
+  // ⚠️ MUST run under HOOK_ON. Every earlier conjunct has to PASS for this one
+  // to be reachable — with the standardization off the gate short-circuits and
+  // these two assert nothing (caught by revert-proof: deleting the Meta-floor
+  // conjunct left them green).
+  const floorOff = { META_VIDEO_DURATION_SEC: '0',
     PMAX_FUNNEL_VARIANTS: 'true', UNIFIED_VIDEO_9_16_MASTER: 'true' };
+  const withFloorOff = (fn) => withPromptModule(HOOK_ON, () => withEnv(floorOff, fn));
   check('E3 [MONEY/SOUNDNESS] Meta floor OFF ⇒ sharing refuses (bills 3, ships nothing broken)',
-    withEnv(floorOff, () => svc.resolvePortraitMasterFormat(MIXED)) === PMAX_9,
+    withFloorOff(() => svc.resolvePortraitMasterFormat(MIXED)) === PMAX_9,
     'with no Meta floor a shared plate is an 8s PAID render Google rejects — '
     + 'the gate must fall back to PMax minting its own portrait master');
   check('E3a and that arm really does bill 3 again',
-    withEnv(floorOff, () => bill(plan(MIXED)).length) === 3);
+    withFloorOff(() => bill(plan(MIXED)).length) === 3);
+  check('E3a2 [PREMISE] and every OTHER conjunct is satisfied in that arm',
+    withPromptModule(HOOK_ON, () => withEnv(
+      { PMAX_FUNNEL_VARIANTS: 'true', UNIFIED_VIDEO_9_16_MASTER: 'true' },
+      () => svc.resolvePortraitMasterFormat(MIXED))) === META_MASTER,
+    'if this fails, E3/E3a are passing for the wrong reason — something other '
+    + 'than the Meta floor is already blocking the share');
   check('E3b the Meta floor is still revertible with no deploy',
     withEnv({ META_VIDEO_DURATION_SEC: '0' },
       () => svc.resolveVideoDurationForFormat(META_MASTER, 8)) === 8);
@@ -302,27 +363,92 @@ check('A4 [MONEY] resolvePortraitMasterFormat is DEFINED once and CALLED once',
 
 // ── F. [MONEY] every conjunct of the gate fails closed ─────────────────
 {
-  check('F1 [MONEY] divergent camera prompts ⇒ NO sharing (2 bills become 3)',
+  check('F1 [MONEY] camera standardization OFF ⇒ NO sharing (2 bills become 3)',
     unshared(() => bill(plan(MIXED)).length) === 3,
-    'sharing a plate while Meta and PMax ask for different framing delivers '
-    + 'Meta\'s camera to YouTube Shorts');
-  check('F1a and the coherence probe reports the divergence honestly',
+    'sharing a plate that was not shot with the standardized camera delivers '
+    + 'Meta\'s pan to YouTube Shorts');
+  check('F1a and the coherence probe reports it honestly',
     unshared(() => svc.isSharedPortraitPlatePromptCoherent()) === false
       && shared(() => svc.isSharedPortraitPlatePromptCoherent()) === true);
   check('F2 the gate is a real probe of veoPromptBuilder, not a constant',
     /require\(['"]\.\/veoPromptBuilder['"]\)/.test(svcSrc)
-      && /promptProfileFor/.test(svcSrc),
+      && /isHookFirstVideoPromptEnabled/.test(svcSrc),
     'a hard-coded true here removes the only protection against a plate '
     + 'that was shot for the wrong destination');
+
+  // ── F6 [MONEY] THE CROSS-BRANCH DEFECT THIS GROUP EXISTS FOR ──────────
+  // Profile EQUALITY is not the right predicate and this is the proof.
+  // With the standardization switched off, both destinations fall back to
+  // the SAME frozen gemini-omni profile — equal profiles, incoherent plate.
+  // An equality-only gate returns true here and keeps sharing a Ken Burns
+  // master on YouTube Shorts, so the kill switch would revert the camera
+  // and silently leave the sharing running. Restoring an equality-only gate
+  // must turn THIS check red.
+  check('F6 [MONEY] switch OFF but profiles EQUAL ⇒ still refuses to share',
+    withPromptModule(HOOK_OFF_PROFILES_EQUAL, () => withEnv(PROD_ENV, () => {
+      const profilesAgree =
+        HOOK_OFF_PROFILES_EQUAL.promptProfileFor(null, { platformFormat: META_MASTER })
+        === HOOK_OFF_PROFILES_EQUAL.promptProfileFor(null, { platformFormat: PMAX_9 });
+      // The premise of the check: this really is the equal-profiles case.
+      return profilesAgree
+        && svc.isSharedPortraitPlatePromptCoherent() === false
+        && svc.resolvePortraitMasterFormat(MIXED) === PMAX_9
+        && bill(plan(MIXED)).length === 3;
+    })),
+    'equality-only gating is vacuous — it is TRUE in both switch states, so '
+    + 'it gates nothing at all once the prompt lane lands');
+  check('F6a the load-bearing conjunct is the SWITCH, not profile equality',
+    /isHookFirstVideoPromptEnabled\(\) !== true/.test(svcSrc),
+    'the gate must ask "did both get the standardized camera?", not merely '
+    + '"do both agree?"');
+  check('F6b a missing switch export fails CLOSED (bills rather than shares)',
+    withPromptModule(
+      { promptProfileFor: () => 'hook_first', directivesForProfile: () => ({}) },
+      () => withEnv(PROD_ENV, () => svc.isSharedPortraitPlatePromptCoherent())
+    ) === false,
+    'an older veoPromptBuilder without the export must not unlock free 9:16');
+  check('F6c a throwing switch fails CLOSED',
+    withPromptModule(
+      { isHookFirstVideoPromptEnabled: () => { throw new Error('boom'); },
+        promptProfileFor: () => 'hook_first', directivesForProfile: () => ({}) },
+      () => withEnv(PROD_ENV, () => svc.isSharedPortraitPlatePromptCoherent())
+    ) === false);
+  check('F6d switch ON but a destination escaped it ⇒ still refuses (belt-and-braces)',
+    withPromptModule(HOOK_ON_PROFILES_DIFFER,
+      () => withEnv(PROD_ENV, () => svc.isSharedPortraitPlatePromptCoherent())) === false,
+    'the equality comparison is retained as a SECOND conjunct and must still bite');
+  // The switch is owned by the prompt lane and reads TWO env names with a
+  // fail-safe OR. We must call it, never re-implement it.
+  // Scoped to actual process.env READS, not mentions: the gate's own comment
+  // names both env vars to explain why it delegates, and a bare-substring
+  // test would fail on the documentation rather than on a re-implementation.
+  const svcCode = svcSrc
+    .replace(/\/\*[\s\S]*?\*\//g, '')
+    .replace(/(^|[^:])\/\/.*$/gm, '$1');
+  check('F6e the two switch env names are NOT re-implemented here',
+    !/process\.env\.VIDEO_HOOK_FIRST_PROMPT/.test(svcCode)
+      && !/process\.env\.PMAX_VIDEO_DIRECTIVES/.test(svcCode)
+      && !/process\.env\[/.test(svcCode),
+    'duplicating the switch parsing is exactly the drift this file argues '
+    + 'against — the legacy-alias fail-safe OR must have exactly one owner');
+  // Exercise the REAL module: whatever build is on disk, the gate must
+  // return a clean boolean rather than throwing.
+  check('F5 the gate survives the REAL veoPromptBuilder on disk',
+    typeof svc.isSharedPortraitPlatePromptCoherent() === 'boolean');
+  // ⚠️ HOOK_ON again — the kill switch must be what refuses, not a coherence
+  // short-circuit upstream of it (same vacuity trap as E3).
+  const killed = (fn) => withPromptModule(HOOK_ON, () => withEnv(
+    { PMAX_FUNNEL_VARIANTS: 'true', UNIFIED_VIDEO_9_16_MASTER: 'false' }, fn));
   check('F3 [MONEY] UNIFIED_VIDEO_9_16_MASTER=false restores 3 billable masters',
-    withEnv({ PMAX_VIDEO_DIRECTIVES: 'false', PMAX_FUNNEL_VARIANTS: 'true',
-      UNIFIED_VIDEO_9_16_MASTER: 'false' },
-    () => bill(plan(MIXED)).length) === 3);
+    killed(() => bill(plan(MIXED)).length) === 3);
   check('F3a and flag-off is byte-identical to the unshared plan',
-    JSON.stringify(withEnv({ PMAX_VIDEO_DIRECTIVES: 'false',
-      PMAX_FUNNEL_VARIANTS: 'true', UNIFIED_VIDEO_9_16_MASTER: 'false' },
-    () => plan(MIXED)))
+    JSON.stringify(killed(() => plan(MIXED)))
       === JSON.stringify(unshared(() => plan(MIXED))));
+  check('F3b [PREMISE] the kill switch is genuinely what refuses in F3',
+    withPromptModule(HOOK_ON, () => withEnv(
+      { PMAX_FUNNEL_VARIANTS: 'true', UNIFIED_VIDEO_9_16_MASTER: 'true' },
+      () => svc.resolvePortraitMasterFormat(MIXED))) === META_MASTER,
+    'with the switch back on the same config must SHARE, or F3 proves nothing');
   // A throwing / missing prompt builder must read as "cannot prove" → bill.
   check('F4 [MONEY] the coherence probe is wrapped so a throw means DO NOT SHARE',
     /catch\s*\([\s\S]{0,40}\)\s*\{\s*return false;/.test(svcSrc),
@@ -401,8 +527,6 @@ check('A4 [MONEY] resolvePortraitMasterFormat is DEFINED once and CALLED once',
   // findSiblingMasterAd must keep matching TRUE masters only, and must NOT
   // have learned to roam across formats — a cross-format search would let a
   // PMax-only run silently adopt an old Meta plate instead of billing.
-  check('H2 [MONEY] findSiblingMasterAd still excludes derives and funnel rows',
-    /deriveFromMaster: null/.test(adsSrc) && /funnelStage: null/.test(adsSrc));
   const sibStart = adsSrc.indexOf('async function findSiblingMasterAd');
   let sibBody = null;
   if (sibStart !== -1) {
@@ -413,6 +537,20 @@ check('A4 [MONEY] resolvePortraitMasterFormat is DEFINED once and CALLED once',
       else if (adsSrc[i] === '}') { depth--; if (depth === 0) { sibBody = adsSrc.slice(open, i + 1); break; } }
     }
   }
+  check('H1b findSiblingMasterAd body extracted (not the param list)',
+    !!sibBody && /platformFormat/.test(sibBody),
+    `extracted ${sibBody ? sibBody.length : 0} chars`);
+  // H2 used to regex the WHOLE routes/ads.js for these substrings, which is
+  // individually vacuous: it passes on any occurrence anywhere in a
+  // 4000-line file, so weakening the real clause while some unrelated
+  // occurrence existed would not register. Scoped to the extracted function
+  // body below (adversarial-review finding, folded in).
+  check('H2 [MONEY] findSiblingMasterAd itself excludes derives and funnel rows',
+    !!sibBody
+      && /deriveFromMaster: null/.test(sibBody)
+      && /funnelStage: null/.test(sibBody),
+    'a master lookup that can return a derive or a funnel retitle hands the '
+    + 'waiter a row that holds no plate of its own');
   check('H3 [MONEY] findSiblingMasterAd binds platformFormat EXACTLY ONCE',
     !!sibBody && (sibBody.match(/platformFormat/g) || []).length === 1,
     'a second platformFormat binding means a cross-format / fallback lookup. '
