@@ -56,8 +56,18 @@ if [ -f "$STAMP" ] && [ "$DRY" -eq 0 ]; then
   exit 0
 fi
 
+# MISCONFIGURATION vs NOTHING QUEUED — these must not look the same. A scheduled
+# job pointed at a checkout without the harness would exit 0 every night and read
+# as "quiet week" forever (which is exactly what happened: the launchd job was
+# installed against the shared checkout, where scripts/rpd does not exist on main).
+if [ ! -f scripts/rpd/rpd.js ]; then
+  log "MISCONFIGURED: no scripts/rpd/rpd.js under $(pwd) — this checkout does not contain the harness."
+  log "Point the scheduled job at a checkout/worktree that has it, or merge the harness to this branch."
+  exit 2
+fi
+
 if [ ! -f "$SPEC" ]; then
-  log "no spec at $SPEC — nothing queued for tonight. Exiting."
+  log "no spec at $SPEC — nothing queued for tonight. Exiting 0 (this is a legitimate no-op)."
   exit 0
 fi
 

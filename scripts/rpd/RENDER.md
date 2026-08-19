@@ -55,11 +55,42 @@ directory, which is gone.
 
 Pinned by `verifyRpdHarness.js` section H, revert-proven on all three.
 
-## Setting it up
+## Current state: LOCAL. Render is one command away.
 
-A **Render Cron Job** service, separate from WEB and WORKER. Separate on purpose:
+The nightly loop runs on the owner's Mac via launchd
+(`com.reachsocial.rpd-nightly`, 02:17 daily, `$2` cap) — verified firing the exact
+scheduled command. Nothing is deployed to Render yet, deliberately.
+
+⚠️ **The launchd job points at the WORKTREE** (`.worktrees/rpd-harness`), because
+that is the only checkout containing the harness until PR #212 merges. **After the
+merge, repoint it at the normal checkout** — otherwise removing the worktree breaks
+the schedule. Until then it fails loudly rather than silently (`no such file or
+directory` in `/tmp/reachsocial-rpd-nightly.err`), which is how the original
+mis-pointing was caught.
+
+### Deploying to Render, when you want it
+
+```bash
+# set the secrets in your shell, then:
+./scripts/rpd/loop/render-create-cronjob.sh --dry   # show the payload, apply nothing
+./scripts/rpd/loop/render-create-cronjob.sh         # create the service
+```
+
+It **refuses** unless `ATLAS_API_KEY`, both Cloudinary secrets, `SLACK_BOT_TOKEN`
+and `RPD_SLACK_CHANNEL` are present, so the service can never exist in a state
+where it spends money but cannot keep its receipts. Optional
+`NETLIFY_AUTH_TOKEN` + `RPD_NETLIFY_TEAM` add gallery publishing. Secret values are
+copied onto the service and redacted in `--dry` output.
+
+No `render.yaml` on purpose: the existing WEB and WORKER services are
+dashboard-managed, and introducing a Blueprint would pull them under file control
+as a side effect of adding a cron job.
+
+## What the service looks like
+
+A **Render Cron Job**, separate from WEB and WORKER. Separate on purpose:
 experiment spend and a harness bug stay away from the production render queue,
-and only this service gets a Pages-write Cloudflare token.
+and only this service holds a Netlify token.
 
 Dashboard → **New → Cron Job**:
 
