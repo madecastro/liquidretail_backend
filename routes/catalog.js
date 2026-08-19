@@ -106,7 +106,13 @@ function projectListRow(p, matchCount) {
     // materialized yet) must NOT be conflated with a permanently-unusable
     // one (missing entirely, or a Google Shopping/Lens thumbnail that never
     // loads). `seedIssue` is 'missing' | 'thumbnail-only' | null.
-    ...catalogSeedFields(p.imageUrl),
+    // 2026-08-19 — added `pickerReady` / `pickerBlockReason`. This LIST row
+    // (unlike GET /:id) never materializes on read, so on a freshly
+    // ingested brand the overwhelming majority of rows are honestly
+    // 'materializing' here, not ready — see catalogMaterializeDrainService
+    // for the bounded background sweep that closes the gap, and
+    // POST /api/catalog/materialize for the operator-triggered version.
+    ...catalogSeedFields(p.imageUrl, p.imageMediaId),
     // Hero + alts. URLs are the raw source-CDN strings; *MediaId fields
     // point at the wrapped Cloudinary-mirrored catalog-product Media
     // docs. Both surfaced so the Generate Ads wizard's brand-kind
@@ -160,6 +166,11 @@ function projectDetail(p, category) {
     currency:     p.currency     || null,
     availability: p.availability || null,
     imageUrl:     p.imageUrl     || null,
+    // Same honesty vocabulary as the list row (projectListRow) — by the
+    // time this is called, GET /:id has already best-effort materialized
+    // the hero (see the lazy backfill above), so pickerBlockReason here
+    // reflects the POST-materialize state, not a stale pre-fetch snapshot.
+    ...catalogSeedFields(p.imageUrl, p.imageMediaId),
     additionalImages:        Array.isArray(p.additionalImages) ? p.additionalImages : [],
     imageMediaId:            p.imageMediaId ? String(p.imageMediaId) : null,
     additionalImageMediaIds: Array.isArray(p.additionalImageMediaIds)
@@ -570,6 +581,51 @@ router.post('/brands/:id/infer-categories', async (req, res) => {
     });
   } catch (err) {
     console.error(`❌ POST /api/catalog/brands/:id/infer-categories: ${err.message}`);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /api/catalog/materialize  { brandId }  (also accepts ?brandId= /
+// X-Brand-Id, same convention as GET /)
+// → 202 { run: {id}, started, alreadyRunning?, candidates, excludedUnusable }
+//
+// Operator-triggered version of the fix for "826 of 831 products
+// unpickable": kicks off (or, if one is already running for this brand,
+// reports) a bounded background sweep that materializes every
+// CatalogProduct row's hero imageMediaId so the Generate Ads picker can
+// actually show it as ready. $0 — see catalogMaterializeDrainService.js's
+// header for why (materializeMissingHero never creates a DetectRun).
+// Returns immediately; poll progress via the EXISTING
+// GET /api/progress/active?brandId= or GET /api/progress/:runId — no new
+// progress endpoint. `excludedUnusable` is reported separately from
+// `candidates` because those rows (missing/broken seed image) can never
+// materialize and must not make the progress bar look permanently stuck.
+router.post('/materialize', express.json(), async (req, res) => {
+  try {
+    const brandId = req.body?.brandId || req.query.brandId || req.headers['x-brand-id'];
+    if (!brandId) return res.status(400).json({ error: 'brandId is required' });
+    if (!mongoose.isValidObjectId(brandId)) {
+      return res.status(400).json({ error: 'brandId is not a valid ObjectId' });
+    }
+
+    // Tenant check — same 404-not-403 convention as assertMediaInTenant:
+    // don't leak that a brandId exists for a different advertiser.
+    const Brand = require('../models/Brand');
+    const brand = await Brand.findOne(tenantFilter(req, { _id: brandId })).select('_id advertiserId').lean();
+    if (!brand) return res.status(404).json({ error: 'brand not found' });
+
+    const { startCatalogMaterializeDrain } = require('../services/catalogMaterializeDrainService');
+    const result = await startCatalogMaterializeDrain({
+      brandId,
+      advertiserId: brand.advertiserId,
+      req,
+      label: 'Preparing catalog images (operator-triggered)'
+    });
+
+    if (result.error) return res.status(500).json({ error: result.error });
+    res.status(202).json(result);
+  } catch (err) {
+    console.error(`❌ POST /api/catalog/materialize: ${err.message}`);
     res.status(500).json({ error: err.message });
   }
 });

@@ -2816,6 +2816,34 @@ router.get('/:id/onboarding-status', async (req, res) => {
     //      handwave via the queue tail when nothing else is in flight)
     const liveActivity = await deriveLiveActivity(brand, productMediaIdSet, productRuns, mediaRuns);
 
+    // catalogMaterialize — 2026-08-19 addition, separate from productDetect
+    // above on purpose: that bucket is DetectRun-backed (vision spend,
+    // smart crops), which stays deferred to ad-generation time by design
+    // (CATALOG_DETECT_PRECOMPUTE). This is the $0 "is this product's photo
+    // even mirrored into a Media doc yet" state the Generate Ads picker
+    // actually gates on — see services/catalogMaterializeDrainService.js.
+    // Not modeled as a RunBucket (no per-item failure signal to report
+    // distinctly): `pending` re-queries live, `ready` is a plain count,
+    // `excludedUnusable` is reported separately so a brand with a few
+    // permanently-broken seed images never reads as "stuck" short of 100%.
+    let catalogMaterialize = null;
+    try {
+      const { countMaterializeCandidates, findActiveMaterializeDrain } =
+        require('../services/catalogMaterializeDrainService');
+      const [{ candidates: pending, excludedUnusable }, activeRun] = await Promise.all([
+        countMaterializeCandidates(brand._id),
+        findActiveMaterializeDrain(brand._id)
+      ]);
+      const ready = await CatalogProduct.countDocuments({ brandId: brand._id, imageMediaId: { $ne: null } });
+      catalogMaterialize = {
+        ready, pending, excludedUnusable,
+        running: !!activeRun,
+        runId: activeRun ? String(activeRun._id) : null
+      };
+    } catch (err) {
+      console.warn(`   ⚠️  onboarding-status: catalogMaterialize bucket failed: ${err.message}`);
+    }
+
     res.json({
       enrichment,
       catalog: {
@@ -2824,6 +2852,7 @@ router.get('/:id/onboarding-status', async (req, res) => {
         productCount
       },
       productDetect: productRuns,
+      catalogMaterialize,
       social: {
         connected:        !!catalogCred,
         postCount

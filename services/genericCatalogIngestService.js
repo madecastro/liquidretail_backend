@@ -451,6 +451,16 @@ async function syncBrandGenericCatalog(brand, run, { isBrandAborted, categories 
       errors.push(`detect enqueue: ${err.message}`);
     }
 
+    // See shopifyPublicIngestService.js's copy of this comment —
+    // enqueueBrandProductDetects is a deliberate no-op under the detect
+    // deferral, so nothing else materializes imageMediaId at sync time.
+    // Idempotent (findActiveMaterializeDrain) — safe under retry/overlap.
+    if (productsUpserted > 0) {
+      require('./catalogMaterializeDrainService')
+        .startCatalogMaterializeDrain({ brandId: brand._id, advertiserId: brand.advertiserId, label: 'Preparing catalog images (post-ingest)' })
+        .catch(err => console.warn(`   ⚠️  ${LOG}  catalog materialize drain trigger failed: ${err.message}`));
+    }
+
     setImmediate(() => {
       require('./catalogProductEnrichmentService')
         .enqueueBrandProductEnrichment(brand._id)

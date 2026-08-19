@@ -95,6 +95,39 @@ async function main() {
     check('C8 catalogSeedFields shape for a missing url', f3.seedUnusable === true && f3.seedIssue === 'missing', JSON.stringify(f3));
   }
 
+  // ── C9-C12 — 2026-08-19 addition: pickerReady / pickerBlockReason.
+  // Extends the SAME vocabulary (not a parallel one) to answer "is this
+  // card actually ready", which seedUnusable/seedIssue were never meant to
+  // answer — a good imageUrl with no imageMediaId yet (the 826/831 Pelagic
+  // Gear bug) is NOT seedUnusable, but it is not pickerReady either.
+  {
+    const noId   = catalogSeedFields(GOOD_URLS[0], null);
+    check('C9 good url, no imageMediaId yet → pickerReady false, blocked "materializing"',
+      noId.pickerReady === false && noId.pickerBlockReason === 'materializing' &&
+      noId.seedUnusable === false && noId.seedIssue === null,
+      JSON.stringify(noId));
+
+    const withId = catalogSeedFields(GOOD_URLS[0], '5f1a2b3c4d5e6f7a8b9c0d1e');
+    check('C10 good url, imageMediaId set → pickerReady true, blocked null',
+      withId.pickerReady === true && withId.pickerBlockReason === null,
+      JSON.stringify(withId));
+
+    // A stale/dangling imageMediaId must never make a bad seed "ready" —
+    // seedUnusable is computed from the CURRENT imageUrl and wins.
+    const badWithId = catalogSeedFields(BAD_URLS[0], '5f1a2b3c4d5e6f7a8b9c0d1e');
+    check('C11 bad url still blocks even if imageMediaId is (stale-)set',
+      badWithId.pickerReady === false && badWithId.pickerBlockReason === 'thumbnail-only',
+      JSON.stringify(badWithId));
+
+    // Missing entirely outranks "materializing" — there is nothing to
+    // materialize, so the reason must stay 'missing', not silently
+    // become the new 'materializing' state.
+    const missingNoId = catalogSeedFields(null, null);
+    check('C12 missing url (no imageMediaId either) → blocked "missing", not "materializing"',
+      missingNoId.pickerBlockReason === 'missing' && missingNoId.pickerReady === false,
+      JSON.stringify(missingNoId));
+  }
+
   // ── D. EXECUTE productDetailsService.writeThroughToCatalogProduct ────
   // Stub CatalogProduct.findById/updateOne directly on the required model
   // so this runs with no MONGODB_URI. Proves the REAL write-through
@@ -223,7 +256,11 @@ async function main() {
     const path = require('path');
     const routeSrc = fs.readFileSync(path.join(__dirname, '..', 'routes', 'catalog.js'), 'utf8');
     check('F1 routes/catalog.js imports catalogSeedFields', /require\(['"]\.\.\/services\/catalogImageQuality['"]\)/.test(routeSrc));
-    check('F2 projectListRow spreads catalogSeedFields(p.imageUrl)', /\.\.\.catalogSeedFields\(p\.imageUrl\)/.test(routeSrc));
+    // 2026-08-19 — projectListRow now passes imageMediaId too (adds
+    // pickerReady/pickerBlockReason, see catalogImageQuality.js), so match
+    // the two-arg call rather than the original one-arg shape. seedUnusable
+    // / seedIssue themselves are still URL-only — see C6-C8 above.
+    check('F2 projectListRow spreads catalogSeedFields(p.imageUrl, p.imageMediaId)', /\.\.\.catalogSeedFields\(p\.imageUrl,\s*p\.imageMediaId\)/.test(routeSrc));
 
     // F3 — separate, adjacent fix found while live-testing the above:
     // aggregate()'s raw $match never auto-casts strings to ObjectId, so the

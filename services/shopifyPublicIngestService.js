@@ -865,6 +865,21 @@ async function syncBrandShopifyDirect(brand, run, { isBrandAborted } = {}) {
       errors.push(`detect enqueue: ${err.message}`);
     }
 
+    // enqueueBrandProductDetects (above) is a deliberate no-op under
+    // CATALOG_DETECT_PRECOMPUTE deferral — it returns `deferred` before
+    // ever materializing a hero. Without a separate trigger, imageMediaId
+    // stays null on every row until an operator happens to open ONE
+    // product's own detail page (measured: 826/831 unpickable on a fresh
+    // Pelagic Gear sync). Fire-and-forget, same shape as the enrichment /
+    // category-inference triggers below; idempotent via
+    // findActiveMaterializeDrain so a retried/overlapping sync never
+    // stacks two sweeps over the same brand.
+    if (productsUpserted > 0) {
+      require('./catalogMaterializeDrainService')
+        .startCatalogMaterializeDrain({ brandId: brand._id, advertiserId: brand.advertiserId, label: 'Preparing catalog images (post-ingest)' })
+        .catch(err => console.warn(`   ⚠️  🛍  catalog materialize drain trigger failed: ${err.message}`));
+    }
+
     setImmediate(() => {
       require('./catalogProductEnrichmentService')
         .enqueueBrandProductEnrichment(brand._id)

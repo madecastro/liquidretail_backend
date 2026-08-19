@@ -524,6 +524,16 @@ async function syncBrandShopify(brand, run = null) {
       console.warn(`   ⚠️  product-path detect enqueue failed: ${err.message}`);
     }
 
+    // See shopifyPublicIngestService.js's copy of this comment —
+    // enqueueBrandProductDetects is a deliberate no-op under the detect
+    // deferral, so nothing else materializes imageMediaId at sync time.
+    // Idempotent (findActiveMaterializeDrain) — safe under retry/overlap.
+    if ((summary.added + summary.updated) > 0) {
+      require('./catalogMaterializeDrainService')
+        .startCatalogMaterializeDrain({ brandId: brand._id, advertiserId: brand.advertiserId, label: 'Preparing catalog images (post-ingest)' })
+        .catch(err => console.warn(`   ⚠️  catalog materialize drain trigger failed: ${err.message}`));
+    }
+
     // Fire catalog enrichment in the background — matches what
     // catalogSyncService does after Meta catalog sync completes.
     // Populates CatalogProduct.productReviews.quotes + productDetails
