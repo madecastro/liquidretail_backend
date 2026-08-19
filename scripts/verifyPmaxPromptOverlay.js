@@ -23,15 +23,29 @@
  *       platform-notes block, AFTER the FORMAT geometry block.
  *   S4  Platform notes never appear on any Meta surface, either arm.
  *   S5  resolveDrawCta truth table, both arms.
- *   V1  PMAX_VIDEO_DIRECTIVES ON  ⇒ PMax destination prompt ≠ Meta prompt.
- *   V2  PMAX_VIDEO_DIRECTIVES OFF ⇒ PMax destination prompt === Meta prompt
- *       (kill switch restores Phase A).
- *   V3  Meta prompt (no destination) is byte-identical to the pre-Phase-B
- *       baseline loaded via `git show HEAD:services/veoPromptBuilder.js`
- *       (B14 technique; relative requires rewritten so the temp copy resolves).
- *       Proven in BOTH video flag arms.
- *   V4  PMax video content: hook-first, centre-safe, aspect Frame lines,
- *       10s timeline arithmetic (3.33 / 6.40 / 10.0 — not hardcoded 8s).
+ *   V1  Switch ON  ⇒ Meta and PMax destination prompts are ONE identical
+ *       prompt, and both differ from the destination-less prompt.
+ *   V2  Switch OFF ⇒ BOTH Meta and PMax destination prompts collapse back to
+ *       the destination-less prompt (Meta → frozen pre-#61, PMax → Phase A).
+ *   V2b The switch honours BOTH env names and EITHER can kill, including the
+ *       real defaults.env shape (new name true, legacy dashboard name false).
+ *   V3  Destination-less prompt is byte-identical to the IMMUTABLE
+ *       `134db56~1` baseline (B14 technique; relative requires rewritten so
+ *       the temp copy resolves), in BOTH arms; plus the live Meta destination
+ *       matches that baseline in the OFF arm and has moved in the ON arm.
+ *   V4  Hook-first video content on BOTH platforms: hook-first, centre-safe,
+ *       aspect Frame lines, platform-neutral text, 10s timeline arithmetic
+ *       (3.33 / 6.40 / 10.0 — not hardcoded 8s).
+ *
+ * ── OWNER-DIRECTED STANDARDIZATION, 2026-08-18 (why V1/V2/V4 were rewritten)
+ * Owner, verbatim: "I want to use the PMax prompt for Meta also, and
+ * standardize on that but maintain a single minting for 9x16 across both
+ * formats. Continue to mint a 16x9." The old V1/V2 pair read "flag ON ⇒ PMax
+ * ≠ Meta / flag OFF ⇒ PMax === Meta" — the exact opposite of the intended
+ * end state, and in any case both were comparing against a DESTINATION-LESS
+ * prompt that no Meta ad ever receives (the fixture passed no platformFormat).
+ * Both problems are fixed above. What is still frozen: the OFF arm, and the
+ * OMNI_DIRECTIVES text itself.
  *
  * ── REVERT-PROOF RECIPE ──────────────────────────────────────────────────
  * Concrete mutations that MUST fail this harness (run against a COPY of the
@@ -366,7 +380,15 @@ console.log('\nS5. resolveDrawCta truth table (both arms)');
 // ═══════════════════════════════════════════════════════════════════════
 console.log('\nV. PMax video directives (PMAX_VIDEO_DIRECTIVES)');
 
-const VEO_ARGS_META = {
+// NAMING, CORRECTED 2026-08-18: this fixture used to be called VEO_ARGS_META
+// and every check that used it claimed to be about "Meta". It passes NO
+// platformFormat, so it was only ever exercising the DESTINATION-LESS path
+// (scaffold / aiVideoReferenceService / legacy). That mislabel became actively
+// misleading once Meta destinations started selecting the hook-first profile:
+// "flag-OFF: PMax prompt byte-identical to Meta" was comparing PMax against a
+// prompt no Meta ad receives. Renamed, and a REAL Meta destination fixture
+// added below.
+const VEO_ARGS_NO_DEST = {
   product: { title: 'Wool Runner' },
   aspectRatio: '9:16',
   durationSec: 10,
@@ -375,50 +397,124 @@ const VEO_ARGS_META = {
   caps: { promptByteCap: 20000, paramShape: 'gemini-omni' }
 };
 
+// The live Meta video master — what atlasVideoService.generateForAd actually
+// passes as ad.platformFormat for a Meta video ad.
+const VEO_ARGS_META_916 = {
+  ...VEO_ARGS_NO_DEST,
+  platformFormat: 'meta_stories_9_16'
+};
+
 const VEO_ARGS_PMAX_916 = {
-  ...VEO_ARGS_META,
+  ...VEO_ARGS_NO_DEST,
   aspectRatio: '9:16',
   platformFormat: 'pmax_video_9_16'
 };
 
 const VEO_ARGS_PMAX_169 = {
-  ...VEO_ARGS_META,
+  ...VEO_ARGS_NO_DEST,
   aspectRatio: '16:9',
   platformFormat: 'pmax_video_16_9'
 };
 
 // V1 / V2 — kill switch behaviour
+//
+// REWRITTEN 2026-08-18 for the owner-directed standardization, verbatim:
+//   "I want to use the PMax prompt for Meta also, and standardize on that but
+//    maintain a single minting for 9x16 across both formats. Continue to mint
+//    a 16x9."
+// The old V2 ("flag-OFF: PMax destination prompt byte-identical to Meta") was
+// comparing against the destination-less prompt and is now stated honestly as
+// two separate facts: the kill switch returns BOTH destinations to the
+// destination-less/frozen prompt (V2), and with the switch ON the two
+// destinations converge on ONE prompt (V1) — which is the standardization.
 {
   const on = loadVeoArm('true');
-  const metaOn = on.buildVeoPrompt({ ...VEO_ARGS_META });
+  const noDestOn = on.buildVeoPrompt({ ...VEO_ARGS_NO_DEST });
+  const metaOn = on.buildVeoPrompt({ ...VEO_ARGS_META_916 });
   const pmaxOn = on.buildVeoPrompt({ ...VEO_ARGS_PMAX_916 });
-  truthy('V1 flag-ON: Meta and PMax prompts both non-empty',
-    metaOn.length > 100 && pmaxOn.length > 100);
-  truthy('V1 flag-ON: PMax destination prompt differs from Meta',
-    metaOn !== pmaxOn);
+  truthy('V1 flag-ON: no-destination, Meta and PMax prompts all non-empty',
+    noDestOn.length > 100 && metaOn.length > 100 && pmaxOn.length > 100);
+  truthy('V1 flag-ON: PMax destination prompt differs from the destination-less prompt',
+    noDestOn !== pmaxOn);
+  truthy('V1 flag-ON: Meta destination prompt differs from the destination-less prompt (standardization is live)',
+    noDestOn !== metaOn);
+  check('V1 flag-ON: Meta 9:16 and PMax 9:16 are ONE identical prompt (owner 2026-08-18 standardization)',
+    metaOn, pmaxOn);
 
   const off = loadVeoArm('false');
-  const metaOff = off.buildVeoPrompt({ ...VEO_ARGS_META });
+  const noDestOff = off.buildVeoPrompt({ ...VEO_ARGS_NO_DEST });
+  const metaOff = off.buildVeoPrompt({ ...VEO_ARGS_META_916 });
   const pmaxOff = off.buildVeoPrompt({ ...VEO_ARGS_PMAX_916 });
-  truthy('V2 flag-OFF: Meta and PMax prompts both non-empty',
-    metaOff.length > 100 && pmaxOff.length > 100);
-  check('V2 flag-OFF: PMax destination prompt byte-identical to Meta (kill switch)',
-    pmaxOff, metaOff);
+  truthy('V2 flag-OFF: no-destination, Meta and PMax prompts all non-empty',
+    noDestOff.length > 100 && metaOff.length > 100 && pmaxOff.length > 100);
+  check('V2 flag-OFF: PMax destination prompt byte-identical to the destination-less prompt (kill switch → Phase A)',
+    pmaxOff, noDestOff);
+  check('V2 flag-OFF: Meta destination prompt byte-identical to the destination-less prompt (kill switch → frozen pre-#61 Meta text)',
+    metaOff, noDestOff);
 
-  // Within each arm, Meta (no destination) should not depend on the flag —
-  // the flag only gates destination selection. Cross-arm Meta identity:
-  check('V2 Meta prompt identical across video flag arms',
-    metaOn, metaOff);
+  // The destination-less path must not depend on the flag at all — the switch
+  // only gates destination selection. Cross-arm identity:
+  check('V2 destination-less prompt identical across video flag arms',
+    noDestOn, noDestOff);
 }
 
-// V3 — Meta path byte-identical to HEAD baseline (B14 technique)
-// Mirror verifyPostPilotBatch.js B14: git show → temp file with absolute
-// require rewrite. Baseline = HEAD (committed tree). If the working tree
-// Meta path diverges from HEAD, this fails. If git is unavailable, SKIP
-// loudly rather than false-pass.
-console.log('\nV3. Meta prompt byte-identical to HEAD baseline (both video arms)');
+// V2b — the kill switch honours BOTH env names, and either one can kill.
+// PMAX_VIDEO_DIRECTIVES is the Phase B name that may be set on the Render
+// dashboard; VIDEO_HOOK_FIRST_PROMPT is the current name. Backward
+// compatibility is a hard requirement — a dashboard override must not
+// silently stop working when the code renames its own flag.
 {
-  const BASELINE = 'HEAD:services/veoPromptBuilder.js';
+  const priorHook = process.env.VIDEO_HOOK_FIRST_PROMPT;
+  const priorLegacy = process.env.PMAX_VIDEO_DIRECTIVES;
+  const load = () => {
+    delete require.cache[require.resolve(VEO_PATH)];
+    delete require.cache[require.resolve(PF_PATH)];
+    return require(VEO_PATH);
+  };
+  const metaProfile = (mod) =>
+    mod.promptProfileFor({ promptByteCap: 20000, paramShape: 'gemini-omni' },
+      { platformFormat: 'meta_stories_9_16' });
+
+  delete process.env.VIDEO_HOOK_FIRST_PROMPT;
+  delete process.env.PMAX_VIDEO_DIRECTIVES;
+  check('V2b both names unset ⇒ ON by default', metaProfile(load()), 'hook_first');
+
+  process.env.PMAX_VIDEO_DIRECTIVES = 'false';
+  check('V2b LEGACY name alone kills (Render dashboard back-compat)', metaProfile(load()), 'gemini-omni');
+
+  // The exact production shape: dotenv gives the NEW name a value from
+  // config/defaults.env while the dashboard sets the LEGACY name to false.
+  // A "new name wins" precedence rule would silently ignore the dashboard.
+  process.env.VIDEO_HOOK_FIRST_PROMPT = 'true';
+  check('V2b legacy=false + new=true (defaults.env shape) STILL kills — fail-safe OR, not precedence',
+    metaProfile(load()), 'gemini-omni');
+
+  delete process.env.PMAX_VIDEO_DIRECTIVES;
+  process.env.VIDEO_HOOK_FIRST_PROMPT = 'false';
+  check('V2b NEW name alone kills', metaProfile(load()), 'gemini-omni');
+
+  process.env.VIDEO_HOOK_FIRST_PROMPT = '   ';
+  check('V2b blank/whitespace value counts as unset (not as "false")', metaProfile(load()), 'hook_first');
+
+  if (priorHook === undefined) delete process.env.VIDEO_HOOK_FIRST_PROMPT;
+  else process.env.VIDEO_HOOK_FIRST_PROMPT = priorHook;
+  if (priorLegacy === undefined) delete process.env.PMAX_VIDEO_DIRECTIVES;
+  else process.env.PMAX_VIDEO_DIRECTIVES = priorLegacy;
+}
+
+// V3 — destination-less path byte-identical to the pre-#61 baseline
+// Mirror verifyPostPilotBatch.js B14: git show → temp file with absolute
+// require rewrite. If git is unavailable, SKIP loudly rather than false-pass.
+//
+// BASELINE CHANGED 2026-08-18: was `HEAD:services/veoPromptBuilder.js`, which
+// only ever compared the working tree against the last commit — so the moment
+// a prompt change was committed the pin re-based onto it and stopped proving
+// anything. Now pinned to the IMMUTABLE `134db56~1` source, the same known-good
+// pre-#61 prompt verifyPostPilotBatch B14/B15 use. That is the text this check
+// has always been trying to protect, and it cannot drift out from under itself.
+console.log('\nV3. destination-less prompt byte-identical to the 134db56~1 baseline (both video arms)');
+{
+  const BASELINE = '134db56~1:services/veoPromptBuilder.js';
   const REL_REQUIRE = "require('./platformFormats')";
   let oldMod = null;
   let skipReason = null;
@@ -452,30 +548,61 @@ console.log('\nV3. Meta prompt byte-identical to HEAD baseline (both video arms)
   if (!oldMod) {
     // Skip is NOT a pass — print loudly. Do not count as pass or fail.
     console.log(`  ⏭  V3 SKIP (baseline unavailable): ${skipReason}`);
-    console.log('      ⚠️  Meta byte-identity to HEAD was NOT verified in this run.');
+    console.log('      ⚠️  byte-identity to 134db56~1 was NOT verified in this run.');
   } else {
-    const baselineMeta = oldMod.buildVeoPrompt({ ...VEO_ARGS_META });
+    const baselineNoDest = oldMod.buildVeoPrompt({ ...VEO_ARGS_NO_DEST });
     for (const [arm, flag] of [['ON', 'true'], ['OFF', 'false']]) {
       const mod = loadVeoArm(flag);
-      const liveMeta = mod.buildVeoPrompt({ ...VEO_ARGS_META });
-      check(`V3 arm=${arm}: Meta (no destination) byte-identical to HEAD baseline`,
-        liveMeta, baselineMeta);
+      check(`V3 arm=${arm}: destination-less prompt byte-identical to the 134db56~1 baseline`,
+        mod.buildVeoPrompt({ ...VEO_ARGS_NO_DEST }), baselineNoDest);
     }
-    // Also: baseline Meta must NOT carry PMax-only content when no destination
-    falsy('V3 baseline Meta has no HOOK-FIRST (destination-gated)',
-      /HOOK-FIRST/.test(baselineMeta));
+    // The surviving PR #61 rollback guarantee, stated on the LIVE Meta
+    // destination rather than on the destination-less path: switch off ⇒ a
+    // Meta ad still receives the frozen pre-#61 prompt byte-for-byte.
+    // (verifyPostPilotBatch B15 pins the same fact across a wider matrix;
+    // it is restated here so this harness is not silently weaker than its
+    // own header claims.)
+    check('V3 arm=OFF: LIVE Meta destination byte-identical to the 134db56~1 baseline (PR #61 rollback guarantee survives)',
+      loadVeoArm('false').buildVeoPrompt({ ...VEO_ARGS_META_916 }), baselineNoDest);
+    truthy('V3 arm=ON: LIVE Meta destination has MOVED off the 134db56~1 baseline (owner 2026-08-18 standardization)',
+      loadVeoArm('true').buildVeoPrompt({ ...VEO_ARGS_META_916 }) !== baselineNoDest);
+    // Also: the baseline must NOT carry destination-gated content
+    falsy('V3 baseline (destination-less) has no HOOK-FIRST',
+      /HOOK-FIRST/.test(baselineNoDest));
     if (tmpDir) {
       try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch { /* best effort */ }
     }
   }
 }
 
-// V4 — PMax video content pins (flag ON)
-console.log('\nV4. PMax video content pins (flag ON)');
+// V4 — hook-first video content pins (flag ON), on BOTH platforms
+console.log('\nV4. hook-first video content pins (flag ON) — PMax and Meta');
 {
   const on = loadVeoArm('true');
   const p916 = on.buildVeoPrompt({ ...VEO_ARGS_PMAX_916 });
   const p169 = on.buildVeoPrompt({ ...VEO_ARGS_PMAX_169 });
+  const m916 = on.buildVeoPrompt({ ...VEO_ARGS_META_916 });
+
+  // ── Meta now carries the same hook-first content (owner 2026-08-18) ─────
+  // Asserted separately from the Meta≡PMax equality in V1 on purpose: if a
+  // future change broke BOTH platforms identically, the equality check alone
+  // would still pass. These pin the content itself.
+  truthy('V4 Meta 9:16 contains HOOK-FIRST instruction', /HOOK-FIRST/.test(m916));
+  truthy('V4 Meta 9:16 Scene 1 is a HOOK beat, not the frozen pan',
+    /Scene 1 \(0\.0–3\.33s\): HOOK/.test(m916));
+  falsy('V4 Meta 9:16 no longer opens with the frozen left→right pan',
+    /Scene 1 \(0\.0–3\.33s\): slow horizontal pan/.test(m916));
+  truthy('V4 Meta 9:16 contains centre-safe language', /Centre-safe composition/.test(m916));
+  truthy('V4 Meta 9:16 Scene 3 maintains centre-safe framing',
+    /Maintain centre-safe framing/.test(m916));
+  falsy('V4 Meta 9:16 no longer says "Maintain center framing"',
+    /Maintain center framing/.test(m916));
+  truthy('V4 Meta 9:16 emits the vertical Frame line (it never did before)',
+    /Frame \(9:16 vertical\)/.test(m916));
+  // Platform neutrality — one profile serves both platforms, so the text sent
+  // to the model must not name either one.
+  falsy('V4 Meta prompt never names PMax to the model', /PMax/i.test(m916));
+  falsy('V4 PMax prompt never names Meta to the model', /\bMeta\b/i.test(p916));
 
   // Hook-first
   truthy('V4 9:16 contains HOOK-FIRST instruction', /HOOK-FIRST/.test(p916));

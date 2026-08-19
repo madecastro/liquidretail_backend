@@ -16,13 +16,20 @@
 // uses a fixed default.
 // Labeled default-prompt profiles (PROMPT_PROFILES):
 //   • gemini-omni — verbose; optimized for google/gemini-omni-flash/*
-//     (20,000-byte cap). FROZEN for Meta — owner PR #61 full rollback;
-//     B14 asserts byte-identity to the pre-#61 prompt. Do NOT reword.
+//     (20,000-byte cap). STILL FROZEN, and still byte-identical to the
+//     pre-#61 prompt (owner PR #61 full rollback). It is no longer the
+//     live Meta profile — see hook_first below — but it IS what the kill
+//     switch falls back to, so the rollback guarantee lives here. Do NOT
+//     reword: verifyPostPilotBatch B14/B15 assert byte-identity.
 //   • grok — compact re-authoring of the same rules; optimized for
 //     xai/grok-imagine-video* (4,096-byte cap); also serves veo/generic
-//   • pmax — Google PMax video only (hook-first + centre-safe + aspect
-//     framing). Selected when platformFormat is a pmax_video_* destination
-//     AND PMAX_VIDEO_DIRECTIVES is on (default). Meta path is untouched.
+//   • hook_first — hook-first + centre-safe + aspect-aware Frame. Was the
+//     PMax-only profile ('pmax'); STANDARDIZED ONTO META TOO on owner
+//     instruction 2026-08-18, verbatim: "I want to use the PMax prompt for
+//     Meta also, and standardize on that but maintain a single minting for
+//     9x16 across both formats. Continue to mint a 16x9." Selected for any
+//     Meta OR PMax video destination while the kill switch is on (default).
+//     'pmax' is still accepted as an alias everywhere it was a valid value.
 // promptProfileFor(caps, opts) selects the profile from destination first,
 // then caps.paramShape. The prompt-size cap is per-model (caps.promptByteCap).
 
@@ -48,10 +55,10 @@ const PLATFORM_FORMAT_ASPECT = Object.fromEntries(
 
 // Per-model-family / per-destination default-prompt profiles. Static Ken
 // Burns directives are authored once per profile so Omni (20k headroom),
-// Grok (4,096), and PMax (destination overlay on Omni) can be tuned
+// Grok (4,096), and hook_first (destination overlay on Omni) can be tuned
 // independently; shared dynamic lines (operator lead, duration-scaled
 // Timeline/Output, PRODUCT FIDELITY, compositing, seedHasText) stay in
-// buildVeoPrompt. PMax also adds aspect-aware Frame lines there.
+// buildVeoPrompt. hook_first also adds aspect-aware Frame lines there.
 const PROMPT_PROFILES = {
   'gemini-omni': {
     label: 'Gemini Omni default prompt',
@@ -69,9 +76,13 @@ const PROMPT_PROFILES = {
     ],
     promptByteBudget: 4096
   },
-  'pmax': {
-    label: 'Google PMax video prompt',
+  'hook_first': {
+    label: 'Hook-first video prompt (Meta + Google PMax)',
     optimizedFor: [
+      'meta_stories_9_16',
+      'meta_reels_9_16',
+      'meta_feed_4_5',
+      'meta_feed_1_1',
       'pmax_video_9_16',
       'pmax_video_16_9',
       'pmax_video_1_1'
@@ -81,6 +92,17 @@ const PROMPT_PROFILES = {
   }
 };
 
+// Legacy profile key. 'pmax' was this profile's only name until the owner
+// standardized Meta onto it (2026-08-18); accepted everywhere a profile name
+// is read so an explicit override, a stored value, or an older harness keeps
+// resolving to the same directives.
+const PROFILE_ALIASES = { pmax: 'hook_first' };
+
+function canonicalProfileName(name) {
+  const n = String(name || '').trim();
+  return PROFILE_ALIASES[n] || n;
+}
+
 // True for Google PMax video platformFormat keys (masters + derive-only).
 // Destination is passed in — never sniffed from globals.
 function isPmaxVideoDestination(platformFormat) {
@@ -88,27 +110,71 @@ function isPmaxVideoDestination(platformFormat) {
   return f.startsWith('pmax_video_');
 }
 
-// Kill switch PMAX_VIDEO_DIRECTIVES (default TRUE). Off → PMax destinations
-// fall through to the Omni/Grok profile selection (Phase A behaviour).
-function isPmaxVideoDirectivesEnabled() {
-  return String(process.env.PMAX_VIDEO_DIRECTIVES ?? 'true').toLowerCase() !== 'false';
+// True for Meta platformFormat keys (meta_stories_9_16, meta_reels_9_16,
+// meta_feed_4_5, meta_feed_1_1). buildVeoPrompt is only ever reached on the
+// VIDEO render path, so any meta_* key arriving here is a video destination.
+//
+// Deliberately a PREFIX test rather than a PLATFORM_FORMATS kinds lookup: the
+// capability table is edited by other work in flight (the single-9:16-master
+// minting change), and profile selection must not silently move because a
+// `kinds` array changed under it. Prefix matching is self-contained here and
+// picks up any future meta_* surface automatically.
+function isMetaVideoDestination(platformFormat) {
+  return String(platformFormat || '').startsWith('meta_');
 }
 
+// Destinations that take the hook_first profile: BOTH platforms as of
+// owner 2026-08-18. Kept as one predicate so the two platforms cannot drift.
+function isHookFirstVideoDestination(platformFormat) {
+  return isPmaxVideoDestination(platformFormat)
+    || isMetaVideoDestination(platformFormat);
+}
+
+// Kill switch (default TRUE). Off → EVERY video destination falls through to
+// the Omni/Grok profile selection: Meta returns to the frozen pre-#61
+// gemini-omni text byte-for-byte, PMax returns to Phase A. That off-arm
+// byte-identity IS the surviving PR #61 rollback guarantee — pinned by
+// verifyPostPilotBatch B14/B15.
+//
+// TWO NAMES, AND EITHER ONE CAN KILL. VIDEO_HOOK_FIRST_PROMPT is the current
+// name; PMAX_VIDEO_DIRECTIVES is the name that shipped in Phase B and may be
+// set on the Render dashboard. The rule is "explicit 'false' on EITHER name
+// disables", NOT "new name wins", because config/defaults.env is loaded with
+// dotenv (no override): a Render override of the LEGACY name would be silently
+// shadowed the moment anyone added the new name to defaults.env with a value.
+// Fail-safe OR makes the backward-compatibility guarantee unbreakable by a
+// later defaults.env edit. Blank/whitespace values count as unset.
+const HOOK_FIRST_ENV_NAMES = ['VIDEO_HOOK_FIRST_PROMPT', 'PMAX_VIDEO_DIRECTIVES'];
+
+function isHookFirstVideoPromptEnabled() {
+  for (const name of HOOK_FIRST_ENV_NAMES) {
+    const v = process.env[name];
+    if (typeof v === 'string' && v.trim() !== '' && v.trim().toLowerCase() === 'false') {
+      return false;
+    }
+  }
+  return true;
+}
+
+// Deprecated alias kept for call-site stability. Same switch, wider reach.
+const isPmaxVideoDirectivesEnabled = isHookFirstVideoPromptEnabled;
+
 // Select the default-prompt profile.
-//   1. Explicit opts.promptProfile wins (harness / override).
-//   2. PMax video destination + kill switch on → 'pmax'.
+//   1. Explicit opts.promptProfile wins (harness / override), alias-resolved.
+//   2. Meta OR PMax video destination + kill switch on → 'hook_first'.
 //   3. Else paramShape starting with 'gemini-omni' → gemini-omni;
 //      'grok' → grok; anything else (veo/generic) → grok.
-// Second arg is optional: absent opts preserves pre-PMax behaviour exactly
-// (Meta / scaffold / B14 paths that only pass caps).
+// Second arg is optional: absent opts (no destination) still resolves to the
+// frozen gemini-omni/grok path exactly as before — that is the legacy
+// scaffold / aiVideoReferenceService / B14 contract and must not move.
 function promptProfileFor(caps, opts = null) {
   const o = opts && typeof opts === 'object' ? opts : {};
   if (typeof o.promptProfile === 'string' && o.promptProfile.trim()) {
-    return o.promptProfile.trim();
+    return canonicalProfileName(o.promptProfile);
   }
   const dest = o.platformFormat || o.destination || null;
-  if (isPmaxVideoDestination(dest) && isPmaxVideoDirectivesEnabled()) {
-    return 'pmax';
+  if (isHookFirstVideoDestination(dest) && isHookFirstVideoPromptEnabled()) {
+    return 'hook_first';
   }
   const shape = String(caps?.paramShape || '');
   if (shape.startsWith('gemini-omni')) return 'gemini-omni';
@@ -300,25 +366,41 @@ const GROK_DIRECTIVES = {
     `No fantasy motion — no sparkles, particles, flares, floating props, morphing, or dissolves.`
 };
 
-// ── GOOGLE PMAX video prompt — destination profile for pmax_video_* only ──
+// ── HOOK-FIRST video prompt — destination profile for META *and* PMAX ─────
+// Was PMAX_DIRECTIVES (pmax_video_* only). OWNER-DIRECTED STANDARDIZATION
+// 2026-08-18, verbatim: "I want to use the PMax prompt for Meta also, and
+// standardize on that but maintain a single minting for 9x16 across both
+// formats. Continue to mint a 16x9." Meta video destinations now select this
+// profile too.
+//
 // Starts from OMNI_DIRECTIVES (proven Meta text). Changes ONLY what the
 // destination requires: hook-first objective, centre-safe camera. Fidelity
 // / noText / physicalAccuracy / productPreservation are referenced from
 // OMNI so they cannot drift. Timeline + aspect Frame lines are assembled
-// in buildVeoPrompt when profile === 'pmax'. Kill switch:
-// PMAX_VIDEO_DIRECTIVES=false restores the Omni/Grok path for PMax too.
+// in buildVeoPrompt when profile === 'hook_first'. Kill switch:
+// VIDEO_HOOK_FIRST_PROMPT / PMAX_VIDEO_DIRECTIVES = false restores the
+// Omni/Grok path for BOTH platforms — Meta back to the frozen pre-#61 text
+// byte-for-byte, PMax back to Phase A.
+//
+// THE DIRECTIVE TEXT BELOW IS WHAT THE OWNER STANDARDIZED ON — do not reword
+// it to "improve" it. It is deliberately aspect-neutral and platform-neutral;
+// nothing here may name a platform, because one string now serves both.
 // DO NOT import PR #61 rollback text. DO NOT touch OMNI_DIRECTIVES.
-const PMAX_DIRECTIVES = {
+const HOOK_FIRST_DIRECTIVES = {
   role:
     `Role: Professional product commercial editor. Animate the supplied product photos with virtual camera movement only — ` +
     `do NOT generate, recreate, or alter imagery. The supplied images are the source of truth.`,
   objective:
     `Objective: Create a premium product commercial using subtle Ken Burns camera moves. ` +
-    // Aspect-neutral by design: this one profile serves both the landscape
-    // and vertical PMax masters, and the aspect-specific direction is the
-    // Frame line assembled in buildVeoPrompt. Naming one aspect here (an
-    // earlier draft said "swipe-away vertical") is simply false on the
-    // other master and gives the model a contradictory cue.
+    // Aspect-neutral AND platform-neutral by design: this one profile serves
+    // the landscape and vertical masters on BOTH Meta and PMax, and the
+    // aspect-specific direction is the Frame line assembled in buildVeoPrompt.
+    // Naming one aspect here (an earlier draft said "swipe-away vertical") is
+    // simply false on the other master and gives the model a contradictory
+    // cue; naming one PLATFORM is now false for the same reason. "This
+    // surface" is deliberately generic and is true of Meta Stories/Reels
+    // (swipe-away, hook in the first second — see their creativeBriefs in
+    // platformFormats.js) exactly as it is of YouTube Shorts.
     `HOOK-FIRST: this surface is skipped or scrolled past in seconds — the product must be identifiable within the first 2 seconds; the opening frames carry the whole ad. ` +
     `Must feel luxury while keeping 100% fidelity to the original product.`,
   // Shared fidelity block — reference, do not re-author (drift guard).
@@ -339,8 +421,9 @@ const PMAX_DIRECTIVES = {
 };
 
 function directivesForProfile(profile) {
-  if (profile === 'pmax') return PMAX_DIRECTIVES;
-  if (profile === 'gemini-omni') return OMNI_DIRECTIVES;
+  const p = canonicalProfileName(profile);
+  if (p === 'hook_first') return HOOK_FIRST_DIRECTIVES;
+  if (p === 'gemini-omni') return OMNI_DIRECTIVES;
   return GROK_DIRECTIVES;
 }
 
@@ -544,15 +627,18 @@ function buildVeoPrompt({
   storyboard = null,      // eslint-disable-line no-unused-vars
   caps = null,
   durationSec = 8,        // per-ad render length (wizard format-selection stage)
-  platformFormat = null,  // Ad.platformFormat — PMax destination selector
+  // Ad.platformFormat — hook_first destination selector. Meta AND PMax video
+  // keys both select it since owner 2026-08-18; null/absent still resolves to
+  // the frozen gemini-omni/grok path.
+  platformFormat = null,
   destination = null,     // alias for platformFormat
-  promptProfile = null,   // explicit profile override (harness / opt-in)
+  promptProfile = null,   // explicit profile override ('pmax' aliases to 'hook_first')
   // Lifestyle seed style + variantKind — NEW inputs. Absent/null → packshot
   // path unchanged (B14 matrix never passes these). Lifestyle/UGC +
   // VIDEO_LIFESTYLE_PROMPT → LIFESTYLE_DIRECTIVES sibling branch; OMNI/GROK
-  // text is not edited. Lifestyle and PMax are ORTHOGONAL: a PMax destination
-  // keeps hook-first timing + centre-safe/Frame treatment while using lifestyle
-  // scene/motion directives.
+  // text is not edited. Lifestyle and hook_first are ORTHOGONAL: a hook_first
+  // destination keeps hook-first timing + centre-safe/Frame treatment while
+  // using lifestyle scene/motion directives.
   seedStyle = null,
   variantKind = null,
   // PMax 16:9 split-stage (2026-08). Absent/null → byte-identical to pre-
@@ -575,14 +661,22 @@ function buildVeoPrompt({
     promptProfile
   });
   // Lifestyle is a sibling directive set for scene/motion — it does NOT
-  // suppress the PMax destination profile. Packshot path still uses profile
-  // selection exactly as before (B14).
+  // suppress the hook-first destination profile. Packshot path still uses
+  // profile selection exactly as before (B14).
   const d = lifestyle ? LIFESTYLE_DIRECTIVES : directivesForProfile(profile);
-  // Orthogonal: PMax destination treatment composes with lifestyle, never
-  // gets dropped because the seed is lifestyle.
-  const isPmax = profile === 'pmax';
-  // Used by the PMax timeline only. Meta's timeline is frozen and must not
-  // become aspect-aware (see the PR #61 rollback note above).
+  // Orthogonal: hook-first destination treatment composes with lifestyle,
+  // never gets dropped because the seed is lifestyle.
+  //
+  // TRUE FOR META AS WELL AS PMAX since owner 2026-08-18. Everything gated on
+  // this flag below (hook-first timeline, centre-safe camera, aspect Frame
+  // lines) is now emitted for Meta video destinations too — there is no
+  // second code path. With the kill switch off, profile falls back to
+  // gemini-omni and every one of those branches goes dark again, restoring
+  // the frozen pre-#61 Meta text byte-for-byte.
+  const isHookFirst = profile === 'hook_first';
+  // Used by the hook-first timeline only. The gemini-omni (kill-switch-off)
+  // timeline stays frozen and must NOT become aspect-aware — that frozen
+  // arm is what the PR #61 rollback note above still protects.
   const isVerticalAspect = String(aspectRatio || '') === '9:16';
   // Split-stage gate. 16:9-only: a 9:16 ad with subjectSide set must stay
   // on today's centre-safe path (vertical already has no lateral pan, and
@@ -614,14 +708,20 @@ function buildVeoPrompt({
   // ── Directives (lifestyle sibling OR packshot Ken Burns per-profile) ─
   lines.push(d.role);
   lines.push(d.objective);
-  // PMax hook-first is destination treatment — compose onto lifestyle too.
-  // Packshot PMax already carries HOOK-FIRST inside PMAX_DIRECTIVES.objective;
+  // Hook-first is destination treatment — compose onto lifestyle too.
+  // Packshot already carries HOOK-FIRST inside HOOK_FIRST_DIRECTIVES.objective;
   // lifestyle uses LIFESTYLE_DIRECTIVES.objective, so inject the destination
   // rule once when both are active. Not a contradiction with ambient life:
   // the product must be readable early; ambient motion may still breathe.
-  if (lifestyle && isPmax) {
+  //
+  // PLATFORM-NEUTRALITY EDIT (owner standardization 2026-08-18): this label
+  // used to read "(PMax destination)". One profile now serves Meta and PMax,
+  // so a literal "PMax" in text sent to the model on a Meta ad was simply
+  // false. Only the parenthetical label changed — the directive itself is
+  // untouched.
+  if (lifestyle && isHookFirst) {
     lines.push(
-      `HOOK-FIRST (PMax destination): this surface is skipped or scrolled past in seconds — ` +
+      `HOOK-FIRST (video destination): this surface is skipped or scrolled past in seconds — ` +
       `the product must be identifiable within the first 2 seconds; the opening frames carry the whole ad. ` +
       `Ambient life may move, but never at the cost of early product readability.`
     );
@@ -679,20 +779,23 @@ function buildVeoPrompt({
   }
 
   // Timeline. Lifestyle branch is ambient-life + product-as-star.
-  // Packshot Meta branch is FROZEN — do not reword (B14).
-  // PMax packshot is hook-first Ken Burns.
-  // Lifestyle + PMax composes: lifestyle scene/motion language + PMax
+  // The final `else` (gemini-omni profile) branch is the FROZEN pre-#61
+  // timeline — do not reword (B14/B15). It is now reached only when the
+  // kill switch is off or no destination was passed; that is precisely the
+  // arm the PR #61 rollback guarantee still lives in.
+  // Packshot hook_first (Meta AND PMax since 2026-08-18) is hook-first Ken Burns.
+  // Lifestyle + hook_first composes: lifestyle scene/motion language +
   // hook-first timing + centre-safe framing (not packshot Ken Burns pans —
   // those would re-impose static product commercial moves on a real scene).
-  // Residual tension report (not silently dropped): packshot PMax cameraStyle
-  // says "product stays completely static"; lifestyle allows real-item motion.
-  // Composition keeps lifestyle product-preservation (identity ≠ immobility)
-  // and only takes PMax's hook-first + centre-safe + Frame — never the
-  // packshot-static product line.
+  // Residual tension report (not silently dropped): packshot hook_first
+  // cameraStyle says "product stays completely static"; lifestyle allows
+  // real-item motion. Composition keeps lifestyle product-preservation
+  // (identity ≠ immobility) and only takes hook-first + centre-safe + Frame —
+  // never the packshot-static product line.
   const dur = Number(durationSec || 8);
   const t1  = (dur / 3).toFixed(2);
   const t2  = (dur * 0.64).toFixed(2);
-  if (lifestyle && isPmax) {
+  if (lifestyle && isHookFirst) {
     // Split-stage (16:9 + subjectSide): the stock lifestyle+PMax path holds
     // the product in the "central band" and later injects centre-safe that
     // bans outer side margins — both actively forbid anchoring the subject
@@ -741,7 +844,7 @@ function buildVeoPrompt({
       `Product identity absolute — may move only as the real item would with the wearer/scene; never morph or independently animate. ` +
       `Scene 3 (${t2}–${dur.toFixed(1)}s): ease to a readable full-scene end state with the product still clear; natural motion only, never fantasy.`
     );
-  } else if (isPmax) {
+  } else if (isHookFirst) {
     lines.push(
       `Timeline (${dur.toFixed(1)}s): ` +
       `Scene 1 (0.0–${t1}s): HOOK — product fully legible and identifiable from the first frame; ` +
@@ -786,19 +889,19 @@ function buildVeoPrompt({
     );
   }
   lines.push(d.transitions);
-  // Packshot PMax cameraStyle (PMAX_DIRECTIVES) embeds the same centre-safe
-  // "central region / outer side margins" clause that the lifestyle inject
-  // below carries. Under split that clause FORBIDS side-anchoring — the twin
-  // of the lifestyle trap that was nearly missed in review. Emit a split-
-  // safe camera line for packshot+split only; every other path keeps the
-  // stock directive so non-split prompts stay byte-identical.
-  if (isSplit && isPmax && !lifestyle) {
+  // Packshot hook_first cameraStyle (HOOK_FIRST_DIRECTIVES) embeds the same
+  // centre-safe "central region / outer side margins" clause that the
+  // lifestyle inject below carries. Under split that clause FORBIDS
+  // side-anchoring — the twin of the lifestyle trap that was nearly missed in
+  // review. Emit a split-safe camera line for packshot+split only; every other
+  // path keeps the stock directive so non-split prompts stay byte-identical.
+  if (isSplit && isHookFirst && !lifestyle) {
     // DERIVED, NOT REWRITTEN. An earlier draft hardcoded a replacement camera
     // style; that copy both drifted from the canonical directive and permitted
     // "parallax" while still asserting "The product stays completely static" —
     // a self-contradicting instruction on a billable submit. Substituting only
     // the centre-safe sentence keeps the shared prohibition list (incl.
-    // parallax) and every future edit to PMAX_DIRECTIVES.cameraStyle verbatim.
+    // parallax) and every future edit to HOOK_FIRST_DIRECTIVES.cameraStyle verbatim.
     // The harness pins that the prohibition survives.
     const splitComposition =
       `Split-stage composition: hold the product in the ${sideLabel} vertical band of the wide frame, ` +
@@ -817,32 +920,45 @@ function buildVeoPrompt({
   } else {
     lines.push(d.cameraStyle);
   }
-  // Centre-safe is PMax destination treatment. Lifestyle cameraStyle does not
-  // carry it (would change Meta lifestyle); inject when both are active.
-  // Complementary with lifestyle motion — not a contradiction.
+  // Centre-safe is hook-first destination treatment. Lifestyle cameraStyle
+  // does not carry it, so inject when both are active. Complementary with
+  // lifestyle motion — not a contradiction.
   //
   // Split-stage exception (2026-08): centre-safe says "away from … the outer
   // side margins", which directly forbids anchoring the subject to one side.
-  // That combination (lifestyle + PMax + split) was the one nearly missed in
-  // review because the inject only fires on lifestyle+PMax. Under split emit
-  // the side-anchored composition instead — never both.
-  if (lifestyle && isPmax) {
+  // That combination (lifestyle + hook_first + split) was the one nearly
+  // missed in review because the inject only fires on lifestyle+hook_first.
+  // Under split emit the side-anchored composition instead — never both.
+  //
+  // PLATFORM-NEUTRALITY EDIT (owner standardization 2026-08-18): both labels
+  // used to read "(PMax destination)". One profile now serves Meta and PMax,
+  // so naming PMax in text sent to the model on a Meta ad was false. Only the
+  // parenthetical label changed — the directives themselves are untouched.
+  if (lifestyle && isHookFirst) {
     if (isSplit) {
       lines.push(
-        `Split-stage composition (PMax destination): keep the product and any focal detail in the ${sideLabel} vertical band of the wide frame for the whole clip — ` +
+        `Split-stage composition (video destination): keep the product and any focal detail in the ${sideLabel} vertical band of the wide frame for the whole clip — ` +
         `do not centre it or drift it toward the ${oppositeLabel} side. Keep the ${oppositeLabel} side calm, uncluttered, and unobstructed.`
       );
     } else {
       lines.push(
-        `Centre-safe composition (PMax destination): keep the product and any focal detail within the central region of the frame — ` +
+        `Centre-safe composition (video destination): keep the product and any focal detail within the central region of the frame — ` +
         `away from the top and bottom bands and the outer side margins, where the platform overlays UI.`
       );
     }
   }
 
-  // Aspect-aware framing — PMax destination (packshot AND lifestyle). Meta
-  // never emits Frame lines (Meta was previously aspect-unused on that path).
-  if (isPmax) {
+  // Aspect-aware framing — hook_first destinations (packshot AND lifestyle).
+  // SINCE 2026-08-18 THIS INCLUDES META: a Meta 9:16 master now emits the
+  // `Frame (9:16 vertical)` line it never used to. Only the kill-switch-off
+  // (gemini-omni) arm is Frame-less now.
+  //
+  // Only 16:9 and 9:16 have a Frame line. Meta's 1:1 / 4:5 surfaces are free
+  // CROPS of the 9:16 master (deriveFromMaster) and never build their own
+  // prompt, so no Frame line is needed for them; if one ever did submit, it
+  // simply gets no Frame line rather than a wrong one. No new directive text
+  // was invented for those aspects — the owner standardized on this text as-is.
+  if (isHookFirst) {
     const ar = String(aspectRatio || '');
     if (ar === '16:9') {
       if (isSplit) {
@@ -855,7 +971,7 @@ function buildVeoPrompt({
         lines.push(
           `Frame (16:9 landscape, split-stage): anchor the product in a vertical band on the ${sideLabel} side of the wide frame for the entire clip. ` +
           // "push-in" ONLY — never "parallax". The shared camera prohibition
-          // list in PMAX_DIRECTIVES.cameraStyle forbids parallax outright, and
+          // list in HOOK_FIRST_DIRECTIVES.cameraStyle forbids parallax outright, and
           // an earlier draft prescribed it here while that ban was still in the
           // same prompt: a self-contradicting instruction on a billable submit.
           // A push-in is a zoom, which the list permits.
@@ -1027,12 +1143,29 @@ module.exports = {
   enforceRawByteCap,
   enforceByteCap,
   isPmaxVideoDestination,
+  // ── Owner standardization 2026-08-18 (Meta + PMax on one camera prompt) ──
+  // isHookFirstVideoPromptEnabled() IS THE GATE other services should import
+  // to ask "are Meta and PMax on the same camera prompt right now?". Do not
+  // re-read the env inline anywhere else — the two-name fail-safe OR below is
+  // not reproducible by a naive `process.env.X !== 'false'`.
+  //
+  // NOTE for the plate-sharing decision: prompt-profile EQUALITY is not a
+  // sufficient gate. With the switch OFF, Meta and PMax also agree (both fall
+  // to gemini-omni) — but they agree on the frozen Ken Burns pan, which is the
+  // framing PMax Phase B rejected. Gate on this predicate being TRUE, not on
+  // the two profiles merely matching.
+  isHookFirstVideoPromptEnabled,
+  isHookFirstVideoDestination,
+  isMetaVideoDestination,
+  // Deprecated alias — same switch, now covering Meta too.
   isPmaxVideoDirectivesEnabled,
   directivesForProfile,
   // Exported for offline verify harnesses (directive continuity / policy).
   OMNI_DIRECTIVES,
   GROK_DIRECTIVES,
-  PMAX_DIRECTIVES,
+  HOOK_FIRST_DIRECTIVES,
+  // Deprecated alias for the pre-standardization name.
+  PMAX_DIRECTIVES: HOOK_FIRST_DIRECTIVES,
   // Lifestyle video sibling path (VIDEO_LIFESTYLE_PROMPT) — harness + callers.
   LIFESTYLE_DIRECTIVES,
   LIFESTYLE_VIDEO_GUIDANCE,

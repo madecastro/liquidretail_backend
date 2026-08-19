@@ -109,7 +109,11 @@ const { buildVeoPrompt, aspectRatioForPlatformFormat, promptProfileFor } = requi
     modelOverride,
     fallback: fallback || null,
     paramShape: caps.paramShape,
-    promptProfile: promptProfileFor(caps),
+    // MUST pass the destination. promptProfileFor(caps) alone ignores it and
+    // would report 'gemini-omni' for a Meta or PMax ad whose real submit uses
+    // 'hook_first' — a diagnostic that lies about the live path is worse than
+    // no diagnostic. Mirrors generateForAd's `platformFormat: ad.platformFormat`.
+    promptProfile: promptProfileFor(caps, { platformFormat: ad.platformFormat || null }),
     brandOverride: brand?.videoSettings || null,
     productOverride: product?.videoSettings || null,
     referenceCount,

@@ -17,9 +17,30 @@
  *      side margins" — directly forbids side-anchoring. Nearly missed in
  *      review because it only fires on lifestyle+PMax.
  *
- * Plus packshot PMAX_DIRECTIVES.cameraStyle embeds the same centre-safe
+ * Plus packshot HOOK_FIRST_DIRECTIVES.cameraStyle embeds the same centre-safe
  * clause, so a packshot split would still self-contradict without a
  * gated replacement.
+ *
+ * ── 2026-08-18 (owner standardization) — WHAT CHANGED HERE AND WHY ────────
+ * Owner, verbatim: "I want to use the PMax prompt for Meta also, and
+ * standardize on that but maintain a single minting for 9x16 across both
+ * formats. Continue to mint a 16x9." The profile formerly called 'pmax'
+ * (PMAX_DIRECTIVES) is now 'hook_first' (HOOK_FIRST_DIRECTIVES) and serves
+ * Meta as well; PMAX_DIRECTIVES is still exported as an alias, so this file's
+ * import keeps working unchanged.
+ *
+ * The ONLY substantive edit here: the two destination-inject labels this
+ * harness pins were "Centre-safe composition (PMax destination)" and
+ * "Split-stage composition (PMax destination)". Those strings are sent to the
+ * model, and naming PMax became false once Meta selected the same profile, so
+ * both now read "(video destination)". The checks are otherwise unchanged and
+ * still pin presence/absence exactly as before.
+ *
+ * SPLIT IS UNREACHABLE FROM META TODAY, twice over: no runtime call site
+ * passes subjectSide at all (generateForAd does not thread it), and isSplit
+ * additionally requires 16:9 while Meta's only video master is 9:16. The
+ * split language is also platform-neutral, so if Meta 16:9 is ever wired up
+ * it composes correctly rather than leaking PMax-specific direction.
  *
  * Contract (same class as REFRAME_PROMPT_HARDENING / CLAUDE.md flag-off):
  *   • subjectSide / panelTreatment absent OR null → byte-identical to
@@ -283,7 +304,7 @@ ok('lifestyle+PMax non-split still emits outer-side-margins centre-safe', () => 
       'lifestyle+PMax non-split must still carry the centre-safe outer-margins clause'
     );
     assert.ok(
-      p.includes('Centre-safe composition (PMax destination)'),
+      p.includes('Centre-safe composition (video destination)'),
       'lifestyle+PMax non-split must label the centre-safe inject'
     );
   } finally {
@@ -306,11 +327,11 @@ ok('lifestyle+PMax+split: outer-side-margins centre-safe MUST NOT appear', () =>
       'split must suppress the outer-side-margins centre-safe sentence'
     );
     assert.ok(
-      !p.includes('Centre-safe composition (PMax destination)'),
+      !p.includes('Centre-safe composition (video destination)'),
       'split must not emit the centre-safe inject label'
     );
     assert.ok(
-      p.includes('Split-stage composition (PMax destination)'),
+      p.includes('Split-stage composition (video destination)'),
       'split must emit the side-anchored composition instead'
     );
     assert.ok(
