@@ -731,6 +731,78 @@ the claim-anomaly alert is `alerts.notifyAsync` at `level:'fatal'` and never
 render-loop or reap regions are `await`ed (revert-proven, comment-stripped
 before scanning).
 
+## In-app run status vs Slack (2026-08-19) — gap table + the architecture decision
+
+Owner framing, verbatim: *"Slack seems to know exactly what is going on, why aren't
+we using that as a source of information?"* This section is the inventory that
+prompted, and the fix that followed.
+
+### The decision: reuse Slack's own functions from the HTTP route, not a second copy
+
+Two credible designs existed. **Rejected: bolt Slack's strings onto the UI** — copy
+`buildParentText`'s "now:" line or `summariseFailures`'s grouping logic into
+`routes/ads.js`. That is exactly how the app and Slack would drift again the next
+time either one is edited — two implementations of "what does this failure mean"
+that look similar and slowly diverge, the same class of bug this whole pass exists
+to fix. **Chosen: `GET /api/ads/runs/:runId` calls the SAME exported functions**
+Slack's live feed already calls — `services/adStage.js summarizeInFlightStages`
+(the grouping half of what `buildParentText`'s "now:" line computes) and
+`services/runFeedService.js summariseFailures` (literally the function
+`finishRun`'s Slack summary calls). One computation, two renderers (Slack text,
+React JSON). A future change to either grouping rule is felt on both surfaces by
+construction, not by remembering to update two places.
+
+`runFeedService`'s own per-process `now:` computation (mixing a fresh Mongo read
+with in-memory `lastStageByAd` for ads whose `renderStage` write hasn't landed yet)
+was deliberately **not** touched — that in-memory merge exists for the live feed's
+own real-time feel and has nothing analogous on an HTTP poller, which just reads
+Mongo fresh each request. The shared piece is the taxonomy
+(`services/adStage.js stageBase`) and the grouping/failure functions, not the
+transport-specific plumbing around them.
+
+### Gap table (Slack signal → in-app today)
+
+| Slack signal | Persisted? | Was it in `GET /runs/:runId`? | Now? |
+|---|---|---|---|
+| Live "now: X ×N, Y ×M" stage aggregate (`runFeedService.buildParentText`) | Yes — `Ad.renderStage` | **No** — only aggregate succeeded/failed/skipped counts, zero stage detail | **Yes** — `stages` field, `services/adStage.js summarizeInFlightStages` |
+| Grouped failure headline (`runFeedService.summariseFailures`, e.g. "2✗ Model Moderation Error") | Yes — `Ad.renderError.message` | Only the raw per-ad `errors[]` list (no grouping/dedup) | **Yes** — `failureSummary` field, same function Slack calls |
+| Run liveness (`services/campaignRunHeartbeat.js`) | Yes — `CampaignRun.lastHeartbeatAt` | Not returned at all | **Yes** — `lastHeartbeatAt` + `updatedAt`, used for the frontend's "no update in Xm" caution |
+| "Run reaped as stale" reason | N/A — this was the gap | Reaper stamped `status:'failed'` with an **empty** `errors[]` — zero explanation | **Fixed** — `buildStaleRunningReapUpdate` pushes a real `errors[]` entry naming the stale window |
+| "Queued-drain run crashed" reason | N/A — this was the gap | Same empty-`errors[]` gap, different code path (`POST /api/ads/runs`) | **Fixed** — mirrors the prep/render crash handler's `$push` |
+| Per-ad vision-QC category scores + findings (`adVisionQcService.js` alert fields) | Yes — full `Ad.visionQc` | Only via `GET /api/ads/:id/generation-inspector`; render-activity/ads-list get the pass/fail summary only | **Still gap** — not wired into the run poller or gallery cards; the inspector remains the only full view |
+| Director "payload didn't satisfy the round contract" warning | **No** — console + Slack only, never written to `CampaignRun` | No | **Still gap** — a run with this warning looks clean on the poller |
+| Watchdog "N campaign run(s) not progressing" (age+silence on `preparing`/`running`) | Derived from `CampaignRun` fields, not a new one | No per-run "this has been silent Nm" flag | **Partially addressed** — `lastHeartbeatAt`/`updatedAt` let the frontend flag silence on `'running'`; a `'preparing'` run genuinely has no liveness signal by design (`expandWizardJob` makes zero writes to the row until the flip — see `services/campaignRunGuards.js`), so a stuck-preparing run is still only visible via Slack's watchdog until it ages out via `PREPARE_STALE_MIN` |
+| `alertService` dedupe tally ("+N more since HH:MM") for a repeated failure | In-process map only | No | **Still gap** — a burst of identical failures reads as isolated events on the poller |
+
+Full trace behind this table (every Slack call site, file:line, and what it does or
+does not persist) was produced by a Grok CLI read-only pass over this repo and
+independently spot-checked against the live source before anything above was acted
+on — several of its findings turned out to describe a stale checkout of this repo
+(pre-`services/campaignRunHeartbeat.js`); the table above reflects the current,
+verified state, not that raw pass.
+
+### What shipped alongside this table
+
+- `services/adStage.js`: `groupStageCounts` (pure) + `summarizeInFlightStages`
+  (the Mongo-touching wrapper) — grouped, sorted, capped stage buckets for a run's
+  in-flight `Ad.renderStage` rows.
+- `routes/ads.js` `GET /runs/:runId`: now also returns `stages`, `failureSummary`,
+  `lastHeartbeatAt`, `updatedAt`.
+- `services/campaignRunGuards.js` `buildStaleRunningReapUpdate` +
+  `worker.js reapOrphans()`: the running-reaper's write now `$push`es a real
+  `errors[]` entry instead of a bare status flip.
+- `routes/ads.js` queued-drain crash handler (`POST /api/ads/runs`): same fix,
+  mirroring the existing prep/render crash handler a few hundred lines above it.
+- Frontend (`liquidretail` PR, companion to this one): `RunProgress` now shows the
+  stage aggregate and grouped failure reasons, always-explicit succeeded/skipped/
+  failed/still-rendering counts (never a bare "N of M"), and a truthful
+  heartbeat-driven "no update in Xm" caution that never replaces the live progress
+  underneath it — replacing a client-side poll timeout that used to stop polling
+  entirely and freeze the display mid-run.
+
+Pinned by `scripts/verifyRunStatusTruthfulness.js` (14 checks, revert-proven on 4
+mutations).
+
 ## Known gap this does not close
 
 Alerting tells you work was dropped; it does not resume it. The underlying

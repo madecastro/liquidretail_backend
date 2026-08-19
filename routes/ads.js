@@ -101,7 +101,7 @@ const { buildPreviewHtmlForAd }  = require('../services/adPreviewPageService');
 const registry = require('../services/templateRegistry');
 const alerts   = require('../services/alertService');
 const inFlight = require('../services/inFlight');
-const { adStage } = require('../services/adStage');
+const { adStage, summarizeInFlightStages } = require('../services/adStage');
 const runFeed  = require('../services/runFeedService');
 // Pure Slack-message builders (run-completion per-kind summary, claim-anomaly
 // alert, uncapped-batch run-start line) — see services/slackRunVerbosity.js
@@ -1545,9 +1545,14 @@ router.post('/runs', express.json(), async (req, res) => {
           receiptFree({ _id: { $in: renderIds }, status: 'rendering' }),
           { $set: { status: 'queued', updatedAt: new Date(), ...REQUEUE_MARK } }
         ).catch(() => {});
+        // Mirror the prep/render crash handler above (which already does
+        // this): a post-claim throw here used to stamp status:'failed' with
+        // NO errors[] entry, so GET /api/ads/runs/:id showed a dead "Generate
+        // more" run with zero explanation for why it died.
         CampaignRun.updateOne(
           { _id: run._id },
-          { status: 'failed', completedAt: new Date() }
+          { status: 'failed', completedAt: new Date(),
+            $push: { errors: { index: 0, stage: 'runs-drain', message: err.message || String(err) } } }
         ).catch(() => {});
       });
     });
@@ -3036,10 +3041,26 @@ router.get('/runs/:runId', async (req, res) => {
     // queuedRemaining drives the "Generate more" affordance on the
     // Ads page — the button only makes sense when the campaign has
     // more queued inventory to drain.
-    const queuedRemaining = await Ad.countDocuments({
-      campaignId: run.campaignId,
-      status:     'queued'
-    });
+    //
+    // `stages` and `failureSummary` are the single-source-of-truth fix for
+    // the app/Slack status gap: both are the SAME functions runFeedService
+    // already calls to build Slack's live "now: …" line and its
+    // run-finished failure headline (services/adStage.js
+    // summarizeInFlightStages; services/runFeedService.js
+    // summariseFailures), not a re-derivation that could drift from what
+    // Slack says about this exact run. Neither is awaited-critical — a
+    // failure here must never take down the run poller — so both are
+    // best-effort with an empty-array fallback.
+    const [queuedRemaining, stages, failureSummary] = await Promise.all([
+      Ad.countDocuments({
+        campaignId: run.campaignId,
+        status:     'queued'
+      }),
+      summarizeInFlightStages(run.runId).catch(() => []),
+      (run.failed > 0
+        ? runFeed.summariseFailures(run.runId).catch(() => [])
+        : Promise.resolve([]))
+    ]);
     res.json({
       runId:           run.runId,
       brandId:         String(run.brandId),
@@ -3058,12 +3079,26 @@ router.get('/runs/:runId', async (req, res) => {
       status:          run.status,
       queuedRemaining,
       errors:          run.errors || [],
+      // What stage this run's in-flight (status:'rendering') ads are in,
+      // grouped and counted — e.g. [{stage:'titling 9:16', count:3}]. Empty
+      // once nothing is currently rendering (preparing, or settled).
+      stages,
+      // Grouped, deduped "why did things fail" — e.g.
+      // [{reason:'atlasVideo: prediction timed out after 600s', count:1}].
+      // Present as soon as any ad in this run has failed, even mid-run.
+      failureSummary,
       // Per-product expansion outcomes (why each product queued or skipped).
       // Empty until expandWizardJob finishes; the poller is the source of
       // truth because the 202 response flushes before expansion completes.
       perProduct:      run.perProduct || [],
       startedAt:       run.startedAt,
-      completedAt:     run.completedAt
+      completedAt:     run.completedAt,
+      // Liveness — services/campaignRunHeartbeat.js. Null while 'preparing'
+      // (that lifecycle never heartbeats by design) and until the render
+      // loop's first beat lands. `updatedAt` (mongoose timestamps) is the
+      // fallback for an instant right at claim, before any beat has fired.
+      lastHeartbeatAt: run.lastHeartbeatAt || null,
+      updatedAt:       run.updatedAt || null
     });
   } catch (err) {
     console.error('run fetch failed:', err);

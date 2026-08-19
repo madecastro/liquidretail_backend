@@ -117,11 +117,76 @@ function _resetThrottleForTests() {
   _lastByAd.clear();
 }
 
+/**
+ * Group a set of { renderStage } rows into stage buckets, base-name first
+ * (so a poll trailer like " — polling 20s (7)" collapses into the phase it
+ * belongs to) and sorted most-common-first.
+ *
+ * PURE — takes plain rows, not a query. Exists as its own function so
+ * summarizeInFlightStages (the Mongo-touching half) and any harness can
+ * share one grouping rule instead of two copies drifting apart. This is the
+ * same "now: X, Y" aggregation runFeedService already computes for Slack's
+ * live parent message (buildParentText) — kept here, next to stageBase, so
+ * both the Slack feed and the HTTP run poller can be pointed at one
+ * definition of "what stage is this run's in-flight work in".
+ *
+ * @param {Array<{renderStage?: string|null}>} rows
+ * @param {{limit?: number}} [opts]
+ * @returns {Array<{stage: string, count: number}>} sorted desc by count
+ */
+function groupStageCounts(rows, { limit = 8 } = {}) {
+  const counts = new Map();
+  for (const row of rows || []) {
+    const raw = row && row.renderStage;
+    if (!raw) continue;
+    const base = stageBase(raw) || raw;
+    if (!base) continue;
+    counts.set(base, (counts.get(base) || 0) + 1);
+  }
+  return [...counts.entries()]
+    .map(([stage, count]) => ({ stage, count }))
+    .sort((a, b) => b.count - a.count || a.stage.localeCompare(b.stage))
+    .slice(0, Math.max(1, limit));
+}
+
+/**
+ * What stage is this run's in-flight work actually in, right now?
+ *
+ * Reads the same field (`Ad.renderStage`) and the same base-name rule
+ * (`stageBase`) runFeedService already uses to build Slack's "now: …" line
+ * — this is the read half of the single-source-of-truth the run poller was
+ * missing (GET /api/ads/runs/:id used to return only aggregate
+ * succeeded/failed/skipped counts, with zero notion of *what stage* the
+ * remaining work was in; an operator had to open Slack or Mongo to learn
+ * that, e.g., 8 ads were stuck in "titling" and 2 in "quality check").
+ *
+ * A plain awaited read — NOT fire-and-forget like the rest of this file.
+ * Safe to call from an HTTP handler; it never writes anything.
+ *
+ * @param {string} runId
+ * @param {{limit?: number, _Ad?: object}} [opts] `_Ad` is a test-only
+ *   injection seam (a fake with a chainable `.find().select().lean()`) so a
+ *   harness can drive this without touching real Mongo — mirrors the
+ *   `_setDeps`-style seams elsewhere in this file/runFeedService, just
+ *   scoped to one call instead of module state.
+ * @returns {Promise<Array<{stage: string, count: number}>>}
+ */
+async function summarizeInFlightStages(runId, opts = {}) {
+  if (!runId) return [];
+  const AdModel = opts._Ad || Ad;
+  const rows = await AdModel.find({ campaignRunIds: runId, status: 'rendering' })
+    .select('renderStage')
+    .lean();
+  return groupStageCounts(rows, opts);
+}
+
 module.exports = {
   adStage,
   noteRenderIssue,
   formatElapsed,
   stageBase,
   stageMinMs,
+  groupStageCounts,
+  summarizeInFlightStages,
   _resetThrottleForTests
 };

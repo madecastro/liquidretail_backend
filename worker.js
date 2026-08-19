@@ -138,7 +138,7 @@ const { receiptFree, HAS_RECEIPT } = require('./services/spendReceipt');
 // billable submit may be in flight behind it. REQUEUE_MARK, never
 // PRE_DISPATCH. See the REQUEUE_SITES ledger in services/adArchiveDigest.js.
 const { REQUEUE_MARK } = require('./services/adArchiveDigest');
-const { buildStalePreparingFilter, buildStaleRunningFilter } = require('./services/campaignRunGuards');
+const { buildStalePreparingFilter, buildStaleRunningFilter, buildStaleRunningReapUpdate } = require('./services/campaignRunGuards');
 // Pure Slack-message builder for the preparing-reap notice below — see
 // services/slackRunVerbosity.js header (no Mongo/network at require-time).
 const { buildPreparingReapNotice } = require('./services/slackRunVerbosity');
@@ -342,9 +342,16 @@ async function reapOrphans() {
   // predicate below mean "the holder died" rather than "nothing settled
   // lately". Filter extracted to campaignRunGuards so the harness can evaluate
   // the real one.
+  // The write used to be `{ $set: { status: 'failed', completedAt: new Date() } }`
+  // and nothing else — no errors[] entry, so a reaped run read exactly like
+  // the header above describes: "Nothing threw. It was still rendering." with
+  // zero explanation on the run poller itself. buildStaleRunningReapUpdate
+  // (services/campaignRunGuards.js) now pushes a real errors[] row naming the
+  // stale window, so GET /api/ads/runs/:id can say why instead of a bare
+  // status flip.
   const runs = await CampaignRun.updateMany(
     buildStaleRunningFilter({ now: reapNow, staleMin: REAP_STALE_MIN }),
-    { $set: { status: 'failed', completedAt: new Date() } }
+    buildStaleRunningReapUpdate(REAP_STALE_MIN)
   );
 
   // CampaignRun stuck in 'preparing' → mark 'failed'. Distinct from the sweep
