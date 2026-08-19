@@ -2049,3 +2049,53 @@ not as a separate tuning decision. Re-measure before going higher
 - Adversarial review on non-trivial diffs: have a second model try to *refute* the
   change (bugs, bypasses, money holes) before committing. It caught two real regex
   bugs in the submit guard that review-by-reading missed.
+- **`session.md` gets a new file, never a new paragraph (restructured 2026-08-19,
+  read this before touching either file).** Every dated entry used to append
+  directly to `session.md`, which put every open PR's diff on the same shared
+  lines — one merge to `main` was enough to flip every other open PR from
+  MERGEABLE to CONFLICTING, on the doc, never the code. `session.md` grew to
+  6,962 lines / 475 KB this way, most of it dead weight on every session's
+  required first read. **The fix:** a session's write-up goes in its own file,
+  `session.d/YYYY-MM-DD_<slug>.md` — never as a new section inside `session.md`
+  itself. Two sessions creating two different files cannot conflict; there is no
+  shared line to fight over. `session.md` itself is now short on purpose: the
+  owner's NEXT-SESSION PROMPT, a small replaced-not-appended CURRENT STATE, and
+  pointers to `session.d/` (the full chronological log) and `CHANGELOG.md` (older,
+  hand-curated history). Read `session.md` §"Adding an entry" before your first
+  write — do not edit the body of `session.md` to record what you did.
+- **This file (`CLAUDE.md`) has the same append-tax on a smaller scale — 20 of the
+  last 36 merges to `main` touched it, almost always by inserting a new bullet
+  into an existing numbered section, which is exactly where two unrelated PRs
+  collide.** It was **not** split into multiple files: two harnesses
+  (`scripts/verifyCampaignRunHeartbeat.js` G4, and `docs/ALERTING.md`'s own
+  reader in the same file) assert on this file's content **by this exact path**,
+  and `CLAUDE.md` is a cross-referenced instruction manual read for correctness —
+  a merge strategy that can silently keep two disagreeing versions of the same
+  fact (see the union-merge note below) is the wrong trade here even more than
+  for a log. Instead: **keep new bullets short.** State the rule and the
+  money/correctness consequence in 1-5 lines with a citation
+  (`session.d/<file>.md` or `docs/PIPELINES.md §N`) for the full incident
+  write-up — do not paste the forensic narrative inline here. Several existing
+  bullets already do this (search "Full write-up:"); that is the pattern to
+  copy, not the multi-paragraph incident blocks next to it. This does not
+  eliminate CLAUDE.md merge conflicts (two edits to the *same* bullet still
+  collide, correctly), but it shrinks each PR's footprint in this file, which is
+  most of what makes two unrelated PRs collide here in the first place.
+- **Do not add a `.gitattributes` `merge=union` driver to `CLAUDE.md` or
+  `docs/ALERTING.md`, and think twice before adding one to any table-bearing
+  doc.** It was considered and rejected for both files, 2026-08-19. Union merge
+  auto-resolves two independent line *additions* at the same anchor — fine for a
+  bullet list — but it also auto-resolves two *edits to the same row* of a table
+  by silently keeping both, with no conflict and no human ever told. Both files
+  carry exactly that shape: `docs/ALERTING.md`'s "Gap table" and its LLM-error-code
+  table (the latter is parsed by `scripts/verifyLlmErrorCodes.js` F1/F2, which
+  finds the FIRST row matching a code — a silently duplicated, disagreeing row
+  would have the harness read the stale one and report green), and this file's
+  several status tables (§00, §2, §4a). A **new** row/bullet from two unrelated
+  PRs merges cleanly today without any driver, as long as they don't anchor on
+  the identical last line; it is only the same-row-edited-twice case a driver
+  would paper over, and that case needs a human, not a silent union.
+- `docs/PIPELINES.md` is organised by pipeline (§1-10), not chronology, so two
+  unrelated PRs usually land in different sections and merge cleanly already;
+  the same "cite, don't paste the forensic narrative" convention applies to it,
+  but it was not restructured.
