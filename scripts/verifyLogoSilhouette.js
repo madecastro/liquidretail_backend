@@ -115,6 +115,62 @@ async function cutOutLogo() {
   check('C1 light plate -> black ink', JSON.stringify(svc.monochromeInkFor(0.9)) === JSON.stringify({ r: 0, g: 0, b: 0 }));
   check('C2 dark plate -> white ink', JSON.stringify(svc.monochromeInkFor(0.1)) === JSON.stringify({ r: 255, g: 255, b: 255 }));
   check('C3 unknown luminance -> null (caller keeps the original asset)', svc.monochromeInkFor('x') === null);
+  check('C4 null luminance -> null, not the Number(null)===0 trap', svc.monochromeInkFor(null) === null);
+
+  // ── D. border-polarity sample reads the BORDER, not the whole image
+  // (found + fixed 2026-08-19, pre-existing) ─────────────────────────────
+  // MEASURED on sharp 0.33.5 (both a synthetic fixture and a real
+  // downloaded logo PNG): `.extract(rect).stats()` chained directly,
+  // without an intervening re-encode, silently returns stats for the
+  // WHOLE image, not the extracted region. monochromeLogoBuffer's
+  // "sample the outer border to learn the asset's own background
+  // polarity" step used exactly that pattern — so `bgIsLight` had always
+  // actually been "is the WHOLE ASSET light", not "is the BORDER light".
+  // Fixture: a 200x200 canvas that is DARK only in its top border strip
+  // (the region actually sampled) and WHITE everywhere else (so the
+  // whole-image mean is light while the border itself is dark) —
+  // deliberately the shape that makes the two readings disagree.
+  const borderDarkFixture = await sharp({
+    create: { width: 200, height: 200, channels: 3, background: { r: 250, g: 250, b: 250 } }
+  }).composite([{
+    input: await sharp({ create: { width: 200, height: 8, channels: 3, background: { r: 20, g: 20, b: 20 } } }).png().toBuffer(),
+    left: 0, top: 0
+  }]).png().toBuffer();
+
+  const wholeImageMean = (await sharp(borderDarkFixture).greyscale().stats()).channels[0].mean;
+  check('D1 [fixture check] the whole-image mean reads LIGHT despite a dark border (fixture actually exercises the gap)',
+    wholeImageMean / 255 > 0.5, `whole-image mean=${(wholeImageMean / 255).toFixed(2)}`);
+
+  const fromBorderDark = await svc.monochromeLogoBuffer(borderDarkFixture, inkBlack);
+  check('D2 monochromeLogoBuffer returns a buffer for the border-dark fixture', !!fromBorderDark);
+  if (fromBorderDark) {
+    const raw = await sharp(fromBorderDark).ensureAlpha().raw().toBuffer({ resolveWithObject: true });
+    const alphaAt = (x, y) => raw.data[(y * raw.info.width + x) * raw.info.channels + 3];
+    const borderAlpha = alphaAt(100, 3);   // inside the dark 8px top strip
+    const bodyAlpha = alphaAt(100, 150);   // inside the white body
+    // Correct (border-aware) reading: bgIsLight=false (border is dark) ->
+    // coverage is NOT inverted -> bright body pixels are high-alpha
+    // (opaque "ink"), the dark border strip is low-alpha (transparent).
+    // The broken (whole-image) reading would flip this exactly.
+    check('D3 [THE PRE-EXISTING DEFECT] the dark BORDER strip reads as transparent (bgIsLight correctly false — the border itself was sampled, not the light whole image)',
+      borderAlpha < 128, `border alpha=${borderAlpha} (>=128 would mean the whole-image bug is back)`);
+    check('D4 the light BODY reads as opaque ink (consistent with a correctly-false bgIsLight)',
+      bodyAlpha >= 128, `body alpha=${bodyAlpha}`);
+  }
+
+  // Revert-prove: reconstruct the exact pre-fix extract+stats border read
+  // and show it disagrees with the shipped raw-buffer read on this fixture.
+  async function brokenBorderIsLight(logoPng, w, h) {
+    const grey = sharp(logoPng).removeAlpha().greyscale();
+    const edge = Math.max(1, Math.round(Math.min(w, h) * 0.04));
+    const strip = await grey.clone().extract({ left: 0, top: 0, width: w, height: edge }).stats();
+    return (strip.channels[0].mean / 255) > 0.5;
+  }
+  const brokenReading = await brokenBorderIsLight(borderDarkFixture, 200, 200);
+  check('D5-revert-prove: the pre-fix extract+stats border read gets FOOLED by the whole-image mean (reads bgIsLight=true, wrong)',
+    brokenReading === true, `broken reading bgIsLight=${brokenReading}`);
+  check('D5-revert-prove: the shipped raw-buffer read does not (bodyAlpha/borderAlpha above are consistent with bgIsLight=false)',
+    fromBorderDark ? true : false); // presence check; D3/D4 above carry the actual assertion
 
   const total = passed + failures.length;
   if (failures.length) {

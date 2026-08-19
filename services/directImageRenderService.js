@@ -291,6 +291,248 @@ function safeBoxInDeliveredPx(s, dims) {
  * composite rather than placing it somewhere the model did not reserve.
  */
 /**
+ * Mean luminance (0..1, greyscale) of `refBuffer` inside `box` — a
+ * percentage rect {left,right,top,bottom} of the GENERATED frame, i.e.
+ * `computeSurface(surface).box`, the exact region the prompt tells the
+ * model text must live inside. Applied to the SEED reference photo (the
+ * only pixels that exist before the billable submit), not a whole-frame
+ * average — a whole-image average is exactly the wrong measurement here:
+ * this product's own seed is a bone/cream tee against a mid-grey wall, so
+ * a WHOLE-FRAME mean sits in the ambiguous middle while the actual text
+ * region (upper-left, mostly wall) reads clearly light. Returns null when
+ * the region cannot be read (missing/undersized reference, decode
+ * failure) — callers must then leave ink choice to the model's own
+ * judgement rather than assert a measurement that was never taken.
+ *
+ * APPROXIMATION, stated plainly: the seed photo and the model's generated
+ * frame are not always pixel-registered — under SCENE_PRESERVE they are
+ * (the photograph is the finished plate), but the "scene build" arm lets
+ * the model recompose. Even there this is the best pre-submission signal
+ * available; it is a measured reading of the actual product photo, not
+ * the "you decide" default it replaces.
+ */
+async function sampleSafeBoxLuminance(refBuffer, box) {
+  if (!refBuffer || !box) return null;
+  try {
+    const meta = await sharp(refBuffer).metadata();
+    const w = meta.width, h = meta.height;
+    if (!(w > 0 && h > 0)) return null;
+    const left = Math.max(0, Math.min(w - 1, Math.round((box.left / 100) * w)));
+    const right = Math.max(left + 1, Math.min(w, Math.round((box.right / 100) * w)));
+    const top = Math.max(0, Math.min(h - 1, Math.round((box.top / 100) * h)));
+    const bottom = Math.max(top + 1, Math.min(h, Math.round((box.bottom / 100) * h)));
+    // ⚠️ Deliberately NOT `.extract(region).stats()` chained in one pipeline.
+    // MEASURED on sharp 0.33.5: `.extract(rect).stats()` called without an
+    // intervening re-encode returns stats for the WHOLE image, silently
+    // ignoring the extract — reproduced on both a synthetic composite and a
+    // real downloaded PNG (a 40x40 corner of the real Vuori logo read back
+    // the same mean as the full 1108x179 file). Read the whole greyscale
+    // frame as raw bytes once and average the region in JS instead, which
+    // cannot hit this pipeline-ordering gap.
+    const { data, info } = await sharp(refBuffer).greyscale().raw()
+      .toBuffer({ resolveWithObject: true });
+    let sum = 0, count = 0;
+    for (let y = top; y < bottom; y++) {
+      for (let x = left; x < right; x++) {
+        sum += data[(y * info.width + x) * info.channels];
+        count++;
+      }
+    }
+    if (!count) return null;
+    return (sum / count) / 255;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * A measured, non-negotiable ink-polarity instruction for the model — the
+ * D1 fix. Static ad headlines otherwise carry NO contrast guidance at all
+ * (staticAdIntents.js's LATITUDE clause hands typography colour to "you
+ * decide" along with typeface and weight), and that is provably
+ * insufficient: the SAME headline text, same brand, same seed photo family,
+ * rendered white-on-pale-grey (illegible) on one format and dark-on-pale
+ * (correct) on another sibling format in the same run — the model guesses
+ * per independent generation call with nothing to anchor it. This mirrors
+ * the already-working pattern for the composited LOGO's ink
+ * (monochromeInkFor, immediately below) but must run BEFORE generation,
+ * against the seed photo, because headline text is typeset by the model
+ * itself rather than composited afterwards.
+ *
+ * Returns null when no measurement was taken (sampleSafeBoxLuminance
+ * failed) — the prompt then falls back to its pre-existing "you decide"
+ * wording rather than asserting an unmeasured claim.
+ */
+function textInkDirective(meanLum) {
+  // STRICT typeof, not `Number(meanLum)` first: `Number(null) === 0`,
+  // `Number('') === 0`, and `Number(undefined) === NaN` — so any coercion
+  // path lets a "no measurement taken" signal read as a false, CONFIDENT
+  // luminance-0.0 (pure black) claim, which is the worse failure mode for
+  // an instruction that opens "MEASURED, NOT A STYLE CHOICE". Same trap
+  // class as `Number('') === 0`, documented repo-wide (see
+  // remotion/lib/priceFormat.js). Only a genuine finite `number` primitive
+  // is accepted; every other type (including numeric strings) is treated
+  // as "not measured".
+  if (typeof meanLum !== 'number') return null;
+  const n = meanLum;
+  if (!Number.isFinite(n)) return null;
+  const backdropIsLight = n > 0.5;
+  const ink = backdropIsLight ? 'dark, near-black' : 'light, near-white';
+  const backdrop = backdropIsLight ? 'LIGHT' : 'DARK';
+  return `TEXT INK — MEASURED FROM THE REFERENCE PHOTO, NOT A STYLE CHOICE. The reference photograph's own safe-box region — the area this brief already told you the headline/subheadline/eyebrow copy must sit inside — reads as ${backdrop} (mean luminance ${n.toFixed(2)} of 1.0, sampled from that exact region of the supplied photo, not a whole-frame average). Render the headline, subheadline and eyebrow text in ${ink} ink so it reads clearly against that backdrop. This is a legibility measurement, not a design preference — do not choose the opposite polarity for stylistic reasons. If your own final composition places that text over a region whose actual lightness differs from this reading, prioritise contrast against what you actually painted there over this instruction.`;
+}
+
+/**
+ * D4 fix — CTA casing determinism. Measured live: the SAME derived CTA
+ * string ("Shop the tee", verified byte-identical in every LayoutInputArtifact
+ * for one Vuori run) rendered as three different casings across sibling
+ * ads ("Shop the tee" / "Shop The Tee" / "Shop the Tee") — the generic
+ * "SET EXACTLY THESE STRINGS, verbatim... spelling is critical" instruction
+ * evidently is not read as covering LETTER CASE specifically (title-casing
+ * a button label is a common enough stylistic default that the model
+ * reverts to it under ambiguity). This calls out casing by name, once, for
+ * the one role where it was observed to drift.
+ */
+function ctaCasingDirective(ctaText) {
+  const s = String(ctaText || '').trim();
+  if (!s) return null;
+  return `CTA BUTTON CASING — reproduce "${s}" with EXACTLY this capitalisation, character for character. Do not title-case it, do not capitalise every word, do not change the case of "the"/"a"/"and" or any other word. The casing shown here IS the brand's copy, not a placeholder to restyle.`;
+}
+
+/**
+ * D4 fix — CTA pill fill/ink determinism, mirroring
+ * services/titleSpecService.js buildBrandTokens' WCAG contrast pick
+ * (readableOn) in miniature. NOT imported from that module: it also
+ * resolves brand FONT FILES as part of building its token set, and this
+ * pipeline deliberately never resolves fonts for static ads (see
+ * conceptLook's header, a few lines up) — pulling in the whole token
+ * builder to borrow one colour formula would reopen that boundary. Only
+ * the colour cascade + contrast maths are duplicated.
+ *
+ * Cascade: brand.styleTheme.ctaBgColor (curated colour docs, canvas-engine
+ * vocabulary) -> brand.accentColor -> brand.primaryColor -> a fixed
+ * near-black fallback. Text ink picks whichever of pure black or pure
+ * white has the HIGHER contrast ratio against that fill — computing both
+ * and taking the winner, never a single luminance threshold (a mid-tone
+ * fill like #5B8C5A has luminance ~0.49; a `>0.55 ? dark : white` cutoff
+ * would choose white there at 1.93:1 contrast while black measures 9.3:1
+ * on the same fill — see titleSpecService.js's own note on this).
+ */
+function hexOrNull(v) {
+  const s = String(v || '').trim();
+  const m6 = /^#?([0-9a-fA-F]{6})$/.exec(s);
+  if (m6) return `#${m6[1].toUpperCase()}`;
+  const m3 = /^#?([0-9a-fA-F]{3})$/.exec(s);
+  if (m3) return `#${m3[1].split('').map((c) => c + c).join('').toUpperCase()}`;
+  return null;
+}
+function ctaRelLuminance(hex) {
+  const s = String(hex || '').replace(/^#/, '');
+  if (!/^[0-9a-fA-F]{6}$/.test(s)) return null;
+  const chan = (v) => {
+    const c = parseInt(v, 16) / 255;
+    return c <= 0.03928 ? c / 12.92 : Math.pow((c + 0.055) / 1.055, 2.4);
+  };
+  return 0.2126 * chan(s.slice(0, 2)) + 0.7152 * chan(s.slice(2, 4)) + 0.0722 * chan(s.slice(4, 6));
+}
+function ctaContrastRatio(l1, l2) {
+  const hi = Math.max(l1, l2), lo = Math.min(l1, l2);
+  return (hi + 0.05) / (lo + 0.05);
+}
+const CTA_INK_DARK = '#16181D';
+const CTA_INK_LIGHT = '#FFFFFF';
+const CTA_FALLBACK_BG = '#16181D';
+function deriveCtaColors(brand) {
+  const bg = hexOrNull(brand?.styleTheme?.ctaBgColor) || hexOrNull(brand?.styleTheme?.ctaBg)
+    || hexOrNull(brand?.accentColor) || hexOrNull(brand?.primaryColor) || CTA_FALLBACK_BG;
+  const bgLum = ctaRelLuminance(bg);
+  const explicitText = hexOrNull(brand?.styleTheme?.ctaTextColor) || hexOrNull(brand?.styleTheme?.ctaText);
+  const text = explicitText || (bgLum == null
+    ? CTA_INK_LIGHT
+    : (ctaContrastRatio(ctaRelLuminance(CTA_INK_DARK), bgLum) >= ctaContrastRatio(ctaRelLuminance(CTA_INK_LIGHT), bgLum)
+      ? CTA_INK_DARK : CTA_INK_LIGHT));
+  return { bg, text };
+}
+function ctaColorDirective(colors) {
+  if (!colors || !hexOrNull(colors.bg)) return null;
+  const labelDesc = colors.text === CTA_INK_LIGHT ? 'white' : 'near-black';
+  return `CTA BUTTON COLOUR — FIXED, NOT A STYLE CHOICE. Render the CTA button/pill fill as exactly ${colors.bg}, with ${labelDesc} (${colors.text}) label text. Use this exact fill colour for the CTA regardless of the surrounding scene's palette — it is the brand's own colour, not an art-direction pick for this composition.`;
+}
+
+// Minimal serif/sans classifier, duplicated by hand from
+// services/fontResolverService.js's SERIF_HINTS (same trade-off as
+// LOGO_SAFE_MARGIN_PCT duplicating remotion/lib/safeZones.js above): that
+// module resolves brand font FILES over the network for the VIDEO titling
+// engine and must not be required from here — "Brand fonts are no longer
+// resolved for static ads at all" is a deliberate boundary (see the note a
+// few lines above conceptLook's header). Only the tiny classification regex
+// is worth keeping in sync with it, not the module.
+const FONT_SERIF_HINTS = /serif|playfair|lora|cormorant|garamond|fraunces|caslon|bodoni|didot|georgia|times|libre|crimson|merriweather|spectral|eb garamond|prata|domine|slab|arvo|marcellus|italiana|cinzel/i;
+
+function humanizeFontFamily(slug) {
+  const s = String(slug || '').trim();
+  if (!s) return '';
+  return s.replace(/[-_]+/g, ' ').replace(/\s+/g, ' ').trim()
+    .replace(/\b\w/g, (c) => c.toUpperCase());
+}
+
+/**
+ * D1 fix — headline TYPEFACE determinism, one choice per BRAND, not per
+ * concept or surface.
+ *
+ * Static headlines otherwise carry ZERO typography guidance:
+ * staticAdIntents.js's LATITUDE clause hands typeface and weight to "you
+ * decide" on every single generation call, and each of a run's six
+ * surfaces is an INDEPENDENT gpt-image-2 submit with no shared state — the
+ * model cannot "remember" what a sibling surface chose. Measured live
+ * (run_1787119100250_eef4d871, Vuori tee): the SAME brand, SAME run, SAME
+ * rendered headline text rendered SERIF on four surfaces and SANS on two,
+ * plus three different headline-colour choices — a font-role identity that
+ * changes by aspect ratio, not by any creative reason. This mirrors the
+ * already-shipped fix for CTA colour/casing and headline ink: derive one
+ * deterministic answer from data that does not vary per call, then assert
+ * it identically into every prompt.
+ *
+ * BRAND-LEVEL is deliberate, not concept-level: `Brand.customFonts` /
+ * `websiteFontUsage.heading` describe the brand's own identity and cannot
+ * legitimately differ by which of a round's concepts a given surface
+ * happens to draw, so pinning at the brand keeps every surface of one
+ * product's run coherent regardless of concept spread. When the brand has
+ * an ingested font (brandFontIngestService — Vuori's own "aktiv-grotesk",
+ * mirrored on Cloudinary, 3 weights all HTTP 200 / valid wOF2) that family
+ * is named explicitly, classified serif/sans by the same heuristic
+ * `fontResolverService.fallbackFor` uses for the video path (so the two
+ * pipelines agree on Aktiv Grotesk's own classification even though they
+ * cannot share code — this only reads `family`, a plain string; it never
+ * fetches `customFonts[].url`/`sourceUrl`, so the "sourceUrl needs a
+ * Typekit Referer" trap that bites the FILE-fetching path cannot bite this
+ * one). With no ingested or detected font at all, every such brand still
+ * gets ONE consistent answer — sans-serif, the more common modern DTC ad
+ * convention — rather than each surface improvising its own.
+ */
+function typefaceDirectiveForBrand(brand) {
+  const heading = brand?.websiteFontUsage?.heading || null;
+  const fonts = Array.isArray(brand?.customFonts) ? brand.customFonts : [];
+  const ingested = (heading && fonts.find((f) => f?.family === heading)) || fonts[0] || null;
+  const family = ingested?.family || heading || null;
+
+  if (family) {
+    const readable = humanizeFontFamily(family);
+    const isSerif = FONT_SERIF_HINTS.test(family);
+    const styleWord = isSerif ? 'serif' : 'sans-serif';
+    const characterClause = isSerif
+      ? 'refined editorial serif proportions'
+      : 'clean grotesque/humanist proportions';
+    return `HEADLINE TYPEFACE — FIXED, NOT A STYLE CHOICE. This brand's own typeface is ${readable}, a ${styleWord}. Set the headline, subheadline and eyebrow copy in a ${styleWord} with ${characterClause}, in the spirit of ${readable}. Do not switch to the opposite family (serif vs sans) for stylistic reasons — every surface of this brand's campaign must render the SAME typeface family; only the composition should vary.`;
+  }
+  // No ingested or detected brand font — still pin ONE family so a run's
+  // independent per-surface generation calls cannot each improvise a
+  // different answer. The specific choice (sans) matters far less than
+  // that it is the SAME choice on every call.
+  return `HEADLINE TYPEFACE — FIXED, NOT A STYLE CHOICE. Set the headline, subheadline and eyebrow copy in a clean, modern sans-serif with grotesque/humanist proportions. Do not switch to a serif face for stylistic reasons — every surface of this brand's campaign must render the SAME typeface family; only the composition should vary.`;
+}
+
+/**
  * Which ink a composited logomark should use, given the mean luminance (0..1)
  * of the artwork directly behind it. Light plate → black mark, dark plate →
  * white mark. Pure black/white on purpose: owner asked for "clean and minimal",
@@ -300,7 +542,12 @@ function safeBoxInDeliveredPx(s, dims) {
  * Exported so scripts/verifyProofBeat.js can pin the threshold.
  */
 function monochromeInkFor(meanLum) {
-  const n = Number(meanLum);
+  // Strict typeof before any coercion: `Number(null) === 0` and
+  // `Number('') === 0` would otherwise read as a confident "pure black
+  // backdrop" instead of "no measurement" — see textInkDirective's header
+  // for the general form of this trap.
+  if (typeof meanLum !== 'number') return null;
+  const n = meanLum;
   if (!Number.isFinite(n)) return null;      // unknown → caller keeps the original asset
   return n > 0.5 ? { r: 0, g: 0, b: 0 } : { r: 255, g: 255, b: 255 };
 }
@@ -379,12 +626,24 @@ async function monochromeLogoBuffer(logoPng, ink) {
     coverage = await sharp(logoPng).ensureAlpha().extractChannel(3).raw().toBuffer();
   } else {
     // Sample the outer border to learn the asset's own background polarity.
+    // ⚠️ NOT `.extract(strip).stats()` chained directly — MEASURED on sharp
+    // 0.33.5, that returns the WHOLE image's stats, silently ignoring the
+    // extract (reproduced on a real downloaded logo PNG, not merely a
+    // synthetic fixture; see sampleSafeBoxLuminance's comment for the
+    // measurement). Read the raw greyscale buffer once and average the
+    // border strip's own rows in JS instead.
     const grey = sharp(logoPng).removeAlpha().greyscale();
     const edge = Math.max(1, Math.round(Math.min(w, h) * 0.04));
-    const strip = await grey.clone()
-      .extract({ left: 0, top: 0, width: w, height: edge })
-      .stats();
-    const bgIsLight = (strip.channels[0].mean / 255) > 0.5;
+    const { data: greyRaw, info: greyInfo } = await grey.clone().raw()
+      .toBuffer({ resolveWithObject: true });
+    let stripSum = 0, stripCount = 0;
+    for (let y = 0; y < edge; y++) {
+      for (let x = 0; x < w; x++) {
+        stripSum += greyRaw[(y * greyInfo.width + x) * greyInfo.channels];
+        stripCount++;
+      }
+    }
+    const bgIsLight = stripCount > 0 && (stripSum / stripCount) / 255 > 0.5;
     // bgIsLight → the mark is the DARK pixels, so invert to make them opaque.
     coverage = bgIsLight
       ? await grey.clone().negate().raw().toBuffer()
@@ -401,6 +660,224 @@ async function monochromeLogoBuffer(logoPng, ink) {
     .toBuffer();
 }
 
+/**
+ * Robust background-colour estimate for an opaque logo canvas: the
+ * component-wise MEDIAN of four corner patches' mean colour, not the single
+ * top-edge strip `monochromeLogoBuffer` samples.
+ *
+ * Exists because a single-edge sample breaks exactly when the artwork's own
+ * graphic starts flush against that edge — the measured Vuori asset's
+ * orange->blue gradient block begins at row 0, so a top-strip sample reads
+ * the MARK ITSELF as if it were the canvas. Four independent corners need
+ * three of four to be fooled the same way, not one.
+ */
+async function estimateOpaqueLogoBackground(logoPng, w, h) {
+  const edge = Math.max(1, Math.round(Math.min(w, h) * 0.04));
+  const corners = [
+    { left: 0, top: 0 },
+    { left: Math.max(0, w - edge), top: 0 },
+    { left: 0, top: Math.max(0, h - edge) },
+    { left: Math.max(0, w - edge), top: Math.max(0, h - edge) },
+  ];
+  // ⚠️ ONE raw decode, corners averaged in JS — deliberately not
+  // `.extract(corner).stats()` per corner. MEASURED on sharp 0.33.5:
+  // `.extract(rect).stats()` chained without an intervening re-encode
+  // silently returns stats for the WHOLE image, ignoring the extract
+  // (reproduced on a real downloaded PNG, not just a synthetic fixture —
+  // see sampleSafeBoxLuminance's comment for the measurement). That would
+  // have made every one of these four corners report the SAME whole-image
+  // mean, defeating the entire point of sampling four independent corners.
+  let raw, info;
+  try {
+    ({ data: raw, info } = await sharp(logoPng).removeAlpha().raw()
+      .toBuffer({ resolveWithObject: true }));
+  } catch {
+    return null;
+  }
+  const means = [];
+  for (const c of corners) {
+    const cw = Math.min(edge, w - c.left);
+    const ch = Math.min(edge, h - c.top);
+    if (cw <= 0 || ch <= 0) continue;
+    const sums = [0, 0, 0];
+    let count = 0;
+    for (let y = c.top; y < c.top + ch; y++) {
+      for (let x = c.left; x < c.left + cw; x++) {
+        const idx = (y * info.width + x) * info.channels;
+        sums[0] += raw[idx]; sums[1] += raw[idx + 1]; sums[2] += raw[idx + 2];
+        count++;
+      }
+    }
+    if (count > 0) means.push(sums.map((s) => s / count));
+  }
+  if (!means.length) return null;
+  const medianOf = (vals) => {
+    const s = [...vals].sort((a, b) => a - b);
+    return s[Math.floor(s.length / 2)];
+  };
+  return [0, 1, 2].map((ch) => medianOf(means.map((m) => m[ch])));
+}
+
+/**
+ * Binary "does this pixel belong to the mark" coverage mask (0 or 255 per
+ * pixel), from per-pixel RGB distance to the estimated background colour.
+ *
+ * Replaces greyscale LUMINANCE as a coverage proxy for this one purpose.
+ * Luminance-as-coverage is exactly wrong for artwork with real internal
+ * luminance variation — a colour gradient — because it renders a
+ * TRANSLUCENT BLEND with whatever the logo sits on instead of an opaque
+ * shape: measured on the delivered Vuori render, the orange->blue block came
+ * out as a grey gradient fading into the ad's own background, not a solid
+ * rectangle. A binary distance threshold has no such gradient artifact.
+ */
+async function coverageFromBackgroundDistance(logoPng, bg, w, h, { threshold = 32 } = {}) {
+  const raw = await sharp(logoPng).removeAlpha().raw().toBuffer();
+  const coverage = Buffer.alloc(w * h);
+  for (let i = 0; i < w * h; i++) {
+    const r = raw[i * 3], g = raw[i * 3 + 1], b = raw[i * 3 + 2];
+    const dr = r - bg[0], dg = g - bg[1], db = b - bg[2];
+    const dist = Math.sqrt(dr * dr + dg * dg + db * db);
+    coverage[i] = dist > threshold ? 255 : 0;
+  }
+  return coverage;
+}
+
+/**
+ * Is the artwork under `coverage` (the mark itself, not the canvas around
+ * it) genuinely multi-hue, or effectively monochrome ink?
+ *
+ * Mean per-pixel CHROMA (max channel - min channel, 0..255) over covered
+ * pixels only. A flat-colour wordmark — black, navy, any single brand tint —
+ * reads near zero regardless of how dark or light it is. A colour gradient
+ * (Vuori's orange fading to blue) reads high. Scored only over the mark's
+ * own pixels so the surrounding canvas colour cannot influence the verdict.
+ *
+ * Exported so scripts/verifyLogoColorPreservation.js calls this instead of a
+ * mirror of it.
+ */
+async function logoIsPolychrome(logoPng, coverage, w, h, { chromaThreshold = 24, minCoveredFrac = 0.01 } = {}) {
+  const raw = await sharp(logoPng).removeAlpha().raw().toBuffer();
+  let covered = 0;
+  let chromaSum = 0;
+  for (let i = 0; i < w * h; i++) {
+    if (!coverage[i]) continue;
+    covered++;
+    const r = raw[i * 3], g = raw[i * 3 + 1], b = raw[i * 3 + 2];
+    chromaSum += Math.max(r, g, b) - Math.min(r, g, b);
+  }
+  if (covered < w * h * minCoveredFrac) return false; // too little marked area to judge
+  return (chromaSum / covered) > chromaThreshold;
+}
+
+/**
+ * THE ENTRY POINT for logo compositing — decides colour treatment before
+ * `monochromeLogoBuffer` (unchanged, still used for the monochrome branch)
+ * ever runs.
+ *
+ * Owner's monochrome-ink rule (see monochromeLogoBuffer's header) was
+ * written against a wordmark-on-opaque-canvas defect (AllBirds) and is
+ * right for that shape: a single-ink mark should pick clean black-or-white
+ * ink off whatever it sits on. It is WRONG for a mark whose colour IS the
+ * brand asset — measured live: Vuori's real logomark (1108x179 RGBA) is an
+ * orange-to-blue gradient block plus a wordmark, and forcing it through
+ * monochrome ink discards the brand's only colour asset, "the first
+ * client's logo" per the owner review that found this.
+ *
+ * So: derive a coverage mask (alpha channel if it genuinely discriminates,
+ * else the corner-background-distance mask above — never raw greyscale
+ * luminance, for the translucent-gradient reason documented on
+ * coverageFromBackgroundDistance), then ask whether the MARKED pixels are
+ * polychrome. Polychrome → composite the artwork's OWN colours under that
+ * mask, ink untouched. Otherwise → fall through to the existing, unchanged
+ * monochromeLogoBuffer path (every other brand's simple wordmark keeps
+ * today's behaviour exactly).
+ *
+ * @returns {Promise<{buffer: Buffer, treatment: 'colour-preserved'|'monochrome'|'original', ink?: object}>}
+ */
+async function prepareLogoForComposite(logoPng, { behindLuminance } = {}) {
+  const meta = await sharp(logoPng).metadata();
+  const w = meta.width, h = meta.height;
+  if (!(w > 0 && h > 0)) return { buffer: logoPng, treatment: 'original' };
+
+  const alphaDiscriminates = meta.hasAlpha ? await alphaChannelDiscriminates(logoPng) : false;
+
+  let coverage = null;
+  try {
+    if (alphaDiscriminates) {
+      coverage = await sharp(logoPng).ensureAlpha().extractChannel(3).raw().toBuffer();
+    } else {
+      const bg = await estimateOpaqueLogoBackground(logoPng, w, h);
+      if (bg) coverage = await coverageFromBackgroundDistance(logoPng, bg, w, h);
+    }
+  } catch {
+    coverage = null; // fall through to the existing monochrome path below
+  }
+
+  if (coverage) {
+    let polychrome = false;
+    try {
+      polychrome = await logoIsPolychrome(logoPng, coverage, w, h);
+    } catch { polychrome = false; }
+    if (polychrome) {
+      const rgb = await sharp(logoPng).removeAlpha().raw().toBuffer();
+      const buffer = await sharp(rgb, { raw: { width: w, height: h, channels: 3 } })
+        .joinChannel(coverage, { raw: { width: w, height: h, channels: 1 } })
+        .png()
+        .toBuffer();
+      return { buffer, treatment: 'colour-preserved' };
+    }
+  }
+
+  const ink = monochromeInkFor(behindLuminance);
+  if (!ink) return { buffer: logoPng, treatment: 'original' };
+  const mono = await monochromeLogoBuffer(logoPng, ink);
+  return mono ? { buffer: mono, treatment: 'monochrome', ink } : { buffer: logoPng, treatment: 'original' };
+}
+
+/**
+ * The exact string, if any, that `builtText` (an intent's post-density-budget
+ * [role, string] pairs — `staticAdIntents.buildPrompt(...).text`) asked the
+ * model to typeset for `role`. Returns null when the role was never in the
+ * prompt at all (a role this intent doesn't define, or one the density
+ * budget sacrificed) — the ONLY correct reading for a copy snapshot, because
+ * a role absent from the prompt was never drawn. Exported so
+ * scripts/verifyCopySnapshot.js calls this instead of a mirror of it.
+ */
+function renderedTextForRole(builtText, role) {
+  const hit = (Array.isArray(builtText) ? builtText : []).find(([r]) => r === role);
+  return hit ? hit[1] : null;
+}
+
+/**
+ * Logo-only safe-margin FLOOR, mirroring remotion/lib/safeZones.js's
+ * SAFE_ZONES table (stories / feed / square / landscape entries) — that
+ * file is an ES module inside the video titling engine, this is the
+ * CommonJS static-image path, and the two do not share a module graph, so
+ * the fractions are duplicated by hand rather than imported. Keep both in
+ * sync if either changes.
+ *
+ * WHY A SEPARATE TABLE FROM computeSurface's text box: that box is sized
+ * for where the MODEL may typeset copy, tuned per surface for its own
+ * reasons (PMax's per-axis crop margin, Meta's short-side margin — see
+ * staticAdIntents.js). It is not the platform's own safe-area guarantee.
+ * Measured live on meta_stories_9_16: the text box's right edge lands at
+ * ~94% of the generated frame (≈1015px of 1080 delivered) — inside the
+ * canvas, but outside the platform's own 7.5% (≈999px) safe margin, and on
+ * a wider logo asset than measured here the composited mark can reach the
+ * delivered edge outright. This table is applied as a FLOOR intersected
+ * with the text box below — it can only tighten the logo's placement box,
+ * never loosen it past what the text box already promised the model.
+ */
+const LOGO_SAFE_MARGIN_PCT = {
+  meta_stories_9_16:     { top: 0.14, bottom: 0.14, left: 0.075, right: 0.075 }, // safeZones.stories
+  meta_feed_1_1:         { top: 0.06, bottom: 0.06, left: 0.065, right: 0.06 },  // safeZones.feed
+  meta_feed_4_5:         { top: 0.06, bottom: 0.06, left: 0.065, right: 0.06 },  // safeZones.feed
+  pmax_landscape_1_91_1: { top: 0.10, bottom: 0.10, left: 0.075, right: 0.075 }, // safeZones.landscape
+  pmax_square_1_1:       { top: 0.06, bottom: 0.06, left: 0.065, right: 0.06 },  // safeZones.square
+  pmax_portrait_4_5:     { top: 0.06, bottom: 0.06, left: 0.065, right: 0.06 },  // safeZones.feed (4:5 shares feed's padding)
+  pmax_16_9:             { top: 0.10, bottom: 0.10, left: 0.075, right: 0.075 }  // safeZones.landscape
+};
+
 function logoPlacementFor({ surface, dims, logoW, logoH }) {
   const box = safeBoxInDeliveredPx(surface, dims);
   // Clamp the BOX into the delivered frame before placing anything in it, rather
@@ -408,10 +885,20 @@ function logoPlacementFor({ surface, dims, logoW, logoH }) {
   // back across the very edge the box exists to enforce — and the percentage
   // round-trip does put an edge a pixel outside on 4:5 (top computes to -1), so
   // this is not hypothetical arithmetic.
-  const left = Math.max(0, box.left);
-  const right = Math.min(dims.width, box.right);
-  const top = Math.max(0, box.top);
-  const bottom = Math.min(dims.height, box.bottom);
+  let left = Math.max(0, box.left);
+  let right = Math.min(dims.width, box.right);
+  let top = Math.max(0, box.top);
+  let bottom = Math.min(dims.height, box.bottom);
+  // Bind the platform safe-area floor — see LOGO_SAFE_MARGIN_PCT above.
+  // Math.max/min against the box already computed: whichever margin is
+  // TIGHTER for a given edge wins.
+  const floor = LOGO_SAFE_MARGIN_PCT[surface?.key];
+  if (floor && dims?.width > 0 && dims?.height > 0) {
+    left = Math.max(left, Math.round(floor.left * dims.width));
+    right = Math.min(right, dims.width - Math.round(floor.right * dims.width));
+    top = Math.max(top, Math.round(floor.top * dims.height));
+    bottom = Math.min(bottom, dims.height - Math.round(floor.bottom * dims.height));
+  }
   if (!(logoW > 0 && logoH > 0)) return null;
   if (right - left < logoW || bottom - top < logoH) return null;
   // Bottom-right of the clamped box. Inside it by construction, so there is no
@@ -1341,33 +1828,52 @@ async function finishPlate({ rawFrame, built, dims, genSize, surface, adId, logo
       });
       if (place) {
         // Monochrome the mark against whatever the model actually rendered in
-        // that corner, so it never ships as a white block (owner, 2026-08-03).
-        // Any failure falls back to the original asset — a correctly-placed
-        // logo with an ugly backing beats no logo at all.
+        // that corner, so it never ships as a white block (owner, 2026-08-03)
+        // — UNLESS the mark's own artwork is genuinely polychrome (a colour
+        // gradient, a multi-colour graphic), in which case forcing black-or-
+        // white ink discards the brand's defining colour asset instead of
+        // fixing a legibility problem. prepareLogoForComposite makes that
+        // call; monochromeLogoBuffer (called from inside it) is unchanged for
+        // every simple-wordmark brand. Any failure falls back to the original
+        // asset — a correctly-placed logo with an ugly backing beats no logo
+        // at all.
         let toPlace = logoPng;
         try {
-          const region = await sharp(rendered)
-            .extract({
-              left: Math.max(0, Math.min(place.left, dims.width - 1)),
-              top: Math.max(0, Math.min(place.top, dims.height - 1)),
-              width: Math.max(1, Math.min(lm.width, dims.width - place.left)),
-              height: Math.max(1, Math.min(lm.height, dims.height - place.top)),
-            })
-            .greyscale()
-            .stats();
-          const ink = monochromeInkFor(region.channels[0].mean / 255);
-          if (ink) {
-            const mono = await monochromeLogoBuffer(logoPng, ink);
-            if (mono) {
-              toPlace = mono;
-              console.log(
-                `   🖼️  direct-image: logomark inked ${ink.r ? 'white' : 'black'} ` +
-                `(behind lum=${(region.channels[0].mean / 255).toFixed(2)})`
-              );
+          // ⚠️ [FOUND WHILE FIXING D1/D3, PRE-EXISTING BUG — likely affects
+          // every brand's logo ink, not only Vuori's] NOT
+          // `.extract(region).stats()` chained directly. MEASURED on sharp
+          // 0.33.5: that pattern silently returns stats for the WHOLE
+          // image, ignoring the extract (reproduced on a real logo PNG, not
+          // just a synthetic fixture). So "the luminance behind the logo"
+          // has actually always been "the mean luminance of the entire
+          // rendered ad" — which happens to correlate with the true corner
+          // luminance often enough to look plausible, but is not what this
+          // code has ever claimed to measure. Read the region via a raw
+          // decode instead, which cannot hit this pipeline-ordering gap.
+          const rx = Math.max(0, Math.min(place.left, dims.width - 1));
+          const ry = Math.max(0, Math.min(place.top, dims.height - 1));
+          const rw = Math.max(1, Math.min(lm.width, dims.width - place.left));
+          const rh = Math.max(1, Math.min(lm.height, dims.height - place.top));
+          const { data: renderedGrey, info: renderedInfo } = await sharp(rendered)
+            .greyscale().raw().toBuffer({ resolveWithObject: true });
+          let regionSum = 0, regionCount = 0;
+          for (let y = ry; y < ry + rh; y++) {
+            for (let x = rx; x < rx + rw; x++) {
+              regionSum += renderedGrey[(y * renderedInfo.width + x) * renderedInfo.channels];
+              regionCount++;
             }
           }
+          const behindLuminance = regionCount > 0 ? (regionSum / regionCount) / 255 : null;
+          const prepared = await prepareLogoForComposite(logoPng, { behindLuminance });
+          if (prepared && prepared.buffer) {
+            toPlace = prepared.buffer;
+            console.log(
+              `   🖼️  direct-image: logomark ${prepared.treatment}` +
+              `${prepared.treatment === 'monochrome' ? ` (${prepared.ink?.r ? 'white' : 'black'}, behind lum=${behindLuminance.toFixed(2)})` : ''}`
+            );
+          }
         } catch (err) {
-          console.warn(`   ⚠️  direct-image: logo monochrome skipped (${err.message}) — using original asset`);
+          console.warn(`   ⚠️  direct-image: logo colour/monochrome resolution skipped (${err.message}) — using original asset`);
         }
         layers.push({ input: toPlace, top: place.top, left: place.left });
       } else {
@@ -1691,6 +2197,53 @@ async function renderDirectImage(callArgs = {}) {
     prompt = overrideText;
   } else if (built.prompt) {
     prompt = built.prompt;
+    // D1 CONTRAST FIX — append a MEASURED ink directive, never asserted
+    // without a real sample. See textInkDirective's header: static
+    // headlines otherwise carry no contrast guidance at all, and the same
+    // headline over the same brand's seed photo family measurably rendered
+    // legible on some format siblings and illegible (white-on-pale-grey)
+    // on others in one run. Sampled from refs[0] — the primary reference
+    // photo, the only pixels that exist pre-submission — inside this
+    // surface's own safe box, not a whole-frame average (see
+    // sampleSafeBoxLuminance's header for why a whole-frame mean is the
+    // wrong measurement for a light-garment-on-mid-tone-wall seed).
+    // Skipped silently (no directive appended) when no reference is
+    // available to sample or the sample cannot be read — never asserts an
+    // unmeasured claim; the prompt then falls back to buildPrompt's
+    // pre-existing "you decide" wording exactly as before this fix.
+    try {
+      const backdropLum = await sampleSafeBoxLuminance(refs[0], built.surface?.box);
+      const inkDirective = textInkDirective(backdropLum);
+      if (inkDirective) prompt = `${prompt}\n\n${inkDirective}`;
+    } catch { /* measurement is a best-effort addition, never a submit blocker */ }
+    // TYPEFACE FIX — headline typeface determinism (font-role selection was
+    // format-dependent: same brand/run/headline rendered serif on some
+    // surfaces and sans on others, with no shared state between the six
+    // independent per-surface submits to keep them agreeing). See
+    // typefaceDirectiveForBrand's header. Brand-level, so it does not need
+    // (and must not use) any per-surface or per-concept input — computed
+    // fresh on every call from the same brand doc, so it is identical every
+    // time without needing to persist or share state across the six calls.
+    {
+      const typefaceLine = typefaceDirectiveForBrand(resolvedBrand);
+      if (typefaceLine) prompt = `${prompt}\n\n${typefaceLine}`;
+    }
+    // D4 FIX — CTA determinism, casing + fill colour. Only when this
+    // surface/intent actually draws a CTA (built.text carries the role) —
+    // appending a "render the CTA fill as X" instruction on a surface that
+    // was just told to draw NO CTA at all (Stories, most PMax surfaces —
+    // see resolveDrawCta in staticAdIntents.js) would contradict that
+    // absence instruction instead of reinforcing it.
+    {
+      const ctaHit = built.text.find(([role]) => role === 'CTA BUTTON');
+      if (ctaHit) {
+        const ctaCasing = ctaCasingDirective(ctaHit[1]);
+        if (ctaCasing) prompt = `${prompt}\n\n${ctaCasing}`;
+        const ctaColors = deriveCtaColors(resolvedBrand);
+        const ctaColor = ctaColorDirective(ctaColors);
+        if (ctaColor) prompt = `${prompt}\n\n${ctaColor}`;
+      }
+    }
     // Refinement-note path: append, do not replace. Matches the HTML path's
     // operatorPrompt threading without a second submit.
     const note = String(operatorPrompt || '').trim();
@@ -1796,6 +2349,33 @@ async function renderDirectImage(callArgs = {}) {
       droppedRoles: built.dropped,
       generateSize: genSize,
       logoComposited: plate.logoComposited
+    },
+    // TRUTHFUL COPY SNAPSHOT — what this specific render actually asked the
+    // model to typeset, read back from built.text (the post-density-budget
+    // [role, string] list), never from the pre-render LayoutInputArtifact /
+    // Director marketing copy. Those are DIFFERENT stages of the pipeline —
+    // see persistStage/extractCopySnapshot in renderService.js, which used to
+    // snapshot only the earlier stage. Measured live: a Vuori tee ad stored
+    // copy.headline "Lived-in comfort from day one." while the delivered PNG
+    // showed "220 GSM organic cotton." (a copyDerivationService candidate
+    // resolved onto the concept AFTER the LayoutInputArtifact was cached).
+    // Role names come from the intent's own text() builders — 'BRAND LINE'
+    // is product_first_lifestyle's (and therefore ai_editorial's, its
+    // default intent) headline-shaped slot; other intents (social_proof_led,
+    // objection_resolved) carry no headline role at all, so headline is
+    // correctly null there rather than a fabricated line. Quote marks the
+    // prompt wraps CUSTOMER QUOTE in are stripped so the snapshot matches the
+    // rendered words, not the prompt's punctuation. A role absent from
+    // built.text (sacrificed by the density budget, or never drawn — e.g.
+    // CTA on Stories/PMax surfaces that suppress it) snapshots as null:
+    // absent-in-the-pixels must not become a phantom string in the list view.
+    renderedCopy: {
+      headline: renderedTextForRole(built.text, 'BRAND LINE'),
+      cta_text: renderedTextForRole(built.text, 'CTA BUTTON'),
+      quote: (() => {
+        const q = renderedTextForRole(built.text, 'CUSTOMER QUOTE');
+        return q ? q.replace(/^"|"$/g, '') : null;
+      })()
     },
     visionQc: null
   };
@@ -1994,9 +2574,23 @@ module.exports = {
   safeBoxInDeliveredPx,
   extractFor,
   logoPlacementFor,
+  LOGO_SAFE_MARGIN_PCT,
+  sampleSafeBoxLuminance,
+  textInkDirective,
+  ctaCasingDirective,
+  deriveCtaColors,
+  ctaColorDirective,
+  typefaceDirectiveForBrand,
+  humanizeFontFamily,
+  FONT_SERIF_HINTS,
   monochromeInkFor,
   monochromeLogoBuffer,
   alphaChannelDiscriminates,
+  estimateOpaqueLogoBackground,
+  coverageFromBackgroundDistance,
+  logoIsPolychrome,
+  prepareLogoForComposite,
+  renderedTextForRole,
   intentForTemplate,
   buildIntentData,
   describeProductForPrompt,

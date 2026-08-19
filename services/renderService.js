@@ -1151,7 +1151,7 @@ async function uploadStage(renderOutput, ctx) {
 }
 
 async function persistStage({ req, input, layoutInputArtifactId, renderOutput, upload, videoComposite, sourceFileType = null, stagesMs = null }) {
-  const copy = extractCopySnapshot(input);
+  const copy = extractCopySnapshot(input, renderOutput?.renderedCopy || null);
   const isVideo = !!videoComposite;
   // Update the existing queued Ad doc (status='rendering' was stamped
   // when the run loop selected it). Backfill all the render-output
@@ -1438,15 +1438,29 @@ async function composeVideoOutput({
 
 // ── Helpers ──────────────────────────────────────────────────────────
 
-function extractCopySnapshot(input) {
+// `rendered` is directImageRenderService's renderOutput.renderedCopy — the
+// TRUTHFUL read-back of what built.text actually asked the model to
+// typeset for THIS render, keyed by the intent's own role names. Undefined
+// on the legacy HTML/spec render path (no such concept there), so that path
+// is byte-identical to before. Present-but-null fields (a role the density
+// budget sacrificed, or one a surface never draws — e.g. CTA on Stories)
+// must win over `input` too: falling back to the cached LayoutInputArtifact
+// value there would print copy the ad never actually rendered, the exact
+// defect this function exists to close. Verified live: Ad.copy.headline
+// stored "Lived-in comfort from day one." (LayoutInputArtifact-cached
+// Director copy) while the delivered PNG typeset "220 GSM organic cotton."
+// (a later copyDerivationService-resolved concept string) — two different
+// pipeline stages, and the snapshot was reading the wrong one.
+function extractCopySnapshot(input, rendered = null) {
   const price = input?.product?.price;
   const priceStr = typeof price === 'string' ? price
                 : typeof price === 'number'   ? `$${price.toFixed(2)}`
                 : (price?.display || '');
+  const useRendered = rendered && typeof rendered === 'object';
   return {
-    headline:     input?.copy?.headline                    || '',
-    cta_text:     input?.cta?.text                         || '',
-    quote:        input?.social_proof?.primary_quote?.text || '',
+    headline:     useRendered ? (rendered.headline || '') : (input?.copy?.headline                    || ''),
+    cta_text:     useRendered ? (rendered.cta_text  || '') : (input?.cta?.text                         || ''),
+    quote:        useRendered ? (rendered.quote     || '') : (input?.social_proof?.primary_quote?.text || ''),
     productName:  input?.product?.name                     || '',
     productPrice: priceStr
   };

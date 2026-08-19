@@ -18,6 +18,11 @@
  *   G4  the composited logo lands inside the content rect, clear of the band
  *       the host platform covers with its own UI.
  *       (Was: a flat top = height - 100, 150px inside Stories' 250px reserve.)
+ *   G4c the composited logo also clears the PLATFORM's own safe-margin floor
+ *       (LOGO_SAFE_MARGIN_PCT, mirrors remotion/lib/safeZones.js), not just
+ *       the looser text safe box G4 checks. (Was: a Vuori meta_stories_9_16
+ *       logo landed at x=1011-1015 of 1080 — inside the text box, past the
+ *       platform's 7.5% margin at x=999.)
  *
  * Run: node scripts/verifyStaticGeometry.js
  */
@@ -157,6 +162,79 @@ for (const key of SURFACES) {
       `placed x${p.left}-${p.left + p.width} y${p.top}-${p.top + p.height}, ` +
       `frame ${dims.width}x${dims.height}, box x${sb.left}-${sb.right} y${sb.top}-${sb.bottom}`);
   }
+}
+
+// ── G4c: the logo must clamp to the PLATFORM safe margin, not just the
+// text safe box (2026-08-19) ─────────────────────────────────────────────
+// [THE DEFECT] Measured live on a real meta_stories_9_16 render (Vuori):
+// the composited logomark's right edge landed at x=1011-1015 of a 1080px
+// canvas — inside the delivered FRAME and inside the text safe BOX G4
+// above checks (box right edge ≈94% of the generated frame → ~1015px
+// delivered), but past the platform's own 7.5% right margin (x=999), and
+// close enough to the edge that a differently-sized logo asset can clip
+// the canvas outright. G4's "inside sb" check cannot see this — sb IS the
+// looser text box. This group checks the STRICTER LOGO_SAFE_MARGIN_PCT
+// floor directly (mirrors remotion/lib/safeZones.js's per-surface
+// fractions — see the constant's own comment in directImageRenderService.js).
+for (const key of SURFACES) {
+  const s = intents.computeSurface(key);
+  const dims = direct.deliveryGeometryFor(s);
+  const floor = direct.LOGO_SAFE_MARGIN_PCT[key];
+  check(`G4c ${key} has a declared platform safe-margin floor`, !!floor, `no entry for ${key}`);
+  if (!floor) continue;
+  const production = Math.round(0.16 * Math.min(dims.width, dims.height));
+  const place = direct.logoPlacementFor({
+    surface: s, dims, logoW: production, logoH: Math.round(production * 0.35)
+  });
+  check(`G4c ${key} production-size logo fits inside the platform floor`, !!place);
+  if (!place) continue;
+  const minLeft = Math.round(floor.left * dims.width);
+  const maxRight = dims.width - Math.round(floor.right * dims.width);
+  const minTop = Math.round(floor.top * dims.height);
+  const maxBottom = dims.height - Math.round(floor.bottom * dims.height);
+  check(`G4c ${key} logo right edge (x=${place.left + place.width}) clears the platform margin (x<=${maxRight})`,
+    place.left + place.width <= maxRight);
+  check(`G4c ${key} logo left edge (x=${place.left}) clears the platform margin (x>=${minLeft})`,
+    place.left >= minLeft);
+  check(`G4c ${key} logo top/bottom clear the platform margin`,
+    place.top >= minTop && place.top + place.height <= maxBottom,
+    `logo y${place.top}-${place.top + place.height} vs floor y${minTop}-${maxBottom}`);
+}
+
+// Revert-prove: reconstruct the EXACT pre-fix logoPlacementFor (text safe
+// box only, no platform floor — byte-for-byte the pre-2026-08-19 function
+// body) and show its Stories production-size placement overshoots the
+// platform margin; then show the SHIPPED function does not.
+{
+  const key = 'meta_stories_9_16';
+  const s = intents.computeSurface(key);
+  const dims = direct.deliveryGeometryFor(s);
+  const logoW = Math.round(0.16 * Math.min(dims.width, dims.height));
+  const logoH = Math.round(logoW * 0.35);
+
+  function preFixLogoPlacementFor({ surface, dims: d, logoW: lw, logoH: lh }) {
+    const box = direct.safeBoxInDeliveredPx(surface, d);
+    const left = Math.max(0, box.left);
+    const right = Math.min(d.width, box.right);
+    const top = Math.max(0, box.top);
+    const bottom = Math.min(d.height, box.bottom);
+    if (!(lw > 0 && lh > 0)) return null;
+    if (right - left < lw || bottom - top < lh) return null;
+    return { top: bottom - lh, left: right - lw, width: lw, height: lh };
+  }
+
+  const floor = direct.LOGO_SAFE_MARGIN_PCT[key];
+  const maxRight = dims.width - Math.round(floor.right * dims.width);
+  const preFix = preFixLogoPlacementFor({ surface: s, dims, logoW, logoH });
+  check('G4c-revert-prove: the pre-fix placement DOES overshoot the platform margin',
+    !!preFix && preFix.left + preFix.width > maxRight,
+    `pre-fix right=${preFix && preFix.left + preFix.width}, platform floor max=${maxRight} — ` +
+    `if this is false the revert-proof is not exercising a real gap`);
+
+  const shipped = direct.logoPlacementFor({ surface: s, dims, logoW, logoH });
+  check('G4c-revert-prove: the SHIPPED logoPlacementFor clears the platform margin the pre-fix placement misses',
+    !!shipped && shipped.left + shipped.width <= maxRight,
+    `shipped right=${shipped && shipped.left + shipped.width}, platform floor max=${maxRight}`);
 }
 
 // ── G2: no silent square fallback ───────────────────────────────────────

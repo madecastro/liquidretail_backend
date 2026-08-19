@@ -340,7 +340,18 @@ function geometryBlock(s) {
   // which contradicted the absence list on any surface that strips it (PMax
   // non-conversion today; Stories historically) — the same empty-slot defect
   // that produced a fabricated quote in v1.
-  lines.push(`EVERY element you render other than the photograph itself must sit inside the box from ${s.box.left}% to ${s.box.right}% of width and ${s.box.top}% to ${s.box.bottom}% of height. The photograph should still fill the whole frame edge to edge.`);
+  //
+  // "Scrim or panel" named explicitly (2026-08-19) — measured live on a
+  // pmax_portrait_4_5 render: a translucent legibility scrim behind the
+  // headline bled flush off the LEFT edge (hard cut at x=0, no inset),
+  // reading as a rendering overflow rather than a design choice. "EVERY
+  // element" was already meant to cover it (the LATITUDE clause elsewhere
+  // explicitly permits "a soft scrim or panel behind type" as chrome), but
+  // nothing here said a scrim's own edges are subject to the same box —
+  // the model evidently treats a decorative backdrop panel as exempt from
+  // an instruction that reads, on a first pass, like it is about literal
+  // text/logo/CTA elements. Naming it removes that reading.
+  lines.push(`EVERY element you render other than the photograph itself — text, CTA button, the logo's reserved corner, and any soft scrim or panel placed behind type for legibility — must sit inside the box from ${s.box.left}% to ${s.box.right}% of width and ${s.box.top}% to ${s.box.bottom}% of height, with its OWN edges fully inside that box. A scrim or panel's edge must never touch or bleed past the canvas boundary, even where it fades or is partially transparent — inset it from the edge like every other element. The photograph should still fill the whole frame edge to edge.`);
   return lines.join(' ');
 }
 

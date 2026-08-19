@@ -837,11 +837,18 @@ async function assembleSignals({ brandId, productId, campaignKind, seededUnivers
   const isProductScoped = !!product;
   const ratingValue    = productRatingValue ?? (isProductScoped ? null : brandRatingValue);
   const ratingCount    = productRatingCount ?? (isProductScoped ? null : brandRatingCount);
-  // QUOTE_PROVENANCE_STRICT is media-driven only. Product-attached keeps
-  // the brand pool (identity) so last-resort / proof_options brand
-  // quotes stay. Media-driven noun-checks against THIS seed — not the
-  // brand PMA union of 10, which would let a jacket anywhere in those
-  // rows unblock every jacket quote. Flag-off is an identity.
+  // QUOTE_PROVENANCE_STRICT noun-checks BOTH product-attached and
+  // media-driven calls (reversed 2026-08-19 — quoteProvenance.js header
+  // has the full story: a product-attached identity bypass is what let a
+  // bomber-jacket brand quote survive onto a Vuori tee ad). Product-
+  // attached still needs no per-seed media load here: `productTitle`
+  // below already carries the product's own labels into the allowed set,
+  // and a generic (no-garment-noun) brand quote passes regardless. Only
+  // the media-driven branch loads seed media, and only because THAT
+  // branch has no CatalogProduct title to fall back on — noun-check
+  // against THIS seed's own detected labels, not the brand PMA union of
+  // 10, which would let a jacket anywhere in those rows unblock every
+  // jacket quote. Flag-off is an identity on every branch.
   let quoteScopeMedia = [];
   if (!isProductScoped && quoteProvenanceStrictEnabled()) {
     const seedIds = (Array.isArray(seededUniverse) ? seededUniverse : [])
