@@ -95,13 +95,45 @@ function nextCandidateIds(product, { excludeMediaIds = [], limit } = {}) {
   const seen = new Set(excludeMediaIds.filter(Boolean).map(String));
   const out = [];
   for (const id of orderedCatalogMediaIds(product)) {
+    // Checked BEFORE pushing, not after: a post-push check let `limit: 0`
+    // through with one candidate anyway (push, THEN see length 1 >= 0 and
+    // stop) — `cap: 0` must mean zero, not "at least one no matter what".
+    if (out.length >= cap) break;
     if (seen.has(id)) continue;
     out.push(id);
     seen.add(id);
-    if (out.length >= cap) break;
   }
   return out;
 }
+
+/**
+ * Pure. Whether a render call is eligible for moderation seed fallback at
+ * all — true only when there is AT MOST ONE reference in play, never a
+ * genuine multi-image stack (2+), which is a deliberate, ordered pick
+ * (operator or Director) this feature must never silently rewrite.
+ *
+ * `orderedIds.length === 1` covers the single most common live shape and is
+ * NOT an edge case: renderService.js forwards Ad.mediaIds whenever
+ * Ad.referenceMediaIds is empty, and every concept-driven static mint writes
+ * exactly one id into Ad.mediaIds (DIRECTOR_UNIVERSE_TOP_N=1) — so the
+ * concept-driven static path, the exact path the 2026-08-19 incident
+ * happened on, ALWAYS arrives here with length 1, never 0. A prior version
+ * of this check was `!orderedIds.length` (true only for length 0), which
+ * made the whole fallback mechanism dead code on that path — confirmed
+ * against the real incident's own Ad documents (mediaIds.length===1,
+ * referenceMediaIds.length===0 on the Ad, which renderService.js turns into
+ * a 1-element array here) and against an independent adversarial review
+ * that traced the same gap. `<= 1` treats "the Director's single pick,
+ * surfaced through that plumbing" the same as "no explicit pick at all" —
+ * both resolve to the exact same single seed either way — while still
+ * excluding any real 2+ stack.
+ *
+ * @param {Array} orderedIds  the caller's `referenceMediaIds`, as strings
+ */
+function isSingleSeedEligible(orderedIds) {
+  return (Array.isArray(orderedIds) ? orderedIds.length : 0) <= 1;
+}
+
 
 /**
  * Read-only. What has this run already learned about seed fallback for this
@@ -180,6 +212,7 @@ module.exports = {
   maxFallbackCandidates,
   orderedCatalogMediaIds,
   nextCandidateIds,
+  isSingleSeedEligible,
   readRunSeedState,
   recordSeedOutcome
 };

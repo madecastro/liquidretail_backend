@@ -18,9 +18,27 @@
 //   D. services/renderService.js — failed() threads a classified error's
 //      code/retryable through instead of the old "retryable unless stage is
 //      'validate'" guess, which was a lie for a give-up (moderation) failure.
+//   E. moderationSeedFallback.isSingleSeedEligible — the exact gate that was
+//      WRONG in the first version of this fix (`!orderedIds.length`, which
+//      is only true for a length-0 array — but the concept-driven static
+//      path, the path the incident happened on, ALWAYS forwards a
+//      length-1 array, so the fallback never engaged on the one path it
+//      exists for). Caught by an independent adversarial review, not by
+//      this suite in its original form — section F closes that gap.
+//   F. services/directImageRenderService.js's
+//      submitEditImageWithSeedFallback — the actual money-path orchestration
+//      function, called for real (atlasImageService + Media stubbed through
+//      require.cache, a real tiny PNG buffer for the reference fetch/
+//      normalise step) instead of only unit-testing the helpers around it.
+//      The SAME review found this function was exported "for behavioural
+//      pinning" yet never once invoked by this suite — sections A-D could
+//      not have caught the section-E bug, or the candidate-cap/blocked-
+//      primary bugs fixed alongside it, because none of them called the
+//      loop that actually decides what to submit.
 //
-// Fully offline: no network, no live DB, no keys. Mongoose model calls are
-// stubbed through require.cache before the modules under test load them.
+// Fully offline: no network, no live DB, no keys. Mongoose model calls and
+// the Atlas image submit are stubbed through require.cache / axios patching
+// before the modules under test load them.
 
 const assert = require('assert');
 const path = require('path');
@@ -119,6 +137,15 @@ check('B3 nextCandidateIds: excludes given ids and respects the cap, preserving 
 check('B4 nextCandidateIds: an empty candidate pool (everything excluded) returns []', () => {
   const product = { imageMediaId: 'hero', additionalImageMediaIds: ['alt1'] };
   const out = seedFallback.nextCandidateIds(product, { excludeMediaIds: ['hero', 'alt1'], limit: 5 });
+  assert.deepStrictEqual(out, []);
+});
+
+check('B4b nextCandidateIds: limit:0 means ZERO candidates, not "at least one no matter what"', () => {
+  // Regression guard: a post-push cap check (push, then see length>=cap and
+  // stop) let limit:0 through with one candidate anyway. Checked BEFORE
+  // pushing now.
+  const product = { imageMediaId: 'hero', additionalImageMediaIds: ['alt1', 'alt2'] };
+  const out = seedFallback.nextCandidateIds(product, { excludeMediaIds: [], limit: 0 });
   assert.deepStrictEqual(out, []);
 });
 
@@ -333,6 +360,232 @@ const seedFallbackStubbed = require('../services/moderationSeedFallback');
     const outValidate = failed('job3', 'validate', { message: 'x' });
     assert.strictEqual(outValidate.error.retryable, false, 'pre-existing validate-stage behaviour must be unchanged');
   });
+
+  console.log('\nE. isSingleSeedEligible — the exact gate that was wrong the first time');
+
+  check('E1 empty referenceMediaIds (no explicit pick at all) is eligible', () => {
+    assert.strictEqual(seedFallback.isSingleSeedEligible([]), true);
+  });
+
+  check('E2 a ONE-element referenceMediaIds is eligible — THE INCIDENT SHAPE', () => {
+    // This is what renderService.js actually forwards for every concept-driven
+    // static ad: Ad.referenceMediaIds is empty, so it forwards Ad.mediaIds,
+    // and DIRECTOR_UNIVERSE_TOP_N=1 makes that array exactly one element.
+    // `!orderedIds.length` (the original, wrong gate) returns `false` here —
+    // this check is what would have caught that before it shipped.
+    assert.strictEqual(seedFallback.isSingleSeedEligible(['heroId']), true);
+  });
+
+  check('E3 a TWO-OR-MORE-element referenceMediaIds (a genuine explicit stack) is NOT eligible', () => {
+    assert.strictEqual(seedFallback.isSingleSeedEligible(['heroId', 'alt1']), false);
+    assert.strictEqual(seedFallback.isSingleSeedEligible(['a', 'b', 'c']), false);
+  });
+
+  check('E4 non-array input degrades to eligible (treated as zero references), never throws', () => {
+    assert.strictEqual(seedFallback.isSingleSeedEligible(undefined), true);
+    assert.strictEqual(seedFallback.isSingleSeedEligible(null), true);
+  });
+
+  console.log('\nF. submitEditImageWithSeedFallback — the real money-path orchestration, called for real');
+
+  // ── Stub services/atlasImageService.js's editImage BEFORE
+  // directImageRenderService.js (the module under test) first requires it. ──
+  const atlasImageServicePath = require.resolve('../services/atlasImageService');
+  const mediaModelPath = require.resolve('../models/Media');
+
+  // A real, tiny, valid PNG — sharp() (used by normalizeReference) must be
+  // able to decode whatever optionalImage's mocked fetch returns, or every
+  // fallback candidate is (correctly, but unhelpfully for this test) treated
+  // as unusable and skipped.
+  const sharpForFixture = require('sharp');
+  let tinyPngBuffer;
+
+  function makeModerationError(candidateLabel) {
+    const err = new Error(`Model Moderation Error (${candidateLabel}) — safety filter rejected the input`);
+    err.policy = {
+      name: 'moderationBlocked', code: 'IMAGE_MODERATION_BLOCKED',
+      charged: false, retryable: false, terminal: true
+    };
+    return err;
+  }
+  function makeRateLimitError() {
+    const err = new Error('Atlas image rateLimited (HTTP 429)');
+    err.policy = { name: 'rateLimited', code: 'IMAGE_RATE_LIMITED', charged: false, retryable: true, terminal: false };
+    return err;
+  }
+
+  async function withStubbedMoneyPath(editImageImpl, mediaDocs, testFn) {
+    const submitCalls = [];
+    require.cache[atlasImageServicePath] = {
+      id: atlasImageServicePath, filename: atlasImageServicePath, loaded: true, children: [], paths: [],
+      exports: {
+        isConfigured: () => true,
+        editImage: async (args) => {
+          submitCalls.push(args);
+          return editImageImpl(args, submitCalls.length);
+        }
+      }
+    };
+    require.cache[mediaModelPath] = {
+      id: mediaModelPath, filename: mediaModelPath, loaded: true, children: [], paths: [],
+      exports: {
+        findById: (id) => ({
+          select() { return this; },
+          lean: async () => mediaDocs[String(id)] || null
+        }),
+        // directImageRenderService.js also calls Media.find({_id:{$in:...}})
+        // for an explicit operator/director referenceMediaIds stack — not
+        // exercised by these single-seed tests, but must not throw if hit.
+        find: () => ({ select() { return this; }, lean: async () => [] })
+      }
+    };
+    delete require.cache[require.resolve('../services/directImageRenderService')];
+    const directImage = require('../services/directImageRenderService');
+    try {
+      await testFn(directImage, submitCalls);
+    } finally {
+      delete require.cache[atlasImageServicePath];
+      delete require.cache[mediaModelPath];
+      delete require.cache[require.resolve('../services/directImageRenderService')];
+    }
+  }
+
+  const PRODUCT = {
+    _id: 'prod1',
+    imageMediaId: 'hero',
+    additionalImageMediaIds: ['alt1', 'alt2', 'alt3']
+  };
+  function baseArgs(overrides) {
+    return {
+      refs: ['placeholder-primary-ref'],
+      imageMeta: [{ sourceUrl: 'https://example.test/hero.png', role: 'seed-media' }],
+      prompt: 'test prompt', genSize: '1024x1024', meta: {},
+      model: 'openai/gpt-image-2/edit', quality: 'medium', timeoutMs: 1000, uploadTimeoutMs: 1000,
+      allowProviderFallback: false,
+      singleSeedEligible: true,
+      mediaId: 'hero',
+      resolvedProduct: PRODUCT,
+      campaignRunId: null,
+      productId: 'prod1',
+      ...overrides
+    };
+  }
+
+  await checkAsync('F0 fixture setup: a real decodable PNG buffer for fallback candidate fetches', async () => {
+    tinyPngBuffer = await sharpForFixture({ create: { width: 4, height: 4, channels: 3, background: { r: 255, g: 255, b: 255 } } }).png().toBuffer();
+    assert.ok(Buffer.isBuffer(tinyPngBuffer) && tinyPngBuffer.length > 0);
+  });
+
+  // optionalImage -> fetchBuffer uses axios.get on the candidate's fileUrl.
+  // Patched once, globally, for the rest of section F (restored at the end).
+  const axios = require('axios');
+  const realAxiosGet = axios.get.bind(axios);
+  axios.get = async (url, config) => {
+    if (typeof url === 'string' && url.startsWith('https://example.test/')) {
+      return { data: tinyPngBuffer, status: 200 };
+    }
+    return realAxiosGet(url, config);
+  };
+
+  await checkAsync('F1 NOT eligible (singleSeedEligible:false): submits exactly once, no fallback attempted even though it would fail', async () => {
+    await withStubbedMoneyPath(
+      async () => { throw makeModerationError('primary'); },
+      {},
+      async (directImage, calls) => {
+        await assert.rejects(
+          () => directImage.submitEditImageWithSeedFallback(baseArgs({ singleSeedEligible: false })),
+          /Moderation/
+        );
+        assert.strictEqual(calls.length, 1, 'must not touch the fallback machinery at all when ineligible');
+      }
+    );
+  });
+
+  await checkAsync('F2 THE INCIDENT, FIXED: primary moderation-blocked, catalog alternate succeeds, seedFallback stamped', async () => {
+    await withStubbedMoneyPath(
+      async (args, n) => (n === 1 ? Promise.reject(makeModerationError('hero')) : { data: [{ b64_json: 'ZmFrZQ==' }], submission: { model: args.model } }),
+      { alt1: { fileUrl: 'https://example.test/alt1.png' } },
+      async (directImage, calls) => {
+        const { result, seedFallback: info } = await directImage.submitEditImageWithSeedFallback(baseArgs());
+        assert.strictEqual(calls.length, 2, 'exactly one wasted primary submit, then exactly one successful fallback submit');
+        assert.ok(result?.data?.[0]?.b64_json, 'must return the successful render');
+        assert.deepStrictEqual(info, {
+          used: true, originalMediaId: 'hero', resolvedMediaId: 'alt1',
+          reason: 'moderation_blocked', attemptsBeforeSuccess: 2
+        });
+      }
+    );
+  });
+
+  await checkAsync('F3 coordination: a run that already resolved alt1 for this product skips the doomed primary ENTIRELY', async () => {
+    await withStubbedMoneyPath(
+      async () => ({ data: [{ b64_json: 'ZmFrZQ==' }], submission: {} }),
+      { alt1: { fileUrl: 'https://example.test/alt1.png' } },
+      async (directImage, calls) => {
+        await seedFallbackStubbed.recordSeedOutcome('run-F3', 'prod1', { originalMediaId: 'hero', resolvedMediaId: 'alt1' });
+        const { result, seedFallback: info } = await directImage.submitEditImageWithSeedFallback(
+          baseArgs({ campaignRunId: 'run-F3' })
+        );
+        assert.strictEqual(calls.length, 1, 'the flagged primary must NEVER be submitted once this run already knows the answer');
+        assert.ok(result?.data?.[0]?.b64_json);
+        assert.strictEqual(info.attemptsBeforeSuccess, 1, 'first try success via coordination, not a fresh discovery');
+      }
+    );
+  });
+
+  await checkAsync('F4 bound: at most 1 + maxFallbackCandidates() submits, even with a resolved override AND an unblocked primary both in play', async () => {
+    // Regression guard for the confirmed "4 submits in one call" bug: the
+    // starting slot must be EXACTLY ONE candidate (resolved preferred over
+    // primary), never both, so total submits stay <= 1 + cap.
+    let calls = 0;
+    await withStubbedMoneyPath(
+      async () => { calls++; throw makeModerationError(`candidate-${calls}`); },
+      {
+        alt1: { fileUrl: 'https://example.test/alt1.png' },
+        alt2: { fileUrl: 'https://example.test/alt2.png' },
+        alt3: { fileUrl: 'https://example.test/alt3.png' }
+      },
+      async (directImage) => {
+        await seedFallbackStubbed.recordSeedOutcome('run-F4', 'prod1', { originalMediaId: 'hero', resolvedMediaId: 'alt1' });
+        await assert.rejects(
+          () => directImage.submitEditImageWithSeedFallback(baseArgs({ campaignRunId: 'run-F4' })),
+          /Moderation/
+        );
+        const cap = 1 + seedFallbackStubbed.maxFallbackCandidates();
+        assert.ok(calls <= cap, `expected at most ${cap} submits (1 starting candidate + ${seedFallbackStubbed.maxFallbackCandidates()} cascade), got ${calls}`);
+      }
+    );
+  });
+
+  await checkAsync('F5 a moderation-blocked PRIMARY is recorded to blocked[] too, not only fallback candidates', async () => {
+    await withStubbedMoneyPath(
+      async (args, n) => (n === 1
+        ? Promise.reject(makeModerationError('hero'))
+        : { data: [{ b64_json: 'ZmFrZQ==' }], submission: {} }),
+      { alt1: { fileUrl: 'https://example.test/alt1.png' } },
+      async (directImage) => {
+        await directImage.submitEditImageWithSeedFallback(baseArgs({ campaignRunId: 'run-F5' }));
+        const state = await seedFallbackStubbed.readRunSeedState('run-F5', 'prod1');
+        assert.ok(state.blockedMediaIds.includes('hero'), 'the doomed PRIMARY must be recorded blocked, or every other creative re-pays to rediscover it');
+      }
+    );
+  });
+
+  await checkAsync('F6 a non-moderation failure (rate limit) aborts immediately — no fallback candidates burned', async () => {
+    await withStubbedMoneyPath(
+      async () => { throw makeRateLimitError(); },
+      { alt1: { fileUrl: 'https://example.test/alt1.png' } },
+      async (directImage, calls) => {
+        await assert.rejects(
+          () => directImage.submitEditImageWithSeedFallback(baseArgs({ campaignRunId: 'run-F6' })),
+          /rateLimited|429/
+        );
+        assert.strictEqual(calls.length, 1, 'a non-seed-shaped failure must not spend money trying alternate seeds');
+      }
+    );
+  });
+
+  axios.get = realAxiosGet;
 
   console.log(`\n${pass} passed, ${failures.length} failed`);
   if (failures.length) {
