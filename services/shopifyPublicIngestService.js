@@ -327,6 +327,17 @@ async function syncBrandShopifyDirect(brand, run, { isBrandAborted } = {}) {
   let productsUpserted = 0;
   let videosIngested   = 0;
   let reviewsCaptured  = 0;
+  // VISIBILITY (2026-08-19): a mid-stage rate-limit break previously only
+  // pushed one line into `errors[]`, which the caller (apifyIngestService)
+  // collapses to a bare COUNT (`errors: r.errors.length`) — an operator
+  // looking at a completed 43-minute run with videos=0/reviews=0 had no way
+  // to tell "the store rate-limited us" from "there was nothing to find".
+  // These flags survive into the returned result AND get pushed into the
+  // progress run's own `note` (services/progressService — the existing,
+  // single status channel; not a new one) the moment they happen, so an
+  // operator watching the run does not have to wait for it to finish.
+  let mediaRateLimited = false;
+  let reviewsRateLimited = false;
 
   const abortCheck = typeof isBrandAborted === 'function'
     ? isBrandAborted
@@ -639,8 +650,10 @@ async function syncBrandShopifyDirect(brand, run, { isBrandAborted } = {}) {
         ajax = await politeFetch(`${origin}/products/${encodeURIComponent(p.handle)}.js`);
       } catch (err) {
         if (err.message === 'store rate-limited this server') {
+          mediaRateLimited = true;
           errors.push(`media stage rate-limited at handle=${p.handle}`);
           console.warn(`   ⚠️  🛍  ${err.message} during media stage — skipping remaining videos`);
+          run?.note?.(`store rate-limited us during media stage — remaining videos skipped (${i + 1}/${products.length} products checked)`);
           break;
         }
         // 404 / parse-fail → skip silently, count error.
@@ -810,8 +823,10 @@ async function syncBrandShopifyDirect(brand, run, { isBrandAborted } = {}) {
       html = await politeFetch(`${origin}/products/${encodeURIComponent(p.handle)}`, { asText: true });
     } catch (err) {
       if (err.message === 'store rate-limited this server') {
+        reviewsRateLimited = true;
         errors.push(`reviews stage rate-limited at handle=${p.handle}`);
         console.warn(`   ⚠️  🛍  ${err.message} during reviews stage — skipping remaining reviews`);
+        run?.note?.(`store rate-limited us during reviews stage — remaining reviews skipped (${i + 1}/${products.length} products checked)`);
         break;
       }
       if (err.status === 404) continue;
@@ -855,7 +870,32 @@ async function syncBrandShopifyDirect(brand, run, { isBrandAborted } = {}) {
   }
 
   // ── End-of-run trio (same as catalogSyncService ~298-342) ────────
+  //
+  // ROBUSTNESS (2026-08-19): the enrichment + category-inference triggers
+  // below are intentionally NOT awaited by the main sync — enrichment is a
+  // separate paid/slow tier (GPT + on-site review scrape) and category
+  // inference walks product pages; neither should hold up the catalog sync
+  // itself or its HTTP/executor caller. They used to be wrapped in
+  // setImmediate() to push them one tick out, which is where the bug was:
+  // setImmediate does not keep this process (or its Mongoose connection)
+  // alive, so a SHORT-LIVED caller (a one-off script, a queued job runner
+  // that connects → syncs → disconnects) can tear down the DB connection
+  // before that deferred tick ever runs — the trigger then fails immediately
+  // with "Client must be connected before running operations", silently,
+  // because both call sites only console.warn on failure. Measured live on
+  // a real Marine Layer re-ingest: all three (on-site review scrape,
+  // catalog enrichment, category inference) died this way.
+  //
+  // Fix: call directly (no setImmediate — an async function already returns
+  // control to its caller at its first await, so nothing here blocks the
+  // sync's own return) and COLLECT the promises onto the result so a caller
+  // that owns its own connection lifecycle can choose to await them before
+  // disconnecting. Every existing caller (HTTP routes, capability
+  // executors) ignores this field and is unaffected — they stay connected
+  // for the life of the process anyway, which is why this was invisible
+  // until a short-lived script hit it.
   const cancelled = await abortCheck(brand._id, run);
+  const backgroundWork = [];
   if (!cancelled) {
     try {
       const { enqueueBrandProductDetects } = require('./catalogProductDetectService');
@@ -880,39 +920,37 @@ async function syncBrandShopifyDirect(brand, run, { isBrandAborted } = {}) {
         .catch(err => console.warn(`   ⚠️  🛍  catalog materialize drain trigger failed: ${err.message}`));
     }
 
-    setImmediate(() => {
+    backgroundWork.push(
       require('./catalogProductEnrichmentService')
         .enqueueBrandProductEnrichment(brand._id)
-        .catch(err => console.warn(`   ⚠️  🛍  catalog enrichment enqueue failed: ${err.message}`));
-    });
+        .catch(err => console.warn(`   ⚠️  🛍  catalog enrichment enqueue failed: ${err.message}`))
+    );
 
-    setImmediate(() => {
-      (async () => {
-        try {
-          const inference = require('./productCategoryInferenceService');
-          // NOTE: not { $ne: null, …, $ne: '' } — duplicate keys in a JS
-          // object literal keep only the LAST one, silently dropping the
-          // null exclusion (adversarial-review find; same bug fixed in
-          // catalogSyncService's copy of this query).
-          const candidates = await CatalogProduct.find({
-            brandId: brand._id,
-            productUrl: { $exists: true, $nin: [null, ''] },
-            $or: [
-              { inferredCategoryAt: null },
-              { inferredCategoryAt: { $lt: new Date(Date.now() - inference.TTL_DAYS * 24 * 60 * 60 * 1000) } }
-            ]
-          }).select('_id').lean();
-          if (!candidates.length) return;
-          console.log(`🔎 categoryInference: brand=${brand._id} scheduling ${candidates.length} product page scrapes`);
-          const result = await inference.inferBatch(candidates.map(c => c._id), {
-            concurrency: require('./concurrency').concurrency.CATEGORY_INFERENCE_BATCH_CONCURRENCY
-          });
-          console.log(`🔎 categoryInference: brand=${brand._id} done — ok=${result.ok} cfChallenged=${result.challenged || 0} skipped=${result.skipped} failed=${result.failed}`);
-        } catch (err) {
-          console.warn(`   ⚠️  🛍  category inference enqueue failed: ${err.message}`);
-        }
-      })();
-    });
+    backgroundWork.push((async () => {
+      try {
+        const inference = require('./productCategoryInferenceService');
+        // NOTE: not { $ne: null, …, $ne: '' } — duplicate keys in a JS
+        // object literal keep only the LAST one, silently dropping the
+        // null exclusion (adversarial-review find; same bug fixed in
+        // catalogSyncService's copy of this query).
+        const candidates = await CatalogProduct.find({
+          brandId: brand._id,
+          productUrl: { $exists: true, $nin: [null, ''] },
+          $or: [
+            { inferredCategoryAt: null },
+            { inferredCategoryAt: { $lt: new Date(Date.now() - inference.TTL_DAYS * 24 * 60 * 60 * 1000) } }
+          ]
+        }).select('_id').lean();
+        if (!candidates.length) return;
+        console.log(`🔎 categoryInference: brand=${brand._id} scheduling ${candidates.length} product page scrapes`);
+        const result = await inference.inferBatch(candidates.map(c => c._id), {
+          concurrency: require('./concurrency').concurrency.CATEGORY_INFERENCE_BATCH_CONCURRENCY
+        });
+        console.log(`🔎 categoryInference: brand=${brand._id} done — ok=${result.ok} cfChallenged=${result.challenged || 0} skipped=${result.skipped} failed=${result.failed}`);
+      } catch (err) {
+        console.warn(`   ⚠️  🛍  category inference enqueue failed: ${err.message}`);
+      }
+    })());
   }
 
   const durationMs = Date.now() - t0;
@@ -927,13 +965,24 @@ async function syncBrandShopifyDirect(brand, run, { isBrandAborted } = {}) {
     videosIngested,
     reviewsCaptured,
     errors,
-    durationMs
+    durationMs,
+    // Awaitable by a caller that owns its own connection lifecycle (see the
+    // ROBUSTNESS comment on the end-of-run trio above). Ignored — safely —
+    // by every existing HTTP/executor caller.
+    backgroundWork
   };
   if (cancelled) out.cancelled = true;
   if (hitRateLimit) {
     out.ok = false;
     out.reason = 'store rate-limited this server — partials kept; try the Apify method';
   }
+  // Mid-stage rate-limit notes survive past the bare errors[].length count
+  // apifyIngestService's summary collapses `errors` to (see VISIBILITY
+  // comment above). `videosIngested`/`reviewsCaptured` staying 0 with NO
+  // reason attached is exactly what made the Marine Layer run look like a
+  // silent failure instead of an explained, honest partial result.
+  if (mediaRateLimited) out.mediaRateLimited = true;
+  if (reviewsRateLimited) out.reviewsRateLimited = true;
   return out;
   } catch (err) {
     throw err;
