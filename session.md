@@ -5,13 +5,17 @@ lines of chronological accretion; it is now organised by *what is true* rather t
 *what happened when*. History is compressed at the bottom — anything not listed there
 was judged superseded and dropped **deliberately**, not lost.
 
-## 2026-08-18 — Slack job status messages name who ordered the run
+## 2026-08-19 — Slack job status messages name who ordered the run
 
-Branch `slack-requester-label` (worktree `.claude/worktrees/slack-requester-label`), off
-`origin/main` @ `99d3f06`. **Not committed** — the ask was the feature, not a landing. Suite
-**141 / 142**; the one failure is `verifyLogoSilhouette` needing native `sharp`, which does not
-resolve inside a worktree via `NODE_PATH` — it passes in the main checkout and touches none of
-these files. Lint clean.
+**MERGED to `main`** as `aa827fae` (PR #226, squash), branch deleted. Rebased onto `555fe8cb`
+first — #220 (`fix/campaignrun-heartbeat`) had landed mid-session and also touched `routes/ads.js`
+and `docs/ALERTING.md`; both regions were re-verified after the rebase rather than trusted to a
+clean textual merge. Its heartbeat lands at `routes/ads.js` ~1724, *after* this change's await
+point at ~1642, so they do not interact.
+
+Suite **151 / 152**, lint clean. The one failure is `verifyLogoSilhouette` needing native `sharp`,
+which does not resolve inside a git worktree via `NODE_PATH` — it passes in a normal checkout and
+touches none of these files.
 
 Files: `services/runFeedService.js`, `services/slackRunVerbosity.js`, `routes/ads.js`,
 `scripts/verifyRunFeed.js` (§I, +13), `scripts/verifySlackRunVerbosity.js` (D4–D8, +5),
@@ -52,8 +56,9 @@ neither new section passes vacuously.
 **Note on the shared checkout:** `/Volumes/Sayulita/Projects/RS/liquidretail_backend` was 25
 commits behind `origin/main` when this started, and `routes/ads.js` had moved +391 lines upstream.
 This work was first built there, then rebuilt in the worktree; the shared tree was restored to
-clean. Two hunks genuinely did not apply to current `main` — do not assume a stale-base patch here
-transfers.
+clean and is **still behind** — it was deliberately not pulled, in case another session is working
+in it. Two hunks genuinely did not apply to current `main`, so do not assume a stale-base patch
+here transfers: rebase and re-run the suite, never just retarget by hand.
 
 ## 2026-08-17 — `verifyAgentRegistry` GREEN. Five capabilities were DEAD, not dangerous.
 
