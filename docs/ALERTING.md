@@ -956,6 +956,53 @@ Pinned by `scripts/verifyPerProductReasons.js` (schema + normaliser, offline) an
 `scripts/verifyDirectorRoundPersist.js` (source-region pins on the two LLM-calling
 functions that can't run offline).
 
+### Follow-up (2026-08-19): moderation rejections stopped reading as generic failures
+
+`run_1787136860887_654ed621` (the same run the Video vision QC section above
+diagnosed a colourway defect on) had a second, unrelated defect: all 18 statics
+failed with `atlasErrorPolicy.js`'s `moderationBlocked` classification
+(`safety_violations=[sexual]` against an ordinary apparel photo — a jacket over a
+bralette, bare midriff), and neither `CampaignRun.errors[]` nor `Ad.renderError`
+carried anything more structured than the free-text message to say so — an
+operator (or this table's `failureSummary` field) could tell "Model Moderation
+Error" from the label text, but nothing machine-checkable existed to roll it up,
+and the render pipeline had no mitigation beyond failing the ad outright.
+
+`services/atlasErrorPolicy.js` gained a stable `IMAGE_ERROR_CODES` taxonomy
+(mirroring `services/llmError.js`'s pattern without merging into it — that module
+is text/chat/embedding-only, enforced by `scripts/verifyLlmErrorCodes.js` A5),
+threaded through `services/renderService.js` → `routes/ads.js` into the
+already-declared (for the LLM taxonomy, generic `String`) `CampaignRun.errors[]
+.code`/`.action` and a new `Ad.renderError.code`. `GET /runs/:runId` gains a
+`moderationBlocked` rollup (count + productIds + operator sentence) — a
+structured, code-keyed complement to this table's own `failureSummary` row above
+(which already correctly grouped the text label; the new field survives a future
+message reword). `services/renderService.js failed()` also stopped hardcoding
+`retryable: stage !== 'validate'` — a lie for a `give-up`-classified failure like
+this one, which is never retryable by design.
+
+Separately, `services/moderationSeedFallback.js` (new) + a
+`submitEditImageWithSeedFallback` wiring in `services/directImageRenderService.js`
+give a moderation-rejected render a real second chance: on a rejection of a
+product's single default catalog seed (never an operator/Director explicit
+multi-image pick), try the product's next catalog image before giving up,
+coordinating across a run's creatives via a new `CampaignRun.seedFallbacks` array
+so later creatives for the same product skip a known-doomed seed instead of
+re-discovering it. Live-verified against the actual failing product (real
+`gpt-image-2/edit` submits, settled cost $1.17 total across this session's
+controlled experiments) — see `session.d/2026-08-19_static-moderation-rejections-
+seed-fallback.md` for the full write-up, the exposure-quantification numbers, and
+what was NOT verified.
+
+Pinned by `scripts/verifyModerationSeedFallback.js` (23 checks, offline,
+revert-proven on 5 mutations). Also fixed a real fragility hit while landing:
+`scripts/verifyAdVisionQcSurfacing.js`'s C1-C3 checks used a hardcoded 6000-char
+window to scope `GET /runs/:runId`'s handler, which this session's
+`moderationBlocked` rollup pushed past — the same class of drift
+`verifyRunStatusTruthfulness.js` already fixed once by bounding at the next
+`router.METHOD(` declaration instead of a hand-tuned count. Ported that pattern
+in rather than bumping the number again.
+
 ## Known gap this does not close
 
 Alerting tells you work was dropped; it does not resume it. The underlying
