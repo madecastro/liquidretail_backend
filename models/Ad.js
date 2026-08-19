@@ -553,7 +553,16 @@ const adSchema = new mongoose.Schema({
     chargeState:  { type: String, enum: ['charged', 'not-charged', 'unknown', null], default: null },
     // Provider's own error code (Atlas envelope `code`), e.g. 402 insufficient
     // balance — kept so a billing rejection is distinguishable from a timeout.
-    atlasCode:    { type: Number, default: null }
+    atlasCode:    { type: Number, default: null },
+    // OUR stable classification (services/atlasErrorPolicy.js IMAGE_* codes —
+    // IMAGE_MODERATION_BLOCKED, IMAGE_RATE_LIMITED, ...), added 2026-08-19.
+    // Distinguishes "the image model's own safety filter rejected this input,
+    // identical retry is futile" from every other render failure, which used
+    // to reach an operator as one more generic `renderError.message` with no
+    // way to tell content-policy from a bug or an outage without reading the
+    // raw text. Declared here for the same reason atlasCode/chargeState are —
+    // Mongoose strict mode silently drops an undeclared path on write.
+    code:         { type: String, default: null }
   },
   renderAttempts: { type: Number, default: 0 },
   // A FREE derive-only video ad (deriveFromMaster set) waits IN-RENDER for
