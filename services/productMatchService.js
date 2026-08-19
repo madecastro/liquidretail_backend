@@ -246,7 +246,24 @@ async function findProductMatches({
   if (outcome === 'product_match' && identification?.productName && (identification.certainty || 0) >= 0.3) {
     if (productDetails.isEnabled()) {
       try {
-        identification.details = await productDetails.fetchProductDetails(identification);
+        // catalogProductId threaded for the COST LEDGER and the 30-day details
+        // cache (2026-08-19, adversarial-review finding): this call site was the
+        // one of three fetchProductDetails callers that dropped the id, so every
+        // product_review_summary CostLog row from the scene-level path carried
+        // productId:null — and the path re-paid SerpAPI + Gemini on every detect
+        // because the cache read/write-through is keyed on the id it wasn't
+        // getting. catalogMatch may legitimately be null here (a reasoner-only
+        // product_match with no catalog winner), hence the optional chain.
+        // brandId threaded too (adversarial-review finding, 2026-08-19): the
+        // enclosing findProductMatches already receives `brandId` as its own
+        // param (used by the category/branding lookups above), so it costs
+        // nothing to also join the cost ledger's product_review_summary rows
+        // back to the brand — previously silently null on this path.
+        identification.details = await productDetails.fetchProductDetails(
+          identification,
+          catalogMatch?.product?._id || null,
+          brandId
+        );
       } catch (err) {
         console.warn(`   ✗ productDetails: ${err.message}`);
         errors.productDetails = err.message;
@@ -889,7 +906,11 @@ async function enrichOneMatchInPlace(match, ctx) {
       try {
         // Phase 2f — pass catalogProductId so productDetails writes-through
         // to the CatalogProduct row + reads from cache on repeat hits.
-        const d = await productDetails.fetchProductDetails(ident, match.catalogProductId);
+        // brandId threaded too (adversarial-review finding, 2026-08-19):
+        // ctx.brandId is already in scope in this function (used a few lines up
+        // for the brand-category lookup) — previously not passed here, so this
+        // path's product_review_summary CostLog rows carried brandId:null.
+        const d = await productDetails.fetchProductDetails(ident, match.catalogProductId, ctx.brandId || null);
         if (d) {
           // Merge: SerpAPI commerce data fills in, but the catalog-row
           // authoritative fields (url, imageUrl, price, currency,

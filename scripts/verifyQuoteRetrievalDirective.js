@@ -258,7 +258,11 @@ check('B3 category prompt no longer few-shots the banned patterns', () => {
   // here: what the model actually reads. (CLAUDE.md §0.29998: source pins must strip
   // comments and assert proximity.)
   const i = catSrc.indexOf('const searchPrompt =');
-  const j = catSrc.indexOf('let searchRes', i);
+  // `let searchData`, not `let searchRes`: categoryReviews pass 1 moved onto the
+  // ledgered transport (2026-08-19), which resolves the response BODY rather than
+  // the axios envelope, so the variable was renamed to say so. Same delimiter the
+  // provider's two regions below already use.
+  const j = catSrc.indexOf('let searchData', i);
   assert.ok(i !== -1 && j > i, 'category searchPrompt region not found');
   const promptOnly = catSrc.slice(i, j)
     .split('\n')
@@ -561,7 +565,7 @@ check('T1 all three pass-1 prompts ask for the NUMBERS BEFORE the quotes', () =>
   const regions = [
     ['brand',    pass1Region(provSrc, 'async function lookupBrandReviews',   'let searchData')],
     ['product',  pass1Region(provSrc, 'async function lookupProductReviews', 'let searchData')],
-    ['category', pass1Region(catSrc,  'const searchPrompt =',                'let searchRes')],
+    ['category', pass1Region(catSrc,  'const searchPrompt =',                'let searchData')],
   ];
   for (const [name, region] of regions) {
     const numbers = region.search(/star rating/i);

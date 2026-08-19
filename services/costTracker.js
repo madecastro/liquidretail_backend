@@ -57,10 +57,16 @@ const MODEL_RATES = Object.freeze({
   // GATEWAY entries specifically (distinct from the bare, DIRECT-provider
   // 'gemini-2.5-pro' key below, which stays deliberately untouched per the
   // 2026-08-03 note on that entry — a different call path, not protected by
-  // that note). Was 0.075/0.31; live catalog says 0.03/0.125. The bulk of
-  // that day's gap is very likely the grounding surcharge estimate
-  // (GEMINI_GROUNDING_COST_USD, below) rather than this cache-rate alone —
-  // flagged, not chased further here; see the audit report.
+  // that note). Was 0.075/0.31; live catalog says 0.03/0.125. CORRECTED
+  // 2026-08-19: an earlier version of this note blamed the bulk of that day's
+  // gap on the grounding surcharge estimate (GEMINI_GROUNDING_COST_USD,
+  // below). That is IMPOSSIBLE: `groundedRequests` is set in exactly one
+  // place — geminiSearchProvider.trackedGenerate, which always writes
+  // provider:'gemini' — while reconcileAtlasDailyCosts aggregates
+  // provider:'atlas' rows only, so no Atlas row can carry the surcharge. The
+  // likelier driver of the residual is the flat
+  // VISION_IMAGE_COST_PER_IMAGE_USD estimate. Still flagged, not chased; see
+  // the audit report — just don't chase the surcharge, it cannot be the cause.
   'google/gemini-2.5-flash':     { input: 0.30,  output: 2.50,  cachedInput: 0.03 },
   'google/gemini-2.5-pro':       { input: 1.25,  output: 10.00, cachedInput: 0.125 },
   // Director role as of 2026-07-31. Rates read from the live Atlas catalog

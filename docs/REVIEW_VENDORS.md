@@ -370,7 +370,29 @@ genuinely beats a heuristic:
 `google_search` pass, then a plain JSON-structuring pass. Both now ledger to
 **`CostLog`** under `stage: 'brand_reviews' | 'product_reviews'`, split by
 `purposeTag: 'grounded_search' | 'json_structure'` — see
-`scripts/verifyGeminiSearchCost.js`. Until 2026-08-03 they were the only
+`scripts/verifyGeminiSearchCost.js`.
+
+**Every grounded Gemini call on the review path is now ledgered (2026-08-19,
+second pass).** The five stages, and which transport each is on:
+
+| stage | purposeTag | transport | grounded |
+|---|---|---|---|
+| `brand_reviews` | `grounded_search` | direct REST | ✅ |
+| `brand_reviews` | `json_structure` | Atlas | — |
+| `product_reviews` | `grounded_search` | direct REST | ✅ |
+| `product_reviews` | `json_structure` | Atlas | — |
+| `category_reviews` | `grounded_search` | direct REST | ✅ |
+| `category_reviews` | `json_structure` | Atlas | — |
+| `product_review_summary` | `grounded_search` | direct REST | ✅ |
+| `gemini_product_match` | `grounded_search` | direct REST | ✅ |
+
+All five grounded stages share ONE transport —
+`geminiSearchProvider.trackedGenerate`, now exported for exactly that reason.
+Copying it is how the three details it gets right (resolve the response BODY so
+`extractUsage` sees `usageMetadata`; declare the per-REQUEST grounding surcharge;
+pin `maxRedirects: 0`) drift apart. Pinned by
+`scripts/verifyGroundedGeminiLedger.js` (22 checks, revert-proven against 15
+mechanical mutations). Until 2026-08-03 they were the only
 review-path LLM calls with **no cost tracking at all**, because they hit the raw
 `generativelanguage` REST endpoint rather than `atlasLlmService`.
 
@@ -406,18 +428,51 @@ routes through Atlas (`atlasLlmService.chatCompletion`, model
 half) stays here; see the ATLAS GROUNDING PROBE comment in
 `geminiSearchProvider.js` for the live-tested proof that Atlas cannot ground.
 
-**Still unledgered on this path (known gap, NOT fixed here — same shape as
-the `match` fix above, and a reasonable next pickup):**
-`categoryReviewsService` and `productDetailsService.fetchReviewSummary` both
-still POST the raw endpoint directly with no `trackLlmCall` and no
-`maxRedirects: 0`. Both are genuinely grounded (`tools: [{google_search:{}}]`),
-so — like `match` — the fix is "wrap in a ledgered transport", not "move to
-Atlas": grounding still is not available there. Confirmed LIVE and
-unledgered by a 2026-08-19 trace (`categoryReviewsService` reachable from
-UGC/IG detect on a category-reviews cache miss; `productDetailsService.
-fetchReviewSummary` reachable from UGC product_match and user-triggered
-Enrich, gated on `SERPAPI_API_KEY` being configured for the sibling shopping
-lookup, not on this call itself).
+**THAT GAP IS NOW CLOSED (2026-08-19, second pass).** `categoryReviewsService`
+and `productDetailsService.fetchReviewSummary` were the last two: both POSTed
+the raw endpoint with no `trackLlmCall` and no `maxRedirects: 0`. Both are
+genuinely grounded, so — like `match` — the fix was "wrap in a ledgered
+transport", NOT "move to Atlas". Reachability confirmed by the same trace:
+`categoryReviewsService` from UGC/IG detect on a category-reviews cache miss,
+`fetchReviewSummary` from UGC product_match and the user-triggered Enrich (gated
+on `SERPAPI_API_KEY` for the SIBLING shopping lookup, not on this call itself).
+
+- `categoryReviewsService` pass 1 → `trackedGenerate`, stage `category_reviews`,
+  `grounded: true`, linked by `brandId` + the breadcrumb key as `cacheKey`
+  (threaded down from `fetchAndCache`; CostLog has no category field).
+- `categoryReviewsService` pass 2 → **Atlas**, in a new
+  `structureCategoryNarrative`. Deliberately a SIBLING of the provider's
+  `structureReviewNarrative` rather than a call into it: that one asks for a
+  `ratings[]` array and tells the model to leave the scalar `rating` null when it
+  fills the array, while this path reads only `parsed.rating` — reusing it would
+  null out the star rating on every category. Its strict `json_schema` is a
+  TIGHTENING (the direct call had `responseMimeType: 'application/json'` and no
+  schema at all), safe because every downstream read already treats absent and
+  null identically.
+- `fetchReviewSummary` → `trackedGenerate`, stage `product_review_summary`,
+  `grounded: true`, linked by `productId` + the query descriptor as `cacheKey`
+  (both threaded from `fetchProductDetails`), and **`brandId` too** (second
+  adversarial pass, 2026-08-19): `CatalogProduct.brandId` is a real, required
+  ObjectId field, available at all three production callers
+  (`fetchProductDetails`'s two call sites in `productMatchService.js` and one
+  in `catalogProductEnrichmentService.js`) — the first draft of this fix
+  threaded `productId` and stopped there on the mistaken assumption that
+  `identification.brand` (a NAME string) was the only brand signal in reach.
+  It wasn't the only one; the real Brand `_id` was sitting one property away
+  at every call site and simply hadn't been passed down. Its 45s timeout is
+  deliberately UNCHANGED — a raised ceiling would cut the cost of a
+  timed-out-but-billed call, but this one sits inside a `Promise.allSettled`
+  on a user click, so that is a latency decision of its own, not a side
+  effect of a ledger fix.
+
+**Measured live 2026-08-19, one real call each (Pelagic Gear, "Men > Shirts >
+Performance Shirts"):** category pass 1 `provider:'gemini'` `$0.037387` (2191 in
+/ 692 out + the $0.035 surcharge), category pass 2 `provider:'atlas'`
+`model:'google/gemini-2.5-flash'` `$0.004218`, and `product_review_summary`
+`$0.037883` — **$0.079488 for three rows that previously wrote nothing.**
+Grounding is 92-94% of each grounded row (93.6% and 92.4% measured), which is why `groundedRequests` and not
+token math is what makes these honest. The strict schema was exercised on the
+same run: 10 quotes survived intake and `rating: 3.2` came through as a scalar.
 
 ### The `review-text` role — chosen by measurement
 
