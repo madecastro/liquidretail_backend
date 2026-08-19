@@ -478,6 +478,31 @@ independent, same-day confirmation of exactly the `sharp` worktree bug fixed
 in §7 below, from a session that hit it and correctly reasoned past it rather
 than losing time to it.
 
+**A second, even more direct same-day repeat: PR #240** (`49e08692`,
+video vision-QC), merged while this plan was being written. Its own commit
+message states it *"corrects two stale CURRENT STATE facts found while
+running the full verify gate this session: the script count (160, not 168)
+and the sharp-in-a-worktree failure class, which is a repairable
+git-worktree artifact (`npm install sharp --no-save --ignore-scripts`), not
+permanently environmental."* Three independent sessions, one day, three
+separate encounters with the same two facts (a stale script count, and the
+`sharp` worktree gap) — this plan's own count correction at the top and the
+§7 `sharp` fix are not solving a hypothetical, they are the fourth and fifth
+touches on the same afternoon. PR #240's own diff to `CLAUDE.md` is a second,
+cleaner instance of the append-tax pattern too: its commit title says
+"docs: record the video vision-QC gap closure (**CLAUDE.md, ALERTING.md,
+session.d**)" — naming all three files it touched with one incident's
+narrative, the same shape as PR #239, just more self-aware about it.
+
+One correction PR #240 did NOT make, worth flagging precisely because §00's
+own header text is what it left stale: the header still says *"`NODE_PATH`
+alone will not fix it, since Node resolves the local `node_modules` first"* —
+true of the OLD hardcoded-`__dirname`-path form these three scripts used
+before this PR's §7 fix, but no longer the full picture now that they
+`require('sharp')` normally (which DOES consult `NODE_PATH` as a resolution
+fallback). Not fixed here, deliberately, per this plan's own scope discipline
+(§4 opening) — noted for whoever next edits that header.
+
 ### Recommendation (propose only — do not execute now)
 
 1. **When `CLAUDE.md` restructuring does happen**, move the "Known open"
@@ -603,19 +628,46 @@ now) one.
 At the time this plan was written, six agents were active: the
 undispatched-ad-tail fix (top priority, in `routes/ads.js`), moderation-
 rejection handling, video vision QC (`services/adVisionQcService.js`), Reels
-title truncation (`remotion/` — merged mid-session as PR #239, folded into
-§4's evidence above), and two more implied by the brief's file list. This
-plan:
+title truncation (`remotion/`), and two more implied by the brief's file
+list. All four of those landed **during** this session — this plan does not
+merely coexist with fast-moving trunk, it was actively rebased across it,
+repeatedly, which is itself a live test of the friction this document is
+about:
+
+| PR | What | `origin/main` after |
+|---|---|---|
+| #239 | Reels quote-truncation fix (`remotion/`) | `35af6843` |
+| #241 | **The top-priority undispatched-ad-tail fix** — closed the exact "9 stranded rows invisible to the sweeper" gap in `CLAUDE.md` §2's own heartbeat write-up | `7a5822c6` |
+| #240 | Video vision-QC (`services/adVisionQcService.js`) | `49e08692` |
+| #242 | Pelagic price-snapshot repair | `a96f304c` |
+| (2 more) | Catalog visual-signal persistence; Apify IG comment backfill | `c633e2c1` |
+
+This plan:
 
 - Touched **zero** lines in `routes/ads.js`, `worker.js`,
   `campaignAdsGenerationService.js`, `aiCreativeDirectorService.js`,
-  `CLAUDE.md`, or `remotion/`.
-- Rebased cleanly onto `origin/main` once during this session (`dcca06cb` →
-  `35af6843`, PR #239) with **zero conflicts**, because every file this work
-  touches (`scripts/`, `bin/`, `docs/PARALLEL_WORK.md`, `package.json`) was
-  untouched by the six in-flight agents.
+  `CLAUDE.md`, or `remotion/`, across the whole session.
+- **Rebased onto `origin/main` three times** in one working session
+  (`dcca06cb`→`35af6843`, then →`a96f304c`, then →`c633e2c1`) with **zero
+  conflicts each time** — because every file this work touches (`scripts/`,
+  `bin/`, `docs/PARALLEL_WORK.md`, `package.json`) stayed untouched by the six
+  in-flight agents, confirming §1-3's premise that a plan-only PR restricted
+  to uncontested paths really does rebase for free even against a fast-moving
+  trunk. Ran `scripts/checkRebaseContainment.js` (§7) after each rebase — one
+  real, expected false-positive on the first (a legitimate `docs/TITLING.md`
+  edit from PR #239, inspected and confirmed benign; see §7's worked example),
+  clean on the other two.
 - Everything in §1-3 was researched read-only, in a separate git worktree, off
-  a pinned commit — no product code was written for those sections.
+  a pinned commit — no product code was written for those sections. The line
+  citations in §1-3 are pinned to `origin/main` at the commit named in each
+  section's survey and were **not** re-verified against every subsequent
+  merge — `routes/ads.js` and `worker.js` both changed again after the survey
+  (PR #241), so treat exact line numbers there as approximate-but-structurally-
+  sound, not byte-current, and re-grep before relying on one.
+- The top-priority in-flight fix (#241) landing successfully, without this
+  plan's authors going anywhere near `routes/ads.js`, is itself a small
+  positive data point for the "stay off contended files entirely" strategy
+  this plan follows for its own execution.
 
 **Sequencing recommendation for whoever executes §1-3**: do them one cluster
 at a time, in the safest-first order given in each section, with the full
@@ -742,10 +794,68 @@ Wired as `npm run check:stale-work`; `--repo=<path>` to point at any
 checkout, `--json` for machine consumption, `--min-age-hours=N` to tune the
 threshold.
 
+### A fifth slice: committed work with no PR — `scripts/findOrphanedBranches.js`
+
+The orchestrator surfaced a second variant of the same "finished work has no
+durable home" failure mode mid-session: *"two separate orphans confirmed now,
+one of which had a commit but no PR ever opened."* `findStaleUncommittedWork.js`
+only sees uncommitted diffs — a real commit sitting on an unpushed or
+never-PR'd branch is invisible to it, so this is a genuinely separate check,
+not a duplicate.
+
+This repo's git worktrees all share one `.git`, so `git for-each-ref
+refs/heads` already enumerates every branch any worktree created (222 at the
+time this ran) — no filesystem walk needed. For each branch with commits
+ahead of `origin/main`, it cross-references GitHub via **one** batched `gh pr
+list --state all` call (not 222 individual API calls) and classifies:
+**ORPHANED** (commits ahead, no PR record ever) vs. **STALE** (commits ahead,
+but every matching PR is already closed/merged — usually just a local branch
+nobody ran `git branch -d` on). A `--min-age-hours` floor (default 3) excludes
+branches that are plausibly still being worked.
+
+**Run against the real repo (read-only) as part of verifying it**: found **8
+ORPHANED** branches (3.7h to 387h old, 1-3 commits each — e.g.
+`fix/pelagic-ad-price-snapshots`, 1 commit, 14.2h old) and **119 STALE**
+branches (ordinary post-merge local cleanup debt, not concerning). Per the
+same instruction as the fourth slice, **none of the 8 were landed, deleted, or
+investigated** — reported only as proof the tool catches a real instance of
+exactly the failure mode described. One caveat worth stating plainly: this
+matches PRs to branches by exact head-branch NAME, so content that was landed
+under a *different* branch name (e.g. cherry-picked into a fresh PR branch)
+will still show as ORPHANED even though it is safely merged — an ORPHANED
+result means "needs a human look," not "proven lost." Wired as
+`npm run check:orphaned-branches`; `--show-stale` for the full STALE list
+(collapsed to 5 by default so the actionable ORPHANED bucket isn't buried).
+
 ### Gate
 
 `npm run lint` clean throughout. Full 169-script suite green after every
 change in this session, including post-rebase.
+
+**Honest characterization of the parallel runner's determinism, not just the
+best-case number above:** across roughly 16 full-suite runs during this
+session, 14 were a clean 169/169; two were 168/169, each time a **different**
+single script (`verifyVideoResume.js` once, `verifyQuoteSurfaceLength.js`
+once), and in both cases the same script re-run standalone immediately passed
+100%, as did the very next full-suite run. Both failing scripts require
+heavy service modules (`atlasVideoService.js` + `bootRecoveryService.js`;
+`directImageRenderService.js`) with substantial transitive `require()` graphs
+— the most plausible explanation is transient resource contention from eight
+Node processes cold-starting their module graphs at once on this machine, not
+a logic bug in either script (their failing checks are pure static-regex
+assertions over already-loaded source text, with no timers, no I/O, and no
+env-dependence — nothing in either check should be capable of a
+concurrency-dependent result). **This was not chased to a root cause** — the
+fix, if one is warranted, is either lowering `--concurrency` or investigating
+Node's module-loading behavior under this specific sandbox, and it did not
+seem worth spending further budget on a ~12% per-run chance of a single
+already-explained, non-reproducible flake. **Policy recommendation instead of
+a fix:** if the runner reports a failure, re-run that one script standalone
+(`node scripts/<name>.js`) before treating it as a real regression — this
+matches the repo's existing testing culture (revert-prove, state residuals
+honestly) better than silently auto-retrying inside the runner, which would
+risk masking a script that is *genuinely* flaky rather than environmentally
+unlucky. The runner does not auto-retry, by design.
 
 ---
 
@@ -766,6 +876,9 @@ after this session's research:
   and a stated reason for the shape; building them is a natural next safe
   slice, not done here to keep this PR's footprint matched to what the brief
   asked executed now.
-- **Landing or investigating the three stale-uncommitted files** the new
-  detector (§7) found in the shared checkout. Reported, not acted on, per
-  explicit instruction.
+- **Landing, deleting, or investigating the three stale-uncommitted files or
+  the eight orphaned branches** the two new detectors (§7) found in the real
+  repo. Reported, not acted on, per explicit instruction.
+- **Re-verifying every §1-3 line citation against each subsequent merge.**
+  Three rebases landed during this session (§6); the surveys are pinned to
+  the commit each section names, not continuously re-checked against trunk.

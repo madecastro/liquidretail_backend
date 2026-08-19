@@ -16,7 +16,8 @@
     "test:affected": "node scripts/runVerifySuite.js --affected",
     "setup:worktree": "bash bin/setup-worktree.sh",
     "check:stale-work": "node scripts/findStaleUncommittedWork.js",
-    "check:rebase": "node scripts/checkRebaseContainment.js"
+    "check:rebase": "node scripts/checkRebaseContainment.js",
+    "check:orphaned-branches": "node scripts/findOrphanedBranches.js"
   },
   "devDependencies": {
     "eslint": "^9.39.5"
