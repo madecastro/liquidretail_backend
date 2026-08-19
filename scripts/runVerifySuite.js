@@ -36,12 +36,25 @@
  *
  * --affected IS A DEV-SPEED HEURISTIC, NOT THE GATE. It selects a verify
  * script if (a) the script itself changed, or (b) the script's source text
- * contains the basename of a changed file (a plain substring check against
- * require()/readFileSync() targets — cheap, and deliberately over-inclusive
- * rather than under). It cannot know about indirect effects (e.g. changing
- * a shared helper's *behavior* without changing any name it's checked
- * against). Run the full suite (no flags) before pushing non-trivial
- * changes — CLAUDE.md's own convention section already says so.
+ * contains a changed file's `dir/basename` path fragment (e.g. "models/Ad"
+ * for models/Ad.js) — a plain substring check against require()/
+ * require.resolve()/readFileSync() targets, cheap and deliberately
+ * over-inclusive rather than under. A supplementary bare-basename substring
+ * check (length-gated to >=4 chars, to avoid drowning the selection in noise
+ * from generic short tokens) adds recall on top of that, but is never the
+ * only mechanism — the dir/basename check has no length gate, because a
+ * scoped fragment like "models/Ad" or "routes/ads" is specific enough that it
+ * isn't noisy the way a bare "Ad" substring would be, so short filenames
+ * (Ad.js, Job.js, me.js, ads.js) still get matched precisely instead of being
+ * silently dropped. It cannot know about indirect effects (e.g. changing a
+ * shared helper's *behavior* without changing any name it's checked against),
+ * and it cannot know a changed file has zero real dependents vs. a heuristic
+ * gap — for changed files under CORE_DIRS (the directories everything else
+ * routinely requires) that end up matching NOTHING, computeAffected refuses
+ * to report a clean "nothing selected": it fails loud and signals the caller
+ * to fall back to the full suite instead. Run the full suite (no flags)
+ * before pushing non-trivial changes — CLAUDE.md's own convention section
+ * already says so.
  */
 'use strict';
 
@@ -53,6 +66,18 @@ const { spawn, execFileSync } = require('child_process');
 const ROOT = path.join(__dirname, '..');
 const SCRIPTS_DIR = path.join(ROOT, 'scripts');
 const VERIFY_RE = /^verify.*\.(js|mjs)$/;
+
+// Directories whose modules are routinely require()'d from all over the
+// codebase (verified 2026-08-19: services/ and models/ alone account for
+// 468 relative-require hits across scripts/verify*). If a changed file lives
+// under one of these and the substring checks below still select nothing,
+// that is treated as "the heuristic couldn't confidently resolve this" —
+// never as proof the file has no dependents — and computeAffected falls back
+// to the full suite rather than silently reporting a clean pass. Deliberately
+// excludes scripts/ (already handled as "the script itself changed"), and
+// non-code dirs (docs/, public/, bin/, session.d/) whose edits genuinely
+// have no verify-script dependents.
+const CORE_DIRS = new Set(['models', 'routes', 'services', 'middleware', 'config', 'utils', 'pipelines', 'remotion', 'schemas']);
 
 // Empty today (2026-08-19) — every verify* script was audited and found
 // parallel-safe. Add a filename here if a future script needs exclusive
@@ -94,7 +119,10 @@ function git(args, opts) {
 
 /**
  * Returns the sorted list of affected verify scripts, or null to mean
- * "could not compute a diff — caller should fall back to running everything".
+ * "could not confidently resolve this — caller should fall back to running
+ * everything" (either because the diff itself couldn't be computed, or
+ * because a changed file under a CORE_DIRS directory matched no script and
+ * that's treated as a heuristic gap rather than a real "unaffected" verdict).
  */
 function computeAffected(base) {
   const ref = base || 'origin/main';
@@ -131,19 +159,74 @@ function computeAffected(base) {
   }
 
   // 2. Any other changed file: a verify script is affected if its source
-  //    text mentions the changed file's basename (require/readFileSync
-  //    target, typically). Skip very short basenames (index.js, etc.) to
-  //    avoid drowning the selection in noise.
+  //    text mentions the changed file, checked two ways:
+  //
+  //    a) PRECISE — the "dir/basename" path fragment (e.g. "models/Ad" for
+  //       models/Ad.js, "routes/ads" for routes/ads.js). This is what a
+  //       relative require()/require.resolve()/path.join() target actually
+  //       looks like in source (require('../models/Ad'), require(path.join
+  //       (ROOT, 'models/Ad')), require.resolve('../models/Ad')), and it's
+  //       specific enough as a substring that it needs no length gate — so
+  //       short filenames (Ad.js, Job.js, me.js, ads.js) are matched exactly
+  //       instead of being silently excluded as "noise".
+  //    b) FUZZY — the bare basename on its own, gated to >=4 chars. This is
+  //       supplementary recall for mentions the precise check can't catch
+  //       (comments, fixture strings, non-require references); gating it
+  //       avoids drowning the selection in false positives from generic
+  //       short tokens, which is safe to do here because it is never the
+  //       only mechanism a real dependency relies on — (a) has already
+  //       covered the exact-path case with no gate.
   if (remaining.length) {
-    const needles = remaining
-      .map(rel => path.basename(rel, path.extname(rel)))
-      .filter(n => n.length >= 4);
-    if (needles.length) {
-      for (const script of allScripts) {
-        if (selected.has(script)) continue;
-        const src = fs.readFileSync(path.join(SCRIPTS_DIR, script), 'utf8');
-        if (needles.some(n => src.includes(n))) selected.add(script);
+    const sourceCache = new Map();
+    const sourceOf = (script) => {
+      if (!sourceCache.has(script)) {
+        sourceCache.set(script, fs.readFileSync(path.join(SCRIPTS_DIR, script), 'utf8'));
       }
+      return sourceCache.get(script);
+    };
+
+    const matchedAny = new Set(); // changed-file rel paths that hit >=1 script
+    for (const rel of remaining) {
+      const ext = path.extname(rel);
+      const relNoExt = rel.slice(0, rel.length - ext.length);
+      const segments = relNoExt.split('/');
+      const dirBase = segments.slice(-2).join('/'); // e.g. "models/Ad"
+      const baseNoExt = segments[segments.length - 1]; // e.g. "Ad"
+
+      for (const script of allScripts) {
+        if (sourceOf(script).includes(dirBase)) {
+          selected.add(script);
+          matchedAny.add(rel);
+        }
+      }
+
+      if (baseNoExt.length >= 4) {
+        for (const script of allScripts) {
+          if (selected.has(script)) continue;
+          if (sourceOf(script).includes(baseNoExt)) {
+            selected.add(script);
+            matchedAny.add(rel);
+          }
+        }
+      }
+    }
+
+    // 3. Fail loud, not silent: a changed file under a directory everything
+    //    else routinely depends on (CORE_DIRS) that still matched nothing is
+    //    a signal the heuristic couldn't confidently resolve it — not proof
+    //    it has zero dependents (e.g. models/Job.js today: a real, actively
+    //    required model with no verify* script exercising it directly). Fall
+    //    back to the full suite rather than report a clean "nothing to run".
+    const unresolvedCore = remaining.filter(
+      (rel) => CORE_DIRS.has(rel.split('/')[0]) && !matchedAny.has(rel)
+    );
+    if (unresolvedCore.length) {
+      console.error(
+        `runVerifySuite: --affected could not confidently resolve dependents for ` +
+        `${unresolvedCore.join(', ')} (changed core-dir file(s) matched no verify ` +
+        `script). Falling back to the FULL suite rather than risk a false "nothing to run".`
+      );
+      return null;
     }
   }
 
@@ -202,7 +285,7 @@ async function main() {
   } else if (opts.affected) {
     const affected = computeAffected(opts.affectedBase);
     if (affected === null) {
-      console.log('runVerifySuite: --affected could not compute a diff; falling back to the FULL suite.\n');
+      console.log('runVerifySuite: --affected could not confidently resolve the affected set; falling back to the FULL suite.\n');
       scripts = allScripts;
     } else {
       scripts = affected;

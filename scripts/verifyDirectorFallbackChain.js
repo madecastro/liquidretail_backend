@@ -317,15 +317,36 @@ await check('C4 the wall-clock budget stops the chain from STARTING more work', 
   process.env.ATLAS_LLM_CHAIN_BUDGET_MS = '60';
   delete require.cache[require.resolve('../services/atlasLlmService')];
   const llm2 = require('../services/atlasLlmService');
-  // Each stubbed request burns 40ms of wall clock, so the budget admits the
+  // Each stubbed request burns 40 (logical) ms, so the budget admits the
   // first two starts and refuses the third — the real shape, just scaled down
   // from 210s / 75s. The gate is on STARTING: an in-flight attempt is never
   // cut short, because truncating it would trade a clean verdict for an
   // ambiguous maybe-billed timeout.
+  //
+  // DETERMINISM (fixed 2026-08-19): this used to burn the 40ms with a REAL
+  // setTimeout and race it against atlasLlmService's real Date.now() budget
+  // check. Under CPU oversubscription (measured: 20% of runs at
+  // --concurrency=16, always this check) the scheduler doesn't guarantee a
+  // setTimeout(40) returns within a 60ms wall-clock window, so the second
+  // call sometimes never started and `calls.length` came back 1 instead of
+  // 2 — a scheduler race, not a budget-logic bug. Faking BOTH the clock
+  // atlasLlmService reads (Date.now) and the "work" the stub does (advance a
+  // counter instead of actually waiting) takes the host scheduler out of the
+  // assertion entirely: the elapsed time the budget gate sees is now
+  // *computed*, not *measured*, so this asserts the gate logic deterministically
+  // instead of racing it.
   installHttp([err429(), err429(), err429(), err429()]);
   const inner = axios.post;
-  axios.post = async (...args) => { await new Promise(r => setTimeout(r, 40)); return inner(...args); };
-  const err = await expectThrow(() => llm2.chatCompletion(META, DIRECTOR_PARAMS()));
+  const realDateNow = Date.now;
+  let fakeNow = realDateNow();
+  Date.now = () => fakeNow;
+  axios.post = async (...args) => { fakeNow += 40; return inner(...args); };
+  let err;
+  try {
+    err = await expectThrow(() => llm2.chatCompletion(META, DIRECTOR_PARAMS()));
+  } finally {
+    Date.now = realDateNow;
+  }
   assert.strictEqual(calls.length, 2, `budget must stop the walk, saw ${calls.length} upstream calls`);
   assert.ok(err.chain.some(r => r.code === 'BUDGET_EXHAUSTED'),
     'a budget stop must be RECORDED, never a silent gap that reads as if the link was never in the chain');
