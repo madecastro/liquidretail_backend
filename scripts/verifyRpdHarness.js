@@ -787,6 +787,40 @@ const codeOnly = (src) => src
     }
   });
 
+  // ── K. the knowledge a session needs is present and wired ──────────────
+  console.log('\nK. prompt-knowledge preload');
+  check('K1 the element catalog reads LIVE constants and covers every lever', () => {
+    // A hand-maintained list would drift from the code the moment a directive is
+    // edited, which is exactly the failure this replaces.
+    const cat = require(path.join(RPD, 'lib', 'promptCatalog'));
+    const veo = require(path.join(__dirname, '..', 'services', 'veoPromptBuilder'));
+    for (const profile of cat.videoProfiles()) {
+      const els = cat.videoElements(profile);
+      assert(els.length >= 10, `${profile} should expose its directive keys (got ${els.length})`);
+      const live = profile === 'lifestyle' ? veo.LIFESTYLE_DIRECTIVES : veo.directivesForProfile(profile);
+      assert.deepStrictEqual(els.map((e) => e.key).sort(), Object.keys(live).sort(),
+        `${profile} catalog must match the live directive set exactly`);
+    }
+    const stat = cat.staticElements();
+    assert(stat.some((e) => e.key === 'PRODUCT_FIDELITY' && e.text && e.text.length > 100));
+    // Every lever must carry a meaning, or the CLI teaches nothing.
+    for (const e of cat.videoElements('gemini-omni')) assert(e.meaning, `video ${e.key} needs a meaning`);
+    for (const e of stat) assert(e.meaning, `static ${e.key} needs a meaning`);
+  });
+  check('K2 the skill preloads the element + mechanics references', () => {
+    const skillDir = path.join(__dirname, '..', '.claude', 'skills', 'rpd-experiments');
+    const skill = read(path.join(skillDir, 'SKILL.md'));
+    for (const ref of ['prompt-elements.md', 'prompt-mechanics.md']) {
+      assert(fs.existsSync(path.join(skillDir, 'references', ref)), `${ref} must exist`);
+      assert(skill.includes(ref), `SKILL.md must point at ${ref} or no session will load it`);
+    }
+    // The three traps a brainstorm must not walk into.
+    const elements = read(path.join(skillDir, 'references', 'prompt-elements.md'));
+    assert(/deliberate/i.test(elements) && /dissolve/i.test(elements), 'the crossfade/dissolve contradiction must be documented');
+    assert(/DO NOT REMOVE/.test(elements), 'noText must be marked do-not-remove');
+    assert(/29%/.test(elements), 'the fidelity ceiling must be documented');
+  });
+
   console.log(`\n${passed} passed, ${failed} failed`);
   process.exit(failed ? 1 : 0);
 })().catch((err) => {

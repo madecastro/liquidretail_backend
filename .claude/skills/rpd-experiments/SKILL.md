@@ -1,6 +1,6 @@
 ---
 name: rpd-experiments
-description: Run rapid product development (RPD) experiments — A/B video models and prompt variants against the real production prompt builder, outside the Ad pipeline, then publish a gallery with notes to Cloudflare Pages and log the learning. Use when the user wants to test video models against each other, try prompt changes (guidance, raw rewrites, canonical-directive edits, surgical patches), compare generation quality/cost/latency, build or publish an experiment gallery, or asks to "run an experiment", "test this prompt", "compare models", or "use the RPD harness". Every run collects cost + timing telemetry for forecasting.
+description: Run rapid product development (RPD) experiments — A/B video models and prompt variants against the real production prompt builder, outside the Ad pipeline, then publish a gallery with notes and log the learning. Use when the user wants to test video models against each other, try prompt changes (guidance, raw rewrites, canonical-directive edits, surgical patches), compare generation quality/cost/latency, build or publish an experiment gallery, or asks to "run an experiment", "test this prompt", "compare models", or "use the RPD harness". Every run collects cost + timing telemetry for forecasting.
 ---
 
 # RPD experiments
@@ -8,12 +8,42 @@ description: Run rapid product development (RPD) experiments — A/B video model
 The harness lives at `scripts/rpd/` (read its `README.md` for full detail). It runs entirely from
 this checkout — **no deploy, no Mongo, no Ad rows, no CostLog**. Cells = `models × variants`.
 
-Deep guides in this skill (read the one the task needs):
-- `references/spec-authoring.md` — full spec schema, all four prompt levers with their exact
-  production mappings, directive keys, titling copy rules, matrix patterns that work.
-- `references/operations.md` — credentials per person, exact money semantics with measured
-  price points, resume/finished semantics, the telemetry fields with reference numbers for
-  time forecasting, the sharing checklist, and the agent-loop recipe.
+Deep guides in this skill:
+- **`references/prompt-elements.md`** — every prompt lever, what it CONTROLS, and whether to
+  recommend changing it. **READ THIS BEFORE DISCUSSING ANY PROMPT CHANGE.**
+- **`references/prompt-mechanics.md`** — how the prompt is ASSEMBLED: profile selection, the
+  exact line order, where operator text comes from, the byte-cap sacrifice order, and which
+  inputs change the wording without any prompt edit. Read it before answering "why did it say
+  that?" or "what would actually change?"
+- `references/spec-authoring.md` — full spec schema, every lever's production mapping,
+  titling copy rules, matrix patterns that work.
+- `references/operations.md` — credentials, exact money semantics with measured price points,
+  resume/finished semantics, telemetry fields for forecasting, the sharing checklist.
+
+## Brainstorming a prompt change (the most common request)
+
+The audience is often semi-technical: *"what if we used Grok instead of Omni?"*,
+*"what if we changed this part of the prompt?"*. They rely on you to know what the parts
+are. So:
+
+1. **Ground on the live text FIRST — never describe a prompt element from memory.**
+   ```bash
+   node scripts/rpd/rpd.js prompt                    # video: elements + what each does + current text
+   node scripts/rpd/rpd.js prompt --kind static      # static blocks
+   node scripts/rpd/rpd.js prompt --key transitions  # one in full + a paste-ready variant
+   node scripts/rpd/rpd.js models                    # models, caps, floor estimates
+   ```
+   These strings change, and one pair is **deliberately self-contradictory** in a way that
+   reads like a bug (see the traps in `prompt-elements.md`). Quote what it actually says.
+2. **Name which lever the idea maps to**, and say when it maps to none — "put the headline in
+   the video" is the titling path, not the camera prompt.
+3. **Say when a prompt change is the wrong tool.** Fidelity complaints usually are not fixed
+   by stronger wording; prompt levers move motion, pacing, look and scene.
+4. **One variable per arm**, baseline included, and pick a product whose logo/label IS the test.
+5. **Dry-run — it is free** and prints the exact prompt per cell, so they see what will be sent
+   before any money moves.
+6. **Ask for the dollar cap.** Never invent one.
+7. Note observations, publish, add a LEARNINGS row. Say plainly when n=1 proves little.
 
 ## The safety contract (do not improvise around it)
 
@@ -38,7 +68,8 @@ node scripts/rpd/rpd.js resume <runDir>            # finish interrupted runs (fr
 node scripts/rpd/rpd.js eval <runDir>              # vision-grade cells (own cap: --eval-max-usd)
 node scripts/rpd/rpd.js stats                      # cost + latency across all runs (--csv)
 node scripts/rpd/rpd.js note <runDir> <cellId|run> "observation"
-node scripts/rpd/rpd.js publish <runDir> --project rs-rpd    # Cloudflare Pages URL + Slack
+node scripts/rpd/rpd.js prompt                     # what can I change + current text (free)
+node scripts/rpd/rpd.js publish <runDir>           # Netlify gallery URL + Slack
 ```
 
 **Both media types.** A spec can carry a video section (`models` + `variants`), a `static` section
@@ -76,9 +107,11 @@ levers per variant — `guidance` (prepend), `raw` (full replace), `directives`
 
 After every meaningful run:
 1. `note` your observations onto cells and the run (they render in the gallery).
-2. `publish` and copy the Pages URL.
+2. `publish` and copy the gallery URL (Netlify, site `rs-rpd` in the Flood QRF team).
 3. Append one row to `scripts/rpd/LEARNINGS.md` (date, spec name, settled cost, URL, one-line
    takeaway) and commit it with your branch — that file is the shared experiment log.
 
 Credentials: `ATLAS_API_KEY` (Render WEB dashboard or local `.env`) for live runs;
-`CLOUDFLARE_API_TOKEN` + `CLOUDFLARE_ACCOUNT_ID` for publish. Never print or commit either.
+`NETLIFY_AUTH_TOKEN` + `RPD_NETLIFY_TEAM` for publish (a token, not `netlify switch` — the token
+selects the account and is the only thing that works on a hosted runner). Never print or commit
+either. `manifest.json` is never published — it is the run ledger.

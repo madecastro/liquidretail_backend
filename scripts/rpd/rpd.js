@@ -9,6 +9,7 @@
 //   node scripts/rpd/rpd.js gallery <runDir>
 //   node scripts/rpd/rpd.js note <runDir> <cellId|run> "text"
 //   node scripts/rpd/rpd.js publish <runDir> [--project rs-rpd]
+//   node scripts/rpd/rpd.js prompt [--kind video|static] [--key NAME] [--profile P]
 //   node scripts/rpd/rpd.js models
 //
 // Dry-run is the default; --live is the only billable door and requires
@@ -129,6 +130,64 @@ async function main() {
     }
     await evalRun(runDir, { maxUsd });
     console.log(`Gallery: ${buildGallery(runDir)}`);
+    return;
+  }
+
+  // What can I change, and what does it say NOW? The grounding step for any
+  // "what if we changed this part of the prompt" conversation — free and offline.
+  if (cmd === 'prompt') {
+    const cat = require('./lib/promptCatalog');
+    const kind = (flagValue(args, '--kind') || 'video').toLowerCase();
+    const key = flagValue(args, '--key') || null;
+    const full = flag(args, '--full');
+
+    if (kind === 'static') {
+      const els = cat.staticElements();
+      if (key) {
+        const hit = els.find((e) => e.key === key);
+        if (!hit) throw new Error(`rpd: unknown static element "${key}" (have: ${els.map((e) => e.key).join(', ')})`);
+        if (hit.meaning) console.log(`\nWHAT IT DOES: ${hit.meaning}`);
+        console.log(`\n=== ${hit.key} (static) — CURRENT TEXT ===\n`);
+        console.log(hit.text || '(resolved to nothing — this block may be flag-gated off)');
+        console.log(`\n=== to test a replacement, add this variant to spec.static.variants ===\n`);
+        console.log(cat.exampleVariant('static', hit.key));
+        return;
+      }
+      console.log('\nSTATIC prompt elements you can replace (spec.static.variants[].blocks):\n');
+      for (const e of els) {
+        console.log(`  ${e.key}`);
+        if (e.meaning) console.log(`      WHAT IT DOES: ${e.meaning}`);
+        console.log(`      NOW: ${e.text ? cat.truncate(e.text, 110) : '(flag-gated off)'}`);
+      }
+      console.log(`\nIntents available (spec.static.intent): ${cat.staticIntents().join(', ')}`);
+      console.log('\nSee one in full:  node scripts/rpd/rpd.js prompt --kind static --key PRODUCT_FIDELITY');
+      return;
+    }
+
+    const profile = flagValue(args, '--profile') || 'gemini-omni';
+    if (!cat.videoProfiles().includes(profile)) {
+      throw new Error(`rpd: unknown profile "${profile}" (have: ${cat.videoProfiles().join(', ')})`);
+    }
+    const els = cat.videoElements(profile);
+    if (key) {
+      const hit = els.find((e) => e.key === key);
+      if (!hit) throw new Error(`rpd: unknown video element "${key}" (have: ${els.map((e) => e.key).join(', ')})`);
+      if (hit.meaning) console.log(`\nWHAT IT DOES: ${hit.meaning}`);
+      console.log(`\n=== ${hit.key} (video, ${profile}) — CURRENT TEXT ===\n`);
+      console.log(hit.text);
+      console.log(`\n=== to test a replacement, add this variant to spec.variants ===\n`);
+      console.log(cat.exampleVariant('video', hit.key));
+      return;
+    }
+    console.log(`\nVIDEO prompt elements you can replace — profile "${profile}" (spec.variants[].directives):\n`);
+    for (const e of els) {
+      console.log(`  ${e.key}`);
+      if (e.meaning) console.log(`      WHAT IT DOES: ${e.meaning}`);
+      console.log(`      NOW: ${full ? '\n      ' + e.text + '\n' : cat.truncate(e.text, 110)}`);
+    }
+    console.log(`\nProfiles: ${cat.videoProfiles().join(', ')}   (--profile <name>)`);
+    console.log('See one in full:  node scripts/rpd/rpd.js prompt --key transitions');
+    console.log('Static side:      node scripts/rpd/rpd.js prompt --kind static');
     return;
   }
 
