@@ -378,12 +378,25 @@ async function ensureDetectForProducts(catalogProductIds, {
   // primaries via isPrimaryVariant; without this a campaign using several
   // SKUs of one product would re-materialize + re-detect the same hero N
   // times). Map each requested id → primaryProductId || itself, dedupe.
-  const requested = await CatalogProduct.find({ _id: { $in: oids } })
+  //
+  // Scope both lookups below to brandId when the caller supplies one —
+  // expandWizardJob always does (defense in depth: a foreign catalogProductId
+  // that still reaches this function, e.g. via a same-brand Media's
+  // matchedProducts pointing cross-brand, must not reach enqueueProductDetect,
+  // a billed Gemini vision call, against another brand's product). But
+  // productMatchService's post-scale detect pre-warm passes brandId: null
+  // (an internal match result, not a request-body tenant to check against) —
+  // a hard filter here would silently break that caller, so the clause stays
+  // conditional.
+  const scope = brandId ? { brandId } : {};
+  const requested = await CatalogProduct.find({ _id: { $in: oids }, ...scope })
     .select('_id primaryProductId').lean();
   if (!requested.length) return { ensured: 0, ready: 0, timedOut: 0, total: 0 };
   const primaryOids = [...new Set(requested.map(p => String(p.primaryProductId || p._id)))]
     .map(toOid).filter(Boolean);
-  const products = await CatalogProduct.find({ _id: { $in: primaryOids }, imageUrl: { $ne: null } }).lean();
+  // primaryProductId could in theory point cross-brand on bad data, so this
+  // second lookup stays in-scope too, not just the first.
+  const products = await CatalogProduct.find({ _id: { $in: primaryOids }, imageUrl: { $ne: null }, ...scope }).lean();
   if (!products.length) return { ensured: 0, ready: 0, timedOut: 0, total: 0 };
 
   // 1. Materialize + enqueue detect for products without a hero wrapper.
