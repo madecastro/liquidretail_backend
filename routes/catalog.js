@@ -256,100 +256,187 @@ router.get('/', async (req, res) => {
     // historical ads still resolve their source product row.
     filter.deletedAt = null;
 
-    // Sort by matchCount desc → lastSyncedAt desc so products with
-    // UGC matches stack at the top. Done as a single aggregation so
-    // pagination is correct across the full ranked set (a per-page
-    // join wouldn't move a high-traffic product on page 4 to page 1).
+    // ── Scale fix (2026-08-19) ───────────────────────────────────────
+    // This used to be one aggregate() that ran a $lookup into
+    // productmatchartifacts (matchCount) AND a correlated self-$lookup
+    // into catalogproducts (variantCount / siblings) for EVERY row
+    // matching `filter`, THEN $sort + $skip + $limit. Cost scaled with
+    // total catalog size, not page size, because both lookups ran
+    // before pagination narrowed anything down. Measured live against
+    // production Mongo:
+    //   - Vuori 2 (10,553 products, brandId 6a856fe9b31cf7b22149c0af):
+    //     $match+$addFields alone: ~130ms. Adding just the
+    //     productmatchartifacts $lookup: +17.2s. Adding the siblings
+    //     self-$lookup on top: did not finish in 2 minutes (production
+    //     hits Render's ~29s gateway timeout well before that -> 504).
+    //   - productmatchartifacts.catalogProductId (the $lookup's
+    //     foreignField) had NO index, so every one of the 10,553 outer
+    //     docs ran a collection scan of productmatchartifacts.
+    //   - The siblings $lookup used $expr inside its pipeline, which
+    //     cannot use an index at all — same per-outer-doc collection
+    //     scan problem, against catalogproducts itself (self-join).
+    //   - Separately, catalogproducts had no compound index covering
+    //     {brandId, deletedAt, lastSyncedAt} — the plain $sort stage
+    //     alone did a blocking in-memory sort of the whole filtered
+    //     set; explain() showed totalDocsExamined=10553 for a 100-row
+    //     page, and at a deep offset (10000) it hard-errored with
+    //     QueryExceededMemoryLimitNoDiskUseAllowed (code 292, >32MB).
+    //   - `q=denim` "fixing" it was real but coincidental: search
+    //     shrinks the $match'd set the lookups then ran over, so it
+    //     just did less of the same expensive thing — not evidence the
+    //     lookups themselves were cheap.
     //
-    // Mongoose's find() auto-casts string ids → ObjectId based on the
-    // schema; aggregate() does NOT. Re-cast brandId / advertiserId
-    // here so the $match stage hits the same docs countDocuments does.
-    const aggFilter = { ...filter };
-    if (typeof aggFilter.brandId === 'string' && mongoose.Types.ObjectId.isValid(aggFilter.brandId)) {
-      aggFilter.brandId = new mongoose.Types.ObjectId(aggFilter.brandId);
-    }
-    if (typeof aggFilter.advertiserId === 'string' && mongoose.Types.ObjectId.isValid(aggFilter.advertiserId)) {
-      aggFilter.advertiserId = new mongoose.Types.ObjectId(aggFilter.advertiserId);
-    }
-    // 2026-08-18 fix — same string/ObjectId cast trap as brandId/advertiserId
-    // above, but for the `?ids=` batch-hydration filter. aggregate()'s raw
-    // $match never auto-casts, so `_id: { $in: [<string ids>] }` matched
-    // ZERO rows here even though countDocuments(filter) (which DOES use
-    // find()-style schema casting) reported the correct `total`. Silent
-    // empty result: `res.products` came back `[]` while `total` said 1.
-    // This is exactly the mechanism Step2Picker.tsx's pre-selected-id
-    // hydration depends on (a deep link from the Catalog Browser / Media
-    // Library, or a campaign's pinned products, landing on a product
-    // outside the picker's current page) — so it was silently failing
-    // whenever the pinned/deep-linked id wasn't already in the first page.
-    if (aggFilter._id && Array.isArray(aggFilter._id.$in)) {
-      aggFilter._id = { $in: aggFilter._id.$in
-        .filter(id => mongoose.Types.ObjectId.isValid(id))
-        .map(id => new mongoose.Types.ObjectId(id)) };
+    // Fix: `matches` (ProductMatchArtifact) is a small collection
+    // regardless of catalog size (global total is in the low
+    // thousands, driven by UGC-match events, not by how many products
+    // a brand has synced). So resolve "which products have any match"
+    // with ONE cheap, unfiltered $group over that whole collection
+    // (bounded — see MAX_MATCH_GROUPS below for the degenerate-case
+    // cap), then split the response into two segments that never touch
+    // more than O(page size) or O(match count) documents:
+    //   - "matched" segment: the (small, bounded) set of this brand's
+    //     rows whose effectiveProductId has a match — materialized in
+    //     full, sorted by matchCount desc then lastSyncedAt desc in JS.
+    //   - "rest" segment: everything else, fetched via a plain
+    //     find().sort({lastSyncedAt:-1}).skip().limit() that now hits
+    //     the new {brandId,deletedAt,lastSyncedAt} compound index
+    //     (models/CatalogProduct.js) — confirmed via explain() to do
+    //     IXSCAN+FETCH+LIMIT with exactly `limit` keys/docs examined,
+    //     no SORT stage, regardless of catalog size or offset.
+    // variantCount (siblings) is likewise only computed for the page
+    // actually being returned (≤100 rows), via one $group over just
+    // those rows' itemGroupIds — never a per-row self-join.
+    //
+    // Re-verified end to end against all 4 real brands after this fix
+    // landed — see PR description for the before/after timings.
+
+    let brandObjId = brandId;
+    if (typeof brandId === 'string' && mongoose.Types.ObjectId.isValid(brandId)) {
+      brandObjId = new mongoose.Types.ObjectId(brandId);
     }
 
-    const [rows, total, distinctCategories, totalDrafts] = await Promise.all([
-      CatalogProduct.aggregate([
-        { $match: aggFilter },
-        // Variant inheritance — non-primary variants resolve matches via
-        // their primary (productMatchService only matches against primaries).
-        // effectiveProductId = primaryProductId || _id makes the matchCount
-        // on a 12-pack card mirror its 3-pack primary instead of zero.
-        { $addFields: { effectiveProductId: { $ifNull: ['$primaryProductId', '$_id'] } } },
-        { $lookup: {
-            from:         'productmatchartifacts',
-            localField:   'effectiveProductId',
-            foreignField: 'catalogProductId',
-            as:           'matches'
-        }},
-        // Sibling variant count — only meaningful when itemGroupId is
-        // set (Meta's variant grouping). Title-based groups would
-        // need a normalized-string $lookup which isn't worth the
-        // pipeline cost; siblings stay 0 in that case.
-        { $lookup: {
-            from: 'catalogproducts',
-            let:  { gid: '$itemGroupId', bid: '$brandId', myId: '$_id' },
-            pipeline: [
-              { $match: { $expr: { $and: [
-                  { $ne: ['$$gid', null] },
-                  { $eq: ['$itemGroupId', '$$gid'] },
-                  { $eq: ['$brandId', '$$bid'] },
-                  { $ne: ['$_id', '$$myId'] }
-              ] } } },
-              { $count: 'n' }
-            ],
-            as: 'siblings'
-        }},
-        { $addFields: {
-            matchCount:   { $size: '$matches' },
-            variantCount: { $ifNull: [{ $arrayElemAt: ['$siblings.n', 0] }, 0] }
-        }},
-        { $sort: { matchCount: -1, lastSyncedAt: -1 } },
-        { $skip:  offset },
-        { $limit: limit },
-        { $project: {
-            externalId: 1, source: 1, draft: 1, title: 1, brand: 1, category: 1,
-            price: 1, currency: 1, availability: 1, imageUrl: 1, productUrl: 1,
-            // Hero + alts surfaced so the brand-kind unified ribbon can
-            // render alt tiles and key (productId, altMediaId) exclusions.
-            additionalImages: 1, imageMediaId: 1, additionalImageMediaIds: 1,
-            rating: 1, reviews: 1, gtin: 1, mpn: 1,
-            itemGroupId: 1, isPrimaryVariant: 1, variantCount: 1,
-            detectedFromMediaId: 1, firstSeenAt: 1, lastSyncedAt: 1,
-            matchCount: 1
-        }}
+    // Degenerate-case cap (item 4 in the bug report): if the number of
+    // distinct matched products ever grew unboundedly large, this
+    // $group is the one piece of this query whose cost isn't strictly
+    // bounded by page size. Capping it means an operator on a brand
+    // with pathologically many matches still gets the page back fast —
+    // matches beyond the cap simply fall into the "rest" segment
+    // (still shown, just no longer guaranteed to rank above unmatched
+    // rows) rather than the request degrading or timing out. Today's
+    // real number is in the low thousands across the ENTIRE database
+    // (not per brand), so this cap is not expected to bind in practice.
+    const MAX_MATCH_GROUPS = 5000;
+    const [matchGroups, total, distinctCategories, totalDrafts] = await Promise.all([
+      ProductMatchArtifact.aggregate([
+        { $match: { catalogProductId: { $ne: null } } },
+        { $group: { _id: '$catalogProductId', n: { $sum: 1 } } },
+        { $sort: { n: -1 } },
+        { $limit: MAX_MATCH_GROUPS }
       ]),
       CatalogProduct.countDocuments(filter),
       CatalogProduct.distinct('category', { brandId }),
       CatalogProduct.countDocuments(tenantFilter(req, { brandId, draft: true, deletedAt: null }))
     ]);
 
+    const LIST_PROJECTION = {
+      externalId: 1, source: 1, draft: 1, title: 1, brand: 1, category: 1,
+      price: 1, currency: 1, availability: 1, imageUrl: 1, productUrl: 1,
+      additionalImages: 1, imageMediaId: 1, additionalImageMediaIds: 1,
+      rating: 1, reviews: 1, gtin: 1, mpn: 1,
+      itemGroupId: 1, isPrimaryVariant: 1, primaryProductId: 1,
+      detectedFromMediaId: 1, firstSeenAt: 1, lastSyncedAt: 1
+    };
+
+    const matchCountByEffectiveId = new Map(matchGroups.map(g => [String(g._id), g.n]));
+    const matchedPrimaryIds = matchGroups.map(g => g._id);
+
+    // "matched" segment — variant inheritance preserved exactly as
+    // before: a non-primary variant's effectiveProductId is
+    // primaryProductId || _id, so a 12-pack card still mirrors its
+    // 3-pack primary's matchCount instead of showing zero.
+    let matchedDocs = [];
+    if (matchedPrimaryIds.length) {
+      const matchedOr = [{ _id: { $in: matchedPrimaryIds } }, { primaryProductId: { $in: matchedPrimaryIds } }];
+      const matchedFilter = { ...filter };
+      if (matchedFilter.$or) {
+        matchedFilter.$and = [...(matchedFilter.$and || []), { $or: matchedFilter.$or }, { $or: matchedOr }];
+        delete matchedFilter.$or;
+      } else {
+        matchedFilter.$or = matchedOr;
+      }
+      matchedDocs = await CatalogProduct.find(matchedFilter).select(LIST_PROJECTION).lean();
+      matchedDocs.forEach(d => {
+        const eff = d.primaryProductId ? String(d.primaryProductId) : String(d._id);
+        d.matchCount = matchCountByEffectiveId.get(eff) || 0;
+      });
+      matchedDocs.sort((a, b) =>
+        (b.matchCount - a.matchCount) || (new Date(b.lastSyncedAt || 0) - new Date(a.lastSyncedAt || 0)));
+    }
+
+    // "rest" segment — everything not already captured above.
+    // find()'s schema-based casting handles brandId/_id/etc, so no
+    // manual ObjectId re-casting is needed here (unlike the old
+    // aggregate()-based $match).
+    const restFilter = { ...filter };
+    if (matchedDocs.length) {
+      restFilter._id = { ...(restFilter._id || {}), $nin: matchedDocs.map(d => d._id) };
+    }
+
+    let pageDocs;
+    if (offset < matchedDocs.length) {
+      const fromMatched = matchedDocs.slice(offset, offset + limit);
+      const remaining = limit - fromMatched.length;
+      const fromRest = remaining > 0
+        ? await CatalogProduct.find(restFilter).select(LIST_PROJECTION)
+            .sort({ lastSyncedAt: -1 }).skip(0).limit(remaining).lean()
+        : [];
+      pageDocs = fromMatched.concat(fromRest);
+    } else {
+      pageDocs = await CatalogProduct.find(restFilter).select(LIST_PROJECTION)
+        .sort({ lastSyncedAt: -1 }).skip(offset - matchedDocs.length).limit(limit).lean();
+    }
+    pageDocs.forEach(d => { if (d.matchCount == null) d.matchCount = 0; });
+
+    // variantCount (siblings) — computed only for the ≤`limit` rows on
+    // this page, one $group over their itemGroupIds. Brand-scoped only
+    // (no deletedAt filter), matching the exact scope the old
+    // self-$lookup used.
+    //
+    // Bonus bug fix found while rewriting this, confirmed live: the OLD
+    // self-$lookup's $expr used `{ $ne: ['$$gid', null] }` to skip
+    // products with no itemGroupId — but a $let variable bound to a
+    // genuinely MISSING field does not get the usual "missing == null"
+    // treatment once captured through $$var, so that $ne evaluated
+    // TRUE anyway. Net effect: for any product with NO itemGroupId
+    // (the common case — every real itemGroupId in production today is
+    // unique to a single product, i.e. there are currently zero real
+    // multi-member groups), the old code counted every OTHER
+    // itemGroupId-less product in the same brand as a "sibling" and
+    // showed a bogus "+N variants" badge (CatalogBrowser/Sidebar.tsx) —
+    // e.g. +13 on Vuori Clothing, +56 on Pelagic Gear, confirmed live
+    // against production data. This rewrite's `.filter(Boolean)` on
+    // itemGroupId only ever counts real, shared, non-empty itemGroupId
+    // values, so those badges now correctly read 0 (no known legitimate
+    // case currently depends on the old, wrong number).
+    const pageGroupIds = [...new Set(pageDocs.map(d => d.itemGroupId).filter(Boolean))];
+    let siblingCountByGroupId = new Map();
+    if (pageGroupIds.length) {
+      const sibRows = await CatalogProduct.aggregate([
+        { $match: { brandId: brandObjId, itemGroupId: { $in: pageGroupIds } } },
+        { $group: { _id: '$itemGroupId', n: { $sum: 1 } } }
+      ]);
+      siblingCountByGroupId = new Map(sibRows.map(r => [r._id, r.n]));
+    }
+    pageDocs.forEach(d => {
+      d.variantCount = d.itemGroupId ? Math.max(0, (siblingCountByGroupId.get(d.itemGroupId) || 1) - 1) : 0;
+    });
+
     res.json({
-      products: rows.map(r => projectListRow(r, r.matchCount || 0)),
+      products: pageDocs.map(r => projectListRow(r, r.matchCount || 0)),
       total,
       limit,
       offset,
-      hasMore: offset + rows.length < total,
+      hasMore: offset + pageDocs.length < total,
       categories: distinctCategories.filter(Boolean).sort(),
       totalDrafts
     });
@@ -438,8 +525,12 @@ router.get('/categories', async (req, res) => {
     // req.advertiserId as a String, so passing its result straight into
     // $match compares '<string>' to ObjectId docs and matches nothing —
     // every category then shows productCount:0. Same class of bug
-    // CLAUDE.md §4 flags. Cast explicitly here (same pattern the main
-    // GET /api/catalog handler uses at aggFilter).
+    // CLAUDE.md §4 flags. Cast explicitly here — this route still needs
+    // it because it calls CatalogProduct.aggregate() directly; the main
+    // GET / list handler no longer does (2026-08-19 scale fix moved it
+    // to find(), which auto-casts, for everything except this
+    // siblings/variantCount side-query, which casts brandId the same
+    // way for the same reason).
     const aggAdvertiserId = mongoose.isValidObjectId(req.advertiserId)
       ? new mongoose.Types.ObjectId(String(req.advertiserId))
       : req.advertiserId;
