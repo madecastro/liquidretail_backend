@@ -26,6 +26,7 @@ const {
   technicalInsightsFromStored,
   shouldApplyStoredShot
 } = require('./ingestShotClassifyService');
+const { isUnusableThumbnailUrl } = require('./catalogImageQuality');
 
 // MATERIALISATION cost gate — how many alts get mirrored to Cloudinary +
 // a Media row. SEPARATE knob from CATALOG_MAX_ADDITIONAL_IMAGES (storage,
@@ -589,6 +590,23 @@ async function createDetectRunIfAbsent(media, product) {
 // different brand's catalog with a coincidentally-matching synthetic
 // id can't collide.
 async function materializeImage({ sourceUrl, product, imageRole, feedIndex = null }) {
+  // 2026-08-18 fix — refuse to mirror a known-broken thumbnail (Google
+  // Shopping / Lens `encrypted-tbn*.gstatic.com`) into a Media doc. This is
+  // the actual choke point for BOTH callers below (enqueueProductDetect's
+  // hero+alt loop AND the lazy backfills materializeMissingHero /
+  // materializeMissingAlts) — gating here instead of duplicating the check
+  // at each call site means no future caller can reintroduce the hole.
+  // Without this, `imageMediaId` got stamped from a mirrored gstatic
+  // thumbnail, which is exactly the signal the picker (and the render
+  // pipeline's default-seed resolution) reads as "this product is
+  // generation-ready" — see services/catalogImageQuality.js for the full
+  // incident writeup. Returning null here is already a handled case in
+  // every caller (`if (heroMedia) …` / `if (altMedia) …`), so this is a
+  // pure narrowing of what counts as "materialized", not a new failure mode.
+  if (isUnusableThumbnailUrl(sourceUrl)) {
+    console.log(`   · catalog-product materialize skip[${product._id}]: ${imageRole} sourceUrl is an unusable thumbnail (${sourceUrl})`);
+    return null;
+  }
   const externalId = `cp_${product._id}_${imageRole}_${hashShort(sourceUrl)}`;
 
   // Ingest-time shot style (CatalogProduct.imageShotStyles, URL-keyed).

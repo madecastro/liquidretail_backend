@@ -193,6 +193,37 @@ out captioned "image still processing" for a catalog ingested weeks earlier.
   response, alt crop galleries and operator exclusion pairings all zip by index,
   so compacting silently mis-pairs every alt.
 
+#### `imageMediaId` existing is NOT the same as the hero being a real photo (2026-08-18)
+
+A THIRD trap in the same family as the one above: a hero **Media doc existing**
+(`imageMediaId` truthy) used to be treated as "this product has a real photo" —
+but `materializeImage` mirrors *whatever `CatalogProduct.imageUrl` currently
+holds*, with no check on what that URL actually points at. When
+`services/productDetailsService.js`'s SerpAPI gap-fill (see "Write-through fix"
+below) wrote a Google Shopping/Lens thumbnail
+(`encrypted-tbn*.gstatic.com/shopping?q=tbn:…` — a tiny proxy image that often
+fails to load) into `imageUrl`, `materializeImage` mirrored *that* into
+Cloudinary and stamped `imageMediaId` — so the picker's "is this generation-
+ready" signal fired true for a product that never had a usable photo. Verified
+live: 91 `CatalogProduct` rows across all brands, 90 `detect-identified` + 1
+`ig-catalog`.
+
+Fixed by adding one classifier, `services/catalogImageQuality.js`
+(`isUnusableThumbnailUrl` / `shouldFillImageUrl` / `unusableSeedImageReason` /
+`catalogSeedFields`), consumed at all three points that would otherwise drift
+independently: `productDetailsService.js` (refuse the gap-fill), this file's
+`materializeImage` (refuse to mirror a known-bad thumbnail into a Media doc /
+`imageMediaId` at all — the shared choke point for `enqueueProductDetect` AND
+the lazy `materializeMissingHero`/`materializeMissingAlts` backfills above), and
+`routes/catalog.js` `projectListRow` (surfaces `seedUnusable`/`seedIssue` on
+every list row, computed from the raw `imageUrl`, independent of
+`imageMediaId` — so this new check and the existing "processing" grey-out above
+stay two distinct, non-conflated states). Fence:
+`scripts/verifyCatalogImageSeedSafety.js` (37 checks, executes the real
+functions with Mongo/Cloudinary stubbed — not a source-text assertion).
+Backfill for already-corrupted rows: `scripts/backfillUnusableSeedImages.js`
+(dry-run by default).
+
 Fence: `scripts/verifyCatalogHeroMaterialize.js` (65 checks, offline).
 
 ### Default reference stacks — ENV-configurable (video and static, independently)
@@ -374,6 +405,7 @@ For stores with neither snippets nor a readable API. **Opt-in** (`REVIEW_HEADLES
 `services/productDetailsService.js` `writeThroughToCatalogProduct`:
 
 - **`rating`:** gap-fill only when row’s rating is **null** (never clobber on-page AggregateRating).
+- **`imageUrl`:** gap-fill only when row's `imageUrl` is empty AND the candidate (`fetched.thumbnail`) is not a known-unusable thumbnail (`services/catalogImageQuality.js` `shouldFillImageUrl`, added 2026-08-18 — see §3 "`imageMediaId` existing is NOT the same as the hero being a real photo" above for why).
 - **`ratingDistribution` / `reviews` / `specs` / `sellers` / `reviewSummary`:** cross-web data (disjoint from scan) — refresh in place.
 - Sets `detailsRefreshedAt`.
 
