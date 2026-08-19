@@ -390,14 +390,39 @@ router.post('/preview', async (req, res) => {
   }
 });
 
+// Tenant-ownership filter for POST /generate's productIds — a stale
+// cross-brand product picker (or a hand-crafted request) must not be able
+// to mint an Ad stamped with THIS campaign's brandId but ANOTHER brand's
+// CatalogProduct. Same filtering semantics as POST /campaigns/:id/products
+// (routes/campaigns.js), extracted here (rather than left inline) so
+// scripts/verifyGenerateProductTenancy.js can drive the real function
+// instead of a source-text regex or a reimplementation that keeps the name.
+// Empty input is not queried — an empty productIds array is the legitimate
+// media-library / brand-wide signal (see the comment at its call site) and
+// must reach here as a no-op, not a query over an empty $in.
+async function resolveOwnedProductIds(productIds, brandId) {
+  if (!productIds.length) return { ownedIds: [], droppedIds: [] };
+  const ownedProducts = await CatalogProduct.find({
+    _id: { $in: productIds },
+    brandId
+  }).select('_id').lean();
+  const ownedSet = new Set(ownedProducts.map((p) => String(p._id)));
+  return {
+    ownedIds: productIds.filter((id) => ownedSet.has(String(id))),
+    droppedIds: productIds.filter((id) => !ownedSet.has(String(id)))
+  };
+}
+
 // POST /api/ads/generate
 // Body: { campaignId, productIds, mediaIds, templateIds, cta:{text,url}, urlParams }
 // Response: 202 Accepted { campaignRunId, total, status: 'running' }
 router.post('/generate', async (req, res) => {
   try {
+    // let, not const: the brand-ownership check below re-assigns this after
+    // dropping any productId that doesn't belong to the campaign's brand.
+    let { productIds = [] } = req.body || {};
     const {
       campaignId,
-      productIds  = [],
       mediaIds    = [],
       templateIds = [],
       cta         = {},
@@ -522,6 +547,50 @@ router.post('/generate', async (req, res) => {
     // re-pass it. Tenant-scoped so cross-tenant campaignIds 404.
     const gateCampaign = await Campaign.findOne(tenantFilter(req, { _id: campaignId })).select('brandId').lean();
     if (!gateCampaign) return res.status(404).json({ error: 'campaign not found' });
+
+    // Tenant assertion on every passed productId — drop any that don't belong
+    // to this campaign's brand rather than 400-ing the whole request, same
+    // pattern as POST /campaigns/:id/products (routes/campaigns.js). Without
+    // this, a stale cross-brand product picker mints an Ad stamped with this
+    // campaign's brandId but another brand's CatalogProduct — and when no
+    // operator-picked mediaIds narrow the seeded universe, the tier-based
+    // catalog query resolves that OTHER brand's own media too, producing a
+    // fully cross-branded, billable ad. RE-MEASURED against prod 2026-08-19
+    // (Ad.productId's CatalogProduct.brandId vs the Ad's own brandId, via a
+    // Render one-off job — see session.md): 26 ads across 7 brand pairs,
+    // 2026-07-23..2026-08-11, 23 of the 26 carry a real billable CostLog
+    // receipt (atlas_video_render / direct_image), summing to ~$17.54. The
+    // prior draft of this comment said "11 with real Omni/image-gen
+    // receipts" — that number could not be reproduced and is superseded by
+    // this measurement; do not re-cite it.
+    if (productIds.length) {
+      const { ownedIds, droppedIds } = await resolveOwnedProductIds(productIds, gateCampaign.brandId);
+      if (droppedIds.length) {
+        console.warn(
+          `⚠️ /generate — dropped ${droppedIds.length} productId(s) not owned by brand ${gateCampaign.brandId}: ${droppedIds.join(', ')}`
+        );
+      }
+      // Every requested productId was unowned. Falling through here would
+      // silently reinterpret the request: campaignAdsGenerationService's
+      // `useBrandOnly = productIds.length === 0 && mediaIds.length === 0`
+      // treats an empty productIds array as "no product scope requested" —
+      // the legitimate media-library / brand-wide signal (see the
+      // "legitimately carry productIds:[]" comment on the CONCURRENT
+      // GENERATIONS block further down in this same handler). A caller who
+      // asked for specific (unowned) products would then get billed for a full
+      // brand-wide expansion instead of an honest failure — a scope blowup
+      // layered on top of the tenant leak this block exists to close. 400,
+      // do not fall through.
+      if (!ownedIds.length) {
+        return res.status(400).json({
+          error: 'none of the requested productIds belong to this campaign\'s brand',
+          code: 'products-not-owned',
+          droppedIds
+        });
+      }
+      productIds = ownedIds;
+    }
+
     const { getAdReadiness } = require('../services/adReadinessService');
     const readiness = await getAdReadiness(gateCampaign.brandId);
     if (!readiness.ready) {
@@ -4794,3 +4863,8 @@ module.exports.resolveDeriveFromMaster = resolveDeriveFromMaster;
 // show a stage it is actually sent, so "does the payload carry it" is the whole
 // contract and deserves a real call.
 module.exports.projectAd = projectAd;
+// TENANT-CRITICAL, exported for behavioural pinning by
+// scripts/verifyGenerateProductTenancy.js. Drives the real function against
+// a stubbed CatalogProduct.find rather than a source-text check, which
+// cannot see whether the brandId clause actually reaches the query.
+module.exports.resolveOwnedProductIds = resolveOwnedProductIds;

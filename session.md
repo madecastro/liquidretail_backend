@@ -69,18 +69,26 @@ it clears it back to this placeholder in the same commit that closes it out.)_
 *(Replace this whole section, don't append to it, when it goes stale.)*
 
 - Trunk `main` is moving fast — always `git fetch` before trusting a SHA here.
-  As of this update, `main` was at `dcca06cb` (the session.md → session.d/
-  restructure itself). **#235, #236, #238 merged** since the previous snapshot
-  below.
-- Open PRs at the time of this update: **#227** (backend, undispatched-tail
-  fix in progress — do not block it), plus RPD **#210/#212** (deliberately
-  deferred — do not touch). New this session: `fix/video-vision-qc` (video
-  post-render vision QC — see `session.d/2026-08-19_video-vision-qc.md`).
-- Offline verify: `for f in scripts/verify*.js; do node "$f" || echo "FAIL $f"; done`
-  — **160 scripts** as of this update (re-count before quoting, this number
-  drifts). `npm run lint` enables exactly one rule, `no-undef` — see
-  `CLAUDE.md` §5 for why that one rule matters more than it looks like it
-  should.
+  As of this update, `main` was at `c633e2c1` (apify-ig ingest comments
+  backfill). **#239, #240, #241, #242 merged** since the previous snapshot
+  below (dcca06cb).
+- Open PRs at the time of this update: RPD **#210/#212** (deliberately
+  deferred — do not touch). New this session: `fix/crossbrand-tenancy-generate`
+  — POST /generate never asserted requested productIds belong to the
+  campaign's brand; closed both in the route and in
+  `buildSeededUniverse`'s product-mode catalog query. Rescued from an
+  orphaned uncommitted working tree, verified against prod (26 cross-branded
+  ads, 7 brand pairs, ~$17.54 already billed on 23 of them — **not**
+  retroactively cleaned up, see KNOWN-OPEN), landed with a new offline
+  harness. See `session.d/2026-08-19_crossbrand-tenant-leak-generate-fix.md`.
+- Offline verify: `for f in scripts/verify*.js scripts/verify*.mjs; do node "$f" || echo "FAIL $f"; done`
+  — **170 scripts** as of this update (re-count before quoting, this number
+  drifts; use `node`'s own child_process timeout rather than shell job
+  control if you wrap this in a runner — a bash `&`/`wait` timeout wrapper
+  nested under this harness's own backgrounding misbehaved and silently
+  under-ran the sweep twice in a row 2026-08-19). `npm run lint` enables
+  exactly one rule, `no-undef` — see `CLAUDE.md` §5 for why that one rule
+  matters more than it looks like it should.
 - **Correction to a prior note below**: `verifyLogoSilhouette.js`,
   `verifyLogoColorPreservation.js`, `verifyStaticTextInk.js` failing in a
   fresh `git worktree` checkout (all three `require(path.join(__dirname,
@@ -100,12 +108,14 @@ it clears it back to this placeholder in the same commit that closes it out.)_
   still has no `timeout` binary — a loop that wraps each script in `timeout`
   will misreport all of them as failed regardless of the above.
 - Most recent entries (see `session.d/`, newest by filename date):
+  `2026-08-19_crossbrand-tenant-leak-generate-fix.md` (this update;
+  `fix/crossbrand-tenancy-generate`),
   `2026-08-19_video-vision-qc.md` (video ads now get the same post-render
-  vision QC statics have; `fix/video-vision-qc`),
-  `2026-08-19_vision-qc-surfacing-closed-last-gap-table-row.md` (PR #236, merged),
-  `2026-08-19_ad-readiness-gate-counted-only-the-legacy-apify-shopify-ingest-source.md`,
-  `2026-08-19_two-omni-masters-timed-out-run_1787119100250_eef4d871-the-real-defect.md`,
-  `2026-08-19_run-status-stopped-lying-gap-table-vs-slack-and-the-partial-failure-bu.md`.
+  vision QC statics have; landed as PR #240),
+  `2026-08-19_undispatched-tail-fix-stranded-ads-close-the-loop.md` (PR #241, merged),
+  `2026-08-19_reels-quote-opening-line-silently-dropped-fixed-pr-239.md` (PR #239, merged),
+  `2026-08-19_pelagic-ad-price-snapshots-repaired.md` (PR #242, merged),
+  `2026-08-19_vision-qc-surfacing-closed-last-gap-table-row.md` (PR #236, merged).
 
 ## KNOWN-OPEN
 
