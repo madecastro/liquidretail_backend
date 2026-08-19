@@ -99,6 +99,144 @@ the live-verified gateway rates; unknown model ids warn once instead of
 silently logging $0. Image/video calls record flat per-generation costs
 (`recordFlatCost`) with prices read from the live catalog.
 
+### Full charge-point audit (2026-08-19) — what reconciles, what never can
+
+**There is NO account-level billing/usage statement endpoint** — probed live
+with the real key: `/api/v1/usage`, `/api/v1/billing`, `/api/v1/account`,
+`/api/v1/credits`, `/v1/usage`, `/v1/billing`, `/api/v1/user/usage` are all
+404. **The real Billing Public API lives at a DIFFERENT base path,
+`/public/v1/` (not `/v1/` or `/api/v1/`)** — docs at
+`atlascloud.ai/docs/en/public-api`, three endpoints:
+- `GET /public/v1/balance` — current account balance.
+- `GET /public/v1/model-costs?start_date=&end_date=&group_by[]=model` —
+  authoritative DAILY billed totals, optionally grouped by model. `end_date`
+  is **exclusive**; a day still being billed comes back `partial:true` with
+  a `covered_until` timestamp. `group_by[]` accepts `model` and `api_key`
+  (NOT `model_id`/`model_type`/etc. — probe live, the docs list more than
+  the API accepts).
+- `GET /public/v1/model-usage` — same shape, token/request counts instead of
+  dollars.
+- **Refunds policy, verbatim from `/docs/billing/refunds`:** "LLM requests
+  that fail with a provider error are never billed"; for image/video/audio,
+  "the amount reserved at submission is automatically released back to your
+  balance when a task ends in a failed state (including timeouts)." This is
+  the authoritative basis for reconciling a FAILED prediction to $0 — it is
+  not an inference from sampled data, it is Atlas's stated policy.
+
+None of this is per-request, so it cannot replace `GET
+/model/prediction/:id`'s settled `price` for row-level reconciliation — it
+is the independent DAILY cross-check `scripts/reconcileAtlasDailyCosts.js`
+uses (see below), which per-request reconciliation cannot provide for LLM
+rows.
+
+**Charge-point enumeration.** Every `CostLog.create`/`updateOne` in the
+codebase goes through exactly five `costTracker.js` exports —
+`trackLlmCall`, `recordCacheHit`, `recordFlatCost`, `finalizeFlatCost`,
+`reconcileCost` — there is no other writer. Classified by whether a row can
+ever settle to provider truth:
+
+| class | reconciles? | why |
+|---|---|---|
+| LLM chat (`atlasLlmService`/`atlasLlmStreamService`, and every producer built on `trackLlmCall`: Director, Judge, Copy, Layout, brand enrichment/voice/brief, grounded search, embeddings, vision QC, …) | **NEVER, per row** | Atlas's OpenAI-compatible `/v1/chat/completions` response carries only `usage.{prompt,completion}_tokens` — no `price`/`cost` field anywhere on the body (read the actual response handling in `atlasLlmService.js`/`atlasLlmStreamService.js`; confirmed, not assumed). `reconcileCost` is a prediction-GET keyed on an id these rows never have. The best available correction is (a) an accurate `MODEL_RATES` entry so the estimate is close, and (b) the daily aggregate cross-check below. |
+| Image predictions (`atlasImageService`, `directImageRenderService`, `geminiImageService`'s Atlas path, `openaiService`'s Atlas path, …) | **YES** | `providerRequestId` is stamped at the charge point; `scheduleCostReconcile` + `reconcileCost` upgrade `estimated -> actual` once Atlas publishes `price`. |
+| Video predictions (`atlasVideoService`) | **YES**, including the FAILED case (fixed this audit — see below) | Same mechanism (`scheduleVideoCostReconcile`/`reconcileVideoCostFromTerminal`), now covering both success and a deterministic, non-retryable failure. |
+| `atlasVideoService`'s `reframe-outpaint` stage | **YES as of this audit** — was previously a permanent flat estimate; the charge-point write never stamped `providerRequestId` even though the id was available, so `pollPrediction`'s already-read-back settled `price` was discarded. Fixed by threading the id through and scheduling the same reconcile the video-master path uses. |
+| Cache hits (`recordCacheHit`) | not applicable | Genuinely $0; recorded only to measure hit rate. |
+| Rejections (`atlasImageService`'s submit-refused path) | not applicable | `costSource:'none'`, correctly $0 at the write. |
+| A handful of billable-but-entirely-unledgered call sites found by this audit (`atlasTextService.generate` — three `routes/brand.js` title-spec call sites — plus a few raw `generateContent`/grounded-search calls that bypass `trackedGenerate`) | **NO ROW AT ALL** | Flagged, not fixed here — this is a bigger change (wiring a brand-new charge point) than "reconcile an existing estimate," and is out of scope for this pass. See the audit report / spawned follow-up. |
+
+### `costSource` now has FOUR values, not three (fixed 2026-08-19)
+
+`'actual'` / `'estimated'` / `'none'` / **`'unknown'`** (`models/CostLog.js`,
+`CostLog.COST_SOURCES`). `'unknown'` means: a real, billed LLM call happened,
+but `MODEL_RATES` has no entry for the model, so the per-token cost —
+almost always the dominant part of the call's true cost — was NOT computed.
+Before this fix, `computeCost()`'s "no rate" branch still returned a small
+non-zero `costUsd` whenever a vision/grounding surcharge applied (surcharges
+are flat and independent of the token-rate table), and `persistCost`'s
+default (`costUsd ? 'estimated' : 'none'`) then stamped that surcharge-only
+figure as `'estimated'` — indistinguishable from a real, if imprecise,
+per-token guess. Measured live: a successful Director round on
+`anthropic/claude-sonnet-5` (the plain, non-`-ccmax` slug the live
+cross-provider fallback chain actually calls — §9 below) ledgered **$0.0050**
+(one vision reference image's surcharge, nothing else) looking like a
+plausible small estimate instead of the ~$0.02-0.10+ round it actually was.
+`MODEL_RATES` now carries `anthropic/claude-sonnet-5`,
+`anthropic/claude-opus-5` (live-verified identical to their `-ccmax` twins)
+and `anthropic/claude-sonnet-4.5-20250929` (base tier only — Atlas's own
+catalog also publishes a >200k-token tier this flat-rate table does not
+model). An unmapped model now ALWAYS stamps `costSource:'unknown'`
+regardless of whether a surcharge makes `costUsd` non-zero, and fires a
+deduped Slack alert (not just a console line) the first time it's seen, so a
+new/renamed slug pages someone rather than quietly degrading a spend report.
+`costTracker.costForRun()` reports `unknownUsd` as its own line, never
+folded into `estimatedUsd`.
+
+### The video FAILED-case phantom-spend bug — TWO distinct code paths, both closed
+
+The incident that opened this audit (`run_1787119100250_eef4d871`, two Omni
+masters that timed out and later settled `failed`/`price:null` at Atlas —
+never billed) was **already fixed for one path** by PR #225
+(`bootRecoveryService`'s periodic recovery sweep, gated on the ad still
+sitting `status:'rendering'`). This audit found a SECOND, un-fixed path to
+the same phantom-spend shape: `atlasVideoService.generateForAd`'s
+non-retryable (`!mayRetry`) failure branch — a deterministic failure
+(moderation block, exhausted attempts) — threw immediately with NO cost
+correction, and `routes/ads.js`'s catch block then sets `Ad.status:'failed'`
+**synchronously**, so the ad never sits in `'rendering'` long enough for
+`bootRecoveryService` to ever see it. Fixed by
+`resolveFailureCostReconcile()` (new, `atlasVideoService.js`) — the SAME
+tri-state rule `bootRecoveryService.resolveRecoveredVideoFailureCharge` uses
+(that function now delegates to this one instead of carrying its own copy),
+called right before the final `throw`.
+
+### Backfill script — historical rows stuck at 'estimated' forever
+
+`scripts/backfillCostReconcile.js` (dry-run by default, `--apply` to write).
+Live scheduled reconciliation (`scheduleCostReconcile`/
+`scheduleVideoCostReconcile`) gives up after its bounded retry window
+(~13.5 minutes for video); a row that settles later than that, or whose
+process died before the scheduler ran at all, is stuck at the submit-time
+estimate forever. First live dry run (2026-08-19) found **30** such rows
+total history (`costSource:'estimated'` + a `providerRequestId`) — the two
+known incident rows plus 22 more, mostly other `atlas_video_render` rows.
+**Correctly classified 24 of 30**; the other 6 were left untouched
+(5 successfully-completed predictions where Atlas simply had not published
+`price` yet — see the note below — plus 1 still genuinely processing).
+Touched-row delta: **-$13.16** (claimed $20.36, settled $7.20) — the ledger
+was overstating spend on exactly the rows that never settled.
+
+⚠️ **Asymmetric classification is load-bearing, not an oversight — caught by
+testing against live data before writing anything.** `confirmedCharge()`'s
+"absent price ⇒ not charged" rule is empirically justified ONLY for a
+FAILURE verdict (measured 5/5 failed predictions with no price field — the
+refund policy above confirms why). Applying that same rule to a
+`completed`/`succeeded` verdict is wrong: a live spot-check
+(`b752315fb72e4658a8951aeffb358691`) showed a delivered, real output URL
+with `price` simply absent from the payload — Atlas does not always publish
+`price` immediately even for a billed success (documented elsewhere in this
+file: images, 7/38 at completion). Zeroing that row would have hidden REAL
+spend, the exact mirror-image of the bug being fixed. The backfill script's
+`classifyRow()` therefore never zeroes a `completed`/`succeeded` row with no
+price — it leaves the estimate standing — matching `peekPrediction`'s own
+"done" branch, which passes `price` through unclassified for the same
+reason.
+
+### Daily reconciliation cross-check (new)
+
+`scripts/reconcileAtlasDailyCosts.js` — read-only, writes nothing. Compares
+`SUM(CostLog.costUsd)` per UTC day (provider:`atlas` only) against Atlas's
+own `GET /public/v1/model-costs`, printing a per-day delta and a per-model
+breakdown for the worst day. This is the aggregate check LLM rows can get
+even though they can never settle per-row. First live run found a real,
+actionable drift: 2026-08-17 claimed $4.79 vs Atlas's billed $3.42 (+40%),
+almost entirely attributable to `google/gemini-2.5-flash` ($1.65 claimed vs
+$0.34 billed). Partially explained by a stale `cachedInput` rate (corrected
+this pass, 0.075→0.03, live-verified) but the bulk of the gap is more likely
+the flat `GEMINI_GROUNDING_COST_USD` surcharge over-firing relative to
+Google's free grounded-search allowance — flagged as a follow-up, not
+chased down in this pass (see the spawned task in this repo's session log).
+
 ### Poll-time transport noise ≠ a task verdict (fixed 2026-08-05)
 
 **Incident:** two static ads failed with

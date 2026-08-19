@@ -33,6 +33,12 @@ const mongoose = require('mongoose');
 // constantly while it was in fact succeeding.
 const COST_STATUSES = ['ok', 'error', 'timeout', 'rejected', 'rejected-billing', 'failed', 'charged-no-output', 'submitted'];
 
+// Single source of truth for costSource values — see the costSource field
+// comment below for what each means. Exported for the same reason
+// COST_STATUSES is: a producer or a script must never invent a fourth value
+// that silently fails schema validation and drops the whole row.
+const COST_SOURCES = ['actual', 'estimated', 'unknown', 'none'];
+
 const costLogSchema = new mongoose.Schema({
   // Provenance — what was being generated
   stage:        { type: String, required: true, index: true },
@@ -69,12 +75,19 @@ const costLogSchema = new mongoose.Schema({
 
   // Where costUsd came from.
   //   'actual'    — the provider's own figure (Atlas prediction.price)
-  //   'estimated' — our catalog base_price guess, pending reconciliation
+  //   'estimated' — our per-token/per-generation guess, pending reconciliation
+  //   'unknown'   — a real, billed call whose token cost we CANNOT compute —
+  //                 no MODEL_RATES entry for the model. costUsd on this row is
+  //                 NOT a usable estimate (it is surcharges only, e.g. vision/
+  //                 grounding, which can look like a small-but-real number and
+  //                 previously masqueraded as 'estimated'). Added 2026-08-19
+  //                 after finding a successful Director round ledgering
+  //                 $0.0050 — see services/costTracker.js computeCost().
   //   'none'      — nothing was charged (rejection, or a refunded failure)
   // Worth recording because the two disagreed by ~6x on the image path: the
   // catalog said 0.01 while Atlas actually billed 0.057-0.069 per edit, so a
   // ledger built from estimates understated image spend badly.
-  costSource: { type: String, enum: ['actual', 'estimated', 'none'], default: 'estimated', index: true },
+  costSource: { type: String, enum: COST_SOURCES, default: 'estimated', index: true },
 
   // Cache discipline — 0-cost cache hits still log so we can measure
   // hit rate per (stage, cacheKey).
@@ -123,5 +136,6 @@ costLogSchema.index({ stage: 1, createdAt: -1 });
 
 const CostLog = mongoose.model('CostLog', costLogSchema);
 CostLog.COST_STATUSES = COST_STATUSES;
+CostLog.COST_SOURCES = COST_SOURCES;
 
 module.exports = CostLog;
