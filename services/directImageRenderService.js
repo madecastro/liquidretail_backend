@@ -1996,23 +1996,23 @@ async function submitEditImageWithSeedFallback({
     await moderationSeedFallback.readRunSeedState(campaignRunId, productId);
   const knownBlocked = new Set(blockedMediaIds.map(String));
 
-  // Ordered candidates for THIS call: a previously-discovered good seed for
-  // this product first (skips a doomed primary submit entirely), then the
-  // primary itself (unless this run already proved it blocked), then a fresh
-  // cascade of the product's other catalog images, capped and excluding
-  // anything already queued or known-blocked.
+  // Ordered candidates for THIS call, bounded at 1 + maxFallbackCandidates()
+  // TOTAL, matching moderationSeedFallback.js's documented cost bound.
+  //
+  // The starting slot is EXACTLY ONE id, not "resolved AND primary" — a
+  // prior FIX here pushed both whenever neither was individually blocked,
+  // which both defeated the coordination (the whole point of a resolved
+  // override is to skip the doomed primary, not submit it anyway) and blew
+  // the stated cap to 1(resolved)+1(primary)+cascade. Prefer a
+  // previously-discovered good seed; only fall back to the primary itself
+  // when there is no known-good override (or it turned out to also be
+  // blocked, per the race note below).
   const candidateIds = [];
-  // `resolvedMediaId` and `knownBlocked` are NOT mutually exclusive: a
-  // concurrent creative for the same product can race this read, discover a
-  // DIFFERENT good seed, and record it as resolved AFTER another creative
-  // already recorded this exact id as blocked (Atlas's classifier is not
-  // perfectly deterministic — see moderationSeedFallback.js's header). Skip a
-  // resolvedMediaId this run also knows is blocked rather than wasting the
-  // first attempt on a candidate already proven bad.
-  if (resolvedMediaId && resolvedMediaId !== primaryMediaId && !knownBlocked.has(resolvedMediaId)) {
+  if (resolvedMediaId && !knownBlocked.has(resolvedMediaId)) {
     candidateIds.push(resolvedMediaId);
+  } else if (primaryMediaId && !knownBlocked.has(primaryMediaId)) {
+    candidateIds.push(primaryMediaId);
   }
-  if (primaryMediaId && !knownBlocked.has(primaryMediaId)) candidateIds.push(primaryMediaId);
   const exclude = new Set([primaryMediaId, resolvedMediaId, ...knownBlocked, ...candidateIds].filter(Boolean));
   candidateIds.push(...moderationSeedFallback.nextCandidateIds(resolvedProduct, { excludeMediaIds: [...exclude] }));
 
@@ -2033,12 +2033,12 @@ async function submitEditImageWithSeedFallback({
     if (!isPrimary) {
       // eslint-disable-next-line no-await-in-loop
       const doc = await Media.findById(candidateId).select('fileUrl').lean();
-      if (!doc?.fileUrl) continue; // unusable candidate — try the next one for free
+      if (!doc?.fileUrl) { lastErr = lastErr || taggedError(`moderation fallback candidate ${candidateId} has no usable file — skipped`, { alertLevel: 'warn', alertKey: 'direct-image:fallback-candidate-unusable' }); continue; } // unusable candidate — try the next one for free
       // eslint-disable-next-line no-await-in-loop
       const raw = await optionalImage(doc.fileUrl);
       // eslint-disable-next-line no-await-in-loop
       const normalized = raw ? await normalizeReference(raw) : null;
-      if (!normalized) continue;
+      if (!normalized) { lastErr = lastErr || taggedError(`moderation fallback candidate ${candidateId} could not be normalised — skipped`, { alertLevel: 'warn', alertKey: 'direct-image:fallback-candidate-unusable' }); continue; }
       candidateRefs = [normalized];
       candidateMeta = [{ sourceUrl: doc.fileUrl, role: 'moderation-fallback-seed' }];
     }
@@ -2066,15 +2066,26 @@ async function submitEditImageWithSeedFallback({
       lastErr = err;
       const isModeration = err?.policy?.name === 'moderationBlocked';
       if (!isModeration) throw err; // not a seed-shaped problem — do not burn more submits
-      if (!isPrimary) {
-        moderationSeedFallback.recordSeedOutcome(campaignRunId, productId, {
-          originalMediaId: primaryMediaId, blockedMediaId: candidateId
-        }).catch(() => {});
-      }
+      // Record a blocked PRIMARY too, not only blocked fallback candidates —
+      // a prior version guarded this on `!isPrimary`, which meant the exact
+      // seed the incident was about never entered `blocked[]`. Every other
+      // creative for this product then re-submitted (and re-paid to
+      // discover) the same doomed primary before reaching an alternate.
+      moderationSeedFallback.recordSeedOutcome(campaignRunId, productId, {
+        originalMediaId: primaryMediaId, blockedMediaId: candidateId
+      }).catch(() => {});
       // fall through to the next candidate, if any
     }
   }
-  throw lastErr;
+  // Every candidate was tried (or skipped as unusable) with nothing to show
+  // for it. `lastErr` is only unset if `candidateIds` was non-empty but every
+  // single one was skipped as unusable above — extremely unlikely (it would
+  // need a deleted Media doc for every remaining catalog image) but a bare
+  // `throw null`/`throw undefined` would be far worse than a real Error.
+  throw lastErr || taggedError(
+    'moderation fallback exhausted every candidate without a usable reference',
+    { alertLevel: 'error', alertKey: 'direct-image:fallback-exhausted' }
+  );
 }
 
 async function renderDirectImage(callArgs = {}) {
@@ -2420,12 +2431,27 @@ async function renderDirectImage(callArgs = {}) {
   // above already refuses to reach here with zero references, so this is never
   // asked to invent a product from words alone.
   adStage(adId, `plate submit (${surface})`);
-  // Eligible for seed fallback only on the single default catalog seed —
-  // never when the operator or the Director supplied an explicit ordered
-  // reference stack (orderedIds.length > 0). That stack is a deliberate,
-  // multi-image pick; swapping one entry in it without being asked is the
-  // "silent quality downgrade" this feature is required not to do.
-  const singleSeedEligible = !orderedIds.length;
+  // Eligible for seed fallback whenever there is AT MOST ONE reference in
+  // play — never a genuine multi-image stack (orderedIds.length >= 2), which
+  // is a deliberate, ordered pick (operator or Director) whose composition
+  // this feature must not silently rewrite.
+  //
+  // BUG FIXED 2026-08-19 (caught in adversarial review, confirmed against the
+  // real incident data): this used to be `!orderedIds.length`, which is only
+  // true when `referenceMediaIds` arrives EMPTY. But renderService.js's own
+  // fallback (`referenceMediaIds: adDoc.referenceMediaIds.length ? ... :
+  // adDoc.mediaIds`) means the concept-driven static path — the exact path
+  // the incident happened on — ALWAYS forwards `Ad.mediaIds`, and
+  // DIRECTOR_UNIVERSE_TOP_N=1 makes that array exactly ONE element long, not
+  // zero. Verified live against run_1787136860887_654ed621's own Ad
+  // documents: `mediaIds.length === 1`, `referenceMediaIds.length === 0` on
+  // the Ad, which renderService.js turns into a 1-element `orderedIds` here.
+  // Under the old `!orderedIds.length` check that is `false` — the fallback
+  // never engaged on the ONE path it was built for. `<= 1` treats "the
+  // Director's single pick, surfaced through this plumbing" the same as
+  // "no explicit pick at all" (both fall back to the SAME single seed
+  // either way), while still excluding any real 2+ stack.
+  const singleSeedEligible = moderationSeedFallback.isSingleSeedEligible(orderedIds);
   const { result, seedFallback: seedFallbackInfo } = await submitEditImageWithSeedFallback({
     refs, imageMeta, prompt, genSize, meta,
     model: PLATE_EDIT_MODEL, quality: PLATE_QUALITY, timeoutMs: PLATE_TIMEOUT_MS,

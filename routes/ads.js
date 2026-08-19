@@ -2983,7 +2983,12 @@ async function renderOneInner(run, job, adId, index, renderToken) {
         {
           $set: {
             status:      'failed',
-            renderError: { message: err.message || String(err), stage: 'veo', at: new Date() },
+            // code: threaded 2026-08-19 alongside the static path — atlasVideoService's
+            // buildClassifiedFailureError now stamps err.code from the same
+            // atlasErrorPolicy.js taxonomy (e.g. IMAGE_MODERATION_BLOCKED), so a
+            // video master rejected for the same reason as its sibling statics
+            // (one flagged catalog photo) is no longer invisible to this field.
+            renderError: { message: err.message || String(err), stage: 'veo', code: err.code || null, at: new Date() },
             updatedAt:   new Date()
           },
           $inc: { renderAttempts: 1 }
