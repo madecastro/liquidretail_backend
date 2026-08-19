@@ -117,12 +117,22 @@ async function syncCatalog(brandId, options = {}) {
   try {
     // Multi-credential path: aggregate per-credential results.
     if (creds.length > 1 && !options.credentialId) {
-      const aggregated = { ok: true, fetched: 0, added: 0, updated: 0, errors: 0, totalCount: 0, perCredential: [] };
+      // backgroundWork is aggregated ACROSS credentials (not last-wins like
+      // totalCount): each syncCatalogForCred fires its own enrichment +
+      // category-inference triggers, and a short-lived caller must be able
+      // to await every one of them before disconnecting. See the ROBUSTNESS
+      // comment in syncCatalogForCred.
+      const aggregated = { ok: true, fetched: 0, added: 0, updated: 0, errors: 0, totalCount: 0, perCredential: [], backgroundWork: [] };
       for (const c of creds) {
         await run.checkpoint();
         run.stage(`syncing @${c.igUsername || c._id}`);
         const r = await syncCatalogForCred(c, run);
-        aggregated.perCredential.push({ credentialId: String(c._id), igUsername: c.igUsername, ...r });
+        // Destructure backgroundWork OUT of the per-credential row: those
+        // rows are pure data (they get serialized into HTTP/agent payloads),
+        // and the promises belong on the aggregate exactly once.
+        const { backgroundWork: credBackgroundWork, ...credSummary } = r;
+        aggregated.perCredential.push({ credentialId: String(c._id), igUsername: c.igUsername, ...credSummary });
+        if (Array.isArray(credBackgroundWork)) aggregated.backgroundWork.push(...credBackgroundWork);
         if (r.ok) {
           aggregated.fetched += r.fetched || 0;
           aggregated.added   += r.added   || 0;
@@ -388,6 +398,24 @@ async function syncCatalogForCred(cred, run = null) {
       .catch(err => console.warn(`   ⚠️  catalog materialize drain trigger failed: ${err.message}`));
   }
 
+  // ROBUSTNESS (2026-08-19) — same fix as shopifyPublicIngestService.js's
+  // end-of-run trio, same underlying bug. Both triggers below used to fire
+  // via setImmediate(), which defers ONE tick but does NOT keep the
+  // caller's process (or its Mongoose connection) alive for that tick. A
+  // short-lived caller (a maintenance script that connects -> syncs ->
+  // disconnects) can tear the connection down before the deferred tick
+  // runs; the trigger then throws "Client must be connected before running
+  // operations" silently, because both call sites only console.warn on
+  // failure. Fix: call directly (no setImmediate needed — an async
+  // function already yields control to its caller at its first await, so
+  // nothing here blocks this sync's own return) and COLLECT the promises
+  // so a caller that owns its own connection lifecycle can await them
+  // before disconnecting. Every existing HTTP/executor caller ignores
+  // `backgroundWork` and is unaffected — they stay connected for the life
+  // of the process anyway, which is why this was invisible until a
+  // short-lived script hit it.
+  const backgroundWork = [];
+
   // Eager review + commerce enrichment (Phase: catalog-sync-enrichment).
   // Walks the brand's products and fires productReviews + productDetails
   // for any row that's missing them OR has stale (>30d) cache. Both
@@ -399,41 +427,39 @@ async function syncCatalogForCred(cred, run = null) {
   // scrape (productReviewsScrapeService) and only then pays for the
   // web-wide gap-fill — the Meta/Shopify-auth path has no PDP crawl of
   // its own, so that scrape is where its first-party reviews come from.
-  setImmediate(() => {
+  backgroundWork.push(
     require('./catalogProductEnrichmentService')
       .enqueueBrandProductEnrichment(brandId)
-      .catch(err => console.warn(`   ⚠️  catalog enrichment enqueue failed: ${err.message}`));
-  });
+      .catch(err => console.warn(`   ⚠️  catalog enrichment enqueue failed: ${err.message}`))
+  );
 
   // JSON-LD category inference. Scrapes each product's productUrl for
   // BreadcrumbList structured data and builds the Category tree from
   // the brand's actual site collections — far richer than Meta's coarse
   // category enum. Fire-and-forget; the inference service throttles
   // per-domain and respects a 14-day TTL so re-syncs are cheap.
-  setImmediate(() => {
-    (async () => {
-      try {
-        const inference = require('./productCategoryInferenceService');
-        // NOTE: not { $ne: null, …, $ne: '' } — duplicate keys in a JS
-        // object literal keep only the LAST one, so the null exclusion
-        // was silently dropped and null productUrls reached inferBatch.
-        const candidates = await CatalogProduct.find({
-          brandId,
-          productUrl: { $exists: true, $nin: [null, ''] },
-          $or: [
-            { inferredCategoryAt: null },
-            { inferredCategoryAt: { $lt: new Date(Date.now() - inference.TTL_DAYS * 24 * 60 * 60 * 1000) } }
-          ]
-        }).select('_id').lean();
-        if (!candidates.length) return;
-        console.log(`🔎 categoryInference: brand=${brandId} scheduling ${candidates.length} product page scrapes`);
-        const result = await inference.inferBatch(candidates.map(c => c._id), { concurrency: CONC.CATEGORY_INFERENCE_BATCH_CONCURRENCY });
-        console.log(`🔎 categoryInference: brand=${brandId} done — ok=${result.ok} cfChallenged=${result.challenged || 0} skipped=${result.skipped} failed=${result.failed}`);
-      } catch (err) {
-        console.warn(`   ⚠️  category inference enqueue failed: ${err.message}`);
-      }
-    })();
-  });
+  backgroundWork.push((async () => {
+    try {
+      const inference = require('./productCategoryInferenceService');
+      // NOTE: not { $ne: null, …, $ne: '' } — duplicate keys in a JS
+      // object literal keep only the LAST one, so the null exclusion
+      // was silently dropped and null productUrls reached inferBatch.
+      const candidates = await CatalogProduct.find({
+        brandId,
+        productUrl: { $exists: true, $nin: [null, ''] },
+        $or: [
+          { inferredCategoryAt: null },
+          { inferredCategoryAt: { $lt: new Date(Date.now() - inference.TTL_DAYS * 24 * 60 * 60 * 1000) } }
+        ]
+      }).select('_id').lean();
+      if (!candidates.length) return;
+      console.log(`🔎 categoryInference: brand=${brandId} scheduling ${candidates.length} product page scrapes`);
+      const result = await inference.inferBatch(candidates.map(c => c._id), { concurrency: CONC.CATEGORY_INFERENCE_BATCH_CONCURRENCY });
+      console.log(`🔎 categoryInference: brand=${brandId} done — ok=${result.ok} cfChallenged=${result.challenged || 0} skipped=${result.skipped} failed=${result.failed}`);
+    } catch (err) {
+      console.warn(`   ⚠️  category inference enqueue failed: ${err.message}`);
+    }
+  })());
 
   return {
     ok: true,
@@ -443,7 +469,11 @@ async function syncCatalogForCred(cred, run = null) {
     errors,
     totalCount,
     cappedAt: fetched >= MAX_ITEMS ? MAX_ITEMS : null,
-    durationMs: Date.now() - t0
+    durationMs: Date.now() - t0,
+    // Awaitable by a caller that owns its own connection lifecycle (see the
+    // ROBUSTNESS comment above). Ignored — safely — by every existing
+    // HTTP/executor caller.
+    backgroundWork
   };
   } catch (err) {
     // CancelledError (and any other throw) skips the post-loop pass —

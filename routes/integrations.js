@@ -316,8 +316,16 @@ router.post('/instagram/sync-catalog', async (req, res) => {
     const cred = await IntegrationCredential.findOne(tenantFilter(req, credFilter)).select('_id').lean();
     if (!cred) return res.status(404).json({ error: 'no active Instagram credential for this brand' });
     const result = await syncCatalog(brandId, credentialId ? { credentialId } : {});
-    if (!result.ok) return res.status(400).json(result);
-    res.json(result);
+    // syncCatalog now returns `backgroundWork` — an array of IN-FLIGHT
+    // PROMISES for the post-sync enrichment + category-inference triggers,
+    // so a short-lived caller can await them before disconnecting (see the
+    // ROBUSTNESS comment in catalogSyncService). This handler is not such a
+    // caller: the API process stays connected for its whole lifetime, so it
+    // has nothing to await. Strip the field rather than widen the response
+    // shape — a Promise serializes to a useless `{}` over JSON.
+    const { backgroundWork: _backgroundWork, ...body } = result;
+    if (!body.ok) return res.status(400).json(body);
+    res.json(body);
   } catch (err) {
     console.error('catalog sync failed:', err);
     res.status(500).json({ error: err.message || 'catalog sync failed' });

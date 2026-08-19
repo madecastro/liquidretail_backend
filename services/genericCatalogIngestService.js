@@ -442,6 +442,23 @@ async function syncBrandGenericCatalog(brand, run, { isBrandAborted, categories 
   // Use the cancel state established above (resolver signal or a fresh
   // mid-upsert cancel) — re-polling abortCheck here is unreliable once the
   // run handle has been closed by an earlier checkpoint().
+  //
+  // ROBUSTNESS (2026-08-19) — same fix as shopifyPublicIngestService.js's
+  // end-of-run trio, same underlying bug. The enrichment + category-
+  // inference triggers below used to fire via setImmediate(), which defers
+  // ONE tick but does NOT keep the caller's process (or its Mongoose
+  // connection) alive for that tick. A short-lived caller (a maintenance
+  // script that connects -> syncs -> disconnects) can tear the connection
+  // down before the deferred tick runs; the trigger then throws "Client
+  // must be connected before running operations" silently, because both
+  // call sites only console.warn on failure. Fix: call directly (no
+  // setImmediate needed — an async function already yields to its caller
+  // at its first await, so nothing here blocks this sync's own return) and
+  // COLLECT the promises onto `out` so a caller that owns its own
+  // connection lifecycle can await them before disconnecting. Declared
+  // outside the guard so `out.backgroundWork` is always an array (empty on
+  // a cancelled run). Every existing HTTP/executor caller ignores it.
+  const backgroundWork = [];
   if (!cancelled) {
     try {
       const { enqueueBrandProductDetects } = require('./catalogProductDetectService');
@@ -461,63 +478,61 @@ async function syncBrandGenericCatalog(brand, run, { isBrandAborted, categories 
         .catch(err => console.warn(`   ⚠️  ${LOG}  catalog materialize drain trigger failed: ${err.message}`));
     }
 
-    setImmediate(() => {
+    backgroundWork.push(
       require('./catalogProductEnrichmentService')
         .enqueueBrandProductEnrichment(brand._id)
-        .catch(err => console.warn(`   ⚠️  ${LOG}  catalog enrichment enqueue failed: ${err.message}`));
-    });
+        .catch(err => console.warn(`   ⚠️  ${LOG}  catalog enrichment enqueue failed: ${err.message}`))
+    );
 
-    setImmediate(() => {
-      (async () => {
-        let catRun = null;
-        try {
-          const inference = require('./productCategoryInferenceService');
-          // NOTE: not { $ne: null, …, $ne: '' } — duplicate keys in a JS
-          // object literal keep only the LAST one, silently dropping the
-          // null exclusion (adversarial-review find; same bug fixed in
-          // catalogSyncService's copy of this query).
-          // Most products now arrive pre-stamped with inferredCategoryAt
-          // (breadcrumb captured in-scan), so this backfills only the gaps
-          // the scan couldn't parse — no longer a full per-product crawl.
-          const candidates = await CatalogProduct.find({
-            brandId: brand._id,
-            productUrl: { $exists: true, $nin: [null, ''] },
-            $or: [
-              { inferredCategoryAt: null },
-              { inferredCategoryAt: { $lt: new Date(Date.now() - inference.TTL_DAYS * 24 * 60 * 60 * 1000) } }
-            ]
-          }).select('_id').lean();
-          if (!candidates.length) return;
-          console.log(`🔎 categoryInference: brand=${brand._id} scheduling ${candidates.length} product page scrapes`);
-          // Surface as a cancellable run so it shows in the activity dock.
-          const progressService = require('./progressService');
-          catRun = await progressService.startRun({
-            // Distinct kind so this free category re-scrape isn't conflated
-            // with (or blocked by) the paid 'enrichment' runs in the
-            // activity log / Enrich lock.
-            kind:         'category-inference',
-            advertiserId: brand.advertiserId,
-            brandId:      brand._id,
-            total:        candidates.length,
-            cancellable:  true,
-            label:        'Category inference'
-          });
-          const result = await inference.inferBatch(candidates.map(c => c._id), {
-            concurrency: CONC.CATEGORY_INFERENCE_BATCH_CONCURRENCY,
-            onProgress: async (done, total) => {
-              catRun.tick(done, total, `category inference ${done}/${total}`);
-              try { await catRun.checkpoint(); } catch { throw new Error('cancelled'); }
-            }
-          });
-          if (result.cancelled) catRun.markCancelled?.('Cancelled — partial categories kept');
-          else await catRun.succeed({ ok: result.ok, skipped: result.skipped, failed: result.failed });
-          console.log(`🔎 categoryInference: brand=${brand._id} done — ok=${result.ok} cfChallenged=${result.challenged || 0} skipped=${result.skipped} failed=${result.failed}`);
-        } catch (err) {
-          if (catRun) catRun.fail?.(err);
-          console.warn(`   ⚠️  ${LOG}  category inference enqueue failed: ${err.message}`);
-        }
-      })();
-    });
+    backgroundWork.push((async () => {
+      let catRun = null;
+      try {
+        const inference = require('./productCategoryInferenceService');
+        // NOTE: not { $ne: null, …, $ne: '' } — duplicate keys in a JS
+        // object literal keep only the LAST one, silently dropping the
+        // null exclusion (adversarial-review find; same bug fixed in
+        // catalogSyncService's copy of this query).
+        // Most products now arrive pre-stamped with inferredCategoryAt
+        // (breadcrumb captured in-scan), so this backfills only the gaps
+        // the scan couldn't parse — no longer a full per-product crawl.
+        const candidates = await CatalogProduct.find({
+          brandId: brand._id,
+          productUrl: { $exists: true, $nin: [null, ''] },
+          $or: [
+            { inferredCategoryAt: null },
+            { inferredCategoryAt: { $lt: new Date(Date.now() - inference.TTL_DAYS * 24 * 60 * 60 * 1000) } }
+          ]
+        }).select('_id').lean();
+        if (!candidates.length) return;
+        console.log(`🔎 categoryInference: brand=${brand._id} scheduling ${candidates.length} product page scrapes`);
+        // Surface as a cancellable run so it shows in the activity dock.
+        const progressService = require('./progressService');
+        catRun = await progressService.startRun({
+          // Distinct kind so this free category re-scrape isn't conflated
+          // with (or blocked by) the paid 'enrichment' runs in the
+          // activity log / Enrich lock.
+          kind:         'category-inference',
+          advertiserId: brand.advertiserId,
+          brandId:      brand._id,
+          total:        candidates.length,
+          cancellable:  true,
+          label:        'Category inference'
+        });
+        const result = await inference.inferBatch(candidates.map(c => c._id), {
+          concurrency: CONC.CATEGORY_INFERENCE_BATCH_CONCURRENCY,
+          onProgress: async (done, total) => {
+            catRun.tick(done, total, `category inference ${done}/${total}`);
+            try { await catRun.checkpoint(); } catch { throw new Error('cancelled'); }
+          }
+        });
+        if (result.cancelled) catRun.markCancelled?.('Cancelled — partial categories kept');
+        else await catRun.succeed({ ok: result.ok, skipped: result.skipped, failed: result.failed });
+        console.log(`🔎 categoryInference: brand=${brand._id} done — ok=${result.ok} cfChallenged=${result.challenged || 0} skipped=${result.skipped} failed=${result.failed}`);
+      } catch (err) {
+        if (catRun) catRun.fail?.(err);
+        console.warn(`   ⚠️  ${LOG}  category inference enqueue failed: ${err.message}`);
+      }
+    })());
   }
 
   const durationMs = Date.now() - t0;
@@ -533,7 +548,11 @@ async function syncBrandGenericCatalog(brand, run, { isBrandAborted, categories 
     videosIngested,
     reviewsCaptured,
     errors,
-    durationMs
+    durationMs,
+    // Awaitable by a caller that owns its own connection lifecycle (see the
+    // ROBUSTNESS comment on the end-of-run trio above). Ignored — safely —
+    // by every existing HTTP/executor caller.
+    backgroundWork
   };
   if (cancelled) out.cancelled = true;
   if (partial) {
