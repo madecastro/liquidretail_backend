@@ -195,6 +195,53 @@ export function clampFrac(v, lo, hi) {
 }
 
 /**
+ * Resolve the group box's top/bottom insets in PX for a given anchor — the
+ * SAME arithmetic `stackContainerStyle` uses to build its CSS, factored out
+ * so a group's available HEIGHT (height - topPx - bottomPx) can be computed
+ * once, from one place, by both the CSS builder and anything that needs to
+ * know the budget ahead of render (remotion/lib/stackFit.js's fit planner).
+ * Two call sites deriving this independently is exactly how the `bottom`
+ * anchor drifted into having no ceiling at all (see below) — a single
+ * source keeps that from happening again.
+ *
+ * Every anchor now returns a BOUNDED box (finite topPx AND bottomPx) — see
+ * the `bottom` case, which did not before 2026-08-19.
+ *
+ * @returns {{ topPx: number, bottomPx: number }}
+ */
+export function resolveGroupBoxPx({ anchor, safe, height, offsetY = 0 }) {
+  const topFor = (frac) => clampFrac(frac + offsetY, safe.top, 1 - safe.bottom - 0.05) * height;
+  switch (anchor) {
+    case 'top':
+      return { topPx: topFor(safe.top), bottomPx: safe.bottom * height };
+    case 'upperThird':
+      return { topPx: topFor(ANCHOR_TOP.upperThird), bottomPx: safe.bottom * height };
+    case 'lowerThird':
+      return { topPx: topFor(ANCHOR_TOP.lowerThird), bottomPx: safe.bottom * height };
+    case 'center':
+      return {
+        topPx: clampFrac(safe.top + offsetY, safe.top, 0.7) * height,
+        bottomPx: clampFrac(safe.bottom - offsetY, safe.bottom, 0.7) * height,
+      };
+    case 'bottom':
+    default: {
+      const bottomPx = clampFrac(safe.bottom - offsetY, safe.bottom, 0.9) * height;
+      // NEW (2026-08-19): `bottom` used to be the one anchor with no `top` at
+      // all — the box had an intrinsic (content-sized) height with nothing
+      // above it, so it never clipped but also never had a real ceiling. That
+      // was fine while every `bottom`-anchored group was short (a CTA pill),
+      // but this function no longer gets to assume that: give it the SAME
+      // floor `top` gets, symmetric with the top-anchored cases. Inert for
+      // any group that already fit (safe flex-end still hugs the floor
+      // first), and it closes the one anchor for which "no spec offset can
+      // push content under platform UI" was asserted in prose but not
+      // actually enforced in code.
+      return { topPx: topFor(safe.top), bottomPx };
+    }
+  }
+}
+
+/**
  * Container CSS for a (anchor, align) stack group within the safe area.
  * offsetX/offsetY (fractions) are applied then clamped so content cannot
  * leave the safe area.
@@ -214,7 +261,7 @@ export function stackContainerStyle({ format, safeZoneKey, platformFormat, ancho
     display: 'flex',
     flexDirection: 'column',
   };
-  const topFor = (frac) => clampFrac(frac + offsetY, safe.top, 1 - safe.bottom - 0.05) * height;
+  const { topPx, bottomPx } = resolveGroupBoxPx({ anchor, safe, height, offsetY });
 
   // THE FLOOR (2026-08-12). A top-anchored stack used to set `top` and NOTHING
   // ELSE, so the box had no bottom edge and the flex column simply grew
@@ -261,7 +308,6 @@ export function stackContainerStyle({ format, safeZoneKey, platformFormat, ancho
   // the end); this outer flex-end box was clipping the OPPOSITE way for the
   // group as a whole. Fixed by `safe flex-end` below — do not revert to bare
   // `flex-end` on `bottom`/`lowerThird` without an equivalent guarantee.
-  const floor = { bottom: safe.bottom * height, overflow: 'hidden' };
   // `safe flex-end` (CSS Box Alignment L3 "safe" alignment; supported by the
   // Chromium Remotion renders with — verified empirically, not just read from
   // a spec): behaves exactly like `flex-end` whenever the content fits (the
@@ -271,43 +317,35 @@ export function stackContainerStyle({ format, safeZoneKey, platformFormat, ancho
   // from the TRAILING end, never the opening. This is the guarantee, not a
   // per-surface fudge: it holds for every zone this function resolves,
   // independent of which surface's insets made the box tight.
+  //
+  // ⚠️ "safe" ONLY decides which END drops first. It does not decide WHETHER
+  // an element gets sliced through its own middle when the box is smaller
+  // than a single whole element — that is `remotion/lib/stackFit.js`'s job
+  // (Canonical.jsx sizes/drops WHOLE slots before the box ever has to clip).
+  // `overflow:hidden` here stays as the last-resort safety net, not the
+  // enforcement mechanism.
   const JUSTIFY_END_SAFE = 'safe flex-end';
 
   switch (anchor) {
     case 'top':
-      return { ...base, ...floor, top: topFor(safe.top) };
+      return { ...base, top: topPx, bottom: bottomPx, overflow: 'hidden' };
     case 'upperThird':
-      return { ...base, ...floor, top: topFor(ANCHOR_TOP.upperThird) };
+      return { ...base, top: topPx, bottom: bottomPx, overflow: 'hidden' };
     case 'center':
-      return {
-        ...base,
-        // Both insets clamped: an offset shifts the centering window but
-        // can never push it outside the safe area.
-        top: clampFrac(safe.top + offsetY, safe.top, 0.7) * height,
-        bottom: clampFrac(safe.bottom - offsetY, safe.bottom, 0.7) * height,
-        justifyContent: 'center',
-      };
+      return { ...base, top: topPx, bottom: bottomPx, justifyContent: 'center' };
     case 'lowerThird':
       // lowerThird is the worst offender and gets the strongest treatment: it
       // is MEANT to sit low, so it grows UPWARD from the safe floor instead of
       // downward from a line near it. Anchoring it by `top` is what let the
       // measured rating/review overflow happen — starting low and growing
       // down has nowhere to go but under the chrome.
-      return {
-        ...base,
-        ...floor,
-        top: topFor(ANCHOR_TOP.lowerThird),
-        justifyContent: JUSTIFY_END_SAFE,
-      };
+      return { ...base, top: topPx, bottom: bottomPx, overflow: 'hidden', justifyContent: JUSTIFY_END_SAFE };
     case 'bottom':
     default:
-      return {
-        ...base,
-        // Floor at the safe band — the documented invariant is that no
-        // spec offset can push content under platform UI.
-        bottom: clampFrac(safe.bottom - offsetY, safe.bottom, 0.9) * height,
-        justifyContent: JUSTIFY_END_SAFE,
-      };
+      // `top`/`overflow:hidden` are new here (2026-08-19) — see
+      // resolveGroupBoxPx's `bottom` case for why. Inert for any group that
+      // already fit inside its floor-anchored box.
+      return { ...base, top: topPx, bottom: bottomPx, overflow: 'hidden', justifyContent: JUSTIFY_END_SAFE };
   }
 }
 

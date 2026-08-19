@@ -103,6 +103,15 @@ is unchanged at two.
    from the END, never the opening. Both pinned by
    `scripts/verifyReelsSafeZone.mjs` sections G (overflow direction) and H
    (width measure).
+   ⚠️ **"Never the opening" was not "never clips through an element" —
+   closed the same day.** The rating slot (stars + score + review count)
+   still landed on the box/element boundary and got sliced mid-star.
+   `remotion/lib/stackFit.js` (new) sizes the whole GROUP to its box before
+   paint — shrink (bounded) → drop the reviews line → drop whole trailing
+   rows, protecting the hero — so `overflow:hidden` is a backstop, not the
+   mechanism. Not Reels-specific: `verticalYt`/`landscapeYt` share the same
+   tight-box exposure and go through the identical code path. Pinned by
+   `scripts/verifyReelsOverflowSafety.mjs`.
    **What `safeArea` IS for, so nobody deletes it as dead:** it is live on the
    **static image** path — `staticAdIntents.computeSurface` turns it into the
    geometry box in the billable gpt-image-2 prompt and into Sharp logomark

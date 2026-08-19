@@ -20,6 +20,7 @@ import { stackContainerStyle, panelColumnStyle, resolveSafeZone, resolveSafeZone
 import { contrastToken } from '../lib/tokens.js';
 import { resolveSlotContent } from '../lib/slotContent.js';
 import { decideInkOnLight, worstCaseInkForBand, usesWorstCaseInk } from '../lib/plateHints.js';
+import { estimateSlotHeightPx, planGroupFit } from '../lib/stackFit.js';
 // Re-export pure resolver for offline harnesses (same decision as render).
 export {
   resolveSlotContent,
@@ -29,6 +30,7 @@ export {
   TEXT_CHAR_CAP,
 } from '../lib/slotContent.js';
 export { decideInkOnLight, worstCaseInkForBand, usesWorstCaseInk } from '../lib/plateHints.js';
+export { estimateSlotHeightPx, planGroupFit } from '../lib/stackFit.js';
 
 const BAND_FOR_ANCHOR = { top: 'top', upperThird: 'top', center: 'middle', lowerThird: 'bottom', bottom: 'bottom' };
 
@@ -384,76 +386,145 @@ export const Canonical = ({ format = 'feed', safeZoneKey = null, platformFormat 
         const placed = panelBox
           ? { ...container, left: panelBox.left, right: panelBox.right }
           : container;
+        const rowGapPx = Math.round((spec.stack?.rowGapPct ?? 0.018) * height);
+
+        // ── Pre-resolve every slot's content + layout ctx ONCE, keyed on the
+        // slot object itself (stable — foldRows/group.items never clone it).
+        // Moved out of the render map below so the fit planner and the final
+        // render see IDENTICAL numbers — no drift between "did it fit" and
+        // "what got painted". Byte-identical resolution to before; only WHEN
+        // it runs changed.
+        const panelW = panelBox ? (width - panelBox.left - panelBox.right) : null;
+        const resolvedByRawSlot = new Map();
+        for (const rawSlot of group.items) {
+          const t = rawSlot.treatment || {};
+          const maxWidthPct = rawSlot.position?.maxWidthPct;
+          let usableWidthPx = null;
+          if (Number.isFinite(maxWidthPct) && maxWidthPct > 0) {
+            const fromPct = maxWidthPct * width;
+            usableWidthPx = panelW != null && panelW > 0
+              ? Math.min(fromPct, panelW)
+              : fromPct;
+          } else if (panelW != null && panelW > 0) {
+            // No authored maxWidthPct — text fills the panel column.
+            // Documented fallback; Canonical landscape slots always
+            // carry maxWidthPct:0.46 in canonical.json.
+            usableWidthPx = panelW;
+          }
+          const fontPx = baseSize(rawSlot.key, format, t.sizeScale);
+          const capCtx = {
+            format,
+            canvasWidth: width,
+            maxWidthPct: Number.isFinite(maxWidthPct) ? maxWidthPct : null,
+            usableWidthPx,
+            maxLines: Number.isFinite(t.maxLines) ? t.maxLines : null,
+            fontPx,
+            sizeScale: Number.isFinite(t.sizeScale) ? t.sizeScale : null,
+            panelColumn: !!panelBox,
+            panelSide: panelBox ? panelSide : null,
+            panelWidthFrac: panelW != null && width > 0
+              ? panelW / width
+              : null,
+            // Already resolved once above (zoneKey) — reuse it rather
+            // than re-deriving from platformFormat inside slotContent.js,
+            // so an explicit safeZoneKey prop override stays honored.
+            // Lets deriveCharCap bound usableWidthPx by the surface's
+            // OWN safe-zone width when it is narrower than `format`'s
+            // shared default (reels/verticalYt/landscapeYt/squareYt/
+            // pmax_video_*) — inert for vertical/feed/square/landscape/
+            // stories. See resolveSurfaceSafeWidthPx in slotContent.js.
+            safeZoneKey: zoneKey,
+          };
+          const content = resolveSlotContent(rawSlot, meta, allSlots, capCtx);
+          resolvedByRawSlot.set(rawSlot, { content, usableWidthPx, fontPx, maxLines: capCtx.maxLines });
+        }
+
+        // ── Fit plan (remotion/lib/stackFit.js): estimate each folded row's
+        // height from the resolved content above and decide, BEFORE paint,
+        // whether the group must shrink and/or drop whole trailing rows to
+        // fit the box its effective anchor affords — never letting
+        // `overflow:hidden` below slice through a whole element (a half
+        // star row, half a line of text). Inert (scale 1, nothing dropped)
+        // for every group that already fits, the overwhelming common case.
+        const fitRows = rows.map((row, ri) => {
+          let heightPx = 0;
+          let heightPxNoReviews = 0;
+          for (const rawSlot of row.slots) {
+            const resolved = resolvedByRawSlot.get(rawSlot);
+            if (!resolved || resolved.content == null) continue;
+            const estCtx = {
+              fontPx: resolved.fontPx,
+              usableWidthPx: resolved.usableWidthPx,
+              maxLines: resolved.maxLines,
+              dims,
+              sizePct: rawSlot.treatment?.sizePct,
+            };
+            const h = estimateSlotHeightPx(rawSlot.key, resolved.content, estCtx);
+            const hNoRev = rawSlot.key === 'rating'
+              ? estimateSlotHeightPx(rawSlot.key, resolved.content, { ...estCtx, dropReviews: true })
+              : h;
+            heightPx = Math.max(heightPx, h);
+            heightPxNoReviews = Math.max(heightPxNoReviews, hNoRev);
+          }
+          return { id: `row-${ri}`, heightPx, heightPxNoReviews };
+        });
+        const boxHeightPx = (Number.isFinite(placed.top) && Number.isFinite(placed.bottom))
+          ? Math.max(0, height - placed.top - placed.bottom)
+          : null;
+        // Null only if a future anchor variant somehow omits top/bottom —
+        // every anchor resolveGroupBoxPx knows about sets both. Fail open
+        // (scale 1, nothing dropped) rather than invent a drop decision from
+        // no box, matching this file's existing "never throw, never NaN" bar.
+        const fitPlan = boxHeightPx != null
+          ? planGroupFit({ rows: fitRows, boxHeightPx, rowGapPx })
+          : { scale: 1, dropReviewsRowId: null, droppedRowIds: new Set() };
+
         return (
-          <div key={`${group.phase}|${group.anchor}`} style={{ ...placed, gap: Math.round((spec.stack?.rowGapPct ?? 0.018) * height) }}>
+          <div key={`${group.phase}|${group.anchor}`} style={{ ...placed, gap: rowGapPx }}>
             {rows.map((row, ri) => {
+              const rowId = `row-${ri}`;
+              // Whole-row drop (stackFit.js step 3) — never a partial row.
+              if (fitPlan.droppedRowIds.has(rowId)) return null;
+              const dropReviewsThisRow = fitPlan.dropReviewsRowId === rowId;
               const rendered = row.slots.map((rawSlot, si) => {
                 // Same-anchor same-phase slots stack as a flex column (container
                 // gap). Empty siblings drop out — e.g. proof falls back to
                 // claim+rating when quote is gated empty (visibleWhenEmpty).
-                // Cap context for deriveCharCap (width×lines/font model):
-                // live canvas dims, slot maxWidthPct, treatment maxLines,
-                // rendered font px (same baseSize the TextSlot paints), and
-                // panel column width when split-stage is on. usableWidthPx
-                // is canvas-relative (maxWidthPct×W), min'd with the panel
-                // when present — same arithmetic videoHeadlineService
-                // documents (0.46×1920, 0.9×1080). Absent panelBox → no
-                // panel fields; format-only still derives via defaults.
-                const t = rawSlot.treatment || {};
-                const maxWidthPct = rawSlot.position?.maxWidthPct;
-                const panelW = panelBox
-                  ? (width - panelBox.left - panelBox.right)
-                  : null;
-                let usableWidthPx = null;
-                if (Number.isFinite(maxWidthPct) && maxWidthPct > 0) {
-                  const fromPct = maxWidthPct * width;
-                  usableWidthPx = panelW != null && panelW > 0
-                    ? Math.min(fromPct, panelW)
-                    : fromPct;
-                } else if (panelW != null && panelW > 0) {
-                  // No authored maxWidthPct — text fills the panel column.
-                  // Documented fallback; Canonical landscape slots always
-                  // carry maxWidthPct:0.46 in canonical.json.
-                  usableWidthPx = panelW;
+                const resolved = resolvedByRawSlot.get(rawSlot);
+                if (!resolved || resolved.content == null) return null;
+                // Step 2 of the fit plan: strip the rating row's OWN trailing
+                // reviews line before ever considering dropping the row
+                // whole (see stackFit.js priority order).
+                let content = resolved.content;
+                if (dropReviewsThisRow && rawSlot.key === 'rating' && content?.reviewsText) {
+                  content = { ...content, reviewsText: '' };
                 }
-                const capCtx = {
-                  format,
-                  canvasWidth: width,
-                  maxWidthPct: Number.isFinite(maxWidthPct) ? maxWidthPct : null,
-                  usableWidthPx,
-                  maxLines: Number.isFinite(t.maxLines) ? t.maxLines : null,
-                  fontPx: baseSize(rawSlot.key, format, t.sizeScale),
-                  sizeScale: Number.isFinite(t.sizeScale) ? t.sizeScale : null,
-                  panelColumn: !!panelBox,
-                  panelSide: panelBox ? panelSide : null,
-                  panelWidthFrac: panelW != null && width > 0
-                    ? panelW / width
-                    : null,
-                  // Already resolved once above (zoneKey) — reuse it rather
-                  // than re-deriving from platformFormat inside slotContent.js,
-                  // so an explicit safeZoneKey prop override stays honored.
-                  // Lets deriveCharCap bound usableWidthPx by the surface's
-                  // OWN safe-zone width when it is narrower than `format`'s
-                  // shared default (reels/verticalYt/landscapeYt/squareYt/
-                  // pmax_video_*) — inert for vertical/feed/square/landscape/
-                  // stories. See resolveSurfaceSafeWidthPx in slotContent.js.
-                  safeZoneKey: zoneKey,
-                };
-                const content = resolveSlotContent(rawSlot, meta, allSlots, capCtx);
-                if (content == null) return null;
                 const Renderer = SLOT_RENDERERS[rawSlot.key];
                 if (!Renderer) return null;
                 // Bright plate (globally decided) → flip text tokens to
                 // their on-light variants (brand pills/CTA keep brand color).
-                const slot = (inkOnLight || reinforceShadow)
+                // Also step 1 of the fit plan: a bounded, uniform shrink
+                // applied as an EXTRA multiplier on the authored sizeScale —
+                // preferred over any dropping (stackFit.js). scale===1 is
+                // the common case and changes nothing.
+                const needsInkOverride = inkOnLight || reinforceShadow;
+                const needsScaleOverride = fitPlan.scale !== 1;
+                const slot = (needsInkOverride || needsScaleOverride)
                   ? {
                       ...rawSlot,
                       treatment: {
                         ...rawSlot.treatment,
-                        colorToken: inkOnLight
-                          ? contrastToken(mergedTokens, rawSlot.treatment.colorToken, true)
-                          : rawSlot.treatment.colorToken,
-                        shadow: reinforceShadow ? 'layered' : rawSlot.treatment.shadow,
+                        ...(needsInkOverride ? {
+                          colorToken: inkOnLight
+                            ? contrastToken(mergedTokens, rawSlot.treatment.colorToken, true)
+                            : rawSlot.treatment.colorToken,
+                          shadow: reinforceShadow ? 'layered' : rawSlot.treatment.shadow,
+                        } : null),
+                        ...(needsScaleOverride ? {
+                          sizeScale: (Number.isFinite(rawSlot.treatment?.sizeScale)
+                            ? rawSlot.treatment.sizeScale
+                            : 1) * fitPlan.scale,
+                        } : null),
                       },
                     }
                   : rawSlot;
