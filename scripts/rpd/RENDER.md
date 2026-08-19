@@ -15,6 +15,7 @@ Render changes the design.
 | `GEMINI_API_KEY` | ✅ | ✅ |
 | `MONGODB_URI` | ✅ | ✅ |
 | `CLOUDFLARE_API_TOKEN` | ❌ | ❌ |
+| `NETLIFY_AUTH_TOKEN` | ❌ | ❌ |
 
 `CLOUDINARY_CLOUD_NAME` is not a dashboard var and does not need to be — it is
 committed in `config/defaults.env` as `reach-social-prod`.
@@ -69,8 +70,13 @@ Dashboard → **New → Cron Job**:
 - **Env:** add `RPD_SLACK_CHANNEL`, and copy `ATLAS_API_KEY`,
   `CLOUDINARY_API_KEY`, `CLOUDINARY_API_SECRET`, `SLACK_BOT_TOKEN` from WEB.
   Optional: `RPD_MAX_USD` (default 2), `RPD_EVAL_MAX_USD` (0.5),
-  `CLOUDFLARE_API_TOKEN` + `RPD_PAGES_PROJECT` to publish galleries,
   `MONGODB_URI` only if a spec uses `seed.productId`.
+  **To publish galleries from Render:** `NETLIFY_AUTH_TOKEN` (a Personal Access
+  Token from the account that owns **Flood QRF**) plus
+  `RPD_NETLIFY_TEAM=decastro-mark85`. The token *is* the account selector, so no
+  `netlify switch` and no interactive login — which is the only thing that works
+  on a hosted runner. `RPD_PUBLISH_HOST` defaults to `netlify`; set it to
+  `cloudflare` (with `CLOUDFLARE_API_TOKEN`) to go back to Pages.
 
 Deliberately **not** committing a `render.yaml`: the existing services are
 dashboard-managed, and introducing a Blueprint would put them under file control

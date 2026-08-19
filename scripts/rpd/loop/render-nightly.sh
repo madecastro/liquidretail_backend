@@ -22,7 +22,11 @@
 # OPTIONAL:
 #   RPD_MAX_USD             — nightly cap, default 2
 #   RPD_SPEC                — spec path, default the committed candidates spec
-#   CLOUDFLARE_API_TOKEN    — only if you want the gallery published from Render
+#   NETLIFY_AUTH_TOKEN      — publish the gallery from Render (token = account
+#                             selector; an interactive `netlify login` is
+#                             impossible here). Pair with RPD_NETLIFY_TEAM.
+#   RPD_NETLIFY_TEAM        — team slug, e.g. decastro-mark85 (Flood QRF, Pro)
+#   CLOUDFLARE_API_TOKEN    — only if RPD_PUBLISH_HOST=cloudflare
 #   MONGODB_URI             — only if a spec uses seed.productId
 
 set -uo pipefail
@@ -66,11 +70,15 @@ fi
 log "auto-eval"
 node scripts/rpd/rpd.js eval "$RUN_DIR" --eval-max-usd "${RPD_EVAL_MAX_USD:-0.5}" || log "eval failed (non-fatal)"
 
-if [ -n "${CLOUDFLARE_API_TOKEN:-}" ]; then
-  log "publishing gallery"
-  node scripts/rpd/rpd.js publish "$RUN_DIR" --project "${RPD_PAGES_PROJECT:-rs-rpd}" || log "publish failed (non-fatal)"
+PUB_HOST="${RPD_PUBLISH_HOST:-netlify}"
+if { [ "$PUB_HOST" = "netlify" ] && [ -n "${NETLIFY_AUTH_TOKEN:-}" ]; } \
+   || { [ "$PUB_HOST" = "cloudflare" ] && [ -n "${CLOUDFLARE_API_TOKEN:-}" ]; }; then
+  log "publishing gallery to $PUB_HOST"
+  node scripts/rpd/rpd.js publish "$RUN_DIR" --host "$PUB_HOST" \
+    --site "${RPD_PAGES_PROJECT:-rs-rpd}" ${RPD_NETLIFY_TEAM:+--team "$RPD_NETLIFY_TEAM"} \
+    || log "publish failed (non-fatal)"
 else
-  log "CLOUDFLARE_API_TOKEN unset — gallery not published; media + manifest are mirrored to Cloudinary"
+  log "no token for $PUB_HOST — gallery not published; media + ledger are mirrored to Cloudinary"
 fi
 
 # LEARNINGS.md cannot be appended from here (no writable checkout, and a cron job

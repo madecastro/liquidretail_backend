@@ -17,7 +17,7 @@ It lives **outside the Ad pipeline**:
 - No `CostLog`.
 - No campaign / generate / claim path.
 
-You pick one or more Atlas video models, a seed image, and a list of prompt levers. The runner builds **cells = models × variants**, optionally submits to Atlas (billable), polls for free, downloads `master.mp4`, optionally titles with production Remotion, and writes a self-contained gallery you can publish to Cloudflare Pages.
+You pick one or more Atlas video models, a seed image, and a list of prompt levers. The runner builds **cells = models × variants**, optionally submits to Atlas (billable), polls for free, downloads `master.mp4`, optionally titles with production Remotion, and writes a self-contained gallery you can publish to Netlify (or Cloudflare Pages).
 
 Use this to tune the **canonical camera prompt** and compare Omni vs Grok (or other `MODEL_CAPS` models) without minting ads or touching spend ledgers.
 
@@ -34,8 +34,9 @@ Same load order as `retitleDriver`: process env first, then `config/defaults.env
 | Var | Required | Where |
 |---|---|---|
 | `ATLAS_API_KEY` | **Yes for `--live`** | Render dashboard → **WEB** `srv-d1vuktqli9vc73ft07ng` (secret). Or local `.env`. **Never print or commit it.** |
-| `CLOUDFLARE_API_TOKEN` | For `publish` | Cloudflare API token with Pages write. |
-| `CLOUDFLARE_ACCOUNT_ID` | For `publish` | Cloudflare account id. |
+| `NETLIFY_AUTH_TOKEN` | For `publish` (default host) | Personal Access Token from the account owning the **Flood QRF** team. The token selects the account — no `netlify switch`. Required on Render. |
+| `RPD_NETLIFY_TEAM` | For `publish` | Team slug, `decastro-mark85` (Flood QRF). Needed to create the site in the right account. |
+| `CLOUDFLARE_API_TOKEN` / `_ACCOUNT_ID` | Only for `--host cloudflare` | Pages-write token + account id. |
 | Cloudinary | Optional | Seed **prep** (aspect crop) only works for Cloudinary URLs. Uploads stay **off** by default; Pages serves local files. |
 
 ```bash
@@ -150,7 +151,7 @@ node scripts/rpd/rpd.js eval <runDir> [--eval-max-usd 0.5]
 node scripts/rpd/rpd.js stats [--out rpd-runs] [--csv]
 node scripts/rpd/rpd.js gallery <runDir>
 node scripts/rpd/rpd.js note <runDir> <cellId|run> "text"
-node scripts/rpd/rpd.js publish <runDir> [--project rs-rpd] [--no-slack]
+node scripts/rpd/rpd.js publish <runDir> [--host netlify|cloudflare] [--site rs-rpd] [--team <slug>] [--cli] [--no-slack]
 node scripts/rpd/rpd.js models
 ```
 
@@ -160,7 +161,7 @@ node scripts/rpd/rpd.js models
 | `resume <runDir>` | Re-poll existing receipts, download, reconcile settled price, rebuild gallery. **Structurally never submits** (resume path does not import `submitGeneration`). | No (polls are free) |
 | `gallery <runDir>` | Rebuild `index.html` from `manifest.json`. | No |
 | `note <runDir> <cellId\|run> "text"` | Append an observation on a cell or the whole run; persist on the manifest; rebuild gallery. | No |
-| `publish <runDir> [--project rs-rpd]` | `npx --yes wrangler pages deploy`. Creates the Pages project on first 404. | No (Cloudflare only) |
+| `publish <runDir>` | Deploy the gallery. **Netlify by default** (site `rs-rpd`, Flood QRF); `--host cloudflare` for Pages. Creates the site once if absent. Per-deploy URLs are immutable; `manifest.json` is never published. | No (hosting only) |
 | `eval <runDir>` | Vision-grade settled cells into badged auto-notes. Own cap, `--eval-max-usd` (default $0.50). | Yes — vision LLM, ~$0.01–0.03/cell |
 | `stats` | Aggregate every run manifest: settled cost + latency percentiles per model/duration/size. `--csv` for a spreadsheet. | No |
 | `models` | Print `MODEL_CAPS` + `estimateRenderCostUsd` table. | No |
@@ -266,11 +267,41 @@ Must show:
 
 ### Publish
 
+Galleries go to **Netlify** by default — site `rs-rpd` in the **Flood QRF** team,
+which is on Pro, so site password protection (`secure_site`) is available there.
+
 ```bash
-export CLOUDFLARE_API_TOKEN=...
-export CLOUDFLARE_ACCOUNT_ID=...
-node scripts/rpd/rpd.js publish <runDir> --project rs-rpd
+# token path (default; works locally AND on Render — the token selects the account)
+export NETLIFY_AUTH_TOKEN=...            # PAT from the account owning Flood QRF
+node scripts/rpd/rpd.js publish <runDir> --site rs-rpd --team decastro-mark85
+
+# CLI path, for a machine with an interactive login instead of a token
+node scripts/rpd/rpd.js publish <runDir> --cli --site rs-rpd --team decastro-mark85
+
+# Cloudflare Pages is still supported
+export CLOUDFLARE_API_TOKEN=... CLOUDFLARE_ACCOUNT_ID=...
+node scripts/rpd/rpd.js publish <runDir> --host cloudflare --project rs-rpd
 ```
+
+**Two accounts?** `netlify switch --email <addr>` flips the machine-wide CLI
+login, which makes "which account did that publish land in" depend on invisible
+local state. Prefer the token path: `NETLIFY_AUTH_TOKEN` overrides the login
+entirely, so it is deterministic locally and the only option on Render.
+
+**Per-deploy URLs are immutable** — deploys are draft/non-prod on purpose, so a
+LEARNINGS row still shows THAT run later. A production deploy would be overwritten
+by the next publish, silently re-pointing every historical link at the newest
+gallery.
+
+**`manifest.json` is never published.** It is the run ledger (prompts, prediction
+ids, settled costs) and the gallery does not reference it. All three publishers
+deploy a staged copy with it removed — pinned by `verifyRpdHarness.js` section P,
+after the CLI path was caught serving it 200 from a public URL.
+
+**Access:** on Flood QRF (Pro) turn on Site configuration → Access & security →
+**Password protection**. That is a real edge gate, unlike a client-side Identity
+widget, which leaves the .mp4/.png URLs directly fetchable. On a Free team the
+capability is absent and a published gallery is readable by anyone with the URL.
 
 Under the hood:
 

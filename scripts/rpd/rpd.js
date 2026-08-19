@@ -165,10 +165,33 @@ async function main() {
 
   if (cmd === 'publish') {
     const runDir = args[0];
-    if (!runDir) throw new Error('usage: rpd publish <runDir> [--project rs-rpd] [--no-slack]');
-    const { publishRun } = require('./lib/publish');
-    const project = flagValue(args, '--project') || 'rs-rpd';
-    const { url } = publishRun(runDir, { project });
+    if (!runDir) {
+      throw new Error('usage: rpd publish <runDir> [--host netlify|cloudflare] [--site|--project rs-rpd] [--team <slug>] [--cli] [--no-slack]');
+    }
+    // Netlify is the default host: it keeps galleries on the same platform as the
+    // frontend. Cloudflare Pages stays fully supported (and is the one with a
+    // free real access gate via Zero Trust) — RPD_PUBLISH_HOST or --host picks.
+    const host = (flagValue(args, '--host') || process.env.RPD_PUBLISH_HOST || 'netlify').toLowerCase();
+    const target = flagValue(args, '--site') || flagValue(args, '--project') || 'rs-rpd';
+    let url = null;
+    if (host === 'netlify') {
+      // API path by default: a token selects the account, so publishing does not
+      // depend on which login `netlify switch` last left active. --cli forces the
+      // CLI path for a machine that only has an interactive login.
+      const team = flagValue(args, '--team');
+      if (flag(args, '--cli')) {
+        const { publishRunNetlify } = require('./lib/publishNetlify');
+        ({ url } = publishRunNetlify(runDir, { site: target, team }));
+      } else {
+        const { publishRunNetlifyApi } = require('./lib/publishNetlifyApi');
+        ({ url } = await publishRunNetlifyApi(runDir, { site: target, team }));
+      }
+    } else if (host === 'cloudflare' || host === 'pages') {
+      const { publishRun } = require('./lib/publish');
+      ({ url } = publishRun(runDir, { project: target }));
+    } else {
+      throw new Error(`rpd: unknown --host "${host}" (netlify | cloudflare)`);
+    }
 
     // Announce it. Opt-in by env (RPD_SLACK_CHANNEL + SLACK_BOT_TOKEN): a
     // published gallery nobody hears about is a learning nobody shares. Never

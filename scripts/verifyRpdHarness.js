@@ -740,6 +740,53 @@ const codeOnly = (src) => src
       'the ledger must be mirrored AFTER the cells, so it carries their uploadedUrls');
   });
 
+  // ── P. publishing never ships the ledger ───────────────────────────────
+  console.log('\nP. publish paths exclude the run ledger');
+  check('P1 the exclusion is defined ONCE and every publisher uses it', () => {
+    // It started life inside the Netlify API module, so the CLI path published
+    // manifest.json — caught live serving 200 from a public URL while a comment
+    // two files away claimed it was excluded.
+    const { EXCLUDE, shouldPublish } = require(path.join(RPD, 'lib', 'publishStage'));
+    assert(EXCLUDE.has('manifest.json'), 'the ledger must be excluded');
+    assert.strictEqual(shouldPublish('/x/manifest.json'), false);
+    assert.strictEqual(shouldPublish('/x/index.html'), true);
+    for (const f of ['publish.js', 'publishNetlify.js', 'publishNetlifyApi.js']) {
+      const src = codeOnly(read(path.join(RPD, 'lib', f)));
+      assert(/require\('\.\/publishStage'\)/.test(src), `${f} must use the shared exclusion`);
+      assert(!/new Set\(\['manifest\.json'\]\)/.test(src), `${f} must not re-declare its own exclusion list`);
+    }
+  });
+  check('P2 directory publishers deploy a STAGED copy, not the run dir', () => {
+    // wrangler and the netlify CLI upload whatever directory they are given and
+    // have no per-file exclude, so passing the run dir republishes the ledger.
+    for (const f of ['publish.js', 'publishNetlify.js']) {
+      const src = codeOnly(read(path.join(RPD, 'lib', f)));
+      assert(/stageForPublish\(/.test(src), `${f} must stage`);
+      assert(/staged\.cleanup\(\)/.test(src), `${f} must clean the staging dir up`);
+      assert(/finally\s*\{[^}]*staged\.cleanup/s.test(src), `${f} must clean up in a finally`);
+      assert(/--dir',\s*staged\.dir|deployArgs\(staged\.dir/.test(src),
+        `${f} must deploy staged.dir, never the raw run dir`);
+    }
+  });
+  await checkAsync('P3 staging really drops the ledger and keeps the gallery', async () => {
+    const { stageForPublish } = require(path.join(RPD, 'lib', 'publishStage'));
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'rpd-p3-'));
+    fs.mkdirSync(path.join(tmp, 'cells', 'c1'), { recursive: true });
+    fs.writeFileSync(path.join(tmp, 'index.html'), '<html></html>');
+    fs.writeFileSync(path.join(tmp, 'manifest.json'), '{\"secret\":1}');
+    fs.writeFileSync(path.join(tmp, 'cells', 'c1', 'plate.png'), 'png');
+    const staged = stageForPublish(tmp);
+    try {
+      assert(fs.existsSync(path.join(staged.dir, 'index.html')), 'gallery must survive');
+      assert(fs.existsSync(path.join(staged.dir, 'cells', 'c1', 'plate.png')), 'media must survive');
+      assert(!fs.existsSync(path.join(staged.dir, 'manifest.json')), 'the ledger must be gone');
+    } finally {
+      staged.cleanup();
+      assert(!fs.existsSync(staged.dir), 'cleanup must remove the staging dir');
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
   console.log(`\n${passed} passed, ${failed} failed`);
   process.exit(failed ? 1 : 0);
 })().catch((err) => {

@@ -5,6 +5,7 @@
 const fs = require('fs');
 const path = require('path');
 const { spawnSync } = require('child_process');
+const { stageForPublish } = require('./publishStage');
 
 function requireCloudflareEnv() {
   if (!process.env.CLOUDFLARE_API_TOKEN) {
@@ -59,17 +60,25 @@ function publishRun(runDir, { project = 'rs-rpd', branch = 'main' } = {}) {
     throw new Error(`rpd: runDir not found or not a directory: ${abs}`);
   }
 
-  let result = runWrangler(deployArgs(abs, project, branch));
-  if (result.status !== 0 && isProjectNotFound(combinedOutput(result))) {
-    console.log(`rpd: project "${project}" not found — creating once, then retrying deploy`);
-    const created = runWrangler([
-      'pages', 'project', 'create', project,
-      '--production-branch', branch
-    ]);
-    if (created.status !== 0) {
-      throw new Error(`rpd: wrangler pages project create failed (exit ${created.status})`);
+  // Staged copy: wrangler uploads the whole directory, so without this the run's
+  // ledger goes public here too (it did on the first galleries).
+  const staged = stageForPublish(abs);
+  let result;
+  try {
+    result = runWrangler(deployArgs(staged.dir, project, branch));
+    if (result.status !== 0 && isProjectNotFound(combinedOutput(result))) {
+      console.log(`rpd: project "${project}" not found — creating once, then retrying deploy`);
+      const created = runWrangler([
+        'pages', 'project', 'create', project,
+        '--production-branch', branch
+      ]);
+      if (created.status !== 0) {
+        throw new Error(`rpd: wrangler pages project create failed (exit ${created.status})`);
+      }
+      result = runWrangler(deployArgs(staged.dir, project, branch));
     }
-    result = runWrangler(deployArgs(abs, project, branch));
+  } finally {
+    staged.cleanup();
   }
 
   if (result.status !== 0) {
