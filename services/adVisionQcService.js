@@ -1,18 +1,41 @@
-// Post-render VISION QC for static product ads.
+// Post-render VISION QC for static AND video product ads.
 //
 // WHY: prompts already demand product fidelity (staticAdIntents.js:261-264,423)
 // and gpt-image-2/edit has no input_fidelity param. Live 2026-08-03 renders still
 // stamped competitor-shaped brand marks onto products (~1 in 3). The remaining
 // lever is measure-and-reject against the ORIGINAL product photo.
 //
-// CONTRACT:
+// STATIC CONTRACT (runPostRenderQc / judgeRender / buildVisionUserContent):
 //   - Always compare ORIGINAL PRODUCT vs FINISHED RENDER in ONE vision call.
 //   - Four categories, each scored + findings.
 //   - Fail → regenerate exactly ONCE with a corrective prompt → re-QC.
 //   - Second failure → fail the ad (never a third generation). MONEY INVARIANT.
 //   - Discarded (already-paid) renders keep their URL on the persisted verdict.
 //
-// Feature flag resolution (most specific first):
+// VIDEO CONTRACT (runVideoPostRenderQc / judgeVideoRender /
+// buildVideoVisionUserContent) — added to close the gap where the video
+// pipeline (atlasVideoService / brandScriptExecutor) shipped with ZERO
+// vision inspection while statics were protected:
+//   - Compare ORIGINAL PRODUCT vs N frames SAMPLED from the delivered video
+//     (services/videoFrameService.buildFrameUrls — quartile sampling on the
+//     already-generated Cloudinary asset, no ffmpeg/local decode needed) in
+//     ONE vision call, same SAME four category keys so Ad.visionQc /
+//     summarizeVisionQc / the gallery UI need no video-specific branch.
+//   - NEVER regenerates. A video master is ~$0.90 (vs ~$0.07 for a static)
+//     and a colourway/brand-mark defect is baked into the generative clip —
+//     a second $0.90 submit on the same seed is not a reliable fix, unlike a
+//     static regen with a corrective prompt. See runVideoPostRenderQc's
+//     docstring for the full money reasoning.
+//   - Deliberately FLAGS rather than fails the ad: the master is already
+//     paid for, and re-deriving/re-titling from it cannot un-bake a
+//     hallucinated colour. `ok` is always true; the caller (brandScriptExecutor
+//     .uploadRenderAndStamp) stamps the failed verdict and ships the ad as a
+//     normal draft so an operator sees the FAIL badge (via the same
+//     summarizeVisionQc surfacing PR #236 wired up) before sending it to a
+//     platform, instead of silently discarding a paid asset.
+//
+// Feature flag resolution (most specific first) — SHARED by both static and
+// video callers (one gate, not two): flipping it protects both pipelines.
 //   1. SystemConfig.adVisionQcEnabled when a real boolean (DB, live-flippable)
 //   2. process.env.AD_VISION_QC_ENABLED === 'true' after toLowerCase (env)
 //   3. default false
@@ -899,6 +922,294 @@ async function runPostRenderQc({
   };
 }
 
+// ── VIDEO post-render vision QC ─────────────────────────────────────────
+// See the file header CONTRACT block for the full static-vs-video
+// comparison. Summary: same 4 category keys (so Ad.visionQc /
+// summarizeVisionQc / the gallery UI are unchanged), same model, same
+// PASS_FLOOR — but ONE vision call over [seed, frame1..frameN] instead of
+// [seed, render], and NO regeneration loop.
+
+/**
+ * Build the multimodal user content for VIDEO QC: labelled text + ONE seed
+ * image + N frames SAMPLED from the delivered video (services/
+ * videoFrameService.buildFrameUrls — Cloudinary `so_<sec>` edge transform,
+ * no ffmpeg/local decode). Image order is fixed: [0]=ORIGINAL PRODUCT,
+ * [1..N]=VIDEO FRAMES in ascending timestamp order.
+ *
+ * `frames`: [{ timestampSec, url }] — see videoFrameService.buildFrameUrls.
+ *
+ * Category rubric differences from buildVisionUserContent (static), all
+ * driven by what a video ad actually is:
+ *   - competitor_marks / product_fidelity: same meaning as static. This
+ *     pair is what catches a hallucinated colourway (product_fidelity) or
+ *     an invented/foreign brand mark (competitor_marks) — the two real
+ *     defects this function exists to catch (see PR description). Scored
+ *     against the WORST frame, not the average — a generative video model
+ *     can drift color mid-clip even when frame 1 is correct.
+ *   - text_defects: narrowed to text/lettering that is part of the PRODUCT
+ *     ITSELF (woven labels, hang tags, embossed logos) across the sampled
+ *     frames. The ad's own burned-in caption/headline/CTA/rating overlay is
+ *     explicitly OUT OF SCOPE — that overlay has its own in-flight QA track
+ *     (Reels truncation / rating stray-character fixes) and this function
+ *     has no expected-copy contract to check it against without duplicating
+ *     that work.
+ *   - layout_safe_box: repurposed as framing/visibility (no fixed safe-box
+ *     geometry is available at this call site, unlike the static path's
+ *     safeBoxInDeliveredPx) — is the product's branding area in-frame, and
+ *     does the caption overlay ever fully obscure the product.
+ */
+function buildVideoVisionUserContent({ originalProductUrl, frames, brandName }) {
+  if (!originalProductUrl) throw new Error('adVisionQc: originalProductUrl required');
+  if (!Array.isArray(frames) || !frames.length) throw new Error('adVisionQc: frames required');
+
+  const brand = brandName || 'the advertiser';
+  const frameList = frames
+    .map((f) => `  - t=${Number(f.timestampSec).toFixed(1)}s`)
+    .join('\n');
+
+  const prompt = `You are a post-render quality inspector for direct-response VIDEO product ads.
+
+You are given ${frames.length + 1} images in this exact order:
+  IMAGE 1 — ORIGINAL PRODUCT PHOTO (the source/hero reference the video was generated from)
+  IMAGE 2-${frames.length + 1} — FRAMES SAMPLED FROM THE DELIVERED VIDEO, in this order:
+${frameList}
+
+Treat the sampled frames as evidence about the WHOLE clip, not independent
+ads: if a defect appears in ANY ONE frame, the category fails for the video.
+
+Brand name: ${brand}
+
+Score EACH category 0-10 (integer) and list concrete findings, citing which
+frame(s) (by timestamp) show the problem. Return ONLY JSON.
+
+CATEGORIES
+
+1. competitor_marks (PRIMARY)
+   Logos, wordmarks, emblems, badges, tree/animal/crest marks, or other brand
+   devices present ON THE PRODUCT in any sampled frame that are ABSENT from
+   the product in IMAGE 1, OR that belong to a DIFFERENT brand than ${brand}.
+   IMPORTANT: ${brand}'s OWN logo composited into a corner as ad chrome is
+   EXPECTED and must NOT be flagged. Only invent marks on the product surface
+   (hardware, woven labels, hang tags) that were not on the original product.
+
+2. product_fidelity (PRIMARY)
+   Silhouette, COLOURWAY, materials, panel/pocket count, orientation, and
+   construction drift from IMAGE 1, checked against EVERY sampled frame. A
+   generative video model can drift the product's colour or shape partway
+   through a clip even when the opening frame is correct -- score the WORST
+   frame, not the average. Scene/background/model/lighting change is fine;
+   product identity or colour drift is not.
+
+3. text_defects (product-intrinsic only -- NOT the ad's caption overlay)
+   Misspelled, mangled, gibberish, or nonsensical text/lettering that is part
+   of the PRODUCT ITSELF or the scene (woven labels, hang tags, embossed or
+   debossed logos, packaging). Do NOT score the ad's own burned-in caption,
+   headline, CTA button, or star-rating overlay -- that overlay is inspected
+   by a separate system and is explicitly OUT OF SCOPE for this category.
+
+4. layout_safe_box (framing/visibility -- no fixed geometry supplied)
+   Is the product's key branding area (where a hang tag, woven label, or
+   logo would sit) fully in-frame and not clipped by the video's crop in the
+   sampled frames? Does the caption/logo overlay ever fully obscure the
+   product in a sampled frame? Flag only real visibility problems, not
+   ordinary cinematic framing choices (close-ups, pans).
+
+JSON SHAPE (no prose outside it):
+{
+  "categories": {
+    "competitor_marks": { "score": 0, "pass": true, "findings": ["..."] },
+    "product_fidelity": { "score": 0, "pass": true, "findings": ["..."] },
+    "text_defects":     { "score": 0, "pass": true, "findings": ["..."] },
+    "layout_safe_box":  { "score": 0, "pass": true, "findings": ["..."] }
+  },
+  "summary": "one-line overall"
+}`;
+
+  const content = [
+    { type: 'text', text: prompt },
+    { type: 'text', text: 'IMAGE 1 — ORIGINAL PRODUCT PHOTO:' },
+    { type: 'image_url', image_url: { url: originalProductUrl } }
+  ];
+  frames.forEach((f, i) => {
+    content.push({ type: 'text', text: `IMAGE ${i + 2} — VIDEO FRAME @ t=${Number(f.timestampSec).toFixed(1)}s:` });
+    content.push({ type: 'image_url', image_url: { url: f.url } });
+  });
+  return content;
+}
+
+/**
+ * One vision call over the seed product photo + N sampled video frames.
+ * Billable LLM — must go through chatCompletion so trackLlmCall ledgers it
+ * (same money discipline as judgeRender).
+ *
+ * deps.chatCompletion / deps.model injectable for the offline harness.
+ */
+async function judgeVideoRender({
+  originalProductUrl,
+  frames,
+  brandName,
+  brandId = null,
+  productId = null,
+  adId = null,
+  campaignId = null
+}, deps = {}) {
+  const chat = deps.chatCompletion || chatCompletion;
+  const model = deps.model || resolveQcModel();
+  const userContent = buildVideoVisionUserContent({ originalProductUrl, frames, brandName });
+
+  // ── MONEY: billable vision LLM call ──────────────────────────────
+  const res = await chat(
+    {
+      stage: 'ad_video_vision_qc',
+      service: 'adVisionQcService',
+      purposeTag: 'post_render_video_qc',
+      visionImages: frames.length + 1,
+      brandId,
+      productId,
+      adId,
+      campaignId
+    },
+    {
+      model,
+      messages: [{ role: 'user', content: userContent }],
+      temperature: 0.0,
+      // Same reasoning as judgeRender's max_tokens comment (2026-08-05 probe):
+      // a thinking model needs headroom that covers REASONING tokens, not
+      // just the verdict, and an unused ceiling costs nothing. Raised over
+      // judgeRender's 5000 because this call reasons over MORE images (seed +
+      // up to ~5 frames vs 2) — do not lower without re-probing on real video
+      // QC calls.
+      max_tokens: 6000,
+      response_format: { type: 'json_object' }
+    }
+  );
+
+  const text = res?.choices?.[0]?.message?.content;
+  if (!text) {
+    return parseVerdict('{"categories":{},"summary":"empty vision response"}');
+  }
+  return parseVerdict(text);
+}
+
+/**
+ * MONEY-AWARE control flow for VIDEO post-render QC. Deliberately much
+ * simpler than runPostRenderQc (static): ONE inspection, NEVER a
+ * regeneration, and NEVER a caller-facing failure signal.
+ *
+ * WHY NO REGENERATION (unlike static's MAX_QC_REGENERATIONS=1):
+ *   - A static regen costs ~$0.0717 and a corrective prompt can plausibly
+ *     fix an invented mark on the NEXT gpt-image-2/edit call.
+ *   - A video master costs ~$0.90 (12x) and the defect classes this
+ *     function exists to catch (hallucinated colourway, garbled on-product
+ *     branding) are generated by the video model INTO the clip over its
+ *     full duration — there is no cheap "fix this one thing" corrective
+ *     prompt equivalent, and a second $0.90 submit on the same seed is not
+ *     a reliable fix. Regenerating here would be spending real money on a
+ *     coin flip. See PR description "cost note" for the full framing.
+ *
+ * WHY `ok` IS ALWAYS TRUE (this function never signals "fail the ad"):
+ *   - The master is ALREADY PAID FOR by the time this runs (post-upload).
+ *     Discarding it (the static path's failure behaviour: throw, caller
+ *     marks the ad 'failed') would waste the ~$0.90 spend AND still not
+ *     un-bake the defect on a retry.
+ *   - Deliberate owner-facing choice: FLAG, DON'T DISCARD. This function
+ *     stamps a failed verdict (`visionQc.passed === false`) and the caller
+ *     (brandScriptExecutor.uploadRenderAndStamp) ships the ad as a normal
+ *     draft — status is NOT forced to 'failed' — so an operator sees the
+ *     FAIL badge via the existing summarizeVisionQc surfacing (gallery list
+ *     / detail modal / run poller, PR #236) and can decide not to send that
+ *     specific ad to a platform, instead of the asset silently vanishing.
+ *   - alertQcFailure below still fires at 'error' level so the failure is
+ *     loud in Slack even though it is not fatal to the render.
+ */
+async function runVideoPostRenderQc({
+  enabled,
+  originalProductUrl,
+  frames,
+  brandName,
+  brandId = null,
+  productId = null,
+  adId = null,
+  campaignId = null,
+  deliveredUrl = null,
+  judgeFn = null
+} = {}) {
+  const qcEnabled = (typeof enabled === 'boolean') ? enabled : await resolveEnabled();
+
+  // ── Flag off: nothing inspected, nothing claimed ──────────────────
+  if (!qcEnabled) {
+    return {
+      ok: true,
+      skipped: true,
+      visionQc: buildPersistedVerdict({
+        passed: false,
+        skipped: true,
+        disabled: true,
+        reason: 'AD_VISION_QC_ENABLED=false',
+        finalAttempt: null,
+        attempts: []
+      })
+    };
+  }
+
+  if (!originalProductUrl) {
+    return { ok: true, skipped: true, visionQc: buildSkippedVerdict('no original product URL') };
+  }
+  if (!Array.isArray(frames) || !frames.length) {
+    return {
+      ok: true,
+      skipped: true,
+      visionQc: buildSkippedVerdict('no frames could be sampled from the delivered video')
+    };
+  }
+
+  const judge = judgeFn || ((args) => judgeVideoRender(args));
+
+  // THROW vs GARBLED VERDICT — same distinction runPostRenderQc draws: a
+  // throw means the model never looked (infrastructure), not evidence the
+  // video is bad. Ship uninspected rather than stamp a false fail.
+  let verdict;
+  try {
+    verdict = await judge({
+      originalProductUrl, frames, brandName, brandId, productId, adId, campaignId
+    });
+  } catch (err) {
+    const msg = (err && err.message) ? err.message : String(err || 'unknown');
+    console.warn(
+      `   ⚠️  adVisionQc(video): vision call threw — shipping paid master uninspected: ${msg}`
+    );
+    return {
+      ok: true,
+      skipped: true,
+      uninspected: true,
+      visionQc: buildSkippedVerdict(`vision call failed: ${msg}`)
+    };
+  }
+
+  reportQcVerdict({ adId, attempt: 1, verdict, willRegenerate: false, terminal: true });
+
+  const attempts = [{
+    attempt: 1,
+    pass: !!verdict.pass,
+    categories: verdict.categories,
+    findings: verdict.findings || [],
+    summary: verdict.summary,
+    renderUrl: deliveredUrl || null,
+    discarded: false
+  }];
+
+  return {
+    ok: true, // ALWAYS true — see docstring. Never signals "fail the ad".
+    skipped: false,
+    passed: !!verdict.pass,
+    visionQc: buildPersistedVerdict({
+      passed: !!verdict.pass,
+      finalAttempt: 1,
+      attempts
+    })
+  };
+}
+
 /**
  * Full per-attempt breakdown (all four category scores + findings + the
  * discarded/kept render URL for every attempt) — this IS "the verbose LLM
@@ -991,8 +1302,15 @@ function buildQcSlackDetail(visionQc, { appUrl = null } = {}) {
  *
  * regenerated: explicit override (recovery passes false).
  * Otherwise inferred from finalAttempt / attempts length > 1.
+ *
+ * mediaLabel: 'Static ad' (default, back-compat) or 'Video ad' — video never
+ * regenerates (runVideoPostRenderQc), so its title collapses to a single
+ * "no regeneration" form regardless of `regenerated`.
  */
-function qcFailureTitle(visionQc, { regenerated = null } = {}) {
+function qcFailureTitle(visionQc, { regenerated = null, mediaLabel = 'Static ad' } = {}) {
+  if (mediaLabel !== 'Static ad') {
+    return `${mediaLabel} failed vision QC`;
+  }
   const attempts = visionQc?.attempts || [];
   const finalAttempt = Number(visionQc?.finalAttempt) || attempts.length || 0;
   const didRegen = regenerated == null
@@ -1073,7 +1391,7 @@ function summarizeVisionQc(visionQc, { categories = false } = {}) {
  * @param {boolean|null} [regenerated] — when known, overrides attempt-count
  *   inference for the alert title (recovery always passes false).
  */
-function alertQcFailure({ adId, brandId, productId, visionQc, brandName, appUrl = null, regenerated = null } = {}) {
+function alertQcFailure({ adId, brandId, productId, visionQc, brandName, appUrl = null, regenerated = null, mediaLabel = 'Static ad' } = {}) {
   try {
     const alerts = require('./alertService');
     const last = (visionQc?.attempts || [])[(visionQc?.attempts || []).length - 1];
@@ -1087,7 +1405,7 @@ function alertQcFailure({ adId, brandId, productId, visionQc, brandName, appUrl 
       : !!regenerated;
     alerts.notifyAsync({
       level: 'error',
-      title: qcFailureTitle(visionQc, { regenerated }),
+      title: qcFailureTitle(visionQc, { regenerated, mediaLabel }),
       // Keyed per-ad, not a fixed literal: alertService's notify() dedupes
       // by this key within a 15-minute window (ALERT_DEDUPE_WINDOW_MIN) and
       // folds anything suppressed into a generic "+N more (suppressed)"
@@ -1126,15 +1444,15 @@ function alertQcFailure({ adId, brandId, productId, visionQc, brandName, appUrl 
  * ALERT_MIN_LEVEL is 'warn', so an 'info' alert here would silently never
  * be delivered under default config.
  */
-function alertQcAccepted({ adId, brandId, productId, visionQc, brandName, appUrl = null }) {
+function alertQcAccepted({ adId, brandId, productId, visionQc, brandName, appUrl = null, mediaLabel = 'Static ad' }) {
   try {
     const alerts = require('./alertService');
     const last = (visionQc?.attempts || [])[(visionQc?.attempts || []).length - 1];
     alerts.notifyAsync({
       level: 'warn',
       title: visionQc?.finalAttempt > 1
-        ? 'Static ad passed vision QC after one regeneration'
-        : 'Static ad passed vision QC',
+        ? `${mediaLabel} passed vision QC after one regeneration`
+        : `${mediaLabel} passed vision QC`,
       // Per-ad key — see the comment on alertQcFailure's key above; the
       // same dedupe-collapse risk applies here and matters more, since
       // acceptance is the common case and will hit far higher volume.
@@ -1161,12 +1479,12 @@ function alertQcAccepted({ adId, brandId, productId, visionQc, brandName, appUrl
  * Keyed PER AD — a fixed key would let alertService's 15-min dedupe swallow
  * every ad but the first (same trap as alertQcFailure).
  */
-function alertQcSkipped({ adId, brandId, productId, brandName, reason }) {
+function alertQcSkipped({ adId, brandId, productId, brandName, reason, mediaLabel = 'Static ad' }) {
   try {
     const alerts = require('./alertService');
     alerts.notifyAsync({
       level: 'error',
-      title: 'Static ad shipped WITHOUT vision QC',
+      title: `${mediaLabel} shipped WITHOUT vision QC`,
       key: `vision-qc:skipped:${adId || 'unknown'}`,
       fields: {
         ad: String(adId || '-'),
@@ -1187,6 +1505,24 @@ function alertQcSkipped({ adId, brandId, productId, brandName, reason }) {
  * there is no runId — must NOT fall back to alertService (scale: hundreds
  * of products × 3 surfaces would trip ALERT_RATE_LIMIT_MAX and starve
  * real error/fatal alerts).
+ *
+ * `qcDetail` carries the SAME buildQcSlackDetail() block the fail/skip
+ * alerts already send to the main channel (verdict, summary, full
+ * per-category scores + findings via renderCategoryBlock, the attempt
+ * trail — collapsed to a plain preview-URL line when there was only one
+ * attempt, which is every video QC call and most static passes) — owner
+ * request 2026-08-19: "I want to see the output even if it is approved so
+ * I can see what it is looking for and what it observes." Deliberately NOT
+ * routed through alertQcAccepted/alertService: that path is dead in
+ * production for exactly this reason (see alertQcAccepted's docstring) —
+ * at real scale (~900 static surfaces/run) a warn-level accept alert per ad
+ * would exhaust ALERT_RATE_LIMIT_MAX and silently drop genuine error/fatal
+ * alerts. The run-feed thread (runFeedService.noteEvent) is NOT subject to
+ * that limiter — it has its own bounded ring buffer + batched Slack posts
+ * (services/runFeedService.js SAFETY CONTRACT) — so this sidesteps the
+ * rate-limit problem entirely while keeping the main channel reserved for
+ * genuine failures. formatThreadLine (runFeedService.js) renders this as an
+ * appended multi-line block after the existing one-line summary.
  */
 function noteQcPassToRunFeed({
   campaignRunId,
@@ -1212,7 +1548,9 @@ function noteQcPassToRunFeed({
       // summary + attempt are rendered by formatThreadLine (not dead payload).
       summary: String(last?.summary || 'pass').slice(0, 200),
       attempt: visionQc?.finalAttempt || null,
-      previewUrl: url
+      previewUrl: url,
+      // Full category-level detail — see docstring above.
+      qcDetail: buildQcSlackDetail(visionQc, { appUrl })
     });
   } catch (err) {
     console.warn(`   ⚠️  adVisionQc: run-feed pass note failed: ${err.message}`);
@@ -1221,7 +1559,12 @@ function noteQcPassToRunFeed({
 
 /**
  * Per-ad QC fail notice → run feed thread (in addition to alertQcFailure).
- * Fire-and-forget.
+ * Fire-and-forget. Carries the same full qcDetail block as the pass path
+ * (see noteQcPassToRunFeed) so the thread is a complete per-ad audit trail
+ * for both outcomes — the main-channel alert (alertQcFailure) already gets
+ * this detail too, but the thread is read chronologically by whoever is
+ * watching a run live, which is a different audience/moment than someone
+ * triaging a Slack alert after the fact.
  */
 function noteQcFailToRunFeed({
   campaignRunId,
@@ -1246,7 +1589,8 @@ function noteQcFailToRunFeed({
       // summary + attempt are rendered by formatThreadLine (not dead payload).
       summary: String(last?.summary || 'fail').slice(0, 200),
       attempt: visionQc?.finalAttempt || null,
-      previewUrl: url
+      previewUrl: url,
+      qcDetail: buildQcSlackDetail(visionQc, { appUrl })
     });
   } catch (err) {
     console.warn(`   ⚠️  adVisionQc: run-feed fail note failed: ${err.message}`);
@@ -1277,9 +1621,13 @@ module.exports = {
   qcFailureTitle,
   summarizeVisionQc,
   reportQcVerdict,
+  // Video pure helpers
+  buildVideoVisionUserContent,
   // I/O
   judgeRender,
   runPostRenderQc,
+  judgeVideoRender,
+  runVideoPostRenderQc,
   alertQcFailure,
   alertQcAccepted,
   alertQcSkipped,
