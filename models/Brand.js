@@ -127,6 +127,19 @@ const brandSchema = new mongoose.Schema({
   // 'scraped' | 'gpt' | 'brand-reviews' | null.
   enrichmentStage:    { type: String, default: null },
 
+  // Diagnostic breadcrumb for "enrichment could not run" — previously a
+  // SILENT no-op (return value discarded by every fire-and-forget caller,
+  // nothing written to the doc). Set whenever enrichBrandFromUrl declines
+  // to run (today: missing websiteUrl) so a starved brand is queryable
+  // instead of indistinguishable from "never tried". Cleared the moment
+  // enrichment is attempted again — a stale reason must not outlive the
+  // condition that caused it (e.g. websiteUrl gets backfilled by catalog
+  // ingest and enrichment then actually runs). This does NOT change
+  // control flow: enrichment still declines gracefully rather than
+  // throwing, preserving every existing fire-and-forget caller's contract.
+  enrichmentSkipReason: { type: String, default: null },
+  enrichmentSkippedAt:  { type: Date,   default: null },
+
   // Brand-level review snapshot. Populated by enrichBrandFromUrl
   // (Tier 4 — Gemini grounded search for "<brand> reviews"). Cached
   // on Brand so per-Media brand_match outcomes share one fetch
@@ -398,9 +411,25 @@ const brandSchema = new mongoose.Schema({
   //     sourceUrl, source: 'website',
   //     license: 'google'|'open'|'commercial'|'unknown',
   //     needsLicense, ingestedAt }
-  // Commercial-foundry faces are recorded but never downloaded — the
-  // client must supply licensed files. fontResolverService prefers
-  // these over Google Fonts when families match.
+  // Commercial-foundry faces (Typekit/Adobe Fonts etc.) are ALWAYS
+  // classified license:'commercial', but whether the file is actually
+  // downloaded and mirrored to Cloudinary depends on
+  // BRAND_FONT_ASSUME_LICENSED (services/brandFontIngestService.js;
+  // config/defaults.env, default true): flag ON (the shipped default)
+  // downloads and mirrors it like any other face, `url` populated,
+  // `needsLicense:false`; flag OFF is the "recorded but never
+  // downloaded, client must supply licensed files" behavior this
+  // comment used to describe unconditionally — CORRECTED 2026-08-19,
+  // it was describing only the non-default arm. Every download is
+  // magic-byte-validated before mirroring (downloadFontFile / isFontMagic)
+  // regardless of license class, so a failed/blocked fetch (e.g. a
+  // foundry CDN 400 without the right Referer) is flagged
+  // `{url:null, needsLicense:true}`, never a false success — an entry
+  // with a real `url` here has already been byte-verified as a real
+  // font file. fontResolverService prefers these over Google Fonts when
+  // families match (services/fontResolverService.js `familyKey()`
+  // normalizes both sides, so e.g. Brandfetch's "Aktiv Grotesk" and a
+  // scraped CSS "aktiv-grotesk" resolve to the same entry).
   customFonts: { type: [mongoose.Schema.Types.Mixed], default: [] },
   // Font roles observed in the customer's own CSS during font ingest.
   // Shape: { heading?, body?, button?, evidence: [{ family, role, selector }] }.

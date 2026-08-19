@@ -1507,6 +1507,32 @@ Full detail in `docs/ATLAS.md` §7 and `docs/CLOUDINARY-VIDEO.md`. Headlines:
   DOWN, the projection must satisfy the callee's field reads, not just its own** —
   and prefer the shared resolver over a re-implemented cascade. The stale header
   claiming "Requires Brand.shopifyUrl" is why this looked right to three readers.
+- **THIRD instance of the same family, fixed 2026-08-18 — `resolveStoreOrigin` reads
+  `apifyDemo.shopifyUrl`, but nothing ever wrote it BACK onto `websiteUrl`.**
+  `syncBrandShopifyDirect` / `syncBrandGenericCatalog` / legacy `syncBrandShopify`
+  all successfully scrape a catalog using `apifyDemo.shopifyUrl` and never touch
+  `Brand.websiteUrl` — the field `brandEnrichmentService`, `brandLogoIngestService`
+  and `brandFontIngestService` all gate on. Confirmed victims (all demo brands, all
+  had `apifyDemo.shopifyUrl` set the whole time): Marine Layer (2446 products),
+  Marine Layer 2 (2295), GymShark (207), Peloton, PB5Star, Soludos 2, Fanatics,
+  Fellow Products, livingspaces, Ubeauty — 10 total, fully backfilled + re-enriched
+  2026-08-18. Fixed by `services/brandWebsiteBackfill.js` — a shared
+  `backfillBrandWebsiteUrl()` called from all three ingest writers once
+  `products.length > 0` (never merely because a config field holds a string).
+  **Its `safeWebsiteOrigin()` denylist matters as much as the write itself:**
+  GymShark's own `CatalogProduct.productUrl` rows are minted against
+  `gymsharkusa.myshopify.com` (the headless-store EFFECTIVE BACKEND
+  `shopifyPublicIngestService` substitutes for the custom domain — see
+  `access.origin` in that file), so a naive "take the origin of any known URL"
+  rule would have back-filled `websiteUrl` with the wrong host and pointed every
+  future logo/font/GPT scrape at Shopify's backend instead of `www.gymshark.com`.
+  The fix reads `origin` **before** that override. Also newly closed: enrichment
+  used to be a genuinely SILENT no-op on missing `websiteUrl` — `enrichBrandFromUrl`'s
+  `{ok:false, reason:'no websiteUrl'}` was discarded by every fire-and-forget
+  caller, so nothing was ever recorded anywhere. Now persisted on the Brand doc
+  (`enrichmentSkipReason` / `enrichmentSkippedAt`), cleared the moment enrichment
+  actually proceeds. Full writeup + revert-proof: `session.md` 2026-08-18,
+  `scripts/verifyBrandWebsiteBackfill.js` (26 checks).
 - **Gate a provider tier on the PRIMARY key, never the fallback.** `wantGpt`
   (`brandEnrichmentService.js`) gated on `OPENAI_API_KEY` while the call itself goes
   through `atlasLlmService.chatCompletion`, whose primary is Atlas and whose direct

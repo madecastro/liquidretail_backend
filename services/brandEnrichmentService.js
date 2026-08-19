@@ -74,10 +74,54 @@ async function setStage(brandId, stage) {
   }
 }
 
+// Persist WHY enrichment declined to run. Before this, every early-return
+// below was a genuinely silent no-op: the {ok:false, reason} object was
+// discarded by every fire-and-forget caller (brandCatalogService,
+// apifyIngestService, the various triggerEnrichment helpers all
+// `.catch(...)` and drop the resolved value), so a brand missing a
+// websiteUrl could sit forever with a fully-synced catalog and nothing
+// anywhere recording that enrichment had ever even been attempted. Never
+// throws — a failure to record the reason must not turn a graceful skip
+// into an unhandled rejection for a fire-and-forget caller.
+async function markEnrichmentSkipped(brandId, reason) {
+  try {
+    await Brand.updateOne(
+      { _id: brandId },
+      { $set: { enrichmentSkipReason: reason, enrichmentSkippedAt: new Date() } }
+    );
+  } catch (e) {
+    console.warn(`   ⚠️  enrichmentSkipReason write failed for ${brandId}: ${e.message}`);
+  }
+}
+
+// Clear a stale skip reason once we're actually proceeding — otherwise a
+// brand that gets its websiteUrl back-filled (see brandWebsiteBackfill.js)
+// and then successfully enriches would still show a "no websiteUrl" skip
+// reason from before the fix, which is worse than no field at all.
+async function clearEnrichmentSkipped(brandId) {
+  try {
+    await Brand.updateOne(
+      { _id: brandId },
+      { $set: { enrichmentSkipReason: null, enrichmentSkippedAt: null } }
+    );
+  } catch (e) {
+    console.warn(`   ⚠️  enrichmentSkipReason clear failed for ${brandId}: ${e.message}`);
+  }
+}
+
 async function enrichBrandFromUrl(brandId) {
   const brand = await Brand.findById(brandId);
-  if (!brand)             return { ok: false, reason: 'brand not found' };
-  if (!brand.websiteUrl)  return { ok: false, reason: 'no websiteUrl' };
+  if (!brand) return { ok: false, reason: 'brand not found' };
+  if (!brand.websiteUrl) {
+    await markEnrichmentSkipped(brandId, 'no websiteUrl');
+    return { ok: false, reason: 'no websiteUrl' };
+  }
+  // We're proceeding — any previously-recorded skip no longer describes
+  // current reality. Clear before the run starts so a crash mid-run still
+  // leaves the doc in a truthful "attempted, not skipped" state (a thrown
+  // error is visible via run.fail() / CampaignRun-style plumbing, not via
+  // this field — this field is specifically for "declined to even try").
+  await clearEnrichmentSkipped(brandId);
 
   // Belt-and-suspenders: clear stage at the end of EVERY exit path
   // (success, early return, thrown error). The final brand.save() also
@@ -905,6 +949,10 @@ function dedupe(arr) {
 module.exports = {
   enrichBrandFromUrl,
   preserveBrandReviewNumbers,
+  // Exported so scripts/verifyBrandWebsiteBackfill.js exercises the real
+  // skip-recording functions rather than a source-text regex.
+  markEnrichmentSkipped,
+  clearEnrichmentSkipped,
   // Re-exported so callers can `require('./brandEnrichmentService').websiteBackgroundHex`
   // without knowing the util path; transform services import the util directly.
   websiteBackgroundHex,
