@@ -393,10 +393,31 @@ approximations are deliberate and documented at that constant: the surcharge is
 `groundingMetadata`, and per-prompt billing is a **2.5-era rule** — Gemini 3 bills
 per executed search query, so a model bump changes the unit.
 
-**Still unledgered on this path (known gap, not fixed here):**
-`geminiSearchProvider.match` / `.lookupBrandCategoryUrl`,
-`categoryReviewsService`, and `productDetailsService.fetchReviewSummary` all POST
-the same raw endpoint with no `trackLlmCall` and no `maxRedirects: 0`.
+**UPDATED 2026-08-19.** `geminiSearchProvider.match` is now ledgered (routed
+through the same `trackedGenerate` helper as brand/product reviews pass 1,
+stage `gemini_product_match`) — it was billing Google on every UGC/IG detect
+with a key and writing nothing to CostLog. `.lookupBrandCategoryUrl` is
+DELETED, not ledgered — confirmed dead (its only caller had zero call sites
+of its own; category breadcrumbs go through `productCategory.
+enrichProductCategory` instead). Also in this pass: `lookupBrandReviews` /
+`lookupProductReviews` pass 2 (the JSON-structuring half, never grounded) now
+routes through Atlas (`atlasLlmService.chatCompletion`, model
+`google/gemini-2.5-flash`) instead of this raw endpoint — pass 1 (the grounded
+half) stays here; see the ATLAS GROUNDING PROBE comment in
+`geminiSearchProvider.js` for the live-tested proof that Atlas cannot ground.
+
+**Still unledgered on this path (known gap, NOT fixed here — same shape as
+the `match` fix above, and a reasonable next pickup):**
+`categoryReviewsService` and `productDetailsService.fetchReviewSummary` both
+still POST the raw endpoint directly with no `trackLlmCall` and no
+`maxRedirects: 0`. Both are genuinely grounded (`tools: [{google_search:{}}]`),
+so — like `match` — the fix is "wrap in a ledgered transport", not "move to
+Atlas": grounding still is not available there. Confirmed LIVE and
+unledgered by a 2026-08-19 trace (`categoryReviewsService` reachable from
+UGC/IG detect on a category-reviews cache miss; `productDetailsService.
+fetchReviewSummary` reachable from UGC product_match and user-triggered
+Enrich, gated on `SERPAPI_API_KEY` being configured for the sibling shopping
+lookup, not on this call itself).
 
 ### The `review-text` role — chosen by measurement
 

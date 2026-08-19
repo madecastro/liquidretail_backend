@@ -157,8 +157,8 @@ the bug this module exists to end.
 **`llm-web` was previously treated as excluded.** That claim is **false** as of
 2026-08-03. Rationale, verified in code:
 
-- `geminiSearchProvider.js:254,399` call Gemini with real
-  `tools:[{google_search:{}}]` grounded search, and `:266,411` record
+- `geminiSearchProvider.js:977,1097,1218` call Gemini with real
+  `tools:[{google_search:{}}]` grounded search, and `:995,1121,1242` record
   `groundingMetadata.groundingChunks` (actual source domains). Gemini is the
   **retrieval** mechanism, not the author. These are real sentences from real
   pages, stamped `origin:'llm-web'`.

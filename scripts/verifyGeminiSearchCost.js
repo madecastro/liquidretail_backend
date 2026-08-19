@@ -29,6 +29,17 @@
  * Pure — no DB, no network, no API key. axios.post and CostLog.create are
  * stubbed, so the "live" checks exercise the real provider + real costTracker
  * without spending anything.
+ *
+ * UPDATED 2026-08-19: pass 2 (the JSON-structuring half of lookupBrandReviews
+ * / lookupProductReviews — never grounded) moved off this raw REST transport
+ * onto Atlas (atlasLlmService.chatCompletion, model google/gemini-2.5-flash).
+ * Pass 1 (grounded search) is UNCHANGED and still the subject of most of this
+ * file. Section D's stub now branches on request URL so one monkey-patched
+ * `axios.post` (shared by this file's own axios require AND
+ * atlasLlmService's, since Node's module cache makes both the same object)
+ * can serve both transports. See scripts/verifyGeminiSearchAtlasRouting.js
+ * for the dedicated, revert-proven pin on the ROUTING decision itself; this
+ * file keeps owning the COST ARITHMETIC.
  */
 
 // Pin the env BEFORE any require: costTracker resolves the grounding surcharge
@@ -37,6 +48,17 @@
 delete process.env.GEMINI_GROUNDING_COST_USD;
 delete process.env.GEMINI_SEARCH_MODEL;
 process.env.GEMINI_API_KEY = 'test-key-not-a-real-credential';   // only gates isEnabled()
+// Pass 2 now goes through atlasLlmService.chatCompletion, which only
+// attempts the Atlas branch when this is set (isConfigured()).
+process.env.ATLAS_API_KEY = 'test-key-not-a-real-credential';
+// Chain/retry tuning: keep the harness fast. chatCompletion retries a failed
+// Atlas attempt MAX_ATTEMPTS times with BACKOFF_MS*n sleeps between — at the
+// real defaults (3 attempts, 3000ms) a single failure test would sleep
+// several real seconds. These are read at module load by atlasLlmService,
+// so they must be set before it is required (directly or transitively via
+// geminiSearchProvider).
+process.env.ATLAS_LLM_MAX_ATTEMPTS = '1';
+process.env.ATLAS_LLM_BACKOFF_MS = '1';
 
 const assert = require('assert');
 const fs     = require('fs');
@@ -74,6 +96,13 @@ const FLASH_INPUT_PER_1M  = 0.30;
 const FLASH_OUTPUT_PER_1M = 2.50;   // "Output price includes thinking tokens"
 const FLASH_CACHED_PER_1M = 0.03;
 const GROUNDING_PER_CALL  = 0.035;  // "$35 / 1,000 grounded prompts"
+// Atlas's google/gemini-2.5-flash listing — read live 2026-08-19 against
+// GET https://api.atlascloud.ai/api/v1/models. Same input/output rate as
+// direct; only cachedInput differs slightly (0.075 vs 0.03) and no fixture
+// below exercises caching on the Atlas path, so that difference is not
+// asserted here.
+const ATLAS_FLASH_INPUT_PER_1M  = 0.30;
+const ATLAS_FLASH_OUTPUT_PER_1M = 2.50;
 
 // ── A. Wiring — asserted against the source, since "no bare axios.post" is not
 //    observable at runtime. ────────────────────────────────────────────────────
@@ -88,9 +117,14 @@ function fnBody(name) {
   assert.notStrictEqual(end, -1, `could not find end of ${name}`);
   return SRC.slice(start, end);
 }
-const BRAND_FN   = fnBody('lookupBrandReviews');
-const PRODUCT_FN = fnBody('lookupProductReviews');
-const HELPER_FN  = fnBody('trackedGenerate');
+const BRAND_FN     = fnBody('lookupBrandReviews');
+const PRODUCT_FN   = fnBody('lookupProductReviews');
+const HELPER_FN    = fnBody('trackedGenerate');
+// Pass 2 (json_structure), UPDATED 2026-08-19 — moved off this file's raw
+// REST transport onto Atlas. Its own fnBody is checked separately (A8/A9)
+// rather than folded into BRAND_FN/PRODUCT_FN, because it is now called from
+// both, not embedded in either.
+const STRUCTURE_FN = fnBody('structureReviewNarrative');
 
 check('A1 lookupBrandReviews makes no unledgered axios.post', () => {
   assert.strictEqual((BRAND_FN.match(/axios\.post\(/g) || []).length, 0,
@@ -100,15 +134,37 @@ check('A2 lookupProductReviews makes no unledgered axios.post', () => {
   assert.strictEqual((PRODUCT_FN.match(/axios\.post\(/g) || []).length, 0,
     'a raw axios.post survives in lookupProductReviews — that call is billable and unledgered');
 });
-check('A3 both functions route exactly their two passes through trackedGenerate', () => {
-  assert.strictEqual((BRAND_FN.match(/trackedGenerate\(/g) || []).length, 2);
-  assert.strictEqual((PRODUCT_FN.match(/trackedGenerate\(/g) || []).length, 2);
+check('A3 both functions route their GROUNDED pass through trackedGenerate exactly once (pass 2 moved to Atlas)', () => {
+  // Was 2 (pass 1 + pass 2) before the 2026-08-19 Atlas migration of pass 2.
+  // Now exactly 1 — pass 2 calls structureReviewNarrative instead (A3b).
+  assert.strictEqual((BRAND_FN.match(/trackedGenerate\(/g) || []).length, 1);
+  assert.strictEqual((PRODUCT_FN.match(/trackedGenerate\(/g) || []).length, 1);
 });
-check('A4 each function declares one grounded pass and one non-grounded pass', () => {
+check('A3b both functions call the SHARED structureReviewNarrative for pass 2, not a re-implemented literal', () => {
+  assert.strictEqual((BRAND_FN.match(/structureReviewNarrative\(/g) || []).length, 1);
+  assert.strictEqual((PRODUCT_FN.match(/structureReviewNarrative\(/g) || []).length, 1);
+});
+check('A4 each function declares its (sole, grounded) trackedGenerate pass as grounded:true', () => {
+  // grounded:false no longer appears anywhere in these two functions — pass 2
+  // does not use trackedGenerate's grounded flag at all now (it is not a
+  // Google-Search-grounding concept on the Atlas/OpenAI-compat transport).
   for (const [name, body] of [['brand', BRAND_FN], ['product', PRODUCT_FN]]) {
     assert.strictEqual((body.match(/grounded:\s*true/g)  || []).length, 1, `${name}: expected 1 grounded pass`);
-    assert.strictEqual((body.match(/grounded:\s*false/g) || []).length, 1, `${name}: expected 1 non-grounded pass`);
+    assert.strictEqual((body.match(/grounded:\s*false/g) || []).length, 0,
+      `${name}: grounded:false should no longer appear — pass 2 moved off trackedGenerate entirely`);
   }
+});
+check('A8 structureReviewNarrative (pass 2, shared) calls chatCompletion, not axios.post directly', () => {
+  assert.strictEqual((STRUCTURE_FN.match(/axios\.post\(/g) || []).length, 0,
+    'pass 2 must not call axios.post directly — it is unledgered exactly the way A1/A2 guard against');
+  assert.ok(/chatCompletion\(/.test(STRUCTURE_FN),
+    'pass 2 must route through atlasLlmService.chatCompletion');
+});
+check('A9 structureReviewNarrative never declares a google_search tool (it must stay ungrounded)', () => {
+  // If this function ever grows a `tools` field, it has become a grounded
+  // call that must NOT be on Atlas — see the ATLAS GROUNDING PROBE comment.
+  assert.ok(!/google_search/.test(STRUCTURE_FN),
+    'pass 2 must never request grounding — if it needs to, it must move back to the direct transport');
 });
 check('A5 trackedGenerate resolves the response BODY, not the axios envelope', () => {
   // `return r;` here would zero every token count while still writing a row.
@@ -136,6 +192,18 @@ check('B1 gemini-2.5-flash carries live-verified rates, not Flash-Lite ones', ()
 });
 check('B2 the grounding surcharge is the published per-request price', () => {
   assert.strictEqual(costTracker.GROUNDED_SEARCH_COST_PER_REQUEST_USD, GROUNDING_PER_CALL);
+});
+check('B1b Atlas google/gemini-2.5-flash (pass 2\'s new home) is priced too, and matches direct', () => {
+  // Read live 2026-08-19 against GET https://api.atlascloud.ai/api/v1/models.
+  const r = costTracker.MODEL_RATES['google/gemini-2.5-flash'];
+  assert.ok(r, 'no MODEL_RATES entry for the Atlas slug — pass 2 would ledger $0 tokens');
+  assert.strictEqual(r.input,  ATLAS_FLASH_INPUT_PER_1M);
+  assert.strictEqual(r.output, ATLAS_FLASH_OUTPUT_PER_1M);
+  // Same price as the direct rate — the whole point of the model-choice
+  // comment in structureReviewNarrative: no cost argument either way, only
+  // the transport changed.
+  assert.strictEqual(r.input,  FLASH_INPUT_PER_1M);
+  assert.strictEqual(r.output, FLASH_OUTPUT_PER_1M);
 });
 
 // ── C. costTracker arithmetic, exercised through the real trackLlmCall. ──────
@@ -255,32 +323,52 @@ const STRUCTURED = JSON.stringify({
   rating: 4.6, reviewCount: 1200, summary: 'Broadly positive.'
 });
 const PASS1_USAGE = { promptTokenCount: 1000, toolUsePromptTokenCount: 500, candidatesTokenCount: 800, thoughtsTokenCount: 200 };
-const PASS2_USAGE = { promptTokenCount: 2000, candidatesTokenCount: 300 };
+// UPDATED 2026-08-19: pass 2 now goes through Atlas's OpenAI-compatible
+// surface, so its usage arrives in OpenAI field names (prompt_tokens /
+// completion_tokens), not Gemini's (promptTokenCount / candidatesTokenCount).
+// Same NUMBERS as the pre-migration PASS2_USAGE (2000 / 300) so EXPECTED_PASS2
+// below is unchanged in value — only the transport and field names moved.
+const PASS2_ATLAS_USAGE = { prompt_tokens: 2000, completion_tokens: 300 };
 
-// Grounded pass 1 is identifiable by the google_search tool in the body.
-function twoPassStub() {
-  return async (_url, body) => {
+// Pass 1 (direct Gemini REST, still grounded) is identifiable by its URL;
+// pass 2 (Atlas chat.completions, structuring) by its URL. Branching on URL
+// rather than on the google_search tool is now required because the two
+// passes are genuinely different transports with different request/response
+// shapes, not just different request bodies against the same endpoint.
+function threeWayStub() {
+  return async (url, body) => {
+    if (String(url).includes('atlascloud.ai')) {
+      // Atlas's OpenAI-compatible chat.completions response shape.
+      return {
+        status: 200,
+        data: {
+          id: 'chatcmpl-test', object: 'chat.completion', model: body.model,
+          choices: [{ index: 0, message: { role: 'assistant', content: STRUCTURED }, finish_reason: 'stop' }],
+          usage: PASS2_ATLAS_USAGE
+        }
+      };
+    }
     const grounded = Array.isArray(body.tools) && body.tools.some(t => t.google_search);
+    assert.ok(grounded, 'the only non-Atlas URL this stub expects is the grounded pass-1 REST call');
     return {
-      data: grounded
-        ? Object.assign(geminiBody(PASS1_USAGE, NARRATIVE), {
-            candidates: [{
-              content: { parts: [{ text: NARRATIVE }] },
-              groundingMetadata: { groundingChunks: [{ web: { uri: 'https://www.trustpilot.com/review/x', title: 'T' } }] }
-            }],
-            usageMetadata: PASS1_USAGE
-          })
-        : geminiBody(PASS2_USAGE, STRUCTURED)
+      status: 200,
+      data: Object.assign(geminiBody(PASS1_USAGE, NARRATIVE), {
+        candidates: [{
+          content: { parts: [{ text: NARRATIVE }] },
+          groundingMetadata: { groundingChunks: [{ web: { uri: 'https://www.trustpilot.com/review/x', title: 'T' } }] }
+        }],
+        usageMetadata: PASS1_USAGE
+      })
     };
   };
 }
 
 const EXPECTED_PASS1 = Number((((1500 / 1e6) * FLASH_INPUT_PER_1M + (1000 / 1e6) * FLASH_OUTPUT_PER_1M) + GROUNDING_PER_CALL).toFixed(6));
-const EXPECTED_PASS2 = Number(((2000 / 1e6) * FLASH_INPUT_PER_1M + (300 / 1e6) * FLASH_OUTPUT_PER_1M).toFixed(6));
+const EXPECTED_PASS2 = Number(((2000 / 1e6) * ATLAS_FLASH_INPUT_PER_1M + (300 / 1e6) * ATLAS_FLASH_OUTPUT_PER_1M).toFixed(6));
 
-await checkAsync('D1 lookupBrandReviews ledgers both passes with brand linkage', async () => {
+await checkAsync('D1 lookupBrandReviews ledgers both passes with brand linkage — pass 1 gemini, pass 2 atlas', async () => {
   rows.length = 0;
-  stubAxios(twoPassStub());
+  stubAxios(threeWayStub());
   const brandId = '6a4e7ea956509c2169977681';
   const out = await provider.lookupBrandReviews({ brandName: 'Allbirds', brandUrl: 'allbirds.com', brandId });
   restoreAxios();
@@ -293,12 +381,19 @@ await checkAsync('D1 lookupBrandReviews ledgers both passes with brand linkage',
   assert.strictEqual(rows[0].brandId, brandId, 'brandId must reach CostLog for the per-brand rollup');
   assert.strictEqual(rows[0].model, 'gemini-2.5-flash');
   assert.strictEqual(rows[0].costUsd, EXPECTED_PASS1);
+  // THE OBSERVABLE PROOF THIS ROUTING FIX TOOK EFFECT: pass 2's provider flips
+  // from 'gemini' (direct) to 'atlas', same stage, same purposeTag string.
+  // A dashboard querying CostLog by (stage, purposeTag, provider) sees exactly
+  // this split without reading a line of code.
+  assert.strictEqual(rows[1].provider, 'atlas', 'pass 2 must now be served by Atlas, not the direct key');
+  assert.strictEqual(rows[1].model, 'google/gemini-2.5-flash');
+  assert.strictEqual(rows[1].brandId, brandId, 'linkage must survive the transport change too');
   assert.strictEqual(rows[1].costUsd, EXPECTED_PASS2);
 });
 
-await checkAsync('D2 lookupProductReviews ledgers both passes with product linkage', async () => {
+await checkAsync('D2 lookupProductReviews ledgers both passes with product linkage — pass 1 gemini, pass 2 atlas', async () => {
   rows.length = 0;
-  stubAxios(twoPassStub());
+  stubAxios(threeWayStub());
   const brandId = '6a4e7ea956509c2169977681';
   const productId = '6a70cf95aa11bb22cc33dd44';
   const out = await provider.lookupProductReviews({
@@ -309,17 +404,21 @@ await checkAsync('D2 lookupProductReviews ledgers both passes with product linka
   assert.ok(out && out.quotes.length === 1);
   assert.strictEqual(rows.length, 2);
   assert.deepStrictEqual(rows.map(r => r.stage), ['product_reviews', 'product_reviews']);
+  assert.deepStrictEqual(rows.map(r => r.provider), ['gemini', 'atlas']);
   assert.strictEqual(rows[0].productId, productId);
   assert.strictEqual(rows[0].brandId, brandId);
+  assert.strictEqual(rows[1].productId, productId, 'pass 2 linkage must survive the transport change');
+  assert.strictEqual(rows[1].brandId, brandId);
 });
 
 await checkAsync('D3 a lookup with no ids still produces rows (linkage is optional)', async () => {
   rows.length = 0;
-  stubAxios(twoPassStub());
+  stubAxios(threeWayStub());
   await provider.lookupBrandReviews({ brandName: 'Gymshark' });
   restoreAxios();
   assert.strictEqual(rows.length, 2, 'a caller without a Brand row must still be billed into the ledger');
   assert.strictEqual(rows[0].brandId, null);
+  assert.strictEqual(rows[1].brandId, null);
 });
 
 await checkAsync('D4 a failed grounded pass is ledgered, not silently swallowed', async () => {

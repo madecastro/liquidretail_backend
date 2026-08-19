@@ -628,6 +628,70 @@ const {
   LLM_ERROR_CODES, LLM_ACTIONS, classifyLlmFailure, makeLlmError,
   extractRequestId, formatLlmLogLine,
 } = require('../llmError');
+// The Atlas-routed transport — used ONLY by the ungrounded structuring pass
+// below (`structureReviewNarrative`). See the ATLAS GROUNDING PROBE comment
+// for why the GROUNDED pass immediately above it in each caller must stay on
+// the raw REST transport instead.
+const { chatCompletion } = require('../atlasLlmService');
+
+/**
+ * ATLAS GROUNDING PROBE — 2026-08-19, PROVEN, not asserted.
+ *
+ * Every call in this file that carries `tools: [{ google_search: {} }]`
+ * (`match`, `lookupBrandReviews` pass 1, `lookupProductReviews` pass 1) MUST
+ * stay on this raw `generativelanguage.googleapis.com` REST transport. Prior
+ * revisions of this comment (and of CLAUDE.md / docs/ATLAS.md) said "Atlas
+ * does not proxy grounded retrieval" as a DESIGN ASSERTION from the 2026-07-21
+ * Atlas migration — reasonable, but never actually tested against a live
+ * Atlas request. It is now tested. Four live, single-shot probes against
+ * `POST https://api.atlascloud.ai/v1/chat/completions`,
+ * `model: 'google/gemini-2.5-flash'` (the exact Atlas slug this role would
+ * map to — see atlasModelMap.js:189), asking "what is today's date" so a
+ * genuinely-grounded answer is trivially distinguishable from a hallucinated
+ * or refused one:
+ *
+ *   1. Plain call, no tools           → 200. Model answers "I cannot
+ *      determine today's date without a live tool" — confirms NO grounding
+ *      is active by default, even though Atlas is demonstrably calling the
+ *      real Gemini backend under the hood (`usage.billing_usage.
+ *      gemini_usage_metadata.source === 'gemini_chat'`).
+ *   2. `tools: [{ google_search: {} }]` (Gemini's OWN native grounding tool,
+ *      copied verbatim from this file's real request body) → HTTP 400
+ *      `{"code":400,"msg":"bad request"}`. Atlas's OpenAI-compatible gateway
+ *      REJECTS the request outright.
+ *   3. `tools: [{ type: 'web_search' }]` (OpenAI's own newer built-in
+ *      web-search tool shape, in case Atlas maps it through generically)
+ *      → also HTTP 400, same rejection.
+ *   4. Top-level `web_search: true` (mirroring the convention Atlas DOES
+ *      document for `bytedance/seedance-2.0` VIDEO text-to-video, in case an
+ *      LLM chat model shares it) → 200, but SILENTLY IGNORED: the model gives
+ *      the identical "I do not have access to real-time information" answer,
+ *      with `usage.billing_usage.gemini_usage_metadata.toolUsePromptTokenCount
+ *      === 0` — no tool ran.
+ *
+ * Every documented and guessed way to ask for grounding through Atlas's
+ * customer-facing surface either 400s or is silently dropped. Also confirmed:
+ * the model catalog (`GET /api/v1/models`) lists NO model whose
+ * `supported_protocols` exposes anything but `openai.chat.completions` (and,
+ * for a handful of Gemini slugs including this one, an internal
+ * `gemini.generate` tag that is NOT a documented or reachable customer
+ * endpoint — three plausible guessed URLs for it all 404'd live). Atlas's own
+ * docs (fetched live the same day) describe exactly one LLM surface,
+ * `/v1/chat/completions`, and never mention `google_search`, `groundingMetadata`,
+ * or grounding of any kind for a text model.
+ *
+ * CONCLUSION: grounded retrieval is NOT available through Atlas today for
+ * this (or any) model, on any surface that could be found or guessed. Do not
+ * "fix" this by rewiring the grounded calls in this file — verify against a
+ * FRESH live probe first, because Atlas's catalog changes (compare the model
+ * list above with the one two migrations ago), and this file rots the same
+ * way every other "verified once" claim in this codebase does.
+ *
+ * The UNGROUNDED structuring pass (pass 2 of lookupBrandReviews /
+ * lookupProductReviews) is NOT subject to any of this — it never sent
+ * `tools` and never read `groundingMetadata` — and is routed through Atlas
+ * via `structureReviewNarrative` below.
+ */
 
 const PROVIDER_NAME = 'gemini-search';
 
@@ -677,6 +741,175 @@ async function trackedGenerate({ stage, purposeTag, grounded, ledger }, body, ti
       return r.data;
     }
   );
+}
+
+/**
+ * REVIEWS_STRUCTURE_SCHEMA — OpenAI strict json_schema equivalent of the
+ * Gemini-native `responseSchema` this call used before the pass-2 Atlas
+ * migration (2026-08-19). See structureReviewNarrative below.
+ *
+ * NOT a byte-for-byte translation, because OpenAI's strict mode has a
+ * different vocabulary for "this key is optional": Gemini's schema simply
+ * left a property out of `required`; OpenAI's strict mode requires
+ * `additionalProperties:false` objects to list EVERY property in `required`
+ * and expresses "may be absent" as "must be present, but may be null"
+ * instead (`type: [T, 'null']`). Every downstream reader already treats a
+ * missing optional field and an explicit null identically (see
+ * pickBestRating / keepVerbatimQuotes below), so this is a representation
+ * change, not a behavior change.
+ *
+ * ONE CONSEQUENCE WORTH STATING: `RATING_REQUIRE_PROVENANCE` used to also
+ * flip whether `ratings[].source` was a REQUIRED schema key. Under strict
+ * mode `source` must always be a present (nullable) key regardless, so the
+ * flag's schema-level lever is gone — `ratingsProvenanceAskSentence()`, the
+ * PROMPT-level ask, is now the flag's only mechanism. Not a regression: the
+ * schema never forced the model to WRITE a real name, only to include the
+ * key, and the prompt sentence is what asked it to try.
+ */
+const REVIEWS_STRUCTURE_SCHEMA = {
+  name: 'reviews_structure',
+  strict: true,
+  schema: {
+    type: 'object',
+    additionalProperties: false,
+    required: ['quotes', 'ratings', 'rating', 'reviewCount', 'summary'],
+    properties: {
+      quotes: {
+        type: 'array',
+        items: {
+          type: 'object',
+          additionalProperties: false,
+          required: ['text', 'author', 'source', 'stage'],
+          properties: {
+            text:   { type: 'string' },
+            author: { type: ['string', 'null'] },
+            source: { type: ['string', 'null'] },
+            stage:  { type: ['string', 'null'], enum: ['awareness', 'consideration', 'conversion', 'retention', 'conquest', null] }
+          }
+        }
+      },
+      ratings: {
+        type: 'array',
+        items: {
+          type: 'object',
+          additionalProperties: false,
+          required: ['source', 'rating', 'reviewCount'],
+          properties: {
+            source:      { type: ['string', 'null'] },
+            rating:      { type: 'number' },
+            reviewCount: { type: ['number', 'null'] }
+          }
+        }
+      },
+      rating:      { type: ['number', 'null'] },
+      reviewCount: { type: ['integer', 'null'] },
+      summary:     { type: ['string', 'null'] }
+    }
+  }
+};
+
+/**
+ * structureReviewNarrative — pass 2 of the two-pass review pipeline,
+ * ATLAS-ROUTED (2026-08-19). See the ATLAS GROUNDING PROBE comment above for
+ * why pass 1 (the grounded search immediately before this in each caller)
+ * cannot move here too — this function never sends `tools` and never reads
+ * `groundingMetadata`, so none of that restriction applies to it.
+ *
+ * MODEL CHOICE: the SAME model as pass 1 (`MODEL`, default
+ * 'gemini-2.5-flash' → Atlas `google/gemini-2.5-flash`, atlasModelMap.js:189)
+ * — not a downgrade to the 6x-cheaper `gemini-2.5-flash-lite` ('review-text'
+ * role) and not an upgrade. Deliberate: (a) pricing is a wash — Atlas lists
+ * `google/gemini-2.5-flash` at input $0.30 / output $2.50 per M tokens
+ * (verified live 2026-08-19 against GET /api/v1/models), IDENTICAL to the
+ * direct rate this call already paid, so there is no cost argument either
+ * way; (b) this exact schema/prompt pair has a documented history in this
+ * file of a weaker setup silently omitting or malforming required fields
+ * (see the `ratings[].source` / `ratings[].rating` comments below), and the
+ * closest precedent in this codebase (`ad-vision-qc` role, atlasModelMap.js)
+ * explicitly rejected `flash` for a similarly fussy structured-JSON task
+ * after a live probe found it broke the requested shape while `pro` did
+ * not. Revisit the model only with its own measured A/B, never as a side
+ * effect of a routing fix.
+ *
+ * KNOWN, ACCEPTED, IMMATERIAL COST DELTA: the direct call disabled Gemini's
+ * hidden "thinking" tokens (`thinkingConfig:{thinkingBudget:0}`); Atlas's
+ * OpenAI-compatible surface has no equivalent parameter to pass through for
+ * a google/* model (only openai/* slugs get `reasoning_effort` — see
+ * atlasLlmService.buildAtlasBody), so this call now spends a small number of
+ * them. Measured live 2026-08-19: ~130-330 thinking tokens, ~$0.0003-0.0008
+ * per call at $2.50/M output — noise next to the $0.035/request grounding
+ * surcharge pass 1 alone carries, and costTracker's `atlas` usage branch
+ * already folds Atlas's `completion_tokens` (itself already folding
+ * thinking + text) into the ledger correctly, so this is not silently
+ * undercounted.
+ *
+ * Returns the parsed `{quotes, ratings, rating, reviewCount, summary}`
+ * object, or `null` on any failure (transport exhausted, unparseable
+ * content) — callers fall back exactly as they did when the direct pass-2
+ * call failed.
+ */
+async function structureReviewNarrative({ subjectLine, narrative, sourceDomains, stage, label, ledger }) {
+  const provenanceAsk = ratingsProvenanceAskSentence();
+  const structurePrompt =
+    `Convert the following ${label} narrative into structured JSON.\n\n` +
+    `${subjectLine}\n` +
+    (sourceDomains.length ? `Sources cited: ${sourceDomains.join(', ')}\n` : '') +
+    `\nNarrative:\n"""\n${narrative}\n"""\n\n` +
+    `Return EXACTLY this shape (no commentary, no markdown):\n` +
+    `{\n` +
+    `  "quotes":      [ { "text": "...", "author": "name or null", "source": "domain or platform or null", "stage": "awareness|consideration|conversion|retention|conquest or null" }, up to ${LLM_QUOTE_CAP} entries ],\n` +
+    `  "ratings":     [{ "source": "<site>", "rating": <0-5>, "reviewCount": <n> }],  // EVERY aggregate found, one entry each; do NOT pick or average.${provenanceAsk}\n` +
+    `  "rating":      <number 0-5 or null>,   // legacy single value; leave null if you filled "ratings"\n` +
+    `  "reviewCount": <integer or null>,\n` +
+    `  "summary":     "one sentence on overall ${label === 'brand-review' ? 'brand' : 'product'} sentiment"\n` +
+    `}\n` +
+    `QUOTE RULES (strict): each quote.text MUST be a verbatim substring of the narrative above, copied character-for-character. If the narrative contains no verbatim customer quotes (e.g. it only summarises sentiment), return an EMPTY quotes array — do NOT chop the summary into clause-fragments, do NOT paraphrase, do NOT invent, do NOT complete a fragment into a sentence. Quotes failing this are dropped in code, so inventing one only loses it.`;
+
+  let completion;
+  try {
+    completion = await chatCompletion(
+      {
+        stage,
+        provider: 'google',
+        model: MODEL,
+        purposeTag: 'json_structure',
+        brandId: ledger?.brandId ?? null,
+        productId: ledger?.productId ?? null,
+        cacheKey: ledger?.cacheKey ?? null,
+        visionImages: 0
+      },
+      {
+        model: MODEL,
+        response_format: { type: 'json_schema', json_schema: REVIEWS_STRUCTURE_SCHEMA },
+        messages: [{ role: 'user', content: structurePrompt }],
+        temperature: 0.1,
+        max_tokens: GROUNDED_PASS2_MAX_TOKENS
+      }
+    );
+  } catch (err) {
+    // chatCompletion throws an already-CODED llmError (services/llmError.js)
+    // when every chain candidate fails — format it directly rather than
+    // re-classifying an axios-shaped error that no longer exists on this path.
+    console.warn(formatLlmLogLine(err && err.llmError ? err : makeLlmError({
+      code: classifyLlmFailure({ message: err?.message }),
+      provider: 'atlas', model: MODEL, role: `${stage}-structuring`,
+      providerMessage: err?.message,
+      action: LLM_ACTIONS.GAVE_UP_PRODUCT,
+      actionDetail: 'returned null — narrative summary kept, quotes/rating/count dropped',
+    })));
+    return null;
+  }
+
+  const jsonText = completion?.choices?.[0]?.message?.content || '';
+  let parsed = null;
+  try { parsed = JSON.parse(jsonText); } catch (_) {
+    const m = jsonText.match(/\{[\s\S]*\}/);
+    if (m) { try { parsed = JSON.parse(m[0]); } catch (_) {} }
+  }
+  if (!parsed) {
+    console.warn(`   · ${label}: structuring produced no parsable JSON for ${subjectLine}`);
+  }
+  return parsed;
 }
 
 async function match({ brand, category, caption, primarySubject, textDetected = [], cropImageUrl = null }) {
@@ -733,8 +966,12 @@ async function match({ brand, category, caption, primarySubject, textDetected = 
   if (imagePart) parts.push(imagePart);
 
   const t0 = Date.now();
-  const res = await axios.post(
-    `${ENDPOINT}?key=${encodeURIComponent(process.env.GEMINI_API_KEY)}`,
+  // Ledgered 2026-08-19 (was a bare axios.post — every UGC/IG detect match
+  // was billing Google and writing NOTHING to CostLog). Genuinely grounded
+  // (tools: google_search below), so this stays on the direct transport —
+  // see the ATLAS GROUNDING PROBE comment above MODEL/ENDPOINT.
+  const data = await trackedGenerate(
+    { stage: 'gemini_product_match', purposeTag: 'grounded_search', grounded: true },
     {
       contents: [{ role: 'user', parts }],
       tools: [{ google_search: {} }],
@@ -744,10 +981,10 @@ async function match({ brand, category, caption, primarySubject, textDetected = 
       // justifies turning it off, so it stays.
       generationConfig: { temperature: 0.2, maxOutputTokens: GROUNDED_PASS2_MAX_TOKENS }
     },
-    { timeout: GROUNDED_CALL_TIMEOUT_MS }
+    GROUNDED_CALL_TIMEOUT_MS
   );
 
-  const candidate = res.data?.candidates?.[0];
+  const candidate = data?.candidates?.[0];
   const reasoningText = (candidate?.content?.parts || [])
     .map(p => p.text || '')
     .join(' ')
@@ -793,98 +1030,14 @@ function extractDomain(url) {
   try { return new URL(url).hostname.replace(/^www\./, ''); } catch { return ''; }
 }
 
-// Brand-category lookup. Asks Gemini grounded search to find the brand's
-// own collection / category page that best matches a generic product
-// label + category. Returns { breadcrumb, url, confidence, reasoning }
-// for downstream use as a fallback CTA destination when no specific SKU
-// match was confident enough.
-//
-// e.g. for { brandUrl: 'pelagicgear.com', label: 'sun shirt', category: 'apparel' }
-// → { breadcrumb: 'Mens > Performance Shirts > Long Sleeve',
-//     url: 'https://pelagicgear.com/collections/mens-long-sleeve-performance' }
-async function lookupBrandCategoryUrl({ brandUrl, brandName, label, category }) {
-  if (!isEnabled()) {
-    // AUTH_MISSING is its own code and its own operator action: nothing was
-    // sent, nothing was billed, and the fix is configuration — not a retry.
-    throw makeLlmError({
-      code: LLM_ERROR_CODES.LLM_AUTH_MISSING,
-      provider: 'google', model: MODEL, role: 'brand-category-lookup',
-      providerMessage: 'GEMINI_API_KEY not set',
-      action: LLM_ACTIONS.SKIPPED_NO_KEY,
-      actionDetail: 'skipped without attempting — set GEMINI_API_KEY on this service',
-    });
-  }
-  if (!brandUrl && !brandName) return null;
-
-  const t0 = Date.now();
-  const prompt =
-    `Use Google Search to find the BEST matching collection / category page on ` +
-    `the brand's own website for the product described below. Walk the brand's ` +
-    `navigation taxonomy (e.g. "Mens > Tops > Performance Shirts") rather than ` +
-    `linking to a specific SKU.\n\n` +
-    `Brand: ${brandName || brandUrl}\n` +
-    (brandUrl ? `Brand site: ${brandUrl}\n` : '') +
-    `Product label: ${label || '(unspecified)'}\n` +
-    `Product category: ${category || '(unspecified)'}\n\n` +
-    `Respond as:\n` +
-    `BREADCRUMB: <Top > Sub > Specific>\n` +
-    `URL: <full URL on the brand's domain>\n` +
-    `CONFIDENCE: <0-100, how certain you are this is the best matching collection page>\n` +
-    `Then one sentence explaining how you decided.`;
-
-  let res;
-  try {
-    res = await axios.post(
-      `${ENDPOINT}?key=${encodeURIComponent(process.env.GEMINI_API_KEY)}`,
-      {
-        contents: [{ role: 'user', parts: [{ text: prompt }] }],
-        tools: [{ google_search: {} }],
-        // Output here is four short lines, so 600 tokens LOOKED generous — but hidden
-        // thinking tokens bill against the same ceiling, which makes a 600-token
-        // grounded call a truncation waiting to happen. Padded rather than
-        // thinking-disabled: choosing the best collection page is judgement work.
-        generationConfig: { temperature: 0.1, maxOutputTokens: GROUNDED_PASS2_MAX_TOKENS }
-      },
-      { timeout: GROUNDED_CALL_TIMEOUT_MS }
-    );
-  } catch (err) {
-    console.warn(formatLlmLogLine(makeLlmError({
-      code: classifyLlmFailure({
-        httpStatus: err.response?.status, errCode: err.code, message: err.message,
-        body: err.response?.data,
-      }),
-      provider: 'google', model: MODEL, role: 'brand-category-lookup',
-      httpStatus: err.response?.status ?? null,
-      requestId: extractRequestId(err.response?.data, err.response?.headers),
-      providerMessage: err.response?.data?.error?.message || err.message,
-      action: LLM_ACTIONS.GAVE_UP_PRODUCT,
-      actionDetail: 'returned null — the brand category URL is unresolved; the caller continues without it',
-    })));
-    return null;
-  }
-
-  const candidate = res.data?.candidates?.[0];
-  const text = (candidate?.content?.parts || []).map(p => p.text || '').join(' ').trim();
-
-  const breadcrumbMatch = text.match(/BREADCRUMB:\s*([^\n]+)/i);
-  const urlMatch        = text.match(/URL:\s*(https?:\/\/[^\s]+)/i);
-  const confMatch       = text.match(/CONFIDENCE:\s*(\d+)/i);
-
-  if (!urlMatch && !breadcrumbMatch) {
-    console.warn(`   · brand-category lookup: no parsable result for ${brandName || brandUrl}`);
-    return null;
-  }
-
-  const result = {
-    breadcrumb: breadcrumbMatch?.[1]?.trim() || null,
-    url:        urlMatch?.[1]?.trim() || null,
-    confidence: confMatch ? Math.max(0, Math.min(1, Number(confMatch[1]) / 100)) : 0.5,
-    reasoning:  text,
-    source:     PROVIDER_NAME
-  };
-  console.log(`   ✓ brand-category: ${result.breadcrumb || '(no breadcrumb)'} → ${result.url || '(no url)'} (${(result.confidence * 100).toFixed(0)}%, ${Date.now() - t0}ms)`);
-  return result;
-}
+// DELETED 2026-08-19: `lookupBrandCategoryUrl` (grounded brand-category-page
+// lookup). Confirmed DEAD — its only caller, `tryLookupBrandCategoryUrl`
+// (services/productMatchService.js), itself had ZERO call sites anywhere in
+// routes/services/worker/scripts. Category breadcrumbs go through
+// `productCategory.enrichProductCategory` (Atlas/GPT) instead; this function
+// never ran. Removed rather than rewired per the "don't rewire dead code"
+// rule — see the caller-side removal in productMatchService.js in the same
+// change. If a future need for this resurfaces, it is not a routing fix.
 
 // Brand-level reviews lookup. Used in the "branding" outcome where no
 // specific product was identifiable — surfaces overall brand sentiment
@@ -976,158 +1129,18 @@ async function lookupBrandReviews({ brandName, brandUrl, brandId = null }) {
     return { quotes: [], rating: null, reviewCount: null, summary: null, source: PROVIDER_NAME };
   }
 
-  // ── Pass 2: structure as JSON ──
-  // Plain Gemini call (no tools) with JSON mime — reliably honors
-  // formatting when there's no google_search tool muddying things.
-  //
-  // RATING_REQUIRE_PROVENANCE gates the PROMPT AND SCHEMA too, not only the
-  // picker ranking. Adversarial review, 2026-08-12: an earlier draft made
-  // `source` a required schema key unconditionally. That is an always-on I/O
-  // change with three unmeasured live outcomes — the model attaches a name
-  // (fine), emits null (fine, ranking unaffected), or DROPS the unattributed
-  // aggregate outright (easier than satisfying a required field with nothing
-  // to put in it) — and the third one is not idle: it is documented right
-  // above as measured behaviour for a REQUIRED field with nothing to fill.
-  // A dropped aggregate reaches pickBestRating as if it never existed, with
-  // the ranking flag never consulted, so "flag off" would not mean "today's
-  // behaviour" for the schema/prompt half of this change. Gating both on the
-  // same flag makes flag-off byte-identical prompt + schema to origin/main —
-  // the guarantee this file's other flags all make — and confines the
-  // unmeasured risk to opt-in.
-  const provenanceAsk = ratingsProvenanceAskSentence();
-  const requiredRatingItemKeys = ratingsItemRequiredKeys();
-  const structurePrompt =
-    `Convert the following brand-review narrative into structured JSON.\n\n` +
-    `Brand: ${brandName}\n` +
-    (sourceDomains.length ? `Sources cited: ${sourceDomains.join(', ')}\n` : '') +
-    `\nNarrative:\n"""\n${narrative}\n"""\n\n` +
-    `Return EXACTLY this shape (no commentary, no markdown):\n` +
-    `{\n` +
-    `  "quotes":      [ { "text": "...", "author": "name or null", "source": "domain or platform or null", "stage": "awareness|consideration|conversion|retention|conquest or null" }, up to ${LLM_QUOTE_CAP} entries ],\n` +
-    `  "ratings":     [{ "source": "<site>", "rating": <0-5>, "reviewCount": <n> }],  // EVERY aggregate found, one entry each; do NOT pick or average.${provenanceAsk}\n` +
-    `  "rating":      <number 0-5 or null>,   // legacy single value; leave null if you filled "ratings"\n` +
-    `  "reviewCount": <integer or null>,\n` +
-    `  "summary":     "one sentence on overall brand sentiment"\n` +
-    `}\n` +
-    `QUOTE RULES (strict): each quote.text MUST be a verbatim substring of the narrative above, copied character-for-character. If the narrative contains no verbatim customer quotes (e.g. it only summarises sentiment), return an EMPTY quotes array — do NOT chop the summary into clause-fragments, do NOT paraphrase, do NOT invent, do NOT complete a fragment into a sentence. Quotes failing this are dropped in code, so inventing one only loses it.`;
-
-  let structData;
-  try {
-    structData = await trackedGenerate(
-      { stage: 'brand_reviews', purposeTag: 'json_structure', grounded: false, ledger },
-      {
-        contents: [{ role: 'user', parts: [{ text: structurePrompt }] }],
-        generationConfig: {
-          temperature: 0.1,
-          maxOutputTokens: GROUNDED_PASS2_MAX_TOKENS,
-          responseMimeType: 'application/json',
-          // gemini-2.5-flash burns hidden thinking tokens against the
-          // visible budget; for a pure narrative → JSON shaping pass
-          // (no reasoning required, schema is fixed), thinking just
-          // truncates the output. Observed as "structuring produced no
-          // parsable JSON" in logs.
-          thinkingConfig: { thinkingBudget: 0 },
-          // Same schema as product-reviews below — Gemini's freeform
-          // JSON output is unreliable enough that the parser fallback
-          // was firing often. Constrains the response shape.
-          responseSchema: {
-            type: 'object',
-            properties: {
-              quotes: {
-                type: 'array',
-                items: {
-                  type: 'object',
-                  properties: {
-                    text:   { type: 'string' },
-                    author: { type: 'string', nullable: true },
-                    source: { type: 'string', nullable: true },
-                    // Funnel stage the quote serves, per AD_USABLE_QUOTE_DIRECTIVE.
-                    // Carried through so selection can match a quote to the ad's
-                    // intent instead of always printing the same top-scored line.
-                    // Nullable: an unlabelled quote is still usable, it just
-                    // cannot win a stage-biased pick.
-                    stage: { type: 'string', nullable: true }
-                  },
-                  required: ['text']
-                }
-              },
-              // REQUIRED, and NOT nullable — this is the whole fix.
-              //
-              // Declared optional, Gemini structured output simply DID NOT EMIT IT.
-              // Measured: the identical prompt against the same model returns all four
-              // aggregates when no responseSchema constrains the call, and returns none
-              // when this property is optional. So pass 1 wrote
-              // "Vuoriclothing.com: 4.58 out of 5 from 15,626 reviews / Trustpilot: 2.3
-              // from 126 / WorthEPenny: 3.8 from 28 / Thingtesting: 4 from 137", pass 2
-              // read it, and the schema dropped every one on the floor — the brand came
-              // back with no rating at all and the picker had nothing to rank.
-              //
-              // An empty array is how "no aggregates found" is expressed; that is a
-              // different statement from "the field is absent", and only the required
-              // form makes the model commit to one of them.
-              ratings: {
-                type: 'array',
-                items: {
-                  type: 'object',
-                  properties: {
-                    source:      { type: 'string', nullable: true },
-                    // Non-nullable: an entry with no number is not an aggregate. A
-                    // source with a non-numeric grade (BBB's "A+") is correctly omitted
-                    // rather than emitted as a null the picker has to filter out.
-                    rating:      { type: 'number' },
-                    reviewCount: { type: 'number', nullable: true }
-                  },
-                  // source is REQUIRED but stays NULLABLE.
-                  //
-                  // Declared optional, Gemini simply omits it, and pickBestRating
-                  // then treats the number as unsourced — so an unattributable 5.0
-                  // can beat a sourced 4.5. Required+nullable forces the model to
-                  // COMMIT to either a real site name or an explicit null, instead
-                  // of silently omitting the field.
-                  //
-                  // Do NOT make source non-nullable. Forcing a non-null string
-                  // makes the model INVENT a source name when it cannot identify
-                  // one, and a fabricated provenance is worse than an absent one
-                  // because it looks auditable and is not.
-                  required: requiredRatingItemKeys
-                }
-              },
-              rating:      { type: 'number',  nullable: true },
-              reviewCount: { type: 'integer', nullable: true },
-              summary:     { type: 'string',  nullable: true }
-            },
-            required: ['quotes', 'ratings']
-          }
-        }
-      },
-      GROUNDED_CALL_TIMEOUT_MS
-    );
-  } catch (err) {
-    console.warn(formatLlmLogLine(makeLlmError({
-      code: classifyLlmFailure({
-        httpStatus: err.response?.status, errCode: err.code, message: err.message,
-        body: err.response?.data,
-      }),
-      provider: 'google', model: MODEL, role: 'brand-reviews-structuring',
-      httpStatus: err.response?.status ?? null,
-      requestId: extractRequestId(err.response?.data, err.response?.headers),
-      providerMessage: err.response?.data?.error?.message || err.message,
-      action: LLM_ACTIONS.GAVE_UP_PRODUCT,
-      actionDetail: 'returned a partial result — narrative summary kept, quotes/rating/count dropped',
-    })));
-    return { quotes: [], rating: null, reviewCount: null, summary: summarySnippet(narrative), source: PROVIDER_NAME };
-  }
-
-  const structCand = structData?.candidates?.[0];
-  const jsonText = (structCand?.content?.parts || []).map(p => p.text || '').join('').trim();
-
-  let parsed = null;
-  try { parsed = JSON.parse(jsonText); } catch (_) {
-    const m = jsonText.match(/\{[\s\S]*\}/);
-    if (m) { try { parsed = JSON.parse(m[0]); } catch (_) {} }
-  }
+  // ── Pass 2: structure as JSON — ATLAS-ROUTED (2026-08-19) ──
+  // Never grounded (no `tools` above), so unlike pass 1 it carries none of
+  // the restriction documented in the ATLAS GROUNDING PROBE comment near
+  // MODEL/ENDPOINT. See structureReviewNarrative for the model choice and
+  // schema-translation rationale.
+  const parsed = await structureReviewNarrative({
+    subjectLine: `Brand: ${brandName}`,
+    narrative, sourceDomains,
+    stage: 'brand_reviews', label: 'brand-review',
+    ledger
+  });
   if (!parsed) {
-    console.warn(`   · brand-reviews: structuring produced no parsable JSON for ${brandName}`);
     return { quotes: [], rating: null, reviewCount: null, summary: summarySnippet(narrative), source: PROVIDER_NAME };
   }
 
@@ -1237,145 +1250,18 @@ async function lookupProductReviews({ productName, brandName, productUrl, brandI
     return { quotes: [], rating: null, reviewCount: null, summary: null, source: PROVIDER_NAME };
   }
 
-  // ── Pass 2: structure as JSON ──
-  // RATING_REQUIRE_PROVENANCE gates the prompt AND schema here too — see the
-  // matching comment in lookupBrandReviews above for why an always-on
-  // required-schema-key change is a real, unmeasured, flag-off risk.
-  const provenanceAsk = ratingsProvenanceAskSentence();
-  const requiredRatingItemKeys = ratingsItemRequiredKeys();
-  const structurePrompt =
-    `Convert the following product-review narrative into structured JSON.\n\n` +
-    `Product: ${productName}${brandName ? ` (brand: ${brandName})` : ''}\n` +
-    (sourceDomains.length ? `Sources cited: ${sourceDomains.join(', ')}\n` : '') +
-    `\nNarrative:\n"""\n${narrative}\n"""\n\n` +
-    `Return EXACTLY this shape (no commentary, no markdown):\n` +
-    `{\n` +
-    `  "quotes":      [ { "text": "...", "author": "name or null", "source": "domain or platform or null", "stage": "awareness|consideration|conversion|retention|conquest or null" }, up to ${LLM_QUOTE_CAP} entries ],\n` +
-    `  "ratings":     [{ "source": "<site>", "rating": <0-5>, "reviewCount": <n> }],  // EVERY aggregate found, one entry each; do NOT pick or average.${provenanceAsk}\n` +
-    `  "rating":      <number 0-5 or null>,   // legacy single value; leave null if you filled "ratings"\n` +
-    `  "reviewCount": <integer or null>,\n` +
-    `  "summary":     "one sentence on overall product sentiment"\n` +
-    `}\n` +
-    `QUOTE RULES (strict): each quote.text MUST be a verbatim substring of the narrative above, copied character-for-character. If the narrative contains no verbatim customer quotes (e.g. it only summarises sentiment), return an EMPTY quotes array — do NOT chop the summary into clause-fragments, do NOT paraphrase, do NOT invent, do NOT complete a fragment into a sentence. Quotes failing this are dropped in code, so inventing one only loses it.`;
-
-  let structData;
-  try {
-    structData = await trackedGenerate(
-      { stage: 'product_reviews', purposeTag: 'json_structure', grounded: false, ledger },
-      {
-        contents: [{ role: 'user', parts: [{ text: structurePrompt }] }],
-        generationConfig: {
-          temperature: 0.1,
-          maxOutputTokens: GROUNDED_PASS2_MAX_TOKENS,
-          responseMimeType: 'application/json',
-          // Same as brand-reviews above — disable thinking so the 1200
-          // token budget goes to the actual JSON instead of hidden
-          // reasoning. Eliminates the "structuring produced no parsable
-          // JSON" warnings caused by MAX_TOKENS-mid-JSON truncations.
-          thinkingConfig: { thinkingBudget: 0 },
-          // Schema-enforced output to eliminate "structuring produced
-          // no parsable JSON" warnings — Gemini was returning markdown-
-          // wrapped JSON, prose with embedded JSON, or fields with
-          // wrong types. responseSchema constrains output to exactly
-          // our shape; the parser below becomes a safety net.
-          responseSchema: {
-            type: 'object',
-            properties: {
-              quotes: {
-                type: 'array',
-                items: {
-                  type: 'object',
-                  properties: {
-                    text:   { type: 'string' },
-                    author: { type: 'string', nullable: true },
-                    source: { type: 'string', nullable: true },
-                    // Funnel stage the quote serves, per AD_USABLE_QUOTE_DIRECTIVE.
-                    // Carried through so selection can match a quote to the ad's
-                    // intent instead of always printing the same top-scored line.
-                    // Nullable: an unlabelled quote is still usable, it just
-                    // cannot win a stage-biased pick.
-                    stage: { type: 'string', nullable: true }
-                  },
-                  required: ['text']
-                }
-              },
-              // REQUIRED, and NOT nullable — this is the whole fix.
-              //
-              // Declared optional, Gemini structured output simply DID NOT EMIT IT.
-              // Measured: the identical prompt against the same model returns all four
-              // aggregates when no responseSchema constrains the call, and returns none
-              // when this property is optional. So pass 1 wrote
-              // "Vuoriclothing.com: 4.58 out of 5 from 15,626 reviews / Trustpilot: 2.3
-              // from 126 / WorthEPenny: 3.8 from 28 / Thingtesting: 4 from 137", pass 2
-              // read it, and the schema dropped every one on the floor — the brand came
-              // back with no rating at all and the picker had nothing to rank.
-              //
-              // An empty array is how "no aggregates found" is expressed; that is a
-              // different statement from "the field is absent", and only the required
-              // form makes the model commit to one of them.
-              ratings: {
-                type: 'array',
-                items: {
-                  type: 'object',
-                  properties: {
-                    source:      { type: 'string', nullable: true },
-                    // Non-nullable: an entry with no number is not an aggregate. A
-                    // source with a non-numeric grade (BBB's "A+") is correctly omitted
-                    // rather than emitted as a null the picker has to filter out.
-                    rating:      { type: 'number' },
-                    reviewCount: { type: 'number', nullable: true }
-                  },
-                  // source is REQUIRED but stays NULLABLE.
-                  //
-                  // Declared optional, Gemini simply omits it, and pickBestRating
-                  // then treats the number as unsourced — so an unattributable 5.0
-                  // can beat a sourced 4.5. Required+nullable forces the model to
-                  // COMMIT to either a real site name or an explicit null, instead
-                  // of silently omitting the field.
-                  //
-                  // Do NOT make source non-nullable. Forcing a non-null string
-                  // makes the model INVENT a source name when it cannot identify
-                  // one, and a fabricated provenance is worse than an absent one
-                  // because it looks auditable and is not.
-                  required: requiredRatingItemKeys
-                }
-              },
-              rating:      { type: 'number',  nullable: true },
-              reviewCount: { type: 'integer', nullable: true },
-              summary:     { type: 'string',  nullable: true }
-            },
-            required: ['quotes', 'ratings']
-          }
-        }
-      },
-      GROUNDED_CALL_TIMEOUT_MS
-    );
-  } catch (err) {
-    console.warn(formatLlmLogLine(makeLlmError({
-      code: classifyLlmFailure({
-        httpStatus: err.response?.status, errCode: err.code, message: err.message,
-        body: err.response?.data,
-      }),
-      provider: 'google', model: MODEL, role: 'product-reviews-structuring',
-      httpStatus: err.response?.status ?? null,
-      requestId: extractRequestId(err.response?.data, err.response?.headers),
-      providerMessage: err.response?.data?.error?.message || err.message,
-      action: LLM_ACTIONS.GAVE_UP_PRODUCT,
-      actionDetail: 'returned a partial result — narrative summary kept, quotes/rating/count dropped',
-    })));
-    return { quotes: [], rating: null, reviewCount: null, summary: summarySnippet(narrative), source: PROVIDER_NAME };
-  }
-
-  const structCand = structData?.candidates?.[0];
-  const jsonText = (structCand?.content?.parts || []).map(p => p.text || '').join('').trim();
-
-  let parsed = null;
-  try { parsed = JSON.parse(jsonText); } catch (_) {
-    const m = jsonText.match(/\{[\s\S]*\}/);
-    if (m) { try { parsed = JSON.parse(m[0]); } catch (_) {} }
-  }
+  // ── Pass 2: structure as JSON — ATLAS-ROUTED (2026-08-19) ──
+  // Never grounded (no `tools` above) — see structureReviewNarrative for the
+  // model choice and schema-translation rationale, and the ATLAS GROUNDING
+  // PROBE comment near MODEL/ENDPOINT for why that restriction does NOT
+  // apply here.
+  const parsed = await structureReviewNarrative({
+    subjectLine: `Product: ${productName}${brandName ? ` (brand: ${brandName})` : ''}`,
+    narrative, sourceDomains,
+    stage: 'product_reviews', label: 'product-review',
+    ledger
+  });
   if (!parsed) {
-    console.warn(`   · product-reviews: structuring produced no parsable JSON for ${productLabel}`);
     return { quotes: [], rating: null, reviewCount: null, summary: summarySnippet(narrative), source: PROVIDER_NAME };
   }
 
@@ -1403,7 +1289,8 @@ module.exports = {
   match,
   isEnabled,
   PROVIDER_NAME,
-  lookupBrandCategoryUrl,
+  // lookupBrandCategoryUrl REMOVED 2026-08-19 — confirmed dead, see the
+  // removal note above lookupBrandReviews.
   lookupBrandReviews,
   lookupProductReviews,
   // Exported so categoryReviewsService uses the SAME directive rather than a
