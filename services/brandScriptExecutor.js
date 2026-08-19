@@ -688,14 +688,164 @@ function gateLayoutInputQuotes(layoutInput, scope = {}) {
   }
 }
 
+// Merchandising qualifiers that describe WHO a product is for, not WHAT it
+// is — the ad already carries the brand's own audience elsewhere, so on the
+// close-phase product-name slot they are pure overhead. Plural/possessive
+// forms ONLY ("Women's", "Kids", "Mens") — bare singular words ("Men",
+// "Boy") are deliberately excluded because they collide with ordinary
+// English inside a real product name ("Men in Black", "Girl Scout"). This
+// list is brand- and category-agnostic: it only ever fires on an exact
+// leading token, never mid-string, so it is inert for the vast majority of
+// titles that don't open with one of these words.
+const GENDER_QUALIFIER_PREFIXES = [
+  "women's", 'womens',
+  "men's", 'mens',
+  "kids'", 'kids',
+  "girls'", 'girls',
+  "boys'", 'boys',
+  "toddler's", 'toddlers',
+  "ladies'", 'ladies',
+  'unisex',
+];
+
+function escapeRegExp(s) {
+  return String(s).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+// Longest-first so "kids'" is tried before the shorter "kids" alternative
+// would otherwise win and swallow the apostrophe form's plain match first.
+const GENDER_QUALIFIER_RE = new RegExp(
+  `^(${GENDER_QUALIFIER_PREFIXES
+    .slice()
+    .sort((a, b) => b.length - a.length)
+    .map(escapeRegExp)
+    .join('|')})\\s+`,
+  'i'
+);
+
+/**
+ * Strip a leading gender/audience qualifier ("Women's", "Kids", …) when it
+ * reads as a merchandising prefix, not part of the brand's own identity.
+ * Guarded: if the brand's own name starts with that same word (a brand
+ * literally called "Women's Health"), the qualifier is load-bearing — leave
+ * it alone. Never empties the string.
+ */
+function stripLeadingGenderQualifier(name, brandName) {
+  const match = name.match(GENDER_QUALIFIER_RE);
+  if (!match) return name;
+  const qualifier = match[1].toLowerCase();
+  const brand = brandName ? String(brandName).trim().toLowerCase() : '';
+  if (brand) {
+    const bare = qualifier.replace(/'/g, '');
+    if (brand === qualifier || brand === bare
+      || brand.startsWith(`${qualifier} `) || brand.startsWith(`${bare} `)) {
+      return name;
+    }
+  }
+  const rest = name.slice(match[0].length).trim();
+  return rest || name;
+}
+
+function normalizeWordForCompare(w) {
+  let s = String(w).toLowerCase();
+  // Strip surrounding punctuation (quotes, trailing period/comma, …) but
+  // NOT an internal apostrophe yet — "women's" needs it for the next step.
+  s = s.replace(/^[^a-z0-9]+/, '').replace(/[^a-z0-9]+$/, '');
+  s = s.replace(/'s$/, ''); // possessive suffix only, never a bare plural "s"
+  return s;
+}
+
+// How many LEADING words of `nameWords` match `brandWords` word-for-word
+// (case-insensitive, possessive-insensitive). Stops at the first mismatch;
+// a brand longer than what's left in the title can never fully match.
+function countLeadingWordMatch(nameWords, brandWords) {
+  let matched = 0;
+  for (let i = 0; i < brandWords.length && i < nameWords.length; i++) {
+    const a = normalizeWordForCompare(brandWords[i]);
+    const b = normalizeWordForCompare(nameWords[i]);
+    if (!a || a !== b) break;
+    matched++;
+  }
+  return matched;
+}
+
+/**
+ * Strip a leading brand-name token when the ad already carries that exact
+ * brand elsewhere (logo / brand-name slot) and the catalog title repeats it
+ * as its first word(s) — e.g. "Vuori Vintage Oversized Denim Jacket" under
+ * Vuori's own brand becomes "Vintage Oversized Denim Jacket".
+ *
+ * Word-by-word prefix match (not a single substring match): consumes as
+ * many of the brand name's words as the title actually opens with, then
+ * stops. This deliberately tolerates a brand name that is LONGER than what
+ * the title repeats — e.g. a test/demo tenant named "Vuori 2" still strips
+ * the catalog "Vuori " prefix from a title that (correctly) never says "2".
+ * A brand whose own name opens with "The" ("The Ordinary") matches directly;
+ * one that doesn't ("North Face") still matches after a title's OWN leading
+ * "The " (only tried when the direct match found nothing, so it never
+ * double-strips a brand that already starts with "The").
+ *
+ * Whole-word only (never a partial/substring match) — a brand word that
+ * merely happens to prefix an unrelated title word never fires. Never
+ * empties the string: matching every word in the title leaves it untouched.
+ */
+function stripLeadingBrandToken(name, brandName) {
+  const brand = brandName ? String(brandName).trim() : '';
+  if (!brand) return name;
+  const nameWords = name.trim().split(/\s+/);
+  const brandWords = brand.split(/\s+/);
+  if (!nameWords.length || !brandWords.length) return name;
+
+  let offset = 0;
+  let matched = countLeadingWordMatch(nameWords, brandWords);
+  if (matched === 0 && /^the$/i.test(nameWords[0]) && !/^the$/i.test(brandWords[0])) {
+    offset = 1;
+    matched = countLeadingWordMatch(nameWords.slice(1), brandWords);
+  }
+  if (matched === 0) return name;
+
+  const consumed = offset + matched;
+  if (consumed >= nameWords.length) return name;
+  const rest = nameWords.slice(consumed).join(' ').trim();
+  return rest || name;
+}
+
+/**
+ * Strip leading gender-qualifier and redundant own-brand tokens, in
+ * whichever order they appear in the source title ("Women's Vuori …" or
+ * "Vuori Women's …"). Two passes is enough to catch both prefixes; a pass
+ * that changes nothing stops the loop early.
+ */
+function stripLeadingMerchandisingTokens(name, brandName) {
+  let out = name;
+  for (let i = 0; i < 2; i++) {
+    const next = stripLeadingBrandToken(stripLeadingGenderQualifier(out, brandName), brandName);
+    if (next === out) break;
+    out = next;
+  }
+  return out;
+}
+
 /**
  * Clean a catalog product title for on-screen DISPLAY.
  * Order: trailing parenthetical → pipe-suffix → trailing " - X" segment
  * (dash only when remainder is ≥2 words or ≥8 chars so short names like
- * "Mach 5 - Turbo" keep their integral dash). productNameFull is untouched.
- * Returns { productName, productNameFull }. Exported for the verify harness.
+ * "Mach 5 - Turbo" keep their integral dash) → leading gender qualifier /
+ * redundant own-brand token (see stripLeadingMerchandisingTokens — a name
+ * like "Women's Vuori Vintage Oversized Denim Jacket" under the Vuori brand
+ * becomes "Vintage Oversized Denim Jacket": the ad already carries Vuori
+ * branding elsewhere, and "Women's" is a merchandising facet, not part of
+ * what the shopper is looking at). productNameFull is always the untouched
+ * raw input. Returns { productName, productNameFull }. Exported for the
+ * verify harness.
+ *
+ * @param {string|null} name  raw catalog/cascade product title
+ * @param {string|null} [brandName]  the ad's own brand name (cascaded.brandName)
+ *   — optional; omitted/null keeps every pre-existing caller byte-identical
+ *   for the brand-token step (the gender-qualifier step still applies, since
+ *   it needs no brand context to be safe).
  */
-function cleanProductNameForDisplay(name) {
+function cleanProductNameForDisplay(name, brandName = null) {
   if (name == null) return { productName: null, productNameFull: null };
   const full = String(name).replace(/\s+/g, ' ').trim();
   if (!full) return { productName: null, productNameFull: null };
@@ -721,6 +871,10 @@ function cleanProductNameForDisplay(name) {
       cleaned = head;
     }
   }
+  // 4) Strip a leading gender qualifier and/or redundant own-brand token —
+  // see stripLeadingMerchandisingTokens. This is what closes the truncation
+  // defect: shortening the SOURCE string beats clamping a still-long one.
+  cleaned = stripLeadingMerchandisingTokens(cleaned, brandName);
   if (!cleaned) cleaned = full;
   return { productName: cleaned, productNameFull: full };
 }
@@ -1206,9 +1360,11 @@ async function buildMetaForAd(ad, brand, opts = {}) {
     ? null
     : (cascaded.promoText ?? null);
 
-  // Display-clean productName (strip trailing parentheticals); keep full
-  // raw cascade value as productNameFull so nothing loses data.
-  const productNameCleaned = cleanProductNameForDisplay(cascaded.productName ?? null);
+  // Display-clean productName (strip trailing parentheticals, leading
+  // gender qualifier, redundant own-brand token); keep full raw cascade
+  // value as productNameFull so nothing loses data. brandName passed so the
+  // redundant-brand-token strip only ever matches THIS ad's own brand.
+  const productNameCleaned = cleanProductNameForDisplay(cascaded.productName ?? null, cascaded.brandName ?? null);
 
   return {
     // Cascaded fields — every one of these can be re-pointed via

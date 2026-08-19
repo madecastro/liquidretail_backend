@@ -50,6 +50,7 @@ import {
   resolveMaxLines,
   resolveFontPx,
   truncateWordSafe,
+  fitProductNameToCap,
   resolveSlotContent,
   resolveSlotContentCore,
 } from '../remotion/lib/slotContent.js';
@@ -666,6 +667,82 @@ const VHS_VERTICAL_HEADLINE = 46;
   check('C DEFAULT_BASE_FONT_PX.headline.landscape is 60', DEFAULT_BASE_FONT_PX.headline.landscape === 60);
   check('C DEFAULT_SIZE_SCALE.headline.vertical is 1.2', DEFAULT_SIZE_SCALE.headline.vertical === 1.2);
   check('C DEFAULT_SIZE_SCALE.headline.landscape is 1.2', DEFAULT_SIZE_SCALE.headline.landscape === 1.2);
+}
+
+// ── J. productName Reels-vs-Stories width delta + noun-preserving fitter
+//    (2026-08-19 truncation incident: "Women's Vuori Vintage Oversized…" on
+//    Reels, a DIFFERENT cutoff on Stories for the SAME source string — the
+//    tell that the clamp is width/box-driven, not a fixed source-string cap)
+// ───────────────────────────────────────────────────────────────────────────
+{
+  const baseCtx = { format: 'vertical', canvasWidth: 1080, maxWidthPct: 0.9, maxLines: 2, fontPx: 56 * 1.2 };
+  const reelsCap = deriveCharCap('productName', { ...baseCtx, platformFormat: 'meta_reels_9_16' });
+  const storiesCap = deriveCharCap('productName', { ...baseCtx, platformFormat: 'meta_stories_9_16' });
+  check('J1 stories productName cap === vertical (stories zone not narrower)',
+    storiesCap === deriveCharCap('productName', baseCtx), `stories=${storiesCap}`);
+  check('J2 reels productName cap < stories productName cap (the actual reported delta)',
+    reelsCap < storiesCap, `reels=${reelsCap} stories=${storiesCap}`);
+  check('J3 reels productName cap === verticalYt (same narrowed zone)',
+    reelsCap === deriveCharCap('productName', { ...baseCtx, platformFormat: 'pmax_video_9_16' }),
+    `reels=${reelsCap} verticalYt=${deriveCharCap('productName', { ...baseCtx, platformFormat: 'pmax_video_9_16' })}`);
+
+  // fitProductNameToCap: fits as-is when already under cap (no-op, no ellipsis).
+  check('J4 fitProductNameToCap: no-op when already under cap',
+    fitProductNameToCap('Trail Shorts', 40) === 'Trail Shorts');
+
+  // Drops the FEWEST leading words needed — a whole real phrase, no ellipsis.
+  check('J5 fitProductNameToCap drops exactly one leading modifier when that alone fits',
+    fitProductNameToCap('Vintage Oversized Denim Jacket', 26) === 'Oversized Denim Jacket',
+    `got ${JSON.stringify(fitProductNameToCap('Vintage Oversized Denim Jacket', 26))}`);
+  check('J6 fitProductNameToCap never emits an ellipsis when a whole-word fit exists',
+    !fitProductNameToCap('Vintage Oversized Denim Jacket', 26).includes('…'));
+
+  // Drops MORE than one word when needed — still minimal, still no ellipsis.
+  check('J7 fitProductNameToCap drops multiple leading words when required',
+    fitProductNameToCap('Vintage Oversized Cropped Denim Jacket', 12) === 'Denim Jacket',
+    `got ${JSON.stringify(fitProductNameToCap('Vintage Oversized Cropped Denim Jacket', 12))}`);
+
+  // Never drops the trailing noun down to nothing needlessly — the fitted
+  // string is always the LONGEST candidate that still fits (fewest words
+  // dropped), never over-shortened.
+  check('J8 fitProductNameToCap keeps the longest fitting candidate (minimal drop)',
+    fitProductNameToCap('Alpha Beta Gamma Delta', 11) === 'Gamma Delta',
+    `got ${JSON.stringify(fitProductNameToCap('Alpha Beta Gamma Delta', 11))}`);
+
+  // Even the last single word alone doesn't fit → falls back to the
+  // standard tail-safe cap+ellipsis (the true last resort). Cap (4) is
+  // smaller than "Jacket" itself (6) so no whole-word candidate can ever fit.
+  check('J9 fitProductNameToCap falls back to truncateWordSafe when no whole-word phrase fits',
+    fitProductNameToCap('Supercalifragilisticexpialidocious Jacket', 4)
+      === truncateWordSafe('Supercalifragilisticexpialidocious Jacket', 4),
+    `got ${JSON.stringify(fitProductNameToCap('Supercalifragilisticexpialidocious Jacket', 4))}`);
+
+  // A single-word name has no leading word to drop → same fallback.
+  check('J10 fitProductNameToCap on a single word falls back to truncateWordSafe',
+    fitProductNameToCap('Supercalifragilisticexpialidocious', 10)
+      === truncateWordSafe('Supercalifragilisticexpialidocious', 10));
+
+  // END-TO-END through resolveSlotContent: productName gets the fitter,
+  // quote does NOT (PR #250 depends on the quote's opening clause surviving
+  // a plain tail cut — this must never change for any slot but productName).
+  const pnSlot = { key: 'productName', visible: true, slotType: 'text', bind: ['productName'], position: {}, treatment: {} };
+  const squareCtx = { format: 'square', canvasWidth: 1080, maxWidthPct: 0.9, maxLines: 1, fontPx: 36 * 1.2, platformFormat: 'pmax_video_1_1' };
+  const squareOut = resolveSlotContent(pnSlot, { productName: 'Vintage Oversized Denim Jacket' }, [pnSlot], squareCtx);
+  check('J11 squareYt productName end-to-end: noun-preserving fit, no ellipsis',
+    squareOut === 'Oversized Denim Jacket', `got ${JSON.stringify(squareOut)}`);
+
+  const quoteSlot = { key: 'quote', visible: true, slotType: 'text', bind: ['quote'], position: {}, treatment: {} };
+  const openingClause = 'The fabric is so soft. I love that it is a bomber-style jacket and cinched at the waist but not tight.';
+  const quoteOut = resolveSlotContent(quoteSlot, { quote: openingClause }, [quoteSlot], {
+    format: 'vertical', canvasWidth: 1080, maxWidthPct: 0.92, maxLines: 3, fontPx: 56 * 1.15, platformFormat: 'meta_reels_9_16',
+  });
+  check('J12 quote slot is UNCHANGED by the productName fitter (still opening-clause tail cut)',
+    quoteOut === truncateWordSafe(openingClause, deriveCharCap('quote', {
+      format: 'vertical', canvasWidth: 1080, maxWidthPct: 0.92, maxLines: 3, fontPx: 56 * 1.15, platformFormat: 'meta_reels_9_16',
+    })),
+    `got ${JSON.stringify(quoteOut)}`);
+  check('J13 quote slot keeps its opening clause (starts with "The fabric is so soft")',
+    quoteOut.startsWith('The fabric is so soft'), `got ${JSON.stringify(quoteOut)}`);
 }
 
 // ── Derived caps table (all four formats × headline/quote) — report aid ───

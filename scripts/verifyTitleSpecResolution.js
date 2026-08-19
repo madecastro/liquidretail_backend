@@ -360,24 +360,32 @@ check('G8 presetOverride bogus name falls through to normal ladder', () => {
     `bogus override with brand preset should fall to preset, got ${r2.source}`);
 });
 
-check('G9 productName cleaning strips parenthetical / pipe / trailing dash; full preserved', () => {
+check('G9 productName cleaning strips parenthetical / pipe / trailing dash / leading gender+brand token; full preserved', () => {
   // FAIL-IF-CLEAN-REGRESSED: close-phase SKU titles must not print colorways,
-  // pipe-suffixes, or trailing " - <colorway|fit>" segments.
+  // pipe-suffixes, trailing " - <colorway|fit>" segments, a leading gender
+  // qualifier, or a redundant leading own-brand token (2026-08-19 —
+  // TRUNCATION INCIDENT: "Women's Vuori Vintage Oversized…" clamped mid-name
+  // on Reels because the source string was never shortened before the char
+  // cap fired; see G9b/G10 below for the brand-aware cases and the full
+  // reported string).
   // Parenthetical only (legacy case — dash segment kept because remainder
-  // is long enough; wait: after paren strip we get "... - Warm Red" which
-  // has head "Women's Breezer Point" ≥2 words → dash also strips now).
+  // is long enough; after paren strip we get "... - Warm Red" which has head
+  // "Women's Breezer Point" ≥2 words → dash also strips; then the leading
+  // "Women's" qualifier strips too, since it is pure merchandising overhead
+  // once the ad already carries the brand elsewhere).
   const sample = "Women's Breezer Point - Warm Red (Dark Cocoa Sole)";
   const { productName, productNameFull } = cleanProductNameForDisplay(sample);
-  assert.strictEqual(productName, "Women's Breezer Point");
+  assert.strictEqual(productName, 'Breezer Point');
   assert.strictEqual(productNameFull, sample);
 
   // Live frame: trailing " - <colorway>" with no paren.
   const colorway = "Women's Breezer Point - Warm Red";
   const c = cleanProductNameForDisplay(colorway);
-  assert.strictEqual(c.productName, "Women's Breezer Point");
+  assert.strictEqual(c.productName, 'Breezer Point');
   assert.strictEqual(c.productNameFull, colorway);
 
   // Live frame: pipe-suffix + trailing dash (order: paren → pipe → dash).
+  // No gender qualifier here — must stay untouched by step 4.
   const pipe = 'Short Sleeve Bridge Button Down - Relaxed Fit | Blue Stripe';
   const p = cleanProductNameForDisplay(pipe);
   assert.strictEqual(p.productName, 'Short Sleeve Bridge Button Down');
@@ -401,6 +409,141 @@ check('G9 productName cleaning strips parenthetical / pipe / trailing dash; full
   const ws = cleanProductNameForDisplay('  Foo   Bar  (Baz)  ');
   assert.strictEqual(ws.productName, 'Foo Bar');
   assert.strictEqual(ws.productNameFull, 'Foo Bar (Baz)');
+});
+
+check('G9b leading gender/brand strip: brand-agnostic, guarded, never mangles a load-bearing token', () => {
+  // FAIL-IF-NORMALIZER-REGRESSED / FAIL-IF-NORMALIZER-OVERREACHES: this is
+  // the general rule the incident fix depends on — it must fire the same
+  // way for ANY brand/category (not a Vuori special-case) and must never
+  // fire where the stripped token is load-bearing.
+
+  // THE REPORTED DEFECT, exactly: gender qualifier + brand both leading.
+  const reels = cleanProductNameForDisplay("Women's Vuori Vintage Oversized Denim Jacket", 'Vuori');
+  assert.strictEqual(reels.productName, 'Vintage Oversized Denim Jacket');
+  assert.strictEqual(reels.productNameFull, "Women's Vuori Vintage Oversized Denim Jacket");
+
+  // Order-independent: brand-first, gender-second still strips both.
+  const brandFirst = cleanProductNameForDisplay("Vuori Women's Vintage Oversized Denim Jacket", 'Vuori');
+  assert.strictEqual(brandFirst.productName, 'Vintage Oversized Denim Jacket');
+
+  // REAL TENANT SHAPE: this platform's demo/test brands are literally named
+  // "<Brand> <N>" (e.g. "Vuori 2", "Pelagic Gear Test 2" — see session.md).
+  // The catalog title never repeats that trailing digit, so a naive
+  // exact-full-string brand match would silently never fire for exactly the
+  // account the incident was reported on. Word-by-word prefix matching must
+  // still strip "Vuori " even though brandName is "Vuori 2".
+  const testTenant = cleanProductNameForDisplay("Women's Vuori Vintage Oversized Denim Jacket", 'Vuori 2');
+  assert.strictEqual(testTenant.productName, 'Vintage Oversized Denim Jacket');
+
+  // Case-insensitive brand match.
+  assert.strictEqual(cleanProductNameForDisplay('VUORI Trail Shorts', 'Vuori').productName, 'Trail Shorts');
+
+  // Multi-word brand, with the title's own leading "The" the brand name
+  // itself doesn't carry.
+  assert.strictEqual(
+    cleanProductNameForDisplay('The North Face Thermoball Jacket', 'North Face').productName,
+    'Thermoball Jacket'
+  );
+  // Multi-word brand that DOES itself open with "The" — must not double-strip.
+  assert.strictEqual(
+    cleanProductNameForDisplay('The Ordinary Niacinamide Serum', 'The Ordinary').productName,
+    'Niacinamide Serum'
+  );
+
+  // GUARD — mid-string brand token is never touched (anchored to the start only).
+  assert.strictEqual(cleanProductNameForDisplay('Vintage Vuori Jacket', 'Vuori').productName, 'Vintage Vuori Jacket');
+
+  // GUARD — never empties the whole title (brand name IS the entire product name).
+  assert.strictEqual(cleanProductNameForDisplay('Vuori', 'Vuori').productName, 'Vuori');
+
+  // GUARD — a bare singular "Men"/"Women" (no possessive/plural) is never
+  // treated as a qualifier: it collides with ordinary English inside a real
+  // product name. Only the unambiguous plural/possessive forms fire.
+  assert.strictEqual(
+    cleanProductNameForDisplay('Men in Black Costume Tee', null).productName,
+    'Men in Black Costume Tee'
+  );
+
+  // GUARD — the qualifier is part of the BRAND's own identity (a brand
+  // literally named "Women's Best"): stripping just "Women's" would sever it
+  // from "Best", but stripping the full brand prefix "Women's Best" is still
+  // correct and leaves a real product name.
+  assert.strictEqual(
+    cleanProductNameForDisplay("Women's Best Protein Powder", "Women's Best").productName,
+    'Protein Powder'
+  );
+
+  // No brandName supplied (byte-identical to every pre-existing 1-arg caller
+  // for the brand-token step) — gender-qualifier step alone still applies.
+  assert.strictEqual(
+    cleanProductNameForDisplay("Mens Compression Shorts").productName,
+    'Compression Shorts'
+  );
+});
+
+check('G10 END-TO-END: the reported Reels/Stories headline-truncation incident is closed', () => {
+  // FAIL-IF-TRUNCATION-REGRESSED / REVERT-PROOF: this reproduces the exact
+  // reported pixel bug at the DATA layer — cleanProductNameForDisplay feeding
+  // deriveCharCap + truncateWordSafe (remotion/lib/slotContent.js), the same
+  // two functions Canonical.jsx calls for the live paint. Before the fix,
+  // the raw cascade string ("Women's Vuori Vintage Oversized Denim Jacket")
+  // was 45 chars — Reels' cap (32, its safe-zone-narrowed width) and
+  // Stories' cap (38) both clamped it with a mid-name ellipsis, at DIFFERENT
+  // cutoffs (proving the clamp is width-driven, not a fixed source cap):
+  // Reels -> "Women's Vuori Vintage Oversized…", Stories ->
+  // "Women's Vuori Vintage Oversized Denim…". Revert cleanProductNameForDisplay's
+  // step 4 (or drop the brandName argument at its call site) and this check
+  // goes red because RAW_TITLE.length (45) once again exceeds both caps.
+  const { deriveCharCap, truncateWordSafe, fitProductNameToCap } = require('../remotion/lib/slotContent.js');
+
+  const RAW_TITLE = "Women's Vuori Vintage Oversized Denim Jacket";
+  const BRAND_NAME = 'Vuori 2'; // the actual shipping tenant's brand doc name
+  const EXPECTED_CLEANED = 'Vintage Oversized Denim Jacket';
+
+  const { productName: cleaned } = cleanProductNameForDisplay(RAW_TITLE, BRAND_NAME);
+  assert.strictEqual(cleaned, EXPECTED_CLEANED, `cleaned productName regressed: ${cleaned}`);
+
+  // Same vertical/productName geometry Canonical.jsx stamps for these two
+  // platformFormats (canonical.json close phase: maxWidthPct 0.9, maxLines 2,
+  // font 56×1.2), differing only in platformFormat -> safe-zone width, which
+  // is exactly what produced the two different cutoffs pre-fix.
+  const baseCtx = {
+    format: 'vertical', canvasWidth: 1080, maxWidthPct: 0.9, maxLines: 2, fontPx: 56 * 1.2,
+  };
+  const reelsCap = deriveCharCap('productName', { ...baseCtx, platformFormat: 'meta_reels_9_16' });
+  const storiesCap = deriveCharCap('productName', { ...baseCtx, platformFormat: 'meta_stories_9_16' });
+
+  // The raw (uncleaned) string would have clamped on BOTH surfaces — this is
+  // the pre-fix incident reproduced, asserted so this check would have
+  // caught it before it shipped.
+  assert.ok(RAW_TITLE.length > reelsCap, `fixture stopped exercising the Reels clamp: raw=${RAW_TITLE.length} cap=${reelsCap}`);
+  assert.ok(RAW_TITLE.length > storiesCap, `fixture stopped exercising the Stories clamp: raw=${RAW_TITLE.length} cap=${storiesCap}`);
+  assert.ok(reelsCap < storiesCap, `fixture stopped proving the width-driven (not fixed-cap) delta: reels=${reelsCap} stories=${storiesCap}`);
+
+  // The CLEANED string must survive uncut on both — the actual fix.
+  const reelsOut = truncateWordSafe(cleaned, reelsCap);
+  const storiesOut = truncateWordSafe(cleaned, storiesCap);
+  assert.strictEqual(reelsOut, EXPECTED_CLEANED, `Reels still clamps the cleaned name: ${reelsOut}`);
+  assert.strictEqual(storiesOut, EXPECTED_CLEANED, `Stories still clamps the cleaned name: ${storiesOut}`);
+  assert.ok(!reelsOut.includes('…'), 'Reels productName must not carry an ellipsis');
+  assert.ok(!storiesOut.includes('…'), 'Stories productName must not carry an ellipsis');
+
+  // squareYt (pmax_video_1_1) shares the same mechanism with a much tighter
+  // 1-line productName cap (26) — the cleaned 30-char name ("Vintage
+  // Oversized Denim Jacket") still doesn't fit there on its own. This is
+  // exactly where the noun-preserving fitProductNameToCap lever (owner's own
+  // suggested fallback: "or even 'Oversized Denim Jacket'") takes over:
+  // drop the leading modifier before ever clamping the tail noun away.
+  const squareCap = deriveCharCap('productName', {
+    format: 'square', canvasWidth: 1080, maxWidthPct: 0.9, maxLines: 1, fontPx: 36 * 1.2,
+    platformFormat: 'pmax_video_1_1',
+  });
+  assert.ok(cleaned.length > squareCap,
+    `fixture stopped exercising the noun-preserving fitter: len=${cleaned.length} cap=${squareCap}`);
+  const squareOut = fitProductNameToCap(cleaned, squareCap);
+  assert.strictEqual(squareOut, 'Oversized Denim Jacket', `squareYt fitter regressed: ${squareOut}`);
+  assert.ok(!squareOut.includes('…'), 'squareYt productName must not carry an ellipsis when a whole-word fit exists');
+  assert.ok(squareOut.length <= squareCap, `squareYt fitted name still exceeds its cap: ${squareOut}`);
 });
 
 // ── H. Experimental proto presets (scoring pilot) ─────────────────────────
