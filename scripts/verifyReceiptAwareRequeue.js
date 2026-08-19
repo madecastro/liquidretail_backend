@@ -122,15 +122,28 @@ function guardsBothReceipts(block) {
 // worker.js also resets DetectRun `processing` -> `queued`, which matched the
 // naive search and made these checks assert against the wrong query entirely —
 // they failed while the real Ad guard was present and correct.
+//
+// TWO anchor shapes, added 2026-08-19 alongside the undispatched-tail fix
+// (services/adArchiveDigest.js, "THE UNDISPATCHED-TAIL GAP"). Both worker.js's
+// reaper and processAlerts.js's SIGTERM handler moved from a bare
+// `{ $set: { status: 'queued', ... } }` to `buildRequeuePipeline({...})`, so
+// the literal `status: 'queued'` text no longer appears at either call site —
+// it lives inside that function, in a different file. The `receiptFree(...)`
+// FILTER (this function's whole reason to exist) is completely unchanged at
+// both sites, still the first argument to the SAME `updateMany(` call, so
+// once the block is found the receipt checks below still evaluate the real
+// guard, not a copy.
 function adRequeueBlock(src) {
-  let at = src.indexOf("$set: { status: 'queued'");
-  while (at >= 0) {
-    const from = src.lastIndexOf('updateMany(', at);
-    if (from >= 0) {
-      const block = src.slice(from, at + 60);
-      if (/status: 'rendering'/.test(block)) return block;   // ads only
+  for (const anchor of ["$set: { status: 'queued'", 'buildRequeuePipeline(']) {
+    let at = src.indexOf(anchor);
+    while (at >= 0) {
+      const from = src.lastIndexOf('updateMany(', at);
+      if (from >= 0) {
+        const block = src.slice(from, at + 60);
+        if (/status: 'rendering'/.test(block)) return block;   // ads only
+      }
+      at = src.indexOf(anchor, at + 1);
     }
-    at = src.indexOf("$set: { status: 'queued'", at + 1);
   }
   return '';
 }
@@ -210,26 +223,34 @@ function walkJs(dir) {
 }
 
 const offenders = [];
+// TWO anchor shapes — see adRequeueBlock's header for why. A bare
+// `{ $set: { status: 'queued', ... } }` still exists at every PRE_DISPATCH
+// site; `buildRequeuePipeline(` (adArchiveDigest.js) is the newer shape two
+// real routes/ads.js sites use since 2026-08-19, and X1 must stay able to see
+// BOTH or a future unguarded site in either shape ships invisible.
+const REQUEUE_ANCHORS = ["$set: { status: 'queued'", 'buildRequeuePipeline('];
 for (const dir of SCAN_DIRS) {
   for (const full of walkJs(dir)) {
     // Comment-stripped: a commented-out receiptFree( must not make an unguarded
     // rendering->queued write look guarded.
     const src = stripComments(fs.readFileSync(full, 'utf8'));
-    let idx = src.indexOf("$set: { status: 'queued'");
-    while (idx >= 0) {
-      const from = src.lastIndexOf('updateMany(', idx);
-      const block = from >= 0 ? src.slice(from, idx + 60) : '';
-      // Only writes that move ads OUT of `rendering` are money-relevant.
-      // ALLOWLIST: the claim-anomaly release takes a claim and hands it straight
-      // back BEFORE any render or submit, so no receipt can exist yet and an
-      // unconditional release is correct. Named, not silently skipped.
-      const near = src.slice(Math.max(0, from - 900), idx);
-      const isClaimAnomalyRelease = /CLAIM ANOMALY/.test(near);
-      if (block && /status: 'rendering'/.test(block)
-          && !guardsBothReceipts(block) && !isClaimAnomalyRelease) {
-        offenders.push(`${path.relative(ROOT, full)} (offset ${idx})`);
+    for (const anchor of REQUEUE_ANCHORS) {
+      let idx = src.indexOf(anchor);
+      while (idx >= 0) {
+        const from = src.lastIndexOf('updateMany(', idx);
+        const block = from >= 0 ? src.slice(from, idx + 60) : '';
+        // Only writes that move ads OUT of `rendering` are money-relevant.
+        // ALLOWLIST: the claim-anomaly release takes a claim and hands it straight
+        // back BEFORE any render or submit, so no receipt can exist yet and an
+        // unconditional release is correct. Named, not silently skipped.
+        const near = src.slice(Math.max(0, from - 900), idx);
+        const isClaimAnomalyRelease = /CLAIM ANOMALY/.test(near);
+        if (block && /status: 'rendering'/.test(block)
+            && !guardsBothReceipts(block) && !isClaimAnomalyRelease) {
+          offenders.push(`${path.relative(ROOT, full)} (offset ${idx})`);
+        }
+        idx = src.indexOf(anchor, idx + 1);
       }
-      idx = src.indexOf("$set: { status: 'queued'", idx + 1);
     }
   }
 }

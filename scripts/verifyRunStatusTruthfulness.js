@@ -276,7 +276,14 @@ await ok('D2 GET /runs/:runId actually CALLS summarizeInFlightStages and runFeed
 });
 
 await ok('D3 the queued-drain run-crash handler pushes a real errors[] entry on crash (mirrors the prep/render handler)', () => {
-  const block = sliceFrom("title: 'Campaign run crashed (queued drain)'", 1200);
+  // Span widened 1200→1600 (2026-08-19): the undispatched-tail fix
+  // (services/adArchiveDigest.js buildRequeuePipeline) added a few explanatory
+  // comment lines ahead of the Ad.updateMany in this same catch block, pushing
+  // the $push/errors text this check looks for a bit further from the anchor.
+  // A fixed span drifting stale the moment the handler grows is exactly the
+  // trap sliceHandler's own header documents; this callsite just hasn't been
+  // worth the dynamic-boundary rewrite yet, so give it real headroom instead.
+  const block = sliceFrom("title: 'Campaign run crashed (queued drain)'", 1600);
   assert.ok(block, 'could not locate the queued-drain crash alert block to scope this check');
   assert.match(block, /\$push:\s*\{\s*errors:/,
     'the CampaignRun.updateOne after a queued-drain crash must $push an errors[] entry — ' +

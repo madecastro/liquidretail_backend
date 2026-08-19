@@ -134,10 +134,17 @@ const WATCHDOG_INTERVAL_MIN = Math.max(1, parseInt(process.env.ALERT_WATCHDOG_IN
 const alerts = require('./services/alertService');
 // Receipt guard for every rendering->queued requeue — see services/spendReceipt.js.
 const { receiptFree, HAS_RECEIPT } = require('./services/spendReceipt');
-// Requeue marker — the reaper fires at an arbitrary point in a render, so a
-// billable submit may be in flight behind it. REQUEUE_MARK, never
-// PRE_DISPATCH. See the REQUEUE_SITES ledger in services/adArchiveDigest.js.
-const { REQUEUE_MARK } = require('./services/adArchiveDigest');
+// Requeue pipeline — the reaper fires at an arbitrary point in a render, so a
+// billable submit may be in flight behind it (REQUEUE_MARK's `wasRendering:
+// true`, never PRE_DISPATCH — see the REQUEUE_SITES ledger in
+// services/adArchiveDigest.js). buildRequeuePipeline stamps that marker AND
+// an honest renderStage breadcrumb on a row that never got dispatched — see
+// its header comment ("THE UNDISPATCHED-TAIL GAP") for why that is required
+// here specifically: this reap fires on a claimed ad the render loop's pool
+// never even reached, which carries no renderStage, and
+// services/strandedRunSweeper.js can never pick up a `queued` row with an
+// empty one.
+const { buildRequeuePipeline } = require('./services/adArchiveDigest');
 const { buildStalePreparingFilter, buildStaleRunningFilter, buildStaleRunningReapUpdate } = require('./services/campaignRunGuards');
 // Pure Slack-message builder for the preparing-reap notice below — see
 // services/slackRunVerbosity.js header (no Mongo/network at require-time).
@@ -300,9 +307,21 @@ async function reapOrphans() {
   // ALERT_RENDERING_STALE_MIN, and the receipt survives for a resume pass to
   // recover the asset for free. Requeuing would replace an untidy state with a
   // duplicate charge. Never trade money for tidiness here.
+  //
+  // buildRequeuePipeline (not a bare `$set`) is what closes the undispatched-
+  // tail gap (adArchiveDigest.js, "THE UNDISPATCHED-TAIL GAP"). This reap
+  // fires at an arbitrary point in a render — sometimes on a row the pool had
+  // already dispatched (which already carries a real `renderStage` from
+  // `adStage()`, and the `$ifNull` inside the pipeline leaves it alone), and
+  // sometimes on a row the render loop's pool never even reached before the
+  // process holding it died (which carries none). Both are stamped
+  // `wasRendering: true` exactly as the old REQUEUE_MARK spread did; the only
+  // change is that the second case no longer leaves `renderStage` empty, so
+  // it stops being permanently invisible to strandedRunSweeper's breadcrumb
+  // requirement.
   const ads = await Ad.updateMany(
     receiptFree({ status: 'rendering', updatedAt: { $lt: cutoff } }),
-    { $set: { status: 'queued', updatedAt: new Date(), ...REQUEUE_MARK } }
+    buildRequeuePipeline({ breadcrumb: 'reaped: claimed but never dispatched — run stalled for over ' + REAP_STALE_MIN + 'm' })
   );
 
   // Count what we deliberately did NOT requeue, so "why is this ad still

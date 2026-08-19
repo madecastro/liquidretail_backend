@@ -1325,16 +1325,30 @@ Video never launches a browser.
   `ALERT_RUN_SILENCE_MIN` (12m on `updatedAt`) can no longer fire for a run
   whose pool is busy — same shape `ALERT_RENDERING_STALE_MIN` has had since the
   Ad beat shipped. See `docs/ALERTING.md`.
-  **NOT FIXED BY THIS, and an operator must be told:** the 9 already-stranded
-  rows do **not** qualify for `services/strandedRunSweeper.js`. Its filter
-  requires a `renderStage` breadcrumb (`renderStage: { $nin: [null, ''] }`) to
-  separate "a deploy killed this" from "an operator has not pressed go yet",
-  and a claimed-but-never-dispatched ad has no stage — `REQUEUE_MARK` is
-  `{ wasRendering: true }` and does not add one. So they stay `queued` until
-  someone presses **Generate more** (`POST /api/ads/runs`), or
-  `queuedArchiveSweeper` parks them after `QUEUED_ARCHIVE_AFTER_H` (24). **Do
-  not widen the sweeper to reach them** — that is a money-adjacent change and
-  the breadcrumb requirement is what stops it draining ads nobody claimed.
+  **CLOSED 2026-08-19 — the undispatched tail is no longer permanently
+  invisible to `services/strandedRunSweeper.js`.** This bullet used to say the
+  9 already-stranded rows do NOT qualify for that sweeper because its
+  `renderStage` breadcrumb requirement (`{ $nin: [null, ''] }`) — the one
+  signal separating "a deploy killed this" from "an operator has not pressed
+  go yet" — is exactly what a claimed-but-never-dispatched ad lacks, since
+  `adStage()` only writes from inside a render attempt, never at claim time.
+  Measured across 14 real runs: 46 of 307 claimed ads (15%) sat exactly like
+  that. **The sweeper's filter is UNCHANGED and must stay that way** — the fix
+  is upstream, at the four REQUEUE_MARK sites (`worker.js` reaper,
+  `processAlerts.js` SIGTERM, both `/generate`/`/runs` crash catches in
+  `routes/ads.js`), which now call `buildRequeuePipeline`
+  (`services/adArchiveDigest.js`) instead of a bare `...REQUEUE_MARK` spread —
+  it stamps the same `wasRendering: true` marker PLUS an honest renderStage
+  breadcrumb whenever the row does not already have one, so the sweeper picks
+  it up on its own next tick with zero code changes to the sweeper itself. An
+  ad that already began rendering keeps its real, more specific stage — the
+  breadcrumb is `$cond`-guarded on "no stage yet", never a blind overwrite.
+  Pinned by `scripts/verifyArchiveDigestRelease.js` E16/E16a (behavioral +
+  per-site structural proof) and the widened `scripts/verifyReceiptAwareRequeue.js`
+  W/P/X1 scan (which needed teaching to recognize the new call shape — see that
+  file's `adRequeueBlock` header). Full incident narrative, the 9 real rows
+  measured in `run_1787136860887_654ed621`, and what remains open:
+  `session.d/2026-08-19_undispatched-tail-fix-stranded-ads-close-the-loop.md`.
 - **Stop parks the stopping RUN's own tail — not the campaign's
   (fixed 2026-08-18).** `routes/ads.js` ran
   `Ad.updateMany({ campaignId: run.campaignId, status:'queued' }, …archive…)`

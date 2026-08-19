@@ -292,6 +292,83 @@ const REQUEUE_SITES = Object.freeze([
 // nothing; a billed history is already recorded. That induction is exactly as
 // strong as the scan's completeness, which is why E14's self-probe matters.
 
+// ── THE UNDISPATCHED-TAIL GAP (closed 2026-08-19) ─────────────────────────
+//
+// `wasRendering: true` answers "may a submit sit behind this?" — it never
+// answered "did the render loop ever even LOOK at this row?", and the four
+// REQUEUE_MARK sites (both crash catches in routes/ads.js, the worker.js
+// reaper, and processAlerts.js's SIGTERM handler) all release a BATCH of
+// claimed ads in one `updateMany`/pipeline write with no per-row distinction.
+// A row the render loop's pool never reached (still sitting in
+// `pool.queue.slice(pool.next)` when the run died) carries no `renderStage` —
+// `adStage()` is the only writer of that field and it is called from INSIDE a
+// render attempt, never at claim time — so it was released looking IDENTICAL
+// to a fresh, never-claimed mint leftover: `status:'queued'`, `renderStage`
+// empty. `services/strandedRunSweeper.js` requires a `renderStage` breadcrumb
+// specifically to separate those two cases, so this population was invisible
+// to it BY DESIGN, forever — not a mint leftover waiting for an explicit
+// claim, but a genuinely claimed-and-abandoned row with no automatic path
+// back except an operator noticing and pressing "Generate more" (which,
+// measured across 14 real runs, was not happening: 46 of 307 claimed ads —
+// 15% — sat `queued` with no `renderStage` while every run that exceeded
+// `VEO_CONCURRENCY` in one wave reported itself "done" or "failed" as if
+// nothing were owed).
+//
+// THE FIX IS NOT TO WIDEN THE SWEEPER'S FILTER. `renderStage` presence stays
+// exactly what it always was: the one signal `buildStrandedAdFilter` trusts to
+// mean "this was not a fresh mint leftover". Widening it to accept an empty
+// stage would make the sweeper unable to tell the two populations apart ever
+// again — exactly the ambiguity it exists to avoid. Instead, every
+// REQUEUE_MARK site now writes an HONEST stage of its own, at the point of
+// release, so the ambiguity never reaches the sweeper's query at all:
+// `buildRequeueSetStage` stamps a breadcrumb describing WHY this row is back
+// in `queued` — but only when `renderStage` is CURRENTLY empty (`$ifNull`).
+// An ad that had already begun a render attempt (e.g. mid derive-wait,
+// `adStage()` already having written "derive-only: waiting for master …")
+// keeps that more specific, already-true note; only a row that was provably
+// never looked at gets the generic "claimed but never dispatched" stamp.
+// Either way, `queued` + empty `renderStage` becomes unreachable for a row
+// that ever passed through one of these four sites, and the EXISTING sweeper
+// — unmodified — picks it up on its next tick exactly as it already does for
+// every other `renderStage`-carrying stranded row. No new claim path, no new
+// double-bill surface: recovery still runs through `requeueStrandedAds` →
+// `claimAdsForRun`, the same atomic `status:'queued'` CAS every other caller
+// uses.
+function buildRequeueSetStage({ breadcrumb, now = new Date() } = {}) {
+  if (typeof breadcrumb !== 'string' || !breadcrumb.trim()) {
+    throw new Error('adArchiveDigest: buildRequeueSetStage needs a non-empty breadcrumb string');
+  }
+  return {
+    status:        { $literal: 'queued' },
+    updatedAt:     { $literal: now },
+    // Same marker every REQUEUE_MARK site has always spread — a submit may
+    // sit behind this release, so the archive-digest release must never see
+    // this row as provably pre-dispatch.
+    wasRendering:  { $literal: true },
+    // Never clobber a real, already-more-specific stage. "Empty" here is
+    // deliberately the SAME test services/strandedRunSweeper.js's own filter
+    // uses (`renderStage: { $nin: [null, ''] }`) — null/missing OR '' — not a
+    // bare `$ifNull`, which alone only substitutes on null/missing and would
+    // leave a legacy `renderStage: ''` row (still "no stage", by the
+    // sweeper's own definition) un-stamped and therefore still invisible to
+    // it. The CAS-lost PRE_DISPATCH release nulls renderStage on purpose and
+    // does not use this builder, so it never reaches this expression at all.
+    renderStage: {
+      $cond: [
+        { $eq: [{ $ifNull: ['$renderStage', ''] }, ''] },
+        { $literal: breadcrumb },
+        '$renderStage'
+      ]
+    },
+    renderStageAt: { $ifNull: ['$renderStageAt', { $literal: now }] }
+  };
+}
+
+/** Wrap the stage above as the one-stage pipeline `updateMany`/`updateOne` want. */
+function buildRequeuePipeline(opts) {
+  return [{ $set: buildRequeueSetStage(opts) }];
+}
+
 /**
  * Wrap caller-supplied values as aggregation LITERALS.
  *
@@ -544,6 +621,8 @@ module.exports = {
   REQUEUE_MARK,
   PRE_DISPATCH,
   REQUEUE_SITES,
+  buildRequeueSetStage,
+  buildRequeuePipeline,
   tombstoneFor,
   isTombstoneDigest,
   DIGEST_RELEASABLE,
