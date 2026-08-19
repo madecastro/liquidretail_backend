@@ -219,10 +219,47 @@ mongoose.connect(process.env.MONGODB_URI, {
   // First sweep after 90s (post-boot-reap, post-Mongo-connect) so a
   // crash-looping deploy surfaces wedged state quickly instead of waiting
   // out the first full interval.
+  // Singleton lease across worker instances. When the WORKER service
+  // scales horizontally (Render min>1) every instance boots this file
+  // and, before this lease, every instance also fired its own
+  // startScheduler() + runWatchdog() timers. That doubles paid Apify
+  // demo syncs (via credential.lastCatalogSyncAt races) and Slack
+  // alerts. The lease pins scheduler+watchdog to a single elected
+  // instance; other instances just run the DetectRun/Job loops.
+  //
+  // A single lease covers BOTH scheduler and watchdog — they are
+  // low-frequency housekeeping and there's no reason to run them on
+  // different instances. If a leader dies mid-heartbeat, the lease
+  // expires after ttlMs (90s default) and another worker takes over.
+  const { createSingletonLease } = require('./services/singletonLease');
+  const housekeepingLease = createSingletonLease('worker-housekeeping', {
+    ttlMs: 90_000,
+    heartbeatMs: 30_000
+  });
+  const isLeader = await housekeepingLease.acquire();
+  if (isLeader) housekeepingLease.startHeartbeat();
+  console.log(`🎫 housekeeping lease: ${isLeader ? 'ACQUIRED' : 'held by another instance'} (id=${housekeepingLease.INSTANCE_ID})`);
+
   const { runWatchdog } = require('./services/backlogWatchdog');
-  const watchdogTick = () => runWatchdog().catch(err => console.warn(`⚠️  watchdog failed: ${err.message}`));
+  const watchdogTick = () => {
+    if (!housekeepingLease.holds()) return;
+    return runWatchdog().catch(err => console.warn(`⚠️  watchdog failed: ${err.message}`));
+  };
   setTimeout(watchdogTick, 90 * 1000);
   setInterval(watchdogTick, WATCHDOG_INTERVAL_MIN * 60 * 1000);
+
+  // Non-leaders re-check every 60s in case the leader died and we can take over.
+  if (!isLeader) {
+    setInterval(async () => {
+      if (housekeepingLease.holds()) return;
+      const took = await housekeepingLease.acquire();
+      if (took) {
+        housekeepingLease.startHeartbeat();
+        console.log('🎫 housekeeping lease: acquired after leader change — starting scheduler + watchdog');
+        startScheduler();
+      }
+    }, 60_000);
+  }
 
   // QUEUED-LEFTOVER ARCHIVE — park mint leftovers so a later Generate cannot
   // claim and bill them. WORKER, not web: this sweep never renders (no
@@ -254,7 +291,11 @@ mongoose.connect(process.env.MONGODB_URI, {
   // Scheduled IG sync — independent timer so it doesn't compete with
   // the queue loop for cycles. Catalog daily, posts hourly per Brand
   // settings; cap-aware DetectRun enqueueing.
-  startScheduler();
+  //
+  // Gated on the housekeeping lease so exactly one worker instance runs
+  // it. The non-leader re-check loop above will call startScheduler()
+  // if a leader change happens later.
+  if (isLeader) startScheduler();
 }).catch(err => console.error('MongoDB error:', err));
 
 // Sweep for orphaned in-flight docs. Cheap (3 indexed updateMany calls);
