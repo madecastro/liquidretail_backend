@@ -2002,7 +2002,16 @@ async function submitEditImageWithSeedFallback({
   // cascade of the product's other catalog images, capped and excluding
   // anything already queued or known-blocked.
   const candidateIds = [];
-  if (resolvedMediaId && resolvedMediaId !== primaryMediaId) candidateIds.push(resolvedMediaId);
+  // `resolvedMediaId` and `knownBlocked` are NOT mutually exclusive: a
+  // concurrent creative for the same product can race this read, discover a
+  // DIFFERENT good seed, and record it as resolved AFTER another creative
+  // already recorded this exact id as blocked (Atlas's classifier is not
+  // perfectly deterministic — see moderationSeedFallback.js's header). Skip a
+  // resolvedMediaId this run also knows is blocked rather than wasting the
+  // first attempt on a candidate already proven bad.
+  if (resolvedMediaId && resolvedMediaId !== primaryMediaId && !knownBlocked.has(resolvedMediaId)) {
+    candidateIds.push(resolvedMediaId);
+  }
   if (primaryMediaId && !knownBlocked.has(primaryMediaId)) candidateIds.push(primaryMediaId);
   const exclude = new Set([primaryMediaId, resolvedMediaId, ...knownBlocked, ...candidateIds].filter(Boolean));
   candidateIds.push(...moderationSeedFallback.nextCandidateIds(resolvedProduct, { excludeMediaIds: [...exclude] }));
