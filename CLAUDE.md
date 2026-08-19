@@ -886,8 +886,24 @@ Video never launches a browser.
   (3 concepts × statics + 2 masters; was planned ~$2.6). See `session.md`.
 - **~1-in-3 static ads** render a competitor-shaped brand mark on the product
   (e.g. tree emblem reading as Timberland on an Allbirds shoe). Prompts already
-  ask for fidelity — fix is measure-and-reject, not prompt tuning. Video path
-  not QC'd on this. **STILL OPEN after the 2026-08-03 prompt hardening — that
+  ask for fidelity — fix is measure-and-reject, not prompt tuning. **Video path
+  is now QC'd too (2026-08-19)** — `adVisionQcService.runVideoPostRenderQc`,
+  wired at the single choke point every video ad's `renderUrl` gets stamped
+  through (`brandScriptExecutor.uploadRenderAndStamp` /
+  `runVideoVisionQcForAd`). Samples 3 frames (quartile) from the delivered
+  clip via the previously-unused `videoFrameService.buildFrameUrls` and
+  compares them + the seed product photo in one vision call, same 4
+  categories/model/PASS_FLOOR as static. Live-verified against the actual
+  Bone Denim jacket rendered as light-blue denim with a garbled woven brand
+  label (run `run_1787136860887_654ed621`) — caught both defects
+  (`product_fidelity=0`, `competitor_marks=2`) — and against a known-good
+  Allbirds video as a negative control (passed, 10/10/7/10). **Never
+  regenerates and never fails the ad** (the master is already paid ~$0.90 and
+  the defect is baked into the clip) — it flags via the same `Ad.visionQc` /
+  `summarizeVisionQc` surfacing statics use, plus the full per-category detail
+  now also posts to the run-feed Slack thread on PASS (not just FAIL — owner
+  request 2026-08-19). See `session.d/2026-08-19_video-vision-qc.md`.
+  **STILL OPEN after the 2026-08-03 prompt hardening — that
   hardening is owner-directed work on top of this note, NOT a fix for it, and it
   has no measured effect on this defect yet.** The static prompt now opens with a
   long `PRODUCT_FIDELITY` block (`staticAdIntents.js`) covering source-of-truth,
