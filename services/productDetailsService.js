@@ -24,6 +24,7 @@
 
 const axios = require('axios');
 const CatalogProduct = require('../models/CatalogProduct');
+const { shouldFillImageUrl } = require('./catalogImageQuality');
 
 const ENDPOINT = 'https://serpapi.com/search.json';
 const COUNTRY  = process.env.SERPAPI_COUNTRY || 'us';
@@ -232,7 +233,18 @@ async function writeThroughToCatalogProduct(catalogProductId, fetched) {
   // Fill commerce gaps only — never overwrite curated / on-page brand data
   if (cp.rating == null && fetched.rating != null) setOps.rating = fetched.rating;
   if (!cp.description && fetched.description) setOps.description = fetched.description;
-  if (!cp.imageUrl    && fetched.thumbnail)   setOps.imageUrl    = fetched.thumbnail;
+  // 2026-08-18 fix: `fetched.thumbnail` can be a Google Shopping / Lens
+  // thumbnail (SerpAPI `google_shopping` top result, or a Lens match via
+  // productReasoner.js) served from gstatic's encrypted-tbn CDN — a tiny
+  // proxy image that does not load as a normal <img> (measured live:
+  // naturalWidth/naturalHeight = 0). Gap-filling imageUrl with one made a
+  // detect-identified row LOOK generation-ready (materializeImage then
+  // mirrors it and stamps imageMediaId) when it never actually was.
+  // shouldFillImageUrl keeps the existing "never overwrite a real image"
+  // rule and adds the one new rule: don't fill the gap with a known-broken
+  // thumbnail either — an honestly-empty imageUrl is what the picker's
+  // seedUnusable flag (routes/catalog.js) is built to surface correctly.
+  if (shouldFillImageUrl(cp.imageUrl, fetched.thumbnail)) setOps.imageUrl = fetched.thumbnail;
   if (cp.price == null && typeof fetched.price?.value === 'number') {
     setOps.price    = fetched.price.value;
     setOps.currency = fetched.price.currency || 'USD';
@@ -363,4 +375,12 @@ async function serp(params) {
   return res.data;
 }
 
-module.exports = { fetchProductDetails, isEnabled };
+module.exports = {
+  fetchProductDetails,
+  isEnabled,
+  // Exported for offline harnesses (scripts/verifyCatalogImageSeedSafety.js)
+  // — not a new public API. Lets the harness EXECUTE the real write-through
+  // decision (stubbed CatalogProduct.findById/updateOne) instead of asserting
+  // over source text.
+  writeThroughToCatalogProduct
+};

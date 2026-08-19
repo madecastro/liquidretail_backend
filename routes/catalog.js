@@ -32,6 +32,7 @@ const Campaign              = require('../models/Campaign');
 const { loadPhotorealUrlMap, loadUseImageRefMap } = require('../services/adDisplayUrlService');
 const { AD_RECENCY_EXPR } = require('../services/adRecencyService');
 const catalogProductPromoteService = require('../services/catalogProductPromoteService');
+const { catalogSeedFields } = require('../services/catalogImageQuality');
 const { tenantFilter, assertMediaInTenant } = require('../middleware/tenantHelpers');
 void assertMediaInTenant;     // kept for future :id verification helpers
 
@@ -98,6 +99,14 @@ function projectListRow(p, matchCount) {
     currency:     p.currency     || null,
     availability: p.availability || null,
     imageUrl:     p.imageUrl     || null,
+    // 2026-08-18 — make the picker HONEST instead of silently accepting a
+    // dead seed. `seedUnusable`/`seedIssue` are computed straight from the
+    // raw imageUrl (services/catalogImageQuality.js), independent of
+    // imageMediaId — a pending-detect row (real imageUrl, imageMediaId not
+    // materialized yet) must NOT be conflated with a permanently-unusable
+    // one (missing entirely, or a Google Shopping/Lens thumbnail that never
+    // loads). `seedIssue` is 'missing' | 'thumbnail-only' | null.
+    ...catalogSeedFields(p.imageUrl),
     // Hero + alts. URLs are the raw source-CDN strings; *MediaId fields
     // point at the wrapped Cloudinary-mirrored catalog-product Media
     // docs. Both surfaced so the Generate Ads wizard's brand-kind
@@ -222,7 +231,11 @@ router.get('/', async (req, res) => {
     }
     if (req.query.q) {
       const re = new RegExp(escapeRegex(String(req.query.q)), 'i');
-      filter.$or = [{ title: re }, { description: re }];
+      // 2026-08-18 — added externalId/retailerId (merchant SKU) so an
+      // operator can actually reach a specific SKU in a large catalog by
+      // typing its code, not just words from the title/description. This
+      // is the picker's only search affordance — see Step2Picker.tsx.
+      filter.$or = [{ title: re }, { description: re }, { externalId: re }, { retailerId: re }];
     }
     if (req.query.inStock === '1') filter.availability = /in stock/i;
     if (req.query.hasReviews === '1') filter['productReviews.quotes.0'] = { $exists: true };
@@ -246,6 +259,22 @@ router.get('/', async (req, res) => {
     }
     if (typeof aggFilter.advertiserId === 'string' && mongoose.Types.ObjectId.isValid(aggFilter.advertiserId)) {
       aggFilter.advertiserId = new mongoose.Types.ObjectId(aggFilter.advertiserId);
+    }
+    // 2026-08-18 fix — same string/ObjectId cast trap as brandId/advertiserId
+    // above, but for the `?ids=` batch-hydration filter. aggregate()'s raw
+    // $match never auto-casts, so `_id: { $in: [<string ids>] }` matched
+    // ZERO rows here even though countDocuments(filter) (which DOES use
+    // find()-style schema casting) reported the correct `total`. Silent
+    // empty result: `res.products` came back `[]` while `total` said 1.
+    // This is exactly the mechanism Step2Picker.tsx's pre-selected-id
+    // hydration depends on (a deep link from the Catalog Browser / Media
+    // Library, or a campaign's pinned products, landing on a product
+    // outside the picker's current page) — so it was silently failing
+    // whenever the pinned/deep-linked id wasn't already in the first page.
+    if (aggFilter._id && Array.isArray(aggFilter._id.$in)) {
+      aggFilter._id = { $in: aggFilter._id.$in
+        .filter(id => mongoose.Types.ObjectId.isValid(id))
+        .map(id => new mongoose.Types.ObjectId(id)) };
     }
 
     const [rows, total, distinctCategories, totalDrafts] = await Promise.all([
@@ -1031,6 +1060,20 @@ router.patch('/:id', express.json(), async (req, res) => {
         continue;
       }
       if (k === 'draft') { updates.draft = !!v; continue; }
+      // imageUrl/productUrl: coerce blank/whitespace-only to null so an
+      // empty-string edit can't persist. `v ?? null` below (the generic
+      // fallthrough) does NOT do this — `?? ` only replaces null/undefined,
+      // not '' — and this was the only writer in the whole backend that
+      // could leave `CatalogProduct.imageUrl: ''` on a row (every ingest
+      // path already coerces blank → null). An empty string still reads as
+      // "no image" everywhere downstream, so this closes the gap without
+      // changing any other behavior. See services/catalogImageQuality.js —
+      // the picker's seedUnusable flag treats '' and null identically
+      // regardless, but a real null is the honest representation.
+      if ((k === 'imageUrl' || k === 'productUrl') && typeof v === 'string' && v.trim() === '') {
+        updates[k] = null;
+        continue;
+      }
       // Per-product video model / reference-count overrides. Validate
       // slugs against the model registry at write time; null clears.
       if (k === 'videoSettings') {
