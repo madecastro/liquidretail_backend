@@ -347,31 +347,56 @@ check('F4 flag ON: the prompt demands a source and bans inventing one', () => {
   });
 });
 
-check('F5 BOTH pass-2 call sites use the SHARED builders, not a re-implemented literal', () => {
-  // stripComments so a mutation that deletes the real call but leaves a
-  // matching comment cannot pass this by accident. Exclude the `function
-  // name() {` declaration line itself — it also matches `name()` textually.
-  const calls = (codeOnly.match(/(?<!function )ratingsItemRequiredKeys\(\)/g) || []).length;
+check('F5 pass-2 (json_structure) is a SINGLE shared implementation, not two, and still asks for provenance', () => {
+  // UPDATED 2026-08-19 — pass 2 of lookupBrandReviews / lookupProductReviews
+  // moved off the direct Gemini REST transport onto Atlas
+  // (structureReviewNarrative, one function, called from both). Two
+  // call sites collapsing to one shared helper is a STRENGTHENING of "shared
+  // builder, not a re-implemented literal" — the schema/prompt genuinely
+  // cannot drift between brand and product now, because there is only one
+  // copy. `ratingsProvenanceAskSentence()` is still the flag's mechanism
+  // (the PROMPT ask); with only one caller of the shared helper's body, it
+  // now has exactly ONE call site in source, not two.
   const asks = (codeOnly.match(/(?<!function )ratingsProvenanceAskSentence\(\)/g) || []).length;
-  assert.strictEqual(calls, 2, `expected 2 call sites (brand + product reviews), got ${calls}`);
-  assert.strictEqual(asks, 2, `expected 2 call sites (brand + product reviews), got ${asks}`);
-  // And no site re-implements its own inline required array or ask sentence —
-  // that duplication is exactly what let the two prompts drift before.
-  assert.ok(!/required:\s*\['rating',\s*'source'\]/.test(codeOnly),
-    'a call site still hardcodes the required array instead of using the builder');
+  assert.strictEqual(asks, 1, `expected 1 call site (the shared structureReviewNarrative helper), got ${asks}`);
+  assert.strictEqual((codeOnly.match(/structureReviewNarrative\(/g) || []).length, 3,
+    'expected 1 declaration + 2 call sites (brand + product reviews)');
+  // `ratingsItemRequiredKeys()` is INTENTIONALLY unused now — see F6b. Assert
+  // that deliberately, so a future re-introduction is a decision, not a
+  // silent revert of this comment's claim.
+  assert.strictEqual((codeOnly.match(/(?<!function )ratingsItemRequiredKeys\(\)/g) || []).length, 0,
+    'ratingsItemRequiredKeys() should have no call sites — see F6b for why');
 });
 
-check('F6 source stays nullable in BOTH ratings schema blocks (do not force a name)', () => {
-  const blocks = src.match(/ratings: \{[\s\S]*?\n              \},/g) || [];
-  assert.strictEqual(blocks.length, 2, `expected 2 ratings schema blocks, got ${blocks.length}`);
-  for (const b of blocks) {
-    assert.ok(/source:\s*\{ type: 'string', nullable: true \}/.test(b),
-      'source must stay nullable — a forced string makes the model invent a site');
-    assert.ok(!/source:\s*\{ type: 'string' \}/.test(b),
-      'a non-nullable source slipped in');
-    assert.ok(/required:\s*requiredRatingItemKeys/.test(b),
-      'the schema item must use the shared builder, not a literal');
-  }
+check('F6a source stays nullable in the (now single, shared) ratings schema (do not force a name)', () => {
+  const idx = src.indexOf('ratings: {');
+  assert.notStrictEqual(idx, -1, 'expected the REVIEWS_STRUCTURE_SCHEMA ratings block');
+  // Exactly one such block should exist now that pass 2 is a single shared
+  // helper (structureReviewNarrative) instead of two duplicated literals.
+  assert.strictEqual(src.indexOf('ratings: {', idx + 1), -1,
+    'expected exactly ONE ratings schema block now that pass 2 is shared, not two');
+  const block = src.slice(idx, idx + 400);
+  assert.ok(/source:\s*\{ type: \['string', 'null'\] \}/.test(block),
+    'source must stay nullable — a forced non-nullable string makes the model invent a site');
+  assert.ok(/rating:\s*\{ type: 'number' \}/.test(block),
+    'rating itself must stay non-nullable — an entry with no number is not an aggregate');
+});
+
+check('F6b RATING_REQUIRE_PROVENANCE no longer gates the SCHEMA, only the PROMPT — by design, not by omission', () => {
+  // OpenAI's strict json_schema mode (additionalProperties:false) requires
+  // EVERY property key to be present in `required`, with nullability
+  // expressed via `type:[T,'null']` instead of omission from `required`.
+  // Gemini's native responseSchema could vary whether `source` was even a
+  // required KEY based on the flag; strict mode cannot express that
+  // distinction, so `source` is unconditionally required-but-nullable now.
+  // This must be a comment-documented decision, not a silent regression —
+  // assert the comment explaining it is still present.
+  assert.ok(/ONE CONSEQUENCE WORTH STATING/.test(src),
+    'the schema-vs-prompt flag-scope-narrowing decision must stay documented in source');
+  // The prompt-level ask is what remains: assert it is still reachable and
+  // still flag-gated (tested behaviourally in section F above via the
+  // exported ratingsProvenanceAskSentence(), not re-tested here).
+  assert.ok(/ratingsProvenanceAskSentence\(\)/.test(src));
 });
 
 check('F7 helper defaults OFF and is read at call time (not module load)', () => {

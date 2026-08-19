@@ -179,11 +179,20 @@ check('C2 cap is >= 8 and env-tunable, rejecting junk', () => {
   assert.ok(/Number\.isInteger\(n\)/.test(provSrc), 'cap must require an integer');
   assert.ok(/n <= 40/.test(provSrc), 'cap must have an upper bound');
 });
-check('C3 the stage tag survives pass 2 (both schemas carry it)', () => {
-  const schemaHits = (provSrc.match(/stage:\s*\{\s*type:\s*'string',\s*nullable:\s*true\s*\}/g) || []).length;
-  assert.strictEqual(schemaHits, 2, `both brand+product JSON schemas must carry stage, found ${schemaHits}`);
+check('C3 the stage tag survives pass 2 (the shared schema+prompt carry it)', () => {
+  // UPDATED 2026-08-19: pass 2 of brand+product reviews moved off the
+  // Gemini-native responseSchema (`nullable: true`) onto a SINGLE shared
+  // OpenAI-strict schema (`structureReviewNarrative` /
+  // REVIEWS_STRUCTURE_SCHEMA), used by both lookups instead of one literal
+  // copy each. "Carries it once, used twice" is a strictly stronger
+  // guarantee against drift than "carries it twice, hopefully identically" —
+  // update the count, keep the intent.
+  const schemaHits = (provSrc.match(/stage:\s*\{\s*type:\s*\['string',\s*'null'\]/g) || []).length;
+  assert.strictEqual(schemaHits, 1, `the shared JSON schema must carry stage, found ${schemaHits}`);
   const hintHits = (provSrc.match(/"stage":\s*"awareness\|consideration\|conversion\|retention\|conquest/g) || []).length;
-  assert.strictEqual(hintHits, 2, `both prompt shape hints must ask for stage, found ${hintHits}`);
+  assert.strictEqual(hintHits, 1, `the shared prompt shape hint must ask for stage, found ${hintHits}`);
+  assert.strictEqual((provSrc.match(/structureReviewNarrative\(/g) || []).length, 3,
+    'expected 1 declaration + 2 call sites (brand + product reviews) sharing that one schema/prompt');
   // Category pass 2 dropped stage entirely, so its labels never persisted.
   assert.ok(/"stage":/.test(catSrc), 'category pass-2 shape must carry stage or the label is discarded');
 });
@@ -205,8 +214,11 @@ check('F1 every path drops quotes not verbatim in the grounded narrative', () =>
     'substring enforcement missing');
 });
 check('F2 pass 2 restates the substring rule (it is a separate generation)', () => {
+  // UPDATED 2026-08-19: one shared prompt template (structureReviewNarrative)
+  // now serves both lookups, so the literal restatement appears once in
+  // source rather than twice — it still reaches both call sites at runtime.
   const restated = (provSrc.match(/verbatim substring of the narrative/g) || []).length;
-  assert.ok(restated >= 2, `brand+product pass 2 must restate the rule, found ${restated}`);
+  assert.ok(restated >= 1, `pass 2's shared prompt must restate the rule, found ${restated}`);
   assert.ok(!/Use direct quotes verbatim from the narrative; do NOT paraphrase or invent/.test(provSrc),
     'the weaker pre-change pass-2 wording is still present');
 });
@@ -857,40 +869,51 @@ check('N8 the picker is WIRED into both lookups, and nothing takes the raw value
   assert.ok(!/rating:\s+typeof parsed\.rating === 'number' \? parsed\.rating : null/.test(code),
     'the un-ranked single value is back — order-dependence returns with it');
 });
-check('N10 the ratings array is REQUIRED in the pass-2 schema, on both lookups', () => {
+check('N10 the ratings array is REQUIRED in the (now single, shared) pass-2 schema', () => {
   // THE BUG THIS PINS, measured live. Declared merely optional, Gemini structured
   // output silently DID NOT EMIT `ratings` — pass 1 wrote all four aggregates
   // ("Vuoriclothing.com: 4.58 from 15,626", "Trustpilot: 2.3 from 126", …), pass 2 read
   // them, and the schema dropped every one. The brand came back with NO rating and the
   // picker had nothing to rank, which looked exactly like "the web didn't say".
   // Verified both ways against the live API: optional → none, required → all four.
+  //
+  // UPDATED 2026-08-19: pass 2 is now ONE shared OpenAI-strict schema
+  // (REVIEWS_STRUCTURE_SCHEMA / structureReviewNarrative), not two literal
+  // copies, so `ratings` is required exactly ONCE in source now — used by
+  // both lookups. OpenAI's strict mode also requires every OTHER top-level
+  // key (`rating`, `reviewCount`, `summary`) to appear in the same array,
+  // which is a stricter contract than the old Gemini-native
+  // `required: ['quotes', 'ratings']`, not a weaker one.
   const code = stripComments(provSrc);
-  const required = code.match(/required: \['quotes', 'ratings'\]/g) || [];
-  assert.strictEqual(required.length, 2,
-    'both the brand and product pass-2 schemas must REQUIRE ratings, or the model omits it');
-  // Optional-and-nullable is the exact shape that failed; make its return visible.
-  const blocks = code.match(/ratings: \{[\s\S]*?\n              \},/g) || [];
-  assert.strictEqual(blocks.length, 2, 'expected a ratings schema block in each lookup');
-  for (const b of blocks) {
-    assert.ok(!/nullable: true/.test(b.split('items:')[0]),
-      'the ratings ARRAY must not be nullable — an empty array is how "none found" is said');
-    // RATING_REQUIRE_PROVENANCE (2026-08-12): whether `source` joins `rating`
-    // in the entry's required keys is now FLAG-GATED via a shared builder —
-    // ratingsItemRequiredKeys() — not a source-text literal, precisely so
-    // flag-off asks Gemini for nothing new (see verifyRatingProvenance.js F1/F3,
-    // the harness that owns the flag's on/off behaviour). This file only pins
-    // that BOTH schema items delegate to the same builder rather than each
-    // re-implementing its own required array (that drift is what let the two
-    // pass-2 prompts disagree before).
-    assert.ok(/required:\s*requiredRatingItemKeys/.test(b),
-      'each ratings item must require rating via the shared, flag-gated builder — see ratingsItemRequiredKeys()');
-    // REQUIRED and NON-NULLABLE are different guarantees, and only asserting the first
-    // let a mutation adding `nullable: true` here pass: the model would then satisfy
-    // the schema with {source:'BBB', rating:null}, which is not an aggregate at all and
-    // which the picker has to filter out downstream. Say it at the schema instead.
-    assert.ok(/rating:\s*\{ type: 'number' \}/.test(b),
-      "the entry's rating must be a plain non-nullable number");
-  }
+  const required = code.match(/required:\s*\['quotes',\s*'ratings',\s*'rating',\s*'reviewCount',\s*'summary'\]/g) || [];
+  assert.strictEqual(required.length, 1,
+    'the shared pass-2 schema must REQUIRE ratings (among the other top-level keys), or the model omits it');
+
+  const idx = code.indexOf('ratings: {');
+  assert.notStrictEqual(idx, -1, 'expected the ratings schema block');
+  assert.strictEqual(code.indexOf('ratings: {', idx + 1), -1,
+    'expected exactly ONE ratings schema block now that pass 2 is shared, not two');
+  const b = code.slice(idx, idx + 400);
+  assert.ok(!/nullable: true/.test(b.split('items:')[0]),
+    'the ratings ARRAY must not be nullable — an empty array is how "none found" is said');
+  // RATING_REQUIRE_PROVENANCE (2026-08-12) used to flip whether `source`
+  // joined `rating` in the entry's required keys via a shared, flag-gated
+  // builder (ratingsItemRequiredKeys()). OpenAI's strict json_schema mode
+  // requires EVERY property key present regardless (nullability is how
+  // "may be absent" is expressed instead — see the "ONE CONSEQUENCE WORTH
+  // STATING" comment above REVIEWS_STRUCTURE_SCHEMA), so `source` is now
+  // unconditionally required-but-nullable and the flag's only remaining
+  // lever is the PROMPT ask (verifyRatingProvenance.js section F, F6b).
+  assert.ok(/required:\s*\['source',\s*'rating',\s*'reviewCount'\]/.test(b),
+    "each ratings item must require source/rating/reviewCount (nullability, not omission, expresses optionality)");
+  assert.ok(/source:\s*\{ type: \['string', 'null'\] \}/.test(b),
+    'source must stay nullable — forcing a non-null string makes the model invent a site');
+  // REQUIRED and NON-NULLABLE are different guarantees, and only asserting the first
+  // let a mutation adding a nullable rating pass: the model would then satisfy
+  // the schema with {source:'BBB', rating:null}, which is not an aggregate at all and
+  // which the picker has to filter out downstream. Say it at the schema instead.
+  assert.ok(/rating:\s*\{ type: 'number' \}/.test(b),
+    "the entry's rating must be a plain non-nullable number");
 });
 check('N9 pass 1 asks for EVERY aggregate and forbids pre-picking', () => {
   for (const [name, region] of [

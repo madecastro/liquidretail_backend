@@ -1495,16 +1495,14 @@ function normalizeForMatch(s) {
     .trim();
 }
 
-// Wrappers around the gemini provider helpers — soft-fail so an
+// Wrapper around the gemini provider helper — soft-fail so an
 // outcome resolution always returns a usable shape even if grounded
 // search hiccups.
-async function tryLookupBrandCategoryUrl(args) {
-  try { return await geminiSearch.lookupBrandCategoryUrl(args); }
-  catch (err) {
-    console.warn(`   ⚠️  brand-category lookup failed: ${err.message}`);
-    return null;
-  }
-}
+//
+// `tryLookupBrandCategoryUrl` (wrapping the now-deleted
+// `geminiSearch.lookupBrandCategoryUrl`) was removed 2026-08-19 — confirmed
+// zero call sites of its own anywhere in the codebase. See the removal note
+// in services/providers/geminiSearchProvider.js.
 async function tryLookupBrandReviews(brandName, brandUrl, brandId = null) {
   try { return await geminiSearch.lookupBrandReviews({ brandName, brandUrl, brandId }); }
   catch (err) {

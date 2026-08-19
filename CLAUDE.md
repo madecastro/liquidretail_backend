@@ -1574,9 +1574,82 @@ Full detail in `docs/ATLAS.md` §7 and `docs/CLOUDINARY-VIDEO.md`. Headlines:
   `(atlasLlmConfigured() || !!process.env.OPENAI_API_KEY)`. **Not the same as
   `wantBrandReviews`:** `geminiSearchProvider` calls Google's grounded-search
   endpoint directly with `GEMINI_API_KEY` and is deliberately *not* behind
-  `atlasLlmService` (Atlas does not proxy grounded retrieval), so gating that tier
-  on its own key is correct. Before "fixing" a key gate, read which client the tier
-  actually calls.
+  `atlasLlmService` for its GROUNDED calls — Atlas genuinely cannot proxy
+  grounded retrieval, now PROVEN rather than asserted, see the dated bullet
+  below — so gating that tier on its own key is correct. Before "fixing" a
+  key gate, read which client the tier actually calls.
+- **THE LAST DIRECT-GEMINI PATH, SWEPT AND PARTIALLY REWIRED (2026-08-19).**
+  A 24h CostLog slice showed one direct-`GEMINI_API_KEY` path left:
+  `provider=gemini, model=gemini-2.5-flash, stage=brand_reviews`. It turned
+  out to be TWO calls sharing a stage name — pass 1 (grounded Google Search
+  retrieval) and pass 2 (plain narrative→JSON structuring, never grounded) —
+  and the fix treats them differently, on purpose.
+  **Grounding is PROVEN unavailable on Atlas, not merely asserted.** Four
+  live, single-shot probes against `POST
+  https://api.atlascloud.ai/v1/chat/completions`,
+  `model: 'google/gemini-2.5-flash'`: (1) plain call, no tools → 200,
+  answers "I cannot determine today's date without a live tool" — confirms
+  no grounding by default, even though Atlas demonstrably calls the real
+  Gemini backend (`usage.billing_usage.gemini_usage_metadata.source ===
+  'gemini_chat'`); (2) Gemini's own native `tools: [{ google_search: {} }]`
+  → **HTTP 400** `{"code":400,"msg":"bad request"}`; (3) OpenAI's newer
+  built-in `tools: [{ type: 'web_search' }]` → also **HTTP 400**; (4)
+  top-level `web_search: true` (mirroring the convention Atlas documents for
+  `bytedance/seedance-2.0` VIDEO, in case an LLM model shared it) → 200 but
+  **SILENTLY IGNORED** (`toolUsePromptTokenCount: 0`, identical
+  no-real-time-access answer). The model catalog lists no customer-reachable
+  surface beyond `openai.chat.completions` for this model either — the
+  `gemini.generate` protocol tag it also carries is not a documented or
+  reachable endpoint (three guessed URLs for it all 404'd live). Full
+  evidence lives in the **ATLAS GROUNDING PROBE** comment in
+  `services/providers/geminiSearchProvider.js`, above `MODEL`/`ENDPOINT`.
+  **So pass 1 (and `match()`, and `lookupBrandCategoryUrl` before it was
+  deleted, and `categoryReviewsService` / `productDetailsService.
+  fetchReviewSummary`, still open) correctly stay on the direct key — do
+  not "fix" this without a FRESH live probe, Atlas's catalog changes.**
+  **Pass 2 has no such restriction and is now Atlas-routed** —
+  `atlasLlmService.chatCompletion`, role `gemini-2.5-flash` → Atlas
+  `google/gemini-2.5-flash` (same model as pass 1, deliberately — see the
+  model-choice comment on `structureReviewNarrative`; pricing is identical
+  either way, verified live against `GET /api/v1/models`, so there is no
+  cost argument for a cheaper/different model here). **Measured live, one
+  real call (Allbirds brand reviews):** pass 1 stayed
+  `provider:'gemini'`, `$0.037357`; pass 2 flipped to `provider:'atlas',
+  model:'google/gemini-2.5-flash'`, `$0.009403`. **Honest sizing, from a
+  real 7-day CostLog query, so this is not oversold:** pass 2 is only
+  **4.5%** of direct-gemini spend in that window ($0.0548 of $1.2072 over
+  7 days, 28 of 59 calls) — the fix is real and correctly scoped, but it is
+  an architecture/observability win (one fewer direct-key dependency, and
+  `match()` — below — closing a real blind spot), not a meaningful dollar
+  saving; pass 1's grounding requirement is the overwhelming majority of
+  the spend and cannot move.
+  **`geminiSearchProvider.match()` (every UGC/IG detect with a key) was
+  billing Google and writing ZERO CostLog rows — now ledgered** (routed
+  through the same `trackedGenerate` helper as brand/product reviews pass
+  1, stage `gemini_product_match`), staying on the direct key because it
+  is also genuinely grounded. Measured live: one real call, `$0.038263`,
+  now visible where before it was invisible spend.
+  **`lookupBrandCategoryUrl` DELETED, not rewired** — confirmed dead (its
+  only caller, `productMatchService.tryLookupBrandCategoryUrl`, itself had
+  zero call sites anywhere in the codebase); category breadcrumbs go
+  through `productCategory.enrichProductCategory` instead.
+  **Still open, NOT touched by this pass, real and unledgered by the same
+  trace:** `categoryReviewsService` and `productDetailsService.
+  fetchReviewSummary` both still POST the raw direct endpoint with no
+  `trackLlmCall`. Both are genuinely grounded, so — like `match()` — the
+  fix there is "wrap in a ledgered transport", not "move to Atlas".
+  Everything else that reads `GEMINI_API_KEY` (`geminiIdentifyService`,
+  `visualCatalogMatchService`, `plateIntelService`, `overlayZoneService`,
+  `quoteSnippetService`, `layoutInputService`, `metaAdsFontService`) was
+  **already Atlas-primary**, with the direct key wired only as
+  `atlasLlmService`'s own fallback-of-last-resort — nothing to fix there.
+  `aiVideoReferenceService` (direct Veo) is gated dead by
+  `VIDEO_PROVIDER=atlas`. `aiImageReferenceService` was already confirmed
+  dead by a prior session. Pinned by
+  `scripts/verifyGeminiSearchAtlasRouting.js` (9 checks, revert-proven on
+  four mutations) and the updated `scripts/verifyGeminiSearchCost.js`
+  section D (behavioural, real function calls against a stubbed transport
+  that branches on URL).
 - **A REGEX OVER SOURCE TEXT CANNOT SEE AN UNBOUND IDENTIFIER — and `node --check`
   cannot either.** This shipped a broken money guard to production with a green
   harness on 2026-08-04. `services/processAlerts.js` called `receiptFree({...})`
@@ -1863,8 +1936,8 @@ Full detail in `docs/ATLAS.md` §7 and `docs/CLOUDINARY-VIDEO.md`. Headlines:
   PR #61 rollback, where a later session "fixed" a deliberate decision.
 - **Customer quotes: `llm-web` is PRINTABLE; attribution is stripped.**
   Prior denylist / "llm-web never prints" claims were **false**.
-  `services/providers/geminiSearchProvider.js:254,399` use
-  `tools:[{google_search:{}}]`; `:266,411` read
+  `services/providers/geminiSearchProvider.js:977,1097,1218` use
+  `tools:[{google_search:{}}]`; `:995,1121,1242` read
   `groundingMetadata.groundingChunks` — real grounded retrieval, not LLM
   authorship. `verbatim:false` on that origin is a **source-class stamp** ("not
   a first-party scrape"), not a paraphrase confession; it still hard-rejects for
