@@ -299,6 +299,12 @@ cannot drift from the code (pinned by `scripts/verifyLlmErrorCodes.js` F1).
 requests are documented as never billed, `true` for HTTP 200 responses whose
 tokens were generated, and `unknown` where we genuinely cannot tell.
 
+**Concurrent-edit note (2026-08-19):** `scripts/verifyLlmErrorCodes.js` F1/F2
+finds the FIRST row matching a `` `LLM_*` `` code — a new code's row is safe to
+add, but never let two rows exist for the same code (a union-style auto-merge
+could produce exactly that, silently, which is why this file has no
+`merge=union` driver — see `CLAUDE.md` §5).
+
 | Code | Means | billable | What to DO |
 |---|---|---|---|
 | `LLM_RATE_LIMITED` | HTTP 429 — the provider is capacity-starved on this model | `false` | **Do not raise the timeout** — the 429 already burned ~50s. Let the chain advance to a non-Anthropic link, or set `ATLAS_MODEL_DIRECTOR` to a probed-healthy slug |
@@ -761,6 +767,14 @@ Mongo fresh each request. The shared piece is the taxonomy
 transport-specific plumbing around them.
 
 ### Gap table (Slack signal → in-app today)
+
+**Concurrent-edit note (2026-08-19):** adding a new row is low-conflict — two
+unrelated PRs each appending a different row merge cleanly unless they anchor on
+the exact same last line. Changing an EXISTING row's "Now?" cell (e.g.
+`"Still gap"` → `"Fixed"`) is a real semantic edit; if two PRs do that to the same
+row concurrently, git conflicting is correct behaviour, not a bug to route around.
+See `CLAUDE.md` §5 for why this file does not use a `merge=union` `.gitattributes`
+driver.
 
 | Slack signal | Persisted? | Was it in `GET /runs/:runId`? | Now? |
 |---|---|---|---|
