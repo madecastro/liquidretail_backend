@@ -173,7 +173,45 @@ const campaignRunSchema = new mongoose.Schema({
   },
 
   startedAt:    { type: Date, default: Date.now },
-  completedAt:  { type: Date, default: null }
+  completedAt:  { type: Date, default: null },
+
+  // LIVENESS HEARTBEAT (services/campaignRunHeartbeat.js), written every ~60s
+  // while runRenderLoop reports real in-flight work — and NOT written when it
+  // does not, so a wedged run is still reaped.
+  //
+  // DECLARED, not optional. This schema is STRICT: an undeclared path is
+  // silently DROPPED on write, which is how `renderError.predictionId` was
+  // lost (CLAUDE.md §2/§4). A dropped write here would look correct in code,
+  // pass every source-text check, and store nothing.
+  //
+  // WHY A SECOND FIELD when the beat's real job is bumping `updatedAt`:
+  // `updatedAt` is now written by two different things with two different
+  // meanings — an ad SETTLING (the per-ad `$inc {succeeded|failed|skipped}`,
+  // refreshed by timestamps:true) and the run merely being ALIVE. Conflating
+  // them is exactly what hid the 2026-08-18 incident: the reaper's
+  // `updatedAt < now - REAP_STALE_MIN` predicate was read as "this run is
+  // dead" when it only ever meant "no ad settled recently", and
+  // run_1787105727540_e8c94542 was stamped 'failed' mid-render with
+  // `errors: []`.
+  //
+  // READ IT LIKE THIS — and note the earlier version of this comment had the
+  // reading BACKWARDS (adversarial review, same day). A beat writes BOTH
+  // fields at one instant, so on a beating run they are always ~equal; only a
+  // settlement moves `updatedAt` alone. The gap between them therefore means
+  // "a settlement landed after the last beat", not "alive but nothing
+  // settled".
+  //   · `lastHeartbeatAt` fresh          → the render loop is alive and has
+  //                                        work in flight (the beat is gated
+  //                                        on the pools' inflight count).
+  //   · stale/null while `running`       → nothing in flight, or the process
+  //                                        is gone; the reaper is right to act.
+  //   · is work SETTLING?                → succeeded+failed+skipped vs `total`,
+  //                                        never a date gap.
+  //
+  // Never written alone-with-counters: the heartbeat writes THIS and
+  // `updatedAt` and nothing else — never `total` (the claim count and the
+  // progress denominator) and never the outcome counters.
+  lastHeartbeatAt: { type: Date, default: null }
 }, {
   timestamps: true,
   // `errors` is a Mongoose reserved pathname (Document.prototype has an

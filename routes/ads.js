@@ -119,6 +119,13 @@ const {
   buildTerminalDoneFilter, buildRunningFlipFilter, buildActiveRunsFilter
 } = require('../services/campaignRunGuards');
 const { reapStaleMin, prepareStaleMin } = require('../services/staleness');
+// CampaignRun liveness heartbeat for the render loop. IMPORTED, never
+// re-implemented inline — CLAUDE.md §4 records three production ReferenceErrors
+// from call sites that used a helper the file never imported, and a source-text
+// harness cannot see an unbound identifier.
+const {
+  startRunHeartbeat, buildClaimedAdHeartbeatFilter, buildClaimedAdHeartbeatUpdate
+} = require('../services/campaignRunHeartbeat');
 
 // Operator-facing gate for a multi-select format list (preset 'explicit'),
 // shared by /preview + /generate.
@@ -1650,50 +1657,115 @@ async function runRenderLoop(run, job, adIds, renderToken) {
     { name: 'image', concurrency: RENDER_CONCURRENCY, queue: otherIds.map((id) => ({ adId: id, index: indexOf.get(String(id)) })), next: 0, inflight: 0 }
   ].filter((p) => p.queue.length > 0);
 
-  await Promise.all(pools.map((pool) => new Promise((resolve) => {
-    const dispatch = async () => {
-      // AWAITED, not fire-and-forget. checkpoint() is async (it reads
-      // cancelRequested from Mongo) and signals cancellation by THROWING, so
-      // `.catch(() => cancelled = true)` could only ever run on a later
-      // microtask. The synchronous while-loop below therefore ran first with a
-      // stale `cancelled === false` and claimed a whole extra wave of renders
-      // AFTER the operator pressed Stop — every one of them billable. Awaiting
-      // costs one already-throttled read (1/s cache in progressService) per
-      // dispatch cycle and makes Stop mean stop.
-      try {
-        await progressRun.checkpoint();
-      } catch {
-        cancelled = true;
-      }
-      if (cancelled && pool.inflight === 0) return resolve();
-      while (!cancelled && pool.inflight < pool.concurrency && pool.next < pool.queue.length) {
-        const { adId, index } = pool.queue[pool.next++];
-        pool.inflight++;
-        renderOne(run, job, adId, index, renderToken)
-          .catch(err => {
-            console.error(`❌ [campaignRun ${run.runId}] #${index} (${pool.name}) dispatch crash:`, err.message || err);
-          })
-          .finally(() => {
-            pool.inflight--;
-            progressRun.tick(++done, adIds.length);
-            inFlight.progress(run.runId, done);
-            // Liveness heartbeat for the reaper — see the comment on the
-            // pre-partition version for why we refresh updatedAt on every
-            // completion instead of just at claim time. Scoped to
-            // status:'rendering' so it never resurrects ads the cancel
-            // path already re-queued.
-            Ad.updateMany(
-              { _id: { $in: adIds }, status: 'rendering' },
-              { $set: { updatedAt: new Date() } }
-            ).catch(() => {});
-            if ((pool.next >= pool.queue.length || cancelled) && pool.inflight === 0) resolve();
-            else dispatch().catch(() => resolve());
-          });
-      }
-      if (cancelled && pool.inflight === 0) resolve();
-    };
-    dispatch().catch(() => resolve());
-  })));
+  // ── CAMPAIGNRUN LIVENESS HEARTBEAT — a money/visibility guard, not telemetry.
+  //
+  // worker.js's reaper flips any CampaignRun sitting in 'running' with
+  // `updatedAt` older than REAP_STALE_MIN (15m) to 'failed'. Nothing was
+  // refreshing that clock during a render: the ONLY writes to the run row are
+  // the per-ad `$inc { succeeded | failed | skipped }` below, which fire when
+  // an ad SETTLES. So the reaper's predicate measured "no ad settled recently",
+  // not "this run is alive", and MEASURED IN PRODUCTION 2026-08-18
+  // (run_1787105727540_e8c94542) those diverged by 15 minutes: 18 statics
+  // settled by 02:21, video titling then ran silently, and at 02:36 the reaper
+  // stamped a working run 'failed' with `errors: []`, `failed: 0`. The Ad sweep
+  // stranded 9 of its ads 'queued' in the same tick. The operator paid for the
+  // masters and silently received 30 of 39 creatives.
+  //
+  // GATED ON REAL WORK, and that is the whole design. A heartbeat that ticked
+  // unconditionally would defeat the reaper and resurrect the class it exists
+  // to kill — a run wedged forever holding claimed ads. `isWorking` reads the
+  // pools' OWN inflight counters, i.e. the same numbers the loop uses to decide
+  // it is finished, so the beat stops the moment nothing is rendering. It also
+  // dies with the process, so a replaced instance cannot beat at all.
+  //
+  // The Ad arm inside the ticker is the timer form of the per-completion
+  // `Ad.updateMany` below — same filter, same update. It is what saves the
+  // claimed-but-undispatched tail (the 9 rows above), and it closes a real
+  // double-bill: an ad reaped to 'queued' while still sitting in this live
+  // in-memory pool is claimable by a concurrent selectAdsForRun, and
+  // renderOneInner has no status guard, so both runs would submit it.
+  //
+  // Fire-and-forget, never awaited, never throws into the loop — same
+  // discipline as adStage(). See services/campaignRunHeartbeat.js.
+  const runHeartbeat = startRunHeartbeat({
+    runDocId:  run._id,
+    adIds,
+    isWorking: () => pools.some((p) => p.inflight > 0)
+  });
+
+  try {
+    await Promise.all(pools.map((pool) => new Promise((resolve) => {
+      const dispatch = async () => {
+        // AWAITED, not fire-and-forget. checkpoint() is async (it reads
+        // cancelRequested from Mongo) and signals cancellation by THROWING, so
+        // `.catch(() => cancelled = true)` could only ever run on a later
+        // microtask. The synchronous while-loop below therefore ran first with a
+        // stale `cancelled === false` and claimed a whole extra wave of renders
+        // AFTER the operator pressed Stop — every one of them billable. Awaiting
+        // costs one already-throttled read (1/s cache in progressService) per
+        // dispatch cycle and makes Stop mean stop.
+        try {
+          await progressRun.checkpoint();
+        } catch {
+          cancelled = true;
+        }
+        if (cancelled && pool.inflight === 0) return resolve();
+        while (!cancelled && pool.inflight < pool.concurrency && pool.next < pool.queue.length) {
+          const { adId, index } = pool.queue[pool.next++];
+          pool.inflight++;
+          renderOne(run, job, adId, index, renderToken)
+            .catch(err => {
+              console.error(`❌ [campaignRun ${run.runId}] #${index} (${pool.name}) dispatch crash:`, err.message || err);
+            })
+            .finally(() => {
+              pool.inflight--;
+              progressRun.tick(++done, adIds.length);
+              inFlight.progress(run.runId, done);
+              // Liveness heartbeat for the reaper — see the comment on the
+              // pre-partition version for why we refresh updatedAt on every
+              // completion instead of just at claim time. Scoped to
+              // status:'rendering' so it never resurrects ads the cancel
+              // path already re-queued.
+              //
+              // SAME BUILDERS as the ticker above, imported not re-inlined: the
+              // completion-driven beat and the time-driven beat must touch one
+              // population. Drift between them is how the undispatched tail got
+              // reaped out from under a live run on 2026-08-18.
+              Ad.updateMany(
+                buildClaimedAdHeartbeatFilter(adIds),
+                buildClaimedAdHeartbeatUpdate(new Date())
+              ).catch(() => {});
+              if ((pool.next >= pool.queue.length || cancelled) && pool.inflight === 0) resolve();
+              else dispatch().catch(() => resolve());
+            });
+        }
+        if (cancelled && pool.inflight === 0) resolve();
+      };
+      dispatch().catch(() => resolve());
+    })));
+  } catch (err) {
+    // DEAD TODAY, AND DELIBERATELY KEPT — say so rather than implying it is
+    // load-bearing (adversarial review corrected an earlier comment here that
+    // did). The drain above cannot reject: each pool is
+    // `new Promise((resolve) => …)` whose `dispatch()` is `.catch(() =>
+    // resolve())`'d and whose renderOne is `.catch`'d, so `Promise.all` only
+    // ever fulfils. What this arm buys is that the invariant survives an edit —
+    // the moment anyone removes one of those catches, or adds an `await`
+    // between the drain and the finally, a rejection would otherwise skip
+    // straight past a still-beating timer and keep a crashed run out of the
+    // reaper's reach forever. `stop()` is idempotent, so the pair costs
+    // nothing, and `throw err` keeps the pre-existing contract with all three
+    // callers (both /generate and /runs already catch this loop's rejection).
+    runHeartbeat.stop();
+    throw err;
+  } finally {
+    // Every normal exit — completion AND operator cancel (the pools resolve
+    // once inflight hits 0 on the cancel path, so the drain is still covered
+    // above and the beat ends here). After this point the run's next write is
+    // its terminal 'done'/'failed' stamp, so there is nothing left to keep
+    // alive.
+    runHeartbeat.stop();
+  }
 
   // Cancelled mid-batch: unclaimed ads (bulk-flipped to 'rendering' at claim
   // time, before the loop) are ARCHIVED — see the block below for why.

@@ -63,9 +63,13 @@ const REAP_INTERVAL_MIN  = Math.max(1, parseInt(process.env.REAP_INTERVAL_MIN, 1
 // A 'preparing' CampaignRun NEVER heartbeats — no write to the row exists
 // anywhere between mint (routes/ads.js POST /generate) and the flip to
 // 'running' (after expandWizardJob + claim), so updatedAt === startedAt for
-// the entire expansion. Unlike REAP_STALE_MIN above (safe on updatedAt,
-// because every per-ad $inc during a live 'running' batch proves liveness),
-// this threshold is unavoidably "time since mint".
+// the entire expansion. Unlike REAP_STALE_MIN above — safe on updatedAt
+// because services/campaignRunHeartbeat.js beats a live 'running' run every
+// ~60s while its render loop has work in flight — this threshold is
+// unavoidably "time since mint". (Until 2026-08-18 this parenthetical credited
+// the per-ad $inc with the liveness guarantee. It never had it: a $inc is a
+// COMPLETION notification, and a run with 15 quiet minutes of video titling
+// behind it was reaped alive. See the running sweep below.)
 //
 // THIS SWEEP is hygiene. THIS VAR IS NOT — corrected 2026-08-18, because the
 // previous version of this comment drew the line in the wrong place and a real
@@ -115,7 +119,9 @@ const REAP_INTERVAL_MIN  = Math.max(1, parseInt(process.env.REAP_INTERVAL_MIN, 1
 //
 // NOTE the clock difference, because it is easy to conflate the two windows:
 // this one is MINT AGE (startedAt — a preparing run never writes to its row),
-// while REAP_STALE_MIN is SILENCE (updatedAt, refreshed by every per-ad $inc).
+// while REAP_STALE_MIN is SILENCE (updatedAt, refreshed by the ~60s beat in
+// services/campaignRunHeartbeat.js as well as by every per-ad $inc — the $inc
+// alone was NOT a liveness signal and reaped a live run on 2026-08-18).
 // The gate's two arms mirror exactly that split; keying its running arm on mint
 // age instead was a confirmed double-bill P0 (2026-08-18) — see
 // services/campaignRunGuards.js buildActiveRunsFilter.
@@ -132,7 +138,7 @@ const { receiptFree, HAS_RECEIPT } = require('./services/spendReceipt');
 // billable submit may be in flight behind it. REQUEUE_MARK, never
 // PRE_DISPATCH. See the REQUEUE_SITES ledger in services/adArchiveDigest.js.
 const { REQUEUE_MARK } = require('./services/adArchiveDigest');
-const { buildStalePreparingFilter } = require('./services/campaignRunGuards');
+const { buildStalePreparingFilter, buildStaleRunningFilter } = require('./services/campaignRunGuards');
 // Pure Slack-message builder for the preparing-reap notice below — see
 // services/slackRunVerbosity.js header (no Mongo/network at require-time).
 const { buildPreparingReapNotice } = require('./services/slackRunVerbosity');
@@ -248,7 +254,11 @@ mongoose.connect(process.env.MONGODB_URI, {
 // safe to run frequently. Logs only when something was reaped so a
 // healthy system doesn't fill logs with no-ops.
 async function reapOrphans() {
-  const cutoff = new Date(Date.now() - REAP_STALE_MIN * 60 * 1000);
+  // ONE `now` for the whole sweep, so the inline Ad/DetectRun cutoffs and the
+  // shared buildStaleRunningFilter below cannot drift by the sweep's own
+  // runtime.
+  const reapNow = Date.now();
+  const cutoff = new Date(reapNow - REAP_STALE_MIN * 60 * 1000);
 
   // DetectRun: stuck in 'processing' → reset to 'queued' so the next
   // worker loop iteration claims it. The original holder is presumed
@@ -311,15 +321,29 @@ async function reapOrphans() {
   // the frontend poller resolves. The individual Ads inside the run
   // were handled by the Ad sweep above.
   //
-  // Staleness is judged on updatedAt, NOT startedAt: the schema has
-  // timestamps:true, so every per-ad `$inc { succeeded/failed }` refreshes
-  // updatedAt — a live run heartbeats roughly once a minute. Filtering on
-  // startedAt would fail ANY run older than 15 minutes, and a serialized
-  // 20-ad video batch legitimately runs 25-35 — the healthy long batch
-  // would be marked failed while still rendering. A run whose counters
-  // haven't moved in 15 minutes is genuinely dead.
+  // Staleness is judged on updatedAt, NOT startedAt. Filtering on startedAt
+  // would fail ANY run older than 15 minutes, and a serialized 20-ad video
+  // batch legitimately runs 25-35 — the healthy long batch would be marked
+  // failed while still rendering.
+  //
+  // ⚠️ THIS SWEEP FALSELY KILLED A LIVE RUN IN PRODUCTION (2026-08-18,
+  // run_1787105727540_e8c94542) and the comment that used to sit here is why
+  // nobody caught it: it asserted "a live run heartbeats roughly once a
+  // minute" on the strength of the per-ad `$inc { succeeded/failed }`. That is
+  // not a heartbeat, it is a COMPLETION notification — it fires when an ad
+  // SETTLES, so a run with 18 statics done and 21 video rows serialising
+  // behind titling wrote nothing for 15 minutes and was stamped 'failed' with
+  // `errors: []`, `failed: 0`, while it was still rendering. 9 of its ads were
+  // stranded 'queued' by the Ad sweep above on the identical silence.
+  //
+  // services/campaignRunHeartbeat.js now beats the row every ~60s for as long
+  // as the render loop reports real in-flight work (and stops the instant it
+  // does not, so a wedged run is still reaped). That is what makes the
+  // predicate below mean "the holder died" rather than "nothing settled
+  // lately". Filter extracted to campaignRunGuards so the harness can evaluate
+  // the real one.
   const runs = await CampaignRun.updateMany(
-    { status: 'running', updatedAt: { $lt: cutoff } },
+    buildStaleRunningFilter({ now: reapNow, staleMin: REAP_STALE_MIN }),
     { $set: { status: 'failed', completedAt: new Date() } }
   );
 

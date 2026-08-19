@@ -455,19 +455,136 @@ these alert thresholds are tuned against:
 
 | Window | Default | Clock | Governs |
 |---|---|---|---|
-| `REAP_STALE_MIN` | `15` | `updatedAt` (**silence**) | **Claimed** work — `Ad` in `rendering`, `CampaignRun` in `running`. Both heartbeat, so 15m of silence really is a dead holder. Also bounds the concurrency gate's `running` arm, which uses the same field and bound as the reaper so that "gate-visible" and "the reaper would spare it" are one statement. |
+| `REAP_STALE_MIN` | `15` | `updatedAt` (**silence**) | **Claimed** work — `Ad` in `rendering`, `CampaignRun` in `running`. Both heartbeat *for real* since 2026-08-18 (see below), so 15m of silence really is a dead holder. Also bounds the concurrency gate's `running` arm, which uses the same field and bound as the reaper so that "gate-visible" and "the reaper would spare it" are one statement. |
 | `PREPARE_STALE_MIN` | `30` | `createdAt`/`startedAt` (**mint age**) | The **preparing** lifecycle — mint → the `preparing`→`running` flip. Mint age is the only available clock because a preparing run makes no writes to its own row. Raised from 15 on 2026-08-18: the healthy runtime (Director + Judge) is **~18-20 min**, so 15 was failing expansions that were merely finishing. Non-secret, so it lives in `config/defaults.env`. |
 
 The clock column is load-bearing. Keying the gate's `running` arm on mint age
 instead of silence was a confirmed double-bill P0 (a run that flipped at t=18
 was invisible to the gate the moment it started submitting billable work, so a
-duplicate was admitted silently). Note the consequence for alerting: because
-`CampaignRun` has **no periodic heartbeat of its own** — the 60s beat in
-`routes/ads.js` refreshes the `Ad` row, not the run — a run's `updatedAt` only
-moves when an ad in the wave settles. A wave where every concurrent render
-stalls near `AI_DIRECT_IMAGE_TIMEOUT_MS` (900s, ≈ `REAP_STALE_MIN`) can
-therefore look silent while alive. That is a pre-existing reaper liveness gap,
-not something the window change introduced.
+duplicate was admitted silently).
+
+### The `CampaignRun` liveness heartbeat — and the run it was written for
+
+**The gap this closes, and it was measured, not theorised.** Until 2026-08-18
+`CampaignRun` had **no periodic heartbeat of its own**: the 60s beat in
+`routes/ads.js` refreshes the `Ad` row, not the run, so a run's `updatedAt`
+moved **only when an ad in the wave settled** (the per-ad
+`$inc { succeeded | failed | skipped }`, refreshed by `timestamps: true`). The
+reaper's `updatedAt < now - REAP_STALE_MIN` predicate therefore did not mean
+*"this run is alive"* — it meant *"an ad settled recently"*, and those are
+different statements the moment a run's tail is long and serialised.
+
+**MEASURED INCIDENT — `run_1787105727540_e8c94542`, 2026-08-18.** One product,
+Meta + PMax "Everything", 39 claimed ads.
+
+| time | what happened |
+|---|---|
+| 02:15:27Z | `startedAt` |
+| ~02:21 | all **18 statics** settled; every remaining row is video |
+| 02:21-02:36 | video titling runs. **Zero writes to the `CampaignRun` row** |
+| 02:36:29Z | `reapOrphans()` matches `{ status:'running', updatedAt: { $lt: … } }` and stamps the run **`failed`** — final doc `succeeded 18 · failed 0 · skipped 0 · total 39 · errors: []`. Nothing threw. It was still rendering. |
+| same tick | the **Ad** sweep flips **9** of the run's rows from `rendering` back to `queued` on the identical silence |
+
+Those 9 rows — the 4:5 derive and the staged Meta funnel variants — were
+stranded permanently. The operator paid for the masters and silently received
+**30 of 39** creatives.
+
+They are the run's claimed-but-**undispatched** tail. That is inference rather
+than direct observation, and it is stated as such because it decides the
+recovery verdict: the count matches `21 video rows − VEO_CONCURRENCY (12) in
+flight = 9` exactly, and the only other path that parks a video row in `queued`
+— `renderDeriveOnlyVideoAd`'s polite wait-requeue — `$inc`s `skipped`, which the
+run's `skipped: 0` rules out.
+
+**Nothing recovers them automatically, and an operator has to be told.**
+`services/strandedRunSweeper.js` re-drives `queued` ads whose owning run went
+`failed`, but only those carrying a `renderStage` breadcrumb
+(`renderStage: { $nin: [null, ''] }`) — the test that separates *"a deploy
+killed this"* from *"an operator has not pressed go yet"*. A claimed-but-never-
+dispatched ad has no stage (only `adStage()` writes one, and it is called from
+`renderOne`, which never ran for these), and the reaper's requeue marker is
+`REQUEUE_MARK = { wasRendering: true }` — it does not add a breadcrumb. So these
+9 **do not qualify**, and the attempt bounds (`renderAttempts`,
+`deriveWaitAttempts`) never come into it. The remedy is **Generate more**
+(`POST /api/ads/runs`), or `queuedArchiveSweeper` parks them after
+`QUEUED_ARCHIVE_AFTER_H` (24). Widening the sweeper to reach them is a
+money-adjacent change: the breadcrumb requirement is what stops it draining ads
+nobody claimed.
+
+**Why this got likelier the same week:** video went to 10s on both platforms and
+Meta+PMax now share ONE 9:16 master, so 15 of 21 video rows queue behind a
+single plate and titling serialises behind `REMOTION_QUEUE_CONCURRENCY` (4).
+Long silent stretches between ad settlements are the **normal** shape of a mixed
+run now, not an edge case.
+
+**The fix — `services/campaignRunHeartbeat.js`.** A ~60s ticker started in
+`runRenderLoop` that writes `$set: { updatedAt, lastHeartbeatAt }` to
+`{ _id, status: 'running' }` and **nothing else** — never `total` (the claim
+count and progress denominator), never the outcome counters. It also beats the
+run's still-`rendering` ads with the same filter/update the loop already used on
+every completion, which is what saves the undispatched tail.
+
+Three properties are load-bearing, all pinned by
+`scripts/verifyCampaignRunHeartbeat.js` (36 checks, offline):
+
+- **It is gated on real work.** `isWorking` reads the render loop's own pool
+  `inflight` counters. An unconditional beat would defeat the reaper outright
+  and resurrect the wedged-run-lives-forever class it exists to kill. A loop
+  with nothing in flight emits no beat, and the timer dies with the process, so
+  a replaced instance cannot beat at all. When the beat stops, the window runs
+  normally from the last beat.
+- **It has a total lifetime cap** — `RUN_HEARTBEAT_MAX_MS`, **4h**, matching
+  `progressService.MAX_RUN_MS` because `runRenderLoop` opens that same run's
+  `ad-batch` `OperationRun` and the two heartbeats must not disagree about when
+  a run stops being credible. `inflight` is decremented in `renderOne`'s
+  `.finally`, so a `renderOne` that **never settles** would otherwise report
+  work forever and make the run immortal — worse than the pre-heartbeat
+  behaviour, since the Ad arm would also hold the claimed `rendering` set out of
+  the Ad reaper's reach. Past the cap the beat stops and recovery behaves as it
+  did before this file existed. (Caught in adversarial review, not by the first
+  design.)
+- **It stops on every exit path** — `runHeartbeat.stop()` in **both** the
+  `catch` and the `finally` around the pool drain (`stop()` is idempotent), and
+  the interval is `unref()`'d. The `catch` arm is dead today — the drain's
+  promises are individually `.catch`'d so `Promise.all` cannot reject — and is
+  kept as an edit guard, which the source says plainly rather than implying it
+  is load-bearing.
+- **The interval is derived from the ONE shared parser** (`services/staleness.js`
+  `reapStaleMin()`), capped at 60s (the `Ad` beat's cadence) and divided so at
+  least 5 beats fit inside the reaper window. At the documented 15 that is
+  **15 consecutive missed writes** before a false reap. `REAP_STALE_MIN` was
+  **not** raised — raising it would delay orphan requeue for every `Ad` and
+  every running run. ⚠️ The 5s spin-guard floor and that divisor **conflict
+  below a ~25s window** (`REAP_STALE_MIN < ~0.42`), where the margin degrades;
+  that is stated in the source and pinned as an explicit boundary rather than
+  claimed away. It is not the binding failure at such a setting — the
+  pre-existing hard-60s `Ad` beat is already hopeless there.
+
+**`CampaignRun.lastHeartbeatAt`** is a declared schema field. Read it like this
+— and note the first draft of this paragraph had it **backwards**: a beat writes
+`updatedAt` and `lastHeartbeatAt` at the same instant, so on a beating run they
+are always ~equal, and only a *settlement* moves `updatedAt` alone.
+
+| observation | meaning |
+|---|---|
+| `lastHeartbeatAt` fresh | the render loop is alive **and has work in flight** (the beat is gated on that) |
+| `lastHeartbeatAt` stale/null while `status:'running'` | nothing is in flight, or the process is gone — the reaper is right to act |
+| is work **settling**? | compare `succeeded + failed + skipped` against `total`. **Not** a date gap |
+
+That first row is the whole point, and it is exactly what `updatedAt` alone
+could not say on 2026-08-18.
+
+⚠️ **Honest consequence for the alert thresholds below.** A run with in-flight
+work now refreshes `updatedAt` every ~60s, so `ALERT_RUN_SILENCE_MIN` (12m on
+`updatedAt`, via `buildStalledRunFilter`) can no longer fire for a run whose
+pool is busy — it now catches only a run that is silent *because nothing is
+rendering*. That is a narrower set than the name suggests. It is the same shape
+`ALERT_RENDERING_STALE_MIN` has had since the `Ad` beat shipped (a dispatched ad
+is beaten every 60s by `renderOne`, so that arm only ever catches ads whose
+holder is gone). Neither is re-tuned here — flagged rather than papered over,
+because a silence alarm behind a heartbeat is a thing a reader must know about
+before trusting it. What still alerts on a genuinely wedged run is
+`ALERT_RUN_STALE_MIN` (45m on `startedAt`).
 
 `ALERT_RENDERING_STALE_MIN` and `ALERT_RUN_SILENCE_MIN` must stay strictly below
 **`REAP_STALE_MIN`** — unchanged by the preparing bump, which touched neither

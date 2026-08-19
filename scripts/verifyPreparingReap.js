@@ -153,6 +153,7 @@ const path = require('node:path');
 
 const {
   buildStalePreparingFilter,
+  buildStaleRunningFilter,
   buildRunningFlipFilter,
   buildActiveRunsFilter
 } = require('../services/campaignRunGuards');
@@ -241,8 +242,23 @@ ok('B4 stale done/failed rows do NOT match (already terminal)', () => {
   assert.strictEqual(matches({ status: 'failed', startedAt: minAgo(999) }, PREP_FILTER), false);
 });
 ok('B5 threshold is strict $lt on startedAt, not updatedAt (preparing rows never heartbeat)', () => {
+  // Slice to the function's REAL end (the first column-0 `}`), not a fixed
+  // character budget. The old `start + 500` window bled into whatever function
+  // came next in the file and started failing the moment
+  // buildStaleRunningFilter — which legitimately keys on updatedAt — was added
+  // below it (2026-08-18). A check that fails on a correct file is worse than
+  // no check: it teaches the next reader to edit the harness.
   const start = guardsSrc.indexOf('function buildStalePreparingFilter');
-  const body = guardsSrc.slice(start, start + 500);
+  assert.notStrictEqual(start, -1, 'buildStalePreparingFilter must exist in campaignRunGuards.js');
+  const endRel = guardsSrc.slice(start).indexOf('\n}');
+  assert.notStrictEqual(endRel, -1, 'could not find the end of buildStalePreparingFilter');
+  const body = guardsSrc.slice(start, start + endRel + 2);
+  // Behavioural first: the real filter, not its spelling.
+  const real = buildStalePreparingFilter({ now: NOW, staleMin: STALE_MIN });
+  assert.ok(real.startedAt && real.startedAt.$lt instanceof Date,
+    'buildStalePreparingFilter must emit a startedAt $lt Date cutoff');
+  assert.strictEqual(real.updatedAt, undefined,
+    'buildStalePreparingFilter must not bound updatedAt');
   assert.ok(/startedAt:\s*\{\s*\$lt:/.test(body),
     'buildStalePreparingFilter must key staleness on startedAt');
   assert.ok(!/updatedAt/.test(body),
@@ -290,7 +306,14 @@ ok('C6 the age guard uses the SAME staleMin the gate passes — not a separately
 ok('D1 worker.js IMPORTS buildStalePreparingFilter (a call without an import is a ReferenceError)', () => {
   assert.ok(/require\(\s*['"]\.\/services\/campaignRunGuards['"]\s*\)/.test(workerSrc),
     'worker.js must require ./services/campaignRunGuards');
-  assert.ok(/\{\s*buildStalePreparingFilter\s*\}/.test(workerSrc),
+  // Match the name INSIDE the destructure rather than requiring it to be the
+  // sole name — worker.js now also pulls buildStaleRunningFilter from the same
+  // require (2026-08-18, the heartbeat change), and a sole-name regex would
+  // fail on a correct file. Same shape as D3 below, which was already written
+  // this way.
+  assert.ok(
+    /const\s*\{[^}]*buildStalePreparingFilter[^}]*\}\s*=\s*require\(\s*['"]\.\/services\/campaignRunGuards['"]\s*\)/
+      .test(workerSrc),
     'buildStalePreparingFilter must be destructured from that require');
 });
 ok('D2 the live worker.js sweep calls buildStalePreparingFilter — not a hand-rolled copy', () => {
@@ -759,9 +782,21 @@ ok('G5d the gate\'s running arm is the SAME predicate as the worker\'s running r
   assert.ok(runningArm.updatedAt && runningArm.updatedAt.$gte,
     'the gate running arm must bound updatedAt, not createdAt — otherwise it cannot mirror the reaper');
   assert.ok(!runningArm.createdAt, 'the running arm must NOT also constrain mint age');
-  assert.ok(/status:\s*'running',\s*\n?\s*updatedAt:\s*\{\s*\$lt:/.test(workerSrc)
-    || /'running'[\s\S]{0,200}updatedAt:\s*\{\s*\$lt:/.test(workerSrc),
-  'worker.js\'s running reaper must still key on updatedAt $lt — if it moved, this arm must move with it');
+  // The reaper's predicate used to be an inline literal in worker.js and this
+  // check regexed for it. Since 2026-08-18 it is the SHARED, exported
+  // buildStaleRunningFilter (extracted so the heartbeat harness can evaluate
+  // the real thing), so assert against the REAL filter object plus the fact
+  // that worker.js actually calls it. Strictly stronger than the old regex: a
+  // filter that still *contains* the right words but is keyed wrong now fails.
+  const reaperFilter = buildStaleRunningFilter({ now: NOW, staleMin: G_RUN_MIN });
+  assert.strictEqual(reaperFilter.status, 'running',
+    'the running reaper must match status:running only');
+  assert.ok(reaperFilter.updatedAt && reaperFilter.updatedAt.$lt instanceof Date,
+    'worker.js\'s running reaper must still key on updatedAt $lt — if it moved, this arm must move with it');
+  assert.ok(!reaperFilter.createdAt && !reaperFilter.startedAt,
+    'the running reaper must key on LIVENESS (updatedAt), never on mint age');
+  assert.ok(workerSrc.includes('buildStaleRunningFilter({ now: reapNow, staleMin: REAP_STALE_MIN })'),
+    'worker.js\'s running sweep must CALL the shared builder, not a hand-rolled copy');
   const reaperCutoff = new Date(NOW.getTime() - G_RUN_MIN * 60 * 1000);
   for (const silence of [0, 5, 14, 15, 16, 30]) {
     const doc = runningRun({ mintAgeMin: 99, silenceMin: silence });

@@ -130,14 +130,17 @@ function buildTerminalDoneFilter(id) {
  * stays visible however old its mint is; a dead one leaves the gate at the
  * instant the reaper's cutoff passes.
  *
- * KNOWN RESIDUAL, pre-existing and NOT introduced here: CampaignRun has no
- * periodic heartbeat of its own (the 60s setInterval in routes/ads.js beats the
- * Ad row, not this one), so updatedAt only moves when an ad in the wave
- * settles. A wave in which every concurrent render stalls near
- * AI_DIRECT_IMAGE_TIMEOUT_MS (900s ≈ REAP_STALE_MIN) could therefore go quiet
- * long enough to be reaped while genuinely alive. That is the REAPER's liveness
- * gap and it is unchanged by this filter — matching the reaper is still strictly
- * better than the old createdAt arm, which was blind to liveness entirely.
+ * THE RESIDUAL THIS COMMENT USED TO RECORD IS NOW CLOSED (2026-08-18). It said
+ * CampaignRun had "no periodic heartbeat of its own", so updatedAt moved only
+ * when an ad in the wave settled, and a wave whose renders all stalled could go
+ * quiet long enough to be reaped while genuinely alive. That stopped being a
+ * hypothetical the same week — run_1787105727540_e8c94542 was stamped 'failed'
+ * at 02:36Z with `errors: []` while it was still rendering, and 9 of its ads
+ * were stranded. services/campaignRunHeartbeat.js now beats this row every ~60s
+ * for as long as the render loop reports real in-flight work, so both this arm
+ * and the reaper are reading a genuine liveness signal rather than a completion
+ * notification. The beat is gated on that in-flight count and capped at
+ * RUN_HEARTBEAT_MAX_MS, so a wedged run still ages out of both.
  *
  * Index note: models/CampaignRun.js declares { campaignId:1, status:1,
  * createdAt:-1 }. The preparing arm is an exact status equality plus a
@@ -190,10 +193,14 @@ function buildActiveRunsFilter({
  * A 'preparing' run never heartbeats: expandWizardJob (Director + Judge,
  * then the atomic Ad claim) makes ZERO writes to the CampaignRun row before
  * the 'running' flip, so updatedAt === startedAt for the entire expansion.
- * That is why this keys on startedAt, unlike the 'running' sweep in
- * worker.js which safely uses updatedAt (a live batch's per-ad $inc proves
- * liveness — see the comment there). Using updatedAt here would be no
- * different from using startedAt, so startedAt states the real semantics.
+ * That is why this keys on startedAt, unlike the 'running' sweep in worker.js,
+ * which safely uses updatedAt because a live batch now BEATS
+ * (services/campaignRunHeartbeat.js, ~60s while the render loop has work in
+ * flight). Until 2026-08-18 this parenthetical credited the per-ad $inc with
+ * that guarantee instead; it never had it, and a run was reaped alive on the
+ * strength of it — see buildStaleRunningFilter below. Using updatedAt HERE
+ * would still be no different from using startedAt (a preparing run writes
+ * nothing and does not beat), so startedAt states the real semantics.
  *
  * This sweep runs on a 5-minute cadence (REAP_INTERVAL_MIN) and can lag
  * arbitrarily further if the worker process itself is down — so it CANNOT
@@ -210,6 +217,43 @@ function buildStalePreparingFilter({ now, staleMin }) {
   return {
     status: 'preparing',
     startedAt: { $lt: new Date(t - staleMin * 60 * 1000) }
+  };
+}
+
+/**
+ * worker.js reapOrphans() — CampaignRuns stuck in 'running'. Keyed on
+ * REAP_STALE_MIN and on `updatedAt` (SILENCE), which is the same field and
+ * bound buildActiveRunsFilter's running arm uses, so "the gate still sees it"
+ * and "the reaper would spare it" stay one statement rather than two numbers
+ * someone has to keep in step.
+ *
+ * EXTRACTED FROM THE INLINE QUERY 2026-08-18, and the extraction is the point:
+ * this predicate is what falsely failed run_1787105727540_e8c94542 while it was
+ * legitimately rendering, so scripts/verifyCampaignRunHeartbeat.js has to
+ * evaluate the REAL filter against REAL document shapes. A harness that
+ * reimplements `{ status:'running', updatedAt: { $lt: cutoff } }` proves only
+ * that the harness agrees with itself.
+ *
+ * ⚠️ THE PREDICATE IS ONLY AS TRUE AS ITS HEARTBEAT. `updatedAt` on a
+ * CampaignRun used to move ONLY when an ad settled (the per-ad
+ * `$inc {succeeded|failed|skipped}`, refreshed by timestamps:true), so this
+ * read "no ad has settled recently", not "this run is dead". Those diverge the
+ * moment a run's work is long and serialised — 18 statics finished, then 15
+ * minutes of video titling behind REMOTION_QUEUE_CONCURRENCY, and the reaper
+ * stamped a working run 'failed' with `errors: []`. services/campaignRunHeartbeat.js
+ * is what now makes the silence real; do not weaken it and leave this filter
+ * asserting a liveness it no longer has.
+ *
+ * Note the CLOCK, which differs from buildStalePreparingFilter above on
+ * purpose: a running run HAS a liveness signal, a preparing one does not.
+ * Keying this on startedAt would fail every run older than the window
+ * regardless of health — a serialized video batch legitimately runs 25-35 min.
+ */
+function buildStaleRunningFilter({ now, staleMin }) {
+  const t = now instanceof Date ? now.getTime() : (Number(now) || Date.now());
+  return {
+    status: 'running',
+    updatedAt: { $lt: new Date(t - staleMin * 60 * 1000) }
   };
 }
 
@@ -288,5 +332,6 @@ module.exports = {
   buildTerminalDoneFilter,
   buildActiveRunsFilter,
   buildStalePreparingFilter,
+  buildStaleRunningFilter,
   buildRunningFlipFilter
 };
