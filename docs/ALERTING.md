@@ -109,6 +109,51 @@ titling run, upload, etc.
 | Thread | Full chronological event log, flushed every `RUN_FEED_THREAD_FLUSH_MS` (default 2s), batched |
 | Poll ticks | **Excluded** from the thread (`… — polling 20s (7)`). Parent "now:" still shows them |
 | Multi-instance | Parent `ts` claimed atomically on `CampaignRun.slackFeed` — only the winner creates the parent |
+| Requester | Head line ends `· by <who>` — who clicked Generate. See **Who ordered the run** below |
+
+### Who ordered the run
+
+The parent head line is `▸ <run> · <brand> [· <product>] · <N> ads · by <who>`, so a channel of
+concurrent runs is attributable at a glance. The thread's `run start` line carries it too.
+`<who>` resolves in this order:
+
+1. `User.displayName` → 2. `User.email` → 3. the last 6 chars of the requester's ObjectId
+   → 4. **the whole `· by …` atom is omitted.**
+
+Source of truth is `CampaignRun.requestedBy` (`req.user.userId`, already stamped at mint time by
+every route that creates a run — no schema change was needed for this). It reaches the feed two
+ways, and both matter:
+
+- **`runRenderLoop`** passes `requestedBy` on its first `runFeed.startRun` (free — already on the
+  run doc, so the *first* parent post already names someone) and the resolved `requesterLabel` on
+  the enriched second call. That label lookup shares one `Promise.all` await point with the
+  existing Brand lookup, so it adds **no** serial round-trip ahead of the render pools.
+- **`loadLiveSnapshot`** (detached interval) copies `requestedBy` off the run doc it already reads
+  and resolves the label itself. This is what covers runs this process did not start: the
+  queued-drain path, a second Render web instance, the worker.
+
+The label lookup is **latched on attempt, not on success** — a `requestedBy` pointing at a deleted
+user would otherwise re-query on every parent tick for the life of the run and never resolve. One
+miss is enough; the head degrades to the short id.
+
+Two rules when touching this:
+
+- **Never `.populate('requestedBy')`.** It throws *"Schema hasn't been registered for model
+  User"* in `routes/ads.js`, which never requires the `User` model — mongoose resolves refs
+  lazily against whatever is registered in the process. Always a guarded `require` + `findById`.
+- **`User` has `displayName`, not `name`.** There is no `name` and no `username` field. The
+  render-activity board had been selecting `'email name'` with a `u?.name` fallback that could
+  never fire; fixed 2026-08-18.
+
+The thread's `run start` line gets the label **through `buildRunStartLine`**
+(`services/slackRunVerbosity.js`), not appended at the call site —
+`verifySlackRunVerbosity` G18 asserts that line has exactly one builder. It is appended last so
+it survives both the at- and above-threshold branches, and omitted entirely when absent so the
+byte-identical guarantee for existing callers still holds.
+
+The requester is also a `by:` field on the four job-status alerts (below). The two
+`Campaign run crashed …` alerts carry the raw **id**, not the label: they fire outside
+`runRenderLoop`, and a failure path does not get a second DB read for a cosmetic field.
 
 **Safety (paid-path contract, same family as `adStage` / `alertService`):**
 
@@ -120,6 +165,11 @@ titling run, upload, etc.
 6. All Slack I/O on a detached `unref`'d interval.
 
 Covered by `scripts/verifyRunFeed.js` (offline; revert-proves the never-escape assertion).
+Section **I** covers the requester: the label on the head line, the short-id fallback, the
+byte-identical head when nobody is known (guards against a dangling `·`), pickup from the run doc
+for a run this process did not start, and a **throwing** `User` lookup leaving the feed working.
+`_setDeps({ User })` is the injection seam. `verifySlackRunVerbosity` D4–D8 cover the builder,
+including that a non-string or blank label never prints `by undefined`.
 
 | Var | Default | Notes |
 |---|---|---|
@@ -142,9 +192,9 @@ Covered by `scripts/verifyRunFeed.js` (offline; revert-proves the never-escape a
 | `N campaign run(s) not progressing` | error | watchdog | `running` past `ALERT_RUN_STALE_MIN` |
 | `Detect queue backing up — N queued` | warn | watchdog | The worker's own queue is growing → worker wedged |
 | `Spend $X in the last hour` | warn | watchdog | Trailing-hour `CostLog` total over `ALERT_HOURLY_SPEND_USD` |
-| `Video generation failed` | error | `routes/ads.js` | Atlas prediction failed or timed out |
-| `Campaign run finished with N failed ad(s)` | warn/error | `runRenderLoop` | Escalates to error when **every** ad failed |
-| `Campaign run crashed …` | error | `routes/ads.js` | The loop itself threw |
+| `Video generation failed` | error | `routes/ads.js` | Atlas prediction failed or timed out. `by:` = requester label, read off `job.requesterLabel` |
+| `Campaign run finished with N failed ad(s)` | warn/error | `runRenderLoop` | Escalates to error when **every** ad failed. `by:` = requester label |
+| `Campaign run crashed …` | error | `routes/ads.js` | The loop itself threw. `by:` = requester **id** (fires outside `runRenderLoop`) |
 | `Claim anomaly — run … released` | **fatal** | `routes/ads.js` `/generate` | `claimAdsForRun`'s updateMany reported a write but the ownership re-read came back empty (should never fire). Ads released to `queued`, run marked `failed`. Sent to the fatal/alert channel, **never** the per-run status feed. See *Claim-anomaly alert* below |
 | `Director LLM unreachable — static ad generation is producing ZERO ads` | **fatal** | `campaignAdsGenerationService` per-product catch | Every Director candidate failed at the TRANSPORT level. **Fires from the SECOND occurrence** (see *Occurrence thresholds*). Carries the code, the chain summary, and the emergency lever |
 | `Director LLM output is UNUSABLE — static ad generation is producing ZERO ads` | **fatal** | same catch, `director:content-failure` key | The model ANSWERED (HTTP 200, tokens billed) and the response could not be used — prose instead of JSON, truncated, or zero usable concepts. Same zero-ads impact, **completely different remedy**, so it pages under its own key. Also 2nd-occurrence |

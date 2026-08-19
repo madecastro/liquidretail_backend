@@ -123,6 +123,7 @@ let flushInFlight = false;
 // Injectable deps for offline tests (no real Mongo / network).
 let _CampaignRun = null;
 let _Ad = null;
+let _User = null;
 let _fetch = null;
 let _now = () => Date.now();
 // Test seam: force an internal throw from entry points under the try/catch.
@@ -138,6 +139,13 @@ function AdModel() {
   if (_Ad) return _Ad;
   // eslint-disable-next-line global-require
   return require('../models/Ad');
+}
+function UserModel() {
+  if (_User) return _User;
+  // Lazy require — same reason as CampaignRun/Ad. Optional _setDeps({ User })
+  // seam; prod falls through to the guarded require.
+  // eslint-disable-next-line global-require
+  return require('../models/User');
 }
 function doFetch(url, opts) {
   const f = _fetch || global.fetch;
@@ -237,9 +245,15 @@ function buildParentText(state, live) {
   const brand = state.brandName || state.brandId || 'brand';
   const product = state.productLabel || null;
   const total = live?.total ?? state.total ?? 0;
+  // Requester is user-controlled (Google displayName). Brand is interpolated
+  // raw today — do not change that. Omit the whole " · by …" atom when neither
+  // label nor id is known so the head stays byte-identical to the pre-change
+  // format (no dangling separator, no "unknown").
+  const byRaw = state.requesterLabel || (state.requestedBy ? shortId(state.requestedBy) : null);
+  const byBit = byRaw ? ` · by ${esc(byRaw)}` : '';
   const head = product
-    ? `▸ ${shortRun} · ${brand} · ${product} · ${total} ads`
-    : `▸ ${shortRun} · ${brand} · ${total} ads`;
+    ? `▸ ${shortRun} · ${brand} · ${product} · ${total} ads${byBit}`
+    : `▸ ${shortRun} · ${brand} · ${total} ads${byBit}`;
 
   const counts = live?.counts || state.counts || {};
   const parts = [];
@@ -443,6 +457,9 @@ function makeRunState(opts) {
     brandId: opts.brandId ? String(opts.brandId) : null,
     brandName: opts.brandName || null,
     productLabel: opts.productLabel || null,
+    requestedBy: opts.requestedBy ? String(opts.requestedBy) : null,
+    requesterLabel: opts.requesterLabel || null,
+    requesterLookupDone: false,
     total: Number(opts.total) || 0,
     startedAt: _now(),
     parentTs: null,
@@ -554,6 +571,11 @@ function startRun(opts = {}) {
       if (opts.total != null) st.total = Number(opts.total) || st.total;
       if (opts.brandName) st.brandName = opts.brandName;
       if (opts.productLabel) st.productLabel = opts.productLabel;
+      if (opts.requestedBy && String(opts.requestedBy) !== st.requestedBy) {
+        st.requestedBy = String(opts.requestedBy);
+        st.requesterLookupDone = false;   // new requester → allow one fresh lookup
+      }
+      if (opts.requesterLabel) st.requesterLabel = opts.requesterLabel;
       st.finished = false;
       st.parentDirty = true;
     }
@@ -606,10 +628,16 @@ function startRun(opts = {}) {
     // uncapped, since 2026-08-18).
     st.ring.push({
       t: _now(),
+      // requesterLabel goes THROUGH buildRunStartLine rather than being appended
+      // here: verifySlackRunVerbosity G18 asserts this call stays
+      // `stage: buildRunStartLine(...)` so the line has exactly one builder.
+      // Named only when the caller already resolved a label — never a Mongo
+      // read on this path.
       stage: buildRunStartLine({
         total: st.total,
         staticCount: opts.staticCount,
-        veoCount: opts.veoCount
+        veoCount: opts.veoCount,
+        requesterLabel: opts.requesterLabel
       }),
       adId: null,
       meta: {}
@@ -892,7 +920,7 @@ async function loadLiveSnapshot(st) {
         .lean()
         .catch(() => []),
       CampaignRun.findOne({ runId: rid })
-        .select('total succeeded failed skipped status brandId')
+        .select('total succeeded failed skipped status brandId requestedBy')
         .lean()
         .catch(() => null)
     ]);
@@ -909,6 +937,8 @@ async function loadLiveSnapshot(st) {
       if (!out.stages.has(adId)) out.stages.set(adId, stage);
     }
     if (runDoc) {
+      // Queued-drain / other instance / worker never passed opts.requestedBy.
+      if (!st.requestedBy && runDoc.requestedBy) st.requestedBy = String(runDoc.requestedBy);
       out.runCounters = {
         total: runDoc.total,
         succeeded: runDoc.succeeded,
@@ -926,6 +956,20 @@ async function loadLiveSnapshot(st) {
         const Brand = require('../models/Brand');
         const b = await Brand.findById(st.brandId).select('name').lean();
         if (b && b.name) st.brandName = b.name;
+      } catch { /* ignore */ }
+    }
+
+    // Enrich requester label once (best-effort, non-blocking for future ticks).
+    // Latched on ATTEMPT, not on success: a requestedBy pointing at a deleted
+    // user would otherwise re-query on every parent tick for the life of the
+    // run and never resolve. One miss is enough — the parent already degrades
+    // to the short id.
+    if (!st.requesterLabel && st.requestedBy && !st.requesterLookupDone) {
+      st.requesterLookupDone = true;
+      try {
+        const User = UserModel();
+        const u = await User.findById(st.requestedBy).select('displayName email').lean();
+        if (u) st.requesterLabel = u.displayName || u.email || null;
       } catch { /* ignore */ }
     }
   } catch {
@@ -1057,6 +1101,7 @@ function _resetState() {
   _forceThrow = false;
   _CampaignRun = null;
   _Ad = null;
+  _User = null;
   _fetch = null;
   _now = () => Date.now();
 }
@@ -1064,6 +1109,7 @@ function _resetState() {
 function _setDeps(deps = {}) {
   if ('CampaignRun' in deps) _CampaignRun = deps.CampaignRun;
   if ('Ad' in deps) _Ad = deps.Ad;
+  if ('User' in deps) _User = deps.User;
   if ('fetch' in deps) _fetch = deps.fetch;
   if ('now' in deps) _now = typeof deps.now === 'function' ? deps.now : () => Date.now();
   if ('forceThrow' in deps) _forceThrow = !!deps.forceThrow;

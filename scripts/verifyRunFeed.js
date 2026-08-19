@@ -585,6 +585,195 @@ async function main() {
     });
   }
 
+  // ── I. Requester on parent head line ────────────────────────────────
+  console.log('\nI. requester identity on parent text');
+  {
+    const live = { now: 1_700_000_000_000, total: 4, counts: {} };
+    const baseState = {
+      runId: 'run_abc12345xx',
+      brandName: 'Acme',
+      total: 4,
+      startedAt: 1_700_000_000_000,
+      counts: {}
+    };
+
+    // I1 — explicit requesterLabel appears after the ads count.
+    const withLabel = feed.buildParentText(
+      { ...baseState, requesterLabel: 'Nick Sheth', requestedBy: '507f1f77bcf86cd799439011' },
+      live
+    );
+    check('I1 parent head names requester',
+      withLabel.split('\n')[0],
+      '▸ run_abc1… · Acme · 4 ads · by Nick Sheth');
+
+    await withEnv(CFG, async () => {
+      feed._resetState();
+      feed._setDeps({
+        CampaignRun: makeCampaignRunFromStore(makeClaimStore()),
+        Ad: makeEmptyAd(),
+        fetch: async () => jsonRes(200, { ok: true, ts: '1.0', channel: 'C_STATUS_VERIFY' }),
+        now: () => 1_700_000_000_000
+      });
+      feed.startRun({
+        runId: 'run_by',
+        total: 3,
+        adIds: ['a'],
+        requestedBy: '507f1f77bcf86cd799439011',
+        requesterLabel: 'Nick Sheth'
+      });
+      const st = feed._getRunState('run_by');
+      check('I1b startRun stores label', st && st.requesterLabel, 'Nick Sheth');
+      checkTrue('I1c run-start ring names requester (no Mongo)',
+        !!(st && st.ring.items.some((e) => /by Nick Sheth/.test(e.stage))));
+    });
+
+    // I2 — unknown requester: head is byte-identical to the pre-change format.
+    const without = feed.buildParentText(baseState, live);
+    const withNulls = feed.buildParentText(
+      { ...baseState, requestedBy: null, requesterLabel: null },
+      live
+    );
+    check('I2a null requester byte-identical to omitted fields', withNulls, without);
+    check('I2b head is pre-change format (no dangling ·)',
+      without.split('\n')[0],
+      '▸ run_abc1… · Acme · 4 ads');
+    const withProd = feed.buildParentText({ ...baseState, productLabel: 'Shoe' }, live);
+    check('I2c product head also unchanged',
+      withProd.split('\n')[0],
+      '▸ run_abc1… · Acme · Shoe · 4 ads');
+    checkTrue('I2d no unknown / null / dangling by',
+      !/· by |unknown|null|undefined/.test(without.split('\n')[0]));
+
+    // I3 — id, no resolvable User → shortened id, no throw, no null print.
+    const uid = '507f1f77bcf86cd799439011';
+    let threw = false;
+    let idText = '';
+    try {
+      idText = feed.buildParentText(
+        { ...baseState, requestedBy: uid, requesterLabel: null },
+        live
+      );
+    } catch {
+      threw = true;
+    }
+    checkTrue('I3a id fallback does not throw', !threw);
+    check('I3b parent shows shortId, not full ObjectId',
+      idText.split('\n')[0],
+      '▸ run_abc1… · Acme · 4 ads · by 439011');
+    checkTrue('I3c no null/undefined/full id in parent',
+      !/null|undefined|507f1f77bcf86cd799439011/.test(idText));
+
+    // I4 — requestedBy picked up from the CampaignRun doc (queued-drain /
+    // second-instance). Seed an already-claimed parent so ensureParent does
+    // not clear parentDirty; first flush then hits loadLiveSnapshot.
+    await withEnv(CFG, async () => {
+      feed._resetState();
+      const store = makeClaimStore();
+      store.seed('run_pick', { ts: '10.0', channel: 'C_STATUS_VERIFY' });
+      const base = makeCampaignRunFromStore(store);
+      const CR = {
+        updateOne: (...a) => base.updateOne(...a),
+        findOne: (f) => ({
+          select() { return this; },
+          lean: async () => {
+            const doc = store.get(f.runId) || null;
+            return doc
+              ? { ...doc, requestedBy: uid, total: 2, succeeded: 0, failed: 0, skipped: 0, status: 'running' }
+              : null;
+          }
+        })
+      };
+      const User = {
+        findById(id) {
+          return {
+            select() { return this; },
+            lean: async () => ({ _id: id, displayName: 'Ada Lovelace', email: 'ada@example.com' })
+          };
+        }
+      };
+      installFetch(async (url) => {
+        if (String(url).includes('chat.update')) {
+          return jsonRes(200, { ok: true, ts: '10.0' });
+        }
+        if (String(url).includes('chat.postMessage')) {
+          return jsonRes(200, { ok: true, ts: '10.1', channel: 'C_STATUS_VERIFY' });
+        }
+        return jsonRes(200, { ok: true });
+      });
+      feed._setDeps({
+        CampaignRun: CR,
+        Ad: makeEmptyAd(),
+        User,
+        fetch: global.fetch,
+        now: () => 1_700_000_000_000
+      });
+      feed.startRun({ runId: 'run_pick', total: 2, adIds: ['a', 'b'] });
+      check('I4a startRun has no requestedBy', feed._getRunState('run_pick').requestedBy, null);
+      await feed._flushOnce();
+      const st = feed._getRunState('run_pick');
+      check('I4b requestedBy copied from run doc', st && st.requestedBy, uid);
+      check('I4c requesterLabel from User.displayName', st && st.requesterLabel, 'Ada Lovelace');
+      const updates = fetchCalls.filter((c) => String(c.url).includes('chat.update'));
+      checkTrue('I4d parent update posted', updates.length >= 1);
+      let updateText = '';
+      try { updateText = JSON.parse(updates[0].opts.body).text || ''; } catch { updateText = ''; }
+      checkTrue('I4e parent names Ada', /· by Ada Lovelace/.test(updateText));
+      restoreFetch();
+    });
+
+    // I5 — throwing User lookup must not break the feed (safety contract).
+    await withEnv(CFG, async () => {
+      feed._resetState();
+      const store = makeClaimStore();
+      store.seed('run_boom', { ts: '11.0', channel: 'C_STATUS_VERIFY' });
+      const base = makeCampaignRunFromStore(store);
+      const CR = {
+        updateOne: (...a) => base.updateOne(...a),
+        findOne: (f) => ({
+          select() { return this; },
+          lean: async () => {
+            const doc = store.get(f.runId) || null;
+            return doc
+              ? { ...doc, requestedBy: uid, total: 1, succeeded: 0, failed: 0, skipped: 0, status: 'running' }
+              : null;
+          }
+        })
+      };
+      const User = {
+        findById() { throw new Error('User schema boom'); }
+      };
+      installFetch(async (url) => {
+        if (String(url).includes('chat.update')) {
+          return jsonRes(200, { ok: true, ts: '11.0' });
+        }
+        if (String(url).includes('chat.postMessage')) {
+          return jsonRes(200, { ok: true, ts: '11.1', channel: 'C_STATUS_VERIFY' });
+        }
+        return jsonRes(200, { ok: true });
+      });
+      feed._setDeps({
+        CampaignRun: CR,
+        Ad: makeEmptyAd(),
+        User,
+        fetch: global.fetch,
+        now: () => 1_700_000_000_000
+      });
+      feed.startRun({ runId: 'run_boom', total: 1, adIds: ['a'] });
+      let flushThrew = false;
+      try { await feed._flushOnce(); } catch { flushThrew = true; }
+      checkTrue('I5a flush does not throw when User lookup throws', !flushThrew);
+      const st = feed._getRunState('run_boom');
+      check('I5b requestedBy still copied', st && st.requestedBy, uid);
+      check('I5c label left unset (degrade, do not invent)', st && st.requesterLabel, null);
+      const updates = fetchCalls.filter((c) => String(c.url).includes('chat.update'));
+      let updateText = '';
+      try { updateText = JSON.parse((updates[0] || {}).opts.body).text || ''; } catch { updateText = ''; }
+      checkTrue('I5d parent falls back to shortId', /· by 439011/.test(updateText));
+      checkTrue('I5e no null/undefined printed', !/null|undefined/.test(updateText));
+      restoreFetch();
+    });
+  }
+
   // Cleanup
   feed._resetState();
   restoreFetch();

@@ -289,6 +289,27 @@ check('D3 exact video-only uncapped form (no "0 static" noise)',
   'run start — 39 ad(s) — uncapped batch (15 video)');
 checkTrue('D3b never renders a zero count', !/\b0 static\b|\b0 video\b/.test(uncappedVeo));
 
+// ── D4-D8. requesterLabel — who ordered the run (docs/ALERTING.md).
+// Appended LAST so it survives both the at- and above-threshold branches, and
+// omitted entirely when absent so every existing caller stays byte-identical.
+check('D4 requesterLabel appended below threshold',
+  buildRunStartLine({ total: 12, requesterLabel: 'Ada Lovelace' }),
+  'run start — 12 ad(s) · by Ada Lovelace');
+check('D5 requesterLabel survives the uncapped branch',
+  buildRunStartLine({ total: 39, staticCount: 24, veoCount: 15, requesterLabel: 'ada@example.com' }),
+  'run start — 39 ad(s) — uncapped batch (24 static + 15 video) · by ada@example.com');
+check('D6 omitted when absent — byte-identical to D1',
+  buildRunStartLine({ total: 12, staticCount: 8, veoCount: 4 }),
+  buildRunStartLine({ total: 12, staticCount: 8, veoCount: 4, requesterLabel: null }));
+checkTrue('D7 a non-string / blank label never prints "by undefined" or a dangling ·',
+  [undefined, null, '', '   ', 42, {}, [], true].every((bad) => {
+    const line = buildRunStartLine({ total: 12, requesterLabel: bad });
+    return line === 'run start — 12 ad(s)';
+  }));
+check('D8 label is trimmed, not passed through raw',
+  buildRunStartLine({ total: 3, requesterLabel: '  Ada  ' }),
+  'run start — 3 ad(s) · by Ada');
+
 // ── E. buildPreparingReapNotice / buildClaimAnomalyAlert (wording) ────
 console.log('\nE. buildPreparingReapNotice / buildClaimAnomalyAlert — wording truthfulness');
 
