@@ -235,3 +235,53 @@ estimated, none auto-retried). Stopped short of the original plan (a 20-item
 exposure sample, ~$1.5-1.8 total) on an explicit mid-session instruction to check
 in before further spend given a shared nightly budget — pivoted to free
 CostLog/category data instead, as directed.
+## POST-SCRIPT: a P0 was caught by adversarial review before merge
+
+Grok (`-m grok-4.6 --effort high`) reviewed the full diff independently and found
+the fallback mechanism above was dead code on the actual incident path:
+`singleSeedEligible = !orderedIds.length` is only true for a length-0
+`referenceMediaIds` array, but `renderService.js:208-211` forwards `Ad.mediaIds`
+whenever `Ad.referenceMediaIds` is empty, and every concept-driven static mint
+writes exactly ONE id into `Ad.mediaIds` (`DIRECTOR_UNIVERSE_TOP_N=1`). Confirmed
+directly against the incident's own Ad documents (`mediaIds.length===1`,
+`referenceMediaIds.length===0`) — the fallback would have shipped never
+engaging on the one path it exists for.
+
+Also found and fixed, same review: (1) candidate-list construction could push
+both a resolved override AND the primary as separate starting slots, allowing up
+to 4 submits against a documented cap of 3; (2) a moderation-blocked PRIMARY was
+never recorded to `blocked[]` (guarded on `!isPrimary`), so other creatives kept
+re-paying to rediscover the exact seed the incident was about; (3)
+`nextCandidateIds` checked its cap after pushing, so `limit:0` still returned one
+candidate; (4) `atlasVideoService.js`'s classified-failure error never carried
+`.code`, so a video master rejected for the same reason as its sibling statics
+was invisible to `Ad.renderError.code` and the `moderationBlocked` rollup.
+
+Root cause of why the original test suite didn't catch this: it exported
+`submitEditImageWithSeedFallback` "for behavioural pinning" and never actually
+called it — every check in the original A-D sections tested the taxonomy,
+coordination helpers, and downstream plumbing correctly, but none of them
+exercised the orchestration loop that decides what to submit. My own live
+proofs (described above) also missed this: they called the money function
+directly with `singleSeedEligible: true` hardcoded, bypassing the very
+computation that was broken.
+
+Fixed: the gate is now `moderationSeedFallback.isSingleSeedEligible(orderedIds)`
+(`<= 1`, not `!length`) — a pure, exported, directly-unit-tested function. New
+harness sections E (5 checks on the gate itself) and F (7 checks that call the
+real `submitEditImageWithSeedFallback`, with `atlasImageService`/`models/Media`
+stubbed through `require.cache` and a real `sharp`-generated PNG fixture for the
+reference-fetch/normalise path) close the gap — every one of the five bugs above
+is now individually revert-proven: reintroducing any one of them fails exactly
+the check that targets it, confirmed by hand for all five.
+
+Full suite after these fixes: 172/172, lint clean. No additional Atlas spend —
+all five bugs were found and fixed through source reading plus offline,
+require.cache-mocked tests, zero live submits.
+
+**Lesson for next time, stated plainly:** "call the real function" is not
+sufficient on its own if the caller hand-constructs the inputs to bypass the
+exact logic under review. The live proofs proved the RETRY MECHANISM works;
+they did not prove the ELIGIBILITY GATE that decides whether it runs at all —
+those are different claims, and conflating them is exactly how this shipped
+broken in the first draft.
