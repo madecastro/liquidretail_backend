@@ -2,6 +2,20 @@
 
 Living checklist. Update in place; do not append a duplicate list elsewhere.
 
+- **CLOSED DECISION (forward-only, PR #253): historical spend on
+  `categoryReviewsService`'s grounded pass and `productDetailsService.
+  fetchReviewSummary` before this PR is NOT reconciled or backfilled into
+  CostLog.** Both were bare unledgered `axios.post` calls with zero rows ever
+  written for them; PR #253 instruments the call sites going forward
+  (`trackedGenerate`, stages `category_reviews` / `product_review_summary`) so
+  new calls ledger correctly, but makes no attempt to reconstruct what was
+  already spent before this landed — no historical Google billing record
+  exists to reconcile against, and per standing owner direction (money
+  ledgering is a lower priority than shipping generation work right now,
+  fixed up once things are otherwise working) no backfill script is staged or
+  should be written. `atlasLlmService.post()` missing `maxRedirects: 0`
+  (found adversarially reviewing this same PR, confirmed pre-existing across
+  ~27 files) is tracked as its own separate follow-up, not bundled here.
 - Video multi-surface fan-out (§00 Phase 3) — intent only.
 - `RENDER_AUTH_TOKEN` logs `EXPIRED` at every boot (dead `renderViaSpec` path).
 - `npm error could not determine executable to run` during postinstall — non-fatal.
