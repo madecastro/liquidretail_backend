@@ -69,20 +69,19 @@ it clears it back to this placeholder in the same commit that closes it out.)_
 *(Replace this whole section, don't append to it, when it goes stale.)*
 
 - Trunk `main` is moving fast — always `git fetch` before trusting a SHA here.
-  As of this update, `main` was at `c633e2c1` (apify-ig ingest comments
-  backfill). **#239, #240, #241, #242 merged** since the previous snapshot
-  below (dcca06cb).
+  As of this update, `main` was at `737732b9` (test-hardening on #247).
+  **#239, #240, #241, #242, #243, #245, #247 + a worker lease Phase-1-prep
+  commit merged** since the previous snapshot below (`dcca06cb`).
 - Open PRs at the time of this update: RPD **#210/#212** (deliberately
-  deferred — do not touch). New this session: `fix/crossbrand-tenancy-generate`
-  — POST /generate never asserted requested productIds belong to the
-  campaign's brand; closed both in the route and in
-  `buildSeededUniverse`'s product-mode catalog query. Rescued from an
-  orphaned uncommitted working tree, verified against prod (26 cross-branded
-  ads, 7 brand pairs, ~$17.54 already billed on 23 of them — **not**
-  retroactively cleaned up, see KNOWN-OPEN), landed with a new offline
-  harness. See `session.d/2026-08-19_crossbrand-tenant-leak-generate-fix.md`.
+  deferred — do not touch). Newest two backend sessions, both landed:
+  `fix/crossbrand-tenancy-generate` (PR #245 — POST /generate never asserted
+  requested productIds belong to the campaign's brand; see
+  `session.d/2026-08-19_crossbrand-tenant-leak-generate-fix.md`) and
+  `fix/reels-overflow-element-safety` (this session, follow-up to #239 —
+  element-aware title overflow, see
+  `session.d/2026-08-19_reels-rating-row-half-sliced-fixed-element-aware-overflow.md`).
 - Offline verify: `for f in scripts/verify*.js scripts/verify*.mjs; do node "$f" || echo "FAIL $f"; done`
-  — **170 scripts** as of this update (re-count before quoting, this number
+  — **171 scripts** as of this update (re-count before quoting, this number
   drifts; use `node`'s own child_process timeout rather than shell job
   control if you wrap this in a runner — a bash `&`/`wait` timeout wrapper
   nested under this harness's own backgrounding misbehaved and silently
@@ -108,8 +107,11 @@ it clears it back to this placeholder in the same commit that closes it out.)_
   still has no `timeout` binary — a loop that wraps each script in `timeout`
   will misreport all of them as failed regardless of the above.
 - Most recent entries (see `session.d/`, newest by filename date):
-  `2026-08-19_crossbrand-tenant-leak-generate-fix.md` (this update;
-  `fix/crossbrand-tenancy-generate`),
+  `2026-08-19_reels-rating-row-half-sliced-fixed-element-aware-overflow.md`
+  (this session — follow-up to #239: a title group can now shrink/drop whole
+  elements to fit its box instead of `overflow:hidden` clipping through the
+  middle of one; `remotion/lib/stackFit.js` is new),
+  `2026-08-19_crossbrand-tenant-leak-generate-fix.md` (PR #245, merged),
   `2026-08-19_video-vision-qc.md` (video ads now get the same post-render
   vision QC statics have; landed as PR #240),
   `2026-08-19_undispatched-tail-fix-stranded-ads-close-the-loop.md` (PR #241, merged),
