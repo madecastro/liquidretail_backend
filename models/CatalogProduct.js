@@ -115,7 +115,31 @@ const catalogProductSchema = new mongoose.Schema({
   description:  String,
   brand:        String,    // Meta's "brand" field (often the brand name)
   category:     String,    // Meta's category string (taxonomy varies)
-  price:        Number,    // numeric only — currency stored separately
+  // UNIT CONTRACT (pinned 2026-08-18 after the Pelagic ZA/USD incident —
+  // see scripts/verifyCatalogPriceCurrencyGuard.js): `price` is USD MAJOR
+  // UNITS as a plain Number, e.g. 150 or 150.5 means $150.00 / $150.50.
+  // NOT cents. Every ingestion path writes this convention today —
+  // apifyPullService.normalizeShopifyProduct, shopifyPublicIngestService's
+  // flat mapper, genericCatalogResolver — and every reader (layoutInputService
+  // `$${cp.price.toFixed(2)}`, renderService.extractCopySnapshot,
+  // remotion PriceSlot) assumes it too. `currency` SHOULD always be 'USD'
+  // for this field to be trusted; a source that cannot confirm the
+  // storefront's real currency is USD must leave BOTH null rather than
+  // write a foreign-currency number under the USD assumption. This was
+  // violated for Pelagic Gear: `Brand.apifyDemo.shopifyUrl` pointed at
+  // `za.pelagicgear.com` (a real, separate South-African Shopify store,
+  // currency ZAR) instead of the US store, so every stored `price` was
+  // the correct ZAR list price mislabeled `currency:'USD'` — read as
+  // dollars it was ~19.97-19.99x too high (that ratio is the live
+  // USD/ZAR rate, not a cents/dollars bug). Apify's Shopify actor
+  // (webdatalabs/shopify-product-scraper) returned `currency:"USD"` for
+  // that store regardless of its real currency, so trusting the scraped
+  // `currency` field is not sufficient — ingestion now cross-checks the
+  // storefront's own `/meta.json` before writing (see
+  // shopifyAccessResolver.verifyStoreCurrencyUsd, used by both
+  // apifyIngestService.syncBrandShopify and
+  // shopifyPublicIngestService.syncBrandShopifyDirect).
+  price:        Number,
   currency:     String,
   availability: String,    // "in stock" | "out of stock" | etc.
 

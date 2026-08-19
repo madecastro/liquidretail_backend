@@ -6,6 +6,49 @@ read `session.md`; this file only answers "when did that change, and why".
 
 Newest first.
 
+## 2026-08-18/19 — Pelagic Gear onboarding: price/currency incident found + fixed, catalog re-ingested 57→831
+
+**Root cause of the ~19.97-19.99x inflated `CatalogProduct.price` on Pelagic Gear
+(source:'apify-shopify'), found and fixed, NOT a cents/dollars unit bug.**
+`Brand.apifyDemo.shopifyUrl` was pointed at `za.pelagicgear.com` — a real,
+independently-operated South-African Shopify store (`/meta.json` →
+`{"currency":"ZAR","country":"ZA"}`), not a presentment variant of the US
+store. Every stored price was the CORRECT ZAR list price, silently mislabeled
+`currency:"USD"` by the Apify actor. Fixed:
+- **Data**: `apifyDemo.shopifyUrl` corrected to `https://pelagicgear.com` via
+  `PATCH /api/sales-demos/brands/:id` (not a raw DB write).
+- **Code**: `services/shopifyAccessResolver.js#verifyStoreCurrencyUsd` — cross-checks
+  a target storefront's real `/meta.json` currency before either ingestion path
+  (`apifyIngestService.syncBrandShopify`, `shopifyPublicIngestService.syncBrandShopifyDirect`)
+  trusts it; refuses on a CONFIRMED mismatch (before the PAID Apify call spends
+  anything), does not block on an inconclusive check. `models/CatalogProduct.js`
+  now documents the USD-major-units unit contract explicitly.
+- **Defense in depth**: `remotion/components/slotRenderers.jsx` `PriceSlot` no
+  longer does a blind `` `$${raw}` `` concat (would have printed e.g. "$2999" for
+  any untrusted upstream number); now formats via `remotion/lib/priceFormat.js`
+  and renders nothing rather than a number it cannot vouch for. Unreachable in
+  production today (no live titleStyleSpec has a visible price slot; static/Director
+  prompts ban price text) but a preset with one already exists in the repo
+  (`babyboo-editorial-monochrome.json`) — this closed a real, if currently dormant,
+  landmine. The wrong number HAD already reached `Ad.copy.productPrice` (shown in
+  app UI) on real draft/failed Pelagic ads before this fix — not retroactively
+  corrected here, flagged as a follow-up.
+- Pinned by `scripts/verifyCatalogPriceCurrencyGuard.js` (27 checks, revert-proven
+  on 4 mutations). Full write-up: `docs/PIPELINES.md` §1 *Price & currency contract*.
+
+**Catalog re-ingested 57 → 831 live products (100% of the 824-product live
+storefront + 7 detect-identified), via the FREE `shopify-direct` public
+storefront ladder** (not Apify — see `session.md` for the "no native Shopify
+connector exists" finding). The 50 stale `apify-shopify` rows (wrong price,
+dead handles) were soft-deleted via the existing `catalog.bulkDeleteProducts`
+capability (reversible; cascade-cleaned 2 Campaign refs, 1 Media ref, 174
+Ad.productId refs — no Ad creative was touched, `copy`/`renderUrl` snapshots
+are frozen at render time). 31 of the 50 matched a live product under a new
+colorway-suffixed handle (reconciled); 19 appear genuinely discontinued.
+
+See `session.md` for full timing/bottleneck data and the generation-readiness
+test.
+
 ## 2026-08-03
 
 Prod moved `a80ae0b` → `f96e0a6` after 24 fixes had sat unpushed for a day, so every QC

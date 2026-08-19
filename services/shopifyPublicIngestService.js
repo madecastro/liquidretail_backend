@@ -346,6 +346,29 @@ async function syncBrandShopifyDirect(brand, run, { isBrandAborted } = {}) {
 
   const CAP = Math.max(1, parseInt(process.env.SHOPIFY_DIRECT_LIMIT, 10) || DEFAULT_PRODUCT_CAP);
 
+  // Same money+correctness guard as apifyIngestService.syncBrandShopify (see
+  // its comment and shopifyAccessResolver.verifyStoreCurrencyUsd's header) —
+  // this path is free of Apify cost, but it can still write a wrong-currency
+  // price under the assumed-USD contract if `origin` is misconfigured. A
+  // POSITIVE, confirmed non-USD currency refuses; an inconclusive check does
+  // not block (this endpoint publishes no currency field at all today — see
+  // the header comment — so most runs fall through to that path unchanged).
+  const { verifyStoreCurrencyUsd } = require('./shopifyAccessResolver');
+  const currencyCheck = await verifyStoreCurrencyUsd(origin);
+  if (currencyCheck.mismatch) {
+    console.warn(`🛍  Shopify-direct sync REFUSED: brand=${brand._id} store=${origin} currency=${currencyCheck.currency} (expected USD) — see models/CatalogProduct.js price unit contract`);
+    return {
+      productsUpserted: 0,
+      videosIngested: 0,
+      reviewsCaptured: 0,
+      errors: [`store currency is ${currencyCheck.currency}, not USD — refusing to write CatalogProduct.price under the wrong currency`],
+      ok: false,
+      reason: `store currency is ${currencyCheck.currency}, not USD`,
+      currencyMismatch: true,
+      detectedCurrency: currencyCheck.currency
+    };
+  }
+
   console.log(`🛍  Shopify-direct sync starting: brand=${brand._id} store=${origin} cap=${CAP}`);
 
   // ── Stage 1: acquire the catalog via the resolver ladder ─────────
@@ -456,7 +479,11 @@ async function syncBrandShopifyDirect(brand, run, { isBrandAborted } = {}) {
             description:      flat.description,
             brand:            flat.brand || brand.name || null,
             price:            flat.price,
-            currency:         flat.currency,
+            // flat.currency is always null on this path (products.json /
+            // .js expose no currency field — see file header). Once we've
+            // independently verified the store via /meta.json above, store
+            // the TRUE currency rather than leaving it null/defaulted.
+            currency:         currencyCheck.verified ? currencyCheck.currency : flat.currency,
             availability:     flat.availability,
             imageUrl:         flat.imageUrl,
             additionalImages: flat.additionalImages,

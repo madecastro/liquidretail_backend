@@ -32,6 +32,7 @@ import {
   suffixOpacityAt,
   lineFadeOpacityAt,
 } from '../lib/ratingMotion.js';
+import { formatBarePriceUsd } from '../lib/priceFormat.js';
 
 // Base text size (px at native canvas) per slot per format — derived from
 // the canvas canonicals' clamp() outputs at 1080×1920 / 1080×1350 / 1920×1080.
@@ -644,9 +645,13 @@ export const PriceSlot = ({ slot, content, tokens, dims, format }) => {
   const size = baseSize('price', format, t.sizeScale);
   const font = tokenFont(tokens, t.fontRole === 'body' ? 'heading' : t.fontRole);
   const raw = String(content);
-  // Only prefix a bare number — anything already carrying a currency
-  // marker anywhere ('From $48', '£29', '48 USD') passes through.
-  const text = /[$€£¥]|usd|eur|gbp/i.test(raw) ? raw : `$${raw}`;
+  // Anything already carrying a currency marker anywhere ('From $48',
+  // '£29', '48 USD') is assumed pre-formatted upstream and passes through
+  // verbatim. A bare number is reformatted from the USD-major-units
+  // contract above — never blindly string-concatenated.
+  const hasCurrencyMarker = /[$€£¥]|usd|eur|gbp/i.test(raw);
+  const text = hasCurrencyMarker ? raw : formatBarePriceUsd(raw);
+  if (text == null) return null;
   return (
     <div style={{ ...scrimStyle(t, tokens, dims), display: 'inline-block' }}>
       <span style={{ fontFamily: fontFamilyCss(font), fontWeight: Math.max(t.weight, 700), fontSize: size, color: tokenColor(tokens, t.colorToken), textShadow: textShadowFor(t.shadow, tokenColor(tokens, t.colorToken)) }}>

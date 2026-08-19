@@ -352,6 +352,30 @@ async function syncBrandShopify(brand, run = null) {
   const shopifyUrl = brand.apifyDemo?.shopifyUrl;
   if (!shopifyUrl) return { ok: false, reason: 'no Shopify URL configured' };
 
+  // Money + correctness guard, added after the Pelagic Gear incident: a
+  // misconfigured apifyDemo.shopifyUrl pointed at za.pelagicgear.com (a real,
+  // separate South-African Shopify store, currency ZAR) instead of the US
+  // store. Apify's actor returned currency:"USD" for that store regardless of
+  // its real currency, so every scraped price was a correct ZAR number
+  // silently mislabeled USD (~19.97-19.99x too high once read as dollars —
+  // that ratio is the live USD/ZAR rate, not a cents/dollars unit bug). This
+  // is a FREE check (no Apify actor run) done BEFORE the paid pull below, so
+  // a misconfigured brand fails fast without spending anything. Only a
+  // POSITIVE, confirmed mismatch refuses the sync — see
+  // shopifyAccessResolver.verifyStoreCurrencyUsd's header comment for why an
+  // inconclusive check (network error, no currency field) must not block.
+  const { verifyStoreCurrencyUsd } = require('./shopifyAccessResolver');
+  const currencyCheck = await verifyStoreCurrencyUsd(shopifyUrl);
+  if (currencyCheck.mismatch) {
+    console.warn(`🛍  Apify Shopify sync REFUSED: brand=${brand._id} shop=${shopifyUrl} currency=${currencyCheck.currency} (expected USD) — see models/CatalogProduct.js price unit contract`);
+    return {
+      ok: false,
+      reason: `store currency is ${currencyCheck.currency}, not USD — refusing to write CatalogProduct.price under the wrong currency (see models/CatalogProduct.js)`,
+      currencyMismatch: true,
+      detectedCurrency: currencyCheck.currency
+    };
+  }
+
   console.log(`🛍  Apify Shopify sync starting: brand=${brand._id} shop=${shopifyUrl}`);
   const products = await pullShopifyProducts(shopifyUrl);
 
@@ -392,7 +416,14 @@ async function syncBrandShopify(brand, run = null) {
             description:     p.description || null,
             brand:           p.brand || brand.name || null,
             price:           p.price,
-            currency:        p.currency,
+            // Prefer the INDEPENDENTLY VERIFIED store currency over the
+            // actor's own per-product field once we've confirmed it above —
+            // the actor is not a reliable reporter of currency (it returned
+            // "USD" for the ZAR Pelagic incident store). When the check was
+            // inconclusive (currencyCheck.verified === false, mismatch ===
+            // false), fall back to whatever the actor reported, same as
+            // before this fix.
+            currency:        currencyCheck.verified ? currencyCheck.currency : p.currency,
             availability:    p.availability,
             imageUrl:        p.imageUrl || null,
             // p.additionalImageUrls is ALREADY the alt list (hero is
