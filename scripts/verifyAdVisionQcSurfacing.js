@@ -274,14 +274,30 @@ check('B4 a shipped-without-QC ad (skipped) never projects passed:true on either
 
 const adsSrc = fs.readFileSync(path.join(__dirname, '..', 'routes', 'ads.js'), 'utf8');
 
-function sliceFrom(marker, span) {
+// Bounds a route-handler marker at the NEXT top-level route declaration (or
+// EOF) instead of a hand-tuned char count, same fix and same reasoning as
+// verifyRunStatusTruthfulness.js's sliceHandler: a fixed span drifts stale the
+// moment the handler grows past it — MEASURED again 2026-08-19, when
+// services/moderationSeedFallback.js's `moderationBlocked` rollup pushed this
+// exact handler's `res.json({...})` past this file's old hardcoded 6000-char
+// sliceFrom, which is precisely the class of fragility that made
+// verifyRunStatusTruthfulness.js switch to this pattern one PR earlier. A span
+// that over-reaches past the real handler boundary would be worse than a scan
+// that can't find its target: a positive assertion ("the handler contains X")
+// could then pass on code belonging to a different route entirely — a
+// silent, unfalsifiable pass, not a scoping bug that fails loud.
+// Self-maintaining: never needs re-tuning as router.get('/runs/:runId') grows.
+function sliceFrom(marker) {
   const start = adsSrc.indexOf(marker);
   if (start === -1) return null;
-  return adsSrc.slice(start, start + span);
+  const routeDeclRe = /router\.(get|post|patch|put|delete)\(/g;
+  routeDeclRe.lastIndex = start + marker.length;
+  const next = routeDeclRe.exec(adsSrc);
+  return adsSrc.slice(start, next ? next.index : adsSrc.length);
 }
 
 check('C1 GET /runs/:runId actually returns visionQcRollup.{shippedWithoutQc,qcdOnRetry} in its res.json object', () => {
-  const handler = sliceFrom("router.get('/runs/:runId'", 6000);
+  const handler = sliceFrom("router.get('/runs/:runId'");
   assert.ok(handler, 'could not locate the GET /runs/:runId handler to scope this check');
   const rjStart = handler.indexOf('res.json({');
   assert.ok(rjStart !== -1, 'no res.json({ call found in the handler');
@@ -294,7 +310,7 @@ check('C1 GET /runs/:runId actually returns visionQcRollup.{shippedWithoutQc,qcd
 });
 
 check('C2 the rollup is actually QUERIED (Ad.countDocuments against visionQc.* filters), not just named in the response', () => {
-  const handler = sliceFrom("router.get('/runs/:runId'", 6000);
+  const handler = sliceFrom("router.get('/runs/:runId'");
   assert.ok(handler);
   assert.match(handler, /Ad\.countDocuments\(\{[^}]*'visionQc\.skipped':\s*true/,
     'must query the shipped-without-QC count against visionQc.skipped, not fabricate the number');
@@ -303,7 +319,7 @@ check('C2 the rollup is actually QUERIED (Ad.countDocuments against visionQc.* f
 });
 
 check('C3 the rollup queries are scoped to THIS run (campaignRunIds), not the whole brand/campaign', () => {
-  const handler = sliceFrom("router.get('/runs/:runId'", 6000);
+  const handler = sliceFrom("router.get('/runs/:runId'");
   assert.ok(handler);
   const rollupBlock = handler.slice(
     handler.search(/Ad\.countDocuments\(\{[^}]*'visionQc\.skipped'/),
