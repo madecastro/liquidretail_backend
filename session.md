@@ -9,7 +9,8 @@ was judged superseded and dropped **deliberately**, not lost.
 ## 2026-08-19 — The 40% CostLog over-claim was the VISION surcharge, not grounding. UNCOMMITTED
 
 Branch `fix/grounded-surcharge-overstatement`, worktree `.worktrees/cost-grounding-surcharge`,
-off `8db473c6`. Coordinated with rs-7c (traffic cop) first — no open PR touches `costTracker.js`;
+off `8db473c6`. **PUSHED, PR OPEN: [#237](https://github.com/Emami-RS-Project/liquidretail_backend/pull/237)** —
+not yet merged; rs-7c (traffic cop) is gating/sequencing. Coordinated with rs-7c (traffic cop) first — no open PR touches `costTracker.js`;
 `fix/cost-run-attribution` touches only the meta/param plumbing, not `computeCost`.
 
 **The starting hypothesis was wrong, and provably so.** `scripts/reconcileAtlasDailyCosts.js`
