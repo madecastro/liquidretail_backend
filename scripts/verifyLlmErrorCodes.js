@@ -94,12 +94,23 @@ check('A1 the scan found EXACTLY the expected LLM posters (an inventory, not a f
   // exactly how an unguarded call site comes back. Enumerate instead — a new
   // LLM-posting module MUST be added here deliberately, which is the moment
   // someone asks whether it reports coded failures.
+  // TWO FILES LEFT THIS LIST ON 2026-08-19, and the reason matters, because the
+  // failure message below correctly says a DISAPPEARANCE usually means the
+  // scanner broke. It did not here: `categoryReviewsService` and
+  // `productDetailsService` stopped posting to an LLM endpoint AT ALL. Their
+  // grounded Gemini calls now go through geminiSearchProvider.trackedGenerate
+  // (still listed) and their structuring pass through atlasLlmService (still
+  // listed), so the transport — and its coded-failure reporting — moved INTO
+  // modules this inventory already covers. That was the whole point: an
+  // unledgered direct POST is what the change removed.
+  //
+  // Their own coded-failure reporting did NOT go away, and A1b below is what
+  // stops this edit from being a quiet coverage drop: both still classify and
+  // report their own LLM failures, they just no longer own the socket.
   const EXPECTED = [
     'services/atlasLlmService.js',
     'services/atlasLlmStreamService.js',
     'services/atlasTextService.js',
-    'services/categoryReviewsService.js',
-    'services/productDetailsService.js',
     'services/providers/geminiSearchProvider.js',
     'services/textEmbeddingService.js',
   ].sort();
@@ -107,6 +118,35 @@ check('A1 the scan found EXACTLY the expected LLM posters (an inventory, not a f
   assert.deepStrictEqual(found, EXPECTED,
     'the LLM-poster inventory changed. If a module was ADDED, wire it to services/llmError.js and list it here. ' +
     'If one DISAPPEARED, the scanner is broken — do not just delete the line.');
+});
+
+check('A1b modules that DELEGATE their LLM transport still report coded failures', () => {
+  // A1's inventory only sees files that own a socket. A file that hands its call
+  // to a ledgered transport drops out of that scan — and would drop out of
+  // A2/A3/A4 with it, silently. These two are exactly that case as of 2026-08-19,
+  // so they are checked explicitly: each must still import the taxonomy, still
+  // classify, and still name the action it took, for the LLM failures it handles.
+  const DELEGATORS = [
+    'services/categoryReviewsService.js',
+    'services/productDetailsService.js',
+  ];
+  for (const r of DELEGATORS) {
+    const full = path.join(REPO, r);
+    assert.ok(fs.existsSync(full), `${r} is gone — if it was deleted, delete this line too`);
+    const src = fs.readFileSync(full, 'utf8');
+    assert.ok(/require\(['"][./]*(\.\.\/)?llmError['"]\)/.test(src),
+      `${r} must still import services/llmError.js`);
+    assert.ok(/classifyLlmFailure\(/.test(src), `${r} must still classify its LLM failures`);
+    assert.ok(/LLM_ACTIONS\./.test(src), `${r} must still stamp the action it took`);
+    // And it must NOT have quietly regained a direct LLM socket — that would be a
+    // billable, unledgered call, which is what leaving A1's list was about.
+    // Asserted against the REAL scan rather than a second, weaker regex: a
+    // hand-rolled /axios\.post\(/ here missed `require('axios').post(` when this
+    // was probed. The scan above already resolves that correctly, so reuse it.
+    assert.ok(!llmPosters.map(rel).includes(r),
+      `${r} owns an LLM socket again — put it back in A1's EXPECTED list, and make sure ` +
+      `that POST is ledgered (see scripts/verifyGroundedGeminiLedger.js)`);
+  }
 });
 
 check('A2 every scanned LLM poster IMPORTS the shared taxonomy (not just calls it)', () => {

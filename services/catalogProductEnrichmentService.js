@@ -144,13 +144,19 @@ async function enrichOne(product, { includeDetails = false } = {}) {
   // SERPAPI is disabled.
   if (includeDetails && productDetailsService.isEnabled()) {
     try {
+      // brandId threaded too (adversarial-review finding, 2026-08-19):
+      // `product.brandId` is a real, required ObjectId field on CatalogProduct
+      // (models/CatalogProduct.js) — previously not passed, so this path's
+      // product_review_summary CostLog rows carried brandId:null despite the
+      // brand being right there on the document being enriched.
       await productDetailsService.fetchProductDetails(
         {
           productName: product.title,
           brand:       product.brand || null,
           variant:     null
         },
-        id
+        id,
+        product.brandId || null
       );
     } catch (err) {
       console.warn(`   ⚠️  enrich-details ${label}: ${err.message}`);

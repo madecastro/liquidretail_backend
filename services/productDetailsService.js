@@ -39,7 +39,17 @@ const {
   extractRequestId, formatLlmLogLine,
 } = require('./llmError');
 
-const GEMINI_MODEL = process.env.GEMINI_SEARCH_MODEL || 'gemini-2.5-flash';
+// The LEDGERED direct-Gemini REST transport, plus the model id it records.
+// IMPORTED, NOT RE-IMPLEMENTED: fetchReviewSummary below is a grounded
+// generativelanguage call, and trackedGenerate is the one place that gets the
+// three easy-to-miss details right (resolve the response BODY so
+// costTracker.extractUsage can see usageMetadata; declare the per-REQUEST
+// grounding surcharge, which is ~90% of a grounded call's true cost; pin
+// maxRedirects:0 per CLAUDE.md §2). GEMINI_MODEL was a local
+// `process.env.GEMINI_SEARCH_MODEL || 'gemini-2.5-flash'` — same value, but a
+// second declaration, so the model this file names in its error log could drift
+// from the model the ledger row records. One definition now.
+const { trackedGenerate, GEMINI_REST_MODEL: GEMINI_MODEL } = require('./providers/geminiSearchProvider');
 const TTL_MS   = 30 * 24 * 60 * 60 * 1000;   // 30 days — matches productReviews/brandReviews
 
 const _rawKey = process.env.SERPAPI_API_KEY || '';
@@ -57,7 +67,7 @@ function isEnabled() { return !!_key; }
 //
 // Without a catalogProductId, behavior is unchanged from Phase 1.9 —
 // always fetches fresh, returns the merged result, no persistence.
-async function fetchProductDetails(identification, catalogProductId = null) {
+async function fetchProductDetails(identification, catalogProductId = null, brandId = null) {
   if (!isEnabled()) throw new Error('SERPAPI_API_KEY not set');
   if (!identification?.productName) return null;
 
@@ -90,7 +100,12 @@ async function fetchProductDetails(identification, catalogProductId = null) {
     fetchReviewSummary({
       productName: identification.productName,
       brand:       identification.brand,
-      variant:     identification.variant
+      variant:     identification.variant,
+      // For the COST LEDGER only — join the grounded call's CostLog row back to
+      // the SKU and, where the caller has one, the brand. Both optional: a call
+      // without either still ledgers, just less joined.
+      catalogProductId,
+      brandId
     })
   ]);
 
@@ -270,7 +285,7 @@ async function fetchImmersiveProduct(pageToken) {
 // fails. Mirrors the grounded-search pattern used in geminiSearchProvider.js:
 // text body is taken from response content parts, cited sources come from
 // groundingMetadata.groundingChunks (authoritative URL list, not prose parsing).
-async function fetchReviewSummary({ productName, brand, variant }) {
+async function fetchReviewSummary({ productName, brand, variant, catalogProductId = null, brandId = null }) {
   if (!process.env.GEMINI_API_KEY) return null;
   if (!productName) return null;
 
@@ -286,11 +301,37 @@ async function fetchReviewSummary({ productName, brand, variant }) {
     `Weight recent reviews higher. Synthesize trends — do NOT include individual review quotes or star ratings. ` +
     `If the product has very limited reviews, say so plainly.`;
 
-  const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent`;
+  // `endpoint` deleted 2026-08-19 — the direct REST URL lives in ONE place now
+  // (providers/geminiSearchProvider, behind trackedGenerate). Re-adding it here
+  // means someone is about to bypass the ledger again.
   const t0 = Date.now();
   try {
-    const res = await axios.post(
-      `${endpoint}?key=${encodeURIComponent(process.env.GEMINI_API_KEY)}`,
+    // LEDGERED 2026-08-19 (second pass). This was a bare axios.post: every
+    // UGC product_match and every user-triggered "Enrich" billed Google — the
+    // ~$0.035-per-request grounding surcharge included, which dwarfs the tokens
+    // — and wrote NOTHING to CostLog, so the path read as free. Note the gate is
+    // SERPAPI_API_KEY (via fetchProductDetails, for the sibling shopping lookup),
+    // not this call's own key, so it ran wherever both keys were set.
+    //
+    // STAYS ON THE DIRECT REST TRANSPORT, proven not assumed: it is genuinely
+    // grounded (`tools: [{ google_search: {} }]` below), and the ATLAS GROUNDING
+    // PROBE comment in providers/geminiSearchProvider.js records four live probes
+    // showing Atlas rejects or silently drops every way of asking for
+    // google_search on this model. Re-probe live before "finishing" any
+    // migration of this line.
+    const data = await trackedGenerate(
+      {
+        stage: 'product_review_summary',
+        purposeTag: 'grounded_search',
+        grounded: true,
+        // brandId is OPTIONAL and often absent: `identification.brand` is
+        // usually a brand NAME string, not a Brand._id, and several production
+        // callers (scene-level UGC detect, per-match enrichment) never resolved
+        // one. Where a caller genuinely holds a Brand._id (CatalogProduct.brandId
+        // is a real, required field) it is threaded through; where it does not,
+        // this stays null honestly rather than guessing from the name string.
+        ledger: { productId: catalogProductId, brandId, cacheKey: descriptor }
+      },
       {
         contents: [{ role: 'user', parts: [{ text: prompt }] }],
         tools: [{ google_search: {} }],
@@ -307,24 +348,42 @@ async function fetchReviewSummary({ productName, brand, variant }) {
           thinkingConfig: { thinkingBudget: 512 }
         }
       },
-      { timeout: 45000 }
+      // LEFT AT THE MEASURED 45s DELIBERATELY, and it is a known, stated
+      // trade-off rather than an oversight. A timeout throws away a grounded call
+      // Google has already billed, and trackLlmCall's error path ledgers it at $0
+      // AND stamps costSource:'none' — which CostLog defines as "confirmed
+      // nothing was charged", a stronger claim than the truth (the per-request
+      // grounding fee was very likely billed at send). Both halves are pinned as
+      // a deliberate shared-semantics limit (verifyGeminiSearchCost C7,
+      // verifyGroundedGeminiLedger F10); fixing the mislabel means teaching
+      // trackLlmCall's catch to distinguish pre-send from post-send failures for
+      // EVERY consumer, which is its own change. So a timeout here is an
+      // UNDER-report that additionally claims certainty. Raising this to
+      // GROUNDED_CALL_TIMEOUT_MS (120s), as the review lookups use, would shrink
+      // that; but unlike those, this call sits inside a Promise.allSettled on a
+      // USER-ACTUATED "Enrich", so it would add up to 75s of wall clock to a
+      // click. Not changed as a side effect of a ledger fix; needs its own
+      // latency-vs-waste call.
+      45000
     );
 
-    const candidate = res.data?.candidates?.[0];
+    // `data` is the response BODY (trackedGenerate returns r.data — what
+    // costTracker.extractUsage reads usageMetadata off), so no `.data` hop.
+    const candidate = data?.candidates?.[0];
     const finishReason = candidate?.finishReason || 'unknown';
     const summary = (candidate?.content?.parts || [])
       .map(p => p.text || '')
       .join(' ')
       .trim();
     if (!summary) {
-      const usage = res.data?.usageMetadata || {};
+      const usage = data?.usageMetadata || {};
       console.log(`   ○ gemini-reviews: empty summary for "${descriptor}" (finishReason=${finishReason}, tokens out=${usage.candidatesTokenCount || 0} thought=${usage.thoughtsTokenCount || 0}) in ${Date.now() - t0}ms`);
       return null;
     }
     // Surface truncation so we notice immediately in logs rather than only
     // when a user complains the summary ends mid-word.
     if (finishReason === 'MAX_TOKENS') {
-      const usage = res.data?.usageMetadata || {};
+      const usage = data?.usageMetadata || {};
       console.warn(`   ⚠️  gemini-reviews: hit MAX_TOKENS for "${descriptor}" (out=${usage.candidatesTokenCount || 0} thought=${usage.thoughtsTokenCount || 0}) — summary may be truncated`);
     }
 
@@ -382,5 +441,11 @@ module.exports = {
   // — not a new public API. Lets the harness EXECUTE the real write-through
   // decision (stubbed CatalogProduct.findById/updateOne) instead of asserting
   // over source text.
-  writeThroughToCatalogProduct
+  writeThroughToCatalogProduct,
+  // Same reason (scripts/verifyGroundedGeminiLedger.js). A source-text harness
+  // cannot prove a CostLog row was written with the right stage, surcharge and
+  // linkage — only calling the real function against a stubbed transport can,
+  // and calling fetchProductDetails instead would drag in SerpAPI. Not a new
+  // public API: nothing outside this file and that harness may call it.
+  fetchReviewSummary
 };
