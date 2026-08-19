@@ -35,7 +35,11 @@ const CatalogProduct       = require('../models/CatalogProduct');
 //   Real Meta/IG: IntegrationCredential row + Media.source='instagram'
 //                 + CatalogProduct.source='ig-catalog'.
 //   Sales demo:   Brand.apifyDemo config + Media.source='apify-ig'
-//                 + CatalogProduct.source='apify-shopify'. No OAuth.
+//                 + CatalogProduct rows from ANY ingest path. No OAuth.
+//                 Historically this meant CatalogProduct.source='apify-shopify',
+//                 but 'shopify-direct' (free public-storefront ladder) and
+//                 'generic-sitemap' are now the common paths — the catalog
+//                 gate below counts all of them, deliberately.
 //
 // Social presence is defined by ACTUAL ingested posts, not by the
 // presence of a credential or config — a brand that only synced
@@ -53,8 +57,31 @@ async function probeConnections(brandId) {
 
   const [socialMediaCount, demoCatalogCount] = await Promise.all([
     Media.countDocuments({ brandId, source: { $in: ['instagram', 'apify-ig'] } }),
+    // Count products from ANY ingest path, not just the legacy paid-Apify one.
+    //
+    // This used to be hardcoded to `source: 'apify-shopify'`, which was the
+    // only demo ingest path when this gate was written. Two more have shipped
+    // since — `shopify-direct` (the FREE public-storefront ladder we now
+    // prefer, $0 vs a paid actor run) and `generic-sitemap` — and neither was
+    // ever added here. The gate's own contract, stated in this file's header,
+    // is "the demo's shopifyUrl WITH at least one product row"; it was
+    // silently enforcing "…with at least one row ingested by one specific
+    // deprecated method".
+    //
+    // Measured impact when found (2026-08-19): 11 of 17 demo brands with a
+    // configured shopifyUrl were locked out of creating a campaign at all,
+    // despite full catalogs — Vuori 2 (9,185 products), Marine Layer (2,444),
+    // Marine Layer 2 (2,295), GymShark, Peloton, PB5Star, Vuori Clothing,
+    // Living Spaces, Fellow Products, Fanatics, Ubeauty. Pelagic Gear passed
+    // only by accident: it still carries 50 SOFT-DELETED legacy apify-shopify
+    // rows alongside its 824 live shopify-direct ones, so a hard delete of
+    // tombstoned rows would have blocked the first client too.
+    //
+    // `deletedAt: null` matters for the same reason — a brand whose entire
+    // catalog has been tombstoned genuinely has nothing to advertise, and
+    // must not read as ready off dead rows.
     apifyDemo.shopifyUrl
-      ? CatalogProduct.countDocuments({ brandId, source: 'apify-shopify' })
+      ? CatalogProduct.countDocuments({ brandId, deletedAt: null })
       : Promise.resolve(0)
   ]);
 
