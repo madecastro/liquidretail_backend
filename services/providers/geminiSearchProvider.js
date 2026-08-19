@@ -719,6 +719,21 @@ function isEnabled() { return !!process.env.GEMINI_API_KEY; }
  *
  * `ledger` carries the linkage ids (brandId / productId) so these rows join
  * back to a brand the way every other CostLog row does.
+ *
+ * EXPORTED, AND SHARED BY THREE FILES (2026-08-19, second pass). It is also the
+ * transport for the two OTHER grounded `generativelanguage` call sites that were
+ * left unledgered by the first pass — `categoryReviewsService` (category-level
+ * grounded review search) and `productDetailsService.fetchReviewSummary`
+ * (product-level grounded review narrative). Both had the identical defect
+ * `match()` had: a bare `axios.post`, billing Google (~$0.035 of grounding per
+ * call before a token is counted) and writing NOTHING to CostLog.
+ *
+ * IMPORTED RATHER THAN COPIED ON PURPOSE. A second implementation is how the
+ * three getting-it-right details above drift apart — and it would also
+ * re-introduce a second definition of MODEL/ENDPOINT. Both consumers resolved
+ * their own `GEMINI_SEARCH_MODEL || 'gemini-2.5-flash'` constant identically, so
+ * `MODEL` is exported too and they now read the SAME value the ledger row
+ * records. Pinned by scripts/verifyGroundedGeminiLedger.js sections E and F.
  */
 async function trackedGenerate({ stage, purposeTag, grounded, ledger }, body, timeout = 30000) {
   return trackLlmCall(
@@ -802,7 +817,12 @@ const REVIEWS_STRUCTURE_SCHEMA = {
         }
       },
       rating:      { type: ['number', 'null'] },
-      reviewCount: { type: ['integer', 'null'] },
+      // 'number', NOT 'integer' — same adversarial-review fix as the category
+      // schema (categoryReviewsService.CATEGORY_REVIEWS_STRUCTURE_SCHEMA): a
+      // float here would reject the WHOLE strict decode and cost the quotes
+      // too, while every reader is `typeof === 'number'` and ratings[].
+      // reviewCount below was already 'number'.
+      reviewCount: { type: ['number', 'null'] },
       summary:     { type: ['string', 'null'] }
     }
   }
@@ -892,7 +912,10 @@ async function structureReviewNarrative({ subjectLine, narrative, sourceDomains,
     // re-classifying an axios-shaped error that no longer exists on this path.
     console.warn(formatLlmLogLine(err && err.llmError ? err : makeLlmError({
       code: classifyLlmFailure({ message: err?.message }),
-      provider: 'atlas', model: MODEL, role: `${stage}-structuring`,
+      // 'unknown', not 'atlas' — same honesty fix as structureCategoryNarrative:
+      // this fallback only fires on a NON-coded throw, which may have come from
+      // the google-openai direct twin, not Atlas.
+      provider: 'unknown', model: MODEL, role: `${stage}-structuring`,
       providerMessage: err?.message,
       action: LLM_ACTIONS.GAVE_UP_PRODUCT,
       actionDetail: 'returned null — narrative summary kept, quotes/rating/count dropped',
@@ -1288,6 +1311,19 @@ async function lookupProductReviews({ productName, brandName, productUrl, brandI
 module.exports = {
   match,
   isEnabled,
+  // Exported 2026-08-19 (second pass) so the two OTHER grounded
+  // `generativelanguage` call sites — categoryReviewsService and
+  // productDetailsService.fetchReviewSummary — ledger through THIS transport
+  // instead of each growing a near-copy of it. See trackedGenerate's own
+  // comment for the three details a re-implementation gets wrong, and
+  // GEMINI_REST_MODEL below for why the model id travels with it.
+  trackedGenerate,
+  // The model id the direct REST transport actually uses, and therefore the one
+  // trackedGenerate writes to CostLog. Both consumers declared their own
+  // `process.env.GEMINI_SEARCH_MODEL || 'gemini-2.5-flash'` — identical today,
+  // and identical only by coincidence. They now import this, so a row's `model`
+  // and the same call's error-log `model` cannot disagree.
+  GEMINI_REST_MODEL: MODEL,
   PROVIDER_NAME,
   // lookupBrandCategoryUrl REMOVED 2026-08-19 — confirmed dead, see the
   // removal note above lookupBrandReviews.

@@ -17,7 +17,12 @@
 //   - Phase 1.7b enrichment Tier 1 fallback when productReviews is empty
 //   - Phase 1.7c instagramCommentService category-level comment quotes
 
-const axios = require('axios');
+// NO `axios` require here on purpose (removed 2026-08-19). Both of this file's
+// billable POSTs now go through a ledgered transport — the grounded pass via
+// providers/geminiSearchProvider.trackedGenerate, the structuring pass via
+// atlasLlmService.chatCompletion. A bare axios.post reappearing in this file is
+// a call billing Google with nothing in CostLog; that is what
+// scripts/verifyGroundedGeminiLedger.js E1/E2 exist to catch.
 const Brand    = require('../models/Brand');
 const Category = require('../models/Category');
 const { breadcrumbToKey } = require('../models/Category');
@@ -31,10 +36,20 @@ const {
   GROUNDED_PASS1_CONFIG,
   GROUNDED_PASS2_MAX_TOKENS,
   GROUNDED_CALL_TIMEOUT_MS,
-  warnIfTruncated
+  warnIfTruncated,
+  // The LEDGERED direct-REST transport (stage/purposeTag/grounded + CostLog
+  // write, response BODY not axios envelope, maxRedirects:0). Imported, never
+  // re-implemented — see its comment in the provider for the three things a
+  // near-copy gets wrong.
+  trackedGenerate,
+  // Was `process.env.GEMINI_SEARCH_MODEL || 'gemini-2.5-flash'` declared locally.
+  // Identical value, but declared twice: now imported so the model this file
+  // NAMES in its error logs is provably the model trackedGenerate LEDGERS.
+  GEMINI_REST_MODEL: GEMINI_MODEL
 } = require('./providers/geminiSearchProvider');
-
-const GEMINI_MODEL = process.env.GEMINI_SEARCH_MODEL || 'gemini-2.5-flash';
+// Pass 2 (narrative -> JSON) is never grounded, so it is Atlas-routed — same
+// reasoning, same model, as geminiSearchProvider.structureReviewNarrative.
+const { chatCompletion } = require('./atlasLlmService');
 // ONE shared LLM error taxonomy — services/llmError.js. Imported, not
 // re-implemented per call site. Every LLM failure in this file is REPORTED
 // with a stable code, the provider/model/status/request_id context, and the
@@ -46,7 +61,9 @@ const {
   extractRequestId, formatLlmLogLine,
 } = require('./llmError');
 
-const ENDPOINT     = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent`;
+// ENDPOINT deleted 2026-08-19 — the direct REST URL lives in ONE place now
+// (providers/geminiSearchProvider, behind trackedGenerate). Re-adding it here
+// means someone is about to bypass the ledger again.
 const TTL_MS       = 30 * 24 * 60 * 60 * 1000;  // 30 days
 
 function isEnabled() { return !!process.env.GEMINI_API_KEY; }
@@ -131,7 +148,10 @@ async function promoteLegacyCategoryReviews({ brandId, breadcrumb, key, entry })
 }
 
 async function fetchAndCache({ brandId, brandName, brandUrl, breadcrumb, categoryId }) {
-  const fresh = await fetchCategoryReviews({ brandName, brandUrl, breadcrumb });
+  // brandId is passed for the COST LEDGER, not for the fetch itself: it is what
+  // joins this call's CostLog rows back to the brand, the way every other row
+  // does. Optional — a caller without one still gets rows, just unjoined.
+  const fresh = await fetchCategoryReviews({ brandName, brandUrl, breadcrumb, brandId });
   if (!fresh) return null;
 
   // Phase 2a — write to Category row. Resolve the leaf id (find-or-create
@@ -183,15 +203,193 @@ async function fetchAndCache({ brandId, brandName, brandUrl, breadcrumb, categor
   return fresh;
 }
 
+/**
+ * CATEGORY_REVIEWS_STRUCTURE_SCHEMA — OpenAI strict json_schema for pass 2,
+ * added with the 2026-08-19 Atlas migration of this call.
+ *
+ * NOT a translation of a Gemini `responseSchema`, because this call never had
+ * one: the direct version asked only for `responseMimeType: 'application/json'`
+ * and relied entirely on the prompt for shape. So this is a TIGHTENING — the
+ * only difference in the RESPONSE CONTRACT. (It is not the only behavioural
+ * difference overall: the TRANSPORT changed too — the direct call was exactly
+ * one POST, while chatCompletion on this single-link role makes up to
+ * MAX_ATTEMPTS (default 3) Atlas attempts plus one ledgered google-openai
+ * direct-twin attempt, each writing its own CostLog row. Small, bounded,
+ * documented at chatCompletion; ~$0.004/attempt worst case.) The schema
+ * tightening is safe in the direction that
+ * matters — an unparsable pass 2 is exactly the failure this path degrades on
+ * (quotes and rating dropped, summary-only) — and every downstream read already
+ * treats a missing field and an explicit null identically:
+ * `typeof parsed.rating === 'number' ? ... : null`,
+ * `typeof parsed.reviewCount === 'number' ? ... : null`, `parsed.summary || null`,
+ * and keepVerbatimQuotes() returns [] for a non-array.
+ *
+ * SHAPE DELIBERATELY DIFFERS from the provider's REVIEWS_STRUCTURE_SCHEMA, which
+ * is why this is not simply reusing structureReviewNarrative: that one asks for a
+ * `ratings[]` ARRAY of every aggregate found and instructs the model to leave the
+ * scalar `rating` null when it fills the array (the caller then runs
+ * pickBestRating over it). This path reads ONLY the scalar `parsed.rating`, so
+ * borrowing that prompt/schema pair would silently null out the star rating on
+ * every category — the exact class of regression the numbers-first pass-1 prompt
+ * comment warns about. Adopting multi-aggregate ratings HERE is a real
+ * improvement and a separate, measured change; it is not a routing fix.
+ *
+ * Strict mode requires additionalProperties:false objects to list EVERY property
+ * in `required` and expresses "may be absent" as "present but nullable" — same
+ * translation rule, and same reasoning, as the provider's schema comment.
+ */
+const CATEGORY_REVIEWS_STRUCTURE_SCHEMA = {
+  name: 'category_reviews_structure',
+  strict: true,
+  schema: {
+    type: 'object',
+    additionalProperties: false,
+    required: ['quotes', 'rating', 'reviewCount', 'summary'],
+    properties: {
+      quotes: {
+        type: 'array',
+        items: {
+          type: 'object',
+          additionalProperties: false,
+          required: ['text', 'author', 'source', 'stage'],
+          properties: {
+            text:   { type: 'string' },
+            author: { type: ['string', 'null'] },
+            source: { type: ['string', 'null'] },
+            stage:  { type: ['string', 'null'], enum: ['awareness', 'consideration', 'conversion', 'retention', 'conquest', null] }
+          }
+        }
+      },
+      rating:      { type: ['number', 'null'] },
+      // 'number', NOT 'integer' (adversarial-review fix, 2026-08-19): the only
+      // reader is `typeof parsed.reviewCount === 'number'`, which accepts
+      // 4500.0 — but under strict decode an `integer` type rejects the ENTIRE
+      // object on a float, so one "4.5k reviews" approximation would throw away
+      // the quotes and rating too and cache the empty result for 30 days. The
+      // old schemaless path kept the quotes and merely nulled a bad count;
+      // match that failure isolation. (`ratings[].reviewCount` in the sibling
+      // provider schema was already 'number' — the two top-levels were the odd
+      // ones out.)
+      reviewCount: { type: ['number', 'null'] },
+      summary:     { type: ['string', 'null'] }
+    }
+  }
+};
+
+/**
+ * structureCategoryNarrative — pass 2 of this file's two-pass fetch,
+ * ATLAS-ROUTED (2026-08-19). The direct twin of
+ * geminiSearchProvider.structureReviewNarrative, and deliberately a sibling
+ * rather than a call into it (see CATEGORY_REVIEWS_STRUCTURE_SCHEMA for why the
+ * shapes cannot be shared).
+ *
+ * WHY IT MAY MOVE WHEN PASS 1 MAY NOT: it sends no `tools` and reads no
+ * `groundingMetadata`. The ATLAS GROUNDING PROBE comment in
+ * providers/geminiSearchProvider.js is about grounded retrieval only.
+ *
+ * MODEL CHOICE — the SAME model as pass 1 (`GEMINI_MODEL`, default
+ * 'gemini-2.5-flash', which atlasModelMap resolves to `google/gemini-2.5-flash`),
+ * not the 6x-cheaper flash-lite 'review-text' role and not an upgrade. Identical
+ * reasoning to structureReviewNarrative: (a) there is NO cost argument either
+ * way — Atlas lists google/gemini-2.5-flash at input $0.30 / output $2.50 per M,
+ * the same rate this call already paid direct; (b) this is a fussy
+ * strict-JSON-over-a-narrative task, and the closest precedent in this codebase
+ * (the 'ad-vision-qc' role) rejected a flash-tier model for one after a live
+ * probe found it broke the requested shape. Revisit only with its own A/B.
+ *
+ * KNOWN, ACCEPTED, IMMATERIAL COST DELTA: the direct call set no thinking budget
+ * here either (unlike pass 1, which pins thinkingBudget:0 via
+ * GROUNDED_PASS1_CONFIG), so nothing changes on that axis; Atlas has no
+ * pass-through for it on a google/* slug in any case, and costTracker's `atlas`
+ * branch folds completion_tokens (thinking included) into the ledger correctly.
+ *
+ * @returns the parsed {quotes, rating, reviewCount, summary}, or null on any
+ *          failure — the caller degrades to a summary-only result exactly as it
+ *          did when the direct pass-2 call failed.
+ */
+async function structureCategoryNarrative({ brandName, breadcrumb, narrative, sourceDomains, ledger }) {
+  const structPrompt =
+    `Convert the following category-review narrative into structured JSON.\n\n` +
+    `Brand:    ${brandName}\n` +
+    `Category: ${breadcrumb}\n` +
+    (sourceDomains.length ? `Sources cited: ${sourceDomains.join(', ')}\n` : '') +
+    `\nNarrative:\n"""\n${narrative}\n"""\n\n` +
+    `Return EXACTLY this shape (no commentary, no markdown):\n` +
+    `{\n` +
+    `  "quotes":      [ { "text": "...", "author": "name or null", "source": "domain or platform or null", "stage": "awareness|consideration|conversion|retention|conquest or null" } ],\n` +
+    `  "rating":      <number 0-5 or null>,\n` +
+    `  "reviewCount": <integer or null>,\n` +
+    `  "summary":     "one sentence on overall sentiment about this category"\n` +
+    `}\n` +
+    `QUOTE RULES (strict):\n` +
+    `- Each quote.text MUST be a verbatim substring of the narrative above, copied character-for-character. If the narrative does not contain any verbatim customer quotes (e.g. it only summarizes sentiment), return an EMPTY quotes array — do NOT chop the summary into clause-fragments and label them as quotes, do NOT paraphrase, do NOT invent.\n` +
+    `- A real quote describes the customer's experience in their own voice (e.g. "best fishing shirt I've ever owned", "fits perfectly even on long offshore trips"). Meta-commentary about reviews ("category receives positive feedback", "reviewers note good comfort") is NOT a quote — exclude it.\n` +
+    `- Acceptable to return zero quotes. Better to return none than fakes.`;
+
+  let completion;
+  try {
+    completion = await chatCompletion(
+      {
+        stage: 'category_reviews',
+        provider: 'google',
+        model: GEMINI_MODEL,
+        purposeTag: 'json_structure',
+        brandId: ledger?.brandId ?? null,
+        cacheKey: ledger?.cacheKey ?? null,
+        visionImages: 0
+      },
+      {
+        model: GEMINI_MODEL,
+        response_format: { type: 'json_schema', json_schema: CATEGORY_REVIEWS_STRUCTURE_SCHEMA },
+        messages: [{ role: 'user', content: structPrompt }],
+        temperature: 0.1,
+        max_tokens: GROUNDED_PASS2_MAX_TOKENS
+      }
+    );
+  } catch (err) {
+    // chatCompletion throws an already-CODED llmError when every chain candidate
+    // fails — format that rather than re-classifying an axios-shaped error which
+    // no longer exists on this path.
+    console.warn(formatLlmLogLine(err && err.llmError ? err : makeLlmError({
+      code: classifyLlmFailure({ message: err?.message }),
+      // 'unknown', not 'atlas': this fallback only fires on a NON-coded throw,
+      // and chatCompletion may have died on its google-openai direct twin —
+      // stamping Atlas would hide a Google-side failure from the operator.
+      provider: 'unknown', model: GEMINI_MODEL, role: 'category-reviews-structuring',
+      providerMessage: err?.message,
+      action: LLM_ACTIONS.GAVE_UP_PRODUCT,
+      actionDetail: 'returned a partial result — narrative summary kept, quotes/rating/count dropped',
+    })));
+    return null;
+  }
+
+  const text = completion?.choices?.[0]?.message?.content || '';
+  let parsed = null;
+  try { parsed = JSON.parse(text); }
+  catch {
+    const m = text.match(/\{[\s\S]*\}/);
+    if (m) { try { parsed = JSON.parse(m[0]); } catch { /* fall through to null */ } }
+  }
+  if (!parsed) {
+    console.warn(`   · categoryReviews: structuring produced no parsable JSON for "${breadcrumb}"`);
+  }
+  return parsed;
+}
+
 // Two-pass Gemini fetch (grounded search → JSON structuring).
 // Same pattern as geminiSearchProvider.lookupBrandReviews / lookupProductReviews —
 // including the SHARED ad-usable quote directive, imported rather than restated so
 // the three retrieval prompts cannot drift apart.
-async function fetchCategoryReviews({ brandName, brandUrl, breadcrumb }) {
+async function fetchCategoryReviews({ brandName, brandUrl, breadcrumb, brandId = null }) {
   if (!isEnabled()) return null;
   if (!brandName || !breadcrumb) return null;
 
   const t0 = Date.now();
+  // Linkage for the cost ledger, shared by BOTH passes. CostLog has no category
+  // field, so the breadcrumb key travels as `cacheKey` — the same key the 30-day
+  // Category cache is stored under, which makes the (stage, cacheKey) hit-rate
+  // query meaningful for this path too.
+  const ledger = { brandId, cacheKey: breadcrumbToKey(breadcrumb) || breadcrumb };
 
   // Pass 1 — grounded narrative
   // NUMBERS FIRST, QUOTES SECOND — see NARRATIVE_ORDER_NOTE in geminiSearchProvider.
@@ -224,16 +422,27 @@ async function fetchCategoryReviews({ brandName, brandUrl, breadcrumb }) {
     `the funnel stage it serves.\n\n` +
     `Write naturally — do not format as JSON.`;
 
-  let searchRes;
+  let searchData;
   try {
-    searchRes = await axios.post(
-      `${ENDPOINT}?key=${encodeURIComponent(process.env.GEMINI_API_KEY)}`,
+    // LEDGERED 2026-08-19 (second pass). This was a bare axios.post: every
+    // UGC/IG detect that missed the 30-day category cache billed Google — the
+    // ~$0.035-per-request grounding surcharge included, which dwarfs the tokens
+    // — and wrote NOTHING to CostLog, so the path read as free.
+    //
+    // STAYS ON THE DIRECT REST TRANSPORT, and that is proven, not assumed: it is
+    // genuinely grounded (`tools: [{ google_search: {} }]` below), and the ATLAS
+    // GROUNDING PROBE comment in providers/geminiSearchProvider.js records four
+    // live probes showing Atlas rejects or silently drops every way of asking
+    // for google_search on this model. Do not "finish the migration" by pointing
+    // this at chatCompletion — re-probe live first.
+    searchData = await trackedGenerate(
+      { stage: 'category_reviews', purposeTag: 'grounded_search', grounded: true, ledger },
       {
         contents: [{ role: 'user', parts: [{ text: searchPrompt }] }],
         tools: [{ google_search: {} }],
         generationConfig: GROUNDED_PASS1_CONFIG
       },
-      { timeout: GROUNDED_CALL_TIMEOUT_MS }   // padded: a timeout throws away a call already paid for
+      GROUNDED_CALL_TIMEOUT_MS   // padded: a timeout throws away a call already paid for
     );
   } catch (err) {
     console.warn(formatLlmLogLine(makeLlmError({
@@ -251,7 +460,10 @@ async function fetchCategoryReviews({ brandName, brandUrl, breadcrumb }) {
     return null;
   }
 
-  const cand = searchRes.data?.candidates?.[0];
+  // `searchData` is the response BODY (trackedGenerate returns r.data — that is
+  // what costTracker.extractUsage reads usageMetadata off), so there is no
+  // `.data` hop here any more.
+  const cand = searchData?.candidates?.[0];
   warnIfTruncated(cand, `categoryReviews pass 1 "${breadcrumb}"`);
   const narrative = (cand?.content?.parts || []).map(p => p.text || '').join(' ').trim();
   const sourceDomains = (cand?.groundingMetadata?.groundingChunks || [])
@@ -265,63 +477,18 @@ async function fetchCategoryReviews({ brandName, brandUrl, breadcrumb }) {
     return { summary: null, quotes: [], rating: null, reviewCount: null, sources: sourceDomains };
   }
 
-  // Pass 2 — structure as JSON
-  const structPrompt =
-    `Convert the following category-review narrative into structured JSON.\n\n` +
-    `Brand:    ${brandName}\n` +
-    `Category: ${breadcrumb}\n` +
-    (sourceDomains.length ? `Sources cited: ${sourceDomains.join(', ')}\n` : '') +
-    `\nNarrative:\n"""\n${narrative}\n"""\n\n` +
-    `Return EXACTLY this shape (no commentary, no markdown):\n` +
-    `{\n` +
-    `  "quotes":      [ { "text": "...", "author": "name or null", "source": "domain or platform or null", "stage": "awareness|consideration|conversion|retention|conquest or null" } ],\n` +
-    `  "rating":      <number 0-5 or null>,\n` +
-    `  "reviewCount": <integer or null>,\n` +
-    `  "summary":     "one sentence on overall sentiment about this category"\n` +
-    `}\n` +
-    `QUOTE RULES (strict):\n` +
-    `- Each quote.text MUST be a verbatim substring of the narrative above, copied character-for-character. If the narrative does not contain any verbatim customer quotes (e.g. it only summarizes sentiment), return an EMPTY quotes array — do NOT chop the summary into clause-fragments and label them as quotes, do NOT paraphrase, do NOT invent.\n` +
-    `- A real quote describes the customer's experience in their own voice (e.g. "best fishing shirt I've ever owned", "fits perfectly even on long offshore trips"). Meta-commentary about reviews ("category receives positive feedback", "reviewers note good comfort") is NOT a quote — exclude it.\n` +
-    `- Acceptable to return zero quotes. Better to return none than fakes.`;
-
-  let structRes;
-  try {
-    structRes = await axios.post(
-      `${ENDPOINT}?key=${encodeURIComponent(process.env.GEMINI_API_KEY)}`,
-      {
-        contents: [{ role: 'user', parts: [{ text: structPrompt }] }],
-        generationConfig: {
-          temperature: 0.1,
-          maxOutputTokens: GROUNDED_PASS2_MAX_TOKENS,
-          responseMimeType: 'application/json'
-        }
-      },
-      { timeout: GROUNDED_CALL_TIMEOUT_MS }   // padded: a timeout throws away a call already paid for
-    );
-  } catch (err) {
-    console.warn(formatLlmLogLine(makeLlmError({
-      code: classifyLlmFailure({
-        httpStatus: err.response?.status, errCode: err.code, message: err.message,
-        body: err.response?.data,
-      }),
-      provider: 'google', model: GEMINI_MODEL, role: 'category-reviews-structuring',
-      httpStatus: err.response?.status ?? null,
-      requestId: extractRequestId(err.response?.data, err.response?.headers),
-      providerMessage: err.response?.data?.error?.message || err.message,
-      action: LLM_ACTIONS.GAVE_UP_PRODUCT,
-      actionDetail: 'returned a partial result — narrative summary kept, quotes/rating/count dropped',
-    })));
-    return { quotes: [], rating: null, reviewCount: null, summary: firstSentences(narrative, 2), sources: sourceDomains };
-  }
-
-  const text = (structRes.data?.candidates?.[0]?.content?.parts || []).map(p => p.text || '').join('').trim();
-  let parsed = null;
-  try { parsed = JSON.parse(text); }
-  catch {
-    const m = text.match(/\{[\s\S]*\}/);
-    if (m) { try { parsed = JSON.parse(m[0]); } catch {} }
-  }
+  // ── Pass 2: structure as JSON — ATLAS-ROUTED (2026-08-19, second pass) ──
+  // Never grounded (it sends no `tools` and reads no groundingMetadata), so none
+  // of the restriction above applies to it: this is the half that CAN move to
+  // the gateway, and the same one that moved for brand/product reviews in the
+  // first pass. See structureCategoryNarrative for the model-choice reasoning.
+  const parsed = await structureCategoryNarrative({
+    brandName, breadcrumb, narrative, sourceDomains, ledger
+  });
   if (!parsed) {
+    // ONE fallback where there used to be two IDENTICAL ones (transport failure
+    // and unparsable content both returned exactly this object): the narrative
+    // summary survives, quotes/rating/count are dropped. Behaviour unchanged.
     return { quotes: [], rating: null, reviewCount: null, summary: firstSentences(narrative, 2), sources: sourceDomains };
   }
 
@@ -377,4 +544,14 @@ function extractDomain(url) {
   try { return new URL(url).hostname.replace(/^www\./, ''); } catch { return ''; }
 }
 
-module.exports = { maybeFetchCategoryReviewsCached, fetchCategoryReviews, isEnabled };
+module.exports = {
+  maybeFetchCategoryReviewsCached, fetchCategoryReviews, isEnabled,
+  // Exported for scripts/verifyGroundedGeminiLedger.js — same reason as
+  // productDetailsService.fetchReviewSummary's export: a source-regex check on
+  // fetchAndCache's own call to fetchCategoryReviews passed against a mutation
+  // that dropped the linkage (`brandId: null` still matches
+  // /fetchCategoryReviews\(\{[^}]*brandId[^}]*\}\)/). Only calling the real
+  // function against stubbed Category/Brand models proves the CALLER — not
+  // just the leaf function — actually threads brandId. Not a new public API.
+  fetchAndCache
+};
