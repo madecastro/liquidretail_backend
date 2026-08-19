@@ -109,6 +109,29 @@ module.exports = [
     }
   },
   {
+    // ESM harnesses. Identical rule set to the .js block above — the ONLY
+    // difference is sourceType, because these use import/export and would be
+    // a parse error under 'commonjs'. Split into its own block rather than
+    // widening the .js block's `files`, which is why this gap existed: adding
+    // '**/*.mjs' there parses them as CommonJS and every one errors out.
+    //
+    // Before this, `eslint .` resolved a config for .mjs but applied NO rules
+    // to them, so the suite exited 0 vacuously — 9 harnesses were unlinted
+    // while appearing to pass.
+    files: ['**/*.mjs'],
+    languageOptions: {
+      ecmaVersion: 2024,
+      sourceType: 'module',
+      globals: nodeGlobals
+    },
+    linterOptions: {
+      reportUnusedDisableDirectives: 'off'
+    },
+    rules: {
+      'no-undef': 'error'
+    }
+  },
+  {
     files: puppeteerHostFiles,
     languageOptions: { globals: browserEvalGlobals }
   }
