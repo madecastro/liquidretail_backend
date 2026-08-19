@@ -32,6 +32,10 @@
 //      → B* bound assertions fail. Drop back to 5 → B1 fails (must stay ~25).
 //   6. Restore Math.min(16_384, …) in buildAtlasBody → T* token-ceiling fails.
 //   7. Clamp + reserve in one Math.min (swallow reserve) → T* reserve fails.
+//   8. Remove `contractWarnings` from directConceptsRound's return object
+//      (2026-08-19) → W12 fails. Move it into an unrelated object literal
+//      elsewhere in the function → W13 fails (catches "added the key but not
+//      to the actual return").
 //   Restoring each makes them pass. Report failing output verbatim.
 //
 // Covered:
@@ -44,7 +48,8 @@
 //   B*  retry is bounded (finite attempts ~25); exhaustion rethrows
 //   I*  detector scopes to THIS index (roundIndex), not bare message match
 //   P*  isTransientInsertError allowlist precision
-//   W*  directConceptsRound wires the retry helper (source pin)
+//   W*  directConceptsRound wires the retry helper (source pin); W12-W13
+//       pin the 2026-08-19 contractWarnings addition to its return value
 //   T*  DIRECTOR_ROUND_TOKENS=30000 survives buildAtlasBody; reserve still added
 
 const fs = require('fs');
@@ -535,6 +540,23 @@ check('P11 mongoose-wrapped cause with ECONNRESET → true',
       const m = SRC.match(/async function createRoundArtifactWithRetry[\s\S]*?\nasync function directConceptsRound/);
       if (!m) return false;
       return /isTransientInsertError\s*\(/.test(m[0]);
+    })());
+
+  // 2026-08-19: the round-contract `reasons` array used to be console+Slack
+  // only ('director:contract-warn' alert a few dozen lines above the return)
+  // and never reached the caller in-memory, so it could never reach
+  // CampaignRun (docs/ALERTING.md "In-app run status vs Slack" gap table).
+  // Source-pinned like W1-W11 above: this function calls a live LLM, so the
+  // full chain can't be exercised by calling it directly in an offline
+  // harness. Behavioral coverage for what happens AFTER this return value
+  // exists lives in scripts/verifyPerProductReasons.js (H/I/J sections).
+  check('W12 directConceptsRound return object carries contractWarnings (same slice(0,6) as the Slack alert)',
+    /contractWarnings:\s*reasons\.length\s*\?\s*reasons\.slice\(0,\s*6\)\s*:\s*\[\]/.test(roundFn));
+
+  check('W13 contractWarnings sits in the SAME return object as avoidListCount (the real return, not a stray reference elsewhere in the function)',
+    (() => {
+      const retMatch = roundFn.match(/return\s*\{[\s\S]*?\};/);
+      return !!retMatch && /avoidListCount/.test(retMatch[0]) && /contractWarnings/.test(retMatch[0]);
     })());
 
   // ── T: token ceiling — 30000 survives buildAtlasBody ───────────────

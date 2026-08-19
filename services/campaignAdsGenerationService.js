@@ -3823,7 +3823,7 @@ async function runConceptDrivenExpansion({
       // Director can load Campaign.creativeBrief for this specific
       // campaign and render it as a CAMPAIGN BRIEF block in the prompt
       // (Phase 2 of the voice/brief cascade).
-      const { artifact, concepts, roundIndex, warnings: dirWarnings } =
+      const { artifact, concepts, roundIndex, warnings: dirWarnings, contractWarnings: directorContractWarnings } =
         await director.directConceptsRound({
           brandId, productId, platformFormat, campaignKind, campaignId,
           creativeIntent, seededUniverse: filtered, seedUniverseHash
@@ -4048,7 +4048,14 @@ async function runConceptDrivenExpansion({
           roundIndex,
           conceptArtifactId: String(artifact._id),
           judgeArtifactId:   judgeArtifactId ? String(judgeArtifactId) : null,
-          batchRationale
+          batchRationale,
+          // Informational about the ROUND, not the skip — the Director can
+          // warn about the round contract and still return usable concepts
+          // that later fail to map to payloads for an unrelated reason
+          // (media pick outside the universe). Kept even on this skip path
+          // so the operator sees both facts, not just one.
+          ...(directorContractWarnings && directorContractWarnings.length
+            ? { directorContractWarnings } : {})
         };
       }
 
@@ -4059,7 +4066,12 @@ async function runConceptDrivenExpansion({
         roundIndex,
         conceptArtifactId: String(artifact._id),
         judgeArtifactId:   judgeArtifactId ? String(judgeArtifactId) : null,
-        batchRationale
+        batchRationale,
+        // Non-skip advisory — same field/shape as above. See
+        // aiCreativeDirectorService.js directConceptsRound's return and
+        // docs/ALERTING.md "In-app run status vs Slack" gap table.
+        ...(directorContractWarnings && directorContractWarnings.length
+          ? { directorContractWarnings } : {})
       };
     } catch (err) {
       // Carry the error CLASS as well as the message. A ReferenceError thrown

@@ -16,10 +16,21 @@
 //   In summarizeEmptyExpansion, replace the uniform no_concepts branch with
 //   `return GENERIC_EMPTY_MESSAGE` → "U3 uniform no_concepts says Director"
 //   fails. That is the exact production lie this change closes.
+//
+// Revert-prove (2026-08-19 directorContractWarnings addition):
+//   Remove the `directorContractWarnings` copy-through in
+//   normalizePerProductEntry → every H* check fails (field never reaches the
+//   row). Remove the field from models/CampaignRun.js perProduct schema →
+//   I1-I3 fail (mongoose silently drops it on assignment instead of erroring,
+//   which is exactly why this is pinned rather than trusted by inspection).
+//   Remove the threading in campaignAdsGenerationService.js
+//   runConceptDrivenExpansion → J1-J3 fail (source-region pins; the function
+//   calls a live LLM so this cannot be exercised end-to-end offline).
 
 const path = require('path');
 const {
   REASON,
+  WARNING,
   HUMAN_FULL,
   GENERIC_EMPTY_MESSAGE,
   humanMessageForReason,
@@ -358,6 +369,102 @@ console.log('\nG. campaignAdsGenerationService records concept skips + caps');
     /capped\.push|capped:/.test(svcSrc) && /payloadsBeforeCap/.test(svcSrc));
   checkTrue('G5 normalises via attachProductNames / normalizePerProductList',
     /attachProductNames/.test(svcSrc));
+}
+
+// ── H. directorContractWarnings — Director round-contract reasons ──────
+// The 2026-08-19 gap: this used to be console + Slack ('director:contract-
+// warn') ONLY, never written to CampaignRun (docs/ALERTING.md "In-app run
+// status vs Slack"). Independent of skip status — it describes the ROUND,
+// not this product's outcome — so unlike `warning` it must survive on a
+// skip row too.
+console.log('\nH. directorContractWarnings — Director round-contract reasons');
+{
+  const queuedRow = normalizePerProductEntry({
+    productId: 'p1', payloads: 2,
+    directorContractWarnings: ['concept[0] missing headline', 'duplicate concept_id c2']
+  });
+  checkTrue('H1 queued row carries directorContractWarnings',
+    Array.isArray(queuedRow.directorContractWarnings));
+  check('H2 queued row is not marked skipped', queuedRow.skipped, false);
+  checkIncl('H3 queued row keeps the actual reason text (not a generic code)',
+    (queuedRow.directorContractWarnings || []).join('; '), 'missing headline');
+
+  // The round can warn AND still fail to map to a payload for an unrelated
+  // reason (concepts_no_usable_media) — the field must survive there too.
+  const skipRow = normalizePerProductEntry({
+    productId: 'p2', skipped: REASON.CONCEPTS_NO_USABLE_MEDIA,
+    directorContractWarnings: ['concept[1] missing art_direction']
+  });
+  checkTrue('H4 skip row also carries directorContractWarnings (round-level, not skip-level)',
+    Array.isArray(skipRow.directorContractWarnings) && skipRow.directorContractWarnings.length === 1);
+  check('H5 skip row skipped stays true', skipRow.skipped, true);
+
+  // Capped at 6 — same slice(0,6) the director:contract-warn Slack alert
+  // uses. Must not silently grow past what the alert already shows.
+  const many = Array.from({ length: 10 }, (_, i) => `reason ${i}`);
+  const cappedRow = normalizePerProductEntry({ productId: 'p3', payloads: 1, directorContractWarnings: many });
+  check('H6 capped at 6 (matches the director:contract-warn Slack alert slice)',
+    (cappedRow.directorContractWarnings || []).length, 6);
+
+  // Absent (not an empty array) when the round had no warnings — must not
+  // bloat every clean row with a dead key.
+  const cleanRow = normalizePerProductEntry({ productId: 'p4', payloads: 1 });
+  checkTrue('H7 field is absent when the round had no warnings',
+    !('directorContractWarnings' in cleanRow));
+
+  // `warning` (fixed enum) and `directorContractWarnings` (free-text list)
+  // are separate channels and must not collide when both are present.
+  const bothRow = normalizePerProductEntry({
+    productId: 'p5', payloads: 1, warning: WARNING.NO_CATALOG_IMAGE,
+    directorContractWarnings: ['missing proof block']
+  });
+  check('H8 warning (fixed enum) unaffected by directorContractWarnings presence',
+    bothRow.warning, WARNING.NO_CATALOG_IMAGE);
+  checkTrue('H9 directorContractWarnings unaffected by warning presence',
+    Array.isArray(bothRow.directorContractWarnings) && bothRow.directorContractWarnings.length === 1);
+}
+
+// ── I. directorContractWarnings survives the strict CampaignRun schema ─
+console.log('\nI. directorContractWarnings survives CampaignRun strict schema');
+{
+  const perProductPath = CampaignRun.schema.path('perProduct');
+  checkTrue('I1 perProduct declares directorContractWarnings (undeclared keys are silently dropped on $set)',
+    !!perProductPath?.schema?.path('directorContractWarnings'));
+  checkTrue('I2 …and it is an array of String',
+    perProductPath?.schema?.path('directorContractWarnings')?.instance === 'Array' &&
+    perProductPath?.schema?.path('directorContractWarnings')?.caster?.instance === 'String');
+
+  const row = normalizePerProductEntry({
+    productId: 'p1', payloads: 1,
+    directorContractWarnings: ['concept[0] missing headline']
+  });
+  const run = new CampaignRun({
+    runId: 'run_verify_contract_warn',
+    brandId: new (require('mongoose').Types.ObjectId)(),
+    campaignId: new (require('mongoose').Types.ObjectId)(),
+    perProduct: [row]
+  });
+  check('I3 survives assignment onto a real CampaignRun doc',
+    run.perProduct[0].directorContractWarnings && run.perProduct[0].directorContractWarnings[0],
+    'concept[0] missing headline');
+}
+
+// ── J. campaignAdsGenerationService threads directorContractWarnings ───
+// (source-level: runConceptDrivenExpansion calls a live LLM via
+// director.directConceptsRound, so the full chain can't run offline — same
+// reason scripts/verifyDirectorRoundPersist.js pins directConceptsRound's
+// own return value by source region rather than by calling it.)
+console.log('\nJ. campaignAdsGenerationService threads directorContractWarnings');
+{
+  const svcSrc = fs.readFileSync(
+    path.join(__dirname, '..', 'services', 'campaignAdsGenerationService.js'), 'utf8'
+  );
+  checkTrue('J1 destructures contractWarnings off directConceptsRound',
+    /contractWarnings:\s*directorContractWarnings\s*\}\s*=[\s\S]{0,60}await director\.directConceptsRound/.test(svcSrc));
+  checkTrue('J2 threads it onto the success per-product row',
+    /productId, payloads,[\s\S]{0,800}directorContractWarnings\s*\}\s*:\s*\{\}\)/.test(svcSrc));
+  checkTrue('J3 threads it onto the concepts_no_usable_media skip row too (round-level, not skip-level)',
+    /CONCEPTS_NO_USABLE_MEDIA,[\s\S]{0,800}directorContractWarnings\s*\}\s*:\s*\{\}\)/.test(svcSrc));
 }
 
 // ── U. REVERT-PROVE (documented; run by temporarily breaking the code) ─

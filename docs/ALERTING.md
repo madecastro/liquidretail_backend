@@ -770,7 +770,7 @@ transport-specific plumbing around them.
 | "Run reaped as stale" reason | N/A — this was the gap | Reaper stamped `status:'failed'` with an **empty** `errors[]` — zero explanation | **Fixed** — `buildStaleRunningReapUpdate` pushes a real `errors[]` entry naming the stale window |
 | "Queued-drain run crashed" reason | N/A — this was the gap | Same empty-`errors[]` gap, different code path (`POST /api/ads/runs`) | **Fixed** — mirrors the prep/render crash handler's `$push` |
 | Per-ad vision-QC category scores + findings (`adVisionQcService.js` alert fields) | Yes — full `Ad.visionQc` | Only via `GET /api/ads/:id/generation-inspector`; render-activity/ads-list get the pass/fail summary only | **Fixed (2026-08-19)** — `GET /api/ads` and `GET /api/ads/:id` now carry a compact `visionQc` on every ad (categories added on the `:id` detail path); `GET /runs/:runId` carries a run-level `visionQcRollup` (shipped-without-QC / QC'd-on-retry counts). The inspector remains the only place for the FULL per-attempt trail (discarded URLs, raw `imageGeneration` payloads) — this closes "was this ad inspected at all", not "show me everything" |
-| Director "payload didn't satisfy the round contract" warning | **No** — console + Slack only, never written to `CampaignRun` | No | **Still gap** — a run with this warning looks clean on the poller |
+| Director "payload didn't satisfy the round contract" warning | **Yes (2026-08-19)** — `CampaignRun.perProduct[].directorContractWarnings` | No | **Fixed** — same `reasons.slice(0,6)` array the `director:contract-warn` Slack alert sends, threaded through `directConceptsRound` → `runConceptDrivenExpansion` → `normalizePerProductEntry`. Deliberately its own field, not folded into `warning` (see models/CampaignRun.js comment) — `warning` is a small fixed enum with a static human sentence per code, this is a variable-length list of free-text validation reasons about the ROUND, not this product's picks. Does not change whether the round proceeds — soft-warning behavior is untouched, this only makes the already-computed fact reach the run document |
 | Watchdog "N campaign run(s) not progressing" (age+silence on `preparing`/`running`) | Derived from `CampaignRun` fields, not a new one | No per-run "this has been silent Nm" flag | **Partially addressed** — `lastHeartbeatAt`/`updatedAt` let the frontend flag silence on `'running'`; a `'preparing'` run genuinely has no liveness signal by design (`expandWizardJob` makes zero writes to the row until the flip — see `services/campaignRunGuards.js`), so a stuck-preparing run is still only visible via Slack's watchdog until it ages out via `PREPARE_STALE_MIN` |
 | `alertService` dedupe tally ("+N more since HH:MM") for a repeated failure | In-process map only | No | **Still gap** — a burst of identical failures reads as isolated events on the poller |
 
@@ -846,6 +846,29 @@ missing-rollup-field mutations). Frontend `RunProgress` rollup rendering
 verified via a dev-only fixture harness (`visionqc-harness.html` /
 `src/pages/Ads/__harness__/visionQc.tsx`, same pattern as the existing
 `badge-harness.html`) plus a clean `tsc -b --noEmit` and production build.
+
+### Follow-up (2026-08-19): the Director contract-warning gap, closed
+
+`services/aiCreativeDirectorService.js` `directConceptsRound` now returns
+`contractWarnings` (the same `reasons.slice(0,6)` array it already Slack-alerts
+via `director:contract-warn`) alongside its existing `warnings` field. Only the
+return value changed — the alert, the soft-warning behavior (generation still
+proceeds on a usable-but-imperfect payload), and everything else about the round
+are untouched.
+
+`services/campaignAdsGenerationService.js` `runConceptDrivenExpansion` threads it
+onto the per-product row as `directorContractWarnings`, and
+`services/perProductReasons.js` `normalizePerProductEntry` copies it through
+unconditionally (it describes the round, not the product's skip status, so it
+survives on both the success row and the `concepts_no_usable_media` skip row).
+`models/CampaignRun.js` declares `perProduct[].directorContractWarnings: [String]`
+on the strict schema — undeclared would have been silently dropped on `$set`,
+the same class of loss as `renderError.predictionId` before it. `GET
+/api/ads/runs/:runId` needed no change: it already returns `perProduct` verbatim.
+
+Pinned by `scripts/verifyPerProductReasons.js` (schema + normaliser, offline) and
+`scripts/verifyDirectorRoundPersist.js` (source-region pins on the two LLM-calling
+functions that can't run offline).
 
 ## Known gap this does not close
 
