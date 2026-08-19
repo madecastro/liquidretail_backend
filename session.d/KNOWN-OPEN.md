@@ -9,21 +9,65 @@ Living checklist. Update in place; do not append a duplicate list elsewhere.
   `layoutResolverService`, `aiCanvasInputBuilder`) — commented, NOT fixed.
 - Reels 204 vs Stories 250 safe zones collapse into one `vertical` entry in
   `remotion/lib/safeZones.js`.
-- The 9 pre-existing stranded ads in `run_1787136860887_654ed621` (the real,
-  measured proof case for the undispatched-tail fix — see
-  `session.d/2026-08-19_undispatched-tail-fix-stranded-ads-close-the-loop.md`)
-  still sit `queued` with no `renderStage` — the CODE fix only prevents this
-  happening to FUTURE reap/SIGTERM/crash events, it does not retroactively
-  touch rows already written before it existed. A one-time backfill script
-  (stamps the identical breadcrumb the fix would have written, via the same
-  `buildRequeueSetStage`, dry-run verified against the real 9 documents) is
-  ready but was **not applied** — the session's own write attempt was blocked
-  by the Claude Code permission classifier (a live production DB write).
-  Someone with write access needs to either run that script (ask the session
-  that wrote it, or re-derive: filter on `campaignRunIds` containing the run,
-  `status:'queued'`, `wasRendering:true`, `renderStage` empty, both attempt
-  counters 0) or simply press **Generate more** on the campaign, which drains
-  them today regardless of this fix.
+- **CLOSED DECISION (owner, 2026-08-19): pre-existing stranded veo ads from
+  before the undispatched-tail fix (PR #241) will NOT be backfilled, drained,
+  or recovered. Forward-only — do not re-open or re-derive a recovery plan.**
+  Population measured at 35 (`status:'queued'`, `wasRendering:true`,
+  `renderStage` empty, across 4 failed runs including the proof case
+  `run_1787136860887_654ed621`) after an earlier count the same night found 46
+  — confirmed zero of them carry any receipt (`veoPredictionId`,
+  `imageGeneration.predictionId`, `renderUrl` all empty, zero `CostLog` rows at
+  all for those ad ids), so draining would have been a first render (~$0.90
+  each, ~$31.50 total), not a double-bill, but the owner declined the spend
+  and separately said "I am not interested in saving any past ads, we are only
+  looking forward." No backfill script is staged; none should be written. The
+  part that actually matters: **PR #241 already stops this from recurring** —
+  `buildRequeueSetStage` (`services/adArchiveDigest.js`) stamps an honest
+  `renderStage` breadcrumb at all four requeue sites, so a NEW
+  claimed-but-never-dispatched tail is visible to `strandedRunSweeper.js` and
+  self-heals; only this one closed-off pre-fix backlog is orphaned.
+- **`strandedRunSweeper.js`'s recovery pass is structurally blind to video
+  receipts — latent double-bill risk for a FUTURE stranded video ad. Not fixed
+  (billing-adjacent, out of scope); write-up only, so it doesn't need
+  re-deriving.** `sweepStrandedRuns` (`services/strandedRunSweeper.js:151`)
+  defaults its `recover` param to `recoverImageAd`
+  (`services/imageRecoveryService.js:69`). That function
+  (`imageRecoveryService.js:57-59`) is: `const predictionId =
+  ad?.imageGeneration?.predictionId || null; if (!predictionId) return {
+  state: 'no-receipt' };` — it reads ONLY the static-image receipt field. A
+  video ad's receipt lives in `Ad.veoPredictionId`
+  (`services/spendReceipt.js`), which this function never inspects. So for
+  every `renderRoute:'veo'` ad, PASS 1 — "recover paid work for free before
+  spending again," the sweeper's entire reason for existing — reports
+  `no-receipt` unconditionally, right or wrong, and the ad falls straight to
+  PASS 2: `requeue` → `requeueStrandedAds` (`routes/ads.js:4713`) →
+  `runRenderLoop`, a fresh billable Omni submit (~$0.90), with no code on that
+  path ever checking `ad.veoPredictionId` first.
+  **Concrete failure scenario:** a video ad is claimed, `atlasVideoService`
+  submits it (charged immediately) and writes `veoPredictionId`, then the
+  process dies before the render loop records completion. If that ad reaches
+  `status:'queued'` with a non-empty `renderStage` while `veoPredictionId` is
+  still set — e.g. `adStage()` fired before the crash, or some future requeue
+  site omits the `receiptFree()` filter that every current site applies —
+  `strandedRunSweeper` calls `recoverImageAd`, gets `no-receipt` (wrongly:
+  a receipt exists, this function simply never looked), and requeues it into
+  a second paid Omni submit for a master already bought once. **Verified
+  tonight this has not happened**: all 35 ads in the decision above have
+  `veoPredictionId` empty, so today the gap is latent, not triggered — it
+  survives only because every current requeue site (`worker.js`,
+  `services/processAlerts.js`, both crash catches in `routes/ads.js`) filters
+  through `receiptFree()` before the `rendering`→`queued` move; the sweeper's
+  own recovery pass adds no defense-in-depth if that upstream discipline is
+  ever missed on some future call site. Fix shape (not implemented): a
+  `recoverVideoAd({ad})` that peeks `ad.veoPredictionId` the same read-only way
+  `recoverImageAd` peeks image predictions, dispatched by `ad.renderRoute`,
+  wired into `sweepStrandedRuns`'s default `recover`; plus a revert-proven
+  check in `scripts/verifyStrandedSweep.js` asserting a stranded video ad WITH
+  a `veoPredictionId` is recovered, not requeued. Do not widen
+  `strandedRunSweeper`'s ad-selection filter itself for this — it is only
+  about what the recovery pass does once an ad is already selected. Flagged as
+  a spawn_task chip ("Add video-receipt recovery to strandedRunSweeper") in the
+  session that found it.
 - Root cause of why THIS SPECIFIC run's CampaignRun heartbeat stopped ticking
   at 11:04:32Z, 17 minutes before the 11:21:43Z reap, was not pinned to one
   line. Render logs for the window show **three separate web-instance
