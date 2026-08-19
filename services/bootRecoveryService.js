@@ -41,7 +41,7 @@ const { HAS_RECEIPT } = require('./spendReceipt');
 // to a settled price the same way a normal (non-recovered) completion does —
 // imported, not re-implemented, so the two paths can never compute the charge
 // differently. See the recovered-master branch below.
-const { resumeForAd, reconcileVideoCostFromTerminal } = require('./atlasVideoService');
+const { resumeForAd, reconcileVideoCostFromTerminal, resolveFailureCostReconcile } = require('./atlasVideoService');
 // Static-image counterpart: recoverImageAd peeks (free GET), finishPlate (local
 // crop + logo), Cloudinary upload, optional vision QC. ZERO image submits.
 // See imageRecoveryService header for the money contract.
@@ -88,20 +88,19 @@ function enabled() {
  */
 function resolveRecoveredVideoFailureCharge(r) {
   const confirmedCharge = r?.charged === true;
-  if (r?.charged === false) return { confirmedCharge, reconcile: { costUsd: 0 } };
-  // `r.priceUsd != null` FIRST, deliberately, before the Number() coercion:
-  // Number(null) and Number(undefined -> NaN) do not agree, and a bare
-  // Number.isFinite(Number(r.priceUsd)) treats an ABSENT price the same as a
-  // confirmed $0 one (Number(null) === 0, which IS finite). charged:true with
-  // no usable price means "Atlas confirms this was billed but did not tell us
-  // how much" — that must leave the estimate standing, not zero it out.
-  if (r?.charged === true && r?.priceUsd != null && Number.isFinite(Number(r.priceUsd))) {
-    return { confirmedCharge, reconcile: { costUsd: Number(r.priceUsd) } };
-  }
-  // charged === null (unknown), or charged:true with no usable price — leave
-  // the ledger exactly as it is. Absence of evidence is not evidence of
-  // non-charge; do not zero or invent a correction.
-  return { confirmedCharge, reconcile: null };
+  // Delegates to atlasVideoService.resolveFailureCostReconcile — the SAME
+  // tri-state rule ("charged:false -> zero", "charged:true + real price ->
+  // correct to it", "anything else -> leave untouched, never guess") now
+  // governs both this recovered-after-restart path and the failed-in-the-
+  // same-process path (atlasVideoService.generateForAd's final-failure
+  // branch). Kept as a thin wrapper, not inlined, so this function's
+  // `{charged, priceUsd}` shape (from resumeForAd/peekPrediction) stays the
+  // public contract scripts/verifyVideoTimeoutReconcile.js pins.
+  const reconcile = resolveFailureCostReconcile({
+    chargeConfirmed: r?.charged,
+    chargePriceUsd:  r?.priceUsd
+  });
+  return { confirmedCharge, reconcile };
 }
 
 /**

@@ -1975,6 +1975,14 @@ async function reframeReferenceForAspect({ media, sourceUrl, aspectRatio, brand,
       let billed    = false;
       let resultUrl = null;
       let method    = null;
+      // Prediction id from submitImageGeneration, hoisted out of the try block
+      // below so the charge-point CostLog write (§7) can stamp it — without
+      // this, the reframe row can never be reconciled (reconcileCost is keyed
+      // on providerRequestId), so it stayed a flat REFRAME_COST_USD() estimate
+      // forever even though Atlas's settled `price` was one free GET away
+      // (pollPrediction already reads it back; see the price-is-ignored
+      // comment at the pollOut destructure below — this is that gap closing).
+      let predictionId = null;
       // BILLING/CLAIM: identity of this process's lease; only release when we
       // still hold a claim-only entry and did NOT bill (see finally below).
       const claimBy = `${process.pid}:${Date.now().toString(36)}:${Math.random().toString(36).slice(2, 8)}`;
@@ -2050,10 +2058,13 @@ async function reframeReferenceForAspect({ media, sourceUrl, aspectRatio, brand,
           // overstated ledger is visible and correctable, an understated one is
           // neither. NEVER cleared once true.
           billed = true;
+          predictionId = id;
 
           const pollOut = await pollPrediction(id);
-          // pollPrediction returns { url, price } (price is for video-master
-          // cost reconcile; reframe ledgers its own flat estimate and ignores it).
+          // pollPrediction returns { url, price }. Reframe used to ledger only
+          // its own flat REFRAME_COST_USD() estimate and ignore `price` —
+          // fixed below (§7): now scheduled through the same settle-from-
+          // terminal-price path images and video masters use.
           const outUrl = pollOut && typeof pollOut === 'object' ? pollOut.url : pollOut;
 
           // Retried (free, idempotent) — see fetchOutpaintOutput. A single blip
@@ -2084,6 +2095,14 @@ async function reframeReferenceForAspect({ media, sourceUrl, aspectRatio, brand,
           // but response carried no prediction id, so we can't poll. Still set
           // billed and ledger rather than lose the spend.
           if (err?.charged) billed = true;
+          // submitImageGeneration succeeded (predictionId already set above)
+          // but the POLL then threw a classified failure — some of those
+          // (buildClassifiedFailureError's shape) carry the id on the error
+          // even though this local `id` const is out of scope here. Best
+          // effort only: if neither source has it, leave predictionId null —
+          // the charge-point write below then stays an un-reconcilable flat
+          // estimate, same as before this fix, never a guessed one.
+          if (!predictionId && err?.predictionId) predictionId = err.predictionId;
           console.warn(`⚠️  reframeReferenceForAspect[${aspectKey}]: outpaint failed — ${err.message}`);
         }
 
@@ -2293,9 +2312,27 @@ async function reframeReferenceForAspect({ media, sourceUrl, aspectRatio, brand,
               mediaId: media?._id || null,
               productId: media?.metadata?.catalogProductId || null,
               purposeTag: `reframe:${aspectRatio}`,
-              costUsd: REFRAME_COST_USD()
+              costUsd: REFRAME_COST_USD(),
+              // Was missing entirely (2026-08-19 audit finding): without a
+              // providerRequestId this row could NEVER be reconciled — it
+              // stayed the flat REFRAME_COST_USD() estimate forever even
+              // though pollPrediction above already read Atlas's settled
+              // `price` back and simply discarded it. Stamping it here lets
+              // scheduleCostReconcile (below) upgrade estimated -> actual the
+              // same way the image path does, and lets a FAILED-but-billed
+              // submit (err.charged, no id available) fall back to staying
+              // 'estimated' rather than crash — never worse than before.
+              providerRequestId: predictionId || null
             });
           } catch { /* telemetry only */ }
+          // Fire-and-forget, same contract as this file's own video-master
+          // charge-point → scheduleVideoCostReconcile pairing (and
+          // atlasImageService's analogous scheduleCostReconcile for images):
+          // never awaited, never blocks the URL, and reconcileCost only ever
+          // upgrades a row that is still 'estimated'. Guarded internally
+          // against a null predictionId too, but checked here as well so the
+          // "no id available" log line above isn't followed by a pointless call.
+          if (predictionId) scheduleVideoCostReconcile(predictionId);
         }
 
         // 8. Persist the asset-library entry — but ONLY when Atlas actually billed
@@ -3066,6 +3103,31 @@ function mayRetryAfterFailure({ policyRetryable, chargeConfirmed, attempt, maxAt
   return policyRetryable === true
     && chargeConfirmed === false
     && Number(attempt) < Number(maxAttempts || 1);
+}
+
+/**
+ * Pure decision: given the tri-state confirmed-charge verdict Atlas provided
+ * for a FINAL (non-retryable, or attempts-exhausted) video failure, what — if
+ * anything — the CostLog charge-point estimate should be corrected to.
+ *
+ * Mirrors bootRecoveryService.resolveRecoveredVideoFailureCharge exactly
+ * (same tri-state rule, same "unknown stays unknown" refusal to guess) —
+ * that function wraps THIS one for its own `{charged, priceUsd}` shape so the
+ * two money decisions (recovered-after-restart vs failed-in-the-same-process)
+ * can never drift apart. Do not re-derive the rule a third time; import this.
+ *
+ * @param {{chargeConfirmed?:*, chargePriceUsd?:*}} v
+ * @returns {{costUsd:number}|null}  null means "leave the ledger exactly as is"
+ */
+function resolveFailureCostReconcile({ chargeConfirmed, chargePriceUsd } = {}) {
+  if (chargeConfirmed === false) return { costUsd: 0 };
+  // chargePriceUsd != null FIRST, deliberately — see the identical comment on
+  // bootRecoveryService.resolveRecoveredVideoFailureCharge for why Number(null)
+  // must not be allowed to read as a confirmed $0.
+  if (chargeConfirmed === true && chargePriceUsd != null && Number.isFinite(Number(chargePriceUsd))) {
+    return { costUsd: Number(chargePriceUsd) };
+  }
+  return null;
 }
 
 function confirmedCharge(data) {
@@ -4198,6 +4260,45 @@ async function generateForAd({
           : err.chargeConfirmed == null  ? 'charge state UNKNOWN — treating as charged, not resubmitting'
           : `exhausted ${maxAttempts} attempt(s)`;
         console.warn(`   ⛔ atlasVideo[ad=${ad._id}]: not retrying — ${because}`);
+
+        // ── FINAL-FAILURE COST RECONCILE (2026-08-19) ──────────────────────
+        // This is the LAST word on this predictionId's CostLog row — nobody
+        // downstream will ever look at it again. routes/ads.js's catch block
+        // marks the Ad 'failed' immediately (not left 'rendering'), so
+        // bootRecoveryService's periodic sweep — which only considers ads
+        // STILL 'rendering' after a staleness window — will NEVER see this
+        // row either. Before this fix, that meant a deterministically
+        // non-retryable failure (moderation block, exhausted attempts, or a
+        // failure discovered at the poll deadline) left the submit-time
+        // ESTIMATE standing forever whenever Atlas confirmed no charge —
+        // the same phantom-spend class as the incident this file's timeout
+        // fix addresses, via a different door. Uses the SAME tri-state rule
+        // as the recovered-after-restart path (resolveFailureCostReconcile,
+        // above) so a video that fails for good is corrected exactly the way
+        // one recovered after a crash would be.
+        const reconcile = resolveFailureCostReconcile({
+          chargeConfirmed: err.chargeConfirmed,
+          chargePriceUsd:  err.chargePriceUsd
+        });
+        if (reconcile && predictionId) {
+          try {
+            await finalizeFlatCost({
+              stage:      'atlas_video_render',
+              provider:   'atlas',
+              model,
+              providerRequestId: predictionId,
+              costUsd:    reconcile.costUsd,
+              // 0 → Atlas confirmed no charge, matches the retry path's own
+              // 'none' stamp. A real settled price is 'actual', same as a
+              // normal completion.
+              costSource: reconcile.costUsd === 0 ? 'none' : 'actual',
+              status:     'failed',
+              errorMessage: err.message || null
+            });
+          } catch (e) {
+            console.warn(`   ⚠️  atlasVideo: could not reconcile final-failure cost row for ${predictionId} — ${e.message}`);
+          }
+        }
         throw err;
       }
 
@@ -4403,8 +4504,12 @@ module.exports = {
   // exposed for verify harnesses (Claude-5-era provider-fault retry gate)
   mayRetryAfterFailure,
   confirmedCharge,
+  // Shared tri-state cost-reconcile decision for a FINAL video failure — used
+  // here and (via delegation) by bootRecoveryService.resolveRecoveredVideoFailureCharge.
+  resolveFailureCostReconcile,
   SETTLED_POLL_STATUSES,
   TERMINAL_FAILURE_STATUSES,
+  TERMINAL_OK_STATUSES,
 
   prepareStoryboard,
   enabled,

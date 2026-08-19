@@ -359,10 +359,15 @@ check('F3 the shared image path keeps its own money gate', () => {
 console.log('\nE. the ledger correction');
 
 check('E1 an unbilled failure zeroes its own charge-point row before resubmitting', () => {
-  // Anchor on the CALL, not the bare name — the name also appears in prose
-  // above the charge-point write, and anchoring there silently walked this
-  // check onto the wrong object.
-  const i = SRC.indexOf('await finalizeFlatCost({');
+  // Anchor on the RETRY PATH'S OWN comment, not the bare call — as of
+  // 2026-08-19 a SECOND finalizeFlatCost call exists (the final-failure
+  // reconcile in the `!mayRetry` branch, just above this one in source
+  // order), so `SRC.indexOf('await finalizeFlatCost({')` now finds that one
+  // first and silently walks this check onto the wrong object. The comment
+  // immediately preceding THIS call site is unique text.
+  const commentI = SRC.indexOf('// Correct the ledger BEFORE spending again.');
+  assert.ok(commentI > 0, 'retry-path ledger-correction comment not found — has it moved or been reworded?');
+  const i = SRC.indexOf('await finalizeFlatCost({', commentI);
   assert.ok(i > 0, 'no ledger correction — a retry would book two submits for one video');
   const window = SRC.slice(i, i + 700);
   assert.ok(/providerRequestId: predictionId/.test(window), 'not keyed on the prediction, so it cannot update in place');

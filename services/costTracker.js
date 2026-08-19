@@ -47,14 +47,54 @@ const MODEL_RATES = Object.freeze({
   'openai/gpt-5.6-luna':         { input: 1.00,  output: 6.00,  cachedInput: 0.10 },
   'openai/gpt-5.6-sol':          { input: 5.00,  output: 30.00, cachedInput: 0.50 },
   'openai/gpt-5.4':              { input: 2.50,  output: 15.00, cachedInput: 0.25 },
-  'google/gemini-2.5-flash':     { input: 0.30,  output: 2.50,  cachedInput: 0.075 },
-  'google/gemini-2.5-pro':       { input: 1.25,  output: 10.00, cachedInput: 0.31 },
+  // cachedInput CORRECTED 2026-08-19: re-verified live against
+  // https://api.atlascloud.ai/api/v1/models (price.actual.cache_price) while
+  // building the daily Atlas-vs-CostLog cross-check
+  // (scripts/reconcileAtlasDailyCosts.js) — that tool's first live run
+  // surfaced 'google/gemini-2.5-flash' as the single largest driver of a
+  // 40% single-day over-claim (2026-08-17: $1.65 claimed vs $0.34 billed for
+  // this model alone), which is what prompted re-checking these two ATLAS-
+  // GATEWAY entries specifically (distinct from the bare, DIRECT-provider
+  // 'gemini-2.5-pro' key below, which stays deliberately untouched per the
+  // 2026-08-03 note on that entry — a different call path, not protected by
+  // that note). Was 0.075/0.31; live catalog says 0.03/0.125. The bulk of
+  // that day's gap is very likely the grounding surcharge estimate
+  // (GEMINI_GROUNDING_COST_USD, below) rather than this cache-rate alone —
+  // flagged, not chased further here; see the audit report.
+  'google/gemini-2.5-flash':     { input: 0.30,  output: 2.50,  cachedInput: 0.03 },
+  'google/gemini-2.5-pro':       { input: 1.25,  output: 10.00, cachedInput: 0.125 },
   // Director role as of 2026-07-31. Rates read from the live Atlas catalog
   // (price.actual input_price/output_price), not the vendor list price. Without an
   // entry here every director call ledgers $0 — the role would be invisible in
   // spend reports precisely when we have just started paying for it.
   'anthropic/claude-sonnet-5-ccmax': { input: 2.00,  output: 10.00, cachedInput: 0.20 },
   'anthropic/claude-opus-5-ccmax':   { input: 5.00,  output: 25.00, cachedInput: 0.50 },
+  // PLAIN (non-`-ccmax`) slugs — CONFIRMED THE REAL HOLE (2026-08-19). The
+  // Director's live cross-provider fallback chain (atlasModelMap.js —
+  // `anthropic/claude-sonnet-5` -> `anthropic/claude-opus-5` -> `openai/gpt-5.6-terra`,
+  // see CLAUDE.md's fallback-chain measurement table) calls these PLAIN slugs,
+  // not the `-ccmax` ones above. Every successful Director round on the
+  // primary or first-fallback link was ledgering near-zero (surcharges only —
+  // $0.0050 with one vision reference image, $0 with none) because
+  // computeCost() found no rate and silently dropped the entire token cost.
+  // Verified LIVE against https://api.atlascloud.ai/api/v1/models 2026-08-19
+  // (price.actual on each entry) — IDENTICAL to the -ccmax twin, which is
+  // expected: same underlying model, `-ccmax` is a routing/tier suffix, not a
+  // different price:
+  //   anthropic/claude-sonnet-5  input=2  output=10  cache=0.2
+  //   anthropic/claude-opus-5    input=5  output=25  cache=0.5
+  'anthropic/claude-sonnet-5':       { input: 2.00,  output: 10.00, cachedInput: 0.20 },
+  'anthropic/claude-opus-5':         { input: 5.00,  output: 25.00, cachedInput: 0.50 },
+  // Named explicitly in the Director fallback chain's own live measurement
+  // table (CLAUDE.md §"Known open" — `anthropic/claude-sonnet-4.5-20250929`,
+  // 200-OK-but-52s). Same catalog probe 2026-08-19: input=3 output=15
+  // cache=0.3 for the base (<=200k token) tier — Atlas also publishes a
+  // `prompt_thresholds` tier above 200k prompt tokens (input=6 output=22.5
+  // cache=0.6) that this flat-rate table does not model; every call here is
+  // priced at the base tier, which UNDER-states a rare >200k-token round. Not
+  // a regression — no entry at all was ALWAYS wrong, and API round prompts
+  // measured well under 200k tokens as of this writing.
+  'anthropic/claude-sonnet-4.5-20250929': { input: 3.00, output: 15.00, cachedInput: 0.30 },
   'anthropic/claude-sonnet-4.6': { input: 3.00,  output: 15.00, cachedInput: 0.30 },
   // Flash-tier models used/benchmarked for the 'review-text' role
   // (atlasModelMap). Rates from the live Atlas catalog 2026-07-27. The
@@ -129,7 +169,7 @@ async function trackLlmCall(meta, fn) {
   // usage.{input_tokens, output_tokens, cache_read_input_tokens?}; Gemini
   // returns usageMetadata.{promptTokenCount, candidatesTokenCount}.
   const usage = extractUsage(result, meta.provider);
-  const { costUsd, inputTokens, outputTokens, cachedInputTokens } =
+  const { costUsd, inputTokens, outputTokens, cachedInputTokens, rateFound } =
     computeCost(meta.model, usage, meta.visionImages || 0, meta.groundedRequests || 0);
 
   await persistCost({
@@ -138,6 +178,13 @@ async function trackLlmCall(meta, fn) {
     visionImages: meta.visionImages || 0,
     groundedRequests: meta.groundedRequests || 0,
     costUsd,
+    // rateFound===false means MODEL_RATES has no entry for this model — the
+    // token-cost component (almost always the dominant part of an LLM call)
+    // was NOT computed, not computed-as-zero. That is a materially different
+    // claim from 'estimated' (a real, if imprecise, guess) and from 'none'
+    // (confirmed nothing was charged) — a genuinely billed call must never be
+    // silently folded into either. See computeCost() / models/CostLog.js.
+    costSource: rateFound === false ? 'unknown' : meta.costSource,
     durationMs: Date.now() - t0,
     status
   });
@@ -168,20 +215,29 @@ async function recordFlatCost(meta) {
  * as status flips to completed, so the row can be written before that value is
  * readable. This updates in place, keyed on the prediction id.
  *
- * Deliberately narrow: only ever upgrades 'estimated' -> 'actual'. It will not
- * touch a row already marked actual, so a late duplicate call cannot corrupt a
- * good figure, and it never creates a row (a missing row means the write failed
- * and inventing one here would hide that).
+ * Deliberately narrow: only ever upgrades 'estimated' -> `costSource` (default
+ * 'actual'). It will not touch a row already marked actual/none/unknown, so a
+ * late duplicate call cannot corrupt a good figure, and it never creates a row
+ * (a missing row means the write failed and inventing one here would hide that).
+ *
+ * `costSource` is an explicit override, not a free-form string — pass 'none'
+ * to settle a CONFIRMED-unbilled prediction to $0 (the same "estimated ->
+ * confirmed-zero" transition atlasVideoService.resolveFailureCostReconcile /
+ * bootRecoveryService already perform inline for the live failure path; this
+ * lets scripts/backfillCostReconcile.js reuse the identical guarded update
+ * for HISTORICAL rows instead of re-implementing the atomic filter). Callers
+ * that omit it get the original 'actual' behaviour, byte-for-byte.
  */
-async function reconcileCost({ providerRequestId, costUsd }) {
+async function reconcileCost({ providerRequestId, costUsd, costSource = 'actual' }) {
   if (!providerRequestId || !Number.isFinite(Number(costUsd))) return false;
+  if (!CostLog.COST_SOURCES.includes(costSource)) return false;
   try {
     const res = await CostLog.updateOne(
       { providerRequestId, costSource: 'estimated' },
-      { $set: { costUsd: Number(costUsd), costSource: 'actual' } }
+      { $set: { costUsd: Number(costUsd), costSource } }
     );
     const n = res.modifiedCount ?? res.nModified ?? 0;
-    if (n) console.log(`   💲 cost reconciled ${providerRequestId} -> $${Number(costUsd).toFixed(6)} (actual)`);
+    if (n) console.log(`   💲 cost reconciled ${providerRequestId} -> $${Number(costUsd).toFixed(6)} (${costSource})`);
     return !!n;
   } catch (err) {
     console.warn(`   ⚠️  cost reconcile failed for ${providerRequestId}: ${err.message}`);
@@ -394,13 +450,32 @@ function computeCost(model, usage, visionImages, groundedRequests) {
   if (!rate) {
     if (model && !warnedUnknownModels.has(model)) {
       warnedUnknownModels.add(model);
-      console.warn(`💰 costTracker: no rate for model '${model}' — tokens log $0 (add it to MODEL_RATES)`);
+      console.warn(`💰 costTracker: no rate for model '${model}' — token cost UNKNOWN, not $0 (add it to MODEL_RATES)`);
+      // Loud, not just a console line that scrolls away: this is a live blind
+      // spot in the ledger (a real, billed call with no dollar figure), not a
+      // one-off warning. Deduped by the SAME warnedUnknownModels gate as the
+      // console.warn above, so a hot path can't page-storm on every call.
+      // notifyAsync is already fire-and-forget internally (Promise.resolve()
+      // .then(...).catch(()=>{})) and returns undefined, not a promise — do
+      // NOT chain .catch() onto it here.
+      alerts.notifyAsync({
+        level: 'warn',
+        title: 'CostLog: unmapped model — token cost is UNKNOWN, not zero',
+        key: `costtracker-unknown-model:${model}`,
+        fields: { model, note: 'add a MODEL_RATES entry in services/costTracker.js' }
+      });
     }
-    // Previously returned a hard 0, which also discarded any per-request
-    // surcharge — a $0.035 grounded call behind a renamed slug ledgered as free.
+    // rateFound:false is the caller's signal to stamp costSource:'unknown'
+    // rather than 'estimated' — a near-zero number here (surcharges only,
+    // e.g. exactly $0.0050 for one vision reference image) previously looked
+    // like a real, if small, estimate. It is not: the entire per-token
+    // component — almost always the dominant part of an LLM call's cost —
+    // is silently missing. Surcharges (vision/grounding) are still counted;
+    // they are flat, known amounts independent of the per-token rate table.
     return {
       costUsd: Number(surcharges.toFixed(6)),
-      inputTokens: usage.input, outputTokens: usage.output, cachedInputTokens: usage.cached
+      inputTokens: usage.input, outputTokens: usage.output, cachedInputTokens: usage.cached,
+      rateFound: false
     };
   }
   const fullInput = Math.max(0, usage.input - (usage.cached || 0));
@@ -413,7 +488,8 @@ function computeCost(model, usage, visionImages, groundedRequests) {
     costUsd: Number(usd.toFixed(6)),
     inputTokens: usage.input,
     outputTokens: usage.output,
-    cachedInputTokens: usage.cached || 0
+    cachedInputTokens: usage.cached || 0,
+    rateFound: true
   };
 }
 
@@ -423,10 +499,13 @@ function computeCost(model, usage, visionImages, groundedRequests) {
  * populated at the write sites — see CLAUDE.md §2 / session.md 2026-08-19).
  *
  * Returns totals split by costSource so a caller can see how much of the
- * figure is settled (`actual`) vs a pre-settlement estimate (`estimated`) —
- * collapsing them into one number would hide exactly the gap this function
- * exists to surface. `none` rows (rejections, refunded failures) are counted
- * separately and contribute $0 to `totalUsd`.
+ * figure is settled (`actual`) vs a pre-settlement estimate (`estimated`) vs
+ * a real billed call we cannot even estimate (`unknown` — no MODEL_RATES
+ * entry; see models/CostLog.js) — collapsing any of these into one number
+ * would hide exactly the gap this function exists to surface. `none` rows
+ * (rejections, refunded failures) are counted separately and contribute $0 to
+ * `totalUsd` (their costUsd is always 0 by construction, unlike `unknown`
+ * rows, whose costUsd can be a nonzero surcharge-only figure).
  *
  * Coverage caveat, stated rather than hidden: only rows written AFTER the
  * campaignRunId threading (2026-08-19) carry it. A run from before that date
@@ -439,12 +518,16 @@ function computeCost(model, usage, visionImages, groundedRequests) {
  *   producer already holds; see the CostLog.campaignRunId schema comment.
  * @returns {Promise<{
  *   campaignRunId: string, rows: number,
- *   totalUsd: number, actualUsd: number, estimatedUsd: number,
+ *   totalUsd: number, actualUsd: number, estimatedUsd: number, unknownUsd: number,
  *   byStage: Array<{stage:string, model:string, n:number, usd:number, costSource:string}>
  * }>}
  */
 async function costForRun(campaignRunId) {
-  const out = { campaignRunId, rows: 0, totalUsd: 0, actualUsd: 0, estimatedUsd: 0, byStage: [] };
+  const out = {
+    campaignRunId, rows: 0,
+    totalUsd: 0, actualUsd: 0, estimatedUsd: 0, unknownUsd: 0,
+    byStage: []
+  };
   if (!campaignRunId) return out;
   const rows = await CostLog.find({ campaignRunId })
     .select('stage model costUsd costSource status')
@@ -456,6 +539,12 @@ async function costForRun(campaignRunId) {
     out.totalUsd += usd;
     if (r.costSource === 'actual') out.actualUsd += usd;
     else if (r.costSource === 'estimated') out.estimatedUsd += usd;
+    // 'unknown' rows carry real spend (a billed call happened) but no usable
+    // per-token estimate — surfaced on its OWN line, never folded into
+    // estimatedUsd, so a caller cannot mistake a MODEL_RATES gap for a
+    // normal pre-settlement estimate. See costSource comment on
+    // models/CostLog.js.
+    else if (r.costSource === 'unknown') out.unknownUsd += usd;
     const key = `${r.stage || 'unknown'}::${r.model || 'unknown'}::${r.costSource || 'unknown'}`;
     const entry = byKey.get(key) || { stage: r.stage || 'unknown', model: r.model || 'unknown', costSource: r.costSource || 'unknown', n: 0, usd: 0 };
     entry.n++;
@@ -465,6 +554,7 @@ async function costForRun(campaignRunId) {
   out.totalUsd     = Number(out.totalUsd.toFixed(6));
   out.actualUsd    = Number(out.actualUsd.toFixed(6));
   out.estimatedUsd = Number(out.estimatedUsd.toFixed(6));
+  out.unknownUsd   = Number(out.unknownUsd.toFixed(6));
   out.byStage = [...byKey.values()]
     .map((e) => ({ ...e, usd: Number(e.usd.toFixed(6)) }))
     .sort((a, b) => b.usd - a.usd);
