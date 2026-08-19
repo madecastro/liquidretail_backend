@@ -427,6 +427,67 @@ async function ingestIgPost(brand, post) {
     }
     throw err;
   }
+
+  // 2026-08-19 — inline comment fetch, mirroring postSyncService's OAuth
+  // path. Measured 2026-08-19: 0 / 159 apify-ig Media had any comments
+  // stored (vs 82% of instagram-source Media), because comment ingestion
+  // was reachable only via the T4 media.refreshCommentsFromApify manual
+  // capability that nobody had invoked for any brand. Fires on FIRST
+  // ingest only (skips re-syncs of existing Media — re-syncs are common
+  // and firing a paid Apify comment pull on each would waste credit).
+  //
+  // Cost: ~$0.02 per new post via APIFY_IG_COMMENTS_LIMIT=50.
+  // Gate APIFY_INGEST_FETCH_COMMENTS (default true) lets an operator
+  // disable it per-brand or globally without a deploy.
+  if (!existing && process.env.APIFY_INGEST_FETCH_COMMENTS !== 'false' && permalink) {
+    setImmediate(() => {
+      Promise.resolve().then(async () => {
+        const { pullInstagramComments } = require('./apifyPullService');
+        const Comment = require('../models/Comment');
+        try {
+          const comments = await pullInstagramComments(permalink, {});
+          let upserted = 0;
+          for (const c of comments) {
+            try {
+              await Comment.updateOne(
+                { mediaId: media._id, externalId: c.externalId },
+                {
+                  $set: {
+                    text:             c.text,
+                    authorUsername:   c.authorUsername,
+                    authorId:         c.authorId,
+                    likeCount:        c.likeCount,
+                    replyCount:       c.replyCount,
+                    postedAt:         c.postedAt,
+                    parentExternalId: c.parentExternalId,
+                    fetchedAt:        new Date()
+                  },
+                  $setOnInsert: {
+                    mediaId:      media._id,
+                    brandId:      brand._id,
+                    advertiserId: brand.advertiserId,
+                    source:       'instagram',   // platform, not ingest path
+                    externalId:   c.externalId
+                  }
+                },
+                { upsert: true }
+              );
+              upserted++;
+            } catch (err) {
+              // 11000 on race with a concurrent operator refresh — safe to ignore.
+              if (err.code !== 11000) {
+                console.warn(`   ⚠️  apify comment upsert failed for ${media._id}/${c.externalId}: ${err.message}`);
+              }
+            }
+          }
+          if (upserted) console.log(`   💬 apify comments: ingested ${upserted} for media ${media._id}`);
+        } catch (err) {
+          console.warn(`   ⚠️  apify comment fetch failed for ${media._id}: ${err.message}`);
+        }
+      });
+    });
+  }
+
   return { mediaId: media._id, runId: run._id, skipped: !!existing };
 }
 
