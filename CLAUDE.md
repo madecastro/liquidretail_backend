@@ -443,6 +443,25 @@ Video never launches a browser.
 - **`maxRedirects: 0` on every billable POST.** Axios defaults to **21** and re-sends
   the body on 307/308 — a silent double charge inside one call, invisible to retry
   logic.
+  **CLOSED 2026-08-19 — the shared LLM chat transport was the one exception.**
+  `services/atlasLlmService.js`'s `post()` — the ONE function serving both the
+  Atlas primary and the direct-provider fallback twin inside `chatCompletion`,
+  which **25 services** call (Director, Judge, copy/layout derivation, and
+  most of the money-facing LLM pipeline) — had no `maxRedirects: 0` until this
+  date. Found during adversarial review (two independent reviewers) of a
+  cost-ledger PR that routed a new caller through this exact function;
+  confirmed pre-existing and not a regression (the direct call it replaced
+  lacked it too). Live-probed the same day with unauthenticated requests: none
+  of the three endpoints this transport calls (`api.atlascloud.ai`,
+  `generativelanguage.googleapis.com`, `api.openai.com`) actually redirect —
+  each returns its rejection status directly, zero hops — so the exposure was
+  real but not firing in practice. Fixed; pinned by
+  `scripts/verifyLlmErrorCodes.js` D5, revert-proven against three mutations
+  (the flag missing, and a bare-`axios.post` bypass at either call site — the
+  first draft of this check was fooled by its OWN explanatory comment
+  containing the string it searched for, and by a bypass regex that matched
+  inside `axios.post(...)` as a substring; both are why the check strips
+  comments and uses a negative lookbehind on `.`).
 - **Never trust a model id or a price from memory.** `GET
   https://api.atlascloud.ai/api/v1/models` (no auth) is the catalog; each entry
   carries `schema` and `readme` **URLs** — fetch those, they are the operative
