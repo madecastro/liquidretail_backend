@@ -113,10 +113,44 @@ const MODEL_RATES = Object.freeze({
 // Atlas slug can't quietly zero the ledger.
 const warnedUnknownModels = new Set();
 
-// Vision image surcharge — gpt-4.1 charges per image (low ≈ 85 tokens,
-// high ≈ 765 tokens per 512×512 tile). We log image count and add a
-// rough cost based on default-quality assumption.
-const VISION_IMAGE_COST_PER_IMAGE_USD = 0.005;   // ~mid-range estimate
+// Vision image surcharge — $0 BY DEFAULT SINCE 2026-08-19, AND THAT IS THE
+// CORRECT VALUE, not a disabled feature. It was 0.005/image.
+//
+// WHY IT WAS WRONG: it double-charged. Every provider in extractUsage()
+// reports image tokens INSIDE its prompt-token count — OpenAI and the
+// OpenAI-compatible Atlas gateway fold them into `usage.prompt_tokens`,
+// Gemini into `promptTokenCount`. The original comment gave the surcharge in
+// TOKENS ("low ≈ 85, high ≈ 765 per 512×512 tile"), which is the tell: it was
+// modelling a quantity the per-token math had already billed. So a vision row
+// paid for its images twice — once at the model's real input rate, then again
+// at a flat $0.005.
+//
+// MEASURED, not reasoned (scripts/reconcileAtlasDailyCosts.js against Atlas's
+// own settled billing, 2026-08-19). On 2026-08-17 the ledger claimed $4.7890
+// against Atlas's actual $3.4185 — a 40% over-claim. 99.2% of that $1.3705 gap
+// was this surcharge: 260 declared images x $0.005 = $1.3000. The same day's
+// google/gemini-2.5-flash rows carried ZERO grounded requests and ZERO cached
+// tokens, so neither the grounding surcharge nor the cachedInput rate fix could
+// account for any of it. Token-only math for those rows came to $0.3520 against
+// Atlas's $0.3418 — a 3.0% drift, in line with every other day. Dropping the
+// surcharge moves 2026-08-17 from +40.1% to +0.3%, and the 6-day complete-day
+// total from +1.6% to -2.3%.
+//
+// A cross-check that settles the direction: if images were NOT already in
+// prompt_tokens, Atlas would have billed MORE than our token-only figure. It
+// billed LESS. Whatever Atlas does with image tokens, it does not add a
+// separate per-image charge on top.
+//
+// Left as an env-tunable constant rather than deleted so a future provider that
+// genuinely reports usage WITHOUT its image tokens can be priced without a code
+// change. Set VISION_IMAGE_COST_USD to that provider's per-image rate if one
+// ever appears; do not set it back to 0.005 for the providers above.
+const VISION_IMAGE_COST_PER_IMAGE_USD = (() => {
+  const raw = process.env.VISION_IMAGE_COST_USD;
+  if (raw === undefined || String(raw).trim() === '') return 0;
+  const n = Number(raw);
+  return Number.isFinite(n) && n >= 0 ? n : 0;
+})();
 
 // Google Search grounding surcharge — billed PER REQUEST on top of tokens,
 // not per token. Live figure 2026-08-03
@@ -136,20 +170,152 @@ const VISION_IMAGE_COST_PER_IMAGE_USD = 0.005;   // ~mid-range estimate
 // bill several queries, and callers would need to count
 // groundingMetadata.webSearchQueries instead of passing 1.
 //
-// TWO KNOWN APPROXIMATIONS, both erring toward never understating:
+// TWO KNOWN APPROXIMATIONS. The first still errs toward never understating;
+// the second DID, and was measured to be the dominant error on this path:
 //  · It is DECLARED, not confirmed. A caller sets it because it enabled the
 //    google_search tool, not because the response proved a search ran. A prompt
 //    the model answers without searching still ledgers the surcharge.
-//  · Inside the free 1,500/day allowance the true marginal cost is $0, so this
-//    overstates until that is exhausted. Set GEMINI_GROUNDING_COST_USD=0 to
-//    ledger the free tier honestly.
+//  · The free allowance was ignored, so every call inside it was ledgered at
+//    the post-allowance price. See FREE-ALLOWANCE below — this is now $0 by
+//    default, because that is what these calls actually cost us.
 // Rows stamp costSource:'estimated' either way.
+//
+// ── FREE-ALLOWANCE DEFAULT (changed 2026-08-19: 0.035 -> 0) ─────────────────
+// Google's 1,500-grounded-prompts/day allowance applies to the PAID tier, not
+// just the free one — re-read live 2026-08-19: "1,500 RPD (free, limit shared
+// with Flash-Lite RPD), then $35 / 1,000 grounded prompts", published
+// identically under both tiers. So a grounded request is genuinely free until
+// the 1,501st one that day.
+//
+// MEASURED VOLUME (CostLog, 2026-08-13..08-19): grounded requests ran at 19/day
+// and 13/day — 1.27% and 0.87% of the allowance. Every grounded call in that
+// window had a true marginal cost of $0.00, and the ledger claimed $1.1200 for
+// them: 89.9% of ALL direct-Gemini spend recorded in the window was this
+// surcharge on calls Google did not bill.
+//
+// WHY THIS ONE COULD NOT SELF-CORRECT, which is why it is worth a comment this
+// long. Grounded calls are pinned to provider:'gemini' (the single call site,
+// services/providers/geminiSearchProvider.js trackedGenerate) because Atlas
+// cannot proxy Google Search grounding at all (probed in PR #229: native
+// google_search -> 400, OpenAI web_search -> 400, top-level flag silently
+// ignored). scripts/reconcileAtlasDailyCosts.js matches provider:'atlas' only,
+// by construction — Atlas's bill cannot contain a call that never touched its
+// meter. So no reconciliation this repo has ever had could see this row, and
+// none ever will until a Google-billing cross-check exists. An unverifiable
+// constant has to be right by argument, because nothing downstream will catch
+// it being wrong.
+//
+// THE UNDERSTATEMENT RISK, AND WHY IT IS NOT SILENT. $0 is correct only while
+// daily volume stays inside the allowance; past it, real money is spent and a
+// $0 ledger hides it — the mirror of the bug being fixed. That is what
+// GEMINI_GROUNDING_FREE_RPD and the crossing alert below are for: when a day's
+// grounded volume approaches the allowance, the ledger says so out loud instead
+// of quietly going wrong. Set GEMINI_GROUNDING_COST_USD=0.035 when that fires.
+//
+// NOT MADE PER-CALLER, deliberately, though that was on the table. The price is
+// a property of Google's billing, not of the calling stage: two stages issuing
+// the same grounded request are charged the same. A per-caller knob would let
+// identical requests ledger different amounts depending on who asked, which is
+// exactly the kind of unauditable drift the rest of this table is written to
+// avoid.
 const GROUNDED_SEARCH_COST_PER_REQUEST_USD = (() => {
   const raw = process.env.GEMINI_GROUNDING_COST_USD;
-  if (raw === undefined || String(raw).trim() === '') return 0.035;
+  if (raw === undefined || String(raw).trim() === '') return 0;
   const n = Number(raw);
-  return Number.isFinite(n) && n >= 0 ? n : 0.035;
+  return Number.isFinite(n) && n >= 0 ? n : 0;
 })();
+
+// Google's published free allowance, per project per UTC day. Env-tunable so a
+// plan change does not need a deploy.
+const GEMINI_GROUNDING_FREE_RPD = (() => {
+  const raw = process.env.GEMINI_GROUNDING_FREE_RPD;
+  const n = Number(raw);
+  return Number.isFinite(n) && n > 0 ? n : 1500;
+})();
+
+// Fraction of the allowance at which we start shouting. Deliberately well below
+// 1.0: this counter is PER PROCESS (web and worker each keep their own), so the
+// project-wide total can be several times the largest local count. A fractional
+// threshold buys the margin that per-process counting costs us.
+//
+// WHAT HAPPENS AT 100% — A STATED DECISION, NOT AN OVERSIGHT. Nothing. The
+// ledger keeps recording $0 per grounded request and keeps the alert standing.
+// It does NOT start charging $0.035 by itself, and that restraint is the point:
+//
+//  · The trigger would be a PER-PROCESS count. Web and worker each hold their
+//    own, so whichever crosses first would flip only its own rows while its
+//    siblings kept billing $0 — the same request priced two different ways
+//    depending on which box served it. An unauditable ledger is worse than a
+//    knowably-conservative one.
+//  · Crossing the allowance is a real, reviewable event (it means grounded
+//    volume grew ~75x from the 13-19/day measured 2026-08-19). It deserves a
+//    human looking at Google's actual bill and setting
+//    GEMINI_GROUNDING_COST_USD deliberately — not a threshold silently
+//    re-pricing every row behind us.
+//  · Auto-repricing off an under-count is EXACTLY the class of bug this block
+//    was written to fix: a number that moved on its own, that nothing
+//    downstream could verify (these rows are provider:'gemini' and no
+//    reconcile sees them), and that therefore stayed wrong for weeks.
+//
+// So past 100% the ledger is deliberately, loudly, KNOWN-conservative rather
+// than quietly precise. If you are here to "finish" this by making the
+// threshold apply the surcharge automatically: that is the regression, not the
+// improvement. Be loudly wrong, never quietly wrong.
+const GROUNDING_ALERT_FRACTION = (() => {
+  const raw = Number(process.env.GEMINI_GROUNDING_ALERT_FRACTION);
+  return Number.isFinite(raw) && raw > 0 && raw <= 1 ? raw : 0.5;
+})();
+
+// UTC-day grounded-request counter. Reset lazily on the first call of a new day
+// rather than on a timer, so an idle process holds no interval handle.
+const groundingUsage = { day: null, count: 0, alerted: false };
+
+/**
+ * Count a grounded request against today's free allowance and, once the local
+ * count crosses GROUNDING_ALERT_FRACTION of it, alert ONCE for that day.
+ *
+ * Called for its side effect only — it deliberately does not change the price
+ * of the row being written, at ANY count, including past the allowance itself.
+ * See GROUNDING_ALERT_FRACTION above for why crossing is surfaced to a human
+ * instead of silently re-pricing; that is a decision, not a missing feature.
+ */
+function noteGroundedRequests(n) {
+  const count = Number(n) || 0;
+  if (count <= 0) return;
+  const today = new Date().toISOString().slice(0, 10);
+  if (groundingUsage.day !== today) {
+    groundingUsage.day = today;
+    groundingUsage.count = 0;
+    groundingUsage.alerted = false;
+  }
+  groundingUsage.count += count;
+
+  const threshold = GEMINI_GROUNDING_FREE_RPD * GROUNDING_ALERT_FRACTION;
+  if (groundingUsage.alerted || groundingUsage.count < threshold) return;
+  groundingUsage.alerted = true;
+
+  const priced = GROUNDED_SEARCH_COST_PER_REQUEST_USD > 0;
+  console.warn(
+    `💰 costTracker: ${groundingUsage.count} grounded requests today in THIS process ` +
+    `(${Math.round(GROUNDING_ALERT_FRACTION * 100)}% of the ${GEMINI_GROUNDING_FREE_RPD}/day free allowance)` +
+    (priced ? ' — surcharge already priced.' : ' — grounded calls are ledgering $0; set GEMINI_GROUNDING_COST_USD=0.035 if the allowance is exhausted.')
+  );
+  if (priced) return;
+  // notifyAsync is fire-and-forget internally and returns undefined — do NOT
+  // chain .catch() onto it (same contract as the unmapped-model alert below).
+  alerts.notifyAsync({
+    level: 'warn',
+    title: 'Grounded search volume is approaching Google\'s free daily allowance',
+    key: `costtracker-grounding-allowance:${today}`,
+    fields: {
+      groundedRequestsThisProcessToday: groundingUsage.count,
+      freeAllowancePerDay: GEMINI_GROUNDING_FREE_RPD,
+      note: 'This count is per-process; the project-wide total is higher. Past the ' +
+            'allowance Google bills $35/1,000 grounded prompts and the ledger is ' +
+            'recording $0 for them. Set GEMINI_GROUNDING_COST_USD=0.035 to price them.'
+    }
+  });
+}
 
 async function trackLlmCall(meta, fn) {
   const t0 = Date.now();
@@ -171,6 +337,13 @@ async function trackLlmCall(meta, fn) {
   const usage = extractUsage(result, meta.provider);
   const { costUsd, inputTokens, outputTokens, cachedInputTokens, rateFound } =
     computeCost(meta.model, usage, meta.visionImages || 0, meta.groundedRequests || 0);
+
+  // Track free-allowance consumption for the alert. Counted on the SUCCESS path
+  // only: the error path above returns before here, and a grounded call that
+  // never produced a response is the one case where we cannot say whether
+  // Google counted it against the allowance. Under-counting here delays the
+  // warning slightly; over-counting would cry wolf on every timeout.
+  noteGroundedRequests(meta.groundedRequests || 0);
 
   await persistCost({
     ...meta,
@@ -570,5 +743,6 @@ module.exports = {
   costForRun,
   MODEL_RATES,
   VISION_IMAGE_COST_PER_IMAGE_USD,
-  GROUNDED_SEARCH_COST_PER_REQUEST_USD
+  GROUNDED_SEARCH_COST_PER_REQUEST_USD,
+  GEMINI_GROUNDING_FREE_RPD
 };

@@ -46,6 +46,11 @@
 // and the provider resolves MODEL at module load, so a stray local override
 // would silently change the expected arithmetic below.
 delete process.env.GEMINI_GROUNDING_COST_USD;
+// Same reason as the line above: these checks pin the SHIPPED DEFAULT, so an
+// operator's override must not be able to make the suite pass against a value
+// nobody ships. Added 2026-08-19 with the vision surcharge's $0 default.
+delete process.env.VISION_IMAGE_COST_USD;
+delete process.env.GEMINI_GROUNDING_FREE_RPD;
 delete process.env.GEMINI_SEARCH_MODEL;
 process.env.GEMINI_API_KEY = 'test-key-not-a-real-credential';   // only gates isEnabled()
 // Pass 2 now goes through atlasLlmService.chatCompletion, which only
@@ -95,7 +100,14 @@ function restoreAxios() { axios.post = realAxiosPost; }
 const FLASH_INPUT_PER_1M  = 0.30;
 const FLASH_OUTPUT_PER_1M = 2.50;   // "Output price includes thinking tokens"
 const FLASH_CACHED_PER_1M = 0.03;
-const GROUNDING_PER_CALL  = 0.035;  // "$35 / 1,000 grounded prompts"
+// The POST-ALLOWANCE price. Not what a grounded row costs today: the first
+// 1,500 grounded prompts each UTC day are free on the paid tier too, and
+// measured volume is ~1% of that, so the shipped default is $0. This constant
+// is what the surcharge becomes when GEMINI_GROUNDING_COST_USD is set past the
+// allowance. See services/costTracker.js §FREE-ALLOWANCE.
+const GROUNDING_POST_ALLOWANCE_PER_CALL = 0.035;  // "$35 / 1,000 grounded prompts"
+// What the ledger actually charges a grounded request with no env override.
+const GROUNDING_PER_CALL  = 0;
 // Atlas's google/gemini-2.5-flash listing — read live 2026-08-19 against
 // GET https://api.atlascloud.ai/api/v1/models. Same input/output rate as
 // direct; only cachedInput differs slightly (0.075 vs 0.03) and no fixture
@@ -190,8 +202,36 @@ check('B1 gemini-2.5-flash carries live-verified rates, not Flash-Lite ones', ()
   assert.strictEqual(r.output, FLASH_OUTPUT_PER_1M);
   assert.strictEqual(r.cachedInput, FLASH_CACHED_PER_1M);
 });
-check('B2 the grounding surcharge is the published per-request price', () => {
+check('B2 a grounded request ledgers $0 by default — inside Google\'s free daily allowance', () => {
+  // CHANGED 2026-08-19 (was pinned to 0.035). Google's 1,500-grounded-prompts/day
+  // allowance applies to the paid tier; measured volume is 13-19/day, ~1% of it.
+  // The old default claimed $1.1200 over 7 days for calls Google never billed —
+  // 89.9% of all direct-Gemini spend in the window.
   assert.strictEqual(costTracker.GROUNDED_SEARCH_COST_PER_REQUEST_USD, GROUNDING_PER_CALL);
+  assert.strictEqual(GROUNDING_PER_CALL, 0, 'the shipped default must be $0, not the post-allowance price');
+});
+check('B2b the free allowance is declared, so the $0 default is bounded rather than blind', () => {
+  // Without this, $0 would be an unexamined guess. With it, the ledger knows the
+  // number it is betting on and alerts as the day's volume approaches it.
+  assert.strictEqual(costTracker.GEMINI_GROUNDING_FREE_RPD, 1500);
+});
+check('B2c the post-allowance price is still reachable via env, unchanged', () => {
+  // The $0 default is a claim about VOLUME, not about Google's price list. If
+  // volume ever exhausts the allowance the operator sets GEMINI_GROUNDING_COST_USD
+  // and every grounded row prices at $35/1,000 again. Pin the parser so that
+  // escape hatch cannot rot: an env value must survive as an exact float.
+  const src = require('fs').readFileSync(require('path').join(__dirname, '..', 'services', 'costTracker.js'), 'utf8');
+  assert.ok(/process\.env\.GEMINI_GROUNDING_COST_USD/.test(src),
+    'the env override must remain the way to price past the allowance');
+  assert.strictEqual(GROUNDING_POST_ALLOWANCE_PER_CALL, 0.035);
+});
+check('B2d the vision surcharge is $0 — image tokens are already inside prompt_tokens', () => {
+  // Measured 2026-08-19 against Atlas's settled billing: on 2026-08-17 this
+  // surcharge was 99.2% of a $1.3705 over-claim (260 images x $0.005 = $1.3000).
+  // Removing it took that day from +40.1% to +0.3%. Every provider in
+  // extractUsage() reports image tokens in its prompt-token count, so charging
+  // per image on top billed the same pixels twice.
+  assert.strictEqual(costTracker.VISION_IMAGE_COST_PER_IMAGE_USD, 0);
 });
 check('B1b Atlas google/gemini-2.5-flash (pass 2\'s new home) is priced too, and matches direct', () => {
   // Read live 2026-08-19 against GET https://api.atlascloud.ai/api/v1/models.
@@ -235,7 +275,11 @@ await checkAsync('C1 thinking + tool-use tokens are counted, not just candidates
   assert.strictEqual(row.outputTokens, 1000, 'thoughtsTokenCount must be added to output');
 });
 
-await checkAsync('C2 a grounded call adds the per-request surcharge on top of tokens', async () => {
+await checkAsync('C2 a grounded call costs its tokens and nothing more, while inside the allowance', async () => {
+  // REWRITTEN 2026-08-19. This check previously asserted the inverse — that the
+  // surcharge DOMINATED the row (>80% of it). That was true of the arithmetic and
+  // false about our bill: the calls were inside Google's free 1,500/day allowance,
+  // so the dominant component was money nobody charged us.
   const row = await ledger({ ...BASE, groundedRequests: 1 }, geminiBody({
     promptTokenCount: 1000, toolUsePromptTokenCount: 500,
     candidatesTokenCount: 800, thoughtsTokenCount: 200
@@ -243,10 +287,12 @@ await checkAsync('C2 a grounded call adds the per-request surcharge on top of to
   const tokens = (1500 / 1e6) * FLASH_INPUT_PER_1M + (1000 / 1e6) * FLASH_OUTPUT_PER_1M;
   assert.strictEqual(row.groundedRequests, 1);
   assert.strictEqual(row.costUsd, Number((tokens + GROUNDING_PER_CALL).toFixed(6)));
-  // The point of the surcharge: it dominates. If this ratio ever inverts,
-  // someone has changed the pricing assumption and the comment is now a lie.
-  assert.ok(GROUNDING_PER_CALL / row.costUsd > 0.8,
-    'grounding should be the majority of a grounded row; token-only math understates ~10x');
+  // The declaration must SURVIVE even though it no longer moves the price — it is
+  // what the allowance counter and any future Google-billing reconcile run on.
+  // A row that forgets it was grounded is unrecoverable after the fact.
+  assert.strictEqual(row.groundedRequests, 1, 'grounding must stay declared even at $0');
+  assert.strictEqual(row.costUsd, Number(tokens.toFixed(6)),
+    'at the shipped default a grounded row is exactly its token cost');
 });
 
 await checkAsync('C3 a non-grounded call carries no surcharge', async () => {
@@ -276,11 +322,19 @@ await checkAsync('C5 returning the axios envelope zeroes the tokens (the trap A5
   assert.strictEqual(row.outputTokens, 0);
 });
 
-await checkAsync('C6 an unknown model still carries the grounding surcharge', async () => {
-  // A renamed slug must not turn a $0.035 grounded call into a free one.
+await checkAsync('C6 an unknown model is stamped UNKNOWN, not quietly priced at the surcharge', async () => {
+  // REWRITTEN 2026-08-19. This used to assert the row still carried $0.035, on the
+  // reasoning that a renamed slug must not make a grounded call look free. With the
+  // surcharge at its correct $0 that costUsd is now 0 — so the protection has to
+  // come from costSource:'unknown', which says "the token cost was NOT computed"
+  // rather than "nothing was charged". That distinction is the real guard, and it
+  // holds at any surcharge value.
   const row = await ledger({ ...BASE, model: 'gemini-9.9-unreleased', groundedRequests: 1 },
     geminiBody({ promptTokenCount: 100, candidatesTokenCount: 100 }));
   assert.strictEqual(row.costUsd, GROUNDING_PER_CALL);
+  assert.strictEqual(row.costSource, 'unknown',
+    'an unmapped model must never pass as a real estimate — $0 here means uncomputed, not free');
+  assert.strictEqual(row.groundedRequests, 1);
 });
 
 await checkAsync('C7 a failed call writes a row, and ledgers $0 — a KNOWN, deliberate limit', async () => {
@@ -363,6 +417,9 @@ function threeWayStub() {
   };
 }
 
+// GROUNDING_PER_CALL is 0 at the shipped default, so pass 1 is now its token cost.
+// Kept as an explicit term rather than dropped: setting GEMINI_GROUNDING_COST_USD
+// past the allowance must keep this expectation correct without an edit here.
 const EXPECTED_PASS1 = Number((((1500 / 1e6) * FLASH_INPUT_PER_1M + (1000 / 1e6) * FLASH_OUTPUT_PER_1M) + GROUNDING_PER_CALL).toFixed(6));
 const EXPECTED_PASS2 = Number(((2000 / 1e6) * ATLAS_FLASH_INPUT_PER_1M + (300 / 1e6) * ATLAS_FLASH_OUTPUT_PER_1M).toFixed(6));
 
