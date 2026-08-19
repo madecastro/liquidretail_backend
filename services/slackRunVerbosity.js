@@ -231,7 +231,14 @@ function buildRunCompletionSummaryLines(opts) {
  * append a visible marker plus the static/video mix so a big batch is
  * distinguishable from routine traffic in the feed.
  *
- * @param {{ total?: number, staticCount?: number, veoCount?: number, threshold?: number }} opts
+ * `requesterLabel` (who clicked Generate, resolved by routes/ads.js) is
+ * appended last as ` · by <who>` when supplied, so it survives both the
+ * at-threshold and above-threshold branches. Omitted entirely when absent —
+ * the byte-identical guarantee above still holds for every existing caller,
+ * none of which passes it.
+ *
+ * @param {{ total?: number, staticCount?: number, veoCount?: number, threshold?: number,
+ *           requesterLabel?: string|null }} opts
  * @returns {string}
  */
 function buildRunStartLine(opts) {
@@ -240,8 +247,12 @@ function buildRunStartLine(opts) {
   const staticCount = num(o.staticCount);
   const veoCount = num(o.veoCount);
   const threshold = o.threshold == null ? DEFAULT_UNCAP_THRESHOLD : num(o.threshold);
+  // Non-empty string only; a non-string (or '') must not print "· by undefined".
+  const by = typeof o.requesterLabel === 'string' && o.requesterLabel.trim()
+    ? ` · by ${o.requesterLabel.trim()}`
+    : '';
   const base = `run start — ${total} ad(s)`;
-  if (total <= threshold) return base;
+  if (total <= threshold) return `${base}${by}`;
   let line = `${base} — uncapped batch`;
   if (staticCount > 0 || veoCount > 0) {
     const bits = [];
@@ -249,7 +260,7 @@ function buildRunStartLine(opts) {
     if (veoCount > 0) bits.push(`${veoCount} video`);
     line += ` (${bits.join(' + ')})`;
   }
-  return line;
+  return `${line}${by}`;
 }
 
 /**

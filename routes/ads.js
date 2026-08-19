@@ -1233,7 +1233,7 @@ router.post('/generate', async (req, res) => {
           level: 'error',
           title: 'Campaign run crashed during prep/render',
           key:   'run-crash:generate',
-          fields: { run: runId, campaign: campaignId, ads: (adIds || []).length, error: err.message || String(err) },
+          fields: { run: runId, by: run?.requestedBy ? String(run.requestedBy) : null, campaign: campaignId, ads: (adIds || []).length, error: err.message || String(err) },
           detail: err.stack || null
         });
         if (adIds && adIds.length) {
@@ -1538,7 +1538,7 @@ router.post('/runs', express.json(), async (req, res) => {
           level: 'error',
           title: 'Campaign run crashed (queued drain)',
           key:   'run-crash:runs',
-          fields: { run: runId, campaign: String(campaign._id), ads: renderIds.length, error: err.message || String(err) },
+          fields: { run: runId, by: run?.requestedBy ? String(run.requestedBy) : null, campaign: String(campaign._id), ads: renderIds.length, error: err.message || String(err) },
           detail: err.stack || null
         });
         Ad.updateMany(
@@ -1607,6 +1607,12 @@ async function runRenderLoop(run, job, adIds, renderToken) {
   // Per-run Slack feed — fire-and-forget, never awaited. Registers adIds so
   // adStage can route events without a Mongo round-trip. Parent message +
   // thread posts are owned by runFeedService's detached interval.
+  //
+  // requestedBy is passed on THIS first call even though the human-readable
+  // label is not resolved yet: it costs nothing (already on the run doc) and it
+  // means the very first parent message names the requester by short id rather
+  // than naming nobody for the first throttle window. The label upgrades it a
+  // few ms later on the enriched call below.
   runFeed.startRun({
     runId:   run.runId,
     brandId: job.brandId,
@@ -1616,20 +1622,48 @@ async function runRenderLoop(run, job, adIds, renderToken) {
     // MAX_CREATIVES_PER_RUN cap of 20; below that it stays byte-identical.
     staticCount: otherIds.length,
     veoCount:    veoIds.length,
-    adIds
+    adIds,
+    requestedBy: run?.requestedBy
   });
 
   // Unified progress row (ActivityDock) — mirrors the CampaignRun
   // counters and adds cooperative cancel: the pool stops claiming new
   // ads, in-flight renders finish, unclaimed ads flip to skipped.
   const { startRun } = require('../services/progressService');
-  const brandDoc = await require('../models/Brand').findById(job.brandId).select('advertiserId name').lean().catch(() => null);
-  if (brandDoc?.name) {
+  // Brand name and requester label are both cosmetic enrichment for the same
+  // Slack line, so they share one await point — issuing them in parallel keeps
+  // this from adding a second serial round-trip ahead of the render pools.
+  //
+  // The requester lookup uses a guarded require and never `.populate()`:
+  // `.populate('requestedBy')` throws "Schema hasn't been registered for model
+  // User" in this file, which never requires the User model (same trap as
+  // GET /api/ads/render-activity — see the note there). Degrades to the raw id,
+  // then to null; a cosmetic field must never fail a run.
+  const [brandDoc, requesterLabel] = await Promise.all([
+    require('../models/Brand').findById(job.brandId).select('advertiserId name').lean().catch(() => null),
+    (async () => {
+      const uid = run?.requestedBy ? String(run.requestedBy) : null;
+      if (!uid) return null;
+      try {
+        const User = require('../models/User');
+        const u = await User.findById(uid).select('displayName email').lean().catch(() => null);
+        return u?.displayName || u?.email || uid;
+      } catch { return null; }
+    })()
+  ]);
+  // Stamp the label onto `job` so renderOneInner's video-failure alert can name
+  // the requester without a second lookup on a failure path. Safe to mutate:
+  // both call sites build `job` fresh per run (never a shared object), and it
+  // already flows unchanged into renderOne → renderOneInner.
+  if (requesterLabel) job.requesterLabel = requesterLabel;
+
+  if (brandDoc?.name || requesterLabel) {
     // Best-effort label enrichment — still fire-and-forget.
     runFeed.startRun({
-      runId: run.runId, brandId: job.brandId, brandName: brandDoc.name,
+      runId: run.runId, brandId: job.brandId, brandName: brandDoc?.name || null,
       total: adIds.length, staticCount: otherIds.length, veoCount: veoIds.length,
-      adIds
+      adIds,
+      requestedBy: run?.requestedBy, requesterLabel
     });
   }
   const progressRun = await startRun({
@@ -1943,6 +1977,7 @@ async function runRenderLoop(run, job, adIds, renderToken) {
       fields: {
         run:      run.runId,
         brand:    job.brandId,
+        by:       requesterLabel || (run?.requestedBy ? String(run.requestedBy) : null),
         outcome:  `${nOk}✓ / ${nFailed}✗ / ${final?.skipped || 0}⊘ of ${adIds.length}`,
         route:    isVeoRun ? 'video' : 'static',
         took:     `${Math.round(totalMs / 1000)}s`
@@ -2784,7 +2819,7 @@ async function renderOneInner(run, job, adId, index, renderToken) {
         level:  'error',
         title:  'Video generation failed',
         key:    `video-failed:${vmsg.slice(0, 60)}`,
-        fields: { ad: String(adId), run: run.runId, brand: job.brandId, error: vmsg.slice(0, 300) }
+        fields: { ad: String(adId), run: run.runId, brand: job.brandId, by: job?.requesterLabel || (run?.requestedBy ? String(run.requestedBy) : null), error: vmsg.slice(0, 300) }
       });
       await CampaignRun.updateOne(
         { _id: run._id },
@@ -3343,7 +3378,7 @@ router.get('/render-activity', async (req, res) => {
     if (requesterIds.length) {
       try {
         const User = require('../models/User');
-        const users = await User.find({ _id: { $in: requesterIds } }).select('email name').lean();
+        const users = await User.find({ _id: { $in: requesterIds } }).select('email displayName').lean();
         users.forEach(u => userById.set(String(u._id), u));
       } catch (err) {
         console.warn(`   ⚠️  render-activity: requester lookup skipped (${err.message}) — showing ids`);
@@ -3408,7 +3443,7 @@ router.get('/render-activity', async (req, res) => {
           const uid = run?.requestedBy ? String(run.requestedBy) : null;
           if (!uid) return null;
           const u = userById.get(uid);
-          return u?.email || u?.name || uid;   // id is still useful; never blank
+          return u?.displayName || u?.email || uid;   // id is still useful; never blank
         })(),
         run:           run ? { status: run.status, total: run.total, succeeded: run.succeeded, failed: run.failed, skipped: run.skipped } : null,
         queuedAt:      a.queuedAt || null,
