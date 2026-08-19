@@ -26,10 +26,62 @@ const { stampFeedTruthCategoryRef, applyFeedTruthStamp } = require('./categoryCl
 
 const APIFY_TRIGGER = 'apify-sync';
 
+// ── Money guard, extracted as pure functions so a harness can pin them
+// without a live DB (same convention as atlasVideoService.submitRetryDecision
+// / atlasErrorPolicy — one pure decision, imported, never re-implemented) ──
+
+/**
+ * shouldRunInstagramSync({ igHandle, skipInstagram }) → boolean
+ *
+ * The ONLY place that decides whether syncBrandApify's IG branch (a paid
+ * Apify actor run, billed per result) executes. Default behaviour
+ * (skipInstagram unset/false) is UNCHANGED — igHandle alone still triggers
+ * it, exactly as before, for the three existing combined-pull callers
+ * (routes/salesDemos.js, capabilityExecutors/{catalogPullFromApify,
+ * salesBrandSync}.js) that deliberately want it. `skipInstagram: true` is
+ * the real, non-racy opt-out for a catalog-only caller — see the MONEY
+ * GUARD comment on syncBrandApify below.
+ */
+function shouldRunInstagramSync({ igHandle, skipInstagram = false } = {}) {
+  return !!igHandle && !skipInstagram;
+}
+
+/**
+ * igWasAttempted(igResult) → boolean
+ *
+ * A deliberately-skipped IG branch (shouldRunInstagramSync === false while
+ * igHandle was actually configured) must read the same as "not attempted"
+ * — same as igHandle never having been set — so computeSyncOutcome never
+ * reports a catalog-only run as "Instagram ingested nothing" (a false
+ * failure reason for something that was never asked to run).
+ */
+function igWasAttempted(igResult) {
+  return igResult != null && !igResult.skipped;
+}
+
 // Orchestrator — runs whichever sub-syncs the brand has configured.
 // Returns per-source summaries so the route response is easy to
 // display in the Sales UI.
-async function syncBrandApify(brandId) {
+//
+// MONEY GUARD (2026-08-19): this function combines IG (paid Apify actor)
+// and Shopify catalog (free shopify-direct, or paid legacy `apify` method)
+// into one call, gated only on `brand.apifyDemo.igHandle` / `.shopifyUrl`
+// being SET — not on what the CALLER actually wants this invocation to do.
+// The three existing HTTP/executor callers (routes/salesDemos.js,
+// services/capabilityExecutors/{catalogPullFromApify,salesBrandSync}.js) are
+// all deliberately combined "demo-brand pull" workflows that document and
+// estimate the IG cost up front — unaffected by this, still combined by
+// default. But ANY OTHER caller wanting a CATALOG-ONLY re-sync of a demo
+// brand that also happens to carry a stamped `igHandle` (every demo brand
+// that has ever run an IG pull) would previously get an unplanned, billable
+// Apify Instagram re-scrape as a silent side effect — Apify bills per
+// result, so this is not a bounded cost. `opts.skipInstagram` is the real,
+// non-racy way to ask for catalog-only: it does not require the caller to
+// mutate `brand.apifyDemo.igHandle` on the document (which is racy — this
+// function re-reads the brand from Mongo, so a caller-side clear only works
+// if it is guaranteed to have committed and nothing else re-sets it first)
+// and it does not touch the brand's stored IG configuration at all.
+async function syncBrandApify(brandId, { skipInstagram = false } = {}) {
   const brand = await Brand.findById(brandId);
   if (!brand) {
     const e = new Error(`Brand ${brandId} not found`);
@@ -63,10 +115,14 @@ async function syncBrandApify(brandId) {
   const out = { ok: true, brandId: String(brand._id), ig: null, shopify: null, method, _run: run };
   const t0 = Date.now();
 
-  if (cfg.igHandle) {
+  if (shouldRunInstagramSync({ igHandle: cfg.igHandle, skipInstagram })) {
     run.stage('instagram posts');
     try       { out.ig = await syncBrandInstagram(brand, run); }
     catch (err) { out.ig = { ok: false, reason: err.message }; }
+  } else if (cfg.igHandle && skipInstagram) {
+    // Explicit opt-out, honored even though a handle is configured — see
+    // the MONEY GUARD comment above syncBrandApify.
+    out.ig = { ok: false, skipped: true, reason: 'catalog-only sync requested (skipInstagram) — Apify IG pull not run' };
   }
   // Check between the two sources too — an abort during IG shouldn't
   // fall through into Shopify.
@@ -106,7 +162,20 @@ async function syncBrandApify(brandId) {
           added:   r.productsUpserted,
           videos:  r.videosIngested,
           reviews: r.reviewsCaptured,
-          errors:  r.errors.length
+          errors:  r.errors.length,
+          // VISIBILITY — see shopifyPublicIngestService.js's own comment.
+          // Without these, `videos:0 reviews:0` on an otherwise-successful
+          // run is indistinguishable from "there was nothing to find" —
+          // that ambiguity is what made the Marine Layer run look silently
+          // broken instead of an explained partial result.
+          ...(r.mediaRateLimited ? { mediaRateLimited: true } : {}),
+          ...(r.reviewsRateLimited ? { reviewsRateLimited: true } : {}),
+          // Awaitable by a caller that owns its own connection lifecycle
+          // (a short-lived script) — see the ROBUSTNESS comment on
+          // shopifyPublicIngestService.js's end-of-run trio. Every existing
+          // HTTP/executor caller ignores this field and is unaffected.
+          ...(Array.isArray(r.backgroundWork) && r.backgroundWork.length
+            ? { backgroundWork: r.backgroundWork } : {})
         };
         // Direct path signals cooperative cancel via r.cancelled —
         // mirror the isBrandAborted=true exit so lastSyncedAt +
@@ -147,7 +216,7 @@ async function syncBrandApify(brandId) {
     // shopify uses `added`; IG uses `ingested`. ok:false is decisive zero
     // even when a count field is missing.
     const shopifyAttempted = out.shopify != null;
-    const igAttempted = out.ig != null;
+    const igAttempted = igWasAttempted(out.ig);
     const shopifyZero = !out.shopify
       || out.shopify.ok === false
       || (out.shopify.added ?? 0) === 0;
@@ -233,11 +302,20 @@ async function syncBrandInstagram(brand, run = null) {
   // was gated on `brand.websiteUrl` and the skip was a bare comment —
   // truly silent, since the guard meant enrichBrandFromUrl was never
   // even called to record anything.
-  setImmediate(() => {
+  // ROBUSTNESS (2026-08-19) — same fix as shopifyPublicIngestService.js's
+  // end-of-run trio, same underlying bug: setImmediate() defers this one
+  // tick, but does not keep the process (or its Mongoose connection) alive
+  // for that tick. A short-lived caller (connects → syncs → disconnects)
+  // can tear the connection down first, and this then throws "Client must
+  // be connected before running operations" with nothing but a console.warn
+  // to show it. Call directly (no setImmediate needed — an async function
+  // already yields at its first await) and expose the promise so a caller
+  // that owns its own connection lifecycle can await it before disconnecting.
+  summary.backgroundWork = [
     require('./brandEnrichmentService')
       .enrichBrandFromUrl(brand._id)
-      .catch(err => console.warn(`   ⚠️  brand enrichment enqueue failed: ${err.message}`));
-  });
+      .catch(err => console.warn(`   ⚠️  brand enrichment enqueue failed: ${err.message}`))
+  ];
 
   summary.durationMs = Date.now() - t0;
   console.log(`📸 Apify IG sync done: brand=${brand._id} fetched=${summary.fetched} ingested=${summary.ingested} skipped=${summary.skipped} errors=${summary.errors} in ${summary.durationMs}ms`);
@@ -694,5 +772,9 @@ module.exports = {
   syncBrandInstagram,
   syncBrandInstagramCommentsApify,
   syncBrandShopify,
-  isBrandAborted
+  isBrandAborted,
+  // Pure money-guard decisions — exported so scripts/verifyApifyCatalogOnlyGuard.js
+  // can pin them offline, no live DB required.
+  shouldRunInstagramSync,
+  igWasAttempted
 };
