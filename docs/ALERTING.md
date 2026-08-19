@@ -552,20 +552,25 @@ flight = 9` exactly, and the only other path that parks a video row in `queued`
 — `renderDeriveOnlyVideoAd`'s polite wait-requeue — `$inc`s `skipped`, which the
 run's `skipped: 0` rules out.
 
-**Nothing recovers them automatically, and an operator has to be told.**
+**CLOSED 2026-08-19 — this used to say "nothing recovers them automatically".**
 `services/strandedRunSweeper.js` re-drives `queued` ads whose owning run went
 `failed`, but only those carrying a `renderStage` breadcrumb
 (`renderStage: { $nin: [null, ''] }`) — the test that separates *"a deploy
 killed this"* from *"an operator has not pressed go yet"*. A claimed-but-never-
-dispatched ad has no stage (only `adStage()` writes one, and it is called from
-`renderOne`, which never ran for these), and the reaper's requeue marker is
-`REQUEUE_MARK = { wasRendering: true }` — it does not add a breadcrumb. So these
-9 **do not qualify**, and the attempt bounds (`renderAttempts`,
-`deriveWaitAttempts`) never come into it. The remedy is **Generate more**
-(`POST /api/ads/runs`), or `queuedArchiveSweeper` parks them after
-`QUEUED_ARCHIVE_AFTER_H` (24). Widening the sweeper to reach them is a
-money-adjacent change: the breadcrumb requirement is what stops it draining ads
-nobody claimed.
+dispatched ad had no stage (only `adStage()` writes one, and it is called from
+`renderOne`, which never ran for these). **The sweeper's filter is unchanged —
+widening it is still the wrong fix, and still money-adjacent.** Instead, the
+four sites that requeue a rendering ad to `queued` on a submit-may-be-in-flight
+basis (this reaper, `processAlerts.js`'s SIGTERM handler, and both
+`/generate`/`/runs` crash catches in `routes/ads.js`) now build their `$set`
+via `buildRequeuePipeline` (`services/adArchiveDigest.js`), which stamps
+`wasRendering: true` exactly as before AND an honest renderStage breadcrumb
+whenever the row does not already have one — never clobbering a real,
+more-specific stage. So a claimed-but-never-dispatched ad now carries a stage
+the moment it is released, and the sweeper picks it up on its own next tick
+with no changes of its own. Measured across 14 real runs this closed a 15%
+silent-loss rate (46 of 307 claimed ads). Full narrative:
+`session.d/2026-08-19_undispatched-tail-fix-stranded-ads-close-the-loop.md`.
 
 **Why this got likelier the same week:** video went to 10s on both platforms and
 Meta+PMax now share ONE 9:16 master, so 15 of 21 video rows queue behind a

@@ -39,11 +39,15 @@ const {
   // real document shapes instead of regexing this closure.
   buildStopUndispatchedArchiveFilter,
   buildStopBacklogArchiveFilter,
-  // Requeue markers. Every rendering→queued write below spreads EXACTLY one:
-  // REQUEUE_MARK when a billable submit may sit behind it, PRE_DISPATCH when
-  // control flow PROVES none can. See the REQUEUE_SITES ledger in that module.
-  REQUEUE_MARK,
-  PRE_DISPATCH
+  // Requeue markers/builders. Every rendering→queued write below uses EXACTLY
+  // one: PRE_DISPATCH (spread bare — control flow PROVES no submit can have
+  // happened) or buildRequeuePipeline (a billable submit MAY sit behind this
+  // release, AND the row may never have been dispatched at all — see that
+  // function's header, "THE UNDISPATCHED-TAIL GAP", for why a bare
+  // `...REQUEUE_MARK` spread is no longer enough on its own). See the
+  // REQUEUE_SITES ledger in that module.
+  PRE_DISPATCH,
+  buildRequeuePipeline
 } = require('../services/adArchiveDigest');
 const { AD_RECENCY_EXPR } = require('../services/adRecencyService');
 const router = express.Router();
@@ -1243,9 +1247,14 @@ router.post('/generate', async (req, res) => {
           detail: err.stack || null
         });
         if (adIds && adIds.length) {
+          // buildRequeuePipeline, not a bare REQUEUE_MARK spread — this catch
+          // wraps the ENTIRE runRenderLoop call, so a crash before its pool
+          // ever dispatched a single ad releases the whole claimed batch with
+          // no renderStage on any of them. See adArchiveDigest.js,
+          // "THE UNDISPATCHED-TAIL GAP".
           await Ad.updateMany(
             receiptFree({ _id: { $in: adIds }, status: 'rendering' }),
-            { $set: { status: 'queued', updatedAt: new Date(), ...REQUEUE_MARK } }
+            buildRequeuePipeline({ breadcrumb: `claimed but never dispatched — run crashed: ${err.message || String(err)}`.slice(0, 200) })
           ).catch(() => {});
         }
         await CampaignRun.updateOne(
@@ -1547,9 +1556,13 @@ router.post('/runs', express.json(), async (req, res) => {
           fields: { run: runId, by: run?.requestedBy ? String(run.requestedBy) : null, campaign: String(campaign._id), ads: renderIds.length, error: err.message || String(err) },
           detail: err.stack || null
         });
+        // buildRequeuePipeline, not a bare REQUEUE_MARK spread — same reason
+        // as the /generate crash handler above: a crash before the pool
+        // dispatched anything releases the whole claimed batch with no
+        // renderStage. See adArchiveDigest.js, "THE UNDISPATCHED-TAIL GAP".
         Ad.updateMany(
           receiptFree({ _id: { $in: renderIds }, status: 'rendering' }),
-          { $set: { status: 'queued', updatedAt: new Date(), ...REQUEUE_MARK } }
+          buildRequeuePipeline({ breadcrumb: `claimed but never dispatched — run crashed: ${err.message || String(err)}`.slice(0, 200) })
         ).catch(() => {});
         // Mirror the prep/render crash handler above (which already does
         // this): a post-claim throw here used to stamp status:'failed' with

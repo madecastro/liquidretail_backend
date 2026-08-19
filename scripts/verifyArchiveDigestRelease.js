@@ -449,6 +449,20 @@ function siteTextWithPayloads(site) {
       text += '\n' + am[0];
     }
   }
+  // A THIRD way to declare REQUEUE_MARK, added 2026-08-19 alongside the fix
+  // for the undispatched-tail gap: `buildRequeuePipeline(...)` from
+  // services/adArchiveDigest.js. Its literal `$literal: 'queued'` and
+  // `$literal: true` (for status/wasRendering) live inside THAT function's
+  // OWN source, never in the caller's — so a bare text scan of the call site
+  // sees neither `status: 'queued'` nor `...REQUEUE_MARK`. Synthesize both
+  // tokens so every downstream count treats it as exactly the declaration it
+  // is. This substitution is sound ONLY because buildRequeueSetStage writes
+  // status/wasRendering UNCONDITIONALLY (no $cond) — E16 pins that shape
+  // structurally, so a future edit that makes either conditional invalidates
+  // the premise this synthesis relies on.
+  if (/\bbuildRequeuePipeline\s*\(/.test(text) && !/status:\s*['"]queued['"]/.test(text)) {
+    text += "\n/* synthesized by siteTextWithPayloads: */ status: 'queued'; ...REQUEUE_MARK;";
+  }
   return text;
 }
 
@@ -1211,12 +1225,13 @@ ok('E14 [SCAN][MONEY] EVERY rendering→queued requeue site stamps the durable m
     assert.ok(row.proof && row.proof.length > 40,
       `REQUEUE_SITES entry "${row.site}" has no real proof text`);
   }
-  // Every file that names a marker must IMPORT it (the receiptFree lesson).
+  // Every file that names a marker — OR calls buildRequeuePipeline, the third
+  // way to declare one — must IMPORT it (the receiptFree lesson).
   for (const [rel, s] of STRIPPED) {
     if (rel === HELPER_REL) continue;
-    if (!/\.\.\.(?:REQUEUE_MARK|PRE_DISPATCH)\b/.test(s)) continue;
+    if (!/\.\.\.(?:REQUEUE_MARK|PRE_DISPATCH)\b/.test(s) && !/\bbuildRequeuePipeline\s*\(/.test(s)) continue;
     assert.ok(/require\(\s*['"][^'"]*adArchiveDigest['"]\s*\)/.test(SRC.get(rel)),
-      `${rel} spreads a requeue marker without requiring adArchiveDigest (ReferenceError at runtime)`);
+      `${rel} references a requeue marker/builder without requiring adArchiveDigest (ReferenceError at runtime)`);
   }
   // And the field must be DECLARED, or Mongoose strict drops every marker write
   // and the guard silently evaluates false forever.
@@ -1242,7 +1257,13 @@ ok('E14a [SELF-PROBE] the requeue scanner can SEE every known hide-shape', () =>
     'nested object first':     `Ad.updateMany(f, { $set: { renderError: { a: { b: 1 } }, status: 'queued' } });`,
     'variable payload':        `const set = { status: 'queued' };\nAd.updateMany(f, { $set: set });`,
     'whole-doc variable':      `const upd = { $set: { status: 'queued' } };\nAd.updateMany(f, upd);`,
-    'url on the same line':    `Ad.updateMany(f, { $set: { status: 'queued', src: 'https://x/y' } });`
+    'url on the same line':    `Ad.updateMany(f, { $set: { status: 'queued', src: 'https://x/y' } });`,
+    // Added 2026-08-19 with the undispatched-tail fix: the call site's own
+    // text contains NEITHER `status: 'queued'` NOR `...REQUEUE_MARK` — both
+    // literals live inside buildRequeueSetStage, in a different file. Without
+    // the synthesis in siteTextWithPayloads this shape is invisible, exactly
+    // like the others above.
+    'buildRequeuePipeline call': `Ad.updateMany(f, buildRequeuePipeline({ breadcrumb: 'x' }));`
   };
   const saved = new Map(STRIPPED);
   const savedSrc = new Map(SRC);
@@ -1397,6 +1418,131 @@ ok('E15d [PROOF] renderDeriveOnlyVideoAd is submit-free (crop + titling only)', 
   }
   // Prove the comment-strip left real code, or the absence check is vacuous.
   assert.ok(/findSiblingMasterAd\s*\(/.test(body), 'stripping erased the body — absence proves nothing');
+});
+
+// ═════════════════════════════════════════════════════════════════════════
+// E16 group — THE UNDISPATCHED-TAIL FIX (2026-08-19). A row the render loop's
+// pool never reached before its owning run died carries no `renderStage` —
+// `adStage()` only writes from inside a render attempt, never at claim time
+// — so all four REQUEUE_MARK sites used to release it looking IDENTICAL to a
+// fresh, never-claimed mint leftover: `queued`, empty stage. Measured across
+// 14 real runs: 46 of 307 claimed ads (15%) sat exactly like that, invisible
+// to services/strandedRunSweeper.js BY DESIGN (its renderStage requirement is
+// what tells a deploy-killed row apart from one an operator has not claimed
+// yet — this fix does not touch that filter at all).
+// buildRequeueSetStage / buildRequeuePipeline is a THIRD way to declare
+// REQUEUE_MARK, alongside the bare `...REQUEUE_MARK` spread and the
+// PRE_DISPATCH `{}`. It needs its own proof it behaves correctly (E16), its
+// own proof the four real sites actually adopted it (E16a), and the E14/E14a
+// scanner needed to be taught to recognize it (done above, in
+// siteTextWithPayloads and the new 'buildRequeuePipeline call' shape in
+// E14a's `shapes` map) — without that, this population would go right back
+// to being invisible, just to a DIFFERENT check this time.
+// ═════════════════════════════════════════════════════════════════════════
+
+ok('E16 [BEHAVIOR][MONEY] buildRequeueSetStage stamps REQUEUE_MARK and an '
+ + 'honest renderStage breadcrumb, but never clobbers a real one', () => {
+  const now = new Date('2026-08-19T11:21:43.000Z');
+  const breadcrumb = 'reaped: claimed but never dispatched — run stalled for over 15m';
+
+  // THE TARGET POPULATION: a row the render loop's pool never reached.
+  const untouched = applySetStage(
+    H.buildRequeueSetStage({ breadcrumb, now }),
+    { status: 'rendering', renderStage: null, renderStageAt: null, wasRendering: false }
+  );
+  assert.strictEqual(untouched.status, 'queued');
+  assert.strictEqual(untouched.wasRendering, true,
+    "REQUEUE_MARK's durable marker must still be stamped — this builder adds to it, never replaces it");
+  assert.strictEqual(untouched.renderStage, breadcrumb,
+    'a row with no existing renderStage must get the honest breadcrumb — this is the whole fix: "queued '
+    + 'with no renderStage after a run reaches terminal" must become impossible');
+  assert.strictEqual(untouched.renderStageAt.getTime(), now.getTime());
+  assert.strictEqual(untouched.updatedAt.getTime(), now.getTime());
+
+  // A row that HAD already begun rendering (adStage() wrote something real,
+  // e.g. mid derive-wait) must keep its own, more specific note — the fix
+  // must never destroy real progress information on its way to closing the
+  // gap for the population that has none.
+  const existingStage = 'derive-only: waiting for master meta_stories_9_16 (attempt 3/30)';
+  const existingAt = new Date('2026-08-19T11:05:00.000Z');
+  const midFlight = applySetStage(
+    H.buildRequeueSetStage({ breadcrumb, now }),
+    { status: 'rendering', renderStage: existingStage, renderStageAt: existingAt, wasRendering: false }
+  );
+  assert.strictEqual(midFlight.renderStage, existingStage,
+    'an ad that already began rendering must keep its real stage, not the generic breadcrumb');
+  assert.strictEqual(midFlight.renderStageAt.getTime(), existingAt.getTime(),
+    'a real renderStageAt must not be overwritten either');
+  assert.strictEqual(midFlight.status, 'queued');
+  assert.strictEqual(midFlight.wasRendering, true);
+
+  // "Empty" is deliberately the SAME test strandedRunSweeper.js's own filter
+  // uses — null OR '' — not a bare `$ifNull`, which only substitutes on
+  // null/missing and would leave a legacy `renderStage: ''` row (still "no
+  // stage" by the sweeper's own definition) permanently un-stamped and so
+  // still invisible to it.
+  const blank = applySetStage(H.buildRequeueSetStage({ breadcrumb, now }), { renderStage: '' });
+  assert.strictEqual(blank.renderStage, breadcrumb,
+    "an empty-string renderStage must be treated as \"no stage yet\", matching strandedRunSweeper's own "
+    + "renderStage: { $nin: [null, ''] } — otherwise this exact legacy shape stays invisible to it");
+
+  // The pipeline wrapper is the one-stage array shape every other builder
+  // here uses (buildArchivePipeline / buildRestorePipeline).
+  const pipeline = H.buildRequeuePipeline({ breadcrumb, now });
+  assert.ok(Array.isArray(pipeline) && pipeline.length === 1 && pipeline[0] && typeof pipeline[0].$set === 'object',
+    'buildRequeuePipeline must return a one-stage [{ $set }] pipeline, like buildArchivePipeline/buildRestorePipeline');
+  const viaPipeline = applySetStage(pipeline[0].$set, { status: 'rendering', renderStage: null });
+  assert.strictEqual(viaPipeline.status, 'queued');
+  assert.strictEqual(viaPipeline.renderStage, breadcrumb);
+
+  // Fail loud on a missing/blank breadcrumb — a call site that forgets one
+  // must not silently write an empty stage back onto a real ad.
+  assert.throws(() => H.buildRequeueSetStage({ now }), /breadcrumb/);
+  assert.throws(() => H.buildRequeueSetStage({ breadcrumb: '   ', now }), /breadcrumb/);
+});
+
+ok('E16a [PROOF] all four REQUEUE_MARK sites use buildRequeuePipeline, not a bare '
+ + 'spread, so a claimed-but-never-dispatched ad always gets an honest renderStage', () => {
+  const worker = STRIPPED_LATE('worker.js');
+  const reaperBody = namedFn(worker, 'async function reapOrphans');
+  assert.ok(reaperBody, 'worker.js reapOrphans not found');
+  assert.ok(/buildRequeuePipeline\(\s*\{\s*breadcrumb:/.test(reaperBody),
+    'worker.js reapOrphans no longer calls buildRequeuePipeline with a breadcrumb');
+  assert.ok(!/\.\.\.REQUEUE_MARK\b/.test(reaperBody),
+    'worker.js reapOrphans reverted to a bare REQUEUE_MARK spread — that leaves renderStage empty on '
+    + 'an undispatched-tail ad, reopening the exact gap this fix closes');
+
+  const pa = STRIPPED_LATE('services/processAlerts.js');
+  const persistBody = namedFn(pa, 'async function persistOrphans');
+  assert.ok(persistBody, 'services/processAlerts.js persistOrphans not found');
+  assert.ok(/buildRequeuePipeline\(\s*\{\s*breadcrumb:/.test(persistBody),
+    'processAlerts.js persistOrphans no longer calls buildRequeuePipeline with a breadcrumb');
+  assert.ok(!/\.\.\.REQUEUE_MARK\b/.test(persistBody),
+    'processAlerts.js persistOrphans reverted to a bare REQUEUE_MARK spread');
+
+  const adsSrc = STRIPPED_LATE('routes/ads.js');
+  const genCatchIdx = adsSrc.indexOf("key:   'run-crash:generate'");
+  assert.ok(genCatchIdx > 0, "/generate's prep/render crash handler (run-crash:generate) not found");
+  const genRegion = adsSrc.slice(genCatchIdx, genCatchIdx + 800);
+  assert.ok(/buildRequeuePipeline\(\s*\{\s*breadcrumb:/.test(genRegion),
+    "/generate's prep/render crash handler no longer calls buildRequeuePipeline with a breadcrumb");
+  assert.ok(!/\.\.\.REQUEUE_MARK\b/.test(genRegion),
+    "/generate's prep/render crash handler reverted to a bare REQUEUE_MARK spread");
+
+  const runsCatchIdx = adsSrc.indexOf("key:   'run-crash:runs'");
+  assert.ok(runsCatchIdx > 0, "/runs's render-loop crash handler (run-crash:runs) not found");
+  const runsRegion = adsSrc.slice(runsCatchIdx, runsCatchIdx + 800);
+  assert.ok(/buildRequeuePipeline\(\s*\{\s*breadcrumb:/.test(runsRegion),
+    "/runs's render-loop crash handler no longer calls buildRequeuePipeline with a breadcrumb");
+  assert.ok(!/\.\.\.REQUEUE_MARK\b/.test(runsRegion),
+    "/runs's render-loop crash handler reverted to a bare REQUEUE_MARK spread");
+
+  // And exactly these four — the ledger and the live scan must still agree,
+  // or E16a is pinning a stale count.
+  const ledgerMarkSites = H.REQUEUE_SITES.filter((r) => r.verdict === 'REQUEUE_MARK');
+  assert.strictEqual(ledgerMarkSites.length, 4,
+    `expected exactly 4 REQUEUE_MARK sites in the ledger, found ${ledgerMarkSites.length} — ` +
+    'update this check (and the count above) if a site was legitimately added or removed');
 });
 
 ok('E13 [SCAN][MONEY] exactly ONE call site opts in to releasing a rendering row\'s digest', () => {
