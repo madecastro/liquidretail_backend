@@ -381,17 +381,35 @@ so one lookup is roughly:
 | component | cost |
 |---|---|
 | grounded pass tokens (~1.5k out) | ~$0.004 |
-| **grounding surcharge** | **$0.035** |
+| **grounding surcharge** (inside free allowance) | **$0.000** |
 | structuring pass tokens | ~$0.001 |
-| **total per lookup** | **~$0.040** |
+| **total per lookup** | **~$0.005** |
 
-Token math alone would have reported ~$0.005 — about **10x** understated. The
-surcharge is `costTracker.GROUNDED_SEARCH_COST_PER_REQUEST_USD`; set
-`GEMINI_GROUNDING_COST_USD=0` while inside the free daily allowance. Two
-approximations are deliberate and documented at that constant: the surcharge is
-*declared* (the tool was enabled) rather than *confirmed* from
-`groundingMetadata`, and per-prompt billing is a **2.5-era rule** — Gemini 3 bills
-per executed search query, so a model bump changes the unit.
+**REVISED 2026-08-19 — the surcharge now defaults to $0, and that is the accurate
+figure, not a disabled feature.** The table previously read $0.035 / ~$0.040 per
+lookup on the reasoning that token math alone understates a grounded call ~10x.
+The arithmetic was right; the premise was not. Google's **1,500 grounded
+prompts/day allowance applies to the paid tier too** (re-read live 2026-08-19:
+"1,500 RPD (free, limit shared with Flash-Lite RPD), then $35 / 1,000 grounded
+prompts"), and measured volume is **13-19 grounded requests/day — about 1% of
+it**. Every grounded call we have made was free; the ledger was claiming $1.12
+over a 7-day window, which was **89.9% of all direct-Gemini spend it recorded**.
+
+This one could not self-correct, which is why it survived: grounded calls are
+pinned to `provider:'gemini'` (Atlas cannot proxy Google Search grounding at all
+— probed in #229), and `scripts/reconcileAtlasDailyCosts.js` matches
+`provider:'atlas'` only. Atlas's bill cannot contain a call that never touched
+its meter, so no reconciliation this repo has had could ever see these rows.
+
+The surcharge is `costTracker.GROUNDED_SEARCH_COST_PER_REQUEST_USD`. Set
+`GEMINI_GROUNDING_COST_USD=0.035` **if daily volume ever exhausts the
+allowance** — `costTracker` alerts when a process sees more than half of
+`GEMINI_GROUNDING_FREE_RPD` (1,500) in a UTC day, so that crossing is announced
+rather than discovered in a bill. Two approximations remain deliberate and are
+documented at that constant: the surcharge is *declared* (the tool was enabled)
+rather than *confirmed* from `groundingMetadata`, and per-prompt billing is a
+**2.5-era rule** — Gemini 3 bills per executed search query, so a model bump
+changes the unit.
 
 **UPDATED 2026-08-19.** `geminiSearchProvider.match` is now ledgered (routed
 through the same `trackedGenerate` helper as brand/product reviews pass 1,
