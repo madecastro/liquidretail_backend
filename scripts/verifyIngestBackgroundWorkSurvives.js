@@ -1,10 +1,13 @@
 #!/usr/bin/env node
 'use strict';
 //
-// verifyIngestBackgroundWorkSurvives — pins two robustness/visibility fixes
-// found while investigating a (later debunked) Marine Layer ingest "hang"
-// report, 2026-08-19. The ingest itself was never stuck — it finished in
-// 42.9 minutes after being rate-limited by marinelayer.com — but two real
+// verifyIngestBackgroundWorkSurvives — pins the "background work survives a
+// short-lived caller's disconnect" invariant across ALL FIVE catalog ingest
+// entry points, plus two visibility fixes.
+//
+// Groups A/B came from investigating a (later debunked) Marine Layer ingest
+// "hang" report, 2026-08-19. The ingest itself was never stuck — it finished
+// in 42.9 minutes after being rate-limited by marinelayer.com — but two real
 // bugs surfaced along the way:
 //
 //   1. shopifyPublicIngestService.js's end-of-run trio (on-site review
@@ -41,9 +44,14 @@
 // unlikely to false-negative and a real regression is unlikely to
 // false-positive.
 //
-// Revert-proven: restoring either setImmediate() call, or dropping
-// `backgroundWork` from either return value, or dropping either
-// `run.note()` rate-limit call fails the corresponding check below.
+// Groups C/D/E/F (phase 2, same day) close the SAME bug in the three ingest
+// paths PR #233 did not touch — see the block above Group C. Group F is the
+// cross-cutting sweep: all five entry points, one assertion.
+//
+// Revert-proven: restoring ANY of the five setImmediate() call sites, or
+// dropping `backgroundWork` from any return value, or dropping either
+// `run.note()` rate-limit call, or dropping either of the two out.shopify
+// forwardings, fails the corresponding check below.
 //
 // Usage: node scripts/verifyIngestBackgroundWorkSurvives.js
 
@@ -136,6 +144,195 @@ check('B4: apifyIngestService.js forwards both rate-limit flags onto out.shopify
   const shopBlock = apifySrc.slice(shopBlockStart, shopBlockStart + 1400);
   assert.ok(shopBlock.includes('mediaRateLimited: true'), 'must forward mediaRateLimited');
   assert.ok(shopBlock.includes('reviewsRateLimited: true'), 'must forward reviewsRateLimited');
+});
+
+// ── Phase 2 (2026-08-19): the SAME setImmediate pattern, three more sites ─
+//
+// PR #233 fixed shopifyPublicIngestService's end-of-run trio and
+// apifyIngestService's IG-side enrichment trigger (Groups A/B above). The
+// identical bug survived, unfixed, in the other three catalog ingest paths.
+// All three are now converted to the same shape and pinned here:
+//
+//   C. catalogSyncService.js#syncCatalogForCred — the Meta / IG-Commerce
+//      OAuth path. TWO triggers (enrichment + category inference).
+//   D. genericCatalogIngestService.js#syncBrandGenericCatalog — the
+//      XML-sitemap + JSON-LD path for non-Shopify stores. TWO triggers.
+//   E. apifyIngestService.js#syncBrandShopify — the LEGACY `apify` method
+//      path (distinct from the shopify-direct and IG paths already fixed).
+//      ONE trigger.
+//
+// "No setImmediate" is asserted against COMMENT-STRIPPED source, because
+// every one of these call sites now carries a ROBUSTNESS comment that
+// legitimately narrates the old setImmediate() bug in prose. Stripping is
+// deliberately conservative — only whole-line `//` comments and `/* */`
+// blocks are removed, never a trailing `// …` after code, so the stripper
+// can never delete real code and hide a regression.
+
+// Remove whole-line // comments and /* */ blocks. Conservative by design:
+// a trailing comment after code is LEFT IN PLACE, so this can only ever
+// produce a false FAILURE (loud, immediately noticed), never a false pass.
+function stripComments(src) {
+  const noBlocks = src.replace(/\/\*[\s\S]*?\*\//g, '');
+  return noBlocks
+    .split('\n')
+    .filter(line => !line.trim().startsWith('//'))
+    .join('\n');
+}
+
+// Slice [startAnchor, endAnchor) out of src, asserting both anchors exist
+// and are ordered. Anchors are precise multi-line code shapes, not loose
+// substrings, so a real regression fails but a cosmetic reflow does not.
+function region(src, startAnchor, endAnchor, label) {
+  const a = src.indexOf(startAnchor);
+  assert.ok(a > -1, `${label}: start anchor not found — file changed shape? (${startAnchor.split('\n')[0]})`);
+  const b = src.indexOf(endAnchor, a);
+  assert.ok(b > a, `${label}: end anchor not found after start — file changed shape? (${endAnchor.split('\n')[0]})`);
+  return src.slice(a, b);
+}
+
+const catalogSyncSrc = fs.readFileSync(path.join(__dirname, '../services/catalogSyncService.js'), 'utf8');
+const genericSrc = fs.readFileSync(path.join(__dirname, '../services/genericCatalogIngestService.js'), 'utf8');
+const integrationsSrc = fs.readFileSync(path.join(__dirname, '../routes/integrations.js'), 'utf8');
+
+// ── Group C: catalogSyncService.js (Meta / IG-Commerce OAuth path) ──────
+
+check('C1: syncCatalogForCred\'s end-of-run triggers contain no setImmediate CODE', () => {
+  const r = region(
+    catalogSyncSrc,
+    '  const backgroundWork = [];\n\n  // Eager review + commerce enrichment',
+    '  return {\n    ok: true,',
+    'C1'
+  );
+  assert.ok(!stripComments(r).includes('setImmediate('), 'the end-of-run triggers must not defer via setImmediate — see the ROBUSTNESS comment');
+  assert.ok(r.includes('backgroundWork.push('), 'the triggers must collect their promises for the caller to await');
+});
+
+check('C2: BOTH catalogSyncService triggers are collected (enrichment AND category inference)', () => {
+  const r = region(
+    catalogSyncSrc,
+    '  const backgroundWork = [];\n\n  // Eager review + commerce enrichment',
+    '  return {\n    ok: true,',
+    'C2'
+  );
+  assert.ok(r.includes("require('./catalogProductEnrichmentService')"), 'enrichment trigger missing from the collected region');
+  assert.ok(r.includes("require('./productCategoryInferenceService')"), 'category-inference trigger missing from the collected region');
+  // Exactly two pushes — a third would mean an uncollected trigger crept in
+  // or one was duplicated.
+  assert.equal((r.match(/backgroundWork\.push\(/g) || []).length, 2, 'expected exactly 2 collected triggers in syncCatalogForCred');
+});
+
+check('C3: syncCatalogForCred returns backgroundWork on its result object', () => {
+  assert.ok(
+    /durationMs: Date\.now\(\) - t0,[\s\S]{0,500}?\n {4}backgroundWork\n {2}\};/.test(catalogSyncSrc),
+    'the returned literal must carry backgroundWork'
+  );
+});
+
+check('C4: syncCatalog aggregates backgroundWork ACROSS credentials, not last-wins', () => {
+  assert.ok(/const aggregated = \{[^}]*backgroundWork: \[\]/.test(catalogSyncSrc), 'aggregated must initialise backgroundWork: []');
+  assert.ok(
+    catalogSyncSrc.includes('if (Array.isArray(credBackgroundWork)) aggregated.backgroundWork.push(...credBackgroundWork);'),
+    'each credential\'s promises must be appended to the aggregate'
+  );
+  // perCredential rows are pure data (they get serialized) — the promises
+  // must be destructured OUT of the spread, not carried along twice.
+  assert.ok(
+    catalogSyncSrc.includes('const { backgroundWork: credBackgroundWork, ...credSummary } = r;'),
+    'perCredential rows must exclude backgroundWork (they are serialized into HTTP/agent payloads)'
+  );
+  assert.ok(
+    !/perCredential\.push\(\{ credentialId: String\(c\._id\), igUsername: c\.igUsername, \.\.\.r \}\)/.test(catalogSyncSrc),
+    'perCredential must not spread the raw result (that would re-introduce the promises)'
+  );
+});
+
+check('C5: the sync-catalog HTTP route strips backgroundWork before res.json', () => {
+  const idx = integrationsSrc.indexOf('const result = await syncCatalog(brandId, credentialId ? { credentialId } : {});');
+  assert.ok(idx > -1, 'sync-catalog route call site not found — file changed shape?');
+  const r = integrationsSrc.slice(idx, idx + 900);
+  assert.ok(r.includes('const { backgroundWork: _backgroundWork, ...body } = result;'), 'the route must strip backgroundWork (a Promise serializes to a useless {})');
+  assert.ok(r.includes('res.json(body);') && !r.includes('res.json(result);'), 'the route must send the stripped body, not the raw result');
+});
+
+// ── Group D: genericCatalogIngestService.js (sitemap + JSON-LD path) ─────
+
+check('D1: syncBrandGenericCatalog\'s end-of-run trio contains no setImmediate CODE', () => {
+  const r = region(
+    genericSrc,
+    '  const backgroundWork = [];\n  if (!cancelled) {',
+    '  const durationMs = Date.now() - t0;',
+    'D1'
+  );
+  assert.ok(!stripComments(r).includes('setImmediate('), 'the end-of-run trio must not defer via setImmediate — see the ROBUSTNESS comment');
+  assert.equal((r.match(/backgroundWork\.push\(/g) || []).length, 2, 'expected exactly 2 collected triggers (enrichment + category inference)');
+  assert.ok(r.includes("require('./catalogProductEnrichmentService')"), 'enrichment trigger missing from the collected region');
+  assert.ok(r.includes("require('./productCategoryInferenceService')"), 'category-inference trigger missing from the collected region');
+});
+
+check('D2: backgroundWork is declared OUTSIDE the !cancelled guard so `out` always carries an array', () => {
+  const declIdx = genericSrc.indexOf('  const backgroundWork = [];\n  if (!cancelled) {');
+  assert.ok(declIdx > -1, 'declaration must sit immediately before the `if (!cancelled)` guard, not inside it');
+});
+
+check('D3: syncBrandGenericCatalog returns backgroundWork on `out`', () => {
+  assert.ok(
+    /const out = \{[\s\S]{0,600}?\n {4}backgroundWork\n {2}\};/.test(genericSrc),
+    'returned `out` must carry backgroundWork'
+  );
+});
+
+check('D4: apifyIngestService forwards genericCatalogIngestService\'s backgroundWork onto out.shopify', () => {
+  const genBlockStart = apifySrc.indexOf("if (method === 'generic-sitemap') {");
+  assert.ok(genBlockStart > -1, 'generic-sitemap branch not found — file changed shape?');
+  const genBlock = apifySrc.slice(genBlockStart, genBlockStart + 1800);
+  assert.ok(genBlock.includes('backgroundWork: r.backgroundWork'), 'out.shopify must forward r.backgroundWork on the generic-sitemap branch');
+});
+
+// ── Group E: apifyIngestService.js legacy syncBrandShopify (`apify`) ─────
+
+check('E1: legacy syncBrandShopify\'s enrichment trigger contains no setImmediate CODE', () => {
+  const r = region(
+    apifySrc,
+    '  const backgroundWork = [];\n  if (!summary.aborted',
+    '  summary.durationMs = Date.now() - t0;',
+    'E1'
+  );
+  assert.ok(!stripComments(r).includes('setImmediate('), 'the legacy path\'s enrichment trigger must not defer via setImmediate — see the ROBUSTNESS comment');
+  assert.equal((r.match(/backgroundWork\.push\(/g) || []).length, 1, 'expected exactly 1 collected trigger (catalog enrichment)');
+  assert.ok(r.includes("require('./catalogProductEnrichmentService')"), 'enrichment trigger missing from the collected region');
+});
+
+check('E2: legacy syncBrandShopify exposes backgroundWork on its summary', () => {
+  assert.ok(apifySrc.includes('summary.backgroundWork = backgroundWork;'), 'summary must expose the collected promises');
+  // Declared outside the abort guard so the field is always an array.
+  const declIdx = apifySrc.indexOf('  const backgroundWork = [];\n  if (!summary.aborted');
+  assert.ok(declIdx > -1, 'declaration must sit immediately before the abort guard, not inside it');
+});
+
+check('E3: syncBrandApify forwards the legacy summary (and thus backgroundWork) onto out.shopify', () => {
+  // The legacy branch assigns the WHOLE summary, so backgroundWork rides
+  // along with no explicit forwarding needed. Pin that shape — a future
+  // refactor to a field-by-field literal would silently drop it, exactly
+  // like the generic-sitemap branch would have (see D4).
+  assert.ok(
+    /\} else \{\n\s*out\.shopify = await syncBrandShopify\(brand, run\);\n\s*\}/.test(apifySrc),
+    'the legacy branch must assign the whole summary to out.shopify (field-by-field would drop backgroundWork)'
+  );
+});
+
+// ── Group F: cross-cutting — every fixed ingest path, no setImmediate ────
+
+check('F1: none of the five fixed ingest entry points retain setImmediate in CODE', () => {
+  const regions = [
+    ['shopifyPublicIngestService end-of-run trio', region(shopifySrc, '  const cancelled = await abortCheck(brand._id, run);\n  const backgroundWork = [];', '  const durationMs = Date.now() - t0;', 'F1a')],
+    ['apifyIngestService syncBrandInstagram', region(apifySrc, 'async function syncBrandInstagram', 'async function ingestIgPost', 'F1b')],
+    ['apifyIngestService syncBrandShopify', region(apifySrc, '  const backgroundWork = [];\n  if (!summary.aborted', '  summary.durationMs = Date.now() - t0;', 'F1c')],
+    ['catalogSyncService syncCatalogForCred', region(catalogSyncSrc, '  const backgroundWork = [];\n\n  // Eager review + commerce enrichment', '  return {\n    ok: true,', 'F1d')],
+    ['genericCatalogIngestService trio', region(genericSrc, '  const backgroundWork = [];\n  if (!cancelled) {', '  const durationMs = Date.now() - t0;', 'F1e')]
+  ];
+  for (const [label, r] of regions) {
+    assert.ok(!stripComments(r).includes('setImmediate('), `${label} still defers a background trigger via setImmediate`);
+  }
 });
 
 // ── summary ─────────────────────────────────────────────────────────

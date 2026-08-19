@@ -151,7 +151,13 @@ async function syncBrandApify(brandId, { skipInstagram = false } = {}) {
             // Sales UI can offer selective import on large catalogs.
             ...(Array.isArray(r.categoryOptions) && r.categoryOptions.length
               ? { categoryOptions: r.categoryOptions } : {}),
-            ...(r.categoryPromptSuggested ? { categoryPromptSuggested: true } : {})
+            ...(r.categoryPromptSuggested ? { categoryPromptSuggested: true } : {}),
+            // Awaitable by a caller that owns its own connection lifecycle
+            // (a short-lived script) — see the ROBUSTNESS comment on
+            // genericCatalogIngestService.js's end-of-run trio. Every
+            // existing HTTP/executor caller ignores this field.
+            ...(Array.isArray(r.backgroundWork) && r.backgroundWork.length
+              ? { backgroundWork: r.backgroundWork } : {})
           };
           if (r.cancelled) stillAborted = true;
         }
@@ -594,6 +600,22 @@ async function syncBrandShopify(brand, run = null) {
   // Same helper the Meta catalog sync uses at end of run. Skipped if
   // /abort fired — no point queueing detect for a run the operator
   // just killed.
+  //
+  // ROBUSTNESS (2026-08-19) — same fix as shopifyPublicIngestService.js's
+  // end-of-run trio and syncBrandInstagram's enrichment trigger above, same
+  // underlying bug. The enrichment trigger below used to fire via
+  // setImmediate(), which defers ONE tick but does NOT keep the caller's
+  // process (or its Mongoose connection) alive for that tick. A short-lived
+  // caller (a maintenance script that connects -> syncs -> disconnects) can
+  // tear the connection down before the deferred tick runs; the trigger then
+  // throws "Client must be connected before running operations" silently,
+  // because the call site only console.warns on failure. Fix: call directly
+  // (no setImmediate needed — an async function already yields to its caller
+  // at its first await) and COLLECT the promise onto `summary` so a caller
+  // that owns its own connection lifecycle can await it before
+  // disconnecting. Declared outside the guard so summary.backgroundWork is
+  // always an array (empty on an aborted run).
+  const backgroundWork = [];
   if (!summary.aborted && !(await isBrandAborted(brand._id, run))) {
     try {
       const { enqueueBrandProductDetects } = require('./catalogProductDetectService');
@@ -622,12 +644,18 @@ async function syncBrandShopify(brand, run = null) {
     // (productReviewsScrapeService) before any paid lookup — the Apify
     // actor returns no review data at all, so that scrape is where this
     // path's first-party reviews and ratings come from.
-    setImmediate(() => {
+    backgroundWork.push(
       require('./catalogProductEnrichmentService')
         .enqueueBrandProductEnrichment(brand._id)
-        .catch(err => console.warn(`   ⚠️  catalog enrichment enqueue failed: ${err.message}`));
-    });
+        .catch(err => console.warn(`   ⚠️  catalog enrichment enqueue failed: ${err.message}`))
+    );
   }
+
+  // Awaitable by a caller that owns its own connection lifecycle (see the
+  // ROBUSTNESS comment above). Ignored — safely — by every existing
+  // HTTP/executor caller, including syncBrandApify, which assigns this whole
+  // summary onto out.shopify verbatim so the field rides along unchanged.
+  summary.backgroundWork = backgroundWork;
 
   summary.durationMs = Date.now() - t0;
   console.log(`🛍  Apify Shopify sync done: brand=${brand._id} fetched=${summary.fetched} added=${summary.added} updated=${summary.updated} errors=${summary.errors} in ${summary.durationMs}ms`);
