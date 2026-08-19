@@ -1,7 +1,12 @@
 // Per-format safe zones (fractions of W/H) and anchor geometry.
 //
-// vertical (9:16 Reels/Shorts/Stories): Meta Reels community-consensus clear
-// zones — top 14%, bottom 35% (sides 7.5%). Official Meta guidance is
+// vertical (9:16): the GENERIC portrait clear zone, and the canvas-format
+// fallback for any 9:16 surface that has no key of its own. Its numbers came
+// from the Meta Reels community consensus, but Reels now has a dedicated
+// `reels` key (right-rail reserve) and Stories has `stories` — so do NOT read
+// this entry as "the Reels zone" and do NOT tune it for a single surface, it
+// is shared.
+// Values: top 14%, bottom 35% (sides 7.5%). Official Meta guidance is
 // qualitative + the Ads Manager on-canvas guardrail; the disclaimer/legal
 // text rule is bottom 40%. Bottom-anchored stacks end at ~65% height
 // (1 - 0.35) — intended. feed (4:5/1:1) and landscape (16:9) mirror the
@@ -66,23 +71,55 @@ export const SAFE_ZONES = {
   //
   // ⚠️ These are OUR recorded spec, not a fresh reading of Meta's published
   // guidance, which is qualitative plus an on-canvas guardrail in Ads Manager.
-  // Sides stay at the existing 7.5% for both. If Meta publishes hard numbers,
-  // reconcile HERE and in PLATFORM_FORMATS together — they are two encodings
-  // of one fact and drifting them is how the duplicate above happened.
+  // If Meta publishes hard numbers, reconcile HERE — THIS FILE IS THE ONLY
+  // TITLING AUTHORITY. `platformFormats.safeArea` looks like a second encoding
+  // of the same fact and is NOT read by Remotion at all (it drives the STATIC
+  // image path and some LLM prompt text); editing it does not move a single
+  // burned-in title. See the doc note in CLAUDE.md §00.
   //
   // stories: 250/1778 top and bottom. Profile row + close button at the top,
-  // the reply/CTA rail at the bottom.
+  // the reply/CTA rail at the bottom. Sides stay at 7.5% — Stories has no
+  // persistent right-edge rail (its controls are top and bottom).
   stories: { top: 0.14, bottom: 0.14, left: 0.075, right: 0.075 },
+
+  // reels: top/bottom/left are BYTE-IDENTICAL to `vertical` above — this is a
+  // pure RIGHT-EDGE change, and Reels keeps the deep 35% bottom reserve it
+  // already had by falling through to `vertical`. What it gains is a rail
+  // reserve.
+  //
+  // WHY. Instagram Reels paints a persistent action rail — like / comment /
+  // share / audio-disc — down the RIGHT edge of the frame. `vertical`'s
+  // right:0.075 puts titling underneath it, so a right-reaching stack is
+  // partially obscured by native UI. This is the SAME defect class that
+  // verticalYt.right:0.15 already fixes for YouTube Shorts' engagement rail;
+  // Reels is the Meta twin of that surface and had no equivalent reserve.
+  //
+  // ⚠️ THE 0.15 IS A CONSIDERED DEFAULT, NOT A MEASURED SPEC. It is PARITY
+  // with verticalYt, derived from the reasoning that the two rails occupy the
+  // same role and roughly the same width (~44-48pt of icon plus margin on a
+  // ~390pt-wide phone ≈ 15%). It is NOT read off a published Instagram safe-
+  // zone template the way landscapeYt.bottom was measured off Google's PNG.
+  // If Meta publishes a real overlay, re-measure and correct HERE. Do not cite
+  // this number as measured evidence elsewhere.
+  //
+  // BLAST: PMAX_VIDEO_SAFE_ZONE_KEY.meta_reels_9_16 → reels, so every
+  // production Reels title uses it. Narrowing the box also narrows the wrap
+  // measure (0.85W → 0.775W); deriveCharCap models usable width from
+  // maxWidthPct × CANVAS width and does not subtract safe insets, so its cap
+  // now runs ~10% optimistic for this zone. That is the same modelling gap
+  // verticalYt/landscapeYt already carry, not a new one — but it means a long
+  // headline is likelier to take an extra line here than it was on `vertical`.
+  reels: { top: 0.14, bottom: 0.35, left: 0.075, right: 0.15 },
 };
 
 // platformFormat → safe-zone key, for any surface whose reserved bands are NOT
 // simply its canvas format's. Anything absent keeps the canvas-format zone via
 // the fallback in resolveSafeZoneKey — still the common case (every static
-// surface, Meta Reels, Meta feed/square). Exported so harnesses can pin the
+// surface, Meta feed/square). Exported so harnesses can pin the
 // surface → zone wiring without re-parsing source text.
 //
-// ⚠️ THE NAME IS NOW NARROWER THAN THE CONTENTS — Meta Stories has an entry
-// below, so this is no longer PMax-only. Deliberately NOT renamed: it is an
+// ⚠️ THE NAME IS NOW NARROWER THAN THE CONTENTS — both Meta 9:16 surfaces have
+// entries below, so this is no longer PMax-only. Deliberately NOT renamed: it is an
 // exported symbol that harnesses and the landscapeYt BLAST note both reference
 // by name, and it is owned by the in-flight PMax safe-zone work. Renaming it
 // from here would break a symbol another change is actively building on, for a
@@ -91,11 +128,14 @@ export const PMAX_VIDEO_SAFE_ZONE_KEY = {
   pmax_video_9_16: 'verticalYt',
   pmax_video_16_9: 'landscapeYt',
   pmax_video_1_1: 'squareYt',
-  // Meta Stories takes its own band; Reels keeps `vertical` (which IS the
-  // Reels zone) via the canvas-format fallback below. Without this entry both
-  // 9:16 Meta surfaces resolve to the same zone and render identically — which
-  // is only visible once Reels is minted as a derivation of Stories.
+  // Both Meta 9:16 surfaces are now EXPLICIT. Neither may go back to the
+  // canvas-format fallback: `vertical` is shared with every other 9:16 caller,
+  // so the only way to give one Meta surface its own band is its own key.
+  // Without these two entries both resolve to the same zone and render
+  // identically — visible the moment Reels is minted as a derivation of
+  // Stories, where "identical" means a duplicate ad and a wasted Remotion pass.
   meta_stories_9_16: 'stories',
+  meta_reels_9_16: 'reels',
 };
 
 /**
