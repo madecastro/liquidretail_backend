@@ -64,8 +64,36 @@ is unchanged at two.
    difference — dropping it turns three free crops into three ~$0.90 charges
    per product. Pinned by `scripts/verifyMixedPlatformVideo.js` H3.
 4. **Title each surface appropriately** — burned into the delivered file, using
-   that surface's own safe zone. Reels (204) and Stories (250) differ and must
-   not share one entry. **Untitled is not success:** after the master lands the
+   that surface's own safe zone. ⚠️ **`remotion/lib/safeZones.js` IS THE ONLY
+   AUTHORITY FOR TITLING. `platformFormats.safeArea` IS NOT — Remotion never
+   reads it. CORRECTED 2026-08-18; this line previously cited "Reels (204) and
+   Stories (250)", which are `safeArea` pixels and have nothing to do with
+   where a title lands.** The live path is: `brandScriptExecutor` passes the
+   row's `platformFormat` **string** → `remotionRenderService` puts it on
+   `inputProps` → `Canonical.jsx` calls `resolveSafeZoneKey({format,
+   platformFormat})` → `SAFE_ZONES[key]`. Those fractions were hand-measured
+   and are **not computed from `safeArea` at runtime**; they have visibly
+   drifted from it (Reels `safeArea` is 204/1778 = 11.5%/11.5%, its Remotion
+   zone is 14%/35%). **So editing `safeArea` to fix a titling defect changes
+   nothing, and editing it to match a zone is busywork** — fix the zone.
+   Per-surface keys today: `meta_stories_9_16`→`stories`,
+   `meta_reels_9_16`→`reels` (right 0.15 for the IG action rail, added
+   2026-08-18 — Reels had been falling through to the shared `vertical` zone
+   with no rail reserve), the PMax three→`verticalYt`/`landscapeYt`/`squareYt`.
+   Pinned by `scripts/verifyReelsSafeZone.mjs`.
+   **What `safeArea` IS for, so nobody deletes it as dead:** it is live on the
+   **static image** path — `staticAdIntents.computeSurface` turns it into the
+   geometry box in the billable gpt-image-2 prompt and into Sharp logomark
+   placement. Material only on `meta_stories_9_16` static (250/250); every
+   other live static surface declares 0/0. It also feeds prompt *text* to the
+   Director (`aiCreativeDirectorService.buildFormatConstraints`) and the canvas
+   HTML generator, and is published as `safeAreaPct` by `GET /api/ads/formats`
+   and `platform.listFormats` (display/agent JSON, nothing reads it back).
+   **`meta_reels_9_16` is `kinds:['video']` and is not in `META_STATIC_FANOUT`,
+   so its 204 has no pixel-affecting consumer at all.** Third encoding, also
+   not `safeArea`: `htmlValidationService.safeBandsForFormat` hardcodes 204 for
+   Reels on the dead HTML-static validator.
+   **Untitled is not success:** after the master lands the
    ad is stamped `status:'draft'` (reaper-safe money guard), then titling runs;
    if Remotion throws, status flips to **`failed`** with
    `master rendered; titling failed`, the run is charged a failure, and the
@@ -467,9 +495,12 @@ Video never launches a browser.
   `isHookFirstVideoPromptEnabled()`. A mixed run measured 21 video Ads / 3 distinct
   `veoPredictionId`s. Two of those three were the same portrait plate at
   byte-identical `deliveryDims` (`meta_stories_9_16` and `pmax_video_9_16`
-  are both 1080×1920; only `safeArea` differs, and that is a TITLING input
-  resolved per row from the row's own `platformFormat`, so one plate serves
-  both surfaces while each keeps its own burned-in treatment). Now
+  are both 1080×1920; they differ only in their **safe ZONE**, which is a
+  TITLING input resolved per row from the row's own `platformFormat` through
+  `remotion/lib/safeZones.js`, so one plate serves both surfaces while each
+  keeps its own burned-in treatment. ⚠️ **Not `platformFormats.safeArea`** —
+  this line used to say that and it was wrong; Remotion never reads that
+  field. See §00 step 4.) Now
   `pmax_video_9_16` keeps its own Ad row and its own `platformFormat` but is
   minted as a FREE derive of the Meta plate. **Delivered count is unchanged
   at 21.** The 16:9 master stays billable — nothing can derive a landscape
