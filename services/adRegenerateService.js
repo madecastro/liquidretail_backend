@@ -466,10 +466,21 @@ async function preflight(adId, brandId) {
   // is scheduled. The right way to refresh this ad is to regenerate its
   // MASTER and let the derive re-run. Uses the SHARED gate so this cannot
   // drift from the render loop's copy.
-  if (resolveDeriveFromMaster(ad)) {
+  //
+  // ⚠️ THE MESSAGE MUST NAME THE ACTUAL MASTER, and that is why it is
+  // interpolated rather than hard-coded. It used to say "its 9:16 master",
+  // which read as "the PMax 9:16 ad" — but on a shared-portrait run
+  // (UNIFIED_VIDEO_9_16_MASTER, campaignAdsGenerationService) the PMax 9:16
+  // is ITSELF a derive and the real master is the Meta Stories ad. An
+  // operator sent to the wrong row regenerates a free surface, gets this
+  // same 409, and eventually regenerates something that DOES bill — a third
+  // Omni charge caused purely by the copy.
+  const derivedFrom = resolveDeriveFromMaster(ad);
+  if (derivedFrom) {
     const e = new Error(
-      'This ad is derived from its 9:16 master (no generation of its own) — '
-      + 'regenerate the master instead.'
+      `This ad is derived from the already-paid ${derivedFrom} master `
+      + '(it has no generation of its own) — regenerate that master instead '
+      + 'and this surface will re-derive from it.'
     );
     e.status = 409; throw e;
   }

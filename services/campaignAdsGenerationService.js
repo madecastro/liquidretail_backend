@@ -516,6 +516,175 @@ function isGoogleVideoMasterRun(masterFormats) {
 }
 
 /**
+ * Kill switch for the SHARED 9:16 master (owner directive 2026-08-18:
+ * "maintain a single minting for 9x16 across both formats").
+ * Default ON. Flag off ⇒ byte-identical to the pre-change plan — a mixed
+ * Meta+PMax run mints THREE paid masters again (meta_stories_9_16 +
+ * pmax_video_9_16 + pmax_video_16_9). Same ad count either way.
+ */
+function isUnifiedNineSixteenMasterEnabled() {
+  const v = process.env.UNIFIED_VIDEO_9_16_MASTER;
+  if (v == null || v === '') return true;
+  return !['0', 'false', 'no', 'off'].includes(String(v).toLowerCase());
+}
+
+/**
+ * Can ONE plate honestly serve both portrait destinations?
+ *
+ * ⚠️ THIS IS A COHERENCE GATE, NOT A FEATURE FLAG, and it is deliberately
+ * BEHAVIOURAL rather than a hand-synced boolean. Sharing a plate is only
+ * legitimate if both destinations asked the model for the SAME camera.
+ * Today they do not: veoPromptBuilder selects the `pmax` directive profile
+ * for a pmax_video_* destination and the omni/grok profile for Meta, so a
+ * shared Meta plate would deliver Meta's framing to YouTube Shorts — the
+ * exact framing PMax Phase B rejected. The owner's paired directive is to
+ * standardise Meta onto the PMax prompt; that work lands in
+ * services/veoPromptBuilder.js (NOT touched here).
+ *
+ * Rather than duplicate that lane's flag — which would silently rot the
+ * moment either side is renamed — we ASK the prompt builder whether the two
+ * destinations now resolve to the same camera. Two ways of standardising
+ * both count: the profile NAME matching, or the resolved DIRECTIVES object
+ * being identical under different names. Anything else, including a throw
+ * or a missing export, is "cannot prove coherence" → do not share → two
+ * bills. Fail-closed: paying $0.90 beats shipping the wrong framing.
+ */
+function isSharedPortraitPlatePromptCoherent() {
+  let promptProfileFor;
+  let directivesForProfile;
+  let isHookFirstVideoPromptEnabled;
+  try {
+    ({
+      promptProfileFor,
+      directivesForProfile,
+      isHookFirstVideoPromptEnabled
+    } = require('./veoPromptBuilder'));
+  } catch (err) {
+    return false;
+  }
+
+  // ⚠️ THE LOAD-BEARING CONJUNCT — AND PROFILE EQUALITY ALONE IS NOT IT.
+  // MEASURED against the merged prompt lane: with the hook-first switch OFF
+  // both destinations fall through to the SAME `gemini-omni` profile, so an
+  // equality test returns true in BOTH switch states and gates nothing at
+  // all. That is not merely a bad configuration, it is a dead conjunct — and
+  // the state it lets through is the worst one: the operator rolls the camera
+  // standardization back to the frozen Ken Burns prompt and silently keeps a
+  // SHARED master shot with Meta's pan, delivered to YouTube Shorts. That
+  // framing is exactly what PMax Phase B rejected, and the kill switch would
+  // have reverted half the change while leaving the other half running.
+  //
+  // So the question is not "do both destinations agree?" but "did both
+  // destinations get the STANDARDIZED hook-first camera?" — which only the
+  // prompt lane can answer. Imported, never re-implemented: the switch reads
+  // TWO env names (VIDEO_HOOK_FIRST_PROMPT + the legacy PMAX_VIDEO_DIRECTIVES)
+  // with a deliberate fail-safe OR, and duplicating that here is precisely
+  // the drift this whole file argues against.
+  if (typeof isHookFirstVideoPromptEnabled !== 'function') return false;
+  try {
+    if (isHookFirstVideoPromptEnabled() !== true) return false;
+  } catch (err) {
+    return false;
+  }
+
+  // Belt-and-braces below: the switch says the standardization is ON, so the
+  // two destinations must ALSO actually resolve to the same camera. Keeps the
+  // gate honest if a future destination stops being covered by the switch.
+  if (typeof promptProfileFor !== 'function') return false;
+  // Compare across the caps shapes this pipeline actually runs: the live
+  // default model is gemini-omni, and null covers the scaffold / override
+  // path. BOTH must agree, so a profile that converges only for one model
+  // cannot unlock sharing for the other.
+  for (const caps of [{ paramShape: 'gemini-omni' }, null]) {
+    let metaProfile;
+    let pmaxProfile;
+    try {
+      metaProfile = promptProfileFor(caps, { platformFormat: META_VIDEO_MASTER_KEY });
+      pmaxProfile = promptProfileFor(caps, { platformFormat: PMAX_VIDEO_DERIVE_SOURCE });
+    } catch (err) {
+      return false;
+    }
+    if (!metaProfile || !pmaxProfile) return false;
+    if (metaProfile === pmaxProfile) continue;
+    // Different profile NAMES can still be the same camera if the lane
+    // standardised by editing the directive text instead of the selector.
+    if (typeof directivesForProfile !== 'function') return false;
+    try {
+      const a = directivesForProfile(metaProfile);
+      const b = directivesForProfile(pmaxProfile);
+      if (!a || !b) return false;
+      if (JSON.stringify(a) !== JSON.stringify(b)) return false;
+    } catch (err) {
+      return false;
+    }
+  }
+  return true;
+}
+
+/**
+ * THE conditional-billability decision. Returns the platformFormat of the
+ * 9:16 master the PMax portrait family actually rides in THIS run:
+ * META_VIDEO_MASTER_KEY when one shared plate serves both platforms,
+ * PMAX_VIDEO_DERIVE_SOURCE when PMax must pay for its own.
+ *
+ * ⚠️ MONEY — COMPUTED EXACTLY ONCE, HERE, AND NOWHERE ELSE.
+ * planDeterministicVideoAds calls this and STAMPS the answer onto every
+ * affected row as `deriveFromMaster`. The render loop and the regenerate
+ * preflight then read that stamp back through resolveDeriveFromMaster.
+ * The renderer never re-evaluates the condition, so planner and renderer
+ * are structurally incapable of disagreeing: one decides, the other reads
+ * what was persisted.
+ *
+ * ⚠️ THE RENDERER MUST NEVER INFER THIS FROM THE CAMPAIGN. "Is there a Meta
+ * sibling on this campaign?" is the wrong question and an expensive one: a
+ * previous Meta-only run would let a later PMax-only 9:16 steal that old
+ * plate and skip its Omni submit, silently substituting a plate the
+ * operator never asked for. Only the mint knows the run, so only the mint
+ * decides.
+ *
+ * FAILS CLOSED ON EVERY CONJUNCT — sharing requires ALL of:
+ *   1. the kill switch on;
+ *   2. the Meta master minted IN THIS RUN (not merely on the campaign);
+ *   3. the PMax portrait master requested IN THIS RUN;
+ *   4. both destinations resolving to the same camera prompt.
+ * On a PMax-only run there is no Meta plate to ride, so pmax_video_9_16
+ * stays BILLABLE. That is not a missed saving: a derive whose master never
+ * exists fails honestly, and the run would deliver NO 9:16 video at all —
+ * strictly worse than paying $0.90 for one. When in doubt, bill.
+ *
+ * Same shape as isGoogleVideoMasterRun / isMetaVideoMasterRun: the gate is
+ * the PRESENCE OF THE SOURCE in this run's master list, never a platform
+ * label, a campaign lookup, or an operator preference.
+ */
+function resolvePortraitMasterFormat(masterFormats) {
+  if (!isUnifiedNineSixteenMasterEnabled()) return PMAX_VIDEO_DERIVE_SOURCE;
+  if (!isMetaVideoMasterRun(masterFormats)) return PMAX_VIDEO_DERIVE_SOURCE;
+  // isGoogleVideoMasterRun IS "pmax_video_9_16 is in this run's master
+  // list" — reused rather than re-tested so the two can never diverge.
+  if (!isGoogleVideoMasterRun(masterFormats)) return PMAX_VIDEO_DERIVE_SOURCE;
+  if (!isSharedPortraitPlatePromptCoherent()) return PMAX_VIDEO_DERIVE_SOURCE;
+  // ⚠️ SOUNDNESS CONJUNCT — the shared plate must be a LEGAL PMax asset.
+  // Google rejects PMax video under 10s. Meta video is floored at 10s
+  // universally (resolveVideoDurationForFormat, owner directive 2026-08-18),
+  // but that floor has a documented kill switch: META_VIDEO_DURATION_SEC=0
+  // returns null and restores the provider default of 8s. With the floor off,
+  // a shared Meta plate would be a PAID 8s render that Google will not accept
+  // on the derived pmax_video_9_16 surface — and no offline harness can see
+  // that, because nothing here talks to Google ingest.
+  //
+  // So the two settings are COUPLED, and the coupling is enforced here rather
+  // than left as a footnote: turning the Meta floor off does not silently
+  // produce broken PMax assets, it stops the sharing and PMax pays for its
+  // own portrait master again. Fail-closed, consistent with every other
+  // conjunct above — bill rather than ship something unusable.
+  const metaFloor = metaVideoDurationSec();
+  if (metaFloor == null || metaFloor < GOOGLE_PMAX_VIDEO_DURATION_SEC) {
+    return PMAX_VIDEO_DERIVE_SOURCE;
+  }
+  return META_VIDEO_MASTER_KEY;
+}
+
+/**
  * Pure plan of deterministic video Ads this run will mint, one entry
  * per (platformFormat, funnelStage) row. expandWizardJob iterates this;
  * the harness asserts counts + the money flags without a DB.
@@ -542,12 +711,35 @@ function planDeterministicVideoAds(masterFormats) {
     : [];
   const plan = [];
 
+  // ONE call, one decision, reused for every row below (see
+  // resolvePortraitMasterFormat). `unified` is DERIVED from it rather than
+  // recomputed, so this file has exactly one predicate that can answer
+  // "does PMax pay for its own 9:16 in this run".
+  const portraitMaster = resolvePortraitMasterFormat(masters);
+  const unified = portraitMaster !== PMAX_VIDEO_DERIVE_SOURCE;
+
   for (const fmt of masters) {
     // Derive-only surfaces are not masters. The resolver already strips
     // them; if one still leaked in, skip it here rather than minting a
     // waiter whose source plate was never queued. googleRun / metaRun
     // add them below, and only when the source master is in this run.
     if (fmt === PMAX_VIDEO_DERIVE_ONLY || META_VIDEO_DERIVE_SET.has(fmt)) continue;
+    // ⚠️ MONEY — THE SHARED 9:16. On a unified run pmax_video_9_16 keeps its
+    // own Ad row and its own platformFormat, so computeDeterministicVideoDigest
+    // is untouched and the row still inserts as its own identity; what changes
+    // is that it is a FREE derive of the Meta Stories plate instead of a second
+    // paid Omni submit. Reachable ONLY when resolvePortraitMasterFormat proved
+    // the Meta master is minted in this same run — on a PMax-only run this
+    // branch is dead and the row below stays billable.
+    if (unified && fmt === PMAX_VIDEO_DERIVE_SOURCE) {
+      plan.push({
+        platformFormat: fmt,
+        funnelStage: null,
+        deriveFromMaster: portraitMaster,
+        billable: false
+      });
+      continue;
+    }
     plan.push({
       platformFormat: fmt,
       funnelStage: null,
@@ -562,11 +754,27 @@ function planDeterministicVideoAds(masterFormats) {
   const metaDerivesOn = isMetaVideoDerivativesEnabled();
 
   if (googleRun) {
+    // ⚠️ RETARGET THE WHOLE PMAX PORTRAIT FAMILY, not just the 9:16 row.
+    // findSiblingMasterAd (routes/ads.js) matches TRUE masters only — it
+    // excludes any row carrying deriveFromMaster. So the moment
+    // pmax_video_9_16 becomes a derive, every row still pointing AT
+    // pmax_video_9_16 (the 1:1 crop and the staged 9:16 retitles) would
+    // find no sibling master and fail with "no sibling master ad" on every
+    // mixed run — a derivative of a derivative, waiting on a plate that is
+    // itself waiting. `portraitMaster` is the plate that actually gets
+    // generated, so pointing the family at it is what keeps these rows
+    // renderable. On a non-unified run it IS pmax_video_9_16 and every
+    // value below is byte-identical to the pre-change plan.
+    //
+    // Harnesses that only exercise a PMax-ONLY plan stay green through this
+    // whole class of breakage, which is why the MIXED plan is pinned
+    // explicitly (scripts/verifySharedPortraitMaster.js).
+    //
     // Unstaged 1:1 IS awareness (no stage). Flag-off still mints it.
     plan.push({
       platformFormat: PMAX_VIDEO_DERIVE_ONLY,
       funnelStage: null,
-      deriveFromMaster: PMAX_VIDEO_DERIVE_SOURCE,
+      deriveFromMaster: portraitMaster,
       billable: false
     });
     if (funnelOn) {
@@ -575,11 +783,17 @@ function planDeterministicVideoAds(masterFormats) {
       // that list would mint Meta rows here AND again in the Meta block.
       const funnelMasters = masters.filter((f) => GOOGLE_VIDEO_MASTER_SET.has(f));
       for (const fmt of funnelMasters) {
+        // A staged row retitles the plate that was actually PAID FOR. For
+        // the 16:9 that is itself; for the portrait master it is
+        // `portraitMaster`, which on a unified run is the Meta plate.
+        const plate = (unified && fmt === PMAX_VIDEO_DERIVE_SOURCE)
+          ? portraitMaster
+          : fmt;
         for (const stage of FUNNEL_VARIANT_STAGES) {
           plan.push({
             platformFormat: fmt,
             funnelStage: stage,
-            deriveFromMaster: fmt,
+            deriveFromMaster: plate,
             billable: false
           });
         }
@@ -588,7 +802,7 @@ function planDeterministicVideoAds(masterFormats) {
         plan.push({
           platformFormat: PMAX_VIDEO_DERIVE_ONLY,
           funnelStage: stage,
-          deriveFromMaster: PMAX_VIDEO_DERIVE_SOURCE,
+          deriveFromMaster: portraitMaster,
           billable: false
         });
       }
@@ -631,6 +845,16 @@ function planDeterministicVideoAds(masterFormats) {
     }
   }
 
+  // ── Duration ──────────────────────────────────────────────────────────
+  // Nothing to do here. Meta video is 10s UNIVERSALLY (owner directive
+  // 2026-08-18: "make meta videos 10 sec also, we already discussed this"),
+  // enforced in resolveVideoDurationForFormat for every Meta video format on
+  // every run. That one rule is also what makes the shared portrait plate a
+  // VALID PMax asset — Google rejects PMax video under 10s — so there is
+  // deliberately NO mixed-run-only duration branch to keep in sync here.
+  // resolvePortraitMasterFormat refuses to share if that floor is ever
+  // switched off, which is where the coupling is enforced.
+
   return plan;
 }
 
@@ -661,6 +885,29 @@ function resolveVideoDurationForFormat(platformFormat, videoDurationSec) {
       // clamps the top end downstream, so asking for 12 or 15 lands on 10.
       if (isGooglePmaxVideo && n < GOOGLE_PMAX_VIDEO_DURATION_SEC) {
         return GOOGLE_PMAX_VIDEO_DURATION_SEC;
+      }
+      // ⚠️ META IS NOW A FLOOR TOO, NOT JUST A DEFAULT.
+      // Owner directive 2026-08-18, verbatim: "make meta videos 10 sec also,
+      // we already discussed this." Meta previously took the operator value
+      // VERBATIM here, so the wizard's hard-coded `8` beat the 10s Meta
+      // default on literally every UI run — the default only applied when
+      // duration was unset, which the wizard never does. Same floor shape as
+      // PMax above: below it is lifted, above it the operator still wins.
+      //
+      // This is also what makes the SHARED portrait plate a valid PMax asset
+      // (see resolvePortraitMasterFormat): one Meta-format master serving a
+      // pmax_video_9_16 derive must clear Google's 10s minimum, and it does
+      // so here rather than in a mixed-run special case.
+      //
+      // NOT A RE-MINT, and this is the part that gets misread:
+      // computeDeterministicVideoDigest omits duration for Meta formats, so
+      // no stored Meta digest moves. The consequence is the OPPOSITE of a
+      // re-bill — see the §2 note: on a campaign that already holds a Meta
+      // video ad the 10s row hashes identically to the stored 8s row and is
+      // swallowed, so existing ads simply stay 8s.
+      const metaFloor = metaVideoDurationSec();
+      if (metaFloor != null && isMetaVideoFormat(platformFormat) && n < metaFloor) {
+        return metaFloor;
       }
       return n;
     }
@@ -4117,6 +4364,14 @@ module.exports = {
   isMetaVideoMasterRun,
   isMetaVideoDerivativesEnabled,
   isPmaxFunnelVariantsEnabled,
+  // Shared 9:16 master (owner directive 2026-08-18). resolvePortraitMasterFormat
+  // is THE conditional-billability decision and is computed only inside
+  // planDeterministicVideoAds; it is exported for the harness, NOT so another
+  // caller can re-decide. The renderer must keep reading the stamped
+  // Ad.deriveFromMaster via resolveDeriveFromMaster.
+  isUnifiedNineSixteenMasterEnabled,
+  isSharedPortraitPlatePromptCoherent,
+  resolvePortraitMasterFormat,
   planDeterministicVideoAds,
   funnelDeriveSource,
   resolveFunnelPresetOverride,

@@ -157,10 +157,49 @@ check('B3 [MONEY] a PMax video can never render below the 10s Google floor',
 check('B3b above the floor the operator still wins on PMax',
   svc.resolveVideoDurationForFormat(MASTER_16_9, 15) === 15);
 
-check('B3c Meta keeps the operator value exactly (no floor applies)',
-  svc.resolveVideoDurationForFormat('meta_stories_9_16', 6) === 6
-    && svc.resolveVideoDurationForFormat('meta_feed_1_1', 4) === 4,
-  'clamping Meta here would silently change every Meta video render');
+// B3c WAS "Meta keeps the operator value exactly (no floor applies)".
+// INVERTED BY OWNER DIRECTIVE 2026-08-18, verbatim: "make meta videos 10 sec
+// also, we already discussed this." This is a DIRECTED change, not drift —
+// do not restore the old assertion without a new directive.
+//
+// Why it mattered: the 10s Meta default (owner, 2026-08-11) only applied when
+// duration was UNSET, and the wizard's Video Length control has no "auto" and
+// posts 8 on every run. So the documented "Meta is 10s" was false on literally
+// every UI run. Meta is now a FLOOR, the same shape as PMax above.
+// It is also what makes the shared portrait plate a legal PMax asset — see
+// resolvePortraitMasterFormat and scripts/verifySharedPortraitMaster.js.
+check('B3c [DIRECTED] Meta video is floored at 10s, like PMax',
+  svc.resolveVideoDurationForFormat('meta_stories_9_16', 6) === 10
+    && svc.resolveVideoDurationForFormat('meta_feed_1_1', 4) === 10
+    && svc.resolveVideoDurationForFormat('meta_stories_9_16', 8) === 10,
+  'owner directive: Meta video is 10s');
+
+check('B3d above the floor the operator still wins on Meta too',
+  svc.resolveVideoDurationForFormat('meta_stories_9_16', 12) === 12,
+  'the floor lifts a short value; it must not cap a long one '
+  + '(Omni\'s [4,6,8,10] enum clamps the top end downstream)');
+
+// The floor is REVERSIBLE without a deploy, and that lever is load-bearing
+// for the shared portrait plate — see F-group in verifySharedPortraitMaster:
+// with the floor off, sharing must refuse rather than ship an 8s PMax asset.
+check('B3e META_VIDEO_DURATION_SEC=0 still restores the provider default',
+  (() => {
+    const prev = process.env.META_VIDEO_DURATION_SEC;
+    process.env.META_VIDEO_DURATION_SEC = '0';
+    for (const k of Object.keys(require.cache)) {
+      if (k.includes('campaignAdsGenerationService')) delete require.cache[k];
+    }
+    const reloaded = require(path.join(ROOT, 'services/campaignAdsGenerationService'));
+    const off = reloaded.resolveVideoDurationForFormat('meta_stories_9_16', 8);
+    const googleStill10 = reloaded.resolveVideoDurationForFormat(MASTER_9_16, 8) === 10;
+    if (prev == null) delete process.env.META_VIDEO_DURATION_SEC;
+    else process.env.META_VIDEO_DURATION_SEC = prev;
+    for (const k of Object.keys(require.cache)) {
+      if (k.includes('campaignAdsGenerationService')) delete require.cache[k];
+    }
+    return off === 8 && googleStill10;
+  })(),
+  'the Meta floor must stay revertible with no deploy, and must never touch PMax');
 
 // ── C. Digest: duration is identity for Google ONLY ────────────────────
 // C1 is the pin for the regression found (and fixed) during Phase A: an

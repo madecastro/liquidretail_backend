@@ -42,6 +42,9 @@ capability.
 **VIDEO (Google PMax, Phase A)** — **two** billable Omni masters (9:16 + 16:9)
 plus one free derive-only 1:1 crop of the 9:16 master — see §2 and
 `docs/PIPELINES.md` §6. Do not apply the Meta one-master rule to `google_video`.
+**On a MIXED Meta+PMax run the two 9:16 masters collapse to ONE** (owner
+directive 2026-08-18) — see the shared-portrait bullet in §2. PMax standalone
+is unchanged at two.
 
 1. Resize the hero image to **9:16** with the **current** resizing system.
 2. **Omni** image-to-video → the 9:16 **master**. `google/gemini-omni-flash/
@@ -450,9 +453,95 @@ Video never launches a browser.
   (measured in prod 2026-08-01) and is a money bug if reintroduced; it is not
   the `meta_video` path.** Flag-off (`PMAX_FUNNEL_VARIANTS=false`) restores
   the pre-variant mint of 4 (1 master + 3 derivatives).
+  **Meta video is now floored at 10s on EVERY run** (owner directive
+  2026-08-18) — the wizard's posted `8` no longer wins; see the duration
+  bullet below. **On a mixed Meta+PMax run this same master also serves
+  PMax's portrait surfaces** — see the shared-portrait bullet below.
+- **Video (MIXED Meta+PMax): ONE shared 9:16 master, not two. TWO billable
+  Omni masters per product, not three — $1.80, was $2.70 (owner directive
+  2026-08-18).** ⚠️ **CONDITIONAL, and the condition is not cosmetic** — the
+  share only happens when all five conjuncts below hold, and the load-bearing
+  one is that the hook-first camera standardization is ON. With it off a mixed
+  run still bills **3 / $2.70**, by design. Do not quote $1.80 as the
+  unconditional present-tense cost without checking
+  `isHookFirstVideoPromptEnabled()`. A mixed run measured 21 video Ads / 3 distinct
+  `veoPredictionId`s. Two of those three were the same portrait plate at
+  byte-identical `deliveryDims` (`meta_stories_9_16` and `pmax_video_9_16`
+  are both 1080×1920; only `safeArea` differs, and that is a TITLING input
+  resolved per row from the row's own `platformFormat`, so one plate serves
+  both surfaces while each keeps its own burned-in treatment). Now
+  `pmax_video_9_16` keeps its own Ad row and its own `platformFormat` but is
+  minted as a FREE derive of the Meta plate. **Delivered count is unchanged
+  at 21.** The 16:9 master stays billable — nothing can derive a landscape
+  frame from a portrait plate without cropping up.
+  - **The decision is `resolvePortraitMasterFormat(masterFormats)`
+    (`campaignAdsGenerationService.js`), computed ONCE inside
+    `planDeterministicVideoAds` and STAMPED onto every affected row as
+    `deriveFromMaster`.** The render loop and the regenerate preflight read
+    that stamp back through `resolveDeriveFromMaster`; neither re-derives the
+    condition, so planner and renderer cannot disagree. **The renderer must
+    never ask "is there a Meta sibling on this campaign?"** — a previous
+    Meta-only run would let a later PMax-only 9:16 adopt that old plate and
+    skip its Omni submit. Only the mint knows the run.
+  - **FAILS CLOSED ON FIVE CONJUNCTS**, all required: the
+    `UNIFIED_VIDEO_9_16_MASTER` kill switch; the Meta master minted IN THIS
+    RUN; the PMax portrait master requested IN THIS RUN; the hook-first camera
+    standardization being ON; and the Meta 10s floor being active. **On a
+    PMax-only run
+    `pmax_video_9_16` stays BILLABLE** — a derive whose master never exists
+    fails honestly and the run would ship NO 9:16 video at all, which is
+    worse than paying $0.90. When in doubt, bill.
+  - ⚠️ **DO NOT add a `platformFormat === 'pmax_video_9_16'` branch to
+    `resolveDeriveFromMaster`.** It looks like the `pmax_video_1_1` pattern
+    and is not: the square was never a legitimate billable master, the 9:16
+    is. Format-only there produces ZERO 9:16 video on every PMax-only run.
+    An unmarked `pmax_video_9_16` must stay billable.
+  - **THE WHOLE PMAX PORTRAIT FAMILY IS RETARGETED, not just the 9:16 row.**
+    `findSiblingMasterAd` matches TRUE masters only (no `deriveFromMaster`,
+    no `funnelStage`), so once the 9:16 is a derive, `pmax_video_1_1` and the
+    staged 9:16 retitles must point at the shared plate too — otherwise they
+    are derivatives of a derivative and fail "no sibling master ad" on every
+    mixed run. Harnesses exercising only a PMax-ONLY plan stay green through
+    that entire failure, which is why the MIXED plan is pinned explicitly.
+  - ⚠️ **DURATION IS A SOUNDNESS REQUIREMENT, NOT A DETAIL. Google rejects
+    PMax video under 10s**, so a shared Meta-format plate must clear 10s or
+    the "free" PMax 9:16 is a paid-for asset Google will not accept — and
+    **nothing offline can see that**, because no harness talks to Google
+    ingest. This is handled by the UNIVERSAL Meta 10s floor (above), not by a
+    mixed-run special case: one rule, nothing to keep in sync. **The two are
+    coupled and the coupling is enforced, not documented:**
+    `META_VIDEO_DURATION_SEC=0` reverts the Meta floor with no deploy, and
+    `resolvePortraitMasterFormat` treats that as a refusal to share — PMax
+    goes back to minting its own portrait master rather than riding an 8s
+    plate. Fail-closed, like every other conjunct.
+  - **Correlated failure is the accepted cost.** One plate means one point of
+    failure: if the shared master fails, 15 of the 21 rows fail with it (was
+    6 under three masters). That is inherent in "a single minting for 9x16"
+    and is owner-directed, not an oversight.
+  - ⚠️ **CONJUNCT 4 IS THE CAMERA SWITCH, NOT "DO THE TWO PROFILES MATCH".**
+    This was got wrong once and the wrong version is seductive. MEASURED
+    against the merged prompt lane: with the standardization OFF both
+    destinations fall through to the SAME `gemini-omni` profile, so a profile
+    -equality test is **TRUE IN BOTH SWITCH STATES** — a dead conjunct that
+    gates nothing, and the state it admits is the worst one (a shared plate
+    shot with Meta's pan, delivered to YouTube Shorts, while the operator
+    believes they rolled the camera back). The gate therefore calls
+    **`veoPromptBuilder.isHookFirstVideoPromptEnabled()`** — imported, never
+    re-implemented, because that switch reads TWO env names
+    (`VIDEO_HOOK_FIRST_PROMPT` + legacy `PMAX_VIDEO_DIRECTIVES`) with a
+    deliberate fail-safe OR. Profile equality is retained only as a SECOND,
+    belt-and-braces conjunct. Pinned by `verifySharedPortraitMaster` F6.
+  - Flag off (`UNIFIED_VIDEO_9_16_MASTER=false`) restores the three-master
+    mint byte-for-byte, same 21 ads. Pinned by
+    `scripts/verifySharedPortraitMaster.js` (86 checks, revert-proven on
+    twelve mutations — including the equality-only gate above, and two
+    checks that were themselves found VACUOUS by revert-proof because they
+    never reached the conjunct they claimed to test).
 - **Video (Google PMax, Phase A 2026-08-10): TWO billable Omni masters per
   product — 9:16 + 16:9 — not one, and not three. Delivered: NINE Ads
-  (3 surfaces × 3 intent stages), not 12.**
+  (3 surfaces × 3 intent stages), not 12.** (Standalone `google_video` /
+  `google_all`; on a mixed Meta+PMax run see the shared-portrait bullet
+  above — still two billable, but the portrait one is Meta's.)
   `resolvePreset('google_video'|'google_all')` returns
   `videoFormats: GOOGLE_VIDEO_MASTERS` only (`['pmax_video_9_16','pmax_video_16_9']`);
   do **not** return the full `GOOGLE_VIDEO_FANOUT`. `pmax_video_1_1` is
@@ -485,6 +574,31 @@ Video never launches a browser.
   product again. Pre-existing Meta digests stay byte-identical. **Meta 8s→10s
   duration identity is a deliberate one-time re-mint that must be costed and
   flagged, never folded in silently.**
+  **CORRECTED 2026-08-18 — "Meta 8s→10s is a one-time re-mint" was about the
+  DIGEST, not the VALUE, and the distinction is the whole point.** Making Meta
+  duration part of the Meta *identity* would re-key the corpus and re-open the
+  re-bill; that is still forbidden. **Changing the duration VALUE costs
+  nothing and re-mints nothing**, because the Meta digest omits duration
+  entirely (verified: `digest(meta, 8) === digest(meta, 10) === digest(meta,
+  null)`, pinned by `verifySharedPortraitMaster` G3). Meta video is now
+  floored at **10s universally** (owner directive 2026-08-18: *"make meta
+  videos 10 sec also, we already discussed this"*) in
+  `resolveVideoDurationForFormat` — previously the 10s Meta default applied
+  only when duration was UNSET, and the wizard's Video Length control has no
+  "auto" and posts `8` on every run, so the documented "Meta is 10s" was false
+  on every UI run. **The real consequence is the OPPOSITE of a re-bill, and it
+  is an operator-expectation item, not a spend item:** on a campaign that
+  already holds a Meta video ad, the new 10s row hashes identically to the
+  stored 8s row, `insertMany` swallows it, and the operator keeps their 8s ad
+  and gets no 10s version — silently. New campaigns/products mint at 10s
+  immediately. **Existing Meta video ads stay 8s until deliberately
+  regenerated.** Do NOT "fix" that swallow by adding duration to the Meta
+  digest — that is precisely the re-key this bullet forbids. Cost: 10s
+  measures **$0.90** settled; 8s is not separately measured (the `MODEL_CAPS`
+  formula ratio implies roughly $0.75, which is a **floor-grade estimate, not
+  settled spend**), so a Meta master gets on the order of $0.15 dearer. Also
+  open: the wizard still labels its default *"8s (standard)"* — a frontend
+  follow-up, not changed here.
   `funnelStage` is the other digest part, and the guard is **null-only, not
   format-scoped**: append the stage when — and only when — it is non-null.
   Every stored master has `funnelStage:null`, so a null-stage hash is
@@ -652,6 +766,20 @@ Video never launches a browser.
 
 ### Known open (do not claim fixed)
 
+- **A pre-existing BILLABLE `pmax_video_9_16` swallows the new free derive.**
+  Exactly the same mechanism as the Meta-crop bullet below and the same
+  refusal to "fix" it: `computeDeterministicVideoDigest` includes
+  `platformFormat` but not `deriveFromMaster`, so on a campaign that already
+  holds an independently-paid `pmax_video_9_16` with the same (product, refs,
+  CTA, prompts, duration), the shared-portrait derive hashes identically,
+  `insertMany` swallows the duplicate-key error, and the operator simply
+  keeps the older independent 9:16. **Not a spend regression** — nothing new
+  bills; the free extra is absent. **Do NOT close it by adding
+  `deriveFromMaster` or a run id to the digest:** the PMax formats now have
+  history, and the `(campaignId, identityDigest)` unique index is the ONLY
+  guard against a repeat Generate re-billing Omni. Note the duration part
+  makes this narrower than the Meta case — a legacy 8s row does not collide
+  with a 10s derive.
 - **The free Meta crops can be silently swallowed on a campaign that already
   has an ad of that format.** `computeDeterministicVideoDigest` includes
   `platformFormat` but NOT `deriveFromMaster`, so a derivative minted for

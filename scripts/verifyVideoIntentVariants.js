@@ -394,8 +394,25 @@ ok('N4 flag-off restores the pre-variant mint (PMax 3, Meta 4)', () => {
 
 ok('N5 mixed run keeps both platforms and does not double-mint Meta', () => {
   const plan = withFunnel(true, () => planAds([META_MASTER, PMAX_9, PMAX_16]));
-  assert.strictEqual(plan.filter((p) => p.billable).length, 3,
-    'mixed run billable count drifted (want 1 Meta + 2 PMax)');
+  // BILLABLE COUNT IS CONDITIONAL — see resolvePortraitMasterFormat. When the
+  // shared 9:16 master is active (kill switch on AND both masters in the run
+  // AND both destinations resolving to the same camera prompt) the mixed run
+  // pays for TWO masters: the shared portrait plate + the PMax 16:9. When any
+  // conjunct is false it pays for THREE, exactly as before. Assert against
+  // the same decision the planner made rather than a literal, so this check
+  // tracks the gate instead of pinning whichever side happens to be live.
+  const shared = svc.resolvePortraitMasterFormat([META_MASTER, PMAX_9, PMAX_16])
+    === META_MASTER;
+  assert.strictEqual(plan.filter((p) => p.billable).length, shared ? 2 : 3,
+    shared
+      ? 'shared 9:16 run must bill exactly 2 (Meta portrait plate + PMax 16:9)'
+      : 'unshared mixed run must bill 3 (1 Meta + 2 PMax)');
+  // The 16:9 master is billable in BOTH arms — it is a genuinely different
+  // aspect and nothing can derive it from a portrait plate.
+  assert.ok(
+    plan.some((p) => p.platformFormat === PMAX_16 && !p.funnelStage && p.billable),
+    'the PMax 16:9 master stopped being billable — that surface has no other source'
+  );
   assert.strictEqual(
     plan.filter((p) => p.platformFormat === META_MASTER).length, 3,
     'mixed run Meta Stories count is not 3 (unstaged + 2 variants)'
