@@ -517,14 +517,25 @@ async function buildSeededUniverse(brandId, productId, opts = {}) {
   }
 
   // ── Catalog media ──────────────────────────────────────────────
-  // Product mode: scope to the specific SKU via catalogProductId.
+  // Product mode: scope to the specific SKU via catalogProductId, AND to
+  // this brand — a legitimate productId's media already belongs to this
+  // brand, so the brandId clause is a no-op there; it only matters when
+  // productId itself belongs to another brand (caller passed an unowned
+  // id — should be caught upstream by /generate's tenant assertion, but
+  // this is the same "never leak media from other brands" guarantee the
+  // operator-picked branch already enforces via associatesWithProduct,
+  // applied here too rather than trusting productOid alone). Without it,
+  // this query happily returns the OTHER brand's own correctly-tagged
+  // media, producing a fully cross-branded ad (found in prod, 2026-08-19
+  // investigation: Ad 6a7bae8abea2eb1ad6bd0f13, brand Pelagic Gear Test 2,
+  // 100% Marine Layer 2 content, actually rendered and billed).
   // Brand mode: pull all catalog media for the brand, capped to a
   // reasonable pool size (shotType ranking sorts the winners).
   const BRAND_CATALOG_LIMIT = 50;
   const productOid = toObjectId(productId);
   const catalogQuery = isBrandOnly
     ? { source: 'catalog-product', brandId }
-    : { source: 'catalog-product', 'metadata.catalogProductId': productOid };
+    : { source: 'catalog-product', brandId, 'metadata.catalogProductId': productOid };
   const catalogCursor = Media.find(catalogQuery)
     .select('_id fileType fileUrl createdAt classification metadata text');
   const catalogMedias = isBrandOnly

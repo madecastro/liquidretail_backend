@@ -41,6 +41,16 @@ Living checklist. Update in place; do not append a duplicate list elsewhere.
   recurs with NO instance-replacement log evidence, that would be the signal
   this explanation is incomplete and the heartbeat mechanism itself needs a
   second look.
+- **26 pre-existing cross-branded Ads are not cleaned up** by the
+  `fix/crossbrand-tenancy-generate` tenant-leak fix (see
+  `session.d/2026-08-19_crossbrand-tenant-leak-generate-fix.md`) — the code
+  change only prevents FUTURE occurrences. 23 of the 26 carry real billable
+  CostLog spend (~$17.54 total, `atlas_video_render` / `direct_image`).
+  Someone with an explicit owner call needs to decide whether to
+  quarantine/delete those specific Ad documents and whether the already-spent
+  ~$17.54 needs any accounting treatment; not attempted as part of the code
+  fix (production Ad deletion is a data-remediation decision, not a
+  correctness fix). Ad ids are in that PR's description.
 
 ---
 
