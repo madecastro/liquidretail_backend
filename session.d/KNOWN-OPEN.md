@@ -51,6 +51,49 @@ Living checklist. Update in place; do not append a duplicate list elsewhere.
   ~$17.54 needs any accounting treatment; not attempted as part of the code
   fix (production Ad deletion is a data-remediation decision, not a
   correctness fix). Ad ids are in that PR's description.
+- **PR #245 fixed productIds ownership on POST /generate, but the same
+  missing-`brandId` pattern still exists in six other places** — found by an
+  adversarial (Grok, `--effort xhigh`) review of #245 after it merged, two of
+  the six independently re-verified by hand against the real source (not just
+  the review's own claim):
+  - **CONFIRMED LIVE, still exploitable on the deployed code as of
+    2026-08-19**: `services/campaignAdsGenerationService.js` ~1330-1346 (inside
+    `expandWizardJob`'s on-demand detect prep) resolves the request's raw,
+    UNFILTERED `mediaIds` via `Media.find({ _id: { $in } })` with no `brandId`
+    clause, unions their `matchedProducts[].catalogProductId` into `ensureIds`,
+    and calls `ensureDetectForProducts(ensureIds, { brandId, ... })` —
+    `services/catalogProductDetectService.js` ~367-387 accepts that `brandId`
+    param and never uses it (`CatalogProduct.find({ _id: { $in: oids } })`, no
+    brand clause). A POST /generate with a foreign brand's UGC `mediaId` can
+    still trigger a BILLED Gemini vision detect call against another brand's
+    catalog product today, regardless of `productIds`. This is a live money +
+    tenant leak independent of what #245 closed.
+  - **CONFIRMED, currently latent** (not reachable through /generate post-#245,
+    since `productIds` there are now ownership-filtered before reaching this):
+    `services/campaignAdsGenerationService.js` ~3035-3087,
+    `firstCatalogMediaForProduct` — the DETERMINISTIC VIDEO seed path, a
+    separate lookup from `buildSeededUniverse` (which #245 fixed) — has the
+    identical no-`brandId` pattern on both its `CatalogProduct.findById` and
+    `Media.findOne` calls. #245's own comment that the `buildSeededUniverse`
+    brandId clause is "the thing that actually stops the leak when productId
+    itself is compromised" is only true for the image/concept path.
+  - Four more claimed by the review but **not yet independently verified**:
+    `/preview` never got the ownership check (dry-run, so no direct Ad
+    spend, but reads/misreports another brand's data for billable-count
+    estimates); `resolveOwnedProductIds` doesn't dedupe, so a caller sending
+    the same owned productId twice can double a Director round's spend;
+    the legacy (`AI_CONCEPT_DRIVEN=false`) cartesian fallback's
+    `seedsFromMedia`/`seedsFromProduct` have the same no-brandId pattern;
+    unfiltered `mediaIds` still get `$addToSet`ed onto `Campaign.mediaIds`
+    (routes/ads.js ~814-818), which can keep re-triggering the detect-cost
+    leak above on every subsequent generate for that campaign.
+  - Flagged as a spawn_task chip in the session that landed #245
+    ("Close remaining brandId gaps in mediaIds/UGC/video product loaders").
+    Priority: the `mediaIds`→detect-cost leak (first bullet) is the only one
+    confirmed both real AND currently exploitable — verify it against prod
+    the same way #245 was (a Render one-off job), fix it, then work through
+    the rest with the same rigor (prod measurement, revert-proved harness,
+    full verify+lint gate, PR, confirm deploy).
 
 ---
 
