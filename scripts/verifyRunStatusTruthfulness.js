@@ -228,7 +228,11 @@ function sliceFrom(marker, span) {
 }
 
 await ok('D1 GET /runs/:runId actually returns stages, failureSummary, lastHeartbeatAt, updatedAt', () => {
-  const handler = sliceFrom("router.get('/runs/:runId'", 4500);
+  // Span widened 4500→6000 (2026-08-19, vision-QC surfacing pass): the
+  // handler grew a visionQcRollup query+field between the destructure and
+  // the res.json close, pushing the real close past the old window — same
+  // "scoped, not open-ended" tradeoff as before, just re-measured.
+  const handler = sliceFrom("router.get('/runs/:runId'", 6000);
   assert.ok(handler, 'could not locate the GET /runs/:runId handler to scope this check');
   // Scoped to the res.json({...}) OBJECT LITERAL itself, not merely
   // "somewhere in this handler" — `stages` and `failureSummary` are also
@@ -250,7 +254,7 @@ await ok('D1 GET /runs/:runId actually returns stages, failureSummary, lastHeart
 });
 
 await ok('D2 GET /runs/:runId actually CALLS summarizeInFlightStages and runFeed.summariseFailures (not just imported)', () => {
-  const body = sliceFrom("router.get('/runs/:runId'", 4500);
+  const body = sliceFrom("router.get('/runs/:runId'", 6000);
   assert.ok(body);
   assert.match(body, /summarizeInFlightStages\(/, 'must call the shared stage-grouping function, not re-derive its own');
   assert.match(body, /runFeed\.summariseFailures\(/, 'must reuse Slack\'s own failure-grouping function, not a second copy');

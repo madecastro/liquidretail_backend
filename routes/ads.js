@@ -103,6 +103,12 @@ const alerts   = require('../services/alertService');
 const inFlight = require('../services/inFlight');
 const { adStage, summarizeInFlightStages } = require('../services/adStage');
 const runFeed  = require('../services/runFeedService');
+// summarizeVisionQc — pure, shared subset of Ad.visionQc for the list/detail
+// projection AND the run-level rollup below (services/adVisionQcService.js).
+// Same reuse principle as adStage/runFeed above: one formatter, not a second
+// ad-hoc derivation of "was this ad inspected" that could drift from what
+// the inspector and Slack already say about the same verdict.
+const { summarizeVisionQc } = require('../services/adVisionQcService');
 // Pure Slack-message builders (run-completion per-kind summary, claim-anomaly
 // alert, uncapped-batch run-start line) — see services/slackRunVerbosity.js
 // header for why these are pulled out of this file: no Mongo/network at
@@ -3107,7 +3113,19 @@ router.get('/runs/:runId', async (req, res) => {
     // Slack says about this exact run. Neither is awaited-critical — a
     // failure here must never take down the run poller — so both are
     // best-effort with an empty-array fallback.
-    const [queuedRemaining, stages, failureSummary] = await Promise.all([
+    //
+    // shippedWithoutQcCount / qcdOnRetryCount — the run-level vision-QC
+    // rollup. Same gap this whole endpoint exists to close: a static ad that
+    // shipped WITHOUT inspection (flag on, QC failed to run — visionQc.skipped)
+    // used to be visible only per-ad on the generation-inspector; an operator
+    // watching the run poller had no way to know "N of this batch weren't
+    // even looked at" without opening every ad. Dot-path queries into
+    // Ad.visionQc (a Mixed field) are safe reads — Mixed only disables
+    // Mongoose-side sub-schema casting, the underlying BSON is a normal
+    // subdocument, same as the `renderError.*` dot-writes elsewhere in this
+    // file. Cheap: scoped by the already-indexed campaignRunIds filter
+    // first, same as queuedRemaining/stages above; best-effort like them too.
+    const [queuedRemaining, stages, failureSummary, shippedWithoutQcCount, qcdOnRetryCount] = await Promise.all([
       Ad.countDocuments({
         campaignId: run.campaignId,
         status:     'queued'
@@ -3115,7 +3133,9 @@ router.get('/runs/:runId', async (req, res) => {
       summarizeInFlightStages(run.runId).catch(() => []),
       (run.failed > 0
         ? runFeed.summariseFailures(run.runId).catch(() => [])
-        : Promise.resolve([]))
+        : Promise.resolve([])),
+      Ad.countDocuments({ campaignRunIds: run.runId, 'visionQc.skipped': true }).catch(() => 0),
+      Ad.countDocuments({ campaignRunIds: run.runId, 'visionQc.finalAttempt': { $gt: 1 } }).catch(() => 0)
     ]);
     res.json({
       runId:           run.runId,
@@ -3143,6 +3163,18 @@ router.get('/runs/:runId', async (req, res) => {
       // [{reason:'atlasVideo: prediction timed out after 600s', count:1}].
       // Present as soon as any ad in this run has failed, even mid-run.
       failureSummary,
+      // Run-level vision-QC rollup — same "single source of truth reused,
+      // not re-derived" principle as stages/failureSummary above, but there
+      // is no Slack equivalent to reuse here: Slack gets this per-ad
+      // (adVisionQcService.alertQcSkipped/alertQcFailure fire individually),
+      // never aggregated across a run. `shippedWithoutQc` is the sharper of
+      // the two — flag on, inspection failed to run, ad shipped anyway
+      // (visionQc.skipped) — a real defect, not routine. `qcdOnRetry` is
+      // informational: passed, but only after the one allowed regeneration.
+      visionQcRollup: {
+        shippedWithoutQc: shippedWithoutQcCount || 0,
+        qcdOnRetry:       qcdOnRetryCount || 0
+      },
       // Per-product expansion outcomes (why each product queued or skipped).
       // Empty until expandWizardJob finishes; the poller is the source of
       // truth because the 202 response flushes before expansion completes.
@@ -4597,7 +4629,20 @@ function projectAd(ad, full = false, extras = {}) {
           error:       h.error || null,
           durationMs:  h.durationMs || null
         }))
-      : []
+      : [],
+    // Compact vision-QC verdict — services/adVisionQcService.js
+    // summarizeVisionQc, the SAME formatter the run-level rollup below and
+    // (eventually) any other consumer use, so "was this ad inspected" never
+    // gets a second, drifting derivation. Previously the ONLY place this was
+    // visible at all was GET /:id/generation-inspector — a static ad that
+    // shipped WITHOUT vision QC (flag on, inspection failed to run — see
+    // adVisionQcService.buildSkippedVerdict) read as a normal successful
+    // draft everywhere else. null when the ad predates the QC gate (no
+    // visionQc was ever written) — distinct from `skipped:true`, which means
+    // QC was expected and did not happen.
+    // No categories/findings here — this is the list-weight compact form;
+    // `full` below upgrades it with the per-category breakdown.
+    visionQc:           summarizeVisionQc(ad.visionQc)
   };
   // A failed ad in the LIST needs to say WHY. renderError itself stays behind
   // `full` (it carries the prediction id and other internals), so surface just
@@ -4622,6 +4667,12 @@ function projectAd(ad, full = false, extras = {}) {
     base.preArchiveIdentityDigest = ad.preArchiveIdentityDigest || null;
     base.renderError           = ad.renderError || null;
     base.renderAttempts        = ad.renderAttempts || 0;
+    // Detail view gets the per-category score/pass/findings breakdown
+    // (final attempt only, findings capped at 3/category — see
+    // summarizeVisionQc's own doc comment) — the exact subset that used to
+    // require a trip to the generation-inspector to see at all. Overwrites
+    // the compact base.visionQc set above; still null on the same ads.
+    base.visionQc = summarizeVisionQc(ad.visionQc, { categories: true });
   }
   return base;
 }
