@@ -104,11 +104,29 @@ export const SAFE_ZONES = {
   //
   // BLAST: PMAX_VIDEO_SAFE_ZONE_KEY.meta_reels_9_16 → reels, so every
   // production Reels title uses it. Narrowing the box also narrows the wrap
-  // measure (0.85W → 0.775W); deriveCharCap models usable width from
-  // maxWidthPct × CANVAS width and does not subtract safe insets, so its cap
-  // now runs ~10% optimistic for this zone. That is the same modelling gap
-  // verticalYt/landscapeYt already carry, not a new one — but it means a long
-  // headline is likelier to take an extra line here than it was on `vertical`.
+  // measure (0.85W → 0.775W); deriveCharCap used to model usable width from
+  // maxWidthPct × CANVAS width alone, with no subtraction for safe insets, so
+  // its cap ran ~10% optimistic for this zone. That was the same modelling
+  // gap verticalYt/landscapeYt already carried, not a new one.
+  //
+  // ⚠️ THIS WAS PREDICTED AND THEN SHIPPED A REAL DEFECT (closed 2026-08-19,
+  // MEASURED on run run_1787136860887_654ed621): a delivered customer quote
+  // lost its OPENING clause on Reels while the identical Stories render kept
+  // it whole. The width gap above was real but not the whole story — the
+  // bigger contributor was `stackContainerStyle`'s `lowerThird`/`bottom`
+  // anchors clipping OVERFLOW at the wrong end (see the "safe flex-end" note
+  // by `floor` above): Reels kept `bottom:0.35` (tight) while Stories moved
+  // to `bottom:0.14` (loose) in the same change that added this zone, so a
+  // keep-out-shifted group that used to just barely fit now doesn't, on
+  // Reels only. Two coordinated fixes closed it: (1) `deriveCharCap`'s width
+  // measure now also bounds by the REAL resolved safe-zone width for any
+  // surface narrower than its canvas format's shared default (`slotContent.js`
+  // `resolveSurfaceSafeWidthPx` — inert for `vertical`/`stories`, which aren't
+  // narrower than their own baseline); (2) `stackContainerStyle` now uses
+  // `safe flex-end` so any group that still overflows its box drops content
+  // from the END, never the opening. Pinned by
+  // `scripts/verifyReelsSafeZone.mjs` (width) and
+  // `scripts/verifyReelsOverflowSafety.mjs` (overflow direction).
   reels: { top: 0.14, bottom: 0.35, left: 0.075, right: 0.15 },
 };
 
@@ -224,7 +242,36 @@ export function stackContainerStyle({ format, safeZoneKey, platformFormat, ancho
   // format-aware character caps (slotContent.js deriveCharCap) size copy to the
   // box it actually renders into, so the overflow this guards against should be
   // the exception it was always assumed to be.
+  //
+  // ⚠️ THAT "unlikely" WAS NOT "IMPOSSIBLE" (2026-08-19). MEASURED on a
+  // delivered Vuori `meta_reels_9_16` (run run_1787136860887_654ed621, t=5.5s):
+  // a `lowerThird` keep-out group (quote+reviewer+rating, shifted off the
+  // authored `upperThird` by face/texture avoidance — see
+  // `resolveGroupAnchor` in Canonical.jsx) whose content needed MORE height
+  // than `reels`' box affords (bottom:0.35 is unchanged from `vertical` and,
+  // post-keep-out, leaves only ~211px here, against Stories' ~614px at
+  // bottom:0.14) overflowed upward — `justifyContent:'flex-end'` pushes every
+  // item toward the FLOOR, so on overflow the EXCESS is pushed past the box's
+  // TOP edge, where `overflow:hidden` clips it. The clipped item was the
+  // quote's own OPENING line ("cinched at the waist but"), not the group's
+  // trailing item — the exact wrong end: a customer quote missing its first
+  // clause reads as a different, broken sentence, not a shorter one.
+  // `-webkit-line-clamp` (slotRenderers.jsx textCoreStyle) already clips a
+  // single slot's OWN excess lines the SAFE way (front-preserved, ellipsis at
+  // the end); this outer flex-end box was clipping the OPPOSITE way for the
+  // group as a whole. Fixed by `safe flex-end` below — do not revert to bare
+  // `flex-end` on `bottom`/`lowerThird` without an equivalent guarantee.
   const floor = { bottom: safe.bottom * height, overflow: 'hidden' };
+  // `safe flex-end` (CSS Box Alignment L3 "safe" alignment; supported by the
+  // Chromium Remotion renders with — verified empirically, not just read from
+  // a spec): behaves exactly like `flex-end` whenever the content fits (the
+  // lowerThird/bottom "grow upward from the floor" design stays intact for
+  // the common case), but falls back to start-alignment the moment the stack
+  // is taller than the box — so any content that must be dropped is dropped
+  // from the TRAILING end, never the opening. This is the guarantee, not a
+  // per-surface fudge: it holds for every zone this function resolves,
+  // independent of which surface's insets made the box tight.
+  const JUSTIFY_END_SAFE = 'safe flex-end';
 
   switch (anchor) {
     case 'top':
@@ -250,7 +297,7 @@ export function stackContainerStyle({ format, safeZoneKey, platformFormat, ancho
         ...base,
         ...floor,
         top: topFor(ANCHOR_TOP.lowerThird),
-        justifyContent: 'flex-end',
+        justifyContent: JUSTIFY_END_SAFE,
       };
     case 'bottom':
     default:
@@ -259,7 +306,7 @@ export function stackContainerStyle({ format, safeZoneKey, platformFormat, ancho
         // Floor at the safe band — the documented invariant is that no
         // spec offset can push content under platform UI.
         bottom: clampFrac(safe.bottom - offsetY, safe.bottom, 0.9) * height,
-        justifyContent: 'flex-end',
+        justifyContent: JUSTIFY_END_SAFE,
       };
   }
 }
