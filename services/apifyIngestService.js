@@ -223,16 +223,21 @@ async function syncBrandInstagram(brand, run = null) {
 
   // Fire brand-level enrichment in the background so downstream ad
   // generation can pull brandReviews / voice / colors from Gemini +
-  // Brandfetch. Requires a websiteUrl; skipped silently otherwise
-  // (demo brands sometimes don't have one). Non-blocking + idempotent
-  // (the service checks its own cache TTL per tier).
-  if (brand.websiteUrl) {
-    setImmediate(() => {
-      require('./brandEnrichmentService')
-        .enrichBrandFromUrl(brand._id)
-        .catch(err => console.warn(`   ⚠️  brand enrichment enqueue failed: ${err.message}`));
-    });
-  }
+  // Brandfetch. Non-blocking + idempotent (the service checks its own
+  // cache TTL per tier). Called UNCONDITIONALLY — enrichBrandFromUrl
+  // itself declines gracefully (and now RECORDS why on the brand doc,
+  // enrichmentSkipReason/enrichmentSkippedAt) when websiteUrl is still
+  // missing at this point (demo brands sometimes don't have one, and
+  // this IG branch runs before the Shopify-catalog branch in
+  // syncBrandApify, which is what would back-fill it). Previously this
+  // was gated on `brand.websiteUrl` and the skip was a bare comment —
+  // truly silent, since the guard meant enrichBrandFromUrl was never
+  // even called to record anything.
+  setImmediate(() => {
+    require('./brandEnrichmentService')
+      .enrichBrandFromUrl(brand._id)
+      .catch(err => console.warn(`   ⚠️  brand enrichment enqueue failed: ${err.message}`));
+  });
 
   summary.durationMs = Date.now() - t0;
   console.log(`📸 Apify IG sync done: brand=${brand._id} fetched=${summary.fetched} ingested=${summary.ingested} skipped=${summary.skipped} errors=${summary.errors} in ${summary.durationMs}ms`);
@@ -349,6 +354,18 @@ async function syncBrandShopify(brand, run = null) {
 
   console.log(`🛍  Apify Shopify sync starting: brand=${brand._id} shop=${shopifyUrl}`);
   const products = await pullShopifyProducts(shopifyUrl);
+
+  // websiteUrl back-fill — same hole as the shopify-direct/generic-sitemap
+  // paths (services/brandWebsiteBackfill.js): this actor already resolved
+  // and proved brand.apifyDemo.shopifyUrl by fetching real products from
+  // it, but nothing ever copied it onto Brand.websiteUrl, so downstream
+  // enrichment/logo/font ingest stayed starved forever. Gated on a
+  // non-empty pull so a bad config can't poison websiteUrl.
+  if (products.length > 0) {
+    require('./brandWebsiteBackfill').backfillBrandWebsiteUrl(brand, shopifyUrl, { ingestSource: 'apify-shopify' }).catch(err =>
+      console.warn(`   ⚠️  websiteUrl back-fill failed for brand=${brand._id}: ${err.message}`)
+    );
+  }
 
   const summary = { ok: true, fetched: products.length, added: 0, updated: 0, errors: 0, aborted: false };
   // ARCHITECTURE: upsert NEVER awaits image classify. Post-loop pass only.

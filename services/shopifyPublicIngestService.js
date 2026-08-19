@@ -48,6 +48,10 @@ const ingestShotClassify = require('./ingestShotClassifyService');
 // authored category field) on upsert so Shopify-only brands don't
 // have to wait for a UGC match / JSON-LD scrape to get a real leaf.
 const { stampFeedTruthCategoryRef, applyFeedTruthStamp } = require('./categoryClassifier');
+// Back-fills Brand.websiteUrl the first time this ingest path proves a
+// storefront domain for a brand that doesn't have one yet — see the
+// module header for why a naive "any known URL's origin" rule is unsafe.
+const { backfillBrandWebsiteUrl } = require('./brandWebsiteBackfill');
 
 // ── constants ──────────────────────────────────────────────────────
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36';
@@ -390,6 +394,16 @@ async function syncBrandShopifyDirect(brand, run, { isBrandAborted } = {}) {
   }
 
   const products = (access.products || []).slice(0, CAP);
+  // websiteUrl back-fill: use the ORIGIN WE RESOLVED FROM (apifyDemo.shopifyUrl
+  // etc.), not the effective backend below — a headless store's myshopify.com
+  // backend is never the right value for Brand.websiteUrl (see
+  // brandWebsiteBackfill.js header). Gated on products.length so a bad/typo'd
+  // config that resolves to nothing never poisons websiteUrl either.
+  if (products.length > 0) {
+    backfillBrandWebsiteUrl(brand, origin, { ingestSource: 'shopify-direct' }).catch(err =>
+      console.warn(`   ⚠️  websiteUrl back-fill failed for brand=${brand._id}: ${err.message}`)
+    );
+  }
   if (access.origin) origin = access.origin;   // effective backend (myshopify for headless)
   const totalPlanned = products.length || CAP;
   const hitRateLimit = !!access.rateLimited;

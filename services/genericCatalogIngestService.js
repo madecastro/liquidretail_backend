@@ -45,6 +45,10 @@ const { stampFeedTruthCategoryRef, applyFeedTruthStamp } = require('./categoryCl
 // the network scan budget's clock, or a slow scan would leave no time to
 // persist products already paid for in network cost.
 const { createBudget } = require('./genericCatalogDiscovery/budget');
+// Back-fills Brand.websiteUrl the first time this ingest path proves a
+// storefront domain for a brand that doesn't have one yet — same helper
+// shopifyPublicIngestService uses; see brandWebsiteBackfill.js header.
+const { backfillBrandWebsiteUrl } = require('./brandWebsiteBackfill');
 
 const LOG = '🗺';
 const UPSERT_BUDGET_MS = parseInt(process.env.GENERIC_CATALOG_UPSERT_BUDGET_MS, 10);
@@ -156,6 +160,18 @@ async function syncBrandGenericCatalog(brand, run, { isBrandAborted, categories 
     ` cf=${stats.cfChallenges ?? '?'})` +
     (access.reason ? ` reason=${access.reason}` : '')
   );
+
+  // websiteUrl back-fill: `origin` here is resolveStoreOrigin's own return
+  // (apifyDemo.shopifyUrl etc.) — this resolver, unlike the Shopify-direct
+  // ladder, never substitutes a myshopify-backend origin for it, but
+  // backfillBrandWebsiteUrl's host denylist is a second, independent guard
+  // regardless. Gated on products.length so an unreachable/typo'd config
+  // never poisons websiteUrl.
+  if (products.length > 0) {
+    backfillBrandWebsiteUrl(brand, origin, { ingestSource: catalogSource }).catch(err =>
+      console.warn(`   ⚠️  websiteUrl back-fill failed for brand=${brand._id}: ${err.message}`)
+    );
+  }
 
   // Cancelled with nothing to persist — report cancel (any partials the
   // resolver did fetch are upserted by the loop below).

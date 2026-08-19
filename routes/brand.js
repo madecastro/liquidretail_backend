@@ -125,10 +125,15 @@ async function ensureSamplePlate(format) {
 // Fire-and-forget enrichment trigger. Imported lazily to avoid the
 // circular require that originally pushed enrichment scheduling into
 // brandCatalogService — same dance, but now the user (not detect)
-// drives it. No-ops cleanly when there's no websiteUrl or no
-// missing tier (Brandfetch / scrape / GPT) to add.
+// drives it. Called unconditionally, even with no websiteUrl yet —
+// enrichBrandFromUrl itself declines gracefully AND records why
+// (Brand.enrichmentSkipReason) instead of this being a bare untracked
+// no-op. Previously the `if (!brand?.websiteUrl) return;` guard here
+// meant enrichBrandFromUrl was never even called on that path, so
+// nothing was recorded anywhere — same "silent skip" class fixed in
+// brandEnrichmentService.js / apifyIngestService.js.
 function triggerEnrichment(brand, reason) {
-  if (!brand?.websiteUrl) return;
+  if (!brand?._id) return;
   console.log(`🌐 enrichment queued for "${brand.name}" (${reason})`);
   const { enrichBrandFromUrl } = require('../services/brandEnrichmentService');
   enrichBrandFromUrl(brand._id).catch(err =>
