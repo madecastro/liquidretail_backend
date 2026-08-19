@@ -420,6 +420,40 @@ check('D4 the ACTION is stamped by control flow, never hardcoded beside a call s
   }
 });
 
+check('D5 the shared post() helper pins maxRedirects:0 (CLAUDE.md §2)', () => {
+  // Every billable POST this transport makes — the Atlas primary AND the
+  // direct-provider fallback twin — goes through this ONE function. Axios
+  // defaults to 21 redirects and RE-SENDS the request body on 307/308, which
+  // is a silent double charge inside one call, invisible to retry logic. See
+  // the same pin on the sibling raw-REST transport,
+  // scripts/verifyGeminiSearchCost.js A6.
+  const src = fs.readFileSync(path.join(REPO, 'services/atlasLlmService.js'), 'utf8');
+  const start = src.indexOf('async function post(');
+  assert.notStrictEqual(start, -1, 'function post() not found in source');
+  const end = src.indexOf('\n}\n', start);
+  assert.notStrictEqual(end, -1, 'could not find end of post()');
+  const POST_FN = src.slice(start, end);
+
+  // Strip comments before matching — a comment referencing "maxRedirects:0"
+  // (this one does, to explain the pin) must never be able to satisfy this
+  // check on its own. Same trap D4 above guards against for makeLlmError.
+  const POST_FN_CODE = POST_FN
+    .replace(/\/\*[\s\S]*?\*\//g, '')
+    .replace(/^[ \t]*\/\/.*$/gm, '');
+  assert.ok(/maxRedirects:\s*0\b/.test(POST_FN_CODE),
+    'post() must pin maxRedirects:0 in actual code — a 307/308 would re-send the body and double-bill');
+
+  // Both call sites must route through this helper, not a bare axios.post —
+  // a bypass at either site would silently lose the pin for that site only.
+  // The negative lookbehind is load-bearing: `post(ATLAS_CHAT_URL` is a
+  // substring of `axios.post(ATLAS_CHAT_URL` too, so a plain substring test
+  // cannot tell the wrapped call from the bypass it exists to catch.
+  assert.ok(/(?<!\.)post\(ATLAS_CHAT_URL/.test(src),
+    'the Atlas primary call site must route through post(), not a bare axios.post');
+  assert.ok(/(?<!\.)post\(DIRECT_URLS\[direct\.provider\]/.test(src),
+    'the direct-provider fallback call site must route through post(), not a bare axios.post');
+});
+
 console.log('\nE. THE OPERATOR SURFACE — CampaignRun.errors[] through the STRICT schema');
 
 check('E1 CampaignRun.errors[] round-trips code/action/chain (strict schemas drop undeclared paths)', () => {

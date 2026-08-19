@@ -145,6 +145,10 @@ async function post(url, key, body, timeoutMs = TIMEOUT_MS) {
     headers: { Authorization: `Bearer ${key}`, 'Content-Type': 'application/json' },
     timeout: timeoutMs,
     validateStatus: () => true,
+    // maxRedirects:0 per CLAUDE.md §2 — axios defaults to 21 and re-sends the
+    // body on 307/308, which is a silent double charge on a billable POST.
+    // Both call sites (Atlas primary, direct-provider fallback) share this fn.
+    maxRedirects: 0,
   });
 }
 

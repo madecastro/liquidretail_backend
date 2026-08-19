@@ -507,6 +507,16 @@ regime-independently rather than by asserting a specific dollar ratio. The
 strict schema was exercised on the same live run: 10 quotes survived intake
 and `rating: 3.2` came through as a scalar.
 
+**Same-day follow-up, a separate finding on the transport pass 2 uses:**
+adversarial review of this move caught that `atlasLlmService.js`'s shared
+`post()` — the function under `chatCompletion` for every caller, not just
+this one, including 25 services across the Director/Judge/copy pipeline —
+had no `maxRedirects: 0` of its own. Live-probed the same day with
+unauthenticated requests: none of the three endpoints this transport calls
+(`api.atlascloud.ai`, `generativelanguage.googleapis.com`, `api.openai.com`)
+actually redirect today, so the exposure was real but not firing in
+practice. Fixed; see CLAUDE.md §2 and `scripts/verifyLlmErrorCodes.js` D5.
+
 ### The `review-text` role — chosen by measurement
 
 Added to `services/atlasModelMap.js` so review-text model choice lives in **one**
