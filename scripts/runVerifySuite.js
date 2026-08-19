@@ -233,6 +233,15 @@ function computeAffected(base) {
   return [...selected].sort();
 }
 
+// Grace period between SIGTERM and a forced SIGKILL when a timed-out script
+// doesn't exit on its own. No verify* script installs a SIGTERM handler
+// today, but scripts/retitleDriver.js in this same repo already does
+// (`process.on('SIGTERM', ...)` that finishes current work before exiting) —
+// a future verify* script sharing that pattern, or simply looping instead of
+// finishing, would otherwise survive SIGTERM and hang the whole runner
+// indefinitely: no output, no exit code, ever.
+const KILL_GRACE_MS = 5000;
+
 function runOne(script, timeoutMs) {
   return new Promise((resolve) => {
     const file = path.join(SCRIPTS_DIR, script);
@@ -241,18 +250,24 @@ function runOne(script, timeoutMs) {
     let stdout = '';
     let stderr = '';
     let timedOut = false;
+    let killTimer = null;
     const timer = setTimeout(() => {
       timedOut = true;
       child.kill('SIGTERM');
+      killTimer = setTimeout(() => {
+        try { child.kill('SIGKILL'); } catch (e) { /* already exited */ }
+      }, KILL_GRACE_MS);
     }, timeoutMs);
     child.stdout.on('data', (d) => { stdout += d; });
     child.stderr.on('data', (d) => { stderr += d; });
     child.on('close', (code) => {
       clearTimeout(timer);
+      if (killTimer) clearTimeout(killTimer);
       resolve({ script, code: timedOut ? 1 : code, timedOut, ms: Date.now() - start, stdout, stderr });
     });
     child.on('error', (err) => {
       clearTimeout(timer);
+      if (killTimer) clearTimeout(killTimer);
       resolve({ script, code: 1, timedOut: false, ms: Date.now() - start, stdout, stderr: String((err && err.stack) || err) });
     });
   });

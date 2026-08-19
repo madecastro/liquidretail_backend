@@ -5,14 +5,23 @@
 #
 # Background: `node_modules` is gitignored but ~4,930 files are tracked from
 # before the ignore rule was added, so a fresh worktree checkout gets a
-# PARTIAL node_modules for free — enough to run most things, but missing:
+# PARTIAL node_modules for free — enough to run most things, but missing (at
+# least — this is the committed subset's known gap list, not a guarantee
+# nothing else is missing):
 #   - https-proxy-agent (anything importing axios, e.g. atlasVideoService,
 #     throws MODULE_NOT_FOUND without it)
 #   - sharp entirely (it's a native module and was never committed; three
 #     verify* harnesses need it — as of 2026-08-19 they `require('sharp')`
 #     normally, so a plain install here is all they need, no path hacks)
+#   - jsonwebtoken (used by middleware/requireAuth.js, routes/auth.js, and
+#     others — also missing from the committed subset. Previously this was
+#     only ever installed as a side effect of `npm install --no-save
+#     https-proxy-agent@...` reconciling the whole tree against
+#     package-lock.json, which happened to pull it in too — undocumented and
+#     not guaranteed to keep happening on a future `npm` version, so it now
+#     gets its own explicit install step below like the other two.)
 #
-# This script installs both WITHOUT touching package.json/package-lock.json
+# This script installs all three WITHOUT touching package.json/package-lock.json
 # (matching the documented `--no-save` remedy), restores the tracked
 # node_modules/.package-lock.json afterwards so `npm install` doesn't leave
 # an uncommitted diff in a tracked file, then runs the verify suite so you
@@ -46,6 +55,13 @@ if [ ! -d node_modules/sharp ]; then
   npm install --no-save sharp
 else
   echo "-- sharp already present, skipping"
+fi
+
+if [ ! -d node_modules/jsonwebtoken ]; then
+  echo "-- installing jsonwebtoken (missing from the committed node_modules subset)"
+  npm install --no-save jsonwebtoken
+else
+  echo "-- jsonwebtoken already present, skipping"
 fi
 
 # npm install above rewrites the tracked node_modules/.package-lock.json even
