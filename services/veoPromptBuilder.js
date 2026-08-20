@@ -509,6 +509,52 @@ function isVideoLifestylePromptEnabled() {
 }
 
 /**
+ * VIDEO_PROMPT_UI_CHROME_GUARD kill switch — default OFF.
+ *
+ * Added 2026-08-19 after a P0: both Omni masters in
+ * run_1787174963435_ff67021e (Marine Layer 2, "Cut & Sew Bode Puffer
+ * Jacket") hallucinated a fake product-detail-page header/footer — a nav
+ * bar with a hamburger icon, garbled pseudo-text, a shopping-bag icon, and
+ * a footer repeating the (correctly-spelled) real product name beside more
+ * garbled text — directly into the video plate, BEFORE Remotion titling
+ * ever touched the frame (confirmed against the raw pre-titling
+ * veoVideoUrl, not just the delivered renderUrl). The seed/reference
+ * images for that ad were verified clean catalog product photography, no
+ * PDP/storefront screenshot anywhere in the stack — so this is a model
+ * hallucination, not a bad seed.
+ *
+ * `noText` (OMNI_DIRECTIVES / GROK_DIRECTIVES, both frozen — see the PR #61
+ * rollback note in CLAUDE.md §00) already bans generating new text,
+ * typography, logos, badges, watermarks, and captions, and Omni still
+ * violated it — but `noText` never named UI/app/webpage CHROME as its own
+ * category (nav bars, menus, icons, buttons are graphic elements, not
+ * strictly "text"), so an icon-heavy hallucination had no explicit line to
+ * violate for half of what it rendered.
+ *
+ * This is a SEPARATE, ADDITIVE prompt line — deliberately NOT folded into
+ * OMNI_DIRECTIVES / GROK_DIRECTIVES / HOOK_FIRST_DIRECTIVES, which must stay
+ * byte-identical to `134db56~1` (scripts/verifyPostPilotBatch.js B1-B17).
+ * Default OFF because it is UNVERIFIED: confirming it actually suppresses
+ * the hallucination needs a live Omni submit (~$0.90), which was
+ * deliberately not spent to build this fix (owner directive, same
+ * incident). Flip to 'true' after a live A/B check against this exact
+ * seed/product before trusting it in production.
+ */
+function isVideoUiChromeGuardEnabled() {
+  return process.env.VIDEO_PROMPT_UI_CHROME_GUARD === 'true';
+}
+
+// Kept OUTSIDE every directive object on purpose (see
+// isVideoUiChromeGuardEnabled above) so OMNI_DIRECTIVES / GROK_DIRECTIVES /
+// HOOK_FIRST_DIRECTIVES never change a byte. Names the failure mode
+// concretely (nav bar, hamburger/bag icons, screenshot/mockup) rather than
+// only repeating the generic "no text" ban noText already states.
+const UI_CHROME_GUARD_LINE =
+  `Do NOT render any user-interface, app, or website elements anywhere in the frame — no navigation bars, menus, ` +
+  `hamburger icons, shopping-cart/bag icons, buttons, price tags, banners, or any screen-within-the-screen. ` +
+  `This is a real-world camera shot of a physical product, never a screenshot, mockup, or render of a web page or app.`;
+
+/**
  * Lifestyle video prompt branch is active only when the flag is on AND
  * (seed is lifestyle OR variantKind is ugc). Matches static preserve trigger
  * so a UGC video with an unclassified seed does not stay on packshot Ken Burns
@@ -1017,6 +1063,14 @@ function buildVeoPrompt({
   // canonical/deterministic and no longer shapes the video prompt.)
   lines.push(d.noText);
 
+  // UI-CHROME GUARD (VIDEO_PROMPT_UI_CHROME_GUARD, default OFF) — see
+  // isVideoUiChromeGuardEnabled above for the incident this closes and why
+  // it defaults off. Runs for every profile (packshot, lifestyle, hook_first,
+  // split) since it sits in the shared assembly section, not inside `d`.
+  if (isVideoUiChromeGuardEnabled()) {
+    lines.push(UI_CHROME_GUARD_LINE);
+  }
+
   if (seedHasText) {
     lines.push(
       `The reference image contains text overlays / captions / stickers / watermarks burned into the source frame. ` +
@@ -1179,5 +1233,10 @@ module.exports = {
   isVideoProductAnchorEnabled,
   productRegionForAd,
   buildProductAnchorBlock,
+  // UI-chrome hallucination guard (VIDEO_PROMPT_UI_CHROME_GUARD, default
+  // OFF) — exported for the offline verify harness only; no other caller
+  // should read the env var directly.
+  isVideoUiChromeGuardEnabled,
+  UI_CHROME_GUARD_LINE,
 };
 
