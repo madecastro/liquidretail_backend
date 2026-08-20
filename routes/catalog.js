@@ -31,6 +31,7 @@ const Ad                    = require('../models/Ad');
 const Campaign              = require('../models/Campaign');
 const { loadPhotorealUrlMap, loadUseImageRefMap } = require('../services/adDisplayUrlService');
 const { buildGridPreviewVideoUrl } = require('../services/videoPreviewUrl');
+const { buildGridPreviewImageUrl } = require('../services/imagePreviewUrl');
 const { AD_RECENCY_EXPR } = require('../services/adRecencyService');
 const catalogProductPromoteService = require('../services/catalogProductPromoteService');
 const { catalogSeedFields } = require('../services/catalogImageQuality');
@@ -992,6 +993,12 @@ router.get('/:id/ads-detail', async (req, res) => {
       // Same downscaled/auto-quality grid-tile variant /api/ads emits —
       // keeps this endpoint's thumbnails in lockstep with the flat ads list.
       previewVideoUrl: a.kind === 'video' ? buildGridPreviewVideoUrl(a.renderUrl || null) : null,
+      // Static-ad equivalent, same priority as the photorealUrl field just
+      // above (photoreal polish when present, else the raw render) — keeps
+      // this endpoint's static thumbnails in lockstep with /api/ads too.
+      previewImageUrl: a.kind === 'video'
+        ? null
+        : buildGridPreviewImageUrl(photorealMap.get(String(a._id)) || a.renderUrl || null),
       headline:       a.copy?.headline || null,
       ctaText:        (a.copy && a.copy.cta_text) || a.ctaText || null,
       generatedAt:    (a.renderedAt || a.generatedAt)

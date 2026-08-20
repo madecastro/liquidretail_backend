@@ -81,6 +81,7 @@ const { renderCreative }        = require('../services/renderService');
 const { generateForAd: veoGenerateForAd, prepareStoryboard: veoPrepareStoryboard } = require('../services/videoRouter');
 const { buildVideoSegmentUrl, buildPromptScaffold } = require('../services/atlasVideoService');
 const { buildGridPreviewVideoUrl } = require('../services/videoPreviewUrl');
+const { buildGridPreviewImageUrl } = require('../services/imagePreviewUrl');
 const ugcVideoPipeline = require('../services/ugcVideoPipeline');
 
 // Derive-only 1:1 ads requeue while their 9:16 master is still in flight.
@@ -4882,6 +4883,17 @@ function projectAd(ad, full = false, extras = {}) {
     // keep using renderUrl untouched. Null for non-video ads / non-Cloudinary
     // sources (buildGridPreviewVideoUrl falls back to the input then).
     previewVideoUrl:    ad.kind === 'video' ? buildGridPreviewVideoUrl(ad.renderUrl) : null,
+    // Same idea, static side: a ~640px c_scale/q_auto/f_auto variant of
+    // whichever image the frontend actually displays (extras.photorealUrl
+    // when the gpt-image-1 polish is present, else the raw renderUrl — same
+    // priority pages/Ads' displayUrl()/pages/ProductAds' displayUrlFor() use)
+    // so a gallery of static ads doesn't stream N full-resolution PNGs
+    // (measured 1.5-4.3MB each) for tiles a few hundred pixels wide. Detail
+    // views keep using renderUrl/photorealUrl untouched. Null for video ads
+    // (previewVideoUrl already covers those).
+    previewImageUrl:    ad.kind === 'video'
+      ? null
+      : buildGridPreviewImageUrl(extras.photorealUrl || ad.renderUrl),
     width:              ad.width,
     height:             ad.height,
     bytes:              ad.bytes,
