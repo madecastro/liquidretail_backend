@@ -293,6 +293,99 @@ function buildStaleRunningReapUpdate(staleMin) {
 }
 
 /**
+ * THE MISSING LINK, found investigating a 2026-08-20 incident
+ * (run_1787263897396_ef1fcb32, and its sibling shape run_1787105727540_e8c94542
+ * — see session.d/ for both write-ups): CampaignRun.status is written ONLY by
+ * process-local code (runRenderLoop's post-`Promise.all` write, or the blind
+ * reaper below). NOTHING ever re-derives it from the Ads the run actually
+ * claimed. So a run whose owning process died can sit `'running'` forever
+ * even after every one of its Ads is genuinely `draft`+renderUrl (delivered
+ * by a completely different path — titlingResumeService, bootRecoveryService
+ * — that never touches CampaignRun at all); and the SAME gap runs the other
+ * direction, where the reaper's blind `failed` stamp leaves stale
+ * succeeded/failed counters that undercount real, already-delivered work
+ * (the observed `status:'failed', succeeded:18` while all 39 Ads had a
+ * `renderUrl`).
+ *
+ * `classifyRunAdOutcome` is the read side of the fix: given the REAL Ad
+ * documents a run claimed (`Ad.find({ campaignRunIds: run.runId })`, called
+ * by worker.js AFTER its own Ad-sweep above has already requeued whatever
+ * receipt-free stale rows it found — so a `'queued'` row here means "this
+ * run's claim on it is genuinely void", not "not looked at yet"), decide
+ * whether the run is actually finished and what its honest counters are.
+ *
+ * Ad.status enum (models/Ad.js): queued | rendering | draft | live |
+ * archived | failed. `draft`/`live`/`archived` are the delivered shapes
+ * (CLAUDE.md documents `draft` as the terminal "delivered" state for both
+ * static and video Ads); `failed` is a settled failure; `queued`/`rendering`
+ * are the only two non-terminal shapes.
+ */
+function classifyRunAdOutcome(adDocs) {
+  let succeeded = 0, failed = 0, stillRendering = 0, requeuedAway = 0;
+  for (const ad of (adDocs || [])) {
+    switch (ad && ad.status) {
+      case 'draft':
+      case 'live':
+      case 'archived': succeeded++; break;
+      case 'failed':   failed++; break;
+      case 'rendering': stillRendering++; break;
+      case 'queued':    requeuedAway++; break;
+      // Anything else (missing/unrecognised) is not counted either way —
+      // the same posture the render loop's own $inc sites already take.
+      default: break;
+    }
+  }
+  return {
+    succeeded,
+    failed,
+    stillRendering,
+    requeuedAway,
+    // A receipt-holding Ad is deliberately left `'rendering'` by the reaper's
+    // Ad-sweep (services/spendReceipt.js) specifically so it can finish for
+    // FREE instead of being requeued into a second paid submit. So
+    // `stillRendering > 0` here means real, already-billed work is still
+    // outstanding — the run must not be finalized either way this cycle;
+    // the next reap tick (REAP_INTERVAL_MIN later) re-checks.
+    isSettled: stillRendering === 0,
+    // Only a genuinely lost claim (an Ad reset to 'queued', needing a fresh
+    // "Generate more") justifies the run reading 'failed'. A settled run
+    // with a mix of succeeded/failed Ads and nothing lost is still a
+    // COMPLETED run — 'done' already means "finished", not "everything
+    // succeeded"; that is the exact semantics runRenderLoop's own terminal
+    // write uses (it does not itself check the succeeded/failed mix either).
+    needsRetry: requeuedAway > 0
+  };
+}
+
+/**
+ * The RECONCILED terminal write — used ONLY after classifyRunAdOutcome has
+ * confirmed `isSettled` from the real Ad documents. This is deliberately a
+ * DIFFERENT function from buildStaleRunningReapUpdate, not an extra
+ * parameter on it: that function's contract (pinned by
+ * scripts/verifyRunStatusTruthfulness.js C1) is a BLIND write that never
+ * inspects a single Ad, so it must never guess at succeeded/failed/skipped —
+ * a guess would be exactly the "corrupt the run's own audit trail" hazard
+ * that test guards against. Here the counters are not a guess: they are
+ * recomputed from verified truth, so stamping them is the fix for the
+ * observed `status:'failed', succeeded:18` shape while every one of 39 Ads
+ * already carried a `renderUrl` — not a new risk.
+ *
+ * `needsRetry` (some claimed Ad was genuinely lost back to 'queued') still
+ * produces the SAME reaper explanation as buildStaleRunningReapUpdate — this
+ * just layers real counters on top of it, spreading from that one function
+ * rather than duplicating its message text.
+ */
+function buildRunReconciliationUpdate(outcome, { staleMin, now } = {}) {
+  const at = now instanceof Date ? now : new Date();
+  const counters = { succeeded: outcome.succeeded, failed: outcome.failed };
+  if (outcome.needsRetry) {
+    const base = buildStaleRunningReapUpdate(staleMin);
+    return { ...base, $set: { ...base.$set, completedAt: at, ...counters } };
+  }
+  return { $set: { status: 'done', completedAt: at, ...counters } };
+}
+
+/**
  * routes/ads.js — the compare-and-swap for the 'preparing' → 'running' flip.
  * THIS is the actual money guard, not the reaper sweep above.
  *
@@ -369,5 +462,7 @@ module.exports = {
   buildStalePreparingFilter,
   buildStaleRunningFilter,
   buildStaleRunningReapUpdate,
+  classifyRunAdOutcome,
+  buildRunReconciliationUpdate,
   buildRunningFlipFilter
 };

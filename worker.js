@@ -145,7 +145,12 @@ const { receiptFree, HAS_RECEIPT } = require('./services/spendReceipt');
 // services/strandedRunSweeper.js can never pick up a `queued` row with an
 // empty one.
 const { buildRequeuePipeline } = require('./services/adArchiveDigest');
-const { buildStalePreparingFilter, buildStaleRunningFilter, buildStaleRunningReapUpdate } = require('./services/campaignRunGuards');
+const {
+  buildStalePreparingFilter,
+  buildStaleRunningFilter,
+  classifyRunAdOutcome,
+  buildRunReconciliationUpdate
+} = require('./services/campaignRunGuards');
 // Pure Slack-message builder for the preparing-reap notice below — see
 // services/slackRunVerbosity.js header (no Mongo/network at require-time).
 const { buildPreparingReapNotice } = require('./services/slackRunVerbosity');
@@ -377,9 +382,12 @@ async function reapOrphans() {
     );
   }
 
-  // CampaignRun: stuck 'running' → mark 'failed' with completedAt so
-  // the frontend poller resolves. The individual Ads inside the run
-  // were handled by the Ad sweep above.
+  // CampaignRun: stuck 'running' → reconcile from real Ad truth (see the
+  // reconciliation block below, after the ⚠️ history this predicate carries)
+  // so the frontend poller resolves to an HONEST terminal state — 'done' if
+  // every claimed Ad already settled, 'failed' with completedAt only if some
+  // were genuinely lost. The individual Ads inside the run were handled by
+  // the Ad sweep above.
   //
   // Staleness is judged on updatedAt, NOT startedAt. Filtering on startedAt
   // would fail ANY run older than 15 minutes, and a serialized 20-ad video
@@ -405,14 +413,87 @@ async function reapOrphans() {
   // The write used to be `{ $set: { status: 'failed', completedAt: new Date() } }`
   // and nothing else — no errors[] entry, so a reaped run read exactly like
   // the header above describes: "Nothing threw. It was still rendering." with
-  // zero explanation on the run poller itself. buildStaleRunningReapUpdate
+  // zero explanation on the run poller itself. `buildStaleRunningReapUpdate`
   // (services/campaignRunGuards.js) now pushes a real errors[] row naming the
-  // stale window, so GET /api/ads/runs/:id can say why instead of a bare
-  // status flip.
-  const runs = await CampaignRun.updateMany(
-    buildStaleRunningFilter({ now: reapNow, staleMin: REAP_STALE_MIN }),
-    buildStaleRunningReapUpdate(REAP_STALE_MIN)
-  );
+  // stale window — GET /api/ads/runs/:id can say why instead of a bare status
+  // flip. It is called from INSIDE `buildRunReconciliationUpdate` below, not
+  // directly here — see that function's header in campaignRunGuards.js for
+  // why a blind write must never itself guess at succeeded/failed/skipped.
+  //
+  // RECONCILE FROM AD TRUTH FIRST — do not blindly stamp 'failed'.
+  //
+  // A stale `updatedAt` on the CampaignRun row means "the process holding
+  // this run's runRenderLoop went quiet", NOT "the work did not happen".
+  // Two other paths — titlingResumeService, bootRecoveryService — can drive
+  // an Ad all the way to its terminal `draft`+renderUrl shape without ever
+  // touching this CampaignRun (no counter $inc, no heartbeat, no `done`
+  // write: that write lives ONLY at the end of runRenderLoop's own
+  // in-memory Promise.all, routes/ads.js). So a run whose original process
+  // died can have every one of its claimed Ads already delivered by the time
+  // this sweep looks at it — measured in production, run_1787263897396_ef1fcb32:
+  // 9/9 Ads drafted with a real renderUrl, CampaignRun left 'running' until
+  // the operator gave up and cancelled what looked like a permanent spinner.
+  //
+  // The reverse gap is the same class: blindly stamping 'failed' here with
+  // no counter update is what produced the sibling shape (status:'failed',
+  // succeeded:18 stale) while all 39 Ads already carried a renderUrl — the
+  // run object disagreeing with reality in the OTHER direction.
+  //
+  // So: find() the stale candidates, then decide EACH one from its real
+  // claimed Ads (services/campaignRunGuards.js classifyRunAdOutcome) —
+  //   · a receipt-holding Ad still 'rendering' (deliberately NOT requeued by
+  //     the Ad-sweep above, so it can finish for free) means real, paid-for
+  //     work is still outstanding — leave status:'running' untouched; the
+  //     next tick (REAP_INTERVAL_MIN later) re-checks. Often this is a run
+  //     simply waiting behind a sibling run's share of the global
+  //     VEO_CONCURRENCY/REMOTION_QUEUE_CONCURRENCY pools, not stalled.
+  //   · every claimed Ad settled, none lost → the run genuinely finished;
+  //     write 'done' with the REAL succeeded/failed counts.
+  //   · every claimed Ad settled, some reset to 'queued' by the Ad-sweep
+  //     above → genuinely abandoned work; write 'failed' (same reaper
+  //     explanation as before) but with real counts instead of stale zeros.
+  //
+  // One find() + per-row updateOne() rather than one blind updateMany():
+  // each candidate needs its own Ad-truth read before it can be judged. The
+  // candidate set is small by construction (buildActiveRunsFilter's own
+  // header: "in practice 0-2 rows" per campaign) and this sweep runs on a
+  // background cadence (REAP_INTERVAL_MIN), never on a request path.
+  const staleRunCandidates = await CampaignRun.find(
+    buildStaleRunningFilter({ now: reapNow, staleMin: REAP_STALE_MIN })
+  ).select('_id runId').lean();
+
+  let nRunsFailed = 0, nRunsReconciled = 0, nRunsDeferred = 0;
+  for (const candidate of staleRunCandidates) {
+    const claimedAds = await Ad.find({ campaignRunIds: candidate.runId }).select('status').lean();
+    const outcome = classifyRunAdOutcome(claimedAds);
+    if (!outcome.isSettled) {
+      nRunsDeferred++;
+      continue;
+    }
+    const update = buildRunReconciliationUpdate(outcome, { staleMin: REAP_STALE_MIN, now: new Date(reapNow) });
+    // Re-checks status:'running' at write time — the same CAS discipline as
+    // buildRunningFlipFilter/buildTerminalDoneFilter elsewhere in this
+    // module: this run's own loop (or an earlier tick) may have already
+    // resolved it between the find() above and this write.
+    const res = await CampaignRun.updateOne({ _id: candidate._id, status: 'running' }, update)
+      .catch(() => ({ modifiedCount: 0 }));
+    if (!(res.modifiedCount ?? res.nModified ?? 0)) continue;
+    if (outcome.needsRetry) nRunsFailed++; else nRunsReconciled++;
+  }
+  if (nRunsReconciled > 0) {
+    console.log(
+      `✅ reconciled ${nRunsReconciled} CampaignRun(running) → done from real Ad truth ` +
+      `(every claimed ad had already settled; the process that owned the render loop ` +
+      `never got to write its own done stamp)`
+    );
+  }
+  if (nRunsDeferred > 0) {
+    console.log(
+      `⏳ left ${nRunsDeferred} stale-looking CampaignRun(running) alone — ` +
+      `receipt-holding ad(s) still genuinely rendering, not abandoned`
+    );
+  }
+  const runs = { modifiedCount: nRunsFailed };
 
   // CampaignRun stuck in 'preparing' → mark 'failed'. Distinct from the sweep
   // above: this covers a run that died BEFORE it ever reached 'running' — the
