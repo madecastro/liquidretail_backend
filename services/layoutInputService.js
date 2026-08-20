@@ -71,6 +71,7 @@ const registry               = require('./templateRegistry');
 const { hydrateMatch }       = require('./productMatchHydration');
 const { resolveDeriveProductPair } = require('./ratingPairAtomic');
 const { computeSlotBudgets } = require('./slotBudget');
+const { filterUnearnedBadges } = require('./badgeClaims');
 const { displayNormalizeTitle } = require('../utils/titleNormalize');
 const { extractSnippet, PROOF_LINE_MAX_CHARS, usableProofCommentsOrNone } = require('./quoteSnippetService');
 // Video-headline SELECTION for fallbackDerivation — reuses an EXISTING
@@ -1225,7 +1226,13 @@ function buildDerivationPrompt(ctx, template, aspectRatio, options) {
     } else {
       lines.push(`- "subheadline" ≤ 15 words, expands the brand promise. "eyebrow" ≤ 3 words (e.g. brand category or audience). "highlight_text" ≤ 5 words.`);
     }
-    lines.push(`- DO NOT emit "short_benefits" or product "badges" — there is no specific product. Use brand-level proof badges instead (e.g. "Trusted by anglers", "Family-owned since 2003", "${brand?.tone?.[0] || 'Premium'} quality").`);
+    // Same defect class as the product badges line below: the examples here
+    // used to include "Family-owned since 2003", which hands the model a
+    // founding YEAR. Nothing in this prompt supplies a real one, so the
+    // model could only fabricate it — a specific, checkable, false factual
+    // claim about the brand. Replaced with shapes that reference only facts
+    // the prompt already lists.
+    lines.push(`- DO NOT emit "short_benefits" or product "badges" — there is no specific product. Use brand-level proof badges instead, each 1–3 words, drawn only from facts already listed above (a Voice word, the Category, the audience those imply). Do NOT state a date, a founding year, a customer count, an award or a rank: none of those are given to you, so any figure would be invented. A claim about sales, popularity, awards, editorial selection or rank is FORBIDDEN — this catalog holds no such field, and any such badge is dropped downstream, so emitting one just wastes a slot.`);
   } else {
     if (useSplitHeadline) {
       const hb = slotBudgets.headline;
@@ -1244,7 +1251,25 @@ function buildDerivationPrompt(ctx, template, aspectRatio, options) {
       lines.push(`- "subheadline" ≤ 15 words. "eyebrow" ≤ 3 words. "highlight_text" ≤ 5 words.`);
     }
     lines.push(`- "short_benefits" 3–5 items, each ≤ 6 words, concrete buyer benefits (not specs).`);
-    lines.push(`- "badges" 2–4 items, each 1–3 words. Examples supported by data: "4.7★ rated" if rating ≥ 4.5; "1k+ reviews" if reviewCount ≥ 1000; "Top rated", "Editor's pick", "Best seller". Prefer real signal over filler.`);
+    // BADGES — a HARD requirement, not a preference (2026-08-19).
+    //
+    // This line used to end "Prefer real signal over filler" and then hand
+    // the model three superlatives to copy: "Top rated", "Editor's pick",
+    // "Best seller". A soft preference plus a literal example is how the
+    // CASING defect below happened too — the model was not inventing the
+    // phrase, it was reading it off the page. Production scan of 1,345
+    // artifacts with non-empty badges: 949 carried an unearned standing
+    // claim, 676 of those with rating AND reviewCount both null.
+    //
+    // PR #138 removed the hardcoded "Bestseller" cascade literal for
+    // exactly this reason; this prompt was the other door to the same slot.
+    // The examples are gone rather than reworded, and the rule that fills
+    // the vacuum is stated as a prohibition, because badges are dropped
+    // downstream by services/badgeClaims.js when the data does not back
+    // them — so a superlative here does not print, it just wastes a slot.
+    lines.push(`- "badges" 2–4 items, each 1–3 words. HARD requirement, not a preference: a standing claim is allowed ONLY when the PRODUCT data above actually carries the number that claim asserts.`);
+    lines.push(`    Conditional shapes (do not copy these words — fill them from THIS product's data): a rating badge only when a numeric rating of 4.5 or above is present (the score plus a star glyph, never a superlative); a review-volume badge only when reviewCount meets a published threshold (the count plus the word reviews).`);
+    lines.push(`    A claim about sales, popularity, awards, editorial selection or rank is FORBIDDEN — this catalog holds no such field, and any such badge is dropped downstream, so emitting one just wastes a slot. Fill remaining slots from concrete attribute, material, or use facts in THIS product's own copy. If nothing is data-backed and nothing is grounded in the copy, emit an empty array.`);
   }
 
   // CASING — stated once, explicitly, because nothing else in this prompt
@@ -2779,8 +2804,39 @@ async function assembleInput(ctx, template, aspectRatio, options, derivation, pr
   // rating/review defaults to ensure badge_row / engagement_row zones have
   // at least ~2 items. Dedupe case-insensitively so we don't repeat a
   // "Top rated" the LLM already wrote.
-  const llmBadges = Array.isArray(derivation.badges) ? derivation.badges.filter(Boolean) : [];
-  const defaultBadges = defaultBadgesFromSignal(details);
+  //
+  // FILTERED BEFORE THE MERGE (2026-08-19). LLM badges used to land on the
+  // artifact raw, and production measured 949 of 1,345 non-empty artifacts
+  // carrying an unearned standing claim — 676 with rating AND reviewCount
+  // both null. Artifact 6a862136b31cf7b2214a2945 printed "Top rated" /
+  // "Best seller" for CatalogProduct 6a7b72f4935d0a8e81905544, which has
+  // neither. That re-opened PR #138, which removed the hardcoded
+  // "Bestseller" cascade literal on the same principle: a badge comes from
+  // real data, earned per product, or it is absent.
+  //
+  // Filtering happens BEFORE the merge so an invented superlative cannot
+  // occupy element 0 — the only element metaCascadeConfig's badgeText
+  // cascade actually reads, and therefore the one Remotion prints.
+  // defaultBadgesFromSignal is already signal-gated, so running it through
+  // the same filter is a no-op today; it is belt-and-braces so a future
+  // edit that breaks that gating cannot ship an unearned default.
+  const badgeSignals = { rating: details.rating, reviewCount: details.reviewCount };
+  const llmFiltered = filterUnearnedBadges(
+    Array.isArray(derivation.badges) ? derivation.badges : [],
+    badgeSignals
+  );
+  const defaultFiltered = filterUnearnedBadges(
+    defaultBadgesFromSignal(details),
+    badgeSignals
+  );
+  const droppedBadges = [...llmFiltered.dropped, ...defaultFiltered.dropped];
+  if (droppedBadges.length) {
+    const who = match?.catalogProductId || details.productId || 'unknown';
+    const summary = droppedBadges.map(d => `${JSON.stringify(d.text)} (${d.reason})`).join('; ');
+    console.warn(`   ⚠️  dropped unearned badge(s) on product ${who}: ${summary}`);
+  }
+  const llmBadges = llmFiltered.kept;
+  const defaultBadges = defaultFiltered.kept;
   const seenBadges = new Set(llmBadges.map(b => String(b).toLowerCase()));
   const derivedBadges = [...llmBadges];
   for (const b of defaultBadges) {
@@ -3062,7 +3118,13 @@ async function assembleInput(ctx, template, aspectRatio, options, derivation, pr
       // rights we certainly cannot show their name.
       show_creator_handle: !!media.metadata?.creatorHandle && rightsApproved,
       show_engagement:     !!media.platformStats && rightsApproved,
-      show_badges:         (derivation.badges?.length || 0) > 0,
+      // Keys off the array actually WRITTEN (derivedBadges), not the raw
+      // LLM array. Two bugs, one fix: a filtered-empty result would
+      // otherwise still claim the zone is shown while product.badges is
+      // absent, and the inverse was already broken before the filter
+      // existed — rating 4.8 with no LLM badges produced
+      // badges:['Top rated'] alongside show_badges:false.
+      show_badges:         derivedBadges.length > 0,
       show_cta:            true
     },
 
@@ -4014,6 +4076,12 @@ module.exports = {
   // numbers. A revert-proof pass showed nothing failed when the marker was
   // removed, which is why it is exported now.
   deriveSocialProofNumbers,
+  // Exported so scripts/verifyNoUnearnedClaims.js section E can pin that
+  // every badge this function emits survives filterUnearnedBadges with the
+  // same signals. The repo's own earned badges must never be dropped by its
+  // own filter, and a copy of this function in the harness would let the two
+  // drift — the same reasoning as deriveSocialProofNumbers above.
+  defaultBadgesFromSignal,
   // Quote-selection internals, exported so scripts/verifyQuoteGate.js can pin
   // the 4.5-star floor and the product-review lookup. Both have already been
   // broken once by a merge with nothing to catch it.

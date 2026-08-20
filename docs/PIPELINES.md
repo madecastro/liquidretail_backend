@@ -134,6 +134,88 @@ existing rows — see `session.md` for the residual.
 
 ---
 
+### Unearned badge claims — the LLM door (2026-08-19)
+
+PR #138 removed a hardcoded `{ type:'literal', value:'Bestseller' }` from
+`metaCascadeConfig.js`'s `badgeText` cascade because it printed a commercial
+superlative precisely when the product had no evidence of being one, and left
+`scripts/verifyNoUnearnedClaims.js` to guard that door. **That harness scanned
+cascade LITERALS only, so it could not see the other door into the same slot:
+the badges array an LLM writes.**
+
+`layoutInputService.js`'s derivation prompt asked Gemini for 2–4 badges with a
+*soft* preference ("Prefer real signal over filler") and handed it three
+superlatives as examples — `"Top rated"`, `"Editor's pick"`, `"Best seller"`.
+As with the `"MEET THE"` defect in `scripts/verifyCopyCasing.js`, the model was
+not inventing the phrase; it was copying it off the page.
+
+**Measured in production (1,345 LayoutInputArtifacts with non-empty badges):**
+
+| | count |
+|---|---|
+| artifacts with ≥1 unearned standing claim | 949 |
+| …of those, with `rating` **and** `reviewCount` both null | **676** |
+| `"top rated"` / `"best seller"` / `"customer favorite"` occurrences | 741 / 438 / 143 |
+| fabricated *numbers* (`"4.7★ rated"`, `"4.8★ rated"`, `"4.6★ rated"`) | 87 |
+
+`badgeText` binds `input.product.badges[0]` and `deliveryLine` binds
+`badges[1]`, so element 0 is what Remotion burns in and element 1 can print a
+superlative as a *shipping* promise.
+
+**There is no sales data in this model.** `CatalogProduct` has no rank,
+units-sold, bestseller or award field — its `sellers` field is aggregated
+Google-Shopping *merchant* listings (which retailers stock the item), not a
+rank. So `"Best seller"`, `"#1"`, `"Award-winning"`, `"As seen on"`,
+`"Editor's pick"` and `"<X> favorite"` can **never** be earned here and are
+dropped unconditionally, no matter how good the rating is. Rating and
+review-count claims are gated on a real number instead of banned, at the same
+4.5 / 100 / 1k / 10k thresholds `defaultBadgesFromSignal` already used — and a
+*numeric* claim may not overstate the real rating (`"4.9★ rated"` against a
+4.6 is dropped; `"4.5★ rated"` against a 4.6 is kept).
+
+**Three layers, one lexicon** (`services/badgeClaims.js` — both gates import
+it; a second copy is exactly how this door stayed open while `C2` stayed green):
+
+1. **Prompt** — the superlative examples are deleted rather than reworded, and
+   the replacement states a prohibition, not a preference. The brand-mode line
+   lost `"Family-owned since 2003"` for the same reason: nothing in the prompt
+   supplies a real founding year, so the model could only invent one.
+2. **Producer gate** — `assembleInput` filters LLM badges *before* the merge,
+   so an invented superlative cannot occupy element 0. `defaultBadgesFromSignal`
+   output is filtered too (a no-op today, belt-and-braces for later edits).
+   `show_badges` now keys off the array actually written, fixing a pre-existing
+   inversion where rating 4.8 with no LLM badges produced
+   `badges:['Top rated']` alongside `show_badges:false`.
+3. **Read gate** — `gateLayoutInputBadges` in `brandScriptExecutor.js`, a
+   sibling of `gateLayoutInputQuotes`, for the **676 artifacts already in
+   Mongo**. A `schemaVersion` bump would not help: `buildMetaForAd`
+   deliberately serves a stale artifact of any version ("Schema freshness is a
+   PREFERENCE, not a filter"). The gate is a local clone, never mutates the
+   document, never throws, fails closed, and gates on the artifact's own
+   `social_proof.rating_value` / `review_count` so the badge and the proof bar
+   cannot disagree.
+
+Attribute and material badges (`"Sustainably made"`, `"100% Recycled"`,
+`"Water resistant"`, `"UPF 50+ protection"`, `"4-way stretch"`) are **not**
+this class and survive — this is not a badge ban, and the harness asserts that
+too so nobody "fixes" it by dropping everything. Adjudicating attribute claims
+against the product description is a separate, open problem.
+
+Pinned by `scripts/verifyNoUnearnedClaims.js` (591 checks, up from 6), revert-
+proven on ten mutations: re-added cascade literal, softened filter, loosened
+separator/apostrophe classes, unearned default badge, restored prompt example,
+restored founding year, reclassified `"5-Star Quality"`, reverted
+`show_badges`, unwired the producer filter, moved the filter after the merge,
+plus four on the read gate (no-op stub, deleted call site, in-place mutation,
+locally re-implemented lexicon).
+
+**Residual:** this does not rewrite the 676 stored artifacts — the read gate
+neutralises them at titling rather than cleaning them. A backfill would be
+needed to make the stored data itself honest (previews served straight from
+`routes/layout.js` still show the raw array). See `session.md`.
+
+---
+
 ## 2. Post-sync trio
 
 Historically three jobs fired at the end of a catalog sync (`services/genericCatalogIngestService.js` ~258–324; mirrored in Shopify public / Apify / `catalogSyncService`). **Current behavior:**

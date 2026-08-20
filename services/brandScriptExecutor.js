@@ -688,6 +688,152 @@ function gateLayoutInputQuotes(layoutInput, scope = {}) {
   }
 }
 
+// Defence in depth for video chrome — the read-time twin of
+// layoutInputService.assembleInput's producer-side filterUnearnedBadges.
+// The producer withholds unearned badges at assembly, so this should
+// rarely fire on a freshly derived artifact. It exists because a
+// LayoutInputArtifact cached BEFORE that producer gate landed still
+// carries LLM-written superlatives ("Top rated", "Best seller") with no
+// backing rating/reviewCount, and the cascade engine is path-blind:
+// badgeText binds input.product.badges[0] and never sees provenance.
+// Without this re-check, Remotion burns that claim into delivered video.
+//
+// A schemaVersion bump is NOT a remedy here. buildMetaForAd treats schema
+// freshness as a PREFERENCE, not a filter (see the comment above its
+// lookup), so stale artifacts are served deliberately. A read-time gate
+// is the only code-only fix for what is already in Mongo.
+//
+// Evidence (production scan, 2026-08-19): 1,345 artifacts with non-empty
+// badges; 949 carry at least one unearned standing claim; 676 of those
+// have rating null AND reviewCount null. Concrete case: artifact
+// 6a862136b31cf7b2214a2945 / product 6a7b72f4935d0a8e81905544 carries
+// ["Top rated","Best seller","Sustainably made"] with no numbers behind
+// either superlative.
+//
+// Lineage: PR #138 (bf0fd397) removed a hardcoded 'Bestseller' literal
+// from the badgeText cascade as a false-advertising claim. This closes
+// the same door against badges an LLM already wrote onto an artifact.
+//
+// Local clone only — never mutates the artifact document. Dropping every
+// badge degrades the slot to absent; this must never throw (Atlas video
+// is already billed by the time titling runs). ONE gate
+// (badgeClaims.filterUnearnedBadges); do not invent a second allowlist
+// that can drift from the producer — the same rule gateLayoutInputQuotes
+// states for quoteProvenance.toPrintableCustomerQuote.
+//
+// Pure + exported so the offline harness can drive the real production
+// path without Mongo. Call site in buildMetaForAd is the live wire.
+function gateLayoutInputBadges(layoutInput) {
+  // Reseat is defined outside the try so the catch can withhold through
+  // the same path. It is itself total: every branch guards its input.
+  const reseat = (kept) => {
+    if (!layoutInput || !layoutInput.input || !layoutInput.input.product) return layoutInput;
+    const product = { ...layoutInput.input.product };
+    if (kept.length) {
+      product.badges = kept;
+    } else {
+      // Absent key, not []. assembleInput writes
+      // badges: limitArray(derivedBadges, 4), limitArray returns
+      // undefined for an empty array, and stripUndefinedDeep then drops
+      // the key — so an absent key is the established "no badge" shape
+      // on a persisted artifact, and badgeText has no literal fallback
+      // to fire into. Matching that shape keeps the two paths identical.
+      delete product.badges;
+    }
+    const input = { ...layoutInput.input, product };
+
+    const sp = layoutInput.input.social_proof;
+    if (sp && typeof sp === 'object' && 'proof_badges' in sp) {
+      const social_proof = { ...sp };
+      if (kept.length) social_proof.proof_badges = kept;
+      else delete social_proof.proof_badges;
+      input.social_proof = social_proof;
+    }
+
+    // Never turn a zone ON here — only off. A surviving badge keeps
+    // whatever the producer decided; an empty result must not leave the
+    // renderer told to paint a zone with nothing in it.
+    if (!kept.length && layoutInput.input.layout_options) {
+      input.layout_options = { ...layoutInput.input.layout_options, show_badges: false };
+    }
+    return { ...layoutInput, input };
+  };
+
+  try {
+    const badges = layoutInput && layoutInput.input && layoutInput.input.product
+      ? layoutInput.input.product.badges
+      : undefined;
+    // Absent or already empty: nothing to decide, return the same object
+    // (same early-out shape as gateLayoutInputQuotes' `if (!pq)`).
+    if (badges === undefined || badges === null) return layoutInput;
+    if (Array.isArray(badges) && badges.length === 0) return layoutInput;
+    // Present but NOT an array is malformed. Withhold rather than pass
+    // through: metaCascadeResolver reads the path `badges[0]`, and an
+    // array-like ({0:'Best seller'}) would resolve to that claim. Fail
+    // closed — this function's whole purpose is that an unvalidated
+    // claim never prints.
+    if (!Array.isArray(badges)) {
+      console.warn('🔒 brandScript: product.badges is not an array — withholding badges');
+      return reseat([]);
+    }
+
+    // Gate against THIS artifact's own social_proof numbers — the very
+    // rating_value / review_count the same ad prints in its proof bar —
+    // so the badge and the proof bar can never disagree, and no extra
+    // CatalogProduct read is needed at titling time. When both are
+    // absent, every rating/count-gated badge drops, because
+    // filterUnearnedBadges requires typeof === 'number'.
+    //
+    // Caveat: a pre-RATING_PAIR_ATOMIC artifact can carry a mixed pair
+    // (product rating beside a brand review count). We still gate on
+    // those numbers rather than refuse them: this function only ever
+    // REMOVES claims, so at worst a mixed pair keeps a count-gated badge
+    // a coherent pair would have dropped — strictly better than printing
+    // "Top rated" against no rating at all.
+    const proof = layoutInput.input.social_proof || {};
+    const signals = { rating: proof.rating_value, reviewCount: proof.review_count };
+    const { filterUnearnedBadges } = require('./badgeClaims');
+    // Filter the WHOLE array, not just element 0. badgeText binds [0],
+    // but deliveryLine binds input.product.badges[1] — dropping only the
+    // first would let "Best seller" reappear as a delivery promise.
+    const { kept, dropped } = filterUnearnedBadges(badges, signals);
+
+    // proof_badges is written from the same array by the producer, but a
+    // hand-edited or partially-migrated artifact could disagree. Check it
+    // independently so a clean product.badges cannot escort a dirty
+    // proof_badges through the identity early-out below.
+    const spBadges = proof.proof_badges;
+    const spDirty = Array.isArray(spBadges)
+      && filterUnearnedBadges(spBadges, signals).dropped.length > 0;
+
+    if (!dropped.length && !spDirty) return layoutInput;
+
+    if (dropped.length) {
+      const summary = dropped.map(d => `${JSON.stringify(d.text)} (${d.reason})`).join('; ');
+      const ratingLog  = typeof proof.rating_value === 'number' ? proof.rating_value : 'none';
+      const reviewsLog = typeof proof.review_count === 'number' ? proof.review_count : 'none';
+      console.log(
+        `🔒 brandScript: dropped unearned badge(s) ${summary} ` +
+        `(rating=${ratingLog} reviews=${reviewsLog}) — titling with ` +
+        `${kept.length ? JSON.stringify(kept) : 'no badge'}`
+      );
+    }
+    return reseat(kept);
+  } catch (err) {
+    // Prefer a thinner ad over a crash after a billed Omni submit, and
+    // over shipping a badge we could not validate. If reseat itself is
+    // what failed, return the artifact minus the badge paths by hand
+    // rather than letting the throw escape into titling.
+    console.warn(`🔒 brandScript: badge gate error (${err.message}) — withholding`);
+    try {
+      return reseat([]);
+    } catch (inner) {
+      console.warn(`🔒 brandScript: badge gate reseat failed (${inner.message}) — returning artifact unchanged`);
+      return layoutInput;
+    }
+  }
+}
+
 // Merchandising qualifiers that describe WHO a product is for, not WHAT it
 // is — the ad already carries the brand's own audience elsewhere, so on the
 // close-phase product-name slot they are pure overhead. Plural/possessive
@@ -916,9 +1062,14 @@ async function buildMetaForAd(ad, brand, opts = {}) {
     // badges, benefits, productDescription. Dropping a stale artifact
     // outright would thin the canonical close phase AND delete the very
     // stars this change exists to restore.
-    // It buys nothing either: the stale artifact's only unsafe field is the
-    // unstamped primary_quote, and gateLayoutInputQuotes (below) already
-    // withholds exactly that — 161 checks in verifyQuoteProvenance.js pin it.
+    // It buys nothing either: the stale artifact's unsafe fields are the
+    // unstamped primary_quote AND the LLM-written badges array, and the two
+    // read-time gates below (gateLayoutInputQuotes / gateLayoutInputBadges)
+    // withhold exactly those — 161 checks in verifyQuoteProvenance.js pin
+    // the first, section H of verifyNoUnearnedClaims.js pins the second.
+    // (This sentence used to say primary_quote was the ONLY unsafe field.
+    // That was true until the badges array was found carrying unearned
+    // superlatives on 676 artifacts with no rating or review data at all.)
     // So: prefer a current-schema artifact, fall back to the newest stale one,
     // and log which we served so a thin proof beat is diagnosable from Render
     // logs without a DB query.
@@ -1066,6 +1217,10 @@ async function buildMetaForAd(ad, brand, opts = {}) {
     extraText: layoutInput?.input?.product?.name || null,
     media: scopeMedia
   });
+  // The stale-artifact BADGE door (see gateLayoutInputBadges). Runs after
+  // the quote gate so both compose on the one local clone; neither
+  // mutates the stored document.
+  layoutInput = gateLayoutInputBadges(layoutInput);
 
   // Catalog media list — the productOnlyImageUrl cascade reads from
   // the pre-picked `catalogMediaProductOnly` context doc (first Media
@@ -2020,6 +2175,7 @@ module.exports = {
   },
   cleanProductNameForDisplay,
   gateLayoutInputQuotes,
+  gateLayoutInputBadges,
   previewBrandScript,
   previewBrandScriptAsVideo,
   resolveBrandRenderer,
