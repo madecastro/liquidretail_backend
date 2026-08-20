@@ -748,14 +748,16 @@ schema use only, confirmed by their own comments; zero scripts require
 `fs.mkdtempSync`, concurrent execution is safe today" claim that used to be
 here was wrong** — three scripts (`verifyVideoCostReconcile.js`,
 `verifyVideoTimeoutReconcile.js`, `verifyQuoteRotation.js`) instead
-`fs.writeFileSync` a mutated copy of a REAL shared repo file in place to
+`fs.writeFileSync`d a mutated copy of a REAL shared repo file in place to
 revert-prove a static check, not a private per-process tmp file; see the
-"Fresh evidence" subsection below for the reproduced failure and fix.
-`UNSAFE_FOR_PARALLEL` in the runner is the auditable escape hatch, and as of
-this writing it is not empty — five scripts are in it, each added after a
-reproduced, root-caused failure (three for the file-mutation race just
-described, two for a real-timer race the same shape as the
-`verifyDirectorFallbackChain.js` C4 flake below).
+"Fresh evidence" subsection below for the reproduced failure **and the fix now
+landed for it** (all three now mutate a private `os.tmpdir()` copy — see
+"The file-mutation defect: fixed" below). `UNSAFE_FOR_PARALLEL` in the runner
+is the auditable escape hatch, and as of this writing it holds **two**
+scripts, both for the unrelated real-timer race described further down
+(`verifyCampaignRunHeartbeat.js`, `verifyConcurrencyConfig.js`) — the three
+file-mutation scripts no longer need it, because they no longer touch a
+shared file at all.
 
 Wired as `npm test` / `npm run test:affected`.
 
@@ -962,14 +964,17 @@ number pasted over the caveat.** An earlier version of this section flagged
 found something more specific and fixed it, rather than leaving that audit
 open indefinitely:
 
-- **Real parallel-unsafety, reproduced and root-caused**, in five *other*
+- **Real parallel-unsafety, reproduced and root-caused**, in three *other*
   scripts — `verifyVideoCostReconcile.js`, `verifyVideoTimeoutReconcile.js`,
-  and `verifyQuoteRotation.js` each `fs.writeFileSync` a mutated copy of a
+  and `verifyQuoteRotation.js` each `fs.writeFileSync`d a mutated copy of a
   REAL repo file **in place** (`services/atlasVideoService.js` for the first
-  two; `services/productReviewsScrapeService.js` and
-  `models/CatalogProduct.js` for the third) to check that a static scan would
-  catch the mutation, then restore it — on the shared checked-out file, not a
-  private tmp copy, contradicting this file's own prior parallel-safety claim
+  two; `services/productReviewsScrapeService.js`, `models/CatalogProduct.js`,
+  `services/quoteRotationService.js`, and `services/layoutInputService.js`
+  for the third — the last two were missed by the original audit that wrote
+  this bullet, found only by re-reading `verifyQuoteRotation.js`'s `H4`/`H8`/
+  `H9` call sites directly) to check that a static scan would catch the
+  mutation, then restore it — on the shared checked-out file, not a private
+  tmp copy, contradicting this file's own prior parallel-safety claim
   ("every script that writes a temp file does it through `fs.mkdtempSync`,
   unique per process"). Two scripts mutate the *same* file, and
   `models/CatalogProduct.js` is required by a large fraction of the suite:
@@ -984,8 +989,8 @@ open indefinitely:
   `setInterval(10ms)` ticker asserted to fire `>=5` times across a real
   `sleep(120)`; two real ~80ms `setTimeout`s asserted to overlap inside a
   140ms wall-clock window) that an oversubscribed scheduler cannot guarantee.
-  All five are now in `UNSAFE_FOR_PARALLEL` (below) — genuine, reproducible
-  parallel-unsafety, not a guess pattern-matched by filename.
+  All five were quarantined in `UNSAFE_FOR_PARALLEL` (below) — genuine,
+  reproducible parallel-unsafety, not a guess pattern-matched by filename.
 - **`verifyRenderFailureRecord.js` and `verifyVideoRetryOnUnbilledFailure.js`
   themselves did NOT reproduce** across further testing, including a run at
   `--concurrency=16` under this machine's most extreme observed load to date
@@ -997,31 +1002,109 @@ open indefinitely:
   reproduced failure, would be exactly the "guess instead of evidence" this
   section exists to stop.
 
+### The file-mutation defect: fixed, and why quarantine alone was not enough
+
+Quarantining the three file-mutation scripts in `UNSAFE_FOR_PARALLEL` stopped
+them from racing *each other or the pool* inside one `runVerifySuite.js`
+invocation, but it never fixed the underlying defect: they still mutated a
+real, shared repo file in place, just one at a time instead of concurrently.
+That is not sufficient, for a reason unrelated to concurrency at all —
+`runVerifySuite.js`'s `runOne()` sends `SIGTERM` to a script that exceeds its
+timeout, then `SIGKILL` after a grace period if it hasn't exited. No
+`verify*` script installs a `SIGTERM` handler, and this was checked directly
+rather than assumed: reproduced live on both Node 22.23.1 and 26.5.1, **with
+no handler installed, `SIGTERM`/`SIGINT` terminate the process without
+running any pending `finally` block.** So a runner timeout, a CI abort, or a
+plain Ctrl-C landing between the mutating write and the restoring write —
+whether inside the quarantine, run standalone as `node scripts/verifyFoo.js`,
+or inside a CI job that never goes through `runVerifySuite.js` at all — would
+leave the real file sitting mutated on disk. Quarantining serializes; it does
+not make the write-then-restore window atomic or interrupt-safe.
+
+**The actual fix**: all three scripts now mutate a private path under
+`os.tmpdir()` (named `${scriptName}-${basename}-${pid}-${Date.now()}`,
+deleted in a `finally` best-effort `unlinkSync`) and never write to the real
+file at all — the same pattern `verifyRatingPairAtomic.js` and
+`verifySeedClass.js` already used, extended to these three. The real file is
+read once, never written.
+
+**Proven, not asserted — reproduced the corruption before fixing it, then
+proved the fix under the identical kill.** Reconstructed the pre-fix
+`verifyVideoCostReconcile.js` from git history, added an artificial delay
+between the mutating write and the restore so an external `kill -TERM`
+could land reliably inside that window (the real window is a few
+microseconds — a delay is a fair way to demonstrate a mechanism that's real
+regardless of window size, not a change to what's being tested), installed
+it at the real script path, ran it, and sent `SIGTERM` ~2s in:
+`git status`/`git diff` afterward showed `services/atlasVideoService.js`
+**modified on disk** — the exact `await` mutation the script's own `H1`
+check injects, left in place on the real, shared, tracked file. Restored the
+file, repeated the identical delay-and-kill treatment against the *fixed*
+script: `git status` on `services/atlasVideoService.js` came back **clean**
+throughout and after — the only artifact left behind was one orphaned file
+under the OS temp directory (harmless; outside the repo, eventually reaped by
+the OS). This is a **reproducible mechanism**, demonstrated on demand — not a
+report of a specific incident where it actually happened in the wild; no
+such incident is evidenced in `session.d/`, this doc, or git history, and
+none is claimed here.
+
+Each of the three was also **revert-proven against the real production code
+it pins**, not just its own internal mutate-and-restore self-test: temporarily
+reintroducing the `await` regression in `services/atlasVideoService.js` fails
+`verifyVideoCostReconcile.js`'s `E1` (39/40); dropping `campaignRunId` from
+the real charge-point record fails `verifyVideoTimeoutReconcile.js`'s `E2`
+(25/27); restoring the stale `|| 10` cap in the real
+`services/productReviewsScrapeService.js`, deleting `recentQuoteKeys` from
+the real `models/CatalogProduct.js` schema, and dropping the
+`secondary_quotes` slice from the real `services/layoutInputService.js` each
+fail the corresponding `verifyQuoteRotation.js` check (`A1`/`A2`, `G1`, `A7`)
+— each restored cleanly afterward back to the full pass count. Switching to a
+temp copy did not downgrade any of these three from a real check to a no-op.
+
+**Quarantine reassessed, not blanket-lifted.** With the file-mutation defect
+fixed, `verifyVideoCostReconcile.js`, `verifyVideoTimeoutReconcile.js`, and
+`verifyQuoteRotation.js` no longer touch a shared file and were removed from
+`UNSAFE_FOR_PARALLEL` — confirmed clean across 3 full-suite runs at
+`--concurrency=16` (174/174 each time) plus 5 repeated runs targeting exactly
+the previously-racy pairing (`verifyVideoCostReconcile.js` +
+`verifyVideoTimeoutReconcile.js`, both mutators of
+`services/atlasVideoService.js`, run together explicitly). `
+verifyCampaignRunHeartbeat.js` and `verifyConcurrencyConfig.js` stay
+quarantined — their root cause (a real-timer margin too tight for an
+oversubscribed scheduler) is unrelated to file mutation and this change did
+not touch their timing internals, so lifting their quarantine would be the
+same "guess instead of evidence" this section exists to stop.
+
 **What a clean-number claim can and can't say, precisely:** at
-`--concurrency=8` or `=16` with the five quarantined scripts serialized after
-the pool, this suite is deterministic *by design* — nothing left in it races
-a real timer against another process, and nothing left mutates a file another
-process might read. What it cannot promise is that *every* verify script,
-including ones nobody has looked at yet, has zero timing sensitivity — host
-contention is unbounded (this session alone saw load average swing from ~50
-to ~980 on the same box), and a script with its own undiscovered
-tight-margin timer would still be able to flake under enough of it. That is
-a standing, honest limit on "zero flakes," not a defect in this fix: the
-five scripts found so far were found by looking, not by assumption, and the
-same standard applies to whatever surfaces next.
+`--concurrency=8` or `=16` with the two remaining quarantined scripts
+serialized after the pool, this suite is deterministic *by design* — nothing
+left in it races a real timer against another process, and nothing left
+mutates a file another process might read. What it cannot promise is that
+*every* verify script, including ones nobody has looked at yet, has zero
+timing sensitivity — host contention is unbounded (this session alone saw
+load average swing from ~50 to ~980 on the same box), and a script with its
+own undiscovered tight-margin timer would still be able to flake under
+enough of it. That is a standing, honest limit on "zero flakes," not a
+defect in this fix: the scripts found so far were found by looking, not by
+assumption, and the same standard applies to whatever surfaces next. (One
+such flake surfaced while verifying this section: `verifyAgentRegistry.js`
+failed once inside a heavily-loaded pool run and passed clean both standalone
+and on an immediate rerun — logged here as an observation, not chased further
+or quarantined, since it did not reproduce.)
 
 **The policy, corrected:** there is no sanctioned "re-run it and see." A
 runner failure is a real failure until proven otherwise by root-causing it —
-the way C4 and the five quarantined scripts were here — never by a clean
-rerun, which proves nothing about a race and everything about the absence of
+the way C4 and the quarantined scripts were here — never by a clean rerun,
+which proves nothing about a race and everything about the absence of
 contention. The one honest quarantine mechanism is `UNSAFE_FOR_PARALLEL` in
 `runVerifySuite.js`: a script whose real-time dependence genuinely cannot be
 made deterministic gets listed there and runs alone, serially, after the
 parallel pool drains — a stated, auditable exception, not a shrug. It holds
-five scripts today (`verifyVideoCostReconcile.js`,
-`verifyVideoTimeoutReconcile.js`, `verifyQuoteRotation.js`,
-`verifyCampaignRunHeartbeat.js`, `verifyConcurrencyConfig.js`) — each added
-after a reproduced, root-caused failure, never on suspicion.
+**two** scripts today (`verifyCampaignRunHeartbeat.js`,
+`verifyConcurrencyConfig.js`) — each added after a reproduced, root-caused
+failure, never on suspicion. The three file-mutation scripts were removed
+once their actual defect (writing through the real file at all, not just
+racing on it) was fixed rather than merely serialized around.
 
 ---
 

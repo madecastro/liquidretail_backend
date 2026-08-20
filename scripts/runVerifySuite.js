@@ -25,14 +25,22 @@
  * Exit code 0 iff every selected script exited 0. Composes with a pre-push
  * hook or CI the same way the old loop did.
  *
- * PARALLEL-SAFETY, audited 2026-08-19: no scripts/verify* script talks to a
- * live DB or network (the handful touching mongoose/axios do so only for
- * in-memory schema use, or say explicitly in their own comments that they
- * run with no MONGODB_URI), and every script that writes a temp file does
- * it through fs.mkdtempSync (unique per process). So running them
- * concurrently on one machine is safe today. UNSAFE_FOR_PARALLEL below is
- * the escape hatch if a future script breaks that assumption — anything
- * listed there runs alone, serially, after the parallel pool drains.
+ * PARALLEL-SAFETY, audited 2026-08-19, corrected 2026-08-19 (see below): no
+ * scripts/verify* script talks to a live DB or network (the handful touching
+ * mongoose/axios do so only for in-memory schema use, or say explicitly in
+ * their own comments that they run with no MONGODB_URI). "Every script that
+ * writes a temp file does it through fs.mkdtempSync, unique per process" was
+ * asserted here before and was FALSE for three scripts — they mutated a real
+ * shared repo file in place instead (see the file-mutation-race note below,
+ * now fixed). It is true again as stated more precisely: every script that
+ * writes a temp file now writes to a private path under os.tmpdir(), unique
+ * per process (either via fs.mkdtempSync or a `${name}-${pid}-${Date.now()}`
+ * suffixed filename) — never to a path any other verify script or the repo's
+ * own tracked source resolves to. UNSAFE_FOR_PARALLEL below is the escape
+ * hatch for a future script that breaks that assumption, or for a check with
+ * its own real-timer margin too tight for an oversubscribed scheduler —
+ * anything listed there runs alone, serially, after the parallel pool
+ * drains.
  *
  * --affected IS A DEV-SPEED HEURISTIC, NOT THE GATE. It selects a verify
  * script if (a) the script itself changed, or (b) the script's source text
@@ -84,25 +92,43 @@ const CORE_DIRS = new Set(['models', 'routes', 'services', 'middleware', 'config
 // sessions — load average ~40-70 on 10 cores). Two DISTINCT failure classes
 // were found, neither previously audited:
 //
-// (1) REAL FILE MUTATION RACE — verifyVideoCostReconcile.js,
-//     verifyVideoTimeoutReconcile.js, and verifyQuoteRotation.js each use a
-//     `withTempMutation`-shaped helper that `fs.writeFileSync`s a mutated
-//     copy of a REAL repo file IN PLACE (services/atlasVideoService.js for
-//     the first two; services/productReviewsScrapeService.js and
-//     models/CatalogProduct.js for the third), runs a check, then restores
-//     the original — all synchronously, but on the SHARED checked-out file,
-//     not a private tmp copy. This contradicts this file's own
-//     previously-stated parallel-safety audit ("every script that writes a
-//     temp file does it through fs.mkdtempSync, unique per process") — that
-//     claim was wrong for these three. Two different scripts mutate the
-//     SAME file (services/atlasVideoService.js), and models/CatalogProduct.js
-//     is required by a large fraction of the suite: any OTHER concurrently
-//     running process that reads or fresh-requires that file during the
-//     brief write-check-restore window can observe the MUTATED content and
-//     fail an unrelated, unmutated assertion — reproduced live: standalone
-//     `node scripts/verifyVideoTimeoutReconcile.js` was 5/5 green, but it
-//     failed intermittently inside the --concurrency=16 pool with "source
-//     text not found" errors on lines that are never actually missing.
+// (1) REAL FILE MUTATION RACE — FIXED 2026-08-19, no longer quarantined for
+//     this reason. verifyVideoCostReconcile.js, verifyVideoTimeoutReconcile.js,
+//     and verifyQuoteRotation.js each used a `withTempMutation`-shaped helper
+//     that `fs.writeFileSync`d a mutated copy of a REAL repo file IN PLACE
+//     (services/atlasVideoService.js for the first two;
+//     services/productReviewsScrapeService.js, models/CatalogProduct.js,
+//     services/quoteRotationService.js, and services/layoutInputService.js
+//     for the third — the latter two were not caught by the original audit),
+//     ran a check, then restored the original — all synchronously, but on
+//     the SHARED checked-out file, not a private tmp copy. Two different
+//     scripts mutated the SAME file (services/atlasVideoService.js), and
+//     models/CatalogProduct.js is required by a large fraction of the suite:
+//     any OTHER concurrently running process that read or fresh-required
+//     that file during the brief write-check-restore window could observe
+//     the MUTATED content and fail an unrelated, unmutated assertion —
+//     reproduced live: standalone `node scripts/verifyVideoTimeoutReconcile.js`
+//     was 5/5 green, but it failed intermittently inside the --concurrency=16
+//     pool with "source text not found" errors on lines that are never
+//     actually missing.
+//     Quarantining these three here was NOT a sufficient fix on its own: this
+//     runner's own timeout path (below) sends SIGTERM then, after a grace
+//     period, SIGKILL; no verify* script installs a SIGTERM handler, and
+//     reproduced directly on Node 22/26 — with no handler, SIGTERM/SIGKILL
+//     terminate the process WITHOUT running a pending `finally` block. So a
+//     timeout, a CI abort, or a Ctrl-C mid-mutation (even serialized, even
+//     run standalone outside this runner entirely) could still leave the
+//     real file sitting mutated on disk; `UNSAFE_FOR_PARALLEL` only ever
+//     serialized these three within one runVerifySuite.js invocation, never
+//     protected a direct `node scripts/verifyFoo.js` or a CI job. The actual
+//     fix: all three now mutate a private path under os.tmpdir()
+//     (`${name}-${basename}-${pid}-${Date.now()}`, matching the pattern
+//     verifyRatingPairAtomic.js/verifySeedClass.js already used) and never
+//     write to the real file at all — proven by running each mutator and
+//     SIGTERM'ing it mid-mutation: before the fix the real file was left
+//     dirty (`git status` showed a modified services/atlasVideoService.js);
+//     after, the real file stayed clean under the identical kill, with only
+//     an orphaned file under the OS tmp dir (harmless, outside the repo).
 // (2) REAL-TIMER RACE (the same shape as the verifyDirectorFallbackChain.js
 //     C4 flake, fixed below in this same change) — verifyCampaignRunHeartbeat.js
 //     (a real `setInterval(10ms)` ticker asserted to fire `>=5` times across a
@@ -113,18 +139,17 @@ const CORE_DIRS = new Set(['models', 'routes', 'services', 'middleware', 'config
 //     deterministic the way C4 was would mean auditing and stubbing timing
 //     internals of `campaignRunHeartbeatService`/`atlasVideoService` this
 //     change did not otherwise need to touch — out of scope here, so they
-//     are quarantined instead of individually fixed.
+//     stay quarantined instead of individually fixed. This is an unrelated
+//     root cause from (1) above (a real-timer margin, not a shared-file
+//     write) and fixing (1) does nothing for it — do not unquarantine these
+//     two without separately making their timers deterministic.
 //
-// All five are genuine, reproducible parallel-UNsafety, not module-load
-// contention guesswork — see docs/PARALLEL_WORK.md for the full stress-test
-// evidence. Listing them here is the honest fix: they run alone, serially,
-// after the parallel pool drains, so no other script can observe them
-// mid-mutation and their own tight real-timer margins never have to compete
-// with 15 other processes for the CPU.
+// Both remaining entries are genuine, reproducible parallel-UNsafety, not
+// module-load contention guesswork — see docs/PARALLEL_WORK.md for the full
+// stress-test evidence. Listing them here is the honest fix: they run alone,
+// serially, after the parallel pool drains, so their own tight real-timer
+// margins never have to compete with 15 other processes for the CPU.
 const UNSAFE_FOR_PARALLEL = new Set([
-  'verifyVideoCostReconcile.js',
-  'verifyVideoTimeoutReconcile.js',
-  'verifyQuoteRotation.js',
   'verifyCampaignRunHeartbeat.js',
   'verifyConcurrencyConfig.js',
 ]);
