@@ -428,7 +428,16 @@ ok('E5 [TOTALS] after claim, the run is stamped mintedTotal + unclaimedAtStart +
 ok('E6 GET /runs returns mintedTotal, unclaimedAtStart, and notice (poller is where post-expand facts land)', () => {
   const i = adsSrc.indexOf("router.get('/runs/:runId'");
   assert.ok(i > 0);
-  const body = adsSrc.slice(i, i + 2500);
+  // STRUCTURAL boundary, not a magic char count (2026-08-19: the vision-QC
+  // rollup fix added a few hundred lines of explanatory comment ahead of
+  // this same handler's res.json({...}), which pushed mintedTotal/
+  // unclaimedAtStart/notice — all further down in that SAME object literal —
+  // past the old fixed 2500-char window. A window bounded at the next real
+  // route declaration cannot drift stale as this handler grows.).
+  const routeDeclRe = /router\.(get|post|patch|put|delete)\(/g;
+  routeDeclRe.lastIndex = i + "router.get('/runs/:runId'".length;
+  const next = routeDeclRe.exec(adsSrc);
+  const body = adsSrc.slice(i, next ? next.index : adsSrc.length);
   assert.ok(/mintedTotal:/.test(body));
   assert.ok(/unclaimedAtStart:/.test(body));
   assert.ok(/notice:/.test(body));

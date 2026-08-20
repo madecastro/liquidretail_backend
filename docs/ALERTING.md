@@ -933,6 +933,100 @@ preserved byte-for-byte, `"Video ad"` for the new path), the
 `videoFrameService.buildFrameUrls` quartile-sampling assumption this relies
 on, and the new run-feed `qcDetail` wiring on both outcomes.
 
+### Follow-up (2026-08-19, third): the gate has been off the whole time, and "off" used to look identical to "clean"
+
+Investigated a direct owner report: a production run
+(`run_1787174963435_ff67021e`, Marine Layer 2, 39/39 ads delivered — 21
+video, 18 static) had `Ad.visionQc` on **zero** of its 39 ads. Two questions,
+one root cause and one separate code bug, both closed here.
+
+**Why did QC run on 0/39?** Not a deploy-timing gap — the ads rendered
+21:29–21:56 UTC on 2026-08-19, and the deploy live for that entire window
+(`c633e2c194`, confirmed via `git merge-base --is-ancestor` and the Render
+deploy history for both `srv-d1vuktqli9vc73ft07ng` and the worker) already
+contained #240's video-QC wiring, deployed over 3 hours earlier. Queried prod
+directly (read-only Render job): `process.env` has **zero** keys matching
+`VISION`/`QC` — `AD_VISION_QC_ENABLED` is unset — and **no `SystemConfig`
+document exists at all** (`findOne({key:'default'})` → null), so
+`resolveEnabled()`/`isEnabled()` correctly fall through to their documented
+default: `false`. This is a real, working, **deliberate** gate — confirmed
+directly in this repo's own `scripts/verifyQcGateWiring.js` docstring, which
+quotes the owner: *"I don't want to QC gate yet, but let's wire it up so
+it's easy to flip on without a re-deploy if we want to test it."* Nobody has
+flipped it since. This document takes no position on whether it should be
+flipped now — that is the owner's call, not a "fix."
+
+**The actual bug: the gate being off was indistinguishable from "inspected
+and passed."** All three live callers of `adVisionQc.isEnabled()` —
+`directImageRenderService.renderDirectImage`, `brandScriptExecutor
+.runVideoVisionQcForAd`, `imageRecoveryService.maybeQcRecoveredPlate` —
+short-circuited on `!isEnabled()` with a bare `return firstOutput` / `return
+null`, **before ever reaching `runPostRenderQc`'s / `runVideoPostRenderQc`'s
+own "Flag off" branch**, which is the ONLY code that builds the
+`{skipped:true, disabled:true, reason:'AD_VISION_QC_ENABLED=false'}` shape
+and logs anything. That branch was consequently dead code in production —
+one caller's own doc comment even said the null return was deliberately
+"mirroring directImageRenderService's early-return-without-stamping," having
+copied the same gap into a second pipeline. Net effect: `Ad.visionQc` stayed
+at its schema default `null` on every ad, reading identically to "inspected
+and passed" to `summarizeVisionQc`, the gallery pill, and — the sharper
+problem — `GET /runs/:runId`'s `shippedWithoutQc` rollup, which only ever
+queried `'visionQc.skipped': true` and therefore counted these ads as **0**,
+not 39. **A QC pass that silently no-ops looked exactly like one that never
+ran, which looked exactly like one that ran clean** — three different facts,
+one representation.
+
+**Fix:**
+- All three early returns now build the SAME disabled-verdict shape
+  `runPostRenderQc`'s "Flag off" branch always intended
+  (`adVisionQc.buildPersistedVerdict({skipped:true, disabled:true,
+  reason:'AD_VISION_QC_ENABLED=false', ...})`) instead of a bare null/
+  `firstOutput`, and call a new shared `adVisionQc.warnQcDisabledOnce(label)`
+  (hourly-rewarn, not once-per-process-ever) so a flag left off for weeks is
+  loud in logs, not silent. Zero behavior change beyond the stamped field —
+  verified no downstream consumer branches on `visionQc === null` vs an
+  object (all three read `if (visionQc) …` or `visionQc.field || fallback`),
+  and no extra billable call is introduced (the disabled branch never reaches
+  `generate()`/`judgeRender`).
+- `GET /runs/:runId`'s `shippedWithoutQc` query is now `$or: [{'visionQc
+  .skipped': true}, {visionQc: null}]` — Mongo equality on `null` matches a
+  missing field too, which is the ONLY way historical ads (shipped before
+  this fix, which cannot be retroactively backfilled) are ever counted as
+  "not inspected" at all.
+- Added a third rollup count, `qcFailed` — a real, non-skipped, non-disabled
+  verdict that came back `passed:false` — so the run banner can show the
+  three states an operator actually needs distinguished: **not inspected**
+  (`shippedWithoutQc`), **inspected and flagged** (`qcFailed`), and a clean
+  pass (still silent by design). Previously only "not inspected" existed as
+  a rollup at all, and it undercounted.
+- Frontend (`liquidretail`, companion PR): the run banner now renders
+  `qcFailed` alongside `shippedWithoutQc`/`qcdOnRetry`, with updated copy
+  ("N not inspected (vision QC didn't run)" vs "N flagged by vision QC") so
+  the two are never conflated into one generic warning.
+
+**Problem 3 (verbose Slack QC output), re-verified, not re-built.** The
+owner's *"I want to see the [vision QC] output even if it is approved"* ask
+from the Video vision QC section above is correctly wired
+(`noteQcPassToRunFeed`/`noteQcFailToRunFeed` → `buildQcSlackDetail` →
+`formatThreadLine`, pinned by `scripts/verifyAdVisionQc.js`'s existing P1–P5,
+all still green) — but because the gate has been off in production since it
+shipped, **it has never actually fired on a live ad**. Nothing to fix here;
+flagging so nobody mistakes "never exercised" for "broken," and so the first
+real Slack post from this path (whenever the gate is turned on) isn't a
+surprise.
+
+Pinned by 8 new checks extending `scripts/verifyAdVisionQcSurfacing.js`
+(sections C5/C6 — structural, source-scanned against the actual
+`GET /runs/:runId` query text — and D2–D5, behavioral: `runVideoVisionQcForAd`
+and `maybeQcRecoveredPlate` driven directly with `adVisionQcService` stubbed
+at the require layer, same convention as `verifyGenerateProductTenancy.js`;
+`directImageRenderService`'s early return is pinned structurally instead —
+its "attempt 1" generation makes it too expensive/billable to drive
+end-to-end offline). All 8 hand-revert-proven: reverting any one of the
+three early returns, the `shippedWithoutQc` query, or the warning's
+one-shot-per-interval guard fails its corresponding check, then passes again
+on restore. Full backend suite 174/174, lint clean.
+
 ### Follow-up (2026-08-19): the Director contract-warning gap, closed
 
 `services/aiCreativeDirectorService.js` `directConceptsRound` now returns

@@ -162,6 +162,48 @@ function _resetSystemConfigFailLogForTests() {
   _systemConfigReadFailedLogged = false;
 }
 
+// ── Gate-off visibility ────────────────────────────────────────────────
+// PRODUCTION FINDING 2026-08-19: a live run (39/39 ads delivered) shipped
+// with visionQc:null on every single ad, static AND video. Root cause was
+// NOT a deploy-timing gap or a swallowed exception — process.env had zero
+// AD_VISION_QC_ENABLED/*QC* keys and no SystemConfig doc existed at all, so
+// resolveEnabled()/isEnabled() correctly fall through to `false`. That part
+// is a real, working gate — but every live caller (directImageRenderService
+// .renderDirectImage, brandScriptExecutor.runVideoVisionQcForAd,
+// imageRecoveryService.maybeQcRecoveredPlate) short-circuits on
+// `!isEnabled()` and returns BEFORE ever reaching runPostRenderQc /
+// runVideoPostRenderQc's own "Flag off" branch below — which is the only
+// code that builds the {skipped:true, disabled:true, reason:...} shape and
+// logs anything. Production never executes that branch, so a flag left off
+// for weeks produces silence in both the DB (Ad.visionQc stays the schema
+// default `null`, indistinguishable from "inspected and passed") and the
+// logs (not one line explains why).
+//
+// warnQcDisabledOnce() is the shared fix: every caller-level early-return
+// now (a) builds this SAME disabled-verdict shape itself via
+// buildPersistedVerdict (cheap — no network/DB, so no cost to calling it
+// unconditionally) instead of bare `return null`, and (b) calls this so the
+// gate being off is loud in logs, not silent. One counter shared across all
+// three callers/pipelines — a run that mixes static+video ads only warns
+// once, not once per ad.
+let _qcDisabledWarnedAt = 0;
+const QC_DISABLED_REWARN_MS = 60 * 60 * 1000; // re-warn hourly — a flag left off for a week must keep being loud, not just once per process start
+function warnQcDisabledOnce(mediaLabel = 'ad') {
+  const now = Date.now();
+  if (now - _qcDisabledWarnedAt < QC_DISABLED_REWARN_MS) return;
+  _qcDisabledWarnedAt = now;
+  console.warn(
+    `   ⚠️  adVisionQc: AD_VISION_QC_ENABLED is OFF (env unset and no SystemConfig.adVisionQcEnabled ` +
+    `override) — every delivered ${mediaLabel} is shipping WITHOUT vision inspection until this is ` +
+    'turned on. Not a failure by itself — just make sure this is the intended state.'
+  );
+}
+
+/** Test hook: allow the harness to re-arm the gate-off warning. */
+function _resetQcDisabledWarnForTests() {
+  _qcDisabledWarnedAt = 0;
+}
+
 function resolveQcModel() {
   const override = process.env.ATLAS_MODEL_AD_VISION_QC || process.env.AD_VISION_QC_MODEL;
   if (override) return override;
@@ -1608,6 +1650,7 @@ module.exports = {
   envEnabled,
   resolveEnabled,
   resolveQcModel,
+  warnQcDisabledOnce,
   // Pure helpers
   buildVisionUserContent,
   parseVerdict,
@@ -1635,5 +1678,6 @@ module.exports = {
   noteQcFailToRunFeed,
   buildQcSlackDetail,
   // Test hooks
-  _resetSystemConfigFailLogForTests
+  _resetSystemConfigFailLogForTests,
+  _resetQcDisabledWarnForTests
 };

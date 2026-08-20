@@ -307,12 +307,28 @@ function extractExpectedTextFromSubmissionPrompt(prompt) {
 /**
  * When AD_VISION_QC_ENABLED, inspect the recovered plate once (vision LLM only).
  * MONEY: no editImage / generateImage. Never discards paid pixels.
- * Returns a persisted-verdict shape, or null when QC is disabled.
+ * Returns a persisted-verdict shape always — including a stamped
+ * {skipped:true, disabled:true} verdict when QC is disabled, so a recovered
+ * ad reads as "not inspected" the same way a live-shipped one does (see
+ * adVisionQcService.warnQcDisabledOnce's comment for the production
+ * incident this closes: gate-off used to mean visionQc stayed null, which
+ * this function's own caller already special-cased via `.disabled` in its
+ * qcFailed guard below — that check was simply unreachable dead code until
+ * this fix, because `null` short-circuited before it could ever run).
  *
  * PRE-SPEND IDEMPOTENCY: re-reads the ad and short-circuits BEFORE the
- * billable judgeRender when (a) a visionQc verdict already exists, or
- * (b) the ad is no longer in a recoverable status. Paying then losing the
- * write is the a84437d-class hole this closes.
+ * billable judgeRender when (a) a REAL visionQc verdict already exists
+ * (inspected, or explicitly skipped for this pass — NOT a `disabled:true`
+ * gate-off stamp; see below), or (b) the ad is no longer in a recoverable
+ * status. Paying then losing the write is the a84437d-class hole this
+ * closes.
+ *
+ * `disabled:true` is deliberately EXCLUDED from that idempotency check: it
+ * only records that the gate was off, not that this ad was ever inspected.
+ * Letting it satisfy the guard would mean an ad recovered once while the
+ * gate is off can never be QC'd again, even after an operator flips
+ * AD_VISION_QC_ENABLED back on and this ad is recovered a second time — the
+ * exact opposite of what enabling the gate is for.
  */
 async function maybeQcRecoveredPlate({ ad, brand, surface, dims, renderUrl }) {
   let adVisionQc;
@@ -322,7 +338,13 @@ async function maybeQcRecoveredPlate({ ad, brand, surface, dims, renderUrl }) {
     console.warn(`   ⚠️  imageRecovery: adVisionQc load failed: ${err.message}`);
     return null;
   }
-  if (!adVisionQc.isEnabled()) return null;
+  if (!adVisionQc.isEnabled()) {
+    adVisionQc.warnQcDisabledOnce('recovered ad');
+    return adVisionQc.buildPersistedVerdict({
+      passed: false, skipped: true, disabled: true,
+      reason: 'AD_VISION_QC_ENABLED=false', finalAttempt: null, attempts: []
+    });
+  }
 
   const adId = ad?._id ? String(ad._id) : null;
   const brandId = ad?.brandId || null;
@@ -347,8 +369,15 @@ async function maybeQcRecoveredPlate({ ad, brand, surface, dims, renderUrl }) {
     if (['draft', 'live', 'archived'].includes(fresh.status)) {
       return fresh.visionQc || null;
     }
-    // Already inspected (or already stamped skipped/disabled) — do not re-pay.
-    if (fresh.visionQc != null && typeof fresh.visionQc === 'object') {
+    // Already inspected (or already stamped a real skip for THIS pass) — do
+    // not re-pay. A `disabled:true` stamp is NOT a real inspection — it only
+    // records that the gate was off. Treating it as "already inspected"
+    // would permanently neuter QC on this ad the moment an operator flips
+    // AD_VISION_QC_ENABLED back on and this ad is recovered again: the
+    // stale disabled stamp would satisfy this guard forever and the real
+    // judgeRender call below would never run. Same !disabled pattern as the
+    // qcFailed computation in recoverImageAd above — match it here too.
+    if (fresh.visionQc != null && typeof fresh.visionQc === 'object' && !fresh.visionQc.disabled) {
       return fresh.visionQc;
     }
   } catch (err) {

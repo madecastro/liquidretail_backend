@@ -2556,7 +2556,22 @@ async function renderDirectImage(callArgs = {}) {
 
   const adVisionQc = require('./adVisionQcService');
   if (!adVisionQc.isEnabled()) {
-    return firstOutput;
+    // Real gate, not a swallowed error — but until this stamp, a flag-off
+    // ad shipped with Ad.visionQc left at its schema default `null`, reading
+    // identically to "inspected and passed" everywhere (summarizeVisionQc,
+    // GET /runs/:runId shippedWithoutQc, imageRecoveryService's qcFailed
+    // guard, which already special-cases `.disabled` but this branch never
+    // gave it the chance to). Build the SAME shape runPostRenderQc's own
+    // "Flag off" branch below constructs — cheap, no network/DB — so
+    // "never inspected" is a real, queryable fact instead of an absence.
+    adVisionQc.warnQcDisabledOnce('static ad');
+    return {
+      ...firstOutput,
+      visionQc: adVisionQc.buildPersistedVerdict({
+        passed: false, skipped: true, disabled: true,
+        reason: 'AD_VISION_QC_ENABLED=false', finalAttempt: null, attempts: []
+      })
+    };
   }
 
   const qcBrandId = resolvedBrand?._id || brandId || null;

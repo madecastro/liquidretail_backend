@@ -3239,18 +3239,72 @@ router.get('/runs/:runId', async (req, res) => {
     // failure here must never take down the run poller — so both are
     // best-effort with an empty-array fallback.
     //
-    // shippedWithoutQcCount / qcdOnRetryCount — the run-level vision-QC
-    // rollup. Same gap this whole endpoint exists to close: a static ad that
-    // shipped WITHOUT inspection (flag on, QC failed to run — visionQc.skipped)
-    // used to be visible only per-ad on the generation-inspector; an operator
-    // watching the run poller had no way to know "N of this batch weren't
-    // even looked at" without opening every ad. Dot-path queries into
-    // Ad.visionQc (a Mixed field) are safe reads — Mixed only disables
-    // Mongoose-side sub-schema casting, the underlying BSON is a normal
-    // subdocument, same as the `renderError.*` dot-writes elsewhere in this
-    // file. Cheap: scoped by the already-indexed campaignRunIds filter
-    // first, same as queuedRemaining/stages above; best-effort like them too.
-    const [queuedRemaining, stages, failureSummary, shippedWithoutQcCount, qcdOnRetryCount] = await Promise.all([
+    // shippedWithoutQcCount / qcFailedCount / qcdOnRetryCount — the run-level
+    // vision-QC rollup. Same gap this whole endpoint exists to close: an ad
+    // that shipped WITHOUT inspection used to be visible only per-ad on the
+    // generation-inspector; an operator watching the run poller had no way
+    // to know "N of this batch weren't even looked at" without opening every
+    // ad. Dot-path queries into Ad.visionQc (a Mixed field) are safe reads —
+    // Mixed only disables Mongoose-side sub-schema casting, the underlying
+    // BSON is a normal subdocument, same as the `renderError.*` dot-writes
+    // elsewhere in this file. Cheap: scoped by the already-indexed
+    // campaignRunIds filter first, same as queuedRemaining/stages above;
+    // best-effort like them too.
+    //
+    // FIXED 2026-08-19 (production incident: a 39-ad run had visionQc:null
+    // on every ad, static AND video — AD_VISION_QC_ENABLED was unset and no
+    // SystemConfig override existed, so QC never ran). shippedWithoutQcCount
+    // used to query ONLY `'visionQc.skipped': true` — "QC attempted and
+    // explicitly skipped" — which is zero whenever the underlying render
+    // pipelines short-circuit on the gate being off and leave Ad.visionQc at
+    // its schema default `null` (services/directImageRenderService.js,
+    // brandScriptExecutor.js, imageRecoveryService.js — all three now stamp
+    // a disabled verdict instead, but that fix cannot retroactively backfill
+    // every ad already shipped this way). The `$or` below counts BOTH: an
+    // explicit skipped/disabled verdict AND a bare absent/null field — Mongo
+    // equality on `null` matches a missing field too, so `{visionQc: null}`
+    // alone already covers "field never written". This is the one place an
+    // operator can tell "not inspected" apart from "inspected and passed"
+    // in aggregate, so it must count every ad that was never looked at, not
+    // just the ones QC consciously declined.
+    //
+    // FIXED 2026-08-19, SECOND PASS (adversarial review of this same fix —
+    // it cried wolf on every healthy in-flight run). The `$or` above had NO
+    // status filter, and `Ad.visionQc` defaults to null until an ad both
+    // finishes rendering AND runs QC — so on a completely healthy run, gate
+    // ON, QC working, every ad still `queued`/`rendering` matched
+    // `{visionQc:null}` too. A 39-ad run polled at t=0 reported
+    // shippedWithoutQc=39 and painted a red "not inspected" banner on the
+    // still-RUNNING card, on every run, every time, until the last ad
+    // completed — alarm fatigue that would train operators to ignore the
+    // warning entirely. An ad that has not finished rendering has not
+    // SHIPPED, so it cannot be "shipped without QC". Scoped to `AD_STATUSES`
+    // (`['draft','live','archived']`, module-level above) — the same
+    // "resolved/delivered" set `imageRecoveryService.maybeQcRecoveredPlate`
+    // already uses for its own pre-spend guard. Deliberately excludes
+    // `'failed'` too: a failed render never shipped either (no deliverable),
+    // and it is already counted and explained via `run.failed` /
+    // `failureSummary` above — folding it into "not inspected" would
+    // double-report the same failure under a confusing second banner. This
+    // also incidentally excludes the UGC-passthrough-skip branch (which
+    // stamps `status:'failed'` and never calls any vision-QC function by
+    // construction — confirmed by reading `renderOneInner`'s
+    // `ugcPassthroughSkip` short-circuit, `routes/ads.js` ~2664-2679, which
+    // `return`s before Stage 3 titling is ever reached) — no separate
+    // ad-kind/platformFormat exclusion is needed for that case once the
+    // status filter is in place.
+    // ⚠️ NOT excluded, deliberately: `renderDeriveOnlyVideoAd` (PMax 1:1
+    // derive-only) ads. Traced against the current code (post the first
+    // 2026-08-19 fix): these DO reach `runVideoVisionQcForAd` /
+    // `runVideoPostRenderQc` via `brandScriptExecutor.renderBrandScriptAndSave`
+    // whenever the source Media's Brand resolves (the common case) — so a
+    // platformFormat-based exclusion for this ad kind would be WRONG, not
+    // merely unnecessary. The one real gap — a video ad (derive-only OR
+    // master, identically) whose source Media has no resolvable `brandId`
+    // skips titling AND QC entirely and still ships `draft` — is a genuine,
+    // actionable "not inspected" case (arguably worse, since it also never
+    // got titled), so it is correctly INCLUDED here, not filtered out.
+    const [queuedRemaining, stages, failureSummary, shippedWithoutQcCount, qcFailedCount, qcdOnRetryCount, qcDisabledCount, qcUnavailableCount] = await Promise.all([
       Ad.countDocuments({
         campaignId: run.campaignId,
         status:     'queued'
@@ -3259,8 +3313,75 @@ router.get('/runs/:runId', async (req, res) => {
       (run.failed > 0
         ? runFeed.summariseFailures(run.runId).catch(() => [])
         : Promise.resolve([])),
-      Ad.countDocuments({ campaignRunIds: run.runId, 'visionQc.skipped': true }).catch(() => 0),
-      Ad.countDocuments({ campaignRunIds: run.runId, 'visionQc.finalAttempt': { $gt: 1 } }).catch(() => 0)
+      Ad.countDocuments({
+        campaignRunIds: run.runId,
+        status: { $in: AD_STATUSES },
+        $or: [{ 'visionQc.skipped': true }, { visionQc: null }]
+      }).catch(() => 0),
+      // Third state the owner asked for: INSPECTED and flagged — a real
+      // vision-model verdict ran, was not skipped/disabled, and came back
+      // failed (whether or not it was later retried; qcdOnRetry below only
+      // counts the ones that ultimately passed). Distinct from
+      // shippedWithoutQc (never looked at) and from a clean pass (silent,
+      // same "surface the exceptional case" precedent as everywhere else in
+      // this rollup). Not status-scoped like shippedWithoutQc above — a real
+      // verdict object with `finalAttempt`/`attempts` can only exist once QC
+      // has actually run, which cannot happen before an ad ships, so an
+      // in-flight ad structurally cannot match this query already.
+      Ad.countDocuments({
+        campaignRunIds: run.runId,
+        'visionQc.skipped': false,
+        'visionQc.disabled': false,
+        'visionQc.passed': false
+      }).catch(() => 0),
+      // FIXED 2026-08-19 (adversarial review): a static ad that fails QC on
+      // BOTH its first attempt and its one allowed regeneration landed in
+      // qcFailed (above) AND here — the banner then read "1 flagged · 1 QC'd
+      // on retry" for what is a single failed ad, which an operator
+      // reasonably reads as two. `passed:true` restricts this to its
+      // intended meaning: informationally passed, but only after a retry —
+      // a subset of "inspected and passed", never overlapping qcFailed.
+      // Same non-status-scoping rationale as qcFailed above.
+      Ad.countDocuments({
+        campaignRunIds: run.runId,
+        'visionQc.finalAttempt': { $gt: 1 },
+        'visionQc.passed': true
+      }).catch(() => 0),
+      // FOURTH STATE (2026-08-19, adversarial review of the shippedWithoutQc
+      // fix above): shippedWithoutQc conflated "the owner deliberately had
+      // the gate off" with "QC was ON and something broke (e.g. the vision
+      // call threw)" — both stamp differently-shaped-but-both-truthy
+      // objects and the rollup counted them identically, so an ongoing
+      // vision-API outage was invisible in the run banner, indistinguishable
+      // from an intentional off-switch. These two counts split that:
+      //   qcDisabled    — `visionQc.disabled:true`. The deliberate stamp
+      //                    (adVisionQcService.buildPersistedVerdict with
+      //                    disabled:true) written when AD_VISION_QC_ENABLED
+      //                    resolves false. Expected, not alarming.
+      //   qcUnavailable — `visionQc.skipped:true` but NOT disabled. Covers
+      //                    every other reason QC did not produce a real
+      //                    verdict while the gate was ON — a vision-call
+      //                    exception (runVideoPostRenderQc's catch →
+      //                    buildSkippedVerdict, disabled:false) or a data
+      //                    gap like "no original product URL" to compare
+      //                    against. This is the one that should worry an
+      //                    operator (a live outage), and it used to be
+      //                    invisible next to qcDisabled.
+      // Both are SUBSETS of shippedWithoutQc, same status scope. The
+      // remainder (shippedWithoutQc minus both) is a bare absent visionQc
+      // field with neither stamp — pre-fix historical ads, or the rare
+      // no-brandDoc video edge case noted above.
+      Ad.countDocuments({
+        campaignRunIds: run.runId,
+        status: { $in: AD_STATUSES },
+        'visionQc.disabled': true
+      }).catch(() => 0),
+      Ad.countDocuments({
+        campaignRunIds: run.runId,
+        status: { $in: AD_STATUSES },
+        'visionQc.skipped': true,
+        'visionQc.disabled': false
+      }).catch(() => 0)
     ]);
     res.json({
       runId:           run.runId,
@@ -3292,12 +3413,40 @@ router.get('/runs/:runId', async (req, res) => {
       // not re-derived" principle as stages/failureSummary above, but there
       // is no Slack equivalent to reuse here: Slack gets this per-ad
       // (adVisionQcService.alertQcSkipped/alertQcFailure fire individually),
-      // never aggregated across a run. `shippedWithoutQc` is the sharper of
-      // the two — flag on, inspection failed to run, ad shipped anyway
-      // (visionQc.skipped) — a real defect, not routine. `qcdOnRetry` is
-      // informational: passed, but only after the one allowed regeneration.
+      // never aggregated across a run. `shippedWithoutQc` is scoped to
+      // SHIPPED ads only (`AD_STATUSES` — draft/live/archived); an ad still
+      // queued/rendering has not shipped and cannot be "shipped without QC"
+      // (2026-08-19 fix — see the query comment above for the incident this
+      // closes: it used to paint a false "N not inspected" banner on every
+      // in-flight run). The states an operator needs to tell apart — "was
+      // this ad even looked at" is a different question from "did it pass":
+      //   shippedWithoutQc — NOT INSPECTED (umbrella). Covers both an
+      //     explicit skipped/disabled verdict AND a bare absent visionQc
+      //     field (see the query comment above for why the latter matters —
+      //     it's the common case whenever the flag is off). qcDisabled +
+      //     qcUnavailable below are the two NAMED subsets of this; whatever
+      //     remains after subtracting both is a bare-null legacy/edge-case
+      //     residual (pre-fix historical ads, or a video ad whose source
+      //     Media never resolved a Brand).
+      //   qcDisabled — subset of shippedWithoutQc: the gate was
+      //     DELIBERATELY off (AD_VISION_QC_ENABLED resolved false).
+      //     Expected, not alarming.
+      //   qcUnavailable — subset of shippedWithoutQc: the gate was ON but
+      //     QC could not produce a real verdict (a vision-call exception, or
+      //     a data gap like no original product image). THIS is the one
+      //     that should worry an operator — it means an ongoing failure, not
+      //     a deliberate choice — and it used to be indistinguishable from
+      //     qcDisabled in this rollup.
+      //   qcFailed — INSPECTED, FLAGGED. A real verdict ran and failed.
+      //   qcdOnRetry — informational: passed, but only after the one
+      //     allowed regeneration (a subset of "inspected and passed", not
+      //     its own top-level state, and never overlapping qcFailed — see
+      //     the query comment above for the double-count this fix closed).
       visionQcRollup: {
         shippedWithoutQc: shippedWithoutQcCount || 0,
+        qcDisabled:       qcDisabledCount || 0,
+        qcUnavailable:    qcUnavailableCount || 0,
+        qcFailed:         qcFailedCount || 0,
         qcdOnRetry:       qcdOnRetryCount || 0
       },
       // Structured complement to failureSummary's text-parsed grouping, added

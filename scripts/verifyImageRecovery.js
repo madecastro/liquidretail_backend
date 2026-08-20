@@ -175,6 +175,87 @@ check('F7 [SLACK] reasons are GROUPED with counts — a 20-ad run failing identi
     + 'is one fact, not twenty lines',
   /counts\.set\(reason, \(counts\.get\(reason\) \|\| 0\) \+ 1\)/.test(feedSrc));
 
+// ── G. [BEHAVIORAL] a stale `disabled:true` stamp must not defeat the
+// pre-spend idempotency guard in maybeQcRecoveredPlate ──────────────────
+// The regex checks above (A5) only prove the guard's presence, not its
+// correctness. This calls the REAL function with a stubbed Ad.findById and
+// a stubbed adVisionQc.isEnabled to reproduce the exact production
+// scenario: an ad recovered once while AD_VISION_QC_ENABLED was OFF (so it
+// carries a persisted {skipped:true, disabled:true} stamp), then recovered
+// AGAIN after an operator flips the gate ON. Before the fix, the guard's
+// bare `typeof fresh.visionQc === 'object'` check treated that stale
+// gate-off stamp as "already inspected" and returned it verbatim — real
+// QC never ran, permanently. After the fix, a `disabled:true` verdict does
+// not satisfy the guard, so the function proceeds (and — because this test
+// ad also has no resolvable original product image — lands on the
+// `resolveOriginalProductUrl` skip branch with a fresh, distinct
+// `{disabled:false, reason:'recovered without QC'}` verdict, proving real
+// code executed past the guard rather than short-circuiting on the stale
+// object).
+async function runBehavioralChecks() {
+  const Ad = require(path.join(ROOT, 'models/Ad'));
+  const adVisionQc = require(path.join(ROOT, 'services/adVisionQcService'));
+  const imageRecovery = require(path.join(ROOT, 'services/imageRecoveryService'));
+
+  const origFindById = Ad.findById;
+  const origIsEnabled = adVisionQc.isEnabled;
+
+  const staleDisabledStamp = {
+    schemaVersion: 1,
+    skipped: true,
+    disabled: true,
+    passed: false,
+    reason: 'AD_VISION_QC_ENABLED=false',
+    finalAttempt: null,
+    maxRegenerations: 1,
+    attempts: []
+  };
+
+  Ad.findById = function fakeFindById() {
+    return {
+      select() { return this; },
+      lean() {
+        return Promise.resolve({ status: 'rendering', visionQc: staleDisabledStamp });
+      }
+    };
+  };
+  adVisionQc.isEnabled = () => true; // operator flipped the gate back ON
+
+  try {
+    const fakeAd = {
+      _id: 'fake-ad-id-for-verify-image-recovery',
+      brandId: null,
+      productId: null,
+      campaignId: null,
+      campaignRunIds: []
+    };
+    const verdict = await imageRecovery.maybeQcRecoveredPlate({
+      ad: fakeAd,
+      brand: null,
+      surface: {},
+      dims: { width: 1080, height: 1080 },
+      renderUrl: 'https://example.test/recovered.png'
+    });
+
+    check(
+      'G1 [BEHAVIORAL][MONEY] a stale disabled:true stamp does not satisfy the '
+        + 'idempotency guard (would otherwise return the SAME stale object)',
+      !!verdict && verdict !== staleDisabledStamp && verdict.disabled !== true,
+      `got ${JSON.stringify(verdict)}`
+    );
+    check(
+      'G2 [BEHAVIORAL] execution actually proceeds past the guard to a real '
+        + 'code path (a fresh skip verdict with a DIFFERENT reason), not just '
+        + 'returning a hand-shaped object',
+      !!verdict && verdict.reason === 'recovered without QC',
+      `got reason=${verdict && verdict.reason}`
+    );
+  } finally {
+    Ad.findById = origFindById;
+    adVisionQc.isEnabled = origIsEnabled;
+  }
+}
+
 // ── Revert-proof (manual, per CLAUDE.md §5) ──────────────────────────────
 // 1. Stamp peek.imageUrl onto renderUrl directly -> B1/B2/B3 fail (the
 //    ships-an-unbranded-image regression).
@@ -183,11 +264,16 @@ check('F7 [SLACK] reasons are GROUPED with counts — a 20-ad run failing identi
 // 3. Drop stage/provider/model from the finalizeFlatCost call -> E3 fails, and the
 //    row is silently discarded in production. Observed live before the fix.
 // 4. Remove the dryRun early return -> E4 fails.
+// 5. Drop the `&& !fresh.visionQc.disabled` clause from the pre-spend guard in
+//    maybeQcRecoveredPlate -> G1/G2 fail (the silent-gate regression: a
+//    disabled stamp permanently defeats QC once the gate is re-enabled).
 // Each verified by hand before shipping this harness.
 
-if (failures.length) {
-  console.error(`❌ verifyImageRecovery: ${failures.length} FAILED, ${pass} passed\n`);
-  failures.forEach((f) => console.error(`   • ${f}`));
-  process.exit(1);
-}
-console.log(`✅ verifyImageRecovery: ${pass} checks passed`);
+runBehavioralChecks().finally(() => {
+  if (failures.length) {
+    console.error(`❌ verifyImageRecovery: ${failures.length} FAILED, ${pass} passed\n`);
+    failures.forEach((f) => console.error(`   • ${f}`));
+    process.exit(1);
+  }
+  console.log(`✅ verifyImageRecovery: ${pass} checks passed`);
+});
