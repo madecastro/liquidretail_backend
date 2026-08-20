@@ -12,6 +12,7 @@
 
 const AiFullRenderArtifact = require('../models/AiFullRenderArtifact');
 const Campaign             = require('../models/Campaign');
+const CatalogProduct       = require('../models/CatalogProduct');
 
 // Cache-key string for an Ad row that matches AiFullRenderArtifact's
 // unique index. Ad doesn't carry campaignContextHash / creativeStyle
@@ -112,8 +113,44 @@ async function loadUseImageRefMap(adRows) {
   return map;
 }
 
+// Returns Map<productId, productUrl> — the retailer's own product page,
+// for the ad detail view's outbound link.
+//
+// Grouped and queried per the OWNING ad's brandId, never a single global
+// $in across all productIds — PR #245 fixed a real cross-brand leak where
+// an ad's productId pointed at another brand's CatalogProduct and the UI
+// rendered (and could bill against) that other brand's creative. Scoping
+// every lookup to (brandId, _id) keeps that class of bug from reopening
+// here even if a future caller ever passes rows spanning multiple brands.
+async function loadProductUrlMap(adRows) {
+  const map = new Map();
+  const idsByBrand = new Map();
+  for (const ad of adRows) {
+    if (!ad.productId || !ad.brandId) continue;
+    const brandKey = String(ad.brandId);
+    if (!idsByBrand.has(brandKey)) idsByBrand.set(brandKey, new Set());
+    idsByBrand.get(brandKey).add(String(ad.productId));
+  }
+  if (!idsByBrand.size) return map;
+
+  const perBrandRows = await Promise.all(
+    [...idsByBrand.entries()].map(([brandId, ids]) =>
+      CatalogProduct.find({ _id: { $in: [...ids] }, brandId })
+        .select('_id productUrl')
+        .lean()
+    )
+  );
+  for (const rows of perBrandRows) {
+    for (const p of rows) {
+      if (p.productUrl) map.set(String(p._id), p.productUrl);
+    }
+  }
+  return map;
+}
+
 module.exports = {
   photorealCacheKey,
   loadPhotorealUrlMap,
-  loadUseImageRefMap
+  loadUseImageRefMap,
+  loadProductUrlMap
 };

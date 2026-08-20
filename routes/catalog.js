@@ -903,7 +903,7 @@ router.get('/:id/ads-detail', async (req, res) => {
           generatedAt: 1, renderedAt: 1, metaSyncStatus: 1, metaAdId: 1, metaAdsetId: 1,
           platformFormat: 1, aiCanvasArtifactId: 1, mediaId: 1, productId: 1, variantKind: 1,
           paletteSource: 1, sourceFileType: 1, regenerating: 1, regenerationStage: 1,
-          regenerationHistory: 1,
+          regenerationHistory: 1, funnelStage: 1,
           // Pipeline stage + when it was entered. Product Ads renders the same
           // ad tiles as the gallery but received neither field, so an ad
           // mid-generation showed a bare "Queued" here while /render-activity
@@ -975,6 +975,10 @@ router.get('/:id/ads-detail', async (req, res) => {
       aspectRatio:    a.aspectRatio,
       platformFormat: a.platformFormat || null,
       kind:           a.kind || 'image',
+      // Intent profile — see models/Ad.js funnelStage / routes/ads.js
+      // projectAd. Same "absent renders as nothing" contract as the flat
+      // ads list, so the two surfaces agree.
+      funnelStage:    a.funnelStage || null,
       sourceFileType: a.sourceFileType || null,
       status:         a.status,
       approved:       !!a.approved,

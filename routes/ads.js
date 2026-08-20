@@ -3509,11 +3509,15 @@ router.get('/', async (req, res) => {
     // decide which to display. Both lookups parallelized + batched.
     const photorealMap         = await loadPhotorealUrlMap(rows);
     const useImageRefByCampaign = await loadUseImageRefMap(rows);
+    // Retailer product-page link for the ad detail view (Ads page) — joined
+    // and brand-scoped by loadProductUrlMap, see services/adDisplayUrlService.js.
+    const productUrlMap = await loadProductUrlMap(rows);
 
     res.json({
       ads: rows.map(r => projectAd(r, false, {
         photorealUrl:           photorealMap.get(String(r._id)) || null,
-        useImageRefAsProduction: useImageRefByCampaign.get(String(r.campaignId)) || false
+        useImageRefAsProduction: useImageRefByCampaign.get(String(r.campaignId)) || false,
+        productUrl:             (r.productId && productUrlMap.get(String(r.productId))) || null
       })),
       total,
       limit,
@@ -4382,7 +4386,14 @@ router.get('/:id', async (req, res) => {
     }
     const ad = await Ad.findOne({ _id: req.params.id, brandId }).lean();
     if (!ad) return res.status(404).json({ error: 'ad not found' });
-    res.json({ ad: projectAd(ad, /* full */ true) });
+    // Keep this single-ad projection's productUrl in lockstep with the list
+    // endpoint above — a poller that merges this response into an
+    // already-populated list row (e.g. ProductAds regen poll) must not
+    // silently null out a link the list fetch had already set.
+    const productUrlMap = await loadProductUrlMap([ad]);
+    res.json({ ad: projectAd(ad, /* full */ true, {
+      productUrl: (ad.productId && productUrlMap.get(String(ad.productId))) || null
+    }) });
   } catch (err) {
     res.status(500).json({ error: err.message || 'ad fetch failed' });
   }
@@ -4672,7 +4683,8 @@ router.get('/:adId/preview-page', async (req, res) => {
 const {
   photorealCacheKey,
   loadPhotorealUrlMap,
-  loadUseImageRefMap
+  loadUseImageRefMap,
+  loadProductUrlMap
 } = require('../services/adDisplayUrlService');
 
 function projectAd(ad, full = false, extras = {}) {
@@ -4685,6 +4697,12 @@ function projectAd(ad, full = false, extras = {}) {
     campaignRunIds:     Array.isArray(ad.campaignRunIds) ? ad.campaignRunIds : [],
     mediaId:            ad.mediaId   ? String(ad.mediaId)   : null,
     productId:          ad.productId ? String(ad.productId) : null,
+    // Retailer's own product-page link (CatalogProduct.productUrl), joined
+    // and brand-scoped by the caller via loadProductUrlMap — see
+    // services/adDisplayUrlService.js. null when the ad has no productId,
+    // the product was soft-deleted/unlinked, or the product simply has no
+    // URL on file. Never resolved cross-brand (PR #245).
+    productUrl:         extras.productUrl || null,
     template:           ad.template,
     aspectRatio:        ad.aspectRatio,
     matchTier:          ad.matchTier,
@@ -4693,6 +4711,13 @@ function projectAd(ad, full = false, extras = {}) {
     campaignKind:       ad.campaignKind,
     platformFormat:     ad.platformFormat || 'meta_feed_1_1',
     kind:               ad.kind,
+    // Intent profile — see models/Ad.js funnelStage. Absent/null on most
+    // static ads and on video ads that predate the funnel-stage retitle
+    // feature; the frontend must render that as "nothing shown", not a
+    // guessed default — an unstaged row is NOT reliably "awareness" from
+    // the UI's point of view even though the render pipeline treats it that
+    // way internally (see the model's own field comment).
+    funnelStage:        ad.funnelStage || null,
     sourceFileType:     ad.sourceFileType || null,
     renderUrl:          ad.renderUrl,
     // Phase B — gpt-image-1 polished version (AiFullRenderArtifact.imageUrl)
