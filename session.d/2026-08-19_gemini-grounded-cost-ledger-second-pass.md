@@ -259,3 +259,36 @@ Final state: 25 checks, 30 mutations across three matrices (19 + 11,
 — `main` grew by 5 scripts while this branch was open), `npm run lint` clean,
 on the branch as actually rebased onto `origin/main` immediately before
 opening PR #253.
+
+## Outcome — merged as a squash commit, one doc note landed separately
+
+**PR #253 merged** (`d49b471b`, squash). Confirmed by diffing the merge commit's
+tree against the fully-reviewed, 30-mutations-proven branch tip: identical
+except for one file. The owner merged directly from an earlier push in the same
+branch — before a final `session.d/KNOWN-OPEN.md` addition (documenting the
+forward-only decision on historical unledgered spend) had been pushed in this
+same recovery pass, so that one 14-line doc note missed the squash and never
+reached `main`. All CODE, the harness, and every schema/binding/ledger fix from
+both adversarial passes above landed intact — verified fresh (not assumed) on
+`main`'s actual post-merge tree, in a clean worktree built from `origin/main`,
+not by re-reading the pre-merge branch: 174-script suite green, lint clean, and
+28 of the 30 mutations (all of `mutate2.py`'s 11, plus 17 of `mutate.py`'s 19)
+re-run and re-confirmed directly.
+
+The remaining two — `M1`/`M2`, "revert the whole file to its pre-fix content" —
+needed a manual correction, not a re-run as written. Both use a
+`git merge-base HEAD origin/main` helper that assumes the branch being tested
+still *forked from* an unmerged main; once the fix itself is `main`, a worktree
+built on top of it has that exact commit as its own merge-base with `origin/main`,
+so "revert to the merge-base" reverts a file to itself — a silent no-op, not a
+weakened check. Re-ran their actual intent by hand instead, checking out each
+file from `d3a8fe7` (`main`'s tip immediately before this PR merged, confirmed
+by grep to genuinely predate the fix) rather than the broken helper: reverting
+`categoryReviewsService.js` failed 19 of 25 checks, reverting
+`productDetailsService.js` failed 14 of 25 — both fail loudly, confirming the
+two-mutation gap was in the test SCRIPT's merge-base logic, not in anything
+the harness or the shipped fix is missing.
+
+The missed doc note landed as **PR #255** (doc-only, one file,
+`session.d/KNOWN-OPEN.md`, unchanged content from what was reviewed here) rather
+than being silently dropped.
