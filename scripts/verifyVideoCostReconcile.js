@@ -50,6 +50,7 @@
  */
 
 const fs = require('fs');
+const os = require('os');
 const path = require('path');
 const assert = require('assert');
 
@@ -333,17 +334,33 @@ console.log('\nH. automated revert-proof (3 mutations)');
 function withTempMutation(filePath, find, replace, runCheck) {
   const original = fs.readFileSync(filePath, 'utf8');
   assert.ok(original.includes(find), `mutate target not found: ${find.slice(0, 60)}…`);
+  const mutated = original.replace(find, replace);
+  // Mutate a PRIVATE temp copy, never the real shared repo file. filePath is
+  // read-only from here down. This file is required by other verify scripts
+  // and can be running concurrently (runVerifySuite.js pool, a standalone
+  // `node scripts/verifyVideoCostReconcile.js`, or CI); writing the mutation
+  // in place — even inside try/finally — is not safe, because a SIGTERM/
+  // SIGKILL mid-mutation (a runner timeout, CI abort, or Ctrl-C) skips any
+  // pending `finally` and leaves the real file corrupted on disk. For
+  // source-text checks like these (H1-H3 only ever inspect the returned
+  // string, never re-require the file), a temp copy is all revert-proving
+  // needs. Same pattern as verifyRatingPairAtomic.js / verifySeedClass.js.
+  const tmp = path.join(
+    os.tmpdir(),
+    `verifyVideoCostReconcile-${path.basename(filePath)}-${process.pid}-${Date.now()}.js`
+  );
+  fs.writeFileSync(tmp, mutated);
   try {
-    fs.writeFileSync(filePath, original.replace(find, replace));
-    // Re-read source for source-level checks; for require() we only mutate
-    // strings the already-loaded module does not re-parse, so H1–H3 below
-    // re-read the file and assert on source / re-parse pure helpers inline.
-    runCheck(fs.readFileSync(filePath, 'utf8'));
+    runCheck(fs.readFileSync(tmp, 'utf8'));
   } finally {
-    fs.writeFileSync(filePath, original);
+    try { fs.unlinkSync(tmp); } catch (_) { /* leave for OS tmp cleanup */ }
   }
-  // Confirm restore.
-  assert.strictEqual(fs.readFileSync(filePath, 'utf8'), original, 'mutation residue left on disk');
+  // Belt-and-braces: confirm the real file was never touched.
+  assert.strictEqual(
+    fs.readFileSync(filePath, 'utf8'),
+    original,
+    'real file was modified — mutation must target the temp copy only'
+  );
 }
 
 check('H1 [REVERT-PROOF] awaiting the call makes E1-style assertion fail', () => {

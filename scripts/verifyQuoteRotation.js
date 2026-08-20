@@ -36,6 +36,7 @@
 
 const assert = require('assert');
 const fs = require('fs');
+const os = require('os');
 const path = require('path');
 
 const ROOT = path.join(__dirname, '..');
@@ -80,13 +81,32 @@ function withEnv(pairs, fn) {
 function withTempMutation(filePath, find, replace, runCheck) {
   const original = fs.readFileSync(filePath, 'utf8');
   assert.ok(original.includes(find), `mutate target not found: ${find.slice(0, 80)}`);
+  const mutated = original.replace(find, replace);
+  // Mutate a PRIVATE temp copy, never the real shared repo file. This helper
+  // is called against services/productReviewsScrapeService.js,
+  // services/quoteRotationService.js, models/CatalogProduct.js, and
+  // services/layoutInputService.js — all required elsewhere in this suite
+  // (models/CatalogProduct.js by a large fraction of it) — and a SIGTERM/
+  // SIGKILL mid-mutation (runner timeout, CI abort, Ctrl-C) skips any
+  // pending `finally`, which would otherwise leave one of those real files
+  // corrupted on disk. See verifyVideoCostReconcile.js's withTempMutation
+  // for the full rationale; same pattern as verifyRatingPairAtomic.js /
+  // verifySeedClass.js.
+  const tmp = path.join(
+    os.tmpdir(),
+    `verifyQuoteRotation-${path.basename(filePath)}-${process.pid}-${Date.now()}.js`
+  );
+  fs.writeFileSync(tmp, mutated);
   try {
-    fs.writeFileSync(filePath, original.replace(find, replace));
-    runCheck(fs.readFileSync(filePath, 'utf8'));
+    runCheck(fs.readFileSync(tmp, 'utf8'));
   } finally {
-    fs.writeFileSync(filePath, original);
+    try { fs.unlinkSync(tmp); } catch (_) { /* leave for OS tmp cleanup */ }
   }
-  assert.strictEqual(fs.readFileSync(filePath, 'utf8'), original, 'mutation residue left on disk');
+  assert.strictEqual(
+    fs.readFileSync(filePath, 'utf8'),
+    original,
+    'real file was modified — mutation must target the temp copy only'
+  );
 }
 
 function freshScrapeModule() {

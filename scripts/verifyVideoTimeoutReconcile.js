@@ -64,6 +64,7 @@
  */
 
 const fs = require('fs');
+const os = require('os');
 const path = require('path');
 const assert = require('assert');
 
@@ -90,13 +91,28 @@ function check(name, fn) {
 function withTempMutation(filePath, find, replace, runCheck) {
   const original = fs.readFileSync(filePath, 'utf8');
   assert.ok(original.includes(find), `mutate target not found in ${path.basename(filePath)}: ${find.slice(0, 80)}…`);
+  const mutated = original.replace(find, replace);
+  // Mutate a PRIVATE temp copy, never the real shared repo file — see
+  // verifyVideoCostReconcile.js's withTempMutation for the full rationale
+  // (SIGTERM/SIGKILL mid-mutation skips `finally` and would otherwise leave
+  // this file corrupted on disk while other verify scripts require it).
+  // runCheck now receives the temp file's path (not the real one) so a
+  // callback that needs to re-read the mutated content reads the copy.
+  const tmp = path.join(
+    os.tmpdir(),
+    `verifyVideoTimeoutReconcile-${path.basename(filePath)}-${process.pid}-${Date.now()}.js`
+  );
+  fs.writeFileSync(tmp, mutated);
   try {
-    fs.writeFileSync(filePath, original.replace(find, replace));
-    runCheck();
+    runCheck(tmp);
   } finally {
-    fs.writeFileSync(filePath, original);
+    try { fs.unlinkSync(tmp); } catch (_) { /* leave for OS tmp cleanup */ }
   }
-  assert.strictEqual(fs.readFileSync(filePath, 'utf8'), original, `mutation residue left on ${filePath}`);
+  assert.strictEqual(
+    fs.readFileSync(filePath, 'utf8'),
+    original,
+    `real file was modified — mutation must target the temp copy only: ${filePath}`
+  );
 }
 
 function freshRequire(modPath) {
@@ -302,8 +318,8 @@ console.log('\nE. campaignRunId threading to the charge-point CostLog writes');
     const find = 'campaignRunId: campaignRunId || null,';
     const replace = '// campaignRunId intentionally dropped for this test';
     let e2WouldStillPass = false; // set true below only if the mutation somehow left the pattern intact
-    withTempMutation(VID_PATH, find, replace, () => {
-      const mutSrc = fs.readFileSync(VID_PATH, 'utf8');
+    withTempMutation(VID_PATH, find, replace, (tmpPath) => {
+      const mutSrc = fs.readFileSync(tmpPath, 'utf8');
       const i = mutSrc.indexOf("stage:      'atlas_video_render'");
       const block = mutSrc.slice(i, i + 1500);
       if (/campaignRunId:\s*campaignRunId \|\| null/.test(block)) e2WouldStillPass = true; // harness blind to the mutation
