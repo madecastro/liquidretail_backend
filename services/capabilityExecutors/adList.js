@@ -16,7 +16,7 @@ const Brand = require('../../models/Brand');
 // gpt-image-1 polish) + the campaign-level useImageRefAsProduction
 // flag. Copying those into the agent's ad.list response keeps the
 // AdThumbnail render logic identical across every surface.
-const { loadPhotorealUrlMap, loadUseImageRefMap } = require('../adDisplayUrlService');
+const { loadPhotorealUrlMap, loadUseImageRefMap, loadProductUrlMap } = require('../adDisplayUrlService');
 
 const DEFAULT_LIMIT = 10;
 const MAX_LIMIT = 50;
@@ -62,17 +62,24 @@ async function run({ req, args }) {
       // Campaign Detail pages use. Kind/template/status/renderUrl were
       // the original set; the rest (posterUrl, copy, ctaText, variant-
       // Kind, mediaId, approved*, regeneration*, meta*, sourceFileType)
-      // are what the shared frontend components read.
-      .select('_id kind template aspectRatio platformFormat status renderUrl posterUrl copy ctaText productId campaignId createdAt updatedAt renderedAt metaSyncStatus metaAdId metaAdsetId variantKind mediaId sourceFileType approved approvedAt regenerating regenerationStage regenerationHistory aiCanvasArtifactId')
+      // are what the shared frontend components read. funnelStage +
+      // brandId added alongside productUrl below — same explicit-
+      // allowlist trap that kept both off catalog.js/campaigns.js
+      // ads-detail: a field this .select() omits arrives undefined no
+      // matter what the document actually has.
+      .select('_id kind template aspectRatio platformFormat status renderUrl posterUrl copy ctaText productId campaignId createdAt updatedAt renderedAt metaSyncStatus metaAdId metaAdsetId variantKind mediaId sourceFileType approved approvedAt regenerating regenerationStage regenerationHistory aiCanvasArtifactId funnelStage brandId')
       .lean()
   ]);
 
   // Same photorealUrl / useImageRefAsProduction join /api/ads does so
   // the frontend picks the right display URL for image ads (Phase B
-  // polish is preferred when populated).
-  const [photorealMap, useImageRefMap] = await Promise.all([
+  // polish is preferred when populated). productUrl is the retailer's
+  // own product-page link, brand-scoped by loadProductUrlMap (see
+  // services/adDisplayUrlService.js / PR #245 / #263).
+  const [photorealMap, useImageRefMap, productUrlMap] = await Promise.all([
     loadPhotorealUrlMap(ads),
-    loadUseImageRefMap(ads)
+    loadUseImageRefMap(ads),
+    loadProductUrlMap(ads)
   ]);
 
   return {
@@ -100,6 +107,12 @@ async function run({ req, args }) {
         copy:           a.copy || {},
         ctaText:        a.ctaText || null,
         productId:      a.productId ? String(a.productId) : null,
+        // Intent profile — see models/Ad.js funnelStage. Absent renders
+        // as nothing on the frontend, never a raw token.
+        funnelStage:    a.funnelStage || null,
+        // Retailer's own product-page link — null when there's no
+        // productId, an unlinked/soft-deleted product, or no URL on file.
+        productUrl:     (a.productId && productUrlMap.get(String(a.productId))) || null,
         campaignId:     a.campaignId ? String(a.campaignId) : null,
         variantKind:    a.variantKind || null,
         mediaId:        a.mediaId ? String(a.mediaId) : null,
