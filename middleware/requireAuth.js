@@ -22,7 +22,36 @@
 
 const jwt = require('jsonwebtoken');
 const User = require('../models/User');
+const Advertiser = require('../models/Advertiser');
 const AdvertiserMembership = require('../models/AdvertiserMembership');
+
+// Synthesize ephemeral 'owner' memberships for a super-admin across every
+// Advertiser they don't already have a real membership for. Not persisted —
+// the same shape as a real AdvertiserMembership doc so downstream code
+// (workspace switcher, X-Advertiser-Id resolution) works unchanged.
+async function expandSuperAdminMemberships(userId, userEmail, realMemberships) {
+  const advertisers = await Advertiser.find({ status: 'active' })
+    .select('_id')
+    .sort({ createdAt: 1 })
+    .lean();
+  const covered = new Set(realMemberships.map(m => String(m.advertiserId)));
+  const synthetic = advertisers
+    .filter(a => !covered.has(String(a._id)))
+    .map(a => ({
+      _id:          `super:${a._id}`,
+      advertiserId: a._id,
+      userId,
+      email:        userEmail,
+      role:         'owner',
+      status:       'active',
+      acceptedAt:   new Date(0),
+      __synthetic:  true
+    }));
+  // Real memberships first so a super-admin who is ALSO a real member of
+  // an Advertiser keeps their real role/audit trail, and the header-less
+  // default falls to the same Advertiser they had before promotion.
+  return [...realMemberships, ...synthetic];
+}
 
 async function requireAuth(req, res, next) {
   const header = req.headers.authorization;
@@ -82,6 +111,14 @@ async function requireAuth(req, res, next) {
     }).sort({ acceptedAt: -1 }).lean();
   }
 
+  // Super-admin: expand memberships to cover every Advertiser so the
+  // workspace switcher shows all of them and the NO_ADVERTISER gate
+  // never fires. Real memberships kept as-is (role + audit trail);
+  // gaps are filled with synthetic 'owner' rows that are NOT persisted.
+  if (user.isSuperAdmin === true) {
+    memberships = await expandSuperAdminMemberships(user._id, user.email, memberships);
+  }
+
   if (memberships.length === 0) {
     return res.status(403).json({
       error: 'No advertiser context — complete onboarding to continue',
@@ -111,7 +148,8 @@ async function requireAuth(req, res, next) {
     name:         user.displayName || payload.name,
     photo:        user.photoUrl || payload.photo,
     advertiserId: String(active.advertiserId),
-    role:         active.role
+    role:         active.role,
+    isSuperAdmin: user.isSuperAdmin === true
   };
   req.advertiserId = String(active.advertiserId);
   req.membership   = active;

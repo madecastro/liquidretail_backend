@@ -30,11 +30,12 @@ router.get('/', async (req, res) => {
 
     res.json({
       user: {
-        userId: req.user.userId,
-        email:  req.user.email,
-        name:   req.user.name,
-        photo:  req.user.photo,
-        role:   req.user.role
+        userId:       req.user.userId,
+        email:        req.user.email,
+        name:         req.user.name,
+        photo:        req.user.photo,
+        role:         req.user.role,
+        isSuperAdmin: req.user.isSuperAdmin === true
       },
       advertiser: activeAdvertiser ? {
         id:    String(activeAdvertiser._id),

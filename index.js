@@ -92,14 +92,21 @@ passport.use(new GoogleStrategy({
     // Google profile shape downstream consumers expect; the persisted
     // User doc is enriched with advertiserId on next-login or via the
     // backfill migration.
+    //
+    // isSuperAdmin is re-stamped from SUPER_ADMIN_EMAILS on every login
+    // so promotions/demotions to the env allowlist take effect on the
+    // next sign-in — no manual data patch. Written as a $set (not
+    // $setOnInsert) so a removed email demotes the existing User too.
+    const { isSuperAdminEmail } = require('./services/superAdminService');
     const userDoc = await User.findOneAndUpdate(
       { googleId: profile.id },
       {
         $set: {
           email,
-          displayName: profile.displayName,
-          photoUrl:    profile.photos?.[0]?.value || null,
-          lastLoginAt: new Date()
+          displayName:  profile.displayName,
+          photoUrl:     profile.photos?.[0]?.value || null,
+          lastLoginAt:  new Date(),
+          isSuperAdmin: isSuperAdminEmail(email)
         },
         $setOnInsert: { googleId: profile.id }
       },
@@ -112,7 +119,8 @@ passport.use(new GoogleStrategy({
       advertiserId: userDoc.advertiserId, // ← null until backfill / signup flow assigns one
       name:         profile.displayName,
       email,
-      photo:        profile.photos?.[0]?.value
+      photo:        profile.photos?.[0]?.value,
+      isSuperAdmin: userDoc.isSuperAdmin === true
     });
   } catch (err) {
     return done(err);

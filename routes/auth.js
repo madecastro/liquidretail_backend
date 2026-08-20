@@ -24,11 +24,17 @@ router.get('/google/callback',
   (req, res) => {
     const token = jwt.sign(
       {
-        id:     req.user.id,         // Google profile id (legacy, kept for compat)
-        userId: req.user.userId,     // persisted User._id — requireAuth re-fetches for fresh advertiserId
-        email:  req.user.email,
-        name:   req.user.name,
-        photo:  req.user.photo
+        id:           req.user.id,         // Google profile id (legacy, kept for compat)
+        userId:       req.user.userId,     // persisted User._id — requireAuth re-fetches for fresh advertiserId
+        email:        req.user.email,
+        name:         req.user.name,
+        photo:        req.user.photo,
+        // Super-admin flag for the frontend to gate admin-only nav (Sales
+        // Demos). Re-stamped from SUPER_ADMIN_EMAILS on every login and
+        // the JWT lasts 24h — a demotion is picked up on the next sign-in
+        // at latest. Server-side gating still hangs off User.isSuperAdmin
+        // via requireAuth; the JWT copy is purely a UX hint.
+        isSuperAdmin: req.user.isSuperAdmin === true
       },
       process.env.JWT_SECRET,
       { expiresIn: '24h' }

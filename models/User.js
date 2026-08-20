@@ -29,6 +29,15 @@ const userSchema = new mongoose.Schema({
   // user creates their own Advertiser on signup.
   role: { type: String, enum: ['owner', 'admin', 'editor', 'viewer'], default: 'owner' },
 
+  // Cross-tenant super-admin. Bypasses the requireAuth NO_ADVERTISER
+  // gate and gets synthetic 'owner' membership for every Advertiser in
+  // the workspace switcher. Bootstrapped from the SUPER_ADMIN_EMAILS
+  // env allowlist on every Google login (see services/superAdminService).
+  // Money-path safety: super-admin does NOT unscope brand queries —
+  // they still act inside one Advertiser at a time via the X-Advertiser-Id
+  // header, they just have implicit access to every workspace.
+  isSuperAdmin: { type: Boolean, default: false, index: true },
+
   lastLoginAt: Date,
   createdAt:   { type: Date, default: Date.now },
   updatedAt:   { type: Date, default: Date.now }
