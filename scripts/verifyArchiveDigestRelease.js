@@ -1410,7 +1410,6 @@ ok('E15d [PROOF] renderDeriveOnlyVideoAd is submit-free (crop + titling only)', 
   const s = STRIPPED_LATE('routes/ads.js');
   const body = namedFn(s, 'async function renderDeriveOnlyVideoAd(');
   assert.ok(body && body.length > 1500, 'renderDeriveOnlyVideoAd body not found');
-  assert.ok(/\.\.\.PRE_DISPATCH/.test(body), 'the derive wait-requeue no longer declares PRE_DISPATCH');
   for (const t of SUBMIT_TOKENS) {
     assert.ok(!t.test(body),
       `renderDeriveOnlyVideoAd now reaches ${t} — a submit on the FREE derive surface, and its ` +
@@ -1418,6 +1417,27 @@ ok('E15d [PROOF] renderDeriveOnlyVideoAd is submit-free (crop + titling only)', 
   }
   // Prove the comment-strip left real code, or the absence check is vacuous.
   assert.ok(/findSiblingMasterAd\s*\(/.test(body), 'stripping erased the body — absence proves nothing');
+});
+
+// 2026-08-20: the wait-requeue's PRE_DISPATCH declaration moved OUT of
+// renderDeriveOnlyVideoAd and into the extracted handleDeriveMasterBackup
+// (owner: "hitting the timeout shouldn't abandon" — see
+// scripts/verifyDeriveWaitBackup.js for the full behavioural proof of the
+// never-abandon contract; this check only re-proves the money invariant
+// E15 exists for: the exemption still declares PRE_DISPATCH and the
+// function it now lives in is STILL submit-free).
+ok('E15e [PROOF] handleDeriveMasterBackup (the timeout/backup branch) is submit-free and still declares PRE_DISPATCH', () => {
+  const s = STRIPPED_LATE('routes/ads.js');
+  const body = namedFn(s, 'async function handleDeriveMasterBackup(');
+  assert.ok(body && body.length > 800, 'handleDeriveMasterBackup body not found');
+  assert.ok(/\.\.\.PRE_DISPATCH/.test(body), 'the derive-wait backup requeue no longer declares PRE_DISPATCH');
+  for (const t of SUBMIT_TOKENS) {
+    assert.ok(!t.test(body),
+      `handleDeriveMasterBackup now reaches ${t} — a submit on the FREE derive surface`);
+  }
+  // Recovery must route through the existing atomic claim (requeueStrandedAds
+  // -> claimAdsForRun), never a submit and never a second claim path.
+  assert.ok(/await\s+requeue\s*\(/.test(body), 'stripping erased the body — absence proves nothing');
 });
 
 // ═════════════════════════════════════════════════════════════════════════

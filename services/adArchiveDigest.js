@@ -275,8 +275,13 @@ const REQUEUE_SITES = Object.freeze([
   { file: 'routes/ads.js', site: 'runs:post-claim-throw', verdict: 'PRE_DISPATCH',
     proof: 'the outer catch; `setImmediate(runRenderLoop)` is the LAST statement of the try, so no '
          + 'await follows it and the catch cannot run after the loop began. Pinned by E15c.' },
-  { file: 'routes/ads.js', site: 'renderDeriveOnlyVideoAd:wait-requeue', verdict: 'PRE_DISPATCH',
-    proof: 'the derive path is submit-free by contract (crop + titling only). Pinned by E15d here '
+  // 2026-08-20: this site moved out of renderDeriveOnlyVideoAd into the
+  // extracted handleDeriveMasterBackup, which now ALSO actively reclaims
+  // the ad (requeueStrandedAds -> claimAdsForRun) instead of merely
+  // hoping something notices — see scripts/verifyDeriveWaitBackup.js for
+  // the never-abandon behavioural proof. Still zero submits either way.
+  { file: 'routes/ads.js', site: 'handleDeriveMasterBackup:wait-requeue', verdict: 'PRE_DISPATCH',
+    proof: 'the derive path is submit-free by contract (crop + titling only). Pinned by E15d/E15e here '
          + 'and by verifyPmaxVideoExpansion E1.' },
   { file: 'services/processAlerts.js', site: 'sigterm:orphan-persist', verdict: 'REQUEUE_MARK',
     proof: 'fires at an arbitrary point in a render; a submit may be in flight.' },

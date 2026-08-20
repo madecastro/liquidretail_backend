@@ -85,14 +85,27 @@ const { buildGridPreviewImageUrl } = require('../services/imagePreviewUrl');
 const ugcVideoPipeline = require('../services/ugcVideoPipeline');
 
 // Derive-only 1:1 ads requeue while their 9:16 master is still in flight.
-// Bound waits so a permanently-missing master cannot spin forever across
-// /runs claims. Each claim→wait→requeue cycle counts as one attempt on
-// `deriveWaitAttempts` — a SEPARATE counter from `renderAttempts` (models/Ad.js).
-// Waiting never submits or renders anything, so it must not inflate
-// renderAttempts: services/queuedArchiveSweeper's `renderAttempts:0` guard
-// uses that field to prove a queued leftover never started, and a wait-only
-// requeue that bumped renderAttempts made itself permanently unsweepable.
-// ~30 cycles is generous vs a ~2–4 min Omni master.
+// Each claim→wait→requeue cycle counts as one attempt on `deriveWaitAttempts`
+// — a SEPARATE counter from `renderAttempts` (models/Ad.js). Waiting never
+// submits or renders anything, so it must not inflate renderAttempts:
+// services/queuedArchiveSweeper's `renderAttempts:0` guard uses that field to
+// prove a queued leftover never started, and a wait-only requeue that bumped
+// renderAttempts made itself permanently unsweepable.
+//
+// RE-SCOPED 2026-08-20 (owner: "hitting the timeout shouldn't abandon, it
+// should just send a slack explaining the backup"). This USED to be a hard
+// cap: cycle 30 stamped the ad `failed` ("refusing Omni fallback"). It no
+// longer does — see handleDeriveMasterBackup below, the only place that
+// still reads this constant. A master still in flight (`queued`/`rendering`)
+// is NEVER a reason to give up; the only honest failure left in this
+// function is a master that is genuinely absent or terminal with no plate
+// (the `else` branch further down, unchanged). MAX_DERIVE_WAIT_ATTEMPTS now
+// marks ESCALATION — the point past which a Slack backup notice bumps from
+// 'warn' to 'error' because ~30 cycles (generous vs. a ~2–4 min Omni master)
+// is well beyond ordinary congestion — never abandonment. Raising
+// VEO_CONCURRENCY/REMOTION_QUEUE_CONCURRENCY (config/defaults.env) makes
+// masters queue longer behind titling, so this constant is crossed more
+// often now; that is the exact scenario this rewrite exists for.
 const MAX_DERIVE_WAIT_ATTEMPTS = 30;
 // In-render wait for the sibling master's plate. An Omni master settles in
 // roughly 2 minutes; 12 minutes leaves generous headroom for a slow poll
@@ -2127,6 +2140,209 @@ async function findSiblingMasterAd(ad, masterPlatformFormat) {
 }
 
 /**
+ * One Slack notice per derive-wait BACKUP EPISODE — not one per ad, not one
+ * per poll (owner 2026-08-20: "send a slack explaining the backup").
+ *
+ * Fires every time handleDeriveMasterBackup hits the wait deadline with the
+ * master still in flight. "Not one per poll" is enforced by alertService's
+ * OWN key-based dedupe (ALERT_DEDUPE_WINDOW_MIN, default 15m), not by any
+ * bookkeeping here: the key is keyed on the MASTER (`master._id`), so every
+ * derivative ad backed up on the SAME master folds into ONE message, and a
+ * still-unresolved episode simply re-surfaces every ~15m with "+N more
+ * (suppressed)" folded in rather than going silent or spamming.
+ *
+ * Deliberately uses alertService (rate-limited), NOT runFeed.noteEvent —
+ * the opposite choice from services/adVisionQcService.js's
+ * noteQcPassToRunFeed, and deliberately so:
+ *   - QC passes are HIGH VOLUME (~900/run) and belong in the run's own
+ *     thread, uncapped, because ALERT_RATE_LIMIT_MAX would otherwise starve
+ *     genuine error/fatal alerts (see that file's header comment).
+ *   - A derive-wait backup is the opposite shape: LOW VOLUME (one episode
+ *     can span many cycles but should read as one event), and — unlike a
+ *     QC pass — it does not belong to a single run's thread. Every
+ *     requeue+reclaim cycle mints a NEW CampaignRun (handleDeriveMasterBackup
+ *     below), so there is no one run whose thread "owns" the whole episode.
+ *     The rate-limited alert channel, keyed on the master, is the right home.
+ *
+ * "Stuck vs merely queued" (owner requirement — a backup notice must not
+ * become the new silent failure): a master sitting `queued` is simply
+ * undispatched — not broken. A master sitting `rendering` with no heartbeat
+ * for longer than reapStaleMin() — the SAME staleness window the worker's
+ * own orphan reaper uses to presume a claimed doc's holder died — is flagged
+ * as looking STUCK, at 'error' instead of 'warn', so a real stall reads
+ * differently from ordinary queue depth.
+ */
+async function notifyDeriveWaitBackup({ ad, adId, master, deriveFromFmt, waitN, run }) {
+  try {
+    const masterAgeMs = master && master.updatedAt
+      ? Date.now() - new Date(master.updatedAt).getTime()
+      : null;
+    const staleMs = reapStaleMin() * 60 * 1000;
+    const masterLooksStuck = master.status === 'rendering' && masterAgeMs != null && masterAgeMs > staleMs;
+    const escalated = masterLooksStuck || waitN > MAX_DERIVE_WAIT_ATTEMPTS;
+
+    // Other ads waiting on THIS SAME master. Reuses the shared gate
+    // (resolveDeriveFromMaster) against a small, product-scoped candidate
+    // set instead of approximating the match with a second query that could
+    // drift from what actually decides "derives from this master".
+    let othersQueued = 0;
+    try {
+      const candidates = await Ad.find({
+        campaignId: ad.campaignId,
+        productId: ad.productId,
+        kind: 'video',
+        status: { $in: ['queued', 'rendering'] },
+        _id: { $ne: adId }
+      }).select('deriveFromMaster platformFormat funnelStage veoPredictionId').lean();
+      othersQueued = candidates.filter((c) => resolveDeriveFromMaster(c) === deriveFromFmt).length;
+    } catch (err) {
+      // Best-effort context only — never let this block the alert itself.
+      console.warn(`⚠️  [derive-only ad=${adId}] othersQueued lookup failed — ${err.message}`);
+    }
+
+    const waitedMs = ad && ad.queuedAt
+      ? Date.now() - new Date(ad.queuedAt).getTime()
+      : waitN * DERIVE_MASTER_WAIT_MS;
+    const fmtMin = (ms) => `${Math.max(1, Math.round(ms / 60000))}m`;
+
+    await alerts.notifyAsync({
+      level: escalated ? 'error' : 'warn',
+      title: masterLooksStuck
+        ? `Derive-wait: master looks STUCK, not just backed up (${deriveFromFmt})`
+        : `Derive-wait backup: ${deriveFromFmt} master still in flight`,
+      // Keyed on the MASTER, not the ad or the run — every derivative
+      // sharing this master folds into ONE message via alertService's own
+      // dedupe (see doc comment above).
+      key: `derive-wait-backup:${master._id}`,
+      fields: {
+        master:       String(master._id),
+        masterStatus: master.status,
+        masterAge:    masterAgeMs != null ? fmtMin(masterAgeMs) : 'unknown',
+        product:      ad && ad.productId ? String(ad.productId) : null,
+        waited:       `${fmtMin(waitedMs)} (attempt ${waitN})`,
+        othersQueued: othersQueued || undefined,
+        run:          run && run.runId ? run.runId : null
+      },
+      detail: masterLooksStuck
+        ? `Master ${master._id} (${deriveFromFmt}) has not heartbeat in ${fmtMin(masterAgeMs)} while ` +
+          `status=rendering — this looks like a stalled render, not ordinary queue depth. Ad ${adId} ` +
+          `remains queued and keeps auto-reclaiming; it has NOT been abandoned.`
+        : `Ad ${adId} is waiting on sibling master ${master._id} (${deriveFromFmt}), still ${master.status}. ` +
+          `This is congestion, not breakage — the ad auto-reclaims through the same atomic claim path ` +
+          `stranded ads use (requeueStrandedAds) and will derive as soon as the master lands.`
+    });
+  } catch (err) {
+    // Alerting must never block or fail the recovery path it is reporting on.
+    console.warn(`⚠️  [derive-only ad=${adId}] notifyDeriveWaitBackup failed — ${err.message}`);
+  }
+}
+
+/**
+ * BACKED UP, NOT ABANDONED (owner 2026-08-20: "hitting the timeout shouldn't
+ * abandon, it should just send a slack explaining the backup").
+ *
+ * Called from renderDeriveOnlyVideoAd when the in-render wait for a sibling
+ * master (DERIVE_MASTER_WAIT_MS) expires with the master still `queued` or
+ * `rendering` — i.e. still in flight, not dead. Until this change that state
+ * was tolerated silently for MAX_DERIVE_WAIT_ATTEMPTS (30) cycles and then
+ * the ad was stamped `failed` ("refusing Omni fallback"). That is exactly
+ * the deliverability failure raising VEO_CONCURRENCY / REMOTION_QUEUE_
+ * CONCURRENCY makes MORE likely: masters queue longer behind titling, so
+ * this fires more often, and every ad that lands here is one the owner
+ * ordered and paid nothing extra for — it must still be delivered.
+ *
+ * Three things happen, in order, and none of them is new money or a new
+ * claim mechanism:
+ *   1. Release the slot: status back to 'queued' (same fields the old
+ *      polite-requeue used) + $inc deriveWaitAttempts (never renderAttempts
+ *      — see models/Ad.js and scripts/verifyPmaxVideoExpansion.js's G-group).
+ *      Zero submits, zero bills, exactly as before.
+ *   2. RECLAIM IMMEDIATELY through the SAME atomic claim path stranded ads
+ *      use — requeueStrandedAds() -> claimAdsForRun() — instead of leaving
+ *      the ad for an operator click or a crash-triggered sweep to notice.
+ *      That passive hand-off was the actual bug: services/strandedRunSweeper
+ *      only scans ads whose run is 'failed', and the run a derive-wait ad
+ *      backs out of normally finishes 'done' with its other ads succeeding
+ *      — so a merely-requeued derivative was invisible to every automatic
+ *      recovery path (see session.d/2026-08-19_two-omni-masters-timed-out-
+ *      run_1787119100250_eef4d871-the-real-defect.md). `requeue` is
+ *      INJECTABLE (defaults to the real requeueStrandedAds) purely so a
+ *      harness can assert the call shape without exercising Mongo.
+ *   3. Notify once per episode via notifyDeriveWaitBackup (also injectable).
+ *      Never blocks step 1/2 on Slack's network round trip failing.
+ *
+ * `attempts` no longer bounds anything here — see MAX_DERIVE_WAIT_ATTEMPTS's
+ * comment above. It only decides alert SEVERITY inside notifyDeriveWaitBackup.
+ *
+ * @returns {Promise<{ requeuedToQueued: boolean, reclaimed: number, notified: boolean }>}
+ */
+async function handleDeriveMasterBackup({
+  ad, adId, master, deriveFromFmt, attempts, index, run,
+  requeue = requeueStrandedAds, notify = notifyDeriveWaitBackup
+}) {
+  const waitN = (Number(attempts) || 0) + 1;
+  const stageNote =
+    `derive-only: waiting for master ${deriveFromFmt} ` +
+    `(attempt ${waitN}, backed up — auto-reclaiming, not abandoned)`;
+  console.log(`⏳ [derive-only ad=${adId}] ${stageNote}`);
+
+  // Release claim → queued so the reclaim below (or, failing that, a later
+  // selectAdsForRun /runs claim) can retry once the master lands. Do NOT
+  // leave status:'rendering' (reaper / stranded paths) and do NOT submit
+  // Omni — unchanged from the old polite requeue.
+  await Ad.updateOne(
+    { _id: adId },
+    {
+      $set: {
+        status: 'queued',
+        ...PRE_DISPATCH,
+        renderStage: stageNote.slice(0, 200),
+        renderStageAt: new Date(),
+        updatedAt: new Date()
+      },
+      // deriveWaitAttempts, NOT renderAttempts — see models/Ad.js and the
+      // G-group pins in scripts/verifyPmaxVideoExpansion.js. Exactly ONE
+      // $inc site now that the exhausted-terminal branch is gone.
+      $inc: { deriveWaitAttempts: 1 }
+    }
+  );
+  // Count as skipped for THIS run (it reappears under the reclaimed run below).
+  await CampaignRun.updateOne(
+    { _id: run._id },
+    {
+      $inc: { skipped: 1 },
+      $push: { errors: { index, stage: 'derive-wait', message: stageNote } }
+    }
+  );
+
+  // Reclaim NOW rather than hoping something notices. Same adapter, same
+  // CAS as /runs and the stranded sweeper — never a second claim path
+  // (CLAUDE.md §2). `ad` is the lean doc already fetched for this render;
+  // requeueStrandedAds only needs _id/productId off it and does its own
+  // atomic status:'queued' match against the DB, so the stale in-memory
+  // status on `ad` is harmless.
+  let reclaimed = 0;
+  try {
+    reclaimed = await requeue({ ads: [ad], run });
+    if (!reclaimed) {
+      console.log(`   ↪ [derive-only ad=${adId}] reclaim found nothing to claim (raced/claimed elsewhere) — left 'queued'`);
+    }
+  } catch (err) {
+    console.warn(`⚠️  [derive-only ad=${adId}] requeue threw — ${err.message} — left 'queued' for the next claim`);
+  }
+
+  let notified = false;
+  try {
+    await notify({ ad, adId, master, deriveFromFmt, waitN, run });
+    notified = true;
+  } catch (err) {
+    console.warn(`⚠️  [derive-only ad=${adId}] backup notify threw — ${err.message}`);
+  }
+
+  return { requeuedToQueued: true, reclaimed: Number(reclaimed) || 0, notified };
+}
+
+/**
  * Google PMax derive-only / funnel-variant render.
  *
  * Covers:
@@ -2143,9 +2359,9 @@ async function findSiblingMasterAd(ad, masterPlatformFormat) {
  *
  * Sequencing: do NOT rely on FIFO claim order. Concurrent VEO_CONCURRENCY
  * means the derive ad can start before the master. If master is still
- * queued/rendering without a veoVideoUrl → polite requeue (status back
- * to queued) with a bounded attempt counter. If master failed/absent →
- * fail honestly. NEVER fall back to a local Omni submit.
+ * queued/rendering without a veoVideoUrl → handleDeriveMasterBackup requeues
+ * it AND actively re-claims it (never abandons — 2026-08-20). If master
+ * failed/absent → fail honestly. NEVER fall back to a local Omni submit.
  *
  * Funnel preset selection is owned by brandScriptExecutor
  * (resolveFunnelPresetOverride from ad.funnelStage) so buildMetaForAd
@@ -2202,84 +2418,15 @@ async function renderDeriveOnlyVideoAd({
     master &&
     (master.status === 'queued' || master.status === 'rendering')
   ) {
-    // Polite requeue — master still in flight. Bound attempts so a
-    // stuck master cannot spin forever across /runs claims.
-    if (attempts >= MAX_DERIVE_WAIT_ATTEMPTS) {
-      const msg =
-        `derive-only: master ${deriveFromFmt} still unsettled after ` +
-        `${attempts} wait(s); refusing Omni fallback`;
-      console.warn(`⚠️  [derive-only ad=${adId}] ${msg}`);
-      await Ad.updateOne(
-        { _id: adId },
-        {
-          $set: {
-            status: 'failed',
-            renderError: { message: msg, stage: 'derive-wait-exhausted', at: new Date() },
-            renderStage: 'derive-only: master wait exhausted (no Omni fallback)',
-            renderStageAt: new Date(),
-            updatedAt: new Date()
-          },
-          // Final tick of the SAME bounded wait loop, not a render attempt —
-          // deriveWaitAttempts, not renderAttempts. This is a terminal write
-          // (status:'failed'), so it does not touch the sweeper's guard
-          // either way, but keeping it on the wait counter is what makes
-          // "renderAttempts == 0" honestly mean "never started" for an ad
-          // that only ever polled for its master.
-          $inc: { deriveWaitAttempts: 1 }
-        }
-      );
-      await CampaignRun.updateOne(
-        { _id: run._id },
-        {
-          $inc: { failed: 1 },
-          $push: { errors: buildErrorEntry(creative, index, 'derive-wait', new Error(msg)) }
-        }
-      );
-      return;
-    }
-    const waitN = attempts + 1;
-    const stageNote =
-      `derive-only: waiting for master ${deriveFromFmt} ` +
-      `(attempt ${waitN}/${MAX_DERIVE_WAIT_ATTEMPTS})`;
-    console.log(`⏳ [derive-only ad=${adId}] ${stageNote} — requeue`);
-    // Release claim → queued so a later selectAdsForRun /runs claim can
-    // retry after the master lands. Do NOT leave status:'rendering' (reaper
-    // / stranded paths) and do NOT submit Omni.
-    await Ad.updateOne(
-      { _id: adId },
-      {
-        $set: {
-          status: 'queued',
-          ...PRE_DISPATCH,
-          renderStage: stageNote.slice(0, 200),
-          renderStageAt: new Date(),
-          updatedAt: new Date()
-        },
-        // deriveWaitAttempts, NOT renderAttempts. This row goes back to
-        // 'queued' having never submitted or rendered anything — bumping
-        // renderAttempts here is exactly the bug: services/queuedArchiveSweeper
-        // trusts renderAttempts:0 to mean "never started" before archiving a
-        // stale leftover, so a wait-only requeue that inflated it made the ad
-        // permanently unsweepable even though it never started and never
-        // billed. deriveWaitAttempts (models/Ad.js) is a dedicated counter for
-        // exactly this loop; MAX_DERIVE_WAIT_ATTEMPTS above reads it too.
-        $inc: { deriveWaitAttempts: 1 }
-      }
-    );
-    // Count as skipped for this run (will reappear on a subsequent claim).
-    await CampaignRun.updateOne(
-      { _id: run._id },
-      {
-        $inc: { skipped: 1 },
-        $push: {
-          errors: {
-            index,
-            stage: 'derive-wait',
-            message: stageNote
-          }
-        }
-      }
-    );
+    // BACKED UP, NOT ABANDONED (owner 2026-08-20). Master is still in
+    // flight after the full in-render wait. See handleDeriveMasterBackup's
+    // own doc comment for the full contract; this used to fail the ad
+    // outright at MAX_DERIVE_WAIT_ATTEMPTS ("refusing Omni fallback") — that
+    // branch is gone. Raising VEO_CONCURRENCY/REMOTION_QUEUE_CONCURRENCY
+    // makes masters queue longer behind titling, so this fires more often;
+    // every ad that lands here is one the owner ordered and must still be
+    // delivered, not written off.
+    await handleDeriveMasterBackup({ ad, adId, master, deriveFromFmt, attempts, index, run });
     return;
   } else {
     // Master absent, failed without a plate, or archived — fail honestly.
@@ -5112,3 +5259,11 @@ module.exports.resolveOwnedProductIds = resolveOwnedProductIds;
 // the real functions.
 module.exports.buildErrorEntry = buildErrorEntry;
 module.exports.buildModerationRollup = buildModerationRollup;
+// DERIVE-WAIT BACKUP (2026-08-20), exported for behavioural pinning by
+// scripts/verifyDeriveWaitBackup.js. A source-text check alone would pass
+// against a reimplementation that kept the name but re-introduced the old
+// "fail after N attempts" branch; the harness drives the real function
+// (with requeue/notify injected) so the never-abandon contract is proven,
+// not assumed.
+module.exports.handleDeriveMasterBackup = handleDeriveMasterBackup;
+module.exports.notifyDeriveWaitBackup = notifyDeriveWaitBackup;
