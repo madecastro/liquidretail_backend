@@ -11,12 +11,22 @@
 // findings in a repo with no lint history. Add rules deliberately, one at a
 // time, each with a reason.
 
-const nodeGlobals = {
+// Bindings the CommonJS module wrapper injects. An ESM file does NOT get
+// these — require/module/exports/__dirname/__filename are genuinely unbound
+// in a .mjs, and reading one is exactly the ReferenceError no-undef exists to
+// catch. Kept OUT of esmGlobals rather than reused wholesale (see the .mjs
+// block below for why that reuse was a real gap).
+const commonjsWrapperGlobals = {
   require: 'readonly',
   module: 'writable',
   exports: 'writable',
   __dirname: 'readonly',
-  __filename: 'readonly',
+  __filename: 'readonly'
+};
+
+// Everything else is a real property of the Node global object, present in
+// both module systems.
+const esmGlobals = {
   process: 'readonly',
   console: 'readonly',
   Buffer: 'readonly',
@@ -54,6 +64,8 @@ const nodeGlobals = {
   crypto: 'readonly'
 };
 
+const nodeGlobals = { ...commonjsWrapperGlobals, ...esmGlobals };
+
 // Callbacks handed to page.evaluate/evaluateOnNewDocument are serialised and
 // run in the BROWSER, so document/window/navigator are legitimately defined
 // there even though the file itself is Node. Listed per-file rather than
@@ -81,6 +93,14 @@ module.exports = [
       'node_modules/**',
       'basecheck/**',
       '.claude/**',
+      // Gitignored local scratch, not repo source — .cache/ is the downloaded
+      // Chrome/chrome-headless-shell bundle (vendored extension JS full of
+      // `chrome`/`trustedTypes`), .drafts/ is throwaway spikes. Both
+      // accumulate real errors over time with no relation to any change,
+      // which keeps `npm run lint` red for reasons unrelated to what you
+      // touched — 173 errors here as of 2026-08-20.
+      '.cache/**',
+      '.drafts/**',
       'remotion/**',        // separate bundler + JSX toolchain
       'frontend/**',
       'public/**',
@@ -91,7 +111,7 @@ module.exports = [
     ]
   },
   {
-    files: ['**/*.js'],
+    files: ['**/*.js', '**/*.cjs'],
     languageOptions: {
       ecmaVersion: 2024,
       sourceType: 'commonjs',
@@ -109,20 +129,24 @@ module.exports = [
     }
   },
   {
-    // ESM harnesses. Identical rule set to the .js block above — the ONLY
-    // difference is sourceType, because these use import/export and would be
-    // a parse error under 'commonjs'. Split into its own block rather than
-    // widening the .js block's `files`, which is why this gap existed: adding
+    // ESM harnesses. Split into its own block rather than widening the .js
+    // block's `files`, which is why the original gap existed: adding
     // '**/*.mjs' there parses them as CommonJS and every one errors out.
     //
-    // Before this, `eslint .` resolved a config for .mjs but applied NO rules
-    // to them, so the suite exited 0 vacuously — 9 harnesses were unlinted
-    // while appearing to pass.
+    // globals is esmGlobals, NOT nodeGlobals — the first version of this
+    // block used nodeGlobals verbatim, which silently re-admits
+    // require/module/exports/__dirname/__filename as valid globals inside a
+    // .mjs. Those are genuinely unbound in ESM, so a harness reading one
+    // passed clean instead of erroring — the exact bug class this whole
+    // config exists to catch, just moved one file extension over. Verified:
+    // `console.log(require, module, exports, __dirname, __filename)` appended
+    // to a .mjs harness was 0 problems / exit 0 under the old block, and is
+    // 5 no-undef errors under this one.
     files: ['**/*.mjs'],
     languageOptions: {
       ecmaVersion: 2024,
       sourceType: 'module',
-      globals: nodeGlobals
+      globals: esmGlobals
     },
     linterOptions: {
       reportUnusedDisableDirectives: 'off'
