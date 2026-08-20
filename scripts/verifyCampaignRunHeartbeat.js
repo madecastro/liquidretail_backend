@@ -126,6 +126,17 @@
 //         → G5 fails. This check found a FOURTH surviving copy that three
 //           passes of hand-reading had missed.
 //
+//   ── Added 2026-08-20, tracing run_1787263897396_ef1fcb32 (9/9 Ads delivered,
+//      CampaignRun stuck 'running' until the operator cancelled it). ──
+//   21. Remove the leading beat (the isWorking()-gated write before
+//       setInterval starts) from startRunHeartbeat
+//         → E8 fails — a batch whose claimed work settles inside the first
+//           intervalMs window would go back to lastHeartbeatAt:null for its
+//           entire life even though it was genuinely alive throughout.
+//   22. Make the leading beat unconditional (drop its own isWorking() check)
+//         → E9 fails — an idle run would get exactly one beat it should
+//           never have gotten, weakening the reaper by one write's worth.
+//
 //   node scripts/verifyCampaignRunHeartbeat.js
 
 const assert = require('node:assert');
@@ -696,6 +707,33 @@ const AD_IDS = ['64b0000000000000000000a1', '64b0000000000000000000a2'];
     hb.stop();
   });
 
+  await okA('E8 LEADING BEAT: a working ticker writes BEFORE the first interval tick — a batch that settles inside intervalMs must not read lastHeartbeatAt:null for its whole life', async () => {
+    // THE GAP found tracing run_1787263897396_ef1fcb32: lastHeartbeatAt only
+    // moves on a setInterval tick, so a run whose claimed work starts AND
+    // ends inside the first intervalMs (up to 60s) window writes zero beats,
+    // ever — indistinguishable on the poller from a run that never had a
+    // liveness signal at all. intervalMs is set absurdly long here (an hour)
+    // specifically so NO interval tick can possibly fire during this test —
+    // any write that lands must be the leading beat, not a lucky race.
+    const { runWrites, adWrites, models } = recordingModels();
+    const hb = startRunHeartbeat({ runDocId: RUN_ID_OBJ, adIds: AD_IDS, isWorking: () => true, models, intervalMs: 60 * 60 * 1000 });
+    await sleep(30);
+    hb.stop();
+    assert.strictEqual(runWrites.length, 1, 'a working ticker must beat once immediately, before any interval tick');
+    assert.strictEqual(adWrites.length, 1);
+    assert.strictEqual(hb.beats, 1, 'the leading beat must count towards .beats, same accounting as an interval beat');
+  });
+
+  await okA('E9 LEADING BEAT is gated on isWorking() exactly like the interval — an idle ticker still writes nothing at t=0', async () => {
+    const { runWrites, adWrites, models } = recordingModels();
+    const hb = startRunHeartbeat({ runDocId: RUN_ID_OBJ, adIds: AD_IDS, isWorking: () => false, models, intervalMs: 60 * 60 * 1000 });
+    await sleep(30);
+    hb.stop();
+    assert.strictEqual(runWrites.length, 0, 'an unconditional leading beat would defeat the reaper exactly like an unconditional interval beat would');
+    assert.strictEqual(adWrites.length, 0);
+    assert.strictEqual(hb.idle, 1, 'the declined leading beat must still count as idle');
+  });
+
   // ════════════════════════════════════════════════════════════════════════
   // Group F — THE HEADLINE. Against the REAL exported reaper predicate.
   // ════════════════════════════════════════════════════════════════════════
@@ -797,8 +835,17 @@ const AD_IDS = ['64b0000000000000000000a1', '64b0000000000000000000a2'];
 
   ok('G2 worker.js\'s running sweep CALLS the shared builder — no hand-rolled copy of the predicate', () => {
     const code = stripCommentLines(workerSrc);
-    assert.ok(/CampaignRun\.updateMany\(\s*\n\s*buildStaleRunningFilter\(/.test(code),
-      'the running reap must be built by the shared, exported predicate so a harness can evaluate the real one');
+    // CampaignRun.find(...), not .updateMany(...), since the 2026-08-20
+    // Ad-truth reconciliation fix (services/campaignRunGuards.js
+    // classifyRunAdOutcome / buildRunReconciliationUpdate): each stale
+    // candidate needs its OWN claimed-Ad read before it can be judged
+    // done/failed/still-genuinely-rendering, so the blind bulk updateMany
+    // became a find() + per-row updateOne(). The predicate itself — what
+    // makes a CampaignRun a "stale running" CANDIDATE in the first place —
+    // is still the one shared, exported builder, which is what this check
+    // actually guards against drifting into a hand-rolled copy.
+    assert.ok(/CampaignRun\.find\(\s*\n\s*buildStaleRunningFilter\(/.test(code),
+      'the running reap must select its candidates via the shared, exported predicate so a harness can evaluate the real one');
     assert.ok(!/\{\s*status:\s*'running',\s*updatedAt:\s*\{\s*\$lt:\s*cutoff\s*\}\s*\}/.test(code),
       'the old inline running-reap literal must not come back');
     // And the two sweeps must stay on their own clocks.

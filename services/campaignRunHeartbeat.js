@@ -263,6 +263,12 @@ async function heartbeatOnce({ CampaignRun, Ad, runDocId, adIds = [], now = new 
  * ticker class), and a double clearInterval must be a no-op rather than a
  * second timer's worth of surprise.
  *
+ * Beats once IMMEDIATELY (gated on the same `isWorking()` the interval uses)
+ * before the first `setInterval` tick, then every `intervalMs` after that —
+ * see the "LEADING BEAT" comment inside for why a batch that settles inside
+ * the first interval must not read `lastHeartbeatAt: null` for its whole life.
+ *
+
  * @param {object}   opts.runDocId   CampaignRun._id
  * @param {string[]} opts.adIds      this run's claimed ad ids (the Ad arm)
  * @param {function} opts.isWorking  () => boolean. THE GATE. Must report the
@@ -292,6 +298,27 @@ function startRunHeartbeat({
   let expired = false;
   let beats   = 0;
   let idle    = 0;
+
+  // LEADING BEAT. Without this, `lastHeartbeatAt` stays null for the whole
+  // first `intervalMs` (up to 60s) after real work starts — and a run whose
+  // claimed work settles inside that window (a short batch, or a process
+  // that dies moments after claim) can show `lastHeartbeatAt: null` for its
+  // ENTIRE life even though it was genuinely alive the whole time. Gated by
+  // the SAME `isWorking()` check the interval uses below, so this cannot
+  // beat a run with nothing in flight — it only moves the FIRST honest beat
+  // from "one tick from now" to "right now".
+  let leadingWorking = false;
+  try {
+    leadingWorking = typeof isWorking === 'function' ? !!isWorking() : false;
+  } catch {
+    leadingWorking = false;
+  }
+  if (leadingWorking) {
+    beats += 1;
+    heartbeatOnce({ CampaignRun, Ad, runDocId, adIds, now: new Date() }).catch(() => {});
+  } else {
+    idle += 1;
+  }
 
   const timer = setInterval(() => {
     if (stopped) return;

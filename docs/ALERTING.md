@@ -819,8 +819,10 @@ verified state, not that raw pass.
   underneath it — replacing a client-side poll timeout that used to stop polling
   entirely and freeze the display mid-run.
 
-Pinned by `scripts/verifyRunStatusTruthfulness.js` (14 checks, revert-proven on 4
-mutations).
+Pinned by `scripts/verifyRunStatusTruthfulness.js` (14 checks at the time,
+revert-proven on 4 mutations — grown to 24 checks by the 2026-08-20 follow-up
+below, which pins the terminal-status reconciliation this table did not yet
+cover).
 
 ### Vision-QC surfacing (2026-08-19, follow-up)
 
@@ -1096,6 +1098,76 @@ window to scope `GET /runs/:runId`'s handler, which this session's
 `verifyRunStatusTruthfulness.js` already fixed once by bounding at the next
 `router.METHOD(` declaration instead of a hand-tuned count. Ported that pattern
 in rather than bumping the number again.
+
+### CampaignRun terminal-status reconciliation (2026-08-20, follow-up)
+
+The gap table above closed "was this run reaped, and why" — it did not close
+"is this run's own status/counters actually TRUE". Measured in production,
+`run_1787263897396_ef1fcb32`: all 9 claimed Ads settled to `draft` with a real
+`renderUrl` (delivered), but `CampaignRun.status` never left `'running'` — it
+only became `'failed'` once the operator, seeing what looked like a permanent
+spinner, cancelled it. Sibling shape, opposite arrow, also observed: a run
+stamped `'failed'` with a stale `succeeded:18` while all 39 of its claimed Ads
+already carried a `renderUrl`.
+
+Root cause: `CampaignRun.status` is written ONLY by process-local code — the
+render loop's own post-`Promise.all` `done` write (`routes/ads.js`), or the
+reaper's blind `failed` stamp (`worker.js reapOrphans`, `buildStaleRunningReapUpdate`)
+— and nothing ever re-derives it from the Ads the run actually claimed. Two
+paths that never touch `CampaignRun` at all — `titlingResumeService`,
+`bootRecoveryService` — can drive an Ad all the way to its terminal
+`draft`+`renderUrl` shape (e.g. after the process holding the original
+`runRenderLoop` closure dies mid-render and a boot-recovery pass in a
+replacement process finishes the already-billed work for free). So a run
+whose original process died can have every claimed Ad already delivered by
+the time anything looks at the row again, and nothing was ever going to
+notice.
+
+`services/campaignRunGuards.js` gained `classifyRunAdOutcome` (pure — given the
+real `Ad.find({ campaignRunIds: runId })` rows a run claimed, decides whether
+every one has settled, and if so whether any was genuinely lost back to
+`'queued'`) and `buildRunReconciliationUpdate` (the honest terminal write,
+built from that verdict — `'done'` with real `succeeded`/`failed` counts if
+nothing was lost, `'failed'` via the SAME reaper explanation otherwise, still
+with real counts instead of stale zeros). `worker.js reapOrphans()` now reads
+each stale-`'running'` candidate's real claimed Ads BEFORE deciding its fate,
+instead of blindly bulk-stamping the whole candidate set `'failed'`. A
+candidate with a receipt-holding Ad still genuinely `'rendering'` (the reaper's
+own Ad-sweep deliberately never requeues those — `services/spendReceipt.js` —
+so it can finish for free instead of being paid for twice) is left alone
+entirely; often that Ad is simply waiting behind a sibling run's share of the
+global `VEO_CONCURRENCY`/`REMOTION_QUEUE_CONCURRENCY` pools, not stalled.
+
+**Deliberately does NOT resurrect an already-`'failed'` run to `'done'`** —
+`buildTerminalDoneFilter`'s `preparing|running`-only allow-list (the D3
+invariant in `scripts/verifyRunAlertsAndDoneGuard.js`) is untouched. The
+historical `run_1787263897396_ef1fcb32` document itself is not corrected
+retroactively (same forward-only posture as the other closed-off incidents in
+`session.d/KNOWN-OPEN.md`); this closes the CLASS going forward — a future run
+in this exact shape gets reconciled to `'done'` (or an honestly-counted
+`'failed'`) instead of stamped wrong.
+
+**Also closed a smaller, related gap**: `services/campaignRunHeartbeat.js`'s
+ticker only wrote `lastHeartbeatAt` on a `setInterval` tick, so a batch whose
+claimed work settled inside the first `intervalMs` window (up to 60s) could
+read `lastHeartbeatAt: null` for its entire life despite being genuinely alive
+throughout. `startRunHeartbeat` now beats once immediately (gated on the same
+`isWorking()` the interval uses) before the first tick.
+
+**Not addressed, assessed only**: `VEO_CONCURRENCY`/`REMOTION_QUEUE_CONCURRENCY`
+are global pools shared across all concurrent runs, not per-run, so a second
+run's ads can queue behind a first run's batch with no operator-visible signal
+that this is *waiting for a slot* rather than *stuck*. The UI has no
+distinction between those two states today. This is a real product-clarity
+gap worth a frontend follow-up (a queued-behind-pool state, distinct from
+both "working" and "stuck"), but the concurrency values themselves are tuned
+against spend and were deliberately left alone here.
+
+Pinned by `scripts/verifyRunStatusTruthfulness.js` (24 checks total, 10 new for
+this fix, revert-proven on 6 mutations — see its section E header) and
+`scripts/verifyCampaignRunHeartbeat.js` (42 checks total, 2 new for the leading
+beat, revert-proven on 2 mutations — see its E8/E9 and the revert-prove list's
+items 21-22).
 
 ## Known gap this does not close
 

@@ -68,10 +68,15 @@ const {
   summarizeInFlightStages,
   stageBase
 } = require('../services/adStage');
-const { buildStaleRunningReapUpdate } = require('../services/campaignRunGuards');
+const {
+  buildStaleRunningReapUpdate,
+  classifyRunAdOutcome,
+  buildRunReconciliationUpdate
+} = require('../services/campaignRunGuards');
 
 const ROOT = path.join(__dirname, '..');
 const adsSrc = fs.readFileSync(path.join(ROOT, 'routes/ads.js'), 'utf8');
+const workerSrcForE = fs.readFileSync(path.join(ROOT, 'worker.js'), 'utf8');
 
 let checks = 0;
 // ASYNC-AWARE on purpose: several checks below (section B) exercise
@@ -293,10 +298,192 @@ await ok('D3 the queued-drain run-crash handler pushes a real errors[] entry on 
 
 await ok('D4 the running-reaper in worker.js uses the shared builder, not an inline duplicate', () => {
   const workerSrc = fs.readFileSync(path.join(ROOT, 'worker.js'), 'utf8');
-  assert.match(workerSrc, /buildStaleRunningReapUpdate\(REAP_STALE_MIN\)/,
-    'worker.js reapOrphans() must call the shared, harness-tested update builder — ' +
+  // worker.js calls buildRunReconciliationUpdate(...), not
+  // buildStaleRunningReapUpdate(...) directly, since the 2026-08-20 Ad-truth
+  // reconciliation fix (services/campaignRunGuards.js) — a blind reap write
+  // is no longer correct on its own; every candidate is judged from its real
+  // claimed Ads first (see section E below for that pin).
+  // buildRunReconciliationUpdate ITSELF still calls buildStaleRunningReapUpdate
+  // for the needsRetry branch (services/campaignRunGuards.js), so the
+  // errors[] message this test exists to protect is not duplicated anywhere
+  // — checked directly below rather than via worker.js's own source text.
+  assert.match(workerSrc, /buildRunReconciliationUpdate\(/,
+    'worker.js reapOrphans() must call the shared reconciliation builder — ' +
     'an inlined copy is exactly how this drifted from having an errors[] entry in the first place');
+  assert.doesNotMatch(workerSrc, /\$push:\s*\{\s*errors:\s*\{\s*index:\s*0,\s*stage:\s*'reaper'/,
+    'the reaper errors[] shape must come from the shared builder, not a hand-rolled copy inlined into worker.js');
+  const guardsSrc = fs.readFileSync(path.join(ROOT, 'services/campaignRunGuards.js'), 'utf8');
+  assert.match(guardsSrc, /function buildRunReconciliationUpdate[\s\S]*?buildStaleRunningReapUpdate\(staleMin\)/,
+    'buildRunReconciliationUpdate must itself delegate to buildStaleRunningReapUpdate for the ' +
+    'needsRetry branch, not re-derive the reaper errors[] message a second way');
 });
+
+// ── E. Ad-truth reconciliation (2026-08-20 incident fix) ──────────────────
+//
+// run_1787263897396_ef1fcb32: 9/9 claimed Ads settled to `draft` with a real
+// renderUrl (delivered), but CampaignRun.status never left 'running' — it
+// only became 'failed' once the operator, seeing what looked like a
+// permanent spinner, cancelled it. Root cause: CampaignRun.status is written
+// ONLY by process-local code (runRenderLoop's post-Promise.all `done` write,
+// or the reaper's blind `failed` stamp) and NOTHING ever re-derives it from
+// the run's actual claimed Ads — so a run whose owning process died can sit
+// 'running' forever even after every Ad it claimed is genuinely delivered by
+// a completely different path (titlingResumeService, bootRecoveryService)
+// that never touches CampaignRun at all.
+//
+// Sibling shape, same root cause, opposite arrow: a run reaped to 'failed'
+// with stale succeeded:18 while all 39 of its claimed Ads already carried a
+// renderUrl — the reaper's blind write never looked at the Ads either.
+//
+// classifyRunAdOutcome / buildRunReconciliationUpdate (services/
+// campaignRunGuards.js) close this by having worker.js's reaper read the
+// REAL claimed Ads for every stale-running candidate before writing
+// anything, rather than trusting the CampaignRun row's own (possibly dead)
+// bookkeeping.
+//
+// Revert-prove (each mutation below must fail this harness):
+//   1. classifyRunAdOutcome always returns isSettled:true (drop the
+//      stillRendering check) → E3 fails (a receipt-holding still-rendering
+//      Ad would let a genuinely in-flight run be finalized).
+//   2. classifyRunAdOutcome never sets needsRetry (drop the requeuedAway
+//      check) → E4 fails (an Ad genuinely lost back to 'queued' would be
+//      silently treated as a clean finish).
+//   3. buildRunReconciliationUpdate's done branch also $sets `skipped` or
+//      `total` → E6 fails (same money-safety posture as C1, now on the new
+//      write path).
+//   4. buildRunReconciliationUpdate's needsRetry branch stops delegating to
+//      buildStaleRunningReapUpdate (hand-rolls its own errors[] message)
+//      → E7/D4 fail.
+//   5. worker.js goes back to a blind `CampaignRun.updateMany(
+//      buildStaleRunningFilter(...), buildStaleRunningReapUpdate(...))`
+//      → E9 fails (no per-candidate Ad.find, no classifier, no
+//      reconciliation update in the source at all).
+//   6. worker.js's reconciliation loop drops the `continue` for an unsettled
+//      candidate (so it falls through to a write) → E10 fails.
+
+const CLAIMED_ADS_DRAFT_ONLY = [
+  { status: 'draft' }, { status: 'draft' }, { status: 'draft' },
+  { status: 'draft' }, { status: 'draft' }, { status: 'draft' },
+  { status: 'draft' }, { status: 'draft' }, { status: 'draft' }
+];
+
+await ok('E1 classifyRunAdOutcome: all 9 claimed Ads draft+delivered — settled, no retry needed, honest counts (THE INCIDENT SHAPE)', () => {
+  const outcome = classifyRunAdOutcome(CLAIMED_ADS_DRAFT_ONLY);
+  assert.strictEqual(outcome.succeeded, 9);
+  assert.strictEqual(outcome.failed, 0);
+  assert.strictEqual(outcome.stillRendering, 0);
+  assert.strictEqual(outcome.requeuedAway, 0);
+  assert.strictEqual(outcome.isSettled, true);
+  assert.strictEqual(outcome.needsRetry, false);
+});
+
+await ok('E2 classifyRunAdOutcome: a genuine mix of draft + Ad.status:\'failed\' is still SETTLED — done means finished, not all-succeeded', () => {
+  const outcome = classifyRunAdOutcome([
+    { status: 'draft' }, { status: 'draft' }, { status: 'failed' }, { status: 'live' }, { status: 'archived' }
+  ]);
+  assert.strictEqual(outcome.succeeded, 4, 'draft + live + archived all count as delivered');
+  assert.strictEqual(outcome.failed, 1);
+  assert.strictEqual(outcome.isSettled, true);
+  assert.strictEqual(outcome.needsRetry, false,
+    'a settled mix of success/failure is a COMPLETED run, not one that lost work');
+});
+
+await ok('E3 classifyRunAdOutcome: ANY receipt-holding Ad still \'rendering\' blocks finalization, however many others are draft', () => {
+  const outcome = classifyRunAdOutcome([
+    { status: 'draft' }, { status: 'draft' }, { status: 'draft' }, { status: 'draft' },
+    { status: 'draft' }, { status: 'draft' }, { status: 'draft' }, { status: 'draft' },
+    { status: 'rendering' } // the 9th ad, still genuinely cooking behind a shared pool
+  ]);
+  assert.strictEqual(outcome.stillRendering, 1);
+  assert.strictEqual(outcome.isSettled, false,
+    'one still-rendering ad must block BOTH done and failed — real paid-for work is outstanding');
+});
+
+await ok('E4 classifyRunAdOutcome: an Ad reset to \'queued\' (genuinely lost, not requeued yet by this pass) forces needsRetry', () => {
+  const outcome = classifyRunAdOutcome([
+    { status: 'draft' }, { status: 'draft' }, { status: 'queued' }
+  ]);
+  assert.strictEqual(outcome.isSettled, true, 'no ad is still rendering, so this candidate CAN be finalized');
+  assert.strictEqual(outcome.needsRetry, true, 'a lost claim must still read failed, honestly');
+  assert.strictEqual(outcome.succeeded, 2);
+});
+
+await ok('E5 classifyRunAdOutcome: empty claimed-ads list is vacuously settled with nothing to retry (defensive, not the expected shape)', () => {
+  const outcome = classifyRunAdOutcome([]);
+  assert.strictEqual(outcome.isSettled, true);
+  assert.strictEqual(outcome.needsRetry, false);
+  assert.strictEqual(outcome.succeeded, 0);
+});
+
+await ok('E6 buildRunReconciliationUpdate: settled + no retry → status:\'done\' with REAL counts, and ONLY status/completedAt/succeeded/failed (money-safety)', () => {
+  const outcome = classifyRunAdOutcome(CLAIMED_ADS_DRAFT_ONLY);
+  const now = new Date('2026-08-20T22:40:00Z');
+  const u = buildRunReconciliationUpdate(outcome, { staleMin: 15, now });
+  assert.deepStrictEqual(Object.keys(u), ['$set'], 'a clean finish must not also $push an errors[] entry');
+  assert.strictEqual(u.$set.status, 'done');
+  assert.strictEqual(u.$set.completedAt, now);
+  assert.strictEqual(u.$set.succeeded, 9, 'THE FIX: the run must be closed out with the REAL delivered count, not a stale 0');
+  assert.strictEqual(u.$set.failed, 0);
+  const setKeys = Object.keys(u.$set).sort();
+  assert.deepStrictEqual(setKeys, ['completedAt', 'failed', 'status', 'succeeded'],
+    'must never touch total/skipped/mintedTotal — same money-safety posture as C1, now on this write path');
+});
+
+await ok('E7 buildRunReconciliationUpdate: settled + needsRetry → status:\'failed\' via the SAME reaper errors[] message, but with real counts', () => {
+  const outcome = classifyRunAdOutcome([
+    { status: 'draft' }, { status: 'draft' }, { status: 'queued' }
+  ]);
+  const now = new Date('2026-08-20T22:40:00Z');
+  const u = buildRunReconciliationUpdate(outcome, { staleMin: 15, now });
+  assert.strictEqual(u.$set.status, 'failed');
+  assert.strictEqual(u.$set.completedAt, now);
+  assert.strictEqual(u.$set.succeeded, 2, 'THE SIBLING FIX: honest succeeded count instead of a stale 0/undercounted value');
+  assert.strictEqual(u.$set.failed, 0);
+  assert.ok(u.$push && u.$push.errors, 'must still carry the reaper explanation');
+  assert.strictEqual(u.$push.errors.stage, 'reaper');
+  assert.match(u.$push.errors.message, /15m/);
+  // Byte-identical message to the blind builder for the same staleMin — this
+  // IS delegation, not a parallel re-derivation that could drift.
+  assert.strictEqual(u.$push.errors.message, buildStaleRunningReapUpdate(15).$push.errors.message);
+});
+
+await ok('E8 buildRunReconciliationUpdate never resurrects a filter — callers must still gate the write on status:\'running\' themselves', () => {
+  // This function returns only the UPDATE half; it has no _id/status filter
+  // of its own to accidentally get wrong. Documented here so a future
+  // change that tries to fold a filter into this function's return value
+  // gets caught by this having to change at all.
+  const outcome = classifyRunAdOutcome(CLAIMED_ADS_DRAFT_ONLY);
+  const u = buildRunReconciliationUpdate(outcome, { staleMin: 15, now: new Date() });
+  assert.ok(!('_id' in u) && !('status' in u), 'the update object must carry no filter-shaped keys of its own');
+});
+
+await ok('E9 worker.js wires find → per-candidate Ad.find(campaignRunIds) → classifyRunAdOutcome → buildRunReconciliationUpdate → status-guarded updateOne', () => {
+  const code = stripCommentLinesForWorker(workerSrcForE);
+  assert.match(code, /CampaignRun\.find\(\s*\n\s*buildStaleRunningFilter\(/,
+    'candidates must come from the shared predicate, not a hand-rolled filter');
+  assert.match(code, /Ad\.find\(\s*\{\s*campaignRunIds:\s*candidate\.runId\s*\}/,
+    'each candidate must be judged from ITS OWN claimed Ads, not a blind bulk write');
+  assert.match(code, /classifyRunAdOutcome\(/, 'must call the shared classifier, not a hand-rolled count');
+  assert.match(code, /buildRunReconciliationUpdate\(/, 'must call the shared reconciliation update builder');
+  assert.match(code, /CampaignRun\.updateOne\(\s*\{\s*_id:\s*candidate\._id,\s*status:\s*'running'\s*\}/,
+    'the finalizing write must re-check status:\'running\' at write time (CAS) — a run this same tick already ' +
+    'resolved some other way must not be clobbered');
+});
+
+await ok('E10 worker.js skips (does not write) an unsettled candidate — the `continue` before any updateOne', () => {
+  const code = stripCommentLinesForWorker(workerSrcForE);
+  const m = code.match(/if\s*\(!outcome\.isSettled\)\s*\{([\s\S]*?)\}/);
+  assert.ok(m, 'could not locate the isSettled guard in worker.js\'s reconciliation loop');
+  assert.match(m[1], /continue/, 'an unsettled candidate (real receipted work still rendering) must be left alone this tick');
+  assert.doesNotMatch(m[1], /updateOne|updateMany/, 'no write may happen for a candidate that is not yet settled');
+});
+
+function stripCommentLinesForWorker(src) {
+  return src
+    .split('\n')
+    .filter((line) => !/^\s*\/\//.test(line))
+    .join('\n');
+}
 
 if (process.exitCode) {
   console.log(`\n❌ verifyRunStatusTruthfulness: failures above (${checks} passed)`);
