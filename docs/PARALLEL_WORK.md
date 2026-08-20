@@ -696,10 +696,50 @@ worker-pool runner reporting the same per-script verdict (process exit code).
 | Verdict | 169/169 pass, 0 failures | 169/169 pass, 0 failures — **identical set, identical result** |
 
 `--affected` mode selects scripts by (a) the script itself changed, or (b) its
-source text mentions the basename of a changed file — a heuristic dev-speed
-tool, explicitly documented as not a substitute for the full suite before
-pushing. `--list`/`--concurrency`/`--timeout` flags; no shelled-out `timeout`
-binary (macOS has none) — per-script timeout is a JS timer + `child.kill()`.
+source text mentions a changed file — a heuristic dev-speed tool, explicitly
+documented as not a substitute for the full suite before pushing.
+`--list`/`--concurrency`/`--timeout` flags; no shelled-out `timeout` binary
+(macOS has none) — per-script timeout is a JS timer + `child.kill()`.
+
+**`--affected`'s bare-basename matcher silently zeroed itself out on short
+filenames — found and fixed 2026-08-19.** The first version gated its
+substring match to basenames `>= 4` chars "to avoid drowning the selection in
+noise." That gate did not just add noise-avoidance, it **excluded every short
+filename outright**: `models/Ad.js` → basename `"Ad"` (2 chars) never matched
+anything, so editing the Ad schema alone reported "no verify scripts
+affected... Nothing to run" with **exit 0** — a confident, silent false
+negative — even though 7 verify scripts directly `require('../models/Ad')`.
+Same hole for `models/Job.js` ("Job"), `routes/me.js` ("me"), and
+`routes/ads.js` ("ads") — the single most-edited file in this repo.
+
+**The fix, in two parts, not one:**
+1. A **precise `dir/basename` check with no length gate** runs first —
+   e.g. `"models/Ad"` for `models/Ad.js`, `"routes/ads"` for `routes/ads.js`.
+   That's what a real `require('../models/Ad')` looks like as a substring, and
+   it's specific enough that a length gate was never actually needed for it —
+   short filenames now match exactly instead of being dropped.
+2. For any changed file that still matches **nothing**, and lives under
+   `CORE_DIRS` (`models/`, `routes/`, `services/`, `middleware/`, `config/`,
+   `utils/`, `pipelines/`, `remotion/`, `schemas/` — directories everything
+   else routinely `require()`s), `computeAffected` refuses to report a clean
+   "nothing selected." It fails loud and returns `null`, and the caller falls
+   back to running the **full suite** — because a core-dir file matching no
+   script is a heuristic gap, never proof the file has zero dependents.
+
+**Verified on this tree, each as an isolated uncommitted edit diffed against
+`HEAD`:**
+
+| Changed file | Old behavior | New behavior |
+|---|---|---|
+| `models/Ad.js` | basename `"Ad"` (2 chars) → **nothing selected**, exit 0 | 14 scripts selected, including all 7 real dependents (`verifyArchiveDigestRelease`, `verifyBasePlateCropOrder`, `verifyAgentRegistry`, `verifyPmaxVideoExpansion`, `verifyQueuedArchiveNotice`, `verifyStrandedSweep`, `verifyTitlingResume`) |
+| `routes/ads.js` | basename `"ads"` (3 chars) → **nothing selected**, exit 0 | 36 scripts selected |
+| `routes/me.js` | basename `"me"` (2 chars) → **nothing selected**, exit 0 | 1 script selected (`verifyAgentRegistry.js`) — precise, not a full-suite fallback |
+| `routes/salesDemos.js` | already worked (`>=4` chars) | 2 scripts selected — confirms a real narrow dependency still selects narrowly, not just core-dir files that happen to fail loud |
+| `models/Job.js` | basename `"Job"` (3 chars) → **nothing selected**, exit 0 | matches no script (real: `Job.js` has no direct verify-script dependent today) → `CORE_DIRS` fires, refuses the false "clean," falls back to the full 173-script suite |
+
+The `models/Job.js` row is the fail-loud path exercising for real, not a
+constructed example: it is a genuine `CORE_DIRS` file with zero current verify
+dependents, and the runner correctly declines to call that "nothing to run."
 
 Audited for parallel-safety before building this: no `scripts/verify*` script
 talks to a live DB or network (the ~9 touching `mongoose` do so for in-memory
@@ -829,33 +869,111 @@ result means "needs a human look," not "proven lost." Wired as
 
 ### Gate
 
-`npm run lint` clean throughout. Full 169-script suite green after every
-change in this session, including post-rebase.
+`npm run lint` clean throughout. Full suite green after every change in this
+session, including post-rebase (169 scripts at the time this section was
+first written; 173 after the 2026-08-19 rebase onto a `main` that had moved
+another 6 commits — see the correction immediately below).
 
-**Honest characterization of the parallel runner's determinism, not just the
-best-case number above:** across roughly 16 full-suite runs during this
-session, 14 were a clean 169/169; two were 168/169, each time a **different**
-single script (`verifyVideoResume.js` once, `verifyQuoteSurfaceLength.js`
-once), and in both cases the same script re-run standalone immediately passed
-100%, as did the very next full-suite run. Both failing scripts require
-heavy service modules (`atlasVideoService.js` + `bootRecoveryService.js`;
-`directImageRenderService.js`) with substantial transitive `require()` graphs
-— the most plausible explanation is transient resource contention from eight
-Node processes cold-starting their module graphs at once on this machine, not
-a logic bug in either script (their failing checks are pure static-regex
-assertions over already-loaded source text, with no timers, no I/O, and no
-env-dependence — nothing in either check should be capable of a
-concurrency-dependent result). **This was not chased to a root cause** — the
-fix, if one is warranted, is either lowering `--concurrency` or investigating
-Node's module-loading behavior under this specific sandbox, and it did not
-seem worth spending further budget on a ~12% per-run chance of a single
-already-explained, non-reproducible flake. **Policy recommendation instead of
-a fix:** if the runner reports a failure, re-run that one script standalone
-(`node scripts/<name>.js`) before treating it as a real regression — this
-matches the repo's existing testing culture (revert-prove, state residuals
-honestly) better than silently auto-retrying inside the runner, which would
-risk masking a script that is *genuinely* flaky rather than environmentally
-unlucky. The runner does not auto-retry, by design.
+**The flake: root-caused and fixed (2026-08-19), superseding everything this
+subsection said before.** The paragraph that used to be here claimed "a
+single **different each time** script," "likely module-load contention," "not
+chased to a root cause," and recommended re-running a failing script
+standalone before treating it as a regression. An adversarial review measured
+the runner directly instead of trusting that writeup, and **every one of
+those claims was wrong**:
+
+- **25 runs at the default `--concurrency=8`: 170/170 every time, zero
+  flakes.**
+- **20 runs at `--concurrency=16`: 4 failures (20%) — and contrary to
+  "different each time," every single failure was the *same* script,
+  `verifyDirectorFallbackChain.js`.**
+
+**Root cause, actually chased down this time:** check **C4** in that script
+sets `ATLAS_LLM_CHAIN_BUDGET_MS=60`, stubs the upstream HTTP call to burn 40ms
+of **real wall clock** via `setTimeout`, and asserts exactly 2 calls start
+inside that 60ms **real-clock** window before `atlasLlmService`'s budget gate
+(`Date.now() - startedAt < CHAIN_BUDGET_MS`, itself real-clock) refuses a
+third. Under CPU oversubscription — 16 Node processes contending for this
+machine's 10 cores — the scheduler does not guarantee a `setTimeout(40)`
+returns inside a 60ms window, so call #2 sometimes never starts and
+`calls.length` comes back 1 instead of 2. That is a hardcoded-real-timer race
+between the test's own stub and the OS scheduler, not module-load contention
+and not a bug in the budget logic itself — the two "it's probably these two
+unrelated heavy-`require()` scripts" guesses in the old writeup were never
+checked against evidence.
+
+**Why "re-run it standalone before treating it as a real regression" was
+actively unsafe, not just factually wrong:** a standalone rerun has zero
+contention, so it clears this exact failure class *every single time* —
+which means a genuine future regression in `atlasLlmService`'s budget gating
+that manifests the same way ("saw N-1 calls instead of N") is
+indistinguishable from this known flake under that policy, and the
+recommended remedy would launder it straight through as "just the flake."
+
+**The fix:** C4 no longer races a real timer against a real clock. Both are
+faked for the duration of the check — `Date.now` is stubbed, and the HTTP
+stub advances a logical counter by 40 instead of actually waiting 40ms — so
+the budget gate now evaluates against *computed* elapsed time, never
+*measured* elapsed time. This asserts the gate's actual logic
+deterministically instead of racing the host scheduler to exercise it.
+
+Three more scripts use the same real-`setTimeout`-inside-an-async-check
+shape and were individually audited for the same failure class, not just
+pattern-matched by their file names:
+
+- **`verifyIngestShotClassify.js` (check J4)** races `safeFetchBuffer`'s real
+  `AbortController` deadline against real per-hop delays (`TIMEOUT_MS=200` vs
+  `HOP_MS=80`) — structurally the same shape as C4, with a wider margin
+  (2.5x vs C4's ~1.5x) that did not reproduce a failure across repeated
+  stress runs at `--concurrency=16`. Unlike `atlasLlmService`'s budget gate,
+  `safeFetchBuffer`'s abort timer isn't behind an injectable clock, so making
+  it deterministic the way C4 was fixed would mean changing production
+  fetch/abort code, not just the test — out of scope here. Instead its
+  `TIMEOUT_MS`/`HOP_MS` were widened 5x (1000ms/400ms, same ratios, same
+  assertions), which shrinks scheduler jitter to a much smaller fraction of
+  every window and cuts the residual risk without touching `safeFetchBuffer`
+  itself.
+- **`verifyTitlingPermit.js`** and **`verifyScrapeSession.js`** also call
+  `setTimeout` inside async checks, but neither races a tight real-time
+  budget: one uses it purely as concurrency-creating scaffolding for a
+  `Semaphore` peak-count assertion (any nonzero delay creates the overlap;
+  the assertion doesn't depend on its size) plus a 500ms deadlock watchdog
+  with a wide margin, the other purely to let four concurrent callers pile up
+  before a stub resolves, for a refresh-de-dupe assertion. Neither needed a
+  change.
+
+**Fresh evidence, post-fix:** C4 in isolation (`node
+scripts/verifyDirectorFallbackChain.js`, standalone, no pool) — **30/30 clean**,
+matching the "both clocks are now faked" design: nothing left for the OS
+scheduler to race.
+
+The pooled full-suite claim needs an honest caveat instead of a clean number.
+Measured at `--concurrency=16` on this 10-core machine, but with **6-10 other
+Claude Code sessions' background agents actively running** at the same time
+(51-63 concurrent `node` processes system-wide, not the pool's own 16) — a
+condition this repo now runs in most nights, not a contrived worst case.
+Under that load, some runs surfaced 1-2 failures in `verifyRenderFailureRecord.js`
+and `verifyVideoRetryOnUnbilledFailure.js` — **not** `verifyDirectorFallbackChain.js`,
+and neither script is part of this fix's scope. A cold, single-shot run of the
+same suite passed 173/173. This reads as genuine machine-level contention
+(real CPU/memory pressure from unrelated processes), not evidence the C4 fix
+regressed — but it means "16" is not a safe universal default divorced from
+how loaded the host already is. **Do not claim a clean N-run/zero-flake
+number for the pooled suite under realistic host load until those two
+scripts are themselves audited for the same hardcoded-real-timer pattern that
+made C4 flaky** — that audit is unstarted, flagged here rather than done
+speculatively.
+
+**The policy, corrected:** there is no sanctioned "re-run it and see." A
+runner failure is a real failure until proven otherwise by root-causing it —
+the way C4 was here — never by a clean rerun, which proves nothing about a
+race and everything about the absence of contention. The one honest
+quarantine mechanism is `UNSAFE_FOR_PARALLEL` in `runVerifySuite.js`: a
+script whose real-time dependence genuinely cannot be made deterministic gets
+listed there and runs alone, serially, after the parallel pool drains — a
+stated, auditable exception, not a shrug. It is empty today; all four
+audited real-timer scripts either got fixed outright (C4) or were confirmed,
+individually, not to need it.
 
 ---
 
