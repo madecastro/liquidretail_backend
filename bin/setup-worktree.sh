@@ -51,8 +51,21 @@ else
 fi
 
 if [ ! -d node_modules/sharp ]; then
-  echo "-- installing sharp (native module, never committed)"
-  npm install --no-save sharp
+  # Pinned to the exact version package.json declares (^0.33.5, which for a
+  # 0.x range only floats the patch — 0.33.5 is effectively the only version
+  # in practice). An earlier version of this line installed plain `sharp`
+  # with no version at all, which grabs npm's CURRENT latest regardless of
+  # package.json — unlike https-proxy-agent right above, which was already
+  # pinned. That matters here specifically because
+  # verifyLogoColorPreservation.js's L1 checks assert a documented,
+  # version-specific bug in sharp@0.33.5's `.extract().stats()`: a different
+  # version can behave differently there, silently changing what the harness
+  # actually verifies. The harness itself now also asserts its loaded sharp
+  # version explicitly, so a mismatch (e.g. a nested worktree resolving a
+  # parent checkout's different copy — see the node_modules note above) fails
+  # loud instead of running version-sensitive checks against the wrong build.
+  echo "-- installing sharp@0.33.5 (native module, never committed; pinned to match package.json)"
+  npm install --no-save sharp@0.33.5
 else
   echo "-- sharp already present, skipping"
 fi

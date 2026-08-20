@@ -20,11 +20,38 @@
  * WHAT THIS DOES: lists tracked files with uncommitted changes (staged or
  * unstaged — NOT untracked scratch files, which this repo's shared checkout
  * accumulates by the dozen and are a separate, lower-stakes kind of clutter)
- * and flags any whose most recent write is older than a threshold. Age is a
- * proxy via mtime, not a perfect signal — but "this tracked file has had an
- * uncommitted diff sitting on disk for N+ hours" is exactly the condition
- * that went undetected for 9 hours in the real incident, and this makes it
- * a one-command check instead of a lucky question from the owner.
+ * and flags any whose diff has existed longer than a threshold.
+ *
+ * Revised 2026-08-19 — two fixes, both confirmed by reproduction:
+ *
+ *   1. RENAME MISPARSE: `git status --porcelain -z` puts a rename record as
+ *      `XY <newpath>\0<oldpath>\0` — confirmed empirically (`git mv a b`
+ *      produces `R  b\0a\0`, NOT the other order). The previous parser
+ *      correctly read the new path from the first field, then
+ *      UNCONDITIONALLY OVERWROTE it with the second (old-path) field,
+ *      reporting a fresh, intentional `git mv` as a stale deletion of a
+ *      file that no longer exists (`fs.statSync` on the old name throws,
+ *      read as "unknown age (deleted)" and always flagged stale). Fixed by
+ *      keeping the first field as-is and just consuming the trailing
+ *      old-path field without using it.
+ *
+ *   2. MTIME IS NOT A PROXY FOR "HOW LONG HAS THIS DIFF EXISTED": a plain
+ *      `touch`, an editor's format-on-save, or — very concretely, in THIS
+ *      repo — the `withTempMutation`-shaped verify* harnesses
+ *      (verifyVideoCostReconcile.js, verifyVideoTimeoutReconcile.js,
+ *      verifyQuoteRotation.js) that `fs.writeFileSync` a mutated copy of a
+ *      real repo file in place, then restore the original bytes, all
+ *      rewrite mtime to "now" with zero net content change — silently
+ *      resetting the staleness clock on a genuinely old, unrelated
+ *      uncommitted diff sitting on that same file, or making the tool
+ *      think a file just became dirty when nothing changed. Fixed by
+ *      tracking age from the DIFF'S CONTENT, not the file's mtime: a
+ *      per-checkout state file (under `git rev-parse --git-dir`, so each
+ *      worktree gets its own — never a tracked/committed path) remembers a
+ *      hash of `git diff HEAD -- <file>` and the timestamp it was first
+ *      observed; unchanged diff content reuses the original "first seen"
+ *      time regardless of how many times the file was rewritten to disk in
+ *      between, and only a genuinely different diff resets the clock.
  *
  * USAGE
  *   node scripts/findStaleUncommittedWork.js                  # this checkout, 2h threshold
@@ -33,8 +60,9 @@
  *   node scripts/findStaleUncommittedWork.js --json
  *
  * This is a REPORTING tool, not a rescue tool — it never commits, stashes,
- * or touches any file. When it finds something, the fix is human judgment:
- * either it becomes a branch + PR (if it's real, scoped work), or it gets
+ * or touches any file (state is recorded only under .git/, never in the
+ * working tree). When it finds something, the fix is human judgment: either
+ * it becomes a branch + PR (if it's real, scoped work), or it gets
  * discarded (if it was scratch), never a silent third option. Exit code 1
  * if anything is flagged as stale, so this can be wired into a periodic
  * check without anyone having to remember to ask.
@@ -43,6 +71,7 @@
 
 const fs = require('fs');
 const path = require('path');
+const crypto = require('crypto');
 const { execFileSync } = require('child_process');
 
 function parseArgs(argv) {
@@ -65,7 +94,18 @@ function git(repo, args) {
   return execFileSync('git', args, { cwd: repo, encoding: 'utf8', maxBuffer: 1024 * 1024 * 32 });
 }
 
-/** Tracked-file status entries only — M/A/D/R/C, both staged (index) and unstaged (worktree). Skips '??' untracked. */
+/**
+ * Tracked-file status entries only — M/A/D/R/C, both staged (index) and
+ * unstaged (worktree). Skips '??' untracked.
+ *
+ * FIX (rename order): confirmed empirically — `git status --porcelain -z`
+ * puts a rename record as `XY <newpath>\0<oldpath>\0`. The first \0-field
+ * (this loop's `entry`) already holds the CURRENT (new) path; a prior
+ * version then unconditionally overwrote it with the second field (the
+ * OLD, now-nonexistent path), so every fresh `git mv` was reported as a
+ * stale deletion of a file that had simply been renamed. The fix is to
+ * leave `file` alone and just consume the trailing old-path field.
+ */
 function trackedStatusEntries(repo) {
   const out = git(repo, ['status', '--porcelain=v1', '-z']);
   const entries = [];
@@ -73,11 +113,9 @@ function trackedStatusEntries(repo) {
   for (let i = 0; i < parts.length; i++) {
     const entry = parts[i];
     const statusCode = entry.slice(0, 2);
-    let file = entry.slice(3);
-    // Renames ("R100") carry "old\0new" — the next \0-part is the new name.
+    const file = entry.slice(3); // already the current/new path, for renames too
     if (statusCode[0] === 'R' || statusCode[1] === 'R') {
-      i++;
-      file = parts[i];
+      i++; // consume the old-path field that follows; it is not `file`
     }
     if (statusCode === '??' || statusCode === '!!') continue; // untracked / ignored
     entries.push({ statusCode: statusCode.trim(), file });
@@ -96,6 +134,55 @@ function numstatFor(repo, file) {
   }
 }
 
+// ---------------------------------------------------------------------------
+// FIX (mtime is not a proxy for diff age): track how long a file's
+// UNCOMMITTED DIFF CONTENT has existed, via a small persisted state file
+// under this checkout's private git-dir (`git rev-parse --git-dir` — a
+// worktree's own `.git/worktrees/<name>`, not the shared common dir, so
+// concurrent worktrees never clobber each other's history; never a tracked
+// path, so this never shows up as a change to commit). A file's mtime gets
+// bumped by a plain `touch`, an editor's format-on-save, or — concretely,
+// in this repo — the verify* harnesses that mutate a real file in place and
+// then restore it: none of those change what `git diff HEAD -- file`
+// actually produces, so hashing THAT is what "first seen" is keyed on.
+// Unchanged diff content across runs reuses the original timestamp
+// regardless of how many times the file was rewritten to disk in between;
+// only a genuinely different diff resets the clock.
+// ---------------------------------------------------------------------------
+
+function gitDirFor(repo) {
+  const out = git(repo, ['rev-parse', '--git-dir']).trim();
+  return path.isAbsolute(out) ? out : path.join(repo, out);
+}
+
+function stateFilePath(repo) {
+  return path.join(gitDirFor(repo), 'findStaleUncommittedWork.state.json');
+}
+
+function loadState(repo) {
+  try {
+    return JSON.parse(fs.readFileSync(stateFilePath(repo), 'utf8'));
+  } catch (e) {
+    return {}; // missing/corrupt — start fresh rather than fail the whole run
+  }
+}
+
+function saveState(repo, state) {
+  try {
+    fs.writeFileSync(stateFilePath(repo), JSON.stringify(state, null, 2));
+  } catch (e) { /* best-effort — a write failure here should not fail the report */ }
+}
+
+/** Content fingerprint of a file's uncommitted diff (covers staged + unstaged, and deletions). */
+function diffFingerprint(repo, file) {
+  try {
+    const out = git(repo, ['diff', 'HEAD', '--', file]);
+    return crypto.createHash('sha256').update(out).digest('hex');
+  } catch (e) {
+    return null; // can't diff (e.g. a brand-new path with a weird mode) — caller falls back to "unknown age"
+  }
+}
+
 function main() {
   const opts = parseArgs(process.argv.slice(2));
 
@@ -109,21 +196,29 @@ function main() {
 
   const entries = trackedStatusEntries(opts.repo);
   const now = Date.now();
-  const thresholdMs = opts.minAgeHours * 60 * 60 * 1000;
+
+  // Content-fingerprint-based age (see the FIX doc comment above
+  // diffFingerprint): "first seen" persists across runs as long as the
+  // diff's actual content is unchanged, regardless of how many times the
+  // file was rewritten to disk (touch, format-on-save, a verify* harness's
+  // mutate-then-restore cycle) in between.
+  const priorState = loadState(opts.repo);
+  const nextState = {}; // rebuilt fresh each run — files no longer dirty simply drop out
 
   const rows = [];
   for (const { statusCode, file } of entries) {
-    const abs = path.join(opts.repo, file);
+    const fp = diffFingerprint(opts.repo, file);
     let ageHours = null;
-    try {
-      const st = fs.statSync(abs);
-      ageHours = (now - st.mtimeMs) / (60 * 60 * 1000);
-    } catch (e) {
-      // Deleted file — no mtime to read; still worth surfacing.
+    if (fp !== null) {
+      const prior = priorState[file];
+      const firstSeenMs = (prior && prior.fingerprint === fp) ? prior.firstSeenMs : now;
+      nextState[file] = { fingerprint: fp, firstSeenMs };
+      ageHours = (now - firstSeenMs) / (60 * 60 * 1000);
     }
     const diff = numstatFor(opts.repo, file);
     rows.push({ statusCode, file, ageHours, diff });
   }
+  saveState(opts.repo, nextState);
 
   const stale = rows.filter(r => r.ageHours === null || r.ageHours >= opts.minAgeHours);
 
@@ -144,7 +239,7 @@ function main() {
     } else {
       console.log(`${stale.length} file(s) flagged — uncommitted for longer than the threshold, so likely NOT still being actively edited:\n`);
       for (const r of stale) {
-        const age = r.ageHours === null ? 'unknown (deleted)' : `${r.ageHours.toFixed(1)}h`;
+        const age = r.ageHours === null ? 'unknown (could not diff)' : `${r.ageHours.toFixed(1)}h`;
         const size = r.diff ? ` (+${r.diff.added}/-${r.diff.removed})` : '';
         console.log(`  [${r.statusCode}] ${r.file}${size}  — uncommitted for ${age}`);
       }

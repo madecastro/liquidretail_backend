@@ -43,26 +43,40 @@
  * drains.
  *
  * --affected IS A DEV-SPEED HEURISTIC, NOT THE GATE. It selects a verify
- * script if (a) the script itself changed, or (b) the script's source text
- * contains a changed file's `dir/basename` path fragment (e.g. "models/Ad"
- * for models/Ad.js) — a plain substring check against require()/
- * require.resolve()/readFileSync() targets, cheap and deliberately
- * over-inclusive rather than under. A supplementary bare-basename substring
- * check (length-gated to >=4 chars, to avoid drowning the selection in noise
- * from generic short tokens) adds recall on top of that, but is never the
- * only mechanism — the dir/basename check has no length gate, because a
- * scoped fragment like "models/Ad" or "routes/ads" is specific enough that it
- * isn't noisy the way a bare "Ad" substring would be, so short filenames
- * (Ad.js, Job.js, me.js, ads.js) still get matched precisely instead of being
- * silently dropped. It cannot know about indirect effects (e.g. changing a
- * shared helper's *behavior* without changing any name it's checked against),
- * and it cannot know a changed file has zero real dependents vs. a heuristic
- * gap — for changed files under CORE_DIRS (the directories everything else
- * routinely requires) that end up matching NOTHING, computeAffected refuses
- * to report a clean "nothing selected": it fails loud and signals the caller
- * to fall back to the full suite instead. Run the full suite (no flags)
- * before pushing non-trivial changes — CLAUDE.md's own convention section
- * already says so.
+ * script if (a) the script itself changed, or (b) the script GENUINELY,
+ * STATICALLY references the changed file — resolved by walking each script's
+ * real require()/require.resolve()/readFileSync()/readFile()/import
+ * dependency graph (transitively), not by grepping raw source text for a
+ * path fragment.
+ *
+ * Revised 2026-08-19 (FIX 1/2): a prior version matched a changed file's
+ * `dir/basename` fragment (e.g. "models/Ad") as a plain substring against
+ * every script's raw source. That was unsound in both directions — it MISSED
+ * real dependents whose only reference was a `path.join(__dirname, ...)`
+ * call (the literal fragment never appears as contiguous text, e.g.
+ * verifyRenderFailureRecord.js's `require(path.join(__dirname,'..','models',
+ * 'Ad.js'))`), and it INVENTED false dependents from coincidental prefix
+ * collisions (`models/Ad` matching inside `models/AdArchive...`, `routes/me`
+ * matching inside the literal string `"routes/media.js filters ..."`) or
+ * arbitrary text that was never a require target at all (`models/User`
+ * matching the HTTP header string `"User-Agent"`). A wrong match is just as
+ * damaging as a right one: it satisfies the "at least one match" check below
+ * and hides a genuine zero. Resolving actual file paths through each script's
+ * real dependency graph eliminates both failure modes at once, because a
+ * match is now always a real resolved path, never a text coincidence.
+ *
+ * This still cannot know about indirect effects (e.g. changing a shared
+ * helper's *behavior* without changing any path referencing it), and it
+ * cannot fully resolve a genuinely dynamic require (e.g. `require(someVar)`)
+ * — those are simply skipped rather than guessed at. So it still cannot know
+ * a changed file has zero real dependents vs. an unresolvable gap — for
+ * changed files under CORE_DIRS (the directories everything else routinely
+ * requires) that end up matching NOTHING, computeAffected refuses to report
+ * a clean "nothing selected": it fails loud and signals the caller to fall
+ * back to the full suite instead. The runner's own file (this one) gets the
+ * same treatment unconditionally when it changes — see computeAffected.
+ * Run the full suite (no flags) before pushing non-trivial changes —
+ * CLAUDE.md's own convention section already says so.
  */
 'use strict';
 
@@ -78,13 +92,19 @@ const VERIFY_RE = /^verify.*\.(js|mjs)$/;
 // Directories whose modules are routinely require()'d from all over the
 // codebase (verified 2026-08-19: services/ and models/ alone account for
 // 468 relative-require hits across scripts/verify*). If a changed file lives
-// under one of these and the substring checks below still select nothing,
-// that is treated as "the heuristic couldn't confidently resolve this" —
+// under one of these and the real dependency-graph resolution below still
+// selects nothing, that is treated as "couldn't confidently resolve this" —
 // never as proof the file has no dependents — and computeAffected falls back
 // to the full suite rather than silently reporting a clean pass. Deliberately
-// excludes scripts/ (already handled as "the script itself changed"), and
-// non-code dirs (docs/, public/, bin/, session.d/) whose edits genuinely
-// have no verify-script dependents.
+// excludes scripts/ for verify*.{js,mjs} files specifically (those are
+// already handled as "the script itself changed"); non-verify files directly
+// under scripts/ (e.g. a shared scripts/lib/ helper) are still covered
+// correctly because the real dependency graph finds any verify script that
+// requires/reads them. The one file under scripts/ that graph resolution can
+// NEVER cover is this runner itself — nothing requires it — so
+// computeAffected has a separate, unconditional check for that (see below).
+// Also deliberately excludes non-code dirs (docs/, public/, bin/,
+// session.d/) whose edits genuinely have no verify-script dependents.
 const CORE_DIRS = new Set(['models', 'routes', 'services', 'middleware', 'config', 'utils', 'pipelines', 'remotion', 'schemas']);
 
 // Populated 2026-08-19 by stress-testing at --concurrency=16 (25-run baseline
@@ -187,12 +207,281 @@ function git(args, opts) {
   return execFileSync('git', args, { cwd: ROOT, encoding: 'utf8', ...opts });
 }
 
+// ---------------------------------------------------------------------------
+// Static require/readFileSync/import graph resolution (FIX 1/2, 2026-08-19).
+//
+// Replaces the old "does a changed file's path fragment appear as a raw
+// text substring in a script" heuristic with actual resolution of each
+// script's real dependency graph, walked the same way Node itself would
+// resolve a relative require. This is intentionally NOT a full JS parser —
+// it recognizes the small, consistent set of patterns this codebase's
+// verify* scripts actually use: plain string-literal requires/imports,
+// `path.join(__dirname, ...)`/`path.resolve(__dirname, ...)` calls (used
+// directly or via a top-level `const ROOT = path.join(__dirname, '..')`-
+// style alias, which ~53 of the 174 scripts define), read as the target of
+// require()/require.resolve()/readFileSync()/readFile()/import. Anything
+// more dynamic than that (e.g. `require(someVariable)`) is simply skipped —
+// best-effort, not required to be complete; see the CORE_DIRS fail-loud
+// check below for what backstops the gap.
+// ---------------------------------------------------------------------------
+
+const _statKindCache = new Map();
+function statKind(p) {
+  if (_statKindCache.has(p)) return _statKindCache.get(p);
+  let kind = null;
+  try {
+    const st = fs.statSync(p);
+    if (st.isFile()) kind = 'file';
+    else if (st.isDirectory()) kind = 'dir';
+  } catch (e) { /* doesn't exist */ }
+  _statKindCache.set(p, kind);
+  return kind;
+}
+
+// Resolves a (possibly extension-less, possibly directory) absolute path the
+// same way Node's own relative-require resolution would, so a bare
+// `require('../config')` pointing at config/index.js and a fully-spelled
+// `require('../models/Ad.js')` both land on the one real absolute file path
+// — matching is meaningless otherwise. Applied identically to both the
+// "changed file" side and the "resolved require target" side.
+function canonicalizeProjectPath(absNoExt) {
+  for (const suffix of ['', '.js', '.mjs', '.json']) {
+    const candidate = absNoExt + suffix;
+    if (statKind(candidate) === 'file') return path.normalize(candidate);
+  }
+  if (statKind(absNoExt) === 'dir') {
+    for (const idx of ['index.js', 'index.mjs', 'index.json']) {
+      const candidate = path.join(absNoExt, idx);
+      if (statKind(candidate) === 'file') return path.normalize(candidate);
+    }
+  }
+  // Not found on disk (deleted file, or a resolution guess that didn't
+  // land) — return the best-effort normalized path anyway so a
+  // same-shaped miss on the "changed file" side still compares equal.
+  return path.normalize(absNoExt);
+}
+
+// Scans `source` starting at the index of a call's opening '(' and returns
+// { argsText, afterIdx } for its balanced-paren argument list, respecting
+// nested parens/brackets and string/template literals (so a comma inside a
+// nested call or a string doesn't get mistaken for an argument separator).
+// Returns null if the parens never balance.
+function scanBalancedArgs(source, openIdx) {
+  let depth = 0;
+  let inString = null;
+  let argsStart = -1;
+  for (let i = openIdx; i < source.length; i++) {
+    const ch = source[i];
+    if (inString) {
+      if (ch === '\\') { i++; continue; }
+      if (ch === inString) inString = null;
+      continue;
+    }
+    if (ch === '\'' || ch === '"' || ch === '`') { inString = ch; continue; }
+    if (ch === '(') { depth++; if (depth === 1) argsStart = i + 1; continue; }
+    if (ch === ')') {
+      depth--;
+      if (depth === 0) return { argsText: source.slice(argsStart, i), afterIdx: i + 1 };
+    }
+  }
+  return null;
+}
+
+// Splits a raw argument-list source string on top-level commas (depth 0,
+// outside strings/brackets), returning trimmed argument source strings.
+function splitTopLevelArgs(argsText) {
+  const parts = [];
+  let depth = 0;
+  let inString = null;
+  let start = 0;
+  for (let i = 0; i < argsText.length; i++) {
+    const ch = argsText[i];
+    if (inString) {
+      if (ch === '\\') { i++; continue; }
+      if (ch === inString) inString = null;
+      continue;
+    }
+    if (ch === '\'' || ch === '"' || ch === '`') { inString = ch; continue; }
+    else if (ch === '(' || ch === '[' || ch === '{') depth++;
+    else if (ch === ')' || ch === ']' || ch === '}') depth--;
+    else if (ch === ',' && depth === 0) { parts.push(argsText.slice(start, i).trim()); start = i + 1; }
+  }
+  const last = argsText.slice(start).trim();
+  if (last.length) parts.push(last);
+  return parts.filter(Boolean);
+}
+
+const STRING_LITERAL_RE = /^(['"`])([\s\S]*)\1$/;
+
+// Best-effort static evaluation of a single JS expression source string down
+// to a path string, given what `__dirname` resolves to in that file
+// (`fromDir`) and a symbol table of other top-level `const IDENT = <expr>`
+// aliases already resolved for this file. Returns null for anything more
+// dynamic than a string literal, `__dirname`, a known alias, or a
+// path.join/path.resolve call over more such atoms — i.e. a genuinely
+// dynamic require this can't resolve, safe to simply skip.
+function evalPathExpr(exprSrc, fromDir, symbols) {
+  const src = exprSrc.trim();
+  if (!src) return null;
+
+  const lit = STRING_LITERAL_RE.exec(src);
+  if (lit) return /\$\{/.test(lit[2]) ? null : lit[2];
+
+  if (src === '__dirname') return fromDir;
+  if (symbols.has(src)) return symbols.get(src);
+
+  const callMatch = /^path\.(join|resolve)\(([\s\S]*)\)$/.exec(src);
+  if (callMatch) {
+    const evaluated = [];
+    for (const part of splitTopLevelArgs(callMatch[2])) {
+      const v = evalPathExpr(part, fromDir, symbols);
+      if (v === null) return null; // one unresolvable arg poisons the whole call
+      evaluated.push(v);
+    }
+    if (!evaluated.length) return null;
+    return callMatch[1] === 'resolve' ? path.resolve(...evaluated) : path.join(...evaluated);
+  }
+
+  return null;
+}
+
+// Finds top-level `const IDENT = <expr>;`-shaped aliases whose initializer
+// is itself statically resolvable (overwhelmingly `path.join(__dirname,
+// '..')`-shaped ROOT aliases in this codebase, but written generically).
+// Built in source order so a later alias may reference an earlier one.
+function extractSymbolTable(source, fromDir) {
+  const symbols = new Map();
+  const assignRe = /\bconst\s+([A-Za-z_$][\w$]*)\s*=\s*/g;
+  let m;
+  while ((m = assignRe.exec(source))) {
+    const ident = m[1];
+    const afterEq = assignRe.lastIndex;
+    const rest = source.slice(afterEq);
+    const callHead = /^path\.(?:join|resolve)\(/.exec(rest);
+    if (callHead) {
+      const scanned = scanBalancedArgs(source, afterEq + callHead[0].length - 1);
+      if (scanned) {
+        const value = evalPathExpr(rest.slice(0, scanned.afterIdx - afterEq), fromDir, symbols);
+        if (value !== null) symbols.set(ident, value);
+      }
+    } else if (/^__dirname\s*[;,)]/.test(rest)) {
+      symbols.set(ident, fromDir);
+    }
+  }
+  return symbols;
+}
+
+// Finds every require()/require.resolve()/readFileSync()/readFile()/import
+// call or static `import ... from` site in `source` and returns each one's
+// raw (unevaluated) first/only relevant argument, tagged by edge kind:
+//   'code' — require/require.resolve/import (static or dynamic): this file's
+//            module graph really loads and executes the target, so a
+//            dependent's transitive closure must keep expanding through it.
+//   'text' — readFileSync/readFile: this file inspects the target's raw
+//            source TEXT (the "source-pin" pattern used throughout this
+//            repo's verify* scripts, e.g. asserting a regex against another
+//            file's contents) without requiring/executing it. The assertion
+//            is invariant to what the *target* itself requires — reading
+//            index.js's text to check for one line does not depend on
+//            whatever module index.js's OTHER lines happen to require — so
+//            this must be a LEAF edge, never expanded further. Conflating
+//            the two (an earlier version of this function did) reintroduces
+//            the exact false-positive class FIX 1/2 exists to remove: e.g.
+//            verifyAgentRegistry.js reads index.js's text for one assertion;
+//            index.js separately requires all ~20 route files including
+//            routes/me.js, and recursing into that make every one of those
+//            routes look like a "dependent" of verifyAgentRegistry.js, which
+//            is exactly the kind of coincidental match this file exists to
+//            eliminate.
+function findDirectRefTargets(source) {
+  const targets = []; // { raw, kind }
+  const callNameRe = /\b(require\.resolve|require|readFileSync|readFile|import)\s*\(/g;
+  let m;
+  while ((m = callNameRe.exec(source))) {
+    const openIdx = callNameRe.lastIndex - 1;
+    const scanned = scanBalancedArgs(source, openIdx);
+    if (!scanned) continue;
+    callNameRe.lastIndex = scanned.afterIdx;
+    const parts = splitTopLevelArgs(scanned.argsText);
+    if (!parts.length) continue;
+    const kind = (m[1] === 'readFileSync' || m[1] === 'readFile') ? 'text' : 'code';
+    targets.push({ raw: parts[0], kind });
+  }
+  const staticImportRe = /\bimport\s+(?:[^'"();]+\bfrom\s+)?(['"])((?:\\.|(?!\1).)*)\1/g;
+  while ((m = staticImportRe.exec(source))) targets.push({ raw: `${m[1]}${m[2]}${m[1]}`, kind: 'code' });
+  return targets;
+}
+
+const _directRefsCache = new Map();
+// Direct (non-transitive) refs of `absFilePath`, split by edge kind:
+//   codeRefs — require/require.resolve/import targets (recursable).
+//   textRefs — readFileSync/readFile targets (leaves only — see
+//              findDirectRefTargets for why these must not be expanded).
+// Bare package specifiers ('fs', 'mongoose', ...) and anything resolving
+// outside the repo or into node_modules are not project-local and excluded.
+// If the SAME path is reached via both kinds in one file, it counts as
+// 'code' (an actual require already justifies full recursion regardless of
+// an additional text-pin elsewhere in the same file).
+function getDirectRefs(absFilePath) {
+  if (_directRefsCache.has(absFilePath)) return _directRefsCache.get(absFilePath);
+  const kindByPath = new Map();
+  try {
+    const source = fs.readFileSync(absFilePath, 'utf8');
+    const fromDir = path.dirname(absFilePath);
+    const symbols = extractSymbolTable(source, fromDir);
+    for (const { raw, kind } of findDirectRefTargets(source)) {
+      const val = evalPathExpr(raw, fromDir, symbols);
+      if (val === null) continue;
+      if (!val.startsWith('.') && !path.isAbsolute(val)) continue; // bare package name
+      const abs = path.isAbsolute(val) ? val : path.resolve(fromDir, val);
+      if (abs !== ROOT && !abs.startsWith(ROOT + path.sep)) continue; // outside the repo
+      if (abs.includes(`${path.sep}node_modules${path.sep}`)) continue;
+      const canonical = canonicalizeProjectPath(abs);
+      if (kind === 'code' || !kindByPath.has(canonical)) kindByPath.set(canonical, kind);
+    }
+  } catch (e) { /* unreadable — treat as no refs */ }
+  const result = {
+    codeRefs: new Set([...kindByPath].filter(([, k]) => k === 'code').map(([p]) => p)),
+    textRefs: new Set([...kindByPath].filter(([, k]) => k === 'text').map(([p]) => p)),
+  };
+  _directRefsCache.set(absFilePath, result);
+  return result;
+}
+
+const _closureCache = new Map();
+// Transitive closure reachable from `absFilePath`: its own direct refs (both
+// kinds — either kind changing could genuinely affect this file), plus,
+// recursively, everything reachable by further following 'code' edges only
+// (never 'text' edges — see findDirectRefTargets). Also never recurses past
+// a non-.js/.mjs file (e.g. a JSON fixture has no further refs to expand).
+// Cycle-safe: a node already on the current call stack returns empty rather
+// than recursing forever, and is not cached mid-cycle — only the outer,
+// fully-unwound call caches its result.
+function getClosure(absFilePath, stack) {
+  stack = stack || new Set();
+  if (_closureCache.has(absFilePath)) return _closureCache.get(absFilePath);
+  if (stack.has(absFilePath)) return new Set();
+  stack.add(absFilePath);
+  const { codeRefs, textRefs } = getDirectRefs(absFilePath);
+  const result = new Set([...codeRefs, ...textRefs]);
+  for (const dep of codeRefs) {
+    if (!/\.(js|mjs)$/.test(dep)) continue;
+    for (const s of getClosure(dep, stack)) result.add(s);
+  }
+  stack.delete(absFilePath);
+  _closureCache.set(absFilePath, result);
+  return result;
+}
+
+const RUNNER_SELF_REL = path.relative(ROOT, __filename).split(path.sep).join('/');
+
 /**
  * Returns the sorted list of affected verify scripts, or null to mean
  * "could not confidently resolve this — caller should fall back to running
- * everything" (either because the diff itself couldn't be computed, or
- * because a changed file under a CORE_DIRS directory matched no script and
- * that's treated as a heuristic gap rather than a real "unaffected" verdict).
+ * everything" (because the diff itself couldn't be computed, because this
+ * runner's own file changed, or because a changed file under a CORE_DIRS
+ * directory matched no real dependent and that's treated as a resolution
+ * gap rather than a genuine "unaffected" verdict).
  */
 function computeAffected(base) {
   const ref = base || 'origin/main';
@@ -207,15 +496,32 @@ function computeAffected(base) {
       return null;
     }
   }
-  // Fold in uncommitted changes too (staged + unstaged) so a dirty working
-  // tree is covered, not just committed history.
+  // Fold in uncommitted changes too — staged, unstaged, AND untracked.
+  // `git diff` never lists untracked ('??') files, so a brand-new file (e.g.
+  // a freshly-written verify script) was previously invisible to --affected
+  // entirely, reporting "nothing to run" instead of trivially selecting it.
   try {
     changed = changed.concat(git(['diff', '--name-only', 'HEAD']).split('\n'));
     changed = changed.concat(git(['diff', '--name-only', '--cached']).split('\n'));
+    changed = changed.concat(git(['ls-files', '--others', '--exclude-standard']).split('\n'));
   } catch (e) { /* best-effort; not fatal */ }
 
   changed = [...new Set(changed.map(s => s.trim()).filter(Boolean))];
   if (changed.length === 0) return [];
+
+  // This runner's own selection logic changing is a special case CORE_DIRS
+  // deliberately doesn't cover (nothing requires this file, so no
+  // dependency-graph signal can ever flag it) — yet a bug here can
+  // invalidate every verdict --affected produces for every OTHER change too.
+  // Never trust --affected to reason about itself: always fall back.
+  if (changed.includes(RUNNER_SELF_REL)) {
+    console.error(
+      `runVerifySuite: scripts/runVerifySuite.js itself changed — --affected's own ` +
+      `selection logic is exactly what's in question, so it can't reason about itself. ` +
+      `Falling back to the FULL suite.`
+    );
+    return null;
+  }
 
   const allScripts = discoverScripts();
   const selected = new Set();
@@ -228,65 +534,40 @@ function computeAffected(base) {
     else remaining.push(rel);
   }
 
-  // 2. Any other changed file: a verify script is affected if its source
-  //    text mentions the changed file, checked two ways:
-  //
-  //    a) PRECISE — the "dir/basename" path fragment (e.g. "models/Ad" for
-  //       models/Ad.js, "routes/ads" for routes/ads.js). This is what a
-  //       relative require()/require.resolve()/path.join() target actually
-  //       looks like in source (require('../models/Ad'), require(path.join
-  //       (ROOT, 'models/Ad')), require.resolve('../models/Ad')), and it's
-  //       specific enough as a substring that it needs no length gate — so
-  //       short filenames (Ad.js, Job.js, me.js, ads.js) are matched exactly
-  //       instead of being silently excluded as "noise".
-  //    b) FUZZY — the bare basename on its own, gated to >=4 chars. This is
-  //       supplementary recall for mentions the precise check can't catch
-  //       (comments, fixture strings, non-require references); gating it
-  //       avoids drowning the selection in false positives from generic
-  //       short tokens, which is safe to do here because it is never the
-  //       only mechanism a real dependency relies on — (a) has already
-  //       covered the exact-path case with no gate.
+  // 2. Any other changed file: a verify script is affected if it genuinely,
+  //    statically references the changed file — checked by resolving each
+  //    script's real dependency graph (transitive) and testing whether the
+  //    changed file's own canonicalized absolute path appears in it. See the
+  //    top-of-file doc comment and the resolver functions above for why this
+  //    replaced the old raw-text substring check.
   if (remaining.length) {
-    const sourceCache = new Map();
-    const sourceOf = (script) => {
-      if (!sourceCache.has(script)) {
-        sourceCache.set(script, fs.readFileSync(path.join(SCRIPTS_DIR, script), 'utf8'));
-      }
-      return sourceCache.get(script);
-    };
+    const changedAbsByRel = new Map();
+    for (const rel of remaining) {
+      changedAbsByRel.set(rel, canonicalizeProjectPath(path.resolve(ROOT, rel)));
+    }
 
     const matchedAny = new Set(); // changed-file rel paths that hit >=1 script
-    for (const rel of remaining) {
-      const ext = path.extname(rel);
-      const relNoExt = rel.slice(0, rel.length - ext.length);
-      const segments = relNoExt.split('/');
-      const dirBase = segments.slice(-2).join('/'); // e.g. "models/Ad"
-      const baseNoExt = segments[segments.length - 1]; // e.g. "Ad"
-
-      for (const script of allScripts) {
-        if (sourceOf(script).includes(dirBase)) {
+    for (const script of allScripts) {
+      const closure = getClosure(path.join(SCRIPTS_DIR, script));
+      for (const [rel, abs] of changedAbsByRel) {
+        if (closure.has(abs)) {
           selected.add(script);
           matchedAny.add(rel);
-        }
-      }
-
-      if (baseNoExt.length >= 4) {
-        for (const script of allScripts) {
-          if (selected.has(script)) continue;
-          if (sourceOf(script).includes(baseNoExt)) {
-            selected.add(script);
-            matchedAny.add(rel);
-          }
         }
       }
     }
 
     // 3. Fail loud, not silent: a changed file under a directory everything
-    //    else routinely depends on (CORE_DIRS) that still matched nothing is
-    //    a signal the heuristic couldn't confidently resolve it — not proof
-    //    it has zero dependents (e.g. models/Job.js today: a real, actively
-    //    required model with no verify* script exercising it directly). Fall
-    //    back to the full suite rather than report a clean "nothing to run".
+    //    else routinely depends on (CORE_DIRS) that still matched no real
+    //    dependent is a signal the graph couldn't confidently resolve it —
+    //    not proof it has zero dependents (e.g. models/Job.js today: a real,
+    //    actively required model with no verify* script exercising it
+    //    directly, confirmed by hand — routes/jobs.js, routes/upload.js and
+    //    routes/detect.js are its only requirers and no verify* script
+    //    reaches any of those three either). Because matches are now real
+    //    resolved paths rather than text coincidences, a wrong match can no
+    //    longer mask a real zero the way it used to (FIX 2's bug) — an empty
+    //    result here is a genuine "nothing currently exercises this."
     const unresolvedCore = remaining.filter(
       (rel) => CORE_DIRS.has(rel.split('/')[0]) && !matchedAny.has(rel)
     );
@@ -294,7 +575,8 @@ function computeAffected(base) {
       console.error(
         `runVerifySuite: --affected could not confidently resolve dependents for ` +
         `${unresolvedCore.join(', ')} (changed core-dir file(s) matched no verify ` +
-        `script). Falling back to the FULL suite rather than risk a false "nothing to run".`
+        `script's real require/readFileSync graph). Falling back to the FULL suite ` +
+        `rather than risk a false "nothing to run".`
       );
       return null;
     }

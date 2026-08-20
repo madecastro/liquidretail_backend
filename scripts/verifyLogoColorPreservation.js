@@ -46,6 +46,34 @@ const path = require('path');
 // bypassed NODE_PATH entirely and always failed in a fresh git worktree,
 // which has no node_modules/sharp of its own (see bin/setup-worktree.sh).
 const sharp = require('sharp');
+
+// FIX (assert the version this harness actually requires): a plain
+// `require('sharp')` succeeding proves only that SOME sharp is loaded, not
+// which one. In a nested worktree with no local node_modules/sharp, Node's
+// module resolution walks up parent directories and can silently pick up a
+// DIFFERENT parent checkout's copy instead — same require, different
+// binary, no error. That matters here specifically: L1 below asserts a
+// documented, version-specific bug in sharp@0.33.5's `.extract().stats()`
+// (see the file header). A different version can behave differently there —
+// the bug may already be fixed upstream, or shifted — which would make L1's
+// pass/fail a coin flip unrelated to whether this repo's OWN fix is correct.
+// Fail loud, before running anything fixture-dependent, rather than let a
+// version mismatch masquerade as a real pass or a real regression.
+const SHARP_EXPECTED_VERSION = '0.33.5';
+const sharpVersion = require('sharp/package.json').version;
+if (sharpVersion !== SHARP_EXPECTED_VERSION) {
+  console.error(
+    `❌ logo colour preservation: sharp@${sharpVersion} is loaded (from ` +
+    `${require.resolve('sharp/package.json')}), but this harness's L1 checks assert a ` +
+    `version-specific bug in sharp@${SHARP_EXPECTED_VERSION}'s .extract().stats() — a different ` +
+    `version makes L1's result meaningless either way it goes. This usually means ` +
+    `node_modules/sharp resolved to a DIFFERENT checkout's copy (a worktree with no local ` +
+    `node_modules/sharp silently walks up to a parent's). Run bin/setup-worktree.sh (pins ` +
+    `sharp@${SHARP_EXPECTED_VERSION} explicitly) and confirm node_modules/sharp lives inside THIS checkout.`
+  );
+  process.exit(1);
+}
+
 const direct = require('../services/directImageRenderService');
 
 let pass = 0;
