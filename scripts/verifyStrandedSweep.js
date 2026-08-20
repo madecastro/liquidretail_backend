@@ -35,6 +35,7 @@ function check(name, cond, detail) {
 const sweepSrc = fs.readFileSync(path.join(ROOT, 'services/strandedRunSweeper.js'), 'utf8');
 const adsSrc   = fs.readFileSync(path.join(ROOT, 'routes/ads.js'), 'utf8');
 const idxSrc   = fs.readFileSync(path.join(ROOT, 'index.js'), 'utf8');
+const videoRecSrc = fs.readFileSync(path.join(ROOT, 'services/videoRecoveryService.js'), 'utf8');
 
 console.log('\nSTRANDED RUN SWEEP\n');
 
@@ -133,6 +134,11 @@ check('D4 the first tick is delayed — on a deploy THIS process just replaced t
     + 'one whose SIGTERM stranded the ads, so an immediate sweep would race the '
     + "shutdown handler's own requeue write",
   /setTimeout\(tick, 120 \* 1000\)/.test(idxSrc));
+check('D5 [WIRING] sweepStrandedRuns defaults recover to recoverStrandedAd, not '
+    + 'recoverImageAd — leaving the dispatcher unused while the default still '
+    + 'points at the image-only recoverer re-opens the video re-buy',
+  /recover = recoverStrandedAd/.test(sweepSrc)
+  && !/recover = recoverImageAd/.test(sweepSrc));
 
 // ── E. Behavioral: order + filtering, with recovery stubbed ──────────────
 (async () => {
@@ -144,12 +150,17 @@ check('D4 the first tick is delayed — on a deploy THIS process just replaced t
     const ads = [
       { _id: 'paid1',  campaignRunIds: ['r1'], imageGeneration: { predictionId: 'p1' } },
       { _id: 'free1',  campaignRunIds: ['r1'] },
-      { _id: 'busy1',  campaignRunIds: ['r1'], imageGeneration: { predictionId: 'p2' } }
+      { _id: 'busy1',  campaignRunIds: ['r1'], imageGeneration: { predictionId: 'p2' } },
+      // THE bug this task closes: a veo ad with a veoPredictionId used to be
+      // reported 'no-receipt' (recoverImageAd never reads that field) and
+      // requeued into a fresh Omni submit. Recovered, never requeued.
+      { _id: 'paidVideo1', campaignRunIds: ['r1'], renderRoute: 'veo', veoPredictionId: 'vp1' }
     ];
     CampaignRun.find = () => ({ select: () => ({ lean: async () => runs }) });
     Ad.find = () => ({ limit: () => ({ lean: async () => ads }) });
     const recover = async ({ ad }) => {
       if (ad._id === 'paid1') return { state: 'recovered', predictionId: 'p1' };
+      if (ad._id === 'paidVideo1') return { state: 'recovered', predictionId: 'vp1' };
       if (ad._id === 'busy1') return { state: 'processing', predictionId: 'p2' };
       return { state: 'no-receipt' };
     };
@@ -165,18 +176,22 @@ check('D4 the first tick is delayed — on a deploy THIS process just replaced t
       requeue: async ({ ads }) => { requeuedIds = ads.map(a => a._id); return ads.length; }
     });
 
-    check('E1 the already-PAID ad was recovered, not requeued', out.recovered === 1);
+    check('E1 the already-PAID ad was recovered, not requeued', out.recovered === 2);
     check('E2 [MONEY] ONLY the receipt-free ad was requeued — the paid one and the '
         + 'still-processing one were both withheld',
       requeuedIds && requeuedIds.length === 1 && requeuedIds[0] === 'free1',
       JSON.stringify(requeuedIds));
     check('E3 a receipt still processing is counted, not re-bought', out.stillProcessing === 1);
+    check('E5 [MONEY] a stranded video ad WITH a veoPredictionId is recovered, '
+        + 'not requeued — the exact invariant this dispatch exists for',
+      out.recovered === 2 && requeuedIds && !requeuedIds.includes('paidVideo1'),
+      JSON.stringify(requeuedIds));
 
     // Recovery-only mode must never requeue.
     requeuedIds = null;
     const out2 = await sweeper.sweepStrandedRuns({ recover, settle });
     check('E4 with no requeue handler: recovery still happens, nothing is requeued',
-      out2.recovered === 1 && out2.requeued === 0 && requeuedIds === null);
+      out2.recovered === 2 && out2.requeued === 0 && requeuedIds === null);
   } finally {
     CampaignRun.find = origRunFind;
     Ad.find = origAdFind;
@@ -300,6 +315,61 @@ check('D4 the first tick is delayed — on a deploy THIS process just replaced t
         /Ad\.find\(buildStrandedAdFilter\(/.test(sweepSrc));
     }
 
+    // ── H. recoverStrandedAd dispatches by renderRoute ──────────────────
+    // THE bug this task closes: recoverImageAd is image-only, so every video
+    // ad used to be reported 'no-receipt' and requeued into a fresh Omni
+    // submit. These call the dispatcher DIRECTLY with injected stubs so a
+    // future "just call recoverImageAd for everything" revert fails loudly.
+    {
+      let imageCalls = 0;
+      let videoCalls = 0;
+      const recoverImage = async () => { imageCalls += 1; return { state: 'no-receipt' }; };
+      const recoverVideo = async () => { videoCalls += 1; return { state: 'recovered', predictionId: 'vp' }; };
+
+      imageCalls = 0; videoCalls = 0;
+      await sweeper.recoverStrandedAd({
+        ad: { _id: 'v1', renderRoute: 'veo', veoPredictionId: 'vp1' },
+        recoverImage, recoverVideo
+      });
+      check('H1 [MONEY] renderRoute:\'veo\' calls ONLY recoverVideo, never recoverImage — '
+          + 'this is the bug: previously EVERY ad, video or not, went through recoverImageAd',
+        videoCalls === 1 && imageCalls === 0,
+        `video=${videoCalls} image=${imageCalls}`);
+
+      imageCalls = 0; videoCalls = 0;
+      await sweeper.recoverStrandedAd({
+        ad: { _id: 'i1' },
+        recoverImage, recoverVideo
+      });
+      check('H2 no renderRoute calls ONLY recoverImage, never recoverVideo '
+          + '(legacy ads predating the field keep today\'s image path)',
+        imageCalls === 1 && videoCalls === 0,
+        `image=${imageCalls} video=${videoCalls}`);
+
+      imageCalls = 0; videoCalls = 0;
+      await sweeper.recoverStrandedAd({
+        ad: { _id: 'i2', renderRoute: 'html_gen' },
+        recoverImage, recoverVideo
+      });
+      check('H2b renderRoute:\'html_gen\' also stays on the image recoverer',
+        imageCalls === 1 && videoCalls === 0,
+        `image=${imageCalls} video=${videoCalls}`);
+    }
+
+    // ── I. [MONEY] video recovery never submits ─────────────────────────
+    // Mirrors scripts/verifyImageRecovery.js A1/A2: recovery's only provider
+    // call is a free GET (resumeForAd → peekPrediction). submitGeneration is
+    // the billable Omni POST in atlasVideoService.js. Comments are stripped
+    // first — the module header NAMING the banned function is not a call.
+    const videoRecCode = videoRecSrc
+      .replace(/\/\*[\s\S]*?\*\//g, '')
+      .replace(/\/\/[^\n]*/g, '');
+    check('I1 [MONEY] video recovery never calls submitGeneration — that is the '
+        + 'billable Omni POST',
+      !/\bsubmitGeneration\s*\(/.test(videoRecCode));
+    check('I2 [MONEY] video recovery issues no HTTP POST of its own',
+      !/axios\.post\(/.test(videoRecCode));
+
   // ── Revert-proof (manual, per CLAUDE.md §5) ────────────────────────────
   // 1. Push every ad to stillNeedRender regardless of receipt -> B2/E2 fail (the
   //    re-buy-what-we-own regression).
@@ -309,6 +379,9 @@ check('D4 the first tick is delayed — on a deploy THIS process just replaced t
   //    asked to render).
   // 5. Render selectedIds instead of claim.renderIds -> C2 fails.
   // 6. Drop the deriveWaitAttempts bound from buildStrandedAdFilter -> G1/G1b fail.
+  // 7. Make recoverStrandedAd call recoverImageAd regardless of renderRoute ->
+  //    H1 fails (a veo ad would hit the image stub). Reverting the sweep
+  //    default recover to recoverImageAd (dispatcher unused) -> D5 fails.
   // Each verified by hand before shipping this harness.
 
   if (failures.length) {

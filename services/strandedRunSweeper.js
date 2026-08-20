@@ -21,8 +21,12 @@
 // "Receipt-free" only means "not billed" if a receipt is reliably written at the
 // charge point. For images that became true on 2026-08-05 (#86); before that an
 // image could be billed and receipt-free, so a sweeper like this would have
-// re-bought real work. Do not port this pattern to a provider path that has no
-// charge-point receipt.
+// re-bought real work. Video has HAD a charge-point receipt all along
+// (Ad.veoPredictionId, services/spendReceipt.js); the bug was that this file
+// never read it — recoverImageAd is image-only, so every renderRoute:'veo' ad
+// was reported 'no-receipt' and fell through to a fresh Omni submit.
+// recoverStrandedAd now dispatches those to recoverVideoAd. Do not port this
+// pattern to a provider path that has no charge-point receipt.
 //
 // ── SCOPE: STRANDED, NOT MERELY QUEUED ─────────────────────────────────────
 // `queued` is ALSO the normal resting state of a freshly generated ad awaiting an
@@ -67,6 +71,7 @@
 const Ad          = require('../models/Ad');
 const CampaignRun = require('../models/CampaignRun');
 const { recoverImageAd, settleChargeState } = require('./imageRecoveryService');
+const { recoverVideoAd } = require('./videoRecoveryService');
 const alerts = require('./alertService');
 
 const truthy = (v, dflt) => {
@@ -135,20 +140,54 @@ async function findStranded() {
 }
 
 /**
+ * Dispatch recovery by ad.renderRoute so a video receipt is never mis-read
+ * as "no receipt".
+ *
+ * WHY (2026-08-19). recoverImageAd is structurally image-only: it reads only
+ * ad.imageGeneration.predictionId and returns 'no-receipt' for anything where
+ * that is empty. A video ad's receipt lives on a different field,
+ * Ad.veoPredictionId (services/spendReceipt.js). Before this dispatcher
+ * existed, every renderRoute:'veo' stranded ad was reported 'no-receipt'
+ * regardless of whether it actually held a receipt, and fell through to a
+ * fresh Omni submit (~$0.90/master). recoverVideoAd is the counterpart
+ * with the same verdict contract; this function is the single place that
+ * chooses between them. sweepStrandedRuns's pass-1/pass-2 loop stays
+ * generic — it already handles the verdict states and must not grow a
+ * second, route-aware copy of that logic.
+ *
+ * Fail-closed on the IMAGE recoverer for anything that is not explicitly
+ * 'veo' — including null/undefined renderRoute — so legacy ads that
+ * predate the field keep today's behaviour. The two recoverers are
+ * overridable options (real functions as defaults) because a destructured
+ * import cannot be stubbed after load; anything a harness needs to swap
+ * must be an injectable parameter, not a bare call to the imported
+ * binding. Same reason sweepStrandedRuns takes `recover` as an option.
+ */
+async function recoverStrandedAd({
+  ad,
+  recoverImage = recoverImageAd,
+  recoverVideo = recoverVideoAd
+} = {}) {
+  if (ad && ad.renderRoute === 'veo') return recoverVideo({ ad });
+  return recoverImage({ ad });
+}
+
+/**
  * One sweep. Recovery first (free), then requeue whatever is genuinely unbilled.
  *
  * @param {function} requeue  async ({ ads, run }) => number — injected by the
  *   caller so this module never imports the render loop (routes/ads.js requires
  *   half the service graph, and a cycle here would be a boot-time landmine).
  *   Omit it to run recovery-only.
- * @param {function} recover  async ({ ad }) => verdict. Defaults to the real
- *   recoverImageAd; injectable so the harness can exercise the RECOVER-BEFORE-
- *   REQUEUE ordering — the one invariant here that costs money if broken —
- *   without a network call. A destructured import cannot be stubbed after load,
- *   which is exactly how the first version of that test silently exercised the
- *   real function against fake prediction ids.
+ * @param {function} recover  async ({ ad }) => verdict. Defaults to
+ *   recoverStrandedAd (renderRoute:'veo' → recoverVideoAd, everything else
+ *   → recoverImageAd); injectable so the harness can exercise the
+ *   RECOVER-BEFORE-REQUEUE ordering — the one invariant here that costs
+ *   money if broken — without a network call. A destructured import cannot
+ *   be stubbed after load, which is exactly how the first version of that
+ *   test silently exercised the real function against fake prediction ids.
  */
-async function sweepStrandedRuns({ requeue = null, recover = recoverImageAd, settle = settleChargeState } = {}) {
+async function sweepStrandedRuns({ requeue = null, recover = recoverStrandedAd, settle = settleChargeState } = {}) {
   const out = { considered: 0, recovered: 0, requeued: 0, skipped: false, stillProcessing: 0, unrecoverable: 0, chargesSettled: 0 };
   if (!ENABLED()) { out.skipped = 'STRANDED_SWEEP_ENABLED=false'; return out; }
 
@@ -293,6 +332,7 @@ function logSweep(out) {
 
 module.exports = {
   sweepStrandedRuns,
+  recoverStrandedAd,
   findStranded,
   buildStrandedAdFilter,
   settleUnknownCharges,
