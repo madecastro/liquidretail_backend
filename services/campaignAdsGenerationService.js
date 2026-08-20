@@ -1331,7 +1331,13 @@ async function expandWizardJob({
       const { ensureDetectForProducts } = require('./catalogProductDetectService');
       const ensureIds = new Set(productIds.map(String));
       if (mediaIds.length) {
-        const pickedMedia = await Media.find({ _id: { $in: mediaIds.map(toObjectId).filter(Boolean) } })
+        const pickedMedia = await Media.find({
+          _id: { $in: mediaIds.map(toObjectId).filter(Boolean) },
+          brandId  // scope to the campaign's own brand — mediaIds is a raw request
+                   // param /generate's product-ownership check never touches; an
+                   // unscoped read here can still union a foreign brand's
+                   // matchedProducts.catalogProductId into ensureDetectForProducts.
+        })
           .select('matchedProducts').lean();
         for (const m of pickedMedia) {
           for (const mp of (m.matchedProducts || [])) {
