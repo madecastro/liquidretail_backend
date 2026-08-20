@@ -509,6 +509,61 @@ function isVideoLifestylePromptEnabled() {
 }
 
 /**
+ * VIDEO_PROMPT_UI_CHROME_GUARD kill switch — default ON.
+ *
+ * Added 2026-08-19 after a P0: both Omni masters in
+ * run_1787174963435_ff67021e (Marine Layer 2, "Cut & Sew Bode Puffer
+ * Jacket") hallucinated a fake product-detail-page header/footer — a nav
+ * bar with a hamburger icon, garbled pseudo-text, a shopping-bag icon, and
+ * a footer repeating the (correctly-spelled) real product name beside more
+ * garbled text — directly into the video plate, BEFORE Remotion titling
+ * ever touched the frame (confirmed against the raw pre-titling
+ * veoVideoUrl, not just the delivered renderUrl). The seed/reference
+ * images for that ad were verified clean catalog product photography, no
+ * PDP/storefront screenshot anywhere in the stack — so this is a model
+ * hallucination, not a bad seed.
+ *
+ * `noText` (OMNI_DIRECTIVES / GROK_DIRECTIVES, both frozen — see the PR #61
+ * rollback note in CLAUDE.md §00) already bans generating new text,
+ * typography, logos, badges, watermarks, and captions, and Omni still
+ * violated it — but `noText` never named UI/app/webpage CHROME as its own
+ * category (nav bars, menus, icons, buttons are graphic elements, not
+ * strictly "text"), so an icon-heavy hallucination had no explicit line to
+ * violate for half of what it rendered.
+ *
+ * This is a SEPARATE, ADDITIVE prompt line — deliberately NOT folded into
+ * OMNI_DIRECTIVES / GROK_DIRECTIVES / HOOK_FIRST_DIRECTIVES, which must stay
+ * byte-identical to `134db56~1` (scripts/verifyPostPilotBatch.js B1-B17).
+ *
+ * VERIFIED LIVE 2026-08-19, same day: shipped OFF first (unverified — a live
+ * submit is ~$0.90 and non-refundable), then a real Omni submit was run
+ * against this EXACT incident's product/brand/seed stack
+ * (run_1787174963435_ff67021e, referenceMediaIds unchanged, flag forced
+ * true) — predictionId `3e579bc492bd4da785d77316c8011c3c`, Atlas-settled
+ * price `$0.90` (confirmed via GET /model/prediction/{id}; the CostLog
+ * write itself failed that run due to an unrelated Mongo Atlas storage-quota
+ * outage — see session.md). Frames pulled from the raw pre-titling video at
+ * 0.1/0.3/0.5/0.8/1.2/2.5s — including t=0.1s and t=0.5s, exactly where the
+ * original defect was visible — show NO nav bar, icons, or garbled text at
+ * any sampled point. Flipped to default true on that evidence. Flip back to
+ * 'false' (or unset) to instantly revert to the byte-identical pre-fix
+ * prompt if a future case regresses.
+ */
+function isVideoUiChromeGuardEnabled() {
+  return process.env.VIDEO_PROMPT_UI_CHROME_GUARD === 'true';
+}
+
+// Kept OUTSIDE every directive object on purpose (see
+// isVideoUiChromeGuardEnabled above) so OMNI_DIRECTIVES / GROK_DIRECTIVES /
+// HOOK_FIRST_DIRECTIVES never change a byte. Names the failure mode
+// concretely (nav bar, hamburger/bag icons, screenshot/mockup) rather than
+// only repeating the generic "no text" ban noText already states.
+const UI_CHROME_GUARD_LINE =
+  `Do NOT render any user-interface, app, or website elements anywhere in the frame — no navigation bars, menus, ` +
+  `hamburger icons, shopping-cart/bag icons, buttons, price tags, banners, or any screen-within-the-screen. ` +
+  `This is a real-world camera shot of a physical product, never a screenshot, mockup, or render of a web page or app.`;
+
+/**
  * Lifestyle video prompt branch is active only when the flag is on AND
  * (seed is lifestyle OR variantKind is ugc). Matches static preserve trigger
  * so a UGC video with an unclassified seed does not stay on packshot Ken Burns
@@ -1017,6 +1072,15 @@ function buildVeoPrompt({
   // canonical/deterministic and no longer shapes the video prompt.)
   lines.push(d.noText);
 
+  // UI-CHROME GUARD (VIDEO_PROMPT_UI_CHROME_GUARD, default ON) — see
+  // isVideoUiChromeGuardEnabled above for the incident this closes and the
+  // live A/B that verified it before the default flipped on. Runs for every
+  // profile (packshot, lifestyle, hook_first, split) since it sits in the
+  // shared assembly section, not inside `d`.
+  if (isVideoUiChromeGuardEnabled()) {
+    lines.push(UI_CHROME_GUARD_LINE);
+  }
+
   if (seedHasText) {
     lines.push(
       `The reference image contains text overlays / captions / stickers / watermarks burned into the source frame. ` +
@@ -1179,5 +1243,10 @@ module.exports = {
   isVideoProductAnchorEnabled,
   productRegionForAd,
   buildProductAnchorBlock,
+  // UI-chrome hallucination guard (VIDEO_PROMPT_UI_CHROME_GUARD, default
+  // ON as of the 2026-08-19 live verification) — exported for the offline
+  // verify harness only; no other caller should read the env var directly.
+  isVideoUiChromeGuardEnabled,
+  UI_CHROME_GUARD_LINE,
 };
 

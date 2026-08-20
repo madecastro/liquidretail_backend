@@ -2,6 +2,16 @@
 
 Living checklist. Update in place; do not append a duplicate list elsewhere.
 
+- **URGENT, ACTIVE: production MongoDB Atlas cluster is at its storage quota — ALL writes
+  are currently blocked.** Discovered 2026-08-19 while verifying PR #262 (UI-chrome guard):
+  a real Omni video submission's charge-point `CostLog` insert failed with "you are over your
+  space quota, using 512 MB of 512 MB. Writes are blocked on your cluster." `db.stats()`
+  showed `dataSize` ~386MB / `storageSize` ~127MB against the 512MB cap at that moment. This
+  is not scoped to that one test — every generation's cost-ledger write (and any other prod
+  write) is failing silently right now; the code treats bookkeeping failures as non-fatal to
+  the generation itself by design, so nothing user-facing errors, but spend is going
+  unledgered cluster-wide. Needs an Atlas tier upgrade or a cleanup/archival pass — owner's
+  call on which. Not attempted, not fixed — flagging only.
 - **CLOSED DECISION (forward-only, PR #253): historical spend on
   `categoryReviewsService`'s grounded pass and `productDetailsService.
   fetchReviewSummary` before this PR is NOT reconciled or backfilled into
