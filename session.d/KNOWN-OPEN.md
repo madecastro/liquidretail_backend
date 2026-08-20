@@ -16,6 +16,25 @@ Living checklist. Update in place; do not append a duplicate list elsewhere.
   should be written. `atlasLlmService.post()` missing `maxRedirects: 0`
   (found adversarially reviewing this same PR, confirmed pre-existing across
   ~27 files) is tracked as its own separate follow-up, not bundled here.
+- **NEEDS AN OWNER DECISION (PR #265): `scripts/backfillBrandFontGenerics.js` has
+  not been run, so the static-ad typeface fix is INERT for every brand already
+  ingested — including Marine Layer 2, the brand it was written for.** The fix
+  reads a serif/sans classification from the CSS generic a storefront declares
+  beside its own font (`font-family: Seriously Nostalgic, serif`), captured at
+  ingest into `websiteFontUsage.{heading,body,button}Generic`. Brands ingested
+  before that capture existed have no such field, and `Brand.fontIngestedAt`
+  exists specifically to stop the pipeline re-crawling storefronts, so there is
+  no natural refresh — nothing changes until the backfill runs or a brand is
+  re-ingested. The script is dry-run by default, writes only those three fields
+  (never a family, never `customFonts`), refuses to overwrite an existing
+  generic, skips any role whose live family no longer matches what was recorded,
+  shares ingest's own `collectStylesheets`/scorer so it cannot derive a value the
+  pipeline would not, and writes each field under a filter requiring it to still
+  be unset. Its derivation path is live-verified against marinelayer.com; the
+  **Mongo write is the one part never exercised**. Suggested order:
+  `--brand "Marine Layer 2"` dry run, then `--apply` for that brand, then a wider
+  dry run. Until then the classification behaviour of every existing brand is
+  byte-identical to before PR #265.
 - Video multi-surface fan-out (§00 Phase 3) — intent only.
 - `RENDER_AUTH_TOKEN` logs `EXPIRED` at every boot (dead `renderViaSpec` path).
 - `npm error could not determine executable to run` during postinstall — non-fatal.

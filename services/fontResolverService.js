@@ -48,7 +48,14 @@ const DEFAULT_ROLE_FONTS = {
 // Must stay aligned with LIBRARY_SERIF_FACES: a library serif whose name misses
 // this regex gets `fallback: 'sans-serif'`, so if the file fails to load the
 // browser substitutes a sans for a serif face.
-const SERIF_HINTS = /serif|playfair|lora|cormorant|garamond|fraunces|caslon|bodoni|didot|georgia|times|libre|crimson|merriweather|spectral|eb garamond|prata|domine|slab|arvo|marcellus|italiana|cinzel/i;
+//
+// The regex itself now lives in services/fontClassification.js, the single
+// source of truth shared with the STATIC image-gen prompt path, which used to
+// hand-copy it (see that module's header). `fallbackFor` below is unchanged:
+// it stays deliberately NAME-ONLY, because it answers a narrower question than
+// that module's classifyTypeface — which CSS generic to emit as this face's
+// fallback — and verifyFontFallback.js pins its naive answers on purpose.
+const { SERIF_HINTS } = require('./fontClassification');
 
 const memoryCache = new Map(); // family|weight -> resolved entry or null
 const inFlight = new Map();    // key -> Promise; prevents same-font download races

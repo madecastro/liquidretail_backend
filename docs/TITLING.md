@@ -248,6 +248,78 @@ Sources of a family name: website `@font-face` ingest (`brandFontIngestService` 
 `Brand.customFonts`, REAL FILES) and Meta-ad identification (`metaAdsFontService` →
 `Brand.metaAdsFontUsage`, a NAME ONLY — see §Brand fonts from Meta ads below).
 
+### Serif-vs-sans classification (`services/fontClassification.js`)
+
+**One shared module, two consumers.** `SERIF_HINTS` lives here, not in this
+service — the STATIC ad prompt path (`directImageRenderService`) used to carry a
+hand-copied duplicate of the same regex, with paired "must stay aligned" comments
+and nothing enforcing it. It is a pure string function, so sharing it crosses no
+boundary: what static must never require is the font RESOLVER (it fetches font
+FILES over the network — "brand fonts are no longer resolved for static ads at
+all"), not the definition of the word "serif".
+
+Precedence in `classifyTypeface({family, generic})`:
+1. a **positive `SERIF_HINTS` match** on the family name → `serif`
+2. a **first-party CSS generic** → its class
+3. `'sans-serif'` — unchanged default
+
+Tier 2 is new (2026-08-20). It sits BELOW the keyword match on purpose: a
+sloppy-but-real `font-family: Playfair Display, sans-serif` would otherwise flip
+a brand the keyword list already gets right. Tier 1 is "a recognised serif type
+NAME wins", not "the name heuristic wins" — the heuristic's `sans-serif` return
+is the absence of a signal, which is the gap tier 2 fills. The invariant this
+buys is pinned: no keyword-matched family can change answer for any generic;
+only brands that were falling through to the bare default move. A MIS-matching
+keyword still wins ("Libre Franklin" is a sans caught by `libre`) — pre-existing,
+and a keyword-list edit is its own measured change.
+
+`websiteFontUsage` is flattened wholesale into `brandSignalText`, so the new
+`*Generic` keys land in the blob `BRAND_SIGNAL_RULES` match against; a 5,040-case
+sweep pins that they never change the video library pick.
+
+**Parser rules that are load-bearing, each of which was a silent miss once.**
+`familyStackTokens` resolves `var()` **iteratively, innermost first** (depth cap 8 = cycle
+guard) and substitutes IN PLACE — replacing the whole value, as an earlier version did,
+discards the trailing generic in Shopify Dawn's `font-family: var(--font-heading-family),
+serif`, which is the single most common shape in the wild. `!important` is stripped AFTER
+substitution (a custom property can carry it). `genericFamilyIn` considers only tokens
+AFTER the first concrete family and takes the LAST one carrying a serif/sans signal — the
+author's ultimate fallback — so `sans-serif, "Brand", serif` is not read as sans and
+`Brand Serif, monospace, serif` resolves to `serif`. `NON_BRAND_FAMILIES` excludes the
+emoji/symbol faces and `-apple-system`/`BlinkMacSystemFont`, because a system stack's only
+non-generic entries are emoji fallbacks and one would otherwise be stored as the brand's
+typeface. Both the ingest-side vote and the read-side lookup key on
+`normalizeFamilyKey` (trim + collapse internal whitespace + lowercase), or a
+double-spaced declaration stores the generic where the consumer cannot find it.
+
+`scripts/backfillBrandFontGenerics.js` shares ingest's `collectStylesheets` (which follows
+`@import`) and `aggregateFontUsageAcrossSheets`, so it cannot score a different sheet set
+from the pipeline and persist — then freeze — a value ingest would never produce. It writes
+each field under a filter requiring it to still be unset, so a concurrent re-ingest is
+never clobbered.
+
+Tier 2's source data. `brandFontIngestService` now keeps the CSS generic
+that sits beside the concrete family in the storefront's own declarations —
+Marine Layer ships `font-family: Seriously Nostalgic, serif`, so the brand states
+its own classification — voted **per (role, family)**, never per role, and stored
+as `websiteFontUsage.{heading,body,button}Generic`. `storedGenericForFamily` only
+returns a role's generic for that role's OWN family, so a serif display heading
+cannot lend its class to a grotesque body face.
+
+**Why not inspect the font file.** Measured before choosing: OS/2 `sFamilyClass`
+is 0 on all 28 files in `services/brandScripts/assets/webfonts`, and panose's
+serif-style byte is unset on every known serif there (Playfair Display, EB
+Garamond, Lora all `[0,0,…]`). "Seriously Nostalgic" itself has panose
+all-zeros — file metadata returns nothing for the exact font that motivated the
+work. The `name` table only restates names. Do not revisit without re-measuring.
+
+`fallbackFor` here is deliberately NOT upgraded to tier 1: it answers a narrower
+question (which CSS generic to emit as a face's fallback) and
+`verifyFontFallback.js` pins its naive answers on purpose. Brands ingested before
+tier 1 existed need `scripts/backfillBrandFontGenerics.js` (dry-run by default);
+until then they classify exactly as before. Pinned by
+`scripts/verifyTypefaceClassification.js` (69 checks, 4 revert-proof mutations).
+
 Output per role: `{family, weight, style, url:localPath, remoteUrl, fallback,
 source, exact, requestedFamily, resolvedFamily, matchReason}`.
 `remotionRenderService` rewrites `url` to an asset-server URL before the browser.

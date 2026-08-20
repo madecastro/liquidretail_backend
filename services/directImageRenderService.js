@@ -462,15 +462,19 @@ function ctaColorDirective(colors) {
   return `CTA BUTTON COLOUR — FIXED, NOT A STYLE CHOICE. Render the CTA button/pill fill as exactly ${colors.bg}, with ${labelDesc} (${colors.text}) label text. Use this exact fill colour for the CTA regardless of the surrounding scene's palette — it is the brand's own colour, not an art-direction pick for this composition.`;
 }
 
-// Minimal serif/sans classifier, duplicated by hand from
-// services/fontResolverService.js's SERIF_HINTS (same trade-off as
-// LOGO_SAFE_MARGIN_PCT duplicating remotion/lib/safeZones.js above): that
-// module resolves brand font FILES over the network for the VIDEO titling
-// engine and must not be required from here — "Brand fonts are no longer
-// resolved for static ads at all" is a deliberate boundary (see the note a
-// few lines above conceptLook's header). Only the tiny classification regex
-// is worth keeping in sync with it, not the module.
-const FONT_SERIF_HINTS = /serif|playfair|lora|cormorant|garamond|fraunces|caslon|bodoni|didot|georgia|times|libre|crimson|merriweather|spectral|eb garamond|prata|domine|slab|arvo|marcellus|italiana|cinzel/i;
+// Serif/sans classification. This was previously a regex "duplicated by hand
+// from services/fontResolverService.js's SERIF_HINTS" — the hand-copy is now
+// gone, replaced by services/fontClassification.js, a PURE module (no I/O, no
+// network, no DB) that both pipelines require.
+//
+// That does NOT breach the boundary the old comment was protecting: what must
+// never be required from here is the font RESOLVER, because it fetches brand
+// font FILES over the network and "Brand fonts are no longer resolved for
+// static ads at all" (see the note a few lines above conceptLook's header).
+// Agreeing on what the word "serif" MEANS is a pure string question and was
+// only ever duplicated for want of a shared home.
+const { classifyTypeface, storedGenericForFamily, SERIF_HINTS: FONT_SERIF_HINTS } =
+  require('./fontClassification');
 
 function humanizeFontFamily(slug) {
   const s = String(slug || '').trim();
@@ -521,7 +525,25 @@ function typefaceDirectiveForBrand(brand) {
 
   if (family) {
     const readable = humanizeFontFamily(family);
-    const isSerif = FONT_SERIF_HINTS.test(family);
+    // The brand's OWN stylesheet fills the gap the family-name keyword list
+    // cannot: Marine Layer's real ingested face "Seriously Nostalgic" is a
+    // Didone display SERIF matching no serif keyword, so the name heuristic
+    // alone instructed gpt-image-2 to set a "clean, modern sans-serif" while
+    // the VIDEO path — which loads the real file and never has to guess —
+    // rendered the same brand as a serif. Their CSS says `font-family:
+    // Seriously Nostalgic, serif`; that generic is captured at ingest
+    // (brandFontIngestService) and read back here.
+    //
+    // NOTE the generic does NOT outrank a positive keyword match — read
+    // fontClassification.js's PRECEDENCE section before changing this. A
+    // recognised serif type name wins, because a real-world sloppy
+    // `font-family: Playfair Display, sans-serif` would otherwise flip a brand
+    // the keyword list already gets right. Brands with no captured generic
+    // classify exactly as they did before.
+    const isSerif = classifyTypeface({
+      family,
+      generic: storedGenericForFamily(brand, family),
+    }) === 'serif';
     const styleWord = isSerif ? 'serif' : 'sans-serif';
     const characterClause = isSerif
       ? 'refined editorial serif proportions'
