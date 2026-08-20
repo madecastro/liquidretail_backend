@@ -17,6 +17,11 @@ const Brand = require('../../models/Brand');
 // flag. Copying those into the agent's ad.list response keeps the
 // AdThumbnail render logic identical across every surface.
 const { loadPhotorealUrlMap, loadUseImageRefMap } = require('../adDisplayUrlService');
+// The same two grid-tile URL builders routes/ads.js projectAd() and
+// routes/catalog.js's /:id/ads-detail already use, so all three surfaces
+// that hand Ad rows to the frontend agree on the tile variant.
+const { buildGridPreviewVideoUrl } = require('../videoPreviewUrl');
+const { buildGridPreviewImageUrl } = require('../imagePreviewUrl');
 
 const DEFAULT_LIMIT = 10;
 const MAX_LIMIT = 50;
@@ -97,6 +102,21 @@ async function run({ req, args }) {
         useImageRefAsProduction: a.campaignId
           ? !!useImageRefMap.get(String(a.campaignId))
           : false,
+        // Downscaled/auto-quality Cloudinary variants for the agent's
+        // resource-card grid (frontend agent/ResourceCard.tsx → AdThumbnail),
+        // so a chat card holding N tiles stops pulling N full-resolution
+        // masters. Identical derivation to projectAd()/ads-detail: video ads
+        // get previewVideoUrl, everything else gets previewImageUrl off
+        // whichever asset the frontend actually displays (photoreal polish
+        // when present, else the raw render). Detail views (AdInspectCard /
+        // AdDetailModal) keep reading renderUrl/photorealUrl untouched. Both
+        // builders return their input unchanged for a non-Cloudinary or
+        // otherwise untransformable URL, so older renders still get a usable
+        // src — just not a downscaled one.
+        previewVideoUrl: a.kind === 'video' ? buildGridPreviewVideoUrl(a.renderUrl || null) : null,
+        previewImageUrl: a.kind === 'video'
+          ? null
+          : buildGridPreviewImageUrl(photorealMap.get(String(a._id)) || a.renderUrl || null),
         copy:           a.copy || {},
         ctaText:        a.ctaText || null,
         productId:      a.productId ? String(a.productId) : null,
