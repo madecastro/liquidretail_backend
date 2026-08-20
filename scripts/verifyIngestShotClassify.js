@@ -1767,10 +1767,24 @@ async function main() {
   // ── J4. BEHAVIOURAL: single per-URL deadline across redirect hops ───────
   // Replaces the comment-prose regex. Each hop burns part of the timeout;
   // total wall clock must be one timeoutMs, not hops × timeoutMs.
+  //
+  // MARGIN (widened 2026-08-19): this races safeFetchBuffer's real
+  // AbortController setTimeout(timeoutMs) against real per-hop setTimeout
+  // delays -- the same shape as the verifyDirectorFallbackChain.js C4 flake
+  // (a real timer raced against a real deadline under CPU oversubscription),
+  // just with a wider margin (2.5x vs C4's ~1.5x) that didn't reproduce a
+  // failure in stress testing at concurrency=16. safeFetchBuffer's abort
+  // timer isn't behind an injectable clock the way atlasLlmService's
+  // Date.now() budget check was, so faking it deterministically would mean
+  // changing production fetch/abort code rather than just this test --
+  // out of scope here. Scaling TIMEOUT_MS/HOP_MS up 5x (same ratios, same
+  // assertions) instead shrinks scheduler jitter to a much smaller fraction
+  // of every window, cutting residual flake risk without touching
+  // safeFetchBuffer itself.
   {
     const { safeFetchBuffer } = ingest;
-    const TIMEOUT_MS = 200;
-    const HOP_MS = 80;
+    const TIMEOUT_MS = 1000;
+    const HOP_MS = 400;
     const HOPS_BEFORE_BODY = 3; // 3 redirects + final body = 4 sleeps if no abort
 
     async function multiHopFetch(fetchImplFactory) {
