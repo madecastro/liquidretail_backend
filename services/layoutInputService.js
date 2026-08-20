@@ -78,6 +78,10 @@ const { extractSnippet, PROOF_LINE_MAX_CHARS, usableProofCommentsOrNone } = requ
 // the best-fitting copy string instead of a templated headline. See
 // services/videoHeadlineService.js for the full design rationale.
 const { resolveVideoHeadline } = require('./videoHeadlineService');
+// Same evidence thresholds the render-time claim gate uses (see
+// buildMetaForAd in brandScriptExecutor.js) — reused here so this
+// deterministic default never asserts a claim the gate would strip anyway.
+const { RATING_CLAIM_MIN, SAMPLE_FLOOR } = require('./claimSubstantiationService');
 
 // Atlas gateway (Gemini served OpenAI-compatible; Google's OpenAI-compat
 // endpoint as the direct fallback inside the transport).
@@ -1244,7 +1248,18 @@ function buildDerivationPrompt(ctx, template, aspectRatio, options) {
       lines.push(`- "subheadline" ≤ 15 words. "eyebrow" ≤ 3 words. "highlight_text" ≤ 5 words.`);
     }
     lines.push(`- "short_benefits" 3–5 items, each ≤ 6 words, concrete buyer benefits (not specs).`);
-    lines.push(`- "badges" 2–4 items, each 1–3 words. Examples supported by data: "4.7★ rated" if rating ≥ 4.5; "1k+ reviews" if reviewCount ≥ 1000; "Top rated", "Editor's pick", "Best seller". Prefer real signal over filler.`);
+    // Rewritten 2026-08-19 (compliance): the prior wording listed "Top
+    // rated" / "Editor's pick" / "Best seller" as bare examples with no
+    // "if" condition attached to them — unlike the two lines right before
+    // them, which do carry one — and the model read that as license to
+    // print any of the five with no evidence, confirmed live
+    // (run_1787174963435_ff67021e: badges=["Top rated","Best seller",
+    // "Sustainably made"] with rating=null/reviewCount=null). A downstream
+    // gate (services/claimSubstantiationService.js, applied in
+    // buildMetaForAd) is the enforced backstop regardless of what this
+    // prompt produces, but the prompt should not be inviting the fabrication
+    // in the first place.
+    lines.push(`- "badges" 0–4 items, each 1–3 words, and ONLY when the data above supports one: "<rating>★ rated" or "Top rated" ONLY if Rating ≥ 4.5 AND Review count ≥ 100 were BOTH given above; "<count>+ reviews" ONLY restating a review-count figure actually given above. If Rating/Review count were not given above, or don't clear those bars, output an EMPTY array — that is the correct, expected answer for most products, not a fallback to avoid. NEVER emit a sales-rank or endorsement claim ("Best seller", "Top seller", "#1", "Most popular", "Editor's pick", "Staff pick", "Trending") — this pipeline has no sales-rank or editorial data for any product, ever. NEVER emit an environmental, ethical or certification claim ("Sustainably made", "Eco-friendly", "Organic", "Cruelty-free", etc.) — these are regulated advertising claims (e.g. FTC Green Guides) this pipeline cannot substantiate from catalog data, for any product.`);
   }
 
   // CASING — stated once, explicitly, because nothing else in this prompt
@@ -2324,9 +2339,20 @@ async function loadCategoryReviewsForMatch(match) {
 // Rating/review-driven badge defaults when the LLM returned none. Fills the
 // badge_row / product.badges / social_proof.proof_badges slots that
 // otherwise render as placeholders.
+//
+// FIXED 2026-08-19 (compliance): 'Top rated' used to append on
+// `rating >= 4.5` alone, with no floor on HOW MANY reviews backed that
+// rating — a 4.5 from a single review passed exactly as readily as a 4.5
+// from ten thousand. Now requires the SAME minimum sample size
+// (SAMPLE_FLOOR, from claimSubstantiationService) the render-time gate
+// requires for any "top rated"-class claim, so this deterministic path
+// can never assert something the gate would strip from an LLM-authored
+// badge anyway. This is belt-and-suspenders, not the enforcement point:
+// buildMetaForAd's gate re-checks every badge regardless of origin.
 function defaultBadgesFromSignal(details) {
   const out = [];
-  if (typeof details.rating === 'number' && details.rating >= 4.5) out.push('Top rated');
+  if (typeof details.rating === 'number' && details.rating >= RATING_CLAIM_MIN
+    && typeof details.reviewCount === 'number' && details.reviewCount >= SAMPLE_FLOOR) out.push('Top rated');
   if (typeof details.reviewCount === 'number') {
     if (details.reviewCount >= 10000) out.push('10k+ reviews');
     else if (details.reviewCount >= 1000) out.push('1k+ reviews');
@@ -4059,5 +4085,9 @@ module.exports = {
   // carries pre-provenance UNSTAMPED quotes that the printability gate
   // then withholds wholesale.
   INPUT_SCHEMA_VERSION,
-  MAX_LAYOUT_SECONDARY_QUOTES
+  MAX_LAYOUT_SECONDARY_QUOTES,
+  // Exported so scripts/verifyClaimSubstantiation.js can pin the
+  // reviewCount sample-floor fix BEHAVIOURALLY (drive the shipped
+  // function), not by scanning the source for the literal 'Top rated'.
+  defaultBadgesFromSignal
 };

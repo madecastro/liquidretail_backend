@@ -1366,25 +1366,53 @@ async function buildMetaForAd(ad, brand, opts = {}) {
   // redundant-brand-token strip only ever matches THIS ad's own brand.
   const productNameCleaned = cleanProductNameForDisplay(cascaded.productName ?? null, cascaded.brandName ?? null);
 
+  // ── Claim substantiation gate ─────────────────────────────────────────
+  // badgeText / badges / deliveryLine are the one part of `cascaded` that
+  // is NOT run through resolveCoherentSocialProof above, even though they
+  // can carry the exact same class of claim the coherence chokepoint exists
+  // to police: badgeText and badges both cascade from `input.product.badges`
+  // (services/metaCascadeConfig.js), which services/layoutInputService.js
+  // populates from an ungated Gemini derivation call — confirmed live to
+  // invent "Top rated" / "Best seller" / "Sustainably made" on an ad whose
+  // real rating/reviewCount were both null (run_1787174963435_ff67021e).
+  // deliveryLine reads `input.product.badges[1]` today (PR #261, open,
+  // retargets it to an empty cascade — this gate is a no-op once that lands,
+  // since gating `null`/`undefined` is already a pass-through).
+  //
+  // Gate AFTER the coherence chokepoint, using the SAME `rating`/
+  // `reviewCount` pair it just resolved (never the LLM's own stated
+  // number) — a "Top rated" badge can only survive on an ad whose own
+  // printed star line already earned it. See
+  // services/claimSubstantiationService.js for the full doctrine
+  // (barred-outright categories vs evidence-gated categories) and
+  // scripts/verifyClaimSubstantiation.js for the revert-proof pins.
+  const { substantiateBadge, substantiateBadges } = require('./claimSubstantiationService');
+  const claimEvidence = { rating, reviewCount };
+  const gatedBadgeText = substantiateBadge(cascaded.badgeText ?? null, claimEvidence);
+  const gatedBadges = substantiateBadges(cascaded.badges, claimEvidence);
+  const gatedDeliveryLine = substantiateBadge(cascaded.deliveryLine ?? null, claimEvidence);
+
   return {
     // Cascaded fields — every one of these can be re-pointed via
     // Brand.metaCascades[<field>] without a code change. Undefined
     // entries (no source produced a value) fall through as `null`
     // to preserve the shape callers expect.
     brandName:          cascaded.brandName          ?? null,
-    badgeText:          cascaded.badgeText          ?? null,
+    // badgeText / badges / deliveryLine: substantiation-gated, not the raw
+    // cascade value — see "Claim substantiation gate" above.
+    badgeText:          gatedBadgeText,
     productName:        productNameCleaned.productName,
     productNameFull:    productNameCleaned.productNameFull,
     productDescription: cascaded.productDescription ?? null,
     price:              cascaded.price              ?? null,
     benefits:           cascaded.benefits           ?? [],
-    badges:             cascaded.badges             ?? [],
+    badges:             gatedBadges,
     headline:           cascaded.headline           ?? null,
     // quote / quoteSnippet: forced to the chokepoint's verified line when
     // one exists — see the "F4 IMPOSSIBLE BY CONSTRUCTION" comment above.
     quote:              finalQuoteText,
     reviewer:           cascaded.reviewer           ?? null,
-    deliveryLine:       cascaded.deliveryLine       ?? null,
+    deliveryLine:       gatedDeliveryLine,
     ctaText:            cascaded.ctaText            ?? null,
     cta:                cascaded.ctaText            ?? null,   // legacy alias for older scripts reading meta.cta
     rating,
