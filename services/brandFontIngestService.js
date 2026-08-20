@@ -383,21 +383,134 @@ function parseFontFacesFromCss(cssText, baseUrl) {
 
 // ── Website role usage ─────────────────────────────────────────────────
 
-const GENERIC_FAMILIES = new Set([
-  'serif', 'sans-serif', 'monospace', 'cursive', 'fantasy', 'system-ui',
-  'ui-serif', 'ui-sans-serif', 'ui-monospace', 'inherit', 'initial', 'unset'
+// The generic-family vocabulary is shared with services/fontClassification.js
+// so the parser that CAPTURES generics and the classifier that CONSUMES them
+// cannot drift apart on which tokens count as generic.
+const {
+  GENERIC_FAMILIES, CSS_WIDE_KEYWORDS, classFromGeneric, normalizeFamilyKey,
+} = require('./fontClassification');
+
+// Substitution passes for nested custom properties. Themes chain them two or
+// three deep (`--font-heading: var(--font-serif)`); the cap is a cycle guard
+// (`--a: var(--b); --b: var(--a)`) far above any real depth.
+const MAX_VAR_DEPTH = 8;
+// Matches ONE var() whose fallback contains no further parens — i.e. always an
+// innermost reference — so repeated passes resolve nesting from the inside out.
+const INNERMOST_VAR_RE = /var\(\s*(--[a-z0-9_-]+)\s*(?:,\s*([^()]*?)\s*)?\)/i;
+
+/**
+ * Resolve every var() in a declaration value against the collected custom
+ * properties, innermost first, falling back to the reference's own default.
+ *
+ * The previous implementation only handled a var() at the START of the value
+ * and REPLACED THE WHOLE VALUE with the variable's contents, which silently
+ * dropped everything after the reference. That broke the single most common
+ * shape in the wild — Shopify's Dawn theme and its derivatives write
+ * `font-family: var(--font-heading-family), serif`, so the trailing generic
+ * (the entire signal this module exists to capture) was discarded on exactly
+ * the storefronts we care most about. It also could not see through a chained
+ * variable, leaving a literal `var(--font-serif)` stored as a family name.
+ */
+function resolveCssVars(value, variables) {
+  let out = String(value);
+  for (let depth = 0; depth < MAX_VAR_DEPTH && INNERMOST_VAR_RE.test(out); depth++) {
+    out = out.replace(new RegExp(INNERMOST_VAR_RE, 'gi'), (_m, name, fallback) => {
+      const resolved = variables[name];
+      if (resolved != null && String(resolved).trim() !== '') return String(resolved);
+      return fallback == null ? '' : fallback;
+    });
+  }
+  // An unresolvable reference is left as-is above; drop it so it can never be
+  // mistaken for a concrete family name (observed live as a stored family of
+  // "var(--font-sans)").
+  return out.replace(new RegExp(INNERMOST_VAR_RE, 'gi'), '');
+}
+
+/**
+ * Split a font-family declaration value into trimmed, unquoted tokens, with
+ * custom properties resolved and the CSS priority flag removed.
+ *
+ * `!important` is stripped AFTER substitution, not before: a custom property
+ * can carry the flag in its own value (`--font-heading: Brand, serif
+ * !important`), and stripping only the raw declaration left the resolved last
+ * token as the string "serif !important", which matches no known generic. That
+ * silently dropped the classification on exactly the declarations a theme
+ * marks as authoritative.
+ */
+function familyStackTokens(raw, variables = {}) {
+  if (!raw) return [];
+  const value = resolveCssVars(String(raw), variables)
+    .replace(/!\s*important\s*$/i, '')
+    .trim();
+  return value.split(',')
+    .map((part) => part.trim().replace(/^['"]+|['"]+$/g, '').replace(/!\s*important\s*$/i, '').trim())
+    .filter(Boolean);
+}
+
+// Names that sit in a font-family stack but can never be a BRAND's typeface:
+// the system-UI aliases, and the emoji/symbol faces every modern reset appends
+// after the real stack (`ui-sans-serif, system-ui, sans-serif, "Apple Color
+// Emoji", "Segoe UI Emoji", …`).
+//
+// This matters because such a stack's only NON-generic entries are those emoji
+// fonts. Once custom properties resolve properly, a rule set to the system
+// stack yields "Apple Color Emoji" as its first concrete family — which is
+// worse than the unresolved `var(--font-sans)` it used to yield, because it is
+// PLAUSIBLE junk: it would be stored as the brand's body face and could be
+// named to an image model as the brand's own typeface. A system stack means
+// "no brand face is declared here", so it must yield nothing.
+const NON_BRAND_FAMILIES = new Set([
+  '-apple-system', 'blinkmacsystemfont', 'apple color emoji', 'segoe ui emoji',
+  'segoe ui symbol', 'noto color emoji', 'android emoji', 'emojisymbols',
+  'apple symbols', 'noto emoji', 'twemoji mozilla',
 ]);
 
 function firstConcreteFamily(raw, variables = {}) {
-  if (!raw) return null;
-  let value = String(raw).trim();
-  const varRef = value.match(/^var\(\s*(--[a-z0-9_-]+)(?:\s*,\s*([^)]+))?\)/i);
-  if (varRef) value = variables[varRef[1]] || varRef[2] || '';
-  for (const part of value.split(',')) {
-    const family = part.trim().replace(/^['"]+|['"]+$/g, '').trim();
-    if (family && !GENERIC_FAMILIES.has(family.toLowerCase())) return family;
+  for (const family of familyStackTokens(raw, variables)) {
+    const lower = family.toLowerCase();
+    if (GENERIC_FAMILIES.has(lower) || NON_BRAND_FAMILIES.has(lower)) continue;
+    return family;
   }
   return null;
+}
+
+/**
+ * The CSS generic the site author put in the SAME declaration as the concrete
+ * family — i.e. their own classification of their own typeface.
+ *
+ * This is the signal that fixes the Marine Layer 2 defect: the site ships
+ * `font-family: Seriously Nostalgic, serif`, so the brand itself tells us the
+ * face is a serif even though the NAME matches no serif keyword and the font
+ * file's OS/2 panose is all-zeros. See services/fontClassification.js for the
+ * measurements that ruled out both of those alternatives.
+ *
+ * CSS-wide keywords (`inherit`/`initial`/`unset`) are skipped: they sit in
+ * generic position but carry no typographic meaning.
+ */
+function genericFamilyIn(raw, variables = {}) {
+  const tokens = familyStackTokens(raw, variables);
+  const firstConcrete = tokens.findIndex((t) => !GENERIC_FAMILIES.has(t.toLowerCase()));
+  // Only tokens AFTER the first concrete family are that family's fallbacks.
+  // A stack may legally open with a generic (`sans-serif, "Brand", serif`);
+  // taking the first generic anywhere would classify that Didone as sans from
+  // a token that is not its fallback at all.
+  const candidates = (firstConcrete === -1 ? tokens : tokens.slice(firstConcrete + 1))
+    .map((t) => t.toLowerCase())
+    .filter((t) => GENERIC_FAMILIES.has(t) && !CSS_WIDE_KEYWORDS.has(t));
+  if (!candidates.length) return null;
+  // A font-family stack is ordered most-preferred first, so the LAST generic is
+  // the author's ultimate fallback and the truest statement of the class. Take
+  // the last one that actually carries a serif/sans signal: in
+  // `Brand Serif, monospace, serif` the terminal `serif` is the classification,
+  // while `monospace` is a mid-stack preference on an orthogonal axis and would
+  // otherwise return a null signal and lose the answer.
+  for (let i = candidates.length - 1; i >= 0; i--) {
+    if (classFromGeneric(candidates[i])) return candidates[i];
+  }
+  // No token carries a serif/sans signal (e.g. `Brand, monospace`). Record the
+  // terminal generic faithfully anyway; classifyTypeface reads it as "no
+  // signal" and falls through, and a truthful stored value beats a null.
+  return candidates[candidates.length - 1];
 }
 
 /**
@@ -424,6 +537,7 @@ function extractFontUsageFromCss(cssText) {
     if (!familyMatch) continue;
     const family = firstConcreteFamily(familyMatch[1], variables);
     if (!family) continue;
+    const generic = genericFamilyIn(familyMatch[1], variables);
 
     let role = null;
     let score = 1;
@@ -436,7 +550,7 @@ function extractFontUsageFromCss(cssText) {
       role = 'body'; score = 3;
     }
     if (!role) continue;
-    evidence.push({ family, role, selector: selector.slice(0, 180), score });
+    evidence.push({ family, role, generic, selector: selector.slice(0, 180), score });
   }
 
   const pick = (role) => {
@@ -446,12 +560,145 @@ function extractFontUsageFromCss(cssText) {
     }
     return [...scores.entries()].sort((a, b) => b[1] - a[1])[0]?.[0] || null;
   };
+
+  /**
+   * The winning generic FOR THE FAMILY THAT WON THIS ROLE — not for the role
+   * as a whole. That distinction is load-bearing, and was measured on Marine
+   * Layer's live stylesheet: voting generics per-ROLE tallies serif 72 vs
+   * sans-serif 72 (their heading rules name a serif display face 72 points'
+   * worth, while a grotesque used on other heading selectors and a stale
+   * `--font-heading` variable contribute 64 + 8 the other way) — an arbitrary,
+   * rule-order-dependent tie. Scoped to the winning family it is serif 72 vs
+   * sans-serif 8, a decisive 9:1.
+   *
+   * Ties within one family resolve to the FIRST generic reached in descending
+   * score order, which `Map` insertion order makes deterministic for a given
+   * stylesheet — the same determinism guarantee `pick` above relies on.
+   */
+  const pickGeneric = (role, family) => {
+    if (!family) return null;
+    // normalizeFamilyKey, not a bare toLowerCase: this must key the generic
+    // under exactly the string fontClassification.storedGenericForFamily will
+    // later look it up by, or the vote lands somewhere the consumer never
+    // reads (internal whitespace being the case that bites — see that
+    // function's header).
+    const want = normalizeFamilyKey(family);
+    const scores = new Map();
+    for (const item of evidence) {
+      if (item.role !== role || !item.generic) continue;
+      if (normalizeFamilyKey(item.family) !== want) continue;
+      scores.set(item.generic, (scores.get(item.generic) || 0) + item.score);
+    }
+    return [...scores.entries()].sort((a, b) => b[1] - a[1])[0]?.[0] || null;
+  };
+
+  const heading = pick('heading');
+  const body = pick('body');
+  const button = pick('button');
   return {
-    heading: pick('heading'),
-    body: pick('body'),
-    button: pick('button'),
+    heading,
+    body,
+    button,
+    // The site author's own serif/sans classification of each role's face.
+    // Consumed via fontClassification.storedGenericForFamily, which only
+    // trusts a role's generic for that role's own family.
+    headingGeneric: pickGeneric('heading', heading),
+    bodyGeneric: pickGeneric('body', body),
+    buttonGeneric: pickGeneric('button', button),
     evidence: evidence.slice(0, 30)
   };
+}
+
+/**
+ * Fetch every stylesheet a page references: inline <style> blocks first, then
+ * up to MAX_STYLESHEETS external sheets, following bounded CSS @imports.
+ *
+ * Extracted from ingestBrandFontsInner so scripts/backfillBrandFontGenerics.js
+ * can collect the SAME sheet set. That is not a tidiness refactor — the
+ * backfill re-derives values it then persists, and its own hand-rolled fetch
+ * loop did not follow @import. Themes routinely put typography in an imported
+ * partial (this function's @import branch exists for exactly that), so the
+ * backfill could vote on a strict subset of the evidence, write a generic that
+ * disagrees with what ingest would compute, and — because it refuses to
+ * overwrite an existing value — freeze that wrong answer permanently.
+ *
+ * One dead sheet is an errors[] line, never a hard failure.
+ *
+ * @param {string} html     the page's HTML
+ * @param {string} pageUrl  the POST-redirect URL, for resolving relative hrefs
+ * @returns {Promise<{sheets: Array<{css,baseUrl,from}>, errors: string[]}>}
+ */
+async function collectStylesheets(html, pageUrl) {
+  const errors = [];
+  const sheets = extractInlineStyles(html)
+    .map((css) => ({ css, baseUrl: pageUrl, from: 'inline <style>' }));
+  const sheetUrls = extractStylesheetUrls(html, pageUrl);
+  const seenSheetUrls = new Set(sheetUrls);
+  for (const href of sheetUrls) {
+    try {
+      const res = await axios.get(href, {
+        timeout: 20_000,
+        maxRedirects: 5,
+        maxContentLength: MAX_HTML_BYTES,
+        responseType: 'text',
+        // keep CSS as the raw string — axios would otherwise try JSON.parse
+        transformResponse: [(d) => d],
+        headers: { 'User-Agent': UA, Accept: 'text/css,*/*;q=0.1' }
+      });
+      const css = String(res.data || '');
+      sheets.push({ css, baseUrl: href, from: href });
+      // Follow bounded CSS @imports. Themes often put @font-face rules in
+      // a typography partial rather than the homepage's first-level sheet.
+      for (const m of css.matchAll(/@import\s+(?:url\(\s*)?['"]?([^'")\s;]+)['"]?\s*\)?[^;]*;/gi)) {
+        if (sheetUrls.length >= MAX_STYLESHEETS) break;
+        try {
+          const imported = new URL(m[1], href).toString();
+          if (/^https?:/i.test(imported) && !seenSheetUrls.has(imported)) {
+            seenSheetUrls.add(imported);
+            sheetUrls.push(imported);
+          }
+        } catch { /* malformed import — skip */ }
+      }
+    } catch (err) {
+      errors.push(`stylesheet fetch failed: ${href}: ${err.message}`);
+    }
+  }
+  return { sheets, errors };
+}
+
+/**
+ * Merge the font-usage evidence of MANY stylesheets into one scored answer.
+ *
+ * A storefront's typography is spread across an inline <style> block and
+ * several external sheets, and each must be scored TOGETHER — a per-sheet
+ * winner would let a small utility sheet outvote the theme. So the evidence
+ * rows are re-serialised into one synthetic stylesheet and re-parsed, which
+ * puts every sheet's rules in front of a single scorer.
+ *
+ * The generic MUST be re-emitted in that round-trip. Emitting only
+ * `font-family:"Family"` silently discarded the first-party serif/sans signal
+ * on every multi-sheet storefront — captured correctly per sheet, then thrown
+ * away on the way to the vote.
+ *
+ * Extracted from ingestBrandFontsInner (which does network I/O and Cloudinary
+ * uploads around it) so this step is reachable from an offline harness — a
+ * revert-proof that has to re-implement the round-trip in order to test it is
+ * only testing itself. Also reused by scripts/backfillBrandFontGenerics.js so
+ * the backfill cannot drift from what ingest actually computes.
+ *
+ * @param {string[]} sheetCssTexts  raw CSS, one entry per sheet
+ * @returns {{heading, body, button, headingGeneric, bodyGeneric, buttonGeneric, evidence}}
+ */
+function aggregateFontUsageAcrossSheets(sheetCssTexts) {
+  const parts = (sheetCssTexts || []).map((css) => extractFontUsageFromCss(css));
+  const evidence = parts.flatMap((u) => u.evidence || []);
+  const usage = extractFontUsageFromCss(
+    evidence
+      .map((e) => `${e.selector}{font-family:"${e.family}"${e.generic ? `,${e.generic}` : ''}}`)
+      .join('\n')
+  );
+  usage.evidence = evidence.slice(0, 30);
+  return usage;
 }
 
 // ── HTML → stylesheet discovery ────────────────────────────────────────
@@ -628,38 +875,8 @@ async function ingestBrandFontsInner(brand, run) {
 
   // 2. Collect CSS: inline <style> blocks + up to MAX_STYLESHEETS external
   // sheets. One dead sheet is an errors[] line, never a hard failure.
-  const sheets = extractInlineStyles(html).map((css) => ({ css, baseUrl: pageUrl, from: 'inline <style>' }));
-  const sheetUrls = extractStylesheetUrls(html, pageUrl);
-  const seenSheetUrls = new Set(sheetUrls);
-  for (const href of sheetUrls) {
-    try {
-      const res = await axios.get(href, {
-        timeout: 20_000,
-        maxRedirects: 5,
-        maxContentLength: MAX_HTML_BYTES,
-        responseType: 'text',
-        // keep CSS as the raw string — axios would otherwise try JSON.parse
-        transformResponse: [(d) => d],
-        headers: { 'User-Agent': UA, Accept: 'text/css,*/*;q=0.1' }
-      });
-      const css = String(res.data || '');
-      sheets.push({ css, baseUrl: href, from: href });
-      // Follow bounded CSS @imports. Themes often put @font-face rules in
-      // a typography partial rather than the homepage's first-level sheet.
-      for (const m of css.matchAll(/@import\s+(?:url\(\s*)?['"]?([^'")\s;]+)['"]?\s*\)?[^;]*;/gi)) {
-        if (sheetUrls.length >= MAX_STYLESHEETS) break;
-        try {
-          const imported = new URL(m[1], href).toString();
-          if (/^https?:/i.test(imported) && !seenSheetUrls.has(imported)) {
-            seenSheetUrls.add(imported);
-            sheetUrls.push(imported);
-          }
-        } catch { /* malformed import — skip */ }
-      }
-    } catch (err) {
-      errors.push(`stylesheet fetch failed: ${href}: ${err.message}`);
-    }
-  }
+  const { sheets, errors: sheetErrors } = await collectStylesheets(html, pageUrl);
+  errors.push(...sheetErrors);
 
   // 3. Parse @font-face rules, dedupe family+weight+style.
   let faces = [];
@@ -671,12 +888,7 @@ async function ingestBrandFontsInner(brand, run) {
     }
   }
   faces = dedupeFaces(faces);
-  const usageParts = sheets.map((sheet) => extractFontUsageFromCss(sheet.css));
-  const usageEvidence = usageParts.flatMap((u) => u.evidence || []);
-  const usage = extractFontUsageFromCss(
-    usageEvidence.map((e) => `${e.selector}{font-family:"${e.family}"}`).join('\n')
-  );
-  usage.evidence = usageEvidence.slice(0, 30);
+  const usage = aggregateFontUsageAcrossSheets(sheets.map((sheet) => sheet.css));
 
   // 4–6. Classify, then mirror ingestable faces to Cloudinary.
   const ingested = [];
@@ -772,5 +984,20 @@ module.exports = {
   MAX_INGESTED_FACES,
   MAX_COMMERCIAL_FACES,
   parseFontFacesFromCss,
-  extractFontUsageFromCss
+  extractFontUsageFromCss,
+  aggregateFontUsageAcrossSheets,
+  collectStylesheets,
+  familyStackTokens,
+  genericFamilyIn,
+  NON_BRAND_FAMILIES,
+  // Exported for scripts/backfillBrandFontGenerics.js, which re-derives the
+  // first-party generics for brands ingested before they were captured. It
+  // reuses these PURE extractors (and UA/MAX_STYLESHEETS) rather than making
+  // the ingest main loop reusable, deliberately: that loop also downloads and
+  // re-uploads font files to Cloudinary, which a classification backfill must
+  // never trigger.
+  extractInlineStyles,
+  extractStylesheetUrls,
+  UA,
+  MAX_STYLESHEETS
 };
