@@ -136,6 +136,38 @@ Duration time-scaling: specs are authored against their own extent (max `phases[
 
 **Follow-up, 2026-08-19: the `productName` (close phase) slot itself was still clamping — a shorter SOURCE string beats a smarter clamp.** Same Vuori jacket: the close-phase headline shipped as `"Women's Vuori Vintage Oversized…"` on Reels and `"Women's Vuori Vintage Oversized Denim…"` on Stories — different cutoffs for the identical source string, the tell that `deriveCharCap` (width-driven) was doing the cutting, not a fixed character cap. `truncateWordSafe` was already word-safe (never mid-word); the actual defect was upstream — nothing had ever shortened a still-45-character catalog title before the cap fired. The fix is in `services/brandScriptExecutor.js`'s `cleanProductNameForDisplay(name, brandName)`, applied once at the single point every video surface's cascade result already funnels through (`buildMetaForAd`, regardless of which cascade source won — `catalogProduct.title` / `layoutInput.input.product.name` / `ad.copy.productName`): strip a leading merchandising gender/audience qualifier (plural/possessive forms only — `Women's`, `Kids`, `Mens`, `Unisex`, … — bare singular `Men`/`Boy` are excluded, they collide with ordinary English like "Men in Black"), then strip a leading token-for-token match of the ad's own brand name (word-by-word prefix match, not a single substring — so a demo/test tenant literally named `"Vuori 2"` still strips the catalog's plain `"Vuori "` prefix). Both steps are guarded to never fire where the token is load-bearing (a brand literally named `"Women's Health"`) and never empty the string. Result for the incident string: `"Vintage Oversized Denim Jacket"` — fits Reels' and Stories' caps outright, no ellipsis. Where even that still doesn't fit a tighter box (`squareYt`/`pmax_video_1_1`'s 1-line cap), `remotion/lib/slotContent.js`'s new `fitProductNameToCap` (scoped to the `productName` slot only — every other slot keeps the plain tail-safe `truncateWordSafe`, so the quote's opening-clause guarantee above is untouched) drops leading modifier words one at a time — `"Oversized Denim Jacket"`, then `"Denim Jacket"`, … — never the trailing noun that actually identifies the product, and never emits an ellipsis while any whole-word phrase still fits. A tail-cut ellipsis remains the true last resort only when no whole-word candidate fits at all. Pinned by `scripts/verifyTitleSpecResolution.js` (G9/G9b/G10 — the cleaning function's brand/gender guards, plus the exact reported string end-to-end) and `scripts/verifyFormatAwareCharCaps.mjs` (section J — the Reels-vs-Stories cap delta and the noun-preserving fitter, including proof the quote slot is unaffected).
 
+**Follow-up, 2026-08-20 (Marine Layer 2, `run_1787174963435_ff67021e`) — four more defects, same
+neighborhood, full write-up `session.d/2026-08-20_five-video-titling-defects-marine-layer-2.md`.**
+(1) `deliveryLine`'s cascade read `input.product.badges[1]` — the same array `badgeText` reads
+`badges[0]` from — so a second undifferentiated merchandising claim ("Best seller") printed beside
+the CTA, redundant with (and on `landscape`/`feed`/`square`, simultaneously visible next to) the
+real `badge` slot's "TOP RATED". Fixed to `deliveryLine: []` — this slot has no genuine
+delivery/shipping data source today; empty always resolves `null`, which `Canonical.jsx` has
+handled cleanly since 2026-07-30. (2) The `headline` slot (Director/layoutInput prose, NOT
+`productName` — that slot was already correct here via the fix above) has no shortening step and
+clamped with a mid-sentence tail-ellipsis on any surface whose real cap was smaller than the
+cascade string. Fixed by running `services/videoHeadlineService.js`'s existing "select a candidate
+that fits, never truncate" machinery **unconditionally** (previously gated on `ad.funnelStage`,
+i.e. only for staged retitles) and against the REAL render-time `deriveCharCap` result, not
+videoHeadlineService's own coarser per-canvas-format estimate. (3) A burned-in quote opened with a
+proper curly `“` and closed with a bare apostrophe-shaped mark on a totally clean render (fresh
+webpack bundle, source data and font file both verified byte-correct in isolation) — the exact
+mechanism wasn't pinned down despite real effort, so `slotRenderers.jsx`'s `quoteWrap` now wraps
+with straight ASCII quotes instead of curly ones: both ends are the same character, so a mismatch
+is structurally impossible regardless of cause. (4) `meta_reels_9_16` productName was hard to read
+over a texturally busy (not merely dark) mountain plate despite a confidently-non-marginal mean
+contrast ratio — `plateIntelService`'s `busy` signal was already computed per band but only ever
+fed to keep-out scoring, never to the shadow decision. `Canonical.jsx`'s `reinforceShadow` now also
+escalates to the same already-authored `layered` shadow (never a scrim, never a stronger halo — see
+the no-scrim comment above `inkForBand` and the "halo is way too much" history right below it) when
+`busy > 0.45`, a first empirically-grounded threshold from this one incident, same status as
+`videoHeadlineService`'s own `LANDSCAPE_HEADLINE_BUDGET_CHARS`. **Investigated and deliberately left
+alone:** a fifth reported defect (video renders the brand's real custom-ingested "Seriously
+Nostalgic" serif; a static ad for the same brand would likely render sans, because
+`directImageRenderService.js`'s `FONT_SERIF_HINTS` keyword regex doesn't recognize that font's name
+as serif) is a classification bug in the STATIC prompt pipeline, not a titling/render defect —
+flagged as its own follow-up rather than patched inline or silently unified with video.
+
 Constants exported: SLOT_KEYS, BINDABLE_META_FIELDS, TOKEN_COLOR_KEYS, FONT_ROLES, ANCHORS, ALIGNS, TRANSITIONS, SCRIMS, SHADOWS, CASINGS, FORMATS, DEFAULT_BIND, clamp.
 
 ## 2b) Formats — one canonical template per format and size

@@ -1107,7 +1107,8 @@ async function buildMetaForAd(ad, brand, opts = {}) {
   const merged  = mergeCascades(DEFAULT_META_CASCADES, brand?.metaCascades || null);
   const cascaded = resolveMeta(merged, context);
 
-  // ── PMax funnel variants must not be cosmetic re-skins ────────────────
+  // ── PMax funnel variants must not be cosmetic re-skins, AND the headline
+  // must actually FIT the surface it renders on ─────────────────────────
   // The three free retitles (awareness / consideration / conversion) all
   // resolve against the SAME LayoutInputArtifact, because buildMetaForAd
   // scopes that lookup by {mediaId, productId} with no stage dimension. So
@@ -1120,31 +1121,76 @@ async function buildMetaForAd(ad, brand, opts = {}) {
   // the three stages across its three concepts, each with its own copy
   // block; nothing ever asked for it by stage. This asks.
   //
+  // SECOND, SEPARATE reason to look for a better candidate — added
+  // 2026-08-20, same site, because it needs the identical machinery
+  // (resolveVideoHeadlineCandidates + selectVideoHeadline). The `headline`
+  // slot has NO shortening step analogous to productName's
+  // cleanProductNameForDisplay/fitProductNameToCap (PR #254) — it is
+  // Director/layoutInput prose, not "[modifiers][noun]" shaped, so dropping
+  // leading/trailing words would change its meaning, not just its length.
+  // Left alone, `resolveSlotContentCore` clamps it with plain
+  // `truncateWordSafe` — a mid-sentence tail-ellipsis — on any surface whose
+  // real render-time cap (`deriveCharCap`, format+platformFormat+safe-zone
+  // aware) is smaller than the cascade's raw string. Measured live: a 45-char
+  // headline ("All the warmth of a puffer without the puff") shipped as
+  // "All the warmth of a puffer…" on `pmax_video_16_9` (cap 32) and "All the
+  // warmth of a puffer without the…" on `meta_reels_9_16`'s hook phase (cap
+  // 40) — same defect class as the funnel-stage duplication above, just
+  // triggered by width instead of by stage, so it is fixed at the same call:
+  // whenever the cascade's headline does not fit THIS ad's actual cap, look
+  // for a candidate that does (any concept, any stage-preferred order) via
+  // the SAME videoHeadlineService "select, never truncate" contract (owner
+  // directive: "Let the director make the call, it has a lot to choose
+  // from") — and only if nothing fits does the plain word-safe clamp remain
+  // the true last resort, exactly mirroring fitProductNameToCap's own
+  // fallback rule.
+  //
   // Read-only and best-effort by construction: videoHeadlineService never
   // calls the Director LLM, so this cannot bill. It only overrides when a
-  // stage-specific headline actually resolves — no candidates means the
-  // cascade's own answer stands, never a template and never an empty slot.
-  if (ad?.funnelStage && cascaded) {
+  // strictly-better candidate actually resolves — no candidates (or nothing
+  // fits better) means the cascade's own answer stands unchanged, never a
+  // template and never an empty slot. Inert when the cascade headline is
+  // null/empty (nothing to fit-check) or already fits.
+  if (cascaded && typeof cascaded.headline === 'string' && cascaded.headline.trim()) {
     try {
-      const { resolveVideoHeadline } = require('./videoHeadlineService');
-      const staged = await resolveVideoHeadline({
-        brandId:      brand?._id || ad.brandId || null,
-        productId:    ad.productId || null,
-        campaignKind: ad.campaignKind || null,
-        aspectRatio:  ad.aspectRatio || null,
-        funnelStage:  ad.funnelStage
+      const { resolveVideoHeadlineCandidates, selectVideoHeadline } = require('./videoHeadlineService');
+      const { deriveCharCap, CANVAS_WIDTH_DEFAULT } = require('../remotion/lib/slotContent.js');
+      const headlineFormat = classifyFormat(ad);
+      const realCap = deriveCharCap('headline', {
+        format: headlineFormat,
+        platformFormat: ad.platformFormat || null,
+        canvasWidth: CANVAS_WIDTH_DEFAULT[headlineFormat] || null,
       });
-      if (typeof staged === 'string' && staged.trim() && staged !== cascaded.headline) {
-        console.log(
-          `   🎯 funnelCopy[ad=${ad._id}] stage=${ad.funnelStage}: ` +
-          `headline differentiated ("${String(cascaded.headline || '').slice(0, 28)}" → "${staged.slice(0, 28)}")`
-        );
-        cascaded.headline = staged;
+      const currentFits = !Number.isFinite(realCap)
+        || cascaded.headline.replace(/\s+/g, ' ').trim().length <= realCap;
+
+      if (ad?.funnelStage || !currentFits) {
+        const candidates = await resolveVideoHeadlineCandidates({
+          brandId:      brand?._id || ad.brandId || null,
+          productId:    ad.productId || null,
+          campaignKind: ad.campaignKind || null,
+          funnelStage:  ad.funnelStage || null,
+        });
+        // Prefer a candidate that FITS THE REAL CAP over videoHeadlineService's
+        // own coarser per-canvas-format budget (HEADLINE_CHAR_BUDGET) — that
+        // table predates per-platformFormat/safe-zone caps and is only an
+        // estimate for `vertical` (see its own header comment); deriveCharCap
+        // is what the renderer actually enforces.
+        const staged = Number.isFinite(realCap)
+          ? selectVideoHeadline({ candidates, budgetChars: realCap })
+          : selectVideoHeadline({ candidates, format: headlineFormat });
+        if (typeof staged === 'string' && staged.trim() && staged !== cascaded.headline) {
+          console.log(
+            `   🎯 funnelCopy[ad=${ad._id}] stage=${ad.funnelStage || 'none'} cap=${realCap ?? 'n/a'}: ` +
+            `headline differentiated ("${String(cascaded.headline || '').slice(0, 28)}" → "${staged.slice(0, 28)}")`
+          );
+          cascaded.headline = staged;
+        }
       }
     } catch (err) {
-      // Differentiation is an enhancement, not a render gate — the video is
-      // already billed by the time titling runs.
-      console.warn(`   ⚠️  funnelCopy[ad=${ad?._id}]: stage headline failed (${err.message}) — keeping cascade headline`);
+      // Differentiation/fit-check is an enhancement, not a render gate — the
+      // video is already billed by the time titling runs.
+      console.warn(`   ⚠️  funnelCopy[ad=${ad?._id}]: stage/fit headline check failed (${err.message}) — keeping cascade headline`);
     }
   }
 

@@ -348,7 +348,8 @@ export const Canonical = ({ format = 'feed', safeZoneKey = null, platformFormat 
         const effectiveAnchor = groupAnchors.get(`${group.phase}|${group.anchor}`) || group.anchor;
         // Ink for THIS group, from the band it actually occupies after keep-out.
         const groupAtSec = first.timing.enterAtSec * timeScale + 0.5;
-        const bandLum = bandStateFor(plateHints, effectiveAnchor, groupAtSec).lum;
+        const groupBandState = bandStateFor(plateHints, effectiveAnchor, groupAtSec);
+        const bandLum = groupBandState.lum;
         // PMax: score the ink against every sample of this band, not just the
         // one nearest the group's enter time. A 10s clip whose shot changes
         // under a title otherwise picks ink for the instant the text arrives
@@ -363,13 +364,38 @@ export const Canonical = ({ format = 'feed', safeZoneKey = null, platformFormat 
         // Even the better ink is below AA on this band: placement cannot carry it,
         // so the strongest authored shadow does. 'layered' is an existing validated
         // treatment value, not a new one.
-        const reinforceShadow = !!bandInk?.marginal;
+        //
+        // BUSY-BAND ESCALATION (2026-08-20). `groupBandState.busy` (local luma
+        // variance — plateIntelService, worst-case across the band's samples,
+        // same aggregation as bandStateFor's own `busy` field above) was
+        // computed for every band and fed to KEEP-OUT scoring only; nothing
+        // ever read it here, so a band with EXCELLENT mean contrast (this
+        // ink's own `best` ratio) could still be too textured to read well in
+        // patches — a rocky/detailed plate has hot and dark pixels the mean
+        // averages away. Measured live (Marine Layer 2, run
+        // run_1787174963435_ff67021e, `meta_reels_9_16` close-phase productName
+        // band): `best=10.87:1` (comfortably non-marginal) yet `busy=0.496` on
+        // a visibly hard-to-read mountain-rock plate. `BUSY_SHADOW_THRESHOLD`
+        // is a first empirically-grounded estimate from that ONE incident
+        // (samples on that plate ranged 0.36-0.87; 0.45 sits just above the
+        // least-busy sample so mildly textured plates stay inert) — same
+        // "measured from one delivered defect, not pixel-swept" status as
+        // videoHeadlineService's LANDSCAPE_HEADLINE_BUDGET_CHARS. Deliberately
+        // escalates to the SAME already-authored 'layered' shadow the marginal
+        // path uses — never a scrim (owner ruled those out, see the header
+        // comment above `inkForBand`) and never a stronger halo than what
+        // shipped after "the halo is way too much" was already fixed once.
+        const BUSY_SHADOW_THRESHOLD = 0.45;
+        const bandBusy = Number.isFinite(groupBandState.busy) ? groupBandState.busy : null;
+        const busyReinforce = bandBusy != null && bandBusy > BUSY_SHADOW_THRESHOLD;
+        const reinforceShadow = !!bandInk?.marginal || busyReinforce;
         // eslint-disable-next-line no-console
         console.log(
           `inkBand: ${group.phase}|${effectiveAnchor} lum=${bandLum == null ? '?' : bandLum.toFixed(2)} ` +
+          `busy=${bandBusy == null ? '?' : bandBusy.toFixed(2)} ` +
           `-> ${inkOnLight ? 'dark ink (on-light tokens)' : 'light ink'}` +
           `${bandInk ? ` best=${bandInk.best}:1` : ' (no band data -> global vote)'}` +
-          `${reinforceShadow ? ' MARGINAL -> layered shadow' : ''}`
+          `${reinforceShadow ? ` ${bandInk?.marginal ? 'MARGINAL' : 'BUSY'} -> layered shadow` : ''}`
         );
         const container = stackContainerStyle({
           format,
