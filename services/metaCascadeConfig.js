@@ -87,9 +87,28 @@ const DEFAULT_META_CASCADES = {
   // because offer_text outranked it on any ad with an offer. A tagline next
   // to a truck is nonsense for the same reason. Null now means the slot is
   // skipped, which is the honest outcome when we hold no delivery terms.
-  deliveryLine: [
-    { type: 'doc', doc: 'layoutInput', path: 'input.product.badges[1]' },
-  ],
+  //
+  // REMOVED 2026-08-20 — this cascade still read
+  // `input.product.badges[1]` (the SECOND item of the same array
+  // `badgeText` reads badges[0] from, above), so this slot printed a second
+  // generic merchandising claim ("Best seller", "New Arrival", "Premium
+  // Cotton", …) beside the CTA on every ad whose badges array had ≥2
+  // entries. `DeliverySlot`'s `DELIVERY_CLAIM` regex already suppresses the
+  // TRUCK ICON for non-shipping text (owner, on seeing it: "I am seeing
+  // the shipping car show back up") — but that fix only hid the icon, not
+  // the text, so the claim kept rendering naked next to the CTA. On video
+  // it additionally duplicates `badge` — both slots hold visible for the
+  // whole clip on landscape/feed/square (single un-staged phase, no
+  // `exitAtSec` on either), so "Top rated" (badge) and "Best seller"
+  // (deliveryLine) print stacked/simultaneously — the "two proof badges"
+  // defect. This slot is a shipping reassurance with no real data source
+  // today (no genuine delivery/shipping field exists anywhere in
+  // LayoutInputArtifact); an empty cascade always resolves to `null`, and
+  // Canonical.jsx already handles the empty case cleanly (row wrapper
+  // falls back to a lone CTA column — see the 2026-07-30 commit that first
+  // established the "null renders nothing" contract this cascade is now
+  // actually honouring).
+  deliveryLine: [],
   promoText: [
     { type: 'doc', doc: 'ad',          path: 'copy.offer_text' },
     { type: 'doc', doc: 'layoutInput', path: 'input.cta.offer_text' },

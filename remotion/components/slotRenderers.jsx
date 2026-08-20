@@ -288,10 +288,35 @@ function starPoints(outerR, innerR) {
   return verts.join(' ');
 }
 
+// Straight ASCII quotes, not curly typographic ones — deliberate, 2026-08-20.
+// A delivered Marine Layer 2 `pmax_video_16_9` (and reproduced identically on
+// meta_feed_1_1/4_5 and pmax_video_1_1 — not surface-specific) opened with a
+// proper "“" but closed with a bare apostrophe-shaped mark instead of the
+// matching "”": `"ridiculously soft and amazingly lightweight'`. Traced hard
+// before landing on this fix — ruled out, each with a live reproduction, not
+// just a read: the source snippet (LayoutInputArtifact primary_quote.text/
+// .snippet — plain ASCII, zero embedded quote chars, checked codepoint by
+// codepoint); this function's own source (both wrap characters are U+201C/
+// U+201D, confirmed by codepoint, not misread in an editor font); the brand's
+// actual custom font file "Seriously Nostalgic" (both the Cloudinary original
+// and the locally cached woff2 render U+201C/U+201D as a correctly matched
+// pair, at every size tested, with and without the exact `layered`/`soft`
+// on-light text-shadow halo this role can carry); the render engine (the
+// SAME chrome-headless-shell binary the real render uses, driven directly,
+// still rendered a matched pair); and a stale webpack bundle cache (cleared
+// `remotion/node_modules/.cache` and re-rendered from a cold bundle — same
+// mismatched output, byte-identical to the cached-bundle run). None of those
+// isolate the actual mechanism. Rather than ship a fix that depends on
+// understanding a font/engine interaction nobody could pin down, wrap with
+// the one character guaranteed to be identical on both ends AND present in
+// every font a brand could ever ingest (Basic Latin, not General
+// Punctuation) — a mismatch becomes structurally impossible, not just
+// unobserved. Slightly less "editorial" than a curly pair; correctness over
+// curliness.
 export const TextSlot = ({ slot, content, tokens, dims, format, progress }) => {
   const t = slot.treatment;
   const text = applyCasing(content, t.casing);
-  const quoteWrap = slot.key === 'quote' ? `“${String(text).replace(/^["'“”]+|["'“”]+$/g, '')}”` : text;
+  const quoteWrap = slot.key === 'quote' ? `"${String(text).replace(/^["'“”]+|["'“”]+$/g, '')}"` : text;
   const reviewerWrap = slot.key === 'reviewer' ? `— ${quoteWrap}` : quoteWrap;
   const accent = t.accent || { type: 'none' };
   return (
