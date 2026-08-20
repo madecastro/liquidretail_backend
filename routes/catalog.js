@@ -29,7 +29,7 @@ const CropArtifact          = require('../models/CropArtifact');
 const DetectionArtifact     = require('../models/DetectionArtifact');
 const Ad                    = require('../models/Ad');
 const Campaign              = require('../models/Campaign');
-const { loadPhotorealUrlMap, loadUseImageRefMap } = require('../services/adDisplayUrlService');
+const { loadPhotorealUrlMap, loadUseImageRefMap, loadProductUrlMap } = require('../services/adDisplayUrlService');
 const { buildGridPreviewVideoUrl } = require('../services/videoPreviewUrl');
 const { AD_RECENCY_EXPR } = require('../services/adRecencyService');
 const catalogProductPromoteService = require('../services/catalogProductPromoteService');
@@ -904,6 +904,14 @@ router.get('/:id/ads-detail', async (req, res) => {
           platformFormat: 1, aiCanvasArtifactId: 1, mediaId: 1, productId: 1, variantKind: 1,
           paletteSource: 1, sourceFileType: 1, regenerating: 1, regenerationStage: 1,
           regenerationHistory: 1, funnelStage: 1,
+          // brandId — this endpoint's own $match already fixes every row to
+          // the single requested brandId (filter.brandId = brandObjectId
+          // above), but loadProductUrlMap() groups its lookup by each row's
+          // OWN ad.brandId (brand-scoped join, see PR #245 / #263). Without
+          // it in this allowlist every row arrives brandId=undefined and
+          // the map silently resolves empty — same trap that kept
+          // productUrl off this endpoint in the first place.
+          brandId: 1,
           // Pipeline stage + when it was entered. Product Ads renders the same
           // ad tiles as the gallery but received neither field, so an ad
           // mid-generation showed a bare "Queued" here while /render-activity
@@ -935,9 +943,14 @@ router.get('/:id/ads-detail', async (req, res) => {
         sourceMediaMap.set(String(m._id), { fileUrl: m.fileUrl || null, fileType: m.fileType || null });
       }
     }
-    const [photorealMap, useImageRefMap] = await Promise.all([
+    // Retailer product-page link for the ad detail view — joined and
+    // brand-scoped by loadProductUrlMap, see services/adDisplayUrlService.js.
+    // Same join /api/ads already performs; this endpoint just never called
+    // it, so Product Ads (the primary nav surface) never got the link.
+    const [photorealMap, useImageRefMap, productUrlMap] = await Promise.all([
       loadPhotorealUrlMap(ads),
-      loadUseImageRefMap(ads)
+      loadUseImageRefMap(ads),
+      loadProductUrlMap(ads)
     ]);
 
     // Distinct campaigns referenced by this product's ads + per-campaign
@@ -979,6 +992,13 @@ router.get('/:id/ads-detail', async (req, res) => {
       // projectAd. Same "absent renders as nothing" contract as the flat
       // ads list, so the two surfaces agree.
       funnelStage:    a.funnelStage || null,
+      // Retailer's own product-page link (CatalogProduct.productUrl),
+      // joined + brand-scoped by loadProductUrlMap above (see PR #245 /
+      // #263 for why the join is per-brand, never a global $in). null
+      // when there's no productId, the product was unlinked/soft-deleted,
+      // or it simply has no URL on file — never throws, never leaks
+      // another brand's link.
+      productUrl:     (a.productId && productUrlMap.get(String(a.productId))) || null,
       sourceFileType: a.sourceFileType || null,
       status:         a.status,
       approved:       !!a.approved,

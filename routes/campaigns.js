@@ -390,7 +390,7 @@ router.get('/:id/ads-detail', async (req, res) => {
     ).select('_id matchedProductIds').lean();
     if (!campaign) return res.status(404).json({ error: 'campaign not found' });
 
-    const { loadPhotorealUrlMap, loadUseImageRefMap } = require('../services/adDisplayUrlService');
+    const { loadPhotorealUrlMap, loadUseImageRefMap, loadProductUrlMap } = require('../services/adDisplayUrlService');
     // Aggregation, not .find(), for the same reason as catalog.js's sibling
     // /:id/ads-detail: ranking must use "true" recency (renderedAt, falling
     // back to generatedAt — see adRecencyService), which a plain
@@ -409,7 +409,15 @@ router.get('/:id/ads-detail', async (req, res) => {
           paletteSource: 1, sourceFileType: 1, regenerating: 1, regenerationStage: 1,
           regenerationHistory: 1,
           // Same gap as catalog.js ads-detail — see the note there.
-          renderStage: 1, renderStageAt: 1
+          renderStage: 1, renderStageAt: 1,
+          // Intent profile (funnelStage) + brandId (so loadProductUrlMap
+          // below can group its per-brand join) — this endpoint's own
+          // $match already fixes every row to one campaign/brand, but both
+          // fields were missing from this allowlist entirely, so neither
+          // ever reached the /campaigns expansion. Same explicit-allowlist
+          // trap as catalog.js's sibling endpoint (PR #263 fixed that one
+          // and /api/ads but missed this route).
+          funnelStage: 1, brandId: 1
       } }
     ], { allowDiskUse: true });
 
@@ -439,11 +447,14 @@ router.get('/:id/ads-detail', async (req, res) => {
       adCount:   productAdCounts.get(String(p._id)) || 0
     })).sort((a, b) => b.adCount - a.adCount);
 
-    // Photoreal + useImageRef joins — same shape /api/ads returns so the
-    // frontend thumbnail / detail-modal code can be shared.
-    const [photorealMap, useImageRefMap] = await Promise.all([
+    // Photoreal + useImageRef + retailer-productUrl joins — same shape
+    // /api/ads returns so the frontend thumbnail / detail-modal code can
+    // be shared. productUrl is brand-scoped by loadProductUrlMap (see
+    // services/adDisplayUrlService.js / PR #245 / #263).
+    const [photorealMap, useImageRefMap, productUrlMap] = await Promise.all([
       loadPhotorealUrlMap(ads),
-      loadUseImageRefMap(ads)
+      loadUseImageRefMap(ads),
+      loadProductUrlMap(ads)
     ]);
 
     const adRows = ads.map(a => ({
@@ -472,6 +483,13 @@ router.get('/:id/ads-detail', async (req, res) => {
       metaAdId:       a.metaAdId || null,
       metaAdsetId:    a.metaAdsetId || null,
       productId:      a.productId ? String(a.productId) : null,
+      // Intent profile — see models/Ad.js funnelStage. Absent renders as
+      // nothing on the frontend, never a raw token.
+      funnelStage:    a.funnelStage || null,
+      // Retailer's own product-page link, brand-scoped — null when
+      // there's no productId, an unlinked/soft-deleted product, or no
+      // URL on file.
+      productUrl:     (a.productId && productUrlMap.get(String(a.productId))) || null,
       regenerating:   !!a.regenerating,
       regenerationStage: a.regenerationStage || null,
       regenerationHistory: Array.isArray(a.regenerationHistory)
