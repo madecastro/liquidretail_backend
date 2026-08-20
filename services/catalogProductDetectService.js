@@ -374,21 +374,37 @@ async function ensureDetectForProducts(catalogProductIds, {
   const oids = [...new Set((catalogProductIds || []).map(String))].map(toOid).filter(Boolean);
   if (!oids.length) return { ensured: 0, ready: 0, timedOut: 0, total: 0 };
 
+  // FAIL CLOSED, STRUCTURALLY (adversarial review of PR #257, 2026-08-19).
+  // This is tenant isolation on a path that bills Gemini vision
+  // (enqueueProductDetect below) — no brandId means no lookup, full stop.
+  //
+  // This used to be `const scope = brandId ? { brandId } : {}`, fail-open
+  // when brandId was falsy, justified by a comment claiming
+  // services/productMatchService.js's post-scale detect pre-warm call
+  // (brandId: ctx.brandId || null) NEEDED that fail-open path or it would
+  // "silently break." That claim was checked against the actual code and is
+  // FALSE: every path in productMatchService.js that can set
+  // match.catalogProductId (buildCatalogWinnerMatchRecord's catalog-first
+  // match, the scene-level legacy catalogMatch, and
+  // ensureCatalogProductForMatch in enrichOneMatchInPlace) is itself gated
+  // on `brandId` being truthy — findPerProductMatches only runs
+  // catalogFirstMatchOneRefined `if (refinedProducts.length && brandId)`,
+  // findProductMatches only computes the legacy catalogMatch `if
+  // (brandId)`, and enrichOneMatchInPlace only calls
+  // ensureCatalogProductForMatch `... && ctx.brandId && ...`. So by the time
+  // that caller's `match.catalogProductId` is truthy and it reaches this
+  // function, `ctx.brandId` is ALREADY always truthy too — the `|| null`
+  // fallback on that call site is dead code that never actually fires. The
+  // caller does not need — and was never exercising — a fail-open path
+  // here. See scripts/verifyDetectPrepMediaTenancy.js section B for the
+  // pinned behavioural proof.
+  if (!brandId) return { ensured: 0, ready: 0, timedOut: 0, total: 0 };
+
   // Collapse variants to their primary (matching + seeds already operate on
   // primaries via isPrimaryVariant; without this a campaign using several
   // SKUs of one product would re-materialize + re-detect the same hero N
   // times). Map each requested id → primaryProductId || itself, dedupe.
-  //
-  // Scope both lookups below to brandId when the caller supplies one —
-  // expandWizardJob always does (defense in depth: a foreign catalogProductId
-  // that still reaches this function, e.g. via a same-brand Media's
-  // matchedProducts pointing cross-brand, must not reach enqueueProductDetect,
-  // a billed Gemini vision call, against another brand's product). But
-  // productMatchService's post-scale detect pre-warm passes brandId: null
-  // (an internal match result, not a request-body tenant to check against) —
-  // a hard filter here would silently break that caller, so the clause stays
-  // conditional.
-  const scope = brandId ? { brandId } : {};
+  const scope = { brandId };
   const requested = await CatalogProduct.find({ _id: { $in: oids }, ...scope })
     .select('_id primaryProductId').lean();
   if (!requested.length) return { ensured: 0, ready: 0, timedOut: 0, total: 0 };

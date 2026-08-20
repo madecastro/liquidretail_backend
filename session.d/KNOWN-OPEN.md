@@ -183,5 +183,37 @@ Living checklist. Update in place; do not append a duplicate list elsewhere.
     the same rigor as the fixed item: prod measurement where applicable,
     revert-proved offline harness, full verify+lint gate, PR.
 
+- **`services/mediaAssignmentService.js`'s `attachProduct` (and every other
+  attach/detach in the file) scopes ownership by `advertiserId` ONLY, never
+  `brandId` — despite the file's own header claiming "Cross-tenant attach is
+  impossible." CONFIRMED by reading the code (adversarial review of PR #257
+  `fix/detect-media-brand-tenancy`, 2026-08-19); report-only, not fixed —
+  this is a separate change from that PR's scope.**
+  `assertMediaOwned` (`:23-27`) is `Media.findOne({ _id: mediaId,
+  advertiserId })` and `assertProductOwned` (`:30-34`) is
+  `CatalogProduct.findOne({ _id: productId, advertiserId })` — brandId never
+  enters either query, and `attachProduct` (`:48-...`) calls only these two
+  before writing the assignment. `models/Brand.js:37` confirms an advertiser
+  routinely owns MULTIPLE brands (`advertiserId` is a real, indexed field,
+  and the unique index at `:495` is `{advertiserId, nameNormalized}` — i.e.
+  uniqueness is per-brand-name-within-an-advertiser, not one brand per
+  advertiser). So an operator on a multi-brand advertiser account can call
+  the attach-product endpoint with a `mediaId` belonging to Brand A and a
+  `productId` belonging to Brand B (same advertiser, different brand) and it
+  succeeds — creating exactly the cross-brand Media↔CatalogProduct shape
+  that `catalogProductDetectService.js`'s (now-corrected, see the fix landed
+  in this same PR) fail-open comment gestured at, except this one is a real,
+  reachable write path, not a dead conditional. Downstream consequence:
+  `catalogProductDetectService.ensureDetectForProducts` is now scoped to the
+  CALLER's brandId, but if an operator has attached a foreign-brand product
+  to a Media row via this path, later detect/render flows that trust
+  `Media.matchedProducts[].catalogProductId` as "this brand's product" would
+  still be handed a cross-brand id — the attach is the actual hole, not the
+  detect scoping this PR fixed. Not fixed here — scoped as its own follow-up
+  (add `brandId` to both `assertMediaOwned`/`assertProductOwned`, derived
+  from the Media's own `brandId` for the product/category assert, and fix
+  the file's header comment to stop claiming an invariant the code does not
+  enforce).
+
 ---
 

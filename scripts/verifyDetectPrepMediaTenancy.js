@@ -28,24 +28,48 @@
 //   1. campaignAdsGenerationService.js — the detect-prep Media.find gained
 //      a `brandId` clause (the campaign's own brandId, already in scope).
 //   2. catalogProductDetectService.js — ensureDetectForProducts's two
-//      CatalogProduct.find calls gained a CONDITIONAL brandId clause
-//      (`brandId ? { brandId } : {}`). THE SECOND query (the primaryOids/
-//      imageUrl lookup that actually produces `products`, the array
-//      everything downstream operates on) is the one that is independently
-//      security-load-bearing — primaryProductId could in theory point
-//      cross-brand on bad data, and this is the query that would let that
-//      through. The FIRST query's clause is real but is a strict subset of
-//      what the second query already re-checks (see section B/M2 below,
-//      which proves this rather than asserting it): its value is narrowing
-//      the candidate set for a caller-supplied `oids` list, not closing an
-//      independently-exploitable hole. Both are kept because the first is
-//      harmless and arguably good practice, but only the second is pinned as
-//      a security-critical revert-prove (M3).
-//      Conditional, not a hard filter, because services/productMatchService.js
-//      (line ~881, post-scale detect pre-warm) calls this function with
-//      `brandId: ctx.brandId || null` — an internal match result, not a
-//      request-body tenant to check against. A hard filter would silently
-//      break that legitimate caller; this harness proves it does not.
+//      CatalogProduct.find calls gained a brandId clause. THE SECOND query
+//      (the primaryOids/imageUrl lookup that actually produces `products`,
+//      the array everything downstream operates on) is the one that is
+//      independently security-load-bearing — primaryProductId could in
+//      theory point cross-brand on bad data, and this is the query that
+//      would let that through. The FIRST query's clause is real but is a
+//      strict subset of what the second query already re-checks (see
+//      section B/M2 below, which proves this rather than asserting it): its
+//      value is narrowing the candidate set for a caller-supplied `oids`
+//      list, not closing an independently-exploitable hole. Both are kept
+//      because the first is harmless and arguably good practice, but only
+//      the second is pinned as a security-critical revert-prove (M3).
+//
+//   UPDATE 2026-08-19 (adversarial review of PR #257 found a blocking
+//   defect in the above): this used to be a CONDITIONAL clause
+//   (`const scope = brandId ? { brandId } : {}`) — fail-OPEN when brandId
+//   was falsy. The justifying comment claimed
+//   services/productMatchService.js's post-scale detect pre-warm call
+//   (`brandId: ctx.brandId || null`, line ~898) NEEDED that fail-open path
+//   or a hard filter would "silently break" it. **That claim was checked
+//   against the actual code and is FALSE.** Every path in
+//   productMatchService.js that can set `match.catalogProductId` — the
+//   catalog-first winner in `buildCatalogWinnerMatchRecord`, the legacy
+//   scene-level `catalogMatch`, and `ensureCatalogProductForMatch` inside
+//   `enrichOneMatchInPlace` — is ITSELF gated on `brandId` being truthy
+//   (`findPerProductMatches` only runs catalog-first `if (refinedProducts.
+//   length && brandId)`; `findProductMatches` only computes the legacy
+//   `catalogMatch` `if (brandId)`; `enrichOneMatchInPlace` only calls
+//   `ensureCatalogProductForMatch` `... && ctx.brandId && ...`). So by the
+//   time that caller's `match.catalogProductId` is truthy and it reaches
+//   `ensureDetectForProducts`, `ctx.brandId` is ALREADY always truthy too —
+//   the `|| null` fallback on that call site is dead code that never
+//   actually fires in practice. **This function now FAILS CLOSED**:
+//   `if (!brandId) return { ensured:0, ready:0, timedOut:0, total:0 }`
+//   before either query runs. `scope` is now unconditionally `{ brandId }`.
+//   Not currently exploitable (both production callers always supply a
+//   truthy brandId when catalogProductId is non-null) but this is tenant
+//   isolation on a path that bills Gemini vision, and a landmine with a
+//   false justifying comment is worse than no comment. Section B below
+//   (B2) now asserts the fail-CLOSED behaviour instead of the old fail-open
+//   one — a prior version of this harness required brandId:null to still
+//   reach both products, which would have failed a correct fail-closed fix.
 //
 // TECHNIQUE.
 //   A. Hunk 1 (the inline Media.find in expandWizardJob, which is NOT its
@@ -216,6 +240,58 @@ function checkHunk1SourceAnchor(genSrc, label) {
   });
 }
 
+// A1's key-presence check only proves the LITERAL NAME `brandId` appears in
+// the object — it would pass equally well on `brandId: campaign.advertiserId`
+// (wrong field, right key name) or on a shorthand `brandId` bound to some
+// other value entirely. This traces what VALUE actually feeds that key: for
+// an explicit `brandId: <expr>` it reads `<expr>` directly; for the ES6
+// shorthand `brandId,` (the real code today) it finds the nearest preceding
+// `const/let brandId = <expr>` in the same file and reads THAT expression
+// instead. Either way it demands the RHS actually mention `campaign.brandId`
+// — not just any `campaign.*` field — so the exact landmine named above
+// (right key, wrong or unrelated source field) fails this check even though
+// it would still pass A1.
+function checkHunk1BrandIdValue(genSrc, label) {
+  check(label, () => {
+    const mediaBlock = braceBlockFrom(genSrc, 'if (mediaIds.length) {');
+    if (!mediaBlock) throw new Error('anchor `if (mediaIds.length) {` not found');
+    const findArg = objectArgOf(mediaBlock, 'Media.find(');
+    if (!findArg) throw new Error('Media.find( call not found inside the mediaIds.length block');
+    const noComments = findArg.replace(/\/\/[^\n]*/g, '');
+
+    // Explicit `brandId: <expr>` — capture up to the next top-level comma
+    // or the closing brace.
+    const explicit = noComments.match(/\bbrandId\s*:\s*([^,}]+)[,}]/);
+    if (explicit) {
+      const valueExpr = explicit[1].trim();
+      if (!/campaign\.brandId\b/.test(valueExpr)) {
+        throw new Error(`Media.find's brandId key has an explicit value "${valueExpr}" that does not reference campaign.brandId — right key name, wrong source field`);
+      }
+      return;
+    }
+
+    // Shorthand `brandId` (no colon) — must be a bare identifier reference;
+    // trace it to its declaration in the enclosing file.
+    if (!/(?:^|[{,])\s*brandId\s*[,}]/.test(noComments)) {
+      throw new Error('brandId key found by objectLiteralKeys but neither an explicit `brandId: <expr>` nor a bare shorthand `brandId` pattern matched it — investigate the actual source shape');
+    }
+    const declRe = /(?:const|let)\s+brandId\s*=\s*([^;]+);/g;
+    let decl;
+    let sawAny = false;
+    let sawCorrect = false;
+    while ((decl = declRe.exec(genSrc))) {
+      sawAny = true;
+      if (/campaign\.brandId\b/.test(decl[1])) sawCorrect = true;
+    }
+    if (!sawAny) {
+      throw new Error('shorthand `brandId` used in Media.find but no `const/let brandId = …` declaration found anywhere in the file to trace it to');
+    }
+    if (!sawCorrect) {
+      throw new Error('every `const/let brandId = …` declaration found traces to something other than campaign.brandId — the shorthand key resolves to the wrong source field');
+    }
+  });
+}
+
 // ── fixtures (24-hex, ObjectId-shaped) ──────────────────────────────────
 const oid = (ch, n) => `68f0${String(ch).repeat(19)}${n}`;
 const BRAND_A = oid('a', '1');
@@ -288,6 +364,7 @@ async function run() {
   console.log('A. campaignAdsGenerationService.js detect-prep Media.find carries brandId');
   const genSrc = read('services', 'campaignAdsGenerationService.js');
   checkHunk1SourceAnchor(genSrc, 'A1. Media.find({...}) inside `if (mediaIds.length)` includes a brandId key');
+  checkHunk1BrandIdValue(genSrc, 'A1b. that brandId key\'s VALUE traces to campaign.brandId, not just its NAME (guards a `brandId: campaign.advertiserId`-shaped false pass)');
   check('A2. module still exports expandWizardJob', () => {
     const svc = require('../services/campaignAdsGenerationService');
     if (typeof svc.expandWizardJob !== 'function') throw new Error('expandWizardJob not exported / not a function');
@@ -308,9 +385,9 @@ async function run() {
         const result = await detectSvc.ensureDetectForProducts([P_OWNED, P_UNOWNED], { brandId: BRAND_A, wait: false });
         assertEqual(result.total, 1, 'total reachable products');
       });
-      await checkAsync('B2. same owned+foreign ids, brandId=null (productMatchService caller) → NOT regressed, both still reachable', async () => {
+      await checkAsync('B2. [FAIL-CLOSED] brandId=null → NOTHING is reachable, not even the owned product', async () => {
         const result = await detectSvc.ensureDetectForProducts([P_OWNED, P_UNOWNED], { brandId: null, wait: false });
-        assertEqual(result.total, 2, 'total reachable products with no brandId supplied');
+        assertEqual(result.total, 0, 'total reachable products with no brandId supplied (fail-closed: no brandId means no lookup, full stop)');
       });
       await checkAsync('B3. same-brand variant whose primaryProductId points cross-brand → filtered by the SECOND query', async () => {
         const result = await detectSvc.ensureDetectForProducts([P_VARIANT], { brandId: BRAND_A, wait: false });
