@@ -69,49 +69,46 @@ it clears it back to this placeholder in the same commit that closes it out.)_
 *(Replace this whole section, don't append to it, when it goes stale.)*
 
 - Trunk `main` is moving fast — always `git fetch` before trusting a SHA here.
-  As of this update, `main` is at `cddee569` (#259, parallel-safety fix for
-  the verify runner), with `fc12c6d4` (#257, `fix/detect-media-brand-tenancy`)
-  merged just before it — **both merged**, closing out the two backend
-  sessions that were open the last two times this section was written (see
-  `session.d/2026-08-19_detect-prep-mediaids-brand-leak-fix.md` for #257's
-  detail). PR #246 landed a proper test runner in this same window: `npm
-  test` (parallel, `scripts/runVerifySuite.js`) and `npm run test:affected`.
-  **Do NOT trust `test:affected`** — confirmed hole in its changed-file
-  basename filter (`length >= 4`), so `models/Ad.js` → `"Ad"` → excluded;
-  editing it (or `routes/ads.js`, `"ads"`) alone can report "nothing to run"
-  and exit 0 while dependent scripts never run. Use plain `npm test` (full
-  suite) until this is fixed — this is also why rebasing #260 onto #257/#259
-  below was verified with the full suite, not `--affected`.
-- Open PRs at the time of this update: RPD **#210/#212** (deliberately
-  deferred — do not touch). Newest backend session (this one): PR **#260**,
-  `fix/vision-qc-silent-gate` — vision QC ran on 0/39 ads on a real
-  production run; root cause was the (deliberate, owner-requested) gate
-  being off combined with three call sites that silently discarded the
-  "disabled" verdict shape instead of stamping it, so `shippedWithoutQc`
-  undercounted to zero. Just rebased onto #257/#259 and picked up a second,
-  adversarial-review pass in the same PR: (a) the pre-spend idempotency
-  guard in `imageRecoveryService.maybeQcRecoveredPlate` treated that same
-  `disabled:true` stamp as "already inspected", which would have
-  permanently defeated QC on any ad recovered again after the gate is
-  re-enabled — fixed; (b) `shippedWithoutQc` had no status filter and
-  falsely alarmed on every in-flight (`queued`/`rendering`) ad — fixed,
-  scoped to `AD_STATUSES`; (c) `qcdOnRetry` double-counted a twice-failed ad
-  against `qcFailed` — fixed with `passed:true`; (d) split
-  `shippedWithoutQc` into two new named subsets, `qcDisabled` (deliberate
-  gate-off) and `qcUnavailable` (gate on, QC could not run — a live outage
-  signal). See `session.d/2026-08-19_vision-qc-silent-gate-fixed-pr-260.md`.
-  **Backend-only shape change** — frontend companion
-  `Emami-RS-Project/liquidretail` PR **#62** (`fix/vision-qc-not-inspected-fe`)
-  does not yet read `qcDisabled`/`qcUnavailable`; confirmed it degrades
-  gracefully (optional chaining over unknown JSON fields, no schema
-  validation) rather than breaking, so #62 is safe to merge as-is — it just
-  keeps showing the older collapsed signal until updated to consume the new
-  fields.
+  As of this update, `main` is at `9fb14705` (#272, reconciles a stale
+  `CampaignRun` from the real Ad truth instead of trusting process-local
+  status writes), with #268 (static ad-grid tile downscale) and #271
+  (brand-scope `mediaAssignmentService` attach/detach) merged just before it.
+  #260-through-#265 (vision-qc silent gate, typeface classification, funnel
+  stage + retailer productUrl on projections, verify-infra hardening) are all
+  merged — the PR #260 narrative that used to live in this section is now
+  historical; see `session.d/2026-08-19_vision-qc-silent-gate-fixed-pr-260.md`
+  if you need it. `npm test` (parallel, `scripts/runVerifySuite.js`) remains
+  the gate; **do NOT trust `npm run test:affected`** — confirmed hole in its
+  changed-file basename filter (`length >= 4`), so `models/Ad.js` → `"Ad"` →
+  excluded; editing it (or `routes/ads.js`, `"ads"`) alone can report "nothing
+  to run" and exit 0 while dependent scripts never run. Use plain `npm test`
+  (full suite) until this is fixed.
+- **Newest backend session (this one, 2026-08-20): PR #274, open, not
+  self-merged** — `fix/concurrency-and-derive-wait-backup`. Two owner-approved
+  changes: (a) `VEO_CONCURRENCY` 12→24 / `REMOTION_QUEUE_CONCURRENCY` 4→8 in
+  `config/defaults.env` (submit+poll-only and low-risk vs. a memory-bound
+  in-process render pool that needs a full-run memory-graph check before going
+  higher than 8); (b) the derive-master wait timeout
+  (`renderDeriveOnlyVideoAd` → new `handleDeriveMasterBackup`,
+  `routes/ads.js`) no longer stamps an ad `failed` after
+  `MAX_DERIVE_WAIT_ATTEMPTS` — it requeues AND actively reclaims through the
+  same atomic claim path stranded ads use (`requeueStrandedAds` →
+  `claimAdsForRun`), and fires one rate-limited Slack notice per backup
+  episode, keyed on the master. Full detail, revert-proof notes, and why this
+  had to ship as one PR (raising concurrency makes the timeout fire more
+  often) in
+  `session.d/2026-08-20_concurrency-raise-and-derive-wait-never-abandons-pr274.md`.
+  New harness `scripts/verifyDeriveWaitBackup.js`. `npm test` — **181/181**
+  passed (post-rebase onto `9fb14705`). `npm run lint` clean.
+- Open PRs at the time of this update: RPD **#210/#212** (carried forward from
+  the prior snapshot as "deliberately deferred — do not touch"; not
+  independently re-verified this session — confirm status before assuming
+  it still holds). Backend: **#274** above.
 - Offline verify: `npm test` (or `node scripts/runVerifySuite.js` directly)
-  — **174 scripts** as of this update (re-count before quoting, this number
-  drifts). `npm run lint` enables exactly one rule, `no-undef` — see
-  `CLAUDE.md` §5 for why that one rule matters more than it looks like it
-  should.
+  — **181 scripts** as of this update (re-count before quoting, this number
+  drifts — it was 174 two snapshots ago). `npm run lint` enables exactly one
+  rule, `no-undef` — see `CLAUDE.md` §5 for why that one rule matters more
+  than it looks like it should.
 - **Correction to a prior note below**: `verifyLogoSilhouette.js`,
   `verifyLogoColorPreservation.js`, `verifyStaticTextInk.js` failing in a
   fresh `git worktree` checkout (all three `require(path.join(__dirname,
