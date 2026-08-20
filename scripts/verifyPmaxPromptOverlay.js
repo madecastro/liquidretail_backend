@@ -8,7 +8,11 @@
  * switches that gate destination-aware prompt work:
  *
  *   PMAX_STATIC_PLATFORM_NOTES  (staticAdIntents)  — default ON
- *   PMAX_VIDEO_DIRECTIVES       (veoPromptBuilder) — default ON
+ *   PMAX_VIDEO_DIRECTIVES       (veoPromptBuilder) — default OFF as of the
+ *                               2026-08-20 owner revert (see V2c); was ON
+ *                               2026-08-18..2026-08-20 (the standardization
+ *                               below). The switch and both arms are
+ *                               unchanged — only the shipped default flipped.
  *
  * Inventory
  * ─────────
@@ -27,8 +31,11 @@
  *       prompt, and both differ from the destination-less prompt.
  *   V2  Switch OFF ⇒ BOTH Meta and PMax destination prompts collapse back to
  *       the destination-less prompt (Meta → frozen pre-#61, PMax → Phase A).
- *   V2b The switch honours BOTH env names and EITHER can kill, including the
- *       real defaults.env shape (new name true, legacy dashboard name false).
+ *   V2b The switch honours BOTH env names and EITHER can kill — general OR-
+ *       logic regression guard (new name true + legacy false, and vice
+ *       versa), independent of whatever config/defaults.env currently ships.
+ *   V2c config/defaults.env ships BOTH names as "false" (2026-08-20 owner
+ *       revert) — the real production default, not simulated.
  *   V3  Destination-less prompt is byte-identical to the IMMUTABLE
  *       `134db56~1` baseline (B14 technique; relative requires rewritten so
  *       the temp copy resolves), in BOTH arms; plus the live Meta destination
@@ -153,8 +160,18 @@ function loadVeoArm(flag) {
   // veoPromptBuilder requires platformFormats — drop both so a fresh
   // builder cannot hold a stale nested module either.
   delete require.cache[require.resolve(PF_PATH)];
-  if (flag === undefined) delete process.env.PMAX_VIDEO_DIRECTIVES;
-  else process.env.PMAX_VIDEO_DIRECTIVES = flag;
+  if (flag === undefined) {
+    delete process.env.PMAX_VIDEO_DIRECTIVES;
+    delete process.env.VIDEO_HOOK_FIRST_PROMPT;
+  } else {
+    // Set BOTH names. Either one reading "false" kills (fail-safe OR), so
+    // setting only the legacy name cannot force ON if a future dotenv load
+    // ever put config/defaults.env's new-default "false" on the other name
+    // (that file now ships both false — see V2c). This process never loads
+    // that file today, but the arm should not depend on that staying true.
+    process.env.PMAX_VIDEO_DIRECTIVES = flag;
+    process.env.VIDEO_HOOK_FIRST_PROMPT = flag;
+  }
   return require(VEO_PATH);
 }
 
@@ -482,11 +499,14 @@ const VEO_ARGS_PMAX_169 = {
   process.env.PMAX_VIDEO_DIRECTIVES = 'false';
   check('V2b LEGACY name alone kills (Render dashboard back-compat)', metaProfile(load()), 'gemini-omni');
 
-  // The exact production shape: dotenv gives the NEW name a value from
-  // config/defaults.env while the dashboard sets the LEGACY name to false.
+  // A shape that could still occur on a dashboard mid-migration: the NEW name
+  // carries a value while a dashboard override sets the LEGACY name to false.
   // A "new name wins" precedence rule would silently ignore the dashboard.
+  // (This is no longer the shipped config/defaults.env shape — see V2c for
+  // that — but the fail-safe OR must hold for ANY combination, not just the
+  // one currently committed.)
   process.env.VIDEO_HOOK_FIRST_PROMPT = 'true';
-  check('V2b legacy=false + new=true (defaults.env shape) STILL kills — fail-safe OR, not precedence',
+  check('V2b legacy=false + new=true STILL kills — fail-safe OR, not precedence',
     metaProfile(load()), 'gemini-omni');
 
   delete process.env.PMAX_VIDEO_DIRECTIVES;
@@ -500,6 +520,28 @@ const VEO_ARGS_PMAX_169 = {
   else process.env.VIDEO_HOOK_FIRST_PROMPT = priorHook;
   if (priorLegacy === undefined) delete process.env.PMAX_VIDEO_DIRECTIVES;
   else process.env.PMAX_VIDEO_DIRECTIVES = priorLegacy;
+}
+
+// V2c — config/defaults.env pins the SHIPPED default, not just the code
+// fallback. Same rationale as verifyPostPilotBatch.js C14 (REPEAT_PRIMARY_
+// REFERENCE): defaults.env is committed and dotenv-loaded at boot, so it is
+// the REAL production value absent a Render dashboard override — pinning
+// only the code default (`isHookFirstVideoPromptEnabled`'s fallback `true`,
+// still asserted by V2b "both names unset") would leave this file free to
+// drift back to "true" unnoticed. Owner revert 2026-08-20, verbatim: "I want
+// to go back to the prompt I was using before we standardized on the pmax
+// prompt ... use this same prompt for PMax for now also."
+{
+  const envText = fs.readFileSync(
+    path.join(__dirname, '..', 'config', 'defaults.env'), 'utf8');
+  truthy('V2c config/defaults.env sets VIDEO_HOOK_FIRST_PROMPT=false (real prod default, owner revert 2026-08-20)',
+    /^VIDEO_HOOK_FIRST_PROMPT=false\s*$/m.test(envText));
+  truthy('V2c config/defaults.env sets PMAX_VIDEO_DIRECTIVES=false (real prod default, owner revert 2026-08-20)',
+    /^PMAX_VIDEO_DIRECTIVES=false\s*$/m.test(envText));
+  falsy('V2c config/defaults.env does NOT still ship VIDEO_HOOK_FIRST_PROMPT=true',
+    /^VIDEO_HOOK_FIRST_PROMPT=true\s*$/m.test(envText));
+  falsy('V2c config/defaults.env does NOT still ship PMAX_VIDEO_DIRECTIVES=true',
+    /^PMAX_VIDEO_DIRECTIVES=true\s*$/m.test(envText));
 }
 
 // V3 — destination-less path byte-identical to the pre-#61 baseline
@@ -655,6 +697,7 @@ console.log('\nV4. hook-first video content pins (flag ON) — PMax and Meta');
 // Restore default env so a later require in the same process is clean.
 delete process.env.PMAX_STATIC_PLATFORM_NOTES;
 delete process.env.PMAX_VIDEO_DIRECTIVES;
+delete process.env.VIDEO_HOOK_FIRST_PROMPT;
 try {
   delete require.cache[require.resolve(INTENTS_PATH)];
   delete require.cache[require.resolve(PF_PATH)];

@@ -8,8 +8,18 @@
  * WHAT THIS PROTECTS. A mixed Meta+PMax run used to pay for THREE Omni
  * masters per product — meta_stories_9_16, pmax_video_9_16, pmax_video_16_9
  * — at a measured $0.90 each ($2.70). Two of those are the same 9:16 plate
- * at byte-identical delivery dims. Now ONE portrait plate is minted and the
- * PMax portrait family derives from it for free, so a mixed run pays $1.80.
+ * at byte-identical delivery dims. When conjunct 4 (the hook-first camera
+ * switch) is ON, ONE portrait plate is minted and the PMax portrait family
+ * derives from it for free, so a mixed run pays $1.80 instead.
+ *
+ * ⚠️ CONJUNCT 4 UPDATE, 2026-08-20 — owner reverted the 2026-08-18 hook-first
+ * standardization (CLAUDE.md §00): `config/defaults.env` now ships
+ * VIDEO_HOOK_FIRST_PROMPT=false / PMAX_VIDEO_DIRECTIVES=false, so conjunct 4
+ * fails closed on a fresh production boot and a mixed run is back to THREE
+ * billable masters / $2.70. That is this gate working as designed, not a
+ * regression to fix here — see F1/F6 below, which already pin the OFF arm.
+ * The $1.80 shared-plate path remains fully live and tested (C1) as an
+ * explicit opt-in: flip either switch name back to "true" to restore it.
  *
  * THE FOUR WAYS THIS CHANGE CAN COST MONEY OR BREAK DELIVERY, each pinned:
  *   1. UNDER-DELIVER — pmax_video_9_16 goes free on a PMax-ONLY run, where
@@ -661,6 +671,7 @@ if (failures.length) {
   process.exit(1);
 }
 console.log(`✅ verifySharedPortraitMaster: ${passed}/${total} checks passed`);
-console.log('   mixed run = 21 ads / 2 billable ($1.80, was $2.70)');
+console.log('   mixed run = 21 ads / 2 billable when hook-first is ON ($1.80); ' +
+  '3 billable when OFF ($2.70 — the config/defaults.env production default as of 2026-08-20)');
 console.log('   PMax-only = 9 ads / 2 billable (fail-closed, unchanged)');
 console.log('   Meta-only = 12 ads / 1 billable (unchanged)');
