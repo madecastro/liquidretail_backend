@@ -307,7 +307,14 @@ function extractExpectedTextFromSubmissionPrompt(prompt) {
 /**
  * When AD_VISION_QC_ENABLED, inspect the recovered plate once (vision LLM only).
  * MONEY: no editImage / generateImage. Never discards paid pixels.
- * Returns a persisted-verdict shape, or null when QC is disabled.
+ * Returns a persisted-verdict shape always — including a stamped
+ * {skipped:true, disabled:true} verdict when QC is disabled, so a recovered
+ * ad reads as "not inspected" the same way a live-shipped one does (see
+ * adVisionQcService.warnQcDisabledOnce's comment for the production
+ * incident this closes: gate-off used to mean visionQc stayed null, which
+ * this function's own caller already special-cased via `.disabled` in its
+ * qcFailed guard below — that check was simply unreachable dead code until
+ * this fix, because `null` short-circuited before it could ever run).
  *
  * PRE-SPEND IDEMPOTENCY: re-reads the ad and short-circuits BEFORE the
  * billable judgeRender when (a) a visionQc verdict already exists, or
@@ -322,7 +329,13 @@ async function maybeQcRecoveredPlate({ ad, brand, surface, dims, renderUrl }) {
     console.warn(`   ⚠️  imageRecovery: adVisionQc load failed: ${err.message}`);
     return null;
   }
-  if (!adVisionQc.isEnabled()) return null;
+  if (!adVisionQc.isEnabled()) {
+    adVisionQc.warnQcDisabledOnce('recovered ad');
+    return adVisionQc.buildPersistedVerdict({
+      passed: false, skipped: true, disabled: true,
+      reason: 'AD_VISION_QC_ENABLED=false', finalAttempt: null, attempts: []
+    });
+  }
 
   const adId = ad?._id ? String(ad._id) : null;
   const brandId = ad?.brandId || null;

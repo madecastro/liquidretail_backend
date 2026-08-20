@@ -1580,13 +1580,29 @@ function resolveTitlingEngine(brand, ad) {
 // than propagating.
 //
 // Returns a persisted-verdict object (buildPersistedVerdict shape) to merge
-// into Ad.visionQc, or null when QC is disabled/not applicable — mirroring
-// directImageRenderService's early-return-without-stamping so "never
-// inspected" reads the same way (an absent field) across both pipelines.
+// into Ad.visionQc — including when the flag is off. FIXED 2026-08-19: this
+// used to `return null` on `!isEnabled()`, on the stated theory that
+// mirroring directImageRenderService's (then-identical) early return made
+// "never inspected" read the same way (an absent field) across both
+// pipelines. In production that symmetry was the bug: a live 39-ad run
+// shipped with Ad.visionQc:null on every ad (static AND video) because
+// AD_VISION_QC_ENABLED was unset and no SystemConfig override existed —
+// and an absent field is EXACTLY what "inspected and passed" also looks
+// like everywhere downstream (summarizeVisionQc, GET /runs/:runId
+// shippedWithoutQc, this file's own gallery badge). Both early returns now
+// build the same disabled-verdict shape runVideoPostRenderQc's/
+// runPostRenderQc's own "Flag off" branch constructs, so "never inspected"
+// is a real stamped fact, not an absence indistinguishable from "clean".
 async function runVideoVisionQcForAd({ ad, deliveredUrl, brandName = null }) {
   try {
     const adVisionQc = require('./adVisionQcService');
-    if (!adVisionQc.isEnabled()) return null;
+    if (!adVisionQc.isEnabled()) {
+      adVisionQc.warnQcDisabledOnce('video ad');
+      return adVisionQc.buildPersistedVerdict({
+        passed: false, skipped: true, disabled: true,
+        reason: 'AD_VISION_QC_ENABLED=false', finalAttempt: null, attempts: []
+      });
+    }
 
     const videoFrameService = require('./videoFrameService');
     const { adStage, noteRenderIssue } = require('./adStage');
@@ -2009,6 +2025,12 @@ module.exports = {
   renderBrandScript,
   renderBrandScriptAndSave,
   buildMetaForAd,
+  // Exported for scripts/verifyAdVisionQcSurfacing.js — the gate-off early
+  // return is the exact thing that shipped 39/39 ads uninspected in
+  // production, and it's cheap enough (no image/video generation, just
+  // Mongo lookups + one vision call when the gate IS on) to drive directly
+  // with the require-layer model stubs the harness already uses elsewhere.
+  runVideoVisionQcForAd,
   // Re-export for harnesses that pin funnel-preset threading without
   // pulling the whole generation service.
   resolveFunnelPresetOverride: (ad) => {

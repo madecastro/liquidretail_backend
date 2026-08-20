@@ -3239,18 +3239,35 @@ router.get('/runs/:runId', async (req, res) => {
     // failure here must never take down the run poller — so both are
     // best-effort with an empty-array fallback.
     //
-    // shippedWithoutQcCount / qcdOnRetryCount — the run-level vision-QC
-    // rollup. Same gap this whole endpoint exists to close: a static ad that
-    // shipped WITHOUT inspection (flag on, QC failed to run — visionQc.skipped)
-    // used to be visible only per-ad on the generation-inspector; an operator
-    // watching the run poller had no way to know "N of this batch weren't
-    // even looked at" without opening every ad. Dot-path queries into
-    // Ad.visionQc (a Mixed field) are safe reads — Mixed only disables
-    // Mongoose-side sub-schema casting, the underlying BSON is a normal
-    // subdocument, same as the `renderError.*` dot-writes elsewhere in this
-    // file. Cheap: scoped by the already-indexed campaignRunIds filter
-    // first, same as queuedRemaining/stages above; best-effort like them too.
-    const [queuedRemaining, stages, failureSummary, shippedWithoutQcCount, qcdOnRetryCount] = await Promise.all([
+    // shippedWithoutQcCount / qcFailedCount / qcdOnRetryCount — the run-level
+    // vision-QC rollup. Same gap this whole endpoint exists to close: an ad
+    // that shipped WITHOUT inspection used to be visible only per-ad on the
+    // generation-inspector; an operator watching the run poller had no way
+    // to know "N of this batch weren't even looked at" without opening every
+    // ad. Dot-path queries into Ad.visionQc (a Mixed field) are safe reads —
+    // Mixed only disables Mongoose-side sub-schema casting, the underlying
+    // BSON is a normal subdocument, same as the `renderError.*` dot-writes
+    // elsewhere in this file. Cheap: scoped by the already-indexed
+    // campaignRunIds filter first, same as queuedRemaining/stages above;
+    // best-effort like them too.
+    //
+    // FIXED 2026-08-19 (production incident: a 39-ad run had visionQc:null
+    // on every ad, static AND video — AD_VISION_QC_ENABLED was unset and no
+    // SystemConfig override existed, so QC never ran). shippedWithoutQcCount
+    // used to query ONLY `'visionQc.skipped': true` — "QC attempted and
+    // explicitly skipped" — which is zero whenever the underlying render
+    // pipelines short-circuit on the gate being off and leave Ad.visionQc at
+    // its schema default `null` (services/directImageRenderService.js,
+    // brandScriptExecutor.js, imageRecoveryService.js — all three now stamp
+    // a disabled verdict instead, but that fix cannot retroactively backfill
+    // every ad already shipped this way). The `$or` below counts BOTH: an
+    // explicit skipped/disabled verdict AND a bare absent/null field — Mongo
+    // equality on `null` matches a missing field too, so `{visionQc: null}`
+    // alone already covers "field never written". This is the one place an
+    // operator can tell "not inspected" apart from "inspected and passed"
+    // in aggregate, so it must count every ad that was never looked at, not
+    // just the ones QC consciously declined.
+    const [queuedRemaining, stages, failureSummary, shippedWithoutQcCount, qcFailedCount, qcdOnRetryCount] = await Promise.all([
       Ad.countDocuments({
         campaignId: run.campaignId,
         status:     'queued'
@@ -3259,7 +3276,23 @@ router.get('/runs/:runId', async (req, res) => {
       (run.failed > 0
         ? runFeed.summariseFailures(run.runId).catch(() => [])
         : Promise.resolve([])),
-      Ad.countDocuments({ campaignRunIds: run.runId, 'visionQc.skipped': true }).catch(() => 0),
+      Ad.countDocuments({
+        campaignRunIds: run.runId,
+        $or: [{ 'visionQc.skipped': true }, { visionQc: null }]
+      }).catch(() => 0),
+      // Third state the owner asked for: INSPECTED and flagged — a real
+      // vision-model verdict ran, was not skipped/disabled, and came back
+      // failed (whether or not it was later retried; qcdOnRetry below only
+      // counts the ones that ultimately passed). Distinct from
+      // shippedWithoutQc (never looked at) and from a clean pass (silent,
+      // same "surface the exceptional case" precedent as everywhere else in
+      // this rollup).
+      Ad.countDocuments({
+        campaignRunIds: run.runId,
+        'visionQc.skipped': false,
+        'visionQc.disabled': false,
+        'visionQc.passed': false
+      }).catch(() => 0),
       Ad.countDocuments({ campaignRunIds: run.runId, 'visionQc.finalAttempt': { $gt: 1 } }).catch(() => 0)
     ]);
     res.json({
@@ -3292,12 +3325,20 @@ router.get('/runs/:runId', async (req, res) => {
       // not re-derived" principle as stages/failureSummary above, but there
       // is no Slack equivalent to reuse here: Slack gets this per-ad
       // (adVisionQcService.alertQcSkipped/alertQcFailure fire individually),
-      // never aggregated across a run. `shippedWithoutQc` is the sharper of
-      // the two — flag on, inspection failed to run, ad shipped anyway
-      // (visionQc.skipped) — a real defect, not routine. `qcdOnRetry` is
-      // informational: passed, but only after the one allowed regeneration.
+      // never aggregated across a run. The three counts are the three states
+      // an operator needs to tell apart — "was this ad even looked at" is a
+      // different question from "did it pass":
+      //   shippedWithoutQc — NOT INSPECTED. Covers both an explicit skipped/
+      //     disabled verdict AND a bare absent visionQc field (see the query
+      //     comment above for why the latter matters — it's the common case
+      //     whenever the flag is off).
+      //   qcFailed — INSPECTED, FLAGGED. A real verdict ran and failed.
+      //   qcdOnRetry — informational: passed, but only after the one
+      //     allowed regeneration (a subset of "inspected and passed", not
+      //     its own top-level state).
       visionQcRollup: {
         shippedWithoutQc: shippedWithoutQcCount || 0,
+        qcFailed:         qcFailedCount || 0,
         qcdOnRetry:       qcdOnRetryCount || 0
       },
       // Structured complement to failureSummary's text-parsed grouping, added

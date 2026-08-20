@@ -38,18 +38,59 @@
  * No DB, no network, no API key. Safe in CI.
  *   node scripts/verifyAdVisionQcSurfacing.js
  *
+ * EXTENDED 2026-08-19 (production incident: run run_1787174963435_ff67021e,
+ * 39/39 ads delivered, visionQc:null on all 39 — static AND video). Root
+ * cause: AD_VISION_QC_ENABLED was unset and no SystemConfig override existed
+ * (a real, working gate), but every live caller of adVisionQc.isEnabled()
+ * (directImageRenderService.renderDirectImage, brandScriptExecutor
+ * .runVideoVisionQcForAd, imageRecoveryService.maybeQcRecoveredPlate) used
+ * to `return null`/`return firstOutput` on the gate being off — so
+ * Ad.visionQc stayed at its schema default `null`, reading identically to
+ * "inspected and passed" everywhere, AND the run-level shippedWithoutQc
+ * rollup (which only ever queried `visionQc.skipped:true`) counted these
+ * ads as zero. Two bugs, one root cause; sections D and the rewritten C
+ * pin the fix for both:
+ *
+ *   D. The three gate-off early returns now stamp the SAME disabled-verdict
+ *      shape runPostRenderQc's/runVideoPostRenderQc's own "Flag off" branch
+ *      builds (buildPersistedVerdict with skipped:true, disabled:true,
+ *      reason:'AD_VISION_QC_ENABLED=false') instead of a bare null, and warn
+ *      once via the new shared adVisionQc.warnQcDisabledOnce.
+ *   C (rewritten). GET /runs/:runId's shippedWithoutQc count now also
+ *      counts a bare absent/null visionQc field, not just an explicit
+ *      skipped:true verdict — the ONLY way historical ads (shipped before
+ *      section D's fix landed, which cannot be retroactively backfilled)
+ *      are ever counted as "not inspected" at all. A third rollup count,
+ *      qcFailed, was added for the "inspected and flagged" state the owner
+ *      asked to be able to see in aggregate, not just per-card.
+ *
+ * No DB, no network, no API key. Safe in CI.
+ *   node scripts/verifyAdVisionQcSurfacing.js
+ *
  * Revert-prove (each mutation below must fail this harness):
  *   1. Have summarizeVisionQc return `passed:true` for a skipped verdict
  *      → A3 fails (an uninspected ship must never read as "fine").
  *   2. Remove the `{ categories: true }` upgrade in projectAd's `full` block
  *      → B3 fails (detail view would silently lose the one gap-closing field
  *      the owner explicitly asked to be exposed).
- *   3. Delete `visionQcRollup` (or one of its two counts) from the
+ *   3. Delete `visionQcRollup` (or any of its three counts) from the
  *      GET /runs/:runId response object → C1 fails.
- *   4. Stub out the two new `Ad.countDocuments({'visionQc...` calls without
+ *   4. Stub out the three `Ad.countDocuments({'visionQc...` calls without
  *      removing the response field → C2 fails (import/response present,
  *      never actually queried — the exact "structural, not just present"
  *      trap verifyRunStatusTruthfulness.js's own D1 comment warns about).
+ *   5. Revert shippedWithoutQc's query back to bare `'visionQc.skipped':
+ *      true` (drop the `$or` / null branch) → C5 fails — the exact
+ *      production regression this whole extension exists to catch.
+ *   6. Revert any of the three `if (!adVisionQc.isEnabled())` early returns
+ *      in brandScriptExecutor.js / imageRecoveryService.js back to a bare
+ *      `return null` → D2/D3 fails (drives the REAL exported function with
+ *      adVisionQcService stubbed at the require layer, same convention as
+ *      verifyGenerateProductTenancy.js).
+ *   7. Remove the disabled-verdict stamp from directImageRenderService.js's
+ *      early return → D4 fails (structural — that function's "attempt 1"
+ *      generation makes it too expensive/billable to drive end-to-end here,
+ *      same posture as this file's own C-section for GET /runs/:runId).
  */
 
 const assert = require('assert');
@@ -296,7 +337,7 @@ function sliceFrom(marker) {
   return adsSrc.slice(start, next ? next.index : adsSrc.length);
 }
 
-check('C1 GET /runs/:runId actually returns visionQcRollup.{shippedWithoutQc,qcdOnRetry} in its res.json object', () => {
+check('C1 GET /runs/:runId actually returns visionQcRollup.{shippedWithoutQc,qcFailed,qcdOnRetry} in its res.json object', () => {
   const handler = sliceFrom("router.get('/runs/:runId'");
   assert.ok(handler, 'could not locate the GET /runs/:runId handler to scope this check');
   const rjStart = handler.indexOf('res.json({');
@@ -306,6 +347,7 @@ check('C1 GET /runs/:runId actually returns visionQcRollup.{shippedWithoutQc,qcd
   const responseObj = handler.slice(rjStart, rjEnd);
   assert.match(responseObj, /visionQcRollup\s*:/, 'GET /runs/:runId response object is missing "visionQcRollup"');
   assert.match(responseObj, /shippedWithoutQc/, 'visionQcRollup must carry shippedWithoutQc');
+  assert.match(responseObj, /qcFailed/, 'visionQcRollup must carry qcFailed — the "inspected and flagged" state');
   assert.match(responseObj, /qcdOnRetry/, 'visionQcRollup must carry qcdOnRetry');
 });
 
@@ -314,6 +356,8 @@ check('C2 the rollup is actually QUERIED (Ad.countDocuments against visionQc.* f
   assert.ok(handler);
   assert.match(handler, /Ad\.countDocuments\(\{[^}]*'visionQc\.skipped':\s*true/,
     'must query the shipped-without-QC count against visionQc.skipped, not fabricate the number');
+  assert.match(handler, /Ad\.countDocuments\(\{[^}]*'visionQc\.disabled':\s*false[^}]*'visionQc\.passed':\s*false/,
+    'must query the qcFailed count against an actually-inspected, failed verdict, not fabricate the number');
   assert.match(handler, /Ad\.countDocuments\(\{[^}]*'visionQc\.finalAttempt':\s*\{\s*\$gt:\s*1/,
     'must query the QC\'d-on-retry count against visionQc.finalAttempt > 1, not fabricate the number');
 });
@@ -332,6 +376,168 @@ check('C3 the rollup queries are scoped to THIS run (campaignRunIds), not the wh
 check('C4 routes/ads.js requires summarizeVisionQc from adVisionQcService (single shared formatter, not a re-derivation)', () => {
   assert.match(adsSrc, /require\(['"]\.\.\/services\/adVisionQcService['"]\)/,
     'projectAd/rollup must reuse adVisionQcService.summarizeVisionQc, not hand-roll a second "is this ad inspected" check');
+});
+
+check('C5 shippedWithoutQc ALSO counts a bare absent/null visionQc field, not just skipped:true — the production regression', () => {
+  const handler = sliceFrom("router.get('/runs/:runId'");
+  assert.ok(handler);
+  const skippedQueryStart = handler.search(/Ad\.countDocuments\(\{[^]*?'visionQc\.skipped':\s*true/);
+  assert.ok(skippedQueryStart !== -1, 'could not locate the shippedWithoutQc query');
+  // Scope to the ONE countDocuments call that contains 'visionQc.skipped'
+  // (bounded at the next `.catch(() => 0)`, mirroring how every rollup
+  // query in this handler terminates) rather than the whole handler, so a
+  // null-check anywhere else in the file cannot make this pass by accident.
+  const callEnd = handler.indexOf('.catch(() => 0)', skippedQueryStart);
+  assert.ok(callEnd !== -1, 'shippedWithoutQc query never terminated with the expected .catch(() => 0)');
+  const callSrc = handler.slice(skippedQueryStart, callEnd);
+  assert.match(callSrc, /\$or\s*:/, 'shippedWithoutQc must be an $or of two conditions, not a single skipped:true filter');
+  assert.match(callSrc, /visionQc\s*:\s*null/,
+    'shippedWithoutQc must also match {visionQc: null} — Mongo equality on null matches a MISSING field too, ' +
+    'which is what every gate-off-shipped ad (and every ad from before this fix) actually has');
+});
+
+check('C6 qcFailed only counts a TRULY inspected, failed verdict (not skipped, not disabled)', () => {
+  const handler = sliceFrom("router.get('/runs/:runId'");
+  assert.ok(handler);
+  // Anchor on the UNIQUE 'visionQc.disabled' text (only the qcFailed query
+  // mentions it) and walk backward to ITS OWN enclosing Ad.countDocuments({,
+  // not the nearest one textually before it — a naive forward, non-greedy
+  // "Ad.countDocuments({ ... 'visionQc.disabled':false" scan happily spans
+  // across the PRECEDING shippedWithoutQc call instead of staying inside
+  // the qcFailed one, silently checking the wrong query.
+  const disabledIdx = handler.indexOf(`'visionQc.disabled': false`);
+  assert.ok(disabledIdx !== -1, 'could not locate the qcFailed query');
+  const idx = handler.lastIndexOf('Ad.countDocuments({', disabledIdx);
+  assert.ok(idx !== -1, 'could not find the Ad.countDocuments({ that owns visionQc.disabled');
+  const callEnd = handler.indexOf('.catch(() => 0)', idx);
+  const callSrc = handler.slice(idx, callEnd);
+  assert.match(callSrc, /'visionQc\.skipped':\s*false/, 'qcFailed must exclude skipped verdicts');
+  assert.match(callSrc, /'visionQc\.disabled':\s*false/, 'qcFailed must exclude gate-off (disabled) verdicts');
+  assert.match(callSrc, /'visionQc\.passed':\s*false/, 'qcFailed must require an actual failed verdict, not a pass');
+  assert.match(callSrc, /campaignRunIds:\s*run\.runId/, 'qcFailed must be scoped to this run');
+});
+
+// ── D. Gate-off early returns stamp a disabled verdict, never a bare null ─
+// The actual production bug: three call sites short-circuit on
+// adVisionQc.isEnabled() === false BEFORE ever reaching runPostRenderQc's /
+// runVideoPostRenderQc's own "Flag off" branch (which builds the nice
+// {skipped:true, disabled:true, reason:...} shape and is consequently DEAD
+// CODE in production while these early returns exist). D2/D3 drive the REAL
+// exported functions with adVisionQcService stubbed at the require layer —
+// same convention as verifyGenerateProductTenancy.js's adReadinessService
+// stub — so `isEnabled` is deterministically false regardless of ambient
+// env, and assert the actual returned object, not a source-text guess.
+// D4 is a structural pin: directImageRenderService.renderDirectImage's
+// "attempt 1" generation makes it too expensive (and billable) to drive
+// end-to-end here, same posture as this file's own C-section for GET
+// /runs/:runId.
+
+function withStubbedAdVisionQc(modulePath, extra = {}) {
+  const qcPath = require.resolve(path.join(__dirname, '..', 'services', 'adVisionQcService.js'));
+  const original = require.cache[qcPath];
+  const warnCalls = [];
+  require.cache[qcPath] = {
+    id: qcPath, filename: qcPath, loaded: true,
+    exports: {
+      isEnabled: () => false,
+      warnQcDisabledOnce: (label) => { warnCalls.push(label); },
+      buildPersistedVerdict: (args) => qc.buildPersistedVerdict(args),
+      ...extra
+    }
+  };
+  // The target module may already be require-cached from earlier in this
+  // process (e.g. routes/ads.js pulling it in transitively) with the REAL
+  // adVisionQcService baked into its closure — evict it too so it re-requires
+  // against the stub just installed above.
+  const targetPath = require.resolve(modulePath);
+  const originalTarget = require.cache[targetPath];
+  delete require.cache[targetPath];
+  const mod = require(modulePath);
+  return {
+    mod,
+    warnCalls,
+    restore() {
+      if (original) require.cache[qcPath] = original; else delete require.cache[qcPath];
+      if (originalTarget) require.cache[targetPath] = originalTarget; else delete require.cache[targetPath];
+      delete require.cache[targetPath]; // force a clean re-require next time, real deps included
+    }
+  };
+}
+
+await (async () => {
+  const { mod: bse, warnCalls, restore } = withStubbedAdVisionQc(path.join('..', 'services', 'brandScriptExecutor.js'));
+  try {
+    const result = await bse.runVideoVisionQcForAd({
+      ad: { _id: '507f1f77bcf86cd799439011', veoReferenceImages: [], campaignRunIds: [] },
+      deliveredUrl: 'https://example.com/delivered.mp4'
+    });
+    check('D2 runVideoVisionQcForAd stamps a disabled verdict (not null) when the gate is off', () => {
+      assert.ok(result, 'gate-off must return a stamped verdict object, not null — an absent Ad.visionQc ' +
+        'field reads identically to "inspected and passed" everywhere downstream');
+      assert.strictEqual(result.skipped, true);
+      assert.strictEqual(result.disabled, true);
+      assert.strictEqual(result.passed, false);
+      assert.strictEqual(result.reason, 'AD_VISION_QC_ENABLED=false');
+    });
+    check('D2b runVideoVisionQcForAd warns once via the shared gate-off warning', () => {
+      assert.deepStrictEqual(warnCalls, ['video ad']);
+    });
+  } finally {
+    restore();
+  }
+})();
+
+await (async () => {
+  const { mod: irs, warnCalls, restore } = withStubbedAdVisionQc(path.join('..', 'services', 'imageRecoveryService.js'));
+  try {
+    const result = await irs.maybeQcRecoveredPlate({
+      ad: { _id: '507f1f77bcf86cd799439011', campaignRunIds: [] },
+      brand: {}, surface: {}, dims: { width: 1080, height: 1080 },
+      renderUrl: 'https://example.com/recovered.png'
+    });
+    check('D3 maybeQcRecoveredPlate stamps a disabled verdict (not null) when the gate is off', () => {
+      assert.ok(result, 'gate-off must return a stamped verdict object, not null');
+      assert.strictEqual(result.skipped, true);
+      assert.strictEqual(result.disabled, true);
+      assert.strictEqual(result.passed, false);
+      assert.strictEqual(result.reason, 'AD_VISION_QC_ENABLED=false');
+    });
+    check('D3b maybeQcRecoveredPlate warns once via the shared gate-off warning', () => {
+      assert.deepStrictEqual(warnCalls, ['recovered ad']);
+    });
+  } finally {
+    restore();
+  }
+})();
+
+check('D4 directImageRenderService\'s gate-off early return stamps a disabled verdict, not a bare `return firstOutput`', () => {
+  const src = fs.readFileSync(path.join(__dirname, '..', 'services', 'directImageRenderService.js'), 'utf8');
+  const idx = src.indexOf('if (!adVisionQc.isEnabled()) {');
+  assert.ok(idx !== -1, 'could not locate the gate-off early return in directImageRenderService.js');
+  const closeIdx = src.indexOf('\n  }\n', idx); // this branch's own closing brace, one indent level in
+  const branch = src.slice(idx, closeIdx !== -1 ? closeIdx : idx + 800);
+  assert.doesNotMatch(branch, /return firstOutput;\s*\}/,
+    'must not return firstOutput bare — Ad.visionQc would stay null, indistinguishable from "passed"');
+  assert.match(branch, /buildPersistedVerdict\(/, 'must stamp the same disabled-verdict shape runPostRenderQc\'s own "Flag off" branch builds');
+  assert.match(branch, /disabled:\s*true/, 'the stamped verdict must mark disabled:true (gate off, not an infra skip)');
+  assert.match(branch, /warnQcDisabledOnce\(/, 'must warn — a flag left off for weeks must be loud in logs, not silent');
+});
+
+check('D5 the shared warnQcDisabledOnce gate is genuinely one-shot-per-interval, not per-call', () => {
+  const warnings = [];
+  const origWarn = console.warn;
+  console.warn = (...args) => warnings.push(args.join(' '));
+  try {
+    qc._resetQcDisabledWarnForTests();
+    qc.warnQcDisabledOnce('static ad');
+    qc.warnQcDisabledOnce('video ad');
+    qc.warnQcDisabledOnce('recovered ad');
+    assert.strictEqual(warnings.length, 1, 'three calls within the rewarn interval must produce exactly one log line');
+    assert.match(warnings[0], /AD_VISION_QC_ENABLED is OFF/);
+  } finally {
+    console.warn = origWarn;
+    qc._resetQcDisabledWarnForTests();
+  }
 });
 
 // ── report ─────────────────────────────────────────────────────────────
