@@ -29,28 +29,35 @@
  * deliberately kept OUTSIDE OMNI_DIRECTIVES / GROK_DIRECTIVES /
  * HOOK_FIRST_DIRECTIVES so it can never touch the byte-identity pin those
  * carry (scripts/verifyPostPilotBatch.js B1-B17, CLAUDE.md §00 PR #61
- * rollback). Gated by VIDEO_PROMPT_UI_CHROME_GUARD, default OFF — this fix
- * was deliberately written without a live Omni submit (owner directive,
- * same incident: budget is tight and a submit is ~$0.90 and non-refundable),
- * so its effectiveness is UNVERIFIED. Flip the flag only after a live A/B
- * check confirms it actually suppresses the hallucination.
+ * rollback). Gated by VIDEO_PROMPT_UI_CHROME_GUARD.
+ *
+ * SHIPPED OFF, THEN VERIFIED LIVE THE SAME DAY (2026-08-19): the flag went
+ * out default OFF because confirming it needs a live, non-refundable ~$0.90
+ * Omni submit. That submit was then run — same product/brand/seed stack as
+ * the incident (run_1787174963435_ff67021e), flag forced true, predictionId
+ * `3e579bc492bd4da785d77316c8011c3c`, Atlas-settled $0.90. Frames pulled
+ * from the raw pre-titling video at 0.1/0.3/0.5/0.8/1.2/2.5s — including
+ * t=0.1s and t=0.5s, exactly where the original chrome was visible — showed
+ * NONE of it. The flag now defaults ON (config/defaults.env). This harness's
+ * assertions below did not need to change: they drive the env var directly
+ * and never depended on the committed default.
  *
  * This harness proves, entirely offline:
- *   A. Flag OFF (default, and on any falsy/unset value) → buildVeoPrompt output
- *      is IDENTICAL with the guard code present vs. absent (byte-for-byte),
+ *   A. Flag OFF (explicit 'false' or unset) → buildVeoPrompt output is
+ *      IDENTICAL with the guard code present vs. absent (byte-for-byte),
  *      across every profile (gemini-omni, grok, hook_first, lifestyle,
- *      pmax split) — i.e. shipping this change with the flag off changes
- *      NOTHING about today's prompts.
- *   B. Flag ON → the new line IS present, in every profile, and names the
- *      concrete failure mode (nav/menu/icon/screenshot) rather than only
- *      repeating noText's generic "no text" ban.
+ *      pmax split) — i.e. flipping the flag back off (rollback) restores
+ *      today's prompts with no other code change needed.
+ *   B. Flag ON (now the default) → the new line IS present, in every
+ *      profile, and names the concrete failure mode (nav/menu/icon/
+ *      screenshot) rather than only repeating noText's generic "no text" ban.
  *   C. OMNI_DIRECTIVES / GROK_DIRECTIVES / HOOK_FIRST_DIRECTIVES objects are
  *      byte-identical to their frozen values regardless of the flag — the
  *      new line is never folded into them.
  *   D. isVideoUiChromeGuardEnabled() is a strict `=== 'true'` gate (matches
  *      the isVideoLifestylePromptEnabled precedent) — 'TRUE', '1', 'yes',
  *      whitespace-padded, etc. all stay OFF, so a stray truthy env string
- *      cannot silently turn this on.
+ *      cannot silently turn this on/off unexpectedly.
  *
  * Revert-proof: comment out the `lines.push(UI_CHROME_GUARD_LINE)` call (or
  * the whole guard block) in services/veoPromptBuilder.js and re-run — group B
@@ -198,9 +205,9 @@ if (failures.length) {
   process.exit(1);
 }
 console.log(`\n✅ verifyVideoUiChromeGuard: ${total}/${total} checks passed`);
-console.log('   Flag OFF (default) → byte-identical prompts, every profile.');
-console.log('   Flag ON            → one extra, concrete UI-chrome prohibition line.');
+console.log('   Flag ON (default as of 2026-08-19) → one extra, concrete UI-chrome prohibition line.');
+console.log('   Flag OFF (explicit false/unset)    → byte-identical prompts, every profile — instant rollback.');
 console.log('   OMNI_DIRECTIVES / GROK_DIRECTIVES / HOOK_FIRST_DIRECTIVES untouched either way.');
-console.log('   UNVERIFIED LIVE: this guard has not been proven against a real Omni submit —');
-console.log('   do not flip VIDEO_PROMPT_UI_CHROME_GUARD to true without an owner-approved A/B.');
+console.log('   VERIFIED LIVE 2026-08-19: real Omni submit (predictionId 3e579bc492bd4da785d77316c8011c3c,');
+console.log('   $0.90 settled) with the flag on showed no chrome at 0.1/0.3/0.5/0.8/1.2/2.5s.');
 assert.ok(true);

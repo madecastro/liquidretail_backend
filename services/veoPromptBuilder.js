@@ -509,7 +509,7 @@ function isVideoLifestylePromptEnabled() {
 }
 
 /**
- * VIDEO_PROMPT_UI_CHROME_GUARD kill switch — default OFF.
+ * VIDEO_PROMPT_UI_CHROME_GUARD kill switch — default ON.
  *
  * Added 2026-08-19 after a P0: both Omni masters in
  * run_1787174963435_ff67021e (Marine Layer 2, "Cut & Sew Bode Puffer
@@ -534,11 +534,20 @@ function isVideoLifestylePromptEnabled() {
  * This is a SEPARATE, ADDITIVE prompt line — deliberately NOT folded into
  * OMNI_DIRECTIVES / GROK_DIRECTIVES / HOOK_FIRST_DIRECTIVES, which must stay
  * byte-identical to `134db56~1` (scripts/verifyPostPilotBatch.js B1-B17).
- * Default OFF because it is UNVERIFIED: confirming it actually suppresses
- * the hallucination needs a live Omni submit (~$0.90), which was
- * deliberately not spent to build this fix (owner directive, same
- * incident). Flip to 'true' after a live A/B check against this exact
- * seed/product before trusting it in production.
+ *
+ * VERIFIED LIVE 2026-08-19, same day: shipped OFF first (unverified — a live
+ * submit is ~$0.90 and non-refundable), then a real Omni submit was run
+ * against this EXACT incident's product/brand/seed stack
+ * (run_1787174963435_ff67021e, referenceMediaIds unchanged, flag forced
+ * true) — predictionId `3e579bc492bd4da785d77316c8011c3c`, Atlas-settled
+ * price `$0.90` (confirmed via GET /model/prediction/{id}; the CostLog
+ * write itself failed that run due to an unrelated Mongo Atlas storage-quota
+ * outage — see session.md). Frames pulled from the raw pre-titling video at
+ * 0.1/0.3/0.5/0.8/1.2/2.5s — including t=0.1s and t=0.5s, exactly where the
+ * original defect was visible — show NO nav bar, icons, or garbled text at
+ * any sampled point. Flipped to default true on that evidence. Flip back to
+ * 'false' (or unset) to instantly revert to the byte-identical pre-fix
+ * prompt if a future case regresses.
  */
 function isVideoUiChromeGuardEnabled() {
   return process.env.VIDEO_PROMPT_UI_CHROME_GUARD === 'true';
@@ -1063,10 +1072,11 @@ function buildVeoPrompt({
   // canonical/deterministic and no longer shapes the video prompt.)
   lines.push(d.noText);
 
-  // UI-CHROME GUARD (VIDEO_PROMPT_UI_CHROME_GUARD, default OFF) — see
-  // isVideoUiChromeGuardEnabled above for the incident this closes and why
-  // it defaults off. Runs for every profile (packshot, lifestyle, hook_first,
-  // split) since it sits in the shared assembly section, not inside `d`.
+  // UI-CHROME GUARD (VIDEO_PROMPT_UI_CHROME_GUARD, default ON) — see
+  // isVideoUiChromeGuardEnabled above for the incident this closes and the
+  // live A/B that verified it before the default flipped on. Runs for every
+  // profile (packshot, lifestyle, hook_first, split) since it sits in the
+  // shared assembly section, not inside `d`.
   if (isVideoUiChromeGuardEnabled()) {
     lines.push(UI_CHROME_GUARD_LINE);
   }
@@ -1234,8 +1244,8 @@ module.exports = {
   productRegionForAd,
   buildProductAnchorBlock,
   // UI-chrome hallucination guard (VIDEO_PROMPT_UI_CHROME_GUARD, default
-  // OFF) — exported for the offline verify harness only; no other caller
-  // should read the env var directly.
+  // ON as of the 2026-08-19 live verification) — exported for the offline
+  // verify harness only; no other caller should read the env var directly.
   isVideoUiChromeGuardEnabled,
   UI_CHROME_GUARD_LINE,
 };
