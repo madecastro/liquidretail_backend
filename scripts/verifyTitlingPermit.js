@@ -111,11 +111,17 @@ console.log('\nVEO SUBMIT/TITLING SPLIT\n');
   // is the measured 926s / 83%-idle titling tail. The permit is now wide (48,
   // owner-directed) and bounds only cheap prep; REMOTION_QUEUE_CONCURRENCY is
   // the real memory guard, so that is what these now protect.
-  check('B2 [SAFETY] the MEMORY-BOUND render pool stays small — 4 is the only '
-      + 'concurrency this process has actually survived (the old combined VEO_CONCURRENCY)',
+  // 4 -> 8 on 2026-08-20, owner-approved, alongside VEO_CONCURRENCY 12->24 —
+  // one doubling, not the 16 originally floated, precisely because 4 "is
+  // the only concurrency this process has actually survived" and is not an
+  // RSS measurement (see config/defaults.env / services/concurrency.js).
+  // The pin stays a hard number, not a >= — this knob is deliberately the
+  // one that must never drift silently.
+  check('B2 [SAFETY] the MEMORY-BOUND render pool stays small — 8 is one '
+      + 'doubling past 4, the only concurrency this process has actually survived (the old combined VEO_CONCURRENCY)',
     SPEC.REMOTION_QUEUE_CONCURRENCY
-    && SPEC.REMOTION_QUEUE_CONCURRENCY.default === 4
-    && CONC.REMOTION_QUEUE_CONCURRENCY === 4);
+    && SPEC.REMOTION_QUEUE_CONCURRENCY.default === 8
+    && CONC.REMOTION_QUEUE_CONCURRENCY === 8);
   check('B2b [SAFETY] the render pool can never be configured above the documented ceiling',
     SPEC.REMOTION_QUEUE_CONCURRENCY && SPEC.REMOTION_QUEUE_CONCURRENCY.max <= 16);
   check('B3 the memory-bound pool is the NARROWEST video knob — the cheap permit and '
@@ -254,7 +260,10 @@ console.log('\nVEO SUBMIT/TITLING SPLIT\n');
   // 2. Swap withPermit for acquire()/release() -> C3 fails (and a throwing titling
   //    render would then leak a permit; A3 is the behavioral twin of that).
   // 3. Construct the Semaphore inside renderOne -> C2 fails.
-  // 4. Set VEO_TITLING_CONCURRENCY default above 4 -> B2 fails.
+  // 4. Change REMOTION_QUEUE_CONCURRENCY's default away from 8 -> B2 fails
+  //    (pre-existing typo fixed 2026-08-20: this used to name
+  //    VEO_TITLING_CONCURRENCY, the knob B2 stopped pinning when it was
+  //    re-pointed to the real memory guard — see the B2 comment above).
   // 5. Release outside the finally in semaphore.js -> A3/A4 fail.
   // Each verified by hand before shipping this harness.
 

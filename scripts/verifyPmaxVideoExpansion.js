@@ -499,10 +499,18 @@ check('F6c the dependent lookup fails CLOSED (keeps the asset when it cannot pro
 // field; renderAttempts stays 0 for an ad that only ever waited.
 //
 // REVERT-PROOF RECIPE (each must fail this section):
-//   8. Change the polite-requeue $inc back to renderAttempts       → G2
-//   9. Change the wait-exhausted terminal $inc back to renderAttempts → G3
+//   8. Change handleDeriveMasterBackup's requeue $inc back to renderAttempts → G2
+//   9. Re-introduce a wait-exhausted terminal branch (status:'failed') that
+//      also $incs deriveWaitAttempts, inside OR outside that function → G2b
 //   10. Repoint the `attempts` bound-check read back to renderAttempts → G4
 //   11. Drop the deriveWaitAttempts field declaration from models/Ad.js → G1
+//
+// 2026-08-20: the wait-exhausted terminal branch that used to live inside
+// renderDeriveOnlyVideoAd is GONE (owner: "hitting the timeout shouldn't
+// abandon"). Its ONE remaining $inc deriveWaitAttempts site now lives in the
+// extracted handleDeriveMasterBackup (see scripts/verifyDeriveWaitBackup.js
+// for the behavioural proof that it never abandons); renderDeriveOnlyVideoAd
+// itself no longer touches deriveWaitAttempts directly at all — it delegates.
 if (deriveBody) {
   // Behavioural, not source-text: require the REAL Mongoose model and read
   // its compiled schema paths. A commented-out declaration still matches a
@@ -523,9 +531,31 @@ if (deriveBody) {
   const waitIncs = (deriveCodeG.match(/\$inc:\s*\{\s*deriveWaitAttempts:\s*1\s*\}/g) || []).length;
   const renderIncs = (deriveCodeG.match(/\$inc:\s*\{\s*renderAttempts:\s*1\s*\}/g) || []).length;
 
-  check('G2/G3 the wait loop increments deriveWaitAttempts exactly twice (requeue + exhausted-terminal)',
-    waitIncs === 2,
-    `found ${waitIncs} — the polite requeue and the MAX_DERIVE_WAIT_ATTEMPTS terminal branch must both use deriveWaitAttempts`);
+  check('G2 renderDeriveOnlyVideoAd itself no longer increments deriveWaitAttempts (delegates to handleDeriveMasterBackup)',
+    waitIncs === 0,
+    `found ${waitIncs} — the backup branch should call out, not $inc deriveWaitAttempts inline`);
+
+  const backupBody = functionBody(adsSrc, 'handleDeriveMasterBackup');
+  check('G2b handleDeriveMasterBackup exists and is parseable', !!backupBody);
+  if (backupBody) {
+    const backupCode = stripComments(backupBody);
+    const backupWaitIncs = (backupCode.match(/\$inc:\s*\{\s*deriveWaitAttempts:\s*1\s*\}/g) || []).length;
+    check('G2c handleDeriveMasterBackup increments deriveWaitAttempts exactly once (never renderAttempts)',
+      backupWaitIncs === 1,
+      `found ${backupWaitIncs} — exactly one requeue-and-reclaim cycle, no separate exhausted-terminal $inc left`);
+    check('G2d [MONEY] handleDeriveMasterBackup never stamps the ad failed — it must not abandon',
+      !/status:\s*'failed'/.test(backupCode),
+      'a status:\'failed\' write here would reintroduce the exact abandonment this function exists to remove — see scripts/verifyDeriveWaitBackup.js for the full behavioural proof');
+    // The default-parameter value (`requeue = requeueStrandedAds`) lives in
+    // the PARAMETER LIST, which functionBody() deliberately excludes (E0b
+    // guards against the extractor returning the param list instead of the
+    // body) — so this reads the declaration line straight from adsSrc.
+    const backupDeclIdx = adsSrc.indexOf('async function handleDeriveMasterBackup(');
+    const backupDecl = backupDeclIdx === -1 ? '' : adsSrc.slice(backupDeclIdx, backupDeclIdx + 400);
+    check('G2e handleDeriveMasterBackup routes recovery through requeueStrandedAds, not a new claim',
+      /requeue\s*=\s*requeueStrandedAds/.test(backupDecl) && /await\s+requeue\s*\(/.test(backupCode),
+      'CLAUDE.md §2 — do not inline a second claim path');
+  }
 
   check('G3b renderAttempts is untouched by the wait loop — only the honest-failure (no master) and success branches still use it',
     renderIncs === 2,
