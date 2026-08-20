@@ -35,9 +35,9 @@ function activeProvider() {
 // Burns prompt fully directs motion). Only the Atlas provider exposes
 // this hook; on Vertex the caller should pass null and accept
 // sequential execution.
-async function prepareStoryboard({ ad, operatorPrompt = null, modelOverride = null }) {
+async function prepareStoryboard({ ad, operatorPrompt = null, modelOverride = null, campaignRunId = null }) {
   if (activeProvider() !== 'atlas') return { storyboard: null };
-  return atlasVideoService.prepareStoryboard({ ad, operatorPrompt, modelOverride });
+  return atlasVideoService.prepareStoryboard({ ad, operatorPrompt, modelOverride, campaignRunId });
 }
 
 // storyboard (optional) — when supplied by the orchestrator (parallel

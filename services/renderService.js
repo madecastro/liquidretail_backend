@@ -292,7 +292,7 @@ async function renderCreative(req) {
     setImmediate(() => {
       const videoPoster = require('./aiVideoPosterService');
       if (!videoPoster.enabled()) return;
-      videoPoster.generatePosterForAd({ adId: ad._id })
+      videoPoster.generatePosterForAd({ adId: ad._id, campaignRunId: req.campaignRunId || null })
         .then(out => {
           if (out?.skipped) return;
           if (out?.ok) {
@@ -306,7 +306,7 @@ async function renderCreative(req) {
     setImmediate(() => {
       const overlayPolish = require('./aiOverlayPolishService');
       if (!overlayPolish.enabled()) return;
-      overlayPolish.polishOverlayForAd({ adId: ad._id })
+      overlayPolish.polishOverlayForAd({ adId: ad._id, campaignRunId: req.campaignRunId || null })
         .then(out => {
           if (out?.skipped) return;
           if (out?.ok) {
@@ -347,6 +347,7 @@ async function deriveStage(req) {
     template,
     aspectRatio,
     refresh: !!req.options?.refresh,
+    campaignRunId: req.campaignRunId || null,
     options: {
       campaignKind:       req.campaignKind        || null,
       promotionalDetails: req.promotionalDetails  || null,
@@ -762,7 +763,8 @@ async function ensureCanvasAndHtml({
       directionConcept,
       nCandidates:         3,
       previewMode:         false,
-      platformFormat
+      platformFormat,
+      campaignRunId
     });
   } catch (err) {
     console.warn(`   ⚠️  [render eager] canvas prime failed: ${err.message}`);

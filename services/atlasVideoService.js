@@ -3709,7 +3709,7 @@ async function submitGeneration({ model, prompt, imageUrls, aspectRatio, caps, v
 // the non-fatal try/catch, the noteRenderIssue({...}) call, the timing
 // log ("derived in Nms"), and the post-build re-read keyed on
 // {mediaId, productId}.
-async function refreshStaleLayoutInput({ layoutInput, ad, media, brand, product, categories, campaign, targetAspect }) {
+async function refreshStaleLayoutInput({ layoutInput, ad, media, brand, product, categories, campaign, targetAspect, campaignRunId = null }) {
   const lpEmpty = !layoutInput?.input || Object.keys(layoutInput.input || {}).length === 0;
   const lpStale = !lpEmpty && layoutInput.schemaVersion !== INPUT_SCHEMA_VERSION;
   if ((lpEmpty || lpStale) && ad.productId) {
@@ -3722,6 +3722,7 @@ async function refreshStaleLayoutInput({ layoutInput, ad, media, brand, product,
         mediaId:     media._id,
         template:    tmpl,
         aspectRatio: targetAspect,
+        campaignRunId,
         options: {
           campaignKind:  campaign?.kind || 'product',
           variantKind:   'product_image',
@@ -3769,7 +3770,7 @@ async function refreshStaleLayoutInput({ layoutInput, ad, media, brand, product,
 // the storyboard once before dispatching Grok and chrome in parallel.
 // Returns { storyboard, aspectRatio } so the caller can stamp it on
 // the Ad doc and pass it to both renderers.
-async function prepareStoryboard({ ad, operatorPrompt = null, modelOverride = null }) {
+async function prepareStoryboard({ ad, operatorPrompt = null, modelOverride = null, campaignRunId = null }) {
   const media = await Media.findById(ad.mediaId).lean();
   if (!media) throw new Error(`Media ${ad.mediaId} not found`);
 
@@ -3807,7 +3808,7 @@ async function prepareStoryboard({ ad, operatorPrompt = null, modelOverride = nu
   // being asked about the Grok fallback aspect.
   let layoutInput = layoutInputInitial;
   layoutInput = await refreshStaleLayoutInput({
-    layoutInput, ad, media, brand, product, categories, campaign, targetAspect
+    layoutInput, ad, media, brand, product, categories, campaign, targetAspect, campaignRunId
   });
 
   // Storyboard retired on the Atlas path: the Ken Burns prompt fully
@@ -3892,7 +3893,7 @@ async function generateForAd({
   // the raw video render aspect. Non-fatal on failure.
   let layoutInput = layoutInputInitial;
   layoutInput = await refreshStaleLayoutInput({
-    layoutInput, ad, media, brand, product, categories, campaign, targetAspect
+    layoutInput, ad, media, brand, product, categories, campaign, targetAspect, campaignRunId
   });
 
   const lpInput    = layoutInput?.input || null;

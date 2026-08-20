@@ -2600,7 +2600,7 @@ async function renderOneInner(run, job, adId, index, renderToken) {
         // prompt directs motion; the GPT storyboard stage is retired) —
         // the stamp below only fires for legacy/vertex storyboards.
         adStage(adId, 'preparing video context');
-        const { storyboard } = await veoPrepareStoryboard({ ad });
+        const { storyboard } = await veoPrepareStoryboard({ ad, campaignRunId: run.runId });
         veoStoryboard = storyboard || null;
 
         // Stamp the storyboard early so chrome can read it from ad.veoStoryboard

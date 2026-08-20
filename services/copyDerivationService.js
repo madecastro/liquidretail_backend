@@ -69,7 +69,11 @@ async function deriveCopy({
   brandId,
   productId       = null,
   creativeStyle,
-  refresh         = false
+  refresh         = false,
+  // CampaignRun.runId string — threaded into the CostLog row via the
+  // meta objects below. Optional: omitting it reproduces pre-threading
+  // behavior (campaignRunId: null) byte-for-byte.
+  campaignRunId   = null
 }) {
   if (!brandId)        throw badRequest('brandId required');
   if (!creativeStyle)  throw badRequest('creativeStyle required');
@@ -99,6 +103,7 @@ async function deriveCopy({
         provider: 'openai',
         model:    DEFAULT_MODEL,
         brandId, productId,
+        campaignRunId,
         cacheKey
       }).catch(() => {});
       return { artifact: cached, cached: true };
@@ -123,6 +128,7 @@ async function deriveCopy({
       service:    'copyDerivationService',
       purposeTag: creativeStyle,
       brandId, productId,
+      campaignRunId,
       visionImages: 0,
       cacheKey
     },

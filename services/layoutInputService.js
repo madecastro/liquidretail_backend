@@ -284,7 +284,17 @@ const DERIVATION_SCHEMA = {
 // ──────────────────────────────────────────────────────────────
 //  Public entry point
 // ──────────────────────────────────────────────────────────────
-async function buildLayoutInput({ mediaId, template, aspectRatio, options = {}, refresh = false }) {
+async function buildLayoutInput({
+  mediaId, template, aspectRatio, options = {}, refresh = false,
+  // CampaignRun.runId string — threaded into runDerivation's CostLog meta
+  // below. Kept as a sibling param rather than folded into `options`:
+  // computeCampaignContextHash only hashes campaignKind/promotionalDetails/
+  // rafflePrizeMediaId, so putting it on `options` would not (yet) change
+  // the cache key, but a later "hash all of options" edit could — a
+  // separate param avoids that landmine entirely. Optional: omitting it
+  // reproduces pre-threading behavior byte-for-byte.
+  campaignRunId = null
+}) {
   if (!registry.getNormalized(template)) throw badRequest(`Unknown template: ${template}`);
   const supportedRatios = registry.getSupportedAspectRatios(template);
   if (!supportedRatios.includes(aspectRatio))
@@ -361,7 +371,7 @@ async function buildLayoutInput({ mediaId, template, aspectRatio, options = {}, 
     }
   }
 
-  const derivation = await runDerivation(ctx, effectiveTemplate, aspectRatio, { ...options, overlayBoxes });
+  const derivation = await runDerivation(ctx, effectiveTemplate, aspectRatio, { ...options, overlayBoxes }, campaignRunId);
   const input = await assembleInput(ctx, effectiveTemplate, aspectRatio, options, derivation, precomputedPlacement);
 
   await LayoutInputArtifact.findOneAndReplace(
@@ -875,7 +885,7 @@ function productReviewsOf(match) {
 // ──────────────────────────────────────────────────────────────
 //  Derivation LLM
 // ──────────────────────────────────────────────────────────────
-async function runDerivation(ctx, template, aspectRatio, options) {
+async function runDerivation(ctx, template, aspectRatio, options, campaignRunId = null) {
   if (!atlasConfigured() && !process.env.GEMINI_API_KEY) return fallbackDerivation(ctx, aspectRatio, options);
 
   const prompt = buildDerivationPrompt(ctx, template, aspectRatio, options);
@@ -886,7 +896,7 @@ async function runDerivation(ctx, template, aspectRatio, options) {
     // Hidden reasoning spends from max_tokens on the OpenAI-compat path
     // (no thinkingBudget knob) — the transport pads a reserve on top.
     const res = await chatCompletion(
-      { stage: 'layout_derivation', service: 'layoutInputService' },
+      { stage: 'layout_derivation', service: 'layoutInputService', campaignRunId },
       {
         model: GEMINI_MODEL,
         messages: [{ role: 'user', content: prompt }],

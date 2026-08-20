@@ -448,7 +448,12 @@ async function directConcepts({
   // bumping DIRECTOR_SIGNALS_VERSION on this Phase invalidates all
   // cached artifacts so the next call regenerates with format-awareness.
   platformFormat = 'meta_feed_1_1',
-  refresh        = false
+  refresh        = false,
+  // The CampaignRun.runId string driving this call — threaded straight
+  // into the CostLog row via the meta objects below (persistCost already
+  // reads meta.campaignRunId generically). Optional: omitting it reproduces
+  // the pre-threading behavior (campaignRunId: null) byte-for-byte.
+  campaignRunId  = null
 }) {
   if (!brandId) throw badRequest('brandId required');
   if (!process.env.OPENAI_API_KEY) {
@@ -489,6 +494,7 @@ async function directConcepts({
         provider: 'openai',
         model:    MODEL_ID,
         brandId, productId,
+        campaignRunId,
         cacheKey
       }).catch(() => {});
       return { artifact: cached, cached: true };
@@ -518,6 +524,7 @@ async function directConcepts({
       model:      MODEL_ID,
       purposeTag: campaignKind || 'untagged',
       brandId, productId,
+      campaignRunId,
       visionImages: 0,
       cacheKey
     },
@@ -2196,7 +2203,11 @@ async function directConceptsRound({
   seededUniverse,           // [{ mediaId, url, fileType, role, metadata }]
   seedUniverseHash = null,  // from seededUniverseService; persisted on the artifact
   roundIndex      = null,   // computed from prior rows when omitted
-  avoidList       = null    // computed from prior rows when omitted
+  avoidList       = null,   // computed from prior rows when omitted
+  // The CampaignRun.runId string driving this round — threaded into the
+  // CostLog row via the chatCompletion meta below. Optional: omitting it
+  // reproduces pre-threading behavior (campaignRunId: null) byte-for-byte.
+  campaignRunId   = null
 }) {
   if (!brandId) throw badRequest('brandId required');
   if (!Array.isArray(seededUniverse) || !seededUniverse.length) {
@@ -2398,6 +2409,7 @@ async function directConceptsRound({
         model:      DIRECTOR_ROUND_MODEL,
         purposeTag: `round:${roundIndex}:${campaignKind || 'untagged'}${attempt ? `:retry${attempt}` : ''}`,
         brandId, productId,
+        campaignRunId,
         visionImages: visionImages.length,
         // attempt distinguishes the retry in the ledger. There is no response cache
         // on this path, so this is telemetry, not retry isolation.
@@ -3617,6 +3629,7 @@ module.exports = {
   N_CONCEPTS_ROUND,
   DIRECTOR_ROUND_TOKENS,
   // exposed for testing
+  DIRECTOR_SIGNALS_VERSION,
   buildPromptRound,
   buildResponseSchemaRound,
   validateConceptsRound,

@@ -1124,7 +1124,11 @@ async function getOrGenerate({
   // section into its prompt. Defaults to 'meta_feed_1_1' so callers
   // that don't pass it (legacy / preview paths) keep producing Feed-
   // sized canvases.
-  platformFormat      = 'meta_feed_1_1'
+  platformFormat      = 'meta_feed_1_1',
+  // CampaignRun.runId string — threaded into the CostLog row via the meta
+  // objects below, and forwarded into the internal judgeCandidates call.
+  // Optional: omitting it reproduces pre-threading behavior byte-for-byte.
+  campaignRunId       = null
 }) {
   if (!input)         throw new Error('input required');
   if (!template)      throw new Error('template required');
@@ -1236,6 +1240,7 @@ async function getOrGenerate({
         model:       MODEL_ID,
         purposeTag:  template,
         brandId, mediaId, productId,
+        campaignRunId,
         cacheKey:    costCacheKey
       }).catch(() => {});
       // Phase 5a lazy backfill — when a render hits a cached AiCanvasArtifact
@@ -1405,6 +1410,7 @@ async function getOrGenerate({
         model:       MODEL_ID,
         purposeTag:  isV2 ? `v2:${v2ConceptId || 'unknown'}:cand${genIndex}` : template,
         brandId, mediaId, productId,
+        campaignRunId,
         visionImages: images.length,
         cacheKey:    costCacheKey
       },
@@ -1503,6 +1509,7 @@ async function getOrGenerate({
         inputSummary,
         brandSignal,
         brandId, productId,
+        campaignRunId,
         adId:         null  // Phase 3.1 will batch by adId
       });
     } catch (err) {

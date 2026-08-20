@@ -2008,11 +2008,13 @@ async function expandWizardJob({
       productIds:     uniqueProductIds,
       campaignKind,
       creativeIntent: null,  // Phase 9 UX adds an operator hint here
-      platformFormat: runPlatformFormat
+      platformFormat: runPlatformFormat,
+      campaignRunId:  generationRunId
     }),
     runCopyDerivationEager({
       brandId,
-      productStylePairs: derivePayloadProductStylePairs(payloads)
+      productStylePairs: derivePayloadProductStylePairs(payloads),
+      campaignRunId: generationRunId
     })
   ]);
   if (directorRes.status === 'rejected') {
@@ -2629,13 +2631,13 @@ function derivePayloadProductStylePairs(payloads) {
 // × style). Each pair is cache-keyed; reruns are cheap. Errors are
 // swallowed — failures fall back to the legacy single-string copy at
 // render time via aiCanvasInputBuilder's lazy lookup.
-async function runCopyDerivationEager({ brandId, productStylePairs }) {
+async function runCopyDerivationEager({ brandId, productStylePairs, campaignRunId = null }) {
   if (!brandId || !Array.isArray(productStylePairs) || !productStylePairs.length) return;
   const copyDerivation = require('./copyDerivationService');
   console.log(`✏️  copy-derivation eager: ${productStylePairs.length} (product × style) pairs for brand=${brandId}`);
   await Promise.all(productStylePairs.map(async ({ productId, creativeStyle }) => {
     try {
-      const { artifact, cached } = await copyDerivation.deriveCopy({ brandId, productId, creativeStyle });
+      const { artifact, cached } = await copyDerivation.deriveCopy({ brandId, productId, creativeStyle, campaignRunId });
       const c = artifact?.candidates || {};
       console.log(
         `✏️  copy-derivation ${cached ? 'CACHE-HIT' : 'GENERATED'} ` +
@@ -2653,7 +2655,7 @@ async function runCopyDerivationEager({ brandId, productStylePairs }) {
 // the cartesian. Director is cache-keyed on (brandId, productId,
 // campaignKind, creativeIntent) so repeat calls are cheap. Errors are
 // swallowed — telemetry-only stage; legacy render path is unaffected.
-async function runCreativeDirectorShadow({ brandId, productIds, campaignKind, creativeIntent, platformFormat = 'meta_feed_1_1' }) {
+async function runCreativeDirectorShadow({ brandId, productIds, campaignKind, creativeIntent, platformFormat = 'meta_feed_1_1', campaignRunId = null }) {
   if (!brandId || !Array.isArray(productIds)) return;
   const director = require('./aiCreativeDirectorService');
   const uniq = Array.from(new Set(productIds.map(String)));
@@ -2670,7 +2672,8 @@ async function runCreativeDirectorShadow({ brandId, productIds, campaignKind, cr
         productId:      pid,
         campaignKind,
         creativeIntent,
-        platformFormat
+        platformFormat,
+        campaignRunId
       });
       console.log(
         `🎭 creative-director shadow ${cached ? 'CACHE-HIT' : 'GENERATED'} ` +
@@ -3826,7 +3829,8 @@ async function runConceptDrivenExpansion({
       const { artifact, concepts, roundIndex, warnings: dirWarnings } =
         await director.directConceptsRound({
           brandId, productId, platformFormat, campaignKind, campaignId,
-          creativeIntent, seededUniverse: filtered, seedUniverseHash
+          creativeIntent, seededUniverse: filtered, seedUniverseHash,
+          campaignRunId: generationRunId
         });
       if (!concepts.length) {
         console.warn(`📦 conceptDriven[${productTag}]: Director returned no concepts — skipping`);
@@ -3845,7 +3849,8 @@ async function runConceptDrivenExpansion({
           inputSummary:  artifact.inputSummary,
           brandSignal:   artifact.inputSummary?.brand_signal,
           seededUniverse: filtered,
-          brandId, productId, campaignId
+          brandId, productId, campaignId,
+          campaignRunId: generationRunId
         });
         conceptScores  = judged.conceptScores;
         judgeArtifactId = judged.judgeResultArtifactId;

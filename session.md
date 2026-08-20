@@ -5,6 +5,109 @@ lines of chronological accretion; it is now organised by *what is true* rather t
 *what happened when*. History is compressed at the bottom — anything not listed there
 was judged superseded and dropped **deliberately**, not lost.
 
+## 2026-08-19 — campaignRunId threaded through the remaining LLM producers. Branch
+`fix/cost-run-attribution` (rebased onto `main` after PR #225 merged as `87cfdd00`).
+
+**Follow-up to PR #225**, which threaded `campaignRunId` through the video and
+static-image charge points only. Before this change, **none** of the LLM-call-site
+producers accepted `campaignRunId` at all (confirmed via grep — zero occurrences in
+each file), so every Director / Judge / Copy / Layout-derivation / Canvas-Spec /
+Overlay-Polish / Video-Poster `CostLog` row was unattributable to the `CampaignRun`
+that spent the money.
+
+**Threaded (10 files: the 11 assigned minus one dead-code exclusion, see below):**
+`aiCreativeDirectorService.js` (both `directConcepts` V1-shadow and `directConceptsRound`
+V2-live — two independent Director entry points, only one of which the original brief
+named), `aiJudgeService.js` (`judgeCandidates` + `judgeConceptsRound`),
+`copyDerivationService.js` (`deriveCopy`), `aiCanvasSpecService.js` (`getOrGenerate`,
+including its internal `judgeCandidates` call), `aiOverlayPolishService.js`
+(`polishOverlayForAd`), `aiVideoPosterService.js` (`generatePosterForAd`),
+`layoutInputService.js` (`buildLayoutInput` + its internal `runDerivation` — added as a
+**sibling param, not folded into `options`**, since `computeCampaignContextHash` doesn't
+hash it and folding it in could silently change the cache key on a later refactor).
+
+**No change needed** in `atlasLlmService.js` / `atlasLlmStreamService.js` — both already
+spread `...meta` into their `trackLlmCall`/`recordFlatCost` calls, so any caller that
+puts `campaignRunId` on its own meta gets it threaded for free.
+
+**`aiImageReferenceService.js` deliberately excluded — dead code, not an oversight.**
+Its only call site (`aiCanvasSpecService.js`'s "Image-Ref shadow") was **removed
+2026-07-31** by owner instruction (an unconsumed billable shadow — see that file's own
+removal comment). Zero live callers confirmed by grep across `services/` + `routes/`.
+Threading a param into unreachable code would be pure busywork.
+
+**`textEmbeddingService.js` — honest gap, not silently threaded.** Its only caller
+(`productMatchService.findCatalogMatchByText`, the CV/UGC catalog-matching pipeline) has
+no `CampaignRun` in scope at all — that pipeline runs at ingest/match time, not during a
+campaign's ad-generation run. Forcing a parameter here would always be null; documented
+as a known gap in `scripts/verifyCostRunAttribution.js` (I4) rather than pretended away.
+
+**Threading hops required outside the 11 named files** (the run's string id —
+`CampaignRun.runId`, same value as `Ad.campaignRunIds[0]` — already exists at these call
+sites under two names: `generationRunId` at mint-time, `campaignRunId` at render-time):
+`campaignAdsGenerationService.js` (`runCreativeDirectorShadow`, `runCopyDerivationEager`,
+plus their two callers inside `expandWizardJob`, plus `runConceptDrivenExpansion`'s two
+internal calls to `directConceptsRound`/`judgeConceptsRound`), `renderService.js`
+(`deriveStage`'s `buildLayoutInput` call, `ensureCanvasAndHtml`'s `getOrGenerate` call —
+that function already had the param from PR #225's video work but never forwarded it —
+and the two poster/overlay-polish shadow calls), `atlasVideoService.js`
+(`refreshStaleLayoutInput` gained the param; `generateForAd` already had it from PR #225
+but never forwarded it into `refreshStaleLayoutInput`; `prepareStoryboard` gained the
+param too), `videoRouter.js` (`prepareStoryboard`'s pass-through wrapper), `routes/ads.js`
+(the one live gap: `veoPrepareStoryboard({ ad })` at the storyboard-prep stage of the
+video render loop didn't pass `run.runId` even though it's in scope one line below where
+`veoGenerateForAd` already does).
+
+**Known accepted residual, not fixed here (out of scope):** `atlasVideoService
+.prepareStoryboard` is also called from the ad-**regenerate** flow
+(`adRegenerateService.js:737` and `routes/ads.js:2563`'s sibling at the studio-preview
+route), where **no run context exists at all** — regenerate re-renders a single existing
+Ad outside any fresh `CampaignRun`. Per this repo's own convention (documented at
+`atlasVideoService.js:3824-3828`, `generateForAd`'s comment: prefer a real parameter over
+reading `ad.campaignRunIds`), the honest choice was to leave those call sites at
+`campaignRunId: null` rather than invent a fallback-to-`ad.campaignRunIds[0]` read that
+nobody asked for. Flagged for a future session if regenerate-path attribution is wanted.
+
+**Also flagged, NOT fixed here (separate bug, out of scope for an attribution PR):**
+per rs-7c's live ground-truth run (`run_1787119100250_eef4d871`, brand Vuori), the
+Director's own LLM rows — `claude-sonnet-5` and `claude-opus-5` — record **`$0.0000`
+with `costSource: 'none'`**, i.e. these two models earn no cost computation at all
+today, independent of attribution. Likely `costTracker.MODEL_RATES` / `computeCost`
+has no entry for either slug. Flagged via spawn_task rather than folded into this diff.
+
+**Verify harness:** `scripts/verifyCostRunAttribution.js` (48 checks) — real exported-
+function tests (not source-scan-only) for the generic mechanism
+(`costTracker.trackLlmCall`/`recordCacheHit`/`recordFlatCost` threading meta.campaignRunId
+onto the CostLog row, Group A) and for the Director service's real `directConcepts()`
+cache-hit path end-to-end (Group B, the brief's required "at least the Director round"
+case — note this exercises the V1 shadow's cache-hit arm, since the live V2
+`directConceptsRound` has no cache-hit arm and would require a real network call to
+exercise past its config gate). Every other producer + threading hop is pinned by a
+source-region-scoped check (function-body-bounded, so a differently-named
+reimplementation can't pass). Includes a revert-proof (temporarily strips
+`campaignRunId` out of the real `costTracker.js`, confirms Group A fails, restores and
+verifies byte-identity). No DB, no network, no real API key.
+**One repo-trap hit while building this:** the worktree's tracked `node_modules` subset
+was missing `https-proxy-agent`, throwing `MODULE_NOT_FOUND` through
+`axios → atlasLlmService`; fixed per CLAUDE.md §4's documented recipe (`npm install
+--no-save https-proxy-agent@5.0.1` + `git checkout -- node_modules/.package-lock.json`).
+
+**Rebased onto `main` (`87cfdd00`) after PR #225 merged** — the branch had zero unique
+commits (all work was uncommitted), so this was a stash → reset --hard origin/main →
+stash pop, not a true rebase replay. Only `session.md` conflicted (this entry); all 12
+code files auto-merged cleanly. Full suite re-run against the new base still needed
+before committing (see below).
+
+**Coordinated with 8 concurrent sessions** touching this repo this session (per the
+CLAUDE.md coordination note) — no file-region conflicts; `aiCreativeDirectorService.js`'s
+`directConceptsRound` return object is owned by a separate concurrent PR (#227, rs-cf),
+confirmed disjoint from this change (params + meta object only, no return-statement
+edits).
+
+**Not yet committed or pushed** — branch `fix/cost-run-attribution` in worktree
+`.worktrees/cost-run-attribution`, now based on `origin/main` (`87cfdd00`, PR #225
+included). Waiting on explicit user go-ahead before committing.
+
 ## 2026-08-19 — Slack job status messages name who ordered the run
 
 **MERGED to `main`** as `aa827fae` (PR #226, squash), branch deleted. Rebased onto `555fe8cb`
@@ -638,6 +741,7 @@ decide when.
 previously-50-cap-buried Denim Jacket; Load-more advancing past 100). "Before"
 screenshots/diagnostics captured directly on live `staging.reach-social.io`.
 Neither PR has been merged or deployed as of this entry.
+
 ## 2026-08-19 — Two Omni masters timed out (run_1787119100250_eef4d871); the real defect
 was write-off + no reconciliation, NOT the 600s cap. Branch `fix/video-master-reliability`.
 

@@ -44,7 +44,11 @@ async function judgeCandidates({
   brandId       = null,
   campaignId    = null,
   adId          = null,
-  aiCanvasArtifactId = null
+  aiCanvasArtifactId = null,
+  // CampaignRun.runId string — threaded into the CostLog row via the
+  // chatCompletion meta below. Optional: omitting it reproduces
+  // pre-threading behavior (campaignRunId: null) byte-for-byte.
+  campaignRunId = null
 }) {
   if (!Array.isArray(candidates) || candidates.length === 0) {
     throw new Error('judgeCandidates: candidates[] required');
@@ -73,6 +77,7 @@ async function judgeCandidates({
       model:      DEFAULT_JUDGE_MODEL,
       purposeTag: `concept:${concept?.concept_id || '-'}`,
       brandId, campaignId, adId,
+      campaignRunId,
       visionImages: 0,
       cacheKey: `judge:${aiCanvasArtifactId || '-'}`
     },
@@ -397,7 +402,11 @@ async function judgeConceptsRound({
   seededUniverse    = [],    // for media_utilization scoring
   brandId           = null,
   productId         = null,
-  campaignId        = null
+  campaignId        = null,
+  // CampaignRun.runId string — threaded into the CostLog row via the
+  // chatCompletion meta below. Optional: omitting it reproduces
+  // pre-threading behavior (campaignRunId: null) byte-for-byte.
+  campaignRunId     = null
 }) {
   if (!Array.isArray(concepts) || concepts.length === 0) {
     throw new Error('judgeConceptsRound: concepts[] required');
@@ -444,6 +453,7 @@ async function judgeConceptsRound({
       model:      DEFAULT_JUDGE_MODEL,
       purposeTag: `round:${roundIndex ?? '-'}:concepts:${concepts.length}`,
       brandId, campaignId,
+      campaignRunId,
       visionImages: 0,
       cacheKey:   `judgeConcepts:${conceptArtifactId || '-'}`
     },

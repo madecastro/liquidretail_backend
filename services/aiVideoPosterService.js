@@ -75,7 +75,14 @@ function buildPolishPrompt() {
 // Idempotent — re-fires for the same Ad just overwrite posterUrl with
 // a fresh polish, no harm done. We don't cache because the input
 // composite changes if the canvas spec is regenerated.
-async function generatePosterForAd({ adId }) {
+async function generatePosterForAd({
+  adId,
+  // CampaignRun.runId string driving THIS render pass — not read off
+  // ad.campaignRunIds (that array can hold several runs across an ad's
+  // life; the caller knows which one is spending money right now). Same
+  // convention as atlasVideoService.generateForAd's campaignRunId param.
+  campaignRunId = null
+}) {
   if (!enabled()) return { skipped: true, reason: 'AI_VIDEO_POSTER_ENABLED=false or Gemini not configured' };
   if (!adId)      throw new Error('adId required');
 
@@ -100,6 +107,7 @@ async function generatePosterForAd({ adId }) {
         brandId:    ad.brandId,
         mediaId:    ad.mediaId,
         productId:  ad.productId,
+        campaignRunId,
         cacheKey:   String(ad._id),
         visionImages: 1
       },
