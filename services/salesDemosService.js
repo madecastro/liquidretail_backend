@@ -129,8 +129,16 @@ async function createDemoBrand({ name, igHandle, shopifyUrl, method }) {
 // Demos workspace via POST /api/sales-demos/bootstrap. Additional reps
 // are added via the normal /api/members invite flow after the first
 // admin lands. Case-insensitive.
+//
+// Super-admins (SUPER_ADMIN_EMAILS) are ALSO accepted here by design —
+// keeping two parallel lists in sync would drift the moment a new
+// super-admin is promoted, and the owner's stated invariant is "any
+// super admin should have access to sales-demos". A user only needs to
+// appear on ONE of the two lists to bootstrap.
 function isAllowedBootstrapper(email) {
   if (!email) return false;
+  const { isSuperAdminEmail } = require('./superAdminService');
+  if (isSuperAdminEmail(email)) return true;
   const raw = process.env.SALES_DEMOS_ADMINS || '';
   const allow = raw.split(',').map(s => s.trim().toLowerCase()).filter(Boolean);
   return allow.includes(String(email).trim().toLowerCase());
