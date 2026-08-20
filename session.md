@@ -69,32 +69,49 @@ it clears it back to this placeholder in the same commit that closes it out.)_
 *(Replace this whole section, don't append to it, when it goes stale.)*
 
 - Trunk `main` is moving fast — always `git fetch` before trusting a SHA here.
-  As of this update, `main` was at `3bd30a93` (docs on the #244 adversarial-
-  review P0). **#239-#252 (incl. #244, #249, #250, #251, #252) merged**
-  since the previous snapshot below (`737732b9`).
+  As of this update, `main` is at `cddee569` (#259, parallel-safety fix for
+  the verify runner), with `fc12c6d4` (#257, `fix/detect-media-brand-tenancy`)
+  merged just before it — **both merged**, closing out the two backend
+  sessions that were open the last two times this section was written (see
+  `session.d/2026-08-19_detect-prep-mediaids-brand-leak-fix.md` for #257's
+  detail). PR #246 landed a proper test runner in this same window: `npm
+  test` (parallel, `scripts/runVerifySuite.js`) and `npm run test:affected`.
+  **Do NOT trust `test:affected`** — confirmed hole in its changed-file
+  basename filter (`length >= 4`), so `models/Ad.js` → `"Ad"` → excluded;
+  editing it (or `routes/ads.js`, `"ads"`) alone can report "nothing to run"
+  and exit 0 while dependent scripts never run. Use plain `npm test` (full
+  suite) until this is fixed — this is also why rebasing #260 onto #257/#259
+  below was verified with the full suite, not `--affected`.
 - Open PRs at the time of this update: RPD **#210/#212** (deliberately
-  deferred — do not touch). Newest backend session:
-  `fix/detect-media-brand-tenancy` — closed the #1 finding from the
-  adversarial review of #245 (see the KNOWN-OPEN entry): `expandWizardJob`'s
-  on-demand detect prep resolved the request's raw `mediaIds` with no
-  `brandId` clause, and `ensureDetectForProducts` accepted a `brandId` option
-  but never applied it. Confirmed live+exploitable, measured against prod (8
-  campaigns/4 brand pairs of persisted foreign-media residue, 0 currently
-  chaining to a billable detect — the code path was the live risk, not
-  today's data), fixed, landed with a new revert-proven harness. Also
-  corrected the severity of the other five findings from the same review —
-  two were previously overstated (`/preview`'s and the legacy cartesian
-  path's actual blast radius are both narrower than first reported; see
-  `session.d/2026-08-19_detect-prep-mediaids-brand-leak-fix.md` and the
-  updated KNOWN-OPEN entry for the corrected version).
-- Offline verify: `for f in scripts/verify*.js scripts/verify*.mjs; do node "$f" || echo "FAIL $f"; done`
+  deferred — do not touch). Newest backend session (this one): PR **#260**,
+  `fix/vision-qc-silent-gate` — vision QC ran on 0/39 ads on a real
+  production run; root cause was the (deliberate, owner-requested) gate
+  being off combined with three call sites that silently discarded the
+  "disabled" verdict shape instead of stamping it, so `shippedWithoutQc`
+  undercounted to zero. Just rebased onto #257/#259 and picked up a second,
+  adversarial-review pass in the same PR: (a) the pre-spend idempotency
+  guard in `imageRecoveryService.maybeQcRecoveredPlate` treated that same
+  `disabled:true` stamp as "already inspected", which would have
+  permanently defeated QC on any ad recovered again after the gate is
+  re-enabled — fixed; (b) `shippedWithoutQc` had no status filter and
+  falsely alarmed on every in-flight (`queued`/`rendering`) ad — fixed,
+  scoped to `AD_STATUSES`; (c) `qcdOnRetry` double-counted a twice-failed ad
+  against `qcFailed` — fixed with `passed:true`; (d) split
+  `shippedWithoutQc` into two new named subsets, `qcDisabled` (deliberate
+  gate-off) and `qcUnavailable` (gate on, QC could not run — a live outage
+  signal). See `session.d/2026-08-19_vision-qc-silent-gate-fixed-pr-260.md`.
+  **Backend-only shape change** — frontend companion
+  `Emami-RS-Project/liquidretail` PR **#62** (`fix/vision-qc-not-inspected-fe`)
+  does not yet read `qcDisabled`/`qcUnavailable`; confirmed it degrades
+  gracefully (optional chaining over unknown JSON fields, no schema
+  validation) rather than breaking, so #62 is safe to merge as-is — it just
+  keeps showing the older collapsed signal until updated to consume the new
+  fields.
+- Offline verify: `npm test` (or `node scripts/runVerifySuite.js` directly)
   — **174 scripts** as of this update (re-count before quoting, this number
-  drifts; use `node`'s own child_process timeout rather than shell job
-  control if you wrap this in a runner — a bash `&`/`wait` timeout wrapper
-  nested under this harness's own backgrounding misbehaved and silently
-  under-ran the sweep twice in a row 2026-08-19). `npm run lint` enables
-  exactly one rule, `no-undef` — see `CLAUDE.md` §5 for why that one rule
-  matters more than it looks like it should.
+  drifts). `npm run lint` enables exactly one rule, `no-undef` — see
+  `CLAUDE.md` §5 for why that one rule matters more than it looks like it
+  should.
 - **Correction to a prior note below**: `verifyLogoSilhouette.js`,
   `verifyLogoColorPreservation.js`, `verifyStaticTextInk.js` failing in a
   fresh `git worktree` checkout (all three `require(path.join(__dirname,
@@ -114,8 +131,14 @@ it clears it back to this placeholder in the same commit that closes it out.)_
   still has no `timeout` binary — a loop that wraps each script in `timeout`
   will misreport all of them as failed regardless of the above.
 - Most recent entries (see `session.d/`, newest by filename date):
-  `2026-08-19_detect-prep-mediaids-brand-leak-fix.md` (this session —
-  `fix/detect-media-brand-tenancy`, closes the #245-review finding #1 above),
+  `2026-08-19_vision-qc-silent-gate-fixed-pr-260.md` (this session — PR
+  #260, open, rebased onto #257/#259 with a second adversarial-review pass:
+  idempotency-guard fix, rollup status-scoping, qcdOnRetry double-count fix,
+  qcDisabled/qcUnavailable split),
+  `2026-08-19_detect-prep-mediaids-brand-leak-fix.md` (PR #257, merged —
+  closes the #245-review finding #1 above; a same-day follow-up also made
+  `ensureDetectForProducts` fail-closed on a missing `brandId`, see
+  `session.d/KNOWN-OPEN.md`),
   `2026-08-19_reels-rating-row-half-sliced-fixed-element-aware-overflow.md`
   (follow-up to #239: a title group can now shrink/drop whole
   elements to fit its box instead of `overflow:hidden` clipping through the
