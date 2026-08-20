@@ -87,15 +87,22 @@ function loadIntents({ preserve, hardening, pmaxNotes } = {}) {
 }
 
 // pmaxVideo drives the hook-first destination kill switch (owner 2026-08-18:
-// Meta and PMax share one camera prompt). Omitted → left at its ambient value,
-// which is ON by default, preserving every existing caller's behaviour.
-// Written through the LEGACY env name deliberately: it is the name that may be
-// set on the Render dashboard, and exercising it here keeps the backward
-// compatibility path covered by a real test rather than only by a comment.
+// Meta and PMax share one camera prompt; reverted by owner 2026-08-20 — see
+// CLAUDE.md §00). Omitted → left at its ambient value: the CODE default is
+// ON (isHookFirstVideoPromptEnabled's fallback), unrelated to the FILE
+// default in config/defaults.env (now OFF), which this isolated process never
+// loads. Written through the LEGACY env name deliberately: it is the name
+// that may be set on the Render dashboard, and exercising it here keeps the
+// backward compatibility path covered by a real test rather than only by a
+// comment. When an arm IS specified, force BOTH names in lockstep — either
+// name reading "false" kills (fail-safe OR), so setting only the legacy name
+// could not force the ON arm if this process ever also loaded a "false" onto
+// the other name.
 function loadVeo({ lifestyle, pmaxVideo } = {}) {
   delete require.cache[VEO_KEY];
   setEnv('VIDEO_LIFESTYLE_PROMPT', lifestyle);
   setEnv('PMAX_VIDEO_DIRECTIVES', pmaxVideo);
+  if (pmaxVideo !== undefined) setEnv('VIDEO_HOOK_FIRST_PROMPT', pmaxVideo);
   return require('../services/veoPromptBuilder');
 }
 

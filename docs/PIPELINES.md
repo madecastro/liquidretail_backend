@@ -989,7 +989,7 @@ Results from deterministic + concept expanders are combined with **`mergeExpansi
 
 > **Load-bearing money shape.** `google_video` → **2 billable Omni masters per product** (9:16 + 16:9). `pmax_video_1_1` is **derive-only** — never an Omni submit. Mirrors how `meta_video` returns only `META_VIDEO_MASTER`; `resolvePreset('google_video'|'google_all')` returns **only** `GOOGLE_VIDEO_MASTERS`, never the full fan-out.
 >
-> **MIXED Meta+PMax runs share the portrait plate (owner directive 2026-08-18).** `resolvePreset` still returns all three surfaces — that number is a SURFACE count, not a bill — but `planDeterministicVideoAds` marks `pmax_video_9_16` a **free derive of `meta_stories_9_16`**, so a mixed run bills **2 masters ($1.80), not 3 ($2.70)**, at an unchanged 21 Ads — **conditionally**: with the hook-first camera standardization off, a mixed run still bills 3 / $2.70 by design, so do not quote $1.80 as unconditional. The two formats declare byte-identical `deliveryDims` (1080×1920) and differ only in `safeArea`, which is resolved per row at titling time — **one plate, two titlings**. The decision is `resolvePortraitMasterFormat`, taken once at mint and stamped as `deriveFromMaster`; the renderer only ever reads the stamp. It **fails closed on five conjuncts** (kill switch `UNIFIED_VIDEO_9_16_MASTER`, Meta master in this run, PMax portrait in this run, the hook-first camera standardization ON, and the Meta 10s floor active). ⚠️ That fourth conjunct calls `veoPromptBuilder.isHookFirstVideoPromptEnabled()` and **must not** be reduced to "do the two prompt profiles match" — with the standardization off both destinations fall back to the same `gemini-omni` profile, so equality is true in BOTH states and gates nothing, so a **PMax-only run still pays for its own 9:16** — a derive with no master ships nothing, which is worse than $0.90. ⚠️ Do **not** drop `pmax_video_9_16` from `GOOGLE_VIDEO_MASTERS` to express this: `isGoogleVideoMasterRun` keys on its presence, so removing it also stops `pmax_video_1_1` minting. ⚠️ The shared plate is 10s because **Meta video is now floored at 10s universally** (owner directive 2026-08-18 — the wizard posts `8` and used to win, so the documented "Meta is 10s" was false on every UI run). Google rejects PMax video under 10s, so that one rule is also what makes the shared plate a legal PMax asset — there is deliberately no mixed-run duration branch. The two are coupled: `META_VIDEO_DURATION_SEC=0` reverts the Meta floor and `resolvePortraitMasterFormat` then **refuses to share** rather than ship an 8s PMax asset. Digest-safe — duration is hashed for Google formats only, so no stored Meta digest moves; the flip side is that a campaign with an existing 8s Meta video ad **keeps it** (the 10s row hashes identically and is swallowed). Pinned by `scripts/verifySharedPortraitMaster.js`.
+> **MIXED Meta+PMax runs share the portrait plate WHEN the hook-first switch is ON (owner directive 2026-08-18; that switch's default was REVERTED by the owner 2026-08-20 — see CLAUDE.md §00).** `resolvePreset` still returns all three surfaces — that number is a SURFACE count, not a bill — but `planDeterministicVideoAds` marks `pmax_video_9_16` a **free derive of `meta_stories_9_16`**, so a mixed run bills **2 masters ($1.80), not 3 ($2.70)**, at an unchanged 21 Ads — **conditionally**: with the hook-first camera standardization off, a mixed run still bills 3 / $2.70 by design, so do not quote $1.80 as unconditional. **As of 2026-08-20, OFF is the shipped `config/defaults.env` default, so a mixed run bills 3 / $2.70 today** absent an explicit re-enable of `VIDEO_HOOK_FIRST_PROMPT` / `PMAX_VIDEO_DIRECTIVES`. The two formats declare byte-identical `deliveryDims` (1080×1920) and differ only in `safeArea`, which is resolved per row at titling time — **one plate, two titlings**. The decision is `resolvePortraitMasterFormat`, taken once at mint and stamped as `deriveFromMaster`; the renderer only ever reads the stamp. It **fails closed on five conjuncts** (kill switch `UNIFIED_VIDEO_9_16_MASTER`, Meta master in this run, PMax portrait in this run, the hook-first camera standardization ON, and the Meta 10s floor active). ⚠️ That fourth conjunct calls `veoPromptBuilder.isHookFirstVideoPromptEnabled()` and **must not** be reduced to "do the two prompt profiles match" — with the standardization off both destinations fall back to the same `gemini-omni` profile, so equality is true in BOTH states and gates nothing, so a **PMax-only run still pays for its own 9:16** — a derive with no master ships nothing, which is worse than $0.90. ⚠️ Do **not** drop `pmax_video_9_16` from `GOOGLE_VIDEO_MASTERS` to express this: `isGoogleVideoMasterRun` keys on its presence, so removing it also stops `pmax_video_1_1` minting. ⚠️ The shared plate is 10s because **Meta video is now floored at 10s universally** (owner directive 2026-08-18 — the wizard posts `8` and used to win, so the documented "Meta is 10s" was false on every UI run). Google rejects PMax video under 10s, so that one rule is also what makes the shared plate a legal PMax asset — there is deliberately no mixed-run duration branch. The two are coupled: `META_VIDEO_DURATION_SEC=0` reverts the Meta floor and `resolvePortraitMasterFormat` then **refuses to share** rather than ship an 8s PMax asset. Digest-safe — duration is hashed for Google formats only, so no stored Meta digest moves; the flip side is that a campaign with an existing 8s Meta video ad **keeps it** (the 10s row hashes identically and is swallowed). Pinned by `scripts/verifySharedPortraitMaster.js`.
 
 #### Formats
 
@@ -1089,13 +1089,19 @@ cascade; it IS awareness. Separate 10s PMax *pacing* files selected via
 per-run `presetOverride` (still open — see the reverted 8s→10s re-time
 above) is a different question from stage selection.
 
-#### Hook-first video directives profile (Phase B; standardized onto Meta 2026-08-18)
+#### Hook-first video directives profile (Phase B; standardized onto Meta 2026-08-18; reverted to an opt-in 2026-08-20)
 
 `services/veoPromptBuilder.js` — the **`hook_first`** profile (`HOOK_FIRST_DIRECTIVES`),
 same key shape as `OMNI_DIRECTIVES`, selected from the destination passed to
 `buildVeoPrompt` (absent → the frozen `gemini-omni`/`grok` path **exactly**).
 Kill switch **`VIDEO_HOOK_FIRST_PROMPT`**, legacy alias **`PMAX_VIDEO_DIRECTIVES`**
-(default **true**; see the switch semantics below).
+— the switch's own CODE fallback (both names unset) is still **true**; the
+`config/defaults.env` FILE default is **false** as of the owner's 2026-08-20
+revert (see the switch semantics below and CLAUDE.md §00). A fresh production
+boot with no Render dashboard override therefore runs the OFF arm — both
+platforms on the frozen `gemini-omni`/`OMNI_DIRECTIVES` prompt — and the
+`hook_first` profile described in this section is now reached only by an
+explicit `true` on either name.
 
 ⚠️ **This profile shipped as PMax-only and is no longer PMax-only.** Owner
 2026-08-18, verbatim: *"I want to use the PMax prompt for Meta also, and
@@ -1144,12 +1150,20 @@ out of git, byte-identity on the destination-less path) still passes.
 
 ##### What the 2026-08-18 standardization changed, and what it did not
 
+⚠️ **The switch's shipped default flipped back to OFF on 2026-08-20 — owner
+revert, verbatim: *"I want to go back to the prompt I was using before we
+standardized on the pmax prompt but stretch it to 10s. Also, I want to use
+this same prompt for PMax for now also."* Nothing in the table below is
+wrong — it describes the switch's two ARMS, which are both still exactly as
+built. Only which arm `config/defaults.env` ships changed** (see CLAUDE.md
+§00 for the full history and the money consequence for mixed Meta+PMax runs).
+
 | | Status |
 |---|---|
 | `OMNI_DIRECTIVES` / `GROK_DIRECTIVES` **text** | **Frozen.** Still `134db56~1`. |
-| Meta prompt, switch **OFF** | **Byte-identical** to `134db56~1` — the surviving PR #61 rollback guarantee (**B15**). |
+| Meta prompt, switch **OFF** | **Byte-identical** to `134db56~1` — the surviving PR #61 rollback guarantee (**B15**). **Shipped default for BOTH platforms as of 2026-08-20.** |
 | Destination-less prompt, either arm | **Byte-identical** (**B14**). |
-| Meta destination, switch **ON** | **Changed by owner instruction** → `hook_first` (**B16**, **B17**). |
+| Meta (or PMax) destination, switch **ON** | `hook_first` (**B16**, **B17**) — the 2026-08-18 standardization; still fully built and tested, now an explicit opt-in rather than the default. |
 
 The delta a Meta 9:16 ad receives is exactly five edits: the HOOK-FIRST
 sentence appended to `objective`; Scene 1's "slow horizontal pan left→right,
@@ -1165,14 +1179,21 @@ against Omni's 20,000-byte cap. Worst realistic Meta prompt measured (lifestyle
 title at 15s) is **8,990 bytes** — 11 KB of headroom.
 
 **Kill-switch semantics — `VIDEO_HOOK_FIRST_PROMPT`, legacy alias
-`PMAX_VIDEO_DIRECTIVES`, default true. EITHER name reading `false` disables.**
+`PMAX_VIDEO_DIRECTIVES`. EITHER name reading `false` disables.**
 That fail-safe OR is deliberate: `config/defaults.env` is loaded by dotenv
 **without override**, so a "new name wins" precedence rule would silently
 shadow a Render dashboard override of the legacy name as soon as the new name
-carried a value in that file. Pinned by `verifyPmaxPromptOverlay` **V2b**,
-including the exact production shape (new `true` from defaults.env + dashboard
-legacy `false` must still kill). Flipping it off restores **both** platforms.
-Other services must gate on the exported **`isHookFirstVideoPromptEnabled()`** —
+carried a value in that file. **Two defaults, kept distinct:** the CODE
+fallback (both names unset) is still `true` — pinned by `verifyPmaxPromptOverlay`
+**V2b** ("both names unset ⇒ ON by default"); the `config/defaults.env` FILE
+default is `false`/`false` as of the 2026-08-20 owner revert — pinned by the
+same file's **V2c**, which reads the real committed file text. `verifyPmaxPromptOverlay`
+**V2b** also still proves the fail-safe OR itself holds for any combination of
+the two names (e.g. one `true` + one `false` still kills), independent of
+whichever combination is currently committed. Flipping either name to `true`
+restores **both** platforms to `hook_first`; the current shipped `false`/`false`
+restores **both** platforms to the frozen pre-#61 text. Other services must
+gate on the exported **`isHookFirstVideoPromptEnabled()`** —
 not on an inline `process.env` read (the two-name OR is not reproducible by
 `process.env.X !== 'false'`), and not on the two profiles merely *matching*,
 because with the switch off they also match, on the frozen Ken Burns pan.
@@ -1528,8 +1549,8 @@ Non-Cloudinary sources can't be transformed by URL, so they pad locally via `pad
 | `VEO_ADS_PER_PRODUCT_CAP` | `1` | Cap on **concept** video variants only (not deterministic) |
 | `DERIVE_MASTER_WAIT_MS` | `720000` (12 min) | In-render wait ceiling for the derive-only path to see the master's plate (`routes/ads.js`). Do **not** "fix" by SKIPPING the wait — see [Google PMax video](#google-performance-max-video-phase-a-2026-08-10). When the wait itself expires the ad is never abandoned (2026-08-20) — it requeues and auto-reclaims via `handleDeriveMasterBackup`, same section |
 | `DERIVE_MASTER_POLL_MS` | `10000` (10s) | Poll interval while waiting for the master plate |
-| `VIDEO_HOOK_FIRST_PROMPT` | **`true`** | **BOTH Meta and PMax** video destinations use `HOOK_FIRST_DIRECTIVES` in `veoPromptBuilder` (hook-first, centre-safe, aspect-aware Frame). Owner standardization 2026-08-18. `false` → frozen Omni/Grok profile for both; Meta returns to the pre-#61 text **byte-for-byte**. Gate other code on `isHookFirstVideoPromptEnabled()` |
-| `PMAX_VIDEO_DIRECTIVES` | **`true`** | **Legacy alias** for the row above (the Phase B name; may be set on the Render dashboard). **Either name reading `false` disables** — fail-safe OR, not precedence, because dotenv loads `defaults.env` without override. Pinned by `verifyPmaxPromptOverlay` V2b |
+| `VIDEO_HOOK_FIRST_PROMPT` | **`false`** (file default since the 2026-08-20 owner revert; code fallback if unset is still `true`) | `true` → **BOTH Meta and PMax** video destinations use `HOOK_FIRST_DIRECTIVES` in `veoPromptBuilder` (hook-first, centre-safe, aspect-aware Frame) — the 2026-08-18 standardization, now opt-in. `false` (shipped) → frozen Omni/Grok profile for both; Meta returns to the pre-#61 text **byte-for-byte**, PMax now shares it too. Gate other code on `isHookFirstVideoPromptEnabled()` |
+| `PMAX_VIDEO_DIRECTIVES` | **`false`** (same 2026-08-20 default) | **Legacy alias** for the row above (the Phase B name; may be set on the Render dashboard). **Either name reading `false` disables** — fail-safe OR, not precedence, because dotenv loads `defaults.env` without override. Pinned by `verifyPmaxPromptOverlay` V2b (OR logic) / V2c (this file's committed value) |
 | `PMAX_PROOF_STRONG_RATING` | `4.5` | Phase B: interpolated into the PMax-only Director hierarchy (RATING-FIRST vs POPULARITY). Meta never sees it |
 | `PMAX_PROOF_MIN_REVIEW_COUNT` | `100` | Phase B: interpolated "substantial count" floor for the PMax hierarchy. Below this, omit the count |
 | `VEO_USE_GPT_STORYBOARD` | `true` | Storyboard on paths that still use it (not Atlas Ken Burns) |
@@ -1660,7 +1681,7 @@ Versioned with the repo. Feature flags, tuning knobs, public IDs/URLs, Slack cha
 | Director seed window | `DIRECTOR_UNIVERSE_TOP_N=1` |
 | Static regenerate reseed | `REGEN_RESEED_CATALOG_FIRST=true` (default ON; kill switch for catalog-first reseed on regenerate — see §5) |
 | Static direct-image path | `AI_DIRECT_IMAGE_*` (edit model / quality / timeout). `AI_IMAGE_REFERENCE_*` kept **inert** (no live consumer) |
-| PMax Phase B creative knobs | `PMAX_STATIC_PLATFORM_NOTES=true`, `VIDEO_HOOK_FIRST_PROMPT=true` (legacy alias `PMAX_VIDEO_DIRECTIVES=true`), `PMAX_PROOF_STRONG_RATING=4.5`, `PMAX_PROOF_MIN_REVIEW_COUNT=100` (prompt text only — not money knobs). ⚠️ The Meta-byte-identity claim now holds for the **static** flag and for the **OFF arm** of the video flag only: owner 2026-08-18 standardized the Meta **video** camera prompt onto the hook-first profile |
+| PMax Phase B creative knobs | `PMAX_STATIC_PLATFORM_NOTES=true`, `VIDEO_HOOK_FIRST_PROMPT=false` (legacy alias `PMAX_VIDEO_DIRECTIVES=false` — flipped from `true` by the 2026-08-20 owner revert, CLAUDE.md §00), `PMAX_PROOF_STRONG_RATING=4.5`, `PMAX_PROOF_MIN_REVIEW_COUNT=100` (prompt text only — not money knobs). ⚠️ The Meta-byte-identity claim now holds for the **static** flag always, and for the video flag's shipped **OFF arm** — which, as of 2026-08-20, means BOTH Meta and PMax **video** default to the frozen camera prompt; the 2026-08-18 hook-first standardization is preserved as the explicit opt-in (`=true`) |
 | Video (Omni under `veo*` names) | `AI_VEO_FEED`, `AI_VEO_REELS`, `AI_VIDEO_POSTER_ENABLED`, `VIDEO_PROVIDER`, `VEO_USE_GPT_STORYBOARD`, `ATLAS_*`, `VEO_CONCURRENCY=4`, `REPEAT_PRIMARY_REFERENCE=false` |
 | Concurrency | `WORKER_CONCURRENCY`, `RENDER_CONCURRENCY=8` (**live since 2026-08-03** — see above), `VEO_CONCURRENCY=4`, `ATLAS_SUBMIT_SPACING_MS`, `GROK_MAX_RPS`, `MAX_CREATIVES_PER_RUN` — resolved via `services/concurrency.js` |
 | Slack alert channels (non-secret) | `SLACK_ALERT_CHANNEL`, `SLACK_ALERT_CHANNEL_FATAL`, `SLACK_ALERT_CHANNEL_STATUS` (per-run live feed via `runFeedService`) |

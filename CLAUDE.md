@@ -151,12 +151,16 @@ video titling (`docs/PIPELINES.md` §6). `meta_video` / `meta_all` use
 **Current objective: tune the canonical prompt.** Archetype-driven video is
 **deferred, not missing.**
 
-⚠️ **SUPERSEDED IN PART, 2026-08-18 — which prompt Meta gets.** The block above
-still describes the camera-only architecture correctly, but "the canonical
-camera-only prompt" is no longer the `gemini-omni` text for Meta. Meta video
-now selects the **`hook_first`** profile — the same one PMax uses. See the
-standardization note at the end of the PR #61 block below. The `gemini-omni`
-text itself is unchanged and still frozen.
+⚠️ **SUPERSEDED 2026-08-18, then REVERTED 2026-08-20 — which prompt Meta (and
+now PMax) gets.** The block above describes the camera-only architecture
+correctly and, as of 2026-08-20, describes the LIVE default again: "the
+canonical camera-only prompt" (`gemini-omni` / `OMNI_DIRECTIVES`) is once more
+what BOTH Meta and PMax destinations receive by default. Between 2026-08-18
+and 2026-08-20, Meta selected the **`hook_first`** profile instead (the same
+one PMax used) — that standardization still exists as a fully-tested opt-in
+(flip the kill switch back to `true`), it is just no longer the shipped
+default. See the standardization note at the end of the PR #61 block below.
+The `gemini-omni` text itself is unchanged and still frozen throughout.
 
 **FULL PR #61 camera-prompt ROLLBACK (owner 2026-08-03, commit `be5b83f`):**
 Commit `134db56` added three camera-prompt changes in
@@ -179,20 +183,54 @@ short dissolve. Owner-confirmed: that contradictory prompt is the version that
 produced better output. **Anyone "fixing" the contradiction is reintroducing
 the regression.** Do not soften, split, or reword either string to resolve it.
 
-**OWNER-DIRECTED STANDARDIZATION ON TOP OF THAT ROLLBACK (owner 2026-08-18).**
+**OWNER-DIRECTED STANDARDIZATION ON TOP OF THAT ROLLBACK (owner 2026-08-18,
+REVERTED BY OWNER 2026-08-20 — read the box below first).**
 Verbatim: *"I want to use the PMax prompt for Meta also, and standardize on
 that but maintain a single minting for 9x16 across both formats. Continue to
-mint a 16x9."* This deliberately breaks the byte-identity pin **on the live
+mint a 16x9."* This deliberately broke the byte-identity pin **on the live
 Meta path only**. Read the split below before touching anything here — the
 whole point of this paragraph is that a future session can tell what was
 directed from what would be drift.
 
+⚠️ **REVERTED, 2026-08-20 — read this before the table.** Owner, verbatim:
+*"we want to revert the change i made to the prompt being used for Meta
+videos. I want to go back to the prompt I was using before we standardized on
+the pmax prompt but stretch it to 10s. Also, I want to use this same prompt
+for PMax for now also."* Mechanism: **the switch itself is unchanged** — the
+revert is a one-line-per-name flip of the SHIPPED DEFAULT, not new code.
+`config/defaults.env` now ships `VIDEO_HOOK_FIRST_PROMPT=false` and
+`PMAX_VIDEO_DIRECTIVES=false` (was `true`/`true`); the code's own fallback
+(`isHookFirstVideoPromptEnabled()`'s `return true` when both names are unset)
+is deliberately untouched, so the switch can still be flipped back to `true`
+with no code change if this is revisited again. On a fresh boot (no Render
+dashboard override of either name) **both Meta and PMax now default to the
+frozen `gemini-omni`/`OMNI_DIRECTIVES` camera prompt** — the same text the OFF
+arm always produced (B15 below), now the shipped state for PMax too. The
+"stretch to 10s" half of the ask needed **no prompt-text change at all**: the
+Timeline/Scene/Output sentences in `buildVeoPrompt` interpolate `durationSec`
+(`t1 = dur/3`, `t2 = dur*0.64`) rather than hardcoding seconds, and Meta/PMax
+were already both flooring to `durationSec=10` before this change (the
+duration bullet in §2, unrelated axis) — so the frozen prompt already reads
+"Timeline (10.0s): Scene 1 (0.0–3.33s) … Scene 3 (6.40–10.0s)" once it is
+selected. Verified live (no generation): `promptProfileFor` returns
+`gemini-omni` for both `meta_stories_9_16` and `pmax_video_9_16` after loading
+the real `config/defaults.env`, and their built prompts are byte-identical to
+each other and to the `134db56~1` baseline at `durationSec=10`.
+**One real cost consequence, not a bug:** the mixed-run shared-9:16-master
+saving below (§2, "MIXED Meta+PMax") requires this switch ON as its 4th
+conjunct — with it OFF by default, a mixed Meta+PMax run fails that conjunct
+closed and bills **3 masters / $2.70 again**, not 2 / $1.80. Pinned (both
+arms) by `verifySharedPortraitMaster` F1/F6/C1 — nothing there changed; only
+which arm is the boot default did. Flip either switch name back to `true` to
+restore the 2026-08-18 hook-first standardization (both platforms, and the
+$1.80 shared-master saving) with no code change.
+
 | | Status |
 |---|---|
 | `OMNI_DIRECTIVES` / `GROK_DIRECTIVES` **text** | **STILL FROZEN**, still `134db56~1`. Never reword. B1–B13 absence pins unchanged. |
-| Meta prompt with the switch **OFF** | **STILL byte-identical** to `134db56~1`. This is where the rollback guarantee now lives — B15. |
+| Meta prompt with the switch **OFF** | **STILL byte-identical** to `134db56~1`. This is where the rollback guarantee now lives — B15. **This is now the shipped default for BOTH platforms (2026-08-20).** |
 | Destination-less prompt (scaffold, `aiVideoReferenceService`), either arm | **STILL byte-identical** — B14. |
-| Which profile a **Meta destination** selects with the switch **ON** | **CHANGED, by owner instruction** → `hook_first` (B16/B17). |
+| Which profile a **Meta or PMax destination** selects with the switch **ON** (opt-in, not default) | `hook_first` (B16/B17) — the 2026-08-18 standardization, still fully supported and tested, just no longer the boot default. |
 
 Mechanism: the profile formerly called `pmax` is renamed **`hook_first`**
 (`PMAX_DIRECTIVES` → `HOOK_FIRST_DIRECTIVES`; both old names still exported as
@@ -207,15 +245,23 @@ line Meta never emitted before. **B16 reconstructs that exact delta from the
 fails loudly with a diff. **B17** pins that Meta 9:16 and PMax 9:16 emit one
 identical prompt — that equality is what lets one 9:16 plate serve both.
 
-**Kill switch — `VIDEO_HOOK_FIRST_PROMPT`, legacy alias `PMAX_VIDEO_DIRECTIVES`,
-default true. EITHER name reading `false` disables**, and that fail-safe OR is
-deliberate, not sloppiness: `config/defaults.env` is loaded by dotenv **without
+**Kill switch — `VIDEO_HOOK_FIRST_PROMPT`, legacy alias `PMAX_VIDEO_DIRECTIVES`.
+EITHER name reading `false` disables**, and that fail-safe OR is deliberate,
+not sloppiness: `config/defaults.env` is loaded by dotenv **without
 override**, so a "new name wins" precedence rule would silently shadow a Render
 dashboard override of the legacy name the moment the new name got a value in
-that file. Pinned by `verifyPmaxPromptOverlay` V2b (including the exact
-defaults.env shape: new=`true` + dashboard legacy=`false` must still kill).
-Flipping it off restores **both** platforms — Meta to the frozen pre-#61 text
-byte-for-byte, PMax to Phase A. Other services must gate on the exported
+that file. **Two different defaults — do not conflate them.** The CODE's own
+fallback (`isHookFirstVideoPromptEnabled()`, both names unset) is still `true`
+— unchanged, and pinned by `verifyPmaxPromptOverlay` V2b "both names unset ⇒
+ON by default". The FILE default in `config/defaults.env` is `false`/`false`
+as of the 2026-08-20 revert above — pinned by the same file's V2c, which reads
+the real committed file text (same pattern as `verifyPostPilotBatch` C14 for
+`REPEAT_PRIMARY_REFERENCE`). On a real boot, dotenv loads the file, so the
+FILE default is what runs absent a Render dashboard override. Flipping either
+name to `true` restores **both** platforms to `hook_first` — Meta to the
+2026-08-18 standardization, PMax likewise. Flipping to `false` (the current
+shipped state) restores **both** platforms to the frozen pre-#61 text
+byte-for-byte. Other services must gate on the exported
 **`isHookFirstVideoPromptEnabled()`**, never on an inline `process.env` read
 (the two-name OR is not reproducible by `process.env.X !== 'false'`), and never
 on the two profiles merely *matching* — with the switch off they also match, on
@@ -558,13 +604,17 @@ Video never launches a browser.
   2026-08-18) — the wizard's posted `8` no longer wins; see the duration
   bullet below. **On a mixed Meta+PMax run this same master also serves
   PMax's portrait surfaces** — see the shared-portrait bullet below.
-- **Video (MIXED Meta+PMax): ONE shared 9:16 master, not two. TWO billable
-  Omni masters per product, not three — $1.80, was $2.70 (owner directive
-  2026-08-18).** ⚠️ **CONDITIONAL, and the condition is not cosmetic** — the
-  share only happens when all five conjuncts below hold, and the load-bearing
-  one is that the hook-first camera standardization is ON. With it off a mixed
-  run still bills **3 / $2.70**, by design. Do not quote $1.80 as the
-  unconditional present-tense cost without checking
+- **Video (MIXED Meta+PMax): ONE shared 9:16 master, not two, WHEN the
+  hook-first switch is ON. TWO billable Omni masters per product then, not
+  three — $1.80, was $2.70 (owner directive 2026-08-18).** ⚠️ **CONDITIONAL,
+  and the condition is not cosmetic** — the share only happens when all five
+  conjuncts below hold, and the load-bearing one is that the hook-first camera
+  standardization is ON. With it off a mixed run still bills **3 / $2.70**, by
+  design. **As of the 2026-08-20 owner revert (§00), OFF is the shipped
+  `config/defaults.env` default** — so a mixed run bills **3 / $2.70 today**,
+  not 2 / $1.80, absent an explicit re-enable of `VIDEO_HOOK_FIRST_PROMPT` /
+  `PMAX_VIDEO_DIRECTIVES`. Do not quote $1.80 as the unconditional
+  present-tense cost without checking
   `isHookFirstVideoPromptEnabled()`. A mixed run measured 21 video Ads / 3 distinct
   `veoPredictionId`s. Two of those three were the same portrait plate at
   byte-identical `deliveryDims` (`meta_stories_9_16` and `pmax_video_9_16`

@@ -63,6 +63,20 @@
  */
 
 const assert = require('assert');
+
+// This file pins HOOK_FIRST_DIRECTIVES split behaviour (16:9 PMax) — it needs
+// the hook-first profile ON to reach PMAX_DIRECTIVES/HOOK_FIRST_DIRECTIVES at
+// all. Force it explicitly rather than relying on the ambient/code default:
+// config/defaults.env now ships BOTH switch names as "false" (owner revert
+// 2026-08-20, CLAUDE.md §00), and while this isolated `node` process never
+// loads that file, pinning the arm here keeps the file's own assertions
+// (TODAY_PAN / the 9:16 push-in) correct regardless of what the surrounding
+// process environment happens to carry. isHookFirstVideoPromptEnabled() is
+// read at CALL time, not require time, so setting this before requiring is
+// not required, but is done here for clarity.
+process.env.PMAX_VIDEO_DIRECTIVES = 'true';
+process.env.VIDEO_HOOK_FIRST_PROMPT = 'true';
+
 const { buildVeoPrompt, OMNI_DIRECTIVES, PMAX_DIRECTIVES, LIFESTYLE_DIRECTIVES } =
   require('../services/veoPromptBuilder');
 
