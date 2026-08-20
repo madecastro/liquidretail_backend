@@ -88,15 +88,24 @@ check('A defaults.env MAX_CREATIVES_PER_RUN is 1000 (effectively uncapped, owner
 // protecting — moved behind VEO_TITLING_CONCURRENCY and is deliberately still 4.
 // Kept <= MAX_CREATIVES_PER_RUN unlike RENDER_CONCURRENCY: going non-binding
 // here is a separate, measured decision. See scripts/verifyTitlingPermit.js.
-check('A defaults.env VEO_CONCURRENCY is 12', fromDefaults.VEO_CONCURRENCY, 12);
+// 12 -> 24 on 2026-08-20, owner-approved: still submit+poll only, no Omni 429
+// ever recorded, Grok paced independently via pacedModelSubmit/GROK_MAX_RPS —
+// see config/defaults.env and services/concurrency.js for the full rationale.
+check('A defaults.env VEO_CONCURRENCY is 24', fromDefaults.VEO_CONCURRENCY, 24);
 // Re-pointed 2026-08-13, not relaxed. VEO_TITLING_CONCURRENCY never bounded
 // Remotion renders — remotionRenderService ran a concurrency-1 promise chain, so
 // exactly one render happened whatever this said. The permit is now wide (48) and
 // bounds only cheap prep; REMOTION_QUEUE_CONCURRENCY is the memory guard, so the
 // safety assertion follows it.
 check('A defaults.env VEO_TITLING_CONCURRENCY is 48', fromDefaults.VEO_TITLING_CONCURRENCY, 48);
-check('A defaults.env REMOTION_QUEUE_CONCURRENCY is 4 (the real memory guard)',
-  fromDefaults.REMOTION_QUEUE_CONCURRENCY, 4);
+// 4 -> 8 on 2026-08-20, owner-approved, moved together with VEO_CONCURRENCY
+// above (raising one without the other makes titling a harder bottleneck).
+// One doubling, not the 16 originally floated — 4 was never an RSS
+// measurement and the failure mode strands an already-paid Omni master;
+// 8 needs validation against the web-service memory graph before any
+// further raise. See config/defaults.env and services/concurrency.js.
+check('A defaults.env REMOTION_QUEUE_CONCURRENCY is 8 (the real memory guard)',
+  fromDefaults.REMOTION_QUEUE_CONCURRENCY, 8);
 check('A the memory-bound render pool is the narrowest video knob',
   fromDefaults.REMOTION_QUEUE_CONCURRENCY <= fromDefaults.VEO_CONCURRENCY
   && fromDefaults.REMOTION_QUEUE_CONCURRENCY <= fromDefaults.VEO_TITLING_CONCURRENCY, true);

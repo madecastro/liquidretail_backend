@@ -32,11 +32,11 @@ const SPEC = Object.freeze({
   },
   VEO_CONCURRENCY: {
     env: 'VEO_CONCURRENCY',
-    default: 12,
+    default: 24,
     min: 1,
     max: 32,
     ceiling: 'SELF-IMPOSED',
-    why: 'In-flight video ads per campaign run — now the SUBMIT+POLL half only. Raised 1→4 (2026-08-02) as a probe; 4→12 (2026-08-05) once titling moved behind its own permit (VEO_TITLING_CONCURRENCY). The 4 was never really about Omni: this lane also ran Remotion renderMedia (headless Chrome + ffmpeg, 1080p) IN-PROCESS, so the number was pinned to what local RAM/CPU could take, while being documented against Omni RPS. Splitting them lets the idle half (an Omni poll is ~2min of waiting; measured p50 117s / p99 247s) run wide without touching the memory-bound half. Omni RPS remains unpublished and no Omni 429 has ever been recorded; submit RATE is still governed by pacedModelSubmit + ATLAS_SUBMIT_SPACING_MS, and Grok stays <=1 RPS via GROK_MAX_RPS regardless of this value. 12 bounds in-flight video submits/polls per run — a wave size under the effectively-uncapped claim.'
+    why: 'In-flight video ads per campaign run — now the SUBMIT+POLL half only. Raised 1→4 (2026-08-02) as a probe; 4→12 (2026-08-05) once titling moved behind its own permit (VEO_TITLING_CONCURRENCY). The 4 was never really about Omni: this lane also ran Remotion renderMedia (headless Chrome + ffmpeg, 1080p) IN-PROCESS, so the number was pinned to what local RAM/CPU could take, while being documented against Omni RPS. Splitting them lets the idle half (an Omni poll is ~2min of waiting; measured p50 117s / p99 247s) run wide without touching the memory-bound half. Omni RPS remains unpublished and no Omni 429 has ever been recorded; submit RATE is still governed by pacedModelSubmit + ATLAS_SUBMIT_SPACING_MS, and Grok stays <=1 RPS via GROK_MAX_RPS regardless of this value. 12 bounds in-flight video submits/polls per run — a wave size under the effectively-uncapped claim. RAISED 12→24 on 2026-08-20 (owner-approved): still submit+poll only, no Omni 429 ever recorded, Grok paced independently, so low-risk. Moved together with REMOTION_QUEUE_CONCURRENCY 4→8 — raising this alone would only make titling a harder bottleneck (masters queue longer for a titling slot).'
   },
   VEO_TITLING_CONCURRENCY: {
     env: 'VEO_TITLING_CONCURRENCY',
@@ -49,11 +49,11 @@ const SPEC = Object.freeze({
 
   REMOTION_QUEUE_CONCURRENCY: {
     env: 'REMOTION_QUEUE_CONCURRENCY',
-    default: 4,
+    default: 8,
     min: 1,
     max: 16,
     ceiling: 'SELF-IMPOSED',
-    why: 'Simultaneous Remotion renders — headless Chrome page + ffmpeg 1080p encode, IN the web process. This is the real titling limit and inherits the caution the old VEO_TITLING_CONCURRENCY note carried: the failure mode is not a provider 429, it is RSS exhaustion -> Render autoscale (60% CPU+mem) -> process replacement -> a paid Omni master stranded mid-titling (~$1.00 each). Default 4 is a 4x throughput win over the serial chain it replaces (926s tail -> ~230s projected) and is NOT arbitrary: 4 is the value the combined VEO_CONCURRENCY carried when it ran submit+poll AND Remotion in one lane, so it is the only concurrency this process has actually survived. It is still not an RSS MEASUREMENT. Raise one step at a time against the web service memory graph across a full run; 1080p is 2.25x the pixels of 720p and one measured render is 76.2s.'
+    why: 'Simultaneous Remotion renders — headless Chrome page + ffmpeg 1080p encode, IN the web process. This is the real titling limit and inherits the caution the old VEO_TITLING_CONCURRENCY note carried: the failure mode is not a provider 429, it is RSS exhaustion -> Render autoscale (60% CPU+mem) -> process replacement -> a paid Omni master stranded mid-titling (~$1.00 each). Default 4 was a 4x throughput win over the serial chain it replaces (926s tail -> ~230s projected) and was NOT arbitrary: 4 was the value the combined VEO_CONCURRENCY carried when it ran submit+poll AND Remotion in one lane, so it was the only concurrency this process had actually survived. RAISED 4→8 on 2026-08-20 (owner-approved), one doubling rather than the 16 originally floated, specifically because 4 was never an RSS measurement and the failure mode strands an already-paid master. Moved together with VEO_CONCURRENCY 12→24 — leaving this at 4 would have made titling a strictly harder bottleneck. 8 must be validated against the web service memory graph on a full run before any further raise; 1080p is 2.25x the pixels of 720p and one measured render is 76.2s.'
   },
   MAX_CREATIVES_PER_RUN: {
     env: 'MAX_CREATIVES_PER_RUN',
