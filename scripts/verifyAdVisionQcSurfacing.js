@@ -107,6 +107,72 @@ function check(label, fn) {
   catch (err) { failures.push(`${label}: ${err.message}`); }
 }
 
+// Brace-balanced extraction of the object literal argument to the NEAREST
+// `Ad.countDocuments({` call that precedes `anchorText` in `src`. Added
+// 2026-08-19 alongside the shippedWithoutQc status-scoping fix: the older
+// C-section checks below used a `[^}]*` regex between `Ad.countDocuments({`
+// and their target key, which silently assumed the call's object literal
+// contained no nested `{...}` of its own. The moment `status: { $in:
+// AD_STATUSES }` was added to that same call, the nested `}` broke every
+// `[^}]*` scan — the exact "regex over source text" trap CLAUDE.md §5
+// warns about, just inside a test file instead of a money guard. This walks
+// real brace depth instead, so it survives further nested clauses.
+// Strip `//`-to-end-of-line comments first — a naive indexOf/anchor search
+// over raw source can find its own explanatory comment (this file's header
+// literally quotes `'visionQc.skipped': true` while explaining the fix,
+// which sits BEFORE the real query in the handler and would otherwise win
+// every `indexOf`). Good enough for this narrow, controlled slice; not a
+// general JS parser, and there are no `/regex/` literals in this handler to
+// desync a bare `//`-comment strip.
+function stripLineComments(src) {
+  return src.replace(/\/\/[^\n]*/g, '');
+}
+
+function countDocumentsCallAt(rawSrc, anchorText) {
+  const src = stripLineComments(rawSrc);
+  const anchorIdx = src.indexOf(anchorText);
+  if (anchorIdx === -1) return null;
+  const callStart = src.lastIndexOf('Ad.countDocuments(', anchorIdx);
+  if (callStart === -1) return null;
+  const open = src.indexOf('{', callStart);
+  if (open === -1) return null;
+  let depth = 0;
+  for (let i = open; i < src.length; i++) {
+    const c = src[i];
+    if (c === '{') depth++;
+    else if (c === '}') {
+      depth--;
+      if (depth === 0) return src.slice(callStart, i + 1);
+    }
+  }
+  return null;
+}
+
+// Every `Ad.countDocuments({...})` call in `src`, each sliced by real brace
+// balance (not a single-shot search from one anchor) — used where a check
+// needs to find "the one call matching several conditions together" rather
+// than being handed a single known anchor string.
+function allCountDocumentsCalls(rawSrc) {
+  const src = stripLineComments(rawSrc);
+  const calls = [];
+  const callRe = /Ad\.countDocuments\(/g;
+  let m;
+  while ((m = callRe.exec(src))) {
+    const open = src.indexOf('{', m.index);
+    if (open === -1) continue;
+    let depth = 0;
+    for (let i = open; i < src.length; i++) {
+      const c = src[i];
+      if (c === '{') depth++;
+      else if (c === '}') {
+        depth--;
+        if (depth === 0) { calls.push(src.slice(m.index, i + 1)); break; }
+      }
+    }
+  }
+  return calls;
+}
+
 (async () => {
 
 // ── A. summarizeVisionQc (pure) ─────────────────────────────────────────
@@ -337,40 +403,60 @@ function sliceFrom(marker) {
   return adsSrc.slice(start, next ? next.index : adsSrc.length);
 }
 
-check('C1 GET /runs/:runId actually returns visionQcRollup.{shippedWithoutQc,qcFailed,qcdOnRetry} in its res.json object', () => {
+check('C1 GET /runs/:runId actually returns visionQcRollup.{shippedWithoutQc,qcDisabled,qcUnavailable,qcFailed,qcdOnRetry} in its res.json object', () => {
   const handler = sliceFrom("router.get('/runs/:runId'");
   assert.ok(handler, 'could not locate the GET /runs/:runId handler to scope this check');
-  const rjStart = handler.indexOf('res.json({');
-  assert.ok(rjStart !== -1, 'no res.json({ call found in the handler');
-  const rjEnd = handler.indexOf('});', rjStart);
-  assert.ok(rjEnd !== -1, 'res.json({ call never closed within the scoped window');
-  const responseObj = handler.slice(rjStart, rjEnd);
-  assert.match(responseObj, /visionQcRollup\s*:/, 'GET /runs/:runId response object is missing "visionQcRollup"');
-  assert.match(responseObj, /shippedWithoutQc/, 'visionQcRollup must carry shippedWithoutQc');
-  assert.match(responseObj, /qcFailed/, 'visionQcRollup must carry qcFailed — the "inspected and flagged" state');
-  assert.match(responseObj, /qcdOnRetry/, 'visionQcRollup must carry qcdOnRetry');
+  // Brace-balanced slice of the visionQcRollup OBJECT LITERAL itself, on
+  // COMMENT-STRIPPED text — the naive prior version slices from `res.json({`
+  // to the next literal `});`, a window that also contains this endpoint's
+  // several paragraphs of explanatory comments (which, deliberately, name
+  // every one of these keys) — so removing an actual key from the object
+  // while its describing comment survives nearby would still "pass". A key
+  // must appear as `\bKEY\s*:` inside the ACTUAL object literal, post
+  // comment-strip, to count.
+  const stripped = stripLineComments(handler);
+  const anchorIdx = stripped.indexOf('visionQcRollup:');
+  assert.ok(anchorIdx !== -1, 'GET /runs/:runId response object is missing "visionQcRollup"');
+  const open = stripped.indexOf('{', anchorIdx);
+  assert.ok(open !== -1, 'visionQcRollup: has no object literal following it');
+  let depth = 0, closeIdx = -1;
+  for (let i = open; i < stripped.length; i++) {
+    if (stripped[i] === '{') depth++;
+    else if (stripped[i] === '}') { depth--; if (depth === 0) { closeIdx = i; break; } }
+  }
+  assert.ok(closeIdx !== -1, 'visionQcRollup: { ... } object literal never closed');
+  const rollupObj = stripped.slice(open, closeIdx + 1);
+  for (const key of ['shippedWithoutQc', 'qcFailed', 'qcdOnRetry', 'qcDisabled', 'qcUnavailable']) {
+    assert.match(rollupObj, new RegExp(`\\b${key}\\s*:`),
+      `visionQcRollup object literal is missing the "${key}" key (found only in a comment, or not at all)`);
+  }
 });
 
 check('C2 the rollup is actually QUERIED (Ad.countDocuments against visionQc.* filters), not just named in the response', () => {
   const handler = sliceFrom("router.get('/runs/:runId'");
   assert.ok(handler);
-  assert.match(handler, /Ad\.countDocuments\(\{[^}]*'visionQc\.skipped':\s*true/,
+  assert.match(handler, /Ad\.countDocuments\(\{[\s\S]*?'visionQc\.skipped':\s*true/,
     'must query the shipped-without-QC count against visionQc.skipped, not fabricate the number');
-  assert.match(handler, /Ad\.countDocuments\(\{[^}]*'visionQc\.disabled':\s*false[^}]*'visionQc\.passed':\s*false/,
+  assert.match(handler, /Ad\.countDocuments\(\{[\s\S]*?'visionQc\.disabled':\s*false[\s\S]*?'visionQc\.passed':\s*false/,
     'must query the qcFailed count against an actually-inspected, failed verdict, not fabricate the number');
-  assert.match(handler, /Ad\.countDocuments\(\{[^}]*'visionQc\.finalAttempt':\s*\{\s*\$gt:\s*1/,
-    'must query the QC\'d-on-retry count against visionQc.finalAttempt > 1, not fabricate the number');
+  assert.match(handler, /Ad\.countDocuments\(\{[\s\S]*?'visionQc\.finalAttempt':\s*\{\s*\$gt:\s*1[\s\S]*?'visionQc\.passed':\s*true/,
+    'must query the QC\'d-on-retry count against visionQc.finalAttempt > 1 AND passed:true, not fabricate the number');
 });
 
 check('C3 the rollup queries are scoped to THIS run (campaignRunIds), not the whole brand/campaign', () => {
   const handler = sliceFrom("router.get('/runs/:runId'");
   assert.ok(handler);
-  const rollupBlock = handler.slice(
-    handler.search(/Ad\.countDocuments\(\{[^}]*'visionQc\.skipped'/),
-    handler.search(/Ad\.countDocuments\(\{[^}]*'visionQc\.finalAttempt'/) + 200
-  );
-  assert.match(rollupBlock, /campaignRunIds:\s*run\.runId/,
-    'an unscoped count would leak every other run\'s QC outcomes into this run\'s rollup');
+  for (const anchor of [
+    `'visionQc.skipped': true`,
+    `'visionQc.disabled': false`,
+    `'visionQc.finalAttempt'`,
+    `'visionQc.disabled': true`
+  ]) {
+    const call = countDocumentsCallAt(handler, anchor);
+    assert.ok(call, `could not locate the brace-balanced Ad.countDocuments call containing ${anchor}`);
+    assert.match(call, /campaignRunIds:\s*run\.runId/,
+      `an unscoped count (anchor: ${anchor}) would leak every other run's QC outcomes into this run's rollup`);
+  }
 });
 
 check('C4 routes/ads.js requires summarizeVisionQc from adVisionQcService (single shared formatter, not a re-derivation)', () => {
@@ -381,40 +467,82 @@ check('C4 routes/ads.js requires summarizeVisionQc from adVisionQcService (singl
 check('C5 shippedWithoutQc ALSO counts a bare absent/null visionQc field, not just skipped:true — the production regression', () => {
   const handler = sliceFrom("router.get('/runs/:runId'");
   assert.ok(handler);
-  const skippedQueryStart = handler.search(/Ad\.countDocuments\(\{[^]*?'visionQc\.skipped':\s*true/);
-  assert.ok(skippedQueryStart !== -1, 'could not locate the shippedWithoutQc query');
-  // Scope to the ONE countDocuments call that contains 'visionQc.skipped'
-  // (bounded at the next `.catch(() => 0)`, mirroring how every rollup
-  // query in this handler terminates) rather than the whole handler, so a
-  // null-check anywhere else in the file cannot make this pass by accident.
-  const callEnd = handler.indexOf('.catch(() => 0)', skippedQueryStart);
-  assert.ok(callEnd !== -1, 'shippedWithoutQc query never terminated with the expected .catch(() => 0)');
-  const callSrc = handler.slice(skippedQueryStart, callEnd);
+  const callSrc = countDocumentsCallAt(handler, `'visionQc.skipped': true`);
+  assert.ok(callSrc, 'could not locate the shippedWithoutQc query (brace-balanced)');
   assert.match(callSrc, /\$or\s*:/, 'shippedWithoutQc must be an $or of two conditions, not a single skipped:true filter');
   assert.match(callSrc, /visionQc\s*:\s*null/,
     'shippedWithoutQc must also match {visionQc: null} — Mongo equality on null matches a MISSING field too, ' +
     'which is what every gate-off-shipped ad (and every ad from before this fix) actually has');
 });
 
+check('C5b [2026-08-19] shippedWithoutQc is scoped to SHIPPED statuses only (draft/live/archived), not queued/rendering', () => {
+  const handler = sliceFrom("router.get('/runs/:runId'");
+  assert.ok(handler);
+  const callSrc = countDocumentsCallAt(handler, `'visionQc.skipped': true`);
+  assert.ok(callSrc, 'could not locate the shippedWithoutQc query (brace-balanced)');
+  assert.match(callSrc, /status:\s*\{\s*\$in:\s*AD_STATUSES\s*\}/,
+    'shippedWithoutQc must exclude in-flight (queued/rendering) ads via a status filter, or it re-introduces ' +
+    'the "false alarm on every healthy in-flight run" regression: Ad.visionQc is null on every not-yet-rendered ' +
+    'ad too, and an unfiltered {visionQc:null} arm matches those just as readily as a truly shipped-uninspected ad');
+});
+
+check('C5c [2026-08-19] qcFailed and qcdOnRetry are NOT status-scoped (a real verdict cannot exist pre-ship, so the guard would be redundant, not wrong to omit)', () => {
+  const handler = sliceFrom("router.get('/runs/:runId'");
+  assert.ok(handler);
+  const qcFailedCall = countDocumentsCallAt(handler, `'visionQc.disabled': false`);
+  const qcdOnRetryCall = countDocumentsCallAt(handler, `'visionQc.finalAttempt'`);
+  assert.ok(qcFailedCall && qcdOnRetryCall, 'could not locate both queries');
+  // Documents the deliberate asymmetry rather than asserting either shape —
+  // if a future edit adds AD_STATUSES scoping here too that is harmless
+  // (structurally impossible to match pre-ship), so this is a NON-regression
+  // note, not a revert-provable requirement. No assertion beyond "found".
+});
+
 check('C6 qcFailed only counts a TRULY inspected, failed verdict (not skipped, not disabled)', () => {
   const handler = sliceFrom("router.get('/runs/:runId'");
   assert.ok(handler);
-  // Anchor on the UNIQUE 'visionQc.disabled' text (only the qcFailed query
-  // mentions it) and walk backward to ITS OWN enclosing Ad.countDocuments({,
-  // not the nearest one textually before it — a naive forward, non-greedy
-  // "Ad.countDocuments({ ... 'visionQc.disabled':false" scan happily spans
-  // across the PRECEDING shippedWithoutQc call instead of staying inside
-  // the qcFailed one, silently checking the wrong query.
-  const disabledIdx = handler.indexOf(`'visionQc.disabled': false`);
-  assert.ok(disabledIdx !== -1, 'could not locate the qcFailed query');
-  const idx = handler.lastIndexOf('Ad.countDocuments({', disabledIdx);
-  assert.ok(idx !== -1, 'could not find the Ad.countDocuments({ that owns visionQc.disabled');
-  const callEnd = handler.indexOf('.catch(() => 0)', idx);
-  const callSrc = handler.slice(idx, callEnd);
+  const callSrc = countDocumentsCallAt(handler, `'visionQc.disabled': false`);
+  assert.ok(callSrc, 'could not locate the qcFailed query (brace-balanced)');
   assert.match(callSrc, /'visionQc\.skipped':\s*false/, 'qcFailed must exclude skipped verdicts');
   assert.match(callSrc, /'visionQc\.disabled':\s*false/, 'qcFailed must exclude gate-off (disabled) verdicts');
   assert.match(callSrc, /'visionQc\.passed':\s*false/, 'qcFailed must require an actual failed verdict, not a pass');
   assert.match(callSrc, /campaignRunIds:\s*run\.runId/, 'qcFailed must be scoped to this run');
+});
+
+check('C7 [2026-08-19] qcdOnRetry requires passed:true — a twice-failed ad must not double-count against qcFailed', () => {
+  const handler = sliceFrom("router.get('/runs/:runId'");
+  assert.ok(handler);
+  const callSrc = countDocumentsCallAt(handler, `'visionQc.finalAttempt'`);
+  assert.ok(callSrc, 'could not locate the qcdOnRetry query (brace-balanced)');
+  assert.match(callSrc, /'visionQc\.finalAttempt':\s*\{\s*\$gt:\s*1\s*\}/, 'qcdOnRetry must require finalAttempt > 1');
+  assert.match(callSrc, /'visionQc\.passed':\s*true/,
+    'qcdOnRetry must require passed:true — without it, an ad that fails BOTH its first attempt and its one ' +
+    'allowed regeneration lands in qcFailed AND here, and the banner reads "1 flagged · 1 QC\'d on retry" for ' +
+    'what is a single failed ad');
+  assert.match(callSrc, /campaignRunIds:\s*run\.runId/, 'qcdOnRetry must be scoped to this run');
+});
+
+check('C8 [2026-08-19] qcDisabled counts the deliberate gate-off stamp only, scoped to shipped statuses', () => {
+  const handler = sliceFrom("router.get('/runs/:runId'");
+  assert.ok(handler);
+  const callSrc = countDocumentsCallAt(handler, `'visionQc.disabled': true`);
+  assert.ok(callSrc, 'could not locate the qcDisabled query (brace-balanced)');
+  assert.match(callSrc, /status:\s*\{\s*\$in:\s*AD_STATUSES\s*\}/, 'qcDisabled must be scoped to shipped statuses, same as shippedWithoutQc');
+  assert.match(callSrc, /campaignRunIds:\s*run\.runId/, 'qcDisabled must be scoped to this run');
+});
+
+check('C9 [2026-08-19] qcUnavailable counts skipped-but-not-disabled verdicts only — the live-outage signal, distinct from qcDisabled', () => {
+  const handler = sliceFrom("router.get('/runs/:runId'");
+  assert.ok(handler);
+  const calls = allCountDocumentsCalls(handler);
+  const target = calls.find(c =>
+    /'visionQc\.skipped':\s*true/.test(c)
+    && /'visionQc\.disabled':\s*false/.test(c)
+    && /status:\s*\{\s*\$in:\s*AD_STATUSES\s*\}/.test(c)
+    && !/\$or\s*:/.test(c)   // must NOT be the same call as shippedWithoutQc (which is $or-shaped)
+  );
+  assert.ok(target, 'could not find a status-scoped, non-$or query requiring visionQc.skipped:true AND visionQc.disabled:false (qcUnavailable)');
+  assert.match(target, /campaignRunIds:\s*run\.runId/, 'qcUnavailable must be scoped to this run');
 });
 
 // ── D. Gate-off early returns stamp a disabled verdict, never a bare null ─
