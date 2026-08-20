@@ -43,13 +43,17 @@ switcher only resolved to "Pelagic Gear" for this account across both listed wor
 Social Admin, Sales Demos); not investigated further, not blocking, but worth a look if someone
 with broader brand access wants to re-confirm against those specific campaigns.
 
-**Frontend side** (liquidretail#64): `pages/Ads/index.tsx`'s `gridDisplayUrl()` now also prefers
-`previewImageUrl` for image ads — fixed a real pre-existing bug where the image branch rendered
-`displayUrl(ad)` (full res) directly instead of calling `gridDisplayUrl(ad)` at all (the video
-branch already did). `pages/ProductAds/index.tsx` gained a `gridDisplayUrlFor()` (same shape) and
-`AdThumbnail` now uses it — covers `pages/ProductAds`, `pages/UgcAds`, `pages/CampaignDetail`, and
-`agent/ResourceCard` in one place since all four import `AdThumbnail` from ProductAds. `AdDetailModal`
-deliberately untouched, still full resolution.
+**Frontend side** (liquidretail#64) — **scope corrected mid-session by the coordinator**: the
+owner doesn't use the legacy `/ads` gallery at all (confirmed separately by frontend PR #65,
+"mark the legacy /ads gallery as do-not-develop", merged to `master` during this same session).
+`/product-ads` (`AdThumbnail`, shared by `ProductAds`/`UgcAds`/`CampaignDetail`/`agent/ResourceCard`)
+is the real primary surface, and it had **zero** references to `previewVideoUrl` on `master` even
+though this backend already emitted it — so the real frontend fix wires BOTH `previewVideoUrl` and
+`previewImageUrl` into `AdThumbnail` via a new `gridDisplayUrlFor()`, and leaves `pages/Ads/index.tsx`
+alone entirely (an earlier version of that PR's diff touched it; reverted before landing). No
+backend change was needed for the video half of that fix — `previewVideoUrl` already existed on
+both `projectAd` and `ads-detail` before this session. `AdDetailModal` deliberately untouched,
+still full resolution via `displayUrlFor()`.
 
 **NOT fixed, flagged separately (spawned as a background task, not yet started):**
 `services/capabilityExecutors/adList.js` (the agent chat's `AdInspectCard`/`ResourceCard` ad tiles)
