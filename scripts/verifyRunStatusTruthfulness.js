@@ -71,12 +71,14 @@ const {
 const {
   buildStaleRunningReapUpdate,
   classifyRunAdOutcome,
-  buildRunReconciliationUpdate
+  buildRunReconciliationUpdate,
+  buildRecentlyFailedFilter
 } = require('../services/campaignRunGuards');
 
 const ROOT = path.join(__dirname, '..');
 const adsSrc = fs.readFileSync(path.join(ROOT, 'routes/ads.js'), 'utf8');
 const workerSrcForE = fs.readFileSync(path.join(ROOT, 'worker.js'), 'utf8');
+const processAlertsSrc = fs.readFileSync(path.join(ROOT, 'services/processAlerts.js'), 'utf8');
 
 let checks = 0;
 // ASYNC-AWARE on purpose: several checks below (section B) exercise
@@ -476,6 +478,220 @@ await ok('E10 worker.js skips (does not write) an unsettled candidate — the `c
   assert.ok(m, 'could not locate the isSettled guard in worker.js\'s reconciliation loop');
   assert.match(m[1], /continue/, 'an unsettled candidate (real receipted work still rendering) must be left alone this tick');
   assert.doesNotMatch(m[1], /updateOne|updateMany/, 'no write may happen for a candidate that is not yet settled');
+});
+
+// ── F. services/processAlerts.js persistOrphans — the SIGTERM twin of E ────
+//
+// Measured incident (2026-08-20): two runs (operator brian@egami.tv) sat at
+// `status:'failed', succeeded:18, total:39` while every one of the 39
+// claimed Ads was, by the time anyone looked, genuinely `draft` with a real
+// renderUrl — 100% delivered, reported as 46%. `persistOrphans` used to fire
+// a BLIND `CampaignRun.updateMany({...}, {$set:{status:'failed',...}})` on
+// every SIGTERM for every run this process still had in flight — no read of
+// the run's actual claimed Ads — and because 'failed' sits outside
+// worker.js's `buildStaleRunningFilter` ('running' only), that write was
+// effectively unhealable by section E's fix above.
+//
+// Revert-prove (each mutation below must fail this harness):
+//   1. persistOrphans goes back to a blind `CampaignRun.updateMany(...,
+//      {$set:{status:'failed',...}})` with no per-run Ad read → F1 fails
+//      (no `classifyRunAdOutcome(` / `buildRunReconciliationUpdate(` call).
+//   2. The Ad requeue and the CampaignRun reconciliation move back into one
+//      `Promise.all([...])` (so the reconciliation read can race the
+//      requeue write instead of seeing it landed) → F2 fails.
+//   3. The `!outcome.isSettled` branch starts setting `status` anyway → F3
+//      fails (a receipt-holding still-rendering Ad must not be finalized).
+
+function fnBody(src, marker) {
+  // NOT just "the first balanced {...} after the marker" — for
+  // `async function name({ destructured, params }) { body }` that first
+  // brace pair is the PARAMETER destructuring, which closes immediately and
+  // returns a near-empty slice ending mid-signature. Skip the parameter
+  // list (matching parens, not braces) to find the body's own opening brace
+  // first. Naive either way about braces/parens inside strings/comments/
+  // regex literals in the body — fine here, this file's functions don't
+  // have any that would desync the count.
+  const start = src.indexOf(marker);
+  if (start === -1) return null;
+  const parenStart = src.indexOf('(', start);
+  if (parenStart === -1) return null;
+  let parenDepth = 0;
+  let i = parenStart;
+  for (; i < src.length; i++) {
+    if (src[i] === '(') parenDepth++;
+    else if (src[i] === ')') {
+      parenDepth--;
+      if (parenDepth === 0) { i += 1; break; }
+    }
+  }
+  const braceStart = src.indexOf('{', i);
+  if (braceStart === -1) return null;
+  let depth = 0;
+  for (let j = braceStart; j < src.length; j++) {
+    if (src[j] === '{') depth++;
+    else if (src[j] === '}') {
+      depth--;
+      if (depth === 0) return src.slice(start, j + 1);
+    }
+  }
+  return src.slice(start);
+}
+
+const persistOrphansBody = fnBody(processAlertsSrc, 'async function persistOrphans');
+
+await ok('F0 persistOrphans is still findable as a whole function body (scoping precondition for F1-F3)', () => {
+  assert.ok(persistOrphansBody, 'could not locate persistOrphans in services/processAlerts.js — later checks would silently scope to the whole file');
+  assert.ok(persistOrphansBody.length < processAlertsSrc.length,
+    'fnBody must have scoped to the function, not fallen back to the whole file');
+});
+
+function stripLineComments(src) {
+  // Line-comment-only stripper (this file has no block comments in the
+  // regions scanned below) — cheap insurance against a positive/negative
+  // regex being fooled by a `// classifyRunAdOutcome(` mention or a
+  // commented-out old blind stamp, the exact class of harness weakness
+  // adversarial review flagged (2026-08-20).
+  return src.split('\n').map((line) => line.replace(/\/\/.*$/, '')).join('\n');
+}
+
+const persistOrphansStripped = stripLineComments(persistOrphansBody);
+
+await ok('F1 persistOrphans reconciles from real Ad truth (classifyRunAdOutcome + buildRunReconciliationUpdate), not a blind stamp', () => {
+  assert.match(persistOrphansStripped, /classifyRunAdOutcome\(/,
+    'persistOrphans must call the shared classifier on each run\'s real claimed Ads before deciding a terminal status');
+  assert.match(persistOrphansStripped, /buildRunReconciliationUpdate\(/,
+    'persistOrphans must call the shared reconciliation update builder, not hand-roll succeeded/failed');
+  // Broader than the one exact old spelling: NO write anywhere in this
+  // function may $set a run's status without that value having come out of
+  // buildRunReconciliationUpdate's destructured `$set` a few lines earlier —
+  // approximated here by requiring every literal `status:` OUTSIDE of a
+  // `$set` destructured from the builder to be gone. Concretely: the old
+  // shape `$set: { status: 'failed', completedAt: now }` (any key order) is
+  // banned by requiring `$set:` never appears immediately followed by a
+  // hand-written `status:` key within the same object literal.
+  assert.doesNotMatch(persistOrphansStripped, /\$set:\s*\{[^}]*\bstatus\s*:\s*'(?:failed|done)'/,
+    'persistOrphans must not blind-stamp a literal status value in any $set — every terminal status must come ' +
+    'from buildRunReconciliationUpdate\'s own $set, not a hand-written one');
+});
+
+await ok('F2 the Ad requeue is AWAITED before the CampaignRun reconciliation read (not raced beside it in one Promise.all)', () => {
+  const adUpdateIdx = persistOrphansBody.indexOf('Ad.updateMany(');
+  const campaignFindIdx = persistOrphansBody.indexOf('CampaignRun.find(');
+  assert.ok(adUpdateIdx !== -1, 'expected an Ad.updateMany( requeue call in persistOrphans');
+  assert.ok(campaignFindIdx !== -1, 'expected a CampaignRun.find( candidate read in persistOrphans (not a blind updateMany)');
+  assert.ok(adUpdateIdx < campaignFindIdx,
+    'the Ad requeue must be awaited and appear BEFORE the CampaignRun candidate read — the reconciliation read ' +
+    'must see this process\'s own requeue writes already landed, or a "queued" row can be misread as "not looked at yet"');
+  assert.doesNotMatch(persistOrphansBody, /Promise\.all\(\[\s*\n?\s*Ad\.updateMany/,
+    'the Ad requeue and the CampaignRun write must not be raced together in one Promise.all — that reopens the ' +
+    'exact ordering bug this fix closes');
+});
+
+await ok('F3 a candidate with nothing lost yet (still-rendering, no needsRetry) is left alone — never stamped failed', () => {
+  // NOT a bare `!outcome.isSettled` guard — adversarial review (2026-08-20,
+  // two independent passes) caught that guard flattening a MIXED shape
+  // (some claimed Ads still receipt-holding + rendering, OTHERS already
+  // genuinely lost to 'queued') into "leave the whole run alone", which
+  // starves services/strandedRunSweeper.js (it only drains a queued/
+  // receipt-free tail once the OWNING run reads status:'failed') for
+  // however long the receipt-holding sibling takes to separately resolve.
+  // The correct guard only defers when NOTHING has been lost AND something
+  // is still genuinely rendering.
+  const m = persistOrphansStripped.match(/if\s*\(outcome\.stillRendering\s*>\s*0\s*&&\s*!outcome\.needsRetry\)\s*\{([\s\S]*?)\n\s{6}\}/);
+  assert.ok(m, 'could not locate the stillRendering-and-not-needsRetry defer guard inside persistOrphans');
+  assert.doesNotMatch(m[1], /\$set\b/,
+    'a deferred candidate (real receipted work still outstanding, nothing lost) must not $set ANY field — ' +
+    'only the audit $push is allowed; a hand-written status/counters write here is exactly the blind guess ' +
+    'this fix removes');
+  // The revert-prove for the specific regression this guard exists to
+  // prevent: a candidate with something ALREADY lost (needsRetry) must NOT
+  // hit this defer branch even if another sibling is still rendering — it
+  // must instead reach buildRunReconciliationUpdate and get failed for real.
+  assert.doesNotMatch(persistOrphansStripped, /if\s*\(!outcome\.isSettled\)/,
+    'persistOrphans must not gate on bare !outcome.isSettled anywhere — that reopens the mixed-shape regression ' +
+    '(a lost Ad alongside a still-rendering one must still fail the run, not wait on the still-rendering one)');
+});
+
+// ── G. The GENERAL safety net — recently-'failed' runs get re-checked too ──
+//
+// classifyRunAdOutcome/buildRunReconciliationUpdate (section E) only fixed
+// the running-reaper's OWN blind stamp. `buildRecentlyFailedFilter`
+// (services/campaignRunGuards.js) widens the SAME worker cadence to also
+// re-derive already-'failed' runs, closing every OTHER writer that can land
+// a run there blind (processAlerts.js persistOrphans — section F — plus
+// routes/ads.js's crash handlers) and the shape where a run was correctly
+// judged `needsRetry` at the time, then had its "lost" ads later drained
+// into a successful re-render by services/strandedRunSweeper.js — which
+// fixes the Ad, never the CampaignRun row it came from.
+//
+// Revert-prove (each mutation below must fail this harness):
+//   1. buildRecentlyFailedFilter stops filtering on `completedAt` (scans
+//      every 'failed' run ever) → G1 fails (window is not respected).
+//   2. worker.js's healing pass drops the `!outcome.isSettled` guard →
+//      G3-shaped bug is no longer structurally prevented (checked via G2's
+//      source scan requiring the same guard pattern as section E10).
+//   3. worker.js stops re-checking 'failed' runs at all (removes the whole
+//      pass) → G2 fails (no buildRecentlyFailedFilter( call in worker.js).
+
+await ok('G1 buildRecentlyFailedFilter: status:\'failed\' + completedAt within the window, nothing else', () => {
+  const now = new Date('2026-08-20T23:00:00Z');
+  const filter = buildRecentlyFailedFilter({ now, windowMin: 180 });
+  assert.strictEqual(filter.status, 'failed');
+  assert.ok(filter.completedAt && filter.completedAt.$gte instanceof Date);
+  assert.strictEqual(filter.completedAt.$gte.getTime(), now.getTime() - 180 * 60 * 1000);
+  assert.deepStrictEqual(Object.keys(filter).sort(), ['completedAt', 'status'],
+    'must not smuggle in any other condition — a run outside the window is deliberately left alone');
+});
+
+function failedHealingLoopBody(code) {
+  // Bounded at the next REAL statement after the loop (the summary-log
+  // `if`), not a hand-tuned char count — the same "self-maintaining" posture
+  // sliceHandler documents in section D above, and the direct fix for
+  // adversarial review's critique that a fixed span is the span-drift trap
+  // this file already knows about.
+  const loopStart = code.indexOf('for (const failedCandidate of recentlyFailedCandidates)');
+  if (loopStart === -1) return null;
+  const nextMarker = code.indexOf('if (nRunsHealed > 0)', loopStart);
+  if (nextMarker === -1) return null;
+  return code.slice(loopStart, nextMarker);
+}
+
+await ok('G2 worker.js wires buildRecentlyFailedFilter → per-candidate Ad.find → classifyRunAdOutcome → buildRunReconciliationUpdate → status-guarded updateOne, mirroring section E\'s running-run pass', () => {
+  const code = stripCommentLinesForWorker(workerSrcForE);
+  assert.match(code, /buildRecentlyFailedFilter\(/, 'worker.js must call the shared recently-failed predicate');
+  assert.match(code, /CampaignRun\.find\(\s*\n\s*buildRecentlyFailedFilter\(/,
+    'the recently-failed candidates must come from the shared predicate, not a hand-rolled filter');
+  const loopBody = failedHealingLoopBody(code);
+  assert.ok(loopBody, 'could not locate the recently-failed healing loop, scoped to its own body');
+  // Scoped to the FAILED loop specifically, not counted across the whole
+  // file — adversarial review caught that a whole-file count could pass
+  // with a hollow failed loop as long as section E's running loop alone
+  // called each function twice.
+  assert.match(loopBody, /classifyRunAdOutcome\(/, 'the failed-run healing loop must call the shared classifier itself, not just the running-run loop above it');
+  assert.match(loopBody, /buildRunReconciliationUpdate\(/, 'the failed-run healing loop must call the shared reconciliation builder itself');
+  assert.match(loopBody, /CampaignRun\.updateOne\(\s*\{\s*_id:\s*failedCandidate\._id,\s*status:\s*'failed'\s*\}/,
+    'the healing write must re-check status:\'failed\' at write time (CAS) — a run this same tick already moved ' +
+    'on some other way must not be clobbered');
+});
+
+await ok('G3 worker.js skips a candidate with nothing lost yet (still-rendering, no needsRetry) — never writes to it', () => {
+  const code = stripCommentLinesForWorker(workerSrcForE);
+  const loopBody = failedHealingLoopBody(code);
+  assert.ok(loopBody, 'could not locate the recently-failed healing loop, scoped to its own body');
+  // Same guard-shape fix as F3 — NOT a bare !outcome.isSettled (see F3's
+  // header for the mixed-shape regression that guard caused).
+  const m = loopBody.match(/if\s*\(outcome\.stillRendering\s*>\s*0\s*&&\s*!outcome\.needsRetry\)\s*continue;/);
+  assert.ok(m, 'the healing loop must skip (continue) a candidate with real receipt-holding work still outstanding and nothing yet lost');
+  assert.doesNotMatch(loopBody, /if\s*\(!outcome\.isSettled\)/,
+    'the healing loop must not gate on bare !outcome.isSettled anywhere — same regression F3 guards against');
+  // Structural E10-style guarantee: nothing may write between the loop's
+  // start and this exact continue statement — a write BEFORE the guard
+  // would still pass a purely textual "does `continue` exist somewhere"
+  // check, which is the specific weakness adversarial review flagged.
+  const guardIdx = loopBody.search(/if\s*\(outcome\.stillRendering\s*>\s*0\s*&&\s*!outcome\.needsRetry\)\s*continue;/);
+  const beforeGuard = loopBody.slice(0, guardIdx);
+  assert.doesNotMatch(beforeGuard, /updateOne|updateMany/,
+    'no write may happen before the still-rendering/no-needsRetry guard — a candidate must be classified before anything is written');
 });
 
 function stripCommentLinesForWorker(src) {

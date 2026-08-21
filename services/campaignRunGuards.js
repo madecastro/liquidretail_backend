@@ -492,6 +492,49 @@ function buildRunningFlipFilter(runDocId, { now, staleMin } = {}) {
   return filter;
 }
 
+/**
+ * THE GENERAL SAFETY NET — 'failed' is not necessarily FINAL truth, only the
+ * last thing written. Found investigating a 2026-08-20 incident: TWO runs
+ * (operator brian@egami.tv) sat at `status:'failed', succeeded:18, total:39`
+ * while every one of the 39 claimed Ads was, by the time anyone looked,
+ * genuinely `draft` with a real `renderUrl` — 100% delivered, reported as
+ * 46%. `classifyRunAdOutcome`/`buildRunReconciliationUpdate` above already
+ * fix the running-reaper's OWN blind stamp, but that is only ONE of several
+ * writers that can land a run on `status:'failed'` without ever looking at
+ * its Ads:
+ *
+ *   - services/processAlerts.js persistOrphans — the SIGTERM/crash stamp,
+ *     fires on every deploy and autoscale replacement.
+ *   - routes/ads.js's crash handlers (the queued-drain run-crash handler,
+ *     the prep/render crash handler) — a post-claim throw stamps 'failed'
+ *     with no recount.
+ *   - a run this SAME reaper reconciled correctly with `needsRetry` (some
+ *     claimed Ad had genuinely been reset to 'queued' at that moment) whose
+ *     "lost" Ads services/strandedRunSweeper.js later drained into a
+ *     SUCCESSFUL re-render — that service fixes the Ad, never the
+ *     CampaignRun row it came from. The ~15-minute gap between the measured
+ *     incidents' `lastHeartbeatAt` and `completedAt` matches this reaper's
+ *     own staleness window almost exactly, which is why this is believed to
+ *     be the dominant path in production, not merely a hypothetical.
+ *
+ * Patching every individual writer is a losing game — a future one will
+ * exist that nobody remembers to route through classifyRunAdOutcome. So
+ * 'failed' runs get the SAME re-derivation as 'running' ones, on the same
+ * worker cadence, bounded to a recency window (`completedAt` within
+ * `windowMin`) so this stays a cheap indexed scan of yesterday's handful of
+ * failures — not a crawl of the collection's entire history. A run outside
+ * the window is old enough that nothing is still quietly delivering more of
+ * its Ads in the background; re-scanning it forever would only cost cycles
+ * for no correctness gain.
+ */
+function buildRecentlyFailedFilter({ now, windowMin }) {
+  const t = now instanceof Date ? now.getTime() : (Number(now) || Date.now());
+  return {
+    status: 'failed',
+    completedAt: { $gte: new Date(t - windowMin * 60 * 1000) }
+  };
+}
+
 module.exports = {
   DONE_ELIGIBLE_STATUSES,
   buildTerminalDoneFilter,
@@ -501,5 +544,6 @@ module.exports = {
   buildStaleRunningReapUpdate,
   classifyRunAdOutcome,
   buildRunReconciliationUpdate,
-  buildRunningFlipFilter
+  buildRunningFlipFilter,
+  buildRecentlyFailedFilter
 };

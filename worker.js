@@ -60,6 +60,16 @@ const { reapStaleMin, prepareStaleMin } = require('./services/staleness');
 // stays fixed for the process lifetime.
 const REAP_STALE_MIN     = reapStaleMin();
 const REAP_INTERVAL_MIN  = Math.max(1, parseInt(process.env.REAP_INTERVAL_MIN, 10)  || 5);
+// How far back a 'failed' CampaignRun is still worth re-checking against real
+// Ad truth (services/campaignRunGuards.js buildRecentlyFailedFilter — read
+// that header for WHY this pass exists: 'failed' is the last thing written,
+// not necessarily final truth). 3h default: generous enough to catch a run
+// whose "lost" ads were drained and successfully re-rendered by
+// services/strandedRunSweeper.js after the original failure (that service has
+// its own attempt/backoff budget, not measured in minutes here, so this stays
+// wide), cheap enough that the indexed `{status:'failed', completedAt}` scan
+// stays a handful of rows even on a busy day.
+const FAILED_RUN_RECONCILE_WINDOW_MIN = Math.max(1, parseInt(process.env.FAILED_RUN_RECONCILE_WINDOW_MIN, 10) || 180);
 // A 'preparing' CampaignRun NEVER heartbeats — no write to the row exists
 // anywhere between mint (routes/ads.js POST /generate) and the flip to
 // 'running' (after expandWizardJob + claim), so updatedAt === startedAt for
@@ -149,7 +159,8 @@ const {
   buildStalePreparingFilter,
   buildStaleRunningFilter,
   classifyRunAdOutcome,
-  buildRunReconciliationUpdate
+  buildRunReconciliationUpdate,
+  buildRecentlyFailedFilter
 } = require('./services/campaignRunGuards');
 // Pure Slack-message builder for the preparing-reap notice below — see
 // services/slackRunVerbosity.js header (no Mongo/network at require-time).
@@ -503,6 +514,59 @@ async function reapOrphans() {
       `recovery in flight (${nRunsDeferredTitling} of them for titling), not abandoned`
     );
   }
+
+  // ── HEAL RECENTLY-'failed' RUNS TOO (2026-08-20 incident) ────────────────
+  // See services/campaignRunGuards.js buildRecentlyFailedFilter's header for
+  // the full why. Short version: `status:'failed'` is not necessarily FINAL
+  // truth — at least three writers (this reaper's OWN former blind stamp,
+  // processAlerts.js persistOrphans on SIGTERM, routes/ads.js's crash
+  // handlers) can land a run there without ever looking at its Ads, and a
+  // run this reaper reconciled correctly a tick ago can still go stale again
+  // if services/strandedRunSweeper.js later drains its "lost" (queued) ads
+  // into a successful re-render — that service fixes the Ad, never the
+  // CampaignRun row it came from. Re-run the SAME classify/reconcile pass
+  // against recent 'failed' rows so all of these self-heal on this reaper's
+  // existing cadence, instead of needing a bespoke fix at every writer
+  // (including ones not discovered yet). Measured incident shape this closes:
+  // two runs (brian@egami.tv, 2026-08-20) stuck at `status:'failed',
+  // succeeded:18, total:39` while every one of the 39 claimed Ads was
+  // genuinely `draft` with a real renderUrl.
+  const recentlyFailedCandidates = await CampaignRun.find(
+    buildRecentlyFailedFilter({ now: reapNow, windowMin: FAILED_RUN_RECONCILE_WINDOW_MIN })
+  ).select('_id runId succeeded failed status').lean();
+
+  let nRunsHealed = 0;
+  for (const failedCandidate of recentlyFailedCandidates) {
+    const claimedAds = await Ad.find({ campaignRunIds: failedCandidate.runId }).select('status').lean();
+    if (claimedAds.length === 0) continue; // nothing claimed — nothing to reconcile
+    const outcome = classifyRunAdOutcome(claimedAds);
+    // Same guard fix as services/processAlerts.js persistOrphans (adversarial
+    // review, 2026-08-20): defer ONLY when nothing has been lost AND
+    // something is still genuinely rendering. A bare `!outcome.isSettled`
+    // would also defer a candidate that already HAS a lost (`needsRetry`)
+    // Ad — but this candidate is already `status:'failed'`, so there is no
+    // gate/sweeper visibility to protect here the way there is in
+    // persistOrphans; the reason to still wait is purely to avoid computing
+    // a premature (undercounted) succeeded/failed while a receipt-holding
+    // sibling's outcome is still genuinely unknown.
+    if (outcome.stillRendering > 0 && !outcome.needsRetry) continue;
+    const healed = buildRunReconciliationUpdate(outcome, { staleMin: REAP_STALE_MIN, now: new Date(reapNow) });
+    const alreadyCorrect = healed.$set.status === failedCandidate.status &&
+      healed.$set.succeeded === failedCandidate.succeeded &&
+      healed.$set.failed === failedCandidate.failed;
+    if (alreadyCorrect) continue; // stored counters already match Ad truth — do not touch completedAt or spam a write
+    const res = await CampaignRun.updateOne({ _id: failedCandidate._id, status: 'failed' }, healed)
+      .catch(() => ({ modifiedCount: 0 }));
+    if (res.modifiedCount ?? res.nModified ?? 0) nRunsHealed++;
+  }
+  if (nRunsHealed > 0) {
+    console.log(
+      `🩹 healed ${nRunsHealed} previously-'failed' CampaignRun(s) whose stored succeeded/failed ` +
+      `counters had drifted from real Ad truth (e.g. work delivered by titlingResumeService / ` +
+      `bootRecoveryService / strandedRunSweeper after the original failure was stamped)`
+    );
+  }
+
   const runs = { modifiedCount: nRunsFailed };
 
   // CampaignRun stuck in 'preparing' → mark 'failed'. Distinct from the sweep

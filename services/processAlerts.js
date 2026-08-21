@@ -94,45 +94,120 @@ async function persistOrphans({ signal, role }) {
 
   const Ad = require('../models/Ad');
   const CampaignRun = require('../models/CampaignRun');
+  const { classifyRunAdOutcome, buildRunReconciliationUpdate } = require('./campaignRunGuards');
+  const { reapStaleMin } = require('./staleness');
   const now = new Date();
   const stage = 'shutdown';
   const message = `${role} process ${signal} at ${now.toISOString()} — ${s.adsRemaining} ad(s) requeued`;
 
   try {
-    const [adRes, runRes] = await Promise.all([
-      // RECEIPT-AWARE (2026-08-04). This requeue runs on EVERY SIGTERM, so it
-      // fires on every deploy — which makes it the more dangerous of the two
-      // requeue sites (the worker reaper only sweeps every 15 minutes).
-      //
-      // An ad holding a spend receipt (Ad.veoPredictionId for video,
-      // imageGeneration.predictionId for static) has ALREADY been billed —
-      // the provider charged at submit. Requeuing it means the next run
-      // SUBMITS AGAIN and we pay twice for a generation Atlas may have
-      // already delivered. Measured today: a 411s Omni master completed at
-      // 17:27:09 and this path requeued its run one second later.
-      //
-      // Receipt-FREE ads are requeued exactly as before: they were never
-      // billed, so re-running them costs the one charge that was always owed.
-      // Receipt-holding ads stay in `rendering` on purpose — honest (the
-      // outcome is genuinely unknown until the receipt is polled), still
-      // visible to ALERT_RENDERING_STALE_MIN, and the receipt survives so the
-      // asset can be recovered for free instead of re-bought.
-      Ad.updateMany(
-        receiptFree({ campaignRunIds: { $in: s.runIds }, status: 'rendering' }),
-        buildRequeuePipeline({
-          breadcrumb: `${role} process ${signal} at ${now.toISOString()} — claimed but never dispatched`,
-          now
-        })
-      ),
-      CampaignRun.updateMany(
-        { runId: { $in: s.runIds }, status: { $nin: ['done', 'failed'] } },
-        {
-          $set: { status: 'failed', completedAt: now },
-          $push: { errors: { stage, message } }
-        }
-      )
-    ]);
-    console.log(`🛑 orphan persist: requeued ${adRes.modifiedCount} ad(s), marked ${runRes.modifiedCount} run(s) failed`);
+    // RECEIPT-AWARE (2026-08-04). This requeue runs on EVERY SIGTERM, so it
+    // fires on every deploy — which makes it the more dangerous of the two
+    // requeue sites (the worker reaper only sweeps every 15 minutes).
+    //
+    // An ad holding a spend receipt (Ad.veoPredictionId for video,
+    // imageGeneration.predictionId for static) has ALREADY been billed —
+    // the provider charged at submit. Requeuing it means the next run
+    // SUBMITS AGAIN and we pay twice for a generation Atlas may have
+    // already delivered. Measured today: a 411s Omni master completed at
+    // 17:27:09 and this path requeued its run one second later.
+    //
+    // Receipt-FREE ads are requeued exactly as before: they were never
+    // billed, so re-running them costs the one charge that was always owed.
+    // Receipt-holding ads stay in `rendering` on purpose — honest (the
+    // outcome is genuinely unknown until the receipt is polled), still
+    // visible to ALERT_RENDERING_STALE_MIN, and the receipt survives so the
+    // asset can be recovered for free instead of re-bought.
+    //
+    // AWAITED BEFORE the reconciliation read below (not run in a Promise.all
+    // beside it, as this used to be) — see the reconciliation comment.
+    const adRes = await Ad.updateMany(
+      receiptFree({ campaignRunIds: { $in: s.runIds }, status: 'rendering' }),
+      buildRequeuePipeline({
+        breadcrumb: `${role} process ${signal} at ${now.toISOString()} — claimed but never dispatched`,
+        now
+      })
+    );
+
+    // RECONCILE FROM AD TRUTH, not a blind stamp — this is the SIGTERM twin
+    // of worker.js's stale-running reaper (services/campaignRunGuards.js
+    // classifyRunAdOutcome / buildRunReconciliationUpdate). Before this,
+    // EVERY SIGTERM flipped every one of this process's still-in-flight runs
+    // straight to `status:'failed'` with whatever succeeded/failed counts the
+    // per-ad $inc sites happened to have already reached — and because
+    // 'failed' sits OUTSIDE worker.js's buildStaleRunningFilter ('running'
+    // only), that blind stamp used to be effectively permanent for the
+    // running-reaper's own healing pass (a second, wider healing pass now
+    // also revisits recently-'failed' runs — see
+    // campaignRunGuards.buildRecentlyFailedFilter — but fixing the write
+    // here still closes the gap at the moment it happens, not minutes later).
+    // Measured in production 2026-08-20: two runs (brian@egami.tv) stuck at
+    // `status:'failed', succeeded:18, total:39` while all 39 claimed Ads were
+    // genuinely `draft` with a real renderUrl — 100% delivered, reported as
+    // 46%, because a write shaped exactly like the old one here ran while
+    // some of those 39 were still "in flight" from this process's own
+    // in-memory bookkeeping (services/inFlight.js) even though most had
+    // already landed their terminal Ad write — the classic two-await gap
+    // (Ad write, then a SEPARATE CampaignRun $inc) a SIGTERM can land inside.
+    //
+    // The Ad requeue above is awaited FIRST so this read sees this process's
+    // own writes already landed — a 'queued' row here means "genuinely
+    // lost", not "not looked at yet", the same ordering worker.js's reaper
+    // documents for this identical pair of calls.
+    const candidates = await CampaignRun.find(
+      { runId: { $in: s.runIds }, status: { $nin: ['done', 'failed'] } }
+    ).select('_id runId').lean();
+
+    let nDone = 0, nFailed = 0, nLeftRunning = 0;
+    await Promise.all(candidates.map(async (run) => {
+      const claimedAds = await Ad.find({ campaignRunIds: run.runId }).select('status').lean();
+      const outcome = classifyRunAdOutcome(claimedAds);
+      const detail = `${message} — run ${run.runId}: ${outcome.succeeded} succeeded, ` +
+        `${outcome.failed} failed, ${outcome.stillRendering} still rendering (receipt held), ` +
+        `${outcome.requeuedAway} requeued (of ${claimedAds.length} claimed)`;
+      // Defer ONLY when nothing has been lost yet AND something is still
+      // genuinely rendering — i.e. `isSettled` alone is the WRONG guard here.
+      // Adversarially reviewed 2026-08-20 (two independent passes, same
+      // finding): the common deploy shape is MIXED — some claimed Ads already
+      // receipt-holding and still `rendering` (left alone on purpose above)
+      // AND OTHER claimed Ads that were receipt-free and just got requeued to
+      // `queued` a few lines up. `services/strandedRunSweeper.js` only drains
+      // that queued/receipt-free tail once its OWNING run reads
+      // `status:'failed'` (`findStranded`'s filter). Gating on bare
+      // `isSettled` left the run `running` in that mixed case — invisible to
+      // the sweeper AND still occupying `buildActiveRunsFilter`'s concurrency
+      // gate — until every receipt-holding sibling separately finished, which
+      // can take many minutes (bootRecoveryService's own staleness window) to
+      // the full ~600s Omni poll ceiling. Failing the run the moment ANYTHING
+      // was genuinely lost (`needsRetry`) does not touch the still-rendering
+      // Ad's own status at all — that Ad keeps recovering for free exactly as
+      // before, in parallel — it only unblocks the gate and the sweeper for
+      // the OTHER, already-lost siblings sooner.
+      if (outcome.stillRendering > 0 && !outcome.needsRetry) {
+        // A receipt-holding Ad is still genuinely 'rendering' and NOTHING
+        // else was lost — the money guard above already left it that way on
+        // purpose so titlingResumeService/bootRecoveryService can finish it
+        // for free. Stamping this run 'failed' now would be exactly the
+        // blind guess this fix exists to remove; leave status untouched and
+        // let a later tick decide once that Ad has actually settled.
+        nLeftRunning++;
+        return CampaignRun.updateOne(
+          { _id: run._id, status: { $nin: ['done', 'failed'] } },
+          { $push: { errors: { stage, message: detail } } }
+        ).catch(() => null);
+      }
+      const { $set } = buildRunReconciliationUpdate(outcome, { staleMin: reapStaleMin(), now });
+      if ($set.status === 'failed') nFailed++; else nDone++;
+      return CampaignRun.updateOne(
+        { _id: run._id, status: { $nin: ['done', 'failed'] } },
+        { $set, $push: { errors: { stage, message: detail } } }
+      ).catch(() => null);
+    }));
+
+    console.log(
+      `🛑 orphan persist: requeued ${adRes.modifiedCount} ad(s); ${candidates.length} run(s) ` +
+      `reconciled from Ad truth (${nDone} done, ${nFailed} failed, ${nLeftRunning} left running for receipt-holding work)`
+    );
   } catch (err) {
     // Best-effort — the alert is still going out with the orphan count,
     // and the reaper will eventually catch what we couldn't.
