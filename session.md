@@ -85,7 +85,13 @@ it clears it back to this placeholder in the same commit that closes it out.)_
   measured teal `(96,156,168)` → navy `(12,60,96)`, L1 252, which vision QC then
   independently reported and failed 5 ads for. Full detail, the three ranked fix
   options, and two schema traps that will otherwise mislead you:
-  `session.d/2026-08-21_oom-titling-loop-and-reframe-recolour.md`.
+  `session.d/2026-08-21_oom-titling-loop-and-reframe-recolour.md` — **read
+  `session.d/2026-08-21_reframe-fabrication-spotcheck-pr151.md` WITH it. That file
+  corrects a wrong claim in the first (the product-only pad branch DOES exist, at
+  `atlasVideoService.js:1880`, and runs before the crop attempt), and establishes
+  that this is the merchandise-fidelity spot-check PR #151 explicitly asked for —
+  so re-enabling that pad is NOT the fix: padding a SEED bakes letterbox bands into
+  the delivered video, which is exactly why #151 reverted it.**
   *(This section is append-not-replace here on purpose: the bullets below are
   other sessions' live state and I could not establish they are stale.)*
 - Trunk `main` is moving fast — always `git fetch` before trusting a SHA here.
