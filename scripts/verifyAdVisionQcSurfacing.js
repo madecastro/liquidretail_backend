@@ -621,6 +621,19 @@ function withStubbedAdVisionQc(modulePath, extra = {}) {
       // caller missing this would throw `TypeError: ... is not a function`
       // rather than exercising the gate-off branch under test.
       resolveEnabled: async () => false,
+      // SPLIT 2026-08-21 — directImageRenderService/imageRecoveryService now
+      // call resolveStaticEnabled(), brandScriptExecutor.runVideoVisionQcForAd
+      // now calls resolveVideoEnabled(), NEITHER calls the legacy
+      // resolveEnabled() above anymore. This helper is shared by callers of
+      // both pipelines (D2 = video, D3 = static), so both new resolvers must
+      // be present here with the SAME gate-off default, or whichever caller
+      // hits the missing one throws `TypeError: ... is not a function`
+      // instead of exercising the gate-off branch under test — exactly the
+      // stale-stub class this file's own D6 check exists to catch on the
+      // production side. A per-check `extra` override can still flip either
+      // one to `true` for a gate-on scenario.
+      resolveStaticEnabled: async () => false,
+      resolveVideoEnabled: async () => false,
       warnQcDisabledOnce: (label) => { warnCalls.push(label); },
       buildPersistedVerdict: (args) => qc.buildPersistedVerdict(args),
       // Delegate to the REAL implementation (pure, no I/O) rather than
@@ -703,12 +716,14 @@ check('D4 directImageRenderService\'s gate-off early return stamps a disabled ve
   // via the resolved-boolean guard, which is what actually gates the branch
   // now; a literal `adVisionQc.isEnabled()` search would silently stop
   // finding anything the day that sync path is fully retired.
+  // SPLIT 2026-08-21 — this is the STATIC pipeline, so the call is now
+  // `resolveStaticEnabled()`, not the legacy shared `resolveEnabled()`.
   const idx = src.indexOf('if (!qcEnabledNow) {');
   assert.ok(idx !== -1, 'could not locate the gate-off early return in directImageRenderService.js');
-  // The gate must be resolved via the async, non-racy path.
+  // The gate must be resolved via the async, non-racy, STATIC-specific path.
   const gateSetup = src.slice(Math.max(0, idx - 400), idx);
-  assert.match(gateSetup, /await\s+adVisionQc\.resolveEnabled\(\)/,
-    'the gate must be resolved via awaited resolveEnabled(), not the synchronous isEnabled() TTL-cache peek');
+  assert.match(gateSetup, /await\s+adVisionQc\.resolveStaticEnabled\(\)/,
+    'the gate must be resolved via awaited resolveStaticEnabled(), not the synchronous isEnabled() TTL-cache peek nor the legacy undifferentiated resolveEnabled()');
   const closeIdx = src.indexOf('\n  }\n', idx); // this branch's own closing brace, one indent level in
   const branch = src.slice(idx, closeIdx !== -1 ? closeIdx : idx + 800);
   assert.doesNotMatch(branch, /return firstOutput;\s*\}/,
@@ -718,20 +733,36 @@ check('D4 directImageRenderService\'s gate-off early return stamps a disabled ve
   assert.match(branch, /warnQcDisabledOnce\(/, 'must warn — a flag left off for weeks must be loud in logs, not silent');
 });
 
-check('D6 [2026-08-20] the three real callers await resolveEnabled(), not the racy sync isEnabled() peek', () => {
-  // Structural regression guard for the TTL-cache-race fix: a future edit
-  // that quietly reintroduces a bare `adVisionQc.isEnabled()` call on one of
-  // these three hot paths would reopen the exact incident this pins against
-  // (a stale cache silently reading a genuinely-on DB flag as off).
+check('D6 [2026-08-20, resolver names updated 2026-08-21] the three real callers await their OWN pipeline-specific resolver, not the racy sync isEnabled() peek nor the legacy shared resolveEnabled()', () => {
+  // Structural regression guard for the TTL-cache-race fix AND the
+  // static/video gate split. A future edit that quietly reintroduces a bare
+  // `adVisionQc.isEnabled()` call, OR that calls the WRONG pipeline's
+  // resolver (e.g. brandScriptExecutor calling resolveStaticEnabled), OR
+  // that reverts to the legacy undifferentiated resolveEnabled(), would
+  // reopen either the original cache-race incident or silently merge the
+  // two gates back into one. Each site now names its OWN expected resolver
+  // — this is deliberately three separate expectations, not one shared
+  // regex, because "all three callers use resolveEnabled()" stopped being
+  // true the moment the gate split.
   const sites = [
-    { file: 'directImageRenderService.js', label: 'directImageRenderService.finishPlate' },
-    { file: 'brandScriptExecutor.js', label: 'brandScriptExecutor.runVideoVisionQcForAd' },
-    { file: 'imageRecoveryService.js', label: 'imageRecoveryService.maybeQcRecoveredPlate' }
+    { file: 'directImageRenderService.js', label: 'directImageRenderService.finishPlate', resolver: 'resolveStaticEnabled' },
+    { file: 'brandScriptExecutor.js', label: 'brandScriptExecutor.runVideoVisionQcForAd', resolver: 'resolveVideoEnabled' },
+    { file: 'imageRecoveryService.js', label: 'imageRecoveryService.maybeQcRecoveredPlate', resolver: 'resolveStaticEnabled' }
   ];
-  for (const { file, label } of sites) {
+  for (const { file, label, resolver } of sites) {
     const src = fs.readFileSync(path.join(__dirname, '..', 'services', file), 'utf8');
-    assert.match(src, /await\s+adVisionQc\.resolveEnabled\(\)/,
-      `${label} must await adVisionQc.resolveEnabled()`);
+    const re = new RegExp(`await\\s+adVisionQc\\.${resolver}\\(\\)`);
+    assert.match(src, re, `${label} must await adVisionQc.${resolver}()`);
+    // Narrower than "the string never appears": each site must not call
+    // the OTHER pipeline's resolver either — that would silently gate one
+    // pipeline's spend decision on the other pipeline's flag.
+    const otherResolver = resolver === 'resolveStaticEnabled' ? 'resolveVideoEnabled' : 'resolveStaticEnabled';
+    const otherRe = new RegExp(`adVisionQc\\.${otherResolver}\\(`);
+    assert.doesNotMatch(src, otherRe,
+      `${label} must not call adVisionQc.${otherResolver}() — that is the OTHER pipeline's gate`);
+    // And must not have quietly reverted to the legacy shared gate either.
+    assert.doesNotMatch(src, /await\s+adVisionQc\.resolveEnabled\(\)/,
+      `${label} must not revert to the legacy shared adVisionQc.resolveEnabled()`);
   }
   // isEnabled() itself may still exist as a documented legacy sync fallback
   // (adVisionQcService.js exports it, and this harness's own I1/I2 checks
@@ -934,6 +965,12 @@ await (async () => {
       // synchronous isEnabled() to `await resolveEnabled()` (cache-race
       // fix) — this stub must cover both so this section survives either.
       resolveEnabled: async () => true,
+      // SPLIT 2026-08-21 — runVideoVisionQcForAd (exercised below via a
+      // fresh brandScriptExecutor require) now calls resolveVideoEnabled(),
+      // not the legacy resolveEnabled() above. Missing this throws
+      // `TypeError: adVisionQc.resolveVideoEnabled is not a function`
+      // instead of exercising the gate-on QC-failure scenario under test.
+      resolveVideoEnabled: async () => true,
       buildAppPreviewUrl: () => 'https://app.example/preview',
       runVideoPostRenderQc: async () => ({ ok: true, skipped: false, passed: false, visionQc: fakeVerdict }),
       alertQcFailure: () => 'FAKE_SLACK_DETAIL_TEXT_FOR_TEST',
