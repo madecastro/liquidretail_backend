@@ -24,6 +24,18 @@ if (!MONGODB_URI) {
 const WORKER_ID = process.env.ADGEN_WORKER_ID
   || `${ROLE}-${crypto.randomBytes(4).toString('hex')}`;
 
+// Handoff gate — same env name backend reads. When false, the renderer
+// role sleeps (does not poll or claim) so it can be deployed without
+// stealing work from backend's in-process render loop. Backend's
+// runRenderLoop reads this same flag; both flip together.
+function isAdgenRendererEnabled() {
+  return String(process.env.ADGEN_RENDERER_ENABLED || '').toLowerCase() === 'true';
+}
+
+// Phase 1a knob — how long the mock renderer pretends work takes.
+// Phase 1b replaces this with the real render implementation.
+const MOCK_WORK_MS = Number(process.env.ADGEN_MOCK_WORK_MS || 5000);
+
 module.exports = Object.freeze({
   ROLE,
   MONGODB_URI,
@@ -32,5 +44,7 @@ module.exports = Object.freeze({
   WORKER_ID,
   LOG_LEVEL:     process.env.ADGEN_LOG_LEVEL || 'info',
   SLACK_BOT_TOKEN:     process.env.SLACK_BOT_TOKEN || null,
-  SLACK_ALERT_CHANNEL: process.env.SLACK_ALERT_CHANNEL || null
+  SLACK_ALERT_CHANNEL: process.env.SLACK_ALERT_CHANNEL || null,
+  MOCK_WORK_MS,
+  isAdgenRendererEnabled
 });
