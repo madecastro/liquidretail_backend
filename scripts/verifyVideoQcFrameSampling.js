@@ -621,6 +621,7 @@ console.log('\nverifyVideoQcFrameSampling — dense frame pre-filter for video v
 
     const originalSelect = frameSelectionService.selectQcFrameTimestamps;
     const originalIsEnabled = adVisionQc.isEnabled;
+    const originalResolveEnabled = adVisionQc.resolveEnabled;
     const originalRunVideoQc = adVisionQc.runVideoPostRenderQc;
 
     const MARKER_TIMESTAMPS = [0.3, 0.9, 6.6]; // distinctive — not the real baseline
@@ -629,7 +630,19 @@ console.log('\nverifyVideoQcFrameSampling — dense frame pre-filter for video v
     frameSelectionService.selectQcFrameTimestamps = async () => ({
       timestamps: MARKER_TIMESTAMPS, denseCount: 12, flaggedCount: 2, degraded: false
     });
+    // BOTH gates must be stubbed, and resolveEnabled() is the load-bearing one.
+    // runVideoVisionQcForAd stopped reading the synchronous isEnabled() peek on
+    // 2026-08-20 (see adVisionQcService's resolveEnabled/isEnabled doc comments —
+    // all three hot-path callers now `await resolveEnabled()` instead, precisely
+    // because the sync peek reads a 5s-TTL cache and answers "off" on a cold miss).
+    // Stubbing isEnabled alone left the REAL resolveEnabled() in the path, which
+    // (a) reached for a live SystemConfig.findOne() — so this harness was not
+    // actually offline and paid a 10s Mongoose buffering timeout on every run —
+    // and (b) then fell through to envEnabled() === false, so the gate short-
+    // circuited and runVideoPostRenderQc was never called at all. isEnabled is
+    // kept stubbed so the check does not depend on which gate the caller reads.
     adVisionQc.isEnabled = () => true;
+    adVisionQc.resolveEnabled = async () => true;
     adVisionQc.runVideoPostRenderQc = async (args) => {
       capturedFrames = args.frames;
       return {
@@ -654,6 +667,7 @@ console.log('\nverifyVideoQcFrameSampling — dense frame pre-filter for video v
     } finally {
       frameSelectionService.selectQcFrameTimestamps = originalSelect;
       adVisionQc.isEnabled = originalIsEnabled;
+      adVisionQc.resolveEnabled = originalResolveEnabled;
       adVisionQc.runVideoPostRenderQc = originalRunVideoQc;
     }
 
