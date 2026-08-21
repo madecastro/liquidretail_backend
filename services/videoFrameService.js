@@ -58,6 +58,13 @@ function planTimestamps(durationSec, { isReel = false, max = isReel ? 4 : 5 } = 
 // the rest of the clip — the pre-filter's outlier score needs frames from
 // the WHOLE clip to know what the clip's own "steady state" looks like.
 //
+// Exported so callers that need to know WHICH returned timestamps are
+// "early" (e.g. videoQcFrameSelectionService.js, to keep its outlier
+// reference derived from the "late" cluster only — see that module's file
+// header) use the exact same boundary planDenseTimestamps itself applies,
+// rather than a second hardcoded "2" that could silently drift from it.
+const DEFAULT_EARLY_WINDOW_SEC = 2;
+
 // Pure function, no I/O. Exported for direct unit testing of the timestamp
 // plan independent of network/image-decode behavior.
 function planDenseTimestamps(durationSec, opts = {}) {
@@ -65,7 +72,7 @@ function planDenseTimestamps(durationSec, opts = {}) {
   if (!Number.isFinite(d) || d <= 0) return [];
 
   const {
-    earlyWindowSec = 2,
+    earlyWindowSec = DEFAULT_EARLY_WINDOW_SEC,
     earlySampleCount = 6,
     lateSampleCount = 6
   } = opts;
@@ -184,6 +191,7 @@ async function fetchFrameBuffersAtTimestamps(videoUrl, timestamps, opts = {}) {
 }
 
 module.exports = {
+  DEFAULT_EARLY_WINDOW_SEC,
   planTimestamps,
   planDenseTimestamps,
   buildFrameUrl,

@@ -250,6 +250,33 @@ console.log('\nverifyVideoQcFrameSampling — dense frame pre-filter for video v
     assert.ok(scored.every((s) => !s.outlier));
   });
 
+  check('D5 REGRESSION (Grok finding 1): WITHOUT a reference subset, an EVEN 6/6 split flags nothing — the exact blind spot this fix closes', () => {
+    // The naive whole-set-median design breaks down here: median+MAD have
+    // a ~50% breakdown point, and an even split makes the "steady state"
+    // a blend of both halves, so nothing clears the threshold. This is
+    // the failure mode a defect spanning planDenseTimestamps' entire
+    // early cluster would hit under the OLD scoring. Documents the
+    // fallback behavior scoreOutliers still has with no referenceIndices
+    // (or too few) — see D6 for the fix that avoids this in production.
+    const sigs = Array.from({ length: 12 }, (_, i) => (i < 6 ? [1, 1] : [0, 0]));
+    const scored = sel.scoreOutliers(sigs);
+    assert.ok(scored.every((s) => !s.outlier), 'an even split is mathematically invisible to a whole-set median — documented, not a surprise');
+  });
+
+  check('D6 THE FIX: with referenceIndices pointing at the clean half, the SAME even 6/6 split is fully caught', () => {
+    const sigs = Array.from({ length: 12 }, (_, i) => (i < 6 ? [1, 1] : [0, 0]));
+    const referenceIndices = [6, 7, 8, 9, 10, 11]; // the clean half only
+    const scored = sel.scoreOutliers(sigs, { referenceIndices });
+    const flaggedIdx = scored.map((s, i) => (s.outlier ? i : -1)).filter((i) => i >= 0);
+    assert.deepStrictEqual(flaggedIdx, [0, 1, 2, 3, 4, 5], 'every defect frame must be flagged once the reference is uncontaminated');
+  });
+
+  check('D7 a reference subset shorter than MIN_REFERENCE_FRAMES falls back to whole-set scoring (degrades to D5, not a crash)', () => {
+    const sigs = Array.from({ length: 12 }, (_, i) => (i < 6 ? [1, 1] : [0, 0]));
+    const scored = sel.scoreOutliers(sigs, { referenceIndices: [6, 7] }); // only 2 — below MIN_REFERENCE_FRAMES
+    assert.ok(scored.every((s) => !s.outlier), 'too-small a reference subset must fall back, not divide by near-zero spread');
+  });
+
   // ── E. selectQcFrameTimestamps orchestration (mocked transport only) ─
   //
   // ADVERSARIAL-REVIEW FIX (2026-08-20, Grok): every mock in this section
@@ -363,22 +390,46 @@ console.log('\nverifyVideoQcFrameSampling — dense frame pre-filter for video v
     assert.ok(!result.timestamps.includes(5.8) && !result.timestamps.includes(8.5));
   });
 
-  await checkAsync('E7 redundancy filter DISCRIMINATES: a near-baseline outlier is dropped while a real, far outlier in the SAME call survives', async () => {
-    // ADVERSARIAL-REVIEW FIX (Grok): the old version only asserted "the
-    // near-duplicate is absent" and "flaggedCount is 0" — both also true
-    // if scoreOutliers simply never flagged ANYTHING, or if the call
-    // degraded to baseline. Neither of those actually exercises the 0.4s
-    // redundancy filter. Also, the old injected "near-duplicate" (2.6s)
-    // was not even a real planDenseTimestamps output — it only existed
-    // because the mock manually concatenated it.
-    //
-    // Fixed with a POSITIVE CONTROL in the same call: 7.2s is a REAL dense
-    // timestamp only 0.3s from the 7.5s baseline (must be dropped as
-    // redundant); 1.6s is a REAL dense timestamp 0.9s from its nearest
-    // baseline (2.5s) and must survive. Both score as outliers; only one
-    // should make it through, which is the only way to tell "the filter
-    // discriminates" from "nothing got through".
-    const outlierTimestamps = new Set([7.2, 1.6]);
+  await checkAsync('E7 REGRESSION (Grok finding 2): a real outlier close in TIME to a baseline quartile is KEPT, not dropped as a false "redundancy"', async () => {
+    // The first version of this file dropped any flagged outlier within
+    // 0.4s of a baseline quartile, reasoning it was "probably the same
+    // moment" as a frame already covered. An adversarial review showed
+    // that reasoning is backwards for exactly the frames this module
+    // flags: a defect visible ONLY at a REAL dense timestamp (7.2s) and
+    // gone by the very next baseline quartile (7.5s, 0.3s later) would
+    // have been silently dropped, handing the vision model the clean
+    // 7.5s frame and calling it covered — reintroducing the "quartile
+    // sampling missed it" failure this whole feature exists to fix, just
+    // at a 0.4s radius instead of a multi-second one. Proximity-based
+    // redundancy filtering is REMOVED (see file header); this pins that
+    // removal behaviorally.
+    const result = await sel.selectQcFrameTimestamps(
+      { deliveredUrl: CLOUDINARY_URL, durationSec: 10 },
+      {
+        fetchDenseFrames: async (url, stamps) => {
+          assert.deepStrictEqual(stamps, denseSet, 'must probe the REAL planDenseTimestamps(10) output');
+          return stamps.map((t) => ({ timestampSec: t, buffer: bufFor(t) }));
+        },
+        computeFrameSignature: async (buf) => (Number(buf.toString()) === 7.2 ? [1, 1] : [0, 0])
+      }
+    );
+    assert.strictEqual(result.degraded, false);
+    assert.ok(result.timestamps.includes(7.2),
+      'a real outlier 0.3s from the 7.5s baseline must survive — it is NOT redundant just because it is nearby in time');
+    assert.strictEqual(result.flaggedCount, 1);
+  });
+
+  await checkAsync('E8 REGRESSION (Grok finding 1, THE confirmed bug): a defect spanning the ENTIRE early cluster (even 6/6 split) is still caught end-to-end', async () => {
+    // Direct behavioral analogue of D5/D6 through the real orchestration
+    // function: planDenseTimestamps(10) puts exactly 6 of its 12 samples
+    // in the early (<=2s) cluster. A defect visible across ALL of them
+    // (not a 1-2 frame flash, but ~2 continuous seconds of it — the same
+    // "gone by the 2.5s quartile" shape as the real incident, just
+    // lasting the whole early window) is an even 6/6 split, which is
+    // mathematically invisible to a whole-set median (see D5). Proves
+    // the fix: scoring every frame against a LATE-cluster-only reference
+    // (selectQcFrameTimestamps's real wiring, not a stub) still flags it.
+    const EARLY = videoFrameService.DEFAULT_EARLY_WINDOW_SEC;
     const result = await sel.selectQcFrameTimestamps(
       { deliveredUrl: CLOUDINARY_URL, durationSec: 10 },
       {
@@ -388,16 +439,14 @@ console.log('\nverifyVideoQcFrameSampling — dense frame pre-filter for video v
         },
         computeFrameSignature: async (buf) => {
           const t = Number(buf.toString());
-          return outlierTimestamps.has(t) ? [1, 1] : [0, 0];
+          return t <= EARLY ? [1, 1] : [0, 0];
         }
       }
     );
-    assert.strictEqual(result.degraded, false);
-    assert.ok(!result.timestamps.includes(7.2),
-      'a near-duplicate of the 7.5s baseline (0.3s away) must not double up');
-    assert.ok(result.timestamps.includes(1.6),
-      'a real, far outlier (0.9s from its nearest baseline) in the SAME call must survive — proves this is discrimination, not universal suppression');
-    assert.strictEqual(result.flaggedCount, 1, 'exactly one of the two flagged outliers should have cleared the redundancy filter');
+    const extras = result.timestamps.filter((t) => !sel.baselineTimestamps(10).includes(t));
+    assert.ok(extras.length > 0, 'the entire-early-cluster defect must produce at least one flagged frame, not zero');
+    assert.ok(extras.every((t) => t <= EARLY), 'every flagged extra must come from the defective early cluster, not the clean late one');
+    assert.strictEqual(result.flaggedCount, Math.min(sel.MAX_EXTRA_FRAMES, 6));
   });
 
   // ── F. THE REAL BEHAVIORAL PROOF: real JPEGs, the actual 2026-08-20 defect ─
