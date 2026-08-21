@@ -84,6 +84,9 @@ console.log('\nverifyAdVisionQc — post-render vision QC contracts\n');
 check('A1 MAX_QC_REGENERATIONS is exactly 1 (money hard bound)', () => {
   assert.strictEqual(qc.MAX_QC_REGENERATIONS, 1);
 });
+check('A1b PASS_FLOOR is exactly 7 (must not move)', () => {
+  assert.strictEqual(qc.PASS_FLOOR, 7);
+});
 check('A2 CATEGORIES has all four required checks', () => {
   assert.deepStrictEqual([...qc.CATEGORIES], [
     'competitor_marks', 'product_fidelity', 'text_defects', 'layout_safe_box'
@@ -124,6 +127,505 @@ check('A5 buildCorrectiveNote names the invented mark', () => {
   assert.match(note, /tree emblem/i);
   assert.match(note, /CRITICAL/i);
   assert.match(note, /competitor/i);
+});
+
+// ── AA. parseVerdict SHAPE TOLERANCE (garbled-but-JSON model replies) ──
+// Fixed 2026-08-20: parseVerdict used to fail-closed on ANY shape drift from
+// {categories:{<key>:{score,pass,findings}}} — a bare boolean, findings
+// hoisted to the root, a missing `categories` wrapper, or JSON wrapped in
+// fences/prose all fell into the same "not JSON" branch or silently zeroed a
+// category via `false || {}`. That consumed the single allowed static
+// regeneration (or failed an already-paid VIDEO out of draft) on pure model
+// noise, not a real defect. Tolerance is SHAPE-only: every check below that
+// exercises a real defect (bad score) must still fail; only the JSON
+// wrapping/nesting drift is forgiven. See parseVerdict's own header comment
+// for the full drift list and the direction-of-boolean reasoning.
+check('AA1 bare boolean TRUE for competitor_marks still FAILS (never a guessed pass)', () => {
+  const v = qc.parseVerdict({
+    categories: {
+      competitor_marks: true,
+      product_fidelity: { score: 9, findings: [] },
+      text_defects:     { score: 9, findings: [] },
+      layout_safe_box:  { score: 9, findings: [] }
+    },
+    summary: 'x'
+  });
+  assert.strictEqual(v.categories.competitor_marks.pass, false,
+    'a bare `true` must never be interpreted as a passing score — direction is ambiguous');
+  assert.strictEqual(v.categories.competitor_marks.score, 0);
+  assert.strictEqual(v.pass, false);
+  const text = v.categories.competitor_marks.findings.join(' ');
+  assert.match(text, /bare boolean/i);
+  assert.match(text, /ambiguous/i);
+});
+check('AA2 bare boolean FALSE for competitor_marks ALSO fails (symmetric — not a guessed pass either)', () => {
+  const v = qc.parseVerdict({
+    categories: {
+      competitor_marks: false,
+      product_fidelity: { score: 9, findings: [] },
+      text_defects:     { score: 9, findings: [] },
+      layout_safe_box:  { score: 9, findings: [] }
+    }
+  });
+  assert.strictEqual(v.categories.competitor_marks.pass, false);
+  assert.strictEqual(v.categories.competitor_marks.score, 0);
+  assert.match(v.categories.competitor_marks.findings.join(' '), /bare boolean/i);
+});
+check('AA3 all four categories as bare booleans → overall FAIL, not a false pass', () => {
+  const v = qc.parseVerdict({
+    categories: {
+      competitor_marks: true,
+      product_fidelity: true,
+      text_defects: true,
+      layout_safe_box: true
+    }
+  });
+  for (const k of qc.CATEGORIES) {
+    assert.strictEqual(v.categories[k].pass, false, `${k} must not pass on a bare boolean`);
+  }
+  assert.strictEqual(v.pass, false);
+});
+check('AA4 findings hoisted to a top-level object keyed by category are attributed to that category', () => {
+  const v = qc.parseVerdict({
+    categories: {
+      competitor_marks: { score: 2 },
+      product_fidelity: { score: 9 },
+      text_defects:     { score: 9 },
+      layout_safe_box:  { score: 9 }
+    },
+    findings: { competitor_marks: ['tree emblem on midfoot'] },
+    summary: 'x'
+  });
+  assert.deepStrictEqual(v.categories.competitor_marks.findings, ['tree emblem on midfoot']);
+  assert.strictEqual(v.categories.competitor_marks.pass, false, 'hoisting findings must not touch the score-derived pass');
+  assert.ok(v.findings.some((f) => f.includes('tree emblem on midfoot')));
+});
+check('AA5 a flat hoisted findings array is kept as unattributed [general] context on a FAILING verdict', () => {
+  const v = qc.parseVerdict({
+    categories: {
+      competitor_marks: { score: 2 },
+      product_fidelity: { score: 9 },
+      text_defects:     { score: 9 },
+      layout_safe_box:  { score: 9 }
+    },
+    findings: ['something looked off overall'],
+    summary: 'x'
+  });
+  assert.ok(v.findings.some((f) => /\[general\].*something looked off overall/.test(f)));
+});
+check('AA6 a flat hoisted findings array must NOT leak onto a PASSING verdict', () => {
+  const v = qc.parseVerdict({
+    categories: {
+      competitor_marks: { score: 9 },
+      product_fidelity: { score: 9 },
+      text_defects:     { score: 9 },
+      layout_safe_box:  { score: 9 }
+    },
+    findings: ['stray commentary'],
+    summary: 'x'
+  });
+  assert.strictEqual(v.pass, true);
+  assert.deepStrictEqual(v.findings, [], 'unattributed findings must never appear on a pass');
+});
+check('AA7 missing `categories` wrapper — keys at the root — parses exactly like the nested shape', () => {
+  const v = qc.parseVerdict({
+    competitor_marks: { score: 9, findings: [] },
+    product_fidelity: { score: 9, findings: [] },
+    text_defects:     { score: 9, findings: [] },
+    layout_safe_box:  { score: 9, findings: [] },
+    summary: 'root ok'
+  });
+  assert.strictEqual(v.pass, true);
+  for (const k of qc.CATEGORIES) assert.strictEqual(v.categories[k].score, 9);
+});
+check('AA8 PARTIAL hoist — some categories nested, one loose at the root, one genuinely absent — recovers the loose one and still fails the absent one', () => {
+  const v = qc.parseVerdict({
+    categories: {
+      competitor_marks: { score: 9, findings: [] },
+      product_fidelity: { score: 9, findings: [] }
+      // text_defects intentionally absent from BOTH categories and root
+    },
+    layout_safe_box: { score: 8, findings: [] }, // hoisted to root, no wrapper entry
+    summary: 'x'
+  });
+  assert.strictEqual(v.categories.competitor_marks.score, 9);
+  assert.strictEqual(v.categories.layout_safe_box.score, 8, 'root-level fallback must recover a per-key hoist');
+  assert.strictEqual(v.categories.text_defects.score, 0, 'a category present nowhere must still fail');
+  assert.strictEqual(v.categories.text_defects.pass, false);
+  assert.strictEqual(v.pass, false);
+});
+check('AA9 prose-wrapped JSON (sentence before AND after, no fences) is salvaged', () => {
+  const payload = JSON.stringify({
+    categories: {
+      competitor_marks: { score: 9, findings: [] },
+      product_fidelity: { score: 9, findings: [] },
+      text_defects:     { score: 9, findings: [] },
+      layout_safe_box:  { score: 9, findings: [] }
+    },
+    summary: 'clean'
+  });
+  const v = qc.parseVerdict(`Sure, here is the verdict:\n${payload}\nLet me know if you need anything else!`);
+  assert.strictEqual(v.parseError, null);
+  assert.strictEqual(v.pass, true);
+});
+check('AA10 fenced JSON with trailing commentary AFTER the closing fence is salvaged', () => {
+  // The existing fence-strip regex anchors the trailing ``` at the END of the
+  // string ( ```\s*$ ) — a model that adds a sentence after the closing fence
+  // defeats that strip, and a bare JSON.parse then throws on the leftover
+  // "```\nHope that helps!" tail. This is exactly what salvageVerdictJson's
+  // balanced-brace scan must recover.
+  const payload = JSON.stringify({
+    categories: {
+      competitor_marks: { score: 2, findings: ['tree mark'] },
+      product_fidelity: { score: 9, findings: [] },
+      text_defects:     { score: 9, findings: [] },
+      layout_safe_box:  { score: 9, findings: [] }
+    },
+    summary: 'fail'
+  });
+  const v = qc.parseVerdict('```json\n' + payload + '\n```\nHope that helps!');
+  assert.strictEqual(v.parseError, null, 'must not fall into the parse-error branch');
+  assert.strictEqual(v.pass, false);
+  assert.strictEqual(v.categories.competitor_marks.score, 2);
+  assert.deepStrictEqual(v.categories.competitor_marks.findings, ['tree mark']);
+});
+check('AA11 pure prose with NO JSON object anywhere still fails closed exactly as before', () => {
+  const v = qc.parseVerdict('I cannot process this request right now.');
+  assert.notStrictEqual(v.parseError, null);
+  for (const k of qc.CATEGORIES) {
+    assert.strictEqual(v.categories[k].pass, false);
+    assert.strictEqual(v.categories[k].score, 0);
+  }
+  assert.strictEqual(v.pass, false);
+});
+check('AA12 a genuinely absent category (present nowhere) still fails even with three real 9s and no wrapper drift', () => {
+  const v = qc.parseVerdict({
+    categories: {
+      competitor_marks: { score: 9, findings: [] },
+      product_fidelity: { score: 9, findings: [] },
+      text_defects:     { score: 9, findings: [] }
+      // layout_safe_box: intentionally omitted
+    },
+    summary: 'x'
+  });
+  assert.strictEqual(v.categories.layout_safe_box.score, 0);
+  assert.strictEqual(v.categories.layout_safe_box.pass, false);
+  assert.strictEqual(v.pass, false, 'one missing category must fail the whole verdict');
+});
+check('AA13 a decoy empty {} earlier in the prose must not win over the real payload later in the text', () => {
+  // Adversarial case for the multi-candidate salvage: naively taking the
+  // FIRST balanced span would parse the decoy "{}" successfully and stop
+  // there, silently discarding the real verdict that follows.
+  const payload = JSON.stringify({
+    categories: {
+      competitor_marks: { score: 2, findings: ['tree mark'] },
+      product_fidelity: { score: 9, findings: [] },
+      text_defects:     { score: 9, findings: [] },
+      layout_safe_box:  { score: 9, findings: [] }
+    },
+    summary: 'fail'
+  });
+  const v = qc.parseVerdict(`Note: {} is just an empty example. Real verdict: ${payload}`);
+  assert.strictEqual(v.parseError, null);
+  assert.strictEqual(v.pass, false, 'must have picked the real payload, not the decoy {}');
+  assert.strictEqual(v.categories.competitor_marks.score, 2);
+});
+check('AA14 JSON5-only-valid payload (trailing comma) inside prose is still salvaged', () => {
+  const withTrailingComma =
+    '{"categories":{' +
+    '"competitor_marks":{"score":9,"findings":[]},' +
+    '"product_fidelity":{"score":9,"findings":[]},' +
+    '"text_defects":{"score":9,"findings":[]},' +
+    '"layout_safe_box":{"score":9,"findings":[]},' +
+    '},"summary":"clean",}'; // trailing commas — invalid strict JSON, valid JSON5
+  const v = qc.parseVerdict(`Here you go:\n${withTrailingComma}\nDone.`);
+  assert.strictEqual(v.parseError, null);
+  assert.strictEqual(v.pass, true);
+});
+
+// ── AA16-AA20: adversarial review findings (2026-08-20) ────────────────
+// A first draft of the salvage candidate-selection heuristic ("prefer the
+// LAST balanced span with an object `categories` key") was reviewed by an
+// independent adversarial pass BEFORE this landed, specifically hunting for
+// an input where the new tolerance lets a REAL defect ship as a pass. It
+// found one, live, on the real parseVerdict: a genuine failing verdict
+// followed by ANY later object that also happens to have a `categories` key
+// (a restated "example of the shape", a second "cleaned up" draft, a
+// revision) had its FAIL silently discarded in favour of the later, more
+// passing-looking object. These five checks pin the fix (scan every
+// verdict-shaped candidate; prefer ANY that fails over all that pass) and
+// the narrower follow-up it exposed (a balanced span that opens like a real
+// JSON object and then fails to parse — quote-tracking corruption, not
+// decorative prose — must not be silently skipped past).
+check('AA16 a real FAIL followed by a later passing "example of the shape" object must still fail (the exact adversarial-review counterexample)', () => {
+  const text = 'Here is my verdict:\n' +
+    JSON.stringify({
+      categories: {
+        competitor_marks: { score: 2, findings: ['tree emblem on midfoot'] },
+        product_fidelity: { score: 9, findings: [] },
+        text_defects:     { score: 9, findings: [] },
+        layout_safe_box:  { score: 9, findings: [] }
+      },
+      summary: 'fail — tree mark on midfoot'
+    }) +
+    '\n\nExample of a passing report in the required shape:\n' +
+    JSON.stringify({
+      categories: {
+        competitor_marks: { score: 9, findings: [] },
+        product_fidelity: { score: 9, findings: [] },
+        text_defects:     { score: 9, findings: [] },
+        layout_safe_box:  { score: 9, findings: [] }
+      },
+      summary: 'one-line overall'
+    });
+  const v = qc.parseVerdict(text);
+  assert.strictEqual(v.parseError, null, 'must salvage, not fall into the parse-error branch');
+  assert.strictEqual(v.pass, false, 'the real fail must not be discarded in favour of the trailing example');
+  assert.strictEqual(v.categories.competitor_marks.score, 2);
+  assert.deepStrictEqual(v.categories.competitor_marks.findings, ['tree emblem on midfoot']);
+});
+check('AA17 same counterexample, ORDER REVERSED (passing example first, real fail second) — order must not matter', () => {
+  const text = 'Example of the required shape:\n' +
+    JSON.stringify({
+      categories: {
+        competitor_marks: { score: 9, findings: [] },
+        product_fidelity: { score: 9, findings: [] },
+        text_defects:     { score: 9, findings: [] },
+        layout_safe_box:  { score: 9, findings: [] }
+      },
+      summary: 'one-line overall'
+    }) +
+    '\n\nHere is my real verdict:\n' +
+    JSON.stringify({
+      categories: {
+        competitor_marks: { score: 2, findings: ['tree emblem on midfoot'] },
+        product_fidelity: { score: 9, findings: [] },
+        text_defects:     { score: 9, findings: [] },
+        layout_safe_box:  { score: 9, findings: [] }
+      },
+      summary: 'fail — tree mark on midfoot'
+    });
+  const v = qc.parseVerdict(text);
+  assert.strictEqual(v.pass, false, 'a real fail earlier or later must never be beaten by a passing decoy');
+  assert.strictEqual(v.categories.competitor_marks.score, 2);
+});
+check('AA18 a decoy-empty-{} case that legitimately passes still passes (AA13 must not have been "fixed" by over-blocking everything)', () => {
+  const text = 'Note: {} is just an empty example. Real verdict: ' +
+    JSON.stringify({
+      categories: {
+        competitor_marks: { score: 9, findings: [] },
+        product_fidelity: { score: 9, findings: [] },
+        text_defects:     { score: 9, findings: [] },
+        layout_safe_box:  { score: 9, findings: [] }
+      },
+      summary: 'clean'
+    });
+  const v = qc.parseVerdict(text);
+  assert.strictEqual(v.parseError, null);
+  assert.strictEqual(v.pass, true, 'a genuinely clean verdict salvaged past a benign decoy must still pass');
+});
+check('AA19 a truncated SECOND JSON value elsewhere in the reply forces fail-closed, even though the FIRST value parsed cleanly', () => {
+  // Two top-level values: a complete root-shaped (no `categories` wrapper)
+  // passing "example", then a genuinely truncated real verdict. Naive
+  // candidate-picking (skip whatever failed to balance, trust whatever DID
+  // parse) would silently ship the passing example. The unrecoverable-span
+  // signal must refuse to guess here.
+  const text = JSON.stringify({
+    competitor_marks: { score: 9, findings: [] },
+    product_fidelity: { score: 9, findings: [] },
+    text_defects:     { score: 9, findings: [] },
+    layout_safe_box:  { score: 9, findings: [] },
+    summary: 'example of the format'
+  }) + '\n' +
+    '{"categories": {"competitor_marks": {"score": 2, "findings": ["tree emblem on midfoot"]}, "product_fidelity": {"score": 4, "findings": ["colourway drift"]';
+  const v = qc.parseVerdict(text);
+  assert.notStrictEqual(v.parseError, null, 'a truncated second value must fail closed, not silently trust the first');
+  assert.strictEqual(v.pass, false);
+});
+check('AA20 unescaped quotes that corrupt the scan and expose a coincidentally-nested passing blob must fail closed, not adopt the nested blob', () => {
+  const text = '{"categories": {"competitor_marks": {"score": 2, "findings": ["saw {' +
+    '"categories": {"competitor_marks": {"score": 9, "findings": []}, ' +
+    '"product_fidelity": {"score": 9, "findings": []}, "text_defects": {"score": 9, "findings": []}, ' +
+    '"layout_safe_box": {"score": 9, "findings": []}}} inside"]}}}';
+  const v = qc.parseVerdict(text);
+  assert.notStrictEqual(v.parseError, null, 'quote-corrupted text must fail closed rather than adopt a nested fragment');
+  assert.strictEqual(v.pass, false);
+  assert.notStrictEqual(v.categories.competitor_marks.score, 9,
+    'must not have silently adopted the nested passing example');
+});
+check('AA21 `categories` present but the WRONG TYPE (a string, or an array) must not fall back to coincidental root-level scores', () => {
+  // Root-fallback exists for a MISSING wrapper (drift #2). A `categories`
+  // key that IS present but malformed (a stringified sub-verdict, or an
+  // array) is a different, more corrupted signal — trusting root data here
+  // would let an unrelated root shape override a categories value the model
+  // clearly (if badly) tried to nest, and a real fail sitting inside that
+  // string/array must not be silently replaced by passing root scores.
+  const stringCategories = qc.parseVerdict({
+    categories: JSON.stringify({ competitor_marks: { score: 2, findings: ['tree'] } }),
+    competitor_marks: { score: 9, findings: [] },
+    product_fidelity: { score: 9, findings: [] },
+    text_defects:     { score: 9, findings: [] },
+    layout_safe_box:  { score: 9, findings: [] }
+  });
+  assert.strictEqual(stringCategories.pass, false, 'a string `categories` must not let root 9s win');
+  assert.strictEqual(stringCategories.categories.competitor_marks.score, 0);
+
+  const arrayCategories = qc.parseVerdict({
+    categories: [{ name: 'competitor_marks', score: 2, findings: ['tree'] }],
+    competitor_marks: { score: 9, findings: [] },
+    product_fidelity: { score: 9, findings: [] },
+    text_defects:     { score: 9, findings: [] },
+    layout_safe_box:  { score: 9, findings: [] }
+  });
+  assert.strictEqual(arrayCategories.pass, false, 'an array `categories` must not let root 9s win');
+  assert.strictEqual(arrayCategories.categories.competitor_marks.score, 0);
+});
+
+// ── AA22–AA27: duplicate-key false pass + the two secondary holes ──
+// AA16–AA21 pin MULTI-SPAN fail-wins. They cannot see this bug: JSON.parse
+// on the whole string succeeds, pickSafestCandidate never runs, last-wins
+// ships a pass. A stub that implements only multi-span fail-wins and still
+// JSON.parse's the whole string stays GREEN on AA16–AA21 and MUST now FAIL
+// AA22, AA23, and AA24.
+//
+// Policy pin on AA22–AA24: score is 0 (unparseable), not 2 (clever fail-wins
+// by re-parsing both values). JS object literals cannot express this input
+// — they last-wins at parse too — so these three are STRINGS.
+check('AA22 duplicate `categories` key inside ONE object must fail closed (the measured JSON.parse last-wins false pass)', () => {
+  const text = [
+    '{',
+    '  "categories": ' + JSON.stringify({
+      competitor_marks: { score: 2, findings: ['tree emblem on midfoot'] },
+      product_fidelity: { score: 9, findings: [] },
+      text_defects:     { score: 9, findings: [] },
+      layout_safe_box:  { score: 9, findings: [] }
+    }) + ',',
+    '  "summary": "FAIL — competitor mark present",',
+    '  "categories": ' + JSON.stringify({
+      competitor_marks: { score: 9, findings: [] },
+      product_fidelity: { score: 9, findings: [] },
+      text_defects:     { score: 9, findings: [] },
+      layout_safe_box:  { score: 9, findings: [] }
+    }),
+    '}'
+  ].join('\n');
+  const v = qc.parseVerdict(text);
+  assert.notStrictEqual(v.parseError, null, 'duplicate keys must be unparseable, not last-wins');
+  assert.match(String(v.parseError), /duplicate/i);
+  assert.strictEqual(v.pass, false);
+  assert.strictEqual(v.categories.competitor_marks.score, 0,
+    'unparseable — must not pick either restatement (last-wins 9 OR fail-wins 2)');
+  for (const k of qc.CATEGORIES) {
+    assert.strictEqual(v.categories[k].pass, false, `${k} must fail closed`);
+    assert.strictEqual(v.categories[k].score, 0);
+  }
+});
+check('AA23 duplicate per-category key (`competitor_marks` twice) must fail closed', () => {
+  const text = [
+    '{',
+    '  "categories": {',
+    '    "competitor_marks": {"score":2,"findings":["tree emblem"]},',
+    '    "product_fidelity": {"score":9,"findings":[]},',
+    '    "text_defects": {"score":9,"findings":[]},',
+    '    "layout_safe_box": {"score":9,"findings":[]},',
+    '    "competitor_marks": {"score":9,"findings":[]}',
+    '  },',
+    '  "summary": "FAIL — competitor mark present"',
+    '}'
+  ].join('\n');
+  const v = qc.parseVerdict(text);
+  assert.match(String(v.parseError), /duplicate/i);
+  assert.strictEqual(v.pass, false);
+  assert.strictEqual(v.categories.competitor_marks.score, 0);
+});
+check('AA24 JSON5 salvage path (trailing comma) + duplicate `categories` must fail closed', () => {
+  // Trailing comma → JSON.parse throws → salvage JSON5.parse last-wins
+  // unless the raw-text duplicate check runs on this path too. A fix that
+  // only guards the JSON.parse-success arm stays green on AA22 and red here.
+  const json5Dup = [
+    '{',
+    '  "categories": ' + JSON.stringify({
+      competitor_marks: { score: 2, findings: ['tree emblem on midfoot'] },
+      product_fidelity: { score: 9, findings: [] },
+      text_defects:     { score: 9, findings: [] },
+      layout_safe_box:  { score: 9, findings: [] }
+    }) + ',',
+    '  "summary": "FAIL — competitor mark present",',
+    '  "categories": ' + JSON.stringify({
+      competitor_marks: { score: 9, findings: [] },
+      product_fidelity: { score: 9, findings: [] },
+      text_defects:     { score: 9, findings: [] },
+      layout_safe_box:  { score: 9, findings: [] }
+    }) + ',',
+    '}'
+  ].join('\n');
+  const v = qc.parseVerdict('Here you go:\n' + json5Dup + '\nDone.');
+  assert.match(String(v.parseError), /duplicate/i);
+  assert.strictEqual(v.pass, false);
+  assert.strictEqual(v.categories.competitor_marks.score, 0);
+});
+check('AA25 empty `categories: {}` decoy must not fail-wins over a later genuine pass', () => {
+  // AA18's decoy is `{}` (NOT verdict-shaped). This decoy has a categories
+  // key and used to look verdict-shaped, so pickSafestCandidate returned
+  // that fail and never scored the real pass.
+  const text = 'Draft: {"categories":{}}\nReal: ' + JSON.stringify({
+    categories: {
+      competitor_marks: { score: 9, findings: [] },
+      product_fidelity: { score: 9, findings: [] },
+      text_defects:     { score: 9, findings: [] },
+      layout_safe_box:  { score: 9, findings: [] }
+    },
+    summary: 'clean'
+  });
+  const v = qc.parseVerdict(text);
+  assert.strictEqual(v.parseError, null);
+  assert.strictEqual(v.pass, true);
+  assert.strictEqual(v.categories.competitor_marks.score, 9);
+});
+check('AA26 `categories: null` must not fall through to root-level 9s', () => {
+  const v = qc.parseVerdict({
+    categories: null,
+    competitor_marks: { score: 9, findings: [] },
+    product_fidelity: { score: 9, findings: [] },
+    text_defects:     { score: 9, findings: [] },
+    layout_safe_box:  { score: 9, findings: [] },
+    summary: 'should not pass'
+  });
+  assert.strictEqual(v.pass, false, 'null wrapper is present-but-malformed, not omitted');
+  for (const k of qc.CATEGORIES) {
+    assert.strictEqual(v.categories[k].score, 0);
+    assert.strictEqual(v.categories[k].pass, false);
+  }
+});
+check('AA27 null INSIDE the categories wrapper must not fall through to a root-level 9', () => {
+  const v = qc.parseVerdict({
+    categories: {
+      competitor_marks: null,
+      product_fidelity: { score: 9, findings: [] },
+      text_defects:     { score: 9, findings: [] },
+      layout_safe_box:  { score: 9, findings: [] }
+    },
+    competitor_marks: { score: 9, findings: [] },
+    summary: 'should not pass'
+  });
+  assert.strictEqual(v.pass, false);
+  assert.strictEqual(v.categories.competitor_marks.score, 0,
+    'present-as-null is not a missing key; AA8 root fallback must not fire');
+  assert.strictEqual(v.categories.product_fidelity.score, 9);
+});
+
+check('AA15 the JSON5 fallback used by salvage is actually IMPORTED, not just called (no-undef cannot be trusted alone)', () => {
+  // CLAUDE.md §5: a source-text harness cannot see an unbound identifier —
+  // `receiptFree` / `preferUgcMediaId` / `usableProofCommentsOrNone` all
+  // shipped broken because a check asserted the CALL existed without
+  // asserting the IMPORT did too. `eslint`'s no-undef would catch a missing
+  // require at lint time, but this offline harness must not depend on a
+  // separate lint pass having been run — assert both here.
+  const src = require('fs').readFileSync(
+    path.join(__dirname, '..', 'services', 'adVisionQcService.js'), 'utf8'
+  );
+  assert.match(src, /require\(\s*['"]json5['"]\s*\)/, 'JSON5 must be required');
+  assert.match(src, /JSON5\.parse\(/, 'JSON5 must actually be used (salvage fallback)');
 });
 
 // ── B. Both images, correctly labelled ───────────────────────────────

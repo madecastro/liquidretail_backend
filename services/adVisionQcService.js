@@ -69,6 +69,11 @@
 'use strict';
 
 const { chatCompletion } = require('./atlasLlmService');
+// Salvage-only fallback for a garbled-but-still-JSON verdict — see
+// salvageVerdictJson()'s header for why this is a LOCAL port of
+// aiCreativeDirectorService's balanced-brace algorithm rather than an
+// import of that module.
+const JSON5 = require('json5');
 
 // ── MONEY INVARIANT ───────────────────────────────────────────────────
 // Exactly one regeneration is allowed after a failed QC pass. This is a
@@ -496,32 +501,401 @@ function emptyCategories(reason) {
 }
 
 /**
- * Normalize model JSON into a stable verdict shape. Pure — no I/O.
+ * String-aware balanced {...} span starting at `start` — a brace inside a
+ * quoted finding string cannot end the object early. Local port of
+ * aiCreativeDirectorService's `balancedSpanFrom` (both quote chars tracked
+ * for the same JSON5-single-quote reason that file documents). Returns null
+ * when nothing balances.
  */
-function parseVerdict(raw) {
-  let parsed = raw;
-  if (typeof raw === 'string') {
-    const cleaned = String(raw).replace(/^\s*```(?:json)?\s*/i, '').replace(/```\s*$/, '');
-    try { parsed = JSON.parse(cleaned); }
-    catch (err) {
-      return {
-        pass: false,
-        parseError: err.message,
-        categories: emptyCategories('vision response was not JSON'),
-        summary: 'parse failure — treating as QC fail (safe default)',
-        findings: ['vision response was not JSON']
-      };
+function balancedSpanFrom(s, start) {
+  if (start < 0 || s[start] !== '{') return null;
+  let depth = 0;
+  let quote = null;
+  let escape = false;
+  for (let i = start; i < s.length; i++) {
+    const c = s[i];
+    if (quote) {
+      if (escape) { escape = false; continue; }
+      if (c === '\\') { escape = true; continue; }
+      if (c === quote) quote = null;
+      continue;
+    }
+    if (c === '"' || c === "'") { quote = c; continue; }
+    if (c === '{') depth++;
+    else if (c === '}') {
+      depth--;
+      if (depth === 0) return s.slice(start, i + 1);
     }
   }
-  const catsIn = parsed?.categories || {};
+  return null;
+}
+
+/**
+ * Does the RAW TEXT of a vision reply state a load-bearing key more than
+ * once inside the same object? `categories` and the four category names are
+ * load-bearing: they are what scoreVerdictCategories reads. `summary` is
+ * not — it never flips pass/fail.
+ *
+ * WHY THIS CANNOT BE A POST-PARSE RULE. JSON.parse (and JSON5.parse) keep
+ * the LAST duplicate key. A JSON.parse reviver also never sees the discarded
+ * value (verified: one reviver call per unique key, already last-wins). So
+ * pickSafestCandidate cannot fail-wins a restatement that was collapsed
+ * inside a single object — it never receives both. That is the same bug
+ * class AA16 pins for MULTIPLE spans, one level lower.
+ *
+ * POLICY: fail CLOSED on that ambiguity. Do not reconstruct both values
+ * and pick the failing one. Two statements of the same load-bearing key
+ * in one object make the reply unparseable, same as "not JSON". A false
+ * FAIL costs one static regeneration; a false PASS ships a defective ad.
+ * Multi-span replies (a real fail object AND a later example object) are
+ * a different shape — those still go through pickSafestCandidate. This
+ * detector counts keys PER OBJECT, so two sibling objects each with one
+ * `categories` key do not trip it.
+ *
+ * JSON5 salvage (trailing commas, single quotes, unquoted keys, comments)
+ * uses the same walk: a duplicate the strict parser never got to see is
+ * still a duplicate.
+ */
+function hasDuplicateLoadBearingKeys(text) {
+  const LOAD_BEARING_KEYS = new Set(['categories', ...CATEGORIES]);
+  const s = String(text == null ? '' : text);
+
+  function skipWsAndComments(i) {
+    while (i < s.length) {
+      const c = s[i];
+      if (c === ' ' || c === '\t' || c === '\n' || c === '\r' || c === '\f' || c === '\v') { i += 1; continue; }
+      if (c === '/' && s[i + 1] === '/') {
+        const nl = s.indexOf('\n', i);
+        i = nl < 0 ? s.length : nl + 1;
+        continue;
+      }
+      if (c === '/' && s[i + 1] === '*') {
+        const end = s.indexOf('*/', i + 2);
+        i = end < 0 ? s.length : end + 2;
+        continue;
+      }
+      break;
+    }
+    return i;
+  }
+
+  function readQuoted(i) {
+    const q = s[i];
+    if (q !== '"' && q !== "'") return null;
+    i += 1;
+    let out = '';
+    while (i < s.length) {
+      const c = s[i];
+      if (c === '\\') {
+        const n = s[i + 1];
+        if (n == null) return null;
+        if (n === 'u' && /^[0-9a-fA-F]{4}/.test(s.slice(i + 2, i + 6))) {
+          out += String.fromCharCode(parseInt(s.slice(i + 2, i + 6), 16));
+          i += 6;
+          continue;
+        }
+        const map = { n: '\n', r: '\r', t: '\t', b: '\b', f: '\f' };
+        out += Object.prototype.hasOwnProperty.call(map, n) ? map[n] : n;
+        i += 2;
+        continue;
+      }
+      if (c === q) return { value: out, next: i + 1 };
+      out += c;
+      i += 1;
+    }
+    return null;
+  }
+
+  function readIdent(i) {
+    if (!/[A-Za-z_$]/.test(s[i] || '')) return null;
+    let j = i + 1;
+    while (j < s.length && /[A-Za-z0-9_$]/.test(s[j])) j += 1;
+    return { value: s.slice(i, j), next: j };
+  }
+
+  const stack = [];
+  let quote = null;
+  let escape = false;
+  let i = 0;
+  while (i < s.length) {
+    if (quote) {
+      const c = s[i];
+      if (escape) { escape = false; i += 1; continue; }
+      if (c === '\\') { escape = true; i += 1; continue; }
+      if (c === quote) quote = null;
+      i += 1;
+      continue;
+    }
+
+    i = skipWsAndComments(i);
+    if (i >= s.length) break;
+
+    const frame = stack.length ? stack[stack.length - 1] : null;
+
+    if (frame && frame.expectingKey) {
+      const tok = readQuoted(i) || readIdent(i);
+      if (tok) {
+        const after = skipWsAndComments(tok.next);
+        if (s[after] === ':') {
+          if (LOAD_BEARING_KEYS.has(tok.value)) {
+            frame.counts[tok.value] = (frame.counts[tok.value] || 0) + 1;
+            if (frame.counts[tok.value] > 1) return true;
+          }
+          frame.expectingKey = false;
+          i = after + 1;
+          continue;
+        }
+      }
+    }
+
+    const c = s[i];
+    if (c === '"') { quote = c; i += 1; continue; }
+    // JSON5 single-quoted strings exist only INSIDE a JSON value. A prose
+    // apostrophe ("Here's my verdict") must not open a phantom string that
+    // swallows the real object — that was a false-negative on the first
+    // draft of this walk.
+    if (c === "'" && stack.length) { quote = c; i += 1; continue; }
+    if (c === '{') {
+      stack.push({ counts: Object.create(null), expectingKey: true });
+      i += 1;
+      continue;
+    }
+    if (c === '[') {
+      stack.push(null);
+      i += 1;
+      continue;
+    }
+    if (c === '}' || c === ']') {
+      stack.pop();
+      const parent = stack.length ? stack[stack.length - 1] : null;
+      if (parent) parent.expectingKey = false;
+      i += 1;
+      continue;
+    }
+    if (c === ',') {
+      if (frame) frame.expectingKey = true;
+      i += 1;
+      continue;
+    }
+    i += 1;
+  }
+  return false;
+}
+
+function failClosedDuplicateKeys() {
+  const reason = 'vision response stated duplicate load-bearing keys';
+  return {
+    pass: false,
+    parseError: 'duplicate load-bearing key in vision QC verdict',
+    categories: emptyCategories(reason),
+    summary: 'parse failure — treating as QC fail (safe default)',
+    findings: [reason]
+  };
+}
+
+/**
+ * Non-greedy, multi-CANDIDATE JSON scan for a vision reply that is
+ * JSON-SHAPED but not JSON-ONLY — fenced with trailing commentary after the
+ * closing fence, or prefaced/followed by a sentence of prose. Scans every
+ * balanced `{...}` span left to right (a span that fails to parse is looked
+ * INTO, not skipped, in case the real object is nested inside prose-shaped
+ * braces), parsing each with JSON.parse then a JSON5 fallback.
+ *
+ * Returns EVERY candidate that parsed, plus `hadUnrecoverableSpan` — true
+ * when the text contains a `{` that either (a) never found a matching `}`,
+ * or (b) DID balance but failed BOTH JSON.parse and JSON5.parse WHILE LOOKING
+ * LIKE A GENUINE JSON-OBJECT ATTEMPT (`/^\{\s*"[^"\\]*"\s*:/` — starts with a
+ * quoted key and a colon, e.g. `{"categories": …`), as opposed to incidental
+ * prose punctuation (`{option A}`, `{finalized}`). That distinction matters:
+ * a span that merely LOOKS like decorative prose braces is expected and
+ * benign — it's exactly what "look INTO a failed span" below exists to see
+ * past — but a span that opens like a real JSON object and then fails to
+ * parse is evidence the reply itself is corrupted (e.g. an unescaped quote
+ * inside a `findings` string breaks quote-tracking for everything after it),
+ * and trusting whatever DID parse elsewhere in that same corrupted text is
+ * exactly how a real failing verdict can be shadowed by an accidentally
+ * well-formed fragment nested inside it. Both conditions make the whole
+ * salvage untrustworthy, not just the one span. A span that DID parse but
+ * whose raw text has duplicate load-bearing keys is the same class: JSON.parse
+ * / JSON5.parse already collapsed to last-wins, so the object is not a safe
+ * candidate — it sets hadUnrecoverableSpan and is not pushed. Deliberately
+ * does NOT pick a winner among the candidates that DID parse — see
+ * pickSafestCandidate() below for why that decision needs to be verdict-aware
+ * (money-safe), not a generic parsing heuristic.
+ *
+ * This is a LOCAL PORT of aiCreativeDirectorService.safeParseDirectorJSON's
+ * scanning algorithm (the task's named closest fit), not an import of that
+ * module: this file today requires nothing but `atlasLlmService` at the top
+ * (plus a few lazily-required siblings — systemConfigService, alertService,
+ * runFeedService — none of them model-heavy). aiCreativeDirectorService
+ * drags in five Mongoose models and half a dozen Director-only services;
+ * pulling that into the vision-QC module to reuse a few lines of pure
+ * scanning logic would be a much bigger blast radius than the logic itself,
+ * and this fix is scoped to touch only this file. The SCAN is reused
+ * verbatim — deliberately non-greedy, for the same reason documented there:
+ * a greedy `/\{[\s\S]*\}/` swallows trailing prose and turns a salvageable
+ * reply into a parse error. Only the WINNER-PICKING half diverges, because
+ * "prefer a `concepts` array" (Director) and "never let ambiguity between
+ * two replies invent a passing QC score" (here) are different problems.
+ */
+const LOOKS_LIKE_JSON_OBJECT_ATTEMPT = /^\{\s*"[^"\\]*"\s*:/;
+
+function salvageVerdictJson(rawText) {
+  const text = String(rawText == null ? '' : rawText);
+  const candidates = [];
+  let hadUnrecoverableSpan = false;
+  let i = text.indexOf('{');
+  while (i >= 0) {
+    const span = balancedSpanFrom(text, i);
+    if (!span) { hadUnrecoverableSpan = true; i = text.indexOf('{', i + 1); continue; }
+    let obj;
+    let ok = true;
+    try { obj = JSON.parse(span); }
+    catch { try { obj = JSON5.parse(span); } catch { ok = false; } }
+    if (ok) {
+      if (hasDuplicateLoadBearingKeys(span)) {
+        // Span parsed, but JSON.parse/JSON5.parse already collapsed a
+        // duplicate load-bearing key. Do not push the last-wins object —
+        // that is the false-pass. The whole salvage is untrustworthy.
+        hadUnrecoverableSpan = true;
+      } else {
+        candidates.push(obj);
+      }
+      i = text.indexOf('{', i + span.length);
+    } else {
+      if (LOOKS_LIKE_JSON_OBJECT_ATTEMPT.test(span)) hadUnrecoverableSpan = true;
+      i = text.indexOf('{', i + 1);
+    }
+  }
+  return { candidates, hadUnrecoverableSpan };
+}
+
+/**
+ * Core per-category normalization + scoring for an ALREADY-PARSED object, in
+ * any of the tolerated root shapes (nested `categories` wrapper, missing
+ * wrapper with keys at root, findings hoisted). Pure, no I/O.
+ *
+ * Factored out of parseVerdict so there is exactly ONE place that decides
+ * "does this parsed object represent a pass or a fail" — both the main path
+ * below and pickSafestCandidate()'s money-safe candidate selection call this
+ * SAME function, so "which shape drift is tolerated" and "how a salvage
+ * candidate is judged safe to trust" can never silently diverge.
+ *
+ * Drifts tolerated, all shape-only, substance never invented:
+ *   (a) The `categories` wrapper missing — the four keys sit on the root
+ *       object instead (checked key-by-key, so a PARTIALLY hoisted reply —
+ *       some keys nested, one loose at the root — is still recovered per
+ *       key, not all-or-nothing). Root fallback is disabled entirely when
+ *       `categories` is PRESENT but the wrong type (a string/array/number/
+ *       boolean/null) — that is a different, more corrupted signal than
+ *       "omitted wrapper", and trusting root data in that case would let a
+ *       coincidental root shape override a categories value the model
+ *       clearly (if badly) tried to nest. A category key present as `null`
+ *       is likewise not "missing" — it does not fall through to root.
+ *   (b) `findings` hoisted to the top level instead of nested per category —
+ *       tolerated in two shapes: an object keyed by category name (attributed
+ *       to that category, merged with — never replacing — any findings the
+ *       category itself carried) or a flat array of strings (cannot be
+ *       attributed to any one category with any real signal, so it is kept
+ *       as unattributed context on a FAILING verdict only, never used to
+ *       flip any category's own score/pass).
+ *   (c) A category value arriving as a bare boolean instead of an object —
+ *       see the direction-of-boolean reasoning inline below. Both `true` and
+ *       `false` are treated as an unparseable category and FAIL, same as a
+ *       wholly absent category — tolerance never means guessing a pass.
+ *
+ * A category that is genuinely absent from every one of these shapes still
+ * fails: `co` falls back to `{}`, `clampScore(undefined)` is 0, and
+ * `0 >= PASS_FLOOR` is false. Nothing here can turn "no data" into a pass.
+ */
+function scoreVerdictCategories(parsed) {
+  const parsedObj = (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) ? parsed : null;
+  const catsRaw = parsedObj ? parsedObj.categories : undefined;
+  const wrapper = (catsRaw && typeof catsRaw === 'object' && !Array.isArray(catsRaw)) ? catsRaw : null;
+  // Present but the wrong type (string/array/number/boolean/null) — do NOT
+  // treat this the same as "wrapper omitted"; disable root fallback entirely.
+  // `null` is the hole AA21's `catsRaw != null` missed: `typeof null ===
+  // 'object'` is true but `catsRaw &&` already made wrapper null, and
+  // `null != null` is false, so a `categories: null` wrapper used to fall
+  // through to coincidental root-level 9s.
+  const categoriesKeyPresent = !!(parsedObj && Object.prototype.hasOwnProperty.call(parsedObj, 'categories'));
+  const categoriesPresentButMalformed = categoriesKeyPresent && !wrapper;
+  const rootFallback = (!categoriesPresentButMalformed && parsedObj) ? parsedObj : {};
+
+  const hoisted = (parsed && typeof parsed === 'object') ? parsed.findings : undefined;
+  const hoistedByCategory = (hoisted && typeof hoisted === 'object' && !Array.isArray(hoisted))
+    ? hoisted : null;
+  const hoistedGeneral = Array.isArray(hoisted)
+    ? hoisted.map((x) => String(x)).filter(Boolean)
+    : [];
+
   const categories = {};
   const findings = [];
   for (const key of CATEGORIES) {
-    const c = catsIn[key] || {};
-    const score = clampScore(c.score);
-    const f = Array.isArray(c.findings)
-      ? c.findings.map((x) => String(x)).filter(Boolean)
-      : (c.findings ? [String(c.findings)] : []);
+    // A key PRESENT on the wrapper (even as null) is not "missing". The
+    // previous `wrapper[key] != null` treated `competitor_marks: null` as
+    // absent and fell through to a coincidental root-level 9. Missing-key
+    // root fallback (AA8 partial hoist) is unchanged.
+    let c;
+    if (wrapper && Object.prototype.hasOwnProperty.call(wrapper, key)) {
+      c = wrapper[key];
+    } else if (rootFallback[key] != null) {
+      c = rootFallback[key];
+    } else {
+      c = undefined;
+    }
+
+    // DIRECTION-OF-BOOLEAN REASONING (do not "fix" this by picking a
+    // mapping): a model collapsing {score,pass,findings} to a bare boolean
+    // could mean either of two things and there is no signal in the JSON to
+    // tell them apart —
+    //   (i)  it reused the category's own `pass` field    → true = GOOD
+    //   (ii) it answered "is this defect/mark present?"   → true = BAD
+    // Every one of these four keys names the THING BEING INSPECTED FOR
+    // ("competitor_marks", "text_defects"), not "no_<thing>" or
+    // "<thing>_ok" — in common LLM JSON idiom a bare boolean under a name
+    // like that reads AT LEAST as plausibly as "defect present" (reading ii)
+    // as it does as a stray `pass` echo (reading i), and those two readings
+    // invert each other. Guessing (i) when the model meant (ii) turns a REAL
+    // defect into a false pass on a money-facing gate — the single worst
+    // outcome this fix could produce, worse than the over-strictness it is
+    // fixing. Per the task's own instruction: when direction is genuinely
+    // ambiguous, treat it as UNKNOWN and fail closed rather than guess a
+    // pass. Concretely: both `true` and `false` are normalized to "no
+    // parseable category data" (same as a category missing outright), so
+    // the observed outcome is UNCHANGED from before this fix (both booleans
+    // already failed, via `true.score === undefined` → clampScore → 0) —
+    // what changes is that the failure is now INTENTIONAL, uniform across
+    // all four categories (not just competitor_marks), and documented with
+    // a finding instead of happening by accident of `||` coercion.
+    let boolShapeNote = null;
+    if (c === null) {
+      boolShapeNote = `${key} arrived as null instead of {score,findings} — ` +
+        'treated as unparseable and failed rather than falling through to ' +
+        'root-level scores';
+      c = undefined;
+    }
+    if (typeof c === 'boolean') {
+      boolShapeNote = `${key} arrived as a bare boolean (${c}) instead of ` +
+        '{score,findings} — direction is ambiguous (could mean "check passed" ' +
+        'or "defect present"); treated as unparseable and failed rather than ' +
+        'guessing a pass';
+      c = undefined;
+    }
+
+    const co = (c && typeof c === 'object') ? c : {};
+    const score = clampScore(co.score);
+    let f = Array.isArray(co.findings)
+      ? co.findings.map((x) => String(x)).filter(Boolean)
+      : (co.findings ? [String(co.findings)] : []);
+    if (hoistedByCategory && hoistedByCategory[key] != null) {
+      const hf = Array.isArray(hoistedByCategory[key])
+        ? hoistedByCategory[key].map((x) => String(x)).filter(Boolean)
+        : [String(hoistedByCategory[key])];
+      f = f.concat(hf);
+    }
+    if (boolShapeNote) f = [boolShapeNote, ...f];
+
     const pass = score >= PASS_FLOOR;
     categories[key] = { score, pass, findings: f };
     if (!pass) findings.push(...f.map((t) => `[${key}] ${t}`));
@@ -530,6 +904,140 @@ function parseVerdict(raw) {
   // the prompt; the floor gate treats all four uniformly so a text defect
   // cannot ship either.
   const pass = CATEGORIES.every((k) => categories[k].pass);
+  // Unattributed hoisted findings are additional FAILURE context only —
+  // never added on a passing verdict, and never able to flip one, since
+  // `pass` above is already fixed by the per-category scores.
+  if (!pass && hoistedGeneral.length) {
+    findings.push(...hoistedGeneral.map((t) => `[general] ${t}`));
+  }
+  return { categories, pass, findings };
+}
+
+/**
+ * Does `cand` look like it is TRYING to be a verdict object at all (as
+ * opposed to an incidental balanced-brace span salvage picked up along the
+ * way — an empty `{}`, a stray findings fragment, etc.)? An object
+ * `categories` wrapper that actually CONTAINS at least one of the four
+ * category names, OR at least one of those names sitting on the root.
+ * An empty `categories: {}` is not verdict-shaped.
+ */
+function looksVerdictShaped(cand) {
+  if (!cand || typeof cand !== 'object' || Array.isArray(cand)) return false;
+  const cats = cand.categories;
+  if (cats && typeof cats === 'object' && !Array.isArray(cats)) {
+    // Empty `categories: {}` is NOT a verdict — it used to win fail-wins
+    // over a later genuine pass and waste a regeneration (AA18's decoy is
+    // `{}`, which never had a categories key, so it did not cover this).
+    if (CATEGORIES.some((k) => Object.prototype.hasOwnProperty.call(cats, k))) return true;
+  }
+  return CATEGORIES.some((k) => cand[k] != null);
+}
+
+/**
+ * MONEY-SAFE candidate selection among everything salvageVerdictJson found.
+ *
+ * A vision reply that needs salvage in the first place is already off-script
+ * (that's why AA9/AA10 exist), and a model that goes off-script can restate
+ * the requested JSON shape as a trailing "example"/template, or draft an
+ * answer and then revise it — both realistic Gemini-2.5-pro behaviours, not
+ * theoretical. If more than one balanced span in the reply looks
+ * verdict-shaped, there is no way to know FROM THE JSON ALONE which one is
+ * "the real verdict" — exactly the same kind of genuine ambiguity the
+ * bare-boolean case above resolves toward the safe side, not toward "prefer
+ * whichever one is more convenient". So: evaluate every verdict-shaped
+ * candidate with the exact same scoring rule real data gets
+ * (scoreVerdictCategories), and if ANY of them independently fails, treat
+ * the WHOLE salvage as a fail — a false FAIL only costs a wasted regeneration
+ * (or an operator glance on video); a false PASS ships the defect this gate
+ * exists to catch. Only when every verdict-shaped candidate agrees on a pass
+ * is a pass allowed through salvage.
+ *
+ * This directly closes a real false-pass found in adversarial review: the
+ * previous heuristic ("prefer the LAST candidate with an object `categories`
+ * key") could pick a later, higher-scoring decorative/example object over an
+ * earlier genuine failing verdict. Picking a FAILING candidate first, by
+ * scanning ALL of them rather than trusting position, is immune to which one
+ * came first or last.
+ */
+function pickSafestCandidate(candidates) {
+  if (!candidates.length) return null;
+  let bestFail = null;
+  let bestPass = null;
+  for (const cand of candidates) {
+    if (!looksVerdictShaped(cand)) continue;
+    const { pass } = scoreVerdictCategories(cand);
+    if (!pass) { bestFail = cand; break; }
+    if (!bestPass) bestPass = cand;
+  }
+  if (bestFail) return bestFail;
+  if (bestPass) return bestPass;
+  // Nothing looked verdict-shaped at all — fall back to the first parseable
+  // object; scoreVerdictCategories will find no recognizable category data
+  // in it and fail closed downstream, same as the pre-salvage "not JSON" path.
+  return candidates[0];
+}
+
+/**
+ * Normalize model JSON into a stable verdict shape. Pure — no I/O.
+ *
+ * TOLERANT OF SHAPE DRIFT, NEVER OF SUBSTANCE. A model reply that drifts
+ * from the requested `{categories:{<key>:{score,pass,findings}}}` contract
+ * must not silently fail-closed on pure noise (that burns the single
+ * allowed static regeneration, or fails an already-paid video out of draft
+ * — see this file's header) NOR silently invent a passing score (that ships
+ * a real defect). See scoreVerdictCategories()'s header for the three
+ * per-category shape drifts tolerated, and pickSafestCandidate()'s header
+ * for how ambiguity between multiple salvaged candidates is resolved
+ * (toward failure, never toward a guessed pass).
+ *
+ * Duplicate load-bearing keys inside ONE object never reach salvage:
+ * JSON.parse succeeds (last-wins) and pickSafestCandidate never sees both
+ * values. hasDuplicateLoadBearingKeys() inspects the raw text and fail-closes
+ * that reply as unparseable — we do not reconstruct and pick the failing
+ * restatement. A false FAIL costs one static regeneration; a false PASS
+ * ships a defective ad.
+ *
+ * `hadUnrecoverableSpan` (from salvageVerdictJson) forces the whole reply to
+ * fail closed even when SOME span did parse: a truncated second JSON value,
+ * or a balanced span that opens like a real JSON object and then fails to
+ * parse (quote-tracking corruption, not decorative prose), is itself a sign
+ * the reply is too corrupted to trust confidently, and the safe response to
+ * "we don't know what the rest of this says" is the same fail-closed the
+ * pre-salvage "not JSON" branch already used — never "trust whatever
+ * happened to parse".
+ */
+function parseVerdict(raw) {
+  let parsed = raw;
+  if (typeof raw === 'string') {
+    const cleaned = String(raw).replace(/^\s*```(?:json)?\s*/i, '').replace(/```\s*$/, '');
+    const duplicateKeys = hasDuplicateLoadBearingKeys(cleaned);
+    try {
+      parsed = JSON.parse(cleaned);
+      // JSON.parse succeeded — including the duplicate-key last-wins case
+      // that never throws. If the raw text stated two values for a
+      // load-bearing key, discard the collapsed object.
+      if (duplicateKeys) return failClosedDuplicateKeys();
+    } catch (err) {
+      // JSON5 / prose path. Same raw-text duplicate check: JSON5.parse
+      // also last-wins, and salvage would otherwise push that object.
+      if (duplicateKeys) return failClosedDuplicateKeys();
+      const { candidates, hadUnrecoverableSpan } = salvageVerdictJson(cleaned);
+      const chosen = hadUnrecoverableSpan ? null : pickSafestCandidate(candidates);
+      if (chosen && typeof chosen === 'object') {
+        parsed = chosen;
+      } else {
+        return {
+          pass: false,
+          parseError: err.message,
+          categories: emptyCategories('vision response was not JSON'),
+          summary: 'parse failure — treating as QC fail (safe default)',
+          findings: ['vision response was not JSON']
+        };
+      }
+    }
+  }
+
+  const { categories, pass, findings } = scoreVerdictCategories(parsed);
   return {
     pass,
     categories,
