@@ -132,7 +132,21 @@ it clears it back to this placeholder in the same commit that closes it out.)_
 - Open PRs at the time of this update: RPD **#210/#212** (carried forward from
   the prior snapshot as "deliberately deferred — do not touch"; not
   independently re-verified this session — confirm status before assuming
-  it still holds). Backend: **#276, #274** above.
+  it still holds). Backend: **#276, #274** above, and **#278**
+  `fix/titling-delivery-truth`: closes the gap where `renderUrl` non-null +
+  `status:'draft'` was treated as "delivered" everywhere (run rollup,
+  `projectAd`, both `ads-detail` endpoints, Meta push), which let an untitled
+  video master ship indistinguishable from a finished ad — see
+  `session.d/2026-08-20_titling-delivery-truth-fix.md`. Also found and fixed a
+  live bug in `routes/catalog.js`/`routes/campaigns.js` ads-detail: both
+  fetched `renderStage` but never put it on the response, so despite frontend
+  commit `6541164`'s claim, Product Ads had NO pipeline-stage signal at all.
+  Root-cause note on the *why now*: `render logs` shows the web instance being
+  autoscale-replaced roughly every 1-9 minutes from 23:09Z through past 23:51Z
+  on 2026-08-20 — well past the day's 3 real deploys — consistent with
+  `REMOTION_QUEUE_CONCURRENCY` 4→8 (PR #274, same day, explicitly unvalidated
+  against the memory graph) causing RSS-driven replacement mid-titling. Not
+  reverted here — owner-approved, flagged for a memory-graph check instead.
 - Offline verify: `npm test` (or `node scripts/runVerifySuite.js` directly)
   — **181 scripts** as of this update (re-count before quoting, this number
   drifts — it was 174 two snapshots ago). `npm run lint` enables exactly one

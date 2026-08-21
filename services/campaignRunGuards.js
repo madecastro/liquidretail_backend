@@ -57,6 +57,12 @@ const {
   REAP_STALE_MIN_DEFAULT,
   PREPARE_STALE_MIN_DEFAULT
 } = require('./staleness');
+// The one place that knows whether a video Ad's titling actually settled —
+// see its header. classifyRunAdOutcome below used to count `draft` as
+// unconditionally "succeeded", which is the same renderUrl-means-delivered
+// heuristic that stranded 13 untitled masters as "delivered" on 2026-08-20;
+// this is the run-rollup half of that fix.
+const { isVideoTitlingSettled } = require('./adTitlingTruth');
 
 const DONE_ELIGIBLE_STATUSES = Object.freeze(['preparing', 'running']);
 
@@ -317,16 +323,37 @@ function buildStaleRunningReapUpdate(staleMin) {
  * Ad.status enum (models/Ad.js): queued | rendering | draft | live |
  * archived | failed. `draft`/`live`/`archived` are the delivered shapes
  * (CLAUDE.md documents `draft` as the terminal "delivered" state for both
- * static and video Ads); `failed` is a settled failure; `queued`/`rendering`
- * are the only two non-terminal shapes.
+ * static and video Ads) — PROVIDED titling has actually settled for a video
+ * Ad; see `isVideoTitlingSettled` below. `failed` is a settled failure;
+ * `queued`/`rendering` are the only two non-terminal shapes.
+ *
+ * ⚠️ `draft` ALONE IS NOT "SUCCEEDED" FOR A VIDEO AD (fixed 2026-08-20).
+ * The normal render path, `bootRecoveryService`, and `titlingResumeService`
+ * all stamp `status:'draft'` + `renderUrl:veoVideoUrl` the INSTANT a paid
+ * master lands — before Remotion titling has even started — specifically so
+ * the asset is viewable immediately (see routes/ads.js's money-guard comment
+ * and titlingResumeService.js's header). If the process then dies mid-title
+ * (measured 2026-08-20: an autoscale replacement mid-Remotion-render), the
+ * Ad sits `draft`+untitled forever unless titlingResumeService's own
+ * stale-claim sweep gets to it. Counting that as `succeeded` here — the
+ * exact bug this reconciliation function exists to fix in the OTHER
+ * direction (undercounting) — would launder an untitled master into a
+ * `'done'` run with an honest-looking succeeded count. `isVideoTitlingSettled`
+ * is the one function in this repo that tells a real composite apart from a
+ * raw master parked on `renderUrl`; see services/adTitlingTruth.js.
  */
 function classifyRunAdOutcome(adDocs) {
-  let succeeded = 0, failed = 0, stillRendering = 0, requeuedAway = 0;
+  let succeeded = 0, failed = 0, stillRendering = 0, requeuedAway = 0, titlingIncomplete = 0;
   for (const ad of (adDocs || [])) {
     switch (ad && ad.status) {
       case 'draft':
       case 'live':
-      case 'archived': succeeded++; break;
+      case 'archived':
+        // Same delivered-status bucket as before; now gated on titling
+        // truth for video Ads (a no-op check for images — see the function).
+        if (isVideoTitlingSettled(ad)) succeeded++;
+        else titlingIncomplete++;
+        break;
       case 'failed':   failed++; break;
       case 'rendering': stillRendering++; break;
       case 'queued':    requeuedAway++; break;
@@ -340,13 +367,23 @@ function classifyRunAdOutcome(adDocs) {
     failed,
     stillRendering,
     requeuedAway,
+    // Video Ads sitting `draft`+untitled-master. Distinct from
+    // `stillRendering` (that is Ad.status:'rendering'; this is Ad.status:
+    // 'draft' with an unsettled titling debt) but the SAME posture: real,
+    // already-billed work that titlingResumeService is (or will be, on its
+    // next sweep) actively finishing for free. Never counted as succeeded
+    // OR failed — see isSettled below.
+    titlingIncomplete,
     // A receipt-holding Ad is deliberately left `'rendering'` by the reaper's
     // Ad-sweep (services/spendReceipt.js) specifically so it can finish for
     // FREE instead of being requeued into a second paid submit. So
     // `stillRendering > 0` here means real, already-billed work is still
     // outstanding — the run must not be finalized either way this cycle;
-    // the next reap tick (REAP_INTERVAL_MIN later) re-checks.
-    isSettled: stillRendering === 0,
+    // the next reap tick (REAP_INTERVAL_MIN later) re-checks. An untitled
+    // master mid-recovery is the SAME kind of outstanding, unbilled-again
+    // work, so it defers the run identically rather than being laundered
+    // into a dishonest 'done'.
+    isSettled: stillRendering === 0 && titlingIncomplete === 0,
     // Only a genuinely lost claim (an Ad reset to 'queued', needing a fresh
     // "Generate more") justifies the run reading 'failed'. A settled run
     // with a mix of succeeded/failed Ads and nothing lost is still a

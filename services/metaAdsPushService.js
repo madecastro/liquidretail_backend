@@ -22,6 +22,7 @@ const Campaign              = require('../models/Campaign');
 const IntegrationCredential = require('../models/IntegrationCredential');
 const { decrypt }           = require('./integrationCryptoService');
 const { concurrency: CONC } = require('./concurrency');
+const { isVideoTitlingSettled } = require('./adTitlingTruth');
 
 const { META_API_VERSION } = require('./metaApiVersion');
 const META_GRAPH_ROOT  = `https://graph.facebook.com/${META_API_VERSION}`;
@@ -283,6 +284,20 @@ function composeCtaUrl(url, params) {
 // failed status without halting.
 async function pushOne({ ad, adsetId, adAccountId, token, pageId, metaCampaignId }) {
   if (!ad.renderUrl) throw new Error('ad has no renderUrl (not yet rendered)');
+  // GATE ADDED 2026-08-20: `renderUrl` being non-null is true the instant a
+  // paid video master lands, BEFORE Remotion titling has even started (see
+  // services/adTitlingTruth.js header for the incident this closes). Without
+  // this check a video ad interrupted mid-titling — no headline, no CTA, no
+  // rating, no logo — was pushable to Meta exactly like a finished one, and
+  // nothing here or upstream ever re-checked. isVideoTitlingSettled is a
+  // no-op for image ads (no titling step), so this only ever blocks the
+  // shape that was actually broken.
+  if (!isVideoTitlingSettled(ad)) {
+    throw new Error(
+      `ad titling has not settled — refusing to push a raw, untitled master to Meta ` +
+      `(titlingResumeState=${ad.titlingResumeState || 'null'})`
+    );
+  }
   // Video and image branches diverge on the upload + creative steps;
   // the final Ad creation is identical. Video adds a poll-for-ready
   // wait (Meta's /advideos is async, ~30s–3min) before the creative

@@ -294,6 +294,13 @@ const MAX_CREATIVES_PER_RUN = CONC.MAX_CREATIVES_PER_RUN;
 const { Semaphore } = require('../services/semaphore');
 const veoTitlingSemaphore = new Semaphore(CONC.VEO_TITLING_CONCURRENCY, 'veo-titling');
 
+// The one function that knows whether a video Ad's titling actually
+// settled, as opposed to `renderUrl` merely being non-null (true from the
+// instant a paid master lands, before titling even starts) — see its
+// header. Used by projectAd below so `titled` is never inferred twice, once
+// correctly here and once wrong on a client.
+const { isAdHonestlyDelivered } = require('../services/adTitlingTruth');
+
 // Live titling queue depth, read from the pool that ads ACTUALLY wait in.
 //
 // DIAGNOSTICS MUST BE TRUE OR THEY COST MORE THAN THEY GIVE (owner rule): a
@@ -5077,11 +5084,19 @@ function projectAd(ad, full = false, extras = {}) {
     // finished. 'draft' is stamped the instant the paid master lands, BEFORE
     // titling starts (routes/ads.js §00 money-guard comment: it must not sit
     // in 'rendering', or the reaper re-submits and double-bills), so 'draft'
-    // alone covers both "still titling" and "fully done." The pipeline's own
-    // last step stamps renderStage:'done' right after the real completion
-    // write and never on the failure path (status flips to 'failed' there
-    // instead) — so `renderStage && renderStage !== 'done'` is the exact
-    // "still actively processing" signal, with no extra timestamp needed.
+    // alone covers both "still titling" and "fully done."
+    //
+    // CORRECTED 2026-08-20 — the paragraph this replaced claimed
+    // `renderStage && renderStage !== 'done'` was "the exact still-processing
+    // signal". It is not: `renderStage` is a free-text, fire-and-forget
+    // breadcrumb (models/Ad.js) that also reads 'done' for an intentional
+    // no-chrome/no-brand ship of the RAW master, and goes stale forever if
+    // the process writing it dies mid-render (measured: an autoscale
+    // replacement mid-Remotion-render leaves it frozen on e.g. 'titling
+    // 9:16' with no further write, ever). Use the `titled` field below —
+    // it is the one place in this repo that actually checks whether
+    // titling settled (services/adTitlingTruth.js) — rather than
+    // re-deriving a "done-ness" guess from this string.
     renderStage:        ad.renderStage || null,
     // WHEN that stage was entered. Without it the gallery can say WHAT an ad is
     // doing but not whether it has been doing it for 8 seconds or 40 minutes —
@@ -5089,6 +5104,23 @@ function projectAd(ad, full = false, extras = {}) {
     // see. /render-activity already derives its stageAgeSec from this field;
     // omitting it here is why the honest view existed on exactly one page.
     renderStageAt:      ad.renderStageAt || null,
+    // Recovery/normal-path titling debt: null | 'pending' | 'claimed'. Not
+    // itself a "titled" answer (see `titled` below) — pending/claimed always
+    // means NOT settled, but a resting null is ambiguous between titled,
+    // deliberately bare, and (the 2026-08-20 incident) silently abandoned.
+    // Exposed raw anyway because it is the one field that can tell an
+    // operator "titling is actively in flight or overdue for it" without
+    // guessing from `renderStage` text.
+    titlingResumeState: ad.titlingResumeState || null,
+    // THE HONEST ANSWER: is this the finished, advertiser-usable creative,
+    // or (for a video ad) still just the raw Omni master? Computed the same
+    // way everywhere in this repo now does — services/adTitlingTruth.js —
+    // so this field, the CampaignRun rollup, and the Meta-push gate can
+    // never again disagree about what "delivered" means. Always true for a
+    // non-video ad; for a video ad, false the instant the master lands and
+    // true only once titling genuinely composited (or was deliberately
+    // skipped for a real, declared reason — see that module's header).
+    titled:             isAdHonestlyDelivered(ad),
     queuedAt:           ad.queuedAt,
     renderedAt:         ad.renderedAt,
     generatedAt:        ad.generatedAt,
