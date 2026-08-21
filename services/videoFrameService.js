@@ -10,6 +10,15 @@
 // detect pipeline still operates on a single hero frame for
 // subjects/text and Gemini Identify (the YOLO microservice already
 // scans the whole clip server-side and returns a hero).
+//
+// planTimestamps / buildFrameUrl / buildFrameUrls / fetchFrameBuffers are
+// UNCHANGED below — pinned byte-for-byte by scripts/verifyAdVisionQc.js O13
+// and relied on as-is by services/basePlateCropService.js. The
+// *-AtTimestamps siblings added below are pure additive refactors (shared
+// URL-building / fetch plumbing, exposed for an explicit timestamp list
+// instead of a duration-derived plan) — added for
+// services/videoQcFrameSelectionService.js's dense pre-filter, which needs
+// to fetch a caller-supplied timestamp list rather than re-deriving one.
 
 const axios = require('axios');
 
@@ -39,6 +48,69 @@ function planTimestamps(durationSec, { isReel = false, max = isReel ? 4 : 5 } = 
   return out;
 }
 
+// Dense, EARLY-WEIGHTED candidate timestamps — a much larger set than
+// planTimestamps, meant to be probed CHEAPLY (small width, no vision call)
+// by services/videoQcFrameSelectionService.js's perceptual pre-filter, not
+// sent to a paid model directly. Concentrates samples in the first
+// `earlyWindowSec` because that is where a generative video model's
+// transient artifacts empirically cluster (2026-08-20 storefront-chrome
+// incident: visible at t=0.1s/0.5s, gone by t=2.5s) while still covering
+// the rest of the clip — the pre-filter's outlier score needs frames from
+// the WHOLE clip to know what the clip's own "steady state" looks like.
+//
+// Exported so callers that need to know WHICH returned timestamps are
+// "early" (e.g. videoQcFrameSelectionService.js, to keep its outlier
+// reference derived from the "late" cluster only — see that module's file
+// header) use the exact same boundary planDenseTimestamps itself applies,
+// rather than a second hardcoded "2" that could silently drift from it.
+const DEFAULT_EARLY_WINDOW_SEC = 2;
+
+// Pure function, no I/O. Exported for direct unit testing of the timestamp
+// plan independent of network/image-decode behavior.
+function planDenseTimestamps(durationSec, opts = {}) {
+  const d = Number(durationSec);
+  if (!Number.isFinite(d) || d <= 0) return [];
+
+  const {
+    earlyWindowSec = DEFAULT_EARLY_WINDOW_SEC,
+    earlySampleCount = 6,
+    lateSampleCount = 6
+  } = opts;
+
+  // Tiny clip — no meaningful "early vs. late" distinction to weight
+  // toward; just spread samples evenly across the whole thing.
+  if (d <= earlyWindowSec) {
+    const n = Math.max(2, Math.min(earlySampleCount, Math.round(d * 3)));
+    return dedupeSorted(evenlySpaced(0.1, Math.max(0.1, d - 0.1), n), d);
+  }
+
+  const early = evenlySpaced(0.1, earlyWindowSec, earlySampleCount);
+  const remainder = d - earlyWindowSec;
+  const lateCount = Math.max(2, Math.min(lateSampleCount, Math.round(remainder)));
+  const late = evenlySpaced(
+    earlyWindowSec + remainder / (lateCount + 1),
+    Math.max(earlyWindowSec + 0.1, d - 0.1),
+    lateCount
+  );
+
+  return dedupeSorted([...early, ...late], d);
+}
+
+function evenlySpaced(start, end, n) {
+  if (!(end > start)) return [round1(start)];
+  if (n <= 1) return [round1((start + end) / 2)];
+  const out = [];
+  for (let i = 0; i < n; i++) {
+    out.push(round1(start + (end - start) * (i / (n - 1))));
+  }
+  return out;
+}
+
+function dedupeSorted(nums, durationSec) {
+  const set = new Set(nums.map(round1).filter((t) => t > 0 && t < durationSec));
+  return [...set].sort((a, b) => a - b);
+}
+
 function round1(n) { return Math.round(n * 10) / 10; }
 
 // Build a Cloudinary URL that returns a single JPEG frame at the
@@ -65,20 +137,30 @@ function buildFrameUrl(videoUrl, timestampSec, { width = 1024 } = {}) {
 // URLs the caller can pass to whichever vision model needs the bytes.
 function buildFrameUrls(videoUrl, durationSec, opts = {}) {
   const stamps = planTimestamps(durationSec, opts);
-  return stamps
-    .map(t => ({ timestampSec: t, url: buildFrameUrl(videoUrl, t, opts) }))
-    .filter(f => f.url);
+  return buildFrameUrlsAtTimestamps(videoUrl, stamps, opts);
 }
 
-// Fetch frame buffers in parallel. Used when the consumer needs the
-// raw bytes (e.g. inline-data Gemini calls). Each frame is fetched
-// independently and a 4xx on one frame doesn't poison the batch.
-async function fetchFrameBuffers(videoUrl, durationSec, opts = {}) {
-  const frames = buildFrameUrls(videoUrl, durationSec, opts);
+// Same as buildFrameUrls, but for a caller-supplied timestamp list
+// instead of one derived from planTimestamps. Shared by buildFrameUrls
+// (stamps = planTimestamps(...)) and the dense QC pre-filter
+// (stamps = planDenseTimestamps(...) or a curated final selection).
+function buildFrameUrlsAtTimestamps(videoUrl, timestamps, opts = {}) {
+  if (!Array.isArray(timestamps) || !timestamps.length) return [];
+  return timestamps
+    .map((t) => ({ timestampSec: round1(t), url: buildFrameUrl(videoUrl, t, opts) }))
+    .filter((f) => f.url)
+    .sort((a, b) => a.timestampSec - b.timestampSec);
+}
+
+// Shared fetch plumbing for a already-built frame-descriptor list. Each
+// frame is fetched independently and a 4xx on one frame doesn't poison
+// the batch.
+async function fetchFramesForUrls(frames, opts = {}) {
+  const { timeoutMs = 15000 } = opts;
   const out = [];
-  await Promise.all(frames.map(async f => {
+  await Promise.all(frames.map(async (f) => {
     try {
-      const res = await axios.get(f.url, { responseType: 'arraybuffer', timeout: 15000 });
+      const res = await axios.get(f.url, { responseType: 'arraybuffer', timeout: timeoutMs });
       out.push({
         timestampSec: f.timestampSec,
         url:          f.url,
@@ -92,9 +174,29 @@ async function fetchFrameBuffers(videoUrl, durationSec, opts = {}) {
   return out.sort((a, b) => a.timestampSec - b.timestampSec);
 }
 
+// Fetch frame buffers in parallel. Used when the consumer needs the
+// raw bytes (e.g. inline-data Gemini calls). Each frame is fetched
+// independently and a 4xx on one frame doesn't poison the batch.
+async function fetchFrameBuffers(videoUrl, durationSec, opts = {}) {
+  const frames = buildFrameUrls(videoUrl, durationSec, opts);
+  return fetchFramesForUrls(frames, opts);
+}
+
+// Same as fetchFrameBuffers, but for a caller-supplied timestamp list.
+// Used by the dense QC pre-filter to pull a cheap, small-width probe set
+// that never reaches a vision model directly.
+async function fetchFrameBuffersAtTimestamps(videoUrl, timestamps, opts = {}) {
+  const frames = buildFrameUrlsAtTimestamps(videoUrl, timestamps, opts);
+  return fetchFramesForUrls(frames, opts);
+}
+
 module.exports = {
+  DEFAULT_EARLY_WINDOW_SEC,
   planTimestamps,
+  planDenseTimestamps,
   buildFrameUrl,
   buildFrameUrls,
-  fetchFrameBuffers
+  buildFrameUrlsAtTimestamps,
+  fetchFrameBuffers,
+  fetchFrameBuffersAtTimestamps
 };

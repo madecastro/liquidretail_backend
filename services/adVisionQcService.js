@@ -17,10 +17,20 @@
 // pipeline (atlasVideoService / brandScriptExecutor) shipped with ZERO
 // vision inspection while statics were protected:
 //   - Compare ORIGINAL PRODUCT vs N frames SAMPLED from the delivered video
-//     (services/videoFrameService.buildFrameUrls — quartile sampling on the
-//     already-generated Cloudinary asset, no ffmpeg/local decode needed) in
-//     ONE vision call, same SAME four category keys so Ad.visionQc /
-//     summarizeVisionQc / the gallery UI need no video-specific branch.
+//     in ONE vision call, same SAME four category keys so Ad.visionQc /
+//     summarizeVisionQc / the gallery UI need no video-specific branch. This
+//     function does not pick the frames itself — the caller
+//     (brandScriptExecutor.runVideoVisionQcForAd) resolves them via
+//     services/videoQcFrameSelectionService.js, which sends the pre-existing
+//     3-frame quartile baseline (services/videoFrameService.buildFrameUrls —
+//     Cloudinary `so_<sec>` edge transform, no ffmpeg/local decode needed)
+//     PLUS up to 2 extra frames flagged by a cheap, non-billable perceptual
+//     pre-filter — added 2026-08-20 because quartile sampling ALONE is
+//     structurally blind to a defect that appears and disappears inside one
+//     quartile window (see that module's file header for the full
+//     "hallucinated storefront-chrome" incident and the design). This
+//     function's contract (compare seed vs whatever frames it is handed,
+//     one vision call, no regeneration) is unchanged either way.
 //   - NEVER regenerates. A video master is ~$0.90 (vs ~$0.07 for a static)
 //     and a colourway/brand-mark defect is baked into the generative clip —
 //     a second $0.90 submit on the same seed is not a reliable fix, unlike a
