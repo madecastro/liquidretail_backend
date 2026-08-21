@@ -115,7 +115,7 @@ must NOT be merged as-is.** Re-run the suite yourself.
 
 | branch | SHA | what it is |
 |---|---|---|
-| `fix/members-invitations-caller-role-guard` | **`2a256808`** | privesc fix: new `middleware/requireMembershipRole.js` + `scripts/verifyMembersAuthz.js`, edits to `routes/members.js` + `routes/invitations.js` |
+| `fix/members-invitations-caller-role-guard` | **`b6ddf3e9`** | privesc fix: new `middleware/requireMembershipRole.js` + `scripts/verifyMembersAuthz.js`, edits to `routes/members.js` + `routes/invitations.js` |
 | `feat/admin-settings-qc-gates` | **`6f5f6632`** | QC gate split (static/video) in progress + the 1168-line design doc `session.d/2026-08-21_admin-settings-and-qc-gate-split-DESIGN.md` |
 | `fix/qc-verdict-parser-tolerance` | **`ef07b6b0`** | `parseVerdict` shape tolerance + harness |
 
@@ -162,6 +162,15 @@ AFTER the initial preservation commit, so there are two commits per branch:
 | `fix/members-invitations-caller-role-guard` | `fee1f7c7` | **`2a256808`** (+ `scripts/verifyMembersAuthz.js`) |
 | `fix/qc-verdict-parser-tolerance` | `ef07b6b0` | `ef07b6b0` (unchanged — nothing new) |
 
+**THIRD UPDATE — the privesc fix is COMPLETE, not just WIP.** `fix/members-invitations-caller-role-guard`
+is now **`b6ddf3e9`** (pushed). It adds `middleware/requireMembershipRole.js` (one shared guard,
+imported by both route files) + `scripts/verifyMembersAuthz.js` at **53/53**, revert-proven
+against **11 mutations** including the import-dropped-but-calls-kept case. Full suite **185/185
+green**, eslint clean, and `/by-token/:token/accept` explicitly verified still working with zero
+pre-existing membership. **Still needs review before merge, and still MUST NOT be merged alone** —
+the agent-chat capability-executor bypass (§5.1 item 2) is tracked as `task_94b1f76d` and is the
+other half.
+
 A peer session was told `fee1f7c7`; if it branched off that, it is missing the authz
 harness in `2a256808`. Tell it to rebase. All three branches are confirmed identical
 local vs `origin`.
@@ -198,7 +207,17 @@ Related but NOT live: `requireAuth.js:87-111` self-heal. A peer claimed revoke u
 throws 11000, the soft-fail catch swallows it, and the request correctly 403s. Latent only if
 `User.advertiserId` points at a *different* advertiser with no row.
 
-### 5.2 Four UI defects from ui-smoke, with a VALID session (not artifacts)
+### 5.2 Four UI defects — NOW ROOT-CAUSED, see `session.d/2026-08-21_ui-defect-rootcause/`
+**UPDATE:** the root-cause workflow finished after this file was first written. Verdicts:
+**#1 format-picker = CONFIRMED PRODUCT DEFECT (real money under-quote, ~$0.90/product)**;
+#2 wizard-Next = CONFIRMED; #3 Loading-stall = CONFIRMED **test** defect (`pages.js` has no
+settle wait at all); #4 gallery-empty = **PARTLY-WRONG** — j6 tests `/ads` (the legacy gallery)
+not `/product-ads`, and the real mechanism is a deterministic `useState(false)` vs `useState(true)`
+asymmetry, NOT a status filter. **Whether the 3 delivered ads are visible on the PRIMARY surface
+is still unanswered.** Full detail + raw agent evidence in that directory. The text below is the
+original pre-verification framing, kept for context.
+
+### 5.2 (original) Four UI defects from ui-smoke, with a VALID session (not artifacts)
 Run: `133/143`, 10 fail, 4 skip. Root-cause workflow was still running at restart — findings
 were NOT confirmed, so re-verify each.
 1. **MONEY: format picker quotes 2 video generations, test expects 3.** CLAUDE.md: the shared
