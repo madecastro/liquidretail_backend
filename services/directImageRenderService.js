@@ -2584,11 +2584,14 @@ async function renderDirectImage(callArgs = {}) {
   // apart) reads the cache as empty and falls through to the env default,
   // even though SystemConfig.adVisionQcEnabled is genuinely true. This
   // function is already async and already awaits runPostRenderQc below, so
-  // there is no reason to take the racy sync path — resolveEnabled() does a
-  // real (TTL-cached, but AWAITED) SystemConfig read and can never observe
-  // "cache miss" as "off". See services/adVisionQcService.js resolveEnabled
-  // vs isEnabled doc comments for the full precedence + fail-safe writeup.
-  const qcEnabledNow = await adVisionQc.resolveEnabled();
+  // there is no reason to take the racy sync path — resolveStaticEnabled()
+  // does a real (TTL-cached, but AWAITED) SystemConfig read and can never
+  // observe "cache miss" as "off". See services/adVisionQcService.js
+  // resolveStaticEnabled vs isEnabled doc comments for the full precedence
+  // + fail-safe writeup. This is the STATIC pipeline — resolveStaticEnabled()
+  // reads SystemConfig.staticVisionQcEnabled (2026-08-21 split; was the
+  // single resolveEnabled() gate before then).
+  const qcEnabledNow = await adVisionQc.resolveStaticEnabled();
   if (!qcEnabledNow) {
     // Real gate, not a swallowed error — but until this stamp, a flag-off
     // ad shipped with Ad.visionQc left at its schema default `null`, reading

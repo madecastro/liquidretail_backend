@@ -625,6 +625,7 @@ console.log('\nverifyVideoQcFrameSampling — dense frame pre-filter for video v
     const originalSelect = frameSelectionService.selectQcFrameTimestamps;
     const originalIsEnabled = adVisionQc.isEnabled;
     const originalResolveEnabled = adVisionQc.resolveEnabled;
+    const originalResolveVideoEnabled = adVisionQc.resolveVideoEnabled;
     const originalRunVideoQc = adVisionQc.runVideoPostRenderQc;
     // adStage does a real (unawaited) Ad.updateOne — harmless in production
     // (fire-and-forget, .catch(()=>{})) but this file promises "No DB, no
@@ -644,19 +645,24 @@ console.log('\nverifyVideoQcFrameSampling — dense frame pre-filter for video v
     frameSelectionService.selectQcFrameTimestamps = async () => ({
       timestamps: MARKER_TIMESTAMPS, denseCount: 12, flaggedCount: 2, degraded: false
     });
-    // BOTH gates must be stubbed, and resolveEnabled() is the load-bearing one.
+    // ALL of isEnabled/resolveEnabled/resolveVideoEnabled must be stubbed.
     // runVideoVisionQcForAd stopped reading the synchronous isEnabled() peek on
     // 2026-08-20 (see adVisionQcService's resolveEnabled/isEnabled doc comments —
-    // all three hot-path callers now `await resolveEnabled()` instead, precisely
-    // because the sync peek reads a 5s-TTL cache and answers "off" on a cold miss).
-    // Stubbing isEnabled alone left the REAL resolveEnabled() in the path, which
-    // (a) reached for a live SystemConfig.findOne() — so this harness was not
-    // actually offline and paid a 10s Mongoose buffering timeout on every run —
-    // and (b) then fell through to envEnabled() === false, so the gate short-
-    // circuited and runVideoPostRenderQc was never called at all. isEnabled is
-    // kept stubbed so the check does not depend on which gate the caller reads.
+    // the hot-path callers `await` the real gate instead, precisely because the
+    // sync peek reads a 5s-TTL cache and answers "off" on a cold miss). Stubbing
+    // isEnabled alone left the REAL resolver in the path, which (a) reached for a
+    // live SystemConfig.findOne() — so this harness was not actually offline and
+    // paid a 10s Mongoose buffering timeout on every run — and (b) then fell
+    // through to env === false, so the gate short-circuited and
+    // runVideoPostRenderQc was never called at all.
+    // SPLIT 2026-08-21 — runVideoVisionQcForAd now calls resolveVideoEnabled(),
+    // not the legacy resolveEnabled(). resolveEnabled is stubbed too only as
+    // belt-and-braces (it is no longer on this call's live path at all); the
+    // load-bearing one is resolveVideoEnabled — omitting it reproduces EXACTLY
+    // the PR #288 incident this comment describes, one gate name later.
     adVisionQc.isEnabled = () => true;
     adVisionQc.resolveEnabled = async () => true;
+    adVisionQc.resolveVideoEnabled = async () => true;
     adVisionQc.runVideoPostRenderQc = async (args) => {
       capturedFrames = args.frames;
       return {
@@ -682,6 +688,7 @@ console.log('\nverifyVideoQcFrameSampling — dense frame pre-filter for video v
       frameSelectionService.selectQcFrameTimestamps = originalSelect;
       adVisionQc.isEnabled = originalIsEnabled;
       adVisionQc.resolveEnabled = originalResolveEnabled;
+      adVisionQc.resolveVideoEnabled = originalResolveVideoEnabled;
       adVisionQc.runVideoPostRenderQc = originalRunVideoQc;
       if (originalAdStage) require.cache[adStagePath] = originalAdStage;
       else delete require.cache[adStagePath];
