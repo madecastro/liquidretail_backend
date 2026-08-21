@@ -92,6 +92,13 @@ it clears it back to this placeholder in the same commit that closes it out.)_
   that this is the merchandise-fidelity spot-check PR #151 explicitly asked for —
   so re-enabling that pad is NOT the fix: padding a SEED bakes letterbox bands into
   the delivered video, which is exactly why #151 reverted it.**
+  **DECIDED 2026-08-21 — CLOSED. The owner reviewed all 33 generated references and
+  ruled the reframe ACCEPTABLE (1 of 9 products rejectable, ~$0.14 expected waste per
+  product, QC catches it and nothing ships).
+  `session.d/2026-08-21_reframe-owner-verdict-CLOSED.md` is authoritative and records
+  four things NOT to do, incl. that a pixel pre-flight screen CANNOT work. Do not
+  reopen. The keep-out band gap (PR #306) is separate and still open — moved to
+  another session 2026-08-21.**
   *(This section is append-not-replace here on purpose: the bullets below are
   other sessions' live state and I could not establish they are stale.)*
 - Trunk `main` is moving fast — always `git fetch` before trusting a SHA here.
