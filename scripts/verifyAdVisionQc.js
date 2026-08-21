@@ -122,6 +122,233 @@ check('A5 buildCorrectiveNote names the invented mark', () => {
   assert.match(note, /competitor/i);
 });
 
+// ── AA. parseVerdict SHAPE TOLERANCE (garbled-but-JSON model replies) ──
+// Fixed 2026-08-20: parseVerdict used to fail-closed on ANY shape drift from
+// {categories:{<key>:{score,pass,findings}}} — a bare boolean, findings
+// hoisted to the root, a missing `categories` wrapper, or JSON wrapped in
+// fences/prose all fell into the same "not JSON" branch or silently zeroed a
+// category via `false || {}`. That consumed the single allowed static
+// regeneration (or failed an already-paid VIDEO out of draft) on pure model
+// noise, not a real defect. Tolerance is SHAPE-only: every check below that
+// exercises a real defect (bad score) must still fail; only the JSON
+// wrapping/nesting drift is forgiven. See parseVerdict's own header comment
+// for the full drift list and the direction-of-boolean reasoning.
+check('AA1 bare boolean TRUE for competitor_marks still FAILS (never a guessed pass)', () => {
+  const v = qc.parseVerdict({
+    categories: {
+      competitor_marks: true,
+      product_fidelity: { score: 9, findings: [] },
+      text_defects:     { score: 9, findings: [] },
+      layout_safe_box:  { score: 9, findings: [] }
+    },
+    summary: 'x'
+  });
+  assert.strictEqual(v.categories.competitor_marks.pass, false,
+    'a bare `true` must never be interpreted as a passing score — direction is ambiguous');
+  assert.strictEqual(v.categories.competitor_marks.score, 0);
+  assert.strictEqual(v.pass, false);
+  const text = v.categories.competitor_marks.findings.join(' ');
+  assert.match(text, /bare boolean/i);
+  assert.match(text, /ambiguous/i);
+});
+check('AA2 bare boolean FALSE for competitor_marks ALSO fails (symmetric — not a guessed pass either)', () => {
+  const v = qc.parseVerdict({
+    categories: {
+      competitor_marks: false,
+      product_fidelity: { score: 9, findings: [] },
+      text_defects:     { score: 9, findings: [] },
+      layout_safe_box:  { score: 9, findings: [] }
+    }
+  });
+  assert.strictEqual(v.categories.competitor_marks.pass, false);
+  assert.strictEqual(v.categories.competitor_marks.score, 0);
+  assert.match(v.categories.competitor_marks.findings.join(' '), /bare boolean/i);
+});
+check('AA3 all four categories as bare booleans → overall FAIL, not a false pass', () => {
+  const v = qc.parseVerdict({
+    categories: {
+      competitor_marks: true,
+      product_fidelity: true,
+      text_defects: true,
+      layout_safe_box: true
+    }
+  });
+  for (const k of qc.CATEGORIES) {
+    assert.strictEqual(v.categories[k].pass, false, `${k} must not pass on a bare boolean`);
+  }
+  assert.strictEqual(v.pass, false);
+});
+check('AA4 findings hoisted to a top-level object keyed by category are attributed to that category', () => {
+  const v = qc.parseVerdict({
+    categories: {
+      competitor_marks: { score: 2 },
+      product_fidelity: { score: 9 },
+      text_defects:     { score: 9 },
+      layout_safe_box:  { score: 9 }
+    },
+    findings: { competitor_marks: ['tree emblem on midfoot'] },
+    summary: 'x'
+  });
+  assert.deepStrictEqual(v.categories.competitor_marks.findings, ['tree emblem on midfoot']);
+  assert.strictEqual(v.categories.competitor_marks.pass, false, 'hoisting findings must not touch the score-derived pass');
+  assert.ok(v.findings.some((f) => f.includes('tree emblem on midfoot')));
+});
+check('AA5 a flat hoisted findings array is kept as unattributed [general] context on a FAILING verdict', () => {
+  const v = qc.parseVerdict({
+    categories: {
+      competitor_marks: { score: 2 },
+      product_fidelity: { score: 9 },
+      text_defects:     { score: 9 },
+      layout_safe_box:  { score: 9 }
+    },
+    findings: ['something looked off overall'],
+    summary: 'x'
+  });
+  assert.ok(v.findings.some((f) => /\[general\].*something looked off overall/.test(f)));
+});
+check('AA6 a flat hoisted findings array must NOT leak onto a PASSING verdict', () => {
+  const v = qc.parseVerdict({
+    categories: {
+      competitor_marks: { score: 9 },
+      product_fidelity: { score: 9 },
+      text_defects:     { score: 9 },
+      layout_safe_box:  { score: 9 }
+    },
+    findings: ['stray commentary'],
+    summary: 'x'
+  });
+  assert.strictEqual(v.pass, true);
+  assert.deepStrictEqual(v.findings, [], 'unattributed findings must never appear on a pass');
+});
+check('AA7 missing `categories` wrapper — keys at the root — parses exactly like the nested shape', () => {
+  const v = qc.parseVerdict({
+    competitor_marks: { score: 9, findings: [] },
+    product_fidelity: { score: 9, findings: [] },
+    text_defects:     { score: 9, findings: [] },
+    layout_safe_box:  { score: 9, findings: [] },
+    summary: 'root ok'
+  });
+  assert.strictEqual(v.pass, true);
+  for (const k of qc.CATEGORIES) assert.strictEqual(v.categories[k].score, 9);
+});
+check('AA8 PARTIAL hoist — some categories nested, one loose at the root, one genuinely absent — recovers the loose one and still fails the absent one', () => {
+  const v = qc.parseVerdict({
+    categories: {
+      competitor_marks: { score: 9, findings: [] },
+      product_fidelity: { score: 9, findings: [] }
+      // text_defects intentionally absent from BOTH categories and root
+    },
+    layout_safe_box: { score: 8, findings: [] }, // hoisted to root, no wrapper entry
+    summary: 'x'
+  });
+  assert.strictEqual(v.categories.competitor_marks.score, 9);
+  assert.strictEqual(v.categories.layout_safe_box.score, 8, 'root-level fallback must recover a per-key hoist');
+  assert.strictEqual(v.categories.text_defects.score, 0, 'a category present nowhere must still fail');
+  assert.strictEqual(v.categories.text_defects.pass, false);
+  assert.strictEqual(v.pass, false);
+});
+check('AA9 prose-wrapped JSON (sentence before AND after, no fences) is salvaged', () => {
+  const payload = JSON.stringify({
+    categories: {
+      competitor_marks: { score: 9, findings: [] },
+      product_fidelity: { score: 9, findings: [] },
+      text_defects:     { score: 9, findings: [] },
+      layout_safe_box:  { score: 9, findings: [] }
+    },
+    summary: 'clean'
+  });
+  const v = qc.parseVerdict(`Sure, here is the verdict:\n${payload}\nLet me know if you need anything else!`);
+  assert.strictEqual(v.parseError, null);
+  assert.strictEqual(v.pass, true);
+});
+check('AA10 fenced JSON with trailing commentary AFTER the closing fence is salvaged', () => {
+  // The existing fence-strip regex anchors the trailing ``` at the END of the
+  // string ( ```\s*$ ) — a model that adds a sentence after the closing fence
+  // defeats that strip, and a bare JSON.parse then throws on the leftover
+  // "```\nHope that helps!" tail. This is exactly what salvageVerdictJson's
+  // balanced-brace scan must recover.
+  const payload = JSON.stringify({
+    categories: {
+      competitor_marks: { score: 2, findings: ['tree mark'] },
+      product_fidelity: { score: 9, findings: [] },
+      text_defects:     { score: 9, findings: [] },
+      layout_safe_box:  { score: 9, findings: [] }
+    },
+    summary: 'fail'
+  });
+  const v = qc.parseVerdict('```json\n' + payload + '\n```\nHope that helps!');
+  assert.strictEqual(v.parseError, null, 'must not fall into the parse-error branch');
+  assert.strictEqual(v.pass, false);
+  assert.strictEqual(v.categories.competitor_marks.score, 2);
+  assert.deepStrictEqual(v.categories.competitor_marks.findings, ['tree mark']);
+});
+check('AA11 pure prose with NO JSON object anywhere still fails closed exactly as before', () => {
+  const v = qc.parseVerdict('I cannot process this request right now.');
+  assert.notStrictEqual(v.parseError, null);
+  for (const k of qc.CATEGORIES) {
+    assert.strictEqual(v.categories[k].pass, false);
+    assert.strictEqual(v.categories[k].score, 0);
+  }
+  assert.strictEqual(v.pass, false);
+});
+check('AA12 a genuinely absent category (present nowhere) still fails even with three real 9s and no wrapper drift', () => {
+  const v = qc.parseVerdict({
+    categories: {
+      competitor_marks: { score: 9, findings: [] },
+      product_fidelity: { score: 9, findings: [] },
+      text_defects:     { score: 9, findings: [] }
+      // layout_safe_box: intentionally omitted
+    },
+    summary: 'x'
+  });
+  assert.strictEqual(v.categories.layout_safe_box.score, 0);
+  assert.strictEqual(v.categories.layout_safe_box.pass, false);
+  assert.strictEqual(v.pass, false, 'one missing category must fail the whole verdict');
+});
+check('AA13 a decoy empty {} earlier in the prose must not win over the real payload later in the text', () => {
+  // Adversarial case for the multi-candidate salvage: naively taking the
+  // FIRST balanced span would parse the decoy "{}" successfully and stop
+  // there, silently discarding the real verdict that follows.
+  const payload = JSON.stringify({
+    categories: {
+      competitor_marks: { score: 2, findings: ['tree mark'] },
+      product_fidelity: { score: 9, findings: [] },
+      text_defects:     { score: 9, findings: [] },
+      layout_safe_box:  { score: 9, findings: [] }
+    },
+    summary: 'fail'
+  });
+  const v = qc.parseVerdict(`Note: {} is just an empty example. Real verdict: ${payload}`);
+  assert.strictEqual(v.parseError, null);
+  assert.strictEqual(v.pass, false, 'must have picked the real payload, not the decoy {}');
+  assert.strictEqual(v.categories.competitor_marks.score, 2);
+});
+check('AA14 JSON5-only-valid payload (trailing comma) inside prose is still salvaged', () => {
+  const withTrailingComma =
+    '{"categories":{' +
+    '"competitor_marks":{"score":9,"findings":[]},' +
+    '"product_fidelity":{"score":9,"findings":[]},' +
+    '"text_defects":{"score":9,"findings":[]},' +
+    '"layout_safe_box":{"score":9,"findings":[]},' +
+    '},"summary":"clean",}'; // trailing commas — invalid strict JSON, valid JSON5
+  const v = qc.parseVerdict(`Here you go:\n${withTrailingComma}\nDone.`);
+  assert.strictEqual(v.parseError, null);
+  assert.strictEqual(v.pass, true);
+});
+check('AA15 the JSON5 fallback used by salvage is actually IMPORTED, not just called (no-undef cannot be trusted alone)', () => {
+  // CLAUDE.md §5: a source-text harness cannot see an unbound identifier —
+  // `receiptFree` / `preferUgcMediaId` / `usableProofCommentsOrNone` all
+  // shipped broken because a check asserted the CALL existed without
+  // asserting the IMPORT did too. `eslint`'s no-undef would catch a missing
+  // require at lint time, but this offline harness must not depend on a
+  // separate lint pass having been run — assert both here.
+  const src = require('fs').readFileSync(
+    path.join(__dirname, '..', 'services', 'adVisionQcService.js'), 'utf8'
+  );
+  assert.match(src, /require\(\s*['"]json5['"]\s*\)/, 'JSON5 must be required');
+  assert.match(src, /JSON5\.parse\(/, 'JSON5 must actually be used (salvage fallback)');
+});
+
 // ── B. Both images, correctly labelled ───────────────────────────────
 // Revert: dropping original image or labels fails B1–B3.
 check('B1 buildVisionUserContent includes BOTH image_url parts', () => {
