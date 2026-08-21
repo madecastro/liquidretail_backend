@@ -109,6 +109,21 @@ Total validation spend $0.34.
 
 ## 4. ⚠️ IN FLIGHT — PUSHED PRESERVATION BRANCHES, ALL UNREVIEWED
 
+> ### 🔴 USE THE BRANCH TIP, NOT THE SHAs BELOW
+> The SHAs in this section have gone stale **three times** — background agents kept
+> producing work after each preservation snapshot, so any SHA written here is a point-in-time
+> record, not the tip. **Always:**
+> ```
+> git fetch origin --prune
+> git checkout <branch>        # resolves to origin's tip
+> git log --oneline -5         # see how many preservation snapshots it carries
+> ```
+> Final tips as of session end: `fix/members-invitations-caller-role-guard` **`b6ddf3e9`**
+> (the COMPLETE privesc fix, 53/53 harness, 185/185 suite),
+> `feat/admin-settings-qc-gates` **`c16c4c78`**, `fix/qc-verdict-parser-tolerance`
+> **`33761480`**. All three verified `local == origin`, all worktrees clean at exit.
+> All three remain **UNREVIEWED — do not merge as-is.**
+
 Every background agent died at the restart. Their work was **uncommitted working-tree state**;
 I committed and pushed it as WIP so it survives. **All three are UNREVIEWED, INCOMPLETE, and
 must NOT be merged as-is.** Re-run the suite yourself.
