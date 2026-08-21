@@ -20,7 +20,10 @@
  * `deps.fetchDenseFrames` — real image DECODE (sharp) still runs for real
  * in section C/F/G, only the network hop is stubbed, matching the existing
  * convention in this suite (services/adVisionQcService.js is exercised the
- * same way — real code, mocked transport).
+ * same way — real code, mocked transport). G2 stubs adStage (same
+ * require.cache replacement as scripts/verifyAdVisionQcSurfacing.js F6)
+ * so the fire-and-forget Ad.updateOne in services/adStage.js never
+ * buffers against a missing Mongo connection.
  *
  * All checks run SEQUENTIALLY (not fired-and-gathered) because several
  * mutate process.env.VIDEO_QC_DENSE_SAMPLING for the duration of one check
@@ -623,6 +626,17 @@ console.log('\nverifyVideoQcFrameSampling — dense frame pre-filter for video v
     const originalIsEnabled = adVisionQc.isEnabled;
     const originalResolveEnabled = adVisionQc.resolveEnabled;
     const originalRunVideoQc = adVisionQc.runVideoPostRenderQc;
+    // adStage does a real (unawaited) Ad.updateOne — harmless in production
+    // (fire-and-forget, .catch(()=>{})) but this file promises "No DB, no
+    // network" in its own header, so stub it too rather than let a buffered
+    // mongoose op float in the background of a CI process with no connection.
+    // Same require.cache replacement as scripts/verifyAdVisionQcSurfacing.js F6.
+    const adStagePath = require.resolve(path.join(__dirname, '..', 'services', 'adStage.js'));
+    const originalAdStage = require.cache[adStagePath];
+    require.cache[adStagePath] = {
+      id: adStagePath, filename: adStagePath, loaded: true,
+      exports: { adStage: () => {}, noteRenderIssue: () => {} }
+    };
 
     const MARKER_TIMESTAMPS = [0.3, 0.9, 6.6]; // distinctive — not the real baseline
     let capturedFrames = null;
@@ -669,6 +683,8 @@ console.log('\nverifyVideoQcFrameSampling — dense frame pre-filter for video v
       adVisionQc.isEnabled = originalIsEnabled;
       adVisionQc.resolveEnabled = originalResolveEnabled;
       adVisionQc.runVideoPostRenderQc = originalRunVideoQc;
+      if (originalAdStage) require.cache[adStagePath] = originalAdStage;
+      else delete require.cache[adStagePath];
     }
 
     assert.ok(Array.isArray(capturedFrames), 'runVideoPostRenderQc must have been called with a frames array');
