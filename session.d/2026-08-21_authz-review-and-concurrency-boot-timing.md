@@ -13,6 +13,14 @@ pointed out that its own work sits on top of mine, so a green suite on the peer'
 includes my unreviewed code. Closing that gap. **Verdict: the guard logic is sound.**
 Not yet merged — see §1.3.
 
+### 1.0 Independent peer read — my target-2 reasoning CONFIRMED empirically
+A peer session re-read this branch (I asked, precisely because I wrote the brief the
+implementing agent worked from, so my own review was not independent). It **executed the real
+exported helpers across all 16 caller/target pairs** rather than reasoning about them:
+`canActOnRole(r,r)` is true for all four roles, and **all six possible self-promotions**
+(viewer→editor/admin/owner, editor→admin/owner, admin→owner) are blocked by `canGrantRole` and
+by nothing else. Zero promotions slip past. So §1.1's claim below stands, verified behaviourally.
+
 ### 1.1 What I verified myself, reading `middleware/requireMembershipRole.js`
 - `roleRank()` uses `Object.prototype.hasOwnProperty.call(...)`, so `__proto__` /
   `constructor` cannot poison the lookup, and an unknown role ranks `-Infinity`.
@@ -40,7 +48,63 @@ is correct behaviour and the handler's last-owner `409` still applies. But it ma
 "reach zero active memberships" an easy, deliberate action, and that is the trigger for
 `requireAuth`'s self-heal (`:87-111`), which mints a membership with **`role:'owner'`**.
 
-I traced whether that is exploitable. **It is not, today** — and the reason matters:
+⚠️ **CORRECTED — my "not exploitable today" conclusion below was WRONG.** I claimed the
+blocker was "nothing hard-deletes an AdvertiserMembership row." **There is one**, found by an
+independent peer read and verified by me:
+
+`services/accountDeletionService.js:127`
+```js
+const memRes = await AdvertiserMembership.deleteMany({ advertiserId: a.advertiserId });
+```
+Its own comment says it removes "the user's, plus any pending/revoked rows" — i.e. it frees
+exactly the partial-unique-index slot I was relying on. And the cascade's own guards count
+**`status:'active'` only** (`:50-53`, `:62-64`), so a revoked member does not block it.
+
+**Two more corrections to my facts:**
+- I cited only `routes/onboarding.js:111` as writing `User.advertiserId`. There is a **second
+  site**: `routes/invitations.js:216-221`, on invite accept, guarded by
+  `if (!req.userDoc.advertiserId)`. So a stale pointer can be created by accepting an invite,
+  not just by onboarding.
+- The index reading itself was right: `models/AdvertiserMembership.js:66-69`,
+  `{advertiserId:1, userId:1}` unique, `partialFilterExpression: { userId: {$type:'objectId'} }`
+  — type, not status. That reasoning holds; it just does not survive a hard delete.
+
+**The live-route chain, no migration script needed:**
+1. V accepts an invite to advertiser X with a null pointer → `V.advertiserId = X`, row `(X,V)` active.
+2. V is revoked, or resigns via the self-target carve-out → row `status:'revoked'`, pointer still X.
+3. V holds no other active membership.
+4. The sole owner of X deletes their account. The cascade only checks for other **active**
+   members, so V does not block it → `deleteMany({advertiserId: X})` **hard-deletes V's revoked row.**
+5. V authenticates → 0 active memberships, truthy pointer → self-heal inserts
+   `{X, V, role:'owner', status:'active'}`. **No 11000, because the row is gone.** V is now owner.
+
+**Severity — narrower than it first looks, and I agree with the peer's framing here.** By step 4
+the Advertiser doc and its brands are already deleted, so V inherits owner of a **ghost tenant**,
+not access to anyone's data. V also cannot drive it end-to-end: steps 1-2 are V's, but step 4
+belongs to an unrelated party. So this is a **latent integrity bug** — unearned `owner`, a
+resurrected deleted tenant, a user dropped into a broken workspace instead of onboarding, and V
+able to invite others into a tenant whose Advertiser row does not exist. **Not a blocker for the
+members-authz PR**, which neither introduces nor worsens it beyond making step 2 a one-request
+action.
+
+⚠️ **The sharper variant is operator-run, and the ordering is load-bearing and undocumented.**
+`scripts/backfillAdvertiser.js:71` does
+`User.updateMany({advertiserId:null},{$set:{advertiserId:defaultAdv._id}})` and creates **zero**
+memberships — the file contains **no `AdvertiserMembership` reference at all** (verified). Run
+alone, every affected user self-heals to **owner of the default advertiser, which still exists**
+— so this variant is not a ghost tenant. `scripts/backfillMemberships.js` is the pairing script
+that mints rows from the pointers; the pair is only self-consistent **if both run, in order**.
+
+**Cheapest real fix (peer's suggestion, and I agree):** make self-heal require that the
+`Advertiser` doc still exists AND refuse to mint `owner` for a pointer with no corroborating
+membership history — one extra query, closes the whole class. Alternatively clear
+`User.advertiserId` wherever the row it points at stops being active (revoke, resign, and the
+cascade's `deleteMany`).
+
+---
+
+**Original (now-falsified) reasoning, kept so the failure mode is legible:** I traced whether
+that is exploitable and concluded **it is not, today** — for these reasons:
 
 - `User.advertiserId` is written at onboarding (`routes/onboarding.js:111`) and on
   invite-accept-if-null, and is **never cleared** on revoke or resign. So a stale pointer
@@ -53,7 +117,7 @@ I traced whether that is exploitable. **It is not, today** — and the reason ma
   soft-fail catch swallows it, and the request correctly 403s.
 - Onboarding and invite-accept both create a row alongside the pointer.
 
-**So the safety of this rests entirely on "nothing hard-deletes an AdvertiserMembership."**
+**So the safety of this rested entirely on "nothing hard-deletes an AdvertiserMembership" — and that premise is FALSE (see the correction above).**
 That invariant is undocumented and the planned **Users tab is precisely where someone would
 add a "remove user permanently" button.** If a hard delete is ever introduced, the
 self-resign → self-heal → owner path becomes live. Either keep revoke-not-delete as an
