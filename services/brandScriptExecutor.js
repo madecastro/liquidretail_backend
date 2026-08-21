@@ -1711,18 +1711,41 @@ async function runVideoVisionQcForAd({ ad, deliveredUrl, brandName = null }) {
     // relies on for the identical buildFrameUrls call (detectClipBoxes) —
     // do not re-derive with a second convention (e.g. ffprobe).
     const durationSec = Number(ad.videoDurationSec) > 0 ? Number(ad.videoDurationSec) : 8;
-    // Quartile sampling for our 8-10s ads (videoFrameService.planTimestamps):
-    // 25/50/75% of duration, mid-phase rather than on a cut/fade boundary —
-    // same "mid-phase, not on-boundary" principle previewBrandScript already
-    // uses for its own preview frame indices (see that function's comment).
-    // Verified 2026-08-19 against a real delivered ad (run
-    // run_1787136860887_654ed621, Vuori Bone Denim jacket rendered as light
-    // blue denim with a garbled "VOME" woven neck label): the defect is
-    // visible at EVERY one of these three quartiles, not just the opening
-    // frame — confirming a colourway/brand-mark hallucination in this video
-    // model persists across the clip rather than being a one-frame glitch,
-    // so 3 evidence points is enough without sampling every frame.
-    const frames = videoFrameService.buildFrameUrls(deliveredUrl, durationSec);
+    // Quartile sampling ALONE (25/50/75%, videoFrameService.planTimestamps)
+    // is a good evidence set for a PERSISTENT defect — verified 2026-08-19
+    // against a real delivered ad (run run_1787136860887_654ed621, Vuori
+    // Bone Denim jacket rendered as light blue denim with a garbled "VOME"
+    // woven neck label): visible at EVERY quartile, confirming that class
+    // of hallucination persists across the whole clip rather than being a
+    // one-frame glitch.
+    //
+    // It is BLIND to a TRANSIENT one. PROVEN 2026-08-20: a hallucinated
+    // storefront-UI overlay (nav bar, shopping-bag icon, garbled
+    // header/footer text) baked into a video plate was visible at
+    // t=0.1s/0.5s and completely gone by t=2.5s — on a ~10s clip, quartile
+    // sampling hits 2.5/5.0/7.5s and would see NOTHING.
+    //
+    // videoQcFrameSelectionService closes that gap with a cheap, NON-
+    // billable pre-filter in front of the paid vision call: it probes a
+    // dense, early-weighted set of tiny frames (Cloudinary edge transform —
+    // no vision cost), scores each against the clip's own steady state,
+    // and sends the vision model the quartile baseline above PLUS up to 2
+    // frames that actually look like outliers (capped at 5 total). A clean
+    // clip — the common case — still costs exactly the same 3 frames as
+    // before; see that module's file header for the full design and the
+    // measured cost delta. Kill switch VIDEO_QC_DENSE_SAMPLING (default
+    // true) restores this exact quartile-only call with no deploy.
+    const frameSelectionService = require('./videoQcFrameSelectionService');
+    const frameSelection = await frameSelectionService.selectQcFrameTimestamps({
+      deliveredUrl, durationSec
+    });
+    const frames = videoFrameService.buildFrameUrlsAtTimestamps(deliveredUrl, frameSelection.timestamps);
+    if (frameSelection.flaggedCount > 0) {
+      console.log(
+        `   🔎 brandScript[ad=${ad._id}]: vision QC (video) dense pre-filter flagged ` +
+        `${frameSelection.flaggedCount} extra frame(s) of ${frameSelection.denseCount} probed`
+      );
+    }
 
     const campaignRunId = (Array.isArray(ad.campaignRunIds) && ad.campaignRunIds.length)
       ? ad.campaignRunIds[ad.campaignRunIds.length - 1]
