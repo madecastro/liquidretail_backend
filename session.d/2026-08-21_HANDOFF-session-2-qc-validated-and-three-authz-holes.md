@@ -115,11 +115,11 @@ must NOT be merged as-is.** Re-run the suite yourself.
 
 | branch | SHA | what it is |
 |---|---|---|
-| `fix/members-invitations-caller-role-guard` | **`fee1f7c7`** | privesc fix: new `middleware/requireMembershipRole.js` + `scripts/verifyMembersAuthz.js`, edits to `routes/members.js` + `routes/invitations.js` |
-| `feat/admin-settings-qc-gates` | **`fa84cd8b`** | QC gate split (static/video) in progress + the 1168-line design doc `session.d/2026-08-21_admin-settings-and-qc-gate-split-DESIGN.md` |
+| `fix/members-invitations-caller-role-guard` | **`2a256808`** | privesc fix: new `middleware/requireMembershipRole.js` + `scripts/verifyMembersAuthz.js`, edits to `routes/members.js` + `routes/invitations.js` |
+| `feat/admin-settings-qc-gates` | **`6f5f6632`** | QC gate split (static/video) in progress + the 1168-line design doc `session.d/2026-08-21_admin-settings-and-qc-gate-split-DESIGN.md` |
 | `fix/qc-verdict-parser-tolerance` | **`ef07b6b0`** | `parseVerdict` shape tolerance + harness |
 
-`middleware/requireMembershipRole.js` @ `fee1f7c7` exports:
+`middleware/requireMembershipRole.js` @ `2a256808` exports:
 `module.exports = requireMembershipRole` (factory) plus `.ROLE_RANK`, `.roleRank`,
 `.canActOnRole(callerRole,targetRole)`, `.canGrantRole(callerRole,requestedRole)`.
 **Import these — do not re-derive rank logic a third time.**
@@ -151,6 +151,20 @@ re-derive it if lost.** Verified-correct properties of that draft worth reproduc
 
 A local backup of the untouched stub file is at
 `/private/tmp/.../scratchpad/generation.js.backup` (also disposable).
+
+### 4.6 SHA CORRECTION — two agents kept working after the first preserve
+The table above carries the **second** snapshot. Two agents produced more harness work
+AFTER the initial preservation commit, so there are two commits per branch:
+
+| branch | first preserve | **use this** |
+|---|---|---|
+| `feat/admin-settings-qc-gates` | `fa84cd8b` | **`6f5f6632`** (+ `verifyAdVisionQcSurfacing.js`, `verifyVideoQcFrameSampling.js`) |
+| `fix/members-invitations-caller-role-guard` | `fee1f7c7` | **`2a256808`** (+ `scripts/verifyMembersAuthz.js`) |
+| `fix/qc-verdict-parser-tolerance` | `ef07b6b0` | `ef07b6b0` (unchanged — nothing new) |
+
+A peer session was told `fee1f7c7`; if it branched off that, it is missing the authz
+harness in `2a256808`. Tell it to rebase. All three branches are confirmed identical
+local vs `origin`.
 
 ---
 
@@ -211,7 +225,7 @@ If video **titling** throws, `routes/ads.js:2570-2598` and `:3008-3045` stamp `s
 
 ## 6. PENDING: 11 admin-design questions
 `.wt-admin-settings/session.d/2026-08-21_admin-settings-and-qc-gate-split-DESIGN.md` §7 (also
-on branch `feat/admin-settings-qc-gates` @ `fa84cd8b`). Highest-stakes: **Q2** catalog scope
+on branch `feat/admin-settings-qc-gates` @ `6f5f6632`). Highest-stakes: **Q2** catalog scope
 (curated ~20-40 keys vs all 208 `defaults.env` keys), **Q3** promote-UI blast radius (grants
 owner on EVERY workspace, plus an env-allowlist-sticky tradeoff), **Q6** whether to fix the
 §5.3 titling-QC hole in the same change. The design confirms the 4-level role model and full
