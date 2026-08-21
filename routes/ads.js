@@ -1696,6 +1696,33 @@ router.post('/runs', express.json(), async (req, res) => {
 // the CampaignRun doc as each render finishes so the frontend's
 // poller can show real-time progress.
 async function runRenderLoop(run, job, adIds, renderToken) {
+  // Ad-gen microservice handoff (Phase 1). When ADGEN_RENDERER_ENABLED
+  // is true, backend has completed its side of the flow (validate, gate,
+  // mint, claim → Ad.status='rendering') and the adgen renderer service
+  // picks up the actual work via its own atomic claim on
+  // {status:'rendering', claimedByWorker:null}. Backend returns here
+  // without dispatching. See services/adgenBridge.js + the
+  // ADGEN_RENDERER_ENABLED flag in config/defaults.env.
+  //
+  // Why this is the single gate: every render entry point (POST /generate,
+  // POST /runs, regenerate) funnels through runRenderLoop. Gating here
+  // instead of at each caller means the flip can never partially apply.
+  //
+  // CampaignRun status transition still needs to happen so the operator's
+  // UI shows 'running' rather than 'preparing' forever — one write, same
+  // shape as the (elided) status flip that lives further down this loop.
+  const { isAdgenRendererEnabled } = require('../services/adgenBridge');
+  if (isAdgenRendererEnabled()) {
+    console.log(
+      `🔀 [campaignRun ${run.runId}] ADGEN handoff — ${adIds.length} ad(s) deferred to adgen renderer service`
+    );
+    await CampaignRun.updateOne(
+      { _id: run._id, status: 'preparing' },
+      { $set: { status: 'running', startedAt: run.startedAt || new Date(), updatedAt: new Date() } }
+    ).catch((err) => console.error(`⚠️  [campaignRun ${run.runId}] ADGEN handoff: preparing→running flip failed: ${err.message}`));
+    return;
+  }
+
   const t0 = Date.now();
   // Partition the batch by renderRoute so veo (quota-limited) and image
   // (cheap, parallelizable) render in independent pools. A single mixed

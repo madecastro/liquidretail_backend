@@ -38,6 +38,20 @@ const adSchema = new mongoose.Schema({
   // Empty until a CampaignRun first picks the Ad.
   campaignRunIds: { type: [String], default: [], index: true },
 
+  // Ad-gen microservice extraction (Phase 1). Which renderer worker (if
+  // any) has taken ownership of this ad for the actual render work.
+  // NULL while queued OR while status='rendering' but not yet claimed by
+  // a worker — a renderer instance atomically claims by findOneAndUpdate
+  // ({status:'rendering', claimedByWorker:null}, {$set:{claimedByWorker,
+  // claimedAt}}). Cleared when the ad transitions to a terminal state.
+  //
+  // Backend's in-process render path (flag ADGEN_RENDERER_ENABLED=false)
+  // leaves both fields null — its own runRenderLoop owns the work without
+  // needing a per-worker marker. When ADGEN_RENDERER_ENABLED=true, backend
+  // skips runRenderLoop and adgen renderers race for the claim.
+  claimedByWorker: { type: String, default: null, index: true },
+  claimedAt:       { type: Date,   default: null, index: true },
+
   // ── Source linkage ───────────────────────────────────────────────
   mediaId:   { type: mongoose.Schema.Types.ObjectId, ref: 'Media',          required: true, index: true },
   productId: { type: mongoose.Schema.Types.ObjectId, ref: 'CatalogProduct', default: null,  index: true },
