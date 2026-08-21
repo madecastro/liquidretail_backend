@@ -364,18 +364,21 @@ attempt bound** — an ad could cycle claim → abandon → reclaim forever, inv
 declared `titlingResumeAttempts` counter, a bounded filter, an honest terminal verdict
 (master kept, never re-billed), and a second watchdog arm keyed on attempt count.
 
-⚠️ **It lived only in `/private/tmp/...`, which macOS clears on reboot.** It has been
-backed up — patch + all untracked files, 3,570 lines — to:
+✅ **IT IS NOW ON GITHUB.** It originally lived only in `/private/tmp/...`, which macOS
+clears on reboot. It has been pushed, unmerged, to a clearly-labelled preservation
+branch so it survives this machine:
 
 ```
-/Volumes/Sayulita/Projects/RS/.rescue/2026-08-21_titling-claim-staleness/
+git fetch origin && git checkout wip/titling-claim-staleness-PRESERVED
 ```
 
-Contents: `uncommitted-vs-origin-main.patch`, `status.txt`, `untracked-list.txt`, and
-`untracked/` (which holds the harnesses and
-`session.d/2026-08-20_titling-claim-staleness.md`). Original worktree, if it still
-exists:
-`/private/tmp/claude-502/-Volumes-Sayulita-Projects-RS/901763ed-6688-438b-9079-60b55c57f4a9/scratchpad/wt-titling-claim`
+Branch `wip/titling-claim-staleness-PRESERVED` @ `dbafdd80`, based on `c27df039`.
+1,569 insertions across 9 files, including
+`session.d/2026-08-20_titling-claim-staleness.md` with the full write-up.
+
+**It is UNREVIEWED and must not be merged as-is.** The gate numbers above are the
+authoring session's own report and were **not** independently re-verified before the
+preservation push. Re-run the suite yourself, then open a real PR — after Nick approves.
 
 ### Housekeeping: ~47 local branches have commits that exist on NO remote
 Mostly spent/superseded experiments, but nobody has audited them. They are invisible to
@@ -386,3 +389,33 @@ Also: the shared checkout `/Volumes/Sayulita/Projects/RS/liquidretail_backend` c
 carries **77 dirty files** on `main`. Two independent sessions flagged this as stale
 replay drift, not real unmerged work. **Verify with `git diff --numstat origin/main`
 before committing anything from it** — committing that tree reverts landed fixes.
+
+
+---
+
+## 12. REACHABILITY — everything is in git, nothing is stranded on the old machine
+
+The new account may be on different hardware, so every artifact below is reachable with
+nothing but repo access. **No local path is load-bearing any more.**
+
+| What | Where | 
+|---|---|
+| This handoff | `session.d/2026-08-21_HANDOFF-account-switch.md` on `main` |
+| 92 session notes, incl. all of tonight's | `session.d/*.md` on `main` |
+| rs-32's unpushed work | branch `wip/titling-claim-staleness-PRESERVED` |
+| rs-24's write-up | `session.d/2026-08-20_adlist-grid-preview-urls.md` on `main` |
+| The pipeline bible | `CLAUDE.md` on `main` |
+| Everything else merged today | `main` @ `4d4461ed` or later |
+
+Two repos: `Emami-RS-Project/liquidretail_backend` (trunk `main`) and
+`Emami-RS-Project/liquidretail` (trunk **`master`**).
+
+**Only these are machine-local, and none is required:** the `.rescue/` folder (now
+redundant — its contents are on the preservation branch), the `/private/tmp/...`
+worktrees (disposable), and ~47 stale local branches that exist on no remote (§11
+housekeeping — unaudited, mostly spent experiments, but genuinely lost with the machine).
+
+**Credentials the new machine needs:** GitHub (`gh auth`), the Render CLI, the Atlas
+Cloud key, and `~/.grok/bin/grok` if Grok is to be used. None of those travel with the
+Claude account — they are machine setup. If Grok is missing on the new box, say so
+(standing directive) and fall back to subagents rather than stalling.
