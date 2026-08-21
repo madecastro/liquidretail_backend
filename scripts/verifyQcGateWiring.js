@@ -35,6 +35,8 @@ const path = require('path');
 
 // Isolate from a developer shell that may have the flag on.
 delete process.env.AD_VISION_QC_ENABLED;
+delete process.env.STATIC_VISION_QC_ENABLED;
+delete process.env.VIDEO_VISION_QC_ENABLED;
 
 const SystemConfig = require('../models/SystemConfig');
 const systemConfig = require('../services/systemConfigService');
@@ -64,7 +66,10 @@ async function checkAsync(label, fn) {
 // Same pattern as verifySeededUniverseHeroDefault.js: the service holds
 // the same model object we mutate here.
 
-let stubDbValue = null;          // true | false | null
+let stubDbValue = null;          // legacy adVisionQcEnabled: true | false | null
+                                 // undefined = no document (findOne → null)
+let stubStaticDbValue = null;    // staticVisionQcEnabled: true | false | null
+let stubVideoDbValue = null;     // videoVisionQcEnabled: true | false | null
 let stubShouldThrow = false;
 const origFindOne = SystemConfig.findOne;
 
@@ -82,7 +87,12 @@ function installStub() {
         return Promise.resolve(
           stubDbValue === undefined
             ? null
-            : { key: 'default', adVisionQcEnabled: stubDbValue }
+            : {
+                key: 'default',
+                adVisionQcEnabled: stubDbValue,
+                staticVisionQcEnabled: stubStaticDbValue,
+                videoVisionQcEnabled: stubVideoDbValue
+              }
         );
       }
     };
@@ -95,9 +105,15 @@ function restoreStub() {
 
 function resetAll() {
   delete process.env.AD_VISION_QC_ENABLED;
+  delete process.env.STATIC_VISION_QC_ENABLED;
+  delete process.env.VIDEO_VISION_QC_ENABLED;
   stubDbValue = null;
+  stubStaticDbValue = null;
+  stubVideoDbValue = null;
   stubShouldThrow = false;
   systemConfig.resetAdVisionQcEnabledCache();
+  systemConfig.resetStaticVisionQcEnabledCache();
+  systemConfig.resetVideoVisionQcEnabledCache();
   if (typeof qc._resetSystemConfigFailLogForTests === 'function') {
     qc._resetSystemConfigFailLogForTests();
   }
@@ -134,6 +150,50 @@ installStub();
       assert.strictEqual(typeof qc.resolveEnabled, 'function');
       assert.strictEqual(typeof qc.envEnabled, 'function');
       assert.strictEqual(typeof qc.isEnabled, 'function');
+    });
+
+    check('A4 SystemConfig schema declares staticVisionQcEnabled + videoVisionQcEnabled (nullable tri-state)', () => {
+      const paths = SystemConfig.schema.paths;
+      assert.ok(paths.staticVisionQcEnabled, 'staticVisionQcEnabled path missing from schema');
+      assert.ok(paths.videoVisionQcEnabled, 'videoVisionQcEnabled path missing from schema');
+      assert.strictEqual(paths.staticVisionQcEnabled.defaultValue, null,
+        'static default must be null (unset → migration bridge → env), not false');
+      assert.strictEqual(paths.videoVisionQcEnabled.defaultValue, null,
+        'video default must be null (unset → migration bridge → env), not false');
+      // Legacy field must still be present — removing it is the
+      // "ships uninspected ads" bug the split's comments exist to prevent.
+      assert.ok(paths.adVisionQcEnabled, 'legacy adVisionQcEnabled must stay on the schema');
+    });
+
+    check('A5 split-gate service surface: resolvers, env helpers, parseBoolEnv, get/set/peek/reset', () => {
+      assert.strictEqual(typeof qc.resolveStaticEnabled, 'function');
+      assert.strictEqual(typeof qc.resolveVideoEnabled, 'function');
+      assert.strictEqual(typeof qc.staticEnvEnabled, 'function');
+      assert.strictEqual(typeof qc.videoEnvEnabled, 'function');
+      assert.strictEqual(typeof qc.parseBoolEnv, 'function');
+      // Legacy exports must stay — this harness's A3/C/D/E/F still call them.
+      assert.strictEqual(typeof qc.resolveEnabled, 'function');
+      assert.strictEqual(typeof qc.envEnabled, 'function');
+      assert.strictEqual(typeof systemConfig.getStaticVisionQcEnabled, 'function');
+      assert.strictEqual(typeof systemConfig.setStaticVisionQcEnabled, 'function');
+      assert.strictEqual(typeof systemConfig.peekStaticVisionQcEnabled, 'function');
+      assert.strictEqual(typeof systemConfig.resetStaticVisionQcEnabledCache, 'function');
+      assert.strictEqual(typeof systemConfig.refreshStaticVisionQcEnabledCache, 'function');
+      assert.strictEqual(typeof systemConfig.getVideoVisionQcEnabled, 'function');
+      assert.strictEqual(typeof systemConfig.setVideoVisionQcEnabled, 'function');
+      assert.strictEqual(typeof systemConfig.peekVideoVisionQcEnabled, 'function');
+      assert.strictEqual(typeof systemConfig.resetVideoVisionQcEnabledCache, 'function');
+      assert.strictEqual(typeof systemConfig.refreshVideoVisionQcEnabledCache, 'function');
+    });
+
+    check('A6 config/defaults.env keeps AD_VISION_QC_ENABLED and adds the two split names', () => {
+      const src = fs.readFileSync(
+        path.join(__dirname, '..', 'config', 'defaults.env'),
+        'utf8'
+      );
+      assert.match(src, /^AD_VISION_QC_ENABLED=/m);
+      assert.match(src, /^STATIC_VISION_QC_ENABLED=/m);
+      assert.match(src, /^VIDEO_VISION_QC_ENABLED=/m);
     });
 
     // ── B. money constants unchanged ─────────────────────────────────
@@ -674,6 +734,841 @@ installStub();
         'utf8'
       );
       assert.match(src, /adVisionQcEnabled\s*:/);
+    });
+
+    check('J2 models/SystemConfig.js source contains the split fields (legacy kept)', () => {
+      const src = fs.readFileSync(
+        path.join(__dirname, '..', 'models', 'SystemConfig.js'),
+        'utf8'
+      );
+      assert.match(src, /staticVisionQcEnabled\s*:/);
+      assert.match(src, /videoVisionQcEnabled\s*:/);
+      assert.match(src, /adVisionQcEnabled\s*:/);
+    });
+
+    // Shared deps bag for the split resolvers. Passing BOTH getters on
+    // every call is load-bearing: a resolver that copy-pasted the other
+    // pipeline's dep key would ignore its own getter and read this one.
+    function splitDeps(staticVal, videoVal) {
+      return {
+        getStaticVisionQcEnabled: async () => staticVal,
+        getVideoVisionQcEnabled: async () => videoVal
+      };
+    }
+
+    // ── L. resolveStaticEnabled precedence (mirror of C/D/F, static only) ─
+    await checkAsync('L1 default OFF: no SystemConfig, no env → resolveStaticEnabled false', async () => {
+      resetAll();
+      stubStaticDbValue = null;
+      stubDbValue = null;
+      const v = await qc.resolveStaticEnabled({
+        getStaticVisionQcEnabled: () => systemConfig.getStaticVisionQcEnabled()
+      });
+      assert.strictEqual(v, false);
+    });
+
+    await checkAsync('L2 SystemConfig static true wins over env unset', async () => {
+      resetAll();
+      stubStaticDbValue = true;
+      stubDbValue = null;
+      const v = await qc.resolveStaticEnabled({
+        getStaticVisionQcEnabled: () => systemConfig.getStaticVisionQcEnabled()
+      });
+      assert.strictEqual(v, true, 'DB static true must enable QC even with env unset');
+    });
+
+    await checkAsync('L3 SystemConfig static true wins over STATIC env false', async () => {
+      resetAll();
+      process.env.STATIC_VISION_QC_ENABLED = 'false';
+      stubStaticDbValue = true;
+      stubDbValue = null;
+      systemConfig.resetStaticVisionQcEnabledCache();
+      const v = await qc.resolveStaticEnabled({
+        getStaticVisionQcEnabled: () => systemConfig.getStaticVisionQcEnabled()
+      });
+      assert.strictEqual(v, true, 'DB static true must beat STATIC env false');
+    });
+
+    await checkAsync('L4 SystemConfig static false wins over STATIC env true (explicit off)', async () => {
+      resetAll();
+      process.env.STATIC_VISION_QC_ENABLED = 'true';
+      stubStaticDbValue = false;
+      stubDbValue = null;
+      systemConfig.resetStaticVisionQcEnabledCache();
+      const v = await qc.resolveStaticEnabled({
+        getStaticVisionQcEnabled: () => systemConfig.getStaticVisionQcEnabled()
+      });
+      assert.strictEqual(v, false,
+        'DB static false is an explicit kill-switch and must beat STATIC env true');
+    });
+
+    await checkAsync('L5 SystemConfig static null falls through to STATIC env true', async () => {
+      resetAll();
+      process.env.STATIC_VISION_QC_ENABLED = 'true';
+      stubStaticDbValue = null;
+      stubDbValue = null; // no legacy bridge either
+      systemConfig.resetStaticVisionQcEnabledCache();
+      const v = await qc.resolveStaticEnabled({
+        getStaticVisionQcEnabled: () => systemConfig.getStaticVisionQcEnabled()
+      });
+      assert.strictEqual(v, true, 'null static DB override must fall through to STATIC env');
+    });
+
+    await checkAsync('L6 throwing getStaticVisionQcEnabled does not propagate (falls back to STATIC env)', async () => {
+      resetAll();
+      process.env.STATIC_VISION_QC_ENABLED = 'true';
+      delete process.env.AD_VISION_QC_ENABLED;
+      const v = await qc.resolveStaticEnabled({
+        getStaticVisionQcEnabled: async () => {
+          throw new Error('mongo down (injected)');
+        }
+      });
+      assert.strictEqual(v, true,
+        'must fall back to staticEnvEnabled (STATIC=true), not throw, and not envEnabled (AD unset → false)');
+    });
+
+    await checkAsync('L7 throwing getStaticVisionQcEnabled with STATIC unset → false', async () => {
+      resetAll();
+      const v = await qc.resolveStaticEnabled({
+        getStaticVisionQcEnabled: async () => {
+          throw new Error('mongo down (injected)');
+        }
+      });
+      assert.strictEqual(v, false);
+    });
+
+    await checkAsync('L8 injected getStaticVisionQcEnabled true is honoured (deps win without Mongo)', async () => {
+      resetAll();
+      stubStaticDbValue = false;
+      stubDbValue = false;
+      const v = await qc.resolveStaticEnabled({
+        getStaticVisionQcEnabled: async () => true
+      });
+      assert.strictEqual(v, true,
+        'deps.getStaticVisionQcEnabled must be the resolver\'s SystemConfig read, matching resolveEnabled\'s deps.getAdVisionQcEnabled');
+    });
+
+    // ── M. resolveVideoEnabled precedence (mirror of L, video only) ────
+    await checkAsync('M1 default OFF: no SystemConfig, no env → resolveVideoEnabled false', async () => {
+      resetAll();
+      stubVideoDbValue = null;
+      stubDbValue = null;
+      const v = await qc.resolveVideoEnabled({
+        getVideoVisionQcEnabled: () => systemConfig.getVideoVisionQcEnabled()
+      });
+      assert.strictEqual(v, false);
+    });
+
+    await checkAsync('M2 SystemConfig video true wins over env unset', async () => {
+      resetAll();
+      stubVideoDbValue = true;
+      stubDbValue = null;
+      const v = await qc.resolveVideoEnabled({
+        getVideoVisionQcEnabled: () => systemConfig.getVideoVisionQcEnabled()
+      });
+      assert.strictEqual(v, true, 'DB video true must enable QC even with env unset');
+    });
+
+    await checkAsync('M3 SystemConfig video true wins over VIDEO env false', async () => {
+      resetAll();
+      process.env.VIDEO_VISION_QC_ENABLED = 'false';
+      stubVideoDbValue = true;
+      stubDbValue = null;
+      systemConfig.resetVideoVisionQcEnabledCache();
+      const v = await qc.resolveVideoEnabled({
+        getVideoVisionQcEnabled: () => systemConfig.getVideoVisionQcEnabled()
+      });
+      assert.strictEqual(v, true, 'DB video true must beat VIDEO env false');
+    });
+
+    await checkAsync('M4 SystemConfig video false wins over VIDEO env true (explicit off)', async () => {
+      resetAll();
+      process.env.VIDEO_VISION_QC_ENABLED = 'true';
+      stubVideoDbValue = false;
+      stubDbValue = null;
+      systemConfig.resetVideoVisionQcEnabledCache();
+      const v = await qc.resolveVideoEnabled({
+        getVideoVisionQcEnabled: () => systemConfig.getVideoVisionQcEnabled()
+      });
+      assert.strictEqual(v, false,
+        'DB video false is an explicit kill-switch and must beat VIDEO env true');
+    });
+
+    await checkAsync('M5 SystemConfig video null falls through to VIDEO env true', async () => {
+      resetAll();
+      process.env.VIDEO_VISION_QC_ENABLED = 'true';
+      stubVideoDbValue = null;
+      stubDbValue = null;
+      systemConfig.resetVideoVisionQcEnabledCache();
+      const v = await qc.resolveVideoEnabled({
+        getVideoVisionQcEnabled: () => systemConfig.getVideoVisionQcEnabled()
+      });
+      assert.strictEqual(v, true, 'null video DB override must fall through to VIDEO env');
+    });
+
+    await checkAsync('M6 throwing getVideoVisionQcEnabled does not propagate (falls back to VIDEO env)', async () => {
+      resetAll();
+      process.env.VIDEO_VISION_QC_ENABLED = 'true';
+      delete process.env.AD_VISION_QC_ENABLED;
+      const v = await qc.resolveVideoEnabled({
+        getVideoVisionQcEnabled: async () => {
+          throw new Error('mongo down (injected)');
+        }
+      });
+      assert.strictEqual(v, true,
+        'must fall back to videoEnvEnabled (VIDEO=true), not throw, and not envEnabled (AD unset → false)');
+    });
+
+    await checkAsync('M7 throwing getVideoVisionQcEnabled with VIDEO unset → false', async () => {
+      resetAll();
+      const v = await qc.resolveVideoEnabled({
+        getVideoVisionQcEnabled: async () => {
+          throw new Error('mongo down (injected)');
+        }
+      });
+      assert.strictEqual(v, false);
+    });
+
+    await checkAsync('M8 injected getVideoVisionQcEnabled true is honoured (deps win without Mongo)', async () => {
+      resetAll();
+      stubVideoDbValue = false;
+      stubDbValue = false;
+      const v = await qc.resolveVideoEnabled({
+        getVideoVisionQcEnabled: async () => true
+      });
+      assert.strictEqual(v, true,
+        'deps.getVideoVisionQcEnabled must be the resolver\'s SystemConfig read');
+    });
+
+    // ── N. MIGRATION BRIDGE — real getStatic/getVideoVisionQcEnabled ──
+    // These call the REAL systemConfigService getters against the SAME
+    // SystemConfig.findOne stub as D1/G1. A hand-rolled getter would not
+    // prove the bridge that keeps prod QC on across this deploy.
+
+    await checkAsync('N1 static field unset + legacy DB true → getStaticVisionQcEnabled true (bridge)', async () => {
+      resetAll();
+      stubStaticDbValue = null;
+      stubVideoDbValue = false; // sibling off — must not leak
+      stubDbValue = true;
+      const dbVal = await systemConfig.getStaticVisionQcEnabled();
+      assert.strictEqual(dbVal, true,
+        'unset staticVisionQcEnabled must bridge to legacy adVisionQcEnabled=true, ' +
+        'not fall through to env/false and not read the video field');
+      const resolved = await qc.resolveStaticEnabled({
+        getStaticVisionQcEnabled: () => systemConfig.getStaticVisionQcEnabled()
+      });
+      assert.strictEqual(resolved, true,
+        'resolveStaticEnabled must honour the bridged getter, not skip it and read env');
+    });
+
+    await checkAsync('N2 video field unset + legacy DB true → getVideoVisionQcEnabled true (bridge)', async () => {
+      resetAll();
+      stubVideoDbValue = null;
+      stubStaticDbValue = false; // sibling off — must not leak
+      stubDbValue = true;
+      const dbVal = await systemConfig.getVideoVisionQcEnabled();
+      assert.strictEqual(dbVal, true,
+        'unset videoVisionQcEnabled must bridge to legacy adVisionQcEnabled=true');
+      const resolved = await qc.resolveVideoEnabled({
+        getVideoVisionQcEnabled: () => systemConfig.getVideoVisionQcEnabled()
+      });
+      assert.strictEqual(resolved, true);
+    });
+
+    await checkAsync('N3 static field explicitly false wins over legacy true (bridge only while unset)', async () => {
+      resetAll();
+      stubStaticDbValue = false;
+      stubDbValue = true;
+      stubVideoDbValue = true;
+      const dbVal = await systemConfig.getStaticVisionQcEnabled();
+      assert.strictEqual(dbVal, false,
+        'explicit static false must win over legacy true — once the new field is set the bridge must not apply');
+      const resolved = await qc.resolveStaticEnabled({
+        getStaticVisionQcEnabled: () => systemConfig.getStaticVisionQcEnabled()
+      });
+      assert.strictEqual(resolved, false);
+    });
+
+    await checkAsync('N4 video field explicitly false wins over legacy true (bridge only while unset)', async () => {
+      resetAll();
+      stubVideoDbValue = false;
+      stubDbValue = true;
+      stubStaticDbValue = true;
+      const dbVal = await systemConfig.getVideoVisionQcEnabled();
+      assert.strictEqual(dbVal, false,
+        'explicit video false must win over legacy true');
+      const resolved = await qc.resolveVideoEnabled({
+        getVideoVisionQcEnabled: () => systemConfig.getVideoVisionQcEnabled()
+      });
+      assert.strictEqual(resolved, false);
+    });
+
+    await checkAsync('N5 static field explicitly true wins over legacy false', async () => {
+      resetAll();
+      stubStaticDbValue = true;
+      stubDbValue = false;
+      const dbVal = await systemConfig.getStaticVisionQcEnabled();
+      assert.strictEqual(dbVal, true,
+        'explicit static true must win over legacy false');
+    });
+
+    await checkAsync('N6 bridge is to LEGACY, not to the sibling pipeline field', async () => {
+      resetAll();
+      // static unset, video true, legacy false → static must be false (legacy),
+      // not true (that would mean it bridged to videoVisionQcEnabled).
+      stubStaticDbValue = null;
+      stubVideoDbValue = true;
+      stubDbValue = false;
+      const s = await systemConfig.getStaticVisionQcEnabled();
+      assert.strictEqual(s, false,
+        'static unset must bridge to adVisionQcEnabled (false), not to videoVisionQcEnabled (true)');
+      const v = await systemConfig.getVideoVisionQcEnabled();
+      assert.strictEqual(v, true,
+        'video explicit true must still win on its own getter');
+    });
+
+    await checkAsync('N7 both new fields unset + legacy null → getters return null (resolver then env)', async () => {
+      resetAll();
+      process.env.AD_VISION_QC_ENABLED = 'true';
+      stubStaticDbValue = null;
+      stubVideoDbValue = null;
+      stubDbValue = null;
+      assert.strictEqual(await systemConfig.getStaticVisionQcEnabled(), null,
+        'getter must return null (not false) so the resolver can fall through to env');
+      assert.strictEqual(await systemConfig.getVideoVisionQcEnabled(), null);
+      assert.strictEqual(
+        await qc.resolveStaticEnabled({
+          getStaticVisionQcEnabled: () => systemConfig.getStaticVisionQcEnabled()
+        }),
+        true,
+        'null getter + AD env true (STATIC unset → staticEnvEnabled → envEnabled) must enable'
+      );
+      assert.strictEqual(
+        await qc.resolveVideoEnabled({
+          getVideoVisionQcEnabled: () => systemConfig.getVideoVisionQcEnabled()
+        }),
+        true
+      );
+    });
+
+    await checkAsync('N8 no SystemConfig document → getter null (bridge cannot invent a legacy value)', async () => {
+      resetAll();
+      stubDbValue = undefined; // existing idiom: findOne lean() → null
+      stubStaticDbValue = true; // would be true IF a document existed — it must not
+      const s = await systemConfig.getStaticVisionQcEnabled();
+      assert.strictEqual(s, null,
+        'a missing singleton has no legacy field to bridge from; must return null, not the stubStatic value sitting on a document that was not returned');
+    });
+
+    await checkAsync('N9 static and video TTL caches are independent (shared-cache copy-paste)', async () => {
+      resetAll();
+      stubStaticDbValue = true;
+      stubVideoDbValue = false;
+      stubDbValue = null;
+      let reads = 0;
+      const orig = SystemConfig.findOne;
+      SystemConfig.findOne = function (...args) {
+        reads += 1;
+        return orig.apply(this, args);
+      };
+      try {
+        const s1 = await systemConfig.getStaticVisionQcEnabled();
+        const s2 = await systemConfig.getStaticVisionQcEnabled();
+        assert.strictEqual(s1, true);
+        assert.strictEqual(s2, true);
+        assert.strictEqual(reads, 1, `static cache hit should not re-read Mongo, got ${reads} reads`);
+        const v = await systemConfig.getVideoVisionQcEnabled();
+        assert.strictEqual(v, false,
+          'video getter must not serve the static cache (true) — a shared cache object would return true here');
+        assert.strictEqual(reads, 2, `video has its own cache and must perform its own Mongo read, got ${reads}`);
+        assert.strictEqual(systemConfig.peekStaticVisionQcEnabled(), true);
+        assert.strictEqual(systemConfig.peekVideoVisionQcEnabled(), false);
+      } finally {
+        SystemConfig.findOne = orig;
+        installStub();
+      }
+    });
+
+    // ── O. 2×2 independence matrix ───────────────────────────────────
+    await checkAsync('O1 2×2 matrix: each resolver returns its own injected value (both getters passed every time)', async () => {
+      resetAll();
+      const combos = [
+        { name: 'static=true,video=false', s: true, v: false },
+        { name: 'static=false,video=true', s: false, v: true },
+        { name: 'static=true,video=true', s: true, v: true },
+        { name: 'static=false,video=false', s: false, v: false }
+      ];
+      for (const c of combos) {
+        const deps = splitDeps(c.s, c.v);
+        const gotS = await qc.resolveStaticEnabled(deps);
+        const gotV = await qc.resolveVideoEnabled(deps);
+        assert.strictEqual(gotS, c.s,
+          `${c.name}: resolveStaticEnabled returned ${gotS}, expected ${c.s} ` +
+          `(if this equals the VIDEO value, the static resolver is reading getVideoVisionQcEnabled)`);
+        assert.strictEqual(gotV, c.v,
+          `${c.name}: resolveVideoEnabled returned ${gotV}, expected ${c.v} ` +
+          `(if this equals the STATIC value, the video resolver is reading getStaticVisionQcEnabled)`);
+      }
+    });
+
+    await checkAsync('O2 flipping ONLY video does not change resolveStaticEnabled', async () => {
+      resetAll();
+      for (const s of [true, false]) {
+        const before = await qc.resolveStaticEnabled(splitDeps(s, false));
+        const after = await qc.resolveStaticEnabled(splitDeps(s, true));
+        assert.strictEqual(before, s);
+        assert.strictEqual(after, s,
+          `flipping video false→true must not change resolveStaticEnabled (held static=${s})`);
+        assert.strictEqual(await qc.resolveVideoEnabled(splitDeps(s, false)), false);
+        assert.strictEqual(await qc.resolveVideoEnabled(splitDeps(s, true)), true);
+      }
+    });
+
+    await checkAsync('O3 flipping ONLY static does not change resolveVideoEnabled', async () => {
+      resetAll();
+      for (const v of [true, false]) {
+        const before = await qc.resolveVideoEnabled(splitDeps(false, v));
+        const after = await qc.resolveVideoEnabled(splitDeps(true, v));
+        assert.strictEqual(before, v);
+        assert.strictEqual(after, v,
+          `flipping static false→true must not change resolveVideoEnabled (held video=${v})`);
+        assert.strictEqual(await qc.resolveStaticEnabled(splitDeps(false, v)), false);
+        assert.strictEqual(await qc.resolveStaticEnabled(splitDeps(true, v)), true);
+      }
+    });
+
+    await checkAsync('O4 2×2 against REAL getters + Mongo stub (not just injected deps)', async () => {
+      // Injected deps in O1 would still pass if both resolvers ignored deps
+      // and read the same Mongo field that happened to match. This arm
+      // drives the real getters so a shared-field copy-paste fails.
+      resetAll();
+      const combos = [
+        { name: 'static=true,video=false', s: true, v: false },
+        { name: 'static=false,video=true', s: false, v: true },
+        { name: 'static=true,video=true', s: true, v: true },
+        { name: 'static=false,video=false', s: false, v: false }
+      ];
+      for (const c of combos) {
+        stubStaticDbValue = c.s;
+        stubVideoDbValue = c.v;
+        stubDbValue = null; // no legacy bridge
+        systemConfig.resetStaticVisionQcEnabledCache();
+        systemConfig.resetVideoVisionQcEnabledCache();
+        const gotS = await qc.resolveStaticEnabled({
+          getStaticVisionQcEnabled: () => systemConfig.getStaticVisionQcEnabled()
+        });
+        const gotV = await qc.resolveVideoEnabled({
+          getVideoVisionQcEnabled: () => systemConfig.getVideoVisionQcEnabled()
+        });
+        assert.strictEqual(gotS, c.s, `${c.name} (real getter): static expected ${c.s}, got ${gotS}`);
+        assert.strictEqual(gotV, c.v, `${c.name} (real getter): video expected ${c.v}, got ${gotV}`);
+      }
+    });
+
+    // ── P. mutation-style cross-wiring (copy-pasted the wrong dep key) ─
+    await checkAsync('P1 resolveStaticEnabled must NOT invoke getVideoVisionQcEnabled (throws if it does)', async () => {
+      resetAll();
+      stubStaticDbValue = false;
+      stubVideoDbValue = false;
+      stubDbValue = false;
+      const v = await qc.resolveStaticEnabled({
+        getStaticVisionQcEnabled: async () => true,
+        getVideoVisionQcEnabled: async () => {
+          throw new Error('resolveStaticEnabled invoked getVideoVisionQcEnabled (copy-pasted the video dep key)');
+        }
+      });
+      assert.strictEqual(v, true,
+        'static resolver must use getStaticVisionQcEnabled (true) — ' +
+        'if it copy-pasted getVideoVisionQcEnabled this either threw or returned Mongo false');
+    });
+
+    await checkAsync('P2 resolveVideoEnabled must NOT invoke getStaticVisionQcEnabled (returns true IFF it did)', async () => {
+      resetAll();
+      stubStaticDbValue = false;
+      stubVideoDbValue = false;
+      stubDbValue = false;
+      // Static accessor returns true; video accessor returns false.
+      // If resolveVideoEnabled accidentally called getStaticVisionQcEnabled,
+      // it would resolve true — the only way this assertion sees true.
+      const v = await qc.resolveVideoEnabled({
+        getStaticVisionQcEnabled: async () => true,
+        getVideoVisionQcEnabled: async () => false
+      });
+      assert.strictEqual(v, false,
+        'resolveVideoEnabled must return its own getter (false), not the static getter (true)');
+
+      // Same fact, fail-loud: the static getter throws if touched.
+      const v2 = await qc.resolveVideoEnabled({
+        getStaticVisionQcEnabled: async () => {
+          throw new Error('resolveVideoEnabled invoked getStaticVisionQcEnabled (copy-pasted the static dep key)');
+        },
+        getVideoVisionQcEnabled: async () => false
+      });
+      assert.strictEqual(v2, false);
+    });
+
+    // ── Q. shared parseBoolEnv semantics across all three env helpers ─
+    check('Q1 parseBoolEnv("1") is false — and all three env helpers agree', () => {
+      resetAll();
+      process.env.AD_VISION_QC_ENABLED = '1';
+      process.env.STATIC_VISION_QC_ENABLED = '1';
+      process.env.VIDEO_VISION_QC_ENABLED = '1';
+      assert.strictEqual(qc.parseBoolEnv('1'), false);
+      assert.strictEqual(qc.envEnabled(), false);
+      assert.strictEqual(qc.staticEnvEnabled(), false);
+      assert.strictEqual(qc.videoEnvEnabled(), false,
+        'if videoEnvEnabled is true here it is not using parseBoolEnv (truthy "1")');
+    });
+
+    check('Q2 parseBoolEnv("TRUE ") trailing space is false — all three agree', () => {
+      resetAll();
+      process.env.AD_VISION_QC_ENABLED = 'TRUE ';
+      process.env.STATIC_VISION_QC_ENABLED = 'TRUE ';
+      process.env.VIDEO_VISION_QC_ENABLED = 'TRUE ';
+      assert.strictEqual(qc.parseBoolEnv('TRUE '), false,
+        'toLowerCase alone does not trim — trailing space must stay off');
+      assert.strictEqual(qc.envEnabled(), false);
+      assert.strictEqual(qc.staticEnvEnabled(), false);
+      assert.strictEqual(qc.videoEnvEnabled(), false);
+    });
+
+    check('Q3 parseBoolEnv("true") is true — all three agree', () => {
+      resetAll();
+      process.env.AD_VISION_QC_ENABLED = 'true';
+      process.env.STATIC_VISION_QC_ENABLED = 'true';
+      process.env.VIDEO_VISION_QC_ENABLED = 'true';
+      assert.strictEqual(qc.parseBoolEnv('true'), true);
+      assert.strictEqual(qc.envEnabled(), true);
+      assert.strictEqual(qc.staticEnvEnabled(), true);
+      assert.strictEqual(qc.videoEnvEnabled(), true);
+    });
+
+    check('Q4 parseBoolEnv("TRUE") is true (toLowerCase) — all three agree', () => {
+      resetAll();
+      process.env.AD_VISION_QC_ENABLED = 'TRUE';
+      process.env.STATIC_VISION_QC_ENABLED = 'TRUE';
+      process.env.VIDEO_VISION_QC_ENABLED = 'TRUE';
+      assert.strictEqual(qc.parseBoolEnv('TRUE'), true);
+      assert.strictEqual(qc.envEnabled(), true);
+      assert.strictEqual(qc.staticEnvEnabled(), true);
+      assert.strictEqual(qc.videoEnvEnabled(), true);
+    });
+
+    check('Q5 unset → false on parseBoolEnv and all three env helpers', () => {
+      resetAll();
+      assert.strictEqual(qc.parseBoolEnv(undefined), false);
+      assert.strictEqual(qc.parseBoolEnv(null), false);
+      assert.strictEqual(qc.parseBoolEnv(''), false);
+      assert.strictEqual(qc.envEnabled(), false);
+      assert.strictEqual(qc.staticEnvEnabled(), false);
+      assert.strictEqual(qc.videoEnvEnabled(), false);
+    });
+
+    // ── R. per-gate env-var fallback (own name unset → legacy AD_ name) ─
+    check('R1 STATIC unset + AD_VISION_QC_ENABLED=true → staticEnvEnabled true (legacy env bridge)', () => {
+      resetAll();
+      process.env.AD_VISION_QC_ENABLED = 'true';
+      delete process.env.STATIC_VISION_QC_ENABLED;
+      delete process.env.VIDEO_VISION_QC_ENABLED;
+      assert.strictEqual(qc.staticEnvEnabled(), true,
+        'entirely-unset STATIC_VISION_QC_ENABLED must fall back to envEnabled() (legacy true)');
+      assert.strictEqual(qc.videoEnvEnabled(), true,
+        'entirely-unset VIDEO_VISION_QC_ENABLED must fall back to the same legacy true');
+      assert.strictEqual(qc.envEnabled(), true);
+    });
+
+    check('R2 STATIC="" wins over legacy true (empty is set, not unset)', () => {
+      resetAll();
+      process.env.AD_VISION_QC_ENABLED = 'true';
+      process.env.STATIC_VISION_QC_ENABLED = '';
+      delete process.env.VIDEO_VISION_QC_ENABLED;
+      assert.strictEqual(qc.staticEnvEnabled(), false,
+        'empty string is !== undefined so it wins outright; parseBoolEnv("") is false even though legacy is true');
+      assert.strictEqual(qc.envEnabled(), true,
+        'legacy envEnabled must be unaffected by STATIC being set');
+      assert.strictEqual(qc.videoEnvEnabled(), true,
+        'setting STATIC must not steal VIDEO\'s unset→legacy fallback');
+    });
+
+    check('R3 STATIC="false" wins over legacy true', () => {
+      resetAll();
+      process.env.AD_VISION_QC_ENABLED = 'true';
+      process.env.STATIC_VISION_QC_ENABLED = 'false';
+      assert.strictEqual(qc.staticEnvEnabled(), false,
+        'STATIC=false must win over AD=true — the new name, once present, is the whole decision');
+    });
+
+    check('R4 STATIC="true" wins over legacy false', () => {
+      resetAll();
+      process.env.AD_VISION_QC_ENABLED = 'false';
+      process.env.STATIC_VISION_QC_ENABLED = 'true';
+      assert.strictEqual(qc.staticEnvEnabled(), true);
+      assert.strictEqual(qc.envEnabled(), false);
+    });
+
+    check('R5 VIDEO unset + AD_VISION_QC_ENABLED=true → videoEnvEnabled true (legacy env bridge)', () => {
+      resetAll();
+      process.env.AD_VISION_QC_ENABLED = 'true';
+      delete process.env.VIDEO_VISION_QC_ENABLED;
+      assert.strictEqual(qc.videoEnvEnabled(), true);
+    });
+
+    check('R6 VIDEO="" wins over legacy true (empty is set, not unset)', () => {
+      resetAll();
+      process.env.AD_VISION_QC_ENABLED = 'true';
+      process.env.VIDEO_VISION_QC_ENABLED = '';
+      delete process.env.STATIC_VISION_QC_ENABLED;
+      assert.strictEqual(qc.videoEnvEnabled(), false,
+        'empty string is !== undefined so it wins outright even though legacy is true');
+      assert.strictEqual(qc.staticEnvEnabled(), true,
+        'setting VIDEO must not steal STATIC\'s unset→legacy fallback');
+    });
+
+    check('R7 VIDEO="false" wins over legacy true', () => {
+      resetAll();
+      process.env.AD_VISION_QC_ENABLED = 'true';
+      process.env.VIDEO_VISION_QC_ENABLED = 'false';
+      assert.strictEqual(qc.videoEnvEnabled(), false);
+    });
+
+    check('R8 VIDEO="true" wins over legacy false', () => {
+      resetAll();
+      process.env.AD_VISION_QC_ENABLED = 'false';
+      process.env.VIDEO_VISION_QC_ENABLED = 'true';
+      assert.strictEqual(qc.videoEnvEnabled(), true);
+      assert.strictEqual(qc.envEnabled(), false);
+    });
+
+    // ── S. runPostRenderQc / runVideoPostRenderQc enabled-omitted fallback ─
+    // runPostRenderQc calls resolveStaticEnabled() as a SAME-MODULE lexical
+    // binding, so qc.resolveStaticEnabled = … (the sibling-harness export
+    // swap) does NOT intercept it — that is the PR #288 class applied to
+    // CJS. The hop the resolver actually performs at call time is
+    // require('./systemConfigService').getStaticVisionQcEnabled, and THAT
+    // is a require-cache export — the same idiom this file already uses
+    // for SystemConfig.findOne. We swap those getters.
+    //
+    // Observable: gate OFF → skipped/disabled, judgeFn never called.
+    //            gate ON  → judgeFn called, skipped false.
+
+    function passingVerdict() {
+      return {
+        pass: true,
+        summary: 'clean',
+        findings: [],
+        categories: {
+          competitor_marks: { score: 9, pass: true, findings: [] },
+          product_fidelity: { score: 9, pass: true, findings: [] },
+          text_defects: { score: 9, pass: true, findings: [] },
+          layout_safe_box: { score: 9, pass: true, findings: [] }
+        }
+      };
+    }
+
+    function functionBody(src, fnName) {
+      const start = src.indexOf(`function ${fnName}`);
+      assert.ok(start >= 0, `${fnName} function not found`);
+      const sigClose = src.slice(start).search(/\)\s*\{/);
+      assert.ok(sigClose >= 0, `${fnName} signature close not found`);
+      const brace = start + sigClose + src.slice(start + sigClose).indexOf('{');
+      let depth = 0;
+      for (let i = brace; i < src.length; i++) {
+        if (src[i] === '{') depth++;
+        else if (src[i] === '}') {
+          depth--;
+          if (depth === 0) return src.slice(start, i + 1);
+        }
+      }
+      throw new Error(`${fnName} body not closed`);
+    }
+
+    await checkAsync('S1 runPostRenderQc(enabled omitted) reads getStaticVisionQcEnabled, not video/legacy', async () => {
+      resetAll();
+      const origS = systemConfig.getStaticVisionQcEnabled;
+      const origV = systemConfig.getVideoVisionQcEnabled;
+      const origL = systemConfig.getAdVisionQcEnabled;
+      let staticCalls = 0;
+      let videoCalls = 0;
+      let legacyCalls = 0;
+      let judgeCalls = 0;
+      systemConfig.getStaticVisionQcEnabled = async () => { staticCalls += 1; return true; };
+      systemConfig.getVideoVisionQcEnabled = async () => { videoCalls += 1; return false; };
+      systemConfig.getAdVisionQcEnabled = async () => { legacyCalls += 1; return false; };
+      try {
+        const result = await qc.runPostRenderQc({
+          // enabled omitted on purpose — this IS the fallback branch
+          originalProductUrl: 'https://example.test/product.jpg',
+          generate: async () => ({ renderUrl: 'https://example.test/ad.png' }),
+          judgeFn: async () => { judgeCalls += 1; return passingVerdict(); },
+          adId: 'qc-gate-s1'
+        });
+        assert.ok(staticCalls >= 1,
+          `runPostRenderQc fallback must call getStaticVisionQcEnabled (got ${staticCalls} calls)`);
+        assert.strictEqual(videoCalls, 0,
+          `runPostRenderQc must not call getVideoVisionQcEnabled (got ${videoCalls}) — that is the video resolver`);
+        assert.strictEqual(legacyCalls, 0,
+          `runPostRenderQc must not call getAdVisionQcEnabled (got ${legacyCalls}) — that is the pre-split resolveEnabled path`);
+        assert.ok(judgeCalls >= 1,
+          'static getter returned true, so QC must actually run (judgeFn called) — a stale resolveEnabled() stub would skip');
+        assert.strictEqual(result.skipped, false);
+      } finally {
+        systemConfig.getStaticVisionQcEnabled = origS;
+        systemConfig.getVideoVisionQcEnabled = origV;
+        systemConfig.getAdVisionQcEnabled = origL;
+      }
+    });
+
+    await checkAsync('S2 runVideoPostRenderQc(enabled omitted) reads getVideoVisionQcEnabled, not static/legacy', async () => {
+      resetAll();
+      const origS = systemConfig.getStaticVisionQcEnabled;
+      const origV = systemConfig.getVideoVisionQcEnabled;
+      const origL = systemConfig.getAdVisionQcEnabled;
+      let staticCalls = 0;
+      let videoCalls = 0;
+      let legacyCalls = 0;
+      let judgeCalls = 0;
+      systemConfig.getStaticVisionQcEnabled = async () => { staticCalls += 1; return false; };
+      systemConfig.getVideoVisionQcEnabled = async () => { videoCalls += 1; return true; };
+      systemConfig.getAdVisionQcEnabled = async () => { legacyCalls += 1; return false; };
+      try {
+        const result = await qc.runVideoPostRenderQc({
+          originalProductUrl: 'https://example.test/product.jpg',
+          frames: [{ timestampSec: 0.5, url: 'https://example.test/frame.jpg' }],
+          judgeFn: async () => { judgeCalls += 1; return passingVerdict(); },
+          adId: 'qc-gate-s2'
+        });
+        assert.ok(videoCalls >= 1,
+          `runVideoPostRenderQc fallback must call getVideoVisionQcEnabled (got ${videoCalls} calls)`);
+        assert.strictEqual(staticCalls, 0,
+          `runVideoPostRenderQc must not call getStaticVisionQcEnabled (got ${staticCalls})`);
+        assert.strictEqual(legacyCalls, 0,
+          `runVideoPostRenderQc must not call getAdVisionQcEnabled (got ${legacyCalls}) — that is the pre-split resolveEnabled path`);
+        assert.ok(judgeCalls >= 1,
+          'video getter returned true, so QC must actually run (judgeFn called)');
+        assert.strictEqual(result.skipped, false);
+      } finally {
+        systemConfig.getStaticVisionQcEnabled = origS;
+        systemConfig.getVideoVisionQcEnabled = origV;
+        systemConfig.getAdVisionQcEnabled = origL;
+      }
+    });
+
+    await checkAsync('S3 swapping ONLY the video getter changes only runVideoPostRenderQc', async () => {
+      resetAll();
+      const origS = systemConfig.getStaticVisionQcEnabled;
+      const origV = systemConfig.getVideoVisionQcEnabled;
+      let staticGate = true;
+      let videoGate = false;
+      systemConfig.getStaticVisionQcEnabled = async () => staticGate;
+      systemConfig.getVideoVisionQcEnabled = async () => videoGate;
+      try {
+        const staticBefore = await qc.runPostRenderQc({
+          originalProductUrl: 'https://example.test/product.jpg',
+          generate: async () => ({ renderUrl: 'https://example.test/ad.png' }),
+          judgeFn: async () => passingVerdict(),
+          adId: 'qc-gate-s3-static-before'
+        });
+        const videoBefore = await qc.runVideoPostRenderQc({
+          originalProductUrl: 'https://example.test/product.jpg',
+          frames: [{ timestampSec: 0.5, url: 'https://example.test/frame.jpg' }],
+          judgeFn: async () => passingVerdict(),
+          adId: 'qc-gate-s3-video-before'
+        });
+        assert.strictEqual(staticBefore.skipped, false, 'static=true → runPostRenderQc must inspect');
+        assert.strictEqual(videoBefore.skipped, true, 'video=false → runVideoPostRenderQc must skip');
+        assert.strictEqual(videoBefore.visionQc && videoBefore.visionQc.disabled, true);
+
+        // Flip ONLY video.
+        videoGate = true;
+        const staticAfter = await qc.runPostRenderQc({
+          originalProductUrl: 'https://example.test/product.jpg',
+          generate: async () => ({ renderUrl: 'https://example.test/ad.png' }),
+          judgeFn: async () => passingVerdict(),
+          adId: 'qc-gate-s3-static-after'
+        });
+        const videoAfter = await qc.runVideoPostRenderQc({
+          originalProductUrl: 'https://example.test/product.jpg',
+          frames: [{ timestampSec: 0.5, url: 'https://example.test/frame.jpg' }],
+          judgeFn: async () => passingVerdict(),
+          adId: 'qc-gate-s3-video-after'
+        });
+        assert.strictEqual(staticAfter.skipped, false,
+          'flipping ONLY video true must not change runPostRenderQc (still inspects)');
+        assert.strictEqual(videoAfter.skipped, false,
+          'flipping video false→true must make runVideoPostRenderQc inspect');
+      } finally {
+        systemConfig.getStaticVisionQcEnabled = origS;
+        systemConfig.getVideoVisionQcEnabled = origV;
+      }
+    });
+
+    await checkAsync('S4 swapping ONLY the static getter changes only runPostRenderQc', async () => {
+      resetAll();
+      const origS = systemConfig.getStaticVisionQcEnabled;
+      const origV = systemConfig.getVideoVisionQcEnabled;
+      let staticGate = true;
+      let videoGate = true;
+      systemConfig.getStaticVisionQcEnabled = async () => staticGate;
+      systemConfig.getVideoVisionQcEnabled = async () => videoGate;
+      try {
+        staticGate = false; // flip ONLY static
+        const staticRes = await qc.runPostRenderQc({
+          originalProductUrl: 'https://example.test/product.jpg',
+          generate: async () => ({ renderUrl: 'https://example.test/ad.png' }),
+          judgeFn: async () => {
+            throw new Error('runPostRenderQc judged while static getter is false — still on the video/legacy resolver');
+          },
+          adId: 'qc-gate-s4-static'
+        });
+        const videoRes = await qc.runVideoPostRenderQc({
+          originalProductUrl: 'https://example.test/product.jpg',
+          frames: [{ timestampSec: 0.5, url: 'https://example.test/frame.jpg' }],
+          judgeFn: async () => passingVerdict(),
+          adId: 'qc-gate-s4-video'
+        });
+        assert.strictEqual(staticRes.skipped, true,
+          'static=false → runPostRenderQc must skip (and must not call judgeFn)');
+        assert.strictEqual(staticRes.visionQc && staticRes.visionQc.disabled, true);
+        assert.strictEqual(videoRes.skipped, false,
+          'flipping ONLY static false must not change runVideoPostRenderQc (still inspects)');
+      } finally {
+        systemConfig.getStaticVisionQcEnabled = origS;
+        systemConfig.getVideoVisionQcEnabled = origV;
+      }
+    });
+
+    check('S5 runPostRenderQc source fallback calls resolveStaticEnabled (not video, not legacy)', () => {
+      const src = fs.readFileSync(
+        path.join(__dirname, '..', 'services', 'adVisionQcService.js'),
+        'utf8'
+      );
+      const body = functionBody(src, 'runPostRenderQc');
+      const stripped = body
+        .replace(/\/\*[\s\S]*?\*\//g, '')
+        .replace(/\/\/[^\n]*/g, '');
+      assert.match(stripped, /typeof enabled === ['"]boolean['"]/);
+      assert.match(stripped, /\bresolveStaticEnabled\s*\(/);
+      assert.ok(!/\bresolveVideoEnabled\s*\(/.test(stripped),
+        'runPostRenderQc must not call resolveVideoEnabled');
+      assert.ok(!/\bresolveEnabled\s*\(/.test(stripped),
+        'runPostRenderQc must not fall back to the legacy resolveEnabled() — that is the stale-stub class from PR #288');
+    });
+
+    check('S6 runVideoPostRenderQc source fallback calls resolveVideoEnabled (not static, not legacy)', () => {
+      const src = fs.readFileSync(
+        path.join(__dirname, '..', 'services', 'adVisionQcService.js'),
+        'utf8'
+      );
+      const body = functionBody(src, 'runVideoPostRenderQc');
+      const stripped = body
+        .replace(/\/\*[\s\S]*?\*\//g, '')
+        .replace(/\/\/[^\n]*/g, '');
+      assert.match(stripped, /typeof enabled === ['"]boolean['"]/);
+      assert.match(stripped, /\bresolveVideoEnabled\s*\(/);
+      assert.ok(!/\bresolveStaticEnabled\s*\(/.test(stripped),
+        'runVideoPostRenderQc must not call resolveStaticEnabled');
+      assert.ok(!/\bresolveEnabled\s*\(/.test(stripped),
+        'runVideoPostRenderQc must not fall back to the legacy resolveEnabled()');
     });
 
   } finally {

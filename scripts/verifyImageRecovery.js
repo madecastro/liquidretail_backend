@@ -208,6 +208,13 @@ async function runBehavioralChecks() {
   // harness) SystemConfig.findOne() Mongo call and hang for the full
   // mongoose buffering timeout before failing soft to the env default.
   const origResolveEnabled = adVisionQc.resolveEnabled;
+  // SPLIT 2026-08-21 — maybeQcRecoveredPlate now calls resolveStaticEnabled()
+  // (this module recovers STATIC ads only, per its own file header), not the
+  // legacy resolveEnabled() above. resolveEnabled is stubbed too only as
+  // belt-and-braces; omitting resolveStaticEnabled reproduces the exact
+  // same-shaped incident this file's header already documents, one gate
+  // name later — a live SystemConfig.findOne() and a 10s buffering timeout.
+  const origResolveStaticEnabled = adVisionQc.resolveStaticEnabled;
 
   const staleDisabledStamp = {
     schemaVersion: 1,
@@ -230,6 +237,7 @@ async function runBehavioralChecks() {
   };
   adVisionQc.isEnabled = () => true; // operator flipped the gate back ON
   adVisionQc.resolveEnabled = async () => true; // same signal, on the real (awaited) gate path
+  adVisionQc.resolveStaticEnabled = async () => true; // the actual gate this caller reads post-split
 
   try {
     const fakeAd = {
@@ -264,6 +272,7 @@ async function runBehavioralChecks() {
     Ad.findById = origFindById;
     adVisionQc.isEnabled = origIsEnabled;
     adVisionQc.resolveEnabled = origResolveEnabled;
+    adVisionQc.resolveStaticEnabled = origResolveStaticEnabled;
   }
 }
 

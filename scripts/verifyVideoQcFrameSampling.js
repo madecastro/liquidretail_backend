@@ -662,7 +662,7 @@ console.log('\nverifyVideoQcFrameSampling — dense frame pre-filter for video v
     // the PR #288 incident this comment describes, one gate name later.
     adVisionQc.isEnabled = () => true;
     adVisionQc.resolveEnabled = async () => true;
-    
+    adVisionQc.resolveVideoEnabled = async () => true;
     adVisionQc.runVideoPostRenderQc = async (args) => {
       capturedFrames = args.frames;
       return {
