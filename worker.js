@@ -537,19 +537,26 @@ async function reapOrphans() {
 
   let nRunsHealed = 0;
   for (const failedCandidate of recentlyFailedCandidates) {
-    const claimedAds = await Ad.find({ campaignRunIds: failedCandidate.runId }).select('status').lean();
+    // Wide projection, matching the running-run pass above (PR #278):
+    // classifyRunAdOutcome's video-titling check needs kind/renderUrl/
+    // veoVideoUrl/titlingResumeState/renderStage too — a status-only
+    // projection would silently misjudge every video Ad.
+    const claimedAds = await Ad.find({ campaignRunIds: failedCandidate.runId })
+      .select('status kind renderUrl veoVideoUrl titlingResumeState renderStage')
+      .lean();
     if (claimedAds.length === 0) continue; // nothing claimed — nothing to reconcile
     const outcome = classifyRunAdOutcome(claimedAds);
     // Same guard fix as services/processAlerts.js persistOrphans (adversarial
     // review, 2026-08-20): defer ONLY when nothing has been lost AND
-    // something is still genuinely rendering. A bare `!outcome.isSettled`
-    // would also defer a candidate that already HAS a lost (`needsRetry`)
-    // Ad — but this candidate is already `status:'failed'`, so there is no
-    // gate/sweeper visibility to protect here the way there is in
-    // persistOrphans; the reason to still wait is purely to avoid computing
-    // a premature (undercounted) succeeded/failed while a receipt-holding
-    // sibling's outcome is still genuinely unknown.
-    if (outcome.stillRendering > 0 && !outcome.needsRetry) continue;
+    // something is still genuinely outstanding (`!isSettled` — receipt-
+    // holding + rendering, OR, since PR #278, an untitled paid master). A
+    // bare `!outcome.isSettled` would also defer a candidate that already
+    // HAS a lost (`needsRetry`) Ad — but this candidate is already
+    // `status:'failed'`, so there is no gate/sweeper visibility to protect
+    // here the way there is in persistOrphans; the reason to still wait is
+    // purely to avoid computing a premature (undercounted) succeeded/failed
+    // while an outstanding sibling's outcome is still genuinely unknown.
+    if (!outcome.isSettled && !outcome.needsRetry) continue;
     const healed = buildRunReconciliationUpdate(outcome, { staleMin: REAP_STALE_MIN, now: new Date(reapNow) });
     const alreadyCorrect = healed.$set.status === failedCandidate.status &&
       healed.$set.succeeded === failedCandidate.succeeded &&
