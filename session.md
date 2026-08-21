@@ -87,6 +87,32 @@ it clears it back to this placeholder in the same commit that closes it out.)_
   (or `routes/ads.js`, `"ads"`) alone can report "nothing to run" and exit 0
   while dependent scripts never run. Use plain `npm test` (full suite) until
   this is fixed.
+- **Newer backend session (2026-08-20): PR #279, open, not self-merged** —
+  `fix/run-counter-desync-and-render-resilience`. Owner-flagged: two runs
+  (brian@egami.tv) stuck at `status:'failed', succeeded:18, total:39` while
+  all 39 claimed Ads were genuinely `draft` with a real `renderUrl` (confirmed
+  against prod via a read-only query). Root cause: PR #272's Ad-truth
+  reconciliation is wired into exactly one place (the worker's stale-`running`
+  reaper); `services/processAlerts.js` `persistOrphans` (fires on every
+  deploy/autoscale SIGTERM) blind-stamped `status:'failed'` with no recount,
+  which is permanently invisible to that fix. Fixed: `persistOrphans` now
+  reconciles from real Ad truth (reusing `classifyRunAdOutcome`/
+  `buildRunReconciliationUpdate`), plus a new general healing pass
+  (`buildRecentlyFailedFilter`) that re-checks recently-`'failed'` runs the
+  same way — this is what actually heals the two already-broken runs once
+  deployed. Two independent Grok adversarial reviews caught a real regression
+  in the first draft (a bare `!outcome.isSettled` guard starving
+  `strandedRunSweeper`'s contract in the common mixed deploy shape) before
+  commit; fixed and revert-proven. Also investigated (no code change): the
+  SIGTERM/render-resilience question — Render's own events API shows the
+  22:45:45 single SIGTERM was a benign autoscale scale-down and the 23:05:09
+  triple was the operator's own deploys, though genuine OOM kills do recur
+  independently every 20-45 minutes; existing recovery
+  (`bootRecoveryService`/`titlingResumeService`) already avoids double-
+  billing there, with 5-20 minute latency. Full write-up:
+  `session.d/2026-08-20_run-counter-desync-and-render-sigterm-investigation.md`.
+  `scripts/verifyRunStatusTruthfulness.js` extended 24 → 31 checks. `npm test`
+  — **181/181** passed. `npm run lint` clean.
 - **Newest backend session (this one, 2026-08-20): PR #276, open, not
   self-merged** — `fix/vision-qc-cache-race`. Owner turned
   `SystemConfig.adVisionQcEnabled` on and it barely ran: 11/18 delivered
