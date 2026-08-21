@@ -489,7 +489,10 @@ JSON SHAPE (no prose outside it):
 function clampScore(n) {
   const x = Number(n);
   if (!Number.isFinite(x)) return 0;
-  return Math.max(0, Math.min(10, Math.round(x)));
+  // Floor, not round: a sub-floor fraction (6.5, 6.9) must not round UP
+  // across PASS_FLOOR. The prompt asks for integers; flooring is the
+  // fail-closed net when the model emits a fraction anyway.
+  return Math.max(0, Math.min(10, Math.floor(x)));
 }
 
 function emptyCategories(reason) {
@@ -740,6 +743,8 @@ function salvageVerdictJson(rawText) {
  *       see the direction-of-boolean reasoning inline below. Both `true` and
  *       `false` are treated as an unparseable category and FAIL, same as a
  *       wholly absent category — tolerance never means guessing a pass.
+ *   (d) A category value that IS a usable numeric score (bare 2 / "2") —
+ *       read as the score. Empty {} is still not a score (AA32).
  *
  * A category that is genuinely absent from every one of these shapes still
  * fails: `co` falls back to `{}`, `clampScore(undefined)` is 0, and
@@ -820,6 +825,10 @@ function scoreVerdictCategories(parsed) {
       c = undefined;
     }
 
+    // Same helper as categoryIsAttempted: a usable scalar IS the score.
+    // Empty {} is not usableNumericScore — still not attempted (AA32).
+    if (usableNumericScore(c)) c = { score: c };
+
     const co = (c && typeof c === 'object') ? c : {};
     const score = clampScore(co.score);
     let f = Array.isArray(co.findings)
@@ -851,19 +860,32 @@ function scoreVerdictCategories(parsed) {
 }
 
 /**
- * Did the model actually ATTEMPT this category — as opposed to a bare,
- * empty `{}` skeleton that merely mentions the category name? `score` /
- * `findings` / `pass` present (any of the three), or the category arriving
- * as a boolean/null (scoreVerdictCategories' own bare-boolean/null handling
- * still fails those, but they are an attempt, not an empty skeleton).
- * `looksVerdictShaped` uses this instead of a bare key-presence check so a
- * decoy like `{"categories":{"competitor_marks":{}}}` — no score, no
- * findings, nothing — cannot win tree-wide fail-wins over a later genuine
- * pass: it has nothing in it to fail on, it is just a shape that happens to
- * mention a category name.
+ * Did the model actually ATTEMPT this category?
+ *
+ * Attempted:
+ *   - boolean / null (existing ambiguous-attempt path — not a numeric score)
+ *   - a usable numeric score in ANY shape: bare 2, "2", {score:2}, {score:"2"}
+ *     (0 is a real fail, not "empty")
+ *   - object with own `score` / `findings` / `pass` (existing; covers a
+ *     present-but-unparseable score key, which must still fail-closed)
+ *
+ * NOT attempted: empty `{}`, arrays, "", "fail", missing key.
+ * AA32's empty-skeleton decoy stays closed — this does NOT revert that
+ * narrowing; it only restores values that genuinely convey a score.
  */
+function usableNumericScore(v) {
+  if (typeof v === 'number') return Number.isFinite(v);
+  if (typeof v === 'string') {
+    const t = v.trim();
+    if (!t) return false;
+    return Number.isFinite(Number(t));
+  }
+  return false;
+}
+
 function categoryIsAttempted(c) {
   if (typeof c === 'boolean' || c === null) return true;
+  if (usableNumericScore(c)) return true;
   if (!c || typeof c !== 'object' || Array.isArray(c)) return false;
   return Object.prototype.hasOwnProperty.call(c, 'score')
       || Object.prototype.hasOwnProperty.call(c, 'findings')

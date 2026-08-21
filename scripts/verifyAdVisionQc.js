@@ -899,6 +899,219 @@ check('AA38 widening control: genuine garbage still fails closed under JSON5-onl
   assert.strictEqual(vNullString.pass, false, 'a bare JSON5 `null` must not parse into a passing verdict');
 });
 
+// ── AA39–AA43: round-4 surviving false pass (bare numeric) + rounding ──
+// The JSON5 insertion hook is sound. AA32 correctly refused empty {}.
+// That narrowing also dropped competitor_marks:2 / "2", so a failing
+// shorthand span was not "attempted" and a later nested pass shipped.
+// {score:"2"} already fail-wins on the live export (hasOwnProperty score);
+// pin it so a future "objects only" narrowing cannot drop it.
+//
+// M1 below is the CURRENT production categoryIsAttempted. It keeps
+// AA32/AA34/AA35/AA31 green (the 111-check harness) and MUST turn AA39
+// red. Three previous rounds were green with a hole open; this pin is
+// mandatory.
+
+const PASS_RESTATEMENT = JSON.stringify({
+  categories: {
+    competitor_marks: { score: 9, findings: [] },
+    product_fidelity: { score: 9, findings: [] },
+    text_defects:     { score: 9, findings: [] },
+    layout_safe_box:  { score: 9, findings: [] }
+  },
+  summary: 'clean'
+});
+
+check('AA39 bare-numeric FAIL + later nested PASS must fail-wins (real score 2, not zeros) — the round-4 blocker', () => {
+  const text = '{categories:{competitor_marks:2,product_fidelity:9,text_defects:9,layout_safe_box:9},summary:"fail"}\n' +
+    PASS_RESTATEMENT;
+  const v = qc.parseVerdict(text);
+  assert.strictEqual(v.parseError, null);
+  assert.strictEqual(v.pass, false, 'bare 2 is a fail; a later nested 9 must not ship the ad');
+  assert.strictEqual(v.categories.competitor_marks.score, 2,
+    'usable scalar must be THE score, not fail-closed 0');
+});
+
+check('AA40 numeric-string "2" + later nested PASS must fail-wins with score 2', () => {
+  const text = '{categories:{competitor_marks:"2",product_fidelity:9,text_defects:9,layout_safe_box:9},summary:"fail"}\n' +
+    PASS_RESTATEMENT;
+  const v = qc.parseVerdict(text);
+  assert.strictEqual(v.pass, false);
+  assert.strictEqual(v.categories.competitor_marks.score, 2);
+});
+
+check('AA41 {score:"2"} + later nested PASS must fail-wins with score 2', () => {
+  const text = JSON.stringify({
+    categories: {
+      competitor_marks: { score: '2', findings: [] },
+      product_fidelity: { score: 9, findings: [] },
+      text_defects:     { score: 9, findings: [] },
+      layout_safe_box:  { score: 9, findings: [] }
+    },
+    summary: 'fail'
+  }) + '\n' + PASS_RESTATEMENT;
+  const v = qc.parseVerdict(text);
+  assert.strictEqual(v.pass, false);
+  assert.strictEqual(v.categories.competitor_marks.score, 2);
+});
+
+check('AA42 score 6.5 (and 6.9) must FAIL — floor, not round-up across PASS_FLOOR', () => {
+  for (const n of [6.5, 6.9, '6.5']) {
+    const v = qc.parseVerdict(JSON.stringify({
+      categories: {
+        competitor_marks: { score: n, findings: [] },
+        product_fidelity: { score: 9, findings: [] },
+        text_defects:     { score: 9, findings: [] },
+        layout_safe_box:  { score: 9, findings: [] }
+      }
+    }));
+    assert.strictEqual(v.pass, false, `${n} must not round up to 7 and pass`);
+    assert.strictEqual(v.categories.competitor_marks.score, 6);
+    assert.strictEqual(v.categories.competitor_marks.pass, false);
+  }
+});
+
+check('AA43 score exactly 7 still passes (floor must not move the bound)', () => {
+  const v = qc.parseVerdict(JSON.stringify({
+    categories: {
+      competitor_marks: { score: 7, findings: [] },
+      product_fidelity: { score: 7, findings: [] },
+      text_defects:     { score: 7, findings: [] },
+      layout_safe_box:  { score: 7, findings: [] }
+    }
+  }));
+  assert.strictEqual(v.pass, true);
+  for (const k of qc.CATEGORIES) assert.strictEqual(v.categories[k].score, 7);
+});
+
+check('AA39b lone bare-numeric FAIL (no restatement) keeps real scores, not zeros', () => {
+  const v = qc.parseVerdict(
+    '{categories:{competitor_marks:2,product_fidelity:9,text_defects:9,layout_safe_box:9},summary:"fail"}'
+  );
+  assert.strictEqual(v.pass, false);
+  assert.strictEqual(v.categories.competitor_marks.score, 2);
+  assert.strictEqual(v.categories.product_fidelity.score, 9);
+});
+
+check('AA39c usableNumericScore is shared (attempted + wrap) and clampScore floors', () => {
+  const src = require('fs').readFileSync(
+    require('path').join(__dirname, '..', 'services', 'adVisionQcService.js'), 'utf8'
+  );
+  assert.match(src, /function usableNumericScore\(/);
+  const attempted = src.slice(
+    src.indexOf('function categoryIsAttempted('),
+    src.indexOf('function looksVerdictShaped(')
+  );
+  assert.match(attempted, /usableNumericScore\(c\)/);
+  const scoreFn = src.slice(
+    src.indexOf('function scoreVerdictCategories('),
+    src.indexOf('function categoryIsAttempted(')
+  );
+  assert.match(scoreFn, /usableNumericScore\(c\)/);
+  const clamp = src.slice(src.indexOf('function clampScore'), src.indexOf('function emptyCategories'));
+  assert.match(clamp, /Math\.floor\(x\)/);
+  assert.doesNotMatch(clamp.replace(/\/\/.*$/gm, ''), /Math\.round\(/);
+});
+
+// Mutation matrix: compile a mutated copy as if it still lived at
+// services/adVisionQcService.js so relative requires resolve. No writes
+// into the tree.
+{
+  const fs = require('fs');
+  const Module = require('module');
+  const svcPath = path.join(__dirname, '..', 'services', 'adVisionQcService.js');
+  const origSrc = fs.readFileSync(svcPath, 'utf8');
+
+  function compileMutated(label, mutator) {
+    const mutated = mutator(origSrc);
+    assert.notStrictEqual(mutated, origSrc, `mutation ${label} was a no-op`);
+    const m = new Module(svcPath + '.' + label);
+    m.filename = svcPath;
+    m.paths = Module._nodeModulePaths(path.dirname(svcPath));
+    m._compile(mutated, svcPath);
+    return m.exports;
+  }
+  function once(hay, needle, repl, label) {
+    const n = hay.split(needle).length - 1;
+    assert.strictEqual(n, 1, `${label}: expected 1 occurrence, found ${n}`);
+    return hay.replace(needle, repl);
+  }
+
+  const D1 = '{categories:{competitor_marks:2,product_fidelity:9,text_defects:9,layout_safe_box:9},summary:"fail"}\n' +
+    PASS_RESTATEMENT;
+  const AA32text = 'Draft: {"categories":{"competitor_marks":{}}}\nReal: ' + PASS_RESTATEMENT;
+  const wellFail = JSON.stringify({
+    categories: {
+      competitor_marks: { score: 2, findings: ['tree emblem on midfoot'] },
+      product_fidelity: { score: 9, findings: [] },
+      text_defects:     { score: 9, findings: [] },
+      layout_safe_box:  { score: 9, findings: [] }
+    },
+    summary: 'FAIL — competitor mark present'
+  });
+  const score65 = JSON.stringify({
+    categories: {
+      competitor_marks: { score: 6.5, findings: [] },
+      product_fidelity: { score: 9, findings: [] },
+      text_defects:     { score: 9, findings: [] },
+      layout_safe_box:  { score: 9, findings: [] }
+    }
+  });
+
+  check('AA-M1 CURRENT categoryIsAttempted (drop usableNumericScore) passes old pins and MUST fail AA39', () => {
+    const mod = compileMutated('M1', (s) => once(
+      s, '  if (usableNumericScore(c)) return true;\n', '', 'M1'
+    ));
+    // Old harness still green:
+    const skel = mod.parseVerdict(AA32text);
+    assert.strictEqual(skel.pass, true, 'AA32 must survive M1 — this is not an AA32 revert');
+    const legitFail = mod.parseVerdict(wellFail);
+    assert.strictEqual(legitFail.pass, false);
+    assert.strictEqual(legitFail.categories.competitor_marks.score, 2);
+    const legitPass = mod.parseVerdict(PASS_RESTATEMENT);
+    assert.strictEqual(legitPass.pass, true);
+    // NEW pin must go RED on this mutation (today's hole):
+    const hole = mod.parseVerdict(D1);
+    assert.strictEqual(hole.pass, true, 'setup: M1 must reopen the D1 false pass (otherwise the pin is vacuous)');
+    // The live (unmutated) export is asserted by AA39 itself.
+  });
+
+  check('AA-M2 Math.floor -> Math.round reopens 6.5 pass and leaves D1 closed', () => {
+    const mod = compileMutated('M2', (s) => once(s, 'Math.floor(x)', 'Math.round(x)', 'M2'));
+    const v = mod.parseVerdict(score65);
+    assert.strictEqual(v.pass, true, 'setup: M2 must reopen the 6.5 round-up');
+    assert.strictEqual(v.categories.competitor_marks.score, 7);
+    const d1 = mod.parseVerdict(D1);
+    assert.strictEqual(d1.pass, false);
+  });
+
+  check('AA-M3 any-object attempted reopens AA32 (proves we did not "fix" D1 by reverting AA32)', () => {
+    const mod = compileMutated('M3', (s) => once(
+      s,
+      '  if (!c || typeof c !== \'object\' || Array.isArray(c)) return false;\n' +
+      '  return Object.prototype.hasOwnProperty.call(c, \'score\')\n' +
+      '      || Object.prototype.hasOwnProperty.call(c, \'findings\')\n' +
+      '      || Object.prototype.hasOwnProperty.call(c, \'pass\');',
+      '  if (!c || typeof c !== \'object\' || Array.isArray(c)) return false;\n' +
+      '  return true; // MUTATION: empty {} is attempted',
+      'M3'
+    ));
+    const skel = mod.parseVerdict(AA32text);
+    assert.strictEqual(skel.pass, false, 'setup: M3 must make empty {} fail-wins');
+    const d1 = mod.parseVerdict(D1);
+    assert.strictEqual(d1.pass, false, 'D1 can stay closed while AA32 is reverted — that is the over-broad "fix"');
+  });
+
+  check('AA-M4 drop wrap only: D1 still fail-wins, but score becomes 0 not 2', () => {
+    const mod = compileMutated('M4', (s) => once(
+      s, '    if (usableNumericScore(c)) c = { score: c };\n', '', 'M4'
+    ));
+    const v = mod.parseVerdict(D1);
+    assert.strictEqual(v.pass, false, 'attempted-recognition alone still fail-wins');
+    assert.strictEqual(v.categories.competitor_marks.score, 0,
+      'setup: without the wrap the real 2 is lost');
+  });
+}
+
 // ── B. Both images, correctly labelled ───────────────────────────────
 // Revert: dropping original image or labels fails B1–B3.
 check('B1 buildVisionUserContent includes BOTH image_url parts', () => {
