@@ -1786,21 +1786,29 @@ async function runVideoVisionQcForAd({ ad, deliveredUrl, brandName = null }) {
     }
 
     if (!qcResult.passed) {
-      // FLAG, DON'T DISCARD — see adVisionQcService.runVideoPostRenderQc's
-      // docstring for the full money reasoning. The caller (below) still
-      // ships this ad as a normal draft; this only makes the failure loud.
-      adVisionQc.alertQcFailure({
+      // FLAG, DON'T DISCARD, AND (owner decision 2026-08-20) DON'T SHIP AS A
+      // NORMAL DRAFT EITHER — see adVisionQcService.runVideoPostRenderQc's
+      // docstring for the money reasoning behind never regenerating/
+      // discarding. uploadRenderAndStamp (below, this file) reads
+      // qcResult.visionQc.passed off the object we return here and flips
+      // Ad.status to 'failed' while keeping the already-paid renderUrl.
+      //
+      // alertQcFailure returns the EXACT text it just sent to Slack — stamp
+      // it onto the SAME qcResult.visionQc object that ships on Ad.visionQc,
+      // so the detail screen and Slack are provably reading one string.
+      const failureDetail = adVisionQc.alertQcFailure({
         adId: ad._id, brandId: ad.brandId, productId: ad.productId,
         brandName: resolvedBrandName, visionQc: qcResult.visionQc, appUrl,
         regenerated: false, mediaLabel: 'Video ad'
       });
+      if (failureDetail) qcResult.visionQc.failureDetail = failureDetail;
       adVisionQc.noteQcFailToRunFeed({
         campaignRunId, adId: ad._id, aspectRatio: ad.aspectRatio, platformFormat: ad.platformFormat,
         visionQc: qcResult.visionQc, previewUrl: deliveredUrl, appUrl
       });
       console.warn(
         `   ⚠️  brandScript[ad=${ad._id}]: vision QC (video) FAILED — flagged on Ad.visionQc, ` +
-        'shipping as draft anyway (master already paid for; see PR description)'
+        'delivering as failed (master already paid for; asset kept, see PR description)'
       );
     } else {
       adVisionQc.noteQcPassToRunFeed({
@@ -1872,13 +1880,58 @@ async function qcAndStampVideoAd({ ad, deliveredUrl, brandName = null }) {
     const Ad = require('../models/Ad');
     const videoVisionQc = await runVideoVisionQcForAd({ ad, deliveredUrl, brandName });
     if (videoVisionQc) {
-      await Ad.updateOne({ _id: ad._id }, { $set: { visionQc: videoVisionQc } });
+      // Same status flip uploadRenderAndStamp's titled path applies (owner
+      // decision 2026-08-20: a real QC failure delivers 'failed', not a
+      // normal draft) — baked in HERE so all five callers of this shared
+      // helper (routes/ads.js's two no-brand mints, adRegenerateService's
+      // titling-throw/no-brand fallbacks, titlingResumeService's
+      // give-up-on-brand branch, and this file's own no-chrome branch)
+      // get it for free instead of five independent call sites having to
+      // remember it. See buildVideoQcFailureFields's docstring.
+      await Ad.updateOne(
+        { _id: ad._id },
+        { $set: { visionQc: videoVisionQc, ...buildVideoQcFailureFields(videoVisionQc) } }
+      );
     }
     return videoVisionQc || null;
   } catch (err) {
     console.warn(`   ⚠️  brandScript[ad=${ad && ad._id}]: qcAndStampVideoAd failed: ${err.message}`);
     return null;
   }
+}
+
+// Owner decision 2026-08-20: a REAL video QC failure (not skipped/disabled —
+// same tri-state check imageRecoveryService.js's qcFailed uses) now delivers
+// the ad as status:'failed' with a short renderError, instead of the normal
+// draft it used to fall through to. NEVER discards the asset — the caller
+// still writes renderUrl/posterUrl/visionQc; this only adds the two fields
+// below on top when the verdict is a real fail. Shared by BOTH places a
+// video ad's terminal status gets stamped (uploadRenderAndStamp for a
+// titled render, and renderBrandScriptAndSave's no-chrome branch for a
+// format with nothing to title) so the two paths cannot drift on what
+// "failed vision QC" means.
+function buildVideoQcFailureFields(videoVisionQc) {
+  const qcFailed = !!videoVisionQc
+    && videoVisionQc.passed === false
+    && !videoVisionQc.skipped
+    && !videoVisionQc.disabled;
+  if (!qcFailed) return {};
+  const lastSummary = (videoVisionQc.attempts || []).slice(-1)[0]?.summary || 'vision QC fail';
+  return {
+    status: 'failed',
+    renderError: {
+      // Short one-liner for logs/ops — the RICH text (identical to what
+      // Slack got) lives on visionQc.failureDetail and is what the detail
+      // screen renders as "what was wrong with it".
+      message: `video ad failed vision QC (no regeneration): ${lastSummary}`,
+      stage:   'vision-qc',
+      at:      new Date(),
+      // The master render itself succeeded and was already billed — this is
+      // a post-hoc rejection of an already-paid asset, not an unbilled
+      // infra failure.
+      charged: true
+    }
+  };
 }
 
 // Shared tail of both engines: upload the rendered mp4, stamp
@@ -1939,7 +1992,14 @@ async function uploadRenderAndStamp({ ad, finalPath, tempDir, timings, titlingSn
     // load-bearing — kept because runVideoVisionQcForAd's own contract only
     // promises "never throws", not "never returns falsy".
     const videoVisionQc = await runVideoVisionQcForAd({ ad, deliveredUrl: uploaded.secure_url, brandName });
-    if (videoVisionQc) set.visionQc = videoVisionQc;
+    if (videoVisionQc) {
+      set.visionQc = videoVisionQc;
+      // Asset is NOT discarded on a real QC fail — renderUrl/posterUrl above
+      // are left as-is, so the operator can still see exactly what shipped;
+      // buildVideoQcFailureFields only adds status:'failed' + renderError on
+      // top. See that function's docstring for the full reasoning.
+      Object.assign(set, buildVideoQcFailureFields(videoVisionQc));
+    }
     await Ad.updateOne(
       { _id: ad._id },
       { $set: set }
@@ -2151,6 +2211,9 @@ async function renderBrandScriptAndSave({ ad, brand, presetOverride = null }) {
     // but the ad still SHIPS a delivered video (its raw Grok master, already
     // stamped as renderUrl upstream at Stage 2.5 in routes/ads.js) — it must
     // not silently skip vision QC just because there was no titling step.
+    // qcAndStampVideoAd (PR #276) now bakes in the same status:'failed' flip
+    // uploadRenderAndStamp's titled path applies on a real QC failure — see
+    // that helper's own comment.
     await qcAndStampVideoAd({ ad, deliveredUrl: ad.veoVideoUrl, brandName: brand?.name || null });
     return { skipped: true, reason: 'no-chrome', format: renderer.format };
   }
@@ -2196,9 +2259,18 @@ module.exports = {
   // Shared helper for every "ships a video ad with no titling step" branch
   // outside this file — routes/ads.js (master + derive-only mint),
   // adRegenerateService.js (video regenerate), titlingResumeService.js (the
-  // give-up-on-brand branch). See its own doc comment for why this must stay
-  // ONE function, imported, not reimplemented per caller.
+  // give-up-on-brand branch), and this file's own no-chrome branch. See its
+  // own doc comment for why this must stay ONE function, imported, not
+  // reimplemented per caller — now including the status:'failed' flip via
+  // buildVideoQcFailureFields below.
   qcAndStampVideoAd,
+  // Pure — exported for the same harness. A real (non-skipped/disabled) QC
+  // failure now delivers status:'failed' instead of a normal draft (owner
+  // decision 2026-08-20); this is the ONE function every terminal video-ad
+  // write path (uploadRenderAndStamp's titled path AND qcAndStampVideoAd's
+  // five callers) goes through, so none of them can drift on what "failed
+  // vision QC" means.
+  buildVideoQcFailureFields,
   // Re-export for harnesses that pin funnel-preset threading without
   // pulling the whole generation service.
   resolveFunnelPresetOverride: (ad) => {

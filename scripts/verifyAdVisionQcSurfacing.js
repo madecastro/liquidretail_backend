@@ -67,6 +67,36 @@
  * No DB, no network, no API key. Safe in CI.
  *   node scripts/verifyAdVisionQcSurfacing.js
  *
+ * EXTENDED 2026-08-20 (owner decision: a QC-failed ad must be delivered as
+ * FAILED with a reason, and that reason must be the EXACT text Slack's
+ * vision-QC alert already carries). Three more things this pins:
+ *
+ *   E. alertQcFailure (adVisionQcService.js) now RETURNS the exact `detail`
+ *      string it sent to Slack (buildQcSlackDetail's output), instead of
+ *      void. Every call site that persists a QC-failed visionQc (static
+ *      live path, video live path, static recovery path) captures that
+ *      return value and stamps it onto `visionQc.failureDetail` BEFORE
+ *      persisting — so the app and Slack are provably reading one string,
+ *      never two independent derivations. summarizeVisionQc passes that
+ *      field through verbatim, gated behind {categories:true} (detail view
+ *      only — list weight stays compact).
+ *   F. A REAL video vision-QC failure (passed:false, not skipped, not
+ *      disabled) now delivers the ad as status:'failed' with a renderError,
+ *      instead of the normal draft it used to fall through to — reversing
+ *      the prior "ships anyway" behaviour this same file's D2 section
+ *      pinned the gate-off shape for. The asset is still NEVER discarded
+ *      (money: the ~$0.90 master is already paid for). One pure function,
+ *      buildVideoQcFailureFields (brandScriptExecutor.js, exported), is the
+ *      sole decision point shared by both places a video ad's terminal
+ *      status gets written, so they cannot drift on what "failed" means.
+ *   G. routes/catalog.js's `GET /:id/ads-detail` (the Product Ads page's
+ *      backing endpoint — the one detail surface that is NOT routes/ads.js)
+ *      had never carried visionQc or renderError at all: a field missing
+ *      from that endpoint's own $project allowlist arrives `undefined`
+ *      regardless of what's on the Ad document. Source-scan posture (same
+ *      as C1/C4/D4): this route needs a live DB + tenant-scoped product to
+ *      exercise end-to-end.
+ *
  * Revert-prove (each mutation below must fail this harness):
  *   1. Have summarizeVisionQc return `passed:true` for a skipped verdict
  *      → A3 fails (an uninspected ship must never read as "fine").
@@ -91,6 +121,18 @@
  *      early return → D4 fails (structural — that function's "attempt 1"
  *      generation makes it too expensive/billable to drive end-to-end here,
  *      same posture as this file's own C-section for GET /runs/:runId).
+ *   8. Have alertQcFailure stop returning `detail` (back to void) → E1/E2
+ *      fail (confirmed live, 2026-08-20: reverting adVisionQcService.js
+ *      alone dropped E1 through E4 to failing while every other check,
+ *      including E5, E6, and all of section F and G, stayed green).
+ *   9. Remove buildVideoQcFailureFields's export, or its status:'failed'
+ *      branch → F1/F5/F7 fail (confirmed live: reverting
+ *      brandScriptExecutor.js alone failed exactly F1-F7, nothing else).
+ *  10. Drop `visionQc: 1, renderError: 1` from catalog.js's ads-detail
+ *      $project, or the `visionQc: summarizeVisionQc(...)` /
+ *      `renderErrorMessage` lines from its adRows shaping → G2/G3 fail
+ *      (confirmed live: reverting routes/catalog.js alone failed exactly
+ *      G1-G3, nothing else).
  */
 
 const assert = require('assert');
@@ -99,6 +141,10 @@ const path = require('path');
 
 const qc = require('../services/adVisionQcService');
 const { CATEGORIES } = qc;
+// Real (unstubbed) module — used by section F for the pure
+// buildVideoQcFailureFields helper. Requiring it does no I/O; it only
+// wires up function closures, same posture as routes/ads.js in B0 below.
+const bse = require('../services/brandScriptExecutor.js');
 
 let pass = 0;
 const failures = [];
@@ -714,6 +760,253 @@ check('D5 the shared warnQcDisabledOnce gate is genuinely one-shot-per-interval,
     console.warn = origWarn;
     qc._resetQcDisabledWarnForTests();
   }
+});
+
+// ── E. failureDetail: the app and Slack must read the SAME text ─────────
+// Owner decision 2026-08-20: a QC-failed ad's detail screen must show what
+// was wrong with it, and it must be the EXACT text Slack's vision-QC alert
+// already carries — not a second, independently-worded description of the
+// same verdict. The mechanism: alertQcFailure (which already builds
+// buildQcSlackDetail's text to send as Slack's `detail` field) now RETURNS
+// that same string; every call site that persists a QC-failed visionQc onto
+// an Ad stamps the return value onto `visionQc.failureDetail` BEFORE
+// persisting, and summarizeVisionQc (the shared projection formatter)
+// passes that field straight through, verbatim, only when {categories:true}
+// (the detail-view flag). Nothing here re-derives prose from a verdict a
+// second time — that is the whole guarantee.
+function withStubbedAlertService() {
+  const alertPath = require.resolve(path.join(__dirname, '..', 'services', 'alertService.js'));
+  const original = require.cache[alertPath];
+  const calls = [];
+  require.cache[alertPath] = {
+    id: alertPath, filename: alertPath, loaded: true,
+    exports: { notifyAsync: (payload) => { calls.push(payload); } }
+  };
+  return {
+    calls,
+    restore() {
+      if (original) require.cache[alertPath] = original; else delete require.cache[alertPath];
+    }
+  };
+}
+
+(() => {
+  const { calls, restore } = withStubbedAlertService();
+  try {
+    const visionQc = qc.buildPersistedVerdict({
+      passed: false, finalAttempt: 1,
+      attempts: [{
+        attempt: 1, pass: false, categories: {}, findings: ['bad logo'],
+        summary: 'logo mismatch', renderUrl: 'https://x/y.png', discarded: false
+      }]
+    });
+    const returned = qc.alertQcFailure({
+      adId: 'a1', brandId: 'b1', productId: 'p1', brandName: 'Acme',
+      visionQc, appUrl: 'https://app.example/x'
+    });
+    check('E1 alertQcFailure returns the EXACT text it sent to Slack as `detail` — byte-identical, not a re-derivation', () => {
+      assert.strictEqual(calls.length, 1, 'must have sent exactly one Slack notify');
+      assert.strictEqual(typeof returned, 'string');
+      assert.strictEqual(returned, calls[0].detail,
+        'the returned string must be byte-identical to what Slack actually got — THE guarantee this whole feature rests on');
+    });
+    check('E2 the returned text equals a fresh buildQcSlackDetail call with the same inputs — one formatter, not two', () => {
+      assert.strictEqual(returned, qc.buildQcSlackDetail(visionQc, { appUrl: 'https://app.example/x' }));
+    });
+  } finally {
+    restore();
+  }
+})();
+
+(() => {
+  // alertService itself throwing must never propagate — this alert helper is
+  // fire-and-forget by contract (every existing caller ignores the return
+  // value; the new callers merely opt IN to reading it). Confirms the return
+  // contract stays "string on success, null on failure", not an uncaught throw.
+  const alertPath = require.resolve(path.join(__dirname, '..', 'services', 'alertService.js'));
+  const original = require.cache[alertPath];
+  require.cache[alertPath] = {
+    id: alertPath, filename: alertPath, loaded: true,
+    exports: { notifyAsync: () => { throw new Error('slack transport down'); } }
+  };
+  try {
+    const visionQc = qc.buildPersistedVerdict({
+      passed: false, finalAttempt: 1,
+      attempts: [{ attempt: 1, pass: false, categories: {}, findings: [], summary: 'x', renderUrl: null, discarded: false }]
+    });
+    check('E3 alertQcFailure swallows an alert-transport throw and returns null, never breaks the render path', () => {
+      const returned = qc.alertQcFailure({ adId: 'a1', visionQc });
+      assert.strictEqual(returned, null);
+    });
+  } finally {
+    if (original) require.cache[alertPath] = original; else delete require.cache[alertPath];
+  }
+})();
+
+check('E4 summarizeVisionQc(..., {categories:true}) passes visionQc.failureDetail through verbatim (capped 2500 chars)', () => {
+  const visionQc = qc.buildPersistedVerdict({
+    passed: false, finalAttempt: 1,
+    attempts: [{ attempt: 1, pass: false, categories: {}, findings: [], summary: 'x', renderUrl: null, discarded: false }]
+  });
+  visionQc.failureDetail = 'VERDICT: FAIL\nsomething went wrong';
+  const s = qc.summarizeVisionQc(visionQc, { categories: true });
+  assert.strictEqual(s.failureDetail, visionQc.failureDetail);
+});
+
+check('E5 summarizeVisionQc omits failureDetail from the compact (categories:false) form even when present on the raw doc', () => {
+  const visionQc = qc.buildPersistedVerdict({
+    passed: false, finalAttempt: 1,
+    attempts: [{ attempt: 1, pass: false, categories: {}, findings: [], summary: 'x', renderUrl: null, discarded: false }]
+  });
+  visionQc.failureDetail = 'some detail text nobody asked for on the list view';
+  const s = qc.summarizeVisionQc(visionQc); // categories defaults false
+  assert.strictEqual('failureDetail' in s, false, 'list-weight callers must not pay for the rich text they did not ask for');
+});
+
+check('E6 summarizeVisionQc never fabricates failureDetail on a passed verdict (the field is only ever written on a real failure)', () => {
+  const passedQc = qc.buildPersistedVerdict({
+    passed: true, finalAttempt: 1,
+    attempts: [{ attempt: 1, pass: true, categories: {}, findings: [], summary: 'clean', renderUrl: null, discarded: false }]
+  });
+  const s = qc.summarizeVisionQc(passedQc, { categories: true });
+  assert.strictEqual('failureDetail' in s, false);
+});
+
+// ── F. A real video QC failure now delivers status:'failed', never a
+// normal draft ────────────────────────────────────────────────────────────
+// Owner decision 2026-08-20 reverses the video pipeline's prior behaviour
+// (adVisionQcService.js's own file-header CONTRACT block, and
+// runVideoVisionQcForAd's old comment, both said "ships as a normal draft
+// anyway; the caller decides not to send that specific ad to a platform").
+// The asset itself is still NEVER discarded (money: the ~$0.90 master is
+// already paid for) — only the terminal status + reason now tell the truth.
+// buildVideoQcFailureFields (brandScriptExecutor.js, pure) is the ONE place
+// that decides "does this verdict mean status:'failed'" — shared by BOTH
+// call sites (uploadRenderAndStamp's titled path and
+// renderBrandScriptAndSave's no-chrome path) so they cannot drift.
+check('F1 buildVideoQcFailureFields: a real failure (passed:false, not skipped, not disabled) → status:\'failed\' + a renderError', () => {
+  const visionQc = qc.buildPersistedVerdict({
+    passed: false, finalAttempt: 1,
+    attempts: [{ attempt: 1, pass: false, categories: {}, findings: ['garbled logo'], summary: 'hallucinated colourway', renderUrl: 'https://x/v.mp4', discarded: false }]
+  });
+  const fields = bse.buildVideoQcFailureFields(visionQc);
+  assert.strictEqual(fields.status, 'failed');
+  assert.ok(fields.renderError, 'must include a renderError so the operator sees why');
+  assert.strictEqual(fields.renderError.stage, 'vision-qc');
+  assert.match(fields.renderError.message, /hallucinated colourway/);
+  assert.strictEqual(fields.renderError.charged, true, 'the master was already billed — this is not an unbilled infra failure');
+});
+
+for (const [label, verdict] of [
+  ['F2 skipped (uninspected) verdict', qc.buildSkippedVerdict('no frames could be sampled')],
+  ['F3 disabled (gate off) verdict', qc.buildPersistedVerdict({ passed: false, skipped: true, disabled: true, reason: 'AD_VISION_QC_ENABLED=false', finalAttempt: null, attempts: [] })],
+  ['F4 a genuine pass', qc.buildPersistedVerdict({ passed: true, finalAttempt: 1, attempts: [{ attempt: 1, pass: true, categories: {}, findings: [], summary: 'clean', renderUrl: null, discarded: false }] })],
+]) {
+  check(`${label} must NOT flip status — buildVideoQcFailureFields returns {}`, () => {
+    assert.deepStrictEqual(bse.buildVideoQcFailureFields(verdict), {});
+  });
+}
+
+check('F5 buildVideoQcFailureFields(null) → {} (never throws on a missing verdict)', () => {
+  assert.deepStrictEqual(bse.buildVideoQcFailureFields(null), {});
+  assert.deepStrictEqual(bse.buildVideoQcFailureFields(undefined), {});
+});
+
+await (async () => {
+  // Drives the REAL exported runVideoVisionQcForAd (gate forced ON via the
+  // stub) with a stubbed runVideoPostRenderQc returning a real-failure
+  // verdict, and a stubbed alertQcFailure standing in for the Slack call —
+  // proves the function actually captures alertQcFailure's return value and
+  // stamps it onto the SAME visionQc object it returns (which is what ends
+  // up on Ad.visionQc.failureDetail downstream). Same require-cache-stub
+  // convention as D2/D3 above.
+  const qcPath = require.resolve(path.join(__dirname, '..', 'services', 'adVisionQcService.js'));
+  const original = require.cache[qcPath];
+  const fakeVerdict = qc.buildPersistedVerdict({
+    passed: false, finalAttempt: 1,
+    attempts: [{ attempt: 1, pass: false, categories: {}, findings: ['bad colour'], summary: 'wrong colourway', renderUrl: 'https://x/v.mp4', discarded: false }]
+  });
+  require.cache[qcPath] = {
+    id: qcPath, filename: qcPath, loaded: true,
+    exports: {
+      isEnabled: () => true,
+      buildAppPreviewUrl: () => 'https://app.example/preview',
+      runVideoPostRenderQc: async () => ({ ok: true, skipped: false, passed: false, visionQc: fakeVerdict }),
+      alertQcFailure: () => 'FAKE_SLACK_DETAIL_TEXT_FOR_TEST',
+      noteQcFailToRunFeed: () => {},
+      noteQcPassToRunFeed: () => {},
+      alertQcSkipped: () => {},
+      warnQcDisabledOnce: () => {},
+      buildPersistedVerdict: (args) => qc.buildPersistedVerdict(args)
+    }
+  };
+  // adStage does a real (unawaited) Ad.updateOne — harmless in production
+  // (fire-and-forget, .catch(()=>{})) but this file promises "No DB, no
+  // network" in its own header, so stub it too rather than let a buffered
+  // mongoose op float in the background of a CI process with no connection.
+  const adStagePath = require.resolve(path.join(__dirname, '..', 'services', 'adStage.js'));
+  const originalAdStage = require.cache[adStagePath];
+  require.cache[adStagePath] = {
+    id: adStagePath, filename: adStagePath, loaded: true,
+    exports: { adStage: () => {}, noteRenderIssue: () => {} }
+  };
+  const bsePath = require.resolve(path.join(__dirname, '..', 'services', 'brandScriptExecutor.js'));
+  const originalBse = require.cache[bsePath];
+  delete require.cache[bsePath];
+  try {
+    const freshBse = require(path.join('..', 'services', 'brandScriptExecutor.js'));
+    const result = await freshBse.runVideoVisionQcForAd({
+      ad: { _id: '507f1f77bcf86cd799439011', veoReferenceImages: ['https://x/orig.png'], campaignRunIds: [] },
+      deliveredUrl: 'https://x/v.mp4'
+    });
+    check('F6 runVideoVisionQcForAd stamps alertQcFailure\'s return value onto the SAME visionQc.failureDetail it returns', () => {
+      assert.strictEqual(result.failureDetail, 'FAKE_SLACK_DETAIL_TEXT_FOR_TEST');
+    });
+    check('F7 buildVideoQcFailureFields on that exact returned verdict flips status to failed', () => {
+      assert.strictEqual(bse.buildVideoQcFailureFields(result).status, 'failed');
+    });
+  } finally {
+    if (original) require.cache[qcPath] = original; else delete require.cache[qcPath];
+    if (originalAdStage) require.cache[adStagePath] = originalAdStage; else delete require.cache[adStagePath];
+    if (originalBse) require.cache[bsePath] = originalBse; else delete require.cache[bsePath];
+    delete require.cache[bsePath];
+  }
+})();
+
+// ── G. routes/catalog.js ads-detail allowlist — the exact trap named in
+// the PR description: "a field missing from that allowlist arrives
+// `undefined` regardless of the document". This endpoint (Product Ads'
+// backing API — the ONLY detail surface that isn't routes/ads.js) omitted
+// visionQc/renderError entirely, so a QC-failed ad's reason never reached
+// AdDetailModal even though routes/ads.js's projectAd had carried it for a
+// long time. Source-scan posture (same as C1/C4/D4 above): this route needs
+// a live DB + tenant-scoped product to exercise end-to-end.
+check('G1 catalog.js requires summarizeVisionQc from adVisionQcService (single shared formatter, not a re-derivation)', () => {
+  const src = fs.readFileSync(path.join(__dirname, '..', 'routes', 'catalog.js'), 'utf8');
+  assert.match(src, /require\(['"]\.\.\/services\/adVisionQcService['"]\)/,
+    'catalog.js must reuse adVisionQcService.summarizeVisionQc, not format a QC verdict itself');
+});
+
+check('G2 the ads-detail $project allowlist includes visionQc AND renderError', () => {
+  const src = fs.readFileSync(path.join(__dirname, '..', 'routes', 'catalog.js'), 'utf8');
+  const routeIdx = src.indexOf("router.get('/:id/ads-detail'");
+  assert.ok(routeIdx !== -1, 'could not locate the ads-detail route');
+  const projectIdx = src.indexOf('$project:', routeIdx);
+  assert.ok(projectIdx !== -1, 'ads-detail must build its rows off an aggregation $project (the allowlist itself)');
+  const projectClose = src.indexOf('} }', projectIdx);
+  const projection = src.slice(projectIdx, projectClose !== -1 ? projectClose : projectIdx + 2000);
+  assert.match(projection, /visionQc:\s*1/, 'visionQc missing from the $project allowlist — arrives undefined regardless of the document');
+  assert.match(projection, /renderError:\s*1/, 'renderError missing from the $project allowlist — same trap');
+});
+
+check('G3 the shaped ad row actually surfaces visionQc (via summarizeVisionQc) and a conditional renderErrorMessage', () => {
+  const src = fs.readFileSync(path.join(__dirname, '..', 'routes', 'catalog.js'), 'utf8');
+  const routeIdx = src.indexOf("router.get('/:id/ads-detail'");
+  const mapIdx = src.indexOf('adRows', routeIdx);
+  assert.ok(mapIdx !== -1, 'could not locate the adRows shaping block');
+  const tail = src.slice(mapIdx, mapIdx + 4000);
+  assert.match(tail, /visionQc:\s*summarizeVisionQc\(/, 'the shaped row must carry visionQc through the shared formatter, not the raw Mixed doc');
+  assert.match(tail, /renderErrorMessage/, 'a failed ad\'s operator-facing reason never reaches this endpoint\'s response otherwise');
 });
 
 // ── report ─────────────────────────────────────────────────────────────

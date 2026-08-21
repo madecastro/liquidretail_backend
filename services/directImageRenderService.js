@@ -2717,7 +2717,12 @@ async function renderDirectImage(callArgs = {}) {
 
   if (!qcResult.ok) {
     // Fail path: low-volume actionable alert channel AND run-feed thread line.
-    adVisionQc.alertQcFailure({
+    // alertQcFailure returns the EXACT text it just sent to Slack — stamp it
+    // onto the SAME qcResult.visionQc object that ends up on Ad.visionQc
+    // (via err.visionQc below → renderService.js → routes/ads.js), so the
+    // detail screen and Slack are provably reading one string, not two
+    // independent derivations. See alertQcFailure's docstring.
+    const failureDetail = adVisionQc.alertQcFailure({
       adId,
       brandId: qcBrandId,
       productId: qcProductId,
@@ -2725,6 +2730,7 @@ async function renderDirectImage(callArgs = {}) {
       visionQc: qcResult.visionQc,
       appUrl
     });
+    if (failureDetail) qcResult.visionQc.failureDetail = failureDetail;
     adVisionQc.noteQcFailToRunFeed({
       campaignRunId,
       adId,

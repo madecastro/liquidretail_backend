@@ -446,10 +446,14 @@ async function maybeQcRecoveredPlate({ ad, brand, surface, dims, renderUrl }) {
     if (!raw.pass) {
       // Fail closed on scores — stamp + alert, KEEP recovered asset.
       // regenerated:false — recovery never burns a second image submit.
-      adVisionQc.alertQcFailure({
+      // Same failureDetail capture as the live path (directImageRenderService.js)
+      // — alertQcFailure's return is the exact Slack text; stamp it onto the
+      // SAME `verdict` object this function returns (→ setFields.visionQc).
+      const failureDetail = adVisionQc.alertQcFailure({
         adId, brandId, productId, brandName, visionQc: verdict, appUrl,
         regenerated: false
       });
+      if (failureDetail) verdict.failureDetail = failureDetail;
       adVisionQc.noteQcFailToRunFeed({
         campaignRunId: runId,
         adId,

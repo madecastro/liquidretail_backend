@@ -33,6 +33,10 @@ const { loadPhotorealUrlMap, loadUseImageRefMap, loadProductUrlMap } = require('
 const { buildGridPreviewVideoUrl } = require('../services/videoPreviewUrl');
 const { buildGridPreviewImageUrl } = require('../services/imagePreviewUrl');
 const { AD_RECENCY_EXPR } = require('../services/adRecencyService');
+// summarizeVisionQc — the SAME formatter routes/ads.js's projectAd uses, so
+// "was this ad inspected, and why did it fail" never gets a second, drifting
+// derivation between the flat ads list and this product-detail expansion.
+const { summarizeVisionQc } = require('../services/adVisionQcService');
 const catalogProductPromoteService = require('../services/catalogProductPromoteService');
 const { catalogSeedFields } = require('../services/catalogImageQuality');
 const { tenantFilter, assertMediaInTenant } = require('../middleware/tenantHelpers');
@@ -906,6 +910,13 @@ router.get('/:id/ads-detail', async (req, res) => {
           platformFormat: 1, aiCanvasArtifactId: 1, mediaId: 1, productId: 1, variantKind: 1,
           paletteSource: 1, sourceFileType: 1, regenerating: 1, regenerationStage: 1,
           regenerationHistory: 1, funnelStage: 1,
+          // Vision QC verdict + the operator-facing failure headline. A field
+          // missing from this allowlist arrives `undefined` regardless of
+          // what's on the document — this endpoint used to omit both, so a
+          // QC-failed ad's reason (and even the fact that it failed vision
+          // QC at all) never reached the Product Ads detail modal, only the
+          // flat /api/ads list (routes/ads.js projectAd already had these).
+          visionQc: 1, renderError: 1,
           // brandId — this endpoint's own $match already fixes every row to
           // the single requested brandId (filter.brandId = brandObjectId
           // above), but loadProductUrlMap() groups its lookup by each row's
@@ -1034,6 +1045,19 @@ router.get('/:id/ads-detail', async (req, res) => {
       generatedAt:    (a.renderedAt || a.generatedAt)
                         ? new Date(a.renderedAt || a.generatedAt).toISOString()
                         : null,
+      // Same two fields routes/ads.js projectAd surfaces for a failed ad —
+      // renderErrorMessage only present on an actual failure (mirrors
+      // projectAd's own gate exactly, including a video ad that now fails
+      // closed on a real vision-QC verdict instead of shipping as a normal
+      // draft — see brandScriptExecutor.js buildVideoQcFailureFields).
+      // visionQc.failureDetail (via summarizeVisionQc, categories:true) is
+      // the EXACT text alertQcFailure already sent to Slack — see that
+      // function's docstring — so the detail modal can show "what was
+      // wrong with it" without a second, independently-drifting derivation.
+      ...(a.status === 'failed' && a.renderError?.message
+        ? { renderErrorMessage: String(a.renderError.message) }
+        : {}),
+      visionQc:       summarizeVisionQc(a.visionQc, { categories: true }),
       metaSyncStatus: a.metaSyncStatus || null,
       metaAdId:       a.metaAdId || null,
       metaAdsetId:    a.metaAdsetId || null,

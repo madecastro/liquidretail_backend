@@ -1414,9 +1414,10 @@ function qcFailureTitle(visionQc, { regenerated = null, mediaLabel = 'Static ad'
  * @param {boolean} [opts.categories=false] — include the final attempt's
  *   per-category {score, pass, findings} (findings capped at 3/category —
  *   enough to tell an operator WHY without shipping every attempt's full
- *   findings list, which is what makes the inspector's payload heavy).
- *   Callers building a compact list/badge should omit this; the detail
- *   modal should pass true.
+ *   findings list, which is what makes the inspector's payload heavy) AND
+ *   `failureDetail` (the exact Slack `detail` text, capped at 2500 chars,
+ *   present only on a real failure — see alertQcFailure). Callers building
+ *   a compact list/badge should omit this; the detail modal should pass true.
  * @returns {object|null} null only when visionQc itself is null/undefined
  *   (ad never reached the QC gate at all, e.g. pre-QC historical ads).
  */
@@ -1441,18 +1442,31 @@ function summarizeVisionQc(visionQc, { categories = false } = {}) {
     regenerated:  finalAttempt > 1 || attempts.length > 1,
     summary:      last?.summary || null
   };
-  if (categories && last?.categories) {
-    out.categories = CATEGORIES.reduce((acc, key) => {
-      const c = last.categories[key];
-      if (!c) return acc;
-      const findings = Array.isArray(c.findings) ? c.findings : (c.findings ? [c.findings] : []);
-      acc[key] = {
-        score:    c.score ?? null,
-        pass:     !!c.pass,
-        findings: findings.slice(0, 3).map((f) => String(f))
-      };
-      return acc;
-    }, {});
+  if (categories) {
+    if (last?.categories) {
+      out.categories = CATEGORIES.reduce((acc, key) => {
+        const c = last.categories[key];
+        if (!c) return acc;
+        const findings = Array.isArray(c.findings) ? c.findings : (c.findings ? [c.findings] : []);
+        acc[key] = {
+          score:    c.score ?? null,
+          pass:     !!c.pass,
+          findings: findings.slice(0, 3).map((f) => String(f))
+        };
+        return acc;
+      }, {});
+    }
+    // The EXACT text alertQcFailure sent to Slack for this verdict —
+    // buildQcSlackDetail's output, stamped onto Ad.visionQc.failureDetail at
+    // the moment the alert fired (see alertQcFailure's docstring + the three
+    // call sites that capture its return value). NOT re-derived here: this
+    // is a straight passthrough of already-persisted text so the detail
+    // screen can never say something different from what Slack already
+    // said. Absent on a passed/skipped/disabled verdict — those never stamp
+    // this field in the first place.
+    if (visionQc.failureDetail) {
+      out.failureDetail = String(visionQc.failureDetail).slice(0, 2500);
+    }
   }
   return out;
 }
@@ -1462,6 +1476,15 @@ function summarizeVisionQc(visionQc, { categories = false } = {}) {
  *
  * @param {boolean|null} [regenerated] — when known, overrides attempt-count
  *   inference for the alert title (recovery always passes false).
+ * @returns {string|null} the EXACT text this call sent to Slack as `detail`
+ *   (buildQcSlackDetail's output) — or null if the alert itself threw before
+ *   that text was built. Owner requirement 2026-08-20: an ad's detail screen
+ *   must show the same reason Slack got, not a second derivation. Callers
+ *   that persist a QC failure onto Ad.visionQc should capture this return
+ *   value and stamp it onto `visionQc.failureDetail` (see the three call
+ *   sites: directImageRenderService.js, brandScriptExecutor.js,
+ *   imageRecoveryService.js) — that is the ONLY place this prose is built;
+ *   nothing else may re-format a verdict into words.
  */
 function alertQcFailure({ adId, brandId, productId, visionQc, brandName, appUrl = null, regenerated = null, mediaLabel = 'Static ad' } = {}) {
   try {
@@ -1475,6 +1498,7 @@ function alertQcFailure({ adId, brandId, productId, visionQc, brandName, appUrl 
     const didRegen = regenerated == null
       ? (finalAttempt > 1 || attempts.length > 1)
       : !!regenerated;
+    const detail = buildQcSlackDetail(visionQc, { appUrl });
     alerts.notifyAsync({
       level: 'error',
       title: qcFailureTitle(visionQc, { regenerated, mediaLabel }),
@@ -1495,10 +1519,12 @@ function alertQcFailure({ adId, brandId, productId, visionQc, brandName, appUrl 
         regenerated: didRegen ? 'yes' : 'no',
         findings: findings.slice(0, 300)
       },
-      detail: buildQcSlackDetail(visionQc, { appUrl })
+      detail
     });
+    return detail;
   } catch (err) {
     console.warn(`   ⚠️  adVisionQc: alert failed: ${err.message}`);
+    return null;
   }
 }
 
