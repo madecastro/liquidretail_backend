@@ -930,6 +930,10 @@ await (async () => {
     id: qcPath, filename: qcPath, loaded: true,
     exports: {
       isEnabled: () => true,
+      // PR #276 switched runVideoVisionQcForAd's live gate check from the
+      // synchronous isEnabled() to `await resolveEnabled()` (cache-race
+      // fix) — this stub must cover both so this section survives either.
+      resolveEnabled: async () => true,
       buildAppPreviewUrl: () => 'https://app.example/preview',
       runVideoPostRenderQc: async () => ({ ok: true, skipped: false, passed: false, visionQc: fakeVerdict }),
       alertQcFailure: () => 'FAKE_SLACK_DETAIL_TEXT_FOR_TEST',
@@ -1002,7 +1006,12 @@ check('G2 the ads-detail $project allowlist includes visionQc AND renderError', 
 check('G3 the shaped ad row actually surfaces visionQc (via summarizeVisionQc) and a conditional renderErrorMessage', () => {
   const src = fs.readFileSync(path.join(__dirname, '..', 'routes', 'catalog.js'), 'utf8');
   const routeIdx = src.indexOf("router.get('/:id/ads-detail'");
-  const mapIdx = src.indexOf('adRows', routeIdx);
+  // Anchor on the actual declaration, not a bare 'adRows' substring — a
+  // 2026-08-20 comment earlier in this same route now mentions `adRows` in
+  // backticks while explaining an unrelated renderStage fix, which an
+  // indexOf('adRows', ...) would find FIRST and then slice 4000 chars of
+  // comment prose instead of the real map body.
+  const mapIdx = src.indexOf('const adRows = ads.map(', routeIdx);
   assert.ok(mapIdx !== -1, 'could not locate the adRows shaping block');
   const tail = src.slice(mapIdx, mapIdx + 4000);
   assert.match(tail, /visionQc:\s*summarizeVisionQc\(/, 'the shaped row must carry visionQc through the shared formatter, not the raw Mixed doc');
