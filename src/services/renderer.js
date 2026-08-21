@@ -14,6 +14,11 @@
 // SEE unclaimed rendering ads without touching them. No writes.
 
 const { POLL_MS, WORKER_ID } = require('../config');
+const {
+  isStaleTopologyError,
+  reconnectAfterStaleTopology,
+  resetReconnectAttempts
+} = require('../db');
 const Ad = require('../models/Ad');
 
 let stopping = false;
@@ -39,8 +44,13 @@ async function poll() {
     if (unclaimed > 0) {
       console.log(`renderer[${WORKER_ID}]: ${unclaimed} claimable ad(s) in queue — Phase 0 no-op`);
     }
+    // Successful query = SDAM is healthy = reconnect budget resets.
+    resetReconnectAttempts();
   } catch (err) {
     console.warn(`renderer[${WORKER_ID}]: poll error — ${err.message}`);
+    if (isStaleTopologyError(err)) {
+      reconnectAfterStaleTopology();
+    }
   }
   const elapsed = Date.now() - start;
   const wait = Math.max(50, POLL_MS - elapsed);

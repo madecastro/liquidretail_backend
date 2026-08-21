@@ -12,6 +12,11 @@
 // loop runs on schedule. No writes. No prod impact.
 
 const { POLL_MS, WORKER_ID } = require('../config');
+const {
+  isStaleTopologyError,
+  reconnectAfterStaleTopology,
+  resetReconnectAttempts
+} = require('../db');
 const CampaignRun = require('../models/CampaignRun');
 
 let stopping = false;
@@ -25,8 +30,15 @@ async function poll() {
     if (preparingCount > 0) {
       console.log(`orchestrator[${WORKER_ID}]: ${preparingCount} preparing run(s) — Phase 0 no-op`);
     }
+    // Successful query = SDAM is healthy = reconnect budget resets.
+    resetReconnectAttempts();
   } catch (err) {
     console.warn(`orchestrator[${WORKER_ID}]: poll error — ${err.message}`);
+    if (isStaleTopologyError(err)) {
+      // Fire-and-forget; the reconnect guard inside db.js serialises
+      // concurrent callers so this is safe from the timer loop.
+      reconnectAfterStaleTopology();
+    }
   }
   const elapsed = Date.now() - start;
   const wait = Math.max(50, POLL_MS - elapsed);
