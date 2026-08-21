@@ -44,13 +44,26 @@
 //     summarizeVisionQc surfacing PR #236 wired up) before sending it to a
 //     platform, instead of silently discarding a paid asset.
 //
-// Feature flag resolution (most specific first) — SHARED by both static and
-// video callers (one gate, not two): flipping it protects both pipelines.
-//   1. SystemConfig.adVisionQcEnabled when a real boolean (DB, live-flippable)
-//   2. process.env.AD_VISION_QC_ENABLED === 'true' after toLowerCase (env)
+// Feature flag resolution — SPLIT 2026-08-21 into two independent gates,
+// one per pipeline (`resolveStaticEnabled()` / `resolveVideoEnabled()`
+// below). Previously ONE gate shared by both callers; that single-flag
+// design is preserved as a LEGACY fallback, not removed — see
+// models/SystemConfig.js and services/systemConfigService.js for the
+// migration bridge that keeps QC on for both pipelines across this deploy
+// without anyone having to flip a new switch first. Each gate's precedence
+// (most specific first):
+//   1. SystemConfig.<pipeline>VisionQcEnabled when a real boolean (DB,
+//      live-flippable) — bridges to the legacy SystemConfig.adVisionQcEnabled
+//      field when unset, so a still-unmigrated deployment keeps whatever the
+//      old single flag said.
+//   2. process.env.<PIPELINE>_VISION_QC_ENABLED === 'true' after toLowerCase
+//      (env) — falls back to the legacy AD_VISION_QC_ENABLED env var when
+//      the pipeline-specific name is entirely unset.
 //   3. default false
-// Default stays OFF. DB override is the no-redeploy lever — env alone would
-// force a Render restart. See resolveEnabled() / isEnabled() below.
+// Default stays OFF absent any override. DB override is the no-redeploy
+// lever — env alone would force a Render restart. See resolveStaticEnabled()
+// / resolveVideoEnabled() below; resolveEnabled() / isEnabled() remain as
+// the legacy, undifferentiated gate for any caller that still reads it.
 // Model role: 'ad-vision-qc' in atlasModelMap (routing MUST be probed live).
 
 'use strict';
@@ -103,16 +116,58 @@ const QC_MODEL_ROLE = 'ad-vision-qc';
 let _systemConfigReadFailedLogged = false;
 
 /**
- * Env-only gate. Matches the historical isEnabled() contract:
- *   String(env || '').toLowerCase() === 'true'
- * so "TRUE" enables, "false" / "TRUE " / "1" do not.
+ * THE ONE boolean-env parser for every vision-QC gate — legacy and split.
+ * Matches the historical contract exactly:
+ *   String(x || '').toLowerCase() === 'true'
+ * so "TRUE" enables, "false" / "TRUE " (trailing space) / "1" do not.
+ * Every gate below reuses this; none re-implements the check. Two readers
+ * of one semantic with different rules is a defect class this repo has
+ * already shipped (this file's own header docs the isEnabled/resolveEnabled
+ * cache-staleness incident) — do not let the gate split become a second
+ * instance of it via a copy-pasted comparison.
  */
-function envEnabled() {
-  return String(process.env.AD_VISION_QC_ENABLED || '').toLowerCase() === 'true';
+function parseBoolEnv(raw) {
+  return String(raw || '').toLowerCase() === 'true';
 }
 
 /**
- * Async resolver — preferred for any path that can await.
+ * Env-only gate — LEGACY, single flag. Matches the historical isEnabled()
+ * contract. Kept exactly as-is; the split gates below reuse parseBoolEnv
+ * rather than re-implementing this line, and fall back to THIS function
+ * (not the raw env var) when their own specific env var is unset, so an
+ * environment that only ever configured the legacy name keeps working.
+ */
+function envEnabled() {
+  return parseBoolEnv(process.env.AD_VISION_QC_ENABLED);
+}
+
+/**
+ * Env-only gate — STATIC pipeline. Own env var first; if that name is
+ * entirely unset (not merely falsy), falls back to the legacy envEnabled()
+ * so a deploy that only ever set AD_VISION_QC_ENABLED does not silently
+ * lose static coverage the moment the gate splits.
+ */
+function staticEnvEnabled() {
+  if (process.env.STATIC_VISION_QC_ENABLED !== undefined) {
+    return parseBoolEnv(process.env.STATIC_VISION_QC_ENABLED);
+  }
+  return envEnabled();
+}
+
+/**
+ * Env-only gate — VIDEO pipeline. Same shape as staticEnvEnabled() above,
+ * independent env var, same legacy fallback.
+ */
+function videoEnvEnabled() {
+  if (process.env.VIDEO_VISION_QC_ENABLED !== undefined) {
+    return parseBoolEnv(process.env.VIDEO_VISION_QC_ENABLED);
+  }
+  return envEnabled();
+}
+
+/**
+ * Async resolver — LEGACY, single flag. UNCHANGED by the 2026-08-21 split;
+ * preferred for any path that can await.
  *
  * Precedence (most specific first):
  *   1. SystemConfig.adVisionQcEnabled when typeof === 'boolean'
@@ -141,14 +196,80 @@ async function resolveEnabled(deps = {}) {
 }
 
 /**
- * SYNCHRONOUS fallback ONLY — as of 2026-08-20, NONE of the three
- * production hot-path callers (directImageRenderService.renderDirectImage /
- * finishPlate, brandScriptExecutor.runVideoVisionQcForAd,
+ * Async resolver — STATIC pipeline gate (directImageRenderService,
+ * imageRecoveryService — recovery is static-only, see that file's header).
+ * Precedence, IDENTICAL shape to the legacy resolver, one field swapped:
+ *   1. SystemConfig.staticVisionQcEnabled when typeof === 'boolean'
+ *      (systemConfigService bridges to the legacy adVisionQcEnabled field
+ *      when this one is unset — see that file for the migration reasoning)
+ *   2. env STATIC_VISION_QC_ENABLED (falls back to legacy AD_VISION_QC_ENABLED
+ *      when STATIC_VISION_QC_ENABLED itself is unset — via staticEnvEnabled)
+ *   3. default false
+ * Fail-safe: never rejects. deps.getStaticVisionQcEnabled is injectable.
+ */
+async function resolveStaticEnabled(deps = {}) {
+  try {
+    const getCfg = deps.getStaticVisionQcEnabled
+      || require('./systemConfigService').getStaticVisionQcEnabled;
+    const dbVal = await getCfg();
+    if (typeof dbVal === 'boolean') return dbVal;
+  } catch (err) {
+    if (!_systemConfigReadFailedLogged) {
+      _systemConfigReadFailedLogged = true;
+      const msg = (err && err.message) ? err.message : String(err || 'unknown');
+      console.warn(
+        `   ⚠️  adVisionQc: SystemConfig read failed (static) — falling back to env/default: ${msg}`
+      );
+    }
+  }
+  return staticEnvEnabled();
+}
+
+/**
+ * Async resolver — VIDEO pipeline gate (brandScriptExecutor). Same shape
+ * as resolveStaticEnabled above, independent value, own env fallback chain.
+ */
+async function resolveVideoEnabled(deps = {}) {
+  try {
+    const getCfg = deps.getVideoVisionQcEnabled
+      || require('./systemConfigService').getVideoVisionQcEnabled;
+    const dbVal = await getCfg();
+    if (typeof dbVal === 'boolean') return dbVal;
+  } catch (err) {
+    if (!_systemConfigReadFailedLogged) {
+      _systemConfigReadFailedLogged = true;
+      const msg = (err && err.message) ? err.message : String(err || 'unknown');
+      console.warn(
+        `   ⚠️  adVisionQc: SystemConfig read failed (video) — falling back to env/default: ${msg}`
+      );
+    }
+  }
+  return videoEnvEnabled();
+}
+
+/**
+ * SYNCHRONOUS fallback ONLY, LEGACY/COMBINED FLAG ONLY — as of 2026-08-20,
+ * NONE of the three production hot-path callers
+ * (directImageRenderService.renderDirectImage / finishPlate,
+ * brandScriptExecutor.runVideoVisionQcForAd,
  * imageRecoveryService.maybeQcRecoveredPlate) use this anymore. All three
  * are already `async` functions that already `await` a billable vision
- * call a few lines later, so they now `await resolveEnabled()` directly —
- * there is no reason for an async caller to take a synchronous, cache-racy
- * path when it can just await the correct one.
+ * call a few lines later, so they now `await resolveStaticEnabled()` /
+ * `resolveVideoEnabled()` directly — there is no reason for an async caller
+ * to take a synchronous, cache-racy path when it can just await the correct
+ * one.
+ *
+ * STILL ZERO CALL SITES after the 2026-08-21 static/video split, and this
+ * function was deliberately NOT split alongside them — it still answers
+ * only the legacy, undifferentiated `adVisionQcEnabled` question (via
+ * `peekAdVisionQcEnabled`/`refreshAdVisionQcEnabledCache`, unchanged by the
+ * split), which is not the same question either new pipeline-specific gate
+ * asks. Do not add a new caller to this function for a static- or
+ * video-specific decision — use the async `resolveStaticEnabled()` /
+ * `resolveVideoEnabled()` instead. Left in place only as a legacy
+ * synchronous fallback of last resort, matching the orchestrator's explicit
+ * "you may leave it... if you keep it, keep it correct" — it remains
+ * correct for the narrower, legacy question it has always answered.
  *
  * PRODUCTION BUG THIS USED TO HAVE, fixed 2026-08-20 (kept here as the
  * cautionary reason nothing should switch back to calling this from a hot
@@ -745,7 +866,11 @@ function reportQcVerdict({
  *
  * `enabled`:
  *   - boolean → used as-is (callers that already resolved the flag)
- *   - undefined → await resolveEnabled() (SystemConfig → env → false)
+ *   - undefined → await resolveStaticEnabled() (SystemConfig.
+ *     staticVisionQcEnabled, bridged to legacy adVisionQcEnabled while
+ *     unset → env → false). Was resolveEnabled() (the legacy, undifferentiated
+ *     gate) before the 2026-08-21 static/video split — this function is the
+ *     STATIC pipeline, so it now resolves the static-specific gate.
  */
 async function runPostRenderQc({
   enabled,
@@ -769,11 +894,11 @@ async function runPostRenderQc({
     throw new Error('adVisionQc.runPostRenderQc: generate() required');
   }
 
-  // Resolve the gate once per run. Explicit boolean wins; otherwise the
-  // async SystemConfig → env → false cascade. Never throws.
+  // Resolve the STATIC gate once per run. Explicit boolean wins; otherwise
+  // the async SystemConfig → env → false cascade. Never throws.
   const qcEnabled = (typeof enabled === 'boolean')
     ? enabled
-    : await resolveEnabled();
+    : await resolveStaticEnabled();
 
   // ── MONEY: clamp any attempt to raise the retry bound ────────────
   const maxRegen = Math.min(
@@ -1206,7 +1331,9 @@ async function runVideoPostRenderQc({
   deliveredUrl = null,
   judgeFn = null
 } = {}) {
-  const qcEnabled = (typeof enabled === 'boolean') ? enabled : await resolveEnabled();
+  // VIDEO pipeline — resolves the video-specific gate. Was resolveEnabled()
+  // (the legacy, undifferentiated gate) before the 2026-08-21 split.
+  const qcEnabled = (typeof enabled === 'boolean') ? enabled : await resolveVideoEnabled();
 
   // ── Flag off: nothing inspected, nothing claimed ──────────────────
   if (!qcEnabled) {
@@ -1705,6 +1832,12 @@ module.exports = {
   isEnabled,
   envEnabled,
   resolveEnabled,
+  // Split gates (2026-08-21)
+  parseBoolEnv,
+  staticEnvEnabled,
+  videoEnvEnabled,
+  resolveStaticEnabled,
+  resolveVideoEnabled,
   resolveQcModel,
   warnQcDisabledOnce,
   // Pure helpers

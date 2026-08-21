@@ -251,6 +251,171 @@ async function setAdVisionQcEnabled(enabled, updatedBy = null) {
   return doc;
 }
 
+// ── Split vision-QC gates: staticVisionQcEnabled / videoVisionQcEnabled ─
+// (2026-08-21). Two independent tri-state caches, one per pipeline — same
+// TTL/peek/refresh/reset shape as the legacy gate above, deliberately NOT
+// refactored into a shared factory with it: the legacy block above is
+// proven-correct in production (it is the ONLY thing keeping QC on right
+// now) and this split must not risk changing its behaviour by even one
+// line while adding the new gates beside it. Mirrored by hand instead.
+//
+// MIGRATION BRIDGE — the load-bearing part. Each new field starts `null`
+// (unset) the moment this deploys. Without a bridge, `getStaticVisionQc
+// Enabled()`/`getVideoVisionQcEnabled()` would read null, adVisionQcService's
+// resolvers would fall through past SystemConfig straight to env (which is
+// `false` in `config/defaults.env`), and QC would go dark in production
+// between this deploy landing and someone explicitly setting either new
+// field — exactly the regression the orchestrator flagged as unacceptable.
+// So: when the new field is unset, each accessor falls back to the LEGACY
+// `adVisionQcEnabled` field (currently `true` in prod) before ever reaching
+// null. Once an operator (or a future admin settings screen) sets either
+// new field explicitly — including explicitly to `false` — that field wins
+// outright and the legacy bridge no longer applies to it. The legacy field
+// itself is untouched by this split and keeps working via
+// getAdVisionQcEnabled/setAdVisionQcEnabled above for any caller that still
+// uses it. Remove the legacy field and this bridge together, later, only
+// once both new fields are confirmed populated — not in this change.
+
+const STATIC_VISION_QC_CACHE_TTL_MS = AD_VISION_QC_CACHE_TTL_MS;
+let _staticVisionQcCache = { loaded: false, value: null, expiresAt: 0 };
+let _staticVisionQcRefresh = null;
+
+function resetStaticVisionQcEnabledCache() {
+  _staticVisionQcCache = { loaded: false, value: null, expiresAt: 0 };
+  _staticVisionQcRefresh = null;
+}
+
+function peekStaticVisionQcEnabled() {
+  if (!_staticVisionQcCache.loaded) return undefined;
+  return _staticVisionQcCache.value;
+}
+
+function _storeStaticVisionQcCache(value) {
+  _staticVisionQcCache = {
+    loaded: true,
+    value: (value === true || value === false) ? value : null,
+    expiresAt: Date.now() + STATIC_VISION_QC_CACHE_TTL_MS
+  };
+}
+
+/**
+ * Read SystemConfig.staticVisionQcEnabled with the migration bridge to the
+ * legacy adVisionQcEnabled field (see block header). Returns true|false|null.
+ */
+async function getStaticVisionQcEnabled() {
+  const now = Date.now();
+  if (_staticVisionQcCache.loaded && now < _staticVisionQcCache.expiresAt) {
+    return _staticVisionQcCache.value;
+  }
+  const cfg = await SystemConfig.findOne({ key: 'default' })
+    .select('staticVisionQcEnabled adVisionQcEnabled')
+    .lean();
+  const raw = cfg ? cfg.staticVisionQcEnabled : null;
+  let value = (raw === true || raw === false) ? raw : null;
+  if (value === null && cfg) {
+    const legacyRaw = cfg.adVisionQcEnabled;
+    if (legacyRaw === true || legacyRaw === false) value = legacyRaw;
+  }
+  _storeStaticVisionQcCache(value);
+  return value;
+}
+
+function refreshStaticVisionQcEnabledCache() {
+  if (_staticVisionQcRefresh) return;
+  if (_staticVisionQcCache.loaded && Date.now() < _staticVisionQcCache.expiresAt) return;
+  _staticVisionQcRefresh = getStaticVisionQcEnabled()
+    .catch(() => { /* fail-soft: leave cache unloaded */ })
+    .finally(() => { _staticVisionQcRefresh = null; });
+}
+
+/**
+ * Persist the STATIC tri-state override. Pass null to clear (fall back to
+ * the legacy field, then env). Invalidates the TTL cache immediately.
+ */
+async function setStaticVisionQcEnabled(enabled, updatedBy = null) {
+  if (enabled !== null && enabled !== true && enabled !== false) {
+    const e = new Error('staticVisionQcEnabled must be true, false, or null');
+    e.status = 400;
+    throw e;
+  }
+  const doc = await ensureSingleton();
+  doc.staticVisionQcEnabled = enabled;
+  if (updatedBy) doc.updatedBy = updatedBy;
+  await doc.save();
+  _storeStaticVisionQcCache(enabled);
+  return doc;
+}
+
+const VIDEO_VISION_QC_CACHE_TTL_MS = AD_VISION_QC_CACHE_TTL_MS;
+let _videoVisionQcCache = { loaded: false, value: null, expiresAt: 0 };
+let _videoVisionQcRefresh = null;
+
+function resetVideoVisionQcEnabledCache() {
+  _videoVisionQcCache = { loaded: false, value: null, expiresAt: 0 };
+  _videoVisionQcRefresh = null;
+}
+
+function peekVideoVisionQcEnabled() {
+  if (!_videoVisionQcCache.loaded) return undefined;
+  return _videoVisionQcCache.value;
+}
+
+function _storeVideoVisionQcCache(value) {
+  _videoVisionQcCache = {
+    loaded: true,
+    value: (value === true || value === false) ? value : null,
+    expiresAt: Date.now() + VIDEO_VISION_QC_CACHE_TTL_MS
+  };
+}
+
+/**
+ * Read SystemConfig.videoVisionQcEnabled with the migration bridge to the
+ * legacy adVisionQcEnabled field (see block header). Returns true|false|null.
+ */
+async function getVideoVisionQcEnabled() {
+  const now = Date.now();
+  if (_videoVisionQcCache.loaded && now < _videoVisionQcCache.expiresAt) {
+    return _videoVisionQcCache.value;
+  }
+  const cfg = await SystemConfig.findOne({ key: 'default' })
+    .select('videoVisionQcEnabled adVisionQcEnabled')
+    .lean();
+  const raw = cfg ? cfg.videoVisionQcEnabled : null;
+  let value = (raw === true || raw === false) ? raw : null;
+  if (value === null && cfg) {
+    const legacyRaw = cfg.adVisionQcEnabled;
+    if (legacyRaw === true || legacyRaw === false) value = legacyRaw;
+  }
+  _storeVideoVisionQcCache(value);
+  return value;
+}
+
+function refreshVideoVisionQcEnabledCache() {
+  if (_videoVisionQcRefresh) return;
+  if (_videoVisionQcCache.loaded && Date.now() < _videoVisionQcCache.expiresAt) return;
+  _videoVisionQcRefresh = getVideoVisionQcEnabled()
+    .catch(() => { /* fail-soft: leave cache unloaded */ })
+    .finally(() => { _videoVisionQcRefresh = null; });
+}
+
+/**
+ * Persist the VIDEO tri-state override. Pass null to clear (fall back to
+ * the legacy field, then env). Invalidates the TTL cache immediately.
+ */
+async function setVideoVisionQcEnabled(enabled, updatedBy = null) {
+  if (enabled !== null && enabled !== true && enabled !== false) {
+    const e = new Error('videoVisionQcEnabled must be true, false, or null');
+    e.status = 400;
+    throw e;
+  }
+  const doc = await ensureSingleton();
+  doc.videoVisionQcEnabled = enabled;
+  if (updatedBy) doc.updatedBy = updatedBy;
+  await doc.save();
+  _storeVideoVisionQcCache(enabled);
+  return doc;
+}
+
 module.exports = {
   ensureSingleton,
   getCanonicalScript,
@@ -265,6 +430,17 @@ module.exports = {
   refreshAdVisionQcEnabledCache,
   resetAdVisionQcEnabledCache,
   AD_VISION_QC_CACHE_TTL_MS,
+  // Split gates (2026-08-21) — see the block above for the migration bridge.
+  getStaticVisionQcEnabled,
+  setStaticVisionQcEnabled,
+  peekStaticVisionQcEnabled,
+  refreshStaticVisionQcEnabledCache,
+  resetStaticVisionQcEnabledCache,
+  getVideoVisionQcEnabled,
+  setVideoVisionQcEnabled,
+  peekVideoVisionQcEnabled,
+  refreshVideoVisionQcEnabledCache,
+  resetVideoVisionQcEnabledCache,
   CANONICAL_FEED_FILE,
   CANONICAL_VERTICAL_FILE,
   CANONICAL_VERTICAL_DR_V1_FILE,

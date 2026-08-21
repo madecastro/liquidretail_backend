@@ -1677,7 +1677,12 @@ async function runVideoVisionQcForAd({ ad, deliveredUrl, brandName = null }) {
     // just past the 5s TTL (the normal case — real renders are spaced much
     // further apart than that) would read a cache miss as "off" even when
     // SystemConfig.adVisionQcEnabled is genuinely true.
-    const qcEnabledNow = await adVisionQc.resolveEnabled();
+    // VIDEO pipeline — reads the video-specific gate: resolveVideoEnabled()
+    // (2026-08-21 split; was the single resolveEnabled() gate before then).
+    // This is the ONE gate check for this file: qcAndStampVideoAd (below)
+    // calls THIS function rather than checking the gate itself, so there is
+    // no second call site here to update.
+    const qcEnabledNow = await adVisionQc.resolveVideoEnabled();
     if (!qcEnabledNow) {
       adVisionQc.warnQcDisabledOnce('video ad');
       return adVisionQc.buildPersistedVerdict({

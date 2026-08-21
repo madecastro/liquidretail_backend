@@ -345,7 +345,11 @@ async function maybeQcRecoveredPlate({ ad, brand, surface, dims, renderUrl }) {
   // 5s TTL (the normal case for recovery, which runs on its own poll cadence,
   // not in lockstep with the cache) would read a cache miss as "off" even
   // when SystemConfig.adVisionQcEnabled is genuinely true.
-  const qcEnabledNow = await adVisionQc.resolveEnabled();
+  // This module recovers STATIC ads only (see the file header — video
+  // recovery is bootRecoveryService, on the WORKER), so it reads the STATIC
+  // gate: resolveStaticEnabled() (2026-08-21 split; was the single
+  // resolveEnabled() gate before then).
+  const qcEnabledNow = await adVisionQc.resolveStaticEnabled();
   if (!qcEnabledNow) {
     adVisionQc.warnQcDisabledOnce('recovered ad');
     return adVisionQc.buildPersistedVerdict({
