@@ -125,6 +125,43 @@ const SURFACE_INSETS = {
 // the stack's top edge, catching content that rides right at the boundary.
 const LOWER_THIRD_TOP = 0.54;
 const BAND_LEAD_IN = 0.02;
+
+// ── DECOUPLING THE SAMPLED REGION FROM THE THRESHOLD'S CALIBRATION.
+//
+// bandFaceOverlapFrac is inter/bandArea, so the overlap fraction is measured
+// RELATIVE TO THE STRIP. That couples two things that should be independent:
+// WHICH region we sample (a geometry question, per surface) and HOW SENSITIVE
+// the test is (a calibration question, global). Widening a strip therefore
+// makes it HARDER to trip, which is backwards.
+//
+// MEASURED, and this is a REGRESSION the geometry fix would have shipped on
+// its own. For a union spanning the strip width the test reduces to
+// faceHeight/stripHeight, so the flag threshold in face-height terms is
+// 0.20 * stripHeight:
+//
+//   surface    strip h 0.13 -> new     flags if faceH >          lost window
+//   stories        0.13 -> 0.34        0.0260 -> 0.0680     faceH 0.026-0.068
+//   feed/square    0.13 -> 0.42        0.0260 -> 0.0840     faceH 0.026-0.084
+//   squareYt       0.13 -> 0.38        0.0260 -> 0.0760     faceH 0.026-0.076
+//
+// On a 1920px stories frame that is faces 50-131px tall that flag `avoid`
+// today and would STOP flagging — ordinary sizes in the full-body on-model
+// shots this catalogue is full of. Caught in review by a second session; the
+// first version of this change had computed the denominator problem only in
+// the direction of marks not yet caught, and missed that it cuts both ways.
+//
+// THE FIX: normalise against a FIXED reference height rather than the strip's
+// own. 0.13 is the height every existing 0.20 threshold was tuned against
+// (the old [0.52, 0.65] literal), so sensitivity for content in the old region
+// is preserved EXACTLY while the widened region is covered as well.
+//
+// Applied at the call site in applyFaceKeepOut, NOT inside
+// bandFaceOverlapFrac: that function is exported and scripts/verifyFaceKeepOut.js
+// calls it with explicit 0.14-height rects, where changing the denominator
+// would inflate every result ~8% and tip assertions calibrated just under 0.20.
+// Rescaling the pure function's output is algebraically identical
+// (inter/(width*REF) === raw * stripH/REF) and leaves that harness untouched.
+const REFERENCE_BAND_H = 0.13;
 // SCOPE, deliberately narrow. Only the BOTTOM strip is derived here.
 //
 // The `top` strip is left at its literal on every surface, because
@@ -551,10 +588,15 @@ function applyFaceKeepOut(plateHints, faceSamples, opts = {}) {
     const union = unionFaceBoxes(facesByPlateIdx[i]);
     if (!union) continue;
     const bands = out.samples[i].bands;
-    for (const bandKey of Object.keys(BANDS)) {
+    for (const bandKey of Object.keys(bandsFor(opts.safeZoneKey))) {
       if (!bands[bandKey]) continue;
       const br = bandRect(bandKey, opts.safeZoneKey || null);
-      const overlap = bandFaceOverlapFrac(br, union);
+      // Rescale to the reference strip height so a wider sampled region cannot
+      // desensitise the threshold — see REFERENCE_BAND_H. Clamped because a
+      // union taller than the reference would otherwise exceed 1; the test is a
+      // boolean over the threshold, so saturation costs nothing.
+      const stripH = Math.max(1e-6, br.bottom - br.top);
+      const overlap = Math.min(1, bandFaceOverlapFrac(br, union) * (stripH / REFERENCE_BAND_H));
       if (overlap > threshold) {
         bands[bandKey].avoid = true;
         flagged += 1;
@@ -575,6 +617,7 @@ module.exports = {
   bandsFor,
   bandRect,
   SURFACE_INSETS,
+  REFERENCE_BAND_H,
   BAND_X0,
   BAND_X1,
   resolveBandXRange,

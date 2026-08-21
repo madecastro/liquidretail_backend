@@ -78,7 +78,10 @@
  *   5. bandRect ignores its safeZoneKey argument          -> D1 fails
  *   6. remotionRenderService stops passing safeZoneKey    -> E1/E2 fail
  *   7. applyFaceKeepOut stops forwarding it to bandRect   -> D2 fails
- *   8. revert plateIntelService entirely                  -> A/B/C/D/F fail
+ *   8. drop the REFERENCE_BAND_H rescale in applyFaceKeepOut -> G2 fails
+ *      (the desensitisation regression this change almost shipped)
+ *   9. change REFERENCE_BAND_H away from 0.13             -> G1/G3 fail
+ *  10. revert plateIntelService entirely                  -> A/B/C/D/F/G fail
  */
 import assert from 'node:assert';
 import fs from 'node:fs';
@@ -215,31 +218,75 @@ ok('D3 behavioural — content at y 0.66-0.86 flags `bottom` on stories, not on 
     'vertical: 0.66-0.86 is below where its copy paints, so it must NOT flag');
 });
 
-ok('D4 KNOWN, NOT FIXED — a wider strip is HARDER to trip, because the overlap '
- + 'fraction divides by band area', () => {
-  // overlap = inter / bandArea (bandFaceOverlapFrac). Widening stories' bottom
-  // strip from height 0.13 to 0.34 multiplies the denominator by ~2.6, so a
-  // small mark needs ~2.6x the area to clear FACE_BAND_OVERLAP_THRESHOLD.
-  // That is backwards — a LARGER painted region should be EASIER to collide
-  // with — and it is why this change alone does not close the two
-  // meta_reels_9_16 `layout_safe_box` failures from 2026-08-21, which are
-  // small chest marks rather than large back logos.
-  //
-  // Pinned deliberately so the interaction is a recorded decision, not a
-  // surprise. Fixing it means changing the denominator (e.g. inter/faceArea,
-  // "how much of the mark would be covered"), which alters behaviour on EVERY
-  // surface including the ones this change leaves byte-identical — a separate
-  // decision with a much wider blast radius, not something to fold in here.
+ok('D4 a NARROW small mark below 0.65 now flags on a widened surface', () => {
+  // Before REFERENCE_BAND_H this scored 0.140 against the widened strip and
+  // stayed under the 0.20 threshold — the geometry fix alone could SEE it but
+  // not act on it. The rescale closes that.
   const small = { left: 0.30, top: 0.70, right: 0.70, bottom: 0.80 };
-  const frac = plateIntel.bandFaceOverlapFrac(bandRect('bottom', 'stories'), small);
-  assert.ok(frac > 0, 'the widened strip must at least SEE content the old one missed');
-  assert.ok(frac < plateIntel.FACE_BAND_OVERLAP_THRESHOLD,
-    `expected the known shortfall: ${frac.toFixed(3)} is below the ${plateIntel.FACE_BAND_OVERLAP_THRESHOLD} `
-    + 'threshold. If this now passes, the denominator or threshold changed — '
-    + 'update this check and the PR note that documents the gap.');
-  // And pin the improvement direction: the OLD geometry could not see it at all.
-  assert.strictEqual(plateIntel.bandFaceOverlapFrac(bandRect('bottom'), small), 0,
-    'the old vertical-derived strip must score exactly 0 on this mark');
+  const mk = (key) => plateIntel.applyFaceKeepOut(
+    { samples: [{ atSec: 1, bands: { top: {}, middle: {}, bottom: {} } }] },
+    [{ atSec: 1, face: small }], { safeZoneKey: key }
+  ).samples[0].bands.bottom.avoid;
+  assert.strictEqual(mk('stories'), true, 'stories: a mark under the close copy must flag');
+  assert.notStrictEqual(mk('vertical'), true,
+    'vertical: 0.70-0.80 is below where its copy paints, so it must NOT flag');
+});
+
+// ── G. THE REGRESSION THIS ALMOST SHIPPED. Run these first on any change to
+//    the strips OR the threshold — their absence is what let a desensitisation
+//    through the first review.
+ok('G1 REFERENCE_BAND_H is the height the 0.20 threshold was tuned against', () => {
+  assert.strictEqual(plateIntel.REFERENCE_BAND_H, 0.13,
+    'changing this re-calibrates every keep-out threshold at once');
+  assert.strictEqual(r4(BANDS.bottom[1] - BANDS.bottom[0]), 0.13,
+    'the old literal strip height moved — REFERENCE_BAND_H must be revisited');
+});
+
+ok('G2 NO DESENSITISATION — a face inside the OLD strip still flags on every widened surface', () => {
+  // Without the rescale, inter/bandArea makes a wider strip HARDER to trip: on
+  // stories the flag threshold in face-height terms moved 0.026 -> 0.068, so
+  // faces 50-131px tall on a 1920px frame silently stopped flagging. Ordinary
+  // sizes in the full-body on-model shots this catalogue is full of.
+  const mk = (key, face) => plateIntel.applyFaceKeepOut(
+    { samples: [{ atSec: 1, bands: { top: {}, middle: {}, bottom: {} } }] },
+    [{ atSec: 1, face }], { safeZoneKey: key }
+  ).samples[0].bands.bottom.avoid;
+  for (const h of [0.026, 0.03, 0.05, 0.068, 0.084]) {
+    const face = { left: 0.08, top: 0.53, right: 0.92, bottom: 0.53 + h };
+    assert.strictEqual(mk(null, face), true, `sanity: faceH ${h} must flag on old geometry`);
+    for (const k of ['stories', 'feed', 'square', 'squareYt']) {
+      assert.strictEqual(mk(k, face), true,
+        `DESENSITISED: faceH ${h} flags on the old strip but not on ${k}`);
+    }
+  }
+});
+
+ok('G3 the rescale is exactly inert where the strip IS the reference height', () => {
+  for (const k of [null, 'vertical', 'reels', 'verticalYt']) {
+    const b = bandsFor(k);
+    assert.strictEqual(r4(b.bottom[1] - b.bottom[0]), plateIntel.REFERENCE_BAND_H,
+      `${k}: strip height must equal the reference, or its threshold shifts`);
+  }
+});
+
+ok('G4 saturation is clamped — a full-frame union still just flags', () => {
+  const huge = { left: 0.0, top: 0.0, right: 1.0, bottom: 1.0 };
+  const mk = (key) => plateIntel.applyFaceKeepOut(
+    { samples: [{ atSec: 1, bands: { top: {}, middle: {}, bottom: {} } }] },
+    [{ atSec: 1, face: huge }], { safeZoneKey: key }
+  ).samples[0].bands.bottom.avoid;
+  for (const k of ['stories', 'feed', 'square', 'squareYt', 'vertical'])
+    assert.strictEqual(mk(k), true, `${k}: a full-frame face must flag`);
+});
+
+ok('G5 reels is genuinely UNCHANGED, so its two known failures stay open', () => {
+  // The 2026-08-21 run had two meta_reels_9_16 layout_safe_box failures. reels'
+  // strip was already correct (inset 0.35 -> paints to 0.65), so neither the
+  // geometry nor the rescale touches it. Pinned so nobody credits this change
+  // with fixing them.
+  assert.strictEqual(j(bandsFor('reels')), j(BANDS), 'reels must be byte-identical');
+  assert.strictEqual(r4(bandsFor('reels').bottom[1] - bandsFor('reels').bottom[0]),
+    plateIntel.REFERENCE_BAND_H, 'reels rescale multiplier must be exactly 1');
 });
 
 // ── E. WIRING. The pure rule is worthless if the render path stops supplying
