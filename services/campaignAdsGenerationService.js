@@ -2236,10 +2236,54 @@ async function seedFromBrandOnly(brandId, topN) {
 // Inventory-pull paths (brand_only, brand_match fallback in
 // seedsFromProduct) still apply the gate.
 async function seedsFromMedia(brandId, mediaId, opts = {}) {
-  const media = await Media.findById(mediaId)
+  // TENANCY — FAIL CLOSED (house idiom: PR #245 buildSeededUniverse,
+  // PR #257 ensureDetectForProducts, mediaAssignmentService.assertProductOwned).
+  // `mediaId` comes from /generate's raw `mediaIds` request array, which —
+  // unlike `productIds` — has NO ownership assertion anywhere on the path to
+  // here: routes/ads.js filters productIds through resolveOwnedProductIds
+  // (and 400s when none are owned) but never checks a single mediaId, and
+  // expandWizardJob's sibling detect-prep query only *reads* brand-scoped,
+  // it does not narrow the array this loop iterates. So an unscoped read
+  // here loads a FOREIGN brand's Media row wholesale, and every seed minted
+  // from it carries that brand's imagery and its catalogProductId.
+  // Empty-return rather than throw: this function already treats
+  // "no such media" as [], and #257 is the empty-return precedent.
+  if (!brandId) return [];
+  const media = await Media.findOne({ _id: mediaId, brandId })
     .select('matchedProducts matchedCategories adSuitability fileType classification platformStats')
     .lean();
   if (!media) return [];
+
+  // Brand-scope the catalog FKs this media carries BEFORE any of them can
+  // become a seed productId. Scoping the Media read above is necessary but
+  // NOT sufficient: an own-brand Media row can still hold a foreign
+  // catalogProductId, because matchedProducts[] has no brand field of its
+  // own (models/Media.js) and two live write paths can put one there —
+  //   · a pre-PR-#271 operator attach (that fix is explicitly forward-only:
+  //     "does not remediate any pre-existing cross-brand row"), which
+  //     hardcodes outcome:'product_match', the exact value Case 1 selects on;
+  //   · the keeper-repoint paths, whose Media.updateMany selects purely on
+  //     `matchedProducts.catalogProductId` with no brand clause at all
+  //     (catalogRetroLinkService.reparentAllRefs, catalogProductPromoteService).
+  // Unlike buildSeededUniverse — which only uses matchedProducts as a FILTER
+  // against an already-ownership-checked productId — this function uses
+  // matchedProducts as the SOURCE of the productId, so there is nothing
+  // downstream to catch a foreign FK. It has to be checked here.
+  const ownedProductIds = await ownedCatalogProductIdSet(
+    (media.matchedProducts || []).map(mp => mp.catalogProductId),
+    brandId
+  );
+  const ownedMatchedProducts = (media.matchedProducts || []).filter(
+    mp => mp.catalogProductId && ownedProductIds.has(String(mp.catalogProductId))
+  );
+  const foreignCount = (media.matchedProducts || []).filter(mp => mp.catalogProductId).length
+                     - ownedMatchedProducts.length;
+  if (foreignCount) {
+    console.warn(
+      `🔒 seedsFromMedia[${mediaId}]: dropped ${foreignCount} matchedProducts entr${foreignCount === 1 ? 'y' : 'ies'} ` +
+      `whose catalogProductId does not belong to brand ${brandId}`
+    );
+  }
   const baseSeed = {
     mediaId:          String(mediaId),
     variantKind:      'ugc',
@@ -2256,7 +2300,11 @@ async function seedsFromMedia(brandId, mediaId, opts = {}) {
   //   - otherwise → productId:null, matchTier:'brand_only' (the
   //     brand-only path that brand-led copy uses already)
   if (opts.campaignKind === 'brand') {
-    const productMatches = (media.matchedProducts || []).filter(mp => mp.catalogProductId);
+    // ownedMatchedProducts, not media.matchedProducts — a foreign FK here
+    // would be stamped straight onto the returned seed's productId. When
+    // every match is foreign this correctly degrades to the brand_only
+    // seed below rather than emitting a cross-brand product reference.
+    const productMatches = ownedMatchedProducts;
     const top = productMatches.find(mp => mp.outcome === 'product_match')
               || productMatches.find(mp => mp.outcome === 'product_category')
               || null;
@@ -2277,7 +2325,13 @@ async function seedsFromMedia(brandId, mediaId, opts = {}) {
   // Case 1 — at least one refined product is a product_match.
   // matchedProducts captures BOTH product_match AND product_category
   // outcomes; partition by outcome.
-  const productMatches = (media.matchedProducts || []).filter(mp => mp.catalogProductId);
+  // ownedMatchedProducts, not media.matchedProducts — see the tenancy note
+  // at the top of this function. A foreign entry surviving to here becomes
+  // BOTH a seed productId and (via the Tier 0 alt expansion below) a pull of
+  // the other brand's catalog plates. Dropping them here degrades to Case 2 /
+  // Case 3, both of which resolve products through
+  // loadTopProductsByPopularity({ brandId, … }) and are already brand-safe.
+  const productMatches = ownedMatchedProducts;
   const trueProductMatches = productMatches.filter(mp => mp.outcome === 'product_match');
   if (trueProductMatches.length) {
     const seeds = trueProductMatches.map(mp => ({
@@ -2297,6 +2351,11 @@ async function seedsFromMedia(brandId, mediaId, opts = {}) {
       if (!productOid) continue;
       const catalogMedias = await Media.find({
         source: 'catalog-product',
+        brandId,  // the guarantee PR #245 added to the same catalog-media query
+                  // shape in seededUniverseService.js (product-mode filter).
+                  // Redundant for an owned productId — its catalog media is
+                  // this brand's by construction — and that is the point: it
+                  // only bites if a foreign id ever reaches this loop again.
         'metadata.catalogProductId': productOid
       }).select('_id fileType adSuitability classification metadata.imageRole').lean();
       const ranked = rankCatalogMediasForHero(catalogMedias);
@@ -2348,6 +2407,31 @@ async function seedsFromMedia(brandId, mediaId, opts = {}) {
     productId: String(p._id),
     matchTier: 'brand_match'
   }));
+}
+
+// Which of these CatalogProduct ids actually belong to `brandId`.
+//
+// Same query shape as routes/ads.js's resolveOwnedProductIds — the tenant
+// assertion /generate already applies to `productIds`. This is the equivalent
+// for catalog FKs that arrive by a route the request body never declares:
+// Media.matchedProducts[].catalogProductId. Returns a Set of id strings so
+// callers can filter in place.
+//
+// FAILS CLOSED: a falsy brandId returns an empty Set and runs NO query — the
+// PR #257 / assertProductOwned idiom, deliberately not
+// `...(brandId ? { brandId } : {})`, which is the fail-OPEN shape #257
+// removed for exactly this reason.
+async function ownedCatalogProductIdSet(ids, brandId) {
+  if (!brandId) return new Set();
+  const oids = (Array.isArray(ids) ? ids : [])
+    .filter(Boolean)
+    .map(toObjectId)
+    .filter(Boolean);
+  if (!oids.length) return new Set();
+  const owned = await CatalogProduct.find({ _id: { $in: oids }, brandId })
+    .select('_id')
+    .lean();
+  return new Set(owned.map(p => String(p._id)));
 }
 
 // Load CatalogProducts ranked by productPopularityScore, capped at
@@ -4359,6 +4443,13 @@ module.exports = {
   // Exported for scripts/verifyCatalogFeedOrderSeeding.js (offline, mocked
   // Media model — see that harness for how it stubs Media.findOne).
   firstCatalogMediaForProduct,
+  // Exported for scripts/verifySeedsFromMediaBrandTenancy.js (offline, mocked
+  // Media + CatalogProduct models). Same rationale as the line above: the
+  // brandId scoping in here is a money-path tenant control, and a behavioural
+  // test has to be able to CALL it — a source-text assertion would pass
+  // against any reimplementation that merely kept the name.
+  seedsFromMedia,
+  ownedCatalogProductIdSet,
   isCatalogFeedOrderSeedingEnabled,
   isVideoOperatorStackOnlyEnabled,
   isVideoSeedFeedOrderEnabled,
