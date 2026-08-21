@@ -29,17 +29,27 @@
  *
  *   node scripts/verifyVideoQcFrameSampling.js
  *
- * REVERT-PROOF: F5 flips the VIDEO_QC_DENSE_SAMPLING kill switch off
- * mid-script and re-asserts the SAME real-incident scenario collapses back
- * to the old blind baseline — i.e. this file fails on its own if the
- * feature is disabled, which is also exactly what happens if
- * services/videoQcFrameSelectionService.js or its wiring into
- * brandScriptExecutor.js is reverted. Confirmed by hand, same session:
- * reverting the brandScriptExecutor.js wiring (restoring the bare
- * `videoFrameService.buildFrameUrls(deliveredUrl, durationSec)` call) fails
- * G1/G2; deleting videoQcFrameSelectionService.js entirely fails every
- * check below with MODULE_NOT_FOUND; setting VIDEO_QC_DENSE_SAMPLING=false
- * in the real environment reproduces exactly F5's assertion for real ads.
+ * REVERT-PROOF, stated precisely per revert MECHANISM (an earlier version
+ * of this comment implied F5 alone covered all of these — an adversarial
+ * review correctly called that an overclaim; each is a DIFFERENT check):
+ *   - Flag flipped off (VIDEO_QC_DENSE_SAMPLING=false, real env or
+ *     config/defaults.env): F5 — the SAME real-incident frames go
+ *     uncaught, and the dense probe is never even attempted. H1 pins the
+ *     shipped config/defaults.env value itself (checks above it delete
+ *     the env var and would not notice that file regressing).
+ *   - selectQcFrameTimestamps's dense planner swapped back to the old
+ *     quartile-only plan: F0 (source-level) plus the stamps-equality
+ *     assertions inside E1/E2/E6/E7/F2/F3 (behavioral) — confirmed by
+ *     hand, same session, by literally making that swap and watching F0
+ *     and F2/F3 fail.
+ *   - services/brandScriptExecutor.js's wiring reverted to the bare
+ *     `videoFrameService.buildFrameUrls(deliveredUrl, durationSec)` call:
+ *     G1/G2 — confirmed by hand, same session, by making that revert and
+ *     watching both fail.
+ *   - services/videoQcFrameSelectionService.js deleted entirely: every
+ *     check in this file fails with MODULE_NOT_FOUND — confirmed by hand,
+ *     same session.
+ * No single check proves all of these; the set of checks together does.
  */
 
 const assert = require('assert');
@@ -121,9 +131,37 @@ console.log('\nverifyVideoQcFrameSampling — dense frame pre-filter for video v
     assert.ok(Array.isArray(tiny) && tiny.every((t) => t > 0 && t < 0.3));
   });
 
-  check('A6 baselineTimestamps matches the PRE-EXISTING quartile plan exactly — never drops below it', () => {
+  check('A6 baselineTimestamps matches the PRE-EXISTING quartile plan exactly for a typical 8-10s ad', () => {
     assert.deepStrictEqual(sel.baselineTimestamps(10), [2.5, 5, 7.5]);
     assert.deepStrictEqual(sel.BASELINE_FRACTIONS, [0.25, 0.5, 0.75]);
+  });
+
+  check('A7 REGRESSION (found by adversarial review): baselineTimestamps must equal planTimestamps in EVERY duration bucket, not just 4-20s', () => {
+    // A literal `[0.25,0.5,0.75].map(f => durationSec*f)` formula matches
+    // planTimestamps ONLY inside the 4-20s quartile bucket. It silently
+    // diverges for a tiny clip (<=4s -- ONE mid-frame, not three) and a
+    // long one (>20s -- stride-based, capped at 5, not three quartiles).
+    // durationSec=4 is not hypothetical: Omni's duration enum is
+    // [4,6,8,10] (see CLAUDE.md), so a real ad can hit this bucket.
+    // Without this, "kill switch off restores byte-identical old
+    // behavior" would be FALSE for any ad outside 4-20s.
+    for (const d of [1, 2, 3, 4, 5, 6, 8, 10, 20, 21, 25, 40]) {
+      assert.deepStrictEqual(
+        sel.baselineTimestamps(d),
+        videoFrameService.planTimestamps(d),
+        `baselineTimestamps(${d}) must equal planTimestamps(${d})`
+      );
+    }
+  });
+
+  await checkAsync('A8 REGRESSION, behavioral: with the kill switch OFF, a 4s ad gets the OLD single-frame plan, not three quartiles', async () => {
+    await withEnv('VIDEO_QC_DENSE_SAMPLING', 'false', async () => {
+      const result = await sel.selectQcFrameTimestamps(
+        { deliveredUrl: CLOUDINARY_URL, durationSec: 4 },
+        { fetchDenseFrames: async () => { throw new Error('must not be called'); } }
+      );
+      assert.deepStrictEqual(result.timestamps, [2], 'must match videoFrameService.planTimestamps(4) exactly, not a 3-fraction guess');
+    });
   });
 
   // ── B. Additive URL/fetch helpers do not disturb the existing contract ─
@@ -213,13 +251,34 @@ console.log('\nverifyVideoQcFrameSampling — dense frame pre-filter for video v
   });
 
   // ── E. selectQcFrameTimestamps orchestration (mocked transport only) ─
+  //
+  // ADVERSARIAL-REVIEW FIX (2026-08-20, Grok): every mock in this section
+  // used to IGNORE the `stamps` argument selectQcFrameTimestamps actually
+  // passes to fetchDenseFrames — they built their response from a
+  // pre-captured `denseSet` closure variable instead. That made the whole
+  // section (and F2/F3 below) vacuous with respect to the ONE THING that
+  // matters most: whether the real videoFrameService.planDenseTimestamps
+  // output is what actually drives frame selection. Swapping
+  // planDenseTimestamps(durationSec) out for the OLD quartile-only
+  // planTimestamps(durationSec) inside selectQcFrameTimestamps — i.e.
+  // reintroducing the exact blindness this PR fixes — would still have
+  // passed every check below, because the mocks never looked at what was
+  // actually requested.
+  //
+  // Fixed by making every mock build its response FROM the received
+  // `stamps` argument (not from the closure), AND asserting that argument
+  // equals the real planDenseTimestamps output wherever the check's point
+  // is "does the real planner drive this".
   const denseSet = videoFrameService.planDenseTimestamps(10);
 
-  await checkAsync('E1 no outliers -> exactly the baseline, flaggedCount 0', async () => {
+  await checkAsync('E1 no outliers -> exactly the baseline, flaggedCount 0 (and the REAL dense planner was consulted)', async () => {
     const result = await sel.selectQcFrameTimestamps(
       { deliveredUrl: CLOUDINARY_URL, durationSec: 10 },
       {
-        fetchDenseFrames: async () => denseSet.map((t) => ({ timestampSec: t, buffer: bufFor('clean') })),
+        fetchDenseFrames: async (url, stamps) => {
+          assert.deepStrictEqual(stamps, denseSet, 'must probe the REAL planDenseTimestamps(10) output');
+          return stamps.map((t) => ({ timestampSec: t, buffer: bufFor('clean') }));
+        },
         computeFrameSignature: async () => [0.5, 0.5, 0.5, 0.5]
       }
     );
@@ -228,11 +287,14 @@ console.log('\nverifyVideoQcFrameSampling — dense frame pre-filter for video v
     assert.strictEqual(result.degraded, false);
   });
 
-  await checkAsync('E2 two flagged outliers merge into the baseline, sorted', async () => {
+  await checkAsync('E2 two flagged outliers merge into the baseline, sorted (frames built from the REAL requested stamps)', async () => {
     const result = await sel.selectQcFrameTimestamps(
       { deliveredUrl: CLOUDINARY_URL, durationSec: 10 },
       {
-        fetchDenseFrames: async () => denseSet.map((t) => ({ timestampSec: t, buffer: bufFor(t) })),
+        fetchDenseFrames: async (url, stamps) => {
+          assert.deepStrictEqual(stamps, denseSet, 'must probe the REAL planDenseTimestamps(10) output');
+          return stamps.map((t) => ({ timestampSec: t, buffer: bufFor(t) }));
+        },
         computeFrameSignature: async (buf) => {
           const t = Number(buf.toString());
           return (t === 0.1 || t === 0.5) ? [1, 1, 1, 1] : [0, 0, 0, 0];
@@ -276,13 +338,16 @@ console.log('\nverifyVideoQcFrameSampling — dense frame pre-filter for video v
 
   await checkAsync('E6 more outliers than the cap: only the top MAX_EXTRA_FRAMES by score survive', async () => {
     // 8 majority "clean" frames at [0,0]; 4 minority frames, each a clear
-    // outlier but with DISTINCT scores, at timestamps far from every
-    // baseline quartile so none gets redundancy-filtered.
+    // outlier but with DISTINCT scores, at REAL dense-set timestamps far
+    // from every baseline quartile so none gets redundancy-filtered.
     const scoreByTimestamp = { 1.6: 1.0, 3.1: 0.9, 5.8: 0.8, 8.5: 0.7 };
     const result = await sel.selectQcFrameTimestamps(
       { deliveredUrl: CLOUDINARY_URL, durationSec: 10 },
       {
-        fetchDenseFrames: async () => denseSet.map((t) => ({ timestampSec: t, buffer: bufFor(t) })),
+        fetchDenseFrames: async (url, stamps) => {
+          assert.deepStrictEqual(stamps, denseSet, 'must probe the REAL planDenseTimestamps(10) output');
+          return stamps.map((t) => ({ timestampSec: t, buffer: bufFor(t) }));
+        },
         computeFrameSignature: async (buf) => {
           const t = Number(buf.toString());
           const v = scoreByTimestamp[t] || 0;
@@ -298,17 +363,41 @@ console.log('\nverifyVideoQcFrameSampling — dense frame pre-filter for video v
     assert.ok(!result.timestamps.includes(5.8) && !result.timestamps.includes(8.5));
   });
 
-  await checkAsync('E7 an outlier within 0.4s of a baseline quartile is treated as redundant and dropped', async () => {
-    const extra = { timestampSec: 2.6, buffer: bufFor(2.6) };
+  await checkAsync('E7 redundancy filter DISCRIMINATES: a near-baseline outlier is dropped while a real, far outlier in the SAME call survives', async () => {
+    // ADVERSARIAL-REVIEW FIX (Grok): the old version only asserted "the
+    // near-duplicate is absent" and "flaggedCount is 0" — both also true
+    // if scoreOutliers simply never flagged ANYTHING, or if the call
+    // degraded to baseline. Neither of those actually exercises the 0.4s
+    // redundancy filter. Also, the old injected "near-duplicate" (2.6s)
+    // was not even a real planDenseTimestamps output — it only existed
+    // because the mock manually concatenated it.
+    //
+    // Fixed with a POSITIVE CONTROL in the same call: 7.2s is a REAL dense
+    // timestamp only 0.3s from the 7.5s baseline (must be dropped as
+    // redundant); 1.6s is a REAL dense timestamp 0.9s from its nearest
+    // baseline (2.5s) and must survive. Both score as outliers; only one
+    // should make it through, which is the only way to tell "the filter
+    // discriminates" from "nothing got through".
+    const outlierTimestamps = new Set([7.2, 1.6]);
     const result = await sel.selectQcFrameTimestamps(
       { deliveredUrl: CLOUDINARY_URL, durationSec: 10 },
       {
-        fetchDenseFrames: async () => denseSet.map((t) => ({ timestampSec: t, buffer: bufFor(t) })).concat([extra]),
-        computeFrameSignature: async (buf) => (buf.toString() === '2.6' ? [1, 1] : [0, 0])
+        fetchDenseFrames: async (url, stamps) => {
+          assert.deepStrictEqual(stamps, denseSet, 'must probe the REAL planDenseTimestamps(10) output');
+          return stamps.map((t) => ({ timestampSec: t, buffer: bufFor(t) }));
+        },
+        computeFrameSignature: async (buf) => {
+          const t = Number(buf.toString());
+          return outlierTimestamps.has(t) ? [1, 1] : [0, 0];
+        }
       }
     );
-    assert.ok(!result.timestamps.includes(2.6), 'a near-duplicate of the 2.5s baseline must not double up');
-    assert.strictEqual(result.flaggedCount, 0, 'the only candidate outlier was redundant with baseline — nothing extra should ship');
+    assert.strictEqual(result.degraded, false);
+    assert.ok(!result.timestamps.includes(7.2),
+      'a near-duplicate of the 7.5s baseline (0.3s away) must not double up');
+    assert.ok(result.timestamps.includes(1.6),
+      'a real, far outlier (0.9s from its nearest baseline) in the SAME call must survive — proves this is discrimination, not universal suppression');
+    assert.strictEqual(result.flaggedCount, 1, 'exactly one of the two flagged outliers should have cleared the redundancy filter');
   });
 
   // ── F. THE REAL BEHAVIORAL PROOF: real JPEGs, the actual 2026-08-20 defect ─
@@ -354,6 +443,20 @@ console.log('\nverifyVideoQcFrameSampling — dense frame pre-filter for video v
     buffer: await makeIncidentFrame({ defect: DEFECT_TIMESTAMPS.has(t) })
   })));
 
+  check('F0 SOURCE-LEVEL PIN: selectQcFrameTimestamps calls the REAL planDenseTimestamps, not the old quartile-only planTimestamps, to build its probe list', () => {
+    // Static companion to the runtime stamps-assertions in E/F below —
+    // added after adversarial review showed those mocks could previously
+    // be fooled if this were swapped for the old planner (which is
+    // exactly the pre-existing blindness this PR fixes).
+    const src = fs.readFileSync(path.join(__dirname, '..', 'services', 'videoQcFrameSelectionService.js'), 'utf8');
+    const m = src.match(/async function selectQcFrameTimestamps\([\s\S]*?\n\}\n/);
+    assert.ok(m, 'selectQcFrameTimestamps not found');
+    const body = m[0];
+    assert.ok(/\.planDenseTimestamps\(/.test(body), 'must call planDenseTimestamps to build the dense probe list');
+    assert.ok(!/videoFrameService\.planTimestamps\(/.test(body),
+      'must NOT call the bare quartile-only planTimestamps directly — that is exactly the pre-existing blindness');
+  });
+
   await checkAsync('F1 sanity: the synthetic defect frames really do decode differently from clean ones', async () => {
     const sigs = await Promise.all(incidentFrames.map((f) => sel.computeFrameSignature(f.buffer)));
     const scored = sel.scoreOutliers(sigs);
@@ -361,13 +464,40 @@ console.log('\nverifyVideoQcFrameSampling — dense frame pre-filter for video v
     assert.deepStrictEqual(flaggedTs.sort((a, b) => a - b), [0.1, 0.5]);
   });
 
-  await checkAsync('F2/F3 selectQcFrameTimestamps (real sharp decode, mocked network only) CATCHES the real incident at its real timestamps', async () => {
+  // ADVERSARIAL-REVIEW FIX (Grok): the mock used to be
+  // `fetchDenseFrames: async () => incidentFrames`, ignoring the `stamps`
+  // argument entirely. That made this check vacuous with respect to
+  // planDenseTimestamps: if selectQcFrameTimestamps were changed to probe
+  // the OLD quartile-only planTimestamps instead (durationSec=10 ->
+  // [2.5,5,7.5], which never overlaps 0.1/0.5), this mock would still hand
+  // back the same defect frames regardless, and F2/F3 would still
+  // (wrongly) pass. Fixed by asserting `stamps` equals the REAL
+  // planDenseTimestamps(10) output before returning anything, and by
+  // building the response FROM `stamps` (lookup) rather than from the
+  // closure — so a swapped planner fails loudly here, not silently.
+  const incidentFrameByTimestamp = new Map(incidentFrames.map((f) => [f.timestampSec, f]));
+  await checkAsync('F2/F3 selectQcFrameTimestamps (real sharp decode, mocked network only) CATCHES the real incident at its real timestamps — AND really asked the real dense planner for them', async () => {
     const result = await sel.selectQcFrameTimestamps(
       { deliveredUrl: CLOUDINARY_URL, durationSec: 10 },
-      { fetchDenseFrames: async () => incidentFrames } // real buffers; only the network hop is stubbed
+      {
+        fetchDenseFrames: async (url, stamps) => {
+          assert.deepStrictEqual(stamps, incidentDense, 'must request the REAL planDenseTimestamps(10) output, not something else');
+          return stamps.map((t) => incidentFrameByTimestamp.get(t)).filter(Boolean);
+        }
+      }
     );
     assert.ok(result.timestamps.includes(0.1), 'must catch the t=0.1s frame of the real incident');
     assert.ok(result.timestamps.includes(0.5), 'must catch the t=0.5s frame of the real incident');
+  });
+
+  await checkAsync('F2b if the dense planner were swapped for the OLD quartile-only plan, the SAME real incident frames would go uncaught', async () => {
+    // Directly demonstrates why F2/F3 asserting the real stamps matters:
+    // quartile timestamps for a 10s clip (2.5/5/7.5) never intersect the
+    // incident's dense set, so a lookup against them finds nothing —
+    // exactly the pre-existing blindness this PR fixes.
+    const quartileOnly = videoFrameService.planTimestamps(10);
+    const wouldFetch = quartileOnly.map((t) => incidentFrameByTimestamp.get(t)).filter(Boolean);
+    assert.strictEqual(wouldFetch.length, 0, 'quartile timestamps must not overlap the incident dense set at all');
   });
 
   await checkAsync('F4 the PRE-EXISTING quartile-only baseline would have caught NEITHER defect frame (the documented blindness)', () => {
@@ -376,7 +506,21 @@ console.log('\nverifyVideoQcFrameSampling — dense frame pre-filter for video v
     assert.ok(!baseline.includes(0.1) && !baseline.includes(0.5));
   });
 
-  await checkAsync('F5 REVERT-PROOF: flipping VIDEO_QC_DENSE_SAMPLING off on the SAME incident reproduces the old blindness', async () => {
+  await checkAsync('F5 the kill-switch-OFF branch specifically: flipping VIDEO_QC_DENSE_SAMPLING off on the SAME incident reproduces the old blindness', async () => {
+    // SCOPE, stated precisely after an adversarial review flagged the
+    // original wording as overclaiming: F5 pins ONLY the flag's own
+    // contract — "off means baseline, and the dense probe is never
+    // attempted at all" — which is the early-return branch at the top of
+    // selectQcFrameTimestamps, BEFORE any fetch/decode/scoring runs. It
+    // does NOT exercise scoring and it does NOT prove "this whole file
+    // fails if the feature is reverted any other way". Those are covered
+    // separately: G1/G2 fail if the brandScriptExecutor.js wiring is
+    // reverted; a bare require() throws MODULE_NOT_FOUND if
+    // videoQcFrameSelectionService.js is deleted; F2/F3 (with the F2b
+    // control above) fail if planDenseTimestamps is swapped out; H1 pins
+    // the shipped config/defaults.env value. Each was independently
+    // confirmed by hand this session (see session.d/ and the PR
+    // description) — no single check here proves all of them at once.
     await withEnv('VIDEO_QC_DENSE_SAMPLING', 'false', async () => {
       let fetchCalled = false;
       const result = await sel.selectQcFrameTimestamps(
@@ -385,9 +529,24 @@ console.log('\nverifyVideoQcFrameSampling — dense frame pre-filter for video v
       );
       assert.deepStrictEqual(result.timestamps, [2.5, 5, 7.5]);
       assert.ok(!result.timestamps.includes(0.1) && !result.timestamps.includes(0.5),
-        'with the flag off, the exact same real incident frames must go uncaught — proves F2/F3 is not vacuous');
+        'with the flag off, the exact same real incident frames must go uncaught');
       assert.strictEqual(fetchCalled, false);
     });
+  });
+
+  // ── H. config/defaults.env agrees with the code default (shipped prod value) ─
+  // ADVERSARIAL-REVIEW FIX (Grok): every check above deletes
+  // process.env.VIDEO_QC_DENSE_SAMPLING up front and relies on the CODE
+  // default, so none of them would notice if the COMMITTED
+  // config/defaults.env value were flipped to false — that file, not the
+  // code default, is what actually ships to production (dotenv-loaded at
+  // boot, see CLAUDE.md §4a). Same pattern as verifyPostPilotBatch.js C14.
+  check('H1 config/defaults.env sets VIDEO_QC_DENSE_SAMPLING=true (the real shipped prod default)', () => {
+    const envSrc = fs.readFileSync(path.join(__dirname, '..', 'config', 'defaults.env'), 'utf8');
+    assert.ok(/^VIDEO_QC_DENSE_SAMPLING=true\s*$/m.test(envSrc),
+      'config/defaults.env must set VIDEO_QC_DENSE_SAMPLING=true — this is what actually ships, not the code default');
+    assert.ok(!/^VIDEO_QC_DENSE_SAMPLING=false\s*$/m.test(envSrc),
+      'must not ALSO carry a false line (e.g. from a bad merge) that would win or confuse precedence');
   });
 
   // ── G. Integration wiring into brandScriptExecutor.js ────────────────

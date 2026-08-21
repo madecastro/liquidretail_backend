@@ -68,7 +68,10 @@ const videoFrameService = require('./videoFrameService');
 
 const PREFILTER_WIDTH = 160;          // tiny — this download never reaches a vision model
 const SIGNATURE_SIZE = 16;            // 16x16 grayscale grid per frame (256 values)
-const BASELINE_FRACTIONS = Object.freeze([0.25, 0.5, 0.75]); // unchanged quartile floor
+// Documentation only, NOT what baselineTimestamps() computes — see the
+// comment on that function for why a literal fractions formula here would
+// be a bug, not just a simplification. Describes the common 8-10s ad case.
+const BASELINE_FRACTIONS = Object.freeze([0.25, 0.5, 0.75]);
 const MAX_EXTRA_FRAMES = 2;           // cap on OUTLIER-triggered extra vision frames
 const MAX_TOTAL_FRAMES = 5;           // hard cap: baseline (3) + extras (<=2)
 const OUTLIER_MIN_SCORE = 0.04;       // floor so near-static footage can't "flag" from decode noise
@@ -86,13 +89,25 @@ function isDenseSamplingEnabled() {
   return envFlag('VIDEO_QC_DENSE_SAMPLING', true);
 }
 
-function round1(n) { return Math.round(n * 10) / 10; }
-
-/** The pre-existing quartile timestamps — the floor this module never drops below. */
+/**
+ * The pre-existing frame plan — the floor this module never drops below,
+ * and (with the kill switch off) the WHOLE answer.
+ *
+ * MUST delegate to the real videoFrameService.planTimestamps rather than
+ * reimplementing a fractions formula: planTimestamps has THREE duration
+ * buckets, not one — a tiny clip (<=4s, a real value: Omni's duration enum
+ * is [4,6,8,10]) gets exactly ONE mid-frame, not three quartiles, and a
+ * long clip (>20s) gets a stride-based plan capped at 5, not three
+ * quartiles either. A literal `[0.25,0.5,0.75].map(f => d*f)` formula here
+ * matches planTimestamps ONLY inside the 4-20s bucket and silently
+ * diverges outside it — caught by an adversarial review probing exactly
+ * this (durationSec=4: planTimestamps returns [2], a fractions formula
+ * returns [1,2,3]). That divergence would make the "kill switch off
+ * restores byte-identical old behavior" claim false for any ad whose
+ * duration falls outside 4-20s, which is the entire point of the switch.
+ */
 function baselineTimestamps(durationSec) {
-  const d = Number(durationSec);
-  if (!Number.isFinite(d) || d <= 0) return [];
-  return BASELINE_FRACTIONS.map((f) => round1(d * f));
+  return videoFrameService.planTimestamps(durationSec);
 }
 
 /**
