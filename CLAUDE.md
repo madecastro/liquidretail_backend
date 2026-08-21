@@ -10,14 +10,40 @@ security, money, or the render queue** — it carries verified P0s with `path:li
 
 Live prod (2026-08-11) = **`5d02debe`** (both services — WEB
 `srv-d1vuktqli9vc73ft07ng`, WORKER `srv-d8128c1o3t8c73e8kb30`). Offline verify
-suite = **101 scripts, all green**. Re-run with
-`for f in scripts/verify*.js; do node "$f" || echo "FAIL $f"; done` — there is
-no aggregate runner and no `npm test`. Two worktree gotchas that cost real time:
-the committed `node_modules` subset is incomplete (no native `sharp`, so
-`verifyLogoSilhouette.js` fails until you run `npm install` in the worktree —
-`NODE_PATH` alone will not fix it, since Node resolves the local `node_modules`
-first), and **macOS has no `timeout` binary**, so a loop wrapping each script in
-`timeout` reports all 101 as failed. Claims written against pre-deploy binaries
+suite = **184 scripts** (174 `.js` + 10 `.mjs`).
+**Run it with `npm test`.** That is `node scripts/runVerifySuite.js` — a parallel
+aggregate runner that globs `scripts/verify*.{js,mjs}` and takes
+`--concurrency=` / `--timeout=` flags.
+
+⚠️ **CORRECTED 2026-08-21. This block previously said "there is
+no aggregate runner and no `npm test`" and told you to run
+`for f in scripts/verify*.js; do node "$f" || echo "FAIL $f"; done`. Both were
+false, and the second is worse than merely stale: that glob is `.js` ONLY, so it
+SILENTLY SKIPS ALL TEN `.mjs` HARNESSES** — including
+`verifyReelsSafeZone.mjs`, `verifyLandscapeYtSafeZone.mjs`,
+`verifyStackSafeFloor.mjs`, `verifyReelsOverflowSafety.mjs`,
+`verifyNoDoubleTitledBand.mjs` and `verifyPmaxTitleInk.mjs`, i.e. most of what
+pins titling geometry and title ink. Sessions following this instruction have
+been reporting "all green" against 174 of 184 for as long as the `.mjs`
+harnesses have existed; PR #303's "174/174 pass" is one measured instance.
+`runVerifySuite.js`'s own header already called this out — the docs just never
+caught up. If you quote a suite count, say which glob produced it.
+
+The `timeout` note that used to live here is also gone: `runVerifySuite.js`
+implements its own per-script timeout (`--timeout=`, SIGTERM then SIGKILL), so
+macOS lacking a `timeout` binary no longer matters when you use `npm test`.
+
+**Worktree gotcha, still true and it bites the `.mjs` harnesses hardest.** The
+committed `node_modules` subset is incomplete. For CJS scripts,
+`NODE_PATH=<main checkout>/node_modules` is a workaround (native `sharp` is the
+exception — `verifyLogoSilhouette.js` needs a real `npm install` in the
+worktree, since Node resolves the local `node_modules` first). **For `.mjs` it
+is not a workaround at all: ESM ignores `NODE_PATH`.** Measured 2026-08-21:
+`verifyTitleBeatScale.mjs` imports the `remotion` package, fails
+`ERR_MODULE_NOT_FOUND` in ANY worktree including a pristine detached
+`origin/main`, and passes in the main checkout. So a lone `.mjs` failure in a
+worktree is the default expectation, not a regression — confirm it against the
+main checkout before believing it. Claims written against pre-deploy binaries
 are suspect. **A red harness in a local checkout is not necessarily red
 on `main`** — this tree carries other sessions' uncommitted work, so confirm
 against a clean worktree off `origin/main` before believing a failure (or a pass).
@@ -2256,7 +2282,9 @@ not as a separate tuning decision. Re-measure before going higher
   without explicit permission.
 - Before pushing non-trivial changes: run **`npm run lint`**, `node --check` the
   touched files, and run the relevant `scripts/verify*.{js,mjs}` harness
-  (**143 `.js` scripts / 152 including the 9 `.mjs`** as of the CampaignRun
+  (**174 `.js` scripts / 184 including the 10 `.mjs`** — recounted 2026-08-21;
+  run them with `npm test`, NOT the `verify*.js` shell loop, which skips every
+  `.mjs`. Was "143 / 152 including the 9" as of the CampaignRun
   heartbeat, 2026-08-18 — the "101" the header still carries is stale by ~42,
   and the "138" this line carried counted only part of the tree). Add a
   harness for money/security-critical logic, and **revert-prove it** — back
