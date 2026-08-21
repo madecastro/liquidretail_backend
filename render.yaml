@@ -1,0 +1,52 @@
+# Render deployment for liquidretail_adgen.
+#
+# Three services from one Docker image. Env var ADGEN_ROLE selects the role.
+# Autoscale on the renderer only — orchestrator is singleton (distributed lease
+# handles failover), api scales on HTTP RPS if needed later.
+#
+# MONGODB_URI + SLACK_* live in the Render dashboard as secrets. Everything
+# else lives here or in .env.example (non-secret defaults).
+
+services:
+  - type: web
+    name: adgen-api
+    env: docker
+    plan: starter
+    dockerfilePath: ./Dockerfile
+    healthCheckPath: /health
+    autoDeploy: true
+    envVars:
+      - key: ADGEN_ROLE
+        value: api
+      - key: PORT
+        value: 3100
+      - key: MONGODB_URI
+        sync: false   # dashboard-only secret
+
+  - type: worker
+    name: adgen-orchestrator
+    env: docker
+    plan: starter
+    dockerfilePath: ./Dockerfile
+    autoDeploy: true
+    # Singleton by design; distributed lease keeps a 2nd instance from
+    # duplicating expansion work. numInstances stays 1 in dashboard.
+    envVars:
+      - key: ADGEN_ROLE
+        value: orchestrator
+      - key: MONGODB_URI
+        sync: false
+
+  - type: worker
+    name: adgen-renderer
+    env: docker
+    plan: standard   # more RAM headroom for Remotion in Phase 1
+    dockerfilePath: ./Dockerfile
+    autoDeploy: true
+    # Autoscale in the Render dashboard (min 2, max 8+) — Phase 0 stays at
+    # 1 instance until real work moves here.
+    envVars:
+      - key: ADGEN_ROLE
+        value: renderer
+      - key: MONGODB_URI
+        sync: false

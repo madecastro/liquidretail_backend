@@ -1,0 +1,19 @@
+{
+  "name": "liquidretail_adgen",
+  "version": "0.0.1",
+  "private": true,
+  "description": "Ad-generation microservice — extracted from liquidretail_backend",
+  "main": "src/entrypoint.js",
+  "scripts": {
+    "start": "node src/entrypoint.js",
+    "dev": "node src/entrypoint.js"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "dependencies": {
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2",
+    "mongoose": "^8.5.1"
+  }
+}
