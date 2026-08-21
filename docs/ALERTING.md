@@ -17,7 +17,9 @@ Ad rendering, **including every paid video generation**, does not run on a
 durable queue. `POST /api/ads/generate` and `POST /api/ads/runs` flush a
 `202 Accepted` and then run `runRenderLoop` in a `setImmediate` **inside the
 web service process** (`routes/ads.js`). Video ads run at
-`VEO_CONCURRENCY` concurrent Omni submits, so a large batch occupies that
+`VEO_CONCURRENCY` concurrent Omni submits, and every finished master is then
+titled in that same process behind `REMOTION_QUEUE_CONCURRENCY` simultaneous
+Remotion renders (headless Chrome + ffmpeg), so a large batch occupies that
 process for a long time.
 
 That process does not survive that long reliably:
@@ -550,7 +552,9 @@ than direct observation, and it is stated as such because it decides the
 recovery verdict: the count matches `21 video rows − VEO_CONCURRENCY (12) in
 flight = 9` exactly, and the only other path that parks a video row in `queued`
 — `renderDeriveOnlyVideoAd`'s polite wait-requeue — `$inc`s `skipped`, which the
-run's `skipped: 0` rules out.
+run's `skipped: 0` rules out. (`VEO_CONCURRENCY` was **12** when this run
+happened; the file default is **24** since 2026-08-20. The arithmetic above is
+historical — do not re-derive it from today's value.)
 
 **CLOSED 2026-08-19 — this used to say "nothing recovers them automatically".**
 `services/strandedRunSweeper.js` re-drives `queued` ads whose owning run went
@@ -574,7 +578,8 @@ silent-loss rate (46 of 307 claimed ads). Full narrative:
 
 **Why this got likelier the same week:** video went to 10s on both platforms and
 Meta+PMax now share ONE 9:16 master, so 15 of 21 video rows queue behind a
-single plate and titling serialises behind `REMOTION_QUEUE_CONCURRENCY` (4).
+single plate and titling serialises behind `REMOTION_QUEUE_CONCURRENCY` (4 at
+the time; the file default is 8 since 2026-08-20).
 Long silent stretches between ad settlements are the **normal** shape of a mixed
 run now, not an edge case.
 
