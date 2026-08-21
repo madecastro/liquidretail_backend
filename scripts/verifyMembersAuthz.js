@@ -93,47 +93,59 @@ async function checkAsync(label, fn) {
   }
 }
 
-// ── regex-literal-aware comment/string stripper ────────────────────────────
-// A naive quote tracker (only tracking ' " `) desyncs the moment it walks
-// past a `/regex/` literal containing a quote character — everything after
-// is misread as inside/outside a string. This tracks a fourth state, REGEX,
-// using the standard heuristic: `/` starts a regex literal (not division)
-// when the previous significant token is an operator/punctuator/keyword
-// rather than an identifier/number/closing-bracket.
+// ── regex-literal-aware comment stripper ───────────────────────────────────
+// Same contract as the repo's existing stripComments() (see
+// scripts/verifyReceiptAwareRequeue.js): strip comments, PRESERVE string
+// contents verbatim (so a require('...') path is still readable by a regex
+// afterwards) — but additionally track a fourth state, REGEX, that the
+// existing helper does not. A naive tracker that only knows ' " ` desyncs
+// the moment it walks past a `/regex/` literal containing a quote character
+// (or a bare `/` used as division) — everything after is misread as
+// inside/outside a string, which can silently swallow a real require(...)
+// call later in the same file (this is the exact "naive quote tracker
+// desyncs on regex literals" class of bug). `/` starts a regex literal (not
+// division) using the standard heuristic: the previous significant token is
+// an operator/punctuator/keyword rather than an identifier/number/closing
+// bracket.
 function stripCommentsAndStrings(src) {
   let out = '';
   let i = 0;
-  let quote = null; // ' " ` when inside a string/template
-  let lastSignificant = ''; // last non-whitespace, non-comment char emitted
+  let quote = null; // ' " ` or 'REGEX'
+  let lastSignificant = ''; // last non-whitespace chars actually emitted
   const regexPrecedingKeywords = /(?:^|[^\w$])(return|typeof|instanceof|in|of|new|delete|void|throw|case|do|else|yield|await)$/;
   function canStartRegex(preceding) {
     if (preceding === '') return true;
-    if (/[\w$)\]]/.test(preceding.slice(-1)) && !regexPrecedingKeywords.test(preceding)) return false;
+    const lastChar = preceding.slice(-1);
+    if (/[\w$)\]]/.test(lastChar) && !regexPrecedingKeywords.test(preceding)) return false;
     return true;
+  }
+  function noteSignificant(str) {
+    lastSignificant += str;
+    if (lastSignificant.length > 40) lastSignificant = lastSignificant.slice(-40);
   }
   while (i < src.length) {
     const c = src[i], n = src[i + 1];
     if (quote === 'REGEX') {
-      if (c === '\\') { out += '  '; i += 2; continue; }
-      if (c === '[') { // char class — '/' inside it doesn't end the regex
-        out += ' '; i++;
+      if (c === '\\') { out += c + (n || ''); noteSignificant(c + (n || '')); i += 2; continue; }
+      if (c === '[') { // char class — a bare '/' inside it doesn't end the regex
+        out += c; i++;
         while (i < src.length && src[i] !== ']') {
-          if (src[i] === '\\') { i += 2; out += '  '; continue; }
-          out += ' '; i++;
+          if (src[i] === '\\') { out += src[i] + (src[i + 1] || ''); i += 2; continue; }
+          out += src[i]; i++;
         }
-        if (i < src.length) { out += ' '; i++; }
+        if (i < src.length) { out += src[i]; i++; }
         continue;
       }
-      if (c === '/') { quote = null; out += ' '; i++; continue; }
+      if (c === '/') { quote = null; out += c; noteSignificant(c); i++; continue; }
       if (c === '\n') { quote = null; out += '\n'; i++; continue; } // unterminated — bail safely
-      out += ' '; i++; continue;
+      out += c; i++; continue;
     }
     if (quote) {
-      if (c === '\\') { out += '  '; i += 2; continue; }
-      if (c === quote) { quote = null; out += ' '; i++; continue; }
-      out += c === '\n' ? '\n' : ' '; i++; continue;
+      if (c === '\\') { out += c + (n || ''); i += 2; continue; }
+      if (c === quote) { quote = null; out += c; noteSignificant(c); i++; continue; }
+      out += c; i++; continue;
     }
-    if (c === '"' || c === "'" || c === '`') { quote = c; out += ' '; i++; continue; }
+    if (c === '"' || c === "'" || c === '`') { quote = c; out += c; i++; continue; }
     if (c === '/' && n === '/') {
       while (i < src.length && src[i] !== '\n') { out += ' '; i++; }
       continue;
@@ -147,11 +159,10 @@ function stripCommentsAndStrings(src) {
       continue;
     }
     if (c === '/' && canStartRegex(lastSignificant)) {
-      quote = 'REGEX'; out += ' '; i++; continue;
+      quote = 'REGEX'; out += c; noteSignificant(c); i++; continue;
     }
     out += c;
-    if (!/\s/.test(c)) lastSignificant += c;
-    if (lastSignificant.length > 40) lastSignificant = lastSignificant.slice(-40);
+    if (!/\s/.test(c)) noteSignificant(c);
     i++;
   }
   return out;
@@ -811,7 +822,20 @@ check('C0b by-token/accept is wired to requireUserOnly (reference identity), NOT
 
   // M1 — drop the gate off PATCH /:userId. A viewer must now be able to
   // reach the handler and (absent any other check) self-promote.
-  await checkAsync('E-M1 dropping the gate off PATCH /:userId lets a viewer reach the handler (must fail)', async () => {
+  // NOTE on scenario choice: removing ONLY the route-level gate does NOT
+  // reproduce raw "viewer self-promotes to owner" — canGrantRole inside the
+  // handler is a rank check independent of who is allowed to call the route
+  // at all, and it still blocks a viewer (rank 0) from requesting owner
+  // (rank 3) even with the gate gone. That is a genuine defense-in-depth
+  // property of this design, not a flaw in the mutation. What the gate
+  // ALONE is responsible for is stopping non-owner/admin callers from
+  // reaching PATCH at all, regardless of whether the requested change is
+  // rank-respecting — so this mutation instead proves an EDITOR (who must
+  // have ZERO PATCH access per the brief) can, once the gate is gone,
+  // promote a VIEWER to editor: canActOnRole('editor','viewer') and
+  // canGrantRole('editor','editor') both legitimately pass rank-wise, so
+  // only the now-missing gate was standing between an editor and this call.
+  await checkAsync('E-M1 dropping the gate off PATCH /:userId lets an editor (zero PATCH access) reach the handler (must fail)', async () => {
     const mutated = mutateOrThrow(
       membersSrc,
       "router.patch('/:userId', requireMembershipRole(['owner', 'admin']), express.json(), async (req, res) => {",
@@ -819,13 +843,21 @@ check('C0b by-token/accept is wired to requireUserOnly (reference identity), NOT
       'M1'
     );
     await withMutatedSibling(membersAbsPath, mutated, async (mutatedRouter) => {
-      await withStubs(baseRows(), async () => {
+      await withStubs(baseRows(), async (store) => {
+        // The gate was the FIRST layer; with it removed, express.json() (a
+        // real body-parser expecting a real stream) shifts into that slot,
+        // so this drives the terminal handler directly rather than through
+        // findLayer's generic first-layer-as-gate assumption — the point of
+        // this mutation is the HANDLER's own reachability, not re-testing
+        // body-parser wiring.
         const mutatedPatch = findLayer(mutatedRouter, 'patch', '/:userId');
-        const req = reqAs(U.viewer, 'viewer', { params: { userId: U.viewer }, body: { role: 'owner' } });
-        const { res, stoppedAtGate } = await driveChain(mutatedPatch.gate, mutatedPatch.handler, req);
-        assert.strictEqual(stoppedAtGate, false, 'expected the REVERTED code to let a viewer past the (now-json-parser) first layer');
-        assert.strictEqual(res.statusCode, 200, 'expected the REVERTED code to let a viewer self-promote to owner');
-        REVERT_ROWS.push('M1 — dropping the PATCH gate reproduced viewer self-promotion');
+        const req = reqAs(U.editor, 'editor', { params: { userId: U.viewer }, body: { role: 'editor' } });
+        const res = fakeRes();
+        await mutatedPatch.handler(req, res, (err) => { if (err) throw err; });
+        assert.strictEqual(res.statusCode, 200, 'expected the REVERTED code to let an editor reach and execute the PATCH handler');
+        const row = store.docs.find((d) => String(d.userId) === U.viewer);
+        assert.strictEqual(row.role, 'editor', 'expected the editor caller to have successfully promoted the viewer');
+        REVERT_ROWS.push('M1 — dropping the PATCH gate reproduced an editor (zero PATCH access) reaching the handler');
       });
     });
   });
@@ -896,12 +928,21 @@ check('C0b by-token/accept is wired to requireUserOnly (reference identity), NOT
       'M4'
     );
     await withMutatedSibling(membersAbsPath, mutated, async (mutatedRouter) => {
-      await withStubs(baseRows(), async (store) => {
+      // A SECOND viewer as the target, not U.editor — this mutation removes
+      // only the ROUTE-LEVEL gate. The in-handler canActOnRole check (a
+      // SEPARATE guard, its own removal is M5 below) is still present and
+      // would correctly 403 a viewer targeting a higher-ranked editor,
+      // masking exactly what M4 is supposed to isolate. A same-rank (viewer
+      // -> viewer) target passes canActOnRole trivially, so only the
+      // now-missing gate stands between the caller and the revoke.
+      const viewer2 = oid();
+      const rows = [...baseRows(), { _id: oid(), advertiserId: ADV, userId: viewer2, email: 'viewer2@x.com', role: 'viewer', status: 'active' }];
+      await withStubs(rows, async (store) => {
         const mutatedDelete = findLayer(mutatedRouter, 'delete', '/:userId');
-        const req = reqAs(U.viewer, 'viewer', { params: { userId: U.editor } });
+        const req = reqAs(U.viewer, 'viewer', { params: { userId: viewer2 } });
         const { res } = await driveChain(mutatedDelete.gate, mutatedDelete.handler, req);
         assert.strictEqual(res.statusCode, 200, 'expected the REVERTED code to let a viewer revoke another member');
-        const row = store.docs.find((d) => String(d.userId) === U.editor);
+        const row = store.docs.find((d) => String(d.userId) === viewer2);
         assert.strictEqual(row.status, 'revoked');
         REVERT_ROWS.push('E-M4 — dropping the DELETE gate reproduced arbitrary revoke');
       });
@@ -939,7 +980,12 @@ check('C0b by-token/accept is wired to requireUserOnly (reference identity), NOT
 
   // M6 — drop the gate off POST /api/invitations. A viewer must now be
   // able to invite.
-  await checkAsync('E-M6 dropping the gate off POST /api/invitations lets a viewer invite (must fail)', async () => {
+  // Same scenario-choice note as E-M1: canGrantRole('viewer','admin') is
+  // independently false, so a viewer inviting at 'admin' stays blocked even
+  // with the gate gone. Invite at 'viewer' (rank-respecting: 0 <= 0) isolates
+  // what the gate alone contributes — a viewer must have ZERO invite access,
+  // full stop, regardless of the requested role's rank.
+  await checkAsync('E-M6 dropping the gate off POST /api/invitations lets a viewer invite at their own rank (must fail)', async () => {
     const mutated = mutateOrThrow(
       invitationsSrc,
       "router.post('/', requireMembershipRole(['owner', 'admin']), express.json(), async (req, res) => {",
@@ -948,12 +994,16 @@ check('C0b by-token/accept is wired to requireUserOnly (reference identity), NOT
     );
     await withMutatedSibling(invitationsAbsPath, mutated, async (mutatedRouter) => {
       await withStubs(baseRows(), async (store) => {
+        // Same reasoning as E-M1: with the gate removed, express.json()
+        // shifts into the first-layer slot, so drive the terminal handler
+        // directly.
         const mutatedPost = findLayer(mutatedRouter, 'post', '/');
-        const req = reqAs(U.viewer, 'viewer', { body: { email: 'evil@x.com', role: 'admin' } });
-        const { res } = await driveChain(mutatedPost.gate, mutatedPost.handler, req);
+        const req = reqAs(U.viewer, 'viewer', { body: { email: 'evil@x.com', role: 'viewer' } });
+        const res = fakeRes();
+        await mutatedPost.handler(req, res, (err) => { if (err) throw err; });
         assert.strictEqual(res.statusCode, 201, 'expected the REVERTED code to let a viewer create an invitation');
         assert.strictEqual(store.calls.create.length, 1);
-        REVERT_ROWS.push('E-M6 — dropping the invitations POST gate reproduced uncontrolled invites');
+        REVERT_ROWS.push('E-M6 — dropping the invitations POST gate reproduced a viewer (zero invite access) inviting');
       });
     });
   });
