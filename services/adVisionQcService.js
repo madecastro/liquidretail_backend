@@ -531,162 +531,81 @@ function balancedSpanFrom(s, start) {
 }
 
 /**
- * Does the RAW TEXT of a vision reply state a load-bearing key more than
- * once inside the same object? `categories` and the four category names are
- * load-bearing: they are what scoreVerdictCategories reads. `summary` is
- * not — it never flips pass/fail.
+ * Parse with JSON5 — JSON5 is the ONLY document parser in this file now, and
+ * JSON is a subset of it — and REJECT a duplicate key at the moment JSON5's
+ * own parser inserts it.
  *
- * WHY THIS CANNOT BE A POST-PARSE RULE. JSON.parse (and JSON5.parse) keep
- * the LAST duplicate key. A JSON.parse reviver also never sees the discarded
- * value (verified: one reviver call per unique key, already last-wins). So
- * pickSafestCandidate cannot fail-wins a restatement that was collapsed
- * inside a single object — it never receives both. That is the same bug
- * class AA16 pins for MULTIPLE spans, one level lower.
+ * WHY A POST-PARSE SCANNER CANNOT DO THIS (three rounds proved it the hard
+ * way). JSON.parse / JSON5.parse both keep the LAST duplicate key and never
+ * expose the discarded one, so any check running AFTER parse only ever sees
+ * one value — it cannot fail-wins a restatement it never received. The fix
+ * that shipped before this one tried to answer "was there a duplicate?" with
+ * a SECOND hand-rolled text scanner mirroring JSON5's lexer (an allowlist of
+ * "load-bearing" key names, its own `\uXXXX` unescape). That is a second
+ * decoder that can drift from the first: it missed `score` (not on the
+ * allowlist), and it decoded `\uXXXX` but not `\xHH` or line-continuation, so
+ * `"\x63ategories"` decoded to `categories` by JSON5 but not by the scanner —
+ * two different opinions of what key the text stated, and the false PASS that
+ * produces is exactly the round-3 blocker this file is fixing.
  *
- * POLICY: fail CLOSED on that ambiguity. Do not reconstruct both values
- * and pick the failing one. Two statements of the same load-bearing key
- * in one object make the reply unparseable, same as "not JSON". A false
- * FAIL costs one static regeneration; a false PASS ships a defective ad.
- * Multi-span replies (a real fail object AND a later example object) are
- * a different shape — those still go through pickSafestCandidate. This
- * detector counts keys PER OBJECT, so two sibling objects each with one
- * `categories` key do not trip it.
+ * THE FIX: there is no second decoder. JSON5's lexer has already decoded
+ * \u / \x / line-continuation / unquoted / single-quoted keys into
+ * `token.value` before it ever assigns; assignment happens in exactly one
+ * place, `Object.defineProperty(parent, key, …)`
+ * (`node_modules/json5/lib/parse.js`, `push()`). Hooking THAT call counts the
+ * decoded key the parser itself just produced — the same tokenizer answers
+ * both "what does this key decode to" and "have I seen it on this object",
+ * so there is nothing left to drift. Native `JSON.parse` is not used anywhere
+ * in this file any more, on purpose: it last-wins silently, with no insertion
+ * hook to catch — that silent last-win on a strict-JSON duplicate `score` is
+ * what let the round-3 payload ship as a pass.
  *
- * JSON5 salvage (trailing commas, single quotes, unquoted keys, comments)
- * uses the same walk: a duplicate the strict parser never got to see is
- * still a duplicate.
+ * Every key is counted, not an allowlist of "load-bearing" names — the
+ * allowlist missing `score` is exactly how that key shipped as a false PASS.
+ * A duplicate `summary` fails closed too, stricter than before; see this
+ * file's known-residuals note near parseVerdict.
+ *
+ * Duplicate counting is PER OBJECT (a WeakMap keyed by the object JSON5 just
+ * created), so two sibling objects that each state `categories` once do not
+ * collide with each other.
  */
-function hasDuplicateLoadBearingKeys(text) {
-  const LOAD_BEARING_KEYS = new Set(['categories', ...CATEGORIES]);
-  const s = String(text == null ? '' : text);
-
-  function skipWsAndComments(i) {
-    while (i < s.length) {
-      const c = s[i];
-      if (c === ' ' || c === '\t' || c === '\n' || c === '\r' || c === '\f' || c === '\v') { i += 1; continue; }
-      if (c === '/' && s[i + 1] === '/') {
-        const nl = s.indexOf('\n', i);
-        i = nl < 0 ? s.length : nl + 1;
-        continue;
+function parseJson5Unique(text) {
+  const orig = Object.defineProperty;
+  const seen = new WeakMap();
+  function hooked(obj, prop, desc) {
+    if (obj !== null && typeof obj === 'object' && !Array.isArray(obj)) {
+      let keys = seen.get(obj);
+      if (!keys) { keys = new Set(); seen.set(obj, keys); }
+      if (keys.has(prop)) {
+        const err = new Error('Duplicate key ' + String(prop));
+        err.code = 'DUPLICATE_KEY';
+        throw err;
       }
-      if (c === '/' && s[i + 1] === '*') {
-        const end = s.indexOf('*/', i + 2);
-        i = end < 0 ? s.length : end + 2;
-        continue;
-      }
-      break;
+      keys.add(prop);
     }
-    return i;
+    return orig(obj, prop, desc);
   }
-
-  function readQuoted(i) {
-    const q = s[i];
-    if (q !== '"' && q !== "'") return null;
-    i += 1;
-    let out = '';
-    while (i < s.length) {
-      const c = s[i];
-      if (c === '\\') {
-        const n = s[i + 1];
-        if (n == null) return null;
-        if (n === 'u' && /^[0-9a-fA-F]{4}/.test(s.slice(i + 2, i + 6))) {
-          out += String.fromCharCode(parseInt(s.slice(i + 2, i + 6), 16));
-          i += 6;
-          continue;
-        }
-        const map = { n: '\n', r: '\r', t: '\t', b: '\b', f: '\f' };
-        out += Object.prototype.hasOwnProperty.call(map, n) ? map[n] : n;
-        i += 2;
-        continue;
-      }
-      if (c === q) return { value: out, next: i + 1 };
-      out += c;
-      i += 1;
-    }
-    return null;
+  Object.defineProperty = hooked;
+  try {
+    return { ok: true, value: JSON5.parse(text) };
+  } catch (err) {
+    return {
+      ok: false,
+      duplicate: !!(err && err.code === 'DUPLICATE_KEY'),
+      error: err
+    };
+  } finally {
+    // ALWAYS restore, even on throw — a stuck hook would corrupt every other
+    // object literal created anywhere in the process for the rest of its life.
+    Object.defineProperty = orig;
   }
-
-  function readIdent(i) {
-    if (!/[A-Za-z_$]/.test(s[i] || '')) return null;
-    let j = i + 1;
-    while (j < s.length && /[A-Za-z0-9_$]/.test(s[j])) j += 1;
-    return { value: s.slice(i, j), next: j };
-  }
-
-  const stack = [];
-  let quote = null;
-  let escape = false;
-  let i = 0;
-  while (i < s.length) {
-    if (quote) {
-      const c = s[i];
-      if (escape) { escape = false; i += 1; continue; }
-      if (c === '\\') { escape = true; i += 1; continue; }
-      if (c === quote) quote = null;
-      i += 1;
-      continue;
-    }
-
-    i = skipWsAndComments(i);
-    if (i >= s.length) break;
-
-    const frame = stack.length ? stack[stack.length - 1] : null;
-
-    if (frame && frame.expectingKey) {
-      const tok = readQuoted(i) || readIdent(i);
-      if (tok) {
-        const after = skipWsAndComments(tok.next);
-        if (s[after] === ':') {
-          if (LOAD_BEARING_KEYS.has(tok.value)) {
-            frame.counts[tok.value] = (frame.counts[tok.value] || 0) + 1;
-            if (frame.counts[tok.value] > 1) return true;
-          }
-          frame.expectingKey = false;
-          i = after + 1;
-          continue;
-        }
-      }
-    }
-
-    const c = s[i];
-    if (c === '"') { quote = c; i += 1; continue; }
-    // JSON5 single-quoted strings exist only INSIDE a JSON value. A prose
-    // apostrophe ("Here's my verdict") must not open a phantom string that
-    // swallows the real object — that was a false-negative on the first
-    // draft of this walk.
-    if (c === "'" && stack.length) { quote = c; i += 1; continue; }
-    if (c === '{') {
-      stack.push({ counts: Object.create(null), expectingKey: true });
-      i += 1;
-      continue;
-    }
-    if (c === '[') {
-      stack.push(null);
-      i += 1;
-      continue;
-    }
-    if (c === '}' || c === ']') {
-      stack.pop();
-      const parent = stack.length ? stack[stack.length - 1] : null;
-      if (parent) parent.expectingKey = false;
-      i += 1;
-      continue;
-    }
-    if (c === ',') {
-      if (frame) frame.expectingKey = true;
-      i += 1;
-      continue;
-    }
-    i += 1;
-  }
-  return false;
 }
 
 function failClosedDuplicateKeys() {
-  const reason = 'vision response stated duplicate load-bearing keys';
+  const reason = 'vision response stated a duplicate key';
   return {
     pass: false,
-    parseError: 'duplicate load-bearing key in vision QC verdict',
+    parseError: 'duplicate key in vision QC verdict',
     categories: emptyCategories(reason),
     summary: 'parse failure — treating as QC fail (safe default)',
     findings: [reason]
@@ -699,29 +618,45 @@ function failClosedDuplicateKeys() {
  * closing fence, or prefaced/followed by a sentence of prose. Scans every
  * balanced `{...}` span left to right (a span that fails to parse is looked
  * INTO, not skipped, in case the real object is nested inside prose-shaped
- * braces), parsing each with JSON.parse then a JSON5 fallback.
+ * braces), parsing each with `parseJson5Unique` — JSON5 only, duplicate keys
+ * rejected at insertion time. There is no `JSON.parse` fallback anywhere in
+ * this file any more; JSON is a subset of JSON5, so nothing that used to
+ * parse stops parsing, and there is no second success path that could ship
+ * a last-wins duplicate `JSON.parse` never told JSON5 about.
  *
  * Returns EVERY candidate that parsed, plus `hadUnrecoverableSpan` — true
  * when the text contains a `{` that either (a) never found a matching `}`,
- * or (b) DID balance but failed BOTH JSON.parse and JSON5.parse WHILE LOOKING
- * LIKE A GENUINE JSON-OBJECT ATTEMPT (`/^\{\s*"[^"\\]*"\s*:/` — starts with a
- * quoted key and a colon, e.g. `{"categories": …`), as opposed to incidental
- * prose punctuation (`{option A}`, `{finalized}`). That distinction matters:
- * a span that merely LOOKS like decorative prose braces is expected and
- * benign — it's exactly what "look INTO a failed span" below exists to see
- * past — but a span that opens like a real JSON object and then fails to
- * parse is evidence the reply itself is corrupted (e.g. an unescaped quote
- * inside a `findings` string breaks quote-tracking for everything after it),
- * and trusting whatever DID parse elsewhere in that same corrupted text is
+ * or (b) DID balance but failed to parse WHILE LOOKING LIKE A GENUINE
+ * JSON-OBJECT ATTEMPT (`/^\{\s*"[^"\\]*"\s*:/` — starts with a quoted key and
+ * a colon, e.g. `{"categories": …`), as opposed to incidental prose
+ * punctuation (`{option A}`, `{finalized}`). That distinction matters: a span
+ * that merely LOOKS like decorative prose braces is expected and benign —
+ * it's exactly what "look INTO a failed span" below exists to see past — but
+ * a span that opens like a real JSON object and then fails to parse is
+ * evidence the reply itself is corrupted (e.g. an unescaped quote inside a
+ * `findings` string breaks quote-tracking for everything after it), and
+ * trusting whatever DID parse elsewhere in that same corrupted text is
  * exactly how a real failing verdict can be shadowed by an accidentally
  * well-formed fragment nested inside it. Both conditions make the whole
- * salvage untrustworthy, not just the one span. A span that DID parse but
- * whose raw text has duplicate load-bearing keys is the same class: JSON.parse
- * / JSON5.parse already collapsed to last-wins, so the object is not a safe
- * candidate — it sets hadUnrecoverableSpan and is not pushed. Deliberately
- * does NOT pick a winner among the candidates that DID parse — see
- * pickSafestCandidate() below for why that decision needs to be verdict-aware
- * (money-safe), not a generic parsing heuristic.
+ * salvage untrustworthy, not just the one span.
+ *
+ * A span that parsed but stated a duplicate key sets BOTH
+ * `hadUnrecoverableSpan` and `hadDuplicate`, and — load-bearing — the scan
+ * resumes AFTER THE WHOLE SPAN (`i + span.length`), never by stepping into
+ * it (`i + 1`). Stepping in would let the scanner find the `{` of an INNER
+ * category object nested inside the duplicate span and unique-parse THAT on
+ * its own, handing back a "clean" fragment carved out of a reply this file
+ * has already decided is too corrupted to trust — turning a fail-closed
+ * unparseable verdict into a clever partial score. Skipping the span is what
+ * keeps a duplicate fail-closed as a whole, same as the top-level path.
+ *
+ * Deliberately does NOT pick a winner among the candidates that DID parse —
+ * see pickSafestCandidate() below for why that decision needs to be
+ * verdict-aware (money-safe), not a generic parsing heuristic. Each parsed
+ * span is expanded to every verdict-shaped node inside it via
+ * `collectVerdictShaped` before being added to `candidates`, so a fail
+ * nested under a wrapper key competes on equal footing with a pass at that
+ * span's root — the same tree-wide fail-wins the whole-document path uses.
  *
  * This is a LOCAL PORT of aiCreativeDirectorService.safeParseDirectorJSON's
  * scanning algorithm (the task's named closest fit), not an import of that
@@ -744,30 +679,32 @@ function salvageVerdictJson(rawText) {
   const text = String(rawText == null ? '' : rawText);
   const candidates = [];
   let hadUnrecoverableSpan = false;
+  let hadDuplicate = false;
   let i = text.indexOf('{');
   while (i >= 0) {
     const span = balancedSpanFrom(text, i);
     if (!span) { hadUnrecoverableSpan = true; i = text.indexOf('{', i + 1); continue; }
-    let obj;
-    let ok = true;
-    try { obj = JSON.parse(span); }
-    catch { try { obj = JSON5.parse(span); } catch { ok = false; } }
-    if (ok) {
-      if (hasDuplicateLoadBearingKeys(span)) {
-        // Span parsed, but JSON.parse/JSON5.parse already collapsed a
-        // duplicate load-bearing key. Do not push the last-wins object —
-        // that is the false-pass. The whole salvage is untrustworthy.
-        hadUnrecoverableSpan = true;
-      } else {
-        candidates.push(obj);
-      }
+    const r = parseJson5Unique(span);
+    if (r.duplicate) {
+      // Skip the WHOLE span (i + span.length), never step into it (i + 1) —
+      // see the header above: walking in would unique-parse the inner
+      // category objects on their own and defeat the fail-closed policy.
+      hadDuplicate = true;
+      hadUnrecoverableSpan = true;
+      i = text.indexOf('{', i + span.length);
+      continue;
+    }
+    if (r.ok) {
+      const nodes = collectVerdictShaped(r.value);
+      if (nodes.length) candidates.push(...nodes);
+      else candidates.push(r.value);
       i = text.indexOf('{', i + span.length);
     } else {
       if (LOOKS_LIKE_JSON_OBJECT_ATTEMPT.test(span)) hadUnrecoverableSpan = true;
       i = text.indexOf('{', i + 1);
     }
   }
-  return { candidates, hadUnrecoverableSpan };
+  return { candidates, hadUnrecoverableSpan, hadDuplicate };
 }
 
 /**
@@ -914,12 +851,33 @@ function scoreVerdictCategories(parsed) {
 }
 
 /**
+ * Did the model actually ATTEMPT this category — as opposed to a bare,
+ * empty `{}` skeleton that merely mentions the category name? `score` /
+ * `findings` / `pass` present (any of the three), or the category arriving
+ * as a boolean/null (scoreVerdictCategories' own bare-boolean/null handling
+ * still fails those, but they are an attempt, not an empty skeleton).
+ * `looksVerdictShaped` uses this instead of a bare key-presence check so a
+ * decoy like `{"categories":{"competitor_marks":{}}}` — no score, no
+ * findings, nothing — cannot win tree-wide fail-wins over a later genuine
+ * pass: it has nothing in it to fail on, it is just a shape that happens to
+ * mention a category name.
+ */
+function categoryIsAttempted(c) {
+  if (typeof c === 'boolean' || c === null) return true;
+  if (!c || typeof c !== 'object' || Array.isArray(c)) return false;
+  return Object.prototype.hasOwnProperty.call(c, 'score')
+      || Object.prototype.hasOwnProperty.call(c, 'findings')
+      || Object.prototype.hasOwnProperty.call(c, 'pass');
+}
+
+/**
  * Does `cand` look like it is TRYING to be a verdict object at all (as
  * opposed to an incidental balanced-brace span salvage picked up along the
  * way — an empty `{}`, a stray findings fragment, etc.)? An object
- * `categories` wrapper that actually CONTAINS at least one of the four
- * category names, OR at least one of those names sitting on the root.
- * An empty `categories: {}` is not verdict-shaped.
+ * `categories` wrapper that actually CONTAINS an ATTEMPTED category (see
+ * `categoryIsAttempted` above), OR an attempted category sitting on the
+ * root. An empty `categories: {}` — or a category present as `{}` with no
+ * score/findings/pass — is not verdict-shaped.
  */
 function looksVerdictShaped(cand) {
   if (!cand || typeof cand !== 'object' || Array.isArray(cand)) return false;
@@ -928,9 +886,38 @@ function looksVerdictShaped(cand) {
     // Empty `categories: {}` is NOT a verdict — it used to win fail-wins
     // over a later genuine pass and waste a regeneration (AA18's decoy is
     // `{}`, which never had a categories key, so it did not cover this).
-    if (CATEGORIES.some((k) => Object.prototype.hasOwnProperty.call(cats, k))) return true;
+    if (CATEGORIES.some((k) => categoryIsAttempted(cats[k]))) return true;
   }
-  return CATEGORIES.some((k) => cand[k] != null);
+  return CATEGORIES.some((k) => categoryIsAttempted(cand[k]));
+}
+
+/**
+ * Walk a parsed value's ENTIRE tree — not just its top level — collecting
+ * every node that `looksVerdictShaped`. This is what makes fail-wins apply
+ * to a fail nested under an arbitrary wrapper key (e.g. `{draft:{...FAIL},
+ * categories:{...PASS}}`), not only to multiple top-level salvage spans:
+ * before this, a single successful JSON5 parse handed `parseVerdict` exactly
+ * one object, and a failing verdict tucked inside any wrapper key was simply
+ * never looked at.
+ *
+ * Cycle-safe (a `seen` Set of visited object/array references — JSON5 output
+ * cannot self-reference, but this also runs on whole-document candidates,
+ * not just fresh JSON5 output, so the guard is cheap insurance) and does not
+ * stop at the first hit: a node that itself looks verdict-shaped is still
+ * walked INTO, in case it also nests another one (a wrapper that is itself
+ * shaped like a verdict AND contains a further-nested one).
+ */
+function collectVerdictShaped(node, out = [], seen = new Set()) {
+  if (!node || typeof node !== 'object') return out;
+  if (seen.has(node)) return out;
+  seen.add(node);
+  if (Array.isArray(node)) {
+    for (const x of node) collectVerdictShaped(x, out, seen);
+    return out;
+  }
+  if (looksVerdictShaped(node)) out.push(node);
+  for (const v of Object.values(node)) collectVerdictShaped(v, out, seen);
+  return out;
 }
 
 /**
@@ -990,12 +977,35 @@ function pickSafestCandidate(candidates) {
  * for how ambiguity between multiple salvaged candidates is resolved
  * (toward failure, never toward a guessed pass).
  *
- * Duplicate load-bearing keys inside ONE object never reach salvage:
- * JSON.parse succeeds (last-wins) and pickSafestCandidate never sees both
- * values. hasDuplicateLoadBearingKeys() inspects the raw text and fail-closes
- * that reply as unparseable — we do not reconstruct and pick the failing
- * restatement. A false FAIL costs one static regeneration; a false PASS
- * ships a defective ad.
+ * STRINGS ONLY — a non-string `raw` is REJECTED, not "applied the same
+ * guarantee to". A JS object cannot express a duplicate key by construction
+ * (the object literal that built it, or `JSON.parse`, already collapsed one
+ * before this function ever saw it) — there is no text left to inspect, so
+ * there is nothing this function could recover. Production only ever calls
+ * this with `message.content`, a string, from both live call sites; a raw
+ * object here means a caller (or a test) handed in something already run
+ * through a decoder this file does not control, which is exactly the shape
+ * of the bypass this rejection closes — see the residuals note below.
+ *
+ * JSON5 IS THE ONLY DOCUMENT PARSER — `JSON.parse` is never called on the
+ * whole document (or on a salvage span; see `salvageVerdictJson`). JSON is a
+ * subset of JSON5, so nothing that used to parse stops parsing. A duplicate
+ * key is rejected the instant JSON5's own parser inserts it a second time
+ * onto the SAME object (`parseJson5Unique`'s header explains why an
+ * insertion-time hook cannot drift the way a second text scanner did across
+ * three rounds) — every key counts, not an allowlist, so `score` (round 3's
+ * blocker) and any future key are covered by construction, not by adding a
+ * name to a list.
+ *
+ * TREE-WIDE FAIL-WINS, not just top-level spans. After a unique whole-document
+ * parse, `collectVerdictShaped` walks the ENTIRE parsed tree — not only its
+ * root — and every node that looks like an attempted verdict competes through
+ * `pickSafestCandidate`, the same money-safe selection multi-span salvage
+ * already used. This is what stops a reply that states a real failing verdict
+ * nested under some wrapper key (`draft`, an "earlier attempt", anything) next
+ * to a passing one at the root: before this fix, a single successful parse
+ * handed the whole object straight to `scoreVerdictCategories`, and only the
+ * ROOT's shape was ever read — a nested fail was invisible.
  *
  * `hadUnrecoverableSpan` (from salvageVerdictJson) forces the whole reply to
  * fail closed even when SOME span did parse: a truncated second JSON value,
@@ -1004,44 +1014,72 @@ function pickSafestCandidate(candidates) {
  * the reply is too corrupted to trust confidently, and the safe response to
  * "we don't know what the rest of this says" is the same fail-closed the
  * pre-salvage "not JSON" branch already used — never "trust whatever
- * happened to parse".
+ * happened to parse". `hadDuplicate` (also from salvage) routes through the
+ * exact same `failClosedDuplicateKeys()` the whole-document path uses, so a
+ * duplicate found only inside one salvage span still reports as a duplicate,
+ * not a generic "was not JSON".
+ *
+ * RESIDUALS, stated rather than papered over (see the draft's residuals
+ * section for the full list): (1) a duplicate NON-scoring key (two
+ * `summary`s on an otherwise-passing verdict) now fails closed too — stricter
+ * than the old allowlist, and accepted, because a false FAIL costs one
+ * regeneration and a false PASS ships a defect. (2) The hook site is JSON5
+ * 2.2.3's own `Object.defineProperty(parent, key, …)` call
+ * (`node_modules/json5/lib/parse.js`) — if a future JSON5 version assigns
+ * keys a different way, this hook goes silent; `AA36` below pins the call
+ * shape existing, and `AA28` pins the actual duplicate-`score` behavior, so a
+ * silent hook fails the behavioral pin even if the structural one is missed.
+ * (3) JSON5 is more permissive than `JSON.parse` (trailing commas, unquoted
+ * keys, single quotes, comments, hex numbers, `Infinity`) — `clampScore`
+ * already maps every non-finite score to 0, so none of that new leniency can
+ * turn into a guessed pass; see AA-series checks (k) for the explicit proof.
  */
 function parseVerdict(raw) {
-  let parsed = raw;
-  if (typeof raw === 'string') {
-    const cleaned = String(raw).replace(/^\s*```(?:json)?\s*/i, '').replace(/```\s*$/, '');
-    const duplicateKeys = hasDuplicateLoadBearingKeys(cleaned);
-    try {
-      parsed = JSON.parse(cleaned);
-      // JSON.parse succeeded — including the duplicate-key last-wins case
-      // that never throws. If the raw text stated two values for a
-      // load-bearing key, discard the collapsed object.
-      if (duplicateKeys) return failClosedDuplicateKeys();
-    } catch (err) {
-      // JSON5 / prose path. Same raw-text duplicate check: JSON5.parse
-      // also last-wins, and salvage would otherwise push that object.
-      if (duplicateKeys) return failClosedDuplicateKeys();
-      const { candidates, hadUnrecoverableSpan } = salvageVerdictJson(cleaned);
-      const chosen = hadUnrecoverableSpan ? null : pickSafestCandidate(candidates);
-      if (chosen && typeof chosen === 'object') {
-        parsed = chosen;
-      } else {
-        return {
-          pass: false,
-          parseError: err.message,
-          categories: emptyCategories('vision response was not JSON'),
-          summary: 'parse failure — treating as QC fail (safe default)',
-          findings: ['vision response was not JSON']
-        };
-      }
-    }
+  if (typeof raw !== 'string') {
+    // A JS object cannot state a duplicate key — whatever decoded it (a
+    // JSON.parse call this file does not control, an object literal) already
+    // collapsed one before this function ever saw it. "Apply the same
+    // guarantee" cannot recover a key JSON.parse already threw away, so this
+    // is a hard reject, not a silent pass-through to the scorer.
+    const reason = 'vision response was not a string';
+    return {
+      pass: false,
+      parseError: reason,
+      categories: emptyCategories(reason),
+      summary: 'parse failure — treating as QC fail (safe default)',
+      findings: [reason]
+    };
   }
 
-  const { categories, pass, findings } = scoreVerdictCategories(parsed);
+  const cleaned = String(raw).replace(/^\s*```(?:json)?\s*/i, '').replace(/```\s*$/, '');
+  const whole = parseJson5Unique(cleaned);
+  if (whole.duplicate) return failClosedDuplicateKeys();
+
+  let chosen = null;
+  if (whole.ok) {
+    const nodes = collectVerdictShaped(whole.value);
+    chosen = pickSafestCandidate(nodes.length ? nodes : [whole.value]);
+  } else {
+    const salvaged = salvageVerdictJson(cleaned);
+    if (salvaged.hadDuplicate) return failClosedDuplicateKeys();
+    chosen = salvaged.hadUnrecoverableSpan ? null : pickSafestCandidate(salvaged.candidates);
+  }
+
+  if (!chosen || typeof chosen !== 'object') {
+    return {
+      pass: false,
+      parseError: (whole.error && whole.error.message) || 'vision response was not JSON',
+      categories: emptyCategories('vision response was not JSON'),
+      summary: 'parse failure — treating as QC fail (safe default)',
+      findings: ['vision response was not JSON']
+    };
+  }
+
+  const { categories, pass, findings } = scoreVerdictCategories(chosen);
   return {
     pass,
     categories,
-    summary: String(parsed?.summary || (pass ? 'pass' : 'fail')).slice(0, 500),
+    summary: String(chosen?.summary || (pass ? 'pass' : 'fail')).slice(0, 500),
     findings,
     parseError: null
   };
