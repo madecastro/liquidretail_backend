@@ -68,8 +68,28 @@ it clears it back to this placeholder in the same commit that closes it out.)_
 
 *(Replace this whole section, don't append to it, when it goes stale.)*
 
+- **UNATTENDED E2E LOOP, 2026-08-21 (this entry): `main` is at `8fc602d6`
+  (#303).** PR #303 reverts `REMOTION_QUEUE_CONCURRENCY` 8→4 — the 4→8 raise in
+  #274 was owner-approved *contingent on* being validated against the web-service
+  memory graph on a full run, that validation ran, and 8 OOM-killed the web
+  process at its 8Gi limit (0.33 → 7.57 GiB in two minutes; ~0.9 GiB per
+  concurrent Remotion slot). Deployed and confirmed live; same workload now peaks
+  at 3.38 GiB. 174/174 verify scripts pass. `VEO_CONCURRENCY` deliberately left
+  at 24. **Recovery from that OOM was flawless and needs no work** — 12/12 ads
+  re-titled free, run reconciled to `done · succeeded 12`, zero re-spend; read
+  the entry before "fixing" the reaper or the resume window. **Video vision QC is
+  now validated end-to-end in production for the first time** (12 real verdicts,
+  ~$0.025 each, 3 pass / 9 fail). **NEW, NOT FIXED:** the 9:16 generative reframe
+  (`nano-banana-2/edit`, no mask, re-synthesises the whole canvas with no pixel
+  paste-back) is **recolouring brand logos before Omni runs** — Pelagic's marlin
+  measured teal `(96,156,168)` → navy `(12,60,96)`, L1 252, which vision QC then
+  independently reported and failed 5 ads for. Full detail, the three ranked fix
+  options, and two schema traps that will otherwise mislead you:
+  `session.d/2026-08-21_oom-titling-loop-and-reframe-recolour.md`.
+  *(This section is append-not-replace here on purpose: the bullets below are
+  other sessions' live state and I could not establish they are stale.)*
 - Trunk `main` is moving fast — always `git fetch` before trusting a SHA here.
-  As of this update, `main` is at `9534502a` (#275, reverts the Meta video
+  As of an earlier update, `main` was at `9534502a` (#275, reverts the Meta video
   prompt hook-first standardization back to pre-standardization text and
   applies the same text to PMax), with #274, #273, #272, #271, #268 merged
   just before it. #260-through-#265 (vision-qc silent gate, typeface
