@@ -46,11 +46,25 @@ needs an owner decision on approach first.
 The peer corrected `docs/AGENT.md`, which previously framed `confirmations[]` as "the SOLE
 source of authorisation" — that misconception is what produced this bug class.
 
+📌 **USE THE NOTE, NOT THIS SUMMARY, FOR LINE NUMBERS.**
+`session.d/2026-08-21_agent-confirmations-are-not-authorization.md` on branch
+`fix/agent-capability-team-authz` @ `8980e5c2` is authoritative: the peer re-verified every
+line number individually and **found two of its own earlier citations wrong** (`:517`→`:512`
+for `clientMessages`, `:540`→`:539` for the model loop). The note also carries three
+directional options (server-side proposal record / HMAC-signed proposal / accept it as UX-only
+and push authz into executors), explicitly flagged as NOT a recommendation.
+
+**One narrowing worth keeping, from the peer:** the replay path only fires when
+`confirmations` is non-empty, so a caller must supply the id **and** a matching `role:'tool'`
+stub. That is trivially satisfiable, so the conclusion stands — but it is not "no LLM
+involvement is ever needed", and the note deliberately does not overstate it. The genuine bug
+is that a **model-facing** control was reasoned about as a **caller-facing** one.
+
 ---
 
-## 2. Peer session work AT RISK OF LOSS
+## 2. Peer session work — CORRECTED: NOT at risk of loss (I was wrong)
 
-Branch `fix/agent-capability-team-authz` @ **`5f411615`** — the sibling fix for the
+Branch `fix/agent-capability-team-authz` @ **`8980e5c2`** (fix at `5f411615`, plus a `session.d/` write-up of the §1 finding at `8980e5c2`) — the sibling fix for the
 capability-executor bypass (§5.1 item 2 of the main handoff). Contents: a new
 `services/capabilityExecutors/_teamAuthzCommon.js` that **imports** `canActOnRole` /
 `canGrantRole` from the members middleware (zero rank logic of its own, with a harness check
@@ -58,11 +72,34 @@ asserting it declares none and cross-checking all 16 caller/target pairs), the f
 enforcing the same matrix, and `scripts/verifyAgentTeamCapabilityAuthz.js` (33 checks, 8
 behavioural revert-proofs).
 
-⚠️ **It exists ONLY at `/private/tmp/claude-502/.../wt-agent-authz`, which macOS clears on
-reboot.** That session's user instructed it not to push, and it correctly refused my request
-to — a peer cannot authorize what another user forbade. **Ask the owner to green-light a push
-to a clearly-labelled unmerged branch.** Four such near-losses already happened on this
-project.
+⚠️ **CORRECTION — my original claim here was WRONG and I verified the correction myself.**
+I wrote that this work "exists ONLY at `/private/tmp/.../wt-agent-authz`, which macOS clears on
+reboot" and called it time-sensitive. **That is not true, and the peer session was right to
+push back on it.** Verified directly:
+
+```
+git -C liquidretail_backend rev-parse fix/agent-capability-team-authz  -> 8980e5c2
+git -C liquidretail_backend cat-file -t 5f411615                       -> commit
+ls .git/refs/heads/fix/agent-capability-team-authz                     -> real 41-byte file
+cat <worktree>/.git  -> "gitdir: .../liquidretail_backend/.git/worktrees/wt-agent-authz"
+```
+
+**A linked worktree stores no objects and no refs of its own.** Its `.git` is a *file*
+pointing back at the main repo, so both commits and the branch ref live on the persistent
+`/Volumes/Sayulita` volume. A `/private/tmp` wipe destroys the **working-tree checkout only**,
+fully reconstructible with `git worktree add <path> fix/agent-capability-team-authz`, and the
+branch ref keeps the objects alive against gc.
+
+**The generalisable lesson, because I conflated two different failure modes:** the four earlier
+near-losses on this project were **uncommitted working-tree state** — that genuinely dies with a
+wipe, and it is exactly what I found and preserved three times in other worktrees tonight. **A
+commit on a branch is not the same thing.** Do not treat "it's in a /private/tmp worktree" as a
+loss risk once the work is committed; check `git rev-parse <branch>` from the main repo first.
+
+Pushing is still worth doing for **visibility** and so a fresh orchestrator can see it — but
+that is a discoverability argument, not a preservation one. That session's user instructed it
+not to push and it correctly refused my request; a peer cannot authorize what another user
+forbade, so this remains the owner's call on accurate facts.
 
 **One design constraint from it, worth preserving:** the executor gates sit **after** shape
 validation but **before** any membership lookup. That is deliberate — validation touches no
