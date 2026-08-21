@@ -87,8 +87,15 @@ it clears it back to this placeholder in the same commit that closes it out.)_
   (or `routes/ads.js`, `"ads"`) alone can report "nothing to run" and exit 0
   while dependent scripts never run. Use plain `npm test` (full suite) until
   this is fixed.
-- **Newer backend session (2026-08-20): PR #279, open, not self-merged** —
-  `fix/run-counter-desync-and-render-resilience`. Owner-flagged: two runs
+- **Newer backend session (2026-08-20): PR #279 + fast-follow #280, both
+  MERGED** — `fix/run-counter-desync-and-render-resilience` +
+  `fix/run-counter-titling-truth-compat`. #279 merged while #278 was
+  concurrently in flight; the two didn't textually conflict but #278 changed
+  `classifyRunAdOutcome`'s semantics (titling-truth awareness) in a way
+  #279's two new call sites weren't written against — #280 closed that gap
+  moments later (wide Ad projection + `!isSettled && !needsRetry` guard).
+  Both PRs' 33-check harness state and 182/182 full-suite pass are current on
+  `main` as of this note. Owner-flagged: two runs
   (brian@egami.tv) stuck at `status:'failed', succeeded:18, total:39` while
   all 39 claimed Ads were genuinely `draft` with a real `renderUrl` (confirmed
   against prod via a read-only query). Root cause: PR #272's Ad-truth
