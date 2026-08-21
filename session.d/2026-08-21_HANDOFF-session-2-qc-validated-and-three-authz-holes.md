@@ -10,6 +10,13 @@ Session ended on the owner's request to restart, mid-flight, with several agents
 
 ---
 
+## ⚠️ THERE IS AN ADDENDUM — READ IT
+`session.d/2026-08-21_HANDOFF-addendum-2-fourth-authz-hole-and-gate-cleanup.md` records what
+happened after this file was written: a **FOURTH authz hole that outranks the privesc below**
+(any authenticated caller can trigger `ad.delete` — an irreversible Cloudinary destroy — or
+`ads.publishToMeta`, an external publish), a production SystemConfig write that is already
+done, three completed branches, and four more owner decisions. Read it before acting on §5.1.
+
 ## 0. READ ORDER
 
 1. `session.d/2026-08-21_HANDOFF-account-switch.md` — the master handoff. Still accurate
