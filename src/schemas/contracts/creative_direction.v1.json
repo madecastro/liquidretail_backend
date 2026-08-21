@@ -1,0 +1,145 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://reach-social.app/contracts/creative_direction.v1.json",
+  "title": "AI Creative Director Output (v1)",
+  "description": "Strategy + concept emission from the Director stage. No coordinates. Cached per (brandId, productId, campaignKind, creativeIntent || null).",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "contract_type", "version", "cache_key", "input_summary",
+    "available_archetypes", "available_component_roles", "creative_rules",
+    "concepts"
+  ],
+  "properties": {
+    "contract_type": { "type": "string", "const": "creative_direction" },
+    "version":       { "type": "string", "const": "1.0" },
+    "cache_key": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["brandId", "productId", "campaignKind", "creativeIntent"],
+      "properties": {
+        "brandId":        { "type": "string" },
+        "productId":      { "type": ["string", "null"] },
+        "campaignKind":   { "type": ["string", "null"], "enum": ["product", "brand", "promotional", null] },
+        "creativeIntent": { "type": ["string", "null"] }
+      }
+    },
+    "input_summary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["brand_signal", "product_signal", "ugc_signal", "social_proof_signal", "performance_signal"],
+      "properties": {
+        "brand_signal": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["name", "tone", "primary_color", "secondary_color"],
+          "properties": {
+            "name":            { "type": "string" },
+            "tone":            { "type": "array", "items": { "type": "string" } },
+            "primary_color":   { "type": ["string", "null"] },
+            "secondary_color": { "type": ["string", "null"] }
+          }
+        },
+        "product_signal": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["name", "category", "priority"],
+          "properties": {
+            "name":     { "type": ["string", "null"] },
+            "category": { "type": ["string", "null"] },
+            "priority": { "type": "string", "enum": ["high", "medium", "low", "absent"] }
+          }
+        },
+        "ugc_signal": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["platform", "media_strength", "rights_approved"],
+          "properties": {
+            "platform":        { "type": ["string", "null"] },
+            "media_strength":  { "type": "string", "enum": ["high", "medium", "low", "absent"] },
+            "rights_approved": { "type": ["boolean", "null"] }
+          }
+        },
+        "social_proof_signal": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["has_primary_quote", "has_top_comments", "has_rating", "strongest_signal"],
+          "properties": {
+            "has_primary_quote": { "type": "boolean" },
+            "has_top_comments":  { "type": "boolean" },
+            "has_rating":        { "type": "boolean" },
+            "strongest_signal":  { "type": ["string", "null"], "enum": ["testimonial", "stat", "creator", "review", "rating", null] }
+          }
+        },
+        "performance_signal": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["likes", "comments", "strength"],
+          "properties": {
+            "likes":    { "type": ["integer", "null"], "minimum": 0 },
+            "comments": { "type": ["integer", "null"], "minimum": 0 },
+            "strength": { "type": "string", "enum": ["high", "medium", "low", "absent"] }
+          }
+        }
+      }
+    },
+    "available_archetypes": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "Locked enum of archetypes the Director can pick from. Generator must materialize one of these per concept."
+    },
+    "available_component_roles": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "Locked role enum (see aiVocabulary.ROLES)."
+    },
+    "creative_rules": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["do_not_generate_coordinates", "produce_distinct_concepts", "prioritize_strongest_signal", "avoid_repeating_same_archetype"],
+      "properties": {
+        "do_not_generate_coordinates":   { "type": "boolean", "const": true },
+        "produce_distinct_concepts":     { "type": "boolean" },
+        "prioritize_strongest_signal":   { "type": "boolean" },
+        "avoid_repeating_same_archetype":{ "type": "boolean" }
+      }
+    },
+    "concepts": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 5,
+      "items":   { "$ref": "#/definitions/concept" }
+    }
+  },
+  "definitions": {
+    "concept": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "concept_id", "name", "archetype", "layout_family",
+        "emotional_hook", "social_proof_type",
+        "product_priority", "ugc_priority", "comment_priority", "stat_priority", "cta_emphasis",
+        "recommended_components", "rationale"
+      ],
+      "properties": {
+        "concept_id":      { "type": "string" },
+        "name":            { "type": "string" },
+        "archetype":       { "type": "string" },
+        "layout_family":   { "type": "string" },
+        "emotional_hook":  { "type": "string" },
+        "social_proof_type":{ "type": "string" },
+        "product_priority":{ "type": "string", "enum": ["high", "medium", "low", "absent"] },
+        "ugc_priority":    { "type": "string", "enum": ["high", "medium", "low", "absent"] },
+        "comment_priority":{ "type": "string", "enum": ["high", "medium", "low", "absent"] },
+        "stat_priority":   { "type": "string", "enum": ["high", "medium", "low", "absent"] },
+        "cta_emphasis":    { "type": "string", "enum": ["primary", "secondary", "minimal", "absent"] },
+        "recommended_components": {
+          "type": "object",
+          "description": "Map of role → component_style. Generator MAY override if constraints demand.",
+          "additionalProperties": { "type": "string" }
+        },
+        "rationale":       { "type": "string", "maxLength": 600 }
+      }
+    }
+  }
+}

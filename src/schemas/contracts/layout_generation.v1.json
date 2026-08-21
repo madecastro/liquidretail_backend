@@ -1,0 +1,182 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://reach-social.app/contracts/layout_generation.v1.json",
+  "title": "AI Layout Generator Output (v1)",
+  "description": "Renderer-safe canvas spec. References a concept_id from the Director output. Cached per (concept_id, canvas_dims, paletteSource, mediaId, variantKind).",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "contract_type", "version", "cache_key",
+    "canvas", "creative_direction", "hierarchy_spec", "creative_style",
+    "style_bindings", "zones",
+    "elements_used", "elements_skipped", "rationale"
+  ],
+  "properties": {
+    "contract_type": { "type": "string", "const": "layout_generation" },
+    "version":       { "type": "string", "const": "1.0" },
+    "cache_key": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["conceptId", "mediaId", "aspectRatio", "variantKind", "paletteSource"],
+      "properties": {
+        "conceptId":     { "type": "string" },
+        "mediaId":       { "type": "string" },
+        "aspectRatio":   { "type": "string" },
+        "variantKind":   { "type": ["string", "null"], "enum": ["ugc", "product_image", null] },
+        "paletteSource": { "type": "string", "enum": ["media", "brand"] }
+      }
+    },
+    "canvas": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["width", "height", "aspect_ratio"],
+      "properties": {
+        "width":        { "type": "integer", "minimum": 1 },
+        "height":       { "type": "integer", "minimum": 1 },
+        "aspect_ratio": { "type": "string" }
+      }
+    },
+    "creative_direction": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["concept_id", "name", "archetype", "layout_family"],
+      "properties": {
+        "concept_id":    { "type": "string" },
+        "name":          { "type": "string" },
+        "archetype":     { "type": "string" },
+        "layout_family": { "type": "string" }
+      }
+    },
+    "hierarchy_spec": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["strategy", "layout"],
+      "properties": {
+        "strategy": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["emotional_hook", "social_proof_type", "product_priority", "ugc_priority", "comment_priority", "stat_priority", "cta_emphasis"],
+          "properties": {
+            "emotional_hook":   { "type": "string" },
+            "social_proof_type":{ "type": "string" },
+            "product_priority": { "type": "string" },
+            "ugc_priority":     { "type": "string" },
+            "comment_priority": { "type": "string" },
+            "stat_priority":    { "type": "string" },
+            "cta_emphasis":     { "type": "string" }
+          }
+        },
+        "layout": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["layout_family", "visual_direction"],
+          "properties": {
+            "layout_family":    { "type": "string" },
+            "visual_direction": { "$ref": "#/definitions/visualDirection" }
+          }
+        }
+      }
+    },
+    "creative_style": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "palette_strategy", "surface_strategy", "component_style_strategy"],
+      "properties": {
+        "name":                     { "type": "string" },
+        "palette_strategy":         { "type": "string" },
+        "surface_strategy":         { "type": "string" },
+        "component_style_strategy": { "type": "string" }
+      }
+    },
+    "style_bindings": {
+      "type": "object",
+      "description": "Flat name → value map. Values can be `#hex`, `brand.*` paths, `rgba(...)`, or `linear-gradient(...)`. Resolver passes through any CSS-literal-shaped string.",
+      "additionalProperties": { "type": ["string", "null"] }
+    },
+    "zones": {
+      "type": "array",
+      "minItems": 1,
+      "items":   { "$ref": "#/definitions/zone" }
+    },
+    "elements_used":    { "type": "array", "items": { "type": "string" } },
+    "elements_skipped": { "type": "array", "items": { "type": "string" } },
+    "rationale":        { "type": "string", "maxLength": 800 }
+  },
+  "definitions": {
+    "rect": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["x", "y", "w", "h"],
+      "properties": {
+        "x": { "type": "integer", "minimum": 0 },
+        "y": { "type": "integer", "minimum": 0 },
+        "w": { "type": "integer", "minimum": 1 },
+        "h": { "type": "integer", "minimum": 1 }
+      }
+    },
+    "point": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["x", "y"],
+      "properties": {
+        "x": { "type": "integer", "minimum": 0 },
+        "y": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "visualDirection": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["density", "visual_energy", "contrast", "corner_radius", "shadow_depth", "glass_level"],
+      "properties": {
+        "density":        { "type": ["string", "null"] },
+        "visual_energy":  { "type": ["string", "null"] },
+        "contrast":       { "type": ["string", "null"] },
+        "corner_radius":  { "type": ["string", "null"] },
+        "shadow_depth":   { "type": ["string", "null"] },
+        "glass_level":    { "type": ["string", "null"] }
+      }
+    },
+    "zone": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id", "kind", "role", "component_style", "layer", "slot", "rect",
+        "fit", "zone_scaler", "visual_direction", "clipPolygon"
+      ],
+      "properties": {
+        "id":               { "type": "string" },
+        "kind":             { "type": "string", "description": "v1: equals role" },
+        "role":             { "type": "string", "description": "Locked enum from aiVocabulary.ROLES" },
+        "component_style":  { "type": ["string", "null"], "description": "Variant from COMPONENT_STYLE_BY_ROLE[role]" },
+        "layer":            { "type": "integer", "minimum": 0, "description": "Numeric z-index. 0 = back." },
+        "slot": {
+          "anyOf": [
+            { "type": "string" },
+            { "type": "array", "items": { "type": "string" } },
+            { "type": "null" }
+          ]
+        },
+        "rect":             { "$ref": "#/definitions/rect" },
+        "fit":              { "type": ["string", "null"], "enum": ["cover", "contain", "subject_preserve", null] },
+        "zone_scaler":      { "type": ["number", "null"], "minimum": 0.5, "maximum": 3.0 },
+        "visual_direction": {
+          "anyOf": [
+            { "type": "null" },
+            { "$ref": "#/definitions/visualDirection" }
+          ]
+        },
+        "clipPolygon": {
+          "anyOf": [
+            { "type": "null" },
+            {
+              "type": "array",
+              "minItems": 3,
+              "maxItems": 16,
+              "items": { "$ref": "#/definitions/point" }
+            }
+          ]
+        }
+      }
+    }
+  }
+}

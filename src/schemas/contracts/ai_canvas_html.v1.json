@@ -1,0 +1,107 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://reach-social.app/contracts/ai_canvas_html.v1.json",
+  "title": "AI Layout Generator HTML Output (v1)",
+  "description": "HTML envelope contract — the response_format the Generator's LLM emits when outputKind='html'. Replaces the JSON-zones canvas spec for the HTML rendering path. The renderer feeds `html` directly to Puppeteer's page.setContent; the image-ref shadow may use the rendered HTML bitmap as a seed for gpt-image-1.edit. Sibling contract to layout_generation.v1.json (JSON-zones path).",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "contract_type", "version",
+    "html", "rationale", "creative_style", "color_palette",
+    "elements_used", "elements_skipped", "hierarchy_spec"
+  ],
+  "properties": {
+    "contract_type": { "type": "string", "const": "ai_canvas_html" },
+    "version":       { "type": "string", "const": "1.0" },
+
+    "html": {
+      "type": "string",
+      "minLength": 200,
+      "maxLength": 30000,
+      "description": "Complete self-contained HTML document. MUST include <html>, <head>, <body>. Inline <style> ONLY — no <link rel='stylesheet'>. NO <script>. Fixed viewport via inline width/height on <body>. All image src URLs MUST come from the supplied crop maps verbatim — no placeholders like {{...}}."
+    },
+
+    "css_extracted": {
+      "type": "string",
+      "default": "",
+      "description": "OPTIONAL — when the LLM separates CSS from HTML, the standalone CSS block. Usually empty (style stays inline in html). Renderer concatenates this with html when present."
+    },
+
+    "rationale": {
+      "type": "string",
+      "minLength": 20,
+      "description": "1-3 sentences explaining WHY this composition serves the Director's concept. Must reference the concept's archetype + emotional_hook + at least one signal that drove the call."
+    },
+
+    "creative_style": {
+      "type": "string",
+      "enum": ["brand_led", "ugc_led", "social_proof_led", "editorial", "promotional"],
+      "description": "Echoes back the creative_style the operator picked. Lets the Judge sanity-check no drift."
+    },
+
+    "color_palette": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "pattern": "^#[A-Fa-f0-9]{6}$"
+      },
+      "minItems": 2,
+      "maxItems": 5,
+      "description": "The 2-5 hex colors the LLM picked for this composition. Validator uses this for contrast checks; spec preview displays it as a swatch row."
+    },
+
+    "elements_used": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "Roles/components actually rendered in the HTML (e.g. 'hero_media', 'headline', 'cta', 'quote_card')."
+    },
+
+    "elements_skipped": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "Roles intentionally OMITTED with rationale (e.g. 'price — out of stock, suppressed'). Empty array allowed."
+    },
+
+    "hierarchy_spec": {
+      "type": "object",
+      "additionalProperties": true,
+      "description": "Strategy mirror — same shape as the JSON-spec path's hierarchy_spec (strategy + layout). Lets the Judge score strategy_fit + hierarchy_consistency without parsing HTML. Required so the Pre-Judge proof-strategy filter still works.",
+      "properties": {
+        "strategy": {
+          "type": "object",
+          "properties": {
+            "archetype":           { "type": "string" },
+            "layout_family":       { "type": "string" },
+            "emotional_hook":      { "type": "string" },
+            "social_proof_type":   { "type": "string" },
+            "product_priority":    { "type": "string" },
+            "ugc_priority":        { "type": "string" },
+            "comment_priority":    { "type": "string" },
+            "stat_priority":       { "type": "string" },
+            "cta_emphasis":        { "type": "string" }
+          }
+        },
+        "layout": {
+          "type": "object",
+          "properties": {
+            "layout_family":     { "type": "string" },
+            "visual_direction":  { "type": "object", "additionalProperties": true },
+            "zones": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "properties": {
+                  "role":            { "type": "string" },
+                  "priority":        { "type": "string" },
+                  "anchor":          { "type": "string" },
+                  "weight":          { "type": "number" },
+                  "component_style": { "type": "string" }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}

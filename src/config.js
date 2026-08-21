@@ -4,7 +4,13 @@
 // reads from this object, never process.env directly — one place to
 // audit for env access.
 
-require('dotenv').config();
+// Two-tier env load, mirroring backend's index.js: process env wins (Render
+// dashboard secrets), .env supplements for local dev, config/defaults.env
+// provides non-secret defaults for every knob the copied services read.
+// dotenv is called without `override:true` so process.env stays highest
+// precedence (Render secrets shadow the file).
+require('dotenv').config();                                    // .env
+require('dotenv').config({ path: 'config/defaults.env' });     // committed defaults
 const crypto = require('crypto');
 
 const ROLE = String(process.env.ADGEN_ROLE || '').toLowerCase();
