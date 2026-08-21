@@ -11,7 +11,11 @@
  *   - all four categories appear in the verdict shape
  *   - with the feature flag off, NO vision call and NO regeneration
  *
- * No DB, no network, no API key. Safe in CI.
+ * No DB, no network, no API key. Safe in CI. E2 no-ops
+ * systemConfigService.refreshAdVisionQcEnabledCache so the real
+ * isEnabled() cannot kick off SystemConfig.findOne (Mongoose would
+ * buffer ~10s against a missing connection); the check still reads
+ * the env var through the real sync gate.
  *   node scripts/verifyAdVisionQc.js
  *
  * Revert-proof notes live next to each group: if that production code is
@@ -382,13 +386,23 @@ check('B4 judgeRender payload carries visionImages:2 meta (ledger)', async () =>
   });
 
   await checkAsync('E2 isEnabled() reads AD_VISION_QC_ENABLED', () => {
-    delete process.env.AD_VISION_QC_ENABLED;
-    assert.strictEqual(qc.isEnabled(), false);
-    process.env.AD_VISION_QC_ENABLED = 'true';
-    assert.strictEqual(qc.isEnabled(), true);
-    process.env.AD_VISION_QC_ENABLED = 'false';
-    assert.strictEqual(qc.isEnabled(), false);
-    delete process.env.AD_VISION_QC_ENABLED;
+    const cfg = require('../services/systemConfigService');
+    const origRefresh = cfg.refreshAdVisionQcEnabledCache;
+    // Fire-and-forget SystemConfig.findOne — not what E2 asserts.
+    // Peek stays cold (undefined) so isEnabled() falls through to
+    // envEnabled(), which is the contract this check pins.
+    cfg.refreshAdVisionQcEnabledCache = () => {};
+    try {
+      delete process.env.AD_VISION_QC_ENABLED;
+      assert.strictEqual(qc.isEnabled(), false);
+      process.env.AD_VISION_QC_ENABLED = 'true';
+      assert.strictEqual(qc.isEnabled(), true);
+      process.env.AD_VISION_QC_ENABLED = 'false';
+      assert.strictEqual(qc.isEnabled(), false);
+      delete process.env.AD_VISION_QC_ENABLED;
+    } finally {
+      cfg.refreshAdVisionQcEnabledCache = origRefresh;
+    }
   });
 
   // ── F. Model role is real (not invented) ───────────────────────────

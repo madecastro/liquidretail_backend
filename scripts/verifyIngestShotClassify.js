@@ -17,7 +17,11 @@
  *
  * Offline: no DB, no network, no API keys, no real DNS. Fetcher + DNS
  * lookup are stubbed; images are synthesized with sharp. The hung-DNS
- * test exercises real safeFetchBuffer + AbortSignal deadline.
+ * test exercises real safeFetchBuffer + AbortSignal deadline. I-section
+ * writers also stub Brand.findOneAndUpdate, Category.findOneAndUpdate
+ * (categoryClassifier destructures findOrCreateCategoryTree at load, so
+ * stubbing the model method is the one that actually intercepts), and
+ * startCatalogMaterializeDrain (fire-and-forget OperationRun.findOne).
  *
  *   node scripts/verifyIngestShotClassify.js
  *
@@ -1145,11 +1149,20 @@ async function main() {
   // Drive each real writer and assert: (a) every product is upserted BEFORE
   // any classify fetch; (b) beginClassifyPhase fires only after the upsert
   // loop. Session-level batch/cancel/cache checks stay below.
+  // Sibling stubs that look redundant and are not: Brand.findOneAndUpdate
+  // (websiteUrl back-fill, fire-and-forget) and Category.findOneAndUpdate
+  // (stampFeedTruthCategoryRef → findOrCreateCategoryTree bound at
+  // categoryClassifier load — Category.findOrCreateCategoryTree on the
+  // model is not the function that runs). startCatalogMaterializeDrain
+  // is the post-ingest OperationRun.findOne; stub the service method,
+  // not OperationRun.findOne, or a fast findOne lets drain proceed into
+  // Cloudinary.
   {
     const CatalogProduct = require('../models/CatalogProduct');
     const Category = require('../models/Category');
     const Brand = require('../models/Brand');
     const IntegrationCredential = require('../models/IntegrationCredential');
+    const materializeDrain = require('../services/catalogMaterializeDrainService');
     const cryptoSvc = require('../services/integrationCryptoService');
     const axios = require('axios');
     const genericResolver = require('../services/genericCatalogResolver');
@@ -1183,8 +1196,11 @@ async function main() {
         find: CatalogProduct.find,
         findOne: CatalogProduct.findOne,
         catFindOrCreate: Category.findOrCreateCategoryTree,
+        catFindOneAndUpdate: Category.findOneAndUpdate,
         brandFindById: Brand.findById,
         brandFindOne: Brand.findOne,
+        brandFindOneAndUpdate: Brand.findOneAndUpdate,
+        startDrain: materializeDrain.startCatalogMaterializeDrain,
         resolveGeneric: genericResolver.resolveGenericCatalog,
         resolveShopify: shopifyAccess.resolveShopifyAccess,
         pullShopify: apifyPull.pullShopifyProducts,
@@ -1275,6 +1291,10 @@ async function main() {
       };
       CatalogProduct.findOne = () => emptyQuery();
       Category.findOrCreateCategoryTree = async () => '00000000000000000000c001';
+      // categoryClassifier.js destructures findOrCreateCategoryTree at load,
+      // so the stub above does not intercept stampFeedTruthCategoryRef.
+      // The bound original still calls Category.findOneAndUpdate at runtime.
+      Category.findOneAndUpdate = async () => ({ _id: '00000000000000000000c002' });
       // apify isBrandAborted → Brand.findById().select().lean() — must not hit Mongo.
       const brandNotAborted = () => {
         const q = {
@@ -1286,6 +1306,11 @@ async function main() {
       };
       Brand.findById = () => brandNotAborted();
       Brand.findOne = () => brandNotAborted();
+      // backfillBrandWebsiteUrl is fire-and-forget; return null so it does
+      // not proceed into enrichBrandFromUrl (already stubbed below, but
+      // null is the no-write shape).
+      Brand.findOneAndUpdate = async () => null;
+      materializeDrain.startCatalogMaterializeDrain = async () => ({ started: false });
       catClassify.inferCoarseEnum = () => null;
       catClassify.resolveCoarseCategoryRef = async () => null;
       detectSvc.enqueueBrandProductDetects = async () => ({ enqueued: 0 });
@@ -1331,8 +1356,11 @@ async function main() {
         CatalogProduct.find = orig.find;
         CatalogProduct.findOne = orig.findOne;
         Category.findOrCreateCategoryTree = orig.catFindOrCreate;
+        Category.findOneAndUpdate = orig.catFindOneAndUpdate;
         Brand.findById = orig.brandFindById;
         Brand.findOne = orig.brandFindOne;
+        Brand.findOneAndUpdate = orig.brandFindOneAndUpdate;
+        materializeDrain.startCatalogMaterializeDrain = orig.startDrain;
         genericResolver.resolveGenericCatalog = orig.resolveGeneric;
         shopifyAccess.resolveShopifyAccess = orig.resolveShopify;
         apifyPull.pullShopifyProducts = orig.pullShopify;
