@@ -330,6 +330,64 @@ checkTrue('T18 pre-render errors release the claim instead of marking the ad fai
   && /if\s*\(\s*!renderAttempted\s*\)/.test(RESUME_CODE),
   'a Mongo blip during a deploy would write off a paid ad');
 
+// ── T19: the attempt counter is declared (Mongoose strict-drop trap again) ──
+checkTrue('T19 Ad.titlingResumeAttempts is DECLARED in models/Ad.js',
+  /titlingResumeAttempts:\s*\{\s*type:\s*Number/.test(MODEL_CODE),
+  'an undeclared counter would be silently dropped on every save, same trap as G3');
+
+// ── T20: the stale-claim CAS $inc's the counter on the SAME write ────
+{
+  const claimIdx = RESUME_CODE.indexOf('const claim = await Ad.updateOne(claimFilter');
+  const block = claimIdx >= 0 ? RESUME_CODE.slice(claimIdx, claimIdx + 300) : '';
+  checkTrue('T20 the claim write $incs titlingResumeAttempts on the SAME updateOne as the CAS',
+    /\$inc:\s*\{\s*titlingResumeAttempts:\s*1\s*\}/.test(block),
+    'counting anywhere else could miss the attempt that then died, or double-count a lost race');
+}
+
+// ── T21: the resume filter's stale-claim arm is bounded by the counter ──
+{
+  const cutoff = new Date('2026-08-20T23:00:00Z');
+  const arms = svc.buildResumeFilter(cutoff).$or || [];
+  const staleArm = arms.find(a => a.titlingResumeState === svc.STATE_CLAIMED);
+  const bound = staleArm && staleArm.$or;
+  checkTrue('T21 QUERY bounds the stale-claim arm by titlingResumeAttempts, with an $exists escape for pre-counter ads',
+    Array.isArray(bound)
+    && bound.some(c => c.titlingResumeAttempts && '$lt' in c.titlingResumeAttempts)
+    && bound.some(c => c.titlingResumeAttempts && c.titlingResumeAttempts.$exists === false),
+    'without the $exists branch, every ad already stuck before this counter existed would be excluded');
+}
+
+// ── T22: exhausted claims are condemned by a DIFFERENT, exported filter ──
+checkTrue('T22 exports buildExhaustedClaimFilter, markExhaustedClaims, RESUME_MAX_ATTEMPTS',
+  typeof svc.buildExhaustedClaimFilter === 'function'
+  && typeof svc.markExhaustedClaims === 'function'
+  && typeof svc.RESUME_MAX_ATTEMPTS === 'number');
+{
+  const cutoff = new Date('2026-08-20T23:00:00Z');
+  const f = svc.buildExhaustedClaimFilter(cutoff);
+  checkTrue('T22b exhausted filter requires draft + claimed + stale + budget spent',
+    f.status === 'draft'
+    && f.titlingResumeState === svc.STATE_CLAIMED
+    && f.updatedAt && f.updatedAt.$lt instanceof Date
+    && f.titlingResumeAttempts && f.titlingResumeAttempts.$gte === svc.RESUME_MAX_ATTEMPTS,
+    'a loose exhausted filter could condemn an ad that is mid-render right now');
+}
+
+// ── T23: giving up writes an HONEST verdict, mirroring the real failure branch ──
+checkTrue('T23 markExhaustedClaims mirrors T9: status failed + titlingResumeState null + renderError.stage titling',
+  /status:\s*'failed'[\s\S]{0,300}titlingResumeState:\s*null[\s\S]{0,300}stage:\s*'titling'/.test(RESUME_CODE)
+  && /renderStage:\s*'master rendered; titling abandoned'/.test(RESUME_CODE),
+  'a give-up that does not clear the debt or fails the ad stays indistinguishable from success');
+checkTrue('T23b markExhaustedClaims never writes the "no titling (" prefix',
+  !/markExhaustedClaims[\s\S]*?no titling \(/.test(RESUME_CODE.slice(RESUME_CODE.indexOf('async function markExhaustedClaims'), RESUME_CODE.indexOf('async function resumeUntitledMasters'))),
+  'that prefix means DELIBERATE bare-master ship — using it here mislabels an abandoned render as intentional');
+checkTrue('T23c markExhaustedClaims never touches renderUrl/veoVideoUrl (the paid master)', (() => {
+  const start = RESUME_CODE.indexOf('async function markExhaustedClaims');
+  const end = RESUME_CODE.indexOf('async function resumeUntitledMasters');
+  const body = RESUME_CODE.slice(start, end);
+  return !/\brenderUrl\s*:/.test(body) && !/\bveoVideoUrl\s*:/.test(body);
+})());
+
 const total = pass + failures.length;
 if (failures.length) {
   console.error(`verifyTitlingResume: ${pass}/${total} passed, ${failures.length} FAILED`);

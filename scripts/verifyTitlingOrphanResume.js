@@ -49,6 +49,10 @@ const ok = (label, fn) => {
   try { fn(); checks += 1; }
   catch (err) { console.error(`  ❌ ${label}\n     ${err.message}`); process.exitCode = 1; }
 };
+const okAsync = async (label, fn) => {
+  try { await fn(); checks += 1; }
+  catch (err) { console.error(`  ❌ ${label}\n     ${err.message}`); process.exitCode = 1; }
+};
 
 console.log('verifyTitlingOrphanResume\n');
 
@@ -62,6 +66,15 @@ function matchOp(value, cond) {
       if (op === '$ne') { if (value === operand) return false; }
       else if (op === '$lt') { if (!(value != null && value < operand)) return false; }
       else if (op === '$in') { if (!operand.includes(value)) return false; }
+      // $gte / $exists added deliberately for the titling ATTEMPT BOUND (group F).
+      // Both model Mongo's real treatment of a MISSING field, which is the whole
+      // point here: every ad already stranded 'claimed' in production predates
+      // the counter and carries no `titlingResumeAttempts` at all. Mongoose's
+      // `default: 0` applies only to newly created documents, so a matcher that
+      // quietly treated missing as 0 would pass a filter that, in production,
+      // silently excluded exactly the ads the sweep exists to rescue.
+      else if (op === '$gte') { if (!(value != null && value >= operand)) return false; }
+      else if (op === '$exists') { if ((value !== undefined && value !== null) !== operand) return false; }
       else throw new Error(`matcher does not implement operator ${op} — extend it deliberately`);
     }
     return true;
@@ -114,7 +127,19 @@ ok('A4 matcher: $or', () => {
   assert.strictEqual(matches({ a: 1 }, { $or: [{ a: 9 }, { a: 8 }] }), false);
 });
 ok('A5 matcher refuses an operator it does not implement', () => {
-  assert.throws(() => matches({ a: 1 }, { a: { $gte: 1 } }), /does not implement/);
+  // Was $gte until the attempt bound needed it (see matchOp). The guard itself
+  // is the point, so it now names an operator this filter genuinely never uses.
+  assert.throws(() => matches({ a: 1 }, { a: { $regex: /x/ } }), /does not implement/);
+});
+ok('A6 matcher: $gte and $exists model a MISSING field the way Mongo does', () => {
+  assert.strictEqual(matches({ n: 3 }, { n: { $gte: 3 } }), true);
+  assert.strictEqual(matches({ n: 2 }, { n: { $gte: 3 } }), false);
+  // The load-bearing case: $gte and $lt BOTH miss an absent field.
+  assert.strictEqual(matches({}, { n: { $gte: 3 } }), false);
+  assert.strictEqual(matches({}, { n: { $lt: 3 } }), false);
+  assert.strictEqual(matches({}, { n: { $exists: false } }), true);
+  assert.strictEqual(matches({ n: 0 }, { n: { $exists: false } }), false);
+  assert.strictEqual(matches({ n: 0 }, { n: { $exists: true } }), true);
 });
 
 // ── Group B — the ORPHAN the incident produced must now be reclaimed.
@@ -287,8 +312,189 @@ ok('E6 the sweeper query is built by the exported pure function', () => {
     'the live query must use buildResumeFilter, or these checks test a copy');
 });
 
-if (process.exitCode) {
-  console.log(`\n❌ verifyTitlingOrphanResume: failures above (${checks} passed)`);
-} else {
-  console.log(`\n✅ verifyTitlingOrphanResume: ${checks}/${checks} checks passed`);
-}
+(async () => {
+  // ── Group F — THE CLAIM LOOP MUST TERMINATE, AND ITS END MUST BE VISIBLE.
+  //
+  // THE DEFECT (verified against production 2026-08-20, run_1787266578461_70865bdd).
+  // The stale-claim reclaim above is real recovery and it worked — every video ad
+  // on that run is titled today. What had no bound was the number of times it
+  // could happen. The web service took four SIGTERMs inside 20 minutes (three in
+  // one second at 23:05:09Z); each one abandoned a Remotion render mid-flight,
+  // each abandoned claim went stale after CLAIM_STALE_MIN, and each reclaim WROTE
+  // updatedAt. Nothing counted the cycles, so:
+  //   - there was no terminal verdict an operator could ever see: the ad stays
+  //     'claimed', which reads as "in flight", not "this will never finish";
+  //   - a full Remotion render (headless Chrome + a 1080p ffmpeg encode, measured
+  //     76s) was burned per cycle on the web process — and if the render is what
+  //     kills the process, the loop sustains itself and takes every other
+  //     in-flight render on that instance down with it; and
+  //   - backlogWatchdog's titling-stuck alert could not fire, because a reclaim
+  //     lands at most CLAIM_STALE_MIN (15m) + the sweep interval (5m) after the
+  //     previous touch and its threshold is 45m. The alarm built for this class
+  //     was structurally blind to the case where recovery is actively running.
+  //
+  // F2/F3/F4 pin the termination, F5 pins that bounding it did not strand the
+  // pre-existing population, and F7/F8 pin that giving up is never mistaken for
+  // delivery — "the raw master shipped as if finished" is the whole defect.
+  const {
+    buildExhaustedClaimFilter, markExhaustedClaims, RESUME_MAX_ATTEMPTS
+  } = require('../services/titlingResumeService');
+  const {
+    isAdHonestlyDelivered, isVideoTitlingSettled, INTENTIONAL_NO_TITLING_STAGE_RE
+  } = require('../services/adTitlingTruth');
+
+  const EXHAUSTED = buildExhaustedClaimFilter(STALE_CUTOFF);
+  const staleClaim = (attempts) => ({
+    status: 'draft', kind: 'video',
+    veoVideoUrl: MASTER, renderUrl: MASTER,
+    titlingResumeState: STATE_CLAIMED, updatedAt: OLD,
+    ...(attempts === undefined ? {} : { titlingResumeAttempts: attempts })
+  });
+
+  ok('F1 a stale claim still WITHIN its retry budget is re-driven', () => {
+    assert.strictEqual(matches(staleClaim(RESUME_MAX_ATTEMPTS - 1), FILTER), true,
+      'bounding the loop must not stop ordinary recovery');
+  });
+
+  ok('F2 [THE BUG] a stale claim that has SPENT its budget is no longer re-driven', () => {
+    assert.strictEqual(matches(staleClaim(RESUME_MAX_ATTEMPTS), FILTER), false,
+      'the claim -> abandon -> reclaim loop had no exit: an ad whose render can never '
+      + 'finish inside one process lifetime burned a Remotion render every cycle forever');
+  });
+
+  ok('F3 ...and is condemned instead of silently dropped', () => {
+    assert.strictEqual(matches(staleClaim(RESUME_MAX_ATTEMPTS), EXHAUSTED), true,
+      'dropping it out of the sweep without a verdict leaves it "claimed" forever, '
+      + 'which reads to an operator as still in flight');
+  });
+
+  ok('F4 the two filters PARTITION a stale claim — never both, never neither', () => {
+    // The invariant that makes the bound safe. "Never both" = no double handling
+    // (condemned while another instance re-renders it). "Never neither" = no
+    // attempt count at which the ad falls out of the machine entirely, which is
+    // how the original loop would come back wearing a bound.
+    for (const n of [undefined, 0, 1, RESUME_MAX_ATTEMPTS - 1, RESUME_MAX_ATTEMPTS, RESUME_MAX_ATTEMPTS + 7]) {
+      const doc = staleClaim(n);
+      const swept = matches(doc, FILTER);
+      const condemned = matches(doc, EXHAUSTED);
+      assert.notStrictEqual(swept, condemned,
+        `attempts=${n}: swept=${swept} condemned=${condemned} — must be exactly one`);
+    }
+  });
+
+  ok('F5 [REGRESSION GUARD] a claim stranded BEFORE the counter existed is still re-driven', () => {
+    // Mongo's $lt does not match a missing field and Mongoose's `default: 0` only
+    // applies to newly created docs, so every ad already stuck 'claimed' in
+    // production has no counter at all. Without the $exists:false branch the new
+    // bound would exclude exactly the population the sweep exists to rescue —
+    // turning a fix for a leak into a wider leak.
+    assert.strictEqual(matches(staleClaim(undefined), FILTER), true,
+      'the attempt bound must not strand the ads that predate the counter');
+    assert.strictEqual(matches(staleClaim(undefined), EXHAUSTED), false,
+      'an ad with no counter has spent no budget and must not be condemned');
+  });
+
+  ok('F6 an ad whose Nth attempt is running RIGHT NOW is not condemned', () => {
+    // The claim bumps updatedAt and then renders for up to ~76s. Without the
+    // staleness bound on the exhausted filter this would write off a titling job
+    // that was about to succeed.
+    assert.strictEqual(
+      matches({ ...staleClaim(RESUME_MAX_ATTEMPTS), updatedAt: FRESH }, EXHAUSTED), false,
+      'the exhausted filter must mean "budget spent AND nobody holding it"');
+  });
+
+  ok('F7 the abandoned verdict is NOT indistinguishable from a delivered ad', () => {
+    // The whole failure mode is a raw, brand-less master presenting as a finished
+    // creative. Both of adTitlingTruth's predicates must reject the shape this
+    // service writes on give-up — independently, so neither one carries it alone.
+    const abandoned = {
+      kind: 'video', status: 'failed',
+      veoVideoUrl: MASTER, renderUrl: MASTER,      // paid master kept, never discarded
+      titlingResumeState: null,
+      renderStage: 'master rendered; titling abandoned'
+    };
+    assert.strictEqual(isAdHonestlyDelivered(abandoned), false,
+      'the run rollup, Slack summary, ads JSON and Meta push gate would count it delivered');
+    assert.strictEqual(isVideoTitlingSettled(abandoned), false,
+      'status alone must not be the only thing standing between this and "delivered"');
+    assert.strictEqual(INTENTIONAL_NO_TITLING_STAGE_RE.test(abandoned.renderStage), false,
+      'wording the give-up as "no titling (...)" would relabel an ABANDONED render as a '
+      + 'DELIBERATE bare-master ship — the single most dangerous edit to this string');
+    // And it must not re-enter the sweep: a terminal verdict stays terminal.
+    assert.strictEqual(matches({ ...abandoned, updatedAt: OLD }, FILTER), false);
+  });
+
+  await okAsync('F8 markExhaustedClaims writes that verdict and NEVER touches the paid master', async () => {
+    // Behavioural, against the real function. A source-text check here would pass
+    // against a reimplementation that merely kept the name.
+    const Ad = require('../models/Ad');
+    const realFind = Ad.find, realUpdateOne = Ad.updateOne;
+    const writes = [];
+    let queried = null;
+    const chain = (rows) => {
+      const q = { sort: () => q, limit: () => q, select: () => q, lean: async () => rows };
+      return q;
+    };
+    Ad.find = (filter) => { queried = filter; return chain([{ _id: 'AD1', titlingResumeAttempts: 4 }]); };
+    Ad.updateOne = async (filter, update) => { writes.push({ filter, update }); return { modifiedCount: 1 }; };
+    try {
+      await require('../services/titlingResumeService').markExhaustedClaims(STALE_CUTOFF);
+    } finally {
+      Ad.find = realFind; Ad.updateOne = realUpdateOne;
+    }
+    assert.strictEqual(writes.length, 1, 'expected exactly one terminal write');
+    const { filter, update } = writes[0];
+    const $set = update.$set;
+    assert.strictEqual(filter.titlingResumeState, STATE_CLAIMED,
+      'the write must re-assert the claim, or it can condemn an ad another instance just re-claimed');
+    assert.strictEqual($set.status, 'failed');
+    assert.strictEqual($set.titlingResumeState, null, 'the debt must be settled, not left open');
+    assert.strictEqual($set.renderError.stage, 'titling');
+    assert.ok(!('renderUrl' in $set) && !('veoVideoUrl' in $set),
+      'MONEY: the paid Omni master must never be cleared by the give-up write');
+    assert.ok(!('status' in queried) || queried.status === 'draft');
+    assert.strictEqual(INTENTIONAL_NO_TITLING_STAGE_RE.test($set.renderStage), false);
+  });
+
+  await okAsync('F9 the claim COUNTS the attempt, atomically with the CAS that wins it', async () => {
+    // Behavioural. Counting in a second write would miss the attempt that then
+    // died — the only attempt worth counting — or double-count a lost race.
+    const Ad = require('../models/Ad');
+    const realFind = Ad.find, realUpdateOne = Ad.updateOne, realFindById = Ad.findById;
+    const writes = [];
+    const chain = (rows) => {
+      const q = { sort: () => q, limit: () => q, select: () => q, lean: async () => rows };
+      return q;
+    };
+    // The exhausted pass runs first and must find nothing; the sweep then sees one
+    // stale claim. Distinguished by the filter each pass actually builds.
+    Ad.find = (filter) => chain(
+      filter.titlingResumeAttempts ? [] : [{ _id: 'AD2', titlingResumeState: STATE_CLAIMED }]
+    );
+    Ad.updateOne = async (filter, update) => { writes.push({ filter, update }); return { modifiedCount: 1 }; };
+    Ad.findById = () => ({ lean: async () => null });   // stop before any render
+    let out;
+    try {
+      out = await require('../services/titlingResumeService').resumeUntitledMasters({ limit: 1 });
+    } finally {
+      Ad.find = realFind; Ad.updateOne = realUpdateOne; Ad.findById = realFindById;
+    }
+    assert.ok(writes.length >= 1, 'the claim write never happened');
+    const claim = writes[0];
+    assert.deepStrictEqual(claim.update.$inc, { titlingResumeAttempts: 1 },
+      'the claim must $inc the attempt counter on the SAME write as the CAS');
+    assert.strictEqual(claim.filter.titlingResumeState, STATE_CLAIMED);
+    assert.ok(claim.filter.updatedAt && claim.filter.updatedAt.$lt,
+      'the stale-claim CAS must keep its updatedAt arbiter');
+    assert.strictEqual(out.abandoned, 0);
+  });
+
+  if (process.exitCode) {
+    console.log(`\n❌ verifyTitlingOrphanResume: failures above (${checks} passed)`);
+  } else {
+    console.log(`\n✅ verifyTitlingOrphanResume: ${checks}/${checks} checks passed`);
+  }
+})().catch((err) => {
+  console.error(err);
+  process.exit(1);
+});

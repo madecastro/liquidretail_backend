@@ -288,6 +288,45 @@ checkTrue('B3 the watchdog queries titlingResumeState in [pending, claimed] gate
   /titlingResumeState:\s*\{\s*\$in:\s*\[\s*['"]pending['"],\s*['"]claimed['"]\s*\]\s*\}/.test(WATCHDOG_CODE)
   && /watchdog:titling-stuck/.test(WATCHDOG_CODE));
 
+// ── B4-B6: THE BLIND SPOT (2026-08-20 incident, second half). The idle-based
+// arm above (B1-B3) cannot see an ad ACTIVELY cycling claim -> abandon ->
+// reclaim: titlingResumeService's own stale-claim reclaim (CLAIM_STALE_MIN,
+// 15m default) refreshes updatedAt every time it fires, and the reclaim
+// interval (≈CLAIM_STALE_MIN + the sweep's own 5m cadence) sits well under
+// ALERT_TITLING_STUCK_MIN's 45m default — so the idle predicate can only ever
+// fire on an ad the sweeper has STOPPED reaching, never on one it is actively
+// (and fruitlessly) re-driving. Measured live: a batch of Remotion renders
+// stalled 11-15m straight through an autoscale replacement storm with zero
+// alert. Counting claims, not measuring silence, is what makes that visible.
+checkTrue('B4 exports TITLING_CYCLES',
+  typeof watchdog.TITLING_CYCLES === 'function');
+{
+  const prevEnv = process.env.ALERT_TITLING_CYCLES;
+  delete process.env.ALERT_TITLING_CYCLES;
+  const dflt = watchdog.TITLING_CYCLES();
+  process.env.ALERT_TITLING_CYCLES = '9';
+  const overridden = watchdog.TITLING_CYCLES();
+  process.env.ALERT_TITLING_CYCLES = '1';
+  const floored = watchdog.TITLING_CYCLES();
+  if (prevEnv === undefined) delete process.env.ALERT_TITLING_CYCLES;
+  else process.env.ALERT_TITLING_CYCLES = prevEnv;
+  checkTrue('B5 TITLING_CYCLES defaults to 2, honors an env override, and floors at 2',
+    dflt === 2 && overridden === 9 && floored === 2,
+    'a floor of 1 would page on ordinary single-claim recovery doing its job');
+}
+checkTrue('B6 the watchdog query ALSO matches on titlingResumeAttempts, independent of updatedAt',
+  (() => {
+    // Locate the titling-stuck query block specifically, not the whole file —
+    // a whole-file regex would be satisfied by an unrelated $gte elsewhere.
+    const idx = WATCHDOG_CODE.indexOf("key:   'watchdog:titling-stuck'");
+    const qIdx = WATCHDOG_CODE.lastIndexOf('Ad.find(', idx);
+    const block = WATCHDOG_CODE.slice(qIdx, idx);
+    return /titlingResumeAttempts:\s*\{\s*\$gte:\s*cycles\s*\}/.test(block)
+      && /\$or:\s*\[/.test(block);
+  })(),
+  'without this, an ad cycling through reclaims every ~20m never crosses the 45m idle bar '
+  + 'and the alert this incident asked for still cannot fire on the case it was written for');
+
 const total = pass + failures.length;
 if (failures.length) {
   console.error(`verifyTitlingDeliveryTruth: ${pass}/${total} passed, ${failures.length} FAILED`);

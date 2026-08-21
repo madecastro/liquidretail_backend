@@ -82,6 +82,25 @@ const HOURLY_SPEND_USD    = () => {
 // takes 25-35 minutes" concern here.
 const TITLING_STUCK_MIN   = () => N('ALERT_TITLING_STUCK_MIN', 45);
 
+// TITLING_CYCLES — how many resume claims on ONE ad constitute a cycling
+// pathology worth alerting on, independent of how long it has been idle.
+//
+// ⚠️ THE IDLE ARM ABOVE CANNOT SEE THE CASE IT WAS WRITTEN FOR, and that is why
+// this exists. titlingResumeService re-claims a stale claim after
+// CLAIM_STALE_MIN (15m) and the claim WRITES updatedAt, so an ad in the
+// claim → abandon → reclaim loop is never idle for longer than
+// CLAIM_STALE_MIN + the sweep interval (5m) ≈ 20m. ALERT_TITLING_STUCK_MIN is
+// 45m. So the idle predicate is structurally incapable of firing while the loop
+// is turning — it can only ever report an ad the sweeper has STOPPED reaching.
+// The live incident the idle arm was added for ("a batch of Remotion renders
+// stalled for 11-15m straight through an autoscale replacement storm") is
+// exactly the shape it misses.
+//
+// Counting claims instead of measuring silence is what makes the active
+// pathology visible. 2 is the floor that means anything: 1 claim is ordinary
+// recovery doing its job and must not page anyone.
+const TITLING_CYCLES      = () => Math.max(2, N('ALERT_TITLING_CYCLES', 2));
+
 async function runWatchdog() {
   if (!alerts.isConfigured()) return;
 
@@ -136,14 +155,19 @@ async function runWatchdog() {
   // alone cannot tell those two apart; only elapsed time can).
   try {
     const cutoff = ago(TITLING_STUCK_MIN());
-    const stuck = await Ad.find({
-      titlingResumeState: { $in: ['pending', 'claimed'] },
-      updatedAt: { $lt: cutoff }
-    })
+    const cycles = TITLING_CYCLES();
+    // TWO INDEPENDENT SYMPTOMS OF THE SAME DEBT, and neither implies the other:
+    // idle past the threshold = nothing is re-driving this ad any more; claimed
+    // `cycles` times = something IS re-driving it and getting nowhere, which the
+    // idle clause can never see because each reclaim refreshes updatedAt (see
+    // TITLING_CYCLES). Reporting only their union is what closes the blind spot.
+    const stuck = await Ad.find(buildTitlingStuckFilter({ cutoff, cycles }))
       .sort({ updatedAt: 1 }).limit(50)
-      .select('_id titlingResumeState renderStage updatedAt campaignRunIds').lean();
+      .select('_id titlingResumeState renderStage updatedAt campaignRunIds titlingResumeAttempts')
+      .lean();
     if (stuck.length) {
       const claimed = stuck.filter((a) => a.titlingResumeState === 'claimed').length;
+      const cycling = stuck.filter((a) => (a.titlingResumeAttempts || 0) >= cycles).length;
       const oldestMin = Math.round((now - new Date(stuck[0].updatedAt).getTime()) / 60000);
       await alerts.notify({
         level: 'error',
@@ -154,10 +178,11 @@ async function runWatchdog() {
           'oldest':       `${oldestMin}m`,
           'claimed (mid-render or abandoned)': claimed || undefined,
           'pending (never started)':           (stuck.length - claimed) || undefined,
+          [`cycling (re-claimed ≥${cycles}x)`]: cycling || undefined,
           'likely cause': 'render process replaced mid-Remotion-render, or titling genuinely wedged'
         },
         detail: stuck.slice(0, 12)
-          .map((a) => `${a._id} state=${a.titlingResumeState} stage="${a.renderStage || '-'}" idle=${Math.round((now - new Date(a.updatedAt).getTime()) / 60000)}m run=${(a.campaignRunIds || []).slice(-1)[0] || '-'}`)
+          .map((a) => `${a._id} state=${a.titlingResumeState} tries=${a.titlingResumeAttempts || 0} stage="${a.renderStage || '-'}" idle=${Math.round((now - new Date(a.updatedAt).getTime()) / 60000)}m run=${(a.campaignRunIds || []).slice(-1)[0] || '-'}`)
           .join('\n')
       });
     }
@@ -298,11 +323,45 @@ function buildStalledRunFilter({ now, ageMin, silenceMin } = {}) {
   };
 }
 
+/**
+ * The titling-stuck ALERT predicate, as a pure function of (cutoff, cycles).
+ *
+ * Extracted for the same reason buildStalledRunFilter is (above) and
+ * buildResumeFilter is (titlingResumeService.js): a harness can evaluate the
+ * REAL query object against real document shapes, not regex the source. A
+ * regex can be satisfied by a shape that reads right but is structurally
+ * wrong — e.g. `titlingResumeState:{$in:[...]}` living INSIDE the `$or`
+ * instead of gating it, which would silently alert on healthy, never-claimed
+ * ads. That gap existed here until this extraction closed it (adversarial
+ * review, 2026-08-21) — B3/B6 in verifyTitlingDeliveryTruth.js only checked
+ * that the right tokens appeared in the file, not where.
+ *
+ * The two clauses are DELIBERATELY independent alarms on the SAME underlying
+ * debt (see the caller's comment): idle past `cutoff` catches an ad nothing
+ * is re-driving any more; `titlingResumeAttempts >= cycles` catches one being
+ * actively (and fruitlessly) re-driven, which idle time alone cannot see
+ * because every reclaim refreshes `updatedAt`.
+ *
+ * @param {Date}   cutoff  ads idle since before this are alerted
+ * @param {number} cycles  claim count at/above which cycling is alerted
+ */
+function buildTitlingStuckFilter({ cutoff, cycles } = {}) {
+  return {
+    titlingResumeState: { $in: ['pending', 'claimed'] },
+    $or: [
+      { updatedAt: { $lt: cutoff } },
+      { titlingResumeAttempts: { $gte: cycles } }
+    ]
+  };
+}
+
 module.exports = {
   runWatchdog,
   buildStalledRunFilter,
   RUN_STALE_MIN,
   RUN_SILENCE_MIN,
   RENDERING_STALE_MIN,
-  TITLING_STUCK_MIN
+  TITLING_STUCK_MIN,
+  TITLING_CYCLES,
+  buildTitlingStuckFilter
 };

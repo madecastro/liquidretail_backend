@@ -581,6 +581,32 @@ const adSchema = new mongoose.Schema({
   // ONLY thing the derive-wait loop increments.
   deriveWaitAttempts: { type: Number, default: 0 },
 
+  // How many times services/titlingResumeService has CLAIMED this ad for a
+  // titling retry. Not renderAttempts, and not deriveWaitAttempts, for the same
+  // reason those two are separate from each other: each counts a different kind
+  // of attempt and a shared counter makes all of them unreadable.
+  // renderAttempts is $inc'd once per render ENTRY by routes/ads.js (on the same
+  // write that stamps the paid master and titlingResumeState:'claimed'), so it
+  // says nothing about how many times RECOVERY has since re-driven the titling.
+  //
+  // ⚠️ WHY IT HAS TO EXIST. The resume sweep re-claims any 'claimed' row whose
+  // updatedAt is older than CLAIM_STALE_MIN, and the claim itself writes
+  // updatedAt. Nothing counted the claims, so an ad whose Remotion render can
+  // never finish inside one process lifetime (a deploy/autoscale storm, or a
+  // render that OOMs this process — which happened on 2026-08-04) cycled
+  // claim → abandon → reclaim FOREVER: no terminal verdict, a full Remotion
+  // render burned every cycle, and — because each reclaim refreshed updatedAt
+  // to now — permanently invisible to backlogWatchdog's idle-based
+  // titling-stuck alert, whose threshold can never be crossed while the loop
+  // is turning. This counter is what bounds that loop and what makes the
+  // cycling itself detectable.
+  //
+  // Declared here because Mongoose strict mode silently DROPS a write to an
+  // undeclared path — the same trap documented on titlingResumeState above and
+  // on renderError.predictionId, both of which this repo has already been bitten
+  // by. Pinned by scripts/verifyTitlingResume.js.
+  titlingResumeAttempts: { type: Number, default: 0 },
+
   // ── Copy snapshot — filled at render time ────────────────────────
   // Cached resolution of the LayoutInputArtifact's derived copy so
   // the ads page list doesn't have to round-trip the artifact for
