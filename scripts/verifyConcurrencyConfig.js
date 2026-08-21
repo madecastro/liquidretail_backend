@@ -104,8 +104,8 @@ check('A defaults.env VEO_TITLING_CONCURRENCY is 48', fromDefaults.VEO_TITLING_C
 // measurement and the failure mode strands an already-paid Omni master;
 // 8 needs validation against the web-service memory graph before any
 // further raise. See config/defaults.env and services/concurrency.js.
-check('A defaults.env REMOTION_QUEUE_CONCURRENCY is 8 (the real memory guard)',
-  fromDefaults.REMOTION_QUEUE_CONCURRENCY, 8);
+check('A defaults.env REMOTION_QUEUE_CONCURRENCY is 4 (the real memory guard)',
+  fromDefaults.REMOTION_QUEUE_CONCURRENCY, 4);
 check('A the memory-bound render pool is the narrowest video knob',
   fromDefaults.REMOTION_QUEUE_CONCURRENCY <= fromDefaults.VEO_CONCURRENCY
   && fromDefaults.REMOTION_QUEUE_CONCURRENCY <= fromDefaults.VEO_TITLING_CONCURRENCY, true);
