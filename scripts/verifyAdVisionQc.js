@@ -446,6 +446,33 @@ check('AA20 unescaped quotes that corrupt the scan and expose a coincidentally-n
   assert.notStrictEqual(v.categories.competitor_marks.score, 9,
     'must not have silently adopted the nested passing example');
 });
+check('AA21 `categories` present but the WRONG TYPE (a string, or an array) must not fall back to coincidental root-level scores', () => {
+  // Root-fallback exists for a MISSING wrapper (drift #2). A `categories`
+  // key that IS present but malformed (a stringified sub-verdict, or an
+  // array) is a different, more corrupted signal — trusting root data here
+  // would let an unrelated root shape override a categories value the model
+  // clearly (if badly) tried to nest, and a real fail sitting inside that
+  // string/array must not be silently replaced by passing root scores.
+  const stringCategories = qc.parseVerdict({
+    categories: JSON.stringify({ competitor_marks: { score: 2, findings: ['tree'] } }),
+    competitor_marks: { score: 9, findings: [] },
+    product_fidelity: { score: 9, findings: [] },
+    text_defects:     { score: 9, findings: [] },
+    layout_safe_box:  { score: 9, findings: [] }
+  });
+  assert.strictEqual(stringCategories.pass, false, 'a string `categories` must not let root 9s win');
+  assert.strictEqual(stringCategories.categories.competitor_marks.score, 0);
+
+  const arrayCategories = qc.parseVerdict({
+    categories: [{ name: 'competitor_marks', score: 2, findings: ['tree'] }],
+    competitor_marks: { score: 9, findings: [] },
+    product_fidelity: { score: 9, findings: [] },
+    text_defects:     { score: 9, findings: [] },
+    layout_safe_box:  { score: 9, findings: [] }
+  });
+  assert.strictEqual(arrayCategories.pass, false, 'an array `categories` must not let root 9s win');
+  assert.strictEqual(arrayCategories.categories.competitor_marks.score, 0);
+});
 
 check('AA15 the JSON5 fallback used by salvage is actually IMPORTED, not just called (no-undef cannot be trusted alone)', () => {
   // CLAUDE.md §5: a source-text harness cannot see an unbound identifier —
