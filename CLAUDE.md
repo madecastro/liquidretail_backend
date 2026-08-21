@@ -2255,18 +2255,28 @@ not as a separate tuning decision. Re-measure before going higher
 - Commit/push **only when asked**. Feature branches only; never push to `main`
   without explicit permission.
 - Before pushing non-trivial changes: run **`npm run lint`**, `node --check` the
-  touched files, and run the relevant `scripts/verify*.js` harness (**143 `.js`
-  scripts / 151 including `.mjs`** as of the CampaignRun heartbeat, 2026-08-18 —
-  the "101" the header still carries is stale by ~42, and the "138" this line
-  carried counted only part of the tree). Add a harness for money/security-critical
-  logic, and **revert-prove it** — back the fix out and confirm the test fails. A test
-  that cannot fail is not a test.
+  touched files, and run the relevant `scripts/verify*.{js,mjs}` harness
+  (**143 `.js` scripts / 152 including the 9 `.mjs`** as of the CampaignRun
+  heartbeat, 2026-08-18 — the "101" the header still carries is stale by ~42,
+  and the "138" this line carried counted only part of the tree). Add a
+  harness for money/security-critical logic, and **revert-prove it** — back
+  the fix out and confirm the test fails. A test that cannot fail is not a
+  test.
 - **`npm run lint` is not optional, and it is not a style check.** It enables exactly
   one rule, `no-undef`, because that is the one thing every harness here is blind to:
   they assert over source text, and a regex cannot see an unbound identifier —
   neither can `node --check`, since a `ReferenceError` is a runtime error. This has
   now shipped to production three times (`receiptFree`, `preferUgcMediaId`,
   `usableProofCommentsOrNone`). If you add a rule, add it deliberately and say why.
+- **A `no-undef` gap can hide per file-extension, not just per file (#252 +
+  same-day follow-up).** `**/*.js` doesn't match `.mjs`/`.cjs` — a file matched
+  by no block still gets walked and reports `0 problems, exit 0`, which is
+  indistinguishable from clean. #252 added an `.mjs` block but reused
+  `nodeGlobals` verbatim, so `require`/`module`/`exports`/`__dirname`/
+  `__filename` — genuinely unbound in ESM — passed silently inside it; the
+  follow-up split a trimmed `esmGlobals` and folded `.cjs` into the CommonJS
+  block. New extension → new block, and prove it with the injection recipe
+  above, not just a green `eslint .`. See `eslint.config.js` comments.
 - Adversarial review on non-trivial diffs: have a second model try to *refute* the
   change (bugs, bypasses, money holes) before committing. It caught two real regex
   bugs in the submit guard that review-by-reading missed.
