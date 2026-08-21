@@ -60,6 +60,112 @@ const BANDS = {
   bottom: [0.52, 0.65],
 };
 
+// ── SURFACE-AWARE BANDS. The literals above are DERIVED FROM ONE SURFACE.
+//
+// Read the comment block above again: it derives the strips from
+// `SAFE_ZONES.vertical` and states the contract as "MUST match where remotion
+// stacks actually paint". `vertical` has bottom inset 0.35, so bottom-anchored
+// content ends at 1-0.35 = 0.65 and [0.52, 0.65] is exactly right — for that
+// surface. It is WRONG for every surface whose bottom inset differs, and the
+// strips were applied to all of them:
+//
+//   zone         bottom inset   copy paints to   strip ends   UNTESTED
+//   vertical         0.35           0.65           0.65        —
+//   reels            0.35           0.65           0.65        —
+//   verticalYt       0.35           0.65           0.65        —
+//   landscapeYt      0.36           0.64           0.65        —
+//   stories          0.14           0.86           0.65        0.65-0.86  (21% of H)
+//   squareYt         0.10           0.90           0.65        0.65-0.90  (25%)
+//   feed             0.06           0.94           0.65        0.65-0.94  (29%)
+//   square           0.06           0.94           0.65        0.65-0.94  (29%)
+//
+// On a 12-ad Meta video run that is NINE ads sampling a strip the copy does not
+// sit in: 3 stories, 3 meta_feed_1_1 (-> square), 3 meta_feed_4_5 (-> feed).
+// Only the three reels rows were ever measured where their text lands.
+//
+// WHY THIS MATTERS THREE TIMES OVER, since all three read these strips:
+//   1. FACE KEEP-OUT   — a face below 0.65 on stories/feed never flags `avoid`.
+//   2. BUSY / TEXTURE   — the score that moves copy off a printed garment
+//      wordmark (see Canonical.jsx resolveGroupAnchor: "wordmark printed across
+//      the garment. Measured: bottom busy 0.199, top 0.144"). Measured on the
+//      wrong strip, a caption lands on the product's logo and nothing objects.
+//      This is the mechanism behind the 2026-08-21 `layout_safe_box` QC
+//      failures ("the caption overlay is placed directly on top of the primary
+//      back logo, obscuring the brand name").
+//   3. MEDIAN LUMA      — the dark-vs-light ink vote. Sampling where the text is
+//      NOT is the very failure the tightened geometry above was written to fix
+//      (the Vuori note). So correcting the strips makes the ink vote MORE
+//      correct, not riskier.
+//
+// INERTNESS CONTRACT, and it is the reason this is safe to land: with
+// `safeZoneKey` absent, or on any surface whose insets are vertical's, this
+// returns values BYTE-IDENTICAL to BANDS above. It can only change a surface
+// that provably violates the stated contract. Pinned by
+// scripts/verifyKeepOutBandGeometry.js.
+//
+// Insets are MIRRORED, not imported, for the same reason as
+// PANEL_CENTER_GUTTER_FRAC below and LOGO_SAFE_MARGIN_PCT in
+// directImageRenderService: plateIntel is CJS and safeZones is the ESM remotion
+// island, with no shared module graph. The harness pins every value equal to
+// SAFE_ZONES, so a drift fails loudly instead of silently mis-sampling.
+const SURFACE_INSETS = {
+  vertical:    { top: 0.14, bottom: 0.35 },
+  feed:        { top: 0.06, bottom: 0.06 },
+  square:      { top: 0.06, bottom: 0.06 },
+  landscape:   { top: 0.10, bottom: 0.10 },
+  stories:     { top: 0.14, bottom: 0.14 },
+  reels:       { top: 0.14, bottom: 0.35 },
+  verticalYt:  { top: 0.14, bottom: 0.35 },
+  landscapeYt: { top: 0.10, bottom: 0.36 },
+  squareYt:    { top: 0.10, bottom: 0.10 },
+};
+
+// remotion/lib/safeZones.js ANCHOR_TOP.lowerThird. The 0.02 lead-in reproduces
+// today's 0.52 literal (0.54 - 0.02) so the bottom strip starts a touch above
+// the stack's top edge, catching content that rides right at the boundary.
+const LOWER_THIRD_TOP = 0.54;
+const BAND_LEAD_IN = 0.02;
+// SCOPE, deliberately narrow. Only the BOTTOM strip is derived here.
+//
+// The `top` strip is left at its literal on every surface, because
+// BAND_FOR_ANCHOR maps BOTH `top` and `upperThird` onto it and those two
+// anchors do NOT share an origin: `top` starts at the surface's own safe.top,
+// while `upperThird` is the fixed ANCHOR_TOP.upperThird = 0.135 regardless of
+// surface. Deriving the strip from safe.top alone would give feed/square
+// [0.06, 0.20] and miss the lower half of an upperThird group. Whether the top
+// strip needs its own per-surface treatment is a real question, but this change
+// has no evidence for it — every surface measured as defective differs in
+// `bottom` — so it is left exactly as it is rather than changed on a guess.
+//
+// `middle` is flex-centred inside the safe window and tied to neither inset.
+
+/**
+ * Band strips for a surface, derived from that surface's own safe zone so the
+ * SAMPLED rect is the PAINTED rect by construction.
+ *
+ * Pure, total, never throws. Unknown / absent key -> BANDS verbatim.
+ *
+ * @param {string|null} safeZoneKey a SAFE_ZONES key (see resolveSafeZoneKey)
+ */
+// Fractions are compared against SAFE_ZONES by the harness, so keep them free
+// of float dust (1 - 0.06 = 0.9399999999999999 without this).
+function round4(v) { return Math.round(v * 1e4) / 1e4; }
+
+function bandsFor(safeZoneKey) {
+  const z = SURFACE_INSETS[String(safeZoneKey || '').trim()];
+  if (!z) return BANDS;
+  const bottomEnd = round4(1 - z.bottom);
+  const bottomStart = round4(LOWER_THIRD_TOP - BAND_LEAD_IN);
+  // A surface whose safe zone leaves no room below lowerThird would invert the
+  // strip; fall back rather than emit a negative-height rect.
+  if (!(bottomEnd > bottomStart)) return BANDS;
+  return {
+    top: BANDS.top.slice(),
+    middle: BANDS.middle.slice(),
+    bottom: [bottomStart, bottomEnd],
+  };
+}
+
 async function extractFrames(platePath, times, outDir) {
   if (!FFMPEG) throw new Error('ffmpeg-static unavailable');
   const frames = [];
@@ -142,7 +248,7 @@ async function analyzeFrameBands(framePath, opts = {}) {
   const xLo = Math.floor(W * x0);
   const xHi = Math.ceil(W * x1);
   const bands = {};
-  for (const [band, [y0, y1]] of Object.entries(BANDS)) {
+  for (const [band, [y0, y1]] of Object.entries(bandsFor(opts.safeZoneKey))) {
     const rows = [Math.floor(y0 * H), Math.ceil(y1 * H)];
     const values = [];
     let sum = 0;
@@ -235,7 +341,7 @@ function resolveTitlePlacementMode({ placementMode = null, brand = null } = {}) 
  * white-on-white title text. Scan depth (not whether it runs at all)
  * is controlled by TITLE_PLATE_SCAN ('basic' default | 'gemini' | 'off').
  */
-async function analyzePlate(platePath, { durationSec = 8, isImage = false, panelSide = null, xRange = null } = {}) {
+async function analyzePlate(platePath, { durationSec = 8, isImage = false, panelSide = null, xRange = null, safeZoneKey = null } = {}) {
   const mode = (process.env.TITLE_PLATE_SCAN || 'basic').toLowerCase();
   if (mode === 'off') return null;
   const tmpDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'platescan_'));
@@ -259,7 +365,8 @@ async function analyzePlate(platePath, { durationSec = 8, isImage = false, panel
     if (!frames.length) return null;
 
     // panelSide / xRange optional — absent keeps full-width sampling (inert).
-    const bandOpts = { panelSide, xRange };
+    // safeZoneKey optional — absent keeps the BANDS literals (inert), see bandsFor.
+    const bandOpts = { panelSide, xRange, safeZoneKey };
     const hints = { samples: [] };
     for (const f of frames) {
       try {
@@ -373,8 +480,8 @@ function mapSourceFaceToPlate(face, { cropRect = null, sourceW = null, sourceH =
   };
 }
 
-function bandRect(bandKey) {
-  const extent = BANDS[bandKey];
+function bandRect(bandKey, safeZoneKey = null) {
+  const extent = bandsFor(safeZoneKey)[bandKey];
   if (!extent) return null;
   return { left: BAND_X0, top: extent[0], right: BAND_X1, bottom: extent[1] };
 }
@@ -446,7 +553,7 @@ function applyFaceKeepOut(plateHints, faceSamples, opts = {}) {
     const bands = out.samples[i].bands;
     for (const bandKey of Object.keys(BANDS)) {
       if (!bands[bandKey]) continue;
-      const br = bandRect(bandKey);
+      const br = bandRect(bandKey, opts.safeZoneKey || null);
       const overlap = bandFaceOverlapFrac(br, union);
       if (overlap > threshold) {
         bands[bandKey].avoid = true;
@@ -465,6 +572,9 @@ module.exports = {
   resolveTitlePlacementMode,
   BAND_FOR_ANCHOR,
   BANDS,
+  bandsFor,
+  bandRect,
+  SURFACE_INSETS,
   BAND_X0,
   BAND_X1,
   resolveBandXRange,

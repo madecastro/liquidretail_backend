@@ -483,7 +483,9 @@ async function renderTitles({ videoUrl, meta, spec, tokens, format, brandName = 
       let plateHints = null;
       if (String(process.env.TITLE_PLATE_SCAN || '').toLowerCase() !== 'off') {
         try {
-          plateHints = await analyzePlate(platePath, { durationSec: probe.durationSec });
+          // safeZoneKey: sample the luma/busy strips where THIS surface's copy
+          // actually paints. Absent -> plateIntel's BANDS literals (inert).
+          plateHints = await analyzePlate(platePath, { durationSec: probe.durationSec, safeZoneKey });
         } catch (err) {
           // Legibility intelligence must never fail a render; null keeps the
           // pre-fix behaviour (brand default ink).
@@ -500,6 +502,9 @@ async function renderTitles({ videoUrl, meta, spec, tokens, format, brandName = 
             cropRect: faceKeepOut.cropRect || null,
             sourceW: faceKeepOut.sourceW || null,
             sourceH: faceKeepOut.sourceH || null,
+            // Test the band the copy actually occupies on this surface. Without
+            // it, a face below 0.65 on stories/feed/square never flags `avoid`.
+            safeZoneKey,
           });
         } catch (err) {
           console.warn(`🎬 remotion[ad=${adId || '?'}]: face keep-out failed (${err.message}) — bands unflagged`);
@@ -653,7 +658,7 @@ async function renderPreview({ meta, spec, tokens, format, plateImagePath = null
         // contrast flip needs hints, and preview must match production.
         if (String(process.env.TITLE_PLATE_SCAN || '').toLowerCase() !== 'off') {
           try {
-            plateHints = await analyzePlate(target, { durationSec: probe.durationSec });
+            plateHints = await analyzePlate(target, { durationSec: probe.durationSec, safeZoneKey });
           } catch (err) {
             console.warn(`🎬 remotion preview: plate scan failed (${err.message}) — ink flip unavailable`);
           }
@@ -665,7 +670,7 @@ async function renderPreview({ meta, spec, tokens, format, plateImagePath = null
         plate = { imageUrl: `${base}/jobs/${jobId}/plate${ext}` };
         if (String(process.env.TITLE_PLATE_SCAN || '').toLowerCase() !== 'off') {
           try {
-            plateHints = await analyzePlate(plateImagePath, { isImage: true });
+            plateHints = await analyzePlate(plateImagePath, { isImage: true, safeZoneKey });
           } catch (err) {
             console.warn(`🎬 remotion preview: plate scan failed (${err.message}) — ink flip unavailable`);
           }
