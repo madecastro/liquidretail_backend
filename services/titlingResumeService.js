@@ -230,12 +230,21 @@ async function resumeUntitledMasters({ limit = TITLING_RESUME_MAX } = {}) {
         if (tooOld) {
           // Past the window the brand is treated as genuinely absent, and then we
           // MIRROR THE NORMAL PATH rather than invent a harsher outcome:
-          // routes/ads.js:1469 wraps titling in `if (brandDoc)` and its else-branch
-          // (:1512) promotes the ad to draft and counts it a SUCCESS — with no
+          // routes/ads.js wraps titling in `if (brandDoc)` and its else-branch
+          // promotes the ad to draft and counts it a SUCCESS — with no
           // brand there is no chrome to composite, so the raw master IS the
           // deliverable. Marking it 'failed' here would write off a perfectly good
           // paid ad for a condition the normal path ships happily, and would make
           // the same ad's outcome depend on which code path titled it.
+          //
+          // Mirror that path's vision QC too, not just its "ship anyway"
+          // verdict — this branch never reaches renderBrandScriptAndSave, so
+          // without this the ad would ship with NO Ad.visionQc at all (same
+          // gap the routes/ads.js no-brand branches had). Lazy require —
+          // same reason as the one a few lines below (worker.js must not pay
+          // the remotion/ffmpeg load at boot for a constant).
+          const { qcAndStampVideoAd } = require('./brandScriptExecutor');
+          await qcAndStampVideoAd({ ad: adFresh, deliveredUrl: adFresh.veoVideoUrl });
           await Ad.updateOne(
             { _id: ad._id, titlingResumeState: STATE_CLAIMED },
             {

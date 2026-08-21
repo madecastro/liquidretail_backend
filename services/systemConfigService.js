@@ -116,7 +116,10 @@ async function setCanonicalScriptLandscape(source, updatedBy = null) {
 //
 // Cache value is the raw tri-state: true | false | null.
 // `null` means "DB has no override — caller falls through to env".
-// `undefined` from peek means "cache miss / expired — do not invent null".
+// `undefined` from peek means "never loaded in this process" — see
+// peekAdVisionQcEnabled's doc comment below for why that is now the ONLY
+// thing undefined means (it used to also mean "expired", which was a live
+// production bug — CLAUDE.md / session notes 2026-08-20).
 
 const AD_VISION_QC_CACHE_TTL_MS = 5000;
 
@@ -133,13 +136,57 @@ function resetAdVisionQcEnabledCache() {
 }
 
 /**
- * Synchronous peek at the TTL cache. Returns:
- *   true | false | null  when a fresh entry is loaded
- *   undefined            on cache miss or expiry (caller must not treat as null)
+ * Synchronous peek at the last LOADED value. Returns:
+ *   true | false | null  — a real SystemConfig read has completed at least
+ *                           once in this process (possibly stale past its
+ *                           TTL — see below for why that is fine).
+ *   undefined             — no SystemConfig read has EVER completed in this
+ *                            process (true cold start). Caller falls through
+ *                            to the env default, same as "no override set".
+ *
+ * FIXED 2026-08-20 — this used to also return `undefined` once `expiresAt`
+ * elapsed, i.e. on almost every call in production: real renders are spaced
+ * far more than 5s apart, so by the time the NEXT render asked, the TTL had
+ * always already expired. The only caller of this function,
+ * adVisionQcService.isEnabled(), calls `refreshAdVisionQcEnabledCache()` —
+ * fire-and-forget — immediately before peeking, IN THE SAME synchronous
+ * tick, so that refresh can never have landed yet. Gating the peek on
+ * `expiresAt` therefore meant "I have not re-fetched THIS INSTANT" was read
+ * as "unknown", and the caller fell through to the env default — silently
+ * treating a merely-stale cache the same as never having read the DB at
+ * all. Measured effect: SystemConfig.adVisionQcEnabled=true, but the sync
+ * gate answered `false` on the large majority of real render calls.
+ *
+ * The fix: a value that has been loaded at least once is trusted until it
+ * is explicitly reset or re-read — `expiresAt` still exists and still drives
+ * `refreshAdVisionQcEnabledCache` below (that half of the TTL contract, "go
+ * get a fresher answer in the background once stale", is unchanged). What
+ * changed is only the SYNCHRONOUS answer handed back while that refresh is
+ * in flight: a few-seconds-stale real DB value, not a manufactured
+ * "unknown". A `resetAdVisionQcEnabledCache()` (e.g. right after
+ * `setAdVisionQcEnabled`, which also write-throughs the new value
+ * immediately) is what makes an operator flip felt without waiting on
+ * staleness at all.
+ *
+ * FAIL-SAFE DIRECTION, decided deliberately: serving the last known real
+ * value (even stale) is preferred over collapsing to the env default,
+ * because QC existing to catch is a documented ~1-in-3 competitor-logo /
+ * product-fidelity defect rate (CLAUDE.md §"Known open"), and an operator
+ * who just turned the flag ON is trusting that decision to take effect —
+ * silently failing OFF defeats the switch they just flipped. The ~$0.05/ad
+ * QC cost the other direction could occasionally over-spend by (continuing
+ * to run one extra check on a value that, unbeknownst to the stale cache,
+ * had just been flipped OFF) is bounded and small next to that. This
+ * reasoning does NOT extend to a truly cold cache (never loaded at all,
+ * e.g. the first call after a process boot) — there we have no signal
+ * whatsoever, not even a stale one, so `undefined` still falls through to
+ * the pre-existing "no override configured" → env → default-false
+ * precedence. That is not a staleness failure, it is genuine absence of
+ * data, and the existing default-OFF-when-unconfigured contract is correct
+ * for it.
  */
 function peekAdVisionQcEnabled() {
   if (!_adVisionQcCache.loaded) return undefined;
-  if (Date.now() >= _adVisionQcCache.expiresAt) return undefined;
   return _adVisionQcCache.value;
 }
 

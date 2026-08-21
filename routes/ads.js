@@ -2566,6 +2566,13 @@ async function renderDeriveOnlyVideoAd({
         `⚠️ brandScript[ad=${adId}] derive-only: titling failed — plate kept, not counted as success: ${scriptErr.message}`
       );
     }
+  } else {
+    // NO BRAND RESOLVED — same gap as the master path above: this never
+    // reaches renderBrandScriptAndSave, so it never reaches vision QC
+    // either. The derived plate would otherwise ship with NO Ad.visionQc
+    // at all.
+    const { qcAndStampVideoAd } = require('../services/brandScriptExecutor');
+    await qcAndStampVideoAd({ ad: adFinal, deliveredUrl: veoVideoUrl });
   }
 
   if (titlingFailed) {
@@ -2997,6 +3004,17 @@ async function renderOneInner(run, job, adId, index, renderToken) {
             `⚠️ brandScript[ad=${adId}]: titling failed — master kept, not counted as success: ${scriptErr.message}`
           );
         }
+      } else {
+        // NO BRAND RESOLVED (sourceMedia carried no brandId, or the lookup
+        // came back empty) — this NEVER reaches renderBrandScriptAndSave, so
+        // it never reaches uploadRenderAndStamp or the no-chrome branch
+        // either. Both of those call vision QC before the ad is considered
+        // delivered; this branch used to ship the raw master straight to
+        // 'draft' below with no equivalent call at all — a video ad with
+        // NO Ad.visionQc whatsoever, not even the {skipped:true,
+        // disabled:true} stub PR #260 added for exactly this visibility.
+        const { qcAndStampVideoAd } = require('../services/brandScriptExecutor');
+        await qcAndStampVideoAd({ ad: adFinal, deliveredUrl: veoVideoUrl });
       }
 
       if (titlingFailed) {

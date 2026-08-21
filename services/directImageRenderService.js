@@ -2577,7 +2577,19 @@ async function renderDirectImage(callArgs = {}) {
   if (skipVisionQc) return firstOutput;
 
   const adVisionQc = require('./adVisionQcService');
-  if (!adVisionQc.isEnabled()) {
+  // AWAIT the real gate — do NOT use the synchronous isEnabled() peek here.
+  // isEnabled() answers from a 5s-TTL cache and fires only a fire-and-forget
+  // refresh on a miss/expiry, so a call landing just after the TTL elapses
+  // (which is the NORMAL case — real renders are spaced far more than 5s
+  // apart) reads the cache as empty and falls through to the env default,
+  // even though SystemConfig.adVisionQcEnabled is genuinely true. This
+  // function is already async and already awaits runPostRenderQc below, so
+  // there is no reason to take the racy sync path — resolveEnabled() does a
+  // real (TTL-cached, but AWAITED) SystemConfig read and can never observe
+  // "cache miss" as "off". See services/adVisionQcService.js resolveEnabled
+  // vs isEnabled doc comments for the full precedence + fail-safe writeup.
+  const qcEnabledNow = await adVisionQc.resolveEnabled();
+  if (!qcEnabledNow) {
     // Real gate, not a swallowed error — but until this stamp, a flag-off
     // ad shipped with Ad.visionQc left at its schema default `null`, reading
     // identically to "inspected and passed" everywhere (summarizeVisionQc,
