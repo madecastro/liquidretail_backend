@@ -597,8 +597,8 @@ await ok('F3 a candidate with nothing lost yet (still-rendering, no needsRetry) 
   // however long the receipt-holding sibling takes to separately resolve.
   // The correct guard only defers when NOTHING has been lost AND something
   // is still genuinely rendering.
-  const m = persistOrphansStripped.match(/if\s*\(outcome\.stillRendering\s*>\s*0\s*&&\s*!outcome\.needsRetry\)\s*\{([\s\S]*?)\n\s{6}\}/);
-  assert.ok(m, 'could not locate the stillRendering-and-not-needsRetry defer guard inside persistOrphans');
+  const m = persistOrphansStripped.match(/if\s*\(!outcome\.isSettled\s*&&\s*!outcome\.needsRetry\)\s*\{([\s\S]*?)\n\s{6}\}/);
+  assert.ok(m, 'could not locate the !isSettled-and-not-needsRetry defer guard inside persistOrphans');
   assert.doesNotMatch(m[1], /\$set\b/,
     'a deferred candidate (real receipted work still outstanding, nothing lost) must not $set ANY field — ' +
     'only the audit $push is allowed; a hand-written status/counters write here is exactly the blind guess ' +
@@ -607,9 +607,36 @@ await ok('F3 a candidate with nothing lost yet (still-rendering, no needsRetry) 
   // prevent: a candidate with something ALREADY lost (needsRetry) must NOT
   // hit this defer branch even if another sibling is still rendering — it
   // must instead reach buildRunReconciliationUpdate and get failed for real.
-  assert.doesNotMatch(persistOrphansStripped, /if\s*\(!outcome\.isSettled\)/,
-    'persistOrphans must not gate on bare !outcome.isSettled anywhere — that reopens the mixed-shape regression ' +
-    '(a lost Ad alongside a still-rendering one must still fail the run, not wait on the still-rendering one)');
+  assert.doesNotMatch(persistOrphansStripped, /if\s*\(!outcome\.isSettled\)\s*\{/,
+    'persistOrphans must not gate on bare !outcome.isSettled ALONE anywhere (i.e. without also requiring ' +
+    '!outcome.needsRetry) — that reopens the mixed-shape regression (a lost Ad alongside a still-outstanding ' +
+    'one must still fail the run, not wait on the still-outstanding one)');
+});
+
+await ok('F4 persistOrphans projects the WIDE Ad field set classifyRunAdOutcome\'s titling-truth check needs (PR #278), not a status-only projection', () => {
+  // PR #278 (merged 2026-08-20, moments before this branch was rebased onto
+  // it) taught classifyRunAdOutcome to also check video-titling truth
+  // (isVideoTitlingSettled), which reads kind/renderUrl/veoVideoUrl/
+  // titlingResumeState/renderStage. A `.select('status')`-only projection
+  // silently reads every video Ad's `kind` as `undefined !== 'video'`, so it
+  // is treated as a static and the titling debt is never seen — the EXACT
+  // "would have silently no-op'd the whole fix" failure mode #278's own
+  // commit message warns about, now against THIS PR's two new call sites
+  // instead of the running-reaper it originally fixed. Revert-prove: widen
+  // this .select( call back down to 'status' only → this check fails, but
+  // (as measured while writing this check) nothing else in this file did —
+  // it was a genuine, previously-unpinned hole.
+  const adFindIdx = persistOrphansStripped.indexOf("Ad.find({ campaignRunIds: run.runId })");
+  assert.ok(adFindIdx !== -1, 'could not locate the per-run Ad.find( campaignRunIds: run.runId ) call inside persistOrphans');
+  const afterAdFind = persistOrphansStripped.slice(adFindIdx);
+  const selectMatch = afterAdFind.match(/\.select\(\s*'([^']*)'\s*\)\s*\n?\s*\.lean\(\)/);
+  assert.ok(selectMatch, 'could not locate the .select(...).lean() projection on persistOrphans\' per-run Ad.find call');
+  const fields = selectMatch[1].split(/\s+/).filter(Boolean);
+  for (const required of ['status', 'kind', 'renderUrl', 'veoVideoUrl', 'titlingResumeState', 'renderStage']) {
+    assert.ok(fields.includes(required),
+      `persistOrphans' Ad.find projection is missing "${required}" — classifyRunAdOutcome's titling-truth ` +
+      'check needs it, and losing it silently miscounts every video Ad instead of throwing');
+  }
 });
 
 // ── G. The GENERAL safety net — recently-'failed' runs get re-checked too ──
@@ -680,19 +707,37 @@ await ok('G3 worker.js skips a candidate with nothing lost yet (still-rendering,
   assert.ok(loopBody, 'could not locate the recently-failed healing loop, scoped to its own body');
   // Same guard-shape fix as F3 — NOT a bare !outcome.isSettled (see F3's
   // header for the mixed-shape regression that guard caused).
-  const m = loopBody.match(/if\s*\(outcome\.stillRendering\s*>\s*0\s*&&\s*!outcome\.needsRetry\)\s*continue;/);
-  assert.ok(m, 'the healing loop must skip (continue) a candidate with real receipt-holding work still outstanding and nothing yet lost');
-  assert.doesNotMatch(loopBody, /if\s*\(!outcome\.isSettled\)/,
-    'the healing loop must not gate on bare !outcome.isSettled anywhere — same regression F3 guards against');
+  const m = loopBody.match(/if\s*\(!outcome\.isSettled\s*&&\s*!outcome\.needsRetry\)\s*continue;/);
+  assert.ok(m, 'the healing loop must skip (continue) a candidate with real outstanding work and nothing yet lost');
+  assert.doesNotMatch(loopBody, /if\s*\(!outcome\.isSettled\)\s*continue;/,
+    'the healing loop must not gate on bare !outcome.isSettled ALONE — same regression F3 guards against');
   // Structural E10-style guarantee: nothing may write between the loop's
   // start and this exact continue statement — a write BEFORE the guard
   // would still pass a purely textual "does `continue` exist somewhere"
   // check, which is the specific weakness adversarial review flagged.
-  const guardIdx = loopBody.search(/if\s*\(outcome\.stillRendering\s*>\s*0\s*&&\s*!outcome\.needsRetry\)\s*continue;/);
+  const guardIdx = loopBody.search(/if\s*\(!outcome\.isSettled\s*&&\s*!outcome\.needsRetry\)\s*continue;/);
   const beforeGuard = loopBody.slice(0, guardIdx);
   assert.doesNotMatch(beforeGuard, /updateOne|updateMany/,
     'no write may happen before the still-rendering/no-needsRetry guard — a candidate must be classified before anything is written');
 });
+
+await ok('G4 the failed-run healing loop projects the same WIDE Ad field set (PR #278) as the running-run pass', () => {
+  const code = stripCommentLinesForWorker(workerSrcForE);
+  const loopBody = failedHealingLoopBody(code);
+  assert.ok(loopBody, 'could not locate the recently-failed healing loop, scoped to its own body');
+  const adFindIdx = loopBody.indexOf('Ad.find({ campaignRunIds: failedCandidate.runId })');
+  assert.ok(adFindIdx !== -1, 'could not locate the Ad.find( campaignRunIds: failedCandidate.runId ) call inside the healing loop');
+  const afterAdFind = loopBody.slice(adFindIdx);
+  const selectMatch = afterAdFind.match(/\.select\(\s*'([^']*)'\s*\)\s*\n?\s*\.lean\(\)/);
+  assert.ok(selectMatch, 'could not locate the .select(...).lean() projection on the healing loop\'s Ad.find call');
+  const fields = selectMatch[1].split(/\s+/).filter(Boolean);
+  for (const required of ['status', 'kind', 'renderUrl', 'veoVideoUrl', 'titlingResumeState', 'renderStage']) {
+    assert.ok(fields.includes(required),
+      `the failed-run healing loop's Ad.find projection is missing "${required}" — same PR #278 titling-truth ` +
+      'requirement as the running-run pass above it, and section F\'s persistOrphans call');
+  }
+});
+
 
 function stripCommentLinesForWorker(src) {
   return src

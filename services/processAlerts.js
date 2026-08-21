@@ -160,36 +160,49 @@ async function persistOrphans({ signal, role }) {
 
     let nDone = 0, nFailed = 0, nLeftRunning = 0;
     await Promise.all(candidates.map(async (run) => {
-      const claimedAds = await Ad.find({ campaignRunIds: run.runId }).select('status').lean();
+      // Wide projection, matching worker.js's reaper (PR #278, merged
+      // moments before this branch was rebased onto it): classifyRunAdOutcome
+      // now also checks video-titling truth (isVideoTitlingSettled), which
+      // needs kind/renderUrl/veoVideoUrl/titlingResumeState/renderStage — a
+      // status-only projection would silently read every video Ad as NOT
+      // titling-settled (unselected `kind` !== 'video') and defer/misjudge
+      // runs that were actually fully delivered.
+      const claimedAds = await Ad.find({ campaignRunIds: run.runId })
+        .select('status kind renderUrl veoVideoUrl titlingResumeState renderStage')
+        .lean();
       const outcome = classifyRunAdOutcome(claimedAds);
       const detail = `${message} — run ${run.runId}: ${outcome.succeeded} succeeded, ` +
         `${outcome.failed} failed, ${outcome.stillRendering} still rendering (receipt held), ` +
+        `${outcome.titlingIncomplete} titling-incomplete master(s), ` +
         `${outcome.requeuedAway} requeued (of ${claimedAds.length} claimed)`;
       // Defer ONLY when nothing has been lost yet AND something is still
-      // genuinely rendering — i.e. `isSettled` alone is the WRONG guard here.
-      // Adversarially reviewed 2026-08-20 (two independent passes, same
-      // finding): the common deploy shape is MIXED — some claimed Ads already
-      // receipt-holding and still `rendering` (left alone on purpose above)
-      // AND OTHER claimed Ads that were receipt-free and just got requeued to
-      // `queued` a few lines up. `services/strandedRunSweeper.js` only drains
-      // that queued/receipt-free tail once its OWNING run reads
-      // `status:'failed'` (`findStranded`'s filter). Gating on bare
-      // `isSettled` left the run `running` in that mixed case — invisible to
-      // the sweeper AND still occupying `buildActiveRunsFilter`'s concurrency
-      // gate — until every receipt-holding sibling separately finished, which
-      // can take many minutes (bootRecoveryService's own staleness window) to
-      // the full ~600s Omni poll ceiling. Failing the run the moment ANYTHING
-      // was genuinely lost (`needsRetry`) does not touch the still-rendering
-      // Ad's own status at all — that Ad keeps recovering for free exactly as
-      // before, in parallel — it only unblocks the gate and the sweeper for
-      // the OTHER, already-lost siblings sooner.
-      if (outcome.stillRendering > 0 && !outcome.needsRetry) {
-        // A receipt-holding Ad is still genuinely 'rendering' and NOTHING
-        // else was lost — the money guard above already left it that way on
-        // purpose so titlingResumeService/bootRecoveryService can finish it
-        // for free. Stamping this run 'failed' now would be exactly the
+      // genuinely outstanding — `!outcome.isSettled` (receipt-holding Ad
+      // still `rendering`, OR, since PR #278, a video master delivered but
+      // not yet titled) — AND NOT `needsRetry`. NOT `!isSettled` alone:
+      // adversarially reviewed 2026-08-20 (two independent passes, same
+      // finding): the common deploy shape is MIXED — some claimed Ads still
+      // outstanding (left alone on purpose above/below) AND OTHER claimed
+      // Ads that were receipt-free and just got requeued to `queued` a few
+      // lines up. `services/strandedRunSweeper.js` only drains that
+      // queued/receipt-free tail once its OWNING run reads `status:'failed'`
+      // (`findStranded`'s filter). Gating on bare `!isSettled` left the run
+      // `running` in that mixed case — invisible to the sweeper AND still
+      // occupying `buildActiveRunsFilter`'s concurrency gate — until every
+      // outstanding sibling separately finished, which can take many minutes
+      // (bootRecoveryService's/titlingResumeService's own staleness windows)
+      // up to the full ~600s Omni poll ceiling. Failing the run the moment
+      // ANYTHING was genuinely lost (`needsRetry`) does not touch the
+      // outstanding Ad's own status at all — it keeps recovering for free
+      // exactly as before, in parallel — it only unblocks the gate and the
+      // sweeper for the OTHER, already-lost siblings sooner.
+      if (!outcome.isSettled && !outcome.needsRetry) {
+        // Something is still genuinely outstanding (receipt-holding
+        // `rendering`, or an untitled paid master) and NOTHING else was
+        // lost — the money guards above/elsewhere already left those alone
+        // on purpose so titlingResumeService/bootRecoveryService can finish
+        // them for free. Stamping this run 'failed' now would be exactly the
         // blind guess this fix exists to remove; leave status untouched and
-        // let a later tick decide once that Ad has actually settled.
+        // let a later tick decide once everything outstanding has settled.
         nLeftRunning++;
         return CampaignRun.updateOne(
           { _id: run._id, status: { $nin: ['done', 'failed'] } },
