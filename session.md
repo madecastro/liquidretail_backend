@@ -146,6 +146,23 @@ it clears it back to this placeholder in the same commit that closes it out.)_
   `scripts/verifyAdVisionQcSurfacing.js`, `scripts/verifyImageRecovery.js`.
   `npm test` — **181/181** passed. `npm run lint` clean. Read-only against
   prod; `SystemConfig.adVisionQcEnabled` untouched (still `true`).
+- **Also 2026-08-20, a separate concurrent session: PR #282, open, not
+  self-merged** — `feat/qc-failed-status-and-reason`. Owner decision: a QC-failed
+  ad now delivers as `status:'failed'` (video path — statics already did, via
+  the existing job-failure/recovery handling) with a `visionQc.failureDetail`
+  that is byte-identical to what `alertQcFailure` sends Slack (it now returns
+  that string; callers stamp it before persisting). Rebased onto PR #276 below
+  (both touched `brandScriptExecutor.js`'s new `qcAndStampVideoAd` shared
+  helper) — the status flip now lives INSIDE `qcAndStampVideoAd` itself, so
+  all five of #276's callers get it, not just the two this PR originally
+  touched. Also fixes `routes/catalog.js`'s `GET /:id/ads-detail` — the
+  Product Ads detail endpoint — which never carried `visionQc`/`renderError`
+  in its own `$project` allowlist at all. Extended
+  `scripts/verifyAdVisionQcSurfacing.js` (+20 checks, hand revert-proven three
+  ways, re-run green post-rebase). `npm test` 181/181, lint clean. Paired
+  frontend PR `liquidretail#68` (gallery pill + detail-screen description).
+  Full detail:
+  `session.d/2026-08-20_qc-failed-status-and-slack-reason-parity-pr282.md`.
 - **PR #274, open, not self-merged** — `fix/concurrency-and-derive-wait-backup`. Two owner-approved
   changes: (a) `VEO_CONCURRENCY` 12→24 / `REMOTION_QUEUE_CONCURRENCY` 4→8 in
   `config/defaults.env` (submit+poll-only and low-risk vs. a memory-bound
