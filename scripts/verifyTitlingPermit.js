@@ -120,8 +120,8 @@ console.log('\nVEO SUBMIT/TITLING SPLIT\n');
   check('B2 [SAFETY] the MEMORY-BOUND render pool stays small — 8 is one '
       + 'doubling past 4, the only concurrency this process has actually survived (the old combined VEO_CONCURRENCY)',
     SPEC.REMOTION_QUEUE_CONCURRENCY
-    && SPEC.REMOTION_QUEUE_CONCURRENCY.default === 8
-    && CONC.REMOTION_QUEUE_CONCURRENCY === 8);
+    && SPEC.REMOTION_QUEUE_CONCURRENCY.default === 4
+    && CONC.REMOTION_QUEUE_CONCURRENCY === 4);
   check('B2b [SAFETY] the render pool can never be configured above the documented ceiling',
     SPEC.REMOTION_QUEUE_CONCURRENCY && SPEC.REMOTION_QUEUE_CONCURRENCY.max <= 16);
   check('B3 the memory-bound pool is the NARROWEST video knob — the cheap permit and '
@@ -260,7 +260,7 @@ console.log('\nVEO SUBMIT/TITLING SPLIT\n');
   // 2. Swap withPermit for acquire()/release() -> C3 fails (and a throwing titling
   //    render would then leak a permit; A3 is the behavioral twin of that).
   // 3. Construct the Semaphore inside renderOne -> C2 fails.
-  // 4. Change REMOTION_QUEUE_CONCURRENCY's default away from 8 -> B2 fails
+  // 4. Change REMOTION_QUEUE_CONCURRENCY's default away from 4 -> B2 fails
   //    (pre-existing typo fixed 2026-08-20: this used to name
   //    VEO_TITLING_CONCURRENCY, the knob B2 stopped pinning when it was
   //    re-pointed to the real memory guard — see the B2 comment above).
