@@ -69,22 +69,51 @@ it clears it back to this placeholder in the same commit that closes it out.)_
 *(Replace this whole section, don't append to it, when it goes stale.)*
 
 - Trunk `main` is moving fast — always `git fetch` before trusting a SHA here.
-  As of this update, `main` is at `9fb14705` (#272, reconciles a stale
-  `CampaignRun` from the real Ad truth instead of trusting process-local
-  status writes), with #268 (static ad-grid tile downscale) and #271
-  (brand-scope `mediaAssignmentService` attach/detach) merged just before it.
-  #260-through-#265 (vision-qc silent gate, typeface classification, funnel
-  stage + retailer productUrl on projections, verify-infra hardening) are all
-  merged — the PR #260 narrative that used to live in this section is now
-  historical; see `session.d/2026-08-19_vision-qc-silent-gate-fixed-pr-260.md`
-  if you need it. `npm test` (parallel, `scripts/runVerifySuite.js`) remains
-  the gate; **do NOT trust `npm run test:affected`** — confirmed hole in its
-  changed-file basename filter (`length >= 4`), so `models/Ad.js` → `"Ad"` →
-  excluded; editing it (or `routes/ads.js`, `"ads"`) alone can report "nothing
-  to run" and exit 0 while dependent scripts never run. Use plain `npm test`
-  (full suite) until this is fixed.
-- **Newest backend session (this one, 2026-08-20): PR #274, open, not
-  self-merged** — `fix/concurrency-and-derive-wait-backup`. Two owner-approved
+  As of this update, `main` is at `9534502a` (#275, reverts the Meta video
+  prompt hook-first standardization back to pre-standardization text and
+  applies the same text to PMax), with #274, #273, #272, #271, #268 merged
+  just before it. #260-through-#265 (vision-qc silent gate, typeface
+  classification, funnel stage + retailer productUrl on projections,
+  verify-infra hardening) are all merged — the PR #260 narrative that used to
+  live in this section is now historical; see
+  `session.d/2026-08-19_vision-qc-silent-gate-fixed-pr-260.md` if you need it
+  (**and see the new PR #276 bullet below — #260 fixed the missing
+  disabled-stub visibility; #276 fixes a DIFFERENT, deeper bug in the same
+  gate that #260 did not touch: a cache-race that read a genuinely-ON DB flag
+  as off on most real calls**). `npm test` (parallel,
+  `scripts/runVerifySuite.js`) remains the gate; **do NOT trust
+  `npm run test:affected`** — confirmed hole in its changed-file basename
+  filter (`length >= 4`), so `models/Ad.js` → `"Ad"` → excluded; editing it
+  (or `routes/ads.js`, `"ads"`) alone can report "nothing to run" and exit 0
+  while dependent scripts never run. Use plain `npm test` (full suite) until
+  this is fixed.
+- **Newest backend session (this one, 2026-08-20): PR #276, open, not
+  self-merged** — `fix/vision-qc-cache-race`. Owner turned
+  `SystemConfig.adVisionQcEnabled` on and it barely ran: 11/18 delivered
+  statics on one run stamped `disabled:true` with the flag genuinely on, and
+  all 14 delivered videos had no `visionQc` at all. Root cause #1: the
+  synchronous `adVisionQcService.isEnabled()` gate fired a fire-and-forget
+  cache refresh and peeked the cache in the SAME TICK, so any call landing
+  past the 5s TTL (the normal case in production) read a cache miss as "off".
+  Fixed by switching all three real callers to `await resolveEnabled()` (the
+  pre-existing, never-racy async resolver — they are all already `async`
+  functions already awaiting a billable vision call a few lines later) plus a
+  defense-in-depth fix in `systemConfigService.peekAdVisionQcEnabled()` itself
+  (serve the last-known value across staleness instead of collapsing to env).
+  Root cause #2 (separate, also reported): several video paths (no-brand
+  branches in `routes/ads.js` ×2 and `adRegenerateService.js`, a swallowed
+  chrome-throw in `adRegenerateService.js`, `titlingResumeService.js`'s
+  give-up-on-brand branch) never reach `renderBrandScriptAndSave` at all, so
+  they never reach vision QC either — not even PR #260's disabled stub. Added
+  a shared `qcAndStampVideoAd()` helper and wired it into all five spots.
+  Full write-up, revert-proof notes, and the mocked-`Date.now()` TTL
+  regression test in
+  `session.d/2026-08-20_vision-qc-ttl-cache-race-and-video-visibility-gaps-pr276.md`.
+  Extended `scripts/verifyQcGateWiring.js` (new section K),
+  `scripts/verifyAdVisionQcSurfacing.js`, `scripts/verifyImageRecovery.js`.
+  `npm test` — **181/181** passed. `npm run lint` clean. Read-only against
+  prod; `SystemConfig.adVisionQcEnabled` untouched (still `true`).
+- **PR #274, open, not self-merged** — `fix/concurrency-and-derive-wait-backup`. Two owner-approved
   changes: (a) `VEO_CONCURRENCY` 12→24 / `REMOTION_QUEUE_CONCURRENCY` 4→8 in
   `config/defaults.env` (submit+poll-only and low-risk vs. a memory-bound
   in-process render pool that needs a full-run memory-graph check before going
@@ -103,7 +132,7 @@ it clears it back to this placeholder in the same commit that closes it out.)_
 - Open PRs at the time of this update: RPD **#210/#212** (carried forward from
   the prior snapshot as "deliberately deferred — do not touch"; not
   independently re-verified this session — confirm status before assuming
-  it still holds). Backend: **#274** above.
+  it still holds). Backend: **#276, #274** above.
 - Offline verify: `npm test` (or `node scripts/runVerifySuite.js` directly)
   — **181 scripts** as of this update (re-count before quoting, this number
   drifts — it was 174 two snapshots ago). `npm run lint` enables exactly one

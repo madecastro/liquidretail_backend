@@ -199,6 +199,15 @@ async function runBehavioralChecks() {
 
   const origFindById = Ad.findById;
   const origIsEnabled = adVisionQc.isEnabled;
+  // FIXED 2026-08-20 — maybeQcRecoveredPlate now awaits resolveEnabled(),
+  // not the synchronous isEnabled() TTL-cache peek (that peek is exactly
+  // the production incident this file's own header discusses: a stale
+  // cache silently read a genuinely-on SystemConfig flag as off). Stubbing
+  // only isEnabled() here would leave resolveEnabled() unstubbed, which
+  // would fall through to a REAL (unstubbed, unreachable in this offline
+  // harness) SystemConfig.findOne() Mongo call and hang for the full
+  // mongoose buffering timeout before failing soft to the env default.
+  const origResolveEnabled = adVisionQc.resolveEnabled;
 
   const staleDisabledStamp = {
     schemaVersion: 1,
@@ -220,6 +229,7 @@ async function runBehavioralChecks() {
     };
   };
   adVisionQc.isEnabled = () => true; // operator flipped the gate back ON
+  adVisionQc.resolveEnabled = async () => true; // same signal, on the real (awaited) gate path
 
   try {
     const fakeAd = {
@@ -253,6 +263,7 @@ async function runBehavioralChecks() {
   } finally {
     Ad.findById = origFindById;
     adVisionQc.isEnabled = origIsEnabled;
+    adVisionQc.resolveEnabled = origResolveEnabled;
   }
 }
 

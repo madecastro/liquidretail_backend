@@ -787,7 +787,24 @@ async function runVideoFull(adId, prompt, progressRun = null, videoModel = null,
       await brandScriptExecutor.renderBrandScriptAndSave({ ad: adFinal, brand });
     } catch (scriptErr) {
       console.warn(`🔁 regenerate[ad=${adId}]: brand-script failed (non-fatal) — ${scriptErr.message}`);
+      // Chrome/titling threw before ever reaching uploadRenderAndStamp, so
+      // vision QC never ran on this render either — and because this catch
+      // is deliberately non-fatal (the raw master, already stamped as
+      // renderUrl above, is a perfectly good fallback), the ad keeps
+      // looking "delivered" with a brand new render nobody inspected. QC
+      // the raw plate now so an operator can tell "titling failed but this
+      // was checked" from "titling failed and nobody looked".
+      await brandScriptExecutor.qcAndStampVideoAd({ ad: adFinal, deliveredUrl: veoResult.videoUrl, brandName: brand?.name || null });
     }
+  } else {
+    // NO BRAND RESOLVED — this never reaches renderBrandScriptAndSave, so it
+    // never reaches vision QC either (uploadRenderAndStamp and the
+    // no-chrome branch both live inside renderBrandScriptAndSave's call
+    // graph). The raw regenerated master ships as renderUrl regardless
+    // (stamped above); without this it would ship with NO Ad.visionQc at
+    // all — same gap as the two no-brand branches in routes/ads.js.
+    const adFinal = await Ad.findById(adId).lean();
+    await brandScriptExecutor.qcAndStampVideoAd({ ad: adFinal, deliveredUrl: veoResult.videoUrl });
   }
 }
 

@@ -538,6 +538,135 @@ installStub();
       assert.strictEqual(qc.isEnabled(), false);
     });
 
+    // ── K. TTL-EXPIRY REGRESSION — the exact bug reported live 2026-08-20 ──
+    // Owner repro, reproduced here without real sleeps (Date.now is mocked
+    // forward instead of waiting out the TTL):
+    //   RESOLVE_ENABLED_ASYNC              true   (awaits the DB read — correct)
+    //   IS_ENABLED_SYNC_CALL_1              true   (cache still warm)
+    //   IS_ENABLED_SYNC_CALL_2 (+8s gap)    ??? ← was `false` pre-fix (BUG),
+    //                                             must be `true` post-fix
+    //   IS_ENABLED_SYNC_CALL_3 (+200ms)     true   (unchanged either way)
+    //
+    // A harness that only ever calls isEnabled()/peekAdVisionQcEnabled() on a
+    // WARM cache (I1/I2 above) passes against the broken code — the whole
+    // point of this section is a call landing AFTER the TTL elapses, which
+    // is the NORMAL case in production (real renders are spaced further
+    // apart than the 5s TTL) but was never exercised by I1/I2.
+    function withMockedNow(offsetMs, fn) {
+      const base = Date.now();
+      const orig = Date.now;
+      Date.now = () => base + offsetMs;
+      try {
+        return fn();
+      } finally {
+        Date.now = orig;
+      }
+    }
+
+    // Async-safe variant — keeps Date.now mocked until the returned promise
+    // SETTLES, not just until it is created. K1-K4 below only ever wrap a
+    // synchronous function (peekAdVisionQcEnabled / isEnabled), where the
+    // plain version above is exact. K5 wraps resolveEnabled(), which awaits
+    // internally, so it needs this one.
+    async function withMockedNowAsync(offsetMs, fn) {
+      const base = Date.now();
+      const orig = Date.now;
+      Date.now = () => base + offsetMs;
+      try {
+        return await fn();
+      } finally {
+        Date.now = orig;
+      }
+    }
+
+    await checkAsync('K1 peekAdVisionQcEnabled survives past the TTL (stale-but-real, not undefined)', async () => {
+      resetAll();
+      stubDbValue = true;
+      systemConfig.resetAdVisionQcEnabledCache();
+      await systemConfig.getAdVisionQcEnabled(); // warm the cache at "now"
+      // Jump past AD_VISION_QC_CACHE_TTL_MS (5000ms) without any reset or
+      // re-read — this is exactly what a real render arriving >5s after the
+      // last one looks like.
+      const peeked = withMockedNow(systemConfig.AD_VISION_QC_CACHE_TTL_MS + 3000, () =>
+        systemConfig.peekAdVisionQcEnabled());
+      assert.strictEqual(peeked, true,
+        'a value loaded once must still be readable after its TTL elapses — ' +
+        'expiry should trigger a BACKGROUND refresh, not erase the last known answer');
+    });
+
+    await checkAsync('K2 isEnabled() past the TTL still reflects the true DB value, not env', async () => {
+      resetAll();
+      // Env is the OPPOSITE of the DB value — if the bug is present, the
+      // stale-cache fallback silently answers the env value instead.
+      process.env.AD_VISION_QC_ENABLED = 'false';
+      stubDbValue = true;
+      systemConfig.resetAdVisionQcEnabledCache();
+      await systemConfig.getAdVisionQcEnabled(); // IS_ENABLED_SYNC_CALL_1 equivalent: warm
+      assert.strictEqual(qc.isEnabled(), true, 'sanity: warm cache must read true first');
+
+      // IS_ENABLED_SYNC_CALL_2 (+8s gap, i.e. past the 5s TTL). Pre-fix this
+      // read `undefined` from peek (expired) and fell through to envEnabled()
+      // === false — the exact production incident (11/18 statics stamped
+      // disabled:true with the flag genuinely on).
+      const call2 = withMockedNow(8000, () => qc.isEnabled());
+      assert.strictEqual(call2, true,
+        'CALL_2 (+8s, past TTL): must still read the true DB value (true), ' +
+        'not silently fall back to env (false) merely because nobody has ' +
+        're-fetched in the last 8 seconds');
+
+      // IS_ENABLED_SYNC_CALL_3 (+200ms more) — unaffected either way, kept
+      // for parity with the owner's exact repro shape.
+      const call3 = withMockedNow(8200, () => qc.isEnabled());
+      assert.strictEqual(call3, true, 'CALL_3 (+8.2s): still true');
+    });
+
+    await checkAsync('K3 isEnabled() past the TTL still reflects DB false over env true', async () => {
+      // Mirror of K2 in the other direction — the bug is direction-agnostic
+      // (it reads "whatever env says" once stale), so pin both.
+      resetAll();
+      process.env.AD_VISION_QC_ENABLED = 'true';
+      stubDbValue = false;
+      systemConfig.resetAdVisionQcEnabledCache();
+      await systemConfig.getAdVisionQcEnabled();
+      assert.strictEqual(qc.isEnabled(), false, 'sanity: warm cache must read false first');
+
+      const stale = withMockedNow(9000, () => qc.isEnabled());
+      assert.strictEqual(stale, false,
+        'past TTL, isEnabled() must still honour the DB false (explicit kill-switch), ' +
+        'not fall through to env true just because the cache is stale');
+    });
+
+    await checkAsync('K4 a TRULY cold cache (never loaded) still falls through to env — unchanged', async () => {
+      // Distinguishes "stale" (K1-K3: a real answer exists, just past its
+      // TTL) from "cold" (nothing has EVER been read in this process) — only
+      // the latter is genuine absence of data and should still default via
+      // env, matching the pre-existing "unconfigured -> off" contract.
+      resetAll();
+      process.env.AD_VISION_QC_ENABLED = 'true';
+      systemConfig.resetAdVisionQcEnabledCache();
+      assert.strictEqual(systemConfig.peekAdVisionQcEnabled(), undefined,
+        'never-loaded cache must still peek as undefined, not invent a value');
+      assert.strictEqual(qc.isEnabled(), true,
+        'a truly cold cache falls through to env — this is "unconfigured", not "stale"');
+    });
+
+    await checkAsync('K5 resolveEnabled() (the async path) is correct across the same TTL gap', async () => {
+      // The async path was never racy (it awaits a real read), but pin it
+      // alongside the sync-path regression so a future change to either
+      // cannot silently reintroduce staleness-as-off asymmetry between them.
+      resetAll();
+      process.env.AD_VISION_QC_ENABLED = 'false';
+      stubDbValue = true;
+      systemConfig.resetAdVisionQcEnabledCache();
+      const getCfg = () => systemConfig.getAdVisionQcEnabled();
+      assert.strictEqual(await qc.resolveEnabled({ getAdVisionQcEnabled: getCfg }), true);
+      const stalePeekButRealRead = await withMockedNowAsync(8000, () =>
+        qc.resolveEnabled({ getAdVisionQcEnabled: getCfg }));
+      assert.strictEqual(stalePeekButRealRead, true,
+        'resolveEnabled() awaits a real read every time its own cache is stale — ' +
+        'must never regress to answering from env just because time has passed');
+    });
+
     // ── J. source wiring: schema + service field name ────────────────
     check('J1 models/SystemConfig.js source contains adVisionQcEnabled', () => {
       const src = fs.readFileSync(

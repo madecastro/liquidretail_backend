@@ -338,7 +338,15 @@ async function maybeQcRecoveredPlate({ ad, brand, surface, dims, renderUrl }) {
     console.warn(`   ⚠️  imageRecovery: adVisionQc load failed: ${err.message}`);
     return null;
   }
-  if (!adVisionQc.isEnabled()) {
+  // AWAIT the real gate — see the matching comment in
+  // directImageRenderService.js / brandScriptExecutor.js. This function is
+  // already `async` (it awaits the billable vision call below), so there is no reason to
+  // read the racy sync isEnabled() cache peek: a call landing just past the
+  // 5s TTL (the normal case for recovery, which runs on its own poll cadence,
+  // not in lockstep with the cache) would read a cache miss as "off" even
+  // when SystemConfig.adVisionQcEnabled is genuinely true.
+  const qcEnabledNow = await adVisionQc.resolveEnabled();
+  if (!qcEnabledNow) {
     adVisionQc.warnQcDisabledOnce('recovered ad');
     return adVisionQc.buildPersistedVerdict({
       passed: false, skipped: true, disabled: true,

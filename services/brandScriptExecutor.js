@@ -1670,7 +1670,15 @@ function resolveTitlingEngine(brand, ad) {
 async function runVideoVisionQcForAd({ ad, deliveredUrl, brandName = null }) {
   try {
     const adVisionQc = require('./adVisionQcService');
-    if (!adVisionQc.isEnabled()) {
+    // AWAIT the real gate — see the matching comment in
+    // directImageRenderService.js. This function is already `async` and
+    // already awaits runVideoPostRenderQc a few lines below, so there is no
+    // reason to read the racy sync isEnabled() cache peek: a call landing
+    // just past the 5s TTL (the normal case — real renders are spaced much
+    // further apart than that) would read a cache miss as "off" even when
+    // SystemConfig.adVisionQcEnabled is genuinely true.
+    const qcEnabledNow = await adVisionQc.resolveEnabled();
+    if (!qcEnabledNow) {
       adVisionQc.warnQcDisabledOnce('video ad');
       return adVisionQc.buildPersistedVerdict({
         passed: false, skipped: true, disabled: true,
@@ -1781,9 +1789,71 @@ async function runVideoVisionQcForAd({ ad, deliveredUrl, brandName = null }) {
     return qcResult.visionQc;
   } catch (err) {
     // MUST NEVER throw into uploadRenderAndStamp — see file comment above.
+    //
+    // FIXED 2026-08-20 — this used to `return null`, which the caller reads
+    // as "nothing to stamp" (see the `if (videoVisionQc)` guard at both call
+    // sites), leaving Ad.visionQc untouched. That is the EXACT visibility
+    // gap this whole file's disabled-gate fix (2026-08-19) closed for the
+    // "QC is off" case, reopened for "QC threw" instead: an infra failure
+    // (frame-URL build, a Brand/CatalogProduct lookup, the vision call
+    // itself) is indistinguishable from "not yet processed" or, worse, from
+    // "inspected and passed" — the exact absence-read-as-clean bug this
+    // service exists to prevent. Build the same kind of real, queryable
+    // stub `runPostRenderQc`'s own throw-handling branch does for statics
+    // (adVisionQcService.runPostRenderQc's `catch` around `judge(...)`),
+    // instead of silently shipping unstamped.
+    const msg = (err && err.message) ? err.message : String(err || 'unknown');
     console.warn(
-      `   ⚠️  brandScript[ad=${ad && ad._id}]: vision QC (video) infra error — shipping unstamped: ${err.message}`
+      `   ⚠️  brandScript[ad=${ad && ad._id}]: vision QC (video) infra error — shipping with a skipped stub: ${msg}`
     );
+    try {
+      const adVisionQc = require('./adVisionQcService');
+      return adVisionQc.buildSkippedVerdict(`vision QC (video) infra error: ${msg}`);
+    } catch {
+      // adVisionQcService itself would not even load — truly nothing left
+      // to stamp with. Extremely unlikely (the same require succeeded a few
+      // lines up in the try) but this function must still never throw.
+      return null;
+    }
+  }
+}
+
+/**
+ * Run video vision QC and merge the verdict onto Ad.visionQc — the shared
+ * two-step (call runVideoVisionQcForAd, then $set the result) every path
+ * that ships a video ad WITHOUT ever calling renderBrandScript needs.
+ *
+ * DEFINED ONCE, IMPORTED EVERYWHERE — same convention this repo already
+ * uses for resolveDeriveFromMaster / receiptFree / adArchiveDigest (see
+ * CLAUDE.md §4 "repo traps"): a duplicated copy at each call site is exactly
+ * how this class of gap opens, because it is easy to copy the QC call and
+ * forget the `if (videoVisionQc)` write, or to copy the write and forget the
+ * `brandName` fallback. Callers today: this file's own "no chrome
+ * configured" branch (below), and the "no brand resolved" branches in
+ * routes/ads.js (master + derive-only video mint), services/
+ * adRegenerateService.js (video regenerate), and
+ * services/titlingResumeService.js (the give-up-on-brand branch) — all four
+ * of which ship a delivered video ad's raw master with no titling step and,
+ * before this helper existed, with NO Ad.visionQc field at all: not even
+ * the {skipped:true, disabled:true} stub PR #260 added for exactly this
+ * visibility. `runVideoVisionQcForAd` never throws and resolves `brandName`
+ * from `ad.brandId` itself when none is passed, so a caller that never
+ * managed to resolve a Brand doc (that is the whole reason it is calling
+ * this) can still call it with nothing but the ad and a URL.
+ *
+ * Never throws — belt-and-braces around the Ad.updateOne write, since
+ * runVideoVisionQcForAd already guarantees it does not.
+ */
+async function qcAndStampVideoAd({ ad, deliveredUrl, brandName = null }) {
+  try {
+    const Ad = require('../models/Ad');
+    const videoVisionQc = await runVideoVisionQcForAd({ ad, deliveredUrl, brandName });
+    if (videoVisionQc) {
+      await Ad.updateOne({ _id: ad._id }, { $set: { visionQc: videoVisionQc } });
+    }
+    return videoVisionQc || null;
+  } catch (err) {
+    console.warn(`   ⚠️  brandScript[ad=${ad && ad._id}]: qcAndStampVideoAd failed: ${err.message}`);
     return null;
   }
 }
@@ -1837,9 +1907,14 @@ async function uploadRenderAndStamp({ ad, finalPath, tempDir, timings, titlingSn
     // its actual render rather than an intermediate buffer. Merged into the
     // SAME $set/updateOne below so the renderUrl stamp and its QC verdict
     // commit atomically — no window where a video ad has a renderUrl but a
-    // stale/absent visionQc. Never throws (see runVideoVisionQcForAd);
-    // returns null when QC is disabled, in which case Ad.visionQc is left
-    // untouched, same as the static path's early-return-without-stamping.
+    // stale/absent visionQc. Never throws (see runVideoVisionQcForAd) and,
+    // as of 2026-08-20, always returns a real stamped verdict object — a
+    // {skipped:true, disabled:true} stub when the gate is off, a
+    // {skipped:true, reason:'vision QC (video) infra error: ...'} stub on
+    // an internal throw, or a real pass/fail verdict otherwise. The
+    // `if (videoVisionQc)` guard below is therefore belt-and-braces, not
+    // load-bearing — kept because runVideoVisionQcForAd's own contract only
+    // promises "never throws", not "never returns falsy".
     const videoVisionQc = await runVideoVisionQcForAd({ ad, deliveredUrl: uploaded.secure_url, brandName });
     if (videoVisionQc) set.visionQc = videoVisionQc;
     await Ad.updateOne(
@@ -2053,17 +2128,7 @@ async function renderBrandScriptAndSave({ ad, brand, presetOverride = null }) {
     // but the ad still SHIPS a delivered video (its raw Grok master, already
     // stamped as renderUrl upstream at Stage 2.5 in routes/ads.js) — it must
     // not silently skip vision QC just because there was no titling step.
-    try {
-      const Ad = require('../models/Ad');
-      const videoVisionQc = await runVideoVisionQcForAd({
-        ad, deliveredUrl: ad.veoVideoUrl, brandName: brand?.name || null
-      });
-      if (videoVisionQc) {
-        await Ad.updateOne({ _id: ad._id }, { $set: { visionQc: videoVisionQc } });
-      }
-    } catch (err) {
-      console.warn(`   ⚠️  brandScript[ad=${ad._id}]: vision QC (video, no-chrome path) failed: ${err.message}`);
-    }
+    await qcAndStampVideoAd({ ad, deliveredUrl: ad.veoVideoUrl, brandName: brand?.name || null });
     return { skipped: true, reason: 'no-chrome', format: renderer.format };
   }
   if (!ad?.veoVideoUrl) {
@@ -2105,6 +2170,12 @@ module.exports = {
   // Mongo lookups + one vision call when the gate IS on) to drive directly
   // with the require-layer model stubs the harness already uses elsewhere.
   runVideoVisionQcForAd,
+  // Shared helper for every "ships a video ad with no titling step" branch
+  // outside this file — routes/ads.js (master + derive-only mint),
+  // adRegenerateService.js (video regenerate), titlingResumeService.js (the
+  // give-up-on-brand branch). See its own doc comment for why this must stay
+  // ONE function, imported, not reimplemented per caller.
+  qcAndStampVideoAd,
   // Re-export for harnesses that pin funnel-preset threading without
   // pulling the whole generation service.
   resolveFunnelPresetOverride: (ad) => {

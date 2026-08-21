@@ -568,8 +568,20 @@ function withStubbedAdVisionQc(modulePath, extra = {}) {
     id: qcPath, filename: qcPath, loaded: true,
     exports: {
       isEnabled: () => false,
+      // FIXED 2026-08-20 — the three real callers now `await resolveEnabled()`
+      // instead of the racy sync `isEnabled()` (see systemConfigService.js /
+      // adVisionQcService.js for the TTL-cache-race fix this stub must stay
+      // in sync with). This stub must implement BOTH gate functions: a
+      // caller missing this would throw `TypeError: ... is not a function`
+      // rather than exercising the gate-off branch under test.
+      resolveEnabled: async () => false,
       warnQcDisabledOnce: (label) => { warnCalls.push(label); },
       buildPersistedVerdict: (args) => qc.buildPersistedVerdict(args),
+      // Delegate to the REAL implementation (pure, no I/O) rather than
+      // re-stubbing it — needed by runVideoVisionQcForAd's infra-error catch
+      // (services/brandScriptExecutor.js), which now builds a real skipped
+      // stub instead of returning null on an internal throw.
+      buildSkippedVerdict: (reason) => qc.buildSkippedVerdict(reason),
       ...extra
     }
   };
@@ -640,8 +652,17 @@ await (async () => {
 
 check('D4 directImageRenderService\'s gate-off early return stamps a disabled verdict, not a bare `return firstOutput`', () => {
   const src = fs.readFileSync(path.join(__dirname, '..', 'services', 'directImageRenderService.js'), 'utf8');
-  const idx = src.indexOf('if (!adVisionQc.isEnabled()) {');
+  // FIXED 2026-08-20 — the gate is now `await adVisionQc.resolveEnabled()`
+  // (assigned to qcEnabledNow), not the racy sync `isEnabled()` peek. Locate
+  // via the resolved-boolean guard, which is what actually gates the branch
+  // now; a literal `adVisionQc.isEnabled()` search would silently stop
+  // finding anything the day that sync path is fully retired.
+  const idx = src.indexOf('if (!qcEnabledNow) {');
   assert.ok(idx !== -1, 'could not locate the gate-off early return in directImageRenderService.js');
+  // The gate must be resolved via the async, non-racy path.
+  const gateSetup = src.slice(Math.max(0, idx - 400), idx);
+  assert.match(gateSetup, /await\s+adVisionQc\.resolveEnabled\(\)/,
+    'the gate must be resolved via awaited resolveEnabled(), not the synchronous isEnabled() TTL-cache peek');
   const closeIdx = src.indexOf('\n  }\n', idx); // this branch's own closing brace, one indent level in
   const branch = src.slice(idx, closeIdx !== -1 ? closeIdx : idx + 800);
   assert.doesNotMatch(branch, /return firstOutput;\s*\}/,
@@ -649,6 +670,33 @@ check('D4 directImageRenderService\'s gate-off early return stamps a disabled ve
   assert.match(branch, /buildPersistedVerdict\(/, 'must stamp the same disabled-verdict shape runPostRenderQc\'s own "Flag off" branch builds');
   assert.match(branch, /disabled:\s*true/, 'the stamped verdict must mark disabled:true (gate off, not an infra skip)');
   assert.match(branch, /warnQcDisabledOnce\(/, 'must warn — a flag left off for weeks must be loud in logs, not silent');
+});
+
+check('D6 [2026-08-20] the three real callers await resolveEnabled(), not the racy sync isEnabled() peek', () => {
+  // Structural regression guard for the TTL-cache-race fix: a future edit
+  // that quietly reintroduces a bare `adVisionQc.isEnabled()` call on one of
+  // these three hot paths would reopen the exact incident this pins against
+  // (a stale cache silently reading a genuinely-on DB flag as off).
+  const sites = [
+    { file: 'directImageRenderService.js', label: 'directImageRenderService.finishPlate' },
+    { file: 'brandScriptExecutor.js', label: 'brandScriptExecutor.runVideoVisionQcForAd' },
+    { file: 'imageRecoveryService.js', label: 'imageRecoveryService.maybeQcRecoveredPlate' }
+  ];
+  for (const { file, label } of sites) {
+    const src = fs.readFileSync(path.join(__dirname, '..', 'services', file), 'utf8');
+    assert.match(src, /await\s+adVisionQc\.resolveEnabled\(\)/,
+      `${label} must await adVisionQc.resolveEnabled()`);
+  }
+  // isEnabled() itself may still exist as a documented legacy sync fallback
+  // (adVisionQcService.js exports it, and this harness's own I1/I2 checks
+  // above still exercise it directly) — the assertion is narrower than "the
+  // string never appears": it is that none of these three FILES calls
+  // `adVisionQc.isEnabled(` on the hot path.
+  for (const { file, label } of sites) {
+    const src = fs.readFileSync(path.join(__dirname, '..', 'services', file), 'utf8');
+    assert.doesNotMatch(src, /adVisionQc\.isEnabled\(/,
+      `${label} must not call the synchronous isEnabled() gate anymore`);
+  }
 });
 
 check('D5 the shared warnQcDisabledOnce gate is genuinely one-shot-per-interval, not per-call', () => {

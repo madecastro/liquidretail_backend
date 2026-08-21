@@ -131,13 +131,33 @@ async function resolveEnabled(deps = {}) {
 }
 
 /**
- * Synchronous gate kept for existing callers
- * (directImageRenderService, imageRecoveryService, harnesses).
+ * SYNCHRONOUS fallback ONLY — as of 2026-08-20, NONE of the three
+ * production hot-path callers (directImageRenderService.renderDirectImage /
+ * finishPlate, brandScriptExecutor.runVideoVisionQcForAd,
+ * imageRecoveryService.maybeQcRecoveredPlate) use this anymore. All three
+ * are already `async` functions that already `await` a billable vision
+ * call a few lines later, so they now `await resolveEnabled()` directly —
+ * there is no reason for an async caller to take a synchronous, cache-racy
+ * path when it can just await the correct one.
  *
- * Reads the systemConfigService TTL cache when a fresh boolean is available
- * (so a live DB flip is visible without a restart, within ~TTL seconds).
- * On cache miss/expiry, kicks a fire-and-forget refresh and answers from
- * env. Never throws.
+ * PRODUCTION BUG THIS USED TO HAVE, fixed 2026-08-20 (kept here as the
+ * cautionary reason nothing should switch back to calling this from a hot
+ * path): `refreshAdVisionQcEnabledCache()` is fire-and-forget, so the
+ * `peekAdVisionQcEnabled()` immediately below it can only ever see the
+ * state from BEFORE that refresh, never the value it just kicked off. As
+ * long as `peekAdVisionQcEnabled()` also expired stale entries (pre-fix),
+ * any call landing after the 5s TTL — which is the NORMAL case, since real
+ * renders are spaced further apart than 5s — read "no fresh entry" and fell
+ * through to `envEnabled()`, silently disabling QC even when
+ * SystemConfig.adVisionQcEnabled was genuinely `true`. Measured live: 11 of
+ * 18 delivered statics stamped `visionQc.disabled:true` with the flag on.
+ * `peekAdVisionQcEnabled()` (services/systemConfigService.js) no longer
+ * expires its answer this way — see its doc comment for the fix and the
+ * fail-safe-direction reasoning — so this function is safe to call again if
+ * a genuinely synchronous caller ever needs it. It still answers from
+ * `envEnabled()` on a truly cold cache (nothing ever loaded in this
+ * process), which matches the documented "unconfigured → off" default.
+ * Never throws.
  */
 function isEnabled() {
   try {
@@ -148,7 +168,7 @@ function isEnabled() {
     if (typeof cfg.peekAdVisionQcEnabled === 'function') {
       const peeked = cfg.peekAdVisionQcEnabled();
       // Only a real boolean overrides env. null = "not set" → env.
-      // undefined = cache miss → env.
+      // undefined = never loaded in this process → env.
       if (typeof peeked === 'boolean') return peeked;
     }
   } catch (_) {
