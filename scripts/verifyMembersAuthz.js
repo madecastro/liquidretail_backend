@@ -1142,8 +1142,40 @@ check('C0b by-token/accept is wired to requireUserOnly (reference identity), NOT
     });
   });
 
-  check('E table recorded all 10 revert-prove mutations, each reproducing its bug', () => {
-    assert.strictEqual(REVERT_ROWS.length, 10, `only ${REVERT_ROWS.length} of 10 recorded: ${REVERT_ROWS.join(' | ')}`);
+  // M11 — the exact failure class CLAUDE.md calls out by name: a call site
+  // that survives with its IMPORT removed. "A regex over source text cannot
+  // see an unbound identifier, and node --check cannot either — a
+  // ReferenceError is runtime, not syntax." This repo has shipped that
+  // exact defect to production three times (receiptFree, preferUgcMediaId,
+  // usableProofCommentsOrNone). D1 above only proves the CURRENT file still
+  // has the import; this proves that if it did not, module load itself
+  // would crash loudly (router.patch(...) evaluates requireMembershipRole(...)
+  // synchronously at require time) — i.e. the failure mode is real and
+  // observable, not something only a text scanner could miss silently.
+  await checkAsync('E-M11 dropping the import (keeping the calls) crashes at require-time with a ReferenceError (must fail == must throw)', async () => {
+    const mutated = mutateOrThrow(
+      membersSrc,
+      "const requireMembershipRole = require('../middleware/requireMembershipRole');\nconst { canActOnRole, canGrantRole } = requireMembershipRole;\n",
+      '',
+      'M11'
+    );
+    let threw = null;
+    try {
+      await withMutatedSibling(membersAbsPath, mutated, async () => {
+        // requiring the sibling alone is enough — router.patch(...) calls
+        // requireMembershipRole(...) synchronously while the module body runs.
+      });
+    } catch (err) {
+      threw = err;
+    }
+    assert.ok(threw, 'expected requiring the import-stripped sibling to throw');
+    assert.ok(threw instanceof ReferenceError, `expected a ReferenceError, got ${threw && threw.constructor && threw.constructor.name}: ${threw && threw.message}`);
+    assert.match(threw.message, /requireMembershipRole is not defined/);
+    REVERT_ROWS.push('E-M11 — dropping the import (keeping the calls) reproduced the exact "shipped to prod three times" unbound-identifier class');
+  });
+
+  check('E table recorded all 11 revert-prove mutations, each reproducing its bug', () => {
+    assert.strictEqual(REVERT_ROWS.length, 11, `only ${REVERT_ROWS.length} of 11 recorded: ${REVERT_ROWS.join(' | ')}`);
   });
 
   // ── report ──────────────────────────────────────────────────────────────
