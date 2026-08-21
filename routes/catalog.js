@@ -36,6 +36,7 @@ const { AD_RECENCY_EXPR } = require('../services/adRecencyService');
 const catalogProductPromoteService = require('../services/catalogProductPromoteService');
 const { catalogSeedFields } = require('../services/catalogImageQuality');
 const { tenantFilter, assertMediaInTenant } = require('../middleware/tenantHelpers');
+const { isAdHonestlyDelivered } = require('../services/adTitlingTruth');
 void assertMediaInTenant;     // kept for future :id verification helpers
 
 function escapeRegex(s) { return String(s || '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); }
@@ -918,7 +919,16 @@ router.get('/:id/ads-detail', async (req, res) => {
           // mid-generation showed a bare "Queued" here while /render-activity
           // knew it was "titling 4:5". regenerationStage above is a DIFFERENT
           // field (the regen banner) and never covered first-generation.
-          renderStage: 1, renderStageAt: 1
+          //
+          // FOUND STILL BROKEN 2026-08-20: projected here since whenever the
+          // comment above landed, but the mapped `adRows` below never
+          // actually emitted either field — so despite the comment's intent,
+          // every ad on this page (the primary Product Ads surface) read as
+          // renderStage:undefined regardless of real pipeline state. Fixed
+          // below alongside adding the real titling-truth fields.
+          renderStage: 1, renderStageAt: 1,
+          // Inputs to isAdHonestlyDelivered (services/adTitlingTruth.js).
+          titlingResumeState: 1, veoVideoUrl: 1
       } }
     ], { allowDiskUse: true });
 
@@ -1027,6 +1037,20 @@ router.get('/:id/ads-detail', async (req, res) => {
       metaSyncStatus: a.metaSyncStatus || null,
       metaAdId:       a.metaAdId || null,
       metaAdsetId:    a.metaAdsetId || null,
+      // FIX 2026-08-20: fetched above (see the $project comment) but never
+      // actually put on this row, so the Product Ads page — the primary nav
+      // surface, per its own status-pill fix (frontend #67) — had no
+      // pipeline-stage signal at all and every draft ad read as finished.
+      renderStage:    a.renderStage || null,
+      renderStageAt:  a.renderStageAt || null,
+      // Recovery/normal-path titling debt — see routes/ads.js projectAd's
+      // field of the same name for the full explanation. null|'pending'|'claimed'.
+      titlingResumeState: a.titlingResumeState || null,
+      // THE HONEST "is this actually finished" answer — same computation
+      // routes/ads.js projectAd and the CampaignRun rollup use
+      // (services/adTitlingTruth.js), so this page can never disagree with
+      // those about what "delivered" means.
+      titled:         isAdHonestlyDelivered(a),
       regenerating:   !!a.regenerating,
       regenerationStage: a.regenerationStage || null,
       regenerationHistory: Array.isArray(a.regenerationHistory)

@@ -59,6 +59,28 @@ const HOURLY_SPEND_USD    = () => {
   const v = parseFloat(process.env.ALERT_HOURLY_SPEND_USD);
   return Number.isFinite(v) && v > 0 ? v : 25;
 };
+// TITLING_STUCK_MIN — how long an Ad may sit with an open titling debt
+// (titlingResumeState 'pending' or 'claimed') before this alerts.
+//
+// WHY THIS EXISTS (2026-08-20 incident): titlingResumeService's own
+// stale-claim reclaim (services/titlingResumeService.js CLAIM_STALE_MIN,
+// default 15m) is real recovery, not just a diagnostic — a stale claim gets
+// re-swept and re-attempted automatically. But nothing has EVER alerted an
+// operator that this is happening, so an ad could cycle claim→abandon→
+// reclaim indefinitely (measured live: a batch of Remotion renders stalled
+// for 11-15m straight through an autoscale replacement storm) with zero
+// signal anywhere a person would look — "no recovery, no failure signal,
+// indistinguishable from success" per the incident writeup. This does not
+// fix the underlying cause; it is the missing signal session.md already
+// flagged as a deliberately-deferred gap ("No watchdog arm for the new
+// non-terminal states") before there was live evidence it actually bites.
+//
+// Default (45m) is 3x CLAIM_STALE_MIN on purpose — one stale-reclaim cycle
+// plus margin for a legitimately slow render, not a hair-trigger on the
+// first missed sweep. Titling is CPU-local (no provider round-trip), so
+// there is no equivalent to RUN_STALE_MIN's "a real batch legitimately
+// takes 25-35 minutes" concern here.
+const TITLING_STUCK_MIN   = () => N('ALERT_TITLING_STUCK_MIN', 45);
 
 async function runWatchdog() {
   if (!alerts.isConfigured()) return;
@@ -101,6 +123,46 @@ async function runWatchdog() {
     }
   } catch (err) {
     console.warn(`🔔 watchdog[ads-rendering] failed: ${err.message}`);
+  }
+
+  // ── 1b. Ads with an open titling debt — pending or claimed too long ──
+  //
+  // Distinct from arm 1 above: those Ads are `status:'rendering'`. These are
+  // `status:'draft'` (the paid master already landed and is viewable) with
+  // `titlingResumeState` still 'pending' (recovery marked it, titling never
+  // started) or 'claimed' (a render started and either is still genuinely
+  // in flight or died without anything noticing — see
+  // services/titlingResumeService.js's stale-claim comment for why a claim
+  // alone cannot tell those two apart; only elapsed time can).
+  try {
+    const cutoff = ago(TITLING_STUCK_MIN());
+    const stuck = await Ad.find({
+      titlingResumeState: { $in: ['pending', 'claimed'] },
+      updatedAt: { $lt: cutoff }
+    })
+      .sort({ updatedAt: 1 }).limit(50)
+      .select('_id titlingResumeState renderStage updatedAt campaignRunIds').lean();
+    if (stuck.length) {
+      const claimed = stuck.filter((a) => a.titlingResumeState === 'claimed').length;
+      const oldestMin = Math.round((now - new Date(stuck[0].updatedAt).getTime()) / 60000);
+      await alerts.notify({
+        level: 'error',
+        title: `${stuck.length} video ad(s) delivered as an untitled master`,
+        key:   'watchdog:titling-stuck',
+        fields: {
+          'idle past':    `${TITLING_STUCK_MIN()}m`,
+          'oldest':       `${oldestMin}m`,
+          'claimed (mid-render or abandoned)': claimed || undefined,
+          'pending (never started)':           (stuck.length - claimed) || undefined,
+          'likely cause': 'render process replaced mid-Remotion-render, or titling genuinely wedged'
+        },
+        detail: stuck.slice(0, 12)
+          .map((a) => `${a._id} state=${a.titlingResumeState} stage="${a.renderStage || '-'}" idle=${Math.round((now - new Date(a.updatedAt).getTime()) / 60000)}m run=${(a.campaignRunIds || []).slice(-1)[0] || '-'}`)
+          .join('\n')
+      });
+    }
+  } catch (err) {
+    console.warn(`🔔 watchdog[titling-stuck] failed: ${err.message}`);
   }
 
   // ── 2. CampaignRuns that have gone silent ──
@@ -241,5 +303,6 @@ module.exports = {
   buildStalledRunFilter,
   RUN_STALE_MIN,
   RUN_SILENCE_MIN,
-  RENDERING_STALE_MIN
+  RENDERING_STALE_MIN,
+  TITLING_STUCK_MIN
 };

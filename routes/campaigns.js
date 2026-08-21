@@ -20,6 +20,7 @@ const Media = require('../models/Media');
 const Ad = require('../models/Ad');
 const { tenantFilter } = require('../middleware/tenantHelpers');
 const { AD_RECENCY_EXPR } = require('../services/adRecencyService');
+const { isAdHonestlyDelivered } = require('../services/adTitlingTruth');
 
 // GET /api/campaigns?brandId=X[&platform=meta-ads|google-ads][&status=ACTIVE]
 // Lightweight list for the Campaigns page. Returns a projection that
@@ -408,8 +409,13 @@ router.get('/:id/ads-detail', async (req, res) => {
           platformFormat: 1, aiCanvasArtifactId: 1, mediaId: 1, productId: 1, variantKind: 1,
           paletteSource: 1, sourceFileType: 1, regenerating: 1, regenerationStage: 1,
           regenerationHistory: 1,
-          // Same gap as catalog.js ads-detail — see the note there.
+          // Same gap as catalog.js ads-detail — see the note there. FOUND
+          // STILL BROKEN 2026-08-20 alongside it: projected but never
+          // reached the mapped row below either, so this surface had the
+          // identical "every draft ad reads as finished" bug.
           renderStage: 1, renderStageAt: 1,
+          // Inputs to isAdHonestlyDelivered (services/adTitlingTruth.js).
+          titlingResumeState: 1, veoVideoUrl: 1,
           // Intent profile (funnelStage) + brandId (so loadProductUrlMap
           // below can group its per-brand join) — this endpoint's own
           // $match already fixes every row to one campaign/brand, but both
@@ -483,6 +489,15 @@ router.get('/:id/ads-detail', async (req, res) => {
       metaAdId:       a.metaAdId || null,
       metaAdsetId:    a.metaAdsetId || null,
       productId:      a.productId ? String(a.productId) : null,
+      // FIX 2026-08-20 — same gap as catalog.js's sibling endpoint: fetched
+      // above but never put on this row.
+      renderStage:    a.renderStage || null,
+      renderStageAt:  a.renderStageAt || null,
+      titlingResumeState: a.titlingResumeState || null,
+      // THE HONEST "is this actually finished" answer — see
+      // services/adTitlingTruth.js. Same computation projectAd and the
+      // CampaignRun rollup use.
+      titled:         isAdHonestlyDelivered(a),
       // Intent profile — see models/Ad.js funnelStage. Absent renders as
       // nothing on the frontend, never a raw token.
       funnelStage:    a.funnelStage || null,

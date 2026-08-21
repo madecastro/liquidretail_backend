@@ -462,12 +462,21 @@ async function reapOrphans() {
     buildStaleRunningFilter({ now: reapNow, staleMin: REAP_STALE_MIN })
   ).select('_id runId').lean();
 
-  let nRunsFailed = 0, nRunsReconciled = 0, nRunsDeferred = 0;
+  let nRunsFailed = 0, nRunsReconciled = 0, nRunsDeferred = 0, nRunsDeferredTitling = 0;
   for (const candidate of staleRunCandidates) {
-    const claimedAds = await Ad.find({ campaignRunIds: candidate.runId }).select('status').lean();
+    // classifyRunAdOutcome's video-titling check (services/adTitlingTruth.js)
+    // needs kind/renderUrl/veoVideoUrl/titlingResumeState/renderStage in
+    // addition to status — a `status`-only projection silently defeats that
+    // check (an unselected `kind` reads as `undefined !== 'video'`, so every
+    // Ad would be treated as a static and the titling debt would never be
+    // seen at all).
+    const claimedAds = await Ad.find({ campaignRunIds: candidate.runId })
+      .select('status kind renderUrl veoVideoUrl titlingResumeState renderStage')
+      .lean();
     const outcome = classifyRunAdOutcome(claimedAds);
     if (!outcome.isSettled) {
       nRunsDeferred++;
+      if (outcome.titlingIncomplete > 0) nRunsDeferredTitling++;
       continue;
     }
     const update = buildRunReconciliationUpdate(outcome, { staleMin: REAP_STALE_MIN, now: new Date(reapNow) });
@@ -490,7 +499,8 @@ async function reapOrphans() {
   if (nRunsDeferred > 0) {
     console.log(
       `⏳ left ${nRunsDeferred} stale-looking CampaignRun(running) alone — ` +
-      `receipt-holding ad(s) still genuinely rendering, not abandoned`
+      `receipt-holding ad(s) still genuinely rendering or untitled-master ` +
+      `recovery in flight (${nRunsDeferredTitling} of them for titling), not abandoned`
     );
   }
   const runs = { modifiedCount: nRunsFailed };
