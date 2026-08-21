@@ -335,6 +335,118 @@ check('AA14 JSON5-only-valid payload (trailing comma) inside prose is still salv
   assert.strictEqual(v.parseError, null);
   assert.strictEqual(v.pass, true);
 });
+
+// ── AA16-AA20: adversarial review findings (2026-08-20) ────────────────
+// A first draft of the salvage candidate-selection heuristic ("prefer the
+// LAST balanced span with an object `categories` key") was reviewed by an
+// independent adversarial pass BEFORE this landed, specifically hunting for
+// an input where the new tolerance lets a REAL defect ship as a pass. It
+// found one, live, on the real parseVerdict: a genuine failing verdict
+// followed by ANY later object that also happens to have a `categories` key
+// (a restated "example of the shape", a second "cleaned up" draft, a
+// revision) had its FAIL silently discarded in favour of the later, more
+// passing-looking object. These five checks pin the fix (scan every
+// verdict-shaped candidate; prefer ANY that fails over all that pass) and
+// the narrower follow-up it exposed (a balanced span that opens like a real
+// JSON object and then fails to parse — quote-tracking corruption, not
+// decorative prose — must not be silently skipped past).
+check('AA16 a real FAIL followed by a later passing "example of the shape" object must still fail (the exact adversarial-review counterexample)', () => {
+  const text = 'Here is my verdict:\n' +
+    JSON.stringify({
+      categories: {
+        competitor_marks: { score: 2, findings: ['tree emblem on midfoot'] },
+        product_fidelity: { score: 9, findings: [] },
+        text_defects:     { score: 9, findings: [] },
+        layout_safe_box:  { score: 9, findings: [] }
+      },
+      summary: 'fail — tree mark on midfoot'
+    }) +
+    '\n\nExample of a passing report in the required shape:\n' +
+    JSON.stringify({
+      categories: {
+        competitor_marks: { score: 9, findings: [] },
+        product_fidelity: { score: 9, findings: [] },
+        text_defects:     { score: 9, findings: [] },
+        layout_safe_box:  { score: 9, findings: [] }
+      },
+      summary: 'one-line overall'
+    });
+  const v = qc.parseVerdict(text);
+  assert.strictEqual(v.parseError, null, 'must salvage, not fall into the parse-error branch');
+  assert.strictEqual(v.pass, false, 'the real fail must not be discarded in favour of the trailing example');
+  assert.strictEqual(v.categories.competitor_marks.score, 2);
+  assert.deepStrictEqual(v.categories.competitor_marks.findings, ['tree emblem on midfoot']);
+});
+check('AA17 same counterexample, ORDER REVERSED (passing example first, real fail second) — order must not matter', () => {
+  const text = 'Example of the required shape:\n' +
+    JSON.stringify({
+      categories: {
+        competitor_marks: { score: 9, findings: [] },
+        product_fidelity: { score: 9, findings: [] },
+        text_defects:     { score: 9, findings: [] },
+        layout_safe_box:  { score: 9, findings: [] }
+      },
+      summary: 'one-line overall'
+    }) +
+    '\n\nHere is my real verdict:\n' +
+    JSON.stringify({
+      categories: {
+        competitor_marks: { score: 2, findings: ['tree emblem on midfoot'] },
+        product_fidelity: { score: 9, findings: [] },
+        text_defects:     { score: 9, findings: [] },
+        layout_safe_box:  { score: 9, findings: [] }
+      },
+      summary: 'fail — tree mark on midfoot'
+    });
+  const v = qc.parseVerdict(text);
+  assert.strictEqual(v.pass, false, 'a real fail earlier or later must never be beaten by a passing decoy');
+  assert.strictEqual(v.categories.competitor_marks.score, 2);
+});
+check('AA18 a decoy-empty-{} case that legitimately passes still passes (AA13 must not have been "fixed" by over-blocking everything)', () => {
+  const text = 'Note: {} is just an empty example. Real verdict: ' +
+    JSON.stringify({
+      categories: {
+        competitor_marks: { score: 9, findings: [] },
+        product_fidelity: { score: 9, findings: [] },
+        text_defects:     { score: 9, findings: [] },
+        layout_safe_box:  { score: 9, findings: [] }
+      },
+      summary: 'clean'
+    });
+  const v = qc.parseVerdict(text);
+  assert.strictEqual(v.parseError, null);
+  assert.strictEqual(v.pass, true, 'a genuinely clean verdict salvaged past a benign decoy must still pass');
+});
+check('AA19 a truncated SECOND JSON value elsewhere in the reply forces fail-closed, even though the FIRST value parsed cleanly', () => {
+  // Two top-level values: a complete root-shaped (no `categories` wrapper)
+  // passing "example", then a genuinely truncated real verdict. Naive
+  // candidate-picking (skip whatever failed to balance, trust whatever DID
+  // parse) would silently ship the passing example. The unrecoverable-span
+  // signal must refuse to guess here.
+  const text = JSON.stringify({
+    competitor_marks: { score: 9, findings: [] },
+    product_fidelity: { score: 9, findings: [] },
+    text_defects:     { score: 9, findings: [] },
+    layout_safe_box:  { score: 9, findings: [] },
+    summary: 'example of the format'
+  }) + '\n' +
+    '{"categories": {"competitor_marks": {"score": 2, "findings": ["tree emblem on midfoot"]}, "product_fidelity": {"score": 4, "findings": ["colourway drift"]';
+  const v = qc.parseVerdict(text);
+  assert.notStrictEqual(v.parseError, null, 'a truncated second value must fail closed, not silently trust the first');
+  assert.strictEqual(v.pass, false);
+});
+check('AA20 unescaped quotes that corrupt the scan and expose a coincidentally-nested passing blob must fail closed, not adopt the nested blob', () => {
+  const text = '{"categories": {"competitor_marks": {"score": 2, "findings": ["saw {' +
+    '"categories": {"competitor_marks": {"score": 9, "findings": []}, ' +
+    '"product_fidelity": {"score": 9, "findings": []}, "text_defects": {"score": 9, "findings": []}, ' +
+    '"layout_safe_box": {"score": 9, "findings": []}}} inside"]}}}';
+  const v = qc.parseVerdict(text);
+  assert.notStrictEqual(v.parseError, null, 'quote-corrupted text must fail closed rather than adopt a nested fragment');
+  assert.strictEqual(v.pass, false);
+  assert.notStrictEqual(v.categories.competitor_marks.score, 9,
+    'must not have silently adopted the nested passing example');
+});
+
 check('AA15 the JSON5 fallback used by salvage is actually IMPORTED, not just called (no-undef cannot be trusted alone)', () => {
   // CLAUDE.md §5: a source-text harness cannot see an unbound identifier —
   // `receiptFree` / `preferUgcMediaId` / `usableProofCommentsOrNone` all

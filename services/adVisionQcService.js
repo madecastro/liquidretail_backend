@@ -410,38 +410,57 @@ function balancedSpanFrom(s, start) {
 }
 
 /**
- * Non-greedy, multi-candidate JSON salvage for a vision reply that is
+ * Non-greedy, multi-CANDIDATE JSON scan for a vision reply that is
  * JSON-SHAPED but not JSON-ONLY — fenced with trailing commentary after the
  * closing fence, or prefaced/followed by a sentence of prose. Scans every
  * balanced `{...}` span left to right (a span that fails to parse is looked
  * INTO, not skipped, in case the real object is nested inside prose-shaped
- * braces), parses each with JSON.parse then a JSON5 fallback, and — when
- * several spans parse — prefers the LAST one carrying an object `categories`
- * key, else the first parseable object.
+ * braces), parsing each with JSON.parse then a JSON5 fallback.
+ *
+ * Returns EVERY candidate that parsed, plus `hadUnrecoverableSpan` — true
+ * when the text contains a `{` that either (a) never found a matching `}`,
+ * or (b) DID balance but failed BOTH JSON.parse and JSON5.parse WHILE LOOKING
+ * LIKE A GENUINE JSON-OBJECT ATTEMPT (`/^\{\s*"[^"\\]*"\s*:/` — starts with a
+ * quoted key and a colon, e.g. `{"categories": …`), as opposed to incidental
+ * prose punctuation (`{option A}`, `{finalized}`). That distinction matters:
+ * a span that merely LOOKS like decorative prose braces is expected and
+ * benign — it's exactly what "look INTO a failed span" below exists to see
+ * past — but a span that opens like a real JSON object and then fails to
+ * parse is evidence the reply itself is corrupted (e.g. an unescaped quote
+ * inside a `findings` string breaks quote-tracking for everything after it),
+ * and trusting whatever DID parse elsewhere in that same corrupted text is
+ * exactly how a real failing verdict can be shadowed by an accidentally
+ * well-formed fragment nested inside it. Both conditions make the whole
+ * salvage untrustworthy, not just the one span. Deliberately does NOT pick a
+ * winner among the candidates that DID parse — see pickSafestCandidate()
+ * below for why that decision needs to be verdict-aware (money-safe), not a
+ * generic parsing heuristic.
  *
  * This is a LOCAL PORT of aiCreativeDirectorService.safeParseDirectorJSON's
- * exact algorithm (the task's named closest fit), not an import of that
+ * scanning algorithm (the task's named closest fit), not an import of that
  * module: this file today requires nothing but `atlasLlmService` at the top
  * (plus a few lazily-required siblings — systemConfigService, alertService,
  * runFeedService — none of them model-heavy). aiCreativeDirectorService
  * drags in five Mongoose models and half a dozen Director-only services;
- * pulling that into the vision-QC module to reuse a four-line pure function
- * would be a much bigger blast radius than the function itself, and this fix
- * is scoped to touch only this file. The ALGORITHM is reused verbatim —
- * deliberately non-greedy, for the same reason documented there: a greedy
- * `/\{[\s\S]*\}/` swallows trailing prose and turns a salvageable reply into
- * a parse error. Only the candidate-selection heuristic is adapted to this
- * module's shape (`categories` object instead of a `concepts` array).
- *
- * Returns null (never throws) when nothing salvageable is found.
+ * pulling that into the vision-QC module to reuse a few lines of pure
+ * scanning logic would be a much bigger blast radius than the logic itself,
+ * and this fix is scoped to touch only this file. The SCAN is reused
+ * verbatim — deliberately non-greedy, for the same reason documented there:
+ * a greedy `/\{[\s\S]*\}/` swallows trailing prose and turns a salvageable
+ * reply into a parse error. Only the WINNER-PICKING half diverges, because
+ * "prefer a `concepts` array" (Director) and "never let ambiguity between
+ * two replies invent a passing QC score" (here) are different problems.
  */
+const LOOKS_LIKE_JSON_OBJECT_ATTEMPT = /^\{\s*"[^"\\]*"\s*:/;
+
 function salvageVerdictJson(rawText) {
   const text = String(rawText == null ? '' : rawText);
   const candidates = [];
+  let hadUnrecoverableSpan = false;
   let i = text.indexOf('{');
   while (i >= 0) {
     const span = balancedSpanFrom(text, i);
-    if (!span) { i = text.indexOf('{', i + 1); continue; }
+    if (!span) { hadUnrecoverableSpan = true; i = text.indexOf('{', i + 1); continue; }
     let obj;
     let ok = true;
     try { obj = JSON.parse(span); }
@@ -450,77 +469,59 @@ function salvageVerdictJson(rawText) {
       candidates.push(obj);
       i = text.indexOf('{', i + span.length);
     } else {
+      if (LOOKS_LIKE_JSON_OBJECT_ATTEMPT.test(span)) hadUnrecoverableSpan = true;
       i = text.indexOf('{', i + 1);
     }
   }
-  if (!candidates.length) return null;
-  const withCategories = candidates.filter(
-    (o) => o && typeof o === 'object' && o.categories && typeof o.categories === 'object'
-  );
-  return withCategories.length ? withCategories[withCategories.length - 1] : candidates[0];
+  return { candidates, hadUnrecoverableSpan };
 }
 
 /**
- * Normalize model JSON into a stable verdict shape. Pure — no I/O.
+ * Core per-category normalization + scoring for an ALREADY-PARSED object, in
+ * any of the tolerated root shapes (nested `categories` wrapper, missing
+ * wrapper with keys at root, findings hoisted). Pure, no I/O.
  *
- * TOLERANT OF SHAPE DRIFT, NEVER OF SUBSTANCE. A model reply that drifts
- * from the requested `{categories:{<key>:{score,pass,findings}}}` contract
- * must not silently fail-closed on pure noise (that burns the single
- * allowed static regeneration, or fails an already-paid video out of draft
- * — see this file's header) NOR silently invent a passing score (that ships
- * a real defect). Four drifts are tolerated here, all shape-only:
+ * Factored out of parseVerdict so there is exactly ONE place that decides
+ * "does this parsed object represent a pass or a fail" — both the main path
+ * below and pickSafestCandidate()'s money-safe candidate selection call this
+ * SAME function, so "which shape drift is tolerated" and "how a salvage
+ * candidate is judged safe to trust" can never silently diverge.
  *
- *   1. Prose/fence-wrapped JSON — see salvageVerdictJson() above.
- *   2. The `categories` wrapper missing — the four keys sit on the root
- *      object instead (`rootFallback` below; checked key-by-key, so a
- *      PARTIALLY hoisted reply — some keys nested, one loose at the root —
- *      is still recovered per key, not all-or-nothing).
- *   3. `findings` hoisted to the top level instead of nested per category —
- *      tolerated in two shapes: an object keyed by category name (attributed
- *      to that category, merged with — never replacing — any findings the
- *      category itself carried) or a flat array of strings (cannot be
- *      attributed to any one category with any real signal, so it is kept
- *      as unattributed context on a FAILING verdict only, never used to
- *      flip any category's own score/pass).
- *   4. A category value arriving as a bare boolean instead of an object —
- *      see the direction-of-boolean reasoning inline below. Both `true` and
- *      `false` are treated as an unparseable category and FAIL, same as a
- *      wholly absent category — tolerance never means guessing a pass.
+ * Drifts tolerated, all shape-only, substance never invented:
+ *   (a) The `categories` wrapper missing — the four keys sit on the root
+ *       object instead (checked key-by-key, so a PARTIALLY hoisted reply —
+ *       some keys nested, one loose at the root — is still recovered per
+ *       key, not all-or-nothing). Root fallback is disabled entirely when
+ *       `categories` is PRESENT but the wrong type (a string/array/number/
+ *       boolean) — that is a different, more corrupted signal than "omitted
+ *       wrapper", and trusting root data in that case would let a
+ *       coincidental root shape override a categories value the model
+ *       clearly (if badly) tried to nest.
+ *   (b) `findings` hoisted to the top level instead of nested per category —
+ *       tolerated in two shapes: an object keyed by category name (attributed
+ *       to that category, merged with — never replacing — any findings the
+ *       category itself carried) or a flat array of strings (cannot be
+ *       attributed to any one category with any real signal, so it is kept
+ *       as unattributed context on a FAILING verdict only, never used to
+ *       flip any category's own score/pass).
+ *   (c) A category value arriving as a bare boolean instead of an object —
+ *       see the direction-of-boolean reasoning inline below. Both `true` and
+ *       `false` are treated as an unparseable category and FAIL, same as a
+ *       wholly absent category — tolerance never means guessing a pass.
  *
  * A category that is genuinely absent from every one of these shapes still
  * fails: `co` falls back to `{}`, `clampScore(undefined)` is 0, and
  * `0 >= PASS_FLOOR` is false. Nothing here can turn "no data" into a pass.
  */
-function parseVerdict(raw) {
-  let parsed = raw;
-  if (typeof raw === 'string') {
-    const cleaned = String(raw).replace(/^\s*```(?:json)?\s*/i, '').replace(/```\s*$/, '');
-    try { parsed = JSON.parse(cleaned); }
-    catch (err) {
-      const salvaged = salvageVerdictJson(cleaned);
-      if (salvaged && typeof salvaged === 'object') {
-        parsed = salvaged;
-      } else {
-        return {
-          pass: false,
-          parseError: err.message,
-          categories: emptyCategories('vision response was not JSON'),
-          summary: 'parse failure — treating as QC fail (safe default)',
-          findings: ['vision response was not JSON']
-        };
-      }
-    }
-  }
+function scoreVerdictCategories(parsed) {
+  const catsRaw = (parsed && typeof parsed === 'object') ? parsed.categories : undefined;
+  const wrapper = (catsRaw && typeof catsRaw === 'object' && !Array.isArray(catsRaw)) ? catsRaw : null;
+  // Present but the wrong type (string/array/number/boolean) — do NOT treat
+  // this the same as "wrapper omitted"; disable root fallback entirely.
+  const categoriesPresentButMalformed = catsRaw != null && !wrapper;
+  const rootFallback = (!categoriesPresentButMalformed && parsed && typeof parsed === 'object')
+    ? parsed : {};
 
-  // Drift #2: wrapper present-and-an-object is authoritative per key; a key
-  // missing from it (or the wrapper missing/malformed entirely) falls back
-  // to the same key on the root object.
-  const wrapper = (parsed && typeof parsed === 'object' && parsed.categories
-    && typeof parsed.categories === 'object') ? parsed.categories : null;
-  const rootFallback = (parsed && typeof parsed === 'object') ? parsed : {};
-
-  // Drift #3: hoisted top-level `findings`, split into the two tolerated
-  // shapes described above.
   const hoisted = (parsed && typeof parsed === 'object') ? parsed.findings : undefined;
   const hoistedByCategory = (hoisted && typeof hoisted === 'object' && !Array.isArray(hoisted))
     ? hoisted : null;
@@ -534,10 +535,10 @@ function parseVerdict(raw) {
     let c = (wrapper && wrapper[key] != null) ? wrapper[key]
       : (rootFallback[key] != null ? rootFallback[key] : undefined);
 
-    // Drift #4 — DIRECTION-OF-BOOLEAN REASONING (do not "fix" this by
-    // picking a mapping): a model collapsing {score,pass,findings} to a
-    // bare boolean could mean either of two things and there is no signal
-    // in the JSON to tell them apart —
+    // DIRECTION-OF-BOOLEAN REASONING (do not "fix" this by picking a
+    // mapping): a model collapsing {score,pass,findings} to a bare boolean
+    // could mean either of two things and there is no signal in the JSON to
+    // tell them apart —
     //   (i)  it reused the category's own `pass` field    → true = GOOD
     //   (ii) it answered "is this defect/mark present?"   → true = BAD
     // Every one of these four keys names the THING BEING INSPECTED FOR
@@ -593,6 +594,110 @@ function parseVerdict(raw) {
   if (!pass && hoistedGeneral.length) {
     findings.push(...hoistedGeneral.map((t) => `[general] ${t}`));
   }
+  return { categories, pass, findings };
+}
+
+/**
+ * Does `cand` look like it is TRYING to be a verdict object at all (as
+ * opposed to an incidental balanced-brace span salvage picked up along the
+ * way — an empty `{}`, a stray findings fragment, etc.)? Object `categories`
+ * key, OR at least one of the four category names sitting on the root.
+ */
+function looksVerdictShaped(cand) {
+  if (!cand || typeof cand !== 'object' || Array.isArray(cand)) return false;
+  if (cand.categories && typeof cand.categories === 'object' && !Array.isArray(cand.categories)) return true;
+  return CATEGORIES.some((k) => cand[k] != null);
+}
+
+/**
+ * MONEY-SAFE candidate selection among everything salvageVerdictJson found.
+ *
+ * A vision reply that needs salvage in the first place is already off-script
+ * (that's why AA9/AA10 exist), and a model that goes off-script can restate
+ * the requested JSON shape as a trailing "example"/template, or draft an
+ * answer and then revise it — both realistic Gemini-2.5-pro behaviours, not
+ * theoretical. If more than one balanced span in the reply looks
+ * verdict-shaped, there is no way to know FROM THE JSON ALONE which one is
+ * "the real verdict" — exactly the same kind of genuine ambiguity the
+ * bare-boolean case above resolves toward the safe side, not toward "prefer
+ * whichever one is more convenient". So: evaluate every verdict-shaped
+ * candidate with the exact same scoring rule real data gets
+ * (scoreVerdictCategories), and if ANY of them independently fails, treat
+ * the WHOLE salvage as a fail — a false FAIL only costs a wasted regeneration
+ * (or an operator glance on video); a false PASS ships the defect this gate
+ * exists to catch. Only when every verdict-shaped candidate agrees on a pass
+ * is a pass allowed through salvage.
+ *
+ * This directly closes a real false-pass found in adversarial review: the
+ * previous heuristic ("prefer the LAST candidate with an object `categories`
+ * key") could pick a later, higher-scoring decorative/example object over an
+ * earlier genuine failing verdict. Picking a FAILING candidate first, by
+ * scanning ALL of them rather than trusting position, is immune to which one
+ * came first or last.
+ */
+function pickSafestCandidate(candidates) {
+  if (!candidates.length) return null;
+  let bestFail = null;
+  let bestPass = null;
+  for (const cand of candidates) {
+    if (!looksVerdictShaped(cand)) continue;
+    const { pass } = scoreVerdictCategories(cand);
+    if (!pass) { bestFail = cand; break; }
+    if (!bestPass) bestPass = cand;
+  }
+  if (bestFail) return bestFail;
+  if (bestPass) return bestPass;
+  // Nothing looked verdict-shaped at all — fall back to the first parseable
+  // object; scoreVerdictCategories will find no recognizable category data
+  // in it and fail closed downstream, same as the pre-salvage "not JSON" path.
+  return candidates[0];
+}
+
+/**
+ * Normalize model JSON into a stable verdict shape. Pure — no I/O.
+ *
+ * TOLERANT OF SHAPE DRIFT, NEVER OF SUBSTANCE. A model reply that drifts
+ * from the requested `{categories:{<key>:{score,pass,findings}}}` contract
+ * must not silently fail-closed on pure noise (that burns the single
+ * allowed static regeneration, or fails an already-paid video out of draft
+ * — see this file's header) NOR silently invent a passing score (that ships
+ * a real defect). See scoreVerdictCategories()'s header for the three
+ * per-category shape drifts tolerated, and pickSafestCandidate()'s header
+ * for how ambiguity between multiple salvaged candidates is resolved
+ * (toward failure, never toward a guessed pass).
+ *
+ * `hadUnrecoverableSpan` (from salvageVerdictJson) forces the whole reply to
+ * fail closed even when SOME span did parse: a truncated second JSON value,
+ * or a balanced span that opens like a real JSON object and then fails to
+ * parse (quote-tracking corruption, not decorative prose), is itself a sign
+ * the reply is too corrupted to trust confidently, and the safe response to
+ * "we don't know what the rest of this says" is the same fail-closed the
+ * pre-salvage "not JSON" branch already used — never "trust whatever
+ * happened to parse".
+ */
+function parseVerdict(raw) {
+  let parsed = raw;
+  if (typeof raw === 'string') {
+    const cleaned = String(raw).replace(/^\s*```(?:json)?\s*/i, '').replace(/```\s*$/, '');
+    try { parsed = JSON.parse(cleaned); }
+    catch (err) {
+      const { candidates, hadUnrecoverableSpan } = salvageVerdictJson(cleaned);
+      const chosen = hadUnrecoverableSpan ? null : pickSafestCandidate(candidates);
+      if (chosen && typeof chosen === 'object') {
+        parsed = chosen;
+      } else {
+        return {
+          pass: false,
+          parseError: err.message,
+          categories: emptyCategories('vision response was not JSON'),
+          summary: 'parse failure — treating as QC fail (safe default)',
+          findings: ['vision response was not JSON']
+        };
+      }
+    }
+  }
+
+  const { categories, pass, findings } = scoreVerdictCategories(parsed);
   return {
     pass,
     categories,
