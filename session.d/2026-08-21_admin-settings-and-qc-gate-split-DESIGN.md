@@ -416,6 +416,212 @@ harness rather than a reviewer's memory.
   keys require the same confirmation as a normal UI edit — import is not a
   bypass of §2.6.
 
+### 2.9 Concurrency knobs — added per Nick's follow-up ("put the concurrency limit in the panel... and remove that from env")
+
+This is its own subsection because it is not just "more keys for the
+catalog" — the coordinator asked specifically to lead with *when* each
+value is read, because a settings screen that accepts a change and then
+does nothing is worse than no screen. That turned out to be the central
+finding, not a caveat: **every concurrency knob in this codebase is
+boot-time-only today, with no exception that a settings screen alone can
+fix.** Stated precisely, not just asserted:
+
+**The inventory — `services/concurrency.js`'s `SPEC` table, confirmed
+complete.** `grep -oE '^[A-Z_]*CONCURRENCY[A-Z_]*='` /
+`RPS|SPACING_MS` against `config/defaults.env` turns up nothing outside
+this table — it is genuinely the single source of truth the file's own
+header claims. 19 knobs:
+
+| Knob | Default | Ceiling kind | What it sizes |
+|---|---|---|---|
+| `RENDER_CONCURRENCY` | 24 | SELF | In-flight static/image ads per run (`routes/ads.js`) |
+| `VEO_CONCURRENCY` | 24 | SELF | In-flight video submit+poll per run (`routes/ads.js`) |
+| `VEO_TITLING_CONCURRENCY` | 48 | SELF | Concurrent titling-prep slots (`routes/ads.js`) |
+| `REMOTION_QUEUE_CONCURRENCY` | 8 | SELF | Simultaneous Remotion (headless Chrome + ffmpeg 1080p) renders — **the real OOM-risk knob** |
+| `WORKER_CONCURRENCY` | 8 | SELF | Parallel DetectRun/Job polling loops **and** derives the worker's Mongo pool size |
+| `MAX_CREATIVES_PER_RUN` | 1000 | SELF | Sanity ceiling, not a real product cap (owner directive 2026-08-18) |
+| `ATLAS_SUBMIT_SPACING_MS` | 1200 | SELF | Start-to-start spacing for same-model video submits |
+| `GROK_MAX_RPS` | 1 | **PROVIDER** | Grok Imagine's real, documented 1 RPS — env/DB can only lower, `resolveKnob`'s `Math.min(max, v)` already enforces this regardless of source |
+| `GENERIC_CATALOG_PDP_CONCURRENCY` | 5 | SELF | Parallel product-page fetches, catalog scan |
+| `CATALOG_ENRICHMENT_CONCURRENCY` | 6 | SELF | Parallel products in review/detail enrichment (bounds SerpAPI/Gemini spend rate) |
+| `CATALOG_INGEST_SHOT_CLASSIFY_CONCURRENCY` | 6 | SELF | Free image-fetch concurrency at ingest |
+| `CAMPAIGN_BRIEF_CONCURRENCY` | 3 | SELF | In-flight campaign-brief LLM derivations |
+| `AI_LAYOUT_COMBO_CONCURRENCY` | 3 | SELF | In-flight AI Layout Studio reference gens |
+| `CLOUDINARY_DELETE_CONCURRENCY` | 4 | SELF | Parallel Cloudinary destroy calls |
+| `CATALOG_MATERIALIZE_CONCURRENCY` | 4 | SELF | Parallel Cloudinary upload (hero materialize) |
+| `CATEGORY_INFERENCE_DOMAIN_CONCURRENCY` | 3 | SELF | Per-host scrape concurrency |
+| `CATEGORY_INFERENCE_BATCH_CONCURRENCY` | 6 | SELF | Global category-inference worker pool |
+| `META_PUSH_CONCURRENCY` | 3 | SELF | In-flight Meta Graph ad-publish calls |
+| `VOICE_SWEEP_CONCURRENCY` | 2 | SELF | In-flight brand-voice LLM refresh in the scheduled sweep |
+
+Only `GROK_MAX_RPS` is genuinely **provider-imposed** — a real external
+rate limit, not a preference. Recommend it ships **read-only** in the
+panel (show the ceiling and why, no input field) rather than editable — an
+editable field that silently gets clamped server-side to 1 the moment
+someone tries 5 is a worse UX than not offering the field, and matches
+Nick's own "friendly to use" goal better than a control that lies about
+what it does. `ATLAS_SUBMIT_SPACING_MS` is SELF-imposed but exists
+specifically to keep other models' submit rate sane — not provider-capped,
+but not a knob to raise casually either; flag it money-adjacent (below),
+not provider-locked.
+
+**The boot-time finding, verified by reading the actual require order, not
+inferred:**
+
+- `services/concurrency.js:262`: `const concurrency =
+  Object.freeze(resolveAll());` — a **synchronous** statement that runs
+  once, the first time the module is required, and freezes the result.
+  `resolveAll()` reads only `process.env` (`resolveKnob` →
+  `process.env[spec.env]`) — there is no DB read anywhere in this path
+  today.
+- Every consumer in the codebase (18 files, confirmed by grep — `routes/ads.js`,
+  `worker.js`, `services/cloudinaryService.js`,
+  `services/aiLayoutStudioService.js`, `services/catalogSyncService.js`,
+  and a dozen more) destructures `{ concurrency: CONC }` from that SAME
+  frozen module-cache object at their own module-load time. None of them
+  re-`require` or re-resolve per call. `routes/ads.js:295` goes one step
+  further and **constructs a `Semaphore` object** with the frozen value
+  baked into its capacity at module load
+  (`new Semaphore(CONC.VEO_TITLING_CONCURRENCY, ...)`) — even a hypothetical
+  live-reloadable *number* wouldn't resize an already-constructed semaphore
+  without its own code change. `worker.js:173` sizes the **Mongo connection
+  pool itself** off `WORKER_CONCURRENCY` at boot
+  (`Math.max(50, Math.min(CONCURRENCY * 3, 200))`) — a second boot-fixed
+  resource riding on the same number.
+- **This is not merely "nobody re-reads it yet" — it is structurally hard
+  to fix without reordering boot.** `index.js:8` calls
+  `require('./services/concurrency').logConcurrencyConfig()` (which forces
+  the module's first require, and so the freeze); `mongoose.connect(...)`
+  doesn't happen until `index.js:296`. Same shape in `worker.js`: concurrency
+  resolves at line 41, Mongo connects at line 175. **`SystemConfig` is not
+  reachable at the exact moment the frozen snapshot is computed, in either
+  process.** Making the frozen table DB-aware would require connecting to
+  Mongo *before* resolving concurrency (a real boot-sequence change, with
+  its own risk: the first log line and the concurrency table would now wait
+  on a Mongo round-trip that today happens for free, synchronously) — that
+  is a code change for a future implementation pass, not something the
+  settings-store design can paper over.
+- **Practical conclusion, stated as plainly as the coordinator asked for:**
+  today, changing ANY of these 19 values — by any mechanism, panel or
+  otherwise — takes effect only on the next process boot. A panel is still
+  worth building (see below for why), but it must say this outright, not
+  imply otherwise.
+
+**The one partial exception, and why it doesn't change the practical
+conclusion.** `submitSpacingMsForModel(model, values = null)`
+(`services/concurrency.js:239`) defaults to `resolveAll()` when called
+without an explicit `values` argument — and its one production caller,
+`atlasVideoService.js:2964`, calls it exactly that way:
+`submitSpacingMsForModel(model)`, no cached values passed. So
+`ATLAS_SUBMIT_SPACING_MS`/`GROK_MAX_RPS`, on this ONE call path, really are
+re-derived fresh on every video submit, not read from the frozen snapshot —
+verified by reading the call site, not inferred from the function's
+existence. This makes them the only knobs where "DB-backed, no restart
+needed" is a **small** change (teach `resolveKnob` to check `SystemConfig`
+before falling to env — Mongo is certainly connected by the time a real
+video submit happens, long after boot) rather than a call-site-by-call-site
+refactor. It does not change anything for the other 17: their consumers
+still read the boot-frozen object, and a DB check inside `resolveKnob`
+would only ever be reachable for these two.
+
+**The `RENDER_CONCURRENCY` precedent, read as instructed
+(`CLAUDE.md` §4a) — and why removing the env vars solves a DIFFERENT
+problem than "no restart needed," not the same one.** Verified: the Render
+dashboard pinned `RENDER_CONCURRENCY=4` while `config/defaults.env` said
+`8`; `dotenv` never overrides an already-set var, so the dashboard silently
+won and production ran at 4 for a day while the file (and the team's belief)
+said 8. That is a **two-sources-disagree** failure — nothing to do with
+boot-timing, everything to do with two independent config files nobody was
+comparing. Moving concurrency's source of truth into `SystemConfig` (one
+document, one value per key) makes that specific class of incident
+structurally impossible — there is no second file left to disagree with,
+and the settings screen's "effective value + source" display (§2.1)
+answers "why is it this number" directly instead of requiring a manual
+diff against a Render dashboard. **This is real progress, and worth doing
+for its own sake** — but it does NOT make a change take effect without a
+restart. The design must not present "we removed the env var" as having
+solved the boot-timing problem too; they are two different problems with
+two different fixes, and conflating them is exactly the "looks right,
+silently does nothing" trap the coordinator named.
+
+**Multi-instance: the panel must not imply a cluster-wide cap, because it
+is not one — and this is a live, already-documented finding, not a
+hypothetical.** `docs/PIPELINES.md:1603` confirms the WEB service
+autoscales `min 1 / max 3` on CPU+memory at 60%. `ARCHITECTURE_REVIEW.md`'s
+own finding PIPELINE-7, independent of this design: *"`VEO_CONCURRENCY` is
+per-process; at autoscale-3 the global rate is 3 against a 1-RPS
+provider."* I confirmed the mechanism myself: `atlasVideoService.js`'s
+pacing state (`_modelSubmitGate`, `_modelLastSubmitAt`) is a plain
+module-level `Map()` — in-memory, per-process, with zero cross-instance
+coordination. So at 3 autoscaled WEB instances, each independently pacing
+Grok submits to "1 RPS," the **aggregate** rate against Grok's real
+1-RPS-total ceiling can be up to 3x over — a live violation of a provider
+limit that no per-process knob can see, let alone fix. `RENDER_CONCURRENCY`,
+`VEO_CONCURRENCY`, `VEO_TITLING_CONCURRENCY`, and `REMOTION_QUEUE_CONCURRENCY`
+all carry the same "per-instance, not fleet-wide" shape since they're all
+resolved inside the same autoscaled WEB process. `WORKER_CONCURRENCY` is
+different in kind: I could not find a documented autoscale range for the
+WORKER service the way WEB's is documented (flagging as unverified, not
+assumed single-instance) — but even if WORKER does run >1 instance, its
+knob only paces polling loops behind an atomic `findOneAndUpdate` claim, so
+multiple instances can't double-claim the same row; it lacks
+`VEO_CONCURRENCY`'s specific provider-rate-limit exposure.
+
+**Design proposal:**
+
+1. Concurrency knobs join the general settings catalog (§2.2) as a
+   `category: 'concurrency'` group, same one-doc-per-key store, same
+   audited-writer requirement (§2.6) — no separate mechanism.
+2. Every catalog entry for a concurrency knob carries a new required field,
+   `liveness: 'boot-only' | 'live'`. Set to `'boot-only'` for all 19 today.
+   (`ATLAS_SUBMIT_SPACING_MS`/`GROK_MAX_RPS` could become `'live'` in a
+   later pass that also teaches `resolveKnob` to check `SystemConfig` — not
+   in this one; ship them `'boot-only'` too until that specific code change
+   lands, so the UI never claims a capability the backend doesn't have yet.)
+3. **UI requirement, not optional:** a `'boot-only'` knob's edit form shows
+   a persistent, unmissable notice — "Takes effect on the next
+   deploy/restart of [WEB / WORKER]. Currently-running processes keep their
+   own boot-time value until then." — not a one-time toast that scrolls
+   away. The effective-value display (§2.1: value + source) stays useful
+   even here — it tells an operator what a *freshly-booted* process would
+   read, which is exactly the number worth knowing before triggering a
+   restart.
+4. `GROK_MAX_RPS` ships read-only (ceiling + explanation, no input) per
+   above. Every other provider-shaped constraint in this table (there are
+   none besides `GROK_MAX_RPS` today) gets the same treatment if one shows
+   up later — the rule is "provider-imposed ⇒ read-only or hard-capped
+   input at the documented ceiling with that ceiling stated in the UI,"
+   not "editable and silently clamped."
+5. Money/stability-adjacent knobs — `RENDER_CONCURRENCY`, `VEO_CONCURRENCY`,
+   `VEO_TITLING_CONCURRENCY`, `REMOTION_QUEUE_CONCURRENCY`,
+   `WORKER_CONCURRENCY`, `ATLAS_SUBMIT_SPACING_MS` — require the same
+   explicit confirmation as any `money:true` key (§2.6) **on increase
+   only** (a decrease is the conservative direction and doesn't need the
+   same friction); every change, either direction, gets an audit-log entry.
+   `REMOTION_QUEUE_CONCURRENCY` and `VEO_CONCURRENCY` additionally carry a
+   `moneyNote`/stability note citing the documented failure mode verbatim
+   (RSS exhaustion → autoscale replacement → a paid ~$1.00 Omni master
+   stranded mid-titling, `docs/PIPELINES.md:1648`) — this is the strongest
+   "why does this number matter" copy available and it already exists in
+   the docs, not something to write fresh.
+6. Every knob whose consumer runs inside the autoscaled WEB process
+   (`RENDER_CONCURRENCY`, `VEO_CONCURRENCY`, `VEO_TITLING_CONCURRENCY`,
+   `REMOTION_QUEUE_CONCURRENCY`) carries fixed UI copy: *"Applies
+   independently to each running instance. This service currently
+   autoscales 1-3 instances — actual system-wide concurrency can be up to
+   3x this number, not capped at it."* This is the direct fix for the
+   PIPELINE-7-class confusion, stated where an operator will actually see
+   it before they raise a number expecting a hard global ceiling.
+7. **Not proposing in this pass, flagged instead as Question 12:** a
+   "restart this service" trigger from the panel. Without one, "takes
+   effect on next restart" is informational only — an operator still has
+   to go trigger a Render deploy/restart themselves. Building a
+   restart-trigger is a meaningfully bigger scope addition (it's an action
+   with its own blast radius — an accidental restart mid-render-batch
+   orphans in-flight billable work per the render-queue durability gap
+   ARCHITECTURE_REVIEW.md already documents) and shouldn't be assumed into
+   scope silently.
+
 ---
 
 ## 3. Authorization model
@@ -995,6 +1201,28 @@ before shipping, not after. Do not build this ahead of §3.4's writer.
 - `font-vision`, `moderationSeedFallback`, `htmlValidationService` — each
   read directly to confirm Grok's "not a QC gate" verdict rather than
   trusting it blind.
+- §2.9's entire boot-time analysis: `services/concurrency.js` read in full;
+  the require order in both `index.js` (concurrency at `:8`, `mongoose.connect`
+  at `:296`) and `worker.js` (concurrency at `:41`, `mongoose.connect` at
+  `:175`) read directly, not inferred from comments; the `veoTitlingSemaphore`
+  construction at `routes/ads.js:295` and the Mongo-pool derivation at
+  `worker.js:173` read directly; `submitSpacingMsForModel`'s uncached
+  `resolveAll()` default and its one call site
+  (`atlasVideoService.js:2964`, no `values` argument passed) read directly
+  — this is what makes the "one partial exception" claim a read fact, not a
+  guess; every `*CONCURRENCY`/`RPS`/`SPACING_MS`-named key in
+  `config/defaults.env` cross-checked against `SPEC` and found to match
+  exactly (no stray un-migrated knob).
+- The `RENDER_CONCURRENCY` incident, read from `CLAUDE.md` §4a directly, not
+  taken from the coordinator's summary of it, including the exact before/after
+  key counts (WEB 64→23, WORKER 24→14) and the "4 vs 8 for a day" detail.
+- `ARCHITECTURE_REVIEW.md`'s PIPELINE-7 finding (`VEO_CONCURRENCY` per-process
+  at autoscale-3 vs Grok's 1 RPS) and the WEB autoscale range
+  (`docs/PIPELINES.md:1603`, "min 1 / max 3") — both read directly; PIPELINE-7
+  is an existing, independent finding from an earlier review, not something
+  I derived myself, though I independently confirmed the mechanism it's based
+  on (`atlasVideoService.js`'s in-memory `_modelSubmitGate`/`_modelLastSubmitAt`
+  Maps) by reading the code.
 
 **Verified via Grok's read-only sweep, not independently re-read line-by-line
 by me** (medium confidence, but Grok's specific file:line citations were
@@ -1043,6 +1271,20 @@ alone:**
 - **`CLAUDE_API_KEY`** on the "Liquid Retail" env group — per Grok, not
   referenced anywhere in the codebase (dead credential). Not independently
   re-verified by me; not load-bearing for this design either way.
+- **WORKER's own autoscale range** — I could not find a documented instance
+  count/range for the WORKER service the way WEB's "min 1 / max 3" is
+  documented. §2.9 flags this explicitly rather than assuming single-instance;
+  it changes how much the multi-instance caveat matters for
+  `WORKER_CONCURRENCY` specifically (low-risk either way, since its consumers
+  sit behind an atomic Mongo claim — but I'm not asserting a WORKER instance
+  count I didn't verify).
+- **"Real OOM kills recur every 20-45 min"** — this specific cadence is the
+  coordinator's own live measurement, relayed to me, not something I found
+  documented or verified myself. The underlying mechanism (RSS exhaustion →
+  60%-CPU/mem autoscale trigger → process replacement → a stranded paid
+  master) IS independently documented (`docs/PIPELINES.md:1648`,
+  `ARCHITECTURE_REVIEW.md`) and I cite that part as verified; the exact
+  frequency is relayed, not re-derived.
 
 ---
 
@@ -1166,3 +1408,35 @@ Recommended option listed first for each.
     elsewhere in the product is the kind of gap that gets found in
     production rather than review. Say if you'd rather this stay a
     separate, explicitly-scoped follow-up instead.
+
+12. **A "restart this service" trigger, or accept "informational only" for
+    concurrency (§2.9).** Every concurrency knob is boot-time-only today
+    (verified: the frozen snapshot resolves before Mongo even connects, in
+    both processes) — the panel can tell an operator a change needs a
+    restart, but without a trigger they still have to go do that themselves
+    on Render. Recommend **not** building a restart trigger in this pass —
+    it's a real action with its own blast radius (an accidental or
+    mistimed restart orphans in-flight billable renders, a durability gap
+    `ARCHITECTURE_REVIEW.md` already documents as open) and deserves its
+    own explicit go-ahead rather than riding in on a settings-panel scope
+    expansion. Confirm "informational only" is acceptable for v1, or say if
+    a restart trigger is actually wanted now.
+
+13. **`GROK_MAX_RPS` read-only vs. editable-with-a-clamp-warning.**
+    Recommend read-only (show the 1 RPS provider ceiling and why, no input
+    field) — editable-but-silently-clamped is the exact "looks like it
+    worked, didn't" trap this whole exercise is about avoiding, for a
+    control that in this one case can never do anything above its floor
+    anyway. Confirm, or say you'd rather it stay editable with the
+    clamp explained inline.
+
+14. **Whether to spend the (small) extra effort making
+    `ATLAS_SUBMIT_SPACING_MS`/`GROK_MAX_RPS` genuinely live now.** These
+    two are the only knobs in the table where "DB-backed, no restart" is a
+    small change rather than a call-site refactor (§2.9) — the pacing
+    function already re-derives fresh per call, and Mongo is definitely
+    connected by the time it runs. Recommend deferring this too, in the
+    same pass as everything else in this design, so the concurrency
+    category ships with one uniform "boot-only, restart to apply" story
+    rather than two knobs behaving differently from the other seventeen on
+    day one. Confirm, or say this pair is worth the extra work now.
