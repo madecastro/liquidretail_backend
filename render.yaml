@@ -40,13 +40,19 @@ services:
   - type: worker
     name: adgen-renderer
     env: docker
-    plan: standard   # more RAM headroom for Remotion in Phase 1
+    # Standard-Plus: 4 vCPU / 8 GB. The RAM ceiling is set by Remotion —
+    # ~1.5-2 GB per render at 4 concurrent (REMOTION_QUEUE_CONCURRENCY=4)
+    # ≈ 6-8 GB peak. Standard (4 GB) OOMs under real video load.
+    plan: standard_plus
     dockerfilePath: ./Dockerfile
     autoDeploy: true
-    # Autoscale in the Render dashboard (min 2, max 8+) — Phase 0 stays at
-    # 1 instance until real work moves here.
+    # Set autoscale in the Render dashboard: min=2 (survives one instance
+    # replacement), max=8 (capacity for 2000 static/hr + 450 video/hr with
+    # margin — see src/config.js MAX_INFLIGHT comment for the math).
     envVars:
       - key: ADGEN_ROLE
         value: renderer
+      - key: ADGEN_MAX_INFLIGHT
+        value: 32
       - key: MONGODB_URI
         sync: false

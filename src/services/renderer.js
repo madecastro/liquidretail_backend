@@ -22,7 +22,7 @@
 // therefore only cover the static half. Leave the flag off in prod until
 // Phase 1c ships.
 
-const { POLL_MS, WORKER_ID, isAdgenRendererEnabled } = require('../config');
+const { POLL_MS, WORKER_ID, MAX_INFLIGHT, isAdgenRendererEnabled } = require('../config');
 const {
   isStaleTopologyError,
   reconnectAfterStaleTopology,
@@ -92,14 +92,14 @@ const atlasVideo = require('./atlasVideoService');
 const { renderBrandScriptAndSave } = require('./brandScriptExecutor');
 const { veoPrepareStoryboard } = require('./videoRouter');
 
-// Bounded wait for a derive-only ad's sibling master to complete. Mirrors
-// backend's renderDeriveOnlyVideoAd — the derive ad row polls Mongo for
-// its master's veoVideoUrl, up to DERIVE_MASTER_WAIT_MS. When the wait
-// expires the ad is requeued for a peer worker to try again (bounded by
-// deriveWaitAttempts so it can't spin forever).
-const DERIVE_MASTER_WAIT_MS   = Number(process.env.DERIVE_MASTER_WAIT_MS   || 720_000); // 12 min
-const DERIVE_MASTER_POLL_MS   = Number(process.env.DERIVE_MASTER_POLL_MS   || 10_000);
-const MAX_DERIVE_WAIT_ATTEMPTS = Number(process.env.MAX_DERIVE_WAIT_ATTEMPTS || 30);
+// Bounded wait for a derive-only ad's sibling master to complete. Kept
+// SHORT (60s default) so an unwaiting derive releases its worker slot
+// quickly for another ad — peer workers pick it up when the master
+// lands. A backend-style 12-min wait would hog MAX_INFLIGHT slots and
+// starve throughput. deriveWaitAttempts bounds infinite requeue loops.
+const DERIVE_MASTER_WAIT_MS    = Number(process.env.DERIVE_MASTER_WAIT_MS    || 60_000);  // 60s
+const DERIVE_MASTER_POLL_MS    = Number(process.env.DERIVE_MASTER_POLL_MS    || 5_000);   // 5s poll
+const MAX_DERIVE_WAIT_ATTEMPTS = Number(process.env.MAX_DERIVE_WAIT_ATTEMPTS || 60);      // 60 × ~60s = 60 min ceiling per derive
 
 let stopping = false;
 
@@ -534,6 +534,45 @@ async function renderVideo(ad) {
   await bumpRunCounter(ad.campaignRunIds, 'succeeded');
 }
 
+// In-process concurrent-render tracking. Every processAd() invocation
+// increments this on entry and decrements on completion (finally). poll()
+// burst-claims up to MAX_INFLIGHT and fires each render as an unawaited
+// promise, so one instance can run many concurrent ads.
+let inFlight = 0;
+
+// End-to-end render for one claimed ad. Wrapped so poll() can dispatch
+// via .finally() without holding the poll loop.
+async function processAd(ad) {
+  const started = Date.now();
+  try {
+    if (ad.renderRoute === 'html_gen') {
+      await renderStatic(ad);
+    } else if (ad.renderRoute === 'veo') {
+      await renderVideo(ad);
+    } else {
+      throw new Error(`unknown renderRoute: ${ad.renderRoute}`);
+    }
+  } catch (err) {
+    const shortId = String(ad._id).slice(-6);
+    const wallSec = ((Date.now() - started) / 1000).toFixed(1);
+    console.error(`renderer[${WORKER_ID}]: render failed ad=${shortId} route=${ad.renderRoute} wall=${wallSec}s: ${err.message}`);
+    try { noteRenderIssue(ad._id, { message: err.message, stage: 'render' }); } catch (_) {}
+    await Ad.updateOne(
+      { _id: ad._id, claimedByWorker: WORKER_ID },
+      {
+        $set: {
+          status:          'failed',
+          claimedByWorker: null,
+          claimedAt:       null,
+          renderError:     { message: err.message.slice(0, 400), stage: 'render', at: new Date(), code: err.code || null },
+          updatedAt:       new Date()
+        }
+      }
+    ).catch(() => {});
+    await bumpRunCounter(ad.campaignRunIds, 'failed');
+  }
+}
+
 async function poll() {
   const start = Date.now();
   try {
@@ -543,41 +582,20 @@ async function poll() {
       return;
     }
 
-    const ad = await claimOne();
+    // Burst-claim: keep pulling ads while there's spare capacity. Each
+    // claim is an atomic findOneAndUpdate (fast ~ms) and the render fires
+    // as an unawaited promise so N concurrent renders share this single
+    // Node event loop. Loop guarded by MAX_INFLIGHT so we never over-
+    // subscribe local resources (Sharp memory, Remotion pool, etc).
+    while (inFlight < MAX_INFLIGHT) {
+      const ad = await claimOne();
+      if (!ad) break;   // queue empty for now — next poll will re-check
+      inFlight++;
+      // Fire-and-forget: processAd manages its own error state and Ad row.
+      // .finally releases the slot regardless of outcome.
+      processAd(ad).finally(() => { inFlight--; });
+    }
     resetReconnectAttempts();
-    if (!ad) {
-      scheduleNext(start);
-      return;
-    }
-
-    try {
-      if (ad.renderRoute === 'html_gen') {
-        await renderStatic(ad);
-      } else if (ad.renderRoute === 'veo') {
-        await renderVideo(ad);
-      } else {
-        throw new Error(`unknown renderRoute: ${ad.renderRoute}`);
-      }
-    } catch (err) {
-      console.error(`renderer[${WORKER_ID}]: render failed ad=${String(ad._id).slice(-6)} route=${ad.renderRoute}: ${err.message}`);
-      try { noteRenderIssue(ad._id, { message: err.message, stage: 'render' }); } catch (_) {}
-      // Best-effort: mark the ad failed so it does not sit in status:'rendering'
-      // forever. Backend's reaper would eventually requeue, but a clean
-      // failed state is the honest outcome here.
-      await Ad.updateOne(
-        { _id: ad._id, claimedByWorker: WORKER_ID },
-        {
-          $set: {
-            status:          'failed',
-            claimedByWorker: null,
-            claimedAt:       null,
-            renderError:     { message: err.message.slice(0, 400), stage: 'render', at: new Date(), code: err.code || null },
-            updatedAt:       new Date()
-          }
-        }
-      ).catch(() => {});
-      await bumpRunCounter(ad.campaignRunIds, 'failed');
-    }
   } catch (err) {
     console.warn(`renderer[${WORKER_ID}]: poll error — ${err.message}`);
     if (isStaleTopologyError(err)) {
@@ -596,13 +614,13 @@ function scheduleNext(startTs) {
 async function run() {
   const gated = isAdgenRendererEnabled();
   console.log(
-    `renderer[${WORKER_ID}] starting — poll interval ${POLL_MS}ms, handoff gate ${gated ? 'ON (claiming)' : 'OFF (sleeping)'}`
+    `renderer[${WORKER_ID}] starting — poll interval ${POLL_MS}ms, max-inflight ${MAX_INFLIGHT}, handoff gate ${gated ? 'ON (claiming)' : 'OFF (sleeping)'}`
   );
   poll();
   setInterval(() => {
     if (stopping) return;
     const g = isAdgenRendererEnabled();
-    console.log(`renderer[${WORKER_ID}] alive — uptime ${Math.round(process.uptime())}s, handoff ${g ? 'ON' : 'OFF'}`);
+    console.log(`renderer[${WORKER_ID}] alive — uptime ${Math.round(process.uptime())}s, inflight ${inFlight}/${MAX_INFLIGHT}, handoff ${g ? 'ON' : 'OFF'}`);
   }, 30_000).unref();
 }
 
