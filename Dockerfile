@@ -8,23 +8,55 @@
 
 FROM node:20-slim
 
-# Native runtime deps for sharp (libvips). node:20-slim is debian-based;
-# sharp normally ships a prebuilt libvips binary and works out of the box
-# on x64 linux, but the runtime dynamic deps (libc, libstdc++) are already
-# in slim. If you see "sharp missing" errors on Render, uncomment the
-# apt-get block below to install libvips explicitly.
-# RUN apt-get update && apt-get install -y --no-install-recommends \
-#       libvips-dev ca-certificates \
-#     && rm -rf /var/lib/apt/lists/*
+# Native runtime deps:
+# - Chrome/Puppeteer needs an X11-less font/render stack: libnss3, libatk*,
+#   libcups2, libdrm2, libgbm1, libasound2, ca-certificates, fonts-liberation.
+# - Remotion's headless render + ffmpeg-static ships its own ffmpeg binary
+#   but needs the shared libs for the Chrome side of the render.
+# - sharp uses a prebuilt libvips binary on x64 linux; no apt package needed
+#   beyond glibc which is in node:20-slim.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      ca-certificates \
+      fonts-liberation \
+      libasound2 \
+      libatk-bridge2.0-0 \
+      libatk1.0-0 \
+      libcairo2 \
+      libcups2 \
+      libdbus-1-3 \
+      libdrm2 \
+      libgbm1 \
+      libglib2.0-0 \
+      libgtk-3-0 \
+      libnspr4 \
+      libnss3 \
+      libpango-1.0-0 \
+      libx11-6 \
+      libx11-xcb1 \
+      libxcb1 \
+      libxcomposite1 \
+      libxdamage1 \
+      libxext6 \
+      libxfixes3 \
+      libxrandr2 \
+      libxrender1 \
+      libxss1 \
+      libxtst6 \
+      wget \
+      xdg-utils \
+    && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
 # Install deps first (better layer caching). --omit=dev skips eslint etc.
+# Puppeteer's postinstall downloads Chrome (~150MB). Remotion's postinstall
+# is a no-op — its renderer downloads headless-shell on first use.
 COPY package*.json ./
 RUN npm install --omit=dev
 
 # Copy everything the app needs at runtime: source + committed non-secret
-# defaults. config/defaults.env is loaded by src/config.js on boot.
+# defaults + Remotion compositions. config/defaults.env is loaded by
+# src/config.js on boot; src/remotion is bundled by Remotion at render time.
 COPY src/ ./src/
 COPY config/ ./config/
 

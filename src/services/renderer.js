@@ -29,10 +29,25 @@ const {
   resetReconnectAttempts
 } = require('../db');
 const Ad          = require('../models/Ad');
+const Brand       = require('../models/Brand');
+const Media       = require('../models/Media');
 const CampaignRun = require('../models/CampaignRun');
 const directImage = require('./directImageRenderService');
 const { buildLayoutInput } = require('./layoutInputService');
 const { adStage, noteRenderIssue } = require('./adStage');
+const { resolveDeriveFromMaster } = require('./campaignAdsGenerationService');
+const atlasVideo = require('./atlasVideoService');
+const { renderBrandScriptAndSave } = require('./brandScriptExecutor');
+const { veoPrepareStoryboard } = require('./videoRouter');
+
+// Bounded wait for a derive-only ad's sibling master to complete. Mirrors
+// backend's renderDeriveOnlyVideoAd — the derive ad row polls Mongo for
+// its master's veoVideoUrl, up to DERIVE_MASTER_WAIT_MS. When the wait
+// expires the ad is requeued for a peer worker to try again (bounded by
+// deriveWaitAttempts so it can't spin forever).
+const DERIVE_MASTER_WAIT_MS   = Number(process.env.DERIVE_MASTER_WAIT_MS   || 720_000); // 12 min
+const DERIVE_MASTER_POLL_MS   = Number(process.env.DERIVE_MASTER_POLL_MS   || 10_000);
+const MAX_DERIVE_WAIT_ATTEMPTS = Number(process.env.MAX_DERIVE_WAIT_ATTEMPTS || 30);
 
 let stopping = false;
 
@@ -175,14 +190,216 @@ async function renderStatic(ad) {
   }
 }
 
-// Video path — Phase 1c. For now, throw honest so the claim releases and
-// backend can be flipped back to ADGEN_RENDERER_ENABLED=false for video
-// runs. When Phase 1c ships, this branch calls into atlasVideoService +
-// brandScriptExecutor + Remotion.
+// Sibling master lookup. Mirrors backend's findSiblingMasterAd in
+// routes/ads.js — a derive ad's master is same-campaign, same-product,
+// video kind, with the requested platformFormat, and NO deriveFromMaster
+// / funnelStage of its own (true master, not another retitle).
+async function findSiblingMasterAd(ad, masterPlatformFormat) {
+  const base = {
+    campaignId: ad.campaignId,
+    productId:  ad.productId,
+    platformFormat: masterPlatformFormat,
+    kind:      'video',
+    _id:       { $ne: ad._id },
+    $and: [
+      { $or: [{ deriveFromMaster: null }, { deriveFromMaster: { $exists: false } }] },
+      { $or: [{ funnelStage: null },       { funnelStage: { $exists: false } }] }
+    ]
+  };
+  const runIds = Array.isArray(ad.campaignRunIds) ? ad.campaignRunIds.map(String).filter(Boolean) : [];
+  if (runIds.length) {
+    const inRun = await Ad.findOne({ ...base, campaignRunIds: { $in: runIds } })
+      .sort({ generatedAt: -1 }).lean();
+    if (inRun) return inRun;
+  }
+  return Ad.findOne(base).sort({ generatedAt: -1 }).lean();
+}
+
+// Requeue a derive whose master isn't ready yet. Bumps deriveWaitAttempts
+// (NOT renderAttempts — that would spuriously trip the stranded-sweeper).
+// The claim is released so a peer worker can retry after the master lands.
+async function requeueDeriveForRetry(ad, reason) {
+  await Ad.updateOne(
+    { _id: ad._id, claimedByWorker: WORKER_ID },
+    {
+      $set: {
+        status:          'rendering',
+        claimedByWorker: null,
+        claimedAt:       null,
+        updatedAt:       new Date()
+      },
+      $inc: { deriveWaitAttempts: 1 }
+    }
+  );
+  console.log(`renderer[${WORKER_ID}]: derive requeued ad=${String(ad._id).slice(-6)} — ${reason}`);
+}
+
+// Video render path — handles BOTH the billable master submit (Atlas Omni)
+// AND the free derive-only crops/retitles of an existing master. Money-
+// critical gate: renderDeriveOnlyVideoAd MUST NEVER call atlasVideo.
+// generateForAd — that would submit a paid Omni master on a "free" derive
+// row. The check is resolveDeriveFromMaster (imported, single definition,
+// fail-closed on pmax_video_1_1 by construction).
 async function renderVideo(ad) {
-  const err = new Error(`video render not yet extracted (Phase 1c) — ad ${String(ad._id).slice(-6)} route=veo`);
-  err.notYetImplemented = true;
-  throw err;
+  const adId = String(ad._id);
+  const shortId = adId.slice(-6);
+  const t0 = Date.now();
+  const runId = Array.isArray(ad.campaignRunIds) && ad.campaignRunIds.length
+    ? ad.campaignRunIds[ad.campaignRunIds.length - 1]
+    : null;
+
+  const deriveFromFmt = resolveDeriveFromMaster(ad);
+
+  if (deriveFromFmt) {
+    // ── DERIVE PATH — no Omni submit, ever ─────────────────────────────
+    console.log(`renderer[${WORKER_ID}]: VIDEO DERIVE start ad=${shortId} deriveFrom=${deriveFromFmt}`);
+
+    if ((ad.deriveWaitAttempts || 0) >= MAX_DERIVE_WAIT_ATTEMPTS) {
+      throw new Error(`derive exceeded max wait attempts (${MAX_DERIVE_WAIT_ATTEMPTS}); sibling master never landed`);
+    }
+
+    // Poll for the sibling master's veoVideoUrl up to DERIVE_MASTER_WAIT_MS.
+    const deadline = Date.now() + DERIVE_MASTER_WAIT_MS;
+    let master = null;
+    while (Date.now() < deadline) {
+      master = await findSiblingMasterAd(ad, deriveFromFmt);
+      if (master?.veoVideoUrl) break;
+      if (master?.status === 'failed') {
+        throw new Error(`sibling master ${String(master._id).slice(-6)} failed — cannot derive`);
+      }
+      await new Promise((r) => setTimeout(r, DERIVE_MASTER_POLL_MS));
+    }
+    if (!master?.veoVideoUrl) {
+      await requeueDeriveForRetry(ad, 'sibling master not yet ready — retry later');
+      return; // NOT counted as failure; requeue is the intent
+    }
+
+    // Inherit the paid master's veoVideoUrl / cloudinary asset onto the derive
+    // and stamp titling-debt marker so sweepers can find this row if we crash
+    // between here and the final renderUrl write.
+    await Ad.updateOne(
+      { _id: ad._id },
+      {
+        $set: {
+          veoVideoUrl:        master.veoVideoUrl,
+          veoAspectRatio:     master.veoAspectRatio || ad.aspectRatio,
+          veoModel:           master.veoModel || null,
+          renderUrl:          master.veoVideoUrl,
+          sourceFileType:     'video',
+          renderedAt:         new Date(),
+          updatedAt:          new Date(),
+          titlingResumeState: 'claimed'
+        },
+        $inc: { renderAttempts: 1 }
+      }
+    );
+
+    // Load brand for titling
+    const sourceMedia = ad.mediaId ? await Media.findById(ad.mediaId).select('brandId').lean() : null;
+    const brandDoc = sourceMedia?.brandId
+      ? await Brand.findById(sourceMedia.brandId).lean()
+      : (ad.brandId ? await Brand.findById(ad.brandId).lean() : null);
+
+    if (brandDoc) {
+      adStage(adId, `titling ${ad.aspectRatio || '9:16'} (derive)`);
+      const adFinal = await Ad.findById(adId).lean();
+      const chromeOut = await renderBrandScriptAndSave({ ad: adFinal, brand: brandDoc });
+      if (chromeOut?.skipped) {
+        console.log(`renderer[${WORKER_ID}]: VIDEO DERIVE no-chrome ad=${shortId} — shipping master`);
+      }
+    }
+
+    // Success stamp — clear titling debt, terminal state.
+    await Ad.updateOne(
+      { _id: ad._id },
+      {
+        $set: {
+          status:             'draft',
+          titlingResumeState: null,
+          claimedByWorker:    null,
+          claimedAt:          null,
+          updatedAt:          new Date()
+        }
+      }
+    );
+    const wallSec = ((Date.now() - t0) / 1000).toFixed(1);
+    console.log(`renderer[${WORKER_ID}]: VIDEO DERIVE done ad=${shortId} wall=${wallSec}s`);
+    await bumpRunCounter(ad.campaignRunIds, 'succeeded');
+    return;
+  }
+
+  // ── MASTER PATH — billable Atlas Omni submit ──────────────────────────
+  console.log(`renderer[${WORKER_ID}]: VIDEO MASTER start ad=${shortId} format=${ad.platformFormat}`);
+
+  const sourceMedia = ad.mediaId ? await Media.findById(ad.mediaId).select('fileType fileUrl brandId').lean() : null;
+  const brandDoc = sourceMedia?.brandId
+    ? await Brand.findById(sourceMedia.brandId).lean()
+    : (ad.brandId ? await Brand.findById(ad.brandId).lean() : null);
+
+  // Stage 1 — prepare storyboard / prompt context. On Atlas the storyboard
+  // is null and the Ken Burns prompt directs motion; kept as-called for
+  // compat with legacy vertex path (which noop-returns).
+  adStage(adId, 'preparing video context');
+  const { storyboard } = await veoPrepareStoryboard({ ad });
+
+  // Stage 2 — the billable Omni submit + poll. Stamps veoPredictionId
+  // (spend receipt) inside atlasVideoService before polling.
+  adStage(adId, `master video generation (${ad.aspectRatio || '9:16'})`);
+  const veoResult = await atlasVideo.generateForAd({ ad, storyboard, campaignRunId: runId });
+  if (veoResult.skipped) {
+    throw new Error(veoResult.reason || 'video generation skipped by provider');
+  }
+
+  // Persist master + titling debt marker in one write (see backend
+  // routes/ads.js:2940 — this shape is the money-critical stamp that
+  // makes the paid asset reclaimable if the process dies mid-titling).
+  await Ad.updateOne(
+    { _id: ad._id },
+    {
+      $set: {
+        veoVideoUrl:          veoResult.videoUrl,
+        veoAspectRatio:       veoResult.aspectRatio || ad.aspectRatio,
+        veoPrompt:            veoResult.prompt || null,
+        veoStoryboard:        veoResult.storyboard || storyboard || null,
+        veoCloudinaryPublicId: veoResult.cloudinaryPublicId || null,
+        veoModel:             veoResult.model || null,
+        veoReferenceImages:   veoResult.referenceImages || [],
+        renderUrl:            veoResult.videoUrl,
+        sourceFileType:       'video',
+        renderedAt:           new Date(),
+        updatedAt:            new Date(),
+        titlingResumeState:   'claimed'
+      },
+      $inc: { renderAttempts: 1 }
+    }
+  );
+
+  // Stage 3 — Remotion titling on the paid master.
+  if (brandDoc) {
+    adStage(adId, `titling ${ad.aspectRatio || '9:16'}`);
+    const adFinal = await Ad.findById(adId).lean();
+    const chromeOut = await renderBrandScriptAndSave({ ad: adFinal, brand: brandDoc });
+    if (chromeOut?.skipped) {
+      console.log(`renderer[${WORKER_ID}]: VIDEO MASTER no-chrome ad=${shortId} — shipping master`);
+    }
+  }
+
+  // Terminal — clear titling debt + claim.
+  await Ad.updateOne(
+    { _id: ad._id },
+    {
+      $set: {
+        status:             'draft',
+        titlingResumeState: null,
+        claimedByWorker:    null,
+        claimedAt:          null,
+        updatedAt:          new Date()
+      }
+    }
+  );
+  const wallSec = ((Date.now() - t0) / 1000).toFixed(1);
+  console.log(`renderer[${WORKER_ID}]: VIDEO MASTER done ad=${shortId} wall=${wallSec}s`);
+  await bumpRunCounter(ad.campaignRunIds, 'succeeded');
 }
 
 async function poll() {
