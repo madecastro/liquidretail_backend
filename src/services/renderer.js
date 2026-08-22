@@ -52,15 +52,20 @@ const MAX_DERIVE_WAIT_ATTEMPTS = Number(process.env.MAX_DERIVE_WAIT_ATTEMPTS || 
 let stopping = false;
 
 async function claimOne() {
+  // Claim any static (html_gen) or video (veo) ad that's in status:'rendering'
+  // and unowned. NOTE: derives ARE claimable here even without their own
+  // veoVideoUrl — the sibling-master wait happens INSIDE renderVideo() via
+  // findSiblingMasterAd, not at claim time. Gating derives on their OWN
+  // veoVideoUrl (Phase 1a design mistake) meant no derive was ever claimable,
+  // because the veoVideoUrl gets INHERITED from the master during render,
+  // never before. Cost of the fix: a derive worker holds a slot for up to
+  // DERIVE_MASTER_WAIT_MS (12min) if the master hasn't landed yet. Bounded
+  // by MAX_DERIVE_WAIT_ATTEMPTS at requeue time. Matches backend behavior.
   return Ad.findOneAndUpdate(
     {
       status:          'rendering',
       claimedByWorker: null,
-      $or: [
-        { renderRoute: 'html_gen' },
-        { renderRoute: 'veo', deriveFromMaster: null },
-        { renderRoute: 'veo', deriveFromMaster: { $ne: null }, veoVideoUrl: { $ne: null } }
-      ]
+      renderRoute:     { $in: ['html_gen', 'veo'] }
     },
     { $set: { claimedByWorker: WORKER_ID, claimedAt: new Date() } },
     { new: true, sort: { createdAt: 1 } }
