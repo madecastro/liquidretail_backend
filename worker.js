@@ -376,8 +376,24 @@ async function reapOrphans() {
   // change is that the second case no longer leaves `renderStage` empty, so
   // it stops being permanently invisible to strandedRunSweeper's breadcrumb
   // requirement.
+  // Skip ads owned by an ad-gen microservice renderer (claimedByWorker set).
+  // Phase 1a extraction: when ADGEN_RENDERER_ENABLED=true, backend hands off
+  // via runRenderLoop → adgen atomically claims via findOneAndUpdate({
+  //   status:'rendering', claimedByWorker:null }, { $set:{claimedByWorker,
+  //   claimedAt}}). Without this filter, backend's reaper would $set status:
+  //   'queued' on adgen-owned ads every REAP_STALE_MIN, causing spurious
+  //   churn (observed 2026-08-22: derive b431a9 accumulated 15 runIds in
+  //   ~5 hours while adgen was mid-wait for a sibling master). Adgen owns
+  //   the reclaim decision on its own claims.
+  // Fail-safe if adgen worker dies: the claim stays until manual cleanup.
+  // A later phase can add per-ad heartbeat + claim-TTL. For now, trust the
+  // worker + rely on operator visibility (Ad.claimedByWorker is queryable).
   const ads = await Ad.updateMany(
-    receiptFree({ status: 'rendering', updatedAt: { $lt: cutoff } }),
+    receiptFree({
+      status: 'rendering',
+      updatedAt: { $lt: cutoff },
+      claimedByWorker: null
+    }),
     buildRequeuePipeline({ breadcrumb: 'reaped: claimed but never dispatched — run stalled for over ' + REAP_STALE_MIN + 'm' })
   );
 
