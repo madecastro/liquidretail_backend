@@ -186,12 +186,27 @@ async function renderStatic(ad) {
       await Ad.updateOne({ _id: adId }, { $set: { status: 'failed', claimedByWorker: null, updatedAt: new Date() } });
     }
   } else {
-    // renderDirectImage stamped renderUrl + status='draft' internally.
+    // MONEY-CRITICAL: renderDirectImage does NOT transition status='draft'
+    // on its own — that lived in the (deleted) renderService.persistStage.
+    // Without this write the ad stays in status:'rendering', the claim
+    // query re-selects it on the next poll, and we bill ANOTHER Atlas
+    // submit. Measured live: same ad b46703 re-rendered 10+ times at
+    // $0.07/submit before this bug was caught. Fix: transition status +
+    // clear claim in a SINGLE atomic write, gated on claimedByWorker
+    // still being us (defensive — a peer sweep must never win this race).
     console.log(`renderer[${WORKER_ID}]: STATIC done ad=${shortId} wall=${wallSec}s`);
+    await Ad.updateOne(
+      { _id: ad._id, claimedByWorker: WORKER_ID, status: 'rendering' },
+      {
+        $set: {
+          status:          'draft',
+          claimedByWorker: null,
+          claimedAt:       null,
+          updatedAt:       new Date()
+        }
+      }
+    );
     await bumpRunCounter(ad.campaignRunIds, 'succeeded');
-    // Release claim on the terminal-state row — renderDirectImage set
-    // status='draft' but may not have cleared claimedByWorker.
-    await releaseClaim(ad._id);
   }
 }
 
