@@ -33,8 +33,60 @@ const Brand       = require('../models/Brand');
 const Media       = require('../models/Media');
 const CampaignRun = require('../models/CampaignRun');
 const directImage = require('./directImageRenderService');
-const { buildLayoutInput } = require('./layoutInputService');
+const {
+  buildLayoutInput,
+  resolveQuoteAssemblyOptions,
+  applyStagedQuotePick
+} = require('./layoutInputService');
+const LayoutInputArtifact = require('../models/LayoutInputArtifact');
+const { uploadBufferToCloudinary } = require('./cloudinaryService');
+const crypto = require('crypto');
 const { adStage, noteRenderIssue } = require('./adStage');
+
+// Extracted from backend renderService.persistStage's `copy` field builder.
+// Preferred: renderedCopy from directImage output (post-density-budget
+// truth) — the actual strings the model was told to typeset. Fallback:
+// layoutInput.copy (pre-render marketing copy). See CLAUDE.md § 5 for
+// why the two can drift.
+function extractCopySnapshot(input, rendered = null) {
+  const price = input?.product?.price;
+  const priceStr = typeof price === 'string' ? price
+                 : typeof price === 'number' ? `$${price.toFixed(2)}`
+                 : (price?.display || '');
+  const useRendered = rendered && typeof rendered === 'object';
+  return {
+    headline:     useRendered ? (rendered.headline || '') : (input?.copy?.headline                    || ''),
+    cta_text:     useRendered ? (rendered.cta_text  || '') : (input?.cta?.text                         || ''),
+    quote:        useRendered ? (rendered.quote     || '') : (input?.social_proof?.primary_quote?.text || ''),
+    productName:  input?.product?.name                     || '',
+    productPrice: priceStr
+  };
+}
+
+// Extracted from renderService.uploadStage. Same Cloudinary folder / publicId
+// shape backend uses — so re-renders of the same ad OVERWRITE (money invariant:
+// one identity digest = one Cloudinary asset) rather than accumulate orphans.
+async function uploadRenderToCloudinary(renderOutput, ctx) {
+  const folder = `ads/${ctx.brandId}/${ctx.campaignId}`;
+  const shortMedia = String(ctx.mediaId).slice(-8);
+  const shortDigest = (ctx.identityDigest || '').slice(0, 8) || crypto.randomBytes(4).toString('hex');
+  const publicId = `${ctx.aspectRatio.replace(/[:.]/g, '_')}-${ctx.template}-${shortMedia}-${shortDigest}`;
+  const result = await uploadBufferToCloudinary(renderOutput.buffer, {
+    folder,
+    publicId,
+    resourceType: 'image',
+    overwrite:    true
+  });
+  return {
+    cloudinaryPublicId: result.public_id,
+    renderUrl:          result.secure_url || result.url,
+    posterUrl:          null,
+    bytes:              result.bytes  || renderOutput.bytes,
+    width:              result.width  || renderOutput.width,
+    height:             result.height || renderOutput.height,
+    durationMs:         null
+  };
+}
 const { resolveDeriveFromMaster } = require('./campaignAdsGenerationService');
 const atlasVideo = require('./atlasVideoService');
 const { renderBrandScriptAndSave } = require('./brandScriptExecutor');
@@ -114,31 +166,60 @@ async function renderStatic(ad) {
   );
   const t0 = Date.now();
 
-  // Step 1 — derive LayoutInputArtifact. Same shape backend uses in
-  // renderService.deriveStage → buildLayoutInput.
-  const layoutOpts = {
-    productId:    ad.productId ? String(ad.productId) : null,
-    variantKind:  ad.variantKind || null,
-    paletteSource: ad.paletteSource || 'media',
-    campaignKind:  ad.campaignKind || null,
-    platformFormat: ad.platformFormat || 'meta_feed_1_1',
-    funnelStage:   ad.funnelStage || null,
-    campaignId:    ad.campaignId ? String(ad.campaignId) : null,
-    brandId:       ad.brandId ? String(ad.brandId) : null,
-    // Concept-driven ads pass the artifact + concept id so buildLayoutInput
-    // can pull the Director's copy / proof / media picks.
-    adConceptArtifactId: ad.conceptArtifactId ? String(ad.conceptArtifactId) : null,
-    adConceptId:         ad.conceptId || null,
-    // adId lets buildLayoutInput noteRenderIssue on this row on failure.
-    adId
-  };
+  // Step 1 — derive LayoutInputArtifact. MIRRORS backend's
+  // renderService.deriveStage exactly. Three moves:
+  //   a. resolveQuoteAssemblyOptions — pre-computes funnel-stage + concept
+  //      angle so the quote pool + stage-aware pick land consistently.
+  //   b. buildLayoutInput — returns the derived input (NOT the artifact).
+  //   c. LayoutInputArtifact.findOne — separate lookup for the persisted
+  //      artifact's _id (buildLayoutInput does NOT return it — a Phase 1b
+  //      wrong-destructure bug meant renderDirectImage always saw
+  //      layoutInputArtifactId=undefined and fell back to a "generic
+  //      layout" on every static render).
+  //   d. applyStagedQuotePick — re-picks the printed quote against the
+  //      stored pool so a cache-hit artifact written by another stage
+  //      cannot leak.
+  const quoteAssembly = await resolveQuoteAssemblyOptions({
+    funnelStage:       ad.funnelStage || null,
+    conceptArtifactId: ad.conceptArtifactId ? String(ad.conceptArtifactId) : null,
+    conceptId:         ad.conceptId || null,
+    conceptAngle:      null
+  });
 
-  const { input, layoutInputArtifactId } = await buildLayoutInput({
-    mediaId:      String(ad.mediaId),
-    template:     ad.template,
-    aspectRatio:  ad.aspectRatio,
-    options:      layoutOpts,
-    refresh:      false
+  const rawInput = await buildLayoutInput({
+    mediaId:     String(ad.mediaId),
+    template:    ad.template,
+    aspectRatio: ad.aspectRatio,
+    refresh:     false,
+    options: {
+      campaignKind:       ad.campaignKind || null,
+      promotionalDetails: null,
+      ctaText:            ad.ctaText || null,
+      ctaUrl:             ad.ctaUrl  || null,
+      variantKind:        ad.variantKind || 'ugc',
+      productId:          ad.productId ? String(ad.productId) : null,
+      paletteSource:      ad.paletteSource || 'media',
+      rafflePrizeMediaId: ad.rafflePrizeMediaId ? String(ad.rafflePrizeMediaId) : null,
+      funnelStage:        quoteAssembly.funnelStage,
+      conceptAngle:       quoteAssembly.conceptAngle
+    }
+  });
+
+  // Cache-key fields match buildLayoutInput's findOneAndReplace filter
+  // (mediaId, template, aspectRatio, productId, variantKind) so the
+  // FK re-read matches exactly the row buildLayoutInput just wrote.
+  const artifact = await LayoutInputArtifact.findOne({
+    mediaId:     String(ad.mediaId),
+    template:    ad.template,
+    aspectRatio: ad.aspectRatio,
+    productId:   ad.productId ? String(ad.productId) : null,
+    variantKind: ad.variantKind || 'ugc'
+  }).select('_id').lean();
+
+  const layoutInputArtifactId = artifact?._id || null;
+  const input = applyStagedQuotePick(rawInput, {
+    funnelStage:  quoteAssembly.funnelStage,
+    conceptAngle: quoteAssembly.conceptAngle
   });
 
   // Step 2 — actual render. Directly through directImageRenderService,
@@ -174,40 +255,71 @@ async function renderStatic(ad) {
   const wallSec = ((Date.now() - t0) / 1000).toFixed(1);
   if (result && result.skipped) {
     console.log(`renderer[${WORKER_ID}]: STATIC skipped ad=${shortId} reason=${result.reason || '-'} wall=${wallSec}s`);
-    // A skip is not a success and not a failure — mirror backend's behavior:
-    // the ad transitions to 'skipped' inside renderDirectImage or upstream;
-    // if the ad is still 'rendering', we leave the claim for a peer to retry.
-    // Increment run.skipped counter.
-    await bumpRunCounter(ad.campaignRunIds, 'skipped');
-    // If renderDirectImage did NOT flip status, treat as failed for our
-    // book-keeping so we don't strand the claim.
-    const fresh = await Ad.findById(adId).select('status').lean();
-    if (fresh?.status === 'rendering') {
-      await Ad.updateOne({ _id: adId }, { $set: { status: 'failed', claimedByWorker: null, updatedAt: new Date() } });
-    }
-  } else {
-    // MONEY-CRITICAL: renderDirectImage does NOT transition status='draft'
-    // on its own — that lived in the (deleted) renderService.persistStage.
-    // Without this write the ad stays in status:'rendering', the claim
-    // query re-selects it on the next poll, and we bill ANOTHER Atlas
-    // submit. Measured live: same ad b46703 re-rendered 10+ times at
-    // $0.07/submit before this bug was caught. Fix: transition status +
-    // clear claim in a SINGLE atomic write, gated on claimedByWorker
-    // still being us (defensive — a peer sweep must never win this race).
-    console.log(`renderer[${WORKER_ID}]: STATIC done ad=${shortId} wall=${wallSec}s`);
     await Ad.updateOne(
-      { _id: ad._id, claimedByWorker: WORKER_ID, status: 'rendering' },
-      {
-        $set: {
-          status:          'draft',
+      { _id: adId, claimedByWorker: WORKER_ID },
+      { $set: {
+          status: 'failed',
+          renderError: { message: `skipped: ${result.reason || 'no reason'}`, stage: 'render', at: new Date() },
           claimedByWorker: null,
-          claimedAt:       null,
-          updatedAt:       new Date()
-        }
-      }
+          claimedAt: null,
+          updatedAt: new Date()
+      }}
     );
-    await bumpRunCounter(ad.campaignRunIds, 'succeeded');
+    await bumpRunCounter(ad.campaignRunIds, 'skipped');
+    return;
   }
+
+  // renderDirectImage returned a paid buffer + metadata. Now upload to
+  // Cloudinary (previously renderService.uploadStage) then persist the
+  // full field set (previously renderService.persistStage). Doing this
+  // in ONE Ad.updateOne closes the money bug where the ad stayed in
+  // status:'rendering', got re-claimed, and re-billed a fresh Atlas
+  // submit ($0.072/loop) — observed 21× on ad b46703 pre-fix, ~$1.44 lost.
+  if (!result?.buffer) {
+    throw new Error('renderDirectImage returned no buffer — cannot upload');
+  }
+  const upload = await uploadRenderToCloudinary(result, {
+    brandId:        ad.brandId ? String(ad.brandId) : 'unknown',
+    campaignId:     ad.campaignId ? String(ad.campaignId) : 'unknown',
+    mediaId:        String(ad.mediaId),
+    template:       ad.template,
+    aspectRatio:    ad.aspectRatio,
+    identityDigest: ad.identityDigest
+  });
+
+  const copy = extractCopySnapshot(input, result.renderedCopy || null);
+
+  await Ad.updateOne(
+    { _id: ad._id, claimedByWorker: WORKER_ID, status: 'rendering' },
+    {
+      $set: {
+        layoutInputArtifactId,
+        sourceFileType:     null,
+        kind:               result.kind || 'image',
+        renderUrl:          upload.renderUrl,
+        posterUrl:          upload.posterUrl,
+        cloudinaryPublicId: upload.cloudinaryPublicId,
+        width:              upload.width,
+        height:             upload.height,
+        bytes:              upload.bytes,
+        durationMs:         upload.durationMs,
+        fontResolution:     result.fontResolution || null,
+        imageGeneration:    result.imageGeneration || null,
+        intentResolution:   result.intentResolution || null,
+        visionQc:           result.visionQc || null,
+        copy,
+        status:             'draft',
+        renderedAt:         new Date(),
+        updatedAt:          new Date(),
+        claimedByWorker:    null,
+        claimedAt:          null
+      },
+      $inc: { renderAttempts: 1 }
+    }
+  );
+
+  console.log(`renderer[${WORKER_ID}]: STATIC done ad=${shortId} wall=${wallSec}s url=${upload.renderUrl.slice(0, 60)}…`);
+  await bumpRunCounter(ad.campaignRunIds, 'succeeded');
 }
 
 // Sibling master lookup. Mirrors backend's findSiblingMasterAd in
