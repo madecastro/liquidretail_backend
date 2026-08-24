@@ -419,3 +419,102 @@ backend.
   **neither is started from `src/entrypoint.js` or `renderer.js`**.
   A mid-titling crash on adgen may not self-heal the way the backend
   web interval does. Unverified in production.
+
+---
+
+## RPD findings salvaged from the retired A/B harness (backend PRs #210 / #212)
+
+Backend built an "RPD harness" (`scripts/rpd/`, branch
+`origin/claude/rpd-harness-v2`) for A/B testing video-model and prompt
+variants. It targets a version of the prompt/QC system adgen has since
+superseded independently, so the harness code itself is dead and was
+retired without landing — PRs **#210 and #212 closed on
+`liquidretail_backend` 2026-08-24, branches NOT deleted**, so the code is
+recoverable if anyone wants it later. This section is the actual substance
+worth keeping — about half a page of prose out of `scripts/rpd/LEARNINGS.md`
+and `.claude/skills/rpd-experiments/references/prompt-elements.md` on that
+branch — landed here because a future adgen session is far more likely to
+open this file than to go dig up a closed PR on a different repo.
+
+**Evidence-strength discipline, read before trusting any of this:** items 1,
+2, and 4 below are each **a single measured comparison (n=1/arm), run
+2026-08-18**, not a validated policy — the harness's own convention was to
+record null results as null results, and that honesty is preserved
+deliberately here. Two are directional wins, one is an explicit null. Item 3
+is not an RPD experiment at all — it's an external benchmark cited as
+context. Do not read any of this as settled fact from two data points.
+
+1. **[n=1, 2026-08-18, directional signal, NOT applied] Low camera motion
+   favours product fidelity.** The recommendation from the harness's prompt
+   lever notes: slow push-in, subtle parallax, static product with the
+   camera as the only thing moving. **Caution for whoever picks this up:**
+   adgen's current `OMNI_DIRECTIVES.cameraStyle`
+   (`src/services/veoPromptBuilder.js:287-289`) already *forbids* parallax
+   outright — "No shake, handheld, parallax, simulated 3D, orbit, or object
+   movement. The product stays completely static." So this is a candidate
+   lever for a **future** experiment, not something already implemented;
+   don't assume the two agree just because both say "low motion."
+
+2. **[n=1, 2026-08-18, measured win — still live and actionable, verified
+   present 2026-08-24] The crossfade/dissolve contradiction is deliberate;
+   a narrower one-line patch measurably fixed a real defect.** Two things
+   are both true and must not be conflated:
+   - The contradiction itself is **intentional, owner-confirmed policy**:
+     `transitions` permits "Smooth crossfades only, ~0.25s" while `doNot`
+     bans "dissolves" outright, and a crossfade *is* a short dissolve.
+     PR #61 "cleaned up" this exact inconsistency in the video prompt and
+     was rolled back in full — the owner said the contradictory version
+     produced better output. adgen's `veoPromptBuilder.js` carries this
+     verbatim, with its own "DO NOT FIX" comment
+     (`src/services/veoPromptBuilder.js:314-320`, `transitions` at line
+     286, the `doNot` dissolves clause at line 327). **Confirmed still
+     present on `origin/master` as of this writing** — this is not a
+     historical note, the identical contradiction is live in production
+     today.
+   - Separately, the harness ran a **measured A/B** (`rpd-validation-crossfade-ab`,
+     $0.90 settled, 2 × $0.45 Omni dev 4s 1080p) that found the baseline
+     (the contradictory pair above) produces mid-crossfade **ghosting** at
+     ~1.2s and ~2.5s in every sampled frame, and a **narrower one-line
+     patch** — "hard cuts only" — removed the ghosting in every sampled
+     frame with no other prompt change.
+   - These do not contradict each other: the owner's rollback precedent is
+     about the *general* transitions/doNot pair reading as internally
+     inconsistent; the ghosting fix is a *specific, measured* defect in the
+     current text with a *specific, measured, one-line* patch. n=1, so
+     treat "hard cuts only" as a promising next experiment to re-run and
+     confirm, not as a change to make unilaterally against explicit
+     "DO NOT FIX" code comments and rollback history.
+
+3. **[external benchmark, July 2026, not an RPD experiment] Product
+   fidelity has a ceiling that prompt wording cannot fix.** An independent
+   benchmark found even leading image models preserve *complete* product
+   detail in only **~29%** of generations — in line with adgen's own
+   observed ~1-in-3 competitor-mark defect rate. The harness's conclusion:
+   a fidelity complaint is usually not solved by more forceful prompt
+   wording. The real fix is **measure-and-reject** — adgen's own
+   `src/services/adVisionQcService.js`, gated by `SystemConfig` (see
+   `queuedArchiveSweeper.js` / `renderer.js` call sites) — not another
+   round of `productPreservation` / `PRODUCT_FIDELITY` prose.
+
+4. **[n=1/arm × 4 cells, 2026-08-18, MEASURED NULL RESULT] Rewriting the
+   static `PRODUCT_FIDELITY` block did not beat the canonical block.**
+   `static-fidelity-block-ab`, $0.2168 settled across 4 cells. A short
+   product-specific rewrite of the whole `PRODUCT_FIDELITY` block was
+   compared against the canonical block; neither measurably beat the other
+   — both arms preserved the printed logo lockup and its text and invented
+   nothing (corroborated by both a human read and the production
+   gemini-2.5-pro auto-eval judge, 10/10 on both axes for all four cells).
+   **Takeaway the harness recorded: prefer testing a different model over
+   rewriting this block again** — this exact rewrite has already been
+   tried and measured not to help.
+
+**Measured prices worth keeping (concrete, from the same two runs above):**
+- Image edit: `gpt-image-2/edit` settled **$0.072272**, `-developer/edit`
+  settled **$0.036136** — the developer variant really is ~half the
+  standard price, not an approximation.
+- Video: 4s Omni dev 1080p settled **$0.45** vs the pricing table's formula
+  estimate of $0.60 (~25% over-estimate, same direction previously observed
+  at 10s).
+- **Atlas publishes `executionTime=0` on that video model** — it is not a
+  usable latency signal. Use `queueToTerminalMs` instead if timing this
+  path.
