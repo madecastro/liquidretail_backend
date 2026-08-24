@@ -261,6 +261,25 @@ function storedGenericForFamily(brand, family) {
   return null;
 }
 
+/**
+ * True for dingbat / glyph-icon families. These are not typefaces: they
+ * exist so CSS `content:"\e90x"` on a ::before/::after can draw a chevron
+ * or a spinner. They must never win a heading/body/button role or be named
+ * to an image model as the brand's own face.
+ *
+ * Pattern, not a name list. Storefronts invent new widget-icon families
+ * (`oke-widget-icons`, `swiper-icons`) faster than any allowlist; a family
+ * whose name is the word `icon`/`icons` (with the usual separators) is an
+ * icon font, and a brand display face is not. `Iconic` does not match —
+ * the trailing `ic` keeps it from being the word `icon`.
+ */
+function isIconFontFamily(family) {
+  const lower = String(family || '').trim().toLowerCase();
+  if (!lower) return false;
+  return /(?:^|[^a-z0-9])(?:icons?|glyphicons?|font[-\s]?awesome|material[-\s]?icons?|icomoon)(?:[^a-z0-9]|$)/i
+    .test(lower);
+}
+
 module.exports = {
   SERIF_HINTS,
   normalizeFamilyKey,
@@ -272,4 +291,5 @@ module.exports = {
   classFromFamilyName,
   classifyTypeface,
   storedGenericForFamily,
+  isIconFontFamily,
 };

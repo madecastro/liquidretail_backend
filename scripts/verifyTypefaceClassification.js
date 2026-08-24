@@ -57,10 +57,15 @@
  *       Dawn's `var(--f), serif`, chained custom properties, `!important`
  *       inside a variable value, a stack whose generic is not first, and
  *       family keys with internal whitespace.
- *   C7  REVERT-PROOF: ten mutations of the real shipped source, each
- *       compiled IN MEMORY and re-run, each asserted to break a specific
- *       check above. A check that cannot fail is not a test. Nothing is
- *       written to disk — see loadMutated's header and #259.
+ *   C9  Soludos GS (2026-08-24): icon-font ::before/::after rules are not
+ *       role evidence, and CSS custom properties defined on one sheet are
+ *       visible to `font-family: var(--token)` usage on another. End-to-end
+ *       the static directive names Newsreader as a serif. Keyword-matched
+ *       serif and genuine-sans brands stay byte-identical.
+ *   C7  REVERT-PROOF: mutations of the real shipped source, each compiled
+ *       IN MEMORY and re-run, each asserted to break a specific check above.
+ *       A check that cannot fail is not a test. Nothing is written to disk
+ *       — see loadMutated's header and #259.
  *
  * Run: node scripts/verifyTypefaceClassification.js
  */
@@ -566,6 +571,201 @@ const ML_BRAND_PRE_BACKFILL = {
 }
 
 // ─────────────────────────────────────────────────────────────────────────
+// C9: Soludos GS — measured 2026-08-24 against the REAL production Brand
+// document AND the live soludos.com CSS that produced it.
+//
+// THE DEFECT (production directive, verbatim):
+//   "This brand's own typeface is Newsreader, a sans-serif. Set the
+//    headline … in a sans-serif with clean grotesque/humanist
+//    proportions, in the spirit of Newsreader."
+// Newsreader is Google's news/reading SERIF. Every static ad for this
+// brand rendered sans headlines off-brand.
+//
+// TWO LINKED FAULTS, both required:
+//   (a) Role detection's only evidence was icon fonts on ::before/::after
+//       of widget buttons (Okendo `oke-widget-icons`, Swiper
+//       `swiper-icons`). Those are dingbats, never typography.
+//   (b) The brand DOES declare the generic — verbatim, in an inline
+//       `:root` block: `--FONT-STACK-HEADING: Newsreader, serif;` — but
+//       the USAGE is in theme.css as `h1 { font-family: var(--FONT-STACK-
+//       HEADING); }` with no trailing generic of its own. Per-sheet
+//       parsing resolved the var to empty, skipped the heading rule, and
+//       left heading/headingGeneric null, so classifyTypeface fell
+//       through to the name heuristic ("Newsreader" matches no serif
+//       keyword → sans).
+//
+// CSS below is the live declaration shapes, trimmed to the rules that
+// participate — not a restatement of the whole theme sheet.
+// ─────────────────────────────────────────────────────────────────────────
+const SOLUDOS_INLINE_CSS = [
+  ':root {',
+  '    --FONT-STACK-BODY: "DM Sans", sans-serif;',
+  '    --FONT-STACK-HEADING: Newsreader, serif;',
+  '    --FONT-STACK-SUBHEADING: "DM Sans", sans-serif;',
+  '    --FONT-STACK-NAV: Newsreader, serif;',
+  '}',
+  // Verbatim Okendo loading-button pseudo (the production evidence row).
+  '.okeReviews[data-oke-container] .oke-button.oke-is-loading:before,div.okeReviews .oke-button.oke-is-loading:before{font-family:oke-widget-icons!important;content:"\\e901"}',
+].join('\n');
+const SOLUDOS_THEME_CSS = [
+  // Verbatim from theme.css (t/269, read 2026-08-24).
+  '.h1, .h2, .h3, .h4, .h5, .h6, h1, h2, h3, h4, h5, h6 {',
+  '  font-family: var(--FONT-STACK-HEADING);',
+  '}',
+  'body {',
+  '  font-family: var(--FONT-STACK-BODY);',
+  '}',
+].join('\n');
+const SOLUDOS_SWIPER_CSS =
+  '.swiper-button-next:after,.swiper-button-prev:after{font-family:swiper-icons;font-size:var(--swiper-navigation-size)}';
+
+// customFonts families, in stored order, measured on the production doc.
+const SOLUDOS_CUSTOM_FONTS = [
+  { family: 'Newsreader' }, { family: 'DM Sans' }, { family: 'Newsreader' },
+  { family: 'DM Sans' }, { family: 'DM Sans' }, { family: 'DM Sans' },
+  { family: 'DM Sans' }, { family: 'oke-widget-icons' },
+];
+// The REAL stored websiteFontUsage, measured. Used to pin the defect's
+// consume-time shape and to prove a keyword-list change is not how we fix it.
+const SOLUDOS_GS_STORED = {
+  fontFamily: 'Newsreader',
+  customFonts: SOLUDOS_CUSTOM_FONTS,
+  websiteFontUsage: {
+    heading: null, body: null, button: 'oke-widget-icons',
+    headingGeneric: null, bodyGeneric: null, buttonGeneric: null,
+    evidence: [
+      {
+        family: 'oke-widget-icons', role: 'button', generic: null, score: 3,
+        selector: '.okeReviews[data-oke-container] .oke-button.oke-is-loading:before,div.okeReviews .oke-button.oke-is-loading:before',
+      },
+      {
+        family: 'swiper-icons', role: 'button', generic: null, score: 3,
+        selector: '.swiper-button-next:after,.swiper-button-prev:after',
+      },
+    ],
+  },
+};
+
+// Byte-identical pins for brands that already classified correctly. Hardcoded
+// from the pre-change function so a silent rewrite of the directive is a
+// failure, not a tautology against the post-change function.
+const PLAYFAIR_BEFORE =
+  'HEADLINE TYPEFACE — FIXED, NOT A STYLE CHOICE. This brand\'s own typeface is Playfair Display, a serif. Set the headline, subheadline and eyebrow copy in a serif with refined editorial serif proportions, in the spirit of Playfair Display. Do not switch to the opposite family (serif vs sans) for stylistic reasons — every surface of this brand\'s campaign must render the SAME typeface family; only the composition should vary.';
+const AKTIV_BEFORE =
+  'HEADLINE TYPEFACE — FIXED, NOT A STYLE CHOICE. This brand\'s own typeface is Aktiv Grotesk, a sans-serif. Set the headline, subheadline and eyebrow copy in a sans-serif with clean grotesque/humanist proportions, in the spirit of Aktiv Grotesk. Do not switch to the opposite family (serif vs sans) for stylistic reasons — every surface of this brand\'s campaign must render the SAME typeface family; only the composition should vary.';
+const PLAYFAIR_BRAND = { customFonts: [{ family: 'Playfair Display', weight: 700 }] };
+const AKTIV_BRAND = {
+  websiteFontUsage: { heading: 'aktiv-grotesk', headingGeneric: 'sans-serif' },
+  customFonts: [{ family: 'aktiv-grotesk', weight: 400 }],
+};
+
+{
+  // (a) icon fonts / pseudo-elements are not role evidence.
+  check('C9 (a) isIconFontFamily matches the two production dingbats',
+    fc.isIconFontFamily('oke-widget-icons') && fc.isIconFontFamily('swiper-icons'));
+  check('C9 (a) isIconFontFamily does not match brand faces',
+    !fc.isIconFontFamily('Newsreader')
+    && !fc.isIconFontFamily('DM Sans')
+    && !fc.isIconFontFamily('Seriously Nostalgic')
+    && !fc.isIconFontFamily('Playfair Display')
+    && !fc.isIconFontFamily('aktiv-grotesk')
+    && !fc.isIconFontFamily('Iconic'));
+  check('C9 (a) a :before icon-font rule yields no button evidence',
+    ingest.extractFontUsageFromCss(
+      '.oke-button.oke-is-loading:before{font-family:oke-widget-icons!important}'
+    ).button == null);
+  check('C9 (a) a :after icon-font rule yields no button evidence',
+    ingest.extractFontUsageFromCss(
+      '.swiper-button-next:after,.swiper-button-prev:after{font-family:swiper-icons}'
+    ).button == null);
+  check('C9 (a) a mixed list h1, h1:before still yields the heading face',
+    ingest.extractFontUsageFromCss('h1, h1:before{font-family:Newsreader, serif}').heading === 'Newsreader');
+  check('C9 (a) a list that is ONLY :before is still dropped even for a real serif',
+    ingest.extractFontUsageFromCss('h1:before, h2:before{font-family:Newsreader, serif}').heading == null);
+  check('C9 (a) a NON-pseudo icon-font rule is also dropped (name, not just selector)',
+    ingest.extractFontUsageFromCss('.btn{font-family:swiper-icons}').button == null);
+  check('C9 (a) a real button face next to an icon pseudo is kept',
+    ingest.extractFontUsageFromCss(
+      '.btn{font-family:DM Sans,sans-serif}.oke-button:before{font-family:oke-widget-icons}'
+    ).button === 'DM Sans');
+
+  // (b) cross-sheet custom properties. Per-sheet (the defect): theme.css
+  // alone cannot see the inline :root token, so heading stays null.
+  check('C9 (b) [THE DEFECT] theme.css alone cannot resolve --FONT-STACK-HEADING',
+    ingest.extractFontUsageFromCss(SOLUDOS_THEME_CSS).heading == null
+    && ingest.extractFontUsageFromCss(SOLUDOS_THEME_CSS).headingGeneric == null);
+  check('C9 (b) inline :root tokens alone yield no heading role (no heading selector)',
+    ingest.extractFontUsageFromCss(SOLUDOS_INLINE_CSS).heading == null);
+  check('C9 (b) [THE FIX] aggregate across the two sheets captures Newsreader + serif',
+    (() => {
+      const u = ingest.aggregateFontUsageAcrossSheets([SOLUDOS_INLINE_CSS, SOLUDOS_THEME_CSS]);
+      return u.heading === 'Newsreader' && u.headingGeneric === 'serif'
+        && u.body === 'DM Sans' && u.bodyGeneric === 'sans-serif';
+    })());
+  check('C9 (b) icon sheets in the same aggregate do not steal the heading',
+    (() => {
+      const u = ingest.aggregateFontUsageAcrossSheets([
+        SOLUDOS_SWIPER_CSS, SOLUDOS_INLINE_CSS, SOLUDOS_THEME_CSS,
+      ]);
+      return u.heading === 'Newsreader' && u.headingGeneric === 'serif'
+        && !u.evidence.some((e) => /icon/i.test(e.family))
+        && u.button !== 'oke-widget-icons' && u.button !== 'swiper-icons';
+    })());
+  // Same-sheet concatenation would have worked even before the fix (the
+  // parser already collects vars from the string it is scoring). Pin it
+  // so a future "only cross-sheet works" regression is visible, but do
+  // not treat it as proof of (b).
+  check('C9 concatenated sheets still resolve (same-parser path, not the bug)',
+    ingest.extractFontUsageFromCss(SOLUDOS_INLINE_CSS + '\n' + SOLUDOS_THEME_CSS)
+      .headingGeneric === 'serif');
+
+  // End-to-end through the real static directive. Fixture = the production
+  // customFonts order + the usage ingest NOW produces from the live CSS.
+  const soludosUsage = ingest.aggregateFontUsageAcrossSheets([
+    SOLUDOS_SWIPER_CSS, SOLUDOS_INLINE_CSS, SOLUDOS_THEME_CSS,
+  ]);
+  const soludosBrand = {
+    fontFamily: 'Newsreader',
+    customFonts: SOLUDOS_CUSTOM_FONTS,
+    websiteFontUsage: soludosUsage,
+  };
+  const soludosLine = direct.typefaceDirectiveForBrand(soludosBrand);
+  check('C9 [THE FIX, end to end] Soludos GS is instructed SERIF',
+    /\ba serif\b/.test(soludosLine) && !/sans-serif/.test(soludosLine), soludosLine);
+  check('C9 it names Newsreader', /Newsreader/.test(soludosLine), soludosLine);
+  check('C9 serif character clause, not grotesque',
+    /refined editorial serif proportions/.test(soludosLine)
+    && !/grotesque/.test(soludosLine), soludosLine);
+
+  // The stored production shape (heading null, no generic) still NAMES
+  // Newsreader via customFonts[0], and still classifies SANS — the generic
+  // is captured at ingest, and we deliberately did not put "Newsreader" on
+  // the keyword list. Re-ingest (or a backfill that fills a NULL heading)
+  // is what repairs already-stored docs.
+  check('C9 stored production shape still names Newsreader',
+    /Newsreader/.test(direct.typefaceDirectiveForBrand(SOLUDOS_GS_STORED)));
+  check('C9 stored production shape is still sans without a captured generic (not a keyword-list fix)',
+    /a sans-serif/.test(direct.typefaceDirectiveForBrand(SOLUDOS_GS_STORED)));
+
+  // NO-OP for brands that already classified correctly. Byte-identical to
+  // the pre-change strings, not merely "still serif" / "still sans".
+  check('C9 [NO-OP] keyword-matched serif directive is byte-identical to pre-change',
+    direct.typefaceDirectiveForBrand(PLAYFAIR_BRAND) === PLAYFAIR_BEFORE,
+    direct.typefaceDirectiveForBrand(PLAYFAIR_BRAND));
+  check('C9 [NO-OP] genuine sans directive is byte-identical to pre-change',
+    direct.typefaceDirectiveForBrand(AKTIV_BRAND) === AKTIV_BEFORE,
+    direct.typefaceDirectiveForBrand(AKTIV_BRAND));
+  check('C9 [NO-OP] icon-font button evidence does not change a correct heading',
+    direct.typefaceDirectiveForBrand({
+      websiteFontUsage: {
+        heading: 'Playfair Display', headingGeneric: 'serif',
+        button: 'oke-widget-icons',
+      },
+      customFonts: [{ family: 'Playfair Display', weight: 700 }],
+    }) === PLAYFAIR_BEFORE);
+}
+
+// ─────────────────────────────────────────────────────────────────────────
 // C7: REVERT-PROOF. Mutate the REAL shipped source, re-require it, and
 // assert a specific check above actually breaks. A check that cannot fail
 // proves nothing.
@@ -808,6 +1008,97 @@ try {
     }
   );
 } catch (err) { failures.push(`C7-J mutation harness failed: ${err.message}`); }
+
+// C7-K — drop the cross-sheet extraVariables merge: Soludos's theme.css
+// usage of var(--FONT-STACK-HEADING) must lose its generic again.
+try {
+  withMutatedModule('brandFontIngestService.js',
+    (src) => src.replace(
+      '  const variables = {\n'
+      + '    ...(extraVariables && typeof extraVariables === \'object\' ? extraVariables : {}),\n'
+      + '  };',
+      '  const variables = {};'
+    ),
+    (mut) => {
+      const sheets = [SOLUDOS_INLINE_CSS, SOLUDOS_THEME_CSS];
+      const mutated = mut.aggregateFontUsageAcrossSheets(sheets);
+      check('C7-K revert-proof: without extraVariables, Soludos headingGeneric is lost',
+        mutated.headingGeneric == null && mutated.heading == null,
+        `got heading=${mutated.heading} generic=${mutated.headingGeneric} — C9 (b) cannot fail`);
+      check('C7-K the shipped aggregator captures it (so C9 discriminates)',
+        ingest.aggregateFontUsageAcrossSheets(sheets).headingGeneric === 'serif'
+        && ingest.aggregateFontUsageAcrossSheets(sheets).heading === 'Newsreader');
+    }
+  );
+} catch (err) { failures.push(`C7-K mutation harness failed: ${err.message}`); }
+
+// C7-L — drop the pseudo-element skip: the Okendo :before dingbat becomes
+// button evidence again.
+try {
+  withMutatedModule('brandFontIngestService.js',
+    (src) => src.replace(
+      '    if (isOnlyPseudoElementSelectors(selector)) continue;\n',
+      ''
+    ),
+    (mut) => {
+      // Isolate the SELECTOR skip from the icon-NAME skip: a real serif on a
+      // :before must not be role evidence either. Using oke-widget-icons
+      // here would still be dropped by isIconFontFamily, so the mutation
+      // would be invisible.
+      const css = '.heading:before{font-family:Newsreader, serif}';
+      check('C7-L revert-proof: without the pseudo skip, a :before serif wins heading',
+        mut.extractFontUsageFromCss(css).heading === 'Newsreader'
+        && mut.extractFontUsageFromCss(css).headingGeneric === 'serif',
+        `got ${mut.extractFontUsageFromCss(css).heading}/${mut.extractFontUsageFromCss(css).headingGeneric} — C9 (a) cannot fail`);
+      check('C7-L the shipped parser reports no family (so C9 discriminates)',
+        ingest.extractFontUsageFromCss(css).heading == null);
+    }
+  );
+} catch (err) { failures.push(`C7-L mutation harness failed: ${err.message}`); }
+
+// C7-N — restore whole-selector :before matching: a mixed `h1, h1:before`
+// list must lose the heading face again.
+try {
+  withMutatedModule('brandFontIngestService.js',
+    (src) => src.replace(
+      'function isOnlyPseudoElementSelectors(selector) {\n'
+      + '  const parts = String(selector || \'\').split(\',\');\n'
+      + '  return parts.length > 0 && parts.every((p) => isPseudoElementSelector(p));\n'
+      + '}',
+      'function isOnlyPseudoElementSelectors(selector) {\n'
+      + '  return isPseudoElementSelector(selector);\n'
+      + '}'
+    ),
+    (mut) => {
+      const css = 'h1, h1:before{font-family:Newsreader, serif}';
+      check('C7-N revert-proof: whole-selector skip drops a mixed h1, h1:before list',
+        mut.extractFontUsageFromCss(css).heading == null,
+        `got ${mut.extractFontUsageFromCss(css).heading}`);
+      check('C7-N the shipped parser keeps the heading (so C9 mixed-list discriminates)',
+        ingest.extractFontUsageFromCss(css).heading === 'Newsreader');
+    }
+  );
+} catch (err) { failures.push(`C7-N mutation harness failed: ${err.message}`); }
+
+// C7-M — drop the icon-family skip in firstConcreteFamily: a NON-pseudo
+// icon-font rule becomes the brand's button face again. Isolates (a)'s
+// name-pattern half from the selector half C7-L covers.
+try {
+  withMutatedModule('brandFontIngestService.js',
+    (src) => src.replace(
+      '    if (isIconFontFamily(family)) continue;\n',
+      ''
+    ),
+    (mut) => {
+      const css = '.btn{font-family:swiper-icons}';
+      check('C7-M revert-proof: without the icon-family skip, swiper-icons wins button',
+        mut.extractFontUsageFromCss(css).button === 'swiper-icons',
+        `got ${mut.extractFontUsageFromCss(css).button}`);
+      check('C7-M the shipped parser reports no family (so C9 discriminates)',
+        ingest.extractFontUsageFromCss(css).button == null);
+    }
+  );
+} catch (err) { failures.push(`C7-M mutation harness failed: ${err.message}`); }
 
 // C7-H — remove the whitespace collapse: the stored key stops matching the
 // @font-face name the consumer looks up.
