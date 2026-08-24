@@ -617,8 +617,10 @@ function gateLayoutInputQuotes(layoutInput, scope = {}) {
     const pq = layoutInput?.input?.social_proof?.primary_quote;
     if (!pq) return layoutInput;
     const { toPrintableCustomerQuote, applyStrictQuoteScope } = require('./quoteProvenance');
+    const { applyQuoteColourway } = require('./quoteColourway');
     let printable = toPrintableCustomerQuote(pq);
     let withheldByStrict = false;
+    let withheldByColourway = false;
     if (printable) {
       const scoped = applyStrictQuoteScope(printable, scope);
       if (!scoped) {
@@ -638,11 +640,41 @@ function gateLayoutInputQuotes(layoutInput, scope = {}) {
           withheldByStrict = true;
           printable = null;
         }
+      } else {
+        printable = scoped;
+      }
+    }
+    if (printable) {
+      const colourOk = applyQuoteColourway(printable, scope);
+      if (!colourOk) {
+        const rest = Array.isArray(layoutInput?.input?.social_proof?.secondary_quotes)
+          ? layoutInput.input.social_proof.secondary_quotes : [];
+        let rescued = null;
+        for (const cand of rest) {
+          const next = applyQuoteColourway(
+            applyStrictQuoteScope(toPrintableCustomerQuote(cand), scope),
+            scope
+          );
+          if (next) { rescued = next; break; }
+        }
+        if (rescued) {
+          console.log(
+            `🔒 brandScript: quote failed colourway — using next allowed candidate`
+          );
+          printable = rescued;
+        } else {
+          withheldByColourway = true;
+          printable = null;
+        }
+      } else {
+        printable = colourOk;
       }
     }
     if (!printable) {
       console.log(
-        withheldByStrict
+        withheldByColourway
+          ? `🔒 brandScript: quote withheld (colourway mismatch) — titling with no testimonial`
+          : withheldByStrict
           ? `🔒 brandScript: quote withheld (QUOTE_PROVENANCE_STRICT ` +
             `tier=${pq.tier || 'unstamped'}) — titling with no testimonial`
           : `🔒 brandScript: quote withheld (tier=${pq.tier || 'unstamped'} ` +
