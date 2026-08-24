@@ -482,7 +482,69 @@ async function loadQuoteScopeMediaByIds(ids) {
   return Media.find({ _id: { $in: list } }).select(QUOTE_SCOPE_MEDIA_SELECT).lean();
 }
 
+// ── Attribution viability ─────────────────────────────────────────────────
+//
+// A quote's author line is rendered as `— {name}`. Whether it is PRINTABLE is
+// already decided upstream (toPrintableCustomerQuote strips bylines for origins
+// that may not carry one). This is the separate, narrower question of whether a
+// name that IS allowed to print can actually FUNCTION as an attribution.
+//
+// MEASURED 2026-08-24 on a delivered Pelagic Gear video ad: a scraped product
+// review whose author field was a bare initial rendered as
+//
+//     — D
+//
+// under the quote. That is not attribution — it identifies nobody, and it reads
+// as a truncation bug rather than a design choice (it was reported as one).
+// Nothing filtered it: the video path takes
+// `primary_quote.author_name || .author` through metaCascadeConfig's reviewer
+// chain, and the static path reads `quote.author_name` directly at
+// directImageRenderService.js — neither checks the value is usable.
+//
+// The test is LETTER COUNT, not string length, which is what makes it safe:
+//   "D"                  → 1 letter  → dropped
+//   "D."                 → 1 letter  → dropped
+//   "J.D."               → 2 letters → kept
+//   "Connor H."          → 8 letters → kept
+//   "祐子"                → 2 letters → kept (\p{L} is Unicode-wide, not [A-Za-z])
+//   "DBallzdeep"         → kept
+//   "jefferyledford0811" → kept
+//
+// Deliberately narrow. It does NOT filter "Anonymous", "Guest" or
+// "Verified Buyer" — those are real conventions in review UIs and carry meaning
+// a reader recognises; suppressing them is a copy decision, not a correctness
+// one, and would be a silent editorial change to shipped creative.
+//
+// ONE definition, imported by both render paths — same rule as
+// resolveDeriveFromMaster (CLAUDE.md §4). A per-caller copy is exactly how the
+// static and video quote gates would drift apart.
+
+/** Count Unicode letters, so this works outside Latin script. */
+function letterCount(str) {
+  const m = String(str ?? '').match(/\p{L}/gu);
+  return m ? m.length : 0;
+}
+
+/**
+ * Return a trimmed attribution when it can actually attribute, else null.
+ * Never throws — an unusable name degrades the slot to absent, exactly as a
+ * missing one already does.
+ *
+ * @param {*} raw the author_name / author value as stored
+ * @returns {string|null}
+ */
+function usableAttribution(raw) {
+  if (typeof raw !== 'string' && typeof raw !== 'number') return null;
+  const s = String(raw).replace(/\s+/g, ' ').trim();
+  if (!s) return null;
+  // A single letter cannot attribute, with or without a trailing period.
+  if (letterCount(s) < 2) return null;
+  return s;
+}
+
 module.exports = {
+  usableAttribution,
+  letterCount,
   PRINTABLE_QUOTE_ORIGINS,
   ANONYMOUS_PRINT_ORIGINS,
   BYLINE_FIELDS,
