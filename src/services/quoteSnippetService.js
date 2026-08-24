@@ -559,9 +559,37 @@ async function extractSnippet(text, { brandId = null, productId = null } = {}) {
   // service complaint out of a 3-sentence review.
   const source = strongestSentence(clean);
   // If that one sentence already fits, we are done — no model call at all.
-  if (source.length <= MAX_CHARS) {
+  //
+  // GATED (was not, until ad 6a8c830612c17a42936d529e rendered "Great for
+  // offshore fishing and the length is....", the customer's OWN informal
+  // trail-off punctuation, not an appended ellipsis). splitSentences' boundary
+  // regex is `/[.!?…]+(?=\s+["'“(\[]?[A-Z0-9]|\s*$)/g` — `[.!?…]+` matches a
+  // RUN of terminators as a single boundary, so a review that writes
+  // "...and the length is.... 8'6\" and handles rough water great" splits
+  // cleanly after the four dots (followed by whitespace + a digit, which
+  // satisfies the lookahead), and strongestSentence can pick that fragment as
+  // its highest scorer. This path returned it verbatim — the ONLY one of
+  // extractSnippet's three return paths that did: the already-fits short
+  // circuit above gates on meetsProofBar(clean), and the LLM path below
+  // verifies isExtractive + verbatimSpan before ever printing. This path had
+  // no gate at all, so a 48-char fragment ending in a run of dots sailed
+  // through the `.length <= MAX_CHARS` check untouched.
+  //
+  // meetsProofBar rejects `/[…]|\.\.\./` (see ~:435), so gating here catches
+  // exactly this. A source that fits the budget but fails the bar is not
+  // dropped outright — it is re-run through the same clause/sentence ladder
+  // used for an over-budget quote (bestFallbackSnippet), so a salvageable
+  // whole clause still ships instead of nothing.
+  if (source.length <= MAX_CHARS && meetsProofBar(source)) {
     snippetCacheSet(cacheKey, source);
     return source;
+  }
+  if (source.length <= MAX_CHARS) {
+    // Fits the budget but fails the bar — run the same clause/sentence ladder
+    // used for an over-budget quote instead of shipping the fragment.
+    const salvaged = bestFallbackSnippet(clean, source, MAX_CHARS);
+    snippetCacheSet(cacheKey, salvaged);
+    return salvaged;
   }
 
   // Fallback ladder, best-first, used whenever the model is unavailable or
