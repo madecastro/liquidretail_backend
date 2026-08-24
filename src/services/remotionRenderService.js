@@ -446,6 +446,25 @@ async function warmup() {
   await Promise.all([getServeUrl(), ensureBrowserReady(), getAssetServer()]);
 }
 
+// ObjectId-shaped values (a mongoose.Types.ObjectId, or any bson ObjectId)
+// must never cross the IPC boundary raw. bson >=6 (this repo's mongoose 8.x)
+// stores the 12-byte id on an OWN, ENUMERABLE instance property literally
+// named `buffer`, backed by a real Node Buffer on this platform (see
+// node_byte_utils.js's toLocalBufferType — every branch returns Buffer.from
+// or Buffer.alloc). assertNoBuffers walks Object.keys() before JSON.stringify
+// ever runs, so it finds that property and throws
+// "remotion child IPC forbids buffers (key=buffer); pass a path" — a real,
+// reproduced crash (not a false positive), because bson 5.x (this repo's
+// backend sibling, mongoose 7.x) hid the same bytes behind a Symbol key and
+// never tripped this. `adId` already gets this right below (`String(ad._id)`
+// at the call site); brandId/productId/campaignRunId did not when they were
+// threaded through here (#43) — coerce them the same way, defensively, at
+// this single choke point so no future caller can reintroduce a raw id.
+function toPlainId(value) {
+  if (value == null) return null;
+  return typeof value === 'string' ? value : String(value);
+}
+
 function payloadForChild(args) {
   // Explicit allow-list. Brand is reduced to the one field
   // resolveTitlePlacementMode reads — a mongoose lean() doc must not cross
@@ -457,10 +476,10 @@ function payloadForChild(args) {
     tokens: args.tokens,
     format: args.format,
     brandName: args.brandName || null,
-    adId: args.adId || null,
-    brandId: args.brandId || null,
-    productId: args.productId || null,
-    campaignRunId: args.campaignRunId || null,
+    adId: toPlainId(args.adId),
+    brandId: toPlainId(args.brandId),
+    productId: toPlainId(args.productId),
+    campaignRunId: toPlainId(args.campaignRunId),
     placementMode: args.placementMode || null,
     brand: args.brand
       ? { videoSettings: { titlePlacementMode: args.brand.videoSettings && args.brand.videoSettings.titlePlacementMode || null } }
