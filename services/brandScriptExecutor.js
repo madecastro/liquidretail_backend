@@ -2273,6 +2273,18 @@ module.exports = {
   // Mongo lookups + one vision call when the gate IS on) to drive directly
   // with the require-layer model stubs the harness already uses elsewhere.
   runVideoVisionQcForAd,
+  // Exported for scripts/verifyVideoQcVerdictSurvives.js — that harness used
+  // to prove the Object.assign(set, buildVideoQcFailureFields(...)) merge
+  // order via a source-text scan of this function's body, hardened across
+  // three rounds against decoys and a resurrecting assignment. An
+  // adversarial pass then found six shapes (findByIdAndUpdate,
+  // Ad.collection.updateOne, a $set built as a variable, a computed key, a
+  // backtick, a later assignment in an uncovered spot) that still clobber
+  // the verdict while reading as green. Exporting this lets the harness call
+  // the real function with Cloudinary/vision-QC/Ad stubbed and assert on the
+  // ACTUAL Ad.updateOne payload instead — immune to all of the above and to
+  // any future shape, because it never reads source.
+  uploadRenderAndStamp,
   // Shared helper for every "ships a video ad with no titling step" branch
   // outside this file — routes/ads.js (master + derive-only mint),
   // adRegenerateService.js (video regenerate), titlingResumeService.js (the
