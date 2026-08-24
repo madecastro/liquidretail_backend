@@ -181,7 +181,7 @@ check('R8 the rounding trap still bites, at the NEW floor (4.31/4.34 display as 
   assert.strictEqual(formatDisplayRating(4.51), '4.5');
   assert.strictEqual(formatDisplayRating(4.6), '4.6');
   assert.strictEqual(formatDisplayRating(4.66), '4.7');
-  assert.strictEqual(formatDisplayRating(5), '5');
+  assert.strictEqual(formatDisplayRating(5), '5.0');
 });
 
 check('R9 a suppressed rating with a rounding-trap value still shows its count', () => {

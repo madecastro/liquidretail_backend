@@ -229,6 +229,52 @@ async function monochromeWordmarkFixture() {
   const outMeta = await sharp(prepGrad.buffer).metadata();
   check('L4 output keeps the source dimensions', outMeta.width === meta.width && outMeta.height === meta.height);
   check('L4 output carries a real alpha channel (a shape mask, not an opaque rectangle)', outMeta.hasAlpha === true);
+
+  // ── L5: mixed lockup on a DARK plate — wordmark re-inked, tiles kept ──
+  // THE PELAGIC DEFECT. Colour-preserving the whole mark is right for the
+  // tiles/gradient and wrong for a dark wordmark sitting on a dark generated
+  // plate: the letterforms vanish, the colour tiles stay, and the same SVG
+  // reads as two different lockups across one batch. Re-ink only low-chroma
+  // covered pixels, and only when the plate behind is dark.
+  async function sampleRgb(buf, x, y) {
+    const { data, info } = await sharp(buf).removeAlpha().raw().toBuffer({ resolveWithObject: true });
+    const i = (y * info.width + x) * info.channels;
+    return [data[i], data[i + 1], data[i + 2]];
+  }
+  const chromaOf = ([r, g, b]) => Math.max(r, g, b) - Math.min(r, g, b);
+  // Fixture layout (gradientLogoFixture): wordmark at (160,35) 150×30,
+  // gradient block at (10,10) 120×80.
+  const wordmarkPx = [160 + 75, 35 + 15];
+  const tilePx = [10 + 60, 10 + 40];
+
+  const prepDark = await direct.prepareLogoForComposite(gradFixture, { behindLuminance: 0.1 });
+  check('L5 dark plate still colour-preserves (does not fall through to full-monochrome)',
+    prepDark.treatment === 'colour-preserved', `got ${prepDark.treatment}`);
+  const wordmarkDark = await sampleRgb(prepDark.buffer, wordmarkPx[0], wordmarkPx[1]);
+  const tileDark = await sampleRgb(prepDark.buffer, tilePx[0], tilePx[1]);
+  check('L5 [THE DEFECT] on a DARK plate the wordmark is re-inked to LIGHT (visible against the plate)',
+    wordmarkDark[0] >= 240 && wordmarkDark[1] >= 240 && wordmarkDark[2] >= 240,
+    `wordmark rgb=${wordmarkDark.join(',')} — still dark letterforms would vanish on a dark plate`);
+  check('L5 on a DARK plate the colour tile/gradient KEEPS chroma (not flattened to the wordmark ink)',
+    chromaOf(tileDark) > direct.LOGO_CHROMA_THRESHOLD,
+    `tile rgb=${tileDark.join(',')} chroma=${chromaOf(tileDark)}`);
+
+  const prepLight = await direct.prepareLogoForComposite(gradFixture, { behindLuminance: 0.85 });
+  const wordmarkLight = await sampleRgb(prepLight.buffer, wordmarkPx[0], wordmarkPx[1]);
+  const tileLight = await sampleRgb(prepLight.buffer, tilePx[0], tilePx[1]);
+  check('L5 [REGRESSION GUARD] on a LIGHT plate the wordmark stays DARK (today\'s colour-preserved output)',
+    wordmarkLight[0] < 80 && wordmarkLight[1] < 80 && wordmarkLight[2] < 80,
+    `wordmark rgb=${wordmarkLight.join(',')} — re-inking on a light plate would be a new bug`);
+  check('L5 on a LIGHT plate the colour tile/gradient still has chroma',
+    chromaOf(tileLight) > direct.LOGO_CHROMA_THRESHOLD,
+    `tile rgb=${tileLight.join(',')} chroma=${chromaOf(tileLight)}`);
+
+  // Revert-prove: the pre-fix colour-preserved path used the artwork's own
+  // pixels under the mask with no backdrop-aware re-ink, so a dark wordmark
+  // stayed dark on a dark plate.
+  check('L5-revert-prove: without the re-ink, the dark-plate wordmark would still be dark (the defect)',
+    wordmarkLight[0] < 80 && !(wordmarkDark[0] < 80),
+    `light-plate wordmark=${wordmarkLight.join(',')} dark-plate wordmark=${wordmarkDark.join(',')} — if both are dark the re-ink did not fire`);
 })().then(() => {
   if (failures.length) {
     console.error(`\n❌ logo colour preservation: ${failures.length} FAILED, ${pass} passed\n`);

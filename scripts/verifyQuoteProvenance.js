@@ -195,7 +195,7 @@ const RATINGS = [
   [4.6, '4.6', 'just over the floor still prints'],
   [4.66, '4.7', '4.66 rounds to 4.7 and prints'],
   [4.666666, '4.7', 'a raw float is rounded, not printed in full'],
-  [5, '5', 'top of scale'],
+  [5, '5.0', 'top of scale — one decimal, never the integer 5 that reads as a broken widget'],
   ['4.5', undefined, 'a string is not a number — type strictness is unchanged'],
   [null, undefined, 'null'],
   [NaN, undefined, 'NaN']

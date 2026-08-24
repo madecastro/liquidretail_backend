@@ -404,6 +404,32 @@ function ctaCasingDirective(ctaText) {
 }
 
 /**
+ * Render-time CTA casing canonicalize. The prompt-side ctaCasingDirective
+ * pins whatever string arrived; it cannot stop two sibling ads asking for
+ * "Shop now" and "Shop Now" when those are the source strings.
+ *
+ * ONLY the generic phrases we ourselves emit (layoutInput default "Shop now",
+ * mergeCta's "Shop the Brand"/"Shop the Collection", the former 'SHOP NOW'
+ * fallback) are rewritten, case-insensitively. Product-specific copy
+ * ("Shop the Mai Tai") is left byte-identical — that is content variety,
+ * not casing drift.
+ *
+ * Applied in buildIntentData so cached LayoutInputArtifacts pick it up
+ * without a re-derive.
+ */
+const GENERIC_CTA_CASING = Object.freeze({
+  'shop now': 'Shop now',
+  'shop the brand': 'Shop the brand',
+  'shop the collection': 'Shop the collection',
+});
+
+function normalizeCtaCasing(text) {
+  const s = String(text || '').replace(/\s+/g, ' ').trim();
+  if (!s) return null;
+  return GENERIC_CTA_CASING[s.toLowerCase()] || s;
+}
+
+/**
  * D4 fix — CTA pill fill/ink determinism, mirroring
  * services/titleSpecService.js buildBrandTokens' WCAG contrast pick
  * (readableOn) in miniature. NOT imported from that module: it also
@@ -781,7 +807,9 @@ async function coverageFromBackgroundDistance(logoPng, bg, w, h, { threshold = 3
  * Exported so scripts/verifyLogoColorPreservation.js calls this instead of a
  * mirror of it.
  */
-async function logoIsPolychrome(logoPng, coverage, w, h, { chromaThreshold = 24, minCoveredFrac = 0.01 } = {}) {
+const LOGO_CHROMA_THRESHOLD = 24;
+
+async function logoIsPolychrome(logoPng, coverage, w, h, { chromaThreshold = LOGO_CHROMA_THRESHOLD, minCoveredFrac = 0.01 } = {}) {
   const raw = await sharp(logoPng).removeAlpha().raw().toBuffer();
   let covered = 0;
   let chromaSum = 0;
@@ -846,6 +874,25 @@ async function prepareLogoForComposite(logoPng, { behindLuminance } = {}) {
     } catch { polychrome = false; }
     if (polychrome) {
       const rgb = await sharp(logoPng).removeAlpha().raw().toBuffer();
+      // Mixed lockup (colour tiles / gradient + dark wordmark). Colour-
+      // preserving the whole mark is right for the tiles and wrong for
+      // the wordmark: on a DARK generated plate the dark letterforms
+      // vanish while the tiles stay, which is the measured Pelagic
+      // split (full lockup on light ads, tiles-only on dark ones) from
+      // one SVG. Re-ink only LOW-chroma covered pixels, and only when
+      // the plate behind is dark — high-chroma pixels stay untouched,
+      // and a light plate keeps today's colour-preserved wordmark.
+      const ink = monochromeInkFor(behindLuminance);
+      if (ink && typeof behindLuminance === 'number' && behindLuminance <= 0.5) {
+        for (let i = 0; i < w * h; i++) {
+          if (!coverage[i]) continue;
+          const o = i * 3;
+          const r = rgb[o], g = rgb[o + 1], b = rgb[o + 2];
+          if (Math.max(r, g, b) - Math.min(r, g, b) <= LOGO_CHROMA_THRESHOLD) {
+            rgb[o] = ink.r; rgb[o + 1] = ink.g; rgb[o + 2] = ink.b;
+          }
+        }
+      }
       const buffer = await sharp(rgb, { raw: { width: w, height: h, channels: 3 } })
         .joinChannel(coverage, { raw: { width: w, height: h, channels: 1 } })
         .png()
@@ -930,6 +977,25 @@ function logoPlacementFor({ surface, dims, logoW, logoH }) {
   // Bottom-right of the clamped box. Inside it by construction, so there is no
   // second adjustment that could invalidate the guarantee above.
   return { top: bottom - logoH, left: right - logoW, width: logoW, height: logoH };
+}
+
+/**
+ * Max box the composited logomark is scaled into (`fit:'inside'`).
+ *
+ * Side is 16% of the delivered short edge so the mark is the same physical
+ * size on every surface. The box is SQUARE. A WIDE wordmark still binds on
+ * width (Vuori 1108×179 → height ≈ 0.16 of width, unchanged). A STACKED
+ * lockup (wordmark above a two-tile mark, ~1:1) used to be crushed into
+ * height = 0.35 × width (~60px on 1080), which made the wordmark
+ * illegible and, after coverage-at-that-size, dropped it.
+ */
+const LOGO_BOX_FRAC = 0.16;
+
+function logoResizeBox(dims) {
+  const w = dims && dims.width, h = dims && dims.height;
+  if (!(w > 0 && h > 0)) return { width: 0, height: 0 };
+  const side = Math.round(LOGO_BOX_FRAC * Math.min(w, h));
+  return { width: side, height: side };
 }
 
 /**
@@ -1702,7 +1768,7 @@ function buildIntentData({ concept, layoutInput, brand, product = null, cta, cam
     headline,
     subhead,
     badge: undefined,
-    cta: cta || 'SHOP NOW'
+    cta: normalizeCtaCasing(cta) || 'Shop now'
   };
 }
 
@@ -1834,13 +1900,14 @@ async function finishPlate({ rawFrame, built, dims, genSize, surface, adId, logo
   // surface, and placed inside the content rect rather than at a flat offset from
   // the bottom. The flat offset put it 150px inside Stories' 250px reply-bar
   // reserve — the brand's logomark, on the one surface where it was invisible.
+  // The box is square — see logoResizeBox. Wide wordmarks still bind on width.
   const layers = [];
   const logo = await optionalImage(logoUrl);
   if (logo) {
     try {
-      const boxW = Math.round(0.16 * Math.min(dims.width, dims.height));
+      const boxWH = logoResizeBox(dims);
       const logoPng = await sharp(logo)
-        .resize({ width: boxW, height: Math.round(boxW * 0.35), fit: 'inside', withoutEnlargement: true })
+        .resize({ width: boxWH.width, height: boxWH.height, fit: 'inside', withoutEnlargement: true })
         .png()
         .toBuffer();
       // Measure what came out: fit:'inside' preserves aspect, so a tall or a wide
@@ -2817,10 +2884,15 @@ module.exports = {
   safeBoxInDeliveredPx,
   extractFor,
   logoPlacementFor,
+  logoResizeBox,
+  LOGO_BOX_FRAC,
+  LOGO_CHROMA_THRESHOLD,
   LOGO_SAFE_MARGIN_PCT,
   sampleSafeBoxLuminance,
   textInkDirective,
   ctaCasingDirective,
+  normalizeCtaCasing,
+  GENERIC_CTA_CASING,
   deriveCtaColors,
   ctaColorDirective,
   typefaceDirectiveForBrand,
