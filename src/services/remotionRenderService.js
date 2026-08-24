@@ -47,6 +47,9 @@ const COMPOSITION_BY_FORMAT = {
 const ENTRY_POINT = path.join(__dirname, '..', 'remotion', 'index.jsx');
 const ASSET_ROOT = path.join(os.tmpdir(), 'remotion_assets');
 const CHILD_PATH = path.join(__dirname, 'remotionRender.child.js');
+// Pre-bundle path — scripts/prebuildRemotionBundle.js writes here at Docker
+// build time. When present, getServeUrl() skips the ~5-15s webpack bundle.
+const PREBUILT_BUNDLE_DIR = path.join(__dirname, '..', '..', '.remotion-bundle');
 
 // ── bundle cache ───────────────────────────────────────────────────────────
 
@@ -54,6 +57,15 @@ let bundlePromise = null;
 
 function getServeUrl() {
   if (!bundlePromise) {
+    // Fast path: use the deploy-time bundle if it exists. Detected by the
+    // presence of index.html at the root — webpack writes it last, so a
+    // partial bundle from a killed prebuild step is not misread as complete.
+    if (fs.existsSync(path.join(PREBUILT_BUNDLE_DIR, 'index.html'))) {
+      console.log(`🎬 remotion: using pre-built bundle at ${PREBUILT_BUNDLE_DIR}`);
+      bundlePromise = Promise.resolve(PREBUILT_BUNDLE_DIR);
+      return bundlePromise;
+    }
+    // Slow path: on-the-fly bundle (dev, tests, older images). Unchanged.
     const started = Date.now();
     const { bundle } = require('@remotion/bundler');
     bundlePromise = bundle({ entryPoint: ENTRY_POINT, onProgress: () => {} })

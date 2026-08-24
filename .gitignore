@@ -7,3 +7,8 @@ dist/
 .claude/
 .codegraph/
 .codemap/
+# Remotion webpack bundle — built at Docker build time by
+# scripts/prebuildRemotionBundle.js. Local runs are for smoke-testing
+# only and should never commit their output.
+.remotion-bundle/
+probe-results/

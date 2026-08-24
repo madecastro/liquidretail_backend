@@ -56,9 +56,17 @@ RUN npm install --omit=dev
 
 # Copy everything the app needs at runtime: source + committed non-secret
 # defaults + Remotion compositions. config/defaults.env is loaded by
-# src/config.js on boot; src/remotion is bundled by Remotion at render time.
+# src/config.js on boot.
 COPY src/ ./src/
 COPY config/ ./config/
+COPY scripts/ ./scripts/
+
+# Pre-bundle Remotion at BUILD time so runtime children skip the ~5-15s
+# webpack step per render. Output lands at /app/.remotion-bundle;
+# remotionRenderService.getServeUrl() detects and uses it. Absent this
+# step the runtime falls back to on-the-fly bundling (existing behaviour),
+# so the change is purely additive.
+RUN node scripts/prebuildRemotionBundle.js
 
 # api role listens on PORT; orchestrator/renderer are workers with no port.
 EXPOSE 3100

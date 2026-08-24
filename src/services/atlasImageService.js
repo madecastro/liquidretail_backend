@@ -597,7 +597,15 @@ function buildParams(model, { prompt, size, quality, images, inputFidelity, aspe
   if (size) p.size = size;
   if (quality) p.quality = quality;
   if (images?.length) p.images = images;
-  if (inputFidelity) p.input_fidelity = inputFidelity;
+  // input_fidelity is only supported by gpt-image-1.5/edit. Measured 2026-08-24
+  // against gpt-image-2/edit: ~22% of submits carrying it fail with
+  // "does not support the 'input_fidelity' parameter" (inconsistent Atlas
+  // validation — 78% silently accept + succeed). Strip on any other model and
+  // warn once so a caller re-adding it never quietly loses ~1-in-5 renders.
+  if (inputFidelity) {
+    if (/gpt-image-1\.5\/edit/.test(model)) p.input_fidelity = inputFidelity;
+    else console.warn(`   ⚠️  atlasImage: dropping input_fidelity for ${model} — only gpt-image-1.5/edit supports it (Atlas rejects ~22% otherwise)`);
+  }
   return p;
 }
 
