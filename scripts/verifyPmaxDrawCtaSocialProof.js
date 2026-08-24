@@ -215,19 +215,35 @@ for (const surface of [...META_SURFACES, 'meta_stories_9_16']) {
     spec.text = original.text;
   }
 
-  // Restore-proof: after `finally`, the module's real (pre-#34, unpatched)
-  // eligible must once again reject quote-only data for social_proof_led —
-  // proving the monkeypatch above was fully undone and this harness cannot
-  // leak state into any script that runs after it in the same suite.
-  check('B restore-proof: real eligible() rejects quote-only data again after patch teardown',
-    spec.eligible({ quote: 'x', rating: null }) === 'no rating — this intent is the rating');
+  // Restore-proof: the monkeypatch above must be fully undone, so this harness
+  // cannot leak state into any script that runs after it in the same suite.
+  //
+  // UPDATED 2026-08-24. These two checks asserted the PRE-#34 world: that the
+  // real eligible REJECTS quote-only data. PR #34 has since merged, and by
+  // explicit owner direction a usable quote alone IS proof — so quote-only now
+  // resolves social_proof_led rather than descending to objection_resolved.
+  // The product code is correct and these assertions were stale; they are
+  // updated to the new behaviour. NOT "fixed" by narrowing eligible() again —
+  // that would revert an owner directive while showing a green suite.
+  //
+  // The teardown proof itself is now IDENTITY against `original`, the captures
+  // taken before the patch was installed. It must NOT be written against
+  // intents.INTENTS.social_proof_led: `spec` IS that object, so such a check
+  // reads `X.eligible === X.eligible` and passes whether or not `finally` ran.
+  // Verified by neutering the teardown — this form fails, that form does not.
+  check('B restore-proof: teardown restored the exact pre-patch eligible/text/core references',
+    spec.eligible === original.eligible
+    && spec.text === original.text
+    && spec.core === original.core);
+  check('B restore-proof: the real (merged #34) eligible accepts quote-only data',
+    spec.eligible({ quote: 'x', rating: null }) === null);
   const realBuilt = intents.buildPrompt({
     intentKey: 'social_proof_led',
     data: { quote: 'This fixed my chronic back pain', cta: 'Shop now' },
     product: {}, surface: 'pmax_16_9'
   });
-  check('B restore-proof: real buildPrompt() falls back to objection_resolved again for quote-only data',
-    realBuilt.resolved.key === 'objection_resolved', `got ${JSON.stringify(realBuilt.resolved.key)}`);
+  check('B restore-proof: real buildPrompt() resolves social_proof_led for quote-only data (post-#34)',
+    realBuilt.resolved.key === 'social_proof_led', `got ${JSON.stringify(realBuilt.resolved.key)}`);
 }
 
 // ── C: flag-off revert-proof (child process — env is read at module load) ──
