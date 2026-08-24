@@ -258,9 +258,10 @@ function pruneDedupeState(now) {
 }
 
 // ── transport ────────────────────────────────────────────────────────────────
-async function sendSlack(text, lvl) {
+async function sendSlack(text, lvl, channelOverride) {
   const token   = BOT_TOKEN();
-  const channel = CHANNEL_FOR(lvl);
+  const override = (channelOverride && String(channelOverride).trim()) || '';
+  const channel = override || CHANNEL_FOR(lvl);
   if (!token || !channel) return false;
 
   // Node 20+ (package.json engines: >=20 <23) — global fetch, matching the
@@ -376,7 +377,7 @@ function buildMessage({ lvl, title, fields, detail, held }) {
  *                 behaviour. Use 2 for "alert me if it happens more than once".
  * @returns {Promise<boolean>} true if a message was actually delivered
  */
-async function notify({ level = 'warn', title, detail, fields, key, minCount } = {}) {
+async function notify({ level = 'warn', title, detail, fields, key, minCount, channel } = {}) {
   try {
     if (!ENABLED()) return false;
 
@@ -384,7 +385,8 @@ async function notify({ level = 'warn', title, detail, fields, key, minCount } =
     if (LEVELS[lvl] < MIN_LEVEL()) return false;
 
     const token = BOT_TOKEN();
-    const chat  = CHANNEL();
+    const override = (channel && String(channel).trim()) || '';
+    const chat  = override || CHANNEL();
     if (!token || !chat) {
       // One console line so a misconfigured deploy is diagnosable without
       // being noisy on every single call.
@@ -455,7 +457,7 @@ async function notify({ level = 'warn', title, detail, fields, key, minCount } =
     const held = suppressed.get(dedupeKey);
     suppressed.delete(dedupeKey);
 
-    const ok = await sendSlack(buildMessage({ lvl, title, fields, detail, held }), lvl);
+    const ok = await sendSlack(buildMessage({ lvl, title, fields, detail, held }), lvl, override || undefined);
     if (!ok) {
       // A failed send shouldn't hold the dedupe slot — a transient network
       // blip would otherwise silence this key for the whole window. Put the

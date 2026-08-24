@@ -180,7 +180,7 @@ check('F7 [SLACK] reasons are GROUPED with counts — a 20-ad run failing identi
 // The regex checks above (A5) only prove the guard's presence, not its
 // correctness. This calls the REAL function with a stubbed Ad.findById and
 // a stubbed adVisionQc.isEnabled to reproduce the exact production
-// scenario: an ad recovered once while AD_VISION_QC_ENABLED was OFF (so it
+// scenario: an ad recovered once while staticVisionQcEnabled was OFF (so it
 // carries a persisted {skipped:true, disabled:true} stamp), then recovered
 // AGAIN after an operator flips the gate ON. Before the fix, the guard's
 // bare `typeof fresh.visionQc === 'object'` check treated that stale
@@ -221,7 +221,7 @@ async function runBehavioralChecks() {
     skipped: true,
     disabled: true,
     passed: false,
-    reason: 'AD_VISION_QC_ENABLED=false',
+    reason: 'vision QC disabled (SystemConfig.staticVisionQcEnabled)',
     finalAttempt: null,
     maxRegenerations: 1,
     attempts: []

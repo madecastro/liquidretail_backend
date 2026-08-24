@@ -168,6 +168,11 @@ app.use('/api/invitations', (req, res, next) => {
   return requireAuth(req, res, next);
 }, invitationRoutes);
 app.use('/api/members',     requireAuth, memberRoutes);
+// Platform-wide admin (vision-QC gates, etc.). Own auth chain lives on
+// the router (requireUserOnly + requireSuperAdmin) — do NOT wrap this
+// in requireAuth. requireAuth would inject a tenant advertiser id onto
+// a surface that must never read one.
+app.use('/api/admin', require('./routes/admin'));
 // Integrations: Meta OAuth callback comes from a browser redirect with
 // no JWT — security on /instagram/callback comes from the signed state
 // param, not a session. Skip global requireAuth for that path; require
@@ -198,6 +203,18 @@ app.use((req, res, next) => {
   next();
 });
 app.use('/api/ads',       requireAuth, adsRoutes);
+app.use((req, res, next) => {
+  if (req.method !== 'GET') return next();
+  if (!/^\/api\/qc-insights\/report(?:[/?]|$)/i.test(req.url)) return next();
+  if (req.headers.authorization) return next();
+  const t = (req.query && req.query._token) || null;
+  if (t && typeof t === 'string') req.headers.authorization = `Bearer ${t}`;
+  next();
+});
+// PLATFORM-WIDE, not tenant-scoped — same reasoning as /api/admin, and
+// gated the same way: bare mount, auth lives INSIDE the router (see
+// routes/qcInsights.js header) so a future added route cannot forget it.
+app.use('/api/qc-insights', require('./routes/qcInsights'));
 app.use('/api/seeds',     requireAuth, seedsRoutes);
 app.use('/api/sales-demos', requireAuth, require('./routes/salesDemos'));
 // Home-page agent (backlog rows 167, 168). Mounted unconditionally so a

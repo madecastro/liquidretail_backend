@@ -192,7 +192,7 @@ const MAP = Object.freeze({
   // same google/gemini-2.5-flash slug already used for vision identify/match
   // (geminiIdentifyService, visualCatalogMatchService). CHEAP + vision-
   // capable. CRITICAL: confirm ROUTABLE with a live chat probe before
-  // enabling AD_VISION_QC_ENABLED — catalog listing alone is not enough
+  // enabling SystemConfig vision QC — catalog listing alone is not enough
   // (openai/gpt-5-nano is listed but returns HTTP 400 "router not found").
   // Override: ATLAS_MODEL_AD_VISION_QC=<slug>.
   // PRO, not flash — and the draft that introduced this role had it wrong.
@@ -204,6 +204,14 @@ const MAP = Object.freeze({
   // regeneration for nothing. The ~$0.0094 delta per check is noise against the
   // $0.01–0.17 generation it protects.
   'ad-vision-qc':     { atlas: 'google/gemini-2.5-pro',   direct: { provider: 'google', model: 'gemini-2.5-pro' } },
+  // QC-insights proposal stage (services/qcInsightsProposalService.js).
+  // Text-only strict-JSON task: propose additive prompt directives from
+  // aggregated vision-QC stats. Same model family already proven routable
+  // and reliable for `ad-vision-qc` (live 200 + valid JSON). Own role so it
+  // can be repointed independently of the vision gate — and so this path
+  // never lands on the capacity-starved Anthropic Atlas routes documented
+  // on MAP.director above. Override: ATLAS_MODEL_QC_INSIGHTS=<slug>.
+  'qc-insights':      { atlas: 'google/gemini-2.5-pro',   direct: { provider: 'google', model: 'gemini-2.5-pro' } },
   // Typeface identification from a brand's Meta ad creatives
   // (metaAdsFontService). Same model and the same reason as 'ad-vision-qc': the
   // task is fine-grained visual discrimination between similar letterforms, and

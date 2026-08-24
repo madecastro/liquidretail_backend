@@ -30,7 +30,7 @@
 // Provider / LLM calls that ARE allowed (never image generation):
 //   · peekImagePrediction — free GET of an already-paid prediction
 //   · judgeRender (adVisionQcService) — billable vision LLM (~$0.01–0.03) when
-//     AD_VISION_QC_ENABLED; zero gpt-image-2/edit submits. The spend is
+//     SystemConfig.staticVisionQcEnabled; zero gpt-image-2/edit submits. The spend is
 //     short-circuited before the call when the ad already holds a visionQc
 //     verdict or is no longer recoverable (see maybeQcRecoveredPlate).
 
@@ -158,7 +158,7 @@ async function recoverImageAd({ ad, dryRun = false } = {}) {
 
   // ── Vision QC on recovered plate (vision LLM ONLY — zero image submits) ──
   // A restart mid-QC would otherwise stamp draft with no verdict and ship
-  // uninspected while AD_VISION_QC_ENABLED claims every static ad is checked.
+  // uninspected while SystemConfig.staticVisionQcEnabled claims every static ad is checked.
   // Prefer judge once (cheap ~$0.01–0.03). NEVER regenerate here — the plate
   // is already paid; recovery must stay free of new image submits (money).
   // Fail closed on a bad verdict → status:'failed' (not draft/exportable),
@@ -305,7 +305,7 @@ function extractExpectedTextFromSubmissionPrompt(prompt) {
 }
 
 /**
- * When AD_VISION_QC_ENABLED, inspect the recovered plate once (vision LLM only).
+ * When SystemConfig.staticVisionQcEnabled, inspect the recovered plate once (vision LLM only).
  * MONEY: no editImage / generateImage. Never discards paid pixels.
  * Returns a persisted-verdict shape always — including a stamped
  * {skipped:true, disabled:true} verdict when QC is disabled, so a recovered
@@ -327,7 +327,7 @@ function extractExpectedTextFromSubmissionPrompt(prompt) {
  * only records that the gate was off, not that this ad was ever inspected.
  * Letting it satisfy the guard would mean an ad recovered once while the
  * gate is off can never be QC'd again, even after an operator flips
- * AD_VISION_QC_ENABLED back on and this ad is recovered a second time — the
+ * staticVisionQcEnabled back on and this ad is recovered a second time — the
  * exact opposite of what enabling the gate is for.
  */
 async function maybeQcRecoveredPlate({ ad, brand, surface, dims, renderUrl }) {
@@ -354,7 +354,7 @@ async function maybeQcRecoveredPlate({ ad, brand, surface, dims, renderUrl }) {
     adVisionQc.warnQcDisabledOnce('recovered ad');
     return adVisionQc.buildPersistedVerdict({
       passed: false, skipped: true, disabled: true,
-      reason: 'AD_VISION_QC_ENABLED=false', finalAttempt: null, attempts: []
+      reason: 'vision QC disabled (SystemConfig.staticVisionQcEnabled)', finalAttempt: null, attempts: []
     });
   }
 
@@ -385,7 +385,7 @@ async function maybeQcRecoveredPlate({ ad, brand, surface, dims, renderUrl }) {
     // not re-pay. A `disabled:true` stamp is NOT a real inspection — it only
     // records that the gate was off. Treating it as "already inspected"
     // would permanently neuter QC on this ad the moment an operator flips
-    // AD_VISION_QC_ENABLED back on and this ad is recovered again: the
+    // staticVisionQcEnabled back on and this ad is recovered again: the
     // stale disabled stamp would satisfy this guard forever and the real
     // judgeRender call below would never run. Same !disabled pattern as the
     // qcFailed computation in recoverImageAd above — match it here too.

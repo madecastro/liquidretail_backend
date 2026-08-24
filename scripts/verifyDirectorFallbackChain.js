@@ -146,7 +146,13 @@ await check('A2 EVERY other role is a single link identical to resolveModel (unc
   // cannot say which roles it checked.
   assert.deepStrictEqual(others, [
     'ad-vision-qc', 'font-vision', 'gemini-2.5-flash', 'gemini-2.5-pro',
-    'gpt-4.1', 'gpt-4.1-mini', 'gpt-4o', 'gpt-4o-mini', 'review-text',
+    'gpt-4.1', 'gpt-4.1-mini', 'gpt-4o', 'gpt-4o-mini',
+    // 'qc-insights' added 2026-08-21 (QC feedback loop,
+    // qcInsightsProposalService) — deliberately single-link, no chain: it
+    // runs OFF the render path inside a daily job whose own give-up path is
+    // the fallback, so advancing to another model would just buy the same
+    // non-answer twice.
+    'qc-insights', 'review-text',
   ], 'the MAP role inventory changed — a role was added or removed, confirm its chain behaviour deliberately');
   for (const role of others) {
     const chain = modelMap.resolveChain(role);

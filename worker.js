@@ -295,6 +295,14 @@ mongoose.connect(process.env.MONGODB_URI, {
     setInterval(archiveTick, archiveIntervalMin * 60 * 1000);
     console.log(`🗃️  queued archive: every ${archiveIntervalMin}m (after ${process.env.QUEUED_ARCHIVE_AFTER_H || 24}h, max ${process.env.QUEUED_ARCHIVE_MAX_ADS || 200}/pass)`);
   }
+  // QC-insights aggregation — never renders, never submits. Reads
+  // Ad.visionQc verdicts and writes QcInsightsReport. Leader-gated with
+  // the rest of worker housekeeping.
+  try {
+    require('./services/qcInsightsService').startScheduler();
+  } catch (err) {
+    console.warn(`⚠️  qc-insights scheduler failed to start: ${err.message}`);
+  }
   // Name the vars the code ACTUALLY reads. This line said "Telegram … set
   // TELEGRAM_BOT_TOKEN" for the whole of the Slack cutover, so the one place
   // an operator looks to find out why alerts are silent told them to set two
