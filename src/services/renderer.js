@@ -439,6 +439,77 @@ async function requeueDeriveForRetry(ad, reason) {
   console.log(`renderer[${WORKER_ID}]: derive requeued ad=${String(ad._id).slice(-6)} — ${reason}`);
 }
 
+/**
+ * Fallback half of the video terminal stamp, shared by both branches.
+ * Reached ONLY when the guarded promote-to-draft write matched nothing,
+ * i.e. something already stamped a terminal verdict. Returns
+ * { status, counter }.
+ *
+ * The promote write itself stays INLINE in each branch on purpose: two
+ * harnesses read the literal out of the branch body — verifyPmaxVideoExpansion
+ * E1b wants `status: 'draft'` inside the derive body, and
+ * verifyRendererAtomicClaim D1 wants status and `claimedByWorker: null` in the
+ * SAME update document. Hoisting it here would blind both.
+ *
+ * THE GUARD IS THE POINT. Titling runs before this and can stamp its OWN
+ * terminal verdict: services/brandScriptExecutor.js buildVideoQcFailureFields
+ * sets status:'failed' when vision QC really fails (PR #282 — "deliver a
+ * QC-failed ad as failed with the exact Slack reason"). This write used to be
+ * a bare { _id }, so it overwrote that verdict with 'draft' and then counted
+ * the ad 'succeeded'. Measured in prod 2026-08-24: 47 video ads with
+ * visionQc.passed:false sitting in status:'draft', and ZERO in 'failed' —
+ * B=0 is the signature; the verdict never survived even once.
+ *
+ * WHY $nin AND NOT status:'rendering'. Copying renderStatic's
+ * { _id, claimedByWorker, status:'rendering' } filter here looks right and is
+ * wrong: uploadRenderAndStamp (brandScriptExecutor.js) already promoted this
+ * row to 'draft' during titling, so a 'rendering' guard would no-op on every
+ * SUCCESSFUL render — stranding claimedByWorker forever (claimOne needs it
+ * null, and nothing in either repo ever clears it) and leaving the titling
+ * debt for titlingResumeService to re-render. $nin preserves any terminal
+ * verdict, whoever wrote it, without blocking the happy path.
+ * AN ALLOWLIST, NOT A DENYLIST, AND THAT DIRECTION IS THE SAFETY PROPERTY.
+ * A $nin:['failed','archived'] denylist fails OPEN: any status nobody
+ * enumerated gets overwritten with 'draft'. That resurrects a row a backend
+ * requeue just moved to 'queued' (processAlerts SIGTERM / the crash catches),
+ * and it DEMOTES an ad an operator promoted to 'live'. The allowlist admits
+ * only the two states this function legitimately owns at this point —
+ * 'rendering' (no-chrome / no-brand: titling never ran) and 'draft' (the
+ * normal case: uploadRenderAndStamp already promoted it) — so every unknown
+ * status falls to the settle-only arm, which releases the claim and clears
+ * the debt WITHOUT touching status. Unknown state => leave it alone.
+ * These literals live in the FILTER, never the update, so renderer.js still
+ * never WRITES 'archived' — see scripts/verifyRendererAdStatusEnum.js B3.
+ *
+ * The claim + debt are settled on BOTH branches. A no-op that skipped them
+ * would trade a clobbered verdict for a permanently unclaimable row.
+ */
+async function settleNonDraftTerminal(ad, label) {
+  const shortId = String(ad._id).slice(-6);
+  // A terminal verdict was already stamped. Do NOT resurrect it — but the
+  // claim and the titling debt are still ours to settle.
+  const after = await Ad.findOneAndUpdate(
+    { _id: ad._id },
+    {
+      $set: {
+        titlingResumeState: null,
+        claimedByWorker:    null,
+        claimedAt:          null,
+        updatedAt:          new Date()
+      }
+    },
+    { new: true, projection: { status: 1 } }
+  ).lean();
+  const kept = (after && after.status) || 'failed';
+  console.warn(
+    `renderer[${WORKER_ID}]: ${label} ad=${shortId} kept terminal status='${kept}' ` +
+    `(NOT overwritten with draft) — claim released, titling debt cleared`
+  );
+  // 'archived' is an operator action, not a render failure; only a real
+  // 'failed' verdict counts against the run.
+  return { status: kept, counter: kept === 'failed' ? 'failed' : 'succeeded' };
+}
+
 // Video render path — handles BOTH the billable master submit (Atlas Omni)
 // AND the free derive-only crops/retitles of an existing master. Money-
 // critical gate: renderDeriveOnlyVideoAd MUST NEVER call atlasVideo.
@@ -514,9 +585,11 @@ async function renderVideo(ad) {
       }
     }
 
-    // Success stamp — clear titling debt, terminal state.
-    await Ad.updateOne(
-      { _id: ad._id },
+    // Success stamp — clear titling debt, terminal state. GUARDED: titling
+    // may already have stamped status:'failed' (vision QC). See
+    // settleNonDraftTerminal for the full reasoning.
+    const derivePromoted = await Ad.updateOne(
+      { _id: ad._id, status: { $in: ['rendering', 'draft'] } },
       {
         $set: {
           status:             'draft',
@@ -527,9 +600,14 @@ async function renderVideo(ad) {
         }
       }
     );
+    const deriveSettled = derivePromoted.matchedCount
+      ? { status: 'draft', counter: 'succeeded' }
+      : await settleNonDraftTerminal(ad, 'VIDEO DERIVE');
     const wallSec = ((Date.now() - t0) / 1000).toFixed(1);
-    console.log(`renderer[${WORKER_ID}]: VIDEO DERIVE done ad=${shortId} wall=${wallSec}s`);
-    await bumpRunCounter(ad.campaignRunIds, 'succeeded');
+    console.log(
+      `renderer[${WORKER_ID}]: VIDEO DERIVE done ad=${shortId} wall=${wallSec}s status=${deriveSettled.status}`
+    );
+    await bumpRunCounter(ad.campaignRunIds, deriveSettled.counter);
     return;
   }
 
@@ -589,9 +667,10 @@ async function renderVideo(ad) {
     }
   }
 
-  // Terminal — clear titling debt + claim.
-  await Ad.updateOne(
-    { _id: ad._id },
+  // Terminal — clear titling debt + claim. GUARDED: titling may already have
+  // stamped status:'failed' (vision QC). See settleNonDraftTerminal.
+  const masterPromoted = await Ad.updateOne(
+    { _id: ad._id, status: { $in: ['rendering', 'draft'] } },
     {
       $set: {
         status:             'draft',
@@ -602,9 +681,14 @@ async function renderVideo(ad) {
       }
     }
   );
+  const masterSettled = masterPromoted.matchedCount
+    ? { status: 'draft', counter: 'succeeded' }
+    : await settleNonDraftTerminal(ad, 'VIDEO MASTER');
   const wallSec = ((Date.now() - t0) / 1000).toFixed(1);
-  console.log(`renderer[${WORKER_ID}]: VIDEO MASTER done ad=${shortId} wall=${wallSec}s`);
-  await bumpRunCounter(ad.campaignRunIds, 'succeeded');
+  console.log(
+    `renderer[${WORKER_ID}]: VIDEO MASTER done ad=${shortId} wall=${wallSec}s status=${masterSettled.status}`
+  );
+  await bumpRunCounter(ad.campaignRunIds, masterSettled.counter);
 }
 
 // In-process concurrent-render tracking. Every processAd() invocation
