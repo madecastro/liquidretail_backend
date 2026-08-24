@@ -74,6 +74,7 @@
 const assert = require('node:assert');
 const fs = require('node:fs');
 const path = require('node:path');
+const { walkSource } = require('./lib/sourceWalk');
 
 const H = require('../services/adArchiveDigest');
 const {
@@ -300,23 +301,12 @@ function stripComments(src) {
     .replace(/(^|[^:])\/\/.*$/gm, '$1');
 }
 
-const SKIP_DIRS = new Set(['node_modules', '.git', '.claude', 'worktrees', 'coverage', 'dist', 'build']);
-function walk(dir, out = []) {
-  for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
-    if (SKIP_DIRS.has(e.name)) continue;
-    const p = path.join(dir, e.name);
-    if (e.isDirectory()) walk(p, out);
-    else if (e.name.endsWith('.js')) out.push(p);
-  }
-  return out;
-}
-
 // WHOLE REPO, not a directory allow-list. Two blind spots were found the hard
 // way: worker.js (root level) hosts the 15-minute orphan reaper, and an
 // allow-list of services/ + routes/ + scripts/ cannot see a new top-level
 // folder (pipelines/, middleware/, utils/) at all. A scan with a blind spot is
 // worse than no scan — it reports green. Exclusions are vendor/VCS only.
-const FILES = walk(ROOT)
+const FILES = walkSource(ROOT, { extensions: ['.js'] })
   // The verify* harnesses talk ABOUT these patterns; they never write.
   .filter((p) => !path.basename(p).startsWith('verify'));
 const SRC = new Map(FILES.map((p) => [path.relative(ROOT, p), fs.readFileSync(p, 'utf8')]));

@@ -27,6 +27,7 @@
 
 const fs = require('fs');
 const path = require('path');
+const { walkSource } = require('./lib/sourceWalk');
 const assert = require('assert');
 const Module = require('module');
 
@@ -84,18 +85,10 @@ function stripComments(src) {
 }
 
 function walkJs(dirAbs) {
-  if (!fs.existsSync(dirAbs)) return [];
-  const out = [];
-  for (const entry of fs.readdirSync(dirAbs, { withFileTypes: true })) {
-    const full = path.join(dirAbs, entry.name);
-    if (entry.isDirectory()) {
-      if (entry.name === 'node_modules') continue;
-      out.push(...walkJs(full));
-    } else if (entry.name.endsWith('.js')) {
-      out.push(full);
-    }
-  }
-  return out;
+  // node_modules/assets hold no source. Worktree, .drafts and dot-dir
+  // exclusion comes from the shared helper — scripts/lib/sourceWalk.js.
+  // walkSource returns [] for a missing root, matching the old existsSync guard.
+  return walkSource(dirAbs, { extensions: ['.js'] });
 }
 
 function fakeRes() {

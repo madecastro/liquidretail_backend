@@ -48,6 +48,47 @@ are suspect. **A red harness in a local checkout is not necessarily red
 on `main`** — this tree carries other sessions' uncommitted work, so confirm
 against a clean worktree off `origin/main` before believing a failure (or a pass).
 
+### The five parallel-work checks — RUN THESE, they already exist
+
+`docs/PARALLEL_WORK.md` §7 shipped tooling for the exact failure modes this
+multi-session setup keeps hitting. **It has been on `main` since 2026-08-19 and
+was measurably not being used**, because it was documented only in that file and
+nothing pointed here. That is the whole reason this section exists.
+
+| command | what it does | the failure it prevents |
+|---|---|---|
+| `npm test` | parallel aggregate runner over every `verify*.{js,mjs}`; **reports its own count** — do not hardcode one here, the number in this file has been stale three separate times | the `.js`-only shell loop silently skipping 10 `.mjs` harnesses |
+| `npm run test:affected` | only harnesses touching changed files | a 3-5 min serial re-run per iteration |
+| `npm run setup:worktree` | fixes a fresh worktree's incomplete `node_modules` | up to 93 false `MODULE_NOT_FOUND` "failures" before one real check runs |
+| `npm run check:rebase` | verifies a rebase dropped nothing | two rebases silently dropped content with no safety net (the incident that motivated §7) |
+| `npm run check:stale-work` | uncommitted work older than 2h | **measured 2026-08-21: 319 lines of feature work sat uncommitted for 13 DAYS** in a frontend worktree, found only by an unrelated sweep |
+| `npm run check:orphaned-branches` | commits ahead, never pushed, no PR | 13 such branches existed, incl. two carrying a privilege-escalation fix |
+
+**Prefer `check:orphaned-branches` over a hand-rolled audit.** Measured
+2026-08-21: a manual pass produced four false negatives, while this script
+correctly separates *never pushed* (at risk of permanent loss) from *pushed but
+no PR* (safe on the remote) — a distinction the manual pass got wrong.
+
+**Do not create a git worktree INSIDE this repo's directory.** 22 harnesses do
+their own `fs.readdirSync` walk. Measured 2026-08-21: **4 are safe** because they
+skip every dot-prefixed directory (`ensurePuppeteerChrome`, `runVerifySuite`,
+`verifyConceptContract`, `verifyLlmErrorCodes`) — copy that pattern, not a
+literal name list. The other **18 are exposed**: they enumerate a fixed set of
+skip names that does not include `.worktrees/`, `.wt-*` or `.drafts/`, so a
+nested worktree silently feeds another session's uncommitted code into
+assertions here. It already turned
+`verifyArchiveDigestRelease` (a MONEY harness) red with 7 false positives, and
+the harnesses that *don't* go red are worse: they pass or fail depending on what
+someone else has checked out. `.gitignore` does not protect them — these are raw
+filesystem walks, not git-aware ones. Put worktrees as siblings of the repo
+(`/Volumes/Sayulita/Projects/RS/.wt-<name>`), never under it.
+
+**Read `docs/PARALLEL_WORK.md` before proposing a refactor of `routes/ads.js`,
+`worker.js`, `campaignAdsGenerationService.js`, `aiCreativeDirectorService.js`,
+or this file.** §1-5 are decomposition plans that are deliberately NOT executed —
+six agents were mid-flight on those exact files. That deferral is a live
+decision, not an oversight; §7 is the safe slice that shipped instead.
+
 ---
 
 ## 00. THE CATALOG PRODUCT-AD PIPELINE — owner-stated, 2026-08-02
