@@ -10,6 +10,7 @@
 // winner is picked, so the snippet is cached on the LayoutInputArtifact
 // alongside the full quote text.
 
+const crypto = require('crypto');
 const { trackLlmCall } = require('./costTracker');
 
 const { chatCompletion, isConfigured: atlasConfigured } = require('./atlasLlmService');
@@ -18,6 +19,59 @@ const Comment = require('../models/Comment');
 // Conversion-weighted sentence ranking, shared with the review-storage path.
 const { scoreSentence, OFF_PRODUCT, NOISE } = require('../utils/reviewText');
 const { splitSentences } = require('../utils/htmlEntities');
+
+// ── Per-process extractSnippet cache ─────────────────────────────────
+//
+// Same source text → same snippet output → same 15s LLM call. Measured
+// on adgen at 8-way per-instance concurrency: 9 static ads in one run
+// all invoked extractSnippet on the identical Pelagic Gear review text
+// and each fired its own ~15s LLM request. Wasted ~15 concurrent LLM
+// seconds per ad + N × $0.001 in duplicate spend per run — small per
+// run, ~$18/hr at the 2000 static/hr target.
+//
+// Cache is per-process (per-instance in the adgen fleet) so autoscale
+// doesn't share it across renderers — first ad per instance still pays
+// the 15s LLM. LRU-capped at CACHE_CAP entries so a rich long-tail of
+// unique quotes cannot OOM the process. Cache stores the return value
+// verbatim (string OR null — extractSnippet returns null for empty or
+// unprintable inputs) so a cache hit shortcuts to the exact same value
+// the LLM path would have produced.
+//
+// Also cached: the pre-LLM short-circuits (empty text, already-fit,
+// strongest-sentence-fits) still return without a cache write — those
+// are ~0-cost paths and caching them would just add overhead.
+const SNIPPET_CACHE_CAP = Number(process.env.QUOTE_SNIPPET_CACHE_CAP || 1000);
+const snippetCache = new Map();
+function snippetCacheKey(clean, opts = {}) {
+  // brandId + productId in the key so a rare same-text-different-product
+  // scenario doesn't cross-pollute — cheap defence, LLM output doesn't
+  // actually depend on them today but might tomorrow if the prompt starts
+  // reading brand/product context.
+  const h = crypto.createHash('sha1');
+  h.update(clean);
+  h.update('|');
+  h.update(String(opts.brandId || ''));
+  h.update('|');
+  h.update(String(opts.productId || ''));
+  return h.digest('hex');
+}
+function snippetCacheGet(key) {
+  if (!snippetCache.has(key)) return undefined;
+  // Refresh LRU order — get + delete + set puts the entry at the tail.
+  const v = snippetCache.get(key);
+  snippetCache.delete(key);
+  snippetCache.set(key, v);
+  return v;
+}
+function snippetCacheSet(key, value) {
+  if (snippetCache.has(key)) snippetCache.delete(key);
+  snippetCache.set(key, value);
+  // Evict oldest (Map iteration order is insertion order — first key is oldest).
+  while (snippetCache.size > SNIPPET_CACHE_CAP) {
+    const oldest = snippetCache.keys().next().value;
+    snippetCache.delete(oldest);
+  }
+}
 
 // The 'review-text' role, not a bare model id: every review-text task in the
 // app resolves through one entry in atlasModelMap so the cost/quality choice is
@@ -490,17 +544,38 @@ async function extractSnippet(text, { brandId = null, productId = null } = {}) {
   // Fitting the box was never the standard — helping the ad is.
   if (clean.length <= MAX_CHARS) return meetsProofBar(clean) ? clean : null;
 
+  // Cache lookup BEFORE the strongest-sentence narrowing so cache lookup is a
+  // single hash on the original text (deterministic across the caller). Cache
+  // key includes brandId + productId per snippetCacheKey — see the module-
+  // header comment for why.
+  const cacheKey = snippetCacheKey(clean, { brandId, productId });
+  const cached = snippetCacheGet(cacheKey);
+  if (cached !== undefined) {
+    return cached;
+  }
+
   // Narrow to the single strongest sentence BEFORE the model sees it. See
   // strongestSentence() — without this, every model tested picked a customer
   // service complaint out of a 3-sentence review.
   const source = strongestSentence(clean);
   // If that one sentence already fits, we are done — no model call at all.
-  if (source.length <= MAX_CHARS) return source;
+  if (source.length <= MAX_CHARS) {
+    snippetCacheSet(cacheKey, source);
+    return source;
+  }
 
   // Fallback ladder, best-first, used whenever the model is unavailable or
   // returns something unusable: a different whole sentence → whole clause →
   // marked excerpt. See bestFallbackSnippet's docstring.
-  const mechanical = () => bestFallbackSnippet(clean, source, MAX_CHARS);
+  //
+  // Cache-aware wrapper: every mechanical() return goes through the cache too,
+  // so a run whose LLM call failed once (e.g. rate-limited) doesn't retry the
+  // LLM on the next ad — it takes the same mechanical output.
+  const mechanical = () => {
+    const m = bestFallbackSnippet(clean, source, MAX_CHARS);
+    snippetCacheSet(cacheKey, m);
+    return m;
+  };
 
   // atlasConfigured(), not a bare OPENAI_API_KEY check: Atlas is the primary
   // route and OpenAI only the direct fallback, so gating on OPENAI_API_KEY
@@ -574,6 +649,7 @@ async function extractSnippet(text, { brandId = null, productId = null } = {}) {
 
     const elapsedMs = Date.now() - t0;
     console.log(`💬 quoteSnippet: "${verbatim}" (${verbatim.length}c) from ${clean.length}c in ${elapsedMs}ms`);
+    snippetCacheSet(cacheKey, verbatim);
     return verbatim;
   } catch (err) {
     const elapsedMs = Date.now() - t0;
