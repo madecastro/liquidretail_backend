@@ -52,6 +52,7 @@
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
+const { walkSource } = require('./lib/sourceWalk');
 const assert = require('assert');
 const Module = require('module');
 
@@ -169,17 +170,9 @@ function stripCommentsAndStrings(src) {
 }
 
 function walkJs(dir) {
-  const out = [];
-  for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
-    const full = path.join(dir, entry.name);
-    if (entry.isDirectory()) {
-      if (entry.name === 'node_modules' || entry.name === 'assets') continue;
-      out.push(...walkJs(full));
-    } else if (entry.name.endsWith('.js')) {
-      out.push(full);
-    }
-  }
-  return out;
+  // node_modules/assets hold no source. Worktree, .drafts and dot-dir
+  // exclusion comes from the shared helper — scripts/lib/sourceWalk.js.
+  return walkSource(dir, { extensions: ['.js'], extraSkipDirs: ['assets'] });
 }
 
 console.log('\nverifyMembersAuthz\n');

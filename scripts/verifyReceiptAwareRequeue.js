@@ -48,6 +48,7 @@
 
 const fs   = require('fs');
 const path = require('path');
+const { walkSource } = require('./lib/sourceWalk');
 
 const ROOT = path.join(__dirname, '..');
 const WORKER = fs.readFileSync(path.join(ROOT, 'worker.js'), 'utf8');
@@ -208,18 +209,9 @@ const SCAN_DIRS = [path.join(ROOT, 'services'), path.join(ROOT, 'routes')];
 // — the exact thing X1 exists to catch — could have landed there unguarded.
 // No nested file matches today; this closes the hole before it is used.
 function walkJs(dir) {
-  const out = [];
-  for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
-    const full = path.join(dir, entry.name);
-    if (entry.isDirectory()) {
-      // node_modules is never scanned; assets/fonts holds no source.
-      if (entry.name === 'node_modules' || entry.name === 'assets') continue;
-      out.push(...walkJs(full));
-    } else if (entry.name.endsWith('.js')) {
-      out.push(full);
-    }
-  }
-  return out;
+  // node_modules/assets hold no source. Worktree, .drafts and dot-dir
+  // exclusion comes from the shared helper — scripts/lib/sourceWalk.js.
+  return walkSource(dir, { extensions: ['.js'], extraSkipDirs: ['assets'] });
 }
 
 const offenders = [];
