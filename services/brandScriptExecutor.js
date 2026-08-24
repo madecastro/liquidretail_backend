@@ -28,6 +28,7 @@ const { spawn } = require('child_process');
 const axios     = require('axios');
 
 const ffmpegPath = require('ffmpeg-static');
+const { usableAttribution } = require('./quoteProvenance');
 
 const RUNNER_PATH = path.join(__dirname, 'brandScriptRunner.child.js');
 const FONTS_DIR   = path.join(__dirname, 'brandScripts', 'assets', 'fonts');
@@ -1457,7 +1458,8 @@ async function buildMetaForAd(ad, brand, opts = {}) {
     // quote / quoteSnippet: forced to the chokepoint's verified line when
     // one exists — see the "F4 IMPOSSIBLE BY CONSTRUCTION" comment above.
     quote:              finalQuoteText,
-    reviewer:           cascaded.reviewer           ?? null,
+    // Bare initials ("D") are not attribution — see usableAttribution.
+    reviewer:           usableAttribution(cascaded.reviewer) ?? null,
     deliveryLine:       gatedDeliveryLine,
     ctaText:            cascaded.ctaText            ?? null,
     cta:                cascaded.ctaText            ?? null,   // legacy alias for older scripts reading meta.cta
