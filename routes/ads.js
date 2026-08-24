@@ -851,6 +851,13 @@ router.post('/generate', async (req, res) => {
       total:        0,
       status:       'preparing',
       requestedBy:  req.user?.userId || null,
+      // See models/CampaignRun.js — stamped from JWT claims middleware/
+      // requireAuth.js reads, never inferred here. sessionLabel only when
+      // isAutomated, so a normal login never carries a stray label.
+      automation: {
+        isAutomated:  req.user?.automated === true,
+        sessionLabel: req.user?.automated === true ? (req.user?.sessionLabel || null) : null
+      },
       startedAt:    new Date(),
       // Scope for the concurrency gate above. MUST be written here, at mint
       // time: the gate runs while sibling runs are still 'preparing', long
@@ -1335,7 +1342,7 @@ router.post('/generate', async (req, res) => {
           level: 'error',
           title: 'Campaign run crashed during prep/render',
           key:   'run-crash:generate',
-          fields: { run: runId, by: run?.requestedBy ? String(run.requestedBy) : null, campaign: campaignId, ads: (adIds || []).length, error: err.message || String(err) },
+          fields: { run: runId, by: automatedRunLabel(run) || (run?.requestedBy ? String(run.requestedBy) : null), campaign: campaignId, ads: (adIds || []).length, error: err.message || String(err) },
           detail: err.stack || null
         });
         if (adIds && adIds.length) {
@@ -1606,6 +1613,13 @@ router.post('/runs', express.json(), async (req, res) => {
       total:        claim.total,
       status:       'running',
       requestedBy:  req.user?.userId || null,
+      // See models/CampaignRun.js — stamped from JWT claims middleware/
+      // requireAuth.js reads, never inferred here. sessionLabel only when
+      // isAutomated, so a normal login never carries a stray label.
+      automation: {
+        isAutomated:  req.user?.automated === true,
+        sessionLabel: req.user?.automated === true ? (req.user?.sessionLabel || null) : null
+      },
       startedAt:    new Date(),
       requestedProductIds: claimedProductIds,
       // A render claim is not a generation request — it mints no ads and bills no
@@ -1645,7 +1659,7 @@ router.post('/runs', express.json(), async (req, res) => {
           level: 'error',
           title: 'Campaign run crashed (queued drain)',
           key:   'run-crash:runs',
-          fields: { run: runId, by: run?.requestedBy ? String(run.requestedBy) : null, campaign: String(campaign._id), ads: renderIds.length, error: err.message || String(err) },
+          fields: { run: runId, by: automatedRunLabel(run) || (run?.requestedBy ? String(run.requestedBy) : null), campaign: String(campaign._id), ads: renderIds.length, error: err.message || String(err) },
           detail: err.stack || null
         });
         // buildRequeuePipeline, not a bare REQUEUE_MARK spread — same reason
@@ -1693,6 +1707,18 @@ router.post('/runs', express.json(), async (req, res) => {
   }
 });
 
+// Automated-run label — the one place that decides what the Slack feed (and
+// the two crash alerts below, which need the same answer with NO extra DB
+// read) calls a machine-triggered run. `run.automation` is stamped at mint
+// time (both CampaignRun.create call sites above) from `req.user.automated` /
+// `req.user.sessionLabel`; see models/CampaignRun.js and docs/ALERTING.md
+// "Automated runs". Returns null for an ordinary human run — callers fall
+// back to their own (cosmetic, best-effort) human-identity resolution.
+function automatedRunLabel(run) {
+  if (run?.automation?.isAutomated !== true) return null;
+  return `${run.automation.sessionLabel || 'automated'} (Claude session)`;
+}
+
 // Background render loop. Runs after the response has flushed; updates
 // the CampaignRun doc as each render finishes so the frontend's
 // poller can show real-time progress.
@@ -1722,6 +1748,80 @@ async function runRenderLoop(run, job, adIds, renderToken) {
   const otherIds = adIds.filter((id) => routeById.get(String(id)) !== 'veo');
   const isVeoRun = veoIds.length > 0;
 
+  // Who ordered this run — resolved ONCE, HOISTED ABOVE THE ADGEN HANDOFF
+  // RETURN and above the (now single) runFeed.startRun call below.
+  //
+  // PR #328 hoisted startRun itself above the handoff return but left this
+  // enrichment below it, still reasoning in terms of the OLD two-call shape
+  // ("the label upgrades it a few ms later on the enriched call below; on
+  // the handoff path this is the only call, so the short id is what shows").
+  // That was an incomplete fix: on the handoff path (100% of production runs,
+  // ADGEN_RENDERER_ENABLED=true) the enriched call sat after the `return`
+  // this branch always takes, so it was dead code — the parent posted once,
+  // to a raw id (or nothing), and NEVER refreshed. It is not rescued by
+  // loadLiveSnapshot's periodic re-enrichment either: that only runs when a
+  // later onStage/noteEvent call marks the run's parent dirty again, and on
+  // the handoff path nothing in THIS process ever does — adgen is a separate
+  // service with no call into this in-process runFeedService state. Moving
+  // the lookup here, before the one and only startRun call, fixes both paths
+  // with a single change instead of patching the symptom downstream.
+  //
+  // Brand name + human requester label still share one await point (as
+  // before) so this adds no serial round-trip ahead of anything billable —
+  // this whole function runs from routes/ads.js's `setImmediate`, AFTER the
+  // request's res.json already returned, and adgen's renderer claims Ad rows
+  // via its own independent poll of Ad.status, never via anything this
+  // function does. A failed lookup must never break a run: both branches
+  // below degrade to null on error, same as before.
+  //
+  // Automated runs (scripts/mintTestToken.js — the offline test-token minter
+  // the ui-smoke skill uses) authenticate as a REAL User (a genuine
+  // AdvertiserMembership is required to drive the app), so the human lookup
+  // below would resolve to that person's own real displayName — which is
+  // exactly why automated test traffic was indistinguishable from the
+  // owner's own activity. `CampaignRun.automation` is stamped at mint time
+  // (both CampaignRun.create call sites in this file) from
+  // `req.user.automated` / `req.user.sessionLabel`, themselves read off the
+  // JWT by middleware/requireAuth.js — never inferred here from heuristics.
+  // When set it WINS over the human lookup below, which is skipped entirely
+  // (no point querying User just to discard the result).
+  const autoLabel = automatedRunLabel(run);
+  const isAutomated = autoLabel !== null;
+
+  // The requester lookup uses a guarded require and never `.populate()`:
+  // `.populate('requestedBy')` throws "Schema hasn't been registered for model
+  // User" in this file, which never requires the User model (same trap as
+  // GET /api/ads/render-activity — see the note there). Degrades to the raw
+  // id, then to null; a cosmetic field must never fail a run.
+  const [brandDoc, humanRequesterLabel] = await Promise.all([
+    require('../models/Brand').findById(job.brandId).select('advertiserId name').lean().catch(() => null),
+    isAutomated ? Promise.resolve(null) : (async () => {
+      const uid = run?.requestedBy ? String(run.requestedBy) : null;
+      if (!uid) return null;
+      try {
+        const User = require('../models/User');
+        const u = await User.findById(uid).select('displayName email').lean().catch(() => null);
+        return u?.displayName || u?.email || uid;
+      } catch { return null; }
+    })()
+  ]);
+
+  // Final label the Slack feed (and every downstream `by:` field) renders.
+  // `autoLabel` (from automatedRunLabel, above) WINS over the human lookup
+  // — never merely supplements it, since showing both a real name and
+  // "automated" would still read as a real person to a channel skimmer —
+  // and is rendered as `<session> (Claude session)` or, when the caller did
+  // not supply a session label (see scripts/mintTestToken.js's
+  // --session-label), the honest `automated (Claude session)` rather than a
+  // fabricated name.
+  const requesterLabel = autoLabel || humanRequesterLabel;
+
+  // Stamp the label onto `job` so renderOneInner's video-failure alert can name
+  // the requester without a second lookup on a failure path. Safe to mutate:
+  // both call sites build `job` fresh per run (never a shared object), and it
+  // already flows unchanged into renderOne → renderOneInner.
+  if (requesterLabel) job.requesterLabel = requesterLabel;
+
   // Per-run Slack feed — fire-and-forget, never awaited. Registers adIds so
   // adStage can route events without a Mongo round-trip. Parent message +
   // thread posts are owned by runFeedService's detached interval.
@@ -1731,26 +1831,16 @@ async function runRenderLoop(run, job, adIds, renderToken) {
   // ADGEN_RENDERER_ENABLED went true the handoff `return` fired first and
   // startRun was never called at all — no parent message, so
   // CampaignRun.slackFeed.ts stayed null forever and every stage event adgen
-  // emitted had no thread to post into. Measured: the feed's last working run
-  // started 2026-08-22T04:09Z, minutes before the handoff commits landed, and
-  // all 21 runs on 2026-08-24 have slackFeed.ts = null. Two days of silent
-  // status reporting, with nothing failing and nothing logged, because nothing
-  // was ever attempted.
-  //
-  // adgen does the rendering but has NO startRun call site of its own — its
-  // only feed touchpoints are adStage.onStage and adVisionQcService.noteEvent,
-  // both of which need a parent that only this call creates. Backend owns the
-  // run lifecycle, so backend owns starting the feed, handoff or not.
-  //
-  // requestedBy is passed on THIS first call even though the human-readable
-  // label is not resolved yet: it costs nothing (already on the run doc) and it
-  // means the very first parent message names the requester by short id rather
-  // than naming nobody for the first throttle window. On the NON-handoff path
-  // the label upgrades it a few ms later on the enriched call below; on the
-  // handoff path this is the only call, so the short id is what shows.
+  // emitted had no thread to post into (PR #328). ONE call now, always fully
+  // resolved (brand name + requester label, human or automated) before it
+  // fires — there is no second "upgrade later" call anymore: that shape was
+  // exactly what broke on the handoff path, and the enrichment above is
+  // already off the request's critical path, so there is nothing left for a
+  // second call to usefully upgrade.
   runFeed.startRun({
     runId:   run.runId,
     brandId: job.brandId,
+    brandName: brandDoc?.name || null,
     total:   adIds.length,
     // Kind mix for the uncap context line (slackVerbosity.buildRunStartLine)
     // — only changes the thread text when total exceeds the old
@@ -1758,7 +1848,8 @@ async function runRenderLoop(run, job, adIds, renderToken) {
     staticCount: otherIds.length,
     veoCount:    veoIds.length,
     adIds,
-    requestedBy: run?.requestedBy
+    requestedBy: run?.requestedBy,
+    requesterLabel
   });
 
   const { isAdgenRendererEnabled } = require('../services/adgenBridge');
@@ -1791,51 +1882,13 @@ async function runRenderLoop(run, job, adIds, renderToken) {
   // loop lives in the web process and dies with it — see services/inFlight.js.
   inFlight.track(run.runId, { total: adIds.length, brandId: job.brandId, veo: isVeoRun });
 
-  // The Slack run feed was already started ABOVE the adgen handoff return —
-  // it must fire on both paths, and this position could only ever be reached
-  // on the non-handoff one. The label-enrichment call further down still
-  // upgrades that first parent message once the brand and requester resolve.
+  // Brand name / requester label / job.requesterLabel were already resolved
+  // ABOVE the adgen handoff return (see there) — nothing left to do here.
 
   // Unified progress row (ActivityDock) — mirrors the CampaignRun
   // counters and adds cooperative cancel: the pool stops claiming new
   // ads, in-flight renders finish, unclaimed ads flip to skipped.
   const { startRun } = require('../services/progressService');
-  // Brand name and requester label are both cosmetic enrichment for the same
-  // Slack line, so they share one await point — issuing them in parallel keeps
-  // this from adding a second serial round-trip ahead of the render pools.
-  //
-  // The requester lookup uses a guarded require and never `.populate()`:
-  // `.populate('requestedBy')` throws "Schema hasn't been registered for model
-  // User" in this file, which never requires the User model (same trap as
-  // GET /api/ads/render-activity — see the note there). Degrades to the raw id,
-  // then to null; a cosmetic field must never fail a run.
-  const [brandDoc, requesterLabel] = await Promise.all([
-    require('../models/Brand').findById(job.brandId).select('advertiserId name').lean().catch(() => null),
-    (async () => {
-      const uid = run?.requestedBy ? String(run.requestedBy) : null;
-      if (!uid) return null;
-      try {
-        const User = require('../models/User');
-        const u = await User.findById(uid).select('displayName email').lean().catch(() => null);
-        return u?.displayName || u?.email || uid;
-      } catch { return null; }
-    })()
-  ]);
-  // Stamp the label onto `job` so renderOneInner's video-failure alert can name
-  // the requester without a second lookup on a failure path. Safe to mutate:
-  // both call sites build `job` fresh per run (never a shared object), and it
-  // already flows unchanged into renderOne → renderOneInner.
-  if (requesterLabel) job.requesterLabel = requesterLabel;
-
-  if (brandDoc?.name || requesterLabel) {
-    // Best-effort label enrichment — still fire-and-forget.
-    runFeed.startRun({
-      runId: run.runId, brandId: job.brandId, brandName: brandDoc?.name || null,
-      total: adIds.length, staticCount: otherIds.length, veoCount: veoIds.length,
-      adIds,
-      requestedBy: run?.requestedBy, requesterLabel
-    });
-  }
   const progressRun = await startRun({
     kind: 'ad-batch',
     advertiserId: brandDoc?.advertiserId,

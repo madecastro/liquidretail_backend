@@ -80,6 +80,12 @@
 //   AdvertiserMembership (status:'active') plus optional X-Advertiser-Id
 //   header. Brand scope is entirely separate (X-Brand-Id header → Brand
 //   rows with Brand.advertiserId matching the active advertiser).
+//
+// This script's tokens ALSO carry `automated: true` + `sessionLabel` —
+// extra claims, additive to the shape above, read by requireAuth.js to mark
+// any CampaignRun this identity mints so the Slack run feed can tell a real
+// click from test traffic (models/CampaignRun.js `automation`). routes/
+// auth.js's real login callback never sets them.
 
 require('dotenv').config({ quiet: true });
 
@@ -109,10 +115,25 @@ Options:
                            (real login TTL). Accepts Ns/Nm/Nh or bare seconds.
   --advertiser-id <id>     Prefer this advertiser (must be an active membership).
   --brand-id <id>          Prefer this brand (must belong to the chosen advertiser).
+  --session-label <name>   Identifies WHICH automated run this is in the Slack
+                           run feed, e.g. "rs-e5" or a worktree/session name.
+                           Every token this script mints is already marked
+                           automated (see AUTOMATION MARKER below); this only
+                           supplies the friendly name shown beside that mark.
+                           Omit it and the feed shows an honest
+                           "automated (Claude session)" rather than a guess.
   --list-brands            Print brands for the resolved advertiser to stderr.
   --json                   Emit one JSON object on stdout:
                            {token, brandId, advertiserId, expiresAt, email}
   -h, --help               This text.
+
+AUTOMATION MARKER (added so the Slack run feed can tell a real click from
+test traffic — see models/CampaignRun.js "automation" / middleware/
+requireAuth.js): every token this script mints carries {automated: true,
+sessionLabel} as EXTRA claims alongside the real-login claim shape below.
+routes/auth.js's Google OAuth callback never sets these, so a real login
+always resolves automated:false regardless of who the user is — this is a
+property of the TOKEN this script mints, never of the account it mints for.
 
 Env (required):
   JWT_SECRET               Same secret the web service uses to verify tokens.
@@ -132,6 +153,7 @@ function parseArgs(argv) {
     ttl: DEFAULT_TTL,
     advertiserId: null,
     brandId: null,
+    sessionLabel: null,
     listBrands: false,
     json: false,
     help: false
@@ -149,6 +171,7 @@ function parseArgs(argv) {
     else if (a === '--ttl') out.ttl = next();
     else if (a === '--advertiser-id') out.advertiserId = next();
     else if (a === '--brand-id') out.brandId = next();
+    else if (a === '--session-label') out.sessionLabel = next();
     else if (a === '--list-brands') out.listBrands = true;
     else if (a === '--json') out.json = true;
     else if (a === '-h' || a === '--help') out.help = true;
@@ -320,12 +343,38 @@ async function main() {
     // Exact claim keys as routes/auth.js:25-32. userId as string — real
     // tokens carry a stringified ObjectId after JSON serialisation of the
     // Mongoose doc id from the strategy callback.
+    //
+    // `automated` / `sessionLabel` are EXTRA claims, additive to that real
+    // shape, not a replacement of it — routes/auth.js never sets them, so
+    // jwt.verify()'s payload on a real login simply lacks them and
+    // middleware/requireAuth.js resolves `automated: false`. Unconditional
+    // `true` here: any token from this script is, by construction, a test
+    // credential, never a real interactive login. `sessionLabel` degrades to
+    // null (rendered as "automated (Claude session)", never fabricated) when
+    // the caller did not pass --session-label.
+    // Defense in depth, matching middleware/requireAuth.js's read-side
+    // sanitizer: strip control characters (a newline here could otherwise
+    // forge an extra spoofed line in slackRunVerbosity's thread "run start"
+    // text, which — unlike runFeedService's parent head — does not
+    // HTML-escape its `by:` atom). requireAuth.js is the real trust-boundary
+    // enforcement point; this just stops a control character from ever being
+    // signed into a claim in the first place.
+    const sanitizedSessionLabel = args.sessionLabel
+      ? Array.from(String(args.sessionLabel))
+          .map((ch) => (ch.charCodeAt(0) <= 0x1F || ch.charCodeAt(0) === 0x7F) ? ' ' : ch)
+          .join('')
+          .replace(/\s+/g, ' ')
+          .trim()
+          .slice(0, 80) || null
+      : null;
     const claims = {
       id:     user.googleId,
       userId: String(user._id),
       email:  user.email,
       name:   user.displayName || '',
-      photo:  user.photoUrl || null
+      photo:  user.photoUrl || null,
+      automated: true,
+      sessionLabel: sanitizedSessionLabel
     };
 
     const token = jwt.sign(claims, process.env.JWT_SECRET, {
@@ -356,6 +405,7 @@ async function main() {
     }
     logErr('SPA localStorage keys: token, advertiser_id, brand_id');
     logErr('(A token alone is not enough — inject brand_id + advertiser_id too.)');
+    logErr(`automated=true  sessionLabel=${claims.sessionLabel || '(none — feed will show "automated (Claude session)")'}`);
 
     if (args.json) {
       // Single JSON object on stdout for harness capture. No trailing chatter.
@@ -364,7 +414,9 @@ async function main() {
         brandId,
         advertiserId,
         expiresAt,
-        email: user.email
+        email: user.email,
+        automated: true,
+        sessionLabel: claims.sessionLabel
       }) + '\n');
     } else {
       // Token only — one line so TOKEN=$(…) stays clean.

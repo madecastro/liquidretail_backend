@@ -214,6 +214,25 @@ const campaignRunSchema = new mongoose.Schema({
 
   requestedBy:  { type: mongoose.Schema.Types.ObjectId, ref: 'User', default: null },
 
+  // Marks a run as machine-triggered rather than a real person clicking
+  // Generate — scripts/mintTestToken.js (the ui-smoke skill's offline
+  // test-token minter) mints a REAL User's JWT (a genuine
+  // AdvertiserMembership is required to drive the app), so `requestedBy`
+  // alone cannot tell a test run from the owner's own click. Stamped at
+  // mint time (routes/ads.js's CampaignRun.create call sites) from
+  // `req.user.automated` / `req.user.sessionLabel`, themselves read off
+  // JWT claims by middleware/requireAuth.js — never inferred here from
+  // heuristics (user-agent, IP, timing, …). `isAutomated` WINS over
+  // `requestedBy`'s human identity in the Slack run feed (runFeed /
+  // routes/ads.js `runRenderLoop`), never merely supplements it: showing
+  // both a real name AND "automated" would still read as a real person to
+  // a channel skimmer. `sessionLabel` is honest-degrade, not fabricated —
+  // null means "automated (Claude session)" with no name suffix, never a guessed name.
+  automation: {
+    isAutomated:  { type: Boolean, default: false },
+    sessionLabel: { type: String,  default: null }
+  },
+
   // Per-run Slack live feed (services/runFeedService.js). Parent message
   // ts is claimed atomically across web instances (min 1 / max 3) so two
   // processes working the same run do not each create a parent. Only the
