@@ -245,8 +245,11 @@ async function resumeUntitledMasters({ limit = TITLING_RESUME_MAX } = {}) {
           // the remotion/ffmpeg load at boot for a constant).
           const { qcAndStampVideoAd } = require('./brandScriptExecutor');
           await qcAndStampVideoAd({ ad: adFresh, deliveredUrl: adFresh.veoVideoUrl });
-          await Ad.updateOne(
-            { _id: ad._id, titlingResumeState: STATE_CLAIMED },
+          // Status-guarded for the same reason as the titled arm above:
+          // qcAndStampVideoAd (line above) can stamp status:'failed' on a real
+          // vision-QC failure, and this write used to overwrite it with 'draft'.
+          const noBrandPromoted = await Ad.updateOne(
+            { _id: ad._id, titlingResumeState: STATE_CLAIMED, status: { $in: ['rendering', 'draft'] } },
             {
               $set: {
                 status: 'draft',
@@ -257,7 +260,14 @@ async function resumeUntitledMasters({ limit = TITLING_RESUME_MAX } = {}) {
                 updatedAt: new Date()
               }
             }
-          ).catch(() => {});
+          ).catch(() => null);
+          if (!noBrandPromoted || !noBrandPromoted.matchedCount) {
+            // Verdict kept — still settle the debt or this ad is re-swept forever.
+            await Ad.updateOne(
+              { _id: ad._id, titlingResumeState: STATE_CLAIMED },
+              { $set: { titlingResumeState: null, renderStageAt: new Date(), updatedAt: new Date() } }
+            ).catch(() => {});
+          }
           out.titled++;
           console.warn(
             `   ⚠️  titlingResume[${ad._id}]: brand unresolvable for >${BRAND_GIVEUP_MIN}m — ` +
@@ -297,8 +307,16 @@ async function resumeUntitledMasters({ limit = TITLING_RESUME_MAX } = {}) {
       // intentional success). Do NOT overwrite renderUrl/posterUrl —
       // renderBrandScriptAndSave already persists the titled asset itself.
       const now = new Date();
-      await Ad.updateOne(
-        { _id: ad._id },
+      // GUARDED — renderBrandScriptAndSave runs vision QC, and a real QC
+      // failure stamps status:'failed' (buildVideoQcFailureFields) without
+      // throwing, so this arm is reached with a terminal verdict already on
+      // the row. A bare { _id } write overwrote it with 'draft'. Measured in
+      // prod 2026-08-24: 47 QC-failed video ads in 'draft', ZERO in 'failed'.
+      // Allowlist, not denylist: an unknown status is left alone, never
+      // resurrected. The debt is settled on BOTH arms or the sweeper re-picks
+      // this ad forever.
+      const promoted = await Ad.updateOne(
+        { _id: ad._id, status: { $in: ['rendering', 'draft'] } },
         {
           $set: {
             status: 'draft',
@@ -310,6 +328,12 @@ async function resumeUntitledMasters({ limit = TITLING_RESUME_MAX } = {}) {
           }
         }
       );
+      if (!promoted.matchedCount) {
+        await Ad.updateOne(
+          { _id: ad._id },
+          { $set: { titlingResumeState: null, renderStage: 'done', renderStageAt: now, updatedAt: now } }
+        );
+      }
       out.titled++;
     } catch (err) {
       // A PRE-RENDER throw is NOT the ad's fault — release, do not condemn.

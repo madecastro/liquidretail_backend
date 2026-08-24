@@ -259,8 +259,16 @@ ok('E2 [ANTI-DOUBLE-RENDER] the stamp is claimed, never pending', () => {
 
 ok('E3 every terminal outcome clears the debt', () => {
   const cleared = adsSrc.match(/titlingResumeState:\s*null/g) || [];
-  assert.strictEqual(cleared.length, 4,
-    `expected 4 terminal clears (2 paths x {titled, failed}), found ${cleared.length}`);
+  // 6, not 4, since 2026-08-24: the two paths x {titled, failed} are joined by
+  // a THIRD terminal outcome on the video path — "a terminal verdict was
+  // already stamped, keep it". Vision QC does not throw, so `titlingFailed` is
+  // null and the success branch used to overwrite its status:'failed' with
+  // 'draft' (measured: 47 QC-failed video ads in 'draft', 0 in 'failed'). That
+  // Both the master AND derive success branches are now guarded, and each
+  // no-op arm still has to settle the debt — hence two more clears. Deliberately still strictEqual: this pins the exact
+  // number of terminal outcomes, so a NEW unguarded one fails here.
+  assert.strictEqual(cleared.length, 6,
+    `expected 6 terminal clears (2 paths x {titled, failed} + a kept-verdict arm on EACH), found ${cleared.length}`);
 });
 
 ok('E4 the heartbeat covers a claimed draft, not just rendering', () => {

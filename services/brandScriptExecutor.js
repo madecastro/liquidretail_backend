@@ -2003,6 +2003,16 @@ async function uploadRenderAndStamp({ ad, finalPath, tempDir, timings, titlingSn
       // are left as-is, so the operator can still see exactly what shipped;
       // buildVideoQcFailureFields only adds status:'failed' + renderError on
       // top. See that function's docstring for the full reasoning.
+      // ORDER IS THE INVARIANT, not the assignment. This MUST run after the
+      // `status: 'draft'` literal above so Object.assign's key overwrites it
+      // inside the SAME object — that overwrite is the entire mechanism that
+      // makes a real QC failure win. Move this above `const set = {...}`, or
+      // swap which one runs last, and a real QC failure silently ships as
+      // 'draft' again with NO test failure: the terminal write's own $in
+      // guard (renderer.js / routes/ads.js) only ever sees the already-wrong
+      // 'draft' this function handed it. Pinned by a structural harness check
+      // (grep for buildVideoQcFailureFields position) precisely because this
+      // margin is invisible to any check that only reads the terminal write.
       Object.assign(set, buildVideoQcFailureFields(videoVisionQc));
     }
     await Ad.updateOne(
