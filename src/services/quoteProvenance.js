@@ -533,6 +533,11 @@ function letterCount(str) {
  * @param {*} raw the author_name / author value as stored
  * @returns {string|null}
  */
+// Colourway matching is a SIBLING of this module, not a fifth origin
+// rule: services/quoteColourway.js `usableColourwayQuote`. Folding it
+// into toPrintableCustomerQuote would make a colour-free scraped quote
+// look unprintable, which it is not.
+
 function usableAttribution(raw) {
   if (typeof raw !== 'string' && typeof raw !== 'number') return null;
   const s = String(raw).replace(/\s+/g, ' ').trim();

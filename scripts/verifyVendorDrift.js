@@ -112,10 +112,6 @@ const SEED_FORK_REASONS = {
     'adgen keeps the env-fallback bridge on the QC split fields; backend reads SystemConfig only',
   'services/adVisionQcService.js':
     'adgen still honors AD_VISION_QC_ENABLED / pipeline env fallbacks; backend retired them',
-  'services/adStage.js':
-    'adgen #19 persist remotion child stderr/stdout on renderError',
-  'services/aiCreativeDirectorService.js':
-    'hunk-ported backend #325 (adgen #18); UNPORTED backend #324 colour-language testimonial drop',
   'services/alertService.js':
     'adgen dropped notify() channel override; backend still has it',
   'services/atlasModelMap.js':
@@ -123,19 +119,15 @@ const SEED_FORK_REASONS = {
   'services/brandFontIngestService.js':
     'UNPORTED: backend #323 cross-sheet CSS generics / icon-font drop (port in flight at seed)',
   'services/brandScriptExecutor.js':
-    'adgen video QC/titling path; UNPORTED backend #324 colour-language testimonial drop',
+    'adgen video QC/titling path (Remotion child OOM/timeout); colourway gate hunk-ported from backend #324',
   'services/directImageRenderService.js':
-    'deliberate fork: adgen owns usableAttribution, composeCorrectiveOverride, buildQcRetryArgs, submitEditImageWithSeedFallback. UNPORTED backend #324 colour-language testimonial drop',
+    'deliberate fork: adgen owns usableAttribution, composeCorrectiveOverride, buildQcRetryArgs, submitEditImageWithSeedFallback; colourway gate hunk-ported from backend #324',
   'services/fontClassification.js':
     'UNPORTED: backend #323 icon-font role-evidence drop (port in flight at seed)',
   'services/plateIntelService.js':
     'adgen extract is smaller than backend (backend grew after the copy)',
-  'services/layoutInputService.js':
-    'UNPORTED: backend #324 colour-language testimonial drop',
   'services/quoteProvenance.js':
-    'comment-only plus UNPORTED backend #324 colour-language testimonial drop',
-  'services/quoteRotationService.js':
-    'UNPORTED: backend #324 colour-language testimonial drop',
+    'comment-only: adgen dropped CLAUDE.md §4 cross-ref; colourway sibling comment ported from backend #324',
   'services/remotionRenderService.js':
     'adgen child-supervisor / isolation path; not a wholesale copy',
   'services/staticAdIntents.js':

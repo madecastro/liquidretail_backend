@@ -1,14 +1,14 @@
 {
   "version": 1,
   "backendRef": "origin/main",
-  "backendHead": "d8c133011275d62fa4133ed939b5e47fe5e90bdc",
-  "generatedAt": "2026-08-24T14:42:52.514Z",
+  "backendHead": "36aedfa35e671da580d3e1d323431f431752b576",
+  "generatedAt": "2026-08-24T15:13:18.809Z",
   "files": {
     "models/Ad.js": {
-      "backendHash": "a07f9e68626ef2e49ec86006af3f0536c4a07d6c3e3b3231d1a7d115e0c2b83f",
-      "backendSha": "aff3488d494ee7484d27971920a2b96e438e60fd",
+      "backendHash": "8e4951d5a020ada681e2e83f4c1869faf4e74e00b6c4afa1a7de71105b72aca4",
+      "backendSha": "36aedfa35e671da580d3e1d323431f431752b576",
       "status": "fork",
-      "reason": "comment-only: adgen still documents AD_VISION_QC_ENABLED env; backend retired the env fallback"
+      "reason": "comment-only: adgen still documents AD_VISION_QC_ENABLED env; backend retired the env fallback. Looked at backend #326 stderrTail/stdoutTail — adgen already declares both."
     },
     "models/Advertiser.js": {
       "backendHash": "0a7e1bb9ca5e0fbbfc6972f9c96d87f839b0a86175831b5446ae27095137ba3f",
@@ -405,10 +405,9 @@
       "reason": "only reached from unused capability executor / backend regenerate HTTP"
     },
     "services/adStage.js": {
-      "backendHash": "8b3ad5ac40f69aba319d0f34b28e30e7149b5f48d4fe2bf380c3a2fbfc5e2db6",
-      "backendSha": "11ce9e12eb5da2b1322a669353f06d1eec091eff",
-      "status": "fork",
-      "reason": "adgen #19 persist remotion child stderr/stdout on renderError"
+      "backendHash": "437314029f1ff3ea5dcd35f68ba074c2fbc30fe20c38c706f72e9b3c4b66529b",
+      "backendSha": "36aedfa35e671da580d3e1d323431f431752b576",
+      "status": "synced"
     },
     "services/adTitlingTruth.js": {
       "backendHash": "217adb4910d27b03e7fdffc57c43e70df0ec153094d21d48db58286c630078f0",
@@ -430,8 +429,7 @@
     "services/aiCreativeDirectorService.js": {
       "backendHash": "38f01d5f9dbb060b8e51aea2b94d9a1459dd001bf1228cae8abc6ac1309193ec",
       "backendSha": "d8c133011275d62fa4133ed939b5e47fe5e90bdc",
-      "status": "fork",
-      "reason": "hunk-ported backend #325 (adgen #18); UNPORTED backend #324 colour-language testimonial drop"
+      "status": "synced"
     },
     "services/aiCreativeV2Helpers.js": {
       "backendHash": "52130701af3ed3c383e084355cf898e48bd170e072fc3df193b9948416e2c013",
@@ -561,7 +559,7 @@
       "backendHash": "c123aa44b7c094d52e0c5eb3096380623e672f04b23efd5a399751e0d2eeb170",
       "backendSha": "d8c133011275d62fa4133ed939b5e47fe5e90bdc",
       "status": "fork",
-      "reason": "adgen video QC/titling path; UNPORTED backend #324 colour-language testimonial drop"
+      "reason": "adgen video QC/titling path (Remotion child OOM/timeout); colourway gate hunk-ported from backend #324"
     },
     "services/brandScriptRunner.child.js": {
       "backendHash": "c8f60343c015bda7e03d69bfa07b8d01cb91c3347701a11773412537a6e36b76",
@@ -709,7 +707,7 @@
       "backendHash": "730ca69ee7cd2aee12dcc7f53a27f0f37daa70d358c5cc6d8a9c8e2f5a9710b4",
       "backendSha": "d8c133011275d62fa4133ed939b5e47fe5e90bdc",
       "status": "fork",
-      "reason": "deliberate fork: adgen owns usableAttribution, composeCorrectiveOverride, buildQcRetryArgs, submitEditImageWithSeedFallback. UNPORTED backend #324 colour-language testimonial drop"
+      "reason": "deliberate fork: adgen owns usableAttribution, composeCorrectiveOverride, buildQcRetryArgs, submitEditImageWithSeedFallback; colourway gate hunk-ported from backend #324"
     },
     "services/enrichmentReconciler.js": {
       "backendHash": "18319b9414c7c67c332f03cbb7870c42048dace067a55523f54b7ea16c071649",
@@ -804,8 +802,7 @@
     "services/layoutInputService.js": {
       "backendHash": "aee859d5f6c2ac2a81eca98b967dd4632e2cb89b983068dc3129ef689d0afff5",
       "backendSha": "d8c133011275d62fa4133ed939b5e47fe5e90bdc",
-      "status": "fork",
-      "reason": "UNPORTED: backend #324 colour-language testimonial drop"
+      "status": "synced"
     },
     "services/llmError.js": {
       "backendHash": "589fd87ece50784d1620ac2db054d92911c880d21d2a34be4db3f4df8aaf7f8f",
@@ -923,17 +920,21 @@
       "status": "unused",
       "reason": "backend archive sweeper; not wired into adgen entrypoint"
     },
+    "services/quoteColourway.js": {
+      "backendHash": "d78b03b18bc07b1e663a1c295dfeefa64ace46adae1460ec3acab143da711c49",
+      "backendSha": "d8c133011275d62fa4133ed939b5e47fe5e90bdc",
+      "status": "synced"
+    },
     "services/quoteProvenance.js": {
       "backendHash": "60b30bc103fe267f5a82ca0a29237c32dcb0fc61e1a7471e74ff1d3fb32bdcd7",
       "backendSha": "d8c133011275d62fa4133ed939b5e47fe5e90bdc",
       "status": "fork",
-      "reason": "comment-only plus UNPORTED backend #324 colour-language testimonial drop"
+      "reason": "comment-only: adgen dropped CLAUDE.md §4 cross-ref; colourway sibling comment ported from backend #324"
     },
     "services/quoteRotationService.js": {
       "backendHash": "6f6f4e1c5a767e472bdbe3793eede2eb8518cb2ac0e915d559eb9db12c5c7469",
       "backendSha": "d8c133011275d62fa4133ed939b5e47fe5e90bdc",
-      "status": "fork",
-      "reason": "UNPORTED: backend #324 colour-language testimonial drop"
+      "status": "synced"
     },
     "services/quoteSnippetService.js": {
       "backendHash": "d5f4a2e9c1829ac711e7db572787880d56200e5ac320ba1c74f9ec2108dea0f8",
@@ -965,6 +966,12 @@
       "backendSha": "dabceaf47fc8db7671a7d8f812024d550e66287a",
       "status": "fork",
       "reason": "adgen child-supervisor / isolation path; not a wholesale copy"
+    },
+    "services/renderErrorFields.js": {
+      "backendHash": "0efda9eab3d25ab7f1a1efa8f8ca3cc8f5f2ca93a9a56319f0ecb3de0aa0d748",
+      "backendSha": "36aedfa35e671da580d3e1d323431f431752b576",
+      "status": "fork",
+      "reason": "comment-only: adgen header omits the (adgen) parenthetical; clip/NUL contract matches backend #326 (adgen #19 twin)."
     },
     "services/reviewAdapters/bazaarvoice.js": {
       "backendHash": "5edbca2aaf5780b76337f2ba281a80ce28ba2a50a64462330cfd941ce67d02b9",
@@ -1152,10 +1159,10 @@
       "status": "synced"
     },
     "services/titlingResumeService.js": {
-      "backendHash": "23c87b424e5a12b5a1099825f81173e64098bc6f93cf82211c570ffc988aa7df",
-      "backendSha": "22f246732afb17a89dc569ca76bd18d3c920c233",
+      "backendHash": "c97b0aec136b95e5fdc87e81444543a97ab9fd41cccdda988410fc271eadded5",
+      "backendSha": "36aedfa35e671da580d3e1d323431f431752b576",
       "status": "unused",
-      "reason": "only required from unwired bootRecoveryService — not on adgen renderer path (look before wiring)"
+      "reason": "adgen-only QC-verdict guard + remotion-child-OOM retry; only required from unwired bootRecoveryService. Looked at backend #326 child-tail persist — already present."
     },
     "services/ugcVideoPipeline.js": {
       "backendHash": "2a7c1390a0bd0c46f2f361fb6eb445a9b55bbb225ada35adb6fdc84b5601d78e",

@@ -100,10 +100,16 @@ function nextRecentKeys(prev, fingerprint, { wrapped = false, max = MEMORY_N } =
 function passesRenderGate(quote, scope) {
   if (!quote) return false;
   const { toPrintableCustomerQuote, applyStrictQuoteScope } = require('./quoteProvenance');
+  const { applyQuoteColourway } = require('./quoteColourway');
   const printable = toPrintableCustomerQuote(quote);
   if (!printable) return false;
-  if (!scope) return true;
-  return applyStrictQuoteScope(printable, scope) != null;
+  const scoped = scope ? applyStrictQuoteScope(printable, scope) : printable;
+  if (!scoped) return false;
+  // Colourway is a sibling of noun-scope, not inside it: a colour-free
+  // quote is a no-op even with a product title, and a product-less
+  // scope (brand / media ads) is a no-op too. Missing scope skips
+  // both gates, matching the pre-colour contract.
+  return applyQuoteColourway(scoped, scope || {}) != null;
 }
 
 /**

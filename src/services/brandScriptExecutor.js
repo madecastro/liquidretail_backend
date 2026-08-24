@@ -617,8 +617,10 @@ function gateLayoutInputQuotes(layoutInput, scope = {}) {
     const pq = layoutInput?.input?.social_proof?.primary_quote;
     if (!pq) return layoutInput;
     const { toPrintableCustomerQuote, applyStrictQuoteScope } = require('./quoteProvenance');
+    const { applyQuoteColourway } = require('./quoteColourway');
     let printable = toPrintableCustomerQuote(pq);
     let withheldByStrict = false;
+    let withheldByColourway = false;
     if (printable) {
       const scoped = applyStrictQuoteScope(printable, scope);
       if (!scoped) {
@@ -638,11 +640,41 @@ function gateLayoutInputQuotes(layoutInput, scope = {}) {
           withheldByStrict = true;
           printable = null;
         }
+      } else {
+        printable = scoped;
+      }
+    }
+    if (printable) {
+      const colourOk = applyQuoteColourway(printable, scope);
+      if (!colourOk) {
+        const rest = Array.isArray(layoutInput?.input?.social_proof?.secondary_quotes)
+          ? layoutInput.input.social_proof.secondary_quotes : [];
+        let rescued = null;
+        for (const cand of rest) {
+          const next = applyQuoteColourway(
+            applyStrictQuoteScope(toPrintableCustomerQuote(cand), scope),
+            scope
+          );
+          if (next) { rescued = next; break; }
+        }
+        if (rescued) {
+          console.log(
+            `🔒 brandScript: quote failed colourway — using next allowed candidate`
+          );
+          printable = rescued;
+        } else {
+          withheldByColourway = true;
+          printable = null;
+        }
+      } else {
+        printable = colourOk;
       }
     }
     if (!printable) {
       console.log(
-        withheldByStrict
+        withheldByColourway
+          ? `🔒 brandScript: quote withheld (colourway mismatch) — titling with no testimonial`
+          : withheldByStrict
           ? `🔒 brandScript: quote withheld (QUOTE_PROVENANCE_STRICT ` +
             `tier=${pq.tier || 'unstamped'}) — titling with no testimonial`
           : `🔒 brandScript: quote withheld (tier=${pq.tier || 'unstamped'} ` +
@@ -1034,12 +1066,21 @@ async function buildMetaForAd(ad, brand, opts = {}) {
   // burned primary_quote.snippet. Rotate BEFORE the gate so the gate still
   // has the final word; rotation itself refuses lines the gate would drop
   // so flag-on cannot lose a testimonial flag-off would have printed.
+  //
+  // colourwayTitle is ONE value shared by rotation and paint. Catalog
+  // title first (raw pipe form); display-normalized layoutInput name
+  // is the fallback. Paint used to drop the catalog title, so the two
+  // sites could disagree on a colourway after display-normalize
+  // flattened `|` to ` - `.
+  const colourwayTitle = catalogProduct?.title
+    || layoutInput?.input?.product?.name
+    || null;
   {
     const rot = require('./quoteRotationService');
     const runId = rot.campaignRunIdFromAd(ad);
     const rotateScope = {
       productAttached: !!ad.productId,
-      productTitle: layoutInput?.input?.product?.name || catalogProduct?.title || null,
+      productTitle: colourwayTitle,
       extraText: layoutInput?.input?.product?.name || null,
       media: scopeMedia
     };
@@ -1063,7 +1104,7 @@ async function buildMetaForAd(ad, brand, opts = {}) {
 
   layoutInput = gateLayoutInputQuotes(layoutInput, {
     productAttached: !!ad.productId,
-    productTitle: layoutInput?.input?.product?.name || null,
+    productTitle: colourwayTitle,
     extraText: layoutInput?.input?.product?.name || null,
     media: scopeMedia
   });
