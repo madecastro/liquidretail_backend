@@ -2858,12 +2858,23 @@ function buildPromptRound({ inputSummary, creativeIntent, platformFormat, univer
     : `AVOID — no prior rounds for this product. You're on round 0; lead with the strongest signal.`;
 
   // PROOF PRESENCE — computed here in JS rather than left to the model, because
-  // the reserved proof-led slot below must fire on exactly the INVERSE of the
-  // HONESTY RULE's condition. If the two ever both fired, the prompt would
-  // simultaneously demand a proof-led concept and forbid surfacing proof —
-  // the self-contradictory-prompt failure class that cost a full rollback on
-  // the video side (CLAUDE.md §00, PR #61). Reading the same fields the
+  // the reserved proof-led slot below must never fire when the HONESTY RULE
+  // fires. If the two ever both fired, the prompt would simultaneously demand a
+  // proof-led concept and forbid surfacing proof — the self-contradictory-prompt
+  // failure class that cost a full rollback on the video side (PR #61; the
+  // doctrine is written up in the SIBLING repo's CLAUDE.md §00,
+  // liquidretail_backend — this repo's CLAUDE.md has no §00, the reference came
+  // across with the wholesale port in 881dabd8). Reading the same fields the
   // honesty rule reads is what keeps them mutually exclusive.
+  //
+  // PRECISELY: what is required is CONTAINMENT, not equivalence. The slot's
+  // condition must be a SUBSET of "the honesty rule does not fire"; it is not
+  // and need not be that condition's exact inverse, and today it is a STRICT
+  // subset — the honesty rule stands down for a quote or a comment alone, while
+  // this gate still requires a rating (see correction 1). An earlier revision of
+  // this comment said "exactly the INVERSE", which overstated it and disagreed
+  // with the RESERVED PROOF-LED SLOT comment further down that correctly says
+  // "strict subset". Containment is the invariant; keep asserting that.
   //
   // proof_options is included deliberately: when DIRECTOR_PROOF_MENU_ENABLED is
   // on, a product-scoped run has its brand/category proof withheld from
@@ -2875,19 +2886,93 @@ function buildPromptRound({ inputSummary, creativeIntent, platformFormat, univer
   // TWO CORRECTIONS from adversarial review — both were real, do not undo:
   //
   //  1. RATING-BEARING, not merely "any proof". Reserving a slot on the strength
-  //     of a quote or a comment ALONE would actively make things worse:
+  //     of a quote or a comment ALONE would actively make things worse. The
+  //     ORIGINAL mechanism (9305e90d, backend, 2026-08-10, owner-authored):
   //     INTENTS.social_proof_led.eligible is rating-only (staticAdIntents.js —
   //     its `core` IS the rating), so a quote-only product would mint
   //     ai_social_proof_led and then fall straight back to objection_resolved at
-  //     render. That is the exact collapse this change exists to stop, and the
-  //     reserved slot would have amplified it. So the slot is gated on a rating
-  //     actually being reachable.
+  //     render — the exact collapse that commit exists to stop, which the
+  //     reserved slot would have amplified.
+  //
+  //     THAT ARGUMENT IS CONTINGENT, WHICH THE ORIGINAL WORDING DID NOT SAY —
+  //     and that omission is what made this comment go stale. It holds only
+  //     while INTENTS.social_proof_led.eligible is rating-only. The moment
+  //     eligibility accepts a quote alone, a quote-only product stops falling
+  //     back and this paragraph stops being a reason for anything. Verify which
+  //     world you are in by calling the real code, not by reading this comment:
+  //       node -e "const S=require('./src/services/staticAdIntents');
+  //                console.log(S.INTENTS.social_proof_led.eligible({quote:'x'}))"
+  //     null means eligibility is already widened (quote-only no longer falls
+  //     back); a 'no rating' string means it is still rating-only.
+  //     scripts/verifyProofReservationGate.js pins whichever is true and fails
+  //     loudly when it flips, so this cannot silently rot a second time.
+  //
+  //     WHAT WIDENING WOULD CURRENTLY PRODUCE — a measurement, not a ruling.
+  //     Whether the Director should COMPEL a proof-led concept for a quote-only
+  //     product is the owner's call, not this comment's; what follows is only
+  //     what the code does today, obtained by CALLING the real `goal` /
+  //     `emphasis` / `absences` rather than reading them
+  //     (scripts/verifyProofReservationGate.js asserts every claim below):
+  //       - The path a quote-only product reaches once eligibility IS widened is
+  //         WORSE than the objection_resolved fallback it replaces.
+  //         social_proof_led's `goal` unconditionally demands "the rating
+  //         widget — star glyphs, the numeral, the count" and its `emphasis`
+  //         still ranks "the rating" second, while `absences` for that same
+  //         rating-less data simultaneously forbids "no numeric score, star
+  //         glyphs or trust mark of any kind" — and the one piece of proof that
+  //         DOES exist, the quote, drops to third. objection_resolved leads with
+  //         "the customer's sentence, as the loudest thing in the frame" and is
+  //         coherent for exactly this data.
+  //       - On PMax it also silently loses the in-image CTA button:
+  //         resolveDrawCta grants a burned-in CTA only for
+  //         intentKey === 'objection_resolved'.
+  //     So widening the reservation TODAY would GUARANTEE more products land on
+  //     a self-contradictory prompt — correction 2's PR #61 class, arriving at
+  //     the render layer instead of the round layer. That is an argument about
+  //     SEQUENCING, not about the merits: the governing principle is unchanged,
+  //     only the layer that threatens it has moved. Read this as "these two
+  //     things are broken first", never as "the answer is no".
+  //
+  //     AND NOTE WHAT THIS GATE DOES NOT DO — the reason widening buys less than
+  //     it looks like. It controls only what is COMPELLED, never what is
+  //     ALLOWED. The CREATIVE STYLE selection criteria below already tell the
+  //     Director that social_proof_led means "a specific quote, PRODUCT TIER
+  //     FIRST" — no rating named at all — so a quote-only product is already
+  //     free to choose a proof-led concept and frequently should. Widening this
+  //     gate would only turn that "may" into a "must". The coverage problem
+  //     9305e90d set out to fix (proof-led ads vanishing) is addressed by those
+  //     criteria; the reserved slot is the stronger guarantee, held back for the
+  //     data where the resulting render is unambiguously coherent.
+  //
+  //     THE OPEN QUESTION, STATED PLAINLY SO IT IS NOT LOST AGAIN. The owner
+  //     directive of 2026-08-24 — "a social proof led ad doesn't require a
+  //     rating, if there is positive social proof that we can use in the form of
+  //     a quote, that is OK also" — is about which intent RENDERS. It was
+  //     implemented at the render layer only, and it does NOT by itself decide
+  //     the Director-side question of which concept the round is COMPELLED to
+  //     reserve. Those are different mechanisms and the directive is silent on
+  //     this one. But the direction it points is unmistakable, so treat the
+  //     rating-only gate here as UNRESOLVED-AND-PENDING, not as settled policy:
+  //     nobody has yet put the Director-side question to the owner.
+  //
+  //     PRECONDITIONS for widening, both currently OPEN on master — each has an
+  //     empty branch reserved for it, so the intent exists and the work does not:
+  //       1. social_proof_led's goal/emphasis made conditional on `d.rating`
+  //          (branch fix/social-proof-goal-emphasis-conditional)
+  //       2. social_proof_led added to resolveDrawCta's PMax allowlist
+  //          (branch fix/pmax-drawcta-social-proof)
+  //     Close those two and the measured objection above disappears, at which
+  //     point widening this gate is very likely the right call — and
+  //     verifyProofReservationGate.js will go red to force exactly that
+  //     conversation rather than letting this comment rot a second time.
+  //
   //  2. The proof_options term is gated on the SAME flag as the honesty rule's
   //     proof_options clause. Ungated, an injected/stale summary carrying
   //     proof_options while the menu is OFF would fire the reserved slot while
   //     the (unamended) honesty rule still demanded social_proof_type="none" —
   //     a self-contradictory prompt, the PR #61 class. Gating both on one flag
-  //     is what makes "exact inverse" true rather than merely intended.
+  //     is what makes the containment above actually hold on the proof_options
+  //     dimension rather than merely be intended.
   const proofSignal   = inputSummary?.social_proof_signal || {};
   const proofOptions  = (directorProofMenuEnabled() && Array.isArray(proofSignal.proof_options))
     ? proofSignal.proof_options : [];
@@ -3042,12 +3127,20 @@ function buildPromptRound({ inputSummary, creativeIntent, platformFormat, univer
     ] : []),
     // RESERVED PROOF-LED SLOT — owner directive 2026-08-07, after social-proof
     // static ads all but disappeared from production. Emitted ONLY when a RATING
-    // is reachable (see hasUsableProof above), which is both a strict subset of
-    // "honesty rule does not fire" — so the two can never contradict — and the
-    // condition the render-side intent actually requires. Deliberately not a
-    // mechanical post-parse rejection: a thin-data product should degrade to an
-    // honest non-proof concept rather than have a hollow proof ad forced on it,
-    // which is the same reasoning behind INTENTS.social_proof_led's `core`.
+    // is reachable (see hasUsableProof above), which is a strict subset of
+    // "honesty rule does not fire" — so the two can never contradict.
+    //
+    // It was ALSO described as "the condition the render-side intent actually
+    // requires". Treat that as true only while INTENTS.social_proof_led.eligible
+    // is rating-only: once eligibility accepts a quote alone, the render side
+    // requires strictly LESS than this gate does, and this gate is then
+    // deliberately the stricter of the two. Correction 1 above has the measured
+    // reason it stays stricter rather than being widened to match.
+    //
+    // Deliberately not a mechanical post-parse rejection: a thin-data product
+    // should degrade to an honest non-proof concept rather than have a hollow
+    // proof ad forced on it, which is the same reasoning behind
+    // INTENTS.social_proof_led's `core`.
     ...(hasUsableProof ? [
       `- PROOF-LED COVERAGE: this product has a usable RATING, so at least ONE of your ${N_CONCEPTS_ROUND} concepts MUST set routing.creative_style="social_proof_led" and anchor its composition on that rating (a quote or comment may support it, but the rating is what makes the ad renderable). The other concepts stay free. If you truly cannot ground a proof-led concept on this data, explain why in that concept's reasoning.rationale — do not silently skip it.`
     ] : []),

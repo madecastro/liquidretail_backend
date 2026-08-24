@@ -1,8 +1,8 @@
 {
   "version": 1,
   "backendRef": "origin/main",
-  "backendHead": "a8e812db398a8813796db2320b26b9d0477e4292",
-  "generatedAt": "2026-08-24T18:23:13.079Z",
+  "backendHead": "b7b8cae674b29c95ed2ad2bb5fb7574f2dae60f4",
+  "generatedAt": "2026-08-24T19:59:49.395Z",
   "files": {
     "models/Ad.js": {
       "backendHash": "8e4951d5a020ada681e2e83f4c1869faf4e74e00b6c4afa1a7de71105b72aca4",
@@ -429,7 +429,8 @@
     "services/aiCreativeDirectorService.js": {
       "backendHash": "38f01d5f9dbb060b8e51aea2b94d9a1459dd001bf1228cae8abc6ac1309193ec",
       "backendSha": "d8c133011275d62fa4133ed939b5e47fe5e90bdc",
-      "status": "synced"
+      "status": "fork",
+      "reason": "comment-only: the reserved proof-led slot's correction 1 is annotated for adgen's ADGEN-ONLY social_proof_led eligibility widening (STATIC_SOCIAL_PROOF_QUOTE_ELIGIBLE, PR #34). Backend eligibility is still rating-only, so the original unqualified wording is still accurate THERE and must not be ported back. No behaviour change either side."
     },
     "services/aiCreativeV2Helpers.js": {
       "backendHash": "52130701af3ed3c383e084355cf898e48bd170e072fc3df193b9948416e2c013",
