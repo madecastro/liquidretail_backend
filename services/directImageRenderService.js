@@ -605,58 +605,88 @@ function monochromeInkFor(meanLum) {
 }
 
 /**
- * Rec.709-weighted luminance of an sRGB triple, 0..1, NO gamma linearization.
+ * Rec.709-weighted luminance of an sRGB triple, 0..1, NO per-channel
+ * gamma linearization.
  *
  * Used only on LOW-chroma (near-grey) pixels, where Rec.709, Rec.601 and
  * sharp greyscale agree. `behindLuminance` is production
  * `sharp().greyscale()` mean / 255 (finishPlate) — measured on sharp
  * 0.33.5 that is NEITHER Rec.601 nor Rec.709-no-gamma on chromatic
- * primaries (red 124 vs 76 vs 54). Do not "align" the two formulas, and
- * do not linearize: linearizing the plate number classifies the failing
- * 0.56 plate as ~3.24:1 and SKIP the re-ink. Pinned by
- * scripts/verifyLogoColorPreservation.js L6.
+ * primaries (red 124 vs 76 vs 54). Do not "align" the two formulas:
+ * this helper must stay in the same encoded 0..1 space as the plate
+ * number. Linearization of that encoded grey happens in
+ * inkContrastRatio, not here.
  */
 function logoPixelLuminance(r, g, b) {
   return (0.2126 * r + 0.7152 * g + 0.0722 * b) / 255;
 }
 
 /**
- * Contrast ratio between two 0..1 luminances. WCAG 2.x formula, applied
- * WITHOUT sRGB linearization — the plate number is whatever finishPlate
- * stored (sharp greyscale / 255) and the pixel number is
- * logoPixelLuminance. Linearizing either one inverts the 0.56 case.
+ * sRGB-encoded 0..1 channel → linear (IEC 61966-2-1 / WCAG 2.x relative
+ * luminance). Threshold is the sRGB breakpoint 0.04045, not the 0.03928
+ * WCAG 2.0 transcription. Applied to already-greyscale 0..1 values
+ * (behindLuminance, logoPixelLuminance) — not per RGB channel.
+ *
+ * Load-bearing as a PAIR with the 4.5 floor. Linearize
+ * alone (floor 3) classifies the failing 0.56 plate as ~3.24:1 and
+ * SKIPS the re-ink. Floor 4.5 alone (no linearize) classifies the
+ * good 0.27 plate as 3.28:1 and RE-INKS Mai Tai to black. Pinned by
+ * scripts/verifyLogoColorPreservation.js L6 matrix.
+ */
+function srgbEncodedToLinear(c) {
+  if (typeof c !== 'number' || !Number.isFinite(c)) return 0;
+  const x = c < 0 ? 0 : c > 1 ? 1 : c;
+  return x <= 0.04045 ? x / 12.92 : ((x + 0.055) / 1.055) ** 2.4;
+}
+
+/**
+ * Contrast ratio between two sRGB-encoded 0..1 luminances. True WCAG 2.x
+ * relative-luminance: linearize each value, then (hi+0.05)/(lo+0.05).
  *
  * Exported so the harness pins the measured Pelagic plates against the
- * shipped function, not a copy.
+ * shipped function, not a copy. contrastingInkFor uses this same helper
+ * so the picker and the re-ink gate cannot disagree on the metric.
  */
 function inkContrastRatio(L1, L2) {
   if (typeof L1 !== 'number' || typeof L2 !== 'number') return 0;
   if (!Number.isFinite(L1) || !Number.isFinite(L2)) return 0;
-  const hi = Math.max(L1, L2);
-  const lo = Math.min(L1, L2);
+  const a = srgbEncodedToLinear(L1);
+  const b = srgbEncodedToLinear(L2);
+  const hi = Math.max(a, b);
+  const lo = Math.min(a, b);
   return (hi + 0.05) / (lo + 0.05);
 }
 
-// WCAG 2.x large-text / UI-component floor, used as a number IN THE SAME
-// 0..1 space as behindLuminance (not linearized relative luminance).
+// WCAG 2.x AA normal-text floor, applied AFTER sRGB linearization.
 // Measured on the Pelagic batch that exhibited the defect:
-//   white vs Ws Aquatek plate 0.56 → 1.72  (wordmark invisible)
-//   white vs Mai Tai plate     0.27 → 3.28  (wordmark clearly present)
-// 3 sits between those two observed ratios. The white-ink crossover
-// (ratio === 3) is plate L = 0.30, so Mai Tai has 0.03 of headroom.
-// A 0.5 luminance split is 0.06 FROM the failing plate and on the WRONG
-// side of it — that was the inverted fix. Do not restore it.
-const LOGO_MIN_INK_CONTRAST = 3;
+//   white vs Ws Aquatek 0.56 → 3.24  (wordmark invisible; 28% below 4.5)
+//   white vs Mai Tai     0.27 → 9.61  (wordmark present;  114% above 4.5)
+// BOTH the linearization and this floor are required. The white-ink
+// cliff (ratio === 4.5) is plate L ≈ 0.465, so Mai Tai has 0.195 of
+// headroom — the previous non-linear floor-3 cliff was 0.300, leaving
+// only 0.03, inside ordinary shot-to-shot variance of behindLuminance
+// (a mean over the plate region, not a controlled constant).
+const LOGO_MIN_INK_CONTRAST = 4.5;
 
 const INK_BLACK = { r: 0, g: 0, b: 0 };
 const INK_WHITE = { r: 255, g: 255, b: 255 };
 
 /**
  * Pick black or white ink, whichever has higher contrast against the plate.
- * Independent of monochromeInkFor's 0.5 split: in the 0.18–0.50 band that
- * split picks WHITE, but black has the better WCAG ratio (at plate 0.49,
- * black is 10.8:1 vs white 1.94:1). Using monochromeInkFor here would
- * re-ink a white wordmark to white on any plate ≤ 0.5 — still invisible.
+ * Uses inkContrastRatio, so it is linearized on the SAME basis as the
+ * re-ink gate. Independent of monochromeInkFor's 0.5 split.
+ *
+ * Linearized black/white crossover is plate L ≈ 0.460 (both inks 4.58:1).
+ * The non-linear picker crossed at ≈ 0.179 and chose BLACK from 0.20
+ * upward — including Mai Tai 0.27, where black's true WCAG ratio is
+ * only 2.19 (fails 4.5) and white is 9.61. Using that picker with the
+ * linearized gate would re-ink a failing dark wordmark to still-failing
+ * black ink.
+ *
+ * Disagrees with monochromeInkFor only in the 0.460–0.500 band (this
+ * picker BLACK, 0.5-split WHITE). 0.49 is the remaining pin. Using
+ * monochromeInkFor here would re-ink a white wordmark to white on any
+ * plate ≤ 0.5 — still invisible on 0.49.
  */
 function contrastingInkFor(behindLuminance) {
   if (typeof behindLuminance !== 'number' || !Number.isFinite(behindLuminance)) {
@@ -910,7 +940,7 @@ async function logoIsPolychrome(logoPng, coverage, w, h, { chromaThreshold = LOG
  * plate, dark ink on a light plate). High-chroma pixels are never
  * re-inked — brand-colour preservation wins over legibility there, because
  * a contrast rule on those pixels would flatten Pelagic's #0055b8 / #c10230
- * tiles on BOTH measured plates (they fail 3:1 against 0.27 and 0.56).
+ * tiles on BOTH measured plates (they fail 4.5:1 against 0.27 and 0.56).
  * Otherwise → fall through to the existing, unchanged monochromeLogoBuffer
  * path (every other brand's simple wordmark keeps today's behaviour exactly).
  *
@@ -945,6 +975,8 @@ async function prepareLogoForComposite(logoPng, { behindLuminance } = {}) {
       // composite onto black. A 50% white AA fringe stays (255,255,255)
       // and follows the same contrast rule as solid white. (Measured on
       // sharp 0.33.5: flatten({background:black}) is the premultiply path.)
+      // White vs Mai Tai 0.27 is 9.61:1 linearized, so a white fringe is
+      // NOT re-inked to a black outline on that plate.
       const rgb = await sharp(logoPng).removeAlpha().raw().toBuffer();
       // Mixed lockup (colour tiles / gradient + a low-chroma wordmark).
       // Colour-preserving the whole mark is right for the tiles and wrong
@@ -960,9 +992,11 @@ async function prepareLogoForComposite(logoPng, { behindLuminance } = {}) {
       //   inverted fix: 0.56 never fires, and light ink is what vanished.
       //
       // Re-ink only LOW-chroma covered pixels, and only when their contrast
-      // against the plate is below LOGO_MIN_INK_CONTRAST. Ink is whichever
-      // of black/white maximises contrast — NOT monochromeInkFor's 0.5
-      // split. High-chroma pixels stay untouched on purpose (see header).
+      // against the plate is below LOGO_MIN_INK_CONTRAST (true WCAG
+      // relative luminance, floor 4.5 — both, as a pair). Ink is whichever
+      // of black/white maximises contrast on that same metric — NOT
+      // monochromeInkFor's 0.5 split. High-chroma pixels stay untouched
+      // on purpose (see header).
       const ink = contrastingInkFor(behindLuminance);
       if (ink) {
         for (let i = 0; i < w * h; i++) {
