@@ -89,7 +89,11 @@ async function recoverImageAd({ ad, dryRun = false } = {}) {
       provider:   'atlas',
       model:      ad.imageGeneration?.model || 'unknown',
       brandId:    ad.brandId || null,
+      productId:  ad.productId || null,
       campaignId: ad.campaignId || null,
+      campaignRunId: Array.isArray(ad.campaignRunIds) && ad.campaignRunIds.length
+        ? ad.campaignRunIds[ad.campaignRunIds.length - 1]
+        : null,
       adId:       String(ad._id),
       costUsd:    Number(peek.price),
       costSource: 'actual',
@@ -432,7 +436,15 @@ async function maybeQcRecoveredPlate({ ad, brand, surface, dims, renderUrl }) {
       brandId,
       productId,
       adId,
-      campaignId: ad?.campaignId || null
+      campaignId: ad?.campaignId || null,
+      // Deliberately NOT `runId` (above) — that's the mint run, kept for the
+      // Slack/preview-URL link-back. Cost attribution matches this file's
+      // other two new hops (recoverImageAd, settleChargeState): the most
+      // recent run touching this ad, since that's the one actually active
+      // when this billable QC call fires.
+      campaignRunId: Array.isArray(ad?.campaignRunIds) && ad.campaignRunIds.length
+        ? ad.campaignRunIds[ad.campaignRunIds.length - 1]
+        : null
     });
     const verdict = adVisionQc.buildPersistedVerdict({
       passed: !!raw.pass,
@@ -564,7 +576,11 @@ async function settleChargeState({ ad } = {}) {
         provider:   'atlas',
         model:      ad.imageGeneration?.model || 'unknown',
         brandId:    ad.brandId || null,
+        productId:  ad.productId || null,
         campaignId: ad.campaignId || null,
+        campaignRunId: Array.isArray(ad.campaignRunIds) && ad.campaignRunIds.length
+          ? ad.campaignRunIds[ad.campaignRunIds.length - 1]
+          : null,
         adId:       String(ad._id),
         costUsd:    price,
         costSource: 'actual',

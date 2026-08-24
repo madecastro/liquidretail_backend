@@ -513,12 +513,13 @@
       "backendHash": "6fc231e0773ebf194f83e97d3b454660ba5d3da2193e4a7284ea03744cadd921",
       "backendSha": "149862fdcde316f7d22a706bf627d7ca9f9f091e",
       "status": "fork",
-      "reason": "generateForAd now has a resume-from-receipt gate (shouldResumeAttempt) so a re-claimed, receipt-holding ad does not double-bill Atlas Omni. Backend does not have this yet — adgen is the current render-owning service and the priority target; backend's own out-of-band bootRecoveryService sweep is its existing mitigation. Not a permanent fork: port to backend if/when the same re-claim exposure is prioritized there."
+      "reason": "generateForAd now has a resume-from-receipt gate (shouldResumeAttempt) so a re-claimed, receipt-holding ad does not double-bill Atlas Omni. Backend does not have this yet — adgen is the current render-owning service and the priority target; backend's own out-of-band bootRecoveryService sweep is its existing mitigation. Not a permanent fork: port to backend if/when the same re-claim exposure is prioritized there. Additionally carries cost-ledger attribution (brandId/productId/adId/campaignRunId) threaded independently per repo's real call graph — backend via pipelines/detect.js, adgen via renderer.js/generateForAd; not byte-identical by design."
     },
     "services/basePlateCropService.js": {
       "backendHash": "d41de1310b463a27ef7531770fa58353becbfa97bf54436e50fbf59f1496d3ee",
       "backendSha": "c24d6526ecbfcb3ea8cfa0b52b3a25a3556fa1d7",
-      "status": "synced"
+      "status": "fork",
+      "reason": "cost-ledger attribution (brandId/productId/adId/campaignRunId) threaded independently per repo's real call graph — backend via pipelines/detect.js, adgen via renderer.js/generateForAd; not byte-identical by design"
     },
     "services/blockClassifier.js": {
       "backendHash": "505108cca42df8bb500c620f032f1455f9023fa6cd7b5e554672a4fe1cb5d893",
@@ -540,7 +541,8 @@
     "services/brandEnrichmentService.js": {
       "backendHash": "b2a8ed1a36523961df246a107690ab614fa2cf72e24c6344c1e3f332faa01a05",
       "backendSha": "c31ffe9976670f02d87fb9e7824911d6fd848643",
-      "status": "synced"
+      "status": "fork",
+      "reason": "cost-ledger attribution: added brandId to the brand_enrichment_gpt chatCompletion meta (threaded from the enclosing runEnrichment(brand, brandId, run) param) — not byte-identical to backend by design, same class of change as the other attribution-fix reconciles"
     },
     "services/brandFontIngestService.js": {
       "backendHash": "4356d30c999bc14c23ba0d3a5fa5c5ae52fadcd8326871ba13024c15514071bf",
@@ -805,7 +807,8 @@
     "services/layoutInputService.js": {
       "backendHash": "aee859d5f6c2ac2a81eca98b967dd4632e2cb89b983068dc3129ef689d0afff5",
       "backendSha": "d8c133011275d62fa4133ed939b5e47fe5e90bdc",
-      "status": "synced"
+      "status": "fork",
+      "reason": "cost-ledger attribution (brandId/productId/adId/campaignRunId) threaded independently per repo's real call graph — backend via pipelines/detect.js, adgen via renderer.js/generateForAd; not byte-identical by design"
     },
     "services/llmError.js": {
       "backendHash": "589fd87ece50784d1620ac2db054d92911c880d21d2a34be4db3f4df8aaf7f8f",
@@ -873,7 +876,8 @@
     "services/overlayZoneService.js": {
       "backendHash": "a7ad2c22c50df2c4d2f7d6032449a26d9b60d0b5ffdd4d42617f1ad2bba983f4",
       "backendSha": "f727e3f95bd33615b11286e7644524e71150fd9c",
-      "status": "synced"
+      "status": "fork",
+      "reason": "cost-ledger attribution (brandId/productId/adId/campaignRunId) threaded independently per repo's real call graph — backend via pipelines/detect.js, adgen via renderer.js/generateForAd; not byte-identical by design"
     },
     "services/perProductReasons.js": {
       "backendHash": "4a528d2d7c3d57d3787e531be79521c5000e20fe9b322ef0231917903b49df10",

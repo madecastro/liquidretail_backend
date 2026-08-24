@@ -307,7 +307,7 @@ const DERIVATION_SCHEMA = {
 // ──────────────────────────────────────────────────────────────
 //  Public entry point
 // ──────────────────────────────────────────────────────────────
-async function buildLayoutInput({ mediaId, template, aspectRatio, options = {}, refresh = false }) {
+async function buildLayoutInput({ mediaId, template, aspectRatio, options = {}, refresh = false, campaignRunId = null, brandId = null, productId = null, adId = null }) {
   if (!registry.getNormalized(template)) throw badRequest(`Unknown template: ${template}`);
   const supportedRatios = registry.getSupportedAspectRatios(template);
   if (!supportedRatios.includes(aspectRatio))
@@ -384,7 +384,14 @@ async function buildLayoutInput({ mediaId, template, aspectRatio, options = {}, 
     }
   }
 
-  const derivation = await runDerivation(ctx, effectiveTemplate, aspectRatio, { ...options, overlayBoxes });
+  const derivation = await runDerivation(ctx, effectiveTemplate, aspectRatio, {
+    ...options,
+    overlayBoxes,
+    campaignRunId: campaignRunId || options.campaignRunId || null,
+    brandId:       brandId       || options.brandId       || null,
+    productId:     productId     || options.productId     || null,
+    adId:          adId          || options.adId          || null
+  });
   const input = await assembleInput(ctx, effectiveTemplate, aspectRatio, options, derivation, precomputedPlacement);
 
   await LayoutInputArtifact.findOneAndReplace(
@@ -898,7 +905,7 @@ function productReviewsOf(match) {
 // ──────────────────────────────────────────────────────────────
 //  Derivation LLM
 // ──────────────────────────────────────────────────────────────
-async function runDerivation(ctx, template, aspectRatio, options) {
+async function runDerivation(ctx, template, aspectRatio, options = {}) {
   if (!atlasConfigured() && !process.env.GEMINI_API_KEY) return fallbackDerivation(ctx, aspectRatio, options);
 
   const prompt = buildDerivationPrompt(ctx, template, aspectRatio, options);
@@ -909,7 +916,14 @@ async function runDerivation(ctx, template, aspectRatio, options) {
     // Hidden reasoning spends from max_tokens on the OpenAI-compat path
     // (no thinkingBudget knob) — the transport pads a reserve on top.
     const res = await chatCompletion(
-      { stage: 'layout_derivation', service: 'layoutInputService' },
+      {
+        stage: 'layout_derivation',
+        service: 'layoutInputService',
+        campaignRunId: options.campaignRunId || null,
+        brandId: options.brandId || ctx.media?.brandId || null,
+        productId: options.productId || null,
+        adId: options.adId || null
+      },
       {
         model: GEMINI_MODEL,
         messages: [{ role: 'user', content: prompt }],

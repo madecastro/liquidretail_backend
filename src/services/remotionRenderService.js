@@ -446,6 +446,9 @@ function payloadForChild(args) {
     format: args.format,
     brandName: args.brandName || null,
     adId: args.adId || null,
+    brandId: args.brandId || null,
+    productId: args.productId || null,
+    campaignRunId: args.campaignRunId || null,
     placementMode: args.placementMode || null,
     brand: args.brand
       ? { videoSettings: { titlePlacementMode: args.brand.videoSettings && args.brand.videoSettings.titlePlacementMode || null } }
@@ -461,7 +464,7 @@ function payloadForChild(args) {
  * via renderTitles once REMOTION_IN_CHILD=1. The parent never runs it for
  * production titles — only renderPreview stays in-process.
  */
-async function renderTitlesJob({ videoUrl, meta, spec, tokens, format, brandName = null, adId = null, placementMode = null, brand = null, faceKeepOut = null, platformFormat = null, safeZoneKey = null }) {
+async function renderTitlesJob({ videoUrl, meta, spec, tokens, format, brandName = null, adId = null, brandId = null, productId = null, campaignRunId = null, placementMode = null, brand = null, faceKeepOut = null, platformFormat = null, safeZoneKey = null }) {
     const compositionId = COMPOSITION_BY_FORMAT[format];
     if (!compositionId) throw new Error(`renderTitles: unknown format '${format}'`);
     const timings = {};
@@ -509,7 +512,7 @@ async function renderTitlesJob({ videoUrl, meta, spec, tokens, format, brandName
       let plateHints = null;
       if (String(process.env.TITLE_PLATE_SCAN || '').toLowerCase() !== 'off') {
         try {
-          plateHints = await analyzePlate(platePath, { durationSec: probe.durationSec });
+          plateHints = await analyzePlate(platePath, { durationSec: probe.durationSec, brandId, productId, adId, campaignRunId });
         } catch (err) {
           // Legibility intelligence must never fail a render; null keeps the
           // pre-fix behaviour (brand default ink).

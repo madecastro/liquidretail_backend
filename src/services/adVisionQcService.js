@@ -1084,7 +1084,8 @@ async function judgeRender({
   brandId = null,
   productId = null,
   adId = null,
-  campaignId = null
+  campaignId = null,
+  campaignRunId = null
 }, deps = {}) {
   const chat = deps.chatCompletion || chatCompletion;
   const model = deps.model || resolveQcModel();
@@ -1108,7 +1109,8 @@ async function judgeRender({
       brandId,
       productId,
       adId,
-      campaignId
+      campaignId,
+      campaignRunId
     },
     {
       model,
@@ -1384,6 +1386,7 @@ async function runPostRenderQc({
   productId = null,
   adId = null,
   campaignId = null,
+  campaignRunId = null,
   generate,
   uploadAttempt = null,
   judgeFn = null,
@@ -1512,7 +1515,8 @@ async function runPostRenderQc({
         brandId,
         productId,
         adId,
-        campaignId
+        campaignId,
+        campaignRunId
       });
     } catch (err) {
       const msg = (err && err.message) ? err.message : String(err || 'unknown');
@@ -1748,7 +1752,8 @@ async function judgeVideoRender({
   brandId = null,
   productId = null,
   adId = null,
-  campaignId = null
+  campaignId = null,
+  campaignRunId = null
 }, deps = {}) {
   const chat = deps.chatCompletion || chatCompletion;
   const model = deps.model || resolveQcModel();
@@ -1764,7 +1769,8 @@ async function judgeVideoRender({
       brandId,
       productId,
       adId,
-      campaignId
+      campaignId,
+      campaignRunId
     },
     {
       model,
@@ -1828,6 +1834,7 @@ async function runVideoPostRenderQc({
   productId = null,
   adId = null,
   campaignId = null,
+  campaignRunId = null,
   deliveredUrl = null,
   judgeFn = null
 } = {}) {
@@ -1870,7 +1877,7 @@ async function runVideoPostRenderQc({
   let verdict;
   try {
     verdict = await judge({
-      originalProductUrl, frames, brandName, brandId, productId, adId, campaignId
+      originalProductUrl, frames, brandName, brandId, productId, adId, campaignId, campaignRunId
     });
   } catch (err) {
     const msg = (err && err.message) ? err.message : String(err || 'unknown');

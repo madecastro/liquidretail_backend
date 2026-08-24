@@ -1819,6 +1819,7 @@ async function runVideoVisionQcForAd({ ad, deliveredUrl, brandName = null }) {
       brandId: ad.brandId || null,
       productId: ad.productId || null,
       adId: ad._id || null,
+      campaignRunId,
       deliveredUrl
     });
 
@@ -2226,6 +2227,11 @@ async function renderWithRemotionAndSave({ ad, brand, format, presetOverride = n
       platformFormat,
       brandName: brand?.name,
       adId:      String(ad._id),
+      brandId:   ad.brandId || null,
+      productId: ad.productId || null,
+      campaignRunId: Array.isArray(ad.campaignRunIds) && ad.campaignRunIds.length
+        ? ad.campaignRunIds[ad.campaignRunIds.length - 1]
+        : null,
       brand,
       placementMode: placement,
       // Cropped plate: face boxes must be mapped through cropRect (source→plate).
@@ -2258,6 +2264,11 @@ async function renderWithRemotionAndSave({ ad, brand, format, presetOverride = n
           platformFormat,
           brandName: brand?.name,
           adId:      String(ad._id),
+          brandId:   ad.brandId || null,
+          productId: ad.productId || null,
+          campaignRunId: Array.isArray(ad.campaignRunIds) && ad.campaignRunIds.length
+            ? ad.campaignRunIds[ad.campaignRunIds.length - 1]
+            : null,
           brand,
           placementMode: placement,
           // Raw plate = source frame; identity mapping (no cropRect).

@@ -1769,7 +1769,7 @@ async function waitForReframeUrl(mediaId, aspectKey, attempts = 3) {
 // skip / $0 pad). NEVER throws — any failure degrades to deterministic Cloudinary
 // crop so the ad pipeline keeps moving. Successful reframes (incl. exact / pad)
 // are persisted on Media.metadata.reframes[aspectKey] for reuse.
-async function reframeReferenceForAspect({ media, sourceUrl, aspectRatio, brand, subjectSide = null }) {
+async function reframeReferenceForAspect({ media, sourceUrl, aspectRatio, brand, subjectSide = null, brandId = null, productId = null, adId = null, campaignRunId = null }) {
   const cropUrl = () => cropImageUrlForAspect(sourceUrl, aspectRatio, brand);
   // Set when we find a cached asset from an OLDER ladder. We re-derive it, but
   // it stays the last resort: an old reframe is a real, correctly-shaped image,
@@ -2137,7 +2137,11 @@ async function reframeReferenceForAspect({ media, sourceUrl, aspectRatio, brand,
             const zones = await analyzeOverlayZones({
               imageUrl: resultUrl,
               label: `split-density[${aspectKey}]`,
-              ratio: aspectRatio
+              ratio: aspectRatio,
+              brandId: brandId || brand?._id || media?.brandId || null,
+              productId: productId || media?.metadata?.catalogProductId || null,
+              adId,
+              campaignRunId
             });
             const panelRectPct = copyPanelRectForSubjectSide(splitSide);
             const verdict = isCopyHalfCalm({
@@ -2584,7 +2588,8 @@ async function buildReferenceImages({
   // Phase 3 — when non-empty, build the identity list DIRECTLY from this
   // ordered Media-doc array (operator pick order). Position 0 = primary
   // seed. Skips seed+catalogMedias+fallback assembly entirely.
-  orderedReferenceMedia = null
+  orderedReferenceMedia = null,
+  brandId = null, productId = null, adId = null, campaignRunId = null
 }) {
   const requested = Number.isFinite(referenceCount) && referenceCount >= 1
     ? Math.min(referenceCount, MAX_REFERENCE_IMAGE_COUNT)
@@ -2740,7 +2745,11 @@ async function buildReferenceImages({
       media: id.mediaDoc,
       sourceUrl: id.sourceUrl,
       aspectRatio,
-      brand
+      brand,
+      brandId,
+      productId,
+      adId,
+      campaignRunId
     }).catch((err) => {
       console.warn(
         `⚠️  buildReferenceImages: reframe failed for ${id.mediaDoc?._id || id.sourceUrl} ` +
@@ -3890,7 +3899,7 @@ async function submitGeneration({ model, prompt, imageUrls, aspectRatio, caps, v
 // the non-fatal try/catch, the noteRenderIssue({...}) call, the timing
 // log ("derived in Nms"), and the post-build re-read keyed on
 // {mediaId, productId}.
-async function refreshStaleLayoutInput({ layoutInput, ad, media, brand, product, categories, campaign, targetAspect }) {
+async function refreshStaleLayoutInput({ layoutInput, ad, media, brand, product, categories, campaign, targetAspect, campaignRunId = null }) {
   const lpEmpty = !layoutInput?.input || Object.keys(layoutInput.input || {}).length === 0;
   const lpStale = !lpEmpty && layoutInput.schemaVersion !== INPUT_SCHEMA_VERSION;
   if ((lpEmpty || lpStale) && ad.productId) {
@@ -3903,6 +3912,13 @@ async function refreshStaleLayoutInput({ layoutInput, ad, media, brand, product,
         mediaId:     media._id,
         template:    tmpl,
         aspectRatio: targetAspect,
+        campaignRunId: campaignRunId
+          || (Array.isArray(ad.campaignRunIds) && ad.campaignRunIds.length
+            ? ad.campaignRunIds[ad.campaignRunIds.length - 1]
+            : null),
+        brandId:     ad.brandId || null,
+        productId:   ad.productId || null,
+        adId:        ad._id || null,
         options: {
           campaignKind:  campaign?.kind || 'product',
           variantKind:   'product_image',
@@ -4079,7 +4095,7 @@ async function generateForAd({
   // the raw video render aspect. Non-fatal on failure.
   let layoutInput = layoutInputInitial;
   layoutInput = await refreshStaleLayoutInput({
-    layoutInput, ad, media, brand, product, categories, campaign, targetAspect
+    layoutInput, ad, media, brand, product, categories, campaign, targetAspect, campaignRunId
   });
 
   const lpInput    = layoutInput?.input || null;
@@ -4149,7 +4165,11 @@ async function generateForAd({
     referenceCount,
     brand,
     // Lifestyle: ignore multi-pick ordered stacks — seed only (media at pos 0).
-    orderedReferenceMedia: lifestylePlan.forceSeedOnly ? null : orderedReferenceMedia
+    orderedReferenceMedia: lifestylePlan.forceSeedOnly ? null : orderedReferenceMedia,
+    brandId: ad.brandId || media.brandId || null,
+    productId: ad.productId || product?._id || null,
+    adId: ad._id || null,
+    campaignRunId: campaignRunId || null
   });
   if (!imageUrls.length) throw new Error(`atlasVideo[ad=${ad._id}]: no reference images available`);
 

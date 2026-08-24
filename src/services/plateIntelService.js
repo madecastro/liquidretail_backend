@@ -172,7 +172,7 @@ async function analyzeFrameBands(framePath, opts = {}) {
   return bands;
 }
 
-async function semanticScan(frames, hints) {
+async function semanticScan(frames, hints, { brandId = null, productId = null, adId = null, campaignRunId = null } = {}) {
   // Atlas gateway (Gemini served OpenAI-compatible; direct Google
   // OpenAI-compat endpoint as fallback inside the transport).
   const { chatCompletion } = require('./atlasLlmService');
@@ -185,7 +185,7 @@ async function semanticScan(frames, hints) {
     content.push({ type: 'image_url', image_url: { url: `data:image/png;base64,${(await fsp.readFile(f.path)).toString('base64')}` } });
   }
   const res = await chatCompletion(
-    { stage: 'title_plate_scan', service: 'plateIntelService', visionImages: frames.length },
+    { stage: 'title_plate_scan', service: 'plateIntelService', visionImages: frames.length, brandId, productId, adId, campaignRunId },
     {
       model: process.env.TITLE_SCAN_MODEL || 'gemini-2.5-flash',
       messages: [{ role: 'user', content }],
@@ -235,7 +235,7 @@ function resolveTitlePlacementMode({ placementMode = null, brand = null } = {}) 
  * white-on-white title text. Scan depth (not whether it runs at all)
  * is controlled by TITLE_PLATE_SCAN ('basic' default | 'gemini' | 'off').
  */
-async function analyzePlate(platePath, { durationSec = 8, isImage = false, panelSide = null, xRange = null } = {}) {
+async function analyzePlate(platePath, { durationSec = 8, isImage = false, panelSide = null, xRange = null, brandId = null, productId = null, adId = null, campaignRunId = null } = {}) {
   const mode = (process.env.TITLE_PLATE_SCAN || 'basic').toLowerCase();
   if (mode === 'off') return null;
   const tmpDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'platescan_'));
@@ -272,7 +272,7 @@ async function analyzePlate(platePath, { durationSec = 8, isImage = false, panel
 
     if (mode === 'gemini') {
       try {
-        await semanticScan(frames, hints);
+        await semanticScan(frames, hints, { brandId, productId, adId, campaignRunId });
       } catch (e) {
         console.warn(`🔎 plateIntel: gemini scan failed (${e.message}) — using basic hints`);
       }

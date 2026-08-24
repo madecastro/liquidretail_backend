@@ -758,6 +758,12 @@ async function renderStatic(ad) {
     template:    ad.template,
     aspectRatio: ad.aspectRatio,
     refresh:     false,
+    campaignRunId: Array.isArray(ad.campaignRunIds) && ad.campaignRunIds.length
+      ? ad.campaignRunIds[ad.campaignRunIds.length - 1]
+      : null,
+    brandId:     ad.brandId ? String(ad.brandId) : null,
+    productId:   ad.productId ? String(ad.productId) : null,
+    adId,
     options: {
       campaignKind:       ad.campaignKind || null,
       promotionalDetails: null,

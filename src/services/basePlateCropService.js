@@ -395,10 +395,10 @@ function parseBox(raw) {
 }
 
 /** One frame -> { subject, face } | null. Failures return null (a frame that couldn't vote). */
-async function detectFrameBoxes(frameUrl, meta) {
+async function detectFrameBoxes(frameUrl, { campaignRunId = null, brandId = null, productId = null, adId = null, ...meta } = {}) {
   try {
     const response = await chatCompletion(
-      { stage: 'base_plate_crop', service: 'basePlateCropService', ...meta },
+      { stage: 'base_plate_crop', service: 'basePlateCropService', campaignRunId, brandId, productId, adId, ...meta },
       {
         model: 'gpt-4.1', // legacy id -> atlasModelMap -> openai/gpt-5.6-terra on the Atlas transport
         messages: [
@@ -439,7 +439,7 @@ async function detectFrameBoxes(frameUrl, meta) {
  * 640-wide for bandwidth; the model still returns fractions of the full
  * frame, so no pixel conversion is needed for keep-out mapping.
  */
-async function detectClipBoxes(sourceUrl, durationSec, meta) {
+async function detectClipBoxes(sourceUrl, durationSec, { campaignRunId = null, brandId = null, productId = null, adId = null, ...meta } = {}) {
   const frames = buildFrameUrls(sourceUrl, durationSec, { width: 640, isReel: true });
   if (!frames.length) {
     return { subject: null, head: null, frames: 0, faceHits: 0, envelope: null, faceSamples: [] };
@@ -449,7 +449,7 @@ async function detectClipBoxes(sourceUrl, durationSec, meta) {
   // Serial, deliberately: 3-4 frames, and vision RPS buckets are shared with the rest of the
   // pipeline. Latency (~2-6s total) is fine — this runs post-generation, pre-titling, not in any
   // interactive request path.
-  for (const f of frames) results.push(await detectFrameBoxes(f.url, meta));
+  for (const f of frames) results.push(await detectFrameBoxes(f.url, { campaignRunId, brandId, productId, adId, ...meta }));
 
   const frameBoxes = results.map((r) => r?.subject ?? null);
   const frameFaces = results.map((r) => r?.face ?? null);
@@ -583,6 +583,10 @@ async function resolveBasePlateVideoUrl({ ad, format }) {
     const durationSec = Number(ad.videoDurationSec) > 0 ? Number(ad.videoDurationSec) : 8;
     const det = await internals.detectClipBoxes(ad.veoVideoUrl, durationSec, {
       brandId: ad.brandId, campaignId: ad.campaignId, adId: ad._id, mediaId: ad.mediaId,
+      productId: ad.productId || null,
+      campaignRunId: Array.isArray(ad.campaignRunIds) && ad.campaignRunIds.length
+        ? ad.campaignRunIds[ad.campaignRunIds.length - 1]
+        : null,
     });
 
     const decision = decideBasePlateCrop({
@@ -800,6 +804,10 @@ async function ensureFaceDetectionForKeepOut({ ad, format }) {
     const dims = await internals.measureDeliveryDims(ad.veoVideoUrl);
     const det = await internals.detectClipBoxes(ad.veoVideoUrl, durationSec, {
       brandId: ad.brandId, campaignId: ad.campaignId, adId: ad._id, mediaId: ad.mediaId,
+      productId: ad.productId || null,
+      campaignRunId: Array.isArray(ad.campaignRunIds) && ad.campaignRunIds.length
+        ? ad.campaignRunIds[ad.campaignRunIds.length - 1]
+        : null,
     });
     const extras = detectionExtras(det, dims);
     // Merge into existing basePlate when present (preserve crop videoUrl/rect/reason).

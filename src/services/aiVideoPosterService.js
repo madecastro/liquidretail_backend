@@ -80,7 +80,7 @@ async function generatePosterForAd({ adId }) {
   if (!adId)      throw new Error('adId required');
 
   const ad = await Ad.findById(adId)
-    .select('_id brandId kind renderUrl posterUrl mediaId productId')
+    .select('_id brandId kind renderUrl posterUrl mediaId productId campaignRunIds')
     .lean();
   if (!ad)                         return { skipped: true, reason: 'Ad not found' };
   if (ad.kind !== 'video')         return { skipped: true, reason: 'Ad is not video' };
@@ -100,6 +100,10 @@ async function generatePosterForAd({ adId }) {
         brandId:    ad.brandId,
         mediaId:    ad.mediaId,
         productId:  ad.productId,
+        adId:       String(ad._id),
+        campaignRunId: Array.isArray(ad.campaignRunIds) && ad.campaignRunIds.length
+          ? ad.campaignRunIds[ad.campaignRunIds.length - 1]
+          : null,
         cacheKey:   String(ad._id),
         visionImages: 1
       },
