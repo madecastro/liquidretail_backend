@@ -265,8 +265,13 @@ try {
   delete process.env.PMAX_STATIC_PLATFORM_NOTES;
   const drawCta = (surfaceKey, intentKey) =>
     S.resolveDrawCta({ surfaceKey, policy: S.SURFACE_POLICY[surfaceKey], intentKey });
-  check('C8 PMax grants NO in-image CTA to social_proof_led',
-    drawCta('pmax_square_1_1', 'social_proof_led') === false);
+  // UPDATED 2026-08-24 (owner decision, PMAX_STATIC_CTA_ALL_INTENTS default
+  // ON): PMax statics now draw the in-image CTA on EVERY intent, so this
+  // inverts rather than being deleted — a later unreviewed flip back must
+  // fail a test immediately. The old expectation is pinned as the flag-OFF
+  // arm by scripts/verifyPmaxDrawCtaSocialProof.js.
+  check('C8 PMax grants the in-image CTA to social_proof_led (2026-08-24 owner decision)',
+    drawCta('pmax_square_1_1', 'social_proof_led') === true);
   check('C9 PMax grants the in-image CTA to objection_resolved',
     drawCta('pmax_square_1_1', 'objection_resolved') === true);
   check('C10 Meta is unaffected — both intents keep their CTA',
@@ -313,14 +318,25 @@ try {
     em.includes('the rating') || em.includes('the rating and how many people gave it'),
     RESIDUAL_1_ACTION);
 
-  check('D3 TRIPWIRE residual 2 still OPEN (PMax CTA allowlist excludes social_proof_led)',
-    drawCta('pmax_square_1_1', 'social_proof_led') === false,
-    'NOT A BUG IN THIS HARNESS — READ THIS. Residual 2 (resolveDrawCta grants the PMax ' +
-    'in-image CTA only to objection_resolved) appears CLOSED, likely by ' +
-    'fix/pmax-drawcta-social-proof. That was the other precondition for widening the Director ' +
-    'reservation gate to fire on a quote alone. Re-read correction 1 in ' +
-    'src/services/aiCreativeDirectorService.js, decide the gate question with the owner, then ' +
-    'update this pin in the SAME commit as the decision.');
+  // TRIPWIRE FIRED AND ACKNOWLEDGED — 2026-08-24. Residual 2 is now CLOSED by
+  // owner decision (PMAX_STATIC_CTA_ALL_INTENTS): PMax grants the in-image CTA
+  // on every intent, social_proof_led included. Per this harness's own
+  // instructions the pin is updated in the same commit as the decision.
+  //
+  // WHAT THIS DOES NOT DECIDE — read before widening anything. Closing this
+  // residual was only ONE of the two preconditions for widening the Director
+  // reservation gate to fire on a quote alone. That gate
+  // (aiCreativeDirectorService.js, correction 1) is UNTOUCHED and remains an
+  // explicit, unstarted owner call — the PMax CTA decision is not a green
+  // light for it, and the D-group markers below still pin the gate's current
+  // rating-only reasoning. Do not read a closed residual 2 as consent.
+  check('D3 residual 2 CLOSED — PMax CTA allowlist now includes social_proof_led',
+    drawCta('pmax_square_1_1', 'social_proof_led') === true,
+    'Residual 2 was CLOSED on 2026-08-24 and this pin was inverted to match. If it is red now, ' +
+    'the PMax CTA grant has been REVERTED (or PMAX_STATIC_CTA_ALL_INTENTS was set false in this ' +
+    'environment) — that is a change to a decided behaviour, not a harness bug. The Director ' +
+    'reservation-gate question (correction 1 in src/services/aiCreativeDirectorService.js) is ' +
+    'still open and was NOT decided by that change.');
 
   // Each marker anchors one half of the reasoning the comment must keep: the
   // original recorded mechanism, the contingency that was missing the first time,

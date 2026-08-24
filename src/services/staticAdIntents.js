@@ -338,8 +338,9 @@ function geometryBlock(s) {
       : `The platform covers the top ${s.platformReservePx.top}px and bottom ${s.platformReservePx.bottom}px of the frame with its own interface.`);
   }
   // Element-agnostic on purpose. Naming "the CTA" here asserted a CTA exists,
-  // which contradicted the absence list on any surface that strips it (PMax
-  // non-conversion today; Stories historically) — the same empty-slot defect
+  // which contradicted the absence list on any surface that strips it
+  // (Stories; PMax too before the 2026-08-24 CTA decision, and still under
+  // PMAX_STATIC_CTA_ALL_INTENTS=false) — the same empty-slot defect
   // that produced a fabricated quote in v1.
   //
   // "Scrim or panel" named explicitly (2026-08-19) — measured live on a
@@ -412,14 +413,14 @@ function describeSurfaces() {
  *   - reels video-only ....... from platformFormats.kinds (authoritative here)
  *   - stories link sticker ... owner-stated, and REAFFIRMED 2026-08-13 after a
  *     round-trip through the opposite conclusion
- *   - pmax platform CTA ...... the platform draws its own CTA on most
- *     placements; the SURFACE_POLICY.drawCta:true values below are the
- *     Phase A / flag-off baseline. With PMAX_STATIC_PLATFORM_NOTES on,
- *     resolveDrawCta rewrites pmax_* to intent-dependent: true for
- *     objection_resolved / conversion, and (2026-08-24 regression fix) also
- *     true for a quote-only social_proof_led render — see
- *     PMAX_DRAWCTA_QUOTE_ONLY_SOCIAL_PROOF at resolveDrawCta's definition.
- *     Meta is never rewritten.
+ *   - pmax platform CTA ...... SUPERSEDED 2026-08-24. The claim that Google
+ *     draws its own CTA on most placements was the original reason pmax_*
+ *     suppressed the burned-in button for every intent but the conversion
+ *     one. It was never owner-confirmed and the live corpus contradicted its
+ *     effect, so pmax_* now simply keeps the SURFACE_POLICY.drawCta:true
+ *     values below — no intent- or data-dependent rewrite at all. See
+ *     PMAX_STATIC_CTA_ALL_INTENTS at resolveDrawCta's definition; setting it
+ *     false restores the old allowlist. Meta is never rewritten either way.
  *   - feed draws its own ..... INFERRED. Meta renders a CTA button beneath the
  *     image, so an in-image button is arguably duplicative, but the repo brief
  *     says "CTA should land within the first frame". Left as draws-own-CTA
@@ -437,9 +438,10 @@ const SURFACE_POLICY = {
   meta_stories_9_16: { static: true,  drawCta: false, maxTextElements: 3,
                        ctaNote: 'the platform supplies the link affordance' },
   pmax_16_9:         { static: true,  drawCta: true,  maxTextElements: 4 },
-  // Phase A live PMax statics. drawCta:true is the SURFACE default and the
-  // flag-off baseline; with PMAX_STATIC_PLATFORM_NOTES on, resolveDrawCta
-  // rewrites it intent-by-intent (true only for objection_resolved).
+  // Phase A live PMax statics. drawCta:true is the SURFACE default, and since
+  // the 2026-08-24 owner decision (PMAX_STATIC_CTA_ALL_INTENTS) it is also
+  // what resolveDrawCta returns — every intent draws. Turning that switch off
+  // restores the old intent-by-intent allowlist.
   // maxTextElements 3 on the small 1.91:1 canvas — dense text hurts there.
   pmax_landscape_1_91_1: { static: true, drawCta: true, maxTextElements: 3 },
   pmax_square_1_1:       { static: true, drawCta: true, maxTextElements: 4 },
@@ -554,8 +556,69 @@ function resolvePlatformNotes(surfaceKey, { preserve = false } = {}) {
  * widening itself is off — quote-only data can then never resolve to
  * social_proof_led in the first place, so this branch is simply never hit.
  * Two independent, revertable levers, byte-identical off either way.
+ *
+ * ⚠️ INERT ON TODAY'S DEFAULTS — READ BEFORE FLIPPING THIS. Since the
+ * 2026-08-24 owner decision, PMAX_STATIC_CTA_ALL_INTENTS (default ON) returns
+ * the per-surface SURFACE_POLICY boolean for every pmax_* intent BEFORE
+ * resolveDrawCta ever reaches the branch below. Setting this flag to false
+ * therefore changes NOTHING while that switch is on — including the "restores
+ * the exact pre-fix allowlist" claim in the paragraph above, which is true
+ * only in the PMAX_STATIC_CTA_ALL_INTENTS=false world. MEASURED:
+ *
+ *   ALL_INTENTS=true  QUOTE_ONLY=true  -> quoteOnly=true  rated=true
+ *   ALL_INTENTS=true  QUOTE_ONLY=false -> quoteOnly=true  rated=true   <- inert
+ *   ALL_INTENTS=false QUOTE_ONLY=true  -> quoteOnly=true  rated=false
+ *   ALL_INTENTS=false QUOTE_ONLY=false -> quoteOnly=false rated=false
+ *
+ * To reach this lever at all, set PMAX_STATIC_CTA_ALL_INTENTS=false first.
  */
 const PMAX_DRAWCTA_QUOTE_ONLY_SOCIAL_PROOF = process.env.PMAX_DRAWCTA_QUOTE_ONLY_SOCIAL_PROOF !== 'false';
+
+/**
+ * PMax STATIC CTA, EVERY INTENT — kill switch, default ON.
+ *
+ * Owner decision 2026-08-24, and a deliberate SUPERSET of
+ * PMAX_DRAWCTA_QUOTE_ONLY_SOCIAL_PROOF above (PR #42). That fix restored the
+ * button for the one data shape PR #34 had regressed — a social_proof_led
+ * render carrying a quote but no rating — and said so explicitly: it was
+ * "deliberately narrower than adding social_proof_led to the allowlist
+ * outright", leaving the rated population for an owner call. This is that
+ * call, and it goes further than the allowlist question: PMax statics draw
+ * the CTA on EVERY intent.
+ *
+ * WHY. The `intentKey === 'objection_resolved'` allowlist was never an owner
+ * decision about proof-led creative. It arrived whole with the PMax
+ * activation as a class rule ("Google draws its own button, so suppress ours
+ * except on the conversion intent"), its body was never revisited, and
+ * nothing in either repo's history records a reason proof-led specifically
+ * should go without one. Meanwhile INTENTS.social_proof_led.ownerBrief ends
+ * "Clear Shop Now CTA.", and the PMax VIDEO path burns a button in on every
+ * intent precisely because YouTube/Display supply none (backend
+ * scripts/verifyProofBeat.js M1: "non-Meta surfaces (pmax/YouTube) still
+ * need their own CTA").
+ *
+ * MEASURED on the live corpus before deciding — 69 PMax statics carrying an
+ * intentResolution stamp, 2026-08-20 → 2026-08-24: only 7 drew a CTA, and
+ * every one of those 7 was a social_proof_led render whose proof was too thin
+ * to hold the intent and descended to objection_resolved. The rule therefore
+ * REWARDED FAILED PROOF with a button and denied it to proof that held. PR
+ * #42 closed the descent half; the rated population — 11 of the 69 — was
+ * still silently button-less. This closes the rest.
+ *
+ * Flag ON: `pmax_*` keeps its own SURFACE_POLICY.drawCta boolean, exactly the
+ * way Meta always has, with no intent- or data-dependent rewrite in either
+ * direction. `false` restores the allowlist as it stood immediately before
+ * this change — conversion intent PLUS PR #42's quote-only branch — BYTE-
+ * IDENTICALLY. It deliberately does NOT revert further: #42 is a separate
+ * decision and this switch must not silently undo it.
+ *
+ * Separate from PMAX_STATIC_PLATFORM_NOTES, which also governs the
+ * platform-notes block — reverting the CTA through that one would drop the
+ * notes too. NOT a contradiction risk: PLATFORM_NOTES.pmax speaks only about
+ * cropping, standalone legibility and thumbnail size, never about who
+ * supplies a CTA (checked against the PR #61 self-contradictory-prompt class).
+ */
+const PMAX_STATIC_CTA_ALL_INTENTS = process.env.PMAX_STATIC_CTA_ALL_INTENTS !== 'false';
 
 /**
  * Effective drawCta for a surface + resolved intent.
@@ -564,21 +627,27 @@ const PMAX_DRAWCTA_QUOTE_ONLY_SOCIAL_PROOF = process.env.PMAX_DRAWCTA_QUOTE_ONLY
  * ctaNote 'the platform supplies the link affordance', and the absences /
  * density path keys on that boolean. Do not rewrite Meta.
  *
- * PMax, flag ON only: the platform supplies the CTA affordance on most
- * placements, so a burned-in button is usually redundant — same *mechanism*
- * Stories used to use (strip before applyDensity + absence line). Stories
- * itself now draws the button (2026-08-12 delivered-ad defect). Exception:
- * conversion-flavoured creatives (objection_resolved, what ai_promotional
- * maps to) still want the in-image CTA. Flag OFF restores the Phase A
- * per-surface boolean (all pmax_* true).
+ * PMax: no intent- or data-dependent rewrite either, as of the owner decision
+ * 2026-08-24. Google's placements do not reliably supply a CTA affordance —
+ * the PMax VIDEO path burns one in on every intent for exactly that reason —
+ * so `pmax_*` keeps its own SURFACE_POLICY boolean too. All four pmax_*
+ * statics carry drawCta:true, so all four draw the button.
  *
- * Second exception, PMAX_DRAWCTA_QUOTE_ONLY_SOCIAL_PROOF (see above): a
- * social_proof_led render carrying a quote but no rating is the same
- * risk-reversal-quote ad objection_resolved was built for — it only wears
- * the social_proof_led label because eligibility now lets a quote alone
- * qualify. `data` is optional and defaults to `{}` so any existing caller
- * that omits it keeps today's rating-gated (false) behaviour rather than
- * throwing.
+ * HISTORY, so the old rule is never re-derived as intentional. Until
+ * 2026-08-24 this returned true only for `objection_resolved` (plus, from PR
+ * #42, a social_proof_led render with a quote and no rating), suppressing the
+ * button for every rated social_proof_led / product_first_lifestyle /
+ * brand_led PMax static. See PMAX_STATIC_CTA_ALL_INTENTS above for what was
+ * measured and why that was wrong. Setting that flag false restores the
+ * whole pre-change allowlist — BOTH arms, PR #42 included — byte-identically.
+ *
+ * (The 2026-08-12 Stories CTA flip is NOT precedent here: it was reverted the
+ * next day on owner reaffirmation, because Instagram really does supply a
+ * link sticker. meta_stories_9_16 stays drawCta:false. That is a surface fact
+ * about Instagram, not a claim about which intents deserve a button.)
+ *
+ * `data` stays in the signature and stays optional: the flag-off arm still
+ * reads it, and an existing caller that omits it must not throw.
  */
 function resolveDrawCta({ surfaceKey, policy, intentKey, data = {} }) {
   if (!policy) return true;
@@ -586,12 +655,14 @@ function resolveDrawCta({ surfaceKey, policy, intentKey, data = {} }) {
   if (!PMAX_STATIC_PLATFORM_NOTES) return policy.drawCta;
   // Meta (and any non-pmax) → never rewrite.
   if (destinationForSurface(surfaceKey) !== 'pmax') return policy.drawCta;
-  // PMax + flag on: intent-dependent.
+  // PMax, CTA switch ON → the per-surface boolean, same as Meta.
+  if (PMAX_STATIC_CTA_ALL_INTENTS) return policy.drawCta;
+  // ── flag OFF below: the pre-2026-08-24 allowlist, byte-identical ──────
   if (intentKey === 'objection_resolved') return true;
-  // Quote-only social_proof_led (no rating) — the regression fix. Requires
-  // BOTH a missing rating AND a present quote so this can only ever fire for
-  // the specific data shape it exists to serve, never merely because a
-  // caller forgot to pass `data`.
+  // Quote-only social_proof_led (no rating) — PR #42's regression fix.
+  // Requires BOTH a missing rating AND a present quote so this can only ever
+  // fire for the specific data shape it exists to serve, never merely because
+  // a caller forgot to pass `data`.
   if (PMAX_DRAWCTA_QUOTE_ONLY_SOCIAL_PROOF && intentKey === 'social_proof_led' && !data.rating && data.quote) {
     return true;
   }
@@ -1477,10 +1548,12 @@ function buildPrompt({ intentKey, data, product, surface, seedStyle = null, vari
   if (!resolved.key) return { error: resolved.why };
   const spec = resolved.spec;
 
-  // Intent-aware CTA for pmax only (flag on). Meta and flag-off keep the
-  // SURFACE_POLICY object as-is so absences / density / returned policy stay
-  // byte-identical to today. When suppressed, reuse the Stories path:
-  // strip CTA before applyDensity + absence line with ctaNote.
+  // Effective CTA policy. With PMAX_STATIC_CTA_ALL_INTENTS on (the default)
+  // this equals policy.drawCta on every surface, so `effectivePolicy` IS the
+  // SURFACE_POLICY object and absences / density / the returned policy are
+  // untouched. Only the flag-off arm can still suppress on pmax, and when it
+  // does it reuses the Stories path: strip CTA before applyDensity + absence
+  // line with ctaNote.
   const drawCta = resolveDrawCta({ surfaceKey: surface, policy, intentKey: resolved.key, data });
   const effectivePolicy = drawCta === policy.drawCta
     ? policy
@@ -1508,8 +1581,9 @@ function buildPrompt({ intentKey, data, product, surface, seedStyle = null, vari
   const s = computeSurface(surface);
 
   /**
-   * Zero surviving text is legitimate — a surface that strips CTA (PMax
-   * non-conversion) with no proof data is just a product image. But emitting
+   * Zero surviving text is legitimate — a surface that strips CTA (Stories,
+   * or PMax under PMAX_STATIC_CTA_ALL_INTENTS=false) with no proof data is
+   * just a product image. But emitting
    * the "SET EXACTLY THIS TEXT" heading above an empty list recreates the v1
    * defect exactly: an instruction pointing at a slot with nothing in it.
    * State the absence of text as a positive instruction instead.

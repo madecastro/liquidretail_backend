@@ -53,6 +53,31 @@
 'use strict';
 const path = require('path');
 const { execFileSync } = require('child_process');
+
+/**
+ * SUPERSEDED IN THE DEFAULT WORLD — 2026-08-24 owner decision. This harness
+ * pins PR #42's ALLOWLIST: the PMax in-image CTA granted to objection_resolved
+ * plus a quote-only social_proof_led, and withheld from everything else. That
+ * allowlist is no longer what ships. PMAX_STATIC_CTA_ALL_INTENTS (default ON)
+ * makes every pmax_* static draw the button on every intent, and #42's
+ * allowlist is now reachable only with that switch OFF.
+ *
+ * So this file pins the OFF arm, deliberately and explicitly, rather than
+ * being deleted — same discipline as the Stories CTA revert (#200), which
+ * inverted its harness sites instead of removing them so a later unreviewed
+ * flip fails a test immediately. Everything below still protects the #42
+ * branch: it is the revert path, and PMAX_STATIC_CTA_ALL_INTENTS's own
+ * contract is that turning it off restores #42 byte-identically.
+ *
+ * The ON arm — what actually ships — is pinned by
+ * scripts/verifyPmaxCtaAllIntents.js, which also asserts from the other side
+ * that this branch survives the OFF arm (its check C2e).
+ *
+ * MUST be set before requiring staticAdIntents: the flag is read once at
+ * module load. Child processes spawned below inherit it, which is intended.
+ */
+process.env.PMAX_STATIC_CTA_ALL_INTENTS = 'false';
+
 const intents = require('../src/services/staticAdIntents');
 
 let pass = 0;
