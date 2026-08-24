@@ -36,6 +36,7 @@ const csstree = require('css-tree');
 // Required as a namespace (not destructured) so tests can monkey-patch
 // uploadBufferToCloudinary without hitting the real Cloudinary API.
 const cloudinaryService = require('./cloudinaryService');
+const { probeVariableWeightAxis } = require('./fontAxisProbe');
 
 const UA =
   'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36';
@@ -933,6 +934,44 @@ async function ingestBrandFontsInner(brand, run) {
 
     try {
       const buf = await downloadFontFile(face.url, { referer: pageUrl });
+
+      // THE FILE OUTRANKS THE CSS ON THE WEIGHT AXIS — but only when the CSS
+      // said nothing. A `@font-face` may legally omit `font-weight` entirely,
+      // and for a VARIABLE font that omission is not "this face is 400", it is
+      // "the author did not say". Pelagic Gear is the measured case:
+      //
+      //   @font-face { font-family: "ArchivoV";
+      //     src: url(.../Archivo-Variable.woff2) format('woff2');
+      //     font-display: swap; }
+      //
+      // parseWeight() returns its 400 default and parseWeightRange() returns
+      // {null,null}, so a wght 100..900 file was persisted as a static 400 cut.
+      // fontResolverService.resolveCustomFont gates the variable path on those
+      // two fields being finite, so EVERY weight request collapsed to 400 —
+      // and headings ask for 700, which meant every headline in every render
+      // was drawn with SYNTHETIC bold instead of the brand's real bold.
+      //
+      // Only fills a GAP: an explicit `font-weight: 100 900` still wins, so a
+      // deliberate author narrowing (shipping a variable file but declaring a
+      // sub-range) is preserved rather than widened back out.
+      const axis = probeVariableWeightAxis(buf);
+      if (axis && !Number.isFinite(face.weightMin) && !Number.isFinite(face.weightMax)) {
+        entryBase.weightMin = axis.weightMin;
+        entryBase.weightMax = axis.weightMax;
+        // Re-seat the nominal weight on the axis. It is what matchCustomFont
+        // sorts by when a request falls OUTSIDE the range, and the CSS-derived
+        // 400 can sit outside the file's own range entirely (a 600..900 display
+        // cut would be labelled 400 and picked for body text). Clamp rather
+        // than adopt the axis default blindly, so a real declared weight inside
+        // the range is left alone.
+        entryBase.weight = Math.min(Math.max(face.weight, axis.weightMin), axis.weightMax);
+        console.log(
+          `🔤 brand font: "${face.family}" is VARIABLE (wght ${axis.weightMin}..${axis.weightMax}, ` +
+          `default ${axis.weightDefault}) — CSS declared no range, using the file's axis` +
+          (entryBase.weight !== face.weight ? ` [nominal ${face.weight} → ${entryBase.weight}]` : '')
+        );
+      }
+
       // 'i' suffix keeps italic cuts from colliding with the roman at the
       // same weight; extension lives IN the public_id for raw resources so
       // the delivered URL keeps its .woff2/.ttf suffix.
@@ -940,7 +979,7 @@ async function ingestBrandFontsInner(brand, run) {
       const uploaded = await cloudinaryService.uploadBufferToCloudinary(buf, {
         folder: 'liquidretail/brand_fonts',
         resourceType: 'raw',
-        publicId: `${brandId}-${familySlug(face.family)}-${face.weight}${styleSuffix}.${face.format}`,
+        publicId: `${brandId}-${familySlug(face.family)}-${entryBase.weight}${styleSuffix}.${face.format}`,
         // Re-ingest must refresh the mirror — the helper defaults to
         // overwrite:false, which silently returns the OLD asset forever.
         overwrite: true
