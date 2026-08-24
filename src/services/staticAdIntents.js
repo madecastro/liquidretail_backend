@@ -415,8 +415,11 @@ function describeSurfaces() {
  *   - pmax platform CTA ...... the platform draws its own CTA on most
  *     placements; the SURFACE_POLICY.drawCta:true values below are the
  *     Phase A / flag-off baseline. With PMAX_STATIC_PLATFORM_NOTES on,
- *     resolveDrawCta rewrites pmax_* to intent-dependent (true only for
- *     objection_resolved / conversion). Meta is never rewritten.
+ *     resolveDrawCta rewrites pmax_* to intent-dependent: true for
+ *     objection_resolved / conversion, and (2026-08-24 regression fix) also
+ *     true for a quote-only social_proof_led render — see
+ *     PMAX_DRAWCTA_QUOTE_ONLY_SOCIAL_PROOF at resolveDrawCta's definition.
+ *     Meta is never rewritten.
  *   - feed draws its own ..... INFERRED. Meta renders a CTA button beneath the
  *     image, so an in-image button is arguably duplicative, but the repo brief
  *     says "CTA should land within the first frame". Left as draws-own-CTA
@@ -520,6 +523,41 @@ function resolvePlatformNotes(surfaceKey, { preserve = false } = {}) {
 }
 
 /**
+ * PMAX DRAWCTA — QUOTE-ONLY SOCIAL PROOF — kill switch, default ON.
+ *
+ * Regression fix, 2026-08-24. A sibling change widens
+ * `INTENTS.social_proof_led.eligible` so a usable customer quote alone
+ * (no numeric rating) is enough for that intent to run — see
+ * `SOCIAL_PROOF_QUOTE_ELIGIBLE` in this file's history / the PR that added
+ * it. Before that widening, quote-only data failed social_proof_led's
+ * rating-only eligibility and fell through FALLBACK_ORDER to
+ * objection_resolved instead — which `resolveDrawCta` already allowlists for
+ * the in-image PMax CTA. After the widening, the *identical* quote-only ad
+ * resolves to social_proof_led directly, and social_proof_led was not on the
+ * allowlist, so four PMax surfaces silently lost their in-image CTA for
+ * exactly this data shape. Measured with real `buildPrompt` calls: all four
+ * `pmax_*` statics kept `objection_resolved` + CTA before the widening and
+ * got `social_proof_led` + no CTA after, for the same quote-only input; Meta
+ * was unaffected (Meta never reaches this allowlist at all).
+ *
+ * The fix is deliberately NARROWER than "add social_proof_led to the
+ * allowlist" — that would also flip the CTA on for the existing, unmeasured,
+ * unaffected population of RATED social_proof_led PMax ads (priority-1, the
+ * common case), which is a much larger and un-owner-directed change. Instead
+ * this keys on the render actually being data-identical to what used to be
+ * objection_resolved: a social_proof_led render with a quote but NO rating.
+ * A rated social_proof_led render is byte-identical either way — it never
+ * satisfies `!data.rating`, so it never reaches this branch.
+ *
+ * `false` restores the exact pre-fix allowlist (objection_resolved only),
+ * which is also what you get automatically if the sibling eligibility
+ * widening itself is off — quote-only data can then never resolve to
+ * social_proof_led in the first place, so this branch is simply never hit.
+ * Two independent, revertable levers, byte-identical off either way.
+ */
+const PMAX_DRAWCTA_QUOTE_ONLY_SOCIAL_PROOF = process.env.PMAX_DRAWCTA_QUOTE_ONLY_SOCIAL_PROOF !== 'false';
+
+/**
  * Effective drawCta for a surface + resolved intent.
  *
  * Meta keeps SURFACE_POLICY.drawCta exactly — Stories stamps false with
@@ -533,15 +571,31 @@ function resolvePlatformNotes(surfaceKey, { preserve = false } = {}) {
  * conversion-flavoured creatives (objection_resolved, what ai_promotional
  * maps to) still want the in-image CTA. Flag OFF restores the Phase A
  * per-surface boolean (all pmax_* true).
+ *
+ * Second exception, PMAX_DRAWCTA_QUOTE_ONLY_SOCIAL_PROOF (see above): a
+ * social_proof_led render carrying a quote but no rating is the same
+ * risk-reversal-quote ad objection_resolved was built for — it only wears
+ * the social_proof_led label because eligibility now lets a quote alone
+ * qualify. `data` is optional and defaults to `{}` so any existing caller
+ * that omits it keeps today's rating-gated (false) behaviour rather than
+ * throwing.
  */
-function resolveDrawCta({ surfaceKey, policy, intentKey }) {
+function resolveDrawCta({ surfaceKey, policy, intentKey, data = {} }) {
   if (!policy) return true;
   // Flag off → every surface uses the raw SURFACE_POLICY boolean (byte-identity).
   if (!PMAX_STATIC_PLATFORM_NOTES) return policy.drawCta;
   // Meta (and any non-pmax) → never rewrite.
   if (destinationForSurface(surfaceKey) !== 'pmax') return policy.drawCta;
-  // PMax + flag on: intent-dependent. TRUE only for the conversion intent.
-  return intentKey === 'objection_resolved';
+  // PMax + flag on: intent-dependent.
+  if (intentKey === 'objection_resolved') return true;
+  // Quote-only social_proof_led (no rating) — the regression fix. Requires
+  // BOTH a missing rating AND a present quote so this can only ever fire for
+  // the specific data shape it exists to serve, never merely because a
+  // caller forgot to pass `data`.
+  if (PMAX_DRAWCTA_QUOTE_ONLY_SOCIAL_PROOF && intentKey === 'social_proof_led' && !data.rating && data.quote) {
+    return true;
+  }
+  return false;
 }
 
 /**
@@ -1357,7 +1411,7 @@ function buildPrompt({ intentKey, data, product, surface, seedStyle = null, vari
   // SURFACE_POLICY object as-is so absences / density / returned policy stay
   // byte-identical to today. When suppressed, reuse the Stories path:
   // strip CTA before applyDensity + absence line with ctaNote.
-  const drawCta = resolveDrawCta({ surfaceKey: surface, policy, intentKey: resolved.key });
+  const drawCta = resolveDrawCta({ surfaceKey: surface, policy, intentKey: resolved.key, data });
   const effectivePolicy = drawCta === policy.drawCta
     ? policy
     : {
@@ -1560,6 +1614,7 @@ module.exports = {
   resolvePlatformNotes,
   destinationForSurface,
   resolveDrawCta,
+  PMAX_DRAWCTA_QUOTE_ONLY_SOCIAL_PROOF,
   // Seed aspect from Media.width/height — production path for 'native' arm.
   seedAspectFromDims,
   parseAspectValue
