@@ -14,26 +14,28 @@ it clears it back to this placeholder.)_
 
 ## CURRENT STATE
 
-*(Written 2026-08-24. Worktree `/Volumes/Sayulita/Projects/RS/.wt-port-creative`.)*
+*(Written 2026-08-24. Worktree `/Volumes/Sayulita/Projects/RS/.wt-remotion-sub`,
+branch `perf/remotion-subprocess` = adgen PR #8, rebased onto `origin/master`
+@ `62436f6` = #10 + #11 + #9 + #7.)*
 
-- **Branch:** `port/creative-fixes-to-adgen` based on `origin/master` @ `0143f7c`
-  (`fix(memory): Remotion titling OOM-killed an 8 GiB box at concurrency 4 (#5)`).
-  Not pushed. Do not merge or deploy until the owner reviews the diff.
-- **This session:** ported backend `fix/attribution-viability` (PR #318) into
-  adgen. `usableAttribution` + `letterCount` live in
-  `src/services/quoteProvenance.js` and are imported by both render paths.
-  Without this port the backend-only fix is inert for every newly generated ad
-  (`ADGEN_RENDERER_ENABLED=true`).
-- **Call sites (matched backend before the patch, then wired identically):**
-  - Video: `src/services/brandScriptExecutor.js` `buildMetaForAd`
-    `reviewer: usableAttribution(cascaded.reviewer) ?? null`
-  - Static: `src/services/directImageRenderService.js` `buildIntentData`
-    `attribution: quoteText ? (usableAttribution(quote?.author_name) ?? undefined) : undefined`
-- **Harness:** `scripts/verifyAttributionViability.js` (52 checks, offline).
-  Paths adapted `services/` → `src/services/`.
-- **Suite:** baseline 10/14 (new harness not yet present) → after 11/15.
-  Same four reds as on a clean worktree: two `*_KNOWN_OPEN.js`,
-  `verifyArchiveDigestRelease`, `verifyModelParity`. Do not weaken them.
+- **Rebased in two hops.** Original fork point `0143f7c` (`#5`). First hop
+  onto `98fe279` (`#9`) resolved the real `renderer.js` conflict (heartbeat
+  OUTER, OOM try/catch INNER, both titling sites). Trunk then moved again
+  (`397284f` #11 cap clamp, `62436f6` #10 attribution) during that hop;
+  second hop onto current `origin/master` auto-merged `renderer.js` and
+  `brandScriptExecutor.js`, conflicted only on this file.
+- **`git diff origin/master HEAD --stat`** is only #8's files (supervisor,
+  child script, brandScriptExecutor, remotionRenderService, renderer.js,
+  titlingResumeService, isolation harness, this file). No re-application of
+  #7/#9/#10/#11.
+- **Nesting:** heartbeat `try/finally { beat.stop() }` is OUTER; OOM
+  try/catch with early `return` is INNER. The OOM `return` still runs
+  `beat.stop()`. Terminal `$set` `$in: ['rendering','draft']` (#7) and
+  heartbeat cap/interval/`claimedByWorker` (#9, cap corrected by #11) were
+  not rewritten by this PR.
+- **D11** in `scripts/verifyRemotionChildIsolation.js` pins that the OOM
+  early-return sits inside the heartbeat try whose finally stops the beat.
+- **Pushed** `--force-with-lease` to `origin/perf/remotion-subprocess`. Not merged.
 
 ---
 
@@ -41,16 +43,16 @@ it clears it back to this placeholder.)_
 
 - **`verifyCampaignRunHeartbeatWired_KNOWN_OPEN.js`** — expected red.
   `startRunHeartbeat` has no call site in `src/`.
-- **`verifyRunFinalizesOnSettle_KNOWN_OPEN.js`** — file still labelled
-  expected-fail; `maybeFinalizeRun` has since been added. Group A only
-  replays the `$inc` half of `bumpRunCounter`.
-- **`verifyArchiveDigestRelease.js` / `verifyModelParity.js`** — red at
-  baseline on a clean worktree. Model-parity additionally fails while a
-  `node_modules` symlink is present (remove it before commit).
-- **Orchestrator is not Phase 2.** Do not assume it expands or claims.
-- **Vendoring lag.** A backend fix is not live here until ported.
-- **`../config` from `src/services` is the FILE `src/config.js`**, not the
-  directory `config/`. Rewrite requires when porting backend services.
+- **`verifyRunFinalizesOnSettle_KNOWN_OPEN.js`** — still labelled expected-fail;
+  `maybeFinalizeRun` is wired on this branch. Group A only replays the `$inc`.
+- **`verifyArchiveDigestRelease.js` E3/E14** — self-diagnosed broken ported scans.
+- **`verifyModelParity.js`** — red in this worktree because sibling
+  `liquidretail_backend/models/*` no longer call `mongoose.model(...)` in a
+  shape the harness can extract. Also fails while a `node_modules` symlink
+  is present (remove it before commit).
+- **Orchestrator is not Phase 2.**
+- **`titlingResumeService` / `bootRecoveryService` unwired** from adgen boot.
+  Isolation leaves resume state; it does not start the sweeper.
 
 ---
 

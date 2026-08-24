@@ -92,6 +92,7 @@ const { resolveDeriveFromMaster } = require('./campaignAdsGenerationService');
 const { classifyRunAdOutcome, buildRunReconciliationUpdate } = require('./campaignRunGuards');
 const atlasVideo = require('./atlasVideoService');
 const { renderBrandScriptAndSave } = require('./brandScriptExecutor');
+const { isRemotionChildOomError } = require('./remotionChildSupervisor');
 // videoRouter exports `prepareStoryboard`; the backend's routes/ads.js binds it
 // under the local alias `veoPrepareStoryboard`. Phase 1c ported the CALL from
 // there but kept the alias on the require(), destructuring a key that does not
@@ -771,15 +772,29 @@ async function renderVideo(ad) {
       const adFinal = await Ad.findById(adId).lean();
       // Beat updatedAt for the whole titling window — including the queue
       // wait, which writes nothing otherwise. See startAdHeartbeat.
+      // OUTER wrapper: beat.stop() lives in finally so an OOM early-return
+      // still releases the timer. INNER wrapper: child OOM returns without
+      // the success $set (that would clear titling debt) and without throwing
+      // into processAd (that would mark status:'failed').
       const beat = startAdHeartbeat(adId);
-      let chromeOut;
       try {
-        chromeOut = await renderBrandScriptAndSave({ ad: adFinal, brand: brandDoc });
+        try {
+          const chromeOut = await renderBrandScriptAndSave({ ad: adFinal, brand: brandDoc });
+          if (chromeOut?.skipped) {
+            console.log(`renderer[${WORKER_ID}]: VIDEO DERIVE no-chrome ad=${shortId} — shipping master`);
+          }
+        } catch (scriptErr) {
+          if (isRemotionChildOomError(scriptErr)) {
+            // brandScriptExecutor already stamped draft + titlingResumeState:'pending'.
+            // Do not fall through to the success $set (that would clear the debt)
+            // and do not throw into processAd (that would mark status:'failed').
+            console.warn(`renderer[${WORKER_ID}]: VIDEO DERIVE remotion child OOM-killed ad=${shortId} — paid plate kept, titling left pending`);
+            return;
+          }
+          throw scriptErr;
+        }
       } finally {
-        beat.stop();   // must not outlive the render, on success OR throw
-      }
-      if (chromeOut?.skipped) {
-        console.log(`renderer[${WORKER_ID}]: VIDEO DERIVE no-chrome ad=${shortId} — shipping master`);
+        beat.stop();   // must not outlive the render, on success OR throw OR OOM return
       }
     }
 
@@ -861,15 +876,29 @@ async function renderVideo(ad) {
     const adFinal = await Ad.findById(adId).lean();
     // Beat updatedAt for the whole titling window — including the queue
     // wait, which writes nothing otherwise. See startAdHeartbeat.
+    // OUTER wrapper: beat.stop() lives in finally so an OOM early-return
+    // still releases the timer. INNER wrapper: child OOM returns without
+    // the success $set (that would clear titling debt) and without throwing
+    // into processAd (that would mark status:'failed').
     const beat = startAdHeartbeat(adId);
-    let chromeOut;
     try {
-      chromeOut = await renderBrandScriptAndSave({ ad: adFinal, brand: brandDoc });
+      try {
+        const chromeOut = await renderBrandScriptAndSave({ ad: adFinal, brand: brandDoc });
+        if (chromeOut?.skipped) {
+          console.log(`renderer[${WORKER_ID}]: VIDEO MASTER no-chrome ad=${shortId} — shipping master`);
+        }
+      } catch (scriptErr) {
+        if (isRemotionChildOomError(scriptErr)) {
+          // brandScriptExecutor already stamped draft + titlingResumeState:'pending'.
+          // Do not fall through to the success $set (that would clear the debt)
+          // and do not throw into processAd (that would mark status:'failed').
+          console.warn(`renderer[${WORKER_ID}]: VIDEO MASTER remotion child OOM-killed ad=${shortId} — paid master kept, titling left pending`);
+          return;
+        }
+        throw scriptErr;
+      }
     } finally {
-      beat.stop();   // must not outlive the render, on success OR throw
-    }
-    if (chromeOut?.skipped) {
-      console.log(`renderer[${WORKER_ID}]: VIDEO MASTER no-chrome ad=${shortId} — shipping master`);
+      beat.stop();   // must not outlive the render, on success OR throw OR OOM return
     }
   }
 

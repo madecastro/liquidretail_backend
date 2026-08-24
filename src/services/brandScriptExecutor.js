@@ -2133,6 +2133,45 @@ async function renderWithRemotionAndSave({ ad, brand, format, presetOverride = n
   // id + titleStyleSpec key. Absent/unknown platformFormat → Meta zones.
   const platformFormat = ad?.platformFormat || null;
 
+  const { isRemotionChildOomError, isRemotionChildTimeoutError } = require('./remotionChildSupervisor');
+
+  // Child OOM is NOT a merited render failure: the paid master is already on
+  // renderUrl. Stamp titlingResumeState:'pending' so the resume sweeper can
+  // re-title for free, then rethrow so callers that would mark status:'failed'
+  // (processAd catch, titlingResumeService's terminal arm) can skip that.
+  async function stampTitlingOomAndThrow(err) {
+    const Ad = require('../models/Ad');
+    const msg = `remotion child OOM-killed; paid master kept, titling deferred: ${err && err.message ? err.message : err}`;
+    try {
+      await Ad.updateOne(
+        { _id: ad._id },
+        {
+          $set: {
+            status: 'draft',
+            claimedByWorker: null,
+            claimedAt: null,
+            // pending, not claimed: we are no longer in-flight, so the sweeper
+            // must not wait CLAIM_STALE_MIN.
+            titlingResumeState: 'pending',
+            renderError: {
+              message: String(msg).slice(0, 400),
+              stage: 'titling',
+              at: new Date(),
+              code: 'REMOTION_CHILD_OOM'
+            },
+            renderStage: 'master rendered; titling oom-killed — resume pending',
+            renderStageAt: new Date(),
+            updatedAt: new Date()
+          }
+        }
+      );
+    } catch (persistErr) {
+      console.warn(`   ⚠️  brandScript[ad=${ad._id}]: OOM stamp failed (${persistErr.message})`);
+    }
+    console.warn(`   ⚠️  brandScript[ad=${ad._id}]: ${msg}`);
+    throw err;
+  }
+
   let result;
   try {
     adStage(ad._id, `titling ${ad.aspectRatio || format}`);
@@ -2158,23 +2197,36 @@ async function renderWithRemotionAndSave({ ad, brand, format, presetOverride = n
         : null,
     });
   } catch (err) {
+    if (isRemotionChildOomError(err)) {
+      await stampTitlingOomAndThrow(err);
+    }
+    // Do not spend a second Remotion slot on a child we already killed for
+    // hanging. Timeout is a real error of this attempt (distinct from OOM).
+    if (isRemotionChildTimeoutError(err)) throw err;
     // A cropped-plate failure must NEVER cost the titles: renderBrandScriptAndSave's callers
     // treat chrome as best-effort, so an unhandled throw here ships the raw UNTITLED 9:16
     // master as the deliverable — strictly worse than a titled-but-centre-cropped ad. Retry
     // once with the raw plate; only a raw-plate failure propagates.
     if (basePlate.cropped && plateUrl !== ad.veoVideoUrl) {
       console.warn(`   ⚠️  brandScript[ad=${ad._id}]: titling failed on the cropped plate (${err.message}) — retrying once with the raw plate`);
-      result = await renderTitles({
-        videoUrl:  ad.veoVideoUrl,
-        meta, spec, tokens, format,
-        platformFormat,
-        brandName: brand?.name,
-        adId:      String(ad._id),
-        brand,
-        placementMode: placement,
-        // Raw plate = source frame; identity mapping (no cropRect).
-        faceKeepOut: faceKeepOut ? { ...faceKeepOut, cropRect: null } : null,
-      });
+      try {
+        result = await renderTitles({
+          videoUrl:  ad.veoVideoUrl,
+          meta, spec, tokens, format,
+          platformFormat,
+          brandName: brand?.name,
+          adId:      String(ad._id),
+          brand,
+          placementMode: placement,
+          // Raw plate = source frame; identity mapping (no cropRect).
+          faceKeepOut: faceKeepOut ? { ...faceKeepOut, cropRect: null } : null,
+        });
+      } catch (err2) {
+        if (isRemotionChildOomError(err2)) {
+          await stampTitlingOomAndThrow(err2);
+        }
+        throw err2;
+      }
     } else {
       throw err;
     }

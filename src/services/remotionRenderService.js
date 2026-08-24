@@ -1,10 +1,12 @@
 // Remotion SSR render service for the video titling engine.
 //
-// Lifecycle: bundle() the remotion/ island once per process (warmed at boot,
-// lazily on first render otherwise), keep a single headless browser, and run
-// renders through a bounded pool (REMOTION_QUEUE_CONCURRENCY, default 4).
-// Renders are memory-heavy, so the pool — not the caller's permit — is the real
-// limit; see the note above `enqueue`.
+// Lifecycle: the PARENT process owns a bounded pool (REMOTION_QUEUE_CONCURRENCY)
+// and spawns one child per production renderTitles call. The child bundles the
+// remotion/ island, runs headless Chrome + ffmpeg, writes the titled MP4 to a
+// temp path, prints a JSON report, and exits so the OS reclaims RSS. A Chrome/
+// ffmpeg OOM kills the child, not the parent holding the other claimed ads.
+// renderPreview stays in-process (operator stills; not the production RSS path).
+// See remotionChildSupervisor.js + remotionRender.child.js.
 //
 // Asset delivery: the render browser must fetch the plate video and font
 // files. Instead of relying on egress from headless Chrome, everything is
@@ -29,6 +31,10 @@ const axios = require('axios');
 
 const { FONT_CACHE_DIR } = require('./fontResolverService');
 const { FONTS_DIR } = require('./fontLoader');
+const {
+  RENDER_TIMEOUT_MS,
+  superviseRemotionChild
+} = require('./remotionChildSupervisor');
 
 const COMPOSITION_BY_FORMAT = {
   vertical: 'CanonicalVertical',
@@ -39,7 +45,7 @@ const COMPOSITION_BY_FORMAT = {
 
 const ENTRY_POINT = path.join(__dirname, '..', 'remotion', 'index.jsx');
 const ASSET_ROOT = path.join(os.tmpdir(), 'remotion_assets');
-const RENDER_TIMEOUT_MS = Number(process.env.REMOTION_TIMEOUT_MS || 180_000);
+const CHILD_PATH = path.join(__dirname, 'remotionRender.child.js');
 
 // ── bundle cache ───────────────────────────────────────────────────────────
 
@@ -269,12 +275,13 @@ function getAssetServer() {
 // concurrency number finally means what it says.
 //
 // MEMORY IS THE CONSTRAINT AND IT IS NOT MEASURED. Each slot is a headless
-// Chrome page plus an ffmpeg 1080p encode inside the web process. The documented
-// failure mode is not a provider 429 — it is RSS exhaustion, Render replacing
-// the instance, and a paid Omni master stranded mid-titling. Default is
-// therefore deliberately modest and the ceiling is env-driven: raise
-// REMOTION_QUEUE_CONCURRENCY only against an observed RSS number, one step at a
-// time, watching the web service's memory graph across a full run.
+// Chrome page plus an ffmpeg 1080p encode, now in a dedicated child process
+// so an OOM kills the child rather than the parent (which may be holding
+// ADGEN_MAX_INFLIGHT=32 claims). The documented failure mode is not a
+// provider 429 — it is RSS exhaustion. Default is therefore deliberately
+// modest and the ceiling is env-driven: raise REMOTION_QUEUE_CONCURRENCY
+// only against an observed RSS number, one step at a time. The queue still
+// lives in THIS process; isolation changes WHERE each slot runs, not HOW MANY.
 const QUEUE_CONCURRENCY = Math.max(
   1,
   parseInt(process.env.REMOTION_QUEUE_CONCURRENCY, 10) || 4
@@ -426,18 +433,36 @@ async function warmup() {
   await Promise.all([getServeUrl(), ensureBrowserReady(), getAssetServer()]);
 }
 
-/**
- * Render titles over the ad's base video. Mirrors renderBrandScript's
- * contract: returns { finalPath, tempDir, timings } — the caller uploads
- * finalPath and removes tempDir.
- */
-async function renderTitles({ videoUrl, meta, spec, tokens, format, brandName = null, adId = null, placementMode = null, brand = null, faceKeepOut = null, platformFormat = null, safeZoneKey = null }) {
-  if (!videoUrl) throw new Error('renderTitles: videoUrl required');
-  if (!spec) throw new Error('renderTitles: spec required');
-  const compositionId = COMPOSITION_BY_FORMAT[format];
-  if (!compositionId) throw new Error(`renderTitles: unknown format '${format}'`);
+function payloadForChild(args) {
+  // Explicit allow-list. Brand is reduced to the one field
+  // resolveTitlePlacementMode reads — a mongoose lean() doc must not cross
+  // the IPC boundary whole (it can carry buffers / circular-ish trees).
+  return {
+    videoUrl: args.videoUrl,
+    meta: stripHeavyMeta(args.meta),
+    spec: args.spec,
+    tokens: args.tokens,
+    format: args.format,
+    brandName: args.brandName || null,
+    adId: args.adId || null,
+    placementMode: args.placementMode || null,
+    brand: args.brand
+      ? { videoSettings: { titlePlacementMode: args.brand.videoSettings && args.brand.videoSettings.titlePlacementMode || null } }
+      : null,
+    faceKeepOut: args.faceKeepOut || null,
+    platformFormat: args.platformFormat || null,
+    safeZoneKey: args.safeZoneKey || null
+  };
+}
 
-  return enqueue(async () => {
+/**
+ * In-process render body (no queue, no spawn). The child process calls this
+ * via renderTitles once REMOTION_IN_CHILD=1. The parent never runs it for
+ * production titles — only renderPreview stays in-process.
+ */
+async function renderTitlesJob({ videoUrl, meta, spec, tokens, format, brandName = null, adId = null, placementMode = null, brand = null, faceKeepOut = null, platformFormat = null, safeZoneKey = null }) {
+    const compositionId = COMPOSITION_BY_FORMAT[format];
+    if (!compositionId) throw new Error(`renderTitles: unknown format '${format}'`);
     const timings = {};
     let t = Date.now();
 
@@ -584,6 +609,10 @@ async function renderTitles({ videoUrl, meta, spec, tokens, format, brandName = 
         chromiumOptions,
         timeoutInMilliseconds: RENDER_TIMEOUT_MS,
         concurrency: process.env.REMOTION_CONCURRENCY ? Number(process.env.REMOTION_CONCURRENCY) : null,
+        // Drop the ffmpeg prestitcher's extra RSS. Chrome already serializes
+        // frames (REMOTION_CONCURRENCY pinned to 1); parallel encode is the
+        // second memory spike on the same 8 GiB box.
+        disallowParallelEncoding: true,
         onProgress: ({ progress }) => {
           const pct = Math.round(progress * 100);
           if (pct >= lastLogged + 25) {
@@ -601,7 +630,30 @@ async function renderTitles({ videoUrl, meta, spec, tokens, format, brandName = 
       await fsp.rm(jobDir, { recursive: true, force: true }).catch(() => {});
       throw e;
     }
-  });
+}
+
+/**
+ * Render titles over the ad's base video. Mirrors renderBrandScript's
+ * contract: returns { finalPath, tempDir, timings } — the caller uploads
+ * finalPath and removes tempDir.
+ *
+ * Parent: enqueue() then spawn remotionRender.child.js (queue semantics
+ * unchanged). Child (REMOTION_IN_CHILD=1): run the job in-process and exit.
+ */
+async function renderTitles(args) {
+  if (!args || !args.videoUrl) throw new Error('renderTitles: videoUrl required');
+  if (!args.spec) throw new Error('renderTitles: spec required');
+  const compositionId = COMPOSITION_BY_FORMAT[args.format];
+  if (!compositionId) throw new Error(`renderTitles: unknown format '${args.format}'`);
+
+  if (process.env.REMOTION_IN_CHILD === '1') {
+    return renderTitlesJob(args);
+  }
+  return enqueue(() => superviseRemotionChild({
+    runnerPath: CHILD_PATH,
+    payload: payloadForChild(args),
+    timeoutMs: RENDER_TIMEOUT_MS
+  }));
 }
 
 /**
@@ -773,12 +825,16 @@ async function renderPreview({ meta, spec, tokens, format, plateImagePath = null
 module.exports = {
   warmup,
   renderTitles,
+  renderTitlesJob,
   renderPreview,
   COMPOSITION_BY_FORMAT,
   // test surface for scripts/verifyFontServing.js (pure helpers)
   assetPathFor,
   fontRouteForLocalPath,
   fontsToUrls,
+  payloadForChild,
+  CHILD_PATH,
+  RENDER_TIMEOUT_MS,
   // Pool internals — exported so scripts/verifyTitlingQueueParallel.js can
   // prove the pool actually overlaps work instead of regexing for the word
   // "concurrency". A serial queue and a parallel one look identical in source.

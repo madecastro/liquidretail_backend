@@ -356,6 +356,19 @@ async function resumeUntitledMasters({ limit = TITLING_RESUME_MAX } = {}) {
         continue;
       }
 
+      // Child OOM is process death, not a merited render failure. The paid
+      // master stays on renderUrl and brandScriptExecutor already re-armed
+      // titlingResumeState:'pending'. Marking failed here would lose the
+      // asset as a terminal verdict and the sweeper would never retry.
+      const { isRemotionChildOomError } = require('./remotionChildSupervisor');
+      if (isRemotionChildOomError(err)) {
+        out.skipped++;
+        console.warn(
+          `   ⚠️  titlingResume[${ad._id}]: remotion child OOM-killed — left pending for retry`
+        );
+        continue;
+      }
+
       // TERMINAL BY DESIGN, and only for a real render failure: clear the state so
       // a permanently failing ad is retried once and then stops instead of looping
       // forever on a CPU-heavy Remotion render. The paid master stays on renderUrl
