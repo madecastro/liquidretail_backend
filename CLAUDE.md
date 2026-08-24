@@ -398,9 +398,85 @@ npm test                                 # origin/master only; needs scripts/
 `.env.example` does not list `ADGEN_RENDERER_ENABLED`; without it the
 renderer sleeps.
 
-Do **not** put git worktrees inside this repo directory. Put them as
-siblings (`/Volumes/Sayulita/Projects/RS/.wt-<name>`), same rule as the
-backend.
+### Do not create a git worktree INSIDE this repo directory
+
+**This keeps recurring.** A cleanup pass on 2026-08-24 whose entire purpose
+was removing nested worktrees found a NEW one appear *during* the cleanup
+itself: `liquidretail_adgen/.worktrees/pr34-measure`. The three-line version
+of this warning that used to live here evidently was not enough to stop it —
+hence the longer version below.
+
+**Rule: worktrees go as SIBLINGS of the repo**
+(`/Volumes/Sayulita/Projects/RS/.wt-<name>`), **never nested under
+`liquidretail_adgen/`** — not `.worktrees/`, not `.claude/worktrees/`, not
+anywhere inside the repo tree. `.gitignore` does **not** protect against
+this: the hazard below is raw filesystem walks, not git status, so an
+ignored directory gets scanned exactly like a tracked one.
+
+**Why, concretely — audited 2026-08-24.** `scripts/` has exactly **8** call
+sites that do their own `fs.readdirSync`, directly or via one of three
+shared walk helpers: `scripts/lib/requireGraph.js` (backs
+`verifyRequireGraph.js`), `scripts/lib/sourceWalk.js` (backs
+`verifyArchiveDigestRelease.js`), `scripts/lib/vendorDrift.js` (backs
+`verifyVendorDrift.js`), `scripts/runVerifySuite.js` itself, and four
+harnesses that walk directly: `verifyAdgenRunHeartbeat.js`,
+`verifyCampaignRunHeartbeatWired.js`, `verifyModelParity.js`,
+`verifyRunFinalizesOnSettle_KNOWN_OPEN.js`.
+
+Unlike `liquidretail_backend` (4 of 22 safe, 18 exposed — see that repo's
+`CLAUDE.md`), **all 8 of adgen's are currently safe**: the four direct
+harnesses skip any entry whose name starts with `.` before recursing
+(`entry.name.startsWith('.')`), and the two tree-walking lib helpers
+(`requireGraph.js`, `vendorDrift.js`) do the same. `sourceWalk.js` goes
+further — it special-cases `.worktrees` by name AND pattern-matches any
+`.wt-*` prefix (`shouldSkipDir`, `scripts/lib/sourceWalk.js:65-69`), and
+detects a linked worktree by its `.git` FILE (not directory) rather than
+trusting a name list at all. `runVerifySuite.js`'s own `readdirSync` only
+lists `scripts/` itself, never the repo root, so it isn't exposed to this
+hazard regardless.
+
+**This is not a green light — do not read it as one.** It takes exactly one
+future harness copied from a fixed-name-list pattern (the way backend's 18
+were written) to reintroduce the hazard, and no non-verify tooling here has
+been audited at all. The rule — worktrees are always siblings, never nested
+— is unconditional; it does not get softer because today's 8 harnesses
+happen to be careful. This is the same defect class that already turned
+`liquidretail_backend`'s `verifyArchiveDigestRelease` (a MONEY harness) red
+with 7 false positives there, and the silent failure mode is worse: a
+harness that passes or fails depending on what another session has checked
+out, with no red flag at all.
+
+### Two more tooling traps that have cost real time
+
+**Never `npm ci` an adgen worktree, and never set `NODE_PATH` here.**
+`verifyModelParity.js` needs its own `require('mongoose')` to FAIL first —
+only then does its `Module._load` fallback patch install
+(`loadMongooseWithFallback`, `scripts/verifyModelParity.js:124-173`), which
+is what lets it read both adgen's and the sibling backend's 33 model files
+through one shared mongoose instance (`captureSchema`,
+`scripts/verifyModelParity.js:188-201`, patches `mongoose.model` once and
+relies on every later `require('mongoose')` in the process resolving to
+that same instance). Give the worktree its own `mongoose` — via `npm ci` or
+via `NODE_PATH` pointing at any `node_modules` that has it — and the
+fallback patch never installs, the shared-instance assumption breaks, and
+every one of the 33 adgen models reports "never called mongoose.model(...)
+— cannot extract a schema." Measured: a bare worktree passes 33/33; an
+`npm ci`'d or `NODE_PATH`-set one fails 33/33 with that exact message, which
+reads exactly like a real schema-parity defect and is not one. Run this
+harness from a bare worktree with the sibling `liquidretail_backend`
+checkout present alongside it.
+
+**Backend is the opposite** — its worktrees need `npm run setup:worktree`
+first, because its committed `node_modules` subset is incomplete. Don't
+carry either repo's rule over to the other.
+
+**Parallel agents running mutation-style revert-proves in the same repo
+interfere with each other's suite runs.** Observed twice in one night as a
+transient `verifyRequireGraph` failure caused by another process's temp
+file — not a real defect. A clean re-run fixed it both times. Re-run before
+reporting a lone red, especially on a harness whose own revert-prove recipe
+mutates a file on disk while another session could be doing the same thing
+concurrently.
 
 ---
 
