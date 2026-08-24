@@ -605,6 +605,69 @@ function monochromeInkFor(meanLum) {
 }
 
 /**
+ * Rec.709-weighted luminance of an sRGB triple, 0..1, NO gamma linearization.
+ *
+ * Used only on LOW-chroma (near-grey) pixels, where Rec.709, Rec.601 and
+ * sharp greyscale agree. `behindLuminance` is production
+ * `sharp().greyscale()` mean / 255 (finishPlate) — measured on sharp
+ * 0.33.5 that is NEITHER Rec.601 nor Rec.709-no-gamma on chromatic
+ * primaries (red 124 vs 76 vs 54). Do not "align" the two formulas, and
+ * do not linearize: linearizing the plate number classifies the failing
+ * 0.56 plate as ~3.24:1 and SKIP the re-ink. Pinned by
+ * scripts/verifyLogoColorPreservation.js L6.
+ */
+function logoPixelLuminance(r, g, b) {
+  return (0.2126 * r + 0.7152 * g + 0.0722 * b) / 255;
+}
+
+/**
+ * Contrast ratio between two 0..1 luminances. WCAG 2.x formula, applied
+ * WITHOUT sRGB linearization — the plate number is whatever finishPlate
+ * stored (sharp greyscale / 255) and the pixel number is
+ * logoPixelLuminance. Linearizing either one inverts the 0.56 case.
+ *
+ * Exported so the harness pins the measured Pelagic plates against the
+ * shipped function, not a copy.
+ */
+function inkContrastRatio(L1, L2) {
+  if (typeof L1 !== 'number' || typeof L2 !== 'number') return 0;
+  if (!Number.isFinite(L1) || !Number.isFinite(L2)) return 0;
+  const hi = Math.max(L1, L2);
+  const lo = Math.min(L1, L2);
+  return (hi + 0.05) / (lo + 0.05);
+}
+
+// WCAG 2.x large-text / UI-component floor, used as a number IN THE SAME
+// 0..1 space as behindLuminance (not linearized relative luminance).
+// Measured on the Pelagic batch that exhibited the defect:
+//   white vs Ws Aquatek plate 0.56 → 1.72  (wordmark invisible)
+//   white vs Mai Tai plate     0.27 → 3.28  (wordmark clearly present)
+// 3 sits between those two observed ratios. The white-ink crossover
+// (ratio === 3) is plate L = 0.30, so Mai Tai has 0.03 of headroom.
+// A 0.5 luminance split is 0.06 FROM the failing plate and on the WRONG
+// side of it — that was the inverted fix. Do not restore it.
+const LOGO_MIN_INK_CONTRAST = 3;
+
+const INK_BLACK = { r: 0, g: 0, b: 0 };
+const INK_WHITE = { r: 255, g: 255, b: 255 };
+
+/**
+ * Pick black or white ink, whichever has higher contrast against the plate.
+ * Independent of monochromeInkFor's 0.5 split: in the 0.18–0.50 band that
+ * split picks WHITE, but black has the better WCAG ratio (at plate 0.49,
+ * black is 10.8:1 vs white 1.94:1). Using monochromeInkFor here would
+ * re-ink a white wordmark to white on any plate ≤ 0.5 — still invisible.
+ */
+function contrastingInkFor(behindLuminance) {
+  if (typeof behindLuminance !== 'number' || !Number.isFinite(behindLuminance)) {
+    return null;
+  }
+  const blackC = inkContrastRatio(0, behindLuminance);
+  const whiteC = inkContrastRatio(1, behindLuminance);
+  return whiteC >= blackC ? INK_WHITE : INK_BLACK;
+}
+
+/**
  * Re-render a logo as a single-ink silhouette.
  *
  * WHY: the asset is composited verbatim, so a logo delivered on an OPAQUE white
@@ -842,9 +905,14 @@ async function logoIsPolychrome(logoPng, coverage, w, h, { chromaThreshold = LOG
  * luminance, for the translucent-gradient reason documented on
  * coverageFromBackgroundDistance), then ask whether the MARKED pixels are
  * polychrome. Polychrome → composite the artwork's OWN colours under that
- * mask, ink untouched. Otherwise → fall through to the existing, unchanged
- * monochromeLogoBuffer path (every other brand's simple wordmark keeps
- * today's behaviour exactly).
+ * mask, then re-ink LOW-chroma covered pixels whose contrast against the
+ * plate is below LOGO_MIN_INK_CONTRAST (bidirectional: light ink on a dark
+ * plate, dark ink on a light plate). High-chroma pixels are never
+ * re-inked — brand-colour preservation wins over legibility there, because
+ * a contrast rule on those pixels would flatten Pelagic's #0055b8 / #c10230
+ * tiles on BOTH measured plates (they fail 3:1 against 0.27 and 0.56).
+ * Otherwise → fall through to the existing, unchanged monochromeLogoBuffer
+ * path (every other brand's simple wordmark keeps today's behaviour exactly).
  *
  * @returns {Promise<{buffer: Buffer, treatment: 'colour-preserved'|'monochrome'|'original', ink?: object}>}
  */
@@ -873,22 +941,37 @@ async function prepareLogoForComposite(logoPng, { behindLuminance } = {}) {
       polychrome = await logoIsPolychrome(logoPng, coverage, w, h);
     } catch { polychrome = false; }
     if (polychrome) {
+      // removeAlpha DROPS the channel and keeps source RGB — it does not
+      // composite onto black. A 50% white AA fringe stays (255,255,255)
+      // and follows the same contrast rule as solid white. (Measured on
+      // sharp 0.33.5: flatten({background:black}) is the premultiply path.)
       const rgb = await sharp(logoPng).removeAlpha().raw().toBuffer();
-      // Mixed lockup (colour tiles / gradient + dark wordmark). Colour-
-      // preserving the whole mark is right for the tiles and wrong for
-      // the wordmark: on a DARK generated plate the dark letterforms
-      // vanish while the tiles stay, which is the measured Pelagic
-      // split (full lockup on light ads, tiles-only on dark ones) from
-      // one SVG. Re-ink only LOW-chroma covered pixels, and only when
-      // the plate behind is dark — high-chroma pixels stay untouched,
-      // and a light plate keeps today's colour-preserved wordmark.
-      const ink = monochromeInkFor(behindLuminance);
-      if (ink && typeof behindLuminance === 'number' && behindLuminance <= 0.5) {
+      // Mixed lockup (colour tiles / gradient + a low-chroma wordmark).
+      // Colour-preserving the whole mark is right for the tiles and wrong
+      // for a wordmark whose contrast against the GENERATED plate is too
+      // low: the letterforms vanish, the tiles stay, and the same SVG
+      // reads as two lockups across one batch.
+      //
+      // THE PELAGIC CASE, measured not argued:
+      //   SVG fills: #ffffff (wordmark) / #0055b8 / #c10230 (tiles). There
+      //   is no dark wordmark. Ws Aquatek plate behind the logo = 0.56
+      //   (white wordmark invisible). Mai Tai plate = 0.27 (white wordmark
+      //   clearly present). A dark-plate-only re-ink to LIGHT ink is the
+      //   inverted fix: 0.56 never fires, and light ink is what vanished.
+      //
+      // Re-ink only LOW-chroma covered pixels, and only when their contrast
+      // against the plate is below LOGO_MIN_INK_CONTRAST. Ink is whichever
+      // of black/white maximises contrast — NOT monochromeInkFor's 0.5
+      // split. High-chroma pixels stay untouched on purpose (see header).
+      const ink = contrastingInkFor(behindLuminance);
+      if (ink) {
         for (let i = 0; i < w * h; i++) {
           if (!coverage[i]) continue;
           const o = i * 3;
           const r = rgb[o], g = rgb[o + 1], b = rgb[o + 2];
-          if (Math.max(r, g, b) - Math.min(r, g, b) <= LOGO_CHROMA_THRESHOLD) {
+          if (Math.max(r, g, b) - Math.min(r, g, b) > LOGO_CHROMA_THRESHOLD) continue;
+          const pixelL = logoPixelLuminance(r, g, b);
+          if (inkContrastRatio(pixelL, behindLuminance) < LOGO_MIN_INK_CONTRAST) {
             rgb[o] = ink.r; rgb[o + 1] = ink.g; rgb[o + 2] = ink.b;
           }
         }
@@ -1963,7 +2046,8 @@ async function finishPlate({ rawFrame, built, dims, genSize, surface, adId, logo
             toPlace = prepared.buffer;
             console.log(
               `   🖼️  direct-image: logomark ${prepared.treatment}` +
-              `${prepared.treatment === 'monochrome' ? ` (${prepared.ink?.r ? 'white' : 'black'}, behind lum=${behindLuminance.toFixed(2)})` : ''}`
+              `${typeof behindLuminance === 'number' ? ` (behind lum=${behindLuminance.toFixed(3)})` : ''}` +
+              `${prepared.treatment === 'monochrome' ? ` (${prepared.ink?.r ? 'white' : 'black'})` : ''}`
             );
           }
         } catch (err) {
@@ -2887,7 +2971,11 @@ module.exports = {
   logoResizeBox,
   LOGO_BOX_FRAC,
   LOGO_CHROMA_THRESHOLD,
+  LOGO_MIN_INK_CONTRAST,
   LOGO_SAFE_MARGIN_PCT,
+  logoPixelLuminance,
+  inkContrastRatio,
+  contrastingInkFor,
   sampleSafeBoxLuminance,
   textInkDirective,
   ctaCasingDirective,

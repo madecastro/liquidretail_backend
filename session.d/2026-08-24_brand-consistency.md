@@ -1,5 +1,10 @@
 # 2026-08-24 — three brand-consistency defects on one Pelagic static batch
 
+> **CORRECTION (same day):** defect 3(b) polarity was inverted. Pelagic's
+> wordmark is WHITE and vanished on the LIGHT plate (0.56), not a dark
+> wordmark on a dark plate. See `session.d/2026-08-24_logo-reink-polarity.md`.
+
+
 Measured on 27 delivered static ads for Pelagic Gear, run
 `run_1787561664355_17096cc2`. Same brand, same run, same campaign. Branch
 `fix/brand-consistency` off `origin/main`. No spend-path files touched.

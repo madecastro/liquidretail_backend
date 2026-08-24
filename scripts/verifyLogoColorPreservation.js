@@ -37,6 +37,16 @@
  *       small fixture built in-process — no network fetch — that
  *       reproduces its defining property: a multi-hue gradient block next
  *       to a monochrome wordmark, both on a near-opaque canvas).
+ *   L5  Mixed lockup, Vuori-shaped fixture (dark wordmark + colour
+ *       gradient): a dark wordmark on a dark plate is re-inked light;
+ *       a dark wordmark on a very light plate (contrast already sufficient)
+ *       stays dark. Regression guard for the original colour-preserve path.
+ *   L6  THE PELAGIC DEFECT, measured not argued. The live SVG has three
+ *       fills only: #ffffff (wordmark), #0055b8, #c10230 (tiles). Plate
+ *       luminance behind the logo: Ws Aquatek 0.56 (white wordmark
+ *       vanished), Mai Tai 0.27 (white wordmark present). Re-ink is
+ *       contrast-driven and bidirectional; high-chroma tiles are never
+ *       re-inked on either plate.
  *
  * Run: node scripts/verifyLogoColorPreservation.js
  */
@@ -123,6 +133,47 @@ async function monochromeWordmarkFixture() {
       left: 70, top: 25
     }])
     .png().toBuffer();
+}
+
+// THE PELAGIC LOCKUP, colours taken from the live SVG at pelagicgear.com
+// (three fills, no dark wordmark). Transparent canvas so the white
+// wordmark is in the alpha coverage mask — a white-on-white opaque
+// canvas would drop those pixels in coverageFromBackgroundDistance and
+// the harness would be testing a different bug. Production ads prove
+// the white pixels ARE composited (they are visible on the 0.27 plate).
+const PELAGIC_WHITE = [255, 255, 255];
+const PELAGIC_BLUE = [0x00, 0x55, 0xb8]; // #0055b8 chroma 184 lum 0.29
+const PELAGIC_RED = [0xc1, 0x02, 0x30];  // #c10230 chroma 191 lum 0.18
+const PLATE_WS_AQUATEK = 0.56; // measured behind-logo luminance; wordmark vanished
+const PLATE_MAI_TAI = 0.27;    // measured; wordmark clearly present
+const PELAGIC_WORDMARK_PX = [20 + 90, 16 + 14];
+const PELAGIC_BLUE_PX = [220 + 25, 40 + 25];
+const PELAGIC_RED_PX = [280 + 25, 40 + 25];
+
+async function pelagicLockupFixture() {
+  const w = 400, h = 120;
+  const wordmark = await sharp({
+    create: { width: 180, height: 28, channels: 4, background: { r: 255, g: 255, b: 255, alpha: 1 } }
+  }).png().toBuffer();
+  const blue = await sharp({
+    create: {
+      width: 50, height: 50, channels: 4,
+      background: { r: PELAGIC_BLUE[0], g: PELAGIC_BLUE[1], b: PELAGIC_BLUE[2], alpha: 1 }
+    }
+  }).png().toBuffer();
+  const red = await sharp({
+    create: {
+      width: 50, height: 50, channels: 4,
+      background: { r: PELAGIC_RED[0], g: PELAGIC_RED[1], b: PELAGIC_RED[2], alpha: 1 }
+    }
+  }).png().toBuffer();
+  return sharp({
+    create: { width: w, height: h, channels: 4, background: { r: 0, g: 0, b: 0, alpha: 0 } }
+  }).composite([
+    { input: wordmark, left: 20, top: 16 },
+    { input: blue, left: 220, top: 40 },
+    { input: red, left: 280, top: 40 }
+  ]).png().toBuffer();
 }
 
 (async () => {
@@ -230,18 +281,20 @@ async function monochromeWordmarkFixture() {
   check('L4 output keeps the source dimensions', outMeta.width === meta.width && outMeta.height === meta.height);
   check('L4 output carries a real alpha channel (a shape mask, not an opaque rectangle)', outMeta.hasAlpha === true);
 
-  // ── L5: mixed lockup on a DARK plate — wordmark re-inked, tiles kept ──
-  // THE PELAGIC DEFECT. Colour-preserving the whole mark is right for the
-  // tiles/gradient and wrong for a dark wordmark sitting on a dark generated
-  // plate: the letterforms vanish, the colour tiles stay, and the same SVG
-  // reads as two different lockups across one batch. Re-ink only low-chroma
-  // covered pixels, and only when the plate behind is dark.
+  // ── L5: Vuori-shaped mixed lockup (dark wordmark + colour gradient) ──
+  // Regression guard: a DARK low-chroma wordmark on a DARK plate still
+  // gets re-inked light (the original colour-preserve hole). A dark
+  // wordmark on a very light plate already has sufficient contrast and
+  // stays dark. THE Pelagic defect is L6 — this fixture is the wrong
+  // colours for it.
   async function sampleRgb(buf, x, y) {
-    const { data, info } = await sharp(buf).removeAlpha().raw().toBuffer({ resolveWithObject: true });
+    const { data, info } = await sharp(buf).ensureAlpha().raw().toBuffer({ resolveWithObject: true });
     const i = (y * info.width + x) * info.channels;
     return [data[i], data[i + 1], data[i + 2]];
   }
   const chromaOf = ([r, g, b]) => Math.max(r, g, b) - Math.min(r, g, b);
+  const rgbClose = (a, b, tol = 2) =>
+    Math.abs(a[0] - b[0]) <= tol && Math.abs(a[1] - b[1]) <= tol && Math.abs(a[2] - b[2]) <= tol;
   // Fixture layout (gradientLogoFixture): wordmark at (160,35) 150×30,
   // gradient block at (10,10) 120×80.
   const wordmarkPx = [160 + 75, 35 + 15];
@@ -252,7 +305,7 @@ async function monochromeWordmarkFixture() {
     prepDark.treatment === 'colour-preserved', `got ${prepDark.treatment}`);
   const wordmarkDark = await sampleRgb(prepDark.buffer, wordmarkPx[0], wordmarkPx[1]);
   const tileDark = await sampleRgb(prepDark.buffer, tilePx[0], tilePx[1]);
-  check('L5 [THE DEFECT] on a DARK plate the wordmark is re-inked to LIGHT (visible against the plate)',
+  check('L5 on a DARK plate the dark wordmark is re-inked to LIGHT (visible against the plate)',
     wordmarkDark[0] >= 240 && wordmarkDark[1] >= 240 && wordmarkDark[2] >= 240,
     `wordmark rgb=${wordmarkDark.join(',')} — still dark letterforms would vanish on a dark plate`);
   check('L5 on a DARK plate the colour tile/gradient KEEPS chroma (not flattened to the wordmark ink)',
@@ -262,19 +315,161 @@ async function monochromeWordmarkFixture() {
   const prepLight = await direct.prepareLogoForComposite(gradFixture, { behindLuminance: 0.85 });
   const wordmarkLight = await sampleRgb(prepLight.buffer, wordmarkPx[0], wordmarkPx[1]);
   const tileLight = await sampleRgb(prepLight.buffer, tilePx[0], tilePx[1]);
-  check('L5 [REGRESSION GUARD] on a LIGHT plate the wordmark stays DARK (today\'s colour-preserved output)',
+  check('L5 [REGRESSION GUARD] a dark wordmark on a very LIGHT plate (contrast already sufficient) stays DARK',
     wordmarkLight[0] < 80 && wordmarkLight[1] < 80 && wordmarkLight[2] < 80,
-    `wordmark rgb=${wordmarkLight.join(',')} — re-inking on a light plate would be a new bug`);
+    `wordmark rgb=${wordmarkLight.join(',')} — restyling a already-legible dark wordmark on a light plate is not the fix`);
   check('L5 on a LIGHT plate the colour tile/gradient still has chroma',
     chromaOf(tileLight) > direct.LOGO_CHROMA_THRESHOLD,
     `tile rgb=${tileLight.join(',')} chroma=${chromaOf(tileLight)}`);
 
-  // Revert-prove: the pre-fix colour-preserved path used the artwork's own
-  // pixels under the mask with no backdrop-aware re-ink, so a dark wordmark
-  // stayed dark on a dark plate.
-  check('L5-revert-prove: without the re-ink, the dark-plate wordmark would still be dark (the defect)',
+  check('L5-revert-prove: without the re-ink, the dark-plate wordmark would still be dark',
     wordmarkLight[0] < 80 && !(wordmarkDark[0] < 80),
     `light-plate wordmark=${wordmarkLight.join(',')} dark-plate wordmark=${wordmarkDark.join(',')} — if both are dark the re-ink did not fire`);
+
+  // 0.1 is below contrastingInkFor's black/white crossover (~0.179), so
+  // BOTH pickers choose white there — L5 at 0.1 cannot catch a swap back
+  // to monochromeInkFor. The measured Mai Tai plate (0.27) is above that
+  // crossover: contrastingInkFor is BLACK, monochromeInkFor is WHITE.
+  // A dark wordmark that fails 3:1 is therefore re-inked BLACK (6.4:1),
+  // not white. Pelagic's WHITE fill is a different pixel and is L6.
+  const prepDarkOnMaiTai = await direct.prepareLogoForComposite(gradFixture, { behindLuminance: PLATE_MAI_TAI });
+  const wordmarkMaiTaiDark = await sampleRgb(prepDarkOnMaiTai.buffer, wordmarkPx[0], wordmarkPx[1]);
+  check('L5 dark wordmark on the measured 0.27 plate is re-inked BLACK (max contrast), not white (0.5-split)',
+    wordmarkMaiTaiDark[0] < 20 && wordmarkMaiTaiDark[1] < 20 && wordmarkMaiTaiDark[2] < 20,
+    `wordmark rgb=${wordmarkMaiTaiDark.join(',')} — monochromeInkFor(0.27) is white; if this is white the picker swapped back`);
+  check('L5-revert-prove: monochromeInkFor(0.27) is WHITE, contrastingInkFor(0.27) is BLACK',
+    direct.monochromeInkFor(PLATE_MAI_TAI).r === 255
+    && direct.contrastingInkFor(PLATE_MAI_TAI).r === 0);
+
+  // ── L6: THE PELAGIC DEFECT — white wordmark, measured plates ──────────
+  check('L6-exports inkContrastRatio / contrastingInkFor / LOGO_MIN_INK_CONTRAST',
+    typeof direct.inkContrastRatio === 'function'
+    && typeof direct.contrastingInkFor === 'function'
+    && typeof direct.logoPixelLuminance === 'function'
+    && direct.LOGO_MIN_INK_CONTRAST === 3);
+
+  const whiteVsAquatek = direct.inkContrastRatio(1, PLATE_WS_AQUATEK);
+  const whiteVsMaiTai = direct.inkContrastRatio(1, PLATE_MAI_TAI);
+  check('L6 measured Ws Aquatek 0.56 vs white is BELOW the floor (the observed invisible wordmark)',
+    whiteVsAquatek < direct.LOGO_MIN_INK_CONTRAST,
+    `ratio=${whiteVsAquatek.toFixed(3)} floor=${direct.LOGO_MIN_INK_CONTRAST}`);
+  check('L6 measured Mai Tai 0.27 vs white is AT OR ABOVE the floor (the observed visible wordmark)',
+    whiteVsMaiTai >= direct.LOGO_MIN_INK_CONTRAST,
+    `ratio=${whiteVsMaiTai.toFixed(3)} floor=${direct.LOGO_MIN_INK_CONTRAST}`);
+  check('L6 floor=3 sits between the two measured ratios (1.72 and 3.28)',
+    whiteVsAquatek < 3 && 3 <= whiteVsMaiTai
+    && Math.abs(whiteVsAquatek - 1.72) < 0.02
+    && Math.abs(whiteVsMaiTai - 3.28) < 0.02,
+    `aquatek=${whiteVsAquatek.toFixed(3)} maiTai=${whiteVsMaiTai.toFixed(3)}`);
+
+  // Linearizing the plate luminance (true WCAG relative-luminance) would
+  // classify the FAILING 0.56 plate as ~3.27:1 and skip the re-ink.
+  function srgbLin(c) {
+    return c <= 0.04045 ? c / 12.92 : ((c + 0.055) / 1.055) ** 2.4;
+  }
+  const linAquatek = (1 + 0.05) / (srgbLin(PLATE_WS_AQUATEK) + 0.05);
+  check('L6-revert-prove: linearized WCAG would call the failing 0.56 plate sufficient (>=3)',
+    linAquatek >= 3,
+    `lin(0.56) ratio=${linAquatek.toFixed(3)} — if the shipped helper linearizes, L6 Aquatek re-ink goes red`);
+  check('L6-revert-prove: the shipped ratio on 0.56 does NOT linearize (stays below the floor)',
+    whiteVsAquatek < 3);
+
+  check('L6-revert-prove: a 4.5 floor would also re-ink white on Mai Tai 0.27 (the regression)',
+    whiteVsMaiTai < 4.5 && whiteVsMaiTai >= direct.LOGO_MIN_INK_CONTRAST);
+  check('L6-revert-prove: the failing plate 0.56 is on the LIGHT side of 0.5, so a dark-plate-only gate never fires',
+    PLATE_WS_AQUATEK > 0.5);
+  check('L6-revert-prove: monochromeInkFor(0.49) is WHITE — using it as mixed-lockup ink re-inks white to white',
+    direct.monochromeInkFor(0.49).r === 255 && direct.monochromeInkFor(0.49).g === 255);
+  check('L6-revert-prove: contrastingInkFor(0.49) is BLACK (the visible choice on a near-mid plate)',
+    direct.contrastingInkFor(0.49).r === 0 && direct.contrastingInkFor(0.49).g === 0);
+  check('L6-revert-prove: contrastingInkFor(0.56) is BLACK (dark ink on the failing light plate)',
+    direct.contrastingInkFor(PLATE_WS_AQUATEK).r === 0);
+  check('L6-revert-prove: contrastingInkFor(0.27) is also BLACK — we do NOT use it on Mai Tai because current contrast already passes',
+    direct.contrastingInkFor(PLATE_MAI_TAI).r === 0);
+
+  const pelagic = await pelagicLockupFixture();
+  check('L6 fixture alpha discriminates (white wordmark is in the coverage mask, not dropped as canvas)',
+    (await direct.alphaChannelDiscriminates(pelagic)) === true);
+
+  const prepAquatek = await direct.prepareLogoForComposite(pelagic, { behindLuminance: PLATE_WS_AQUATEK });
+  const prepMaiTai = await direct.prepareLogoForComposite(pelagic, { behindLuminance: PLATE_MAI_TAI });
+  check('L6 both plates stay colour-preserved (tiles are not flattened via the monochrome path)',
+    prepAquatek.treatment === 'colour-preserved' && prepMaiTai.treatment === 'colour-preserved',
+    `aquatek=${prepAquatek.treatment} maiTai=${prepMaiTai.treatment}`);
+
+  const wmAquatek = await sampleRgb(prepAquatek.buffer, PELAGIC_WORDMARK_PX[0], PELAGIC_WORDMARK_PX[1]);
+  const wmMaiTai = await sampleRgb(prepMaiTai.buffer, PELAGIC_WORDMARK_PX[0], PELAGIC_WORDMARK_PX[1]);
+  const blueAquatek = await sampleRgb(prepAquatek.buffer, PELAGIC_BLUE_PX[0], PELAGIC_BLUE_PX[1]);
+  const blueMaiTai = await sampleRgb(prepMaiTai.buffer, PELAGIC_BLUE_PX[0], PELAGIC_BLUE_PX[1]);
+  const redAquatek = await sampleRgb(prepAquatek.buffer, PELAGIC_RED_PX[0], PELAGIC_RED_PX[1]);
+  const redMaiTai = await sampleRgb(prepMaiTai.buffer, PELAGIC_RED_PX[0], PELAGIC_RED_PX[1]);
+
+  check('L6 [THE DEFECT] white ink on the 0.56 Ws Aquatek plate is re-inked DARK',
+    wmAquatek[0] < 20 && wmAquatek[1] < 20 && wmAquatek[2] < 20,
+    `wordmark rgb=${wmAquatek.join(',')} — white on 0.56 is the measured invisible wordmark`);
+  check('L6 [MUST NOT REGRESS] white ink on the 0.27 Mai Tai plate stays LIGHT',
+    wmMaiTai[0] >= 240 && wmMaiTai[1] >= 240 && wmMaiTai[2] >= 240,
+    `wordmark rgb=${wmMaiTai.join(',')} — re-inking Mai Tai to black is the other polarity inversion`);
+
+  check('L6 #0055b8 is NEVER re-inked on the 0.56 plate',
+    rgbClose(blueAquatek, PELAGIC_BLUE),
+    `got ${blueAquatek.join(',')} expected ${PELAGIC_BLUE.join(',')}`);
+  check('L6 #0055b8 is NEVER re-inked on the 0.27 plate',
+    rgbClose(blueMaiTai, PELAGIC_BLUE),
+    `got ${blueMaiTai.join(',')} expected ${PELAGIC_BLUE.join(',')}`);
+  check('L6 #c10230 is NEVER re-inked on the 0.56 plate',
+    rgbClose(redAquatek, PELAGIC_RED),
+    `got ${redAquatek.join(',')} expected ${PELAGIC_RED.join(',')}`);
+  check('L6 #c10230 is NEVER re-inked on the 0.27 plate',
+    rgbClose(redMaiTai, PELAGIC_RED),
+    `got ${redMaiTai.join(',')} expected ${PELAGIC_RED.join(',')}`);
+
+  // High-chroma residual, decided not silent: both tiles fail the 3:1
+  // floor on BOTH measured plates. Re-inking them would flatten Pelagic's
+  // brand colour on every ad. Brand-colour preservation therefore wins
+  // for high-chroma pixels; a navy wordmark on a dark plate is the same
+  // accepted residual (pixel-level we cannot tell a navy wordmark from
+  // a navy tile).
+  const blueL = direct.logoPixelLuminance(...PELAGIC_BLUE);
+  const redL = direct.logoPixelLuminance(...PELAGIC_RED);
+  check('L6 residual: #0055b8 luminance is the measured ~0.29 (Rec.709, no linearize)',
+    Math.abs(blueL - 0.29) < 0.01, `got ${blueL.toFixed(3)}`);
+  check('L6 residual: #c10230 luminance is the measured ~0.18',
+    Math.abs(redL - 0.18) < 0.01, `got ${redL.toFixed(3)}`);
+  check('L6 residual: #0055b8 fails 3:1 on BOTH measured plates — and is still not re-inked',
+    direct.inkContrastRatio(blueL, PLATE_WS_AQUATEK) < 3
+    && direct.inkContrastRatio(blueL, PLATE_MAI_TAI) < 3
+    && rgbClose(blueAquatek, PELAGIC_BLUE)
+    && rgbClose(blueMaiTai, PELAGIC_BLUE));
+  check('L6 residual: #c10230 fails 3:1 on BOTH measured plates — and is still not re-inked',
+    direct.inkContrastRatio(redL, PLATE_WS_AQUATEK) < 3
+    && direct.inkContrastRatio(redL, PLATE_MAI_TAI) < 3
+    && rgbClose(redAquatek, PELAGIC_RED)
+    && rgbClose(redMaiTai, PELAGIC_RED));
+
+  // A plate 0.01 below the old 0.5 split: white wordmark must still go
+  // DARK. monochromeInkFor(0.49) is white; contrastingInkFor(0.49) is
+  // black. This is the load-bearing reason the mixed-lockup path must
+  // not reuse monochromeInkFor.
+  const prep049 = await direct.prepareLogoForComposite(pelagic, { behindLuminance: 0.49 });
+  const wm049 = await sampleRgb(prep049.buffer, PELAGIC_WORDMARK_PX[0], PELAGIC_WORDMARK_PX[1]);
+  check('L6 white wordmark on a 0.49 plate is re-inked DARK (0.5-split would have painted white)',
+    wm049[0] < 20 && wm049[1] < 20 && wm049[2] < 20,
+    `wordmark rgb=${wm049.join(',')} — 0.49 is the band where monochromeInkFor picks white`);
+  const blue049 = await sampleRgb(prep049.buffer, PELAGIC_BLUE_PX[0], PELAGIC_BLUE_PX[1]);
+  const red049 = await sampleRgb(prep049.buffer, PELAGIC_RED_PX[0], PELAGIC_RED_PX[1]);
+  check('L6 tiles still preserved on the 0.49 plate',
+    rgbClose(blue049, PELAGIC_BLUE) && rgbClose(red049, PELAGIC_RED),
+    `blue=${blue049.join(',')} red=${red049.join(',')}`);
+
+  const fs = require('fs');
+  const src = fs.readFileSync(path.join(__dirname, '..', 'services', 'directImageRenderService.js'), 'utf8');
+  check('L6-src: the inverted `behindLuminance <= 0.5` gate is gone',
+    ! /behindLuminance\s*<=\s*0\.5/.test(src));
+  check('L6-src: mixed-lockup re-ink uses contrastingInkFor, not monochromeInkFor',
+    /const ink = contrastingInkFor\(\s*behindLuminance\s*\)/.test(src));
+  check('L6-src: simple-wordmark path still uses monochromeInkFor (unchanged)',
+    /const ink = monochromeInkFor\(\s*behindLuminance\s*\)/.test(src));
 })().then(() => {
   if (failures.length) {
     console.error(`\n❌ logo colour preservation: ${failures.length} FAILED, ${pass} passed\n`);

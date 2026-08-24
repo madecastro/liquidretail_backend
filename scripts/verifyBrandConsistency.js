@@ -27,8 +27,13 @@
  *   generated. Two contained causes from one asset:
  *     (a) resize box was width × 0.35·width — a stacked lockup was crushed
  *         to ~60px tall on 1080, wordmark illegible;
- *     (b) colour-preserve kept a dark wordmark on a dark generated plate,
- *         so the wordmark vanished while the polychrome tiles stayed.
+ *     (b) CORRECTED 2026-08-24: Pelagic's wordmark is WHITE (#ffffff), not
+ *         dark. It vanishes on a LIGHT plate (Ws Aquatek behind-logo
+ *         luminance 0.56) and is clearly present on a DARK plate (Mai Tai
+ *         0.27). Colour-preserve kept the white pixels, which is right on
+ *         0.27 and invisible on 0.56. Re-ink is contrast-driven and
+ *         bidirectional; high-chroma tiles (#0055b8 / #c10230) are never
+ *         re-inked. Pinned by verifyLogoColorPreservation.js L6.
  *   Model-drawn logos (prompt non-compliance) remain possible and are
  *   NOT a config fix — see the session write-up. (a)+(b) are.
  *

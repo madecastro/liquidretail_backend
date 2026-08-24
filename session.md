@@ -68,6 +68,15 @@ it clears it back to this placeholder in the same commit that closes it out.)_
 
 *(Replace this whole section, don't append to it, when it goes stale.)*
 
+- **THIS WORKTREE (`fix/brand-consistency`, 2026-08-24):** logo re-ink
+  polarity corrected. `1d8e3007` re-inked low-chroma pixels to LIGHT ink
+  on dark plates only; Pelagic's wordmark is WHITE and vanished on the
+  LIGHT plate (Ws Aquatek behind-logo luminance **0.56**, Mai Tai **0.27**
+  stayed visible). Re-ink is now contrast-driven and bidirectional; red/blue
+  tiles are never re-inked. Square logo box + rating `"5.0"` + generic-CTA
+  casing from `1d8e3007` unchanged. Write-up:
+  `session.d/2026-08-24_logo-reink-polarity.md`. Branch is local, not on
+  `main`.
 - **UNATTENDED E2E LOOP, 2026-08-21 (this entry): `main` is at `8fc602d6`
   (#303).** PR #303 reverts `REMOTION_QUEUE_CONCURRENCY` 8→4 — the 4→8 raise in
   #274 was owner-approved *contingent on* being validated against the web-service
