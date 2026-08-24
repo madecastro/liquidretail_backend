@@ -68,17 +68,14 @@ it clears it back to this placeholder in the same commit that closes it out.)_
 
 *(Replace this whole section, don't append to it, when it goes stale.)*
 
-- **THIS WORKTREE (`fix/brand-consistency`, 2026-08-24):** logo re-ink
-  is contrast-driven and bidirectional (`10d38637`), then the decision
-  margin was widened: true-WCAG linearized `inkContrastRatio` + floor
-  **4.5**, as a pair (linearize-only lets 0.56 through; floor-only
-  blacks out Mai Tai 0.27). Worst-case margin **28%** (was 9%);
-  white-ink cliff 0.465 (Mai Tai headroom 0.195, was 0.03); picker
-  crossover moved 0.179 → 0.460. Dark-plate black-ink cliff widened
-  0.10 → 0.455. Tiles / chroma / rating / CTA / square box unchanged.
-  Write-up: `session.d/2026-08-24_logo-reink-wcag-pair.md` (this) and
-  `session.d/2026-08-24_logo-reink-polarity.md` (polarity). Branch is
-  local, not on `main`.
+- **THIS WORKTREE (`fix/social-proof-renders-furniture`, 2026-08-24):**
+  static `ai_social_proof_led` now demands a star-glyph widget instead of
+  paraphrasing the rating into a headline. Kill switch
+  `STATIC_RATING_FURNITURE` (default ON) restores the previous static and
+  Director prompts byte-for-byte. Director validator rejects "by everyone"
+  / "brand-wide" as copy. Scope label stays on the number. Write-up:
+  `session.d/2026-08-24_social-proof-rating-furniture.md`. PR open, not
+  merged.
 - **UNATTENDED E2E LOOP, 2026-08-21 (this entry): `main` is at `8fc602d6`
   (#303).** PR #303 reverts `REMOTION_QUEUE_CONCURRENCY` 8→4 — the 4→8 raise in
   #274 was owner-approved *contingent on* being validated against the web-service

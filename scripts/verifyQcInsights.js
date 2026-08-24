@@ -153,12 +153,13 @@ check('B3 append-only: output starts with the unmodified baseline', () => {
   assert.strictEqual(r2.prompt, BASELINE, 'empty table is a no-op again');
 });
 
-check('B4 promptFlagsSnapshot includes the four flags', () => {
+check('B4 promptFlagsSnapshot includes the five flags', () => {
   const snap = promptFlagsSnapshot();
   assert.strictEqual(typeof snap.fidelityHardening, 'boolean');
   assert.strictEqual(typeof snap.lifestylePreserve, 'boolean');
   assert.strictEqual(typeof snap.brandLedCopy, 'boolean');
   assert.strictEqual(typeof snap.segmentOverridesEnabled, 'boolean');
+  assert.strictEqual(typeof snap.ratingFurniture, 'boolean');
 });
 
 const insights = require('../services/qcInsightsService');
