@@ -2312,9 +2312,20 @@ async function reframeReferenceForAspect({ media, sourceUrl, aspectRatio, brand,
               stage: 'reframe-outpaint',
               provider: 'atlas',
               model: REFRAME_OUTPAINT_MODEL(),
-              brandId: brand?._id || media?.brandId || null,
+              // Prefer the explicit params over the doc-derived fallbacks: the
+              // caller knows which ad/run this reframe is FOR, the Media doc
+              // does not. Two hunks above, the analyzeOverlayZones call in this
+              // same function already threads all four — this write was simply
+              // missed, so a real billed Atlas outpaint landed in CostLog with
+              // no adId/campaignRunId and could not be traced to the ad that
+              // caused it. Same class as the 2026-08-24 attribution audit
+              // (42% of one day's spend unattributable). Ported from backend
+              // #329, which fixed the identical call in its copy of this file.
+              brandId: brandId || brand?._id || media?.brandId || null,
               mediaId: media?._id || null,
-              productId: media?.metadata?.catalogProductId || null,
+              productId: productId || media?.metadata?.catalogProductId || null,
+              adId,
+              campaignRunId,
               purposeTag: `reframe:${aspectRatio}`,
               costUsd: REFRAME_COST_USD(),
               // Was missing entirely (2026-08-19 audit finding): without a

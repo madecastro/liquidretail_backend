@@ -1,8 +1,8 @@
 {
   "version": 1,
   "backendRef": "origin/main",
-  "backendHead": "b7b8cae674b29c95ed2ad2bb5fb7574f2dae60f4",
-  "generatedAt": "2026-08-24T20:04:28.036Z",
+  "backendHead": "ba99a59f10619bbd940be9442c8852dc32ae278a",
+  "generatedAt": "2026-08-24T21:42:07.169Z",
   "files": {
     "models/Ad.js": {
       "backendHash": "8e4951d5a020ada681e2e83f4c1869faf4e74e00b6c4afa1a7de71105b72aca4",
@@ -416,10 +416,10 @@
       "status": "synced"
     },
     "services/adVisionQcService.js": {
-      "backendHash": "927d4d0c0fc4f6db56a3a7c06dd2f6c17d6c31f8766a80a39c0d998436bbf50c",
-      "backendSha": "aff3488d494ee7484d27971920a2b96e438e60fd",
+      "backendHash": "50c112ea46d74d8cfada2b720b1bcb7dc3277d6162328ea0a4fdb46a9cef9c90",
+      "backendSha": "ba99a59f10619bbd940be9442c8852dc32ae278a",
       "status": "fork",
-      "reason": "env-var fallback removed + buildPersistedVerdict invariant restored 2026-08-24 to match backend (was: adgen still honored AD_VISION_QC_ENABLED/pipeline env fallbacks after backend retired them). Residual, deliberate gap: backend's isStaticEnabled()/isVideoEnabled() synchronous pipeline gates are not ported (unused by any adgen caller)."
+      "reason": "Backend #329 threads campaignRunId through judgeRender/runPostRenderQc/judgeVideoRender/runVideoPostRenderQc; adgen already carries campaignRunId in all four (via adgen's own #43 cost-ledger attribution work) — same shape, verified at each call site (adVisionQcService.js:1088,1389,1756,1837 + their internal judge() calls). Residual divergence unchanged from prior look: env-var fallback removed + buildPersistedVerdict invariant restored to match backend; backend's isStaticEnabled()/isVideoEnabled() synchronous pipeline gates remain unported (unused by any adgen caller)."
     },
     "services/adgenBridge.js": {
       "backendHash": "49ac3bb8c5a63a35d538e9cbd798bd1af1789ef9f121770b8e2d25659efd6496",
@@ -449,10 +449,10 @@
       "status": "synced"
     },
     "services/aiVideoPosterService.js": {
-      "backendHash": "5987935ec756fd8880166850340e5b9415dc7df8cf8fd55a8c018260707e525d",
-      "backendSha": "096e92d6d0f543e7edafd070d4540b02b40a4a4b",
+      "backendHash": "344743defecabaab6b3d833ddd9df6c9dcbc9547239bab8556236b15cb7d1f32",
+      "backendSha": "ba99a59f10619bbd940be9442c8852dc32ae278a",
       "status": "unused",
-      "reason": "backend poster path; adgen does not invoke it"
+      "reason": "Backend #329 added adId to the vision-QC cost meta inside generatePosterForAd; irrelevant here — reconfirmed zero require()/mentions of this file anywhere in adgen src/ (backend poster path; adgen does not invoke it)."
     },
     "services/aiVideoReferenceService.js": {
       "backendHash": "5605a8da64af1774e9955e65269225083c0a5e3e3708bc0e0c7779e7499a2fdd",
@@ -510,16 +510,16 @@
       "reason": "backend text helper; renderer uses atlasLlmService / atlasImageService"
     },
     "services/atlasVideoService.js": {
-      "backendHash": "6fc231e0773ebf194f83e97d3b454660ba5d3da2193e4a7284ea03744cadd921",
-      "backendSha": "149862fdcde316f7d22a706bf627d7ca9f9f091e",
+      "backendHash": "72a5e707e664e9d0dcf90b90b34ea27ffcb71cca4d045719182bafa28cf75088",
+      "backendSha": "ba99a59f10619bbd940be9442c8852dc32ae278a",
       "status": "fork",
-      "reason": "generateForAd now has a resume-from-receipt gate (shouldResumeAttempt) so a re-claimed, receipt-holding ad does not double-bill Atlas Omni. Backend does not have this yet — adgen is the current render-owning service and the priority target; backend's own out-of-band bootRecoveryService sweep is its existing mitigation. Not a permanent fork: port to backend if/when the same re-claim exposure is prioritized there. Additionally carries cost-ledger attribution (brandId/productId/adId/campaignRunId) threaded independently per repo's real call graph — backend via pipelines/detect.js, adgen via renderer.js/generateForAd; not byte-identical by design."
+      "reason": "fork — generateForAd carries a resume-from-receipt gate (shouldResumeAttempt) so a re-claimed, receipt-holding ad does not re-submit a paid Atlas Omni generation; backend has no equivalent and relies on its out-of-band bootRecoveryService sweep. Cost-ledger attribution (brandId/productId/adId/campaignRunId) is threaded per each repo's own call graph — backend via pipelines/detect.js, adgen via renderer.js/generateForAd — so the files are not byte-identical by design. Backend #329's reframe-outpaint attribution fix WAS a real gap on this side and is ported here (recordFlatCost stage:'reframe-outpaint' now prefers the explicit brandId/productId params and carries adId/campaignRunId); re-pointed only after that port, not instead of it."
     },
     "services/basePlateCropService.js": {
-      "backendHash": "d41de1310b463a27ef7531770fa58353becbfa97bf54436e50fbf59f1496d3ee",
-      "backendSha": "c24d6526ecbfcb3ea8cfa0b52b3a25a3556fa1d7",
+      "backendHash": "03d13d046489c24734fc54a97edb158ed9abc4f7ad03e2ec4a84c8b0ad3b6aeb",
+      "backendSha": "ba99a59f10619bbd940be9442c8852dc32ae278a",
       "status": "fork",
-      "reason": "cost-ledger attribution (brandId/productId/adId/campaignRunId) threaded independently per repo's real call graph — backend via pipelines/detect.js, adgen via renderer.js/generateForAd; not byte-identical by design"
+      "reason": "Backend #329 added productId: ad.productId || null to both detectClipBoxes call sites (resolveBasePlateVideoUrl, ensureFaceDetectionForKeepOut); adgen already threads campaignRunId/brandId/productId/adId through detectFrameBoxes/detectClipBoxes (basePlateCropService.js:398,442) and both call sites already pass productId: ad.productId || null (adgen #43) — verified byte-identical outcome for this hunk."
     },
     "services/blockClassifier.js": {
       "backendHash": "505108cca42df8bb500c620f032f1455f9023fa6cd7b5e554672a4fe1cb5d893",
@@ -539,10 +539,9 @@
       "status": "synced"
     },
     "services/brandEnrichmentService.js": {
-      "backendHash": "b2a8ed1a36523961df246a107690ab614fa2cf72e24c6344c1e3f332faa01a05",
-      "backendSha": "c31ffe9976670f02d87fb9e7824911d6fd848643",
-      "status": "fork",
-      "reason": "cost-ledger attribution: added brandId to the brand_enrichment_gpt chatCompletion meta (threaded from the enclosing runEnrichment(brand, brandId, run) param) — not byte-identical to backend by design, same class of change as the other attribution-fix reconciles"
+      "backendHash": "d87ae2c5e4dfef9c772c305d050b7a364baf320c3168c70cfeca829ee7260e5a",
+      "backendSha": "ba99a59f10619bbd940be9442c8852dc32ae278a",
+      "status": "synced"
     },
     "services/brandFontIngestService.js": {
       "backendHash": "4356d30c999bc14c23ba0d3a5fa5c5ae52fadcd8326871ba13024c15514071bf",
@@ -709,10 +708,10 @@
       "reason": "backend matcher; adgen does not call it"
     },
     "services/directImageRenderService.js": {
-      "backendHash": "6fdcaefb2c96ddb9227d07f97029be3f76ddf4d33c41785f6fe38dde0127a99a",
-      "backendSha": "a8e812db398a8813796db2320b26b9d0477e4292",
+      "backendHash": "f26a16df7e1a5e78b104f0824ea7ce63250c4fe153bfd8cc50721e7900cc0cda",
+      "backendSha": "ba99a59f10619bbd940be9442c8852dc32ae278a",
       "status": "fork",
-      "reason": "deliberate fork: adgen owns usableAttribution, composeCorrectiveOverride, buildQcRetryArgs, submitEditImageWithSeedFallback; colourway gate hunk-ported from backend #324; logo-safe-box inset hunk-ported from backend #327 (adgen #23) — both sides now carry LOGO_INSET_FRAC/logoInsetPx, verified identical"
+      "reason": "Backend #327 (logo-safe-box) parity already held; backend #329 additionally added campaignRunId: campaignRunId || null to the vision-QC params object immediately preceding the 'MONEY: generate() attempt 1...' comment. adgen already carries campaignRunId: campaignRunId || null at the identical call site (directImageRenderService.js:2951, adgen #43) — confirmed byte-identical for this hunk. Existing fork reasons unchanged: adgen owns usableAttribution, composeCorrectiveOverride, buildQcRetryArgs, submitEditImageWithSeedFallback; colourway gate + logo-safe-box inset hunk-ported from backend, both sides verified identical on LOGO_INSET_FRAC/logoInsetPx."
     },
     "services/enrichmentReconciler.js": {
       "backendHash": "18319b9414c7c67c332f03cbb7870c42048dace067a55523f54b7ea16c071649",
@@ -772,10 +771,10 @@
       "reason": "backend preview helper; no adgen caller"
     },
     "services/imageRecoveryService.js": {
-      "backendHash": "7560a0679aef48d4a0e737d972467d3dac7fe4cd9d270061c183dde1f46807a6",
-      "backendSha": "aff3488d494ee7484d27971920a2b96e438e60fd",
+      "backendHash": "7090677f5ee39bf6d7c928f8151ed1a32b48f4ed43c2d44d8c95ed5b04bd48c7",
+      "backendSha": "ba99a59f10619bbd940be9442c8852dc32ae278a",
       "status": "unused",
-      "reason": "only reached from unwired bootRecovery / strandedRunSweeper"
+      "reason": "Backend #329 added productId to the CostLog objects in recoverImageAd and settleChargeState; irrelevant — reconfirmed both callers (strandedRunSweeper.js, bootRecoveryService.js) have zero requirers anywhere in adgen src/ (entrypoint.js only requires ./config, ./db, ./routes/api, ./services/orchestrator, ./services/renderer), so this file stays unreachable. Same reason as before: only reached from unwired bootRecovery / strandedRunSweeper."
     },
     "services/imageShotHeuristicService.js": {
       "backendHash": "3a9a4ea1b7ad95437b0374f1d4844c2c20c28c651c0a2d517b52f3171d17111b",
@@ -799,16 +798,16 @@
       "status": "synced"
     },
     "services/judgeService.js": {
-      "backendHash": "98056ec09e550239f738ece26f6d3041a18f3a8ac34af0929f1409e01e31acc9",
-      "backendSha": "872c40ef6b92738038a5d89903afa67954263b1d",
+      "backendHash": "1d0e37eaa893b54bb6ebacd5b7e875a56dcb4e5c1600c2d5565303ee797b4ff9",
+      "backendSha": "ba99a59f10619bbd940be9442c8852dc32ae278a",
       "status": "unused",
-      "reason": "legacy judge; adgen uses aiJudgeService"
+      "reason": "Backend #329 threads brandId/productId/adId/campaignRunId through judgeDetections, judgeExtendedCrops, and callOpenAIWithCloudinaryRetry; irrelevant here — reconfirmed zero require() sites in adgen src/ (only two doc-comment mentions in llmError.js:708,781). adgen uses aiJudgeService, unchanged."
     },
     "services/layoutInputService.js": {
-      "backendHash": "aee859d5f6c2ac2a81eca98b967dd4632e2cb89b983068dc3129ef689d0afff5",
-      "backendSha": "d8c133011275d62fa4133ed939b5e47fe5e90bdc",
+      "backendHash": "7a4357b068af59d0aceda0f15b7d387700cea557d679f07b25c28df0ad09dff4",
+      "backendSha": "ba99a59f10619bbd940be9442c8852dc32ae278a",
       "status": "fork",
-      "reason": "cost-ledger attribution (brandId/productId/adId/campaignRunId) threaded independently per repo's real call graph — backend via pipelines/detect.js, adgen via renderer.js/generateForAd; not byte-identical by design"
+      "reason": "Backend #329 added brandId/productId/adId/campaignRunId to the layout_derivation chatCompletion call inside runDerivation; adgen's runDerivation already carries the identical four fields on the same call (layoutInputService.js:918-924, adgen #43) — verified equivalent. Cost-ledger attribution threaded per repo's own call graph, same class as the other #43 reconciles."
     },
     "services/llmError.js": {
       "backendHash": "589fd87ece50784d1620ac2db054d92911c880d21d2a34be4db3f4df8aaf7f8f",
@@ -874,10 +873,9 @@
       "status": "synced"
     },
     "services/overlayZoneService.js": {
-      "backendHash": "a7ad2c22c50df2c4d2f7d6032449a26d9b60d0b5ffdd4d42617f1ad2bba983f4",
-      "backendSha": "f727e3f95bd33615b11286e7644524e71150fd9c",
-      "status": "fork",
-      "reason": "cost-ledger attribution (brandId/productId/adId/campaignRunId) threaded independently per repo's real call graph — backend via pipelines/detect.js, adgen via renderer.js/generateForAd; not byte-identical by design"
+      "backendHash": "804039cce95310cedb4d1585cfad98aad991e99aafe895df50ee23562c50ac30",
+      "backendSha": "ba99a59f10619bbd940be9442c8852dc32ae278a",
+      "status": "synced"
     },
     "services/perProductReasons.js": {
       "backendHash": "4a528d2d7c3d57d3787e531be79521c5000e20fe9b322ef0231917903b49df10",
@@ -885,10 +883,10 @@
       "status": "synced"
     },
     "services/plateIntelService.js": {
-      "backendHash": "5ad0e46c221011510aaf0ed63025b690fff0850a489415e0581fb7ab779beef0",
-      "backendSha": "dabceaf47fc8db7671a7d8f812024d550e66287a",
+      "backendHash": "21c5d7c66dbfd1a8636d2ef6feddbbf51a53f287e1fa8168ad99955786f6602d",
+      "backendSha": "ba99a59f10619bbd940be9442c8852dc32ae278a",
       "status": "fork",
-      "reason": "adgen extract is smaller than backend (backend grew after the copy)"
+      "reason": "Backend #329 added an ids={} third param to semanticScan but never wires it into the title_plate_scan chatCompletion call (verified: zero 'ids.' reads anywhere in backend's function body) — a scaffold-only change on backend's side. adgen's semanticScan/analyzePlate already fully destructure and thread brandId/productId/adId/campaignRunId into the same call (plateIntelService.js:175,238, adgen #43); adgen is ahead of backend on this specific hunk. Prior reason unchanged: adgen extract is smaller than backend (backend grew after the copy)."
     },
     "services/platformFormats.js": {
       "backendHash": "6e0a24cbf76a019e1425599a2c6411d8012962f80915fb474a699c3e003a8cde",
@@ -1151,10 +1149,10 @@
       "status": "synced"
     },
     "services/textEmbeddingService.js": {
-      "backendHash": "89fd121615f484cd06c5abfa308867c91764b77329c0b99e3e525104756749fa",
-      "backendSha": "d3bcf5c160b7e3126967724afb516925c7f831a0",
+      "backendHash": "86ef2b68438c3ff4d0f3a71b5949d4fbd4a5048a3b111818e633e5e399bb3c3c",
+      "backendSha": "ba99a59f10619bbd940be9442c8852dc32ae278a",
       "status": "unused",
-      "reason": "backend embeddings; adgen does not call it"
+      "reason": "Backend #329 added brandId/productId/adId/campaignRunId to both trackLlmCall meta objects in embed() (atlas + direct-openai-fallback paths); irrelevant — reconfirmed zero require() sites in adgen src/ (one doc-comment mention in models/CatalogProduct.js:105). Backend embeddings; adgen does not call it."
     },
     "services/titleSpecService.js": {
       "backendHash": "8a917f9e8acec42c94bca8db1f13effe9fab96e464d051c8d2ab308a0b60286d",
