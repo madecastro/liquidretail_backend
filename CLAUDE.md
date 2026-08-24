@@ -5,8 +5,57 @@ Express + Mongoose backend for Reach Social's ad-generation product. Deploys to
 (`Emami-RS-Project/liquidretail`, trunk `master`) deployed to **Netlify**
 (`staging.reach-social.io`). Trunk here is `main`.
 
+**Render ownership (2026-08-24):** when Render-dashboard
+`ADGEN_RENDERER_ENABLED=true`, **this process does not render ads.**
+`runRenderLoop` (`routes/ads.js:1715-1723`) flips the CampaignRun to
+`running` and returns; `liquidretail_adgen`'s renderer claims
+`Ad.status='rendering'` rows and runs Atlas + Remotion. This repo still
+owns HTTP generate, expansion, mint, and claim. The in-process loop below
+this gate is the **fallback** for when the flag is not `'true'` (committed
+default in `config/defaults.env` is `false`). See
+`services/adgenBridge.js` and `../liquidretail_adgen/CLAUDE.md`. Older
+docs in `docs/PIPELINES.md` / `docs/ALERTING.md` / `docs/TITLING.md` that
+say the **web process** runs `runRenderLoop` describe that fallback (and
+the pre-cutover architecture). Titling resume being "web-only"
+(`index.js` warms Remotion; `worker.js` has zero remotion refs) is still
+true **inside this repo**; live titling of new work runs in adgen.
+
 **Read `session.md` for live state. Read `ARCHITECTURE_REVIEW.md` before touching
 security, money, or the render queue** — it carries verified P0s with `path:line`.
+
+## codemap (structural analysis — installed, wired via hooks + MCP)
+
+codemap injects project structure and working-set context automatically at session start,
+on prompt submit, and around edits (project-local hooks in `.claude/settings.local.json`),
+and its MCP tools (`get_importers`, `get_dependencies`, `get_structure`, `get_diff`,
+`get_hubs`, …) are available via `.mcp.json`. That part needs no action.
+
+Actively reach for it when:
+
+- **Cold-starting on unfamiliar code**: `codemap .` (structure + most-imported hubs) and
+  `codemap --deps .` (dependency flow).
+- **Reviewing or finishing a branch**: `codemap --diff --ref main .` (diff + deps in one
+  bundle).
+
+**`codemap --importers <file>` (and the MCP `get_importers`) IS UNRELIABLE ON THIS REPO —
+confirmed false negative, do not trust it for blast-radius.** Root cause (verified against
+codemap's own upstream source, `scanner/sg-rules/javascript.yml`): the plain-`.js` import
+rule is three literal ast-grep text patterns hardcoded to **double-quoted** strings
+(`import $$$_ from "$PATH"`, `import "$PATH"`, `require("$PATH")`) — `.ts`/`.tsx`/`.jsx`
+use a structural `kind: import_statement` rule instead, which is quote-agnostic. This repo's
+`.js` files are single-quoted throughout, so every plain `require('./x')` call matches zero
+patterns. Confirmed directly with `ast-grep` itself: `require('./x')` → no match,
+`require("./x")` → matches. Verified on `routes/members.js` (required at `index.js:37`) and
+independently reconfirmed by a peer session on `services/layoutInputService.js` (14 real
+requirers including `aiCreativeDirectorService.js`, `atlasVideoService.js`,
+`brandScriptExecutor.js`, `directImageRenderService.js`, `renderService.js` — codemap 4.4.0
+says zero). Filed upstream: [JordanCoin/codemap#147](https://github.com/JordanCoin/codemap/issues/147).
+Separate and already-fixed upstream (don't rediagnose it): v4.4.0's misleading "Go resolves
+imports at package level" note used to print unconditionally on *any* zero-importer file;
+current upstream `main` gates it to `.go` files only — that fix doesn't touch the
+quote-style bug above. **Use `grep -rn "require(.*['\"].*<name>" --include="*.js" .` for any
+import/blast-radius question here instead.** The tree view, `--diff`, and dependency-flow
+output are unaffected — they don't depend on the same import-resolution path.
 
 Live prod (2026-08-11) = **`5d02debe`** (both services — WEB
 `srv-d1vuktqli9vc73ft07ng`, WORKER `srv-d8128c1o3t8c73e8kb30`). Offline verify
