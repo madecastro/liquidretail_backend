@@ -53,6 +53,7 @@
  */
 
 const pf = require('./platformFormats');
+const { ratingFurnitureEnabled } = require('./adCopyGuards');
 
 // ── generation sizes + surface geometry ─────────────────────────────────
 // gpt-image-2/edit size contract: the SCHEMA is operative (the model README is
@@ -561,22 +562,42 @@ const SACRIFICE_ORDER = ['BADGE', 'ATTRIBUTION', 'SUBHEAD', 'TRUST MARK', 'CUSTO
  * intent that never shows a quote must say so even when a quote exists, or the
  * model borrows it from context.
  */
-function absences(d, { rendersQuote, rendersRating, rendersBadge, rendersSubhead }, dropped = [], policy = {}) {
+function absences(d, { rendersQuote, rendersRating, rendersBadge, rendersSubhead }, dropped = [], policy = {}, extras = {}) {
   const out = [];
   const lost = (role) => dropped.includes(role);
   if (!rendersQuote || !d.quote || lost('CUSTOMER QUOTE')) out.push(
-    'no customer quote, testimonial, review sentence, quotation marks, star-glyph row or attribution — and never re-dress a tagline, badge or headline as something a customer said');
+    extras.furnitureRating
+      // Furniture arm: do not ban the glyph row the widget demands.
+      // Flag-off / non-furniture keeps the original sentence (byte-identity).
+      ? 'no customer quote, testimonial, review sentence, quotation marks or attribution — and never re-dress a tagline, badge or headline as something a customer said'
+      : 'no customer quote, testimonial, review sentence, quotation marks, star-glyph row or attribution — and never re-dress a tagline, badge or headline as something a customer said');
   else if (!d.attribution || lost('ATTRIBUTION')) out.push(
     'no name, initial, city, date, handle, avatar or verification tick — the quote stands alone');
   if (!rendersRating || !d.rating || lost('RATING') || lost('TRUST MARK')) out.push(
     'no numeric score, star glyphs or trust mark of any kind');
-  else {
+  else if (extras.furnitureRating) {
+    /**
+     * social_proof_led + STATIC_RATING_FURNITURE. The previous branch BANNED
+     * the star row ("ONLY rating mark permitted") so gpt-image-2 satisfied
+     * the RATING string by paraphrasing it into a headline — measured on
+     * Soludos ("Rated 5 Stars By Everyone Who's Tried Them") and Pelagic
+     * ("5-star brand-wide rating"), with no stars / numeral / count on
+     * frame. Invert: demand the widget, forbid the sentence form. Other
+     * intents keep the star-row fence below (quiet TRUST MARK).
+     */
+    out.push(RATING_FURNITURE_ABSENCE);
+    if (!d.reviewCount) out.push('no review count, and not the words review, reviews, ratings or customers');
+  } else {
     /**
      * Fires even though a rating IS shown. Two of five test renders drew a
      * five-star glyph row beside the supplied "4.8 ★" string — and both drew
      * FOUR AND A HALF stars, contradicting the real 4.8. Showing one rating
      * invites the model to complete the familiar review-widget pattern, so the
      * permitted mark has to be fenced explicitly.
+     *
+     * social_proof_led under STATIC_RATING_FURNITURE takes the branch above
+     * instead — that intent's core IS the rating, and the fence is what
+     * let the model replace the widget with a claim sentence.
      */
     out.push('no star row, five-star graphic, half-star, rating bar, meter, percentage score, review-site widget, verified tick, customer avatar, screenshot of a review, publication masthead or award laurel — the single rating string above is the ONLY rating mark permitted anywhere in the frame');
     if (!d.reviewCount) out.push('no review count, and not the words review, reviews, ratings or customers');
@@ -609,8 +630,15 @@ function absences(d, { rendersQuote, rendersRating, rendersBadge, rendersSubhead
      * rules above already permit exactly those and fence the rest. A blanket
      * "no ratings" line here would contradict the supplied rating string and
      * undo the tuned star-row rule above it.
+     *
+     * Furniture carve-out: without it this line forbids the star-glyph row
+     * the widget demands ("if a … mark is not in the text above, it does
+     * not belong") — the same self-contradictory-prompt class as PR #61.
+     * Flag-off / non-furniture intents keep the original sentence.
      */
-    out.push('no award, laurel, ribbon, seal, guarantee, warranty or money-back claim, QR code, barcode, legal or regulatory small print, or promotional claim of any kind — and nothing else you were not given: if a word, numeral or mark is not in the text above, it does not belong in the image');
+    out.push(extras.furnitureRating
+      ? 'no award, laurel, ribbon, seal, guarantee, warranty or money-back claim, QR code, barcode, legal or regulatory small print, or promotional claim of any kind — and nothing else you were not given: if a word, numeral or mark is not in the text above, it does not belong in the image, except the star-glyph row the rating widget requires'
+      : 'no award, laurel, ribbon, seal, guarantee, warranty or money-back claim, QR code, barcode, legal or regulatory small print, or promotional claim of any kind — and nothing else you were not given: if a word, numeral or mark is not in the text above, it does not belong in the image');
   } else {
     out.push('no product name, website, hashtag or small print');
     out.push('no added brand logo, wordmark or lockup anywhere in the scene — any logo already printed on the garment itself stays exactly as it is, but nothing new is drawn');
@@ -623,7 +651,14 @@ const INTENTS = {
   social_proof_led: {
     priority: 1,
     ownerBrief: 'Product image dominates; prominently show average star rating, review count, and a short authentic quote if available. Clean modern design, generous white space, strong hierarchy. Badge if available. Logo subtle. Clear Shop Now CTA. Premium, trustworthy, native to Instagram/Facebook — not a banner ad.',
-    goal: 'A stranger scrolling past should understand, before reading a word of body copy, that many real people already bought this and rate it highly.',
+    /**
+     * Flag-off returns the pre-change string byte-for-byte. Flag-on drops
+     * "many real people … rate it highly", which invited the model to write
+     * "by everyone" as the takeaway instead of drawing the widget.
+     */
+    goal: (kept, ctx = {}) => RATING_FURNITURE
+      ? 'A stranger scrolling past should see the rating widget — star glyphs, the numeral, the count — before they read a word of body copy. The rating is those marks, not a sentence about them.'
+      : 'A stranger scrolling past should understand, before reading a word of body copy, that many real people already bought this and rate it highly.',
     renders: { rendersQuote: true, rendersRating: true, rendersBadge: true },
     core: ['RATING'],
     /** Eligibility, from the owner brief: this intent IS the rating. */
@@ -889,6 +924,34 @@ const LIFESTYLE_PRESERVE = process.env.STATIC_LIFESTYLE_PRESERVE === 'true';
  * than re-reading the env var.
  */
 const BRAND_LED_COPY = process.env.STATIC_BRAND_LED_COPY !== 'false';
+
+/**
+ * RATING FURNITURE — kill switch, default ON.
+ *
+ * `false` restores a **byte-identical** pre-change prompt: social_proof_led
+ * keeps the star-row BAN ("ONLY rating mark permitted"), the original goal
+ * sentence, and no furniture note. That completeness is the point — the
+ * measured defect (rating paraphrased into a headline, no stars/numeral/count
+ * on frame) was produced by that prompt, and the A/B control arm has to be
+ * the arm that produced it.
+ *
+ * Flag-on inverts the social_proof_led rating path only. brand_led /
+ * product_first_lifestyle TRUST MARK prompts stay byte-identical either way.
+ * Director copy-contract half lives in adCopyGuards + validateDirectorPayload
+ * and reverts with the same flag.
+ */
+const RATING_FURNITURE = ratingFurnitureEnabled();
+
+/**
+ * Placed AFTER the SET EXACTLY THESE STRINGS block, never above it — the
+ * fidelity-hardening block already more than doubled this prompt, and weight
+ * above the verbatim list has previously cost text fidelity (CLAUDE.md).
+ * A prose headline cannot satisfy "star glyphs + numeral + count"; that is
+ * the whole demand.
+ */
+const RATING_FURNITURE_NOTE = 'The rating line is a review widget, not copy. Draw star glyphs whose fill matches the numeral (do not snap 4.8 to a half-star), then the numeral, then the parenthetical count as a small qualifier on that number. The glyph row is how that rating line is drawn — it is required, not extra copy, and not a violation of SET EXACTLY THESE STRINGS. Do not rewrite it as a headline or claim sentence — "Rated 5 stars by everyone" and "5-star brand-wide rating" are failures. Words in parentheses (including "brand reviews") qualify the count; they are not a headline.';
+
+const RATING_FURNITURE_ABSENCE = 'no rating written as a sentence or headline — never "Rated X stars", "X-star rating", "by everyone", "everyone who\'s tried them", "universally", "all customers"; the rating exists only as the star-glyph widget named above';
 
 /** The exact pre-2026-08-03 wording. Do not edit — it is the A/B control arm. */
 const LEGACY_PRODUCT_FIDELITY = `The supplied photograph is a PRODUCT REFERENCE ONLY. Reproduce this exact item faithfully — its colour, material, construction and any branding printed on the product itself — then build an entirely new scene around it. Do not reuse the reference's background, crop or lighting.`;
@@ -1247,7 +1310,8 @@ function buildPrompt({ intentKey, data, product, surface, seedStyle = null, vari
   const goalCtx = { preserve };
   const goalText = typeof spec.goal === 'function' ? spec.goal(kept_, goalCtx) : spec.goal;
   const emphasis = spec.emphasis(data, kept_, { preserve });
-  const absent = absences(data, spec.renders, dropped, effectivePolicy);
+  const furnitureRating = RATING_FURNITURE && resolved.key === 'social_proof_led' && kept_('RATING');
+  const absent = absences(data, spec.renders, dropped, effectivePolicy, { furnitureRating });
   const s = computeSurface(surface);
 
   /**
@@ -1288,6 +1352,9 @@ The words to the LEFT of each arrow name the element for your reference and must
 ${kept.map(([role, str]) => `  ${role.toLowerCase()} -> ${str}`).join('\n')}
 Set no other words, numerals or letterforms anywhere in the image — including on signage, packaging, screens or clothing within the scene.${carveOutWithCopy}`
     : `THIS AD CARRIES NO TEXT AT ALL. Render a pure product image: no words, numerals, letterforms, logos or graphic marks of any kind, anywhere in the frame — including on signage, packaging, screens or clothing within the scene.${carveOutNoCopy} The photograph alone has to do the work.`;
+  // AFTER the verbatim list, never above it. Flag-off: empty string, so
+  // the concatenation below is a no-op and the prompt is byte-identical.
+  const furnitureBlock = furnitureRating ? `\n\n${RATING_FURNITURE_NOTE}` : '';
 
   /**
    * Role framing. Owner-supplied 2026-08-03. Gated with the rest of the hardening
@@ -1364,7 +1431,7 @@ WHAT SHOULD WIN ATTENTION, in this order:
 ${emphasis.map((e, i) => `  ${i + 1}. ${e}`).join('\n')}
 That is an order of importance, not a layout, and not a checklist. Express it however reads fastest.
 
-${textBlock}
+${textBlock}${furnitureBlock}
 
 ${decideBlock}
 
@@ -1413,6 +1480,9 @@ module.exports = {
   SURFACE_EDGE_MARGIN_PCT,
   describeSurfaces,
   BRAND_LED_COPY,
+  RATING_FURNITURE,
+  RATING_FURNITURE_NOTE,
+  RATING_FURNITURE_ABSENCE,
   // Phase B PMax static overlay — harnesses call these directly.
   PMAX_STATIC_PLATFORM_NOTES,
   PLATFORM_NOTES,

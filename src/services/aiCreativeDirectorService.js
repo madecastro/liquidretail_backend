@@ -48,6 +48,7 @@ const {
 } = require('./quoteProvenance');
 const { formatBrandReviewsText, formatProductReviewsText } = require('./ratingDisplay');
 const { resolveDirectorProductRatingPair } = require('./ratingPairAtomic');
+const { ratingFurnitureEnabled, copyFailsCompliance } = require('./adCopyGuards');
 
 // Master switch for the proof MENU (category tier + social_proof_signal.
 // proof_options[] + routing.proof_pick). Default OFF: assembleSignals'
@@ -1821,6 +1822,16 @@ function validateDirectorPayload(parsed, { schema = null, nConcepts = 3, forbidd
     if (/(\$\s?\d|[£€]\s?\d|\b\d+% ?off\b|\bdiscount\b|\bsavings?\b|\bsale\b)/i.test(copy)) {
       reasons.push(`concepts[${i}].copy contains pricing or discount language, which is switched off system-wide`);
     }
+    // Same flag as the static furniture prompt. Flag-off: this scan does
+    // not run, so a round that would have been rejected for "everyone
+    // who's tried them" / "brand-wide" still validates — the A/B control
+    // arm is the validator that produced the measured headlines.
+    if (ratingFurnitureEnabled()) {
+      const fail = copyFailsCompliance(copy);
+      if (fail) {
+        reasons.push(`concepts[${i}].copy ${fail.message}`);
+      }
+    }
   });
 
   const dupes = primaries.filter((p, i) => primaries.indexOf(p) !== i);
@@ -2978,6 +2989,13 @@ function buildPromptRound({ inputSummary, creativeIntent, platformFormat, univer
     // instruction that contradicts it, or the round is self-contradictory in
     // the same way §00's PR #61 video prompt was.
     `- NO PRICING OR DISCOUNT LANGUAGE, in any copy field, on any concept. Copy containing a currency amount ("$40", "£29", "€35"), a percentage-off claim ("20% off"), or the words "discount", "sale" or "savings" is REJECTED and the ENTIRE round is re-asked — it is not salvaged per concept. Sell on the product, the proof, or the spec; never on the price.`,
+    // Stated in the prompt because the validator half below rejects the
+    // whole round — same lesson as the pricing ban: a silent validator
+    // costs a paid re-ask. Flag-off omits this line so the Director
+    // prompt is byte-identical to the pre-furniture text.
+    ...(ratingFurnitureEnabled() ? [
+      `- RATING IS FURNITURE, NOT A HEADLINE. Do not write the star rating, the review count, or a paraphrase of them as copy.headline / copy.subheadline. The renderer typesets a star-glyph widget + numeral + count; copy may quote a customer or speak to a product fact. Unqualified universal-endorsement language is REJECTED for the whole round, same as pricing: "by everyone", "everyone who's tried them", "universally", "all customers". Do not use "brand-wide" as a headline adjective — the widget already carries the scope label next to a brand-tier number.`
+    ] : []),
     `- DO NOT ground two concepts in the SAME item. If two concepts are both proof-led, they must quote DIFFERENT reviews from the pool. If the pool has only one usable quote, the second concept must switch source — a spec, or brand voice — rather than restate the same quote.`,
     // Counterweight to "THIN DATA IS NOT A STOP" below, which correctly tells
     // the model it may null an UNGROUNDED role. Read alone, that instruction
@@ -2996,7 +3014,9 @@ function buildPromptRound({ inputSummary, creativeIntent, platformFormat, univer
       ? `- HONESTY RULE: if social_proof_signal.primary_quote is null AND top_comments is empty AND rating is null AND social_proof_signal.proof_options is empty, you MUST set routing.social_proof_type="none" on EVERY concept. Don't promise proof the data can't back. In that case also avoid stat_led_social_proof and hero_quote_overlay — lean on brand voice (typographic_dominant, magazine_editorial) or the photo itself. Record that choice in reasoning.rationale only — never in art_direction or copy. When proof_options IS non-empty, proof CAN be backed — but only in that option's own scope, so surface it with its scope wording (see PROOF MENU below), never as this product's own number.`
       : `- HONESTY RULE: if social_proof_signal.primary_quote is null AND top_comments is empty AND rating is null, you MUST set routing.social_proof_type="none" on EVERY concept. Don't promise proof the data can't back. In that case also avoid stat_led_social_proof and hero_quote_overlay — lean on brand voice (typographic_dominant, magazine_editorial) or the photo itself. Record that choice in reasoning.rationale only — never in art_direction or copy.`,
     ...(directorProofMenuEnabled() ? [
-      `- PROOF MENU: social_proof_signal.proof_options[] lists every available proof point across product / category / brand tiers, each with its own pre-scoped "reviews_text" disclosure. Set routing.proof_pick to the 0-based index of the option your copy draws from, or null if you used none of them / relied on primary_quote instead. If you write copy from a category or brand option, your words MUST carry that option's own scope (e.g. "loved across our whole line" / "brand-wide") — NEVER phrase a category or brand number as if it belonged to this specific product. routing.proof_pick does NOT change which number or quote actually renders in the ad's dedicated proof slots — that is decided separately, deterministically, and always truthfully; it only tells us which signal informed your copy, for audit.`
+      ratingFurnitureEnabled()
+        ? `- PROOF MENU: social_proof_signal.proof_options[] lists every available proof point across product / category / brand tiers, each with its own pre-scoped "reviews_text" disclosure. Set routing.proof_pick to the 0-based index of the option your copy draws from, or null if you used none of them / relied on primary_quote instead. If you write copy from a category or brand option, do NOT put the number or "brand-wide" in the headline — the renderer typesets the number with its scope label as a rating widget. Allude to the wider following without restating the numeral ("loved across our whole line" is fine; "5-star brand-wide rating" is not). NEVER phrase a category or brand number as if it belonged to this specific product. routing.proof_pick does NOT change which number or quote actually renders in the ad's dedicated proof slots — that is decided separately, deterministically, and always truthfully; it only tells us which signal informed your copy, for audit.`
+        : `- PROOF MENU: social_proof_signal.proof_options[] lists every available proof point across product / category / brand tiers, each with its own pre-scoped "reviews_text" disclosure. Set routing.proof_pick to the 0-based index of the option your copy draws from, or null if you used none of them / relied on primary_quote instead. If you write copy from a category or brand option, your words MUST carry that option's own scope (e.g. "loved across our whole line" / "brand-wide") — NEVER phrase a category or brand number as if it belonged to this specific product. routing.proof_pick does NOT change which number or quote actually renders in the ad's dedicated proof slots — that is decided separately, deterministically, and always truthfully; it only tells us which signal informed your copy, for audit.`
     ] : []),
     // RESERVED PROOF-LED SLOT — owner directive 2026-08-07, after social-proof
     // static ads all but disappeared from production. Emitted ONLY when a RATING

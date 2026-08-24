@@ -14,135 +14,54 @@ it clears it back to this placeholder.)_
 
 ## CURRENT STATE
 
-*(Written 2026-08-24. Worktree `/Volumes/Sayulita/Projects/RS/.wt-remotimeout`,
-branch `fix/remotion-child-timeout` off `origin/master` @ `227348c`.)*
+*(Written 2026-08-24. Worktree `/Volumes/Sayulita/Projects/RS/.wt-proofport`,
+branch `port/rating-furniture-to-adgen` off `origin/master` @ `9d68b20`.)*
 
-- **What this is.** Production regression from PR #8 (`c00e17d`): the Remotion
-  child supervisor reused `REMOTION_TIMEOUT_MS=180s` as a wall-clock SIGKILL of
-  the whole child. Tonight 3/12 ads on run_1787575090320_db5a5d96 failed with
-  `remotion child exceeded 180000ms timeout` after the Omni master was paid.
-- **Mechanism (confirmed).** Timer starts at spawn AFTER `enqueue()` takes a
-  `REMOTION_QUEUE_CONCURRENCY` slot — queue wait is not counted. Covers the
-  whole child lifetime (re-bundle, download, plate scan, selectComposition,
-  renderMedia, process.exit). Remotion's `timeoutInMilliseconds` is a
-  delayRender() watchdog (4.0.495 `timeout.js`), not a whole-render bound.
-  Same number, two clocks. Not nested double-count.
-- **Fix.** Split: `RENDER_TIMEOUT_MS` / `REMOTION_TIMEOUT_MS=180000` stays the
-  delayRender timeout. New `CHILD_TIMEOUT_MS` / `REMOTION_CHILD_TIMEOUT_MS=480000`
-  is the wall-clock. 480s admits 100% of the 62-asset sample (mean 89 / p95 158 /
-  max 380) with 26% slack above max. Finite — a wedged Chrome/ffmpeg is still
-  SIGKILL'd at 8 min. Child isolation, D11, heartbeat, #7 `$in` filters,
-  `REMOTION_QUEUE_CONCURRENCY=2` untouched.
-- **Heartbeat interaction.** Per-child 480s sits under the 10 min formula floor
-  and the live 60.8 min cap, so a hung *in-slot* child dies before that ad's
-  beat. A full 32-inflight pile-up of 480s waves is 128 min and exceeds 60.8 min
-  (the formula still uses 76s). 16×180s used to fit; 16×380s already did not.
-  Not fixed here — heartbeat is out of scope. Tonight's 12-ad batch (6 waves)
-  still fits at 480s (48 min).
-- **Proof.** Isolation 27/27 → 32/32. Mutation: Infinity → B6/B7/D12 red;
-  absent fallback → B6/B7 red; reunite timeoutMs → B5/D1 red; 700s (past floor)
-  → B7/D12 red; `CHILD_TIMEOUT_MS * 2` → B5/D1 red. Restored 32/32. Heartbeat
-  17/17, slack 34/34. Suite before/after 18/22, same four reds.
-- **Pushed.** PR against master. Do not merge.
-
-*(Written 2026-08-24. Worktree `/Volumes/Sayulita/Projects/RS/.wt-runbeat`,
-branch `fix/adgen-run-heartbeat`, cut from `origin/master` @ `227348c`.)*
-
-- **What this is.** Wire the vendored-but-dead `startRunHeartbeat` into
-  adgen's render loop. With `ADGEN_RENDERER_ENABLED=true` adgen renders
-  every new ad; the module existed and was never required/called, so no
-  CampaignRun row was heartbeaten. Live proof: run_1787575090320_db5a5d96
-  had `lastHeartbeatAt` NULL and frozen `updatedAt` while the master was
-  generating. Backend reaper (`buildStaleRunningFilter`, REAP_STALE_MIN=15)
-  would stamp the run `failed` mid-render — the exact incident
-  campaignRunHeartbeat.js was written to close (run_1787105727540_e8c94542).
-- **In-flight signal.** Not process-wide `inFlight` (any ad, any run — that
-  would keep a finished run beating while a sibling worked). Per-run Map
-  `runInflight`, incremented when `processAd` begins work on an ad of that
-  run, decremented in the same finally that stops the ticker. That is
-  adgen's equivalent of backend `pools.some(p => p.inflight > 0)`.
-  `isWorking: () => runIsWorking(runId)` is exact, not `() => true`.
-- **runDocId.** Module filter is `{ _id, status:'running' }`. Ads stamp the
-  runId STRING on `campaignRunIds`, so we `findOne({ runId }).select('_id')`
-  once per run. Lookup miss → no ticker (fail towards reapable). Module
-  itself untouched.
-- **Ad arm.** Backend still bulk-claims the whole batch to `rendering`
-  before the adgen early-return. Those rows sit unowned with `updatedAt`
-  frozen at claim time (`Ad.timestamps` is false; `claimOne` does not
-  refresh it) — that IS the claimed-but-undispatched tail the 2026-08-18
-  Ad sweep stranded. At ticker start we `Ad.find({ campaignRunIds: runId })`
-  and pass those ids, same as `routes/ads.js:1868`. Two independent Grok
-  reviews both caught the empty-`adIds` hole; `startAdHeartbeat` cannot
-  cover it (`claimedByWorker:WORKER_ID`, titling-only).
-- **stop()** in processAd outer catch AND finally; handle is refcounted and
-  idempotent. Cap is module `RUN_HEARTBEAT_MAX_MS` (4h = progressService).
-  Write is still only `{ updatedAt, lastHeartbeatAt }`.
-- **Harness close-out (this session).** Production wiring was already
-  verified. `verifyCampaignRunHeartbeatWired_KNOWN_OPEN.js` still failed
-  for the wrong reason (B2 asserted the require's ABSENCE; C1 only
-  replayed bumpRunCounter). Inverted B2 (renderer.js MUST require the
-  module — import-plus-call-site). Rewrote C1 to RUN renderer.js's
-  acquireRunHeartbeat against stubs and drive heartbeatOnce at
-  runHeartbeatMs() across the 20-minute gap; updatedAt now stays inside
-  REAP_STALE_MIN. Deleted the KNOWN-OPEN header; renamed to
-  `scripts/verifyCampaignRunHeartbeatWired.js`. Revert-prove: remove
-  require → B2 red; remove startRunHeartbeat call → C1 red; restore →
-  8/8 green. Suite before 19/23 (four reds), after 20/23. Remaining
-  reds: verifyArchiveDigestRelease, verifyModelParity,
-  verifyRunFinalizesOnSettle_KNOWN_OPEN.
-- **Not merged.** PR #16 against master.
-
-*(Written 2026-08-24. Worktree `/Volumes/Sayulita/Projects/RS/.wt-brandport`,
-branch `port/brand-consistency-to-adgen`, cut from `origin/master` @ `af4338b`.)*
-
-- **What this is.** Hunk port of backend `fix/brand-consistency` (PR #321:
-  `65285607` / `21f1bf09` / `784ffad3`) into adgen so the three creative
-  fixes are LIVE on the new-ad path (`ADGEN_RENDERER_ENABLED=true`). Backend
-  copies remain regenerate/preview only.
-- **Ported files.** `src/services/directImageRenderService.js`,
-  `src/services/ratingDisplay.js`, plus harnesses
-  `scripts/verifyBrandConsistency.js`, `verifyLogoColorPreservation.js`,
-  `verifyStaticCtaDeterminism.js`. Harness requires rewritten
-  `services/*` → `src/services/*`. No `require('../config/foo')` came
-  across (nothing to rewrite to `../../config/foo`).
-- **Not a wholesale overwrite.** Every ported function body matches
-  backend byte-for-byte. Adgen divergence kept (`usableAttribution`,
+- **What this is.** Fourth port tonight of a backend-only creative fix into
+  adgen, where `ADGEN_RENDERER_ENABLED=true` actually renders NEW ads.
+  Backend PR #325 (`7cc2c7df`) made `social_proof_led` demand a star-glyph
+  widget instead of a rating CLAIM headline. Three delivered ads printed
+  "Rated 5 Stars By Everyone Who's Tried Them" (Soludos, two surfaces) and
+  "5-star brand-wide rating" (Pelagic PMax) with no stars, numeral, or count.
+  Adgen vendored `staticAdIntents.js` / `aiCreativeDirectorService.js` /
+  `directImageRenderService.js` and had ZERO `hasUniversalEndorsement` /
+  `copyFailsCompliance` hits — the backend fix was inert on the new-ad path.
+- **Port, not overwrite.** DIR divergence kept (`usableAttribution`,
   `composeCorrectiveOverride`, `buildQcRetryArgs`,
-  `submitEditImageWithSeedFallback`). DIR 2841 → 3035 lines (backend 3050).
-- **The logo pair.** `srgbEncodedToLinear` (true WCAG, breakpoint 0.04045)
-  AND `LOGO_MIN_INK_CONTRAST = 4.5`. Picker is `contrastingInkFor` on the
-  same metric. High-chroma tiles never re-inked.
-- **Hunks.** All nine DIR/ratingDisplay hunks applied on matching anchors.
-  None re-anchored.
-- **Proof.** Harnesses 82 / 21 / 41 (match backend). Mutation matrix:
-  (a) floor 3 keep lin → RED 8 fail, 0.56 wordmark stays white;
-  (b) identity linearize keep 4.5 → RED 17 fail, Mai Tai 0.27 wordmark
-  `rgb=0,0,0`; (c) both → RED 18 fail; (d) restored → 82 green.
-  Suite before 14/18, after 17/21. Same four reds (two KNOWN_OPEN,
-  verifyArchiveDigestRelease, verifyModelParity). Require-graph 506/506.
-- **Pushed** to `origin/port/brand-consistency-to-adgen`. Not merged.
-
-*(Written 2026-08-24. Worktree `/Volumes/Sayulita/Projects/RS/.wt-slack`,
-branch `fix/adgen-slack-alerting` — additive Slack alerting in `renderer.js`,
-rebased onto `origin/master` @ `c00e17d` = #8 + #10 + #11 + #9 + #7.
-False-page closed: orphan scan is now claimed-old AND not-heartbeating.)*
-
-- **Rebase still good.** Five ancestors present; diff vs master is still only
-  the two additive files (`renderer.js`, `verifyRendererSlackAlerts.js`).
-- **Orphan query is two clocks.** `claimedAt < CLAIM_STALE_MIN(20)` AND
-  `updatedAt < HEARTBEAT_STALE_MIN(5, floor 3)`. claimedAt stays: claimOne
-  does not write updatedAt (`timestamps: false`), so a fresh backlog claim
-  can carry a pre-claim stale updatedAt. Bound is 5 min = RESUME_STALE_MIN
-  (5 missed 60s beats / 3.3 missed 90s beats), not 20. Floor 3 so a legal
-  `RESUME_STALE_MIN=1` cannot make a live 90s beat look stale.
-- **Delayed rescan.** Immediate boot scan plus one unref'd `setTimeout` at
-  HEARTBEAT_STALE_MIN + AD_HEARTBEAT_SAFE_MAX_MS (5 min + 90s). A predecessor
-  that died seconds before boot still looks alive; waiting that window is
-  how "not heartbeating" becomes distinguishable from a live sibling.
-- **Invariants held.** Heartbeat interval/cap/`claimedByWorker` untouched.
-  Terminal `$in: ['rendering','draft']` untouched. OOM OUTER/INNER nesting
-  untouched; D11 green. Harness still in-memory `notifyAsync` only (E6).
-- **Not merged. Do not open a PR.**
+  `submitEditImageWithSeedFallback`, brand-consistency #14). PMax notes and
+  SCENE_PRESERVE kept. `promptFlagsSnapshot` does not exist in adgen — that
+  hunk was skipped, not invented.
+- **Hunks applied on matching anchors** (staticAdIntents absences / goal /
+  furnitureBlock / catch-all carve-out; Director require + validator +
+  round-prompt furniture rule + PROOF MENU ternary). **Re-anchored:**
+  (1) exports landed after `BRAND_LED_COPY` before the PMax block (backend
+  inserted before `SEGMENT_OVERRIDES_ENABLED`, which adgen does not export);
+  (2) quote-absence line: backend #325 left `star-glyph row` banned whenever
+  there is no quote, which contradicts the widget demand on rating-only
+  `social_proof_led` (eligible on rating alone; harness PROOF_DATA always
+  has a quote so 130 stayed green). Furniture arm drops that glyph ban;
+  flag-off keeps the original sentence. **Skipped:** `promptFlagsSnapshot`
+  (adgen never had it; no `verifyQcInsights` / `verifyStaticIntents` here).
+- **Require paths.** `adCopyGuards.js` has no `require('../config/…')` —
+  it reads `process.env` only. From `src/services/` a `require('./adCopyGuards')`
+  is correct. Harness requires rewritten `../services/*` →
+  `../src/services/*`. Require-graph 510/510 (was 506/506).
+- **Kill switch** `STATIC_RATING_FURNITURE` (default ON) in
+  `config/defaults.env`. Flag-off is byte-identical to pre-port prompts on
+  all three surfaces AND the Director round system prompt (dumped against
+  origin/master before the port was restored).
+- **Proof.** `verifyRatingFurniture.js` 130/130 (matches backend; no harness
+  edit to chase the count). Extra fixture matrix against REAL functions:
+  BLOCK "Rated 5 Stars By Everyone Who's Tried Them", "5-star brand-wide
+  rating", "Loved universally by all customers"; KEEP "Rated 4.8 by 2,341
+  verified buyers", "Highly rated by the runners who log 50-mile weeks",
+  "For the city and everywhere in between." Suite 20/23 → 21/24, same three
+  reds (verifyArchiveDigestRelease, verifyModelParity,
+  verifyRunFinalizesOnSettle_KNOWN_OPEN).
+- **Companion.** `verifyBrandConsistency.js` S-section updated so it does
+  not pin the inverted star-row BAN (22 → 24). `resolveCoherentSocialProof`
+  / `allowLabeledBrandNumbers` untouched.
+- **Pushed.** PR against master. Do not merge.
 
 ---
 
@@ -155,8 +74,6 @@ False-page closed: orphan scan is now claimed-old AND not-heartbeating.)*
   `liquidretail_backend/models/*` no longer call `mongoose.model(...)` in a
   shape the harness can extract. Also fails while a `node_modules` symlink
   is present (remove it before commit).
-- **Closed this session:** `verifyCampaignRunHeartbeatWired.js` (was
-  `_KNOWN_OPEN`). Defect is wired; harness now pins the closed state.
 - **Orchestrator is not Phase 2.**
 - **`titlingResumeService` / `bootRecoveryService` unwired** from adgen boot.
   Isolation leaves resume state; it does not start the sweeper.
