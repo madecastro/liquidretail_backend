@@ -137,24 +137,39 @@ const MAX_DERIVE_WAIT_ATTEMPTS = Number(process.env.MAX_DERIVE_WAIT_ATTEMPTS || 
 // EXISTS. adgen has never had one, so RESUME_STALE_MIN has been measuring
 // nothing for every adgen row — this does not just close a steal window, it
 // makes an existing safety margin mean what its own comment says it means.
-const AD_HEARTBEAT_MS = Number(process.env.AD_HEARTBEAT_MS || 60_000);   // 60s, as backend
+const AD_HEARTBEAT_MS_RAW = Number(process.env.AD_HEARTBEAT_MS || 60_000);   // 60s, as backend
 
-// SAFETY FLOOR ON THE INTERVAL ITSELF — adversarial review (2026-08-24) found
-// this relationship was documented in prose but nowhere enforced: nothing
-// stopped a future AD_HEARTBEAT_MS edit from silently exceeding backend's
-// RESUME_STALE_MIN (bootRecoveryService.js, default 5min/300_000ms) and
-// defeating the whole mechanism — a beat slower than the recovery window
-// means recovery can fire before a SINGLE beat has landed. 90s is 1/3.3 of
-// the 5min default, well inside the "five missed heartbeats" margin
-// bootRecovery's own comment describes; loud rather than silent because a
-// misconfigured interval here is a money-adjacent failure, not a style nit.
-if (AD_HEARTBEAT_MS > 90_000) {
-  console.warn(
-    `renderer[${WORKER_ID}]: AD_HEARTBEAT_MS=${AD_HEARTBEAT_MS}ms is dangerously close to or ` +
-    'above backend RESUME_STALE_MIN (default 5min) — a live titling job could be recovered ' +
-    'out from under this render. Keep this well under 90s unless RESUME_STALE_MIN moved too.'
+// SAFETY CLAMP ON THE INTERVAL ITSELF — CLAMP, not fail-boot, and not a
+// mere warn. Adversarial review (2026-08-24, second pass) found the earlier
+// warn-only version could be silenced by wrapping its condition in dead code
+// (`if (false && ...)`) while the unsafe value still flowed through — a
+// presence check on the warn text proved nothing about the actual interval
+// used. Clamping the VALUE itself has no boolean gate to defeat: as long as
+// this statement exists at all, AD_HEARTBEAT_MS can never exceed the safe
+// ceiling, regardless of what happens to any warning around it.
+//
+// Why clamp instead of the fail-boot pattern src/config.js uses for
+// ADGEN_ROLE: ADGEN_ROLE has no safe default, so refusing to boot is the
+// only honest option there. AD_HEARTBEAT_MS has a perfectly good default —
+// failing to boot over a misconfigured interval would take the entire
+// renderer down, a strictly worse outage than one stolen titling job. There
+// is also no legitimate reason to ever set this interval at or above the
+// staleness window it exists to defeat, so clamping overrides no real
+// operator intent.
+//
+// 90s is 1/3.3 of backend's RESUME_STALE_MIN default (5min/300_000ms) —
+// inside the "five missed heartbeats" margin bootRecoveryService's own
+// comment describes.
+const AD_HEARTBEAT_SAFE_MAX_MS = 90_000;
+if (AD_HEARTBEAT_MS_RAW > AD_HEARTBEAT_SAFE_MAX_MS) {
+  console.error(
+    `renderer[${WORKER_ID}]: AD_HEARTBEAT_MS=${AD_HEARTBEAT_MS_RAW}ms is above backend ` +
+    `RESUME_STALE_MIN (default 5min) — CLAMPING to ${AD_HEARTBEAT_SAFE_MAX_MS}ms so a live ` +
+    'titling job cannot be recovered out from under this render. Fix the env var — this clamp ' +
+    'keeps the renderer running safely, it does not fix the misconfiguration.'
   );
 }
+const AD_HEARTBEAT_MS = Math.min(AD_HEARTBEAT_MS_RAW, AD_HEARTBEAT_SAFE_MAX_MS);
 
 // TOTAL LIFETIME CAP — mandatory, and the hazard here is WORSE than the run
 // case campaignRunHeartbeat guards. An uncapped beat on a Remotion render
@@ -172,30 +187,60 @@ if (AD_HEARTBEAT_MS > 90_000) {
 // of 76s (concurrency.js REMOTION_QUEUE_CONCURRENCY 'why'). 3x that for
 // headroom — 76s is one measurement, not a distribution, and 1080p render
 // time is not guaranteed linear in queue depth if memory pressure forces
-// swapping under concurrency. Floored at 10 min so a very low concurrency
-// value cannot shrink the cap to uselessness, and left far below the 4h run
-// cap so the two heartbats can never disagree about a wedged render.
+// swapping under concurrency.
+//
+// STATE THE REAL NUMBER, do not let the floor read as the size. At today's
+// live values (MAX_INFLIGHT=32, REMOTION_QUEUE_CONCURRENCY=2) this resolves
+// to 3 * ceil(32/2) * 76_000ms = 3,648,000ms = 60.8 MINUTES. The 10-minute
+// floor NEVER BINDS at these values — the derived term is 6x larger — it
+// only matters if concurrency is raised enough to shrink the formula under
+// it. Do not lower this to "something that feels right" (10min, 20min): the
+// cap must outlast a LEGITIMATE worst-case queue wait, which really is
+// ceil(MAX_INFLIGHT / REMOTION_QUEUE_CONCURRENCY) renders deep, or the cap
+// fires mid-legitimate-wait and hands a healthy ad to bootRecovery — the
+// exact bug this file exists to fix, reintroduced by a more reassuring
+// number. The design self-corrects the direction that matters: the cap is
+// inversely proportional to REMOTION_QUEUE_CONCURRENCY, so it is 60.8min
+// today only BECAUSE that knob was dropped 4 -> 2 after the OOM; restoring 4
+// halves it to ~30min automatically. A hung render on an otherwise-idle box
+// looks alive and holds a paid master untitled for up to 60.8 minutes before
+// bootRecovery can even consider it. Left far below the 4h run cap so the
+// two heartbeats can never disagree about a wedged render — that does not
+// make 60.8min small, only smaller than 4h.
 const REMOTION_RENDER_MS_MEASURED = 76_000;
 const AD_HEARTBEAT_MAX_MS = Number(process.env.AD_HEARTBEAT_MAX_MS) || Math.max(
   10 * 60 * 1000,
   3 * Math.ceil(MAX_INFLIGHT / concurrency.REMOTION_QUEUE_CONCURRENCY) * REMOTION_RENDER_MS_MEASURED
 );
 
-// ACCEPTED RESIDUAL — stopping the beat does not stop the render. When the
-// cap fires, Remotion keeps running in THIS process; we have only stopped
-// telling Mongo about it. If the render is still genuinely alive past the
-// cap (not hung, just slow — the swapping/memory-pressure case above), the
-// row now reads as abandoned and backend recovery can title the same paid
-// master concurrently with our own still-running job. This is the SAME
-// trade campaignRunHeartbeat's own 4h cap makes ("a batch legitimately
-// longer than 4h would be reaped") — accepted there for the identical
-// reason: an uncapped beat on a render that never settles is strictly
-// worse, because it strands a paid master out of recovery's reach forever
-// instead of merely risking a race on one that runs unusually long. Actually
-// cancelling the in-flight Remotion job at the cap would close this
-// properly; that reaches into remotionRenderService's queue and is out of
-// scope here. The cap's calibration above is the mitigation available at
-// this layer — keep it comfortably above measured render time, not tight.
+// ACCEPTED RESIDUAL — stopping the beat does not stop the render, and does
+// NOT release the claim. When the cap fires we stop telling Mongo about this
+// row; Remotion keeps running in THIS process, and claimedByWorker stays set
+// on purpose (see the divergence note below) so no OTHER adgen worker can
+// claim it and resubmit a second paid Omni master. What we give up is only
+// the protection against BACKEND recovery: if the render is still genuinely
+// alive past the cap (not hung, just slow — the swapping/memory-pressure
+// case above), the row now reads as abandoned to bootRecoveryService, which
+// can hand it to titlingResumeService for a SECOND Remotion render on the
+// same paid asset while ours is still in-process.
+//
+// THIS IS NOT THE SAME HAZARD CLASS campaignRunHeartbeat's 4h cap accepts,
+// and treating it as directly equivalent overstates how settled this is.
+// Stopping a RUN beat lets the reaper reclaim a whole batch — coarse, but a
+// clean handoff. Stopping THIS beat risks a live dual-title race on one
+// asset, for however long the render keeps running past the cap —
+// CONCRETELY: two concurrent Remotion renders of the same clip on a box
+// that has already OOM-killed twice today at ~2 GiB/slot. That is a memory
+// event, not merely wasted CPU — say that plainly rather than leaning on
+// "different hazard class" as an abstraction. Both traded away an uncapped
+// beat's worse failure (a paid master stranded out of recovery's reach
+// forever) for a bounded, smaller one — that part IS the same shape — but
+// the smaller ones are not the same size or the same kind of smaller.
+// Actually cancelling the in-flight Remotion job at the cap would close
+// this properly; that reaches into remotionRenderService's queue and
+// is out of scope here. The cap's calibration above is the mitigation
+// available at this layer — keep it comfortably above measured render time,
+// not tight, and do not read "60.8 minutes" as "effectively never happens."
 
 /**
  * Beat one claimed ad's `updatedAt` while THIS worker is titling it.
@@ -224,7 +269,9 @@ function startAdHeartbeat(adId) {
       stopped = true;
       console.warn(
         `renderer[${WORKER_ID}]: titling heartbeat for ad=${String(adId).slice(-6)} hit the ` +
-        `${Math.round(AD_HEARTBEAT_MAX_MS / 60000)}m cap — releasing it to recovery`
+        `${Math.round(AD_HEARTBEAT_MAX_MS / 60000)}m cap — stopping liveness updates. Claim stays ` +
+        `held (claimedByWorker unchanged) so no other adgen worker resubmits; backend recovery ` +
+        `can now consider this row abandoned if the render is genuinely still running`
       );
       return;
     }

@@ -99,6 +99,33 @@ function fnBody(name) {
 }
 
 /**
+ * The RHS of `const NAME = <expr>;`, balanced through any nested parens/
+ * brackets/braces and cut at the top-level (depth 0) semicolon — not a
+ * substring match. THIRD PASS fix: the previous D1/C2 checks matched a
+ * PREFIX of the expression (e.g. captured `60_000` out of
+ * `Number(... || 60_000) * 5` and never noticed the trailing `* 5`) or
+ * checked properties ANYWHERE IN THE FILE rather than within this specific
+ * statement (so `MAX_INFLIGHT` used elsewhere kept a check green even after
+ * the real formula stopped reading it). Scoping to the exact statement and
+ * requiring a FULL-STRING match closes both classes.
+ */
+function constStatement(text, name) {
+  const m = new RegExp(`const\\s+${name}\\s*=\\s*`).exec(text);
+  if (!m) return null;
+  let i = m.index + m[0].length;
+  let depth = 0;
+  const start = i;
+  while (i < text.length) {
+    const c = text[i];
+    if (c === '(' || c === '{' || c === '[') depth++;
+    else if (c === ')' || c === '}' || c === ']') depth--;
+    else if (c === ';' && depth === 0) break;
+    i++;
+  }
+  return text.slice(start, i);
+}
+
+/**
  * Every `try { ... } finally { ... }` block in `text`, paired — not counted
  * separately the way the first version of this file did. Returns
  * { tryIndex, tryBody, finallyBody }.
@@ -167,6 +194,39 @@ check('B2 [MUTATION 2: beat started after the call] the beat starts BEFORE each 
   }
 });
 
+check('B1b [ANTI-SMUGGLE] the guarding finally does NOTHING but stop the beat', () => {
+  // A real, adversarial mutation: `finally { beat.stop(); await Ad.updateOne({_id}, {$set:
+  // {status:'draft'}}); }` — a bare, UNGUARDED status write smuggled into the same finally
+  // that stops the beat. B1 only checks the finally CONTAINS `.stop()`; it says nothing about
+  // what else is in there. That write defeats the entire vision-QC $in guard from #7 while every
+  // check about the beat itself stays green, because this file never inspects finally CONTENTS
+  // beyond the one string it is looking for.
+  for (const pair of guardedPairs) {
+    assert.ok(!/\bAd\s*\.\s*(updateOne|updateMany|findOneAndUpdate|findOneAndDelete|deleteOne)\s*\(/.test(pair.finallyBody),
+      `the finally that stops the beat must not perform any other Ad write — found one in: ` +
+      pair.finallyBody.replace(/\s+/g, ' ').trim());
+  }
+});
+
+check('B2b [ANTI-DECOY] the finally stops the SAME variable that captured startAdHeartbeat\'s return value', () => {
+  // B1 proves a titling call is wrapped and SOME .stop() runs in its
+  // finally. It does not prove they are connected. The third pass's
+  // decoy: `const beat = startAdHeartbeat(adId); ... finally { beat.stop(); }`
+  // where `beat` in the finally is a DIFFERENT local (e.g. shadowed, or a
+  // dummy `{ stop(){} }`) than the one holding the real timer handle. Named
+  // capture across both regexes closes it: the SAME identifier must appear
+  // in both the declaration and the .stop() call.
+  for (const pair of guardedPairs) {
+    const preTry = SRC.slice(Math.max(0, pair.tryIndex - 250), pair.tryIndex);
+    const decl = /(?:const|let)\s+(\w+)\s*=\s*startAdHeartbeat\s*\(/.exec(preTry);
+    assert.ok(decl, 'no variable capturing startAdHeartbeat(...)\'s return value found before this try');
+    const varName = decl[1];
+    assert.match(pair.finallyBody, new RegExp(`\\b${varName}\\.stop\\(\\)`),
+      `the finally must call .stop() on "${varName}" specifically — the exact variable that ` +
+      'captured startAdHeartbeat\'s return value, not a same-shaped decoy declared separately');
+  }
+});
+
 console.log('\n── C: it cannot run forever, and the cap cannot be silently defeated ──');
 
 check('C1 [MONEY] the beat has a total lifetime cap, and the cap actually stops the timer', () => {
@@ -176,19 +236,42 @@ check('C1 [MONEY] the beat has a total lifetime cap, and the cap actually stops 
   assert.match(beat, /clearInterval/, 'the cap must actually stop the timer');
 });
 
+check('C1b [ANTI-DEAD-CODE] the cap COMPARISON is not gated dead by a constant', () => {
+  // `if (false && Date.now() - openedAt > AD_HEARTBEAT_MAX_MS)` keeps
+  // AD_HEARTBEAT_MAX_MS and clearInterval both present (C1 stays green)
+  // while the cap NEVER fires — the beat runs forever, the exact "uncapped
+  // beat strands a paid master forever" hazard the cap exists to prevent.
+  const m = /if\s*\(([^)]*Date\.now\(\)\s*-\s*openedAt\s*>\s*AD_HEARTBEAT_MAX_MS[^)]*)\)/.exec(beat);
+  assert.ok(m, 'no if(...) statement found guarding the cap comparison');
+  const cond = m[1].replace(/\s+/g, '');
+  assert.strictEqual(cond, 'Date.now()-openedAt>AD_HEARTBEAT_MAX_MS',
+    `the cap's if-condition must be EXACTLY "Date.now() - openedAt > AD_HEARTBEAT_MAX_MS", found ` +
+    `"${m[1].trim()}" — anything else (e.g. "false && ...") can dead-gate the cap while C1's ` +
+    'presence checks still report green');
+});
+
 check('C2 [MUTATION 3: near-zero cap] the cap resolves via the derived formula with its floor, not a bare fallback', () => {
-  // Not just "the constant exists" (old C2) — assert the SHAPE that prevents
-  // it collapsing to near-zero: a Math.max against a >=10min floor, combined
-  // with a formula that actually reads live concurrency, not a hardcoded
-  // number baked in at review time.
-  assert.match(SRC, /const AD_HEARTBEAT_MAX_MS\s*=\s*Number\(process\.env\.AD_HEARTBEAT_MAX_MS\)\s*\|\|\s*Math\.max\(/,
+  // SCOPED TO THE ACTUAL STATEMENT, not "anywhere in the file". The earlier
+  // version checked MAX_INFLIGHT / REMOTION_QUEUE_CONCURRENCY / the floor
+  // literal as independent whole-file matches — all four stay green if the
+  // real formula is gutted (e.g. `Math.max(10*60*1000*0, 1)`) as long as
+  // `void MAX_INFLIGHT; void concurrency.REMOTION_QUEUE_CONCURRENCY;` sits
+  // anywhere else, or those identifiers are legitimately used elsewhere
+  // (MAX_INFLIGHT already is, in poll()).
+  const rhs = constStatement(SRC, 'AD_HEARTBEAT_MAX_MS');
+  assert.ok(rhs, 'could not find AD_HEARTBEAT_MAX_MS\'s declaration');
+  assert.match(rhs, /^Number\(process\.env\.AD_HEARTBEAT_MAX_MS\)\s*\|\|\s*Math\.max\(/,
     'the cap must fall back to a computed Math.max(...), not a bare small default');
-  assert.match(SRC, /10\s*\*\s*60\s*\*\s*1000/,
-    'the >=10-minute floor is gone — a very low concurrency value could shrink the cap to uselessness');
-  assert.match(SRC, /MAX_INFLIGHT/, 'the derived formula must read live MAX_INFLIGHT, not a constant');
-  assert.match(SRC, /concurrency\.REMOTION_QUEUE_CONCURRENCY/,
-    'the derived formula must read LIVE REMOTION_QUEUE_CONCURRENCY — a hardcoded number silently ' +
-    'goes stale the next time that knob moves (it already moved once, 4 -> 2, from an OOM)');
+  assert.match(rhs, /10\s*\*\s*60\s*\*\s*1000/,
+    'the >=10-minute floor must be IN this statement — a very low concurrency value could shrink ' +
+    'the cap to uselessness without it');
+  assert.ok(!/10\s*\*\s*60\s*\*\s*1000\s*\*\s*0\b/.test(rhs),
+    'the floor is multiplied by 0 — a near-zero cap dressed up with the right tokens');
+  assert.match(rhs, /MAX_INFLIGHT/, 'the derived formula must read live MAX_INFLIGHT WITHIN this statement, not a constant');
+  assert.match(rhs, /concurrency\.REMOTION_QUEUE_CONCURRENCY/,
+    'the derived formula must read LIVE REMOTION_QUEUE_CONCURRENCY WITHIN this statement — a ' +
+    'hardcoded number silently goes stale the next time that knob moves (it already moved once, ' +
+    '4 -> 2, from an OOM)');
 });
 
 check('C3 [MUTATION 4: openedAt reset every tick] openedAt is captured ONCE, outside the interval callback, and never reassigned inside it', () => {
@@ -203,6 +286,23 @@ check('C3 [MUTATION 4: openedAt reset every tick] openedAt is captured ONCE, out
   assert.ok(!/openedAt\s*=(?!=)/.test(cbBody),
     'openedAt is reassigned INSIDE the interval callback — that resets the cap on every tick and ' +
     'the cap comparison (Date.now() - openedAt > AD_HEARTBEAT_MAX_MS) can then never fire');
+});
+
+check('C3b [MUTATION: nested-helper reassignment] openedAt is declared const, so it cannot be reset via ANY indirection', () => {
+  // C3 only inspects the interval callback's own body. A mutation the third
+  // adversarial pass found and C3 misses: a helper defined INSIDE
+  // startAdHeartbeat (closing over openedAt) that the callback merely CALLS
+  // — `function bump(t) { openedAt = t; } ... setInterval(() => bump(Date.now()), ...)`.
+  // The reassignment text never appears inside the callback body C3 scans.
+  // `const` forecloses the whole indirection CLASS at the language level:
+  // any reassignment from anywhere closing over the binding throws at
+  // runtime instead of silently resetting the cap.
+  assert.match(beat, /\bconst\s+openedAt\s*=\s*Date\.now\(\)/,
+    'openedAt must be declared const — that makes a reassignment from ANYWHERE closing over it ' +
+    '(inline, or via a nested helper called from the interval) a runtime TypeError instead of a ' +
+    'silent reset of the cap comparison');
+  assert.ok(!/\blet\s+openedAt\b/.test(beat) && !/\bvar\s+openedAt\b/.test(beat),
+    'openedAt must not be declared let/var anywhere in this function');
 });
 
 check('C4 the beat writes ONLY updatedAt', () => {
@@ -235,9 +335,19 @@ check('C7 the timer is unref\'d so it cannot hold the process open', () => {
 
 console.log('\n── D: the interval itself is calibrated against the recovery window it must beat ──');
 
-check('D1 [MUTATION 1: interval too slow] AD_HEARTBEAT_MS default is a small fraction of backend RESUME_STALE_MIN (5min)', () => {
-  const m = /const AD_HEARTBEAT_MS\s*=\s*Number\(process\.env\.AD_HEARTBEAT_MS\s*\|\|\s*(\d[\d_]*)\)/.exec(SRC);
-  assert.ok(m, 'could not find AD_HEARTBEAT_MS\'s literal default');
+check('D1 [MUTATION 1: interval too slow] AD_HEARTBEAT_MS_RAW default is a small fraction of backend RESUME_STALE_MIN (5min)', () => {
+  // FULL-STRING anchored match, not a prefix .exec() — the earlier version
+  // captured only the digits inside Number(... || 60_000) and never noticed
+  // trailing arithmetic. `Number(process.env.X || 60_000) * 5` (a 300s
+  // interval — EXACTLY RESUME_STALE_MIN) still satisfied a prefix capture of
+  // "60_000" while the REAL interval reopened the steal window outright.
+  const rhs = constStatement(SRC, 'AD_HEARTBEAT_MS_RAW');
+  assert.ok(rhs, 'could not find AD_HEARTBEAT_MS_RAW\'s declaration');
+  const trimmed = rhs.replace(/\s+/g, '');
+  const m = /^Number\(process\.env\.AD_HEARTBEAT_MS\|\|(\d[\d_]*)\)$/.exec(trimmed);
+  assert.ok(m,
+    'AD_HEARTBEAT_MS_RAW\'s declaration must be EXACTLY Number(process.env.AD_HEARTBEAT_MS || ' +
+    `<literal>) with nothing else in the expression (no trailing "* N" etc). Found: ${rhs.trim()}`);
   const ms = Number(m[1].replace(/_/g, ''));
   // Backend's RESUME_STALE_MIN default is 5 minutes (bootRecoveryService.js).
   // A beat interval anywhere near that defeats the whole mechanism — the
@@ -245,19 +355,27 @@ check('D1 [MUTATION 1: interval too slow] AD_HEARTBEAT_MS default is a small fra
   // under half: an interval this loose was the exact mutation that reopened
   // the window while every earlier check stayed green.
   assert.ok(ms > 0 && ms <= 90_000,
-    `AD_HEARTBEAT_MS default is ${ms}ms — must stay well under backend's 5min RESUME_STALE_MIN ` +
+    `AD_HEARTBEAT_MS_RAW default is ${ms}ms — must stay well under backend's 5min RESUME_STALE_MIN ` +
     '(<=90s) or a slow beat lets recovery fire before protecting the row at all');
 });
 
-check('D2 a runtime safety warning exists if AD_HEARTBEAT_MS is ever configured too high', () => {
-  // A future env override could still set this dangerously high; that must
-  // not be silent. This does not replace D1 (the DEFAULT must be safe) — it
-  // is the guard for the case someone overrides it.
-  assert.match(SRC, /AD_HEARTBEAT_MS\s*>\s*90_000/,
-    'no boot-time check warns when AD_HEARTBEAT_MS is configured above the safe threshold');
+check('D2 [ANTI-DEAD-CODE] AD_HEARTBEAT_MS is CLAMPED, not merely warned about, if configured too high', () => {
+  // A warn-only guard can be silenced by wrapping its condition in dead code
+  // (`if (false && ...)`) while the unsafe value still reaches the beat — a
+  // presence check on warning TEXT proves nothing about the VALUE actually
+  // used. A clamp has no boolean gate to defeat: as long as the Math.min(...)
+  // exists in the final assignment, the value used by the beat can never
+  // exceed the ceiling, independent of anything wrapped around the log line.
+  const finalDecl = constStatement(SRC, 'AD_HEARTBEAT_MS');
+  assert.ok(finalDecl, 'could not find the final AD_HEARTBEAT_MS declaration');
+  assert.match(finalDecl.replace(/\s+/g, ''), /^Math\.min\(AD_HEARTBEAT_MS_RAW,AD_HEARTBEAT_SAFE_MAX_MS\)$/,
+    'AD_HEARTBEAT_MS must be assigned EXACTLY Math.min(AD_HEARTBEAT_MS_RAW, AD_HEARTBEAT_SAFE_MAX_MS) ' +
+    '— a value-level clamp, not a conditional warning that can be gated dead');
+  assert.match(SRC, /const AD_HEARTBEAT_SAFE_MAX_MS\s*=\s*90_000/,
+    'the safe ceiling must be a named constant at 90_000ms');
   assert.match(SRC, /RESUME_STALE_MIN/,
-    'the safety warning must name the backend constant it is protecting against, so the next ' +
-    'reader can find the relationship instead of trusting a bare number');
+    'the clamp must name the backend constant it is protecting against, so the next reader can ' +
+    'find the relationship instead of trusting a bare number');
 });
 
 console.log('');
