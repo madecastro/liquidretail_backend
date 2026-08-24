@@ -14,8 +14,8 @@ require('dotenv').config({ path: 'config/defaults.env' });     // committed defa
 const crypto = require('crypto');
 
 const ROLE = String(process.env.ADGEN_ROLE || '').toLowerCase();
-if (!['api', 'orchestrator', 'renderer'].includes(ROLE)) {
-  console.error(`❌ ADGEN_ROLE must be one of: api, orchestrator, renderer (got "${ROLE}")`);
+if (!['api', 'orchestrator', 'renderer', 'titler'].includes(ROLE)) {
+  console.error(`❌ ADGEN_ROLE must be one of: api, orchestrator, renderer, titler (got "${ROLE}")`);
   process.exit(1);
 }
 
@@ -36,6 +36,19 @@ const WORKER_ID = process.env.ADGEN_WORKER_ID
 // runRenderLoop reads this same flag; both flip together.
 function isAdgenRendererEnabled() {
   return String(process.env.ADGEN_RENDERER_ENABLED || '').toLowerCase() === 'true';
+}
+
+// Titler handoff gate — same shape as ADGEN_RENDERER_ENABLED. When false
+// (default), the titler role sleeps and never polls. When true, it polls
+// for { status:'rendering', veoVideoUrl:{$ne:null}, titlingNeeded:true,
+// claimedByWorker:null } and does Remotion titling out-of-process from the
+// renderer. Field `titlingNeeded` is stamped by the renderer's video path
+// atomic with its claim-release, and only when the SAME env is true on the
+// renderer side (single flag, two readers). The scaffold ships this gate
+// off so the service can be deployed dark and prove it boots before we
+// wire the handoff.
+function isTitlerEnabled() {
+  return String(process.env.ADGEN_TITLER_ENABLED || '').toLowerCase() === 'true';
 }
 
 // Per-instance in-process concurrency cap. The renderer's poll loop
@@ -72,5 +85,6 @@ module.exports = Object.freeze({
   SLACK_ALERT_CHANNEL: process.env.SLACK_ALERT_CHANNEL || null,
   MOCK_WORK_MS,
   MAX_INFLIGHT,
-  isAdgenRendererEnabled
+  isAdgenRendererEnabled,
+  isTitlerEnabled
 });

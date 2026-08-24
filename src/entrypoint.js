@@ -47,6 +47,19 @@ async function main() {
     });
     return;
   }
+
+  if (ROLE === 'titler') {
+    const titler = require('./services/titler');
+    await titler.run();
+    installShutdown(async () => {
+      // AWAIT for the same reason renderer does: titler.shutdown drains
+      // in-flight titling and releases any remaining claims so a peer
+      // titler picks them up on the next poll.
+      await titler.shutdown();
+      await disconnect();
+    });
+    return;
+  }
 }
 
 function installShutdown(fn) {
