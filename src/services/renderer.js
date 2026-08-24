@@ -90,7 +90,12 @@ async function uploadRenderToCloudinary(renderOutput, ctx) {
 const { resolveDeriveFromMaster } = require('./campaignAdsGenerationService');
 const atlasVideo = require('./atlasVideoService');
 const { renderBrandScriptAndSave } = require('./brandScriptExecutor');
-const { veoPrepareStoryboard } = require('./videoRouter');
+// videoRouter exports `prepareStoryboard`; the backend's routes/ads.js binds it
+// under the local alias `veoPrepareStoryboard`. Phase 1c ported the CALL from
+// there but kept the alias on the require(), destructuring a key that does not
+// exist — so this was `undefined` and every first-time video master threw
+// "veoPrepareStoryboard is not a function". Alias explicitly instead.
+const { prepareStoryboard: veoPrepareStoryboard } = require('./videoRouter');
 
 // Bounded wait for a derive-only ad's sibling master to complete. Kept
 // SHORT (60s default) so an unwaiting derive releases its worker slot
