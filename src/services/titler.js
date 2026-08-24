@@ -34,7 +34,7 @@
 // shared module NOW would enlarge the blast radius of this PR unnecessarily.
 // If you edit one copy, edit the other, until Phase 4 lands.
 
-const { POLL_MS, WORKER_ID, MAX_INFLIGHT, isTitlerEnabled } = require('../config');
+const { POLL_MS, WORKER_ID, MAX_INFLIGHT, isTitlerEnabled, isAdgenRendererEnabled } = require('../config');
 const {
   isStaleTopologyError,
   reconnectAfterStaleTopology,
@@ -89,6 +89,24 @@ function heartbeatOnce() {
 
 // ── atomic claim ───────────────────────────────────────────────────────────
 async function claimOne() {
+  // GATED ON ADGEN_RENDERER_ENABLED — the SAME cutover flag the renderer's
+  // claimOne consults — in addition to ADGEN_TITLER_ENABLED (checked by
+  // pollTick() before this is ever called). Two reasons this second gate
+  // exists, on top of pollTick()'s own:
+  //   1. Defense in depth, same as the renderer — safe for any future call
+  //      site, not just today's single caller.
+  //   2. ADGEN_RENDERER_ENABLED is the single switch documented to decide
+  //      whether adgen or backend is doing ANY rendering work right now.
+  //      Titling-in-progress video is part of that work. Without this, an
+  //      operator reverting to backend by flipping ADGEN_RENDERER_ENABLED
+  //      off — while forgetting ADGEN_TITLER_ENABLED, a separate flag —
+  //      would leave this role still claiming and titling fresh masters.
+  // Read at CALL TIME, same fail-safe direction as the renderer: unreadable
+  // or malformed reads as OFF, so this stands down rather than claims. A
+  // row already claimed by THIS worker is unaffected either way — the gate
+  // only guards acquiring a NEW claim, never an in-flight one.
+  if (!isAdgenRendererEnabled()) return null;
+
   return await Ad.findOneAndUpdate(
     {
       status:          'rendering',

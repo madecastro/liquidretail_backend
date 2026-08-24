@@ -603,6 +603,25 @@ async function alertOrphanedClaimsOnBoot() {
 let stopping = false;
 
 async function claimOne() {
+  // GATED ON ADGEN_RENDERER_ENABLED, read HERE — not only by poll()'s
+  // caller-side check (below) before it loops into this function. poll()
+  // has always checked first, so this is defense in depth for any other
+  // call site, present or future, rather than a behavior change on the
+  // live path. Read at CALL TIME (isAdgenRendererEnabled() re-reads
+  // process.env every time, never cached), so the switch stays effective
+  // without a restart — same property backend's adgenBridge.js relies on.
+  //
+  // FAIL-SAFE DIRECTION: an unreadable/malformed value is treated as OFF
+  // (see isAdgenRendererEnabled in ../config — anything other than the
+  // exact string 'true' reads as disabled). OFF means this function
+  // returns null and claims nothing. That is the safe direction here,
+  // specifically because backend's own render loop renders
+  // UNCONDITIONALLY whenever this same flag is not 'true'
+  // (services/adgenBridge.js) — so adgen standing down leaves the ad
+  // exactly where backend already handles it; adgen claiming on a
+  // misread would instead race backend for the same row.
+  if (!isAdgenRendererEnabled()) return null;
+
   // Claim any static (html_gen) or video (veo) ad that's in status:'rendering'
   // and unowned. NOTE: derives ARE claimable here even without their own
   // veoVideoUrl — the sibling-master wait happens INSIDE renderVideo() via
