@@ -38,6 +38,7 @@ const { isHtmlPipeline, DIRECT_IMAGE } = require('./staticPipeline');
 // assembly, so this gate should never fire — it exists because an artifact
 // cached before the producer-side filter landed can still carry one.
 const { toPrintableCustomerQuote, applyStrictQuoteScope, usableAttribution } = require('./quoteProvenance');
+const { applyQuoteColourway } = require('./quoteColourway');
 const { formatDisplayRating, resolveCoherentSocialProof, brandAttributionLabel } = require('./ratingDisplay');
 // THE sanctioned concept reader. Direct reads of concept.rationale on this
 // path are how private Director reasoning became art direction on 2026-08-01.
@@ -1645,6 +1646,40 @@ function buildIntentData({ concept, layoutInput, brand, product = null, cta, cam
         console.log(
           `🔒 direct-image: quote withheld (QUOTE_PROVENANCE_STRICT ` +
           `tier=${tier || 'unstamped'}) — rendering this ad with no testimonial`
+        );
+        quote = null;
+      }
+    } else {
+      quote = scoped;
+    }
+  }
+  // Colourway — sibling of noun-scope, same rescue shape. A quote that
+  // names a colour we cannot verify against this product's title is
+  // dropped; a colour-free quote is a no-op. productAttached === false
+  // is a no-op (brand / media ads) even when productTitle is set for
+  // noun-scope; product-attached + unknown colourway fails closed.
+  if (quote) {
+    const colourOk = applyQuoteColourway(quote, strictScope);
+    if (!colourOk) {
+      const tier = quote.tier || null;
+      const rest = [rotated, ...(Array.isArray(proof.secondary_quotes) ? proof.secondary_quotes : [])]
+        .filter((q) => q && q !== rotated && String(q.text || '').trim())
+        .filter((q) => (q.tier || null) === tier);
+      let rescued = null;
+      for (const cand of rest) {
+        const printable = toPrintableCustomerQuote(cand);
+        const scoped = applyStrictQuoteScope(printable, strictScope);
+        const next = applyQuoteColourway(scoped, strictScope);
+        if (next) { rescued = next; break; }
+      }
+      if (rescued) {
+        console.log(
+          `🔒 direct-image: quote failed colourway — using next allowed candidate`
+        );
+        quote = rescued;
+      } else {
+        console.log(
+          `🔒 direct-image: quote withheld (colourway mismatch) — rendering this ad with no testimonial`
         );
         quote = null;
       }

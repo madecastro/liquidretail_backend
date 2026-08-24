@@ -76,6 +76,26 @@ it clears it back to this placeholder in the same commit that closes it out.)_
   / "brand-wide" as copy. Scope label stays on the number. Write-up:
   `session.d/2026-08-24_social-proof-rating-furniture.md`. PR open, not
   merged.
+
+- **THIS WORKTREE (`fix/quote-colourway-mismatch`, 2026-08-24):** fail-closed
+  colourway gate for customer quotes (PR #324). Three owner-reproduced
+  holes closed on the same branch: display-normalized titles keep the
+  full multi-colour colourway; `green-accented` is colour language;
+  ordinary-word collocates (`mint condition`, …) are MUST-KEEP.
+  Unknown colourway + colour language drops only on product-attached
+  ads. Write-up: `session.d/2026-08-24_quote-colourway-mismatch.md`
+  and `session.d/2026-08-24_quote-colourway-pr324-holes.md`.
+- **OTHER WORKTREE (`fix/brand-consistency`, 2026-08-24):** logo re-ink
+  is contrast-driven and bidirectional (`10d38637`), then the decision
+  margin was widened: true-WCAG linearized `inkContrastRatio` + floor
+  **4.5**, as a pair (linearize-only lets 0.56 through; floor-only
+  blacks out Mai Tai 0.27). Worst-case margin **28%** (was 9%);
+  white-ink cliff 0.465 (Mai Tai headroom 0.195, was 0.03); picker
+  crossover moved 0.179 → 0.460. Dark-plate black-ink cliff widened
+  0.10 → 0.455. Tiles / chroma / rating / CTA / square box unchanged.
+  Write-up: `session.d/2026-08-24_logo-reink-wcag-pair.md` and
+  `session.d/2026-08-24_logo-reink-polarity.md` (polarity). Branch is
+  local, not on `main`.
 - **UNATTENDED E2E LOOP, 2026-08-21 (this entry): `main` is at `8fc602d6`
   (#303).** PR #303 reverts `REMOTION_QUEUE_CONCURRENCY` 8→4 — the 4→8 raise in
   #274 was owner-approved *contingent on* being validated against the web-service

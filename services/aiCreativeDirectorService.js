@@ -105,12 +105,22 @@ function mapArrivalReview(r) {
  * @param {object} [opts]
  * @returns {{text:string, author?:string}|null}
  */
+function colourSafeArrivalReviews(mapped, product) {
+  const title = product?.title || null;
+  if (!title) return mapped;
+  const { usableColourwayQuote } = require('./quoteColourway');
+  return mapped.filter((r) => usableColourwayQuote(r, title));
+}
+
 function pickDirectorPrimaryQuote(product, opts) {
   if (!directorQuotePoolAlignedEnabled()) {
     const reviews = Array.isArray(product?.reviews) ? product.reviews : [];
-    const mapped = reviews
-      .map(mapArrivalReview)
-      .filter((r) => typeof r.text === 'string' && r.text.trim().length > 30);
+    const mapped = colourSafeArrivalReviews(
+      reviews
+        .map(mapArrivalReview)
+        .filter((r) => typeof r.text === 'string' && r.text.trim().length > 30),
+      product
+    );
     return mapped[0] || null;
   }
   let pickPrimaryProductQuote;
@@ -120,6 +130,14 @@ function pickDirectorPrimaryQuote(product, opts) {
     pickPrimaryProductQuote = null;
   }
   if (typeof pickPrimaryProductQuote !== 'function') return null;
+  // Thread the product title so colour-describing quotes are fail-closed
+  // against this SKU's colourway (quoteColourway.js). Spread onto opts
+  // rather than an inline object so verifyQuoteStageAware H7 still sees
+  // `pickPrimaryProductQuote(product?.productReviews, opts`.
+  opts = {
+    ...(opts || {}),
+    productTitle: product?.title || (opts && opts.productTitle) || null
+  };
   const picked = pickPrimaryProductQuote(product?.productReviews, opts || {});
   if (!picked || !picked.text) return null;
   return {
@@ -136,9 +154,12 @@ function pickDirectorPrimaryQuote(product, opts) {
  */
 function productQuotesForDirector(product) {
   if (!directorQuotePoolAlignedEnabled()) {
-    return (Array.isArray(product?.reviews) ? product.reviews : [])
-      .map(mapArrivalReview)
-      .filter((r) => typeof r.text === 'string' && r.text.trim().length > 30);
+    return colourSafeArrivalReviews(
+      (Array.isArray(product?.reviews) ? product.reviews : [])
+        .map(mapArrivalReview)
+        .filter((r) => typeof r.text === 'string' && r.text.trim().length > 30),
+      product
+    );
   }
   let prepareQuotePool;
   try {
@@ -150,7 +171,8 @@ function productQuotesForDirector(product) {
   return prepareQuotePool(
     product?.productReviews,
     product?.productReviews?.quotes,
-    'product'
+    'product',
+    product?.title || null
   ).map((q) => ({
     text:   q.text,
     author: q.author_name || q.author || null,

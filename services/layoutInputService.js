@@ -189,6 +189,7 @@ const {
   ANONYMOUS_PRINT_ORIGINS,
   selectBrandQuotesForScope
 } = require('./quoteProvenance');
+const { usableColourwayQuote } = require('./quoteColourway');
 
 // 4.2 (2026-08-24, OWNER-DIRECTED): forces every cached LayoutInputArtifact to
 // re-derive so PR #312's provenance fix actually reaches existing products.
@@ -2247,17 +2248,43 @@ function stampTier(quotes, tierName) {
 }
 // Tier pool prep, in ONE place, so pickPrimaryProductQuote ranks exactly the
 // pool the renderer prints from. Composition is identical to the nested calls
-// this replaced — stampTier ∘ gateQuotesByRating ∘ printableQuotes ∘
-// stampQuoteOrigins — for product and category.
+// this replaced — stampTier ∘ gateQuotesByColourway ∘ gateQuotesByRating ∘
+// printableQuotes ∘ stampQuoteOrigins — for product and category.
 //
 // BRAND also routes through here, which stamps tier one step earlier than
 // before; that is neutral and verified, not incidental. selectBrandQuotesForScope
 // is tier-blind, and the only .tier reader (applyStrictQuoteScope) treats
 // unstamped and 'brand' identically, so the later stampTier(…, 'brand') is an
 // idempotent no-op. COMMENT tier does not use this: it skips stampQuoteOrigins.
-function prepareQuotePool(container, quotes, tierName) {
+//
+// productTitle is OPTIONAL. Omitted / null → colourway gate is a no-op so
+// every existing 3-arg caller stays byte-identical. A real title filters
+// colour-describing quotes fail-closed (services/quoteColourway.js).
+function gateQuotesByColourway(quotes, productTitle, tierName) {
+  if (productTitle == null || !String(productTitle).trim()) return quotes || [];
+  const list = quotes || [];
+  const kept = [];
+  let dropped = 0;
+  for (const q of list) {
+    if (usableColourwayQuote(q, productTitle)) kept.push(q);
+    else dropped++;
+  }
+  if (dropped) {
+    console.log(
+      `🔒 quote colourway[${tierName || '?'}] — ${dropped} quote(s) withheld: ` +
+      `colour language does not match product colourway`
+    );
+  }
+  return kept;
+}
+
+function prepareQuotePool(container, quotes, tierName, productTitle) {
   return stampTier(
-    gateQuotesByRating(printableQuotes(stampQuoteOrigins(container, quotes), tierName), tierName),
+    gateQuotesByColourway(
+      gateQuotesByRating(printableQuotes(stampQuoteOrigins(container, quotes), tierName), tierName),
+      productTitle,
+      tierName
+    ),
     tierName
   );
 }
@@ -2270,7 +2297,10 @@ function pickPrimaryProductQuote(productReviews, opts = {}) {
   if (!productReviews || !Array.isArray(productReviews.quotes) || !productReviews.quotes.length) {
     return null;
   }
-  return pickStrongestQuote(prepareQuotePool(productReviews, productReviews.quotes, 'product'), opts);
+  return pickStrongestQuote(
+    prepareQuotePool(productReviews, productReviews.quotes, 'product', opts.productTitle),
+    opts
+  );
 }
 
 // Load brand-scoped Instagram/TikTok comments as quote-pool candidates.
@@ -2672,9 +2702,15 @@ async function assembleInput(ctx, template, aspectRatio, options, derivation, pr
   // prints from. One definition each — two copies of the provenance stamp is
   // how the pick and the print silently disagree about which quote won.
   const productReviewsForMatch = productReviewsOf(ctx.match);
-  const tierProduct = prepareQuotePool(productReviewsForMatch, productReviewsForMatch?.quotes, 'product');
+  // Colourway is a SKU check. Brand / media-library ads have no
+  // product colourway; ident.productName is a noun-scope label and
+  // must not fail-closed colour-describing quotes on those ads.
+  const colourwayTitle = (options && options.productId)
+    ? (details.title || ident.productName || null)
+    : null;
+  const tierProduct = prepareQuotePool(productReviewsForMatch, productReviewsForMatch?.quotes, 'product', colourwayTitle);
   const catReviewsForMatch = await loadCategoryReviewsForMatch(ctx.match);
-  const tierCategory = prepareQuotePool(catReviewsForMatch, catReviewsForMatch?.quotes, 'category');
+  const tierCategory = prepareQuotePool(catReviewsForMatch, catReviewsForMatch?.quotes, 'category', colourwayTitle);
   // Brand-tier reviews are catalog-wide: they are about whatever the reviewer
   // bought, which on a multi-SKU brand is usually NOT this product. Rendering
   // one under this product's photo presents another item's praise as if it
@@ -2708,7 +2744,7 @@ async function assembleInput(ctx, template, aspectRatio, options, derivation, pr
   const withholdBrandOnProductAd = isProductScoped && !QUOTE_BRAND_TIER_FALLBACK;
   const tierBrandUnscoped = withholdBrandOnProductAd
     ? []
-    : prepareQuotePool(brandReviewsContainer, brandQuotesRaw, 'brand');
+    : prepareQuotePool(brandReviewsContainer, brandQuotesRaw, 'brand', colourwayTitle);
   // Noun-scope the brand pool ONLY when this run has no CatalogProduct
   // attached (options.productId). A PMA catalogProductId is not that —
   // media-driven ads often carry a product_match PMA (the Vuori case)
@@ -2729,7 +2765,14 @@ async function assembleInput(ctx, template, aspectRatio, options, derivation, pr
       `that named a product type missing from the seed labels (${tierBrand.length} remain)`
     );
   }
-  const tierComment  = stampTier(printableQuotes(await loadBrandCommentsForQuotePool(ctx), 'comment'), 'comment');
+  const tierComment  = stampTier(
+    gateQuotesByColourway(
+      printableQuotes(await loadBrandCommentsForQuotePool(ctx), 'comment'),
+      colourwayTitle,
+      'comment'
+    ),
+    'comment'
+  );
 
   // TIERS 5 AND 6 ARE GONE, and they are not coming back behind a flag.
   //
@@ -4136,6 +4179,7 @@ module.exports = {
   stampQuoteOrigins,
   printableQuotes,
   prepareQuotePool,
+  gateQuotesByColourway,
   pickPrimaryProductQuote,
   // Exported for scripts/verifyQuoteProvenance.js, which pins the rule that a
   // byline is a real person's name or nothing — this function used to substitute
