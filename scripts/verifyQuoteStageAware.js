@@ -16,8 +16,10 @@
  *     2. Do NOT partition campaignContextHash by stage. Re-pick the
  *        printed quote at RENDER / TITLING time from the artifact's
  *        stored pool (primary_quote + secondary_quotes).
- *     3. Keep INPUT_SCHEMA_VERSION at 4.1 — freshness is the
- *        render-time pick, not a rebuild.
+ *     3. Do not bump INPUT_SCHEMA_VERSION FOR THIS FEATURE — freshness is
+ *        the render-time pick, not a rebuild. (The constant is 4.2 as of
+ *        2026-08-24, bumped for PR #312's provenance fix, which is a
+ *        different and genuine rebuild case. Still 4.1-era reasoning here.)
  *
  * This harness DRIVES the live readers (buildMetaForAd, deriveStage,
  * buildIntentData) with model stubs, the same pattern as
@@ -331,10 +333,21 @@ console.log('C. cache-key BYTES are HEAD-identical (no stage partition)');
   }
 
   setStageFlag(undefined);
-  check('C5 INPUT_SCHEMA_VERSION stays 4.1 (no global bump)',
-    INPUT_SCHEMA_VERSION === '4.1');
-  check('C6 schema 4.1 is the literal in source',
-    /const INPUT_SCHEMA_VERSION = '4\.1'/.test(
+  // C5/C6 pinned 4.1 to stop a bump being made FOR STAGE-AWARENESS reasons —
+  // that argument still holds (see the header: freshness is the render-time
+  // pick, not a rebuild) and this check still enforces it by pinning an exact
+  // value that a casual edit cannot drift.
+  //
+  // The value moved to 4.2 on 2026-08-24 by OWNER DECISION, for a reason
+  // OUTSIDE this harness's scope: PR #312's quote-provenance fix changes what
+  // goes INTO the artifact's pool at assemble time, and a render-time re-pick
+  // cannot repair an empty stored pool. That is a rebuild the stage-aware
+  // argument never contemplated. Do NOT read this bump as licence to bump
+  // again for stage-partitioning — that remains wrong.
+  check('C5 INPUT_SCHEMA_VERSION is 4.2 (bumped 2026-08-24 for #312, owner-directed)',
+    INPUT_SCHEMA_VERSION === '4.2');
+  check('C6 schema 4.2 is the literal in source',
+    /const INPUT_SCHEMA_VERSION = '4\.2'/.test(
       fs.readFileSync(path.join(ROOT, 'services/layoutInputService.js'), 'utf8')));
 }
 
@@ -825,9 +838,9 @@ console.log('RP. revert-proofs (broken twin fails; live still holds)');
   check('RP5b live aligned pool includes the ranked conversion line',
     livePool.some((q) => q.text === CONVERSION_TEXT));
 
-  // RP6: bumping schemaVersion would fail the 4.1 pin.
-  check('RP6 live schemaVersion is 4.1 (a bump fails C5)',
-    INPUT_SCHEMA_VERSION === '4.1');
+  // RP6: the schemaVersion is pinned exactly, so a drifting edit fails C5.
+  check('RP6 live schemaVersion is 4.2 (a drift fails C5)',
+    INPUT_SCHEMA_VERSION === '4.2');
 
   setStageFlag(undefined);
   setAlignFlag(undefined);
