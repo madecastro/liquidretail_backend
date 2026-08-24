@@ -18,8 +18,8 @@
       "removeWhen": "the run-finalization bug is fixed — delete the harness's _KNOWN_OPEN suffix and this entry together"
     },
     "verifyArchiveDigestRelease.js": {
-      "reason": "Pre-existing failure on master, unowned. Its E14 MONEY scan reports 'expected >= 8 Ad rendering->queued requeue writes, scan found 0 — the scan is broken', i.e. the harness's own scanner is not matching the current call shape rather than the guard being absent. Needs someone to repair the scan.",
-      "removeWhen": "the E14 scan is repaired to match the current requeue call shape"
+      "reason": "VENDORED FROM BACKEND AND NOT PORTED — it asserts backend's architecture against a repo that does not have it. E14 wants >=8 rendering->queued requeue writes and finds 0; E3 wants >=6 wired archive/restore sites and finds 1. That is not a broken scanner: backend's requeue sites live in routes/ads.js, worker.js and processAlerts.js, and adgen has NONE of those three files. adgen's renderer releases CLAIMS on shutdown (see verifyShutdownReleaseReceiptAware.js) and never flips status to 'queued', so the sites this counts genuinely do not exist here. Its own failure text says 'the scan is broken', which is misleading and cost one wrong diagnosis already.",
+      "removeWhen": "the harness is genuinely ported — its scan targets and its >=8 / >=6 thresholds rewritten against adgen's real archive/requeue surface — or it is deleted here as backend-only. Do NOT 'fix' it by lowering the thresholds to match what adgen happens to have; that turns a money harness into one that cannot fail."
     }
   }
 }
