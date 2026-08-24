@@ -171,19 +171,69 @@ checkTrue('E1 titling catch does not only console.warn',
 checkTrue('E2 titling failure sets status failed',
   /titlingFailed[\s\S]{0,400}status:\s*['"]failed['"]/.test(adsSrc) ||
   /master rendered; titling failed[\s\S]{0,200}status:\s*['"]failed['"]/.test(adsSrc));
-checkTrue('E3 titling failure increments failed not succeeded',
-  /titlingFailed[\s\S]{0,600}\$inc:\s*\{\s*failed:\s*1/.test(adsSrc) ||
-  /titlingFailed[\s\S]{0,600}failed:\s*1/.test(adsSrc));
+
+// E3-E6 scan the REAL if(titlingFailed){...}else{...} block boundaries via
+// brace matching rather than a fixed character window. A fixed window
+// (600/2000 chars) drifts stale the moment an explanatory comment grows
+// inside the block — measured 2026-08-24: PR #317 pushed the derive-path
+// else-block's `else {` → `succeeded: 1` distance to 704 chars, and the
+// master-path block's own comment is longer still, so BOTH real sites
+// silently stopped matching a hardcoded 600-char cap while the code itself
+// stayed correct. See CLAUDE.md "A regex over source text cannot see an
+// unbound identifier" for the sibling lesson — this is the same family:
+// a magic-number window is not a syntactic boundary.
+function findBraceBlock(str, openBraceIdx) {
+  // str[openBraceIdx] must be '{'. Does not skip string/template-literal
+  // contents — acceptable here because this scan targets a specific known
+  // control-flow shape (if/else statement bodies), not arbitrary source.
+  let depth = 0;
+  for (let i = openBraceIdx; i < str.length; i++) {
+    if (str[i] === '{') depth++;
+    else if (str[i] === '}') {
+      depth--;
+      if (depth === 0) return str.slice(openBraceIdx, i + 1);
+    }
+  }
+  return null;
+}
+function findTitlingFailedBlocks(str) {
+  const blocks = [];
+  const re = /if\s*\(\s*titlingFailed\s*\)\s*\{/g;
+  let m;
+  while ((m = re.exec(str))) {
+    const ifOpenBrace = m.index + m[0].length - 1;
+    const ifBlock = findBraceBlock(str, ifOpenBrace);
+    if (!ifBlock) continue;
+    const afterIf = ifOpenBrace + ifBlock.length;
+    const elseMatch = /^\s*else\s*\{/.exec(str.slice(afterIf, afterIf + 200));
+    if (!elseMatch) continue;
+    const elseOpenBrace = afterIf + elseMatch[0].length - 1;
+    const elseBlock = findBraceBlock(str, elseOpenBrace);
+    if (!elseBlock) continue;
+    blocks.push({ ifBlock, elseBlock });
+  }
+  return blocks;
+}
+const titlingBlocks = findTitlingFailedBlocks(adsSrc);
+checkTrue('E0 at least one if(titlingFailed){}else{} block found (scan didn\'t break)',
+  titlingBlocks.length > 0);
+checkTrue('E3 titling failure increments failed not succeeded (every block)',
+  titlingBlocks.length > 0 &&
+  titlingBlocks.every((b) => /\$inc:\s*\{\s*failed:\s*1|failed:\s*1/.test(b.ifBlock)));
 // Intermediate stamp may set draft (reaper money guard) but succeeded++
 // must only run on the post-titling branch, never immediately after the
 // master stamp.
-checkTrue('E4 succeeded++ is gated on !titlingFailed (not post-master)',
-  /if\s*\(\s*titlingFailed\s*\)[\s\S]{0,2000}else\s*\{[\s\S]{0,600}succeeded:\s*1/.test(adsSrc));
-checkTrue('E5 raw master kept on titling failure (renderUrl not deleted)',
-  /titlingFailed[\s\S]{0,400}Keep renderUrl|master kept|do not delete/i.test(adsSrc) ||
-  /titlingFailed[\s\S]{0,300}status:\s*['"]failed['"]/.test(adsSrc));
-checkTrue('E6 success path only after titling (or no-chrome)',
-  /if\s*\(\s*titlingFailed\s*\)[\s\S]{0,2000}else\s*\{[\s\S]{0,600}succeeded:\s*1/.test(adsSrc) &&
+checkTrue('E4 succeeded++ is gated on !titlingFailed (not post-master) (every block)',
+  titlingBlocks.length > 0 &&
+  titlingBlocks.every((b) => /succeeded:\s*1/.test(b.elseBlock)));
+checkTrue('E5 raw master kept on titling failure (renderUrl not deleted) (every block)',
+  titlingBlocks.length > 0 &&
+  titlingBlocks.every((b) =>
+    /Keep renderUrl|master kept|do not delete/i.test(b.ifBlock) ||
+    /status:\s*['"]failed['"]/.test(b.ifBlock)));
+checkTrue('E6 success path only after titling (or no-chrome) (every block)',
+  titlingBlocks.length > 0 &&
+  titlingBlocks.every((b) => /succeeded:\s*1/.test(b.elseBlock)) &&
   /adStage\([^)]*done/.test(adsSrc));
 
 // ── F. claimAdsForRun untouched (structural smoke) ────────────────────

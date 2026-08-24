@@ -1719,7 +1719,12 @@ async function runRenderLoop(run, job, adIds, renderToken) {
     );
     await CampaignRun.updateOne(
       { _id: run._id, status: 'preparing' },
-      { $set: { status: 'running', startedAt: run.startedAt || new Date(), updatedAt: new Date() } }
+      // startedAt is intentionally NOT in this $set — it is stamped once at
+      // CampaignRun.create() and never rewritten (verifyPreparingReap F2):
+      // buildRunningFlipFilter keys staleness on startedAt while the gate
+      // keys on createdAt, safe only because startedAt <= createdAt always
+      // holds. A $set here would invert that ordering on an existing doc.
+      { $set: { status: 'running', updatedAt: new Date() } }
     ).catch((err) => console.error(`⚠️  [campaignRun ${run.runId}] ADGEN handoff: preparing→running flip failed: ${err.message}`));
     return;
   }
