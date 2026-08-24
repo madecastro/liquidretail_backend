@@ -2632,8 +2632,12 @@ async function renderDeriveOnlyVideoAd({
       }
     );
   } else {
-    await Ad.updateOne(
-      { _id: adId },
+    // GUARDED — same reasoning as the master arm below: vision QC does not
+    // throw, so `titlingFailed` is null and this write used to overwrite the
+    // status:'failed' that buildVideoQcFailureFields just stamped. Allowlist,
+    // not denylist, so an unknown status is left alone rather than resurrected.
+    const promoted = await Ad.updateOne(
+      { _id: adId, status: { $in: ['rendering', 'draft'] } },
       {
         $set: {
           status:     'draft',
@@ -2643,8 +2647,20 @@ async function renderDeriveOnlyVideoAd({
         }
       }
     );
-    await CampaignRun.updateOne({ _id: run._id }, { $inc: { succeeded: 1 } });
-    adStage(adId, 'done');
+    if (promoted.matchedCount) {
+      await CampaignRun.updateOne({ _id: run._id }, { $inc: { succeeded: 1 } });
+      adStage(adId, 'done');
+    } else {
+      const kept = await Ad.findOneAndUpdate(
+        { _id: adId },
+        { $set: { titlingResumeState: null, updatedAt: new Date() } },
+        { new: true, projection: { status: 1 } }
+      ).lean();
+      const keptStatus = (kept && kept.status) || 'failed';
+      const counter = keptStatus === 'failed' ? 'failed' : 'succeeded';
+      await CampaignRun.updateOne({ _id: run._id }, { $inc: { [counter]: 1 } });
+      adStage(adId, `done (kept terminal status '${keptStatus}')`);
+    }
   }
 }
 
@@ -3081,8 +3097,30 @@ async function renderOneInner(run, job, adId, index, renderToken) {
         // Title landed (or no chrome / no brand). Promote to draft now.
         // Soft notes written mid-pipeline (face-crop skip etc.) stay on
         // renderError so the board still shows "what degraded" after ship.
-        await Ad.updateOne(
-          { _id: adId },
+        //
+        // GUARDED ON status — titling is not the only writer of a terminal
+        // verdict. `titlingFailed` catches a Remotion THROW, but vision QC
+        // does not throw: brandScriptExecutor.buildVideoQcFailureFields
+        // stamps status:'failed' inside uploadRenderAndStamp (PR #282,
+        // "deliver a QC-failed ad as failed with the exact Slack reason").
+        // This write used to be a bare { _id }, so it overwrote that verdict
+        // with 'draft' and counted the ad succeeded. MEASURED in prod
+        // 2026-08-24: 47 video ads with visionQc.passed:false sitting in
+        // 'draft', ZERO in 'failed' — the verdict never survived once.
+        // "Counting an untitled master as success is forbidden" (§2) has
+        // always been the rule; this closes the QC arm of it.
+        //
+        // ALLOWLIST, NOT DENYLIST — the direction is the safety property. A
+        // $nin:['failed','archived'] fails OPEN: any status nobody enumerated
+        // gets overwritten with 'draft'. That resurrects a row a requeue just
+        // moved to 'queued' (processAlerts SIGTERM, the /generate and /runs
+        // crash catches) and DEMOTES an ad an operator promoted to 'live'.
+        // $in admits only the two states this point legitimately owns:
+        // 'rendering' (no-chrome / no-brand — titling never ran) and 'draft'
+        // (uploadRenderAndStamp already promoted it). Unknown state => the
+        // settle-only arm, which clears the debt without touching status.
+        const promoted = await Ad.updateOne(
+          { _id: adId, status: { $in: ['rendering', 'draft'] } },
           {
             $set: {
               status:     'draft',
@@ -3096,8 +3134,24 @@ async function renderOneInner(run, job, adId, index, renderToken) {
             }
           }
         );
-        await CampaignRun.updateOne({ _id: run._id }, { $inc: { succeeded: 1 } });
-        adStage(adId, 'done');
+        if (promoted.matchedCount) {
+          await CampaignRun.updateOne({ _id: run._id }, { $inc: { succeeded: 1 } });
+          adStage(adId, 'done');
+        } else {
+          // A terminal verdict is already on the row. Do NOT resurrect it —
+          // but the titling debt is still ours to settle, or titlingResumeService
+          // re-renders this ad on its next sweep.
+          const kept = await Ad.findOneAndUpdate(
+            { _id: adId },
+            { $set: { titlingResumeState: null, updatedAt: new Date() } },
+            { new: true, projection: { status: 1 } }
+          ).lean();
+          const keptStatus = (kept && kept.status) || 'failed';
+          // 'archived' is an operator action, not a render failure.
+          const counter = keptStatus === 'failed' ? 'failed' : 'succeeded';
+          await CampaignRun.updateOne({ _id: run._id }, { $inc: { [counter]: 1 } });
+          adStage(adId, `done (kept terminal status '${keptStatus}')`);
+        }
       }
     } catch (err) {
       console.error(`❌ veoReference[ad=${adId}]:`, err.message || err);
