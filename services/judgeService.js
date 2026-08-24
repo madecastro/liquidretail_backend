@@ -8,7 +8,7 @@ const { chatCompletion } = require('./atlasLlmService');
 //  (5:4, 1:1, 4:5). Uses a structured rubric so decisions are consistent and
 //  the scores are exposed to the UI for spot-checking.
 // ─────────────────────────────────────────────────────────────────────────────
-async function judgeDetections({ imageUrl, products, subjects, text, crops, safeRect }) {
+async function judgeDetections({ imageUrl, products, subjects, text, crops, safeRect, brandId = null, productId = null, adId = null, campaignRunId = null }) {
   const payload = {
     products: products.map(p => ({ id: p.id, className: p.className, confidence: p.confidence, x1: p.x1, y1: p.y1, x2: p.x2, y2: p.y2 })),
     subjects,
@@ -17,7 +17,7 @@ async function judgeDetections({ imageUrl, products, subjects, text, crops, safe
     ...(safeRect ? { safeRect } : {})
   };
 
-  const response = await chatCompletion({ stage: 'judge_detections', service: 'judgeService', visionImages: 1 }, {
+  const response = await chatCompletion({ stage: 'judge_detections', service: 'judgeService', visionImages: 1, brandId, productId, adId, campaignRunId }, {
     model: 'gpt-4.1',
     response_format: { type: 'json_object' },
     messages: [
@@ -122,6 +122,10 @@ async function judgeExtendedCrops(arg) {
   const sourceImageUrl = arg?.sourceImageUrl || null;
   const detectedText = Array.isArray(arg?.text) ? arg.text : [];
   const primarySubject = arg?.primarySubject || null;
+  const brandId = arg?.brandId ?? null;
+  const productId = arg?.productId ?? null;
+  const adId = arg?.adId ?? null;
+  const campaignRunId = arg?.campaignRunId ?? null;
 
   const ratios = Object.keys(extendedCrops).filter(r => extendedCrops[r].length > 0);
   if (ratios.length === 0) return {};
@@ -204,7 +208,7 @@ async function judgeExtendedCrops(arg) {
     }],
     max_tokens: 2500,
     temperature: 0.2
-  });
+  }, { brandId, productId, adId, campaignRunId });
 
   const raw = response.choices[0].message.content.trim();
   const parsed = safeParseJSON(raw);
@@ -314,12 +318,12 @@ function sumDimensions(dims) {
 // with "Timeout while downloading". Two retries with growing
 // backoff (1.5s, 4s) covers the slowest propagation we've observed
 // without holding the run hostage.
-async function callOpenAIWithCloudinaryRetry(payload) {
+async function callOpenAIWithCloudinaryRetry(payload, costMeta = {}) {
   const delays = [1500, 4000];   // ms before each retry
   let lastErr;
   for (let attempt = 0; attempt <= delays.length; attempt++) {
     try {
-      return await chatCompletion({ stage: 'judge_extended_crops', service: 'judgeService', visionImages: 1 }, payload);
+      return await chatCompletion({ stage: 'judge_extended_crops', service: 'judgeService', visionImages: 1, ...costMeta }, payload);
     } catch (err) {
       lastErr = err;
       const isCloudinaryRace =

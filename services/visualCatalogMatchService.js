@@ -28,7 +28,7 @@ const MODEL = process.env.GEMINI_VISION_MODEL || 'gemini-2.5-flash';
 // Compare ONE crop to ONE catalog candidate. Returns
 //   { isMatch: bool, score: 0..1, reasoning: string }
 // or null if the call failed or inputs were missing.
-async function compareCropToCandidate({ cropImageUrl, candidate }) {
+async function compareCropToCandidate({ cropImageUrl, candidate, brandId = null, productId = null }) {
   if (!isConfigured() && !process.env.GEMINI_API_KEY) {
     console.warn('   ⚠️  visualCatalogMatch: neither ATLAS_API_KEY nor GEMINI_API_KEY set');
     return null;
@@ -80,7 +80,7 @@ async function compareCropToCandidate({ cropImageUrl, candidate }) {
     // Atlas gemini routes) keeps the parser belt-and-braces rather than
     // load-bearing.
     res = await chatCompletion(
-      { stage: 'visual_catalog_match', service: 'visualCatalogMatchService', visionImages: 2 },
+      { stage: 'visual_catalog_match', service: 'visualCatalogMatchService', visionImages: 2, brandId, productId },
       {
         model: MODEL,
         messages: [{ role: 'user', content: [

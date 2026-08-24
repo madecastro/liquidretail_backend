@@ -47,7 +47,7 @@ async function identifyYoloDetections(detections, hints = {}) {
 }
 
 async function identifyChunk(chunk, hints, offset) {
-  const { brand, category } = hints;
+  const { brand, category, brandId = null, productId = null, adId = null, campaignRunId = null } = hints;
   const hintLines = [];
   if (brand)    hintLines.push(`- Expected brand for this scene: ${brand}`);
   if (category) hintLines.push(`- Expected category for this scene: ${category}`);
@@ -118,7 +118,7 @@ async function identifyChunk(chunk, hints, offset) {
     `- Return one item entry for every index 1..${imageParts.length}, even if products is [].\n` +
     `Return ONLY valid JSON — no prose outside.`;
 
-  const response = await chatCompletion({ stage: 'yolo_identify', service: 'yoloIdentifyService' }, {
+  const response = await chatCompletion({ stage: 'yolo_identify', service: 'yoloIdentifyService', brandId, productId, adId, campaignRunId }, {
     model: 'gpt-4.1',
     response_format: { type: 'json_object' },
     messages: [{

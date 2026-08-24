@@ -583,6 +583,7 @@ async function resolveBasePlateVideoUrl({ ad, format }) {
     const durationSec = Number(ad.videoDurationSec) > 0 ? Number(ad.videoDurationSec) : 8;
     const det = await internals.detectClipBoxes(ad.veoVideoUrl, durationSec, {
       brandId: ad.brandId, campaignId: ad.campaignId, adId: ad._id, mediaId: ad.mediaId,
+      productId: ad.productId || null,
     });
 
     const decision = decideBasePlateCrop({
@@ -800,6 +801,7 @@ async function ensureFaceDetectionForKeepOut({ ad, format }) {
     const dims = await internals.measureDeliveryDims(ad.veoVideoUrl);
     const det = await internals.detectClipBoxes(ad.veoVideoUrl, durationSec, {
       brandId: ad.brandId, campaignId: ad.campaignId, adId: ad._id, mediaId: ad.mediaId,
+      productId: ad.productId || null,
     });
     const extras = detectionExtras(det, dims);
     // Merge into existing basePlate when present (preserve crop videoUrl/rect/reason).

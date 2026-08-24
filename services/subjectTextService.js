@@ -30,7 +30,7 @@ const { chatCompletion } = require('./atlasLlmService');
 //     secondaryElementsTags: string[]
 //   }
 async function detectSubjectsAndText(imageUrl, hints = {}) {
-  const { brand, category, caption } = hints;
+  const { brand, category, caption, brandId = null, productId = null, adId = null, campaignRunId = null } = hints;
   const hintLines = [];
   if (brand)    hintLines.push(`- User states the BRAND is: ${brand}`);
   if (category) hintLines.push(`- User states the CATEGORY is: ${category}`);
@@ -39,7 +39,7 @@ async function detectSubjectsAndText(imageUrl, hints = {}) {
     ? `\n\nUSER HINTS (use these to pick which subject is PRIMARY and to enrich its description):\n${hintLines.join('\n')}`
     : '';
 
-  const response = await chatCompletion({ stage: 'subject_text', service: 'subjectTextService' }, {
+  const response = await chatCompletion({ stage: 'subject_text', service: 'subjectTextService', brandId, productId, adId, campaignRunId }, {
     model: 'gpt-4.1',
     messages: [
       {
