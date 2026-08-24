@@ -314,113 +314,169 @@ check('D3 the fallback maps a real \'failed\' verdict to the failed counter', ()
     "settleNonDraftTerminal must map kept==='failed' -> 'failed', not the inverse");
 });
 
-// ── summary ──────────────────────────────────────────────────────────────
-// ── E. THE UPSTREAM WRITER — the harness's own blind spot, closed ───────
-// Everything above opens ONLY renderer.js. An adversarial pass proved that is
-// not enough: deleting the Object.assign merge in brandScriptExecutor.js
-// keeps EVERY check above green (renderVideo's $in guard still matches
-// 'draft' — because 'draft' is now the only thing ever written — and 47/0
-// reproduces) while the real bug is back. This section opens the upstream
-// file and pins the one line whose ORDER, not presence, is the invariant.
-console.log('\n── E: the upstream QC-verdict writer cannot be silently defeated ──');
+// ── E. THE UPSTREAM WRITER — now a BEHAVIOURAL test, not a source scan ────
+// Everything above opens ONLY renderer.js. Section E used to open
+// brandScriptExecutor.js as text too and pin the Object.assign merge order
+// by regex — hardened across three rounds against decoys and a resurrecting
+// assignment. RETIRED 2026-08-24 after an adversarial (Grok xhigh) pass on
+// the backend's identical copy found it still went green on six real shapes
+// that clobber the verdict just the same: findByIdAndUpdate,
+// Ad.collection.updateOne (bypasses Mongoose), a $set built as a variable, a
+// computed key, a backtick-quoted status, and an assignment sitting after
+// the merge in a spot the scan didn't cover. Each round closed the shapes
+// we'd thought of and left the ones we hadn't — an unbounded game against
+// JS/Mongoose syntax. Replaced with a test that calls the REAL
+// uploadRenderAndStamp (Cloudinary/vision-QC/Ad stubbed via the same
+// require-cache convention scripts/verifyAdVisionQcSurfacing.js's own
+// F-section already established), forces a genuine QC failure, and asserts
+// the ACTUAL Ad.updateOne payload it produces. That is immune to all six
+// shapes at once, and to any future one, because it never reads source.
+console.log('\n── E: the upstream QC-verdict writer cannot be silently defeated (behavioural) ──');
 
-const BSE_PATH = path.join(ROOT, 'src/services/brandScriptExecutor.js');
-const BSE_RAW = fs.readFileSync(BSE_PATH, 'utf8');
-const { stripped: BSE_SRC, stringSpans: BSE_STRINGS } = analyzeSource(BSE_RAW);
-
-function bseFnBody(name) {
-  const m = new RegExp(`async function ${name}\\s*\\(`).exec(BSE_SRC);
-  if (!m) return null;
-  const openBrace = BSE_SRC.indexOf('{', BSE_SRC.indexOf(')', m.index));
-  return { body: balanced(BSE_SRC, openBrace, '{', '}'), offset: openBrace };
-}
-const uploadFn = bseFnBody('uploadRenderAndStamp');
-const uploadBody = uploadFn && uploadFn.body;
-// BSE_STRINGS shifted into uploadBody's own local coordinate space, so E2/E3
-// can reject a match without re-walking the whole file for every check.
-const uploadStrings = uploadFn
-  ? BSE_STRINGS.map(([s, e]) => [s - uploadFn.offset, e - uploadFn.offset])
-      .filter(([s]) => s >= 0)
-  : [];
-
-check('E1 uploadRenderAndStamp() is present and its body extracts', () => {
-  assert.ok(uploadBody && uploadBody.length > 200,
-    'uploadRenderAndStamp not found — re-derive this section against brandScriptExecutor.js');
-});
-
-check('E2 [THE REAL MECHANISM] the QC-failure merge runs AFTER the draft literal, in the SAME object', () => {
-  // [ANTI-DECOY] Every match is checked against uploadStrings — a match
-  // whose START falls inside a tracked string span is a decoy (a log
-  // message or comment-that-survived-as-a-string-literal quoting the exact
-  // text this check looks for), not real code, and is skipped rather than
-  // trusted. Comments are already stripped upstream; this additionally
-  // protects against the text surviving inside a STRING, which stripComments
-  // deliberately preserves verbatim.
-  let draftIdx = -1;
-  {
-    const RE = /status:\s*['"]draft['"]/g;
-    let m;
-    while ((m = RE.exec(uploadBody))) {
-      if (!isInsideAString(uploadStrings, m.index)) { draftIdx = m.index; break; }
+(async () => {
+  const cloudinaryPath = require.resolve(path.join(ROOT, 'src/services/cloudinaryService.js'));
+  const originalCloudinary = require.cache[cloudinaryPath];
+  require.cache[cloudinaryPath] = {
+    id: cloudinaryPath, filename: cloudinaryPath, loaded: true,
+    exports: {
+      uploadFileToCloudinary: async () => ({ secure_url: 'https://res.cloudinary.com/x/video/upload/v1/fake.mp4' })
     }
+  };
+
+  const qcPath = require.resolve(path.join(ROOT, 'src/services/adVisionQcService.js'));
+  const originalQc = require.cache[qcPath];
+  const fakeVerdict = {
+    passed: false, skipped: false, disabled: false, finalAttempt: 1,
+    attempts: [{
+      attempt: 1, pass: false, categories: {}, findings: ['garbled logo'],
+      summary: 'hallucinated colourway', renderUrl: 'https://x/v.mp4', discarded: false
+    }]
+  };
+  require.cache[qcPath] = {
+    id: qcPath, filename: qcPath, loaded: true,
+    exports: {
+      resolveVideoEnabled: async () => true,
+      warnQcDisabledOnce: () => {},
+      buildAppPreviewUrl: () => 'https://app.example/preview',
+      runVideoPostRenderQc: async () => ({ ok: true, skipped: false, passed: false, visionQc: fakeVerdict }),
+      alertQcFailure: () => 'FAKE_SLACK_DETAIL_TEXT_FOR_TEST',
+      noteQcFailToRunFeed: () => {},
+      noteQcPassToRunFeed: () => {},
+      alertQcSkipped: () => {},
+      buildPersistedVerdict: (args) => args,
+      buildSkippedVerdict: (reason) => ({ skipped: true, reason })
+    }
+  };
+
+  const adStagePath = require.resolve(path.join(ROOT, 'src/services/adStage.js'));
+  const originalAdStage = require.cache[adStagePath];
+  require.cache[adStagePath] = {
+    id: adStagePath, filename: adStagePath, loaded: true,
+    exports: { adStage: () => {}, noteRenderIssue: () => {} }
+  };
+
+  // Covers every Mongoose write method AND the raw collection bypass, so a
+  // future code change is captured cleanly regardless of which one it uses
+  // — deliberately not locked to updateOne only.
+  const adModelPath = require.resolve(path.join(ROOT, 'src/models/Ad.js'));
+  const originalAdModel = require.cache[adModelPath];
+  const updateCalls = [];
+  const recordWrite = (filter, update) => {
+    updateCalls.push({ filter, update });
+    return { matchedCount: 1, modifiedCount: 1 };
+  };
+  require.cache[adModelPath] = {
+    id: adModelPath, filename: adModelPath, loaded: true,
+    exports: {
+      updateOne: async (filter, update) => recordWrite(filter, update),
+      findOneAndUpdate: async (filter, update) => { recordWrite(filter, update); return null; },
+      findByIdAndUpdate: async (id, update) => { recordWrite({ _id: id }, update); return null; },
+      collection: { updateOne: async (filter, update) => recordWrite(filter, update) }
+    }
+  };
+
+  const bsePath = require.resolve(path.join(ROOT, 'src/services/brandScriptExecutor.js'));
+  const originalBse = require.cache[bsePath];
+  delete require.cache[bsePath];
+  try {
+    const freshBse = require(path.join(ROOT, 'src/services/brandScriptExecutor.js'));
+
+    check('E1 uploadRenderAndStamp() is exported for direct behavioural testing', () => {
+      assert.strictEqual(typeof freshBse.uploadRenderAndStamp, 'function');
+    });
+
+    const result = await freshBse.uploadRenderAndStamp({
+      ad: { _id: '507f1f77bcf86cd799439099', veoReferenceImages: ['https://x/orig.png'], campaignRunIds: [] },
+      // Neither path is read for real: uploadFileToCloudinary is stubbed
+      // above (never touches finalPath), and tempDir cleanup uses
+      // fs.promises.rm(..., { force: true }), which is silent on ENOENT.
+      finalPath: '/tmp/verifyVideoQcVerdictSurvives-does-not-exist.mp4',
+      tempDir:   '/tmp/verifyVideoQcVerdictSurvives-does-not-exist-tmp',
+      timings:   {}
+    });
+
+    check('E2 [THE REAL MECHANISM, BEHAVIOURAL] a real QC failure persists status:\'failed\', not draft', () => {
+      assert.strictEqual(updateCalls.length, 1, `expected exactly one Ad.updateOne call, saw ${updateCalls.length}`);
+      const set = updateCalls[0].update.$set || updateCalls[0].update;
+      assert.strictEqual(set.status, 'failed',
+        'a real (non-skipped/disabled) vision-QC failure must persist status:\'failed\'. This assertion ' +
+        'reads the ACTUAL persisted value, so it does not matter what internal shape produced the write — ' +
+        'merge order, a later resurrecting assignment, findByIdAndUpdate instead of updateOne, a raw ' +
+        'Ad.collection.updateOne bypass, a computed key, a backtick, or a $set built as a variable all ' +
+        'either produce the right payload or they do not, and this is what checks which.');
+      assert.ok(set.renderError, 'must include a renderError so the operator sees why');
+      assert.strictEqual(set.renderError.charged, true, 'the master was already billed — must not read as an unbilled infra failure');
+      assert.strictEqual(set.visionQc?.failureDetail, 'FAKE_SLACK_DETAIL_TEXT_FOR_TEST',
+        'must stamp the same failureDetail text alertQcFailure sent to Slack');
+    });
+
+    check('E3 uploadRenderAndStamp still returns the delivered renderUrl on a QC failure (asset never discarded)', () => {
+      assert.strictEqual(result.renderUrl, 'https://res.cloudinary.com/x/video/upload/v1/fake.mp4');
+    });
+
+    // POSITIVE CONTROL — a genuine QC PASS must leave status as 'draft', not
+    // 'failed'. Without this, a hypothetical bug that always stamped
+    // 'failed' regardless of the verdict would pass every check above.
+    require.cache[qcPath].exports.runVideoPostRenderQc = async () => ({
+      ok: true, skipped: false, passed: true,
+      visionQc: { passed: true, skipped: false, disabled: false, finalAttempt: 1, attempts: [] }
+    });
+    delete require.cache[bsePath];
+    const passFreshBse = require(path.join(ROOT, 'src/services/brandScriptExecutor.js'));
+    updateCalls.length = 0;
+    const passResult = await passFreshBse.uploadRenderAndStamp({
+      ad: { _id: '507f1f77bcf86cd799439098', veoReferenceImages: ['https://x/orig.png'], campaignRunIds: [] },
+      finalPath: '/tmp/verifyVideoQcVerdictSurvives-does-not-exist-2.mp4',
+      tempDir:   '/tmp/verifyVideoQcVerdictSurvives-does-not-exist-tmp-2',
+      timings:   {}
+    });
+    check('E4 [POSITIVE CONTROL] a genuine QC pass leaves status as \'draft\'', () => {
+      assert.strictEqual(updateCalls.length, 1, `expected exactly one Ad.updateOne call, saw ${updateCalls.length}`);
+      const set = updateCalls[0].update.$set || updateCalls[0].update;
+      assert.strictEqual(set.status, 'draft',
+        'a genuine pass must not flip status to failed — if this fails while E2 above also passes, ' +
+        'something stamps failed unconditionally rather than reading the real verdict.');
+      assert.strictEqual(set.renderError, undefined, 'no renderError on a genuine pass');
+      assert.strictEqual(passResult.renderUrl, 'https://res.cloudinary.com/x/video/upload/v1/fake.mp4');
+    });
+  } finally {
+    if (originalCloudinary) require.cache[cloudinaryPath] = originalCloudinary; else delete require.cache[cloudinaryPath];
+    if (originalQc) require.cache[qcPath] = originalQc; else delete require.cache[qcPath];
+    if (originalAdStage) require.cache[adStagePath] = originalAdStage; else delete require.cache[adStagePath];
+    if (originalAdModel) require.cache[adModelPath] = originalAdModel; else delete require.cache[adModelPath];
+    if (originalBse) require.cache[bsePath] = originalBse; else delete require.cache[bsePath];
+    delete require.cache[bsePath];
   }
-  let assignIdx = -1;
-  {
-    const needle = 'Object.assign(set, buildVideoQcFailureFields(';
-    let from = 0;
-    while (true) {
-      const idx = uploadBody.indexOf(needle, from);
-      if (idx === -1) break;
-      if (!isInsideAString(uploadStrings, idx)) { assignIdx = idx; break; }
-      from = idx + needle.length;
-    }
+
+  console.log('');
+  if (failures) {
+    console.log(`❌ verifyVideoQcVerdictSurvives: ${failures} FAILED, ${passes} passed`);
+    console.log('\nOn UNFIXED code the expected reds are B1 (bare {_id} filters), C1-C4');
+    console.log('(no fallback handler) and D1/D2 (hardcoded \'succeeded\').');
+    process.exit(1);
   }
-  assert.ok(draftIdx >= 0, "no REAL (non-string-decoy) status:'draft' literal found in uploadRenderAndStamp");
-  assert.ok(assignIdx >= 0, 'no REAL (non-string-decoy) buildVideoQcFailureFields merge found in uploadRenderAndStamp');
-  assert.ok(assignIdx > draftIdx,
-    "Object.assign must run AFTER 'status: draft' so its key overwrites it in the same object. " +
-    'Reorder these two lines (or delete the merge) and a real QC failure ships as draft again ' +
-    'with every check above still green, because renderer.js only ever receives the already-wrong ' +
-    "verdict this function handed it.");
-
-  check('E2b [ANTI-RESURRECTION] nothing re-writes status AFTER the merge, before Mongo sees it', () => {
-    // The last-write hole: order-correct (assignIdx > draftIdx) is not
-    // enough if a THIRD write — a direct `set.status = ...` reassignment, or
-    // a second Object.assign(set, ...) — appears between the merge and the
-    // Ad.updateOne call that actually persists `set`, undoing it again.
-    const updateOneIdx = uploadBody.indexOf('Ad.updateOne(', assignIdx);
-    const scanEnd = updateOneIdx === -1 ? uploadBody.length : updateOneIdx;
-    const window = uploadBody.slice(assignIdx + 'Object.assign(set, buildVideoQcFailureFields('.length, scanEnd);
-    const windowOffset = assignIdx + 'Object.assign(set, buildVideoQcFailureFields('.length;
-    const resurrections = [];
-    for (const re of [/\bset\s*\.\s*status\s*=/g, /Object\.assign\s*\(\s*set\s*,/g]) {
-      let m;
-      while ((m = re.exec(window))) {
-        if (!isInsideAString(uploadStrings, windowOffset + m.index)) resurrections.push(m[0]);
-      }
-    }
-    assert.strictEqual(resurrections.length, 0,
-      `something re-touches "set" between the QC merge and the Ad.updateOne write that persists ` +
-      `it, undoing the merge: ${resurrections.join(', ')}`);
-  });
-});
-
-check('E3 the merge target is the SAME object the draft literal was declared on', () => {
-  // Guards against a version that assigns onto a DIFFERENT object (e.g. a
-  // local copy) that never reaches the $set — order would be correct and
-  // the fix would still be inert.
-  const setDecl = /const\s+(\w+)\s*=\s*\{[^}]*status:\s*['"]draft['"]/.exec(uploadBody);
-  assert.ok(setDecl, 'could not find the object literal declaring status:\'draft\'');
-  const varName = setDecl[1];
-  assert.ok(new RegExp(`Object\\.assign\\(${varName}\\s*,`).test(uploadBody),
-    `Object.assign must target the SAME variable (${varName}) that declared status:'draft'`);
-});
-
-console.log('');
-if (failures) {
-  console.log(`❌ verifyVideoQcVerdictSurvives: ${failures} FAILED, ${passes} passed`);
-  console.log('\nOn UNFIXED code the expected reds are B1 (bare {_id} filters), C1-C4');
-  console.log('(no fallback handler) and D1/D2 (hardcoded \'succeeded\').');
+  console.log(`✅ verifyVideoQcVerdictSurvives: all ${passes} checks passed`);
+})().catch((err) => {
+  console.error('verifyVideoQcVerdictSurvives crashed:', err);
   process.exit(1);
-}
-console.log(`✅ verifyVideoQcVerdictSurvives: all ${passes} checks passed`);
+});
