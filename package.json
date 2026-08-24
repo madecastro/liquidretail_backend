@@ -6,10 +6,15 @@
   "main": "src/entrypoint.js",
   "scripts": {
     "start": "node src/entrypoint.js",
-    "dev": "node src/entrypoint.js"
+    "dev": "node src/entrypoint.js",
+    "lint": "eslint .",
+    "test": "node scripts/runVerifySuite.js"
   },
   "engines": {
     "node": ">=20.0.0"
+  },
+  "devDependencies": {
+    "eslint": "^9.39.5"
   },
   "dependencies": {
     "@google/generative-ai": "^0.21.0",

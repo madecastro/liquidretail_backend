@@ -1,0 +1,274 @@
+#!/usr/bin/env node
+'use strict';
+//
+// verifyModelParity — adgen vendors copies of liquidretail_backend's
+// Mongoose models (33 of them today), and BOTH services write the SAME
+// production database (ADGEN_RENDERER_ENABLED=true is the permanent live
+// state — see README.md). A schema drift between the two copies is a live
+// data-corruption risk: if adgen's copy of a model declares a field the
+// backend's copy does not, one service can write a document shape the
+// other silently cannot see (Mongoose strict mode drops writes to
+// undeclared paths with no error — liquidretail_backend/CLAUDE.md §4
+// already recorded a real production loss this exact way,
+// renderError.predictionId).
+//
+// RULE CHOSEN, STATED EXPLICITLY (the task that created this file asked
+// for this decision to be recorded, not just made): SUBSET, not full
+// parity. adgen asserts
+//
+//     adgen's top-level schema paths ⊆ backend's top-level schema paths
+//
+// for every model that exists in both trees — never full equality. adgen
+// is a narrower render-only service; the backend legitimately owns more
+// surface area (auth, billing, scraping, …) and will keep growing fields
+// adgen has no reason to vendor. Requiring exact parity would fail on every
+// such legitimate backend-only addition and pressure someone into copying
+// fields adgen never reads just to keep this harness green — a worse
+// outcome than the drift it exists to catch. The dangerous direction is the
+// other one: adgen inventing a field the backend's copy of the SAME model
+// lacks, which means the two processes now disagree about what a document
+// of that collection can contain. That is FAIL. A backend-only field is
+// reported as INFO (informational — not vendored into adgen, which may be
+// entirely intentional) and never fails the build.
+//
+// MECHANISM — each model is REQUIRED for real, not regex-parsed. A source-
+// text scan of `{ field: {...} }` object literals cannot reliably handle
+// nested braces, enum arrays, commented-out fields, or computed keys across
+// 33 files this size (Ad.js alone is 90+ top-level fields with deeply
+// nested Mixed/subdocument blocks) — Mongoose has already done that parsing
+// correctly the moment the file is required. mongoose.model() is
+// intercepted (never actually calling the original) so requiring adgen's
+// and the backend's copy of the SAME model name in one process cannot throw
+// `OverwriteModelError`, and nothing is ever really registered/compiled.
+// Object.keys(schema.paths) is then reduced to top-level names (everything
+// before the first '.').
+//
+// NODE_MODULES: this needs mongoose to construct real Schema objects — a
+// fresh worktree here has no node_modules of its own (documented in this
+// repo's task brief). require('mongoose') falls back to the sibling
+// liquidretail_backend's node_modules via a Module._load patch — the same
+// technique liquidretail_backend/scripts/verifyQuoteProvenanceStamp.js
+// already uses there to stub a missing https-proxy-agent. If neither this
+// repo nor the sibling backend has mongoose installed, this FAILS with an
+// actionable message (never a silent skip) — per this task's own
+// instruction: "if something genuinely needs a real install, say so rather
+// than faking it."
+//
+// THE PATCH IS DELIBERATELY LEFT INSTALLED FOR THE LIFE OF THE PROCESS, NOT
+// RESTORED RIGHT AFTER THIS FILE'S OWN `require('mongoose')`. First draft
+// restored it immediately and every model FAILED with "Cannot find module
+// mongoose" anyway — captureSchema() below requires 33 adgen model files
+// and 33 backend model files, and EVERY ONE of those files does its own
+// `const mongoose = require('mongoose')`, at the time THAT require runs,
+// not at the time this file's top-level require ran. Restoring the patch
+// early left every one of those later requires hitting the unpatched
+// loader again. A verify script is a one-shot process anyway, so leaving
+// the patch installed until the process exits is the correct scope, not a
+// shortcut.
+//
+// BACKEND LOCATION: scripts/lib/siblingBackend.js — ADGEN_BACKEND_PATH env,
+// else ../liquidretail_backend. If neither resolves to a real checkout,
+// the cross-repo comparison is SKIPPED with a clear INFO line and this
+// script exits 0 — a checkout that only has adgen genuinely cannot run a
+// two-repo comparison, which is a different situation from a bug in either
+// repo, and must not be reported as a failure.
+//
+// Otherwise fully offline: mongoose.Schema() never opens a connection, and
+// nothing here touches the network, a real DB, or an API key.
+//
+// Revert-prove:
+//   node scripts/verifyModelParity.js                         → pass
+//   (edit src/models/Ad.js: add `notInBackend: { type: String }`)
+//   node scripts/verifyModelParity.js                         → FAILS,
+//     names Ad.js and the exact field "notInBackend"
+//   (revert the edit)
+//   node scripts/verifyModelParity.js                         → pass again
+
+const fs = require('fs');
+const path = require('path');
+const Module = require('module');
+const { resolveBackendRoot } = require('./lib/siblingBackend');
+
+const ROOT = path.join(__dirname, '..');
+const ADGEN_MODELS_DIR = path.join(ROOT, 'src', 'models');
+const BACKEND_ROOT = resolveBackendRoot(ROOT);
+
+let pass = 0;
+const failures = [];
+const infos = [];
+
+function check(label, fn) {
+  try {
+    fn();
+    pass += 1;
+  } catch (err) {
+    failures.push(`${label}: ${err.message.split('\n')[0].slice(0, 600)}`);
+  }
+}
+
+function info(label) {
+  infos.push(label);
+}
+
+// ---------------------------------------------------------------------------
+// mongoose loader with a sibling-node_modules fallback. Patches
+// Module._load so a bare specifier (never a relative or absolute path)
+// that fails NORMAL resolution gets one more attempt resolved against the
+// candidate dir — this repo's own node_modules, if it ever gets one, always
+// wins first, since orig.apply() is tried before the fallback. Restored
+// immediately after mongoose is loaded so this file does not leave a
+// process-wide monkeypatch behind for anything requiring it later in the
+// same process (the runVerifySuite.js pool spawns a fresh process per
+// script, so this matters only for a direct `node -e` harness chain).
+// ---------------------------------------------------------------------------
+function loadMongooseWithFallback() {
+  try {
+    return require('mongoose');
+  } catch (err) {
+    if (!err || err.code !== 'MODULE_NOT_FOUND') throw err;
+  }
+
+  const candidateDir = BACKEND_ROOT ? path.join(BACKEND_ROOT, 'node_modules') : null;
+  if (!candidateDir || !fs.existsSync(candidateDir)) {
+    console.error(
+      [
+        'verifyModelParity: cannot load "mongoose" (MODULE_NOT_FOUND) and no',
+        'sibling liquidretail_backend/node_modules was found to fall back to.',
+        'This harness constructs real mongoose.Schema objects — it is not',
+        'faked with a regex — so it genuinely needs mongoose installed.',
+        'Fix: run `npm install` in this worktree, or',
+        '`export NODE_PATH=<path-to-a-node_modules-containing-mongoose>`.'
+      ].join('\n')
+    );
+    process.exit(1);
+  }
+
+  const origLoad = Module._load;
+  Module._load = function fallbackLoad(request, parent, isMain) {
+    try {
+      return origLoad.apply(this, arguments);
+    } catch (err) {
+      if (err && err.code === 'MODULE_NOT_FOUND' && !request.startsWith('.') && !path.isAbsolute(request)) {
+        try {
+          const resolved = require.resolve(request, { paths: [candidateDir] });
+          return origLoad.call(this, resolved, parent, isMain);
+        } catch (e2) { /* fall through to the original error */ }
+      }
+      throw err;
+    }
+  };
+  // NOT restored here — see the comment above this function.
+  try {
+    return require('mongoose');
+  } catch (err) {
+    console.error(
+      [
+        `verifyModelParity: cannot load "mongoose" even via the sibling`,
+        `backend's node_modules (${candidateDir}). ${err.message}`,
+        'Fix: run `npm install` in this worktree.'
+      ].join('\n')
+    );
+    process.exit(1);
+  }
+}
+
+const mongoose = loadMongooseWithFallback();
+
+// ---------------------------------------------------------------------------
+// Schema extraction.
+// ---------------------------------------------------------------------------
+
+// Requires `absPath` with mongoose.model() intercepted so nothing is really
+// registered (avoids OverwriteModelError when adgen's and backend's copies
+// of the same model name are both required in this one process) and
+// nothing is really compiled twice. Returns { name, schema } for the FIRST
+// mongoose.model(...) call the file makes, or null if it made none (a model
+// file that does not call mongoose.model — unexpected for this repo's
+// models, but reported as a check failure rather than crashing here).
+function captureSchema(absPath) {
+  const origModel = mongoose.model.bind(mongoose);
+  let captured = null;
+  mongoose.model = function interceptedModel(name, schema) {
+    if (!captured) captured = { name, schema };
+    return function StubModel() {};
+  };
+  try {
+    delete require.cache[absPath];
+    require(absPath);
+  } finally {
+    mongoose.model = origModel;
+  }
+  return captured;
+}
+
+function topLevelPaths(schema) {
+  return [...new Set(Object.keys(schema.paths).map((p) => p.split('.')[0]))].sort();
+}
+
+// ---------------------------------------------------------------------------
+// Main.
+// ---------------------------------------------------------------------------
+
+function main() {
+  if (!BACKEND_ROOT) {
+    console.log(
+      'verifyModelParity: sibling liquidretail_backend not found (checked ' +
+      'ADGEN_BACKEND_PATH and ../liquidretail_backend) — cross-repo model ' +
+      'parity check SKIPPED. This is expected in a checkout that only has ' +
+      'adgen, and is not a failure.'
+    );
+    console.log('\n✅ verifyModelParity: 0/0 checks run (skipped — see above)');
+    return;
+  }
+
+  const backendModelsDir = path.join(BACKEND_ROOT, 'models');
+  const files = fs.readdirSync(ADGEN_MODELS_DIR).filter((f) => f.endsWith('.js')).sort();
+
+  for (const f of files) {
+    const adgenPath = path.join(ADGEN_MODELS_DIR, f);
+    const backendPath = path.join(backendModelsDir, f);
+
+    if (!fs.existsSync(backendPath)) {
+      info(`${f}: no counterpart at liquidretail_backend/models/${f} — not compared (renamed, or adgen-only model)`);
+      continue;
+    }
+
+    check(`${f}: loads + adgen's top-level fields are a subset of backend's`, () => {
+      const adgenCaptured = captureSchema(adgenPath);
+      if (!adgenCaptured) throw new Error('src/models/' + f + ' never called mongoose.model(...) — cannot extract a schema');
+      const backendCaptured = captureSchema(backendPath);
+      if (!backendCaptured) throw new Error('backend models/' + f + ' never called mongoose.model(...) — cannot extract a schema');
+
+      const adgenFields = topLevelPaths(adgenCaptured.schema);
+      const backendFields = topLevelPaths(backendCaptured.schema);
+      const backendSet = new Set(backendFields);
+      const adgenSet = new Set(adgenFields);
+
+      const onlyBackend = backendFields.filter((x) => !adgenSet.has(x));
+      if (onlyBackend.length) {
+        info(`${f}: backend-only field(s), not vendored into adgen (fine, not asserted): ${onlyBackend.join(', ')}`);
+      }
+
+      const onlyAdgen = adgenFields.filter((x) => !backendSet.has(x));
+      if (onlyAdgen.length) {
+        throw new Error(
+          `adgen declares field(s) the backend model LACKS — schema drift, ` +
+          `both services write the same DB: ${onlyAdgen.join(', ')}`
+        );
+      }
+    });
+  }
+
+  const total = pass + failures.length;
+  console.log(`verifyModelParity: compared ${total} model(s) against liquidretail_backend/models/ (SUBSET rule — see file header).`);
+  for (const line of infos) console.log(`  info: ${line}`);
+
+  if (failures.length) {
+    console.log(`\n❌ verifyModelParity: ${failures.length} of ${total} model(s) FAILED`);
+    for (const f of failures) console.log(`   • ${f}`);
+    process.exit(1);
+  }
+  console.log(`\n✅ verifyModelParity: ${total}/${total} model(s) passed`);
+}
+
+main();

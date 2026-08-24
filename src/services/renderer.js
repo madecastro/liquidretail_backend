@@ -88,6 +88,7 @@ async function uploadRenderToCloudinary(renderOutput, ctx) {
   };
 }
 const { resolveDeriveFromMaster } = require('./campaignAdsGenerationService');
+const { classifyRunAdOutcome, buildRunReconciliationUpdate } = require('./campaignRunGuards');
 const atlasVideo = require('./atlasVideoService');
 const { renderBrandScriptAndSave } = require('./brandScriptExecutor');
 // videoRouter exports `prepareStoryboard`; the backend's routes/ads.js binds it
@@ -155,6 +156,73 @@ async function bumpRunCounter(campaignRunIds, field) {
     );
   } catch (err) {
     console.warn(`renderer[${WORKER_ID}]: bumpRunCounter(${field}) failed for ${runId}: ${err.message}`);
+  }
+  await maybeFinalizeRun(runId);
+}
+
+/**
+ * Drive a CampaignRun to its terminal state once every claimed Ad has settled.
+ *
+ * WHY THIS EXISTS. The backend's own terminal write (routes/ads.js:2048,
+ * `buildTerminalDoneFilter` -> status:'done' + completedAt) sits ~325 lines
+ * AFTER runRenderLoop's adgen early-return, so with ADGEN_RENDERER_ENABLED
+ * true it is unreachable. Nothing in adgen wrote it either: bumpRunCounter
+ * only $inc'd counters. MEASURED in production: run_1787557633213_a0ccdd01
+ * held succeeded=2 failed=1 total=3 — every ad settled — while status stayed
+ * 'running' with completedAt null for ~20 minutes.
+ *
+ * That is not merely cosmetic. While updatedAt is stale past REAP_STALE_MIN
+ * (15m) the backend's duplicate-generation gate loses its running arm, so an
+ * identical /generate is admitted with no 409 — and for static that is a
+ * second BILLED gpt-image-2 fan-out.
+ *
+ * WHY IT REUSES THE VENDORED BUILDERS rather than inventing semantics:
+ * classifyRunAdOutcome + buildRunReconciliationUpdate are already vendored in
+ * campaignRunGuards.js — byte-identical to the backend's — and were simply
+ * never called from anywhere in src/. The backend reaper (worker.js:496-526)
+ * makes exactly these calls. Using them means both services derive the same
+ * verdict from the same Ad truth instead of two implementations drifting.
+ *
+ * SAFE AGAINST THE BACKEND REAPER BY CONSTRUCTION. The write is CAS-guarded on
+ * status:'running', which is the identical guard worker.js:522 uses. Whichever
+ * runs first wins; the loser's updateOne matches nothing and is a no-op. No
+ * lock, no coordination, no double-write.
+ *
+ * DELIBERATELY DOES NOT HANDLE needsRetry. When some sibling ad has been
+ * requeued away, buildRunReconciliationUpdate takes its stale-reaper branch,
+ * whose operator-facing message reads "no update from the render loop for over
+ * Xm" — true when a 15-minute reaper says it, a lie when we say it moments
+ * after an ad settled. That case is left to the backend reaper, which has the
+ * elapsed-time context to describe it honestly. Finalizing early is not worth
+ * writing a false explanation into a row an operator reads.
+ *
+ * Failure is swallowed: this is a post-settle convenience, and the backend
+ * reaper remains the backstop. It must never be able to fail a render.
+ */
+async function maybeFinalizeRun(runId) {
+  if (!runId) return;
+  try {
+    // Match the backend reaper's query EXACTLY (worker.js:508): ads are found
+    // by the runId STRING on campaignRunIds, not by the CampaignRun _id.
+    const claimedAds = await Ad.find({ campaignRunIds: runId })
+      .select('status kind renderUrl veoVideoUrl titlingResumeState renderStage')
+      .lean();
+    if (!claimedAds.length) return;
+
+    const outcome = classifyRunAdOutcome(claimedAds);
+    if (!outcome.isSettled) return;       // something is still rendering
+    if (outcome.needsRetry) return;       // see the header — backend reaper owns this
+
+    const update = buildRunReconciliationUpdate(outcome, { now: new Date() });
+    const res = await CampaignRun.updateOne({ runId, status: 'running' }, update);
+    if (res && (res.modifiedCount || res.nModified)) {
+      console.log(
+        `renderer[${WORKER_ID}]: run ${runId} finalized -> done ` +
+        `(succeeded=${outcome.succeeded} failed=${outcome.failed})`
+      );
+    }
+  } catch (err) {
+    console.warn(`renderer[${WORKER_ID}]: maybeFinalizeRun(${runId}) failed: ${err.message}`);
   }
 }
 
