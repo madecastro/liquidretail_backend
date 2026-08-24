@@ -1,14 +1,14 @@
 {
   "version": 1,
   "backendRef": "origin/main",
-  "backendHead": "ba99a59f10619bbd940be9442c8852dc32ae278a",
-  "generatedAt": "2026-08-24T21:46:01.100Z",
+  "backendHead": "e75f6884439fb3343993590ae7bdaa73b3790ae9",
+  "generatedAt": "2026-08-24T22:30:09.489Z",
   "files": {
     "models/Ad.js": {
-      "backendHash": "8e4951d5a020ada681e2e83f4c1869faf4e74e00b6c4afa1a7de71105b72aca4",
-      "backendSha": "36aedfa35e671da580d3e1d323431f431752b576",
+      "backendHash": "2c7423b688a764b10991e5c2f067aabcfd6dc68301883c616d43deba08cf0957",
+      "backendSha": "e75f6884439fb3343993590ae7bdaa73b3790ae9",
       "status": "fork",
-      "reason": "comment-only: adgen still documents AD_VISION_QC_ENABLED env; backend retired the env fallback. Looked at backend #326 stderrTail/stdoutTail — adgen already declares both."
+      "reason": "fork — comment-only divergence plus titlingNeeded. adgen documents the AD_VISION_QC_ENABLED env fallback its systemConfigService still honours; backend retired that fallback and its comment. titlingNeeded is now declared on BOTH sides (backend #332) so a backend save() cannot silently drop adgen's Phase 3 titler handoff flag and strand an already-paid video master — Mongoose strict mode discards undeclared paths with no error, the same way this repo previously lost renderError.predictionId."
     },
     "models/Advertiser.js": {
       "backendHash": "0a7e1bb9ca5e0fbbfc6972f9c96d87f839b0a86175831b5446ae27095137ba3f",
