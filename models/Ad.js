@@ -516,6 +516,24 @@ const adSchema = new mongoose.Schema({
   // scripts/verifyTitlingResume.js (asserts this declaration exists, so the field
   // cannot be used without being declared).
   titlingResumeState: { type: String, enum: ['pending', 'claimed', null], default: null },
+  // Declared here for the SAME reason as titlingResumeState above, and it is the
+  // backend copy that has to carry it even though nothing in this repo reads or
+  // writes it.
+  //
+  // liquidretail_adgen's Phase 3 titler handoff stamps `titlingNeeded: true` on
+  // the ad, releases the claim, and lets a separate titler process pick the row
+  // up. Both services write the SAME production database. Backend's copy of this
+  // model did not declare the path, so any backend `save()` on such an ad would
+  // SILENTLY DROP the flag — Mongoose strict mode discards undeclared paths with
+  // no error — leaving a paid video master that nothing will ever finish. That is
+  // the identical failure mode this file already records twice above
+  // (renderError.predictionId, and the renderStage sentinel).
+  //
+  // scripts/verifyModelParity.js exists to catch exactly this and went red on it:
+  // its rule is adgen's schema paths ⊆ backend's, because adgen inventing a field
+  // backend lacks is the dangerous direction. Adding it here is the correct fix —
+  // NOT removing it from adgen, which needs it.
+  titlingNeeded:      { type: Boolean, default: false },
   posterUrl:          { type: String, default: null },
   // Sparse index — queued ads carry null, only rendered ads contribute.
   cloudinaryPublicId: { type: String, default: null, index: { sparse: true } },
