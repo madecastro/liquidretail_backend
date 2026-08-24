@@ -1712,6 +1712,55 @@ async function runRenderLoop(run, job, adIds, renderToken) {
   // CampaignRun status transition still needs to happen so the operator's
   // UI shows 'running' rather than 'preparing' forever — one write, same
   // shape as the (elided) status flip that lives further down this loop.
+  // Route partition, HOISTED ABOVE THE ADGEN HANDOFF RETURN. It used to sit
+  // below, next to the render pools that consume it — but the Slack run feed
+  // needs staticCount/veoCount too, and the feed has to start on BOTH paths.
+  // Cheap: one projected _id+renderRoute read.
+  const routes = await Ad.find({ _id: { $in: adIds } }).select('_id renderRoute').lean();
+  const routeById = new Map(routes.map((r) => [String(r._id), r.renderRoute || null]));
+  const veoIds   = adIds.filter((id) => routeById.get(String(id)) === 'veo');
+  const otherIds = adIds.filter((id) => routeById.get(String(id)) !== 'veo');
+  const isVeoRun = veoIds.length > 0;
+
+  // Per-run Slack feed — fire-and-forget, never awaited. Registers adIds so
+  // adStage can route events without a Mongo round-trip. Parent message +
+  // thread posts are owned by runFeedService's detached interval.
+  //
+  // THIS MUST STAY ABOVE THE ADGEN HANDOFF RETURN BELOW. It used to live down
+  // with the render pools, which meant that from the moment
+  // ADGEN_RENDERER_ENABLED went true the handoff `return` fired first and
+  // startRun was never called at all — no parent message, so
+  // CampaignRun.slackFeed.ts stayed null forever and every stage event adgen
+  // emitted had no thread to post into. Measured: the feed's last working run
+  // started 2026-08-22T04:09Z, minutes before the handoff commits landed, and
+  // all 21 runs on 2026-08-24 have slackFeed.ts = null. Two days of silent
+  // status reporting, with nothing failing and nothing logged, because nothing
+  // was ever attempted.
+  //
+  // adgen does the rendering but has NO startRun call site of its own — its
+  // only feed touchpoints are adStage.onStage and adVisionQcService.noteEvent,
+  // both of which need a parent that only this call creates. Backend owns the
+  // run lifecycle, so backend owns starting the feed, handoff or not.
+  //
+  // requestedBy is passed on THIS first call even though the human-readable
+  // label is not resolved yet: it costs nothing (already on the run doc) and it
+  // means the very first parent message names the requester by short id rather
+  // than naming nobody for the first throttle window. On the NON-handoff path
+  // the label upgrades it a few ms later on the enriched call below; on the
+  // handoff path this is the only call, so the short id is what shows.
+  runFeed.startRun({
+    runId:   run.runId,
+    brandId: job.brandId,
+    total:   adIds.length,
+    // Kind mix for the uncap context line (slackVerbosity.buildRunStartLine)
+    // — only changes the thread text when total exceeds the old
+    // MAX_CREATIVES_PER_RUN cap of 20; below that it stays byte-identical.
+    staticCount: otherIds.length,
+    veoCount:    veoIds.length,
+    adIds,
+    requestedBy: run?.requestedBy
+  });
+
   const { isAdgenRendererEnabled } = require('../services/adgenBridge');
   if (isAdgenRendererEnabled()) {
     console.log(
@@ -1725,17 +1774,12 @@ async function runRenderLoop(run, job, adIds, renderToken) {
   }
 
   const t0 = Date.now();
-  // Partition the batch by renderRoute so veo (quota-limited) and image
-  // (cheap, parallelizable) render in independent pools. A single mixed
-  // batch used to fall back to VEO_CONCURRENCY for ALL ads because "any
-  // veo ad ⇒ serialize everything" — which meant a 20-min Grok poll
-  // starved 3 image ads that could have finished in <1 min. Two pools
-  // dispatched via Promise.all restores parallelism.
-  const routes = await Ad.find({ _id: { $in: adIds } }).select('_id renderRoute').lean();
-  const routeById = new Map(routes.map((r) => [String(r._id), r.renderRoute || null]));
-  const veoIds   = adIds.filter((id) => routeById.get(String(id)) === 'veo');
-  const otherIds = adIds.filter((id) => routeById.get(String(id)) !== 'veo');
-  const isVeoRun = veoIds.length > 0;
+  // The renderRoute partition that feeds the two pools below (veo is
+  // quota-limited and serialized; image is cheap and parallel — a single mixed
+  // batch used to fall back to VEO_CONCURRENCY for ALL ads, so a 20-min Grok
+  // poll starved image ads that could have finished in <1 min) is computed
+  // ABOVE the adgen handoff return now, because the Slack run feed needs the
+  // same counts and has to start on both paths. See the hoist there.
   console.log(
     `🚀 [campaignRun ${run.runId}] start — ${adIds.length} ad(s) ` +
     `concurrency=veo:${VEO_CONCURRENCY}(${veoIds.length}) image:${RENDER_CONCURRENCY}(${otherIds.length}) ` +
@@ -1747,27 +1791,10 @@ async function runRenderLoop(run, job, adIds, renderToken) {
   // loop lives in the web process and dies with it — see services/inFlight.js.
   inFlight.track(run.runId, { total: adIds.length, brandId: job.brandId, veo: isVeoRun });
 
-  // Per-run Slack feed — fire-and-forget, never awaited. Registers adIds so
-  // adStage can route events without a Mongo round-trip. Parent message +
-  // thread posts are owned by runFeedService's detached interval.
-  //
-  // requestedBy is passed on THIS first call even though the human-readable
-  // label is not resolved yet: it costs nothing (already on the run doc) and it
-  // means the very first parent message names the requester by short id rather
-  // than naming nobody for the first throttle window. The label upgrades it a
-  // few ms later on the enriched call below.
-  runFeed.startRun({
-    runId:   run.runId,
-    brandId: job.brandId,
-    total:   adIds.length,
-    // Kind mix for the uncap context line (slackVerbosity.buildRunStartLine)
-    // — only changes the thread text when total exceeds the old
-    // MAX_CREATIVES_PER_RUN cap of 20; below that it stays byte-identical.
-    staticCount: otherIds.length,
-    veoCount:    veoIds.length,
-    adIds,
-    requestedBy: run?.requestedBy
-  });
+  // The Slack run feed was already started ABOVE the adgen handoff return —
+  // it must fire on both paths, and this position could only ever be reached
+  // on the non-handoff one. The label-enrichment call further down still
+  // upgrades that first parent message once the brand and requester resolve.
 
   // Unified progress row (ActivityDock) — mirrors the CampaignRun
   // counters and adds cooperative cancel: the pool stops claiming new
