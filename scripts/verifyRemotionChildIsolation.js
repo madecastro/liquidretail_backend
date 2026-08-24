@@ -29,7 +29,9 @@
 //   D. Structural (source of remotionRenderService / renderer /
 //      brandScriptExecutor / titlingResumeService):
 //        - production renderTitles goes through enqueue + supervise
-//        - timeout is RENDER_TIMEOUT_MS (REMOTION_TIMEOUT_MS, default 180s)
+//        - Remotion delayRender timeout is RENDER_TIMEOUT_MS (REMOTION_TIMEOUT_MS, default 180s)
+//        - supervisor wall-clock is CHILD_TIMEOUT_MS (REMOTION_CHILD_TIMEOUT_MS, default 480s)
+//          DISTINCT from the delayRender timeout, finite, under the heartbeat cap
 //        - queue still reads REMOTION_QUEUE_CONCURRENCY
 //        - OOM is not a terminal status:'failed' on a paid master
 //        - OOM early-return is INSIDE the heartbeat try whose finally
@@ -49,6 +51,11 @@
 //     (D6 and verifyTitlingHeartbeat B1 stay green — that is the
 //      silent leak this rebase can reintroduce while both features
 //      appear present)
+//   timeoutMs: RENDER_TIMEOUT_MS again (reunite the two bounds) → B5 red
+//   CHILD_TIMEOUT_MS fallback Infinity / omit the || literal    → B6 red
+//   CHILD_TIMEOUT_MS raised to 700_000 (past 10min floor)      → B7 red
+//   superviseRemotionChild accepting timeoutMs: Infinity        → B8 red
+//   drop REMOTION_CHILD_TIMEOUT_MS from defaults.env            → D12 red
 
 const fs = require('fs');
 const path = require('path');
@@ -57,6 +64,7 @@ const assert = require('assert');
 
 const {
   RENDER_TIMEOUT_MS,
+  CHILD_TIMEOUT_MS,
   superviseRemotionChild,
   classifyChildExit,
   serializePayload,
@@ -185,12 +193,82 @@ check('B3 defaultChildEnv strips secrets (MONGODB_URI, ATLAS keys) and sets REMO
     if (prevAtlas === undefined) delete process.env.ATLAS_API_KEY; else process.env.ATLAS_API_KEY = prevAtlas;
   }
 });
-check('B4 RENDER_TIMEOUT_MS is REMOTION_TIMEOUT_MS default 180000 — the existing render timeout', () => {
+check('B4 RENDER_TIMEOUT_MS is Remotion\'s delayRender timeout (REMOTION_TIMEOUT_MS default 180000), NOT the child kill', () => {
   assert.strictEqual(RENDER_TIMEOUT_MS, Number(process.env.REMOTION_TIMEOUT_MS || 180_000));
   assert.ok(SUPERVISOR_SRC.indexOf('REMOTION_TIMEOUT_MS') !== -1);
   assert.ok(SUPERVISOR_SRC.indexOf('180_000') !== -1);
   // Not the canvas child's 5-minute budget — that would stall a 2-slot queue.
   assert.ok(SUPERVISOR_SRC.indexOf('5 * 60 * 1000') === -1);
+});
+check('B5 [MUTATION: reunite the two bounds] CHILD_TIMEOUT_MS is DISTINCT from RENDER_TIMEOUT_MS', () => {
+  assert.notStrictEqual(CHILD_TIMEOUT_MS, RENDER_TIMEOUT_MS,
+    'supervisor wall-clock and Remotion delayRender timeout must not share a value — ' +
+    'tuning one (admit a 380s encode) would break the other (hung delayRender waits the same)');
+  assert.ok(SUPERVISOR_SRC.indexOf('REMOTION_CHILD_TIMEOUT_MS') !== -1,
+    'wall-clock must be its own env var, not an alias of REMOTION_TIMEOUT_MS');
+  assert.match(RENDER_SRC, /timeoutMs:\s*CHILD_TIMEOUT_MS\s*[,\n}]/,
+    'parent must pass CHILD_TIMEOUT_MS as the child kill budget, with no trailing arithmetic');
+  assert.ok(!/timeoutMs:\s*CHILD_TIMEOUT_MS\s*[*/+-]/.test(RENDER_SRC),
+    'timeoutMs: CHILD_TIMEOUT_MS * N would still match a prefix check while doubling the kill budget');
+  assert.ok(!/timeoutMs:\s*RENDER_TIMEOUT_MS/.test(RENDER_SRC),
+    'parent must not reuse RENDER_TIMEOUT_MS as the child kill budget');
+  assert.ok(/timeoutInMilliseconds:\s*RENDER_TIMEOUT_MS/.test(RENDER_SRC),
+    'Remotion calls must still pass RENDER_TIMEOUT_MS as timeoutInMilliseconds');
+});
+check('B6 [MUTATION: Infinity / absent] CHILD_TIMEOUT_MS is finite, positive, and admits the measured max', () => {
+  assert.ok(Number.isFinite(CHILD_TIMEOUT_MS) && CHILD_TIMEOUT_MS > 0,
+    `CHILD_TIMEOUT_MS must be a finite positive number, got ${CHILD_TIMEOUT_MS}`);
+  assert.ok(CHILD_TIMEOUT_MS > 380_000,
+    `CHILD_TIMEOUT_MS=${CHILD_TIMEOUT_MS} does not admit the measured max of 380s`);
+  const decl = /const CHILD_TIMEOUT_MS\s*=\s*Number\(process\.env\.REMOTION_CHILD_TIMEOUT_MS\s*\|\|\s*([^)]+)\)/.exec(SUPERVISOR_SRC);
+  assert.ok(decl, 'CHILD_TIMEOUT_MS must be Number(process.env.REMOTION_CHILD_TIMEOUT_MS || <literal>) — an absent fallback is Number(undefined) === NaN, i.e. unbounded');
+  const fallback = decl[1].replace(/\s+/g, '');
+  assert.ok(!/Infinity|NaN|undefined|null/.test(fallback),
+    `wall-clock fallback must not be Infinity/absent/NaN, found ${fallback}`);
+  const n = Number(fallback.replace(/_/g, ''));
+  assert.ok(Number.isFinite(n) && n > 0,
+    `wall-clock fallback must parse as a finite positive number, got ${fallback}`);
+});
+check('B7 [MUTATION: raise past heartbeat cap] CHILD_TIMEOUT_MS is under the titling-heartbeat lifetime cap', () => {
+  // Heartbeat lifetime cap (renderer.js): max(10min floor,
+  // 3 * ceil(MAX_INFLIGHT / REMOTION_QUEUE_CONCURRENCY) * 76s).
+  // Live (32 / 2): 3,648,000ms = 60.8 min. Floor binds if concurrency
+  // rises enough to shrink the derived term. The wall-clock must sit
+  // under BOTH so a hung child is SIGKILL'd (slot frees) before the
+  // beat dies (bootRecovery can steal a still-running render).
+  assert.match(RENDERER_SRC, /const AD_HEARTBEAT_MAX_MS/,
+    'heartbeat cap must still exist — do not "fix" a long render by removing it');
+  assert.match(RENDERER_SRC, /10\s*\*\s*60\s*\*\s*1000/,
+    'heartbeat formula floor (10 min) must still be in AD_HEARTBEAT_MAX_MS');
+  const HEARTBEAT_FLOOR_MS = 10 * 60 * 1000;
+  const LIVE_CAP_MS = Math.max(
+    HEARTBEAT_FLOOR_MS,
+    3 * Math.ceil(32 / 2) * 76_000
+  );
+  assert.strictEqual(LIVE_CAP_MS, 3_648_000, 'sanity: live cap is 60.8 min at MAX_INFLIGHT=32, conc=2');
+  assert.ok(CHILD_TIMEOUT_MS < HEARTBEAT_FLOOR_MS,
+    `CHILD_TIMEOUT_MS=${CHILD_TIMEOUT_MS} must sit under the heartbeat floor (${HEARTBEAT_FLOOR_MS}ms) ` +
+    'so a hung child is killed before the beat dies even if the floor binds');
+  assert.ok(CHILD_TIMEOUT_MS < LIVE_CAP_MS,
+    `CHILD_TIMEOUT_MS=${CHILD_TIMEOUT_MS} must sit under today's live heartbeat cap (${LIVE_CAP_MS}ms)`);
+});
+check('B8 [MUTATION: pass Infinity / omit timeoutMs] superviseRemotionChild refuses a non-finite kill budget', () => {
+  assert.throws(
+    () => superviseRemotionChild({ runnerPath: CHILD_FILE, payload: { videoUrl: '/tmp/x' }, timeoutMs: Infinity }),
+    /timeoutMs must be a positive number/
+  );
+  assert.throws(
+    () => superviseRemotionChild({ runnerPath: CHILD_FILE, payload: { videoUrl: '/tmp/x' } }),
+    /timeoutMs must be a positive number/
+  );
+  assert.throws(
+    () => superviseRemotionChild({ runnerPath: CHILD_FILE, payload: { videoUrl: '/tmp/x' }, timeoutMs: 0 }),
+    /timeoutMs must be a positive number/
+  );
+  assert.throws(
+    () => superviseRemotionChild({ runnerPath: CHILD_FILE, payload: { videoUrl: '/tmp/x' }, timeoutMs: -1 }),
+    /timeoutMs must be a positive number/
+  );
 });
 
 // ═════════════════════════════════════════════════════════════════════════
@@ -419,7 +497,10 @@ function runD() {
     assert.ok(fn, 'renderTitles not found');
     const body = fn[0];
     assert.ok(/enqueue\(\(\)\s*=>\s*superviseRemotionChild\(/.test(body), 'parent path must enqueue the supervisor');
-    assert.ok(/timeoutMs:\s*RENDER_TIMEOUT_MS/.test(body), 'parent must pass RENDER_TIMEOUT_MS as the child kill budget');
+    assert.match(body, /timeoutMs:\s*CHILD_TIMEOUT_MS\s*[,\n}]/,
+      'parent must pass CHILD_TIMEOUT_MS as the child kill budget, with no trailing arithmetic');
+    assert.ok(!/timeoutMs:\s*CHILD_TIMEOUT_MS\s*[*/+-]/.test(body),
+      'timeoutMs: CHILD_TIMEOUT_MS * N would still match a prefix check while doubling the kill budget');
     assert.ok(/runnerPath:\s*CHILD_PATH/.test(body), 'parent must spawn remotionRender.child.js');
     assert.ok(/REMOTION_IN_CHILD === '1'/.test(body), 'child re-entry must skip spawn (no fork bomb)');
     assert.ok(/return renderTitlesJob\(args\)/.test(body), 'child re-entry runs the in-process job');
@@ -577,6 +658,26 @@ function runD() {
           'startAdHeartbeat must start immediately before the try that stops it');
       }
     }
+  });
+
+  check('D12 defaults.env pins both bounds, with the measured distribution on the wall-clock', () => {
+    const defaults = fs.readFileSync(path.join(ROOT, 'config', 'defaults.env'), 'utf8');
+    const childAssigns = defaults.match(/^REMOTION_CHILD_TIMEOUT_MS=/gm) || [];
+    const renderAssigns = defaults.match(/^REMOTION_TIMEOUT_MS=/gm) || [];
+    assert.strictEqual(childAssigns.length, 1,
+      'REMOTION_CHILD_TIMEOUT_MS must appear exactly once (dotenv last-occurrence wins)');
+    assert.strictEqual(renderAssigns.length, 1,
+      'REMOTION_TIMEOUT_MS must appear exactly once (dotenv last-occurrence wins)');
+    assert.match(defaults, /^REMOTION_CHILD_TIMEOUT_MS=480000$/m);
+    assert.match(defaults, /^REMOTION_TIMEOUT_MS=180000$/m);
+    assert.match(SUPERVISOR_SRC,
+      /const CHILD_TIMEOUT_MS\s*=\s*Number\(process\.env\.REMOTION_CHILD_TIMEOUT_MS\s*\|\|\s*480_000\)/,
+      'code fallback must lockstep with defaults.env (480_000) so a missed dotenv load does not re-ship 180s');
+    assert.match(defaults, /mean 89/);
+    assert.match(defaults, /p95 158/);
+    assert.match(defaults, /max 380/);
+    assert.match(defaults, /1\.97 GiB/);
+    assert.match(defaults, /concurrency 2/);
   });
 }
 

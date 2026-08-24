@@ -18,24 +18,50 @@ const os = require('os');
 
 const REPO_ROOT = path.resolve(__dirname, '..', '..');
 
-// Parent-side kill budget. SAME constant remotionRenderService applies as
-// timeoutInMilliseconds on selectComposition/renderMedia
-// (`Number(process.env.REMOTION_TIMEOUT_MS || 180_000)`).
+// TWO BOUNDS, TWO FAILURE MODES. Do not reunite these.
+//
+// RENDER_TIMEOUT_MS is Remotion's INTERNAL delayRender() watchdog,
+// passed as timeoutInMilliseconds on selectComposition/renderMedia/
+// renderStill. Remotion 4.0.495 documents it as "how long the render
+// may take to resolve all delayRender() calls" (package default 30000).
+// It is NOT a whole-render wall-clock. #8 reused this number as the
+// child SIGKILL budget; a legitimate encode past 180s then died as
+// "remotion child exceeded 180000ms timeout" (25% of a 12-ad Meta
+// batch, run_1787575090320_db5a5d96) after the Omni master was paid.
+const RENDER_TIMEOUT_MS = Number(process.env.REMOTION_TIMEOUT_MS || 180_000);
+//
+// CHILD_TIMEOUT_MS is the parent-side WALL-CLOCK kill of the whole
+// child process. Timer starts at spawn, AFTER enqueue() has acquired a
+// REMOTION_QUEUE_CONCURRENCY slot — queue wait is not counted. Covers
+// the child's full lifetime: re-bundle, browser, plate download/scan,
+// selectComposition, renderMedia, process.exit. Per spawn, per
+// renderTitles call.
 //
 // WHY this and not brandScriptExecutor's CHILD_TIMEOUT_MS (5 min): this
 // child IS a Remotion render. A hung child holding one of the
-// REMOTION_QUEUE_CONCURRENCY slots (live: 2) for 5 minutes would stall
-// the entire titling queue. The remotion-specific budget is the right
-// one. The canvas-engine 5 min is a different workload (per-frame PNG
-// loop), not a render-timeout constant.
+// REMOTION_QUEUE_CONCURRENCY slots (live: 2) forever would stall the
+// entire titling queue. The bound must still exist; Infinity is how a
+// wedged Chrome/ffmpeg holds a slot until the process is replaced.
 //
-// The parent timer is a BACKSTOP. If Remotion's own watchdog fires
-// cleanly the child exits non-zero and we surface that as a render throw
-// (kind:'render'), with the Error's message/stack restored from the JSON
-// report. If Chrome/ffmpeg hang past that watchdog, we SIGKILL and
-// surface kind:'timeout' — distinct from an OS OOM SIGKILL because we
-// set timedOut BEFORE killing.
-const RENDER_TIMEOUT_MS = Number(process.env.REMOTION_TIMEOUT_MS || 180_000);
+// WHY 480s: measured over 62 assets in this pipeline — mean 89s /
+// p95 158s / max 380s — at REMOTION_QUEUE_CONCURRENCY=2 (1.97 GiB/slot).
+// 180s sat INSIDE that tail. 480s admits 100% of the sample (max 380)
+// with 26% slack above the observed max for in-child work that is not
+// renderMs (each child re-bundles) and for conc=2 CPU contention.
+// Must stay under the titling-heartbeat lifetime cap as a PER-CHILD
+// bound (floor 10 min / live 60.8 min at MAX_INFLIGHT=32, conc=2) so a
+// hung in-slot child is killed before that ad's beat dies. A full
+// 32-inflight pile-up of 480s waves (128 min) exceeds 60.8 min because
+// the beat formula still uses 76s; that cap is a different PR. See
+// config/defaults.env.
+//
+// The parent timer is a BACKSTOP. If Remotion's own delayRender
+// watchdog fires cleanly the child exits non-zero and we surface that
+// as a render throw (kind:'render'), with the Error's message/stack
+// restored from the JSON report. If Chrome/ffmpeg hang past that
+// watchdog, we SIGKILL and surface kind:'timeout' — distinct from an
+// OS OOM SIGKILL because we set timedOut BEFORE killing.
+const CHILD_TIMEOUT_MS = Number(process.env.REMOTION_CHILD_TIMEOUT_MS || 480_000);
 
 const KEEP_ENV = [
   'PATH', 'NODE_PATH', 'HOME', 'TMPDIR', 'TMP', 'TEMP',
@@ -188,7 +214,7 @@ function superviseRemotionChild({
   if (!runnerPath) throw new Error('superviseRemotionChild: runnerPath required');
   const budget = Number(timeoutMs);
   if (!Number.isFinite(budget) || budget <= 0) {
-    throw new Error('superviseRemotionChild: timeoutMs must be a positive number (pass RENDER_TIMEOUT_MS)');
+    throw new Error('superviseRemotionChild: timeoutMs must be a positive number (pass CHILD_TIMEOUT_MS)');
   }
   const body = serializePayload(payload);
 
@@ -232,7 +258,7 @@ function superviseRemotionChild({
       if (kind === 'timeout') {
         return finish(reject, makeChildError({
           kind: 'timeout',
-          message: `remotion child exceeded ${budget}ms timeout (REMOTION_TIMEOUT_MS=${RENDER_TIMEOUT_MS})`,
+          message: `remotion child exceeded ${budget}ms timeout (REMOTION_CHILD_TIMEOUT_MS=${CHILD_TIMEOUT_MS})`,
           code,
           signal,
           stderr,
@@ -309,6 +335,7 @@ function superviseRemotionChild({
 
 module.exports = {
   RENDER_TIMEOUT_MS,
+  CHILD_TIMEOUT_MS,
   superviseRemotionChild,
   classifyChildExit,
   serializePayload,

@@ -33,6 +33,7 @@ const { FONT_CACHE_DIR } = require('./fontResolverService');
 const { FONTS_DIR } = require('./fontLoader');
 const {
   RENDER_TIMEOUT_MS,
+  CHILD_TIMEOUT_MS,
   superviseRemotionChild
 } = require('./remotionChildSupervisor');
 
@@ -652,7 +653,7 @@ async function renderTitles(args) {
   return enqueue(() => superviseRemotionChild({
     runnerPath: CHILD_PATH,
     payload: payloadForChild(args),
-    timeoutMs: RENDER_TIMEOUT_MS
+    timeoutMs: CHILD_TIMEOUT_MS
   }));
 }
 
@@ -835,6 +836,7 @@ module.exports = {
   payloadForChild,
   CHILD_PATH,
   RENDER_TIMEOUT_MS,
+  CHILD_TIMEOUT_MS,
   // Pool internals — exported so scripts/verifyTitlingQueueParallel.js can
   // prove the pool actually overlaps work instead of regexing for the word
   // "concurrency". A serial queue and a parallel one look identical in source.

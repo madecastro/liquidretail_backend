@@ -56,7 +56,7 @@ async function main() {
   });
   // Remotion's Chrome / asset server can pin the event loop after the
   // render returns. Without an explicit exit the parent sits on close
-  // until RENDER_TIMEOUT_MS and then SIGKILLs a SUCCESSFUL render,
+  // until CHILD_TIMEOUT_MS and then SIGKILLs a SUCCESSFUL render,
   // classifying it as timeout. brandScriptRunner.child.js didn't need
   // this because canvas does not keep a browser open.
   process.exit(0);

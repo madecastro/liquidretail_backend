@@ -14,6 +14,37 @@ it clears it back to this placeholder.)_
 
 ## CURRENT STATE
 
+*(Written 2026-08-24. Worktree `/Volumes/Sayulita/Projects/RS/.wt-remotimeout`,
+branch `fix/remotion-child-timeout` off `origin/master` @ `227348c`.)*
+
+- **What this is.** Production regression from PR #8 (`c00e17d`): the Remotion
+  child supervisor reused `REMOTION_TIMEOUT_MS=180s` as a wall-clock SIGKILL of
+  the whole child. Tonight 3/12 ads on run_1787575090320_db5a5d96 failed with
+  `remotion child exceeded 180000ms timeout` after the Omni master was paid.
+- **Mechanism (confirmed).** Timer starts at spawn AFTER `enqueue()` takes a
+  `REMOTION_QUEUE_CONCURRENCY` slot — queue wait is not counted. Covers the
+  whole child lifetime (re-bundle, download, plate scan, selectComposition,
+  renderMedia, process.exit). Remotion's `timeoutInMilliseconds` is a
+  delayRender() watchdog (4.0.495 `timeout.js`), not a whole-render bound.
+  Same number, two clocks. Not nested double-count.
+- **Fix.** Split: `RENDER_TIMEOUT_MS` / `REMOTION_TIMEOUT_MS=180000` stays the
+  delayRender timeout. New `CHILD_TIMEOUT_MS` / `REMOTION_CHILD_TIMEOUT_MS=480000`
+  is the wall-clock. 480s admits 100% of the 62-asset sample (mean 89 / p95 158 /
+  max 380) with 26% slack above max. Finite — a wedged Chrome/ffmpeg is still
+  SIGKILL'd at 8 min. Child isolation, D11, heartbeat, #7 `$in` filters,
+  `REMOTION_QUEUE_CONCURRENCY=2` untouched.
+- **Heartbeat interaction.** Per-child 480s sits under the 10 min formula floor
+  and the live 60.8 min cap, so a hung *in-slot* child dies before that ad's
+  beat. A full 32-inflight pile-up of 480s waves is 128 min and exceeds 60.8 min
+  (the formula still uses 76s). 16×180s used to fit; 16×380s already did not.
+  Not fixed here — heartbeat is out of scope. Tonight's 12-ad batch (6 waves)
+  still fits at 480s (48 min).
+- **Proof.** Isolation 27/27 → 32/32. Mutation: Infinity → B6/B7/D12 red;
+  absent fallback → B6/B7 red; reunite timeoutMs → B5/D1 red; 700s (past floor)
+  → B7/D12 red; `CHILD_TIMEOUT_MS * 2` → B5/D1 red. Restored 32/32. Heartbeat
+  17/17, slack 34/34. Suite before/after 18/22, same four reds.
+- **Pushed.** PR against master. Do not merge.
+
 *(Written 2026-08-24. Worktree `/Volumes/Sayulita/Projects/RS/.wt-brandport`,
 branch `port/brand-consistency-to-adgen`, cut from `origin/master` @ `af4338b`.)*
 
