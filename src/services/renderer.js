@@ -95,6 +95,12 @@ async function uploadRenderToCloudinary(renderOutput, ctx) {
 }
 const { resolveDeriveFromMaster } = require('./campaignAdsGenerationService');
 const { classifyRunAdOutcome, buildRunReconciliationUpdate } = require('./campaignRunGuards');
+// CampaignRun liveness heartbeat. IMPORTED, never re-implemented inline —
+// CLAUDE.md records production ReferenceErrors from call sites that used a
+// helper the file never imported. The module itself is vendored and correct;
+// it was never required from this render loop, which is why a live run's
+// lastHeartbeatAt stays null until an ad settles.
+const { startRunHeartbeat } = require('./campaignRunHeartbeat');
 const atlasVideo = require('./atlasVideoService');
 const { renderBrandScriptAndSave } = require('./brandScriptExecutor');
 const { isRemotionChildOomError } = require('./remotionChildSupervisor');
@@ -1224,37 +1230,177 @@ async function renderVideo(ad) {
 // promise, so one instance can run many concurrent ads.
 let inFlight = 0;
 
+// ── CAMPAIGNRUN LIVENESS HEARTBEAT — a money/visibility guard, not telemetry.
+//
+// Backend worker.js's reaper flips any CampaignRun sitting in 'running' with
+// `updatedAt` older than REAP_STALE_MIN (15m) to 'failed'. With
+// ADGEN_RENDERER_ENABLED=true, adgen renders every new ad, and the only
+// CampaignRun writes this loop used to make were bumpRunCounter's per-ad
+// `$inc { succeeded | failed | skipped }` — which fire when an ad SETTLES.
+// So the reaper's predicate measured "no ad settled recently", not "this
+// run is alive". MEASURED IN PRODUCTION 2026-08-18
+// (run_1787105727540_e8c94542): 18 statics settled by 02:21, video titling
+// then ran silently, and at 02:36 the reaper stamped a working run 'failed'
+// with `errors: []`, `failed: 0`. Re-measured live 2026-08-24
+// (run_1787575090320_db5a5d96): lastHeartbeatAt NULL, updatedAt frozen 6+
+// minutes while the master was generating and the per-ad beat moved every
+// ~10s. The module that was written to fix this was vendored into adgen
+// and never called.
+//
+// GATED ON REAL WORK, and that is the whole design. Backend's runRenderLoop
+// owns one run and gates on `pools.some(p => p.inflight > 0)` — the same
+// counters the loop uses to decide it is finished. Adgen's worker is
+// multi-run: the process-wide `inFlight` above is "any ad, any run", so
+// gating on it would keep a finished run beating while a sibling's ads
+// were in flight (the unconditional tick that defeats the reaper). The
+// equivalent signal is this Map: incremented when processAd begins work
+// on an ad of that run, decremented in the same finally that stops the
+// ticker. A truthy constant here would resurrect the wedged-run-lives-
+// forever class the reaper exists to kill.
+//
+// `runDocId` is CampaignRun._id (what buildRunHeartbeatFilter matches).
+// Ad.campaignRunIds holds the runId STRING, so we resolve _id once per
+// run and cache it. Lookup failure → no ticker (fail towards reapable).
+//
+// The Ad arm gets this run's claimed set, same as backend routes/ads.js:1868.
+// Backend still bulk-claims the whole batch to status:'rendering' BEFORE
+// the adgen early-return (claimAdsForRun, then runRenderLoop returns).
+// Those rows sit {status:'rendering', claimedByWorker:null} with updatedAt
+// frozen at claim time (Ad.timestamps is false; claimOne does not refresh
+// it). That is the claimed-but-undispatched tail the 2026-08-18 Ad sweep
+// stranded — it is in Mongo, not an in-memory pool. startAdHeartbeat
+// cannot cover it: it requires claimedByWorker:WORKER_ID and only wraps
+// titling. Passing a snapshot of the one ad in processAd would miss the
+// siblings still waiting for a slot. The module's Ad-arm filter is
+// { _id: { $in: adIds }, status:'rendering' }, so settled rows are a
+// no-op and the per-ad beat (#9/#11) is undisturbed.
+//
+// Fire-and-forget, never awaited into the render, never throws into the
+// loop. stop() is idempotent and is called from BOTH catch and finally —
+// same discipline as routes/ads.js:1922/1937.
+const runInflight    = new Map(); // runId string → processAd count for that run
+const runHeartbeats  = new Map(); // runId string → startRunHeartbeat handle
+const runDocIdCache  = new Map(); // runId string → CampaignRun._id
+
+function runIdOf(ad) {
+  return Array.isArray(ad.campaignRunIds) && ad.campaignRunIds.length
+    ? ad.campaignRunIds[ad.campaignRunIds.length - 1]
+    : null;
+}
+
+function runIsWorking(runId) {
+  return (runInflight.get(runId) || 0) > 0;
+}
+
+async function acquireRunHeartbeat(runId) {
+  const noop = { stop() {} };
+  if (!runId) return noop;
+
+  runInflight.set(runId, (runInflight.get(runId) || 0) + 1);
+
+  let released = false;
+  const release = () => {
+    if (released) return;
+    released = true;
+    const n = (runInflight.get(runId) || 1) - 1;
+    if (n <= 0) {
+      runInflight.delete(runId);
+      const handle = runHeartbeats.get(runId);
+      runHeartbeats.delete(runId);
+      runDocIdCache.delete(runId);
+      if (handle) handle.stop();
+    } else {
+      runInflight.set(runId, n);
+    }
+  };
+
+  try {
+    if (!runHeartbeats.has(runId)) {
+      let docId = runDocIdCache.get(runId);
+      if (!docId) {
+        const doc = await CampaignRun.findOne({ runId }).select('_id').lean();
+        docId = doc && doc._id;
+        if (docId) runDocIdCache.set(runId, docId);
+        else {
+          console.warn(
+            `renderer[${WORKER_ID}]: no CampaignRun for ${runId} — skipping run heartbeat (fail towards reapable)`
+          );
+        }
+      }
+      if (docId && !runHeartbeats.has(runId)) {
+        // Same population backend hands the ticker: every ad this run
+        // claimed. Taken once when the ticker opens — the bulk claim
+        // already landed before the first processAd of the run.
+        let adIds = [];
+        try {
+          const claimed = await Ad.find({ campaignRunIds: runId }).select('_id').lean();
+          adIds = Array.isArray(claimed) ? claimed.map((a) => a._id) : [];
+        } catch (err) {
+          console.warn(
+            `renderer[${WORKER_ID}]: Ad.find for run heartbeat ${runId} failed: ${err.message} — run arm still starts`
+          );
+        }
+        runHeartbeats.set(runId, startRunHeartbeat({
+          runDocId:  docId,
+          adIds,
+          isWorking: () => runIsWorking(runId)
+        }));
+      }
+    }
+  } catch (err) {
+    // A missed start is survivable — the run stays reapable. Never throw
+    // into processAd over a liveness ticker.
+    console.warn(`renderer[${WORKER_ID}]: startRunHeartbeat failed for ${runId}: ${err.message}`);
+  }
+
+  return { stop: release };
+}
+
 // End-to-end render for one claimed ad. Wrapped so poll() can dispatch
 // via .finally() without holding the poll loop.
 async function processAd(ad) {
   const started = Date.now();
+  const runHeartbeat = await acquireRunHeartbeat(runIdOf(ad));
   try {
-    if (ad.renderRoute === 'html_gen') {
-      await renderStatic(ad);
-    } else if (ad.renderRoute === 'veo') {
-      await renderVideo(ad);
-    } else {
-      throw new Error(`unknown renderRoute: ${ad.renderRoute}`);
+    try {
+      if (ad.renderRoute === 'html_gen') {
+        await renderStatic(ad);
+      } else if (ad.renderRoute === 'veo') {
+        await renderVideo(ad);
+      } else {
+        throw new Error(`unknown renderRoute: ${ad.renderRoute}`);
+      }
+    } catch (err) {
+      const shortId = String(ad._id).slice(-6);
+      const wallSec = ((Date.now() - started) / 1000).toFixed(1);
+      console.error(`renderer[${WORKER_ID}]: render failed ad=${shortId} route=${ad.renderRoute} wall=${wallSec}s: ${err.message}`);
+      try { noteRenderIssue(ad._id, { message: err.message, stage: 'render' }); } catch (_) {}
+      notifyRenderFailure(ad, err);
+      await Ad.updateOne(
+        { _id: ad._id, claimedByWorker: WORKER_ID },
+        {
+          $set: {
+            status:          'failed',
+            claimedByWorker: null,
+            claimedAt:       null,
+            renderError:     { message: err.message.slice(0, 400), stage: 'render', at: new Date(), code: err.code || null },
+            updatedAt:       new Date()
+          }
+        }
+      ).catch(() => {});
+      await bumpRunCounter(ad.campaignRunIds, 'failed');
     }
   } catch (err) {
-    const shortId = String(ad._id).slice(-6);
-    const wallSec = ((Date.now() - started) / 1000).toFixed(1);
-    console.error(`renderer[${WORKER_ID}]: render failed ad=${shortId} route=${ad.renderRoute} wall=${wallSec}s: ${err.message}`);
-    try { noteRenderIssue(ad._id, { message: err.message, stage: 'render' }); } catch (_) {}
-    notifyRenderFailure(ad, err);
-    await Ad.updateOne(
-      { _id: ad._id, claimedByWorker: WORKER_ID },
-      {
-        $set: {
-          status:          'failed',
-          claimedByWorker: null,
-          claimedAt:       null,
-          renderError:     { message: err.message.slice(0, 400), stage: 'render', at: new Date(), code: err.code || null },
-          updatedAt:       new Date()
-        }
-      }
-    ).catch(() => {});
-    await bumpRunCounter(ad.campaignRunIds, 'failed');
+    // DEAD TODAY, AND DELIBERATELY KEPT — same as backend routes/ads.js's
+    // runRenderLoop catch. The inner catch swallows render failures, so this
+    // arm only fires if the inner catch itself throws. What it buys is that
+    // the invariant survives an edit: a rejection would otherwise skip the
+    // still-beating timer and keep a crashed run out of the reaper's reach.
+    // stop() is idempotent, so the pair with finally costs nothing.
+    runHeartbeat.stop();
+    throw err;
+  } finally {
+    runHeartbeat.stop();
   }
 }
 

@@ -45,6 +45,53 @@ branch `fix/remotion-child-timeout` off `origin/master` @ `227348c`.)*
   17/17, slack 34/34. Suite before/after 18/22, same four reds.
 - **Pushed.** PR against master. Do not merge.
 
+*(Written 2026-08-24. Worktree `/Volumes/Sayulita/Projects/RS/.wt-runbeat`,
+branch `fix/adgen-run-heartbeat`, cut from `origin/master` @ `227348c`.)*
+
+- **What this is.** Wire the vendored-but-dead `startRunHeartbeat` into
+  adgen's render loop. With `ADGEN_RENDERER_ENABLED=true` adgen renders
+  every new ad; the module existed and was never required/called, so no
+  CampaignRun row was heartbeaten. Live proof: run_1787575090320_db5a5d96
+  had `lastHeartbeatAt` NULL and frozen `updatedAt` while the master was
+  generating. Backend reaper (`buildStaleRunningFilter`, REAP_STALE_MIN=15)
+  would stamp the run `failed` mid-render — the exact incident
+  campaignRunHeartbeat.js was written to close (run_1787105727540_e8c94542).
+- **In-flight signal.** Not process-wide `inFlight` (any ad, any run — that
+  would keep a finished run beating while a sibling worked). Per-run Map
+  `runInflight`, incremented when `processAd` begins work on an ad of that
+  run, decremented in the same finally that stops the ticker. That is
+  adgen's equivalent of backend `pools.some(p => p.inflight > 0)`.
+  `isWorking: () => runIsWorking(runId)` is exact, not `() => true`.
+- **runDocId.** Module filter is `{ _id, status:'running' }`. Ads stamp the
+  runId STRING on `campaignRunIds`, so we `findOne({ runId }).select('_id')`
+  once per run. Lookup miss → no ticker (fail towards reapable). Module
+  itself untouched.
+- **Ad arm.** Backend still bulk-claims the whole batch to `rendering`
+  before the adgen early-return. Those rows sit unowned with `updatedAt`
+  frozen at claim time (`Ad.timestamps` is false; `claimOne` does not
+  refresh it) — that IS the claimed-but-undispatched tail the 2026-08-18
+  Ad sweep stranded. At ticker start we `Ad.find({ campaignRunIds: runId })`
+  and pass those ids, same as `routes/ads.js:1868`. Two independent Grok
+  reviews both caught the empty-`adIds` hole; `startAdHeartbeat` cannot
+  cover it (`claimedByWorker:WORKER_ID`, titling-only).
+- **stop()** in processAd outer catch AND finally; handle is refcounted and
+  idempotent. Cap is module `RUN_HEARTBEAT_MAX_MS` (4h = progressService).
+  Write is still only `{ updatedAt, lastHeartbeatAt }`.
+- **Harness close-out (this session).** Production wiring was already
+  verified. `verifyCampaignRunHeartbeatWired_KNOWN_OPEN.js` still failed
+  for the wrong reason (B2 asserted the require's ABSENCE; C1 only
+  replayed bumpRunCounter). Inverted B2 (renderer.js MUST require the
+  module — import-plus-call-site). Rewrote C1 to RUN renderer.js's
+  acquireRunHeartbeat against stubs and drive heartbeatOnce at
+  runHeartbeatMs() across the 20-minute gap; updatedAt now stays inside
+  REAP_STALE_MIN. Deleted the KNOWN-OPEN header; renamed to
+  `scripts/verifyCampaignRunHeartbeatWired.js`. Revert-prove: remove
+  require → B2 red; remove startRunHeartbeat call → C1 red; restore →
+  8/8 green. Suite before 19/23 (four reds), after 20/23. Remaining
+  reds: verifyArchiveDigestRelease, verifyModelParity,
+  verifyRunFinalizesOnSettle_KNOWN_OPEN.
+- **Not merged.** PR #16 against master.
+
 *(Written 2026-08-24. Worktree `/Volumes/Sayulita/Projects/RS/.wt-brandport`,
 branch `port/brand-consistency-to-adgen`, cut from `origin/master` @ `af4338b`.)*
 
@@ -101,8 +148,6 @@ False-page closed: orphan scan is now claimed-old AND not-heartbeating.)*
 
 ## KNOWN-OPEN
 
-- **`verifyCampaignRunHeartbeatWired_KNOWN_OPEN.js`** — expected red.
-  `startRunHeartbeat` has no call site in `src/`.
 - **`verifyRunFinalizesOnSettle_KNOWN_OPEN.js`** — still labelled expected-fail;
   `maybeFinalizeRun` is wired on this branch. Group A only replays the `$inc`.
 - **`verifyArchiveDigestRelease.js` E3/E14** — self-diagnosed broken ported scans.
@@ -110,6 +155,8 @@ False-page closed: orphan scan is now claimed-old AND not-heartbeating.)*
   `liquidretail_backend/models/*` no longer call `mongoose.model(...)` in a
   shape the harness can extract. Also fails while a `node_modules` symlink
   is present (remove it before commit).
+- **Closed this session:** `verifyCampaignRunHeartbeatWired.js` (was
+  `_KNOWN_OPEN`). Defect is wired; harness now pins the closed state.
 - **Orchestrator is not Phase 2.**
 - **`titlingResumeService` / `bootRecoveryService` unwired** from adgen boot.
   Isolation leaves resume state; it does not start the sweeper.
