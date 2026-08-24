@@ -40,16 +40,20 @@ services:
   - type: worker
     name: adgen-renderer
     env: docker
-    # Standard-Plus: 4 vCPU / 8 GB. The RAM ceiling is set by Remotion —
+    # Pro-Plus: 4 vCPU / 8 GB. The RAM ceiling is set by Remotion —
     # ~1.5-2 GB per render at 4 concurrent (REMOTION_QUEUE_CONCURRENCY=4)
-    # ≈ 6-8 GB peak. Standard (4 GB) OOMs under real video load.
+    # ≈ 6-8 GB peak. Standard (4 GB) OOMs under real video load. Was
+    # standard_plus in this file until 2026-08-24 (Render's plan naming
+    # shifted mid-year; the live service was already on pro_plus via
+    # dashboard override, and standard_plus is no longer a valid worker
+    # plan on blueprint sync — this rename catches the file up to reality).
     #
     # When ADGEN_TITLER_ENABLED=true (dashboard override), this role stops
     # doing Remotion in-process and simply stamps titlingNeeded=true after
     # the master's veoVideoUrl lands. The titler service (below) picks it
     # up. In that mode this instance stops being memory-bound by Remotion
     # and can raise ADGEN_MAX_INFLIGHT — but that's a separate tuning PR.
-    plan: standard_plus
+    plan: pro_plus
     dockerfilePath: ./Dockerfile
     autoDeploy: true
     # Set autoscale in the Render dashboard: min=2 (survives one instance
@@ -66,15 +70,15 @@ services:
   - type: worker
     name: adgen-titler
     env: docker
-    # Same plan as adgen-renderer (see that block's comment). Titler needs
-    # the RAM for Chrome — but unlike the renderer, this instance has NO
-    # competing work (no Atlas HTTP, no static gpt-image-2/edit, no poll
-    # loop overhead beyond claim polling), so Chrome gets the whole budget.
+    # Same plan as adgen-renderer (see that block's comment on why 8 GB is
+    # required for Chrome). Titler has NO competing work on this instance
+    # (no Atlas HTTP, no static gpt-image-2/edit, no poll loop overhead
+    # beyond claim polling), so Chrome gets the whole budget.
     # REMOTION_QUEUE_CONCURRENCY is inherited from config/defaults.env (=2)
     # for a safe first deploy; raise via env override once validated under
     # real load. Do not duplicate the value here — two sources of truth for
     # a memory ceiling has bitten this repo before.
-    plan: standard_plus
+    plan: pro_plus
     dockerfilePath: ./Dockerfile
     autoDeploy: true
     # Dashboard autoscale: min=1 (dark launch — flag off, service is idle),

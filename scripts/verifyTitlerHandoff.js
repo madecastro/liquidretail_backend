@@ -160,9 +160,9 @@ check('F2 shutdown drains up to 25s then force-releases',
 const renderYaml = fs.readFileSync(path.join(REPO, 'render.yaml'), 'utf8');
 check('G1 render.yaml declares adgen-titler service',
   /name:\s*adgen-titler/.test(renderYaml));
-check('G2 render.yaml titler runs on standard_plus (8GB)',
-  /name:\s*adgen-titler[\s\S]{0,600}?plan:\s*standard_plus/.test(renderYaml),
-  'Chrome needs the RAM — Standard OOMs');
+check('G2 render.yaml titler runs on an 8GB plan (pro_plus)',
+  /name:\s*adgen-titler[\s\S]{0,900}?plan:\s*pro_plus/.test(renderYaml),
+  'Chrome needs the RAM — Standard OOMs. Renamed from standard_plus 2026-08-24 (blueprint sync rejected the old name).');
 check('G3 render.yaml titler sets ADGEN_ROLE=titler',
   /name:\s*adgen-titler[\s\S]{0,1600}?ADGEN_ROLE[\s\S]{0,40}?titler/.test(renderYaml));
 check('G4 render.yaml titler ships with flag off (safe first deploy)',

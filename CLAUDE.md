@@ -378,9 +378,12 @@ Read these; do not edit `config/defaults.env` from a docs pass.
 
 ### Instance size (Remotion)
 
-Committed `render.yaml:46` still says `plan: standard_plus` with a comment
-about 8 GB. On 2026-08-24 the live `adgen-renderer` service was upgraded
-**standard (2 GiB) → pro_plus (8 GiB)**.
+Committed `render.yaml` now correctly says `plan: pro_plus`. Was
+`standard_plus` until a later 2026-08-24 push, when a blueprint sync
+attempt rejected that plan name for worker services (Render's plan
+naming shifted mid-year; the live `adgen-renderer` service was already
+running `pro_plus` via a manual dashboard upgrade). Both the renderer
+and the new titler now match — no drift between the file and reality.
 
 **That upgrade was necessary but NOT sufficient.** The first real video run on
 this service (`run_1787564306902_d3c1ca4a`, 1 paid Omni master + 11 free
