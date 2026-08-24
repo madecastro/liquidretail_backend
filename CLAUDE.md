@@ -1236,7 +1236,10 @@ Video never launches a browser.
   on `social_proof_led`, which **can** emit a customer quote. Documented
   deliberately rather than closed: the descent hierarchy is owner-specified,
   and a hollow brand-led ad is what `core:['BRAND LINE']` exists to prevent.
-  Reachable only when all three headline tiers are absent. Full write-up:
+  Reachable only when all three headline tiers are absent. As of the
+  rating-furniture fix that descent now demands a star-glyph widget rather
+  than a paraphrased rating headline — still a quote-on-a-brand-led-template
+  surprise, not a claim-without-proof one. Full write-up:
   `docs/PIPELINES.md` §5 *Brand-led intent + copy cascade*.
 - **Static geometry — two defects FIXED 2026-08-03; read the diagnostic before
   re-opening.** (A) `staticAdIntents.computeSurface` combined the post-generation
@@ -2222,6 +2225,19 @@ Full detail in `docs/ATLAS.md` §7 and `docs/CLOUDINARY-VIDEO.md`. Headlines:
   **`STATIC_BRAND_STARS_WITH_QUOTE=false`** (committed in `config/defaults.env`)
   reverts with no deploy. Precedent for why this note exists at all: §00's
   PR #61 rollback, where a later session "fixed" a deliberate decision.
+- **Static `ai_social_proof_led` must render RATING FURNITURE, not a paraphrase
+  headline (2026-08-24).** Three delivered ads (Soludos 4:5 + Stories, Pelagic
+  PMax landscape) printed a rating CLAIM with no stars / numeral / count —
+  including the unsubstantiated "Rated 5 Stars By Everyone Who's Tried Them".
+  Cause: the rating-present absence BANNED the star row ("ONLY rating mark
+  permitted"), so gpt-image-2 satisfied the RATING string as a sentence.
+  Flag-on (`STATIC_RATING_FURNITURE`, default true) demands a star-glyph
+  widget after SET EXACTLY THESE STRINGS and rejects universal-endorsement
+  copy in `validateDirectorPayload`. Flag-off restores the previous static
+  *and* Director prompts byte-for-byte. Scope label (`brand reviews` /
+  "brand-wide") stays on the number, not as a headline adjective. Pinned by
+  `scripts/verifyRatingFurniture.js`. Full write-up:
+  `session.d/2026-08-24_social-proof-rating-furniture.md`.
 - **Customer quotes: `llm-web` is PRINTABLE; attribution is stripped.**
   Prior denylist / "llm-web never prints" claims were **false**.
   `services/providers/geminiSearchProvider.js:977,1097,1218` use

@@ -280,10 +280,26 @@ for (const intentKey of intents) {
         }
       }
 
-      // OBSERVED DEFECT 2: a five-star glyph row drawn beside the supplied
-      // rating in 2/5 renders — and at 4.5 stars for a 4.8 rating.
+      // OBSERVED DEFECT 2 (2026-08, then REVISED 2026-08-24):
+      // A five-star glyph row drawn beside the supplied rating in 2/5 renders
+      // — and at 4.5 stars for a 4.8 rating — is why TRUST MARK / quiet
+      // rating paths still fence the star row. social_proof_led's core IS
+      // the rating: that same fence let gpt-image-2 paraphrase the RATING
+      // string into a headline with no widget (Soludos / Pelagic). Under
+      // STATIC_RATING_FURNITURE (default ON) that intent demands furniture
+      // instead. Flag-off restores the fence — pinned by verifyRatingFurniture.
       if (r.text.some(([role]) => role === 'RATING' || role === 'TRUST MARK')) {
-        truthy(`${label} star-row explicitly fenced`, /ONLY rating mark permitted/.test(p));
+        const furniture = r.resolved.key === 'social_proof_led'
+          && r.text.some(([role]) => role === 'RATING');
+        if (furniture) {
+          truthy(`${label} rating demanded as furniture`, /review widget/.test(p));
+          truthy(`${label} names the measured claim-headlines as failures`,
+            /Rated 5 stars by everyone/.test(p) && /5-star brand-wide rating/.test(p));
+          falsy(`${label} social_proof_led does not ban the star row`,
+            /ONLY rating mark permitted/.test(p));
+        } else {
+          truthy(`${label} star-row explicitly fenced`, /ONLY rating mark permitted/.test(p));
+        }
       }
 
       // the geometry line must not assert an element exists

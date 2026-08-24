@@ -117,16 +117,36 @@ check('R1-revert-prove: the shipped helper does not equal that expression',
     `got ${JSON.stringify(trust2)}`);
 }
 
-// ── S. the five-star-row forbid stays (do NOT "fix" 5.0 by asking for ★★★★★)
+// ── S. star-row policy is INTENT-SCOPED (revised 2026-08-24)
+// The original S1 forbade a five-star graphic on social_proof_led because
+// 2/5 test renders drew 4.5 stars next to a 4.8. That fence is what let
+// gpt-image-2 paraphrase the RATING string into a headline (Soludos /
+// Pelagic, no widget on frame). social_proof_led's core IS the rating, so
+// it now demands a matching star-glyph widget and names the 4.8→half-star
+// snap as a failure. Quiet TRUST MARK intents (brand_led,
+// product_first_lifestyle) keep the original fence.
 {
-  const built = intents.buildPrompt({
+  const proof = intents.buildPrompt({
     intentKey: 'social_proof_led',
     data: { rating: '5.0', reviewCount: 12, reviewsText: '12 reviews', cta: 'Shop now' },
     product: {}, surface: 'meta_feed_1_1'
   });
-  check('S1 [DO NOT ADD STAR ROWS] the prompt still forbids a five-star graphic next to the rating string',
-    /no star row, five-star graphic/i.test(built.prompt || ''),
-    'the absence line is the whole reason we emit a compact "X ★" instead of ★★★★★ — measured, the model drew 4.5 stars next to a 4.8');
+  check('S1 social_proof_led demands a matching star-glyph widget, not a sentence',
+    /review widget/i.test(proof.prompt || '') && /star glyphs/i.test(proof.prompt || ''),
+    'core IS the rating — a prose headline cannot satisfy the demand');
+  check('S1b social_proof_led still names the 4.8→half-star snap',
+    /do not snap 4\.8 to a half-star/i.test(proof.prompt || ''));
+  check('S1c social_proof_led no longer carries the old star-row BAN',
+    !/no star row, five-star graphic/i.test(proof.prompt || ''));
+
+  const quiet = intents.buildPrompt({
+    intentKey: 'product_first_lifestyle',
+    data: { rating: '4.8', headline: 'Walk lighter.', cta: 'Shop now' },
+    product: {}, surface: 'meta_feed_1_1'
+  });
+  check('S1d quiet TRUST MARK path still forbids a five-star graphic',
+    /no star row, five-star graphic/i.test(quiet.prompt || ''),
+    'measured: the model drew 4.5 stars next to a 4.8 on this path');
 }
 
 // ── L. logo resize box is square; the 0.35-height crush is gone ────────
