@@ -2,7 +2,7 @@
   "version": 1,
   "backendRef": "origin/main",
   "backendHead": "a8e812db398a8813796db2320b26b9d0477e4292",
-  "generatedAt": "2026-08-24T18:16:43.358Z",
+  "generatedAt": "2026-08-24T18:23:13.079Z",
   "files": {
     "models/Ad.js": {
       "backendHash": "8e4951d5a020ada681e2e83f4c1869faf4e74e00b6c4afa1a7de71105b72aca4",
@@ -418,7 +418,7 @@
       "backendHash": "927d4d0c0fc4f6db56a3a7c06dd2f6c17d6c31f8766a80a39c0d998436bbf50c",
       "backendSha": "aff3488d494ee7484d27971920a2b96e438e60fd",
       "status": "fork",
-      "reason": "adgen still honors AD_VISION_QC_ENABLED / pipeline env fallbacks; backend retired them"
+      "reason": "env-var fallback removed + buildPersistedVerdict invariant restored 2026-08-24 to match backend (was: adgen still honored AD_VISION_QC_ENABLED/pipeline env fallbacks after backend retired them). Residual, deliberate gap: backend's isStaticEnabled()/isVideoEnabled() synchronous pipeline gates are not ported (unused by any adgen caller)."
     },
     "services/adgenBridge.js": {
       "backendHash": "49ac3bb8c5a63a35d538e9cbd798bd1af1789ef9f121770b8e2d25659efd6496",
