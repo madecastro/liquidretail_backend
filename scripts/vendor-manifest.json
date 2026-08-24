@@ -2,7 +2,7 @@
   "version": 1,
   "backendRef": "origin/main",
   "backendHead": "b7b8cae674b29c95ed2ad2bb5fb7574f2dae60f4",
-  "generatedAt": "2026-08-24T19:59:49.395Z",
+  "generatedAt": "2026-08-24T20:04:28.036Z",
   "files": {
     "models/Ad.js": {
       "backendHash": "8e4951d5a020ada681e2e83f4c1869faf4e74e00b6c4afa1a7de71105b72aca4",
@@ -224,7 +224,8 @@
     "remotion/lib/slotContent.js": {
       "backendHash": "8cb75a6656409058080570adc64a1fbeb640fc944c6db7fdd03a04c3d9d175a1",
       "backendSha": "d3a8fe74ae1f6e704efb326c33c76a946e703b88",
-      "status": "synced"
+      "status": "fork",
+      "reason": "adgen-only fork: fitProductNameToCap dispatch now gated on the resolved bind FIELD (entry==='productName'), not slot.key alone — closes a defect where DEFAULT_BRAND_MODE_BIND's brand-tagline substitution into the productName slot got the noun-preserving front-word-dropping fitter meant for catalog titles, which can invert negation-led taglines (e.g. 'Not for everyone...' -> 'for everyone...'). Not yet ported to backend."
     },
     "remotion/lib/stackFit.js": {
       "backendHash": "58d4e06f109f85aabdd7575aa0f8a2d23d33f70162e6235f2f022bbbc0eb493a",

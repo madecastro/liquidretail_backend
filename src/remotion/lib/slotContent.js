@@ -619,13 +619,31 @@ export function resolveSlotContentCore(slot, meta, ctx = null) {
       }
       const charCap = deriveCharCap(slot.key, capCtx);
       if (!charCap) return raw;
-      // productName gets the noun-preserving fitter (drop leading modifiers
-      // before ever clamping the tail) — every other slot (quote, headline,
-      // …) keeps the plain tail-safe cap unchanged. A customer quote or a
-      // Director headline is not "[modifiers][noun]" shaped, and PR #250
-      // depends on the quote's OPENING clause surviving untouched — this
-      // must stay scoped to productName alone.
-      return slot.key === 'productName'
+      // The noun-preserving fitter's whole justification (see its docstring
+      // above, and backend PR #254) is that a CATALOG TITLE reads as
+      // "[modifiers][noun]" — dropping leading words trades adjectives for
+      // legibility while the noun that identifies the product survives.
+      // That assumption is true of the `productName` META FIELD (catalog
+      // title / layoutInput.input.product.name / ad.copy.productName — see
+      // metaCascadeConfig.js), not of the `productName` SLOT KEY it happens
+      // to render into.
+      //
+      // On a brand-mode (no-product) endcard, titleSpecValidator's
+      // DEFAULT_BRAND_MODE_BIND substitutes the brand's TAGLINE into this
+      // same slot key (chain = ['brandTagline', 'headline'] instead of
+      // ['productName']) — prose, not a modifier-stacked catalog title.
+      // Dropping ITS leading words can flip meaning rather than merely
+      // shorten it: "Not for everyone, built for those who refuse to quit"
+      // clipped to 48 chars becomes "for everyone, built for those who
+      // refuse to quit" — the literal opposite claim, from dropping one
+      // word. Gate the fitter on which FIELD actually supplied the text
+      // (`entry`), not on the slot key, so a substituted tagline gets the
+      // same safe tail-ellipsis every other prose slot (quote, headline)
+      // already uses. A customer quote or a Director headline was already
+      // excluded for the same shape reason (PR #250's quote-opening-clause
+      // guarantee) — this closes the same gap for the tagline substitution.
+      const isCatalogProductTitle = slot.key === 'productName' && entry === 'productName';
+      return isCatalogProductTitle
         ? fitProductNameToCap(raw, charCap)
         : truncateWordSafe(raw, charCap);
     }
