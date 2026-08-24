@@ -30,6 +30,10 @@
  *   C4  Live integration: renderDirectImage only appends these directives
  *       when built.text actually carries a CTA BUTTON role (never
  *       contradicts a surface that was told to draw NO CTA).
+ *   C5  Source-string casing canonicalize (2026-08-24). The directive in
+ *       C1 pins whatever arrived; it cannot stop "Shop now" vs "Shop Now"
+ *       when those are the source strings. Generic phrases we emit are
+ *       rewritten at buildIntentData; product-specific CTAs are not.
  *
  * Run: node scripts/verifyStaticCtaDeterminism.js
  */
@@ -152,6 +156,64 @@ check('C3 pure white on a pure black fill', direct.deriveCtaColors({ accentColor
     feedPrompt.includes('CTA BUTTON CASING') && feedPrompt.includes('CTA BUTTON COLOUR'));
   check('C4-revert-prove: without the built.text gate, the directive would have been appended to Stories too (the regression this guards)',
     `${builtStories.prompt}\n\n${direct.ctaCasingDirective('Shop the tee')}`.includes('CTA BUTTON CASING'));
+}
+
+// ── C5: source-string casing canonicalize (the 2026-08-24 follow-up) ──
+// ctaCasingDirective pins whatever arrived. That cannot stop two sibling
+// ads asking for "Shop now" and "Shop Now" when those are the SOURCE
+// strings. Only the generic phrases we ourselves emit are rewritten;
+// product-specific copy is left byte-identical.
+{
+  check('C5 normalizeCtaCasing is exported', typeof direct.normalizeCtaCasing === 'function');
+  check('C5 "Shop now" stays sentence case', direct.normalizeCtaCasing('Shop now') === 'Shop now');
+  check('C5 "Shop Now" (title case of the same phrase) canonicalizes to "Shop now"',
+    direct.normalizeCtaCasing('Shop Now') === 'Shop now');
+  check('C5 "SHOP NOW" (the former buildIntentData fallback) canonicalizes to "Shop now"',
+    direct.normalizeCtaCasing('SHOP NOW') === 'Shop now');
+  check('C5 "shop now" (all-lower) canonicalizes to "Shop now"',
+    direct.normalizeCtaCasing('shop now') === 'Shop now');
+  check('C5 whitespace-collapsed "  Shop   Now  " canonicalizes',
+    direct.normalizeCtaCasing('  Shop   Now  ') === 'Shop now');
+  check('C5 empty/null -> null (caller falls back)',
+    direct.normalizeCtaCasing('') === null
+    && direct.normalizeCtaCasing(null) === null
+    && direct.normalizeCtaCasing(undefined) === null);
+  check('C5 "Shop the Brand" / "SHOP THE BRAND" / "shop the brand" collapse to one form',
+    direct.normalizeCtaCasing('Shop the Brand') === 'Shop the brand'
+    && direct.normalizeCtaCasing('SHOP THE BRAND') === 'Shop the brand'
+    && direct.normalizeCtaCasing('shop the brand') === 'Shop the brand');
+  check('C5 "Shop the Collection" family collapses',
+    direct.normalizeCtaCasing('Shop the Collection') === 'Shop the collection'
+    && direct.normalizeCtaCasing('SHOP THE COLLECTION') === 'Shop the collection');
+  check('C5 [DO NOT FLATTEN] "Shop the Mai Tai" is untouched — product-specific content, not the generic phrase',
+    direct.normalizeCtaCasing('Shop the Mai Tai') === 'Shop the Mai Tai');
+  check('C5 [DO NOT FLATTEN] "Shop the Vaportek" is untouched',
+    direct.normalizeCtaCasing('Shop the Vaportek') === 'Shop the Vaportek');
+  check('C5 [DO NOT FLATTEN] "Shop The Tee" (product-specific title-case) is NOT rewritten to "Shop the tee"',
+    direct.normalizeCtaCasing('Shop The Tee') === 'Shop The Tee');
+
+  const missing = direct.buildIntentData({
+    concept: {}, layoutInput: {}, brand: {}, cta: undefined
+  });
+  check('C5 missing cta falls back to "Shop now", never "SHOP NOW"',
+    missing.cta === 'Shop now', `got ${JSON.stringify(missing.cta)}`);
+  const allCaps = direct.buildIntentData({
+    concept: {}, layoutInput: {}, brand: {}, cta: 'SHOP NOW'
+  });
+  check('C5 buildIntentData rewrites the ALL-CAPS fallback input to "Shop now"',
+    allCaps.cta === 'Shop now', `got ${JSON.stringify(allCaps.cta)}`);
+  const product = direct.buildIntentData({
+    concept: {}, layoutInput: {}, brand: {}, cta: 'Shop the Mai Tai'
+  });
+  check('C5 buildIntentData leaves a product-specific CTA byte-identical',
+    product.cta === 'Shop the Mai Tai', `got ${JSON.stringify(product.cta)}`);
+
+  // Revert-prove: a toUpperCase of the whole string (the former fallback)
+  // is a DIFFERENT string from the canonical form, so the pin is not vacuous.
+  check('C5-revert-prove: "SHOP NOW" !== "Shop now" (the two casings are genuinely distinct)',
+    'SHOP NOW' !== 'Shop now');
+  check('C5-revert-prove: "Shop Now" !== "Shop now"',
+    'Shop Now' !== 'Shop now');
 }
 
 if (failures.length) {

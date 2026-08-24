@@ -114,14 +114,15 @@ const PMAX_STATIC_SURFACE_KEYS = [
 ];
 
 // Production logo geometry — mirrors directImageRenderService compositing.
-const LOGO_W_FRAC = 0.16;
-const LOGO_H_OF_W = 0.35;
+// Box is square (hOfW = 1): wide wordmarks still bind on width via fit:inside.
+const LOGO_W_FRAC = render.LOGO_BOX_FRAC;
+const LOGO_H_OF_W = 1;
 // Extra sizes the previous geometry harness swept; keep the same spirit so a
 // single production-size pass cannot hide a flush-edge placement that only
 // appears at a different mark size.
 const LOGO_SWEEP = [
   { wFrac: 0.10, hOfW: 0.35 },
-  { wFrac: 0.16, hOfW: 0.35 }, // production
+  { wFrac: LOGO_W_FRAC, hOfW: LOGO_H_OF_W }, // production (square)
   { wFrac: 0.20, hOfW: 0.40 },
   { wFrac: 0.12, hOfW: 0.50 }
 ];

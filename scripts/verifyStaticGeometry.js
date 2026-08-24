@@ -98,12 +98,14 @@ for (const key of SURFACES) {
   // it must clear the platform's declared UI band (or nobody ever sees it).
   const safe = pf.safeAreaForPlatformFormat(key) || {};
   const sb = direct.safeBoxInDeliveredPx(s, dims);
-  const production = Math.round(0.16 * Math.min(dims.width, dims.height));
+  const production = Math.round(direct.LOGO_BOX_FRAC * Math.min(dims.width, dims.height));
+  const prodBox = direct.logoResizeBox(dims);
   // Sweep sizes, not just the production one. The first version of this fix
   // clamped the RESULT into the frame, which could shove the mark back across
   // the safe-box edge it was meant to honour — invisible to a single-size test.
   const sizes = [
-    [production, Math.round(production * 0.35)],  // what the renderer asks for
+    [prodBox.width, prodBox.height],              // what the renderer asks for (square)
+    [production, Math.round(production * 0.35)],  // legacy wide-wordmark box (still valid)
     [40, 14],                                     // a tiny mark, unenlarged
     [Math.round(dims.width * 0.9), 60],           // absurdly wide
     [120, Math.round(dims.height * 0.95)],        // absurdly tall
@@ -123,7 +125,7 @@ for (const key of SURFACES) {
       `logo x${place.left}-${place.left + place.width} y${place.top}-${place.top + place.height} in ${dims.width}x${dims.height}`);
   }
   // The production-size mark must actually place, and must clear the platform band.
-  const place = direct.logoPlacementFor({ surface: s, dims, logoW: production, logoH: Math.round(production * 0.35) });
+  const place = direct.logoPlacementFor({ surface: s, dims, logoW: prodBox.width, logoH: prodBox.height });
   check(`G4 ${key} the production-size logo fits inside the safe box`, !!place);
   if (place) {
     const contentBottom = dims.height - (safe.bottom || 0);
@@ -182,9 +184,9 @@ for (const key of SURFACES) {
   const floor = direct.LOGO_SAFE_MARGIN_PCT[key];
   check(`G4c ${key} has a declared platform safe-margin floor`, !!floor, `no entry for ${key}`);
   if (!floor) continue;
-  const production = Math.round(0.16 * Math.min(dims.width, dims.height));
+  const prodBox = direct.logoResizeBox(dims);
   const place = direct.logoPlacementFor({
-    surface: s, dims, logoW: production, logoH: Math.round(production * 0.35)
+    surface: s, dims, logoW: prodBox.width, logoH: prodBox.height
   });
   check(`G4c ${key} production-size logo fits inside the platform floor`, !!place);
   if (!place) continue;
@@ -235,6 +237,14 @@ for (const key of SURFACES) {
   check('G4c-revert-prove: the SHIPPED logoPlacementFor clears the platform margin the pre-fix placement misses',
     !!shipped && shipped.left + shipped.width <= maxRight,
     `shipped right=${shipped && shipped.left + shipped.width}, platform floor max=${maxRight}`);
+
+  const square = direct.logoResizeBox(dims);
+  const shippedSquare = direct.logoPlacementFor({
+    surface: s, dims, logoW: square.width, logoH: square.height
+  });
+  check('G4c square production-size (what the renderer now asks for) also clears the platform margin',
+    !!shippedSquare && shippedSquare.left + shippedSquare.width <= maxRight,
+    `square ${square.width}x${square.height} right=${shippedSquare && shippedSquare.left + shippedSquare.width}`);
 }
 
 // ── G2: no silent square fallback ───────────────────────────────────────
