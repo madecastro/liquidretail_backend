@@ -43,6 +43,11 @@ const LayoutInputArtifact = require('../models/LayoutInputArtifact');
 const { uploadBufferToCloudinary } = require('./cloudinaryService');
 const crypto = require('crypto');
 const { adStage, noteRenderIssue } = require('./adStage');
+// Already required by 6 other adgen services (adVisionQcService,
+// aiCreativeDirectorService, bootRecoveryService, campaignAdsGenerationService,
+// costTracker, metaApiVersion) — this file had ZERO references until now. See
+// the "Slack alerting" section below for why and what it ports.
+const alerts = require('./alertService');
 
 // Extracted from backend renderService.persistStage's `copy` field builder.
 // Preferred: renderedCopy from directImage output (post-density-budget
@@ -298,6 +303,291 @@ function startAdHeartbeat(adId) {
   };
 }
 
+// ── Slack alerting — ports the backend's now-dead call sites ───────────────
+//
+// WHY THIS EXISTS: when ADGEN_RENDERER_ENABLED is true, backend's own
+// runRenderLoop (routes/ads.js) returns before it ever reaches its own
+// per-run Slack alert, the CampaignRun heartbeat, or any of its four
+// alertService call sites (~2113 run-completion, ~2242 derive-wait backup,
+// ~3132 video-unsettled-at-timeout, ~3168 video-failed). This renderer does
+// the actual work now but never picked up the alerting that went with it —
+// the crash path here only ever `console.warn`ed. Measured consequence:
+// adgen-renderer was OOM-killed twice on 2026-08-24, stranding 12 ads
+// mid-titling, and a text search for "alert" across that service's
+// full-day logs returns zero rows.
+//
+// Every function below is a PURE ADDITION next to the render/claim logic —
+// none of them changes a $set object or what gets persisted to Mongo.
+// renderer.js's terminal writes are owned by a peer branch
+// (fix/vision-qc-invariant); this file stays out of that. alertService
+// itself never throws and every call here is fire-and-forget
+// (notifyAsync), so a Slack outage or a bad channel id can never affect a
+// render.
+
+// TWO windows. They measure two different clocks, and an orphan is BOTH.
+//
+// claimedAt is stamped ONCE at claimOne() and never refreshed — the
+// titling heartbeat writes updatedAt only (#9). CLAIM_STALE_MIN is
+// therefore "how old is this claim", not "has this job gone quiet".
+// 20 minutes is still the right bound for that first question: generous
+// enough to cover Atlas's 10-minute poll budget plus Remotion, without
+// leaving a never-started claim invisible for the life of the next
+// instance. Kept in the orphan filter on purpose: claimOne() does not
+// write updatedAt (Ad.timestamps is false), so a freshly claimed row can
+// carry a pre-claim stale updatedAt. Without this gate a sibling that
+// just claimed a backlog row would page on our next boot, before its
+// first beat. A claim that died before the first beat still pages, once
+// claimedAt itself is this old.
+const CLAIM_STALE_MIN = Math.max(1, parseInt(process.env.ADGEN_CLAIM_STALE_MIN, 10) || 20);
+
+// updatedAt IS refreshed, at least every AD_HEARTBEAT_MS (clamped to 90s
+// by #11). HEARTBEAT_STALE_MIN is "has the beat gone quiet", and it is
+// deliberately NOT 20 minutes — 20 minutes of silence on a 60-90s beat
+// is 13–20 missed beats, which would leave a dead paid master unpaged
+// long after bootRecovery already treats it as abandoned.
+//
+// Same env, same default, same meaning as bootRecoveryService's
+// RESUME_STALE_MIN: 5 minutes = 5 missed 60s beats, or 3.3 missed beats
+// at the 90s clamp (the heartbeat's own comment already treats 90s as
+// inside that "five missed heartbeats" margin). A live job that beats
+// every 60-90s can never look stale here; a worker that died mid-titling
+// looks stale within minutes.
+//
+// Floor at 3 minutes even if RESUME_STALE_MIN is set to 1: 3 = two
+// missed clamped 90s beats plus 30s. Without the floor a legal
+// RESUME_STALE_MIN=1 would make a live job at the 90s clamp look stale
+// (90s > 60s) and re-open a false page on the pager. Recovery being
+// mis-tuned must not teach Slack to cry wolf.
+const HEARTBEAT_STALE_MIN = Math.max(
+  3,
+  Math.max(1, parseInt(process.env.RESUME_STALE_MIN, 10) || 5)
+);
+
+/**
+ * A single ad's render failing — called from processAd's catch. Mirrors
+ * backend routes/ads.js's two dead video alerts for the video route
+ * (~3132 unsettled-at-timeout warn, ~3168 video-failed error), and for the
+ * static route reuses the classification directImageRenderService ALREADY
+ * stamps on every throw (`err.alertLevel` / `err.alertKey` — e.g. 'fatal' +
+ * 'direct-image:no-credentials' for missing Atlas creds; see its
+ * taggedError()). That is the exact convention backend's
+ * services/renderService.js used to consume at ITS OWN dead call site —
+ * deleted from this repo entirely (CLAUDE.md "Layout difference": adgen
+ * calls directImageRenderService directly, bypassing renderService.js) —
+ * so reusing the tag here revives an existing classification rather than
+ * inventing a new one.
+ */
+function notifyRenderFailure(ad, err) {
+  try {
+    const adId  = String(ad._id);
+    const runId = Array.isArray(ad.campaignRunIds) && ad.campaignRunIds.length
+      ? ad.campaignRunIds[ad.campaignRunIds.length - 1]
+      : null;
+    const msg = String((err && err.message) || err || 'unknown error');
+    const commonFields = {
+      ad:    adId,
+      run:   runId,
+      brand: ad.brandId ? String(ad.brandId) : null
+    };
+
+    if (ad.renderRoute === 'veo') {
+      if (err && err.unsettledAtTimeout) {
+        alerts.notifyAsync({
+          level:  'warn',
+          title:  'Video master unsettled at poll timeout — awaiting reconciliation',
+          key:    `video-unsettled:${msg.slice(0, 60)}`,
+          fields: { ...commonFields, predictionId: err.predictionId || null, error: msg.slice(0, 300) }
+        });
+      } else {
+        alerts.notifyAsync({
+          level:  'error',
+          title:  'Video generation failed',
+          key:    `video-failed:${msg.slice(0, 60)}`,
+          fields: { ...commonFields, error: msg.slice(0, 300) }
+        });
+      }
+      return;
+    }
+
+    // Static (html_gen) route — and the defensive "unknown renderRoute"
+    // throw from processAd's dispatch, which has no route-specific class
+    // of its own and falls into the same bucket as any other static fault.
+    alerts.notifyAsync({
+      level:  (err && err.alertLevel) || 'error',
+      title:  'Static ad render failed (direct overlay)',
+      key:    (err && err.alertKey) || 'direct-image:render-failed',
+      fields: { ...commonFields, error: msg.slice(0, 300) },
+      detail: (err && err.stack) || null
+    });
+  } catch (_) {
+    // Alerting must never fail the failure path it is reporting on.
+  }
+}
+
+/**
+ * One Slack notice per derive-wait BACKUP EPISODE — not one per ad, not one
+ * per poll. Mirrors backend routes/ads.js's notifyDeriveWaitBackup (~2242).
+ * "Not one per poll" is enforced entirely by alertService's own key-based
+ * dedupe (ALERT_DEDUPE_WINDOW_MIN), keyed on the sibling MASTER so every
+ * derivative waiting on the same master folds into one message rather than
+ * spamming or going silent.
+ *
+ * Adapted to this service's shape: adgen's derive wait is a short (60s)
+ * poll-then-requeue cycle, not backend's 12-minute in-process hold, and
+ * this repo has no `othersQueued` context query — omitted rather than
+ * approximated with a second query that could drift from what actually
+ * decides "derives from this master" (resolveDeriveFromMaster).
+ */
+function notifyDeriveWaitBackup(ad, master, waitAttempt) {
+  try {
+    const masterId = master && master._id ? String(master._id) : null;
+    const masterAgeMs = master && master.updatedAt
+      ? Date.now() - new Date(master.updatedAt).getTime()
+      : null;
+    // Sibling-master "stuck" is a conservative ceiling on updatedAt silence
+    // — CLAIM_STALE_MIN (20), not the tighter heartbeat bound the boot
+    // orphan scan uses. A derive waiting on a live, heartbeating master
+    // will not escalate: master.updatedAt is what this reads, and a beat
+    // every 60-90s keeps masterAgeMs well under 20 minutes. The orphan
+    // scan (below) is a different question and uses both clocks.
+    const masterLooksStuck = !!master && master.status === 'rendering'
+      && masterAgeMs != null && masterAgeMs > CLAIM_STALE_MIN * 60 * 1000;
+    const escalated = masterLooksStuck || waitAttempt > MAX_DERIVE_WAIT_ATTEMPTS;
+    const fmtMin = (ms) => `${Math.max(1, Math.round(ms / 60000))}m`;
+
+    alerts.notifyAsync({
+      level: escalated ? 'error' : 'warn',
+      title: masterLooksStuck
+        ? 'Derive-wait: sibling master looks STUCK, not just backed up'
+        : 'Derive-wait backup: sibling master still in flight',
+      key: `derive-wait-backup:${masterId || String(ad._id)}`,
+      fields: {
+        ad:           String(ad._id),
+        master:       masterId,
+        masterStatus: master ? master.status : 'not-found-yet',
+        masterAge:    masterAgeMs != null ? fmtMin(masterAgeMs) : 'unknown',
+        attempt:      waitAttempt
+      }
+    });
+  } catch (_) {
+    // Alerting must never block the derive-wait retry path.
+  }
+}
+
+/**
+ * A CampaignRun reaching its terminal 'done' state with losses — mirrors
+ * backend routes/ads.js's run-completion alert (~2113), which fires at the
+ * end of runRenderLoop and is therefore unreachable once
+ * ADGEN_RENDERER_ENABLED short-circuits that loop. maybeFinalizeRun (above)
+ * is the only place in this service that drives a CampaignRun to 'done',
+ * so it is the only correct place to fire the replacement. Silent when
+ * nothing failed, matching backend's own `nFailed > 0` gate.
+ */
+function notifyRunFinalized(runId, outcome) {
+  if (!outcome || !outcome.failed) return;
+  try {
+    const nOk = outcome.succeeded || 0;
+    const nFailed = outcome.failed;
+    alerts.notifyAsync({
+      level: nOk === 0 ? 'error' : 'warn',
+      title: nOk === 0
+        ? `Campaign run failed entirely — ${nFailed} ad(s)`
+        : `Campaign run finished with ${nFailed} failed ad(s)`,
+      key: `run-failed:${nOk === 0 ? 'total' : 'partial'}`,
+      fields: {
+        run:     runId,
+        outcome: `${nOk}✓ / ${nFailed}✗ of ${nOk + nFailed}`
+      }
+    });
+  } catch (_) {
+    // Alerting must never block run finalization.
+  }
+}
+
+/**
+ * Boot-time visibility for ads orphaned by a SIGKILL'd renderer. SIGKILL is
+ * uncatchable — nothing can alert from INSIDE a dying process — so this is
+ * the only way a silent process death ever becomes visible without a human
+ * reading Render logs by hand: the NEXT process notices on its own boot
+ * (immediate scan for already-cold rows, plus one delayed rescan after
+ * HEARTBEAT_STALE_MIN + one clamped beat — a predecessor that died seconds
+ * before we started still looks alive until that window elapses).
+ *
+ * READ-ONLY. Deliberately does not touch claimedByWorker/status — deciding
+ * whether to release or resume a stranded claim is a real remediation
+ * question (bootRecoveryService is the adjacent, receipt-based mechanism
+ * for exactly this, but it is not wired into this repo's boot path either —
+ * see CLAUDE.md "What this repo does not do (yet)" — and wiring it is a
+ * separate, larger change than an alerting fix). This function only makes
+ * the orphan VISIBLE.
+ *
+ * SEVERITY — chosen deliberately, not defaulted: a video row that already
+ * has `veoVideoUrl` is a PAID master (Atlas Omni, ~$1.00) stranded
+ * mid-titling — the money is already spent and the asset is sitting there
+ * recoverable, which is a materially different situation from a claim that
+ * died before anything billable happened. That bucket alerts at 'error';
+ * everything else at 'warn'. Both deliberately clear ALERT_MIN_LEVEL's
+ * default 'warn' floor — an 'info' alert here (as bootRecoveryService
+ * itself uses for its own "recovered" case) would never reach Slack under
+ * that default floor, which is exactly the silent-recovery trap this
+ * function exists to avoid.
+ */
+async function alertOrphanedClaimsOnBoot() {
+  try {
+    const now = Date.now();
+    const claimCutoff = new Date(now - CLAIM_STALE_MIN * 60 * 1000);
+    const beatCutoff  = new Date(now - HEARTBEAT_STALE_MIN * 60 * 1000);
+    // An orphan is claimed long ago AND not heartbeating. claimedAt-only
+    // was the false-page: a healthy titling job holds its original
+    // claimedAt for up to AD_HEARTBEAT_MAX_MS (~60.8 min) while beating
+    // updatedAt every 60-90s, so a 20-minute claim-age cutoff matched
+    // WORKING paid masters. updatedAt-only would false-page a fresh
+    // claim whose updatedAt is still the pre-claim write (claimOne does
+    // not touch it). Both conditions, both required.
+    const stale = await Ad.find({
+      status:          'rendering',
+      claimedByWorker: { $ne: null },
+      claimedAt:       { $lt: claimCutoff },
+      updatedAt:       { $lt: beatCutoff }
+    }).select('_id claimedByWorker claimedAt updatedAt renderRoute veoVideoUrl').lean();
+
+    if (!stale.length) return;
+
+    const paidMasters = stale.filter((a) => a.renderRoute === 'veo' && a.veoVideoUrl);
+    const other       = stale.filter((a) => !(a.renderRoute === 'veo' && a.veoVideoUrl));
+    const owners      = [...new Set(stale.map((a) => a.claimedByWorker))];
+
+    if (paidMasters.length) {
+      alerts.notifyAsync({
+        level: 'error',
+        title: `${paidMasters.length} paid video master(s) stranded mid-titling by a dead worker`,
+        key:   'orphaned-claim:paid-master',
+        fields: {
+          worker:         WORKER_ID,
+          count:          paidMasters.length,
+          previousOwners: owners.slice(0, 5).join(',') || null,
+          ads:            paidMasters.slice(0, 8).map((a) => String(a._id).slice(-6)).join(',')
+        }
+      });
+    }
+    if (other.length) {
+      alerts.notifyAsync({
+        level: 'warn',
+        title: `${other.length} ad(s) orphaned by a dead renderer worker (stale claim)`,
+        key:   'orphaned-claim:unstarted',
+        fields: {
+          worker:         WORKER_ID,
+          count:          other.length,
+          previousOwners: owners.slice(0, 5).join(',') || null,
+          ads:            other.slice(0, 8).map((a) => String(a._id).slice(-6)).join(',')
+        }
+      });
+    }
+  } catch (err) {
+    console.warn(`renderer[${WORKER_ID}]: alertOrphanedClaimsOnBoot failed — ${err.message}`);
+  }
+}
+
 let stopping = false;
 
 async function claimOne() {
@@ -411,6 +701,7 @@ async function maybeFinalizeRun(runId) {
         `renderer[${WORKER_ID}]: run ${runId} finalized -> done ` +
         `(succeeded=${outcome.succeeded} failed=${outcome.failed})`
       );
+      notifyRunFinalized(runId, outcome);
     }
   } catch (err) {
     console.warn(`renderer[${WORKER_ID}]: maybeFinalizeRun(${runId}) failed: ${err.message}`);
@@ -737,6 +1028,7 @@ async function renderVideo(ad) {
       await new Promise((r) => setTimeout(r, DERIVE_MASTER_POLL_MS));
     }
     if (!master?.veoVideoUrl) {
+      notifyDeriveWaitBackup(ad, master, (ad.deriveWaitAttempts || 0) + 1);
       await requeueDeriveForRetry(ad, 'sibling master not yet ready — retry later');
       return; // NOT counted as failure; requeue is the intent
     }
@@ -949,6 +1241,7 @@ async function processAd(ad) {
     const wallSec = ((Date.now() - started) / 1000).toFixed(1);
     console.error(`renderer[${WORKER_ID}]: render failed ad=${shortId} route=${ad.renderRoute} wall=${wallSec}s: ${err.message}`);
     try { noteRenderIssue(ad._id, { message: err.message, stage: 'render' }); } catch (_) {}
+    notifyRenderFailure(ad, err);
     await Ad.updateOne(
       { _id: ad._id, claimedByWorker: WORKER_ID },
       {
@@ -1008,6 +1301,20 @@ async function run() {
   console.log(
     `renderer[${WORKER_ID}] starting — poll interval ${POLL_MS}ms, max-inflight ${MAX_INFLIGHT}, handoff gate ${gated ? 'ON (claiming)' : 'OFF (sleeping)'}`
   );
+  // Fire-and-forget. Immediate pass catches already-cold orphans
+  // (updatedAt already past HEARTBEAT_STALE_MIN — predecessor died well
+  // before we started). A predecessor that died seconds before this boot
+  // still looks alive (last beat ≤90s ago); the two-condition filter
+  // cannot distinguish that from a live sibling until the silence window
+  // elapses. One delayed rescan after HEARTBEAT_STALE_MIN + one clamped
+  // beat: a live job will have kept beating, a dead one will not. unref
+  // so the timer cannot hold the process open. Same key as the immediate
+  // pass, so ALERT_DEDUPE_WINDOW_MIN (15) swallows a double-fire on a
+  // cold orphan both scans would see.
+  alertOrphanedClaimsOnBoot();
+  const orphanRescanMs = HEARTBEAT_STALE_MIN * 60 * 1000 + AD_HEARTBEAT_SAFE_MAX_MS;
+  const orphanRescan = setTimeout(() => { alertOrphanedClaimsOnBoot(); }, orphanRescanMs);
+  if (typeof orphanRescan.unref === 'function') orphanRescan.unref();
   poll();
   setInterval(() => {
     if (stopping) return;

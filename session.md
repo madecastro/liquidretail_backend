@@ -44,6 +44,28 @@ branch `port/brand-consistency-to-adgen`, cut from `origin/master` @ `af4338b`.)
   verifyArchiveDigestRelease, verifyModelParity). Require-graph 506/506.
 - **Pushed** to `origin/port/brand-consistency-to-adgen`. Not merged.
 
+*(Written 2026-08-24. Worktree `/Volumes/Sayulita/Projects/RS/.wt-slack`,
+branch `fix/adgen-slack-alerting` — additive Slack alerting in `renderer.js`,
+rebased onto `origin/master` @ `c00e17d` = #8 + #10 + #11 + #9 + #7.
+False-page closed: orphan scan is now claimed-old AND not-heartbeating.)*
+
+- **Rebase still good.** Five ancestors present; diff vs master is still only
+  the two additive files (`renderer.js`, `verifyRendererSlackAlerts.js`).
+- **Orphan query is two clocks.** `claimedAt < CLAIM_STALE_MIN(20)` AND
+  `updatedAt < HEARTBEAT_STALE_MIN(5, floor 3)`. claimedAt stays: claimOne
+  does not write updatedAt (`timestamps: false`), so a fresh backlog claim
+  can carry a pre-claim stale updatedAt. Bound is 5 min = RESUME_STALE_MIN
+  (5 missed 60s beats / 3.3 missed 90s beats), not 20. Floor 3 so a legal
+  `RESUME_STALE_MIN=1` cannot make a live 90s beat look stale.
+- **Delayed rescan.** Immediate boot scan plus one unref'd `setTimeout` at
+  HEARTBEAT_STALE_MIN + AD_HEARTBEAT_SAFE_MAX_MS (5 min + 90s). A predecessor
+  that died seconds before boot still looks alive; waiting that window is
+  how "not heartbeating" becomes distinguishable from a live sibling.
+- **Invariants held.** Heartbeat interval/cap/`claimedByWorker` untouched.
+  Terminal `$in: ['rendering','draft']` untouched. OOM OUTER/INNER nesting
+  untouched; D11 green. Harness still in-memory `notifyAsync` only (E6).
+- **Not merged. Do not open a PR.**
+
 ---
 
 ## KNOWN-OPEN
