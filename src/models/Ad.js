@@ -515,6 +515,16 @@ const adSchema = new mongoose.Schema({
   // scripts/verifyTitlingResume.js (asserts this declaration exists, so the field
   // cannot be used without being declared).
   titlingResumeState: { type: String, enum: ['pending', 'claimed', null], default: null },
+  // Handoff marker for out-of-process titling (adgen-titler role).
+  // Stamped `true` by the adgen renderer atomic with (veoVideoUrl set +
+  // claim release) when ADGEN_TITLER_ENABLED=true; the titler service polls
+  // for {status:'rendering', veoVideoUrl:{$ne:null}, titlingNeeded:true,
+  // claimedByWorker:null}, claims, does Remotion titling, and clears this
+  // field on terminal stamp. Under strict mode an undeclared field would
+  // vanish on save (see titlingResumeState note above) — declared so the
+  // write actually persists. Existing rows carry undefined which doesn't
+  // match `titlingNeeded: true`, so a flag-off deploy shifts nothing.
+  titlingNeeded:      { type: Boolean, default: false },
   posterUrl:          { type: String, default: null },
   // Sparse index — queued ads carry null, only rendered ads contribute.
   cloudinaryPublicId: { type: String, default: null, index: { sparse: true } },

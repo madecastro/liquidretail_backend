@@ -22,7 +22,7 @@
 // therefore only cover the static half. Leave the flag off in prod until
 // Phase 1c ships.
 
-const { POLL_MS, WORKER_ID, MAX_INFLIGHT, isAdgenRendererEnabled } = require('../config');
+const { POLL_MS, WORKER_ID, MAX_INFLIGHT, isAdgenRendererEnabled, isTitlerEnabled } = require('../config');
 const { concurrency } = require('./concurrency');
 const {
   isStaleTopologyError,
@@ -1051,25 +1051,54 @@ async function renderVideo(ad) {
       return; // NOT counted as failure; requeue is the intent
     }
 
-    // Inherit the paid master's veoVideoUrl / cloudinary asset onto the derive
-    // and stamp titling-debt marker so sweepers can find this row if we crash
-    // between here and the final renderUrl write.
+    // Inherit the paid master's veoVideoUrl / cloudinary asset onto the derive.
+    // Two modes, one atomic write — DO NOT split (a two-write shape opens a
+    // window where a titler can observe titlingNeeded=true without veoVideoUrl):
+    //   - HANDOFF mode (isTitlerEnabled true): stamp titlingNeeded=true and
+    //     release the claim in the same $set as veoVideoUrl. Return early; the
+    //     titler role picks up the ad on its next poll and does Remotion out
+    //     of process.
+    //   - IN-PROCESS mode: stamp titlingResumeState:'claimed' as before and
+    //     fall through to the existing Remotion titling below.
+    // Keep the mode-specific fields as an inline literal spread so
+    // titlingResumeState: 'claimed' lands verbatim in the source —
+    // verifyVideoQcVerdictSurvives F5 uses that string as its ordering anchor.
+    const handoffMode = isTitlerEnabled();
+    const $setDerive = {
+      veoVideoUrl:        master.veoVideoUrl,
+      veoAspectRatio:     master.veoAspectRatio || ad.aspectRatio,
+      veoModel:           master.veoModel || null,
+      renderUrl:          master.veoVideoUrl,
+      sourceFileType:     'video',
+      renderedAt:         new Date(),
+      updatedAt:          new Date(),
+      ...(handoffMode
+        ? {
+            titlingNeeded:      true,
+            titlingResumeState: null,
+            claimedByWorker:    null,
+            claimedAt:          null,
+          }
+        : {
+            titlingResumeState: 'claimed',
+          }),
+    };
     await Ad.updateOne(
-      { _id: ad._id },
-      {
-        $set: {
-          veoVideoUrl:        master.veoVideoUrl,
-          veoAspectRatio:     master.veoAspectRatio || ad.aspectRatio,
-          veoModel:           master.veoModel || null,
-          renderUrl:          master.veoVideoUrl,
-          sourceFileType:     'video',
-          renderedAt:         new Date(),
-          updatedAt:          new Date(),
-          titlingResumeState: 'claimed'
-        },
-        $inc: { renderAttempts: 1 }
-      }
+      { _id: ad._id, claimedByWorker: WORKER_ID },
+      { $set: $setDerive, $inc: { renderAttempts: 1 } }
     );
+
+    if (handoffMode) {
+      const wallSec = ((Date.now() - t0) / 1000).toFixed(1);
+      console.log(
+        `renderer[${WORKER_ID}]: VIDEO DERIVE handoff ad=${shortId} wall=${wallSec}s ` +
+        `— stamped titlingNeeded=true, released to titler`
+      );
+      // Do NOT bumpRunCounter — the ad hasn't settled yet, the titler owns
+      // the terminal stamp. `updatedAt` above keeps the CampaignRun off the
+      // reaper radar during the brief poll window before titler claims.
+      return;
+    }
 
     // Load brand for titling
     const sourceMedia = ad.mediaId ? await Media.findById(ad.mediaId).select('brandId').lean() : null;
@@ -1250,26 +1279,51 @@ async function renderVideo(ad) {
   // URL is visible but the reference list isn't. The derive no-brand else-arm
   // below relies on exactly this to source a correct QC reference image. If
   // this write is ever split into two, that guarantee breaks silently.
+  //
+  // HANDOFF mode (isTitlerEnabled true) adds titlingNeeded=true + claim
+  // release TO THIS SAME $set so a titler observing titlingNeeded also sees
+  // the settled veoVideoUrl — same partial-write-window argument, one write.
+  // Mode-specific spread — see derive path above for the F5 anchor note.
+  const handoffMode = isTitlerEnabled();
+  const $setMaster = {
+    veoVideoUrl:          veoResult.videoUrl,
+    veoAspectRatio:       veoResult.aspectRatio || ad.aspectRatio,
+    veoPrompt:            veoResult.prompt || null,
+    veoStoryboard:        veoResult.storyboard || storyboard || null,
+    veoCloudinaryPublicId: veoResult.cloudinaryPublicId || null,
+    veoModel:             veoResult.model || null,
+    veoReferenceImages:   veoResult.referenceImages || [],
+    renderUrl:            veoResult.videoUrl,
+    sourceFileType:       'video',
+    renderedAt:           new Date(),
+    updatedAt:            new Date(),
+    ...(handoffMode
+      ? {
+          titlingNeeded:      true,
+          titlingResumeState: null,
+          claimedByWorker:    null,
+          claimedAt:          null,
+        }
+      : {
+          titlingResumeState: 'claimed',
+        }),
+  };
   await Ad.updateOne(
-    { _id: ad._id },
-    {
-      $set: {
-        veoVideoUrl:          veoResult.videoUrl,
-        veoAspectRatio:       veoResult.aspectRatio || ad.aspectRatio,
-        veoPrompt:            veoResult.prompt || null,
-        veoStoryboard:        veoResult.storyboard || storyboard || null,
-        veoCloudinaryPublicId: veoResult.cloudinaryPublicId || null,
-        veoModel:             veoResult.model || null,
-        veoReferenceImages:   veoResult.referenceImages || [],
-        renderUrl:            veoResult.videoUrl,
-        sourceFileType:       'video',
-        renderedAt:           new Date(),
-        updatedAt:            new Date(),
-        titlingResumeState:   'claimed'
-      },
-      $inc: { renderAttempts: 1 }
-    }
+    { _id: ad._id, claimedByWorker: WORKER_ID },
+    { $set: $setMaster, $inc: { renderAttempts: 1 } }
   );
+
+  if (handoffMode) {
+    const wallSec = ((Date.now() - t0) / 1000).toFixed(1);
+    console.log(
+      `renderer[${WORKER_ID}]: VIDEO MASTER handoff ad=${shortId} wall=${wallSec}s ` +
+      `— stamped titlingNeeded=true, released to titler`
+    );
+    // Do NOT bumpRunCounter — the ad hasn't settled yet, the titler owns
+    // the terminal stamp. `updatedAt` above keeps the CampaignRun off the
+    // reaper radar during the brief poll window before titler claims.
+    return;
+  }
 
   // Stage 3 — Remotion titling on the paid master.
   // Re-read AFTER the persist-write above, before either arm — that write

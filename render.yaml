@@ -43,6 +43,12 @@ services:
     # Standard-Plus: 4 vCPU / 8 GB. The RAM ceiling is set by Remotion —
     # ~1.5-2 GB per render at 4 concurrent (REMOTION_QUEUE_CONCURRENCY=4)
     # ≈ 6-8 GB peak. Standard (4 GB) OOMs under real video load.
+    #
+    # When ADGEN_TITLER_ENABLED=true (dashboard override), this role stops
+    # doing Remotion in-process and simply stamps titlingNeeded=true after
+    # the master's veoVideoUrl lands. The titler service (below) picks it
+    # up. In that mode this instance stops being memory-bound by Remotion
+    # and can raise ADGEN_MAX_INFLIGHT — but that's a separate tuning PR.
     plan: standard_plus
     dockerfilePath: ./Dockerfile
     autoDeploy: true
@@ -54,5 +60,32 @@ services:
         value: renderer
       - key: ADGEN_MAX_INFLIGHT
         value: 32
+      - key: MONGODB_URI
+        sync: false
+
+  - type: worker
+    name: adgen-titler
+    env: docker
+    # Same plan as adgen-renderer (see that block's comment). Titler needs
+    # the RAM for Chrome — but unlike the renderer, this instance has NO
+    # competing work (no Atlas HTTP, no static gpt-image-2/edit, no poll
+    # loop overhead beyond claim polling), so Chrome gets the whole budget.
+    # REMOTION_QUEUE_CONCURRENCY is inherited from config/defaults.env (=2)
+    # for a safe first deploy; raise via env override once validated under
+    # real load. Do not duplicate the value here — two sources of truth for
+    # a memory ceiling has bitten this repo before.
+    plan: standard_plus
+    dockerfilePath: ./Dockerfile
+    autoDeploy: true
+    # Dashboard autoscale: min=1 (dark launch — flag off, service is idle),
+    # max=8. Bump min after ADGEN_TITLER_ENABLED goes true so the handoff
+    # never queues behind cold-start.
+    envVars:
+      - key: ADGEN_ROLE
+        value: titler
+      - key: ADGEN_TITLER_ENABLED
+        value: "false"   # flip to true in dashboard after validating deploy
+      - key: ADGEN_MAX_INFLIGHT
+        value: 16        # I/O ceiling; Remotion queue self-limits below this
       - key: MONGODB_URI
         sync: false
