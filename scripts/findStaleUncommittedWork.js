@@ -78,6 +78,7 @@ function parseArgs(argv) {
   const opts = { repo: process.cwd(), minAgeHours: 2, json: false };
   for (const arg of argv) {
     if (arg.startsWith('--repo=')) opts.repo = path.resolve(arg.slice('--repo='.length));
+    else if (arg === '--all-worktrees') opts.allWorktrees = true;
     else if (arg.startsWith('--min-age-hours=')) opts.minAgeHours = parseFloat(arg.slice('--min-age-hours='.length));
     else if (arg === '--json') opts.json = true;
     else if (arg === '--help' || arg === '-h') { printHelp(); process.exit(0); }
@@ -86,7 +87,7 @@ function parseArgs(argv) {
 }
 
 function printHelp() {
-  console.log('Usage: node scripts/findStaleUncommittedWork.js [--repo=<path>] [--min-age-hours=N] [--json]');
+  console.log('Usage: node scripts/findStaleUncommittedWork.js [--repo=<path>] [--all-worktrees] [--min-age-hours=N] [--json]');
   console.log('Lists tracked files with uncommitted changes in a checkout, flagging any older than the threshold.');
 }
 
@@ -183,8 +184,7 @@ function diffFingerprint(repo, file) {
   }
 }
 
-function main() {
-  const opts = parseArgs(process.argv.slice(2));
+function runOne(opts) {
 
   let branch;
   try {
@@ -211,7 +211,39 @@ function main() {
     let ageHours = null;
     if (fp !== null) {
       const prior = priorState[file];
-      const firstSeenMs = (prior && prior.fingerprint === fp) ? prior.firstSeenMs : now;
+      // FIRST OBSERVATION USES MTIME AS A FLOOR, NOT `now`.
+      //
+      // Using `now` here meant the staleness clock started when this TOOL
+      // first looked, so on a first run in any checkout every diff reported
+      // 0.0h and nothing was ever flagged. Measured 2026-08-21: a sweep of
+      // the frontend worktrees reached
+      // `.claude/worktrees/catalog-rescrape`, correctly listed all three
+      // dirty files, and flagged NONE — while `Sidebar.tsx` carried 309
+      // lines of feature work whose mtime was 13 DAYS old. The tool could
+      // not have caught the exact case it exists for, in any worktree it
+      // had not previously been run in.
+      //
+      // This does NOT reintroduce the mtime bug in the header. That bug is
+      // about mtime RESETTING a known-old clock (a harness rewrite or
+      // format-on-save bumps mtime to now, making old work look new). Here
+      // mtime is consulted ONLY when there is no prior state for this exact
+      // diff content — and from then on the stored firstSeenMs wins, so a
+      // later rewrite still cannot reset it. Worst case on a first run is an
+      // UNDER-estimate of age (a genuinely old diff whose file was just
+      // rewritten), which fails toward silence rather than a false alarm.
+      let firstSeenMs;
+      if (prior && prior.fingerprint === fp) {
+        firstSeenMs = prior.firstSeenMs;
+      } else {
+        let mtimeMs = now;
+        try {
+          const st = fs.statSync(path.join(opts.repo, file));
+          if (Number.isFinite(st.mtimeMs) && st.mtimeMs > 0 && st.mtimeMs < now) {
+            mtimeMs = st.mtimeMs;
+          }
+        } catch { /* deleted or unreadable — fall back to now */ }
+        firstSeenMs = mtimeMs;
+      }
       nextState[file] = { fingerprint: fp, firstSeenMs };
       ageHours = (now - firstSeenMs) / (60 * 60 * 1000);
     }
@@ -230,6 +262,15 @@ function main() {
 
     if (rows.length === 0) {
       console.log('Nothing uncommitted. Tree is clean.');
+      if (!opts.allWorktreesRun) {
+        // "Tree is clean" is true and MISLEADING on its own. Measured
+        // 2026-08-21: this exact line printed here while a sibling worktree
+        // held 319 lines of feature work that had been uncommitted for 13
+        // DAYS — precisely what this tool exists to surface. A reader takes
+        // "clean" as "nothing at risk", so say what was NOT checked.
+        console.log('NOTE: only this checkout was inspected. Other worktrees of this repo were NOT —');
+        console.log('      re-run with --all-worktrees to sweep every one (see `git worktree list`).');
+      }
     } else if (stale.length === 0) {
       console.log('All uncommitted changes are recent (below the age threshold) — probably still in progress. Nothing flagged.');
       for (const r of rows) {
@@ -250,6 +291,73 @@ function main() {
   }
 
   process.exitCode = stale.length > 0 ? 1 : 0;
+}
+
+/**
+ * Sweep every worktree of THIS repo (--all-worktrees).
+ *
+ * Scope is deliberately this repo only. `/Volumes/Sayulita/Projects/RS/` also
+ * holds a second, unrelated repo (`liquidretail`) plus worktrees belonging to
+ * it; reporting those here would make the output untrustworthy for the repo the
+ * caller actually asked about. `git worktree list` is inherently per-repo, so
+ * that scoping is structural rather than a filter we have to maintain.
+ *
+ * Registered-but-missing worktrees are reported, not fatal: this machine
+ * accumulates them under /private/tmp, which is periodically wiped, and a
+ * hygiene tool that crashes on a pruned entry is a hygiene tool nobody runs.
+ */
+function listWorktrees(repo) {
+  const out = [];
+  let raw;
+  try {
+    raw = execFileSync('git', ['-C', repo, 'worktree', 'list', '--porcelain'],
+      { encoding: 'utf8', maxBuffer: 8 * 1024 * 1024 });
+  } catch {
+    return out;
+  }
+  let cur = null;
+  for (const line of raw.split('\n')) {
+    if (line.startsWith('worktree ')) {
+      if (cur) out.push(cur);
+      cur = { path: line.slice('worktree '.length).trim(), prunable: false };
+    } else if (line.startsWith('prunable ') && cur) {
+      cur.prunable = true;
+    }
+  }
+  if (cur) out.push(cur);
+  return out;
+}
+
+function main() {
+  const opts = parseArgs(process.argv.slice(2));
+  if (!opts.allWorktrees) return runOne(opts);
+
+  const trees = listWorktrees(opts.repo);
+  const missing = [];
+  const usable = [];
+  for (const w of trees) {
+    if (w.prunable || !fs.existsSync(w.path)) missing.push(w.path);
+    else usable.push(w.path);
+  }
+
+  if (!opts.json) {
+    console.log(`findStaleUncommittedWork --all-worktrees: ${usable.length} worktree(s) of ${opts.repo}`);
+    if (missing.length) {
+      console.log(`${missing.length} registered but absent from disk (run \`git worktree prune\`):`);
+      for (const m of missing) console.log(`  - ${m}`);
+    }
+    console.log('');
+  }
+
+  let anyStale = false;
+  for (const treePath of usable) {
+    if (!opts.json) console.log('='.repeat(72));
+    // allWorktreesRun suppresses the per-tree "other worktrees were not
+    // checked" note — in this mode they demonstrably were.
+    runOne({ ...opts, repo: treePath, allWorktreesRun: true });
+    if (process.exitCode === 1) anyStale = true;
+  }
+  process.exitCode = anyStale ? 1 : 0;
 }
 
 main();
