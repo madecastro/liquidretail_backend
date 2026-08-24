@@ -85,7 +85,8 @@ check('D2 fallback still clears on error',
 
 // E. Ignore rules: build artifact never leaks into git.
 const gi = fs.readFileSync(path.join(REPO, '.gitignore'), 'utf8');
-check('E1 .gitignore ignores .remotion-bundle', /(^|\n)\.remotion-bundle\/?(\n|$)/.test(gi));
+// CRLF-tolerant: Windows checkouts get \r\n line endings via git's autocrlf.
+check('E1 .gitignore ignores .remotion-bundle', /(^|\r?\n)\.remotion-bundle\/?(\r?\n|$)/.test(gi));
 
 // ── report
 console.log(`\nverifyRemotionPrebuild: ${passes.length} pass, ${failures.length} fail`);
