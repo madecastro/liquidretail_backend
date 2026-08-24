@@ -23,7 +23,7 @@ const NEW_RATIOS = {
 // there. The orchestrator only knows about (provider, variant) tuples; it
 // hands each one the same input bundle and uploads whatever buffer comes
 // back to Cloudinary with the per-ratio AR-fit transform.
-async function generateExtendedCrops({ sourceImageUrl, sourceVideoUrl, smartCrops, judge, primarySubject, background, isVideo }) {
+async function generateExtendedCrops({ sourceImageUrl, sourceVideoUrl, smartCrops, judge, primarySubject, background, isVideo, brandId = null, productId = null }) {
   const output = {};
   const errors = {};
   for (const r of Object.keys(NEW_RATIOS)) { output[r] = []; errors[r] = []; }
@@ -56,7 +56,7 @@ async function generateExtendedCrops({ sourceImageUrl, sourceVideoUrl, smartCrop
       label:     `${capitalize(p.provider)} ${p.variant}`,
       provider:  p.provider,
       variant:   p.variant,
-      generator: () => p.generate({ sourceImageUrl, baseCrop, newRatio, primarySubject, background }),
+      generator: () => p.generate({ sourceImageUrl, baseCrop, newRatio, primarySubject, background, brandId, productId }),
       newRatio, cloudinaryAr, sharedVideoUrl
     }));
 

@@ -12,7 +12,8 @@ async function identifyProduct({
   primarySubject,
   textDetected = [],
   imageUrl,
-  providers = {}
+  providers = {},
+  brandId = null
 }) {
   // Flatten all provider matches into a single evidence list, preserving origin
   const evidence = [];
@@ -142,7 +143,7 @@ async function identifyProduct({
     }
   ];
 
-  const response = await chatCompletion({ stage: 'product_reasoning', service: 'productReasoner' }, {
+  const response = await chatCompletion({ stage: 'product_reasoning', service: 'productReasoner', brandId }, {
     model: 'gpt-4.1',
     messages,
     response_format: { type: 'json_object' },

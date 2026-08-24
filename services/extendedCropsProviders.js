@@ -22,7 +22,7 @@
 //     variant:   'extension' | 'generation', // semantic slot
 //     idSlug:    string,                   // short tag for candidate ids ('ext' | 'gen' historically)
 //     isEnabled: () => boolean,            // env-gate / feature-flag
-//     generate:  ({ sourceImageUrl, baseCrop, newRatio, primarySubject, background })
+//     generate:  ({ sourceImageUrl, baseCrop, newRatio, primarySubject, background, brandId, productId })
 //                  => Promise<Buffer>      // returned buffer is uploaded by the orchestrator
 //   }
 
@@ -34,15 +34,15 @@ module.exports = [
     variant:   'extension',
     idSlug:    'ext',
     isEnabled: () => geminiImg.isEnabled(),
-    generate:  ({ sourceImageUrl, baseCrop, newRatio, primarySubject, background }) =>
-      geminiImg.extendImage(sourceImageUrl, baseCrop, newRatio, primarySubject, background)
+    generate:  ({ sourceImageUrl, baseCrop, newRatio, primarySubject, background, brandId, productId }) =>
+      geminiImg.extendImage(sourceImageUrl, baseCrop, newRatio, primarySubject, background, { brandId, productId })
   },
   {
     provider:  'gemini',
     variant:   'generation',
     idSlug:    'gen',
     isEnabled: () => geminiImg.isEnabled(),
-    generate:  ({ sourceImageUrl, baseCrop, newRatio, primarySubject, background }) =>
-      geminiImg.generateFresh(sourceImageUrl, baseCrop, newRatio, primarySubject, background)
+    generate:  ({ sourceImageUrl, baseCrop, newRatio, primarySubject, background, brandId, productId }) =>
+      geminiImg.generateFresh(sourceImageUrl, baseCrop, newRatio, primarySubject, background, { brandId, productId })
   }
 ];

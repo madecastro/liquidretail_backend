@@ -38,7 +38,7 @@ const RESPONSE_SCHEMA = {
 //   productDescription — optional one-line description
 //
 // Returns { breadcrumb, url, confidence, reasoning } or null on failure.
-async function enrichProductCategory({ brandName, brandUrl, productLabel, productCategory, productDescription }) {
+async function enrichProductCategory({ brandName, brandUrl, productLabel, productCategory, productDescription, brandId = null, productId = null }) {
   if (!isEnabled()) return null;
   if (!productLabel && !productDescription) return null;
 
@@ -60,7 +60,7 @@ async function enrichProductCategory({ brandName, brandUrl, productLabel, produc
 
   let res;
   try {
-    res = await chatCompletion({ stage: 'product_category', service: 'productCategoryService' }, {
+    res = await chatCompletion({ stage: 'product_category', service: 'productCategoryService', brandId, productId }, {
       model: 'gpt-4.1',
       response_format: { type: 'json_object' },
       messages: [{ role: 'user', content: prompt }],

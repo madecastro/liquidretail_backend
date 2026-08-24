@@ -52,6 +52,21 @@
  *      and asserts each real call site threads an actual object property
  *      (`run.brandId`, `ad._id`, `req.brandId`, …), not just the field name.
  *
+ * EXTENDED 2026-08-24 (same day, follow-up audit) — sections 8-12 pin FOUR more
+ * producers the original six-stage sweep never touched, still writing null-
+ * brandId CostLog rows at the time: gemini_product_match
+ * (geminiSearchProvider.match()), product_reasoning (productReasoner.
+ * identifyProduct()), gemini_image_extend/gemini_image_fresh
+ * (geminiImageService — structural, no brand/product param existed anywhere
+ * on that call chain), and product_category (productCategoryService.
+ * enrichProductCategory(), two dead call sites in productMatchService.js).
+ * Unlike the original six, these four carry brandId only (productId where
+ * genuinely known) — adId/campaignRunId are out of scope for every one of
+ * them, since all four run inside the UGC/detect ingest pipeline, never the
+ * ad-render path. Same structural-slice convention as sections 1-7: every
+ * window is bounded at a real syntactic anchor (a function boundary, a
+ * `});` call-closer, or a specific marker string), never a byte count.
+ *
  * Run: node scripts/verifyCostAttribution.js
  */
 
@@ -346,6 +361,171 @@ console.log('\nCOST ATTRIBUTION — six 2026-08-24 stages carry brand/product/ad
     /brandId:\s*req\.brandId\s*\|\| null/.test(block)
       && /adId:\s*req\.adId\s*\|\| null/.test(block)
       && /campaignRunId:\s*req\.campaignRunId\s*\|\| null/.test(block));
+}
+
+console.log('\nCOST ATTRIBUTION FOLLOW-UP — four 2026-08-24 gaps the six-stage fix never touched\n');
+
+// ── 8. gemini_product_match (services/providers/geminiSearchProvider.js match()) ──
+{
+  const src = read('services/providers/geminiSearchProvider.js');
+  const i = src.indexOf('async function match(');
+  check('8a match() signature accepts brandId', i >= 0 && /brandId\s*=\s*null/.test(src.slice(i, src.indexOf('\n', i))));
+  const block = i >= 0 ? sliceToNextFn(src, i) : '';
+
+  // trackedGenerate destructures {stage, purposeTag, grounded, ledger} — a bare
+  // top-level brandId key in the call's first arg would be silently dropped
+  // (this is exactly the shape of bug a naive fix would have shipped: the
+  // `ledger` object is the ONLY field that transport forwards to persistCost).
+  function matchThreadsLedgerBrandId(b) {
+    if (!b) return false;
+    const ci = b.indexOf("stage: 'gemini_product_match'");
+    if (ci < 0) return false;
+    const ledgerConst = b.lastIndexOf('const ledger = { brandId };', ci);
+    if (ledgerConst < 0) return false;
+    const callLine = b.slice(ci, b.indexOf('\n', ci) + 1);
+    return /\bledger\b/.test(callLine);
+  }
+  check('8b a real `const ledger = { brandId }` feeds the gemini_product_match trackedGenerate call',
+    matchThreadsLedgerBrandId(block));
+  check('8c [REVERT-PROOF, real file] stripping that ledger const fails 8b',
+    revertProof(block, 'const ledger = { brandId };', matchThreadsLedgerBrandId));
+}
+
+// ── 9. product_reasoning (services/productReasoner.js identifyProduct()) ──
+{
+  const src = read('services/productReasoner.js');
+  const i = src.indexOf('async function identifyProduct(');
+  check('9a identifyProduct signature accepts brandId', i >= 0 && /brandId\s*=\s*null/.test(sliceToNextFn(src, i).slice(0, 250)));
+  const block = i >= 0 ? sliceToNextFn(src, i) : '';
+  const meta = captureMeta(block, "stage: 'product_reasoning'");
+  const hasBrandId = m => !!m && /\bbrandId\b/.test(m);
+  check('9b the chatCompletion meta for stage product_reasoning carries brandId', hasBrandId(meta));
+  check('9c [REVERT-PROOF, real file] stripping brandId from the real meta fails 9b',
+    revertProof(meta, ', brandId', hasBrandId));
+}
+
+// ── 10. gemini_image_extend / gemini_image_fresh (services/geminiImageService.js) ──
+// The largest of the four and the only structural one — no brand/product
+// param existed ANYWHERE on this call chain, so every link had to gain one:
+// pipelines/detect.js -> extendedCropsService.generateExtendedCrops ->
+// extendedCropsProviders.generate() -> geminiImageService.extendImage /
+// generateFresh -> viaAtlasOrDirect -> atlasImageService.editImage's meta.
+{
+  const gi = read('services/geminiImageService.js');
+
+  const vI = gi.indexOf('async function viaAtlasOrDirect(');
+  const vBlock = vI >= 0 ? sliceToNextFn(gi, vI) : '';
+  check('10a viaAtlasOrDirect accepts an attribution param',
+    vI >= 0 && /viaAtlasOrDirect\(prompt, sourceUrl, aspectRatio, stage, attribution = \{\}\)/.test(gi.slice(vI, vI + 120)));
+  const hasAttrMeta = b => !!b && /brandId:\s*attribution\.brandId\s*\|\|\s*null/.test(b) && /productId:\s*attribution\.productId\s*\|\|\s*null/.test(b);
+  check('10b editImage\'s meta derives brandId/productId from attribution', hasAttrMeta(vBlock));
+  check('10c [REVERT-PROOF, real file] stripping the productId line fails 10b',
+    revertProof(vBlock, 'productId: attribution.productId || null\n        ', hasAttrMeta));
+
+  const eI = gi.indexOf('async function extendImage(');
+  const gI = gi.indexOf('async function generateFresh(');
+  check('10d extendImage forwards attribution to viaAtlasOrDirect',
+    eI >= 0 && /viaAtlasOrDirect\([^)]*attribution\)/.test(gi.slice(eI, gI)));
+  check('10e generateFresh forwards attribution to viaAtlasOrDirect',
+    gI >= 0 && /viaAtlasOrDirect\([^)]*attribution\)/.test(sliceToNextFn(gi, gI)));
+
+  const ep = read('services/extendedCropsProviders.js');
+  check('10f both provider entries destructure brandId/productId and pass them as an object to extendImage/generateFresh',
+    /extendImage\(sourceImageUrl, baseCrop, newRatio, primarySubject, background, \{ brandId, productId \}\)/.test(ep)
+      && /generateFresh\(sourceImageUrl, baseCrop, newRatio, primarySubject, background, \{ brandId, productId \}\)/.test(ep));
+
+  const es = read('services/extendedCropsService.js');
+  const gecI = es.indexOf('async function generateExtendedCrops(');
+  check('10g generateExtendedCrops accepts brandId/productId and forwards them into p.generate()',
+    gecI >= 0
+      && /brandId\s*=\s*null,\s*productId\s*=\s*null/.test(es.slice(gecI, gecI + 250))
+      && /p\.generate\(\{[^)]*brandId, productId \}\)/.test(sliceToNextFn(es, gecI)));
+
+  const detect = read('pipelines/detect.js');
+  const gecCallIdx = detect.indexOf('const { candidates, errors } = await generateExtendedCrops({');
+  const gecCall = gecCallIdx >= 0 ? detect.slice(gecCallIdx, detect.indexOf('});', gecCallIdx)) : '';
+  const callThreadsIds = c => /brandId:\s*run\.brandId \|\| media\.brandId \|\| null/.test(c)
+    && /productId:\s*media\.metadata\?\.catalogProductId \|\| null/.test(c);
+  check('10h pipelines/detect.js\'s generateExtendedCrops call threads run.brandId/media.brandId + catalogProductId',
+    callThreadsIds(gecCall));
+  check('10i [REVERT-PROOF, real file] stripping the productId line from the real call site fails 10h',
+    revertProof(gecCall, 'productId: media.metadata?.catalogProductId || null', callThreadsIds));
+}
+
+// ── 11. product_category (services/productCategoryService.js enrichProductCategory()) ──
+{
+  const src = read('services/productCategoryService.js');
+  const i = src.indexOf('async function enrichProductCategory(');
+  const sigLine = i >= 0 ? src.slice(i, src.indexOf('\n', i)) : '';
+  check('11a enrichProductCategory signature accepts brandId AND productId',
+    /brandId\s*=\s*null/.test(sigLine) && /productId\s*=\s*null/.test(sigLine));
+  const block = i >= 0 ? sliceToNextFn(src, i) : '';
+  const meta = captureMeta(block, "stage: 'product_category'");
+  const hasBrandId = m => !!m && /\bbrandId\b/.test(m);
+  const hasProductId = m => !!m && /\bproductId\b/.test(m);
+  check('11b the chatCompletion meta for stage product_category carries brandId', hasBrandId(meta));
+  check('11c [REVERT-PROOF, real file] stripping brandId from the real meta fails 11b',
+    revertProof(meta, ', brandId', hasBrandId));
+  check('11c2 the chatCompletion meta for stage product_category carries productId', hasProductId(meta));
+  check('11c3 [REVERT-PROOF, real file] stripping productId from the real meta fails 11c2',
+    revertProof(meta, ', productId', hasProductId));
+
+  // Both call sites in productMatchService.js — the task's own framing:
+  // "already hold brandId and don't pass it". productId is threaded too:
+  // both sites already have a catalog-product id in scope (catalogMatch /
+  // match.catalogProductId), the same value productDetails.fetchProductDetails
+  // already uses a few lines above each — so a null here would be merely
+  // unforwarded, not genuinely unknowable.
+  const pms = read('services/productMatchService.js');
+
+  const fpmIdx = pms.indexOf('async function findProductMatches(');
+  const fpmBlock = fpmIdx >= 0 ? sliceToNextFn(pms, fpmIdx) : '';
+  const sceneCallIdx = fpmBlock.indexOf('productCategory.enrichProductCategory({');
+  const sceneCall = sceneCallIdx >= 0 ? fpmBlock.slice(sceneCallIdx, fpmBlock.indexOf('});', sceneCallIdx)) : '';
+  const hasBareBrandId = c => /(^|[^.\w])brandId(\s*[,\n])/.test(c);
+  const hasSceneProductId = c => /productId:\s*catalogMatch\?\.product\?\._id \|\| null/.test(c);
+  check('11d findProductMatches\' scene-level enrichProductCategory call threads brandId', hasBareBrandId(sceneCall));
+  check('11e [REVERT-PROOF, real file] stripping brandId from the real scene-level call fails 11d',
+    revertProof(sceneCall, ',\n          brandId', hasBareBrandId));
+  check('11f findProductMatches\' scene-level enrichProductCategory call threads productId (catalogMatch, already in scope)',
+    hasSceneProductId(sceneCall));
+  check('11g [REVERT-PROOF, real file] stripping productId from the real scene-level call fails 11f',
+    revertProof(sceneCall, 'productId: catalogMatch?.product?._id || null', hasSceneProductId));
+
+  const eomIdx = pms.indexOf('async function enrichOneMatchInPlace(');
+  const eomBlock = eomIdx >= 0 ? sliceToNextFn(pms, eomIdx) : '';
+  const perMatchCallIdx = eomBlock.indexOf('productCategory.enrichProductCategory({');
+  const perMatchCall = perMatchCallIdx >= 0 ? eomBlock.slice(perMatchCallIdx, eomBlock.indexOf('});', perMatchCallIdx)) : '';
+  const hasCtxBrandId = c => /brandId:\s*ctx\.brandId/.test(c);
+  const hasMatchProductId = c => /productId:\s*match\.catalogProductId \|\| null/.test(c);
+  check('11h enrichOneMatchInPlace\'s per-match enrichProductCategory call threads ctx.brandId', hasCtxBrandId(perMatchCall));
+  check('11i [REVERT-PROOF, real file] stripping ctx.brandId from the real per-match call fails 11h',
+    revertProof(perMatchCall, ',\n            brandId:         ctx.brandId', hasCtxBrandId));
+  check('11j enrichOneMatchInPlace\'s per-match enrichProductCategory call threads productId (match.catalogProductId, already in scope)',
+    hasMatchProductId(perMatchCall));
+  check('11k [REVERT-PROOF, real file] stripping productId from the real per-match call fails 11j',
+    revertProof(perMatchCall, 'productId:       match.catalogProductId || null', hasMatchProductId));
+}
+
+// ── 12. aiLayoutStudioService.js:219 extractLayoutFromImage (sibling of the
+//     already-fixed generateReferenceImage, same file, same ctx) ──
+{
+  const src = read('services/aiLayoutStudioService.js');
+  const i = src.indexOf('async function extractLayoutFromImage(');
+  check('12a extractLayoutFromImage accepts a ctx param',
+    i >= 0 && /extractLayoutFromImage\(imageUrl, ctx = \{\}\)/.test(src.slice(i, i + 60)));
+  const block = i >= 0 ? sliceToNextFn(src, i) : '';
+  const meta = captureMeta(block, "stage: 'layout_vision'");
+  const hasCtxIds = m => !!m
+    && /brandId:\s*ctx\.media\?\.brandId \|\| ctx\.brand\?\._id \|\| null/.test(m)
+    && /productId:\s*ctx\.match\?\.catalogProductId \|\| null/.test(m);
+  check('12b the chatCompletion meta for stage layout_vision derives brandId/productId from ctx (same cascade as generateReferenceImage)',
+    hasCtxIds(meta));
+  check('12c [REVERT-PROOF, real file] stripping the productId line from the real meta fails 12b',
+    revertProof(meta, 'productId: ctx.match?.catalogProductId || null\n  ', hasCtxIds));
+
+  const calls = (src.match(/extractLayoutFromImage\(imageUrl, ctx\)/g) || []).length;
+  check('12d both call sites pass ctx through to extractLayoutFromImage', calls === 2, `found ${calls}`);
 }
 
 console.log(`\n${failures.length === 0 ? '✅' : '❌'} verifyCostAttribution: ${pass}/${pass + failures.length} passed`);

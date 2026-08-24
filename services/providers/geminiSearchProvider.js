@@ -935,7 +935,7 @@ async function structureReviewNarrative({ subjectLine, narrative, sourceDomains,
   return parsed;
 }
 
-async function match({ brand, category, caption, primarySubject, textDetected = [], cropImageUrl = null }) {
+async function match({ brand, category, caption, primarySubject, textDetected = [], cropImageUrl = null, brandId = null }) {
   if (!isEnabled()) {
     // AUTH_MISSING is its own code and its own operator action: nothing was
     // sent, nothing was billed, and the fix is configuration — not a retry.
@@ -993,8 +993,11 @@ async function match({ brand, category, caption, primarySubject, textDetected = 
   // was billing Google and writing NOTHING to CostLog). Genuinely grounded
   // (tools: google_search below), so this stays on the direct transport —
   // see the ATLAS GROUNDING PROBE comment above MODEL/ENDPOINT.
+  // brandId threaded 2026-08-24 — this row was ledgered but still landed with
+  // brandId null; findProductMatches/runPerProductProviders have it in scope.
+  const ledger = { brandId };
   const data = await trackedGenerate(
-    { stage: 'gemini_product_match', purposeTag: 'grounded_search', grounded: true },
+    { stage: 'gemini_product_match', purposeTag: 'grounded_search', grounded: true, ledger },
     {
       contents: [{ role: 'user', parts }],
       tools: [{ google_search: {} }],
