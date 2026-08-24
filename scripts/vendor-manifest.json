@@ -2,7 +2,7 @@
   "version": 1,
   "backendRef": "origin/main",
   "backendHead": "ba99a59f10619bbd940be9442c8852dc32ae278a",
-  "generatedAt": "2026-08-24T21:42:07.169Z",
+  "generatedAt": "2026-08-24T21:46:01.100Z",
   "files": {
     "models/Ad.js": {
       "backendHash": "8e4951d5a020ada681e2e83f4c1869faf4e74e00b6c4afa1a7de71105b72aca4",
@@ -484,7 +484,8 @@
     "services/atlasImageService.js": {
       "backendHash": "b9806803b902b482703a8ea78465390ebd4af0fcdc8f8eebfb39b1b635d0264c",
       "backendSha": "39231220ca43a37e68bcf908fc54d1af77fb6aa3",
-      "status": "synced"
+      "status": "fork",
+      "reason": "fork — adgen carries an input_fidelity model guard backend does not have: input_fidelity is only accepted by gpt-image-1.5/edit, and measured 2026-08-24 against gpt-image-2/edit ~22% of submits carrying it fail with 'does not support the input_fidelity parameter' (Atlas validates inconsistently; the other 78% silently succeed). adgen strips it on any other model and warns once, so a caller re-adding it cannot quietly lose ~1-in-5 renders. Worth porting to backend if backend ever renders again with ADGEN_RENDERER_ENABLED off — flagged, not done, since adgen owns rendering today."
     },
     "services/atlasLlmService.js": {
       "backendHash": "86eb6f236480a103f90082d44a1ee096ad9b064608cf8b4abeeabcad7cd2a649",
