@@ -43,6 +43,7 @@ const LayoutInputArtifact = require('../models/LayoutInputArtifact');
 const { uploadBufferToCloudinary } = require('./cloudinaryService');
 const crypto = require('crypto');
 const { adStage, noteRenderIssue } = require('./adStage');
+const { childTailsFrom } = require('./renderErrorFields');
 // Already required by 6 other adgen services (adVisionQcService,
 // aiCreativeDirectorService, bootRecoveryService, campaignAdsGenerationService,
 // costTracker, metaApiVersion) — this file had ZERO references until now. See
@@ -395,6 +396,10 @@ function notifyRenderFailure(ad, err) {
       run:   runId,
       brand: ad.brandId ? String(ad.brandId) : null
     };
+    // Slack field values clip to 200 chars. Child stderr belongs in `detail`
+    // (fenced block, ~4 KiB) — a fields.stderrTail slice would keep the HEAD
+    // of a throw-first stack and then get clipped again.
+    const stderrDetail = (childTailsFrom(err).stderrTail || '').slice(0, 4000) || null;
 
     if (ad.renderRoute === 'veo') {
       if (err && err.unsettledAtTimeout) {
@@ -409,7 +414,8 @@ function notifyRenderFailure(ad, err) {
           level:  'error',
           title:  'Video generation failed',
           key:    `video-failed:${msg.slice(0, 60)}`,
-          fields: { ...commonFields, error: msg.slice(0, 300) }
+          fields: { ...commonFields, error: msg.slice(0, 300) },
+          detail: stderrDetail
         });
       }
       return;
@@ -1374,7 +1380,10 @@ async function processAd(ad) {
       const shortId = String(ad._id).slice(-6);
       const wallSec = ((Date.now() - started) / 1000).toFixed(1);
       console.error(`renderer[${WORKER_ID}]: render failed ad=${shortId} route=${ad.renderRoute} wall=${wallSec}s: ${err.message}`);
-      try { noteRenderIssue(ad._id, { message: err.message, stage: 'render' }); } catch (_) {}
+      if (err && err.stderrTail) {
+        console.error(`renderer[${WORKER_ID}]: child stderrTail ad=${shortId}:\n${err.stderrTail}`);
+      }
+      try { noteRenderIssue(ad._id, { message: err.message, stage: 'render', err }); } catch (_) {}
       notifyRenderFailure(ad, err);
       await Ad.updateOne(
         { _id: ad._id, claimedByWorker: WORKER_ID },
@@ -1383,7 +1392,13 @@ async function processAd(ad) {
             status:          'failed',
             claimedByWorker: null,
             claimedAt:       null,
-            renderError:     { message: err.message.slice(0, 400), stage: 'render', at: new Date(), code: err.code || null },
+            renderError:     {
+              message: String(err.message || err).slice(0, 400),
+              stage: 'render',
+              at: new Date(),
+              code: err.code || null,
+              ...childTailsFrom(err)
+            },
             updatedAt:       new Date()
           }
         }

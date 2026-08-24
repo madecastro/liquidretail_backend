@@ -576,7 +576,17 @@ const adSchema = new mongoose.Schema({
     // way to tell content-policy from a bug or an outage without reading the
     // raw text. Declared here for the same reason atlasCode/chargeState are —
     // Mongoose strict mode silently drops an undeclared path on write.
-    code:         { type: String, default: null }
+    code:         { type: String, default: null },
+    // CHILD STDERR/STDOUT TAILS. remotionChildSupervisor attaches these
+    // onto the thrown Error so a `remotion child exited code=1 signal=none`
+    // failure still names WHY. They were being written onto renderError
+    // and then SILENTLY DROPPED — same trap as predictionId above. Without
+    // the declaration, a live production titling failure is undiagnosable
+    // from the Ad doc (and the parent log line does not carry the tail
+    // either). Persist-side clip lives in services/renderErrorFields.js
+    // (8 KiB stderr keep-start / 2 KiB stdout keep-end; NULs stripped).
+    stderrTail:   { type: String, default: null },
+    stdoutTail:   { type: String, default: null }
   },
   renderAttempts: { type: Number, default: 0 },
   // A FREE derive-only video ad (deriveFromMaster set) waits IN-RENDER for

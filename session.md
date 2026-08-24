@@ -14,54 +14,26 @@ it clears it back to this placeholder.)_
 
 ## CURRENT STATE
 
-*(Written 2026-08-24. Worktree `/Volumes/Sayulita/Projects/RS/.wt-proofport`,
-branch `port/rating-furniture-to-adgen` off `origin/master` @ `9d68b20`.)*
+*(Written 2026-08-24. Worktree `/Volumes/Sayulita/Projects/RS/.wt-stderrtail-adgen`,
+branch `fix/persist-child-stderr` off `origin/master`.)*
 
-- **What this is.** Fourth port tonight of a backend-only creative fix into
-  adgen, where `ADGEN_RENDERER_ENABLED=true` actually renders NEW ads.
-  Backend PR #325 (`7cc2c7df`) made `social_proof_led` demand a star-glyph
-  widget instead of a rating CLAIM headline. Three delivered ads printed
-  "Rated 5 Stars By Everyone Who's Tried Them" (Soludos, two surfaces) and
-  "5-star brand-wide rating" (Pelagic PMax) with no stars, numeral, or count.
-  Adgen vendored `staticAdIntents.js` / `aiCreativeDirectorService.js` /
-  `directImageRenderService.js` and had ZERO `hasUniversalEndorsement` /
-  `copyFailsCompliance` hits — the backend fix was inert on the new-ad path.
-- **Port, not overwrite.** DIR divergence kept (`usableAttribution`,
-  `composeCorrectiveOverride`, `buildQcRetryArgs`,
-  `submitEditImageWithSeedFallback`, brand-consistency #14). PMax notes and
-  SCENE_PRESERVE kept. `promptFlagsSnapshot` does not exist in adgen — that
-  hunk was skipped, not invented.
-- **Hunks applied on matching anchors** (staticAdIntents absences / goal /
-  furnitureBlock / catch-all carve-out; Director require + validator +
-  round-prompt furniture rule + PROOF MENU ternary). **Re-anchored:**
-  (1) exports landed after `BRAND_LED_COPY` before the PMax block (backend
-  inserted before `SEGMENT_OVERRIDES_ENABLED`, which adgen does not export);
-  (2) quote-absence line: backend #325 left `star-glyph row` banned whenever
-  there is no quote, which contradicts the widget demand on rating-only
-  `social_proof_led` (eligible on rating alone; harness PROOF_DATA always
-  has a quote so 130 stayed green). Furniture arm drops that glyph ban;
-  flag-off keeps the original sentence. **Skipped:** `promptFlagsSnapshot`
-  (adgen never had it; no `verifyQcInsights` / `verifyStaticIntents` here).
-- **Require paths.** `adCopyGuards.js` has no `require('../config/…')` —
-  it reads `process.env` only. From `src/services/` a `require('./adCopyGuards')`
-  is correct. Harness requires rewritten `../services/*` →
-  `../src/services/*`. Require-graph 510/510 (was 506/506).
-- **Kill switch** `STATIC_RATING_FURNITURE` (default ON) in
-  `config/defaults.env`. Flag-off is byte-identical to pre-port prompts on
-  all three surfaces AND the Director round system prompt (dumped against
-  origin/master before the port was restored).
-- **Proof.** `verifyRatingFurniture.js` 130/130 (matches backend; no harness
-  edit to chase the count). Extra fixture matrix against REAL functions:
-  BLOCK "Rated 5 Stars By Everyone Who's Tried Them", "5-star brand-wide
-  rating", "Loved universally by all customers"; KEEP "Rated 4.8 by 2,341
-  verified buyers", "Highly rated by the runners who log 50-mile weeks",
-  "For the city and everywhere in between." Suite 20/23 → 21/24, same three
-  reds (verifyArchiveDigestRelease, verifyModelParity,
-  verifyRunFinalizesOnSettle_KNOWN_OPEN).
-- **Companion.** `verifyBrandConsistency.js` S-section updated so it does
-  not pin the inverted star-row BAN (22 → 24). `resolveCoherentSocialProof`
-  / `allowLabeledBrandNumbers` untouched.
-- **Pushed.** PR against master. Do not merge.
+- **What this is.** Tonight 4/12 video ads on `run_1787579089058_b7efb329`
+  failed with only `remotion child exited code=1 signal=none`. The child's
+  real error was on `err.stderrTail` (`makeChildError`) and then thrown
+  away: `Ad.renderError` is a strict mongoose subdocument and those two
+  fields were undeclared, AND `renderer.js` processAd copied
+  message/stage/code/at and never the tails. Schema half + forwarding half
+  — either one alone is a no-op.
+- **Fix.** Declare `stderrTail`/`stdoutTail` on `src/models/Ad.js`. Copy
+  via `childTailsFrom()` at processAd, titlingResume terminal persist, OOM
+  stamp, and noteRenderIssue. Persist-side clip 8 KiB stderr keep-start /
+  2 KiB stdout keep-end; NULs stripped. processAd logs `stderrTail`; Slack
+  video-fail puts it in `detail`. Backend gets the same schema + titling
+  persist copy (same production DB).
+- **Proof.** `scripts/verifyRenderErrorTails.js` — Ad-doc round-trip,
+  in-process revert (stripped schema drops the payload), `makeChildError`
+  → persist shape → schema set. Do not merge until the sibling backend PR
+  is up; both must land.
 
 ---
 

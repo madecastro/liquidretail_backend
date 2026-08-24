@@ -17,6 +17,7 @@
 const Ad    = require('../models/Ad');
 const Brand = require('../models/Brand');
 const Media = require('../models/Media');
+const { childTailsFrom } = require('./renderErrorFields');
 // brandScriptExecutor is required lazily below: bootRecoveryService imports only
 // TITLING_PENDING from this module, and the worker process must not pay the
 // remotion/ffmpeg load at boot for a constant.
@@ -382,7 +383,7 @@ async function resumeUntitledMasters({ limit = TITLING_RESUME_MAX } = {}) {
             $set: {
               status: 'failed',
               titlingResumeState: null,
-              renderError: { message: tmsg, stage: 'titling', at: new Date() },
+              renderError: { message: tmsg, stage: 'titling', at: new Date(), ...childTailsFrom(err) },
               renderStage: 'master rendered; titling failed',
               renderStageAt: new Date(),
               updatedAt: new Date()
@@ -398,6 +399,9 @@ async function resumeUntitledMasters({ limit = TITLING_RESUME_MAX } = {}) {
       console.warn(
         `   ⚠️  titlingResume[${ad._id}]: titling failed — master kept: ${err.message || err}`
       );
+      if (err && err.stderrTail) {
+        console.warn(`   ⚠️  titlingResume[${ad._id}]: child stderrTail:\n${err.stderrTail}`);
+      }
     }
   }
 

@@ -2157,7 +2157,8 @@ async function renderWithRemotionAndSave({ ad, brand, format, presetOverride = n
               message: String(msg).slice(0, 400),
               stage: 'titling',
               at: new Date(),
-              code: 'REMOTION_CHILD_OOM'
+              code: 'REMOTION_CHILD_OOM',
+              ...require('./renderErrorFields').childTailsFrom(err)
             },
             renderStage: 'master rendered; titling oom-killed — resume pending',
             renderStageAt: new Date(),

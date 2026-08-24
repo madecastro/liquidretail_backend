@@ -312,6 +312,7 @@ function superviseRemotionChild({
         err.childCode = code;
         err.childSignal = signal || null;
         if (stderr) err.stderrTail = String(stderr).split('\n').slice(-40).join('\n');
+        if (stdout) err.stdoutTail = String(stdout).split('\n').slice(-10).join('\n');
         return finish(reject, err);
       }
       return finish(reject, makeChildError({
