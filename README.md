@@ -1,36 +1,61 @@
 # liquidretail_adgen
 
-Ad-generation microservice, extracted from `liquidretail_backend` per the 2026-08-21 architecture plan. Owns end-to-end ad generation: expand → Director/Judge → Atlas submit → Remotion titling → upload → vision QC. Backend keeps the `/api/ads/generate` HTTP endpoint (validate + fingerprint gate + mint CampaignRun); this service picks it up from there.
+Ad-generation **renderer** microservice for Reach Social. Fork of
+[`liquidretail_backend`](https://github.com/Emami-RS-Project/liquidretail_backend).
+When `ADGEN_RENDERER_ENABLED=true`, this service owns rendering in production.
+The backend still owns `/api/ads/generate`, expansion, mint, and claim.
 
-**Status: Phase 0** — scaffold only. Boots on Render staging; does not process production traffic yet.
+Trunk: **`master`**. Deploy: Render, one Docker image, three roles
+(`render.yaml`). Same MongoDB as the backend.
 
-## Services
+Agent notes: [`CLAUDE.md`](./CLAUDE.md). Live handoff: [`session.md`](./session.md).
 
-Three roles selected by `ADGEN_ROLE` env, one Docker image:
+## How the four repos fit together
 
-- **`api`** — Express HTTP. Health + inspect endpoints. Sync-only, no long work.
-- **`orchestrator`** — singleton worker (distributed lease). Polls `CampaignRun.status='preparing'`, expands + claims, publishes work to the Ad queue.
-- **`renderer`** — horizontally-scaled worker (N=2..16 autoscale). Claims individual Ad rows from `status='rendering' AND claimedByWorker=null`, does the actual generation work.
+| Repo | What it is |
+|---|---|
+| [`liquidretail`](https://github.com/Emami-RS-Project/liquidretail) | React SPA (trunk **`master`**). Netlify `staging.reach-social.io`. Calls the backend HTTP API. |
+| [`liquidretail_backend`](https://github.com/Emami-RS-Project/liquidretail_backend) | Express + Mongo API (trunk **`main`**). Auth, catalog, wizard, Director/Judge, mint. Hands off render when the flag is on. |
+| **This repo** | Claims `Ad.status='rendering'` rows and runs static Atlas plates + Omni video + Remotion titling. |
+| [`rs-ai-backend`](https://github.com/Emami-RS-Project/rs-ai-backend) | Older/parallel backend fork. **Reference only.** |
 
-## Money invariants (Phase 1+, not yet ported)
+## Roles (`ADGEN_ROLE`)
 
-Every invariant from `../liquidretail/server/CLAUDE.md` §2 that moves into this service is revert-proven by a `verify*.js` harness in the same commit that moves the code. Non-negotiable.
+Selected in `src/entrypoint.js`. One process runs one role:
 
-## Cutover
+- **`api`** — `GET /health` only (`src/routes/api.js`).
+- **`orchestrator`** — Phase 0 no-op poller. Does **not** expand or claim.
+- **`renderer`** — live worker. Atomic claim → static / video-master / derive → Remotion → terminal stamp. See `CLAUDE.md`.
 
-Backend gates on `ADGEN_SERVICE_ENABLED`:
-- `false` (default) → backend runs the current in-process render loop.
-- `true` → backend mints `CampaignRun.status='preparing'` and returns. Adgen picks up.
+## Cutover flag
 
-Flag flips per-phase during migration (`ADGEN_RENDERER_ENABLED` before Phase 1, `ADGEN_ORCHESTRATOR_ENABLED` before Phase 2, unified `ADGEN_SERVICE_ENABLED` after Phase 3 cleanup).
+`ADGEN_RENDERER_ENABLED` (read at call time in both repos):
 
-## Local dev
+- `true` — backend `runRenderLoop` returns; this renderer claims and renders.
+- anything else (committed default `false` in `config/defaults.env`) — renderer sleeps; backend's in-process loop still runs.
+
+There is no `ADGEN_SERVICE_ENABLED` in this tree.
+
+## Local
 
 ```
-cp .env.example .env
-# fill in MONGODB_URI (point at staging, NEVER prod)
+cp .env.example .env          # MONGODB_URI → staging, never prod
 npm install
-ADGEN_ROLE=api npm start           # health check at :3100/health
-ADGEN_ROLE=orchestrator npm start  # polls, logs, no-op
-ADGEN_ROLE=renderer npm start      # polls, logs, no-op
+ADGEN_ROLE=api npm start
+ADGEN_ROLE=orchestrator npm start
+ADGEN_RENDERER_ENABLED=true ADGEN_ROLE=renderer npm start
+npm test                      # node scripts/runVerifySuite.js (on master)
 ```
+
+`scripts/` and `npm test` exist on `origin/master`. A checkout parked before
+`881dabd` will not have them.
+
+## Vendoring
+
+~130 backend services live under `src/services/` (134 `*.js` at repo root of
+that folder as of 2026-08-24) plus 33 models under `src/models/`. A backend
+fix is **not** live here until it is ported. Layout trap: backend has
+`services/` + `config/` at repo root; this repo has `src/services/` +
+**both** `src/config.js` (a file) and `config/` (a directory), so
+`require('../config')` from a service resolves to the **file**. Details in
+`CLAUDE.md`.
