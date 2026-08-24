@@ -1625,11 +1625,55 @@ async function shutdown() {
   if (inFlight > 0) {
     console.warn(`renderer[${WORKER_ID}] drain window elapsed (${drainedMs}ms), ${inFlight} still in flight — releasing claims for peer pickup`);
     try {
+      // RECEIPT-AWARE. Releasing a claim on a `rendering` ad hands it straight
+      // back to claimOne — its filter is {status:'rendering', claimedByWorker:
+      // null, renderRoute:{$in:['html_gen','veo']}}, which is exactly the shape
+      // this write produces. The peer that picks it up re-enters renderVideo /
+      // renderStatic from the top and calls generateForAd again, and
+      // generateForAd has NO resume-from-receipt guard: it never reads
+      // ad.veoPredictionId before submitting (atlasVideoService.js — the only
+      // mention inside that function is the WRITE of the receipt after the
+      // submit, at the charge point). So for any ad already holding a receipt,
+      // a release here buys the same generation a second time.
+      //
+      // services/spendReceipt.js already states the rule this must obey:
+      // "a requeue may only ever touch RECEIPT-FREE ads". That module exists
+      // because providers charge at SUBMIT, so a stamped predictionId means the
+      // money is gone whatever happens next. RECEIPT_FREE covers BOTH charge
+      // points — Ad.veoPredictionId (Omni video) and
+      // Ad.imageGeneration.predictionId (static gpt-image-2) — and is shaped to
+      // treat null/'' as "no receipt", because the schema default is null so a
+      // bare {$exists:false} would match almost nothing.
+      //
+      // Receipt-HOLDING ads deliberately stay claimed and `rendering`. That is
+      // the honest state (the outcome genuinely is unknown until the receipt is
+      // polled), it keeps them visible to ALERT_RENDERING_STALE_MIN, and it
+      // preserves the receipt so the asset can be recovered for free rather
+      // than re-bought. It does re-expose the zombie-claim problem this
+      // shutdown handler was written to solve — but only for the subset that
+      // has spent money, where paying twice is the worse outcome. The general
+      // answer is a resume-from-receipt path in generateForAd (one already
+      // exists in atlasVideoService for the recovery flow, just not wired into
+      // generateForAd); until that lands, this is the safe half.
+      // USE THE COMPOSER, NOT A SPREAD. spendReceipt.js exports receiptFree()
+      // for exactly this and says why: "Spread-merging would silently drop an
+      // existing `$and`". `{ ...base, ...RECEIPT_FREE }` works only while the
+      // base filter happens to have no $and of its own — the day someone adds
+      // one, the receipt guard disappears with no error and no failing test,
+      // and we are back to buying paid generations twice. receiptFree()
+      // concatenates instead, so it stays correct under that edit.
+      const { receiptFree } = require('./spendReceipt');
       const res = await Ad.updateMany(
-        { claimedByWorker: WORKER_ID, status: 'rendering' },
+        receiptFree({ claimedByWorker: WORKER_ID, status: 'rendering' }),
         { $set: { claimedByWorker: null, claimedAt: null, updatedAt: new Date() } }
       );
-      console.warn(`renderer[${WORKER_ID}] released ${res.modifiedCount} claim(s) on forced shutdown`);
+      const held = await Ad.countDocuments({ claimedByWorker: WORKER_ID, status: 'rendering' });
+      console.warn(
+        `renderer[${WORKER_ID}] released ${res.modifiedCount} receipt-free claim(s) on forced shutdown` +
+        (held > 0
+          ? ` — ${held} receipt-holding ad(s) deliberately KEPT claimed so a peer cannot re-submit a paid generation`
+          : '')
+      );
     } catch (err) {
       console.error(`renderer[${WORKER_ID}] release-on-shutdown failed: ${err.message}`);
     }
