@@ -190,7 +190,25 @@ const {
   selectBrandQuotesForScope
 } = require('./quoteProvenance');
 
-const INPUT_SCHEMA_VERSION = '4.1';   // 4.1: quote provenance (origin + tier) stamped on primary_quote; LLM tiers removed
+// 4.2 (2026-08-24, OWNER-DIRECTED): forces every cached LayoutInputArtifact to
+// re-derive so PR #312's provenance fix actually reaches existing products.
+//
+// #312 fixed stampQuoteOrigins reading container.source instead of
+// container.quotesOrigin, which had made 20934 first-party reviews across 937
+// products unprintable. But assembleInput is CACHED on this constant, and every
+// production artifact was already 4.1 holding a brand-tier quote with an empty
+// product pool — so the fix was live in code and inert in effect. A render-time
+// re-pick cannot repair it: the stored pool itself is empty, and there is
+// nothing to re-pick from.
+//
+// COST, stated because this is a spend decision and not a free one: each
+// artifact re-derives lazily on next use, and runDerivation calls
+// chatCompletion (:892). So this is one paid LLM call per (media, template,
+// aspect, product) key as it is next touched — amortised over normal use rather
+// than a bulk charge, and it does NOT re-bill any image or video generation.
+//
+// 4.1: quote provenance (origin + tier) stamped on primary_quote; LLM tiers removed
+const INPUT_SCHEMA_VERSION = '4.2';
 
 // productReviews storage went 10 → 30 so rotation has a deeper pool.
 // The cached LayoutInputArtifact must NOT inherit that 3× dump:
