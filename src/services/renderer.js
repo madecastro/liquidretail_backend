@@ -1071,9 +1071,15 @@ async function renderVideo(ad) {
       ? await Brand.findById(sourceMedia.brandId).lean()
       : (ad.brandId ? await Brand.findById(ad.brandId).lean() : null);
 
+    // Re-read AFTER the inherit-write above, before either arm — the master's
+    // veoReferenceImages (the exact seed sent to the model) has to be visible
+    // to qcAndStampVideoAd's no-brand arm below, not just to renderBrandScript
+    // AndSave's. Hoisted out of the if-arm (which used to read it locally) so
+    // both arms share one read instead of the no-brand arm needing its own.
+    const adFinal = await Ad.findById(adId).lean();
+
     if (brandDoc) {
       adStage(adId, `titling ${ad.aspectRatio || '9:16'} (derive)`);
-      const adFinal = await Ad.findById(adId).lean();
       // Beat updatedAt for the whole titling window — including the queue
       // wait, which writes nothing otherwise. See startAdHeartbeat.
       // OUTER wrapper: beat.stop() lives in finally so an OOM early-return
@@ -1099,6 +1105,75 @@ async function renderVideo(ad) {
         }
       } finally {
         beat.stop();   // must not outlive the render, on success OR throw OR OOM return
+      }
+    } else {
+      // NO BRAND RESOLVED — same gap as the master path below (and the one
+      // backend's routes/ads.js:2609/3067 already closed): this never reaches
+      // renderBrandScriptAndSave, so it never reaches vision QC either. The
+      // derived plate would otherwise ship with NO Ad.visionQc at all — not
+      // even the {skipped:true, disabled:true} stub. deliveredUrl is the
+      // inherited sibling master's URL, not a fresh Omni submit (this is the
+      // free derive path).
+      //
+      // SAME HEARTBEAT AS THE BRAND ARM, and for the identical reason: vision
+      // QC is a real vision-LLM call (up to MAX_ATTEMPTS x TIMEOUT_MS plus a
+      // direct-provider fallback — several minutes in a real retry scenario),
+      // and this row is still status:'rendering' with a live Omni receipt.
+      // Without a beat, backend's bootRecoveryService (RESUME_STALE_MIN,
+      // default 5min) can steal it mid-QC exactly as it could a live titling
+      // render — the whole reason startAdHeartbeat exists. Adversarial review
+      // (Grok xhigh) caught this being missing on the first draft of this fix.
+      //
+      // REFERENCE IMAGE: adFinal does NOT carry the master's veoReferenceImages
+      // — the inherit-write above deliberately copies only what's needed to
+      // ship/title the plate, not the seed list. Passing adFinal as-is would
+      // make runVideoVisionQcForAd fall through to a CatalogProduct hero photo
+      // that may not be the frame that generated this clip (the master could
+      // have been seeded from a different lifestyle photo), producing a FALSE
+      // product-fidelity failure that flips a perfectly good derive to
+      // status:'failed'. Also caught in the same adversarial pass. Sourcing
+      // veoReferenceImages/videoDurationSec from `master` (the sibling's own
+      // record, already in memory, unprojected) instead fixes the comparison
+      // for THIS call only — deliberately NOT persisted onto the Ad doc, and
+      // deliberately NOT a fix to the pre-existing branded-arm version of this
+      // same gap (uploadRenderAndStamp's QC call has the identical exposure
+      // today, independent of this change — a separate, pre-existing defect).
+      //
+      // videoDurationSec falls back to adFinal's OWN value, not straight to
+      // null, if master's happens to be unset — Ad.videoDurationSec is
+      // operator/wizard-stamped per ad per format
+      // (campaignAdsGenerationService.resolveVideoDurationForFormat), so
+      // master-null-while-derive-set is reachable. `master.x || null` would
+      // silently discard a real duration and force
+      // runVideoVisionQcForAd's hardcoded 8s fallback, which shifts every
+      // sampled frame timestamp and can request frames past a shorter clip's
+      // end. veoReferenceImages has no equivalent third fallback because
+      // there isn't one to lose — an empty array here and an empty array on
+      // adFinal land on the identical CatalogProduct fallback either way.
+      //
+      // ⚠️ DO NOT "HARMONISE" THESE TWO LINES TO THE SAME SHAPE. They look
+      // like they should match and MUST NOT: Ad.videoDurationSec defaults to
+      // null (models/Ad.js) — falsy — so `master.x || adFinal.x || null`
+      // works. Ad.veoReferenceImages defaults to `[]` (models/Ad.js) — an
+      // EMPTY ARRAY IS TRUTHY in JS — so the identical-looking
+      // `adFinal.veoReferenceImages || master.veoReferenceImages || []`
+      // would silently pick adFinal's stored `[]` and never reach master at
+      // all, reopening the exact CatalogProduct-fallback bug this merge
+      // exists to close. Found in a second adversarial (Grok xhigh) round,
+      // specifically as "the review comment that would spring it."
+      const { qcAndStampVideoAd } = require('./brandScriptExecutor');
+      const beat = startAdHeartbeat(adId);
+      try {
+        await qcAndStampVideoAd({
+          ad: {
+            ...adFinal,
+            veoReferenceImages: master.veoReferenceImages || [],
+            videoDurationSec:   master.videoDurationSec || adFinal.videoDurationSec || null
+          },
+          deliveredUrl: master.veoVideoUrl
+        });
+      } finally {
+        beat.stop();
       }
     }
 
@@ -1153,6 +1228,14 @@ async function renderVideo(ad) {
   // Persist master + titling debt marker in one write (see backend
   // routes/ads.js:2940 — this shape is the money-critical stamp that
   // makes the paid asset reclaimable if the process dies mid-titling).
+  //
+  // veoVideoUrl and veoReferenceImages land in the SAME $set, which is what
+  // makes the derive path's poll loop (findSiblingMasterAd, above) safe: the
+  // moment a sibling can observe master.veoVideoUrl, master.veoReferenceImages
+  // is guaranteed populated too — there is no partial-write window where the
+  // URL is visible but the reference list isn't. The derive no-brand else-arm
+  // below relies on exactly this to source a correct QC reference image. If
+  // this write is ever split into two, that guarantee breaks silently.
   await Ad.updateOne(
     { _id: ad._id },
     {
@@ -1175,9 +1258,15 @@ async function renderVideo(ad) {
   );
 
   // Stage 3 — Remotion titling on the paid master.
+  // Re-read AFTER the persist-write above, before either arm — that write
+  // just populated veoReferenceImages (the exact seed URLs actually sent to
+  // the model), which qcAndStampVideoAd's no-brand arm below needs just as
+  // much as renderBrandScriptAndSave does. Reading it off the in-memory `ad`
+  // param instead would silently fall through to a CatalogProduct hero photo
+  // that may not be the frame that generated this clip.
+  const adFinal = await Ad.findById(adId).lean();
   if (brandDoc) {
     adStage(adId, `titling ${ad.aspectRatio || '9:16'}`);
-    const adFinal = await Ad.findById(adId).lean();
     // Beat updatedAt for the whole titling window — including the queue
     // wait, which writes nothing otherwise. See startAdHeartbeat.
     // OUTER wrapper: beat.stop() lives in finally so an OOM early-return
@@ -1203,6 +1292,29 @@ async function renderVideo(ad) {
       }
     } finally {
       beat.stop();   // must not outlive the render, on success OR throw OR OOM return
+    }
+  } else {
+    // NO BRAND RESOLVED (sourceMedia carried no brandId, or the lookup came
+    // back empty) — this NEVER reaches renderBrandScriptAndSave, so it never
+    // reaches vision QC either. Both of those call vision QC before the ad is
+    // considered delivered; without this, the master ships straight to
+    // 'draft' below with no equivalent call at all — a video ad with NO
+    // Ad.visionQc whatsoever, not even the {skipped:true, disabled:true}
+    // stub. Mirrors backend's routes/ads.js:3067.
+    //
+    // SAME HEARTBEAT AS THE BRAND ARM — vision QC is a real vision-LLM call
+    // (several minutes in a real retry scenario) and this row is still
+    // status:'rendering' with a live Omni receipt; without a beat, backend's
+    // bootRecoveryService can steal it mid-QC exactly as it could a live
+    // titling render. adFinal already carries the correct veoReferenceImages
+    // here (the persist-write just above wrote them from veoResult before
+    // this re-read), unlike the derive path, so no extra merge is needed.
+    const { qcAndStampVideoAd } = require('./brandScriptExecutor');
+    const beat = startAdHeartbeat(adId);
+    try {
+      await qcAndStampVideoAd({ ad: adFinal, deliveredUrl: veoResult.videoUrl });
+    } finally {
+      beat.stop();
     }
   }
 

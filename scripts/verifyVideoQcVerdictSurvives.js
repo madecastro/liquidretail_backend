@@ -145,6 +145,16 @@ function fnBody(name) {
 }
 
 const renderVideoBody = fnBody('renderVideo');
+// Offset of renderVideoBody within SRC, so section F can shift SRC_STRINGS
+// into renderVideoBody-local coordinates for decoy-resistant scanning —
+// same technique section E used for uploadBody before it became behavioural.
+const renderVideoOffset = (() => {
+  const m = /async function renderVideo\s*\(/.exec(SRC);
+  return m ? SRC.indexOf('{', SRC.indexOf(')', m.index)) : -1;
+})();
+const renderVideoStrings = renderVideoOffset >= 0
+  ? SRC_STRINGS.map(([s, e]) => [s - renderVideoOffset, e - renderVideoOffset]).filter(([s]) => s >= 0)
+  : [];
 
 // ── A. the scan is real (a zero-result scan proves nothing) ──────────────
 console.log('\n── A: the scan found the code it claims to check ──');
@@ -312,6 +322,322 @@ check('D3 the fallback maps a real \'failed\' verdict to the failed counter', ()
   // real QC failure as succeeded and passed this check anyway.
   assert.match(settleBody, /kept\s*===\s*'failed'\s*\?\s*'failed'\s*:\s*'succeeded'/,
     "settleNonDraftTerminal must map kept==='failed' -> 'failed', not the inverse");
+});
+
+// ── F. NO BRAND RESOLVED must still reach vision QC ──────────────────────
+// A SEPARATE, pre-existing defect from B/C/D above (found during adversarial
+// review of #7): both `if (brandDoc) { ...renderBrandScriptAndSave... }`
+// blocks had no else-arm at all. When brandDoc is falsy, NEITHER
+// renderBrandScriptAndSave NOR any QC call ever runs — the ad ships with
+// ZERO Ad.visionQc, not even a {skipped:true, disabled:true} stub. Backend
+// hit and fixed this exact gap already (routes/ads.js:2609/3067, comment:
+// "NO BRAND RESOLVED — same gap as the master path"); adgen's renderer.js
+// was ported without the else-arm. This is presence, not order/decoy risk
+// (unlike section E's old defeat class) — but still string-decoy-scanned
+// for the same reason section A-D's checks already strip comments: cheap
+// insurance against a log message that spells out the exact text this
+// check searches for.
+console.log('\n── F: NO BRAND RESOLVED must still reach vision QC ──');
+
+/** Every top-level `if (brandDoc) { ... }` in `body`, paired with whatever
+ *  else-block (if any) immediately follows it. */
+function findBrandDocArms(body) {
+  const arms = [];
+  const IF_RE = /if\s*\(\s*brandDoc\s*\)\s*\{/g;
+  let m;
+  while ((m = IF_RE.exec(body))) {
+    const ifOpen = body.indexOf('{', m.index);
+    const ifBlock = balanced(body, ifOpen, '{', '}');
+    if (!ifBlock) continue;
+    const afterIf = ifOpen + ifBlock.length;
+    const elseMatch = /^\s*else\s*\{/.exec(body.slice(afterIf, afterIf + 40));
+    let elseBlock = null, elseOffset = -1;
+    if (elseMatch) {
+      elseOffset = afterIf + elseMatch[0].indexOf('{');
+      elseBlock = balanced(body, elseOffset, '{', '}');
+    }
+    arms.push({ ifIndex: m.index, ifBlock, elseBlock, elseOffset });
+    IF_RE.lastIndex = afterIf;
+  }
+  return arms;
+}
+
+const brandDocArms = findBrandDocArms(renderVideoBody);
+
+check('F1 both if (brandDoc) blocks were found (derive + master)', () => {
+  assert.strictEqual(brandDocArms.length, 2,
+    `expected exactly 2 "if (brandDoc)" blocks in renderVideo, found ${brandDocArms.length}`);
+});
+
+check('F2 [THE FIX] each if (brandDoc) block has an else-arm', () => {
+  const missing = brandDocArms.filter((a) => !a.elseBlock);
+  assert.strictEqual(missing.length, 0,
+    `${missing.length} of ${brandDocArms.length} "if (brandDoc)" blocks have NO else-arm — a no-brand ` +
+    'video ad ships with zero Ad.visionQc, not even a skipped/disabled stub.');
+});
+
+check('F3 [ANTI-DECOY] each else-arm actually CALLS qcAndStampVideoAd — not a string that mentions it', () => {
+  for (const { elseBlock, elseOffset } of brandDocArms) {
+    if (!elseBlock) continue; // already failed by F2
+    const CALL_RE = /qcAndStampVideoAd\s*\(/g;
+    let found = false, cm;
+    while ((cm = CALL_RE.exec(elseBlock))) {
+      if (!isInsideAString(renderVideoStrings, elseOffset + cm.index)) { found = true; break; }
+    }
+    assert.ok(found, 'no REAL (non-string-decoy) call to qcAndStampVideoAd found in the else-arm');
+  }
+});
+
+/** Split the interior of a balanced "{...}" object literal on TOP-LEVEL
+ *  commas only (tracking nested {}/[]/() and string literals), then parse
+ *  each part as a `key: value` entry. Needed because the derive arm's `ad:`
+ *  value is itself an object literal with its own commas — a naive split on
+ *  every comma would misparse it. */
+function splitTopLevelCommas(text) {
+  const parts = [];
+  let depth = 0, cur = '', inStr = null;
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i];
+    if (inStr) {
+      cur += c;
+      if (c === '\\') { cur += text[i + 1] || ''; i++; continue; }
+      if (c === inStr) inStr = null;
+      continue;
+    }
+    if (c === '"' || c === "'" || c === '`') { inStr = c; cur += c; continue; }
+    if (c === '{' || c === '[' || c === '(') depth++;
+    if (c === '}' || c === ']' || c === ')') depth--;
+    if (c === ',' && depth === 0) { parts.push(cur); cur = ''; continue; }
+    cur += c;
+  }
+  if (cur.trim()) parts.push(cur);
+  return parts;
+}
+function objectLiteralEntries(objLiteralText) {
+  const inner = objLiteralText.slice(1, -1); // strip outer { }
+  const entries = {};
+  for (const part of splitTopLevelCommas(inner)) {
+    const m = /^\s*([A-Za-z_$][\w$]*)\s*:\s*([\s\S]*)$/.exec(part);
+    if (m) entries[m[1]] = m[2].trim();
+  }
+  return entries;
+}
+
+/** Find every REAL (non-string-decoy) `await qcAndStampVideoAd({...})` call
+ *  in `elseBlock`, returning {argsEntries, awaited, callIdx} for each. Reused
+ *  by F4-F6 so all three inspect the SAME real call(s) — a check that
+ *  re-derives its own match independently can silently diverge from what the
+ *  others verified. */
+function findRealQcCalls(elseBlock, elseOffset) {
+  const found = [];
+  const CALL_RE = /qcAndStampVideoAd\s*\(/g;
+  let cm;
+  while ((cm = CALL_RE.exec(elseBlock))) {
+    if (isInsideAString(renderVideoStrings, elseOffset + cm.index)) continue;
+    const openParen = elseBlock.indexOf('(', cm.index);
+    const callArgs = balanced(elseBlock, openParen, '(', ')') || '';
+    const objStart = callArgs.indexOf('{');
+    const objLiteral = objStart >= 0 ? (balanced(callArgs, objStart, '{', '}') || '') : '';
+    const preceding = elseBlock.slice(Math.max(0, cm.index - 20), cm.index);
+    found.push({
+      callIdx: cm.index,
+      argsEntries: objLiteral ? objectLiteralEntries(objLiteral) : {},
+      awaited: /\bawait\s*$/.test(preceding)
+    });
+  }
+  return found;
+}
+
+// KNOWN LIMITS OF F4/F5, documented rather than chased (rs-d2, after a
+// second Grok xhigh round constructed both by hand): F4's `awaited` check
+// looks at the 20 chars immediately before the call, so an unawaited async
+// IIFE wrapper around the real call — `(async () => { await
+// qcAndStampVideoAd(...) })();` — reads as awaited from the inside while the
+// OUTER statement races the terminal $in write below it. F5 matches the
+// IDENTIFIER `adFinal` appearing anywhere in the "ad:" text, so
+// `ad: adFinal && ad` or `ad: { adFinal }` (a nested, unused property, not a
+// spread) both satisfy the regex while the object actually handed to
+// qcAndStampVideoAd is the stale `ad` param. Both are adversarial
+// constructions, not shapes a normal edit produces — unlike the F6/F7 holes
+// this round fixed, which were accident-shaped (a missing argument, a
+// "harmonising" edit). Patching a source-text check against a determined
+// author is a game with no fixed point, proven three times already tonight
+// in a different file's section E; the same call was made here rather than
+// starting a fourth round on F4/F5. If either shape is ever seen for real,
+// this is the place to reconsider.
+check('F4 each REAL qcAndStampVideoAd call is awaited and passes both `ad` and `deliveredUrl`', () => {
+  for (const { elseBlock, elseOffset } of brandDocArms) {
+    if (!elseBlock) continue; // already failed by F2
+    const calls = findRealQcCalls(elseBlock, elseOffset);
+    assert.strictEqual(calls.length, 1, `expected exactly 1 real call in the else-arm, found ${calls.length}`);
+    const call = calls[0];
+    assert.ok(call.awaited,
+      'qcAndStampVideoAd must be awaited — an un-awaited call races the terminal $in write below it, ' +
+      'which can promote status to draft before the QC verdict has even been computed, let alone persisted.');
+    assert.ok('ad' in call.argsEntries, `call is missing "ad:": ${JSON.stringify(call.argsEntries)}`);
+    assert.ok('deliveredUrl' in call.argsEntries, `call is missing "deliveredUrl:": ${JSON.stringify(call.argsEntries)}`);
+    // VALUE, not just key. `deliveredUrl: ad.veoVideoUrl` (the stale
+    // renderVideo(ad) param — empty/undefined on a fresh master or derive
+    // before its own inherit/persist write ever ran) satisfies the key-only
+    // check above while pointing at nothing. The two legitimate sources are
+    // master.veoVideoUrl (derive, the inherited sibling plate) and
+    // veoResult.videoUrl (master, this call's own fresh Omni result) — never
+    // a bare `ad.` or `adFinal.` field read.
+    const dUrl = call.argsEntries.deliveredUrl;
+    assert.ok(!/\b(ad|adFinal)\.\w+/.test(dUrl),
+      `deliveredUrl must not read off the stale ad/adFinal object — found: ${dUrl}`);
+    assert.match(dUrl, /^(master\.veoVideoUrl|veoResult\.videoUrl)$/,
+      `deliveredUrl must be exactly master.veoVideoUrl (derive) or veoResult.videoUrl (master), got: ${dUrl}`);
+  }
+});
+
+check('F5 [FRESH READ] each call passes a re-read Ad doc (adFinal), never the stale renderVideo(ad) param', () => {
+  // The master path's Ad.updateOne (just above Stage 3) writes
+  // veoReferenceImages — the exact seed URLs actually sent to the model —
+  // which runVideoVisionQcForAd reads. Passing the original in-memory `ad`
+  // param there would silently fall through to a CatalogProduct hero photo
+  // that may not be the frame that generated the delivered clip, flipping
+  // the verdict in either direction. `adFinal` (Ad.findById(adId), read
+  // AFTER that write) is the only value in scope that reflects it.
+  //
+  // The `ad:` value is checked for the IDENTIFIER `adFinal` appearing
+  // anywhere in it — accepts both `ad: adFinal` (master) and
+  // `ad: { ...adFinal, veoReferenceImages: ... }` (derive, which additionally
+  // overrides the reference-image list from `master` — see F6's neighbour
+  // check and the inline comment at the real call site for why: the inherit
+  // -write never copies veoReferenceImages onto the derive row itself, so
+  // adFinal alone would still compare against the wrong reference image).
+  // A bare `ad: ad` (the stale param) contains no `adFinal` substring at all
+  // and is correctly rejected.
+  for (const { elseBlock, elseOffset } of brandDocArms) {
+    if (!elseBlock) continue;
+    const calls = findRealQcCalls(elseBlock, elseOffset);
+    if (!calls.length) continue; // already failed by F4
+    const adValue = calls[0].argsEntries.ad || '';
+    assert.match(adValue, /\badFinal\b/,
+      `qcAndStampVideoAd's "ad" value must reference adFinal, not the stale renderVideo(ad) param: ${adValue}`);
+  }
+  // ORDERING: adFinal's declaration must appear textually AFTER the derive
+  // inherit-write / master persist-write that populates the fields QC
+  // depends on, not before it (a findById moved above that write, or a
+  // `const adFinal = ad` alias, would satisfy the identifier check above
+  // while reading stale data). Scoped PER ARM via ifIndex — pairing globally
+  // nearest-before would let the master's read match against the DERIVE
+  // branch's write (textually earlier in the same function, but a different
+  // code path entirely) if the master's own read were hoisted too far up.
+  const declMatches = [...renderVideoBody.matchAll(/const\s+adFinal\s*=\s*await\s+Ad\.findById\s*\(\s*adId\s*\)\s*\.lean\s*\(\s*\)/g)]
+    .filter((m) => !isInsideAString(renderVideoStrings, m.index));
+  assert.strictEqual(declMatches.length, 2,
+    `expected exactly 2 "const adFinal = await Ad.findById(adId).lean()" declarations (derive + master), found ${declMatches.length}`);
+  const writeMarkers = [...renderVideoBody.matchAll(/titlingResumeState:\s*['"]claimed['"]/g)]
+    .filter((m) => !isInsideAString(renderVideoStrings, m.index));
+  assert.strictEqual(writeMarkers.length, 2,
+    `expected exactly 2 titlingResumeState:'claimed' persist-writes (derive inherit + master persist), found ${writeMarkers.length}`);
+  for (const arm of brandDocArms) {
+    const priorWrite = writeMarkers.filter((w) => w.index < arm.ifIndex).pop();
+    const priorDecl = declMatches.filter((d) => d.index < arm.ifIndex).pop();
+    assert.ok(priorWrite,
+      `no titlingResumeState:'claimed' persist-write found before the if(brandDoc) at offset ${arm.ifIndex}`);
+    assert.ok(priorDecl,
+      `no adFinal declaration found before the if(brandDoc) at offset ${arm.ifIndex}`);
+    assert.ok(priorDecl.index > priorWrite.index,
+      `this branch's adFinal was read (offset ${priorDecl.index}) BEFORE its own persist-write ` +
+      `(offset ${priorWrite.index}) — a stale read, exactly the bug the hoist exists to fix.`);
+  }
+});
+
+check('F6 [NO STEAL] each real call is wrapped in the SAME startAdHeartbeat/beat.stop() as the brand arm', () => {
+  // Vision QC is a real vision-LLM call (multiple minutes in a real retry
+  // scenario) and this row is still status:'rendering' with a live Omni
+  // receipt. Without a beat, backend's bootRecoveryService (RESUME_STALE_MIN)
+  // can steal it mid-QC exactly as it could a live titling render — the
+  // whole reason startAdHeartbeat exists in this file at all. Missing this
+  // was the more serious of the two holes an adversarial (Grok xhigh) pass
+  // found in the first draft of this fix.
+  for (const { elseBlock, elseOffset } of brandDocArms) {
+    if (!elseBlock) continue;
+    const calls = findRealQcCalls(elseBlock, elseOffset);
+    if (!calls.length) continue; // already failed by F4
+    const callIdx = calls[0].callIdx;
+    const BEAT_START_RE = /const\s+beat\s*=\s*startAdHeartbeat\s*\(/g;
+    let beatStart = null, bm;
+    while ((bm = BEAT_START_RE.exec(elseBlock))) {
+      if (bm.index < callIdx && !isInsideAString(renderVideoStrings, elseOffset + bm.index)) beatStart = bm;
+    }
+    assert.ok(beatStart,
+      'no REAL (non-string-decoy) "const beat = startAdHeartbeat(" found before the qcAndStampVideoAd call');
+    // THE ARGUMENT, not just the call shape. startAdHeartbeat() or
+    // startAdHeartbeat(null) matches the token pattern above but beats
+    // nothing — Ad.updateOne's filter is { _id: undefined, ... }, which
+    // matches no document, so bootRecovery still steals the row mid-QC after
+    // RESUME_STALE_MIN. A plausible typo, not just an adversarial construct
+    // (found in a second Grok xhigh round after the first round only
+    // checked call/stop presence).
+    const openParen = elseBlock.indexOf('(', beatStart.index + beatStart[0].length - 1);
+    const beatArgs = (balanced(elseBlock, openParen, '(', ')') || '').slice(1, -1).trim();
+    assert.strictEqual(beatArgs, 'adId',
+      `startAdHeartbeat must be called with exactly "adId", got: "${beatArgs}" — an empty, null, or wrong ` +
+      'argument beats nothing and leaves the row unprotected from a bootRecovery steal.');
+    const BEAT_STOP_RE = /beat\.stop\s*\(\s*\)/g;
+    let beatStopFound = false, sm;
+    while ((sm = BEAT_STOP_RE.exec(elseBlock))) {
+      if (sm.index > callIdx && !isInsideAString(renderVideoStrings, elseOffset + sm.index)) { beatStopFound = true; break; }
+    }
+    assert.ok(beatStopFound, 'no REAL (non-string-decoy) "beat.stop()" found after the qcAndStampVideoAd call');
+  }
+});
+
+check('F7 [DERIVE REFERENCE FIDELITY] the derive arm merges the master\'s veoReferenceImages into the QC payload', () => {
+  // The derive inherit-write (above, in the if/else's shared setup) copies
+  // veoVideoUrl/veoAspectRatio/veoModel/renderUrl onto the derived row but
+  // deliberately NOT veoReferenceImages — the derived row was never itself
+  // submitted to Omni, so it has no seed list of its own. Passing plain
+  // adFinal (as the master arm correctly does — its OWN persist-write DOES
+  // write veoReferenceImages from veoResult) would make
+  // runVideoVisionQcForAd fall through to a CatalogProduct hero photo that
+  // may not be the frame that generated this clip, producing a FALSE
+  // product-fidelity failure on a perfectly good derive. Found in
+  // adversarial (Grok xhigh) review of the first draft, which called plain
+  // `ad: adFinal` on derive "not the same *comparison* as the master arm."
+  // brandDocArms[0] is the derive arm (renderVideo processes derive before
+  // master, and there are exactly 2 — pinned by F1).
+  const derive = brandDocArms[0];
+  const calls = findRealQcCalls(derive.elseBlock, derive.elseOffset);
+  if (!calls.length) return; // already failed by F4
+  const adValue = (calls[0].argsEntries.ad || '').trim();
+  assert.ok(adValue.startsWith('{') && adValue.endsWith('}'),
+    `the derive arm's "ad" value must be an object literal (to carry the master-sourced overrides), got: ${adValue}`);
+  const adEntries = objectLiteralEntries(adValue);
+  // PIN THE VALUE, not a substring of the whole "ad:" text. A prior version
+  // of this check did `assert.match(adValue, /master\.veoReferenceImages/)`,
+  // which a THIRD round of adversarial review (Grok xhigh) showed stays
+  // green even when the expression is broken — e.g. the "harmonised",
+  // defensive-looking `adFinal.veoReferenceImages || master.veoReferenceImages
+  // || []` contains the substring `master.veoReferenceImages` but NEVER
+  // evaluates it, because Ad.veoReferenceImages defaults to `[]`
+  // (models/Ad.js) and an empty array is truthy in JS — adFinal's stored `[]`
+  // wins every time. Parsing the "ad:" object literal's own entries and
+  // asserting the EXACT expression closes that: only `master.x || []` (no
+  // `adFinal.x ||` in front) can satisfy it.
+  assert.strictEqual(adEntries.veoReferenceImages, 'master.veoReferenceImages || []',
+    `veoReferenceImages must be exactly "master.veoReferenceImages || []" — no adFinal fallback in front of ` +
+    `it (adFinal's stored default is [], which is TRUTHY, so any "adFinal.x || master.x" shape would never ` +
+    `reach master at all): got "${adEntries.veoReferenceImages}"`);
+  // videoDurationSec must fall back to adFinal's own value, not straight to
+  // null, if master's happens to be unset — Ad.videoDurationSec is
+  // operator/wizard-stamped per ad per format, so master-null-while-derive
+  // -set is reachable. `master.videoDurationSec || null` would silently
+  // discard a real duration and force the QC's hardcoded 8s fallback, which
+  // shifts every sampled frame timestamp. Found in a second round of
+  // adversarial review (rs-d2), after the first round's veoReferenceImages
+  // fix already landed. UNLIKE veoReferenceImages above, Ad.videoDurationSec
+  // defaults to null (falsy), so master-first-then-adFinal is the CORRECT
+  // and only safe order here — the two fields are NOT interchangeable
+  // despite sitting next to each other with a similar shape; see the
+  // renderer.js comment at this exact call site for why.
+  assert.strictEqual(adEntries.videoDurationSec, "master.videoDurationSec || adFinal.videoDurationSec || null",
+    `videoDurationSec must be exactly "master.videoDurationSec || adFinal.videoDurationSec || null": ` +
+    `got "${adEntries.videoDurationSec}"`);
 });
 
 // ── E. THE UPSTREAM WRITER — now a BEHAVIOURAL test, not a source scan ────
