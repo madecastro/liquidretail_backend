@@ -38,7 +38,11 @@ async function main() {
     const renderer = require('./services/renderer');
     await renderer.run();
     installShutdown(async () => {
-      renderer.shutdown();
+      // AWAIT: renderer.shutdown is async now — drains in-flight processAd()
+      // promises and releases any remaining claims for peer pickup before we
+      // let installShutdown call process.exit(0). Fire-and-forget here would
+      // race with process.exit and lose the release write.
+      await renderer.shutdown();
       await disconnect();
     });
     return;

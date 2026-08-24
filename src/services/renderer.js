@@ -1484,9 +1484,46 @@ async function run() {
   }, 30_000).unref();
 }
 
-function shutdown() {
+// Graceful shutdown. Render fires SIGTERM ~30s before SIGKILL on deploy /
+// autoscale-down / instance replacement. Three responsibilities:
+//   1. Stop the poll loop from claiming NEW ads (stopping=true — poll's
+//      claim-loop bails, scheduleNext no-ops).
+//   2. Give in-flight processAd() promises up to SHUTDOWN_DRAIN_MS to
+//      settle. On terminal state they clear their own claim.
+//   3. Any ad STILL claimed after the drain window is about to be SIGKILL'd —
+//      release its claim so a peer can pick it up on next poll. Otherwise
+//      it becomes a zombie for the reaper to clean up, and today the reaper
+//      CAN'T (backend worker.js:1b692d1 — respects claimedByWorker != null
+//      by design so live workers own their claims).
+//
+// Live proof this matters: three rolling deploys in 10 min accumulated 22
+// zombie claims that blocked the queue.
+const SHUTDOWN_DRAIN_MS = Number(process.env.ADGEN_SHUTDOWN_DRAIN_MS || 25_000);
+
+async function shutdown() {
+  if (stopping) return;
   stopping = true;
-  console.log(`renderer[${WORKER_ID}] shutting down`);
+  const t0 = Date.now();
+  console.log(`renderer[${WORKER_ID}] shutting down — inflight=${inFlight}, drain up to ${SHUTDOWN_DRAIN_MS}ms`);
+  const deadline = t0 + SHUTDOWN_DRAIN_MS;
+  while (inFlight > 0 && Date.now() < deadline) {
+    await new Promise(r => setTimeout(r, 500));
+  }
+  const drainedMs = Date.now() - t0;
+  if (inFlight > 0) {
+    console.warn(`renderer[${WORKER_ID}] drain window elapsed (${drainedMs}ms), ${inFlight} still in flight — releasing claims for peer pickup`);
+    try {
+      const res = await Ad.updateMany(
+        { claimedByWorker: WORKER_ID, status: 'rendering' },
+        { $set: { claimedByWorker: null, claimedAt: null, updatedAt: new Date() } }
+      );
+      console.warn(`renderer[${WORKER_ID}] released ${res.modifiedCount} claim(s) on forced shutdown`);
+    } catch (err) {
+      console.error(`renderer[${WORKER_ID}] release-on-shutdown failed: ${err.message}`);
+    }
+  } else {
+    console.log(`renderer[${WORKER_ID}] clean drain in ${drainedMs}ms — no forced release needed`);
+  }
 }
 
 module.exports = { run, shutdown };
