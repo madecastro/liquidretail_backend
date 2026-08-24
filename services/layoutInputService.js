@@ -69,7 +69,7 @@ const { findBrandByName }    = require('./brandCatalogService');
 const { placeOverlays }      = require('./overlayPlacementService');
 const registry               = require('./templateRegistry');
 const { hydrateMatch }       = require('./productMatchHydration');
-const { resolveDeriveProductPair } = require('./ratingPairAtomic');
+const { resolveDeriveProductPair, classifyProductReviewsProvenance } = require('./ratingPairAtomic');
 const { computeSlotBudgets } = require('./slotBudget');
 const { displayNormalizeTitle } = require('../utils/titleNormalize');
 const { extractSnippet, PROOF_LINE_MAX_CHARS, usableProofCommentsOrNone } = require('./quoteSnippetService');
@@ -1890,6 +1890,23 @@ const QUOTE_REQUIRE_RATING = String(process.env.QUOTE_REQUIRE_RATING || 'false')
 // without a deploy.
 const QUOTE_BRAND_TIER_FALLBACK = String(process.env.QUOTE_BRAND_TIER_FALLBACK || 'true').toLowerCase() === 'true';
 
+// Stamp a quote's origin from the parent productReviews container when the
+// quote itself has none. Default ON. Measured 2026-08-21: 0 of 20934
+// first-party quotes carried their own origin, so json-ld (788 products /
+// 18452 quotes) and api:yotpo (149 / 2482) containers carrying
+// quotesOrigin:'scraped' all stamped 'unknown' and were dropped as
+// unprintable; the brand-tier last-resort then printed a brand quote about
+// "two pairs of these" on a t-shirt ad. Uses classifyProductReviewsProvenance
+// — the SAME classifier the ratings path already trusts (ratingPairAtomic.js
+// :73), so one snapshot can no longer have a trusted rating and untrusted
+// quotes. That function is pure and is NOT gated by RATING_PAIR_ATOMIC.
+// `||` not `??`, matching the neighbours above: a BLANK value (a cleared
+// Render dashboard var) must fall back to the committed default of true, not
+// silently revert to the buggy stamp. A deliberate disable is `=false`, which
+// works either way. Set false to restore the pre-change stamp (gemini-search
+// / q.source==='store' only) with no deploy.
+const QUOTE_ORIGIN_FROM_CONTAINER = String(process.env.QUOTE_ORIGIN_FROM_CONTAINER || 'true').toLowerCase() === 'true';
+
 function gateQuotesByRating(candidates, tierName) {
   if (!Array.isArray(candidates) || !candidates.length) return [];
   let rated = 0, dropped = 0, unrated = 0;
@@ -2156,17 +2173,50 @@ function stampQuoteOrigins(container, quotes) {
     if (!origin) {
       if (containerSource === 'gemini-search') origin = 'llm-web';
       else if (q?.source === 'store') origin = 'store-import';
-      else origin = 'unknown';
+      else if (QUOTE_ORIGIN_FROM_CONTAINER) {
+        // The container knows its own provenance in `quotesOrigin`, and this
+        // function never read it — which is the whole defect. Delegate to the
+        // classifier the ratings path already uses so the two halves of one
+        // snapshot cannot disagree about whether it is a first-party scrape.
+        // ORDER IS LOAD-BEARING: this arm sits AFTER the two above, so it can
+        // only ever convert an outcome that was previously 'unknown'. Every
+        // other outcome is bit-identical (pinned: verifyQuoteProvenanceStamp
+        // B1/B2). Moving it earlier changes gemini-search and store rows.
+        const classified = classifyProductReviewsProvenance(container);
+        if (classified === 'scraped') origin = 'scraped';
+        else if (classified === 'llm-web') origin = 'llm-web';
+      }
+      // Anything the classifier could not name positively stays unknown, and
+      // unknown is not printable. A category-shaped container (`sources`
+      // plural, no `source`) still lands here — that fail-closed case is the
+      // one the comment above assembleInput was written to guard.
+      if (!origin) origin = 'unknown';
     }
     return normalizeQuote({ ...q, origin });
   });
 }
 
 function printableQuotes(quotes, tierName) {
-  const kept = (quotes || []).filter(Boolean).map(toPrintableCustomerQuote).filter(Boolean);
-  const dropped = (quotes || []).filter(Boolean).length - kept.length;
+  const candidates = (quotes || []).filter(Boolean);
+  const kept = candidates.map(toPrintableCustomerQuote).filter(Boolean);
+  const dropped = candidates.length - kept.length;
   if (dropped) {
     console.log(`🔒 quote provenance[${tierName}] — ${dropped} quote(s) withheld: origin not printable as a customer testimonial`);
+  }
+  // A STORED review that cannot print is a bug signal, not an empty pool, and
+  // the line above cannot tell those apart — it read the same for 20934
+  // quotes whose provenance was simply never looked up. Log-only and NOT
+  // flag-gated: this is diagnostics, not behaviour. No alertService and no
+  // await — this is a hot render path and stage telemetry here is
+  // fire-and-forget by contract.
+  if (candidates.length >= 1 && kept.length === 0) {
+    const droppedUnknown = candidates.filter((q) => q.origin === 'unknown').length;
+    if (droppedUnknown >= 1) {
+      console.log(
+        `🔒 quote provenance[${tierName}] — provenance-failure: ${droppedUnknown}/${candidates.length} ` +
+        `candidate(s) stamped origin=unknown; kept 0 (a stored review that cannot print is a bug, not an absence)`
+      );
+    }
   }
   return kept;
 }
