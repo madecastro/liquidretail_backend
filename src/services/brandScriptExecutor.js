@@ -2227,10 +2227,21 @@ async function renderWithRemotionAndSave({ ad, brand, format, presetOverride = n
       platformFormat,
       brandName: brand?.name,
       adId:      String(ad._id),
-      brandId:   ad.brandId || null,
-      productId: ad.productId || null,
+      // String() is LOAD-BEARING on every id here, exactly as it is on adId
+      // above. These three cross a child-process IPC boundary, and
+      // remotionChildSupervisor's assertNoBuffers rejects any Buffer on the
+      // payload. A Mongoose ObjectId exposes its bytes as `.buffer`, which
+      // under mongoose 8 / bson 6 IS a real Node Buffer (bson allocates via
+      // Buffer.allocUnsafe) — so a RAW ObjectId here throws
+      //   "remotion child IPC forbids buffers (key=buffer); pass a path"
+      // and titling dies. Every video ad has a brandId, so that is 100% of
+      // video ads, not an edge case. Verified 2026-08-24 by executing the real
+      // guard against a real ObjectId on mongoose 8.24.4: raw throws,
+      // String(id) passes.
+      brandId:   ad.brandId ? String(ad.brandId) : null,
+      productId: ad.productId ? String(ad.productId) : null,
       campaignRunId: Array.isArray(ad.campaignRunIds) && ad.campaignRunIds.length
-        ? ad.campaignRunIds[ad.campaignRunIds.length - 1]
+        ? String(ad.campaignRunIds[ad.campaignRunIds.length - 1])
         : null,
       brand,
       placementMode: placement,
@@ -2264,10 +2275,14 @@ async function renderWithRemotionAndSave({ ad, brand, format, presetOverride = n
           platformFormat,
           brandName: brand?.name,
           adId:      String(ad._id),
-          brandId:   ad.brandId || null,
-          productId: ad.productId || null,
+          // Same String() requirement as the primary call above — this retry
+          // path carried the identical raw-ObjectId bug, so the "retry once on
+          // the raw plate" fallback ALSO threw on the IPC guard and could
+          // never rescue a failed titling attempt.
+          brandId:   ad.brandId ? String(ad.brandId) : null,
+          productId: ad.productId ? String(ad.productId) : null,
           campaignRunId: Array.isArray(ad.campaignRunIds) && ad.campaignRunIds.length
-            ? ad.campaignRunIds[ad.campaignRunIds.length - 1]
+            ? String(ad.campaignRunIds[ad.campaignRunIds.length - 1])
             : null,
           brand,
           placementMode: placement,
