@@ -14,40 +14,33 @@ it clears it back to this placeholder.)_
 
 ## CURRENT STATE
 
-*(Written 2026-08-24. Worktree `/Volumes/Sayulita/Projects/RS/.wt-colourport`,
-branch `port/colour-quote-to-adgen` off `origin/master` @ `fdd81d3`.)*
+*(Written 2026-08-24. Worktree `/Volumes/Sayulita/Projects/RS/.wt-slackharness`,
+branch `fix/slack-harness-plumbing` off `origin/master` @ `a99afb1`.)*
 
-- **What this is.** Port of backend #324 (colour-language testimonial drop)
-  into adgen. The fifth such port tonight; this is the vendor-drift
-  detector's first real job. Measured defect: two statics for
-  "Women's Roma Retro Sneaker | White - Wine" printed a green-accent
-  review over a burgundy shoe.
-- **Port, not a copy.** `quoteColourway.js` copied wholesale (no requires).
-  `layoutInputService` / `quoteRotationService` / `aiCreativeDirectorService`
-  were byte-identical to backend pre-#324, so the post-#324 files were
-  copied. `quoteProvenance` comment-only (kept adgen's dropped CLAUDE.md
-  §4 cross-ref). `brandScriptExecutor` and `directImageRenderService`
-  hunk-ported around adgen's Remotion-OOM / usableAttribution divergence.
-  `directImageRenderService` was not on the owner's verbatim 5-file list
-  but is the static paint-time gate for the measured defect and the
-  harness drives `buildIntentData` for real — hunk re-anchored, fork kept.
-- **Harness.** `scripts/verifyQuoteColourway.js` ported with
-  `../services/*` → `../src/services/*` and
-  `path.join(ROOT, 'services')` → `path.join(ROOT, 'src', 'services')`
-  including the D2 `require.resolve`. **99/99**, same as backend; no
-  harness-count delta.
-- **Manifest.** Reconciled the ported files (4 synced, 3 still-forks
-  with UNPORTED #324 stripped). Also looked at backend #326 (stderr
-  tails) which moved origin/main after the detector seed:
-  `adStage.js` now byte-identical → synced; `Ad.js` / `renderErrorFields.js`
-  re-attested as comment-only forks; `titlingResumeService.js` still
-  unused (file not touched). Remaining UNPORTED in the manifest is
-  backend #323 (font ingest) — out of scope.
-- **Proof.** Require-graph 513/513 → 518/518 (5 new `./quoteColourway`
-  edges). Vendor-drift 11/11 green. Fixture matrix on the real
-  `usableColourwayQuote`: raw and display titles both `{white,wine}`;
-  green / green-accented DROP; mint condition, silver lining, green
-  light, white lie KEEP; wine accent / white sole / comfort KEEP.
+- **What this is.** Harness plumbing only. `verifyRendererSlackAlerts.js`
+  went 4/34 red on healthy master after #19 (`childTailsFrom` in
+  `notifyRenderFailure`). Production alerting was not broken. The A-tests
+  extract function bodies via `new Function` and injected only `alerts`,
+  so the new free name threw before `alerts.notifyAsync`.
+- **Option (b), not (a).** Bare `require` of renderer.js is blocked:
+  `config.js` `process.exit(1)` without `ADGEN_ROLE`+`MONGODB_URI`; the
+  file exports only `{ run, shutdown }`; the graph pulls mongoose/Atlas/
+  Slack; E6 forbids loading `alertService`. #13's recipe needed a
+  production export (`uploadRenderAndStamp`) — not done here. Isolated
+  `Module._compile` with a custom `require()`: stub `alertService` /
+  config / db / Ad, load leaf `renderErrorFields` + `concurrency` for
+  real, stub other relative requires as `{}`. Internals are re-exported
+  only in the compiled copy.
+- **ECONNREFUSED.** D6's in-memory `Ad.find` thrower. The function's
+  catch logs `renderer[renderer-test]: … failed — ECONNREFUSED`. Not a
+  live connection. D6 now captures that warn and asserts it.
+- **Proof.** 34/34. A1–A4 assertions byte-identical vs origin/master.
+  Mutation: hardcode static `level: 'error'` → A4 red (`'error' !==
+  'fatal'`). Extra used `require('os')` inside `notifyRenderFailure` →
+  still 34/34; extraction would have thrown. Reverted both. E6 still
+  forbids `require(alertService)` / `require(services/renderer)`.
+- **Suite after.** Same two expected reds as master:
+  `verifyArchiveDigestRelease` E3/E14, `verifyRunFinalizesOnSettle_KNOWN_OPEN`.
 - **Pushed.** PR against master. Do not merge.
 
 ---
@@ -57,8 +50,6 @@ branch `port/colour-quote-to-adgen` off `origin/master` @ `fdd81d3`.)*
 - **`verifyRunFinalizesOnSettle_KNOWN_OPEN.js`** — still labelled expected-fail;
   `maybeFinalizeRun` is wired on this branch. Group A only replays the `$inc`.
 - **`verifyArchiveDigestRelease.js` E3/E14** — self-diagnosed broken ported scans.
-- **`verifyRendererSlackAlerts.js`** — red on master before this port
-  (A1–A4, `ECONNREFUSED` on `alertOrphanedClaimsOnBoot`). Not introduced here.
 - **`verifyModelParity.js`** — red in some worktrees because sibling
   `liquidretail_backend/models/*` no longer call `mongoose.model(...)` in a
   shape the harness can extract. Also fails while a `node_modules` symlink

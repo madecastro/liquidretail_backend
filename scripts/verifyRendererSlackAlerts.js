@@ -12,7 +12,7 @@
 // zero Slack rows for that service that day.
 //
 // WHAT THIS PINS, behaviourally, by executing the REAL function bodies
-// (not a reimplementation — see "SOURCE EXTRACTION" below):
+// (not a reimplementation — see "ISOLATED MODULE LOAD" below):
 //   A. notifyRenderFailure  — the processAd-catch alert. Video route
 //      classifies unsettledAtTimeout (warn) vs a hard failure (error);
 //      static route reuses directImageRenderService's existing
@@ -35,22 +35,52 @@
 //      it claims to cover (processAd's catch, maybeFinalizeRun's success
 //      branch, renderVideo's derive-wait branch, run()'s boot sequence).
 //
-// SOURCE EXTRACTION, not a copy. Every function this harness executes is
-// sliced verbatim out of the real src/services/renderer.js text (balanced-
-// brace parsing, same technique as verifyRendererAtomicClaim.js) and handed
-// to `new Function` with its free module-scope variables (alerts, Ad,
-// WORKER_ID, CLAIM_STALE_MIN, MAX_DERIVE_WAIT_ATTEMPTS) injected as
-// parameters bound to test doubles. A hand-copied reimplementation that
-// merely kept the same name would keep passing forever after the real
-// function drifted; this cannot, because it IS the real function body.
+// ISOLATED MODULE LOAD, not source-text extraction. A–D used to slice each
+// function out of renderer.js with a balanced-brace parser and eval it via
+// `new Function`, injecting free names (`alerts`, `Ad`, …) as parameters.
+// That died the moment #19 added `const { childTailsFrom } = require(
+// './renderErrorFields')` and referenced it inside notifyRenderFailure:
+// the extracted body ran in a synthetic scope that did not include the
+// new binding, threw before alerts.notifyAsync, and A1–A4 went red on
+// healthy production code. Production alerting was never broken — the
+// real module has the require at the top of renderer.js.
+//
+// The same class of bug is why verifyVideoQcVerdictSurvives.js section E
+// (adgen #13 / backend #322) stopped scanning source and required the
+// real module with require.cache stubs. We cannot copy that recipe
+// verbatim here:
+//   • renderer.js exports only { run, shutdown } — the functions under
+//     test are not exported, and this harness does not change production
+//     to export them.
+//   • a bare load of src/services/renderer.js pulls src/config.js,
+//     which process.exit(1)s without ADGEN_ROLE + MONGODB_URI, and then
+//     the rest of the render graph (mongoose models, Atlas, Cloudinary,
+//     Remotion). This file must stay node_modules-free.
+//   • E6 forbids the harness from requiring alertService.
+// So we compile renderer.js as its own Module with a custom require():
+//   • './alertService' → the in-memory notifyAsync stub (never the real
+//     module, never a Slack token / chat.postMessage).
+//   • '../config', '../db', '../models/Ad' → test doubles.
+//   • './renderErrorFields', './concurrency' → the real leaf modules
+//     (no config/mongoose/network). A new require of this shape, used
+//     inside notifyRenderFailure, just works — that is the #19 bug.
+//   • any other project-local require → {} so a new heavy dependency
+//     cannot pull mongoose/Slack into this script. If an alert function
+//     starts *calling* a new leaf helper, add that specifier to
+//     REAL_RELATIVE below (the trap, documented).
+//   • module.exports is rewritten ONLY in the compiled copy so A–D can
+//     call the unexported functions; the file on disk is untouched.
+// E1–E5 stay source scans of call sites (wiring is not exported). Do
+// not call run() — that starts poll loops.
 //
 // Pure + offline: no DB, no network, no Slack token, no node_modules
-// required (only Node builtins: fs, path, assert). Run:
+// required (only Node builtins: fs, path, assert, module). Run:
 //   node scripts/verifyRendererSlackAlerts.js
 
 const fs = require('fs');
 const path = require('path');
 const assert = require('assert');
+const Module = require('module');
 
 const RENDERER_PATH = path.join(__dirname, '..', 'src', 'services', 'renderer.js');
 const SRC = fs.readFileSync(RENDERER_PATH, 'utf8');
@@ -82,26 +112,67 @@ function functionBody(src, signatureRe) {
   assert.ok(body, `unterminated function body for ${signatureRe}`);
   return body;
 }
-// Full declaration (signature THROUGH the matching closing brace) — what
-// `new Function` needs to install a real, callable function.
-function functionDecl(src, signatureRe) {
-  const m = signatureRe.exec(src);
-  assert.ok(m, `signature not found: ${signatureRe}`);
-  const brace = src.indexOf('{', m.index + m[0].length - 1);
-  const body = balanced(src, brace, '{', '}');
-  assert.ok(body, `unterminated function body for ${signatureRe}`);
-  return src.slice(m.index, brace + body.length);
+// Isolated compile of renderer.js. Does NOT go through Node's normal
+// require() of that file (E6 pins this), so config.js cannot process.exit
+// and alertService never loads. The compiled copy is the real function
+// bodies with a stubbed module graph.
+const EXPORT_RE = /module\.exports\s*=\s*\{\s*run,\s*shutdown\s*\}\s*;/;
+const REAL_RELATIVE = new Set(['./renderErrorFields', './concurrency']);
+
+function specId(request) {
+  return String(request || '').replace(/\\/g, '/').replace(/\.js$/i, '');
 }
-// Build a real, callable function from its extracted source text, with its
-// free module-scope variables bound as closure parameters of the
-// surrounding `new Function` — the same "pass free vars as params" trick
-// verifyRendererAtomicClaim.js uses for a single expression, extended here
-// to a whole function declaration.
-function loadFn(signatureRe, fnName, paramNames, paramValues) {
-  const decl = functionDecl(SRC, signatureRe);
-  // eslint-disable-next-line no-new-func
-  const factory = new Function(...paramNames, `${decl}\nreturn ${fnName};`);
-  return factory(...paramValues);
+
+function loadRenderer({ alerts, Ad }) {
+  assert.ok(EXPORT_RE.test(SRC),
+    'renderer.js no longer assigns module.exports = { run, shutdown }; update the isolated loader');
+  const wrapped = SRC.replace(
+    EXPORT_RE,
+    'module.exports = { run, shutdown, notifyRenderFailure, notifyDeriveWaitBackup, notifyRunFinalized, alertOrphanedClaimsOnBoot };'
+  );
+
+  const filename = RENDERER_PATH;
+  const mod = new Module(filename);
+  mod.filename = filename;
+  mod.paths = Module._nodeModulePaths(path.dirname(filename));
+
+  const origRequire = Module.prototype.require.bind(mod);
+  const AdStub = Ad || {
+    find() { throw new Error('isolated renderer: Ad.find was not stubbed for this check'); }
+  };
+
+  mod.require = function isolatedRequire(request) {
+    const id = specId(request);
+    if (id === '../config') {
+      return {
+        POLL_MS: 500,
+        WORKER_ID: 'renderer-test',
+        MAX_INFLIGHT: 32,
+        isAdgenRendererEnabled: () => false
+      };
+    }
+    if (id === '../db') {
+      return {
+        isStaleTopologyError: () => false,
+        reconnectAfterStaleTopology: async () => {},
+        resetReconnectAttempts: () => {}
+      };
+    }
+    if (id === './alertService') return alerts;
+    if (id === '../models/Ad') return AdStub;
+    if (REAL_RELATIVE.has(id)) return origRequire(request);
+    // Other project-local requires (directImage, atlas, cloudinary, models,
+    // …) stay empty so this script never needs node_modules and never
+    // reaches a live service. A new require of a LEAF helper that an
+    // alert function actually calls must be added to REAL_RELATIVE —
+    // that is the remaining trap, and it is smaller than "every free
+    // name in the extracted body."
+    if (id.startsWith('.')) return {};
+    return origRequire(request);
+  };
+
+  mod._compile(wrapped, filename);
+  return mod.exports;
 }
 
 function makeAlertsStub() {
@@ -121,7 +192,7 @@ function makeAdStub(docs) {
   };
 }
 
-// Apply the REAL Ad.find filter the extracted function issued — not a
+// Apply the REAL Ad.find filter the isolated function issued — not a
 // reimplementation of orphan logic. Understands only the operators this
 // query uses (equality, $ne, $lt). Anything else fails closed.
 function matchesCapturedFilter(doc, filter) {
@@ -152,12 +223,7 @@ function matchesCapturedFilter(doc, filter) {
 }
 
 function loadOrphanFn(alerts, AdStub) {
-  return loadFn(
-    /async function alertOrphanedClaimsOnBoot\(\)\s*\{/,
-    'alertOrphanedClaimsOnBoot',
-    ['alerts', 'CLAIM_STALE_MIN', 'HEARTBEAT_STALE_MIN', 'Ad', 'WORKER_ID'],
-    [alerts, 20, 5, AdStub, 'renderer-test']
-  );
+  return loadRenderer({ alerts, Ad: AdStub }).alertOrphanedClaimsOnBoot;
 }
 
 async function main() {
@@ -172,7 +238,7 @@ async function main() {
 
   await check('A1 video route + unsettledAtTimeout → warn, video-unsettled key, carries predictionId', () => {
     const alerts = makeAlertsStub();
-    const fn = loadFn(SIG_A, 'notifyRenderFailure', ['alerts'], [alerts]);
+    const fn = loadRenderer({ alerts }).notifyRenderFailure;
     const ad = { _id: 'ad1', renderRoute: 'veo', brandId: 'brandX', campaignRunIds: ['run1', 'run2'] };
     const err = new Error('atlasVideo: prediction timed out after 600s');
     err.unsettledAtTimeout = true;
@@ -191,7 +257,7 @@ async function main() {
 
   await check('A2 video route + ordinary failure → error, video-failed key, NO predictionId field', () => {
     const alerts = makeAlertsStub();
-    const fn = loadFn(SIG_A, 'notifyRenderFailure', ['alerts'], [alerts]);
+    const fn = loadRenderer({ alerts }).notifyRenderFailure;
     const ad = { _id: 'ad2', renderRoute: 'veo', brandId: null, campaignRunIds: [] };
     const err = new Error('Atlas 500 Internal Server Error');
     fn(ad, err);
@@ -206,7 +272,7 @@ async function main() {
 
   await check('A3 static route, untagged error → defaults to error / direct-image:render-failed', () => {
     const alerts = makeAlertsStub();
-    const fn = loadFn(SIG_A, 'notifyRenderFailure', ['alerts'], [alerts]);
+    const fn = loadRenderer({ alerts }).notifyRenderFailure;
     const ad = { _id: 'ad3', renderRoute: 'html_gen', brandId: 'brandY', campaignRunIds: ['run9'] };
     const err = new Error('buffer was empty');
     fn(ad, err);
@@ -220,7 +286,7 @@ async function main() {
 
   await check('A4 static route reuses directImageRenderService\'s own err.alertLevel/err.alertKey tag', () => {
     const alerts = makeAlertsStub();
-    const fn = loadFn(SIG_A, 'notifyRenderFailure', ['alerts'], [alerts]);
+    const fn = loadRenderer({ alerts }).notifyRenderFailure;
     const ad = { _id: 'ad4', renderRoute: 'html_gen', brandId: 'brandY', campaignRunIds: [] };
     const err = new Error('no Atlas credentials configured');
     err.alertLevel = 'fatal';
@@ -233,7 +299,7 @@ async function main() {
 
   await check('A5 a throwing alerts stub is swallowed — alerting must never fail the failure path', () => {
     const throwingAlerts = { notifyAsync() { throw new Error('slack transport blew up'); } };
-    const fn = loadFn(SIG_A, 'notifyRenderFailure', ['alerts'], [throwingAlerts]);
+    const fn = loadRenderer({ alerts: throwingAlerts }).notifyRenderFailure;
     assert.doesNotThrow(() => fn({ _id: 'x', renderRoute: 'veo', campaignRunIds: [] }, new Error('boom')));
   });
 
@@ -248,7 +314,7 @@ async function main() {
 
   await check('B1 master never found yet → warn, backup title, key falls back to the ad id', () => {
     const alerts = makeAlertsStub();
-    const fn = loadFn(SIG_B, 'notifyDeriveWaitBackup', ['alerts', 'CLAIM_STALE_MIN', 'MAX_DERIVE_WAIT_ATTEMPTS'], [alerts, 20, 60]);
+    const fn = loadRenderer({ alerts }).notifyDeriveWaitBackup;
     fn({ _id: 'adA' }, null, 1);
     const c = alerts.calls[0];
     assert.strictEqual(c.level, 'warn');
@@ -259,7 +325,7 @@ async function main() {
 
   await check('B2 master found but young + queued → still ordinary backup, not stuck', () => {
     const alerts = makeAlertsStub();
-    const fn = loadFn(SIG_B, 'notifyDeriveWaitBackup', ['alerts', 'CLAIM_STALE_MIN', 'MAX_DERIVE_WAIT_ATTEMPTS'], [alerts, 20, 60]);
+    const fn = loadRenderer({ alerts }).notifyDeriveWaitBackup;
     const master = { _id: 'masterM', status: 'queued', updatedAt: new Date() };
     fn({ _id: 'adB' }, master, 2);
     const c = alerts.calls[0];
@@ -269,7 +335,7 @@ async function main() {
 
   await check('B3 [ESCALATION] master rendering + stale past CLAIM_STALE_MIN → error, STUCK title', () => {
     const alerts = makeAlertsStub();
-    const fn = loadFn(SIG_B, 'notifyDeriveWaitBackup', ['alerts', 'CLAIM_STALE_MIN', 'MAX_DERIVE_WAIT_ATTEMPTS'], [alerts, 20, 60]);
+    const fn = loadRenderer({ alerts }).notifyDeriveWaitBackup;
     const master = { _id: 'masterN', status: 'rendering', updatedAt: new Date(Date.now() - 25 * 60 * 1000) };
     fn({ _id: 'adC' }, master, 3);
     const c = alerts.calls[0];
@@ -279,7 +345,7 @@ async function main() {
 
   await check('B4 [ESCALATION] wait ceiling exceeded escalates level WITHOUT relabeling it "stuck"', () => {
     const alerts = makeAlertsStub();
-    const fn = loadFn(SIG_B, 'notifyDeriveWaitBackup', ['alerts', 'CLAIM_STALE_MIN', 'MAX_DERIVE_WAIT_ATTEMPTS'], [alerts, 20, 60]);
+    const fn = loadRenderer({ alerts }).notifyDeriveWaitBackup;
     const master = { _id: 'masterP', status: 'queued', updatedAt: new Date() }; // NOT stuck by staleness
     fn({ _id: 'adD' }, master, 61); // > MAX_DERIVE_WAIT_ATTEMPTS (60)
     const c = alerts.calls[0];
@@ -298,7 +364,7 @@ async function main() {
 
   await check('C1 a run with zero failures alerts NOTHING (matches backend\'s nFailed > 0 gate)', () => {
     const alerts = makeAlertsStub();
-    const fn = loadFn(SIG_C, 'notifyRunFinalized', ['alerts'], [alerts]);
+    const fn = loadRenderer({ alerts }).notifyRunFinalized;
     fn('run1', { succeeded: 5, failed: 0 });
     fn('run1', null);
     fn('run1', undefined);
@@ -307,7 +373,7 @@ async function main() {
 
   await check('C2 total failure (succeeded:0) → error, "failed entirely", run-failed:total key', () => {
     const alerts = makeAlertsStub();
-    const fn = loadFn(SIG_C, 'notifyRunFinalized', ['alerts'], [alerts]);
+    const fn = loadRenderer({ alerts }).notifyRunFinalized;
     fn('run_abc', { succeeded: 0, failed: 3 });
     const c = alerts.calls[0];
     assert.strictEqual(c.level, 'error');
@@ -318,7 +384,7 @@ async function main() {
 
   await check('C3 partial failure → warn, "finished with N failed", run-failed:partial key', () => {
     const alerts = makeAlertsStub();
-    const fn = loadFn(SIG_C, 'notifyRunFinalized', ['alerts'], [alerts]);
+    const fn = loadRenderer({ alerts }).notifyRunFinalized;
     fn('run_xyz', { succeeded: 5, failed: 2 });
     const c = alerts.calls[0];
     assert.strictEqual(c.level, 'warn');
@@ -415,15 +481,32 @@ async function main() {
 
   await check('D6 never throws even if the Ad query rejects — boot must not crash on a Mongo blip', async () => {
     const alerts = makeAlertsStub();
+    // The thrown message is the Mongo-blip stand-in. The function's own
+    // catch logs `renderer[renderer-test]: alertOrphanedClaimsOnBoot failed
+    // — ECONNREFUSED`. That line is this stub, not a live connection:
+    // Ad.find is the in-memory thrower below, and E6 guarantees the
+    // harness never loads alertService. Capture the warn so a green run
+    // does not look like it reached the network.
     const AdStub = { find() { throw new Error('ECONNREFUSED'); } };
     const fn = loadOrphanFn(alerts, AdStub);
-    await assert.doesNotReject(() => fn());
+    const warnings = [];
+    const origWarn = console.warn;
+    console.warn = (...args) => { warnings.push(args.map(String).join(' ')); };
+    try {
+      await assert.doesNotReject(() => fn());
+    } finally {
+      console.warn = origWarn;
+    }
+    assert.ok(
+      warnings.some((w) => /alertOrphanedClaimsOnBoot failed — ECONNREFUSED/.test(w)),
+      'the catch path must log the handled Ad.find failure (WORKER_ID is the config stub)'
+    );
   });
 
   // ── D7–D11: the REAL captured filter, run against timed fixtures ──
   // Ad.find's stub does not evaluate Mongo; D3–D5 inject already-matching
   // docs to pin classification. These checks pin the QUERY itself by
-  // applying the filter object the extracted function actually issued.
+  // applying the filter object the isolated function actually issued.
   // D7 is the false-page this change exists to close.
 
   async function captureOrphanFilter() {
@@ -617,6 +700,22 @@ async function main() {
     assert.doesNotMatch(harnessSrc, /require\([^)]*alertService/);
     assert.doesNotMatch(harnessSrc, /require\([^)]*services\/renderer/);
     assert.match(harnessSrc, /notifyAsync\(opts\)\s*\{\s*calls\.push\(opts\)/);
+    // Live intercept, not a comment: isolatedRequire must return the
+    // in-memory stub for ./alertService. Matching the identifier anywhere
+    // in this file is not enough — a commented-out intercept plus the
+    // same text in a comment would keep a naive scan green while
+    // origRequire loaded the real Slack module.
+    const iso = functionBody(harnessSrc, /mod\.require = function isolatedRequire\(request\)\s*\{/);
+    const live = iso.split('\n').filter((l) => !/^\s*\/\//.test(l)).join('\n');
+    assert.match(live, /if \(id === ['"]\.\/alertService['"]\) return alerts;/);
+    assert.doesNotMatch(live, /origRequire\([^)]*alertService/);
+    // Leaf modules loaded for real must themselves stay leaves — their
+    // requires go through Module.prototype.require, not isolatedRequire.
+    for (const rel of REAL_RELATIVE) {
+      const leafSrc = fs.readFileSync(path.join(path.dirname(RENDERER_PATH), `${rel}.js`), 'utf8');
+      assert.doesNotMatch(leafSrc, /require\([^)]*alertService/);
+      assert.doesNotMatch(leafSrc, /require\(['"]\.\.\/config['"]\)/);
+    }
   });
 
   // ── report ───────────────────────────────────────────────────────────────
