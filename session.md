@@ -14,34 +14,38 @@ it clears it back to this placeholder.)_
 
 ## CURRENT STATE
 
-*(Written 2026-08-24. Worktree `/Volumes/Sayulita/Projects/RS/.wt-slackharness`,
-branch `fix/slack-harness-plumbing` off `origin/master` @ `a99afb1`.)*
+*(Written 2026-08-24. Worktree `/Volumes/Sayulita/Projects/RS/.wt-logosafe-adgen`,
+branch `port/logo-safe-area-to-adgen` off `origin/master` @ `e1063d2`.)*
 
-- **What this is.** Harness plumbing only. `verifyRendererSlackAlerts.js`
-  went 4/34 red on healthy master after #19 (`childTailsFrom` in
-  `notifyRenderFailure`). Production alerting was not broken. The A-tests
-  extract function bodies via `new Function` and injected only `alerts`,
-  so the new free name threw before `alerts.notifyAsync`.
-- **Option (b), not (a).** Bare `require` of renderer.js is blocked:
-  `config.js` `process.exit(1)` without `ADGEN_ROLE`+`MONGODB_URI`; the
-  file exports only `{ run, shutdown }`; the graph pulls mongoose/Atlas/
-  Slack; E6 forbids loading `alertService`. #13's recipe needed a
-  production export (`uploadRenderAndStamp`) — not done here. Isolated
-  `Module._compile` with a custom `require()`: stub `alertService` /
-  config / db / Ad, load leaf `renderErrorFields` + `concurrency` for
-  real, stub other relative requires as `{}`. Internals are re-exported
-  only in the compiled copy.
-- **ECONNREFUSED.** D6's in-memory `Ad.find` thrower. The function's
-  catch logs `renderer[renderer-test]: … failed — ECONNREFUSED`. Not a
-  live connection. D6 now captures that warn and asserts it.
-- **Proof.** 34/34. A1–A4 assertions byte-identical vs origin/master.
-  Mutation: hardcode static `level: 'error'` → A4 red (`'error' !==
-  'fatal'`). Extra used `require('os')` inside `notifyRenderFailure` →
-  still 34/34; extraction would have thrown. Reverted both. E6 still
-  forbids `require(alertService)` / `require(services/renderer)`.
-- **Suite after.** Same two expected reds as master:
-  `verifyArchiveDigestRelease` E3/E14, `verifyRunFinalizesOnSettle_KNOWN_OPEN`.
-- **Pushed.** PR against master. Do not merge.
+- **What this is.** Port of backend `fix/logo-safe-area` (`378d7b7d`) into
+  adgen. The composited brand mark was pasted flush to the QC box
+  (`left = right - logoW` against the un-inset edge). Vision QC is handed
+  the same `safeBoxInDeliveredPx` numbers and treats on-the-line as a
+  breach. Measured tonight: 14 of 21 static QC failures, two thirds, and
+  19 of 21 were regenerated first. Adgen renders every NEW ad, so the
+  backend fix was inert until this landed.
+- **Where it pastes.** Same compositor as backend. `finishPlate` resizes
+  via `logoResizeBox` + `fit:'inside'`, then
+  `layers.push({ input: toPlace, top: place.top, left: place.left })` at
+  `src/services/directImageRenderService.js:2155`. Inset is applied in
+  `logoPlacementFor` (the function that produces `place`), not at the
+  paste site. Square `logoResizeBox` and re-ink contrast untouched.
+- **Re-anchors.** Harness requires `../src/services/*` (not
+  `../services/*`). Q1/Q2 source scan is
+  `src/services/directImageRenderService.js`. No new `require('../config')`
+  from `src/services/` — the FILE vs DIRECTORY trap is unused here.
+- **Proof.** `verifyLogoSafeBox` 55/55 across the same 6 live surfaces as
+  backend (no harness-count delta). Mutation: `LOGO_INSET_FRAC=0` and
+  `LOGO_INSET_PX_FLOOR=0` → 15 failed, right/bottom margins 0 on every
+  surface (the exact defect). Restored. `verifyLogoColorPreservation`
+  82/82, `verifyBrandConsistency` 24/24, `verifyRatingFurniture` 130/130,
+  `verifyRequireGraph` 518/518, `verifyVendorDrift` 11/11. Suite after:
+  26/28 — same two expected reds as master (`verifyArchiveDigestRelease`
+  E3/E14, `verifyRunFinalizesOnSettle_KNOWN_OPEN`).
+- **Landed.** adgen PR #23 (`20568ae`) and backend PR #327 merged
+  together at 17:06Z. Do not re-open. Code on `origin/master` matches
+  this worktree (inset + harness + vendor reason). This session.md
+  commit is handoff only.
 
 ---
 
