@@ -68,6 +68,13 @@ it clears it back to this placeholder in the same commit that closes it out.)_
 
 *(Replace this whole section, don't append to it, when it goes stale.)*
 
+- **THIS WORKTREE (`fix/persist-child-stderr`, 2026-08-24):** declare
+  `renderError.stderrTail` / `stdoutTail` and copy them at persist time.
+  Tonight's run left 4/12 videos failed with only `remotion child exited
+  code=1 signal=none` — the child's stderr was captured then silently
+  dropped by mongoose strict mode (same trap as `predictionId`). Write-up:
+  `session.d/2026-08-24_persist-child-stderr-tails.md`. Pair with the
+  adgen PR on `.wt-stderrtail-adgen`. Do not merge until both are up.
 - **THIS WORKTREE (`fix/social-proof-renders-furniture`, 2026-08-24):**
   static `ai_social_proof_led` now demands a star-glyph widget instead of
   paraphrasing the rating into a headline. Kill switch

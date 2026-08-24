@@ -95,12 +95,14 @@ function adStage(adId, stage) {
  *
  * FIRE-AND-FORGET. Never throws. Never awaited.
  */
-function noteRenderIssue(adId, { message, stage, predictionId, charged, atlasCode } = {}) {
+function noteRenderIssue(adId, { message, stage, predictionId, charged, atlasCode, err } = {}) {
   if (adId == null || !message) return;
+  const { childTailsFrom } = require('./renderErrorFields');
   const renderError = {
     message: String(message).slice(0, 1000),
     stage:   stage ? String(stage) : 'unknown',
-    at:      new Date()
+    at:      new Date(),
+    ...childTailsFrom(err)
   };
   if (predictionId != null) renderError.predictionId = String(predictionId);
   if (charged === true)     renderError.charged = true;

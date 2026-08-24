@@ -78,6 +78,7 @@ const {
 const { summarizeEmptyExpansion, REASON: PER_PRODUCT_REASON } = require('../services/perProductReasons');
 const { assertGeneratablePlatformFormat, resolveExplicitFormats } = require('../services/platformFormats');
 const { renderCreative }        = require('../services/renderService');
+const { childTailsFrom }        = require('../services/renderErrorFields');
 const { generateForAd: veoGenerateForAd, prepareStoryboard: veoPrepareStoryboard } = require('../services/videoRouter');
 const { buildVideoSegmentUrl, buildPromptScaffold } = require('../services/atlasVideoService');
 const { buildGridPreviewVideoUrl } = require('../services/videoPreviewUrl');
@@ -2616,7 +2617,7 @@ async function renderDeriveOnlyVideoAd({
       {
         $set: {
           status: 'failed',
-          renderError: { message: tmsg, stage: 'titling', at: new Date() },
+          renderError: { message: tmsg, stage: 'titling', at: new Date(), ...childTailsFrom(titlingFailed) },
           renderStage: 'derived plate ready; titling failed',
           renderStageAt: new Date(),
           updatedAt: new Date(),
@@ -3075,7 +3076,7 @@ async function renderOneInner(run, job, adId, index, renderToken) {
             $set: {
               // Keep renderUrl = raw master. Do not delete the paid asset.
               status: 'failed',
-              renderError: { message: tmsg, stage: 'titling', at: new Date() },
+              renderError: { message: tmsg, stage: 'titling', at: new Date(), ...childTailsFrom(titlingFailed) },
               renderStage: 'master rendered; titling failed',
               renderStageAt: new Date(),
               updatedAt: new Date(),
@@ -3242,7 +3243,7 @@ async function renderOneInner(run, job, adId, index, renderToken) {
             // atlasErrorPolicy.js taxonomy (e.g. IMAGE_MODERATION_BLOCKED), so a
             // video master rejected for the same reason as its sibling statics
             // (one flagged catalog photo) is no longer invisible to this field.
-            renderError: { message: err.message || String(err), stage: 'veo', code: err.code || null, at: new Date() },
+            renderError: { message: err.message || String(err), stage: 'veo', code: err.code || null, at: new Date(), ...childTailsFrom(err) },
             updatedAt:   new Date()
           },
           $inc: { renderAttempts: 1 }
@@ -3355,7 +3356,8 @@ async function renderOneInner(run, job, adId, index, renderToken) {
               // the ads UI/API tell a content-policy rejection apart from a
               // bug or an outage without parsing renderError.message text.
               code:         result.error?.code || null,
-              at:           new Date()
+              at:           new Date(),
+              ...childTailsFrom(result.error)
             },
             // Keep vision QC verdict (incl. discarded paid URLs) on failure.
             ...(result.error?.visionQc ? { visionQc: result.error.visionQc } : {}),
@@ -3396,7 +3398,8 @@ async function renderOneInner(run, job, adId, index, renderToken) {
             predictionId: err.predictionId || err.cause?.predictionId || null,
             charged:      err.charged === true || err.cause?.charged === true,
             atlasCode:    err.atlasCode ?? err.cause?.atlasCode ?? null,
-            code:         err.code || err.cause?.code || null
+            code:         err.code || err.cause?.code || null,
+            ...childTailsFrom(err)
           },
           updatedAt:   new Date()
         },

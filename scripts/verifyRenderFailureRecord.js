@@ -45,7 +45,7 @@ console.log('\nverifyRenderFailureRecord\n');
 // Mongoose strips undeclared paths at SET time under strict mode, so simply
 // assigning and reading back is a true test of whether it would persist.
 console.log('A. Ad.renderError persists what is needed to recover a paid render');
-for (const f of ['message', 'stage', 'at', 'predictionId', 'charged', 'atlasCode']) {
+for (const f of ['message', 'stage', 'at', 'predictionId', 'charged', 'atlasCode', 'stderrTail', 'stdoutTail']) {
   truthy(`renderError.${f} is declared on the schema`, !!Ad.schema.path(`renderError.${f}`));
 }
 
