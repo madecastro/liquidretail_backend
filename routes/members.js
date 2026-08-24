@@ -10,6 +10,8 @@ const router  = express.Router();
 
 const User = require('../models/User');
 const AdvertiserMembership = require('../models/AdvertiserMembership');
+const requireMembershipRole = require('../middleware/requireMembershipRole');
+const { canActOnRole, canGrantRole } = requireMembershipRole;
 
 const VALID_ROLES = ['owner', 'admin', 'editor', 'viewer'];
 
@@ -55,7 +57,22 @@ router.get('/', async (req, res) => {
 // Body: { role: 'owner' | 'admin' | 'editor' | 'viewer' }
 // Promote / demote a member. Refuses to demote the last owner —
 // every Advertiser must have at least one owner.
-router.patch('/:userId', express.json(), async (req, res) => {
+//
+// AUTHZ (caller-role gate, added — see middleware/requireMembershipRole.js
+// for the full rationale): only owner/admin may call this route at all
+// (no self-target carve-out here, unlike DELETE below — self-promotion
+// must still be blocked, so a viewer/editor can never reach this handler
+// even against their own userId). Two further checks inside the handler,
+// once the target's CURRENT role is known:
+//   - canActOnRole: caller may not touch a member whose current role
+//     outranks the caller's own (an admin may not modify an owner).
+//   - canGrantRole: caller may not GRANT a role that outranks their own
+//     (blocks self-promotion, and blocks an admin from granting 'owner' —
+//     escalation-laundering via a role change is the same hole as via an
+//     invitation). Lowering one's own role is allowed by this check; the
+//     last-owner guard below still protects against removing the only
+//     owner.
+router.patch('/:userId', requireMembershipRole(['owner', 'admin']), express.json(), async (req, res) => {
   try {
     const role = String(req.body?.role || '').toLowerCase();
     if (!VALID_ROLES.includes(role)) {
@@ -68,6 +85,19 @@ router.patch('/:userId', express.json(), async (req, res) => {
       status:       'active'
     });
     if (!target) return res.status(404).json({ error: 'member not found' });
+
+    if (!canActOnRole(req.user.role, target.role)) {
+      return res.status(403).json({
+        error: 'cannot modify a member with a higher role than your own',
+        code:  'ROLE_FORBIDDEN'
+      });
+    }
+    if (!canGrantRole(req.user.role, role)) {
+      return res.status(403).json({
+        error: `only a role at or below your own (${req.user.role}) can be granted`,
+        code:  'ROLE_FORBIDDEN'
+      });
+    }
 
     // Last-owner guard: don't allow demoting the only owner.
     if (target.role === 'owner' && role !== 'owner') {
@@ -96,8 +126,15 @@ router.patch('/:userId', express.json(), async (req, res) => {
 // Revoke an active membership. Soft-deletes (status='revoked' +
 // audit fields) rather than hard-deleting so we keep an audit
 // trail. Last-owner guard applies. A user CAN revoke their own
-// membership (resign).
-router.delete('/:userId', async (req, res) => {
+// membership (resign) regardless of role — that legitimate case is why
+// requireMembershipRole is called with allowSelfTargetParam: 'userId'
+// below, so a viewer resigning is never blocked by the owner/admin gate.
+//
+// AUTHZ: a NON-self revoke requires owner/admin (route-level gate) AND
+// canActOnRole — caller rank must be >= the target's CURRENT role, so an
+// admin can never revoke an owner ("escalation-by-deletion"). Self-revoke
+// bypasses both, by design.
+router.delete('/:userId', requireMembershipRole(['owner', 'admin'], { allowSelfTargetParam: 'userId' }), async (req, res) => {
   try {
     const target = await AdvertiserMembership.findOne({
       advertiserId: req.advertiserId,
@@ -105,6 +142,14 @@ router.delete('/:userId', async (req, res) => {
       status:       'active'
     });
     if (!target) return res.status(404).json({ error: 'member not found' });
+
+    const isSelf = String(target.userId) === String(req.user.userId);
+    if (!isSelf && !canActOnRole(req.user.role, target.role)) {
+      return res.status(403).json({
+        error: 'cannot revoke a member with a higher role than your own',
+        code:  'ROLE_FORBIDDEN'
+      });
+    }
 
     if (target.role === 'owner') {
       const ownerCount = await AdvertiserMembership.countDocuments({

@@ -5,20 +5,65 @@ that routes to typed capabilities (`catalog.listProducts`, `ad.archive`,
 `ads.publishToMeta`, …) so the operator can inspect, mutate, and orchestrate
 without leaving the home page.
 
-**Currently gated OFF** in every env — `AGENT_ENABLED=false` in
-`config/defaults.env`. Flip per-env when the frontend chat drawer lands.
-When disabled, the endpoint returns `503 Service Unavailable` with a clear
-reason so the frontend can distinguish "feature off" from "backend missing".
+**Currently ON by default** — `AGENT_ENABLED=true` in `config/defaults.env`
+(line 1572). Set it to `false` per-env to disable. When disabled, the
+endpoint returns `503 Service Unavailable` with a clear reason so the
+frontend can distinguish "feature off" from "backend missing".
+(This section previously claimed the agent was gated OFF in every env. It
+was not, and that error made a live authorization hole read as unreachable —
+see "What the tier gates do NOT protect against" below.)
 
 ## The one rule that would have saved the most time
 
-**The client's `confirmations[]` array is the SOLE source of authorisation
-for Tier 1+ dispatch.** A rogue LLM that emits a tool call for `ad.archive`
-without operator input hits the server-side gate and gets a synthetic
-`{ ok:false, needsConfirmation:true }` result — it CANNOT self-confirm. Same
-for phrase gates (Tier 3) and spend gates (Tier 2+). If you're reading this
-because you want to bypass a gate: **don't**. The gates are the safety net.
-Every capability that ships must live under them.
+**The client's `confirmations[]` array is the sole thing standing between a
+tool_call and dispatch for Tier 1+.** A rogue LLM that emits a tool call for
+`ad.archive` without operator input hits the server-side gate and gets a
+synthetic `{ ok:false, needsConfirmation:true }` result — it CANNOT
+self-confirm. Same for phrase gates (Tier 3) and spend gates (Tier 2+). If
+you're reading this because you want to bypass a gate: **don't**. The gates
+are the safety net. Every capability that ships must live under them.
+
+## What the tier gates do NOT protect against
+
+Read this before you assume a capability is safe because it is Tier 3.
+
+The tier system defends against **the model**, not against **the caller**.
+`confirmations[]` and `explicitConfirmations` both arrive in the REQUEST
+BODY (`routes/agent.js:508-511`), and `working` — the whole message history,
+including the assistant `tool_calls` being replayed — is built verbatim from
+`req.body.messages` (`:523`). `replayConfirmations` (`:300-443`) then runs
+BEFORE any LLM call whenever `confirmations` is non-empty, dispatching those
+client-authored tool_calls directly. Concretely:
+
+- A confirmation is bound to a `tool_call.id` and NOTHING else — not the
+  capability id, not the tool name, not the arguments. The server keeps no
+  record of what was proposed (`:50-51`, "Server holds no chat state").
+- The `role:'tool'` stub the replay looks for is only checked for
+  EXISTENCE (`:319-327`); its `content` is never read. The code comment
+  saying hand-crafted history is skipped holds only when the client omits
+  the stub — supply one and the replay proceeds.
+- An `explicitConfirmation` phrase is a fixed string published in the
+  manifest and compared against a caller-supplied value. Any authenticated
+  caller can type `"REMOVE MEMBER"`.
+
+So: **tier + confirmation + phrase are UX friction and anti-LLM-self-confirm
+controls. They are NOT authorization.** An authenticated caller can invoke
+any capability at any tier with arguments of their choosing.
+
+**Therefore every capability that mutates permission-relevant state must
+enforce its own caller-role check inside the executor.** The `team.*`
+membership capabilities do this via
+`services/capabilityExecutors/_teamAuthzCommon.js`, which reuses the same
+`canActOnRole` / `canGrantRole` helpers as the HTTP routes
+(`middleware/requireMembershipRole.js`). `/api/agent` is mounted with
+`requireAuth` ONLY (`index.js:207-208`) — there is no role middleware on the
+agent path, and Express middleware cannot gate an executor anyway, because an
+executor is a plain `run({req, args})` function rather than a route layer.
+
+If you add a capability that changes who can do what, mirror that pattern.
+An executor whose header comment says "Mirrors `<some HTTP route>`" must
+mirror the route's AUTHORIZATION, not just its behaviour — four of them
+mirrored only the behaviour, and that was a live privilege-escalation hole.
 
 ---
 

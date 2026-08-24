@@ -9,13 +9,26 @@
 //
 // Tier 3 with phrase gate "INVITE MEMBER" per coverage plan §D3: an
 // invitation is externally visible state (shows in members UI, may
-// later drive email dispatch), and revoking is a separate step.
+// later drive email dispatch), and revoking is a separate step. That
+// phrase is caller-supplied UX friction, NOT an authorization control.
+//
+// AUTHZ — mirrors the route's caller-role gate, previously omitted here
+// (see _teamAuthzCommon.js). Without it any active member, including a
+// `viewer`, could mint invitations at any role in VALID_ROLES:
+//   - manager gate — owner|admin only.
+//   - canGrantRole — cap the invited role by the inviter's own rank.
+// canGrantRole is a no-op against the CURRENT VALID_ROLES (its maximum,
+// admin=2, is already dominated by both owner=3 and admin=2), exactly as
+// on the route. It is enforced explicitly anyway because VALID_ROLES is a
+// static list that could grow: if 'owner' were ever added, an admin
+// minting an owner would be escalation laundering.
 
 'use strict';
 
 const AdvertiserMembership = require('../../models/AdvertiserMembership');
 const { generateInviteToken } = require('../../models/AdvertiserMembership');
 const User = require('../../models/User');
+const { requireManagerRole, requireCanGrant } = require('./_teamAuthzCommon');
 
 const VALID_ROLES = ['admin', 'editor', 'viewer'];   // owner never invited — first user only
 
@@ -32,6 +45,15 @@ async function run({ req, args }) {
   if (!VALID_ROLES.includes(role)) {
     return { ok: false, error: `role must be one of: ${VALID_ROLES.join(', ')}` };
   }
+  // Manager gate: after shape validation (which touches no data), but BEFORE
+  // the membership lookups below — an unauthorized caller must not be able to
+  // probe which emails are already members of this advertiser.
+  const notManager = requireManagerRole(req);
+  if (notManager) return notManager;
+  // AFTER the VALID_ROLES check, never before — canGrantRole ranks an
+  // unrecognised role -Infinity and would wave a garbage string through.
+  const cannotGrant = requireCanGrant(req, role);
+  if (cannotGrant) return cannotGrant;
 
   // Active-member guard.
   const existingActive = await AdvertiserMembership.findOne({

@@ -17,6 +17,8 @@ const User       = require('../models/User');
 const AdvertiserMembership = require('../models/AdvertiserMembership');
 const { generateInviteToken } = require('../models/AdvertiserMembership');
 const requireUserOnly = require('../middleware/requireUserOnly');
+const requireMembershipRole = require('../middleware/requireMembershipRole');
+const { canGrantRole } = requireMembershipRole;
 
 const VALID_ROLES = ['admin', 'editor', 'viewer'];   // owner can't be invited; only first user gets owner
 
@@ -28,7 +30,18 @@ const VALID_ROLES = ['admin', 'editor', 'viewer'];   // owner can't be invited; 
 // Body: { email: string, role?: 'admin'|'editor'|'viewer' }
 // Creates a pending membership row + returns the invite URL the
 // caller can copy/email to the invitee.
-router.post('/', express.json(), async (req, res) => {
+//
+// AUTHZ: only owner/admin may invite (route-level gate below). VALID_ROLES
+// already excludes 'owner' structurally (comment above — "only first user
+// gets owner"), so canGrantRole is a no-op against the CURRENT role set
+// (both owner=3 and admin=2 already dominate every invitable role, whose
+// max is admin=2). It is still enforced explicitly — not just implied by
+// VALID_ROLES — because VALID_ROLES is a static list that could grow, and
+// "cap the invitable role by the inviter's own role" (owner directive) must
+// keep holding if it ever does: an admin inviting a new owner would be
+// escalation laundering, structurally identical to the PATCH self-promotion
+// hole this PR closes elsewhere.
+router.post('/', requireMembershipRole(['owner', 'admin']), express.json(), async (req, res) => {
   try {
     const email = String(req.body?.email || '').trim().toLowerCase();
     const role  = String(req.body?.role || 'editor').toLowerCase();
@@ -37,6 +50,12 @@ router.post('/', express.json(), async (req, res) => {
     }
     if (!VALID_ROLES.includes(role)) {
       return res.status(400).json({ error: `role must be one of ${VALID_ROLES.join(', ')}` });
+    }
+    if (!canGrantRole(req.user.role, role)) {
+      return res.status(403).json({
+        error: `only a role at or below your own (${req.user.role}) can be invited`,
+        code:  'ROLE_FORBIDDEN'
+      });
     }
 
     // If this email already has an ACTIVE membership for this
@@ -105,7 +124,12 @@ router.get('/', async (req, res) => {
 // DELETE /api/invitations/:id
 // Revoke a pending invite. Active memberships go through
 // DELETE /api/members/:userId instead.
-router.delete('/:id', async (req, res) => {
+//
+// AUTHZ: only owner/admin may cancel a pending invite. Unlike the members
+// PATCH/DELETE routes, there is no rank-vs-target-role comparison here —
+// a pending invitation has not granted anyone any access yet, so canceling
+// one cannot be an escalation regardless of what role it was offered at.
+router.delete('/:id', requireMembershipRole(['owner', 'admin']), async (req, res) => {
   try {
     const inv = await AdvertiserMembership.findOne({
       _id:          req.params.id,
