@@ -36,7 +36,7 @@ const { isHtmlPipeline, DIRECT_IMAGE } = require('./staticPipeline');
 // Defence in depth. layoutInputService already withholds these at pool
 // assembly, so this gate should never fire — it exists because an artifact
 // cached before the producer-side filter landed can still carry one.
-const { toPrintableCustomerQuote, applyStrictQuoteScope } = require('./quoteProvenance');
+const { toPrintableCustomerQuote, applyStrictQuoteScope, usableAttribution } = require('./quoteProvenance');
 const { formatDisplayRating, resolveCoherentSocialProof, brandAttributionLabel } = require('./ratingDisplay');
 // THE sanctioned concept reader. Direct reads of concept.rationale on this
 // path are how private Director reasoning became art direction on 2026-08-01.
@@ -1693,7 +1693,8 @@ function buildIntentData({ concept, layoutInput, brand, product = null, cta, cam
     // said the words on 80 live artifacts — and then to "Verified buyer" or
     // "Anonymous Customer", which assert things about a person we cannot name.
     // An unattributed real quote is honest. An attributed fake is not.
-    attribution: quoteText && quote?.author_name ? String(quote.author_name).trim() : undefined,
+    // usableAttribution drops a bare initial so "D" cannot render as "— D".
+    attribution: quoteText ? (usableAttribution(quote?.author_name) ?? undefined) : undefined,
     // The Director's line (or cascade when BRAND_LED_COPY). Not the product
     // name — that is dropped entirely by owner instruction and is separately
     // forbidden in the absence block.
