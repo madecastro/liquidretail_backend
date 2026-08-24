@@ -121,7 +121,7 @@ const SEED_FORK_REASONS = {
   'services/brandScriptExecutor.js':
     'adgen video QC/titling path (Remotion child OOM/timeout); colourway gate hunk-ported from backend #324',
   'services/directImageRenderService.js':
-    'deliberate fork: adgen owns usableAttribution, composeCorrectiveOverride, buildQcRetryArgs, submitEditImageWithSeedFallback; colourway gate hunk-ported from backend #324',
+    'deliberate fork: adgen owns usableAttribution, composeCorrectiveOverride, buildQcRetryArgs, submitEditImageWithSeedFallback; colourway gate hunk-ported from backend #324; logo-safe-box inset hunk-ported from backend fix/logo-safe-area',
   'services/fontClassification.js':
     'UNPORTED: backend #323 icon-font role-evidence drop (port in flight at seed)',
   'services/plateIntelService.js':

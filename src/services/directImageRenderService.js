@@ -1089,11 +1089,42 @@ function logoPlacementFor({ surface, dims, logoW, logoH }) {
     top = Math.max(top, Math.round(floor.top * dims.height));
     bottom = Math.min(bottom, dims.height - Math.round(floor.bottom * dims.height));
   }
+  // Strict interior of the QC-declared box. Aligning flush (`right - logoW`
+  // against the un-inset edge) is what the 2026-08-24 layout_safe_box
+  // failures measured: vision QC is handed the same safeBoxInDeliveredPx
+  // numbers and treats a mark sitting ON those coordinates as a breach.
+  // The frame-gap harness stayed green because the box is already inset
+  // from the frame. See LOGO_INSET_FRAC.
+  const inset = logoInsetPx(dims);
+  left += inset;
+  right -= inset;
+  top += inset;
+  bottom -= inset;
   if (!(logoW > 0 && logoH > 0)) return null;
   if (right - left < logoW || bottom - top < logoH) return null;
-  // Bottom-right of the clamped box. Inside it by construction, so there is no
-  // second adjustment that could invalidate the guarantee above.
+  // Bottom-right of the inset box. Strictly inside the QC box and the
+  // platform floor by construction (inset ≥ 1px on every live canvas).
   return { top: bottom - logoH, left: right - logoW, width: logoW, height: logoH };
+}
+
+/**
+ * Extra inset on top of the text-box ∩ platform-floor intersection, so the
+ * composited mark cannot sit ON the box edge the vision-QC inspector is
+ * given. 2% of the delivered short edge (~22px on 1080, ~13px on 628) —
+ * one third of Meta's 6% text margin. Large enough for a vision inspector
+ * to see, small enough that the mark stays in the reserved corner. Floor
+ * 8px so a tiny canvas still has a visible gap.
+ *
+ * This does NOT shrink the square resize box (that was the stacked-lockup
+ * legibility fix). It only moves the already-sized mark up and left.
+ */
+const LOGO_INSET_FRAC = 0.02;
+const LOGO_INSET_PX_FLOOR = 8;
+
+function logoInsetPx(dims) {
+  const short = Math.min(dims && dims.width, dims && dims.height);
+  if (!(short > 0)) return LOGO_INSET_PX_FLOOR;
+  return Math.max(LOGO_INSET_PX_FLOOR, Math.round(LOGO_INSET_FRAC * short));
 }
 
 /**
@@ -3023,7 +3054,10 @@ module.exports = {
   extractFor,
   logoPlacementFor,
   logoResizeBox,
+  logoInsetPx,
   LOGO_BOX_FRAC,
+  LOGO_INSET_FRAC,
+  LOGO_INSET_PX_FLOOR,
   LOGO_CHROMA_THRESHOLD,
   LOGO_MIN_INK_CONTRAST,
   LOGO_SAFE_MARGIN_PCT,

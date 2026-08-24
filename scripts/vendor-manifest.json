@@ -2,7 +2,7 @@
   "version": 1,
   "backendRef": "origin/main",
   "backendHead": "36aedfa35e671da580d3e1d323431f431752b576",
-  "generatedAt": "2026-08-24T15:13:18.809Z",
+  "generatedAt": "2026-08-24T16:59:12.246Z",
   "files": {
     "models/Ad.js": {
       "backendHash": "8e4951d5a020ada681e2e83f4c1869faf4e74e00b6c4afa1a7de71105b72aca4",
@@ -707,7 +707,7 @@
       "backendHash": "730ca69ee7cd2aee12dcc7f53a27f0f37daa70d358c5cc6d8a9c8e2f5a9710b4",
       "backendSha": "d8c133011275d62fa4133ed939b5e47fe5e90bdc",
       "status": "fork",
-      "reason": "deliberate fork: adgen owns usableAttribution, composeCorrectiveOverride, buildQcRetryArgs, submitEditImageWithSeedFallback; colourway gate hunk-ported from backend #324"
+      "reason": "deliberate fork: adgen owns usableAttribution, composeCorrectiveOverride, buildQcRetryArgs, submitEditImageWithSeedFallback; colourway gate hunk-ported from backend #324; logo-safe-box inset hunk-ported from backend fix/logo-safe-area"
     },
     "services/enrichmentReconciler.js": {
       "backendHash": "18319b9414c7c67c332f03cbb7870c42048dace067a55523f54b7ea16c071649",
