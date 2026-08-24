@@ -422,11 +422,21 @@ try {
   console.log('E. fallback, intent data, scope label');
   {
     const on = loadIntents(undefined);
-    // E1 — no rating still falls back. Furniture cannot run hollow.
+    // E1 — genuinely no proof (no rating, no quote) still falls back.
+    // Furniture cannot run hollow.
+    //
+    // UPDATED 2026-08-24 (STATIC_SOCIAL_PROOF_QUOTE_ELIGIBLE, orthogonal
+    // flag, default ON): a quote-ONLY render — the case this check used to
+    // exercise (`{quote: 'Love these.', cta: 'Shop Now'}`) — now RESOLVES
+    // social_proof_led directly rather than falling back; that is the
+    // owner-directed behaviour change, covered by
+    // scripts/verifyStaticIntentChanges.js, not a regression here. This
+    // check narrows to the still-true invariant: with NEITHER a rating NOR a
+    // quote, social_proof_led has no proof to be and must still fall back.
     const noRating = on.resolveIntent('social_proof_led', {
-      quote: 'Love these.', cta: 'Shop Now'
+      cta: 'Shop Now'
     });
-    check('E1 no rating: social_proof_led falls back (not a hollow claim)',
+    check('E1 no proof at all: social_proof_led falls back (not a hollow claim)',
       noRating.key !== 'social_proof_led' && noRating.fellBackFrom === 'social_proof_led');
 
     // E2 — brand_led with no headline + a rating lands on social_proof_led
@@ -447,10 +457,17 @@ try {
       (descentPrompt.prompt || '').includes('review widget')
       && descentPrompt.resolved.key === 'social_proof_led');
 
-    // E3 — RATING is core, so density cannot drop it. Furniture is always
-    // reachable when the intent is eligible.
-    check('E3 social_proof_led.core is [RATING]',
-      JSON.stringify(on.INTENTS.social_proof_led.core) === JSON.stringify(['RATING']));
+    // E3 — RATING is core for a rating-bearing render, so density cannot
+    // drop it. Furniture is always reachable when the intent is eligible.
+    //
+    // UPDATED 2026-08-24: `core` is now a function of the data (see
+    // SOCIAL_PROOF_QUOTE_ELIGIBLE / staticAdIntents.js), not the literal
+    // ['RATING'] this checked before — a quote-only render needs
+    // ['CUSTOMER QUOTE'] as core instead (verifyStaticIntentChanges.js). The
+    // invariant this check actually protects — a rating-bearing render's
+    // core is ['RATING'] — still holds and is what this now asserts.
+    check('E3 social_proof_led.core(rating-bearing data) is [RATING]',
+      JSON.stringify(on.INTENTS.social_proof_led.core(PROOF_DATA)) === JSON.stringify(['RATING']));
 
     // E4 — buildIntentData still hands over scoped reviewsText. Do not
     // remove the scope label; relocate how it is drawn.

@@ -1453,11 +1453,39 @@ async function optionalImage(url) {
 // With BRAND_LED_COPY off, ai_brand_led is absent from the map so
 // intentForTemplate returns DEFAULT_INTENT and INTENTS.brand_led is unreachable
 // (it is not in FALLBACK_ORDER, so it can only be selected as an explicitly
-// requested intent). ai_ugc_led / ai_editorial stay on the default intent —
-// out of scope.
+// requested intent). ai_editorial stays on the default intent — out of scope
+// (it needs its own authored intent; separate work).
+//
+// ai_ugc_led -> objection_resolved, owner-approved 2026-08-24. The Director is
+// explicitly instructed for creative_style='ugc_led' to write copy "in the
+// reviewer's/creator's own register — first person, casual, unpolished. Not
+// marketing voice" (aiCreativeDirectorService.js), but the ugc_led schema has
+// no dedicated quote field for that — it lands in copy.headline like any
+// other style's copy. Left on DEFAULT_INTENT (product_first_lifestyle), that
+// headline prints unconditionally as BRAND LINE, a slot with NO provenance
+// gate — unlike CUSTOMER QUOTE, which every d.quote on this path has already
+// passed through toPrintableCustomerQuote / applyStrictQuoteScope /
+// applyQuoteColourway (buildIntentData below). So a first-person "I tried
+// this and love it" line was shipping as brand voice, unverified, 100% of the
+// time for this template. objection_resolved's core IS CUSTOMER QUOTE
+// (d.quote, never d.headline) and is eligible only when a REAL, gated
+// customer quote exists, so ugc_led copy now either prints through that same
+// gate or the intent is ineligible and the render falls back through
+// FALLBACK_ORDER instead of printing untraced.
+//
+// Known residual, not closed by this one-line map: when a ugc_led render has
+// NEITHER a gated quote NOR a rating, resolveIntent's chain
+// ['objection_resolved', 'social_proof_led', 'product_first_lifestyle']
+// bottoms out at product_first_lifestyle, which still prints d.headline as
+// BRAND LINE ungated — same exposure as today, just narrowed to that one
+// case instead of every ai_ugc_led render. Closing that residual needs
+// buildIntentData to stop feeding the Director's ugc_led headline into
+// `headline` at all (or a dedicated ugc_led intent, like ai_editorial) —
+// out of scope here.
 const TEMPLATE_INTENT = {
   ai_social_proof_led: 'social_proof_led',
   ai_promotional: 'objection_resolved',
+  ai_ugc_led: 'objection_resolved',
   ...(BRAND_LED_COPY ? { ai_brand_led: 'brand_led' } : {})
 };
 const DEFAULT_INTENT = 'product_first_lifestyle';

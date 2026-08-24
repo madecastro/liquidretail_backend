@@ -760,9 +760,37 @@ const INTENTS = {
         : 'A stranger scrolling past should understand, before reading a word of body copy, that many real people already bought this and rate it highly.';
     },
     renders: { rendersQuote: true, rendersRating: true, rendersBadge: true },
-    core: ['RATING'],
-    /** Eligibility, from the owner brief: this intent IS the rating. */
-    eligible: (d) => d.rating ? null : 'no rating — this intent is the rating',
+    /**
+     * `core` states which role density must never sacrifice. It was a plain
+     * array because eligibility used to guarantee a rating always exists by
+     * the time this runs. SOCIAL_PROOF_QUOTE_ELIGIBLE (below) breaks that
+     * guarantee, so `core` is now a function of the data — same shape as
+     * `eligible` / `goal` / `emphasis` / `text` elsewhere in this object.
+     * applyDensity resolves either shape (see there).
+     *
+     * Rating wins whenever one exists — byte-identical to the pre-change
+     * literal for every rating-bearing render, flag on or off. The quote is
+     * core only in the render this change exists to serve: no rating, a
+     * usable quote, flag on. Flag off can never reach that branch anyway —
+     * `eligible` below still requires a rating — so the `!SOCIAL_PROOF_
+     * QUOTE_ELIGIBLE` arm is belt-and-suspenders, not load-bearing.
+     */
+    core: (d) => (d.rating || !SOCIAL_PROOF_QUOTE_ELIGIBLE) ? ['RATING'] : ['CUSTOMER QUOTE'],
+    /**
+     * Eligibility, from the owner brief: this intent IS the proof.
+     *
+     * Owner directive, 2026-08-24: "a social proof led ad doesn't require a
+     * rating, if there is positive social proof that we can use in the form
+     * of a quote, that is OK also." SOCIAL_PROOF_QUOTE_ELIGIBLE (default ON,
+     * defined below) widens this from rating-only to rating-OR-a-usable-
+     * quote. `d.quote` reaching here has already cleared
+     * toPrintableCustomerQuote / applyStrictQuoteScope / applyQuoteColourway
+     * in buildIntentData — real customer proof, not an invented one. Flag
+     * off restores the exact pre-change rating-only line.
+     */
+    eligible: (d) => (d.rating || (SOCIAL_PROOF_QUOTE_ELIGIBLE && d.quote))
+      ? null
+      : 'no rating or usable quote — this intent is the proof',
     // Third arg `ctx` optional so flag-off / non-preserve callers stay
     // byte-identical. Preserve-aware emphasis ranks type/chrome over the
     // existing plate — never re-composition of the photograph.
@@ -807,8 +835,16 @@ const INTENTS = {
       // as that SKU's own review volume. Falls back to the pre-change unscoped
       // template only when reviewsText is absent (flag off, or a caller that
       // never ran the coherence gate) so behaviour there is unchanged.
-      ['RATING', d.reviewsText ? `${d.rating} ★ (${d.reviewsText})`
-        : d.reviewCount ? `${d.rating} ★ (${d.reviewCount} reviews)` : `${d.rating} ★`],
+      //
+      // Gated on d.rating — required once SOCIAL_PROOF_QUOTE_ELIGIBLE can
+      // reach this with no rating at all. The literal tuple below is
+      // byte-identical to before for every rating-bearing render (the only
+      // reachable case pre-change); without the guard, a rating-less render
+      // would print the literal string "undefined ★" and simultaneously
+      // contradict the "no numeric score" line absences() emits for the same
+      // data.
+      d.rating ? ['RATING', d.reviewsText ? `${d.rating} ★ (${d.reviewsText})`
+        : d.reviewCount ? `${d.rating} ★ (${d.reviewCount} reviews)` : `${d.rating} ★`] : null,
       d.quote ? ['CUSTOMER QUOTE', `"${d.quote}"`] : null,
       d.quote && d.attribution ? ['ATTRIBUTION', `— ${d.attribution}`] : null,
       d.badge ? ['BADGE', d.badge] : null,
@@ -982,16 +1018,20 @@ function resolveIntent(requested, d) {
  * button) — CTA staying OUT of the count means that class of bug cannot recur
  * on any surface, not just the one that got manually checked.
  */
-function applyDensity(text, spec, policy) {
+function applyDensity(text, spec, policy, data = {}) {
   const kept = text.slice();
   const dropped = [];
   const budget = policy.maxTextElements ?? Infinity;
+  // `core` is a literal array on every intent except social_proof_led, whose
+  // core depends on the data (see SOCIAL_PROOF_QUOTE_ELIGIBLE below) —
+  // resolve either shape here rather than special-casing one intent.
+  const core = typeof spec.core === 'function' ? spec.core(data) : spec.core;
   // Prose count for the budget check — CTA is present in `kept`/rendered
   // output the whole time; it just never counts against or displaces prose.
   const proseCount = (list) => list.filter(([r]) => r !== 'CTA BUTTON').length;
   for (const role of SACRIFICE_ORDER) {
     if (proseCount(kept) <= budget) break;
-    if (spec.core.includes(role)) continue;
+    if (core.includes(role)) continue;
     const i = kept.findIndex(([r]) => r === role);
     if (i === -1) continue;
     dropped.push(...kept.splice(i, 1).map(([r]) => r));
@@ -1075,6 +1115,36 @@ const RATING_FURNITURE = ratingFurnitureEnabled();
 const RATING_FURNITURE_NOTE = 'The rating line is a review widget, not copy. Draw star glyphs whose fill matches the numeral (do not snap 4.8 to a half-star), then the numeral, then the parenthetical count as a small qualifier on that number. The glyph row is how that rating line is drawn — it is required, not extra copy, and not a violation of SET EXACTLY THESE STRINGS. Do not rewrite it as a headline or claim sentence — "Rated 5 stars by everyone" and "5-star brand-wide rating" are failures. Words in parentheses (including "brand reviews") qualify the count; they are not a headline.';
 
 const RATING_FURNITURE_ABSENCE = 'no rating written as a sentence or headline — never "Rated X stars", "X-star rating", "by everyone", "everyone who\'s tried them", "universally", "all customers"; the rating exists only as the star-glyph widget named above';
+
+/**
+ * SOCIAL PROOF QUOTE ELIGIBLE — kill switch, default ON.
+ *
+ * Owner directive, 2026-08-24: "a social proof led ad doesn't require a
+ * rating, if there is positive social proof that we can use in the form of
+ * a quote, that is OK also." Before this, INTENTS.social_proof_led.eligible
+ * was rating-only, so a product with a strong, provenance-cleared customer
+ * quote but no numeric rating failed this intent and fell back through
+ * FALLBACK_ORDER to objection_resolved instead.
+ *
+ * KNOWN CONSEQUENCE, stated so nobody re-discovers it as a bug: FALLBACK_ORDER
+ * is ['social_proof_led', 'objection_resolved', 'product_first_lifestyle'].
+ * A quote-only render that used to fail social_proof_led and land on
+ * objection_resolved now passes social_proof_led directly instead — a real
+ * creative-output change (different slot set, different emphasis order,
+ * different prompt framing) for every quote-only, no-rating render, not just
+ * an eligibility technicality. See the PR that shipped this flag for the
+ * before/after comparison.
+ *
+ * `false` restores BOTH halves byte-identically together, same pattern as
+ * every other kill switch in this file: a widened `eligible` with an
+ * unwidened `core` would let a quote-only render pass eligibility and then
+ * still demand a RATING density slot no rating-less `text()` output can fill.
+ *   - eligible reverts to rating-only.
+ *   - core reverts to effectively always ['RATING'] (see there) — though
+ *     since eligible is rating-only again, core is never actually called
+ *     with a rating-less `d` either way; this is belt-and-suspenders.
+ */
+const SOCIAL_PROOF_QUOTE_ELIGIBLE = process.env.STATIC_SOCIAL_PROOF_QUOTE_ELIGIBLE !== 'false';
 
 /** The exact pre-2026-08-03 wording. Do not edit — it is the A/B control arm. */
 const LEGACY_PRODUCT_FIDELITY = `The supplied photograph is a PRODUCT REFERENCE ONLY. Reproduce this exact item faithfully — its colour, material, construction and any branding printed on the product itself — then build an entirely new scene around it. Do not reuse the reference's background, crop or lighting.`;
@@ -1423,7 +1493,7 @@ function buildPrompt({ intentKey, data, product, surface, seedStyle = null, vari
 
   let text = spec.text({ ...data, cta: data.cta });
   if (!effectivePolicy.drawCta) text = text.filter(([r]) => r !== 'CTA BUTTON');
-  const { kept, dropped } = applyDensity(text, spec, effectivePolicy);
+  const { kept, dropped } = applyDensity(text, spec, effectivePolicy, data);
 
   const keptRoles = new Set(kept.map(([r]) => r));
   const kept_ = (role) => keptRoles.has(role);
@@ -1606,6 +1676,7 @@ module.exports = {
   RATING_FURNITURE,
   RATING_FURNITURE_NOTE,
   RATING_FURNITURE_ABSENCE,
+  SOCIAL_PROOF_QUOTE_ELIGIBLE,
   // Phase B PMax static overlay — harnesses call these directly.
   PMAX_STATIC_PLATFORM_NOTES,
   PLATFORM_NOTES,
