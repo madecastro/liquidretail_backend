@@ -655,10 +655,56 @@ const INTENTS = {
      * Flag-off returns the pre-change string byte-for-byte. Flag-on drops
      * "many real people … rate it highly", which invited the model to write
      * "by everyone" as the takeaway instead of drawing the widget.
+     *
+     * RATING-LESS ARM, 2026-08-24. Both strings below assert a rating exists:
+     * one orders the widget drawn, the other says people "rate it highly".
+     * That was safe while `eligible` was rating-only, and stops being safe the
+     * moment this intent can run on a quote alone
+     * (STATIC_SOCIAL_PROOF_QUOTE_ELIGIBLE). Measured directly on a quote-only
+     * render: the goal demanded a rating widget while `absences` — correctly,
+     * for the same data — emitted "no numeric score, star glyphs or trust mark
+     * of any kind". That is the self-contradictory-prompt class this file has
+     * already paid for twice (the RATING_FURNITURE catch-all carve-out;
+     * product_first_lifestyle's "nothing but the product and a line" on a
+     * zero-text render). Never describe an element the prompt may not carry.
+     *
+     * PREDICATE — `kept('RATING')`, not `d.rating`. The two are equivalent for
+     * this intent: `text()` emits a RATING tuple only when `d.rating` is
+     * present, and `core` names RATING so `applyDensity` can never sacrifice
+     * it, hence kept('RATING') ⇔ d.rating. `kept()` is additionally the exact
+     * predicate `buildPrompt` uses to compute `furnitureRating`, which is what
+     * selects the absence line this goal was contradicting — so keying both
+     * off `kept()` makes the contradiction unrepresentable rather than merely
+     * fixed once.
+     *
+     * BYTE-IDENTITY. Every rating-bearing render takes the `kept('RATING')`
+     * branch and gets the two pre-change strings unchanged, on BOTH arms of
+     * RATING_FURNITURE. With STATIC_SOCIAL_PROOF_QUOTE_ELIGIBLE off — or
+     * before it exists — `eligible` is rating-only, so the rating-less branch
+     * is unreachable and every prompt this intent produces is byte-identical
+     * to today's.
      */
-    goal: (kept, ctx = {}) => RATING_FURNITURE
-      ? 'A stranger scrolling past should see the rating widget — star glyphs, the numeral, the count — before they read a word of body copy. The rating is those marks, not a sentence about them.'
-      : 'A stranger scrolling past should understand, before reading a word of body copy, that many real people already bought this and rate it highly.',
+    goal: (kept, ctx = {}) => {
+      if (!kept('RATING')) {
+        // Belt-and-suspenders, unreachable by construction: `eligible`
+        // guarantees a rating or a quote, and whichever exists is `core`, so
+        // density cannot leave this intent with neither. Stated rather than
+        // assumed, because the hollow case is precisely the one that must not
+        // promise proof it has none of.
+        if (!kept('CUSTOMER QUOTE')) {
+          return 'A stranger scrolling past should want this product on the strength of the photograph alone. This ad carries no proof, and it must not imply any.';
+        }
+        // No score to point at, so the customer's sentence IS the proof.
+        // "not as a slogan written for them" is the same fence the furniture
+        // arm sets with "not a sentence about them": the measured failure on
+        // borrowed-proof copy is the model rewriting it into brand voice (see
+        // TEMPLATE_INTENT.ai_ugc_led, directImageRenderService).
+        return 'A stranger scrolling past should register, before they read a word of anything else, that a real customer already bought this and said so. That customer\'s own sentence is the proof this ad rests on, and it has to read as something a person said — not as a slogan written for them.';
+      }
+      return RATING_FURNITURE
+        ? 'A stranger scrolling past should see the rating widget — star glyphs, the numeral, the count — before they read a word of body copy. The rating is those marks, not a sentence about them.'
+        : 'A stranger scrolling past should understand, before reading a word of body copy, that many real people already bought this and rate it highly.';
+    },
     renders: { rendersQuote: true, rendersRating: true, rendersBadge: true },
     core: ['RATING'],
     /** Eligibility, from the owner brief: this intent IS the rating. */
@@ -666,12 +712,35 @@ const INTENTS = {
     // Third arg `ctx` optional so flag-off / non-preserve callers stay
     // byte-identical. Preserve-aware emphasis ranks type/chrome over the
     // existing plate — never re-composition of the photograph.
+    //
+    // RATING-LESS ARM, 2026-08-24 — same defect, same predicate and same
+    // byte-identity argument as `goal` above. The rating entry was the only
+    // UNGUARDED line in this list; every other one is already
+    // `kept(ROLE) ? … : null`. Guarding it the same way is what stops "the
+    // rating" being ranked #2 in WHAT SHOULD WIN ATTENTION on a render whose
+    // absences section bans every rating mark. `d.reviewCount` still selects
+    // the wording INSIDE the guarded branch, so a rating-bearing render's list
+    // is byte-identical; `.filter(Boolean)` already renumbers, so dropping the
+    // entry needs no other change.
+    //
+    // The promoted quote wording fires only when there is no rating. It names
+    // the quote as PROOF rather than a headline (the borrowed-proof failure
+    // mode) and deliberately keeps the product at #1 — this intent's owner
+    // brief is "product image dominates", which is what still distinguishes it
+    // from objection_resolved, where the customer's sentence outranks the
+    // product and is "the whole ad".
     emphasis: (d, kept, ctx = {}) => [
       ctx.preserve
         ? 'the product as the photograph already presents it — desirable as shown'
         : 'the product itself, shown large and desirable',
-      d.reviewCount ? 'the rating and how many people gave it' : 'the rating',
-      kept('CUSTOMER QUOTE') ? "the customer's own words" : null,
+      kept('RATING')
+        ? (d.reviewCount ? 'the rating and how many people gave it' : 'the rating')
+        : null,
+      kept('CUSTOMER QUOTE')
+        ? (kept('RATING')
+          ? "the customer's own words"
+          : "the customer's own words, set as the proof this ad rests on rather than as a headline")
+        : null,
       kept('BADGE') ? 'the badge, quietly' : null,
       kept('CTA BUTTON') ? 'the CTA, unmissable but not shouting' : null
     ].filter(Boolean),
