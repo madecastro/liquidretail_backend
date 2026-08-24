@@ -1066,12 +1066,21 @@ async function buildMetaForAd(ad, brand, opts = {}) {
   // burned primary_quote.snippet. Rotate BEFORE the gate so the gate still
   // has the final word; rotation itself refuses lines the gate would drop
   // so flag-on cannot lose a testimonial flag-off would have printed.
+  //
+  // colourwayTitle is ONE value shared by rotation and paint. Catalog
+  // title first (raw pipe form); display-normalized layoutInput name
+  // is the fallback. Paint used to drop the catalog title, so the two
+  // sites could disagree on a colourway after display-normalize
+  // flattened `|` to ` - `.
+  const colourwayTitle = catalogProduct?.title
+    || layoutInput?.input?.product?.name
+    || null;
   {
     const rot = require('./quoteRotationService');
     const runId = rot.campaignRunIdFromAd(ad);
     const rotateScope = {
       productAttached: !!ad.productId,
-      productTitle: layoutInput?.input?.product?.name || catalogProduct?.title || null,
+      productTitle: colourwayTitle,
       extraText: layoutInput?.input?.product?.name || null,
       media: scopeMedia
     };
@@ -1095,7 +1104,7 @@ async function buildMetaForAd(ad, brand, opts = {}) {
 
   layoutInput = gateLayoutInputQuotes(layoutInput, {
     productAttached: !!ad.productId,
-    productTitle: layoutInput?.input?.product?.name || null,
+    productTitle: colourwayTitle,
     extraText: layoutInput?.input?.product?.name || null,
     media: scopeMedia
   });

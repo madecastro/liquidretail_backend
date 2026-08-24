@@ -2702,7 +2702,12 @@ async function assembleInput(ctx, template, aspectRatio, options, derivation, pr
   // prints from. One definition each — two copies of the provenance stamp is
   // how the pick and the print silently disagree about which quote won.
   const productReviewsForMatch = productReviewsOf(ctx.match);
-  const colourwayTitle = details.title || ident.productName || null;
+  // Colourway is a SKU check. Brand / media-library ads have no
+  // product colourway; ident.productName is a noun-scope label and
+  // must not fail-closed colour-describing quotes on those ads.
+  const colourwayTitle = (options && options.productId)
+    ? (details.title || ident.productName || null)
+    : null;
   const tierProduct = prepareQuotePool(productReviewsForMatch, productReviewsForMatch?.quotes, 'product', colourwayTitle);
   const catReviewsForMatch = await loadCategoryReviewsForMatch(ctx.match);
   const tierCategory = prepareQuotePool(catReviewsForMatch, catReviewsForMatch?.quotes, 'category', colourwayTitle);

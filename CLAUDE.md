@@ -2261,10 +2261,17 @@ Full detail in `docs/ATLAS.md` §7 and `docs/CLOUDINARY-VIDEO.md`. Headlines:
   burgundy shoe; QC failed, regen failed, ~$0.14 burned per occurrence.
   No structured colour field exists on CatalogProduct (and we do not add
   one here). Colour-free quotes and colourway-matching quotes are a
-  no-op; unparseable colourway + colour language drops the quote.
-  Composed with `toPrintableCustomerQuote`, never inside it. Pinned by
-  `scripts/verifyQuoteColourway.js`. Write-up:
-  `session.d/2026-08-24_quote-colourway-mismatch.md`.
+  no-op; unparseable colourway + colour language drops the quote
+  **on product-attached ads only** (brand / media-library ads are a
+  no-op even when a noun-scope title is present). Three follow-up
+  holes closed on the same PR: display-normalized titles keep the
+  full multi-colour colourway (not last-dash-only); hyphenated
+  adjectives (`green-accented`) are colour language; ordinary-word
+  collocates (`mint condition`, `golden opportunity`, …) are
+  MUST-KEEP. Composed with `toPrintableCustomerQuote`, never inside
+  it. Pinned by `scripts/verifyQuoteColourway.js`. Write-up:
+  `session.d/2026-08-24_quote-colourway-mismatch.md` and
+  `session.d/2026-08-24_quote-colourway-pr324-holes.md`.
 - **Stage telemetry is fire-and-forget.** `services/adStage.js` — **never
   await** (`adStage` sits where Atlas is already billed). Both static and video
   piggyback existing poll ticks (`ATLAS_IMAGE_POLL_MS` 3s,

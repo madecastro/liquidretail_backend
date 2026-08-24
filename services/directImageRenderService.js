@@ -1655,8 +1655,9 @@ function buildIntentData({ concept, layoutInput, brand, product = null, cta, cam
   }
   // Colourway — sibling of noun-scope, same rescue shape. A quote that
   // names a colour we cannot verify against this product's title is
-  // dropped; a colour-free quote is a no-op. Missing productTitle on
-  // scope is a no-op (brand / media ads).
+  // dropped; a colour-free quote is a no-op. productAttached === false
+  // is a no-op (brand / media ads) even when productTitle is set for
+  // noun-scope; product-attached + unknown colourway fails closed.
   if (quote) {
     const colourOk = applyQuoteColourway(quote, strictScope);
     if (!colourOk) {

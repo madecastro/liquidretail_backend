@@ -21,10 +21,14 @@
 // Revert-prove (each mutation must fail this harness — section R runs
 // them as sibling copies, it does not edit the tree):
 //   R1  usableColourwayQuote always returns quote            → A measured KEEP
-//   R2  maskIdioms is identity                               → A blue-chip DROP
+//   R2  maskIdioms is identity                               → A idiom KEEP
 //   R3  unparseable colourway returns quote                  → A unparseable KEEP
 //   R4  static site skips applyQuoteColourway                → B measured KEEP
 //   R5  video site skips applyQuoteColourway                 → C measured KEEP
+//   R6  dash parse last-segment-only                         → M white-sole display KEEP
+//   R7  hyphenated adj tails skipped again                   → M green-accented DROP
+//   R8  mint collocate removed                               → M mint-condition KEEP
+//   R9  productAttached===false no longer short-circuits     → A brand/media KEEP
 
 const fs = require('fs');
 const path = require('path');
@@ -58,6 +62,7 @@ const {
 } = require('../services/quoteColourway');
 const { toPrintableCustomerQuote } = require('../services/quoteProvenance');
 const { prepareQuotePool, pickPrimaryProductQuote } = require('../services/layoutInputService');
+const { displayNormalizeTitle } = require('../utils/titleNormalize');
 const direct = require('../services/directImageRenderService');
 const { gateLayoutInputQuotes } = require('../services/brandScriptExecutor');
 
@@ -121,13 +126,26 @@ console.log = () => {};
 console.warn = () => {};
 
 const SOLUDOS_TITLE = "Women's Roma Retro Sneaker | White - Wine";
+const SOLUDOS_DISPLAY = displayNormalizeTitle(SOLUDOS_TITLE);
 const GREEN_TEXT = 'Love the green accent on the heel — it makes the whole shoe.';
+const GREEN_HYPHEN_TEXT = 'Love the green-accented heel — it makes the whole shoe.';
+const GREEN_ONES_TEXT = 'the green ones are lovely';
 const NONE_TEXT = 'The quality is amazing and they fit true to size.';
 const MATCH_TEXT = 'The burgundy heel tab is perfect with the white upper.';
 const WINE_TEXT = 'The wine-colored heel tab is gorgeous.';
+const WINE_ACCENT_TEXT = 'The wine accent is gorgeous.';
+const WHITE_SOLE_TEXT = 'the white sole is perfect';
+const COMFORT_TEXT = 'So comfortable for long walks';
 const BLUECHIP_TEXT = 'blue-chip quality from day one of wearing them.';
 const ROSE_TEXT = 'it rose to the occasion on race day and never blistered.';
 const BLACK_TEXT = 'we have been in the black since switching to these.';
+const MINT_TEXT = 'Arrived in mint condition and ready to wear.';
+const GOLDEN_TEXT = 'a golden opportunity to upgrade my rotation.';
+const SILVER_TEXT = 'every cloud has a silver lining with these.';
+const GREENLIGHT_TEXT = 'they gave me the green light to run the race.';
+const WHITELIE_TEXT = 'not a white lie, they really last all day.';
+const GREYAREA_TEXT = 'sizing is a grey area for me but these fit.';
+const REDHANDED_TEXT = 'caught red-handed snacking in them.';
 
 function q(text, extra) {
   return {
@@ -141,6 +159,12 @@ function q(text, extra) {
 
 function kept(quote, product) {
   return usableColourwayQuote(quote, product) != null;
+}
+
+function wayKey(title) {
+  const way = productColourwayFromTitle(title);
+  if (!way) return null;
+  return [...way].sort().join(',');
 }
 
 // ── A. Behavioural: drive the REAL exported helper ────────────────────
@@ -215,6 +239,103 @@ check('A idiom MUST-KEEP: in the black',
   kept(q(BLACK_TEXT), SOLUDOS_TITLE) === true
   && colourFamiliesIn(BLACK_TEXT).length === 0);
 
+// ── M. Fixture matrix — REAL exported predicate, both title forms ────
+// Defect 1: display-normalize flattens `|` to ` - `; last-dash-only
+// parse kept Wine and dropped White, so "white sole" was a silent
+// false rejection. Both forms must yield the same colourway AND the
+// same verdict.
+check('M display-normalize flattens pipe to dash (the form paint used to pass)',
+  SOLUDOS_DISPLAY === "Women's Roma Retro Sneaker - White - Wine",
+  `got ${JSON.stringify(SOLUDOS_DISPLAY)}`);
+
+check('M both title forms parse to white+wine (same set)',
+  wayKey(SOLUDOS_TITLE) === 'white,wine'
+  && wayKey(SOLUDOS_DISPLAY) === 'white,wine',
+  `raw=${wayKey(SOLUDOS_TITLE)} display=${wayKey(SOLUDOS_DISPLAY)}`);
+
+function sameVerdict(text) {
+  return kept(q(text), SOLUDOS_TITLE) === kept(q(text), SOLUDOS_DISPLAY);
+}
+
+// MUST DROP
+check('M DROP: green accent on White-Wine (raw AND display)',
+  kept(q(GREEN_TEXT), SOLUDOS_TITLE) === false
+  && kept(q(GREEN_TEXT), SOLUDOS_DISPLAY) === false
+  && sameVerdict(GREEN_TEXT));
+
+check('M DROP: green-accented on White-Wine (raw AND display)',
+  kept(q(GREEN_HYPHEN_TEXT), SOLUDOS_TITLE) === false
+  && kept(q(GREEN_HYPHEN_TEXT), SOLUDOS_DISPLAY) === false
+  && colourFamiliesIn(GREEN_HYPHEN_TEXT).includes('green')
+  && sameVerdict(GREEN_HYPHEN_TEXT));
+
+check('M DROP: the green ones are lovely on White-Wine (raw AND display)',
+  kept(q(GREEN_ONES_TEXT), SOLUDOS_TITLE) === false
+  && kept(q(GREEN_ONES_TEXT), SOLUDOS_DISPLAY) === false
+  && sameVerdict(GREEN_ONES_TEXT));
+
+// MUST KEEP — matching colour / colour-free
+check('M KEEP: wine accent on White-Wine (raw AND display)',
+  kept(q(WINE_ACCENT_TEXT), SOLUDOS_TITLE) === true
+  && kept(q(WINE_ACCENT_TEXT), SOLUDOS_DISPLAY) === true
+  && sameVerdict(WINE_ACCENT_TEXT));
+
+check('M KEEP: white sole on White-Wine (raw AND display) — defect 1 victim',
+  kept(q(WHITE_SOLE_TEXT), SOLUDOS_TITLE) === true
+  && kept(q(WHITE_SOLE_TEXT), SOLUDOS_DISPLAY) === true
+  && sameVerdict(WHITE_SOLE_TEXT));
+
+check('M KEEP: so comfortable on White-Wine (raw AND display)',
+  kept(q(COMFORT_TEXT), SOLUDOS_TITLE) === true
+  && kept(q(COMFORT_TEXT), SOLUDOS_DISPLAY) === true
+  && colourFamiliesIn(COMFORT_TEXT).length === 0
+  && sameVerdict(COMFORT_TEXT));
+
+// MUST KEEP — ordinary-word colour senses (collocate shape, not one-offs)
+check('M KEEP idiom: mint condition (raw AND display)',
+  kept(q(MINT_TEXT), SOLUDOS_TITLE) === true
+  && kept(q(MINT_TEXT), SOLUDOS_DISPLAY) === true
+  && colourFamiliesIn(MINT_TEXT).length === 0
+  && sameVerdict(MINT_TEXT));
+
+check('M KEEP idiom: golden opportunity (raw AND display)',
+  kept(q(GOLDEN_TEXT), SOLUDOS_TITLE) === true
+  && colourFamiliesIn(GOLDEN_TEXT).length === 0
+  && sameVerdict(GOLDEN_TEXT));
+
+check('M KEEP idiom: silver lining (raw AND display)',
+  kept(q(SILVER_TEXT), SOLUDOS_TITLE) === true
+  && colourFamiliesIn(SILVER_TEXT).length === 0
+  && sameVerdict(SILVER_TEXT));
+
+check('M KEEP idiom: green light (raw AND display)',
+  kept(q(GREENLIGHT_TEXT), SOLUDOS_TITLE) === true
+  && colourFamiliesIn(GREENLIGHT_TEXT).length === 0
+  && sameVerdict(GREENLIGHT_TEXT));
+
+check('M KEEP idiom: white lie (raw AND display)',
+  kept(q(WHITELIE_TEXT), SOLUDOS_TITLE) === true
+  && colourFamiliesIn(WHITELIE_TEXT).length === 0
+  && sameVerdict(WHITELIE_TEXT));
+
+check('M KEEP idiom: grey area (raw AND display)',
+  kept(q(GREYAREA_TEXT), SOLUDOS_TITLE) === true
+  && colourFamiliesIn(GREYAREA_TEXT).length === 0
+  && sameVerdict(GREYAREA_TEXT));
+
+check('M KEEP idiom: caught red-handed (raw AND display)',
+  kept(q(REDHANDED_TEXT), SOLUDOS_TITLE) === true
+  && colourFamiliesIn(REDHANDED_TEXT).length === 0
+  && sameVerdict(REDHANDED_TEXT));
+
+check('M dash walk does not steal Pink Floyd from a colour-named product',
+  wayKey('Pink Floyd Graphic Tee - Black') === 'black'
+  && wayKey('Pink Floyd Graphic Tee | Black') === 'black');
+
+check('M dash walk keeps Heavy Blue and ignores Limited Edition',
+  wayKey('Hoodie - Heavy Blue') === 'blue'
+  && wayKey('Foo - Limited Edition') === null);
+
 check('A never throws on object-as-quote-without-text',
   usableColourwayQuote({ origin: 'scraped' }, SOLUDOS_TITLE) != null
   || usableColourwayQuote({ origin: 'scraped' }, SOLUDOS_TITLE) === null);
@@ -238,6 +359,36 @@ check('A never throws on null quote', usableColourwayQuote(null, SOLUDOS_TITLE) 
   const out = applyQuoteColourway(quote, { productTitle: SOLUDOS_TITLE });
   check('A applyQuoteColourway keeps colour-free via scope.productTitle',
     out && out.text === NONE_TEXT);
+}
+
+{
+  const quote = q(GREEN_TEXT);
+  check('A brand/media: productAttached false KEEPS colour quote even with unparseable title',
+    applyQuoteColourway(quote, {
+      productAttached: false,
+      productTitle: 'Roma Retro Sneaker'
+    }) === quote);
+}
+
+{
+  const quote = q(GREEN_TEXT);
+  check('A product-attached unknown colourway DROPS colour quote',
+    applyQuoteColourway(quote, {
+      productAttached: true,
+      productTitle: 'Roma Retro Sneaker'
+    }) === null);
+}
+
+{
+  const quote = q(GREEN_TEXT);
+  check('A product-attached missing title DROPS colour quote',
+    applyQuoteColourway(quote, { productAttached: true }) === null);
+}
+
+{
+  const quote = q(NONE_TEXT);
+  check('A product-attached missing title KEEPS colour-free quote',
+    applyQuoteColourway(quote, { productAttached: true }) === quote);
 }
 
 // Printability is a SIBLING. The green quote is still a printable
@@ -375,6 +526,16 @@ function videoArtifact(text, extra) {
 }
 
 {
+  const gated = gateLayoutInputQuotes(videoArtifact(GREEN_TEXT), {
+    productAttached: false,
+    productTitle: 'Roma Retro Sneaker'
+  });
+  check('C video brand/media: colour quote KEEP when not product-attached',
+    gated.input.social_proof.primary_quote
+    && gated.input.social_proof.primary_quote.text === GREEN_TEXT);
+}
+
+{
   const gated = gateLayoutInputQuotes(
     videoArtifact(GREEN_TEXT, { secondary_quotes: [q(NONE_TEXT)] }),
     { productTitle: SOLUDOS_TITLE }
@@ -470,6 +631,26 @@ check('E static colour assignment calls applyQuoteColourway(quote, strictScope)'
 
 check('E video colour assignment calls applyQuoteColourway(printable, scope)',
   /const\s+colourOk\s*=\s*applyQuoteColourway\s*\(\s*printable\s*,\s*scope\s*\)/.test(videoCode));
+
+check('E video rotation and paint share colourwayTitle (catalog title first)',
+  /const\s+colourwayTitle\s*=\s*catalogProduct\?\.title\s*\|\|\s*layoutInput\?\.input\?\.product\?\.name/.test(videoCode)
+  && (videoCode.match(/productTitle:\s*colourwayTitle/g) || []).length === 2,
+  'both rotateScope and gateLayoutInputQuotes must read the same catalog-first title');
+
+check('E layoutInput colourwayTitle is product-attached only (options.productId)',
+  /const colourwayTitle = \(options && options\.productId\)/.test(lisCode)
+  || /colourwayTitle = \(options && options\.productId\)/.test(lisSrc),
+  'brand/media layout assembly must not fail-closed on ident.productName');
+
+check('E applyQuoteColourway short-circuits productAttached === false',
+  /if\s*\(\s*scope\.productAttached\s*===\s*false\s*\)\s*return\s*quote/.test(qcCode));
+
+check('E hyphenated colour adjectives are not skipped as non-colour',
+  /COLOUR_ADJ_TAIL_SET\.has\(tail\)/.test(qcCode)
+  && /accented/.test(qcSrc));
+
+check('E mint condition is a collocate, not a one-off sentence',
+  /mint:\s*\['condition'\]/.test(qcCode) || /mint:\s*\[\s*'condition'\s*\]/.test(qcSrc));
 
 check('E helper is defined once in quoteColourway.js',
   (qcCode.match(/function\s+usableColourwayQuote\s*\(/g) || []).length === 1);
@@ -604,6 +785,86 @@ function withMutatedSibling(realAbsPath, mutatedSrc, fn) {
   });
 }
 
+{
+  // R6: last-dash-only parse → display title drops White → "white sole"
+  // REJECT. Pins that M KEEP white-sole-on-display is the walk, not luck.
+  const mutated = mutateOrThrow(
+    qcSrc,
+    `  const collected = [];
+  for (let i = parts.length - 1; i >= 1; i--) {
+    if (segmentIsColourwaySuffix(parts[i])) collected.unshift(parts[i].trim());
+    else break;
+  }`,
+    `  const collected = [];
+  const last = parts[parts.length - 1];
+  if (segmentIsColourwaySuffix(last)) collected.push(last.trim());`,
+    'R6'
+  );
+  withMutatedSibling(SRC_QC, mutated, (mod) => {
+    const displayWay = mod.productColourwayFromTitle(SOLUDOS_DISPLAY);
+    const got = mod.usableColourwayQuote(q(WHITE_SOLE_TEXT), SOLUDOS_DISPLAY);
+    check('R6 last-dash-only parse DROPS white sole on display title (M would go red)',
+      got == null
+      && displayWay
+      && displayWay.has('wine')
+      && !displayWay.has('white'),
+      `way=${displayWay ? [...displayWay].join(',') : 'null'} kept=${!!got}`);
+  });
+}
+
+{
+  // R7: hyphenated adjective tails skipped again → green-accented KEEP.
+  const mutated = mutateOrThrow(
+    qcSrc,
+    'if (COLOUR_ADJ_TAIL_SET.has(tail)) return false;',
+    'if (false && COLOUR_ADJ_TAIL_SET.has(tail)) return false;',
+    'R7'
+  );
+  withMutatedSibling(SRC_QC, mutated, (mod) => {
+    const got = mod.usableColourwayQuote(q(GREEN_HYPHEN_TEXT), SOLUDOS_TITLE);
+    check('R7 skipped adj tails KEEP green-accented on White-Wine (M DROP would go red)',
+      got != null && got.text === GREEN_HYPHEN_TEXT,
+      `got ${JSON.stringify(got && got.text)}`);
+  });
+}
+
+{
+  // R8: mint collocate removed → "mint condition" names green → REJECT.
+  const mutated = mutateOrThrow(
+    qcSrc,
+    "mint:   ['condition'],",
+    'mint:   [],',
+    'R8'
+  );
+  withMutatedSibling(SRC_QC, mutated, (mod) => {
+    const got = mod.usableColourwayQuote(q(MINT_TEXT), SOLUDOS_TITLE);
+    check('R8 mint-collocate-removed REJECTS mint condition (M KEEP would go red)',
+      got == null,
+      `got ${JSON.stringify(got && got.text)}`);
+  });
+}
+
+{
+  // R9: productAttached===false no longer short-circuits → brand/media
+  // ad with a noun-scope title DROPS a colour quote.
+  const mutated = mutateOrThrow(
+    qcSrc,
+    'if (scope.productAttached === false) return quote;',
+    'if (scope.productAttached === false) { /* colourway still applies */ }',
+    'R9'
+  );
+  withMutatedSibling(SRC_QC, mutated, (mod) => {
+    const quote = q(GREEN_TEXT);
+    const got = mod.applyQuoteColourway(quote, {
+      productAttached: false,
+      productTitle: 'Roma Retro Sneaker'
+    });
+    check('R9 productAttached-false skip removed DROPS brand/media colour quote (A would go red)',
+      got == null,
+      `got ${JSON.stringify(got && got.text)}`);
+  });
+}
+
 console.log = realLog;
 console.warn = realWarn;
 
@@ -613,4 +874,4 @@ if (failures.length) {
   process.exit(1);
 }
 console.log(`✅ verifyQuoteColourway: ${pass} checks passed`);
-console.log('   helper + static + video + Director driven for real; revert-proven on 5 mutations');
+console.log('   helper + static + video + Director driven for real; revert-proven on 9 mutations');

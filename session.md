@@ -78,12 +78,13 @@ it clears it back to this placeholder in the same commit that closes it out.)_
   merged.
 
 - **THIS WORKTREE (`fix/quote-colourway-mismatch`, 2026-08-24):** fail-closed
-  colourway gate for customer quotes. A quote that names a colour prints
-  only when that colour matches the product title's parsed colourway;
-  unparseable colourway + colour language drops the quote. Measured
-  Soludos White-Wine / green-accent defect. No CatalogProduct colour
-  field added. Write-up:
-  `session.d/2026-08-24_quote-colourway-mismatch.md`.
+  colourway gate for customer quotes (PR #324). Three owner-reproduced
+  holes closed on the same branch: display-normalized titles keep the
+  full multi-colour colourway; `green-accented` is colour language;
+  ordinary-word collocates (`mint condition`, …) are MUST-KEEP.
+  Unknown colourway + colour language drops only on product-attached
+  ads. Write-up: `session.d/2026-08-24_quote-colourway-mismatch.md`
+  and `session.d/2026-08-24_quote-colourway-pr324-holes.md`.
 - **OTHER WORKTREE (`fix/brand-consistency`, 2026-08-24):** logo re-ink
   is contrast-driven and bidirectional (`10d38637`), then the decision
   margin was widened: true-WCAG linearized `inkContrastRatio` + floor
