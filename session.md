@@ -68,6 +68,15 @@ it clears it back to this placeholder in the same commit that closes it out.)_
 
 *(Replace this whole section, don't append to it, when it goes stale.)*
 
+- **THIS WORKTREE (`fix/logo-safe-area`, 2026-08-24):** static composited
+  logomark was sitting ON the QC-declared safe-box edge (0px remaining
+  right/bottom on every live surface). Vision QC is handed those same
+  pixel numbers and flags it — 14/21 QC fails tonight, double-billed.
+  Logo is Sharp-composited (`logoPlacementFor`), not model-placed. Square
+  `logoResizeBox` (#321) amplified a stacked lockup but did not create the
+  flush. Inset 2% of short edge; square box / re-ink untouched. Harness
+  `scripts/verifyLogoSafeBox.js`. **Needs porting to adgen.** Write-up:
+  `session.d/2026-08-24_logo-safe-box-flush.md`.
 - **THIS WORKTREE (`fix/persist-child-stderr`, 2026-08-24):** declare
   `renderError.stderrTail` / `stdoutTail` and copy them at persist time.
   Tonight's run left 4/12 videos failed with only `remotion child exited

@@ -15,9 +15,11 @@
  *   G3  the crop performed is the CENTRED crop the prompt promised, and the
  *       extracted region already has the delivery aspect so the resize cannot
  *       crop or stretch. (Was: fit:'cover', position:'attention' — saliency.)
- *   G4  the composited logo lands inside the content rect, clear of the band
- *       the host platform covers with its own UI.
- *       (Was: a flat top = height - 100, 150px inside Stories' 250px reserve.)
+ *   G4  the composited logo lands STRICTLY inside the content rect (`<` the
+ *       box edge, not `≤`), clear of the band the host platform covers.
+ *       Flush-to-box is a vision-QC layout_safe_box fail (2026-08-24).
+ *       (Was: a flat top = height - 100, 150px inside Stories' 250px reserve;
+ *       then flush to the QC box itself, which S3's frame-gap pin could not see.)
  *   G4c the composited logo also clears the PLATFORM's own safe-margin floor
  *       (LOGO_SAFE_MARGIN_PCT, mirrors remotion/lib/safeZones.js), not just
  *       the looser text safe box G4 checks. (Was: a Vuori meta_stories_9_16
@@ -114,11 +116,11 @@ for (const key of SURFACES) {
   for (const [lw, lh] of sizes) {
     const place = direct.logoPlacementFor({ surface: s, dims, logoW: lw, logoH: lh });
     if (!place) continue;   // refusing to place is always a legitimate answer
-    check(`G4 ${key} logo ${lw}x${lh} stays inside the safe box the prompt reserved`,
-      place.top >= Math.max(0, sb.top) && place.top + place.height <= Math.min(dims.height, sb.bottom) &&
-      place.left >= Math.max(0, sb.left) && place.left + place.width <= Math.min(dims.width, sb.right),
+    check(`G4 ${key} logo ${lw}x${lh} stays strictly inside the safe box the prompt reserved`,
+      place.top >= Math.max(0, sb.top) && place.top + place.height < Math.min(dims.height, sb.bottom) &&
+      place.left >= Math.max(0, sb.left) && place.left + place.width < Math.min(dims.width, sb.right),
       `logo x${place.left}-${place.left + place.width} y${place.top}-${place.top + place.height} ` +
-      `vs safe box x${sb.left}-${sb.right} y${sb.top}-${sb.bottom}`);
+      `vs safe box x${sb.left}-${sb.right} y${sb.top}-${sb.bottom} — flush (≤) is the 2026-08-24 QC breach`);
     check(`G4 ${key} logo ${lw}x${lh} is inside the delivered frame`,
       place.left >= 0 && place.top >= 0 &&
       place.left + place.width <= dims.width && place.top + place.height <= dims.height,
@@ -157,10 +159,10 @@ for (const key of SURFACES) {
   for (const [lw, lh] of [[1053, 60], [60, 1053], [900, 900], [173, 61]]) {
     const p = direct.logoPlacementFor({ surface: synth, dims, logoW: lw, logoH: lh });
     if (!p) continue;
-    check(`G4b synthetic ${lw}x${lh} honours BOTH the frame and the safe box`,
+    check(`G4b synthetic ${lw}x${lh} honours BOTH the frame and the safe box (strict interior)`,
       p.left >= Math.max(0, sb.left) && p.top >= Math.max(0, sb.top) &&
-      p.left + p.width <= Math.min(dims.width, sb.right) &&
-      p.top + p.height <= Math.min(dims.height, sb.bottom),
+      p.left + p.width < Math.min(dims.width, sb.right) &&
+      p.top + p.height < Math.min(dims.height, sb.bottom),
       `placed x${p.left}-${p.left + p.width} y${p.top}-${p.top + p.height}, ` +
       `frame ${dims.width}x${dims.height}, box x${sb.left}-${sb.right} y${sb.top}-${sb.bottom}`);
   }
