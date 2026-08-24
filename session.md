@@ -14,26 +14,40 @@ it clears it back to this placeholder.)_
 
 ## CURRENT STATE
 
-*(Written 2026-08-24. Worktree `/Volumes/Sayulita/Projects/RS/.wt-stderrtail-adgen`,
-branch `fix/persist-child-stderr` off `origin/master`.)*
+*(Written 2026-08-24. Worktree `/Volumes/Sayulita/Projects/RS/.wt-vendordrift`,
+branch `feat/vendor-drift-detector` off `origin/master` @ `6045317`.)*
 
-- **What this is.** Tonight 4/12 video ads on `run_1787579089058_b7efb329`
-  failed with only `remotion child exited code=1 signal=none`. The child's
-  real error was on `err.stderrTail` (`makeChildError`) and then thrown
-  away: `Ad.renderError` is a strict mongoose subdocument and those two
-  fields were undeclared, AND `renderer.js` processAd copied
-  message/stage/code/at and never the tails. Schema half + forwarding half
-  — either one alone is a no-op.
-- **Fix.** Declare `stderrTail`/`stdoutTail` on `src/models/Ad.js`. Copy
-  via `childTailsFrom()` at processAd, titlingResume terminal persist, OOM
-  stamp, and noteRenderIssue. Persist-side clip 8 KiB stderr keep-start /
-  2 KiB stdout keep-end; NULs stripped. processAd logs `stderrTail`; Slack
-  video-fail puts it in `detail`. Backend gets the same schema + titling
-  persist copy (same production DB).
-- **Proof.** `scripts/verifyRenderErrorTails.js` — Ad-doc round-trip,
-  in-process revert (stripped schema drops the payload), `makeChildError`
-  → persist shape → schema set. Do not merge until the sibling backend PR
-  is up; both must land.
+- **What this is.** A vendor-drift detector. Tonight's repeated mistake
+  (fix in backend, never ported to adgen: #318/#321/#325; plus
+  campaignRunHeartbeat.js vendored-but-unwired, #16) had no check.
+  Byte-equality is useless — adgen has large legitimate divergence.
+- **Design.** Committed `scripts/vendor-manifest.json`. Per file: sha256
+  of the *backend* blob last looked at (FAIL signal) + last-touching
+  backend commit (provenance) + status `synced`/`fork`/`unused`. Vendored
+  set is derived: adgen `src/<rel>` ∩ backend `<rel>` at `origin/main`
+  (`git show`, working tree ignored). Backend absent → skip drift, still
+  fail dead modules.
+- **Dead modules.** Vendored `services/*.js` that export and have no
+  `require()` / `path.join(__dirname,…)` reference in `src/`. FAIL unless
+  `unused` with a reason. New copies with no requirer fail untracked+dead
+  even after today's seed.
+- **First run (no manifest, at 9d68b20).** 236 vendored, 220 identical,
+  16 divergent, 236 untracked, 33 dead. Seeded so the suite starts
+  clean. Rebased onto #18/#19; backend meanwhile moved to `d8c13301`
+  (#324) and the check flagged 6 real files + new `adCopyGuards.js`.
+  Reconciled, did not port. Landed numbers: 237 vendored, 218
+  identical, 19 divergent, 18 forks, 56 unused, 163 synced, 0 drift,
+  0 dead, 11/11.
+- **Proof.** Overlay pre-#318/#321/#325 hashes → drift flags. DIR
+  recorded as fork, adgen differs, not flagged. Fixture `services/c.js`
+  with no requirer flags; stripping `unused` from live `semaphore.js`
+  flags it; `campaignRunHeartbeat.js` is wired and does not. Suite path
+  never writes. Adversarial review: unused no longer mutes drift;
+  dead check is reachability from adgen-owned files; line-comment
+  `require()` ignored; `GIT_DIR` stripped on `git -C`.
+- **Reconcile.** Failure prints `git log recorded..current -- path` and
+  `node scripts/verifyVendorDrift.js --reconcile <path> --reason "…"`.
+- **Pushed.** PR against master. Do not merge.
 
 ---
 

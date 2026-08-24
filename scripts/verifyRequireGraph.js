@@ -71,9 +71,14 @@
 //   mv /tmp/helpers.js.bak src/services/reviewAdapters/helpers.js   → restore
 //   node scripts/verifyRequireGraph.js                              → pass again
 
-const fs = require('fs');
 const path = require('path');
 const { resolveBackendRoot } = require('./lib/siblingBackend');
+const {
+  fileExists,
+  dirExists,
+  resolveRelativeTarget,
+  buildProjectRequireGraph,
+} = require('./lib/requireGraph');
 
 const ROOT = path.join(__dirname, '..');
 const SRC_DIR = path.join(ROOT, 'src');
@@ -101,257 +106,9 @@ function relSrc(absPath) {
   return path.relative(ROOT, absPath).split(path.sep).join('/');
 }
 
-// ---------------------------------------------------------------------------
-// Filesystem walk. Deliberately does not pull in liquidretail_backend's
-// scripts/lib/sourceWalk.js (a different repo — do not reach across the
-// require graph this file itself checks). Same skip philosophy, smaller
-// scope: this repo has no worktrees or drafts nested inside src/ today, but
-// the dotdir/underscore-name defense costs nothing and matches the sibling
-// repo's own hard lesson (CLAUDE.md: a one-character skip-list miss let a
-// nested worktree's uncommitted files corrupt a money harness's verdict).
-// ---------------------------------------------------------------------------
-const SKIP_DIRS = new Set(['node_modules', '.git', 'coverage', 'dist', 'build']);
-
-function shouldSkipDir(name) {
-  if (name === '.' || name === '..') return true;
-  if (SKIP_DIRS.has(name)) return true;
-  if (name.startsWith('.')) return true;
-  return false;
-}
-
-function listSourceFiles(rootDir) {
-  const out = [];
-  function walk(dir) {
-    let entries;
-    try {
-      entries = fs.readdirSync(dir, { withFileTypes: true });
-    } catch (e) {
-      return;
-    }
-    for (const entry of entries) {
-      const full = path.join(dir, entry.name);
-      if (entry.isDirectory()) {
-        if (shouldSkipDir(entry.name)) continue;
-        walk(full);
-      } else if (entry.isFile() && /\.(js|mjs)$/.test(entry.name)) {
-        out.push(full);
-      }
-    }
-  }
-  walk(rootDir);
-  return out.sort();
-}
-
-function fileExists(p) {
-  try {
-    return fs.statSync(p).isFile();
-  } catch (e) {
-    return false;
-  }
-}
-
-function dirExists(p) {
-  try {
-    return fs.statSync(p).isDirectory();
-  } catch (e) {
-    return false;
-  }
-}
-
-// ---------------------------------------------------------------------------
-// Balanced-paren / balanced-bracket / quote-aware scanning, adapted from
-// liquidretail_backend/scripts/runVerifySuite.js (scanBalancedArgs /
-// splitTopLevelArgs there). Kept minimal — this file does not need that
-// runner's path.join(__dirname,...) alias symbol table, only a plain
-// balanced-arg scan for require(...)/path.join(...)/path.resolve(...) calls
-// and a balanced-bracket scan for `const X = [...]` array literals.
-// ---------------------------------------------------------------------------
-
-function scanBalancedParens(source, openIdx) {
-  let depth = 0;
-  let inString = null;
-  let argsStart = -1;
-  for (let i = openIdx; i < source.length; i++) {
-    const ch = source[i];
-    if (inString) {
-      if (ch === '\\') { i++; continue; }
-      if (ch === inString) inString = null;
-      continue;
-    }
-    if (ch === '\'' || ch === '"' || ch === '`') { inString = ch; continue; }
-    if (ch === '(') { depth++; if (depth === 1) argsStart = i + 1; continue; }
-    if (ch === ')') {
-      depth--;
-      if (depth === 0) return { bodyText: source.slice(argsStart, i), afterIdx: i + 1 };
-    }
-  }
-  return null;
-}
-
-function scanBalancedBrackets(source, openIdx) {
-  let depth = 0;
-  let inString = null;
-  let bodyStart = -1;
-  for (let i = openIdx; i < source.length; i++) {
-    const ch = source[i];
-    if (inString) {
-      if (ch === '\\') { i++; continue; }
-      if (ch === inString) inString = null;
-      continue;
-    }
-    if (ch === '\'' || ch === '"' || ch === '`') { inString = ch; continue; }
-    if (ch === '[') { depth++; if (depth === 1) bodyStart = i + 1; continue; }
-    if (ch === ']') {
-      depth--;
-      if (depth === 0) return { bodyText: source.slice(bodyStart, i), afterIdx: i + 1 };
-    }
-  }
-  return null;
-}
-
-function splitTopLevelArgs(argsText) {
-  const parts = [];
-  let depth = 0;
-  let inString = null;
-  let start = 0;
-  for (let i = 0; i < argsText.length; i++) {
-    const ch = argsText[i];
-    if (inString) {
-      if (ch === '\\') { i++; continue; }
-      if (ch === inString) inString = null;
-      continue;
-    }
-    if (ch === '\'' || ch === '"' || ch === '`') { inString = ch; continue; }
-    else if (ch === '(' || ch === '[' || ch === '{') depth++;
-    else if (ch === ')' || ch === ']' || ch === '}') depth--;
-    else if (ch === ',' && depth === 0) { parts.push(argsText.slice(start, i).trim()); start = i + 1; }
-  }
-  const last = argsText.slice(start).trim();
-  if (last.length) parts.push(last);
-  return parts.filter(Boolean);
-}
-
-const STRING_LITERAL_RE = /^(['"`])([\s\S]*)\1$/;
-
-function asStaticStringLiteral(exprSrc) {
-  const src = exprSrc.trim();
-  const lit = STRING_LITERAL_RE.exec(src);
-  if (!lit) return null;
-  if (/\$\{/.test(lit[2])) return null; // template literal with an interpolation — genuinely dynamic
-  return lit[2];
-}
-
-function lineOf(source, index) {
-  return source.slice(0, index).split('\n').length;
-}
-
-// ---------------------------------------------------------------------------
-// Per-file extraction.
-// ---------------------------------------------------------------------------
-
-// Top-level `const IDENT = ['./a', './b', ...]` where every element is a
-// plain string literal. Powers the reviewAdapters/index.js
-// `for (const mod of ADAPTER_MODULES) { require(mod); }` pattern below.
-function extractStringArrayConstants(source) {
-  const table = new Map();
-  const re = /\bconst\s+([A-Za-z_$][\w$]*)\s*=\s*\[/g;
-  let m;
-  while ((m = re.exec(source))) {
-    const openIdx = re.lastIndex - 1; // index of the '['
-    const scanned = scanBalancedBrackets(source, openIdx);
-    if (!scanned) continue;
-    const parts = splitTopLevelArgs(scanned.bodyText);
-    const literals = [];
-    let allLiteral = parts.length > 0;
-    for (const part of parts) {
-      const lit = asStaticStringLiteral(part);
-      if (lit === null) { allLiteral = false; break; }
-      literals.push(lit);
-    }
-    if (allLiteral) table.set(m[1], literals);
-  }
-  return table;
-}
-
-// `for (const IDENT of SOME_ARRAY) { ... require(IDENT) ... }` — the exact
-// shape src/services/reviewAdapters/index.js uses (loop variable `mod` over
-// `ADAPTER_MODULES`). A require() of the LOOP VARIABLE is not itself a
-// `const IDENT = [...]` (that lives on the iterable, one level up), so this
-// is a separate map: loop variable name -> iterable identifier name. Only
-// covers `for (const X of Y)` where Y is a bare identifier — this codebase
-// has exactly one dynamic-require loop and that is its exact shape.
-function extractForOfLoopVarSources(source) {
-  const table = new Map();
-  const re = /\bfor\s*\(\s*const\s+([A-Za-z_$][\w$]*)\s+of\s+([A-Za-z_$][\w$]*)\s*\)/g;
-  let m;
-  while ((m = re.exec(source))) table.set(m[1], m[2]);
-  return table;
-}
-
-// Every require(<expr>) call site. Returns the raw (unevaluated) first
-// argument's source text plus its line number. `require.resolve(...)` is
-// deliberately NOT matched (a literal '.' follows `require`, not '(').
-function findRequireCalls(source) {
-  const calls = [];
-  const re = /\brequire\s*\(/g;
-  let m;
-  while ((m = re.exec(source))) {
-    const openIdx = re.lastIndex - 1;
-    const scanned = scanBalancedParens(source, openIdx);
-    if (!scanned) continue;
-    re.lastIndex = scanned.afterIdx;
-    const parts = splitTopLevelArgs(scanned.bodyText);
-    if (!parts.length) continue;
-    calls.push({ raw: parts[0], line: lineOf(source, m.index) });
-  }
-  return calls;
-}
-
-// Every path.join(__dirname, 'lit', ...) / path.resolve(__dirname, 'lit', ...)
-// call built entirely from __dirname + string literals. Used only to grow
-// the "referenced" set for the dead-code check (2) — a file named this way
-// is being depended on for its TEXT (fs.readFileSync elsewhere), not
-// require()'d, so it is never added to the FAIL-checked require graph.
-function findDirnameJoinTargets(source) {
-  const targets = [];
-  const re = /\bpath\.(join|resolve)\s*\(/g;
-  let m;
-  while ((m = re.exec(source))) {
-    const openIdx = re.lastIndex - 1;
-    const scanned = scanBalancedParens(source, openIdx);
-    if (!scanned) continue;
-    re.lastIndex = scanned.afterIdx;
-    const parts = splitTopLevelArgs(scanned.bodyText);
-    if (!parts.length || parts[0].trim() !== '__dirname') continue;
-    const rest = [];
-    let allLiteral = true;
-    for (let i = 1; i < parts.length; i++) {
-      const lit = asStaticStringLiteral(parts[i]);
-      if (lit === null) { allLiteral = false; break; }
-      rest.push(lit);
-    }
-    if (allLiteral && rest.length) targets.push(rest);
-  }
-  return targets;
-}
-
-// Resolves a relative require target the same way Node's own require()
-// would: exact path, then +.js/.mjs/.json, then (if a directory)
-// index.js/.mjs/.json.
-function resolveRelativeTarget(fromDir, rawTarget) {
-  const absNoExt = path.resolve(fromDir, rawTarget);
-  for (const suffix of ['', '.js', '.mjs', '.json']) {
-    const candidate = absNoExt + suffix;
-    if (fileExists(candidate)) return candidate;
-  }
-  if (dirExists(absNoExt)) {
-    for (const idx of ['index.js', 'index.mjs', 'index.json']) {
-      const candidate = path.join(absNoExt, idx);
-      if (fileExists(candidate)) return candidate;
-    }
-  }
-  return null;
-}
+// Scanner lives in scripts/lib/requireGraph.js (shared with
+// verifyVendorDrift.js). This file keeps the vendoring-gap note and the
+// pass/fail policy.
 
 // If `rawTarget` (as required from `fromFile`) doesn't resolve in adgen,
 // check whether the identical relative-to-src/ path exists in the sibling
@@ -383,47 +140,17 @@ function vendoringGapNote(fromFile, rawTarget) {
 // ---------------------------------------------------------------------------
 
 function main() {
-  const files = listSourceFiles(SRC_DIR);
-  const referenced = new Set(); // absolute paths this scan found SOME reference to
-  const requireEdges = []; // { fromFile, line, raw, viaConst? } — project-local only
-  let unresolvedDynamicCount = 0;
-  const unresolvedDynamicSamples = [];
-
-  for (const file of files) {
-    const source = fs.readFileSync(file, 'utf8');
-    const arrayConsts = extractStringArrayConstants(source);
-    const forOfSources = extractForOfLoopVarSources(source);
-
-    for (const call of findRequireCalls(source)) {
-      const literal = asStaticStringLiteral(call.raw);
-      if (literal !== null) {
-        if (literal.startsWith('.')) requireEdges.push({ file, line: call.line, raw: literal });
-        // bare npm package name or absolute path — not project-local, not our concern
-        continue;
-      }
-      const bareIdent = call.raw.trim();
-      let arrayIdent = null;
-      if (/^[A-Za-z_$][\w$]*$/.test(bareIdent)) {
-        if (arrayConsts.has(bareIdent)) arrayIdent = bareIdent;
-        else if (forOfSources.has(bareIdent) && arrayConsts.has(forOfSources.get(bareIdent))) arrayIdent = forOfSources.get(bareIdent);
-      }
-      if (arrayIdent) {
-        for (const target of arrayConsts.get(arrayIdent)) {
-          if (target.startsWith('.')) requireEdges.push({ file, line: call.line, raw: target, viaConst: arrayIdent });
-        }
-        continue;
-      }
-      unresolvedDynamicCount += 1;
-      if (unresolvedDynamicSamples.length < 8) {
-        unresolvedDynamicSamples.push(`${relSrc(file)}:${call.line} require(${call.raw.slice(0, 60)})`);
-      }
-    }
-
-    for (const restParts of findDirnameJoinTargets(source)) {
-      const resolved = path.resolve(path.dirname(file), ...restParts);
-      referenced.add(resolved);
-    }
-  }
+  const graph = buildProjectRequireGraph(SRC_DIR);
+  const files = graph.files;
+  const referenced = graph.referenced;
+  const requireEdges = graph.requireEdges;
+  const unresolvedDynamicCount = graph.unresolvedDynamicCount;
+  const unresolvedDynamicSamples = graph.unresolvedDynamicSamples.map((s) => {
+    // lib stores absolute paths; print repo-relative like before.
+    const colon = s.indexOf(':');
+    if (colon < 0) return s;
+    return `${relSrc(s.slice(0, colon))}${s.slice(colon)}`;
+  });
 
   // Check 1 — every project-local require edge must resolve to a real file.
   for (const edge of requireEdges) {
