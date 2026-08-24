@@ -141,7 +141,7 @@ async function generateReferenceImage(ctx, variant, aspectRatio, quality) {
     prompt,
     size,
     quality,
-    meta: { stage: 'ai_layout_image', service: 'aiLayoutStudioService' }
+    meta: { stage: 'ai_layout_image', service: 'aiLayoutStudioService', brandId: ctx.media?.brandId || ctx.brand?._id || null, productId: ctx.match?.catalogProductId || null }
   });
 
   const b64 = res.data?.[0]?.b64_json;

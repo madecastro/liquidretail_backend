@@ -2066,7 +2066,7 @@ async function findCatalogMatchByText({
         // One embedding call for the signal + one for every stale row.
         const inputs = [signalBlob, ...needFetch.map(n => n.embSource)];
         const embRes = await textEmbedding.embed(
-          { service: 'productMatchService', purposeTag: 'text-catalog-match' },
+          { service: 'productMatchService', purposeTag: 'text-catalog-match', brandId: brandId || null },
           inputs
         );
         const vectors = embRes.embeddings || [];
@@ -2302,7 +2302,7 @@ async function ensureCatalogProductForMatch(match, ctx) {
           const pool = tieBand.slice(0, FUZZY_VISUAL_MAX);
           try {
             const visuals = await Promise.all(pool.map(s =>
-              compareUgcCropToCatalogProduct(cropUrl, s.row)
+              compareUgcCropToCatalogProduct(cropUrl, s.row, { brandId: ctx.brandId || null })
                 .catch(err => {
                   console.warn(`   ⚠️  D2 visual tiebreak threw: ${err.message}`);
                   return null;
@@ -2432,7 +2432,7 @@ const CATALOG_VISUAL_MATCH_MAX_IMAGES = Math.max(1, parseInt(process.env.CATALOG
 // AFTER ordering so top-1 mode always picks the strongest signal
 // available. Returns the best { isMatch, score, reasoning,
 // matchedAgainst } across the chosen targets.
-async function compareUgcCropToCatalogProduct(ugcCropImageUrl, product) {
+async function compareUgcCropToCatalogProduct(ugcCropImageUrl, product, { brandId = null } = {}) {
   if (!ugcCropImageUrl || !product) return null;
 
   // Refined crops first (tight YOLO bbox of the product, less
@@ -2452,7 +2452,9 @@ async function compareUgcCropToCatalogProduct(ugcCropImageUrl, product) {
   const results = await Promise.all(targets.map(async (url) => {
     const r = await visualCatalogMatch.compareCropToCandidate({
       cropImageUrl: ugcCropImageUrl,
-      candidate:    { imageUrl: url, title: product.title }
+      candidate:    { imageUrl: url, title: product.title },
+      brandId:      brandId || product.brandId || null,
+      productId:    product._id || null
     });
     return r ? { ...r, matchedAgainst: url } : null;
   }));
@@ -2594,7 +2596,7 @@ async function catalogFirstMatchOneRefined(refined, { brandId, brandName = null,
       return { combinedScore: 0, catalogMatch: null, visualResult: null };
     }
     const visualResults = await Promise.all(visualCandidates.map(p =>
-      compareUgcCropToCatalogProduct(refined.croppedImageUrl, p)
+      compareUgcCropToCatalogProduct(refined.croppedImageUrl, p, { brandId: brandId || null })
         .catch(err => {
           console.warn(`   ⚠️  visualCatalogMatch (fallback) threw: ${err.message}`);
           return null;
@@ -2627,7 +2629,7 @@ async function catalogFirstMatchOneRefined(refined, { brandId, brandName = null,
   // crops persisted by the catalog-product detect pipeline. Best score
   // across all catalog-side images wins.
   const visualResults = await Promise.all(textCandidates.map(c =>
-    compareUgcCropToCatalogProduct(refined.croppedImageUrl, c.product)
+    compareUgcCropToCatalogProduct(refined.croppedImageUrl, c.product, { brandId: brandId || null })
       .catch(err => {
         console.warn(`   ⚠️  visualCatalogMatch threw: ${err.message}`);
         return null;

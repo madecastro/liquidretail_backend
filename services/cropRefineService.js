@@ -53,14 +53,14 @@ function isOverlappingSameClass(a, b) {
   return containmentRatio(small, large) >= 0.9;
 }
 
-async function refineDetectionCrops(detections, sourceImageUrl) {
+async function refineDetectionCrops(detections, sourceImageUrl, ids = {}) {
   if (!Array.isArray(detections) || !detections.length) return [];
 
   // Batch in chunks if many detections survived the non-product filter.
   const all = [];
   for (let offset = 0; offset < detections.length; offset += MAX_DETECTIONS_PER_CALL) {
     const chunk = detections.slice(offset, offset + MAX_DETECTIONS_PER_CALL);
-    const refined = await refineChunk(chunk, sourceImageUrl, offset);
+    const refined = await refineChunk(chunk, sourceImageUrl, offset, ids);
     all.push(...refined);
   }
   // Dedup pass — overlapping YOLO detections (e.g. a person bbox and a
@@ -187,7 +187,7 @@ function normalizeBrandKey(s) {
     .trim();
 }
 
-async function refineChunk(chunk, sourceImageUrl, idOffset) {
+async function refineChunk(chunk, sourceImageUrl, idOffset, ids = {}) {
   // Defensive index alignment (same pattern as yoloIdentifyService) — only
   // detections with a cropBuffer go to GPT; the promptIndexToChunk map
   // preserves the link back so a missing crop can't cause GPT's response
@@ -247,7 +247,7 @@ async function refineChunk(chunk, sourceImageUrl, idOffset) {
 
   let parsed;
   try {
-    const response = await chatCompletion({ stage: 'crop_refine', service: 'cropRefineService' }, {
+    const response = await chatCompletion({ stage: 'crop_refine', service: 'cropRefineService', brandId: ids.brandId || null, productId: ids.productId || null, adId: ids.adId || null, campaignRunId: ids.campaignRunId || null }, {
       model: 'gpt-4.1',
       response_format: { type: 'json_object' },
       messages: [{

@@ -43,7 +43,7 @@ async function identifyYoloDetectionsGemini(detections, hints = {}) {
 }
 
 async function identifyChunkGemini(chunk, hints) {
-  const { brand, category } = hints;
+  const { brand, category, brandId = null, productId = null, adId = null, campaignRunId = null } = hints;
   const hintLines = [];
   if (brand)    hintLines.push(`- Expected brand for this scene: ${brand}`);
   if (category) hintLines.push(`- Expected category for this scene: ${category}`);
@@ -109,7 +109,7 @@ async function identifyChunkGemini(chunk, hints) {
     // from max_tokens instead, so the transport's reasoning reserve plus
     // this base budget keeps the visible JSON from truncating mid-array.
     const res = await chatCompletion(
-      { stage: 'gemini_identify', service: 'geminiIdentifyService', visionImages: imageParts.length },
+      { stage: 'gemini_identify', service: 'geminiIdentifyService', visionImages: imageParts.length, brandId, productId, adId, campaignRunId },
       {
         model: MODEL,
         messages: [{ role: 'user', content: [{ type: 'text', text: prompt }, ...imageParts] }],

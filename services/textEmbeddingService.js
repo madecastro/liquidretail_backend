@@ -106,7 +106,7 @@ async function embed(meta, input) {
   if (isConfigured()) {
     try {
       const res = await trackLlmCall(
-        { ...meta, provider: 'atlas', model: MODEL_ID, purpose: (meta?.purpose || meta?.purposeTag || '') },
+        { ...meta, provider: 'atlas', model: MODEL_ID, purpose: (meta?.purpose || meta?.purposeTag || ''), brandId: meta?.brandId || null, productId: meta?.productId || null, adId: meta?.adId || null, campaignRunId: meta?.campaignRunId || null },
         async () => {
           const r = await post(ATLAS_EMBED_URL, process.env.ATLAS_API_KEY, body);
           if (r.status !== 200) {
@@ -142,7 +142,7 @@ async function embed(meta, input) {
   console.warn(`🌐 textEmbedding: falling back to direct openai/${DIRECT_MODEL_ID} (${lastErr?.message?.slice(0, 120) || 'no atlas'})`);
   const directBody = { ...body, model: DIRECT_MODEL_ID };
   const res = await trackLlmCall(
-    { ...meta, provider: 'openai', model: DIRECT_MODEL_ID, purpose: (meta?.purpose || meta?.purposeTag || '') + ':direct-fallback' },
+    { ...meta, provider: 'openai', model: DIRECT_MODEL_ID, purpose: (meta?.purpose || meta?.purposeTag || '') + ':direct-fallback', brandId: meta?.brandId || null, productId: meta?.productId || null, adId: meta?.adId || null, campaignRunId: meta?.campaignRunId || null },
     async () => {
       const r = await post(OPENAI_EMBED_URL, key, directBody);
       if (r.status !== 200) {

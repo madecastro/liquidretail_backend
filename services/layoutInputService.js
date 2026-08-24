@@ -909,7 +909,14 @@ async function runDerivation(ctx, template, aspectRatio, options) {
     // Hidden reasoning spends from max_tokens on the OpenAI-compat path
     // (no thinkingBudget knob) — the transport pads a reserve on top.
     const res = await chatCompletion(
-      { stage: 'layout_derivation', service: 'layoutInputService' },
+      {
+        stage: 'layout_derivation',
+        service: 'layoutInputService',
+        brandId: options.brandId || ctx.media?.brandId || null,
+        productId: options.productId || null,
+        adId: options.adId || null,
+        campaignRunId: options.campaignRunId || null
+      },
       {
         model: GEMINI_MODEL,
         messages: [{ role: 'user', content: prompt }],

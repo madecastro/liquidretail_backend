@@ -206,7 +206,11 @@ async function runImagePipeline(run, media, buffer, sourceUrlOverride = null) {
 
   const judge = await timeStage(run, 'judge', async () => {
     try {
-      return await judgeDetections({ imageUrl: sourceUrl, products, subjects, text, crops, safeRect });
+      return await judgeDetections({
+        imageUrl: sourceUrl, products, subjects, text, crops, safeRect,
+        brandId: run.brandId || media.brandId || null,
+        productId: media.metadata?.catalogProductId || null
+      });
     } catch (err) {
       console.warn('⚠️  Judge:', err.message);
       stampStageFailure(run, 'judge', err);
@@ -586,7 +590,11 @@ async function runCatalogProductPipeline(run, media, buffer) {
   if (isHero) {
     judge = await timeStage(run, 'judge', async () => {
       try {
-        return await judgeDetections({ imageUrl: sourceUrl, products, subjects, text, crops, safeRect });
+        return await judgeDetections({
+          imageUrl: sourceUrl, products, subjects, text, crops, safeRect,
+          brandId: run.brandId || media.brandId || null,
+          productId: media.metadata?.catalogProductId || null
+        });
       } catch (err) {
         console.warn('⚠️  Catalog-path judge:', err.message);
         stampStageFailure(run, 'judge', err);
@@ -954,7 +962,12 @@ async function runYoloChain(run, buffer, media, sourceUrlOverride = null, option
     // det.identification alias. Gemini failures are non-fatal (GPT carries
     // the run with single-engine penalty applied during reconciliation).
     await timeStage(run, 'yolo-identify', async () => {
-      const hints = { brand: media.metadata?.brand, category: media.metadata?.category };
+      const hints = {
+        brand: media.metadata?.brand,
+        category: media.metadata?.category,
+        brandId: run.brandId || media.brandId || null,
+        productId: media.metadata?.catalogProductId || null
+      };
       const tasks = [identifyYoloDetections(products, hints).catch(err => {
         console.warn('⚠️  GPT yolo-identify:', err.message);
         stampStageFailure(run, 'identifyGpt', err);
@@ -1011,7 +1024,10 @@ async function runYoloChain(run, buffer, media, sourceUrlOverride = null, option
   if (survivors.length && canRefine) {
     refinedProducts = await timeStage(run, 'crop-refine', async () => {
       try {
-        const refined = await refineDetectionCrops(survivors, refineSourceUrl);
+        const refined = await refineDetectionCrops(survivors, refineSourceUrl, {
+          brandId: run.brandId || media.brandId || null,
+          productId: media.metadata?.catalogProductId || null
+        });
         console.log(`✂️   crop-refine: ${refined.length} refined product(s) from ${survivors.length} surviving detection(s)`);
         return refined;
       } catch (err) {
@@ -1069,7 +1085,9 @@ async function runSubjectsTextChain(run, imageUrl, media) {
       const st = await detectSubjectsAndText(imageUrl, {
         brand: media.metadata?.brand,
         category: media.metadata?.category,
-        caption: media.metadata?.caption
+        caption: media.metadata?.caption,
+        brandId: run.brandId || media.brandId || null,
+        productId: media.metadata?.catalogProductId || null
       });
       return {
         subjects: st.subjects,
@@ -1408,7 +1426,9 @@ async function runExtendedAndOverlayChain(run, media, sourceImageUrl, sourceVide
             candidates: extendedCandidates,
             sourceImageUrl,
             text,
-            primarySubject: primarySubjectDesc
+            primarySubject: primarySubjectDesc,
+            brandId: run.brandId || media.brandId || null,
+            productId: media.metadata?.catalogProductId || null
           });
         } catch (err) {
           console.warn('⚠️  Judge extended:', err.message);
@@ -1443,7 +1463,9 @@ async function runExtendedAndOverlayChain(run, media, sourceImageUrl, sourceVide
       try {
         overlayZones = await runOverlayZoneAnalysis({
           sourceImageUrl, crops, judge, extendedCrops: extendedCandidates,
-          forbiddenRectsPct
+          forbiddenRectsPct,
+          brandId: run.brandId || media.brandId || null,
+          productId: media.metadata?.catalogProductId || null
         });
       } catch (err) {
         console.warn('⚠️  Overlay zones:', err.message);
@@ -1615,12 +1637,12 @@ function buildCloudinaryCropUrl(videoUrl, crop) {
 //   - Analyze the actually-rendered self-underlay video. Use Cloudinary
 //     `so_<sec>` transform to extract N frames from the composed output
 //     URL. Cheap, but serializes compose→analyze which is currently parallel.
-async function runOverlayZoneAnalysis({ sourceImageUrl, crops, judge, extendedCrops, forbiddenRectsPct }) {
+async function runOverlayZoneAnalysis({ sourceImageUrl, crops, judge, extendedCrops, forbiddenRectsPct, brandId = null, productId = null, adId = null, campaignRunId = null }) {
   const inputs = pickOverlayZoneInputs({ sourceImageUrl, crops, judge, extendedCrops });
   if (!inputs.length) return {};
 
   const settled = await Promise.allSettled(inputs.map(i =>
-    analyzeOverlayZones({ imageUrl: i.imageUrl, label: i.label, ratio: i.ratio, forbiddenRectsPct })
+    analyzeOverlayZones({ imageUrl: i.imageUrl, label: i.label, ratio: i.ratio, forbiddenRectsPct, brandId, productId, adId, campaignRunId })
   ));
 
   const artifact = {};

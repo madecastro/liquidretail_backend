@@ -446,7 +446,7 @@ async function runEnrichment(brand, brandId, run = null) {
       `Ground personas in the brand's actual positioning; don't invent irrelevant personas. If the brand is niche, 2 personas is fine.`;
 
     try {
-      const response = await chatCompletion({ stage: 'brand_enrichment_gpt', service: 'brandEnrichmentService' }, {
+      const response = await chatCompletion({ stage: 'brand_enrichment_gpt', service: 'brandEnrichmentService', brandId: brandId || null }, {
         model: 'gpt-4.1',
         response_format: { type: 'json_object' },
         messages: [{ role: 'user', content: prompt }],

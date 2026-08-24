@@ -101,7 +101,7 @@ function rectPctSchema() {
 // Analyze a single image. Returns the parsed analysis or null on any failure
 // (caller treats null as a non-fatal degradation — the layout generator can
 // still work for the other images on the same job).
-async function analyzeOverlayZones({ imageUrl, label, ratio, forbiddenRectsPct }) {
+async function analyzeOverlayZones({ imageUrl, label, ratio, forbiddenRectsPct, brandId = null, productId = null, adId = null, campaignRunId = null }) {
   if (!isEnabled()) return null;
   if (!imageUrl) return null;
 
@@ -142,7 +142,7 @@ async function analyzeOverlayZones({ imageUrl, label, ratio, forbiddenRectsPct }
     // keeps headroom for the JSON body. responseSchema converts to strict
     // json_schema (probed working on Atlas's gemini routes).
     const res = await chatCompletion(
-      { stage: 'overlay_zones', service: 'overlayZoneService', visionImages: 1 },
+      { stage: 'overlay_zones', service: 'overlayZoneService', visionImages: 1, brandId, productId, adId, campaignRunId },
       {
         model: MODEL,
         messages: [{ role: 'user', content: [

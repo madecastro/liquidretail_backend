@@ -100,6 +100,7 @@ async function generatePosterForAd({ adId }) {
         brandId:    ad.brandId,
         mediaId:    ad.mediaId,
         productId:  ad.productId,
+        adId:       adId,
         cacheKey:   String(ad._id),
         visionImages: 1
       },

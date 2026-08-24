@@ -315,7 +315,7 @@ async function analyzeFrameBands(framePath, opts = {}) {
   return bands;
 }
 
-async function semanticScan(frames, hints) {
+async function semanticScan(frames, hints, ids = {}) {
   // Atlas gateway (Gemini served OpenAI-compatible; direct Google
   // OpenAI-compat endpoint as fallback inside the transport).
   const { chatCompletion } = require('./atlasLlmService');

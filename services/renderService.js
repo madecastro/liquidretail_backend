@@ -354,6 +354,9 @@ async function deriveStage(req) {
       ctaUrl:             req.cta?.url            || null,
       variantKind:        req.variantKind         || 'ugc',
       productId:          req.productId           || null,
+      brandId:            req.brandId             || null,
+      adId:               req.adId                || null,
+      campaignRunId:      req.campaignRunId       || null,
       paletteSource:      req.paletteSource       || 'media',
       // Per-ad raffle prize — when the campaign has multiple prize
       // media, this stamps which one this specific render should use
