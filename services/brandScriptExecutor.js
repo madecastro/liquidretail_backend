@@ -1660,7 +1660,7 @@ function resolveTitlingEngine(brand, ad) {
 // "never inspected" read the same way (an absent field) across both
 // pipelines. In production that symmetry was the bug: a live 39-ad run
 // shipped with Ad.visionQc:null on every ad (static AND video) because
-// AD_VISION_QC_ENABLED was unset and no SystemConfig override existed —
+// SystemConfig.videoVisionQcEnabled was unset/false and no override existed —
 // and an absent field is EXACTLY what "inspected and passed" also looks
 // like everywhere downstream (summarizeVisionQc, GET /runs/:runId
 // shippedWithoutQc, this file's own gallery badge). Both early returns now
@@ -1687,7 +1687,7 @@ async function runVideoVisionQcForAd({ ad, deliveredUrl, brandName = null }) {
       adVisionQc.warnQcDisabledOnce('video ad');
       return adVisionQc.buildPersistedVerdict({
         passed: false, skipped: true, disabled: true,
-        reason: 'AD_VISION_QC_ENABLED=false', finalAttempt: null, attempts: []
+        reason: 'vision QC disabled (SystemConfig.videoVisionQcEnabled)', finalAttempt: null, attempts: []
       });
     }
 

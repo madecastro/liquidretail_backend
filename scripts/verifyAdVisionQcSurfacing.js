@@ -40,7 +40,7 @@
  *
  * EXTENDED 2026-08-19 (production incident: run run_1787174963435_ff67021e,
  * 39/39 ads delivered, visionQc:null on all 39 — static AND video). Root
- * cause: AD_VISION_QC_ENABLED was unset and no SystemConfig override existed
+ * cause: SystemConfig vision QC was unset and no override existed
  * (a real, working gate), but every live caller of adVisionQc.isEnabled()
  * (directImageRenderService.renderDirectImage, brandScriptExecutor
  * .runVideoVisionQcForAd, imageRecoveryService.maybeQcRecoveredPlate) used
@@ -54,7 +54,7 @@
  *   D. The three gate-off early returns now stamp the SAME disabled-verdict
  *      shape runPostRenderQc's/runVideoPostRenderQc's own "Flag off" branch
  *      builds (buildPersistedVerdict with skipped:true, disabled:true,
- *      reason:'AD_VISION_QC_ENABLED=false') instead of a bare null, and warn
+ *      reason:'vision QC disabled (SystemConfig.…)') instead of a bare null, and warn
  *      once via the new shared adVisionQc.warnQcDisabledOnce.
  *   C (rewritten). GET /runs/:runId's shippedWithoutQc count now also
  *      counts a bare absent/null visionQc field, not just an explicit
@@ -231,7 +231,7 @@ check('A1 null visionQc → null (ad predates the QC gate, not "uninspected")', 
 check('A2 disabled verdict → inspected:false, disabled:true, passed:false', () => {
   const v = qc.buildPersistedVerdict({
     passed: false, disabled: true, skipped: true, finalAttempt: 1, attempts: [],
-    reason: 'AD_VISION_QC_ENABLED=false'
+    reason: 'vision QC disabled (SystemConfig.staticVisionQcEnabled)'
   });
   const s = qc.summarizeVisionQc(v);
   assert.strictEqual(s.inspected, false);
@@ -676,7 +676,7 @@ await (async () => {
       assert.strictEqual(result.skipped, true);
       assert.strictEqual(result.disabled, true);
       assert.strictEqual(result.passed, false);
-      assert.strictEqual(result.reason, 'AD_VISION_QC_ENABLED=false');
+      assert.strictEqual(result.reason, 'vision QC disabled (SystemConfig.videoVisionQcEnabled)');
     });
     check('D2b runVideoVisionQcForAd warns once via the shared gate-off warning', () => {
       assert.deepStrictEqual(warnCalls, ['video ad']);
@@ -699,7 +699,7 @@ await (async () => {
       assert.strictEqual(result.skipped, true);
       assert.strictEqual(result.disabled, true);
       assert.strictEqual(result.passed, false);
-      assert.strictEqual(result.reason, 'AD_VISION_QC_ENABLED=false');
+      assert.strictEqual(result.reason, 'vision QC disabled (SystemConfig.staticVisionQcEnabled)');
     });
     check('D3b maybeQcRecoveredPlate warns once via the shared gate-off warning', () => {
       assert.deepStrictEqual(warnCalls, ['recovered ad']);
@@ -786,7 +786,7 @@ check('D5 the shared warnQcDisabledOnce gate is genuinely one-shot-per-interval,
     qc.warnQcDisabledOnce('video ad');
     qc.warnQcDisabledOnce('recovered ad');
     assert.strictEqual(warnings.length, 1, 'three calls within the rewarn interval must produce exactly one log line');
-    assert.match(warnings[0], /AD_VISION_QC_ENABLED is OFF/);
+    assert.match(warnings[0], /vision QC is OFF/);
   } finally {
     console.warn = origWarn;
     qc._resetQcDisabledWarnForTests();
@@ -930,7 +930,7 @@ check('F1 buildVideoQcFailureFields: a real failure (passed:false, not skipped, 
 
 for (const [label, verdict] of [
   ['F2 skipped (uninspected) verdict', qc.buildSkippedVerdict('no frames could be sampled')],
-  ['F3 disabled (gate off) verdict', qc.buildPersistedVerdict({ passed: false, skipped: true, disabled: true, reason: 'AD_VISION_QC_ENABLED=false', finalAttempt: null, attempts: [] })],
+  ['F3 disabled (gate off) verdict', qc.buildPersistedVerdict({ passed: false, skipped: true, disabled: true, reason: 'vision QC disabled (SystemConfig.staticVisionQcEnabled)', finalAttempt: null, attempts: [] })],
   ['F4 a genuine pass', qc.buildPersistedVerdict({ passed: true, finalAttempt: 1, attempts: [{ attempt: 1, pass: true, categories: {}, findings: [], summary: 'clean', renderUrl: null, discarded: false }] })],
 ]) {
   check(`${label} must NOT flip status — buildVideoQcFailureFields returns {}`, () => {

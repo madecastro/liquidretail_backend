@@ -953,15 +953,17 @@ one root cause and one separate code bug, both closed here.
 deploy history for both `srv-d1vuktqli9vc73ft07ng` and the worker) already
 contained #240's video-QC wiring, deployed over 3 hours earlier. Queried prod
 directly (read-only Render job): `process.env` has **zero** keys matching
-`VISION`/`QC` — `AD_VISION_QC_ENABLED` is unset — and **no `SystemConfig`
-document exists at all** (`findOne({key:'default'})` → null), so
-`resolveEnabled()`/`isEnabled()` correctly fall through to their documented
-default: `false`. This is a real, working, **deliberate** gate — confirmed
-directly in this repo's own `scripts/verifyQcGateWiring.js` docstring, which
-quotes the owner: *"I don't want to QC gate yet, but let's wire it up so
-it's easy to flip on without a re-deploy if we want to test it."* Nobody has
-flipped it since. This document takes no position on whether it should be
-flipped now — that is the owner's call, not a "fix."
+`VISION`/`QC` and **no `SystemConfig` document exists at all**
+(`findOne({key:'default'})` → null), so `resolveEnabled()`/`isEnabled()`
+correctly fall through to their documented default: `false`. (The env var
+`AD_VISION_QC_ENABLED` has since been retired; the only lever is the
+SystemConfig booleans.) This is a real, working, **deliberate** gate —
+confirmed directly in this repo's own `scripts/verifyQcGateWiring.js`
+docstring, which quotes the owner: *"I don't want to QC gate yet, but let's
+wire it up so it's easy to flip on without a re-deploy if we want to test
+it."* Nobody had flipped it at the time of this incident. This document
+takes no position on whether it should be flipped now — that is the owner's
+call, not a "fix."
 
 **The actual bug: the gate being off was indistinguishable from "inspected
 and passed."** All three live callers of `adVisionQc.isEnabled()` —
@@ -970,7 +972,7 @@ and passed."** All three live callers of `adVisionQc.isEnabled()` —
 short-circuited on `!isEnabled()` with a bare `return firstOutput` / `return
 null`, **before ever reaching `runPostRenderQc`'s / `runVideoPostRenderQc`'s
 own "Flag off" branch**, which is the ONLY code that builds the
-`{skipped:true, disabled:true, reason:'AD_VISION_QC_ENABLED=false'}` shape
+`{skipped:true, disabled:true, reason:'vision QC disabled (SystemConfig.…)'}` shape
 and logs anything. That branch was consequently dead code in production —
 one caller's own doc comment even said the null return was deliberately
 "mirroring directImageRenderService's early-return-without-stamping," having
@@ -987,7 +989,7 @@ one representation.
 - All three early returns now build the SAME disabled-verdict shape
   `runPostRenderQc`'s "Flag off" branch always intended
   (`adVisionQc.buildPersistedVerdict({skipped:true, disabled:true,
-  reason:'AD_VISION_QC_ENABLED=false', ...})`) instead of a bare null/
+  reason:'vision QC disabled (SystemConfig.…)', ...})`) instead of a bare null/
   `firstOutput`, and call a new shared `adVisionQc.warnQcDisabledOnce(label)`
   (hourly-rewarn, not once-per-process-ever) so a flag left off for weeks is
   loud in logs, not silent. Zero behavior change beyond the stamped field —

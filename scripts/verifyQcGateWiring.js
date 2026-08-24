@@ -9,15 +9,16 @@
  * gate should be verbose and echoed to slack in addition to used in the
  * retry."
  *
- * The previous gate was process.env.AD_VISION_QC_ENABLED only. On Render,
- * changing an env var restarts the service — exactly what the owner does
- * not want. SystemConfig.adVisionQcEnabled (Mongo singleton) is the
- * no-restart lever. This harness pins:
+ * The previous gate was process.env.AD_VISION_QC_ENABLED only. That env
+ * var (and STATIC_VISION_QC_ENABLED / VIDEO_VISION_QC_ENABLED) is now
+ * RETIRED — setting it to any value must not change the resolved boolean.
+ * SystemConfig.staticVisionQcEnabled / videoVisionQcEnabled (Mongo
+ * singleton, with a legacy adVisionQcEnabled bridge) is the only lever.
+ * This harness pins:
  *   - default OFF
- *   - SystemConfig boolean wins over env (including explicit false over env true)
- *   - SystemConfig null falls through to env
- *   - env is compared via toLowerCase() === 'true' (historical contract)
- *   - a throwing SystemConfig read does NOT propagate
+ *   - SystemConfig boolean is the only live switch
+ *   - env vars are inert (retired / dead)
+ *   - a throwing SystemConfig read does NOT propagate (resolves false)
  *   - the TTL cache expires so a flip is picked up without restart
  *   - Slack uses notifyAsync (never await) on the paid render path
  *   - PASS_FLOOR=7 and MAX_QC_REGENERATIONS=1 stay unchanged
@@ -131,7 +132,7 @@ installStub();
       assert.ok(paths.adVisionQcEnabled, 'adVisionQcEnabled path missing from schema');
       // Nullable tri-state: default null, not false
       assert.strictEqual(paths.adVisionQcEnabled.defaultValue, null,
-        'default must be null (fall through to env), not false');
+        'default must be null (unset → split getters bridge, then false), not false');
     });
 
     check('A2 systemConfigService exports get/set/peek/reset/TTL', () => {
@@ -146,9 +147,9 @@ installStub();
         'TTL must be short (seconds, not minutes) so a flip is felt soon');
     });
 
-    check('A3 adVisionQcService exports resolveEnabled + envEnabled', () => {
+    check('A3 adVisionQcService exports resolveEnabled + isEnabled; envEnabled retired / dead', () => {
       assert.strictEqual(typeof qc.resolveEnabled, 'function');
-      assert.strictEqual(typeof qc.envEnabled, 'function');
+      assert.strictEqual(typeof qc.envEnabled, 'undefined');
       assert.strictEqual(typeof qc.isEnabled, 'function');
     });
 
@@ -157,23 +158,26 @@ installStub();
       assert.ok(paths.staticVisionQcEnabled, 'staticVisionQcEnabled path missing from schema');
       assert.ok(paths.videoVisionQcEnabled, 'videoVisionQcEnabled path missing from schema');
       assert.strictEqual(paths.staticVisionQcEnabled.defaultValue, null,
-        'static default must be null (unset → migration bridge → env), not false');
+        'static default must be null (unset → migration bridge → false), not false');
       assert.strictEqual(paths.videoVisionQcEnabled.defaultValue, null,
-        'video default must be null (unset → migration bridge → env), not false');
+        'video default must be null (unset → migration bridge → false), not false');
       // Legacy field must still be present — removing it is the
       // "ships uninspected ads" bug the split's comments exist to prevent.
       assert.ok(paths.adVisionQcEnabled, 'legacy adVisionQcEnabled must stay on the schema');
     });
 
-    check('A5 split-gate service surface: resolvers, env helpers, parseBoolEnv, get/set/peek/reset', () => {
+    check('A5 split-gate service surface: resolvers, env helpers retired / dead, parseBoolEnv, get/set/peek/reset', () => {
       assert.strictEqual(typeof qc.resolveStaticEnabled, 'function');
       assert.strictEqual(typeof qc.resolveVideoEnabled, 'function');
-      assert.strictEqual(typeof qc.staticEnvEnabled, 'function');
-      assert.strictEqual(typeof qc.videoEnvEnabled, 'function');
+      assert.strictEqual(typeof qc.staticEnvEnabled, 'undefined');
+      assert.strictEqual(typeof qc.videoEnvEnabled, 'undefined');
       assert.strictEqual(typeof qc.parseBoolEnv, 'function');
-      // Legacy exports must stay — this harness's A3/C/D/E/F still call them.
+      assert.strictEqual(typeof qc.isStaticEnabled, 'function');
+      assert.strictEqual(typeof qc.isVideoEnabled, 'function');
+      // Legacy resolver stays — this harness's A3/C/D/E/F still call it.
+      // envEnabled parser is GONE from the export surface, not just unused.
       assert.strictEqual(typeof qc.resolveEnabled, 'function');
-      assert.strictEqual(typeof qc.envEnabled, 'function');
+      assert.strictEqual(typeof qc.envEnabled, 'undefined');
       assert.strictEqual(typeof systemConfig.getStaticVisionQcEnabled, 'function');
       assert.strictEqual(typeof systemConfig.setStaticVisionQcEnabled, 'function');
       assert.strictEqual(typeof systemConfig.peekStaticVisionQcEnabled, 'function');
@@ -186,14 +190,14 @@ installStub();
       assert.strictEqual(typeof systemConfig.refreshVideoVisionQcEnabledCache, 'function');
     });
 
-    check('A6 config/defaults.env keeps AD_VISION_QC_ENABLED and adds the two split names', () => {
+    check('A6 config/defaults.env env vars retired / dead — none of the three names assigned', () => {
       const src = fs.readFileSync(
         path.join(__dirname, '..', 'config', 'defaults.env'),
         'utf8'
       );
-      assert.match(src, /^AD_VISION_QC_ENABLED=/m);
-      assert.match(src, /^STATIC_VISION_QC_ENABLED=/m);
-      assert.match(src, /^VIDEO_VISION_QC_ENABLED=/m);
+      assert.doesNotMatch(src, /^AD_VISION_QC_ENABLED=/m);
+      assert.doesNotMatch(src, /^STATIC_VISION_QC_ENABLED=/m);
+      assert.doesNotMatch(src, /^VIDEO_VISION_QC_ENABLED=/m);
     });
 
     // ── B. money constants unchanged ─────────────────────────────────
@@ -214,9 +218,14 @@ installStub();
       assert.strictEqual(v, false);
     });
 
-    await checkAsync('C2 envEnabled() alone is false when unset', async () => {
+    await checkAsync('C2 env retired / dead: AD_VISION_QC_ENABLED=true does not enable resolveEnabled', async () => {
       resetAll();
-      assert.strictEqual(qc.envEnabled(), false);
+      process.env.AD_VISION_QC_ENABLED = 'true';
+      stubDbValue = null;
+      const v = await qc.resolveEnabled({
+        getAdVisionQcEnabled: () => systemConfig.getAdVisionQcEnabled()
+      });
+      assert.strictEqual(v, false, 'env var is inert; unset DB must stay off');
     });
 
     // ── D. SystemConfig precedence ───────────────────────────────────
@@ -252,7 +261,7 @@ installStub();
         'DB false is an explicit kill-switch and must beat env true');
     });
 
-    await checkAsync('D4 SystemConfig null falls through to env true', async () => {
+    await checkAsync('D4 env retired / dead: SystemConfig null + AD_VISION_QC_ENABLED=true still false', async () => {
       resetAll();
       process.env.AD_VISION_QC_ENABLED = 'true';
       stubDbValue = null;
@@ -260,7 +269,7 @@ installStub();
       const v = await qc.resolveEnabled({
         getAdVisionQcEnabled: () => systemConfig.getAdVisionQcEnabled()
       });
-      assert.strictEqual(v, true, 'null DB override must fall through to env');
+      assert.strictEqual(v, false, 'null DB override must NOT fall through to env (env retired)');
     });
 
     await checkAsync('D5 SystemConfig null falls through to env false/unset', async () => {
@@ -273,32 +282,31 @@ installStub();
       assert.strictEqual(v, false);
     });
 
-    // ── E. env strictness (actual contract: toLowerCase === 'true') ───
-    check('E1 env string "false" does NOT enable', () => {
+    // ── E. env retired / dead — any value is inert ───────────────────
+    check('E1 env retired / dead: string "false" does not change isEnabled', () => {
       resetAll();
       process.env.AD_VISION_QC_ENABLED = 'false';
-      assert.strictEqual(qc.envEnabled(), false);
+      assert.strictEqual(qc.isEnabled(), false);
     });
-    check('E2 env string "TRUE" enables (toLowerCase)', () => {
+    check('E2 env retired / dead: string "TRUE" does NOT enable', () => {
       resetAll();
       process.env.AD_VISION_QC_ENABLED = 'TRUE';
-      assert.strictEqual(qc.envEnabled(), true);
+      assert.strictEqual(qc.isEnabled(), false);
     });
-    check('E3 env string "TRUE " with trailing space does NOT enable', () => {
+    check('E3 env retired / dead: string "TRUE " with trailing space does NOT enable', () => {
       resetAll();
       process.env.AD_VISION_QC_ENABLED = 'TRUE ';
-      assert.strictEqual(qc.envEnabled(), false,
-        'toLowerCase alone does not trim — trailing space must stay off');
+      assert.strictEqual(qc.isEnabled(), false);
     });
-    check('E4 env string "1" does NOT enable', () => {
+    check('E4 env retired / dead: string "1" does NOT enable', () => {
       resetAll();
       process.env.AD_VISION_QC_ENABLED = '1';
-      assert.strictEqual(qc.envEnabled(), false);
+      assert.strictEqual(qc.isEnabled(), false);
     });
-    check('E5 env string "true" enables', () => {
+    check('E5 env retired / dead: string "true" does NOT enable', () => {
       resetAll();
       process.env.AD_VISION_QC_ENABLED = 'true';
-      assert.strictEqual(qc.envEnabled(), true);
+      assert.strictEqual(qc.isEnabled(), false);
     });
 
     // ── F. fail-safe on throwing SystemConfig read ───────────────────
@@ -311,7 +319,7 @@ installStub();
           throw new Error('mongo down (injected)');
         }
       });
-      assert.strictEqual(v, true, 'must fall back to env true, not throw');
+      assert.strictEqual(v, false, 'must fail toward OFF, not fall back to env true');
     });
 
     await checkAsync('F2 throwing SystemConfig with env unset → false', async () => {
@@ -332,7 +340,7 @@ installStub();
       const v = await qc.resolveEnabled({
         getAdVisionQcEnabled: () => systemConfig.getAdVisionQcEnabled()
       });
-      assert.strictEqual(v, true, 'findOne rejection must fall back to env');
+      assert.strictEqual(v, false, 'findOne rejection must fail toward OFF, not env');
       stubShouldThrow = false;
     });
 
@@ -696,18 +704,18 @@ installStub();
         'not fall through to env true just because the cache is stale');
     });
 
-    await checkAsync('K4 a TRULY cold cache (never loaded) still falls through to env — unchanged', async () => {
+    await checkAsync('K4 env retired / dead: a TRULY cold cache returns false even if env is true', async () => {
       // Distinguishes "stale" (K1-K3: a real answer exists, just past its
       // TTL) from "cold" (nothing has EVER been read in this process) — only
-      // the latter is genuine absence of data and should still default via
-      // env, matching the pre-existing "unconfigured -> off" contract.
+      // the latter is genuine absence of data and now resolves false.
+      // Env is inert.
       resetAll();
       process.env.AD_VISION_QC_ENABLED = 'true';
       systemConfig.resetAdVisionQcEnabledCache();
       assert.strictEqual(systemConfig.peekAdVisionQcEnabled(), undefined,
         'never-loaded cache must still peek as undefined, not invent a value');
-      assert.strictEqual(qc.isEnabled(), true,
-        'a truly cold cache falls through to env — this is "unconfigured", not "stale"');
+      assert.strictEqual(qc.isEnabled(), false,
+        'a truly cold cache returns false — env is retired, not a fallback');
     });
 
     await checkAsync('K5 resolveEnabled() (the async path) is correct across the same TTL gap', async () => {
@@ -802,7 +810,7 @@ installStub();
         'DB static false is an explicit kill-switch and must beat STATIC env true');
     });
 
-    await checkAsync('L5 SystemConfig static null falls through to STATIC env true', async () => {
+    await checkAsync('L5 env retired / dead: SystemConfig static null + STATIC env true still false', async () => {
       resetAll();
       process.env.STATIC_VISION_QC_ENABLED = 'true';
       stubStaticDbValue = null;
@@ -811,10 +819,10 @@ installStub();
       const v = await qc.resolveStaticEnabled({
         getStaticVisionQcEnabled: () => systemConfig.getStaticVisionQcEnabled()
       });
-      assert.strictEqual(v, true, 'null static DB override must fall through to STATIC env');
+      assert.strictEqual(v, false, 'null static DB override must NOT fall through to STATIC env (env retired)');
     });
 
-    await checkAsync('L6 throwing getStaticVisionQcEnabled does not propagate (falls back to STATIC env)', async () => {
+    await checkAsync('L6 env retired / dead: throwing getStaticVisionQcEnabled resolves false (not STATIC env)', async () => {
       resetAll();
       process.env.STATIC_VISION_QC_ENABLED = 'true';
       delete process.env.AD_VISION_QC_ENABLED;
@@ -823,8 +831,8 @@ installStub();
           throw new Error('mongo down (injected)');
         }
       });
-      assert.strictEqual(v, true,
-        'must fall back to staticEnvEnabled (STATIC=true), not throw, and not envEnabled (AD unset → false)');
+      assert.strictEqual(v, false,
+        'must fail toward OFF, not fall back to STATIC env true');
     });
 
     await checkAsync('L7 throwing getStaticVisionQcEnabled with STATIC unset → false', async () => {
@@ -894,7 +902,7 @@ installStub();
         'DB video false is an explicit kill-switch and must beat VIDEO env true');
     });
 
-    await checkAsync('M5 SystemConfig video null falls through to VIDEO env true', async () => {
+    await checkAsync('M5 env retired / dead: SystemConfig video null + VIDEO env true still false', async () => {
       resetAll();
       process.env.VIDEO_VISION_QC_ENABLED = 'true';
       stubVideoDbValue = null;
@@ -903,10 +911,10 @@ installStub();
       const v = await qc.resolveVideoEnabled({
         getVideoVisionQcEnabled: () => systemConfig.getVideoVisionQcEnabled()
       });
-      assert.strictEqual(v, true, 'null video DB override must fall through to VIDEO env');
+      assert.strictEqual(v, false, 'null video DB override must NOT fall through to VIDEO env (env retired)');
     });
 
-    await checkAsync('M6 throwing getVideoVisionQcEnabled does not propagate (falls back to VIDEO env)', async () => {
+    await checkAsync('M6 env retired / dead: throwing getVideoVisionQcEnabled resolves false (not VIDEO env)', async () => {
       resetAll();
       process.env.VIDEO_VISION_QC_ENABLED = 'true';
       delete process.env.AD_VISION_QC_ENABLED;
@@ -915,8 +923,8 @@ installStub();
           throw new Error('mongo down (injected)');
         }
       });
-      assert.strictEqual(v, true,
-        'must fall back to videoEnvEnabled (VIDEO=true), not throw, and not envEnabled (AD unset → false)');
+      assert.strictEqual(v, false,
+        'must fail toward OFF, not fall back to VIDEO env true');
     });
 
     await checkAsync('M7 throwing getVideoVisionQcEnabled with VIDEO unset → false', async () => {
@@ -1027,27 +1035,27 @@ installStub();
         'video explicit true must still win on its own getter');
     });
 
-    await checkAsync('N7 both new fields unset + legacy null → getters return null (resolver then env)', async () => {
+    await checkAsync('N7 env retired / dead: both new fields unset + legacy null → resolvers false even if env true', async () => {
       resetAll();
       process.env.AD_VISION_QC_ENABLED = 'true';
       stubStaticDbValue = null;
       stubVideoDbValue = null;
       stubDbValue = null;
       assert.strictEqual(await systemConfig.getStaticVisionQcEnabled(), null,
-        'getter must return null (not false) so the resolver can fall through to env');
+        'getter must return null (not false) — unset, not an invented off');
       assert.strictEqual(await systemConfig.getVideoVisionQcEnabled(), null);
       assert.strictEqual(
         await qc.resolveStaticEnabled({
           getStaticVisionQcEnabled: () => systemConfig.getStaticVisionQcEnabled()
         }),
-        true,
-        'null getter + AD env true (STATIC unset → staticEnvEnabled → envEnabled) must enable'
+        false,
+        'null getter + AD env true must NOT enable (env retired)'
       );
       assert.strictEqual(
         await qc.resolveVideoEnabled({
           getVideoVisionQcEnabled: () => systemConfig.getVideoVisionQcEnabled()
         }),
-        true
+        false
       );
     });
 
@@ -1207,136 +1215,137 @@ installStub();
       assert.strictEqual(v2, false);
     });
 
-    // ── Q. shared parseBoolEnv semantics across all three env helpers ─
-    check('Q1 parseBoolEnv("1") is false — and all three env helpers agree', () => {
+    // ── Q. parseBoolEnv still exists; env helpers retired / dead ──────
+    check('Q1 env retired / dead: parseBoolEnv("1") is false; env helpers gone; env does not enable gates', () => {
       resetAll();
       process.env.AD_VISION_QC_ENABLED = '1';
       process.env.STATIC_VISION_QC_ENABLED = '1';
       process.env.VIDEO_VISION_QC_ENABLED = '1';
       assert.strictEqual(qc.parseBoolEnv('1'), false);
-      assert.strictEqual(qc.envEnabled(), false);
-      assert.strictEqual(qc.staticEnvEnabled(), false);
-      assert.strictEqual(qc.videoEnvEnabled(), false,
-        'if videoEnvEnabled is true here it is not using parseBoolEnv (truthy "1")');
+      assert.strictEqual(typeof qc.envEnabled, 'undefined');
+      assert.strictEqual(typeof qc.staticEnvEnabled, 'undefined');
+      assert.strictEqual(typeof qc.videoEnvEnabled, 'undefined');
+      assert.strictEqual(qc.isEnabled(), false);
+      assert.strictEqual(qc.isStaticEnabled(), false);
+      assert.strictEqual(qc.isVideoEnabled(), false);
     });
 
-    check('Q2 parseBoolEnv("TRUE ") trailing space is false — all three agree', () => {
+    check('Q2 env retired / dead: parseBoolEnv("TRUE ") trailing space is false; env helpers gone', () => {
       resetAll();
       process.env.AD_VISION_QC_ENABLED = 'TRUE ';
       process.env.STATIC_VISION_QC_ENABLED = 'TRUE ';
       process.env.VIDEO_VISION_QC_ENABLED = 'TRUE ';
       assert.strictEqual(qc.parseBoolEnv('TRUE '), false,
         'toLowerCase alone does not trim — trailing space must stay off');
-      assert.strictEqual(qc.envEnabled(), false);
-      assert.strictEqual(qc.staticEnvEnabled(), false);
-      assert.strictEqual(qc.videoEnvEnabled(), false);
+      assert.strictEqual(typeof qc.envEnabled, 'undefined');
+      assert.strictEqual(qc.isEnabled(), false);
+      assert.strictEqual(qc.isStaticEnabled(), false);
+      assert.strictEqual(qc.isVideoEnabled(), false);
     });
 
-    check('Q3 parseBoolEnv("true") is true — all three agree', () => {
+    check('Q3 env retired / dead: parseBoolEnv("true") is true but env does NOT enable gates', () => {
       resetAll();
       process.env.AD_VISION_QC_ENABLED = 'true';
       process.env.STATIC_VISION_QC_ENABLED = 'true';
       process.env.VIDEO_VISION_QC_ENABLED = 'true';
       assert.strictEqual(qc.parseBoolEnv('true'), true);
-      assert.strictEqual(qc.envEnabled(), true);
-      assert.strictEqual(qc.staticEnvEnabled(), true);
-      assert.strictEqual(qc.videoEnvEnabled(), true);
+      assert.strictEqual(typeof qc.envEnabled, 'undefined');
+      assert.strictEqual(qc.isEnabled(), false);
+      assert.strictEqual(qc.isStaticEnabled(), false);
+      assert.strictEqual(qc.isVideoEnabled(), false);
     });
 
-    check('Q4 parseBoolEnv("TRUE") is true (toLowerCase) — all three agree', () => {
+    check('Q4 env retired / dead: parseBoolEnv("TRUE") is true (toLowerCase) but env does NOT enable gates', () => {
       resetAll();
       process.env.AD_VISION_QC_ENABLED = 'TRUE';
       process.env.STATIC_VISION_QC_ENABLED = 'TRUE';
       process.env.VIDEO_VISION_QC_ENABLED = 'TRUE';
       assert.strictEqual(qc.parseBoolEnv('TRUE'), true);
-      assert.strictEqual(qc.envEnabled(), true);
-      assert.strictEqual(qc.staticEnvEnabled(), true);
-      assert.strictEqual(qc.videoEnvEnabled(), true);
+      assert.strictEqual(typeof qc.envEnabled, 'undefined');
+      assert.strictEqual(qc.isEnabled(), false);
+      assert.strictEqual(qc.isStaticEnabled(), false);
+      assert.strictEqual(qc.isVideoEnabled(), false);
     });
 
-    check('Q5 unset → false on parseBoolEnv and all three env helpers', () => {
+    check('Q5 env retired / dead: unset parseBoolEnv is false; env helpers gone', () => {
       resetAll();
       assert.strictEqual(qc.parseBoolEnv(undefined), false);
       assert.strictEqual(qc.parseBoolEnv(null), false);
       assert.strictEqual(qc.parseBoolEnv(''), false);
-      assert.strictEqual(qc.envEnabled(), false);
-      assert.strictEqual(qc.staticEnvEnabled(), false);
-      assert.strictEqual(qc.videoEnvEnabled(), false);
+      assert.strictEqual(typeof qc.envEnabled, 'undefined');
+      assert.strictEqual(typeof qc.staticEnvEnabled, 'undefined');
+      assert.strictEqual(typeof qc.videoEnvEnabled, 'undefined');
     });
 
-    // ── R. per-gate env-var fallback (own name unset → legacy AD_ name) ─
-    check('R1 STATIC unset + AD_VISION_QC_ENABLED=true → staticEnvEnabled true (legacy env bridge)', () => {
+    // ── R. env retired / dead — leftover env names must not enable anything ─
+    check('R1 env retired / dead: STATIC unset + AD_VISION_QC_ENABLED=true does NOT enable gates', () => {
       resetAll();
       process.env.AD_VISION_QC_ENABLED = 'true';
       delete process.env.STATIC_VISION_QC_ENABLED;
       delete process.env.VIDEO_VISION_QC_ENABLED;
-      assert.strictEqual(qc.staticEnvEnabled(), true,
-        'entirely-unset STATIC_VISION_QC_ENABLED must fall back to envEnabled() (legacy true)');
-      assert.strictEqual(qc.videoEnvEnabled(), true,
-        'entirely-unset VIDEO_VISION_QC_ENABLED must fall back to the same legacy true');
-      assert.strictEqual(qc.envEnabled(), true);
+      assert.strictEqual(typeof qc.staticEnvEnabled, 'undefined');
+      assert.strictEqual(typeof qc.videoEnvEnabled, 'undefined');
+      assert.strictEqual(typeof qc.envEnabled, 'undefined');
+      assert.strictEqual(qc.isStaticEnabled(), false);
+      assert.strictEqual(qc.isVideoEnabled(), false);
+      assert.strictEqual(qc.isEnabled(), false);
     });
 
-    check('R2 STATIC="" wins over legacy true (empty is set, not unset)', () => {
+    check('R2 env retired / dead: STATIC="" + AD=true does NOT enable gates', () => {
       resetAll();
       process.env.AD_VISION_QC_ENABLED = 'true';
       process.env.STATIC_VISION_QC_ENABLED = '';
       delete process.env.VIDEO_VISION_QC_ENABLED;
-      assert.strictEqual(qc.staticEnvEnabled(), false,
-        'empty string is !== undefined so it wins outright; parseBoolEnv("") is false even though legacy is true');
-      assert.strictEqual(qc.envEnabled(), true,
-        'legacy envEnabled must be unaffected by STATIC being set');
-      assert.strictEqual(qc.videoEnvEnabled(), true,
-        'setting STATIC must not steal VIDEO\'s unset→legacy fallback');
+      assert.strictEqual(qc.isStaticEnabled(), false);
+      assert.strictEqual(qc.isEnabled(), false);
+      assert.strictEqual(qc.isVideoEnabled(), false);
     });
 
-    check('R3 STATIC="false" wins over legacy true', () => {
+    check('R3 env retired / dead: STATIC="false" + AD=true does NOT enable gates', () => {
       resetAll();
       process.env.AD_VISION_QC_ENABLED = 'true';
       process.env.STATIC_VISION_QC_ENABLED = 'false';
-      assert.strictEqual(qc.staticEnvEnabled(), false,
-        'STATIC=false must win over AD=true — the new name, once present, is the whole decision');
+      assert.strictEqual(qc.isStaticEnabled(), false);
     });
 
-    check('R4 STATIC="true" wins over legacy false', () => {
+    check('R4 env retired / dead: STATIC="true" + AD=false does NOT enable static gate', () => {
       resetAll();
       process.env.AD_VISION_QC_ENABLED = 'false';
       process.env.STATIC_VISION_QC_ENABLED = 'true';
-      assert.strictEqual(qc.staticEnvEnabled(), true);
-      assert.strictEqual(qc.envEnabled(), false);
+      assert.strictEqual(qc.isStaticEnabled(), false);
+      assert.strictEqual(qc.isEnabled(), false);
     });
 
-    check('R5 VIDEO unset + AD_VISION_QC_ENABLED=true → videoEnvEnabled true (legacy env bridge)', () => {
+    check('R5 env retired / dead: VIDEO unset + AD_VISION_QC_ENABLED=true does NOT enable video gate', () => {
       resetAll();
       process.env.AD_VISION_QC_ENABLED = 'true';
       delete process.env.VIDEO_VISION_QC_ENABLED;
-      assert.strictEqual(qc.videoEnvEnabled(), true);
+      assert.strictEqual(typeof qc.videoEnvEnabled, 'undefined');
+      assert.strictEqual(qc.isVideoEnabled(), false);
     });
 
-    check('R6 VIDEO="" wins over legacy true (empty is set, not unset)', () => {
+    check('R6 env retired / dead: VIDEO="" + AD=true does NOT enable video gate', () => {
       resetAll();
       process.env.AD_VISION_QC_ENABLED = 'true';
       process.env.VIDEO_VISION_QC_ENABLED = '';
       delete process.env.STATIC_VISION_QC_ENABLED;
-      assert.strictEqual(qc.videoEnvEnabled(), false,
-        'empty string is !== undefined so it wins outright even though legacy is true');
-      assert.strictEqual(qc.staticEnvEnabled(), true,
-        'setting VIDEO must not steal STATIC\'s unset→legacy fallback');
+      assert.strictEqual(qc.isVideoEnabled(), false);
+      assert.strictEqual(qc.isStaticEnabled(), false);
     });
 
-    check('R7 VIDEO="false" wins over legacy true', () => {
+    check('R7 env retired / dead: VIDEO="false" + AD=true does NOT enable video gate', () => {
       resetAll();
       process.env.AD_VISION_QC_ENABLED = 'true';
       process.env.VIDEO_VISION_QC_ENABLED = 'false';
-      assert.strictEqual(qc.videoEnvEnabled(), false);
+      assert.strictEqual(qc.isVideoEnabled(), false);
     });
 
-    check('R8 VIDEO="true" wins over legacy false', () => {
+    check('R8 env retired / dead: VIDEO="true" + AD=false does NOT enable video gate', () => {
       resetAll();
       process.env.AD_VISION_QC_ENABLED = 'false';
       process.env.VIDEO_VISION_QC_ENABLED = 'true';
-      assert.strictEqual(qc.videoEnvEnabled(), true);
-      assert.strictEqual(qc.envEnabled(), false);
+      assert.strictEqual(qc.isVideoEnabled(), false);
+      assert.strictEqual(qc.isEnabled(), false);
     });
 
     // ── S. runPostRenderQc / runVideoPostRenderQc enabled-omitted fallback ─
@@ -1570,6 +1579,103 @@ installStub();
       assert.ok(!/\bresolveEnabled\s*\(/.test(stripped),
         'runVideoPostRenderQc must not fall back to the legacy resolveEnabled()');
     });
+
+    // ── M. "OFF must stay distinguishable from PASSED" — the retirement's
+    // blocking condition. The pre-retirement bug (docs/ALERTING.md incident)
+    // was that a flag-off ad shipped with Ad.visionQc left at its schema
+    // default `null`, which every downstream reader coerced to "inspected
+    // and passed". Retiring the env tier changes WHY the gate resolves
+    // false; it must not change WHAT happens once it does. This section
+    // pins that at two independent levels: the verdict builder cannot
+    // construct a not-inspected-but-passed shape even if a future caller
+    // gets the arguments wrong, and today's three hot-path callers actually
+    // stamp (never bare-return) when their gate resolves off.
+    console.log('M. OFF stays distinguishable from PASSED (retirement blocking condition)');
+
+    check('M1 buildPersistedVerdict: disabled:true forces passed:false even if the caller passes passed:true', () => {
+      const v = qc.buildPersistedVerdict({
+        passed: true, disabled: true, skipped: true, attempts: [], finalAttempt: null
+      });
+      assert.strictEqual(v.passed, false, 'a disabled verdict must never read as passed, regardless of caller input');
+      assert.strictEqual(v.disabled, true);
+      assert.strictEqual(v.skipped, true);
+    });
+
+    check('M2 buildPersistedVerdict: skipped:true (not disabled) also forces passed:false', () => {
+      const v = qc.buildPersistedVerdict({
+        passed: true, disabled: false, skipped: true, attempts: [], finalAttempt: null
+      });
+      assert.strictEqual(v.passed, false, 'skipped-but-uninspected must never read as passed either');
+    });
+
+    check('M3 buildPersistedVerdict: a genuinely inspected pass is unaffected', () => {
+      const v = qc.buildPersistedVerdict({
+        passed: true, disabled: false, skipped: false, attempts: [{ attempt: 1, pass: true }], finalAttempt: 1
+      });
+      assert.strictEqual(v.passed, true, 'the hardening must not break a real pass');
+    });
+
+    check('M4 the verdict shape never carries an undefined/absent skipped, disabled, or passed key', () => {
+      const v = qc.buildPersistedVerdict({ passed: undefined, disabled: undefined, skipped: undefined, attempts: [], finalAttempt: null });
+      for (const key of ['skipped', 'disabled', 'passed']) {
+        assert.strictEqual(typeof v[key], 'boolean', `${key} must be a real boolean, never undefined — an absent key is how "off" gets misread as "passed"`);
+      }
+    });
+
+    // Source pins on the three hot-path callers: each must, in its
+    // if(!qcEnabledNow)-shaped branch, build a stamped verdict with
+    // disabled:true and passed:false — never a bare `return firstOutput`/
+    // `return null` (the exact shape docs/ALERTING.md's incident describes).
+    const callerFiles = [
+      { path: 'services/directImageRenderService.js', label: 'static (directImageRenderService)' },
+      { path: 'services/brandScriptExecutor.js',       label: 'video (brandScriptExecutor)' },
+      { path: 'services/imageRecoveryService.js',       label: 'recovery (imageRecoveryService)' }
+    ];
+    for (const { path: relPath, label } of callerFiles) {
+      check(`M5 ${label}: gate-off branch stamps disabled:true + passed:false, not a bare return`, () => {
+        const src = fs.readFileSync(path.join(__dirname, '..', relPath), 'utf8');
+        // Find every `if (!qcEnabledNow) {` (or similarly named gate-check
+        // boolean) block and require it to build a persisted verdict with
+        // disabled:true and passed:false BEFORE returning. Broad regex
+        // scoped to the gate-check idiom this repo already uses (qcEnabledNow),
+        // not to exact variable names elsewhere in the file.
+        const gateBlocks = [...src.matchAll(/if\s*\(!qcEnabledNow\)\s*\{([\s\S]*?)\n\s{0,4}\}/g)];
+        assert.ok(gateBlocks.length >= 1, `expected at least one "if (!qcEnabledNow)" gate-off branch in ${relPath}`);
+        for (const m of gateBlocks) {
+          const block = m[1];
+          assert.match(block, /disabled:\s*true/, `${relPath}: gate-off branch must set disabled:true`);
+          assert.match(block, /passed:\s*false/, `${relPath}: gate-off branch must set passed:false`);
+          assert.match(block, /buildPersistedVerdict\s*\(/, `${relPath}: gate-off branch must call buildPersistedVerdict (a stamp), not a bare return`);
+        }
+      });
+    }
+
+    // ── N. env retired — BOTH directions are inert, not just one ────────
+    // A suite that only ever sets env='true' and checks "still off" could
+    // stay green if a future edit accidentally made env='false' the thing
+    // that resolves ON (an inverted-logic bug, not a missing-fallback bug).
+    // Pin both polarities explicitly for all three gates.
+    console.log('N. env retired — both true AND false are inert, all three gates');
+
+    const gateChecks = [
+      { name: 'legacy', envName: 'AD_VISION_QC_ENABLED', resolve: () => qc.resolveEnabled({ getAdVisionQcEnabled: () => Promise.resolve(null) }) },
+      { name: 'static', envName: 'STATIC_VISION_QC_ENABLED', resolve: () => qc.resolveStaticEnabled({ getStaticVisionQcEnabled: () => Promise.resolve(null) }) },
+      { name: 'video', envName: 'VIDEO_VISION_QC_ENABLED', resolve: () => qc.resolveVideoEnabled({ getVideoVisionQcEnabled: () => Promise.resolve(null) }) }
+    ];
+    for (const { name, envName, resolve } of gateChecks) {
+      await checkAsync(`N1 ${name} gate: env ${envName}='true' with DB null still resolves false`, async () => {
+        resetAll();
+        process.env[envName] = 'true';
+        const v = await resolve();
+        assert.strictEqual(v, false, `${envName}=true must be inert (env retired) — DB null means OFF`);
+      });
+      await checkAsync(`N2 ${name} gate: env ${envName}='false' with DB null still resolves false (both directions inert)`, async () => {
+        resetAll();
+        process.env[envName] = 'false';
+        const v = await resolve();
+        assert.strictEqual(v, false, `${envName}=false must ALSO be inert — proves the suite isn't only exercising one polarity`);
+      });
+    }
 
   } finally {
     restoreStub();

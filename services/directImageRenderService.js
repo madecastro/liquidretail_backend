@@ -21,6 +21,7 @@
 
 'use strict';
 
+const crypto = require('crypto');
 const axios = require('axios');
 const sharp = require('sharp');
 
@@ -2158,7 +2159,7 @@ async function renderDirectImage(callArgs = {}) {
     LayoutInputArtifact.findById(layoutInputArtifactId).select('input brandId productId').lean(),
     resolveConcept({ adConceptArtifactId, adConceptId, expectedProductId: productId }),
     brandId ? Brand.findById(brandId).lean() : null,
-    productId ? CatalogProduct.findById(productId).select('title imageUrl imageMediaId additionalImageMediaIds rating productReviews recentQuoteKeys lastQuoteRunId lastQuoteFingerprint').lean() : null,
+    productId ? CatalogProduct.findById(productId).select('title imageUrl imageMediaId additionalImageMediaIds rating productReviews recentQuoteKeys lastQuoteRunId lastQuoteFingerprint category inferredBreadcrumb').lean() : null,
     // classification + technicalInsights feed resolveSeedStyle for the
     // lifestyle scene-preserve branch (STATIC_LIFESTYLE_PRESERVE).
     // width + height feed seedAspectFromDims → resolveAspectTreatment's
@@ -2215,7 +2216,7 @@ async function renderDirectImage(callArgs = {}) {
       { alertLevel: 'fatal', alertKey: 'direct-image:no-credentials' }
     );
   }
-  const resolvedProduct = product || (effectiveLayout.productId ? await CatalogProduct.findById(effectiveLayout.productId).select('title imageUrl imageMediaId additionalImageMediaIds rating productReviews recentQuoteKeys lastQuoteRunId lastQuoteFingerprint').lean() : null);
+  const resolvedProduct = product || (effectiveLayout.productId ? await CatalogProduct.findById(effectiveLayout.productId).select('title imageUrl imageMediaId additionalImageMediaIds rating productReviews recentQuoteKeys lastQuoteRunId lastQuoteFingerprint category inferredBreadcrumb').lean() : null);
   // Delivery dims are NOT derived here any more: they come from the surface the
   // prompt is built from, a few lines below, so the size Sharp writes and the
   // size the geometry block promised the model cannot disagree.
@@ -2334,7 +2335,13 @@ async function renderDirectImage(callArgs = {}) {
     surface,
     seedStyle,
     variantKind,
-    seedAspect
+    seedAspect,
+    segment: {
+      categoryPath: resolvedProduct?.category
+        || (Array.isArray(resolvedProduct?.inferredBreadcrumb) && resolvedProduct.inferredBreadcrumb.length
+          ? resolvedProduct.inferredBreadcrumb.join(' > ')
+          : null)
+    }
   });
   // A surface that takes no static image is a routing fact, not a failure —
   // meta_reels_9_16 is declared kinds:['video'] in platformFormats.
@@ -2539,7 +2546,15 @@ async function renderDirectImage(callArgs = {}) {
       renderedRoles: built.text.map(([role]) => role),
       droppedRoles: built.dropped,
       generateSize: genSize,
-      logoComposited: plate.logoComposited
+      logoComposited: plate.logoComposited,
+      promptSha256: crypto.createHash('sha256').update(String(prompt || '')).digest('hex'),
+      seedStyle,
+      promptFlags: {
+        ...intents.promptFlagsSnapshot(),
+        segmentOverrides: built.appliedOverrides || [],
+        operatorOverride: !!overrideText,
+        operatorNote: !!(operatorPrompt && String(operatorPrompt).trim())
+      }
     },
     // TRUTHFUL COPY SNAPSHOT — what this specific render actually asked the
     // model to typeset, read back from built.text (the post-density-budget
@@ -2606,7 +2621,7 @@ async function renderDirectImage(callArgs = {}) {
       ...firstOutput,
       visionQc: adVisionQc.buildPersistedVerdict({
         passed: false, skipped: true, disabled: true,
-        reason: 'AD_VISION_QC_ENABLED=false', finalAttempt: null, attempts: []
+        reason: 'vision QC disabled (SystemConfig.staticVisionQcEnabled)', finalAttempt: null, attempts: []
       })
     };
   }

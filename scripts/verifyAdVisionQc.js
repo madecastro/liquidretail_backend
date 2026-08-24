@@ -14,8 +14,8 @@
  * No DB, no network, no API key. Safe in CI. E2 no-ops
  * systemConfigService.refreshAdVisionQcEnabledCache so the real
  * isEnabled() cannot kick off SystemConfig.findOne (Mongoose would
- * buffer ~10s against a missing connection); the check still reads
- * the env var through the real sync gate.
+ * buffer ~10s against a missing connection); the check pins that the
+ * env var is INERT (retired / dead) through the real sync gate.
  *   node scripts/verifyAdVisionQc.js
  *
  * Revert-proof notes live next to each group: if that production code is
@@ -1371,21 +1371,24 @@ check('B4 judgeRender payload carries visionImages:2 meta (ledger)', async () =>
     assert.strictEqual(result.visionQc.attempts.length, 0);
   });
 
-  await checkAsync('E2 isEnabled() reads AD_VISION_QC_ENABLED', () => {
+  await checkAsync('E2 env retired / dead: isEnabled() does NOT read AD_VISION_QC_ENABLED', () => {
     const cfg = require('../services/systemConfigService');
     const origRefresh = cfg.refreshAdVisionQcEnabledCache;
     // Fire-and-forget SystemConfig.findOne — not what E2 asserts.
-    // Peek stays cold (undefined) so isEnabled() falls through to
-    // envEnabled(), which is the contract this check pins.
+    // Peek stays cold (undefined) so isEnabled() returns false for THIS
+    // call (no env fallback). Setting the retired env var must not enable.
     cfg.refreshAdVisionQcEnabledCache = () => {};
     try {
       delete process.env.AD_VISION_QC_ENABLED;
       assert.strictEqual(qc.isEnabled(), false);
       process.env.AD_VISION_QC_ENABLED = 'true';
-      assert.strictEqual(qc.isEnabled(), true);
+      assert.strictEqual(qc.isEnabled(), false,
+        'env var is inert — cold cache must stay off even if AD_VISION_QC_ENABLED=true');
       process.env.AD_VISION_QC_ENABLED = 'false';
       assert.strictEqual(qc.isEnabled(), false);
       delete process.env.AD_VISION_QC_ENABLED;
+      assert.strictEqual(typeof qc.envEnabled, 'undefined',
+        'envEnabled parser must be GONE from the export surface, not just unused');
     } finally {
       cfg.refreshAdVisionQcEnabledCache = origRefresh;
     }

@@ -47,22 +47,21 @@
 // Feature flag resolution — SPLIT 2026-08-21 into two independent gates,
 // one per pipeline (`resolveStaticEnabled()` / `resolveVideoEnabled()`
 // below). Previously ONE gate shared by both callers; that single-flag
-// design is preserved as a LEGACY fallback, not removed — see
-// models/SystemConfig.js and services/systemConfigService.js for the
-// migration bridge that keeps QC on for both pipelines across this deploy
-// without anyone having to flip a new switch first. Each gate's precedence
-// (most specific first):
+// design is preserved as a LEGACY DB-field bridge (SystemConfig.adVisionQcEnabled),
+// not a separate lever. The ONLY live switch is the SystemConfig tri-state
+// booleans — flippable with no redeploy via systemConfigService setters.
+// Env fallback NEVER exists after 2026-08-21: AD_VISION_QC_ENABLED /
+// STATIC_VISION_QC_ENABLED / VIDEO_VISION_QC_ENABLED are retired and must
+// not be reintroduced. Each gate's precedence (most specific first):
 //   1. SystemConfig.<pipeline>VisionQcEnabled when a real boolean (DB,
 //      live-flippable) — bridges to the legacy SystemConfig.adVisionQcEnabled
 //      field when unset, so a still-unmigrated deployment keeps whatever the
 //      old single flag said.
-//   2. process.env.<PIPELINE>_VISION_QC_ENABLED === 'true' after toLowerCase
-//      (env) — falls back to the legacy AD_VISION_QC_ENABLED env var when
-//      the pipeline-specific name is entirely unset.
-//   3. default false
-// Default stays OFF absent any override. DB override is the no-redeploy
-// lever — env alone would force a Render restart. See resolveStaticEnabled()
-// / resolveVideoEnabled() below; resolveEnabled() / isEnabled() remain as
+//   2. default false
+// A throwing SystemConfig read logs once and resolves false (fail toward
+// OFF — a missed QC pass ships an inspectable ad; failing open would start
+// spending money nobody authorized). See resolveStaticEnabled() /
+// resolveVideoEnabled() below; resolveEnabled() / isEnabled() remain as
 // the legacy, undifferentiated gate for any caller that still reads it.
 // Model role: 'ad-vision-qc' in atlasModelMap (routing MUST be probed live).
 
@@ -117,70 +116,41 @@ const PASS_FLOOR = 7;
 const QC_MODEL_ROLE = 'ad-vision-qc';
 
 // Log-once guard for a SystemConfig read failure. A config lookup must
-// never be able to break a render; we fall back to env/default and warn.
+// never be able to break a render; we fail toward OFF and warn.
 let _systemConfigReadFailedLogged = false;
 
 /**
- * THE ONE boolean-env parser for every vision-QC gate — legacy and split.
- * Matches the historical contract exactly:
- *   String(x || '').toLowerCase() === 'true'
- * so "TRUE" enables, "false" / "TRUE " (trailing space) / "1" do not.
- * Every gate below reuses this; none re-implements the check. Two readers
- * of one semantic with different rules is a defect class this repo has
- * already shipped (this file's own header docs the isEnabled/resolveEnabled
- * cache-staleness incident) — do not let the gate split become a second
- * instance of it via a copy-pasted comparison.
+ * THE ONE boolean-env parser. Kept exported so existing harnesses can still
+ * pin the historical `toLowerCase() === 'true'` contract (TRUE enables,
+ * "false" / "TRUE " / "1" do not). It is NOT used by any live QC gate —
+ * env fallback was retired; SystemConfig booleans are the only lever.
  */
 function parseBoolEnv(raw) {
   return String(raw || '').toLowerCase() === 'true';
 }
 
-/**
- * Env-only gate — LEGACY, single flag. Matches the historical isEnabled()
- * contract. Kept exactly as-is; the split gates below reuse parseBoolEnv
- * rather than re-implementing this line, and fall back to THIS function
- * (not the raw env var) when their own specific env var is unset, so an
- * environment that only ever configured the legacy name keeps working.
- */
-function envEnabled() {
-  return parseBoolEnv(process.env.AD_VISION_QC_ENABLED);
+const DISABLED_REASON_STATIC = 'vision QC disabled (SystemConfig.staticVisionQcEnabled)';
+const DISABLED_REASON_VIDEO = 'vision QC disabled (SystemConfig.videoVisionQcEnabled)';
+
+function _logSystemConfigFail(scope, err) {
+  if (_systemConfigReadFailedLogged) return;
+  _systemConfigReadFailedLogged = true;
+  const msg = (err && err.message) ? err.message : String(err || 'unknown');
+  const label = scope ? ` (${scope})` : '';
+  console.warn(
+    `   ⚠️  adVisionQc: SystemConfig read failed${label} — resolving false (no env fallback): ${msg}`
+  );
 }
 
 /**
- * Env-only gate — STATIC pipeline. Own env var first; if that name is
- * entirely unset (not merely falsy), falls back to the legacy envEnabled()
- * so a deploy that only ever set AD_VISION_QC_ENABLED does not silently
- * lose static coverage the moment the gate splits.
- */
-function staticEnvEnabled() {
-  if (process.env.STATIC_VISION_QC_ENABLED !== undefined) {
-    return parseBoolEnv(process.env.STATIC_VISION_QC_ENABLED);
-  }
-  return envEnabled();
-}
-
-/**
- * Env-only gate — VIDEO pipeline. Same shape as staticEnvEnabled() above,
- * independent env var, same legacy fallback.
- */
-function videoEnvEnabled() {
-  if (process.env.VIDEO_VISION_QC_ENABLED !== undefined) {
-    return parseBoolEnv(process.env.VIDEO_VISION_QC_ENABLED);
-  }
-  return envEnabled();
-}
-
-/**
- * Async resolver — LEGACY, single flag. UNCHANGED by the 2026-08-21 split;
- * preferred for any path that can await.
+ * Async resolver — LEGACY, single flag. Preferred for any path that can await.
  *
  * Precedence (most specific first):
  *   1. SystemConfig.adVisionQcEnabled when typeof === 'boolean'
- *   2. env AD_VISION_QC_ENABLED (via envEnabled)
- *   3. default false
+ *   2. default false
  *
- * Fail-safe: a throwing Mongo/config read falls through to env/default and
- * NEVER rejects. deps.getAdVisionQcEnabled is injectable for the harness.
+ * Fail-safe: a throwing Mongo/config read resolves false and NEVER rejects.
+ * No env fallback exists. deps.getAdVisionQcEnabled is injectable for the harness.
  */
 async function resolveEnabled(deps = {}) {
   try {
@@ -189,28 +159,20 @@ async function resolveEnabled(deps = {}) {
     const dbVal = await getCfg();
     if (typeof dbVal === 'boolean') return dbVal;
   } catch (err) {
-    if (!_systemConfigReadFailedLogged) {
-      _systemConfigReadFailedLogged = true;
-      const msg = (err && err.message) ? err.message : String(err || 'unknown');
-      console.warn(
-        `   ⚠️  adVisionQc: SystemConfig read failed — falling back to env/default: ${msg}`
-      );
-    }
+    _logSystemConfigFail(null, err);
   }
-  return envEnabled();
+  return false;
 }
 
 /**
  * Async resolver — STATIC pipeline gate (directImageRenderService,
  * imageRecoveryService — recovery is static-only, see that file's header).
- * Precedence, IDENTICAL shape to the legacy resolver, one field swapped:
+ * Precedence:
  *   1. SystemConfig.staticVisionQcEnabled when typeof === 'boolean'
  *      (systemConfigService bridges to the legacy adVisionQcEnabled field
  *      when this one is unset — see that file for the migration reasoning)
- *   2. env STATIC_VISION_QC_ENABLED (falls back to legacy AD_VISION_QC_ENABLED
- *      when STATIC_VISION_QC_ENABLED itself is unset — via staticEnvEnabled)
- *   3. default false
- * Fail-safe: never rejects. deps.getStaticVisionQcEnabled is injectable.
+ *   2. default false
+ * Fail-safe: never rejects. No env fallback. deps.getStaticVisionQcEnabled is injectable.
  */
 async function resolveStaticEnabled(deps = {}) {
   try {
@@ -219,20 +181,14 @@ async function resolveStaticEnabled(deps = {}) {
     const dbVal = await getCfg();
     if (typeof dbVal === 'boolean') return dbVal;
   } catch (err) {
-    if (!_systemConfigReadFailedLogged) {
-      _systemConfigReadFailedLogged = true;
-      const msg = (err && err.message) ? err.message : String(err || 'unknown');
-      console.warn(
-        `   ⚠️  adVisionQc: SystemConfig read failed (static) — falling back to env/default: ${msg}`
-      );
-    }
+    _logSystemConfigFail('static', err);
   }
-  return staticEnvEnabled();
+  return false;
 }
 
 /**
  * Async resolver — VIDEO pipeline gate (brandScriptExecutor). Same shape
- * as resolveStaticEnabled above, independent value, own env fallback chain.
+ * as resolveStaticEnabled above, independent value. No env fallback.
  */
 async function resolveVideoEnabled(deps = {}) {
   try {
@@ -241,15 +197,9 @@ async function resolveVideoEnabled(deps = {}) {
     const dbVal = await getCfg();
     if (typeof dbVal === 'boolean') return dbVal;
   } catch (err) {
-    if (!_systemConfigReadFailedLogged) {
-      _systemConfigReadFailedLogged = true;
-      const msg = (err && err.message) ? err.message : String(err || 'unknown');
-      console.warn(
-        `   ⚠️  adVisionQc: SystemConfig read failed (video) — falling back to env/default: ${msg}`
-      );
-    }
+    _logSystemConfigFail('video', err);
   }
-  return videoEnvEnabled();
+  return false;
 }
 
 /**
@@ -264,36 +214,10 @@ async function resolveVideoEnabled(deps = {}) {
  * to take a synchronous, cache-racy path when it can just await the correct
  * one.
  *
- * STILL ZERO CALL SITES after the 2026-08-21 static/video split, and this
- * function was deliberately NOT split alongside them — it still answers
- * only the legacy, undifferentiated `adVisionQcEnabled` question (via
- * `peekAdVisionQcEnabled`/`refreshAdVisionQcEnabledCache`, unchanged by the
- * split), which is not the same question either new pipeline-specific gate
- * asks. Do not add a new caller to this function for a static- or
- * video-specific decision — use the async `resolveStaticEnabled()` /
- * `resolveVideoEnabled()` instead. Left in place only as a legacy
- * synchronous fallback of last resort, matching the orchestrator's explicit
- * "you may leave it... if you keep it, keep it correct" — it remains
- * correct for the narrower, legacy question it has always answered.
- *
- * PRODUCTION BUG THIS USED TO HAVE, fixed 2026-08-20 (kept here as the
- * cautionary reason nothing should switch back to calling this from a hot
- * path): `refreshAdVisionQcEnabledCache()` is fire-and-forget, so the
- * `peekAdVisionQcEnabled()` immediately below it can only ever see the
- * state from BEFORE that refresh, never the value it just kicked off. As
- * long as `peekAdVisionQcEnabled()` also expired stale entries (pre-fix),
- * any call landing after the 5s TTL — which is the NORMAL case, since real
- * renders are spaced further apart than 5s — read "no fresh entry" and fell
- * through to `envEnabled()`, silently disabling QC even when
- * SystemConfig.adVisionQcEnabled was genuinely `true`. Measured live: 11 of
- * 18 delivered statics stamped `visionQc.disabled:true` with the flag on.
- * `peekAdVisionQcEnabled()` (services/systemConfigService.js) no longer
- * expires its answer this way — see its doc comment for the fix and the
- * fail-safe-direction reasoning — so this function is safe to call again if
- * a genuinely synchronous caller ever needs it. It still answers from
- * `envEnabled()` on a truly cold cache (nothing ever loaded in this
- * process), which matches the documented "unconfigured → off" default.
- * Never throws.
+ * Cache hit (peek returns a real boolean, including a stale-but-loaded
+ * value past the TTL) → that boolean. Cache miss / expired / null / throw
+ * → kick the fire-and-forget refresh and return false for THIS call.
+ * Env is never consulted. Never throws.
  */
 function isEnabled() {
   try {
@@ -303,14 +227,51 @@ function isEnabled() {
     }
     if (typeof cfg.peekAdVisionQcEnabled === 'function') {
       const peeked = cfg.peekAdVisionQcEnabled();
-      // Only a real boolean overrides env. null = "not set" → env.
-      // undefined = never loaded in this process → env.
       if (typeof peeked === 'boolean') return peeked;
     }
   } catch (_) {
     // never break a render over a config module hiccup
   }
-  return envEnabled();
+  return false;
+}
+
+/**
+ * SYNCHRONOUS STATIC gate. Same contract as isEnabled(): cache hit → boolean;
+ * miss/null → kick refresh, return false for this call. No env fallback.
+ */
+function isStaticEnabled() {
+  try {
+    const cfg = require('./systemConfigService');
+    if (typeof cfg.refreshStaticVisionQcEnabledCache === 'function') {
+      cfg.refreshStaticVisionQcEnabledCache();
+    }
+    if (typeof cfg.peekStaticVisionQcEnabled === 'function') {
+      const peeked = cfg.peekStaticVisionQcEnabled();
+      if (typeof peeked === 'boolean') return peeked;
+    }
+  } catch (_) {
+    // never break a render over a config module hiccup
+  }
+  return false;
+}
+
+/**
+ * SYNCHRONOUS VIDEO gate. Same contract as isStaticEnabled().
+ */
+function isVideoEnabled() {
+  try {
+    const cfg = require('./systemConfigService');
+    if (typeof cfg.refreshVideoVisionQcEnabledCache === 'function') {
+      cfg.refreshVideoVisionQcEnabledCache();
+    }
+    if (typeof cfg.peekVideoVisionQcEnabled === 'function') {
+      const peeked = cfg.peekVideoVisionQcEnabled();
+      if (typeof peeked === 'boolean') return peeked;
+    }
+  } catch (_) {
+    // never break a render over a config module hiccup
+  }
+  return false;
 }
 
 /** Test hook: allow the harness to re-arm the one-shot failure log. */
@@ -321,19 +282,18 @@ function _resetSystemConfigFailLogForTests() {
 // ── Gate-off visibility ────────────────────────────────────────────────
 // PRODUCTION FINDING 2026-08-19: a live run (39/39 ads delivered) shipped
 // with visionQc:null on every single ad, static AND video. Root cause was
-// NOT a deploy-timing gap or a swallowed exception — process.env had zero
-// AD_VISION_QC_ENABLED/*QC* keys and no SystemConfig doc existed at all, so
-// resolveEnabled()/isEnabled() correctly fall through to `false`. That part
-// is a real, working gate — but every live caller (directImageRenderService
-// .renderDirectImage, brandScriptExecutor.runVideoVisionQcForAd,
-// imageRecoveryService.maybeQcRecoveredPlate) short-circuits on
-// `!isEnabled()` and returns BEFORE ever reaching runPostRenderQc /
-// runVideoPostRenderQc's own "Flag off" branch below — which is the only
-// code that builds the {skipped:true, disabled:true, reason:...} shape and
-// logs anything. Production never executes that branch, so a flag left off
-// for weeks produces silence in both the DB (Ad.visionQc stays the schema
-// default `null`, indistinguishable from "inspected and passed") and the
-// logs (not one line explains why).
+// NOT a deploy-timing gap or a swallowed exception — no SystemConfig doc
+// existed at all, so resolveEnabled()/isEnabled() correctly fall through
+// to `false`. That part is a real, working gate — but every live caller
+// (directImageRenderService.renderDirectImage, brandScriptExecutor
+// .runVideoVisionQcForAd, imageRecoveryService.maybeQcRecoveredPlate)
+// short-circuits on `!isEnabled()` and returns BEFORE ever reaching
+// runPostRenderQc / runVideoPostRenderQc's own "Flag off" branch below —
+// which is the only code that builds the {skipped:true, disabled:true,
+// reason:...} shape and logs anything. Production never executes that
+// branch, so a flag left off for weeks produces silence in both the DB
+// (Ad.visionQc stays the schema default `null`, indistinguishable from
+// "inspected and passed") and the logs (not one line explains why).
 //
 // warnQcDisabledOnce() is the shared fix: every caller-level early-return
 // now (a) builds this SAME disabled-verdict shape itself via
@@ -349,9 +309,9 @@ function warnQcDisabledOnce(mediaLabel = 'ad') {
   if (now - _qcDisabledWarnedAt < QC_DISABLED_REWARN_MS) return;
   _qcDisabledWarnedAt = now;
   console.warn(
-    `   ⚠️  adVisionQc: AD_VISION_QC_ENABLED is OFF (env unset and no SystemConfig.adVisionQcEnabled ` +
-    `override) — every delivered ${mediaLabel} is shipping WITHOUT vision inspection until this is ` +
-    'turned on. Not a failure by itself — just make sure this is the intended state.'
+    `   ⚠️  adVisionQc: vision QC is OFF (SystemConfig.staticVisionQcEnabled / ` +
+    `videoVisionQcEnabled unset or false) — every delivered ${mediaLabel} is shipping WITHOUT ` +
+    'vision inspection until this is turned on. Not a failure by itself — just make sure this is the intended state.'
   );
 }
 
@@ -1247,9 +1207,18 @@ function buildPersistedVerdict({
 }) {
   return {
     schemaVersion: 1,
+    // `disabled` and `skipped` both mean "not inspected" — a caller must
+    // never be able to construct a verdict that is BOTH not-inspected and
+    // passed:true. This is enforced HERE, not just by caller discipline:
+    // the retired AD_VISION_QC_ENABLED env var used to silently collapse
+    // "gate off" into an absent/null Ad.visionQc that every downstream
+    // reader (summarizeVisionQc, GET /runs/:runId, imageRecoveryService's
+    // qcFailed guard) coerced to "inspected and passed" (see docs/
+    // ALERTING.md's incident writeup). Retiring the env tier must not
+    // reopen that hole through a NEW caller forgetting `passed: false`.
     skipped: !!skipped,
     disabled: !!disabled,
-    passed: !!passed,
+    passed: (skipped || disabled) ? false : !!passed,
     // WHY QC did not inspect (only meaningful when skipped). string|null.
     reason: reason == null ? null : String(reason).slice(0, 500),
     finalAttempt: finalAttempt || null,
@@ -1492,7 +1461,7 @@ async function runPostRenderQc({
         passed: false,
         skipped: true,
         disabled: true,
-        reason: 'AD_VISION_QC_ENABLED=false',
+        reason: DISABLED_REASON_STATIC,
         finalAttempt: 1,
         attempts: []
       }),
@@ -1912,7 +1881,7 @@ async function runVideoPostRenderQc({
         passed: false,
         skipped: true,
         disabled: true,
-        reason: 'AD_VISION_QC_ENABLED=false',
+        reason: DISABLED_REASON_VIDEO,
         finalAttempt: null,
         attempts: []
       })
@@ -2398,14 +2367,15 @@ module.exports = {
   QC_MODEL_ROLE,
   // Flag / model
   isEnabled,
-  envEnabled,
+  isStaticEnabled,
+  isVideoEnabled,
   resolveEnabled,
   // Split gates (2026-08-21)
   parseBoolEnv,
-  staticEnvEnabled,
-  videoEnvEnabled,
   resolveStaticEnabled,
   resolveVideoEnabled,
+  DISABLED_REASON_STATIC,
+  DISABLED_REASON_VIDEO,
   resolveQcModel,
   warnQcDisabledOnce,
   // Pure helpers

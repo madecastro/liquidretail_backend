@@ -890,6 +890,87 @@ const LIFESTYLE_PRESERVE = process.env.STATIC_LIFESTYLE_PRESERVE === 'true';
  */
 const BRAND_LED_COPY = process.env.STATIC_BRAND_LED_COPY !== 'false';
 
+/**
+ * Segment prompt overrides — APPEND-ONLY directives from
+ * config/segmentPromptOverrides.js. Default ON unless the env is the
+ * exact string 'false'. Empty table (the committed default) is a
+ * byte-identical no-op: applySegmentOverrides returns the input prompt
+ * unchanged.
+ */
+const SEGMENT_OVERRIDES_ENABLED = process.env.STATIC_SEGMENT_PROMPT_OVERRIDES !== 'false';
+
+let _segmentOverrideTable = null;
+let _segmentOverrideWarned = false;
+
+function loadSegmentOverrides() {
+  if (_segmentOverrideTable) return _segmentOverrideTable;
+  try {
+    const raw = require('../config/segmentPromptOverrides');
+    if (!Array.isArray(raw)) {
+      if (!_segmentOverrideWarned) {
+        _segmentOverrideWarned = true;
+        console.warn('⚠️  segmentPromptOverrides: table is not an array — treating as []');
+      }
+      _segmentOverrideTable = [];
+      return _segmentOverrideTable;
+    }
+    _segmentOverrideTable = raw;
+    return _segmentOverrideTable;
+  } catch (err) {
+    if (!_segmentOverrideWarned) {
+      _segmentOverrideWarned = true;
+      console.warn(`⚠️  segmentPromptOverrides: failed to load — treating as []: ${err && err.message ? err.message : err}`);
+    }
+    _segmentOverrideTable = [];
+    return _segmentOverrideTable;
+  }
+}
+
+function _setSegmentOverridesForTests(list) {
+  _segmentOverrideTable = Array.isArray(list) ? list : [];
+}
+
+function matchSegmentOverride(entry, ctx) {
+  if (!entry || typeof entry !== 'object') return false;
+  if (entry.enabled === false) return false;
+  if (!entry.id) return false;
+  if (!entry.appendText || !String(entry.appendText).trim()) return false;
+  const m = entry.match || {};
+  if (m.seedStyle != null && m.seedStyle !== ctx.seedStyle) return false;
+  if (m.variantKind != null && m.variantKind !== ctx.variantKind) return false;
+  if (m.surface != null && m.surface !== ctx.surface) return false;
+  if (m.intent != null && m.intent !== ctx.intent) return false;
+  if (m.categoryPrefix != null) {
+    const path = String(ctx.categoryPath || '');
+    if (!path.toLowerCase().startsWith(String(m.categoryPrefix).toLowerCase())) return false;
+  }
+  return true;
+}
+
+function applySegmentOverrides(prompt, ctx) {
+  if (!SEGMENT_OVERRIDES_ENABLED) return { text: prompt, ids: [] };
+  const table = loadSegmentOverrides();
+  const matched = [];
+  for (const entry of table) {
+    if (matchSegmentOverride(entry, ctx || {})) matched.push(entry);
+  }
+  if (!matched.length) return { text: prompt, ids: [] };
+  const block = matched.map((e) => String(e.appendText).trim()).join('\n');
+  return {
+    text: `${prompt}\n\nADDITIONAL DIRECTIVES\n${block}`,
+    ids: matched.map((e) => e.id)
+  };
+}
+
+function promptFlagsSnapshot() {
+  return {
+    fidelityHardening: FIDELITY_HARDENING,
+    lifestylePreserve: LIFESTYLE_PRESERVE,
+    brandLedCopy: BRAND_LED_COPY,
+    segmentOverridesEnabled: SEGMENT_OVERRIDES_ENABLED
+  };
+}
+
 /** The exact pre-2026-08-03 wording. Do not edit — it is the A/B control arm. */
 const LEGACY_PRODUCT_FIDELITY = `The supplied photograph is a PRODUCT REFERENCE ONLY. Reproduce this exact item faithfully — its colour, material, construction and any branding printed on the product itself — then build an entirely new scene around it. Do not reuse the reference's background, crop or lighting.`;
 
@@ -1163,7 +1244,7 @@ function shouldPreserveScene({ seedStyle = null, variantKind = null } = {}) {
   return false;
 }
 
-function buildPrompt({ intentKey, data, product, surface, seedStyle = null, variantKind = null, preserveScene = null, seedAspect = null }) {
+function buildPrompt({ intentKey, data, product, surface, seedStyle = null, variantKind = null, preserveScene = null, seedAspect = null, segment = null }) {
   // Explicit preserveScene=true is harness/test only and STILL requires a
   // lifestyle-or-ugc subject — a packshot must never land on SCENE_PRESERVE
   // even when a caller forces the override. preserveScene=false always wins
@@ -1376,8 +1457,17 @@ Keep the ${product.logoCorner || 'bottom-right'} corner clear of text and graphi
 
 ${geometryBlock(s)}${platformNotesBlock}`;
 
+  const categoryPath = segment && segment.categoryPath ? segment.categoryPath : null;
+  const applied = applySegmentOverrides(prompt, {
+    seedStyle,
+    variantKind,
+    surface,
+    intent: resolved.key,
+    categoryPath
+  });
+
   return {
-    prompt,
+    prompt: applied.text,
     resolved,
     absent,
     emphasis,
@@ -1386,7 +1476,8 @@ ${geometryBlock(s)}${platformNotesBlock}`;
     surface: s,
     policy: effectivePolicy,
     preserveScene: preserve,
-    aspectTreatment: preserve ? aspectTreatment : null
+    aspectTreatment: preserve ? aspectTreatment : null,
+    appliedOverrides: applied.ids
   };
 }
 
@@ -1413,6 +1504,12 @@ module.exports = {
   SURFACE_EDGE_MARGIN_PCT,
   describeSurfaces,
   BRAND_LED_COPY,
+  SEGMENT_OVERRIDES_ENABLED,
+  loadSegmentOverrides,
+  matchSegmentOverride,
+  applySegmentOverrides,
+  promptFlagsSnapshot,
+  _setSegmentOverridesForTests,
   // Phase B PMax static overlay — harnesses call these directly.
   PMAX_STATIC_PLATFORM_NOTES,
   PLATFORM_NOTES,

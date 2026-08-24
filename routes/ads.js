@@ -3452,7 +3452,7 @@ router.get('/runs/:runId', async (req, res) => {
     // best-effort like them too.
     //
     // FIXED 2026-08-19 (production incident: a 39-ad run had visionQc:null
-    // on every ad, static AND video — AD_VISION_QC_ENABLED was unset and no
+    // on every ad, static AND video — SystemConfig vision-QC gates were unset and no
     // SystemConfig override existed, so QC never ran). shippedWithoutQcCount
     // used to query ONLY `'visionQc.skipped': true` — "QC attempted and
     // explicitly skipped" — which is zero whenever the underlying render
@@ -3556,7 +3556,7 @@ router.get('/runs/:runId', async (req, res) => {
       // from an intentional off-switch. These two counts split that:
       //   qcDisabled    — `visionQc.disabled:true`. The deliberate stamp
       //                    (adVisionQcService.buildPersistedVerdict with
-      //                    disabled:true) written when AD_VISION_QC_ENABLED
+      //                    disabled:true) written when SystemConfig vision QC
       //                    resolves false. Expected, not alarming.
       //   qcUnavailable — `visionQc.skipped:true` but NOT disabled. Covers
       //                    every other reason QC did not produce a real
@@ -3629,7 +3629,7 @@ router.get('/runs/:runId', async (req, res) => {
       //     residual (pre-fix historical ads, or a video ad whose source
       //     Media never resolved a Brand).
       //   qcDisabled — subset of shippedWithoutQc: the gate was
-      //     DELIBERATELY off (AD_VISION_QC_ENABLED resolved false).
+      //     DELIBERATELY off (SystemConfig vision QC resolved false).
       //     Expected, not alarming.
       //   qcUnavailable — subset of shippedWithoutQc: the gate was ON but
       //     QC could not produce a real verdict (a vision-call exception, or

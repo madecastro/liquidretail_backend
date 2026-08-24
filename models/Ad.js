@@ -471,7 +471,8 @@ const adSchema = new mongoose.Schema({
   //               discarded, discardedRenderUrl, imageGeneration }] }.
   // Per-attempt renderUrl is KEPT when discarded — the first render was
   // already paid for (mirrors Omni master keep on titling failure).
-  // Null when AD_VISION_QC_ENABLED is off or the ad predates this field.
+  // Null when vision QC is off (or the ad predates this field). Gate-off
+  // now stamps a disabled verdict rather than leaving this null.
   visionQc:           { type: mongoose.Schema.Types.Mixed, default: null },
   // Per-stage wall time in ms for THIS render, whichever pipeline ran:
   // { deriveMs, renderMs, uploadMs }. Answers "why is this ad slow" without a
