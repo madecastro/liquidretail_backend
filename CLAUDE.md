@@ -82,23 +82,53 @@ All four sit as siblings under `/Volumes/Sayulita/Projects/RS/`.
 
 ---
 
-## Three roles (`ADGEN_ROLE` → `src/entrypoint.js`)
+## Four roles (`ADGEN_ROLE` → `src/entrypoint.js`)
 
-One image, one entrypoint. `src/config.js:16-19` **exits 1** unless
-`ADGEN_ROLE` is exactly `api`, `orchestrator`, or `renderer`. Boot:
-connect Mongo → start the matching role → install SIGTERM/SIGINT
-(`src/entrypoint.js:9-45`).
+One image, one entrypoint. `src/config.js` **exits 1** unless `ADGEN_ROLE`
+is exactly `api`, `orchestrator`, `renderer`, or `titler`. Boot: connect
+Mongo → start the matching role → install SIGTERM/SIGINT.
 
-`render.yaml` maps the three Render services:
+`render.yaml` maps the four Render services:
 
 | Role | Render service | What the code actually does |
 |---|---|---|
-| `api` | `adgen-api` (web, starter, `:3100/health`) | Express app with **only** `GET /health` (`src/routes/api.js:13-21`). 200 if mongoose `readyState === 1`, else 503. No inspect endpoints, no generate API. |
-| `orchestrator` | `adgen-orchestrator` (worker, starter, singleton) | Polls `CampaignRun.countDocuments({ status: 'preparing' })` and logs. **No writes, no lease, no expansion** (`src/services/orchestrator.js:24-32`). Phase 2 is still a comment. |
-| `renderer` | `adgen-renderer` (worker, autoscale) | The live path. `renderer.run()` → `poll()` burst-claims up to `ADGEN_MAX_INFLIGHT` ads and fires `processAd` as unawaited promises (`src/services/renderer.js:649-669`). |
+| `api` | `adgen-api` (web, starter, `:3100/health`) | Express app with **only** `GET /health`. 200 if mongoose `readyState === 1`, else 503. No inspect endpoints, no generate API. |
+| `orchestrator` | `adgen-orchestrator` (worker, starter, singleton) | Polls `CampaignRun.countDocuments({ status: 'preparing' })` and logs. **No writes, no lease, no expansion**. Phase 2 is still a comment. |
+| `renderer` | `adgen-renderer` (worker, autoscale) | The live path. `renderer.run()` → `poll()` burst-claims up to `ADGEN_MAX_INFLIGHT` ads and fires `processAd` as unawaited promises. |
+| `titler` | `adgen-titler` (worker, autoscale, PHASE 3) | Out-of-process Remotion titling — polls for `{status:'rendering', veoVideoUrl:{$ne:null}, titlingNeeded:true, claimedByWorker:null}` when `ADGEN_TITLER_ENABLED=true`. Ships dark by default. |
 
-Worker identity: `ADGEN_WORKER_ID` or auto `${ROLE}-${random}` 
-(`src/config.js:30-31`). Stamped onto `Ad.claimedByWorker`.
+Worker identity: `ADGEN_WORKER_ID` or auto `${ROLE}-${random}`. Stamped onto
+`Ad.claimedByWorker`.
+
+### The titler handoff — env-var switchover (Phase 3, 2026-08-24)
+
+The renderer's video path, when `isTitlerEnabled()` is true, atomically
+stamps `veoVideoUrl` + `titlingNeeded: true` + clears the claim, all in the
+SAME `$set`. It returns without titling (no in-process Remotion, no
+bumpRunCounter). The titler role picks up the row on its next poll and
+does Remotion out-of-process where Chrome gets the full 8 GB without
+contending with the renderer's poll loop / Atlas HTTP / static submits.
+
+**Money invariants preserved.** The persist-write is ONE $set (see the
+long-standing veoVideoUrl+veoReferenceImages co-persist rule — same
+argument). The renderer's handoff write is owner-scoped
+(`claimedByWorker: WORKER_ID`). The titler's terminal write is
+`status:{$in:['rendering','draft']}` guarded so vision-QC-`failed` verdicts
+are not resurrected to `draft`. The titler NEVER calls Atlas.
+
+**Rollback path.** Flip `ADGEN_TITLER_ENABLED=false` and the renderer
+titles in-process again — the renderer's Remotion path was NOT deleted
+(Phase 4 is when that goes away, after the switchover is proven stable).
+Both paths coexist; the flag chooses. `config/defaults.env` ships `false`.
+
+**Duplication.** `titler.js` duplicates several helpers from `renderer.js`
+(`startAdHeartbeat`, `bumpRunCounter`, `maybeFinalizeRun`,
+`settleNonDraftTerminal`, `notifyRunFinalized`, the per-run heartbeat
+plumbing). Phase 4 consolidates these when the renderer's copies vanish
+with the code that uses them. If you edit one copy, edit the other.
+
+Pinned by `scripts/verifyTitlerHandoff.js` (44 checks, revert-proven on
+10 targeted mutations covering both sides + config + render.yaml).
 
 ---
 
