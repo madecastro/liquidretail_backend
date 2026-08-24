@@ -23,6 +23,7 @@
 // Phase 1c ships.
 
 const { POLL_MS, WORKER_ID, MAX_INFLIGHT, isAdgenRendererEnabled } = require('../config');
+const { concurrency } = require('./concurrency');
 const {
   isStaleTopologyError,
   reconnectAfterStaleTopology,
@@ -106,6 +107,148 @@ const { prepareStoryboard: veoPrepareStoryboard } = require('./videoRouter');
 const DERIVE_MASTER_WAIT_MS    = Number(process.env.DERIVE_MASTER_WAIT_MS    || 60_000);  // 60s
 const DERIVE_MASTER_POLL_MS    = Number(process.env.DERIVE_MASTER_POLL_MS    || 5_000);   // 5s poll
 const MAX_DERIVE_WAIT_ATTEMPTS = Number(process.env.MAX_DERIVE_WAIT_ATTEMPTS || 60);      // 60 × ~60s = 60 min ceiling per derive
+
+// ── PER-AD TITLING HEARTBEAT ──────────────────────────────────────────────
+// Ported from liquidretail_backend routes/ads.js:2704. Read that, and
+// services/campaignRunHeartbeat.js, before changing anything here — the
+// gating and the cap below are load-bearing, not ceremony.
+//
+// WHY IT EXISTS. models/Ad.js is `timestamps: false`, so `updatedAt` only
+// moves when written explicitly, and claimOne() writes only claimedByWorker
+// /claimedAt. During the Atlas Omni poll we are fine — pollPrediction calls
+// adStage every ~5s and that $sets updatedAt. But after the master persists
+// we enter Remotion titling, which queues behind REMOTION_QUEUE_CONCURRENCY
+// with NO Ad write while it waits. Backend's worker runs bootRecoveryService
+// against this SAME collection, ungated on ADGEN_RENDERER_ENABLED, selecting
+// { status:'rendering', updatedAt < now-5min, HAS_RECEIPT } — so a perfectly
+// healthy adgen titling job becomes eligible to be "recovered" out from
+// under us, after which backend web's titlingResumeService titles the same
+// paid master concurrently. Two Remotion renders, one ~$0.90 asset, both
+// writing renderUrl.
+//
+// The OOM fix made this MORE likely, not less: REMOTION_QUEUE_CONCURRENCY
+// went 4 -> 2 (measured 1.97 GiB/slot, not the committed ~0.9), so per-ad
+// queue wait is longer and the 5-minute window is easier to reach.
+//
+// bootRecovery's own comment (backend services/bootRecoveryService.js:34-36)
+// says the quiet part: "renderOne heartbeats updatedAt every 60s, so an ad
+// untouched for RESUME_STALE_MIN minutes has missed several beats and is not
+// being actively rendered by anyone." That calibration assumes a 60s beat
+// EXISTS. adgen has never had one, so RESUME_STALE_MIN has been measuring
+// nothing for every adgen row — this does not just close a steal window, it
+// makes an existing safety margin mean what its own comment says it means.
+const AD_HEARTBEAT_MS = Number(process.env.AD_HEARTBEAT_MS || 60_000);   // 60s, as backend
+
+// SAFETY FLOOR ON THE INTERVAL ITSELF — adversarial review (2026-08-24) found
+// this relationship was documented in prose but nowhere enforced: nothing
+// stopped a future AD_HEARTBEAT_MS edit from silently exceeding backend's
+// RESUME_STALE_MIN (bootRecoveryService.js, default 5min/300_000ms) and
+// defeating the whole mechanism — a beat slower than the recovery window
+// means recovery can fire before a SINGLE beat has landed. 90s is 1/3.3 of
+// the 5min default, well inside the "five missed heartbeats" margin
+// bootRecovery's own comment describes; loud rather than silent because a
+// misconfigured interval here is a money-adjacent failure, not a style nit.
+if (AD_HEARTBEAT_MS > 90_000) {
+  console.warn(
+    `renderer[${WORKER_ID}]: AD_HEARTBEAT_MS=${AD_HEARTBEAT_MS}ms is dangerously close to or ` +
+    'above backend RESUME_STALE_MIN (default 5min) — a live titling job could be recovered ' +
+    'out from under this render. Keep this well under 90s unless RESUME_STALE_MIN moved too.'
+  );
+}
+
+// TOTAL LIFETIME CAP — mandatory, and the hazard here is WORSE than the run
+// case campaignRunHeartbeat guards. An uncapped beat on a Remotion render
+// that never settles keeps this row out of bootRecoveryService's reach
+// FOREVER, and the thing stranded is a master we have already paid ~$0.90
+// for. Past the cap the beat stops, updatedAt goes stale, and recovery
+// behaves exactly as it did before this existed. Adversarial review caught
+// the absence of the equivalent cap in the run heartbeat; not repeating it.
+//
+// DERIVED FROM LIVE CONCURRENCY, not hardcoded — REMOTION_QUEUE_CONCURRENCY
+// was 4 before the 2026-08-21 OOM and is 2 today; a future re-raise (more RAM)
+// or another drop must not silently invalidate a number baked in at review
+// time. Worst-case queue depth is MAX_INFLIGHT ads all queued behind
+// REMOTION_QUEUE_CONCURRENCY titling slots, at a MEASURED single-render time
+// of 76s (concurrency.js REMOTION_QUEUE_CONCURRENCY 'why'). 3x that for
+// headroom — 76s is one measurement, not a distribution, and 1080p render
+// time is not guaranteed linear in queue depth if memory pressure forces
+// swapping under concurrency. Floored at 10 min so a very low concurrency
+// value cannot shrink the cap to uselessness, and left far below the 4h run
+// cap so the two heartbats can never disagree about a wedged render.
+const REMOTION_RENDER_MS_MEASURED = 76_000;
+const AD_HEARTBEAT_MAX_MS = Number(process.env.AD_HEARTBEAT_MAX_MS) || Math.max(
+  10 * 60 * 1000,
+  3 * Math.ceil(MAX_INFLIGHT / concurrency.REMOTION_QUEUE_CONCURRENCY) * REMOTION_RENDER_MS_MEASURED
+);
+
+// ACCEPTED RESIDUAL — stopping the beat does not stop the render. When the
+// cap fires, Remotion keeps running in THIS process; we have only stopped
+// telling Mongo about it. If the render is still genuinely alive past the
+// cap (not hung, just slow — the swapping/memory-pressure case above), the
+// row now reads as abandoned and backend recovery can title the same paid
+// master concurrently with our own still-running job. This is the SAME
+// trade campaignRunHeartbeat's own 4h cap makes ("a batch legitimately
+// longer than 4h would be reaped") — accepted there for the identical
+// reason: an uncapped beat on a render that never settles is strictly
+// worse, because it strands a paid master out of recovery's reach forever
+// instead of merely risking a race on one that runs unusually long. Actually
+// cancelling the in-flight Remotion job at the cap would close this
+// properly; that reaches into remotionRenderService's queue and is out of
+// scope here. The cap's calibration above is the mitigation available at
+// this layer — keep it comfortably above measured render time, not tight.
+
+/**
+ * Beat one claimed ad's `updatedAt` while THIS worker is titling it.
+ * Returns { stop } — call it in a finally; a double stop is a no-op.
+ *
+ * WRITES ONLY updatedAt. Never status, never titlingResumeState, never a
+ * counter — same rule as campaignRunHeartbeat, for the same reason: a
+ * heartbeat that touched outcome state would tell an operator work happened
+ * that did not.
+ *
+ * DELIBERATE DIVERGENCE FROM THE PORTED SHAPE — the claimedByWorker term.
+ * Backend's beat cannot express it because backend never sets that field;
+ * renderer.js is the only writer of it in either repo. Requiring it here
+ * means that if we somehow no longer own the claim we STOP beating, instead
+ * of keeping another owner's row artificially alive and out of reach of the
+ * recovery that should now have it. This is an improvement on the original,
+ * not drift — do not "fix" it back when diffing the two copies.
+ */
+function startAdHeartbeat(adId) {
+  const openedAt = Date.now();
+  let stopped = false;
+  const timer = setInterval(() => {
+    // The cap. See AD_HEARTBEAT_MAX_MS.
+    if (Date.now() - openedAt > AD_HEARTBEAT_MAX_MS) {
+      clearInterval(timer);
+      stopped = true;
+      console.warn(
+        `renderer[${WORKER_ID}]: titling heartbeat for ad=${String(adId).slice(-6)} hit the ` +
+        `${Math.round(AD_HEARTBEAT_MAX_MS / 60000)}m cap — releasing it to recovery`
+      );
+      return;
+    }
+    Ad.updateOne(
+      {
+        _id: adId,
+        claimedByWorker: WORKER_ID,
+        $or: [
+          { status: 'rendering' },
+          { status: 'draft', titlingResumeState: 'claimed' }
+        ]
+      },
+      { $set: { updatedAt: new Date() } }
+    ).catch(() => {});   // a missed beat is survivable; the next one lands
+  }, AD_HEARTBEAT_MS);
+  if (typeof timer.unref === 'function') timer.unref();
+  return {
+    stop() {
+      if (stopped) return;
+      stopped = true;
+      clearInterval(timer);
+    }
+  };
+}
 
 let stopping = false;
 
@@ -579,7 +722,15 @@ async function renderVideo(ad) {
     if (brandDoc) {
       adStage(adId, `titling ${ad.aspectRatio || '9:16'} (derive)`);
       const adFinal = await Ad.findById(adId).lean();
-      const chromeOut = await renderBrandScriptAndSave({ ad: adFinal, brand: brandDoc });
+      // Beat updatedAt for the whole titling window — including the queue
+      // wait, which writes nothing otherwise. See startAdHeartbeat.
+      const beat = startAdHeartbeat(adId);
+      let chromeOut;
+      try {
+        chromeOut = await renderBrandScriptAndSave({ ad: adFinal, brand: brandDoc });
+      } finally {
+        beat.stop();   // must not outlive the render, on success OR throw
+      }
       if (chromeOut?.skipped) {
         console.log(`renderer[${WORKER_ID}]: VIDEO DERIVE no-chrome ad=${shortId} — shipping master`);
       }
@@ -661,7 +812,15 @@ async function renderVideo(ad) {
   if (brandDoc) {
     adStage(adId, `titling ${ad.aspectRatio || '9:16'}`);
     const adFinal = await Ad.findById(adId).lean();
-    const chromeOut = await renderBrandScriptAndSave({ ad: adFinal, brand: brandDoc });
+    // Beat updatedAt for the whole titling window — including the queue
+    // wait, which writes nothing otherwise. See startAdHeartbeat.
+    const beat = startAdHeartbeat(adId);
+    let chromeOut;
+    try {
+      chromeOut = await renderBrandScriptAndSave({ ad: adFinal, brand: brandDoc });
+    } finally {
+      beat.stop();   // must not outlive the render, on success OR throw
+    }
     if (chromeOut?.skipped) {
       console.log(`renderer[${WORKER_ID}]: VIDEO MASTER no-chrome ad=${shortId} — shipping master`);
     }
