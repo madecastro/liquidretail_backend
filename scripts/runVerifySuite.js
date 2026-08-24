@@ -188,8 +188,16 @@ async function main() {
     console.log(`${mark} ${r.script}  (${r.ms}ms)${r.timedOut ? '  [TIMED OUT]' : ''}`);
   }
 
-  const failed = results.filter((r) => r.code !== 0);
-  const passed = results.length - failed.length;
+  const expected = loadExpectedFailures();
+
+  const allFailed = results.filter((r) => r.code !== 0);
+  const failed = allFailed.filter((r) => !expected[r.script]);          // real
+  const expectedFailed = allFailed.filter((r) => expected[r.script]);   // known, tolerated
+  // A listed script that PASSED. This is what stops the allowlist rotting into a
+  // rug: you cannot fix a harness and leave it suppressed, and you cannot park a
+  // flaky script here and forget it. Removing the entry is part of the fix.
+  const stale = results.filter((r) => r.code === 0 && expected[r.script]);
+  const passed = results.length - allFailed.length;
 
   if (failed.length) {
     console.log(`\n--- FAILURE DETAIL (${failed.length} of ${results.length}) ---`);
@@ -200,11 +208,60 @@ async function main() {
     }
   }
 
+  if (expectedFailed.length) {
+    console.log(`\n--- EXPECTED FAILURES (${expectedFailed.length}), from scripts/expected-failures.json ---`);
+    for (const r of expectedFailed) {
+      console.log(`  ~ ${r.script} — ${expected[r.script].reason}`);
+      console.log(`      remove when: ${expected[r.script].removeWhen}`);
+    }
+  }
+
   console.log(`\nrunVerifySuite: ${passed}/${results.length} passed in ${elapsedSec}s wall clock (concurrency=${concurrency}).`);
+  if (expectedFailed.length) {
+    console.log(`EXPECTED-FAIL (not failing the run): ${expectedFailed.map((r) => r.script).join(', ')}`);
+  }
+
+  if (stale.length) {
+    console.log(`\n❌ STALE EXPECTED-FAILURE ENTR${stale.length === 1 ? 'Y' : 'IES'}: ` +
+      `${stale.map((r) => r.script).join(', ')}`);
+    console.log('   These are listed in scripts/expected-failures.json but PASSED. Whatever they');
+    console.log('   were waiting on is fixed — delete the entry. An allowlist that outlives its');
+    console.log('   reason silently suppresses a live harness.');
+    process.exitCode = 1;
+  }
+
   if (failed.length) {
     console.log(`FAILED: ${failed.map((r) => r.script).join(', ')}`);
     process.exitCode = 1;
   }
+}
+
+// Scripts known to fail on master. See scripts/expected-failures.json for the
+// contract — in particular that a listed script which PASSES fails the run.
+// A malformed or missing file is a hard error, never a silent empty allowlist:
+// "everything is expected to fail" and "nothing is" must not be reachable by typo.
+function loadExpectedFailures() {
+  const p = path.join(SCRIPTS_DIR, 'expected-failures.json');
+  if (!fs.existsSync(p)) return {};
+  let parsed;
+  try {
+    parsed = JSON.parse(fs.readFileSync(p, 'utf8'));
+  } catch (err) {
+    console.error(`runVerifySuite: scripts/expected-failures.json is not valid JSON — ${err.message}`);
+    process.exit(1);
+  }
+  const map = parsed && parsed.expectedFailures;
+  if (!map || typeof map !== 'object' || Array.isArray(map)) {
+    console.error('runVerifySuite: scripts/expected-failures.json must contain an "expectedFailures" object');
+    process.exit(1);
+  }
+  for (const [script, meta] of Object.entries(map)) {
+    if (!meta || !meta.reason || !meta.removeWhen) {
+      console.error(`runVerifySuite: expected-failures entry "${script}" needs both "reason" and "removeWhen"`);
+      process.exit(1);
+    }
+  }
+  return map;
 }
 
 main().catch((err) => {
