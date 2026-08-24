@@ -59,29 +59,65 @@ const RAW = fs.readFileSync(path.join(ROOT, 'src/services/renderer.js'), 'utf8')
 // against code that deleted both. Same lesson verifyLlmErrorCodes D5 learned.
 // Regex-literal aware: `replace(/^['"]|['"]$/g, '')` desyncs a naive quote
 // tracker for the rest of the file (see productDetailsService.js:56).
-function stripComments(src) {
+/**
+ * One character-walk that both strips comments AND records string/template
+ * literal spans in the OUTPUT's coordinate space. Regex-vs-division
+ * disambiguation is the SAME prevSig heuristic stripComments always used —
+ * reusing it here, not re-implementing it, is what stops the string tracker
+ * from being confused by a quote INSIDE a regex literal (this file's own
+ * /['"]draft['"]/ , for instance): a naive string-only scan applied
+ * separately would see that ' and think a string just opened.
+ *
+ * WHY THIS EXISTS: adversarial review named a "string-decoy" hole in E2/E3 —
+ * a string literal whose CONTENTS spell out the exact text a check searches
+ * for (e.g. a log message containing "Object.assign(set, buildVideoQcFailure
+ * Fields(") would satisfy a plain .indexOf/regex scan even though it is
+ * inert data, not code. stringSpans lets a check reject a match that falls
+ * inside someone else's string.
+ */
+function analyzeSource(src) {
   let out = ''; let i = 0;
   let inS = null, inBlock = false, inLine = false, inRe = false;
   let prevSig = '';
+  const stringSpans = [];
+  let stringStart = -1;
   while (i < src.length) {
     const c = src[i], d = src[i + 1];
     if (inLine)       { if (c === '\n') { inLine = false; out += c; } i++; continue; }
     if (inBlock)      { if (c === '*' && d === '/') { inBlock = false; i += 2; } else i++; continue; }
     if (inS)          { out += c; if (c === '\\') { out += src[i + 1] || ''; i += 2; continue; }
-                        if (c === inS) inS = null; i++; continue; }
+                        if (c === inS) { inS = null; stringSpans.push([stringStart, out.length]); }
+                        i++; continue; }
     if (inRe)         { out += c; if (c === '\\') { out += src[i + 1] || ''; i += 2; continue; }
                         if (c === '/') inRe = false; i++; continue; }
     if (c === '/' && d === '/') { inLine = true; i += 2; continue; }
     if (c === '/' && d === '*') { inBlock = true; i += 2; continue; }
-    if (c === '"' || c === "'" || c === '`') { inS = c; out += c; i++; continue; }
+    if (c === '"' || c === "'" || c === '`') { inS = c; stringStart = out.length; out += c; i++; continue; }
     if (c === '/' && /[=(,:[!&|?{};+\-*%^~<>]/.test(prevSig)) { inRe = true; out += c; i++; continue; }
     out += c;
     if (!/\s/.test(c)) prevSig = c;
     i++;
   }
-  return out;
+  return { stripped: out, stringSpans };
 }
-const SRC = stripComments(RAW);
+
+/**
+ * True if `idx` — the match's OWN START position — sits STRICTLY INSIDE the
+ * interior of a tracked string (after its opening quote, before its closing
+ * quote). Deliberately NOT an overlap test: a real, legitimate match like
+ * `status: 'draft'` starts in CODE (at `status`) and its tail legitimately
+ * runs into the 'draft' string's own span — an overlap test would call that
+ * a decoy too, rejecting genuine code. A decoy, by contrast, has its match
+ * START somewhere in the MIDDLE of an unrelated string's content, because
+ * the whole needle was typed as characters between someone else's quotes.
+ */
+function isInsideAString(stringSpans, idx) {
+  return stringSpans.some(([s, e]) => idx > s && idx < e);
+}
+
+function stripComments(src) { return analyzeSource(src).stripped; }
+
+const { stripped: SRC, stringSpans: SRC_STRINGS } = analyzeSource(RAW);
 
 let failures = 0;
 let passes = 0;
@@ -290,14 +326,22 @@ console.log('\n── E: the upstream QC-verdict writer cannot be silently defea
 
 const BSE_PATH = path.join(ROOT, 'src/services/brandScriptExecutor.js');
 const BSE_RAW = fs.readFileSync(BSE_PATH, 'utf8');
-const BSE_SRC = stripComments(BSE_RAW);
+const { stripped: BSE_SRC, stringSpans: BSE_STRINGS } = analyzeSource(BSE_RAW);
 
 function bseFnBody(name) {
   const m = new RegExp(`async function ${name}\\s*\\(`).exec(BSE_SRC);
   if (!m) return null;
-  return balanced(BSE_SRC, BSE_SRC.indexOf('{', BSE_SRC.indexOf(')', m.index)), '{', '}');
+  const openBrace = BSE_SRC.indexOf('{', BSE_SRC.indexOf(')', m.index));
+  return { body: balanced(BSE_SRC, openBrace, '{', '}'), offset: openBrace };
 }
-const uploadBody = bseFnBody('uploadRenderAndStamp');
+const uploadFn = bseFnBody('uploadRenderAndStamp');
+const uploadBody = uploadFn && uploadFn.body;
+// BSE_STRINGS shifted into uploadBody's own local coordinate space, so E2/E3
+// can reject a match without re-walking the whole file for every check.
+const uploadStrings = uploadFn
+  ? BSE_STRINGS.map(([s, e]) => [s - uploadFn.offset, e - uploadFn.offset])
+      .filter(([s]) => s >= 0)
+  : [];
 
 check('E1 uploadRenderAndStamp() is present and its body extracts', () => {
   assert.ok(uploadBody && uploadBody.length > 200,
@@ -305,15 +349,60 @@ check('E1 uploadRenderAndStamp() is present and its body extracts', () => {
 });
 
 check('E2 [THE REAL MECHANISM] the QC-failure merge runs AFTER the draft literal, in the SAME object', () => {
-  const draftIdx = uploadBody.search(/status:\s*['"]draft['"]/);
-  const assignIdx = uploadBody.indexOf('Object.assign(set, buildVideoQcFailureFields(');
-  assert.ok(draftIdx >= 0, "no status:'draft' literal found in uploadRenderAndStamp");
-  assert.ok(assignIdx >= 0, 'buildVideoQcFailureFields merge not found in uploadRenderAndStamp');
+  // [ANTI-DECOY] Every match is checked against uploadStrings — a match
+  // whose START falls inside a tracked string span is a decoy (a log
+  // message or comment-that-survived-as-a-string-literal quoting the exact
+  // text this check looks for), not real code, and is skipped rather than
+  // trusted. Comments are already stripped upstream; this additionally
+  // protects against the text surviving inside a STRING, which stripComments
+  // deliberately preserves verbatim.
+  let draftIdx = -1;
+  {
+    const RE = /status:\s*['"]draft['"]/g;
+    let m;
+    while ((m = RE.exec(uploadBody))) {
+      if (!isInsideAString(uploadStrings, m.index)) { draftIdx = m.index; break; }
+    }
+  }
+  let assignIdx = -1;
+  {
+    const needle = 'Object.assign(set, buildVideoQcFailureFields(';
+    let from = 0;
+    while (true) {
+      const idx = uploadBody.indexOf(needle, from);
+      if (idx === -1) break;
+      if (!isInsideAString(uploadStrings, idx)) { assignIdx = idx; break; }
+      from = idx + needle.length;
+    }
+  }
+  assert.ok(draftIdx >= 0, "no REAL (non-string-decoy) status:'draft' literal found in uploadRenderAndStamp");
+  assert.ok(assignIdx >= 0, 'no REAL (non-string-decoy) buildVideoQcFailureFields merge found in uploadRenderAndStamp');
   assert.ok(assignIdx > draftIdx,
     "Object.assign must run AFTER 'status: draft' so its key overwrites it in the same object. " +
     'Reorder these two lines (or delete the merge) and a real QC failure ships as draft again ' +
     'with every check above still green, because renderer.js only ever receives the already-wrong ' +
     "verdict this function handed it.");
+
+  check('E2b [ANTI-RESURRECTION] nothing re-writes status AFTER the merge, before Mongo sees it', () => {
+    // The last-write hole: order-correct (assignIdx > draftIdx) is not
+    // enough if a THIRD write — a direct `set.status = ...` reassignment, or
+    // a second Object.assign(set, ...) — appears between the merge and the
+    // Ad.updateOne call that actually persists `set`, undoing it again.
+    const updateOneIdx = uploadBody.indexOf('Ad.updateOne(', assignIdx);
+    const scanEnd = updateOneIdx === -1 ? uploadBody.length : updateOneIdx;
+    const window = uploadBody.slice(assignIdx + 'Object.assign(set, buildVideoQcFailureFields('.length, scanEnd);
+    const windowOffset = assignIdx + 'Object.assign(set, buildVideoQcFailureFields('.length;
+    const resurrections = [];
+    for (const re of [/\bset\s*\.\s*status\s*=/g, /Object\.assign\s*\(\s*set\s*,/g]) {
+      let m;
+      while ((m = re.exec(window))) {
+        if (!isInsideAString(uploadStrings, windowOffset + m.index)) resurrections.push(m[0]);
+      }
+    }
+    assert.strictEqual(resurrections.length, 0,
+      `something re-touches "set" between the QC merge and the Ad.updateOne write that persists ` +
+      `it, undoing the merge: ${resurrections.join(', ')}`);
+  });
 });
 
 check('E3 the merge target is the SAME object the draft literal was declared on', () => {
