@@ -2,7 +2,7 @@
   "version": 1,
   "backendRef": "origin/main",
   "backendHead": "a8e812db398a8813796db2320b26b9d0477e4292",
-  "generatedAt": "2026-08-24T17:15:23.780Z",
+  "generatedAt": "2026-08-24T18:16:43.358Z",
   "files": {
     "models/Ad.js": {
       "backendHash": "8e4951d5a020ada681e2e83f4c1869faf4e74e00b6c4afa1a7de71105b72aca4",
@@ -939,7 +939,8 @@
     "services/quoteSnippetService.js": {
       "backendHash": "d5f4a2e9c1829ac711e7db572787880d56200e5ac320ba1c74f9ec2108dea0f8",
       "backendSha": "3a3c06bd217ac36e4fa23c19ac9934a226256764",
-      "status": "synced"
+      "status": "fork",
+      "reason": "adgen-only per-process LRU cache added in a391de8 (kills duplicate extractSnippet LLM calls: 9 ads, identical review text, one ~15s call each). NOT a permanent fork — backend's copy still has the duplicating behaviour (services/quoteSnippetService.js cacheKey:null at :524/:710, no LRU), so backend is paying the same bill. PORT PENDING to backend; re-reconcile as synced once ported."
     },
     "services/ratingDisplay.js": {
       "backendHash": "da5d1a8454ff8bcf1dc9e35b73656c9ec31b33e49691b3e92587323db985e8e7",
