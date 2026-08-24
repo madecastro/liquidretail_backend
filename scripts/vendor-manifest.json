@@ -512,7 +512,8 @@
     "services/atlasVideoService.js": {
       "backendHash": "6fc231e0773ebf194f83e97d3b454660ba5d3da2193e4a7284ea03744cadd921",
       "backendSha": "149862fdcde316f7d22a706bf627d7ca9f9f091e",
-      "status": "synced"
+      "status": "fork",
+      "reason": "generateForAd now has a resume-from-receipt gate (shouldResumeAttempt) so a re-claimed, receipt-holding ad does not double-bill Atlas Omni. Backend does not have this yet — adgen is the current render-owning service and the priority target; backend's own out-of-band bootRecoveryService sweep is its existing mitigation. Not a permanent fork: port to backend if/when the same re-claim exposure is prioritized there."
     },
     "services/basePlateCropService.js": {
       "backendHash": "d41de1310b463a27ef7531770fa58353becbfa97bf54436e50fbf59f1496d3ee",
@@ -1229,7 +1230,8 @@
     "services/videoRouter.js": {
       "backendHash": "f23861150ec146820336da11db4459c5abdf001b8ce926b518e28d328b7fe247",
       "backendSha": "87cfdd0085127c63b70ff69b13cd16db463eca1d",
-      "status": "synced"
+      "status": "fork",
+      "reason": "threads generateForAd's new allowResume parameter through to atlasVideoService.generateForAd — see services/atlasVideoService.js's reconcile reason for the full context. Backend's videoRouter.js does not need this yet since it doesn't have the parameter to thread."
     },
     "services/whisperService.js": {
       "backendHash": "5d6e707d7298527e9de75225a5210219ab565e55c46ebd97d72c078df5402ba3",

@@ -7,9 +7,18 @@
 // instance replacement is about to kill. Releasing a `rendering` ad reproduces
 // claimOne's filter exactly ({status:'rendering', claimedByWorker:null,
 // renderRoute:{$in:['html_gen','veo']}}), so the peer re-enters renderVideo /
-// renderStatic from the top and calls generateForAd again. generateForAd has no
-// resume-from-receipt guard, so any ad already holding a spend receipt gets its
-// generation bought a SECOND time.
+// renderStatic from the top and calls generateForAd again.
+//
+// UPDATED: generateForAd NOW has a resume-from-receipt guard
+// (shouldResumeAttempt, atlasVideoService.js — pinned by
+// scripts/verifyVideoResumeFromReceipt.js), so a re-entry that DOES slip past
+// this file's own release guard is no longer an automatic double-bill on its
+// own. This file still matters for the SAME reason it always did: shutdown's
+// release is the other half of defense in depth — receiptFree() here stops a
+// paid claim from being handed to a peer at all, so the resume guard in
+// generateForAd is a backstop for paths THIS file cannot see (a future
+// claim-TTL sweeper, a SIGKILL/OOM the shutdown handler never runs for), not
+// a reason to relax the check here.
 //
 // services/spendReceipt.js states the rule: "a requeue may only ever touch
 // RECEIPT-FREE ads." Backend enforces it with verifyReceiptAwareRequeue.js;

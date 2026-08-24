@@ -46,13 +46,19 @@ async function prepareStoryboard({ ad, operatorPrompt = null, modelOverride = nu
 // same script.
 // modelOverride (optional) — per-run model slug from the operator's
 // regenerate dropdown; Atlas provider only (Vertex has a single model).
-async function generateForAd({ ad, operatorPrompt = null, storyboard = null, modelOverride = null, campaignRunId = null }) {
+async function generateForAd({
+  ad, operatorPrompt = null, storyboard = null, modelOverride = null, campaignRunId = null,
+  // Threaded through to atlasVideoService.generateForAd — see that
+  // function's shouldResumeAttempt doc comment. Default true matches the
+  // normal render path; adRegenerateService passes false explicitly.
+  allowResume = true
+}) {
   const provider = activeProvider();
   const t0 = Date.now();
 
   let result;
   if (provider === 'atlas') {
-    result = await atlasVideoService.generateForAd({ ad, operatorPrompt, storyboard, modelOverride, campaignRunId });
+    result = await atlasVideoService.generateForAd({ ad, operatorPrompt, storyboard, modelOverride, campaignRunId, allowResume });
   } else {
     // Default: Vertex Veo direct. Backward compatible — no behavioral
     // change for deployments that haven't set VIDEO_PROVIDER.

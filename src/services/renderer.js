@@ -1219,8 +1219,16 @@ async function renderVideo(ad) {
 
   // Stage 2 — the billable Omni submit + poll. Stamps veoPredictionId
   // (spend receipt) inside atlasVideoService before polling.
+  //
+  // allowResume: true — EXPLICIT, matching the default, so a future reader
+  // does not have to go check atlasVideoService's default to know this call
+  // site is protected. This is the exact path a released claim on a
+  // receipt-holding ad re-enters (claimOne has no receipt filter — a claim
+  // released while status stays 'rendering', by a future claim-TTL sweeper
+  // or any other requeue path, makes the row claimable again), so this is
+  // precisely where resume-instead-of-resubmit has to be on.
   adStage(adId, `master video generation (${ad.aspectRatio || '9:16'})`);
-  const veoResult = await atlasVideo.generateForAd({ ad, storyboard, campaignRunId: runId });
+  const veoResult = await atlasVideo.generateForAd({ ad, storyboard, campaignRunId: runId, allowResume: true });
   if (veoResult.skipped) {
     throw new Error(veoResult.reason || 'video generation skipped by provider');
   }
@@ -1495,8 +1503,49 @@ async function processAd(ad) {
       if (err && err.stderrTail) {
         console.error(`renderer[${WORKER_ID}]: child stderrTail ad=${shortId}:\n${err.stderrTail}`);
       }
-      try { noteRenderIssue(ad._id, { message: err.message, stage: 'render', err }); } catch (_) {}
+      try {
+        noteRenderIssue(ad._id, {
+          message: err.message,
+          stage: 'render',
+          predictionId: (err && err.predictionId) ? err.predictionId : undefined,
+          err
+        });
+      } catch (_) {}
       notifyRenderFailure(ad, err);
+
+      // UNSETTLED AT TIMEOUT — NOT a confirmed failure. pollPrediction hit
+      // its own MAX_POLL_MS wall-clock budget while the Atlas job was still
+      // genuinely processing (real Omni predictions have been measured
+      // taking 14-25+ min). Writing status:'failed' here would strand the
+      // whole point of the resume-from-receipt fix: shouldResumeAttempt
+      // (atlasVideoService.js) only fires on a FRESH attempt against a row
+      // that gets re-entered — a row stamped 'failed' is never re-entered
+      // by anything.
+      //
+      // adgen's recovery here is claim-shaped, not status-flip-shaped like
+      // backend's bootRecoveryService (same pattern requeueDeriveForRetry
+      // above already uses for the derive-wait case): release the claim
+      // and leave status:'rendering' untouched, so claimOne()'s own filter
+      // (status:'rendering', claimedByWorker:null) re-claims this ad on a
+      // future poll. That next processAd call re-enters generateForAd
+      // fresh (attempt 1), sees ad.veoPredictionId still set, and
+      // shouldResumeAttempt resumes the SAME prediction — re-polling,
+      // never resubmitting, so this can only ever cost more poll time,
+      // never a second charge. Mirrors backend's routes/ads.js
+      // unsettledAtTimeout handling (2026-08-19, run_1787119100250_eef4d871),
+      // adapted to this claim-based model.
+      //
+      // bumpRunCounter('skipped') is safe here even though the Ad's true
+      // fate is still pending: maybeFinalizeRun re-derives isSettled from a
+      // LIVE Ad.find, and classifyRunAdOutcome buckets status:'rendering'
+      // as stillRendering — so the run cannot finalize while this row sits
+      // here, regardless of what the 'skipped' counter says.
+      if (err && err.unsettledAtTimeout) {
+        await releaseClaim(ad._id, 'video master unsettled at poll timeout — left rendering for resume');
+        await bumpRunCounter(ad.campaignRunIds, 'skipped');
+        return;
+      }
+
       await Ad.updateOne(
         { _id: ad._id, claimedByWorker: WORKER_ID },
         {
@@ -1630,11 +1679,21 @@ async function shutdown() {
       // null, renderRoute:{$in:['html_gen','veo']}}, which is exactly the shape
       // this write produces. The peer that picks it up re-enters renderVideo /
       // renderStatic from the top and calls generateForAd again, and
-      // generateForAd has NO resume-from-receipt guard: it never reads
-      // ad.veoPredictionId before submitting (atlasVideoService.js — the only
-      // mention inside that function is the WRITE of the receipt after the
-      // submit, at the charge point). So for any ad already holding a receipt,
-      // a release here buys the same generation a second time.
+      // STILL TRUE FOR STATIC/IMAGE ADS, NO LONGER TRUE FOR VIDEO. Video
+      // (atlasVideoService.generateForAd) now HAS a resume-from-receipt
+      // guard: shouldResumeAttempt reads ad.veoPredictionId on a fresh
+      // attempt and resumes the existing prediction instead of submitting a
+      // new one (see processAd's unsettledAtTimeout branch above, which
+      // relies on exactly this). Static (atlasImageService — the OTHER
+      // charge point RECEIPT_FREE covers) has no equivalent: it never reads
+      // Ad.imageGeneration.predictionId before submitting, so releasing a
+      // claim there still buys the same generation a second time. So this
+      // exclusion is no longer a single guard against one universal gap —
+      // it now does double duty, one justified reason per charge point:
+      // required for static (no guard exists), and merely conservative for
+      // video (a guard exists, so a release here would already be safe, but
+      // widening THIS SIGKILL path to rely on it is a separate, deliberately
+      // undone decision — not a leftover gap).
       //
       // services/spendReceipt.js already states the rule this must obey:
       // "a requeue may only ever touch RECEIPT-FREE ads". That module exists
@@ -1651,10 +1710,13 @@ async function shutdown() {
       // preserves the receipt so the asset can be recovered for free rather
       // than re-bought. It does re-expose the zombie-claim problem this
       // shutdown handler was written to solve — but only for the subset that
-      // has spent money, where paying twice is the worse outcome. The general
-      // answer is a resume-from-receipt path in generateForAd (one already
-      // exists in atlasVideoService for the recovery flow, just not wired into
-      // generateForAd); until that lands, this is the safe half.
+      // has spent money, where paying twice is the worse outcome. Widening
+      // this specific release to also cover receipt-holding VIDEO ads (now
+      // that the video guard exists) is a real, available follow-up — not
+      // done here because it changes SIGKILL-time behavior beyond
+      // generateForAd itself and deserves its own sign-off, separate from
+      // this fix. Static still needs its own resume-from-receipt path
+      // before its half of this exclusion can be revisited at all.
       // USE THE COMPOSER, NOT A SPREAD. spendReceipt.js exports receiptFree()
       // for exactly this and says why: "Spread-merging would silently drop an
       // existing `$and`". `{ ...base, ...RECEIPT_FREE }` works only while the
