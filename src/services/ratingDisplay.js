@@ -118,7 +118,8 @@ const QUOTE_TIER_NUMBER_SIDE = Object.freeze({
  * @param {*} raw  Candidate rating (must be a finite number to print).
  * @param {number|{starMin?:number}} [opts] Optional star floor. A bare number
  *   or `{ starMin }` both work. Default is RATING_STAR_MIN (today's behaviour).
- * @returns {string|undefined} display string (e.g. "4.6") or undefined to withhold.
+ * @returns {string|undefined} display string (always one decimal, e.g. "4.6"
+ *   or "5.0") or undefined to withhold.
  */
 function formatDisplayRating(raw, opts) {
   if (typeof raw !== 'number' || !Number.isFinite(raw)) return undefined;
@@ -127,7 +128,14 @@ function formatDisplayRating(raw, opts) {
     : (typeof opts === 'number' ? opts : RATING_STAR_MIN);
   const displayed = Number(raw.toFixed(1));
   if (!(displayed > starMin && displayed <= 5)) return undefined;
-  return String(displayed);
+  // ALWAYS one decimal. `String(displayed)` drops the trailing zero on a
+  // perfect 5 → "5", and the static prompt then asks the image model for
+  // "5 ★" (see staticAdIntents text slots). Measured on a 27-ad Pelagic
+  // batch: that string typesets as a large numeral beside a single star
+  // with a wide gap, which a reader parses as a broken widget, not a
+  // rating. `toFixed(1)` keeps "5.0" so the requested string is "5.0 ★".
+  // Do NOT `String(Number(n.toFixed(1)))` — that is the bug.
+  return displayed.toFixed(1);
 }
 
 /**

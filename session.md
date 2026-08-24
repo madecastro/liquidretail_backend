@@ -14,28 +14,35 @@ it clears it back to this placeholder.)_
 
 ## CURRENT STATE
 
-*(Written 2026-08-24. Worktree `/Volumes/Sayulita/Projects/RS/.wt-remotion-sub`,
-branch `perf/remotion-subprocess` = adgen PR #8, rebased onto `origin/master`
-@ `62436f6` = #10 + #11 + #9 + #7.)*
+*(Written 2026-08-24. Worktree `/Volumes/Sayulita/Projects/RS/.wt-brandport`,
+branch `port/brand-consistency-to-adgen`, cut from `origin/master` @ `af4338b`.)*
 
-- **Rebased in two hops.** Original fork point `0143f7c` (`#5`). First hop
-  onto `98fe279` (`#9`) resolved the real `renderer.js` conflict (heartbeat
-  OUTER, OOM try/catch INNER, both titling sites). Trunk then moved again
-  (`397284f` #11 cap clamp, `62436f6` #10 attribution) during that hop;
-  second hop onto current `origin/master` auto-merged `renderer.js` and
-  `brandScriptExecutor.js`, conflicted only on this file.
-- **`git diff origin/master HEAD --stat`** is only #8's files (supervisor,
-  child script, brandScriptExecutor, remotionRenderService, renderer.js,
-  titlingResumeService, isolation harness, this file). No re-application of
-  #7/#9/#10/#11.
-- **Nesting:** heartbeat `try/finally { beat.stop() }` is OUTER; OOM
-  try/catch with early `return` is INNER. The OOM `return` still runs
-  `beat.stop()`. Terminal `$set` `$in: ['rendering','draft']` (#7) and
-  heartbeat cap/interval/`claimedByWorker` (#9, cap corrected by #11) were
-  not rewritten by this PR.
-- **D11** in `scripts/verifyRemotionChildIsolation.js` pins that the OOM
-  early-return sits inside the heartbeat try whose finally stops the beat.
-- **Pushed** `--force-with-lease` to `origin/perf/remotion-subprocess`. Not merged.
+- **What this is.** Hunk port of backend `fix/brand-consistency` (PR #321:
+  `65285607` / `21f1bf09` / `784ffad3`) into adgen so the three creative
+  fixes are LIVE on the new-ad path (`ADGEN_RENDERER_ENABLED=true`). Backend
+  copies remain regenerate/preview only.
+- **Ported files.** `src/services/directImageRenderService.js`,
+  `src/services/ratingDisplay.js`, plus harnesses
+  `scripts/verifyBrandConsistency.js`, `verifyLogoColorPreservation.js`,
+  `verifyStaticCtaDeterminism.js`. Harness requires rewritten
+  `services/*` → `src/services/*`. No `require('../config/foo')` came
+  across (nothing to rewrite to `../../config/foo`).
+- **Not a wholesale overwrite.** Every ported function body matches
+  backend byte-for-byte. Adgen divergence kept (`usableAttribution`,
+  `composeCorrectiveOverride`, `buildQcRetryArgs`,
+  `submitEditImageWithSeedFallback`). DIR 2841 → 3035 lines (backend 3050).
+- **The logo pair.** `srgbEncodedToLinear` (true WCAG, breakpoint 0.04045)
+  AND `LOGO_MIN_INK_CONTRAST = 4.5`. Picker is `contrastingInkFor` on the
+  same metric. High-chroma tiles never re-inked.
+- **Hunks.** All nine DIR/ratingDisplay hunks applied on matching anchors.
+  None re-anchored.
+- **Proof.** Harnesses 82 / 21 / 41 (match backend). Mutation matrix:
+  (a) floor 3 keep lin → RED 8 fail, 0.56 wordmark stays white;
+  (b) identity linearize keep 4.5 → RED 17 fail, Mai Tai 0.27 wordmark
+  `rgb=0,0,0`; (c) both → RED 18 fail; (d) restored → 82 green.
+  Suite before 14/18, after 17/21. Same four reds (two KNOWN_OPEN,
+  verifyArchiveDigestRelease, verifyModelParity). Require-graph 506/506.
+- **Pushed** to `origin/port/brand-consistency-to-adgen`. Not merged.
 
 ---
 
