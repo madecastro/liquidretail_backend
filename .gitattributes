@@ -1,0 +1,15 @@
+# scripts/vendor-manifest.json is a GENERATED file (scripts/lib/vendorDrift.js
+# `saveManifest`, invoked by `verifyVendorDrift.js --seed` / `--reconcile`).
+# On conflict, regenerate it instead of textual 3-way merge — see
+# scripts/mergeVendorManifest.js for what the driver does and why.
+#
+# This `merge=vendor-manifest` NAME does nothing by itself. Each clone /
+# worktree must ALSO run `node scripts/setupMergeDrivers.js` (or
+# `npm run setup:worktree`) once to point the name at the driver command in
+# LOCAL git config — .gitattributes cannot carry that, by git design (a
+# cloned repo must not be able to make your git execute a command without
+# you opting in locally). Until that command has been run in THIS clone,
+# git silently falls back to its default textual merge for this path —
+# no error, no warning. If conflicts on this file still look like raw JSON
+# diff noise, the driver is not configured here; run the setup command.
+scripts/vendor-manifest.json merge=vendor-manifest

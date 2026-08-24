@@ -8,7 +8,8 @@
     "start": "node src/entrypoint.js",
     "dev": "node src/entrypoint.js",
     "lint": "eslint .",
-    "test": "node scripts/runVerifySuite.js"
+    "test": "node scripts/runVerifySuite.js",
+    "setup:worktree": "node scripts/setupMergeDrivers.js"
   },
   "engines": {
     "node": ">=20.0.0"
