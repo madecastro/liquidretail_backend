@@ -1706,6 +1706,34 @@ async function processAd(ad) {
               code: err.code || null,
               ...childTailsFrom(err)
             },
+            // PERSIST THE QC VERDICT ON A TERMINAL FAILURE.
+            //
+            // directImageRenderService attaches `err.visionQc` on a
+            // QC-exhausted static, with the explicit comment "surface that +
+            // the verdict (with discarded URLs) so the failure path can
+            // persist them". THIS is that failure path, and it dropped it.
+            // renderError.message survived, so the failure looked
+            // investigable right up until you tried to see the pixels that
+            // caused it — visionQc was null and the discarded attempt URLs
+            // were gone with it.
+            //
+            // Measured twice, in two separate E2E rounds: three statics
+            // rejected for inventing a brand wordmark on the product, none
+            // re-examinable; then the same wall again adjudicating
+            // logo-occlusion catches. Both investigations degraded to quoting
+            // the judge's prose instead of looking at the image.
+            //
+            // The VIDEO path has done this correctly since #282 —
+            // brandScriptExecutor's
+            //   $set: { visionQc, ...buildVideoQcFailureFields(...) }
+            // This is the static half of the same idea, not a new mechanism.
+            //
+            // CONDITIONAL, not unconditional. Most terminal failures here
+            // carry no verdict at all — a provider timeout, an unreachable
+            // seed, an IPC error. Writing the key regardless would replace a
+            // real earlier verdict with null on a later non-QC failure of the
+            // same ad, which is worse than not writing it.
+            ...(err.visionQc ? { visionQc: err.visionQc } : {}),
             updatedAt:       new Date()
           }
         }

@@ -261,6 +261,41 @@ check('C1 processAd catch handler releases the claim on failure', () => {
   assert.match(update, /claimedAt:\s*null/);
 });
 
+// C1b — the QC verdict must survive a terminal failure.
+//
+// directImageRenderService attaches `err.visionQc` on a QC-exhausted static,
+// with the comment "surface that + the verdict (with discarded URLs) so the
+// failure path can persist them". This catch IS that failure path and used to
+// drop it: renderError.message survived, so the row looked investigable right
+// up until you tried to see the pixels — visionQc was null and the discarded
+// attempt URLs with it. Measured twice, in two separate E2E rounds; both
+// investigations degraded to quoting the judge's prose instead of looking.
+//
+// It must be CONDITIONAL. Most terminal failures here carry no verdict (a
+// provider timeout, an unreachable seed, an IPC error), and an unconditional
+// write would replace a real earlier verdict with null on a later non-QC
+// failure of the same ad.
+//
+// HONEST LIMITATION OF THIS CHECK: it is a source-text scan of the catch
+// body, like its siblings above, and is therefore weaker than the behavioural
+// standard this repo prefers — it would pass against a reimplementation that
+// kept the shape. Making it behavioural requires extracting the $set into a
+// helper (the shape brandScriptExecutor.buildVideoQcFailureFields already
+// has), which moves these literals out of processAd's body and breaks the
+// source scans in this file, verifyRendererSlackAlerts and
+// verifyVideoResumeFromReceipt. That migration is worth doing and is
+// deliberately NOT bundled with a one-line bug fix.
+check('C1b processAd catch persists visionQc, conditionally', () => {
+  const catchIdx = processAdBody.indexOf('} catch (err) {');
+  const catchBody = balanced(processAdBody, processAdBody.indexOf('{', catchIdx), '{', '}');
+  const { args } = callArgs(catchBody, 'Ad.updateOne(');
+  const update = args[1];
+  assert.match(update, /visionQc/,
+    'a QC-exhausted static throws with err.visionQc attached specifically so this path can persist it; without it the verdict and every discarded attempt URL are lost when the row is written');
+  assert.match(update, /err\.visionQc\s*\?/,
+    'the write must be guarded on err.visionQc — writing it unconditionally would null out a real earlier verdict on a later non-QC failure of the same ad');
+});
+
 const requeueBody = functionBody(SRC, /async function requeueDeriveForRetry\s*\(ad, reason\)\s*\{/);
 check('C2 derive-wait requeue also releases the claim (benign retry, not a failure)', () => {
   const { args } = callArgs(requeueBody, 'Ad.updateOne(');
