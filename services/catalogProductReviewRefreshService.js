@@ -64,7 +64,15 @@ async function refreshOne({ productId, allowHeadless = null }) {
 
   let result;
   try {
-    result = await reviews.fetchProductReviews(url, { allowHeadless: useHeadless });
+    // KEY NAME IS LOAD-BEARING. fetchProductReviews destructures `useHeadless`;
+    // it has never accepted `allowHeadless`. Passing the latter meant the value
+    // computed on the line above — including an explicit allowHeadless override
+    // from a caller — was dropped on the floor and useHeadless fell back to its
+    // `false` default, so tier 3 could never run through this service either.
+    // Same defect class as the missing `force` at the tier-3 call site in
+    // productReviewsScrapeService; two independent ways to ask for the headless
+    // tier, both silently ignored.
+    result = await reviews.fetchProductReviews(url, { useHeadless });
   } catch (err) {
     return {
       ok: false,

@@ -29,7 +29,7 @@ async function preview({ req, args }) {
   });
 
   const force        = !!args?.force;
-  const useHeadless  = !!args?.useHeadless;
+  const useHeadless  = args?.useHeadless === true;  // strict: routes/agent.js JSON.parses args with no schema coercion, so the STRING "false" is truthy
 
   return {
     ok: true,
@@ -56,7 +56,7 @@ async function execute({ req, args, onProgress }) {
   const started = Date.now();
 
   const force        = !!args?.force;
-  const useHeadless  = !!args?.useHeadless;
+  const useHeadless  = args?.useHeadless === true;  // strict: routes/agent.js JSON.parses args with no schema coercion, so the STRING "false" is truthy
   const pages        = Number(args?.pages);
 
   if (typeof onProgress === 'function') {
