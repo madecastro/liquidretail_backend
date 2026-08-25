@@ -439,11 +439,15 @@ async function processAd(ad) {
           { _id: ad._id, claimedByWorker: WORKER_ID },
           {
             $set: {
-              status:          'failed',
-              titlingNeeded:   false,
-              claimedByWorker: null,
-              claimedAt:       null,
-              updatedAt:       new Date(),
+              status:             'failed',
+              // Clear BOTH titling markers on terminal failure so
+              // backlogWatchdog[titling-stuck] can't page forever on this
+              // row. Same fix as renderer.js's own catch (paired PR).
+              titlingResumeState: null,
+              titlingNeeded:      false,
+              claimedByWorker:    null,
+              claimedAt:          null,
+              updatedAt:          new Date(),
               renderError: {
                 message: (err && err.message) ? String(err.message).slice(0, 500) : 'titler processAd threw',
                 stage:   'titler',

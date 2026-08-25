@@ -1699,6 +1699,16 @@ async function processAd(ad) {
             status:          'failed',
             claimedByWorker: null,
             claimedAt:       null,
+            // Clear the titling-debt marker on terminal failure — otherwise
+            // backlogWatchdog[titling-stuck] pages forever on 'claimed' ads
+            // that already died. Measured 2026-08-25: 44 failed ads (yesterday's
+            // Pelagic run + earlier) stuck in state='claimed' because this catch
+            // stamps failed but doesn't touch titlingResumeState, so the OLD
+            // renderer's stamp of 'claimed' before the throw survives the terminal
+            // write. Cleared here too (same shape as titlingNeeded below) so any
+            // future bubbled titling failure lands clean.
+            titlingResumeState: null,
+            titlingNeeded:      false,
             renderError:     {
               message: String(err.message || err).slice(0, 400),
               stage: 'render',
