@@ -9,3 +9,4 @@ services/brandScripts/assets/fonts/*.ttf
 .DS_Store
 .drafts/
 .codemap/
+.rs-status-threads.json
