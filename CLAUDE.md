@@ -1574,6 +1574,12 @@ Video never launches a browser.
   `index.js`; `worker.js` has **zero** remotion references. So the worker
   recovers the asset (`bootRecoveryService`) and the web process titles it
   (`titlingResumeService`, on an interval with a re-entrancy guard).
+- **Titling resume stands down when adgen owns rendering.** Same helper as the
+  render-loop handoff (`adgenBridge.isAdgenRendererEnabled`, call-time). Missing
+  or malformed ⇒ this repo still sweeps (adgen only claims on `'true'`; dual-none
+  would strand a paid master). Gate is inside `resumeUntitledMasters`, not the
+  interval, so an in-flight pass finishes and a dashboard flip needs no redeploy.
+  Pinned by `scripts/verifyTitlingResumeAdgenGate.js`.
 - **The resume state lives on `Ad.titlingResumeState` — NEVER on `renderStage`,
   and this was got wrong once.** The first design parked the sentinel in
   `renderStage`, reasoning that reusing an existing field dodges the
