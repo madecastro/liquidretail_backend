@@ -14,135 +14,53 @@ it clears it back to this placeholder.)_
 
 ## CURRENT STATE
 
-*(Written 2026-08-24/25. Worktree `/Volumes/Sayulita/Projects/RS/.wt-video-titling-recovery`,
-branch `fix/video-titling-recoverable` off `origin/master` @ `0c97041`.
-PR #60 open, NOT merged, NOT deployed — owner asked for a PR only.)*
+*(Replaced 2026-08-25 ~08:00 UTC, end of a long overnight session. Trunk `master`
+@ `684ac8b`. Full narrative: `session.d/2026-08-25_overnight-video-chain-and-review-coverage.md`.)*
 
-- **Made a failed titling pass on a paid video master recoverable instead
-  of stranding it.** Confirmed defect, as measured: `liquidretail_adgen`'s
-  video path is Omni submit (PAID, ~$0.45-$1.00) → Remotion titling
-  in-process → done, and only a Remotion child OOM was ever stamped
-  resumable (`brandScriptExecutor.js`'s `stampTitlingOomAndThrow`); a
-  timeout or any other child failure fell through to a bare `throw` and
-  processAd's generic catch marked the row `status:'failed'` with NO
-  resume marker — permanently stranding an already-billed master.
-  `titlingResumeService.resumeUntitledMasters()` (the module that would
-  rescue such a row) had ZERO callers anywhere in `src/` — confirmed via
-  grep across `entrypoint.js`/`renderer.js`/`titler.js`/`orchestrator.js`.
-  All three defects the task described were confirmed present, unchanged
-  from the description.
-  1. **Generalized the stamp** (`brandScriptExecutor.js`,
-     `stampTitlingFailureAndThrow`, now module-level + exported) to cover
-     OOM, timeout, AND a generic child failure/exception — all three
-     stamp `status:'draft'`+`titlingResumeState:'pending'` (resumable) up
-     to a shared `TITLING_ATTEMPTS_MAX` ceiling (new `Ad.titlingAttempts`
-     counter, default 3, env-overridable), past which the ad goes
-     TERMINAL (`status:'failed'`) instead — an unbounded retry on a paid
-     path would be worse than the stranding it replaces (a real
-     deterministic bug — "remotion child IPC forbids buffers" — showed up
-     in the stranded-ad query below, which is exactly the failure class
-     the cap exists for). `renderer.js`'s two titling call sites (derive +
-     master) and `titlingResumeService.js`'s own catch now defer to
-     `err.titlingResumable` (the flag the stamp sets) instead of
-     re-classifying OOM only — otherwise the renderer's own generic
-     catch-all or the resume sweep's old OOM-only branch would clobber a
-     resumable stamp straight back to `failed`.
-  2. **Wired the resume sweep from `renderer.js`**, on a 90s-delay/5-min
-     interval, modeled on backend's own wiring, gated on
-     `isAdgenRendererEnabled()` (same flag PR #52 wired into `claimOne()`)
-     so it cannot race backend's own render/resume path over the same
-     collection, and re-entrancy-guarded so a slow pass never stacks
-     concurrent Remotion renders. **First draft put this on `orchestrator`**
-     (the one adgen role Render keeps singleton) reasoning that avoided
-     "two workers racing" — **adversarial review (Grok, xhigh, two
-     independent passes) caught that this would have OOM-killed the
-     process**: `orchestrator`'s Render plan is `starter` (~512 MB) but
-     `resumeUntitledMasters()` calls `renderBrandScriptAndSave` for REAL,
-     and a single Remotion titling slot has been MEASURED at ~1.97 GiB
-     (`renderer.js`'s own `REMOTION_QUEUE_CONCURRENCY` comment). The very
-     first ad it actually retitled would have crashed the singleton.
-     Correct fix: run it from `renderer.js` (`pro_plus`, 8 GB, already
-     budgets exactly this cost) — autoscaled (min2/max8), which is fine
-     because the atomic per-document claim (below) is what makes two
-     instances racing the same ad safe, not "only one process runs this."
-     Also mirrored the same `err.titlingResumable` gate into `titler.js`'s
-     own titling call site (same review pass found it still OOM-only —
-     this file duplicates renderer's call site by design, per its own "if
-     you edit one copy, edit the other" header) and closed a real
-     regression the review found: a cap-exceeded (terminal) titling
-     failure used to reach `processAd`'s catch and have its detailed
-     `renderError` (stage/code/attempt-count) clobbered by the generic,
-     unscoped `noteRenderIssue()` write — fixed by skipping that call when
-     `err.titlingFailureKind` is already set.
-  3. **Claimability** relies on `titlingResumeService`'s OWN pre-existing
-     atomic per-document claim (already vendored, untouched) — did NOT
-     touch `claimOne()` or widen the renderer's `status:'rendering'`
-     filter, which would have required routing a resumed ad back through
-     the full `renderVideo()` (re-submitting Omni). Proved the claim is
-     race-safe with two REAL concurrent `resumeUntitledMasters()` calls
-     racing one ad (`scripts/verifyTitlingRecoverability.js` C1) — exactly
-     one titles it, the other sees `modifiedCount:0` and skips.
-  4. **MONEY — verified by execution, not just review**, that no resume
-     path can reach `atlasVideoService.submitGeneration` (the only
-     billable Omni POST): `submitGeneration` has exactly 1 call site,
-     structurally inside the `else` of `if (isResuming)`
-     (`scripts/verifyTitlingResumeNeverResubmits.js` section A), and a REAL
-     require-graph BFS (Node's own `require.resolve`, not a regex) proves
-     `atlasVideoService.js` is unreachable from either
-     `titlingResumeService.js` or `brandScriptExecutor.js`'s entire
-     transitive require graph (section B) — with a positive control
-     proving the same BFS DOES find it from `renderer.js` (rules out a
-     vacuous pass). Mutation-tested: injecting a fake
-     `require('./atlasVideoService')` into `titlingResumeService.js`, or a
-     second `submitGeneration(...)` call site, or moving the call into the
-     `if(isResuming)` branch, each turned the harness red; reverting turned
-     it green.
-  - **Stranded-population query (read-only Render job, `adgen-renderer`
-    service, `MONGODB_URI` already in env).** The exact population the
-    task specified (`titlingResumeState` in `{pending,claimed}`,
-    `status:'draft'`, non-null `veoVideoUrl`) is currently **0** — because
-    the OLD code only ever put an ad in that state for OOM, which is rare;
-    everything else went straight to `status:'failed'` with no resume
-    marker at all. The REAL population this fix would have rescued:
-    **88** video ads are `status:'failed'` with a paid master
-    (`veoVideoUrl`) already on file, of which **38** have a titling-
-    specific failure signature (Remotion timeout, the IPC-buffer bug) —
-    the other 50 are legitimate vision-QC rejections, a different, correct
-    code path this PR does not touch. All 88 are 4.9-14.3 hours old (this
-    fleet is 3 days old). This is retrospective only — the OLD code
-    already terminal-failed these; the fix changes behavior for failures
-    from here forward.
-  - **Suite: 41/44 passed** (2 new scripts added, `runVerifySuite.js`
-    auto-discovers). Non-passing, none caused by this branch (confirmed by
-    stashing and re-running on bare `origin/master`):
-    - `verifyRunFinalizesOnSettle_KNOWN_OPEN.js` — allowlisted expected-fail.
-    - `verifyVendorDrift.js` — pre-existing, sibling backend has moved on.
-    - `verifyModelParity.js` — pre-existing (`titlingNeeded`, from the
-      titler Phase 3 PR #52, already violated the adgen-fields-⊆-backend-
-      fields rule before this branch). This PR's new `Ad.titlingAttempts`
-      field adds a SECOND entry to the same, already-red check — same
-      precedent as `titlingNeeded` (an adgen-only mechanism with no backend
-      analogue), not a new category of problem. Did not touch the sibling
-      `liquidretail_backend` repo (out of scope — separate repo, separate
-      PR process, not authorized here). Flagged as a real follow-up, not
-      silently left; see KNOWN-OPEN.
-  - Two pre-existing harnesses (`verifyRemotionChildIsolation.js` D6/D8/D11,
-    `verifyRenderErrorTails.js` D3) had text/regex pins tied to the old
-    OOM-only shape and needed updating to the new OOM+timeout+generic
-    shape — not weakened, just re-pointed at the widened mechanism
-    (mutation-tested same as above).
-- **Not landed.** PR #60 open against `master`, NOT merged, NOT deployed —
-  owner reviews and merges/deploys.
+**Video generation works.** The outage was PR #43 passing raw Mongoose ObjectIds on
+the Remotion child IPC payload, which `remotionChildSupervisor.assertNoBuffers`
+rejects. Fixed by `String()`-wrapping every id at both `renderTitles` call sites in
+`brandScriptExecutor.js`. Proof is in production data, not the merge log: the last
+`remotion child IPC forbids buffers` failure is 22:09 UTC 2026-08-24; the 04:13 UTC
+2026-08-25 batch returned `status:'draft'` with `veoVideoUrl` populated. The only
+failure in that batch was a vision-QC content rejection.
 
-  *(Superseded by this entry: a concurrent session's `fix/wire-
-  safezonekey-titling-adgen` — surface-aware titling band geometry,
-  `resolveSafeZoneKeyCjs` in `plateIntelService.js`, wired into both
-  `renderTitles` call sites in `brandScriptExecutor.js` — landed and
-  merged as PR #54/#59 while this session was in flight. Full write-up:
-  `session.d/2026-08-24_wire-safezonekey-titling.md`. This branch was
-  rebased onto that merge; the `safeZoneKey` plumbing and this session's
-  titling-recoverability changes are both present and non-overlapping in
-  `brandScriptExecutor.js`/`renderer.js`.)*
+**Deployed:** all four adgen services and both backend services are live on their
+trunks. `ADGEN_RENDERER_ENABLED=true` on backend-web (dashboard, not the file).
+
+**Two production levers are still unpulled, both deliberately:**
+
+1. `REMOTION_QUEUE_CONCURRENCY` is **2** on the adgen-renderer dashboard. PR #61
+   raised `config/defaults.env` to 3, but `src/config.js:12` loads dotenv WITHOUT
+   `override:true`, so the dashboard variable wins — **PR #61 is inert in
+   production.** Raising it is a dashboard edit. Measured ~1.97 GiB per concurrent
+   Remotion render, so 3 ≈ 5.9 GiB of an 8 GiB box. 4 is the value that was
+   OOM-killed on 2026-08-21 holding a paid master; do not restore it.
+2. `ADGEN_TITLER_ENABLED` is **false**. Its blocker is now cleared: PR #63 landed the
+   `titlingNeeded: { $ne: true }` exclusion in `claimOne()`, gated on
+   `isTitlerEnabled()` so a flag-off rollback can still drain leftovers. Without it
+   the renderer re-claimed every row it handed to the titler. **Next step is a
+   dashboard flip, once someone has watched a video run on the deployed build.**
+
+**`verifyModelParity` now pins to backend `origin/main`** (`git archive` into a temp
+dir, then a real `require()`), matching `verifyVendorDrift`. It previously read the
+sibling's WORKING TREE — a shared checkout that is routinely dirty and behind — and
+produced a false "backend lacks titlingNeeded/titlingAttempts" failure. Override the
+ref with `ADGEN_BACKEND_REF`. **The NODE_PATH prohibition is unchanged and absolute:
+never set NODE_PATH, never run `npm ci` in an adgen worktree.**
+
+**Suite:** `node scripts/runVerifySuite.js` → 48/49 on the #63 branch (49 harnesses),
+47/48 on trunk. The single red is `verifyRunFinalizesOnSettle_KNOWN_OPEN.js`, red by
+design and listed in `scripts/expected-failures.json`.
+
+**Review-coverage numbers were corrected, and this changes the funnel plan.** The
+strategy document's "80.5% of SKUs have a usable product review quote" is the
+UNGATED count and was measured on Pelagic Gear, then generalised. Measured across six
+brands, first-party (`scraped`) quote coverage is 946 of 4,424 SKUs — **21%**. Details
+and the mechanism live in the backend's session entry for the same date; the short
+version is that `catalogproducts.productReviews` is a Mixed OBJECT (not an array),
+`quotesOrigin` is `scraped` or `llm-web`, and ingest never writes ratings — three
+separate later passes do.
 
 ---
 
