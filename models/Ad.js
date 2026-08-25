@@ -534,6 +534,29 @@ const adSchema = new mongoose.Schema({
   // backend lacks is the dangerous direction. Adding it here is the correct fix —
   // NOT removing it from adgen, which needs it.
   titlingNeeded:      { type: Boolean, default: false },
+  // Declared here for the SAME reason as titlingNeeded above, and it is the
+  // backend copy that has to carry it even though nothing in this repo reads or
+  // writes it. The declaration exists purely so a `save()` from this side cannot
+  // erase adgen's value.
+  //
+  // liquidretail_adgen's brandScriptExecutor $incs `titlingAttempts` on every
+  // titling failure (OOM, timeout, or a generic child exit) and shares the
+  // same counter with titlingResumeService, so a retry ceiling
+  // (TITLING_ATTEMPTS_MAX, default 3) holds across the original renderer
+  // attempt and every resume. Both services write the SAME production
+  // database. Backend's copy of this model did not declare the path, so any
+  // backend `save()` on such an ad would SILENTLY DROP the counter — Mongoose
+  // strict mode discards undeclared paths with no error — resetting the cap
+  // to a no-op and reopening unbounded retries on a master that has ALREADY
+  // been paid for. That is the identical failure mode this file already
+  // records above (renderError.predictionId, the renderStage sentinel,
+  // titlingNeeded).
+  //
+  // scripts/verifyModelParity.js exists to catch exactly this and went red on
+  // it: its rule is adgen's schema paths ⊆ backend's. Adding it here is the
+  // correct fix — NOT removing it from adgen, which needs it. Pinned by
+  // scripts/verifyTitlingResume.js G3c/G3d.
+  titlingAttempts:    { type: Number, default: 0 },
   posterUrl:          { type: String, default: null },
   // Sparse index — queued ads carry null, only rendered ads contribute.
   cloudinaryPublicId: { type: String, default: null, index: { sparse: true } },
