@@ -631,11 +631,19 @@ async function claimOne() {
   // never before. Cost of the fix: a derive worker holds a slot for up to
   // DERIVE_MASTER_WAIT_MS (12min) if the master hasn't landed yet. Bounded
   // by MAX_DERIVE_WAIT_ATTEMPTS at requeue time. Matches backend behavior.
+  //
+  // TITLER HANDOFF: when isTitlerEnabled(), the video path stamps
+  // titlingNeeded:true and clears this claim in the same $set (master
+  // ~:1353, derive ~:1094), leaving status:'rendering'. Exclude those
+  // rows here or the next poll re-claims them — renderer/titler livelock.
+  // `$ne: true` (not `: false`) so pre-field rows stay claimable. Gated
+  // so a flag-off rollback can still pick leftovers and title in-process.
   return Ad.findOneAndUpdate(
     {
       status:          'rendering',
       claimedByWorker: null,
-      renderRoute:     { $in: ['html_gen', 'veo'] }
+      renderRoute:     { $in: ['html_gen', 'veo'] },
+      ...(isTitlerEnabled() ? { titlingNeeded: { $ne: true } } : {}),
     },
     { $set: { claimedByWorker: WORKER_ID, claimedAt: new Date() } },
     { new: true, sort: { createdAt: 1 } }

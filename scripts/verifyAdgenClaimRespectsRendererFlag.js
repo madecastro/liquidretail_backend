@@ -161,8 +161,10 @@ function buildClaimOne(body) {
   // WORKER_ID is a module-level const in both real files (used in the
   // $set: { claimedByWorker: WORKER_ID, ... }); claimOne() itself never
   // declares it, so it must come in as a closure arg here too.
+  // isTitlerEnabled is referenced by renderer.js claimOne's filter spread;
+  // bind it at call time (same as the real module scope).
   // eslint-disable-next-line no-new-func
-  return new AsyncFunction('Ad', 'isAdgenRendererEnabled', 'WORKER_ID', inner);
+  return new AsyncFunction('Ad', 'isAdgenRendererEnabled', 'isTitlerEnabled', 'WORKER_ID', inner);
 }
 
 async function run() {
@@ -177,7 +179,7 @@ async function run() {
     ]);
 
     flagState.on = false;
-    const offResult = await claimOne(Ad, isAdgenRendererEnabled, 'test-worker-1');
+    const offResult = await claimOne(Ad, isAdgenRendererEnabled, () => false, 'test-worker-1');
     check('B1 renderer.js: flag OFF -> claimOne() returns null', () => {
       assert.strictEqual(offResult, null);
     });
@@ -191,7 +193,7 @@ async function run() {
     // call-time proof: if the check were cached at construction/require time,
     // flipping flagState.on here would have no effect on the SAME function.
     flagState.on = true;
-    const onResult = await claimOne(Ad, isAdgenRendererEnabled, 'test-worker-1');
+    const onResult = await claimOne(Ad, isAdgenRendererEnabled, () => false, 'test-worker-1');
     check('C1 renderer.js: SAME constructed function, flag flipped ON -> now claims', () => {
       assert.ok(onResult, 'expected a claim once the flag reads true — proves the gate re-reads live state, not a cached value');
     });
@@ -209,7 +211,7 @@ async function run() {
       { _id: 'ad1', status: 'rendering', claimedByWorker: null, veoVideoUrl: 'https://example/v.mp4', titlingNeeded: true, createdAt: new Date() }
     ]);
 
-    const offResult = await claimOne(Ad, isAdgenRendererEnabled, 'test-worker-1');
+    const offResult = await claimOne(Ad, isAdgenRendererEnabled, () => false, 'test-worker-1');
     check('B3 titler.js: flag OFF -> claimOne() returns null', () => {
       assert.strictEqual(offResult, null);
     });
@@ -218,7 +220,7 @@ async function run() {
     });
 
     flagState.on = true;
-    const onResult = await claimOne(Ad, isAdgenRendererEnabled, 'test-worker-1');
+    const onResult = await claimOne(Ad, isAdgenRendererEnabled, () => false, 'test-worker-1');
     check('C3 titler.js: SAME constructed function, flag flipped ON -> now claims', () => {
       assert.ok(onResult, 'expected a claim once the flag reads true');
     });

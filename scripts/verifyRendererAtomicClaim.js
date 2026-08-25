@@ -107,14 +107,15 @@ const [filterText, updateText, optsText] = claimArgs;
 
 let claimFilter;
 check('A1 filter is a self-contained literal — safe to literal-eval', () => {
-  // A bare (unquoted) identifier used as a VALUE — as opposed to an object
-  // KEY, which needs no variable binding — would throw a ReferenceError the
-  // instant the returned function is invoked. That throw is exactly the
-  // signal that this literal-eval technique has stopped being safe for this
-  // file and needs re-deriving; it is not swallowed by `check()`+catch below
-  // in the sense that a passing A1 means it demonstrably did NOT throw.
+  // isTitlerEnabled is referenced by the titler-on spread in claimOne's
+  // filter. Bind it FALSE here so this suite keeps testing the flag-off
+  // shape (identical to today's production-default query). The titler-on
+  // exclusion is pinned behaviourally by
+  // verifyRendererTitlerClaimPartition.js. A bare identifier used as a
+  // VALUE that we have not bound would still throw — that throw remains
+  // the signal that this eval is no longer safe and needs re-deriving.
   // eslint-disable-next-line no-new-func
-  claimFilter = new Function(`return (${filterText});`)();
+  claimFilter = new Function('isTitlerEnabled', `return (${filterText});`)(() => false);
   assert.ok(claimFilter && typeof claimFilter === 'object');
 });
 
@@ -143,6 +144,7 @@ function mongoMatch(filter, doc) {
     if (cond !== null && typeof cond === 'object' && !Array.isArray(cond)) {
       for (const [op, operand] of Object.entries(cond)) {
         if (op === '$in') { if (!operand.includes(val)) return false; }
+        else if (op === '$ne') { if (val === operand) return false; }
         else throw new Error(`mongoMatch: unsupported operator ${op} — extend deliberately`);
       }
     } else if (cond === null) {
