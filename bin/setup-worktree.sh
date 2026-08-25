@@ -88,6 +88,24 @@ if git ls-files --error-unmatch node_modules/.package-lock.json >/dev/null 2>&1;
   fi
 fi
 
+# .codegraph/codegraph.db is gitignored (see .codegraph/.gitignore) and
+# CodeGraph resolves the nearest .codegraph/ walking up from cwd, so a fresh
+# worktree has no index of its own and either refuses or, worse, silently
+# resolves a DIFFERENT checkout's index if one happens to be an ancestor
+# directory — stale relative to this worktree's actual commit. Build one
+# local to this worktree; it's fast (~1-2s for this repo).
+if command -v codegraph >/dev/null 2>&1; then
+  if [ ! -f .codegraph/codegraph.db ]; then
+    echo "-- building codegraph index for this worktree (not inherited from the main checkout)"
+    codegraph init || echo "!! codegraph init failed — continuing without it"
+  else
+    echo "-- codegraph index already present, syncing"
+    codegraph sync -q || echo "!! codegraph sync failed — continuing with existing index"
+  fi
+else
+  echo "-- codegraph not installed, skipping index build"
+fi
+
 echo
 echo "== running the verify suite to confirm the worktree is clean =="
 node scripts/runVerifySuite.js

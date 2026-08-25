@@ -97,6 +97,20 @@ are suspect. **A red harness in a local checkout is not necessarily red
 on `main`** — this tree carries other sessions' uncommitted work, so confirm
 against a clean worktree off `origin/main` before believing a failure (or a pass).
 
+**CodeGraph in a worktree — needs its own index, does not inherit one.**
+`.codegraph/codegraph.db` is gitignored (`.codegraph/.gitignore`), and
+CodeGraph resolves the *nearest* `.codegraph/` walking up from cwd — so a
+fresh worktree either has none (queries refuse) or, if a `.codegraph/`
+happens to exist in an ancestor directory, silently answers from **that
+checkout's index**, which reflects a different commit than what's actually on
+disk here. `npm run setup:worktree` now runs `codegraph init` for you; if you
+skipped that, run `codegraph init` (fresh worktree) or `codegraph sync`
+(existing index, moved since) yourself — both take 1-2s for this repo. Never
+point a worktree's query at the main checkout's index as a substitute: it
+drifts (observed 40 commits behind in practice) and produces confidently
+wrong answers, e.g. "unused" for a symbol that's actually a live caller on
+the worktree's own branch.
+
 ### The five parallel-work checks — RUN THESE, they already exist
 
 `docs/PARALLEL_WORK.md` §7 shipped tooling for the exact failure modes this
@@ -108,7 +122,7 @@ nothing pointed here. That is the whole reason this section exists.
 |---|---|---|
 | `npm test` | parallel aggregate runner over every `verify*.{js,mjs}`; **reports its own count** — do not hardcode one here, the number in this file has been stale three separate times | the `.js`-only shell loop silently skipping 10 `.mjs` harnesses |
 | `npm run test:affected` | only harnesses touching changed files | a 3-5 min serial re-run per iteration |
-| `npm run setup:worktree` | fixes a fresh worktree's incomplete `node_modules` | up to 93 false `MODULE_NOT_FOUND` "failures" before one real check runs |
+| `npm run setup:worktree` | fixes a fresh worktree's incomplete `node_modules`; also builds this worktree's own CodeGraph index | up to 93 false `MODULE_NOT_FOUND` "failures" before one real check runs |
 | `npm run check:rebase` | verifies a rebase dropped nothing | two rebases silently dropped content with no safety net (the incident that motivated §7) |
 | `npm run check:stale-work` | uncommitted work older than 2h | **measured 2026-08-21: 319 lines of feature work sat uncommitted for 13 DAYS** in a frontend worktree, found only by an unrelated sweep |
 | `npm run check:orphaned-branches` | commits ahead, never pushed, no PR | 13 such branches existed, incl. two carrying a privilege-escalation fix |
