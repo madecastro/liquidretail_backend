@@ -120,6 +120,54 @@ const SURFACE_INSETS = {
   squareYt:    { top: 0.10, bottom: 0.10 },
 };
 
+// platformFormat → safe-zone key. MIRRORS remotion/lib/safeZones.js
+// PMAX_VIDEO_SAFE_ZONE_KEY + resolveSafeZoneKey EXACTLY, for the same reason
+// SURFACE_INSETS above mirrors SAFE_ZONES rather than importing it: plateIntel
+// is CJS and safeZones.js is the ESM remotion island (its own package.json:
+// "Bundled by @remotion/bundler at boot; the CJS app never requires these
+// files directly" — a stated architectural boundary, not a missing feature).
+//
+// THIS IS THE OTHER HALF OF THE #307 FIX. bandsFor(safeZoneKey) shipped with
+// nothing ever computing a safeZoneKey to hand it: both renderTitles call
+// sites in brandScriptExecutor.js had `platformFormat` in scope and never
+// derived a key from it, so bandsFor always received `undefined` and fell
+// back to BANDS on every real render — the surface-aware geometry existed and
+// never fired. resolveSafeZoneKeyCjs (below) + its call site in
+// brandScriptExecutor.js close that gap.
+//
+// Pinned against the REAL ESM source by scripts/verifyKeepOutBandGeometry.mjs
+// group H, which imports the real resolveSafeZoneKey/PMAX_VIDEO_SAFE_ZONE_KEY
+// and asserts this mirror agrees with it for every reachable input (both
+// directions — a key added to either side and not the other fails loudly)
+// instead of the two silently drifting apart.
+const PMAX_VIDEO_SAFE_ZONE_KEY_CJS = {
+  pmax_video_9_16: 'verticalYt',
+  pmax_video_16_9: 'landscapeYt',
+  pmax_video_1_1: 'squareYt',
+  meta_stories_9_16: 'stories',
+  meta_reels_9_16: 'reels',
+};
+
+/**
+ * CJS mirror of remotion/lib/safeZones.js resolveSafeZoneKey. Pure, total,
+ * never throws — same contract as bandsFor. Canvas `format` stays the
+ * composition id (see that file's own header comment); only the safe-zone
+ * lookup may switch to a surface-specific variant when platformFormat has
+ * its own entry. Unknown/absent platformFormat -> SURFACE_INSETS[format] ||
+ * 'feed' (mirrors SAFE_ZONES[format] || 'feed' on the ESM side; SURFACE_INSETS
+ * is pinned byte-equal to SAFE_ZONES by group B below, so the two fallbacks
+ * are equivalent).
+ *
+ * @param {{ format?: string|null, platformFormat?: string|null }} [opts]
+ * @returns {string} a SURFACE_INSETS / SAFE_ZONES key
+ */
+function resolveSafeZoneKeyCjs({ format, platformFormat } = {}) {
+  const pf = String(platformFormat || '').toLowerCase().trim();
+  if (pf && PMAX_VIDEO_SAFE_ZONE_KEY_CJS[pf]) return PMAX_VIDEO_SAFE_ZONE_KEY_CJS[pf];
+  if (format && SURFACE_INSETS[format]) return format;
+  return 'feed';
+}
+
 // remotion/lib/safeZones.js ANCHOR_TOP.lowerThird. The 0.02 lead-in reproduces
 // today's 0.52 literal (0.54 - 0.02) so the bottom strip starts a touch above
 // the stack's top edge, catching content that rides right at the boundary.
@@ -617,6 +665,8 @@ module.exports = {
   bandsFor,
   bandRect,
   SURFACE_INSETS,
+  resolveSafeZoneKeyCjs,
+  PMAX_VIDEO_SAFE_ZONE_KEY_CJS,
   REFERENCE_BAND_H,
   BAND_X0,
   BAND_X1,

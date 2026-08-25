@@ -2136,7 +2136,7 @@ async function renderWithRemotionAndSave({ ad, brand, format, presetOverride = n
     layoutInputBrand = li?.input?.brand || null;
   } catch {}
   const tokens = await buildBrandTokens(brand, { layoutInputBrand, specFontOverrides: spec.tokenOverrides?.fonts || {} });
-  const { resolveTitlePlacementMode } = require('./plateIntelService');
+  const { resolveTitlePlacementMode, resolveSafeZoneKeyCjs } = require('./plateIntelService');
   const placement = resolveTitlePlacementMode({ brand });
   console.log(`🎨 brandScript[ad=${ad._id}]: engine=remotion format=${format} spec=${source} placement=${placement} fonts=${['heading', 'body', 'quote'].map(r => `${r}:${tokens.fonts[r].family}(${tokens.fonts[r].source})`).join(' ')}`);
 
@@ -2173,6 +2173,17 @@ async function renderWithRemotionAndSave({ ad, brand, format, presetOverride = n
   // (verticalYt/landscapeYt/squareYt). Canvas `format` stays the composition
   // id + titleStyleSpec key. Absent/unknown platformFormat → Meta zones.
   const platformFormat = ad?.platformFormat || null;
+  // safeZoneKey: the surface-aware key plateIntelService.bandsFor needs to
+  // sample the strip THIS surface's copy actually paints (backend #307).
+  // MUST be resolved here — analyzePlate/applyFaceKeepOut run entirely on
+  // the CJS side (this file -> remotionRenderService -> plateIntelService),
+  // never inside the ESM Remotion render tree, so there is no fallback
+  // resolution downstream the way Canonical.jsx's own titling PLACEMENT has
+  // (it calls the real resolveSafeZoneKey itself when no key is passed).
+  // Without this line, #307's bandsFor(safeZoneKey) always received
+  // `undefined` and silently fell back to the old one-surface BANDS literal
+  // on every real render — the exact gap this change closes.
+  const safeZoneKey = resolveSafeZoneKeyCjs({ format, platformFormat });
 
   let result;
   try {
@@ -2184,6 +2195,7 @@ async function renderWithRemotionAndSave({ ad, brand, format, presetOverride = n
       tokens,
       format,
       platformFormat,
+      safeZoneKey,
       brandName: brand?.name,
       adId:      String(ad._id),
       brand,
@@ -2209,6 +2221,7 @@ async function renderWithRemotionAndSave({ ad, brand, format, presetOverride = n
         videoUrl:  ad.veoVideoUrl,
         meta, spec, tokens, format,
         platformFormat,
+        safeZoneKey,
         brandName: brand?.name,
         adId:      String(ad._id),
         brand,

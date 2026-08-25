@@ -68,6 +68,22 @@ it clears it back to this placeholder in the same commit that closes it out.)_
 
 *(Replace this whole section, don't append to it, when it goes stale.)*
 
+- **THIS WORKTREE (`fix/wire-safezonekey-titling`, 2026-08-24):** PR #307's
+  surface-aware titling bands (`bandsFor(safeZoneKey)`) never fired on any
+  real render — both `brandScriptExecutor.js` `renderTitles({...})` call
+  sites had `platformFormat` in scope and never computed a `safeZoneKey` from
+  it, so `bandsFor` always got `undefined` and silently used the pre-fix
+  `BANDS` literal on every surface, including the four #307 specifically
+  targeted (`stories`/`squareYt`/`feed`/`square`). Fixed with
+  `resolveSafeZoneKeyCjs` (CJS mirror of `remotion/lib/safeZones.js`
+  `resolveSafeZoneKey`, in `plateIntelService.js` next to `SURFACE_INSETS` —
+  same mirror-not-import pattern, pinned against drift by new harness groups
+  H/I/J in `scripts/verifyKeepOutBandGeometry.mjs`), called once in
+  `brandScriptExecutor.js` and forwarded to both call sites. 198/200 suite
+  (baseline, unaffected), lint clean. **Same gap in adgen** (PR #54 ported
+  #307 faithfully, inheriting it) — companion PR on
+  `fix/wire-safezonekey-titling-adgen`, built on top of adgen's open PR #54.
+  Write-up: `session.d/2026-08-24_wire-safezonekey-titling.md`.
 - **THIS WORKTREE (`fix/logo-safe-area`, 2026-08-24):** static composited
   logomark was sitting ON the QC-declared safe-box edge (0px remaining
   right/bottom on every live surface). Vision QC is handed those same

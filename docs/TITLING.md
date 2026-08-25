@@ -431,6 +431,29 @@ Threaded through `renderWithRemotionAndSave` → `renderTitles` / `renderPreview
 - Output: {samples: [{atSec, bands: {top|middle|bottom: {lum, busy, avoid}}}] }.
 - Contrast: ONE global ink decision per render (plateIsLightGlobal in Canonical.jsx) — band verdicts weighted by how many slots render copy there; majority wins, so copy never mixes ink colors across light/dark bands in one video (the minority band leans on the layered shadows). Keep-out `avoid` nudges stay per-band (positional only) and in practice only fire from the gemini pass or face-keep-out — basic-only scans never set `avoid`, so `Canonical.jsx` still renders at its authored static positions whenever gemini/face-keep-out are absent, regardless of placement mode. `plateHints: null` (no hints at all) now only happens if the kill switch is set or the scan throws/finds nothing.
 
+**Which BAND RECT gets sampled is surface-aware, but PR #307 (`dabceaf4`) shipped
+that fix inert — fixed 2026-08-24, see `session.d/2026-08-24_wire-safezonekey-titling.md`.**
+`bandsFor(safeZoneKey)` / `bandRect(bandKey, safeZoneKey)` derive the bottom
+strip from the surface's OWN safe-zone insets (`SURFACE_INSETS`, mirroring
+`remotion/lib/safeZones.js` `SAFE_ZONES`) instead of the single `vertical`-shaped
+literal `BANDS` (`[0.52, 0.65]`) every surface used before. But neither
+`brandScriptExecutor.js` call site ever computed a `safeZoneKey` to hand
+`renderTitles` — both had `platformFormat` in scope and passed it straight
+through, never deriving a key from it — so `bandsFor` always received
+`undefined` and fell back to `BANDS` on every real render regardless of
+surface. **`resolveSafeZoneKeyCjs({format, platformFormat})`** (in
+`plateIntelService.js`, next to `SURFACE_INSETS`) is the CJS mirror of
+`remotion/lib/safeZones.js`'s `resolveSafeZoneKey` — mirrored, not imported,
+for the same CJS/ESM-island reason `SURFACE_INSETS` is — and
+`brandScriptExecutor.js` now calls it once per render and forwards the result
+to both `renderTitles({...})` call sites. `scripts/verifyKeepOutBandGeometry.mjs`
+groups H (resolver agrees with the real ESM one, both directions) / I (the call
+site actually forwards a resolved key, not a decoy `null`) / J (end-to-end:
+real `(format, platformFormat)` pairs produce the right per-surface bands)
+are what would have caught the original gap — groups A-G alone stayed green
+throughout, because they exercise `bandsFor`/`bandRect` directly with
+hand-picked keys and never through the real call site.
+
 ## 5) Operator flows (routes/brand.js, all under /api/brand/:id, Bearer + tenant-scoped)
 
 - `GET /title-spec` — full titling state: saved titleStyleSpec/titleStylePreset, resolved spec + source + per-format fonts (each resolved with that spec's own tokenOverrides.fonts), available presets, tokens, customFonts.
