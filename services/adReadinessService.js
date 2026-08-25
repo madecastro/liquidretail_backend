@@ -1,10 +1,21 @@
 // Gate for "is this brand allowed to create campaigns / generate ads?"
 //
-// Strictest definition (chosen 2026-05-14): for EACH source the brand
-// has connected, require at least one completed DetectRun AND zero
-// in-flight runs (queued OR processing). Partial state is the failure
-// mode we keep hitting — ads composed against a half-ingested catalog
-// pair the seed SKU with stale or wrong-jar UGC.
+// The rule, as of 2026-08-25 — it is NOT symmetric across sources, and the
+// asymmetry is deliberate:
+//
+//   catalog — require catalog-product Media AND zero in-flight runs.
+//             A completed DetectRun is NOT required.
+//   social  — require Instagram Media AND ≥1 completed DetectRun AND zero
+//             in-flight runs. Unchanged.
+//
+// The original 2026-05-14 rule was symmetric ("≥1 completed on every
+// connected source") and justified by: ads composed against a half-ingested
+// catalog pair the seed SKU with stale or wrong-jar UGC. That justification
+// still holds for SOCIAL, which is where the UGC comes from. It stopped
+// holding for catalog when catalog detect became DEFERRED — see the long
+// note at the catalog branch below — and, worse, became a deadlock, because
+// the only thing that creates a catalog DetectRun now runs inside the
+// request this gate was refusing.
 //
 // Sources are derived from the same signals the onboarding-status
 // endpoint uses, so the gate and the panel agree on what's connected:
@@ -15,7 +26,8 @@
 //     Instagram IntegrationCredential exists (catalogId optional).
 //
 // Returns { ready, reason, blockers[] }:
-//   ready    true when every connected source has ≥1 completed + 0 in-flight
+//   ready    true when catalog (if connected) has Media + 0 in-flight, and
+//            social (if connected) has Media + ≥1 completed + 0 in-flight
 //   reason   short human-readable summary (for tooltips + 409 body)
 //   blockers list of { code, message, source } so the UI can render
 //            per-source rows that mirror OnboardingStatusPanel
@@ -155,19 +167,56 @@ async function getAdReadiness(brandId) {
 
   const blockers = [];
 
-  // Catalog source — ≥1 completed AND 0 in-flight.
+  // Catalog source — Media must exist. A COMPLETED detect run must NOT be
+  // required, and this is the correction (2026-08-25) rather than the
+  // original 2026-05-14 rule.
+  //
+  // WHY THE OLD RULE BECAME A DEADLOCK. Catalog detect is DEFERRED at sync
+  // time: enqueueBrandProductDetects is called at the end of every catalog
+  // ingest (Shopify, Meta catalog, Apify, generic sitemap) and returns
+  // { deferred: true, heroEnqueued: 0 } unless CATALOG_DETECT_PRECOMPUTE is
+  // the string 'true' — and the committed default (config/defaults.env) is
+  // false, deliberately, because most catalog products never become ads.
+  // The only thing that then creates a catalog DetectRun is
+  // ensureDetectForProducts, called from campaignAdsGenerationService — i.e.
+  // from inside the very request this gate was refusing. A brand onboarded
+  // after deferral shipped could therefore NEVER become ready: the gate
+  // demanded work that only the blocked path was allowed to start.
+  //
+  // MEASURED 2026-08-25: PB5star (102 catalog Media / 0 runs), Marine Layer
+  // (200 / 0) and Gymshark (5 / 0) were all permanently locked out of
+  // campaign creation and ad generation. Pelagic and both Soludos brands
+  // pass only because they were onboarded while detect was still eager.
+  //
+  // WHY DROPPING IT IS SAFE, not merely convenient. This blocker's stated
+  // purpose (see this file's header) is "ads composed against a
+  // half-ingested catalog pair the seed SKU with stale or wrong-jar UGC" —
+  // a UGC-pairing concern. Deferral already abandoned catalog-wide detect at
+  // sync time, so that protection was gone regardless of this gate. What
+  // replaced it is per-request and stricter about the thing that matters:
+  // campaignAdsGenerationService awaits ensureDetectForProducts for exactly
+  // the products the run will use, before generating, with a bounded wait
+  // and documented graceful degradation on timeout. Blocking the request is
+  // what PREVENTS that work from happening.
+  //
+  // WHAT THIS DOES NOT FIX, stated so nobody assumes it did:
+  //   - 'catalog-empty' still blocks, and must: no Media means no seed.
+  //     Peloton Apparel is in that state (1,492 CatalogProducts, 0 Media)
+  //     because materialize never ran for it. Separate ticket.
+  //   - Video reframe reads YOLO boxes from Media.refinedProducts[];
+  //     without them reframeStrategyChooser defers to paid generative
+  //     outpaint. ensureDetectForProducts is what supplies them, so the
+  //     first run for a fresh brand pays a bounded wait rather than a
+  //     quality penalty — unless that wait times out, in which case the
+  //     render path degrades as designed.
+  //   - The in-flight check below is still scoped brand-wide rather than to
+  //     the request's products. Left deliberately for a separate change.
   if (connections.catalog) {
     if (catalogMediaIds.length === 0) {
       blockers.push({
         code: 'catalog-empty',
         source: 'catalog',
         message: 'No catalog products synced yet. Run a catalog sync first.'
-      });
-    } else if (catalogRuns.completed === 0) {
-      blockers.push({
-        code: 'catalog-detect-not-started',
-        source: 'catalog',
-        message: `No catalog product detect runs have completed yet (${catalogRuns.queued + catalogRuns.processing} in flight).`
       });
     } else if (catalogRuns.queued + catalogRuns.processing > 0) {
       blockers.push({

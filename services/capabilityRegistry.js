@@ -336,7 +336,7 @@ const CAPABILITIES = [
   {
     id:       'campaign.create',
     title:    'Create campaign',
-    describe: 'Create a new reach-social campaign under a brand. Kind must be \'brand\', \'product\', or \'promotional\'. Optional productIds[] and mediaIds[] pre-populate the wizard\'s Step 2 selection; ids that don\'t belong to the same brand are silently dropped and reported. Blocked by the ad-readiness gate (every connected integration must have ≥1 completed DetectRun). Only creates reach-social campaigns; platform-synced ones (meta-ads / google-ads) originate on the platform side. Requires operator confirmation.',
+    describe: 'Create a new reach-social campaign under a brand. Kind must be \'brand\', \'product\', or \'promotional\'. Optional productIds[] and mediaIds[] pre-populate the wizard\'s Step 2 selection; ids that don\'t belong to the same brand are silently dropped and reported. Blocked by the ad-readiness gate (catalog needs synced products with no detect run in flight; a connected Instagram source also needs at least one completed post detect run). Only creates reach-social campaigns; platform-synced ones (meta-ads / google-ads) originate on the platform side. Requires operator confirmation.',
     tier:     1,
     scope:    'brand',
     args: {
