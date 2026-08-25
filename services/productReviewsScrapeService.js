@@ -675,12 +675,37 @@ async function fetchProductReviews(productUrl, {
   }
 
   // ── tier 3: headless, only when the cheap tiers found nothing ────
+  //
+  // `force` here is NOT optional, and it is NOT captureForProduct's TTL `force`.
+  // reviewHeadlessCapture reads REVIEW_HEADLESS_ENABLED ONCE, at module load, into a
+  // frozen `ENABLED`; captureReviews then bails on its first lines unless ENABLED is
+  // true OR force is passed. Because ENABLED is frozen at boot, a per-call opt-in has
+  // no other way through. Reaching this branch already
+  // means the caller asked for tier 3 — either by setting that env var (which is what
+  // HEADLESS_DEFAULT reads) or by passing useHeadless explicitly, which is what
+  // `?headless=1` on POST /brands/:id/sync-reviews does. Without force, an explicit
+  // per-call request was silently discarded by the env default it was meant to override.
+  //
+  // That was a live silent no-op, measured 2026-08-25: a Gymshark run issued with
+  // ?headless=1 reported "0 captured · 0 with quotes · 1600 skipped" and finished 1,600
+  // products in ~7 minutes — impossible for a tier documented at ~10-25s per product.
+  // Every one of those 1,600 calls returned null instantly. The run looked like proof
+  // that Gymshark has no reachable reviews; it was proof of nothing, because the tier
+  // that exists precisely for client-rendered widgets never executed.
+  // docs/PIPELINES.md:349 and :379 already document `?headless=1` as equivalent to the
+  // env var, so this was a broken promise rather than an intended design.
+  //
+  // `!!useHeadless` rather than a bare `true`: today this line only runs inside
+  // `if (useHeadless ...)`, so they are identical — but if anyone later hoists or
+  // restructures this branch, a hardcoded `true` becomes a landmine that silently
+  // enables a browser per product. Tie force to the thing that actually authorises it.
   if (useHeadless && !merged.quotes.length) {
     try {
       const headless = require('./reviewHeadlessCapture');
       const viaBrowser = await headless.captureReviews(productUrl, {
         platform: merged.platform,
-        maxReviews: adapterMaxReviews
+        maxReviews: adapterMaxReviews,
+        force: !!useHeadless
       });
       if (viaBrowser) mergeTier(merged, viaBrowser, 'headless');
     } catch (err) {
@@ -939,9 +964,21 @@ async function syncBrandProductReviews(brandId, {
     }
   };
 
+  // HEADLESS CLAMP. reviewHeadlessCapture calls headlessScrapeService.getBrowser()
+  // and newPage() WITHOUT taking headlessBrowserClient's mutex — that mutex exists
+  // because one dyno cannot afford a second browser. While tier 3 was an accidental
+  // no-op this cost nothing; now that a per-call opt-in actually reaches Chrome,
+  // PRODUCT_REVIEWS_CONCURRENCY (default 4) would put four full Chromium page loads
+  // on the WEB process, which also runs Remotion, on an 8 GiB box. That is the exact
+  // shape of the 2026-08-21 OOM. Serialise until tier 3 takes the mutex properly;
+  // the HTTP tiers keep their normal concurrency because they are cheap.
+  const effectiveConcurrency = useHeadless ? 1 : concurrency;
+  if (useHeadless && concurrency > 1) {
+    console.log(`   ${LOG}  headless requested — clamping concurrency ${concurrency} -> 1 (Chrome is not mutex-guarded here)`);
+  }
   const queue = rows.slice();
   await Promise.all(
-    Array.from({ length: Math.min(concurrency, queue.length) }, () => worker(queue))
+    Array.from({ length: Math.min(effectiveConcurrency, queue.length) }, () => worker(queue))
   );
 
   summary.cancelled = cancelled;
