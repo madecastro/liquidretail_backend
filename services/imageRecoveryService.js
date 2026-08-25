@@ -165,7 +165,7 @@ async function recoverImageAd({ ad, dryRun = false } = {}) {
   // Fail closed on a bad verdict → status:'failed' (not draft/exportable),
   // still KEEP the recovered asset (invariant 4).
   const visionQc = await maybeQcRecoveredPlate({
-    ad, brand, surface, dims, renderUrl
+    ad, brand, surface, dims, renderUrl, logoRect: plate.logoRect || null
   });
 
   // QC fail closed mirrors the live path (routes/ads failure → status failed
@@ -331,7 +331,7 @@ function extractExpectedTextFromSubmissionPrompt(prompt) {
  * staticVisionQcEnabled back on and this ad is recovered a second time — the
  * exact opposite of what enabling the gate is for.
  */
-async function maybeQcRecoveredPlate({ ad, brand, surface, dims, renderUrl }) {
+async function maybeQcRecoveredPlate({ ad, brand, surface, dims, renderUrl, logoRect = null }) {
   let adVisionQc;
   try {
     adVisionQc = require('./adVisionQcService');
@@ -419,6 +419,10 @@ async function maybeQcRecoveredPlate({ ad, brand, surface, dims, renderUrl }) {
   }
 
   const { expectedText, expectedTextUnknown } = resolveExpectedTextForRecovery(ad);
+  // Same code-computed fact the live render path hands the judge — see
+  // adVisionQcService.computeLogoGeometry. finishPlate already returned this
+  // attempt's logoRect above; safeBox is the same box the judge is told.
+  const logoGeometry = adVisionQc.computeLogoGeometry(logoRect, safeBox);
 
   try {
     // VISION ONLY — one free-of-image-submit call. No regenerate path here.
@@ -430,6 +434,7 @@ async function maybeQcRecoveredPlate({ ad, brand, surface, dims, renderUrl }) {
       deliveryDims: dims,
       expectedText: expectedTextUnknown ? null : expectedText,
       expectedTextUnknown: !!expectedTextUnknown,
+      logoGeometry,
       brandId,
       productId,
       adId,
@@ -445,7 +450,8 @@ async function maybeQcRecoveredPlate({ ad, brand, surface, dims, renderUrl }) {
         findings: raw.findings || [],
         summary: raw.summary || null,
         renderUrl,
-        discarded: false
+        discarded: false,
+        logoGeometry
       }]
     });
     if (!raw.pass) {
