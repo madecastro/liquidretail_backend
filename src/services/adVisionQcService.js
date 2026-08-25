@@ -1134,7 +1134,7 @@ function parseVerdict(raw) {
  * Names the invented marks / defects so the image model has an explicit
  * negative instruction (directImageRenderService operatorPrompt path).
  */
-function buildCorrectiveNote(verdict) {
+function buildCorrectiveNote(verdict, { expectedText = null, logoCorner = null } = {}) {
   const lines = ['VISION QC CORRECTION — previous render failed inspection. Fix ALL of the following:'];
   const cats = verdict?.categories || {};
   for (const key of CATEGORIES) {
@@ -1152,6 +1152,38 @@ function buildCorrectiveNote(verdict) {
   if (verdict?.categories?.text_defects && !verdict.categories.text_defects.pass) {
     lines.push(
       '- Do not print role labels (e.g. "RATING:") — only the value text. Fix every misspelling.'
+    );
+  }
+  // When layout_safe_box fails on OCCLUSION (composited logo sitting on the
+  // product/model), the model cannot move the logo — it is deterministically
+  // composited by post-processing into the reserved corner. What the model
+  // CAN do is recompose so that corner is background, not product/model.
+  // Give it that concrete lever explicitly.
+  const layoutFail = cats.layout_safe_box;
+  if (layoutFail && !layoutFail.pass) {
+    const findingText = (layoutFail.findings || []).join(' ').toLowerCase();
+    const occlusion = /occlud|on top of|across|over the (product|sleeve|shoe|hat|model|item|garment)/.test(findingText);
+    if (occlusion) {
+      const cornerName = logoCorner || 'bottom-right';
+      lines.push(
+        `- LAYOUT — the brand logo is composited by post-processing into the ${cornerName} ` +
+        `corner AFTER you generate. You cannot move it. Instead, RECOMPOSE the scene so ` +
+        `the ${cornerName} corner shows background only (sky, ocean, wall, environment) — ` +
+        `NEVER the product, model, garment, hardware, or hands. Keep the product prominent ` +
+        `elsewhere in the frame; leave background negative space specifically in the ${cornerName}.`
+      );
+    }
+  }
+  // Preserve exact on-ad copy across regen. Otherwise the model rewrites
+  // otherwise-valid strings (measured 2026-08-25 on Pelagic swimwear: a
+  // regen told to "fix logo occlusion" shortened "Shop the collection" to
+  // "Shop now" — text_defects then failed terminally).
+  const expected = Array.isArray(expectedText) ? expectedText.filter(Boolean) : [];
+  if (expected.length) {
+    const list = expected.map((t) => `  • ${t}`).join('\n');
+    lines.push(
+      'PRESERVE THESE EXACT COPY STRINGS verbatim — same words, same wording, same casing. ' +
+      'Do not paraphrase, shorten, or substitute:\n' + list
     );
   }
   lines.push('Reproduce the original product faithfully. Ship only after these defects are gone.');
@@ -1491,6 +1523,12 @@ async function runPostRenderQc({
   adId = null,
   campaignId = null,
   campaignRunId = null,
+  // logoCorner: the reserved-corner slug (e.g. 'bottom-right') the compositor
+  // will drop the brand mark into. Used by the corrective note on a
+  // layout_safe_box occlusion failure to tell the LLM which corner to
+  // recompose as background. Optional — omitted → note falls back to a
+  // generic corner phrasing.
+  logoCorner = null,
   generate,
   uploadAttempt = null,
   judgeFn = null,
@@ -1705,7 +1743,10 @@ async function runPostRenderQc({
     }
 
     // Prepare the single allowed regeneration.
-    correctiveNote = buildCorrectiveNote(verdict);
+    correctiveNote = buildCorrectiveNote(verdict, {
+      expectedText: expectedTextUnknown ? null : expectedText,
+      logoCorner
+    });
     attempts[attempts.length - 1].discarded = true;
     reportQcVerdict({
       adId,

@@ -2986,6 +2986,14 @@ async function renderDirectImage(callArgs = {}) {
     productId: qcProductId,
     adId: adId || null,
     campaignRunId: campaignRunId || null,
+    // Reserved-corner slug for the corrective-note builder. On a
+    // layout_safe_box occlusion failure it tells the LLM which corner to
+    // recompose as background — the composited logomark itself is
+    // deterministic and cannot be moved by regen. Currently hardcoded to
+    // 'bottom-right' at the buildPrompt call above (see product.logoCorner
+    // there). When corner rotation lands as a follow-up, thread the same
+    // value through here.
+    logoCorner: 'bottom-right',
     // MONEY: generate() attempt 1 returns the already-paid firstOutput.
     // attempt 2 (at most once) re-enters renderDirectImage with a corrective
     // operatorPrompt and skipVisionQc:true — one more billable editImage.
