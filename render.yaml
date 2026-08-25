@@ -41,8 +41,13 @@ services:
     name: adgen-renderer
     env: docker
     # Pro-Plus: 4 vCPU / 8 GB. The RAM ceiling is set by Remotion —
-    # ~1.5-2 GB per render at 4 concurrent (REMOTION_QUEUE_CONCURRENCY=4)
-    # ≈ 6-8 GB peak. Standard (4 GB) OOMs under real video load. Was
+    # MEASURED ~1.97 GB per concurrent render, so REMOTION_QUEUE_CONCURRENCY=3
+    # ≈ 5.9 GB peak (74%, ~2 GB headroom). 4 concurrent ≈ 7.9 GB and is the
+    # configuration that was OOM-killed on 2026-08-21 while holding a paid
+    # master — do not restore it here. Standard (4 GB) OOMs under real video
+    # load. NOTE: autoscaling is currently DISABLED on this service, so the
+    # 60% memory trigger is not a live constraint on the concurrency choice.
+    # Was
     # standard_plus in this file until 2026-08-24 (Render's plan naming
     # shifted mid-year; the live service was already on pro_plus via
     # dashboard override, and standard_plus is no longer a valid worker
