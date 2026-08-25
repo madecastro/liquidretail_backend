@@ -2633,7 +2633,16 @@ async function renderDirectImage(callArgs = {}) {
     product: {
       desc: describeProductForPrompt({ concept, product: resolvedProduct, layoutInput: effectiveLayout.input || {} }),
       look: conceptLook(concept),
-      logoCorner: 'bottom-right'
+      logoCorner: 'bottom-right',
+      // Category threaded through so staticAdIntents.buildPrompt can
+      // detect apparel and adjust the role preamble (see the
+      // APPAREL EXTENSION comment there). Reads from the resolvedProduct
+      // FIRST (CatalogProduct.category — the merchant feed's own
+      // category string), falls back to layoutInput. Optional field on
+      // the prompt-input contract; absent = non-apparel = no-op.
+      category:  resolvedProduct?.category
+                 || effectiveLayout?.input?.product?.category
+                 || null
     },
     surface,
     seedStyle,

@@ -1626,9 +1626,27 @@ Set no other words, numerals or letterforms anywhere in the image — including 
   /**
    * Role framing. Owner-supplied 2026-08-03. Gated with the rest of the hardening
    * so the flag-off arm stays byte-identical to the measured baseline.
+   *
+   * APPAREL EXTENSION (2026-08-25). When the product is apparel-category
+   * (isApparelCategory reads product.category), append explicit commercial-
+   * catalog framing to the role. Reason: OpenAI gpt-image-2/edit's safety
+   * classifier false-positived on 4 of 9 Pelagic swimwear statics in
+   * run_1787684512013_e5feaf12 (safety_violations=[sexual] on ordinary
+   * retailer photography). The added sentence gives the model explicit
+   * commercial-photography context so the request reads as legitimate
+   * retailer catalog work rather than lifestyle content. The moderation-
+   * fast-fail change shipped earlier stops us BURNING TIME on retries; this
+   * one aims to REDUCE the false-positive rate in the first place.
+   *
+   * Byte-identical for non-apparel products (isApparelCategory false → the
+   * extension is an empty string → the concat is a no-op).
    */
+  const { isApparelCategory } = require('./apparelCategory');
+  const apparelClause = (FIDELITY_HARDENING && isApparelCategory(product?.category))
+    ? ' This is professional apparel catalog photography for a legitimate retailer — editorial commercial imagery in the style of a shipped brand campaign, garment-focused.'
+    : '';
   const rolePreamble = FIDELITY_HARDENING
-    ? 'You are an expert advertising creative director, commercial product photographer and graphic designer.\n\n'
+    ? `You are an expert advertising creative director, commercial product photographer and graphic designer.${apparelClause}\n\n`
     : '';
 
   /**
