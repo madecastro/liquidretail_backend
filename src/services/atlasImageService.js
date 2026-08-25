@@ -343,7 +343,26 @@ async function submitAndPoll(model, params, meta = {}, { timeoutMs = TIMEOUT_MS 
     // Check the envelope before the status. A non-200, or a body carrying an
     // error code, is terminal now — there is nothing to wait for.
     const apiCode = poll.data?.code;
-    const apiMsg  = poll.data?.msg || poll.data?.message || null;
+    // Message for classify() must combine ENVELOPE + INNER error text.
+    //
+    // MEASURED 2026-08-25 on run_1787684512013_e5feaf12 (Pelagic "Key West Top"
+    // swimwear): a moderation-blocked poll returns envelope msg="task failed"
+    // (which matches NO regex in atlasErrorPolicy.moderationBlocked) while the
+    // actual "safety_violations=[sexual]" / "safety system" text sits at
+    // data.data.error(.message). Reading only the envelope classified 4 ads as
+    // `predictionFailed` (action:'retry') and burned ~60-90s of retry backoff
+    // per ad on identical prompts that will always be rejected. Peer function
+    // peekImagePrediction (~:869) already reads data.error correctly; the poll
+    // loop was the outlier. Concat instead of picking one so the safety text
+    // reaches classify() the FIRST time it's available, and moderationBlocked
+    // (action:'give-up') fires immediately instead of after N retries.
+    const innerErr = poll.data?.data?.error;
+    const innerMsg = typeof innerErr === 'string'
+      ? innerErr
+      : (innerErr && typeof innerErr.message === 'string' ? innerErr.message : null);
+    const apiMsg = [poll.data?.msg, poll.data?.message, innerMsg]
+      .filter((s) => typeof s === 'string' && s.length > 0)
+      .join(' | ') || null;
     const st = String(poll.data?.data?.status || 'unknown').toLowerCase();
 
     // Classification is centralised in atlasErrorPolicy so precedence is
