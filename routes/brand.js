@@ -2998,10 +2998,12 @@ router.get('/:id/lifestyle-eligible-media-ids', async (req, res) => {
 });
 
 // Ad-readiness gate — same signals as the onboarding panel, condensed
-// into a yes/no the wizard can disable buttons on. Strictest bar:
-// every connected source has ≥1 completed DetectRun AND zero in-flight
-// runs. Returns 200 with { ready, reason, blockers[] } even when not
-// ready — the frontend renders the blockers as a tooltip / banner.
+// into a yes/no the wizard can disable buttons on. The bar is asymmetric
+// since 2026-08-25: catalog needs Media + 0 in-flight (NO completed
+// DetectRun required — catalog detect is deferred); social still needs
+// ≥1 completed + 0 in-flight. Returns 200 with { ready, reason,
+// blockers[] } even when not ready — the frontend renders the blockers
+// as a tooltip / banner.
 router.get('/:id/ad-readiness', async (req, res) => {
   try {
     const brand = await Brand.findOne(tenantFilter(req, { _id: req.params.id })).select('_id').lean();

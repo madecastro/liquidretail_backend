@@ -724,10 +724,12 @@ router.post('/', express.json(), async (req, res) => {
     if (!brandId)        return res.status(400).json({ error: 'brandId required' });
     if (!req.advertiserId) return res.status(400).json({ error: 'advertiser context missing' });
 
-    // Account-setup gate — block campaign creation until every connected
-    // source has ≥1 completed DetectRun and zero in-flight runs. Partial
-    // ingest state pairs seeds with stale/mismatched UGC; the strictest
-    // bar avoids that until detect terminates everywhere.
+    // Account-setup gate. NOT symmetric across sources since 2026-08-25:
+    // catalog needs Media + 0 in-flight (a completed DetectRun is NOT
+    // required — catalog detect is deferred and only the generation path
+    // creates one); social still needs ≥1 completed + 0 in-flight, because
+    // that is where the stale-UGC pairing risk actually lives. See
+    // services/adReadinessService.js for the full reasoning.
     const { getAdReadiness } = require('../services/adReadinessService');
     const readiness = await getAdReadiness(brandId);
     if (!readiness.ready) {

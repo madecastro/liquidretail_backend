@@ -44,8 +44,10 @@ async function run({ req, args }) {
   const mediaIds   = Array.isArray(args?.mediaIds)   ? args.mediaIds   : [];
 
   // Ad-readiness gate — matches the route handler's behavior. Blocks
-  // campaign creation until every connected source has completed at
-  // least one DetectRun.
+  // campaign creation until catalog has Media with no in-flight detect,
+  // and social (if connected) has ≥1 completed DetectRun. A completed
+  // CATALOG DetectRun is deliberately not required; see
+  // services/adReadinessService.js.
   const readiness = await getAdReadiness(brand._id);
   if (!readiness.ready) {
     return {
