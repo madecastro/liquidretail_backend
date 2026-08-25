@@ -1,8 +1,8 @@
 {
   "version": 1,
   "backendRef": "origin/main",
-  "backendHead": "e5f4a3ffb9890f84858fb1ad453a9c9f7059d58d",
-  "generatedAt": "2026-08-25T07:23:13.802Z",
+  "backendHead": "9bad6b803b1d2ed72b10ae2388e1bbcbec688a28",
+  "generatedAt": "2026-08-25T09:55:54.382Z",
   "files": {
     "models/Ad.js": {
       "backendHash": "959aebff9a2620a7c4ab63f98d38909d355cc208f7f3a33a16b085d507fa0e37",
@@ -394,10 +394,10 @@
       "status": "synced"
     },
     "services/adReadinessService.js": {
-      "backendHash": "8de31b15b0fe0cda65ce6195dbdbd30490f543ebd0d06064711b4a8e29fa2779",
-      "backendSha": "a035aeb9d5337fcdf8accd53de1acbe08667ed6f",
+      "backendHash": "22e736dcd7e48c5492c0e5b775ec609a3f067f7cf0c81c37a084f6064a7e0270",
+      "backendSha": "9bad6b803b1d2ed72b10ae2388e1bbcbec688a28",
       "status": "unused",
-      "reason": "backend ad-readiness HTTP surface; adgen renderer does not call it"
+      "reason": "unused in adgen — the readiness gate runs on backend routes (campaigns create / ads generate), nothing under adgen/src requires it. Re-attested after backend #340, which REMOVED the catalog-detect-not-started blocker: catalog detect is deferred (CATALOG_DETECT_PRECOMPUTE=false) and the only creator of a catalog DetectRun runs inside the request the gate was refusing, so it deadlocked every brand onboarded after deferral. If this copy is ever wired up in adgen, port that fix first — this vendored copy predates it."
     },
     "services/adRegenerateService.js": {
       "backendHash": "2df1a9a2e034ebc99aa0d232f636294fde78cc3889b2e06662bcb89e0f09db18",
@@ -652,10 +652,10 @@
       "reason": "only required from unused capabilityRegistry"
     },
     "services/capabilityRegistry.js": {
-      "backendHash": "45a390721c131c3f43f3772e9f8d4778f1df95b74720e213047ddadfbf3ec036",
-      "backendSha": "d63bb064545abb34b8b02ed780f8fe3cc52b8b94",
+      "backendHash": "b662a945c8dbfd30af1e85073ebf00ab8efd2214c7f028e041d42bb8ab109ea9",
+      "backendSha": "9bad6b803b1d2ed72b10ae2388e1bbcbec688a28",
       "status": "unused",
-      "reason": "operator-agent capability surface is backend-owned"
+      "reason": "unused in adgen — operator-agent capability surface is backend-owned. Re-attested after backend #340 corrected campaign.create's describe text, which had been telling the agent layer the old deadlocked readiness rule ('every connected integration must have >=1 completed DetectRun')."
     },
     "services/catalogImageQuality.js": {
       "backendHash": "f949335ad31cf3efc99f4f5f2315b67eaa6f8693342851642f4843d3d37baf60",

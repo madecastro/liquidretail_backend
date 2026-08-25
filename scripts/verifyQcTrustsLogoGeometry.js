@@ -168,6 +168,36 @@ function promptText(userContent) {
     /do NOT flag[\s\S]*logo's POSITION under layout_safe_box/i.test(text));
   check('P4 category 4 text is scoped to TEXT/CTA, no longer "text, CTA, or logo"',
     /Any TEXT or CTA that breaches/.test(text) && !/Any text, CTA, or logo that breaches/.test(text));
+
+  // ── P7-P9: OCCLUSION. Added 2026-08-25 after two production ads shipped
+  //    with the brand's own logo composited ON TOP OF the product — Pelagic
+  //    Daybreak (logo across the model's sleeve, meta_stories_9_16 and
+  //    pmax_portrait_4_5) and a PB5star pickleball shoe (pb5* logo across the
+  //    outsole, pmax_landscape_1_91_1). BOTH scored a clean 10/10 on every
+  //    category, one of them while the judge praised the heel branding as
+  //    "faithfully reproduced".
+  //
+  //    That was not the judge being lax — it was structurally unable to say
+  //    so. P3 above (correctly) tells it not to re-litigate the logo's
+  //    POSITION, competitor_marks explicitly exempts the brand's own
+  //    composited logo, and product_fidelity is about drift from IMAGE 1.
+  //    Occlusion had no category to land in, so it always passed.
+  //
+  //    logoPlacementFor computes the rect from LOGO_SAFE_MARGIN_PCT — pure
+  //    edge geometry — and has no knowledge of where the product's pixels
+  //    are, so a bottom-right logo lands on the subject whenever the pose
+  //    reaches that corner. The measured rectangle settles WHERE the logo
+  //    is; it says nothing about WHAT is underneath it. The video prompt
+  //    already asks this question ("Does the caption/logo overlay ever fully
+  //    obscure the product"); static did not.
+  check('P7 prompt asks whether the logo sits ON TOP OF the product, not just where it is',
+    /ON TOP OF the product/i.test(text));
+  check('P8 occlusion is explicitly separated from position, and routed to a category',
+    /OCCLUSION IS A DIFFERENT QUESTION FROM POSITION/i.test(text)
+      && /flag it under[\s\S]*layout_safe_box/i.test(text));
+  check('P9 the position instruction (P2/P3) SURVIVES alongside the occlusion one',
+    /TRUST THIS[\s\S]*MEASURED FACT/.test(text)
+      && /do NOT flag[\s\S]*logo's POSITION under layout_safe_box/i.test(text));
 }
 
 {

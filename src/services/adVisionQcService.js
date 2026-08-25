@@ -392,7 +392,14 @@ function buildVisionUserContent({
         `MEASURED FACT over your own visual estimate of the logo's location — do NOT flag ` +
         `this logo's POSITION under layout_safe_box, even if it looks close to an edge to ` +
         `you. (You may still flag the logo elsewhere — competitor_marks or product_fidelity — ` +
-        `for a WRONG or DISTORTED mark; this note is about position only.)`;
+        `for a WRONG or DISTORTED mark; this note is about position only.) ` +
+        `\n  OCCLUSION IS A DIFFERENT QUESTION FROM POSITION, and you MUST still judge it ` +
+        `by eye: does this logo sit ON TOP OF the product itself — across a sleeve, a shoe ` +
+        `sole, a garment panel — rather than over background? A logo can be comfortably ` +
+        `inside the safe box, exactly where the renderer intended, and still be printed ` +
+        `across the product it is advertising. If it overlaps the product, flag it under ` +
+        `layout_safe_box and say so in the finding. The measured rectangle above settles ` +
+        `WHERE the logo is; it says nothing about WHAT is underneath it.`;
     } else {
       // Defensive branch, not expected to fire given how logoPlacementFor is
       // constructed today — but if it ever does, the code itself is telling
