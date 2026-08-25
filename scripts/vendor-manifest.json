@@ -1,8 +1,8 @@
 {
   "version": 1,
   "backendRef": "origin/main",
-  "backendHead": "e75f6884439fb3343993590ae7bdaa73b3790ae9",
-  "generatedAt": "2026-08-24T22:30:09.489Z",
+  "backendHead": "e955b04891fcb861bbf64a5bc8642aa2fbe7a0bc",
+  "generatedAt": "2026-08-25T02:53:55.778Z",
   "files": {
     "models/Ad.js": {
       "backendHash": "2c7423b688a764b10991e5c2f067aabcfd6dc68301883c616d43deba08cf0957",
@@ -416,8 +416,8 @@
       "status": "synced"
     },
     "services/adVisionQcService.js": {
-      "backendHash": "50c112ea46d74d8cfada2b720b1bcb7dc3277d6162328ea0a4fdb46a9cef9c90",
-      "backendSha": "ba99a59f10619bbd940be9442c8852dc32ae278a",
+      "backendHash": "ec26acfea7dfb97e3537cf471da36f8dc440b13748e85b20a450b0d7fb7dc586",
+      "backendSha": "e955b04891fcb861bbf64a5bc8642aa2fbe7a0bc",
       "status": "fork",
       "reason": "Backend #329 threads campaignRunId through judgeRender/runPostRenderQc/judgeVideoRender/runVideoPostRenderQc; adgen already carries campaignRunId in all four (via adgen's own #43 cost-ledger attribution work) — same shape, verified at each call site (adVisionQcService.js:1088,1389,1756,1837 + their internal judge() calls). Residual divergence unchanged from prior look: env-var fallback removed + buildPersistedVerdict invariant restored to match backend; backend's isStaticEnabled()/isVideoEnabled() synchronous pipeline gates remain unported (unused by any adgen caller)."
     },
@@ -564,7 +564,7 @@
       "backendHash": "c123aa44b7c094d52e0c5eb3096380623e672f04b23efd5a399751e0d2eeb170",
       "backendSha": "d8c133011275d62fa4133ed939b5e47fe5e90bdc",
       "status": "fork",
-      "reason": "adgen video QC/titling path (Remotion child OOM/timeout); colourway gate hunk-ported from backend #324"
+      "reason": "adgen video QC/titling path (Remotion child OOM/timeout); colourway gate hunk-ported from backend #324. FIXED 2026-08-24: the #307 port (below, plateIntelService.js) left both renderTitles({...}) call sites here computing platformFormat but never deriving safeZoneKey from it, so bandsFor(safeZoneKey) always got undefined and silently used pre-#307 BANDS on every real render — the fix was reachable but never actually exercised. Now computes `const safeZoneKey = resolveSafeZoneKeyCjs({format, platformFormat})` once and forwards it to both call sites. Same gap independently found and fixed on backend main the same day (unmerged there too as of this reason). Verified via scripts/verifyKeepOutBandGeometry.mjs groups I/J/K, mutation-proven (dropping the call-site arg, and a decoy hardcoded null, each turn a check red)."
     },
     "services/brandScriptRunner.child.js": {
       "backendHash": "c8f60343c015bda7e03d69bfa07b8d01cb91c3347701a11773412537a6e36b76",
@@ -709,8 +709,8 @@
       "reason": "backend matcher; adgen does not call it"
     },
     "services/directImageRenderService.js": {
-      "backendHash": "f26a16df7e1a5e78b104f0824ea7ce63250c4fe153bfd8cc50721e7900cc0cda",
-      "backendSha": "ba99a59f10619bbd940be9442c8852dc32ae278a",
+      "backendHash": "f08b826fce868dac48bab3e037b736a338f07859df885533034ec2ad1a621e4f",
+      "backendSha": "e955b04891fcb861bbf64a5bc8642aa2fbe7a0bc",
       "status": "fork",
       "reason": "Backend #327 (logo-safe-box) parity already held; backend #329 additionally added campaignRunId: campaignRunId || null to the vision-QC params object immediately preceding the 'MONEY: generate() attempt 1...' comment. adgen already carries campaignRunId: campaignRunId || null at the identical call site (directImageRenderService.js:2951, adgen #43) — confirmed byte-identical for this hunk. Existing fork reasons unchanged: adgen owns usableAttribution, composeCorrectiveOverride, buildQcRetryArgs, submitEditImageWithSeedFallback; colourway gate + logo-safe-box inset hunk-ported from backend, both sides verified identical on LOGO_INSET_FRAC/logoInsetPx."
     },
@@ -772,8 +772,8 @@
       "reason": "backend preview helper; no adgen caller"
     },
     "services/imageRecoveryService.js": {
-      "backendHash": "7090677f5ee39bf6d7c928f8151ed1a32b48f4ed43c2d44d8c95ed5b04bd48c7",
-      "backendSha": "ba99a59f10619bbd940be9442c8852dc32ae278a",
+      "backendHash": "adfabcf2dce9caf82e332cca557cb22c014b618b65452087c9b07ce194c56b1d",
+      "backendSha": "e955b04891fcb861bbf64a5bc8642aa2fbe7a0bc",
       "status": "unused",
       "reason": "Backend #329 added productId to the CostLog objects in recoverImageAd and settleChargeState; irrelevant — reconfirmed both callers (strandedRunSweeper.js, bootRecoveryService.js) have zero requirers anywhere in adgen src/ (entrypoint.js only requires ./config, ./db, ./routes/api, ./services/orchestrator, ./services/renderer), so this file stays unreachable. Same reason as before: only reached from unwired bootRecovery / strandedRunSweeper."
     },
@@ -887,7 +887,7 @@
       "backendHash": "21c5d7c66dbfd1a8636d2ef6feddbbf51a53f287e1fa8168ad99955786f6602d",
       "backendSha": "ba99a59f10619bbd940be9442c8852dc32ae278a",
       "status": "fork",
-      "reason": "Backend #329 added an ids={} third param to semanticScan but never wires it into the title_plate_scan chatCompletion call (verified: zero 'ids.' reads anywhere in backend's function body) — a scaffold-only change on backend's side. adgen's semanticScan/analyzePlate already fully destructure and thread brandId/productId/adId/campaignRunId into the same call (plateIntelService.js:175,238, adgen #43); adgen is ahead of backend on this specific hunk. PORTED 2026-08-24: backend #307 (dabceaf4) surface-aware keep-out bands — SURFACE_INSETS, LOWER_THIRD_TOP/BAND_LEAD_IN, bandsFor(safeZoneKey), REFERENCE_BAND_H rescale in applyFaceKeepOut, bandRect(bandKey, safeZoneKey), analyzeFrameBands reading bandsFor(opts.safeZoneKey) — with adgen's brandId/productId/adId/campaignRunId params on analyzePlate preserved alongside the new safeZoneKey param. Verified via scripts/verifyKeepOutBandGeometry.mjs (25 checks incl. cross-module pin against src/remotion/lib/safeZones.js). Prior reason unchanged: adgen extract is smaller than backend (backend grew after the copy)."
+      "reason": "Backend #329 added an ids={} third param to semanticScan but never wires it into the title_plate_scan chatCompletion call (verified: zero 'ids.' reads anywhere in backend's function body) — a scaffold-only change on backend's side. adgen's semanticScan/analyzePlate already fully destructure and thread brandId/productId/adId/campaignRunId into the same call (plateIntelService.js:175,238, adgen #43); adgen is ahead of backend on this specific hunk. PORTED 2026-08-24: backend #307 (dabceaf4) surface-aware keep-out bands — SURFACE_INSETS, LOWER_THIRD_TOP/BAND_LEAD_IN, bandsFor(safeZoneKey), REFERENCE_BAND_H rescale in applyFaceKeepOut, bandRect(bandKey, safeZoneKey), analyzeFrameBands reading bandsFor(opts.safeZoneKey) — with adgen's brandId/productId/adId/campaignRunId params on analyzePlate preserved alongside the new safeZoneKey param. Verified via scripts/verifyKeepOutBandGeometry.mjs (25 checks incl. cross-module pin against src/remotion/lib/safeZones.js). Prior reason unchanged: adgen extract is smaller than backend (backend grew after the copy). FOLLOW-UP FIX 2026-08-24 (same day): the port above was itself inert — nothing ever called this file's bandsFor with a real safeZoneKey, because neither renderTitles call site in brandScriptExecutor.js computed one. Added resolveSafeZoneKeyCjs({format, platformFormat}) next to SURFACE_INSETS, a CJS mirror of remotion/lib/safeZones.js's resolveSafeZoneKey (same mirror-not-import pattern as SURFACE_INSETS itself), pinned against drift by new harness groups I/J/K. bandsFor/bandRect/SURFACE_INSETS themselves are unchanged by this follow-up."
     },
     "services/platformFormats.js": {
       "backendHash": "6e0a24cbf76a019e1425599a2c6411d8012962f80915fb474a699c3e003a8cde",

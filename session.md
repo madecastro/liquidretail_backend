@@ -14,78 +14,38 @@ it clears it back to this placeholder.)_
 
 ## CURRENT STATE
 
-*(Written 2026-08-24. Worktree `/Volumes/Sayulita/Projects/RS/.wt-vendorgate`,
-branch `feat/parallel-work-infra` off `origin/master` @ `904062e`. PR open
-(see PR description for number), NOT merged — owner asked for a PR only,
-no self-merge.)*
+*(Written 2026-08-24. Worktree `/Volumes/Sayulita/Projects/RS/.wt-safezonekey-adgen`,
+branch `fix/wire-safezonekey-titling-adgen`, built ON TOP OF the open
+`port/backend-307-titling-band-geometry` branch (PR #54, itself open/unmerged
+— this branch must land AFTER #54, not instead of it). PR open, NOT merged.)*
 
-- **What this is.** Build infra to stop parallel work from falling behind
-  trunk. Diagnosed problem: 38 merges/14h, median gap 12.5min — far under
-  how long a real unit of work takes to build+verify. Three things landed:
-
-  1. **`scripts/vendor-manifest.json` merge driver.** Confirmed generated
-     (`scripts/lib/vendorDrift.js` `saveManifest`, written by
-     `verifyVendorDrift.js --seed`/`--reconcile`) and the single most
-     merge-conflicted path (9/38 merges) — git's textual 3-way merge
-     collides on sorted-JSON-key proximity even when two branches' actual
-     changes never overlap. `scripts/mergeVendorManifest.js` merges the
-     `files` map at the KEY level instead, re-seeds anything newly vendored
-     in the merged tree, and verifies (untracked/stale/dead must be empty)
-     before writing — reusing vendorDrift.js's own primitives, no
-     reimplementation. Live-tested with synthetic merges (disjoint-key:
-     clean, with backend present and forced absent; same-key conflicting
-     edit: fails loudly, JSON never corrupted). Setup is NOT automatic —
-     `npm run setup:worktree` (→ `scripts/setupMergeDrivers.js`) must run
-     once per clone/worktree; `.gitattributes` documents this. **Real
-     finding, not fixed here:** the manifest's `generatedAt`/`backendHead`
-     are a wall-clock timestamp + the sibling backend's live HEAD — neither
-     is deterministic, though neither is read back by any pass/fail check
-     either (confirmed by reading `loadManifest`), so it's safe but will
-     always show churn.
-  2. **Auto-rebase, not a merge queue.** `master` has NO branch protection
-     today (confirmed via API — 404). Enabling GitHub's merge queue needs
-     branch protection + required status checks, which is a standing
-     repo-admin change out of scope for a PR to make — the org plan
-     (`team`) does support it if the owner wants to flip it on; see the PR
-     description for exact steps. Shipped the cheaper, no-admin-needed
-     alternative instead: `.github/workflows/rebase-open-prs.yml` runs
-     after every push to master and rebases every open, ready-for-review,
-     same-repo PR (`.github/scripts/rebaseOpenPrs.js`), `--force-with-lease`,
-     skipping drafts/forks/`no-auto-rebase`-labeled PRs, commenting instead
-     of force-pushing on conflict.
-  3. **Collision warnings.** `.github/workflows/pr-collision-watch.yml` +
-     `.github/scripts/prCollisionWatch.js` recomputes every open PR's
-     file-overlap set on every relevant event and keeps one bot comment per
-     PR current (edited in place via a hidden marker — a stale "no
-     collision" claim is worse than none). Uses `gh pr diff --name-only`
-     (real merge-base diff, not a raw local diff, so a merely-behind PR
-     doesn't look like it touches everything).
-  4. **`renderer.js` report (no refactor)** — see PR description / this
-     session's final report for the full breakdown. Short version: 1747
-     lines, one function (`renderVideo`, ~398 lines) is the single largest
-     chunk and itself covers three distinct money paths (master/derive/
-     titling); `renderStatic` (~169 lines) is a fully separate pipeline
-     sharing almost nothing with it except claim/bump/heartbeat primitives
-     and module-level state (`inFlight`, `runInflight`/`runHeartbeats`/
-     `runDocIdCache` Maps). Natural seam: split by render route into
-     `staticRenderService.js` / `videoRenderService.js`, leaving
-     `renderer.js` as the poll/claim/heartbeat/dispatch core. Not done —
-     owner decision, this was report-only.
-- **Suite: 36/38 passed.** Two non-passing, both pre-existing / not caused
-  by this branch (confirmed: `scripts/vendor-manifest.json` is
-  byte-identical to `origin/master`'s copy on this branch):
-  - `verifyRunFinalizesOnSettle_KNOWN_OPEN.js` — the documented, allowlisted
-    expected-failure (see `scripts/expected-failures.json`).
-  - `verifyVendorDrift.js` — a REAL, PRE-EXISTING failure already on
-    `origin/master`: 12 vendored files have drifted because the sibling
-    `liquidretail_backend` has moved past the manifest's last recorded
-    reconciliation (backend is at `ba99a59f` / #329; the manifest's
-    recorded `backendHead` is `b7b8cae6`, several backend commits back).
-    This is a content/porting decision (port or re-attest each file via
-    `--reconcile`), not a build-infra concern — out of scope for this PR,
-    flagged for the owner rather than silently fixed or ignored.
-- **Not landed.** PR open against `master`, NOT merged per explicit
-  instruction — owner reviews and merges.
+- **What this is.** PR #54 ported backend #307's surface-aware titling band
+  geometry (`bandsFor(safeZoneKey)` etc.) faithfully — including the gap that
+  made it inert on backend too: nothing on adgen's side ever computed a
+  `safeZoneKey` to hand it. Both `renderTitles({...})` call sites in
+  `src/services/brandScriptExecutor.js` had `platformFormat` in scope and
+  never derived `safeZoneKey` from it, so `bandsFor` always fell back to the
+  pre-#307 literal on every real render. Fixed with `resolveSafeZoneKeyCjs`
+  (`src/services/plateIntelService.js`, mirrors `src/remotion/lib/
+  safeZones.js`'s `resolveSafeZoneKey` the same way `SURFACE_INSETS` already
+  mirrors `SAFE_ZONES`), called once in `brandScriptExecutor.js` and forwarded
+  to both call sites. New harness groups I/J/K in
+  `scripts/verifyKeepOutBandGeometry.mjs` (this port's own groups run A-H)
+  are the regression check that would have caught the gap; mutation-proven
+  (3 mutations, each red then restored green). `scripts/vendor-manifest.json`
+  reasons updated for both touched files. Full write-up:
+  `session.d/2026-08-24_wire-safezonekey-titling.md`. Companion fix, same
+  day: `liquidretail_backend`'s own PR for the identical gap.
+- **Suite: 40/43 passed.** Identical to the PR #54 branch tip BEFORE this
+  change (confirmed via `git stash` bisection) — no new failures introduced.
+  - `verifyRunFinalizesOnSettle_KNOWN_OPEN.js` — documented expected-fail.
+  - `verifyModelParity.js` / `verifyVendorDrift.js` — both pre-existing on
+    the PR #54 branch tip, unrelated to files this change touches (drift is
+    against `adVisionQcService.js` / `directImageRenderService.js` /
+    `imageRecoveryService.js`, a known ongoing backend-sync gap flagged by
+    prior sessions, not introduced or worsened here).
+- **Not landed.** PR open, NOT merged — must land after (or alongside, not
+  instead of) PR #54.
 
 ---
 
