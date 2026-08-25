@@ -75,6 +75,7 @@ const state = {
   inFlight: new Set(),                 // ad._id strings currently being titled
   heartbeatTimer: null,
   pollTimer: null,
+  polling: false,                      // pollTick mutex — see pollTick header
   startedAt: null,
 };
 
@@ -513,7 +514,26 @@ function shouldSkipForBackpressure() {
     if (!stats || !Number.isFinite(stats.concurrency)) return false;
     const active = Number(stats.active) || 0;
     const waiting = Number(stats.waiting) || 0;
-    return (active + waiting) >= (stats.concurrency + REMOTION_BACKPRESSURE_SLACK);
+    const cap = stats.concurrency + REMOTION_BACKPRESSURE_SLACK;
+    // Two lenses, and BOTH must be checked. Measured 2026-08-25 on
+    // run_1787699708xxx (Pelagic apparel): the Remotion-queue lens alone
+    // missed the setup-latency gap. When burst-claim fires, the newly-
+    // claimed ads spend ~1s in synchronous setup (funnelCopy → coherentProof
+    // → brandScript → templateRegistry → face detection) BEFORE enqueue()
+    // is called. During that window they are pinned to state.inFlight but
+    // INVISIBLE to renderQueueStats, so this instance's poll loop happily
+    // claims more — 4 ads captured before active ever moved off 1.
+    //
+    //   1. Remotion queue (active+waiting) — catches steady-state
+    //      pipeline utilization. This alone is what the original fix used.
+    //   2. state.inFlight — catches the setup-latency gap where ads are
+    //      claim-committed but not yet enqueued into Remotion. Post-Remotion
+    //      QC ads also count here, which is conservative but correct: they
+    //      still occupy the pipeline slot and a slot freeing on the sibling
+    //      instance is preferable to holding here.
+    if ((active + waiting) >= cap) return true;
+    if (state.inFlight.size >= cap) return true;
+    return false;
   } catch (err) {
     // Fail-open — a broken stats getter must NEVER stop the titler.
     return false;
@@ -521,18 +541,27 @@ function shouldSkipForBackpressure() {
 }
 
 // ── poll ──────────────────────────────────────────────────────────────────
+// MUTEX. setInterval does not serialize its callbacks — if one pollTick's
+// awaited claimOne(s) take longer than POLL_MS, the next firing runs
+// concurrently. Measured 2026-08-25: two overlapping pollTicks each observed
+// state.inFlight.size=3, each passed the `< MAX_INFLIGHT` gate, each
+// claimed an ad — result was 5/4 inFlight on one instance (a MAX_INFLIGHT
+// violation). The `state.polling` gate makes overlapping fires no-op.
 async function pollTick() {
   if (state.shuttingDown) return;
   if (!isTitlerEnabled()) return;
+  if (state.polling) return;         // another pollTick is already inside the loop
   if (state.inFlight.size >= MAX_INFLIGHT) return;
 
+  state.polling = true;
   try {
     while (!state.shuttingDown && state.inFlight.size < MAX_INFLIGHT) {
       // Backpressure: stop claiming if THIS instance's Remotion queue is
-      // already saturated. The check must run INSIDE the loop, not just at
-      // entry — during a burst-claim tick, each successful claim mutates
-      // the queue state (its enqueue() increments active or waiting), so a
-      // once-per-tick check would still overshoot.
+      // already saturated OR its state.inFlight is already at the effective
+      // cap. The check must run INSIDE the loop, not just at entry — during
+      // a burst-claim tick, each successful claim mutates the queue state
+      // (its enqueue() increments active or waiting), so a once-per-tick
+      // check would still overshoot.
       if (shouldSkipForBackpressure()) break;
       const ad = await claimOne();
       if (!ad) break;
@@ -547,6 +576,8 @@ async function pollTick() {
       return;
     }
     warn(`poll error: ${err.message}`);
+  } finally {
+    state.polling = false;
   }
 }
 
@@ -594,8 +625,9 @@ module.exports = {
   run,
   shutdown,
   // Exported for scripts/verifyTitlerBackpressure.js — the harness stubs
-  // renderQueueStats and asserts skip vs claim behavior across the
-  // 6 quadrants of (active, waiting) space.
+  // renderQueueStats + mutates _state.inFlight and asserts skip vs claim
+  // behavior across BOTH lenses (Remotion queue AND setup-latency).
   shouldSkipForBackpressure,
-  REMOTION_BACKPRESSURE_SLACK
+  REMOTION_BACKPRESSURE_SLACK,
+  _state: state
 };

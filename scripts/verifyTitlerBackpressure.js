@@ -49,9 +49,14 @@ require.cache[remotionPath].exports.renderQueueStats = () => {
 // Now load titler (which will use the patched renderQueueStats).
 const titlerPath = require.resolve(path.join(REPO, 'src', 'services', 'titler.js'));
 const titler = require(titlerPath);
-const { shouldSkipForBackpressure, REMOTION_BACKPRESSURE_SLACK } = titler;
+const { shouldSkipForBackpressure, REMOTION_BACKPRESSURE_SLACK, _state } = titler;
+
+// Reset state.inFlight between quadrants — the setup-latency lens reads it.
+function resetInflight() { _state.inFlight.clear(); }
+function setInflight(n) { _state.inFlight.clear(); for (let i = 0; i < n; i++) _state.inFlight.add(`stub-${i}`); }
 
 // ── A. Predicate quadrants (SLACK=1, concurrency=2 in stub) ────────────────
+resetInflight();
 // A1: empty queue → don't skip
 stubStats = { concurrency: 2, active: 0, waiting: 0 };
 check('A1: empty queue (0/0/2) → CLAIM', shouldSkipForBackpressure() === false);
@@ -87,6 +92,48 @@ check('A7: concurrency=4, 4 active / 0 waiting → CLAIM (slack still 1)',
 stubStats = { concurrency: 4, active: 4, waiting: 1 };
 check('A7b: concurrency=4, 4 active / 1 waiting → SKIP',
   shouldSkipForBackpressure() === true);
+
+// ── A2. state.inFlight lens (the setup-latency gap fix, 2026-08-25) ────────
+// The Remotion-queue lens alone is blind to claimed-but-not-yet-enqueued
+// ads (~1s setup phase). The second lens catches those.
+resetInflight();
+stubStats = { concurrency: 2, active: 0, waiting: 0 };  // queue empty
+setInflight(3);                                          // but 3 already in setup
+check('A8: setup-latency gap — queue empty (0/0) but inFlight=3 → SKIP',
+  shouldSkipForBackpressure() === true);
+
+resetInflight();
+setInflight(2);
+check('A9: inFlight=2 (under cap=3) with empty queue → CLAIM',
+  shouldSkipForBackpressure() === false);
+
+resetInflight();
+setInflight(4);
+check('A10: inFlight=4 (well over cap) with empty queue → SKIP',
+  shouldSkipForBackpressure() === true);
+
+// Either lens alone at cap → skip.
+resetInflight();
+stubStats = { concurrency: 2, active: 2, waiting: 1 };
+setInflight(0);
+check('A11: queue at cap (2+1) with inFlight=0 → SKIP (Remotion lens alone)',
+  shouldSkipForBackpressure() === true);
+
+resetInflight();
+stubStats = { concurrency: 2, active: 0, waiting: 0 };
+setInflight(3);
+check('A12: queue empty with inFlight=3 (setup-latency) → SKIP (inFlight lens alone)',
+  shouldSkipForBackpressure() === true);
+
+// Under both caps → claim.
+resetInflight();
+stubStats = { concurrency: 2, active: 1, waiting: 0 };
+setInflight(2);
+check('A13: both lenses below cap → CLAIM',
+  shouldSkipForBackpressure() === false);
+
+// Reset for B tests
+resetInflight();
 
 // ── B. Fail-open behavior ──────────────────────────────────────────────────
 statsThrows = new Error('remotion queue offline');
@@ -152,6 +199,22 @@ if (helperBody) {
 check('D9: renderQueueStats imported from ./remotionRenderService',
   /require\(['"]\.\/remotionRenderService['"]\)/.test(titlerSrc)
   && /renderQueueStats/.test(titlerSrc));
+
+// D10-D12: pollTick mutex — prevents overlapping setInterval fires from
+// racing on state.inFlight.size (measured 2026-08-25: two concurrent
+// pollTicks each observed inFlight=3, each passed the < MAX_INFLIGHT
+// gate, each claimed an ad → 5/4 violation).
+if (pollTickBody) {
+  const body = pollTickBody[0];
+  check('D10: pollTick reads state.polling as an early-return guard',
+    /if\s*\(\s*state\.polling\s*\)\s*return/.test(body));
+  check('D11: pollTick SETS state.polling = true before the loop',
+    /state\.polling\s*=\s*true/.test(body));
+  check('D12: pollTick clears state.polling in a finally block',
+    /finally\s*\{[\s\S]*?state\.polling\s*=\s*false/.test(body));
+}
+check('D13: state object declares a `polling` field',
+  /polling:\s*false/.test(titlerSrc));
 
 // ── E. Automated revert-proofs ─────────────────────────────────────────────
 // E1: If the backpressure check were removed from pollTick, D2 must fail.
