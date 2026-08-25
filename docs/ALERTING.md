@@ -117,26 +117,50 @@ titling run, upload, etc.
 
 The parent head line is `▸ <run> · <brand> [· <product>] · <N> ads · by <who>`, so a channel of
 concurrent runs is attributable at a glance. The thread's `run start` line carries it too.
-`<who>` resolves in this order:
+For a real person, `<who>` resolves in this order:
 
 1. `User.displayName` → 2. `User.email` → 3. the last 6 chars of the requester's ObjectId
    → 4. **the whole `· by …` atom is omitted.**
 
-Source of truth is `CampaignRun.requestedBy` (`req.user.userId`, already stamped at mint time by
-every route that creates a run — no schema change was needed for this). It reaches the feed two
-ways, and both matter:
+For an **automated** run (below), the human tiers above are skipped entirely and `<who>` is
+`<sessionLabel> (Claude session)` or `automated (Claude session)` when no label was supplied —
+never the human displayName, even though `CampaignRun.requestedBy` still points at a real User.
 
-- **`runRenderLoop`** passes `requestedBy` on its first `runFeed.startRun` (free — already on the
-  run doc, so the *first* parent post already names someone) and the resolved `requesterLabel` on
-  the enriched second call. That label lookup shares one `Promise.all` await point with the
-  existing Brand lookup, so it adds **no** serial round-trip ahead of the render pools.
-- **`loadLiveSnapshot`** (detached interval) copies `requestedBy` off the run doc it already reads
-  and resolves the label itself. This is what covers runs this process did not start: the
-  queued-drain path, a second Render web instance, the worker.
+Source of truth is `CampaignRun.requestedBy` (`req.user.userId`, stamped at mint time by every
+route that creates a run) plus, since 2026-08-24, `CampaignRun.automation` (below). Both are
+resolved **once, synchronously with the brand-name lookup, BEFORE `runFeed.startRun` is called and
+BEFORE the adgen-handoff early return** in `runRenderLoop` — there is exactly **one**
+`runFeed.startRun` call in that function, already fully resolved.
 
-The label lookup is **latched on attempt, not on success** — a `requestedBy` pointing at a deleted
-user would otherwise re-query on every parent tick for the life of the run and never resolve. One
-miss is enough; the head degrades to the short id.
+⚠️ **REGRESSION, FIXED 2026-08-24 — read this before touching the ordering again.** PR #328
+(2026-08-24) hoisted the *bare* `runFeed.startRun({..., requestedBy})` call above the adgen-handoff
+`return` (`ADGEN_RENDERER_ENABLED=true` is 100% of production traffic), but left the ENRICHED
+lookup — the `Promise.all` that resolves `User.displayName` and re-calls `startRun` with
+`requesterLabel` — below that same `return`, reasoning from the OLD two-call design ("the label
+upgrades it a few ms later on the enriched call below"). That call was dead code in production:
+the parent posted once, to a raw short id (or nothing), and was **never refreshed** —
+`loadLiveSnapshot`'s periodic re-enrichment (previously the fallback path) does not rescue this
+either, because it only fires when a later `onStage`/`noteEvent` call marks the run's parent dirty
+again, and on the handoff path nothing in the backend process ever does (adgen is a separate
+service with no call into this in-process `runFeedService` state). **Fixed by moving the
+enrichment itself above the handoff return and consolidating to one call** — there is no longer a
+"post fast, upgrade later" two-call shape at all; the lookup is cheap enough (one Mongo
+round-trip) and already off the request's critical path (`runRenderLoop` runs from a
+`setImmediate` AFTER the HTTP response already returned, and adgen claims `Ad` rows via its own
+independent poll, not via anything this function does) that there is nothing left for a second
+call to usefully upgrade. Pinned by `scripts/verifyRunFeedStartsUnderHandoff.js` (existing,
+startRun-before-handoff) and `scripts/verifyAutomatedRunRequesterLabel.js` (new — pins that the
+*resolution* itself, not just the call, precedes both the call and the handoff gate, and that only
+one `runFeed.startRun` call exists in the function).
+
+`loadLiveSnapshot` (detached interval) still separately copies `requestedBy` off the run doc and
+resolves a human label the same way — this is what covers runs THIS process did not start (the
+queued-drain path, a second Render web instance, the worker) and is unaffected by the above; the
+bug was specific to `runRenderLoop`'s own first-post path.
+
+The human label lookup is **latched on attempt, not on success** — a `requestedBy` pointing at a
+deleted user would otherwise re-query on every parent tick for the life of the run and never
+resolve. One miss is enough; the head degrades to the short id.
 
 Two rules when touching this:
 
@@ -147,6 +171,45 @@ Two rules when touching this:
   render-activity board had been selecting `'email name'` with a `u?.name` fallback that could
   never fire; fixed 2026-08-18.
 
+### Automated runs — `CampaignRun.automation` (added 2026-08-24)
+
+`scripts/mintTestToken.js` (an offline JWT minter the `ui-smoke` test skill uses to drive the real
+app headlessly) mints a token for a REAL `User` — a genuine `AdvertiserMembership` is required to
+generate anything — so before this change a test run was **indistinguishable** from the owner's
+own click: same `requestedBy`, same resolved `User.displayName`.
+
+Mechanism, entirely additive — a real interactive login is unaffected at every step:
+
+- Every token `mintTestToken.js` mints carries two EXTRA JWT claims, unconditionally:
+  `automated: true` and `sessionLabel` (from the new `--session-label <name>` flag; `null` if
+  omitted). `routes/auth.js`'s real Google OAuth callback signs a different, smaller claims shape
+  and never sets either — a real login token has no `automated` claim at all, ever.
+- `middleware/requireAuth.js` reads `payload.automated === true` (strict — a non-boolean truthy
+  value, e.g. a forged `"true"` string, does not count) and, only then, `payload.sessionLabel`;
+  attaches both to `req.user.automated` / `req.user.sessionLabel`.
+- Both `CampaignRun.create` call sites (`/generate`, `/runs`) stamp
+  `automation: { isAutomated: req.user?.automated === true, sessionLabel: … }` at mint time — a
+  field on the run doc, not an inference made later from heuristics (user-agent, IP, timing, …).
+- `runRenderLoop` reads `run?.automation?.isAutomated === true` and, when true, **skips the human
+  `User.findById` lookup entirely** (there is no reason to resolve a displayName only to discard
+  it) and renders the label as `<sessionLabel> (Claude session)` or `automated (Claude session)`
+  when no session label was supplied — an honest "automated" marker rather than a fabricated name.
+  Automated **wins** over the human lookup; it is never merely appended beside it, because showing
+  both a real name and "automated" would still read as a real person to a channel skimmer.
+
+The internal stranded-ad sweep (`requeueStrandedAds` in `routes/ads.js`) mints its OWN
+system-identity `CampaignRun` with `requestedBy: null` and is deliberately **not** stamped
+`automation` — it already renders with no `by:` atom at all (the degradation chain's tier 4), which
+is honest (nobody clicked anything) and was not the problem this fix addresses.
+
+**Known open, not fixed here:** `mintTestToken.js`'s `--session-label` has no default — a caller
+that omits it gets the honest `automated (Claude session)` fallback rather than a friendly name
+like `rs-e5`. Wiring a real per-session label through requires the `ui-smoke` skill/harness (a
+separate tool, outside this repo) to pass `--session-label` when it shells out to this script —
+proposed, not implemented, since this PR is backend-only.
+
+Pinned by `scripts/verifyAutomatedRunRequesterLabel.js`.
+
 The thread's `run start` line gets the label **through `buildRunStartLine`**
 (`services/slackRunVerbosity.js`), not appended at the call site —
 `verifySlackRunVerbosity` G18 asserts that line has exactly one builder. It is appended last so
@@ -154,8 +217,12 @@ it survives both the at- and above-threshold branches, and omitted entirely when
 byte-identical guarantee for existing callers still holds.
 
 The requester is also a `by:` field on the four job-status alerts (below). The two
-`Campaign run crashed …` alerts carry the raw **id**, not the label: they fire outside
-`runRenderLoop`, and a failure path does not get a second DB read for a cosmetic field.
+`Campaign run crashed …` alerts carry the raw **id** for a human requester, not the
+displayName lookup — they fire outside `runRenderLoop`, and a failure path does not get a
+second DB read for a cosmetic field. They DO carry the full automation label
+(`<session> (Claude session)` / `automated (Claude session)`) when `CampaignRun.automation`
+says the run was automated, via the shared `automatedRunLabel(run)` helper — that costs no
+extra lookup at all, since automation is stamped on the run doc at mint time.
 
 **Safety (paid-path contract, same family as `adStage` / `alertService`):**
 

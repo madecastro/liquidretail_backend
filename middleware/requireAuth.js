@@ -141,6 +141,34 @@ async function requireAuth(req, res, next) {
     active = memberships[0];
   }
 
+  // Automation marker — set ONLY by scripts/mintTestToken.js (the ui-smoke
+  // skill's offline test-token minter), never by the real Google OAuth login
+  // flow (routes/auth.js signs a fixed, smaller claims shape with no such
+  // field). A real login token therefore always resolves `automated: false`
+  // here, regardless of who the user is — this is a property of the TOKEN,
+  // never inferred from the user account. `sessionLabel` is read only when
+  // `automated` is strictly `true`, so a stray/forged non-boolean value on an
+  // otherwise-real token cannot leak a fake label through.
+  //
+  // sessionLabel is free text that ends up in a real Slack channel
+  // (SLACK_ALERT_CHANNEL_STATUS via runFeedService's parent head — escaped
+  // there — AND slackRunVerbosity's thread "run start" line, which does NOT
+  // HTML-escape its `by:` atom, same pre-existing gap a real User.displayName
+  // already has). Strip control characters (incl. \n\r) here, at the actual
+  // trust-boundary read, so a `--session-label` containing a newline cannot
+  // be used to forge an extra spoofed parent/thread line in that unescaped
+  // path — this is bounded by the JWT_SECRET operator trust boundary already
+  // required to mint a token at all, but costs nothing to close outright.
+  const automated = payload.automated === true;
+  const rawSessionLabel = automated && typeof payload.sessionLabel === 'string'
+    ? Array.from(payload.sessionLabel)
+        .map((ch) => (ch.charCodeAt(0) <= 0x1F || ch.charCodeAt(0) === 0x7F) ? ' ' : ch)
+        .join('')
+        .replace(/\s+/g, ' ')
+        .trim()
+    : '';
+  const sessionLabel = rawSessionLabel ? rawSessionLabel.slice(0, 80) : null;
+
   req.user = {
     id:           payload.id,
     userId:       String(user._id),
@@ -149,7 +177,9 @@ async function requireAuth(req, res, next) {
     photo:        user.photoUrl || payload.photo,
     advertiserId: String(active.advertiserId),
     role:         active.role,
-    isSuperAdmin: user.isSuperAdmin === true
+    isSuperAdmin: user.isSuperAdmin === true,
+    automated,
+    sessionLabel
   };
   req.advertiserId = String(active.advertiserId);
   req.membership   = active;

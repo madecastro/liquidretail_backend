@@ -2111,6 +2111,17 @@ Full detail in `docs/ATLAS.md` §7 and `docs/CLOUDINARY-VIDEO.md`. Headlines:
   `{ok:false,error:…}` on logical failure; checking only `res.ok` reports
   success while nothing delivered (`alertService.js:220-222`). Worker boot:
   `🔔 alerts: Slack configured`.
+- **Run-feed `by:` regression, FIXED 2026-08-24.** PR #328 hoisted the *bare*
+  `runFeed.startRun` call above the adgen-handoff `return` but left the
+  displayName-resolving enrichment below it — dead code on the handoff path
+  (100% of prod runs), so the parent posted once to a short id and never
+  refreshed. Fixed by hoisting the resolution itself, consolidated to one
+  call. Same change adds `CampaignRun.automation` so a `scripts/
+  mintTestToken.js` (ui-smoke) run renders `by: <session> (Claude session)`
+  instead of the real human identity it authenticates as. Full mechanism:
+  `docs/ALERTING.md` "Who ordered the run" / "Automated runs"; pinned by
+  `scripts/verifyRunFeedStartsUnderHandoff.js` +
+  `scripts/verifyAutomatedRunRequesterLabel.js`.
 - **`DIRECTOR_UNIVERSE_TOP_N` default is 1** (`config/defaults.env:35`,
   `campaignAdsGenerationService.js:195`). Ceiling stays 10
   (`seededUniverseService` `DEFAULT_TOP_N`); multi-image remains wired;

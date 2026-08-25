@@ -2,6 +2,46 @@
 
 Living checklist. Update in place; do not append a duplicate list elsewhere.
 
+- **`--session-label` is not yet wired from the `ui-smoke` skill (2026-08-24).**
+  `scripts/mintTestToken.js` supports `--session-label <name>` and every token it
+  mints is marked `automated: true`, but the skill/harness that shells out to it
+  (a separate tool, outside this repo) does not yet pass a label — so an
+  automated run today renders the honest `automated (Claude session)` in the
+  Slack feed rather than a friendly name like `rs-e5`. `CLAUDE_CODE_SESSION_ID`
+  is set in a Claude Code session's own environment and could be threaded
+  through as a candidate value, but that wiring lives in the `ui-smoke`
+  skill/harness, not this backend. Not fixed here — flagging only.
+- **`buildRunStartLine`'s `by:` atom (the thread's "run start" line) is not
+  HTML-escaped, unlike `buildParentText`'s (`services/runFeedService.js`
+  `esc()` at the parent head only).** Pre-existing, not introduced by the
+  2026-08-24 automation-label PR — a real `User.displayName` (Google profile
+  name, user-controlled) already flowed through this same unescaped path.
+  **Adversarial review (Grok, same day) found the sharper version of this for
+  `automation.sessionLabel` specifically: a `--session-label` containing a
+  raw newline could forge an extra, spoofed-looking parent/thread line in
+  that unescaped path** (e.g. `--session-label $'foo\n▸ run_fake… · by
+  Nick'`). **Fixed** at the actual trust-boundary read
+  (`middleware/requireAuth.js`, where the JWT claim becomes `req.user.
+  sessionLabel`) by stripping every ASCII control character (incl. `\n`/`\r`)
+  and collapsing remaining whitespace to one space before the 80-char cap;
+  `scripts/mintTestToken.js` applies the same sanitizer defensively at
+  sign-time too. Still requires `JWT_SECRET` to reach at all (same
+  operator-only trust boundary the whole test-minting tool already relies
+  on) — this closes the concrete newline-injection shape, not the general,
+  pre-existing lack of `esc()` on that thread line, which still applies to
+  an ordinary human `User.displayName` and is not otherwise attacker-facing.
+  A defense-in-depth `esc()` on `buildRunStartLine` itself would close the class
+  for both cases. Not fixed here — flagging only.
+- **`GET /api/ads/render-activity`'s requester resolution (`routes/ads.js`,
+  search `render-activity`) does not distinguish automated runs** the way the
+  Slack feed now does — it still resolves only `User.displayName`/email/id for
+  `CampaignRun.requestedBy`, so a ui-smoke run shows as the real human account
+  on that internal diagnostic board even though the Slack feed correctly shows
+  `(Claude session)`. Same `CampaignRun.automation` field is already available
+  to that endpoint; a follow-up could reuse `automatedRunLabel(run)`-style
+  logic there. Not fixed here (out of scope for the Slack-feed regression) —
+  flagging only.
+
 - **URGENT, ACTIVE: production MongoDB Atlas cluster is at its storage quota — ALL writes
   are currently blocked.** Discovered 2026-08-19 while verifying PR #262 (UI-chrome guard):
   a real Omni video submission's charge-point `CostLog` insert failed with "you are over your
