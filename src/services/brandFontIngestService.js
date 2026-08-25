@@ -388,6 +388,7 @@ function parseFontFacesFromCss(cssText, baseUrl) {
 // cannot drift apart on which tokens count as generic.
 const {
   GENERIC_FAMILIES, CSS_WIDE_KEYWORDS, classFromGeneric, normalizeFamilyKey,
+  isIconFontFamily,
 } = require('./fontClassification');
 
 // Substitution passes for nested custom properties. Themes chain them two or
@@ -469,9 +470,48 @@ function firstConcreteFamily(raw, variables = {}) {
   for (const family of familyStackTokens(raw, variables)) {
     const lower = family.toLowerCase();
     if (GENERIC_FAMILIES.has(lower) || NON_BRAND_FAMILIES.has(lower)) continue;
+    if (isIconFontFamily(family)) continue;
     return family;
   }
   return null;
+}
+
+/**
+ * Collect CSS custom properties (`--foo: value`) from a stylesheet.
+ *
+ * Extracted so aggregateFontUsageAcrossSheets can merge tokens from EVERY
+ * sheet BEFORE scoring any of them. Shopify themes (Soludos measured
+ * 2026-08-24) put `--FONT-STACK-HEADING: Newsreader, serif` in an inline
+ * `:root` block and `h1 { font-family: var(--FONT-STACK-HEADING) }` in
+ * theme.css — per-sheet parsing resolved the usage to empty, skipped the
+ * heading rule, and left headingGeneric null. Later sheets overwrite
+ * earlier ones of the same name (last-wins, approximating cascade).
+ */
+function collectCssVariables(cssText, into = {}) {
+  const css = String(cssText || '').replace(/\/\*[\s\S]*?\*\//g, ' ');
+  for (const m of css.matchAll(/(--[a-z0-9_-]+)\s*:\s*([^;}{]+)/gi)) {
+    const val = String(m[2] || '').trim();
+    if (val) into[m[1]] = val;
+  }
+  return into;
+}
+
+/**
+ * A `font-family` on `:before`/`:after` (or the CSS3 `::` forms) is an icon
+ * font, never brand copy. Soludos GS's only stored role evidence was
+ * `oke-widget-icons` / `swiper-icons` bound to widget-button pseudos.
+ *
+ * Applied per comma-separated selector, then AND-ed across the list: a mixed
+ * rule `h1, h1:before { font-family: Newsreader, serif }` still counts as
+ * heading evidence. Only a list whose EVERY part is a pseudo is dropped.
+ */
+function isPseudoElementSelector(selector) {
+  return /::?(?:before|after)\b/i.test(String(selector || ''));
+}
+
+function isOnlyPseudoElementSelectors(selector) {
+  const parts = String(selector || '').split(',');
+  return parts.length > 0 && parts.every((p) => isPseudoElementSelector(p));
 }
 
 /**
@@ -518,13 +558,21 @@ function genericFamilyIn(raw, variables = {}) {
  * assigns to headings, body copy and buttons. This is intentionally
  * evidence, not computed-style truth: the resolver still validates the
  * family against an ingested website face or Google Fonts before use.
+ *
+ * @param {string} cssText
+ * @param {object} [extraVariables] custom properties collected from OTHER
+ *   sheets. Required for the Shopify split where `:root` tokens live in an
+ *   inline block and heading `font-family: var(--token)` lives in theme.css.
  */
-function extractFontUsageFromCss(cssText) {
+function extractFontUsageFromCss(cssText, extraVariables = {}) {
   const css = String(cssText || '').replace(/\/\*[\s\S]*?\*\//g, ' ');
-  const variables = {};
-  for (const m of css.matchAll(/(--[a-z0-9_-]+)\s*:\s*([^;}{]+)/gi)) {
-    variables[m[1]] = m[2].trim();
-  }
+  // extraVariables is the cross-sheet token map. Local declarations still
+  // win for this sheet (collectCssVariables overwrites matching names), so
+  // a theme that redefines a token is scored against its own value.
+  const variables = {
+    ...(extraVariables && typeof extraVariables === 'object' ? extraVariables : {}),
+  };
+  collectCssVariables(css, variables);
 
   const evidence = [];
   const ruleRe = /([^{}]+)\{([^{}]*)\}/g;
@@ -532,6 +580,7 @@ function extractFontUsageFromCss(cssText) {
   while ((match = ruleRe.exec(css)) !== null) {
     const selector = match[1].trim();
     if (!selector || selector.startsWith('@')) continue;
+    if (isOnlyPseudoElementSelectors(selector)) continue;
     const declaration = match[2];
     const familyMatch = declaration.match(/font-family\s*:\s*([^;}]+)/i);
     if (!familyMatch) continue;
@@ -690,7 +739,14 @@ async function collectStylesheets(html, pageUrl) {
  * @returns {{heading, body, button, headingGeneric, bodyGeneric, buttonGeneric, evidence}}
  */
 function aggregateFontUsageAcrossSheets(sheetCssTexts) {
-  const parts = (sheetCssTexts || []).map((css) => extractFontUsageFromCss(css));
+  const sheets = Array.isArray(sheetCssTexts) ? sheetCssTexts : [];
+  // Merge custom properties across every sheet FIRST, then score. Per-sheet
+  // scoring (the previous behaviour) cannot see a token defined in sheet A
+  // and used as `font-family: var(--token)` in sheet B — the Soludos GS
+  // shape, and a common Shopify split of `:root` tokens vs theme.css usage.
+  const variables = {};
+  for (const css of sheets) collectCssVariables(css, variables);
+  const parts = sheets.map((css) => extractFontUsageFromCss(css, variables));
   const evidence = parts.flatMap((u) => u.evidence || []);
   const usage = extractFontUsageFromCss(
     evidence
@@ -986,9 +1042,12 @@ module.exports = {
   parseFontFacesFromCss,
   extractFontUsageFromCss,
   aggregateFontUsageAcrossSheets,
+  collectCssVariables,
   collectStylesheets,
   familyStackTokens,
   genericFamilyIn,
+  isPseudoElementSelector,
+  isOnlyPseudoElementSelectors,
   NON_BRAND_FAMILIES,
   // Exported for scripts/backfillBrandFontGenerics.js, which re-derives the
   // first-party generics for brands ingested before they were captured. It

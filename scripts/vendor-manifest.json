@@ -548,7 +548,7 @@
       "backendHash": "4356d30c999bc14c23ba0d3a5fa5c5ae52fadcd8326871ba13024c15514071bf",
       "backendSha": "9dd98b85232f040efd4ca76c4f41f4b37ba78b3e",
       "status": "fork",
-      "reason": "UNPORTED: backend #323 cross-sheet CSS generics / icon-font drop (port in flight at seed)"
+      "reason": "PORTED 2026-08-24: backend #323 cross-sheet CSS generics / icon-font drop (collectCssVariables, isPseudoElementSelector/isOnlyPseudoElementSelectors, isIconFontFamily skip in firstConcreteFamily, extractFontUsageFromCss(cssText, extraVariables) second param, aggregateFontUsageAcrossSheets pre-merging variables) — verified via scripts/verifyIconFontAndCrossSheetGenerics.js. Remaining, deliberate fork: adgen lacks backend's later fontAxisProbe/probeVariableWeightAxis variable-weight-axis feature (require + the entryBase.weightMin/weightMax block in ingestBrandFontsInner, and the resulting publicId uses face.weight not entryBase.weight) — separate unported feature, out of scope for #323."
     },
     "services/brandFontPersistenceService.js": {
       "backendHash": "fe345657337521a31c052dfb9c871825d0846210424777de35118b0646bd65fb",
@@ -712,7 +712,7 @@
       "backendHash": "f08b826fce868dac48bab3e037b736a338f07859df885533034ec2ad1a621e4f",
       "backendSha": "e955b04891fcb861bbf64a5bc8642aa2fbe7a0bc",
       "status": "fork",
-      "reason": "Backend #327 (logo-safe-box) parity already held; backend #329 additionally added campaignRunId: campaignRunId || null to the vision-QC params object immediately preceding the 'MONEY: generate() attempt 1...' comment. adgen already carries campaignRunId: campaignRunId || null at the identical call site (directImageRenderService.js:2951, adgen #43) — confirmed byte-identical for this hunk. Existing fork reasons unchanged: adgen owns usableAttribution, composeCorrectiveOverride, buildQcRetryArgs, submitEditImageWithSeedFallback; colourway gate + logo-safe-box inset hunk-ported from backend, both sides verified identical on LOGO_INSET_FRAC/logoInsetPx."
+      "reason": "Backend #327 (logo-safe-box) parity already held; backend #329 additionally added campaignRunId: campaignRunId || null to the vision-QC params object immediately preceding the 'MONEY: generate() attempt 1...' comment. adgen already carries campaignRunId: campaignRunId || null at the identical call site (directImageRenderService.js:2951, adgen #43) — confirmed byte-identical for this hunk. PORTED 2026-08-24: backend #323's icon-font consume-time guard in typefaceDirectiveForBrand — headingRaw/fonts filtered through isIconFontFamily (require updated to pull isIconFontFamily from ./fontClassification) so an already-stored icon-font heading/customFonts[0] is never named to gpt-image-2 — verified via scripts/verifyIconFontAndCrossSheetGenerics.js (C4/C4b). Existing fork reasons unchanged: adgen owns usableAttribution, composeCorrectiveOverride, buildQcRetryArgs, submitEditImageWithSeedFallback; colourway gate + logo-safe-box inset hunk-ported from backend, both sides verified identical on LOGO_INSET_FRAC/logoInsetPx."
     },
     "services/enrichmentReconciler.js": {
       "backendHash": "18319b9414c7c67c332f03cbb7870c42048dace067a55523f54b7ea16c071649",
@@ -728,8 +728,7 @@
     "services/fontClassification.js": {
       "backendHash": "4bfdfad23281c4a29f8306dc91d9bbc774b5d7f226bf6c600aa320fd20ea3364",
       "backendSha": "9dd98b85232f040efd4ca76c4f41f4b37ba78b3e",
-      "status": "fork",
-      "reason": "UNPORTED: backend #323 icon-font role-evidence drop (port in flight at seed)"
+      "status": "synced"
     },
     "services/fontLoader.js": {
       "backendHash": "cb3dde8f0ec420ff3a8e064167dbd75b945146de9cd013cb767dc411ecb79cfd",

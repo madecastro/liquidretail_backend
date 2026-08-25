@@ -500,8 +500,10 @@ function ctaColorDirective(colors) {
 // static ads at all" (see the note a few lines above conceptLook's header).
 // Agreeing on what the word "serif" MEANS is a pure string question and was
 // only ever duplicated for want of a shared home.
-const { classifyTypeface, storedGenericForFamily, SERIF_HINTS: FONT_SERIF_HINTS } =
-  require('./fontClassification');
+const {
+  classifyTypeface, storedGenericForFamily, isIconFontFamily,
+  SERIF_HINTS: FONT_SERIF_HINTS,
+} = require('./fontClassification');
 
 function humanizeFontFamily(slug) {
   const s = String(slug || '').trim();
@@ -545,8 +547,15 @@ function humanizeFontFamily(slug) {
  * convention — rather than each surface improvising its own.
  */
 function typefaceDirectiveForBrand(brand) {
-  const heading = brand?.websiteFontUsage?.heading || null;
-  const fonts = Array.isArray(brand?.customFonts) ? brand.customFonts : [];
+  const headingRaw = brand?.websiteFontUsage?.heading || null;
+  // Icon fonts are dingbats, not typefaces. Soludos GS stored
+  // `button: 'oke-widget-icons'` from a ::before rule; if that family had
+  // won `heading` (or been customFonts[0]) it would be named to gpt-image-2
+  // as the brand's own face. Skip them here so a stored icon-font role is
+  // a no-op on the prompt, not a second classification bug.
+  const heading = headingRaw && !isIconFontFamily(headingRaw) ? headingRaw : null;
+  const fonts = (Array.isArray(brand?.customFonts) ? brand.customFonts : [])
+    .filter((f) => f?.family && !isIconFontFamily(f.family));
   const ingested = (heading && fonts.find((f) => f?.family === heading)) || fonts[0] || null;
   const family = ingested?.family || heading || null;
 
@@ -567,6 +576,11 @@ function typefaceDirectiveForBrand(brand) {
     // `font-family: Playfair Display, sans-serif` would otherwise flip a brand
     // the keyword list already gets right. Brands with no captured generic
     // classify exactly as they did before.
+    //
+    // Soludos GS (2026-08-24): heading was null because ingest missed a
+    // cross-sheet `var(--FONT-STACK-HEADING)` whose value is `Newsreader,
+    // serif`. The classifier here is unchanged; ingest now captures that
+    // generic. Do not add "Newsreader" to SERIF_HINTS.
     const isSerif = classifyTypeface({
       family,
       generic: storedGenericForFamily(brand, family),
