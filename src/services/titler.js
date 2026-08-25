@@ -106,9 +106,15 @@ async function claimOne() {
   // only guards acquiring a NEW claim, never an in-flight one.
   if (!isAdgenRendererEnabled()) return null;
 
+  // status: masters emerge from atlasVideoService.generateForAd already
+  // stamped 'draft' (pre-existing money-safety rule: never leave a paid
+  // Omni master in status:'rendering'). Derives stay 'rendering' through
+  // the renderer's handoff. Accept both — same $in shape the terminal
+  // write uses. titlingNeeded=true is the actual handoff signal; a
+  // completed ad has titlingNeeded=false so is filtered out regardless.
   return await Ad.findOneAndUpdate(
     {
-      status:          'rendering',
+      status:          { $in: ['rendering', 'draft'] },
       veoVideoUrl:     { $ne: null },
       titlingNeeded:   true,
       claimedByWorker: null,

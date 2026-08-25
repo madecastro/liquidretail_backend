@@ -114,7 +114,9 @@ check('E0 titler.js exists', titler.length > 0);
 const claimFilter = titler.match(/findOneAndUpdate\(\s*\{([\s\S]*?)\},\s*\{\s*\$set:\s*\{\s*claimedByWorker:\s*WORKER_ID/);
 check('E1 titler claim parses', !!claimFilter);
 const claimBody = claimFilter ? claimFilter[1] : '';
-check('E2 claim requires status rendering', /status:\s*['"]rendering['"]/.test(claimBody));
+check('E2 claim accepts both rendering + draft statuses',
+  /status:\s*\{\s*\$in:\s*\[['"]rendering['"],\s*['"]draft['"]\]\s*\}/.test(claimBody),
+  'masters come out of atlasVideoService with status=draft (money safety); derives stay rendering');
 check('E3 claim requires veoVideoUrl set (receipt guard)',
   /veoVideoUrl:\s*\{\s*\$ne:\s*null\s*\}/.test(claimBody),
   'MONEY: never claim without a settled master receipt');
