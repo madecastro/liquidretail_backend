@@ -401,6 +401,11 @@ require('./services/remotionRenderService')
   const { resumeUntitledMasters } = require('./services/titlingResumeService');
   const intervalMin = Math.max(1, parseInt(process.env.TITLING_RESUME_INTERVAL_MIN, 10) || 5);
   let inFlightPass = false;
+  // Interval is intentionally NOT gated on ADGEN_RENDERER_ENABLED — that
+  // read belongs inside resumeUntitledMasters (call time, every tick) so a
+  // dashboard flip takes effect without a redeploy and an in-flight pass
+  // is allowed to finish. Gating setInterval itself would freeze the
+  // decision at boot.
   const tick = () => {
     if (inFlightPass) return;
     inFlightPass = true;

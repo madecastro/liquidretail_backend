@@ -68,6 +68,17 @@ it clears it back to this placeholder in the same commit that closes it out.)_
 
 *(Replace this whole section, don't append to it, when it goes stale.)*
 
+- **THIS WORKTREE (`fix/titling-resume-adgen-gate`, 2026-08-24):** the
+  titling-resume sweeper never consulted `ADGEN_RENDERER_ENABLED`, so when
+  adgen owns rendering this repo still competed for the same rows (no
+  retry cap, Remotion in the web process). `resumeUntitledMasters` now
+  stands down via `adgenBridge.isAdgenRendererEnabled()` at call time.
+  Fail-safe: missing/malformed ⇒ this repo still sweeps (adgen only claims
+  on `'true'`; dual-none would strand a paid master). Gate is the function
+  body, not the interval. Harness
+  `scripts/verifyTitlingResumeAdgenGate.js`, mutation-proven. Do not merge
+  until review. Write-up:
+  `session.d/2026-08-24_titling-resume-adgen-gate.md`.
 - **THIS WORKTREE (`fix/wire-safezonekey-titling`, 2026-08-24):** PR #307's
   surface-aware titling bands (`bandsFor(safeZoneKey)`) never fired on any
   real render — both `brandScriptExecutor.js` `renderTitles({...})` call

@@ -18,6 +18,7 @@ const Ad    = require('../models/Ad');
 const Brand = require('../models/Brand');
 const Media = require('../models/Media');
 const { childTailsFrom } = require('./renderErrorFields');
+const { isAdgenRendererEnabled } = require('./adgenBridge');
 // brandScriptExecutor is required lazily below: bootRecoveryService imports only
 // TITLING_PENDING from this module, and the worker process must not pay the
 // remotion/ffmpeg load at boot for a constant.
@@ -128,6 +129,16 @@ function buildResumeFilter(staleCutoff) {
 async function resumeUntitledMasters({ limit = TITLING_RESUME_MAX } = {}) {
   const out = { titled: 0, failed: 0, skipped: 0 };
   if (!enabled()) return out;
+  // Stand down when adgen owns rendering. Call-time read via the shared
+  // helper (re-reads process.env every call) so a dashboard flip takes
+  // effect without a redeploy. Fail-safe: ONLY the exact predicate adgen
+  // uses to claim (`=== 'true'`, case-insensitive) makes us skip. Missing
+  // or malformed ⇒ helper is false ⇒ we still sweep. The other direction
+  // (stand down on any set/truthy value) would strand paid untitled
+  // masters whenever adgen is not claiming. Gate the function body, not
+  // the interval: an in-flight pass that has already passed this check
+  // finishes; only a NEW pass is skipped.
+  if (isAdgenRendererEnabled()) return out;
 
   let ads;
   const staleCutoff = new Date(Date.now() - CLAIM_STALE_MIN * 60 * 1000);
