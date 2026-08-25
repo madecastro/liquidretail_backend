@@ -540,16 +540,24 @@ function runD() {
     assert.ok(!/superviseRemotionChild/.test(fn[0]), 'preview must not spawn a titling child');
   });
 
-  check('D6 renderer.js catches remotion child OOM at BOTH titling sites and returns (does not processAd-fail)', () => {
-    const deriveIdx = RENDERER_SRC.indexOf('VIDEO DERIVE remotion child OOM-killed');
-    const masterIdx = RENDERER_SRC.indexOf('VIDEO MASTER remotion child OOM-killed');
-    assert.ok(deriveIdx > 0, 'derive OOM catch missing');
-    assert.ok(masterIdx > 0, 'master OOM catch missing');
+  check('D6 renderer.js catches a resumable titling failure at BOTH titling sites and returns (does not processAd-fail)', () => {
+    // WAS OOM-only (isRemotionChildOomError + "...OOM-killed" log text). The
+    // titling-recoverability fix widened this to any RESUMABLE titling
+    // failure — OOM, timeout, or a generic child failure/exception, as long
+    // as brandScriptExecutor's shared attempt cap has not been exceeded —
+    // signalled by err.titlingResumable rather than re-classifying the error
+    // here. Markers/assertion updated to match; the invariant this check
+    // exists to pin (return before processAd can mark status:'failed') is
+    // unchanged and, if anything, now covers strictly more failure kinds.
+    const deriveIdx = RENDERER_SRC.indexOf('VIDEO DERIVE titling');
+    const masterIdx = RENDERER_SRC.indexOf('VIDEO MASTER titling');
+    assert.ok(deriveIdx > 0, 'derive titling-failure catch missing');
+    assert.ok(masterIdx > 0, 'master titling-failure catch missing');
     // Each site must return, not throw, so processAd catch cannot mark failed.
     const sliceAround = (idx) => RENDERER_SRC.slice(idx, idx + 400);
     assert.ok(/return;/.test(sliceAround(deriveIdx)));
     assert.ok(/return;/.test(sliceAround(masterIdx)));
-    assert.ok(/isRemotionChildOomError/.test(RENDERER_SRC));
+    assert.ok(/scriptErr\s*&&\s*scriptErr\.titlingResumable/.test(RENDERER_SRC));
   });
 
   check('D7 brandScriptExecutor OOM stamp leaves titlingResumeState:\'pending\' (resume can re-title for free)', () => {
@@ -565,14 +573,18 @@ function runD() {
     assert.ok(/isRemotionChildTimeoutError/.test(oomRetryWindow));
   });
 
-  check('D8 titlingResumeService does not terminal-fail an OOM\'d paid master', () => {
-    assert.ok(/isRemotionChildOomError/.test(RESUME_SRC));
+  check('D8 titlingResumeService does not terminal-fail a resumable (OOM/timeout/generic, under-cap) titling failure', () => {
+    // WAS OOM-only (isRemotionChildOomError). titlingResumeService now defers
+    // to err.titlingResumable — the same flag D6 reads — which
+    // brandScriptExecutor's shared attempt cap sets true/false for EVERY
+    // titling-failure kind, not just OOM.
+    assert.ok(/titlingResumable\s*===\s*true/.test(RESUME_SRC));
     assert.ok(/left pending for retry/.test(RESUME_SRC));
     // The merited-failure arm (status:'failed' + titlingResumeState:null) must
-    // still exist AFTER the OOM skip, not instead of it.
-    const oomIdx = RESUME_SRC.indexOf('isRemotionChildOomError');
+    // still exist AFTER the resumable skip, not instead of it.
+    const resumableIdx = RESUME_SRC.indexOf('titlingResumable === true');
     const failIdx = RESUME_SRC.indexOf("status: 'failed'");
-    assert.ok(oomIdx > 0 && failIdx > oomIdx, 'OOM skip must precede the merited-failure stamp');
+    assert.ok(resumableIdx > 0 && failIdx > resumableIdx, 'resumable skip must precede the merited-failure stamp');
   });
 
   check('D9 renderer.js terminal $set blocks still clear titlingResumeState on genuine success (untouched)', () => {
@@ -628,16 +640,20 @@ function runD() {
       return out;
     }
 
+    // WAS 'VIDEO DERIVE/MASTER remotion child OOM-killed' — now a single
+    // resumable-titling-failure log line covers OOM/timeout/generic alike
+    // (see D6/D8). The static prefix before the ${scriptErr.titlingFailureKind
+    // || 'failed'} interpolation is still a stable source-text marker.
     const sites = [
-      'VIDEO DERIVE remotion child OOM-killed',
-      'VIDEO MASTER remotion child OOM-killed'
+      'VIDEO DERIVE titling',
+      'VIDEO MASTER titling'
     ];
     for (const marker of sites) {
       const logIdx = RENDERER_SRC.indexOf(marker);
-      assert.ok(logIdx > 0, `${marker}: OOM log missing`);
+      assert.ok(logIdx > 0, `${marker}: titling-failure log missing`);
       const afterLog = RENDERER_SRC.slice(logIdx, logIdx + 400);
       const retRel = afterLog.search(/\breturn\s*;/);
-      assert.ok(retRel >= 0, `${marker}: no return; after OOM log — processAd would mark failed`);
+      assert.ok(retRel >= 0, `${marker}: no return; after titling-failure log — processAd would mark failed`);
       const retIdx = logIdx + retRel;
 
       const covering = tryFinallyBlocks(RENDERER_SRC).filter((b) => {

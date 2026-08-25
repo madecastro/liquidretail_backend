@@ -104,7 +104,6 @@ const { classifyRunAdOutcome, buildRunReconciliationUpdate } = require('./campai
 const { startRunHeartbeat } = require('./campaignRunHeartbeat');
 const atlasVideo = require('./atlasVideoService');
 const { renderBrandScriptAndSave } = require('./brandScriptExecutor');
-const { isRemotionChildOomError } = require('./remotionChildSupervisor');
 // videoRouter exports `prepareStoryboard`; the backend's routes/ads.js binds it
 // under the local alias `veoPrepareStoryboard`. Phase 1c ported the CALL from
 // there but kept the alias on the require(), destructuring a key that does not
@@ -601,6 +600,7 @@ async function alertOrphanedClaimsOnBoot() {
 }
 
 let stopping = false;
+let titlingResumeSweep = null;   // set by run(), stopped by shutdown()
 
 async function claimOne() {
   // GATED ON ADGEN_RENDERER_ENABLED, read HERE — not only by poll()'s
@@ -1148,11 +1148,25 @@ async function renderVideo(ad) {
             console.log(`renderer[${WORKER_ID}]: VIDEO DERIVE no-chrome ad=${shortId} — shipping master`);
           }
         } catch (scriptErr) {
-          if (isRemotionChildOomError(scriptErr)) {
-            // brandScriptExecutor already stamped draft + titlingResumeState:'pending'.
-            // Do not fall through to the success $set (that would clear the debt)
-            // and do not throw into processAd (that would mark status:'failed').
-            console.warn(`renderer[${WORKER_ID}]: VIDEO DERIVE remotion child OOM-killed ad=${shortId} — paid plate kept, titling left pending`);
+          // scriptErr.titlingResumable is stamped by brandScriptExecutor's
+          // stampTitlingFailureAndThrow — true for OOM, timeout, AND a
+          // generic child failure/exception, as long as the attempt cap
+          // (TITLING_ATTEMPTS_MAX) has not been exceeded. It has ALREADY
+          // written status:'draft' + titlingResumeState:'pending' (or, past
+          // the cap, status:'failed') before rethrowing here, ALWAYS
+          // clearing claimedByWorker as part of that same write. Do not fall
+          // through to the success $set below (that would clear the debt on
+          // a resumable failure). Throwing into processAd would NOT actually
+          // overwrite the stamped Ad fields — its own terminal write is
+          // filtered on {claimedByWorker: WORKER_ID}, which the stamp has
+          // already nulled, so that write would just no-op — but it WOULD
+          // still run bumpRunCounter('failed') (wrong: this ad is not
+          // terminal) and fire the render-failure Slack alert (noisy: this
+          // is not an operator-actionable event) for a resumable outcome.
+          // Was OOM-only; a timeout or a generic child exit used to fall
+          // through to `throw scriptErr` here and hit exactly that path.
+          if (scriptErr && scriptErr.titlingResumable) {
+            console.warn(`renderer[${WORKER_ID}]: VIDEO DERIVE titling ${scriptErr.titlingFailureKind || 'failed'} ad=${shortId} — paid plate kept, titling left pending`);
             return;
           }
           throw scriptErr;
@@ -1385,11 +1399,18 @@ async function renderVideo(ad) {
           console.log(`renderer[${WORKER_ID}]: VIDEO MASTER no-chrome ad=${shortId} — shipping master`);
         }
       } catch (scriptErr) {
-        if (isRemotionChildOomError(scriptErr)) {
-          // brandScriptExecutor already stamped draft + titlingResumeState:'pending'.
-          // Do not fall through to the success $set (that would clear the debt)
-          // and do not throw into processAd (that would mark status:'failed').
-          console.warn(`renderer[${WORKER_ID}]: VIDEO MASTER remotion child OOM-killed ad=${shortId} — paid master kept, titling left pending`);
+        // See the identical comment on the VIDEO DERIVE arm above —
+        // titlingResumable now covers OOM, timeout, and a generic child
+        // failure/exception (bounded by TITLING_ATTEMPTS_MAX), not just OOM.
+        if (scriptErr && scriptErr.titlingResumable) {
+          // brandScriptExecutor already stamped draft + titlingResumeState:'pending'
+          // and cleared claimedByWorker. Do not fall through to the success
+          // $set (that would clear the debt) — throwing into processAd would
+          // not actually flip the stamped fields back (its terminal write is
+          // filtered on the now-cleared claimedByWorker and would no-op),
+          // but it WOULD still bump the run's 'failed' counter and fire the
+          // failure alert for an outcome that is not actually terminal.
+          console.warn(`renderer[${WORKER_ID}]: VIDEO MASTER titling ${scriptErr.titlingFailureKind || 'failed'} ad=${shortId} — paid master kept, titling left pending`);
           return;
         }
         throw scriptErr;
@@ -1599,14 +1620,32 @@ async function processAd(ad) {
       if (err && err.stderrTail) {
         console.error(`renderer[${WORKER_ID}]: child stderrTail ad=${shortId}:\n${err.stderrTail}`);
       }
-      try {
-        noteRenderIssue(ad._id, {
-          message: err.message,
-          stage: 'render',
-          predictionId: (err && err.predictionId) ? err.predictionId : undefined,
-          err
-        });
-      } catch (_) {}
+      // SKIP when the error already went through
+      // brandScriptExecutor.stampTitlingFailureAndThrow (present whenever
+      // err.titlingFailureKind is set) — that function already persisted a
+      // MORE SPECIFIC renderError on this exact row (stage:'titling', the
+      // real code, and the attempt-cap count) before rethrowing. Only a
+      // titlingResumable===false (cap-exceeded, terminal) error reaches this
+      // catch at all — a resumable one returns early at the renderer.js
+      // call site — but noteRenderIssue's write is UNSCOPED (no claim
+      // filter, unlike the terminal $set below) and unconditionally
+      // OVERWRITES renderError wholesale (adStage.js), so without this guard
+      // it clobbers the stamp's detailed message/code with a generic
+      // stage:'render' one carrying no code and no cap-count — a real
+      // diagnostics regression a titling failure never used to risk before
+      // this fix (OOM previously never reached this catch at all). Every
+      // OTHER failure kind (a genuine render/static/pre-titling error) is
+      // unaffected — it never carries this field.
+      if (!err.titlingFailureKind) {
+        try {
+          noteRenderIssue(ad._id, {
+            message: err.message,
+            stage: 'render',
+            predictionId: (err && err.predictionId) ? err.predictionId : undefined,
+            err
+          });
+        } catch (_) {}
+      }
       notifyRenderFailure(ad, err);
 
       // UNSETTLED AT TIMEOUT — NOT a confirmed failure. pollPrediction hit
@@ -1714,6 +1753,80 @@ function scheduleNext(startTs) {
   if (!stopping) setTimeout(poll, wait);
 }
 
+// ── TITLING RESUME SWEEP ────────────────────────────────────────────────
+//
+// Runs titlingResumeService.resumeUntitledMasters() from THIS role, not
+// orchestrator. First draft of this fix put it on orchestrator specifically
+// because render.yaml keeps that role singleton — but orchestrator's own
+// plan is `starter` (~512 MB), while a single Remotion titling slot has been
+// MEASURED at ~1.97 GiB (see REMOTION_QUEUE_CONCURRENCY's own comment,
+// above). resumeUntitledMasters() calls renderBrandScriptAndSave for real —
+// it is not a dry pass — so the very first ad it actually retitled would
+// have OOM-killed the orchestrator process itself. Caught in adversarial
+// review before this ever deployed; renderer is `pro_plus` (8 GB) and
+// already budgets exactly this cost via REMOTION_QUEUE_CONCURRENCY, so
+// running the sweep here shares the SAME governed Remotion pool instead of
+// spawning an ungoverned one on a box sized for a read-only poll loop.
+//
+// AUTOSCALED (min2/max8), unlike orchestrator — but that is fine:
+// titlingResumeService's own per-document CAS claim (buildResumeFilter +
+// a conditional Ad.updateOne whose filter reproduces the exact prior state)
+// is what makes two instances racing the SAME ad safe, not "only one
+// process ever runs this." Proven with two REAL concurrent
+// resumeUntitledMasters() calls racing one ad
+// (scripts/verifyTitlingRecoverability.js, section C). Redundant `Ad.find`
+// reads across up to 8 instances on a 5-minute interval are cheap; a
+// double-titled ad is not possible because of the claim, and an
+// OOM-crashing sweep host is a guaranteed failure, not a shared-resource
+// nicety — the tradeoff is not close.
+//
+// Still gated on ADGEN_RENDERER_ENABLED (same flag PR #52 wired into
+// claimOne()) so it cannot race backend's own render/resume path over the
+// shared collection when adgen is not the active renderer, and still
+// re-entrancy-guarded (a single Remotion render has been measured at 76s;
+// TITLING_RESUME_MAX defaults to 5/pass, so a pass can outlast the
+// interval — a second concurrent pass on the SAME instance would stack
+// Remotion renders on top of the poll loop's own MAX_INFLIGHT budget).
+function startTitlingResumeSweep() {
+  // Lazy require — keeps titlingResumeService (and its own lazy require of
+  // brandScriptExecutor) out of this module's own top-level require graph;
+  // matches the pattern already used for qcAndStampVideoAd above.
+  const { resumeUntitledMasters } = require('./titlingResumeService');
+  const intervalMin = Math.max(1, parseInt(process.env.TITLING_RESUME_INTERVAL_MIN, 10) || 5);
+  let inFlightPass = false;
+  let timeoutHandle = null;
+  let intervalHandle = null;
+
+  const tick = () => {
+    if (stopping || inFlightPass) return;
+    if (!isAdgenRendererEnabled()) return;   // backend owns this collection right now
+    inFlightPass = true;
+    resumeUntitledMasters()
+      .then((out) => {
+        if (out && (out.titled || out.failed || out.skipped)) {
+          console.log(
+            `renderer[${WORKER_ID}]: titling resume — ${out.titled} titled · ` +
+            `${out.failed} failed · ${out.skipped} skipped`
+          );
+        }
+      })
+      .catch(err => console.warn(`renderer[${WORKER_ID}]: titling resume failed — ${err.message}`))
+      .finally(() => { inFlightPass = false; });
+  };
+
+  timeoutHandle = setTimeout(tick, 90 * 1000);
+  intervalHandle = setInterval(tick, intervalMin * 60 * 1000);
+  timeoutHandle.unref();
+  intervalHandle.unref();
+
+  return {
+    stop() {
+      clearTimeout(timeoutHandle);
+      clearInterval(intervalHandle);
+    }
+  };
+}
+
 async function run() {
   const gated = isAdgenRendererEnabled();
   console.log(
@@ -1739,6 +1852,7 @@ async function run() {
     const g = isAdgenRendererEnabled();
     console.log(`renderer[${WORKER_ID}] alive — uptime ${Math.round(process.uptime())}s, inflight ${inFlight}/${MAX_INFLIGHT}, handoff ${g ? 'ON' : 'OFF'}`);
   }, 30_000).unref();
+  titlingResumeSweep = startTitlingResumeSweep();
 }
 
 // Graceful shutdown. Render fires SIGTERM ~30s before SIGKILL on deploy /
@@ -1760,6 +1874,7 @@ const SHUTDOWN_DRAIN_MS = Number(process.env.ADGEN_SHUTDOWN_DRAIN_MS || 25_000);
 async function shutdown() {
   if (stopping) return;
   stopping = true;
+  if (titlingResumeSweep) titlingResumeSweep.stop();
   const t0 = Date.now();
   console.log(`renderer[${WORKER_ID}] shutting down — inflight=${inFlight}, drain up to ${SHUTDOWN_DRAIN_MS}ms`);
   const deadline = t0 + SHUTDOWN_DRAIN_MS;

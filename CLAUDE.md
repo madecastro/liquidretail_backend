@@ -329,6 +329,8 @@ Sibling backend location for cross-repo checks:
 | `verifyQuoteProvenanceStamp.js` | `stampQuoteOrigins` reads `container.quotesOrigin`; flag-off baseline is an embedded snapshot of backend commit `3e4561e2` (that SHA is not in this repo's history). |
 | `verifyRunFinalizesOnSettle_KNOWN_OPEN.js` | Originally: CampaignRun never reaches `done` because `bumpRunCounter` only `$inc`s. **On `origin/master`, `bumpRunCounter` now also calls `maybeFinalizeRun` (`renderer.js:160, 202-227`).** This harness still extracts **only** the `$inc` update and still labels itself expected-fail. Treat its Group A as a description of the **old** defect; Group C2 (call-site scan for `classifyRunAdOutcome`) should now see `renderer.js`. Current pass/fail: **unverified** (not re-run in this docs pass). |
 | `verifyCampaignRunHeartbeatWired.js` | **Now passing — this was fixed on 2026-08-24 and the harness was renamed (the `_KNOWN_OPEN` suffix is gone).** It previously pinned an expected-fail: `startRunHeartbeat` was exported from `campaignRunHeartbeat.js` with **zero** call sites in `src/`. `startRunHeartbeat` now appears 4× in `renderer.js` on `origin/master`. Why it mattered: without the beat, `CampaignRun.updatedAt` only moves when an ad *settles*, so a long video-titling gap could drop the backend duplicate-generation gate's running arm. |
+| `verifyTitlingRecoverability.js` | Titling-failure recoverability (2026-08-25): (A) `brandScriptExecutor.stampTitlingFailureAndThrow` decides resumable-vs-terminal correctly for OOM/timeout/generic, bounded by a shared `TITLING_ATTEMPTS_MAX` ceiling (execution, real function, stubbed `Ad`). (B) the resume sweep is wired from `renderer.js` (not the RAM-inadequate `orchestrator.js` — see CLAUDE.md's titlingResumeService note), gated on `isAdgenRendererEnabled()`, `orchestrator.js` does NOT run it, and `titler.js`'s own titling call site was mirrored to the same gate (structural). (C) two REAL concurrent `resumeUntitledMasters()` passes racing the same ad — only one titles it (execution, in-memory Mongo-like stub, `scripts/lib/miniMongoStub.js`, whose `findOneAndUpdate` correctly models Mongoose's `{new:true/false}` pre/post-image semantics — an earlier version of the stub ignored `opts` and would have hidden a real sign/timing bug in the attempt-cap read-back). (D) a cap-exceeded titling failure keeps its detailed `renderError` — `processAd`'s unscoped `noteRenderIssue` no longer clobbers the stamp's message/code with a generic one. |
+| `verifyTitlingResumeNeverResubmits.js` | THE MONEY CHECK: a resumed titling attempt can never re-submit a paid Atlas Omni generation. `atlasVideoService.submitGeneration` has exactly one call site, structurally inside the `else` of `if (isResuming)`; a real require-graph BFS (Node's own `require.resolve`) proves `atlasVideoService.js` is unreachable from `titlingResumeService.js`'s or `brandScriptExecutor.js`'s entire transitive require graph, with a positive control (same BFS from `renderer.js`, which DOES require it) ruling out a vacuous pass. |
 
 ---
 
@@ -523,11 +525,49 @@ concurrently.
   It is now called from `renderer.js` (4 sites) and
   `scripts/verifyCampaignRunHeartbeatWired.js` passes. Left visible rather
   than deleted so the next reader can tell this was fixed, not overlooked.
-- `titlingResumeService` / `bootRecoveryService` are vendored
-  (`bootRecoveryService.js:61` requires the resume module) but
-  **neither is started from `src/entrypoint.js` or `renderer.js`**.
-  A mid-titling crash on adgen may not self-heal the way the backend
-  web interval does. Unverified in production.
+- ~~`titlingResumeService` / `bootRecoveryService` are vendored but neither
+  is started~~ — **`titlingResumeService.resumeUntitledMasters()` is WIRED
+  as of the video-titling-recoverability PR (2026-08-25)**, started from
+  `renderer.js` (`pro_plus`, 8 GB), on a 90s-delay/5-min interval modeled on
+  backend's own wiring, gated on `isAdgenRendererEnabled()` so it cannot
+  race backend's own render/resume path over the shared collection when
+  the flag is off. **NOT run from `orchestrator.js`** — that was the first
+  draft, on the reasoning that it's the one adgen role Render keeps
+  singleton, but adversarial review (Grok, xhigh) caught that
+  `orchestrator`'s Render plan is `starter` (~512 MB) while
+  `resumeUntitledMasters()` calls Remotion for real (~1.97 GiB/slot,
+  measured) — the first ad it actually retitled would have OOM-killed the
+  singleton. `renderer.js` already budgets that RAM and is safe to
+  autoscale here because titlingResumeService's own atomic per-document
+  claim (not "only one process runs this") is what prevents two instances
+  double-titling the same ad — proven with two REAL concurrent
+  `resumeUntitledMasters()` calls in
+  `scripts/verifyTitlingRecoverability.js` section C. Paired with a
+  widened `brandScriptExecutor.js` failure stamp
+  (`stampTitlingFailureAndThrow`, exported) that marks OOM, timeout, AND a
+  generic child failure resumable (not just OOM), bounded by a shared
+  `Ad.titlingAttempts` ceiling (`TITLING_ATTEMPTS_MAX`, default 3) so a
+  deterministic bug cannot retry forever on a paid path, mirrored into
+  `titler.js`'s own titling call site (same duplication rule as
+  `startRunHeartbeat`/`bumpRunCounter` above). See
+  `scripts/verifyTitlingRecoverability.js` and
+  `scripts/verifyTitlingResumeNeverResubmits.js`.
+  **KNOWN, NOT FIXED HERE (cross-repo):** `liquidretail_backend`'s OWN
+  `titlingResumeService` runs on its web process **ungated** on
+  `ADGEN_RENDERER_ENABLED` (confirmed absent from
+  `liquidretail_backend/index.js`'s wiring) and has no
+  `stampTitlingFailureAndThrow`/`titlingResumable` concept at all — if
+  backend's sweep wins the claim race on a resumable ad before adgen's
+  does, its Remotion failure immediately terminal-fails the ad
+  (`status:'failed'`) on the FIRST retry, undoing this fix's whole point
+  for that one ad. This pre-existed for the OOM-only case; this PR widens
+  which failures are exposed to it. The atomic claim still prevents a
+  double-title either way. Fixing it requires a change to the backend
+  repo — out of scope here, flagged for a follow-up.
+  **`bootRecoveryService` is STILL unwired** — a different mechanism
+  (recovers a finished Omni master from a spend receipt after a
+  mid-generation crash, before any titling ever starts) that this PR did
+  not touch. Don't assume it's covered by the above.
 
 ---
 

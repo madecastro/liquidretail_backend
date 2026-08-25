@@ -257,9 +257,21 @@ check('D2 titlingResumeService terminal persist spreads childTailsFrom(err)', ()
   const src = stripComments(srcOf('src/services/titlingResumeService.js'));
   assert.match(src, /childTailsFrom\(err\)/);
 });
-check('D3 brandScriptExecutor OOM stamp spreads childTailsFrom(err)', () => {
+check('D3 brandScriptExecutor titling-failure stamp spreads childTailsFrom(err)', () => {
+  // WAS: a single OOM-only inline stamp with a literal code:'REMOTION_CHILD_OOM'
+  // in the same object as the spread. The titling-recoverability fix
+  // consolidated OOM/timeout/generic into one shared
+  // stampTitlingFailureAndThrow, whose renderError object now carries a
+  // COMPUTED `code` variable (REMOTION_CHILD_OOM is still one of its three
+  // possible values) rather than the literal inline — so the check now pins
+  // (a) the OOM code constant still exists, and (b) the renderError object
+  // still spreads childTailsFrom(err) immediately after `code,` — true for
+  // BOTH the terminal and resumable stamps.
   const src = stripComments(srcOf('src/services/brandScriptExecutor.js'));
-  assert.match(src, /code:\s*'REMOTION_CHILD_OOM'[\s\S]{0,120}childTailsFrom\(err\)/);
+  assert.match(src, /'REMOTION_CHILD_OOM'/);
+  assert.match(src, /stampTitlingFailureAndThrow/);
+  const spreads = src.match(/code,\s*\.\.\.renderErrorFields\.childTailsFrom\(err\)/g) || [];
+  assert.ok(spreads.length >= 2, `expected childTailsFrom(err) spread on both the terminal and resumable stamps, found ${spreads.length}`);
 });
 check('D4 noteRenderIssue forwards tails from the thrown err', () => {
   const src = stripComments(srcOf('src/services/adStage.js'));

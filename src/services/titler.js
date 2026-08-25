@@ -47,7 +47,6 @@ const CampaignRun = require('../models/CampaignRun');
 const alerts      = require('./alertService');
 const { adStage } = require('./adStage');
 const { renderBrandScriptAndSave, qcAndStampVideoAd } = require('./brandScriptExecutor');
-const { isRemotionChildOomError } = require('./remotionChildSupervisor');
 const { classifyRunAdOutcome, buildRunReconciliationUpdate } = require('./campaignRunGuards');
 const { startRunHeartbeat } = require('./campaignRunHeartbeat');
 
@@ -345,15 +344,27 @@ async function titleAd(ad) {
           log(`VIDEO ${label} no-chrome ad=${shortId} — shipping master`);
         }
       } catch (scriptErr) {
-        if (isRemotionChildOomError(scriptErr)) {
+        // scriptErr.titlingResumable is stamped by brandScriptExecutor's
+        // stampTitlingFailureAndThrow for OOM, timeout, AND a generic child
+        // failure/exception (bounded by TITLING_ATTEMPTS_MAX) — was OOM-only
+        // (isRemotionChildOomError). This file duplicates renderer.js's
+        // titling call site (see this file's own header: "If you edit one
+        // copy, edit the other") — renderer.js's video derive/master arms
+        // were updated to the same flag; this arm had been missed, which
+        // meant a resumable timeout/generic titling failure on the titler
+        // role fell through to processAd's catch below and got
+        // double-counted as a genuine 'failed' (bumpRunCounter) even though
+        // the Ad row itself stays recoverable (its write is owner-scoped and
+        // no-ops once the stamp has cleared claimedByWorker).
+        if (scriptErr && scriptErr.titlingResumable) {
           // brandScriptExecutor already stamped draft + titlingResumeState:'pending'.
           // Also clear titlingNeeded so we don't loop-claim (resume path takes
-          // over from here — same shape as renderer's OOM branch).
+          // over from here — same shape as renderer's resumable branch).
           await Ad.updateOne(
             { _id: ad._id, claimedByWorker: WORKER_ID },
             { $set: { titlingNeeded: false, claimedByWorker: null, claimedAt: null } }
           );
-          warn(`VIDEO ${label} remotion child OOM-killed ad=${shortId} — paid asset kept, titling left pending`);
+          warn(`VIDEO ${label} titling ${scriptErr.titlingFailureKind || 'failed'} ad=${shortId} — paid asset kept, titling left pending`);
           return { earlyReturn: true };
         }
         throw scriptErr;

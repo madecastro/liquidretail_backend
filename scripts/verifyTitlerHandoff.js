@@ -125,7 +125,14 @@ check('E6 claim sorts FIFO', /sort:\s*\{\s*createdAt:\s*1\s*\}/.test(titler));
 // Titling actually happens.
 check('E7 titler imports renderBrandScriptAndSave', /renderBrandScriptAndSave/.test(titler));
 check('E8 titler imports qcAndStampVideoAd (no-brand fallback)', /qcAndStampVideoAd/.test(titler));
-check('E9 titler catches Remotion child OOM', /isRemotionChildOomError\(/.test(titler));
+// WAS isRemotionChildOomError(...) — the titling-recoverability PR widened
+// this to any resumable titling failure (OOM, timeout, or a generic child
+// failure/exception, bounded by TITLING_ATTEMPTS_MAX), signalled by
+// scriptErr.titlingResumable (stamped by
+// brandScriptExecutor.stampTitlingFailureAndThrow) rather than
+// re-classifying OOM only.
+check('E9 titler catches a resumable Remotion child titling failure (OOM/timeout/generic)',
+  /scriptErr\s*&&\s*scriptErr\.titlingResumable/.test(titler));
 
 // Terminal + counter.
 check('E10 titler terminal draft-write clears titlingNeeded',

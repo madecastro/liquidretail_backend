@@ -599,6 +599,26 @@ const adSchema = new mongoose.Schema({
     stdoutTail:   { type: String, default: null }
   },
   renderAttempts: { type: Number, default: 0 },
+  // TITLING-SPECIFIC attempt ceiling — distinct from renderAttempts (which
+  // counts the outer submit/generation attempt, not the Remotion titling
+  // step nested inside it). brandScriptExecutor's stampTitlingFailureAndThrow
+  // $incs this on EVERY titling failure (OOM, timeout, or a generic child
+  // exit/exception) before deciding resumable vs terminal, and the SAME
+  // counter is shared by a later resume attempt (titlingResumeService calls
+  // the identical function), so the ceiling holds across both the original
+  // renderer attempt and every retry. Exists because "stamp every titling
+  // failure resumable" would otherwise retry a DETERMINISTIC failure (a
+  // malformed spec, a missing asset, a serialization bug that throws
+  // identically every time — see the ObjectId-Buffer bug fixed nearby)
+  // forever: an unbounded retry on a path that already charged for the
+  // master is worse than the stranding it replaces. Past
+  // TITLING_ATTEMPTS_MAX (default 3, env-overridable) the ad goes terminal
+  // (status:'failed') instead of resumable — the master itself is NEVER
+  // deleted, so nothing paid for is lost, only the automatic retry stops.
+  // MUST STAY DECLARED — Mongoose strict mode silently drops writes to
+  // undeclared paths (see titlingResumeState note above); an undeclared
+  // counter here would make the cap a no-op and reopen an infinite retry.
+  titlingAttempts: { type: Number, default: 0 },
   // A FREE derive-only video ad (deriveFromMaster set) waits IN-RENDER for
   // its sibling master's plate (renderDeriveOnlyVideoAd, routes/ads.js) and
   // requeues to 'queued' if the wait expires — it never submits anything,

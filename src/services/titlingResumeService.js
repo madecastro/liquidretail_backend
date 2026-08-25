@@ -357,23 +357,47 @@ async function resumeUntitledMasters({ limit = TITLING_RESUME_MAX } = {}) {
         continue;
       }
 
-      // Child OOM is process death, not a merited render failure. The paid
-      // master stays on renderUrl and brandScriptExecutor already re-armed
-      // titlingResumeState:'pending'. Marking failed here would lose the
-      // asset as a terminal verdict and the sweeper would never retry.
-      const { isRemotionChildOomError } = require('./remotionChildSupervisor');
-      if (isRemotionChildOomError(err)) {
+      // brandScriptExecutor's stampTitlingFailureAndThrow is the SINGLE
+      // SOURCE OF TRUTH for whether a titling failure from
+      // renderBrandScriptAndSave (OOM, timeout, or a generic child
+      // failure/exception) is resumable or terminal — it already persisted
+      // that decision (and the shared TITLING_ATTEMPTS_MAX ceiling) to this
+      // SAME Ad row before rethrowing, and stamped `err.titlingResumable`
+      // accordingly (renderer.js's processAd wrapper reads the identical
+      // flag). Deferring to it here — rather than re-deciding from err's
+      // shape, as this file used to (OOM-only) — means this arm cannot
+      // disagree with what the DB already says: re-marking 'failed' an ad
+      // that brandScriptExecutor just re-armed 'pending' would silently
+      // undo the whole point of the resumable stamp.
+      if (err && err.titlingResumable === true) {
         out.skipped++;
         console.warn(
-          `   ⚠️  titlingResume[${ad._id}]: remotion child OOM-killed — left pending for retry`
+          `   ⚠️  titlingResume[${ad._id}]: titling ${err.titlingFailureKind || 'failed'} ` +
+          `(attempt ${err.titlingAttempts}) — left pending for retry`
+        );
+        continue;
+      }
+      if (err && err.titlingResumable === false) {
+        // Attempt cap reached — brandScriptExecutor already wrote the
+        // terminal stamp (status:'failed', titlingResumeState:null, a
+        // renderError naming the cap). Nothing more to persist; just count
+        // it so the pass log is accurate.
+        out.failed++;
+        console.warn(
+          `   ⚠️  titlingResume[${ad._id}]: titling failed — attempt cap reached, master kept: ${err.message || err}`
         );
         continue;
       }
 
-      // TERMINAL BY DESIGN, and only for a real render failure: clear the state so
-      // a permanently failing ad is retried once and then stops instead of looping
-      // forever on a CPU-heavy Remotion render. The paid master stays on renderUrl
-      // and is never deleted. Mirror routes/ads.js:1490-1504 exactly.
+      // FALLBACK, for an error that never reached brandScriptExecutor's
+      // stamp function at all (titlingResumable is undefined) — e.g. a throw
+      // from basePlateCropService/plateIntelService resolution, which sits
+      // OUTSIDE the try/catch that wraps the actual renderTitles call. TERMINAL
+      // BY DESIGN, and only for a real render failure: clear the state so a
+      // permanently failing ad is retried once and then stops instead of
+      // looping forever on a CPU-heavy Remotion render. The paid master
+      // stays on renderUrl and is never deleted. Mirror routes/ads.js:1490-1504
+      // exactly.
       try {
         const msg = (err && err.message) ? String(err.message) : String(err);
         const tmsg = `master rendered; titling failed: ${msg}`;

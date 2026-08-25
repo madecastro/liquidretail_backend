@@ -2073,6 +2073,156 @@ async function uploadRenderAndStamp({ ad, finalPath, tempDir, timings, titlingSn
   }
 }
 
+// Bounded resumable-retry ceiling for a titling failure. Read fresh on every
+// call, not cached, so a test/harness can vary TITLING_ATTEMPTS_MAX per run
+// (and so a live env-var change takes effect without a redeploy).
+//
+// WHY A CAP AT ALL: "stamp every titling failure resumable" would otherwise
+// retry a DETERMINISTIC failure forever — a malformed spec, a missing asset,
+// an IPC/serialization bug that throws identically on every attempt (see the
+// ObjectId-Buffer bug fixed in renderWithRemotionAndSave below, which hit
+// 100% of video ads until fixed). OOM and timeout are usually load-dependent,
+// not deterministic, but they are capped by the SAME ceiling rather than
+// carved out as "always safe to retry" — a titling bug that reliably OOMs or
+// reliably times out is exactly as stuck as one that reliably throws. An
+// unbounded retry on a path that already charged for the master is worse
+// than the stranding it replaces. Past the cap the ad goes TERMINAL
+// (status:'failed'); the master itself is NEVER deleted, so nothing paid for
+// is lost — only the automatic retry stops.
+function titlingAttemptsMax() {
+  return Math.max(1, parseInt(process.env.TITLING_ATTEMPTS_MAX, 10) || 3);
+}
+
+// Single source of truth for "is this titling failure resumable, and how
+// many times have we tried". Called from EVERY titling-failure catch in
+// renderWithRemotionAndSave below — OOM, timeout, and a generic child
+// exit/exception alike — so callers (renderer.js's processAd wrapper,
+// titlingResumeService's own catch) never re-classify the error themselves:
+// they read `err.titlingResumable` off what THIS function already decided
+// and persisted. The resume sweep re-enters titling through this exact same
+// function on its own attempt (titlingResumeService → renderBrandScriptAndSave
+// → renderWithRemotionAndSave → here), so the attempt ceiling is shared
+// across the original renderer attempt AND every later resume attempt — not
+// reset by "it's a different caller now".
+//
+// Top-level (not a closure over `ad`) and exported so
+// scripts/verifyTitlingRecoverability.js can drive it directly against a stubbed
+// `../models/Ad` without paying for the rest of renderWithRemotionAndSave's
+// dependency chain (titleSpecService, basePlateCropService, plateIntelService,
+// Cloudinary, ...).
+async function stampTitlingFailureAndThrow(ad, err) {
+  const Ad = require('../models/Ad');
+  const { isRemotionChildOomError, isRemotionChildTimeoutError } = require('./remotionChildSupervisor');
+  const kind = isRemotionChildOomError(err) ? 'oom'
+    : isRemotionChildTimeoutError(err) ? 'timeout'
+    : 'generic';
+  const code = kind === 'oom' ? 'REMOTION_CHILD_OOM'
+    : kind === 'timeout' ? 'REMOTION_CHILD_TIMEOUT'
+    : 'REMOTION_CHILD_FAILED';
+  const max = titlingAttemptsMax();
+
+  // Atomic $inc + read-back. In practice only one worker ever holds this
+  // ad's claim at a time, so a plain read-then-write would likely be safe
+  // too — but $inc costs nothing extra and removes that assumption, and a
+  // failed read fails CLOSED (see capExceeded below) rather than silently
+  // granting an unlimited retry.
+  let attempts = null;
+  try {
+    const updated = await Ad.findOneAndUpdate(
+      { _id: ad._id },
+      { $inc: { titlingAttempts: 1 } },
+      { new: true, projection: { titlingAttempts: 1 } }
+    ).lean();
+    attempts = updated ? updated.titlingAttempts : null;
+  } catch (incErr) {
+    console.warn(`   ⚠️  brandScript[ad=${ad._id}]: titlingAttempts $inc failed (${incErr.message})`);
+  }
+  // >= , NOT > : `attempts` is the count INCLUDING this failure, so with
+  // TITLING_ATTEMPTS_MAX=3 the intent is "at most 3 total attempts, ever" —
+  // attempts 1 and 2 stay resumable, attempt 3's failure is the last one and
+  // must be terminal. `attempts > max` would let a 4th attempt run before
+  // giving up (off by one against the name of the env var) — this exact
+  // off-by-one was caught live by scripts/verifyTitlingRecoverability.js's
+  // A3 (attempt 3 must already be terminal, not still resumable) and its A5
+  // (a lowered TITLING_ATTEMPTS_MAX=1 must terminal on the very first
+  // failure) during an adversarial review pass.
+  const capExceeded = attempts == null || attempts >= max;
+  const kindLabel = kind === 'oom' ? 'OOM-killed' : kind === 'timeout' ? 'timed out' : `failed (${err && err.message ? err.message : err})`;
+
+  err.titlingFailureKind = kind;
+  err.titlingAttempts = attempts;
+  err.titlingResumable = !capExceeded;
+
+  const renderErrorFields = require('./renderErrorFields');
+  if (capExceeded) {
+    const msg = `remotion child ${kindLabel} — paid master kept, titling FAILED after ` +
+      `${attempts == null ? 'an unknown number of' : attempts} attempt(s) (cap ${max})`;
+    try {
+      await Ad.updateOne(
+        { _id: ad._id },
+        {
+          $set: {
+            status: 'failed',
+            claimedByWorker: null,
+            claimedAt: null,
+            titlingResumeState: null,
+            renderError: {
+              message: String(msg).slice(0, 400),
+              stage: 'titling',
+              at: new Date(),
+              code,
+              ...renderErrorFields.childTailsFrom(err)
+            },
+            renderStage: 'master rendered; titling failed (attempt cap reached)',
+            renderStageAt: new Date(),
+            updatedAt: new Date()
+          }
+        }
+      );
+    } catch (persistErr) {
+      console.warn(`   ⚠️  brandScript[ad=${ad._id}]: terminal titling stamp failed (${persistErr.message})`);
+    }
+    console.warn(`   ⚠️  brandScript[ad=${ad._id}]: ${msg}`);
+    throw err;
+  }
+
+  // RESUMABLE: paid master is already on renderUrl. Stamp
+  // titlingResumeState:'pending' so the resume sweeper can re-title for
+  // free, then rethrow so callers that would otherwise mark status:'failed'
+  // (processAd catch, titlingResumeService's terminal arm) can defer to this
+  // decision instead.
+  const msg = `remotion child ${kindLabel}; paid master kept, titling deferred (attempt ${attempts}/${max})`;
+  try {
+    await Ad.updateOne(
+      { _id: ad._id },
+      {
+        $set: {
+          status: 'draft',
+          claimedByWorker: null,
+          claimedAt: null,
+          // pending, not claimed: we are no longer in-flight, so the sweeper
+          // must not wait CLAIM_STALE_MIN.
+          titlingResumeState: 'pending',
+          renderError: {
+            message: String(msg).slice(0, 400),
+            stage: 'titling',
+            at: new Date(),
+            code,
+            ...renderErrorFields.childTailsFrom(err)
+          },
+          renderStage: `master rendered; titling ${kindLabel} — resume pending`,
+          renderStageAt: new Date(),
+          updatedAt: new Date()
+        }
+      }
+    );
+  } catch (persistErr) {
+    console.warn(`   ⚠️  brandScript[ad=${ad._id}]: titling-failure stamp failed (${persistErr.message})`);
+  }
+  console.warn(`   ⚠️  brandScript[ad=${ad._id}]: ${msg}`);
+  throw err;
+}
+
 // Remotion path: spec + tokens resolved server-side, composition rendered
 // by services/remotionRenderService. Never "no chrome" — the canonical
 // preset always exists.
@@ -2189,44 +2339,6 @@ async function renderWithRemotionAndSave({ ad, brand, format, presetOverride = n
 
   const { isRemotionChildOomError, isRemotionChildTimeoutError } = require('./remotionChildSupervisor');
 
-  // Child OOM is NOT a merited render failure: the paid master is already on
-  // renderUrl. Stamp titlingResumeState:'pending' so the resume sweeper can
-  // re-title for free, then rethrow so callers that would mark status:'failed'
-  // (processAd catch, titlingResumeService's terminal arm) can skip that.
-  async function stampTitlingOomAndThrow(err) {
-    const Ad = require('../models/Ad');
-    const msg = `remotion child OOM-killed; paid master kept, titling deferred: ${err && err.message ? err.message : err}`;
-    try {
-      await Ad.updateOne(
-        { _id: ad._id },
-        {
-          $set: {
-            status: 'draft',
-            claimedByWorker: null,
-            claimedAt: null,
-            // pending, not claimed: we are no longer in-flight, so the sweeper
-            // must not wait CLAIM_STALE_MIN.
-            titlingResumeState: 'pending',
-            renderError: {
-              message: String(msg).slice(0, 400),
-              stage: 'titling',
-              at: new Date(),
-              code: 'REMOTION_CHILD_OOM',
-              ...require('./renderErrorFields').childTailsFrom(err)
-            },
-            renderStage: 'master rendered; titling oom-killed — resume pending',
-            renderStageAt: new Date(),
-            updatedAt: new Date()
-          }
-        }
-      );
-    } catch (persistErr) {
-      console.warn(`   ⚠️  brandScript[ad=${ad._id}]: OOM stamp failed (${persistErr.message})`);
-    }
-    console.warn(`   ⚠️  brandScript[ad=${ad._id}]: ${msg}`);
-    throw err;
-  }
-
   let result;
   try {
     adStage(ad._id, `titling ${ad.aspectRatio || format}`);
@@ -2269,12 +2381,14 @@ async function renderWithRemotionAndSave({ ad, brand, format, presetOverride = n
         : null,
     });
   } catch (err) {
-    if (isRemotionChildOomError(err)) {
-      await stampTitlingOomAndThrow(err);
+    // OOM and timeout are never worth a second Remotion slot: OOM means the
+    // box is already over its memory budget and timeout means we already
+    // SIGKILLed a hung child — a raw-plate retry would not address either
+    // cause, only spend a second slot on the same failure class. Both go
+    // straight to the shared stamp/cap decision instead of retrying.
+    if (isRemotionChildOomError(err) || isRemotionChildTimeoutError(err)) {
+      await stampTitlingFailureAndThrow(ad, err);
     }
-    // Do not spend a second Remotion slot on a child we already killed for
-    // hanging. Timeout is a real error of this attempt (distinct from OOM).
-    if (isRemotionChildTimeoutError(err)) throw err;
     // A cropped-plate failure must NEVER cost the titles: renderBrandScriptAndSave's callers
     // treat chrome as best-effort, so an unhandled throw here ships the raw UNTITLED 9:16
     // master as the deliverable — strictly worse than a titled-but-centre-cropped ad. Retry
@@ -2304,13 +2418,19 @@ async function renderWithRemotionAndSave({ ad, brand, format, presetOverride = n
           faceKeepOut: faceKeepOut ? { ...faceKeepOut, cropRect: null } : null,
         });
       } catch (err2) {
-        if (isRemotionChildOomError(err2)) {
-          await stampTitlingOomAndThrow(err2);
-        }
-        throw err2;
+        // Any failure on the RAW plate — the fallback of last resort — is a
+        // real titling failure of THIS attempt, whatever kind. Same shared
+        // decision as above (OOM/timeout/generic all route through it).
+        await stampTitlingFailureAndThrow(ad, err2);
       }
     } else {
-      throw err;
+      // No cropped-plate retry available (already on the raw plate) — a
+      // generic failure here is exactly as real as OOM/timeout above, and
+      // previously fell through to a bare `throw err`, which NEVER stamped
+      // titlingResumeState:'pending' — the ad was stranded even though the
+      // paid master sat right there on renderUrl. Route it through the same
+      // shared decision instead.
+      await stampTitlingFailureAndThrow(ad, err);
     }
   }
   return uploadRenderAndStamp({
@@ -2454,4 +2574,11 @@ module.exports = {
   isSquareFormat,
   classifyFormat,
   BRAND_SCRIPT_FIELD,
+  // Exported for scripts/verifyTitlingRecoverability.js — the resumable-vs-
+  // terminal decision (and its attempt ceiling) is the money-critical part
+  // of the titling-recoverability fix, and this lets the harness drive the
+  // REAL decision function against a stubbed `../models/Ad` instead of
+  // regexing this file or re-running the whole Remotion pipeline.
+  stampTitlingFailureAndThrow,
+  titlingAttemptsMax,
 };
