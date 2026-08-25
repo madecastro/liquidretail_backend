@@ -1303,13 +1303,30 @@ async function renderVideo(ad) {
   // release TO THIS SAME $set so a titler observing titlingNeeded also sees
   // the settled veoVideoUrl — same partial-write-window argument, one write.
   // Mode-specific spread — see derive path above for the F5 anchor note.
+  //
+  // FIELD NAME: `cloudinaryPublicId`, NOT `veoCloudinaryPublicId`. This key
+  // MUST match backend routes/ads.js:3004 exactly — that write puts the SAME
+  // veoResult.cloudinaryPublicId (the raw Omni master's Cloudinary asset,
+  // uploaded by atlasVideoService/aiVideoReferenceService BEFORE Remotion
+  // titling ever runs) into the schema-declared `cloudinaryPublicId` path.
+  // The later titled-render upload (brandScriptExecutor.uploadRenderAndStamp,
+  // both repos) only ever stamps `renderUrl`/`posterUrl` — it never touches
+  // `cloudinaryPublicId` — so this field identifies the RAW MASTER for the
+  // life of the ad, never the titled asset. `veoCloudinaryPublicId` is NOT a
+  // path in models/Ad.js on either side (verified: only `cloudinaryPublicId`
+  // is declared, at src/models/Ad.js:530 here and models/Ad.js:539 on
+  // backend) — writing that name is a silent no-op under Mongoose strict
+  // mode. This was the 4th instance of that failure class in this repo,
+  // after renderError.predictionId, the renderStage sentinel, and
+  // titlingNeeded (all documented in models/Ad.js). See
+  // scripts/verifyVideoMasterCloudinaryPublicId.js for the regression guard.
   const handoffMode = isTitlerEnabled();
   const $setMaster = {
     veoVideoUrl:          veoResult.videoUrl,
     veoAspectRatio:       veoResult.aspectRatio || ad.aspectRatio,
     veoPrompt:            veoResult.prompt || null,
     veoStoryboard:        veoResult.storyboard || storyboard || null,
-    veoCloudinaryPublicId: veoResult.cloudinaryPublicId || null,
+    cloudinaryPublicId:    veoResult.cloudinaryPublicId || null,
     veoModel:             veoResult.model || null,
     veoReferenceImages:   veoResult.referenceImages || [],
     renderUrl:            veoResult.videoUrl,
