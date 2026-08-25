@@ -887,7 +887,7 @@
       "backendHash": "21c5d7c66dbfd1a8636d2ef6feddbbf51a53f287e1fa8168ad99955786f6602d",
       "backendSha": "ba99a59f10619bbd940be9442c8852dc32ae278a",
       "status": "fork",
-      "reason": "Backend #329 added an ids={} third param to semanticScan but never wires it into the title_plate_scan chatCompletion call (verified: zero 'ids.' reads anywhere in backend's function body) — a scaffold-only change on backend's side. adgen's semanticScan/analyzePlate already fully destructure and thread brandId/productId/adId/campaignRunId into the same call (plateIntelService.js:175,238, adgen #43); adgen is ahead of backend on this specific hunk. Prior reason unchanged: adgen extract is smaller than backend (backend grew after the copy)."
+      "reason": "Backend #329 added an ids={} third param to semanticScan but never wires it into the title_plate_scan chatCompletion call (verified: zero 'ids.' reads anywhere in backend's function body) — a scaffold-only change on backend's side. adgen's semanticScan/analyzePlate already fully destructure and thread brandId/productId/adId/campaignRunId into the same call (plateIntelService.js:175,238, adgen #43); adgen is ahead of backend on this specific hunk. PORTED 2026-08-24: backend #307 (dabceaf4) surface-aware keep-out bands — SURFACE_INSETS, LOWER_THIRD_TOP/BAND_LEAD_IN, bandsFor(safeZoneKey), REFERENCE_BAND_H rescale in applyFaceKeepOut, bandRect(bandKey, safeZoneKey), analyzeFrameBands reading bandsFor(opts.safeZoneKey) — with adgen's brandId/productId/adId/campaignRunId params on analyzePlate preserved alongside the new safeZoneKey param. Verified via scripts/verifyKeepOutBandGeometry.mjs (25 checks incl. cross-module pin against src/remotion/lib/safeZones.js). Prior reason unchanged: adgen extract is smaller than backend (backend grew after the copy)."
     },
     "services/platformFormats.js": {
       "backendHash": "6e0a24cbf76a019e1425599a2c6411d8012962f80915fb474a699c3e003a8cde",
@@ -972,7 +972,7 @@
       "backendHash": "52604a214dd53d237632c0b76581e4aeca7c82e043d008a1630e34f3f7d4978a",
       "backendSha": "dabceaf47fc8db7671a7d8f812024d550e66287a",
       "status": "fork",
-      "reason": "adgen child-supervisor / isolation path; not a wholesale copy"
+      "reason": "adgen child-supervisor / isolation path; not a wholesale copy. PORTED 2026-08-24: backend #307 (dabceaf4) safeZoneKey threading — renderTitlesJob's analyzePlate call now passes safeZoneKey alongside adgen's existing brandId/productId/adId/campaignRunId params, its applyFaceKeepOut call now passes safeZoneKey, and both of renderPreview's analyzePlate calls now pass safeZoneKey. Without this the plateIntelService.js #307 fix is reachable in code but never exercised (a caller-supplied safeZoneKey would be silently dropped) — see scripts/verifyKeepOutBandGeometry.mjs groups E/H, mutation-proven to catch exactly this drop."
     },
     "services/renderErrorFields.js": {
       "backendHash": "0efda9eab3d25ab7f1a1efa8f8ca3cc8f5f2ca93a9a56319f0ecb3de0aa0d748",
