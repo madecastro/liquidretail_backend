@@ -92,7 +92,7 @@ async function generateAiLayouts({ mediaId, variants, aspectRatios, quality }) {
     try {
       const imageUrl = await generateReferenceImage(ctx, c.variant, c.aspectRatio, q);
       let extractedCanvas = null;
-      try { extractedCanvas = await extractLayoutFromImage(imageUrl); }
+      try { extractedCanvas = await extractLayoutFromImage(imageUrl, ctx); }
       catch (err) { console.warn(`   ⚠️  ai-layouts[${c.variant}/${c.aspectRatio}] extraction failed: ${err.message}`); }
       return { ...c, imageUrl, extractedCanvas, status: 'ok' };
     } catch (err) {
@@ -200,7 +200,7 @@ function buildGenerationPrompt(ctx, variant, aspectRatio) {
 // ──────────────────────────────────────────────────────────────
 //  Extraction
 // ──────────────────────────────────────────────────────────────
-async function extractLayoutFromImage(imageUrl) {
+async function extractLayoutFromImage(imageUrl, ctx = {}) {
   const prompt = [
     `You are analyzing a social-media ad layout. Decompose it into rectangular zones and return JSON matching the schema.`,
     ``,
@@ -216,7 +216,11 @@ async function extractLayoutFromImage(imageUrl) {
     `Identify 4-8 distinct zones. Focus on structural layout — don't try to read garbled AI text. Use tight bounding rectangles (no extra padding).`
   ].join('\n');
 
-  const response = await chatCompletion({ stage: 'layout_vision', service: 'aiLayoutStudioService' }, {
+  const response = await chatCompletion({
+    stage: 'layout_vision', service: 'aiLayoutStudioService',
+    brandId: ctx.media?.brandId || ctx.brand?._id || null,
+    productId: ctx.match?.catalogProductId || null
+  }, {
     model: 'gpt-4.1',
     response_format: { type: 'json_object' },
     messages: [{
@@ -340,7 +344,7 @@ async function runSession(sessionId) {
           try {
             const imageUrl = await generateReferenceImage(ctx, c.variant, c.aspectRatio, q);
             let extractedCanvas = null;
-            try { extractedCanvas = await extractLayoutFromImage(imageUrl); }
+            try { extractedCanvas = await extractLayoutFromImage(imageUrl, ctx); }
             catch (err) { console.warn(`   ⚠️  ai-layouts[${c.variant}/${c.aspectRatio}] extraction failed: ${err.message}`); }
             ref = { ...c, imageUrl, extractedCanvas, status: 'ok' };
           } catch (err) {

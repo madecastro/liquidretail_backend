@@ -106,7 +106,7 @@ async function findProductMatches({
 
   // ── Run all providers in parallel ─────────────────────────────────
   const tasks = enabled.map(p =>
-    p.match({ brand, category, caption, primarySubject, textDetected, imageUrl })
+    p.match({ brand, category, caption, primarySubject, textDetected, imageUrl, brandId })
      .then(result => ({ status: 'ok', name: p.PROVIDER_NAME, result }))
      .catch(err => ({ status: 'err', name: p.PROVIDER_NAME, error: err.message || String(err) }))
   );
@@ -134,7 +134,7 @@ async function findProductMatches({
   if (totalMatches > 0) {
     try {
       identification = await identifyProduct({
-        brand, category, caption, primarySubject, textDetected, imageUrl, providers
+        brand, category, caption, primarySubject, textDetected, imageUrl, providers, brandId
       });
       console.log(`🔎 Identification: ${identification.productName || '(none)'} — ${identification.certaintyLabel} (${(identification.certainty * 100).toFixed(0)}%)`);
     } catch (err) {
@@ -290,7 +290,9 @@ async function findProductMatches({
           brandUrl,
           productLabel,
           productCategory: productCategoryHint,
-          productDescription
+          productDescription,
+          brandId,
+          productId: catalogMatch?.product?._id || null
         });
       } catch (err) {
         console.warn(`   ✗ productCategory: ${err.message}`);
@@ -375,7 +377,8 @@ async function runPerProductProviders(refined, ctx) {
       primarySubject: refined.label,                 // ← per-product label seed (was scene-level primarySubject)
       textDetected:   ctx.textDetected,
       imageUrl:       refined.croppedImageUrl,        // ← per-product crop URL (Lens uses this)
-      cropImageUrl:   refined.croppedImageUrl         // ← multimodal seed for Gemini grounded search
+      cropImageUrl:   refined.croppedImageUrl,        // ← multimodal seed for Gemini grounded search
+      brandId:        ctx.brandId || null
     })
     .then(result => ({ status: 'ok', name: p.PROVIDER_NAME, result }))
     .catch(err => ({ status: 'err', name: p.PROVIDER_NAME, error: err.message || String(err) }))
@@ -410,7 +413,8 @@ async function runPerProductReasoner(provResult, refined, ctx) {
       primarySubject: refined.label,
       textDetected:   ctx.textDetected,
       imageUrl:       refined.croppedImageUrl,
-      providers:      provResult.providers
+      providers:      provResult.providers,
+      brandId:        ctx.brandId || null
     });
     if (ident) {
       console.log(`   · per-product reasoner[${refined.id}]: "${ident.productName || '(none)'}" — ${ident.certaintyLabel} (${((ident.certainty || 0) * 100).toFixed(0)}%)`);
@@ -978,7 +982,9 @@ async function enrichOneMatchInPlace(match, ctx) {
             brandUrl:        ctx.brandUrl,
             productLabel,
             productCategory: productCategoryHint,
-            productDescription
+            productDescription,
+            brandId:         ctx.brandId,
+            productId:       match.catalogProductId || null
           });
           if (match.brandCategory) tiers.push('category');
         } catch (err) {

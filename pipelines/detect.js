@@ -1404,7 +1404,9 @@ async function runExtendedAndOverlayChain(run, media, sourceImageUrl, sourceVide
         const { candidates, errors } = await generateExtendedCrops({
           sourceImageUrl, sourceVideoUrl,
           smartCrops: crops, judge, primarySubject: primarySubjectDesc,
-          background, isVideo
+          background, isVideo,
+          brandId: run.brandId || media.brandId || null,
+          productId: media.metadata?.catalogProductId || null
         });
         extendedCandidates = candidates;
         extendedErrors = errors;

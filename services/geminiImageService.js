@@ -8,7 +8,11 @@ const ATLAS_GEMINI_IMAGE_MODEL = process.env.ATLAS_GEMINI_IMAGE_MODEL || 'google
 
 // Try Atlas first, fall back to the direct Gemini runImageGen path when a
 // GEMINI_API_KEY is configured. Returns a PNG/JPEG Buffer either way.
-async function viaAtlasOrDirect(prompt, sourceUrl, aspectRatio, stage) {
+// `attribution` carries brandId/productId so this billable edit joins back to
+// a brand the way every other CostLog row does — was structurally absent
+// (no brand/product param anywhere on this call chain) until threaded from
+// pipelines/detect.js's runExtendedAndOverlayChain, 2026-08-24.
+async function viaAtlasOrDirect(prompt, sourceUrl, aspectRatio, stage, attribution = {}) {
   if (atlasImage.isConfigured()) {
     try {
       const res = await atlasImage.editImage({
@@ -16,7 +20,11 @@ async function viaAtlasOrDirect(prompt, sourceUrl, aspectRatio, stage) {
         images: [sourceUrl],
         model: ATLAS_GEMINI_IMAGE_MODEL,
         aspectRatio: aspectRatio || undefined,
-        meta: { stage, service: 'geminiImageService' }
+        meta: {
+          stage, service: 'geminiImageService',
+          brandId: attribution.brandId || null,
+          productId: attribution.productId || null
+        }
       });
       return Buffer.from(res.data[0].b64_json, 'base64');
     } catch (err) {
@@ -112,7 +120,7 @@ async function candidateModels() {
   return ordered;
 }
 
-async function extendImage(sourceUrl, baseCrop, targetRatio, subjectDescription, background) {
+async function extendImage(sourceUrl, baseCrop, targetRatio, subjectDescription, background, attribution = {}) {
   const cropUrl = buildCropUrl(sourceUrl, baseCrop);
 
   const prompt =
@@ -122,12 +130,12 @@ async function extendImage(sourceUrl, baseCrop, targetRatio, subjectDescription,
     formatBackgroundForExtension(background) +
     `Do not introduce new objects. Output a single image at ${targetRatio} aspect ratio.`;
 
-  const viaAtlas = await viaAtlasOrDirect(prompt, cropUrl, targetRatio, 'gemini_image_extend');
+  const viaAtlas = await viaAtlasOrDirect(prompt, cropUrl, targetRatio, 'gemini_image_extend', attribution);
   if (viaAtlas) return viaAtlas;
   return Buffer.from(await runImageGen(prompt, cropUrl), 'base64');
 }
 
-async function generateFresh(sourceUrl, baseCrop, targetRatio, subjectDescription, background) {
+async function generateFresh(sourceUrl, baseCrop, targetRatio, subjectDescription, background, attribution = {}) {
   const cropUrl = buildCropUrl(sourceUrl, baseCrop);
 
   const prompt =
@@ -138,7 +146,7 @@ async function generateFresh(sourceUrl, baseCrop, targetRatio, subjectDescriptio
     `The subject is the clear focal point. ` +
     `Output a single image at ${targetRatio} aspect ratio.`;
 
-  const viaAtlas = await viaAtlasOrDirect(prompt, cropUrl, targetRatio, 'gemini_image_fresh');
+  const viaAtlas = await viaAtlasOrDirect(prompt, cropUrl, targetRatio, 'gemini_image_fresh', attribution);
   if (viaAtlas) return viaAtlas;
   return Buffer.from(await runImageGen(prompt, cropUrl), 'base64');
 }
