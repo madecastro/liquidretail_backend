@@ -14,53 +14,38 @@ it clears it back to this placeholder.)_
 
 ## CURRENT STATE
 
-*(Replaced 2026-08-25 ~08:00 UTC, end of a long overnight session. Trunk `master`
-@ `684ac8b`. Full narrative: `session.d/2026-08-25_overnight-video-chain-and-review-coverage.md`.)*
+*(Replaced 2026-08-25 ~12:30 UTC. Trunk `master` @ the commit after #66. Narrative:
+`session.d/2026-08-25_overnight-video-chain-and-review-coverage.md` then
+`session.d/2026-08-25_e2e-rounds-and-qc-findings.md`.)*
 
-**Video generation works.** The outage was PR #43 passing raw Mongoose ObjectIds on
-the Remotion child IPC payload, which `remotionChildSupervisor.assertNoBuffers`
-rejects. Fixed by `String()`-wrapping every id at both `renderTitles` call sites in
-`brandScriptExecutor.js`. Proof is in production data, not the merge log: the last
-`remotion child IPC forbids buffers` failure is 22:09 UTC 2026-08-24; the 04:13 UTC
-2026-08-25 batch returned `status:'draft'` with `veoVideoUrl` populated. The only
-failure in that batch was a vision-QC content rejection.
+**Video generation works** — the PR #43 IPC regression is fixed and proven in production
+data. **Static creative is reliable**: ~160 images across four E2E rounds with essentially
+zero final-attempt fidelity failures.
 
-**Deployed:** all four adgen services and both backend services are live on their
-trunks. `ADGEN_RENDERER_ENABLED=true` on backend-web (dashboard, not the file).
+**What you must not trust: the VIDEO QC judge.** It is confidently wrong in both
+directions — it fabricated specific defects on two masters (one claim reproduced
+identically by four separate QC calls, visible in no frame) and caught a genuinely hidden
+real one on a third. Video has NO regeneration, so a fabricated verdict terminally
+discards a paid master. Before acting on this, note the confound: round 4 used a
+single-image seed override instead of the default 3-image reference stack. Re-run with the
+default stack first.
 
-**Two production levers are still unpulled, both deliberately:**
+**Three fixes shipped from here:** #63 (renderer claim excludes titler-handoff rows —
+`ADGEN_TITLER_ENABLED` is now unblocked and needs only a dashboard flip after a watched
+video run), #65 (QC can see a logo composited on top of the product), #66 (terminal static
+failures persist their verdict — verified by a natural before/after in production, 0 of 10
+before the deploy, 16 of 16 after).
 
-1. `REMOTION_QUEUE_CONCURRENCY` is **2** on the adgen-renderer dashboard. PR #61
-   raised `config/defaults.env` to 3, but `src/config.js:12` loads dotenv WITHOUT
-   `override:true`, so the dashboard variable wins — **PR #61 is inert in
-   production.** Raising it is a dashboard edit. Measured ~1.97 GiB per concurrent
-   Remotion render, so 3 ≈ 5.9 GiB of an 8 GiB box. 4 is the value that was
-   OOM-killed on 2026-08-21 holding a paid master; do not restore it.
-2. `ADGEN_TITLER_ENABLED` is **false**. Its blocker is now cleared: PR #63 landed the
-   `titlingNeeded: { $ne: true }` exclusion in `claimOne()`, gated on
-   `isTitlerEnabled()` so a flag-off rollback can still drain leftovers. Without it
-   the renderer re-claimed every row it handed to the titler. **Next step is a
-   dashboard flip, once someone has watched a video run on the deployed build.**
+**Two production levers still unpulled.** `REMOTION_QUEUE_CONCURRENCY` is 2 on the
+adgen-renderer dashboard, so PR #61 is inert — round 4 measured the cost at ~30 minutes for
+26 video ads through titling. `ADGEN_TITLER_ENABLED` is false.
 
-**`verifyModelParity` now pins to backend `origin/main`** (`git archive` into a temp
-dir, then a real `require()`), matching `verifyVendorDrift`. It previously read the
-sibling's WORKING TREE — a shared checkout that is routinely dirty and behind — and
-produced a false "backend lacks titlingNeeded/titlingAttempts" failure. Override the
-ref with `ADGEN_BACKEND_REF`. **The NODE_PATH prohibition is unchanged and absolute:
-never set NODE_PATH, never run `npm ci` in an adgen worktree.**
+**Do not build subject-aware logo placement** — see the session.d entry. #65's QC-retry
+path restages the scene; relocation only trades one collision for another.
 
-**Suite:** `node scripts/runVerifySuite.js` → 48/49 on the #63 branch (49 harnesses),
-47/48 on trunk. The single red is `verifyRunFinalizesOnSettle_KNOWN_OPEN.js`, red by
-design and listed in `scripts/expected-failures.json`.
-
-**Review-coverage numbers were corrected, and this changes the funnel plan.** The
-strategy document's "80.5% of SKUs have a usable product review quote" is the
-UNGATED count and was measured on Pelagic Gear, then generalised. Measured across six
-brands, first-party (`scraped`) quote coverage is 946 of 4,424 SKUs — **21%**. Details
-and the mechanism live in the backend's session entry for the same date; the short
-version is that `catalogproducts.productReviews` is a Mixed OBJECT (not an array),
-`quotesOrigin` is `scraped` or `llm-web`, and ingest never writes ratings — three
-separate later passes do.
+**Suite:** `node scripts/runVerifySuite.js` → 48/49, the one red being
+`verifyRunFinalizesOnSettle_KNOWN_OPEN`, red by design. **Never set NODE_PATH and never run
+`npm ci` in an adgen worktree.**
 
 ---
 

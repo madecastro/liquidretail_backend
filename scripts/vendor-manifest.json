@@ -1,8 +1,8 @@
 {
   "version": 1,
   "backendRef": "origin/main",
-  "backendHead": "9bad6b803b1d2ed72b10ae2388e1bbcbec688a28",
-  "generatedAt": "2026-08-25T09:55:54.382Z",
+  "backendHead": "0363ea03c6d6438d3ac46368c446623c3987a443",
+  "generatedAt": "2026-08-25T12:32:20.157Z",
   "files": {
     "models/Ad.js": {
       "backendHash": "959aebff9a2620a7c4ab63f98d38909d355cc208f7f3a33a16b085d507fa0e37",
@@ -56,9 +56,10 @@
       "status": "synced"
     },
     "models/CampaignRun.js": {
-      "backendHash": "13bfbdfb9a80481249dff7ef57877da8270946d1be4e0129608dcb171abe3d8c",
-      "backendSha": "149862fdcde316f7d22a706bf627d7ca9f9f091e",
-      "status": "synced"
+      "backendHash": "3a3a5f657ad1fb86aae8f574723be644868bea930f509f3844de745ecb34ca30",
+      "backendSha": "0363ea03c6d6438d3ac46368c446623c3987a443",
+      "status": "fork",
+      "reason": "NOT PORTED, deliberately. Backend #333 added CampaignRun.automation so an automated/ui-smoke run renders 'by: <session> (Claude session)' in the Slack run feed rather than the human identity its test token authenticates as. Only the BACKEND sets that field, at run creation; adgen only bumps counters on an existing run. verifyModelParity enforces adgen-fields SUBSET backend-fields, so a backend-only field is fine here and porting it would add a path adgen never writes."
     },
     "models/CatalogProduct.js": {
       "backendHash": "c4ea01fde561687af7fcb2ce0c7bd22df82ecfb5fcc953ce483d2e91168c8561",
@@ -748,10 +749,10 @@
       "reason": "HTTP origin check for backend API routes"
     },
     "services/geminiImageService.js": {
-      "backendHash": "9000d37c901eb4401b3949a30f9b8168f0e3eb2f2ae7e95f86e735d11edc2d86",
-      "backendSha": "9c6e1147d53cf16c59c0cf8ddde49e8908f67569",
+      "backendHash": "acf8a176a577e4584dc127e2be171fa09e807143cfdeb491a1bf25cdbef63ce2",
+      "backendSha": "1acb49bd9775eb79848fcb05d9a7289bbd3efa6b",
       "status": "unused",
-      "reason": "only reached from unused backend scrape/enrichment path"
+      "reason": "unused in adgen — Gemini image generation is backend-owned. Re-looked after backend #331, which threaded brandId/productId through four more unledgered cost producers so their CostLog rows attribute correctly."
     },
     "services/generationGate.js": {
       "backendHash": "8e1e414c11e2c0560db6e9dbb872096c25d0e89f12e83d102d2700970ab68202",
@@ -910,9 +911,10 @@
       "status": "synced"
     },
     "services/providers/geminiSearchProvider.js": {
-      "backendHash": "780f22b15aee607fe4f35580e344f88fc859a718c76c29dc7462812e5d717b7f",
-      "backendSha": "d49b471b5f2a092990cd841bfc02304b79768346",
-      "status": "synced"
+      "backendHash": "cbecc38bf7bb05c8a49b07ef3fcb8440f4295d0db1e39eff5201e39571fd6287",
+      "backendSha": "1acb49bd9775eb79848fcb05d9a7289bbd3efa6b",
+      "status": "fork",
+      "reason": "NOT PORTED, deliberately. Backend #331 threaded brandId/productId through this and three other previously unledgered cost producers so their CostLog rows attribute correctly. This provider runs BACKEND-side only (the Gemini grounded-search review gap-fill); adgen's copy is unwired, so the attribution fix has nothing to attribute here. NOTE: this module produces the llm-web review quotes, which print TEXT ONLY with every byline stripped — read services/quoteProvenance.js before wiring this copy."
     },
     "services/pushToShopify.js": {
       "backendHash": "96cbcabfb6b4172eab832b7d94d6154e38160a567537f67bb3c9f3af6f59b151",
