@@ -1,12 +1,12 @@
 {
   "version": 1,
   "backendRef": "origin/main",
-  "backendHead": "e955b04891fcb861bbf64a5bc8642aa2fbe7a0bc",
-  "generatedAt": "2026-08-25T02:53:55.778Z",
+  "backendHead": "e5f4a3ffb9890f84858fb1ad453a9c9f7059d58d",
+  "generatedAt": "2026-08-25T07:23:13.802Z",
   "files": {
     "models/Ad.js": {
-      "backendHash": "2c7423b688a764b10991e5c2f067aabcfd6dc68301883c616d43deba08cf0957",
-      "backendSha": "e75f6884439fb3343993590ae7bdaa73b3790ae9",
+      "backendHash": "959aebff9a2620a7c4ab63f98d38909d355cc208f7f3a33a16b085d507fa0e37",
+      "backendSha": "17099f472c305680c0122a923318832c9d7ca12b",
       "status": "fork",
       "reason": "fork — comment-only divergence plus titlingNeeded. adgen documents the AD_VISION_QC_ENABLED env fallback its systemConfigService still honours; backend retired that fallback and its comment. titlingNeeded is now declared on BOTH sides (backend #332) so a backend save() cannot silently drop adgen's Phase 3 titler handoff flag and strand an already-paid video master — Mongoose strict mode discards undeclared paths with no error, the same way this repo previously lost renderError.predictionId."
     },
@@ -561,8 +561,8 @@
       "status": "synced"
     },
     "services/brandScriptExecutor.js": {
-      "backendHash": "c123aa44b7c094d52e0c5eb3096380623e672f04b23efd5a399751e0d2eeb170",
-      "backendSha": "d8c133011275d62fa4133ed939b5e47fe5e90bdc",
+      "backendHash": "bc87bd56fa996f2aca33e581712496b35e68ea4fda285e5dec79491e9c1c8165",
+      "backendSha": "2d93ace1f79a7d91c7aede75667fb4d8c4e48a23",
       "status": "fork",
       "reason": "adgen video QC/titling path (Remotion child OOM/timeout); colourway gate hunk-ported from backend #324. FIXED 2026-08-24: the #307 port (below, plateIntelService.js) left both renderTitles({...}) call sites here computing platformFormat but never deriving safeZoneKey from it, so bandsFor(safeZoneKey) always got undefined and silently used pre-#307 BANDS on every real render — the fix was reachable but never actually exercised. Now computes `const safeZoneKey = resolveSafeZoneKeyCjs({format, platformFormat})` once and forwards it to both call sites. Same gap independently found and fixed on backend main the same day (unmerged there too as of this reason). Verified via scripts/verifyKeepOutBandGeometry.mjs groups I/J/K, mutation-proven (dropping the call-site arg, and a decoy hardcoded null, each turn a check red)."
     },
@@ -690,7 +690,8 @@
     "services/concurrency.js": {
       "backendHash": "019ff6bfee1808f92e9f55dd91ca052e9a4c242bd8bab40525ca3669dad45a16",
       "backendSha": "8fc602d6d080871456e0ad37b6934b86a7bb6e04",
-      "status": "synced"
+      "status": "fork",
+      "reason": "adgen-only: SPEC fallback lowered 4->2 (4 is the measured OOM-fatal value on an 8 GiB box; a degraded-boot fallback must be the most conservative survived value), plus a correction to the why-note — the old ~0.9 GiB/slot figure divided a 7.57 GiB peak by 8 permits when only 4 were rendering; real figure is ~1.97 GiB/slot. adgen tuned operating value lives in config/defaults.env (3). Backend still carries default 4 in its own copy; see handoff follow-up."
     },
     "services/copyDerivationService.js": {
       "backendHash": "d7e3d8dfd47fbbd22443452c542dba8f71d800ddcf5b914d8f6848b4f8401669",
@@ -883,8 +884,8 @@
       "status": "synced"
     },
     "services/plateIntelService.js": {
-      "backendHash": "21c5d7c66dbfd1a8636d2ef6feddbbf51a53f287e1fa8168ad99955786f6602d",
-      "backendSha": "ba99a59f10619bbd940be9442c8852dc32ae278a",
+      "backendHash": "70c38fc7fc4704194866c884326aeeb3fc02a0b2bdf8902ffbad87b9895dc6e7",
+      "backendSha": "2d93ace1f79a7d91c7aede75667fb4d8c4e48a23",
       "status": "fork",
       "reason": "Backend #329 added an ids={} third param to semanticScan but never wires it into the title_plate_scan chatCompletion call (verified: zero 'ids.' reads anywhere in backend's function body) — a scaffold-only change on backend's side. adgen's semanticScan/analyzePlate already fully destructure and thread brandId/productId/adId/campaignRunId into the same call (plateIntelService.js:175,238, adgen #43); adgen is ahead of backend on this specific hunk. PORTED 2026-08-24: backend #307 (dabceaf4) surface-aware keep-out bands — SURFACE_INSETS, LOWER_THIRD_TOP/BAND_LEAD_IN, bandsFor(safeZoneKey), REFERENCE_BAND_H rescale in applyFaceKeepOut, bandRect(bandKey, safeZoneKey), analyzeFrameBands reading bandsFor(opts.safeZoneKey) — with adgen's brandId/productId/adId/campaignRunId params on analyzePlate preserved alongside the new safeZoneKey param. Verified via scripts/verifyKeepOutBandGeometry.mjs (25 checks incl. cross-module pin against src/remotion/lib/safeZones.js). Prior reason unchanged: adgen extract is smaller than backend (backend grew after the copy). FOLLOW-UP FIX 2026-08-24 (same day): the port above was itself inert — nothing ever called this file's bandsFor with a real safeZoneKey, because neither renderTitles call site in brandScriptExecutor.js computed one. Added resolveSafeZoneKeyCjs({format, platformFormat}) next to SURFACE_INSETS, a CJS mirror of remotion/lib/safeZones.js's resolveSafeZoneKey (same mirror-not-import pattern as SURFACE_INSETS itself), pinned against drift by new harness groups I/J/K. bandsFor/bandRect/SURFACE_INSETS themselves are unchanged by this follow-up."
     },
@@ -1165,8 +1166,8 @@
       "status": "synced"
     },
     "services/titlingResumeService.js": {
-      "backendHash": "c97b0aec136b95e5fdc87e81444543a97ab9fd41cccdda988410fc271eadded5",
-      "backendSha": "36aedfa35e671da580d3e1d323431f431752b576",
+      "backendHash": "fd938acd3cbd1060ae81351da372442d53dd5dafc1bd728908226f15ff9d758d",
+      "backendSha": "e5f4a3ffb9890f84858fb1ad453a9c9f7059d58d",
       "status": "unused",
       "reason": "adgen-only QC-verdict guard + remotion-child-OOM retry; only required from unwired bootRecoveryService. Looked at backend #326 child-tail persist — already present."
     },

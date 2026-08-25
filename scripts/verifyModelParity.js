@@ -73,6 +73,26 @@
 // two-repo comparison, which is a different situation from a bug in either
 // repo, and must not be reported as a failure.
 //
+// COMPARISON REF: origin/main of that sibling, not its working tree. The
+// sibling checkout is shared and routinely dirty and behind origin/main
+// (measured 2026-08-25: 18 commits behind, 9 modified tracked files).
+// Requiring models/*.js straight off that working tree produced a FALSE
+// FAILURE — Ad.js: adgen declares field(s) the backend model LACKS:
+// titlingAttempts, titlingNeeded — even though origin/main (e5f4a3ff)
+// declares both (models/Ad.js:536 and :559). The subset rule was working;
+// the comparison target was stale. We therefore `git archive` origin/main's
+// models/ (plus the two files those models require at load time — see
+// EXTRA_ARCHIVE_PATHS) into a temp dir and require() those copies for
+// real: same mongoose.model intercept, same Module._load mongoose
+// fallback. A dirty or behind working tree cannot masquerade as "what
+// backend has shipped". The info line matches verifyVendorDrift:
+// "comparing backend origin/main <sha>; working tree HEAD <sha> is
+// ignored". If origin/main is missing (different remote name, bare/odd
+// clone) we fall back to the working tree with a clear INFO line and
+// never hard-fail on that. Override the ref with ADGEN_BACKEND_REF (same
+// knob as verifyVendorDrift). We do not fetch. The temp dir is removed
+// on every exit path including throw.
+//
 // Otherwise fully offline: mongoose.Schema() never opens a connection, and
 // nothing here touches the network, a real DB, or an API key.
 //
@@ -83,11 +103,20 @@
 //     names Ad.js and the exact field "notInBackend"
 //   (revert the edit)
 //   node scripts/verifyModelParity.js                         → pass again
+//   (sibling backend working tree behind origin/main and/or dirty on
+//    models/Ad.js — the 2026-08-25 false-failure shape)
+//   node scripts/verifyModelParity.js                         → still pass,
+//     prints "info: comparing backend origin/main <sha>; working tree HEAD
+//     <sha> is ignored" and does not FAIL Ad.js for titlingAttempts /
+//     titlingNeeded (those fields exist on origin/main)
 
 const fs = require('fs');
+const os = require('os');
 const path = require('path');
 const Module = require('module');
+const { spawnSync } = require('child_process');
 const { resolveBackendRoot } = require('./lib/siblingBackend');
+const { isGitRepo, resolveRefSha } = require('./lib/vendorDrift');
 
 const ROOT = path.join(__dirname, '..');
 const ADGEN_MODELS_DIR = path.join(ROOT, 'src', 'models');
@@ -108,6 +137,114 @@ function check(label, fn) {
 
 function info(label) {
   infos.push(label);
+}
+
+// ---------------------------------------------------------------------------
+// Backend origin/main extract. Same rule as verifyVendorDrift: pin to the
+// remote-tracking trunk so a dirty/behind shared checkout cannot
+// masquerade as "what backend has shipped". ADGEN_BACKEND_REF overrides.
+// Media.js also lazy-requires ../services/mediaInsightsService inside a
+// post('save') hook that captureSchema never fires, so it is not extracted.
+// ---------------------------------------------------------------------------
+
+const EXTRA_ARCHIVE_PATHS = [
+  'services/platformFormats.js', // models/AiCanvasArtifact.js load-time require
+  'utils/titleNormalize.js',     // models/CatalogProduct.js load-time require
+];
+
+let backendExtractDir = null;
+
+function cleanupBackendExtract() {
+  if (!backendExtractDir) return;
+  try { fs.rmSync(backendExtractDir, { recursive: true, force: true }); } catch (e) { /* ignore */ }
+  backendExtractDir = null;
+}
+process.on('exit', cleanupBackendExtract);
+
+function gitEnv() {
+  // git -C must win. Inherited GIT_DIR/GIT_WORK_TREE (hooks, rebase --exec)
+  // point at THIS repo and make `git -C $backend archive origin/main` miss.
+  const env = Object.assign({}, process.env);
+  delete env.GIT_DIR;
+  delete env.GIT_WORK_TREE;
+  delete env.GIT_COMMON_DIR;
+  delete env.GIT_INDEX_FILE;
+  return env;
+}
+
+function shortSha(sha) {
+  return sha ? String(sha).slice(0, 8) : '(none)';
+}
+
+function resolveParityBackendRef(backendRoot) {
+  if (process.env.ADGEN_BACKEND_REF) return process.env.ADGEN_BACKEND_REF;
+  if (!isGitRepo(backendRoot)) return null;
+  if (resolveRefSha(backendRoot, 'origin/main')) return 'origin/main';
+  return null;
+}
+
+function extractBackendRefToTemp(backendRoot, ref) {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'verifyModelParity-'));
+  const archive = spawnSync(
+    'git',
+    ['-C', backendRoot, 'archive', '--format=tar', ref, '--', 'models', ...EXTRA_ARCHIVE_PATHS],
+    { encoding: 'buffer', maxBuffer: 32 * 1024 * 1024, env: gitEnv() }
+  );
+  if (archive.status !== 0 || !archive.stdout || archive.stdout.length === 0) {
+    try { fs.rmSync(tmp, { recursive: true, force: true }); } catch (e) { /* ignore */ }
+    return null;
+  }
+  const tarPath = path.join(tmp, 'backend.tar');
+  try {
+    fs.writeFileSync(tarPath, archive.stdout);
+    const extracted = spawnSync('tar', ['-xf', tarPath, '-C', tmp]);
+    try { fs.unlinkSync(tarPath); } catch (e) { /* ignore */ }
+    if (extracted.status !== 0) {
+      try { fs.rmSync(tmp, { recursive: true, force: true }); } catch (e) { /* ignore */ }
+      return null;
+    }
+  } catch (err) {
+    try { fs.rmSync(tmp, { recursive: true, force: true }); } catch (e) { /* ignore */ }
+    return null;
+  }
+  // Extracted copies live under os.tmpdir(), which has no node_modules.
+  // Bare require('mongoose') from those files therefore misses normal
+  // lookup and hits the process-wide Module._load patch installed by
+  // loadMongooseWithFallback (candidateDir = BACKEND_ROOT/node_modules).
+  // Relative requires stay inside this tree. Do not set NODE_PATH — that
+  // would make the patch's first origLoad succeed from the wrong place
+  // and break schema capture (see this file's NODE_MODULES header).
+  return tmp;
+}
+
+function prepareBackendModelsDir() {
+  const fallback = path.join(BACKEND_ROOT, 'models');
+  const ref = resolveParityBackendRef(BACKEND_ROOT);
+  if (!ref) {
+    info('backend origin/main not found — comparing the working tree');
+    return fallback;
+  }
+  const extracted = extractBackendRefToTemp(BACKEND_ROOT, ref);
+  if (!extracted) {
+    info(`backend ${ref} archive failed — comparing the working tree`);
+    return fallback;
+  }
+  backendExtractDir = extracted;
+  const modelsDir = path.join(extracted, 'models');
+  if (!fs.existsSync(modelsDir)) {
+    info(`backend ${ref} extract had no models/ — comparing the working tree`);
+    cleanupBackendExtract();
+    return fallback;
+  }
+  const backendHead = resolveRefSha(BACKEND_ROOT, ref);
+  const workingTreeHead = isGitRepo(BACKEND_ROOT) ? resolveRefSha(BACKEND_ROOT, 'HEAD') : null;
+  if (backendHead && workingTreeHead && backendHead !== workingTreeHead) {
+    info(
+      `comparing backend ${ref} ${shortSha(backendHead)}; ` +
+      `working tree HEAD ${shortSha(workingTreeHead)} is ignored`
+    );
+  }
+  return modelsDir;
 }
 
 // ---------------------------------------------------------------------------
@@ -221,8 +358,9 @@ function main() {
     return;
   }
 
-  const backendModelsDir = path.join(BACKEND_ROOT, 'models');
-  const files = fs.readdirSync(ADGEN_MODELS_DIR).filter((f) => f.endsWith('.js')).sort();
+  try {
+    const backendModelsDir = prepareBackendModelsDir();
+    const files = fs.readdirSync(ADGEN_MODELS_DIR).filter((f) => f.endsWith('.js')).sort();
 
   for (const f of files) {
     const adgenPath = path.join(ADGEN_MODELS_DIR, f);
@@ -266,9 +404,13 @@ function main() {
   if (failures.length) {
     console.log(`\n❌ verifyModelParity: ${failures.length} of ${total} model(s) FAILED`);
     for (const f of failures) console.log(`   • ${f}`);
-    process.exit(1);
+    process.exitCode = 1;
+    return;
   }
   console.log(`\n✅ verifyModelParity: ${total}/${total} model(s) passed`);
+  } finally {
+    cleanupBackendExtract();
+  }
 }
 
 main();
