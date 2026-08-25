@@ -290,6 +290,46 @@ function resolveQcModel() {
 }
 
 /**
+ * Pure geometric containment check: does the composited LOGO rect sit
+ * entirely inside the declared safe box? Both are computed by the SAME
+ * rendering code (directImageRenderService.js's logoPlacementFor / the
+ * caller's safeBoxInDeliveredPx) — there is no vision estimation involved on
+ * either side. This is what replaces asking the vision model to eyeball the
+ * logo's position under layout_safe_box (2026-08-24 false-positive fix; see
+ * buildVisionUserContent's logoGeometrySection).
+ *
+ * `logoRect`: {left, top, width, height} — logoPlacementFor's return shape,
+ * or null/undefined when no logo was composited.
+ * `safeBox`: {left, top, right, bottom} — safeBoxInDeliveredPx's return shape.
+ *
+ * Returns null when there is nothing to check (no rect, or no box). Otherwise
+ * `{ rect: {left,top,right,bottom}, withinSafeBox, margin: {left,top,right,bottom} }`.
+ * A negative margin on any side means that side is OUTSIDE the box.
+ */
+function computeLogoGeometry(logoRect, safeBox) {
+  if (!logoRect || !safeBox) return null;
+  if (!(Number.isFinite(logoRect.left) && Number.isFinite(logoRect.top)
+    && Number.isFinite(logoRect.width) && Number.isFinite(logoRect.height))) {
+    return null;
+  }
+  const right = logoRect.left + logoRect.width;
+  const bottom = logoRect.top + logoRect.height;
+  const margin = {
+    left: logoRect.left - (safeBox.left ?? 0),
+    top: logoRect.top - (safeBox.top ?? 0),
+    right: (safeBox.right ?? 0) - right,
+    bottom: (safeBox.bottom ?? 0) - bottom
+  };
+  const withinSafeBox = margin.left >= 0 && margin.top >= 0
+    && margin.right >= 0 && margin.bottom >= 0;
+  return {
+    rect: { left: logoRect.left, top: logoRect.top, right, bottom },
+    withinSafeBox,
+    margin
+  };
+}
+
+/**
  * Build the multimodal user content: labelled text + TWO images.
  * Image order is fixed: [0]=ORIGINAL PRODUCT, [1]=GENERATED AD.
  * Follows aiCreativeDirectorService.js:1208-1212 convention
@@ -310,7 +350,8 @@ function buildVisionUserContent({
   safeBox,
   deliveryDims,
   expectedText,
-  expectedTextUnknown = false
+  expectedTextUnknown = false,
+  logoGeometry = null
 }) {
   if (!originalProductUrl) throw new Error('adVisionQc: originalProductUrl required');
   if (!renderUrl) throw new Error('adVisionQc: renderUrl required');
@@ -318,6 +359,56 @@ function buildVisionUserContent({
   const brand = brandName || 'the advertiser';
   const box = safeBox || {};
   const dims = deliveryDims || {};
+
+  // WHY THIS EXISTS (2026-08-24): logoPlacementFor composites the brand
+  // logomark at an EXACT, CODE-COMPUTED rectangle — not something the model
+  // has to guess. Measured against real production renders that a vision
+  // pass rejected for "logo outside the safe box": the compositor's own
+  // numbers put the mark 15-38px inside every declared edge, and the
+  // model's stated "position" in its findings was routinely just the safe
+  // box's own boundary number restated back, not an independent pixel
+  // read — the tell that it was guessing from the coordinates in the
+  // prompt rather than looking. Asking a vision model to re-derive by eye
+  // a rectangle the renderer already knows exactly is strictly worse than
+  // telling it the fact, so this section states the measured rectangle and
+  // instructs the model NOT to re-litigate the logo's position under
+  // layout_safe_box. This does not touch VIDEO's layout_safe_box prompt
+  // (buildVideoVisionUserContent below) — that category means something
+  // different there (framing/visibility, no fixed box) and was never the
+  // source of this false-positive class.
+  let logoGeometrySection;
+  if (logoGeometry && logoGeometry.rect) {
+    const r = logoGeometry.rect;
+    if (logoGeometry.withinSafeBox) {
+      const tightest = Math.min(
+        logoGeometry.margin.left, logoGeometry.margin.top,
+        logoGeometry.margin.right, logoGeometry.margin.bottom
+      );
+      logoGeometrySection =
+        `${brand}'s composited corner LOGO was placed by the RENDERING CODE (not the ` +
+        `image model) at rect left=${r.left}, top=${r.top}, right=${r.right}, bottom=${r.bottom}. ` +
+        `This has been verified by direct pixel computation to sit strictly inside the safe ` +
+        `box above, with at least ${tightest}px of margin on its tightest side. TRUST THIS ` +
+        `MEASURED FACT over your own visual estimate of the logo's location — do NOT flag ` +
+        `this logo's POSITION under layout_safe_box, even if it looks close to an edge to ` +
+        `you. (You may still flag the logo elsewhere — competitor_marks or product_fidelity — ` +
+        `for a WRONG or DISTORTED mark; this note is about position only.)`;
+    } else {
+      // Defensive branch, not expected to fire given how logoPlacementFor is
+      // constructed today — but if it ever does, the code itself is telling
+      // you there is a real breach, so do not soften this into a maybe.
+      logoGeometrySection =
+        `${brand}'s composited corner LOGO was placed by the RENDERING CODE at rect ` +
+        `left=${r.left}, top=${r.top}, right=${r.right}, bottom=${r.bottom}, which the ` +
+        `rendering code itself has computed to EXTEND OUTSIDE the safe box above. Treat this ` +
+        `as a CONFIRMED layout_safe_box breach for the logo.`;
+    }
+  } else {
+    logoGeometrySection =
+      `No brand logo rectangle was measured for this render (none was composited, or its ` +
+      `placement was not tracked). If you see a logo-like mark, judge it under ` +
+      `competitor_marks / product_fidelity, not layout_safe_box.`;
+  }
 
   let expectedTextSection;
   let textDefectsInstruction;
@@ -384,9 +475,10 @@ CATEGORIES
    ${textDefectsInstruction}
 
 4. layout_safe_box
-   Any text, CTA, or logo that breaches the declared safe box numbers above,
-   or a CTA that is clipped at the canvas edge. Use the pixel numbers — do
-   not invent a different safe region.
+   Any TEXT or CTA that breaches the declared safe box numbers above, or is
+   clipped at the canvas edge. Use the pixel numbers — do not invent a
+   different safe region.
+   ${logoGeometrySection}
 
 JSON SHAPE (no prose outside it):
 {
@@ -1081,6 +1173,7 @@ async function judgeRender({
   deliveryDims,
   expectedText,
   expectedTextUnknown = false,
+  logoGeometry = null,
   brandId = null,
   productId = null,
   adId = null,
@@ -1096,7 +1189,8 @@ async function judgeRender({
     safeBox,
     deliveryDims,
     expectedText,
-    expectedTextUnknown
+    expectedTextUnknown,
+    logoGeometry
   });
 
   // ── MONEY: billable vision LLM call ──────────────────────────────
@@ -1198,7 +1292,10 @@ function buildPersistedVerdict({
       renderUrl: a.renderUrl || null,
       discarded: !!a.discarded,
       discardedRenderUrl: a.discarded ? (a.renderUrl || null) : null,
-      imageGeneration: a.imageGeneration || null
+      imageGeneration: a.imageGeneration || null,
+      // Code-computed logo-vs-safe-box fact handed to the judge for this
+      // attempt (null when no logo was composited). See computeLogoGeometry.
+      logoGeometry: a.logoGeometry || null
     }))
   };
 }
@@ -1488,6 +1585,11 @@ async function runPostRenderQc({
     }
 
     const visionRenderUrl = persistedUrl || renderUrl;
+    // Code-computed logo geometry for THIS attempt's own composited plate
+    // (a regeneration re-runs finishPlate, so each attempt gets its own
+    // rect) — see computeLogoGeometry's header for why this replaces asking
+    // vision to estimate the logo's position.
+    const logoGeometry = computeLogoGeometry(output.logoRect, safeBox);
     // ── MONEY: billable vision LLM call ────────────────────────────
     //
     // THROW vs GARBLED VERDICT — deliberate distinction (money + fidelity):
@@ -1512,6 +1614,7 @@ async function runPostRenderQc({
         deliveryDims,
         expectedText,
         expectedTextUnknown,
+        logoGeometry,
         brandId,
         productId,
         adId,
@@ -1547,7 +1650,11 @@ async function runPostRenderQc({
       summary: verdict.summary,
       renderUrl: persistedUrl || null,
       discarded: false,
-      imageGeneration: output.imageGeneration || null
+      imageGeneration: output.imageGeneration || null,
+      // Code-verified fact handed to the judge for THIS attempt — kept for
+      // audit so a report can show the geometry was actually measured, not
+      // just claimed. Null when no logo was composited on this attempt.
+      logoGeometry
     });
 
     if (verdict.pass) {
@@ -2346,6 +2453,7 @@ module.exports = {
   warnQcDisabledOnce,
   // Pure helpers
   buildVisionUserContent,
+  computeLogoGeometry,
   parseVerdict,
   buildCorrectiveNote,
   buildPersistedVerdict,

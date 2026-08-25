@@ -2112,6 +2112,12 @@ async function finishPlate({ rawFrame, built, dims, genSize, surface, adId, logo
   // reserve — the brand's logomark, on the one surface where it was invisible.
   // The box is square — see logoResizeBox. Wide wordmarks still bind on width.
   const layers = [];
+  // The exact composited logo rectangle, in delivered pixels — set only when
+  // a logo is actually placed. Returned below so the vision-QC call site can
+  // hand the JUDGE this code-computed fact instead of asking it to estimate
+  // the logo's position by eye (2026-08-24 false-positive fix — see
+  // adVisionQcService.computeLogoGeometry).
+  let composedLogoRect = null;
   const logo = await optionalImage(logoUrl);
   if (logo) {
     try {
@@ -2181,6 +2187,7 @@ async function finishPlate({ rawFrame, built, dims, genSize, surface, adId, logo
           console.warn(`   ⚠️  direct-image: logo colour/monochrome resolution skipped (${err.message}) — using original asset`);
         }
         layers.push({ input: toPlace, top: place.top, left: place.left });
+        composedLogoRect = { top: place.top, left: place.left, width: place.width, height: place.height };
       } else {
         const msg = `no room for the logo inside ${surface}'s content rect — ad ships without logo`;
         console.warn(`   ⚠️  direct-image: ${msg}`);
@@ -2202,7 +2209,10 @@ async function finishPlate({ rawFrame, built, dims, genSize, surface, adId, logo
     buffer: layers.length
       ? await sharp(rendered).composite(layers).png().toBuffer()
       : rendered,
-    logoComposited: layers.length > 0
+    logoComposited: layers.length > 0,
+    // Null whenever no logo was composited (fetch failed, no room in the
+    // content rect, or no logoUrl at all) — never fabricated.
+    logoRect: composedLogoRect
   };
 }
 
@@ -2793,6 +2803,10 @@ async function renderDirectImage(callArgs = {}) {
   const firstOutput = {
     buffer, contentType: 'image/png', width: dims.width, height: dims.height,
     bytes: buffer.length, kind: 'image', directImage: true,
+    // The exact composited logo rect (or null) — carried through so
+    // adVisionQcService can hand the vision judge a code-verified fact for
+    // layout_safe_box instead of asking it to estimate the logo's position.
+    logoRect: plate.logoRect || null,
     // Verbatim audit of the image-model request, built at submit time inside
     // atlasImageService. Persisted onto the Ad so the inspector never has to
     // re-derive what "should" have been sent.
