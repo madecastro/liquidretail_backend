@@ -49,6 +49,7 @@ const { adStage } = require('./adStage');
 const { renderBrandScriptAndSave, qcAndStampVideoAd } = require('./brandScriptExecutor');
 const { classifyRunAdOutcome, buildRunReconciliationUpdate } = require('./campaignRunGuards');
 const { startRunHeartbeat } = require('./campaignRunHeartbeat');
+const { renderQueueStats } = require('./remotionRenderService');
 
 const HEARTBEAT_MS = 30_000;
 const SHUTDOWN_DRAIN_MS = 25_000;
@@ -483,6 +484,42 @@ async function processAd(ad) {
   }
 }
 
+// ── Remotion backpressure ─────────────────────────────────────────────────
+// The Remotion queue in remotionRenderService.js caps ACTIVE Chrome renders
+// at REMOTION_QUEUE_CONCURRENCY (default 2 on 8 GB). Claims that arrive
+// beyond that ceiling sit in an IN-PROCESS waiter — and while they wait,
+// they are pinned to THIS titler instance's state.inFlight, so sibling
+// instances (which have their own idle Chrome slots) cannot claim them.
+//
+// Head-of-line pin, measured 2026-08-25 on run_1787697069901: one titler
+// held 4/16 while three others sat at 0/16 for 5+ minutes on a queue of
+// ~15 handed-off ads. MAX_INFLIGHT=4 (env change, same run) narrows the
+// hoard but does not eliminate it; this check is the precise gate.
+//
+// The rule: pause claiming when (active + waiting) is already at
+// concurrency + SLACK. SLACK=1 permits ONE local pipeline waiter so that
+// fetch/prep on the next ad can overlap with the current renders — a
+// slot freeing then hands off to the waiter instantly, no wasted Chrome
+// idle. Anything more than SLACK=1 is head-of-line waste that a sibling
+// could pick up.
+//
+// Fail-open: any exception reading the queue means DON'T backpressure.
+// A telemetry failure must never block productive claim work.
+const REMOTION_BACKPRESSURE_SLACK = 1;
+
+function shouldSkipForBackpressure() {
+  try {
+    const stats = renderQueueStats();
+    if (!stats || !Number.isFinite(stats.concurrency)) return false;
+    const active = Number(stats.active) || 0;
+    const waiting = Number(stats.waiting) || 0;
+    return (active + waiting) >= (stats.concurrency + REMOTION_BACKPRESSURE_SLACK);
+  } catch (err) {
+    // Fail-open — a broken stats getter must NEVER stop the titler.
+    return false;
+  }
+}
+
 // ── poll ──────────────────────────────────────────────────────────────────
 async function pollTick() {
   if (state.shuttingDown) return;
@@ -491,6 +528,12 @@ async function pollTick() {
 
   try {
     while (!state.shuttingDown && state.inFlight.size < MAX_INFLIGHT) {
+      // Backpressure: stop claiming if THIS instance's Remotion queue is
+      // already saturated. The check must run INSIDE the loop, not just at
+      // entry — during a burst-claim tick, each successful claim mutates
+      // the queue state (its enqueue() increments active or waiting), so a
+      // once-per-tick check would still overshoot.
+      if (shouldSkipForBackpressure()) break;
       const ad = await claimOne();
       if (!ad) break;
       // Unawaited — burst-claim, process concurrently.
@@ -547,4 +590,12 @@ async function shutdown() {
   await Promise.all(remaining.map((id) => releaseClaim(id, 'sigterm-drain-timeout')));
 }
 
-module.exports = { run, shutdown };
+module.exports = {
+  run,
+  shutdown,
+  // Exported for scripts/verifyTitlerBackpressure.js — the harness stubs
+  // renderQueueStats and asserts skip vs claim behavior across the
+  // 6 quadrants of (active, waiting) space.
+  shouldSkipForBackpressure,
+  REMOTION_BACKPRESSURE_SLACK
+};
