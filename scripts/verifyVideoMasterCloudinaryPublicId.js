@@ -14,8 +14,9 @@
 //   stamps renderUrl/posterUrl — grep confirms it never writes any
 //   cloudinaryPublicId-shaped key — so this field means "the raw master",
 //   for the life of the ad, never "the titled render". Backend's identical
-//   write (routes/ads.js:2970,3004) puts this same value under the
-//   SCHEMA-DECLARED path `cloudinaryPublicId`. adgen's copy of this write
+//   write (grep `cloudinaryPublicId` in liquidretail_backend/routes/ads.js —
+//   line numbers drift there, not pinned here) puts this same value under
+//   the SCHEMA-DECLARED path `cloudinaryPublicId`. adgen's copy of this write
 //   used the name `veoCloudinaryPublicId` instead — not a path in EITHER
 //   repo's models/Ad.js — so Mongoose strict mode silently dropped it on
 //   every write, no error, ever. Every adgen-rendered video master lost its
@@ -201,7 +202,7 @@ function main() {
       'This harness needs to be re-pointed, not silently skipped.'
     );
   } else {
-    const { keys } = extracted;
+    const { keys, members } = extracted;
 
     check('$setMaster maps the video master to the literal key `cloudinaryPublicId`', () => {
       if (!keys.includes('cloudinaryPublicId')) {
@@ -224,16 +225,22 @@ function main() {
     });
 
     check('$setMaster actually reads veoResult.cloudinaryPublicId as its source value', () => {
-      // Re-slice the raw body so we can confirm the VALUE side, not just the
-      // key name — a fix that renamed the key but pointed it at the wrong
-      // source (e.g. a titled-render URL that doesn't exist yet at this
-      // point in renderVideo()) would pass the two checks above and still
-      // be wrong.
-      const body = rendererSrc.slice(extracted.bodyStart + 1, extracted.bodyEnd);
-      if (!/cloudinaryPublicId\s*:\s*veoResult\.cloudinaryPublicId/.test(body)) {
+      // Test ONLY the `cloudinaryPublicId` member's own value text, not the
+      // whole object body — a whole-body regex would also match a stale
+      // comment, a commented-out old assignment, or a decoy value sitting on
+      // a DIFFERENT key, and pass without the real key actually being
+      // sourced correctly (flagged by an adversarial review pass — see
+      // sourceLiteralScan.js's `members` doc comment). A fix that renamed the
+      // key but pointed it at the wrong source (e.g. a titled-render URL
+      // that doesn't exist yet at this point in renderVideo()) must still
+      // fail this check.
+      const idx = keys.indexOf('cloudinaryPublicId');
+      const ownMember = idx === -1 ? '' : members[idx];
+      if (!/^\s*cloudinaryPublicId\s*:\s*veoResult\.cloudinaryPublicId\b/.test(ownMember)) {
         throw new Error(
           '$setMaster.cloudinaryPublicId is not sourced from veoResult.cloudinaryPublicId ' +
-          '— confirm the raw master\'s Cloudinary id is still what gets persisted'
+          `(own member text: ${JSON.stringify(ownMember.trim().slice(0, 120))}) — confirm the ` +
+          'raw master\'s Cloudinary id is still what gets persisted'
         );
       }
     });

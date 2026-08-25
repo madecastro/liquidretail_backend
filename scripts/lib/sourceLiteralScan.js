@@ -121,9 +121,14 @@ function memberTopLevelKey(member) {
 }
 
 // Top-level convenience: find `declRegex` in `src` (must match up to and
-// including the opening `{`), then return { keys, bodyStart, bodyEnd } —
-// keys is the array of top-level (depth-0) key names in that object
-// literal, spreads excluded.
+// including the opening `{`), then return { keys, members, bodyStart,
+// bodyEnd } — keys is the array of top-level (depth-0) key names in that
+// object literal (spreads excluded); members is the parallel array of each
+// key's own raw `key: value` source slice, so a caller can inspect ONE
+// key's value (e.g. with a regex) without that regex being able to match
+// against a different member's text or a comment elsewhere in the body —
+// scanning the whole body for a value-shaped regex is exactly the
+// unanchored-match risk a member-scoped check avoids.
 function extractTopLevelKeysAfter(src, declRegex) {
   const m = declRegex.exec(src);
   if (!m) return null;
@@ -134,10 +139,16 @@ function extractTopLevelKeysAfter(src, declRegex) {
   const closeIdx = findMatchingBrace(src, braceIdx);
   if (closeIdx === -1) return null;
   const body = src.slice(braceIdx + 1, closeIdx);
-  const keys = splitTopLevelMembers(body)
-    .map(memberTopLevelKey)
-    .filter((k) => k !== null);
-  return { keys, bodyStart: braceIdx, bodyEnd: closeIdx };
+  const rawMembers = splitTopLevelMembers(body);
+  const keys = [];
+  const members = [];
+  for (const member of rawMembers) {
+    const key = memberTopLevelKey(member);
+    if (key === null) continue;
+    keys.push(key);
+    members.push(member);
+  }
+  return { keys, members, bodyStart: braceIdx, bodyEnd: closeIdx };
 }
 
 module.exports = {
