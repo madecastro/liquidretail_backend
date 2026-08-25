@@ -24,6 +24,7 @@
 //   add status:'queued' anywhere                    → T6  (MONEY)
 //   query renderStage instead of titlingResumeState → G1/G2
 //   remove the declaration from models/Ad.js        → G3  (silent-drop trap)
+//   remove titlingAttempts from models/Ad.js        → G3c/G3d (adgen schema-parity)
 //   drop the migration arm                          → T16
 //   drop the updatedAt bound from the claim filter   → T14
 //   move the claim after the render                  → T8
@@ -146,6 +147,17 @@ checkTrue('G3 Ad.titlingResumeState is DECLARED in models/Ad.js (Mongoose strict
   const Ad = require('../models/Ad');
   checkTrue('G3b Ad schema resolves the titlingResumeState path at runtime',
     !!Ad.schema.path('titlingResumeState'));
+  // adgen $incs this counter on every titling failure and shares it with the
+  // resume path. This repo does not read or write it; the declaration exists
+  // so a backend save() cannot silently drop adgen's value (same Mongoose-
+  // strict trap as G3). Type + default must match adgen's copy exactly.
+  checkTrue('G3c Ad.titlingAttempts is DECLARED in models/Ad.js (adgen writes it; mongoose silent-drop otherwise)',
+    /titlingAttempts:\s*\{[^}]*type:\s*Number/.test(MODEL_CODE));
+  const titlingAttemptsPath = Ad.schema.path('titlingAttempts');
+  checkTrue('G3d Ad schema resolves titlingAttempts at runtime with Number / default 0 (matches adgen)',
+    !!titlingAttemptsPath
+    && titlingAttemptsPath.instance === 'Number'
+    && titlingAttemptsPath.defaultValue === 0);
 }
 
 // ── T4: recovered-branch $set writes the viewable fields + state ─────
