@@ -82,18 +82,43 @@
  *      (the desensitisation regression this change almost shipped)
  *   9. change REFERENCE_BAND_H away from 0.13             -> G1/G3 fail
  *  10. revert plateIntelService entirely                  -> A/B/C/D/F/G fail
+ *
+ * GROUPS H/I/J — THE SECOND GAP, closed after this harness first shipped.
+ * A-G above pin that bandsFor/bandRect/applyFaceKeepOut are surface-aware
+ * PURE FUNCTIONS, and that remotionRenderService.renderTitles forwards
+ * whatever safeZoneKey it is GIVEN down to analyzePlate/applyFaceKeepOut
+ * (E1/E2). None of that pins that anything ever GIVES renderTitles a real
+ * key. It didn't: both call sites in brandScriptExecutor.js had
+ * `platformFormat` in scope and passed it straight through, but never
+ * computed `safeZoneKey` at all — so renderTitles's `safeZoneKey = null`
+ * default is what every real render used, `bandsFor(null)` returned BANDS
+ * every time, and groups A-G were all GREEN throughout because they test the
+ * pure functions directly with hand-picked keys, never through the real call
+ * site. This is the exact double no-op that motivated H/I/J: A-G stayed
+ * green even with brandScriptExecutor.js never having computed a
+ * safeZoneKey at all — the fix from PR #307 never fired on a single
+ * production render.
+ *
+ * MUTATIONS THAT MUST FAIL H/I/J SPECIFICALLY
+ *  11. resolveSafeZoneKeyCjs's PMAX map drifts from the real ESM one -> H1/H2 fail
+ *  12. brandScriptExecutor.js's call site drops `safeZoneKey` (either
+ *      renderTitles({...}) block, or both)                -> I1 fails
+ *  13. brandScriptExecutor.js keeps the token but hardcodes
+ *      `safeZoneKey: null` / never assigns it from the resolver -> I2 fails
+ *  14. the resolver+bandsFor chain stops producing per-surface bands for a
+ *      real (format, platformFormat) pair reachable in production -> J1 fails
  */
 import assert from 'node:assert';
 import fs from 'node:fs';
 import path from 'node:path';
 import { createRequire } from 'node:module';
 import { fileURLToPath } from 'node:url';
-import { SAFE_ZONES, PMAX_VIDEO_SAFE_ZONE_KEY, ANCHOR_TOP } from '../remotion/lib/safeZones.js';
+import { SAFE_ZONES, PMAX_VIDEO_SAFE_ZONE_KEY, ANCHOR_TOP, resolveSafeZoneKey } from '../remotion/lib/safeZones.js';
 
 const require = createRequire(import.meta.url);
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const plateIntel = require('../services/plateIntelService');
-const { bandsFor, BANDS, bandRect, SURFACE_INSETS } = plateIntel;
+const { bandsFor, BANDS, bandRect, SURFACE_INSETS, resolveSafeZoneKeyCjs, PMAX_VIDEO_SAFE_ZONE_KEY_CJS } = plateIntel;
 
 let checks = 0;
 const ok = (label, fn) => {
@@ -318,6 +343,135 @@ ok('F2 the untested region is now zero on every mirrored surface', () => {
     const gap = r4((1 - SAFE_ZONES[k].bottom) - bandsFor(k).bottom[1]);
     assert.strictEqual(gap, 0, `${k}: ${gap} of frame height below the strip is still untested`);
   }
+});
+
+// ── H. THE RESOLVER. resolveSafeZoneKeyCjs (services/plateIntelService.js)
+//    is a MIRROR of the real ESM resolveSafeZoneKey, not an import (same
+//    CJS/ESM-island reason SURFACE_INSETS mirrors SAFE_ZONES). Drift between
+//    the two mappings is exactly the failure mode this task exists to guard
+//    against — pin agreement in BOTH directions against the REAL source, not
+//    a copy-pasted expectation list.
+ok('H1 CJS resolver agrees with the real ESM resolver for every REAL PMAX_VIDEO_SAFE_ZONE_KEY entry', () => {
+  // Iterates the ESM map itself (imported, not re-typed) so a FUTURE entry
+  // added only on the ESM side is caught automatically — no hardcoded list
+  // to fall out of date.
+  for (const [pf, expectedKey] of Object.entries(PMAX_VIDEO_SAFE_ZONE_KEY)) {
+    const esm = resolveSafeZoneKey({ platformFormat: pf });
+    const cjs = resolveSafeZoneKeyCjs({ platformFormat: pf });
+    assert.strictEqual(esm, expectedKey, `sanity: ESM resolver disagrees with its own map for ${pf}`);
+    assert.strictEqual(cjs, esm, `DRIFT: resolveSafeZoneKeyCjs(${pf}) = "${cjs}", real resolveSafeZoneKey = "${esm}"`);
+  }
+});
+
+ok('H2 CJS resolver mirror has the SAME key set as the real ESM map (no stale/extra entries either direction)', () => {
+  const esmKeys = Object.keys(PMAX_VIDEO_SAFE_ZONE_KEY).sort();
+  const cjsKeys = Object.keys(PMAX_VIDEO_SAFE_ZONE_KEY_CJS).sort();
+  assert.deepStrictEqual(cjsKeys, esmKeys,
+    `mirror key set drifted from the real map: cjs=[${cjsKeys}] esm=[${esmKeys}]`);
+});
+
+ok('H3 CJS resolver agrees with ESM on every canvas format (no platformFormat) and on absent/unknown', () => {
+  for (const format of ['vertical', 'feed', 'square', 'landscape', undefined, null, 'not-a-real-format']) {
+    for (const platformFormat of [undefined, null, '', 'not_a_real_platform_format']) {
+      const esm = resolveSafeZoneKey({ format, platformFormat });
+      const cjs = resolveSafeZoneKeyCjs({ format, platformFormat });
+      assert.strictEqual(cjs, esm,
+        `DRIFT at format=${format} platformFormat=${platformFormat}: cjs="${cjs}" esm="${esm}"`);
+    }
+  }
+});
+
+ok('H4 case/whitespace handling matches (resolver lowercases + trims platformFormat)', () => {
+  for (const pf of ['  META_STORIES_9_16  ', 'Pmax_Video_1_1']) {
+    assert.strictEqual(resolveSafeZoneKeyCjs({ platformFormat: pf }), resolveSafeZoneKey({ platformFormat: pf }),
+      `case/whitespace handling drifted for "${pf}"`);
+  }
+});
+
+// ── I. THE CALL SITE. The pure resolver + bandsFor chain is worthless if
+//    nothing at the real render call site invokes it. THIS is the check that
+//    would have caught the original #307 gap — it fails on source text that
+//    has bandsFor/bandRect fully wired (groups A-G green) but no caller ever
+//    computing a real safeZoneKey, which is exactly the state this repo
+//    shipped and merged.
+ok('I1 brandScriptExecutor.js passes safeZoneKey on BOTH renderTitles call sites', () => {
+  const src = fs.readFileSync(path.join(ROOT, 'services/brandScriptExecutor.js'), 'utf8');
+  const callSites = [...src.matchAll(/renderTitles\(\{/g)];
+  assert.ok(callSites.length >= 2, `expected >=2 renderTitles({...}) call sites, found ${callSites.length}`);
+  for (const m of callSites) {
+    const start = m.index;
+    const end = src.indexOf('\n  }', start); // each call is a top-level arg object; closing brace is deep-indented
+    const block = src.slice(start, end > start ? end : start + 600);
+    assert.match(block, /\bsafeZoneKey\b/,
+      `renderTitles({...}) call at offset ${start} has no safeZoneKey — the #307 fix cannot fire from this call site`);
+  }
+});
+
+ok('I2 safeZoneKey is assigned from resolveSafeZoneKeyCjs, not a bare null/undefined literal', () => {
+  const src = fs.readFileSync(path.join(ROOT, 'services/brandScriptExecutor.js'), 'utf8');
+  assert.match(src, /const\s+safeZoneKey\s*=\s*resolveSafeZoneKeyCjs\(\s*\{\s*format\s*,\s*platformFormat\s*\}\s*\)/,
+    'safeZoneKey must be assigned from resolveSafeZoneKeyCjs({format, platformFormat}) — a decoy `safeZoneKey: null` would satisfy a naive presence check');
+  assert.doesNotMatch(src, /safeZoneKey\s*:\s*null\b/,
+    'found a hardcoded `safeZoneKey: null` — this is exactly the shape of the original inert call site');
+});
+
+ok('I3 resolveSafeZoneKeyCjs is actually imported from plateIntelService in brandScriptExecutor.js', () => {
+  const src = fs.readFileSync(path.join(ROOT, 'services/brandScriptExecutor.js'), 'utf8');
+  assert.match(src, /require\(['"]\.\/plateIntelService['"]\)/, 'plateIntelService must be required');
+  const reqLine = src.split('\n').find((l) => l.includes("require('./plateIntelService')"));
+  assert.match(reqLine || '', /resolveSafeZoneKeyCjs/,
+    'resolveSafeZoneKeyCjs must be destructured off the plateIntelService require, or the call site throws ReferenceError at runtime');
+});
+
+// ── J. END-TO-END BEHAVIOURAL PROOF. Execute the real resolver -> bandsFor
+//    chain for the (format, platformFormat) pairs an actual Ad document
+//    carries in production, and show the strip actually widens for the four
+//    named-defective surfaces and stays byte-identical for the rest. This is
+//    "execute the function", not "read the source and argue about it".
+const REAL_AD_SHAPES = [
+  { label: 'meta_stories_9_16 -> stories',   format: 'vertical', platformFormat: 'meta_stories_9_16', expectKey: 'stories',   expectChanged: true },
+  { label: 'pmax_video_1_1 -> squareYt',     format: 'square',   platformFormat: 'pmax_video_1_1',     expectKey: 'squareYt',  expectChanged: true },
+  { label: 'meta_feed_4_5 -> feed',          format: 'feed',     platformFormat: 'meta_feed_4_5',      expectKey: 'feed',      expectChanged: true },
+  { label: 'meta_feed_1_1 -> square',        format: 'square',   platformFormat: 'meta_feed_1_1',      expectKey: 'square',   expectChanged: true },
+  { label: 'meta_reels_9_16 -> reels',       format: 'vertical', platformFormat: 'meta_reels_9_16',    expectKey: 'reels',     expectChanged: false },
+  { label: 'pmax_video_9_16 -> verticalYt',  format: 'vertical', platformFormat: 'pmax_video_9_16',    expectKey: 'verticalYt', expectChanged: false },
+  { label: 'meta_video_9_16 master -> vertical (no platformFormat mapping)', format: 'vertical', platformFormat: 'meta_video_9_16', expectKey: 'vertical', expectChanged: false },
+];
+
+ok('J1 real Ad (format, platformFormat) shapes resolve to a non-null key and bandsFor widens exactly the 4 defective surfaces', () => {
+  for (const { label, format, platformFormat, expectKey, expectChanged } of REAL_AD_SHAPES) {
+    const key = resolveSafeZoneKeyCjs({ format, platformFormat });
+    assert.ok(key, `${label}: resolver returned falsy key`);
+    assert.strictEqual(key, expectKey, `${label}: resolved "${key}", expected "${expectKey}"`);
+    const bands = bandsFor(key);
+    const changed = j(bands) !== j(BANDS);
+    assert.strictEqual(changed, expectChanged,
+      `${label}: bandsFor("${key}") changed=${changed}, expected ${expectChanged} (bottom=${j(bands.bottom)} vs BANDS.bottom=${j(BANDS.bottom)})`);
+  }
+});
+
+ok('J2 an ad whose platformFormat is null (legacy row / no PMax mapping) still resolves to a real, non-inverted key', () => {
+  // Mirrors a pre-platformFormat-stamping legacy Ad row: format is whatever
+  // classifyFormat emitted, platformFormat was never backfilled.
+  for (const format of ['vertical', 'feed', 'square', 'landscape']) {
+    const key = resolveSafeZoneKeyCjs({ format, platformFormat: null });
+    assert.strictEqual(key, format, `legacy row with format="${format}" must resolve to itself, got "${key}"`);
+    const bands = bandsFor(key);
+    assert.ok(bands.bottom[1] > bands.bottom[0], `${format}: legacy-row key produced an inverted strip`);
+  }
+});
+
+ok('J3 a genuinely unrecognised (format, platformFormat) pair still fails closed to "feed", never to an inverted or garbage key', () => {
+  const key = resolveSafeZoneKeyCjs({ format: 'not-a-format', platformFormat: 'not-a-platform-format' });
+  assert.strictEqual(key, 'feed', 'must fail closed to feed, matching the real ESM resolver');
+  const bands = bandsFor(key);
+  assert.ok(bands.bottom[1] > bands.bottom[0], 'feed fallback must not itself be an inverted strip');
+  // And bandsFor's OWN independent fallback (this resolver can never actually
+  // trigger it, since it always returns a valid SURFACE_INSETS key — but the
+  // contract must still hold if bandsFor is ever called directly with real
+  // garbage, e.g. from a stale cached job payload).
+  assert.strictEqual(j(bandsFor('totally-bogus-key')), j(BANDS),
+    'bandsFor must still fall back to BANDS verbatim on a key with no SURFACE_INSETS entry at all');
 });
 
 if (process.exitCode) {

@@ -1268,6 +1268,23 @@ Video never launches a browser.
   `1024x1024` default, which would square a 4:5 surface and then crop it.
   `2048x1152` needed no probe — it is an enum member.
 - **Static logo vs QC box — FLUSH-TO-BOX is a layout_safe_box fail (2026-08-24).** The mark is Sharp-composited (`finishPlate` → `logoPlacementFor`), not model-placed. Placement used to align the mark's right/bottom TO the QC-declared `safeBoxInDeliveredPx` (0px remaining on those edges on every live surface). Vision QC is handed those same numbers and treats on-the-line as a breach — 14 of 21 QC failures tonight, two-thirds of all static fails, at double cost (regen then still fail). The square `logoResizeBox` (#321) did not create a negative margin the 0.35-tall box lacked; it made stacked lockups ~2.8× taller so more ink sat on the line. Inset is 2% of the short edge (floor 8px); the square box is unchanged. Pinned by `scripts/verifyLogoSafeBox.js`. Full write-up: `session.d/2026-08-24_logo-safe-box-flush.md`. **Port to adgen** — adgen owns the live render path; this worktree does not.
+- **PR #307's surface-aware titling bands NEVER FIRED on any render — fixed
+  2026-08-24, do not re-diagnose the `layout_safe_box` QC failures as unfixed.**
+  `bandsFor(safeZoneKey)` shipped correct and inert: both `brandScriptExecutor.js`
+  `renderTitles({...})` call sites had `platformFormat` in scope and never
+  computed a `safeZoneKey` from it, so `bandsFor` always got `undefined` and fell
+  back to the pre-fix `BANDS` literal on every real render — the video-QC
+  investigation's root cause was still live after #307 merged. Fixed by
+  `resolveSafeZoneKeyCjs` (CJS mirror of `remotion/lib/safeZones.js`
+  `resolveSafeZoneKey`, next to `SURFACE_INSETS` in `plateIntelService.js`),
+  called once in `brandScriptExecutor.js` and forwarded to both call sites.
+  New harness groups H/I/J in `scripts/verifyKeepOutBandGeometry.mjs` are what
+  would have caught this — the original A-G groups test `bandsFor`/`bandRect`
+  directly with hand-picked keys and stayed green the whole time the real call
+  site supplied nothing. Full write-up:
+  `session.d/2026-08-24_wire-safezonekey-titling.md`. **Same gap exists in
+  adgen** (PR #54 ported #307's plumbing faithfully, inheriting it) — see that
+  repo's own fix.
 - **`queued` leftovers no longer sit forever.** Same-day drain is still an
   explicit `/runs` ("Generate more") claim. After `QUEUED_ARCHIVE_AFTER_H`
   (default 24) a leftover whose minting run is terminal moves to
