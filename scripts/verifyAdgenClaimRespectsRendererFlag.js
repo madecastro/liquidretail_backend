@@ -134,11 +134,21 @@ check('A4 titler.js imports isAdgenRendererEnabled from ../config', () => {
 function makeAtomicCollection(seedDocs) {
   const store = seedDocs.map((d) => ({ ...d }));
   let calls = 0;
+  // Minimal Mongo query-operator support for the offline stub. status can be
+  // either a scalar (renderer.claimOne) or {$in:[...]} (titler.claimOne after
+  // the 2026-08-25 master-status fix — masters emerge from
+  // atlasVideoService.generateForAd already stamped 'draft').
+  const statusMatches = (docStatus, filterStatus) => {
+    if (filterStatus == null) return true;
+    if (typeof filterStatus === 'string') return docStatus === filterStatus;
+    if (filterStatus.$in && Array.isArray(filterStatus.$in)) return filterStatus.$in.includes(docStatus);
+    return false;
+  };
   return {
     findOneAndUpdate(filter, update, opts = {}) {
       calls++;
       const candidates = store.filter((d) =>
-        d.status === filter.status &&
+        statusMatches(d.status, filter.status) &&
         (filter.claimedByWorker === null ? d.claimedByWorker === null : true)
       );
       const match = candidates[0];

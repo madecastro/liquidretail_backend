@@ -1620,6 +1620,19 @@ function reframeClaimPath(aspectKey) {
   return `metadata.reframes.${aspectKey}`;
 }
 
+// In-process registry of reframe claims THIS process currently holds. Every
+// win pushes an entry; every release (finally block or explicit call from
+// SIGTERM handler) removes it. Used by releaseAllActiveReframeClaims() to
+// evict Mongo state cleanly on graceful shutdown so peer renderers don't
+// wait ~6 minutes for the 15-minute lease to expire.
+//
+// MEASURED 2026-08-25 (run_1787677348712_e426912d): the old renderer died
+// mid-reframe on SIGKILL after drain timeout; the new renderer's loser then
+// polled ~26 attempts (sum(1..26) = 351s = 5m51s) before falling back to
+// crop. That single stall added ~350s to the master's total wall clock.
+// Ports the pattern from renderer.js's own SIGTERM claim-release path.
+const _activeReframeClaims = new Set();
+
 // Atomic try-claim. Returns true only when THIS process holds the lease.
 // Fail-CLOSED on Mongo errors: crop instead of risking a double POST.
 async function tryClaimReframe(mediaId, aspectKey, claimBy) {
@@ -1669,13 +1682,47 @@ async function tryClaimReframe(mediaId, aspectKey, claimBy) {
       },
       { new: true }
     );
-    return !!doc;
+    if (doc) {
+      // Register so releaseAllActiveReframeClaims() can evict on SIGTERM. Set
+      // key is the (mediaId, aspectKey, claimBy) triple as a JSON string —
+      // the same identity the release call uses. The finally block in
+      // reframeReferenceForAspect removes the entry on normal completion; a
+      // process death before that finally leaves it here for the shutdown
+      // sweep to catch.
+      _activeReframeClaims.add(JSON.stringify({ m: String(mediaId), a: aspectKey, b: claimBy }));
+      return true;
+    }
+    return false;
   } catch (err) {
     console.error(
       `❌ reframe claim acquire failed (fail-closed, no spend) — ${err.message}`
     );
     return false;
   }
+}
+
+// Called by the renderer's SIGTERM handler to evict every reframe claim
+// THIS process holds. Peer renderers see the entry disappear on their next
+// waitForReframeUrl poll (line ~1749: "winner released without a result —
+// cropping now") and immediately fall back to crop instead of waiting the
+// full ~6 minute claim-loser attempt budget. Never throws; failures are
+// logged but a shutdown must proceed.
+async function releaseAllActiveReframeClaims() {
+  const claims = [..._activeReframeClaims];
+  if (!claims.length) return 0;
+  let cleared = 0;
+  for (const key of claims) {
+    try {
+      const { m, a, b } = JSON.parse(key);
+      await releaseReframeClaim(m, a, b);
+      cleared++;
+    } catch (err) {
+      console.warn(`⚠️  releaseAllActiveReframeClaims: ${err.message}`);
+    } finally {
+      _activeReframeClaims.delete(key);
+    }
+  }
+  return cleared;
 }
 
 // Release OUR claim so a later render can retry. Two shapes, and picking the
@@ -1687,6 +1734,9 @@ async function tryClaimReframe(mediaId, aspectKey, claimBy) {
 // neither can clobber a freshly persisted result (persist replaces the whole
 // entry, which drops `.claim` and makes claim.by stop matching).
 async function releaseReframeClaim(mediaId, aspectKey, claimBy) {
+  // Deregister from the in-process active-claims set FIRST so a concurrent
+  // SIGTERM sweep doesn't try to release the same claim twice.
+  _activeReframeClaims.delete(JSON.stringify({ m: String(mediaId), a: aspectKey, b: claimBy }));
   const path = reframeClaimPath(aspectKey);
   const emptyUrl = [
     { [`${path}.url`]: { $exists: false } },
@@ -4763,5 +4813,9 @@ module.exports = {
   // Timeout-vs-real-failure decision, and the shared failure-error builder —
   // both offline-testable. scripts/verifyVideoTimeoutReconcile.js.
   resolveTimeoutOutcome,
-  buildClassifiedFailureError
+  buildClassifiedFailureError,
+  // SIGTERM sweep for renderer.shutdown — evicts every reframe claim this
+  // process currently holds so peer renderers don't wait ~6min on the TTL
+  // when we die mid-reframe.
+  releaseAllActiveReframeClaims
 };

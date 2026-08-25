@@ -2002,6 +2002,24 @@ async function shutdown() {
   } else {
     console.log(`renderer[${WORKER_ID}] clean drain in ${drainedMs}ms — no forced release needed`);
   }
+
+  // Evict any reframe claims THIS process still holds. Without this, a
+  // peer renderer that races us on the same media+aspect polls for ~6min
+  // (26 attempts × 1s..26s backoff) before giving up and cropping.
+  // MEASURED 2026-08-25: this single stall added ~350s to the master's
+  // total wall clock on run_1787677348712_e426912d. Release is safe here
+  // — atlasVideoService.releaseAllActiveReframeClaims() only touches
+  // claim-only entries (no url yet). A billed reframe already persisted
+  // its URL and the claim is gone from the registry, so this can never
+  // steal a paid asset. Failures are logged but never block shutdown.
+  try {
+    const cleared = await atlasVideo.releaseAllActiveReframeClaims();
+    if (cleared > 0) {
+      console.log(`renderer[${WORKER_ID}] released ${cleared} reframe claim(s) so peers can proceed immediately`);
+    }
+  } catch (err) {
+    console.warn(`renderer[${WORKER_ID}] reframe-claim release-on-shutdown failed: ${err.message}`);
+  }
 }
 
 module.exports = { run, shutdown };
