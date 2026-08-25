@@ -174,10 +174,31 @@ const MAP = Object.freeze({
   // line away and deliberately NOT added: the owner named a three-link order,
   // and every extra link raises the worst-case paid-attempt count.
   'director':         {
-    atlas: 'anthropic/claude-sonnet-5', direct: { provider: 'anthropic', model: 'claude-sonnet-5' },
+    // ANTHROPIC DIRECT TWIN TEMPORARILY DISABLED (2026-08-25).
+    // Reason: no ANTHROPIC_API_KEY on either Render service (WEB
+    // srv-d1vuktqli9vc73ft07ng: 24 vars, WORKER srv-d8128c1o3t8c73e8kb30:
+    // 15 vars, no anthropic among them). Every Director round was logging
+    // TWO `[LLM_AUTH_MISSING] role=director provider=anthropic` lines
+    // before advancing to the next Atlas link — pure log noise, no
+    // functional effect (the transport skips a keyless direct twin for
+    // free, 0.0s, no request). Silencing the noise so the real signals
+    // (Atlas 429s, chain advancement) stand out.
+    //
+    // ⚠️ TURN BACK ON WHEN ANTHROPIC_API_KEY LANDS on Render env.
+    //    Replace the two `direct: null` entries below with the twins
+    //    (still preserved verbatim in the comment block above each) and
+    //    delete this note. See docs/turn-on-anthropic-direct.md for the
+    //    exact restoration steps + expected latency win (~50s per
+    //    Director round in the current Atlas-Anthropic-starved state).
+    //
+    // The OpenAI direct twin on the terra link is UNTOUCHED — that one
+    // has a key on Render (OPENAI_API_KEY is set) and is a real fallback.
+    atlas: 'anthropic/claude-sonnet-5', direct: null,
     chain: [
-      { atlas: 'anthropic/claude-sonnet-5', direct: { provider: 'anthropic', model: 'claude-sonnet-5' } },
-      { atlas: 'anthropic/claude-opus-5',   direct: { provider: 'anthropic', model: 'claude-opus-5'   } },
+      // { atlas: 'anthropic/claude-sonnet-5', direct: { provider: 'anthropic', model: 'claude-sonnet-5' } },
+      { atlas: 'anthropic/claude-sonnet-5', direct: null },
+      // { atlas: 'anthropic/claude-opus-5',   direct: { provider: 'anthropic', model: 'claude-opus-5'   } },
+      { atlas: 'anthropic/claude-opus-5',   direct: null },
       { atlas: 'openai/gpt-5.6-terra',      direct: { provider: 'openai',    model: 'gpt-4.1'         } },
     ],
   },
