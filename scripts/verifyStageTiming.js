@@ -71,8 +71,12 @@ check('D2: write is NEVER awaited (fire-and-forget)',
   !/await\s+Ad\.updateOne/.test(src));
 check('D3: owner-scoped filter includes claimedByWorker: WORKER_ID',
   /claimedByWorker:\s*WORKER_ID/.test(src));
-check('D4: only writes renderStages.<stage> — never bulk-overwrites the field',
-  /renderStages\.\$\{stage\}|\[`renderStages\.\$\{stage\}`\]/.test(src));
+check('D4: uses aggregation pipeline with $mergeObjects (coalesces null parent to {} atomically)',
+  /\$mergeObjects/.test(src) && /\$ifNull:\s*\['\$renderStages',\s*\{\s*\}\s*\]/.test(src));
+check('D5: merges INTO renderStages — the parent-object write, not a nested-key write',
+  /renderStages:\s*\{\s*\$mergeObjects/.test(src));
+check('D6: stage name is the merge target key (not hardcoded)',
+  /\[stage\]:\s*Math\.round\(n\)/.test(src));
 
 // ── E. Whitelist is enforced at the SET boundary, not just the getter ──
 // If someone deletes the KNOWN_STAGES.has() gate, B2 must fail.

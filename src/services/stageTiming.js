@@ -62,10 +62,28 @@ function stampStageTiming(adId, stage, ms) {
   if (!KNOWN_STAGES.has(stage)) return;
   const n = Number(ms);
   if (!Number.isFinite(n) || n < 0) return;
-  // Use $set on the nested key. Mixed-type field means no schema pushback.
+  // Aggregation pipeline update so the write is atomic AND coalesces the
+  // null-parent case. Ad.renderStages defaults to `null` (models/Ad.js's
+  // field declaration), and Mongo REJECTS a nested $set on a null parent
+  // with 'Cannot create field X in element {renderStages: null}' — the
+  // silent failure caught on run_1787778351659 where 12/12 ads showed
+  // renderStages:null after every stamp attempt. `$ifNull` converts null
+  // to `{}`, `$mergeObjects` preserves any pre-existing sub-fields, and
+  // the single-document write cannot race.
   Ad.updateOne(
     { _id: adId, claimedByWorker: WORKER_ID },
-    { $set: { [`renderStages.${stage}`]: Math.round(n) } }
+    [
+      {
+        $set: {
+          renderStages: {
+            $mergeObjects: [
+              { $ifNull: ['$renderStages', {}] },
+              { [stage]: Math.round(n) }
+            ]
+          }
+        }
+      }
+    ]
   ).catch(() => {
     // Deliberately silent — telemetry must not surface as an error on the
     // paid path. Log-noise is worse than a missing datapoint.
