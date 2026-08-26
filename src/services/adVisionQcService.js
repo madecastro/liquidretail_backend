@@ -1550,6 +1550,17 @@ async function runPostRenderQc({
     throw new Error('adVisionQc.runPostRenderQc: generate() required');
   }
 
+  // Time-to-verdict stamp on Ad.renderStages.visionQcMs. Includes ALL
+  // vision LLM calls (attempt 1 + optional regen), the intermediate
+  // generate() re-submit if a regen fires, and the terminal stamps.
+  // Fire-and-forget via startStageTimer. Answers "how much of static wall
+  // time is vision QC" without a log-diving session — direct signal for
+  // Phase 4 QC-model swap experiments.
+  const stopVisionQcTimer = (adId
+    ? require('./stageTiming').startStageTimer('visionQcMs')
+    : null);
+  const stampVisionQc = () => { try { if (stopVisionQcTimer) stopVisionQcTimer(adId); } catch (e) { /* fire-and-forget */ } };
+
   // Resolve the STATIC gate once per run. Explicit boolean wins; otherwise
   // the async SystemConfig → env → false cascade. Never throws.
   const qcEnabled = (typeof enabled === 'boolean')
@@ -1572,6 +1583,7 @@ async function runPostRenderQc({
       `   🔍 adVisionQc: ad=${adId || '-'} gate=OFF — skip vision, one generation, zero regen`
     );
     const output = await generate({ attempt: 1, correctiveNote: null });
+    stampVisionQc();
     return {
       ok: true,
       skipped: true,
@@ -1685,6 +1697,7 @@ async function runPostRenderQc({
       );
       // Do NOT increment visionCallCount — the call did not complete.
       // Do NOT call generate() again — regeneration budget is for bad images.
+      stampVisionQc();
       return {
         ok: true,
         skipped: true,
@@ -1725,6 +1738,7 @@ async function runPostRenderQc({
         willRegenerate: false,
         terminal: true
       });
+      stampVisionQc();
       return {
         ok: true,
         skipped: false,
@@ -1775,6 +1789,7 @@ async function runPostRenderQc({
   }
 
   // Double (or single-with-no-regen) failure — never call generate again.
+  stampVisionQc();
   return {
     ok: false,
     skipped: false,
