@@ -42,6 +42,10 @@ const { uploadBufferToCloudinary, deleteFromCloudinary } = require('./cloudinary
 const { recordFlatCost, finalizeFlatCost, reconcileCost } = require('./costTracker');
 const referenceDefaultsService  = require('./referenceDefaultsService');
 const { adStage, formatElapsed, noteRenderIssue } = require('./adStage');
+// Slack visibility ONLY for the existing not-chargeable auto-retry in
+// generateForAd (buildNotChargeableRetryAlert). Does not change the retry
+// decision. notifyAsync never throws — see alertService.js's own contract.
+const alerts = require('./alertService');
 const {
   buildVeoPrompt,
   aspectRatioForPlatformFormat,
@@ -3338,6 +3342,102 @@ function mayRetryAfterFailure({ policyRetryable, chargeConfirmed, attempt, maxAt
 }
 
 /**
+ * Slack payload for the moment generateForAd is ABOUT to resubmit after
+ * mayRetryAfterFailure() returned true. This function does not decide
+ * anything and does not widen any retry class — it only narrates a decision
+ * the existing predictionFailed policy (commit 76a7740, 2026-08-21) already
+ * made, so ops can see the retry-and-often-fail cycle in Slack.
+ *
+ * Extracted as a pure function — same pattern as submitRetryDecision /
+ * resolveTimeoutOutcome in this file — so scripts/verifyNotChargeableRetryAlert.js
+ * can assert the payload without mocking alertService/Slack.
+ *
+ * `key` dedupes on policy+provider-message, NOT on ad id — deliberately
+ * mirrors renderer.js's `video-failed:${msg.slice(0,60)}` convention. A
+ * single Atlas-side fault clipping many masters should fold into one Slack
+ * message with a "+N more (suppressed)" tail, not one alert per ad.
+ *
+ * Always a master here: renderVideo returns/throws inside `if (deriveFromFmt)`
+ * before the single generateForAd call, so a derive never reaches this retry
+ * branch. This builder does not inspect Ad.deriveFromMaster (that field is a
+ * platformFormat STRING KEY, not an ad id).
+ *
+ * @param {object}  ad             the Mongoose Ad doc (or lean object) being retried
+ * @param {string}  model          resolved Atlas model id for this render
+ * @param {string}  aspectRatio    resolved render aspect (e.g. '9:16')
+ * @param {?string} platformFormat Ad.platformFormat (e.g. 'meta_stories_9_16')
+ * @param {?string} campaignRunId  the CampaignRun.runId driving this render pass
+ * @param {string}  predictionId   the FAILED attempt's Atlas prediction id
+ * @param {?string} atlasPolicy    err.atlasPolicy from buildClassifiedFailureError
+ * @param {?string} providerMsg    err.providerMessage — Atlas's own, undecorated error text
+ * @param {number}  attempt        the attempt number that just failed (1-based)
+ * @param {number}  maxAttempts    the policy's ceiling for this failure class
+ * @param {number}  backoffMs      delay before the next submit, already computed by the caller
+ */
+function buildNotChargeableRetryAlert({
+  ad, model, aspectRatio, platformFormat, campaignRunId, predictionId,
+  atlasPolicy, providerMsg, attempt, maxAttempts, backoffMs
+}) {
+  const adDoc = ad || {};
+  const adId = adDoc._id != null ? String(adDoc._id) : 'unknown';
+  const fmt = platformFormat || adDoc.platformFormat || null;
+  const nextAttempt = Number(attempt) + 1;
+  const max = Number(maxAttempts) || 1;
+  const isFinalRetry = nextAttempt >= max;
+  const backoffSec = Math.round((Number(backoffMs) || 0) / 1000);
+  const remainingAfterThis = max - nextAttempt;
+  const outcomeNote = isFinalRetry
+    ? `This is the LAST retry the policy allows (attempt ${nextAttempt}/${max}). ` +
+      'If it fails again, generateForAd throws and the caller marks the ad failed; ' +
+      'the CostLog row for this prediction is finalized at $0 because Atlas confirmed no charge.'
+    : remainingAfterThis === 1
+      ? '1 more automatic retry remains after this one if it fails again.'
+      : `${remainingAfterThis} more automatic retries remain after this one if it fails again.`;
+
+  return {
+    level: 'warn',
+    title: 'Video generation auto-retried after a confirmed-unbilled Atlas failure',
+    detail:
+      'Atlas settled this prediction as failed and its own record confirms NO price was charged ' +
+      '(price absent on a settled failure — the same signal the failure-path CostLog reconcile ' +
+      'already trusts). generateForAd is resubmitting via the EXISTING mayRetryAfterFailure() ' +
+      'gate (atlasErrorPolicy `predictionFailed`, max 3 attempts, added 2026-08-21). This alert is ' +
+      'Slack visibility on that unchanged decision — it does not add or widen any retry policy.\n\n' +
+      `Provider error (verbatim): "${providerMsg || 'unknown'}"\n` +
+      `Failure class: ${atlasPolicy || 'unknown'}\n` +
+      `Failed prediction: ${predictionId || 'unknown'}\n` +
+      `Model: ${model || 'unknown'}\n` +
+      `Aspect ratio: ${aspectRatio || 'unknown'}\n` +
+      `Platform format: ${fmt || 'unknown'}\n` +
+      `Ad: ${adId}\n` +
+      `Retrying after a ${backoffSec}s backoff (resubmitting as attempt ${nextAttempt}/${max}; ` +
+      `the attempt that just failed was ${attempt}/${max}).\n\n` +
+      'This is a paid video MASTER. generateForAd is unreachable for derive ads — those inherit ' +
+      'the sibling master\'s URL and never submit. Sibling derive ads that inherit from this master ' +
+      'stay blocked until it resolves; if retries exhaust, those free derives fail with it ' +
+      '("sibling master failed — cannot derive").\n\n' +
+      `${outcomeNote}\n\n` +
+      'If this keeps firing for the SAME provider message across many ads/brands, that points at an ' +
+      'Atlas-side degradation, not this brand or product\'s content — check Atlas status before ' +
+      'assuming the creative is at fault.',
+    fields: {
+      ad:             adId,
+      run:            campaignRunId || null,
+      predictionId:   predictionId || null,
+      model:          model || null,
+      platformFormat: fmt,
+      aspectRatio:    aspectRatio || null,
+      scenario:       'master',
+      policy:         atlasPolicy || 'unknown',
+      attempt:        `${nextAttempt}/${max}`,
+      backoff:        `${backoffSec}s`,
+      error:          String(providerMsg || '').slice(0, 200)
+    },
+    key: `video-retry-not-chargeable:${atlasPolicy || 'unknown'}:${String(providerMsg || '').slice(0, 60)}`
+  };
+}
+
+/**
  * MAY WE SKIP THE SUBMIT AND RESUME INSTEAD? Isolated from the render flow
  * for the same reason mayRetryAfterFailure is: this one boolean is the
  * difference between collecting a paid master for free and double-billing it.
@@ -3888,6 +3988,11 @@ function buildClassifiedFailureError(predictionId, status, data) {
   // from the policy: the policy says what SHOULD happen, the price says what
   // DID. generateForAd requires both to agree before it spends again.
   err.predictionId    = predictionId;
+  // Raw provider text, undecorated by the "atlasVideo: prediction failed:"
+  // heading or the "(id=...)" suffix baked into err.message above — kept
+  // separately so a caller building a human-facing alert (Slack) can quote
+  // Atlas's own words without re-parsing err.message's formatted string.
+  err.providerMessage = providerMsg;
   err.policyRetryable = policy.retryable === true;
   err.policyMaxAttempts = policy.maxAttempts || 1;
   // The policy owns the wait between attempts. Carried here because
@@ -4725,6 +4830,20 @@ async function generateForAd({
         `   ↻ atlasVideo[ad=${ad._id}]: ${err.atlasPolicy} on ${predictionId} and Atlas confirms NO charge ` +
         `— resubmitting (attempt ${attempt + 1}/${maxAttempts}) after ${Math.round(backoffMs / 1000)}s`
       );
+      // Slack visibility ONLY — the retry decision above is unchanged
+      // (mayRetryAfterFailure, commit 76a7740). Never allowed to affect the
+      // retry itself. Always a master here: renderVideo returns/throws inside
+      // if (deriveFromFmt) before generateForAd is reachable for a derive.
+      try {
+        alerts.notifyAsync(buildNotChargeableRetryAlert({
+          ad, model, aspectRatio, platformFormat: ad.platformFormat, campaignRunId, predictionId,
+          atlasPolicy: err.atlasPolicy,
+          providerMsg: err.providerMessage,
+          attempt, maxAttempts, backoffMs
+        }));
+      } catch (alertErr) {
+        console.warn(`   ⚠️  atlasVideo: not-chargeable-retry alert build failed (${alertErr.message})`);
+      }
       await new Promise((r) => setTimeout(r, backoffMs));
     }
   }
@@ -4890,6 +5009,10 @@ module.exports = {
   generateForAd,
   // exposed for verify harnesses (Claude-5-era provider-fault retry gate)
   mayRetryAfterFailure,
+  // Slack payload for the not-chargeable auto-retry path — pure, so
+  // scripts/verifyNotChargeableRetryAlert.js can assert its shape without
+  // mocking alertService/Slack.
+  buildNotChargeableRetryAlert,
   // Resume-vs-submit money gate for generateForAd's attempt loop — exported
   // for scripts/verifyVideoResumeFromReceipt.js so the decision is tested
   // directly rather than through a mocked Atlas call.
