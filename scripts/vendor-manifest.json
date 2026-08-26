@@ -2,13 +2,13 @@
   "version": 1,
   "backendRef": "origin/main",
   "backendHead": "a1df77e95159ea70653d26cfe59e3dece6e52d7f",
-  "generatedAt": "2026-08-26T23:20:37.078Z",
+  "generatedAt": "2026-08-26T23:37:44.933Z",
   "files": {
     "models/Ad.js": {
-      "backendHash": "959aebff9a2620a7c4ab63f98d38909d355cc208f7f3a33a16b085d507fa0e37",
-      "backendSha": "17099f472c305680c0122a923318832c9d7ca12b",
+      "backendHash": "4caa2896cc4a2dcd56f5ccb4ba73c37d9675c9c4f59993f235befbc1b0d6672e",
+      "backendSha": "a1df77e95159ea70653d26cfe59e3dece6e52d7f",
       "status": "fork",
-      "reason": "fork — comment-only divergence plus titlingNeeded. adgen documents the AD_VISION_QC_ENABLED env fallback its systemConfigService still honours; backend retired that fallback and its comment. titlingNeeded is now declared on BOTH sides (backend #332) so a backend save() cannot silently drop adgen's Phase 3 titler handoff flag and strand an already-paid video master — Mongoose strict mode discards undeclared paths with no error, the same way this repo previously lost renderError.predictionId."
+      "reason": "fork — comment-only plus pre-existing schema-doc divergence. adgen documents the AD_VISION_QC_ENABLED env fallback its systemConfigService still honours; backend retired that fallback and its comment. regenerationRequest/regenerateClaimedByWorker/regenerateClaimedAt now exist on both sides (backend #345). adgen's schema comment documents the live claim filter as regenerationRequest:{$type:'object'} (Mongo $ne:null matches absent fields and was the double-claim bug); backend #345 still documents {$ne:null} in models/Ad.js. titlingNeeded declared on both sides (backend #332). Reconciled after #345 merged to origin/main."
     },
     "models/Advertiser.js": {
       "backendHash": "0a7e1bb9ca5e0fbbfc6972f9c96d87f839b0a86175831b5446ae27095137ba3f",
@@ -401,10 +401,10 @@
       "reason": "unused in adgen — the readiness gate runs on backend routes (campaigns create / ads generate), nothing under adgen/src requires it. Re-attested after backend #340, which REMOVED the catalog-detect-not-started blocker: catalog detect is deferred (CATALOG_DETECT_PRECOMPUTE=false) and the only creator of a catalog DetectRun runs inside the request the gate was refusing, so it deadlocked every brand onboarded after deferral. If this copy is ever wired up in adgen, port that fix first — this vendored copy predates it."
     },
     "services/adRegenerateService.js": {
-      "backendHash": "2df1a9a2e034ebc99aa0d232f636294fde78cc3889b2e06662bcb89e0f09db18",
-      "backendSha": "69142a449cf667e1681d0d6e8827b19d9168db09",
-      "status": "unused",
-      "reason": "only reached from unused capability executor / backend regenerate HTTP"
+      "backendHash": "8a0512ba08a3f5543e9d9bed0430a9112de7796c361baad559c6b08414893a3e",
+      "backendSha": "a1df77e95159ea70653d26cfe59e3dece6e52d7f",
+      "status": "fork",
+      "reason": "load-bearing adgen fork of backend #345. services/regenerateConsumer.js (adgen-only) requires this file and calls runClaimedRegeneration to execute a regenerate the backend deferred here. Deliberately diverges: this copy has runClaimedRegeneration (backend does not need it) and regenerateAd() has NO shouldDeferToAdgen branch (adgen IS the claimed-work executor, never the deferrer). Reconciled after backend #345 merged to origin/main."
     },
     "services/adStage.js": {
       "backendHash": "437314029f1ff3ea5dcd35f68ba074c2fbc30fe20c38c706f72e9b3c4b66529b",

@@ -644,6 +644,121 @@ async function regenerateAd({
   }
 }
 
+// Ad-gen regenerate consumer entry point (routing fix, 2026-08-26). Backend's
+// regenerateAd(), when ADGEN_RENDERER_ENABLED is true, no longer executes a
+// regenerate itself — it wins the SAME `regenerating` atomic lock (unchanged
+// semantics) and additionally stamps the full call as Ad.regenerationRequest,
+// then returns. services/regenerateConsumer.js polls for exactly that shape
+// (regenerating:true, regenerationRequest non-null, unclaimed) and atomically
+// claims ONE row via its own findOneAndUpdate (regenerateClaimedByWorker) —
+// see that file for the claim query. By the time THIS function is called the
+// row is already locked AND claimed, so — unlike regenerateAd() above — it
+// does NOT re-acquire the `regenerating` lock; it just does the work and
+// calls markComplete on the way out.
+//
+// Deliberately NOT sharing an extracted helper with regenerateAd() above:
+// scripts/verifyVideoResumeFromReceipt.js C2 statically extracts
+// regenerateAd's own function body and asserts it reaches runVideoFull (and,
+// transitively, generateForAd({allowResume:false})) directly — an extra
+// indirection through a shared helper would defeat that check's call-graph
+// walk without weakening the actual invariant, which is not a trade worth
+// making for a few dozen duplicated lines. So this function calls
+// runVideoFull / runImage / markComplete directly too — same dispatch shape
+// as regenerateAd, same allowResume:false carve-out (inherited from
+// runVideoFull, unchanged), independently locatable if the two ever drift.
+async function runClaimedRegeneration(ad, req = {}) {
+  const adId      = String(ad._id);
+  const kind      = req.kind || ad.kind || 'image';
+  const prompt    = req.prompt || '';
+  const startedAt = Date.now();
+
+  // ── MONEY — re-check the two gates that can go stale while queued ──────
+  // preflight() already ran in the backend before the 202, but that used to
+  // be milliseconds before execution (setImmediate); on the deferred path
+  // it can now be minutes (this consumer polls every ~2s AND a video
+  // regenerate ahead of this one in the queue can occupy the worker for
+  // several minutes — see the file's own header on why there is no
+  // concurrency here). Two of preflight's four gates can genuinely change
+  // in that window and must be re-checked before spending money:
+  //   - metaSyncStatus can flip to 'synced' if the operator exports to Meta
+  //     while this request was queued — regenerating would silently
+  //     overwrite the now-canonical exported asset.
+  //   - derive-only status doesn't change on an existing ad, but is
+  //     cheap to re-check and the shared gate is the single source of
+  //     truth for "this ad has no generation of its own" — re-deriving it
+  //     here rather than trusting a queued decision costs nothing.
+  // already-regenerating and the daily cap do NOT need re-checking: the
+  // lock is still held (that's how we got claimed) and the cap was already
+  // consumed at lock time. Fails CLOSED — markComplete('failed'), no
+  // provider call — same shape as the original preflight 409s, just
+  // surfaced through regenerationHistory instead of an HTTP response
+  // (nobody is holding an open connection to return a 409 to).
+  const staleCheck = await Ad.findById(adId).select('metaSyncStatus platformFormat deriveFromMaster').lean();
+  if (staleCheck?.metaSyncStatus === 'synced') {
+    console.log(`🔀 regenerate-consumer[ad=${adId}]: refused at execute time — exported to Meta while queued`);
+    await markComplete(adId, {
+      status: 'failed', durationMs: Date.now() - startedAt,
+      error: 'Ad was exported to Meta while this regenerate was queued — regeneration refused (the synced version is canonical).'
+    });
+    return;
+  }
+  const derivedFrom = staleCheck ? resolveDeriveFromMaster(staleCheck) : null;
+  if (derivedFrom) {
+    console.log(`🔀 regenerate-consumer[ad=${adId}]: refused at execute time — derive-only (${derivedFrom})`);
+    await markComplete(adId, {
+      status: 'failed', durationMs: Date.now() - startedAt,
+      error: `This ad is derived from the already-paid ${derivedFrom} master (it has no generation of its own) — regenerate that master instead.`
+    });
+    return;
+  }
+
+  const { startRun, CancelledError } = require('./progressService');
+  const brandDoc = ad.brandId
+    ? await require('../models/Brand').findById(ad.brandId).select('advertiserId').lean().catch(() => null)
+    : null;
+  const progressRun = await startRun({
+    kind: 'ad-regenerate', advertiserId: brandDoc?.advertiserId, brandId: ad.brandId,
+    label: kind === 'video' ? 'Video ad regenerate' : 'Ad regenerate'
+  });
+
+  try {
+    if (kind === 'video') {
+      await runVideoFull(adId, prompt, progressRun, req.videoModel || null, {
+        videoPromptRaw:      req.videoPromptRaw || null,
+        videoPromptGuidance: req.videoPromptGuidance || null
+      });
+    } else {
+      const imagePromptRaw = req.imagePromptRaw || null;
+      const promptOverride = req.promptOverride || null;
+      if (imagePromptRaw && prompt.trim()) {
+        console.log(
+          `🔁 regenerate[ad=${adId}]: refinement IGNORED — imagePromptRaw replaces the whole prompt`
+        );
+      }
+      await runImage(adId, prompt, progressRun, imagePromptRaw || promptOverride);
+    }
+
+    const durationMs = Date.now() - startedAt;
+    await markComplete(adId, { status: 'done', durationMs });
+    try {
+      await progressRun.succeed({ durationMs });
+    } catch (progErr) {
+      console.warn(`🔁 regenerate[ad=${adId}]: progressRun.succeed failed (non-fatal) — ${progErr.message}`);
+    }
+    console.log(`🔁 regenerate[ad=${adId}]: done in ${Math.round(durationMs / 1000)}s`);
+  } catch (err) {
+    const durationMs = Date.now() - startedAt;
+    if (err instanceof CancelledError) {
+      console.log(`🔁 regenerate[ad=${adId}]: cancelled by operator after ${Math.round(durationMs / 1000)}s`);
+      await markComplete(adId, { status: 'failed', durationMs, error: 'cancelled by operator' });
+      return;
+    }
+    console.error(`❌ regenerate[ad=${adId}]: failed after ${Math.round(durationMs / 1000)}s — ${err.message}`);
+    await markComplete(adId, { status: 'failed', durationMs, error: err.message || String(err) });
+    await progressRun.fail(err);
+  }
+}
+
 // ── Per-mode workers ──────────────────────────────────────────────────
 
 // Load brand — one Media + one Brand lookup — with all fields the
@@ -1050,6 +1165,14 @@ async function markComplete(adId, { status, durationMs, error }) {
       $set: {
         regenerating:                          false,
         regenerationStage:                     null,
+        // Clear the adgen claim markers too (regenerationRequest is stamped
+        // by the BACKEND, never by this file — see runClaimedRegeneration's
+        // header — but clearing it here, alongside the claim fields, is what
+        // lets a future regenerate on this ad start clean instead of racing
+        // this row's now-stale claim).
+        regenerationRequest:                   null,
+        regenerateClaimedByWorker:              null,
+        regenerateClaimedAt:                   null,
         'regenerationHistory.$[e].status':     status,
         'regenerationHistory.$[e].durationMs': durationMs,
         'regenerationHistory.$[e].error':      error || null,
@@ -1087,5 +1210,8 @@ module.exports = {
   // Static regenerate raw prompt — pure helper + cap for the offline harness
   // (R5 in scripts/verifyRegeneration.js) and the route gate.
   IMAGE_PROMPT_RAW_MAX,
-  parseRegenImagePromptField
+  parseRegenImagePromptField,
+  // Ad-gen handoff (routing fix, 2026-08-26) — services/regenerateConsumer.js
+  // is the only real caller of runClaimedRegeneration.
+  runClaimedRegeneration
 };

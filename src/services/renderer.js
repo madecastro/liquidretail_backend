@@ -602,6 +602,7 @@ async function alertOrphanedClaimsOnBoot() {
 let stopping = false;
 let titlingResumeSweep = null;   // set by run(), stopped by shutdown()
 let bootRecoverySweep  = null;   // set by run(), stopped by shutdown()
+let regenerateConsumer = null;   // set by run(), stopped by shutdown()
 
 async function claimOne() {
   // GATED ON ADGEN_RENDERER_ENABLED, read HERE — not only by poll()'s
@@ -2015,6 +2016,12 @@ async function run() {
   }, 30_000).unref();
   titlingResumeSweep = startTitlingResumeSweep();
   bootRecoverySweep  = startBootRecoverySweep();
+  // Ad-gen regenerate consumer (routing fix, 2026-08-26) — see
+  // services/regenerateConsumer.js header for the full money argument.
+  // Own poll loop, own {stop()}, same lifecycle shape as the two sweeps
+  // above; not folded into poll()/claimOne() above because its claim
+  // filter is deliberately disjoint from the mint-time render claim.
+  regenerateConsumer = require('./regenerateConsumer').start();
 }
 
 // Graceful shutdown. Render fires SIGTERM ~30s before SIGKILL on deploy /
@@ -2038,12 +2045,25 @@ async function shutdown() {
   stopping = true;
   if (titlingResumeSweep) titlingResumeSweep.stop();
   if (bootRecoverySweep)  bootRecoverySweep.stop();
+  // regenerateConsumer.stop() is ASYNC — it runs its own internal drain
+  // (same SHUTDOWN_DRAIN_MS budget, read independently) and alerts if a
+  // regenerate is still in flight when that budget expires (see that
+  // file's header — a video regenerate can run for minutes, so this is a
+  // best-effort wait + loud flag, not a guarantee of a clean finish).
+  // Started here WITHOUT awaiting so it runs CONCURRENTLY with the
+  // mint-time drain loop below, not sequentially after it — otherwise a
+  // renderer instance doing both kinds of work could take up to 2x
+  // SHUTDOWN_DRAIN_MS to shut down. Awaited below, after that loop, so
+  // shutdown() as a whole does not proceed to release claims / disconnect
+  // Mongo until BOTH drains have had their full window.
+  const regenerateStopPromise = regenerateConsumer ? regenerateConsumer.stop() : Promise.resolve();
   const t0 = Date.now();
   console.log(`renderer[${WORKER_ID}] shutting down — inflight=${inFlight}, drain up to ${SHUTDOWN_DRAIN_MS}ms`);
   const deadline = t0 + SHUTDOWN_DRAIN_MS;
   while (inFlight > 0 && Date.now() < deadline) {
     await new Promise(r => setTimeout(r, 500));
   }
+  await regenerateStopPromise;
   const drainedMs = Date.now() - t0;
   if (inFlight > 0) {
     console.warn(`renderer[${WORKER_ID}] drain window elapsed (${drainedMs}ms), ${inFlight} still in flight — releasing claims for peer pickup`);
