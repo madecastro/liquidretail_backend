@@ -327,6 +327,71 @@ mongoose.connect(process.env.MONGODB_URI, {
   if (isLeader) startScheduler();
 }).catch(err => console.error('MongoDB error:', err));
 
+// ── STRANDED-CLAIM PAGE (2026-08-26) ─────────────────────────────────────
+// The reaper's classifyRunAdOutcome pass (below) correctly leaves a run
+// alone when it has real outstanding work — but has no way to tell "waiting
+// its turn behind a concurrency pool" from "permanently stuck because a
+// role the pipeline depends on stopped claiming". Measured incident: video
+// derives handed off with `titlingNeeded:true` (claim released) when the
+// titler service had ADGEN_TITLER_ENABLED=false sat forever — uncounted,
+// unalerted, indistinguishable from a run simply waiting its turn behind
+// VEO_CONCURRENCY. This scans the SAME claimed-ads the reaper already
+// fetched through the canonical phase function (services/adPhase.js — the
+// identical function the UI and Slack QC alerts use) and pages once any
+// come back 'stalled' — a phase whose own relevant timestamp hasn't moved
+// in DEFAULT_STALE_MINUTES, which a mere pool-wait cannot produce (a pool
+// wait still beats the heartbeat / bumps updatedAt — see
+// services/campaignRunHeartbeat.js). Generalizes past the titler flag
+// specifically: ANY handoff-style stranding (a role switched off, a service
+// down, a crashed worker the reaper hasn't caught yet) produces the
+// identical shape.
+//
+// Alerting only — no DB write — so this is a plain statement at its call
+// site, not an inline block: scripts/verifyRunStatusTruthfulness.js's E10
+// locates worker.js's `if (!outcome.isSettled) { ... }` guard with a
+// non-greedy brace match (`{([\s\S]*?)}`) that stops at the FIRST closing
+// brace, so any nested `{...}` written inline there truncates the captured
+// body before it reaches the real `continue` — a source-scanning
+// limitation, not a reason to weaken the harness. Keeping this as one
+// function call at the call site sidesteps it while keeping the actual
+// behavior (page, then always continue) identical.
+function alertIfClaimsStranded(runId, claimedAds, now) {
+  try {
+    const stalled = claimedAds
+      .map((ad) => ({ ad, phase: deriveAdPhase(ad, { now }) }))
+      .filter((x) => x.phase === 'stalled');
+    if (stalled.length === 0) return;
+    // Per-run dedup key — ALERT_DEDUPE_WINDOW_MIN (default 15m) already
+    // throttles a repeat page for the same run on every REAP_INTERVAL_MIN
+    // tick without needing a bespoke cooldown here.
+    alerts.notifyAsync({
+      level: 'error',
+      title: `Run stranded — ${stalled.length} claimed ad(s) stopped moving`,
+      key: `reaper:stalled-claim:${runId}`,
+      fields: {
+        runId,
+        'stalled ads': stalled.length,
+        'total claimed': claimedAds.length,
+        'stale threshold': `${DEFAULT_STALE_MINUTES}m`,
+        // Name the specific shape when every stalled ad shares one — the
+        // titler-off incident is common enough to call out by name rather
+        // than making an operator open the run to find it.
+        ...(stalled.every((x) => x.ad.titlingNeeded === true && !x.ad.claimedByWorker)
+          ? { 'likely cause': 'handed off for titling but never claimed — check the titler service is running and ADGEN_TITLER_ENABLED=true there' }
+          : {})
+      },
+      detail: stalled.slice(0, 10).map((x) => {
+        const prevPhase = x.ad.titlingNeeded === true && !x.ad.claimedByWorker ? 'awaiting-titler'
+          : (x.ad.deriveFromMaster && !x.ad.veoVideoUrl ? 'awaiting-master' : 'in-flight');
+        return `${x.ad._id}  stuck-in=${prevPhase}  claimed=${x.ad.claimedByWorker || 'no'}  ` +
+          `lastStage=${x.ad.renderStage || '(none)'}`;
+      }).join('\n')
+    });
+  } catch (err) {
+    console.warn(`⚠️  stalled-claim scan failed for run ${runId} (non-fatal): ${err.message}`);
+  }
+}
+
 // Sweep for orphaned in-flight docs. Cheap (3 indexed updateMany calls);
 // safe to run frequently. Logs only when something was reaped so a
 // healthy system doesn't fill logs with no-ops.
@@ -516,67 +581,22 @@ async function reapOrphans() {
     // silently treating every ad as "not stalled" the same way an
     // unselected `kind` used to silently defeat the titling check above.
     const claimedAds = await Ad.find({ campaignRunIds: candidate.runId })
-      .select('status kind renderUrl veoVideoUrl titlingResumeState renderStage renderStageAt ' +
-              'claimedByWorker claimedAt titlingNeeded deriveFromMaster visionQc renderError updatedAt')
+      .select('status kind renderUrl veoVideoUrl titlingResumeState renderStage renderStageAt claimedByWorker claimedAt titlingNeeded deriveFromMaster visionQc renderError updatedAt')
       .lean();
     const outcome = classifyRunAdOutcome(claimedAds);
     if (!outcome.isSettled) {
       nRunsDeferred++;
       if (outcome.titlingIncomplete > 0) nRunsDeferredTitling++;
-      // ── STRANDED-CLAIM PAGE (2026-08-26) ──────────────────────────────
-      // classifyRunAdOutcome correctly leaves a run with real outstanding
-      // work alone (receipt-holding still rendering, untitled master mid
-      // recovery) — that is often just a run waiting behind a shared
-      // concurrency pool, not stuck. But some outstanding shapes are NOT
-      // "waiting its turn" — they are permanently stuck because a role the
-      // pipeline depends on stopped claiming (the exact incident this fix
-      // responds to: derives handed off with `titlingNeeded:true` when the
-      // titler service had ADGEN_TITLER_ENABLED=false — every such ad sat
-      // `awaiting-titler` forever, uncounted, un-alerted, indistinguishable
-      // from a run simply waiting its turn behind VEO_CONCURRENCY). Any
-      // claimed Ad whose canonical phase (services/adPhase.js — the SAME
-      // function the UI and Slack QC alerts use) comes back 'stalled' means
-      // its own relevant timestamp hasn't moved in DEFAULT_STALE_MINUTES —
-      // that is real, not "waiting its turn" (a pool wait still beats the
-      // heartbeat / bumps updatedAt; see services/campaignRunHeartbeat.js).
-      // This generalizes past the titler flag specifically: ANY handoff-
-      // style stranding (a role switched off, a service down, a crashed
-      // worker the reaper hasn't caught yet) produces the identical shape.
-      try {
-        const stalled = claimedAds
-          .map((ad) => ({ ad, phase: deriveAdPhase(ad, { now: reapNow }) }))
-          .filter((x) => x.phase === 'stalled');
-        if (stalled.length > 0) {
-          // Per-run dedup key — ALERT_DEDUPE_WINDOW_MIN (default 15m) already
-          // throttles a repeat page for the same run on every REAP_INTERVAL_MIN
-          // tick without needing a bespoke cooldown here.
-          alerts.notifyAsync({
-            level: 'error',
-            title: `Run stranded — ${stalled.length} claimed ad(s) stopped moving`,
-            key: `reaper:stalled-claim:${candidate.runId}`,
-            fields: {
-              runId: candidate.runId,
-              'stalled ads': stalled.length,
-              'total claimed': claimedAds.length,
-              'stale threshold': `${DEFAULT_STALE_MINUTES}m`,
-              // Name the specific shape when every stalled ad shares one —
-              // the titler-off incident is common enough to call out by name
-              // rather than making an operator open the run to find it.
-              ...(stalled.every((x) => x.ad.titlingNeeded === true && !x.ad.claimedByWorker)
-                ? { 'likely cause': 'handed off for titling but never claimed — check the titler service is running and ADGEN_TITLER_ENABLED=true there' }
-                : {})
-            },
-            detail: stalled.slice(0, 10).map((x) => {
-              const prevPhase = x.ad.titlingNeeded === true && !x.ad.claimedByWorker ? 'awaiting-titler'
-                : (x.ad.deriveFromMaster && !x.ad.veoVideoUrl ? 'awaiting-master' : 'in-flight');
-              return `${x.ad._id}  stuck-in=${prevPhase}  claimed=${x.ad.claimedByWorker || 'no'}  ` +
-                `lastStage=${x.ad.renderStage || '(none)'}`;
-            }).join('\n')
-          });
-        }
-      } catch (err) {
-        console.warn(`⚠️  stalled-claim scan failed for run ${candidate.runId} (non-fatal): ${err.message}`);
-      }
+      // Real outstanding work alone (receipt-holding still rendering,
+      // untitled master mid recovery) is often just a run waiting behind a
+      // shared concurrency pool, not stuck — classifyRunAdOutcome correctly
+      // leaves it alone above. Some outstanding shapes are NOT "waiting its
+      // turn" though: see alertIfClaimsStranded's own header for the
+      // incident this responds to (a titler-handoff derive nobody ever
+      // claimed). No DB write happens here — alerting only — so this stays
+      // a single statement, deliberately, rather than an inline block: see
+      // that function's header for why.
+      alertIfClaimsStranded(candidate.runId, claimedAds, reapNow);
       continue;
     }
     const update = buildRunReconciliationUpdate(outcome, { staleMin: REAP_STALE_MIN, now: new Date(reapNow) });
