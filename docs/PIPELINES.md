@@ -2,6 +2,18 @@
 
 This is the engineer reference for every background and creative pipeline in the LiquidRetail backend (Node/Express + Mongoose). For each pipeline: what triggers it, its stages, which models/APIs it calls (and rough cost), which env knobs tune it, how progress/cancel works, and what consumes its output. Facts are code-verified as of **2026-08-03** (prod `13cf679`) with **Phase A + Phase B PMax (2026-08-10/11)** documented against branch `feat/pmax-surfaces-phase-a2`, plus a **post-Phase-B addendum** (video cost reconciliation + adversarial corrections; offline suite **78** scripts green). Prefer this doc over tribal memory; when in doubt, open the cited files. Claims written against pre-`13cf679` binaries (including the long-running `a80ae0b` prod window) are suspect.
 
+> **Render cutover (2026-08-24) — read this before §5 / §6 / §8.**
+> When dashboard `ADGEN_RENDERER_ENABLED=true`, the **backend does not
+> execute** `runRenderLoop`'s Atlas / Remotion work. `routes/ads.js:1715-1723`
+> returns after flipping `CampaignRun` to `running`;
+> `liquidretail_adgen` `src/services/renderer.js` claims each ad and runs
+> static / video-master / derive / Remotion. Expansion + mint + the
+> `claimAdsForRun` write still happen **here**. Sections below that say
+> "all in the **web** process" or "`runRenderLoop` → `renderCreative`"
+> describe the **flag-off fallback** (and the architecture as of 2026-08-03).
+> Remotion memory now belongs to the adgen renderer instance, not this
+> web service. Details: `../liquidretail_adgen/CLAUDE.md`.
+
 > **Cost hot-spots (read first)**
 >
 > | Hot-spot | When it fires | Rough cost | Mitigation (current default) |
@@ -9,7 +21,7 @@ This is the engineer reference for every background and creative pipeline in the
 > | **Overlay zones** (`overlayZoneService.analyzeOverlayZones`, Gemini-2.5 vision) | Per catalog-product image after detect | ~**13–26s / image** Gemini vision | **Deferred** to ad time (`CATALOG_DETECT_PRECOMPUTE=false`); only products a campaign will use |
 > | **User-actuated product enrichment** (SerpAPI shopping + immersive + Gemini grounded-search) | Sales Demos **Enrich** button | ~**$0.05–0.12 / product** | Opt-in only; auto path is reviews gap-fill |
 > | **Static ad plate** (`openai/gpt-image-2/edit` via `directImageRenderService`) | Every static `ai_*` ad (default pipeline) | Dominant static-ad $ | One billable edit submit per ad; stages on poll ticks (`ATLAS_IMAGE_POLL_MS` 3s). **Was falsely documented** as "GPT-4.1 HTML → Puppeteer → gpt-image-2 photoreal polish" — that chain is **not** the live default |
-> | **Omni / Atlas video** (legacy name `veo`) | Video ad generation | **MEASURED** 10s @ 1080p on the **developer** model (`google/gemini-omni-flash/image-to-video-developer`, production default): **$0.90** settled. The `MODEL_CAPS` formula (`base 0.20 + 0.10/s` → $1.20 @ 10s) **overstates** the developer variant by ~33% — do not quote $1.20 for it. Ledger now **reconciles** settled price (was estimate-forever — see [*Video cost reconciliation*](#video-cost-reconciliation-post-phase-b)). 720p same list tier as 1080p. | `VEO_CONCURRENCY=24` — the **submit+poll half only** since the 2026-08-05 split (raised 1→4 2026-08-02 probe, 4→12 2026-08-05, 12→24 2026-08-20). Omni RPS still unpublished, but no Omni 429 was ever recorded and a poll is ~2min of idle waiting, so widening this half is low-risk; Grok stays ≤1 RPS via `GROK_MAX_RPS` regardless. **Was falsely documented** as "must stay at 1 — provider 429s"; that belonged to retired direct-Veo / Grok 1 RPS, not Omni. The cap that still needs care is `REMOTION_QUEUE_CONCURRENCY=8` — validate against the web-service memory graph before raising it |
+> | **Omni / Atlas video** (legacy name `veo`) | Video ad generation | **MEASURED** 10s @ 1080p on the **developer** model (`google/gemini-omni-flash/image-to-video-developer`, production default): **$0.90** settled. The `MODEL_CAPS` formula (`base 0.20 + 0.10/s` → $1.20 @ 10s) **overstates** the developer variant by ~33% — do not quote $1.20 for it. Ledger now **reconciles** settled price (was estimate-forever — see [*Video cost reconciliation*](#video-cost-reconciliation-post-phase-b)). 720p same list tier as 1080p. | `VEO_CONCURRENCY=24` — the **submit+poll half only** since the 2026-08-05 split (raised 1→4 2026-08-02 probe, 4→12 2026-08-05, 12→24 2026-08-20). Omni RPS still unpublished, but no Omni 429 was ever recorded and a poll is ~2min of idle waiting, so widening this half is low-risk; Grok stays ≤1 RPS via `GROK_MAX_RPS` regardless. **Was falsely documented** as "must stay at 1 — provider 429s"; that belonged to retired direct-Veo / Grok 1 RPS, not Omni. The cap that still needs care is `REMOTION_QUEUE_CONCURRENCY=4` (8 OOM-killed the 8 GiB web box on 2026-08-21; reverted). **When `ADGEN_RENDERER_ENABLED=true` this work runs in `liquidretail_adgen`, not this web process** |
 > | **Catalog scan (sitemap + JSON-LD)** | Demo / catalog sync | Deterministic HTTP only — **no LLM** | Caps + per-host min-gap; bounded PDP concurrency |
 
 Non-secret defaults live in `config/defaults.env` (versioned). The Render dashboard holds **secrets only** (plus one deliberate non-secret exception, `JIRA_PROJECT_KEY`) — migration complete 2026-08-03; see [§9](#9-configuration--secrets) and CLAUDE.md §4a.
@@ -495,7 +507,7 @@ there is no lexical fallback. Full rationale, failure policy and consumer list:
 
 ### Trigger
 
-- `routes/ads.js` `POST /generate` → **202** + `setImmediate` → `campaignAdsGenerationService.expandWizardJob` → `selectAdsForRun` → `runRenderLoop` (all in the **web** process).
+- `routes/ads.js` `POST /generate` → **202** + `setImmediate` → `campaignAdsGenerationService.expandWizardJob` → `selectAdsForRun` → `claimAdsForRun` → `runRenderLoop`. Expansion + mint + claim stay in this **web** process. **When `ADGEN_RENDERER_ENABLED=true`, `runRenderLoop` returns immediately** (`routes/ads.js:1715-1723`) and `liquidretail_adgen` renders. Flag off: the in-process loop in this file still runs.
 - `POST /api/ads/runs` drains already-queued inventory: `selectAdsForRun` then **`claimAdsForRun()`** (`routes/ads.js:645-750`) — atomic `updateMany` with `status:'queued'`, ownership re-read (`status:'rendering'` + `campaignRunIds: runId`), `modifiedCount` cross-check, post-claim requeue on throw. **Was false:** `/runs` lacked the claim `/generate` already had (double-bill hole on concurrent "render next batch").
 - `CampaignRun` tracks batch status; ad-batch progress via OperationRun kind `ad-batch`.
 - `GET /api/ads/runs/:runId` returns `perProduct` (machine codes + messages from `services/perProductReasons.js`). New code `concepts_no_usable_media` distinguishes "Director returned nothing" from "returned concepts but none usable". Run-level empty message uses `summarizeEmptyExpansion`, not the old generic "check imagery and templates".
@@ -957,7 +969,7 @@ output shape.
 
 - Wizard / API: `POST /api/ads/preview` (dry-run) or `POST /api/ads/generate` → `campaignAdsGenerationService.expandWizardJob` when resolved kinds include `video` and format flags allow (`AI_VEO_FEED` / `AI_VEO_REELS`).
 - Phase-3 body fields (also on preview): `directorVariants`, `seedMediaIds`, `videoPromptGuidance`, `videoPromptRaw` (`routes/ads.js` `parsePhase3WizardFields`).
-- Render: `selectAdsForRun` → `runRenderLoop` → `videoRouter` → `atlasVideoService.generateForAd` when `VIDEO_PROVIDER=atlas` (default).
+- Render: `selectAdsForRun` → `runRenderLoop`. **Flag on:** adgen renderer (`src/services/renderer.js` `renderVideo`) calls `videoRouter.prepareStoryboard` then `atlasVideoService.generateForAd`. **Flag off:** this repo's `runRenderLoop` does the same via `routes/ads.js`. `VIDEO_PROVIDER=atlas` is the default in both.
 
 ### Expansion routing (`expandWizardJob`)
 
@@ -1598,10 +1610,12 @@ Secret: `ATLAS_API_KEY`.
 > - **CRITICAL API trap:** Slack returns HTTP 200 with `{ok:false,error:…}` on logical failure (bad token, `channel_not_found`, `not_in_channel`, …). Checking `res.ok` alone reports success while nothing was delivered (`alertService.js:220-240`). Always require `body.ok === true`.
 > - Boot: worker logs `🔔 alerts: Slack configured` when the token is present (`worker.js`).
 >
-> That doc also records *why* video batches stall: `runRenderLoop` executes
-> in the **web** process, which Render replaces on deploy **and** on
-> autoscale (`min 1 / max 3`, CPU+memory at 60%), and reaped ads land in
-> `queued` where nothing drains them automatically (**still known-open**).
+> That doc also records *why* video batches stall. Pre-cutover /
+> flag-off: `runRenderLoop` executes in the **web** process, which Render
+> replaces on deploy **and** on autoscale, and reaped ads land in `queued`
+> where nothing drains them automatically. Flag-on: the loop lives in
+> `liquidretail_adgen`'s renderer; this reaper skips `claimedByWorker != null`
+> rows (`worker.js:387-405`).
 
 ### Core
 
@@ -1641,11 +1655,11 @@ Single resolver: `services/concurrency.js` (frozen `concurrency` object; boot lo
 
 | Knob | Default | Ceiling kind / notes |
 |---|---|---|
-| `WORKER_CONCURRENCY` | **5** | SELF — DetectRun / job poll workers |
+| `WORKER_CONCURRENCY` | **8** | SELF — DetectRun / job poll workers (`config/defaults.env` + `services/concurrency.js`; raised 5→8 on 2026-08-14). This knob is on the **backend worker**, not adgen |
 | `RENDER_CONCURRENCY` | **24** | SELF — in-flight static/image ads per run. File raised 4→8 (2026-08-02): unpaced `gpt-image-2/edit` measured clean (85s wall, zero 429s). **Became live in prod on 2026-08-03** when the Render dashboard pin of 4 was deleted as part of the secrets-only migration (dotenv never overrides an already-set var — the file change alone did not move prod for a day). Doubling was a consequence of that cleanup, not a separate tuning decision. Then 8→24 (2026-08-04, owner-directed: renders should all go to Atlas at once) — with the run cap now effectively uncapped this is a **wave size**, and spend is unchanged because the submit COUNT is fixed by the ad count, only the rate moves. **Unmeasured above 8** — watch for 429 backoff. **Was also falsely documented as "Puppeteer pool"** — the live pool is direct-image Atlas submits |
-| `VEO_CONCURRENCY` | **24** | SELF — in-flight video ads per run, **submit+poll half only** since 2026-08-05. Raised 1→4 (2026-08-02) as an Omni probe, 4→12 (2026-08-05) once titling moved behind its own permit, 12→24 (2026-08-20). Omni RPS is unpublished but no Omni 429 has ever been recorded and a poll is ~2min of idle waiting, so this half is cheap to widen; Grok stays ≤1 RPS via `GROK_MAX_RPS` regardless. **Was falsely documented as "keep at 1 — provider 429s"**; that belonged to retired direct-Veo + Grok 1 RPS, not Omni. Moved together with `REMOTION_QUEUE_CONCURRENCY` 4→8 — raising this one alone only makes titling a harder bottleneck (SPEC max 32) |
+| `VEO_CONCURRENCY` | **24** | SELF — in-flight video ads per run, **submit+poll half only** since 2026-08-05. Raised 1→4 (2026-08-02) as an Omni probe, 4→12 (2026-08-05) once titling moved behind its own permit, 12→24 (2026-08-20). Omni RPS is unpublished but no Omni 429 has ever been recorded and a poll is ~2min of idle waiting, so this half is cheap to widen; Grok stays ≤1 RPS via `GROK_MAX_RPS` regardless. **Was falsely documented as "keep at 1 — provider 429s"**; that belonged to retired direct-Veo + Grok 1 RPS, not Omni. Coupled 2026-08-20 raise with Remotion 4→8 was later undone on the Remotion side (8→4, 2026-08-21 OOM); this knob stayed at 24 (SPEC max 32) |
 | `VEO_TITLING_CONCURRENCY` | **48** | SELF — how many ads may be INSIDE the titling call at once (4→48, owner-directed 2026-08-13). **Not the memory guard**, despite the old note: it bounds the cheap prep half (`buildMetaForAd`, copy cascade, product/category reads, font resolution — Mongo and disk). `remotionRenderService` used to run a concurrency-1 promise chain regardless of this number, which is the whole 926s / 83%-idle titling tail measured on a 20-ad run. One caveat: ~$0.02 of billable face-detection vision runs inside this permit per ad, so a wide value bursts those concurrently — same total spend, higher instantaneous rate |
-| `REMOTION_QUEUE_CONCURRENCY` | **8** | SELF — **the real titling limit and the number to move carefully.** Simultaneous Remotion renders: a headless Chrome page + an ffmpeg 1080p encode, IN the web process. Failure mode is **not** a provider 429 — it is RSS exhaustion → Render autoscale (60% CPU+mem) → process replacement → a PAID Omni master stranded mid-titling (~$1.00 each). Was 4, the only concurrency this process had actually survived (the old combined `VEO_CONCURRENCY`), and never an RSS measurement; raised 4→8 (2026-08-20) as one deliberate doubling — 16 was floated and rejected for that reason. **Validate 8 against the web-service memory graph across a full run before raising further** (SPEC max 16; one measured render = 76.2s, and 1080p is 2.25x the pixels of 720p) |
+| `REMOTION_QUEUE_CONCURRENCY` | **4** | SELF — **the real titling limit.** Simultaneous Remotion renders (headless Chrome + ffmpeg 1080p). **Raised 4→8 2026-08-20, reverted 8→4 2026-08-21** after a real 12-ad Pelagic run OOM-killed the backend web service at 8 GiB (~0.9 GiB/slot). File default is 4 in `config/defaults.env`. **When `ADGEN_RENDERER_ENABLED=true`, this knob is consumed by `liquidretail_adgen`'s renderer process**, not this web service — titling is `renderer.js` → `renderBrandScriptAndSave` in-process. Adgen-renderer was resized to 8 GiB (pro_plus) on 2026-08-24 so 4 slots fit; that has not yet been re-measured on adgen |
 | `MAX_CREATIVES_PER_RUN` | 1000 (effectively uncapped, owner 2026-08-18) | SELF — ads claimed into one `CampaignRun` |
 | `ATLAS_SUBMIT_SPACING_MS` | 1200 | SELF — same-model **video** submit spacing only; image submits unpaced |
 | `GROK_MAX_RPS` | 1 | **PROVIDER** — env may lower, cannot raise above 1; floors Grok slug spacing independent of `VEO_CONCURRENCY` |
@@ -1655,7 +1669,9 @@ Single resolver: `services/concurrency.js` (frozen `concurrency` object; boot lo
 | `HTTP_SCRAPE_DOMAIN_CONCURRENCY` | 3 | In-flight HTTP per host |
 | `DIRECTOR_UNIVERSE_TOP_N` | **1** | Not a render pool — Director seed window (see §5) |
 
-`runRenderLoop` runs **two pools in parallel** (`routes/ads.js:1805-1806`): `veo` at `VEO_CONCURRENCY` and `image` at `RENDER_CONCURRENCY`. Mixed batches no longer collapse both kinds onto one knob. Since the 2026-08-05 split the `veo` pool covers **submit+poll only** — Remotion titling runs behind its own process-wide permits (`VEO_TITLING_CONCURRENCY` for the cheap prep, `REMOTION_QUEUE_CONCURRENCY` for the renders themselves), so `VEO_CONCURRENCY` is no longer what bounds memory.
+**Flag off:** `runRenderLoop` runs **two pools in parallel** (`routes/ads.js:1805-1806`): `veo` at `VEO_CONCURRENCY` and `image` at `RENDER_CONCURRENCY`. Mixed batches no longer collapse both kinds onto one knob. Since the 2026-08-05 split the `veo` pool covers **submit+poll only** — Remotion titling runs behind its own process-wide permits (`VEO_TITLING_CONCURRENCY` for the cheap prep, `REMOTION_QUEUE_CONCURRENCY` for the renders themselves), so `VEO_CONCURRENCY` is no longer what bounds memory.
+
+**Flag on:** those two pools do not run here. Adgen's renderer burst-claims up to `ADGEN_MAX_INFLIGHT` (default 32) and lets the vendored `REMOTION_QUEUE_CONCURRENCY` / `VEO_CONCURRENCY` table bound work **inside that process**.
 
 ---
 
