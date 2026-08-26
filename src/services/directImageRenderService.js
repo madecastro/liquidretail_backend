@@ -1449,6 +1449,64 @@ async function optionalImage(url) {
   try { return await fetchBuffer(url); } catch (err) { console.warn(`   ⚠️  direct-image: reference fetch failed (${err.message})`); return null; }
 }
 
+// ── Per-process LOGO buffer cache ─────────────────────────────────────
+//
+// WHY (2026-08-26, Phase 2 of the wall-time reduction plan). optionalImage
+// fires a fresh axios GET on every ad. For a 9-ad Pelagic Gear batch on a
+// single brand, the SAME logo URL was fetched 9 times × ~300-700ms each =
+// ~3-6 seconds of pure duplicate HTTP time per run. Sharp decode is fast
+// once bytes are in memory; the network fetch is the dominating cost.
+//
+// Cache the RAW fetched buffer (pre-resize) because Sharp resize dims vary
+// per delivery format. Every ad still does its own resize; only the HTTP
+// fetch is amortised.
+//
+// ── SCOPE: LOGOS ONLY, NOT PRODUCT REFERENCES ────────────────────────
+// optionalImage is also called with product / concept reference URLs
+// (lines 2364, 2573) — those vary widely across ads and their cache
+// working set is unbounded. `optionalImageCached` is a SEPARATE helper so
+// the caller must OPT IN. Only the corner-logomark call site (~2135) is
+// wired below, matching the exact place where the same URL demonstrably
+// repeated 9 times in one batch.
+//
+// LRU-capped at LOGO_CACHE_CAP; TTL LOGO_CACHE_TTL_MS. Logos rarely change,
+// but a 1-hour ceiling ensures a brand-asset update propagates within an
+// hour without a service restart.
+const LOGO_CACHE_CAP    = Number(process.env.LOGO_CACHE_CAP    || 32);
+const LOGO_CACHE_TTL_MS = Number(process.env.LOGO_CACHE_TTL_MS || 60 * 60 * 1000);
+const _logoCache = new Map();  // url → { buf, expiresAt }
+
+function _logoCacheGet(url) {
+  const entry = _logoCache.get(url);
+  if (!entry) return undefined;
+  if (Date.now() >= entry.expiresAt) {
+    _logoCache.delete(url);
+    return undefined;
+  }
+  // LRU refresh — reinsert at tail.
+  _logoCache.delete(url);
+  _logoCache.set(url, entry);
+  return entry.buf;
+}
+
+function _logoCacheSet(url, buf) {
+  if (_logoCache.has(url)) _logoCache.delete(url);
+  _logoCache.set(url, { buf, expiresAt: Date.now() + LOGO_CACHE_TTL_MS });
+  while (_logoCache.size > LOGO_CACHE_CAP) {
+    const oldest = _logoCache.keys().next().value;
+    _logoCache.delete(oldest);
+  }
+}
+
+async function optionalImageCached(url) {
+  if (!url) return null;
+  const hit = _logoCacheGet(url);
+  if (hit) return hit;
+  const buf = await optionalImage(url);
+  if (buf) _logoCacheSet(url, buf);
+  return buf;
+}
+
 /**
  * Which intent a template asks for. The intent module walks DOWN its own
  * hierarchy when the data cannot support the request, so this only has to state
@@ -2132,7 +2190,10 @@ async function finishPlate({ rawFrame, built, dims, genSize, surface, adId, logo
   // the logo's position by eye (2026-08-24 false-positive fix — see
   // adVisionQcService.computeLogoGeometry).
   let composedLogoRect = null;
-  const logo = await optionalImage(logoUrl);
+  // Logo-only cache — see optionalImageCached header. Same URL across a
+  // batch was measured fetching 9× on run_1787696303378. Product/concept
+  // reference fetches at 2364 / 2573 intentionally stay UNCACHED.
+  const logo = await optionalImageCached(logoUrl);
   if (logo) {
     try {
       const boxWH = logoResizeBox(dims);
