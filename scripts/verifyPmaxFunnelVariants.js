@@ -308,6 +308,105 @@ check('E5 findSiblingMasterAd excludes funnelStage siblings',
   !!findBody && /funnelStage/.test(findBody),
   'without this a funnel variant can wait on another variant that never holds a plate');
 
+// Owner directive 2026-08-26: "remove the sibling ad master pull unless the
+// sibling was produced the same day as the request for now." A same-UTC-day
+// version of this guard was implemented, then REVERTED before merge: an
+// adversarial review found it created a worse defect — a Meta master's
+// identity digest excludes duration/run-id (deliberately, a money guard), so
+// re-minting Meta for a product with an existing PRIOR-DAY master collides
+// on the unique index and is silently swallowed, never re-associating that
+// master's campaignRunIds with the new run. Because planDeterministicVideoAds
+// decides "PMax derives from Meta" once PER RUN from the requested surface
+// list — not per product from live DB state — a PMax derive still gets
+// stamped for that product, then a same-day-only lookup cannot find
+// yesterday's master. It fails honestly (no second Omni submit) but
+// PERMANENTLY occupies that PMax format's (campaignId, identityDigest) slot
+// as status:'failed' — silently losing PMax delivery for any campaign
+// generated on more than one day, which is the ordinary case. The actual
+// hazard was never "the sibling is old" — it was "the sibling is DURATION-
+// INCOMPATIBLE" (Google rejects PMax video under 10s). Ad.videoDurationSec
+// is resolved at MINT time, independent of whether the video has finished
+// generating, so gating on it directly closes the true hazard without
+// breaking ordinary multi-day usage. See routes/ads.js's own comment on
+// findSiblingMasterAd for the full history.
+check('E6 [MONEY] findSiblingMasterAd no longer scopes by calendar day',
+  !!findBody && !/base\.createdAt/.test(findBody),
+  'a day bound was tried and reverted — its reappearance means the identity-'
+  + 'squat regression is back: a product generated on >1 day permanently '
+  + 'loses PMax derive delivery the moment its Meta master predates today');
+check('E6a [MONEY] findSiblingMasterAd requires the sibling to meet the PMax 10s floor',
+  !!findBody && /base\.videoDurationSec\s*=\s*\{\s*\$gte:\s*GOOGLE_PMAX_VIDEO_DURATION_SEC\s*\}/.test(findBody),
+  'without this, a sub-floor-duration sibling (Google rejects PMax video '
+  + 'under 10s) can be bound as a fresh derive\'s plate');
+check('E6b the duration bound is set on `base` BEFORE the in-run query, so both lookups inherit it',
+  !!findBody && (() => {
+    const boundIdx = findBody.indexOf('base.videoDurationSec');
+    const inRunIdx = findBody.search(/Ad\.findOne\(\{\s*\.\.\.base/);
+    const fallbackIdx = findBody.lastIndexOf('Ad.findOne(base)');
+    return boundIdx !== -1 && inRunIdx !== -1 && fallbackIdx !== -1
+      && boundIdx < inRunIdx && boundIdx < fallbackIdx;
+  })(),
+  'a bound applied only to one query, or applied after either Ad.findOne call, '
+  + 'leaves the other path unscoped');
+
+// ── E7. LIVE EXECUTION, not source regex — actually call findSiblingMasterAd
+// against a stubbed Ad model and inspect the query it sends. A prior
+// adversarial review of this exact function correctly noted that E6/E6a/E6b-
+// style checks (source-pattern matches) never prove what query Mongo
+// actually receives; this repo has no in-memory Mongo, so inject a fake
+// '../models/Ad' via require.cache (the same live-injection technique
+// verifySharedPortraitMaster.js already uses for veoPromptBuilder) and
+// capture the literal filter object findOne() is called with.
+const e7Promise = (async () => {
+  const AD_MODEL_PATH = require.resolve(path.join(ROOT, 'models', 'Ad.js'));
+  const ROUTES_PATH = require.resolve(path.join(ROOT, 'routes', 'ads.js'));
+  const calls = [];
+  function fakeFindOne(filter) {
+    calls.push(filter);
+    return { sort: () => ({ lean: async () => null }) };
+  }
+  const prevAd = require.cache[AD_MODEL_PATH];
+  const prevRoutes = require.cache[ROUTES_PATH];
+  require.cache[AD_MODEL_PATH] = {
+    id: AD_MODEL_PATH, filename: AD_MODEL_PATH, loaded: true,
+    exports: { findOne: fakeFindOne, findById: () => ({ lean: async () => null }) }
+  };
+  delete require.cache[ROUTES_PATH];
+  let liveErr = null;
+  let liveFn = null;
+  try {
+    // routes/ads.js does real work at require-time (mounts an Express router
+    // against live services) — this is exactly why the rest of this file
+    // pattern-matches the source instead of requiring it. The Ad-model stub
+    // above is the only thing this probe needs faked; if requiring the route
+    // module throws for an unrelated reason, report that honestly rather
+    // than silently falling back to source matching.
+    const routesMod = require(ROUTES_PATH);
+    liveFn = routesMod && routesMod.findSiblingMasterAd;
+  } catch (e) {
+    liveErr = e;
+  } finally {
+    require.cache[AD_MODEL_PATH] = prevAd;
+    if (prevRoutes) require.cache[ROUTES_PATH] = prevRoutes; else delete require.cache[ROUTES_PATH];
+  }
+  if (typeof liveFn !== 'function') {
+    check('E7 [MONEY] live-execution probe: findSiblingMasterAd is exported for testing',
+      false,
+      liveErr ? `route module require failed: ${liveErr.message}` : 'routes/ads.js does not export findSiblingMasterAd — a source-only regex cannot prove what query Mongo actually receives');
+    return;
+  }
+  await liveFn(
+    { _id: 'a1', campaignId: 'c1', productId: 'p1', createdAt: new Date('2026-08-20T12:00:00Z'), campaignRunIds: [] },
+    'meta_stories_9_16'
+  );
+  const q = calls[calls.length - 1] || {};
+  check('E7a [MONEY] live call: the filter sent to Mongo has NO createdAt bound',
+    q.createdAt === undefined, `got createdAt=${JSON.stringify(q.createdAt)}`);
+  check('E7b [MONEY] live call: the filter sent to Mongo requires videoDurationSec >= 10',
+    !!q.videoDurationSec && q.videoDurationSec.$gte === 10,
+    `got videoDurationSec=${JSON.stringify(q.videoDurationSec)}`);
+})();
+
 // ── F. Regenerate refuses funnel / derive ads ──────────────────────────
 const regenSrc = fs.readFileSync(path.join(ROOT, 'services/adRegenerateService.js'), 'utf8');
 check('F1 [MONEY] regenerate path uses resolveDeriveFromMaster (covers funnel variants)',
@@ -585,10 +684,21 @@ console.log('\n── Revert-proofs (mutate / fail / restore) ──');
 }
 
 // ── summary ────────────────────────────────────────────────────────────
-console.log(`\nverifyPmaxFunnelVariants: ${passed} passed, ${failures.length} failed`);
-if (failures.length) {
-  for (const f of failures) console.error('  FAIL:', f);
-  process.exit(1);
+// Deferred behind e7Promise: E7/E7a/E7b are the only async checks in this
+// otherwise fully synchronous harness (findSiblingMasterAd is a real async
+// function; even a stub Ad.findOne makes calling it return a Promise). The
+// summary must wait for that promise or it can print and exit before the
+// live-execution result is recorded.
+function finish() {
+  console.log(`\nverifyPmaxFunnelVariants: ${passed} passed, ${failures.length} failed`);
+  if (failures.length) {
+    for (const f of failures) console.error('  FAIL:', f);
+    process.exit(1);
+  }
+  console.log('OK');
+  process.exit(0);
 }
-console.log('OK');
-process.exit(0);
+e7Promise.then(finish, (err) => {
+  check('E7 [MONEY] live-execution probe did not throw', false, err && err.message);
+  finish();
+});
