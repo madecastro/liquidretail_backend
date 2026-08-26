@@ -1301,7 +1301,17 @@ function buildPersistedVerdict({
   finalAttempt,
   skipped = false,
   disabled = false,
-  reason = null
+  reason = null,
+  // regenerationCount — how many times the LLM was re-invoked to fix a QC
+  // failure. Persisted so DB analytics can count regen success/failure
+  // rates without re-deriving from attempts.length. Added 2026-08-26 after
+  // the wall-time trace found the counter tracked in runPostRenderQc's own
+  // scope but dropped on persist — every DB query for regen behavior
+  // returned 0 across all ads even when logs showed regens firing.
+  // Derivable from `finalAttempt - 1` on legacy rows if this field is
+  // missing, but writing it makes the query one field access instead of
+  // arithmetic on nullable columns.
+  regenerationCount = 0
 }) {
   return {
     schemaVersion: 1,
@@ -1321,6 +1331,7 @@ function buildPersistedVerdict({
     reason: reason == null ? null : String(reason).slice(0, 500),
     finalAttempt: finalAttempt || null,
     maxRegenerations: MAX_QC_REGENERATIONS,
+    regenerationCount: Math.max(0, Number(regenerationCount) || 0),
     attempts: (attempts || []).map((a) => ({
       attempt: a.attempt,
       pass: !!a.pass,
@@ -1721,7 +1732,8 @@ async function runPostRenderQc({
         visionQc: buildPersistedVerdict({
           passed: true,
           finalAttempt: attempt,
-          attempts
+          attempts,
+          regenerationCount
         }),
         generationCount,
         regenerationCount,
@@ -1770,7 +1782,8 @@ async function runPostRenderQc({
     visionQc: buildPersistedVerdict({
       passed: false,
       finalAttempt: attempts.length ? attempts[attempts.length - 1].attempt : null,
-      attempts
+      attempts,
+      regenerationCount
     }),
     generationCount,
     regenerationCount,

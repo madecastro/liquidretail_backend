@@ -467,8 +467,13 @@ const adSchema = new mongoose.Schema({
   intentResolution:   { type: mongoose.Schema.Types.Mixed, default: null },
   // Post-render vision QC verdict (static direct-image path only).
   // { schemaVersion, skipped, disabled, passed, finalAttempt, maxRegenerations,
-  //   attempts:[{ attempt, pass, categories, findings, summary, renderUrl,
-  //               discarded, discardedRenderUrl, imageGeneration }] }.
+  //   regenerationCount, attempts:[{ attempt, pass, categories, findings,
+  //   summary, renderUrl, discarded, discardedRenderUrl, imageGeneration }] }.
+  // `regenerationCount` added 2026-08-26 — how many times the LLM was
+  // re-invoked. Persisted so DB analytics can measure regen success/failure
+  // rates without deriving from attempts.length. Legacy rows with the field
+  // absent should read as null-not-zero (no regen data available), not "0
+  // regens".
   // Per-attempt renderUrl is KEPT when discarded — the first render was
   // already paid for (mirrors Omni master keep on titling failure).
   // Null when AD_VISION_QC_ENABLED is off or the ad predates this field.
