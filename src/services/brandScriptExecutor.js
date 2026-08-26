@@ -33,11 +33,31 @@ const { usableAttribution } = require('./quoteProvenance');
 const RUNNER_PATH = path.join(__dirname, 'brandScriptRunner.child.js');
 const FONTS_DIR   = path.join(__dirname, 'brandScripts', 'assets', 'fonts');
 
-// Child process budget. Long enough for a 6-second video at 24fps
-// (144 frames × ~30ms/frame render + overhead) with slack for a
-// slow Cloudinary download. Ffmpeg extract + encode are metered
-// separately.
-const CHILD_TIMEOUT_MS = 5 * 60 * 1000;
+// Child process budget for brandScriptRunner.child.js — the CANVAS
+// (@napi-rs/canvas) titling engine's own child, spawned by runChild() below.
+// Long enough for a 6-second video at 24fps (144 frames × ~30ms/frame render
+// + overhead) with slack for a slow Cloudinary download. Ffmpeg extract +
+// encode are metered separately.
+//
+// NOT THE SAME CHILD AS REMOTION'S. This is a genuinely separate titling
+// pipeline from remotionRenderService.js's renderTitles function /
+// remotionRender.child.js (REMOTION_TIMEOUT_MS / REMOTION_CHILD_TIMEOUT_MS,
+// see remotionChildSupervisor.js's header) — different child script
+// (brandScriptRunner.child.js vs remotionRender.child.js), different
+// rendering technology (canvas draw calls vs headless Chrome), and NEITHER
+// wraps the other; they are siblings, not nested. Verified 2026-08-26:
+// resolveTitlingEngine() below is currently a hard kill-switch that always
+// returns `engine:'remotion'` (the canvas cascade is commented out, kept for
+// a future re-enable) — so in TODAY's production, renderBrandScriptAndSave()
+// never reaches runChild() at all for the money-critical video-master path,
+// and this timeout cannot fire on it. It still governs the canvas engine's
+// preview call sites (previewBrandScript/previewBrandScriptAsVideo, operator
+// UI) and would govern production titling again the moment the kill-switch
+// is lifted for any brand. Made env-tunable, matching its two Remotion
+// siblings, so a legitimate slow canvas render doesn't need a code change to
+// fix (see the timeout-coherence writeup in scripts/verifyTimeoutCoherence.js
+// for the full three-timeout map).
+const CHILD_TIMEOUT_MS = Number(process.env.BRAND_SCRIPT_CHILD_TIMEOUT_MS) || 5 * 60 * 1000;
 
 // ── Format classifier ──────────────────────────────────────────────
 //

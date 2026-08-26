@@ -9,6 +9,21 @@ const path = require('path');
 const fs = require('fs');
 const REPO = path.resolve(__dirname, '..');
 
+// stageTiming.js requires ../config, which hard-exits (process.exit(1)) the
+// WHOLE test process unless ADGEN_ROLE/MONGODB_URI are set — and, since
+// config.js's REQUIRED_ENV_BY_ROLE guard, also Cloudinary vars for
+// renderer/titler. A bare worktree/CI checkout has none of these (see
+// CLAUDE.md: this repo deliberately ships without a committed node_modules
+// or .env). Set harmless placeholders BEFORE requiring the live module —
+// `||=` so a real local .env is never clobbered — the same pattern
+// verifyTitlerBackpressure.js uses for the same reason.
+process.env.ADGEN_ROLE = process.env.ADGEN_ROLE || 'renderer';
+process.env.MONGODB_URI = process.env.MONGODB_URI || 'mongodb://127.0.0.1:27017/adgen_verify_placeholder';
+process.env.CLOUDINARY_CLOUD_NAME = process.env.CLOUDINARY_CLOUD_NAME || 'verify-placeholder';
+process.env.CLOUDINARY_API_KEY = process.env.CLOUDINARY_API_KEY || 'verify-placeholder';
+process.env.CLOUDINARY_API_SECRET = process.env.CLOUDINARY_API_SECRET || 'verify-placeholder';
+process.env.ATLAS_API_KEY = process.env.ATLAS_API_KEY || 'verify-placeholder';
+
 const failures = [];
 const passes = [];
 function check(name, cond, detail) {

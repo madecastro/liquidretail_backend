@@ -95,6 +95,13 @@ class MiniCollection {
     return Promise.resolve({ matchedCount: 1, modifiedCount: 1 });
   }
 
+  updateMany(filter, update) {
+    this.calls.push({ op: 'updateMany', filter: clonePlain(filter), update: clonePlain(update) });
+    const matched = this.docs.filter((d) => matches(d, filter));
+    for (const doc of matched) applyUpdate(doc, update);
+    return Promise.resolve({ matchedCount: matched.length, modifiedCount: matched.length });
+  }
+
   findOneAndUpdate(filter, update, opts = {}) {
     this.calls.push({ op: 'findOneAndUpdate', filter: clonePlain(filter), update: clonePlain(update), opts: clonePlain(opts) });
     const self = this;
@@ -122,8 +129,18 @@ class MiniCollection {
 
 // Filters/updates can carry Dates and RegExps — JSON round-trip would break
 // those, so the audit-trail clone is a shallow copy, not JSON.parse(JSON.stringify()).
+// FIXED 2026-08-26: Date/RegExp instances were falling into the generic
+// object-loop branch below, which iterates Object.entries() — both types
+// have zero enumerable own properties, so every Date/RegExp in a filter or
+// $set silently became `{}` in the audit trail. Harmless for a harness that
+// never asserts on a cloned Date, but a `x instanceof Date` check on
+// `.calls[...].filter.someField.$lt` (verifyTitlerClaimReclaim.js) failed
+// against an object that used to hold a real staleness cutoff — caught by
+// that new check, not previously exercised by any existing harness.
 function clonePlain(obj) {
   if (obj == null || typeof obj !== 'object') return obj;
+  if (obj instanceof Date) return new Date(obj.getTime());
+  if (obj instanceof RegExp) return new RegExp(obj.source, obj.flags);
   if (Array.isArray(obj)) return obj.map(clonePlain);
   const out = {};
   for (const [k, v] of Object.entries(obj)) out[k] = clonePlain(v);
