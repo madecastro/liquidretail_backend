@@ -71,6 +71,11 @@ const {
   PMAX_VIDEO_DERIVE_ONLY,
   PMAX_VIDEO_DERIVE_SOURCE,
   DERIVE_FROM_MASTER_FIELD,
+  // Google's hard floor (video under 10s is rejected on that surface) —
+  // reused by findSiblingMasterAd's duration-compatibility guard so a
+  // sub-floor master can never be adopted as a shared plate, regardless of
+  // its age. One definition; do not re-derive the value here.
+  GOOGLE_PMAX_VIDEO_DURATION_SEC,
   // THE shared derive-only gate (money) — one definition, imported by both
   // this render loop and services/adRegenerateService. Do not re-implement.
   resolveDeriveFromMaster
@@ -2241,6 +2246,44 @@ async function findSiblingMasterAd(ad, masterPlatformFormat) {
       { $or: [{ funnelStage: null }, { funnelStage: { $exists: false } }] }
     ]
   };
+  // ⚠️ DURATION COMPATIBILITY, NOT CALENDAR DAY. History, because a same-day
+  // version of this guard shipped first and was reverted before merge:
+  //
+  // The owner directed (2026-08-26): "remove the sibling ad master pull
+  // unless the sibling was produced the same day as the request." A
+  // same-UTC-day bound was implemented, verified, and committed — then an
+  // adversarial review of THAT version found it created a WORSE defect than
+  // the one it closed: `expandDeterministicVideo`'s identity digest for a
+  // Meta master does not include duration or a run id (deliberately — see
+  // computeDeterministicVideoDigest's money-guard comment), so re-minting
+  // Meta for a product that already has a master from a PRIOR day collides
+  // on the unique index and is silently swallowed — the pre-existing
+  // master's campaignRunIds is never updated to include today's run. Because
+  // `planDeterministicVideoAds` decides "PMax derives from Meta" ONCE per
+  // RUN (from the requested surface list), not per product from live DB
+  // state, a PMax derive still gets stamped for that product — then, with a
+  // same-day-only sibling lookup, cannot find yesterday's master. It fails
+  // honestly (no second Omni submit) but permanently occupies the
+  // (campaignId, identityDigest) slot for that PMax format as `status:
+  // 'failed'` — so a customer generating on more than one day, the ordinary
+  // case for a running campaign, could silently and permanently lose PMax
+  // 9:16 delivery. That is a more likely and more damaging failure mode
+  // than the one same-day scoping was meant to prevent.
+  //
+  // The actual hazard was never "the sibling is old" — it was "the sibling
+  // is DURATION-INCOMPATIBLE" (Google rejects PMax video under 10s; a
+  // pre-2026-08-18 master could in principle be 8s). `Ad.videoDurationSec`
+  // is resolved and stamped at MINT time (resolveVideoDurationForFormat,
+  // campaignAdsGenerationService.js), independent of whether the video has
+  // finished generating — so it is safe to gate on immediately, including
+  // for a same-run master that is still rendering. Requiring it directly
+  // closes the true hazard regardless of the sibling's age, and does not
+  // regress ordinary multi-day campaign usage. (A live production census
+  // the same day found zero sub-floor masters currently in the database —
+  // this guard is deliberately belt-and-braces against a future one, not a
+  // response to an observed failure.)
+  base.videoDurationSec = { $gte: GOOGLE_PMAX_VIDEO_DURATION_SEC };
+
   const runIds = Array.isArray(ad.campaignRunIds)
     ? ad.campaignRunIds.map(String).filter(Boolean)
     : [];
@@ -5457,6 +5500,12 @@ module.exports.requeueStrandedAds = requeueStrandedAds;
 // check alone would pass against a reimplementation that kept the name,
 // so the harness calls the real function.
 module.exports.resolveDeriveFromMaster = resolveDeriveFromMaster;
+// Exported so scripts/verifyPmaxFunnelVariants.js can drive the real function
+// against a stubbed Ad model and inspect the literal query object Mongo
+// receives, rather than pattern-matching the source text — the class of gap
+// an adversarial review flagged in this exact function (a regex proving an
+// assignment exists proves nothing about what the query actually excludes).
+module.exports.findSiblingMasterAd = findSiblingMasterAd;
 // Exported so scripts/verifyStageVisibility.js can assert the SERIALISED SHAPE
 // by calling it, rather than regexing the object literal. The gallery can only
 // show a stage it is actually sent, so "does the payload carry it" is the whole
