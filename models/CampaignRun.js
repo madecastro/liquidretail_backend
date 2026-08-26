@@ -84,7 +84,31 @@ const campaignRunSchema = new mongoose.Schema({
   // Judge LLM calls). Was previously sync on the request path, but Render's
   // edge can cut a ~28s request even when the backend is healthy — moved
   // off-request so /api/ads/generate responds 202 immediately.
-  status:       { type: String, enum: ['preparing', 'running', 'done', 'failed'], default: 'preparing', index: true },
+  // 'cancelling'/'cancelled' — SCAFFOLDING for the run-Stop feature (owner
+  // scope addition 2026-08-26, targeted for the NEXT merge cycle; not fully
+  // wired by this commit — see session notes). Mirrors the existing
+  // OperationRun cancel contract (routes/progress.js `POST /:runId/cancel`
+  // — cooperative, idempotent on terminal, tenant-scoped): 'cancelling' is
+  // set the instant an operator requests Stop and stays until every
+  // claimed ad has settled or been archived; 'cancelled' is the terminal
+  // write once that draining is done. Cooperative, not preemptive — this
+  // enum value alone does not stop anything; a claimer (adgen's renderer/
+  // titler, or this repo's own runRenderLoop fallback) must check it
+  // before claiming NEW work. Additive: no existing code path writes
+  // either value yet, so this change is behaviorally inert until the
+  // route + claim-side checks land.
+  status:       { type: String, enum: ['preparing', 'running', 'done', 'failed', 'cancelling', 'cancelled'], default: 'preparing', index: true },
+  // Cooperative-cancel signal — same shape as OperationRun.cancelRequested
+  // (services/progressService.js). Kept as its own boolean, separate from
+  // `status`, so "an operator asked" and "the run has fully drained" stay
+  // distinguishable even if a future write path needs to flip status back
+  // for some other reason before the drain completes.
+  cancelRequested: { type: Boolean, default: false },
+  cancelledAt:      { type: Date, default: null },
+  // Best-effort attribution for the Slack/UI "stopped by <who>" line — a
+  // user id string, not a ref/populate (same pattern as `requestedBy`
+  // elsewhere in this schema needing no schema registration at read time).
+  cancelledBy:      { type: String, default: null },
 
   errors: [{
     _id:        false,
