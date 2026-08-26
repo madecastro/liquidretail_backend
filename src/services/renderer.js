@@ -601,6 +601,7 @@ async function alertOrphanedClaimsOnBoot() {
 
 let stopping = false;
 let titlingResumeSweep = null;   // set by run(), stopped by shutdown()
+let bootRecoverySweep  = null;   // set by run(), stopped by shutdown()
 
 async function claimOne() {
   // GATED ON ADGEN_RENDERER_ENABLED, read HERE — not only by poll()'s
@@ -1836,6 +1837,75 @@ function scheduleNext(startTs) {
 // TITLING_RESUME_MAX defaults to 5/pass, so a pass can outlast the
 // interval — a second concurrent pass on the SAME instance would stack
 // Remotion renders on top of the poll loop's own MAX_INFLIGHT budget).
+// Boot-recovery sweep. Wired 2026-08-26 to close the 273-minute-tail defect
+// measured on run_1787699482964: master cb7a91 was left status:'rendering'
+// with claimedBy=renderer-7364c5b1 after that worker died mid-generate. The
+// receipt (veoPredictionId) was intact, but nothing on adgen was reaping it.
+// Backend's bootRecoveryService runs against the same collection UNGATED on
+// ADGEN_RENDERER_ENABLED (see the ADGEN_RENDERER_ENABLED comment further
+// above in this file) — but only on backend's own web boot, which is a
+// rare event during a busy adgen day, so the recovery gap was hours long.
+//
+// bootRecoveryService is money-safe by construction (see its own header):
+// it ONLY touches ads with a spend receipt (veoPredictionId /
+// imageGeneration.predictionId) that have been status:'rendering' with a
+// stale updatedAt beyond RESUME_STALE_MIN (default 5min = five missed 60s
+// heartbeats). Peeks the paid prediction with a GET, either fetches/uploads
+// the finished asset or terminal-fails the row — never re-submits. Safe to
+// run redundantly across autoscaled instances (its own header: "NO CLAIM,
+// ON PURPOSE — the only provider call is a free GET").
+//
+// Two triggers:
+//   1. BOOT — one immediate pass so a newly-booted renderer picks up an
+//      orphan its dead predecessor left behind.
+//   2. PERIODIC — every BOOT_RECOVERY_INTERVAL_MIN (default 5min). Covers
+//      the autoscale-quiet case (long stretch with no new boots).
+//
+// Gated on isAdgenRendererEnabled() — same rationale as titlingResumeSweep:
+// when the flag is OFF (rollback), the backend owns this collection and
+// adgen must stand down.
+function startBootRecoverySweep() {
+  const { resumeInFlightAds } = require('./bootRecoveryService');
+  const intervalMin = Math.max(1, parseInt(process.env.BOOT_RECOVERY_INTERVAL_MIN, 10) || 5);
+  let inFlightPass = false;
+  let timeoutHandle = null;
+  let intervalHandle = null;
+
+  const tick = () => {
+    if (stopping || inFlightPass) return;
+    if (!isAdgenRendererEnabled()) return;   // backend owns this collection right now
+    inFlightPass = true;
+    resumeInFlightAds()
+      .then((out) => {
+        if (out && (out.recovered || out.failed || out.stillRunning || out.recoverableNotCollected)) {
+          console.log(
+            `renderer[${WORKER_ID}]: boot recovery — considered=${out.considered} ` +
+            `recovered=${out.recovered} failed=${out.failed} stillRunning=${out.stillRunning} ` +
+            `recoverableNotCollected=${out.recoverableNotCollected || 0} unknown=${out.unknown || 0}`
+          );
+        }
+      })
+      .catch(err => console.warn(`renderer[${WORKER_ID}]: boot recovery failed — ${err.message}`))
+      .finally(() => { inFlightPass = false; });
+  };
+
+  // Immediate pass on boot — catches orphans left by a dead predecessor.
+  // Small delay (10s) so mongoose is fully connected and the renderer's own
+  // heartbeat has fired at least once (avoids the sweep briefly seeing this
+  // instance's own about-to-heartbeat ads as stale).
+  timeoutHandle = setTimeout(tick, 10 * 1000);
+  intervalHandle = setInterval(tick, intervalMin * 60 * 1000);
+  if (typeof timeoutHandle.unref === 'function') timeoutHandle.unref();
+  if (typeof intervalHandle.unref === 'function') intervalHandle.unref();
+
+  return {
+    stop() {
+      clearTimeout(timeoutHandle);
+      clearInterval(intervalHandle);
+    }
+  };
+}
+
 function startTitlingResumeSweep() {
   // Lazy require — keeps titlingResumeService (and its own lazy require of
   // brandScriptExecutor) out of this module's own top-level require graph;
@@ -1902,6 +1972,7 @@ async function run() {
     console.log(`renderer[${WORKER_ID}] alive — uptime ${Math.round(process.uptime())}s, inflight ${inFlight}/${MAX_INFLIGHT}, handoff ${g ? 'ON' : 'OFF'}`);
   }, 30_000).unref();
   titlingResumeSweep = startTitlingResumeSweep();
+  bootRecoverySweep  = startBootRecoverySweep();
 }
 
 // Graceful shutdown. Render fires SIGTERM ~30s before SIGKILL on deploy /
@@ -1924,6 +1995,7 @@ async function shutdown() {
   if (stopping) return;
   stopping = true;
   if (titlingResumeSweep) titlingResumeSweep.stop();
+  if (bootRecoverySweep)  bootRecoverySweep.stop();
   const t0 = Date.now();
   console.log(`renderer[${WORKER_ID}] shutting down — inflight=${inFlight}, drain up to ${SHUTDOWN_DRAIN_MS}ms`);
   const deadline = t0 + SHUTDOWN_DRAIN_MS;

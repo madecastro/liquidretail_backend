@@ -564,10 +564,18 @@ concurrently.
   which failures are exposed to it. The atomic claim still prevents a
   double-title either way. Fixing it requires a change to the backend
   repo — out of scope here, flagged for a follow-up.
-  **`bootRecoveryService` is STILL unwired** — a different mechanism
-  (recovers a finished Omni master from a spend receipt after a
-  mid-generation crash, before any titling ever starts) that this PR did
-  not touch. Don't assume it's covered by the above.
+  **`bootRecoveryService` is WIRED as of 2026-08-26** — closes the
+  273-minute-tail defect measured on run_1787699482964, where a stuck
+  master claim (`renderer-7364c5b1` died holding cb7a91) blocked
+  `maybeFinalizeRun` for 4.5 hours until backend eventually got to it.
+  Wired from `renderer.js` (`startBootRecoverySweep`) with the same
+  90s-delay/5-min-interval pattern as `titlingResumeService`, gated on
+  `isAdgenRendererEnabled()` so it stands down when the backend owns
+  the collection. Money-safe by construction (only touches
+  `status:'rendering'` + spend receipt + stale updatedAt; peeks with a
+  free GET; never re-submits — its own header pins that). Redundant
+  across autoscaled instances is fine (no claim, guarded writes).
+  Pinned by `scripts/verifyBootRecoveryWired.js` (23 checks).
 
 ---
 
