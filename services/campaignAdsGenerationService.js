@@ -534,62 +534,74 @@ function isUnifiedNineSixteenMasterEnabled() {
  * ⚠️ THIS IS A COHERENCE GATE, NOT A FEATURE FLAG, and it is deliberately
  * BEHAVIOURAL rather than a hand-synced boolean. Sharing a plate is only
  * legitimate if both destinations asked the model for the SAME camera.
- * Today they do not: veoPromptBuilder selects the `pmax` directive profile
- * for a pmax_video_* destination and the omni/grok profile for Meta, so a
- * shared Meta plate would deliver Meta's framing to YouTube Shorts — the
- * exact framing PMax Phase B rejected. The owner's paired directive is to
- * standardise Meta onto the PMax prompt; that work lands in
- * services/veoPromptBuilder.js (NOT touched here).
+ * Two ways of agreeing both count: the profile NAME matching, or the
+ * resolved DIRECTIVES object being identical under different names.
+ * Anything else, including a throw or a missing export, is "cannot prove
+ * coherence" → do not share → two bills. Fail-closed: paying $0.90 beats
+ * shipping the wrong framing.
  *
- * Rather than duplicate that lane's flag — which would silently rot the
- * moment either side is renamed — we ASK the prompt builder whether the two
- * destinations now resolve to the same camera. Two ways of standardising
- * both count: the profile NAME matching, or the resolved DIRECTIVES object
- * being identical under different names. Anything else, including a throw
- * or a missing export, is "cannot prove coherence" → do not share → two
- * bills. Fail-closed: paying $0.90 beats shipping the wrong framing.
+ * ⚠️ THE LOAD-BEARING CONJUNCT IS CAMERA EQUALITY, NOT THE HOOK-FIRST
+ * SWITCH. History, because the old protection is easy to restore by
+ * mistake:
+ *
+ *   2026-08-18 — owner directed one 9:16 minting across Meta+PMax AND
+ *   standardised Meta onto the hook-first camera. Conjunct 4 was written
+ *   as `isHookFirstVideoPromptEnabled() === true`, plus a belt-and-braces
+ *   profile/directive equality check. That comment argued profile equality
+ *   is a "dead conjunct" (true in BOTH switch states) and that the state
+ *   it would admit is "the worst one": a shared plate carrying Meta's Ken
+ *   Burns horizontal pan delivered to YouTube Shorts — a framing "PMax
+ *   Phase B rejected".
+ *
+ *   2026-08-20 — owner reverted the hook-first DEFAULT
+ *   (`VIDEO_HOOK_FIRST_PROMPT=false` / `PMAX_VIDEO_DIRECTIVES=false` in
+ *   config/defaults.env). Conjunct 4 then failed closed on every mixed
+ *   run, so the company paid a second 9:16 Omni master (~$0.90) per
+ *   product for an independent render of the SAME camera.
+ *
+ *   Why that protection was VACUOUS under the frozen prompt — verified
+ *   2026-08-26 against services/veoPromptBuilder.js:938-944: the
+ *   non-hook-first (`else`) timeline is NOT aspect-aware. It emits
+ *   `Scene 1 (...): slow horizontal pan left→right, ~10–15% movement.`
+ *   for every destination and aspect — Meta 9:16, PMax 9:16 AND PMax
+ *   16:9. PMax 9:16 ALREADY receives that exact horizontal pan today
+ *   with sharing off. The conjunct never prevented the framing it was
+ *   written to prevent; it only prevented the two surfaces from sharing
+ *   one render OF that framing. (Contrast the hook-first arm at :919-923,
+ *   which IS aspect-aware.)
+ *
+ *   2026-08-26 — owner, verbatim: "Decouple them but leave them sharing
+ *   a plate and prompt for now. At some point we may choose to further
+ *   decouple, but right now they should share the plate and do a single
+ *   generation." The env switch stays OFF — do NOT flip those defaults.
+ *   Sharing is restored by making conjunct 4 a genuine camera-coherence
+ *   test: share iff META_VIDEO_MASTER_KEY and PMAX_VIDEO_DERIVE_SOURCE
+ *   resolve to the same camera, regardless of the hook-first switch.
+ *
+ *   What makes this conjunct bite again: a future change giving the two
+ *   destinations genuinely different camera text (different profile names
+ *   whose directives also differ). Sharing then self-disables and a mixed
+ *   run bills 3 again. That is the intended fail-closed.
+ *
+ *   `UNIFIED_VIDEO_9_16_MASTER=false` remains the no-deploy kill switch
+ *   for the whole feature, independent of this probe.
+ *
+ *   Do NOT re-implement VIDEO_HOOK_FIRST_PROMPT / PMAX_VIDEO_DIRECTIVES
+ *   here. This function no longer consults the switch; promptProfileFor
+ *   is the authority for "what camera does this destination get".
  */
 function isSharedPortraitPlatePromptCoherent() {
   let promptProfileFor;
   let directivesForProfile;
-  let isHookFirstVideoPromptEnabled;
   try {
     ({
       promptProfileFor,
-      directivesForProfile,
-      isHookFirstVideoPromptEnabled
+      directivesForProfile
     } = require('./veoPromptBuilder'));
   } catch (err) {
     return false;
   }
 
-  // ⚠️ THE LOAD-BEARING CONJUNCT — AND PROFILE EQUALITY ALONE IS NOT IT.
-  // MEASURED against the merged prompt lane: with the hook-first switch OFF
-  // both destinations fall through to the SAME `gemini-omni` profile, so an
-  // equality test returns true in BOTH switch states and gates nothing at
-  // all. That is not merely a bad configuration, it is a dead conjunct — and
-  // the state it lets through is the worst one: the operator rolls the camera
-  // standardization back to the frozen Ken Burns prompt and silently keeps a
-  // SHARED master shot with Meta's pan, delivered to YouTube Shorts. That
-  // framing is exactly what PMax Phase B rejected, and the kill switch would
-  // have reverted half the change while leaving the other half running.
-  //
-  // So the question is not "do both destinations agree?" but "did both
-  // destinations get the STANDARDIZED hook-first camera?" — which only the
-  // prompt lane can answer. Imported, never re-implemented: the switch reads
-  // TWO env names (VIDEO_HOOK_FIRST_PROMPT + the legacy PMAX_VIDEO_DIRECTIVES)
-  // with a deliberate fail-safe OR, and duplicating that here is precisely
-  // the drift this whole file argues against.
-  if (typeof isHookFirstVideoPromptEnabled !== 'function') return false;
-  try {
-    if (isHookFirstVideoPromptEnabled() !== true) return false;
-  } catch (err) {
-    return false;
-  }
-
-  // Belt-and-braces below: the switch says the standardization is ON, so the
-  // two destinations must ALSO actually resolve to the same camera. Keeps the
-  // gate honest if a future destination stops being covered by the switch.
   if (typeof promptProfileFor !== 'function') return false;
   // Compare across the caps shapes this pipeline actually runs: the live
   // default model is gemini-omni, and null covers the scaffold / override

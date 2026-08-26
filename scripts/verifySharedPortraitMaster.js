@@ -12,14 +12,25 @@
  * switch) is ON, ONE portrait plate is minted and the PMax portrait family
  * derives from it for free, so a mixed run pays $1.80 instead.
  *
- * ⚠️ CONJUNCT 4 UPDATE, 2026-08-20 — owner reverted the 2026-08-18 hook-first
- * standardization (CLAUDE.md §00): `config/defaults.env` now ships
- * VIDEO_HOOK_FIRST_PROMPT=false / PMAX_VIDEO_DIRECTIVES=false, so conjunct 4
- * fails closed on a fresh production boot and a mixed run is back to THREE
- * billable masters / $2.70. That is this gate working as designed, not a
- * regression to fix here — see F1/F6 below, which already pin the OFF arm.
- * The $1.80 shared-plate path remains fully live and tested (C1) as an
- * explicit opt-in: flip either switch name back to "true" to restore it.
+ * ⚠️ CONJUNCT 4 UPDATE, 2026-08-26 — conjunct 4 is now CAMERA EQUALITY, not
+ * the hook-first env switch. History: the owner reverted the 2026-08-18
+ * hook-first standardization on 2026-08-20 (`config/defaults.env` ships
+ * VIDEO_HOOK_FIRST_PROMPT=false / PMAX_VIDEO_DIRECTIVES=false), which made
+ * the old switch-based conjunct fail closed on every mixed run — THREE
+ * billable masters / $2.70 instead of two / $1.80. That protection was
+ * VACUOUS: the frozen (non-hook-first) timeline is destination-blind
+ * (services/veoPromptBuilder.js:938-944 emits the same left→right pan for
+ * Meta 9:16, PMax 9:16 AND PMax 16:9), so PMax 9:16 ALREADY received Meta's
+ * pan with sharing off. The switch never prevented the framing it was
+ * written to prevent; it only prevented the two surfaces from sharing one
+ * render OF that framing, at +$0.90/product/mixed run.
+ * Owner 2026-08-26, verbatim: "Decouple them but leave them sharing a plate
+ * and prompt for now... right now they should share the plate and do a
+ * single generation." So: the env defaults stay FALSE (do not flip them),
+ * and sharing is gated on the two destinations actually resolving to the
+ * same camera. On the shipped config that is TRUE, so a mixed run bills 2.
+ * It self-disables (bills 3) the moment the two cameras genuinely diverge —
+ * F1/F6 pin both arms.
  *
  * THE FOUR WAYS THIS CHANGE CAN COST MONEY OR BREAK DELIVERY, each pinned:
  *   1. UNDER-DELIVER — pmax_video_9_16 goes free on a PMax-ONLY run, where
@@ -129,11 +140,14 @@ const HOOK_ON = {
   promptProfileFor: () => 'hook_first',
   directivesForProfile: (p) => ({ profile: p })
 };
-// ⚠️ THE HAZARD CONFIGURATION. Standardization rolled back. Both destinations
-// fall through to the SAME frozen `gemini-omni` profile — so the profiles are
-// still EQUAL and an equality-only gate calls this "coherent" and keeps
-// sharing a Ken Burns plate with Meta's pan, delivered to YouTube Shorts.
-// This stub is what makes F6 a real check rather than a restatement of F1.
+// ⚠️ THE SHIPPED PRODUCTION CONFIGURATION (owner revert 2026-08-20).
+// Standardization rolled back, so both destinations fall through to the SAME
+// frozen `gemini-omni` profile — cameras EQUAL. Under the 2026-08-26 gate this
+// SHARES, which is the owner's explicit instruction ("share the plate and
+// prompt, single generation"). It is legitimate precisely because the frozen
+// timeline is destination-blind (veoPromptBuilder.js:938-944): PMax 9:16
+// already receives Meta's pan with sharing OFF, so sharing one render of it
+// changes nothing creatively and saves ~$0.90/product/mixed run.
 const HOOK_OFF_PROFILES_EQUAL = {
   isHookFirstVideoPromptEnabled: () => false,
   promptProfileFor: () => 'gemini-omni',
@@ -147,6 +161,12 @@ const HOOK_ON_PROFILES_DIFFER = {
   directivesForProfile: (p) => ({ profile: p })
 };
 
+// Comment-stripped view of the service source. Several checks below assert a
+// retired symbol is absent from CODE while the history comment still names it.
+function stripComments(src) {
+  return String(src).replace(/\/\*[\s\S]*?\*\//g, '').replace(/(^|[^:])\/\/.*$/gm, '$1');
+}
+
 const PROD_ENV = { PMAX_FUNNEL_VARIANTS: 'true', META_VIDEO_DERIVATIVES: 'true',
   UNIFIED_VIDEO_9_16_MASTER: 'true', META_VIDEO_DURATION_SEC: undefined,
   VIDEO_HOOK_FIRST_PROMPT: undefined, PMAX_VIDEO_DIRECTIVES: undefined };
@@ -156,8 +176,12 @@ const shared = (fn) => withPromptModule(HOOK_ON, () => withEnv(PROD_ENV, fn));
 // Shared-portrait INACTIVE — via the rolled-back switch, which is also the
 // hazard above. Every existing "unshared" assertion therefore now doubles as
 // a guard on that configuration.
+// ⚠️ RETARGETED 2026-08-26. "Unshared" must now mean CAMERAS GENUINELY
+// DIFFER, because switch-off-with-equal-cameras SHARES under the new gate.
+// Left pointing at HOOK_OFF_PROFILES_EQUAL, D4a/F3a would silently assert
+// the SHARING plan and go green for the wrong reason.
 const unshared = (fn) =>
-  withPromptModule(HOOK_OFF_PROFILES_EQUAL, () => withEnv(PROD_ENV, fn));
+  withPromptModule(HOOK_ON_PROFILES_DIFFER, () => withEnv(PROD_ENV, fn));
 
 const plan  = (masters) => svc.planDeterministicVideoAds(masters);
 const bill  = (p) => p.filter((r) => r.billable);
@@ -373,18 +397,28 @@ check('A4 [MONEY] resolvePortraitMasterFormat is DEFINED once and CALLED once',
 
 // ── F. [MONEY] every conjunct of the gate fails closed ─────────────────
 {
-  check('F1 [MONEY] camera standardization OFF ⇒ NO sharing (2 bills become 3)',
+  check('F1 [MONEY] cameras DIFFER ⇒ NO sharing (2 bills become 3)',
     unshared(() => bill(plan(MIXED)).length) === 3,
-    'sharing a plate that was not shot with the standardized camera delivers '
-    + 'Meta\'s pan to YouTube Shorts');
-  check('F1a and the coherence probe reports it honestly',
-    unshared(() => svc.isSharedPortraitPlatePromptCoherent()) === false
-      && shared(() => svc.isSharedPortraitPlatePromptCoherent()) === true);
+    'sharing a plate shot for a different camera delivers the wrong framing');
+  check('F1a [MONEY] switch OFF but cameras EQUAL ⇒ SHARES, bills 2 (owner 2026-08-26)',
+    withPromptModule(HOOK_OFF_PROFILES_EQUAL, () => withEnv(PROD_ENV, () =>
+      svc.isSharedPortraitPlatePromptCoherent() === true
+      && svc.resolvePortraitMasterFormat(MIXED) === META_MASTER
+      && bill(plan(MIXED)).length === 2)),
+    'this is the SHIPPED config: the hook-first switch is off and must no '
+    + 'longer block sharing, or the company pays $2.70 for $1.80 of output');
+  check('F1b switch ON + cameras EQUAL ⇒ still shares, bills 2 (no ON-arm regression)',
+    shared(() => svc.isSharedPortraitPlatePromptCoherent() === true
+      && bill(plan(MIXED)).length === 2));
   check('F2 the gate is a real probe of veoPromptBuilder, not a constant',
     /require\(['"]\.\/veoPromptBuilder['"]\)/.test(svcSrc)
-      && /isHookFirstVideoPromptEnabled/.test(svcSrc),
+      && /promptProfileFor\(/.test(svcSrc),
     'a hard-coded true here removes the only protection against a plate '
     + 'that was shot for the wrong destination');
+  check('F2a the retired switch is GONE from code (a comment mention is fine)',
+    !/isHookFirstVideoPromptEnabled/.test(stripComments(svcSrc)),
+    'a leftover typeof/!==true check on the switch silently bills 3 again '
+    + 'whenever an older veoPromptBuilder lacks that export');
 
   // ── F6 [MONEY] THE CROSS-BRANCH DEFECT THIS GROUP EXISTS FOR ──────────
   // Profile EQUALITY is not the right predicate and this is the proof.
@@ -394,35 +428,68 @@ check('A4 [MONEY] resolvePortraitMasterFormat is DEFINED once and CALLED once',
   // master on YouTube Shorts, so the kill switch would revert the camera
   // and silently leave the sharing running. Restoring an equality-only gate
   // must turn THIS check red.
-  check('F6 [MONEY] switch OFF but profiles EQUAL ⇒ still refuses to share',
-    withPromptModule(HOOK_OFF_PROFILES_EQUAL, () => withEnv(PROD_ENV, () => {
-      const profilesAgree =
-        HOOK_OFF_PROFILES_EQUAL.promptProfileFor(null, { platformFormat: META_MASTER })
-        === HOOK_OFF_PROFILES_EQUAL.promptProfileFor(null, { platformFormat: PMAX_9 });
-      // The premise of the check: this really is the equal-profiles case.
-      return profilesAgree
+  check('F6 [MONEY] cameras genuinely DIFFER ⇒ refuses, bills 3 (the LIVE conjunct)',
+    withPromptModule(HOOK_ON_PROFILES_DIFFER, () => withEnv(PROD_ENV, () => {
+      const profilesDiffer =
+        HOOK_ON_PROFILES_DIFFER.promptProfileFor(null, { platformFormat: META_MASTER })
+        !== HOOK_ON_PROFILES_DIFFER.promptProfileFor(null, { platformFormat: PMAX_9 });
+      // The premise of the check: this really is the differing-camera case.
+      return profilesDiffer
         && svc.isSharedPortraitPlatePromptCoherent() === false
         && svc.resolvePortraitMasterFormat(MIXED) === PMAX_9
         && bill(plan(MIXED)).length === 3;
     })),
-    'equality-only gating is vacuous — it is TRUE in both switch states, so '
-    + 'it gates nothing at all once the prompt lane lands');
-  check('F6a the load-bearing conjunct is the SWITCH, not profile equality',
-    /isHookFirstVideoPromptEnabled\(\) !== true/.test(svcSrc),
-    'the gate must ask "did both get the standardized camera?", not merely '
-    + '"do both agree?"');
-  check('F6b a missing switch export fails CLOSED (bills rather than shares)',
+    'if camera inequality stops refusing, conjunct 4 is vacuous and a plate '
+    + 'we cannot prove is the same camera gets shared across destinations');
+  check('F6a the load-bearing predicate is CAMERA EQUALITY, not the switch',
+    /promptProfileFor\(caps, \{ platformFormat: META_VIDEO_MASTER_KEY \}\)/.test(svcSrc)
+      && !/isHookFirstVideoPromptEnabled\(\) !== true/.test(stripComments(svcSrc)),
+    'restoring the switch comparison would refuse the frozen prompt the '
+    + 'owner is actually running, re-breaking the $1.80 path');
+  check('F6b [MONEY] switch export ABSENT but cameras equal ⇒ SHARES (switch truly dropped)',
     withPromptModule(
-      { promptProfileFor: () => 'hook_first', directivesForProfile: () => ({}) },
+      { promptProfileFor: () => 'gemini-omni', directivesForProfile: (p) => ({ profile: p }) },
       () => withEnv(PROD_ENV, () => svc.isSharedPortraitPlatePromptCoherent())
-    ) === false,
-    'an older veoPromptBuilder without the export must not unlock free 9:16');
-  check('F6c a throwing switch fails CLOSED',
+    ) === true,
+    'a surviving typeof-check on the retired switch would bill 3 whenever an '
+    + 'older builder lacks that export — this is the canary for that');
+  check('F6b2 a non-function promptProfileFor fails CLOSED',
+    withPromptModule({ promptProfileFor: null, directivesForProfile: () => ({}) },
+      () => withEnv(PROD_ENV, () => svc.isSharedPortraitPlatePromptCoherent())) === false);
+  check('F6c a throwing promptProfileFor fails CLOSED',
     withPromptModule(
-      { isHookFirstVideoPromptEnabled: () => { throw new Error('boom'); },
-        promptProfileFor: () => 'hook_first', directivesForProfile: () => ({}) },
+      { promptProfileFor: () => { throw new Error('boom'); },
+        directivesForProfile: () => ({}) },
       () => withEnv(PROD_ENV, () => svc.isSharedPortraitPlatePromptCoherent())
     ) === false);
+  check('F6c2 a throwing directivesForProfile (names differ) fails CLOSED',
+    withPromptModule(
+      { promptProfileFor: (caps, o) => (String(o && o.platformFormat).startsWith('pmax_') ? 'a' : 'b'),
+        directivesForProfile: () => { throw new Error('boom'); } },
+      () => withEnv(PROD_ENV, () => svc.isSharedPortraitPlatePromptCoherent())
+    ) === false);
+  check('F6g a falsy resolved profile fails CLOSED',
+    withPromptModule({ promptProfileFor: () => null, directivesForProfile: () => ({}) },
+      () => withEnv(PROD_ENV, () => svc.isSharedPortraitPlatePromptCoherent())) === false);
+  check('F6h missing directivesForProfile when names differ fails CLOSED',
+    withPromptModule(
+      { promptProfileFor: (caps, o) => (String(o && o.platformFormat).startsWith('pmax_') ? 'a' : 'b') },
+      () => withEnv(PROD_ENV, () => svc.isSharedPortraitPlatePromptCoherent())) === false);
+  check('F6i convergence for ONE caps shape only does NOT unlock sharing',
+    withPromptModule(
+      { promptProfileFor: (caps, o) => (caps && caps.paramShape === 'gemini-omni'
+          ? 'gemini-omni'
+          : (String(o && o.platformFormat).startsWith('pmax_') ? 'a' : 'b')),
+        directivesForProfile: (p) => ({ profile: p }) },
+      () => withEnv(PROD_ENV, () => svc.isSharedPortraitPlatePromptCoherent())) === false,
+    'both loop iterations must agree — a model-specific convergence must not '
+    + 'unlock a plate shared across every model');
+  check('F6j different profile NAMES with IDENTICAL directives ⇒ shares',
+    withPromptModule(
+      { promptProfileFor: (caps, o) => (String(o && o.platformFormat).startsWith('pmax_') ? 'a' : 'b'),
+        directivesForProfile: () => ({ same: true }) },
+      () => withEnv(PROD_ENV, () => svc.isSharedPortraitPlatePromptCoherent())) === true,
+    'the directives arm must stay live, not be reduced to name equality');
   check('F6d switch ON but a destination escaped it ⇒ still refuses (belt-and-braces)',
     withPromptModule(HOOK_ON_PROFILES_DIFFER,
       () => withEnv(PROD_ENV, () => svc.isSharedPortraitPlatePromptCoherent())) === false,
@@ -671,7 +738,8 @@ if (failures.length) {
   process.exit(1);
 }
 console.log(`✅ verifySharedPortraitMaster: ${passed}/${total} checks passed`);
-console.log('   mixed run = 21 ads / 2 billable when hook-first is ON ($1.80); ' +
-  '3 billable when OFF ($2.70 — the config/defaults.env production default as of 2026-08-20)');
+console.log('   mixed run = 21 ads / 2 billable ($1.80) whenever the two portrait ' +
+  'destinations resolve to the SAME camera — which the shipped frozen prompt does; ' +
+  '3 billable ($2.70) when the cameras genuinely differ, or UNIFIED_VIDEO_9_16_MASTER=false');
 console.log('   PMax-only = 9 ads / 2 billable (fail-closed, unchanged)');
 console.log('   Meta-only = 12 ads / 1 billable (unchanged)');
