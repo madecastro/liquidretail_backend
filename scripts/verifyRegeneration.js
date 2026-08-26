@@ -773,10 +773,47 @@ const atRaw        = 'r'.repeat(4000);
 
   // ── R6c: performRegeneration is exported for the adgen consumer to reuse
   // (and for this harness to assert it exists with the right arity) ──────
-  check('R6c performRegeneration is exported (adgen runClaimedRegeneration calls it)',
+  // NOTE: adgen's runClaimedRegeneration does NOT call this — it has its
+  // own self-contained duplicate (see that repo's adRegenerateService.js
+  // header for why: scripts/verifyVideoResumeFromReceipt.js there
+  // statically extracts regenerateAd's own body and expects it to reach
+  // runVideoFull directly, so a shared cross-repo helper isn't reachable
+  // there anyway; this export exists for THIS repo's own regenerateAd to
+  // reuse, and so this harness can assert it exists with the right arity).
+  check('R6c performRegeneration is exported and reused by this repo\'s own local-execution path',
     typeof regen.performRegeneration === 'function');
   check('R6c performRegeneration takes one options object (not positional args)',
     regen.performRegeneration.length === 1);
+
+  // ── R6d: MONEY — the local-execution lock unconditionally nulls the
+  // adgen handoff markers, not just on success at markComplete ───────────
+  // Defense in depth against a stale leftover from a prior stuck deferred
+  // attempt: if regenerationRequest / regenerateClaimedByWorker survive
+  // past markComplete (e.g. an operator manually reset only
+  // `regenerating:false` to unstick a row), a NEW local regenerate winning
+  // the SAME atomic lock write must null them in that SAME write — not a
+  // separate one — or an adgen consumer could claim the stale object and
+  // run in parallel with this call using different (stale) arguments.
+  // Source-checked (not just import-checked) because this is a Mongo
+  // update-document shape, not something callable offline without a DB.
+  {
+    const fs = require('fs');
+    const path = require('path');
+    const src = fs.readFileSync(path.join(__dirname, '../services/adRegenerateService.js'), 'utf8');
+    const fnIdx = src.indexOf('async function regenerateAd(');
+    if (fnIdx < 0) throw new Error('regenerateAd not found in source');
+    const lockSetIdx = src.indexOf('} else {', fnIdx);
+    if (lockSetIdx < 0) throw new Error('the deferToAdgen else-branch not found in regenerateAd');
+    const elseBodyEndIdx = src.indexOf('const lockResult = await Ad.updateOne(', lockSetIdx);
+    if (elseBodyEndIdx < 0) throw new Error('could not bound the else-branch (lockResult write not found after it)');
+    const body = src.slice(lockSetIdx, elseBodyEndIdx);
+    check('R6d local-execution branch (else, not deferToAdgen) explicitly nulls regenerationRequest',
+      /lockSet\.regenerationRequest\s*=\s*null/.test(body));
+    check('R6d local-execution branch explicitly nulls regenerateClaimedByWorker',
+      /lockSet\.regenerateClaimedByWorker\s*=\s*null/.test(body));
+    check('R6d local-execution branch explicitly nulls regenerateClaimedAt',
+      /lockSet\.regenerateClaimedAt\s*=\s*null/.test(body));
+  }
 }
 
 if (failures.length) {

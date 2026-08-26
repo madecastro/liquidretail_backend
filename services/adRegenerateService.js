@@ -641,6 +641,23 @@ async function regenerateAd({
       kind, prompt, mode: effMode, requestedBy, videoModel, promptOverride,
       videoPromptRaw, videoPromptGuidance, imagePromptRaw
     });
+  } else {
+    // MONEY — unconditionally null out the adgen handoff markers on the
+    // LOCAL path, even though markComplete already clears them at the end
+    // of every regenerate (both paths). Defense in depth against a stale
+    // leftover: if a prior deferred attempt got stuck (adgen crashed after
+    // claiming, or an operator manually reset `regenerating:false` to
+    // unstick a row without also clearing these three fields), a NEW local
+    // regenerate winning this SAME atomic lock write is what makes
+    // regenerationRequest null again — in the SAME write that flips
+    // regenerating:true, not a separate one. Without this, an adgen
+    // consumer polling with a stale regenerateClaimedByWorker:null could
+    // claim the stale regenerationRequest object the instant this lock is
+    // won and run performRegeneration in parallel with THIS call, on
+    // different (stale vs current) call args — a genuine double submit.
+    lockSet.regenerationRequest       = null;
+    lockSet.regenerateClaimedByWorker = null;
+    lockSet.regenerateClaimedAt       = null;
   }
   const lockResult = await Ad.updateOne(
     { _id: adId, regenerating: { $ne: true } },
