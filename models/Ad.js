@@ -229,6 +229,33 @@ const adSchema = new mongoose.Schema({
     default: []
   },
 
+  // Ad-gen microservice handoff for REGENERATE (routing fix, 2026-08-26).
+  // Mirrors the claimedByWorker/claimedAt pattern above, one level up: that
+  // pair claims a MINT-time render; this pair claims a REGENERATE request.
+  //
+  // regenerationRequest: non-null ONLY when the backend decided (at request
+  // time, reading isAdgenRendererEnabled() once, synchronously) to DEFER this
+  // regenerate to adgen rather than run it in this process. This is the
+  // single bit that decides who executes the work — NOT `regenerating`,
+  // which is shared by both the local-execution path (ADGEN_RENDERER_ENABLED
+  // false) and the deferred path, and NOT `regenerateClaimedByWorker` alone,
+  // which starts null on every regenerate regardless of path. The local path
+  // NEVER writes this field, so a poller keying its claim query on
+  // `regenerationRequest: {$ne: null}` cannot ever pick up a row the backend
+  // is already executing in-process. Cleared by markComplete alongside
+  // `regenerating`. Carries exactly the pass-through options
+  // services/adRegenerateService.regenerateAd() would otherwise have
+  // received as call arguments — see that file for the full shape.
+  regenerationRequest: { type: mongoose.Schema.Types.Mixed, default: null },
+  // Which adgen regenerate-consumer worker (if any) has claimed a deferred
+  // regenerationRequest. NULL while queued for adgen but not yet claimed.
+  // A worker atomically claims by findOneAndUpdate({regenerating:true,
+  // regenerationRequest:{$ne:null}, regenerateClaimedByWorker:null},
+  // {$set:{regenerateClaimedByWorker, regenerateClaimedAt}}) — same shape as
+  // the mint-time claim above. Cleared by markComplete.
+  regenerateClaimedByWorker: { type: String, default: null, index: true },
+  regenerateClaimedAt:       { type: Date,   default: null },
+
   // sha256 over identity inputs (campaignId, productId, mediaId,
   // template, aspectRatio, variantKind, paletteSource, ctaText,
   // ctaUrl, ctaUrlParams, rafflePrizeMediaId). Computed at queue time;

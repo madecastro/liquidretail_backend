@@ -711,6 +711,111 @@ const atRaw        = 'r'.repeat(4000);
     directImage.composeCorrectiveOverride(null, NOTE) === null);
 }
 
+// ── R6: ad-gen handoff (routing fix, 2026-08-26) ─────────────────────────
+// Owner directive: "regenerate ... should absolutely be running through
+// adgen." When ADGEN_RENDERER_ENABLED is true the backend must not submit
+// the regeneration itself — it stamps Ad.regenerationRequest and returns;
+// adgen's regenerate consumer claims and runs it. R6 pins the pure decision
+// + payload-shape helpers regenerateAd() calls internally (no DB — the
+// atomic lock write itself is exercised by production, not this harness).
+{
+  const savedAdgenFlag = process.env.ADGEN_RENDERER_ENABLED;
+
+  // ── R6a: the decision reads the SAME call-time flag as the render loop
+  // and titling resume gates (adgenBridge.isAdgenRendererEnabled) ────────
+  check('R6a unset ADGEN_RENDERER_ENABLED -> local execution (matches file default false)',
+    (() => { delete process.env.ADGEN_RENDERER_ENABLED; return regen.shouldDeferToAdgen() === false; })());
+  check('R6a ADGEN_RENDERER_ENABLED=true -> defer to adgen',
+    (() => { process.env.ADGEN_RENDERER_ENABLED = 'true'; return regen.shouldDeferToAdgen() === true; })());
+  check('R6a ADGEN_RENDERER_ENABLED=false -> local execution',
+    (() => { process.env.ADGEN_RENDERER_ENABLED = 'false'; return regen.shouldDeferToAdgen() === false; })());
+  check('R6a ADGEN_RENDERER_ENABLED=TRUE (any case) -> defer to adgen',
+    (() => { process.env.ADGEN_RENDERER_ENABLED = 'TRUE'; return regen.shouldDeferToAdgen() === true; })());
+  check('R6a garbage value -> local execution (fail-safe OFF, same as adgenBridge)',
+    (() => { process.env.ADGEN_RENDERER_ENABLED = 'yes-please'; return regen.shouldDeferToAdgen() === false; })());
+
+  if (savedAdgenFlag === undefined) delete process.env.ADGEN_RENDERER_ENABLED;
+  else process.env.ADGEN_RENDERER_ENABLED = savedAdgenFlag;
+
+  // ── R6b: regenerationRequest payload shape — one definition, both sides
+  // trust it (regenerateAd stamps it; the adgen consumer's
+  // runClaimedRegeneration reads it back) ────────────────────────────────
+  const fullReq = regen.buildRegenerationRequest({
+    kind: 'video', prompt: 'make it punchier', mode: 'full', requestedBy: 'user_1',
+    videoModel: 'atlas-omni', promptOverride: null,
+    videoPromptRaw: 'RAW CAMERA PROMPT', videoPromptGuidance: null, imagePromptRaw: null
+  });
+  check('R6b payload carries kind',
+    fullReq.kind === 'video');
+  check('R6b payload carries every pass-through field the local path uses',
+    fullReq.prompt === 'make it punchier'
+    && fullReq.mode === 'full'
+    && fullReq.requestedBy === 'user_1'
+    && fullReq.videoModel === 'atlas-omni'
+    && fullReq.videoPromptRaw === 'RAW CAMERA PROMPT');
+  check('R6b absent optional fields normalise to null, not undefined (Mongoose Mixed needs a concrete value)',
+    (() => {
+      const bare = regen.buildRegenerationRequest({ kind: 'image', mode: 'full' });
+      return bare.prompt === null && bare.requestedBy === null && bare.videoModel === null
+        && bare.promptOverride === null && bare.videoPromptRaw === null
+        && bare.videoPromptGuidance === null && bare.imagePromptRaw === null;
+    })());
+  check('R6b promptOverride round-trips as an object (image-kind {system,user} shape)',
+    (() => {
+      const withOverride = regen.buildRegenerationRequest({
+        kind: 'image', mode: 'full', promptOverride: { system: 'S', user: 'U' }
+      });
+      return withOverride.promptOverride && withOverride.promptOverride.system === 'S'
+        && withOverride.promptOverride.user === 'U';
+    })());
+  check('R6b mode defaults to full when omitted (matches regenerateAd\'s effMode)',
+    regen.buildRegenerationRequest({ kind: 'image' }).mode === 'full');
+
+  // ── R6c: performRegeneration is exported for the adgen consumer to reuse
+  // (and for this harness to assert it exists with the right arity) ──────
+  // NOTE: adgen's runClaimedRegeneration does NOT call this — it has its
+  // own self-contained duplicate (see that repo's adRegenerateService.js
+  // header for why: scripts/verifyVideoResumeFromReceipt.js there
+  // statically extracts regenerateAd's own body and expects it to reach
+  // runVideoFull directly, so a shared cross-repo helper isn't reachable
+  // there anyway; this export exists for THIS repo's own regenerateAd to
+  // reuse, and so this harness can assert it exists with the right arity).
+  check('R6c performRegeneration is exported and reused by this repo\'s own local-execution path',
+    typeof regen.performRegeneration === 'function');
+  check('R6c performRegeneration takes one options object (not positional args)',
+    regen.performRegeneration.length === 1);
+
+  // ── R6d: MONEY — the local-execution lock unconditionally nulls the
+  // adgen handoff markers, not just on success at markComplete ───────────
+  // Defense in depth against a stale leftover from a prior stuck deferred
+  // attempt: if regenerationRequest / regenerateClaimedByWorker survive
+  // past markComplete (e.g. an operator manually reset only
+  // `regenerating:false` to unstick a row), a NEW local regenerate winning
+  // the SAME atomic lock write must null them in that SAME write — not a
+  // separate one — or an adgen consumer could claim the stale object and
+  // run in parallel with this call using different (stale) arguments.
+  // Source-checked (not just import-checked) because this is a Mongo
+  // update-document shape, not something callable offline without a DB.
+  {
+    const fs = require('fs');
+    const path = require('path');
+    const src = fs.readFileSync(path.join(__dirname, '../services/adRegenerateService.js'), 'utf8');
+    const fnIdx = src.indexOf('async function regenerateAd(');
+    if (fnIdx < 0) throw new Error('regenerateAd not found in source');
+    const lockSetIdx = src.indexOf('} else {', fnIdx);
+    if (lockSetIdx < 0) throw new Error('the deferToAdgen else-branch not found in regenerateAd');
+    const elseBodyEndIdx = src.indexOf('const lockResult = await Ad.updateOne(', lockSetIdx);
+    if (elseBodyEndIdx < 0) throw new Error('could not bound the else-branch (lockResult write not found after it)');
+    const body = src.slice(lockSetIdx, elseBodyEndIdx);
+    check('R6d local-execution branch (else, not deferToAdgen) explicitly nulls regenerationRequest',
+      /lockSet\.regenerationRequest\s*=\s*null/.test(body));
+    check('R6d local-execution branch explicitly nulls regenerateClaimedByWorker',
+      /lockSet\.regenerateClaimedByWorker\s*=\s*null/.test(body));
+    check('R6d local-execution branch explicitly nulls regenerateClaimedAt',
+      /lockSet\.regenerateClaimedAt\s*=\s*null/.test(body));
+  }
+}
+
 if (failures.length) {
   console.error(`\n❌ regeneration: ${failures.length} FAILED, ${pass} passed\n`);
   failures.forEach((f) => console.error(`   • ${f}`));
