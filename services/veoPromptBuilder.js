@@ -930,16 +930,16 @@ function buildVeoPrompt({
       // Decision (2026-08): YES, rewrite under split; leave "centered" alone
       // on the non-split path (byte-identity).
       (isSplit
-        ? `Scene 2 (${t1}–${t2}s): slow zoom toward the logo or most distinctive product detail (~8–10%), subject-anchored in the ${sideLabel} band — do not re-centre the product in the frame. No rotation or distortion. ` +
+        ? `Scene 2 (${t1}–${t2}s): slow zoom toward the most distinctive product detail (~8–10%), subject-anchored in the ${sideLabel} band — do not re-centre the product in the frame. No rotation or distortion. ` +
           `Scene 3 (${t2}–${dur.toFixed(1)}s): begin slightly cropped, slow zoom out ~10–12% to reveal the full product. Hold the product in the ${sideLabel} band throughout; never drift toward the ${oppositeLabel}.`
-        : `Scene 2 (${t1}–${t2}s): slow zoom toward the logo or most distinctive product detail (~8–10%), centered. No rotation or distortion. ` +
+        : `Scene 2 (${t1}–${t2}s): slow zoom toward the most distinctive product detail (~8–10%), centered. No rotation or distortion. ` +
           `Scene 3 (${t2}–${dur.toFixed(1)}s): begin slightly cropped, slow zoom out ~10–12% to reveal the full product. Maintain centre-safe framing.`)
     );
   } else {
     lines.push(
       `Timeline (${dur.toFixed(1)}s): ` +
       `Scene 1 (0.0–${t1}s): slow horizontal pan left→right, ~10–15% movement. No zoom, rotation, or perspective shift. ` +
-      `Scene 2 (${t1}–${t2}s): slow zoom toward the logo or most distinctive product detail (~8–10%), centered. No rotation or distortion. ` +
+      `Scene 2 (${t1}–${t2}s): slow zoom toward the most distinctive product detail (~8–10%), centered. No rotation or distortion. ` +
       `Scene 3 (${t2}–${dur.toFixed(1)}s): begin slightly cropped, slow zoom out ~10–12% to reveal the full product. Maintain center framing.`
     );
   }
