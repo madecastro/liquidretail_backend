@@ -711,6 +711,74 @@ const atRaw        = 'r'.repeat(4000);
     directImage.composeCorrectiveOverride(null, NOTE) === null);
 }
 
+// ── R6: ad-gen handoff (routing fix, 2026-08-26) ─────────────────────────
+// Owner directive: "regenerate ... should absolutely be running through
+// adgen." When ADGEN_RENDERER_ENABLED is true the backend must not submit
+// the regeneration itself — it stamps Ad.regenerationRequest and returns;
+// adgen's regenerate consumer claims and runs it. R6 pins the pure decision
+// + payload-shape helpers regenerateAd() calls internally (no DB — the
+// atomic lock write itself is exercised by production, not this harness).
+{
+  const savedAdgenFlag = process.env.ADGEN_RENDERER_ENABLED;
+
+  // ── R6a: the decision reads the SAME call-time flag as the render loop
+  // and titling resume gates (adgenBridge.isAdgenRendererEnabled) ────────
+  check('R6a unset ADGEN_RENDERER_ENABLED -> local execution (matches file default false)',
+    (() => { delete process.env.ADGEN_RENDERER_ENABLED; return regen.shouldDeferToAdgen() === false; })());
+  check('R6a ADGEN_RENDERER_ENABLED=true -> defer to adgen',
+    (() => { process.env.ADGEN_RENDERER_ENABLED = 'true'; return regen.shouldDeferToAdgen() === true; })());
+  check('R6a ADGEN_RENDERER_ENABLED=false -> local execution',
+    (() => { process.env.ADGEN_RENDERER_ENABLED = 'false'; return regen.shouldDeferToAdgen() === false; })());
+  check('R6a ADGEN_RENDERER_ENABLED=TRUE (any case) -> defer to adgen',
+    (() => { process.env.ADGEN_RENDERER_ENABLED = 'TRUE'; return regen.shouldDeferToAdgen() === true; })());
+  check('R6a garbage value -> local execution (fail-safe OFF, same as adgenBridge)',
+    (() => { process.env.ADGEN_RENDERER_ENABLED = 'yes-please'; return regen.shouldDeferToAdgen() === false; })());
+
+  if (savedAdgenFlag === undefined) delete process.env.ADGEN_RENDERER_ENABLED;
+  else process.env.ADGEN_RENDERER_ENABLED = savedAdgenFlag;
+
+  // ── R6b: regenerationRequest payload shape — one definition, both sides
+  // trust it (regenerateAd stamps it; the adgen consumer's
+  // runClaimedRegeneration reads it back) ────────────────────────────────
+  const fullReq = regen.buildRegenerationRequest({
+    kind: 'video', prompt: 'make it punchier', mode: 'full', requestedBy: 'user_1',
+    videoModel: 'atlas-omni', promptOverride: null,
+    videoPromptRaw: 'RAW CAMERA PROMPT', videoPromptGuidance: null, imagePromptRaw: null
+  });
+  check('R6b payload carries kind',
+    fullReq.kind === 'video');
+  check('R6b payload carries every pass-through field the local path uses',
+    fullReq.prompt === 'make it punchier'
+    && fullReq.mode === 'full'
+    && fullReq.requestedBy === 'user_1'
+    && fullReq.videoModel === 'atlas-omni'
+    && fullReq.videoPromptRaw === 'RAW CAMERA PROMPT');
+  check('R6b absent optional fields normalise to null, not undefined (Mongoose Mixed needs a concrete value)',
+    (() => {
+      const bare = regen.buildRegenerationRequest({ kind: 'image', mode: 'full' });
+      return bare.prompt === null && bare.requestedBy === null && bare.videoModel === null
+        && bare.promptOverride === null && bare.videoPromptRaw === null
+        && bare.videoPromptGuidance === null && bare.imagePromptRaw === null;
+    })());
+  check('R6b promptOverride round-trips as an object (image-kind {system,user} shape)',
+    (() => {
+      const withOverride = regen.buildRegenerationRequest({
+        kind: 'image', mode: 'full', promptOverride: { system: 'S', user: 'U' }
+      });
+      return withOverride.promptOverride && withOverride.promptOverride.system === 'S'
+        && withOverride.promptOverride.user === 'U';
+    })());
+  check('R6b mode defaults to full when omitted (matches regenerateAd\'s effMode)',
+    regen.buildRegenerationRequest({ kind: 'image' }).mode === 'full');
+
+  // ── R6c: performRegeneration is exported for the adgen consumer to reuse
+  // (and for this harness to assert it exists with the right arity) ──────
+  check('R6c performRegeneration is exported (adgen runClaimedRegeneration calls it)',
+    typeof regen.performRegeneration === 'function');
+  check('R6c performRegeneration takes one options object (not positional args)',
+    regen.performRegeneration.length === 1);
+}
+
 if (failures.length) {
   console.error(`\n❌ regeneration: ${failures.length} FAILED, ${pass} passed\n`);
   failures.forEach((f) => console.error(`   • ${f}`));

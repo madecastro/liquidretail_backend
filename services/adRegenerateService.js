@@ -49,6 +49,11 @@ const directImage           = require('./directImageRenderService');
 const { resolveDeriveFromMaster } = require('./campaignAdsGenerationService');
 const { isUgcFirstSeedingEnabled } = require('./seededUniverseService');
 const ugcVideoPipeline             = require('./ugcVideoPipeline');
+// Ad-gen microservice handoff (routing fix, 2026-08-26). Same call-time-read
+// helper the render loop's runRenderLoop gate uses (routes/ads.js:1856) and
+// titlingResumeService uses — read at call time, not at boot, so a dashboard
+// flip takes effect without a redeploy.
+const { isAdgenRendererEnabled } = require('./adgenBridge');
 
 const HISTORY_CAP   = 5;
 const DAILY_CAP     = Math.max(1, parseInt(process.env.REGENERATE_DAILY_CAP, 10) || 10);
@@ -447,6 +452,52 @@ async function deriveFirstCatalogMediaId({ productId, brandId }) {
   return null;
 }
 
+// ── Ad-gen handoff for regenerate (routing fix, 2026-08-26) ────────────
+//
+// Owner directive, verbatim: "regenerate whether user triggered or
+// triggered by the QC check should absolutely be running through adgen."
+// (The QC-check half of that directive is already satisfied structurally —
+// static vision-QC's one allowed re-render happens INSIDE the same
+// render() call that produced the first attempt, so it already runs
+// wherever rendering runs; video QC never regenerates at all, unchanged by
+// this file — see adVisionQcService.js. This section is the standalone
+// regenerate entry points: the HTTP route and the two agent capabilities,
+// which both call regenerateAd() below, and did not go through adgen at
+// all before this change.)
+//
+// PURE — no DB — so scripts/verifyRegeneration.js can pin both without a
+// live Mongo connection.
+
+// The single decision: does THIS regenerate execute locally, or get
+// deferred to adgen's regenerate consumer? regenerateAd() calls this exact
+// function and never re-reads process.env inline, matching the call-time
+// (not boot-time) read convention every other adgen-handoff gate in this
+// repo uses (runRenderLoop, titlingResumeService — see adgenBridge.js).
+function shouldDeferToAdgen() {
+  return isAdgenRendererEnabled();
+}
+
+// Builds the exact payload stamped onto Ad.regenerationRequest on the
+// deferred path. One definition — the adgen consumer's runClaimedRegeneration
+// reads this same shape back out, so drift between "what regenerateAd
+// intended" and "what the consumer executes" is structurally impossible.
+function buildRegenerationRequest({
+  kind, prompt, mode, requestedBy, videoModel, promptOverride,
+  videoPromptRaw, videoPromptGuidance, imagePromptRaw
+}) {
+  return {
+    kind,
+    prompt:              prompt || null,
+    mode:                mode || 'full',
+    requestedBy:         requestedBy || null,
+    videoModel:          videoModel || null,
+    promptOverride:      promptOverride || null,
+    videoPromptRaw:      videoPromptRaw || null,
+    videoPromptGuidance: videoPromptGuidance || null,
+    imagePromptRaw:      imagePromptRaw || null
+  };
+}
+
 // ── Public API ────────────────────────────────────────────────────────
 
 // Validate: not exported, not regenerating, under daily cap. Throws an
@@ -563,18 +614,38 @@ async function regenerateAd({
         : ` prompt="${historyEntry.prompt.slice(0, 60)}${historyEntry.prompt.length > 60 ? '…' : ''}"`)
   );
 
+  // ── Ad-gen handoff (routing fix, 2026-08-26) ──────────────────────────
+  // Read ONCE, synchronously, before the lock write below — this is the
+  // single decision point for "who executes this regenerate", and it must
+  // be resolved before any `await` so a flag flip mid-call cannot straddle
+  // the two paths. See models/Ad.js (regenerationRequest doc comment) for
+  // the full money argument: regenerationRequest is non-null ONLY on this
+  // branch, which is what lets the adgen consumer's claim query never
+  // collide with a row this process is about to execute in-process below.
+  const deferToAdgen = shouldDeferToAdgen();
+
   // Atomic lock + append in-flight history entry. Filter requires
   // regenerating ≠ true so two concurrent workers cannot both win the
   // race past preflight; the loser sees modifiedCount === 0 and exits
-  // without spending provider quota or touching progress.
+  // without spending provider quota or touching progress. On the adgen
+  // path this SAME lock also stamps the full call as regenerationRequest —
+  // one write, so there is never a window where regenerating:true is set
+  // without the payload a claimer would need to actually do the work.
+  const lockSet = {
+    regenerating:      true,
+    regenerationStage: 'pending',
+    updatedAt:         new Date()
+  };
+  if (deferToAdgen) {
+    lockSet.regenerationRequest = buildRegenerationRequest({
+      kind, prompt, mode: effMode, requestedBy, videoModel, promptOverride,
+      videoPromptRaw, videoPromptGuidance, imagePromptRaw
+    });
+  }
   const lockResult = await Ad.updateOne(
     { _id: adId, regenerating: { $ne: true } },
     {
-      $set: {
-        regenerating:      true,
-        regenerationStage: 'pending',
-        updatedAt:         new Date()
-      },
+      $set: lockSet,
       $push: {
         regenerationHistory: { $each: [historyEntry], $slice: -HISTORY_CAP }
       }
@@ -585,14 +656,43 @@ async function regenerateAd({
     return;
   }
 
+  if (deferToAdgen) {
+    console.log(
+      `🔀 regenerate[ad=${adId}]: kind=${kind} — deferred to adgen renderer service ` +
+      `(ADGEN_RENDERER_ENABLED=true); adgen's regenerate consumer will claim and run it`
+    );
+    return;
+  }
+
+  await performRegeneration({
+    adId, kind, prompt, mode: effMode, requestedBy, videoModel, promptOverride,
+    videoPromptRaw, videoPromptGuidance, imagePromptRaw, startedAt
+  });
+}
+
+// The actual work: dispatch to the video or image worker, then markComplete.
+// Extracted out of regenerateAd so BOTH the local-execution path above
+// (ADGEN_RENDERER_ENABLED false — this file) and, in the adgen copy of this
+// file, the adgen regenerate-consumer's claimed-work entry point
+// (runClaimedRegeneration) share one implementation. Not called with a
+// lock still to acquire — the caller is responsible for having already won
+// the `regenerating` lock (regenerateAd here; the consumer's atomic claim
+// on adgen's side).
+async function performRegeneration({
+  adId, kind, prompt, mode, requestedBy, videoModel, promptOverride,
+  videoPromptRaw, videoPromptGuidance, imagePromptRaw, startedAt
+}) {
   // Unified progress row (ActivityDock). Cancel is honored between
   // stages (veo → composite / image-gen) — the in-flight provider call
   // finishes, then the regenerate stops and the ad keeps its previous
   // render.
   const { startRun, CancelledError } = require('./progressService');
-  const brandDoc = await require('../models/Brand').findById(ad.brandId).select('advertiserId').lean().catch(() => null);
+  const adForBrand = await Ad.findById(adId).select('brandId').lean();
+  const brandDoc = adForBrand?.brandId
+    ? await require('../models/Brand').findById(adForBrand.brandId).select('advertiserId').lean().catch(() => null)
+    : null;
   const progressRun = await startRun({
-    kind: 'ad-regenerate', advertiserId: brandDoc?.advertiserId, brandId: ad.brandId,
+    kind: 'ad-regenerate', advertiserId: brandDoc?.advertiserId, brandId: adForBrand?.brandId,
     label: kind === 'video' ? 'Video ad regenerate' : 'Ad regenerate'
   });
 
@@ -1040,6 +1140,12 @@ async function markComplete(adId, { status, durationMs, error }) {
       $set: {
         regenerating:                          false,
         regenerationStage:                     null,
+        // Clear the adgen handoff markers too — harmless no-op on the local
+        // path (they were never set), and required on the deferred path so
+        // a future regenerate on this ad isn't blocked by a stale claim.
+        regenerationRequest:                   null,
+        regenerateClaimedByWorker:              null,
+        regenerateClaimedAt:                   null,
         'regenerationHistory.$[e].status':     status,
         'regenerationHistory.$[e].durationMs': durationMs,
         'regenerationHistory.$[e].error':      error || null,
@@ -1077,5 +1183,12 @@ module.exports = {
   // Static regenerate raw prompt — pure helper + cap for the offline harness
   // (R5 in scripts/verifyRegeneration.js) and the route gate.
   IMAGE_PROMPT_RAW_MAX,
-  parseRegenImagePromptField
+  parseRegenImagePromptField,
+  // Ad-gen handoff (R6 in scripts/verifyRegeneration.js) — pure decision +
+  // payload-shape helpers, plus the extracted work function so the adgen
+  // copy of this file's regenerate-consumer entry point (and any offline
+  // harness) can drive the same dispatch regenerateAd uses internally.
+  shouldDeferToAdgen,
+  buildRegenerationRequest,
+  performRegeneration
 };
