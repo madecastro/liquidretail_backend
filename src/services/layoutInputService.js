@@ -86,6 +86,10 @@ const { RATING_CLAIM_MIN, SAMPLE_FLOOR } = require('./claimSubstantiationService
 // Atlas gateway (Gemini served OpenAI-compatible; Google's OpenAI-compat
 // endpoint as the direct fallback inside the transport).
 const { chatCompletion, isConfigured: atlasConfigured } = require('./atlasLlmService');
+// Phase 0 measurement wiring — stamp layout-derivation wall time on the Ad
+// so DB analytics can measure Director-batching / cache-hit wins. Optional:
+// options.adId must be present; when it is not, the timer is a no-op.
+const { startStageTimer } = require('./stageTiming');
 
 const GEMINI_MODEL = process.env.GEMINI_SEARCH_MODEL || 'gemini-2.5-pro';
 
@@ -906,41 +910,53 @@ function productReviewsOf(match) {
 //  Derivation LLM
 // ──────────────────────────────────────────────────────────────
 async function runDerivation(ctx, template, aspectRatio, options = {}) {
-  if (!atlasConfigured() && !process.env.GEMINI_API_KEY) return fallbackDerivation(ctx, aspectRatio, options);
-
-  const prompt = buildDerivationPrompt(ctx, template, aspectRatio, options);
-
+  // Time-to-derivation stamp. options.adId may be absent (e.g. campaign-scoped
+  // callers that don't have an ad yet); the timer is a no-op on unknown adId.
+  // Includes prompt build + chatCompletion + JSON parse — the whole
+  // "how long did this cost me" answer.
+  const stopTimer = startStageTimer('layoutInputMs');
   try {
-    // DERIVATION_SCHEMA has genuinely optional fields, so it rides as
-    // non-strict json_schema guidance (strict mode requires all-required).
-    // Hidden reasoning spends from max_tokens on the OpenAI-compat path
-    // (no thinkingBudget knob) — the transport pads a reserve on top.
-    const res = await chatCompletion(
-      {
-        stage: 'layout_derivation',
-        service: 'layoutInputService',
-        campaignRunId: options.campaignRunId || null,
-        brandId: options.brandId || ctx.media?.brandId || null,
-        productId: options.productId || null,
-        adId: options.adId || null
-      },
-      {
-        model: GEMINI_MODEL,
-        messages: [{ role: 'user', content: prompt }],
-        temperature: 0.3,
-        max_tokens: 3000,
-        response_format: { type: 'json_schema', json_schema: { name: 'layout_derivation', strict: false, schema: DERIVATION_SCHEMA } }
+    if (!atlasConfigured() && !process.env.GEMINI_API_KEY) return fallbackDerivation(ctx, aspectRatio, options);
+
+    const prompt = buildDerivationPrompt(ctx, template, aspectRatio, options);
+
+    try {
+      // DERIVATION_SCHEMA has genuinely optional fields, so it rides as
+      // non-strict json_schema guidance (strict mode requires all-required).
+      // Hidden reasoning spends from max_tokens on the OpenAI-compat path
+      // (no thinkingBudget knob) — the transport pads a reserve on top.
+      const res = await chatCompletion(
+        {
+          stage: 'layout_derivation',
+          service: 'layoutInputService',
+          campaignRunId: options.campaignRunId || null,
+          brandId: options.brandId || ctx.media?.brandId || null,
+          productId: options.productId || null,
+          adId: options.adId || null
+        },
+        {
+          model: GEMINI_MODEL,
+          messages: [{ role: 'user', content: prompt }],
+          temperature: 0.3,
+          max_tokens: 3000,
+          response_format: { type: 'json_schema', json_schema: { name: 'layout_derivation', strict: false, schema: DERIVATION_SCHEMA } }
+        }
+      );
+      const text = res.choices?.[0]?.message?.content;
+      if (!text) {
+        console.warn(`   ⚠️  layout-derivation: empty response (finishReason=${res.choices?.[0]?.finish_reason})`);
+        return fallbackDerivation(ctx, aspectRatio, options);
       }
-    );
-    const text = res.choices?.[0]?.message?.content;
-    if (!text) {
-      console.warn(`   ⚠️  layout-derivation: empty response (finishReason=${res.choices?.[0]?.finish_reason})`);
+      return JSON.parse(text);
+    } catch (err) {
+      console.warn(`   ⚠️  layout-derivation failed: ${err.response?.data?.error?.message || err.message}`);
       return fallbackDerivation(ctx, aspectRatio, options);
     }
-    return JSON.parse(text);
-  } catch (err) {
-    console.warn(`   ⚠️  layout-derivation failed: ${err.response?.data?.error?.message || err.message}`);
-    return fallbackDerivation(ctx, aspectRatio, options);
+  } finally {
+    // Fire-and-forget stamp on Ad.renderStages.layoutInputMs. Runs on
+    // EVERY exit (fallback path, LLM success, LLM fail) so the DB reflects
+    // real wall time even when we short-circuited. No-op if adId absent.
+    stopTimer(options.adId || null);
   }
 }
 

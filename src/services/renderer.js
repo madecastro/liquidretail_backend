@@ -1983,6 +1983,16 @@ async function run() {
   console.log(
     `renderer[${WORKER_ID}] starting — poll interval ${POLL_MS}ms, max-inflight ${MAX_INFLIGHT}, handoff gate ${gated ? 'ON (claiming)' : 'OFF (sleeping)'}`
   );
+  // Sharp concurrency — see services/sharpConcurrency.js's header. This is
+  // a NO-OP unless SHARP_CONCURRENCY is set; UV_THREADPOOL_SIZE (the other
+  // half) must be an env var and is set in config/defaults.env.
+  try {
+    const { configureSharpConcurrency } = require('./sharpConcurrency');
+    const sc = configureSharpConcurrency();
+    if (sc.applied) console.log(`renderer[${WORKER_ID}] sharp.concurrency(${sc.value}) applied`);
+  } catch (err) {
+    console.warn(`renderer[${WORKER_ID}] sharp concurrency setup failed — ${err.message}`);
+  }
   // Fire-and-forget. Immediate pass catches already-cold orphans
   // (updatedAt already past HEARTBEAT_STALE_MIN — predecessor died well
   // before we started). A predecessor that died seconds before this boot
