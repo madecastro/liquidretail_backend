@@ -17,7 +17,7 @@
  *
  * VIDEO (VIDEO_LIFESTYLE_PROMPT, default OFF):
  *   V1  LIFESTYLE_DIRECTIVES only for lifestyle + flag on; OMNI otherwise
- *   V2  OMNI_DIRECTIVES + GROK_DIRECTIVES byte-unchanged vs 134db56~1 (B14 style)
+ *   V2  OMNI_DIRECTIVES + GROK_DIRECTIVES byte-unchanged vs 9531ae9f (B14 style)
  *   V3  Lifestyle keeps product-identity / no-new-background / noText /
  *       physicalAccuracy — each asserted
  *   V4  Lifestyle does NOT contain packshot-only strings
@@ -788,15 +788,25 @@ console.log('\n=== VIDEO lifestyle directives ===\n');
     life.includes('Ken Burns') && life.includes('high-end ecommerce'));
 }
 
-// V2 — OMNI + GROK byte-unchanged vs 134db56~1
+// V2 — OMNI + GROK byte-unchanged vs 9531ae9f
 // Baseline does NOT export OMNI_DIRECTIVES / GROK_DIRECTIVES, so iterating
 // Object.keys(oldMod.OMNI_DIRECTIVES || {}) ran ZERO comparisons (vacuous).
 // Fix: inject those names into the baseline module.exports (same consts are
 // in scope), then field-compare — plus the B14-style full prompt matrix.
 {
   const mod = loadVeo({ lifestyle: undefined });
-  const BASELINE = '134db56~1:services/veoPromptBuilder.js';
-  const REL_REQUIRE = "require('./platformFormats')";
+  const BASELINE = '9531ae9f:services/veoPromptBuilder.js';
+  // ⚠️ REWRITE EVERY LOCAL RELATIVE REQUIRE THE PINNED FILE MAKES, not a
+  // single hardcoded one. When this harness was written, './platformFormats'
+  // was the only local require in veoPromptBuilder.js; bumping the pin
+  // forward (past owner-approved prompt changes, e.g. commit 9531ae9f)
+  // surfaced a genuinely NEW one, './videoProductAnchor', added between the
+  // two pins — the hardcoded single-name check silently produced "baseline
+  // unavailable" (a SKIP, correctly not a false PASS) instead of comparing
+  // anything. Enumerate what the pinned source actually requires and
+  // relocate each one, so a future pin bump degrades to a loud, specific
+  // module-not-found rather than a generic skip.
+  const REL_REQUIRE_RE = /require\('(\.\/[A-Za-z0-9_-]+)'\)/g;
   let oldMod = null;
   let skipReason = null;
   let tmpDir = null;
@@ -804,19 +814,24 @@ console.log('\n=== VIDEO lifestyle directives ===\n');
     const src = cp.execFileSync('git', ['-C', REPO, 'show', BASELINE], {
       encoding: 'utf8', maxBuffer: 16 * 1024 * 1024, stdio: ['ignore', 'pipe', 'ignore']
     });
-    if (!src.includes(REL_REQUIRE)) {
-      skipReason = `baseline missing ${REL_REQUIRE}`;
+    const relRequires = [...new Set([...src.matchAll(REL_REQUIRE_RE)].map((m) => m[1]))];
+    if (!relRequires.length) {
+      skipReason = 'baseline has no local relative requires to relocate — unexpected shape';
     } else if (!/\bconst OMNI_DIRECTIVES\b/.test(src) || !/\bconst GROK_DIRECTIVES\b/.test(src)) {
       skipReason = 'baseline missing OMNI_DIRECTIVES or GROK_DIRECTIVES const';
     } else {
       tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'lifeVeoPin-'));
       const tmpFile = path.join(tmpDir, 'veoPromptBuilder.baseline.js');
-      // Relocate platformFormats require, then force-export the directive
-      // objects so field comparison is real (baseline never exported them).
-      let patched = src.replace(
-        REL_REQUIRE,
-        `require(${JSON.stringify(path.join(REPO, 'services', 'platformFormats'))})`
-      );
+      // Relocate every local require the pinned file makes, then force-export
+      // the directive objects so field comparison is real (baseline never
+      // exported them).
+      let patched = src;
+      for (const rel of relRequires) {
+        const modName = rel.slice(2); // './foo' -> 'foo'
+        patched = patched.split(`require('${rel}')`).join(
+          `require(${JSON.stringify(path.join(REPO, 'services', modName))})`
+        );
+      }
       if (/module\.exports\s*=\s*\{/.test(patched)) {
         patched = patched.replace(
           /module\.exports\s*=\s*\{/,
@@ -850,12 +865,12 @@ console.log('\n=== VIDEO lifestyle directives ===\n');
     check('V2 baseline OMNI has doNot', omniKeys.includes('doNot'));
     check('V2 baseline GROK has doNot', grokKeys.includes('doNot'));
     for (const key of omniKeys) {
-      check(`V2 OMNI_DIRECTIVES.${key} byte-identical to 134db56~1`,
+      check(`V2 OMNI_DIRECTIVES.${key} byte-identical to 9531ae9f`,
         mod.OMNI_DIRECTIVES[key] === oldMod.OMNI_DIRECTIVES[key],
         key);
     }
     for (const key of grokKeys) {
-      check(`V2 GROK_DIRECTIVES.${key} byte-identical to 134db56~1`,
+      check(`V2 GROK_DIRECTIVES.${key} byte-identical to 9531ae9f`,
         mod.GROK_DIRECTIVES[key] === oldMod.GROK_DIRECTIVES[key],
         key);
     }
@@ -873,7 +888,7 @@ console.log('\n=== VIDEO lifestyle directives ===\n');
               hasProductReference, durationSec, seedHasText, caps
             };
             check(
-              `V2 prompt byte-identical to 134db56~1 (ref=${hasProductReference} dur=${durationSec} text=${seedHasText} caps=${caps ? 'omni' : 'def'})`,
+              `V2 prompt byte-identical to 9531ae9f (ref=${hasProductReference} dur=${durationSec} text=${seedHasText} caps=${caps ? 'omni' : 'def'})`,
               mod.buildVeoPrompt(args) === oldMod.buildVeoPrompt(args)
             );
           }

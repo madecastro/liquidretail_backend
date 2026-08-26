@@ -11,7 +11,7 @@
  *              return-to-primary beat (+ its two PRODUCT FIDELITY sentences),
  *              the crossfade-vs-long-dissolve policy, AND the
  *              subjectContinuity directive. The prompt text must match
- *              134db56~1 byte-for-byte (pinned end-to-end by B14 + B15).
+ *              9531ae9f byte-for-byte (pinned end-to-end by B14 + B15).
  *   CHANGE 4 — OWNER-DIRECTED HOOK-FIRST STANDARDIZATION (2026-08-18). Meta
  *              video now uses the same hook-first camera prompt as PMax.
  *              B15 keeps the rollback guarantee in the kill-switch-OFF arm,
@@ -46,7 +46,7 @@
  * The owner standardized Meta onto the PMax hook-first camera prompt. That is
  * a DELIBERATE, DIRECTED change to which prompt Meta selects — it is NOT a
  * licence to edit the frozen text itself. Precisely:
- *   • OMNI_DIRECTIVES text                 — STILL FROZEN, still 134db56~1.
+ *   • OMNI_DIRECTIVES text                 — STILL FROZEN, still 9531ae9f.
  *   • Meta prompt with the switch OFF      — STILL byte-identical (B15).
  *   • Destination-less prompt, either arm  — STILL byte-identical (B14).
  *   • Which profile a Meta destination picks with the switch ON — CHANGED,
@@ -267,7 +267,7 @@ for (const [name, d] of [['OMNI', OMNI_DIRECTIVES], ['GROK', GROK_DIRECTIVES]]) 
 
   // ── Transition policy: REVERTED to the pre-#61 text (owner 2026-08-03) ──
   // `transitions` was NOT changed by 134db56 (it only gained a comment), so B4
-  // still passes against the restored 134db56~1 text. `doNot` went back to the
+  // still passes against the restored 9531ae9f text. `doNot` went back to the
   // bare ban. B4 and B7 therefore CONTRADICT each other on purpose:
   // transitions permits a ~0.25s crossfade, doNot bans "dissolves", and a
   // crossfade IS a short dissolve. Owner-confirmed after the contradiction was
@@ -362,7 +362,7 @@ let b14SkipReason = null;
 // ══ B14 — THE REAL ACCEPTANCE TEST: same prompt in, same prompt out ════════
 // The three CHANGE 2 pins above are keyword pins; they cannot prove the prompt
 // is byte-identical to the known-good pre-#61 text, only that specific phrases
-// are gone. B14 closes that gap: it builds the prompt from the 134db56~1 source
+// are gone. B14 closes that gap: it builds the prompt from the 9531ae9f source
 // (read straight out of git, never checked out into the tree) and asserts the
 // current builder emits the SAME STRING for every branch that matters.
 //
@@ -379,7 +379,7 @@ let b14SkipReason = null;
   const os   = require('os');
   const cp   = require('child_process');
   const REPO = path.join(__dirname, '..');
-  const BASELINE = '134db56~1:services/veoPromptBuilder.js';
+  const BASELINE = '9531ae9f:services/veoPromptBuilder.js';
   const REL_REQUIRE = "require('./platformFormats')";
 
   let oldMod = null;
@@ -411,7 +411,7 @@ let b14SkipReason = null;
 
   if (!oldMod) {
     // A silent skip here used to be a LIE BY OMISSION: the run still printed
-    // "prompt byte-identical to 134db56~1" in its summary even though the one
+    // "prompt byte-identical to 9531ae9f" in its summary even though the one
     // check that proves it never executed. B14 is the whole acceptance test for
     // an owner-directed revert whose entire justification is "the previous
     // output was better" — so the summary must never claim byte-identity it did
@@ -419,7 +419,7 @@ let b14SkipReason = null;
     b14Ran = false;
     b14SkipReason = skipReason;
     console.log(`   ⏭  B14 SKIP (baseline unavailable): ${skipReason}`);
-    console.log('      ⚠️  byte-identity to 134db56~1 was NOT verified in this run.');
+    console.log('      ⚠️  byte-identity to 9531ae9f was NOT verified in this run.');
   } else {
     b14Ran = true;
     // Cover both directive profiles, both reference-stack shapes, both
@@ -440,7 +440,7 @@ let b14SkipReason = null;
               hasProductReference, durationSec, seedHasText, caps,
             };
             const label = `caps=${capName} productRef=${hasProductReference} dur=${durationSec} seedText=${seedHasText}`;
-            check(`B14 dest=none built prompt is byte-identical to the 134db56~1 prompt (${label})`,
+            check(`B14 dest=none built prompt is byte-identical to the 9531ae9f prompt (${label})`,
               buildVeoPrompt({ ...args }), oldMod.buildVeoPrompt({ ...args }));
           }
         }
@@ -459,7 +459,7 @@ let b14SkipReason = null;
     // WHY B14 ALONE IS NO LONGER ENOUGH — AND WHY IT DID NOT GO RED.
     // B14 above passes NO platformFormat. promptProfileFor() only reaches the
     // hook_first branch when a destination is supplied, so the destination-less
-    // matrix still resolves to gemini-omni and still matches 134db56~1. That is
+    // matrix still resolves to gemini-omni and still matches 9531ae9f. That is
     // correct and worth keeping — the scaffold and aiVideoReferenceService really
     // do call with no destination — but it is NOT the live Meta path. The live
     // submit passes `platformFormat: ad.platformFormat` (atlasVideoService.js,
@@ -469,7 +469,7 @@ let b14SkipReason = null;
     //
     // WHAT REMAINS FROZEN: the OFF arm. B15 is the surviving PR #61 rollback
     // guarantee — with the kill switch off, every Meta destination still emits
-    // the 134db56~1 prompt byte-for-byte. Do not delete or weaken B15; it is the
+    // the 9531ae9f prompt byte-for-byte. Do not delete or weaken B15; it is the
     // reason the owner's "the previous output was better" finding is still
     // recoverable by flipping one env var.
     //
@@ -514,7 +514,7 @@ let b14SkipReason = null;
               caps: OMNI_CAPS, aspectRatio: '9:16', platformFormat: dest,
             };
             const label = `dest=${dest} productRef=${hasProductReference} dur=${durationSec} seedText=${seedHasText}`;
-            check(`B15 switch=OFF Meta prompt is STILL byte-identical to 134db56~1 — the surviving PR #61 rollback guarantee (${label})`,
+            check(`B15 switch=OFF Meta prompt is STILL byte-identical to 9531ae9f — the surviving PR #61 rollback guarantee (${label})`,
               withSwitch('false', () => buildVeoPrompt({ ...args })),
               oldMod.buildVeoPrompt({ ...args }));
           }
@@ -524,7 +524,7 @@ let b14SkipReason = null;
 
     // ── B16: kill switch ON ⇒ Meta gets EXACTLY the documented delta ───────
     // Reconstructs the expected ON prompt by applying five literal edits to the
-    // frozen 134db56~1 string, then demands byte equality. This is the companion
+    // frozen 9531ae9f string, then demands byte equality. This is the companion
     // pin to B15: B15 says "off is unchanged", B16 says "on changed by exactly
     // this and nothing else". Any reword of the hook-first directives, any extra
     // injected line, and any drift in the frozen base all fail here with a diff.
@@ -792,11 +792,11 @@ console.log(`\n✅ verifyPostPilotBatch: ${total}/${total} checks passed`);
 console.log('   CHANGE 1 atomic rating pair · CHANGE 2 the FULL 134db56 prompt rollback:');
 console.log('   subject continuity + return-to-primary + crossfade policy all pinned ABSENT,');
 // Never assert byte-identity the run did not actually prove — B14 skips when the
-// 134db56~1 baseline is unreachable (shallow clone / rewritten history / tarball).
+// 9531ae9f baseline is unreachable (shallow clone / rewritten history / tarball).
 if (b14Ran) {
-  console.log('   prompt byte-identical to 134db56~1 (owner revert 2026-08-03 — hallucination)');
+  console.log('   prompt byte-identical to 9531ae9f (owner revert 2026-08-03 — hallucination)');
   console.log('   · CHANGE 4 hook-first standardization (owner 2026-08-18): switch-OFF Meta still');
-  console.log('     byte-identical to 134db56~1 (B15), switch-ON delta exact (B16), Meta≡PMax (B17)');
+  console.log('     byte-identical to 9531ae9f (B15), switch-ON delta exact (B16), Meta≡PMax (B17)');
 } else {
   console.log(`   ⚠️  byte-identity NOT verified this run — B14 skipped: ${b14SkipReason}`);
   console.log('      keyword pins passed, but "is the old prompt" was NOT proven.');

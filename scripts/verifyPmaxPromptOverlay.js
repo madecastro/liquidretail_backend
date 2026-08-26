@@ -37,7 +37,7 @@
  *   V2c config/defaults.env ships BOTH names as "false" (2026-08-20 owner
  *       revert) — the real production default, not simulated.
  *   V3  Destination-less prompt is byte-identical to the IMMUTABLE
- *       `134db56~1` baseline (B14 technique; relative requires rewritten so
+ *       `9531ae9f` baseline (B14 technique; relative requires rewritten so
  *       the temp copy resolves), in BOTH arms; plus the live Meta destination
  *       matches that baseline in the OFF arm and has moved in the ON arm.
  *   V4  Hook-first video content on BOTH platforms: hook-first, centre-safe,
@@ -551,12 +551,12 @@ const VEO_ARGS_PMAX_169 = {
 // BASELINE CHANGED 2026-08-18: was `HEAD:services/veoPromptBuilder.js`, which
 // only ever compared the working tree against the last commit — so the moment
 // a prompt change was committed the pin re-based onto it and stopped proving
-// anything. Now pinned to the IMMUTABLE `134db56~1` source, the same known-good
+// anything. Now pinned to the IMMUTABLE `9531ae9f` source, the same known-good
 // pre-#61 prompt verifyPostPilotBatch B14/B15 use. That is the text this check
 // has always been trying to protect, and it cannot drift out from under itself.
-console.log('\nV3. destination-less prompt byte-identical to the 134db56~1 baseline (both video arms)');
+console.log('\nV3. destination-less prompt byte-identical to the 9531ae9f baseline (both video arms)');
 {
-  const BASELINE = '134db56~1:services/veoPromptBuilder.js';
+  const BASELINE = '9531ae9f:services/veoPromptBuilder.js';
   const REL_REQUIRE = "require('./platformFormats')";
   let oldMod = null;
   let skipReason = null;
@@ -590,12 +590,12 @@ console.log('\nV3. destination-less prompt byte-identical to the 134db56~1 basel
   if (!oldMod) {
     // Skip is NOT a pass — print loudly. Do not count as pass or fail.
     console.log(`  ⏭  V3 SKIP (baseline unavailable): ${skipReason}`);
-    console.log('      ⚠️  byte-identity to 134db56~1 was NOT verified in this run.');
+    console.log('      ⚠️  byte-identity to 9531ae9f was NOT verified in this run.');
   } else {
     const baselineNoDest = oldMod.buildVeoPrompt({ ...VEO_ARGS_NO_DEST });
     for (const [arm, flag] of [['ON', 'true'], ['OFF', 'false']]) {
       const mod = loadVeoArm(flag);
-      check(`V3 arm=${arm}: destination-less prompt byte-identical to the 134db56~1 baseline`,
+      check(`V3 arm=${arm}: destination-less prompt byte-identical to the 9531ae9f baseline`,
         mod.buildVeoPrompt({ ...VEO_ARGS_NO_DEST }), baselineNoDest);
     }
     // The surviving PR #61 rollback guarantee, stated on the LIVE Meta
@@ -604,9 +604,9 @@ console.log('\nV3. destination-less prompt byte-identical to the 134db56~1 basel
     // (verifyPostPilotBatch B15 pins the same fact across a wider matrix;
     // it is restated here so this harness is not silently weaker than its
     // own header claims.)
-    check('V3 arm=OFF: LIVE Meta destination byte-identical to the 134db56~1 baseline (PR #61 rollback guarantee survives)',
+    check('V3 arm=OFF: LIVE Meta destination byte-identical to the 9531ae9f baseline (PR #61 rollback guarantee survives)',
       loadVeoArm('false').buildVeoPrompt({ ...VEO_ARGS_META_916 }), baselineNoDest);
-    truthy('V3 arm=ON: LIVE Meta destination has MOVED off the 134db56~1 baseline (owner 2026-08-18 standardization)',
+    truthy('V3 arm=ON: LIVE Meta destination has MOVED off the 9531ae9f baseline (owner 2026-08-18 standardization)',
       loadVeoArm('true').buildVeoPrompt({ ...VEO_ARGS_META_916 }) !== baselineNoDest);
     // Also: the baseline must NOT carry destination-gated content
     falsy('V3 baseline (destination-less) has no HOOK-FIRST',
