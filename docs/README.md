@@ -1,6 +1,15 @@
 # server/docs
 
-Engineering docs that live alongside the code.
+Engineering docs that live alongside the **backend** code
+(`liquidretail_backend`).
+
+**Repo map (newcomers):** `liquidretail` = React SPA (trunk `master`);
+this repo = Express API + expansion (trunk `main`);
+`liquidretail_adgen` = live **renderer** when `ADGEN_RENDERER_ENABLED=true`;
+`rs-ai-backend` = older fork, reference only. Pipeline write-ups in this
+folder that still say the web process runs `runRenderLoop` describe the
+flag-off fallback — start with `PIPELINES.md`'s 2026-08-24 banner and
+`../liquidretail_adgen/CLAUDE.md`.
 
 ## backlog.csv
 

@@ -8,8 +8,9 @@
 
 | Piece | Where | Notes |
 |---|---|---|
-| Backend | `liquidretail-backend.onrender.com` (Render web service) | Worker runs in-process via `RUN_WORKER=true`. Autodeploys from `main`. |
-| Frontend | `staging.reach-social.io` (Netlify) | Autodeploys from `master`. Proxies `/api/*` + `/auth/*` to the backend URL above. |
+| Backend | `liquidretail-backend.onrender.com` (Render web service) | Worker runs in-process via `RUN_WORKER=true`. Autodeploys from `main`. HTTP + expansion + mint. **Does not render ads** when dashboard `ADGEN_RENDERER_ENABLED=true`. |
+| Adgen | Render (`adgen-api`, `adgen-orchestrator`, `adgen-renderer`) | Separate repo `liquidretail_adgen`, trunk `master`. Live renderer. Orchestrator is still a no-op. |
+| Frontend | `staging.reach-social.io` (Netlify) | Autodeploys from `master`. Proxies `/api/*` + `/auth/*` to the backend URL above. Does not talk to adgen HTTP (health only). |
 | YOLO microservice | Render Docker | Consumed by backend; single instance shared. |
 | MongoDB | Single Atlas cluster | Shared across everything. |
 | Cloudinary | Single account | Uploads land in `liquidretail/` folder prefix. |
