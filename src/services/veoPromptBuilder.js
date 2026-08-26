@@ -784,9 +784,19 @@ function buildVeoPrompt({
   lines.push(d.sourceImages);
   lines.push(d.productPreservation);
 
-  if (product?.title) {
-    lines.push(`Product: ${product.title}.`);
-  }
+  // Catalog title is NEVER interpolated into the camera prompt.
+  //
+  // Incident (2026-08-26, visually proven on a delivered Pelagic Gear
+  // master): `Product: Vaportek.` was read as a brand-name render
+  // instruction. Omni fabricated a complete "VAPORTEK" chest lockup and
+  // a fake neck tag over the real small PELAGIC fish-mark; vision-QC
+  // (correctly) terminal-rejected the $0.90 master with no regeneration.
+  // `noText` already forbids generating new logos — it was not enough
+  // once a brand-sounding catalog title was also sitting in a labeled
+  // field. PRODUCT FIDELITY + the supplied images already identify the
+  // SKU; this line was optional context (it used to lead DROP_PRIORITY)
+  // and not load-bearing for any parser. Do not re-add a named Product
+  // field. `product` is still consumed below by productRegionForAd.
 
   // Lifestyle product-region anchor (VIDEO_PRODUCT_ANCHOR). Spatial
   // grounding so a push-in finds the product box, not the face. Flag-off,
@@ -1142,8 +1152,13 @@ function buildVeoPrompt({
 
 const DEFAULT_BYTE_CAP = 4096;   // legacy Grok/Veo cap — used when caps is absent
 const BYTE_CAP_MARGIN  = 96;     // safety margin under the hard cap
+// Optional context only. Directive blocks (preservation / fidelity /
+// no-text / timeline) are never listed here — they are load-bearing.
+// `Product: {title}` used to lead this list; it was removed entirely
+// after Omni rendered the catalog title as an on-garment brand mark
+// (see the buildVeoPrompt comment above). Do not put a titled Product
+// line back just to have something cheap to drop.
 const DROP_PRIORITY = [
-  /^Product: /,
   /^PHYSICAL ACCURACY: /,
   /^Transitions: /,
   /^Visual style: /

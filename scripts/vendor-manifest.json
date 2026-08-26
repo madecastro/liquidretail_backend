@@ -1,8 +1,8 @@
 {
   "version": 1,
   "backendRef": "origin/main",
-  "backendHead": "0363ea03c6d6438d3ac46368c446623c3987a443",
-  "generatedAt": "2026-08-25T12:32:20.157Z",
+  "backendHead": "a1df77e95159ea70653d26cfe59e3dece6e52d7f",
+  "generatedAt": "2026-08-26T23:20:37.078Z",
   "files": {
     "models/Ad.js": {
       "backendHash": "959aebff9a2620a7c4ab63f98d38909d355cc208f7f3a33a16b085d507fa0e37",
@@ -1180,9 +1180,10 @@
       "reason": "backend UGC pipeline; adgen renderer does not call it"
     },
     "services/veoPromptBuilder.js": {
-      "backendHash": "0f23e354c2803a84f5dc616d78711a94c896b1c2018b5feb08f57fb47ca9e269",
-      "backendSha": "610c7c756af44d76cef268b3b11121eb1884ba02",
-      "status": "synced"
+      "backendHash": "5b86ddd125b465106d14cd9eb7ec7bc3d907ac2ce3f259f929b0c13393593c6b",
+      "backendSha": "9531ae9f73d5ad9773bddff9c87d19890873ea59",
+      "status": "fork",
+      "reason": "adgen-only production fix 2026-08-26: stop interpolating catalog title as 'Product: {title}' into the camera prompt (Omni rendered 'Vaportek' as an on-garment brand lockup on a Pelagic Gear master). Backend copy is still the pre-fix blob; a human must apply the same edit in liquidretail_backend/services/veoPromptBuilder.js once backend work is unblocked, then re-reconcile to synced."
     },
     "services/veoStoryboardService.js": {
       "backendHash": "4e3d420b3a6219b72f25dc95aac6afa679ea5c23a7c3627d1abcb9ba9f5bf344",
