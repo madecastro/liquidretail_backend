@@ -116,7 +116,7 @@ const TODAY_FRAME =
 const TODAY_CENTRE_SAFE =
   'away from the top and bottom bands and the outer side margins, where the platform overlays UI.';
 const TODAY_SCENE2_CENTERED =
-  'slow zoom toward the logo or most distinctive product detail (~8–10%), centered.';
+  'slow zoom toward the most distinctive product detail (~8–10%), centered.';
 
 // Split language markers — must be ABSENT when inert, PRESENT when active.
 const SPLIT_MARKERS = [
