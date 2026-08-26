@@ -16,6 +16,10 @@ const { trackLlmCall } = require('./costTracker');
 const { chatCompletion, isConfigured: atlasConfigured } = require('./atlasLlmService');
 const alerts = require('./alertService');
 const Comment = require('../models/Comment');
+// Cross-process cache — closes the "same review, N processes, N × 15s LLM"
+// duplication measured on run_1787696303378. See the block comment above the
+// L2 helpers below and models/QuoteSnippetCache.js's header.
+const QuoteSnippetCache = require('../models/QuoteSnippetCache');
 // Conversion-weighted sentence ranking, shared with the review-storage path.
 const { scoreSentence, OFF_PRODUCT, NOISE } = require('../utils/reviewText');
 const { splitSentences } = require('../utils/htmlEntities');
@@ -71,6 +75,50 @@ function snippetCacheSet(key, value) {
     const oldest = snippetCache.keys().next().value;
     snippetCache.delete(oldest);
   }
+}
+
+// ── L2: cross-process Mongo cache ─────────────────────────────────────
+//
+// Read: `mongoSnippetCacheGet(key)` returns the cached snippet string (or
+// undefined on miss). $inc's hits for observability, non-blocking.
+//
+// Write: `mongoSnippetCacheSet(key, snippet, ctx)` upserts LLM-VERIFIED
+// snippets only. Fire-and-forget; the return value is not awaited by the
+// caller. Mechanical fallbacks are NOT written here — a subsequent process
+// should retry the LLM in case the failure was transient (same rationale
+// as mechanical()'s existing behaviour of returning without cache-write
+// discipline for retries; see the mechanical() comment in extractSnippet).
+async function mongoSnippetCacheGet(key) {
+  try {
+    const doc = await QuoteSnippetCache.findById(key).lean();
+    if (!doc || typeof doc.snippet !== 'string') return undefined;
+    // Fire-and-forget hit tracker.
+    QuoteSnippetCache.updateOne(
+      { _id: key },
+      { $inc: { hits: 1 }, $set: { updatedAt: new Date() } }
+    ).catch(() => {});
+    return doc.snippet;
+  } catch (err) {
+    // Fail-open: a Mongo blip on the cache read must never fail the render.
+    // The LLM path still runs.
+    return undefined;
+  }
+}
+
+function mongoSnippetCacheSet(key, snippet, { brandId = null, productId = null } = {}) {
+  if (!snippet || typeof snippet !== 'string') return;
+  // Fire-and-forget upsert. `$setOnInsert` preserves createdAt on refresh so
+  // a hot entry ages out for LLM re-verification at TTL expiry (see model
+  // header). Errors swallowed — the render already has the snippet from the
+  // LLM path; the mongo cache write is pure telemetry infrastructure.
+  QuoteSnippetCache.updateOne(
+    { _id: key },
+    {
+      $set: { snippet, brandId, productId, updatedAt: new Date() },
+      $setOnInsert: { createdAt: new Date() }
+    },
+    { upsert: true }
+  ).catch(() => {});
 }
 
 // The 'review-text' role, not a bare model id: every review-text task in the
@@ -553,6 +601,19 @@ async function extractSnippet(text, { brandId = null, productId = null } = {}) {
   if (cached !== undefined) {
     return cached;
   }
+  // L2: cross-process Mongo cache. Same key as L1. Hit here means a sibling
+  // process already paid the LLM cost for this exact review text on this
+  // (brand, product) — copy it into L1 so subsequent same-process reads
+  // stay fast. Miss returns undefined and falls through to the LLM path.
+  // Measured 2026-08-25: two adgen renderer processes each cold-hit L1 on
+  // the same "fit and look great" quote and each paid ~15.7-15.9s of LLM
+  // time. This lookup avoids that on any second process onward.
+  const l2Hit = await mongoSnippetCacheGet(cacheKey);
+  if (typeof l2Hit === 'string') {
+    // Promote L2 hit into L1 so the next same-process call is instant.
+    snippetCacheSet(cacheKey, l2Hit);
+    return l2Hit;
+  }
 
   // Narrow to the single strongest sentence BEFORE the model sees it. See
   // strongestSentence() — without this, every model tested picked a customer
@@ -582,6 +643,9 @@ async function extractSnippet(text, { brandId = null, productId = null } = {}) {
   // whole clause still ships instead of nothing.
   if (source.length <= MAX_CHARS && meetsProofBar(source)) {
     snippetCacheSet(cacheKey, source);
+    // Pre-LLM verified path — deterministic given the source, safe to persist
+    // cross-process so N sibling processes don't each re-derive.
+    mongoSnippetCacheSet(cacheKey, source, { brandId, productId });
     return source;
   }
   if (source.length <= MAX_CHARS) {
@@ -589,6 +653,8 @@ async function extractSnippet(text, { brandId = null, productId = null } = {}) {
     // used for an over-budget quote instead of shipping the fragment.
     const salvaged = bestFallbackSnippet(clean, source, MAX_CHARS);
     snippetCacheSet(cacheKey, salvaged);
+    // Deterministic pre-LLM output; safe to cross-process cache.
+    mongoSnippetCacheSet(cacheKey, salvaged, { brandId, productId });
     return salvaged;
   }
 
@@ -678,6 +744,10 @@ async function extractSnippet(text, { brandId = null, productId = null } = {}) {
     const elapsedMs = Date.now() - t0;
     console.log(`💬 quoteSnippet: "${verbatim}" (${verbatim.length}c) from ${clean.length}c in ${elapsedMs}ms`);
     snippetCacheSet(cacheKey, verbatim);
+    // L2 write — LLM-verified only. Mechanical fallbacks are NOT written
+    // (see the mongoSnippetCacheSet header): a subsequent process should
+    // retry the LLM in case the original failure was transient.
+    mongoSnippetCacheSet(cacheKey, verbatim, { brandId, productId });
     return verbatim;
   } catch (err) {
     const elapsedMs = Date.now() - t0;
