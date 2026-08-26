@@ -90,6 +90,23 @@ const CATEGORIES = Object.freeze([
 // Per-category minimum to pass (0–10 integer scores from the model).
 const PASS_FLOOR = 7;
 
+// Known false-positive pattern (owner-confirmed, 2026-08-26): `competitor_marks`
+// has fired on the PRODUCT'S OWN name/brand text printed on the item itself —
+// measured twice ("Pura Vida" flagged on a "Ws Pura Vida" product, "VAPORTEK"
+// flagged on a "Vaportek" collar tag). The category is 43.3% of all video QC
+// failures over a measured 7-day window, so an unknown share of every
+// competitor_marks rejection is this bug, not a real invented mark. The
+// upstream fix (feeding the product title to QC as a known-allowed mark) is a
+// separate, already-drafted change — NOT implemented here. This constant only
+// stops the UI/Slack surface from presenting a competitor_marks finding as
+// unqualified fact. Do not delete this caveat when the upstream fix ships
+// without confirming the fix actually closes the false-positive rate to zero.
+const COMPETITOR_MARKS_CAVEAT =
+  'competitor_marks has a known false-positive pattern: it has flagged the ' +
+  'product\'s OWN name/brand text printed on the item itself as a foreign ' +
+  'mark. Check this finding against the product title before treating it as ' +
+  'a real defect.';
+
 // Role name in atlasModelMap. Env ATLAS_MODEL_AD_VISION_QC can re-point.
 //
 // RESOLVES TO google/gemini-2.5-pro (atlasModelMap.js, 'ad-vision-qc').
@@ -2093,6 +2110,13 @@ function renderCategoryBlock(categories) {
     const raw = c.findings;
     const findings = Array.isArray(raw) ? raw : (raw == null || raw === '' ? [] : [raw]);
     for (const f of findings) lines.push(`         - ${String(f)}`);
+    // See COMPETITOR_MARKS_CAVEAT — a failing competitor_marks category has a
+    // known false-positive pattern (the product's own printed name/brand),
+    // so the caveat rides along with the finding wherever it is rendered
+    // rather than needing every caller to remember to add it.
+    if (key === 'competitor_marks' && !c.pass) {
+      lines.push(`         ⚠️ ${COMPETITOR_MARKS_CAVEAT}`);
+    }
   }
   return lines;
 }
@@ -2231,6 +2255,12 @@ function summarizeVisionQc(visionQc, { categories = false } = {}) {
           pass:     !!c.pass,
           findings: findings.slice(0, 3).map((f) => String(f))
         };
+        // Machine-readable twin of the caveat renderCategoryBlock appends to
+        // the Slack text — lets a UI surface show the warning without
+        // string-matching failureDetail. See COMPETITOR_MARKS_CAVEAT.
+        if (key === 'competitor_marks' && !c.pass) {
+          acc[key].caveat = COMPETITOR_MARKS_CAVEAT;
+        }
         return acc;
       }, {});
     }
@@ -2479,6 +2509,7 @@ module.exports = {
   CATEGORIES,
   PASS_FLOOR,
   QC_MODEL_ROLE,
+  COMPETITOR_MARKS_CAVEAT,
   // Flag / model
   isEnabled,
   isStaticEnabled,
