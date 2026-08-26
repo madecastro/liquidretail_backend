@@ -478,12 +478,31 @@ const adSchema = new mongoose.Schema({
   // already paid for (mirrors Omni master keep on titling failure).
   // Null when AD_VISION_QC_ENABLED is off or the ad predates this field.
   visionQc:           { type: mongoose.Schema.Types.Mixed, default: null },
-  // Per-stage wall time in ms for THIS render, whichever pipeline ran:
-  // { deriveMs, renderMs, uploadMs }. Answers "why is this ad slow" without a
-  // log-diving session — direct_image's renderMs is the Atlas submit+poll
-  // round trip and is normally 60-150s; a value far outside that on a specific
-  // ad, not the whole pipeline, points at that one Atlas call rather than at
-  // the code. Null on ads that predate this field.
+  // Per-stage wall time in ms for THIS render, whichever pipeline ran.
+  //
+  // Legacy shape (kept for existing readers): { deriveMs, renderMs, uploadMs }.
+  //
+  // Planned expansion (2026-08-26, Phase 0 of the wall-time reduction plan):
+  //   {
+  //     layoutInputMs,      // buildLayoutInput cold LLM call (Phase 2 target)
+  //     quoteSnippetMs,     // quoteSnippet LLM (Phase 2 cross-process cache target)
+  //     sharpMs,            // reference decode + Sharp composite (Phase 3 worker_threads target)
+  //     atlasSubmitMs,      // Atlas submit+poll wall (external — baseline)
+  //     visionQcMs,         // Vision QC LLM call (Phase 2/4 target)
+  //     remotionMs,         // Chrome + ffmpeg (Phase 3 Chrome-pool target)
+  //     titlerPickupWaitMs, // renderer handoff → titler claim (validates backpressure)
+  //     ...legacyKeys       // deriveMs, renderMs, uploadMs still emitted
+  //   }
+  //
+  // Callers use `services/stageTiming.stampStageTiming(adId, stage, ms)` —
+  // fire-and-forget, non-blocking, silently swallows write errors. Instrumentation
+  // lands with each Phase 2/3 change that needs to measure the stage it touches;
+  // this field is the foundation, not a big-bang instrumentation PR.
+  //
+  // Answers "why is this ad slow" without a log-diving session — Atlas submit
+  // is normally 60-150s for static; a value far outside that on a specific ad,
+  // not the whole pipeline, points at that one Atlas call rather than at the
+  // code. Null on ads that predate this field or that raced past instrumentation.
   renderStages:       { type: mongoose.Schema.Types.Mixed, default: null },
   // LIVE per-ad stage, e.g. 'director' | 'master video generation' |
   // 'titling 9:16' | 'cropping 4:5' | 'uploading'. Updated as the render
