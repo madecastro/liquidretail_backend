@@ -332,6 +332,21 @@ function enabled() {
 // UI (Brand settings card + regenerate dropdown — routes/brand.js
 // exposes them as `videoModels`). Non-selectable entries stay registered
 // so persisted videoSettings/env overrides keep resolving.
+//
+// FULL REGISTRY RE-AUDIT 2026-08-26 against the live Atlas catalog (GET
+// /api/v1/models, 473 models) + each entry's individual OpenAPI schema URL.
+// All 5 pre-existing slugs below still exist live; per-entry comments note
+// what was reconfirmed vs corrected. One new entry was added
+// ('xai/grok-imagine-video-v1.5/reference-to-video', the owner explicitly
+// asked about it) and two more xAI video models were evaluated and
+// deliberately NOT added — see the comment after the closing `};` below for
+// why. Two brand-new Omni surfaces also appeared live since the last audit
+// (google/gemini-omni-flash/{text-to-video,video-edit} — both '-developer'
+// and plain) and a new google/veo3.1-fast + google/veo3.1-lite tier, none
+// registered: they're pure text-to-video / already-rendered-video-transform
+// capabilities this table's image-anchored paramShapes don't model, or thin
+// re-tiers of the already-registered veo3.1 line with no evidenced need here
+// — flagged in the same trailing comment rather than silently expanded.
 const MODEL_CAPS = {
   // Default. Duration is an ENUM (4|6|8|10), not a free range — the
   // request must send it explicitly so the output matches the 8s @ 24fps
@@ -342,7 +357,9 @@ const MODEL_CAPS = {
   // Prompt cap is 20,000 chars per Atlas's OpenAPI schema — enforced
   // here as bytes, the conservative interpretation. Pricing:
   // $0.20 base + $0.10/sec at 720p/1080p (8s ≈ $1.00); 4k base $1.00
-  // (schema + readme re-verified 2026-07-21).
+  // (schema + readme re-verified 2026-07-21, RE-CONFIRMED byte-for-byte
+  // against the same schema + readme 2026-08-26 — every field below still
+  // matches the live contract exactly, nothing changed).
   // Atlas publishes no RPS figure for this slug (unlike Grok's 1 RPS) —
   // the rate-limit backoff below stays defensive until confirmed.
   'google/gemini-omni-flash/image-to-video-developer': {
@@ -368,6 +385,7 @@ const MODEL_CAPS = {
   // Same 16:9/9:16-only aspect support as i2v, so the Grok aspect
   // fallback applies identically. Pricing: FIXED per generation
   // ($1.60 at 720p/1080p, $2.40 at 4k) — duration does not affect price.
+  // RE-CONFIRMED 2026-08-26 against the live schema + readme — unchanged.
   'google/gemini-omni-flash/reference-to-video-developer': {
     label: 'Google Omni Reference-to-Video (video-seeded)',
     selectable: true,
@@ -386,12 +404,16 @@ const MODEL_CAPS = {
   // Grok Imagine 1.5 — the operator-selectable Grok line AND the
   // automatic aspect-fallback target for formats the Omni models can't
   // render. SINGLE starting-frame image only (schema live-verified
-  // 2026-07-21: `image_url` is one string — the multi-image stack of the
-  // v1 reference-to-video line below does NOT carry over); the frame it
-  // receives is the position-0 pre-cropped seed, so composition still
-  // matches the canvas. Duration is a free 1–15s range, default 8.
+  // 2026-07-21, RE-CONFIRMED 2026-08-26: `image_url` is one string — the
+  // multi-image stack of the v1 reference-to-video line below does NOT
+  // carry over); the frame it receives is the position-0 pre-cropped seed,
+  // so composition still matches the canvas. Duration is a free 1–15s
+  // range, default 8. Label carries "(single-image)" as of 2026-08-26 to
+  // distinguish it from the new multi-reference v1.5 sibling registered
+  // immediately below (same family, different input shape — see that
+  // entry's comment).
   'xai/grok-imagine-video-v1.5/image-to-video': {
-    label: 'Grok Imagine Video 1.5',
+    label: 'Grok Imagine Video 1.5 (single-image)',
     selectable: true,
     minDuration: 1, maxDuration: 15,
     defaultDuration: 8,
@@ -405,11 +427,63 @@ const MODEL_CAPS = {
     // rate for this slug (catalog base_price units are opaque). Carrying
     // the v1 line's $0.50/sec as a conservative upper bound until the
     // first live render's billing confirms; revisit alongside costTracker.
+    // RE-CHECKED 2026-08-26: still no "Pricing" section in this model's
+    // readme, and the catalog list's `price.actual.base_price` (0.08) is
+    // NOT trustworthy as a real per-second/per-generation rate — cross-
+    // checking it against every OTHER entry in this table that has a
+    // readme-confirmed formula shows base_price matches neither component
+    // of the real formula for any of them (e.g. gemini-omni-flash i2v-dev
+    // reports base_price 0.112 but its real formula is $0.20 base + $0.10/
+    // sec; veo3.1 i2v reports base_price 0.2, which happens to equal its
+    // real per-second rate, but that looks coincidental given the mismatch
+    // everywhere else). Treat base_price as a catalog sort/display figure,
+    // not a billing source. Still no better number than the $0.50/sec
+    // carried forward here.
+    pricing: { kind: 'per-second', perSecond: 0.50 }
+  },
+  // NEW 2026-08-26 — v1.5 upgrade of the multi-image reference-to-video
+  // line further below (v1.0 'xai/grok-imagine-video/reference-to-video').
+  // Schema live-verified 2026-08-26
+  // (xai-grok-imagine-video-v1.5-reference-to-video.json): same body shape
+  // as the v1.0 entry — `image_urls` array (paramShape 'grok'), prompt
+  // referencing <IMAGE_N> tags — just wider on duration (1–15s vs the v1.0
+  // line's 1–10s cap) and otherwise identical limits (up to 7 references,
+  // resolution capped at 720p — NOT 1080p, even though the sibling single-
+  // image v1.5 entry above supports 1080p; reference-to-video stays capped
+  // lower across both v1.0 and v1.5). No code changes were needed to
+  // register this: the existing 'grok' paramShape case in
+  // buildSubmissionBody already sends exactly this field set. The schema
+  // also exposes an optional `voice_ids` field (up to 3 xAI preset voices
+  // for generated dialogue) that this paramShape does not send — no
+  // dialogue/voice selection is wired up, every render stays silent/
+  // default-audio the same as its v1.0 sibling.
+  // NOT selectable — this is a registry-accuracy pass, not a rollout.
+  // Promoting a new model to the operator dropdown is a product decision
+  // for a follow-up, not something to default to here (mirrors the
+  // existing precedent below: the v1.0 entry is also kept registered but
+  // not selectable).
+  // PRICING UNVERIFIED, same situation as the v1.5 image-to-video entry
+  // above — neither this model's readme nor its schema publishes a usable
+  // rate, and the catalog's base_price (0.08) is not a trustworthy formula
+  // source (see that entry's comment for why). Carrying the same $0.50/sec
+  // conservative upper bound as its v1.0 sibling until a real invoice
+  // confirms.
+  'xai/grok-imagine-video-v1.5/reference-to-video': {
+    label: 'Grok Imagine Video 1.5 (multi-reference)',
+    minDuration: 1, maxDuration: 15,
+    defaultDuration: 8,
+    resolutions: ['480p', '720p'],
+    defaultResolution: '720p',
+    maxReferenceImages: 7,
+    paramShape: 'grok',
+    supportedAspectRatios: ['1:1', '16:9', '9:16', '4:3', '3:4', '3:2', '2:3'],
+    promptByteCap: 4096,
     pricing: { kind: 'per-second', perSecond: 0.50 }
   },
   // Previous default — kept registered (not selectable) so persisted
   // videoSettings / ATLAS_VIDEO_MODEL values keep resolving. Multi-image
   // reference stack (up to 7 refs).
+  // RE-CONFIRMED 2026-08-26 against the live schema — unchanged.
   'xai/grok-imagine-video/reference-to-video': {
     label: 'Grok Imagine Video 1.0 (multi-reference)',
     minDuration: 1, maxDuration: 10,
@@ -421,19 +495,107 @@ const MODEL_CAPS = {
     // Flat per-second. 8s ≈ $4.00 — 4× the Gemini Omni default.
     pricing: { kind: 'per-second', perSecond: 0.50 }
   },
+  // AUDITED 2026-08-26 against the live schema
+  // (google-veo3.1-image-to-video.json) + readme — three fields below were
+  // WRONG and are corrected here:
+  //   duration was a continuous range (minDuration:5, maxDuration:8), but
+  //     the real schema is an ENUM [4,6,8] (readme: "Supported durations:
+  //     4, 6, or 8 seconds") — 5 and 7 were never valid values. This was
+  //     LATENT, not live: the 'veo' paramShape in buildSubmissionBody below
+  //     never sends a `duration` field at all, so nothing ever submitted
+  //     the bad value — but the registry itself was wrong.
+  //   resolutions was missing '4k' — schema enum is [720p,1080p,4k]. Also
+  //     latent: paramShape 'veo' never sends `resolution` either, so every
+  //     render uses Atlas's own schema default (720p) regardless.
+  //   supportedAspectRatios wrongly included '1:1' — schema enum is
+  //     [16:9,9:16] ONLY, confirmed by both the schema and the readme
+  //     ("Landscape (16:9) or Portrait (9:16)"). This one is NOT latent:
+  //     supportedAspectRatios feeds resolveAspectRatioForModel (~line 556),
+  //     and this model sits outside the Omni-only fallback gate at ~line
+  //     657 (`isOmni` checks `paramShape.startsWith('gemini-omni')`, which
+  //     'veo' never matches) — so an ad explicitly overridden to this model
+  //     on a 1:1 canvas would have had '1:1' accepted as "supported" and
+  //     submitted verbatim, which the live schema would reject with a 422.
+  //     Fixed here: 1:1 now correctly resolves to the nearest real option
+  //     (9:16) via the same unmodified resolveAspectRatioForModel logic.
+  //     Nothing about the resolution/fallback ALGORITHM changed — only the
+  //     data it reads. This model is not selectable and not the default,
+  //     so no default-path behavior is affected; this only fixes an
+  //     override-only edge case that would otherwise error.
+  // Pricing CONFIRMED (was "UNVERIFIED tier-dependent $0.05-0.20/sec"): the
+  // readme's explicit tier table gives $0.20/sec for "Video only" vs
+  // $0.40/sec for "Video + Audio". Atlas's own schema default for
+  // `generate_audio` is false, and paramShape 'veo' never sends that field,
+  // so every render here stays on the $0.20/sec silent tier — matches the
+  // value already in this table. (The same readme's "~$3.20 typical cost
+  // for 8s 1080p" prose only reconciles with the $0.40/sec audio tier —
+  // an inconsistency in Atlas's own docs, not this table; the explicit
+  // per-tier table is the more authoritative of the two and is what's used
+  // here, consistent with what this paramShape actually requests.)
   'google/veo3.1/image-to-video': {
     label: 'Google Veo 3.1',
-    minDuration: 5, maxDuration: 8,
-    resolutions: ['720p', '1080p'],
+    minDuration: 4, maxDuration: 8,
+    durationEnum: [4, 6, 8],
+    defaultDuration: 8,
+    resolutions: ['720p', '1080p', '4k'],
+    defaultResolution: '720p',
     maxReferenceImages: 1,
     paramShape: 'veo',
-    supportedAspectRatios: ['9:16', '16:9', '1:1'],
+    supportedAspectRatios: ['16:9', '9:16'],
     promptByteCap: 4096,
-    // UNVERIFIED tier-dependent rate ($0.05–0.20/sec advertised) —
-    // conservative upper bound until confirmed against a real invoice.
     pricing: { kind: 'per-second', perSecond: 0.20 }
   }
 };
+
+// Evaluated against the live catalog 2026-08-26 and deliberately NOT added
+// to MODEL_CAPS, per the owner's ask to judge (not blanket-add) new xAI
+// video surfaces:
+//
+//   xai/grok-imagine-video/extend-video and .../edit-video — schemas live-
+//   verified. Both require a `video_url` (an EXISTING rendered video clip)
+//   as their primary/only input — extend-video appends 2-10s to a 2-15s
+//   source clip; edit-video applies a natural-language edit to a clip
+//   ≤8.7s and returns the same duration. NEITHER accepts image references
+//   or a text-only prompt to generate a video from scratch. Every
+//   paramShape in this table (gemini-omni, gemini-omni-r2v, grok,
+//   grok-i2v, veo) builds its request from image references (the
+//   gemini-omni-r2v shape takes a video too, but ALONGSIDE images, as a
+//   style anchor, not as the sole/primary payload) — none of them, and
+//   nothing in resolveVideoModel/generateForAd, currently sources a
+//   `video_url` pointing at an ad's own already-rendered master to hand to
+//   one of these. Registering either slug today would let an operator (or
+//   a stray ATLAS_VIDEO_MODEL override) pick a model whose request the
+//   existing paramShape switch cannot build correctly — a broken
+//   registration is worse than no registration. Building real support
+//   (a new paramShape, plus a way to feed Ad.veoVideoUrl back in as
+//   `video_url` for a titling/derivative pass) is a genuine feature and a
+//   product decision, out of scope for this data-accuracy pass — flagged
+//   here for whoever picks up video-derivative work next.
+//
+//   google/gemini-omni-flash/{text-to-video,text-to-video-developer,
+//   video-edit} and google/gemini-omni-flash/{image-to-video,
+//   reference-to-video} (the non-'-developer' siblings of the two entries
+//   already registered above) — all confirmed live but not registered.
+//   text-to-video takes no image input at all, which doesn't fit this
+//   pipeline's product-photo-anchored generation; video-edit is the same
+//   "needs an existing video" shape as the two Grok models above. The
+//   plain (non-'-developer') image/reference-to-video variants are the
+//   same input/output shape as the already-registered '-developer' tier
+//   at a different price point — no capability gap, just a billing tier;
+//   see the '-developer' discount rationale further up this file (nano-
+//   banana-2/edit comment, ~line 69) for why this codebase prefers the
+//   developer tier by default.
+//
+//   google/veo3.1-fast/* and google/veo3.1-lite/* — confirmed live,
+//   cheaper/faster tiers of the already-registered google/veo3.1 line.
+//   Not registered: no evidenced need, and veo3.1 itself isn't even
+//   selectable here today (kept registered for override-only use) — no
+//   reason to add two more unselected tiers of a model this pipeline
+//   isn't actively steering ads toward.
+//
+// No veo3.2, no newer Gemini Omni line (e.g. "omni-pro" / "omni-2") exist
+// in the live catalog as of this audit — google/veo3.1(+fast/lite) and
+// google/gemini-omni-flash remain the current lines for their families.
 
 // Where non-16:9/9:16 canvases go when an Omni model is selected: the
 // references are already pre-cropped to the canvas aspect by the

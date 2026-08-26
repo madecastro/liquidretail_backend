@@ -30,7 +30,6 @@
 // through the exceptions.
 
 const Ad = require('../models/Ad');
-const { WORKER_ID } = require('../config');
 
 // Whitelist of stage names so a typo doesn't scatter half-cased keys across
 // the collection. New stages get added here explicitly.
@@ -62,6 +61,7 @@ function stampStageTiming(adId, stage, ms) {
   if (!KNOWN_STAGES.has(stage)) return;
   const n = Number(ms);
   if (!Number.isFinite(n) || n < 0) return;
+  const { WORKER_ID } = require('../config');
   // Aggregation pipeline update so the write is atomic AND coalesces the
   // null-parent case. Ad.renderStages defaults to `null` (models/Ad.js's
   // field declaration), and Mongo REJECTS a nested $set on a null parent
