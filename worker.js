@@ -165,6 +165,11 @@ const {
 // Pure Slack-message builder for the preparing-reap notice below — see
 // services/slackRunVerbosity.js header (no Mongo/network at require-time).
 const { buildPreparingReapNotice } = require('./services/slackRunVerbosity');
+// Canonical per-ad phase (services/adPhase.js) — used here ONLY to detect a
+// run stuck with a stranded claimed ad (e.g. handed off to the titler but no
+// titler ever claims it) so it can be paged, not to duplicate the
+// succeeded/failed/skipped counting classifyRunAdOutcome already owns.
+const { deriveAdPhase, DEFAULT_STALE_MINUTES } = require('./services/adPhase');
 
 // Mongoose default pool is 100 max. With 50+ concurrent workers each
 // firing several queries per pipeline stage, we want a roomy pool to
@@ -573,13 +578,73 @@ async function reapOrphans() {
     // check (an unselected `kind` reads as `undefined !== 'video'`, so every
     // Ad would be treated as a static and the titling debt would never be
     // seen at all).
+    // Widened again (2026-08-26) with the fields deriveAdPhase() needs —
+    // claimedByWorker/titlingNeeded/deriveFromMaster/renderStageAt/updatedAt —
+    // so the stranded-claim scan just below reads real truth instead of
+    // silently treating every ad as "not stalled" the same way an
+    // unselected `kind` used to silently defeat the titling check above.
     const claimedAds = await Ad.find({ campaignRunIds: candidate.runId })
-      .select('status kind renderUrl veoVideoUrl titlingResumeState renderStage')
+      .select('status kind renderUrl veoVideoUrl titlingResumeState renderStage renderStageAt ' +
+              'claimedByWorker claimedAt titlingNeeded deriveFromMaster visionQc renderError updatedAt')
       .lean();
     const outcome = classifyRunAdOutcome(claimedAds);
     if (!outcome.isSettled) {
       nRunsDeferred++;
       if (outcome.titlingIncomplete > 0) nRunsDeferredTitling++;
+      // ── STRANDED-CLAIM PAGE (2026-08-26) ──────────────────────────────
+      // classifyRunAdOutcome correctly leaves a run with real outstanding
+      // work alone (receipt-holding still rendering, untitled master mid
+      // recovery) — that is often just a run waiting behind a shared
+      // concurrency pool, not stuck. But some outstanding shapes are NOT
+      // "waiting its turn" — they are permanently stuck because a role the
+      // pipeline depends on stopped claiming (the exact incident this fix
+      // responds to: derives handed off with `titlingNeeded:true` when the
+      // titler service had ADGEN_TITLER_ENABLED=false — every such ad sat
+      // `awaiting-titler` forever, uncounted, un-alerted, indistinguishable
+      // from a run simply waiting its turn behind VEO_CONCURRENCY). Any
+      // claimed Ad whose canonical phase (services/adPhase.js — the SAME
+      // function the UI and Slack QC alerts use) comes back 'stalled' means
+      // its own relevant timestamp hasn't moved in DEFAULT_STALE_MINUTES —
+      // that is real, not "waiting its turn" (a pool wait still beats the
+      // heartbeat / bumps updatedAt; see services/campaignRunHeartbeat.js).
+      // This generalizes past the titler flag specifically: ANY handoff-
+      // style stranding (a role switched off, a service down, a crashed
+      // worker the reaper hasn't caught yet) produces the identical shape.
+      try {
+        const stalled = claimedAds
+          .map((ad) => ({ ad, phase: deriveAdPhase(ad, { now: reapNow }) }))
+          .filter((x) => x.phase === 'stalled');
+        if (stalled.length > 0) {
+          // Per-run dedup key — ALERT_DEDUPE_WINDOW_MIN (default 15m) already
+          // throttles a repeat page for the same run on every REAP_INTERVAL_MIN
+          // tick without needing a bespoke cooldown here.
+          alerts.notifyAsync({
+            level: 'error',
+            title: `Run stranded — ${stalled.length} claimed ad(s) stopped moving`,
+            key: `reaper:stalled-claim:${candidate.runId}`,
+            fields: {
+              runId: candidate.runId,
+              'stalled ads': stalled.length,
+              'total claimed': claimedAds.length,
+              'stale threshold': `${DEFAULT_STALE_MINUTES}m`,
+              // Name the specific shape when every stalled ad shares one —
+              // the titler-off incident is common enough to call out by name
+              // rather than making an operator open the run to find it.
+              ...(stalled.every((x) => x.ad.titlingNeeded === true && !x.ad.claimedByWorker)
+                ? { 'likely cause': 'handed off for titling but never claimed — check the titler service is running and ADGEN_TITLER_ENABLED=true there' }
+                : {})
+            },
+            detail: stalled.slice(0, 10).map((x) => {
+              const prevPhase = x.ad.titlingNeeded === true && !x.ad.claimedByWorker ? 'awaiting-titler'
+                : (x.ad.deriveFromMaster && !x.ad.veoVideoUrl ? 'awaiting-master' : 'in-flight');
+              return `${x.ad._id}  stuck-in=${prevPhase}  claimed=${x.ad.claimedByWorker || 'no'}  ` +
+                `lastStage=${x.ad.renderStage || '(none)'}`;
+            }).join('\n')
+          });
+        }
+      } catch (err) {
+        console.warn(`⚠️  stalled-claim scan failed for run ${candidate.runId} (non-fatal): ${err.message}`);
+      }
       continue;
     }
     const update = buildRunReconciliationUpdate(outcome, { staleMin: REAP_STALE_MIN, now: new Date(reapNow) });

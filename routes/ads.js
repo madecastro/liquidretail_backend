@@ -307,6 +307,12 @@ const MAX_CREATIVES_PER_RUN = CONC.MAX_CREATIVES_PER_RUN;
 // header. Used by projectAd below so `titled` is never inferred twice, once
 // correctly here and once wrong on a client.
 const { isAdHonestlyDelivered } = require('../services/adTitlingTruth');
+// Canonical per-ad phase — services/adPhase.js. THE single source every
+// surface that shows "where is this ad" (this endpoint's `projectAd`, the
+// render-activity board below, GET /runs, and Slack) must call instead of
+// re-deriving a label from status/renderStage/visionQc independently. See
+// that file's header for the 2026-08-26 audit this responds to.
+const { deriveAdPhase, describeAdFailure } = require('../services/adPhase');
 
 // POST /api/ads/preview
 // Same body as /generate. Runs the entire seed assembly + cartesian +
@@ -4128,6 +4134,14 @@ router.get('/render-activity', async (req, res) => {
               'renderUrl renderError renderAttempts renderStages imageGeneration ' +
               'intentResolution visionQc veoPredictionId veoAspectRatio veoVideoUrl ' +
               'campaignId campaignRunIds productId mediaId brandId conceptId ' +
+              // deriveFromMaster/funnelStage: real lineage (see the fixed
+              // `derivedFromMaster` field below). claimedByWorker/claimedAt/
+              // titlingNeeded/titlingResumeState: needed by deriveAdPhase —
+              // an unselected field here silently mis-derives phase the same
+              // way an unselected `kind` used to silently defeat the titling
+              // check in services/campaignRunGuards.js.
+              'deriveFromMaster funnelStage claimedByWorker claimedAt ' +
+              'titlingNeeded titlingResumeState ' +
               'queuedAt renderedAt updatedAt')
       .sort({ updatedAt: -1 })
       .limit(limit)
@@ -5903,6 +5917,13 @@ function projectAd(ad, full = false, extras = {}) {
     // `full` below upgrades it with the per-category breakdown.
     visionQc:           summarizeVisionQc(ad.visionQc)
   };
+  // THE canonical phase — services/adPhase.js. Every UI surface should read
+  // THIS field for its status pill instead of re-deriving one from `status`
+  // + `renderStage` (the drift that let /ads and ProductAds disagree about
+  // the same ad — see that file's header). Always present, not gated on
+  // `full`: a list tile needs to know "stalled" / "awaiting-titler" just as
+  // much as the detail modal does.
+  base.phase = deriveAdPhase(ad);
   // A failed ad in the LIST needs to say WHY. renderError itself stays behind
   // `full` (it carries other internals), so surface just
   // the operator-facing headline — which since 2026-08-05 leads with the policy
@@ -5914,6 +5935,13 @@ function projectAd(ad, full = false, extras = {}) {
     base.renderErrorMessage = String(ad.renderError.message);
     base.chargeState        = ad.renderError.chargeState || null;
   }
+  // Owner requirement 2026-08-26: "for QC failures it should specifically be
+  // noted as a QC Fail, not just Failed." `failure` is null on every phase
+  // except failed-terminal/qc-failed-kept, so a passing/in-flight ad's
+  // payload is unchanged. See services/adPhase.js describeAdFailure — same
+  // function Slack alerts use, so the label can never disagree.
+  const failure = describeAdFailure(ad, base.phase);
+  if (failure) base.failure = failure;
 
   if (full) {
     base.layoutInputArtifactId = ad.layoutInputArtifactId ? String(ad.layoutInputArtifactId) : null;
