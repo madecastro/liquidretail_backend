@@ -11,4 +11,8 @@ dist/
 # scripts/prebuildRemotionBundle.js. Local runs are for smoke-testing
 # only and should never commit their output.
 .remotion-bundle/
+# Build-time browser prewarm hint — written by scripts/ensureRemotionBrowser.js.
+# Not consumed by the Dockerfile (the ENV there is a literal, checked against
+# this by scripts/verifyRemotionBrowserPrewarm.js) or by runtime; local-only.
+.remotion-browser-path
 probe-results/

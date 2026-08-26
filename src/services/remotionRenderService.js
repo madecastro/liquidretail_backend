@@ -110,29 +110,101 @@ function resolveBrowserExecutable() {
   );
   // DELIBERATELY NO CANDIDATE for Remotion's own cache — it resolves that itself.
   //
-  // What used to be here was a glob of `<repo>/.cache/puppeteer/chrome-headless-shell`
-  // whose comment claimed .puppeteerrc.cjs pinned the puppeteer cache there. It
-  // does not, and has not since f89e30b moved the cache to
-  // `node_modules/.puppeteer-cache` precisely BECAUSE Render loses `.cache/`
-  // between the build and serve containers (see .puppeteerrc.cjs's header). So
-  // that candidate could never match, and this was not a cosmetic wart: it was
-  // why every fresh instance fell through to ensureBrowser() below and downloaded
-  // ~92MB of headless shell on its FIRST render, on a user-visible request.
+  // What used to be here was a glob of `<repo>/.cache/puppeteer/chrome-headless-shell`,
+  // justified by a comment claiming a `.puppeteerrc.cjs` in THIS repo pinned
+  // the puppeteer cache there. CORRECTION (2026-08-26): `.puppeteerrc.cjs`
+  // has never existed anywhere in this repo's git history (`git log --all --
+  // .puppeteerrc.cjs` is empty) — that file, and the commit hash the old
+  // comment cited, belong to a similarly-named concern in the SIBLING
+  // liquidretail_backend repo (see that repo's scripts/ensurePuppeteerChrome.js),
+  // not here. Whatever the original intent, the candidate could never match
+  // in THIS repo: `.cache/puppeteer` does not exist at all on the live box,
+  // and `node_modules/.puppeteer-cache` (this repo's actual puppeteer
+  // postinstall target) holds puppeteer's full `chrome` binary, not a
+  // headless shell — not a candidate for Remotion either way. So every fresh
+  // instance fell through to ensureBrowser() below and downloaded ~92MB of
+  // headless shell on its FIRST render, on a user-visible request — and,
+  // worse, N children doing that close together raced @remotion/renderer's
+  // own install/reinstall logic on ONE shared path (see
+  // scripts/ensureRemotionBrowser.js's header for the full incident trace).
   //
-  // Verified on the live box before removing it: `.cache/puppeteer` does not
-  // exist at all, and `node_modules/.puppeteer-cache` holds only puppeteer's full
-  // `chrome` — not a headless shell, so it is not a candidate for Remotion either.
-  //
-  // The fix is NOT a replacement glob. Remotion's cache nests three levels deep
-  // and platform-specifically
-  // (`node_modules/.remotion/chrome-headless-shell/<platform>/chrome-headless-shell-<platform>/chrome-headless-shell`),
-  // so hand-rolling that path here would be brittle for no benefit —
-  // ensureBrowser() already finds its own cache correctly. The actual fix is
-  // scripts/ensureRemotionBrowser.js, which pre-warms that cache at BUILD time so
-  // the download lands in the artifact and the runtime fallback becomes a no-op.
-  // Keep the Playwright candidate above: that one is a genuinely external browser
-  // this code could not otherwise discover.
+  // The fix is NOT a replacement glob. Remotion's cache nests three levels
+  // deep and platform-specifically — verified against @remotion/renderer
+  // 4.0.495's own source (BrowserFetcher.ts), not assumed:
+  // `node_modules/.remotion/chrome-headless-shell/<platform>/chrome-headless-shell-<platform>/chrome-headless-shell`.
+  // Hand-rolling that path here would be brittle for no benefit. The actual
+  // fix is scripts/ensureRemotionBrowser.js, which pre-warms that cache at
+  // Docker BUILD time and the Dockerfile then bakes REMOTION_BROWSER_EXECUTABLE
+  // pointing straight at the verified binary — so in production this
+  // function returns at the very first line, above, and everything below
+  // this comment (including ensureBrowser() in ensureBrowserReady()) is
+  // unreached. It stays here as the correct fallback for local/dev runs and
+  // as defense-in-depth (see withInstallLock, below) if that env var is ever
+  // missing. Keep the Playwright candidate above: that one is a genuinely
+  // external browser this code could not otherwise discover.
   return firstExisting(candidates.filter(Boolean));
+}
+
+// ── cross-process install lock (defense-in-depth, NOT the primary fix) ─────
+// The primary fix is baking the browser at Docker build time and setting
+// REMOTION_BROWSER_EXECUTABLE (scripts/ensureRemotionBrowser.js + Dockerfile)
+// — with that in place resolveBrowserExecutable() returns non-null on its
+// FIRST check, above, and the ensureBrowser() branch below is unreachable in
+// production. This lock exists only for the case where that env var is ever
+// unset at runtime (a local/dev run outside the Docker build, or a
+// misconfigured deploy that dropped the ENV). In that fallback case, EVERY
+// SIBLING CHILD PROCESS spawned close together would otherwise independently
+// call @remotion/renderer's ensureBrowser() and race its
+// download/verify/reinstall dance on the ONE SHARED on-disk cache directory
+// — ensureBrowser()'s own serialization (`currentEnsureBrowserOperation` in
+// its ensure-browser.ts) is a per-process Promise chain, so it protects
+// nothing across processes. That race is exactly what produced adgen-titler's
+// 2026-08-26 ETXTBSY/ENOENT/ENOTEMPTY "No browser found" incident — see
+// scripts/ensureRemotionBrowser.js's header for the full trace against
+// @remotion/renderer@4.0.495's actual source.
+//
+// fs.mkdirSync on a not-yet-existing path is atomic on POSIX filesystems (one
+// caller wins EEXIST, the rest lose it) — a dependency-free mutex. A lock
+// older than LOCK_STALE_MS is presumed abandoned (its holder crashed/was
+// SIGKILLed, e.g. an OOM) and is busted rather than wedging every future
+// render behind a corpse.
+const REMOTION_INSTALL_LOCK_DIR = path.join(os.tmpdir(), 'remotion-browser-install.lock');
+const LOCK_POLL_MS = 500;
+const LOCK_STALE_MS = 120_000;   // generous vs. a real download+extract (~seconds); a lock older than this means its holder is dead
+const LOCK_WAIT_DEADLINE_MS = 180_000; // give up waiting and proceed unlocked rather than hang a render forever
+
+async function withInstallLock(fn) {
+  const deadline = Date.now() + LOCK_WAIT_DEADLINE_MS;
+  let acquired = false;
+  while (!acquired) {
+    try {
+      fs.mkdirSync(REMOTION_INSTALL_LOCK_DIR);
+      acquired = true;
+    } catch (e) {
+      if (e.code !== 'EEXIST') throw e;
+      try {
+        const age = Date.now() - fs.statSync(REMOTION_INSTALL_LOCK_DIR).mtimeMs;
+        if (age > LOCK_STALE_MS) {
+          fs.rmdirSync(REMOTION_INSTALL_LOCK_DIR);
+          continue; // retry acquiring immediately — do not sleep after busting a stale lock
+        }
+      } catch {
+        // stat/rmdir raced a concurrent release — harmless, just retry below.
+      }
+      if (Date.now() > deadline) {
+        console.warn(`🎬 remotion: install lock wait exceeded ${LOCK_WAIT_DEADLINE_MS}ms — proceeding WITHOUT it (best effort; this is the pre-fix race, not a new risk)`);
+        break; // acquired stays false — never release a lock we do not own
+      }
+      await new Promise((resolve) => setTimeout(resolve, LOCK_POLL_MS));
+    }
+  }
+  try {
+    return await fn();
+  } finally {
+    if (acquired) {
+      try { fs.rmdirSync(REMOTION_INSTALL_LOCK_DIR); } catch { /* best effort */ }
+    }
+  }
 }
 
 let browserReadyPromise = null;
@@ -146,7 +218,7 @@ function ensureBrowserReady() {
           console.log(`🎬 remotion: using browser at ${p}`);
           return p;
         })
-      : ensureBrowser().then(() => {
+      : withInstallLock(() => ensureBrowser()).then(() => {
           console.log('🎬 remotion: headless shell downloaded via ensureBrowser()');
           return null; // renderer resolves its own download
         });
@@ -295,10 +367,63 @@ function getAssetServer() {
 // modest and the ceiling is env-driven: raise REMOTION_QUEUE_CONCURRENCY
 // only against an observed RSS number, one step at a time. The queue still
 // lives in THIS process; isolation changes WHERE each slot runs, not HOW MANY.
+//
+// Fallback `|| 2` matches config/defaults.env's committed default (see that
+// file's long derivation) — this branch only fires if dotenv somehow failed
+// to load defaults.env at all, so it should be dead code in practice. It
+// used to say `|| 4`, a THIRD number silently disagreeing with both the file
+// default and any dashboard override; see config/defaults.env for why 4 is
+// the exact concurrency that OOM-killed adgen-titler three times in 44h.
 const QUEUE_CONCURRENCY = Math.max(
   1,
-  parseInt(process.env.REMOTION_QUEUE_CONCURRENCY, 10) || 4
+  parseInt(process.env.REMOTION_QUEUE_CONCURRENCY, 10) || 2
 );
+
+// ── boot-time memory sanity check (loud, not fatal) ─────────────────────────
+// Refusing to boot on a bad concurrency knob risks taking the whole titling
+// pipeline down over a config typo — worse than the problem it prevents. So:
+// warn loudly, at require time, if the configured concurrency's estimated
+// peak RSS looks unsafe against this instance's memory budget. The measured
+// per-slot figure (~1.97 GiB, corroborated independently on both renderer
+// AND titler — see config/defaults.env's 2026-08-21 and 2026-08-26 sections)
+// and the pro_plus instance size (8 GiB) are both env-overridable so this
+// check can follow a real instance-size change without a code edit.
+// AUTOSCALE_TRIGGER_PCT (60) matters because an autoscaled service (titler)
+// that sits above the memory autoscale trigger doesn't just risk OOM on ITS
+// OWN — it triggers Render to add MORE instances that each run into the same
+// per-instance ceiling, which is the exact mechanism that turned one bad
+// concurrency value into three separate OOM kills. A non-autoscaled service
+// (renderer, currently) only needs to clear the hard OOM ceiling.
+function checkRemotionMemoryBudget() {
+  const perSlotMb = Number(process.env.REMOTION_MEASURED_MB_PER_SLOT || 2016); // ~1.97 GiB
+  const instanceMb = Number(process.env.REMOTION_INSTANCE_MEMORY_MB || 8192);  // pro_plus 8 GiB
+  const autoscaleTriggerPct = Number(process.env.REMOTION_AUTOSCALE_TRIGGER_PCT || 60);
+  if (!(perSlotMb > 0) || !(instanceMb > 0)) return; // misconfigured override — don't crash on it, just skip the check
+
+  const estimatedPeakMb = QUEUE_CONCURRENCY * perSlotMb;
+  const pctOfInstance = (estimatedPeakMb / instanceMb) * 100;
+
+  if (pctOfInstance >= 90) {
+    console.error(
+      `🚨 remotion: REMOTION_QUEUE_CONCURRENCY=${QUEUE_CONCURRENCY} × ~${perSlotMb}MB/slot ≈ ` +
+      `${(estimatedPeakMb / 1024).toFixed(1)}GiB (${pctOfInstance.toFixed(0)}% of the ` +
+      `${(instanceMb / 1024).toFixed(1)}GiB instance) — this is OOM territory (the exact ` +
+      `math behind adgen-titler's three 2026-08-26 OOM kills at concurrency=4). Lower ` +
+      `REMOTION_QUEUE_CONCURRENCY or raise the instance size before this ships real traffic.`
+    );
+  } else if (pctOfInstance >= autoscaleTriggerPct) {
+    console.warn(
+      `⚠️  remotion: REMOTION_QUEUE_CONCURRENCY=${QUEUE_CONCURRENCY} × ~${perSlotMb}MB/slot ≈ ` +
+      `${(estimatedPeakMb / 1024).toFixed(1)}GiB (${pctOfInstance.toFixed(0)}% of the ` +
+      `${(instanceMb / 1024).toFixed(1)}GiB instance) — at or above the ${autoscaleTriggerPct}% ` +
+      `autoscale memory trigger. Safe on a service with autoscaling DISABLED (verify in the ` +
+      `Render dashboard); on an AUTOSCALED service this can make Render pile on more instances ` +
+      `that each hit the same per-instance ceiling instead of relieving it — see ` +
+      `config/defaults.env's 2026-08-26 section for the incident this describes.`
+    );
+  }
+}
+checkRemotionMemoryBudget();
 
 let activeRenders = 0;
 const waiting = [];
@@ -653,6 +778,21 @@ async function renderTitlesJob({ videoUrl, meta, spec, tokens, format, brandName
         // frames (REMOTION_CONCURRENCY pinned to 1); parallel encode is the
         // second memory spike on the same 8 GiB box.
         disallowParallelEncoding: true,
+        // Opt-in memory levers (2026-08-26 reliability pass), both undefined
+        // — Remotion's own default — unless explicitly set, so this is a
+        // zero-behavior-change no-op until the orchestrator chooses to tune
+        // it. offthreadVideoCacheSizeInBytes caps how much decoded base-plate
+        // frame data OffthreadVideo (BasePlate.jsx's video layer — the one
+        // real per-frame video-decode consumer in this composition) keeps
+        // resident; lower = less RSS, more re-decode CPU. NOT changed by
+        // default because there is no production RSS breakdown isolating
+        // OffthreadVideo's own share of the measured ~1.97 GiB/slot from
+        // Chrome's baseline — tune against a real measurement, same rule as
+        // REMOTION_QUEUE_CONCURRENCY (see config/defaults.env), not a guess.
+        offthreadVideoCacheSizeInBytes: process.env.REMOTION_OFFTHREAD_VIDEO_CACHE_BYTES
+          ? Number(process.env.REMOTION_OFFTHREAD_VIDEO_CACHE_BYTES) : undefined,
+        offthreadVideoThreads: process.env.REMOTION_OFFTHREAD_VIDEO_THREADS
+          ? Number(process.env.REMOTION_OFFTHREAD_VIDEO_THREADS) : undefined,
         onProgress: ({ progress }) => {
           const pct = Math.round(progress * 100);
           if (pct >= lastLogged + 25) {
@@ -881,4 +1021,10 @@ module.exports = {
   // "concurrency". A serial queue and a parallel one look identical in source.
   enqueue,
   renderQueueStats,
+  // Browser resolution/lock internals — exported for
+  // scripts/verifyRemotionBrowserPrewarm.js, which drives resolveBrowserExecutable
+  // and withInstallLock directly (execution, not just regex on source text).
+  resolveBrowserExecutable,
+  withInstallLock,
+  REMOTION_INSTALL_LOCK_DIR,
 };

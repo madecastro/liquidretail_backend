@@ -25,6 +25,33 @@ if (!MONGODB_URI) {
   process.exit(1);
 }
 
+// Fail fast on a role that cannot do its job, instead of booting, claiming
+// work, and failing the first render. Both renderer and titler upload the
+// titled/derived asset to Cloudinary at the tail of every ad
+// (cloudinaryService.js's module-level `cloudinary.config()` reads these
+// once at require time) — a missing key here does not surface until that
+// FIRST upload, on an already-paid master, exactly like the 2026-08-25
+// "Must supply api_key" incident (7 titler ads, all with a preserved paid
+// master, traced to a Cloudinary dashboard var not yet propagated to a
+// freshly-launched titler instance — resolved operationally by the time it
+// was investigated, but nothing at boot would have caught the NEXT one).
+// CLOUDINARY_CLOUD_NAME ships a committed non-secret default
+// (config/defaults.env) so it is included for completeness, not because
+// it is expected to be the one that's actually missing in practice.
+// ATLAS_API_KEY is deliberately NOT required for `titler` — the titler role
+// must never call Atlas (see titlingResumeService's money invariant,
+// scripts/verifyTitlingResumeNeverResubmits.js); requiring a key it must
+// never use would be a lie about what this role does.
+const REQUIRED_ENV_BY_ROLE = {
+  renderer: ['CLOUDINARY_CLOUD_NAME', 'CLOUDINARY_API_KEY', 'CLOUDINARY_API_SECRET', 'ATLAS_API_KEY'],
+  titler:   ['CLOUDINARY_CLOUD_NAME', 'CLOUDINARY_API_KEY', 'CLOUDINARY_API_SECRET'],
+};
+const missingRoleEnv = (REQUIRED_ENV_BY_ROLE[ROLE] || []).filter((k) => !process.env[k]);
+if (missingRoleEnv.length) {
+  console.error(`❌ ADGEN_ROLE=${ROLE} is missing required env var(s): ${missingRoleEnv.join(', ')} — every upload/submit on this instance would fail. Refusing to boot rather than silently failing the first render.`);
+  process.exit(1);
+}
+
 // Worker id — either operator-supplied for pinning, or auto for uniqueness.
 // Renderer uses this as Ad.claimedByWorker so we can trace ownership.
 const WORKER_ID = process.env.ADGEN_WORKER_ID

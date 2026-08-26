@@ -1016,6 +1016,19 @@ async function settleNonDraftTerminal(ad, label) {
   const shortId = String(ad._id).slice(-6);
   // A terminal verdict was already stamped. Do NOT resurrect it — but the
   // claim and the titling debt are still ours to settle.
+  //
+  // renderStage:'done' is set here UNCONDITIONALLY, same as the guarded
+  // success $set this function backstops — deliberately NOT status-gated.
+  // renderStage is progress telemetry ("is this ad still working"), not a
+  // pass/fail verdict; `status` (left alone here — could be 'failed' from
+  // vision QC, or 'archived') already carries that distinction correctly.
+  // Before this, NOTHING ever wrote a terminal renderStage on this arm, so a
+  // QC-failed video ad kept showing its last in-flight stage (typically
+  // "vision QC (video)") forever with the frontend's live elapsed-timer UI —
+  // measured 2026-08-26: 242/300 recent video ads stuck exactly there,
+  // reading as "stuck in quality check" when they were actually done and
+  // correctly failed. See renderStage's own success-path precedent in
+  // titlingResumeService.js, which already does this the same way.
   const after = await Ad.findOneAndUpdate(
     { _id: ad._id },
     {
@@ -1023,6 +1036,8 @@ async function settleNonDraftTerminal(ad, label) {
         titlingResumeState: null,
         claimedByWorker:    null,
         claimedAt:          null,
+        renderStage:        'done',
+        renderStageAt:      new Date(),
         updatedAt:          new Date()
       }
     },
@@ -1265,6 +1280,11 @@ async function renderVideo(ad) {
           titlingResumeState: null,
           claimedByWorker:    null,
           claimedAt:          null,
+          // Terminal stage — see settleNonDraftTerminal's comment for why
+          // this is 'done' regardless of the vision-QC verdict (status
+          // already carries pass/fail; renderStage is progress telemetry).
+          renderStage:        'done',
+          renderStageAt:      new Date(),
           updatedAt:          new Date()
         }
       }
@@ -1465,6 +1485,11 @@ async function renderVideo(ad) {
         titlingResumeState: null,
         claimedByWorker:    null,
         claimedAt:          null,
+        // Terminal stage — see settleNonDraftTerminal's comment for why
+        // this is 'done' regardless of the vision-QC verdict (status
+        // already carries pass/fail; renderStage is progress telemetry).
+        renderStage:        'done',
+        renderStageAt:      new Date(),
         updatedAt:          new Date()
       }
     }
@@ -1710,6 +1735,13 @@ async function processAd(ad) {
             // future bubbled titling failure lands clean.
             titlingResumeState: null,
             titlingNeeded:      false,
+            // Terminal stage — this ad is done (definitively failed, status
+            // already carries that); without this it kept showing whatever
+            // in-flight stage it died mid-transition, forever, in the
+            // frontend's live-elapsed-timer UI. Same fix as
+            // settleNonDraftTerminal's — see that function's comment.
+            renderStage:        'done',
+            renderStageAt:      new Date(),
             renderError:     {
               message: String(err.message || err).slice(0, 400),
               stage: 'render',

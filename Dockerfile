@@ -1,7 +1,7 @@
 # Ad-generation microservice.
 #
-# One image, three roles selected by ADGEN_ROLE (api | orchestrator | renderer).
-# Same image ships to all three Render services in render.yaml.
+# One image, four roles selected by ADGEN_ROLE (api | orchestrator | renderer | titler).
+# Same image ships to all four Render services in render.yaml.
 #
 # Node 20 for parity with backend + Remotion 4.x requirements. Phase 1 adds
 # Remotion + its Chrome/ffmpeg deps to the renderer image; Phase 0 stays lean.
@@ -67,6 +67,27 @@ COPY scripts/ ./scripts/
 # step the runtime falls back to on-the-fly bundling (existing behaviour),
 # so the change is purely additive.
 RUN node scripts/prebuildRemotionBundle.js
+
+# Pre-warm @remotion/renderer's chrome-headless-shell at BUILD time — see
+# scripts/ensureRemotionBrowser.js's header for the full incident writeup.
+# Without this, resolveBrowserExecutable() returns null and EVERY spawned
+# render child independently calls @remotion/renderer's ensureBrowser() at
+# runtime; ensureBrowser()'s only serialization is per-process, so N sibling
+# children racing the same shared cache path is exactly what produced
+# adgen-titler's 2026-08-26 ETXTBSY/ENOENT/ENOTEMPTY "No browser found"
+# incident. Baking it here means every runtime child instead resolves the
+# browser via REMOTION_BROWSER_EXECUTABLE below on its very first check
+# (remotionRenderService.js:96) and NEVER calls ensureBrowser() at all — the
+# race is structurally unreachable, not just less likely.
+#
+# The path is HARDCODED here (not read from the script's own
+# .remotion-browser-path hint file) so any drift between what the script
+# actually verified and what this image ships FAILS THE BUILD instead of
+# silently shipping a wrong path — scripts/verifyRemotionBrowserPrewarm.js
+# Group C pins that this literal matches ensureRemotionBrowser.js's own
+# derivation formula.
+RUN node scripts/ensureRemotionBrowser.js
+ENV REMOTION_BROWSER_EXECUTABLE=/app/node_modules/.remotion/chrome-headless-shell/linux64/chrome-headless-shell-linux64/chrome-headless-shell
 
 # api role listens on PORT; orchestrator/renderer are workers with no port.
 EXPOSE 3100

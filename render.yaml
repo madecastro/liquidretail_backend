@@ -41,13 +41,20 @@ services:
     name: adgen-renderer
     env: docker
     # Pro-Plus: 4 vCPU / 8 GB. The RAM ceiling is set by Remotion —
-    # MEASURED ~1.97 GB per concurrent render, so REMOTION_QUEUE_CONCURRENCY=3
-    # ≈ 5.9 GB peak (74%, ~2 GB headroom). 4 concurrent ≈ 7.9 GB and is the
-    # configuration that was OOM-killed on 2026-08-21 while holding a paid
-    # master — do not restore it here. Standard (4 GB) OOMs under real video
-    # load. NOTE: autoscaling is currently DISABLED on this service, so the
-    # 60% memory trigger is not a live constraint on the concurrency choice.
-    # Was
+    # MEASURED ~1.97 GB per concurrent render. Live dashboard value is
+    # REMOTION_QUEUE_CONCURRENCY=2 (≈3.9 GB peak, 49%, ~4 GB headroom) — NOT
+    # 3 as an earlier version of this comment described; config/defaults.env
+    # reasoned 3 was safe here (74%, ~2 GB headroom) given autoscaling is
+    # disabled on this service, but that was never actually rolled out to
+    # this dashboard, and adgen-titler's 2026-08-26 triple-OOM at a
+    # similarly-reasoned-but-unmeasured value (4) is a live argument for not
+    # doing so without a real measurement first — see that file's 2026-08-26
+    # section. 4 concurrent ≈ 7.9 GB and is the configuration that was
+    # OOM-killed on 2026-08-21 while holding a paid master — do not restore
+    # it here. Standard (4 GB) OOMs under real video load. NOTE: autoscaling
+    # is currently DISABLED on this service, so the 60% memory trigger is not
+    # a live constraint on the concurrency choice — unlike adgen-titler
+    # below, where it is. Was
     # standard_plus in this file until 2026-08-24 (Render's plan naming
     # shifted mid-year; the live service was already on pro_plus via
     # dashboard override, and standard_plus is no longer a valid worker
@@ -75,20 +82,25 @@ services:
   - type: worker
     name: adgen-titler
     env: docker
-    # Same plan as adgen-renderer (see that block's comment on why 8 GB is
-    # required for Chrome). Titler has NO competing work on this instance
-    # (no Atlas HTTP, no static gpt-image-2/edit, no poll loop overhead
-    # beyond claim polling), so Chrome gets the whole budget.
-    # REMOTION_QUEUE_CONCURRENCY is inherited from config/defaults.env (=2)
-    # for a safe first deploy; raise via env override once validated under
-    # real load. Do not duplicate the value here — two sources of truth for
-    # a memory ceiling has bitten this repo before.
+    # Same plan as adgen-renderer (8 GB — Chrome needs it). Titler has no
+    # competing work here, but measured 2026-08-26 that does NOT mean higher
+    # safe concurrency: ~1.91 GiB/slot, statistically the same as the
+    # renderer's ~1.97. REMOTION_QUEUE_CONCURRENCY inherits config/defaults.env
+    # (=2); DO NOT duplicate the value here (one source of truth for a memory
+    # ceiling). See that file's 2026-08-26 section: the live dashboard was
+    # raised to 4 without validation and OOM-killed 3 instances in 44h.
+    # Orchestrator action item: dashboard 4 -> 2.
     plan: pro_plus
     dockerfilePath: ./Dockerfile
     autoDeploy: true
-    # Dashboard autoscale: min=1 (dark launch — flag off, service is idle),
-    # max=8. Bump min after ADGEN_TITLER_ENABLED goes true so the handoff
-    # never queues behind cold-start.
+    # Dashboard autoscale documented here (min=1/max=8) has drifted from the
+    # live dashboard (min=4/max=12, raised 2026-08-25 in two steps) without
+    # this file being updated — the same drift class that let the
+    # concurrency regression above go unnoticed. All 3 OOM kills happened
+    # AFTER this widening: more instances didn't relieve the per-instance
+    # ceiling, just multiplied how many could hit it independently. Fix
+    # concurrency first; revisit max-instance count separately once that
+    # holds under real load.
     envVars:
       - key: ADGEN_ROLE
         value: titler
