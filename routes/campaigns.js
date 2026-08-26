@@ -28,6 +28,14 @@ const {
   outcomeAccumulators,
   distinctOnDelivered
 } = require('../services/adDeliveryCounts');
+// Canonical per-ad phase + QC summary — see routes/catalog.js's sibling
+// /:id/ads-detail for the full rationale. This endpoint (Campaigns page
+// expansion) was found MISSING visionQc/renderError from its $project
+// entirely (2026-08-26 audit, D3) — the exact "adapter drops the fields a
+// status pill needs" bug, except here the gap was in the backend endpoint
+// itself, not a frontend adapter stripping fields the endpoint already sent.
+const { deriveAdPhase, describeAdFailure } = require('../services/adPhase');
+const { summarizeVisionQc } = require('../services/adVisionQcService');
 
 // GET /api/campaigns?brandId=X[&platform=meta-ads|google-ads][&status=ACTIVE]
 // Lightweight list for the Campaigns page. Returns a projection that
@@ -473,7 +481,16 @@ router.get('/:id/ads-detail', async (req, res) => {
           // ever reached the /campaigns expansion. Same explicit-allowlist
           // trap as catalog.js's sibling endpoint (PR #263 fixed that one
           // and /api/ads but missed this route).
-          funnelStage: 1, brandId: 1
+          funnelStage: 1, brandId: 1,
+          // FIXED 2026-08-26 — MISSING ENTIRELY from this endpoint (present
+          // on catalog.js's sibling ads-detail since PR #263, never ported
+          // here): vision-QC verdict + the operator-facing failure headline,
+          // and the inputs deriveAdPhase() needs. Without these a QC-failed
+          // ad on the Campaigns expansion showed no reason at all, and an
+          // in-flight video derive/handoff ad could not be told apart from
+          // a stalled one.
+          visionQc: 1, renderError: 1,
+          deriveFromMaster: 1, titlingNeeded: 1, claimedByWorker: 1, claimedAt: 1
       } }
     ], { allowDiskUse: true });
 
@@ -513,7 +530,10 @@ router.get('/:id/ads-detail', async (req, res) => {
       loadProductUrlMap(ads)
     ]);
 
-    const adRows = ads.map(a => ({
+    const adRows = ads.map(a => {
+    const phase = deriveAdPhase(a);
+    const failure = describeAdFailure(a, phase);
+    return {
       adId:           String(a._id),
       campaignId:     a.campaignId ? String(a.campaignId) : null,
       template:       a.template,
@@ -548,6 +568,20 @@ router.get('/:id/ads-detail', async (req, res) => {
       // services/adTitlingTruth.js. Same computation projectAd and the
       // CampaignRun rollup use.
       titled:         isAdHonestlyDelivered(a),
+      // THE canonical phase — same services/adPhase.js routes/ads.js
+      // projectAd and catalog.js's ads-detail use. `failure` is null except
+      // on failed-terminal/qc-failed-kept (owner requirement: a QC
+      // rejection must read "QC Fail", not a generic "Failed").
+      phase,
+      ...(failure ? { failure } : {}),
+      // Same two fields projectAd/catalog.js surface for a failed ad, and
+      // the full QC verdict (categories/findings/failureDetail) — MISSING
+      // from this endpoint entirely until 2026-08-26 (see the $project
+      // comment above).
+      ...(a.status === 'failed' && a.renderError?.message
+        ? { renderErrorMessage: String(a.renderError.message) }
+        : {}),
+      visionQc:       summarizeVisionQc(a.visionQc, { categories: true }),
       // Intent profile — see models/Ad.js funnelStage. Absent renders as
       // nothing on the frontend, never a raw token.
       funnelStage:    a.funnelStage || null,
@@ -568,7 +602,8 @@ router.get('/:id/ads-detail', async (req, res) => {
             durationMs:  h.durationMs || null
           }))
         : []
-    }));
+    };
+    });
 
     res.json({ products, ads: adRows });
   } catch (err) {
