@@ -225,21 +225,44 @@ const realSrc = fs.readFileSync(SRC_PATH, 'utf8');
   // Revert CHANGE 1 alone — the gate + salvage collapse back to the
   // original bare `if (source.length <= MAX_CHARS) return source;`. Must
   // reproduce the exact reported defect: the dotted fragment ships as-is.
-  const gatedBlock = `if (source.length <= MAX_CHARS && meetsProofBar(source)) {
-    snippetCacheSet(cacheKey, source);
-    return source;
+  // ⚠️ STRUCTURAL MUTATION, NOT A COPIED BLOCK — and that is the whole point.
+  // This used to hardcode the entire gate+salvage body verbatim. It drifted
+  // silently the moment 0f8de06 ("cross-process (L2) Mongo cache") inserted
+  // mongoSnippetCacheSet() calls and comments INSIDE both branches, and the
+  // harness died with "revert-prove mutation R1 was a no-op". A revert-prove
+  // whose mutation stops matching is worse than no test: it either throws (as
+  // here) or, if the guard were absent, silently proves nothing.
+  //
+  // So match ONLY the one thing that IS change 1: the proof-bar conjunction in
+  // the gate. Dropping `&& meetsProofBar(source)` makes the first branch return
+  // ANY budget-fitting source bare — and that also makes the salvage branch
+  // below unreachable, because it re-tests the same `length <= MAX_CHARS`
+  // condition that just succeeded. The result is exactly the pre-change
+  // `if (source.length <= MAX_CHARS) return source;` behaviour, without this
+  // harness depending on a single line of either branch's body.
+  const gatedBlock = 'if (source.length <= MAX_CHARS && meetsProofBar(source)) {';
+  const ungated    = 'if (source.length <= MAX_CHARS) {';
+  // Tell the two failure modes apart, because they have OPPOSITE fixes and
+  // conflating them is how this harness wasted a session. A no-op mutation can
+  // mean either (a) the source was refactored around the anchor — fix the
+  // anchor; or (b) CHANGE 1 was REMOVED — fix the source. Absent this check
+  // both surface as "pattern missed the real source", which sent a reader
+  // hunting for drift when the gate itself was gone.
+  if (!realSrc.includes(gatedBlock)) {
+    const bare = realSrc.includes(ungated);
+    throw new Error(
+      bare
+        ? 'CHANGE 1 IS MISSING FROM THE SOURCE: the proof-bar gate '
+          + '`&& meetsProofBar(source)` is gone but the bare length check remains. '
+          + 'This is the regression this harness exists to catch — a budget-fitting '
+          + 'fragment will ship with a trailing ellipsis. Restore the gate; do NOT '
+          + '"fix" this harness.'
+        : 'anchor drift: neither the gated nor the bare form of the CHANGE 1 gate '
+          + 'was found in ' + SRC_PATH + '. The source was refactored around this '
+          + 'anchor — re-point gatedBlock at the current gate condition, keeping '
+          + 'the mutation structural (one condition, not a copied block).'
+    );
   }
-  if (source.length <= MAX_CHARS) {
-    // Fits the budget but fails the bar — run the same clause/sentence ladder
-    // used for an over-budget quote instead of shipping the fragment.
-    const salvaged = bestFallbackSnippet(clean, source, MAX_CHARS);
-    snippetCacheSet(cacheKey, salvaged);
-    return salvaged;
-  }`;
-  const ungated = `if (source.length <= MAX_CHARS) {
-    snippetCacheSet(cacheKey, source);
-    return source;
-  }`;
   const mutated = mutateOrThrow(realSrc, gatedBlock, ungated, 'R1');
   const p = withMutatedSibling(SRC_PATH, mutated, (mod) => mod.extractSnippet(REPORTED));
   check.pending.push(Promise.resolve(p).then((got) => {
