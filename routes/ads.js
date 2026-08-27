@@ -5246,6 +5246,51 @@ router.get('/:id/generation-inspector', async (req, res) => {
         aspectRatio:  ad.veoAspectRatio || null,
         durationSec:  Number.isFinite(ad.videoDurationSec) ? ad.videoDurationSec : null,
         referenceCount: referenceUrls.length,
+        // ⚠️ COUNT ALONE IS A MISLEADING DIAGNOSTIC. Measured on a failing 9:16
+        // ad: two of its three references were byte-different URLs but the SAME
+        // photograph served through two different CDNs. "3 reference images"
+        // read as fine while the model actually received two distinct views —
+        // precisely the "looks complete, is not" failure this endpoint exists to
+        // prevent. Two URLs backed by the same Media row collapse to one
+        // mediaId, so that duplication IS detectable here and is reported.
+        distinctUrlCount: new Set(referenceUrls).size,
+        // Distinct RESOLVABLE sources. Unresolvable URLs are excluded rather
+        // than counted as one anonymous group, which would understate variety.
+        distinctMediaCount: (() => {
+          const ids = (Array.isArray(referenceImages) ? referenceImages : [])
+            .map(r => (r && typeof r === 'object' ? r.mediaId : null))
+            .filter(Boolean);
+          return new Set(ids).size;
+        })(),
+        // Distinct FILENAMES. This is the arm that catches the real production
+        // case: two byte-different URLs on different CDNs, each with its OWN
+        // Media row (so mediaId does NOT collapse), serving the same file —
+        // e.g. cdn.example/alt1.jpg and cdn2.example/alt1.jpg. Verified by
+        // execution: the mediaId arm alone reported 3/3 distinct on exactly
+        // that shape and stayed silent.
+        //
+        // ⚠️ THIS IS A FILENAME HEURISTIC, NOT PROOF, and it is reported as one.
+        // Two different photographs can legitimately share a basename across
+        // CDNs, and one photograph can appear under two different names — so a
+        // collision here is a PROMPT TO LOOK, not a defect, and the warning is
+        // worded that way.
+        distinctBasenameCount: (() => {
+          const names = referenceUrls.map(u => {
+            try {
+              return new URL(u).pathname.split('/').filter(Boolean).pop() || u;
+            } catch { return String(u).split('?')[0].split('/').filter(Boolean).pop() || u; }
+          }).filter(Boolean);
+          return new Set(names).size;
+        })(),
+        // ⚠️ STATED LIMIT: none of these arms is a pixel comparison. Two
+        // DIFFERENT Media rows holding the same photograph under DIFFERENT
+        // filenames are indistinguishable from metadata alone — detecting that
+        // needs a byte or perceptual hash of the images, which nothing records.
+        // A collapse reported here is real; silence is NOT proof that every
+        // reference is a genuinely different view. The per-image descriptions
+        // are listed so an operator can judge the stack by eye, which remains
+        // the only complete check.
+        distinctnessIsMetadataOnly: true,
         predictionId: ad.veoPredictionId || null,
         operatorInputs: {
           // Full text, never truncated — a diagnostic that abbreviates the
@@ -5257,6 +5302,45 @@ router.get('/:id/generation-inspector', async (req, res) => {
           lastRefinementAt:          lastRegen?.at || null
         }
       };
+
+      // A stack that LOOKS varied but collapses to fewer real sources is the
+      // quiet version of a bad reference set: the model got less to work with
+      // than the count implies, and nothing said so.
+      {
+        const sub = out.video.submission;
+        if (referenceUrls.length > 1 && sub.distinctUrlCount < referenceUrls.length) {
+          out.warnings.push({
+            code: 'reference-images-duplicate-urls',
+            message:
+              `${referenceUrls.length} reference images were submitted but only ${sub.distinctUrlCount} `
+              + 'are distinct URLs — the same image was sent more than once, so the model received '
+              + 'less variety than the count suggests.'
+          });
+        } else if (referenceUrls.length > 1 && sub.distinctMediaCount > 0
+                   && sub.distinctMediaCount < sub.distinctUrlCount) {
+          out.warnings.push({
+            code: 'reference-images-same-source',
+            message:
+              `${sub.distinctUrlCount} distinct reference URLs resolve to only ${sub.distinctMediaCount} `
+              + 'catalog image(s) — the same photograph was sent more than once through different URLs '
+              + '(e.g. two CDNs), so the model received fewer genuinely different views than it appears.'
+          });
+        } else if (referenceUrls.length > 1 && sub.distinctBasenameCount < sub.distinctUrlCount) {
+          // The filename arm. Deliberately LAST and deliberately hedged: it is
+          // the only arm that sees the two-CDNs-two-Media-rows case, but it is
+          // a heuristic, so it asks the operator to look rather than asserting
+          // a fault.
+          out.warnings.push({
+            code: 'reference-images-possible-duplicate-filenames',
+            message:
+              `${sub.distinctUrlCount} reference URLs share only ${sub.distinctBasenameCount} distinct `
+              + 'filename(s) — they may be the same image served from different hosts (a real case: the '
+              + 'same photo via two CDNs, so the model got fewer views than the count implies). This is a '
+              + 'filename comparison, not a pixel comparison — check the thumbnails and descriptions '
+              + 'below to confirm before treating it as a fault.'
+          });
+        }
+      }
 
       if (rawOverride) {
         out.warnings.push({
