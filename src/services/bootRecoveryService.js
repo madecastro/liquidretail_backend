@@ -14,9 +14,9 @@
 // asset. Nothing here can submit — it calls atlasVideoService.resumeForAd, whose
 // no-submit guarantee is asserted on its source by scripts/verifyVideoResume.js.
 //
-// ── NO CLAIM, ON PURPOSE ────────────────────────────────────────────────────
+// ── NO LEASE, ON PURPOSE — BUT NOT CLAIM-BLIND ANY MORE ─────────────────────
 // Autoscaling means several instances boot at once and will all run this. There
-// is deliberately NO claim/lease, for two reasons:
+// is deliberately NO claim/lease TAKEN BY THIS MODULE, for two reasons:
 //
 //   1. The only provider call is a free GET. Two instances peeking the same
 //      prediction wastes one HTTP request and nothing else.
@@ -27,13 +27,70 @@
 //      to undeclared paths (this repo has already lost `renderError.predictionId`
 //      that way; see models/Ad.js).
 //
+// Taking no lease is still right. NOT READING the ownership fields was not:
+// buildRecoverySweepFilter below now reads `claimedByWorker` / `claimedAt` and
+// the titler-handoff signal. See "WHAT THE STALENESS WINDOW DOES NOT COVER".
+//
 // ── WHY THE STALENESS WINDOW EXISTS ─────────────────────────────────────────
 // An ad being rendered RIGHT NOW by another live instance is also
 // `status: 'rendering'` with a receipt. Peeking it is harmless, but stamping it
 // `draft` underneath its owner would race the owner's own completion write.
-// renderOne heartbeats `updatedAt` every 60s, so an ad untouched for
-// RESUME_STALE_MIN minutes has missed several beats and is not being actively
-// rendered by anyone. Default 5 = five missed heartbeats.
+// The window is calibrated against a 60s beat, so an ad untouched for
+// RESUME_STALE_MIN minutes has missed several beats. Default 5 = five missed
+// heartbeats. On adgen that beat is real and comes from TWO sources, neither of
+// which is the "renderOne" this comment used to name (adgen has no renderOne):
+//   - `adStage` ($sets updatedAt, adStage.js:83-85) on every Atlas poll tick,
+//     ~5s during the paid Omni generation (atlasVideoService.js:3737).
+//   - `startAdHeartbeat` (renderer.js:318, titler.js:179) every 60-90s while a
+//     worker holds the claim, wrapping Remotion titling and vision QC.
+//
+// ── WHAT THE STALENESS WINDOW DOES NOT COVER (2026-08-26) ───────────────────
+// A stale `updatedAt` is NOT proof that nobody is working the row. Three holes,
+// all of which this file's query now accounts for:
+//
+//   1. THE TITLER HANDOFF (the live one — ADGEN_TITLER_ENABLED=true in prod).
+//      renderer.js's handoff write (~:1435-1474) stamps `titlingNeeded: true`,
+//      CLEARS `claimedByWorker`, persists the Cloudinary-mirrored master to
+//      `veoVideoUrl`/`renderUrl` — and never touches `status`, so the row stays
+//      `status: 'rendering'` WITH its receipt. processAd then returns. Nothing
+//      beats that row until adgen-titler claims it: startAdHeartbeat needs
+//      `claimedByWorker: WORKER_ID` (now null), the Atlas poll is over, and
+//      campaignRunHeartbeat's Ad arm is stopped by acquireRunHeartbeat's
+//      `release()` once the renderer finishes the run's LAST ad. At end-of-run
+//      with the titler still draining a backlog (REMOTION_QUEUE_CONCURRENCY=2
+//      x ~76s vs ADGEN_MAX_INFLIGHT=32 handoffs), those rows sit unclaimed well
+//      past 5 minutes. Sweeping one was actively harmful, twice over:
+//        - `resumeForAd` returns the RAW ATLAS URL (it is a bare peek — see
+//          atlasVideoService.js:3725), so the write CLOBBERED a permanent
+//          Cloudinary URL with an ephemeral provider one.
+//        - it stamps `titlingResumeState: 'pending'` while leaving
+//          `titlingNeeded: true`, and those two are arbitrated by DIFFERENT
+//          services on DIFFERENT fields — titler.js's claimOne (:155-164) keys
+//          on `claimedByWorker`, titlingResumeService's claim (:200-206) keys on
+//          `titlingResumeState`. Neither filter can see the other's claim, so
+//          BOTH could win: two Remotion renders on one ~$0.90 paid master, on a
+//          box already measured to OOM at ~1.97 GiB/slot.
+//      There is nothing to recover on such a row — the paid asset is already
+//      collected and mirrored — so the query excludes it outright.
+//   2. A HELD CLAIM WHOSE BEAT HAS NOT STARTED YET. claimOne (renderer.js:694,
+//      titler.js:155) stamps `claimedByWorker`/`claimedAt` but NOT `updatedAt`
+//      (models/Ad.js:738 is `timestamps: false`), so a claim taken one second
+//      ago on an already-stale row still reads stale for up to a full beat.
+//      `claimedAt` is stamped once at claim time and never refreshed, which
+//      makes it the honest "how old is this claim" clock — so a claimed row now
+//      needs BOTH clocks stale, past the longer RESUME_CLAIM_STALE_MIN.
+//   3. AD_HEARTBEAT_MAX_MS (renderer.js:267, ~60.8min at live concurrency).
+//      Past that cap the beat stops while the claim is deliberately KEPT and
+//      Remotion may still be running. That residual is documented and ACCEPTED
+//      at renderer.js's "ACCEPTED RESIDUAL" block, whose stated proper fix
+//      (cancelling the in-flight Remotion job at the cap) is out of scope here.
+//      A 15-minute claim window does not close it — it is called out so the
+//      next reader does not mistake this file's guard for covering it.
+//
+// STILL OPEN, PRE-EXISTING (same residual backend PR #346 documents): the
+// recovery WRITES below are guarded only by `{_id, status:'rendering'}`, not by
+// `claimedByWorker`. A row that looks unclaimed at query time and is claimed a
+// moment later can still be stomped. Narrowed here, not closed.
 
 const Ad = require('../models/Ad');
 const { HAS_RECEIPT } = require('./spendReceipt');
@@ -66,6 +123,115 @@ const RESUME_STALE_MIN = Math.max(1, parseInt(process.env.RESUME_STALE_MIN, 10) 
 // Bound the boot cost. Recovery is fire-and-forget and must never make startup
 // slow or unbounded; whatever is missed is picked up on the next sweep.
 const RESUME_MAX_ADS   = Math.max(1, parseInt(process.env.RESUME_MAX_ADS, 10) || 25);
+// How old a CLAIMED row's two clocks must both be before it is sweepable.
+// Mirrors titlingResumeService.CLAIM_STALE_MIN's "generous on purpose" 15 and
+// backend PR #346's RESUME_CLAIM_STALE_MIN. Deliberately LONGER than
+// RESUME_STALE_MIN: an unclaimed row has nobody to protect, a claimed one does.
+//
+// FLOORED AT RESUME_STALE_MIN, not just at 1. An operator who sets this BELOW
+// the unclaimed window would invert the whole point — a claimed row would
+// become sweepable SOONER than an unclaimed one — and the inversion would be
+// silent. Clamping the value has no boolean gate to defeat (same argument as
+// renderer.js's AD_HEARTBEAT_MS clamp, which chose clamping over warn-only for
+// exactly this reason).
+//
+// COST OF BEING WRONG IS ASYMMETRIC, and this direction is the cheap one: too
+// long merely delays recovery of a genuinely dead claim (the motivating
+// incident on run_1787699482964 was a 273-MINUTE tail, so 15 minutes is still
+// an order-of-magnitude improvement), while too short re-opens a double-render
+// on a paid master.
+const RESUME_CLAIM_STALE_MIN = Math.max(
+  RESUME_STALE_MIN,
+  parseInt(process.env.RESUME_CLAIM_STALE_MIN, 10) || 15
+);
+
+/**
+ * The sweep predicate, as a PURE function of the clocks.
+ *
+ * Extracted for the same reason titlingResumeService.buildResumeFilter is: a
+ * source-text assertion cannot tell a working query from one that merely still
+ * contains the right words, and this query is the only thing standing between a
+ * paid master and a second billable-adjacent Remotion render. A harness can run
+ * the REAL filter against real document shapes
+ * (scripts/verifyBootRecoveryClaimAware.js).
+ *
+ * EVERY GUARD IS IN THE FILTER, NEVER A `continue` IN THE LOOP. Deferring a row
+ * inside the loop would leave it in the candidate pool on every later pass while
+ * still consuming one of the `.limit(RESUME_MAX_ADS)` slots — enough deferred
+ * rows (one mixed Meta+PMax product alone mints 21 video rows) permanently
+ * starve the image recovery that shares the same limit. That starvation was a
+ * real bug caught in backend PR #346's adversarial review; do not "simplify"
+ * these arms back into the loop.
+ *
+ * OPERATOR SURFACE IS DELIBERATELY NARROW — the arms added here use only
+ * equality, `$ne`, `$lt`, `$in` and `$or`. In particular the handoff exclusion
+ * is written in De Morgan form rather than as a `$nor`, so
+ * scripts/lib/miniMongoStub.js can evaluate this filter for real instead of
+ * throwing on an operator it does not model. (HAS_RECEIPT itself contributes a
+ * `$nin`; the stub models that one — see its header.)
+ *
+ * @param {object}  [opts]
+ * @param {Date}    [opts.now]                 clock origin (injectable for tests)
+ * @param {number}  [opts.staleMinutes]        unclaimed-row window
+ * @param {number}  [opts.claimStaleMinutes]   claimed-row window (both clocks)
+ */
+function buildRecoverySweepFilter({
+  now = new Date(),
+  staleMinutes = RESUME_STALE_MIN,
+  claimStaleMinutes = RESUME_CLAIM_STALE_MIN
+} = {}) {
+  const t = now instanceof Date ? now.getTime() : new Date(now).getTime();
+  const staleCutoff = new Date(t - staleMinutes * 60 * 1000);
+  const claimCutoff = new Date(t - claimStaleMinutes * 60 * 1000);
+  return {
+    status: 'rendering',
+    // $and, NOT a spread. HAS_RECEIPT is itself `{$or:[...]}` (spendReceipt.js:68)
+    // and so are both arms below — spreading them into one object would leave a
+    // single surviving `$or` key and SILENTLY DROP the receipt guard, which is
+    // what stops this sweep from touching never-billed rows. Composing under
+    // $and is the only shape where all three survive.
+    $and: [
+      HAS_RECEIPT,
+      // ── hole 2: claim-awareness ──────────────────────────────────────────
+      {
+        $or: [
+          // Unclaimed: the original 5-minute rule, unchanged.
+          { claimedByWorker: null, updatedAt: { $lt: staleCutoff } },
+          // Claimed: BOTH clocks must be stale. `claimedAt` is never refreshed,
+          // so this protects a freshly-taken claim from the instant it is taken
+          // rather than only once its first beat lands.
+          {
+            claimedByWorker: { $ne: null },
+            updatedAt:       { $lt: claimCutoff },
+            claimedAt:       { $lt: claimCutoff }
+          },
+          // Claimed but with NO claim clock at all. `{$lt: date}` does not match
+          // a null (BSON type bracketing — real Mongo and the stub agree), so
+          // without this arm such a row could NEVER be swept and would strand
+          // forever. A claim with no `claimedAt` gives no liveness signal, so it
+          // falls back to the single clock it does have, at the longer window.
+          {
+            claimedByWorker: { $ne: null },
+            claimedAt:       null,
+            updatedAt:       { $lt: claimCutoff }
+          }
+        ]
+      },
+      // ── hole 1: the titler handoff — nothing here to recover ─────────────
+      // Positive (De Morgan) form of "NOT (titlingNeeded===true AND veoVideoUrl
+      // is a real URL)", written this way so it needs no $nor/$nin.
+      // `$ne: true` matches false/null/missing; `$in: [null, '']` matches an
+      // absent or empty URL. A row keeping BOTH signals has had its paid master
+      // collected AND is queued for titler.claimOne — see hole 1 in the header.
+      {
+        $or: [
+          { titlingNeeded: { $ne: true } },
+          { veoVideoUrl:   { $in: [null, ''] } }
+        ]
+      }
+    ]
+  };
+}
 
 const FEED_SOURCE_BOOT = 'boot-recovery-sweep';
 function noteBootFeed(ad, stage, extra) {
@@ -135,6 +301,7 @@ function resolveRecoveredVideoFailureCharge(r) {
 async function resumeInFlightAds({
   limit = RESUME_MAX_ADS,
   staleMinutes = RESUME_STALE_MIN,
+  claimStaleMinutes = RESUME_CLAIM_STALE_MIN,
   // Injectable so the harness can exercise image recovery without network.
   recoverImage = recoverImageAd
 } = {}) {
@@ -149,7 +316,6 @@ async function resumeInFlightAds({
 
   let ads;
   try {
-    const cutoff = new Date(Date.now() - staleMinutes * 60 * 1000);
     // OWNER of the status:'rendering' + receipt population.
     // strandedRunSweeper owns queued/failed-run stranding; this service owns
     // mid-render / mid-QC crashes left in rendering. The worker reaper
@@ -158,7 +324,9 @@ async function resumeInFlightAds({
     // into a second billable submit. RESUME_STALE_MIN (default 5) is also
     // lower than REAP_STALE_MIN (15): we collect before the reaper even
     // considers the row.
-    ads = await Ad.find({ status: 'rendering', updatedAt: { $lt: cutoff }, ...HAS_RECEIPT })
+    // The filter is the guard — buildRecoverySweepFilter, not a hand-copied
+    // object literal, so the harness and production can never diverge.
+    ads = await Ad.find(buildRecoverySweepFilter({ staleMinutes, claimStaleMinutes }))
       // imageGeneration is selected because HAS_RECEIPT matches on BOTH receipts
       // (veoPredictionId OR imageGeneration.predictionId) — see the routing note in
       // the loop below. Selecting only veoPredictionId is what made every stranded
@@ -302,6 +470,32 @@ async function resumeInFlightAds({
               // render could never be re-swept. renderStage below is a
               // human-readable breadcrumb only.
               titlingResumeState: STATE_PENDING,
+              // CLEAR THE OTHER OWNERSHIP SIGNAL IN THE SAME $set (2026-08-26).
+              // `titlingResumeState:'pending'` hands this row to
+              // titlingResumeService, whose claim arbitrates ONLY on that field
+              // (titlingResumeService.js:200-206). titler.js's claimOne
+              // arbitrates ONLY on `titlingNeeded` + `claimedByWorker`
+              // (titler.js:155-164). Neither filter can see the other's claim,
+              // so leaving BOTH signals set makes the row claimable twice over —
+              // two concurrent Remotion renders of one ~$0.90 paid master, on a
+              // box measured to OOM at ~1.97 GiB/slot.
+              //
+              // The query above already excludes the live titler-handoff shape,
+              // so this is defence in depth for the rows it still (correctly)
+              // selects: a receipt-holding row that carries `titlingNeeded:true`
+              // WITHOUT a collected master, and the pre-existing TOCTOU where a
+              // row becomes a handoff during the peek (the peek is a network
+              // GET, so the find→write gap is seconds, not instants). Found in
+              // adversarial review (Grok xhigh) — the filter alone left the
+              // dual-claim state reachable through the write.
+              //
+              // Safe, not a strand: this stamp's reader (titlingResumeService)
+              // is started from renderer.run() immediately beside this sweep
+              // (renderer.js:2085-2086) under the SAME isAdgenRendererEnabled()
+              // gate, so a process that can write this state always has the
+              // sweep that consumes it. The paid asset is already on renderUrl/
+              // posterUrl above, so the ad is viewable regardless of titling.
+              titlingNeeded: false,
               renderStage: TITLING_PENDING,
               renderStageAt: new Date(),
               updatedAt: new Date()
@@ -419,6 +613,9 @@ async function resumeInFlightAds({
 
 module.exports = {
   resumeInFlightAds, RESUME_STALE_MIN, RESUME_MAX_ADS, enabled,
+  // The sweep predicate — pure, so scripts/verifyBootRecoveryClaimAware.js can
+  // run the REAL filter rather than regex this file.
+  buildRecoverySweepFilter, RESUME_CLAIM_STALE_MIN,
   // Money-decision pure function — scripts/verifyVideoTimeoutReconcile.js.
   resolveRecoveredVideoFailureCharge
 };

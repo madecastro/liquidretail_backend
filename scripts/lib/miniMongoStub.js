@@ -11,20 +11,32 @@
 // makes two racing claims safe) untested.
 //
 // SUPPORTS EXACTLY the operator surface the code under test actually uses:
-// top-level field equality, $ne, $lt, $in, $or, $and. An operator outside
-// that set throws rather than silently matching/no-matching, so a future
-// filter shape this doesn't understand fails LOUD, not quiet.
+// top-level field equality, $ne, $lt, $gt, $in, $nin, $exists, $or, $and. An
+// operator outside that set throws rather than silently matching/no-matching,
+// so a future filter shape this doesn't understand fails LOUD, not quiet.
 //
 // Chaining mirrors real Mongoose Query enough for the call shapes this repo
 // uses: `.find(filter).sort().limit(n).lean()`, `.findById(id).select().lean()`,
 // `.findOneAndUpdate(filter, update, opts).lean()`, `.updateOne(filter, update)`.
 // sort() is a no-op (tests that need FIFO order construct docs pre-sorted).
 
+// Resolve a possibly-DOTTED field path, the way Mongo does. Added 2026-08-26:
+// without this, `matches` read `doc['imageGeneration.predictionId']` as a
+// literal key, got undefined, and SILENTLY treated the condition as unmatched.
+// That is the quiet-failure mode this file's header promises not to have, and it
+// bit for real — spendReceipt.HAS_RECEIPT's image arm is exactly that dotted
+// path, so every harness evaluating the real HAS_RECEIPT would have concluded a
+// stranded IMAGE receipt is never selected, which is false in production.
+function resolvePath(doc, key) {
+  if (!key.includes('.')) return doc[key];
+  return key.split('.').reduce((o, part) => (o == null ? undefined : o[part]), doc);
+}
+
 function matches(doc, filter) {
   return Object.entries(filter).every(([key, cond]) => {
     if (key === '$or') return cond.some((sub) => matches(doc, sub));
     if (key === '$and') return cond.every((sub) => matches(doc, sub));
-    const val = doc[key];
+    const val = resolvePath(doc, key);
     const isOperatorObject = cond && typeof cond === 'object' && !Array.isArray(cond) && !(cond instanceof Date);
     if (isOperatorObject) {
       return Object.entries(cond).every(([op, opVal]) => {
@@ -33,6 +45,12 @@ function matches(doc, filter) {
           case '$lt':  return val != null && val < opVal;
           case '$gt':  return val != null && val > opVal;
           case '$in':  return opVal.includes(val === undefined ? null : val);
+          // $nin added 2026-08-26 for verifyBootRecoveryClaimAware, which
+          // evaluates the REAL spendReceipt.HAS_RECEIPT (`$nin: [null, '']`)
+          // rather than a stubbed stand-in. A missing field is normalised to
+          // null on both sides, matching Mongo: `$nin:[null]` does NOT match an
+          // absent path.
+          case '$nin': return !opVal.includes(val === undefined ? null : val);
           case '$exists': return opVal ? val !== undefined : val === undefined;
           default: throw new Error(`miniMongoStub: unsupported operator ${op}`);
         }
