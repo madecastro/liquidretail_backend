@@ -4,6 +4,22 @@ Branch `fix/truthful-reporting-be` (backend) + `fix/truthful-reporting-fe` (fron
 Backend must land first — the SPA reads two new response fields and is written to render
 unchanged without them.
 
+**Landed:** backend `#352` → `8bd9eebd` on `main`; frontend `#80` → `c1095e0` on **`master`**;
+follow-up `#354` carries the sort checks and two retractions.
+
+> ⚠️ **VERIFYING THE FRONTEND MERGE — use `origin/master`, not `origin/main`.** A checker who
+> reaches for the conventional trunk name gets a **false negative** and may "correct" a true
+> claim. Measured: in `liquidretail`, `origin/main` holds **1 commit** ("Initial commit",
+> `0e20437`) against **557** on `origin/master`, and `c1095e0` is an ancestor of `master` and
+> **not** of `main`. Both repos in one line, so neither has to be guessed:
+> ```
+> git -C liquidretail_backend merge-base --is-ancestor 8bd9eebd origin/main    # backend  → true
+> git -C liquidretail         merge-base --is-ancestor c1095e0  origin/master  # frontend → true
+> ```
+> And for anything squash-merged, prefer a **content** test over ancestry — a squash makes every
+> original commit report "not an ancestor" even when its content is fully present. That is exactly
+> how the orphaned `#354` commit was found: trunk had 76 harness `check(` calls, the branch had 81.
+
 All four defects were found by driving the real app. They share a theme: **each caused the
 system to report something untrue to whoever was looking**, and one had been actively
 distorting a live investigation.
