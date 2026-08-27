@@ -446,10 +446,18 @@ function buildLikeGenerateForAd({ ad, operatorPrompt }) {
   return buildVeoPrompt({ ...PROMPT_FIXTURE, operatorPrompt: guidance });
 }
 
-// ── R4a: request intent gate ────────────────────────────────────────────
-check('R4a neither prompt nor any override has NO intent (must 400)',
+// ── R4a: operator-intent LABEL (no longer a gate) ───────────────────────
+// CHANGED 2026-08-26 — this group used to read "must 400". It no longer does,
+// and the flip is the owner's directive, not drift: "I should be able to
+// regenerate with no operator refinement." `regenerateHasIntent` is retained
+// UNCHANGED as a pure predicate, but routes/ads.js now uses its result to
+// LABEL the request (202 `operatorRefinement`, and the inspector's
+// operatorInputs block) instead of rejecting it. So these two checks still
+// assert the same predicate values — what changed is what the route does with
+// them, which R4a2 below now pins directly.
+check('R4a neither prompt nor any override reports NO operator intent',
   regen.regenerateHasIntent({}) === false);
-check('R4a empty strings have NO intent',
+check('R4a empty strings report NO operator intent',
   regen.regenerateHasIntent({
     prompt: '   ',
     videoPromptRaw: '',
@@ -463,6 +471,52 @@ check('R4a videoPromptGuidance alone has intent',
   regen.regenerateHasIntent({ videoPromptGuidance: 'soft morning light' }) === true);
 check('R4a promptOverride alone has intent (image path, unchanged)',
   regen.regenerateHasIntent({ promptOverride: { system: 's', user: 'u' } }) === true);
+
+// ── R4a2: the ROUTE must accept a refinement-free regenerate ─────────────
+// Owner directive 2026-08-26: "I should be able to regenerate with no operator
+// refinement." R4a above only proves the PREDICATE reports false for an empty
+// body — which it did before this change too, while the route 400'd on that
+// same result. So R4a cannot see the regression this group exists to stop, and
+// a reinstated gate would leave R4a fully green. Pinned here on the real route
+// source: it is an Express handler whose rejection is a `res.status(400)`, not
+// something callable offline without a request/response pair.
+//
+// Every pattern below is chosen to match CODE ONLY, so the block is not
+// comment-stripped: the explanatory comment at the call site discusses this
+// history in prose (slash-separated field names), and none of these regexes can
+// match prose. That is deliberate — a naive comment/quote stripper desyncs on
+// regex literals, and this repo has already been bitten by a check satisfied by
+// the very comment documenting the thing it was checking.
+{
+  const fs = require('fs');
+  const path = require('path');
+  const src = fs.readFileSync(path.join(__dirname, '../routes/ads.js'), 'utf8');
+  const startIdx = src.indexOf("router.post('/:id/regenerate'");
+  if (startIdx < 0) throw new Error('regenerate route not found in routes/ads.js');
+  // Bound at the NEXT route registration — a syntactic boundary, not a char
+  // count, so the window cannot silently drift stale as the handler grows.
+  const endIdx = src.indexOf('router.', startIdx + 'router.post('.length);
+  if (endIdx < 0) throw new Error('could not bound the regenerate handler (no following router. registration)');
+  const handler = src.slice(startIdx, endIdx);
+
+  // Positive control: prove the window really contains the handler body, so a
+  // bad slice reports as a failure rather than as four vacuous passes.
+  check('R4a2 window actually contains the regenerate handler (preflight call)',
+    /regen\.preflight\s*\(/.test(handler));
+
+  check('R4a2 route does NOT reject a refinement-free regenerate (no negated intent guard)',
+    !/if\s*\(\s*!\s*regen\.regenerateHasIntent\s*\(/.test(handler));
+  check('R4a2 the old "is required" 400 body is gone',
+    !/or imagePromptRaw is required/.test(handler));
+  check('R4a2 regenerateHasIntent is still CALLED (kept as a label, not deleted)',
+    /regen\.regenerateHasIntent\s*\(/.test(handler));
+  check('R4a2 the 202 echoes the operator-refinement label',
+    /operatorRefinement:\s*hasOperatorIntent/.test(handler));
+  // The over-length guard is a DIFFERENT rule and must survive: 1000 chars is
+  // wizard parity, and dropping it would let an unbounded note through.
+  check('R4a2 the prompt length cap 400 is retained',
+    /prompt is too long/.test(handler));
+}
 
 // ── R4b: length caps (wizard parity: guidance ≤1000, raw ≤4000) ─────────
 check('R4b VIDEO_PROMPT_GUIDANCE_MAX is 1000 (wizard parsePhase3WizardFields)',
