@@ -83,4 +83,56 @@ function receiptFree(filter = {}) {
   return { ...filter, $and: [...existing, ...RECEIPT_FREE.$and] };
 }
 
-module.exports = { RECEIPT_FREE, HAS_RECEIPT, receiptFree };
+/**
+ * THE READ SIDE (2026-08-27) — the same two receipts, for a RESPONSE PAYLOAD.
+ *
+ * Everything above answers "may I requeue this ad?" as a Mongo filter. This
+ * answers "what did this ad cost, and what is the handle?" for an HTTP consumer,
+ * and it lives here so the read side and the write side can never disagree about
+ * which two fields ARE the receipt. Used by `routes/ads.js` projectAd and by
+ * `routes/catalog.js`'s parallel ads-detail allowlist — those two are required
+ * to stay in lockstep (that file says so in three places) and a copied
+ * expression in each is how they drift apart.
+ *
+ * WHY THE STRING GUARD IS NOT DECORATION. `Ad.imageGeneration` is Mongoose
+ * `Mixed`, so a legacy or corrupt row can hold anything: a string parent, an
+ * array, or an object whose `predictionId` is itself an object. A bare
+ * `x || null` passes every truthy non-string straight through into JSON, so the
+ * payload would advertise an object as a spend receipt. A receipt is a provider
+ * id — a non-empty string — or it is absent. Anything else is `null`, which is
+ * the honest answer and is also fail-closed: it can never invent a receipt.
+ * (`services/adStage.js` reaches for `String(predictionId)` at its own call
+ * site for the same reason; coercing here would instead let `[object Object]`
+ * masquerade as an id, so this refuses rather than stringifies.)
+ *
+ * Field names deliberately mirror the DOCUMENT paths so an operator can move
+ * from a payload straight to a query: `veoPredictionId` is verbatim, and
+ * `imageGenerationPredictionId` is the flattening of `imageGeneration
+ * .predictionId`. (`veoPredictionId` is an Omni id despite the legacy name —
+ * CLAUDE.md §2.)
+ *
+ * NOT merged into one `predictionId`. `GET /api/ads/render-activity` already
+ * publishes a merged form with an `image || veo` precedence; re-deriving that
+ * precedence here would be a second copy of it, and the merged form also loses
+ * WHICH provider billed.
+ */
+function receiptId(value) {
+  return (typeof value === 'string' && value) ? value : null;
+}
+
+function adSpendReceipts(ad) {
+  const doc = ad || {};
+  const img = doc.imageGeneration;
+  return {
+    veoPredictionId: receiptId(doc.veoPredictionId),
+    // Guard the PARENT's type too: on a string parent `img.predictionId` is
+    // undefined, but on an array `[]` it is also undefined while on a String
+    // OBJECT it could resolve — only a plain object may carry a receipt.
+    imageGenerationPredictionId:
+      (img && typeof img === 'object' && !Array.isArray(img))
+        ? receiptId(img.predictionId)
+        : null
+  };
+}
+
+module.exports = { RECEIPT_FREE, HAS_RECEIPT, receiptFree, adSpendReceipts, receiptId };

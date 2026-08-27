@@ -20,7 +20,7 @@ const express = require('express');
 const jwt = require('jsonwebtoken');
 const mongoose = require('mongoose');
 // Receipt guard — a requeue must never re-submit work we have paid for.
-const { receiptFree } = require('../services/spendReceipt');
+const { receiptFree, adSpendReceipts } = require('../services/spendReceipt');
 // THE archive / restore writes — one definition, imported by every site that
 // moves an Ad into or out of status:'archived'. They also move the row's
 // identityDigest to/from preArchiveIdentityDigest, so an archived NEVER-BILLED
@@ -5705,6 +5705,29 @@ function projectAd(ad, full = false, extras = {}) {
           durationMs:  h.durationMs || null
         }))
       : [],
+    // ── SPEND RECEIPTS (2026-08-27) ────────────────────────────────────────
+    // The provider charges at SUBMIT, so these two ids are the only durable
+    // answer to "did this ad cost money, and what is the handle?" — and the
+    // provider retains a prediction for only ~30 days, so the window to ask is
+    // short. Shape + the string guard live in services/spendReceipt.js, beside
+    // the requeue filters that read the SAME two fields, so the read side and
+    // the money-guard write side cannot drift apart. Never re-implement the
+    // expression here (same rule as receiptFree / resolveDeriveFromMaster).
+    //
+    // Exposed UNCONDITIONALLY, not behind `full`, for the same reason
+    // renderErrorMessage below is: "which of these billed" is asked of a LIST
+    // at least as often as of one ad. Measured cost: +88 bytes on the full
+    // projection (1141 -> 1229).
+    //
+    // The values are null, never undefined — `JSON.stringify` DROPS
+    // undefined-valued keys, which would make "this ad holds no receipt"
+    // indistinguishable from "this endpoint does not report receipts", the
+    // exact ambiguity being closed here.
+    //
+    // The verbose veo* fields (prompt ~4.2KB, storyboard, reference stack) stay
+    // OUT on purpose: GET /:id/generation-inspector already returns all of them
+    // per-ad with richer structure. Pinned by verifySpendReceiptSurfacing E1.
+    ...adSpendReceipts(ad),
     // Compact vision-QC verdict — services/adVisionQcService.js
     // summarizeVisionQc, the SAME formatter the run-level rollup below and
     // (eventually) any other consumer use, so "was this ad inspected" never
@@ -5720,7 +5743,7 @@ function projectAd(ad, full = false, extras = {}) {
     visionQc:           summarizeVisionQc(ad.visionQc)
   };
   // A failed ad in the LIST needs to say WHY. renderError itself stays behind
-  // `full` (it carries the prediction id and other internals), so surface just
+  // `full` (it carries other internals), so surface just
   // the operator-facing headline — which since 2026-08-05 leads with the policy
   // label, e.g. "Model Moderation Error: Input Prompt violates policy". Without
   // this the ads page can only render a bare "Render failed" tile, which is what
