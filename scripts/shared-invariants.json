@@ -1,0 +1,99 @@
+{
+  "_README": [
+    "SEMANTIC drift between liquidretail_backend and liquidretail_adgen — the class of",
+    "divergence that no hash can see.",
+    "",
+    "verifyVendorDrift.js answers 'did the bytes we last looked at change?'. That question",
+    "is blind to two real failure modes:",
+    "",
+    "  1. A fix lands in ONE repo. The other copy's backend hash never moved, so drift never",
+    "     fires; the manifest records a 'fork'/'unported' reason and the obligation goes quiet.",
+    "  2. The SAME bug exists in N copies, byte-identical. There is no drift at all — both",
+    "     sides agree, and both are wrong. Byte-equality actively certifies the bug.",
+    "",
+    "This file is the declarative answer: named invariants, each a pattern that must not",
+    "appear (or must appear) in a named set of files, checked across BOTH repos by",
+    "scripts/verifySharedInvariants.js. A fix is then provably a fix everywhere, not just",
+    "in the copy someone happened to open.",
+    "",
+    "`acknowledged` is NOT A MUTE BUTTON. It follows scripts/expected-failures.json's",
+    "contract exactly: an acknowledged instance that is GONE fails the run as a STALE entry.",
+    "You cannot fix an instance and leave it listed, and you cannot park a finding here and",
+    "forget it — removing the entry is part of the fix, in the same commit. Every entry needs",
+    "a reason someone can act on and a removeWhen. 'known issue' is not a reason.",
+    "",
+    "A NEW match that is not acknowledged FAILS. That is the whole point.",
+    "",
+    "`count` (optional, default 1) is how many instances an entry attests to in that file.",
+    "Entries are keyed on repo+path, NOT on a line number — a line-keyed entry goes stale on",
+    "every unrelated edit above it, which trains people to bulk-update this file without",
+    "reading it. But repo+path alone would let an acknowledged file HIDE a new instance:",
+    "acknowledge the hit at :68, and a second one added at :200 keys to the same entry and",
+    "passes silently. So the count is checked in BOTH directions — more than attested means a",
+    "new instance appeared beside a known one; fewer means some were fixed and the entry now",
+    "overstates the debt. Both fail."
+  ],
+  "version": 1,
+  "invariants": [
+    {
+      "id": "no-catalog-title-in-generative-prompt",
+      "severity": "error",
+      "rationale": [
+        "A catalog title must never be interpolated into a labelled `Product:` field of a",
+        "prompt sent to a generative IMAGE or VIDEO model.",
+        "",
+        "INCIDENT (2026-08-26, visually proven on a delivered Pelagic Gear master): the line",
+        "`Product: Vaportek.` was read by Atlas Omni as a brand-name render instruction. It",
+        "fabricated a complete 'VAPORTEK' chest lockup and a fake neck tag over the real",
+        "small PELAGIC fish-mark. Vision-QC correctly terminal-rejected the $0.90 master,",
+        "with no regeneration. The existing `noText` directive already forbids generating new",
+        "logos and was NOT enough once a brand-sounding catalog title was also sitting in a",
+        "labelled field.",
+        "",
+        "The fix was applied to adgen/src/services/veoPromptBuilder.js only. The identical",
+        "construct survived in three other copies across the two repos — which is exactly the",
+        "'one bug, three files, two repos, one fix' pattern this invariant exists to close.",
+        "",
+        "PRODUCT FIDELITY plus the supplied reference images already identify the SKU, so this",
+        "line was optional context and is not load-bearing for any parser."
+      ],
+      "appliesTo": [
+        "services/veoPromptBuilder.js",
+        "services/veoStoryboardService.js"
+      ],
+      "outOfScope": {
+        "services/providers/geminiSearchProvider.js": "Matches the pattern but is a DIFFERENT hazard class and deliberately excluded, not overlooked. Its `Product: ${productName}` subject line goes to gemini-2.5-flash to structure a review narrative into JSON (a text LLM extracting text). Nothing renders it. The Vaportek failure was an image/video model painting the title onto the product as artwork; a text extractor cannot do that."
+      },
+      "forbiddenPattern": "`Product:\\s*\\$\\{",
+      "patternNote": [
+        "Requires a template-literal interpolation (backtick, then `Product:`, then `${`).",
+        "That is what discriminates live code from the comments documenting the fix:",
+        "adgen/src/services/veoPromptBuilder.js:790 contains `Product: Vaportek.` and :1157",
+        "contains `Product: {title}` — neither has `${`, so neither matches. This is",
+        "deliberately a narrow structural pattern rather than a comment-stripping lexer:",
+        "hand-rolled JS comment stripping desyncs on regex literals and would be a worse",
+        "bug than the one it is checking for."
+      ],
+      "acknowledged": [
+        {
+          "repo": "adgen",
+          "path": "services/veoStoryboardService.js",
+          "reason": "DORMANT, BUT NOT FOR THE REASON IT LOOKS LIKE — and one env var from live. Same catalog-title interpolation the Vaportek incident proved harmful, in the GPT-storyboard path. It is NOT gated by VEO_USE_GPT_STORYBOARD: config/defaults.env:395 ships that flag `true` in BOTH repos and no render.yaml, Dockerfile, src/config.js, or SystemConfig overrides it, so enabled() returns true. What actually makes it unreachable is the provider router: videoRouter.activeProvider() defaults to 'atlas' (videoRouter.js:29, VIDEO_PROVIDER=atlas committed at defaults.env:394), and on the atlas path prepareStoryboard returns {storyboard:null} ('Storyboard retired on the Atlas path', atlasVideoService.js:4344). generateStoryboard has exactly ONE production caller, aiVideoReferenceService.js:320, reached only from videoRouter's non-atlas else branch. Set VIDEO_PROVIDER=vertex and this line composes a paid Vertex Veo prompt. The module's own header comment ('Off by default', veoStoryboardService.js:10) describes a gate that is not the real one. Acknowledged rather than fixed here because this PR is documentation + enforcement scope: editing a generative video prompt is a behavioural money-path change needing its own PR and owner sign-off, and bundling it silently would hide it.",
+          "removeWhen": "the `Product: ${title}` interpolation is removed from adgen/src/services/veoStoryboardService.js, matching the veoPromptBuilder fix — then delete this entry in the same commit"
+        },
+        {
+          "repo": "backend",
+          "path": "services/veoStoryboardService.js",
+          "reason": "The backend twin of the entry above — byte-identical to adgen's copy, which is why the vendor manifest correctly calls it 'synced' and why no hash check can ever flag it. Both copies agree and both are wrong.",
+          "removeWhen": "the same removal lands in liquidretail_backend/services/veoStoryboardService.js — then delete this entry"
+        },
+        {
+          "repo": "backend",
+          "path": "services/veoPromptBuilder.js",
+          "reason": "THE UNPORTED FIX. adgen fixed this exact line on 2026-08-26; the backend copy is still the pre-fix blob. The vendor manifest records the obligation in prose ('a human must apply the same edit in liquidretail_backend'), which nothing enforced. This entry plus the manifest's new `unported` status are what now make that obligation fail loudly instead of aging quietly.",
+          "removeWhen": "the veoPromptBuilder catalog-title fix is ported to liquidretail_backend and scripts/vendor-manifest.json is reconciled back to synced — then delete this entry"
+        }
+      ]
+    }
+  ]
+}

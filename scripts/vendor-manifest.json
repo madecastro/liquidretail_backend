@@ -1,1285 +1,1532 @@
 {
-  "version": 1,
+  "version": 2,
   "backendRef": "origin/main",
-  "backendHead": "a1df77e95159ea70653d26cfe59e3dece6e52d7f",
-  "generatedAt": "2026-08-27T00:05:03.508Z",
+  "backendHead": "f8b3d6b152a848a3c9f5665f45cc6c00500ce0cb",
+  "generatedAt": "2026-08-27T10:28:58.859Z",
   "files": {
     "models/Ad.js": {
       "backendHash": "4caa2896cc4a2dcd56f5ccb4ba73c37d9675c9c4f59993f235befbc1b0d6672e",
+      "adgenHash": "ca2d4d7078832e571686db189031815597bda44be9faa21137d2c1f2ef07d2a9",
       "backendSha": "a1df77e95159ea70653d26cfe59e3dece6e52d7f",
       "status": "fork",
       "reason": "fork — comment-only plus pre-existing schema-doc divergence. adgen documents the AD_VISION_QC_ENABLED env fallback its systemConfigService still honours; backend retired that fallback and its comment. regenerationRequest/regenerateClaimedByWorker/regenerateClaimedAt now exist on both sides (backend #345). adgen's schema comment documents the live claim filter as regenerationRequest:{$type:'object'} (Mongo $ne:null matches absent fields and was the double-claim bug); backend #345 still documents {$ne:null} in models/Ad.js. titlingNeeded declared on both sides (backend #332). Reconciled after #345 merged to origin/main."
     },
     "models/Advertiser.js": {
       "backendHash": "0a7e1bb9ca5e0fbbfc6972f9c96d87f839b0a86175831b5446ae27095137ba3f",
+      "adgenHash": "0a7e1bb9ca5e0fbbfc6972f9c96d87f839b0a86175831b5446ae27095137ba3f",
       "backendSha": "77ca0bf35cdcca1904b97d129e01a2362916ff02",
       "status": "synced"
     },
     "models/AdvertiserMembership.js": {
       "backendHash": "eaaaad310e7e9291a872519d49d5f74447e7472d09521471fa0b1d0e5b666fc6",
+      "adgenHash": "eaaaad310e7e9291a872519d49d5f74447e7472d09521471fa0b1d0e5b666fc6",
       "backendSha": "25bed77d3df73c9bb07e6aa1c36cf89dec1c89c0",
       "status": "synced"
     },
     "models/AiCanvasArtifact.js": {
       "backendHash": "ff3214b35c1bd4ec523a24247bc12b24a05052bda753ea96f23d1c81703f511a",
+      "adgenHash": "ff3214b35c1bd4ec523a24247bc12b24a05052bda753ea96f23d1c81703f511a",
       "backendSha": "44554a18b5ada4161d48fbe4edff6893c7f767db",
       "status": "synced"
     },
     "models/AiFullRenderArtifact.js": {
       "backendHash": "62352c6c641ba9daabb0b591c56fd4f7426ed96a2f91690f3ea47fb205fdbfff",
+      "adgenHash": "62352c6c641ba9daabb0b591c56fd4f7426ed96a2f91690f3ea47fb205fdbfff",
       "backendSha": "241d620676bffdfa4ebaea9c5fecf15c9d12dd39",
       "status": "synced"
     },
     "models/AiHtmlValidationArtifact.js": {
       "backendHash": "9fdc50b679306363c7a6836e0d0272a66d25c729c23592f12cc879c2bb56fd67",
+      "adgenHash": "9fdc50b679306363c7a6836e0d0272a66d25c729c23592f12cc879c2bb56fd67",
       "backendSha": "35d7534ce5be7736a092729244eb9108360b519c",
       "status": "synced"
     },
     "models/AiJudgeResultArtifact.js": {
       "backendHash": "fa503251753db2f3ad3f5e5d3836e41aa64d7d7305adb9e40f8d07596b9bd5b5",
+      "adgenHash": "fa503251753db2f3ad3f5e5d3836e41aa64d7d7305adb9e40f8d07596b9bd5b5",
       "backendSha": "ea70568836c971360afe485e32f896ba9688cdb9",
       "status": "synced"
     },
     "models/AiLayoutSession.js": {
       "backendHash": "2beb732ba3f742a1eb3e9564d15f3f5949ea271e9b8373f72b1523ab1c539f74",
+      "adgenHash": "2beb732ba3f742a1eb3e9564d15f3f5949ea271e9b8373f72b1523ab1c539f74",
       "backendSha": "945388feec872ad9e8e187670483b41323e83323",
       "status": "synced"
     },
     "models/Brand.js": {
       "backendHash": "307f9c5c76993e45fb7a2c5b0c183f4a80e7ca6ec03aeac51478c6917b36ade4",
+      "adgenHash": "307f9c5c76993e45fb7a2c5b0c183f4a80e7ca6ec03aeac51478c6917b36ade4",
       "backendSha": "c31ffe9976670f02d87fb9e7824911d6fd848643",
       "status": "synced"
     },
     "models/Campaign.js": {
       "backendHash": "079065a6d9dff95e04f8136469d847cb6f3703452e6553492ea35e26291df6ae",
+      "adgenHash": "079065a6d9dff95e04f8136469d847cb6f3703452e6553492ea35e26291df6ae",
       "backendSha": "31512f0e17203820391993c98fbfe8a61024d079",
       "status": "synced"
     },
     "models/CampaignRun.js": {
       "backendHash": "3a3a5f657ad1fb86aae8f574723be644868bea930f509f3844de745ecb34ca30",
+      "adgenHash": "13bfbdfb9a80481249dff7ef57877da8270946d1be4e0129608dcb171abe3d8c",
       "backendSha": "0363ea03c6d6438d3ac46368c446623c3987a443",
       "status": "fork",
       "reason": "NOT PORTED, deliberately. Backend #333 added CampaignRun.automation so an automated/ui-smoke run renders 'by: <session> (Claude session)' in the Slack run feed rather than the human identity its test token authenticates as. Only the BACKEND sets that field, at run creation; adgen only bumps counters on an existing run. verifyModelParity enforces adgen-fields SUBSET backend-fields, so a backend-only field is fine here and porting it would add a path adgen never writes."
     },
     "models/CatalogProduct.js": {
       "backendHash": "c4ea01fde561687af7fcb2ce0c7bd22df82ecfb5fcc953ce483d2e91168c8561",
+      "adgenHash": "c4ea01fde561687af7fcb2ce0c7bd22df82ecfb5fcc953ce483d2e91168c8561",
       "backendSha": "8db473c665169c97bcbb57170f7ff41786de484d",
       "status": "synced"
     },
     "models/Category.js": {
       "backendHash": "58e0c5c2b9b4bae826ef12adf04425b52d527818b2968191633c4bf4b2218583",
+      "adgenHash": "58e0c5c2b9b4bae826ef12adf04425b52d527818b2968191633c4bf4b2218583",
       "backendSha": "beda3f21fa50b174825a3f0799e3b935f0344e78",
       "status": "synced"
     },
     "models/Comment.js": {
       "backendHash": "d09b161b729ad83c3cd9bf92408885f83c2545398977554941832abe9bb83722",
+      "adgenHash": "d09b161b729ad83c3cd9bf92408885f83c2545398977554941832abe9bb83722",
       "backendSha": "b703a0b848cea89821aee754ba38d92437b4c318",
       "status": "synced"
     },
     "models/CopyCandidatesArtifact.js": {
       "backendHash": "b62dc89fe9ba6ba12d17aef5e6d5b3150fba52b81c19cd6e8041cf98f79063eb",
+      "adgenHash": "b62dc89fe9ba6ba12d17aef5e6d5b3150fba52b81c19cd6e8041cf98f79063eb",
       "backendSha": "9730ed7fb37279aed163b6b1e5f37003936680e4",
       "status": "synced"
     },
     "models/CostLog.js": {
       "backendHash": "0be8c9b07938712da9a8333c396ad0fb592781a9ebf6475a1e3838ce9a7c32dc",
+      "adgenHash": "0be8c9b07938712da9a8333c396ad0fb592781a9ebf6475a1e3838ce9a7c32dc",
       "backendSha": "f8837e364168413411fdec31cb8b8c262d6554c8",
       "status": "synced"
     },
     "models/CreativeDirectionArtifact.js": {
       "backendHash": "d0e1f93c56a71e3b396c2b3e1ba7d17dc65a17de1f43fc9f410dfec6db2cc6de",
+      "adgenHash": "d0e1f93c56a71e3b396c2b3e1ba7d17dc65a17de1f43fc9f410dfec6db2cc6de",
       "backendSha": "b974e90017622348c7c87a42a71f71a04cb1ea7d",
       "status": "synced"
     },
     "models/CropArtifact.js": {
       "backendHash": "04e22ac36a4ff167d30313a69c33ec52dd6c771f766d0254fb73ac38038b83f4",
+      "adgenHash": "04e22ac36a4ff167d30313a69c33ec52dd6c771f766d0254fb73ac38038b83f4",
       "backendSha": "d17b5827eca75d6e87fb295e747e1f9a1890a6cc",
       "status": "synced"
     },
     "models/DetectRun.js": {
       "backendHash": "3512e7e1e64b9b201f44d5bda97d602cd4ad905566a973d856cc1e0306401c30",
+      "adgenHash": "3512e7e1e64b9b201f44d5bda97d602cd4ad905566a973d856cc1e0306401c30",
       "backendSha": "62ba153dd56311b9c777227d3952c7d5fb095dd1",
       "status": "synced"
     },
     "models/DetectionArtifact.js": {
       "backendHash": "ba6fb0e1b99aff1164b3b1b61a4c220fbd59348273431801f18fbd797e124c21",
+      "adgenHash": "ba6fb0e1b99aff1164b3b1b61a4c220fbd59348273431801f18fbd797e124c21",
       "backendSha": "653b89f0bb45edf7bac3f16599123db1e45b48cf",
       "status": "synced"
     },
     "models/ExtendedCropArtifact.js": {
       "backendHash": "257cd50dba93022a82ef9a9fa9a329e81037bb619ff0bd02829a8172a8e65b98",
+      "adgenHash": "257cd50dba93022a82ef9a9fa9a329e81037bb619ff0bd02829a8172a8e65b98",
       "backendSha": "09d5a5f1e9e61418d918916b868348c6c925861c",
       "status": "synced"
     },
     "models/IntegrationCredential.js": {
       "backendHash": "663ead488c65bee52c544f4264346474b6ce95fd21bb32e4d6d57196affc214e",
+      "adgenHash": "663ead488c65bee52c544f4264346474b6ce95fd21bb32e4d6d57196affc214e",
       "backendSha": "5f4f49e19d1ae68b397b4dea367dbb0ddc8b66d0",
       "status": "synced"
     },
     "models/Job.js": {
       "backendHash": "4e687b33d74a88f50882955786921d1e8027a6a4a2b1a4cb34cf9d0f4497fab4",
+      "adgenHash": "4e687b33d74a88f50882955786921d1e8027a6a4a2b1a4cb34cf9d0f4497fab4",
       "backendSha": "87cb09de635fbcf8bdbedfac38ececf0ef9c72bf",
       "status": "synced"
     },
     "models/LayoutInputArtifact.js": {
       "backendHash": "44429c992251f9834b0a4b22ece26c1dcb0fed0227de195474210881f931c014",
+      "adgenHash": "44429c992251f9834b0a4b22ece26c1dcb0fed0227de195474210881f931c014",
       "backendSha": "a01080839b18465f0b9ea7309c422523bbd5d12e",
       "status": "synced"
     },
     "models/Media.js": {
       "backendHash": "09942486e8def86c89baddadc670f61e624a93a6c3b9ab45f31ee7f56e909d53",
+      "adgenHash": "09942486e8def86c89baddadc670f61e624a93a6c3b9ab45f31ee7f56e909d53",
       "backendSha": "8123961dd005fa1687d8a22acb43a6f625fad10e",
       "status": "synced"
     },
     "models/OperationRun.js": {
       "backendHash": "cf5078a88a5e6eba12dba7b5a0a31a64a3e4a512f6b1430a87754f73ca4a8352",
+      "adgenHash": "cf5078a88a5e6eba12dba7b5a0a31a64a3e4a512f6b1430a87754f73ca4a8352",
       "backendSha": "611049b3bc8c1aef2bf2d6e6e5723fd2121bbc02",
       "status": "synced"
     },
     "models/OverlayZoneArtifact.js": {
       "backendHash": "91c942a031aacd86910287390041d8b4f3b04d9490fc2edd36c334b48cac3208",
+      "adgenHash": "91c942a031aacd86910287390041d8b4f3b04d9490fc2edd36c334b48cac3208",
       "backendSha": "d17b5827eca75d6e87fb295e747e1f9a1890a6cc",
       "status": "synced"
     },
     "models/Product.js": {
       "backendHash": "3c5e3ebcfe291701713df1ca3250c89d496d0a046e2121432f712f80ba1a2ffa",
+      "adgenHash": "3c5e3ebcfe291701713df1ca3250c89d496d0a046e2121432f712f80ba1a2ffa",
       "backendSha": "3d40302869e08ff2dc4d8a5a09cd76b57b0acffa",
       "status": "synced"
     },
     "models/ProductMatchArtifact.js": {
       "backendHash": "9c560e2b0b6a82fb45cf8baf27580dcc960aafb525a9c70fdebd9b9c8a70c83d",
+      "adgenHash": "9c560e2b0b6a82fb45cf8baf27580dcc960aafb525a9c70fdebd9b9c8a70c83d",
       "backendSha": "8db473c665169c97bcbb57170f7ff41786de484d",
       "status": "synced"
     },
     "models/ResolvedLayoutArtifact.js": {
       "backendHash": "eeb4a79c00abce0367bd16cc37f41f8ddb27ae31ed52801a93e27951f8c7cf0f",
+      "adgenHash": "eeb4a79c00abce0367bd16cc37f41f8ddb27ae31ed52801a93e27951f8c7cf0f",
       "backendSha": "3e7cf3ad6bbadbfc4046ab360a3b158436a5a627",
       "status": "synced"
     },
     "models/ReviewSiteProfile.js": {
       "backendHash": "4b8f60fd33b774926de909611a5b74f8e3315c62d2575368547658057c8775bb",
+      "adgenHash": "4b8f60fd33b774926de909611a5b74f8e3315c62d2575368547658057c8775bb",
       "backendSha": "d26d32bae585507c5f1c3a681ee2eb602ce979c4",
       "status": "synced"
     },
     "models/SystemConfig.js": {
       "backendHash": "387d6a7769fe1a13fc4d6ebd5115bec65d1f91178a933c1febc0623aba3f69c8",
+      "adgenHash": "d1603d78fd85f9fa3bc0a08919c246865a85a7ab28054c493e5f0f575d439eaa",
       "backendSha": "aff3488d494ee7484d27971920a2b96e438e60fd",
       "status": "fork",
       "reason": "adgen keeps the env-fallback bridge on the QC split fields; backend reads SystemConfig only"
     },
     "models/User.js": {
       "backendHash": "290634bcb18ab497ffa748221ff6d4b30640a04f94a0ea4bf211a814ecf95ff2",
+      "adgenHash": "290634bcb18ab497ffa748221ff6d4b30640a04f94a0ea4bf211a814ecf95ff2",
       "backendSha": "53fcee2171b7f7d6439223de3623a09f338f36c7",
       "status": "synced"
     },
     "remotion/Root.jsx": {
       "backendHash": "86dcd8256972d71331dab7d2ba73b17ceeb2578a2a1f27d6f9d287611f411e51",
+      "adgenHash": "86dcd8256972d71331dab7d2ba73b17ceeb2578a2a1f27d6f9d287611f411e51",
       "backendSha": "31512f0e17203820391993c98fbfe8a61024d079",
       "status": "synced"
     },
     "remotion/components/BasePlate.jsx": {
       "backendHash": "3ffa4ecaf488c8d560d87659da8384e660120f7a41f18a34ad1b2bee03847e92",
+      "adgenHash": "3ffa4ecaf488c8d560d87659da8384e660120f7a41f18a34ad1b2bee03847e92",
       "backendSha": "0e885c52b1d531299c5f064642409ab2d596a0e2",
       "status": "synced"
     },
     "remotion/components/FontLoader.jsx": {
       "backendHash": "ffb17c2362298ae3bcc1c33ed532ef15a71ebb5aacce59beda7fb467de581b66",
+      "adgenHash": "ffb17c2362298ae3bcc1c33ed532ef15a71ebb5aacce59beda7fb467de581b66",
       "backendSha": "baef9adf59db76babb572062c6c1007333fad222",
       "status": "synced"
     },
     "remotion/components/slotRenderers.jsx": {
       "backendHash": "8ac6dc648ad345edfd9943a86385ada0068144ee8cb2da294d65455ed008d692",
+      "adgenHash": "8ac6dc648ad345edfd9943a86385ada0068144ee8cb2da294d65455ed008d692",
       "backendSha": "119b668472c4dffbdb63c3d3dc588a16b9573103",
       "status": "synced"
     },
     "remotion/compositions/Canonical.jsx": {
       "backendHash": "5d651e994a55f2e0122f60ea0a78a631c77ce91adfdf878c8b8a0b79435978ef",
+      "adgenHash": "5d651e994a55f2e0122f60ea0a78a631c77ce91adfdf878c8b8a0b79435978ef",
       "backendSha": "119b668472c4dffbdb63c3d3dc588a16b9573103",
       "status": "synced"
     },
     "remotion/index.jsx": {
       "backendHash": "0e5c37e862d456eafeca548add2112fb6eb150d1b08ee3598491d8b02a67b52e",
+      "adgenHash": "0e5c37e862d456eafeca548add2112fb6eb150d1b08ee3598491d8b02a67b52e",
       "backendSha": "0e885c52b1d531299c5f064642409ab2d596a0e2",
       "status": "synced"
     },
     "remotion/lib/plateHints.js": {
       "backendHash": "65da1e50ea8d56c9b5b7b6716f9bf6589a73ed1c3923303c0af21713bd14f14a",
+      "adgenHash": "65da1e50ea8d56c9b5b7b6716f9bf6589a73ed1c3923303c0af21713bd14f14a",
       "backendSha": "29004514a9de0764579758e82aa97cd53493aa12",
       "status": "synced"
     },
     "remotion/lib/priceFormat.js": {
       "backendHash": "0010c580df02ab7114c7c0665c80938180b08904412dd764a4e4a5a32fd8ca77",
+      "adgenHash": "0010c580df02ab7114c7c0665c80938180b08904412dd764a4e4a5a32fd8ca77",
       "backendSha": "616d4c28c562d96145ab56547455f2a281789756",
       "status": "synced"
     },
     "remotion/lib/ratingMotion.js": {
       "backendHash": "b5229a6a763ac59fcb917c07e589586431e7a30bf872b73bdf56b2ae28116f42",
+      "adgenHash": "b5229a6a763ac59fcb917c07e589586431e7a30bf872b73bdf56b2ae28116f42",
       "backendSha": "0319c68ef8db75f520d104f7b5651d70d39a6995",
       "status": "synced"
     },
     "remotion/lib/safeZones.js": {
       "backendHash": "fec2068a09e6878ad60adb3a4f44bdb9b49094b3495ba69419d9202edca905ae",
+      "adgenHash": "fec2068a09e6878ad60adb3a4f44bdb9b49094b3495ba69419d9202edca905ae",
       "backendSha": "e4d7102df64c5617110e0df9bdcaf9bb7dba4198",
       "status": "synced"
     },
     "remotion/lib/slotContent.js": {
       "backendHash": "8cb75a6656409058080570adc64a1fbeb640fc944c6db7fdd03a04c3d9d175a1",
+      "adgenHash": "a2e8d71c983876e47cc12f73eb8d8ca28f403589c3665c2afd8dfaf287ff1804",
       "backendSha": "d3a8fe74ae1f6e704efb326c33c76a946e703b88",
       "status": "fork",
       "reason": "adgen-only fork: fitProductNameToCap dispatch now gated on the resolved bind FIELD (entry==='productName'), not slot.key alone — closes a defect where DEFAULT_BRAND_MODE_BIND's brand-tagline substitution into the productName slot got the noun-preserving front-word-dropping fitter meant for catalog titles, which can invert negation-led taglines (e.g. 'Not for everyone...' -> 'for everyone...'). Not yet ported to backend."
     },
     "remotion/lib/stackFit.js": {
       "backendHash": "58d4e06f109f85aabdd7575aa0f8a2d23d33f70162e6235f2f022bbbc0eb493a",
+      "adgenHash": "58d4e06f109f85aabdd7575aa0f8a2d23d33f70162e6235f2f022bbbc0eb493a",
       "backendSha": "e4d7102df64c5617110e0df9bdcaf9bb7dba4198",
       "status": "synced"
     },
     "remotion/lib/timing.js": {
       "backendHash": "0cabab5ca97492b2c1a5d648c54ac5fe651a1d8b64ddd89102b31e10301690c1",
+      "adgenHash": "0cabab5ca97492b2c1a5d648c54ac5fe651a1d8b64ddd89102b31e10301690c1",
       "backendSha": "3a3c06bd217ac36e4fa23c19ac9934a226256764",
       "status": "synced"
     },
     "remotion/lib/tokens.js": {
       "backendHash": "fe2fecac71cca8d9301a1e6af108fdc6589be4a5aefdfbc8243eb5050c09a8ba",
+      "adgenHash": "fe2fecac71cca8d9301a1e6af108fdc6589be4a5aefdfbc8243eb5050c09a8ba",
       "backendSha": "4a408819daea8628ae476fd1cbe1bc73fd042cca",
       "status": "synced"
     },
     "remotion/package.json": {
       "backendHash": "3787f7bb65b2c686b59eba69c5c4313a5c17b1c1336e2b72b1c8805c45d30898",
+      "adgenHash": "3787f7bb65b2c686b59eba69c5c4313a5c17b1c1336e2b72b1c8805c45d30898",
       "backendSha": "0e885c52b1d531299c5f064642409ab2d596a0e2",
       "status": "synced"
     },
     "remotion/presets/babyboo-editorial-monochrome.json": {
       "backendHash": "54ec34d8bb80871105f2afde4626cdfbc48197698bf2b32ba73d3df4e73cae1e",
+      "adgenHash": "54ec34d8bb80871105f2afde4626cdfbc48197698bf2b32ba73d3df4e73cae1e",
       "backendSha": "230d2a575d58eb81ec693fef312834915c5e07a7",
       "status": "synced"
     },
     "remotion/presets/babyboo-main-character.json": {
       "backendHash": "7263f12dcbcd907a026ea66e602448dec10d819bc0213db2966a481d3a9e892f",
+      "adgenHash": "7263f12dcbcd907a026ea66e602448dec10d819bc0213db2966a481d3a9e892f",
       "backendSha": "230d2a575d58eb81ec693fef312834915c5e07a7",
       "status": "synced"
     },
     "remotion/presets/canonical-awareness-pmax10.json": {
       "backendHash": "b3847d4e2d771c13b6a4487e7f4deae252582de7416257cb9dcd4f65543f7404",
+      "adgenHash": "b3847d4e2d771c13b6a4487e7f4deae252582de7416257cb9dcd4f65543f7404",
       "backendSha": "230d2a575d58eb81ec693fef312834915c5e07a7",
       "status": "synced"
     },
     "remotion/presets/canonical-awareness.json": {
       "backendHash": "484a2d73ce5c888404a6ce80a4488baf3001126f88692fea30d9fee3e8421cde",
+      "adgenHash": "484a2d73ce5c888404a6ce80a4488baf3001126f88692fea30d9fee3e8421cde",
       "backendSha": "230d2a575d58eb81ec693fef312834915c5e07a7",
       "status": "synced"
     },
     "remotion/presets/canonical-consideration-pmax10.json": {
       "backendHash": "ed9e6c24e2abfddabba2b2152b91b95ba0fe8fec77ca6b4f9bf12eecdccfc984",
+      "adgenHash": "ed9e6c24e2abfddabba2b2152b91b95ba0fe8fec77ca6b4f9bf12eecdccfc984",
       "backendSha": "230d2a575d58eb81ec693fef312834915c5e07a7",
       "status": "synced"
     },
     "remotion/presets/canonical-consideration.json": {
       "backendHash": "b7bd5f241746e9be5a443e989da303eb1476f1c191d77bc0a462fc0210080ed5",
+      "adgenHash": "b7bd5f241746e9be5a443e989da303eb1476f1c191d77bc0a462fc0210080ed5",
       "backendSha": "230d2a575d58eb81ec693fef312834915c5e07a7",
       "status": "synced"
     },
     "remotion/presets/canonical-conversion-pmax10.json": {
       "backendHash": "eb7a4687ffd3436009b2d40392d277a0da6618644c17587de730c7a176c5e462",
+      "adgenHash": "eb7a4687ffd3436009b2d40392d277a0da6618644c17587de730c7a176c5e462",
       "backendSha": "230d2a575d58eb81ec693fef312834915c5e07a7",
       "status": "synced"
     },
     "remotion/presets/canonical-conversion.json": {
       "backendHash": "7804ca2615acdf510721aaef320e7eaebf499e9bb6425294aef6cc3f2c824589",
+      "adgenHash": "7804ca2615acdf510721aaef320e7eaebf499e9bb6425294aef6cc3f2c824589",
       "backendSha": "230d2a575d58eb81ec693fef312834915c5e07a7",
       "status": "synced"
     },
     "remotion/presets/canonical.json": {
       "backendHash": "630898eece7b539b3cbcc7b5f7c6f711864db2ac73edc706b0c3c901489f64e1",
+      "adgenHash": "630898eece7b539b3cbcc7b5f7c6f711864db2ac73edc706b0c3c901489f64e1",
       "backendSha": "230d2a575d58eb81ec693fef312834915c5e07a7",
       "status": "synced"
     },
     "remotion/presets/pelagic-bluewater-editorial.json": {
       "backendHash": "a796fd0977ae4fb8450109630968ac5c6b9c5a2bf02d5a230ca4e41c2114ca1d",
+      "adgenHash": "a796fd0977ae4fb8450109630968ac5c6b9c5a2bf02d5a230ca4e41c2114ca1d",
       "backendSha": "230d2a575d58eb81ec693fef312834915c5e07a7",
       "status": "synced"
     },
     "remotion/presets/pelagic-offshore-bold.json": {
       "backendHash": "306434859f422aa075d92c04f4187b9bc42ecf75b038befc705ed6384e7016cd",
+      "adgenHash": "306434859f422aa075d92c04f4187b9bc42ecf75b038befc705ed6384e7016cd",
       "backendSha": "facf09d49eaeeec41b1d7e562ac6c44dd4b0e0fc",
       "status": "synced"
     },
     "remotion/presets/proto-bottom-editorial.json": {
       "backendHash": "0febc9a6672147059d92216a287c9d08fcb17c7d76d3e663b53dad1b10c5a88a",
+      "adgenHash": "0febc9a6672147059d92216a287c9d08fcb17c7d76d3e663b53dad1b10c5a88a",
       "backendSha": "230d2a575d58eb81ec693fef312834915c5e07a7",
       "status": "synced"
     },
     "remotion/presets/proto-kinetic-center.json": {
       "backendHash": "a906a0941e6f6950104a30b86340557b3b23c5b4e87007d1a4bcc1f2edb68287",
+      "adgenHash": "a906a0941e6f6950104a30b86340557b3b23c5b4e87007d1a4bcc1f2edb68287",
       "backendSha": "230d2a575d58eb81ec693fef312834915c5e07a7",
       "status": "synced"
     },
     "remotion/presets/soludos-mediterranean-editorial.json": {
       "backendHash": "d63ffa7309973ec329c4eb47504567fe5299d30c29d77345d03fa9b39423ed9b",
+      "adgenHash": "d63ffa7309973ec329c4eb47504567fe5299d30c29d77345d03fa9b39423ed9b",
       "backendSha": "230d2a575d58eb81ec693fef312834915c5e07a7",
       "status": "synced"
     },
     "remotion/presets/soludos-summer-postcard.json": {
       "backendHash": "be165be2e98c78eea15c14a3d11ee92aa6c1a5b77f40b5ca611fe7ea5ca58d57",
+      "adgenHash": "be165be2e98c78eea15c14a3d11ee92aa6c1a5b77f40b5ca611fe7ea5ca58d57",
       "backendSha": "230d2a575d58eb81ec693fef312834915c5e07a7",
       "status": "synced"
     },
     "schemas/contracts/ai_canvas_html.v1.json": {
       "backendHash": "99853ed40eda1f159aa1be3471b87fdf994543ac6cf7f7f71c1d7d9a1bf8bc5d",
+      "adgenHash": "99853ed40eda1f159aa1be3471b87fdf994543ac6cf7f7f71c1d7d9a1bf8bc5d",
       "backendSha": "35d7534ce5be7736a092729244eb9108360b519c",
       "status": "synced"
     },
     "schemas/contracts/ai_canvas_validation.v1.json": {
       "backendHash": "c8bd6139e8ea403c2bbf47ec2e9c42255a34a206588e155c8a13113ee019a259",
+      "adgenHash": "c8bd6139e8ea403c2bbf47ec2e9c42255a34a206588e155c8a13113ee019a259",
       "backendSha": "35d7534ce5be7736a092729244eb9108360b519c",
       "status": "synced"
     },
     "schemas/contracts/creative_direction.v1.json": {
       "backendHash": "47e8550b36f9879e8bc2f33571f881435ee8075f4517e9b57ab8ad35bc9097f0",
+      "adgenHash": "47e8550b36f9879e8bc2f33571f881435ee8075f4517e9b57ab8ad35bc9097f0",
       "backendSha": "6497f764ca16503fbd7b80efef93b2451d21836e",
       "status": "synced"
     },
     "schemas/contracts/layout_generation.v1.json": {
       "backendHash": "252df247cf18d01990e67ce82a13ca48ce1ee527fc6ec8b77cadd3b5c88abb43",
+      "adgenHash": "252df247cf18d01990e67ce82a13ca48ce1ee527fc6ec8b77cadd3b5c88abb43",
       "backendSha": "6497f764ca16503fbd7b80efef93b2451d21836e",
       "status": "synced"
     },
     "schemas/contracts/renderer_job.v1.json": {
       "backendHash": "d3368af50af50624aa66de80c6b311e8a5851497a74fb3390ac752d4c9fbd7fd",
+      "adgenHash": "d3368af50af50624aa66de80c6b311e8a5851497a74fb3390ac752d4c9fbd7fd",
       "backendSha": "6497f764ca16503fbd7b80efef93b2451d21836e",
       "status": "synced"
     },
     "schemas/contracts/resolved_layout.v1.json": {
       "backendHash": "380f38eeabc254d759ce811c1da821a3960f5d4a8dffe2305f263ce76cd42550",
+      "adgenHash": "380f38eeabc254d759ce811c1da821a3960f5d4a8dffe2305f263ce76cd42550",
       "backendSha": "6497f764ca16503fbd7b80efef93b2451d21836e",
       "status": "synced"
     },
     "schemas/overlayZoneArtifact.schema.json": {
       "backendHash": "824808e4a5372d7dbbb63a17c2be76962f835dfb2a7aa6ecbe2c572c5f5a99a5",
+      "adgenHash": "824808e4a5372d7dbbb63a17c2be76962f835dfb2a7aa6ecbe2c572c5f5a99a5",
       "backendSha": "e8ed81ae9ecb0f1a22b6702480dc1fb44324814a",
       "status": "synced"
     },
     "schemas/rsSocialProof.canonicalData.v1.json": {
       "backendHash": "08656dae386cf06326cc2cb50aa28871f2ab9931ad163d5411f9a9d5da4354be",
+      "adgenHash": "08656dae386cf06326cc2cb50aa28871f2ab9931ad163d5411f9a9d5da4354be",
       "backendSha": "2ddf04bc8e229c6c432b23984a947178c0a723a4",
       "status": "synced"
     },
     "schemas/rsSocialProof.canvas.v1.json": {
       "backendHash": "5b856fb6dd4bd8f5c3c88480f96214707e4643ad6b3bdc8321106e4d9a85ae23",
+      "adgenHash": "5b856fb6dd4bd8f5c3c88480f96214707e4643ad6b3bdc8321106e4d9a85ae23",
       "backendSha": "fac9f6605e8a65b55e135cf03305fff578cb62a2",
       "status": "synced"
     },
     "schemas/rsSocialProof.renderer.v1.md": {
       "backendHash": "82ca1398669797388b10eadf724914f82f74b0c28a9d79356cd7e3214d77bbdb",
+      "adgenHash": "82ca1398669797388b10eadf724914f82f74b0c28a9d79356cd7e3214d77bbdb",
       "backendSha": "fd291e309130762a3d6d274cdc97677743d5c516",
       "status": "synced"
     },
     "schemas/rsSocialProof.templates.catalog.json": {
       "backendHash": "eade72176d745501d3e494114fc0303b68769eb6a7be0abf25b571e3787d7fae",
+      "adgenHash": "eade72176d745501d3e494114fc0303b68769eb6a7be0abf25b571e3787d7fae",
       "backendSha": "c98a0208bb312060296667b148cbe8e1d137ee93",
       "status": "synced"
     },
     "schemas/rsSocialProof.templates.normalized.json": {
       "backendHash": "769bc983c682fa7cacde40dd6b8515e0fc05024ee6d91fc39fbe29ba6bbd29ed",
+      "adgenHash": "769bc983c682fa7cacde40dd6b8515e0fc05024ee6d91fc39fbe29ba6bbd29ed",
       "backendSha": "fac9f6605e8a65b55e135cf03305fff578cb62a2",
       "status": "synced"
     },
     "services/adArchiveDigest.js": {
       "backendHash": "4f20f9aabe9e50333db07e492f858dc2c3b3333f406658212ab42fa3f72ec0a6",
+      "adgenHash": "4f20f9aabe9e50333db07e492f858dc2c3b3333f406658212ab42fa3f72ec0a6",
       "backendSha": "408216753775677e48b634ac080bfe936adae20b",
       "status": "unused",
       "reason": "only reached from queuedArchiveSweeper, which adgen does not boot"
     },
     "services/adCopyGuards.js": {
       "backendHash": "32775cff5d6e65046a0c1f08672470160c993889efa56cffdd1163212822845e",
+      "adgenHash": "32775cff5d6e65046a0c1f08672470160c993889efa56cffdd1163212822845e",
       "backendSha": "7cc2c7dfbada49e800d3fd0cc1899e9735c425cb",
       "status": "synced"
     },
     "services/adReadinessService.js": {
       "backendHash": "22e736dcd7e48c5492c0e5b775ec609a3f067f7cf0c81c37a084f6064a7e0270",
+      "adgenHash": "8de31b15b0fe0cda65ce6195dbdbd30490f543ebd0d06064711b4a8e29fa2779",
       "backendSha": "9bad6b803b1d2ed72b10ae2388e1bbcbec688a28",
       "status": "unused",
       "reason": "unused in adgen — the readiness gate runs on backend routes (campaigns create / ads generate), nothing under adgen/src requires it. Re-attested after backend #340, which REMOVED the catalog-detect-not-started blocker: catalog detect is deferred (CATALOG_DETECT_PRECOMPUTE=false) and the only creator of a catalog DetectRun runs inside the request the gate was refusing, so it deadlocked every brand onboarded after deferral. If this copy is ever wired up in adgen, port that fix first — this vendored copy predates it."
     },
     "services/adRegenerateService.js": {
       "backendHash": "8a0512ba08a3f5543e9d9bed0430a9112de7796c361baad559c6b08414893a3e",
+      "adgenHash": "1963f7eb5f7bf29ccc161ab150dd6497ef74d5bb24e45b489286b55c9b11e748",
       "backendSha": "a1df77e95159ea70653d26cfe59e3dece6e52d7f",
-      "status": "fork",
-      "reason": "load-bearing adgen fork of backend #345. services/regenerateConsumer.js (adgen-only) requires this file and calls runClaimedRegeneration to execute a regenerate the backend deferred here. Deliberately diverges: this copy has runClaimedRegeneration (backend does not need it) and regenerateAd() has NO shouldDeferToAdgen branch (adgen IS the claimed-work executor, never the deferrer). Reconciled after backend #345 merged to origin/main."
+      "status": "unported",
+      "reason": "Carries the #74 (945f8cb) static resume-from-receipt threading (allowResume through to renderDirectImage), absent from backend. Note the INVERSE debt also exists in this file and is documented in docs/CONTRACT-backend-adgen.md section 4: adgen's runVideoFull passes allowResume:false explicitly (:879) while backend's passes nothing and defaults true, so a flag-off backend regenerate RESUMES a paid prediction where adgen submits fresh. Both directions need a human decision; portTo=backend covers the #74 half.",
+      "portTo": "backend",
+      "owedSince": "2026-08-27T10:28:51.314Z"
     },
     "services/adStage.js": {
       "backendHash": "437314029f1ff3ea5dcd35f68ba074c2fbc30fe20c38c706f72e9b3c4b66529b",
+      "adgenHash": "75e46e36cc40d4ee436dc61e82a5b5de176e2e37e94ba25ce17800fe945501dc",
       "backendSha": "36aedfa35e671da580d3e1d323431f431752b576",
       "status": "fork",
       "reason": "forward optional extra (source) to runFeed.onStage so adgen subsystem tags flow through the existing adStage choke point; Mongo renderStage write unchanged."
     },
     "services/adTitlingTruth.js": {
       "backendHash": "217adb4910d27b03e7fdffc57c43e70df0ec153094d21d48db58286c630078f0",
+      "adgenHash": "217adb4910d27b03e7fdffc57c43e70df0ec153094d21d48db58286c630078f0",
       "backendSha": "9d6322978bc28b080da3db6aaf510d113b0ea216",
       "status": "synced"
     },
     "services/adVisionQcService.js": {
       "backendHash": "ec26acfea7dfb97e3537cf471da36f8dc440b13748e85b20a450b0d7fb7dc586",
+      "adgenHash": "e14898983e45e1820bd724af41cb7ab24442da649bbef208bf8a3fc0507c9e1c",
       "backendSha": "e955b04891fcb861bbf64a5bc8642aa2fbe7a0bc",
       "status": "fork",
       "reason": "Backend #329 threads campaignRunId through judgeRender/runPostRenderQc/judgeVideoRender/runVideoPostRenderQc; adgen already carries campaignRunId in all four (via adgen's own #43 cost-ledger attribution work) — same shape, verified at each call site (adVisionQcService.js:1088,1389,1756,1837 + their internal judge() calls). Residual divergence unchanged from prior look: env-var fallback removed + buildPersistedVerdict invariant restored to match backend; backend's isStaticEnabled()/isVideoEnabled() synchronous pipeline gates remain unported (unused by any adgen caller)."
     },
     "services/adgenBridge.js": {
       "backendHash": "49ac3bb8c5a63a35d538e9cbd798bd1af1789ef9f121770b8e2d25659efd6496",
+      "adgenHash": "49ac3bb8c5a63a35d538e9cbd798bd1af1789ef9f121770b8e2d25659efd6496",
       "backendSha": "f7ede19dd4ae13fcd118859c4dae9bff453a4a83",
       "status": "unused",
       "reason": "backend→adgen handshake copy; adgen is the callee, not the caller"
     },
     "services/aiCreativeDirectorService.js": {
       "backendHash": "38f01d5f9dbb060b8e51aea2b94d9a1459dd001bf1228cae8abc6ac1309193ec",
+      "adgenHash": "4aafee2c1d7cc90487d59d1983df38c0e6b7fb872315cc980161818486decc22",
       "backendSha": "d8c133011275d62fa4133ed939b5e47fe5e90bdc",
       "status": "fork",
       "reason": "comment-only: the reserved proof-led slot's correction 1 is annotated for adgen's ADGEN-ONLY social_proof_led eligibility widening (STATIC_SOCIAL_PROOF_QUOTE_ELIGIBLE, PR #34). Backend eligibility is still rating-only, so the original unqualified wording is still accurate THERE and must not be ported back. No behaviour change either side."
     },
     "services/aiCreativeV2Helpers.js": {
       "backendHash": "52130701af3ed3c383e084355cf898e48bd170e072fc3df193b9948416e2c013",
+      "adgenHash": "52130701af3ed3c383e084355cf898e48bd170e072fc3df193b9948416e2c013",
       "backendSha": "9019eaca6a44484f567dc5c66f7859888db5f818",
       "status": "synced"
     },
     "services/aiJudgeService.js": {
       "backendHash": "a17dd660c619701c660adf9436377198b79bdde95eb0fd6e0baf19335aece96a",
+      "adgenHash": "a17dd660c619701c660adf9436377198b79bdde95eb0fd6e0baf19335aece96a",
       "backendSha": "29285f2a4fa18b57b87ef0821276fcaea8527470",
       "status": "synced"
     },
     "services/aiTemplateRegistry.js": {
       "backendHash": "86984b3e14084f249a0b5b85c33fd05d1c423b66059aa31afdfe31a85af8a928",
+      "adgenHash": "86984b3e14084f249a0b5b85c33fd05d1c423b66059aa31afdfe31a85af8a928",
       "backendSha": "6841c1cb41c5914461eaf3cacc538369587153ac",
       "status": "synced"
     },
     "services/aiVideoPosterService.js": {
       "backendHash": "344743defecabaab6b3d833ddd9df6c9dcbc9547239bab8556236b15cb7d1f32",
+      "adgenHash": "0b344689d2de630ac41a63737497720c5ed730eaa003a53224e6e26e47c24cb3",
       "backendSha": "ba99a59f10619bbd940be9442c8852dc32ae278a",
       "status": "unused",
       "reason": "Backend #329 added adId to the vision-QC cost meta inside generatePosterForAd; irrelevant here — reconfirmed zero require()/mentions of this file anywhere in adgen src/ (backend poster path; adgen does not invoke it)."
     },
     "services/aiVideoReferenceService.js": {
       "backendHash": "5605a8da64af1774e9955e65269225083c0a5e3e3708bc0e0c7779e7499a2fdd",
+      "adgenHash": "5605a8da64af1774e9955e65269225083c0a5e3e3708bc0e0c7779e7499a2fdd",
       "backendSha": "21f68ad80e38c187b7682c2cd8d676bb8a1cdae1",
       "status": "synced"
     },
     "services/aiVocabulary.js": {
       "backendHash": "1bb6e7268c8431326d6091df1e41d4be9f0c183c442575e9fa8f30785a9561a4",
+      "adgenHash": "1bb6e7268c8431326d6091df1e41d4be9f0c183c442575e9fa8f30785a9561a4",
       "backendSha": "6497f764ca16503fbd7b80efef93b2451d21836e",
       "status": "synced"
     },
     "services/alertService.js": {
       "backendHash": "fe41c5a114d0524cdf29e6adadebbcc290996e6a089f9b07f39ba15ade2ee6f0",
+      "adgenHash": "b7397d52c8cb8f0f7861ccfdbd640f98a6c34bfbbc1b06642b8f9215a1048af0",
       "backendSha": "aff3488d494ee7484d27971920a2b96e438e60fd",
       "status": "fork",
       "reason": "adgen dropped notify() channel override; backend still has it"
     },
     "services/amazonService.js": {
       "backendHash": "65baffc2ddc09b5fcf9068a9776647d9c29e6f1daa2b7a90e0154f053e707110",
+      "adgenHash": "65baffc2ddc09b5fcf9068a9776647d9c29e6f1daa2b7a90e0154f053e707110",
       "backendSha": "3d40302869e08ff2dc4d8a5a09cd76b57b0acffa",
       "status": "unused",
       "reason": "Amazon marketplace scrape is backend-owned"
     },
     "services/atlasErrorPolicy.js": {
       "backendHash": "a185af1160b83320adc4aad60aa22465db36b7ded901104dc52ad333cddc28f8",
+      "adgenHash": "a185af1160b83320adc4aad60aa22465db36b7ded901104dc52ad333cddc28f8",
       "backendSha": "149862fdcde316f7d22a706bf627d7ca9f9f091e",
       "status": "synced"
     },
     "services/atlasImageService.js": {
       "backendHash": "b9806803b902b482703a8ea78465390ebd4af0fcdc8f8eebfb39b1b635d0264c",
+      "adgenHash": "ddf91227da01f956b6051211f667b828c4b115e77162cfaa9cdbc57560e2c7e9",
       "backendSha": "39231220ca43a37e68bcf908fc54d1af77fb6aa3",
-      "status": "fork",
-      "reason": "fork — adgen carries an input_fidelity model guard backend does not have: input_fidelity is only accepted by gpt-image-1.5/edit, and measured 2026-08-24 against gpt-image-2/edit ~22% of submits carrying it fail with 'does not support the input_fidelity parameter' (Atlas validates inconsistently; the other 78% silently succeed). adgen strips it on any other model and warns once, so a caller re-adding it cannot quietly lose ~1-in-5 renders. Worth porting to backend if backend ever renders again with ADGEN_RENDERER_ENABLED off — flagged, not done, since adgen owns rendering today."
+      "status": "unported",
+      "reason": "MONEY, adgen-only as of #74 (945f8cb): shouldResumeImageAttempt + submitAndPollWithResume give the static/image charge point a resume-from-receipt guard, mirroring atlasVideoService.shouldResumeAttempt. Verified ABSENT from backend origin/main f8b3d6b1 (0 occurrences of either symbol in backend/services/atlasImageService.js, vs 7 here), so backend still submits a NEW gpt-image-2 generation on every renderDirectImage re-entry with no check of Ad.imageGeneration.predictionId -- the exact gap PR #40's own message admitted. Backend owes this port while its flag-off in-process render path is still live.",
+      "portTo": "backend",
+      "owedSince": "2026-08-27T10:28:36.278Z"
     },
     "services/atlasLlmService.js": {
       "backendHash": "86eb6f236480a103f90082d44a1ee096ad9b064608cf8b4abeeabcad7cd2a649",
+      "adgenHash": "86eb6f236480a103f90082d44a1ee096ad9b064608cf8b4abeeabcad7cd2a649",
       "backendSha": "b280ea710ce2d3c4d0d1cc4019cc2246baebca13",
       "status": "synced"
     },
     "services/atlasLlmStreamService.js": {
       "backendHash": "b68072f20d51eddc609e303893fba81bc86c143e40b2fa0a87fa23b317759a2a",
+      "adgenHash": "b68072f20d51eddc609e303893fba81bc86c143e40b2fa0a87fa23b317759a2a",
       "backendSha": "d3bcf5c160b7e3126967724afb516925c7f831a0",
       "status": "unused",
       "reason": "streaming LLM path not used by the renderer"
     },
     "services/atlasModelMap.js": {
       "backendHash": "08a683a04ca018fd02b38dcb8538c4d54bde6eb1b18cca1e2962a9d89ee49c44",
+      "adgenHash": "0dc008f35e1f1e4c3eb95c8744e7ab9293082d4e4a85ead90f49dae1be8ce48c",
       "backendSha": "aff3488d494ee7484d27971920a2b96e438e60fd",
       "status": "fork",
       "reason": "adgen routing table is a narrower extract; not a wholesale copy"
     },
     "services/atlasTextService.js": {
       "backendHash": "55704dd5ac0061595e5b03840e1b972ac8509ae96d5875c88c7b32c7e954651c",
+      "adgenHash": "55704dd5ac0061595e5b03840e1b972ac8509ae96d5875c88c7b32c7e954651c",
       "backendSha": "d3bcf5c160b7e3126967724afb516925c7f831a0",
       "status": "unused",
       "reason": "backend text helper; renderer uses atlasLlmService / atlasImageService"
     },
     "services/atlasVideoService.js": {
       "backendHash": "72a5e707e664e9d0dcf90b90b34ea27ffcb71cca4d045719182bafa28cf75088",
+      "adgenHash": "ee6e554a03810ac2410370cfa558349c804e7a86704b1ee69880ea83cbee6467",
       "backendSha": "ba99a59f10619bbd940be9442c8852dc32ae278a",
       "status": "fork",
       "reason": "fork — generateForAd carries a resume-from-receipt gate (shouldResumeAttempt) so a re-claimed, receipt-holding ad does not re-submit a paid Atlas Omni generation; backend has no equivalent and relies on its out-of-band bootRecoveryService sweep. Cost-ledger attribution (brandId/productId/adId/campaignRunId) is threaded per each repo's own call graph — backend via pipelines/detect.js, adgen via renderer.js/generateForAd — so the files are not byte-identical by design. Backend #329's reframe-outpaint attribution fix WAS a real gap on this side and is ported here (recordFlatCost stage:'reframe-outpaint' now prefers the explicit brandId/productId params and carries adId/campaignRunId); re-pointed only after that port, not instead of it."
     },
     "services/basePlateCropService.js": {
       "backendHash": "03d13d046489c24734fc54a97edb158ed9abc4f7ad03e2ec4a84c8b0ad3b6aeb",
+      "adgenHash": "b77f416431353b9da7231c0b108e964651007207de875030458d2350a1728c49",
       "backendSha": "ba99a59f10619bbd940be9442c8852dc32ae278a",
       "status": "fork",
       "reason": "Backend #329 added productId: ad.productId || null to both detectClipBoxes call sites (resolveBasePlateVideoUrl, ensureFaceDetectionForKeepOut); adgen already threads campaignRunId/brandId/productId/adId through detectFrameBoxes/detectClipBoxes (basePlateCropService.js:398,442) and both call sites already pass productId: ad.productId || null (adgen #43) — verified byte-identical outcome for this hunk."
     },
     "services/blockClassifier.js": {
       "backendHash": "505108cca42df8bb500c620f032f1455f9023fa6cd7b5e554672a4fe1cb5d893",
+      "adgenHash": "505108cca42df8bb500c620f032f1455f9023fa6cd7b5e554672a4fe1cb5d893",
       "backendSha": "fa2d397fc16f685ac38522d034dcebc59b3f9419",
       "status": "unused",
       "reason": "scrape bot-classifier; only reached from unused http scrape path"
     },
     "services/bootRecoveryService.js": {
-      "backendHash": "9be544e7630b360e513730934103668108c8d5bc0223f9666f4f4e6a89e75d32",
-      "backendSha": "f8837e364168413411fdec31cb8b8c262d6554c8",
-      "status": "unused",
-      "reason": "backend boot-recovery sweeper; not wired into adgen entrypoint (look before wiring)"
+      "backendHash": "1d00e706cb433078d61bba46abc41cb12ffedcd046062a8469f780de6be9429f",
+      "adgenHash": "4ada172fccc5099bf1c7539a168ecc229f4b2afbfacf81b902ce2658ea94dac0",
+      "backendSha": "f8b3d6b152a848a3c9f5665f45cc6c00500ce0cb",
+      "status": "fork",
+      "reason": "Genuine FORK as of 2026-08-26, not a debt: both repos fixed the same titler-handoff race with DIFFERENT, role-appropriate fixes. Backend #346 (f8b3d6b1) makes its sweep stand down on isAdgenRendererEnabled() and adds claim-awareness, SCOPED TO VIDEO RECOVERY ONLY (static-image recovery stays unconditional). adgen #75 (c02c7ff) instead makes ITS sweep stop stomping its own titler handoff, because on adgen's side the dangerous row has no claim at all. Neither side should take the other's patch verbatim. Consequence worth knowing (backend #346's own comment): with backend gated off, a claim stuck past AD_HEARTBEAT_MAX_MS no longer fails over to backend -- recovery depends entirely on adgen's own sweep."
     },
     "services/brandCatalogService.js": {
       "backendHash": "d7b9a4558ffaeffe30d0f4708ffb0800896465e12b5ce881e2278a681a837616",
+      "adgenHash": "d7b9a4558ffaeffe30d0f4708ffb0800896465e12b5ce881e2278a681a837616",
       "backendSha": "4a08a2907d7e220fbd105e72aa2af17612c015bd",
       "status": "synced"
     },
     "services/brandEnrichmentService.js": {
       "backendHash": "d87ae2c5e4dfef9c772c305d050b7a364baf320c3168c70cfeca829ee7260e5a",
+      "adgenHash": "d87ae2c5e4dfef9c772c305d050b7a364baf320c3168c70cfeca829ee7260e5a",
       "backendSha": "ba99a59f10619bbd940be9442c8852dc32ae278a",
       "status": "synced"
     },
     "services/brandFontIngestService.js": {
       "backendHash": "4356d30c999bc14c23ba0d3a5fa5c5ae52fadcd8326871ba13024c15514071bf",
+      "adgenHash": "cb2824e212503cf998463f1b715accd55af880bd31de6d567348a5092ec77dba",
       "backendSha": "9dd98b85232f040efd4ca76c4f41f4b37ba78b3e",
       "status": "fork",
       "reason": "PORTED 2026-08-24: backend #323 cross-sheet CSS generics / icon-font drop (collectCssVariables, isPseudoElementSelector/isOnlyPseudoElementSelectors, isIconFontFamily skip in firstConcreteFamily, extractFontUsageFromCss(cssText, extraVariables) second param, aggregateFontUsageAcrossSheets pre-merging variables) — verified via scripts/verifyIconFontAndCrossSheetGenerics.js. Remaining, deliberate fork: adgen lacks backend's later fontAxisProbe/probeVariableWeightAxis variable-weight-axis feature (require + the entryBase.weightMin/weightMax block in ingestBrandFontsInner, and the resulting publicId uses face.weight not entryBase.weight) — separate unported feature, out of scope for #323."
     },
     "services/brandFontPersistenceService.js": {
       "backendHash": "fe345657337521a31c052dfb9c871825d0846210424777de35118b0646bd65fb",
+      "adgenHash": "fe345657337521a31c052dfb9c871825d0846210424777de35118b0646bd65fb",
       "backendSha": "12cf52560a78fae2b1425374e56556fb7a129be2",
       "status": "synced"
     },
     "services/brandLogoIngestService.js": {
       "backendHash": "d24c07f2be54d99a3c852c915758a7b5ddfb9dd688e4665000cc75efdd67af2e",
+      "adgenHash": "d24c07f2be54d99a3c852c915758a7b5ddfb9dd688e4665000cc75efdd67af2e",
       "backendSha": "4a08a2907d7e220fbd105e72aa2af17612c015bd",
       "status": "synced"
     },
     "services/brandScriptExecutor.js": {
       "backendHash": "bc87bd56fa996f2aca33e581712496b35e68ea4fda285e5dec79491e9c1c8165",
+      "adgenHash": "077e1c05b344f569fb085dcbd415d1875c633534e7b6f3c23b1a5b1b13cee9ed",
       "backendSha": "2d93ace1f79a7d91c7aede75667fb4d8c4e48a23",
       "status": "fork",
       "reason": "adgen video QC/titling path (Remotion child OOM/timeout); colourway gate hunk-ported from backend #324. FIXED 2026-08-24: the #307 port (below, plateIntelService.js) left both renderTitles({...}) call sites here computing platformFormat but never deriving safeZoneKey from it, so bandsFor(safeZoneKey) always got undefined and silently used pre-#307 BANDS on every real render — the fix was reachable but never actually exercised. Now computes `const safeZoneKey = resolveSafeZoneKeyCjs({format, platformFormat})` once and forwards it to both call sites. Same gap independently found and fixed on backend main the same day (unmerged there too as of this reason). Verified via scripts/verifyKeepOutBandGeometry.mjs groups I/J/K, mutation-proven (dropping the call-site arg, and a decoy hardcoded null, each turn a check red)."
     },
     "services/brandScriptRunner.child.js": {
       "backendHash": "c8f60343c015bda7e03d69bfa07b8d01cb91c3347701a11773412537a6e36b76",
+      "adgenHash": "c8f60343c015bda7e03d69bfa07b8d01cb91c3347701a11773412537a6e36b76",
       "backendSha": "ac6ccd2bd9a365c0dcfac9b8eac97da897a6a95e",
       "status": "synced"
     },
     "services/brandScripts/assets/fonts/README.md": {
       "backendHash": "9388a079a8313e7d351cf8b16b055f094280806a831621c59b05de004aac9e6d",
+      "adgenHash": "9388a079a8313e7d351cf8b16b055f094280806a831621c59b05de004aac9e6d",
       "backendSha": "71b86e6c8f65831f33bd304184ef558f72882349",
       "status": "synced"
     },
     "services/brandScripts/canonical.script.js": {
       "backendHash": "ad08bfac49fe4989899d5db813c9c8d199bbbf1f50bb3bab553523f943e5e111",
+      "adgenHash": "ad08bfac49fe4989899d5db813c9c8d199bbbf1f50bb3bab553523f943e5e111",
       "backendSha": "7bc058082ca2b46926ff5192b36c070a119da740",
       "status": "synced"
     },
     "services/brandScripts/canonical_dr_v1_vertical.script.js": {
       "backendHash": "50dada158b1a6e8fb0af9e32f1d07050242192cca62d3c672274c02a07046a8c",
+      "adgenHash": "50dada158b1a6e8fb0af9e32f1d07050242192cca62d3c672274c02a07046a8c",
       "backendSha": "7bc058082ca2b46926ff5192b36c070a119da740",
       "status": "synced"
     },
     "services/brandScripts/local_scrim_landscape.script.js": {
       "backendHash": "f08d829297389b3f4a1f342d3f07af5681f0681fbceccb4cd36bb552b54d4524",
+      "adgenHash": "f08d829297389b3f4a1f342d3f07af5681f0681fbceccb4cd36bb552b54d4524",
       "backendSha": "7bc058082ca2b46926ff5192b36c070a119da740",
       "status": "synced"
     },
     "services/brandScripts/top_scrim_editorial.script.js": {
       "backendHash": "4e79270ddcf4baf58447f14b4b7d5581872a3297482e53c128b3048654834a4d",
+      "adgenHash": "4e79270ddcf4baf58447f14b4b7d5581872a3297482e53c128b3048654834a4d",
       "backendSha": "7bc058082ca2b46926ff5192b36c070a119da740",
       "status": "synced"
     },
     "services/brandScripts/u_beauty.script.js": {
       "backendHash": "965655a7851bbebc1bfa748a45e7e7dc0b2e95a1eee29b8a82bebac38d837fbb",
+      "adgenHash": "965655a7851bbebc1bfa748a45e7e7dc0b2e95a1eee29b8a82bebac38d837fbb",
       "backendSha": "4f1cac288e4db8b1318a6a0d6c4fc915b7e28672",
       "status": "unused",
       "reason": "brand-specific script, not in adgen's canonical set"
     },
     "services/brandStyles/camelback_flowers.js": {
       "backendHash": "e9584e3db8859a98ad72a773718dae375c8ce89442478de3c552ec7e2af40668",
+      "adgenHash": "e9584e3db8859a98ad72a773718dae375c8ce89442478de3c552ec7e2af40668",
       "backendSha": "07aa33e2095d6d74c0d3b7b17755d6d67291b4d6",
       "status": "unused",
       "reason": "backend brand-style module; adgen does not load the registry"
     },
     "services/brandStyles/index.js": {
       "backendHash": "22dc4ba3685329007495a3dc8721d9e273760e258e4217b6017fec3dc22c4654",
+      "adgenHash": "22dc4ba3685329007495a3dc8721d9e273760e258e4217b6017fec3dc22c4654",
       "backendSha": "45659e487a7fd8ed448f7393d4280fd5b57b71e2",
       "status": "unused",
       "reason": "backend brand-style registry; adgen does not load it"
     },
     "services/brandStyles/u_beauty.js": {
       "backendHash": "75cc4a4ae07fb5278b15392198d1df5aa84c8f24bf7740bacf4ea64e6aedd7ab",
+      "adgenHash": "75cc4a4ae07fb5278b15392198d1df5aa84c8f24bf7740bacf4ea64e6aedd7ab",
       "backendSha": "629fae867955690b1c2925ece0d004e702be5a30",
       "status": "unused",
       "reason": "backend brand-style module; adgen does not load the registry"
     },
     "services/brandfetchService.js": {
       "backendHash": "c0bc62b0d11413dd7d9947acaf3359a3f8bfb5e4bb08f5d021dec4aa38665479",
+      "adgenHash": "c0bc62b0d11413dd7d9947acaf3359a3f8bfb5e4bb08f5d021dec4aa38665479",
       "backendSha": "42d129517f73939f2905e67a98d45df2b089a065",
       "status": "synced"
     },
     "services/campaignAdsGenerationService.js": {
       "backendHash": "def174e4b6444f63ed1661ac891a7574a6deeeadfe8164be3d170ba0c02883e0",
+      "adgenHash": "def174e4b6444f63ed1661ac891a7574a6deeeadfe8164be3d170ba0c02883e0",
       "backendSha": "c5a378f16ffe1a9fe5a959c877a3b63c16c81620",
       "status": "synced"
     },
     "services/campaignBriefDerivationService.js": {
       "backendHash": "f08c591b1cfeb0c971d43afa316ebca613570e483654cebd9bd7655d6c69230e",
+      "adgenHash": "f08c591b1cfeb0c971d43afa316ebca613570e483654cebd9bd7655d6c69230e",
       "backendSha": "f727e3f95bd33615b11286e7644524e71150fd9c",
       "status": "synced"
     },
     "services/campaignRunGuards.js": {
       "backendHash": "891af0dcbd31ff71427f4444f52a6c002f193c76e6f6f5cfb9e6998a8c35f345",
+      "adgenHash": "891af0dcbd31ff71427f4444f52a6c002f193c76e6f6f5cfb9e6998a8c35f345",
       "backendSha": "c27df03909ad9b54df9dfc8d27b4c52fdadbadce",
       "status": "synced"
     },
     "services/campaignRunHeartbeat.js": {
       "backendHash": "6afcd696fa4b20916b535ade7c3d3cfc87362e51f5f2f46b63a0f3d90e39c0de",
+      "adgenHash": "6afcd696fa4b20916b535ade7c3d3cfc87362e51f5f2f46b63a0f3d90e39c0de",
       "backendSha": "9fb14705b0bdc7fba68af4424423be11bca39d5f",
       "status": "synced"
     },
     "services/capabilityExecutors/adRegenerate.js": {
       "backendHash": "960b19e0bdf0f112e8a3ac7247faf7f3424c2372bb063feb4c3516c50f7069ab",
+      "adgenHash": "960b19e0bdf0f112e8a3ac7247faf7f3424c2372bb063feb4c3516c50f7069ab",
       "backendSha": "5624d4fa8ed437823d5d5eb9303eec8246bf6dfe",
       "status": "unused",
       "reason": "only required from unused capabilityRegistry"
     },
     "services/capabilityRegistry.js": {
       "backendHash": "b662a945c8dbfd30af1e85073ebf00ab8efd2214c7f028e041d42bb8ab109ea9",
+      "adgenHash": "45a390721c131c3f43f3772e9f8d4778f1df95b74720e213047ddadfbf3ec036",
       "backendSha": "9bad6b803b1d2ed72b10ae2388e1bbcbec688a28",
       "status": "unused",
       "reason": "unused in adgen — operator-agent capability surface is backend-owned. Re-attested after backend #340 corrected campaign.create's describe text, which had been telling the agent layer the old deadlocked readiness rule ('every connected integration must have >=1 completed DetectRun')."
     },
     "services/catalogImageQuality.js": {
       "backendHash": "f949335ad31cf3efc99f4f5f2315b67eaa6f8693342851642f4843d3d37baf60",
+      "adgenHash": "f949335ad31cf3efc99f4f5f2315b67eaa6f8693342851642f4843d3d37baf60",
       "backendSha": "11041776698f92dc4ff03c60894052d70e05e883",
       "status": "synced"
     },
     "services/catalogProductDetectService.js": {
       "backendHash": "e28bfd4feb79e30b4213ff8d1e6523bb48d3d98b44aa3838fe1a81cc161d604b",
+      "adgenHash": "e28bfd4feb79e30b4213ff8d1e6523bb48d3d98b44aa3838fe1a81cc161d604b",
       "backendSha": "fc12c6d43d551a86d3b012a844dfcb77db2019c2",
       "status": "synced"
     },
     "services/categoryChainService.js": {
       "backendHash": "070c8bbf09383221027431902efc20cb60a8ba3c4efe8615565c1bf46e104f09",
+      "adgenHash": "070c8bbf09383221027431902efc20cb60a8ba3c4efe8615565c1bf46e104f09",
       "backendSha": "2cc56ebf6d1cf7bccbd1cccf6b6853a1197f0139",
       "status": "synced"
     },
     "services/claimSubstantiationService.js": {
       "backendHash": "95f94af72f3e32a9a6a3d278204ce5d523e1e8c56e2b884baa7707c2b986e987",
+      "adgenHash": "95f94af72f3e32a9a6a3d278204ce5d523e1e8c56e2b884baa7707c2b986e987",
       "backendSha": "1f1f77931b73f9fc11f218d16a7ac63e50fb5280",
       "status": "synced"
     },
     "services/cloudinaryService.js": {
       "backendHash": "1c7cd39e0a64fd1b09eac7194dcc26be97a21397f767baadb47d0788329e5b1b",
+      "adgenHash": "1c7cd39e0a64fd1b09eac7194dcc26be97a21397f767baadb47d0788329e5b1b",
       "backendSha": "b38965cc20686ec4b135b4af9d12510ba6fa8b06",
       "status": "synced"
     },
     "services/conceptProjection.js": {
       "backendHash": "a8834247caa83318cb1ee1cd36e30adee42c3c32fedcdb2191047a5621d758f3",
+      "adgenHash": "a8834247caa83318cb1ee1cd36e30adee42c3c32fedcdb2191047a5621d758f3",
       "backendSha": "41442ab61998fa34e5675ba008d777403d456a92",
       "status": "synced"
     },
     "services/concurrency.js": {
       "backendHash": "019ff6bfee1808f92e9f55dd91ca052e9a4c242bd8bab40525ca3669dad45a16",
+      "adgenHash": "e3ea6e93a9f0310ce31c422a8ada44e4033f126a4222507da8da1df6174f6a7e",
       "backendSha": "8fc602d6d080871456e0ad37b6934b86a7bb6e04",
       "status": "fork",
       "reason": "adgen-only: SPEC fallback lowered 4->2 (4 is the measured OOM-fatal value on an 8 GiB box; a degraded-boot fallback must be the most conservative survived value), plus a correction to the why-note — the old ~0.9 GiB/slot figure divided a 7.57 GiB peak by 8 permits when only 4 were rendering; real figure is ~1.97 GiB/slot. adgen tuned operating value lives in config/defaults.env (3). Backend still carries default 4 in its own copy; see handoff follow-up."
     },
     "services/copyDerivationService.js": {
       "backendHash": "d7e3d8dfd47fbbd22443452c542dba8f71d800ddcf5b914d8f6848b4f8401669",
+      "adgenHash": "d7e3d8dfd47fbbd22443452c542dba8f71d800ddcf5b914d8f6848b4f8401669",
       "backendSha": "872c40ef6b92738038a5d89903afa67954263b1d",
       "status": "synced"
     },
     "services/costTracker.js": {
       "backendHash": "c0431a1082ceaf42c9e62043f8c527372f74e8c6c01f17fc059ef828b090e2da",
+      "adgenHash": "c0431a1082ceaf42c9e62043f8c527372f74e8c6c01f17fc059ef828b090e2da",
       "backendSha": "d49b471b5f2a092990cd841bfc02304b79768346",
       "status": "synced"
     },
     "services/creativeMatcherCore.js": {
       "backendHash": "8ce8c7b76624d3dcc94e50cb1d18eb21db4fd29814f8c188ff2fdf95034f91b8",
+      "adgenHash": "8ce8c7b76624d3dcc94e50cb1d18eb21db4fd29814f8c188ff2fdf95034f91b8",
       "backendSha": "7b28a3477731953373906f5eaa29b218245f13e1",
       "status": "unused",
       "reason": "backend matcher; adgen does not call it"
     },
     "services/directImageRenderService.js": {
       "backendHash": "f08b826fce868dac48bab3e037b736a338f07859df885533034ec2ad1a621e4f",
+      "adgenHash": "4d683dd781b14545da23a8f850a71aa20eb6450468f8a89c99466757b5b34d1a",
       "backendSha": "e955b04891fcb861bbf64a5bc8642aa2fbe7a0bc",
-      "status": "fork",
-      "reason": "Backend #327 (logo-safe-box) parity already held; backend #329 additionally added campaignRunId: campaignRunId || null to the vision-QC params object immediately preceding the 'MONEY: generate() attempt 1...' comment. adgen already carries campaignRunId: campaignRunId || null at the identical call site (directImageRenderService.js:2951, adgen #43) — confirmed byte-identical for this hunk. PORTED 2026-08-24: backend #323's icon-font consume-time guard in typefaceDirectiveForBrand — headingRaw/fonts filtered through isIconFontFamily (require updated to pull isIconFontFamily from ./fontClassification) so an already-stored icon-font heading/customFonts[0] is never named to gpt-image-2 — verified via scripts/verifyIconFontAndCrossSheetGenerics.js (C4/C4b). Existing fork reasons unchanged: adgen owns usableAttribution, composeCorrectiveOverride, buildQcRetryArgs, submitEditImageWithSeedFallback; colourway gate + logo-safe-box inset hunk-ported from backend, both sides verified identical on LOGO_INSET_FRAC/logoInsetPx."
+      "status": "unported",
+      "reason": "Was a deliberate fork (adgen owns usableAttribution, composeCorrectiveOverride, buildQcRetryArgs, submitEditImageWithSeedFallback; colourway + logo-safe-box hunks ported from backend). #74 (945f8cb) added a NEW obligation on top: this file is where the static resume-from-receipt guard is wired in, and that guard is absent from backend (see services/atlasImageService.js). Recorded as unported rather than fork because the fork was pre-existing and benign while THIS hunk is an unshipped money fix -- the debt is the actionable fact. Do not reconcile back to fork without porting the resume wiring.",
+      "portTo": "backend",
+      "owedSince": "2026-08-27T10:28:43.817Z"
     },
     "services/enrichmentReconciler.js": {
       "backendHash": "18319b9414c7c67c332f03cbb7870c42048dace067a55523f54b7ea16c071649",
+      "adgenHash": "18319b9414c7c67c332f03cbb7870c42048dace067a55523f54b7ea16c071649",
       "backendSha": "bb98fe38d252833cdf4e68305fb34c1bfdfb3561",
       "status": "unused",
       "reason": "backend catalog enrichment; adgen does not call it"
     },
     "services/faceSafeCrop.js": {
       "backendHash": "986126268359d4f9d28f8b8075e930689a541cf369025ffbe83c9a2f61cf90a5",
+      "adgenHash": "986126268359d4f9d28f8b8075e930689a541cf369025ffbe83c9a2f61cf90a5",
       "backendSha": "1a50b5b3611836cf7489971871f66d9080d1c4a0",
       "status": "synced"
     },
     "services/fontClassification.js": {
       "backendHash": "4bfdfad23281c4a29f8306dc91d9bbc774b5d7f226bf6c600aa320fd20ea3364",
+      "adgenHash": "4bfdfad23281c4a29f8306dc91d9bbc774b5d7f226bf6c600aa320fd20ea3364",
       "backendSha": "9dd98b85232f040efd4ca76c4f41f4b37ba78b3e",
       "status": "synced"
     },
     "services/fontLoader.js": {
       "backendHash": "cb3dde8f0ec420ff3a8e064167dbd75b945146de9cd013cb767dc411ecb79cfd",
+      "adgenHash": "cb3dde8f0ec420ff3a8e064167dbd75b945146de9cd013cb767dc411ecb79cfd",
       "backendSha": "12cf52560a78fae2b1425374e56556fb7a129be2",
       "status": "synced"
     },
     "services/fontResolverService.js": {
       "backendHash": "f978e12cf5dc6bff90a826205e49b952523904490b18402b7d7982778cd35c0b",
+      "adgenHash": "f978e12cf5dc6bff90a826205e49b952523904490b18402b7d7982778cd35c0b",
       "backendSha": "6f5372fbcf7b7b58f4a18bc18cb1c899534f7b3b",
       "status": "synced"
     },
     "services/frontendOriginValidator.js": {
       "backendHash": "d7930cc9294706772bead17f378264f6ec01d92fc00fb1a688dc0de8c71e6e2a",
+      "adgenHash": "d7930cc9294706772bead17f378264f6ec01d92fc00fb1a688dc0de8c71e6e2a",
       "backendSha": "b331e2def8d9a14164372957affd18eb776424d5",
       "status": "unused",
       "reason": "HTTP origin check for backend API routes"
     },
     "services/geminiImageService.js": {
       "backendHash": "acf8a176a577e4584dc127e2be171fa09e807143cfdeb491a1bf25cdbef63ce2",
+      "adgenHash": "9000d37c901eb4401b3949a30f9b8168f0e3eb2f2ae7e95f86e735d11edc2d86",
       "backendSha": "1acb49bd9775eb79848fcb05d9a7289bbd3efa6b",
       "status": "unused",
       "reason": "unused in adgen — Gemini image generation is backend-owned. Re-looked after backend #331, which threaded brandId/productId through four more unledgered cost producers so their CostLog rows attribute correctly."
     },
     "services/generationGate.js": {
       "backendHash": "8e1e414c11e2c0560db6e9dbb872096c25d0e89f12e83d102d2700970ab68202",
+      "adgenHash": "8e1e414c11e2c0560db6e9dbb872096c25d0e89f12e83d102d2700970ab68202",
       "backendSha": "2284f8ecd2384a2df3aa2ac45f54c49a74b00bf8",
       "status": "unused",
       "reason": "backend /generate 409 gate; adgen is downstream of the mint (look before wiring)"
     },
     "services/httpScrapeClient.js": {
       "backendHash": "5c6a39f31715b90374ef2fc5783b66a0604783fb9585c3d44a23618f4f3f0242",
+      "adgenHash": "5c6a39f31715b90374ef2fc5783b66a0604783fb9585c3d44a23618f4f3f0242",
       "backendSha": "388ed3b3058ec25c20688976c3df0d3981f61294",
       "status": "unused",
       "reason": "only reached from unused vendor adapters / scrape services"
     },
     "services/imagePreviewUrl.js": {
       "backendHash": "1e350ca6d6b7eb2fcf4ef4ea8e7cf5c46d431b90f2b2a1543d1ef93dd9a45e1d",
+      "adgenHash": "1e350ca6d6b7eb2fcf4ef4ea8e7cf5c46d431b90f2b2a1543d1ef93dd9a45e1d",
       "backendSha": "110837dff668c1485c4e4f4906f9c6db2f836a58",
       "status": "unused",
       "reason": "backend preview helper; no adgen caller"
     },
     "services/imageRecoveryService.js": {
       "backendHash": "adfabcf2dce9caf82e332cca557cb22c014b618b65452087c9b07ce194c56b1d",
+      "adgenHash": "f69e5278c31b3212cba07f7877b6bb14099447069f48994325f4a987483e9cef",
       "backendSha": "e955b04891fcb861bbf64a5bc8642aa2fbe7a0bc",
       "status": "unused",
       "reason": "Backend #329 added productId to the CostLog objects in recoverImageAd and settleChargeState; irrelevant — reconfirmed both callers (strandedRunSweeper.js, bootRecoveryService.js) have zero requirers anywhere in adgen src/ (entrypoint.js only requires ./config, ./db, ./routes/api, ./services/orchestrator, ./services/renderer), so this file stays unreachable. Same reason as before: only reached from unwired bootRecovery / strandedRunSweeper."
     },
     "services/imageShotHeuristicService.js": {
       "backendHash": "3a9a4ea1b7ad95437b0374f1d4844c2c20c28c651c0a2d517b52f3171d17111b",
+      "adgenHash": "3a9a4ea1b7ad95437b0374f1d4844c2c20c28c651c0a2d517b52f3171d17111b",
       "backendSha": "9b482775e2f75324ca0dec26c9bb405bd1899093",
       "status": "synced"
     },
     "services/inFlight.js": {
       "backendHash": "e00c6715822195ba500e8e91124a9016f6944c647e3f35de49e719974e90990d",
+      "adgenHash": "e00c6715822195ba500e8e91124a9016f6944c647e3f35de49e719974e90990d",
       "backendSha": "d3ed8d5638418bf913b165bf42614daea2c4da39",
       "status": "unused",
       "reason": "backend process-wide inflight counter; adgen uses a per-run map in renderer.js (look before wiring)"
     },
     "services/ingestShotClassifyService.js": {
       "backendHash": "8e44a42bc6fc0b1be58abbef4d1bdb5facada4bf699b39a9dbef8f5360ddc03d",
+      "adgenHash": "8e44a42bc6fc0b1be58abbef4d1bdb5facada4bf699b39a9dbef8f5360ddc03d",
       "backendSha": "754ce07a0d2cdfee6ce7ca400a933787df93c7f5",
       "status": "synced"
     },
     "services/integrationCryptoService.js": {
       "backendHash": "54c1737e0aab5908692f6b4092145c659ceea8daece37b68a54c0757be25b856",
+      "adgenHash": "54c1737e0aab5908692f6b4092145c659ceea8daece37b68a54c0757be25b856",
       "backendSha": "56219891b1e6afb727a06d8174502616bad94425",
       "status": "synced"
     },
     "services/judgeService.js": {
       "backendHash": "1d0e37eaa893b54bb6ebacd5b7e875a56dcb4e5c1600c2d5565303ee797b4ff9",
+      "adgenHash": "a2cdad874e664abf625240caed606b2367ee1e32dd6f1787697309c762b8fec4",
       "backendSha": "ba99a59f10619bbd940be9442c8852dc32ae278a",
       "status": "unused",
       "reason": "Backend #329 threads brandId/productId/adId/campaignRunId through judgeDetections, judgeExtendedCrops, and callOpenAIWithCloudinaryRetry; irrelevant here — reconfirmed zero require() sites in adgen src/ (only two doc-comment mentions in llmError.js:708,781). adgen uses aiJudgeService, unchanged."
     },
     "services/layoutInputService.js": {
       "backendHash": "7a4357b068af59d0aceda0f15b7d387700cea557d679f07b25c28df0ad09dff4",
+      "adgenHash": "a49b1ddad6bb11bc41cf117fa1bf5982772ef1f1295595c2e293c3640cfb229b",
       "backendSha": "ba99a59f10619bbd940be9442c8852dc32ae278a",
       "status": "fork",
       "reason": "Backend #329 added brandId/productId/adId/campaignRunId to the layout_derivation chatCompletion call inside runDerivation; adgen's runDerivation already carries the identical four fields on the same call (layoutInputService.js:918-924, adgen #43) — verified equivalent. Cost-ledger attribution threaded per repo's own call graph, same class as the other #43 reconciles."
     },
     "services/llmError.js": {
       "backendHash": "589fd87ece50784d1620ac2db054d92911c880d21d2a34be4db3f4df8aaf7f8f",
+      "adgenHash": "589fd87ece50784d1620ac2db054d92911c880d21d2a34be4db3f4df8aaf7f8f",
       "backendSha": "17ed63e3fedb3d93a36fd7a8248dc720774ce72a",
       "status": "synced"
     },
     "services/mediaAssignmentService.js": {
       "backendHash": "0926f85e226144dbcf8da19e0abaf0717e58ca2e28e60974d64397efae0be065",
+      "adgenHash": "0926f85e226144dbcf8da19e0abaf0717e58ca2e28e60974d64397efae0be065",
       "backendSha": "de243f43d8df02695afb326017966a7dd366e2ed",
       "status": "unused",
       "reason": "backend media assignment; adgen does not call it"
     },
     "services/mediaInsightsService.js": {
       "backendHash": "6c7377c94f2863e8377101c3b844b4eb27a9df4918098d59b3ae08a1e26a86da",
+      "adgenHash": "6c7377c94f2863e8377101c3b844b4eb27a9df4918098d59b3ae08a1e26a86da",
       "backendSha": "218c8beb93a1621a1a3e62e7cfb2956e845a8dde",
       "status": "synced"
     },
     "services/metaAdsFontService.js": {
       "backendHash": "3c8376a0b76d0d7a6bc14e4ae98255fd22cf8bba9d60a6e60de2954685fa8012",
+      "adgenHash": "3c8376a0b76d0d7a6bc14e4ae98255fd22cf8bba9d60a6e60de2954685fa8012",
       "backendSha": "218c8beb93a1621a1a3e62e7cfb2956e845a8dde",
       "status": "synced"
     },
     "services/metaAdsPushService.js": {
       "backendHash": "95f5c3486f73d01b233162d3a62900a59c8cee5d49aecf7c96332fca1beee81f",
+      "adgenHash": "95f5c3486f73d01b233162d3a62900a59c8cee5d49aecf7c96332fca1beee81f",
       "backendSha": "9d6322978bc28b080da3db6aaf510d113b0ea216",
       "status": "synced"
     },
     "services/metaApiVersion.js": {
       "backendHash": "92c4f74b95184b3c1d089c32e9194ebf738ae7ac598fd7491fb781f336745562",
+      "adgenHash": "92c4f74b95184b3c1d089c32e9194ebf738ae7ac598fd7491fb781f336745562",
       "backendSha": "218c8beb93a1621a1a3e62e7cfb2956e845a8dde",
       "status": "synced"
     },
     "services/metaCascadeConfig.js": {
       "backendHash": "991b6974b18190bd16dc1902ed8b05dcfb9b06ae3d0f734d387abfe1a012a1fe",
+      "adgenHash": "991b6974b18190bd16dc1902ed8b05dcfb9b06ae3d0f734d387abfe1a012a1fe",
       "backendSha": "119b668472c4dffbdb63c3d3dc588a16b9573103",
       "status": "synced"
     },
     "services/metaCascadeResolver.js": {
       "backendHash": "5eb1c61fd3c9d19b79c832f93a31153b4597f7fedc0d4a06c800a7186573063c",
+      "adgenHash": "5eb1c61fd3c9d19b79c832f93a31153b4597f7fedc0d4a06c800a7186573063c",
       "backendSha": "21da82d711a808e4067e548ea24f70415bffb4d6",
       "status": "synced"
     },
     "services/moderationSeedFallback.js": {
       "backendHash": "a84aaa641292abeaa3a553c85f0aaa0f856a0ccd7d279d6999432d5a31a8005e",
+      "adgenHash": "a84aaa641292abeaa3a553c85f0aaa0f856a0ccd7d279d6999432d5a31a8005e",
       "backendSha": "149862fdcde316f7d22a706bf627d7ca9f9f091e",
       "status": "synced"
     },
     "services/nerService.js": {
       "backendHash": "68bd7068e9f871899d02d94048ba2ba28bd94eff024cc54dfcd36c95ebebbcc4",
+      "adgenHash": "68bd7068e9f871899d02d94048ba2ba28bd94eff024cc54dfcd36c95ebebbcc4",
       "backendSha": "872c40ef6b92738038a5d89903afa67954263b1d",
       "status": "unused",
       "reason": "backend NER; adgen does not call it"
     },
     "services/openaiService.js": {
       "backendHash": "81669aad712ccf6e38a8de49ce3dbcea380c861fa275d492ccbc8f64753cf6d6",
+      "adgenHash": "81669aad712ccf6e38a8de49ce3dbcea380c861fa275d492ccbc8f64753cf6d6",
       "backendSha": "9c6e1147d53cf16c59c0cf8ddde49e8908f67569",
       "status": "unused",
       "reason": "backend OpenAI wrapper; adgen spends via Atlas"
     },
     "services/overlayPlacementService.js": {
       "backendHash": "ba03d34b3ef993241cf80c9137322e3a3f40d2344c17701587d871f3a0af5a65",
+      "adgenHash": "ba03d34b3ef993241cf80c9137322e3a3f40d2344c17701587d871f3a0af5a65",
       "backendSha": "567d8065a89dacd39475c50b760ecb2f0b133ad4",
       "status": "synced"
     },
     "services/overlayZoneService.js": {
       "backendHash": "804039cce95310cedb4d1585cfad98aad991e99aafe895df50ee23562c50ac30",
+      "adgenHash": "804039cce95310cedb4d1585cfad98aad991e99aafe895df50ee23562c50ac30",
       "backendSha": "ba99a59f10619bbd940be9442c8852dc32ae278a",
       "status": "synced"
     },
     "services/perProductReasons.js": {
       "backendHash": "4a528d2d7c3d57d3787e531be79521c5000e20fe9b322ef0231917903b49df10",
+      "adgenHash": "4a528d2d7c3d57d3787e531be79521c5000e20fe9b322ef0231917903b49df10",
       "backendSha": "3c608b86c4f356a7ac3983e1704dc2279a71002b",
       "status": "synced"
     },
     "services/plateIntelService.js": {
       "backendHash": "70c38fc7fc4704194866c884326aeeb3fc02a0b2bdf8902ffbad87b9895dc6e7",
+      "adgenHash": "97bf9b67e94b5fc96ba4c987ac9e2756bd1fda435dbb972d0a93e7276283dc89",
       "backendSha": "2d93ace1f79a7d91c7aede75667fb4d8c4e48a23",
       "status": "fork",
       "reason": "Backend #329 added an ids={} third param to semanticScan but never wires it into the title_plate_scan chatCompletion call (verified: zero 'ids.' reads anywhere in backend's function body) — a scaffold-only change on backend's side. adgen's semanticScan/analyzePlate already fully destructure and thread brandId/productId/adId/campaignRunId into the same call (plateIntelService.js:175,238, adgen #43); adgen is ahead of backend on this specific hunk. PORTED 2026-08-24: backend #307 (dabceaf4) surface-aware keep-out bands — SURFACE_INSETS, LOWER_THIRD_TOP/BAND_LEAD_IN, bandsFor(safeZoneKey), REFERENCE_BAND_H rescale in applyFaceKeepOut, bandRect(bandKey, safeZoneKey), analyzeFrameBands reading bandsFor(opts.safeZoneKey) — with adgen's brandId/productId/adId/campaignRunId params on analyzePlate preserved alongside the new safeZoneKey param. Verified via scripts/verifyKeepOutBandGeometry.mjs (25 checks incl. cross-module pin against src/remotion/lib/safeZones.js). Prior reason unchanged: adgen extract is smaller than backend (backend grew after the copy). FOLLOW-UP FIX 2026-08-24 (same day): the port above was itself inert — nothing ever called this file's bandsFor with a real safeZoneKey, because neither renderTitles call site in brandScriptExecutor.js computed one. Added resolveSafeZoneKeyCjs({format, platformFormat}) next to SURFACE_INSETS, a CJS mirror of remotion/lib/safeZones.js's resolveSafeZoneKey (same mirror-not-import pattern as SURFACE_INSETS itself), pinned against drift by new harness groups I/J/K. bandsFor/bandRect/SURFACE_INSETS themselves are unchanged by this follow-up."
     },
     "services/platformFormats.js": {
       "backendHash": "6e0a24cbf76a019e1425599a2c6411d8012962f80915fb474a699c3e003a8cde",
+      "adgenHash": "6e0a24cbf76a019e1425599a2c6411d8012962f80915fb474a699c3e003a8cde",
       "backendSha": "d143161a6927f877800852e8416f90e87da64ff4",
       "status": "synced"
     },
     "services/pmaxSplitStrategy.js": {
       "backendHash": "d227762c157ac3a788b3ad02da73dd9c393e127bdb3c70e39d67d2f3d4a9552c",
+      "adgenHash": "d227762c157ac3a788b3ad02da73dd9c393e127bdb3c70e39d67d2f3d4a9552c",
       "backendSha": "3f642e26a91fae20bea5488140f84bf110c0c207",
       "status": "synced"
     },
     "services/productMatchHydration.js": {
       "backendHash": "1bd4b994501b75f51bba050eb32491fd7e2809654eaa112e130fac284251a729",
+      "adgenHash": "1bd4b994501b75f51bba050eb32491fd7e2809654eaa112e130fac284251a729",
       "backendSha": "d69a7313d4b0c17d1acaf6cbb6c4485770f15c9c",
       "status": "synced"
     },
     "services/progressService.js": {
       "backendHash": "a7b2764196954c4fbaa95a25b92aad6b7b65c54712c68c9bd239d018faa47a89",
+      "adgenHash": "a7b2764196954c4fbaa95a25b92aad6b7b65c54712c68c9bd239d018faa47a89",
       "backendSha": "11041776698f92dc4ff03c60894052d70e05e883",
       "status": "synced"
     },
     "services/providers/geminiSearchProvider.js": {
       "backendHash": "cbecc38bf7bb05c8a49b07ef3fcb8440f4295d0db1e39eff5201e39571fd6287",
+      "adgenHash": "780f22b15aee607fe4f35580e344f88fc859a718c76c29dc7462812e5d717b7f",
       "backendSha": "1acb49bd9775eb79848fcb05d9a7289bbd3efa6b",
       "status": "fork",
       "reason": "NOT PORTED, deliberately. Backend #331 threaded brandId/productId through this and three other previously unledgered cost producers so their CostLog rows attribute correctly. This provider runs BACKEND-side only (the Gemini grounded-search review gap-fill); adgen's copy is unwired, so the attribution fix has nothing to attribute here. NOTE: this module produces the llm-web review quotes, which print TEXT ONLY with every byline stripped — read services/quoteProvenance.js before wiring this copy."
     },
     "services/pushToShopify.js": {
       "backendHash": "96cbcabfb6b4172eab832b7d94d6154e38160a567537f67bb3c9f3af6f59b151",
+      "adgenHash": "96cbcabfb6b4172eab832b7d94d6154e38160a567537f67bb3c9f3af6f59b151",
       "backendSha": "f48648fc045cef0c2b5ee44e32217078932db612",
       "status": "unused",
       "reason": "Shopify push is backend-owned"
     },
     "services/queuedArchiveSweeper.js": {
       "backendHash": "2c117638c9123043f1b12ce6e0e10ff633d4a35456976bb24f9429f9c0859c56",
+      "adgenHash": "2c117638c9123043f1b12ce6e0e10ff633d4a35456976bb24f9429f9c0859c56",
       "backendSha": "a1cdd39c497856a82e126aac835fcbe9f6e76d8c",
       "status": "unused",
       "reason": "backend archive sweeper; not wired into adgen entrypoint"
     },
     "services/quoteColourway.js": {
       "backendHash": "d78b03b18bc07b1e663a1c295dfeefa64ace46adae1460ec3acab143da711c49",
+      "adgenHash": "d78b03b18bc07b1e663a1c295dfeefa64ace46adae1460ec3acab143da711c49",
       "backendSha": "d8c133011275d62fa4133ed939b5e47fe5e90bdc",
       "status": "synced"
     },
     "services/quoteProvenance.js": {
       "backendHash": "60b30bc103fe267f5a82ca0a29237c32dcb0fc61e1a7471e74ff1d3fb32bdcd7",
+      "adgenHash": "c8dbb41a0e305fcfd218be0c04d104182ee7ee17eee04541f4380c7fa72d50c5",
       "backendSha": "d8c133011275d62fa4133ed939b5e47fe5e90bdc",
       "status": "fork",
       "reason": "comment-only: adgen dropped CLAUDE.md §4 cross-ref; colourway sibling comment ported from backend #324"
     },
     "services/quoteRotationService.js": {
       "backendHash": "6f6f4e1c5a767e472bdbe3793eede2eb8518cb2ac0e915d559eb9db12c5c7469",
+      "adgenHash": "6f6f4e1c5a767e472bdbe3793eede2eb8518cb2ac0e915d559eb9db12c5c7469",
       "backendSha": "d8c133011275d62fa4133ed939b5e47fe5e90bdc",
       "status": "synced"
     },
     "services/quoteSnippetService.js": {
       "backendHash": "d5f4a2e9c1829ac711e7db572787880d56200e5ac320ba1c74f9ec2108dea0f8",
+      "adgenHash": "74a05ea0e3a56b4b3dcd9af15775f98ac612bb9687b63b3b906fe4d368015273",
       "backendSha": "3a3c06bd217ac36e4fa23c19ac9934a226256764",
       "status": "fork",
       "reason": "adgen-only per-process LRU cache added in a391de8 (kills duplicate extractSnippet LLM calls: 9 ads, identical review text, one ~15s call each). NOT a permanent fork — backend's copy still has the duplicating behaviour (services/quoteSnippetService.js cacheKey:null at :524/:710, no LRU), so backend is paying the same bill. PORT PENDING to backend; re-reconcile as synced once ported."
     },
     "services/ratingDisplay.js": {
       "backendHash": "da5d1a8454ff8bcf1dc9e35b73656c9ec31b33e49691b3e92587323db985e8e7",
+      "adgenHash": "da5d1a8454ff8bcf1dc9e35b73656c9ec31b33e49691b3e92587323db985e8e7",
       "backendSha": "887b4f46a43e3c99d8e86bb34788dfc2bec9b323",
       "status": "synced"
     },
     "services/ratingPairAtomic.js": {
       "backendHash": "d4526a179fe899e76486718a2207a1da5686503f0b61ed44efc7acbaf2fe1b0d",
+      "adgenHash": "d4526a179fe899e76486718a2207a1da5686503f0b61ed44efc7acbaf2fe1b0d",
       "backendSha": "d69a7313d4b0c17d1acaf6cbb6c4485770f15c9c",
       "status": "synced"
     },
     "services/referenceDefaultsService.js": {
       "backendHash": "3ff6f2822ea75fb6c49de2272d32ab32cc3f0af2a115cdfcb32ec77f50fb34fd",
+      "adgenHash": "3ff6f2822ea75fb6c49de2272d32ab32cc3f0af2a115cdfcb32ec77f50fb34fd",
       "backendSha": "d059ffadb41ca760ac364ab58580de74e061286d",
       "status": "synced"
     },
     "services/reframeStrategyChooser.js": {
       "backendHash": "d551435320a09e987b3d721f9e7207eadc26045c58529716d05b75f45e1ca3ce",
+      "adgenHash": "d551435320a09e987b3d721f9e7207eadc26045c58529716d05b75f45e1ca3ce",
       "backendSha": "3831681af745c2e2cb062e996f29c1e53e6d8712",
       "status": "synced"
     },
     "services/remotionRenderService.js": {
       "backendHash": "52604a214dd53d237632c0b76581e4aeca7c82e043d008a1630e34f3f7d4978a",
+      "adgenHash": "a1220c1dcf518e3464b7b01e1b1b63e828454ce0c7941f4a949a435024ee6229",
       "backendSha": "dabceaf47fc8db7671a7d8f812024d550e66287a",
       "status": "fork",
       "reason": "adgen child-supervisor / isolation path; not a wholesale copy. PORTED 2026-08-24: backend #307 (dabceaf4) safeZoneKey threading — renderTitlesJob's analyzePlate call now passes safeZoneKey alongside adgen's existing brandId/productId/adId/campaignRunId params, its applyFaceKeepOut call now passes safeZoneKey, and both of renderPreview's analyzePlate calls now pass safeZoneKey. Without this the plateIntelService.js #307 fix is reachable in code but never exercised (a caller-supplied safeZoneKey would be silently dropped) — see scripts/verifyKeepOutBandGeometry.mjs groups E/H, mutation-proven to catch exactly this drop."
     },
     "services/renderErrorFields.js": {
       "backendHash": "0efda9eab3d25ab7f1a1efa8f8ca3cc8f5f2ca93a9a56319f0ecb3de0aa0d748",
+      "adgenHash": "42ab12d84c721b4d6dde9fab255af64a9046c137d25d7fb8017a7f121e7977fb",
       "backendSha": "36aedfa35e671da580d3e1d323431f431752b576",
       "status": "fork",
       "reason": "comment-only: adgen header omits the (adgen) parenthetical; clip/NUL contract matches backend #326 (adgen #19 twin)."
     },
     "services/reviewAdapters/bazaarvoice.js": {
       "backendHash": "5edbca2aaf5780b76337f2ba281a80ce28ba2a50a64462330cfd941ce67d02b9",
+      "adgenHash": "5edbca2aaf5780b76337f2ba281a80ce28ba2a50a64462330cfd941ce67d02b9",
       "backendSha": "c317d0803180b30aea22e8c88ea03ec48fce9534",
       "status": "unused",
       "reason": "only required from unused reviewAdapters/index.js; adgen uses helpers.js only"
     },
     "services/reviewAdapters/fera.js": {
       "backendHash": "980df71c29b9c5f577b0da5c0aed4bcf16a861bba96df2ae0a662fee6fcbbc4b",
+      "adgenHash": "980df71c29b9c5f577b0da5c0aed4bcf16a861bba96df2ae0a662fee6fcbbc4b",
       "backendSha": "c317d0803180b30aea22e8c88ea03ec48fce9534",
       "status": "unused",
       "reason": "only required from unused reviewAdapters/index.js; adgen uses helpers.js only"
     },
     "services/reviewAdapters/helpers.js": {
       "backendHash": "4d2e1abc587285f931ad34fa0cd4488695100036561b9a6427ecdd48ae9435d1",
+      "adgenHash": "4d2e1abc587285f931ad34fa0cd4488695100036561b9a6427ecdd48ae9435d1",
       "backendSha": "c317d0803180b30aea22e8c88ea03ec48fce9534",
       "status": "synced"
     },
     "services/reviewAdapters/index.js": {
       "backendHash": "7dbf954e67a57afc9293b2bee446f70bebd24fab4b93302945b7dbe83d56b549",
+      "adgenHash": "7dbf954e67a57afc9293b2bee446f70bebd24fab4b93302945b7dbe83d56b549",
       "backendSha": "c317d0803180b30aea22e8c88ea03ec48fce9534",
       "status": "unused",
       "reason": "adapter fan-out is backend scrape; adgen only requires helpers.js via quoteRotationService"
     },
     "services/reviewAdapters/judgeme.js": {
       "backendHash": "5a7ec447d01513296630bcd46a93a1d27aa27195ed22e9a8917490763fca7bfa",
+      "adgenHash": "5a7ec447d01513296630bcd46a93a1d27aa27195ed22e9a8917490763fca7bfa",
       "backendSha": "c317d0803180b30aea22e8c88ea03ec48fce9534",
       "status": "unused",
       "reason": "only required from unused reviewAdapters/index.js; adgen uses helpers.js only"
     },
     "services/reviewAdapters/junip.js": {
       "backendHash": "d1fce186396fad2b999771cbef58869222e424436249b9b00343c310cf486787",
+      "adgenHash": "d1fce186396fad2b999771cbef58869222e424436249b9b00343c310cf486787",
       "backendSha": "c317d0803180b30aea22e8c88ea03ec48fce9534",
       "status": "unused",
       "reason": "only required from unused reviewAdapters/index.js; adgen uses helpers.js only"
     },
     "services/reviewAdapters/okendo.js": {
       "backendHash": "f41c6ee6207f965ae878ec7966aad643040e0f690c64fba2783b125dbc9621ba",
+      "adgenHash": "f41c6ee6207f965ae878ec7966aad643040e0f690c64fba2783b125dbc9621ba",
       "backendSha": "c317d0803180b30aea22e8c88ea03ec48fce9534",
       "status": "unused",
       "reason": "only required from unused reviewAdapters/index.js; adgen uses helpers.js only"
     },
     "services/reviewAdapters/powerreviews.js": {
       "backendHash": "ab82c2bd0c39b38c6efa99bb74cda3e7a6bf9110af3e2ac5634929ea5da282d9",
+      "adgenHash": "ab82c2bd0c39b38c6efa99bb74cda3e7a6bf9110af3e2ac5634929ea5da282d9",
       "backendSha": "c317d0803180b30aea22e8c88ea03ec48fce9534",
       "status": "unused",
       "reason": "only required from unused reviewAdapters/index.js; adgen uses helpers.js only"
     },
     "services/reviewAdapters/reviewsio.js": {
       "backendHash": "847627e58904b873971958fae1f3882e89e1fa60b7182c480beb4c46072b7dd9",
+      "adgenHash": "847627e58904b873971958fae1f3882e89e1fa60b7182c480beb4c46072b7dd9",
       "backendSha": "c317d0803180b30aea22e8c88ea03ec48fce9534",
       "status": "unused",
       "reason": "only required from unused reviewAdapters/index.js; adgen uses helpers.js only"
     },
     "services/reviewAdapters/stamped.js": {
       "backendHash": "8d9668da3a73f8af44ca48c95f1b928a7f03e3f4e8e17151157dcd33ccf7bf1b",
+      "adgenHash": "8d9668da3a73f8af44ca48c95f1b928a7f03e3f4e8e17151157dcd33ccf7bf1b",
       "backendSha": "c317d0803180b30aea22e8c88ea03ec48fce9534",
       "status": "unused",
       "reason": "only required from unused reviewAdapters/index.js; adgen uses helpers.js only"
     },
     "services/reviewAdapters/yotpo.js": {
       "backendHash": "2d00b525ceefc9583167ac363d0b01259c05bb454c556105b2420d87b9c35d1a",
+      "adgenHash": "2d00b525ceefc9583167ac363d0b01259c05bb454c556105b2420d87b9c35d1a",
       "backendSha": "c317d0803180b30aea22e8c88ea03ec48fce9534",
       "status": "unused",
       "reason": "only required from unused reviewAdapters/index.js; adgen uses helpers.js only"
     },
     "services/reviewSiteProfileService.js": {
       "backendHash": "a51b54a019353d6fee7b31859ef23a34f16cc6f15510f79590a18eee82cd1cc9",
+      "adgenHash": "a51b54a019353d6fee7b31859ef23a34f16cc6f15510f79590a18eee82cd1cc9",
       "backendSha": "d26d32bae585507c5f1c3a681ee2eb602ce979c4",
       "status": "unused",
       "reason": "backend review-site admin; adgen does not call it"
     },
     "services/reviewSiteProfiles.json": {
       "backendHash": "0071522095fcb4593c7d2d1f3de8736e8d3bf60689940053df650e44cdbb3fbd",
+      "adgenHash": "0071522095fcb4593c7d2d1f3de8736e8d3bf60689940053df650e44cdbb3fbd",
       "backendSha": "d26d32bae585507c5f1c3a681ee2eb602ce979c4",
       "status": "synced"
     },
     "services/runFeedService.js": {
       "backendHash": "bae1670bd36705c2e5306c7bb0abe9272152d776655a7842d46636d2c5af3de1",
+      "adgenHash": "bb962b3eb0dfb8173666e9489c296f754d08e2ce792503c7ea49e44591dfd00c",
       "backendSha": "49e086928bd936142a967b99c1ded9f653ebc604",
       "status": "fork",
       "reason": "adgen attachAd: READ CampaignRun.slackFeed (backend startRun's in-memory adToRun lives in a different process) and thread under the existing parent; never create a parent from adgen roles. Additive source tag on formatThreadLine/onStage/noteEvent so renderer/titler/resume/boot-recovery events name their subsystem."
     },
     "services/salesDemosService.js": {
       "backendHash": "eaea9fa1bed266f7c8abb885aaa649c12165efb5d8744398134e7793ba3a226e",
+      "adgenHash": "eaea9fa1bed266f7c8abb885aaa649c12165efb5d8744398134e7793ba3a226e",
       "backendSha": "f78e8b5691b3465e2275ea0d71d9f2ff8aef87d2",
       "status": "unused",
       "reason": "sales-demo admin is backend-owned"
     },
     "services/seededUniverseService.js": {
       "backendHash": "a455af05ca91586c5fb5f0e63cf8087aa0745acebd0b7f921a414d301b645289",
+      "adgenHash": "a455af05ca91586c5fb5f0e63cf8087aa0745acebd0b7f921a414d301b645289",
       "backendSha": "815692852bf3fe89aa23bcc313ceb41c22682e09",
       "status": "synced"
     },
     "services/semaphore.js": {
       "backendHash": "aac2d3668b0e13db95c7ba67cfb83c2524165867821022d06f3873289badec40",
+      "adgenHash": "aac2d3668b0e13db95c7ba67cfb83c2524165867821022d06f3873289badec40",
       "backendSha": "2137944c70a26ba115c72379a846d39ec4eb6e76",
       "status": "unused",
       "reason": "backend semaphore helper; no adgen caller"
     },
     "services/shotTypeRank.js": {
       "backendHash": "10d365dae48beedf6c035665fbdca87f479962475a11fd83600ba1268ede6776",
+      "adgenHash": "392d03a90dede955a61b0768b2a60d287d0a2e886c1d39ad0301b7ef24012603",
       "backendSha": "6c59c64ee0c353c3121beaa0e9738b96241fbf08",
       "status": "synced"
     },
     "services/slackRunVerbosity.js": {
       "backendHash": "9b6cc15dfdb39bb3c0fdb331c67a477d994ce4461facea66762a570d65702260",
+      "adgenHash": "9b6cc15dfdb39bb3c0fdb331c67a477d994ce4461facea66762a570d65702260",
       "backendSha": "aa827fae13d75e402ab8cccb87bac66cb48768fc",
       "status": "synced"
     },
     "services/slotBudget.js": {
       "backendHash": "863137873675bee009a21af24f3bd45f06581216c573990b2f4bc255aceaba98",
+      "adgenHash": "863137873675bee009a21af24f3bd45f06581216c573990b2f4bc255aceaba98",
       "backendSha": "fcfec6f884a059990e4a415930555f06a353ed90",
       "status": "synced"
     },
     "services/spendGuard.js": {
       "backendHash": "e587076ebfe7e0199643a05db828c82c82bf487b83246952b590db2cbdf71e64",
+      "adgenHash": "e587076ebfe7e0199643a05db828c82c82bf487b83246952b590db2cbdf71e64",
       "backendSha": "e724b8ba96564abdc69b77729833b6b9e2e0e201",
       "status": "unused",
       "reason": "backend spend cap; adgen has costTracker but does not require spendGuard (look before wiring — money-adjacent)"
     },
     "services/spendReceipt.js": {
       "backendHash": "12b7b031888b682b9f7a9f7490f08cb894b173d90d9197bea554419340b6cdc6",
+      "adgenHash": "12b7b031888b682b9f7a9f7490f08cb894b173d90d9197bea554419340b6cdc6",
       "backendSha": "322bc3a1bbd5f9bca5c4360c7c89c2e550f2e935",
       "status": "unused",
       "reason": "only reached from unused spendGuard (look before wiring — money-adjacent)"
     },
     "services/staleness.js": {
       "backendHash": "136732eeb99b3d46f9d39910319803759bd45fd58d6eb810ec1492a41c8a1aa6",
+      "adgenHash": "136732eeb99b3d46f9d39910319803759bd45fd58d6eb810ec1492a41c8a1aa6",
       "backendSha": "3e74430437eca33fbdcc019bfd2b4736cfa7fc04",
       "status": "synced"
     },
     "services/staticAdIntents.js": {
       "backendHash": "b1e1763ef7482c536ffd2a5a5e2e4a9361e0951977a7c57e247ec4c6be02ecdf",
+      "adgenHash": "303634652afbf87d9bb2967a42b7b3e4ac3d914e7a1cb54e0cfd1dedb08f4e65",
       "backendSha": "7cc2c7dfbada49e800d3fd0cc1899e9735c425cb",
       "status": "fork",
       "reason": "hunk-ported backend #325 (adgen #18); remaining divergence is not a wholesale copy"
     },
     "services/staticPipeline.js": {
       "backendHash": "52b48bf6fcbe9a7723c682dcf0c18e35f7819a8e27f6a39704807bec07e49927",
+      "adgenHash": "52b48bf6fcbe9a7723c682dcf0c18e35f7819a8e27f6a39704807bec07e49927",
       "backendSha": "01e7d1ced2ea244a487eff0081806e446860d978",
       "status": "synced"
     },
     "services/strandedRunSweeper.js": {
       "backendHash": "d549c622db3c730cf8307f9065f1060f34f630b41d5903eacc93c25dcf12b014",
+      "adgenHash": "d549c622db3c730cf8307f9065f1060f34f630b41d5903eacc93c25dcf12b014",
       "backendSha": "d4de65a7f0ad153cefd84839db4eb6225d7ae3fd",
       "status": "unused",
       "reason": "backend stranded-run sweeper; not wired into adgen entrypoint (look before wiring)"
     },
     "services/superAdminService.js": {
       "backendHash": "bd66c9adc0c29a8b23d57474d94acf0811684ec8c2c160425274c756edcba573",
+      "adgenHash": "bd66c9adc0c29a8b23d57474d94acf0811684ec8c2c160425274c756edcba573",
       "backendSha": "53fcee2171b7f7d6439223de3623a09f338f36c7",
       "status": "unused",
       "reason": "backend super-admin surface; adgen does not call it"
     },
     "services/systemConfigService.js": {
       "backendHash": "c6786774ace53c6456ff56f7a749cd926725de34a8f2de9608fb24b8ecb81995",
+      "adgenHash": "2e34c2f2ae3aa74c77d8b9386fc07163c42fe2476ecafd61a405437318d533d1",
       "backendSha": "aff3488d494ee7484d27971920a2b96e438e60fd",
       "status": "fork",
       "reason": "adgen QC resolvers still fall through to env; backend does not"
     },
     "services/tailwindTokenExtractor.js": {
       "backendHash": "b82e5e5ee6b147e9b98340d108513270fc645d291824bd388cd4dfd4e09e8d22",
+      "adgenHash": "b82e5e5ee6b147e9b98340d108513270fc645d291824bd388cd4dfd4e09e8d22",
       "backendSha": "4eddd59c3066e0525c3bf29a4bb78d108f430c53",
       "status": "synced"
     },
     "services/templateRegistry.js": {
       "backendHash": "35b42275fc3f2cd340454902e2ac0d2f12db4e4cd9d2350ae400ce5f9197138a",
+      "adgenHash": "35b42275fc3f2cd340454902e2ac0d2f12db4e4cd9d2350ae400ce5f9197138a",
       "backendSha": "29be84b4b51006f18e512aea8727d2eff383dc93",
       "status": "synced"
     },
     "services/textEmbeddingService.js": {
       "backendHash": "86ef2b68438c3ff4d0f3a71b5949d4fbd4a5048a3b111818e633e5e399bb3c3c",
+      "adgenHash": "89fd121615f484cd06c5abfa308867c91764b77329c0b99e3e525104756749fa",
       "backendSha": "ba99a59f10619bbd940be9442c8852dc32ae278a",
       "status": "unused",
       "reason": "Backend #329 added brandId/productId/adId/campaignRunId to both trackLlmCall meta objects in embed() (atlas + direct-openai-fallback paths); irrelevant — reconfirmed zero require() sites in adgen src/ (one doc-comment mention in models/CatalogProduct.js:105). Backend embeddings; adgen does not call it."
     },
     "services/titleSpecService.js": {
       "backendHash": "8a917f9e8acec42c94bca8db1f13effe9fab96e464d051c8d2ab308a0b60286d",
+      "adgenHash": "8a917f9e8acec42c94bca8db1f13effe9fab96e464d051c8d2ab308a0b60286d",
       "backendSha": "d646c2fde5ef64ccb83ea0c464dbd893a041228e",
       "status": "synced"
     },
     "services/titleSpecValidator.js": {
       "backendHash": "a5115a6bea073308c780d5cd3cdeb51dbdd948272d34af780f2365dc1c40b122",
+      "adgenHash": "a5115a6bea073308c780d5cd3cdeb51dbdd948272d34af780f2365dc1c40b122",
       "backendSha": "45403d733434bb216d5ec8ea3a09756e9803c97b",
       "status": "synced"
     },
     "services/titlingResumeService.js": {
       "backendHash": "fd938acd3cbd1060ae81351da372442d53dd5dafc1bd728908226f15ff9d758d",
+      "adgenHash": "74cc31a25e9f56fec8abedbcbb14942556434836b7df96d07044e2abc03844a6",
       "backendSha": "e5f4a3ffb9890f84858fb1ad453a9c9f7059d58d",
       "status": "unused",
       "reason": "adgen-only QC-verdict guard + remotion-child-OOM retry; only required from unwired bootRecoveryService. Looked at backend #326 child-tail persist — already present."
     },
     "services/ugcVideoPipeline.js": {
       "backendHash": "2a7c1390a0bd0c46f2f361fb6eb445a9b55bbb225ada35adb6fdc84b5601d78e",
+      "adgenHash": "2a7c1390a0bd0c46f2f361fb6eb445a9b55bbb225ada35adb6fdc84b5601d78e",
       "backendSha": "d162f48d5e77f2231268a03cdac9e74bff614575",
       "status": "unused",
       "reason": "backend UGC pipeline; adgen renderer does not call it"
     },
     "services/veoPromptBuilder.js": {
       "backendHash": "5b86ddd125b465106d14cd9eb7ec7bc3d907ac2ce3f259f929b0c13393593c6b",
+      "adgenHash": "630344943f9fa2ee13039e68f9a5fee8a21d54b4ea72c24c3a08061415fc25b9",
       "backendSha": "9531ae9f73d5ad9773bddff9c87d19890873ea59",
-      "status": "fork",
-      "reason": "adgen-only production fix 2026-08-26: stop interpolating catalog title as 'Product: {title}' into the camera prompt (Omni rendered 'Vaportek' as an on-garment brand lockup on a Pelagic Gear master). Backend copy is still the pre-fix blob; a human must apply the same edit in liquidretail_backend/services/veoPromptBuilder.js once backend work is unblocked, then re-reconcile to synced."
+      "status": "unported",
+      "reason": "Catalog-title interpolation fix (Vaportek incident 2026-08-26): adgen stopped interpolating 'Product: {title}' into the Omni camera prompt after Omni rendered the catalog title as an on-garment brand lockup and vision-QC terminal-rejected a $0.90 Pelagic master. The backend copy is still the pre-fix blob. Was recorded as status=fork with this obligation in prose, which nothing could act on; it is a debt, not a deliberate divergence.",
+      "portTo": "backend",
+      "owedSince": "2026-08-27T02:05:09.135Z"
     },
     "services/veoStoryboardService.js": {
       "backendHash": "4e3d420b3a6219b72f25dc95aac6afa679ea5c23a7c3627d1abcb9ba9f5bf344",
+      "adgenHash": "4e3d420b3a6219b72f25dc95aac6afa679ea5c23a7c3627d1abcb9ba9f5bf344",
       "backendSha": "29285f2a4fa18b57b87ef0821276fcaea8527470",
       "status": "synced"
     },
     "services/videoCompositeService.js": {
       "backendHash": "5f146c94b3f93c548e34d50fe1a7d2be725e17975c0094669f92030e484d6625",
+      "adgenHash": "5f146c94b3f93c548e34d50fe1a7d2be725e17975c0094669f92030e484d6625",
       "backendSha": "e283b6cf7be494ca4aade2a1514cff2c047d8d03",
       "status": "unused",
       "reason": "backend composite helper; no adgen caller"
     },
     "services/videoCropUrl.js": {
       "backendHash": "bab907c0a8b60ac8b06a8a0c93b962d30a248fff4c5bf8ca46db2990342b6b34",
+      "adgenHash": "bab907c0a8b60ac8b06a8a0c93b962d30a248fff4c5bf8ca46db2990342b6b34",
       "backendSha": "bcadd29d23ebe7617cfb427d64ab238e8e7c963c",
       "status": "synced"
     },
     "services/videoFrameService.js": {
       "backendHash": "de07c2f311c16c97b9fd08103a5fdf1165999ad2f9a9b8a2ba407cc5da95607c",
+      "adgenHash": "de07c2f311c16c97b9fd08103a5fdf1165999ad2f9a9b8a2ba407cc5da95607c",
       "backendSha": "b06248af38a4e88139c5c0fd438b997ff7084b55",
       "status": "synced"
     },
     "services/videoHeadlineService.js": {
       "backendHash": "568b6409d5c81f8290aea4f9566294ab3b65e55fa5e1f5df2fad903b704eaa46",
+      "adgenHash": "568b6409d5c81f8290aea4f9566294ab3b65e55fa5e1f5df2fad903b704eaa46",
       "backendSha": "11c58bd01b8c34d8f8de1a1e365bec1d37aabccc",
       "status": "synced"
     },
     "services/videoPreviewUrl.js": {
       "backendHash": "e4b0d8586e05fdef53f11952d3c95c7b40549f1aec10e3fa54e63d622bb7c2cf",
+      "adgenHash": "e4b0d8586e05fdef53f11952d3c95c7b40549f1aec10e3fa54e63d622bb7c2cf",
       "backendSha": "64371b975ee4033273b1b33288f84ccdc6a32e65",
       "status": "unused",
       "reason": "backend preview helper; no adgen caller"
     },
     "services/videoProductAnchor.js": {
       "backendHash": "a4624bd2eb4fa3641e356a5e9276faf27e2987889c186080b6332e5926308e3e",
+      "adgenHash": "a4624bd2eb4fa3641e356a5e9276faf27e2987889c186080b6332e5926308e3e",
       "backendSha": "9809eca4ca159fd479901b5fb2c77692f04e9d48",
       "status": "synced"
     },
     "services/videoQcFrameSelectionService.js": {
       "backendHash": "610e1947487419a4e5a76dfe261fbc88690dc3c0d580bc7b815ffa15061d8668",
+      "adgenHash": "610e1947487419a4e5a76dfe261fbc88690dc3c0d580bc7b815ffa15061d8668",
       "backendSha": "b06248af38a4e88139c5c0fd438b997ff7084b55",
       "status": "synced"
     },
     "services/videoRefPrewarmService.js": {
       "backendHash": "0fdd841a7e9d272a3d8e5dc7eb2b570162aca4d64dfa2e0206718cce97dd7dd1",
+      "adgenHash": "0fdd841a7e9d272a3d8e5dc7eb2b570162aca4d64dfa2e0206718cce97dd7dd1",
       "backendSha": "0319c68ef8db75f520d104f7b5651d70d39a6995",
       "status": "unused",
       "reason": "backend ref-prewarm; no adgen caller"
     },
     "services/videoRouter.js": {
       "backendHash": "f23861150ec146820336da11db4459c5abdf001b8ce926b518e28d328b7fe247",
+      "adgenHash": "43f3cd3d6a555a50643aeb544e77c821c081da326166addbcef0f44aae6e6022",
       "backendSha": "87cfdd0085127c63b70ff69b13cd16db463eca1d",
       "status": "fork",
       "reason": "threads generateForAd's new allowResume parameter through to atlasVideoService.generateForAd — see services/atlasVideoService.js's reconcile reason for the full context. Backend's videoRouter.js does not need this yet since it doesn't have the parameter to thread."
     },
     "services/whisperService.js": {
       "backendHash": "5d6e707d7298527e9de75225a5210219ab565e55c46ebd97d72c078df5402ba3",
+      "adgenHash": "5d6e707d7298527e9de75225a5210219ab565e55c46ebd97d72c078df5402ba3",
       "backendSha": "9c6e1147d53cf16c59c0cf8ddde49e8908f67569",
       "status": "unused",
       "reason": "backend transcription; adgen does not call it"
     },
     "services/yoloService.js": {
       "backendHash": "af1180cc6933c63795970897f4c4534405124b1eea4d839416c5f02a809c2222",
+      "adgenHash": "af1180cc6933c63795970897f4c4534405124b1eea4d839416c5f02a809c2222",
       "backendSha": "d100254deb3b1779813033fc65959488070e6055",
       "status": "unused",
       "reason": "backend detection; adgen does not call it"
     },
     "utils/colorContrast.js": {
       "backendHash": "0592b22f7bb40d089c11157ea75252b3060d87c80cf1b119df88e8c639986eb3",
+      "adgenHash": "0592b22f7bb40d089c11157ea75252b3060d87c80cf1b119df88e8c639986eb3",
       "backendSha": "567d8065a89dacd39475c50b760ecb2f0b133ad4",
       "status": "synced"
     },
     "utils/contrastGuard.js": {
       "backendHash": "a94914d0a4554db70fafe060034a67954f1cc70749e6ff8392677f23cf5bd923",
+      "adgenHash": "a94914d0a4554db70fafe060034a67954f1cc70749e6ff8392677f23cf5bd923",
       "backendSha": "8c893f3cdbd46f301e9446a4c0990101014a8738",
       "status": "synced"
     },
     "utils/htmlEntities.js": {
       "backendHash": "d2fd5432b02ad0169f8c9d8ec34b75205008fbe200e39804112e824b41511fa1",
+      "adgenHash": "d2fd5432b02ad0169f8c9d8ec34b75205008fbe200e39804112e824b41511fa1",
       "backendSha": "e921027d07c8ce4e8183d24d50988e1b9b0c6228",
       "status": "synced"
     },
     "utils/reviewText.js": {
       "backendHash": "64870da14938edd8e738e6ba6eb427393ba2dd27902133ffecadf8c6531bc307",
+      "adgenHash": "64870da14938edd8e738e6ba6eb427393ba2dd27902133ffecadf8c6531bc307",
       "backendSha": "3a3c06bd217ac36e4fa23c19ac9934a226256764",
       "status": "synced"
     },
     "utils/titleNormalize.js": {
       "backendHash": "aeee8dcf9739044a69dd0b1730a421443c6c444305097b6ed8d9cd25ecb7decd",
+      "adgenHash": "aeee8dcf9739044a69dd0b1730a421443c6c444305097b6ed8d9cd25ecb7decd",
       "backendSha": "cf9bc1afd180a2002b799c97ec73adcee7a7c9b9",
       "status": "synced"
     },
     "utils/websiteBackground.js": {
       "backendHash": "96be00c95efb057fe9bf81ddfb5febda8d4a00f977ac25271f5ea0287fee0b97",
+      "adgenHash": "96be00c95efb057fe9bf81ddfb5febda8d4a00f977ac25271f5ea0287fee0b97",
       "backendSha": "21f68ad80e38c187b7682c2cd8d676bb8a1cdae1",
       "status": "synced"
     }

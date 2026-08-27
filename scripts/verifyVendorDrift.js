@@ -35,6 +35,37 @@
 //       adgen-owned files (entrypoint/renderer/orchestrator/…), so a
 //       module only required from another unused copy is still dead.
 //       unused exempts THIS check only — backend drift still FAILs.
+//   (d) ADGEN-SIDE DRIFT (manifest v2) — adgen's OWN bytes no longer match
+//       the recorded look → FAIL. Needs NOTHING but this repo, which is
+//       what makes it the only cross-repo teeth that survive CI (see
+//       "WHAT ACTUALLY RUNS IN CI" below). Somebody edited a file that also
+//       exists in backend; the reconcile forces them to say whether backend
+//       needs the same edit.
+//   (e) UNPORTED OBLIGATION OVERDUE (manifest v2) — status=unported carries
+//       `portTo` (which repo owes it) and `owedSince`, and FAILs once it is
+//       past ADGEN_UNPORTED_GRACE_DAYS (default 14). v1 had only `fork`,
+//       which conflated "adgen owns a different shape forever" with "a fix
+//       landed on one side and the other still owes it". The second is a
+//       debt; recorded as prose it stayed green forever.
+//
+// ── WHAT ACTUALLY RUNS IN CI — READ THIS BEFORE TRUSTING A GREEN RUN ───
+// `.github/workflows/ci.yml` checks out THIS REPO ONLY and sets no
+// ADGEN_BACKEND_PATH, so scripts/lib/siblingBackend.js resolves to null on
+// every pull request. Under manifest v1 that meant checks (a)/(b), the
+// synced-match check, the stale check, and the historical/fork probes ALL
+// skipped with an INFO and the harness exited 0. The manifest had real
+// teeth on a developer's laptop and was a structural no-op on the one
+// surface that gates a merge — which is how veoPromptBuilder.js's fix
+// landed in adgen with no CI signal at all.
+//
+// v2's (d) and (e) are the answer, deliberately designed to need only this
+// repo. The backend-side checks still skip in CI; getting them to run there
+// needs the backend checked out in the workflow (a PAT for a private repo),
+// which is a separate, secret-dependent change. Do NOT read a green CI as
+// "the two repos agree" — read it as "adgen's own copies are unchanged
+// since someone last attested them, and no obligation is overdue".
+// The full cross-repo comparison runs when a human runs `npm test` with
+// both repos checked out side by side.
 //
 // ── HOW VENDORED FILES ARE IDENTIFIED ──────────────────────────────────
 // Derived, not hand-maintained: walk src/, strip the leading `src/`, ask
@@ -71,8 +102,18 @@
 //
 //   node scripts/verifyVendorDrift.js --reconcile services/foo.js --reason "…"
 //
-// or re-attest a still-deliberate fork with a new reason. --seed adds
-// any newly discovered files at the current backend ref without
+// or re-attest a still-deliberate fork with a new reason, or — when the
+// divergence is a fix the OTHER repo still owes — record it as a debt:
+//
+//   node scripts/verifyVendorDrift.js --reconcile services/foo.js \
+//        --unported --port-to backend --reason "…"
+//
+// Re-reconciling an already-unported path CARRIES ITS owedSince FORWARD
+// rather than resetting it. Without that, the grace window would be
+// extendable indefinitely by rerunning the command, which is the same
+// failure mode as the prose reason it replaced.
+//
+// --seed adds any newly discovered files at the current backend ref without
 // clobbering existing reasons. The suite path never writes.
 //
 // ── SUITE, NOT AN OPT-IN SCRIPT ────────────────────────────────────────
@@ -89,6 +130,7 @@ const path = require('path');
 const { resolveBackendRoot } = require('./lib/siblingBackend');
 const {
   MANIFEST_VERSION,
+  PORT_TARGETS,
   sha256Hex,
   resolveRefSha,
   readBackendBlob,
@@ -222,7 +264,25 @@ const HISTORICAL_PROBES = [
   },
 ];
 
-const FORK_HELD_PROBE = 'services/directImageRenderService.js';
+// The fork-held probe used to hardcode one exemplar path
+// ('services/directImageRenderService.js'). That rotted the first time the
+// file it named was legitimately reconciled to a different status — the probe
+// failed while the mechanism it was testing was working perfectly, which is
+// the most corrosive kind of red. Pick the exemplar STRUCTURALLY instead: any
+// entry that is currently a held fork. Same lesson this repo already learned
+// about hardcoded suite counts (see runVerifySuite.js's header).
+function pickHeldProbe(manifest, report, status) {
+  for (const rel of Object.keys(manifest.files).sort()) {
+    const entry = manifest.files[rel];
+    if (!entry || entry.status !== status) continue;
+    if (!entry.reason) continue;
+    if (report.drift.some((d) => d.rel === rel)) continue;      // upstream moved; not "held"
+    const v = report.vendored.find((x) => x.rel === rel);
+    if (!v || v.identical !== false) continue;                  // need a REAL divergence
+    return rel;
+  }
+  return null;
+}
 
 function parseArgs(argv) {
   const opts = {
@@ -230,6 +290,9 @@ function parseArgs(argv) {
     reconcile: null,
     reason: null,
     unused: false,
+    unported: false,
+    portTo: null,
+    downgrade: false,
     prove: true,
     help: false,
   };
@@ -241,6 +304,10 @@ function parseArgs(argv) {
     else if (arg === '--reason') { opts.reason = argv[++i]; if (opts.reason == null) throw new Error('--reason needs a string'); }
     else if (arg.startsWith('--reason=')) opts.reason = arg.slice('--reason='.length);
     else if (arg === '--unused') opts.unused = true;
+    else if (arg === '--unported') opts.unported = true;
+    else if (arg === '--downgrade-to-fork') opts.downgrade = true;
+    else if (arg === '--port-to') { opts.portTo = argv[++i]; if (!opts.portTo) throw new Error('--port-to needs backend|adgen'); }
+    else if (arg.startsWith('--port-to=')) opts.portTo = arg.slice('--port-to='.length);
     else if (arg === '--no-prove') opts.prove = false;
     else if (arg === '--help' || arg === '-h') opts.help = true;
     else throw new Error(`unknown flag ${arg}`);
@@ -268,6 +335,22 @@ USAGE
   node scripts/verifyVendorDrift.js --reconcile services/foo.js --unused --reason "…"
       Mark foo.js as present-but-unwired (dead-module check will not fail it).
       Backend drift still FAILs — unused is not a drift mute.
+
+  node scripts/verifyVendorDrift.js --reconcile services/foo.js \
+       --unported --port-to backend|adgen --reason "…"
+      Record the divergence as a DEBT the named repo owes, not a deliberate
+      fork. Fails the suite once older than ADGEN_UNPORTED_GRACE_DAYS
+      (default 14). Re-running this CARRIES owedSince FORWARD — the clock
+      cannot be reset by re-attesting.
+      A completed port makes the copies identical, which reconciles to
+      'synced' and clears the debt on its own.
+
+  node scripts/verifyVendorDrift.js --reconcile services/foo.js \
+       --downgrade-to-fork --reason "…"
+      Deliberately turn an 'unported' DEBT into a permanent 'fork'. Required
+      because a plain --reconcile on a still-divergent unported file is
+      REFUSED: that would silently launder an overdue debt into a
+      permanently-green fork.
 
   --no-prove   skip the historical / in-memory probes (used by --seed/--reconcile).
 `);
@@ -351,7 +434,7 @@ function runSeed() {
   console.log(`  identical ${report.identicalCount}, divergent ${report.divergentCount}, unwired-at-seed ${deadForSeed.length}`);
 }
 
-function runReconcile(rel, reason, unused) {
+function runReconcile(rel, reason, unused, unported, portTo, downgrade) {
   if (!BACKEND_ROOT) {
     console.error('verifyVendorDrift --reconcile: no sibling backend checkout.');
     process.exit(1);
@@ -366,23 +449,78 @@ function runReconcile(rel, reason, unused) {
   }
   let status;
   let usedReason = reason ? String(reason).trim() : '';
+  const extra = {};
   if (unused) {
     status = 'unused';
     if (!usedReason) {
       console.error('--unused requires --reason (why is this copy allowed to stay unwired?)');
       process.exit(1);
     }
+  } else if (unported) {
+    status = 'unported';
+    if (!PORT_TARGETS.has(portTo)) {
+      console.error(`--unported requires --port-to ${[...PORT_TARGETS].join('|')} (which repo OWES the port?)`);
+      process.exit(1);
+    }
+    if (!usedReason) {
+      console.error('--unported requires --reason (what fix is owed, and what breaks until it lands?)');
+      process.exit(1);
+    }
+    extra.portTo = portTo;
+    // CARRY THE CLOCK FORWARD. Re-attesting an already-unported file must
+    // not reset owedSince, or the grace window is extendable forever by
+    // rerunning this command — which is precisely how the prose `fork`
+    // reason it replaced managed to stay green indefinitely.
+    const prior = existing.files[rel];
+    if (prior && prior.status === 'unported' && prior.owedSince) {
+      extra.owedSince = prior.owedSince;
+      console.log(`  (carrying owedSince forward from the existing entry: ${prior.owedSince})`);
+    }
   } else if (v.identical === false) {
+    // ⚠️ DO NOT LET A DEBT BE LAUNDERED INTO A FORK.
+    //
+    // The overdue-obligation failure message tells you to run
+    // `--reconcile <path> --reason "…"` AFTER porting. Run it BEFORE porting —
+    // or in the belief that you had ported — and this branch would have
+    // silently rewritten status=unported to status=fork and dropped
+    // owedSince, making a permanently-green entry out of an overdue debt.
+    // The clock-carry above only fires when --unported is passed again, so
+    // that hole was reachable through the documented happy path. That is the
+    // same "an exemption outlives its reason" failure this whole status
+    // exists to close, so it must not be reachable by accident.
+    //
+    // A port makes the two copies IDENTICAL, which lands in the `synced`
+    // branch below and clears the debt legitimately. So a still-divergent
+    // file cannot have been ported, and downgrading it has to be deliberate.
+    const prior = existing.files[rel];
+    if (prior && prior.status === 'unported' && !downgrade) {
+      console.error(
+        `${rel} is currently status=unported (owes ${prior.portTo}, since ${prior.owedSince})\n` +
+        `and it STILL differs from backend, so the port cannot have landed — a completed port\n` +
+        `makes the copies identical and reconciles to 'synced' on its own.\n\n` +
+        `Refusing to silently downgrade this debt to 'fork' and reset its clock.\n\n` +
+        `  * Ported it? Re-check: the files still differ, so something is missing.\n` +
+        `  * Re-attesting the debt (keeps the original owedSince):\n` +
+        `      --reconcile ${rel} --unported --port-to ${prior.portTo} --reason "…"\n` +
+        `  * Genuinely NOT a debt any more — adgen owns this shape deliberately now:\n` +
+        `      --reconcile ${rel} --downgrade-to-fork --reason "…"`
+      );
+      process.exit(1);
+    }
     status = 'fork';
     if (!usedReason) {
-      console.error(`${rel} still differs from backend; --reason is required to re-attest a fork.`);
+      console.error(
+        `${rel} still differs from backend; --reason is required to re-attest a fork.\n` +
+        `  If the difference is a fix the OTHER repo still owes, this is not a fork — use:\n` +
+        `    --unported --port-to backend --reason "…"`
+      );
       process.exit(1);
     }
   } else {
     status = 'synced';
     usedReason = '';
   }
-  existing.files[rel] = makeEntry(v, status, usedReason || undefined);
+  existing.files[rel] = makeEntry(v, status, usedReason || undefined, extra);
   existing.backendRef = report.backendRef;
   existing.backendHead = report.backendHead;
   existing.generatedAt = new Date().toISOString();
@@ -479,7 +617,7 @@ function main() {
   }
   if (opts.help) { printHelp(); process.exit(0); }
   if (opts.seed) { runSeed(); return; }
-  if (opts.reconcile) { runReconcile(opts.reconcile, opts.reason, opts.unused); return; }
+  if (opts.reconcile) { runReconcile(opts.reconcile, opts.reason, opts.unused, opts.unported, opts.portTo, opts.downgrade); return; }
 
   const manifest = loadManifest(MANIFEST_PATH);
   const failures = [];
@@ -555,6 +693,65 @@ function main() {
     throw new Error(lines.join('\n'));
   });
 
+  // ── THE CI-SIDE TEETH (manifest v2) ───────────────────────────────────
+  // Every check above this point needs the sibling backend checkout, and in
+  // GitHub Actions that sibling does not exist: `.github/workflows/ci.yml`
+  // checks out this repo only and sets no ADGEN_BACKEND_PATH. So until v2
+  // the whole cross-repo half of this harness ran, reported an INFO, and
+  // exited 0 in the one place it was supposed to be a gate. The manifest had
+  // teeth on a developer's laptop and none on a pull request.
+  //
+  // This check needs nothing but this repo. If a vendored file's adgen bytes
+  // changed since the last recorded look, SOMEBODY edited a file that also
+  // exists in liquidretail_backend without saying whether backend needs the
+  // same edit. That is the exact shape of the veoPromptBuilder.js miss.
+  //
+  // The friction is deliberate and it is the feature: the fix is one
+  // command, and running it forces the author to answer the porting
+  // question while the change is still in their head.
+  check('adgen copies unchanged since the last recorded look', () => {
+    if (!report.adgenDrift.length) return;
+    const lines = [
+      `${report.adgenDrift.length} vendored file(s) changed IN THIS REPO since the manifest last ` +
+      `looked at them. Each also exists in liquidretail_backend, so each needs an explicit answer ` +
+      `to "does backend need this same change?":`,
+    ];
+    for (const item of report.adgenDrift) {
+      lines.push(`  ${item.rel}`);
+      lines.push(`    recorded adgen sha256:${shortHash(item.recorded.adgenHash)}…  now:${shortHash(item.current.adgenHash)}…  status=${item.recorded.status}`);
+      lines.push(`    if backend needs it too:  node scripts/verifyVendorDrift.js --reconcile ${item.rel} --unported --port-to backend --reason "…"`);
+      lines.push(`    if adgen-only forever:    node scripts/verifyVendorDrift.js --reconcile ${item.rel} --reason "…"`);
+    }
+    throw new Error(lines.join('\n'));
+  });
+
+  check('tracked vendored files still exist in adgen src/', () => {
+    if (!report.adgenMissing.length) return;
+    throw new Error(
+      `${report.adgenMissing.length} manifest path(s) are gone from adgen src/ — deleted without ` +
+      `updating the manifest:\n    ` + report.adgenMissing.map((m) => m.rel).join('\n    ')
+    );
+  });
+
+  // An `unported` entry is a DEBT with a named counterparty and a start
+  // date. v1's single `fork` bucket could not express that, so
+  // veoPromptBuilder.js's real obligation ("a human must apply the same
+  // edit in liquidretail_backend") lived in free-text prose that was
+  // permanently green. A debt that cannot come due is not tracked, it is
+  // just written down.
+  check('no unported obligation is overdue', () => {
+    if (!report.unportedOverdue.length) return;
+    const lines = [`${report.unportedOverdue.length} unported fix(es) are past the grace window:`];
+    for (const item of report.unportedOverdue) {
+      lines.push(`  ${item.rel}`);
+      lines.push(`    owes: ${item.recorded.portTo}   owed since: ${item.recorded.owedSince}   age: ${item.ageDays.toFixed(1)}d > ${item.graceDays}d grace`);
+      lines.push(`    reason: ${item.recorded.reason}`);
+      lines.push(`    Port it, then: node scripts/verifyVendorDrift.js --reconcile ${item.rel} --reason "…"`);
+      lines.push(`    (raising ADGEN_UNPORTED_GRACE_DAYS to silence this is a decision someone should have to type on purpose, in a PR)`);
+    }
+    throw new Error(lines.join('\n'));
+  });
+
   check('synced files still match backend', () => {
     if (report.backendAbsent) return;
     const lies = [];
@@ -617,21 +814,32 @@ function main() {
         }
       }
 
-      check(`deliberate fork ${FORK_HELD_PROBE} is recorded and not flagged`, () => {
-        const entry = manifest.files[FORK_HELD_PROBE];
-        if (!entry) throw new Error(`${FORK_HELD_PROBE} missing from manifest`);
-        if (entry.status !== 'fork') throw new Error(`${FORK_HELD_PROBE} status=${entry.status}, expected fork`);
-        if (!entry.reason) throw new Error(`${FORK_HELD_PROBE} fork has empty reason`);
-        const flagged = report.drift.some((d) => d.rel === FORK_HELD_PROBE);
-        if (flagged) throw new Error(`${FORK_HELD_PROBE} is in the drift list — the fork was not held`);
-        const v = report.vendored.find((x) => x.rel === FORK_HELD_PROBE);
-        if (v && v.identical === true) {
-          throw new Error(`${FORK_HELD_PROBE} is byte-identical; fork probe needs a real divergence`);
+      // Both non-synced "held" statuses get the same proof: adgen genuinely
+      // differs, backend's hash still matches the recorded look, and the entry
+      // is therefore NOT flagged as drift. That is the property that stops the
+      // manifest crying wolf on the ~29 legitimate divergences.
+      for (const status of ['fork', 'unported']) {
+        const rel = pickHeldProbe(manifest, report, status);
+        if (!rel) {
+          infos.push(`no held '${status}' entry with a real divergence to probe — skipped`);
+          continue;
         }
-        infos.push(
-          `fork held: ${FORK_HELD_PROBE} status=fork, adgen differs, backend hash matches last look — not flagged`
-        );
-      });
+        check(`held '${status}' entry ${rel} is recorded and not flagged`, () => {
+          const entry = manifest.files[rel];
+          if (entry.status !== status) throw new Error(`${rel} status=${entry.status}, expected ${status}`);
+          if (!entry.reason) throw new Error(`${rel} ${status} has empty reason`);
+          if (status === 'unported') {
+            if (!entry.portTo) throw new Error(`${rel} is unported with no portTo`);
+            if (!entry.owedSince) throw new Error(`${rel} is unported with no owedSince`);
+          }
+          if (report.drift.some((d) => d.rel === rel)) throw new Error(`${rel} is in the drift list — not held`);
+          const v = report.vendored.find((x) => x.rel === rel);
+          if (v && v.identical === true) throw new Error(`${rel} is byte-identical; this probe needs a real divergence`);
+          infos.push(
+            `${status} held: ${rel} — adgen differs, backend hash matches the last look, not flagged`
+          );
+        });
+      }
     } else {
       infos.push('historical / fork probes skipped (no backend or no manifest)');
     }
@@ -643,9 +851,12 @@ function main() {
     (report.backendRef ? ` vs backend ${report.backendRef} ${shortSha(report.backendHead)}` : ' (backend absent)') +
     `; identical ${report.identicalCount}, divergent ${report.divergentCount}` +
     `, drift ${report.drift.length}` +
+    `, adgen-drift ${report.adgenDrift.length}` +
     `, untracked ${report.untracked.length}` +
     `, stale ${report.stale.length}, dead ${report.dead.length}` +
-    `, forks-held ${report.forksHeld.length}.`
+    `, forks-held ${report.forksHeld.length}` +
+    `, unported ${report.unportedHeld.length + report.unportedOverdue.length}` +
+    ` (${report.unportedOverdue.length} overdue).`
   );
   for (const line of infos) console.log(`  info: ${line}`);
 

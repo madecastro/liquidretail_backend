@@ -248,68 +248,16 @@ function prepareBackendModelsDir() {
 }
 
 // ---------------------------------------------------------------------------
-// mongoose loader with a sibling-node_modules fallback. Patches
-// Module._load so a bare specifier (never a relative or absolute path)
-// that fails NORMAL resolution gets one more attempt resolved against the
-// candidate dir — this repo's own node_modules, if it ever gets one, always
-// wins first, since orig.apply() is tried before the fallback. Restored
-// immediately after mongoose is loaded so this file does not leave a
-// process-wide monkeypatch behind for anything requiring it later in the
-// same process (the runVerifySuite.js pool spawns a fresh process per
-// script, so this matters only for a direct `node -e` harness chain).
+// mongoose loader — MOVED to scripts/lib/mongooseLoader.js (2026-08-27) so
+// verifyHandoffContract.js can share it instead of carrying a second copy of
+// a loader whose subtlety CLAUDE.md documents with measured numbers (bare
+// worktree 33/33 vs npm-ci'd 0/33). Behaviour is unchanged: own node_modules
+// wins, sibling backend's is the fallback, the Module._load patch is left
+// installed on purpose, and no-mongoose-anywhere still exits 1 for THIS
+// harness because comparing real Schema objects is its entire job.
 // ---------------------------------------------------------------------------
-function loadMongooseWithFallback() {
-  try {
-    return require('mongoose');
-  } catch (err) {
-    if (!err || err.code !== 'MODULE_NOT_FOUND') throw err;
-  }
-
-  const candidateDir = BACKEND_ROOT ? path.join(BACKEND_ROOT, 'node_modules') : null;
-  if (!candidateDir || !fs.existsSync(candidateDir)) {
-    console.error(
-      [
-        'verifyModelParity: cannot load "mongoose" (MODULE_NOT_FOUND) and no',
-        'sibling liquidretail_backend/node_modules was found to fall back to.',
-        'This harness constructs real mongoose.Schema objects — it is not',
-        'faked with a regex — so it genuinely needs mongoose installed.',
-        'Fix: run `npm install` in this worktree, or',
-        '`export NODE_PATH=<path-to-a-node_modules-containing-mongoose>`.'
-      ].join('\n')
-    );
-    process.exit(1);
-  }
-
-  const origLoad = Module._load;
-  Module._load = function fallbackLoad(request, parent, isMain) {
-    try {
-      return origLoad.apply(this, arguments);
-    } catch (err) {
-      if (err && err.code === 'MODULE_NOT_FOUND' && !request.startsWith('.') && !path.isAbsolute(request)) {
-        try {
-          const resolved = require.resolve(request, { paths: [candidateDir] });
-          return origLoad.call(this, resolved, parent, isMain);
-        } catch (e2) { /* fall through to the original error */ }
-      }
-      throw err;
-    }
-  };
-  // NOT restored here — see the comment above this function.
-  try {
-    return require('mongoose');
-  } catch (err) {
-    console.error(
-      [
-        `verifyModelParity: cannot load "mongoose" even via the sibling`,
-        `backend's node_modules (${candidateDir}). ${err.message}`,
-        'Fix: run `npm install` in this worktree.'
-      ].join('\n')
-    );
-    process.exit(1);
-  }
-}
-
-const mongoose = loadMongooseWithFallback();
+const { loadMongooseWithFallback } = require('./lib/mongooseLoader');
+const mongoose = loadMongooseWithFallback({ harnessName: 'verifyModelParity', backendRoot: BACKEND_ROOT });
 
 // ---------------------------------------------------------------------------
 // Schema extraction.
