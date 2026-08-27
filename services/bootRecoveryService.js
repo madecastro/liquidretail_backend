@@ -27,6 +27,104 @@
 //      to undeclared paths (this repo has already lost `renderError.predictionId`
 //      that way; see models/Ad.js).
 //
+// ── ADGEN OWNERSHIP — the PRIMARY guard, added 2026-08-26 ──────────────────
+// This module had two independent gaps, not one. The claim-awareness
+// section below closes the narrower one. This section closes the wider one:
+// until now, this sweep had ZERO awareness that liquidretail_adgen might
+// own rendering at all — no reference anywhere to ADGEN_RENDERER_ENABLED /
+// isAdgenRendererEnabled, unlike its sibling services/titlingResumeService.js
+// (`resumeUntitledMasters`), which has stood down on that flag since the
+// adgen cutover: `if (isAdgenRendererEnabled()) return out;`. Boot recovery
+// was simply never given the same treatment, so worker.js's recoverTick
+// (called unconditionally, every REAP_INTERVAL_MIN) kept sweeping the exact
+// collection adgen's renderer/titler claims rows in, regardless of the flag.
+//
+// adgen carries its OWN vendored copy of this file, wired from its renderer
+// (`startBootRecoverySweep`) and gated on isAdgenRendererEnabled() on ITS
+// side — i.e. it runs precisely when adgen owns rendering. THIS FIX MAKES A
+// NARROWER CLAIM THAN "coverage moves to a claim-aware sweeper" — say that
+// plainly, because it is tempting to overstate. Adgen's vendored copy, as
+// of this writing, is UNAUDITED FROM HERE and still runs the ORIGINAL
+// claim-blind query (no claimedByWorker awareness at all) — this PR does
+// not touch or verify it, and whether it is actually running in production
+// cannot be proven from this repo (its own docs disagree with each other on
+// the wiring date). What standing down here DOES prove, unconditionally: a
+// live adgen title can no longer be stomped BY BACKEND while the flag is
+// on — this process simply never peeks or writes a video-receipt row in
+// that mode. It does NOT prove the dual-render race is closed against
+// EVERY actor, and it does NOT reduce the number of sweepers polling the
+// collection (adgen's own still runs) — at most it removes one VIDEO
+// WRITER from the race, which is the claim this comment makes.
+//
+// One more handoff this changes, worth stating rather than leaving implicit:
+// adgen's own per-ad heartbeat has a deliberate lifetime cap
+// (AD_HEARTBEAT_MAX_MS, liquidretail_adgen/src/services/renderer.js), past
+// which adgen intentionally stops refreshing updatedAt WHILE KEEPING THE
+// CLAIM HELD, on the documented reasoning that backend recovery should be
+// able to take the row from there if the render is genuinely stuck. With
+// this gate on, backend declines that handoff for as long as the flag
+// reads true — failover for a stuck-past-the-cap claim now depends entirely
+// on adgen's own sweep (if it is running).
+//
+// SCOPED TO VIDEO RECOVERY ONLY — this is the constraint that matters most.
+// Static-image recovery (recoverImageAd, below) stays unconditional, and so
+// does its cost-reconcile call, because it was never exposed to the race
+// video is: a recovered image is ONE atomic peek-then-write with no
+// asynchronous hand-off to a second process, so two peekers racing it is
+// exactly the harmless case the "NO CLAIM, ON PURPOSE" reasoning above
+// already covers. Video is different SPECIFICALLY because a recovered
+// master hands off to a SEPARATE titling pass (titlingResumeState:'pending')
+// — that hand-off is the thing a live adgen claim must not have stolen out
+// from under it. Gating the whole function (or the query) would also have
+// silently stopped the per-ad cost-reconcile calls threaded through this
+// loop, which is a worse bug than the one being fixed — so the gate sits
+// at the one call site that actually races (see resumeInFlightAds).
+//
+// ── Ad.claimedByWorker IS A DIFFERENT THING — SECONDARY, defense in depth ──
+// The "no claim" reasoning at the top of this file is about concurrent
+// bootRecoveryService peekers racing each other. Ad.claimedByWorker is
+// adgen's ownership marker for a row this sweep must not touch while the
+// claiming worker is alive — not a concurrency-dedup lease among peekers.
+// With the ownership gate above as the primary defense, this claim-aware
+// filter mostly matters for the TRANSITION window around a flag flip (a
+// row adgen claimed while the flag was on, still mid-render when an
+// operator flips it back off) — but it stays unconditional and per-row
+// rather than assuming the flag is the only signal, because a stale claim
+// marker left over from ANY prior owner deserves the same caution
+// regardless of what the flag currently reads. Adgen's renderer DOES run
+// its own per-ad heartbeat during titling (mirrors this repo's renderOne,
+// routes/ads.js:2822 — every 60s, unlike renderOne it also covers a claimed
+// row stuck at status:'rendering' through the WHOLE titling pass, since
+// adgen does not flip to 'draft' until titling terminates), but this sweep
+// must not assume that heartbeat is reliable: it can lag under event-loop
+// contention from a CPU-heavy Remotion pass, silently miss individual
+// writes (a caught-and-swallowed error — "the next one lands"), or stop
+// entirely once adgen's own heartbeat lifetime cap is hit while work is
+// still genuinely in flight (adgen's own code documents that exact residual
+// as accepted, deferring to backend recovery). Any of those looks identical
+// from here: an untouched updatedAt. Sweeping a still-live claim on the
+// strength of RESUME_STALE_MIN (5m, calibrated for OUR OWN renderOne's
+// beat, not another process's) would stamp status:'draft' +
+// titlingResumeState:'pending' out from under the live worker (dual
+// Remotion render on one paid master). Claimed rows therefore get
+// RESUME_CLAIM_STALE_MIN (default 15, same "generous on purpose" convention
+// as titlingResumeService.CLAIM_STALE_MIN) — long enough that a
+// merely-lagging beat is never mistaken for a dead one, short enough that a
+// dead worker's paid master is still recovered; this sweep must never
+// become a permanent no-op for claimed rows.
+//
+// ⚠️ NEITHER GUARD IS COMPLETE ON ITS OWN, and neither closes every known
+// race — stated plainly rather than implied. The ownership gate is a
+// process-wide switch, not a per-row lock: `Ad.updateOne` below is still
+// guarded only by `{ _id, status:'rendering' }`, so a row that looked
+// unclaimed at query time but gets claimed by adgen a moment later (between
+// the find and the write) can still be stomped — pre-existing behaviour,
+// not introduced or closed here. And adgen's OWN vendored copy of this
+// file is a SEPARATE, unaudited codebase this fix cannot reach — closing
+// this gap here does not prove the adgen-side sweeper is claim-aware or
+// correctly gated. Both are known, out-of-scope-for-this-file residuals;
+// do not read this fix as "the dual-render race is closed."
+//
 // ── WHY THE STALENESS WINDOW EXISTS ─────────────────────────────────────────
 // An ad being rendered RIGHT NOW by another live instance is also
 // `status: 'rendering'` with a receipt. Peeking it is harmless, but stamping it
@@ -37,6 +135,12 @@
 
 const Ad = require('../models/Ad');
 const { HAS_RECEIPT } = require('./spendReceipt');
+// Same helper titlingResumeService.js gates its own stand-down on — never a
+// second inline process.env read (the exact "unbound identifier shipped
+// with a green harness" class of incident this repo has already had twice;
+// importing the shared helper means both stand-downs can never disagree
+// about what the flag says).
+const { isAdgenRendererEnabled } = require('./adgenBridge');
 // reconcileVideoCostFromTerminal upgrades the video charge-point CostLog row
 // to a settled price the same way a normal (non-recovered) completion does —
 // imported, not re-implemented, so the two paths can never compute the charge
@@ -66,6 +170,17 @@ const RESUME_STALE_MIN = Math.max(1, parseInt(process.env.RESUME_STALE_MIN, 10) 
 // Bound the boot cost. Recovery is fire-and-forget and must never make startup
 // slow or unbounded; whatever is missed is picked up on the next sweep.
 const RESUME_MAX_ADS   = Math.max(1, parseInt(process.env.RESUME_MAX_ADS, 10) || 25);
+// Generous on purpose — mirrors titlingResumeService's TITLING_RESUME_STALE_MIN=15.
+// Must be materially larger than RESUME_STALE_MIN (5): RESUME_STALE_MIN is
+// calibrated to OUR OWN renderOne's 60s beat (routes/ads.js:2822); a claim
+// held by a DIFFERENT process has no such guarantee from here — its own
+// heartbeat (if any) can lag under load, miss a write, or stop while work is
+// still genuinely in flight, and titling can legitimately run long when
+// serialized behind REMOTION_QUEUE_CONCURRENCY, so a short window would steal a
+// live claim. A long one costs, at worst, wasted CPU on a redundant second pass
+// IF the claim really is dead — never a double-SPEND (resumeForAd only peeks a
+// free GET and only writes when the provider says done; this sweep never submits).
+const RESUME_CLAIM_STALE_MIN = Math.max(1, parseInt(process.env.RESUME_CLAIM_STALE_MIN, 10) || 15);
 
 function enabled() {
   return String(process.env.RESUME_IN_FLIGHT_ON_BOOT ?? 'true').toLowerCase() !== 'false';
@@ -104,6 +219,99 @@ function resolveRecoveredVideoFailureCharge(r) {
 }
 
 /**
+ * The sweep's candidate filter, as a pure function of both staleness
+ * cutoffs. Exported so a harness can evaluate it against real document
+ * shapes instead of regexing this file.
+ *
+ * Claim-aware (2026-08-26): an ad actively claimed by an adgen worker
+ * (Ad.claimedByWorker set) can legitimately sit status:'rendering' with
+ * a stale updatedAt while Remotion titling runs — the claiming process's
+ * own heartbeat (if any) is not something this sweep can verify or rely
+ * on. Sweeping it here would stamp status:'draft' +
+ * titlingResumeState:'pending' out from under the live claim, corrupting
+ * the status:'rendering' guard the claiming worker's own completion
+ * write relies on to know it still owns the row — the DUAL-RENDER hole.
+ * So a claimed row gets a MUCH longer staleness allowance
+ * (RESUME_CLAIM_STALE_MIN, default 15m, mirrors
+ * titlingResumeService.CLAIM_STALE_MIN's "generous on purpose"
+ * convention) before this sweep treats the claiming worker as dead and
+ * takes the row over anyway — this sweep's whole purpose is recovering
+ * a paid asset a dead process can no longer deliver, so it must never
+ * become a permanent no-op for claimed rows.
+ *
+ * HAS_RECEIPT is nested inside `$and`, never spread next to the claim
+ * `$or`. HAS_RECEIPT is itself `{ $or: [...] }`; two top-level `$or`
+ * keys in one object would silently drop the receipt guard.
+ *
+ * TWO CLOCKS on the claimed arm, both required stale, on purpose. `claimedAt`
+ * is stamped ONCE, at claim time, and never refreshed — it answers "how old
+ * is this ownership", not "is the work still moving". `updatedAt` is what
+ * (if anything) heartbeats during the work itself. Gating on `updatedAt`
+ * alone has a real hole: a HANDOFF — the titler clearing a claim for
+ * reclaim, or a fresh `claimOne()` winning it — writes `claimedByWorker`
+ * without touching `updatedAt` at all (adversarial finding), so a row could
+ * carry a SECONDS-old claim sitting on an `updatedAt` that predates it by
+ * well over claimCutoff and be swept immediately. Requiring `claimedAt` to
+ * ALSO be stale closes exactly that: a brand-new claim's `claimedAt` is
+ * fresh regardless of what `updatedAt` last said, so it is protected from
+ * the moment it is taken, not only once something first heartbeats it.
+ * `claimedAt: null` (legacy/unstamped claims) sorts before any real Date in
+ * Mongo's BSON ordering, so `$lt` still matches — such a claim gets no
+ * EXTRA protection from this clause, which is the correct fallback: rely on
+ * `updatedAt` alone, exactly as before this clause existed.
+ *
+ * `receiptKinds` narrows WHICH receipt a candidate must hold — 'both' (the
+ * original HAS_RECEIPT $or), 'image', or 'video'. Exists so the video
+ * ownership gate in resumeInFlightAds can EXCLUDE video rows from the query
+ * itself, not just skip them once loaded (adversarial finding, second
+ * round): `.limit(limit)` is shared across both kinds, sorted oldest-first,
+ * and a deferred video row is never written — so it stays a candidate on
+ * EVERY subsequent pass. Filtering it out only inside the loop still lets
+ * it occupy a limit slot forever; once enough stranded video rows
+ * accumulate (one mixed Meta+PMax product alone is 21 video rows) they can
+ * fill the whole limit and starve image recovery entirely, which is exactly
+ * the "must keep running" job this gate is not supposed to touch. Excluding
+ * video at the query level keeps every limit slot available for the work
+ * this process still owns.
+ *
+ * @param {Date} cutoff       unclaimed rows older than this are swept
+ * @param {Date} claimCutoff  claimed rows older than this are swept
+ * @param {'both'|'image'|'video'} [receiptKinds='both']
+ */
+function buildRecoverySweepFilter({ cutoff, claimCutoff, receiptKinds = 'both' }) {
+  // 'image' and 'video' must be MUTUALLY EXCLUSIVE and together cover
+  // exactly what HAS_RECEIPT covers, matching the loop's own tie-break rule
+  // below (`isImageReceipt = !ad.veoPredictionId && !!ad.imageGeneration
+  // ?.predictionId` — video wins a tie). A row holding BOTH receipts is
+  // 'video' kind, never 'image' kind, so 'image' must ALSO require
+  // veoPredictionId to be absent/empty — omitting that half would let a
+  // dual-receipt row pass the video ownership gate's query-level exclusion
+  // (it has an image receipt) and then still fall into the video branch in
+  // the loop (video wins the tie), defeating the gate for that row.
+  const receiptClause = receiptKinds === 'image'
+    ? { veoPredictionId: { $in: [null, ''] }, 'imageGeneration.predictionId': { $nin: [null, ''] } }
+    : receiptKinds === 'video'
+      ? { veoPredictionId: { $nin: [null, ''] } }
+      : HAS_RECEIPT;
+  return {
+    status: 'rendering',
+    $and: [
+      receiptClause,
+      {
+        $or: [
+          { claimedByWorker: null, updatedAt: { $lt: cutoff } },
+          {
+            claimedByWorker: { $ne: null },
+            updatedAt: { $lt: claimCutoff },
+            claimedAt: { $lt: claimCutoff }
+          }
+        ]
+      }
+    ]
+  };
+}
+
+/**
  * Find receipt-holding ads stranded in `rendering` and collect whatever the
  * provider finished. Returns a summary; NEVER throws — a recovery pass must not
  * be able to take down the boot it runs inside, which is the exact crash class
@@ -112,6 +320,7 @@ function resolveRecoveredVideoFailureCharge(r) {
 async function resumeInFlightAds({
   limit = RESUME_MAX_ADS,
   staleMinutes = RESUME_STALE_MIN,
+  claimStaleMinutes = RESUME_CLAIM_STALE_MIN,
   // Injectable so the harness can exercise image recovery without network.
   recoverImage = recoverImageAd
 } = {}) {
@@ -120,13 +329,25 @@ async function resumeInFlightAds({
     // Static images whose paid output was located but finishPlate/upload could
     // not complete this pass (fetch blip, geometry, etc.). Retried next sweep.
     // NOT "we refuse to collect" — collection is recoverImageAd below.
-    recoverableNotCollected: 0
+    recoverableNotCollected: 0,
+    // Video-receipt rows left untouched because adgen owns rendering — see
+    // the ADGEN OWNERSHIP header comment. Counted separately from
+    // recoverableNotCollected: this is not "we tried and couldn't", it is
+    // "someone else's job right now", and the two must not be conflated in
+    // an operator-facing summary.
+    deferredToAdgen: 0
   };
   if (!enabled()) { out.skipped = 'RESUME_IN_FLIGHT_ON_BOOT=false'; return out; }
+  // Read once per pass, not per ad — a flag flip mid-pass should not treat
+  // ads claimed in the same batch inconsistently. Call-time read (not a
+  // module-load-time constant) so a dashboard flip still takes effect on
+  // the very next pass with no redeploy, matching adgenBridge's own contract.
+  const adgenOwnsRendering = isAdgenRendererEnabled();
 
   let ads;
   try {
     const cutoff = new Date(Date.now() - staleMinutes * 60 * 1000);
+    const claimCutoff = new Date(Date.now() - claimStaleMinutes * 60 * 1000);
     // OWNER of the status:'rendering' + receipt population.
     // strandedRunSweeper owns queued/failed-run stranding; this service owns
     // mid-render / mid-QC crashes left in rendering. The worker reaper
@@ -135,15 +356,54 @@ async function resumeInFlightAds({
     // into a second billable submit. RESUME_STALE_MIN (default 5) is also
     // lower than REAP_STALE_MIN (15): we collect before the reaper even
     // considers the row.
-    ads = await Ad.find({ status: 'rendering', updatedAt: { $lt: cutoff }, ...HAS_RECEIPT })
-      // imageGeneration is selected because HAS_RECEIPT matches on BOTH receipts
-      // (veoPredictionId OR imageGeneration.predictionId) — see the routing note in
+    //
+    // Claim-aware: an adgen-claimed row can sit status:'rendering' with a
+    // stale updatedAt through titling — its own heartbeat, if any, is not
+    // something this process can verify. The 5-min unclaimed window would
+    // steal a live claim and stamp draft + titlingResumeState pending out
+    // from under the worker. Claimed rows use claimCutoff
+    // (RESUME_CLAIM_STALE_MIN, default 15) so a dead worker is still
+    // recovered. Filter is buildRecoverySweepFilter — HAS_RECEIPT nested
+    // in $and, never spread next to the claim $or.
+    //
+    // ADGEN OWNS RENDERING: the query itself excludes video-receipt rows
+    // (receiptKinds:'image'), not just the loop below — adversarial finding,
+    // second round. `.limit(limit)` is shared and a deferred video row is
+    // never written, so it would stay a candidate on EVERY subsequent pass;
+    // excluding it here (rather than fetching then skipping) keeps every
+    // limit slot available for the image recovery this process still owns.
+    // See the ADGEN OWNERSHIP header comment for the full argument.
+    const receiptKinds = adgenOwnsRendering ? 'image' : 'both';
+    ads = await Ad.find(buildRecoverySweepFilter({ cutoff, claimCutoff, receiptKinds }))
+      // imageGeneration is selected because HAS_RECEIPT/the 'image' clause
+      // matches on imageGeneration.predictionId — see the routing note in
       // the loop below. Selecting only veoPredictionId is what made every stranded
       // STATIC ad fall through to the video resume and get written off as 'unknown'.
       // Full lean doc for recoverImageAd (platformFormat, mediaId, brandId, …).
       .sort({ updatedAt: 1 })          // oldest first — most likely already finished
       .limit(limit)
       .lean();
+
+    // Deferred-video VISIBILITY only — a separate, limit-free count so the
+    // operator-facing summary still says how many paid masters are sitting
+    // out there, without letting them consume a single slot of `limit` that
+    // image recovery needs. Never gates or delays the find above; a count
+    // failure is non-fatal and simply leaves deferredToAdgen at 0 for this
+    // pass (retried next tick, same as everything else in this file).
+    if (adgenOwnsRendering) {
+      out.deferredToAdgen = await Ad.countDocuments(
+        buildRecoverySweepFilter({ cutoff, claimCutoff, receiptKinds: 'video' })
+      ).catch((err) => {
+        console.warn(`⚠️  bootRecovery: could not count deferred video ads — ${err.message}`);
+        return 0;
+      });
+      if (out.deferredToAdgen > 0) {
+        console.log(
+          `♻️  bootRecovery: ${out.deferredToAdgen} video-receipt ad(s) left untouched — ` +
+          `adgen owns rendering (ADGEN_RENDERER_ENABLED=true)`
+        );
+      }
+    }
   } catch (err) {
     console.warn(`⚠️  bootRecovery: could not query stranded ads — ${err.message}`);
     return out;
@@ -162,6 +422,25 @@ async function resumeInFlightAds({
     // proves what was bought. Video wins a tie: if somehow both are present, the
     // Omni master is the expensive one (~$1.00 vs ~$0.07).
     const isImageReceipt = !ad.veoPredictionId && !!ad.imageGeneration?.predictionId;
+
+    // ── ADGEN OWNS RENDERING: belt-and-braces, should be unreachable ──────
+    // The query above already excludes video rows when adgenOwnsRendering,
+    // so `ads` should never contain one here. Kept anyway: the query filter
+    // and this check are two independently-maintainable mechanisms, and a
+    // future edit to ONE of them (e.g. a new receipt shape, a refactored
+    // query) must not silently reopen the video-recovery-while-adgen-owns-
+    // rendering hole this file exists to close. Does not touch
+    // deferredToAdgen — that counter is owned by the countDocuments call
+    // above; if this branch ever fires it means the two mechanisms have
+    // drifted apart, which is worth a distinct log line, not a silent merge
+    // into the same counter.
+    if (!isImageReceipt && adgenOwnsRendering) {
+      console.warn(
+        `⚠️  bootRecovery[${ad._id}]: video row reached the loop while adgen owns rendering — ` +
+        `the query-level exclusion should have prevented this; skipping without acting`
+      );
+      continue;
+    }
 
     // ── STATIC IMAGE: finish the already-paid plate (crop + logo + upload) ──
     // recoverImageAd peeks, fetches, finishPlate, uploads, optional vision QC.
@@ -390,5 +669,8 @@ async function resumeInFlightAds({
 module.exports = {
   resumeInFlightAds, RESUME_STALE_MIN, RESUME_MAX_ADS, enabled,
   // Money-decision pure function — scripts/verifyVideoTimeoutReconcile.js.
-  resolveRecoveredVideoFailureCharge
+  resolveRecoveredVideoFailureCharge,
+  // Claim-aware sweep filter + the longer claimed-row TTL. Exported so a
+  // harness can evaluate the real query against real document shapes.
+  buildRecoverySweepFilter, RESUME_CLAIM_STALE_MIN
 };
