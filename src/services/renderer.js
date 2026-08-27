@@ -50,6 +50,50 @@ const { childTailsFrom } = require('./renderErrorFields');
 // the "Slack alerting" section below for why and what it ports.
 const alerts = require('./alertService');
 
+// Per-run Slack thread (runFeedService). Backend's startRun created the
+// parent on CampaignRun.slackFeed; this process must ATTACH to that ts,
+// never post a second parent. Fire-and-forget, never awaited — a Slack
+// outage cannot fail a billed render (same isolation as notifyRenderFailure).
+function feedSourceFor(ad) {
+  return ad && ad.renderRoute === 'veo'
+    ? 'adgen-renderer (video)'
+    : 'adgen-renderer (static)';
+}
+function noteFeed(ad, stage, extra) {
+  try {
+    const runFeed = require('./runFeedService');
+    const source = (extra && extra.source) || feedSourceFor(ad);
+    runFeed.attachAd(ad, { source });
+    if (stage) adStage(ad && ad._id, stage);
+  } catch (err) {
+    try { console.warn(`renderer[${WORKER_ID}]: runFeed note failed: ${err && err.message}`); }
+    catch (_) { /* alerting must never fail generation */ }
+  }
+}
+function noteFeedEvent(ad, stage, extra) {
+  try {
+    const runFeed = require('./runFeedService');
+    const source = (extra && extra.source) || feedSourceFor(ad);
+    runFeed.attachAd(ad, { source });
+    const runId = Array.isArray(ad && ad.campaignRunIds) && ad.campaignRunIds.length
+      ? ad.campaignRunIds[ad.campaignRunIds.length - 1]
+      : null;
+    if (!runId || !stage) return;
+    runFeed.noteEvent(runId, stage, {
+      adId: ad && ad._id != null ? String(ad._id) : null,
+      source,
+      template: ad && ad.template,
+      aspectRatio: ad && ad.aspectRatio,
+      platformFormat: ad && ad.platformFormat,
+      mediaId: ad && ad.mediaId,
+      ...(extra || {})
+    });
+  } catch (err) {
+    try { console.warn(`renderer[${WORKER_ID}]: runFeed event failed: ${err && err.message}`); }
+    catch (_) { /* alerting must never fail generation */ }
+  }
+}
+
 // Extracted from backend renderService.persistStage's `copy` field builder.
 // Preferred: renderedCopy from directImage output (post-density-budget
 // truth) — the actual strings the model was told to typeset. Fallback:
@@ -743,6 +787,14 @@ async function maybeFinalizeRun(runId) {
         `(succeeded=${outcome.succeeded} failed=${outcome.failed})`
       );
       notifyRunFinalized(runId, outcome);
+      try {
+        require('./runFeedService').finishRun({
+          runId,
+          succeeded: outcome.succeeded,
+          failed: outcome.failed,
+          skipped: outcome.skipped || 0
+        });
+      } catch (_) { /* feed must never fail finalization */ }
     }
   } catch (err) {
     console.warn(`renderer[${WORKER_ID}]: maybeFinalizeRun(${runId}) failed: ${err.message}`);
@@ -761,6 +813,7 @@ async function renderStatic(ad) {
     `format=${ad.platformFormat} concept=${ad.conceptId || 'legacy'}`
   );
   const t0 = Date.now();
+  noteFeed(ad, 'layout build');
 
   // Step 1 — derive LayoutInputArtifact. MIRRORS backend's
   // renderService.deriveStage exactly. Three moves:
@@ -856,6 +909,7 @@ async function renderStatic(ad) {
 
   const wallSec = ((Date.now() - t0) / 1000).toFixed(1);
   if (result && result.skipped) {
+    noteFeed(ad, `failed — skipped (${result.reason || 'no reason'})`);
     console.log(`renderer[${WORKER_ID}]: STATIC skipped ad=${shortId} reason=${result.reason || '-'} wall=${wallSec}s`);
     await Ad.updateOne(
       { _id: adId, claimedByWorker: WORKER_ID },
@@ -880,6 +934,8 @@ async function renderStatic(ad) {
   if (!result?.buffer) {
     throw new Error('renderDirectImage returned no buffer — cannot upload');
   }
+  noteFeed(ad, 'atlas image ready');
+  noteFeed(ad, 'cloudinary upload');
   const upload = await uploadRenderToCloudinary(result, {
     brandId:        ad.brandId ? String(ad.brandId) : 'unknown',
     campaignId:     ad.campaignId ? String(ad.campaignId) : 'unknown',
@@ -921,6 +977,7 @@ async function renderStatic(ad) {
   );
 
   console.log(`renderer[${WORKER_ID}]: STATIC done ad=${shortId} wall=${wallSec}s url=${upload.renderUrl.slice(0, 60)}…`);
+  noteFeedEvent(ad, 'done');
   await bumpRunCounter(ad.campaignRunIds, 'succeeded');
 }
 
@@ -966,6 +1023,7 @@ async function requeueDeriveForRetry(ad, reason) {
     }
   );
   console.log(`renderer[${WORKER_ID}]: derive requeued ad=${String(ad._id).slice(-6)} — ${reason}`);
+  noteFeed(ad, 'derive: retrying (sibling master not ready)');
 }
 
 /**
@@ -1073,6 +1131,7 @@ async function renderVideo(ad) {
   if (deriveFromFmt) {
     // ── DERIVE PATH — no Omni submit, ever ─────────────────────────────
     console.log(`renderer[${WORKER_ID}]: VIDEO DERIVE start ad=${shortId} deriveFrom=${deriveFromFmt}`);
+    noteFeed(ad, 'derive: waiting for sibling master');
 
     if ((ad.deriveWaitAttempts || 0) >= MAX_DERIVE_WAIT_ATTEMPTS) {
       throw new Error(`derive exceeded max wait attempts (${MAX_DERIVE_WAIT_ATTEMPTS}); sibling master never landed`);
@@ -1094,6 +1153,8 @@ async function renderVideo(ad) {
       await requeueDeriveForRetry(ad, 'sibling master not yet ready — retry later');
       return; // NOT counted as failure; requeue is the intent
     }
+
+    noteFeed(ad, 'derive: inherited master');
 
     // Inherit the paid master's veoVideoUrl / cloudinary asset onto the derive.
     // Two modes, one atomic write — DO NOT split (a two-write shape opens a
@@ -1138,6 +1199,7 @@ async function renderVideo(ad) {
         `renderer[${WORKER_ID}]: VIDEO DERIVE handoff ad=${shortId} wall=${wallSec}s ` +
         `— stamped titlingNeeded=true, released to titler`
       );
+      noteFeed(ad, 'derive: handed off to titler');
       // Do NOT bumpRunCounter — the ad hasn't settled yet, the titler owns
       // the terminal stamp. `updatedAt` above keeps the CampaignRun off the
       // reaper radar during the brief poll window before titler claims.
@@ -1297,6 +1359,7 @@ async function renderVideo(ad) {
     console.log(
       `renderer[${WORKER_ID}]: VIDEO DERIVE done ad=${shortId} wall=${wallSec}s status=${deriveSettled.status}`
     );
+    noteFeedEvent(ad, deriveSettled.status === 'draft' ? 'done' : `failed — ${deriveSettled.status}`);
     await bumpRunCounter(ad.campaignRunIds, deriveSettled.counter);
     return;
   }
@@ -1330,6 +1393,7 @@ async function renderVideo(ad) {
   if (veoResult.skipped) {
     throw new Error(veoResult.reason || 'video generation skipped by provider');
   }
+  noteFeed(ad, 'master video ready');
 
   // Persist master + titling debt marker in one write (see backend
   // routes/ads.js:2940 — this shape is the money-critical stamp that
@@ -1402,6 +1466,7 @@ async function renderVideo(ad) {
       `renderer[${WORKER_ID}]: VIDEO MASTER handoff ad=${shortId} wall=${wallSec}s ` +
       `— stamped titlingNeeded=true, released to titler`
     );
+    noteFeed(ad, 'handed off to titler');
     // Do NOT bumpRunCounter — the ad hasn't settled yet, the titler owns
     // the terminal stamp. `updatedAt` above keeps the CampaignRun off the
     // reaper radar during the brief poll window before titler claims.
@@ -1502,6 +1567,7 @@ async function renderVideo(ad) {
   console.log(
     `renderer[${WORKER_ID}]: VIDEO MASTER done ad=${shortId} wall=${wallSec}s status=${masterSettled.status}`
   );
+  noteFeedEvent(ad, masterSettled.status === 'draft' ? 'done' : `failed — ${masterSettled.status}`);
   await bumpRunCounter(ad.campaignRunIds, masterSettled.counter);
 }
 
@@ -1644,6 +1710,7 @@ async function processAd(ad) {
   const runHeartbeat = await acquireRunHeartbeat(runIdOf(ad));
   try {
     try {
+      noteFeed(ad, `claimed by ${WORKER_ID}`);
       if (ad.renderRoute === 'html_gen') {
         await renderStatic(ad);
       } else if (ad.renderRoute === 'veo') {
@@ -1685,6 +1752,7 @@ async function processAd(ad) {
         } catch (_) {}
       }
       notifyRenderFailure(ad, err);
+      noteFeedEvent(ad, `failed — ${String((err && err.message) || err).slice(0, 80)}`);
 
       // UNSETTLED AT TIMEOUT — NOT a confirmed failure. pollPrediction hit
       // its own MAX_POLL_MS wall-clock budget while the Atlas job was still

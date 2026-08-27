@@ -74,6 +74,29 @@ const TITLING_CLAIMED = 'titling recovered master';
 
 const TITLING_RESUME_MAX = Math.max(1, parseInt(process.env.TITLING_RESUME_MAX, 10) || 5);
 
+const FEED_SOURCE_RESUME = 'titling-resume-sweep';
+function noteResumeFeed(ad, stage, extra) {
+  try {
+    const runFeed = require('./runFeedService');
+    runFeed.attachAd(ad, { source: FEED_SOURCE_RESUME });
+    const runId = Array.isArray(ad && ad.campaignRunIds) && ad.campaignRunIds.length
+      ? ad.campaignRunIds[ad.campaignRunIds.length - 1]
+      : null;
+    if (!runId || !stage) return;
+    runFeed.noteEvent(runId, stage, {
+      adId: ad && ad._id != null ? String(ad._id) : null,
+      source: FEED_SOURCE_RESUME,
+      template: ad && ad.template,
+      aspectRatio: ad && ad.aspectRatio,
+      platformFormat: ad && ad.platformFormat,
+      ...(extra || {})
+    });
+  } catch (err) {
+    try { console.warn(`   ⚠️  titlingResume: runFeed note failed: ${err && err.message}`); }
+    catch (_) { /* alerting must never fail resume */ }
+  }
+}
+
 // How long a claim must sit untouched before another pass may take it over.
 // Generous on purpose: unlike routes/ads.js renderOne, this path does NOT
 // heartbeat updatedAt during the render, so a legitimately in-progress titling
@@ -205,6 +228,7 @@ async function resumeUntitledMasters({ limit = TITLING_RESUME_MAX } = {}) {
         out.skipped++;
         continue;
       }
+      noteResumeFeed(adFresh, 'titling resume: claimed stuck ad');
 
       // Resolve brand the same way routes/ads.js:1328-1331 does — via the ad's
       // source Media brandId. Projection is load-bearing for the proof beat
@@ -273,6 +297,7 @@ async function resumeUntitledMasters({ limit = TITLING_RESUME_MAX } = {}) {
             ).catch(() => {});
           }
           out.titled++;
+          noteResumeFeed(adFresh, 'titling resume: done (no brand — shipping master)');
           console.warn(
             `   ⚠️  titlingResume[${ad._id}]: brand unresolvable for >${BRAND_GIVEUP_MIN}m — ` +
             `shipping the untitled master (matches routes/ads.js no-brand behaviour)`
@@ -305,7 +330,9 @@ async function resumeUntitledMasters({ limit = TITLING_RESUME_MAX } = {}) {
       // churning Mongo connections. So the render is marked, and only a throw from
       // INSIDE it is allowed to be terminal — a pre-render throw releases instead.
       renderAttempted = true;
+      noteResumeFeed(adFresh, 'titling resume: remotion start');
       await renderBrandScriptAndSave({ ad: adFresh, brand });
+      noteResumeFeed(adFresh, 'titling resume: remotion done');
 
       // Success (including skipped / no-chrome — routes/ads.js treats that as
       // intentional success). Do NOT overwrite renderUrl/posterUrl —
@@ -339,6 +366,7 @@ async function resumeUntitledMasters({ limit = TITLING_RESUME_MAX } = {}) {
         );
       }
       out.titled++;
+      noteResumeFeed(adFresh, 'titling resume: done');
     } catch (err) {
       // A PRE-RENDER throw is NOT the ad's fault — release, do not condemn.
       // These are DB reads (claim / findById / Media / Brand). A Mongo blip during
@@ -377,6 +405,7 @@ async function resumeUntitledMasters({ limit = TITLING_RESUME_MAX } = {}) {
         );
         continue;
       }
+      noteResumeFeed(ad, `titling resume: failed — ${String((err && err.message) || err).slice(0, 80)}`);
       if (err && err.titlingResumable === false) {
         // Attempt cap reached — brandScriptExecutor already wrote the
         // terminal stamp (status:'failed', titlingResumeState:null, a

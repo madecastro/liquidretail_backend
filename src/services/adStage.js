@@ -55,8 +55,9 @@ function formatElapsed(ms) {
  *
  * @param {string|object} adId
  * @param {string} stage
+ * @param {object} [extra]  optional run-feed meta (e.g. `{ source }`).
  */
-function adStage(adId, stage) {
+function adStage(adId, stage, extra) {
   if (adId == null || stage == null || stage === '') return;
   const id = String(adId);
   const text = String(stage);
@@ -76,7 +77,7 @@ function adStage(adId, stage) {
     // Lazy require: keeps adStage load free of the feed's optional deps
     // and avoids a cycle if the feed ever pulls adStage helpers.
     // eslint-disable-next-line global-require
-    require('./runFeedService').onStage(id, text);
+    require('./runFeedService').onStage(id, text, extra);
   } catch { /* never escape to a render path */ }
 
   Ad.updateOne(

@@ -2,7 +2,7 @@
   "version": 1,
   "backendRef": "origin/main",
   "backendHead": "a1df77e95159ea70653d26cfe59e3dece6e52d7f",
-  "generatedAt": "2026-08-26T23:37:44.933Z",
+  "generatedAt": "2026-08-27T00:05:03.508Z",
   "files": {
     "models/Ad.js": {
       "backendHash": "4caa2896cc4a2dcd56f5ccb4ba73c37d9675c9c4f59993f235befbc1b0d6672e",
@@ -409,7 +409,8 @@
     "services/adStage.js": {
       "backendHash": "437314029f1ff3ea5dcd35f68ba074c2fbc30fe20c38c706f72e9b3c4b66529b",
       "backendSha": "36aedfa35e671da580d3e1d323431f431752b576",
-      "status": "synced"
+      "status": "fork",
+      "reason": "forward optional extra (source) to runFeed.onStage so adgen subsystem tags flow through the existing adStage choke point; Mongo renderStage write unchanged."
     },
     "services/adTitlingTruth.js": {
       "backendHash": "217adb4910d27b03e7fdffc57c43e70df0ec153094d21d48db58286c630078f0",
@@ -1061,7 +1062,8 @@
     "services/runFeedService.js": {
       "backendHash": "bae1670bd36705c2e5306c7bb0abe9272152d776655a7842d46636d2c5af3de1",
       "backendSha": "49e086928bd936142a967b99c1ded9f653ebc604",
-      "status": "synced"
+      "status": "fork",
+      "reason": "adgen attachAd: READ CampaignRun.slackFeed (backend startRun's in-memory adToRun lives in a different process) and thread under the existing parent; never create a parent from adgen roles. Additive source tag on formatThreadLine/onStage/noteEvent so renderer/titler/resume/boot-recovery events name their subsystem."
     },
     "services/salesDemosService.js": {
       "backendHash": "eaea9fa1bed266f7c8abb885aaa649c12165efb5d8744398134e7793ba3a226e",

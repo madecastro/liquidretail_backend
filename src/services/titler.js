@@ -82,6 +82,43 @@ const state = {
 function log(msg) { console.log(`titler[${WORKER_ID}]: ${msg}`); }
 function warn(msg) { console.warn(`titler[${WORKER_ID}]: ${msg}`); }
 
+// Per-run Slack thread. Same contract as renderer.js's noteFeed: attach to
+// the backend-created CampaignRun.slackFeed parent, never create one,
+// never throw into a billed path.
+const FEED_SOURCE_TITLER = 'adgen-titler';
+function noteFeed(ad, stage) {
+  try {
+    const runFeed = require('./runFeedService');
+    runFeed.attachAd(ad, { source: FEED_SOURCE_TITLER });
+    if (stage) adStage(ad && ad._id, stage);
+  } catch (err) {
+    try { warn(`runFeed note failed: ${err && err.message}`); }
+    catch (_) { /* alerting must never fail titling */ }
+  }
+}
+function noteFeedEvent(ad, stage, extra) {
+  try {
+    const runFeed = require('./runFeedService');
+    runFeed.attachAd(ad, { source: FEED_SOURCE_TITLER });
+    const runId = Array.isArray(ad && ad.campaignRunIds) && ad.campaignRunIds.length
+      ? ad.campaignRunIds[ad.campaignRunIds.length - 1]
+      : null;
+    if (!runId || !stage) return;
+    runFeed.noteEvent(runId, stage, {
+      adId: ad && ad._id != null ? String(ad._id) : null,
+      source: FEED_SOURCE_TITLER,
+      template: ad && ad.template,
+      aspectRatio: ad && ad.aspectRatio,
+      platformFormat: ad && ad.platformFormat,
+      mediaId: ad && ad.mediaId,
+      ...(extra || {})
+    });
+  } catch (err) {
+    try { warn(`runFeed event failed: ${err && err.message}`); }
+    catch (_) { /* alerting must never fail titling */ }
+  }
+}
+
 function heartbeatOnce() {
   const uptime = state.startedAt ? Math.floor((Date.now() - state.startedAt) / 1000) : 0;
   const gate = isTitlerEnabled() ? 'ON' : 'OFF';
@@ -195,6 +232,14 @@ async function maybeFinalizeRun(runId) {
     if (res && (res.modifiedCount || res.nModified)) {
       log(`run ${runId} finalized -> done (succeeded=${outcome.succeeded} failed=${outcome.failed})`);
       notifyRunFinalized(runId, outcome);
+      try {
+        require('./runFeedService').finishRun({
+          runId,
+          succeeded: outcome.succeeded,
+          failed: outcome.failed,
+          skipped: outcome.skipped || 0
+        });
+      } catch (_) { /* feed must never fail finalization */ }
     }
   } catch (err) {
     warn(`maybeFinalizeRun(${runId}) failed: ${err.message}`);
@@ -320,6 +365,7 @@ async function titleAd(ad) {
   const isDerive = !!(ad.deriveFromMaster);
   const label = isDerive ? 'DERIVE' : 'MASTER';
   log(`VIDEO ${label} titling start ad=${shortId} format=${ad.platformFormat}`);
+  noteFeed(ad, `claimed for titling (${label.toLowerCase()})`);
 
   // Load brand (via ad.mediaId → Media.brandId, else ad.brandId).
   const sourceMedia = ad.mediaId ? await Media.findById(ad.mediaId).select('brandId').lean() : null;
@@ -354,10 +400,12 @@ async function titleAd(ad) {
     const beat = startAdHeartbeat(adId);
     try {
       try {
+        noteFeed(ad, `titling remotion start (${ad.aspectRatio || '9:16'})`);
         const chromeOut = await renderBrandScriptAndSave({ ad: adFinal, brand: brandDoc });
         if (chromeOut?.skipped) {
           log(`VIDEO ${label} no-chrome ad=${shortId} — shipping master`);
         }
+        noteFeed(ad, 'titling remotion done');
       } catch (scriptErr) {
         // scriptErr.titlingResumable is stamped by brandScriptExecutor's
         // stampTitlingFailureAndThrow for OOM, timeout, AND a generic child
@@ -430,6 +478,7 @@ async function titleAd(ad) {
     : await settleNonDraftTerminal(ad, `VIDEO ${label}`);
   const wallSec = ((Date.now() - t0) / 1000).toFixed(1);
   log(`VIDEO ${label} done ad=${shortId} wall=${wallSec}s status=${settled.status}`);
+  noteFeedEvent(ad, settled.status === 'draft' ? 'done' : `failed — ${settled.status}`);
   await bumpRunCounter(ad.campaignRunIds, settled.counter);
   return { settled };
 }
@@ -441,6 +490,7 @@ async function processAd(ad) {
   state.inFlight.add(adKey);
   try {
     try {
+      noteFeed(ad, `claimed by ${WORKER_ID}`);
       await titleAd(ad);
     } catch (err) {
       const shortId = adKey.slice(-6);
@@ -483,6 +533,7 @@ async function processAd(ad) {
       } catch (bumpErr) {
         warn(`bump-fail write failed for ${adKey.slice(-6)}: ${bumpErr.message}`);
       }
+      noteFeedEvent(ad, `failed — ${String((err && err.message) || err).slice(0, 80)}`);
       try {
         alerts.notifyAsync({
           level: 'error',

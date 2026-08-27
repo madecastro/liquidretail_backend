@@ -28,9 +28,11 @@
 // A lost claim must NOT create a second parent.
 //
 // Hook surface: services/adStage.js (every stage write) + runRenderLoop
-// start/finish in routes/ads.js. Poll ticks
-// ("… — polling 20s (7)") are filtered structurally from the thread log;
-// they still refresh the parent's "now:" line.
+// start/finish in routes/ads.js (backend process). Adgen is a different
+// Node process, so startRun's in-memory adToRun map is empty here —
+// attachAd reads CampaignRun.slackFeed and threads under the existing
+// parent. Poll ticks ("… — polling 20s (7)") are filtered structurally
+// from the thread log; they still refresh the parent's "now:" line.
 
 const os = require('os');
 const { stageBase, formatElapsed } = require('./adStage');
@@ -65,6 +67,41 @@ const MAX_TRACKED_RUNS = 40;
 const ENV_LABEL = () => process.env.ALERT_ENV_LABEL || process.env.NODE_ENV || 'prod';
 const ROLE      = () => process.env.ALERT_ROLE || (process.env.RENDER_SERVICE_TYPE === 'background_worker' ? 'worker' : 'web');
 const INSTANCE  = () => (process.env.RENDER_INSTANCE_ID || os.hostname() || '?').slice(-8);
+
+// Subsystem tags for thread lines. Backend's startRun lives in a different
+// process, so adgen events must name which worker/sweep posted them — the
+// parent footer only shows THIS process's ROLE/INSTANCE.
+const SOURCE = Object.freeze({
+  RENDERER_STATIC: 'adgen-renderer (static)',
+  RENDERER_VIDEO:  'adgen-renderer (video)',
+  TITLER:          'adgen-titler',
+  TITLING_RESUME:  'titling-resume-sweep',
+  BOOT_RECOVERY:   'boot-recovery-sweep'
+});
+
+function isAdgenRole() {
+  const role = String(process.env.ADGEN_ROLE || '');
+  return role === 'api' || role === 'orchestrator' || role === 'renderer' || role === 'titler';
+}
+
+function inferSource(ad, explicit) {
+  if (explicit != null && String(explicit).trim()) return String(explicit).trim();
+  const role = String(process.env.ADGEN_ROLE || '');
+  if (role === 'titler') return SOURCE.TITLER;
+  if (ad && (ad.renderRoute === 'veo' || ad.kind === 'video' || ad.titlingNeeded === true)) {
+    return SOURCE.RENDERER_VIDEO;
+  }
+  if (role === 'renderer') return SOURCE.RENDERER_STATIC;
+  return null;
+}
+
+function runIdOfAd(ad) {
+  if (!ad) return null;
+  if (Array.isArray(ad.campaignRunIds) && ad.campaignRunIds.length) {
+    return String(ad.campaignRunIds[ad.campaignRunIds.length - 1]);
+  }
+  return null;
+}
 
 const SLACK_MAX = 3900; // leave headroom under Slack's ~4000 text limit
 
@@ -112,8 +149,11 @@ class RingBuffer {
 const runs = new Map();
 /** adId → runId (so adStage can route without a Mongo round-trip) */
 const adToRun = new Map();
-/** adId → { template, aspectRatio, mediaId, platformFormat } */
+/** adId → { template, aspectRatio, mediaId, platformFormat, source } */
 const adMeta = new Map();
+/** adId → [{ stage, extra, t }] buffered until attachAd maps the ad */
+const pendingByAd = new Map();
+const lazyAttachInFlight = new Set();
 
 let timer = null;
 let timerIntervalMs = 0;
@@ -208,6 +248,9 @@ function iconFor(stage) {
   if (/crop|logo|composite/.test(s)) return '✂';
   if (/skip|archived/.test(s)) return '⊘';
   if (/stall/.test(s)) return '⏱';
+  if (/retry/.test(s)) return '↻';
+  if (/claim|claimed/.test(s)) return '▸';
+  if (/recover|resume/.test(s)) return '♻';
   if (/ready|download|mirror|plate generation(?!.*polling)/.test(s)) return '✓';
   if (/start|generat|render|static image|master video|preparing|deriving|fetching|building|reference|reusing/.test(s)) {
     return '▶';
@@ -224,7 +267,10 @@ function formatThreadLine(ev) {
   const icon = iconFor(ev.stage);
   const base = stageBase(ev.stage) || ev.stage || '?';
   const meta = ev.meta || {};
-  const bits = [`${t}  ${icon} ${base}`];
+  // Additive: when source is absent the line is byte-identical to before.
+  const source = ev.source || meta.source || null;
+  const tagged = source ? `[${source}] ${base}` : base;
+  const bits = [`${t}  ${icon} ${tagged}`];
   if (meta.template || meta.aspectRatio) {
     bits.push(`${meta.template || '?'}/${meta.aspectRatio || '?'}`);
   }
@@ -484,7 +530,13 @@ function makeRunState(opts) {
     finishSummary: null,
     lastParentAt: 0,
     parentDirty: true,
-    needsParent: true
+    needsParent: true,
+    // Adgen attaches to a parent the backend already created. When true,
+    // ensureParent READs CampaignRun.slackFeed and never chat.postMessage's
+    // a new parent. Missing slackFeed → silent no-op (bounded ring drop).
+    adoptOnly: !!opts.adoptOnly,
+    _noParent: false,
+    _hydrateInFlight: false
   };
 }
 
@@ -678,7 +730,9 @@ function finishRun(opts = {}) {
     if (!st) {
       // Finish without start (edge): still emit a one-shot summary if configured.
       st = makeRunState(opts);
+      if (isAdgenRole()) st.adoptOnly = true;
       runs.set(rid, st);
+      if (st.adoptOnly) scheduleHydrateParent(st);
     }
     st.finished = true;
     st.cancelled = !!opts.cancelled;
@@ -771,12 +825,145 @@ async function summariseFailures(runId) {
     .slice(0, 4);   // a run with 5+ distinct causes is a story for the board
 }
 
+function enqueuePending(adId, ev) {
+  const q = pendingByAd.get(adId) || [];
+  if (q.length >= 20) q.shift();
+  q.push(ev);
+  pendingByAd.set(adId, q);
+}
+
+function drainPending(adId) {
+  const q = pendingByAd.get(adId);
+  if (!q || !q.length) return;
+  pendingByAd.delete(adId);
+  for (const ev of q) {
+    recordStage(adId, ev.stage, ev.extra, ev.t);
+  }
+}
+
+function recordStage(id, text, extra, t) {
+  const rid = adToRun.get(id);
+  if (!rid) return false;
+  const st = runs.get(rid);
+  if (!st) return false;
+
+  st.lastStageByAd.set(id, text);
+  st.parentDirty = true;
+  if (st._noParent) return true;
+  if (isPollTick(text)) return true;
+
+  const stored = adMeta.get(id) || {};
+  const merged = Object.assign({}, stored, extra || {});
+  const source = (extra && extra.source) || stored.source || null;
+  st.ring.push({
+    t: t || _now(),
+    stage: text,
+    adId: id,
+    source,
+    meta: merged
+  });
+  ensureTimer();
+  return true;
+}
+
+function scheduleHydrateParent(st) {
+  if (!st || st._hydrateInFlight || st.parentTs || st._noParent) return;
+  st._hydrateInFlight = true;
+  Promise.resolve()
+    .then(async () => {
+      const existing = await readParentTs(st.runId);
+      if (existing && existing.ts) {
+        st.parentTs = existing.ts;
+        st.channel = existing.channel || st.channel;
+        st.needsParent = false;
+      }
+    })
+    .catch(() => {})
+    .then(() => { st._hydrateInFlight = false; });
+}
+
+function scheduleLazyAttach(adId) {
+  if (lazyAttachInFlight.has(adId) || adToRun.has(adId)) return;
+  lazyAttachInFlight.add(adId);
+  Promise.resolve()
+    .then(async () => {
+      const Ad = AdModel();
+      if (!Ad || typeof Ad.findById !== 'function') return;
+      const q = Ad.findById(adId);
+      const selected = q && typeof q.select === 'function'
+        ? q.select('campaignRunIds template aspectRatio mediaId platformFormat renderRoute kind brandId')
+        : q;
+      const ad = selected && typeof selected.lean === 'function'
+        ? await selected.lean()
+        : await selected;
+      if (ad) attachAd(ad);
+    })
+    .catch(() => {})
+    .then(() => { lazyAttachInFlight.delete(adId); });
+}
+
+/**
+ * Adopt an ad into this process's feed state, threading under the
+ * CampaignRun.slackFeed parent the backend already created. Never
+ * creates a new parent. Fire-and-forget. Never throws.
+ *
+ * This is the adgen-side counterpart to startRun: startRun populates
+ * in-memory adToRun in the BACKEND process. Adgen is a different Node
+ * process, so that map is empty here even though slackFeed.ts is in Mongo.
+ */
+function attachAd(ad, opts = {}) {
+  try {
+    if (_forceThrow) throw new Error('runFeed forced throw');
+    if (!ad || ad._id == null) return;
+    if (!isConfigured()) {
+      warnUnconfiguredOnce();
+      return;
+    }
+    const adId = String(ad._id);
+    const rid = runIdOfAd(ad);
+    if (!rid) return;
+
+    const source = inferSource(ad, opts.source);
+    const prev = adMeta.get(adId) || {};
+    adToRun.set(adId, rid);
+    adMeta.set(adId, {
+      template: ad.template || prev.template || null,
+      aspectRatio: ad.aspectRatio || prev.aspectRatio || null,
+      mediaId: ad.mediaId != null ? String(ad.mediaId) : (prev.mediaId || null),
+      platformFormat: ad.platformFormat || prev.platformFormat || null,
+      source: source || prev.source || null
+    });
+
+    let st = runs.get(rid);
+    if (!st) {
+      st = makeRunState({
+        runId: rid,
+        brandId: ad.brandId || null,
+        adoptOnly: true
+      });
+      st.adoptOnly = true;
+      runs.set(rid, st);
+      pruneRuns();
+    } else {
+      st.adoptOnly = true;
+    }
+    scheduleHydrateParent(st);
+    drainPending(adId);
+    ensureTimer();
+  } catch (err) {
+    try { console.warn(`📡 runFeed.attachAd: ${err && err.message}`); } catch { /* ignore */ }
+  }
+}
+
 /**
  * Record a stage transition for an ad. Called from adStage (choke point).
  * Fire-and-forget. Poll ticks update the parent "now:" view only — they do
  * NOT enter the thread ring buffer.
+ *
+ * Optional third arg `{ source }` tags the subsystem. When omitted, the
+ * source stored by attachAd (adMeta) is used.
  */
-function onStage(adId, stage) {
+function onStage(adId, stage, extra) {
   try {
     if (_forceThrow) throw new Error('runFeed forced throw');
     if (adId == null || stage == null || stage === '') return;
@@ -784,27 +971,17 @@ function onStage(adId, stage) {
 
     const id = String(adId);
     const text = String(stage);
-    const rid = adToRun.get(id);
-    if (!rid) return; // not part of a tracked run in this process
-
-    const st = runs.get(rid);
-    if (!st) return;
-
-    // Parent "now:" always wants the latest stage, including poll progress.
-    st.lastStageByAd.set(id, text);
-    st.parentDirty = true;
-
-    // Thread log: exclude poll ticks structurally.
-    if (isPollTick(text)) return;
-
-    const meta = adMeta.get(id) || {};
-    st.ring.push({
-      t: _now(),
-      stage: text,
-      adId: id,
-      meta
-    });
-    ensureTimer();
+    const meta = extra && typeof extra === 'object' ? extra : {};
+    if (meta.source) {
+      const stored = adMeta.get(id) || {};
+      adMeta.set(id, Object.assign({}, stored, { source: meta.source }));
+    }
+    if (!adToRun.get(id)) {
+      enqueuePending(id, { stage: text, extra: meta, t: _now() });
+      scheduleLazyAttach(id);
+      return;
+    }
+    recordStage(id, text, meta);
   } catch (err) {
     try { console.warn(`📡 runFeed.onStage: ${err && err.message}`); } catch { /* ignore */ }
   }
@@ -812,6 +989,8 @@ function onStage(adId, stage) {
 
 /**
  * Optional direct event (run-level, not from adStage). Fire-and-forget.
+ * If this process has not yet attached the run, adopts it (READ slackFeed,
+ * never create a parent) so QC/sweep notes still land in the existing thread.
  */
 function noteEvent(runId, stage, meta = {}) {
   try {
@@ -820,13 +999,28 @@ function noteEvent(runId, stage, meta = {}) {
     if (!isConfigured()) return;
     if (isPollTick(stage)) return;
     const rid = String(runId);
-    const st = runs.get(rid);
-    if (!st) return;
+    let st = runs.get(rid);
+    if (!st) {
+      st = makeRunState({ runId: rid, adoptOnly: true });
+      st.adoptOnly = true;
+      runs.set(rid, st);
+      scheduleHydrateParent(st);
+    }
+    if (st._noParent) return;
+    const adId = meta && meta.adId ? String(meta.adId) : null;
+    if (adId) {
+      adToRun.set(adId, rid);
+      const stored = adMeta.get(adId) || {};
+      if (meta.source) adMeta.set(adId, Object.assign({}, stored, { source: meta.source }));
+    }
+    const stored = adId ? (adMeta.get(adId) || {}) : {};
+    const merged = Object.assign({}, stored, meta || {});
     st.ring.push({
       t: _now(),
       stage: String(stage),
-      adId: meta.adId ? String(meta.adId) : null,
-      meta: meta || {}
+      adId,
+      source: merged.source || null,
+      meta: merged
     });
     st.parentDirty = true;
     ensureTimer();
@@ -839,18 +1033,30 @@ function noteEvent(runId, stage, meta = {}) {
 
 async function ensureParent(st) {
   if (st.parentTs) return st.parentTs;
+  if (st._noParent) return null;
   if (st.claimInFlight || st.parentCreateInFlight) return null;
   if (!isConfigured()) return null;
 
   st.claimInFlight = true;
   try {
-    // 1. Already claimed by another instance?
+    // 1. Already claimed by another instance (or by backend startRun)?
     const existing = await readParentTs(st.runId);
     if (existing && existing.ts) {
       st.parentTs = existing.ts;
       st.channel = existing.channel || st.channel;
       st.needsParent = false;
       return st.parentTs;
+    }
+
+    // Adgen workers must NEVER create a parent — backend's startRun owns
+    // that write (CampaignRun.slackFeed). Missing slackFeed → silent no-op
+    // (drop the bounded ring so the flush timer can idle).
+    if (st.adoptOnly || isAdgenRole()) {
+      st.ring.drain();
+      st.parentDirty = false;
+      st.needsParent = false;
+      st._noParent = true;
+      return null;
     }
 
     // 2. Create parent message, then claim its ts.
@@ -1101,6 +1307,8 @@ function _resetState() {
   runs.clear();
   adToRun.clear();
   adMeta.clear();
+  pendingByAd.clear();
+  lazyAttachInFlight.clear();
   if (timer) {
     clearInterval(timer);
     timer = null;
@@ -1152,8 +1360,10 @@ module.exports = {
   finishRun,
   onStage,
   noteEvent,
+  attachAd,
   isConfigured,
   isPollTick,
+  SOURCE,
   // pure helpers (tests + formatting reuse)
   summariseFailures,
   formatThreadLine,

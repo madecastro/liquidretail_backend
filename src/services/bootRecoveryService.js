@@ -67,6 +67,29 @@ const RESUME_STALE_MIN = Math.max(1, parseInt(process.env.RESUME_STALE_MIN, 10) 
 // slow or unbounded; whatever is missed is picked up on the next sweep.
 const RESUME_MAX_ADS   = Math.max(1, parseInt(process.env.RESUME_MAX_ADS, 10) || 25);
 
+const FEED_SOURCE_BOOT = 'boot-recovery-sweep';
+function noteBootFeed(ad, stage, extra) {
+  try {
+    const runFeed = require('./runFeedService');
+    runFeed.attachAd(ad, { source: FEED_SOURCE_BOOT });
+    const runId = Array.isArray(ad && ad.campaignRunIds) && ad.campaignRunIds.length
+      ? ad.campaignRunIds[ad.campaignRunIds.length - 1]
+      : null;
+    if (!runId || !stage) return;
+    runFeed.noteEvent(runId, stage, {
+      adId: ad && ad._id != null ? String(ad._id) : null,
+      source: FEED_SOURCE_BOOT,
+      template: ad && ad.template,
+      aspectRatio: ad && ad.aspectRatio,
+      platformFormat: ad && ad.platformFormat,
+      ...(extra || {})
+    });
+  } catch (err) {
+    try { console.warn(`   ⚠️  bootRecovery: runFeed note failed: ${err && err.message}`); }
+    catch (_) { /* alerting must never fail recovery */ }
+  }
+}
+
 function enabled() {
   return String(process.env.RESUME_IN_FLIGHT_ON_BOOT ?? 'true').toLowerCase() !== 'false';
 }
@@ -157,6 +180,7 @@ async function resumeInFlightAds({
   );
 
   for (const ad of ads) {
+    noteBootFeed(ad, 'boot recovery: peeking stuck ad');
     // ROUTE BY WHICH RECEIPT THE AD ACTUALLY HOLDS, never by ad.kind — kind is not
     // always populated on a stranded row, whereas the receipt is the thing that
     // proves what was bought. Video wins a tie: if somehow both are present, the
@@ -177,6 +201,9 @@ async function resumeInFlightAds({
       }
       if (ir.state === 'recovered') {
         out.recovered++;
+        noteBootFeed(ad, ir.qcFailed
+          ? 'boot recovery: recovered static (vision QC failed)'
+          : 'boot recovery: recovered static plate');
         console.log(
           `   ✅ bootRecovery[${ad._id}]: static plate recovered from receipt ${ir.predictionId}` +
           `${ir.qcFailed ? ' (vision QC failed — kept paid render, status failed)' : ''} — $0 image submit`
@@ -212,6 +239,7 @@ async function resumeInFlightAds({
               .catch(() => {});
           }
           out.failed++;
+          noteBootFeed(ad, 'boot recovery: image prediction failed');
         } catch (err) {
           console.warn(`   ⚠️  bootRecovery[${ad._id}]: could not record image failure — ${err.message}`);
           out.unknown++;
@@ -282,6 +310,7 @@ async function resumeInFlightAds({
         );
         if (res.modifiedCount > 0) {
           out.recovered++;
+          noteBootFeed(ad, 'boot recovery: recovered paid master');
           console.log(
             `   ✅ bootRecovery[${ad._id}]: master recovered from receipt ${r.predictionId} — queued for titling`
           );
@@ -341,6 +370,7 @@ async function resumeInFlightAds({
           } }
         );
         out.failed++;
+        noteBootFeed(ad, 'boot recovery: video prediction failed');
       } catch (err) {
         console.warn(`   ⚠️  bootRecovery[${ad._id}]: could not record failure — ${err.message}`);
       }
