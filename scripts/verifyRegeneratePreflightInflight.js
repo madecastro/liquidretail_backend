@@ -502,6 +502,104 @@ const SYNCED    = /exported to Meta/i;
     assert.strictEqual(matchClause(row({ status: 'failed' }), lockCalls[0]), true);
   });
 
+  // ── E. MERGE-ORDER GUARD — completeness is a property of the BASE ─────
+  //
+  // Everything above tests THIS diff. This group goes red on a regression
+  // introduced by SOMEONE ELSE'S merge, which nothing above can see.
+  //
+  // The guard is an EXCLUSION list (`$nin: ['rendering','queued']`,
+  // `$nin: ['pending','claimed']`). That shape is silently incomplete the
+  // moment another PR adds a new Ad.status or titlingResumeState value
+  // meaning "in flight": the new value is not in the exclusion list, so the
+  // guard permits it, the double-bill reopens, and every check above stays
+  // GREEN because none of them knows the enum grew.
+  //
+  // So the enum is asserted against an EXPLICIT classification of every
+  // known value. A rebase that adds a status fails E1 and forces whoever
+  // added it to declare which side of the money guard it falls on. Read from
+  // the REAL compiled schema, not from the source text or from this file's
+  // stub — mongoose compiles it with no DB connection.
+  const REAL_AD = (() => {
+    delete require.cache[AD];
+    return require('../models/Ad');
+  })();
+
+  // status → must the in-flight guard REFUSE it?
+  const STATUS_VERDICT = {
+    queued:    true,   // pre-submit; claimAdsForRun will claim and render it
+    rendering: true,   // the initial render's own claim
+    draft:     false,  // a SUCCESSFUL first render — the feature's main input
+    live:      false,  // approved/promoted; still regenerable
+    archived:  false,  // not in-flight work; selectAdsForRun is queued-only
+    failed:    false   // the other main input; must never be blocked
+  };
+  const TITLING_VERDICT = { pending: true, claimed: true, null: false };
+
+  check('E1 [MERGE-ORDER] Ad.status enum is exactly the set this guard classifies', () => {
+    const real = REAL_AD.schema.path('status').enumValues.slice().sort();
+    const known = Object.keys(STATUS_VERDICT).sort();
+    assert.deepStrictEqual(real, known,
+      `Ad.status changed under this guard.\n  schema: ${JSON.stringify(real)}\n  classified: ${JSON.stringify(known)}\n`
+      + '  A NEW status is not in the guard\'s $nin exclusion list, so it is PERMITTED by default.\n'
+      + '  Decide whether it is in-flight (add it to both halves + STATUS_VERDICT) or not (STATUS_VERDICT only).');
+  });
+  check('E2 [MERGE-ORDER] titlingResumeState enum is exactly the set this guard classifies', () => {
+    const real = REAL_AD.schema.path('titlingResumeState').enumValues
+      .map(v => String(v)).sort();
+    const known = Object.keys(TITLING_VERDICT).sort();
+    assert.deepStrictEqual(real, known,
+      `titlingResumeState changed under this guard: ${JSON.stringify(real)} vs ${JSON.stringify(known)}\n`
+      + '  A new titling state is PERMITTED by default — see E1.');
+  });
+  check('E3 [MERGE-ORDER] both halves still agree with the declared verdict for every status', () => {
+    for (const [status, mustRefuse] of Object.entries(STATUS_VERDICT)) {
+      const readRefuses  = regen.inFlightRefusal(row({ status })) !== null;
+      const writeRefuses = !lockMatches({ status });
+      assert.strictEqual(readRefuses, mustRefuse,
+        `read side disagrees on status:'${status}' (refuses=${readRefuses}, declared=${mustRefuse})`);
+      assert.strictEqual(writeRefuses, mustRefuse,
+        `write side disagrees on status:'${status}' (refuses=${writeRefuses}, declared=${mustRefuse})`);
+    }
+  });
+  check('E4 [MERGE-ORDER] the guard still covers the schema fields it reads', () => {
+    for (const f of ['status', 'titlingResumeState', 'veoVideoUrl', 'renderUrl', 'regenerating']) {
+      assert.ok(REAL_AD.schema.path(f), `Ad.${f} no longer exists — the guard reads a field that is gone`);
+    }
+  });
+
+  // E5 — the CROSS-FILE coupling. The `queued` and `rendering` arms exist
+  // because of a mechanism in another file: claimAdsForRun's atomic
+  // `{status:'queued'}` -> `'rendering'` claim. If a rebase moves that claim
+  // to a different source status, those two arms stop guarding the thing
+  // their comment says they guard, and nothing else here would notice.
+  check('E5 [MERGE-ORDER] claimAdsForRun still claims queued -> rendering', () => {
+    const src = require('fs').readFileSync(
+      require('path').join(__dirname, '..', 'routes', 'ads.js'), 'utf8');
+    const i = src.indexOf('async function claimAdsForRun(');
+    assert.ok(i > 0, 'claimAdsForRun is gone from routes/ads.js — re-derive the guard\'s premise');
+    const body = src.slice(i, src.indexOf('\n}\n', i));
+
+    // Bound the slice to the CLAIM STATEMENT, not the whole function. The
+    // function body also contains a `status: 'queued'` in its CLAIM ANOMALY
+    // release path, so a body-wide regex passes even when the claim itself has
+    // moved to a different source status — that false negative was caught by
+    // mutating the filter and watching this check stay green.
+    const claimStart = body.indexOf('const writeResult = await ads.updateMany(');
+    assert.ok(claimStart > 0,
+      'the atomic claim statement (const writeResult = await ads.updateMany) is gone — re-derive the premise');
+    const claimEnd = body.indexOf('\n  );', claimStart);
+    assert.ok(claimEnd > claimStart, 'could not bound the claim statement — its shape changed');
+    const claim = body.slice(claimStart, claimEnd);
+
+    assert.ok(/status:\s*'queued'/.test(claim),
+      'the mint claim no longer FILTERS on status:\'queued\' — the queued arm of the in-flight guard '
+      + 'no longer guards the mechanism its comment cites. Re-derive both arms against the new claim.');
+    assert.ok(/selectedIds/.test(claim),
+      'the mint claim no longer keys on selectedIds — its shape changed under the guard');
+    assert.ok(/\$set:\s*\{[^{}]*status:\s*'rendering'/.test(claim),
+      'the mint claim no longer SETS status:\'rendering\' — the rendering arm\'s premise moved');
+  });
+
   console.log(`\n${fail ? '❌' : '✅'} verifyRegeneratePreflightInflight: ${pass} passed, ${fail} failed\n`);
   process.exit(fail ? 1 : 0);
 })().catch(e => { console.error('harness error:', e); process.exit(1); });
