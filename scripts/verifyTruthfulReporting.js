@@ -379,8 +379,23 @@ section('B. veo-prompt-scaffold declares itself an approximation');
   // OVER-CAP FINDING, worth pinning in its own right: with a destination
   // profile AND the burned-in-text guard, a 4096-capped model's prompt still
   // exceeds its HARD cap after every droppable line is gone — enforceByteCap
-  // logs "Atlas will reject". Measured 4168 bytes here, which is within 2 bytes
-  // of the 4170-byte prompt observed on the real ad. If this check ever goes
+  // logs "Atlas will reject" — and RETURNS THE OVER-CAP PROMPT ANYWAY rather
+  // than truncating it, so the over-cap body is what gets submitted.
+  //
+  // ⚠️ SCOPE CORRECTION (peer evidence, 2026-08-27). This is a LATENT defect for
+  // the four 4096-capped shapes (grok-i2v ×2, veo3.1, generic) — it is NOT the
+  // explanation for the Marine Layer ad that prompted the investigation. That
+  // master ran `paramShape: 'gemini-omni'`, and its own persisted
+  // renderStages.videoSubmission records `promptBytes: 4170, promptByteCap:
+  // 20000` — 21% of budget, nothing dropped. The 4168-vs-4170 closeness is a
+  // coincidence of prompt SIZE, not evidence of the drop mechanism, and I had
+  // inferred the wrong cap from the missing `Product:` line. At cap 20000
+  // nothing is dropped, so that line's absence on the real ad needs a different
+  // explanation (most likely a falsy `product.title`) which I have NOT verified
+  // and am not going to assert.
+  //
+  // What IS measured and stands: at a 4096 cap this builder drops `Product:`
+  // first and still returns an over-cap prompt. If this check ever goes
   // green-by-shrinking, the over-cap exposure closed and that is worth knowing.
   const onBytes = Buffer.byteLength(grokDestOn, 'utf8');
   check('B4d guard-on + destination at a 4096 cap still EXCEEDS the hard cap (Atlas would reject)',

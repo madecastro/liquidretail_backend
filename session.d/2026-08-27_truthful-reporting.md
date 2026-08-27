@@ -87,9 +87,27 @@ profile at a 4096 cap:
 | preview (guard off) | 3,885 | present |
 | real (guard on) | **4,168** | **dropped** |
 
-4,168 is within **2 bytes** of the 4,170 measured on the real ad. Same builder, different
-budget. **And 4,168 > 4,096** — after every droppable line is gone, so `enforceByteCap` logs
-*"Atlas will reject"*. Flagged as a finding in its own right; pinned by B4d.
+Same builder, different budget. **And 4,168 > 4,096** — after every droppable line is gone, so
+`enforceByteCap` logs *"Atlas will reject"* **and returns the over-cap prompt anyway rather than
+truncating it**, so the over-cap body is what gets submitted. Pinned by B4d.
+
+> **⚠️ SCOPE CORRECTION — peer evidence, same day.** I originally wrote that 4,168 was "within 2
+> bytes of the 4,170 measured on the real ad", implying the real submission was over cap. **That
+> inference is refuted.** The Marine Layer master ran `paramShape: 'gemini-omni'`, and its own
+> persisted `renderStages.videoSubmission` records `promptBytes: 4170, promptByteCap: 20000` — 21%
+> of budget, nothing dropped. The 4,168/4,170 closeness is a coincidence of prompt SIZE, not
+> evidence of the drop mechanism; I had inferred the wrong cap from the missing `Product:` line.
+> Since nothing is dropped at cap 20,000, that line's absence needs a different explanation — most
+> likely a falsy `product.title` — which I have **not** verified and will not assert.
+>
+> What stands, and is arguably worse than I first framed it: `enforceByteCap` uses
+> `caps?.promptByteCap || DEFAULT_BYTE_CAP`, so **any** call site reaching it with `caps` absent or
+> a falsy `promptByteCap` silently gets 4,096. The same frozen prompt text that sits at 21% of
+> budget on gemini-omni is **over cap** on the four 4096-capped shapes (grok-i2v ×2, veo3.1,
+> generic) — a latent defect, and exactly the "frozen invariant text that fits one cap but not
+> another" trap. Two open questions I did not chase: whether any live brand/product actually routes
+> to a 4096-capped shape at this prompt length, and (answered) whether it truncates — it does not,
+> it logs and sends.
 
 **Fix = label, not close.** The destination-less scaffold prompt is a documented frozen
 invariant (`CLAUDE.md` §00, pinned by `verifyPostPilotBatch` B14 against the `9531ae9f`
