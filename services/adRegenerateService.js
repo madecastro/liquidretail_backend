@@ -645,6 +645,31 @@ async function preflight(adId, brandId) {
   return ad;
 }
 
+// THE single source of truth for which regenerate mode will ACTUALLY run and
+// be billed. Defined once and imported — regenerateAd below and the route's
+// 202 body both call this, so the response can never advertise a mode the
+// worker does not run (same one-definition rule as resolveDeriveFromMaster,
+// CLAUDE.md §4).
+//
+// It always returns 'full', and the arguments are accepted and deliberately
+// IGNORED. Video LIGHT (chrome-only, no provider submit) was deleted in
+// a23801e7 together with the HTML/Puppeteer chrome pipeline it depended on;
+// nothing has re-implemented it, and the deleted runVideoLight only honoured
+// an operator prompt via chromeService — now dead code (CLAUDE.md §1). Image
+// ads were always full. So every regenerate re-runs the paid generation:
+// one Omni submit for video, one gpt-image-2/edit for static.
+//
+// MONEY/HONESTY: this must never return the caller's requestedMode. Older
+// clients still send 'light' (the route defaults an absent mode to it), and
+// echoing that back is exactly the billing misrepresentation fixed on
+// 2026-08-26 — the operator was told "only the chrome regenerates" while
+// runVideoFull billed a ~$0.90 video master. Pinned by
+// scripts/verifyRegenerateModeHonesty.js.
+// eslint-disable-next-line no-unused-vars
+function resolveEffectiveRegenMode({ requestedMode, kind } = {}) {
+  return 'full';
+}
+
 // Entry point. Spawned via setImmediate from the route handler — the
 // route responds 202 with { regenerating: true } and the worker runs
 // in the background. The frontend polls /api/catalog/:id/ads-detail
@@ -668,10 +693,11 @@ async function regenerateAd({
 }) {
   const adId      = String(ad._id);
   const kind      = ad.kind || 'image';
-  // Video always regens fully (new Grok video + brand-script chrome).
-  // The `mode` argument is preserved for backward-compat with existing
-  // frontend clients that may still send 'light' — we normalize it here.
-  const effMode   = 'full';
+  // Video always regens fully (new Grok video + brand-script chrome). The
+  // `mode` argument is preserved for backward-compat with existing frontend
+  // clients that may still send 'light'; the shared gate normalizes it, and
+  // the route reports THAT value in its 202 rather than the request's.
+  const effMode   = resolveEffectiveRegenMode({ requestedMode: mode, kind });
   const startedAt = Date.now();
   const historyEntry = {
     prompt:        String(prompt || '').slice(0, 1000),
@@ -1277,6 +1303,10 @@ module.exports = {
   inFlightRefusal,
   notInFlight,
   NOT_IN_FLIGHT_AND,
+  // THE shared billed-mode gate. Imported by routes/ads.js so the 202 reports
+  // the mode that will actually run and be billed — never the caller's.
+  // Always 'full': video LIGHT was deleted in a23801e7.
+  resolveEffectiveRegenMode,
   // Exported so the offline harness can assert the direct-image path
   // (no aiCanvasArtifactId precondition) without invoking providers.
   runImage,

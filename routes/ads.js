@@ -4526,11 +4526,18 @@ router.post('/:id/approve', express.json(), async (req, res) => {
 //            image: refinement note into the live direct_image path).
 //            Required UNLESS one of the override fields below is given.
 //            Up to 1000 chars.
-//   mode:    'light' (default, video only — re-runs chrome + composite,
-//                     Veo unchanged) | 'full' (re-runs Veo too).
-//            Image ads always re-run the live direct_image renderer
-//            (gpt-image-2/edit); mode ignored. Note: adRegenerateService
-//            currently normalises video to full regardless of mode.
+//   mode:    ACCEPTED AND IGNORED. There is no cheaper regenerate. Every
+//            video regenerate re-rolls the master — one billable Omni
+//            submit (~$0.90 settled); every image regenerate is one
+//            billable gpt-image-2/edit. Video LIGHT (chrome-only, no
+//            provider submit) was deleted in a23801e7 with the
+//            HTML/Puppeteer chrome pipeline it needed.
+//            An absent mode still parses as 'light' for back-compat with
+//            older clients, but the 202 reports the mode that will
+//            ACTUALLY run via regen.resolveEffectiveRegenMode — never the
+//            request's. Reporting 'light' here while runVideoFull billed a
+//            video master was a real billing misrepresentation, fixed
+//            2026-08-26; do not reinstate the echo.
 //   promptOverride: { system, user } — image ads only. The operator
 //            edited the EXACT prompt shown in the Generation Details
 //            modal; this text replaces the auto-composed prompt
@@ -4669,12 +4676,27 @@ router.post('/:id/regenerate', express.json(), async (req, res) => {
     }
     const requestedBy = req.user?.userId || req.user?.email || null;
 
+    // MONEY/HONESTY — report the mode that will actually RUN and be billed,
+    // resolved through the ONE shared gate regenerateAd itself uses, so the
+    // 202 cannot disagree with what the operator is charged for. The previous
+    // `ad.kind === 'image' ? 'full' : mode` echoed the request, so a video
+    // regenerate was told mode:'light' while a ~$0.90 Omni master was billed.
+    const billedMode = regen.resolveEffectiveRegenMode({ requestedMode: mode, kind: ad.kind });
+    if (ad.kind === 'video' && mode !== billedMode) {
+      // Operator telemetry only, never a billing gate: surfaces clients still
+      // asking for a cheaper path that does not exist (an omitted mode parses
+      // as 'light', so this also fires for defaults, which is intended).
+      console.log(
+        `🔁 regenerate[ad=${ad._id}]: requested mode='${mode}' ignored — running and billing '${billedMode}'`
+      );
+    }
+
     // 202 — operator polls /api/catalog/:productId/ads-detail for stage.
     res.status(202).json({
       adId:               String(ad._id),
       regenerating:       true,
       regenerationStage:  'pending',
-      mode:               ad.kind === 'image' ? 'full' : mode
+      mode:               billedMode
     });
 
     setImmediate(() => {
