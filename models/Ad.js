@@ -239,10 +239,26 @@ const adSchema = new mongoose.Schema({
   // single bit that decides who executes the work — NOT `regenerating`,
   // which is shared by both the local-execution path (ADGEN_RENDERER_ENABLED
   // false) and the deferred path, and NOT `regenerateClaimedByWorker` alone,
-  // which starts null on every regenerate regardless of path. The local path
-  // NEVER writes this field, so a poller keying its claim query on
-  // `regenerationRequest: {$ne: null}` cannot ever pick up a row the backend
-  // is already executing in-process. Cleared by markComplete alongside
+  // which starts null on every regenerate regardless of path.
+  //
+  // ⚠️ MONEY — THE CLAIM MUST USE $type:'object', NOT $ne:null. This comment
+  // previously described the poller as keying on `{$ne: null}`. That is the
+  // operator that caused a real double-claim bug, and the live consumer does
+  // NOT use it: MongoDB's $ne is documented to match documents that do not
+  // contain the field AT ALL, which is the shape of every pre-migration ad
+  // and of every ad whose regenerate ran on the local path. So {$ne:null}
+  // collapses to matching ANY regenerating:true row — including ones this
+  // process is executing in-process. The live filter is
+  // `regenerationRequest: {$type:'object'}`, which requires an actual stamped
+  // object (excluding both "missing" and explicit null). See
+  // liquidretail_adgen/src/services/regenerateConsumer.js claimOne() and its
+  // regression proof in that repo's
+  // scripts/verifyRegenerateConsumerClaim.js (cases A3/B7).
+  //
+  // The precise invariant this field provides: the local path never writes an
+  // OBJECT here (it writes explicit null — see adRegenerateService.js:658),
+  // so an $type:'object' claim can never pick up a row the backend is already
+  // executing in-process. Cleared by markComplete alongside
   // `regenerating`. Carries exactly the pass-through options
   // services/adRegenerateService.regenerateAd() would otherwise have
   // received as call arguments — see that file for the full shape.
@@ -250,9 +266,10 @@ const adSchema = new mongoose.Schema({
   // Which adgen regenerate-consumer worker (if any) has claimed a deferred
   // regenerationRequest. NULL while queued for adgen but not yet claimed.
   // A worker atomically claims by findOneAndUpdate({regenerating:true,
-  // regenerationRequest:{$ne:null}, regenerateClaimedByWorker:null},
+  // regenerationRequest:{$type:'object'}, regenerateClaimedByWorker:null},
   // {$set:{regenerateClaimedByWorker, regenerateClaimedAt}}) — same shape as
-  // the mint-time claim above. Cleared by markComplete.
+  // the mint-time claim above, and $type:'object' NOT $ne:null for the money
+  // reason spelled out on regenerationRequest above. Cleared by markComplete.
   regenerateClaimedByWorker: { type: String, default: null, index: true },
   regenerateClaimedAt:       { type: Date,   default: null },
 
