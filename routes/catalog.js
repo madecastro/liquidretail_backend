@@ -41,6 +41,11 @@ const catalogProductPromoteService = require('../services/catalogProductPromoteS
 const { catalogSeedFields } = require('../services/catalogImageQuality');
 const { tenantFilter, assertMediaInTenant } = require('../middleware/tenantHelpers');
 const { isAdHonestlyDelivered } = require('../services/adTitlingTruth');
+// adSpendReceipts — the SAME accessor routes/ads.js's projectAd uses, for the
+// same reason summarizeVisionQc is shared above: "did this ad cost money" must
+// not get a second, drifting derivation between the flat ads list and this
+// product-detail expansion.
+const { adSpendReceipts } = require('../services/spendReceipt');
 void assertMediaInTenant;     // kept for future :id verification helpers
 
 function escapeRegex(s) { return String(s || '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); }
@@ -939,7 +944,18 @@ router.get('/:id/ads-detail', async (req, res) => {
           // below alongside adding the real titling-truth fields.
           renderStage: 1, renderStageAt: 1,
           // Inputs to isAdHonestlyDelivered (services/adTitlingTruth.js).
-          titlingResumeState: 1, veoVideoUrl: 1
+          titlingResumeState: 1, veoVideoUrl: 1,
+          // SPEND RECEIPTS (2026-08-27) — the two prediction ids that answer
+          // "did this ad cost money?". routes/ads.js projectAd already emits
+          // them; this endpoint is the PRIMARY Product Ads surface, so leaving
+          // them out here would repeat, for a third time, the exact defect the
+          // visionQc/renderStage comments above record: the flat /api/ads list
+          // knowing something this page does not.
+          //
+          // NOTE the sub-path projection. `imageGeneration` is Mixed and also
+          // carries the full generation prompt; projecting the whole object to
+          // reach one id would drag several KB per row onto a 60-row grid.
+          veoPredictionId: 1, 'imageGeneration.predictionId': 1
       } }
     ], { allowDiskUse: true });
 
@@ -1040,6 +1056,12 @@ router.get('/:id/ads-detail', async (req, res) => {
       previewImageUrl: a.kind === 'video'
         ? null
         : buildGridPreviewImageUrl(photorealMap.get(String(a._id)) || a.renderUrl || null),
+      // Spend receipts — SAME shape routes/ads.js projectAd emits, from the
+      // one shared accessor in services/spendReceipt.js, so the two surfaces
+      // cannot disagree about what a receipt is. Projecting these above
+      // without emitting them here is precisely the 2026-08-20 renderStage
+      // bug recorded in the $project comment; both halves are required.
+      ...adSpendReceipts(a),
       headline:       a.copy?.headline || null,
       ctaText:        (a.copy && a.copy.cta_text) || a.ctaText || null,
       generatedAt:    (a.renderedAt || a.generatedAt)
