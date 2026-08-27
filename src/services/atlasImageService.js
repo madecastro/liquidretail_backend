@@ -184,6 +184,21 @@ function scheduleCostReconcile(predictionId, attempt = 0) {
   }, delays[attempt]).unref?.();
 }
 
+/**
+ * Mirror of atlasVideoService.shouldResumeAttempt for the static/image
+ * charge point. Closes the gap named in commit 2f99218 (PR #40): "the
+ * static/image charge point still has no resume guard at all."
+ *
+ * True only when ALL THREE hold (strict equality, fail-closed):
+ *   allowResume === true, attempt === 1, existingPredictionId a non-empty string.
+ */
+function shouldResumeImageAttempt({ allowResume, attempt, existingPredictionId }) {
+  return allowResume === true
+    && attempt === 1
+    && typeof existingPredictionId === 'string'
+    && existingPredictionId.length > 0;
+}
+
 // ── submit + poll ──────────────────────────────────────────────────────────
 async function submitAndPoll(model, params, meta = {}, { timeoutMs = TIMEOUT_MS } = {}) {
   const generationTimeoutMs = positiveTimeout(timeoutMs, TIMEOUT_MS);
@@ -307,6 +322,16 @@ async function submitAndPoll(model, params, meta = {}, { timeoutMs = TIMEOUT_MS 
     durationMs: Date.now() - t0, status: 'submitted'
   }).catch?.(() => {});
 
+  return pollSubmittedPrediction(id, model, meta, t0, generationTimeoutMs);
+}
+
+/**
+ * Poll an already-submitted prediction to completion. Extracted from
+ * submitAndPoll so a resume can reuse the SAME loop without re-running the
+ * billable POST, the spend-receipt stamp, or the 'submitted' CostLog row.
+ * Body is a byte-for-byte move of the former submitAndPoll poll loop.
+ */
+async function pollSubmittedPrediction(id, model, meta, t0, generationTimeoutMs) {
   let lastStatus = null;
   let transientPolls = 0;   // backoff counter for throttles seen while polling
   let pollCount = 0;
@@ -483,7 +508,27 @@ async function submitAndPoll(model, params, meta = {}, { timeoutMs = TIMEOUT_MS 
     }
     if (st === 'completed' || st === 'succeeded') {
       const out = poll.data.data.outputs?.[0];
-      if (!out) throw await chargedError('Atlas image completed with no outputs', id, model, meta, t0);
+      if (!out) {
+        const noOutputErr = await chargedError('Atlas image completed with no outputs', id, model, meta, t0);
+        // ROUND-2 ADVERSARIAL FINDING (Grok xhigh) — attach a policy so a
+        // RESUMED poll landing here is told apart from a genuinely
+        // ambiguous failure. Atlas has given a CONFIRMED, SETTLED verdict
+        // (status:'completed', charged:true, no output) — re-polling the
+        // SAME id will return the identical answer forever, unlike a
+        // probe-class transport blip that might resolve differently later.
+        // Without this, submitAndPollWithResume's catch had no err.policy
+        // to inspect, fell into the "ambiguous" branch, and marked it
+        // unsettledAtResume — which releases the claim and leaves
+        // status:'rendering' for a future resume, so the ad would
+        // claim→resume→completed-no-outputs→release→reclaim forever,
+        // never terminal-failing and never resolving. See
+        // completedNoOutput's own policy comment (atlasErrorPolicy.js) for
+        // why this is charged:true, and submitAndPollWithResume's catch
+        // for how this policy name is special-cased alongside
+        // policy.terminal.
+        noOutputErr.policy = classify({ predictionStatus: 'completed', hasOutputs: false });
+        throw noOutputErr;
+      }
 
       // ACTUAL cost, not a guess. Atlas publishes the authoritative figure as
       // data.price on the completed prediction. The catalog base_price we used
@@ -565,6 +610,126 @@ async function submitAndPollWithRetry(model, params, meta = {}, opts = {}) {
       attempt++;
     }
   }
+}
+
+/**
+ * Resume-or-submit wrapper. On a genuine first attempt (allowResume:true,
+ * attempt 1, and a real existing predictionId), resumes polling the EXISTING
+ * prediction instead of submitting a new one — mirrors
+ * atlasVideoService.shouldResumeAttempt / generateForAd's resume branch,
+ * closing the gap PR #40 (commit 2f99218) named: "the static/image charge
+ * point still has no resume guard at all."
+ *
+ * `paramsOrThunk` may be the params object OR a (possibly async) zero-arg
+ * function that BUILDS it. On a genuine resume-to-done, it is never called
+ * at all — ADVERSARIAL REVIEW (Grok xhigh) caught that the caller
+ * (editImage) uploads every Buffer reference to Atlas BEFORE this function
+ * used to be reached, so a resume onto an already-paid, already-DONE
+ * prediction was still paying an uploadMedia round trip (and, if that
+ * upload failed, an ad holding a perfectly good receipt would be marked
+ * failed for a reason that has nothing to do with the receipt at all).
+ * Deferring `params` to a thunk means the caller can skip building it
+ * entirely unless this function actually needs to submit something.
+ *
+ * Three outcomes of a resumed poll:
+ *   1. It completes (or Atlas confirms a refunded, safely-resubmittable
+ *      `predictionFailed` via `mayResubmit`) — handled below.
+ *   2. It fails with a CONFIRMED, SETTLED verdict that will never differ on
+ *      a later look: `err.policy.terminal` (bad credentials/balance/
+ *      permissions, or a moderation block), OR `err.policy.name ===
+ *      'completedNoOutput'` (Atlas ran the task to completion and produced
+ *      nothing — a re-poll of the SAME id returns the identical answer,
+ *      it just is not spelled `terminal:true` in the policy table because
+ *      that shape serves OTHER callers like peekImagePrediction
+ *      differently). Rethrown untouched; waiting cannot change either.
+ *      ROUND-2 ADVERSARIAL FINDING (Grok xhigh): the completedNoOutput case
+ *      was originally missing here — with no err.policy at all attached to
+ *      that throw, it fell into branch 3 below and looped
+ *      claim→resume→completed-no-outputs→release→reclaim forever, never
+ *      terminal-failing. Fixed by attaching a policy to that specific
+ *      throw (see the `if (!out)` branch above) and special-casing its name
+ *      here.
+ *   3. It fails AMBIGUOUSLY (no `err.policy` at all — a raw network
+ *      exception off the poll GET itself — or a probe-class Atlas verdict
+ *      like `serverError`/`gatewayTimeout`, where the true outcome is
+ *      simply unknown) — ADVERSARIAL REVIEW (Grok xhigh) found that without
+ *      special-casing this, a single transient poll hiccup on a resumed
+ *      prediction would permanently terminal-fail an ad that might still
+ *      be genuinely processing (or already done) at Atlas, with nothing
+ *      ever looking at that receipt again (bootRecoveryService only
+ *      watches status:'rendering'). `err.unsettledAtResume = true` mirrors
+ *      atlasVideoService's `err.unsettledAtTimeout` — renderer.js's
+ *      processAd releases the claim and leaves status:'rendering' instead
+ *      of stamping 'failed', so a future claimOne() re-entry (or
+ *      bootRecoveryService's own sweep) gets another free look at the SAME
+ *      receipt instead of the ad being stranded by one ambiguous poll.
+ *
+ *      KNOWN, ACCEPTED LIMITATION (round-2 adversarial finding, Grok xhigh,
+ *      severity 'low', deliberately not fixed here): a PERSISTENT
+ *      probe-class failure (not a one-off blip) makes this branch 3 hotter
+ *      on resume than video's own unsettledAtTimeout, which is only set
+ *      after a full poll budget — a resumed poll throws after a single
+ *      ~POLL_MS tick, so claim→resume→ambiguous→release→reclaim can cycle
+ *      every few seconds instead of every generationTimeoutMs. Money-safe
+ *      (mayResubmit still refuses a second POST every cycle) and not silent
+ *      (deduped Slack warn, renderer.js's notifyRenderFailure), but a live
+ *      renderer instance burns more CPU/Mongo-write cycles than the video
+ *      precedent during a real Atlas-side outage. Not fixed here because
+ *      the correct fix — keep polling probe-class errors on resume for the
+ *      full budget before giving up — means threading extra retry state
+ *      into (or around) pollSubmittedPrediction, which is shared verbatim
+ *      with the fresh-submit path and was deliberately kept a byte-for-byte
+ *      extraction to minimize risk to a money-critical function. Tracked as
+ *      a follow-up, not blocking this fix for the actual double-bill gap.
+ *
+ * mayResubmit is the ONLY door to a second billable submit, in every
+ * outcome — this function must never let an uncertain or confirmed-charged
+ * prior attempt trigger one.
+ */
+async function submitAndPollWithResume(model, paramsOrThunk, meta = {}, opts = {}, {
+  allowResume = false, existingPredictionId = null
+} = {}) {
+  if (shouldResumeImageAttempt({ allowResume, attempt: 1, existingPredictionId })) {
+    console.log(
+      `   ♻️  atlasImage: RESUMING existing prediction=${existingPredictionId}` +
+      `${meta.adId ? ` for ad=${meta.adId}` : ''} — receipt already stamped, not submitting again`
+    );
+    try {
+      const generationTimeoutMs = positiveTimeout(opts.timeoutMs, TIMEOUT_MS);
+      return await pollSubmittedPrediction(existingPredictionId, model, meta, Date.now(), generationTimeoutMs);
+    } catch (err) {
+      if (mayResubmit(err.policy, existingPredictionId)) {
+        console.warn(
+          `   ↻ atlasImage: resumed prediction ${existingPredictionId} confirmed FAILED and ` +
+          `UNBILLED (${err.policy?.name}) — proceeding to a fresh submit`
+        );
+        // fall through — a normal fresh submit below is safe (Atlas
+        // confirmed the prior attempt was refunded, exactly mayResubmit's
+        // contract).
+      } else if (err.policy && (err.policy.terminal || err.policy.name === 'completedNoOutput')) {
+        // A genuinely deterministic, SETTLED Atlas verdict. Waiting (or
+        // resuming again later) cannot change it — let the ordinary
+        // terminal-failure path stand. completedNoOutput is explicitly
+        // named alongside `terminal` (not folded into that flag upstream)
+        // because it serves a DIFFERENT purpose for other callers
+        // (peekImagePrediction/imageRecoveryService use 'probe' there to
+        // mean "look at the full record") — here, having JUST polled this
+        // exact id to a completed-with-no-output verdict, there is nothing
+        // left to probe for.
+        throw err;
+      } else {
+        console.warn(
+          `   ⏸  atlasImage: resumed prediction ${existingPredictionId} poll came back AMBIGUOUS ` +
+          `(${err.policy?.name || 'no-policy/network'}) — leaving it unsettled rather than ` +
+          `resubmitting OR terminal-failing the ad`
+        );
+        err.unsettledAtResume = true;
+        throw err;
+      }
+    }
+  }
+  const params = typeof paramsOrThunk === 'function' ? await paramsOrThunk() : paramsOrThunk;
+  return submitAndPollWithRetry(model, params, meta, opts);
 }
 
 /**
@@ -767,25 +932,52 @@ function warnIfDoublePaying(err, kind) {
 async function editImage({
   prompt, images = [], size, quality, inputFidelity, model, fallbackModel,
   aspectRatio, meta = {}, timeoutMs, uploadTimeoutMs, allowFallback = true,
-  imageMeta = []
+  imageMeta = [], existingPredictionId = null, allowResume = false
 }) {
   const m = model || DEFAULT_EDIT_MODEL;
   const buffers = images.filter((i) => Buffer.isBuffer(i));
   try {
     if (!isConfigured()) throw new Error('ATLAS_API_KEY not configured');
-    // Independent reference uploads should not multiply startup latency. A
-    // two-reference static ad now waits for the slower upload, not both.
-    const urls = await Promise.all(images.map((img, index) => (
-      Buffer.isBuffer(img)
-        ? uploadBuffer(img, `reference-${index + 1}.png`, 'image/png', uploadTimeoutMs)
-        : img
-    )));
-    const params = buildParams(m, { prompt, images: urls, size, quality, inputFidelity, aspectRatio });
-    const out = await submitAndPollWithRetry(m, params, meta, { timeoutMs });
+    // MONEY — the reference upload (and buildParams) is built LAZILY, and
+    // memoized so it can never run twice. ADVERSARIAL REVIEW (Grok xhigh)
+    // caught that doing this unconditionally — BEFORE ever checking
+    // whether this call is actually resuming an already-paid prediction —
+    // meant a transient uploadMedia failure could fail an ad that in fact
+    // still held a perfectly good, freely-recoverable receipt. Only a call
+    // that genuinely needs to SUBMIT (the ordinary first-time path, or a
+    // fallthrough from a confirmed-refunded resume) ever invokes this; a
+    // resume straight to a DONE prediction never does.
+    let resolvedFreshParams = null;
+    const buildFreshParams = async () => {
+      if (resolvedFreshParams) return resolvedFreshParams;
+      // Independent reference uploads should not multiply startup latency.
+      // A two-reference static ad now waits for the slower upload, not both.
+      const urls = await Promise.all(images.map((img, index) => (
+        Buffer.isBuffer(img)
+          ? uploadBuffer(img, `reference-${index + 1}.png`, 'image/png', uploadTimeoutMs)
+          : img
+      )));
+      resolvedFreshParams = buildParams(m, { prompt, images: urls, size, quality, inputFidelity, aspectRatio });
+      return resolvedFreshParams;
+    };
+    const out = await submitAndPollWithResume(m, buildFreshParams, meta, { timeoutMs }, { allowResume, existingPredictionId });
+    // The submission record describes what was ACTUALLY sent. Whenever a
+    // real submit happened (the ordinary path, or a fallthrough from a
+    // confirmed-refunded resume), buildFreshParams already ran and
+    // resolvedFreshParams is the real, uploaded-URL params — reuse it
+    // rather than re-uploading. On a genuine resume-to-done, no submit
+    // (and no upload) ever happened, so this falls back to a network-free
+    // description built straight from this call's own arguments: a
+    // Buffer input reports no submittedUrl (nothing was ever uploaded for
+    // it to report), a URL input still shows its real, already-known URL.
+    const submissionParams = resolvedFreshParams || buildParams(m, {
+      prompt, size, quality, inputFidelity, aspectRatio,
+      images: images.map((img) => (Buffer.isBuffer(img) ? null : img))
+    });
     return {
       data: [{ b64_json: out.b64 }],
       url: out.url,
-      submission: buildSubmissionRecord({ provider: 'atlas', model: m, params, predictionId: out.predictionId, imageMeta })
+      submission: buildSubmissionRecord({ provider: 'atlas', model: m, params: submissionParams, predictionId: out.predictionId, imageMeta })
     };
   } catch (err) {
     if (!allowFallback) throw err;
@@ -928,5 +1120,6 @@ async function resumeImageForAd({ ad } = {}) {
 
 module.exports = {
   generateImage, editImage, uploadBuffer, isConfigured, buildPriceMap, buildSubmissionRecord,
-  peekImagePrediction, resumeImageForAd
+  peekImagePrediction, resumeImageForAd,
+  shouldResumeImageAttempt, pollSubmittedPrediction, submitAndPollWithResume
 };

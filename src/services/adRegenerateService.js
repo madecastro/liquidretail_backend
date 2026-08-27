@@ -970,7 +970,19 @@ function buildDirectImageArgsFromAd(ad, {
     // Refinement note (Product Ads modal) OR verbatim override
     // (Generation Details). Override wins inside renderDirectImage.
     operatorPrompt:        prompt || null,
-    rawPromptOverride:     promptOverride || null
+    rawPromptOverride:     promptOverride || null,
+    // MONEY — deliberately explicit, mirroring runVideoFull's own
+    // allowResume:false for generateForAd. A regenerate is an operator (or
+    // QC-driven) request for a genuinely NEW image, not a recovery of a
+    // crashed prior attempt — it must never resume the ad's existing
+    // imageGeneration.predictionId, which may still belong to a DIFFERENT,
+    // currently in-flight mint-time render of the same Ad (preflight() does
+    // not gate on ad.status). Both already default to this same safe shape
+    // inside renderDirectImage; stated here anyway so the invariant is
+    // grep-able at the one call site that must never flip it, same as the
+    // video path's convention.
+    existingPredictionId: null,
+    allowResume:          false
   };
 }
 

@@ -502,8 +502,21 @@ check('D2 the inner catch(err) block is present and extracts', () => {
     'catch (err) { ... } block not found inside processAd');
 });
 
+// Matches EITHER the original standalone guard, `if (err && err.unsettledAtTimeout) {`,
+// OR the combined guard `if (err && (err.unsettledAtTimeout || err.unsettledAtResume)) {`
+// added alongside the static/image resume-from-receipt fix
+// (scripts/verifyStaticReceiptResume.js's C6) — that fix deliberately folded
+// video's pre-existing unsettledAtTimeout handling and static's new
+// unsettledAtResume handling into ONE guard, precisely so the two release/
+// bumpRunCounter/return shapes could never independently drift apart. This
+// harness cares about the INVARIANT (unsettledAtTimeout still releases the
+// claim, leaves rendering, bumps 'skipped', and returns before the generic
+// failed-status write) — not the exact standalone-vs-combined shape of the
+// `if` condition it lives inside.
 function unsettledBranch() {
-  const ifIdx = catchBlock.search(/if\s*\(\s*err\s*&&\s*err\.unsettledAtTimeout\s*\)\s*\{/);
+  const ifIdx = catchBlock.search(
+    /if\s*\(\s*err\s*&&\s*(?:err\.unsettledAtTimeout|\(\s*err\.unsettledAtTimeout\s*\|\|\s*err\.unsettledAtResume\s*\))\s*\)\s*\{/
+  );
   if (ifIdx < 0) return null;
   const ifOpen = catchBlock.indexOf('{', ifIdx);
   return { ifOpen, ifBlock: balanced(catchBlock, ifOpen, '{', '}') };

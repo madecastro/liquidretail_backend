@@ -2334,7 +2334,17 @@ function buildQcRetryArgs(originalCallArgs, { correctiveNote, overrideText } = {
     rawPromptOverride: overrideText
       ? composeCorrectiveOverride(overrideText, correctiveNote)
       : base.rawPromptOverride,
-    skipVisionQc: true
+    skipVisionQc: true,
+    // MONEY — this re-entry is ITSELF a new billable submit (the whole
+    // point: the previous attempt's output failed QC). It must never be
+    // allowed to "resume" the ORIGINAL attempt's predictionId — that
+    // receipt belongs to the rejected image, not this corrective one, and
+    // Atlas's poll for it would return the wrong (already-superseded)
+    // output. Explicit, not relying on renderDirectImage's own safe
+    // default, so the spread above can never silently carry a resume flag
+    // forward from a mint-path original call.
+    existingPredictionId: null,
+    allowResume: false
   };
 }
 
@@ -2367,12 +2377,47 @@ function buildQcRetryArgs(originalCallArgs, { correctiveNote, overrideText } = {
 async function submitEditImageWithSeedFallback({
   refs, imageMeta, prompt, genSize, meta, model, quality, timeoutMs,
   uploadTimeoutMs, allowProviderFallback, singleSeedEligible, mediaId,
-  resolvedProduct, campaignRunId, productId
+  resolvedProduct, campaignRunId, productId,
+  // MONEY — resume-from-receipt. See renderDirectImage's own doc comment on
+  // these two params for the full contract; defaults are the safe,
+  // non-resuming shape.
+  existingPredictionId = null, allowResume = false
 }) {
   const submit = (r, im) => atlasImage.editImage({
     model, images: r, imageMeta: im, prompt, size: genSize, quality, meta,
     timeoutMs, uploadTimeoutMs, allowFallback: allowProviderFallback
   });
+
+  // MONEY — checked ONCE, before any seed-fallback candidate is picked, and
+  // BEFORE the singleSeedEligible/moderation-fallback branching below. A
+  // receipt from a prior crashed attempt belongs to whatever seed image
+  // that attempt actually submitted — resuming it (or confirming it failed
+  // unbilled) has to happen before this function starts trying alternate
+  // catalog images, or a fallback candidate's fresh submit could be wrongly
+  // compared against a receipt for a DIFFERENT image entirely.
+  //
+  // atlasImage.editImage itself does the actual resume-vs-submit decision
+  // (shouldResumeImageAttempt / submitAndPollWithResume) — passing
+  // allowResume+existingPredictionId straight through means: if Atlas
+  // confirms the resumed prediction is done, this returns it exactly like a
+  // fresh submit would; if Atlas confirms it genuinely failed and was
+  // refunded, editImage itself falls through to a normal fresh submit of
+  // the PRIMARY seed (refs/imageMeta as passed in here) — never a
+  // seed-fallback candidate, which is an acceptable, documented trade-off
+  // (the seed-fallback feature is a quality optimisation, not a money-safety
+  // requirement, so losing it in this narrow resume-then-refresh corner
+  // case just reproduces the ORIGINAL moderation error if that's what it
+  // was, exactly as if seed-fallback were disabled).
+  if (atlasImage.shouldResumeImageAttempt({ allowResume, attempt: 1, existingPredictionId })) {
+    return {
+      result: await atlasImage.editImage({
+        model, images: refs, imageMeta, prompt, size: genSize, quality, meta,
+        timeoutMs, uploadTimeoutMs, allowFallback: allowProviderFallback,
+        allowResume, existingPredictionId
+      }),
+      seedFallback: null
+    };
+  }
 
   if (!singleSeedEligible || !moderationSeedFallback.isEnabled() || !resolvedProduct?._id) {
     return { result: await submit(refs, imageMeta), seedFallback: null };
@@ -2510,7 +2555,23 @@ async function renderDirectImage(callArgs = {}) {
     skipVisionQc = false,
     // QUOTE_STAGE_AWARE: Ad.funnelStage from renderCreative. Flag-off
     // buildIntentData ignores it.
-    funnelStage = null
+    funnelStage = null,
+    // MONEY — resume-from-receipt (mirrors atlasVideoService.generateForAd's
+    // allowResume/shouldResumeAttempt). Both default to the SAFE, non-
+    // resuming shape: a caller must explicitly opt in. Only renderer.js's
+    // mint-time renderStatic() does — it passes the Ad's own
+    // imageGeneration.predictionId (if any) with allowResume:true, so a
+    // re-entry on an ad that already holds a receipt (claim released,
+    // status still 'rendering') resumes polling that prediction instead of
+    // submitting a second one. adRegenerateService.runImage and the vision-
+    // QC corrective re-entry (buildQcRetryArgs, above) both leave these at
+    // their default — a regenerate or a QC retry is a deliberately NEW
+    // attempt and must never resume a stale receipt.
+    //   existingPredictionId — the receipt to consider resuming, or null.
+    //   allowResume          — the CALLER's explicit opt-in; false refuses
+    //                          to resume regardless of existingPredictionId.
+    existingPredictionId = null,
+    allowResume = false
   } = callArgs;
   const surface = platformFormat || 'meta_feed_1_1';
   // Credentials are checked further down, AFTER brand routing: a brand
@@ -2852,7 +2913,11 @@ async function renderDirectImage(callArgs = {}) {
     refs, imageMeta, prompt, genSize, meta,
     model: PLATE_EDIT_MODEL, quality: PLATE_QUALITY, timeoutMs: PLATE_TIMEOUT_MS,
     uploadTimeoutMs: UPLOAD_TIMEOUT_MS, allowProviderFallback,
-    singleSeedEligible, mediaId, resolvedProduct, campaignRunId, productId
+    singleSeedEligible, mediaId, resolvedProduct, campaignRunId, productId,
+    // MONEY — resume-from-receipt, threaded straight from this function's
+    // own callArgs. See the doc comment on renderDirectImage's destructure
+    // above for the full contract.
+    existingPredictionId, allowResume
   });
   const b64 = result?.data?.[0]?.b64_json;
   if (!b64) throw new Error('direct-image generation returned no image data');

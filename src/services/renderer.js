@@ -467,13 +467,29 @@ function notifyRenderFailure(ad, err) {
     // Static (html_gen) route — and the defensive "unknown renderRoute"
     // throw from processAd's dispatch, which has no route-specific class
     // of its own and falls into the same bucket as any other static fault.
-    alerts.notifyAsync({
-      level:  (err && err.alertLevel) || 'error',
-      title:  'Static ad render failed (direct overlay)',
-      key:    (err && err.alertKey) || 'direct-image:render-failed',
-      fields: { ...commonFields, error: msg.slice(0, 300) },
-      detail: (err && err.stack) || null
-    });
+    //
+    // unsettledAtResume mirrors the video branch above: a resumed
+    // prediction whose poll came back ambiguous is NOT a confirmed
+    // failure — mayResubmit already refused to spend again, and the claim
+    // is about to be released with status:'rendering' intact for a future
+    // resume/recovery, not stamped 'failed'. Alerting it as "render
+    // failed" would misreport a still-pending outcome as a confirmed one.
+    if (err && err.unsettledAtResume) {
+      alerts.notifyAsync({
+        level:  'warn',
+        title:  'Static ad resume unsettled — awaiting reconciliation',
+        key:    `static-unsettled:${msg.slice(0, 60)}`,
+        fields: { ...commonFields, predictionId: err.predictionId || null, error: msg.slice(0, 300) }
+      });
+    } else {
+      alerts.notifyAsync({
+        level:  (err && err.alertLevel) || 'error',
+        title:  'Static ad render failed (direct overlay)',
+        key:    (err && err.alertKey) || 'direct-image:render-failed',
+        fields: { ...commonFields, error: msg.slice(0, 300) },
+        detail: (err && err.stack) || null
+      });
+    }
   } catch (_) {
     // Alerting must never fail the failure path it is reporting on.
   }
@@ -904,7 +920,23 @@ async function renderStatic(ad) {
     // No regenerate/prompt override on the fresh render path.
     operatorPrompt:      null,
     rawPromptOverride:   null,
-    skipVisionQc:        false
+    skipVisionQc:        false,
+    // MONEY — resume-from-receipt (mirrors renderVideo's video-master submit
+    // call, which passes this same allowResume:true — see that call site
+    // further down in this file). This is the ONE call site allowed to opt
+    // in: renderStatic can be re-entered on an
+    // ad that already holds a receipt (claim released after a crash mid-
+    // submit/poll — see the shutdown-drain comment in this file, and
+    // bootRecoveryService/strandedRunSweeper for the other receipt-aware
+    // recovery paths), and this ad's own imageGeneration.predictionId is
+    // exactly that receipt. Passing it through with allowResume:true means
+    // directImageRenderService resumes polling the SAME Atlas prediction
+    // instead of submitting a fresh one — see directImageRenderService.js's
+    // renderDirectImage doc comment for the full contract, and
+    // atlasImageService.shouldResumeImageAttempt /
+    // submitAndPollWithResume for the decision itself.
+    existingPredictionId: ad.imageGeneration?.predictionId || null,
+    allowResume:          true
   });
 
   const wallSec = ((Date.now() - t0) / 1000).toFixed(1);
@@ -1781,8 +1813,31 @@ async function processAd(ad) {
       // LIVE Ad.find, and classifyRunAdOutcome buckets status:'rendering'
       // as stillRendering — so the run cannot finalize while this row sits
       // here, regardless of what the 'skipped' counter says.
-      if (err && err.unsettledAtTimeout) {
-        await releaseClaim(ad._id, 'video master unsettled at poll timeout — left rendering for resume');
+      //
+      // err.unsettledAtResume is the STATIC counterpart, added alongside
+      // atlasImageService.shouldResumeImageAttempt / submitAndPollWithResume
+      // (adversarial review, Grok xhigh): a resumed static prediction whose
+      // poll came back AMBIGUOUS (no err.policy at all — a raw network
+      // exception off the poll GET — or a probe-class Atlas verdict like
+      // serverError/gatewayTimeout, where the true outcome is genuinely
+      // unknown) must not be terminal-failed either — mayResubmit already
+      // refused a second submit, so nothing here is unsafe, but writing
+      // status:'failed' would strand the receipt exactly like the video
+      // case above: bootRecoveryService only ever looks at status:'rendering'
+      // rows. Same release-and-leave-rendering treatment, so a future
+      // claimOne() re-entry (or bootRecoveryService's own sweep) gets
+      // another free look at the SAME receipt. Deliberately EXCLUDES a
+      // genuinely deterministic verdict (err.policy.terminal — bad
+      // credentials, a moderation block) — atlasImageService itself never
+      // sets unsettledAtResume for those, so they fall through to the
+      // ordinary terminal-failure write below, same as today.
+      if (err && (err.unsettledAtTimeout || err.unsettledAtResume)) {
+        await releaseClaim(
+          ad._id,
+          err.unsettledAtResume
+            ? 'static resume — poll outcome ambiguous, left rendering for a future resume/recovery'
+            : 'video master unsettled at poll timeout — left rendering for resume'
+        );
         await bumpRunCounter(ad.campaignRunIds, 'skipped');
         return;
       }
@@ -2140,31 +2195,33 @@ async function shutdown() {
       // back to claimOne — its filter is {status:'rendering', claimedByWorker:
       // null, renderRoute:{$in:['html_gen','veo']}}, which is exactly the shape
       // this write produces. The peer that picks it up re-enters renderVideo /
-      // renderStatic from the top and calls generateForAd again, and
-      // STILL TRUE FOR STATIC/IMAGE ADS, NO LONGER TRUE FOR VIDEO. Video
-      // (atlasVideoService.generateForAd) now HAS a resume-from-receipt
-      // guard: shouldResumeAttempt reads ad.veoPredictionId on a fresh
-      // attempt and resumes the existing prediction instead of submitting a
-      // new one (see processAd's unsettledAtTimeout branch above, which
-      // relies on exactly this). Static (atlasImageService — the OTHER
-      // charge point RECEIPT_FREE covers) has no equivalent: it never reads
-      // Ad.imageGeneration.predictionId before submitting, so releasing a
-      // claim there still buys the same generation a second time. So this
-      // exclusion is no longer a single guard against one universal gap —
-      // it now does double duty, one justified reason per charge point:
-      // required for static (no guard exists), and merely conservative for
-      // video (a guard exists, so a release here would already be safe, but
-      // widening THIS SIGKILL path to rely on it is a separate, deliberately
-      // undone decision — not a leftover gap).
+      // renderStatic from the top and calls generateForAd / renderDirectImage
+      // again.
       //
-      // services/spendReceipt.js already states the rule this must obey:
-      // "a requeue may only ever touch RECEIPT-FREE ads". That module exists
-      // because providers charge at SUBMIT, so a stamped predictionId means the
-      // money is gone whatever happens next. RECEIPT_FREE covers BOTH charge
-      // points — Ad.veoPredictionId (Omni video) and
-      // Ad.imageGeneration.predictionId (static gpt-image-2) — and is shaped to
-      // treat null/'' as "no receipt", because the schema default is null so a
-      // bare {$exists:false} would match almost nothing.
+      // UPDATED — BOTH charge points now have a resume-from-receipt guard
+      // (adversarial review, Grok xhigh, flagged this exact comment as
+      // stale when the static half landed). Video's atlasVideoService
+      // (shouldResumeAttempt reading ad.veoPredictionId — see processAd's
+      // unsettledAtTimeout branch above, which relies on exactly this) has
+      // had one since commit 2f99218 (PR #40); static's atlasImageService
+      // (shouldResumeImageAttempt / submitAndPollWithResume reading
+      // ad.imageGeneration.predictionId, wired through
+      // directImageRenderService.renderDirectImage's existingPredictionId/
+      // allowResume params — see processAd's unsettledAtResume handling)
+      // closes the gap this comment used to describe as open. So a re-entry
+      // on EITHER route would now resume the existing prediction rather than
+      // buying the same generation a second time — this exclusion is no
+      // longer required by an absent guard on either side.
+      //
+      // It is STILL kept, though, and deliberately: this filter is
+      // conservative, not load-bearing. services/spendReceipt.js already
+      // states the rule this must obey: "a requeue may only ever touch
+      // RECEIPT-FREE ads". That module exists because providers charge at
+      // SUBMIT, so a stamped predictionId means the money is gone whatever
+      // happens next. RECEIPT_FREE covers BOTH charge points — Ad.veoPredictionId
+      // (Omni video) and Ad.imageGeneration.predictionId (static gpt-image-2)
+      // — and is shaped to treat null/'' as "no receipt", because the schema
+      // default is null so a bare {$exists:false} would match almost nothing.
       //
       // Receipt-HOLDING ads deliberately stay claimed and `rendering`. That is
       // the honest state (the outcome genuinely is unknown until the receipt is
@@ -2173,12 +2230,11 @@ async function shutdown() {
       // than re-bought. It does re-expose the zombie-claim problem this
       // shutdown handler was written to solve — but only for the subset that
       // has spent money, where paying twice is the worse outcome. Widening
-      // this specific release to also cover receipt-holding VIDEO ads (now
-      // that the video guard exists) is a real, available follow-up — not
-      // done here because it changes SIGKILL-time behavior beyond
-      // generateForAd itself and deserves its own sign-off, separate from
-      // this fix. Static still needs its own resume-from-receipt path
-      // before its half of this exclusion can be revisited at all.
+      // this specific release to ALSO cover receipt-holding ads (now that a
+      // resume guard exists on both routes) is a real, available follow-up —
+      // not done here because it changes SIGKILL-time behavior beyond
+      // generateForAd/renderDirectImage themselves and deserves its own
+      // sign-off, separate from this fix.
       // USE THE COMPOSER, NOT A SPREAD. spendReceipt.js exports receiptFree()
       // for exactly this and says why: "Spread-merging would silently drop an
       // existing `$and`". `{ ...base, ...RECEIPT_FREE }` works only while the
