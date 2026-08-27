@@ -563,6 +563,27 @@ const UI_CHROME_GUARD_LINE =
   `hamburger icons, shopping-cart/bag icons, buttons, price tags, banners, or any screen-within-the-screen. ` +
   `This is a real-world camera shot of a physical product, never a screenshot, mockup, or render of a web page or app.`;
 
+// The `seedHasText` guard block, hoisted out of buildVeoPrompt's assembly and
+// EXPORTED so a diagnostic can detect, from a PERSISTED prompt, that the
+// render path actually computed seedHasText=true. Same pattern (and the same
+// reason it lives outside every directive object) as UI_CHROME_GUARD_LINE
+// above: no directive text changes, so the frozen OMNI/GROK strings and the
+// B14/B15 byte-identity pins are untouched — `lines.push(CONST)` emits the
+// identical bytes the inline template literal did.
+//
+// WHY A DIAGNOSTIC NEEDS THIS (2026-08-27): the inspector used to re-derive
+// `seedHasText` from Media.text at READ time and disagreed with the render
+// path, which suppressed the `seed-has-burned-in-text` warning on exactly the
+// ads where the render had detected the condition. The submitted prompt is
+// already persisted on Ad.veoPrompt, so its containing this sentence is the
+// strongest available evidence of what the render actually decided — stronger
+// than any later re-read of Media, which can be overwritten by a subsequent
+// detect run. See routes/ads.js's generation-inspector seed block.
+const SEED_BURNED_IN_TEXT_GUARD_LINE =
+  `The reference image contains text overlays / captions / stickers / watermarks burned into the source frame. ` +
+  `Treat that burned-in text as part of the locked photograph — do not read, reproduce, extend, or generate more of it. ` +
+  `The chrome layer will composite all ad copy downstream.`;
+
 /**
  * Lifestyle video prompt branch is active only when the flag is on AND
  * (seed is lifestyle OR variantKind is ugc). Matches static preserve trigger
@@ -1082,11 +1103,7 @@ function buildVeoPrompt({
   }
 
   if (seedHasText) {
-    lines.push(
-      `The reference image contains text overlays / captions / stickers / watermarks burned into the source frame. ` +
-      `Treat that burned-in text as part of the locked photograph — do not read, reproduce, extend, or generate more of it. ` +
-      `The chrome layer will composite all ad copy downstream.`
-    );
+    lines.push(SEED_BURNED_IN_TEXT_GUARD_LINE);
   }
 
   lines.push(d.physicalAccuracy);
@@ -1248,5 +1265,8 @@ module.exports = {
   // verify harness only; no other caller should read the env var directly.
   isVideoUiChromeGuardEnabled,
   UI_CHROME_GUARD_LINE,
+  // Exported so the generation inspector can detect the guard block in a
+  // PERSISTED Ad.veoPrompt rather than re-deriving seedHasText from Media.
+  SEED_BURNED_IN_TEXT_GUARD_LINE,
 };
 

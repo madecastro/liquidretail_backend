@@ -4500,6 +4500,60 @@ async function buildPromptScaffold({
     aspectRatio,
     durationSec: resolvedDuration,
     byteCap: caps?.promptByteCap || 4096,
+
+    // ── THIS PROMPT IS AN APPROXIMATION, AND THE API NOW SAYS SO ──────────
+    //
+    // It is NOT a second builder — this function calls the canonical
+    // buildVeoPrompt, and that was verified by execution 2026-08-27 (a
+    // scaffold-argument call is byte-identical to the sweep's baseline row).
+    // The divergence from what actually gets submitted comes entirely from
+    // the INPUTS, because the scaffold runs BEFORE an ad exists:
+    //
+    //   seedHasText: false        — hardcoded. There is no resolved seed yet,
+    //                               so the burned-in-text guard block can
+    //                               never appear here. MEASURED: that block
+    //                               is +283 bytes, and at a 4096-byte cap it
+    //                               pushes the prompt over target, which makes
+    //                               enforceByteCap drop `Product: ` FIRST
+    //                               (it heads DROP_PRIORITY). So the preview
+    //                               can legitimately show a `Product:` line
+    //                               the real submission dropped — same
+    //                               builder, different budget.
+    //   hasProductReference: true — hardcoded. The real value is computed from
+    //                               the resolved reference stack and the
+    //                               lifestyle plan (forceSeedOnly), neither of
+    //                               which exists yet. MEASURED: false vs true
+    //                               is a 221-byte swing.
+    //   media: null               — no seed doc, so nothing derived from the
+    //                               seed's pixels or its detections.
+    //   layoutInput / sourceMedia / storyboard / seedStyle / variantKind
+    //                             — not passed at all; the render path passes
+    //                               all five from the Ad.
+    //
+    // WHY THIS IS NOT "FIXED" BY FEEDING IT BETTER INPUTS: the destination-less
+    // scaffold prompt is a DOCUMENTED FROZEN INVARIANT — CLAUDE.md §00 lists
+    // "Destination-less prompt (scaffold, aiVideoReferenceService), either arm
+    // — STILL byte-identical", pinned by verifyPostPilotBatch B14 against the
+    // 9531ae9f baseline out of git. Changing what this function passes to
+    // buildVeoPrompt would move those bytes and break a deliberate rollback
+    // guarantee from the PR #61 revert. So the honest move is to LABEL the
+    // approximation rather than quietly narrow the gap, and that is what this
+    // block is for: the SPA renders it beside the editor so nobody debugs from
+    // a prompt that was never submitted.
+    //
+    // The real submitted prompt for a generated ad is recoverable and exact:
+    // GET /api/ads/:id/generation-inspector → video.submission.prompt.
+    approximation: {
+      isApproximation: true,
+      reason: 'Built before an ad exists, so the seed media, reference stack and lifestyle plan are unknown. Same canonical builder as production; different inputs.',
+      assumedInputs: [
+        { field: 'seedHasText',         assumed: false, note: 'No resolved seed yet — the burned-in-text guard block (+283 bytes) can never appear here, and at a 4096-byte cap its absence is also why a `Product:` line may survive here but be dropped from the real submission.' },
+        { field: 'hasProductReference', assumed: true,  note: 'Real value is computed from the resolved reference stack and the lifestyle plan (221-byte swing).' },
+        { field: 'media',               assumed: null,  note: 'No seed document, so nothing derived from the seed is present.' }
+      ],
+      omittedInputs: ['layoutInput', 'sourceMedia', 'storyboard', 'seedStyle', 'variantKind'],
+      exactPromptAvailableAt: 'GET /api/ads/:id/generation-inspector → video.submission.prompt'
+    },
     // Reference-stack limits for the seed picker. maxReferenceImages is a HARD
     // per-model API limit and varies wildly (gemini-omni i2v: 7, omni r2v: 5,
     // grok-imagine i2v and veo3.1: 1), so the UI must read it from the resolved

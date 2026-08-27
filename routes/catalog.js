@@ -33,6 +33,15 @@ const { loadPhotorealUrlMap, loadUseImageRefMap, loadProductUrlMap } = require('
 const { buildGridPreviewVideoUrl } = require('../services/videoPreviewUrl');
 const { buildGridPreviewImageUrl } = require('../services/imagePreviewUrl');
 const { AD_RECENCY_EXPR } = require('../services/adRecencyService');
+// Coverage counts DELIVERABLE assets, not attempts — one shared definition,
+// also used by routes/campaigns.js's ads-summary mirror. See that module's
+// header for the defect (12 failed ads reporting coveragePct:100) and for why
+// this aligns with #278's existing "delivered" definition rather than
+// overturning a prior decision.
+const {
+  outcomeAccumulators,
+  coveragePctFromDelivered
+} = require('../services/adDeliveryCounts');
 // summarizeVisionQc — the SAME formatter routes/ads.js's projectAd uses, so
 // "was this ad inspected, and why did it fail" never gets a second, drifting
 // derivation between the flat ads list and this product-detail expansion.
@@ -465,16 +474,23 @@ router.get('/', async (req, res) => {
 // the /:id route below so static-path matches ('/ads-summary',
 // '/:id/ads-detail') take precedence over the generic '/:id' catch.
 //
-// Coverage is a placeholder formula: min(adCount / TARGET_PER_PRODUCT, 1).
-// Phase 2 will replace this with the proper opportunity scoring engine
-// (fresh UGC × engagement × inverse ad coverage).
+// Coverage is min(deliveredCount / TARGET_PER_PRODUCT, 1) — DELIVERED ads only
+// (draft|live AND, for video, titling settled), never bare Ad rows. It divided
+// `adCount` until 2026-08-27, which reported a product whose 12 ads had all
+// FAILED as 100% covered. The magnitude is still a Phase-2 placeholder — the
+// proper opportunity scoring engine (fresh UGC × engagement × inverse ad
+// coverage) replaces the formula — but WHAT it counts is no longer a
+// placeholder, and must not be widened back to attempts. One shared definition
+// in services/adDeliveryCounts.js; see that header.
 const TARGET_ADS_PER_PRODUCT = 5;
 
 // Single aggregation grouping ads by productId. Brand-scoped, excludes
-// archived. Returns counts by status + the set of distinct campaign IDs
-// + most recent activity (renderedAt, falling back to generatedAt) per
-// product — see services/adRecencyService for why renderedAt is the
-// signal that must be used here.
+// archived. Returns counts by status — including the delivered / failed /
+// in-flight OUTCOME split that coverage is derived from, so a caller can tell
+// "12 created, 0 delivered, 12 failed" from "12 delivered" — plus the set of
+// distinct campaign IDs and most recent activity (renderedAt, falling back to
+// generatedAt) per product — see services/adRecencyService for why renderedAt
+// is the signal that must be used here.
 async function buildAdStatsByProduct(brandObjectId) {
   const rows = await Ad.aggregate([
     { $match: { brandId: brandObjectId, status: { $ne: 'archived' } } },
@@ -484,6 +500,14 @@ async function buildAdStatsByProduct(brandObjectId) {
         draftCount:    { $sum: { $cond: [{ $eq: ['$status', 'draft'] }, 1, 0] } },
         liveCount:     { $sum: { $cond: [{ $eq: ['$status', 'live'] }, 1, 0] } },
         failedCount:   { $sum: { $cond: [{ $eq: ['$status', 'failed'] }, 1, 0] } },
+        // deliveredCount / failedCount / inFlightCount — ONE definition,
+        // imported from services/adDeliveryCounts.js and shared with
+        // routes/campaigns.js's mirror of this endpoint. That header carries
+        // the full mechanism and the git archaeology showing this is an
+        // alignment with the repo's own later "delivered" definition (#278),
+        // not the reversal of a deliberate choice. A per-caller copy is exactly
+        // how the two ads-summary endpoints would drift apart again.
+        ...outcomeAccumulators(),
         readyToExport: {
           $sum: {
             $cond: [
@@ -799,9 +823,30 @@ router.get('/ads-summary', async (req, res) => {
 
     const productsOut = products.map(p => {
       const stats = adStats.get(String(p._id)) || {};
-      const adCount       = stats.adCount       || 0;
+      const adCount        = stats.adCount        || 0;
+      const deliveredCount = stats.deliveredCount || 0;
+      const failedCount    = stats.failedCount    || 0;
+      const inFlightCount  = stats.inFlightCount  || 0;
       const campaignCount = (stats.campaignIds || []).filter(Boolean).length;
-      const coveragePct   = Math.min(100, Math.round((adCount / TARGET_ADS_PER_PRODUCT) * 100));
+      // COVERAGE COUNTS DELIVERABLE ASSETS, NOT ATTEMPTS.
+      //
+      // This divided `adCount` — every non-archived Ad row — by 5, so a product
+      // whose 12 ads ALL FAILED with zero assets reported coveragePct:100 while
+      // the same response said draftCount:0, liveCount:0, readyToExport:0.
+      // Measured in the live app 2026-08-27.
+      //
+      // Not a reverted decision: git shows coverage shipped in ed3e6d83 as an
+      // explicit "placeholder formula (adCount / 5, capped at 100)" — the code
+      // comment above still says Phase 2 will replace it — and the ONLY status
+      // rule anyone ever wrote down for it was `$ne: 'archived'`. That same
+      // commit already computed `failedCount` as its own $cond and then never
+      // returned it or subtracted it, i.e. the distinction was drawn and left
+      // unused. When the repo LATER defined "delivered" (9d632297 / #278) it
+      // named `failed` explicitly as not delivered and applied that to
+      // ads-detail, the run rollup and Meta push — but never to this
+      // aggregation. This aligns the last surface, it does not overturn a
+      // choice.
+      const coveragePct   = coveragePctFromDelivered(deliveredCount, TARGET_ADS_PER_PRODUCT);
       return {
         productId:      String(p._id),
         title:          p.title || '(untitled)',
@@ -813,12 +858,24 @@ router.get('/ads-summary', async (req, res) => {
         inferredBreadcrumb: Array.isArray(p.inferredBreadcrumb) ? p.inferredBreadcrumb : null,
         brand:          p.brand || null,
         size:           p.size || null,
+        // adCount stays EVERY non-archived row and adsCreated stays its sum.
+        // "12 ads were created" is TRUE even when all 12 failed; the untruth
+        // was calling that product covered. Narrowing this too would trade one
+        // false statement for another, so instead the outcome split is now
+        // reported alongside it and the UI can show "12 created · 0 delivered ·
+        // 12 failed".
         adCount,
         campaignCount,
         campaignChips:  chipsByProduct.get(String(p._id)) || [],
         readyToExport:  stats.readyToExport  || 0,
         draftCount:     stats.draftCount     || 0,
         liveCount:      stats.liveCount      || 0,
+        // Newly returned. failedCount was computed here since ed3e6d83 and
+        // never surfaced, which is a large part of why nobody could see that
+        // coverage was counting failures.
+        deliveredCount,
+        failedCount,
+        inFlightCount,
         coveragePct,
         // Phase 2: opportunityScore will be the proper signal-driven
         // ranking. For now, sort by lastActivity desc / coverage asc.
@@ -840,8 +897,20 @@ router.get('/ads-summary', async (req, res) => {
     });
 
     const totalProducts    = productsOut.length;
-    const productsWithAds  = productsOut.filter(p => p.adCount > 0).length;
+    // "N of M products covered" must mean N products that HAVE a deliverable
+    // creative. Keyed on adCount it advanced from "1 of 200" to "2 of 200" for
+    // a product whose every ad failed.
+    const productsWithAds  = productsOut.filter(p => p.deliveredCount > 0).length;
+    // Products that have attempted but delivered nothing — the population the
+    // old counter was silently folding into "covered".
+    const productsAttemptedNoneDelivered =
+      productsOut.filter(p => p.adCount > 0 && p.deliveredCount === 0).length;
+    const productsGenerating = productsOut.filter(p => p.deliveredCount === 0 && p.inFlightCount > 0).length;
+    // adsCreated stays the sum of adCount — see the note on the row above.
     const adsCreated       = productsOut.reduce((s, p) => s + p.adCount, 0);
+    const adsDelivered     = productsOut.reduce((s, p) => s + p.deliveredCount, 0);
+    const adsFailed        = productsOut.reduce((s, p) => s + p.failedCount, 0);
+    const adsInFlight      = productsOut.reduce((s, p) => s + p.inFlightCount, 0);
     const adsReadyToExport = productsOut.reduce((s, p) => s + p.readyToExport, 0);
 
     res.json({
@@ -852,6 +921,13 @@ router.get('/ads-summary', async (req, res) => {
           ? Math.round((productsWithAds / totalProducts) * 100)
           : 0,
         adsCreated,
+        // Newly returned so "created" and "delivered" can never be conflated
+        // by a reader again.
+        adsDelivered,
+        adsFailed,
+        adsInFlight,
+        productsAttemptedNoneDelivered,
+        productsGenerating,
         adsReadyToExport,
         // Phase 2 placeholder — opportunity bucket counts.
         goodOpportunities: null
