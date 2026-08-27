@@ -401,6 +401,59 @@ const POLL_INTERVAL = parseInt(process.env.ATLAS_POLL_INTERVAL_MS, 10) || 5000;
 // asymmetry itself is still live.
 const MAX_POLL_MS   = parseInt(process.env.ATLAS_TIMEOUT_MS, 10)       || 900000; // 15 min
 
+// RETRY POLL CEILING — the budget for attempt 2+ of the retry ladder, as
+// distinct from MAX_POLL_MS which is the budget for the FIRST attempt.
+//
+// WHY THIS EXISTS (capacity regression introduced by PR #82, found 2026-08-27).
+// pollPrediction sets `t0` per INVOCATION, so every ladder attempt used to get
+// a fresh FULL MAX_POLL_MS. Raising the ceiling 600s -> 900s therefore
+// multiplied the ladder's worst case by maxAttempts, not by one:
+//
+//     600s x 3 attempts  = ~30 min       (before #82)
+//     900s x 3 attempts  = ~45 min       (after #82, unintended)
+//     900 + 300 + 300    = ~25 min       (this fix)
+//
+// That matters because the DERIVES waiting on a master die at
+// MAX_DERIVE_WAIT_ATTEMPTS x DERIVE_MASTER_WAIT_MS ~= 60 min (renderer.js:163-165).
+// Measured 2026-08-27 on run_1787846180549_eefa581d: three ladder attempts of
+// 249s + 539s + 391s = 19.7 min on ONE master, and all 12 ads of the run
+// finished with no asset. A tripled 900s ceiling pushes that much closer to the
+// derive deadline, so the ceiling raise — correct for a single flight — is wrong
+// when multiplied.
+//
+// WHY ASYMMETRIC RATHER THAN A TOTAL LADDER BUDGET. A total budget spanning the
+// ladder is the obvious shape and is the one option that reopens a
+// double-charge question: REFRAME_CLAIM_TTL_MS (:210) is floored at
+// MAX_POLL_MS + 10 min precisely so a reframe lease cannot age out under a
+// still-legitimate poll, and its comment states that property. Every individual
+// attempt staying <= MAX_POLL_MS inherits that floor BY CONSTRUCTION; a total
+// budget exceeding MAX_POLL_MS would not, and would need fresh lease analysis.
+// So this fix never lengthens any single attempt.
+//
+// WHY 300s IS ENOUGH FOR A RETRY. The first attempt keeps the full 900s, which
+// is what the measured delivered-video distribution actually bought (n=68: mean
+// 229.7s, sd 124.5s, max 760.3s — p99.84 at 900s; see MAX_POLL_MS above). A
+// RETRY is a different population: predictionFailed's own policy comment records
+// that the retry gate "fired on 3 of 3 eligible failures and rescued 0 of 3 —
+// every retry reproduced the same error" (atlasErrorPolicy.js). A retry is a
+// repeat of a failure, not a slow-but-succeeding generation, so it does not need
+// the tail of a distribution built from SUCCESSES. 300s still clears the
+// measured mean (229.7s) with room to spare.
+//
+// DELIBERATELY NOT reducing predictionFailed's maxAttempts from 3. That would
+// cut real retry coverage on a money path on a modest sample, and the
+// asymmetric ceiling already returns the worst case (~25 min) to better than it
+// was before #82 (~30 min) without touching it. Retiring the widened attempt
+// count remains available as a separate decision — see the falsified-premise
+// note in this commit's message.
+const RETRY_POLL_MS = Math.max(
+  60_000,
+  Math.min(
+    MAX_POLL_MS,
+    parseInt(process.env.ATLAS_RETRY_TIMEOUT_MS, 10) || 300_000 // 5 min
+  )
+);
+
 function apiKey() { return process.env.ATLAS_API_KEY; }
 function enabled() {
   const flag = String(process.env.VIDEO_PROVIDER || '').toLowerCase();
@@ -3811,7 +3864,16 @@ async function resumeForAd({ ad } = {}) {
   return { resumed: peek.state === 'done', predictionId, ...peek };
 }
 
-async function pollPrediction(predictionId, { shouldCancel = null, adId = null, stagePrefix = null } = {}) {
+async function pollPrediction(
+  predictionId,
+  // maxPollMs: the budget for THIS invocation. Defaults to MAX_POLL_MS so every
+  // existing caller (and the reframe path at :2316, which passes no options at
+  // all) is unchanged. generateForAd's ladder passes RETRY_POLL_MS on attempt
+  // 2+ — see RETRY_POLL_MS's comment for why the budget is per-attempt
+  // asymmetric rather than a total across the ladder. Clamped to <= MAX_POLL_MS
+  // at the constant, so no invocation can ever outlive the reframe lease floor.
+  { shouldCancel = null, adId = null, stagePrefix = null, maxPollMs = MAX_POLL_MS } = {}
+) {
   const t0 = Date.now();
   let pollCount = 0;
   let consecutiveErrors = 0;
@@ -3824,7 +3886,7 @@ async function pollPrediction(predictionId, { shouldCancel = null, adId = null, 
     }
   };
   writePollStage();
-  while (Date.now() - t0 < MAX_POLL_MS) {
+  while (Date.now() - t0 < maxPollMs) {
     // Jitter the poll interval by 0–3s so concurrent jobs desync — without
     // this, N workers with the same POLL_INTERVAL burn through Grok's 1 RPS
     // budget in lockstep, converting every poll cycle into a rate-limit
@@ -3940,7 +4002,7 @@ async function pollPrediction(predictionId, { shouldCancel = null, adId = null, 
       throw buildClassifiedFailureError(predictionId, status, data);
     }
     const elapsedSec   = Math.round((Date.now() - t0) / 1000);
-    const remainingSec = Math.round((MAX_POLL_MS - (Date.now() - t0)) / 1000);
+    const remainingSec = Math.round((maxPollMs - (Date.now() - t0)) / 1000);
     console.log(`🎬 atlasVideo: polling ${predictionId} — status=${status} (elapsed=${elapsedSec}s, remaining=${remainingSec}s, poll #${pollCount})`);
   }
 
@@ -3974,7 +4036,7 @@ async function pollPrediction(predictionId, { shouldCancel = null, adId = null, 
   //               shape (policyRetryable is undefined), so this cannot reopen
   //               the double-charge the charge-point receipt guards against.
   const finalPeek = await peekPrediction(predictionId);
-  const outcome = resolveTimeoutOutcome(finalPeek, { predictionId, maxPollMs: MAX_POLL_MS, lastError });
+  const outcome = resolveTimeoutOutcome(finalPeek, { predictionId, maxPollMs, lastError });
   if (outcome.action === 'success') {
     const elapsedSec = Math.round((Date.now() - t0) / 1000);
     console.log(
@@ -4800,7 +4862,45 @@ async function generateForAd({
       // sake of a diagnostic. If this throws, the receipt is lost exactly as
       // it would have been before — no new failure mode is introduced.
       try {
-        await Ad.updateOne({ _id: ad._id }, { $set: {
+        await Ad.updateOne({ _id: ad._id }, {
+        // COUNT THE RETRY SUBMITS. models/Ad.js says renderAttempts "counts
+        // every attempt that STARTED a render (submit/generation actually
+        // reached), regardless of outcome" — but every other $inc site is a
+        // SUCCESS persist (renderer.js:1007/:1225/:1492), and processAd's catch
+        // increments nothing. So a master that submitted three times through
+        // this ladder and then failed terminally incremented ZERO. Measured
+        // 2026-08-27: renderAttempts:0 after three confirmed billable submits.
+        // That is the same blindness that let the original re-claim incident
+        // stay invisible — every attempt-shaped guard read 0 while it worked.
+        //
+        // ONLY ON attempt > 1, deliberately. Attempt 1's start is already
+        // accounted for by the success $inc at renderer.js:1492 when it lands,
+        // so incrementing here too would double-count the ordinary happy path.
+        // Counting only the EXTRA submits errs toward UNDER-count, the safe
+        // direction on a counter strandedRunSweeper and queuedArchiveSweeper
+        // both read as a ceiling.
+        //
+        // Same write, not a second one: rides the existing non-fatal
+        // charge-point update so a counter failure can never fail a generation
+        // post-payment, and cannot race the receipt write.
+        //
+        // ORDERED BEFORE $set ON PURPOSE. Mongo does not care about key order,
+        // but verifyOperatorPromptPrecedence's E0b bounds the receipt object by
+        // searching for its exact closing text after the `$set:` opener — a TEXT
+        // sentinel, despite that group's comment claiming a structural bound.
+        // Appending a sibling key AFTER the $set object removes that sentinel
+        // and turns E0b red on a harness this change has no business breaking.
+        // Keeping $inc first leaves the receipt $set and its closing text
+        // byte-identical to how #77 left it.
+        //
+        // And note what is NOT written here: that closing sequence is
+        // deliberately never quoted literally anywhere in this file. Both E0b
+        // and verifyLadderWallclockBounded's C2 locate it with a plain indexOf,
+        // so a comment containing a copy becomes a decoy the scanner binds to
+        // FIRST — which is exactly how C2 failed while the code was correct.
+        // Describe the sentinel; never reproduce it.
+        ...(attempt > 1 ? { $inc: { renderAttempts: 1 } } : {}),
+        $set: {
           veoPredictionId:    predictionId,
           veoPrompt:          prompt,
           veoModel:           model,
@@ -4882,7 +4982,11 @@ async function generateForAd({
     try {
       const pollOut = await pollPrediction(predictionId, {
         adId: ad._id,
-        stagePrefix
+        stagePrefix,
+        // ATTEMPT 1 KEEPS THE FULL CEILING; RETRIES GET A SHORTER ONE. Without
+        // this the ladder gets maxAttempts x MAX_POLL_MS of wall clock, because
+        // pollPrediction's t0 is per-invocation — see RETRY_POLL_MS.
+        maxPollMs: attempt === 1 ? MAX_POLL_MS : RETRY_POLL_MS
       });
       // pollPrediction returns { url, price } so we can reconcile from the
       // terminal payload when Atlas already published the settled figure.
