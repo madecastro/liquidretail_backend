@@ -4687,10 +4687,79 @@ async function generateForAd({
       // Both are non-fatal: a telemetry or bookkeeping failure must never fail a
       // generation post-payment, because the caller would then never store videoUrl and a
       // retry would double-bill.
+      // SUBMIT-TIME DIAGNOSTIC (2026-08-26) — veoPrompt / veoReferenceImages /
+      // veoModel / veoAspectRatio are stamped HERE, not only on success.
+      //
+      // WHY. Until now the ONLY writers of those four fields were the
+      // success-path persists (renderer.js:1438 master, adRegenerateService.js:892
+      // regenerate). A generation that failed therefore recorded NOTHING about
+      // what was actually submitted — six consecutive regenerate failures on
+      // 2026-08-26 left six ads with veoPrompt:null, so the input nobody could
+      // see in full was, structurally, an input that was never written down.
+      // The generation inspector (frontend PR #76) already renders exactly
+      // these four fields, so stamping them at the charge point makes a FAILED
+      // generation inspectable with no backend or frontend change.
+      //
+      // Idempotent with the success path: the later persists write the same
+      // values back (veoResult.prompt === prompt, veoResult.referenceImages ===
+      // submittedImageUrls(imageUrls, caps), same model/aspect), so nothing a
+      // successful render stores changes. A provider-fault retry re-runs this
+      // block with the same payload and a new predictionId — also correct.
+      //
+      // All four fields exist in BOTH models/Ad.js schemas (verified against
+      // backend origin/main), so scripts/verifyModelParity.js is unaffected.
+      //
+      // Still non-fatal, and still the SAME single write as before: the
+      // veoPredictionId spend receipt must not become less reliable for the
+      // sake of a diagnostic. If this throws, the receipt is lost exactly as
+      // it would have been before — no new failure mode is introduced.
       try {
-        await Ad.updateOne({ _id: ad._id }, { $set: { veoPredictionId: predictionId, updatedAt: new Date() } });
+        await Ad.updateOne({ _id: ad._id }, { $set: {
+          veoPredictionId:    predictionId,
+          veoPrompt:          prompt,
+          veoModel:           model,
+          veoAspectRatio:     aspectRatio,
+          veoReferenceImages: submittedImageUrls(imageUrls, caps),
+          updatedAt:          new Date()
+        } });
       } catch (err) {
         console.warn(`   ⚠️  atlasVideo: could not persist veoPredictionId=${predictionId} (${err.message}) — orphan would be unreconcilable`);
+      }
+      // The submitted PARAMETERS, which have no dedicated Ad field on either
+      // schema. Kept as a SEPARATE, fully independent fire-and-forget write so
+      // a failure here cannot touch the spend receipt above. renderStages is
+      // Mixed and present in both schemas, so no new top-level path is
+      // declared (verifyModelParity compares top-level paths only).
+      //
+      // Aggregation-pipeline form is REQUIRED: renderStages defaults to null
+      // and Mongo rejects a nested $set on a null parent — the exact silent
+      // failure documented in services/stageTiming.js:65-72. $ifNull coalesces
+      // it, $mergeObjects preserves sibling stage timings.
+      //
+      // NOTE: nothing surfaces this yet. The inspector payload is built in
+      // backend routes/ads.js (~:4898-5121) and would need to pass it through
+      // for the SPA to render it — a cross-repo follow-up. Persisting it now
+      // means the next investigation has the data even though today it is only
+      // queryable in Mongo.
+      try {
+        await Ad.updateOne({ _id: ad._id }, [{ $set: { renderStages: { $mergeObjects: [
+          { $ifNull: ['$renderStages', {}] },
+          { videoSubmission: {
+            predictionId,
+            model,
+            paramShape:     caps.paramShape || null,
+            aspectRatio,
+            durationSec:    durationSec || caps.defaultDuration || null,
+            resolution:     renderResolution,
+            referenceCount: submittedImageUrls(imageUrls, caps).length,
+            promptBytes:    Buffer.byteLength(prompt, 'utf8'),
+            promptByteCap:  caps.promptByteCap || null,
+            hasVideoClip:   !!videoClipUrl,
+            submittedAt:    new Date()
+          } }
+        ] } } }]);
+      } catch (err) {
+        console.warn(`   ⚠️  atlasVideo: could not persist renderStages.videoSubmission (${err.message}) — diagnostic only, generation unaffected`);
       }
       try {
         await recordFlatCost({

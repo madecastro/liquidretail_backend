@@ -746,18 +746,81 @@ function buildVeoPrompt({
   const oppositeLabel = isSplit ? (subjectSide === 'east' ? 'left' : 'right') : null;
   const isBrandPanel = isSplit && panelTreatment === 'brand_panel';
 
-  // Operator refinement (regeneration only). Leads the prompt so the
-  // video model sees the requested change before the fixed spec below.
-  // Lifestyle guidance (intent × lifestyle) also arrives here via the
-  // videoPromptGuidance cascade — ambient motion is already permitted by
-  // LIFESTYLE_DIRECTIVES, so guidance can shape mood/pacing without
-  // contradicting the base.
-  if (operatorPrompt && String(operatorPrompt).trim()) {
-    lines.push(
-      `OPERATOR REFINEMENT (HIGHEST PRIORITY — overrides conflicting guidance below): ` +
-      `${String(operatorPrompt).trim()}. ` +
-      `Apply this refinement to the generated video. The product fidelity and no-text guidance still apply, but where the operator's instruction conflicts with stylistic defaults the operator wins.`
-    );
+  // Operator refinement (regeneration, and the lifestyle-guidance cascade).
+  // Leads the prompt so the model sees the requested change early — but it
+  // is SUBORDINATE, not supreme.
+  //
+  // INCIDENT THIS FIXES (2026-08-26). This block used to be labelled
+  // "OPERATOR REFINEMENT (HIGHEST PRIORITY — overrides conflicting guidance
+  // below)". Everything "below" includes `d.noText` (~:1100, forbids
+  // rendering any text/logo not already in the photographs) and the
+  // PRODUCT FIDELITY block (~:1131) — so arbitrary operator free text was
+  // stamped as the single highest-priority directive and explicitly declared
+  // to override the two inviolable constraints. Same defect class as the
+  // catalog-title door closed at :787-799 (a product named "Vaportek" made
+  // Omni fabricate a VAPORTEK chest lockup over the real PELAGIC fish-mark,
+  // and vision-QC terminal-rejected the $0.90 master); this was the same bug
+  // through the OPERATOR door — "make the Vaportek shirt pop" reproduces it
+  // from the Regenerate button.
+  //
+  // THE RULE: fidelity and no-rendered-text constraints are inviolable.
+  // Operator refinement STEERS WITHIN them; it never overrides them.
+  // Steering is the whole point of the button, so the input is kept intact —
+  // only the precedence is corrected. Reinforced by the CONSTRAINT SUPREMACY
+  // block pushed as the LAST element of `lines` below (recency), emitted on
+  // the same guard so the no-operator path stays byte-identical.
+  //
+  // LIFESTYLE_VIDEO_GUIDANCE (:636-650) also arrives through this same
+  // `operatorPrompt` parameter via the guidance cascade
+  // (atlasVideoService.js:4583-4592), so system-authored lifestyle guidance
+  // gets the same fencing. Intended — it is mood/pacing direction and reads
+  // correctly under the new framing — but note it means the lifestyle
+  // GENERATE path also carries these two blocks' bytes.
+  // FENCE, DO NOT FILTER. No keyword scrubber, brand-name blocklist, or
+  // proper-noun detector — an evadable text filter is a losing game, and a
+  // user naming their own brand is legitimate. Instead the operator's words
+  // sit inside a delimited region whose framing declares them direction,
+  // never content to draw. A determined operator can still write something
+  // that reads like a render instruction: the fence is framing, not a parser,
+  // and CONSTRAINT SUPREMACY below is what makes the constraints win.
+  //
+  // Assembled in three PIECES rather than one string so the byte budget at
+  // the end of this function can drop the EXPLANATION while keeping the label,
+  // the fence, and the supremacy block. Degrade the explanation, never the
+  // constraint.
+  const operatorTrim = operatorPrompt && String(operatorPrompt).trim();
+  let operatorLineFull = null;
+  let operatorLineCompact = null;
+  let supremacyLine = null;
+  if (operatorTrim) {
+    // Neutralize OUR OWN control tokens if they appear in the operator's text.
+    // Without this, one pasted delimiter closes the fence and the remainder
+    // reads as top-level prompt (found by adversarial review). This is NOT the
+    // content filter rejected above: it is a CLOSED two-token set that this
+    // file defines, so there is no open-ended evasion space to chase. The
+    // operator's own words are otherwise interpolated verbatim.
+    const safeOperator = String(operatorTrim)
+      .split(FENCE_OPEN).join('[delimiter removed]')
+      .split(FENCE_CLOSE).join('[delimiter removed]');
+
+    // SIZED DELIBERATELY. label + fence markers + supremacy must stay close to
+    // the 274 bytes the old single-string wrapper cost, or a max-length
+    // refinement on a 4,096-byte model stops fitting — a real regression this
+    // change must not introduce (measured; see the budget block at the end of
+    // this function). The long `framing` sentence is the only luxury, and it is
+    // the piece the budget drops first.
+    const label =
+      `OPERATOR REFINEMENT (subordinate to the constraints below). `;
+    const framing =
+      `The fenced text is camera, motion, pacing, mood and framing direction for the existing scene — never content to draw, never text to render, never branding to add. A brand name inside it says which item to film, never a word to display. `;
+    const fence = `${FENCE_OPEN} ${safeOperator} ${FENCE_CLOSE}`;
+
+    operatorLineFull    = label + framing + fence;
+    operatorLineCompact = label + fence;
+    supremacyLine =
+      `CONSTRAINT SUPREMACY: the no-rendered-text, no-invented-branding and PRODUCT FIDELITY constraints above are absolute and outrank this refinement — it may never add text, logos, badges or branding, or change the product identity. Ambient motion already permitted is unaffected.`;
+
+    lines.push(operatorLineFull);
   }
 
   // ── Directives (lifestyle sibling OR packshot Ken Burns per-profile) ─
@@ -1141,12 +1204,107 @@ function buildVeoPrompt({
     );
   }
 
+  // CONSTRAINT SUPREMACY — the precedence rule, in the strongest position.
+  // MUST stay the LAST element of `lines`: recency is what makes the model
+  // treat it as final, and it is the actual override-killer for an operator
+  // refinement that asks for something the constraints forbid (the fence
+  // above is framing only). Do not append anything after this block.
+  //
+  // Operator-path only, on the SAME guard as the block above: with an empty
+  // operatorPrompt the assembled prompt must stay BYTE-IDENTICAL to the
+  // pre-change output — that is the ordinary generate branch (~29 paid
+  // masters/day). NOTE: verifyPostPilotBatch.js (the B14 byte-identity pin
+  // referenced elsewhere in this file) is a BACKEND harness and does NOT exist
+  // in this repo — verified 2026-08-26. In adgen the only pin on this property
+  // is scripts/verifyOperatorPromptPrecedence.js group A, which is therefore
+  // load-bearing rather than belt-and-braces.
+  //
+  // Label deliberately does not match any DROP_PRIORITY pattern, so
+  // enforceByteCap can never drop it.
+  if (operatorTrim) lines.push(supremacyLine);
+
   // Per-model size cap (caps.promptByteCap; Gemini Omni 20,000, Grok
   // 4,096). When over budget, drop optional context lines in defined
   // priority order. Directive blocks (preservation / fidelity / no-text
   // / timeline) are never dropped — they're the load-bearing part.
   // Applies to every profile including pmax.
-  return enforceByteCap(lines, caps);
+  //
+  // NO-OPERATOR PATH IS UNCHANGED, deliberately: same single enforceByteCap
+  // call as before, same warn-and-send behaviour when a prompt is over cap
+  // for reasons that have nothing to do with this change (a lifestyle prompt
+  // on a 4,096-byte model already overflowed before it). Do not add a throw
+  // here — that would be a new failure mode on the ~29-paid-masters/day
+  // branch. Pinned by verifyOperatorPromptPrecedence.js group A + D11.
+  if (!operatorTrim) return enforceByteCap(lines, caps);
+
+  // ── OPERATOR-PATH BYTE BUDGET ────────────────────────────────────────────
+  // The two blocks this change adds cost ~475 bytes on top of the old
+  // wrapper's 274. On a 20,000-byte Omni prompt that is noise; on a
+  // 4,096-byte grok/veo model (operator-selectable in the regenerate
+  // dropdown) a max-length 1,000-char refinement measurably used to fit and
+  // would now be rejected by Atlas. Measured before/after, grok cap:
+  //   no operator   3153 → 3153  (byte-identical, unchanged)
+  //   short refine  3441 → ~3700 (fits)
+  //   1000-char     3959 → over cap without this budget
+  //
+  // PRIORITY, in order: (1) the constraints and the fence are never dropped;
+  // (2) OUR explanation yields first — before the pre-existing DROP_PRIORITY
+  // lines, because PHYSICAL ACCURACY / Transitions / Visual style predate this
+  // change and were tuned deliberately; (3) if even the compact form cannot
+  // fit, FAIL CLOSED rather than submit a prompt whose safety constraints have
+  // been trimmed away. A refused request costs nothing; a submit with the
+  // guardrails silently dropped is the exact failure this change exists to
+  // prevent.
+  const cap = caps?.promptByteCap || DEFAULT_BYTE_CAP;
+
+  // Is the overflow ATTRIBUTABLE TO THIS CHANGE, or to the operator's own text
+  // simply being too long for this model? Probe with the bare fence — no
+  // label, no framing, no supremacy. The old wrapper cost 274 bytes, strictly
+  // more than the fence markers alone, so if even the bare fence is over cap
+  // then the pre-change code was over cap here too. That is a pre-existing
+  // condition (a lifestyle prompt on a 4,096-byte model already overflowed),
+  // and it is not ours to convert into a hard failure — preserve today's
+  // warn-and-send. Otherwise the two new blocks are what tipped it, and
+  // failing closed is the correct response.
+  const preExistingOverflow = applyByteCap(
+    lines
+      .filter((l) => l !== supremacyLine)
+      .map((l) => (l === operatorLineFull ? `${FENCE_OPEN} ${operatorTrim} ${FENCE_CLOSE}` : l)),
+    caps
+  ).bytes > cap;
+
+  const full = applyByteCap(lines, caps);
+  if (full.bytes <= cap && full.dropped.length === 0) {
+    logByteCap(full);
+    return full.prompt;
+  }
+
+  // Sacrifice the explanation before anything else.
+  const compact = applyByteCap(
+    lines.map((l) => (l === operatorLineFull ? operatorLineCompact : l)), caps
+  );
+  if (compact.bytes <= cap) {
+    console.log(
+      `ℹ️  veoPrompt: dropped the operator-refinement explanation to fit under ${cap} bytes ` +
+      `(final=${compact.bytes}); the fence and CONSTRAINT SUPREMACY are retained`
+    );
+    logByteCap(compact);
+    return compact.prompt;
+  }
+
+  if (preExistingOverflow) {
+    logByteCap(compact);
+    return compact.prompt;
+  }
+
+  const err = new Error(
+    `veoPrompt: the operator refinement cannot fit under this model's ${cap}-byte prompt cap ` +
+    `without dropping the no-rendered-text / product-fidelity constraints (needed ${compact.bytes} bytes). ` +
+    `Refusing to submit. Shorten the refinement (currently ` +
+    `${Buffer.byteLength(String(operatorTrim), 'utf8')} bytes) or pick a model with a larger prompt cap.`
+  );
+  err.code = 'VEO_PROMPT_OVER_CAP';
+  throw err;
 }
 
 
@@ -1164,30 +1322,54 @@ const DROP_PRIORITY = [
   /^Visual style: /
 ];
 
-function enforceByteCap(lines, caps = null) {
+// Delimiters for the operator-direction fence. Defined once, in one place, so
+// the neutralization in buildVeoPrompt and the fence itself cannot drift.
+const FENCE_OPEN  = '<<<OPERATOR>>>';
+const FENCE_CLOSE = '<<<END_OPERATOR>>>';
+
+// The cap logic, with NO logging and NO mutation of the caller's array, so
+// buildVeoPrompt's operator-path budget can probe candidate line sets before
+// choosing one. Split out of enforceByteCap (which is now a logging wrapper)
+// rather than reimplemented, so the two can never disagree about drop order,
+// target, or join separator. Output for any given input is byte-identical to
+// the pre-split function.
+//
+// NOTE: the pre-split enforceByteCap spliced the CALLER'S array in place. It
+// was only ever called as the last statement of buildVeoPrompt, so nothing
+// observed that mutation; not mutating is strictly safer.
+function applyByteCap(lines, caps = null) {
   const cap    = caps?.promptByteCap || DEFAULT_BYTE_CAP;
   const target = cap - BYTE_CAP_MARGIN;
-  let prompt = lines.join(' ');
+  const work   = [...lines];
+  let prompt = work.join(' ');
   let bytes  = Buffer.byteLength(prompt, 'utf8');
-  if (bytes <= target) return prompt;
-
   const dropped = [];
+  if (bytes <= target) return { prompt, bytes, dropped, cap, target };
+
   for (const pattern of DROP_PRIORITY) {
     if (bytes <= target) break;
-    const idx = lines.findIndex(l => pattern.test(l));
+    const idx = work.findIndex(l => pattern.test(l));
     if (idx < 0) continue;
-    dropped.push(lines[idx].split(':')[0]);
-    lines.splice(idx, 1);
-    prompt = lines.join(' ');
+    dropped.push(work[idx].split(':')[0]);
+    work.splice(idx, 1);
+    prompt = work.join(' ');
     bytes  = Buffer.byteLength(prompt, 'utf8');
   }
+  return { prompt, bytes, dropped, cap, target };
+}
 
-  if (bytes > cap) {
-    console.warn(`⚠️  veoPrompt: ${bytes} bytes still exceeds the model's prompt cap (${cap}) after dropping [${dropped.join(', ')}] — Atlas will reject`);
-  } else if (dropped.length) {
-    console.log(`ℹ️  veoPrompt: dropped [${dropped.join(', ')}] to fit under ${target} bytes (final=${bytes}, cap=${cap})`);
+function logByteCap(r) {
+  if (r.bytes > r.cap) {
+    console.warn(`⚠️  veoPrompt: ${r.bytes} bytes still exceeds the model's prompt cap (${r.cap}) after dropping [${r.dropped.join(', ')}] — Atlas will reject`);
+  } else if (r.dropped.length) {
+    console.log(`ℹ️  veoPrompt: dropped [${r.dropped.join(', ')}] to fit under ${r.target} bytes (final=${r.bytes}, cap=${r.cap})`);
   }
-  return prompt;
+}
+
+function enforceByteCap(lines, caps = null) {
+  const r = applyByteCap(lines, caps);
+  logByteCap(r);
+  return r.prompt;
 }
 
 // Hard-truncate a full raw-prompt override to the model's byte cap.
