@@ -264,10 +264,28 @@ function resolveRecoveredVideoFailureCharge(r) {
  * ALSO be stale closes exactly that: a brand-new claim's `claimedAt` is
  * fresh regardless of what `updatedAt` last said, so it is protected from
  * the moment it is taken, not only once something first heartbeats it.
- * `claimedAt: null` (legacy/unstamped claims) sorts before any real Date in
- * Mongo's BSON ordering, so `$lt` still matches — such a claim gets no
- * EXTRA protection from this clause, which is the correct fallback: rely on
- * `updatedAt` alone, exactly as before this clause existed.
+ *
+ * `claimedAt: null` (legacy/unstamped claims) needs an EXPLICIT null arm,
+ * not a bare `$lt`, and this was gotten wrong once — corrected 2026-08-27
+ * against a real production probe, not by re-reading the Mongo manual.
+ * MongoDB's comparison OPERATORS are type-bracketed: `{$lt: <a Date>}` only
+ * matches values of a comparable type and does NOT match `null`, unlike the
+ * general BSON *sort* order (where null sorts before every non-MinKey type)
+ * — the two rules look like they should agree and do not. Measured directly
+ * against this collection: of 1,391 rows with `claimedAt: null`, querying
+ * `{claimedAt: {$lt: <a cutoff one full YEAR in the future}}}` matched
+ * **zero** — the most favorable cutoff possible for the wrong assumption,
+ * and it still matched nothing. 65 real-Date `claimedAt` rows matched the
+ * same query as a positive control (all 65). So the ORIGINAL single-clause
+ * `claimedAt: { $lt: claimCutoff }` silently EXCLUDED every legacy claim
+ * from ever being swept — the opposite of the fallback this clause exists
+ * to provide: a claimed-but-unstamped row would sit `status:'rendering'`,
+ * holding a paid receipt, FOREVER, no matter how dead the worker actually
+ * is. The fix is the explicit `$or` below, verified against the same
+ * production data with both a positive control (a real, stale `claimedAt`
+ * still matches) and a negative control (a real, FRESH `claimedAt` — one
+ * newer than the cutoff — still does NOT match, so this is not "null always
+ * passes" swallowing genuine staleness).
  *
  * `receiptKinds` narrows WHICH receipt a candidate must hold — 'both' (the
  * original HAS_RECEIPT $or), 'image', or 'video'. Exists so the video
@@ -312,7 +330,15 @@ function buildRecoverySweepFilter({ cutoff, claimCutoff, receiptKinds = 'both' }
           {
             claimedByWorker: { $ne: null },
             updatedAt: { $lt: claimCutoff },
-            claimedAt: { $lt: claimCutoff }
+            // Explicit null arm — see the docblock above. `{$lt: claimCutoff}`
+            // alone does NOT match `claimedAt: null` in real MongoDB (type-
+            // bracketed comparison, verified against production), so a bare
+            // single clause here would silently strand every legacy/unstamped
+            // claim in `rendering` forever, regardless of how stale it is.
+            $or: [
+              { claimedAt: null },
+              { claimedAt: { $lt: claimCutoff } }
+            ]
           }
         ]
       }

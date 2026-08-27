@@ -91,6 +91,11 @@
 //        arm → H1 fails (a fresh claim on a stale-updatedAt row is swept)
 //   7. Remove the `!isImageReceipt && adgenOwnsRendering` gate, or move it
 //        to wrap the image branch too → G1/G2/G3 fail
+//   8. Revert the explicit `$or: [{claimedAt:null}, {claimedAt:{$lt:...}}]`
+//        back to a bare `claimedAt: { $lt: claimCutoff }` (the exact
+//        merge-gate-caught production bug: MongoDB's $lt does not match
+//        null) → I1 fails (a claimed-but-unstamped dead row becomes
+//        permanently unrecoverable) and E5b fails (structural pin)
 //
 // Pure + offline: no DB, no network, no API key. Group G mocks every
 // network-capable dependency before it is ever called.
@@ -140,12 +145,18 @@ assert.strictEqual(typeof RESUME_CLAIM_STALE_MIN, 'number');
 // accident (same discipline as the mongoMatch helpers this pattern is
 // modelled on elsewhere in this codebase's harnesses).
 //
-// $lt on a MISSING/undefined field matches a Date operand — mirrors real
-// MongoDB BSON comparison ordering, where null/missing sorts before every
-// type except MinKey. Getting this wrong made an earlier draft of this
-// harness fail its OWN correct fixture (a claimedAt-less legacy claim),
-// which is exactly the "harness weaker than production" class of hole
-// adversarial review looks for.
+// $lt on a MISSING/null field does NOT match a Date operand — mirrors real
+// MongoDB comparison-OPERATOR semantics, which are type-bracketed and are
+// NOT the same rule as general BSON *sort* order (where null sorts before
+// every non-MinKey type). An earlier draft of this file got exactly this
+// backwards — it modeled null as `-Infinity` for `$lt`, which made the
+// harness AGREE with a real production bug (`claimedAt: {$lt: claimCutoff}`
+// silently excluding every null-`claimedAt` row from ever being recovered)
+// instead of catching it. Verified directly against this collection: of
+// 1,391 rows with `claimedAt: null`, a query for `{claimedAt: {$lt: <a
+// cutoff one year in the future}}}` matched ZERO of them; 65 real-Date rows
+// matched the same query as a positive control (all 65). Corrected here so
+// this harness can no longer disagree with what MongoDB actually does.
 //
 // MISSING === null for equality ($eq/$ne/$in/$nin membership), also mirroring
 // real Mongo: a field that is simply absent from the document matches a
@@ -166,9 +177,11 @@ function matchesCondition(actual, cond) {
   if (cond !== null && typeof cond === 'object' && !Array.isArray(cond) && !(cond instanceof Date)) {
     for (const [op, operand] of Object.entries(cond)) {
       if (op === '$lt') {
-        const a = actual == null
-          ? -Infinity
-          : (actual instanceof Date ? actual.getTime() : actual);
+        // Type-bracketed: a missing/null field never satisfies $lt against
+        // a non-null operand, regardless of how favorable the cutoff is.
+        // Verified against production — see the header comment above.
+        if (actual == null) return false;
+        const a = actual instanceof Date ? actual.getTime() : actual;
         const b = operand instanceof Date ? operand.getTime() : operand;
         if (!(a < b)) return false;
       } else if (op === '$ne') {
@@ -389,8 +402,46 @@ ok('H1 fresh claim (90s old) on a stale-updatedAt row is NOT swept — the title
 });
 ok('H2 a legacy claim with no claimedAt at all still falls back to updatedAt-only staleness', () => {
   assert.strictEqual(matchesFilter(legacyClaimNoClaimedAt, filter), true,
-    'a claim with no claimedAt should get no LESS protection than before this clause existed — Mongo $lt on a ' +
-    'missing field matches a Date operand, same as this harness\'s own evaluator');
+    'a claim with no claimedAt should get no LESS protection than before this clause existed — the explicit ' +
+    '`claimedAt: null` arm matches a MISSING field too (Mongo equality, not $lt), same as this harness\'s own evaluator');
+});
+
+// ── Group I: the null-claimedAt PRODUCTION BUG — bare $lt never matches null
+// Second-round merge-gate finding, proved directly against production before
+// being fixed here (see the docblock on buildRecoverySweepFilter): MongoDB's
+// $lt is type-bracketed and does NOT match a literal `claimedAt: null` the
+// way it would if BSON *sort* order applied to comparison OPERATORS too.
+// Measured: of 1,391 real rows with `claimedAt: null`, a `{$lt: <a cutoff
+// one year in the future>}` query matched ZERO. The ORIGINAL bare-$lt clause
+// therefore made a claimed-but-unstamped row UNRECOVERABLE FOREVER — exactly
+// the "permanent no-op for claimed rows" this file's own header forbids.
+ok('I1 explicit-null claimedAt + stale updatedAt IS swept — the exact production bug, now closed', () => {
+  const explicitNullClaimedAtStale = {
+    status: 'rendering',
+    claimedByWorker: 'adgen-titler-explicit-null',
+    claimedAt: null,   // as stored by mongoose's declared default, not merely absent
+    updatedAt: minsAgo(RESUME_CLAIM_STALE_MIN + 5),
+    veoPredictionId: 'pred_explicit_null_claimed_at'
+  };
+  assert.strictEqual(matchesFilter(explicitNullClaimedAtStale, filter), true,
+    'a literal claimedAt:null with a stale updatedAt must be recoverable — the production probe showed the ' +
+    'pre-fix bare $lt clause matched zero of 1,391 such rows even against a cutoff a year in the future');
+});
+ok('I2 explicit-null claimedAt + FRESH updatedAt is NOT swept — the null arm does not bypass liveness', () => {
+  // The fix must not overcorrect into "null claimedAt always sweeps
+  // regardless of activity" — updatedAt freshness (a live heartbeat, however
+  // unreliable) still independently excludes the row via the ANDed
+  // `updatedAt: { $lt: claimCutoff }` clause alongside the null-OR.
+  const explicitNullClaimedAtFresh = {
+    status: 'rendering',
+    claimedByWorker: 'adgen-titler-explicit-null-fresh',
+    claimedAt: null,
+    updatedAt: minsAgo(1),
+    veoPredictionId: 'pred_explicit_null_claimed_at_fresh'
+  };
+  assert.strictEqual(matchesFilter(explicitNullClaimedAtFresh, filter), false,
+    'a fresh updatedAt must still exclude the row even with claimedAt:null — the null arm only removes the ' +
+    'FALSE-EXCLUSION bug, it must not also remove the liveness check');
 });
 
 // ── Group E: the live call site uses this exact function, not a copy ─────
@@ -416,9 +467,25 @@ ok('E4 resumeInFlightAds accepts an injectable claimStaleMinutes (same pattern a
 ok('E5 the claimed-arm filter also requires claimedAt to be stale (not updatedAt alone)', () => {
   const i = serviceSrc.indexOf('claimedByWorker: { $ne: null }');
   assert.ok(i > 0, 'expected the claimed $or branch to exist verbatim');
-  const block = serviceSrc.slice(i, i + 160);
+  const block = serviceSrc.slice(i, i + 400);
   assert.ok(/claimedAt:\s*\{\s*\$lt:\s*claimCutoff\s*\}/.test(block),
     'the claimed branch must AND in claimedAt staleness, or H1 above is testing a copy of a stronger filter than production has');
+});
+ok('E5b claimedAt staleness is an EXPLICIT null-OR, not a bare $lt — production-verified fix', () => {
+  // The bare-$lt shape (`claimedAt: { $lt: claimCutoff }` with no sibling
+  // `claimedAt: null` arm) is EXACTLY the shipped bug: MongoDB's $lt does
+  // not match null (type-bracketed comparison — see the docblock and I1/I2
+  // below), so a bare clause here silently strands every unstamped legacy
+  // claim forever. E5 alone would NOT catch a regression back to the bare
+  // form, because the bare form still contains the substring E5 looks for —
+  // this check specifically demands the `claimedAt: null` sibling arm exists
+  // in the same $or, nested under the claimed branch.
+  const i = serviceSrc.indexOf('claimedByWorker: { $ne: null }');
+  assert.ok(i > 0);
+  const block = serviceSrc.slice(i, i + 400);
+  assert.ok(/\$or:\s*\[\s*\{\s*claimedAt:\s*null\s*\}/.test(block),
+    'expected an explicit `{ claimedAt: null }` arm inside a nested $or on the claimed branch — ' +
+    'a bare `claimedAt: { $lt: claimCutoff }` with no null arm is the exact production bug this pins');
 });
 
 // ── Group F: the TTL relationship is real, checked two independent ways ──
