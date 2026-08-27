@@ -4524,8 +4524,12 @@ router.post('/:id/approve', express.json(), async (req, res) => {
 //   prompt:  a refinement note PREPENDED to the auto-composed prompt
 //            (video: OPERATOR REFINEMENT header inside buildVeoPrompt;
 //            image: refinement note into the live direct_image path).
-//            Required UNLESS one of the override fields below is given.
-//            Up to 1000 chars.
+//            OPTIONAL — and so is every override below. A body with NO
+//            refinement at all is a valid, first-class "re-render this ad
+//            as-is" request (owner directive 2026-08-26): the assembled
+//            prompt is then byte-identical to the untouched pipeline
+//            output, because no OPERATOR REFINEMENT block is emitted when
+//            operator text is absent. Up to 1000 chars.
 //   mode:    ACCEPTED AND IGNORED. There is no cheaper regenerate. Every
 //            video regenerate re-rolls the master — one billable Omni
 //            submit (~$0.90 settled); every image regenerate is one
@@ -4626,16 +4630,46 @@ router.post('/:id/regenerate', express.json(), async (req, res) => {
     }
 
     const prompt = String(req.body?.prompt || '').trim();
-    // Gate: at least ONE of prompt / promptOverride / videoPromptRaw /
-    // videoPromptGuidance. Empty regenerate still 400s. Uses the pure
-    // helper so the offline harness pins the same predicate.
-    if (!regen.regenerateHasIntent({
+    // A PLAIN RE-RENDER WITH NO OPERATOR REFINEMENT IS A FIRST-CLASS PATH.
+    // Owner directive 2026-08-26, verbatim: "I should be able to regenerate
+    // with no operator refinement."
+    //
+    // This route used to 400 unless at least one of prompt / promptOverride /
+    // videoPromptRaw / videoPromptGuidance / imagePromptRaw was supplied. That
+    // gate was the ONLY thing forbidding it: every layer below already handles
+    // an absent refinement as an ordinary cascade, and the agent capability
+    // `ad.regenerate` ("Retry a rendered ad AS-IS — no new prompt, no model
+    // swap", services/capabilityExecutors/adRegenerate.js) has always called
+    // regen.regenerateAd() directly with an empty note, bypassing this check.
+    // So the service contract was already "empty is fine" and only the HTTP UI
+    // route disagreed.
+    //
+    // ⚠️ WHY DROPPING IT IS NOT A SPEND REGRESSION — the gate was never the
+    // money guard, and removing it leaves every real one in force. preflight()
+    // (called just below, services/adRegenerateService.js) still refuses a
+    // derive-only surface (409, the ~$0.90 Omni hole), an ad already exported
+    // to Meta (409), an ad with a regeneration ALREADY IN FLIGHT (409 on
+    // ad.regenerating — this is the double-click guard, not the intent gate),
+    // and anything past REGENERATE_DAILY_CAP presses in 24h (429). An empty
+    // refinement changes none of those. What the gate actually prevented was a
+    // deliberate, in-cap, single-flight re-roll of the SAME prompt — which is
+    // precisely the thing being asked for.
+    //
+    // ⚠️ DO NOT "restore" this by inventing a placeholder/default refinement
+    // string to satisfy a validator, and do not reach for `mode` — 'light' /
+    // 'full' select which render stages re-run, NOT whether an instruction was
+    // added, and adRegenerateService normalises video to 'full' regardless.
+    // A synthesised prompt would be injected into the assembled prompt as an
+    // OPERATOR REFINEMENT block, so the re-render would no longer be
+    // byte-identical to the untouched pipeline output — defeating the point.
+    //
+    // regenerateHasIntent is KEPT and still called, but as a LABEL rather than
+    // a rejection: it is what tells the diagnostic whether this run carried any
+    // operator text at all, so "plain re-render" is a recorded fact instead of
+    // something an operator has to infer from an empty field.
+    const hasOperatorIntent = regen.regenerateHasIntent({
       prompt, promptOverride, videoPromptRaw, videoPromptGuidance, imagePromptRaw
-    })) {
-      return res.status(400).json({
-        error: 'prompt, promptOverride, videoPromptRaw, videoPromptGuidance, or imagePromptRaw is required'
-      });
-    }
+    });
     if (prompt.length > 1000) return res.status(400).json({ error: 'prompt is too long (max 1000 chars)' });
     const mode = req.body?.mode === 'full' ? 'full' : 'light';
 
@@ -4692,11 +4726,18 @@ router.post('/:id/regenerate', express.json(), async (req, res) => {
     }
 
     // 202 — operator polls /api/catalog/:productId/ads-detail for stage.
+    // `operatorRefinement` is the accepted-request echo of the label computed
+    // above: false means this is a plain re-render of the untouched pipeline
+    // prompt. It is reported rather than inferred so a client never has to
+    // guess from an empty field whether refinement text was dropped in transit.
     res.status(202).json({
       adId:               String(ad._id),
       regenerating:       true,
       regenerationStage:  'pending',
-      mode:               billedMode
+      // `mode` stays PR #348's billedMode — the mode actually billed, from the
+      // shared resolver. Do NOT revert this to the request's mode.
+      mode:               billedMode,
+      operatorRefinement: hasOperatorIntent
     });
 
     setImmediate(() => {
@@ -5042,8 +5083,70 @@ router.get('/:id/generation-inspector', async (req, res) => {
       // misleading in a diagnostic — an operator comparing output against a
       // reconstructed input stack is debugging a request that never happened.
       // Ads rendered before this was persisted report an empty list and say so.
-      const referenceImages = Array.isArray(ad.veoReferenceImages) ? ad.veoReferenceImages.filter(Boolean) : [];
-      if (!referenceImages.length) {
+      const referenceUrls = Array.isArray(ad.veoReferenceImages) ? ad.veoReferenceImages.filter(Boolean) : [];
+
+      // WHAT EACH REFERENCE IMAGE ACTUALLY IS — not just its URL.
+      // `Ad.veoReferenceImages` is declared `[String]`, so the submit record
+      // carries position and nothing else: an operator looking at four
+      // thumbnails could not tell the catalog primary from an alt, from a
+      // merchant-misfiled colourway photo, from a generated plate. That is
+      // the class of blindness this endpoint exists to remove — a Media row's
+      // own `metadata.imageRole` / `feedIndex` already hold the signal, they
+      // were simply never joined back for the diagnostic.
+      //
+      // ⚠️ HONESTY BOUNDARY — this is a LOOKUP, not a submit-time record, and
+      // it says so per entry via `resolvedFromUrl`. The URL LIST is still the
+      // verbatim persisted stack and is never re-derived (see the comment
+      // above); only the DESCRIPTION of each already-recorded URL is resolved
+      // now. A URL whose Media row was since deleted or re-uploaded resolves
+      // to null and is labelled "not resolvable", rather than being given a
+      // flattering guess — the same rule the empty-stack warning below follows.
+      let referenceImages = referenceUrls;
+      if (referenceUrls.length) {
+        let byUrl = new Map();
+        try {
+          const refMedias = await Media.find({ fileUrl: { $in: referenceUrls } })
+            .select('fileUrl source fileType metadata.imageRole metadata.feedIndex primarySubjectDesc')
+            .lean();
+          byUrl = new Map(refMedias.map(m => [m.fileUrl, m]));
+        } catch (e) {
+          // A diagnostic must never take down the page it explains.
+          console.warn(`generation-inspector: reference-image lookup failed: ${e.message}`);
+        }
+        referenceImages = referenceUrls.map((url, i) => {
+          const m = byUrl.get(url) || null;
+          const imageRole = m?.metadata?.imageRole || null;
+          const feedIndex = Number.isInteger(m?.metadata?.feedIndex) ? m.metadata.feedIndex : null;
+          // Position is the one thing the submit record DOES pin: pos 0 is
+          // the seed by construction (models/Ad.js on veoReferenceImages).
+          const describes = i === 0
+            ? 'seed — the frame the model animated'
+            : (!m
+                ? 'not resolvable — no Media row matches this URL now'
+                : feedIndex === 0
+                  ? 'catalog primary (merchant feed image 0)'
+                  : feedIndex != null
+                    ? `catalog alt (merchant feed image ${feedIndex})`
+                    : imageRole
+                      ? `catalog ${imageRole}`
+                      : `${m.source || 'unknown'} media`);
+          return {
+            url,
+            position:        i,
+            describes,
+            mediaId:         m ? String(m._id) : null,
+            mediaSource:     m?.source || null,
+            imageRole,
+            feedIndex,
+            // The merchant's own description of the subject. A mis-filed
+            // colourway photo is visible HERE before it is visible in the
+            // delivered clip.
+            primarySubjectDesc: m?.primarySubjectDesc || null,
+            resolvedFromUrl: true
+          };
+        });
+      }
+      if (!referenceUrls.length) {
         // Empty is ambiguous — an unrecorded render and a genuinely
         // reference-free one look identical here. State that rather than
         // picking the more flattering explanation.
@@ -5077,6 +5180,187 @@ router.get('/:id/generation-inspector', async (req, res) => {
         } : null,
         referenceImages                           // exactly what was submitted (pos 0 = seed); never reconstructed
       };
+
+      // ── THE FULL SUBMITTED PAYLOAD, not a tidied summary ──
+      // Owner directive 2026-08-26, verbatim: "I want the prompt diagnostic to
+      // extend to everything that the LLM receives in the prompt, not just
+      // operator prompts etc". The concrete failure being closed: six provider
+      // attempts were burned on an input nobody could see in full, because a
+      // brand name was reaching the model through a field nothing inspected.
+      //
+      // `video.prompt` (above) is already the verbatim assembled text — every
+      // directive block, in the order sent, including the product-fidelity
+      // block. What was MISSING is the surrounding truth about that text:
+      // whether the canonical directives were even used, what the operator
+      // supplied, and the numeric parameters that rode alongside it.
+      const promptText  = typeof ad.veoPrompt === 'string' ? ad.veoPrompt : '';
+      const promptBytes = promptText ? Buffer.byteLength(promptText, 'utf8') : 0;
+      let promptByteCap = null;
+      try {
+        // The cap is per-model and lives with the model table, not here — read
+        // it rather than restating it, or the two drift and the diagnostic
+        // starts lying about headroom.
+        const { MODEL_CAPS } = require('../services/atlasVideoService');
+        promptByteCap = MODEL_CAPS?.[ad.veoModel]?.promptByteCap ?? null;
+      } catch (e) {
+        console.warn(`generation-inspector: model-cap lookup failed: ${e.message}`);
+      }
+
+      // ⚠️ `videoPromptRaw` IS THE WIDER HOLE, and it is the reason this block
+      // exists rather than just a byte counter. When an operator supplies it,
+      // atlasVideoService SKIPS buildVeoPrompt entirely and submits the raw
+      // text (logging "canonical directives bypassed"). So on a raw run the
+      // camera directives, the fidelity block and the timeline are simply NOT
+      // in the payload — and until now nothing on any API surface said so:
+      // `videoPromptRaw` appeared on no response at all, and `veoPrompt`
+      // showed the capped raw text, which looks like an ordinary prompt that
+      // merely happens to be short. An operator debugging a bad render could
+      // not tell "the directives ran and did not work" from "the directives
+      // never ran".
+      const rawOverride = typeof ad.videoPromptRaw === 'string' && ad.videoPromptRaw.trim()
+        ? ad.videoPromptRaw
+        : null;
+      const guidance = typeof ad.videoPromptGuidance === 'string' && ad.videoPromptGuidance.trim()
+        ? ad.videoPromptGuidance
+        : null;
+      // The last refinement note actually requested, from the one place it is
+      // persisted. NOTE the asymmetry, stated rather than hidden: raw/guidance
+      // stamped at WIZARD mint time live on the Ad, but a per-call regenerate
+      // override is deliberately PASS-THROUGH (adRegenerateService: "never
+      // write these back onto the Ad row"), so it is only ever visible through
+      // regenerationHistory. Do not read an empty `operatorInputs.raw` as
+      // proof that no raw prompt was used on the most recent regenerate.
+      const history = Array.isArray(ad.regenerationHistory) ? ad.regenerationHistory : [];
+      const lastRegen = history.length ? history[history.length - 1] : null;
+
+      out.video.durationSec = Number.isFinite(ad.videoDurationSec) ? ad.videoDurationSec : null;
+      out.video.submission = {
+        // Which assembly path produced the text in `video.prompt`.
+        promptSource: rawOverride ? 'raw-override' : 'canonical-directives',
+        canonicalDirectivesBypassed: !!rawOverride,
+        promptBytes,
+        promptByteCap,
+        promptBytesRemaining: promptByteCap == null ? null : promptByteCap - promptBytes,
+        promptAtOrOverCap:    promptByteCap == null ? null : promptBytes >= promptByteCap,
+        model:        ad.veoModel || null,
+        aspectRatio:  ad.veoAspectRatio || null,
+        durationSec:  Number.isFinite(ad.videoDurationSec) ? ad.videoDurationSec : null,
+        referenceCount: referenceUrls.length,
+        // ⚠️ COUNT ALONE IS A MISLEADING DIAGNOSTIC. Measured on a failing 9:16
+        // ad: two of its three references were byte-different URLs but the SAME
+        // photograph served through two different CDNs. "3 reference images"
+        // read as fine while the model actually received two distinct views —
+        // precisely the "looks complete, is not" failure this endpoint exists to
+        // prevent. Two URLs backed by the same Media row collapse to one
+        // mediaId, so that duplication IS detectable here and is reported.
+        distinctUrlCount: new Set(referenceUrls).size,
+        // Distinct RESOLVABLE sources. Unresolvable URLs are excluded rather
+        // than counted as one anonymous group, which would understate variety.
+        distinctMediaCount: (() => {
+          const ids = (Array.isArray(referenceImages) ? referenceImages : [])
+            .map(r => (r && typeof r === 'object' ? r.mediaId : null))
+            .filter(Boolean);
+          return new Set(ids).size;
+        })(),
+        // Distinct FILENAMES. This is the arm that catches the real production
+        // case: two byte-different URLs on different CDNs, each with its OWN
+        // Media row (so mediaId does NOT collapse), serving the same file —
+        // e.g. cdn.example/alt1.jpg and cdn2.example/alt1.jpg. Verified by
+        // execution: the mediaId arm alone reported 3/3 distinct on exactly
+        // that shape and stayed silent.
+        //
+        // ⚠️ THIS IS A FILENAME HEURISTIC, NOT PROOF, and it is reported as one.
+        // Two different photographs can legitimately share a basename across
+        // CDNs, and one photograph can appear under two different names — so a
+        // collision here is a PROMPT TO LOOK, not a defect, and the warning is
+        // worded that way.
+        distinctBasenameCount: (() => {
+          const names = referenceUrls.map(u => {
+            try {
+              return new URL(u).pathname.split('/').filter(Boolean).pop() || u;
+            } catch { return String(u).split('?')[0].split('/').filter(Boolean).pop() || u; }
+          }).filter(Boolean);
+          return new Set(names).size;
+        })(),
+        // ⚠️ STATED LIMIT: none of these arms is a pixel comparison. Two
+        // DIFFERENT Media rows holding the same photograph under DIFFERENT
+        // filenames are indistinguishable from metadata alone — detecting that
+        // needs a byte or perceptual hash of the images, which nothing records.
+        // A collapse reported here is real; silence is NOT proof that every
+        // reference is a genuinely different view. The per-image descriptions
+        // are listed so an operator can judge the stack by eye, which remains
+        // the only complete check.
+        distinctnessIsMetadataOnly: true,
+        predictionId: ad.veoPredictionId || null,
+        operatorInputs: {
+          // Full text, never truncated — a diagnostic that abbreviates the
+          // input is the failure mode being fixed here.
+          videoPromptRaw:      rawOverride,
+          videoPromptGuidance: guidance,
+          lastRefinementPrompt:      lastRegen?.prompt || null,
+          lastRefinementWasRawEdit:  lastRegen ? !!lastRegen.rawPromptEdit : null,
+          lastRefinementAt:          lastRegen?.at || null
+        }
+      };
+
+      // A stack that LOOKS varied but collapses to fewer real sources is the
+      // quiet version of a bad reference set: the model got less to work with
+      // than the count implies, and nothing said so.
+      {
+        const sub = out.video.submission;
+        if (referenceUrls.length > 1 && sub.distinctUrlCount < referenceUrls.length) {
+          out.warnings.push({
+            code: 'reference-images-duplicate-urls',
+            message:
+              `${referenceUrls.length} reference images were submitted but only ${sub.distinctUrlCount} `
+              + 'are distinct URLs — the same image was sent more than once, so the model received '
+              + 'less variety than the count suggests.'
+          });
+        } else if (referenceUrls.length > 1 && sub.distinctMediaCount > 0
+                   && sub.distinctMediaCount < sub.distinctUrlCount) {
+          out.warnings.push({
+            code: 'reference-images-same-source',
+            message:
+              `${sub.distinctUrlCount} distinct reference URLs resolve to only ${sub.distinctMediaCount} `
+              + 'catalog image(s) — the same photograph was sent more than once through different URLs '
+              + '(e.g. two CDNs), so the model received fewer genuinely different views than it appears.'
+          });
+        } else if (referenceUrls.length > 1 && sub.distinctBasenameCount < sub.distinctUrlCount) {
+          // The filename arm. Deliberately LAST and deliberately hedged: it is
+          // the only arm that sees the two-CDNs-two-Media-rows case, but it is
+          // a heuristic, so it asks the operator to look rather than asserting
+          // a fault.
+          out.warnings.push({
+            code: 'reference-images-possible-duplicate-filenames',
+            message:
+              `${sub.distinctUrlCount} reference URLs share only ${sub.distinctBasenameCount} distinct `
+              + 'filename(s) — they may be the same image served from different hosts (a real case: the '
+              + 'same photo via two CDNs, so the model got fewer views than the count implies). This is a '
+              + 'filename comparison, not a pixel comparison — check the thumbnails and descriptions '
+              + 'below to confirm before treating it as a fault.'
+          });
+        }
+      }
+
+      if (rawOverride) {
+        out.warnings.push({
+          code: 'video-prompt-raw-override',
+          message:
+            'This ad carries a RAW camera-prompt override, so buildVeoPrompt was bypassed: '
+            + 'the canonical camera directives, the product-fidelity block and the timeline '
+            + 'were NOT sent. The prompt shown above is the operator text (byte-capped), not '
+            + 'an assembled prompt — judge the render against that text alone.'
+        });
+      }
+      if (promptByteCap != null && promptBytes >= promptByteCap) {
+        out.warnings.push({
+          code: 'video-prompt-at-byte-cap',
+          message:
+            `The submitted prompt is ${promptBytes} bytes against this model's ${promptByteCap}-byte cap, `
+            + 'so it was truncated or had optional lines dropped before submit — the model may not have '
+            + 'received the tail of the prompt shown above.'
+        });
+      }
       if (!ad.veoPrompt) {
         out.warnings.push({ code: 'no-video-prompt', message: 'No stored video prompt — ad predates prompt persistence or was not a Veo render.' });
       }
@@ -5125,6 +5409,44 @@ router.get('/:id/generation-inspector', async (req, res) => {
         // Per-stage wall time for THIS render (derive/render/upload ms) — the
         // direct answer to "why is this one slow" without a log search.
         renderStages:          ad.renderStages || null
+      };
+
+      // Submitted-parameter parity with the video block above, so "everything
+      // the model received" means the same thing on both paths.
+      // ⚠️ `promptByteCap` is deliberately null here and that is a fact, not a
+      // gap: no image model in use publishes a prompt cap (docs/ATLAS.md §7 —
+      // "Image models: no published max"), so the static prompt is never
+      // truncated by one. Reporting a made-up ceiling would invent headroom
+      // pressure where none exists. The static prompt does run ~7.8-8.4k chars,
+      // which is exactly why the SIZE is worth showing even with no cap.
+      const imagePromptText = typeof ad.imageGeneration?.prompt === 'string'
+        ? ad.imageGeneration.prompt
+        : '';
+      const imgHistory  = Array.isArray(ad.regenerationHistory) ? ad.regenerationHistory : [];
+      const imgLastRegen = imgHistory.length ? imgHistory[imgHistory.length - 1] : null;
+      image.submission = {
+        promptBytes:   imagePromptText ? Buffer.byteLength(imagePromptText, 'utf8') : 0,
+        promptByteCap: null,
+        model:         ad.imageGeneration?.model    || null,
+        provider:      ad.imageGeneration?.provider || null,
+        size:          ad.imageGeneration?.size     || null,
+        quality:       ad.imageGeneration?.quality  || null,
+        inputFidelity: ad.imageGeneration?.inputFidelity || null,
+        referenceCount: Array.isArray(ad.imageGeneration?.images)
+          ? ad.imageGeneration.images.length
+          : 0,
+        predictionId:  ad.imageGeneration?.predictionId || null,
+        operatorInputs: {
+          // Static has no persisted raw-prompt field: `imagePromptRaw` and
+          // `promptOverride` are per-call PASS-THROUGH and are never written to
+          // the Ad, so history is the only record that a full replacement ran.
+          // `lastRefinementWasRawEdit` true with a null text is therefore an
+          // honest "a verbatim override ran, its text was not retained" — not a
+          // missing field.
+          lastRefinementPrompt:     imgLastRegen?.prompt || null,
+          lastRefinementWasRawEdit: imgLastRegen ? !!imgLastRegen.rawPromptEdit : null,
+          lastRefinementAt:         imgLastRegen?.at || null
+        }
       };
       if (!ad.imageGeneration) {
         // Deliberately does NOT assert a cause. An HTML/Puppeteer render makes
