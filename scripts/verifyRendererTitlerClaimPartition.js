@@ -83,6 +83,29 @@ const titlerClaimBody   = functionBody(TITLER_SRC, CLAIM_ONE_SIG);
 
 function mongoMatch(filter, doc) {
   for (const [key, cond] of Object.entries(filter)) {
+    // FAIL LOUD ON A DOTTED PATH (2026-08-26). This matcher resolves a filter
+    // key as a FLAT `doc[key]` lookup, but real MongoDB resolves `'a.b'` as a
+    // NESTED lookup. Against a nested fixture the flat read yields
+    // `undefined`, so `{'a.b': {$ne: null}}` silently matches EVERYTHING and
+    // `{'a.b': 'x'}` silently matches NOTHING — a false pass in whichever
+    // direction the assertion happens to want, with no red flag at all.
+    // scripts/lib/miniMongoStub.js carried exactly this bug and used it to
+    // conclude that a stranded image receipt is never selected by the recovery
+    // sweep, which is FALSE in production.
+    //
+    // Audited 2026-08-26: every filter THIS harness evaluates is top-level
+    // only, so this guard never fires today. It exists so that the day a
+    // dotted path does reach here — `spendReceipt`'s
+    // 'imageGeneration.predictionId' is the one that already exists in this
+    // repo — the harness STOPS instead of lying. Fix it then by resolving the
+    // path (`key.split('.').reduce((o, k) => (o == null ? undefined : o[k]), doc)`),
+    // never by deleting this check.
+    if (key.includes('.')) {
+      throw new Error(
+        `mongoMatch: dotted path '${key}' needs nested resolution — this matcher does ` +
+        `a flat doc[key] lookup and would silently mis-match. Resolve the path.`
+      );
+    }
     const val = doc[key];
     if (cond !== null && typeof cond === 'object' && !Array.isArray(cond)) {
       for (const [op, operand] of Object.entries(cond)) {
