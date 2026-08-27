@@ -557,24 +557,61 @@ check('D4 [QUOTE-AGNOSTIC] the unsettledAtTimeout branch does NOT stamp status t
     'resume fix, since a "failed" Ad is never re-entered by claimOne or anything else');
 });
 
-check('D5 the unsettledAtTimeout branch releases the claim via releaseClaim(ad._id, ...)', () => {
+// ── D5/D6 REVISED 2026-08-27 — THE ORIGINAL ASSERTIONS PINNED A REAL BUG ────
+//
+// D5 used to REQUIRE `releaseClaim(ad._id, ...)` inside the branch, on the
+// stated reasoning "so claimOne() can re-claim this ad on a future poll". That
+// is exactly the defect. Releasing a claim while leaving `status:'rendering'`
+// hands the row straight back to claimOne, and nothing bounded how many times
+// that could happen: no lifetime cap, no deadline, and renderAttempts was
+// $inc'd only by the COMPLETION writes, so it stayed 0 through every cycle.
+//
+// Measured 2026-08-26 — master 6a8fb12ad0621a3e8f4a7d49, one CampaignRun,
+// 2h21m: TEN DISTINCT Atlas prediction ids, a fresh billable submit roughly
+// every 12-14 minutes, none completing, 17 derives pinned behind it. The
+// "resumes the SAME prediction, never resubmits" comment this harness was
+// written to protect described one door and was read as a bound on all of them.
+//
+// The branch now delegates to renderer.js's `settleUnsettledVideoTimeout`, which
+// keeps a RECEIPT-HOLDING row claimed (so claimOne cannot re-take it, and
+// bootRecoveryService's free GET owns it instead) and only releases a row that
+// holds no receipt and therefore was never billed. D7/D8 below are unchanged and
+// still true — they describe what releaseClaim and claimOne do — but they are no
+// longer the description of THIS path. Full coverage of the new contract,
+// including an executed parameter sweep of the decision function, lives in
+// scripts/verifyUnsettledTimeoutBounded.js.
+check('D5 [REVISED] the unsettledAtTimeout branch delegates to a BOUNDED settler and does not release inline', () => {
   const branch = unsettledBranch();
-  assert.match(branch.ifBlock, /releaseClaim\s*\(\s*ad\._id/,
-    'expected releaseClaim(ad._id, ...) so claimOne() can re-claim this ad on a future poll ' +
-    '(status:"rendering", claimedByWorker:null — see D7/D8)');
+  assert.match(branch.ifBlock, /settleUnsettledVideoTimeout\s*\(\s*ad\s*,\s*err\s*\)/,
+    'expected the branch to delegate to settleUnsettledVideoTimeout(ad, err)');
+  assert.ok(!/releaseClaim\s*\(/.test(branch.ifBlock),
+    'the branch releases the claim inline again — that is the unbounded requeue this closed ' +
+    '(ten billable submits on one ad, 2026-08-26)');
 });
 
-check('D6 [QUOTE-AGNOSTIC] the unsettledAtTimeout branch bumps the run counter as "skipped", never "failed"', () => {
-  const branch = unsettledBranch();
-  const skippedHits = findRealMatches(branch.ifBlock,
+check('D6 [QUOTE-AGNOSTIC] the settler bumps "skipped" while pending, and "failed" ONLY at the cap', () => {
+  const settlerBody = fnBody(rendererSrc, 'async function settleUnsettledVideoTimeout(');
+  assert.ok(settlerBody, 'settleUnsettledVideoTimeout() not found in renderer.js');
+  const skippedHits = findRealMatches(settlerBody,
     /bumpRunCounter\s*\(\s*ad\.campaignRunIds\s*,\s*['"]skipped['"]\s*\)/);
   assert.ok(skippedHits.length >= 1,
-    "expected bumpRunCounter(ad.campaignRunIds, 'skipped') (either quote style) — 'failed' would misreport a " +
-    'genuinely still-pending Atlas job as a confirmed failure to the CampaignRun counters');
-  const failedHits = findRealMatches(branch.ifBlock,
+    "expected bumpRunCounter(ad.campaignRunIds, 'skipped') for the still-pending arms — a genuinely " +
+    'still-processing Atlas job must not be reported to the run counters as a confirmed failure');
+  const failedHits = findRealMatches(settlerBody,
     /bumpRunCounter\s*\(\s*ad\.campaignRunIds\s*,\s*['"]failed['"]\s*\)/);
-  assert.strictEqual(failedHits.length, 0,
-    'the unsettledAtTimeout branch must not ALSO bump the run counter as "failed" alongside "skipped"');
+  // 'failed' is now LEGITIMATE, but only on the terminal cap arm, where the ad
+  // really is being given up on. Anywhere else it would misreport a pending job.
+  assert.strictEqual(failedHits.length, 1,
+    "expected exactly ONE bumpRunCounter(..., 'failed') — the terminal cap arm");
+  // Positional proof that the one 'failed' bump sits in the terminal arm: it
+  // must appear AFTER the terminal branch opens and BEFORE the hold arm does.
+  const termIdx = settlerBody.indexOf("decision.action === 'terminal'");
+  const holdIdx = settlerBody.indexOf("decision.action === 'hold'");
+  const failedIdx = settlerBody.search(/bumpRunCounter\s*\(\s*ad\.campaignRunIds\s*,\s*['"]failed['"]\s*\)/);
+  assert.ok(termIdx !== -1 && holdIdx !== -1, 'could not locate the terminal/hold arms');
+  assert.ok(failedIdx > termIdx && failedIdx < holdIdx,
+    "the 'failed' bump is not inside the terminal arm — a still-pending job would be " +
+    'reported to the run counters as a confirmed failure');
 });
 
 check('D7 releaseClaim() clears claimedByWorker/claimedAt and never touches status', () => {

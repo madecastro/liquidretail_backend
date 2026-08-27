@@ -153,8 +153,13 @@ if (titlerCatchCalls.length) {
 function countRenderStageDone(src) {
   return (src.match(/^\s*renderStage:\s*'done',$/gm) || []).length;
 }
-check('F1: renderer.js has exactly 4 renderStage:\'done\' writes (settle + derive + master + catch)',
-  countRenderStageDone(rendererSrc) === 4, `found ${countRenderStageDone(rendererSrc)}`);
+// 5 as of 2026-08-27: the fifth is settleUnsettledVideoTimeout's terminal cap
+// arm, which gives up on a video master that has hit the Atlas poll ceiling
+// UNSETTLED_TIMEOUT_MAX_ATTEMPTS times. It is a genuine terminal stamp and needs
+// the same 'done' stage as the catch it sits beside — without it the frontend's
+// live-elapsed timer runs forever on a row nothing will touch again.
+check('F1: renderer.js has exactly 5 renderStage:\'done\' writes (settle + derive + master + catch + unsettled-cap)',
+  countRenderStageDone(rendererSrc) === 5, `found ${countRenderStageDone(rendererSrc)}`);
 check('F2: titler.js has exactly 3 renderStage:\'done\' writes (settle + guarded + catch)',
   countRenderStageDone(titlerSrc) === 3, `found ${countRenderStageDone(titlerSrc)}`);
 

@@ -782,26 +782,104 @@ check('C6 [THE STUCK-AD FIX] processAd releases the claim (leaves rendering) on 
   const releaseHits = findRealMatches(catchBlock, /unsettledAtResume/);
   assert.ok(releaseHits.length >= 1, 'processAd\'s catch must reference err.unsettledAtResume');
 
-  // The SAME `if` that already handles unsettledAtTimeout must also cover
-  // unsettledAtResume (not a parallel, easy-to-miss second branch) — and
-  // that combined branch must still call releaseClaim + bumpRunCounter
-  // 'skipped', and must sit BEFORE the generic status:'failed' write.
-  const ifMatch = findRealMatches(catchBlock, /if\s*\(\s*err\s*&&\s*\(\s*err\.unsettledAtTimeout\s*\|\|\s*err\.unsettledAtResume\s*\)\s*\)/);
-  assert.ok(ifMatch.length >= 1,
-    'expected a single `if (err && (err.unsettledAtTimeout || err.unsettledAtResume))` guard — a separate, ' +
-    'parallel branch could drift from the video branch\'s release/bumpRunCounter/return shape');
-  const ifOpen = catchBlock.indexOf('{', ifMatch[0].index);
+  // ASSERT THE INVARIANT, NOT THE SPELLING (updated 2026-08-27, PR #82).
+  //
+  // This check used to require ONE combined
+  //   `if (err && (err.unsettledAtTimeout || err.unsettledAtResume))`
+  // on the reasoning that "a separate, parallel branch could drift from the
+  // video branch's release/bumpRunCounter/return shape". PR #82 deliberately
+  // SPLIT that branch, because the video half must no longer have that shape:
+  // releasing the claim while leaving status:'rendering' is exactly the
+  // re-claim livelock that burned ten billable Atlas predictions on one ad in
+  // 2h21m. Video now delegates to the bounded settleUnsettledVideoTimeout;
+  // static keeps this release-and-leave-rendering treatment, which is correct
+  // for it (no lifetime cap was ever the static bug).
+  //
+  // So the anti-drift concern is re-pointed rather than dropped: the two arms
+  // are now ALLOWED to differ, but BOTH must still exist, the static one must
+  // still have its exact release shape, and neither may terminal-fail a paid
+  // receipt. Deleting either arm still fails this check — which is the
+  // property that actually protects the money, and the reason this was not
+  // "relaxed to make the suite green".
+  const resumeIf = findRealMatches(
+    catchBlock,
+    /if\s*\(\s*err\s*&&\s*\(?[^)]*err\.unsettledAtResume[^)]*\)?\s*\)/
+  );
+  assert.ok(resumeIf.length >= 1,
+    'processAd\'s catch must GUARD on err.unsettledAtResume — either in a combined ' +
+    '`if (err && (err.unsettledAtTimeout || err.unsettledAtResume))` or in its own ' +
+    'dedicated `if (err && err.unsettledAtResume)`. Without a guard, an ambiguous ' +
+    'resumed static poll falls through to the terminal status:\'failed\' write and ' +
+    'strands a PAID image receipt — bootRecoveryService only ever selects status:\'rendering\'.');
+  // NO EXTRA CONJUNCTS. Matching the guard by regex alone would accept
+  //   `if (err && err.unsettledAtResume && somethingElse)`
+  // and a future narrowing conjunct could quietly disable the static
+  // protection while leaving this check green — a hole the OLD C6 did not have,
+  // because it pinned one exact string. So the condition is compared against an
+  // EXHAUSTIVE whitelist of the two logical forms that are actually correct
+  // (split, or combined either way round) rather than pattern-matched.
+  // Deliberately strict: if someone legitimately refactors this guard (hoists
+  // it into a named predicate, say), this fires and makes them re-validate a
+  // money path on purpose instead of by accident. Raised by adversarial review
+  // 2026-08-27.
+  const condOpen = catchBlock.indexOf('(', resumeIf[0].index);
+  const cond = balanced(catchBlock, condOpen, '(', ')');
+  assert.ok(cond, 'could not balance the unsettledAtResume if-condition');
+  const condNorm = cond.replace(/\s+/g, '');
+  const ACCEPTED = [
+    '(err&&err.unsettledAtResume)',
+    '(err&&(err.unsettledAtTimeout||err.unsettledAtResume))',
+    '(err&&(err.unsettledAtResume||err.unsettledAtTimeout))'
+  ];
+  assert.ok(ACCEPTED.includes(condNorm),
+    `the unsettledAtResume guard's condition is ${condNorm}, which is not one of the accepted ` +
+    `forms ${JSON.stringify(ACCEPTED)}. An added conjunct can narrow this guard until a paid ` +
+    'image receipt falls through to the terminal write; a removed one can widen it onto rows it ' +
+    'must not touch. If you are changing this deliberately, add the new form here and re-prove ' +
+    'the static receipt path.');
+
+  const ifOpen = catchBlock.indexOf('{', resumeIf[0].index);
   const ifBlock = balanced(catchBlock, ifOpen, '{', '}');
-  assert.ok(ifBlock, 'could not balance the combined unsettled if-block');
-  assert.match(ifBlock, /releaseClaim\s*\(\s*ad\._id/, 'the combined branch must call releaseClaim(ad._id, ...)');
+  assert.ok(ifBlock, 'could not balance the unsettledAtResume if-block');
+  assert.match(ifBlock, /releaseClaim\s*\(\s*ad\._id/,
+    'the unsettledAtResume branch must call releaseClaim(ad._id, ...)');
   assert.match(ifBlock, /bumpRunCounter\s*\(\s*ad\.campaignRunIds\s*,\s*['"]skipped['"]\s*\)/,
-    'the combined branch must bump the run counter as \'skipped\', not \'failed\'');
-  assert.match(ifBlock, /return\s*;/, 'the combined branch must return — otherwise execution falls through into the generic failed-status write');
+    'the unsettledAtResume branch must bump the run counter as \'skipped\', not \'failed\'');
+  assert.match(ifBlock, /return\s*;/,
+    'the unsettledAtResume branch must return — otherwise execution falls through into the generic failed-status write');
+  // The static arm must NOT terminal-fail: that is the whole defect #74 fixed.
+  assert.ok(!/status:\s*['"]failed['"]/.test(ifBlock),
+    'the unsettledAtResume branch must never write status:\'failed\' — a stranded paid receipt is the bug it exists to prevent');
+  // AND IT MUST NOT BE ROUTED THROUGH THE VIDEO SETTLER. The merge gate called
+  // this out specifically when it proposed the split: settleUnsettledVideoTimeout
+  // is video-specific by construction — it backfills veoPredictionId and writes a
+  // video-shaped renderError (predictionId + chargeState) — so sending a static
+  // resume through it would stamp a video receipt field on an image row and
+  // report against the wrong poll ceiling. Wrong in a different way than the
+  // livelock, and easy to do by accident when collapsing the two arms back
+  // together. Cheap to pin, so pinned.
+  assert.ok(!/settleUnsettledVideoTimeout/.test(ifBlock),
+    'the unsettledAtResume branch must NOT call settleUnsettledVideoTimeout — that settler is ' +
+    'video-specific (backfills veoPredictionId, writes a video-shaped renderError); a static ' +
+    'resume belongs on releaseClaim + leave-rendering');
+
+  // THE VIDEO HALF MUST STILL BE HANDLED SOMEWHERE IN THIS CATCH. Either
+  // combined into the same guard (the pre-#82 shape) or routed to the bounded
+  // settler (the post-#82 shape). If a future resolution of this same conflict
+  // drops the video arm, this fires.
+  const videoHandled =
+    findRealMatches(catchBlock, /err\.unsettledAtTimeout/).length >= 1 &&
+    (/settleUnsettledVideoTimeout\s*\(/.test(catchBlock) ||
+      /err\.unsettledAtTimeout\s*\|\|/.test(catchBlock));
+  assert.ok(videoHandled,
+    'processAd\'s catch must still handle err.unsettledAtTimeout — either combined with ' +
+    'unsettledAtResume, or delegated to settleUnsettledVideoTimeout(ad, err). Losing it ' +
+    'reinstates the video re-claim livelock (PR #82).');
 
   const genericFailedHits = findRealMatches(catchBlock, /status:\s*['"]failed['"]/);
   assert.ok(genericFailedHits.length >= 1, 'no generic status:"failed" write found in the catch block');
-  assert.ok(genericFailedHits[0].index > ifMatch[0].index,
-    'the generic status:"failed" write must come AFTER the combined unsettled branch in source order');
+  assert.ok(genericFailedHits[0].index > resumeIf[0].index,
+    'the generic status:"failed" write must come AFTER the unsettledAtResume branch in source order');
 });
 
 check('C7 atlasImageService distinguishes a DETERMINISTIC verdict (err.policy.terminal OR completedNoOutput) from an AMBIGUOUS one before setting unsettledAtResume', () => {

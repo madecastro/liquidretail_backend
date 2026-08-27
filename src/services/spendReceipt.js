@@ -83,4 +83,97 @@ function receiptFree(filter = {}) {
   return { ...filter, $and: [...existing, ...RECEIPT_FREE.$and] };
 }
 
-module.exports = { RECEIPT_FREE, HAS_RECEIPT, receiptFree };
+/**
+ * THE RULE ABOVE, APPLIED TO ONE SPECIFIC PATH: a video ad whose provider poll
+ * hit OUR wall-clock ceiling while the provider was still working.
+ *
+ * Extracted as a pure decision — the same pattern atlasVideoService.js uses for
+ * `resolveTimeoutOutcome` / `submitRetryDecision` / `shouldResumeAttempt`, and
+ * for the same reason: the money-relevant branching has to be executable in a
+ * harness without mongoose, axios, or an Atlas key. It lives HERE rather than in
+ * renderer.js because renderer.js cannot be required offline (it pulls Remotion,
+ * Cloudinary and the Atlas clients), and because this module's header already
+ * states the rule this function encodes.
+ *
+ * WHY 'hold' EXISTS AT ALL. Until 2026-08-27 this path unconditionally released
+ * the claim while leaving `status:'rendering'`. claimOne's filter is
+ * {status:'rendering', claimedByWorker:null, ...}, so that is an immediate
+ * invitation to re-enter generateForAd. Measured consequence on
+ * run/master 6a8fb12ad0621a3e8f4a7d49 (2026-08-26): ten distinct billable Atlas
+ * prediction ids in 2h21m, ~one fresh submit every 12-14 minutes, none
+ * completing, 17 derives pinned behind it. 'hold' keeps a receipt-holding row
+ * claimed and `rendering` — the resting state this module's header already calls
+ * honest — so the only thing that can touch it next is bootRecoveryService's
+ * free GET, never another submit.
+ *
+ * ⚠️  WHAT 'hold' IS AND IS NOT BOUNDED BY — read before trusting the cap.
+ * Because 'hold' does NOT release the claim, claimOne cannot re-enter processAd
+ * for that row, so the attempt counter is $inc'd exactly ONCE and
+ * `attempts >= cap` is UNREACHABLE on this arm. The cap therefore bounds the
+ * RELEASE arm and catches re-entry driven by anything else (a claim-TTL sweeper,
+ * a future requeue path); it does NOT bound a hold. A hold is bounded instead by
+ * the free receipt poller eventually settling the prediction — which is why
+ * `freePollerEnabled` is an input rather than an assumption: with the poller off
+ * there is nothing to bound it at all, and parking would be a permanent strand,
+ * so this returns 'terminal' instead. An adversarial pass (Grok xhigh,
+ * 2026-08-27) caught an earlier version of this doc claiming "both arms are
+ * bounded by the cap"; that was false in exactly the way the bug this fixes was
+ * false, so it is spelled out here.
+ *
+ * @param {{receipt:?string, attempts:number, cap:number, freePollerEnabled:boolean}} o
+ *   receipt          — the spend receipt (prediction id) this attempt polled, if any.
+ *   attempts         — attempt count AFTER this attempt has been counted (1-based).
+ *   cap              — lifetime ceiling for this branch.
+ *   freePollerEnabled— whether bootRecoveryService's free-GET sweep is actually
+ *                      running (RESUME_IN_FLIGHT_ON_BOOT). Defaults true to match
+ *                      that module's own default.
+ * @returns {{action:'terminal'|'hold'|'release', reason:string, receipt:?string,
+ *            attempts:number, cap:number}}
+ *   terminal — stop: fail the ad, preserving the receipt for reconciliation.
+ *   hold     — keep the claim; hand the row to the free receipt poller.
+ *   release  — nothing was paid for; releasing into the queue is safe.
+ *
+ * Cap is checked FIRST, deliberately: a receipt-holding row that has somehow
+ * come back round despite 'hold' is exactly the runaway this bounds, so the
+ * ceiling must not be reachable-but-skipped just because a receipt is present.
+ */
+function resolveUnsettledTimeoutAction({ receipt, attempts, cap, freePollerEnabled = true } = {}) {
+  const held = typeof receipt === 'string' && receipt.length > 0;
+  // Fail CLOSED on a garbage attempt count — treat an unreadable counter as
+  // "this is the first attempt" rather than as "cap reached", so a counter bug
+  // can never silently terminal-fail a paid render on its first timeout.
+  const nAttempts = Number(attempts);
+  const attemptNo = Number.isFinite(nAttempts) && nAttempts > 0 ? nAttempts : 1;
+  // FLOORED AT 2, and that floor is load-bearing. A ceiling of 1 would make
+  // attempt 1 satisfy `attemptNo >= ceiling`, so the very FIRST timeout would
+  // terminal-fail the ad — foreclosing the free receipt recovery that is the
+  // entire reason this path does not write status:'failed' (a 'failed' row is
+  // outside bootRecoveryService's `status:'rendering'` selector, so the paid
+  // master could never be collected). An operator mis-setting
+  // VIDEO_UNSETTLED_MAX_ATTEMPTS=1, or an unreadable value, must not be able to
+  // convert a slow-but-succeeding render into a discarded charge. Unbounded is
+  // the failure mode this whole change exists to remove, so the fallback still
+  // bounds — just never on the first attempt.
+  const nCap = Number(cap);
+  const ceiling = Math.max(2, Number.isFinite(nCap) && nCap > 0 ? nCap : 2);
+
+  const base = { receipt: held ? receipt : null, attempts: attemptNo, cap: ceiling };
+  if (attemptNo >= ceiling) {
+    return { action: 'terminal', reason: 'cap-reached', ...base };
+  }
+  if (held) {
+    // NOTHING WOULD EVER COLLECT IT. Parking a paid row depends entirely on the
+    // free-GET sweep running: the reaper skips claimed rows, the shutdown drain
+    // only releases receipt-FREE rows, and no periodic scanner pages on a row
+    // that is merely still-processing. With the sweep off, 'hold' is a permanent
+    // silent strand, so failing honestly (receipt preserved for reconciliation)
+    // is strictly better than parking forever.
+    if (!freePollerEnabled) {
+      return { action: 'terminal', reason: 'no-free-poller', ...base };
+    }
+    return { action: 'hold', reason: 'awaiting-free-recovery', ...base };
+  }
+  return { action: 'release', reason: 'no-receipt', ...base };
+}
+
+module.exports = { RECEIPT_FREE, HAS_RECEIPT, receiptFree, resolveUnsettledTimeoutAction };

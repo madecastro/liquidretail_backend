@@ -315,7 +315,44 @@ function lifestyleIntentFromTemplate(template) {
 const BASE_URL     = process.env.ATLAS_BASE_URL || 'https://api.atlascloud.ai/api/v1';
 const BUILT_IN_DEFAULT_MODEL = 'google/gemini-omni-flash/image-to-video-developer';
 const POLL_INTERVAL = parseInt(process.env.ATLAS_POLL_INTERVAL_MS, 10) || 5000;
-const MAX_POLL_MS   = parseInt(process.env.ATLAS_TIMEOUT_MS, 10)       || 600000; // 10 min
+// POLL CEILING — SIZED FROM THE MEASURED PROVIDER LATENCY DISTRIBUTION,
+// raised 600000 -> 900000 on 2026-08-27.
+//
+// The old 10-minute value was not derived from anything. Characterised properly
+// (n=68 delivered videos, at FIXED parameters — production is 100% 1080p and
+// 100% exactly 10.000s, so neither resolution nor duration is a variable):
+//
+//     mean 229.7s   sd 124.5s   range 120-760s   CV 54%
+//
+// The variance is PROVIDER-SIDE, not self-inflicted. Three pairs submitted ~1s
+// apart with byte-identical reference stacks returned 465.9 vs 145.5, 760.3 vs
+// 205.9, and 456.0 vs 171.2 — up to 3.7x apart on identical inputs in the same
+// second. Correlation between submit-burst size and latency is 0.02-0.06, so
+// our own concurrency is ruled out.
+//
+// Against that distribution 600s sat at mean + 2.97sd — a fitted-lognormal
+// p98.4, i.e. roughly 1 in 60 masters abandoned mid-flight — and the OBSERVED
+// MAXIMUM (760.3s) was already beyond it. That is a mis-sized ceiling, not a
+// pathological provider, so raising it is the correct fix rather than a
+// workaround.
+//
+// 900s = mean + 5.4sd, a fitted p99.84, and 1.18x the observed maximum.
+//
+// WHY NOT HIGHER. Beyond this the right mechanism is no longer a longer
+// BLOCKING poll — it is the spend receipt. renderer.js's
+// settleUnsettledVideoTimeout now keeps a receipt-holding row claimed and
+// 'rendering' instead of re-queuing it, so bootRecoveryService's free GET
+// collects a late completion for $0 without occupying a worker slot. Each extra
+// minute of ceiling therefore buys progressively less while costing real
+// concurrency (a poll holds an ADGEN_MAX_INFLIGHT slot). This moves the longest
+// legitimate flight from ~15-17 min to ~20-22 min (poll budget + backoffs +
+// download + Cloudinary mirror + titling composite).
+//
+// SAFE BY CONSTRUCTION for the cross-process lease: REFRAME_CLAIM_TTL_MS above
+// is floored at MAX_POLL_MS + 10 min, and its own comment states the property
+// this relies on — "Raising ATLAS_TIMEOUT_MS therefore cannot silently
+// reintroduce the double-charge this lease exists to prevent."
+const MAX_POLL_MS   = parseInt(process.env.ATLAS_TIMEOUT_MS, 10)       || 900000; // 15 min
 
 function apiKey() { return process.env.ATLAS_API_KEY; }
 function enabled() {

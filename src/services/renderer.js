@@ -1735,6 +1735,365 @@ async function acquireRunHeartbeat(runId) {
   return { stop: release };
 }
 
+// ── VIDEO POLL-TIMEOUT LIFETIME CAP ─────────────────────────────────────────
+// How many times ONE ad may take processAd's unsettledAtTimeout branch before
+// it is failed terminally instead of being left for another cycle.
+//
+// THIS IS NEW COVERAGE, NOT A REPAIR OF SOMETHING THAT EXISTED. The first
+// triage of this incident assumed a frozen renderAttempts had blinded an
+// existing ceiling. It had not: strandedRunSweeper's
+// `renderAttempts < STRANDED_SWEEP_MAX_ATTEMPTS` bound
+// (strandedRunSweeper.js:112) sits inside buildStrandedAdFilter, which also
+// requires `status:'queued'` AND membership in a FAILED run's campaignRunIds
+// (:105-117). A 'rendering' ad on a 'running' run is out of that filter's
+// scope entirely, so no value of the counter could ever have brought it into
+// range. queuedArchiveSweeper's renderAttempts:0 guard is likewise
+// `status:'queued'`-scoped. There was NO guard covering a 'rendering'
+// re-claim loop — the counter being frozen was real and worth fixing for
+// honesty and sweeper visibility, but it is not what let this run away.
+//
+// Default 3 is a backstop, not the primary bound: with the receipt handoff
+// below, a receipt-holding ad takes that branch ONCE and is then owned by
+// bootRecoveryService's free poller, so reaching this cap means something
+// else is re-claiming the row and the loop must stop regardless.
+// FLOOR 2, matching resolveUnsettledTimeoutAction's own floor. They must agree:
+// this constant is what the Slack `cap` field and the persisted message report,
+// while the pure function is what actually decides. Flooring here at 1 while the
+// decision floors at 2 meant VIDEO_UNSETTLED_MAX_ATTEMPTS=1 produced correct
+// BEHAVIOUR (a first timeout still holds) with LYING diagnostics — logs and
+// alerts claiming a cap of 1 that nothing enforced. A stage line that
+// under-reports the real rule misdirects whoever reads it at 3am. Found by
+// adversarial review 2026-08-27.
+const UNSETTLED_TIMEOUT_MAX_ATTEMPTS = Math.max(
+  2,
+  parseInt(process.env.VIDEO_UNSETTLED_MAX_ATTEMPTS, 10) || 3
+);
+
+/**
+ * Settle a video master whose poll hit MAX_POLL_MS while Atlas was still
+ * working. Replaces an unconditional release-the-claim requeue that had no
+ * lifetime bound (see processAd's caller comment for the measured incident).
+ *
+ * THE MONEY INVARIANT: never make a receipt-holding row claimable again.
+ *
+ * A released claim on a `status:'rendering'` row is, by claimOne's own filter
+ * ({status:'rendering', claimedByWorker:null, renderRoute:{$in:[...]}}), an
+ * immediate invitation to re-enter renderVideo -> generateForAd. Even though
+ * that re-entry SHOULD resume from the receipt for free, "should" is doing
+ * load-bearing work across two files and four conditions, and the measured
+ * outcome was ten billable submits. So this stops relying on the downstream
+ * gate to be the only thing between a requeue and a second charge:
+ *
+ *   receipt present  -> DO NOT release the claim. Leave the row claimed and
+ *                       'rendering'. That is exactly the resting state
+ *                       spendReceipt.js already prescribes and the SIGKILL
+ *                       drain handler (:2160-2180) already implements for the
+ *                       same reason, in its own words: "Receipt-HOLDING ads
+ *                       deliberately stay claimed and `rendering`. That is the
+ *                       honest state ... and it preserves the receipt so the
+ *                       asset can be recovered for free rather than re-bought."
+ *                       bootRecoveryService then owns it, and it DOES still
+ *                       sweep a claimed row — but read the condition, because
+ *                       this comment used to state it wrongly. Its selector
+ *                       (buildRecoverySweepFilter, bootRecoveryService.js:178)
+ *                       became claim-AWARE in PR #75, which landed underneath
+ *                       this branch. Alongside the unclaimed arm it carries
+ *                       `{claimedByWorker:{$ne:null}, updatedAt:{$lt:claimCutoff},
+ *                       claimedAt:{$lt:claimCutoff}}`, plus a third arm for a
+ *                       claim with no `claimedAt` at all. So a held row is
+ *                       swept once BOTH clocks are stale, on the longer
+ *                       RESUME_CLAIM_STALE_MIN window — NOT on `updatedAt`
+ *                       alone, which is what the pre-#75 selector needed and
+ *                       what this passage previously claimed.
+ *                       Satisfied here rather than assumed: a held row's
+ *                       `claimedAt` is already ~15 min old, because the Atlas
+ *                       poll ran under this very claim. Verified against the
+ *                       MERGED #75 file during the rebase, not predicted from
+ *                       its branch; harness C5 asserts the invariant (a
+ *                       claimed, stale, receipt-holding row must be sweepable)
+ *                       across both selector shapes rather than either
+ *                       spelling. Ad.js sets `timestamps: false` (:738), so the
+ *                       $inc below does not bump updatedAt and does not itself
+ *                       restart that clock; and the per-ad beat is already
+ *                       stopped, because startAdHeartbeat's `beat.stop()` sits
+ *                       in the render path's `finally` (~:1517) and therefore
+ *                       ran when the throw left renderVideo, before this
+ *                       function was called.
+ *                       Outcome: Atlas settles, and the sweep either collects
+ *                       the paid master for $0 or reconciles the ledger to a
+ *                       confirmed non-charge. Zero further submits.
+ *
+ *                       HONEST LIMITATION — recovery is not necessarily PROMPT.
+ *                       The per-RUN heartbeat also writes ads: acquireRunHeartbeat
+ *                       seeds the ticker with `Ad.find({campaignRunIds: runId})`
+ *                       — EVERY ad of the run — and campaignRunHeartbeat beats
+ *                       `{_id:{$in:adIds}, status:'rendering'}`. A held row
+ *                       matches both, so while this worker still has ANY ad of
+ *                       the same run in flight (`runIsWorking`, refcounted by
+ *                       runInflight), the held row's updatedAt keeps being
+ *                       refreshed and bootRecoveryService's staleness window
+ *                       cannot open. Once the run's last ad settles here the
+ *                       ticker stops and the clock finally runs. So free
+ *                       collection can be delayed by the remainder of the run —
+ *                       which is survivable and strictly better than the old
+ *                       behaviour, because the delay costs only poll-free
+ *                       waiting while the old path spent a fresh submit every
+ *                       cycle. Narrowing the run ticker's Ad population to ads
+ *                       actually in flight would fix the delay, but it is a
+ *                       liveness mechanism shared with titler.js and belongs in
+ *                       its own change, not smuggled into a money fix.
+ *
+ *   no receipt       -> nothing was paid for, so releasing is safe. Kept so a
+ *                       genuinely receipt-free timeout still behaves as before.
+ *
+ * ⚠️  WHAT BOUNDS WHAT — an earlier version of this comment claimed "both arms
+ * are bounded by UNSETTLED_TIMEOUT_MAX_ATTEMPTS". That was FALSE in precisely
+ * the way the bug it fixes was false, and adversarial review (Grok xhigh,
+ * 2026-08-27) caught it. Stated properly:
+ *
+ *   - RELEASE is bounded by the cap. It makes the row claimable, so a re-entry
+ *     increments the counter, and the cap ends it.
+ *   - HOLD is NOT bounded by the cap, and structurally cannot be: holding keeps
+ *     the claim, claimOne cannot re-take the row, so nothing re-enters, so
+ *     renderAttempts is $inc'd exactly once and `attempts >= cap` is
+ *     unreachable. The cap still earns its place on this arm as a backstop
+ *     against re-entry driven by something else (a future claim-TTL sweeper, any
+ *     new requeue path) — but it is not what ends a hold.
+ *   - A HOLD is bounded by bootRecoveryService settling the prediction. If that
+ *     sweep is switched off, nothing bounds it at all, which is why
+ *     freePollerEnabled is passed to the decision and returns 'terminal'
+ *     instead of parking.
+ *   - RESIDUAL, NAMED not hidden: a prediction Atlas NEVER settles parks
+ *     indefinitely even with the sweep on (its 'processing' arm deliberately
+ *     leaves such rows alone, and its Slack report gates on
+ *     recovered+failed+recoverableNotCollected so `stillRunning` never pages).
+ *     This function therefore fires its OWN per-ad alert on every hold, so the
+ *     park is visible rather than silent. A periodic terminal sweeper for that
+ *     residual case is a follow-up, not something this change pretends to have.
+ *
+ * renderAttempts is $inc'd on EVERY pass through here. That matches the field's
+ * documented meaning — models/Ad.js:592 "counts every attempt that STARTED a
+ * render (submit/generation actually reached)" — which a timed-out submit
+ * plainly did. It is deliberately NOT deriveWaitAttempts: that field exists for
+ * the wait-only derive path which "never submits anything, never bills"
+ * (models/Ad.js:681-690), the exact opposite of this path.
+ */
+async function settleUnsettledVideoTimeout(ad, err) {
+  const shortId = String(ad._id).slice(-6);
+
+  // Prefer the id the throw carries — that is the prediction THIS attempt
+  // actually polled. Fall back to the doc's stamp.
+  const receipt =
+    (typeof err.predictionId === 'string' && err.predictionId && err.predictionId) ||
+    (typeof ad.veoPredictionId === 'string' && ad.veoPredictionId && ad.veoPredictionId) ||
+    null;
+
+  // COUNT IT, and read the post-image back so the cap sees a real number
+  // rather than a stale in-memory one. Unscoped by claim on purpose: the
+  // count must land even if the claim moved underneath us.
+  //
+  // KNOWN CONFLATION, documented rather than hidden: renderAttempts counts
+  // RENDER STARTS, not timeout-branch entries — the completion writes at
+  // :975/:1193/:1460 $inc it too. A first-time master is unaffected (0 -> 1, so
+  // it holds), and every other reader of the field is status:'queued'-scoped, so
+  // this increment is strictly safer for them (nonzero means "work started").
+  // The narrow bad case is an ad re-entering renderer with a nonzero stored
+  // count, which could escalate or terminal on its FIRST timeout. The real fix
+  // is a dedicated timeout counter, but that needs a DECLARED schema path and
+  // verifyModelParity asserts adgen's paths are a SUBSET of the backend's — so
+  // it is a coordinated cross-repo change, not a unilateral one. Raised by
+  // adversarial review 2026-08-27 and deliberately left as a tradeoff.
+  let attempts = 1;
+  try {
+    const after = await Ad.findOneAndUpdate(
+      { _id: ad._id },
+      { $inc: { renderAttempts: 1 } },
+      { new: true, projection: { renderAttempts: 1 } }
+    ).lean();
+    const n = Number(after && after.renderAttempts);
+    if (Number.isFinite(n) && n > 0) attempts = n;
+  } catch (e) {
+    console.warn(`renderer[${WORKER_ID}]: could not $inc renderAttempts for ${shortId} — ${e.message}`);
+  }
+
+  // ESCALATE A REPEAT. notifyRenderFailure already fired a warn keyed on the
+  // message (`video-unsettled:${msg.slice(0,60)}`), which folds a wide
+  // Atlas-side fault across many ads into one Slack message — deliberate, and
+  // left alone. But that key carries the prediction id, so it does NOT fold
+  // repeats of the SAME ad, and nothing distinguished "one slow render" from
+  // "this row has done it three times". This ad-scoped error does.
+  if (attempts > 1) {
+    alerts.notifyAsync({
+      level: 'error',
+      title: 'Video master has hit the poll timeout repeatedly — possible re-claim loop',
+      key:   `video-unsettled-repeat:${ad._id}`,
+      fields: {
+        ad:           String(ad._id),
+        run:          runIdOf(ad) || null,
+        attempts:     String(attempts),
+        cap:          String(UNSETTLED_TIMEOUT_MAX_ATTEMPTS),
+        predictionId: receipt
+      }
+    });
+  }
+
+  // THE DECISION IS PURE AND LIVES IN spendReceipt.js — see
+  // resolveUnsettledTimeoutAction's doc comment. Required locally, matching the
+  // existing lazy require of this same module in the shutdown handler below.
+  const { resolveUnsettledTimeoutAction } = require('./spendReceipt');
+  // WHETHER THE FREE POLLER IS ACTUALLY RUNNING is an INPUT, not an assumption.
+  // Parking a paid row is only safe if something will come back for it; with
+  // RESUME_IN_FLIGHT_ON_BOOT=false nothing does (the reaper skips claimed rows,
+  // the shutdown drain only releases receipt-free ones, and bootRecovery's
+  // still-processing count never pages), so the decision has to know.
+  let freePollerEnabled = true;
+  try {
+    freePollerEnabled = require('./bootRecoveryService').enabled();
+  } catch (e) {
+    // Fail towards NOT parking: if we cannot tell, do not bet a paid asset on a
+    // sweep that may not exist.
+    freePollerEnabled = false;
+    console.warn(`renderer[${WORKER_ID}]: could not read bootRecovery enabled() — ${e.message}`);
+  }
+  const decision = resolveUnsettledTimeoutAction({
+    receipt,
+    attempts,
+    cap: UNSETTLED_TIMEOUT_MAX_ATTEMPTS,
+    freePollerEnabled
+  });
+
+  // ── CAP REACHED — terminal, receipt preserved ─────────────────────────────
+  if (decision.action === 'terminal') {
+    // SAY WHICH terminal this is. 'cap-reached' and 'no-free-poller' are very
+    // different operator stories — one means a row cycled, the other means the
+    // free-recovery sweep is switched off and parking would have stranded a paid
+    // asset silently. A generic message would send someone hunting the wrong one.
+    const message = decision.reason === 'no-free-poller'
+      ? `video master unsettled at Atlas and the free receipt sweep is DISABLED ` +
+        `(RESUME_IN_FLIGHT_ON_BOOT=false) — failing instead of parking, because nothing ` +
+        `would ever collect it; receipt ${receipt || 'absent'} preserved for reconciliation`
+      : `video master still unsettled at Atlas after ${attempts} poll timeout(s) ` +
+        `(cap ${UNSETTLED_TIMEOUT_MAX_ATTEMPTS}) — not re-queued; ` +
+        `receipt ${receipt || 'absent'} preserved for reconciliation`;
+    await Ad.updateOne(
+      // CLAIM-SCOPED, matching the ordinary terminal write below rather than
+      // the looser `{_id, status}`. bootRecoveryService's persist uses that same
+      // loose shape, so two writers with no owner check can race: this write
+      // could stamp 'failed' while a concurrent sweep is mid-peek on a
+      // prediction that then settles 'done', and the sweep's own status-guarded
+      // $set would silently no-op — a paid, delivered output recorded as failed
+      // with chargeState 'unknown'. Dormant today (the cap cannot fire on a
+      // clean first-time master) but free to close, and the nearby write already
+      // demonstrates the safer filter. Found by adversarial review 2026-08-27.
+      { _id: ad._id, claimedByWorker: WORKER_ID, status: 'rendering' },
+      {
+        $set: {
+          status:             'failed',
+          claimedByWorker:    null,
+          claimedAt:          null,
+          // Same clears the ordinary terminal write below makes, for the same
+          // reasons (backlogWatchdog[titling-stuck], live-elapsed-timer UI).
+          titlingResumeState: null,
+          titlingNeeded:      false,
+          renderStage:        'done',
+          renderStageAt:      new Date(),
+          updatedAt:          new Date(),
+          renderError: {
+            message,
+            stage:        'render',
+            at:           new Date(),
+            // THE RECOVERY HANDLE. Atlas retains predictions ~30 days, so this
+            // is what lets imageRecoveryService.settleChargeState (and a human)
+            // answer "did this cost us money?" after the fact.
+            predictionId: receipt,
+            // 'unknown', NEVER 'not-charged'. We timed out without a verdict;
+            // absence of evidence is not evidence of non-charge, and
+            // understating the ledger is the one direction that never gets
+            // corrected because nothing knows to go looking (models/Ad.js).
+            chargeState:  'unknown',
+            code:         err.code || null
+          }
+        }
+      }
+    );
+    await bumpRunCounter(ad.campaignRunIds, 'failed');
+    noteFeedEvent(ad, `failed — ${message.slice(0, 80)}`);
+    console.error(`renderer[${WORKER_ID}]: ${shortId} ${message}`);
+    return;
+  }
+
+  // ── RECEIPT PRESENT — hand to the free poller, do NOT release ────────────
+  if (decision.action === 'hold') {
+    // PERSIST THE RECEIPT IF THE CHARGE POINT DID NOT. atlasVideoService's
+    // veoPredictionId $set is deliberately best-effort — wrapped in a non-fatal
+    // try/catch, because "a telemetry or bookkeeping failure must never fail a
+    // generation post-payment". So a genuinely BILLED prediction can exist only
+    // on the thrown Error. spendReceipt.HAS_RECEIPT matches the MONGO field, so
+    // parking such a row would make it invisible to the very sweep we are handing
+    // it to: claim held, money spent, nothing ever coming back. Found by
+    // adversarial review 2026-08-27.
+    //
+    // Guarded THREE ways: owner-scoped (we still hold the claim), only when the
+    // stored field is genuinely empty (never overwrite a newer receipt), and
+    // non-fatal (a failure here must not turn a parked row into an exception).
+    if (receipt && !ad.veoPredictionId) {
+      try {
+        await Ad.updateOne(
+          { _id: ad._id, claimedByWorker: WORKER_ID, veoPredictionId: { $in: [null, ''] } },
+          { $set: { veoPredictionId: receipt } }
+        );
+      } catch (e) {
+        console.warn(
+          `renderer[${WORKER_ID}]: could not backfill veoPredictionId=${receipt} on ${shortId} ` +
+          `— ${e.message}; the free sweep may not see this paid row`
+        );
+      }
+    }
+
+    // bumpRunCounter('skipped') is kept from the original branch and is still
+    // safe: maybeFinalizeRun re-derives isSettled from a LIVE Ad.find, and
+    // classifyRunAdOutcome buckets status:'rendering' as stillRendering, so
+    // the run cannot finalize while this row sits here regardless of what the
+    // counter says. It also refreshes the CampaignRun heartbeat.
+    await bumpRunCounter(ad.campaignRunIds, 'skipped');
+    noteFeedEvent(ad, 'unsettled at poll timeout — awaiting free receipt recovery');
+
+    // MAKE THE PARK VISIBLE. A held row is silent otherwise: bootRecovery's
+    // Slack report gates on `recovered + failed + recoverableNotCollected`, so
+    // its `stillRunning` count never pages; there is no periodic
+    // ALERT_RENDERING_STALE_MIN scanner in this repo (only boot-time
+    // alertOrphanedClaimsOnBoot); and the attempt-cap escalation below cannot
+    // fire on this arm, because holding prevents the re-entry that would
+    // increment the counter. So without this, a paid master parked indefinitely
+    // — including one Atlas never settles — looks exactly like nothing
+    // happening. Ad-scoped key: repeats for the same ad fold, different ads do
+    // not, which is the opposite of the message-keyed warn's behaviour and the
+    // right choice for a per-row park.
+    alerts.notifyAsync({
+      level:  'warn',
+      title:  'Video master parked on its spend receipt — awaiting free recovery',
+      key:    `video-unsettled-parked:${ad._id}`,
+      fields: {
+        ad:           String(ad._id),
+        run:          runIdOf(ad) || null,
+        predictionId: receipt,
+        attempts:     String(attempts),
+        note:         'claim intentionally held so nothing can resubmit; bootRecovery polls this for $0'
+      }
+    });
+
+    console.warn(
+      `renderer[${WORKER_ID}]: ${shortId} unsettled at poll timeout (attempt ${attempts}) — ` +
+      `KEEPING claim on receipt ${receipt}; bootRecovery will poll it for free. Not re-queued.`
+    );
+    return;
+  }
+
+  // ── NO RECEIPT — nothing paid for, releasing is safe ─────────────────────
+  await releaseClaim(ad._id, `video master unsettled at poll timeout, no receipt (attempt ${attempts}/${UNSETTLED_TIMEOUT_MAX_ATTEMPTS})`);
+  await bumpRunCounter(ad.campaignRunIds, 'skipped');
+}
+
 // End-to-end render for one claimed ad. Wrapped so poll() can dispatch
 // via .finally() without holding the poll loop.
 async function processAd(ad) {
@@ -1788,31 +2147,100 @@ async function processAd(ad) {
 
       // UNSETTLED AT TIMEOUT — NOT a confirmed failure. pollPrediction hit
       // its own MAX_POLL_MS wall-clock budget while the Atlas job was still
-      // genuinely processing (real Omni predictions have been measured
-      // taking 14-25+ min). Writing status:'failed' here would strand the
-      // whole point of the resume-from-receipt fix: shouldResumeAttempt
+      // genuinely processing. That ceiling was 600s and is now 900s, sized from
+      // the measured distribution (n=68: mean 229.7s, sd 124.5s, max 760.3s —
+      // see atlasVideoService.js's MAX_POLL_MS comment). 600s sat at mean+2.97sd
+      // with the observed maximum already past it, so this branch fired on
+      // renders that were going to succeed. It can still fire: 900s is p99.84,
+      // not p100, which is exactly why the receipt handling below matters.
+      // Writing status:'failed' here would strand the whole
+      // point of the resume-from-receipt fix: shouldResumeAttempt
       // (atlasVideoService.js) only fires on a FRESH attempt against a row
       // that gets re-entered — a row stamped 'failed' is never re-entered
       // by anything.
       //
-      // adgen's recovery here is claim-shaped, not status-flip-shaped like
-      // backend's bootRecoveryService (same pattern requeueDeriveForRetry
-      // above already uses for the derive-wait case): release the claim
-      // and leave status:'rendering' untouched, so claimOne()'s own filter
-      // (status:'rendering', claimedByWorker:null) re-claims this ad on a
-      // future poll. That next processAd call re-enters generateForAd
-      // fresh (attempt 1), sees ad.veoPredictionId still set, and
-      // shouldResumeAttempt resumes the SAME prediction — re-polling,
-      // never resubmitting, so this can only ever cost more poll time,
-      // never a second charge. Mirrors backend's routes/ads.js
-      // unsettledAtTimeout handling (2026-08-19, run_1787119100250_eef4d871),
-      // adapted to this claim-based model.
+      // ⚠️  THE COMMENT THAT USED TO BE HERE WAS FALSE, AND THAT IS WHY THIS
+      //     INCIDENT STAYED INVISIBLE. It asserted that releasing the claim
+      //     and leaving status:'rendering' meant the next processAd "resumes
+      //     the SAME prediction — re-polling, never resubmitting, so this can
+      //     only ever cost more poll time, never a second charge."
       //
-      // bumpRunCounter('skipped') is safe here even though the Ad's true
-      // fate is still pending: maybeFinalizeRun re-derives isSettled from a
-      // LIVE Ad.find, and classifyRunAdOutcome buckets status:'rendering'
-      // as stillRendering — so the run cannot finalize while this row sits
-      // here, regardless of what the 'skipped' counter says.
+      //     Measured 2026-08-26 (run 2h21m, master 6a8fb12ad0621a3e8f4a7d49):
+      //     TEN DISTINCT Atlas prediction ids, a fresh billable submit roughly
+      //     every 12-14 minutes, none completing, 17 derives pinned behind it.
+      //
+      //     BE PRECISE ABOUT WHICH HALF WAS FALSE — the next reader will trust
+      //     whichever version is left here.
+      //
+      //     TRUE, of the RETRY LADDER inside one generateForAd call. That ladder
+      //     genuinely cannot resubmit after a deadline. mayRetryAfterFailure
+      //     (atlasVideoService.js) requires
+      //     `policyRetryable === true && chargeConfirmed === false`, and neither
+      //     deadline shape can satisfy it: the terminal-failure-at-deadline
+      //     branch sets `policyRetryable = false` / `policyMaxAttempts = 1`
+      //     outright ("deadline already reached; never resubmit from this path",
+      //     :3928-3929), and OUR shape — still 'processing' — simply never sets
+      //     policyRetryable at all, leaving it undefined, with
+      //     chargeConfirmed null. Both are refused, by explicit false in one
+      //     case and by omission in the other. shouldResumeAttempt is likewise
+      //     correct: allowResume && attempt===1 && a non-empty receipt, with
+      //     renderer.js passing allowResume:true explicitly and veoPredictionId
+      //     declared (models/Ad.js:416) so the charge-point $set really lands.
+      //     A re-entry that SEES the receipt does resume for free.
+      //
+      //     FALSE, of the CLAIM BOUNDARY one level up — where the loop actually
+      //     lived. Terminating the ladder is not the same as terminating the
+      //     work. Releasing the claim while leaving status:'rendering' starts a
+      //     BRAND NEW attempt, with a fresh attempt counter and its own fresh
+      //     retry policy, and that attempt submits. So the ladder behaved exactly
+      //     as designed and documented while the row cycled anyway. Nothing at
+      //     the claim boundary bounded ANYTHING: no lifetime cap, no deadline,
+      //     and renderAttempts never moved (it is $inc'd only by the COMPLETION
+      //     writes at :975/:1193/:1460, never on this path), so the row stayed
+      //     re-eligible for claimOne forever while every attempt-shaped guard in
+      //     the service read 0 attempts.
+      //
+      //     THE FIX THEREFORE BELONGS AT THE CLAIM BOUNDARY, not in the ladder —
+      //     bounding retries inside code that is already correct would have
+      //     changed nothing. Same shape the regenerate path already uses for its
+      //     own reclaim loop (ADGEN_REGEN_MAX_RECLAIMS, a doc-persisted count
+      //     checked before any submit).
+      //
+      //     And the free recovery this branch delegated to was structurally
+      //     unreachable: bootRecoveryService selects
+      //     {status:'rendering', updatedAt < now-RESUME_STALE_MIN, HAS_RECEIPT}
+      //     (bootRecoveryService.js:162). The ad heartbeat (:1277) refreshes
+      //     updatedAt every 60-90s precisely so a LIVE render never looks
+      //     stale — so an ad that is re-claimed within seconds of each release
+      //     never once sat still for the 5 minutes that free poller needs. The
+      //     mechanism that was supposed to collect this asset for $0 could
+      //     never see it.
+      //
+      // WHAT THIS DOES NOW. Hand the row to the free receipt poller instead of
+      // back to claimOne, and bound the branch. See
+      // settleUnsettledVideoTimeout below for the full reasoning.
+      if (err && err.unsettledAtTimeout) {
+        await settleUnsettledVideoTimeout(ad, err);
+        return;
+      }
+
+      // ── STATIC RESUME (#74) — A SEPARATE BRANCH, DELIBERATELY *NOT* ROUTED
+      //    THROUGH settleUnsettledVideoTimeout ABOVE ───────────────────────
+      //
+      // These two conditions shared ONE branch until this PR split them, and
+      // they must STAY split. They are structurally disjoint — one per route:
+      // err.unsettledAtTimeout is set ONLY by atlasVideoService (:3945, the
+      // video poll deadline); err.unsettledAtResume ONLY by atlasImageService
+      // (:726, an ambiguous static resume poll). No error can carry both, so
+      // the order of these two ifs is not load-bearing — but the separation is.
+      //
+      // settleUnsettledVideoTimeout is video-specific by construction AND by
+      // name: it backfills veoPredictionId, writes a video-shaped renderError
+      // (predictionId + chargeState) and reports against the VIDEO poll
+      // ceiling. Sending a static resume through it would be wrong in a
+      // different way than the bug this PR fixes. So the static path keeps
+      // #74's release-and-leave-rendering treatment verbatim, and #74's
+      // reasoning for it is preserved below rather than summarised away.
       //
       // err.unsettledAtResume is the STATIC counterpart, added alongside
       // atlasImageService.shouldResumeImageAttempt / submitAndPollWithResume
@@ -1831,12 +2259,17 @@ async function processAd(ad) {
       // credentials, a moderation block) — atlasImageService itself never
       // sets unsettledAtResume for those, so they fall through to the
       // ordinary terminal-failure write below, same as today.
-      if (err && (err.unsettledAtTimeout || err.unsettledAtResume)) {
+      //
+      // bumpRunCounter('skipped') is safe here even though the Ad's true
+      // fate is still pending: maybeFinalizeRun re-derives isSettled from a
+      // LIVE Ad.find, and classifyRunAdOutcome buckets status:'rendering'
+      // as stillRendering — so the run cannot finalize while this row sits
+      // here, regardless of what the 'skipped' counter says.
+      //
+      if (err && err.unsettledAtResume) {
         await releaseClaim(
           ad._id,
-          err.unsettledAtResume
-            ? 'static resume — poll outcome ambiguous, left rendering for a future resume/recovery'
-            : 'video master unsettled at poll timeout — left rendering for resume'
+          'static resume — poll outcome ambiguous, left rendering for a future resume/recovery'
         );
         await bumpRunCounter(ad.campaignRunIds, 'skipped');
         return;
