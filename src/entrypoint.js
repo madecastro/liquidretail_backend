@@ -28,7 +28,12 @@ async function main() {
     const orchestrator = require('./services/orchestrator');
     await orchestrator.run();
     installShutdown(async () => {
-      orchestrator.shutdown();
+      // AWAIT: orchestrator.shutdown is async now — stops the poll then
+      // releases the distributed lease before we let installShutdown call
+      // process.exit(0). Fire-and-forget here would race the release write
+      // and leave the lease held until ttlMs expiry, delaying a replacement
+      // instance from taking over.
+      await orchestrator.shutdown();
       await disconnect();
     });
     return;
