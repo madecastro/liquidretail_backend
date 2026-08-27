@@ -1771,10 +1771,36 @@ endpoints — never re-implemented per route.** `deliveredExpr()` is the aggrega
 non-archived population) **AND**, for video, `isVideoTitlingSettled`. Parity with the JS function
 is proven by execution against a real mongod, not by reading.
 
-- **The defect:** coverage divided `adCount` (a bare `$sum: 1`) by `TARGET_ADS_PER_PRODUCT`, so a
-  product whose 12 ads had ALL FAILED with zero assets reported `coveragePct: 100` while the same
-  response said `draftCount: 0, liveCount: 0, readyToExport: 0`. `Ad.status` has six values and
-  only `archived` was ever excluded, so `failed`, `queued` and `rendering` all counted as coverage.
+- **The defect.** `Ad.status` has six values and only `archived` was ever excluded, so `failed`,
+  `queued` and `rendering` all counted as coverage. **The two endpoints used DIFFERENT formulas** —
+  do not state one as shared — but both were fed by the same status-blind `$sum: 1`, so the
+  conclusion holds for both while the arithmetic does not transfer:
+  - `routes/catalog.js` — an ad-count ratio, `min(100, round(adCount / TARGET_ADS_PER_PRODUCT * 100))`.
+  - `routes/campaigns.js` — a product ratio, `productsWithAds / matchedProductIds.length`.
+- **Measured on live production data.** Marine Layer product `6a8d47cfd9e1e0e1dccee389`: 12
+  non-archived ad rows, **all `failed`, zero assets**. Catalog's formula gives
+  `min(100, round(12/5 × 100)) = 100`, reported beside `draftCount: 0, liveCount: 0,
+  readyToExport: 0`. Independently re-checked under the strict `isAdHonestlyDelivered` predicate —
+  0 of 12 holds there too, and no paid-but-unchromed master is hiding (the master carries
+  `veoVideoUrl: null`, `renderUrl: null`, `titlingNeeded: false`, `titlingResumeState: null`), so
+  the fix cannot be accused of turning a nearly-delivered ad into a reported failure.
+- **⚠️ THE SORT CONSEQUENCE — this is the functional half, not a cosmetic one.** `routes/catalog.js`
+  sorts `lastActivityAt` DESC then `coveragePct` **ASC**, and the comment above it says that
+  ascending tiebreak exists *"so products needing attention surface above well-covered ones"*.
+  Scoring an all-failed product at 100 **inverted exactly that signal**: executed over the real
+  comparator with equal recency, trunk ordered `untouched 0% → half-covered 40% → ALL-FAILED 100%`,
+  putting the worst-off product **last** in the list built to surface products needing attention.
+  After the fix it scores 0 and sorts **first**. Pinned by C6/C6e, and M21 (reversing the tiebreak)
+  must stay red.
+  *Scope, stated precisely because the first framing of this overreached:* the burial is **within a
+  recency group**, not absolute — `models/Ad.js:735` gives `generatedAt` a `default: Date.now` and
+  `AD_RECENCY_EXPR` is `$ifNull[renderedAt, generatedAt]`, so a freshly-failed product still has a
+  recent `lastActivityAt` and sorts near the top on the primary key. The durable harm is that as
+  the failure ages it drifts down while still claiming 100% covered, so it never resurfaces.
+- **`failedCount` already existed on trunk** (`routes/catalog.js`, computed in the same `$group`
+  since `ed3e6d83`) and was simply never projected into the response — the honest number was
+  computed server-side and discarded one line later. Projecting it is the minimum viable fix; the
+  sort predicate is where the real design decision lives.
 - **Both conjuncts are required.** A status-only cut leaves an untitled video draft (paid master
   landed, chrome never composited) counting as coverage while `titled: isAdHonestlyDelivered(a)`
   — projected on ads-**detail** in the same two files — says it is not delivered. Two definitions

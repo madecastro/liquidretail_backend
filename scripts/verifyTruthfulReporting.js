@@ -422,6 +422,59 @@ section('C. coverage counts deliverable assets, not attempts');
   check('C1e negative/NaN delivered yields 0',
     coveragePctFromDelivered(-1, 5) === 0 && coveragePctFromDelivered(NaN, 5) === 0);
 
+  // C6 — THE SORT CONSEQUENCE. This is the functional half of the coverage
+  // defect, and it is why the fix is not cosmetic.
+  //
+  // routes/catalog.js sorts `lastActivityAt` DESC, then `coveragePct` ASC, and
+  // the comment above it says the ascending coverage tiebreak exists "so
+  // products needing attention surface above well-covered ones". On trunk an
+  // all-failed product scored 100, so among products of equal recency it sorted
+  // BELOW a genuinely half-covered one — the list built to surface products
+  // needing attention put the worst-off product last.
+  //
+  // MEASURED, not argued: with 12 failed ads, trunk's adCount/5 gives
+  // min(100, round(12/5*100)) = 100; the fix gives 0. Verified on Marine Layer
+  // product 6a8d47cfd9e1e0e1dccee389 (12 non-archived rows, all failed, zero
+  // assets, beside draftCount:0 / liveCount:0 / readyToExport:0).
+  //
+  // NOTE ON SCOPE, because the first framing of this overreached: the burial is
+  // WITHIN A RECENCY GROUP, not absolute. `models/Ad.js:735` gives generatedAt a
+  // `default: Date.now`, and AD_RECENCY_EXPR is $ifNull[renderedAt, generatedAt],
+  // so a freshly-failed product has a RECENT lastActivityAt and still sorts near
+  // the top on the primary key. What was inverted is the tiebreak — and the
+  // durable harm is that as the failure ages it drifts down while still
+  // claiming 100% covered, so it never resurfaces as needing attention.
+  //
+  // The invariant that makes the sort work is a VALUE invariant, asserted here.
+  // The comparator's own source is already pinned by scripts/verifyAdsRecency.js
+  // (checks 3.1/3.2), so between the two the behaviour is covered end to end.
+  {
+    const TARGET = 5;
+    const allFailed = { adCount: 12, deliveredCount: 0 };  // Marine Layer
+    const halfCov   = { adCount: 2,  deliveredCount: 2 };
+    const fullCov   = { adCount: 5,  deliveredCount: 5 };
+
+    const pct = r => coveragePctFromDelivered(r.deliveredCount, TARGET);
+
+    check('C6 an ALL-FAILED product now scores strictly BELOW a partly-covered one',
+      pct(allFailed) < pct(halfCov),
+      `allFailed=${pct(allFailed)} halfCov=${pct(halfCov)} — ascending coveragePct is the ` +
+      `tiebreak, so this ordering is what surfaces the failure instead of burying it`);
+    check('C6b and strictly below a fully-covered one',
+      pct(allFailed) < pct(fullCov));
+    check('C6c the trunk formula is what inverted it (adCount/5 ⇒ 100 on 12 failures)',
+      Math.min(100, Math.round((allFailed.adCount / TARGET) * 100)) === 100,
+      'if this stops being 100 the historical framing in the PR needs revisiting');
+    check('C6d 12 failed ads score 0, not 100',
+      pct(allFailed) === 0);
+    // Guard the tiebreak DIRECTION in the route, so a later "sort by coverage
+    // descending" change cannot silently re-bury failures.
+    const catSrc2 = fs.readFileSync(path.join(ROOT, 'routes/catalog.js'), 'utf8');
+    check('C6e the coveragePct tiebreak is still ASCENDING (a.coveragePct - b.coveragePct)',
+      /a\.coveragePct\s*-\s*b\.coveragePct/.test(catSrc2),
+      'reversed to b - a, an all-failed product at 0 would sort last again');
+  }
+
   // C2 — the status vocabulary must match the REAL enum in models/Ad.js. If
   // someone adds a status, this fails and forces a decision rather than
   // silently defaulting it into (or out of) coverage.
