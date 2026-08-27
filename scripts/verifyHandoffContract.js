@@ -12,10 +12,17 @@
 // deployed services is an implicit Mongo document shape that — until
 // services/handoffContract.js — neither side declared anywhere.
 //
-// This harness has a twin at
-// liquidretail_adgen/scripts/verifyHandoffContract.js. Both repos run it,
-// and each one checks ITS OWN models/Ad.js. That symmetry is the point:
-// a contract only one side enforces is a contract one side can break.
+// A COUNTERPART lives at liquidretail_adgen/scripts/verifyHandoffContract.js.
+// Both repos run their own copy, and each checks ITS OWN models/Ad.js. That
+// symmetry is the point: a contract only one side enforces is a contract one
+// side can break.
+//
+// The two are NOT byte-identical and must not be described as such: they
+// differ in the module/model paths, in how mongoose is obtained (this repo has
+// it installed; a bare adgen worktree needs a Module._load fallback), in which
+// sibling they resolve and in which direction, and in their fixture tables.
+// Only services/handoffContract.js itself is held byte-identical — check E is
+// what asserts that.
 //
 // The specific thing it protects against on THIS side: several contract
 // fields exist in backend's schema for no reason other than to stop
@@ -62,7 +69,8 @@ const fs = require('fs');
 const path = require('path');
 
 const ROOT = path.join(__dirname, '..');
-// ── THE ONLY LINES THAT DIFFER FROM THE ADGEN TWIN ────────────────────
+// ── REPO-SPECIFIC WIRING (see the header: the counterpart differs in more
+//    than these, so this is not an exhaustive diff) ────────────────────
 const CONTRACT_MODULE_REL = 'services/handoffContract.js';
 const AD_MODEL_REL = 'models/Ad.js';
 const THIS_REPO = 'backend';
@@ -116,6 +124,29 @@ function resolveAdgenRoot() {
     } catch (e) { /* next */ }
   }
   return null;
+}
+
+// Read a path from the sibling's remote-tracking trunk. Mirrors what adgen's
+// scripts/lib/vendorDrift.js readBackendBlob() does about this repo, kept as a
+// tiny local helper because this repo has no equivalent lib and one spawnSync
+// is not worth a new shared module.
+function readSiblingBlob(repoRoot, relPath) {
+  const { spawnSync } = require('child_process');
+  const env = Object.assign({}, process.env);
+  // Inherited GIT_DIR/GIT_WORK_TREE (hooks, rebase --exec) point at THIS repo
+  // and would make `git -C <sibling> show` read the wrong tree entirely.
+  delete env.GIT_DIR; delete env.GIT_WORK_TREE;
+  delete env.GIT_COMMON_DIR; delete env.GIT_INDEX_FILE;
+  const run = (args) => spawnSync('git', ['-C', repoRoot, ...args], { encoding: 'utf8', env, maxBuffer: 32 * 1024 * 1024 });
+  let ref = process.env.BACKEND_ADGEN_REF || null;
+  if (!ref) {
+    for (const cand of ['origin/master', 'origin/main', 'HEAD']) {
+      if (run(['rev-parse', '--verify', cand]).status === 0) { ref = cand; break; }
+    }
+  }
+  if (!ref) return null;
+  const out = run(['show', `${ref}:${relPath}`]);
+  return out.status === 0 ? out.stdout : null;
 }
 
 // ── A. digest ──────────────────────────────────────────────────────────
@@ -181,11 +212,23 @@ check(`${CONTRACT_DOC_REL} exists and names v${HANDOFF_CONTRACT_VERSION}`, () =>
     throw new Error(`missing ${CONTRACT_DOC_REL} — the contract module's prose companion. A version constant with no document is a number nobody can act on.`);
   }
   const doc = fs.readFileSync(docPath, 'utf8');
-  if (!doc.includes(HANDOFF_CONTRACT_VERSION)) {
+  // Matched against the doc's DECLARED version line, not a bare
+  // `doc.includes(version)`. A substring search anywhere in the file passes on
+  // an unrelated mention — a changelog entry, or a code sample — while the
+  // document's own header still declares an older version. That is a check
+  // that looks like it works and does not.
+  const declared = /^\*\*Contract version:\s*([0-9]+\.[0-9]+\.[0-9]+)/m.exec(doc);
+  if (!declared) {
     throw new Error(
-      `${CONTRACT_DOC_REL} does not mention version ${HANDOFF_CONTRACT_VERSION}. ` +
-      `The constant was bumped and the document was not updated — which is the exact rot this ` +
-      `whole mechanism exists to prevent.`
+      `${CONTRACT_DOC_REL} has no parseable version line. Expected a line of the form ` +
+      `"**Contract version: X.Y.Z**" so this check reads the document's own declaration.`
+    );
+  }
+  if (declared[1] !== HANDOFF_CONTRACT_VERSION) {
+    throw new Error(
+      `${CONTRACT_DOC_REL} declares version ${declared[1]} but HANDOFF_CONTRACT_VERSION is ` +
+      `${HANDOFF_CONTRACT_VERSION}. The constant was bumped and the document was not updated — ` +
+      `the exact rot this whole mechanism exists to prevent.`
     );
   }
 });
@@ -222,13 +265,20 @@ check('contract module is identical in both repos', () => {
     );
     return;
   }
-  const theirs = path.join(adgenRoot, SIBLING_CONTRACT_REL);
-  if (!fs.existsSync(theirs)) {
-    infos.push(`${SIBLING_CONTRACT_REL} not present in the adgen sibling — comparison SKIPPED`);
+  // Read adgen's copy from its REMOTE-TRACKING TRUNK, not its working tree.
+  // A sibling checkout is shared, long-lived, and routinely dirty or behind;
+  // reading it would let a stale tree answer "do the two copies agree?" and be
+  // confidently wrong. adgen's own harnesses make the same choice about THIS
+  // repo, so the two must not disagree about the same file.
+  const other = readSiblingBlob(adgenRoot, SIBLING_CONTRACT_REL);
+  if (other == null) {
+    infos.push(
+      `${SIBLING_CONTRACT_REL} not readable in the adgen sibling at its trunk — the adgen half ` +
+      `has not landed there yet. Comparison SKIPPED.`
+    );
     return;
   }
   const mine = fs.readFileSync(path.join(ROOT, CONTRACT_MODULE_REL), 'utf8');
-  const other = fs.readFileSync(theirs, 'utf8');
   if (mine !== other) {
     throw new Error(
       `${CONTRACT_MODULE_REL} differs from adgen's ${SIBLING_CONTRACT_REL}. This module is the ` +

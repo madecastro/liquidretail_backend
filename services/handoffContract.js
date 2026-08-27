@@ -89,7 +89,7 @@ const HANDOFF_CONTRACT_VERSION = '1.0.0';
 
 // sha256 over the normalized CONTRACT_FIELDS (see computeContractDigest).
 // Regenerate with: node scripts/verifyHandoffContract.js --print-digest
-const CONTRACT_DIGEST = '51ad4bc6dc5b140e27e614f2485f68a3731ecbff783fc0c3a580277024a38c47';
+const CONTRACT_DIGEST = 'fd96dd84637cda68530ea036959619215d03472a5cb027d539159c79a35d7780';
 
 // `writer` is the ENFORCED half of the contract — which service is allowed
 // to write the field. Verified against every write site in both repos as of
@@ -98,7 +98,12 @@ const CONTRACT_DIGEST = '51ad4bc6dc5b140e27e614f2485f68a3731ecbff783fc0c3a580277
 //
 //   'backend'  — only liquidretail_backend writes it.
 //   'adgen'    — only liquidretail_adgen writes it.
-//   'both'     — both write it, on disjoint transitions (documented per field).
+//   'both'     — both services write it. This does NOT always mean "on disjoint
+//                transitions": for regenerationRequest and the regenerate claim
+//                pair, backend writes only nulls while adgen writes the live
+//                values, and for veoVideoUrl backend's recovery path can write
+//                the same field adgen's render path does. Read the per-field
+//                note — that is where the actual division lives.
 //
 // `type` is the Mongoose instance name assertContractShape() checks against
 // the live schema: 'String' | 'Number' | 'Boolean' | 'Date' | 'Mixed'.
@@ -111,8 +116,11 @@ const CONTRACT_FIELDS = [
     role: 'lifecycle',
     note:
       'The handoff trigger. Backend mints queued and moves to rendering; that write plus ' +
-      'claimedByWorker:null IS the "adgen may take this" signal. Adgen only ever writes ' +
-      'draft, failed, or rendering (pinned by scripts/verifyRendererAdStatusEnum.js). ' +
+      'claimedByWorker:null IS the "adgen may take this" signal. Adgen\'s RENDERER writes only ' +
+      'draft, failed, or rendering — pinned by scripts/verifyRendererAdStatusEnum.js, whose ' +
+      'scope is renderer.js specifically, not the whole repo (adgen\'s titler and boot recovery ' +
+      'also write draft/failed; its vendored queuedArchiveSweeper would write archived but is ' +
+      'not wired). Backend also writes archived from its OWN live queuedArchiveSweeper. '  +
       'Backend additionally writes rendering->queued in its reaper, but ONLY on rows with ' +
       'claimedByWorker:null, which is what keeps the two services off each other.',
   },
@@ -192,10 +200,13 @@ const CONTRACT_FIELDS = [
   {
     field: 'veoVideoUrl',
     type: 'String',
-    writer: 'adgen',
+    writer: 'both',
     role: 'render output',
     note:
-      'The raw model video, before brand-script chrome. Load-bearing for the contract because ' +
+      'The raw model video, before brand-script chrome. Writer is BOTH, not adgen-only: ' +
+      "backend's boot recovery writes it when it collects an already-paid prediction " +
+      '(bootRecoveryService.js:266), and backend writes it on the flag-off in-process render. ' +
+      'Load-bearing for the contract because ' +
       'a video DERIVE inherits it from its sibling master during render, and because its ' +
       'presence on a stale claim is what distinguishes a stranded PAID master from an ' +
       'unstarted row.',
@@ -217,8 +228,11 @@ const CONTRACT_FIELDS = [
     role: 'regenerate',
     note:
       'THE deferral bit. Backend stamps the full pass-through call here ONLY when it decided ' +
-      'to defer (isAdgenRendererEnabled() true, read once synchronously at request time); the ' +
-      'local path never writes it. Adgen claims on {$type:"object"} and NOT {$ne:null} — ' +
+      'to defer (isAdgenRendererEnabled() true, read once synchronously at request time). The ' +
+      'local path DOES write this field — it sets an explicit null in the same lock write, to ' +
+      'clear any stale payload left by a crashed deferred attempt. So the invariant is NOT ' +
+      '"the local path never writes it" (that is false and was corrected here); it is that the ' +
+      'local path never writes an OBJECT. Adgen claims on {$type:"object"} and NOT {$ne:null} — ' +
       'Mongo $ne:null also matches documents where the field is ABSENT, which is every ' +
       'pre-migration row and every locally-executed regenerate, and that collapse was a real ' +
       'double-claim bug. Cleared by markComplete alongside regenerating.',
@@ -226,20 +240,26 @@ const CONTRACT_FIELDS = [
   {
     field: 'regenerateClaimedByWorker',
     type: 'String',
-    writer: 'adgen',
+    writer: 'both',
     role: 'regenerate',
     note:
-      'The regenerate lease. Disjoint from the mint-time claim (status:rendering + ' +
-      'claimedByWorker), so the two claims can never race for one document. There is ' +
+      'The regenerate lease. Held on a DIFFERENT field from the mint-time claim, which means ' +
+      'the two are NOT mutually exclusive — see the contract doc section 6.5: a row can match ' +
+      'the renderer claim and the regenerate claim at the same time, because backend regenerate ' +
+      'preflight does not refuse status:rendering. Backend also nulls this pair on its ' +
+      'local-execution path. There is ' +
       'deliberately NO release sweep: a crash mid-regenerate leaves this set until an ' +
       'operator clears it, because an automatic retry would be a second billable submit.',
   },
   {
     field: 'regenerateClaimedAt',
     type: 'Date',
-    writer: 'adgen',
+    writer: 'both',
     role: 'regenerate',
-    note: 'Stamped in the same $set as regenerateClaimedByWorker.',
+    note:
+      'Stamped in the same $set as regenerateClaimedByWorker. Writer is BOTH for the same ' +
+      'reason: only adgen ever sets a worker id, but backend nulls the pair on its ' +
+      'local-execution lock write (adRegenerateService.js:658-660).',
   },
   {
     field: 'updatedAt',
