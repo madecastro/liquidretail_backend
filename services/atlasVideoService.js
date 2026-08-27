@@ -4547,9 +4547,17 @@ async function buildPromptScaffold({
       isApproximation: true,
       reason: 'Built before an ad exists, so the seed media, reference stack and lifestyle plan are unknown. Same canonical builder as production; different inputs.',
       assumedInputs: [
-        { field: 'seedHasText',         assumed: false, note: 'No resolved seed yet — the burned-in-text guard block (+283 bytes) can never appear here, and at a 4096-byte cap its absence is also why a `Product:` line may survive here but be dropped from the real submission.' },
-        { field: 'hasProductReference', assumed: true,  note: 'Real value is computed from the resolved reference stack and the lifestyle plan (221-byte swing).' },
-        { field: 'media',               assumed: null,  note: 'No seed document, so nothing derived from the seed is present.' }
+        { field: 'seedHasText',         assumed: false, note: 'No resolved seed yet — the burned-in-text guard block (+283 bytes) can never appear here. This is the LARGEST measured contributor to the preview/submission byte gap. (On a 4096-capped model its absence would also let a `Product:` line survive here that the real submission drops, since /^Product: / heads DROP_PRIORITY — but the default model is gemini-omni at a 20000 cap, where nothing is dropped, so that is not the usual mechanism.)' },
+        { field: 'hasProductReference', assumed: true,  note: 'Real value is computed from the resolved reference stack and the lifestyle plan (forceSeedOnly). Measured 221-byte swing.' },
+        { field: 'media',               assumed: null,  note: 'No seed document, so nothing derived from the seed is present.' },
+        // Declared for completeness after a cap-divergence hypothesis was
+        // checked and refuted: this function DOES pass the caps resolved by the
+        // same resolveModelAndAspect the real submit uses, so the preview is not
+        // built at a different byte cap. What it does hardcode is hasVideoSeed,
+        // which can change the resolved MODEL but provably NOT the cap — the
+        // only requiresVideoSeed model (gemini-omni reference-to-video, 20000)
+        // degrades to BUILT_IN_DEFAULT_MODEL, also 20000.
+        { field: 'hasVideoSeed',        assumed: false, note: 'The real path passes media.fileType === \'video\'. A video-seeded ad can therefore resolve a different model here than at submit time; it cannot change the prompt byte cap, since both sides of that degrade are 20000.' }
       ],
       omittedInputs: ['layoutInput', 'sourceMedia', 'storyboard', 'seedStyle', 'variantKind'],
       exactPromptAvailableAt: 'GET /api/ads/:id/generation-inspector → video.submission.prompt'

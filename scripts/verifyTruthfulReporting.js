@@ -383,7 +383,8 @@ section('B. veo-prompt-scaffold declares itself an approximation');
   // than truncating it, so the over-cap body is what gets submitted.
   //
   // ⚠️ SCOPE CORRECTION (peer evidence, 2026-08-27). This is a LATENT defect for
-  // the four 4096-capped shapes (grok-i2v ×2, veo3.1, generic) — it is NOT the
+  // the THREE registered 4096-capped models (grok-imagine-video-v1.5/i2v,
+  // grok-imagine-video/reference-to-video, veo3.1/i2v) — it is NOT the
   // explanation for the Marine Layer ad that prompted the investigation. That
   // master ran `paramShape: 'gemini-omni'`, and its own persisted
   // renderStages.videoSubmission records `promptBytes: 4170, promptByteCap:

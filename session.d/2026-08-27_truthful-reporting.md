@@ -103,11 +103,22 @@ truncating it**, so the over-cap body is what gets submitted. Pinned by B4d.
 > What stands, and is arguably worse than I first framed it: `enforceByteCap` uses
 > `caps?.promptByteCap || DEFAULT_BYTE_CAP`, so **any** call site reaching it with `caps` absent or
 > a falsy `promptByteCap` silently gets 4,096. The same frozen prompt text that sits at 21% of
-> budget on gemini-omni is **over cap** on the four 4096-capped shapes (grok-i2v ×2, veo3.1,
-> generic) — a latent defect, and exactly the "frozen invariant text that fits one cap but not
-> another" trap. Two open questions I did not chase: whether any live brand/product actually routes
-> to a 4096-capped shape at this prompt length, and (answered) whether it truncates — it does not,
-> it logs and sends.
+> budget on gemini-omni is **over cap** on the **three** registered 4096-capped models
+> (`grok-imagine-video-v1.5/i2v`, `grok-imagine-video/reference-to-video`, `veo3.1/i2v`) — a latent
+> defect, and exactly the "frozen invariant text that fits one cap but not another" trap. My earlier
+> "four … generic" was a miscount: I was counting the `|| 4096` display fallback as if it were a
+> model shape. `BUILT_IN_DEFAULT_MODEL` is gemini-omni, so a 4096 cap is reached only by an explicit
+> override. Two open questions: whether any live tenant overrides onto one at this prompt length
+> (not chased), and whether it truncates — **answered: it does not, it logs and sends.**
+>
+> **A second hypothesis, also checked and REFUTED.** It was suggested that the preview might be
+> built with `caps` absent (hence a default 4,096) while the real submit carries Omni's 20,000 —
+> which would make the preview *more* truncated than the submission. `buildPromptScaffold` **does**
+> pass `caps`, resolved by the same `resolveModelAndAspect` the real path uses; the
+> `caps?.promptByteCap || 4096` in its return is the reported `byteCap` field, not a build input. So
+> caps are not the mechanism on either side, and the preview/submit gap remains what the
+> `approximation` block already says: hardcoded `seedHasText: false` (+283 bytes) and
+> `hasProductReference: true` (221 bytes).
 
 **Fix = label, not close.** The destination-less scaffold prompt is a documented frozen
 invariant (`CLAUDE.md` §00, pinned by `verifyPostPilotBatch` B14 against the `9531ae9f`
