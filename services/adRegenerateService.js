@@ -498,6 +498,93 @@ function buildRegenerationRequest({
   };
 }
 
+// ── ⚠️ MONEY — THE IN-FLIGHT GUARD ───────────────────────────────────
+//
+// A FIRST-TIME RENDER IN FLIGHT MUST NEVER REGENERATE, AND THE
+// `regenerating` LOCK DOES NOT COVER IT. Providers bill on SUBMIT. The
+// initial render's lock is a DIFFERENT field: claimAdsForRun's atomic
+// `{ status:'queued' }` → `'rendering'` write (routes/ads.js). This service
+// never reads or writes Ad.status at all, so the two filters are disjoint
+// and both match the same document — a Regenerate pressed during a first
+// render submits a second real generation for one ad.
+//
+// TWO REPRESENTATIONS OF ONE RULE, deliberately adjacent so they cannot
+// drift: `inFlightRefusal` is the read-side predicate preflight turns into
+// a 409, and `notInFlight` is the write-side Mongo filter regenerateAd ANDs
+// into its atomic lock. THE READ ALONE IS NOT ENOUGH — preflight is a
+// `.lean()` read and every caller answers 202 then runs regenerateAd from
+// setImmediate, so the row can change in between (titlingResumeService can
+// claim a draft master inside that window). `regenerating` has always been
+// enforced in BOTH places for exactly this reason; these follow that
+// convention rather than inventing a read-only one.
+//
+// Each arm is load-bearing:
+//   rendering — the initial render's claim itself; a concurrent 2nd submit.
+//   queued    — never rendered, or requeued by the reaper. Because this
+//               service does not write status, the row STAYS queued and
+//               claimAdsForRun claims and renders it afterwards: a
+//               deterministic second charge, not a race.
+//   titling   — a PAID video master still owed titling. Ad.status is already
+//               'draft' in that window, so a status-only guard misses it.
+//               BOTH shapes titlingResumeService.buildResumeFilter sweeps
+//               are covered: the explicit pending|claimed stamp, AND the
+//               third arm (a draft holding veoVideoUrl with renderUrl still
+//               null) which carries NO stamp at all — regenerating either
+//               discards paid spend and races the resume's own write.
+//
+// draft / live / failed / archived stay regenerable — that is the feature
+// working as intended. Do NOT re-key this on the spend receipt
+// (veoPredictionId / imageGeneration.predictionId): nothing ever clears a
+// receipt (it is stamped once at atlasVideoService.js's submit), so a
+// receipt means "has ever spent", not "is spending now" — MEASURED, a
+// receipt-keyed guard refuses every successfully-rendered draft/live ad and
+// every failed video ad, while still ALLOWING the two pre-submit shapes
+// where the double-bill is actually reachable.
+//
+// Do NOT add a staleness bypass here. A row stuck in-flight by a dead
+// worker holds a PAID master, so bypassing on age re-buys it; recovery is
+// owned elsewhere (worker.js's reaper requeues receipt-FREE rows,
+// bootRecoveryService polls rows holding a receipt and never resubmits, and
+// lease expiry for adgen-claimed claims is adgen's).
+
+function inFlightRefusal(ad) {
+  if (ad.status === 'rendering') {
+    return 'This ad is still rendering its first version — regenerating now would '
+      + 'submit a second billable generation for the same ad. Wait for that render '
+      + 'to finish or fail. A render stranded by a dead worker is cleared by the '
+      + 'render-recovery sweepers or by clearing the stale claim — never by '
+      + 'regenerating, which would re-buy work that may already be paid for.';
+  }
+  if (ad.status === 'queued') {
+    return 'This ad has not been rendered yet (it is still queued). Render it '
+      + 'instead — regenerating does not change the ad\'s status, so the queued row '
+      + 'would still be claimed and rendered afterwards, billing twice.';
+  }
+  if (ad.titlingResumeState === 'pending' || ad.titlingResumeState === 'claimed'
+      || (ad.status === 'draft' && ad.veoVideoUrl && !ad.renderUrl)) {
+    return 'This ad has a paid video master that is still being titled — '
+      + 'regenerating now would discard that spend and race the titling resume. '
+      + 'Wait for titling to finish, then regenerate.';
+  }
+  return null;
+}
+
+// The write-side twin. Composes `$and` rather than spread-merging, for the
+// same reason services/spendReceipt.js's receiptFree does: a spread would
+// silently drop an existing `$and` on the caller's filter.
+const NOT_IN_FLIGHT_AND = Object.freeze([
+  { status:             { $nin: ['rendering', 'queued'] } },
+  { titlingResumeState: { $nin: ['pending', 'claimed'] } },
+  // The untagged resume shape. Absent/null veoVideoUrl, or a renderUrl
+  // already present, both fall outside this $nor and stay regenerable.
+  { $nor: [{ status: 'draft', veoVideoUrl: { $nin: [null, ''] }, renderUrl: { $in: [null, ''] } }] }
+]);
+
+function notInFlight(filter = {}) {
+  const existing = Array.isArray(filter.$and) ? filter.$and : [];
+  return { ...filter, $and: [...existing, ...NOT_IN_FLIGHT_AND] };
+}
+
 // ── Public API ────────────────────────────────────────────────────────
 
 // Validate: not exported, not regenerating, under daily cap. Throws an
@@ -543,6 +630,10 @@ async function preflight(adId, brandId) {
     const e = new Error('A regeneration is already in progress for this ad.');
     e.status = 409; throw e;
   }
+  // ⚠️ MONEY — the in-flight guard. One rule, two representations; see the
+  // block above inFlightRefusal for why the write side exists too.
+  const inFlight = inFlightRefusal(ad);
+  if (inFlight) { const e = new Error(inFlight); e.status = 409; throw e; }
   const since = Date.now() - 24 * 60 * 60 * 1000;
   const recent = (ad.regenerationHistory || []).filter(h =>
     h.at && new Date(h.at).getTime() > since
@@ -659,8 +750,12 @@ async function regenerateAd({
     lockSet.regenerateClaimedByWorker = null;
     lockSet.regenerateClaimedAt       = null;
   }
+  // ⚠️ MONEY — the lock re-asserts the in-flight guard, not just
+  // `regenerating`. preflight's 409 is a `.lean()` READ and the callers 202
+  // then run this from setImmediate, so the row can enter an in-flight state
+  // inside that window; this filter is what makes the refusal atomic.
   const lockResult = await Ad.updateOne(
-    { _id: adId, regenerating: { $ne: true } },
+    notInFlight({ _id: adId, regenerating: { $ne: true } }),
     {
       $set: lockSet,
       $push: {
@@ -1176,6 +1271,12 @@ async function markComplete(adId, { status, durationMs, error }) {
 module.exports = {
   preflight,
   regenerateAd,
+  // ⚠️ MONEY — the in-flight guard's two halves, exported so
+  // scripts/verifyRegeneratePreflightInflight.js can prove BOTH behaviourally
+  // (a read-side-only guard is the hole the atomic lock exists to close).
+  inFlightRefusal,
+  notInFlight,
+  NOT_IN_FLIGHT_AND,
   // Exported so the offline harness can assert the direct-image path
   // (no aiCanvasArtifactId precondition) without invoking providers.
   runImage,
