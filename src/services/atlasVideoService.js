@@ -199,15 +199,23 @@ function readReframeEntry(entry) {
 // Cross-process reframe claim lease. Web service and worker are separate Node
 // processes, so the in-process Map + fresh DB re-read alone cannot stop both
 // from POSTing generateImage for the same (media, aspect). Lease must outlive a
-// realistic generation (ATLAS_TIMEOUT_MS defaults to 15 min since #82) so a
-// live flight
-// is not stolen mid-poll; a crashed holder self-heals when the lease ages out.
+// realistic generation (ATLAS_TIMEOUT_MS is 900000 = 15 min since #82) so a
+// live flight is not stolen mid-poll; a crashed holder self-heals when the
+// lease ages out.
 // Floored at MAX_POLL_MS + 10 min rather than trusting the configured value
 // alone. If the lease could expire while the holder is still legitimately
 // polling, a second process would steal the claim and BOTH would bill — so the
-// safe TTL is coupled to how long a generation is allowed to run. Raising
-// ATLAS_TIMEOUT_MS therefore cannot silently reintroduce the double-charge this
-// lease exists to prevent.
+// safe TTL is coupled to how long a generation is allowed to run.
+//
+// ⚠️ THIS USED TO END: "Raising ATLAS_TIMEOUT_MS therefore cannot silently
+// reintroduce the double-charge this lease exists to prevent." THAT IS TRUE
+// ONLY WITHIN THIS REPO. The floor is computed from THIS file's MAX_POLL_MS,
+// but the claim it guards is a field on the SHARED Media document that
+// liquidretail_backend also steals from using ITS OWN copy of this formula.
+// #82 raised MAX_POLL_MS here and not there, so the two sides no longer agree
+// on when a holder is dead: 25 min here, 20 min there. See the MONEY block at
+// MAX_POLL_MS for the full accounting. Do not restore the old sentence without
+// first making the two repos read one shared floor.
 const REFRAME_CLAIM_TTL_MS = () => {
   const n = Number(process.env.REFRAME_CLAIM_TTL_MS);
   const configured = Number.isFinite(n) && n > 0 ? n : 15 * 60 * 1000;
@@ -364,31 +372,63 @@ const POLL_INTERVAL = parseInt(process.env.ATLAS_POLL_INTERVAL_MS, 10) || 5000;
 //     backend (services/atlasVideoService.js:314,
 //              origin/main c77a4774 = deployed)    600000 → TTL 20 min
 //
-// Both figures were EVALUATED from the two files' real source text with an
-// empty env, which is what production runs: ATLAS_TIMEOUT_MS and
-// REFRAME_CLAIM_TTL_MS are set on NO Render service and in NO env group
-// (checked against the Render API 2026-08-27), so each side takes its own
-// code fallback. Neither repo's config/defaults.env sets the TTL either.
+// HOW EACH SIDE ACTUALLY GETS ITS VALUE (corrected — an earlier version of
+// this block said "empty env, so each side takes its own code fallback", which
+// is wrong for adgen). ATLAS_TIMEOUT_MS is set on NO Render service and in NO
+// env group (checked against the Render API 2026-08-27), and REFRAME_CLAIM_TTL_MS
+// is set nowhere at all. But src/config.js loads config/defaults.env through
+// dotenv without `override`, and that file DECLARES ATLAS_TIMEOUT_MS=900000 —
+// so production adgen runs parseInt('900000'), not the `|| 900000` fallback.
+// Backend's config/defaults.env does not declare the key, so backend really
+// does hit its `|| 600000`. Different mechanisms, same two numbers.
 //
-// So an adgen holder doing exactly what this new ceiling permits — a poll out
-// to 15 min plus the download / Cloudinary / pad-build work the +10 min slack
-// exists to cover — is still a legitimate holder at minute 21, while backend
-// already reads that same claim as dead, steals it, and issues its own
-// billable POST /model/generateImage. Both bill for the same (media, aspect).
-// The 20→25 min band is precisely the band this side now calls a live holder
-// and the other side calls a corpse.
+// WHAT THE STEAL WINDOW ACTUALLY REQUIRES — do not overstate this. The claim is
+// held across ONE submitImageGeneration and ONE pollPrediction; there is no
+// poll retry ladder inside the claimed region. The structured worst case is
+// the 15 min poll ceiling, plus at most one leftover interval and rate-limit
+// backoff, plus fetchOutpaintOutput (3 attempts × 30s timeout with 1.5s/3s
+// backoff ≈ 95s), plus pad build and Cloudinary upload. That lands near 18
+// min — UNDER backend's 20 min line. Reaching 20+ min needs something
+// genuinely unbounded, and the honest candidate is the Cloudinary upload,
+// which has no timeout.
+//
+// AND THE CEILING WAS NOT SIZED FOR THIS PATH. The 900000 derivation below is
+// the VIDEO distribution (n=68 Omni image-to-video masters, max 760s). Reframe
+// runs a different model (REFRAME_OUTPAINT_MODEL, google/nano-banana-2/edit),
+// whose measured cold stage in this file's own notes is 5m19s for THREE
+// serialized outpaints. So "a poll out to 15 min" is not something this
+// ceiling was ever measured to permit for a reframe — it is a tail
+// hypothetical, and raising MAX_POLL_MS lengthened adgen's LEASE without
+// lengthening its HOLD.
+//
+// SO THE DEFECT IS THE DISAGREEMENT, NOT AN IMMINENT CHARGE. The 20→25 min
+// band is a band this side calls a live holder and the other side calls a
+// corpse, over a claim they share. A backend steal inside it goes straight to
+// a billable POST /model/generateImage (its acquire has no holder-identity,
+// fence, receipt or idempotency guard), and releaseReframeClaim is scoped to
+// claim.by — which the steal overwrites — so the original holder's release
+// becomes a no-op and both flights persist. Frequency: NOT MEASURED, and per
+// the bound above, most likely zero today. Treat this as an invariant that no
+// longer holds, which will bite when either side's latency or ceiling moves
+// again — not as a fire.
+//
+// Narrowing it further: the wizard fires prewarm ~1.5s after a product pick
+// (frontend Step2Picker), i.e. BEFORE Generate, while adgen holds during
+// generateForAd AFTER mint, and the SPA de-dupes by signature within a
+// session. The two holders overlapping on the same (media, aspect) is
+// therefore already an unusual interleaving.
 //
 // Backend's reframe path is live and is NOT gated by ADGEN_RENDERER_ENABLED:
 // POST /api/ads/video-ref-prewarm (backend routes/ads.js:4278) →
 // videoRefPrewarmService.buildReferenceImages (:237) →
-// reframeReferenceForAspect → pollPrediction, whose kill switch
-// VIDEO_REF_PREWARM_ENABLED defaults true (backend config/defaults.env:588)
-// and is not overridden. Backend's billable VIDEO submit IS gated off by the
-// handoff flag, so the image reframe is the one surviving user of backend's
-// MAX_POLL_MS — and it is exactly the one that shares this lease.
-//
-// HOW OFTEN a hold actually crosses 20 min is NOT MEASURED. Do not read this
-// as an observed double-charge; read it as an invariant that no longer holds.
+// reframeReferenceForAspect → pollPrediction. Two separate switches sit on
+// that path and neither is the adgen handoff flag: the ROUTE checks
+// VIDEO_REF_PREWARM_ENABLED (backend routes/ads.js:4282, default true, backend
+// config/defaults.env:588) and reframeReferenceForAspect itself checks
+// REFRAME_ENABLED (default true). pollPrediction has no switch of its own.
+// Backend's billable VIDEO submit IS gated off by the handoff flag, so the
+// image reframe is the one surviving user of backend's MAX_POLL_MS — and it is
+// exactly the one that shares this lease.
 //
 // THE DURABLE FIX IS NOT "ALSO RAISE BACKEND". A shared lease whose TTL is
 // derived from a per-repo constant will re-break on the next asymmetric bump
@@ -397,8 +437,12 @@ const POLL_INTERVAL = parseInt(process.env.ATLAS_POLL_INTERVAL_MS, 10) || 5000;
 // not each reader's local constant — decides when it dies. Porting the value
 // is the stopgap, and is now recorded as an `unported` obligation
 // (portTo: backend) in scripts/vendor-manifest.json, which fails the suite
-// once its 14-day grace lapses. THIS COMMIT ONLY CORRECTS THE COMMENTS — the
-// asymmetry itself is still live.
+// once its 14-day grace lapses.
+//
+// NO RUNTIME BEHAVIOUR CHANGED with this correction — but it is not purely
+// cosmetic either: flipping that manifest entry from `fork` to `unported` is
+// machine-readable suite policy with a clock on it. The 20→25 min asymmetry
+// itself is untouched and still live.
 const MAX_POLL_MS   = parseInt(process.env.ATLAS_TIMEOUT_MS, 10)       || 900000; // 15 min
 
 // RETRY POLL CEILING — the budget for attempt 2+ of the retry ladder, as
