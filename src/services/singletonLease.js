@@ -98,11 +98,21 @@
 // claim (`Ad.regenerateClaimedByWorker` / `regenerateClaimedAt`) has NO
 // heartbeat, deliberately — regenerateClaimedAt is stamped once at claim time
 // and stays frozen for the whole flight, so an in-progress video regenerate
-// looks EXACTLY as old as a crashed one. It compensates with a much larger
-// threshold, floored (not merely defaulted) at
+// looks EXACTLY as old as a crashed one.
+//
+// ⚠️ CORRECTED 2026-08-27. An earlier version of this block said that claim
+// "compensates with a much larger threshold, floored (not merely defaulted) at
 // `max(ceil(ATLAS_TIMEOUT_MS/60000) + 10, ADGEN_REGEN_CLAIM_STALE_MIN || 45)`
-// minutes, so raising ATLAS_TIMEOUT_MS raises the floor with it and an
-// operator cannot turn the knob down into a money bug.
+// minutes". IT DOES NOT, ON master. Neither ADGEN_REGEN_CLAIM_STALE_MIN nor
+// that Math.max floor exists anywhere in this repo outside these comments —
+// grep confirms the only occurrences are prose. What master actually has is
+// NO threshold at all: regenerateConsumer.js:41-54 is the accurate statement
+// ("There is deliberately NO retry/release sweep for a claim that crashes
+// mid-flight — regenerateClaimedByWorker stays set forever until an operator
+// clears it by hand"), which is a stuck-claim problem, not a double-submit
+// one. The floor and cap described above are PROPOSED on the still-open,
+// unmerged PR #76 (fix/regenerate-lease-expiry). Do not size anything off
+// them until that lands.
 //
 // So: unifying that claim onto this 90s/30s model requires wiring a heartbeat
 // into the regenerate flight path FIRST. The heartbeat and the shorter TTL
@@ -111,12 +121,18 @@
 // mid-generation and resubmits it, and adRegenerateService.runVideoFull
 // passes allowResume:false to generateForAd on purpose (an operator
 // regenerate always wants a FRESH video), so the reclaim is a genuine second
-// billable Omni submit, not a resumed poll. MAX_RECLAIMS (default 2, checked
-// before any provider call) caps the blast radius but does not remove it.
+// billable Omni submit, not a resumed poll. PR #76 proposes a MAX_RECLAIMS
+// (default 2, checked before any provider call) to cap the blast radius; it
+// would not remove it, and on master it does not exist yet.
 //
-// Note the config knob CANNOT reach the dangerous value on its own — the
-// Math.max floor blocks it — so this is a code-review hazard, not a
-// config-drift one. Guard it in review: do not remove that floor.
+// ⚠️ AND THE OLD CONCLUSION HERE WAS WRONG. This block used to end "the
+// config knob CANNOT reach the dangerous value on its own — the Math.max floor
+// blocks it — so this is a code-review hazard, not a config-drift one." There
+// is no floor on master to block anything, so that reassurance was unearned.
+// Until #76 lands, treat a shortened regenerate-claim threshold as BOTH a
+// code-review and a config-drift hazard. When #76 does land, re-read its
+// actual Math.max before quoting a formula from a comment — including this
+// one.
 const DEFAULT_TTL_MS       = 90_000;
 const DEFAULT_HEARTBEAT_MS = 30_000;
 // Backend's ratio is 30s/90s = 3 beats per TTL. Require at least 3 so a

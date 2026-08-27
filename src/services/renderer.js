@@ -2202,9 +2202,12 @@ async function processAd(ad) {
       //
       //     THE FIX THEREFORE BELONGS AT THE CLAIM BOUNDARY, not in the ladder —
       //     bounding retries inside code that is already correct would have
-      //     changed nothing. Same shape the regenerate path already uses for its
-      //     own reclaim loop (ADGEN_REGEN_MAX_RECLAIMS, a doc-persisted count
-      //     checked before any submit).
+      //     changed nothing. Same shape the regenerate path is PROPOSED to use
+      //     for its own reclaim loop (ADGEN_REGEN_MAX_RECLAIMS, a doc-persisted
+      //     count checked before any submit) — on the still-open, unmerged PR
+      //     #76, NOT on master. Corrected 2026-08-27: this line previously read
+      //     "already uses", and master's regenerate claim in fact has no reclaim
+      //     loop at all (regenerateConsumer.js:41-54).
       //
       //     And the free recovery this branch delegated to was structurally
       //     unreachable: bootRecoveryService selects

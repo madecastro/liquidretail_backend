@@ -1,8 +1,8 @@
 {
   "version": 2,
   "backendRef": "origin/main",
-  "backendHead": "f8b3d6b152a848a3c9f5665f45cc6c00500ce0cb",
-  "generatedAt": "2026-08-27T10:28:58.859Z",
+  "backendHead": "c77a4774c3d0837b7d44e9872a9d81abd77218f6",
+  "generatedAt": "2026-08-27T16:49:12.298Z",
   "files": {
     "models/Ad.js": {
       "backendHash": "4caa2896cc4a2dcd56f5ccb4ba73c37d9675c9c4f59993f235befbc1b0d6672e",
@@ -616,10 +616,12 @@
     },
     "services/atlasVideoService.js": {
       "backendHash": "72a5e707e664e9d0dcf90b90b34ea27ffcb71cca4d045719182bafa28cf75088",
-      "adgenHash": "ee6e554a03810ac2410370cfa558349c804e7a86704b1ee69880ea83cbee6467",
+      "adgenHash": "11c2770d659d482e4c0e770aeb38d5391c14414c19937da85b888a675f2a659b",
       "backendSha": "ba99a59f10619bbd940be9442c8852dc32ae278a",
-      "status": "fork",
-      "reason": "fork — generateForAd carries a resume-from-receipt gate (shouldResumeAttempt) so a re-claimed, receipt-holding ad does not re-submit a paid Atlas Omni generation; backend has no equivalent and relies on its out-of-band bootRecoveryService sweep. Cost-ledger attribution (brandId/productId/adId/campaignRunId) is threaded per each repo's own call graph — backend via pipelines/detect.js, adgen via renderer.js/generateForAd — so the files are not byte-identical by design. Backend #329's reframe-outpaint attribution fix WAS a real gap on this side and is ported here (recordFlatCost stage:'reframe-outpaint' now prefers the explicit brandId/productId params and carries adId/campaignRunId); re-pointed only after that port, not instead of it."
+      "status": "unported",
+      "reason": "fork PLUS an OWED PORT as of #82 (8eb3e5d, 2026-08-27). The pre-existing fork reasons still hold: generateForAd carries a resume-from-receipt gate (shouldResumeAttempt) backend has no equivalent of, and cost-ledger attribution is threaded per each repo's own call graph. NEW AND UNPORTED: #82 raised MAX_POLL_MS 600000 -> 900000 on this side ONLY (adgen :355 vs backend services/atlasVideoService.js:314 on origin/main c77a4774, the deployed commit). That is not a cosmetic divergence, because REFRAME_CLAIM_TTL_MS is floored at MAX_POLL_MS + 10 min in BOTH repos, and the reframe claim it guards is a field on the SHARED Media document (metadata.reframes.<aspect>.claim.at) in the SHARED database. Evaluated from both files' real source with an empty env (which is production: ATLAS_TIMEOUT_MS and REFRAME_CLAIM_TTL_MS are set on no Render service and in no env group, checked 2026-08-27): adgen TTL 25 min, backend TTL 20 min. An adgen holder legitimately polling past minute 20 is read as dead by backend, whose reframe path is live and ungated on ADGEN_RENDERER_ENABLED (POST /api/ads/video-ref-prewarm -> videoRefPrewarmService.buildReferenceImages -> reframeReferenceForAspect -> pollPrediction; VIDEO_REF_PREWARM_ENABLED defaults true), so backend steals the claim and both bill for the same (media, aspect). Frequency unmeasured. Porting the constant is the STOPGAP; the durable fix is to stop deriving a shared lease's TTL from a per-repo constant. Recorded unported/portTo=backend rather than re-attested as a plain fork specifically so the whole-file fork status cannot absorb this constant silently.",
+      "portTo": "backend",
+      "owedSince": "2026-08-27T16:49:12.296Z"
     },
     "services/basePlateCropService.js": {
       "backendHash": "03d13d046489c24734fc54a97edb158ed9abc4f7ad03e2ec4a84c8b0ad3b6aeb",

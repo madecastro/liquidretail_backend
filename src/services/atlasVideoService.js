@@ -199,7 +199,8 @@ function readReframeEntry(entry) {
 // Cross-process reframe claim lease. Web service and worker are separate Node
 // processes, so the in-process Map + fresh DB re-read alone cannot stop both
 // from POSTing generateImage for the same (media, aspect). Lease must outlive a
-// realistic generation (ATLAS_TIMEOUT_MS defaults to 10 min) so a live flight
+// realistic generation (ATLAS_TIMEOUT_MS defaults to 15 min since #82) so a
+// live flight
 // is not stolen mid-poll; a crashed holder self-heals when the lease ages out.
 // Floored at MAX_POLL_MS + 10 min rather than trusting the configured value
 // alone. If the lease could expire while the holder is still legitimately
@@ -237,7 +238,7 @@ const REFRAME_CLAIM_TTL_MS = () => {
 // url (or crop) chosen while a second billable flight was already away. The
 // clamp below walks n down until the span fits, so raising the env var can
 // never reopen the steal window (adversarial finding 5). n=26 → 351s, well
-// under the ≥20 min TTL floor.
+// under the ≥25 min TTL floor (≥20 before #82 raised MAX_POLL_MS).
 const REFRAME_CLAIM_WAIT_ATTEMPTS = () => {
   const n = Number(process.env.REFRAME_CLAIM_WAIT_ATTEMPTS);
   const requested = Number.isFinite(n) && n >= 1 ? Math.min(60, Math.floor(n)) : 26;
@@ -348,10 +349,56 @@ const POLL_INTERVAL = parseInt(process.env.ATLAS_POLL_INTERVAL_MS, 10) || 5000;
 // legitimate flight from ~15-17 min to ~20-22 min (poll budget + backoffs +
 // download + Cloudinary mirror + titling composite).
 //
-// SAFE BY CONSTRUCTION for the cross-process lease: REFRAME_CLAIM_TTL_MS above
-// is floored at MAX_POLL_MS + 10 min, and its own comment states the property
-// this relies on — "Raising ATLAS_TIMEOUT_MS therefore cannot silently
-// reintroduce the double-charge this lease exists to prevent."
+// WITHIN THIS REPO, SAFE BY CONSTRUCTION: REFRAME_CLAIM_TTL_MS above is
+// floored at MAX_POLL_MS + 10 min, so raising this ceiling widens that lease
+// with it and no peer ADGEN process can steal a claim mid-poll.
+//
+// ⚠️ MONEY — THAT GUARANTEE STOPS AT THE REPO BOUNDARY, AND #82 BROKE IT.
+// The reframe claim is not a per-repo lock. It is a field on the SHARED Media
+// document (`metadata.reframes.<aspect>.claim.at` — see reframeClaimPath)
+// in the SAME database liquidretail_backend writes, and BOTH repos decide
+// stealability as `claim.at < now - REFRAME_CLAIM_TTL_MS()`. That TTL is
+// derived from each repo's OWN MAX_POLL_MS, and #82 moved this side only:
+//
+//     adgen   (this file, master 8eb3e5d)          900000 → TTL 25 min
+//     backend (services/atlasVideoService.js:314,
+//              origin/main c77a4774 = deployed)    600000 → TTL 20 min
+//
+// Both figures were EVALUATED from the two files' real source text with an
+// empty env, which is what production runs: ATLAS_TIMEOUT_MS and
+// REFRAME_CLAIM_TTL_MS are set on NO Render service and in NO env group
+// (checked against the Render API 2026-08-27), so each side takes its own
+// code fallback. Neither repo's config/defaults.env sets the TTL either.
+//
+// So an adgen holder doing exactly what this new ceiling permits — a poll out
+// to 15 min plus the download / Cloudinary / pad-build work the +10 min slack
+// exists to cover — is still a legitimate holder at minute 21, while backend
+// already reads that same claim as dead, steals it, and issues its own
+// billable POST /model/generateImage. Both bill for the same (media, aspect).
+// The 20→25 min band is precisely the band this side now calls a live holder
+// and the other side calls a corpse.
+//
+// Backend's reframe path is live and is NOT gated by ADGEN_RENDERER_ENABLED:
+// POST /api/ads/video-ref-prewarm (backend routes/ads.js:4278) →
+// videoRefPrewarmService.buildReferenceImages (:237) →
+// reframeReferenceForAspect → pollPrediction, whose kill switch
+// VIDEO_REF_PREWARM_ENABLED defaults true (backend config/defaults.env:588)
+// and is not overridden. Backend's billable VIDEO submit IS gated off by the
+// handoff flag, so the image reframe is the one surviving user of backend's
+// MAX_POLL_MS — and it is exactly the one that shares this lease.
+//
+// HOW OFTEN a hold actually crosses 20 min is NOT MEASURED. Do not read this
+// as an observed double-charge; read it as an invariant that no longer holds.
+//
+// THE DURABLE FIX IS NOT "ALSO RAISE BACKEND". A shared lease whose TTL is
+// derived from a per-repo constant will re-break on the next asymmetric bump
+// of either side. Either pin this lease to an absolute floor both repos read
+// from one place, or give the claim its own persisted expiry so the writer —
+// not each reader's local constant — decides when it dies. Porting the value
+// is the stopgap, and is now recorded as an `unported` obligation
+// (portTo: backend) in scripts/vendor-manifest.json, which fails the suite
+// once its 14-day grace lapses. THIS COMMIT ONLY CORRECTS THE COMMENTS — the
+// asymmetry itself is still live.
 const MAX_POLL_MS   = parseInt(process.env.ATLAS_TIMEOUT_MS, 10)       || 900000; // 15 min
 
 function apiKey() { return process.env.ATLAS_API_KEY; }
@@ -1986,7 +2033,9 @@ async function releaseReframeClaim(mediaId, aspectKey, claimBy) {
 //   • claim.at older than the lease → holder is dead; the claim is now
 //     stealable, so waiting on it is waiting on nobody.
 // Neither can fire while a live holder works: tryClaimReframe writes claim
-// before the submit and the lease floor (≥20 min) far outlasts a reframe.
+// before the submit and the lease floor (≥25 min) far outlasts a reframe.
+// NOTE that floor is THIS repo's; backend's copy computes ≥20 min from its own
+// MAX_POLL_MS over the same Media claim — see the MONEY block at MAX_POLL_MS.
 // Returning null degrades to the caller's deterministic crop — never spend.
 async function waitForReframeUrl(mediaId, aspectKey, attempts = 3) {
   const path = reframeClaimPath(aspectKey);
@@ -3270,7 +3319,7 @@ function pacedModelSubmit(model, fn) {
 /**
  * SINGLE-SHOT prediction status check. Free — a GET, never a submit.
  *
- * pollPrediction blocks up to MAX_POLL_MS (10 min), which is right inside a
+ * pollPrediction blocks up to MAX_POLL_MS (15 min), which is right inside a
  * render and wrong at boot: recovery must not hold startup open, and an ad that
  * is still processing simply gets checked again on the next sweep.
  *
