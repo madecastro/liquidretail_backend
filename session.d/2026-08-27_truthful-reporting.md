@@ -144,8 +144,42 @@ had **all failed** with zero assets — same response: `draftCount: 0, liveCount
 readyToExport: 0`. Header advanced 18 → 30 "ADS CREATED" and "1 of 200" → "2 of 200
 products".
 
-Coverage divided `adCount` (a bare `$sum: 1`) by `TARGET_ADS_PER_PRODUCT`. `Ad.status` has six
-values; only `archived` was excluded, so `failed`, `queued` and `rendering` all counted.
+`Ad.status` has six values; only `archived` was excluded, so `failed`, `queued` and `rendering`
+all counted. **The two endpoints use DIFFERENT formulas** — catalog is an ad-count ratio
+`min(100, round(adCount/TARGET × 100))`, campaigns is a product ratio
+`productsWithAds/matchedProductIds.length` — but both were fed by the same status-blind `$sum: 1`,
+so the conclusion holds for both while the arithmetic does not transfer.
+
+**Measured on live production data.** Marine Layer product `6a8d47cfd9e1e0e1dccee389`: 12
+non-archived rows, all `failed`, zero assets → `min(100, round(12/5 × 100)) = 100`. Re-checked
+under the strict `isAdHonestlyDelivered` predicate: 0 of 12 holds there too, and no
+paid-but-unchromed master is hiding (`veoVideoUrl: null`, `renderUrl: null`,
+`titlingNeeded: false`, `titlingResumeState: null`), so the fix cannot be accused of turning a
+nearly-delivered ad into a reported failure.
+
+### ⚠️ The sort consequence — the functional half
+
+`routes/catalog.js` sorts `lastActivityAt` DESC then `coveragePct` **ASC**, and the comment above
+it says that tiebreak exists *"so products needing attention surface above well-covered ones."*
+Scoring an all-failed product at 100 inverted exactly that signal. Executed over the real
+comparator at equal recency:
+
+| | trunk | fixed |
+|---|---|---|
+| 1st | untouched, 0% | **ALL-FAILED, 0%** |
+| 2nd | half-covered, 40% | untouched, 0% |
+| 3rd | **ALL-FAILED, 100%** | half-covered, 40% |
+
+The worst-off product sorted **last** in the list built to surface products needing attention.
+
+*Scope, stated precisely because the first framing of this overreached:* the burial is **within a
+recency group**, not absolute. `models/Ad.js:735` gives `generatedAt` a `default: Date.now` and
+`AD_RECENCY_EXPR` is `$ifNull[renderedAt, generatedAt]`, so a freshly-failed product has a recent
+`lastActivityAt` and still sorts near the top on the primary key. The durable harm is that as the
+failure ages it drifts down while still claiming 100% covered, so it never resurfaces.
+
+**`failedCount` already existed on trunk** — computed in the same `$group` since `ed3e6d83`, never
+projected. The honest number was computed server-side and discarded one line later.
 
 **Checked for a prior deliberate decision before changing anything — there is none.** Coverage
 shipped in `ed3e6d83` explicitly as a *"placeholder formula: adCount / 5, capped at 100"*; the
@@ -191,12 +225,12 @@ contradict itself. Clause is now scoped to the images arm and names its unit.
 
 ## Verification
 
-- `scripts/verifyTruthfulReporting.js` — **75/75** with mongod (51 offline + 24 group D).
+- `scripts/verifyTruthfulReporting.js` — **80/80** with mongod (56 offline + 24 group D).
   Behavioural: every check calls the real exported function or runs the real `$group`
   accumulators through a real mongod. Group D **skips loudly** without
   `TRUTHFUL_VERIFY_MONGODB_URI`.
-- **20/20 mutations caught RED, 0 vacuous** (`scripts/mutateTruthfulReporting.sh`), tree
-  byte-restored after each.
+- **21/21 mutations caught RED, 0 vacuous** (`scripts/mutateTruthfulReporting.sh`), tree
+  byte-restored after each. M21 reverses the coveragePct tiebreak and must stay red.
 - Guard-line hoist byte-identical to `origin/main` over 288 input combinations, with arm
   checks proving the sweep was not vacuous.
 - Suite **208/211** after rebasing onto `b5a42717`, with the same three pre-existing failures
