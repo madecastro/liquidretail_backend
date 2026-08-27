@@ -86,6 +86,14 @@ const { renderCreative }        = require('../services/renderService');
 const { childTailsFrom }        = require('../services/renderErrorFields');
 const { generateForAd: veoGenerateForAd, prepareStoryboard: veoPrepareStoryboard } = require('../services/videoRouter');
 const { buildVideoSegmentUrl, buildPromptScaffold } = require('../services/atlasVideoService');
+// The generation inspector detects this exact sentence inside a PERSISTED
+// Ad.veoPrompt to report what the render actually computed for seedHasText,
+// instead of re-deriving it from a Media row that may have changed since.
+// Imported, never re-implemented — a local copy would silently stop matching
+// the moment the builder's wording changed, and the warning would go quiet
+// again exactly as it did before 2026-08-27.
+const { SEED_BURNED_IN_TEXT_GUARD_LINE } = require('../services/veoPromptBuilder');
+const { resolveSeedTextTruth } = require('../services/seedTextTruth');
 const { buildGridPreviewVideoUrl } = require('../services/videoPreviewUrl');
 const { buildGridPreviewImageUrl } = require('../services/imagePreviewUrl');
 const ugcVideoPipeline = require('../services/ugcVideoPipeline');
@@ -5053,21 +5061,108 @@ router.get('/:id/generation-inspector', async (req, res) => {
       const m = await Media.findById(ad.mediaId)
         .select('source fileType fileUrl text metadata.productTitle').lean();
       if (m) {
-        const burnedInText = (Array.isArray(m.text) ? m.text : [])
-          .map(t => (typeof t === 'string' ? t : (t?.text || t?.value || null)))
-          .filter(Boolean);
+        // ── seedHasText: REPORT WHAT THE RENDER COMPUTED, NOT A RE-DERIVATION ──
+        //
+        // This block used to derive the flag from a mapped-and-filtered
+        // projection of Media.text, and it LIED. Mechanism, measured
+        // 2026-08-27: the only production writer of Media.text is
+        // subjectTextService.js:128-135, whose elements are
+        // `{ id, content, type, x1, y1, x2, y2, confidence }` — the readable
+        // string is on `content`. Every other live reader in this repo already
+        // uses `.content` (pipelines/detect.js, judgeService,
+        // adSuitabilityService:169, layoutInputService, aiCanvasInputBuilder,
+        // aiCanvasHtmlGeneratorService, brandSafetyService); this block was the
+        // ONLY decoder looking at `.text`/`.value`. So on the real persisted
+        // shape every element mapped to null, `filter(Boolean)` emptied the
+        // array, and `seedHasText` came back FALSE — while the render path
+        // (atlasVideoService.js `Array.isArray(media.text) && media.text.length > 0`)
+        // saw TRUE and emitted the burned-in-text guard block.
+        //
+        // Consequence, which is why this is a priority fix and not tidying:
+        // the `seed-has-burned-in-text` warning below exists precisely to tell
+        // an investigator that BURNED-IN SOURCE TEXT — not the titling engine —
+        // is the usual cause of garbled on-screen text. It was therefore
+        // suppressed on exactly the ads where the render had detected the
+        // condition. A whole session was spent chasing garbled typography with
+        // this signal silently off.
+        //
+        // Three signals now, in descending order of authority, and the source
+        // is REPORTED so a reader knows which one answered:
+        //   render-prompt  — the persisted Ad.veoPrompt CONTAINS the guard
+        //                    block. This is what the render actually computed,
+        //                    and it survives a later detect run overwriting
+        //                    Media.text (detect $sets the array wholesale,
+        //                    including to [] when its subjects-text stage
+        //                    fails — so a live re-read can honestly go empty
+        //                    on an ad whose render did fire).
+        //   seed-media     — the RAW array length, mirroring the render path's
+        //                    own derivation term-for-term. Used when no prompt
+        //                    was persisted (pre-capture render, or a raw
+        //                    override that bypassed buildVeoPrompt).
+        //   none           — no seed text by either signal.
+        // The flag is deliberately NOT derived from `burnedInText` any more:
+        // that array is a human-readable convenience, and an element with an
+        // empty `content` string would still empty it while the render path,
+        // which only counts, fired.
+        // One definition, imported — services/seedTextTruth.js. Its header
+        // carries the full mechanism; the short version is above. Keeping the
+        // logic there rather than inline is what lets
+        // scripts/verifyTruthfulReporting.js prove it BEHAVIOURALLY by calling
+        // the real function, instead of scanning this route's source text for a
+        // string that a reimplementation could satisfy while behaving wrongly.
+        const truth = resolveSeedTextTruth({
+          media: m,
+          ad,
+          guardLine: SEED_BURNED_IN_TEXT_GUARD_LINE
+        });
+        const {
+          burnedInText,
+          seedHasText,
+          seedHasTextSource,
+          seedTextElementCount,
+          renderComputedSeedHasText: guardInPrompt,
+          recordChangedSinceRender
+        } = truth;
+
         seed = {
           mediaId:     String(m._id),
           source:      m.source,
           fileType:    m.fileType,
           url:         m.fileUrl,
           burnedInText,
-          seedHasText: burnedInText.length > 0
+          seedHasText,
+          // Which signal answered, so the reader is never guessing.
+          seedHasTextSource,
+          // The raw element count, so a decode failure can never again hide a
+          // non-empty field behind an empty decoded list.
+          seedTextElementCount,
+          // Tri-state on purpose: false means "the render ran buildVeoPrompt
+          // and did NOT emit the guard"; null means "we cannot tell from the
+          // prompt" (none persisted, or a raw override bypassed the builder).
+          renderComputedSeedHasText: guardInPrompt
         };
         if (seed.seedHasText) {
+          // Name the signal in the message too — an investigator reading only
+          // the warning should not have to cross-reference the seed block.
+          const basis = seedHasTextSource === 'render-prompt'
+            ? `The render path detected this at submit time (the burned-in-text guard block is present in the submitted prompt)`
+            : `Detected on the seed media record (${seedTextElementCount} text element(s))`;
+          const detail = burnedInText.length
+            ? `${burnedInText.length} decoded: ${burnedInText.slice(0, 5).map(s => JSON.stringify(s)).join(', ')}`
+            : `${seedTextElementCount} element(s) recorded but none carried readable text`;
           out.warnings.push({
             code: 'seed-has-burned-in-text',
-            message: `Source image has ${burnedInText.length} detected burned-in text element(s). The video model can smear/garble baked-in text when animating (Ken Burns) — this is the usual source of garbled on-screen text, NOT the titling engine (titling is overlaid cleanly downstream).`
+            message: `Source image has burned-in text. ${basis}. ${detail}. The video model can smear/garble baked-in text when animating (Ken Burns) — this is the usual source of garbled on-screen text, NOT the titling engine (titling is overlaid cleanly downstream).`
+          });
+        }
+        // A disagreement between the two signals is itself diagnostic: it means
+        // Media.text changed after the render (detect re-ran), so the live
+        // record no longer describes what was submitted. Say so rather than
+        // silently preferring one.
+        if (recordChangedSinceRender) {
+          out.warnings.push({
+            code: 'seed-text-record-changed-since-render',
+            message: `The submitted prompt carries the burned-in-text guard, but the seed Media row now records ZERO text elements. Media.text is overwritten wholesale by each detect run (including to [] when its subjects-text stage fails), so the current record does not describe what this render was given. Trust the prompt.`
           });
         }
       }

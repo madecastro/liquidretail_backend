@@ -21,6 +21,13 @@ const Ad = require('../models/Ad');
 const { tenantFilter } = require('../middleware/tenantHelpers');
 const { AD_RECENCY_EXPR } = require('../services/adRecencyService');
 const { isAdHonestlyDelivered } = require('../services/adTitlingTruth');
+// Shared with routes/catalog.js's ads-summary — this endpoint's own comment
+// says it "mirrors" that one, and the two silently disagreeing about what
+// coverage counts is how the defect stayed invisible on both.
+const {
+  outcomeAccumulators,
+  distinctOnDelivered
+} = require('../services/adDeliveryCounts');
 
 // GET /api/campaigns?brandId=X[&platform=meta-ads|google-ads][&status=ACTIVE]
 // Lightweight list for the Campaigns page. Returns a projection that
@@ -244,7 +251,15 @@ router.get('/ads-summary', async (req, res) => {
               ]
             }
           },
+          // Coverage counts DELIVERABLE assets, never bare row existence —
+          // same shared definition as routes/catalog.js's ads-summary.
+          ...outcomeAccumulators(),
           productsWithAds: { $addToSet: '$productId' },
+          // Distinct products that actually have a DELIVERED creative. A
+          // $addToSet cannot be conditional, so this collects the productId
+          // only on delivered rows and nulls the rest; the nulls are filtered
+          // out downstream exactly as productsWithAds' are.
+          productsDelivered: distinctOnDelivered('$productId'),
           platformFormats: { $addToSet: '$platformFormat' },
           lastGeneratedAt: { $max: AD_RECENCY_EXPR }
       } }
@@ -292,7 +307,16 @@ router.get('/ads-summary', async (req, res) => {
     const out = campaigns.map(c => {
       const stats        = adStatsByCampaign.get(String(c._id));
       const totalProducts = (c.matchedProductIds || []).length;
+      // productsWithAds now means products with a DELIVERED creative, so the
+      // coverage bar cannot read 100% off a campaign that shipped nothing.
+      // See the $group above for why this is an alignment with the repo's own
+      // later "delivered" definition, not a reversal of a prior decision.
       const productsWithAds = stats
+        ? (stats.productsDelivered || []).filter(Boolean).length
+        : 0;
+      // Kept separately: products that have any row at all. The difference
+      // between the two is what the old counter was hiding.
+      const productsAttempted = stats
         ? (stats.productsWithAds || []).filter(Boolean).length
         : 0;
       const coveragePct = totalProducts > 0
@@ -316,8 +340,14 @@ router.get('/ads-summary', async (req, res) => {
         thumbUrl:          thumbUrl || null,
         productCount:      totalProducts,
         productsWithAds,
+        productsAttempted,
         ugcCount:          stats?.ugcCount       || 0,
+        // adCount stays every non-archived row — "created" is a true statement
+        // even for a run that all-failed. The outcome split sits beside it.
         adCount:           stats?.adCount        || 0,
+        deliveredCount:    stats?.deliveredCount || 0,
+        failedCount:       stats?.failedCount    || 0,
+        inFlightCount:     stats?.inFlightCount  || 0,
         readyToExport:     stats?.readyToExport  || 0,
         coveragePct,
         channels:          channelsFromFormats(stats?.platformFormats),
@@ -338,8 +368,15 @@ router.get('/ads-summary', async (req, res) => {
     });
 
     const totalCampaigns      = out.length;
-    const campaignsWithAds    = out.filter(c => c.adCount > 0).length;
+    // "campaigns with ads" drives a coverage percentage, so it means campaigns
+    // that DELIVERED something — not campaigns that merely hold rows.
+    const campaignsWithAds    = out.filter(c => c.deliveredCount > 0).length;
+    const campaignsAttemptedNoneDelivered =
+      out.filter(c => c.adCount > 0 && c.deliveredCount === 0).length;
     const adsCreated          = out.reduce((s, c) => s + c.adCount, 0);
+    const adsDelivered        = out.reduce((s, c) => s + c.deliveredCount, 0);
+    const adsFailed           = out.reduce((s, c) => s + c.failedCount, 0);
+    const adsInFlight         = out.reduce((s, c) => s + c.inFlightCount, 0);
     const adsReadyToExport    = out.reduce((s, c) => s + c.readyToExport, 0);
 
     res.json({
@@ -350,6 +387,10 @@ router.get('/ads-summary', async (req, res) => {
           ? Math.round((campaignsWithAds / totalCampaigns) * 100)
           : 0,
         adsCreated,
+        adsDelivered,
+        adsFailed,
+        adsInFlight,
+        campaignsAttemptedNoneDelivered,
         adsReadyToExport,
         goodOpportunities: null   // Phase 2
       },
