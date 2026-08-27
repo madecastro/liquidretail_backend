@@ -180,7 +180,16 @@ const RESUME_MAX_ADS   = Math.max(1, parseInt(process.env.RESUME_MAX_ADS, 10) ||
 // live claim. A long one costs, at worst, wasted CPU on a redundant second pass
 // IF the claim really is dead — never a double-SPEND (resumeForAd only peeks a
 // free GET and only writes when the provider says done; this sweep never submits).
-const RESUME_CLAIM_STALE_MIN = Math.max(1, parseInt(process.env.RESUME_CLAIM_STALE_MIN, 10) || 15);
+//
+// Floored at RESUME_STALE_MIN, not a bare 1 — adversarial finding: a bare
+// `Math.max(1, ...)` let an operator set RESUME_CLAIM_STALE_MIN=1 (or raise
+// RESUME_STALE_MIN above the claimed default) and INVERT the whole point of
+// this constant, making a claimed row easier to steal than an unclaimed one.
+// That is exactly the misconfiguration that looks fine in a diff and only
+// shows up as a dual Remotion render at 3am. Clamping here means the
+// invariant holds for every caller of buildRecoverySweepFilter, not just the
+// default-value assertions in F1/F1b below, which check defaults only.
+const RESUME_CLAIM_STALE_MIN = Math.max(RESUME_STALE_MIN, parseInt(process.env.RESUME_CLAIM_STALE_MIN, 10) || 15);
 
 function enabled() {
   return String(process.env.RESUME_IN_FLIGHT_ON_BOOT ?? 'true').toLowerCase() !== 'false';

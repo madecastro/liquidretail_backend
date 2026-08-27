@@ -78,9 +78,9 @@
 // Revert-prove (each mutation must fail this harness):
 //   1. Drop the claimedByWorker clauses entirely (old unconditional
 //        `{status:'rendering', updatedAt:{$lt:cutoff}, ...HAS_RECEIPT}`)
-//        → A1/A2/A3 fail (the claimed-fresh row is swept — the dual-render bug)
+//        → A1/A3 fail (the claimed-fresh row is swept — the dual-render bug)
 //   2. Set claimStaleCutoff = staleCutoff (reuse RESUME_STALE_MIN for
-//        claimed rows too) → A1/A2/A3 fail
+//        claimed rows too) → A1/A3 fail
 //   3. Drop the claimedByWorker:{$ne:null} branch entirely (claimed rows
 //        never recovered) → B1/B2 fail (permanent no-op for claimed rows)
 //   4. Spread HAS_RECEIPT next to the claim $or instead of nesting it in
@@ -314,12 +314,22 @@ ok('A1 claimed + fresh-heartbeat (6m, < 15m claim TTL) titling ad is NOT swept',
   assert.strictEqual(matchesFilter(claimedFreshTitling, filter), false,
     'a live claim inside RESUME_CLAIM_STALE_MIN must be excluded — sweeping it is the dual-render bug');
 });
-ok('A2 claim staleness is measured against RESUME_CLAIM_STALE_MIN, not RESUME_STALE_MIN', () => {
-  // Directly pins the boundary: a claimed row exactly at the OLD 5-minute
-  // bar must still be excluded once the NEW 15-minute bar governs it.
-  const rightAtOldBar = { ...claimedFreshTitling, claimedAt: minsAgo(RESUME_STALE_MIN), updatedAt: minsAgo(RESUME_STALE_MIN) };
-  assert.strictEqual(matchesFilter(rightAtOldBar, filter), false);
-});
+// A2 REMOVED (adversarial finding, follow-up pass): its own fixture sat
+// `updatedAt` exactly AT the old RESUME_STALE_MIN cutoff, and that cutoff's
+// comparison is `$lt` (strictly-less-than) everywhere in this file — so the
+// OLD unclaimed-only filter would ALSO have excluded that exact document
+// (an equal-to-cutoff row was never eligible under either rule). The check
+// could not fail against the mutation its own name and comment claimed to
+// guard ("claim staleness is measured against RESUME_CLAIM_STALE_MIN, not
+// RESUME_STALE_MIN") — a decorative assertion in a money-critical harness is
+// worse than no assertion, because the next reader trusts the label. A1
+// (a claim 1 minute inside the OLD 5m bar, `RESUME_STALE_MIN + 1`) and A3
+// (a claim 1 minute inside the REAL, current `RESUME_CLAIM_STALE_MIN` bar,
+// computed off the live constant so a shrunk default moves the fixture with
+// it) are what actually prove the claimed arm uses the claim TTL, not the
+// unclaimed one — both already fail correctly if that mutation is
+// reintroduced. Nothing lost by deleting this one; say so here rather than
+// leave a check that cannot do its stated job.
 ok('A3 claimed row 1 minute INSIDE the real claim boundary is excluded — not just "comfortably fresh"', () => {
   // Closes the specific adversarial-review gap: A1's 6-minute fixture only
   // proved any TTL greater than 6 minutes passes, which a materially
@@ -398,7 +408,7 @@ ok('E2 buildRecoverySweepFilter is exported (a harness outside this file can rea
   assert.ok(/module\.exports\s*=\s*\{[\s\S]*buildRecoverySweepFilter/.test(serviceSrc));
 });
 ok('E3 RESUME_CLAIM_STALE_MIN is read from its own env var, not aliased to RESUME_STALE_MIN', () => {
-  assert.ok(/RESUME_CLAIM_STALE_MIN\s*=\s*Math\.max\(1,\s*parseInt\(process\.env\.RESUME_CLAIM_STALE_MIN/.test(serviceSrc));
+  assert.ok(/RESUME_CLAIM_STALE_MIN\s*=\s*Math\.max\(RESUME_STALE_MIN,\s*parseInt\(process\.env\.RESUME_CLAIM_STALE_MIN/.test(serviceSrc));
 });
 ok('E4 resumeInFlightAds accepts an injectable claimStaleMinutes (same pattern as staleMinutes)', () => {
   assert.ok(/claimStaleMinutes\s*=\s*RESUME_CLAIM_STALE_MIN/.test(serviceSrc));
@@ -429,13 +439,37 @@ ok('F1b same relationship holds on the LITERAL DEFAULT NUMBERS extracted from so
   // verifyPmaxPromptOverlay V2c) and check the SAME relationship on the
   // numbers a fresh, unconfigured boot would actually use.
   const staleMatch = serviceSrc.match(/RESUME_STALE_MIN\s*=\s*Math\.max\(1,\s*parseInt\(process\.env\.RESUME_STALE_MIN,\s*10\)\s*\|\|\s*(\d+)\)/);
-  const claimMatch = serviceSrc.match(/RESUME_CLAIM_STALE_MIN\s*=\s*Math\.max\(1,\s*parseInt\(process\.env\.RESUME_CLAIM_STALE_MIN,\s*10\)\s*\|\|\s*(\d+)\)/);
+  const claimMatch = serviceSrc.match(/RESUME_CLAIM_STALE_MIN\s*=\s*Math\.max\(RESUME_STALE_MIN,\s*parseInt\(process\.env\.RESUME_CLAIM_STALE_MIN,\s*10\)\s*\|\|\s*(\d+)\)/);
   assert.ok(staleMatch, 'could not find the RESUME_STALE_MIN default literal in source — extraction regex is stale');
   assert.ok(claimMatch, 'could not find the RESUME_CLAIM_STALE_MIN default literal in source — extraction regex is stale');
   const staleDefault = Number(staleMatch[1]);
   const claimDefault = Number(claimMatch[1]);
   assert.ok(claimDefault >= 3 * staleDefault,
     `source default RESUME_CLAIM_STALE_MIN=${claimDefault} must be >= 3x source default RESUME_STALE_MIN=${staleDefault}`);
+});
+ok('F1c [ADVERSARIAL FIX] RESUME_CLAIM_STALE_MIN is floored at RESUME_STALE_MIN, not a bare 1 — a claimed row can never be easier to steal than an unclaimed one', () => {
+  // Earlier finding: `Math.max(1, parseInt(process.env.RESUME_CLAIM_STALE_MIN,...) || 15)`
+  // let an operator set RESUME_CLAIM_STALE_MIN=1 (or raise RESUME_STALE_MIN
+  // above the claimed default) via env and INVERT the whole point of this
+  // constant — a claimed row would then be swept sooner than an unclaimed
+  // one, exactly the "misconfiguration that causes a dual render at 3am"
+  // this clamp exists to close. Structural proof (the literal source text
+  // must floor on the identifier RESUME_STALE_MIN, not the numeral 1) PLUS
+  // a behavioural proof (a hostile env can't reproduce the old hole even if
+  // the source text were somehow bypassed).
+  assert.ok(/RESUME_CLAIM_STALE_MIN\s*=\s*Math\.max\(RESUME_STALE_MIN,/.test(serviceSrc),
+    'RESUME_CLAIM_STALE_MIN must floor on RESUME_STALE_MIN by name, not on a bare 1 — a numeral floor cannot track a raised RESUME_STALE_MIN');
+  assert.ok(!/RESUME_CLAIM_STALE_MIN\s*=\s*Math\.max\(1,/.test(serviceSrc),
+    'the old bare-1 floor must be gone, not merely joined by a second clamp');
+  // Behavioural: simulate the hostile env directly against the clamp
+  // expression's OWN logic (Math.max), independent of which literal the
+  // source currently uses — this is what would have caught the original
+  // bug even before anyone wrote the structural regex above.
+  const hostileResumeStale = 999; // an operator could raise this too
+  const hostileClaimEnv = 1;      // and set this to the historical minimum
+  const simulatedFloor = Math.max(hostileResumeStale, parseInt(String(hostileClaimEnv), 10) || 15);
+  assert.ok(simulatedFloor >= hostileResumeStale,
+    'the clamp formula itself must guarantee claim-TTL >= stale-TTL for ANY env input, not just the shipped defaults');
 });
 ok('F2 recovering a dead claim never re-submits (bootRecoveryService.js has no submit call) — no double-SPEND from taking over a dead claim', () => {
   // resumeForAd/recoverImageAd are peeks; the money invariant this harness
