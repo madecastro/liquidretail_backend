@@ -420,13 +420,96 @@ async function titleAd(ad) {
         // the Ad row itself stays recoverable (its write is owner-scoped and
         // no-ops once the stamp has cleared claimedByWorker).
         if (scriptErr && scriptErr.titlingResumable) {
-          // brandScriptExecutor already stamped draft + titlingResumeState:'pending'.
-          // Also clear titlingNeeded so we don't loop-claim (resume path takes
-          // over from here — same shape as renderer's resumable branch).
-          await Ad.updateOne(
-            { _id: ad._id, claimedByWorker: WORKER_ID },
-            { $set: { titlingNeeded: false, claimedByWorker: null, claimedAt: null } }
-          );
+          // brandScriptExecutor's stampTitlingFailureAndThrow has already
+          // written the ENTIRE ownership handover in ONE $set: status:'draft',
+          // titlingResumeState:'pending', titlingNeeded:false, claim cleared.
+          // titlingResumeService owns the row from here.
+          //
+          // `titlingNeeded:false` USED TO BE THIS WRITE'S JOB, and it could
+          // never do it: the filter below is scoped to
+          // `claimedByWorker: WORKER_ID`, which the stamp nulls in the same
+          // $set that leaves titlingNeeded alone — so this write could not
+          // match, titlingNeeded stayed true next to
+          // titlingResumeState:'pending', and BOTH titler.claimOne (keys on
+          // titlingNeeded) and titlingResumeService (keys on
+          // titlingResumeState) could claim the row. Two Remotion renders on
+          // one already-paid Omni master. The clear now lives in the stamp's
+          // own $set, where it is atomic with the claim release.
+          //
+          // THIS WRITE IS KEPT EXACTLY AS IT WAS. Every field it sets is now
+          // byte-identical to what the stamp sets for the same key
+          // (titlingNeeded:false, claimedByWorker:null, claimedAt:null), so
+          // the two writes CANNOT DISAGREE, and its no-op in the normal case
+          // is the correct outcome rather than a silent failure.
+          //
+          // It still has one job: the stamp's updateOne is wrapped in a
+          // try/catch that only warns, so a transient Mongo error there leaves
+          // the row claimed with titlingNeeded:true — exactly the shape this
+          // filter matches.
+          //
+          // BE PRECISE ABOUT WHAT THAT REPAIR DOES AND DOES NOT DO (pre-existing
+          // either way — this branch is unchanged by the dual-claim fix):
+          //   - stamp write failed AND this one also lost → row keeps its claim
+          //     and titlingNeeded:true, and reclaimStaleTitlerClaims' 20-minute
+          //     claimedAt TTL below recovers it: it releases the claim, after
+          //     which claimOne is the ONLY filter that matches (titlingNeeded
+          //     is true, but titlingResumeState is still null and status is
+          //     still 'rendering', so titlingResumeService cannot see the row).
+          //     Free rework on a paid master, bounded by TITLING_ATTEMPTS_MAX.
+          //
+          //     THIS DEPENDS ON PR #75 (bootRecoveryService, commit c02c7ff),
+          //     WHICH IS AN ANCESTOR OF THIS COMMIT — and it is spelled out
+          //     because it is not obvious and a rebase could silently undo it.
+          //     Before #75, the sentence above was FALSE in the dangerous
+          //     direction: boot recovery sweeps on RESUME_STALE_MIN (5 min) and
+          //     so always reached this row before reclaim's 20, stamping
+          //     status:'draft' + titlingResumeState:'pending' while clearing
+          //     NEITHER titlingNeeded NOR claimedByWorker. titlingResumeService
+          //     then matched immediately, and reclaim releasing the claim did
+          //     not rescue the row — it COMPLETED a dual claim. #75 closes that
+          //     by (a) excluding the titler-handoff shape from the sweep
+          //     entirely (`NOT (titlingNeeded===true AND a real veoVideoUrl)`,
+          //     bootRecoveryService.js ~:221-230) and (b) clearing
+          //     titlingNeeded on its own pending write (~:498).
+          //     ⇒ IF #75 IS EVER REVERTED, OR THIS BRANCH IS REBASED ONTO
+          //     ANYTHING PREDATING c02c7ff, THIS PARAGRAPH GOES BACK TO BEING
+          //     WRONG AND THE DUAL CLAIM REOPENS. Section E of
+          //     scripts/verifyTitlingDualClaim.js runs the REAL exported
+          //     buildRecoverySweepFilter against this exact row so that
+          //     regression is a red test, not a stale comment.
+          //   - stamp write failed but THIS one lands → the row ends up
+          //     status:'rendering', unclaimed, titlingNeeded:false and with NO
+          //     titlingResumeState, so no titling-path owner: not claimOne
+          //     (needs titlingNeeded), not reclaimStaleTitlerClaims (needs a
+          //     claim), not titlingResumeService (needs status:'draft'). It is
+          //     recovered instead by bootRecoveryService's rendering+receipt
+          //     sweep, or re-claimed by renderer.claimOne, whose Atlas re-entry
+          //     is receipt-guarded (shouldResumeAttempt) so it cannot re-bill.
+          //     Widening this $set to stamp status:'draft' +
+          //     titlingResumeState:'pending' would hand it to the titling path
+          //     directly, but doing that safely needs the same
+          //     status:{$in:['rendering','draft']} guard every other terminal
+          //     write here carries — deliberately left out of scope rather than
+          //     shipped unguarded on a money path.
+          // WARN-ONLY, mirroring the stamp's own try/catch. This write was
+          // previously unwrapped, and that asymmetry was harmful precisely
+          // because it sits on the failure path: a Mongo blip here escaped the
+          // inner `catch (scriptErr)`, became titleAd's throw, and processAd's
+          // catch below then stamped status:'failed' + bumpRunCounter('failed')
+          // — converting a RESUMABLE OOM, whose paid master is sitting right
+          // there on renderUrl, into a terminally failed ad and a wrong run
+          // counter. A safety net must not be able to fail the thing it is
+          // protecting. Swallowing here leaves the row claimed with
+          // titlingNeeded:true, which is a recoverable shape (see below);
+          // throwing left it written off, which is not.
+          try {
+            await Ad.updateOne(
+              { _id: ad._id, claimedByWorker: WORKER_ID },
+              { $set: { titlingNeeded: false, claimedByWorker: null, claimedAt: null } }
+            );
+          } catch (netErr) {
+            warn(`titling-failure follow-up write failed for ${shortId} (${netErr.message}) — row left claimed for recovery`);
+          }
           warn(`VIDEO ${label} titling ${scriptErr.titlingFailureKind || 'failed'} ad=${shortId} — paid asset kept, titling left pending`);
           return { earlyReturn: true };
         }
@@ -817,5 +900,15 @@ module.exports = {
   // scripts/lib/miniMongoStub.js's use in verifyTitlingRecoverability.js),
   // not just a regex over the source.
   reclaimStaleTitlerClaims,
-  TITLER_CLAIM_STALE_MIN
+  TITLER_CLAIM_STALE_MIN,
+  // Exported for scripts/verifyTitlingDualClaim.js — same reason
+  // reclaimStaleTitlerClaims is exported above. That harness has to prove
+  // that after a resumable titling failure EXACTLY ONE of the two claimants
+  // (this filter, and titlingResumeService's) can select the row. Asserting
+  // that against a filter the harness re-typed from source would prove
+  // nothing about the filter this file actually sends, so the harness
+  // executes claimOne() against a Mongo-like stub and reads the REAL
+  // recorded filter off the audit trail. Read-only from the harness's point
+  // of view: with an empty stub collection there is nothing to claim.
+  claimOne
 };

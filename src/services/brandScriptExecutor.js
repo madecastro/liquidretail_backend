@@ -2186,6 +2186,14 @@ async function stampTitlingFailureAndThrow(ad, err) {
             claimedByWorker: null,
             claimedAt: null,
             titlingResumeState: null,
+            // CLEARED HERE, atomically with the claim release — see the long
+            // note on the resumable branch below. Terminal means nothing owes
+            // titling any more, so leaving `titlingNeeded:true` behind is
+            // simply untrue state. It also cannot be repaired afterwards by
+            // titler.js's processAd catch (its write is filtered on the
+            // `claimedByWorker` this $set just nulled, so it no-ops) — the
+            // same disagreement the resumable branch had.
+            titlingNeeded: false,
             renderError: {
               message: String(msg).slice(0, 400),
               stage: 'titling',
@@ -2223,6 +2231,46 @@ async function stampTitlingFailureAndThrow(ad, err) {
           // pending, not claimed: we are no longer in-flight, so the sweeper
           // must not wait CLAIM_STALE_MIN.
           titlingResumeState: 'pending',
+          // ── SINGLE-OWNER INVARIANT (money) ────────────────────────────────
+          // `titlingNeeded:false` MUST be in THIS $set, not in a follow-up
+          // write by the caller.
+          //
+          // Two independent claimants read this row and they arbitrate on
+          // different fields with nothing in common:
+          //   titler.claimOne()                 keys on titlingNeeded:true
+          //                                     + claimedByWorker:null
+          //                                     + status:{$in:[rendering,draft]}
+          //   titlingResumeService (arm 1)      keys on titlingResumeState:'pending'
+          //                                     + status:'draft'
+          // Before this line, the resumable stamp wrote status:'draft' +
+          // titlingResumeState:'pending' + claimedByWorker:null while leaving
+          // titlingNeeded:true — which satisfies BOTH filters at once. Neither
+          // claimant's claim write touches the other's arbitrating field
+          // (claimOne sets claimedByWorker only; the resume claim sets
+          // titlingResumeState only), so both can win and run Remotion on the
+          // SAME already-paid ~$0.45-$0.90 Omni master: two ~1.97 GiB render
+          // slots, two Cloudinary uploads, and a last-writer-wins race on the
+          // delivered renderUrl.
+          //
+          // titler.js's catch DID try to clear titlingNeeded afterwards, but
+          // its write is filtered on `claimedByWorker: WORKER_ID` — the very
+          // field this $set nulls one statement earlier — so it could never
+          // match and the dual-claim state persisted until something else
+          // happened to touch the row. Folding the clear into this $set is
+          // what makes the two writes unable to DISAGREE: there is no longer
+          // an interval between "claim released" and "titlingNeeded cleared"
+          // for a second claimant to observe. A repaired filter on the
+          // follow-up write would have narrowed that interval to one await,
+          // not removed it — and a filter loose enough to match the
+          // post-stamp row would also match a row a *fresh* titler claim had
+          // legitimately taken in the meantime, stomping it.
+          //
+          // Deliberately no new schema field: mongoose strict mode silently
+          // drops writes to undeclared paths, and an added Ad.js path would
+          // break verifyModelParity.js's adgen ⊆ backend subset check.
+          // `titlingResumeState` is already the arbitrating field; this line
+          // just stops the OTHER signal contradicting it.
+          titlingNeeded: false,
           renderError: {
             message: String(msg).slice(0, 400),
             stage: 'titling',
