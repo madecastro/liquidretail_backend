@@ -1424,7 +1424,11 @@ Commit `134db56` (PR #61) added three camera-prompt changes in `services/veoProm
 2. Else **`ad.videoPromptRaw`** — **full replacement** of canonical (bypasses `buildVeoPrompt`); byte cap.
 3. Else guidance cascade (`videoPromptGuidance` via `resolvePromptGuidance`) → **prepended** to canonical via `buildVeoPrompt({ operatorPrompt: effectiveGuidance })`.
 
-**Wizard Advanced editor feed:** `GET /api/ads/veo-prompt-scaffold?campaignId=&productId?&platformFormat?&durationSec?` → `buildPromptScaffold` returns `{ prompt, model, aspectRatio, durationSec, byteCap }` (canonical prompt; `media=null`; placeholder product title when no product).
+**Wizard Advanced editor feed:** `GET /api/ads/veo-prompt-scaffold?campaignId=&productId?&platformFormat?&durationSec?` → `buildPromptScaffold` returns `{ prompt, model, aspectRatio, durationSec, byteCap, maxReferenceImages, defaultReferenceCount, referenceDefaults, approximation }`.
+
+⚠️ **`prompt` IS AN APPROXIMATION OF WHAT GETS SUBMITTED, not a copy of it.** This line used to call it "canonical prompt", which read as byte-exact and is how an investigator ended up debugging from a prompt that was never sent (2026-08-27). It IS built by the canonical `buildVeoPrompt` — there is no second builder — but the scaffold runs *before an ad exists*, so it feeds different inputs: `seedHasText: false` and `hasProductReference: true` are **hardcoded**, `media` is `null`, and `layoutInput` / `sourceMedia` / `storyboard` / `seedStyle` / `variantKind` are not passed at all. Measured consequences: the burned-in-text guard block (+283 bytes) can never appear here, and at a 4096-byte cap its absence is why a `Product: ` line can survive in the preview and be dropped from the real submission (`/^Product: /` heads `enforceByteCap`'s `DROP_PRIORITY`). The response now carries an `approximation` block naming every assumed and omitted input; the SPA renders it beside the editor.
+
+**Its prompt text is a frozen invariant** — the destination-less scaffold path is pinned byte-identical by `verifyPostPilotBatch` B14 (see §00 of `CLAUDE.md`), so do NOT "improve" the preview by changing what `buildPromptScaffold` passes to the builder. The exact submitted prompt for a generated ad is at `GET /api/ads/:id/generation-inspector` → `video.submission.prompt`.
 
 ### Reference stack + reframe
 
@@ -1758,6 +1762,43 @@ are several hours old". Nothing was broken in generation; the data was invisible
 and `/:id/ads-detail`), `routes/campaigns.js` (`/ads-summary` `$group`, and its own `/:id/ads-detail`
 — a near-mirror of catalog's that an adversarial review caught still on the old sort), and
 `routes/ads.js` (`GET /api/ads`).
+
+### Coverage counts DELIVERED ads, not attempts (2026-08-27)
+
+**One shared definition: `services/adDeliveryCounts.js`, imported by both `/ads-summary`
+endpoints — never re-implemented per route.** `deliveredExpr()` is the aggregation mirror of
+`adTitlingTruth.isAdHonestlyDelivered`: terminal status (`draft|live` within these pipelines'
+non-archived population) **AND**, for video, `isVideoTitlingSettled`. Parity with the JS function
+is proven by execution against a real mongod, not by reading.
+
+- **The defect:** coverage divided `adCount` (a bare `$sum: 1`) by `TARGET_ADS_PER_PRODUCT`, so a
+  product whose 12 ads had ALL FAILED with zero assets reported `coveragePct: 100` while the same
+  response said `draftCount: 0, liveCount: 0, readyToExport: 0`. `Ad.status` has six values and
+  only `archived` was ever excluded, so `failed`, `queued` and `rendering` all counted as coverage.
+- **Both conjuncts are required.** A status-only cut leaves an untitled video draft (paid master
+  landed, chrome never composited) counting as coverage while `titled: isAdHonestlyDelivered(a)`
+  — projected on ads-**detail** in the same two files — says it is not delivered. Two definitions
+  of delivered on one route is the drift this module exists to prevent, and CLAUDE.md §00's money
+  invariant is *"Untitled is not success"*. `untitledDeliverableCount` reports that population.
+- **In-flight is excluded deliberately** (zero assets too; counting it recreates the same lie for
+  the length of a run) and reported as `inFlightCount` instead.
+- **`adCount` / `adsCreated` are deliberately UNCHANGED** — they count attempts, and "12 ads were
+  created" is true even when all 12 failed. The untruth was calling the product *covered*.
+  Narrowing them too would swap one false statement for another. The outcome split
+  (`deliveredCount` / `failedCount` / `inFlightCount`, `adsDelivered` / `adsFailed` /
+  `adsInFlight`) is returned alongside so a UI can say "12 created · 0 delivered · 12 failed".
+- **This is an alignment, not a reversal.** Coverage shipped in `ed3e6d83` explicitly as a
+  "placeholder formula (adCount / 5)"; the only status rule ever written for it was
+  `$ne: 'archived'`; and that same commit already computed `failedCount` and then never returned
+  or subtracted it. When `9d632297` (#278) later defined *delivered*, it applied it to ads-detail,
+  the run rollup and Meta push — but never to these two aggregations.
+- **SPA note:** `pages/ProductAds` and `pages/Campaigns` both read these fields straight from the
+  server (no client-side coverage derivation), and both `coverageLabel` helpers split the zero case
+  by outcome — a product with 12 failed ads reads **"Nothing delivered"**, not "No ads", which
+  would have been a fresh untruth in the opposite direction.
+
+Pinned by `scripts/verifyTruthfulReporting.js` (group C offline + group D against a real mongod).
+Full write-up: `session.d/2026-08-27_truthful-reporting.md`.
 
 Two things that look like reasonable shortcuts and are **wrong**:
 1. **A compound `.sort({renderedAt:-1, generatedAt:-1})` on `.find()` is NOT equivalent.** BSON sorts

@@ -215,11 +215,20 @@ router.get('/ads-summary', async (req, res) => {
 
     if (!campaigns.length) {
       return res.json({
+        // MUST carry every key the non-empty path returns. A short summary here
+        // makes the response SHAPE depend on whether any campaign exists, so a
+        // consumer reading `adsFailed` gets undefined on an empty brand and a
+        // number otherwise — the kind of inconsistency that turns into a
+        // client-side `?? 0` guard hiding a real absence later.
         summary: {
           totalCampaigns:        0,
           campaignsWithAds:      0,
           campaignCoveragePct:   0,
           adsCreated:            0,
+          adsDelivered:          0,
+          adsFailed:             0,
+          adsInFlight:           0,
+          campaignsAttemptedNoneDelivered: 0,
           adsReadyToExport:      0,
           goodOpportunities:     null
         },

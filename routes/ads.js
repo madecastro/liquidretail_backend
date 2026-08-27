@@ -5120,8 +5120,9 @@ router.get('/:id/generation-inspector', async (req, res) => {
           seedHasText,
           seedHasTextSource,
           seedTextElementCount,
-          renderComputedSeedHasText: guardInPrompt,
-          recordChangedSinceRender
+          promptCarriesSeedTextGuard: guardInPrompt,
+          recordChangedSinceRender,
+          guardMissingAtRender
         } = truth;
 
         seed = {
@@ -5136,10 +5137,11 @@ router.get('/:id/generation-inspector', async (req, res) => {
           // The raw element count, so a decode failure can never again hide a
           // non-empty field behind an empty decoded list.
           seedTextElementCount,
-          // Tri-state on purpose: false means "the render ran buildVeoPrompt
-          // and did NOT emit the guard"; null means "we cannot tell from the
-          // prompt" (none persisted, or a raw override bypassed the builder).
-          renderComputedSeedHasText: guardInPrompt
+          // Tri-state on purpose, and named for what it MEASURES rather than
+          // for an inference: false means "a canonically-built prompt was
+          // persisted and does NOT carry the guard"; null means "the prompt
+          // cannot answer" (none persisted, or it IS a raw override).
+          promptCarriesSeedTextGuard: guardInPrompt
         };
         if (seed.seedHasText) {
           // Name the signal in the message too — an investigator reading only
@@ -5155,14 +5157,27 @@ router.get('/:id/generation-inspector', async (req, res) => {
             message: `Source image has burned-in text. ${basis}. ${detail}. The video model can smear/garble baked-in text when animating (Ken Burns) — this is the usual source of garbled on-screen text, NOT the titling engine (titling is overlaid cleanly downstream).`
           });
         }
-        // A disagreement between the two signals is itself diagnostic: it means
-        // Media.text changed after the render (detect re-ran), so the live
-        // record no longer describes what was submitted. Say so rather than
-        // silently preferring one.
+        // ── BOTH DIRECTIONS OF DISAGREEMENT, each with its own code ─────────
+        // A disagreement between prompt and media record is itself diagnostic.
+        // The first draft of this fix emitted only the first of these while its
+        // own comment claimed disagreements are never silently resolved — which
+        // made the comment false for the reverse case. Adversarial review caught
+        // that; it is the same class of defect as the bug being fixed, so both
+        // directions now speak.
         if (recordChangedSinceRender) {
           out.warnings.push({
             code: 'seed-text-record-changed-since-render',
             message: `The submitted prompt carries the burned-in-text guard, but the seed Media row now records ZERO text elements. Media.text is overwritten wholesale by each detect run (including to [] when its subjects-text stage fails), so the current record does not describe what this render was given. Trust the prompt.`
+          });
+        }
+        if (guardMissingAtRender) {
+          // The more actionable direction: the model was handed text-bearing
+          // pixels with NO instruction to leave that text alone. That is a live
+          // candidate cause of garbled on-screen text in the delivered asset,
+          // not merely a bookkeeping mismatch.
+          out.warnings.push({
+            code: 'seed-text-unguarded-at-render',
+            message: `The seed Media row records ${seedTextElementCount} burned-in text element(s), but the submitted prompt does NOT carry the burned-in-text guard — so the model was given text-bearing source pixels with no instruction to treat that text as locked. Either the text was detected after this render, or seedHasText was false at submit while the media already held detections. This is a candidate cause of garbled on-screen text in the delivered asset; the titling engine is a separate layer.`
           });
         }
       }

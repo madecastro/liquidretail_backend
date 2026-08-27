@@ -474,16 +474,23 @@ router.get('/', async (req, res) => {
 // the /:id route below so static-path matches ('/ads-summary',
 // '/:id/ads-detail') take precedence over the generic '/:id' catch.
 //
-// Coverage is a placeholder formula: min(adCount / TARGET_PER_PRODUCT, 1).
-// Phase 2 will replace this with the proper opportunity scoring engine
-// (fresh UGC × engagement × inverse ad coverage).
+// Coverage is min(deliveredCount / TARGET_PER_PRODUCT, 1) — DELIVERED ads only
+// (draft|live AND, for video, titling settled), never bare Ad rows. It divided
+// `adCount` until 2026-08-27, which reported a product whose 12 ads had all
+// FAILED as 100% covered. The magnitude is still a Phase-2 placeholder — the
+// proper opportunity scoring engine (fresh UGC × engagement × inverse ad
+// coverage) replaces the formula — but WHAT it counts is no longer a
+// placeholder, and must not be widened back to attempts. One shared definition
+// in services/adDeliveryCounts.js; see that header.
 const TARGET_ADS_PER_PRODUCT = 5;
 
 // Single aggregation grouping ads by productId. Brand-scoped, excludes
-// archived. Returns counts by status + the set of distinct campaign IDs
-// + most recent activity (renderedAt, falling back to generatedAt) per
-// product — see services/adRecencyService for why renderedAt is the
-// signal that must be used here.
+// archived. Returns counts by status — including the delivered / failed /
+// in-flight OUTCOME split that coverage is derived from, so a caller can tell
+// "12 created, 0 delivered, 12 failed" from "12 delivered" — plus the set of
+// distinct campaign IDs and most recent activity (renderedAt, falling back to
+// generatedAt) per product — see services/adRecencyService for why renderedAt
+// is the signal that must be used here.
 async function buildAdStatsByProduct(brandObjectId) {
   const rows = await Ad.aggregate([
     { $match: { brandId: brandObjectId, status: { $ne: 'archived' } } },

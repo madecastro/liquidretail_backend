@@ -54,7 +54,7 @@ const {
   resolveSeedTextTruth,
   decodeSeedTextElement,
   seedHasTextFromMedia,
-  renderComputedSeedHasText
+  promptCarriesSeedTextGuard
 } = require(path.join(ROOT, 'services/seedTextTruth'));
 const {
   DELIVERED_STATUSES,
@@ -62,7 +62,9 @@ const {
   FAILED_STATUSES,
   outcomeAccumulators,
   distinctOnDelivered,
-  coveragePctFromDelivered
+  coveragePctFromDelivered,
+  titlingSettledExpr,
+  deliveredExpr
 } = require(path.join(ROOT, 'services/adDeliveryCounts'));
 
 let checks = 0, failures = [];
@@ -172,21 +174,21 @@ check('A5 legacy `.text` / `.value` / bare-string elements still decode',
   });
   check('A6d a real prompt WITHOUT the guard reports false, source none',
     rOff.seedHasText === false && rOff.seedHasTextSource === 'none'
-    && rOff.renderComputedSeedHasText === false);
+    && rOff.promptCarriesSeedTextGuard === false);
 }
 
 // A7 — tri-state. A raw override bypasses buildVeoPrompt, so the guard block's
 // absence proves nothing and must NOT be reported as a computed false.
 {
-  check('A7 raw-prompt override ⇒ renderComputedSeedHasText is null, not false',
-    renderComputedSeedHasText({
+  check('A7 a persisted RAW OVERRIDE ⇒ null, not a confident false',
+    promptCarriesSeedTextGuard({
       veoPrompt: 'some raw prompt with no guard',
       videoPromptRaw: 'some raw prompt with no guard',
       guardLine: SEED_BURNED_IN_TEXT_GUARD_LINE
     }) === null);
   check('A7b no persisted prompt ⇒ null (pre-capture render)',
-    renderComputedSeedHasText({ veoPrompt: '', guardLine: SEED_BURNED_IN_TEXT_GUARD_LINE }) === null
-    && renderComputedSeedHasText({ guardLine: SEED_BURNED_IN_TEXT_GUARD_LINE }) === null);
+    promptCarriesSeedTextGuard({ veoPrompt: '', guardLine: SEED_BURNED_IN_TEXT_GUARD_LINE }) === null
+    && promptCarriesSeedTextGuard({ guardLine: SEED_BURNED_IN_TEXT_GUARD_LINE }) === null);
   // With a raw override, the media signal must still be honoured.
   const r = resolveSeedTextTruth({
     media: { text: [REAL_TEXT_EL('X')] },
@@ -195,6 +197,107 @@ check('A5 legacy `.text` / `.value` / bare-string elements still decode',
   });
   check('A7c raw override still reports seed text from the media record',
     r.seedHasText === true && r.seedHasTextSource === 'seed-media');
+}
+
+// A7e — THE STALE-FIELD HOLE (adversarial review, 2026-08-27). Gating on
+// `videoPromptRaw` merely BEING SET was wrong: regenerate is pass-through and
+// never clears that field, so a wizard-stamped raw prompt followed by a
+// refinement regenerate persists a CANONICAL veoPrompt while the field stays
+// set. A field-based gate returned null, fell back to a possibly-emptied Media
+// record, and reported false — the original lie, one field removed.
+{
+  const brand   = { _id: 'b', name: 'N', brandName: 'N' };
+  const product = { _id: 'p', title: 'Merino Crewneck Sweater' };
+  const canonicalWithGuard = buildVeoPrompt({
+    brand, product, media: null, aspectRatio: '9:16', seedHasText: true,
+    hasProductReference: true, caps: { promptByteCap: 20000 },
+    durationSec: 10, platformFormat: null
+  });
+  const canonicalNoGuard = buildVeoPrompt({
+    brand, product, media: null, aspectRatio: '9:16', seedHasText: false,
+    hasProductReference: true, caps: { promptByteCap: 20000 },
+    durationSec: 10, platformFormat: null
+  });
+  const staleRaw = 'a raw prompt the operator set in the wizard long ago';
+
+  check('A7e stale videoPromptRaw + CANONICAL prompt carrying the guard ⇒ true',
+    promptCarriesSeedTextGuard({
+      veoPrompt: canonicalWithGuard, videoPromptRaw: staleRaw,
+      guardLine: SEED_BURNED_IN_TEXT_GUARD_LINE
+    }) === true,
+    'presence is positive evidence however the prompt was assembled');
+  check('A7f stale videoPromptRaw + CANONICAL prompt WITHOUT the guard ⇒ false, not null',
+    promptCarriesSeedTextGuard({
+      veoPrompt: canonicalNoGuard, videoPromptRaw: staleRaw,
+      guardLine: SEED_BURNED_IN_TEXT_GUARD_LINE
+    }) === false,
+    'a stale field must not blind the check — this is the hole the prefix test closes');
+  // And the genuine override still yields null, including the truncated form
+  // enforceRawByteCap produces (the persisted prompt is a PREFIX of the field).
+  check('A7g a genuine raw override ⇒ null (exact)',
+    promptCarriesSeedTextGuard({
+      veoPrompt: staleRaw, videoPromptRaw: staleRaw,
+      guardLine: SEED_BURNED_IN_TEXT_GUARD_LINE
+    }) === null);
+  check('A7h a genuine raw override ⇒ null (byte-cap TRUNCATED prefix)',
+    promptCarriesSeedTextGuard({
+      veoPrompt: staleRaw.slice(0, 20), videoPromptRaw: staleRaw,
+      guardLine: SEED_BURNED_IN_TEXT_GUARD_LINE
+    }) === null);
+}
+
+// A9 — THE REVERSE DISAGREEMENT. The first draft of this fix reported only
+// prompt-true/media-false while its own comment claimed disagreements are never
+// silently resolved, which made the comment false for the other direction.
+// prompt-false + media-true is the MORE actionable case: the model was handed
+// text-bearing pixels with no instruction to leave the text alone.
+{
+  const brand   = { _id: 'b', name: 'N', brandName: 'N' };
+  const product = { _id: 'p', title: 'Merino Crewneck Sweater' };
+  const noGuard = buildVeoPrompt({
+    brand, product, media: null, aspectRatio: '9:16', seedHasText: false,
+    hasProductReference: true, caps: { promptByteCap: 20000 },
+    durationSec: 10, platformFormat: null
+  });
+  const r = resolveSeedTextTruth({
+    media: { _id: 'm', text: [REAL_TEXT_EL('SALE')] },
+    ad: { veoPrompt: noGuard },
+    guardLine: SEED_BURNED_IN_TEXT_GUARD_LINE
+  });
+  check('A9 prompt says NO guard but the seed HAS text ⇒ guardMissingAtRender',
+    r.guardMissingAtRender === true, JSON.stringify(r));
+  check('A9b and seedHasText is still true (the seed really does have text)',
+    r.seedHasText === true && r.seedHasTextSource === 'seed-media');
+  check('A9c a prompt-false + media-false ad raises NEITHER disagreement flag',
+    (() => {
+      const q = resolveSeedTextTruth({
+        media: { _id: 'm', text: [] }, ad: { veoPrompt: noGuard },
+        guardLine: SEED_BURNED_IN_TEXT_GUARD_LINE
+      });
+      return q.guardMissingAtRender === false && q.recordChangedSinceRender === false;
+    })());
+  check('A9d the two disagreement flags are mutually exclusive by construction',
+    (() => {
+      const shapes = [
+        { text: [] }, { text: [REAL_TEXT_EL('X')] }
+      ];
+      const prompts = [noGuard, buildVeoPrompt({
+        brand, product, media: null, aspectRatio: '9:16', seedHasText: true,
+        hasProductReference: true, caps: { promptByteCap: 20000 },
+        durationSec: 10, platformFormat: null
+      }), ''];
+      for (const media of shapes) for (const veoPrompt of prompts) {
+        const q = resolveSeedTextTruth({ media, ad: { veoPrompt }, guardLine: SEED_BURNED_IN_TEXT_GUARD_LINE });
+        if (q.guardMissingAtRender && q.recordChangedSinceRender) return false;
+      }
+      return true;
+    })());
+  // The route must actually EMIT the second warning, not just compute the flag.
+  const routeSrc = fs.readFileSync(path.join(ROOT, 'routes/ads.js'), 'utf8');
+  check('A9e routes/ads.js emits a seed-text-unguarded-at-render warning',
+    /seed-text-unguarded-at-render/.test(routeSrc));
+  check('A9f and still emits the record-changed one',
+    /seed-text-record-changed-since-render/.test(routeSrc));
 }
 
 // A8 — the route must IMPORT the shared helper, not re-implement it. This is
@@ -452,6 +555,130 @@ const MONGO = process.env.TRUTHFUL_VERIFY_MONGODB_URI;
       JSON.stringify({ delivered: delivered.map(String), attempted: attempted.map(String) }));
     check('D4b while productsWithAds still counts both (the attempted set)',
       attempted.length === 2);
+
+    // D4c — distinctOnDelivered must use the FULL predicate, titling included.
+    // Without this the mutation "distinctOnDelivered reverts to status-only"
+    // passed the whole suite: D4 above only exercises draft-vs-failed, which a
+    // status-only predicate gets right. An untitled video draft is the case
+    // that separates them, and it is exactly the population the fix is about.
+    const C2 = new mongoose.Types.ObjectId();
+    const pUntitled = new mongoose.Types.ObjectId();
+    const pTitled   = new mongoose.Types.ObjectId();
+    await Row.insertMany([
+      // Paid master landed, chrome never composited — status says draft.
+      { brandId: B, campaignId: C2, productId: pUntitled, status: 'draft', kind: 'video',
+        titlingResumeState: 'claimed', renderUrl: 'u1', veoVideoUrl: 'u1' },
+      // Genuinely finished video (delivered asset differs from the raw master).
+      { brandId: B, campaignId: C2, productId: pTitled, status: 'draft', kind: 'video',
+        titlingResumeState: null, renderUrl: 'titled.mp4', veoVideoUrl: 'master.mp4' }
+    ]);
+    const [c2row] = await Row.aggregate([
+      { $match: { brandId: B, campaignId: C2, status: { $ne: 'archived' } } },
+      { $group: {
+          _id: '$campaignId',
+          productsWithAds:   { $addToSet: '$productId' },
+          productsDelivered: distinctOnDelivered('$productId'),
+          ...outcomeAccumulators()
+      } }
+    ]).toArray();
+    const c2Delivered = (c2row.productsDelivered || []).filter(Boolean).map(String);
+    check('D4c distinctOnDelivered EXCLUDES an untitled video draft (full predicate, not status-only)',
+      c2Delivered.length === 1 && c2Delivered[0] === String(pTitled),
+      JSON.stringify({ delivered: c2Delivered, wantOnly: String(pTitled),
+        untitled: String(pUntitled), row: c2row }));
+    check('D4d and both products still count as attempted',
+      (c2row.productsWithAds || []).filter(Boolean).length === 2);
+
+    // ── D5. TITLING PARITY: the aggregation must agree with the JS function ──
+    //
+    // THE POINT OF THIS CHECK. `deliveredExpr()` is an aggregation mirror of
+    // adTitlingTruth.isAdHonestlyDelivered. Two definitions of "delivered" in
+    // one route is the drift this whole module exists to prevent, so agreement
+    // is proven by running BOTH over the same rows — mongod for the expression,
+    // the real imported JS function for the predicate — and demanding they
+    // match on every one. A reading-based argument would not have caught the
+    // status-only first draft.
+    const { isAdHonestlyDelivered } = require(path.join(ROOT, 'services/adTitlingTruth'));
+
+    const STAGES = [
+      null, '', 'no titling (no brand)', 'NO TITLING (no chrome configured)',
+      'titling', 'render', 'no titling really', 'xno titling ('
+    ];
+    const matrix = [];
+    for (const status of ['queued', 'rendering', 'draft', 'live', 'failed']) {
+      for (const kind of ['video', 'image']) {
+        for (const titlingResumeState of [null, 'pending', 'claimed']) {
+          for (const [renderUrl, veoVideoUrl] of [
+            [null, null], ['', ''], ['u1', null], ['u1', ''],
+            ['u1', 'u1'], ['u1', 'u2'], [null, 'u2']
+          ]) {
+            for (const renderStage of STAGES) {
+              matrix.push({ status, kind, titlingResumeState, renderUrl, veoVideoUrl, renderStage });
+            }
+          }
+        }
+      }
+    }
+    const Par = mongoose.connection.collection('parityrows');
+    // Stamp an index so we can join mongod's verdict back to the JS one.
+    const docs = matrix.map((m, i) => ({ ...m, i }));
+    await Par.insertMany(docs);
+    const verdicts = await Par.aggregate([
+      { $project: { i: 1, delivered: deliveredExpr(), titled: titlingSettledExpr() } }
+    ]).toArray();
+    const byIndex = new Map(verdicts.map(v => [v.i, v]));
+
+    let mismatches = [];
+    for (const d of docs) {
+      const v = byIndex.get(d.i);
+      const jsDelivered = isAdHonestlyDelivered(d);
+      // isAdHonestlyDelivered admits 'archived'; these pipelines exclude it
+      // from the population, so within this matrix (no archived rows) the two
+      // must agree exactly.
+      if (!!v.delivered !== !!jsDelivered) {
+        mismatches.push({ ...d, mongo: !!v.delivered, js: !!jsDelivered });
+      }
+    }
+    check(`D5 aggregation matches isAdHonestlyDelivered on all ${docs.length} ad shapes`,
+      mismatches.length === 0,
+      mismatches.length
+        ? `${mismatches.length} mismatch(es), first 3: ${JSON.stringify(mismatches.slice(0, 3))}`
+        : '');
+    // Prove the matrix is not vacuous: it must contain BOTH verdicts, and must
+    // actually exercise the untitled-draft case that motivated the fix.
+    const anyDelivered = docs.some(d => isAdHonestlyDelivered(d));
+    const anyNot       = docs.some(d => !isAdHonestlyDelivered(d));
+    check('D5b the parity matrix contains both delivered and not-delivered rows',
+      anyDelivered && anyNot);
+    const untitledDraft = { status: 'draft', kind: 'video', titlingResumeState: 'claimed',
+      renderUrl: 'u1', veoVideoUrl: 'u1', renderStage: null };
+    const [ud] = await Par.aggregate([
+      { $match: { status: 'draft', kind: 'video', titlingResumeState: 'claimed',
+                  renderUrl: 'u1', veoVideoUrl: 'u1', renderStage: null } },
+      { $project: { delivered: deliveredExpr() } }
+    ]).toArray();
+    check('D5c THE MOTIVATING CASE: an untitled video draft is NOT delivered',
+      ud && ud.delivered === false && isAdHonestlyDelivered(untitledDraft) === false,
+      `mongo=${ud && ud.delivered} js=${isAdHonestlyDelivered(untitledDraft)}`);
+    // ...and that a status-only predicate WOULD have called it delivered, which
+    // is what makes D5c a real check rather than a tautology.
+    check('D5d and a status-only predicate would have wrongly called it delivered',
+      DELIVERED_STATUSES.includes(untitledDraft.status));
+
+    // D6 — the untitled population is reported, not merely excluded.
+    const P4 = new mongoose.Types.ObjectId();
+    await Row.insertMany([
+      { brandId: B, productId: P4, status: 'draft', kind: 'video',
+        titlingResumeState: 'claimed', renderUrl: 'u1', veoVideoUrl: 'u1' },
+      { brandId: B, productId: P4, status: 'draft', kind: 'image' }
+    ]);
+    const [urow] = await Row.aggregate([
+      { $match: { brandId: B, productId: P4, status: { $ne: 'archived' } } },
+      { $group: { _id: '$productId', adCount: { $sum: 1 }, ...outcomeAccumulators() } }
+    ]).toArray();
+    check('D6 mongod: untitled video draft ⇒ delivered 1 (the image), untitledDeliverable 1',
+      urow.deliveredCount === 1 && urow.untitledDeliverableCount === 1 && urow.adCount === 2,
+      JSON.stringify(urow));
 
     await mongoose.connection.dropDatabase();
     await mongoose.disconnect();
