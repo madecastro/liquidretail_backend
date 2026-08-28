@@ -77,10 +77,11 @@ const PLATFORM_FORMATS = {
     // re-titled for the new frame — no second generation, so no second charge.
     // 1080x1920 centre-crops to 1080x1350 (4:5) and 1080x1080 (1:1), both of which
     // sit inside the 204px safe bands, so nothing meaningful is lost.
-    // NOTE: `companions` is DEAD data (zero consumers as of 2026-08-01). The live
-    // video derivation intent is META_VIDEO_FANOUT + Phase 3 derivation, not this
-    // field. Kept for back-compat with any external reader of the table shape.
-    companions:  ['meta_feed_4_5', 'meta_feed_1_1'],
+    // The live video derivation intent is META_VIDEO_FANOUT + Phase 3 derivation.
+    // (A `companions` field used to sit here declaring the same pair for a cheaper
+    // static-crop plan that was abandoned — see the fanout comment near
+    // META_STATIC_FANOUT below. Deleted 2026-08-28 as confirmed dead data, zero
+    // reads anywhere in the repo.)
     chromeStyleHints: ['ig_reels', 'tiktok', 'yt_shorts', 'editorial'],
     creativeBrief:
       'Vertical Reels on Instagram + Facebook. Full-screen, fast-paced, sound-on by default. ' +
@@ -99,10 +100,9 @@ const PLATFORM_FORMATS = {
     canvas:       { width: 1000, height: 1778 },
     deliveryDims: { width: 1080, height: 1920 },
     safeArea:     { top: 250, bottom: 250 },  // IG Stories: top creator chip + bottom reply input
-    // Same 9:16 master, same cheap-crop companions. Stories reserves MORE than
-    // Reels (250 vs 204), so a crop that is safe here is safe for Reels too.
-    // NOTE: `companions` is DEAD data — see meta_reels_9_16.
-    companions:  ['meta_feed_4_5', 'meta_feed_1_1'],
+    // Same 9:16 master. Stories reserves MORE than Reels (250 vs 204), so a
+    // crop that is safe here is safe for Reels too. (Same removed `companions`
+    // field as meta_reels_9_16 — see that entry's comment.)
     chromeStyleHints: ['ig_reels', 'editorial'],
     creativeBrief:
       'Vertical IG Stories. Full-screen, 5–15s per slide, viewers tap-through or swipe-away ' +
@@ -461,7 +461,7 @@ function canonicalFormatList(keys) {
 //   - any coming_soon entry — never generatable.
 //
 // EACH ENTRY IS A SEPARATE BILLABLE GENERATION, and that is not an oversight.
-// The `companions: [...]` fields still declared on the 9:16 formats describe an
+// The 9:16 formats used to declare a `companions: [...]` field describing an
 // abandoned cheaper plan: render one 9:16 master and centre-crop it to 4:5 and
 // 1:1 ("a cheap crop and titling"), no second charge. That worked only while
 // copy was composited by us AFTER the crop. The direct_image pipeline has the
@@ -470,6 +470,9 @@ function canonicalFormatList(keys) {
 // generation, typeset for its own safe box — verified against the per-surface
 // geometry in services/staticAdIntents.js. Do not "optimise" this back into a
 // crop without first moving text compositing back out of the model.
+// (`companions` itself was deleted 2026-08-28 — it had zero reads anywhere in
+// the repo; this comment's reasoning for why a crop plan doesn't work still
+// applies and is why the field was never revived rather than fixed.)
 const META_STATIC_FANOUT = ['meta_feed_1_1', 'meta_feed_4_5', 'meta_stories_9_16'];
 
 // Meta VIDEO derivation set. INTENT ONLY in this pass (Phase 3 builds the
