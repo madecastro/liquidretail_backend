@@ -258,6 +258,23 @@ seed('src/services/progressService.js', {
     };
   }
 });
+// Receipt-peek + cost-reconcile for the reclaim-only MONEY gate
+// (fix/regenerate-lease-expiry). Stubbed for the same reason as every other
+// provider boundary above: requiring the REAL atlasVideoService.js pulls in
+// models/Campaign.js, which needs a full mongoose.Schema — this harness's
+// Module._load override only stubs mongoose.Types.ObjectId, so the real file
+// would crash at require time, not call time. None of this suite's scenarios
+// set regenerationRequest.priorVeoPredictionSetAt, so hasFreshReceipt is
+// always false and none of these should ever actually be CALLED; throw loudly
+// if a future scenario ever reaches this branch unstubbed.
+seed('src/services/atlasVideoService.js', {
+  resumeForAd: async () => { throw new Error('atlasVideoService.resumeForAd must not run in the in-flight-gate matrix'); },
+  reconcileVideoCostFromTerminal: () => { throw new Error('atlasVideoService.reconcileVideoCostFromTerminal must not run in the in-flight-gate matrix'); },
+  resolveFailureCostReconcile: () => { throw new Error('atlasVideoService.resolveFailureCostReconcile must not run in the in-flight-gate matrix'); }
+});
+seed('src/services/costTracker.js', {
+  reconcileCost: () => { throw new Error('costTracker.reconcileCost must not run in the in-flight-gate matrix'); }
+});
 
 const trsPath = require.resolve(path.join(ROOT, 'src/services/titlingResumeService.js'));
 const regenPath = require.resolve(path.join(ROOT, 'src/services/adRegenerateService.js'));
@@ -514,7 +531,7 @@ async function main() {
 
   console.log('\n── B: runClaimedRegeneration() executed for real (LIVE path) ──');
 
-  await check('B1 execute-time .select() argument contains every field inFlightRefusal reads', async () => {
+  await check('B1 execute-time .select() argument contains every field inFlightRefusal reads, plus the receipt baseline', async () => {
     await runClaimed(baseAd({ status: 'rendering', renderUrl: null }), { kind: 'image' });
     const arg = adStore.lastSelectArg;
     assert.ok(arg != null, 'Ad.findById().select() was never called');
@@ -522,6 +539,13 @@ async function main() {
     for (const field of ['status', 'titlingResumeState', 'veoVideoUrl', 'renderUrl']) {
       assert.ok(text.includes(field), `select argument ${JSON.stringify(arg)} is missing ${field}`);
     }
+    // veoPredictionId now legitimately rides along on this SAME query
+    // (fix/regenerate-lease-expiry, adRegenerateService.js ~:1040-1044) so the
+    // reclaim receipt gate judges fresh database state without an extra round
+    // trip. This is a deliberate addition, not a leak — see B2's canary below,
+    // which was re-pointed at a field that is genuinely never selected.
+    assert.ok(text.includes('veoPredictionId'),
+      `select argument ${JSON.stringify(arg)} is missing veoPredictionId — the receipt-gate baseline read would silently go stale`);
   });
 
   await check('B2 stub honours the projection — unselected field comes back undefined', async () => {
@@ -529,7 +553,12 @@ async function main() {
       status: 'rendering',
       renderUrl: null,
       canaryField: 'MUST_NOT_LEAK',
-      veoPredictionId: 'pred-must-not-leak'
+      // NOT veoPredictionId — PR fix/regenerate-lease-expiry deliberately
+      // added that to the execute-time select (see B1) so it legitimately
+      // rides along now. A field genuinely absent from every select list
+      // this harness exercises is still the right canary for "did the stub
+      // silently start returning the whole doc".
+      unselectedCanaryField2: 'MUST_ALSO_NOT_LEAK'
     }), { kind: 'image' });
     const projected = adStore.lastProjected;
     assert.ok(projected && typeof projected === 'object', 'no projected doc captured');
@@ -537,8 +566,8 @@ async function main() {
     assert.strictEqual(projected.canaryField, undefined, 'unselected canaryField leaked through — stub is not honouring .select()');
     assert.ok(!Object.prototype.hasOwnProperty.call(projected, 'canaryField'),
       'unselected canaryField is present on the projected doc');
-    assert.ok(!Object.prototype.hasOwnProperty.call(projected, 'veoPredictionId'),
-      'unselected veoPredictionId leaked through — a future dropped select field would still pass');
+    assert.ok(!Object.prototype.hasOwnProperty.call(projected, 'unselectedCanaryField2'),
+      'unselected unselectedCanaryField2 leaked through — a future dropped select field would still pass');
     assert.ok(Object.prototype.hasOwnProperty.call(projected, 'status'));
     assert.ok(Object.prototype.hasOwnProperty.call(projected, 'titlingResumeState')
       || projected.titlingResumeState === undefined);

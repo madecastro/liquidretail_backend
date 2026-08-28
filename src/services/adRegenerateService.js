@@ -49,9 +49,38 @@ const directImage           = require('./directImageRenderService');
 const { resolveDeriveFromMaster } = require('./campaignAdsGenerationService');
 const { isUgcFirstSeedingEnabled } = require('./seededUniverseService');
 const ugcVideoPipeline             = require('./ugcVideoPipeline');
+// Receipt peek for the reclaim path ONLY (runClaimedRegeneration's receipt
+// gate). Required DIRECTLY off atlasVideoService, not through videoRouter,
+// because videoRouter deliberately exports only generateForAd /
+// prepareStoryboard / activeProvider — the same coupling shape
+// bootRecoveryService.js already uses for exactly this purpose. resumeForAd is
+// a free GET over an existing prediction id and CANNOT submit; that is its
+// entire reason to exist. Nothing here calls generateForAd — the only
+// generateForAd on any regenerate path remains runVideoFull's frozen
+// allowResume:false literal.
+const {
+  resumeForAd,
+  reconcileVideoCostFromTerminal,
+  resolveFailureCostReconcile
+} = require('./atlasVideoService');
+const { reconcileCost } = require('./costTracker');
+// Titling handoff for a recovered master — same sentinel pair
+// bootRecoveryService stamps, so the two writers cannot drift.
+const {
+  STATE_PENDING:  TITLING_STATE_PENDING,
+  TITLING_PENDING,
+  fallbackPosterUrl
+} = require('./titlingResumeService');
 
 const HISTORY_CAP   = 5;
 const DAILY_CAP     = Math.max(1, parseInt(process.env.REGENERATE_DAILY_CAP, 10) || 10);
+// Ceiling on regenerateConsumer arm-2 reclaims, enforced in
+// runClaimedRegeneration BEFORE any provider call. Duplicated there with the
+// same env parse (importing across would be a require cycle). Today's
+// stuck-forever claim costs $0 extra; a lease that reclaimed forever would
+// bill a fresh submit every lease interval. This ceiling is what keeps the
+// lease strictly better than the status quo on money.
+const MAX_RECLAIMS  = Math.max(1, parseInt(process.env.ADGEN_REGEN_MAX_RECLAIMS, 10) || 2);
 
 // ── Video prompt override lengths on regenerate ────────────────────────
 // Same product-policy caps as the wizard body parser (routes/ads.js
@@ -1005,8 +1034,14 @@ async function runClaimedRegeneration(ad, req = {}) {
   // silent no-op that still prints green. Pinned by group B of
   // scripts/verifyRegenerateInFlightGate.js, which captures the select string
   // at runtime and honours the projection.
+  //
+  // veoPredictionId also rides along on this EXISTING query (no extra round
+  // trip) so the receipt gate below judges FRESH database state. Reading it
+  // off the in-memory claimed doc instead would widen the still-alive-worker
+  // race: a reclaimed row whose original worker submitted after the
+  // reclaim's findOneAndUpdate would still look receipt-free here.
   const staleCheck = await Ad.findById(adId)
-    .select(`metaSyncStatus platformFormat deriveFromMaster ${IN_FLIGHT_SELECT}`)
+    .select(`metaSyncStatus platformFormat deriveFromMaster veoPredictionId ${IN_FLIGHT_SELECT}`)
     .lean();
   if (staleCheck?.metaSyncStatus === 'synced') {
     console.log(`🔀 regenerate-consumer[ad=${adId}]: refused at execute time — exported to Meta while queued`);
@@ -1033,6 +1068,254 @@ async function runClaimedRegeneration(ad, req = {}) {
   const inFlight = inFlightRefusal(staleCheck);
   if (inFlight) {
     await unwindInFlightRefusal(adId, startedAt, inFlight);
+    return;
+  }
+
+  const reclaimCount = Number(req.reclaimCount || 0);
+
+  // ⚠️ MONEY — DEFENCE IN DEPTH against claimOne arm 2's baseline predicate
+  // drifting away from this gate. Arm 2's filter already refuses to lease a row
+  // with no baseline; if that predicate is ever weakened, a reclaimed row would
+  // arrive here unjudgeable and fall through to a fresh billable submit. Fail
+  // closed instead, loudly.
+  if (reclaimCount > 0 && !req.priorVeoPredictionSetAt) {
+    const error =
+      'Regenerate was reclaimed after a lease expiry but carries no receipt baseline, ' +
+      'so it cannot be proven safe to resubmit — refusing. Needs manual review.';
+    console.error(`❌ regenerate-consumer[ad=${adId}]: ${error}`);
+    await markComplete(adId, { status: 'failed', durationMs: Date.now() - startedAt, error });
+    try {
+      require('./alertService').notifyAsync({
+        level: 'error',
+        title: 'Regenerate reclaimed with no receipt baseline — not resubmitting',
+        key:   `regenerate-no-baseline:${adId}`,
+        fields: { adId, kind, reclaimCount }
+      });
+    } catch (alertErr) {
+      console.warn(`🔁 regenerate[ad=${adId}]: no-baseline alert failed — ${alertErr.message}`);
+    }
+    return;
+  }
+
+  // ── MONEY — RECEIPT GATE (reclaim-only; never a generateForAd resume) ──
+  // A regenerate always runs on an ad that already holds a previously-completed
+  // video, so Ad.veoPredictionId is essentially ALWAYS populated before a
+  // regenerate begins — it holds the OLD prediction. "A receipt exists" cannot
+  // mean "this attempt paid for something": resuming on that basis would poll
+  // the OLD completed prediction, return the OLD video, and report success
+  // while handing the operator back the exact video they wanted replaced. That
+  // is why runVideoFull's allowResume:false literal is frozen (commit 2f99218 /
+  // PR #40, pinned by scripts/verifyVideoResumeFromReceipt.js C2) and why this
+  // gate does NOT widen it — the check lives here, on the reclaim path, which
+  // is the only place a stale-but-genuine receipt can exist.
+  //
+  // claimOne arm 1 snapshotted veoPredictionId at the FIRST claim, before that
+  // attempt could touch it. A NEW id — unequal to that baseline, and only when
+  // the baseline was actually captured — is the ONLY positive proof that the
+  // abandoned attempt minted its own Atlas receipt. Anything else falls through
+  // to today's dispatch, byte-for-byte unchanged (crash-before-submit, every
+  // static regenerate, every row with no baseline).
+  const currentPredictionId = staleCheck?.veoPredictionId ?? null;
+  const hasFreshReceipt = kind === 'video'
+    && !!req.priorVeoPredictionSetAt
+    && !!currentPredictionId
+    && String(currentPredictionId) !== String(req.priorVeoPredictionId || '');
+
+  if (hasFreshReceipt) {
+    // resumeForAd → peekPrediction: one free GET, structurally incapable of
+    // submitting. Pass the FRESH receipt, not the claimed doc's stale copy.
+    let peek;
+    try {
+      peek = await resumeForAd({ ad: { veoPredictionId: currentPredictionId } });
+    } catch (peekErr) {
+      console.warn(
+        `🔁 regenerate[ad=${adId}]: resumeForAd threw on receipt ${currentPredictionId} — ${peekErr.message} ` +
+        '(failing closed: not submitting, not completing; the next lease expiry re-peeks)'
+      );
+      return;
+    }
+
+    if (peek.state === 'done' && peek.videoUrl) {
+      // ⚠️ MONEY — WE OWN A PAID MASTER. The invariant this branch exists to
+      // hold is "never submit again", and that is satisfied by returning here.
+      //
+      // WHAT THIS DELIBERATELY DOES NOT DO, after adversarial review (both
+      // passes flagged it): it does not overwrite renderUrl / posterUrl and does
+      // not hand off to titling. peek.videoUrl is Atlas's raw outputs[0] URL.
+      // The normal path never persists that — generateForAd downloads it and
+      // mirrors it to Cloudinary before it ever reaches the Ad doc, and
+      // resumeForAd is documented as NOT doing that. So writing it to renderUrl
+      // would replace a stable Cloudinary asset with a provider URL that
+      // expires, on an ad that already has a perfectly good render. It would
+      // also ship untitled: titlingResumeService.buildResumeFilter requires
+      // status:'draft', and regenerate never writes Ad.status, so a live ad
+      // would never auto-title and would silently lose its chrome and its QC.
+      //
+      // veoVideoUrl IS stamped, because that is the provenance trail for the
+      // prediction we paid for, and it is what makes the recovery actionable.
+      // Collecting the asset properly (download + Cloudinary mirror + titling)
+      // is a real follow-up, not something to improvise on a money path.
+      console.log(
+        `🔁 regenerate[ad=${adId}]: receipt ${peek.predictionId} is DONE — recording the paid master, ` +
+        'NOT resubmitting and NOT overwriting the existing render (needs collection)'
+      );
+      try {
+        await Ad.updateOne(
+          { _id: adId, regenerateClaimedByWorker: ad.regenerateClaimedByWorker || null },
+          { $set: { veoVideoUrl: peek.videoUrl, updatedAt: new Date() } }
+        );
+      } catch (stampErr) {
+        console.warn(
+          `🔁 regenerate[ad=${adId}]: could not record the recovered master — ${stampErr.message}`
+        );
+      }
+      reconcileVideoCostFromTerminal(peek.predictionId, { price: peek.price ?? null });
+      // The alert IS the handoff. Deliberately not markComplete'd: completing
+      // would null regenerationRequest (the baseline with it) and the claim,
+      // making the paid master unrecoverable by any later pass. Leaving the row
+      // claimed means the lease re-peeks it, and the reclaim ceiling eventually
+      // terminals it with this same alert already on the record.
+      try {
+        require('./alertService').notifyAsync({
+          level: 'warn',
+          title: 'Regenerate recovered a PAID video master — needs collection',
+          key:   `regenerate-master-needs-collection:${adId}:${peek.predictionId}`,
+          fields: {
+            adId, kind, predictionId: peek.predictionId,
+            atlasVideoUrl: peek.videoUrl,
+            price: peek.price ?? null,
+            reclaimCount,
+            note: 'not resubmitted; renderUrl left intact because the Atlas URL is unmirrored and expires'
+          }
+        });
+      } catch (alertErr) {
+        console.warn(`🔁 regenerate[ad=${adId}]: needs-collection alert failed — ${alertErr.message}`);
+      }
+      return;
+    }
+
+    if (peek.state === 'processing') {
+      // Paid and STILL RENDERING. Do not submit, and deliberately do NOT
+      // markComplete — that clears regenerationRequest (the baseline with it)
+      // and would abandon a live paid render. Leave the row; the next lease
+      // expiry re-peeks, bounded by MAX_RECLAIMS.
+      console.log(
+        `🔁 regenerate[ad=${adId}]: receipt ${peek.predictionId} is still PROCESSING — ` +
+        `not submitting, not completing; next lease expiry re-peeks (reclaimCount=${reclaimCount})`
+      );
+      return;
+    }
+
+    // peekPrediction spreads confirmedCharge(data), which returns
+    // { charged, priceUsd } — NOT { chargeConfirmed, chargePriceUsd }. Reading
+    // the wrong names here silently disables this branch (undefined === false
+    // is false), which would terminal-fail every genuinely retryable render.
+    if (peek.state === 'failed' && peek.charged === false) {
+      // Atlas's own settled record confirms NO price: genuinely unbilled, so a
+      // fresh submit is safe. Correct the ledger first, then fall through to
+      // today's dispatch — which still submits via runVideoFull's frozen
+      // allowResume:false.
+      console.log(
+        `🔀 regenerate[ad=${adId}]: receipt ${peek.predictionId} FAILED UNBILLED ` +
+        `(charged=false, policy=${peek.policy || 'n/a'}) — falling through to a fresh submit`
+      );
+      const reconcile = resolveFailureCostReconcile({
+        chargeConfirmed: peek.charged, chargePriceUsd: peek.priceUsd
+      });
+      if (reconcile) {
+        reconcileCost({
+          providerRequestId: peek.predictionId,
+          costUsd:           reconcile.costUsd,
+          costSource:        reconcile.costUsd === 0 ? 'none' : 'actual'
+        }).catch((e) => console.warn(`🔁 regenerate[ad=${adId}]: cost reconcile failed — ${e.message}`));
+      }
+      // fall through to the normal dispatch below
+    } else if (peek.state === 'failed') {
+      // charged === true, or null/undefined (including the completedNoOutput
+      // shape, which spreads no charge fields at all). UNKNOWN IS TREATED AS
+      // CHARGED — this repo's standing rule: a non-charge may only be asserted
+      // from a confirmed price. No submit.
+      const chargeState = String(peek.charged);
+      const error =
+        `The previous regenerate attempt's Atlas prediction ${peek.predictionId} failed with ` +
+        `charged=${chargeState}${peek.policy ? ` (policy ${peek.policy})` : ''}` +
+        `${peek.message ? ` — ${peek.message}` : ''}. Not resubmitting.`;
+      console.error(`❌ regenerate[ad=${adId}]: ${error}`);
+      const reconcile = resolveFailureCostReconcile({
+        chargeConfirmed: peek.charged, chargePriceUsd: peek.priceUsd
+      });
+      if (reconcile) {
+        reconcileCost({
+          providerRequestId: peek.predictionId,
+          costUsd:           reconcile.costUsd,
+          costSource:        reconcile.costUsd === 0 ? 'none' : 'actual'
+        }).catch(() => {});
+      }
+      await markComplete(adId, { status: 'failed', durationMs: Date.now() - startedAt, error });
+      try {
+        require('./alertService').notifyAsync({
+          level: 'error',
+          title: 'Regenerate: paid prediction failed — not resubmitting',
+          key:   `regenerate-receipt-failed:${adId}:${peek.predictionId}`,
+          fields: {
+            adId, kind, predictionId: peek.predictionId, charged: chargeState,
+            policy: peek.policy || null, message: peek.message || null, reclaimCount
+          }
+        });
+      } catch (alertErr) {
+        console.warn(`🔁 regenerate[ad=${adId}]: receipt-failed alert failed — ${alertErr.message}`);
+      }
+      return;
+    } else {
+      // 'unknown' (a transport error told us nothing) or an unclassifiable
+      // shape. FAIL CLOSED: no submit, no markComplete. The next bounded
+      // reclaim re-peeks.
+      console.warn(
+        `🔁 regenerate[ad=${adId}]: receipt peek state=${peek.state || 'n/a'}` +
+        `${peek.message ? ` (${peek.message})` : ''} — failing closed: not submitting, ` +
+        `not completing; next lease expiry re-peeks (reclaimCount=${reclaimCount})`
+      );
+      return;
+    }
+  }
+
+  // ── MONEY — BOUNDED RECLAIM CEILING (gates the SUBMIT, not the COLLECT) ─
+  // Reached on exactly the two routes that go on to spend money: a reclaim with
+  // no proven-fresh receipt, and a reclaim whose receipt Atlas confirmed was
+  // never billed. A lease that reclaimed forever would bill a fresh submit every
+  // ADGEN_REGEN_CLAIM_STALE_MIN indefinitely, so this ceiling is what keeps
+  // lease expiry strictly better than the status quo on money, and turns a
+  // crash-looping row into a bounded, loud, terminal one.
+  //
+  // DELIBERATELY AFTER THE RECEIPT PEEK. An earlier draft checked this at
+  // function entry, which adversarial review caught as a real defect: a row
+  // holding a PAID prediction whose peek kept returning 'processing' or
+  // 'unknown' (Atlas 5xx, a timeout, a missing API key) would be terminal-failed
+  // on the Nth reclaim without ever being peeked again — discarding a paid
+  // master and wiping the baseline, when the entire purpose of those branches is
+  // to keep the row claimable until a later peek can collect it. The ceiling
+  // must bound RESUBMITS, never COLLECTS.
+  //
+  // Enforced here rather than in claimOne arm 2's filter so an exhausted row
+  // settles into an honest terminal state instead of silently dropping out of
+  // the claimable population — filter-side silence is the defect this whole
+  // change exists to remove.
+  if (reclaimCount > MAX_RECLAIMS) {
+    const error =
+      `Regenerate abandoned after ${reclaimCount} reclaim attempts ` +
+      `(ceiling ${MAX_RECLAIMS}) — refusing to submit again. Needs manual review.`;
+    console.error(`❌ regenerate-consumer[ad=${adId}]: ${error}`);
+    await markComplete(adId, { status: 'failed', durationMs: Date.now() - startedAt, error });
+    try {
+      require('./alertService').notifyAsync({
+        level: 'error',
+        title: 'Regenerate reclaim ceiling exceeded — not resubmitting',
+        key:   `regenerate-reclaim-ceiling:${adId}`,
+        fields: { adId, kind, reclaimCount, maxReclaims: MAX_RECLAIMS, worker: ad.regenerateClaimedByWorker || null }
+      });
+    } catch (alertErr) {
+      console.warn(`🔁 regenerate[ad=${adId}]: reclaim-ceiling alert failed — ${alertErr.message}`);
+    }
     return;
   }
 
@@ -1555,6 +1838,7 @@ module.exports = {
   // Pure arg assembly — verifyLifestylePreserve asserts variantKind is threaded.
   buildDirectImageArgsFromAd,
   DAILY_CAP,
+  MAX_RECLAIMS,
   // Catalog-first reseed. The decision and the tier selection are pure so
   // scripts/verifyRegeneration.js can assert them with no DB, network or key.
   RESEED_SKIP,
