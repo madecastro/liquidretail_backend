@@ -93,7 +93,78 @@
           "reason": "THE UNPORTED FIX. adgen fixed this exact line on 2026-08-26; the backend copy is still the pre-fix blob. The vendor manifest records the obligation in prose ('a human must apply the same edit in liquidretail_backend'), which nothing enforced. This entry plus the manifest's new `unported` status are what now make that obligation fail loudly instead of aging quietly.",
           "removeWhen": "the veoPromptBuilder catalog-title fix is ported to liquidretail_backend and scripts/vendor-manifest.json is reconciled back to synced — then delete this entry"
         }
-      ]
+      ],
+      "probe": {
+        "shouldMatch": [
+          "lines.push(`Product: ${product?.title || '(untitled product)'}`);",
+          "    lines.push(`Product: ${product.title}.`);",
+          "const s = `Product:   ${x}`;"
+        ],
+        "shouldNotMatch": [
+          "  // master): `Product: Vaportek.` was read as a brand-name render",
+          "// `Product: {title}` used to lead this list; it was removed entirely",
+          "  /^Product: /,",
+          "lines.push('Product: static string');",
+          "  // Do not re-add a named Product field."
+        ]
+      }
+    },
+    {
+      "id": "reframe-lease-floor-not-derived-from-poll-ceiling",
+      "severity": "error",
+      "rationale": [
+        "The cross-process reframe claim lease floor must NOT be computed from a poll ceiling.",
+        "",
+        "MECHANISM (2026-08-27). metadata.reframes.<aspect>.claim.at is a field on the SHARED",
+        "Media document. BOTH repos steal that claim, each using its OWN copy of this file's",
+        "formula. While the floor read `Math.max(configured, MAX_POLL_MS + 10 * 60 * 1000)`,",
+        "PR #82 raised adgen's ATLAS_TIMEOUT_MS to 900000 and left backend at its 600000 code",
+        "default — so the two processes silently stopped agreeing on when a holder is dead:",
+        "25 min in adgen, 20 min in backend. A steal is safe ONLY when every repo's floor",
+        "exceeds every repo's max hold, so the floor cannot be a function of a knob that only",
+        "one side turns. This is the exact 'one bug, two repos, one fix' shape this file exists",
+        "to close, and no hash check can see it: both copies were byte-plausible and both were",
+        "wrong in the same way.",
+        "",
+        "SECOND, INDEPENDENT REASON. That '+10 min' reads like safety margin and was already",
+        "spent. Bounded non-poll work inside the hold (source GET 20s, mirror upload 60s,",
+        "submit POST 60s, poll overshoot 188s, fetchOutpaintOutput 94.5s, outpaint upload 60s,",
+        "mirror delete 60s, pad-fallback upload 60s) totals 602.5s, so the real margin was",
+        "600 - 602.5 = MINUS 2.5s in BOTH repos, before any unbounded sharp/Mongo term.",
+        "",
+        "So re-deriving the floor from the NEW reframe budget would reproduce the same defect",
+        "in miniature (300s + 10 min = 15 min, WORSE than the 20 min both repos now use).",
+        "The poll budget is a LATENCY choice; the floor is a MONEY guard. Each repo pins the",
+        "hold-vs-lease inequality directly in scripts/verifyReframeHoldBounded.js instead."
+      ],
+      "appliesTo": [
+        "services/atlasVideoService.js"
+      ],
+      "forbiddenPattern": "Math\\.max\\(configured,\\s*MAX_POLL_MS \\+ 10 \\* 60 \\* 1000\\)",
+      "patternNote": [
+        "Matches the live expression only. Requires the literal Math.max(configured, ...) call",
+        "shape, so the PROSE in both repos documenting this history ('it used to be",
+        "MAX_POLL_MS + 10 min') does not match — those comments have no Math.max( and no",
+        "* 60 * 1000. Deliberately a narrow structural regex rather than a comment-stripping",
+        "lexer, for the reason this file's README gives: a hand-rolled JS comment stripper has",
+        "to disambiguate a regex literal from division, and getting that wrong is a worse bug",
+        "than the one being checked for."
+      ],
+      "probe": {
+        "shouldMatch": [
+          "  return Math.max(configured, MAX_POLL_MS + 10 * 60 * 1000);",
+          "return Math.max(configured,MAX_POLL_MS + 10 * 60 * 1000)",
+          "    const ttl = Math.max(configured,  MAX_POLL_MS + 10 * 60 * 1000);"
+        ],
+        "shouldNotMatch": [
+          "// It used to be `MAX_POLL_MS + 10 min`, and THAT ARITHMETIC LINK WAS THE DEFECT",
+          "//      Re-deriving the floor from the new REFRAME_POLL_MS would reproduce the",
+          "  return Math.max(configured, REFRAME_CLAIM_TTL_FLOOR_MS);",
+          "const REFRAME_CLAIM_TTL_FLOOR_MS = 20 * 60 * 1000;",
+          "// adgen is at 25 min (this value + 10) and backend is at 20 min",
+          "  return Math.min(Math.max(configured, 60000), MAX_POLL_MS, leaseCeiling);"
+        ]
+      }
     }
   ]
 }

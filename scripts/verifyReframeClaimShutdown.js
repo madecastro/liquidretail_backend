@@ -46,9 +46,17 @@ check('A1 active-claim registry is declared as a Set',
   /const\s+_activeReframeClaims\s*=\s*new Set\(\)/.test(svc),
   'a Set keyed on {mediaId,aspectKey,claimBy} — cannot be recomputed on the fly');
 
+// STRENGTHENED 2026-08-27. The previous regex was
+//   _activeReframeClaims.add(...)  ;? \n? return true;
+// i.e. it required the add to be IMMEDIATELY followed by `return true`, which
+// broke the moment an acquire log line was inserted between them — a false
+// failure on a change that did not touch the property at all. It also never
+// actually proved the ONLY half of its own name: it said nothing about the
+// non-win path. This version proves both: the add sits inside the `if (doc)`
+// win branch that returns true, and the fall-through returns false.
 check('A2 tryClaimReframe adds to the registry ONLY on win',
-  /_activeReframeClaims\.add\([\s\S]{0,200}?\)\s*;?\s*\n?\s*return true;/.test(svc),
-  'adding on failed claim would leak forever');
+  /if \(doc\) \{[\s\S]{0,1200}?_activeReframeClaims\.add\([\s\S]{0,1200}?return true;[\s\S]{0,80}?\}\s*\n\s*return false;/.test(svc),
+  'adding on a failed claim would leak forever');
 
 check('A3 releaseReframeClaim removes from registry BEFORE the Mongo write',
   /async function releaseReframeClaim[\s\S]{0,400}?_activeReframeClaims\.delete\([\s\S]{0,180}?\)[\s\S]{0,400}?Media\.updateOne/.test(svc),

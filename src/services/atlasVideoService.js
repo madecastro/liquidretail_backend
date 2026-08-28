@@ -202,30 +202,55 @@ function readReframeEntry(entry) {
 // realistic generation (ATLAS_TIMEOUT_MS is 900000 = 15 min since #82) so a
 // live flight is not stolen mid-poll; a crashed holder self-heals when the
 // lease ages out.
-// Floored at MAX_POLL_MS + 10 min rather than trusting the configured value
-// alone. If the lease could expire while the holder is still legitimately
-// polling, a second process would steal the claim and BOTH would bill — so the
-// safe TTL is coupled to how long a generation is allowed to run.
+// ⚠️ THIS FLOOR IS DELIBERATELY AN INDEPENDENT CONSTANT (2026-08-27). It used to
+// be `MAX_POLL_MS + 10 min`, and THAT ARITHMETIC LINK WAS THE DEFECT, for two
+// separate reasons:
 //
-// ⚠️ THIS USED TO END: "Raising ATLAS_TIMEOUT_MS therefore cannot silently
-// reintroduce the double-charge this lease exists to prevent." THAT IS TRUE
-// ONLY WITHIN THIS REPO. The floor is computed from THIS file's MAX_POLL_MS,
-// but the claim it guards is a field on the SHARED Media document that
-// liquidretail_backend also steals from using ITS OWN copy of this formula.
-// #82 raised MAX_POLL_MS here and not there, so the two sides no longer agree
-// on when a holder is dead: 25 min here, 20 min there. See the MONEY block at
-// MAX_POLL_MS for the full accounting. Do not restore the old sentence without
-// first making the two repos read one shared floor.
+//   1. CROSS-REPO DRIFT. The claim this lease guards is a field on the SHARED
+//      Media document (metadata.reframes.<aspect>.claim.at) that
+//      liquidretail_backend also steals from using its own copy of this file.
+//      Deriving the floor from a PER-REPO video timeout meant #82 raising
+//      MAX_POLL_MS here and not there moved this repo's stale-claim line and
+//      not backend's: 25 min here, 20 min there. A steal is only safe if EVERY
+//      repo's floor exceeds EVERY repo's max hold, so the floor cannot be a
+//      function of a knob only one side turns.
+//
+//   2. THE "+10 MIN" WAS ALREADY SPENT. That term reads like safety margin.
+//      Measured against the code, the bounded non-poll work inside the hold
+//      (source GET 20s, mirror upload 60s, submit POST 60s, poll overshoot
+//      188s, fetchOutpaintOutput 94.5s, outpaint upload 60s, mirror delete
+//      60s, pad-fallback upload 60s) totals 602.5s — so the real margin was
+//      600 - 602.5 = MINUS 2.5s, in both repos, before any unbounded term.
+//      Re-deriving the floor from the new REFRAME_POLL_MS would reproduce the
+//      same bug in miniature (300s + 10 min = 15 min, WORSE than this value).
+//
+// So: the poll budget is a LATENCY choice (REFRAME_POLL_MS, measured), and this
+// floor is a MONEY guard (a flat constant, chosen). They are no longer allowed
+// to move each other. Changing either requires re-checking the inequality that
+// scripts/verifyReframeHoldBounded.js asserts.
+//
+// ⚠️ THIS VALUE DROPS 25 min -> 20 min IN THIS REPO, AND THAT IS NOT A LOSS OF
+// SAFETY. The extra 5 minutes was ILLUSORY: the claim is on a shared document
+// and backend steals at ITS floor (20 min) regardless of what this repo
+// believes, so the effective system-wide steal threshold has always been 20
+// min. This change makes this repo's belief match the system's actual
+// behaviour. What buys the real margin is the poll budget: max hold is
+// REFRAME_POLL_MS (300s) + bounded non-poll work (464.5s once pollPrediction
+// respects its own deadline) = 764.5s ~ 12.7 min, leaving ~7.3 min for the
+// terms that have no timeout at all (every sharp() call, every Mongo op —
+// neither repo sets socketTimeoutMS and no reframe query passes maxTimeMS).
+// Margin sized against real unbounded risk, rather than arithmetic that
+// happened to look reassuring.
+const REFRAME_CLAIM_TTL_FLOOR_MS = 20 * 60 * 1000;
+
 const REFRAME_CLAIM_TTL_MS = () => {
   const n = Number(process.env.REFRAME_CLAIM_TTL_MS);
   const configured = Number.isFinite(n) && n > 0 ? n : 15 * 60 * 1000;
-  // Slack covers the work AFTER polling that still precedes persist: output
-  // download with retries (~90s), Cloudinary uploads, pad build. Erring long is
-  // the cheap direction — an over-long lease only makes peers crop for a while,
-  // whereas an under-long one lets a second process bill for the same asset. It
-  // also absorbs modest clock skew between processes, since `claim.at` is
-  // written from each process's own wall clock rather than server time.
-  return Math.max(configured, MAX_POLL_MS + 10 * 60 * 1000);
+  // Erring long is the cheap direction — an over-long lease only makes peers
+  // crop for a while, whereas an under-long one lets a second process bill for
+  // the same asset. It also absorbs modest clock skew between processes, since
+  // `claim.at` is written from each process's own wall clock, not server time.
+  return Math.max(configured, REFRAME_CLAIM_TTL_FLOOR_MS);
 };
 
 // How long a claim LOSER polls for the winner's reframe before degrading to
@@ -413,10 +438,14 @@ const POLL_INTERVAL = parseInt(process.env.ATLAS_POLL_INTERVAL_MS, 10) || 5000;
 // iteration can begin one millisecond inside the deadline and run ~48s past
 // it.
 //
-// #83 CHANGED WHICH BUDGET IS ENFORCED, NOT THE OVERSHOOT. Verified on master
-// 9f41215: the loop body has no deadline-aware clamp on either the sleep or
-// the GET, so the ~48s term below is still live. A peer's poll-overshoot fix
-// is still in flight and WILL retire it — do not pre-credit it here.
+// #83 CHANGED WHICH BUDGET IS ENFORCED, NOT THE OVERSHOOT — and THIS CHANGE
+// retires it. #83 left the loop body with no deadline-aware clamp, so the
+// ~48s term was still live on master 9f41215 (verified by the merge gate).
+// This PR adds sleepWithinBudget: the sleep is clamped to Math.min(ms,
+// remainingMs()) and the loop BREAKS rather than proceeding to the GET when
+// the budget is spent. Residual: the GET's own 30s timeout is still fixed, so
+// an iteration entered with 1ms left can overrun by up to 30s — materially
+// smaller than the 188s term, not zero.
 //
 // Corrected bounded non-poll work is 602.5s (10.04 min) against the +10 min
 // slack: −2.5s of margin. That holds in BOTH repos, since the slack and the
@@ -437,6 +466,18 @@ const POLL_INTERVAL = parseInt(process.env.ATLAS_POLL_INTERVAL_MS, 10) || 5000;
 // caveat: that is Node's socket-INACTIVITY timeout, not a total-duration
 // deadline — a slowly trickling transfer can still exceed 60s, while a
 // genuinely hung socket cannot.
+//
+// ── TERM-BY-TERM, from this PR's re-derivation ──────────────────────────
+// Bounded non-poll work inside the hold therefore totals 602.5s (source GET 20s
+// + mirror upload 60s + submit POST 60s + poll overshoot 188s +
+// fetchOutpaintOutput 94.5s + outpaint upload 60s + mirror delete 60s +
+// pad-fallback upload 60s). Against the old 900s ceiling that is 1502.5s =
+// 25.04 min — OVER backend's 20 min line, not under, with no unbounded term
+// required at all. The window was open on bounded arithmetic alone.
+//
+// (Both defects are fixed: the poll now has its own REFRAME_POLL_MS budget and
+// pollPrediction clamps every sleep to the remaining budget, taking the hold to
+// 764.5s ≈ 12.7 min under a 20 min floor.)
 //
 // AND THE CEILING WAS NOT SIZED FOR THIS PATH. The 900000 derivation below is
 // the VIDEO distribution (n=68 Omni image-to-video masters, max 760s).
@@ -462,11 +503,27 @@ const POLL_INTERVAL = parseInt(process.env.ATLAS_POLL_INTERVAL_MS, 10) || 5000;
 // claim.by — which the steal overwrites — so the robbed holder's release
 // becomes a no-op and both flights persist.
 //
-// A peer is landing the real fix as PRs: a ~300s reframe poll budget on its
-// own env key, a floor held at 20 min in BOTH repos and derived from nothing,
-// the SIGTERM eviction port, durationMs instrumentation, and the
-// poll-overshoot fix — which WILL retire the 48s term above once it lands.
-// #83 has landed the per-invocation budget; the overshoot clamp has not.
+// THIS CHANGE IS THAT FIX: a REFRAME_POLL_MS budget on its own env key, a
+// floor held at 20 min and derived from nothing, and the poll-overshoot clamp.
+// The SIGTERM eviction port and durationMs instrumentation landed separately.
+//
+// ⚠️ CORRECTED 2026-08-27: this sentence used to say backend's "acquire has no
+// holder-identity, fence, receipt or idempotency guard". THE HOLDER-IDENTITY
+// HALF IS FALSE and this comment was the source other write-ups were citing.
+// Backend writes `claim.by` with the IDENTICAL construction adgen uses, and
+// both repos' releaseReframeClaim filters on it (verified in
+// liquidretail_backend/services/atlasVideoService.js on origin/main).
+//
+// State the real gap precisely, because it is narrower and it is shared:
+// NEITHER repo has a FENCING TOKEN. The acquire filter matches on claim.at
+// staleness only — never on claim.by — and persistReframe writes on `_id`
+// alone, so a robbed holder can still persist over the thief's result. Holder
+// identity exists; it just is not checked at the two points where it would
+// stop a stolen flight from landing. That is a real defect and it is NOT what
+// this PR fixes; this PR removes the DISAGREEMENT that lets a steal happen in
+// the first place. Fencing remains open and is worth its own change.
+// Fencing remains open and is worth its own change.
+
 //
 // Narrowing it further: the wizard fires prewarm ~1.5s after a product pick
 // (frontend Step2Picker), i.e. BEFORE Generate, while adgen holds during
@@ -523,12 +580,26 @@ const MAX_POLL_MS   = parseInt(process.env.ATLAS_TIMEOUT_MS, 10)       || 900000
 //
 // WHY ASYMMETRIC RATHER THAN A TOTAL LADDER BUDGET. A total budget spanning the
 // ladder is the obvious shape and is the one option that reopens a
-// double-charge question: REFRAME_CLAIM_TTL_MS (:210) is floored at
-// MAX_POLL_MS + 10 min precisely so a reframe lease cannot age out under a
-// still-legitimate poll, and its comment states that property. Every individual
-// attempt staying <= MAX_POLL_MS inherits that floor BY CONSTRUCTION; a total
-// budget exceeding MAX_POLL_MS would not, and would need fresh lease analysis.
-// So this fix never lengthens any single attempt.
+// double-charge question, so this fix never lengthens any single attempt.
+//
+// ⚠️ CORRECTED 2026-08-27. This paragraph used to end: "REFRAME_CLAIM_TTL_MS is
+// floored at MAX_POLL_MS + 10 min precisely so a reframe lease cannot age out
+// under a still-legitimate poll... Every individual attempt staying <=
+// MAX_POLL_MS inherits that floor BY CONSTRUCTION."
+//
+// THAT INHERITANCE NO LONGER EXISTS, AND IT WAS NEVER SOUND. The reframe lease
+// floor is now an INDEPENDENT constant (REFRAME_CLAIM_TTL_FLOOR_MS) that does
+// not read MAX_POLL_MS at all, and the reframe poll has its own budget
+// (REFRAME_POLL_MS) rather than inheriting the video ceiling. Two reasons the
+// old coupling had to go, both documented at REFRAME_CLAIM_TTL_FLOOR_MS:
+// the floor drifted between this repo and liquidretail_backend over ONE shared
+// Media claim, and its "+10 min" slack was already fully consumed by bounded
+// non-poll work (602.5s), leaving -2.5s of real margin.
+//
+// So the video ladder and the reframe lease are now genuinely independent.
+// Keeping every attempt <= MAX_POLL_MS is still correct for the DERIVE
+// deadline reason above — it just no longer has anything to do with the
+// reframe lease.
 //
 // WHY 300s IS ENOUGH FOR A RETRY. The first attempt keeps the full 900s, which
 // is what the measured delivered-video distribution actually bought (n=68: mean
@@ -553,6 +624,60 @@ const RETRY_POLL_MS = Math.max(
     parseInt(process.env.ATLAS_RETRY_TIMEOUT_MS, 10) || 300_000 // 5 min
   )
 );
+
+// ── Reframe poll ceiling — DELIBERATELY NOT MAX_POLL_MS ──────────────────
+//
+// The reframe outpaint is a different provider call on a different model
+// (REFRAME_OUTPAINT_MODEL, nano-banana-2/edit) than the video master
+// (gemini-omni-flash). Before this constant existed, reframeReferenceForAspect
+// called pollPrediction with NO options, so it inherited the VIDEO ceiling by
+// omission — a coupling nobody chose, which meant tuning ATLAS_TIMEOUT_MS also
+// moved how long a reframe can hold a BILLING CLAIM on a shared Media document.
+//
+// MEASURED (n=60, exact join of CostLog.providerRequestId for
+// stage:'reframe-outpaint' against the completion log line, 2026-08-24 →
+// 2026-08-27): p50 48.5s, p95 136.6s, p99 220.2s, max 232s, mean 55.8s,
+// sd 40.7s. Zero of 126 billed reframes in seven days hit the ceiling.
+//
+// 300000 is 1.29x the observed max — the same shape of headroom the video
+// ceiling was sized with (1.18x of ITS observed max; see ATLAS_TIMEOUT_MS in
+// config/defaults.env). The inherited 900s ceiling was 3.9x the observed max,
+// i.e. budget nobody's latency needed and every claim-hold accounting had to
+// carry.
+//
+// DO NOT size this down to the p99. A cutoff here is not free: `billed` is set
+// at the submit POST, so a poll that gives up on a generation Atlas completes
+// converts a PAID outpaint into a crop ('crop-after-bill') — real money for no
+// asset. Erring long costs claim-hold margin, which is cheap and bounded;
+// erring short costs spend. Clamped to >= 60s so a mistyped env var cannot make
+// every reframe a paid crop, and <= MAX_POLL_MS so it can never exceed the
+// ceiling the rest of this file is reasoned about.
+//
+// ── THE UPPER CLAMP IS DERIVED FROM THE LEASE, NOT FROM MAX_POLL_MS ──────
+//
+// Found by the parameter sweep in scripts/verifyReframeHoldBounded.js, not by
+// reading: clamping to MAX_POLL_MS lets an operator set REFRAME_POLL_MS=900000
+// here, which makes the hold 900 + 464.5 = 1364.5s against a 1200s lease — a
+// configuration the env var alone could reach that reopens the exact
+// double-charge this whole change closes. (backend was safe only by accident,
+// its MAX_POLL_MS being 600000.)
+//
+// THIS IS NOT THE COUPLING THAT WAS JUST REMOVED — the direction is the
+// opposite one, and the direction is the whole point. The defect was a MONEY
+// GUARD (the lease floor) derived from a LATENCY KNOB (the video ceiling), so
+// tuning latency silently moved the money guard. Here a LATENCY KNOB is bounded
+// by the MONEY GUARD, which is the correct dependency: the lease constrains how
+// long we may poll, and can never be moved by how long we want to poll.
+const REFRAME_BOUNDED_NON_POLL_MS = 464500;
+const REFRAME_MIN_LEASE_MARGIN_MS = 60000;
+
+const REFRAME_POLL_MS = () => {
+  const n = Number(process.env.REFRAME_POLL_MS);
+  const configured = Number.isFinite(n) && n > 0 ? n : 300000;
+  const leaseCeiling =
+    REFRAME_CLAIM_TTL_FLOOR_MS - REFRAME_BOUNDED_NON_POLL_MS - REFRAME_MIN_LEASE_MARGIN_MS;
+  return Math.min(Math.max(configured, 60000), MAX_POLL_MS, leaseCeiling);
+};
 
 function apiKey() { return process.env.ATLAS_API_KEY; }
 function enabled() {
@@ -2093,6 +2218,15 @@ async function tryClaimReframe(mediaId, aspectKey, claimBy) {
       // process death before that finally leaves it here for the shutdown
       // sweep to catch.
       _activeReframeClaims.add(JSON.stringify({ m: String(mediaId), a: aspectKey, b: claimBy }));
+      // ACQUIRE LOG. The losing path already logs ("claim held by another
+      // process") but the WINNER was silent, which meant a hold could only be
+      // reconstructed by inference: there was no line saying when the clock
+      // started. Anyone measuring how long a reframe holds its billing claim
+      // needs this line and the persist line at the other end.
+      console.log(
+        `   🔒 reframe[${aspectKey}]: claim acquired (media=${mediaId} by=${claimBy} ` +
+        `lease=${Math.round(REFRAME_CLAIM_TTL_MS() / 1000)}s)`
+      );
       return true;
     }
     return false;
@@ -2442,6 +2576,8 @@ async function reframeReferenceForAspect({ media, sourceUrl, aspectRatio, brand,
       // still hold a claim-only entry and did NOT bill (see finally below).
       const claimBy = `${process.pid}:${Date.now().toString(36)}:${Math.random().toString(36).slice(2, 8)}`;
       let holdClaim = false;
+      // ISO timestamp of claim acquisition, or null when we never held one.
+      let claimedAt = null;
 
       try {
         // CLAIM: atomic cross-process mutex. Loser never reaches submitImageGeneration.
@@ -2461,6 +2597,11 @@ async function reframeReferenceForAspect({ media, sourceUrl, aspectRatio, brand,
           return fallback();
         }
         holdClaim = true;
+        // Start of the billing hold. Threaded into persistReframe so the settled
+        // document records how long the claim was actually held — acquire and
+        // completion could not previously coexist on the same document, because
+        // persist's full $set drops `.claim`.
+        claimedAt = new Date().toISOString();
 
         // CLAIM: last look before spending. Winning the claim does NOT prove no
         // result exists — the FREE tiers (exact-fit skip, product-only pad) call
@@ -2515,7 +2656,11 @@ async function reframeReferenceForAspect({ media, sourceUrl, aspectRatio, brand,
           billed = true;
           predictionId = id;
 
-          const pollOut = await pollPrediction(id);
+          // maxPollMs is passed EXPLICITLY. This call site used to pass no
+          // options at all, which silently inherited MAX_POLL_MS — the VIDEO
+          // ceiling — for a completely different model on a completely
+          // different path. See REFRAME_POLL_MS for the measured sizing.
+          const pollOut = await pollPrediction(id, { maxPollMs: REFRAME_POLL_MS() });
           // pollPrediction returns { url, price }. Reframe used to ledger only
           // its own flat REFRAME_COST_USD() estimate and ignore `price` —
           // fixed below (§7): now scheduled through the same settle-from-
@@ -2817,7 +2962,7 @@ async function reframeReferenceForAspect({ media, sourceUrl, aspectRatio, brand,
         //    render retries the real uncrop — there is no spend to protect.
         //    (method 'outpaint' implies billed, so this gates on `billed` alone.)
         if (resultUrl && method) {
-          if (billed) await persistReframe(media, aspectKey, aspectRatio, resultUrl, method);
+          if (billed) await persistReframe(media, aspectKey, aspectRatio, resultUrl, method, { claimedAt });
           return resultUrl;
         }
 
@@ -2836,7 +2981,8 @@ async function reframeReferenceForAspect({ media, sourceUrl, aspectRatio, brand,
         if (billed && settleUrl) {
           await persistReframe(
             media, aspectKey, aspectRatio, settleUrl,
-            staleUrl ? 'stale-kept-after-bill' : 'crop-after-bill'
+            staleUrl ? 'stale-kept-after-bill' : 'crop-after-bill',
+            { claimedAt }
           );
         }
         return settleUrl;
@@ -2872,15 +3018,43 @@ async function reframeReferenceForAspect({ media, sourceUrl, aspectRatio, brand,
 // calling process still has the paid URL in its lean doc, but other processes
 // cannot see it and may re-POST after the claim TTL — spend is unprotected
 // off-box. Never throws.
-async function persistReframe(media, aspectKey, aspectRatio, finalUrl, method) {
+// claimedAt (optional, ISO string): when THIS process acquired the reframe
+// claim, threaded down from reframeReferenceForAspect. Present only on the
+// tiers that actually held a claim; the free tiers (exact, pad-product-only)
+// omit it and their persisted entry is byte-identical to before.
+//
+// WHY IT IS RECORDED HERE. The `$set` below replaces the WHOLE aspect entry,
+// which is load-bearing — dropping `.claim` is exactly what supersedes the
+// lease so peers stop seeing a live holder. The side effect was that `claim.at`
+// and the completion timestamp could never coexist on a settled document, so
+// the duration of a billing hold was not recoverable from the data at all; it
+// had to be reconstructed by joining CostLog against log lines. These two
+// fields close that gap WITHOUT resurrecting a live claim: they are historical
+// record at `entry.claimedAt` / `entry.heldMs`, not `entry.claim.at`, so
+// tryClaimReframe's claimability test (which reads `<path>.claim.at`) is
+// completely unaffected and the supersede semantics are unchanged.
+//
+// Deliberately NOT stamped on the CostLog row instead: that would measure the
+// PROVIDER call, which is already measurable, and not the hold — the window
+// that the lease TTL has to cover.
+//
+// These fields are not inputs to the ad identity digest (which hashes mediaId,
+// not reframe entry contents — verified 2026-08-27), so adding them cannot
+// change any ad's identity or re-bill an existing master.
+async function persistReframe(media, aspectKey, aspectRatio, finalUrl, method, { claimedAt = null } = {}) {
   if (!finalUrl) return false;
+  const nowIso = new Date().toISOString();
+  const heldMs = claimedAt ? Math.max(0, Date.parse(nowIso) - Date.parse(claimedAt)) : null;
   const entry = {
     url: finalUrl,
     aspect: aspectRatio,
     method,
     model: REFRAME_OUTPAINT_MODEL(),
     ladderVersion: REFRAME_LADDER_VERSION,
-    at: new Date().toISOString()
+    at: nowIso,
+    // Omitted (undefined) when there was no claim, so free-tier entries keep
+    // their historical shape exactly.
+    ...(claimedAt ? { claimedAt, heldMs } : {})
   };
   // Mutate in-memory lean doc so the same run reuses the cache.
   if (media) {
@@ -2895,6 +3069,17 @@ async function persistReframe(media, aspectKey, aspectRatio, finalUrl, method) {
       { _id: media._id },
       { $set: { [`metadata.reframes.${aspectKey}`]: entry } }
     );
+    // HOLD MEASUREMENT, the closing half of the acquire log in tryClaimReframe.
+    // Printed only when a claim was actually held, so the free tiers stay quiet.
+    // This is the line to grep to answer "how long does a reframe hold its
+    // billing claim in production" without a CostLog/log join.
+    if (heldMs != null) {
+      console.log(
+        `   🔓 reframe[${aspectKey}]: claim superseded by persist after ` +
+        `${(heldMs / 1000).toFixed(1)}s hold (method=${method} lease=` +
+        `${Math.round(REFRAME_CLAIM_TTL_MS() / 1000)}s media=${media._id})`
+      );
+    }
     return true;
   } catch (err) {
     // PERSIST/BILLING visibility: was console.warn (easy to miss). A failed
@@ -3967,11 +4152,20 @@ async function resumeForAd({ ad } = {}) {
 async function pollPrediction(
   predictionId,
   // maxPollMs: the budget for THIS invocation. Defaults to MAX_POLL_MS so every
-  // existing caller (and the reframe path at :2316, which passes no options at
-  // all) is unchanged. generateForAd's ladder passes RETRY_POLL_MS on attempt
-  // 2+ — see RETRY_POLL_MS's comment for why the budget is per-attempt
-  // asymmetric rather than a total across the ladder. Clamped to <= MAX_POLL_MS
-  // at the constant, so no invocation can ever outlive the reframe lease floor.
+  // caller that does not pass one is unchanged. generateForAd's ladder passes
+  // RETRY_POLL_MS on attempt 2+ — see RETRY_POLL_MS's comment for why the budget
+  // is per-attempt asymmetric rather than a total across the ladder. The reframe
+  // path passes REFRAME_POLL_MS.
+  //
+  // ⚠️ CORRECTED 2026-08-27. This used to say the reframe path "passes no
+  // options at all", which was true and was the bug — it inherited the VIDEO
+  // ceiling by omission. It also used to end "Clamped to <= MAX_POLL_MS at the
+  // constant, so no invocation can ever outlive the reframe lease floor." That
+  // reasoning is retired: the reframe lease floor no longer derives from
+  // MAX_POLL_MS at all (see REFRAME_CLAIM_TTL_FLOOR_MS), so no invocation
+  // inherits anything from it "by construction". The relationship between a
+  // poll budget and the lease is now asserted explicitly by
+  // scripts/verifyReframeHoldBounded.js instead of being argued in a comment.
   { shouldCancel = null, adId = null, stagePrefix = null, maxPollMs = MAX_POLL_MS } = {}
 ) {
   const t0 = Date.now();
@@ -3985,6 +4179,36 @@ async function pollPrediction(
       adStage(adId, `${stagePrefix} — polling ${formatElapsed(Date.now() - t0)} (${pollCount})`);
     }
   };
+  // Milliseconds left in this invocation's budget. Never negative.
+  const remainingMs = () => Math.max(0, maxPollMs - (Date.now() - t0));
+  // Sleep, but NEVER past the deadline.
+  //
+  // WHY THIS IS NOT A PLAIN setTimeout. The loop condition below is evaluated
+  // only at the top of the `while`; every await inside the body then runs to
+  // completion before it is re-tested. So an iteration entered one millisecond
+  // before the deadline ran a full trailing iteration PAST it — POLL_INTERVAL +
+  // jitter (18s at the deployed ATLAS_POLL_INTERVAL_MS=15000), then a 30s axios
+  // timeout, then up to a 120s rate-limit backoff: ~168s of overshoot on a
+  // budget the caller believed was hard, plus the post-loop peek.
+  //
+  // ⚠️ #82/#83 DID NOT FIX THIS. Adding the maxPollMs PARAMETER changed WHICH
+  // budget is enforced; it did not make the loop respect it. The overshoot term
+  // survived both and is charged to the reframe CLAIM HOLD, where it was
+  // consuming the lease margin REFRAME_CLAIM_TTL_FLOOR_MS is sized against.
+  //
+  // Clamping every sleep to the remaining budget makes maxPollMs a real
+  // deadline: the only work that can now land past it is one in-flight axios
+  // GET (<=30s) and the single post-loop peek (<=20s), both bounded, and both
+  // FREE reads that can still rescue a paid prediction. Returning early is safe
+  // for the same reason the deadline existed: the post-loop peek runs
+  // regardless, and the spend receipt (Ad.veoPredictionId) keeps a late
+  // completion collectable for $0 via bootRecoveryService.
+  const sleepWithinBudget = async (ms) => {
+    const capped = Math.min(ms, remainingMs());
+    if (capped <= 0) return false;
+    await new Promise(r => setTimeout(r, capped));
+    return true;
+  };
   writePollStage();
   while (Date.now() - t0 < maxPollMs) {
     // Jitter the poll interval by 0–3s so concurrent jobs desync — without
@@ -3992,7 +4216,7 @@ async function pollPrediction(
     // budget in lockstep, converting every poll cycle into a rate-limit
     // burst even before the submission traffic weighs in.
     const jitter = Math.floor(Math.random() * 3000);
-    await new Promise(r => setTimeout(r, POLL_INTERVAL + jitter));
+    if (!await sleepWithinBudget(POLL_INTERVAL + jitter)) break;
     // Cooperative cancel: stop WAITING on the provider job (it may still
     // complete server-side — no provider cancel API assumed) and let the
     // caller mark its run cancelled.
@@ -4029,7 +4253,10 @@ async function pollPrediction(
           `   ⏳ atlasVideo: poll #${pollCount} rate-limited ` +
           `(hit #${consecutiveRateLimits}, backing off ${backoffMs / 1000}s): ${summary.body || summary.message}`
         );
-        await new Promise(r => setTimeout(r, backoffMs));
+        // Clamped to the remaining budget — see sleepWithinBudget. A 120s
+        // backoff used to be served in FULL even when only milliseconds of
+        // budget remained, which is where most of the old overshoot came from.
+        await sleepWithinBudget(backoffMs);
         continue;
       }
 
@@ -5366,6 +5593,16 @@ async function buildPromptScaffold({
 
 module.exports = {
   generateForAd,
+  // Reframe hold constants — exposed so scripts/verifyReframeHoldBounded.js can
+  // assert the hold-vs-lease inequality against the REAL values rather than
+  // re-deriving them from source text.
+  REFRAME_POLL_MS,
+  REFRAME_CLAIM_TTL_MS,
+  REFRAME_CLAIM_TTL_FLOOR_MS,
+  // Exposed so that harness can prove the maxPollMs deadline is REALLY
+  // respected by running the loop. A source-text check passes against any
+  // reimplementation that keeps the name; only executing it proves the clamp.
+  pollPrediction,
   // exposed for verify harnesses (Claude-5-era provider-fault retry gate)
   mayRetryAfterFailure,
   // Slack payload for the not-chargeable auto-retry path — pure, so

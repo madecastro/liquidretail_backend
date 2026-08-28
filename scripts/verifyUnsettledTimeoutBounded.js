@@ -539,12 +539,31 @@ check('E3: the ceiling is env-tunable and declared in config/defaults.env', () =
     'config/defaults.env and the code default disagree — the committed value must match');
 });
 
-check('E4: the cross-process reframe lease still outlives the poll', () => {
-  // If the lease could expire mid-poll a second process would steal the claim
-  // and BOTH would bill. The floor is what makes raising the ceiling safe.
-  assert.ok(/Math\.max\(configured,\s*MAX_POLL_MS \+ 10 \* 60 \* 1000\)/.test(atlasSrc),
-    'REFRAME_CLAIM_TTL_MS is no longer floored at MAX_POLL_MS + 10min — raising the poll ceiling ' +
-    'can now expire the lease mid-flight and reintroduce a double charge');
+check('E4: the cross-process reframe lease still outlives the reframe poll', () => {
+  // The PROPERTY is unchanged and still exactly right: if the lease could
+  // expire mid-poll, a second process would steal the claim and BOTH would
+  // bill. What changed 2026-08-27 is HOW it is guaranteed.
+  //
+  // This check used to require the floor to be `MAX_POLL_MS + 10 min`. That
+  // formula was the defect, not the guarantee: it is computed per-repo over a
+  // claim on a SHARED Media document that liquidretail_backend also steals
+  // from (25 min here vs 20 min there after #82), and its "+10 min" was
+  // already fully consumed by 602.5s of bounded non-poll work (-2.5s real
+  // margin). It also tied the lease to the VIDEO ceiling while the reframe
+  // runs a different model entirely.
+  //
+  // Now: the reframe poll has its own budget and the floor is an independent
+  // constant, so the property is asserted as the actual inequality.
+  assert.ok(!/Math\.max\(configured,\s*MAX_POLL_MS \+ 10 \* 60 \* 1000\)/.test(atlasSrc),
+    'the reframe lease floor is coupled to MAX_POLL_MS again — see ' +
+    'scripts/verifyReframeHoldBounded.js for why that is the defect');
+  assert.match(atlasSrc, /const REFRAME_CLAIM_TTL_FLOOR_MS = 20 \* 60 \* 1000;/,
+    'the independent reframe lease floor constant is missing');
+  // The reframe poll must be the one that fits under the lease — not the video
+  // ceiling, which no longer bounds it.
+  assert.match(atlasSrc, /await pollPrediction\(id,\s*\{\s*maxPollMs:\s*REFRAME_POLL_MS\(\)\s*\}\)/,
+    'the reframe call site no longer passes its own budget — it would inherit the video ceiling');
+  // Full numeric + behavioural coverage lives in verifyReframeHoldBounded.js.
 });
 
 check('E5: raising the ceiling did NOT remove the receipt handling it complements', () => {

@@ -22,13 +22,23 @@
  * with no asset.
  *
  * THE SAFETY PROPERTY THIS FILE EXISTS TO PROTECT. A *total* budget spanning
- * the ladder was the obvious alternative and is the one shape that reopens a
- * double-charge question: REFRAME_CLAIM_TTL_MS is floored at
- * MAX_POLL_MS + 10 min precisely so a reframe lease cannot age out under a
- * still-legitimate poll. Keeping EVERY attempt <= MAX_POLL_MS inherits that
- * floor by construction. So the clamp is not cosmetic — group A proves no
+ * the ladder was the obvious alternative and is the one shape that multiplies a
+ * doomed master's wall clock against the DERIVE deadline. Group A proves no
  * configuration can produce a per-attempt budget above the first-attempt
  * ceiling.
+ *
+ * ⚠️ CORRECTED 2026-08-27. This paragraph used to justify the clamp by the
+ * REFRAME LEASE instead: "REFRAME_CLAIM_TTL_MS is floored at MAX_POLL_MS + 10
+ * min precisely so a reframe lease cannot age out under a still-legitimate
+ * poll. Keeping EVERY attempt <= MAX_POLL_MS inherits that floor by
+ * construction." That inheritance is gone, and it was never sound: the floor
+ * was computed PER-REPO over a claim on a Media document SHARED with
+ * liquidretail_backend, so "by construction" only ever held within one repo,
+ * which is not where the claim lives. The reframe lease floor is now an
+ * independent constant (REFRAME_CLAIM_TTL_FLOOR_MS) and the reframe poll has
+ * its own budget (REFRAME_POLL_MS); the hold-vs-lease inequality is asserted
+ * directly by scripts/verifyReframeHoldBounded.js. The DERIVE-deadline reason
+ * above is the real and remaining justification for this clamp.
  *
  * ── FIX 2: renderAttempts was a lying counter on this path ──────────────────
  * models/Ad.js: it "counts every attempt that STARTED a render (submit/
@@ -98,8 +108,8 @@ check('A1: the retry budget NEVER exceeds the first-attempt ceiling (the lease-f
       assert.ok(
         got <= ceiling,
         `retry budget ${got} exceeds the first-attempt ceiling ${ceiling} for env=${JSON.stringify(env)} — ` +
-        'this is the double-charge invariant: an attempt longer than MAX_POLL_MS can outlive the ' +
-        'reframe lease floor (MAX_POLL_MS + 10 min)'
+        'a per-attempt budget above the first-attempt ceiling multiplies the ladder wall clock ' +
+        'against the DERIVE deadline (see the header note on why this is no longer a lease argument)'
       );
     }
   }
@@ -169,11 +179,23 @@ check('B4: attempt 1 gets MAX_POLL_MS and retries get RETRY_POLL_MS', () => {
     'is what the measured delivered-video distribution bought and must not be shortened.');
 });
 
-check('B5: the reframe caller is UNCHANGED (still gets the full default budget)', () => {
-  // The other pollPrediction call site passes no options at all; it must stay
-  // that way, so this fix cannot silently shorten an unrelated path.
-  assert.match(atlasSrc, /const pollOut = await pollPrediction\(id\);/,
-    'the reframe pollPrediction(id) call must remain option-free so it keeps the default ceiling');
+check('B5: the reframe caller passes its OWN budget, not the video default', () => {
+  // ⚠️ INVERTED 2026-08-27. This check used to require the reframe call site to
+  // stay option-free — `const pollOut = await pollPrediction(id);` — on the
+  // reasoning that leaving it alone meant this fix "cannot silently shorten an
+  // unrelated path". The path was never unrelated, and option-free was not
+  // neutral: passing no options meant INHERITING MAX_POLL_MS, so the reframe
+  // outpaint (nano-banana-2/edit) was silently governed by the ceiling sized for
+  // the video master (gemini-omni-flash) — a coupling nobody chose, and one that
+  // put a 900s budget on a call whose measured max is 232s (n=60).
+  //
+  // The reframe now passes REFRAME_POLL_MS explicitly. That is what makes this
+  // caller genuinely independent of the ladder, which is what B5 was reaching
+  // for all along.
+  assert.match(atlasSrc, /const pollOut = await pollPrediction\(id,\s*\{\s*maxPollMs:\s*REFRAME_POLL_MS\(\)\s*\}\)/,
+    'the reframe call site must pass its own REFRAME_POLL_MS budget');
+  assert.ok(!/await pollPrediction\(id\)\s*;/.test(atlasSrc),
+    'a bare option-free pollPrediction(id) is back — it would inherit the video ceiling again');
 });
 
 console.log('\nC. renderAttempts counts retry submits (structural)');
@@ -257,10 +279,32 @@ check('D3: no stale "10 min" claim about ATLAS_TIMEOUT_MS survives (it is 15)', 
     'a comment still says pollPrediction blocks up to 10 min');
 });
 
-check('D4: the reframe lease floor is still MAX_POLL_MS + 10 min (untouched by this fix)', () => {
-  assert.match(atlasSrc, /Math\.max\(configured, MAX_POLL_MS \+ 10 \* 60 \* 1000\)/,
-    'the reframe lease floor must remain coupled to MAX_POLL_MS — group A\'s invariant is only ' +
-    'meaningful while this floor exists');
+check('D4: the reframe lease floor is INDEPENDENT of MAX_POLL_MS', () => {
+  // ⚠️ INVERTED 2026-08-27. This check used to assert the OPPOSITE — that the
+  // floor must REMAIN `Math.max(configured, MAX_POLL_MS + 10 * 60 * 1000)` —
+  // on the reasoning that "the floor is what makes raising the ceiling safe"
+  // and that every attempt staying <= MAX_POLL_MS therefore inherited it by
+  // construction. That reasoning was wrong in two ways, and the coupling it
+  // protected was itself the defect:
+  //
+  //   1. The floor is computed PER-REPO, but the claim it guards is a field on
+  //      the SHARED Media document that liquidretail_backend also steals from
+  //      with its own copy of the formula. #82 raised MAX_POLL_MS here and not
+  //      there, so the two sides silently disagreed about when a holder is
+  //      dead — 25 min here, 20 min there. Inheritance "by construction" only
+  //      ever held within one repo, which is not where the claim lives.
+  //   2. The "+10 min" slack was already spent: bounded non-poll work inside
+  //      the hold totals 602.5s, so the real margin was 600 - 602.5 = -2.5s.
+  //
+  // The floor is now an independent constant, and the hold-vs-lease inequality
+  // is asserted directly (including behaviourally, across child processes at
+  // two different ATLAS_TIMEOUT_MS values) by scripts/verifyReframeHoldBounded.js
+  // rather than argued from a formula's shape.
+  assert.ok(!/Math\.max\(configured,\s*MAX_POLL_MS \+ 10 \* 60 \* 1000\)/.test(atlasSrc),
+    'the reframe lease floor is coupled to MAX_POLL_MS again — that arithmetic link is the ' +
+    'cross-repo drift defect, not a safety property');
+  assert.match(atlasSrc, /const REFRAME_CLAIM_TTL_FLOOR_MS = 20 \* 60 \* 1000;/,
+    'the independent reframe lease floor constant is missing');
 });
 
 console.log(

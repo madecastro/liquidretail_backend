@@ -149,6 +149,14 @@ function loadInvariants() {
   for (const inv of parsed.invariants) {
     if (!inv.id) fatal('an invariant has no id');
     if (!inv.forbiddenPattern) fatal(`invariant ${inv.id} has no forbiddenPattern`);
+    // Fixtures are mandatory — see runPatternProbe. An invariant without them
+    // would opt out of the discrimination proof entirely, silently.
+    if (!inv.probe || !Array.isArray(inv.probe.shouldMatch) || !Array.isArray(inv.probe.shouldNotMatch)) {
+      fatal(`invariant ${inv.id} has no probe.shouldMatch / probe.shouldNotMatch fixtures`);
+    }
+    if (inv.probe.shouldMatch.length === 0 || inv.probe.shouldNotMatch.length === 0) {
+      fatal(`invariant ${inv.id} probe fixtures must be non-empty in BOTH directions`);
+    }
     if (!Array.isArray(inv.appliesTo) || !inv.appliesTo.length) fatal(`invariant ${inv.id} has an empty appliesTo`);
     for (const ack of inv.acknowledged || []) {
       if (!REPO_LAYOUT[ack.repo]) fatal(`invariant ${inv.id}: acknowledged entry has unknown repo "${ack.repo}"`);
@@ -211,25 +219,35 @@ function scanSource(source, pattern) {
 // PROBE — prove the pattern discriminates, on fixtures, in-memory. A
 // harness that asserts "this regex is precise" without demonstrating it is
 // just a claim. Temporary strings only; no repo file is touched.
-function runPatternProbe(pattern) {
-  const shouldMatch = [
-    'lines.push(`Product: ${product?.title || \'(untitled product)\'}`);',
-    '    lines.push(`Product: ${product.title}.`);',
-    'const s = `Product:   ${x}`;',
-  ];
-  const shouldNotMatch = [
-    '  // master): `Product: Vaportek.` was read as a brand-name render',
-    '// `Product: {title}` used to lead this list; it was removed entirely',
-    '  /^Product: /,',
-    "lines.push('Product: static string');",
-    '  // Do not re-add a named Product field.',
-  ];
+// PROBE — prove the pattern discriminates live code from prose, on FIXTURES
+// supplied by the invariant itself.
+//
+// ⚠️ These fixtures used to be HARDCODED here, and they were the catalog-title
+// invariant's. That was invisible while this file held exactly one invariant
+// and became a false failure the moment a second one was added: the new
+// pattern was probed against the OLD invariant's live-code samples and
+// reported three "FALSE NEGATIVE"s for correctly not matching code about a
+// completely different defect. Fixtures belong to a pattern, so they live
+// beside it in shared-invariants.json.
+//
+// Fixtures are REQUIRED, not optional. This section's whole contract is that
+// discrimination is PROVEN rather than asserted; an invariant that ships
+// without fixtures would silently opt out of the one check that catches a
+// pattern which matches everything (or nothing).
+function runPatternProbe(inv) {
+  const probe = inv.probe || {};
+  const shouldMatch = probe.shouldMatch || [];
+  const shouldNotMatch = probe.shouldNotMatch || [];
   const failures = [];
   for (const s of shouldMatch) {
-    if (!new RegExp(pattern).test(s)) failures.push(`FALSE NEGATIVE: pattern missed live code -> ${s}`);
+    if (!new RegExp(inv.forbiddenPattern).test(s)) {
+      failures.push(`FALSE NEGATIVE: pattern missed live code -> ${s}`);
+    }
   }
   for (const s of shouldNotMatch) {
-    if (new RegExp(pattern).test(s)) failures.push(`FALSE POSITIVE: pattern matched prose/inert -> ${s}`);
+    if (new RegExp(inv.forbiddenPattern).test(s)) {
+      failures.push(`FALSE POSITIVE: pattern matched prose/inert -> ${s}`);
+    }
   }
   return failures;
 }
@@ -273,7 +291,7 @@ function main() {
   for (const inv of doc.invariants) {
     if (opts.prove) {
       check(`${inv.id}: pattern discriminates live code from prose`, () => {
-        const probeFailures = runPatternProbe(inv.forbiddenPattern);
+        const probeFailures = runPatternProbe(inv);
         if (probeFailures.length) throw new Error(probeFailures.join('\n'));
         infos.push(`${inv.id}: pattern probe passed (3 live-code fixtures matched, 5 prose/inert fixtures did not)`);
       });

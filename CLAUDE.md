@@ -515,6 +515,31 @@ concurrently.
 
 ---
 
+## Reframe claim: poll budget and lease floor are INDEPENDENT (2026-08-27)
+
+`reframeReferenceForAspect` called `pollPrediction(id)` with **no options**, so the
+reframe outpaint (`nano-banana-2/edit`) inherited `MAX_POLL_MS` — the *video*
+ceiling — by omission. It now passes its own **`REFRAME_POLL_MS`** (300000; measured
+reframe latency n=60: p50 48.5s, max 232s, zero of 126 billed reframes timed out in
+7 days, so the inherited 900s was 3.9× the observed max).
+
+**Do NOT re-derive `REFRAME_CLAIM_TTL_FLOOR_MS` from any poll ceiling.** That
+arithmetic link (`MAX_POLL_MS + 10 min`) *was* the defect: the claim is a field on
+the **shared** `Media` doc that `liquidretail_backend` also steals from with its own
+copy of the formula, so #82 raising `ATLAS_TIMEOUT_MS` here and not there put the
+two sides 5 minutes apart on when a holder is dead (25 min here, 20 there). Its
+"+10 min" was also already spent — 602.5s of bounded non-poll work meant **−2.5s**
+of real margin. The floor is now a flat 20 min in both repos; this repo's value
+dropped 25→20, which costs nothing because backend always stole at 20 anyway.
+Poll budget is a latency choice; the floor is a money guard. The **upper** clamp on
+`REFRAME_POLL_MS` is lease-derived, not `MAX_POLL_MS` — that direction is fine
+(money guard bounds latency knob), and a sweep found the reverse permits a
+1364.5s hold against a 1200s lease.
+
+Cross-repo enforcement is `scripts/shared-invariants.json` (read from backend's
+`origin/main`); per-repo, `scripts/verifyReframeHoldBounded.js` (27 checks,
+revert-proven). Full write-up: `session.d/2026-08-27_reframe-hold-bounded.md`.
+
 ## What this repo does not do (yet)
 
 - Expansion / Director / Judge / Ad mint — still backend.
