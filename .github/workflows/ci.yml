@@ -24,7 +24,23 @@ jobs:
           --health-timeout 5s
           --health-retries 5
     steps:
+      # fetch-depth: 0 is LOAD-BEARING, not a default worth trimming.
+      # scripts/verifyOperatorPromptPrecedence.js extracts the pre-change
+      # veoPromptBuilder from a PINNED IMMUTABLE SHA (BASELINE_SHA = 16e64e2)
+      # with `git show`, and compares the two builders by EXECUTING both — the
+      # harness is behavioural by design, so the baseline object has to be in
+      # the clone. actions/checkout defaults to fetch-depth: 1, which fetches
+      # only the tip commit, so `git show 16e64e2:...` fails with
+      # "fatal: invalid object name" and the harness exits 1 without running a
+      # single check. That made CI red on every push to master and every PR
+      # from 2026-08-27 (the commit that introduced the harness) onward, while
+      # the same suite passed locally, where the SHA is reachable.
+      # scripts/lib/vendorDrift.js also runs git history probes that silently
+      # degrade to "skipped" on a shallow clone.
+      # Any harness that pins a baseline SHA needs full history here.
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - uses: actions/setup-node@v4
         with:
