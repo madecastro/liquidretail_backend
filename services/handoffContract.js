@@ -85,11 +85,11 @@
 // MAJOR — a field is removed or retyped, or a state transition's owner changes.
 // MINOR — a field is added, or a new transition is documented.
 // PATCH — a description/annotation changes with no behavioural meaning.
-const HANDOFF_CONTRACT_VERSION = '1.0.0';
+const HANDOFF_CONTRACT_VERSION = '1.1.0';
 
 // sha256 over the normalized CONTRACT_FIELDS (see computeContractDigest).
 // Regenerate with: node scripts/verifyHandoffContract.js --print-digest
-const CONTRACT_DIGEST = 'fd96dd84637cda68530ea036959619215d03472a5cb027d539159c79a35d7780';
+const CONTRACT_DIGEST = 'c9ae31f35d22d966a06545d8033d49dfc38c21d82f9eed57c8f11f6551aa4cfa';
 
 // `writer` is the ENFORCED half of the contract — which service is allowed
 // to write the field. Verified against every write site in both repos as of
@@ -271,6 +271,79 @@ const CONTRACT_FIELDS = [
       'NOT touch this. Every stale-claim and reaper cutoff compares against it, which is why ' +
       'the render heartbeat exists at all: without a beat, updatedAt only moves when an ad ' +
       'settles, and a long video titling gap looks identical to a dead worker.',
+  },
+  {
+    field: 'retitleRequest',
+    type: 'Mixed',
+    writer: 'backend',
+    role: 'retitle',
+    note:
+      'THE deferral bit for manual RE-TITLE (routes/brand.js retitle-videos / title-still), a ' +
+      'THIRD independent claim namespace alongside the mint-time render claim and the ' +
+      'regenerate claim — deliberately NOT a reuse of titlingNeeded, because that claim ' +
+      '(adgen titler.js claimOne, status:{$in:[rendering,draft]}) exists only for the ' +
+      'immediately-post-generation handoff and can never match the common manual-retitle ' +
+      'target (status:live, delivered days or weeks earlier). Backend stamps the full ' +
+      'pass-through call here ONLY when it decided to defer (isAdgenRendererEnabled() true, ' +
+      'read once synchronously). The local path DOES write this field — an explicit null in ' +
+      'the same stamp write, to clear a stale payload left by a crashed deferred attempt. ' +
+      'Same $type:"object" discipline as regenerationRequest and the same reason: {$ne:null} ' +
+      'also matches every ad where the field is simply ABSENT. Cleared by the retitle ' +
+      'consumer alongside retitleResult, retitleClaimedByWorker, retitleClaimedAt. The stamp ' +
+      'filter ALSO requires regenerating:{$ne:true} (added 2026-08-28 after adversarial review ' +
+      'independently found the same gap from both repos) — without it a retitle could be ' +
+      'stamped on an ad a regenerate is actively rewriting, wasting a Remotion slot and a ' +
+      'vision-QC/face-detection LLM call on a master about to be replaced. ' +
+      '⚠️ KNOWN RESIDUAL, NOT FIXED, NARROWER DIRECTION: the reverse is not guarded — ' +
+      'adRegenerateService\'s existing in-flight lock does not check retitleRequest / ' +
+      'retitleClaimedByWorker, so a regenerate CAN start while a retitle is already claimed ' +
+      'and rendering on the same ad. Worst case is a last-writer-wins clobber between the ' +
+      'retitle\'s stale-master output and the regenerate\'s fresh (paid) master — not a double ' +
+      'bill (regenerate still submits exactly one Omni generation regardless). Judged ' +
+      'disproportionate to fix by modifying regenerate\'s own already-adversarially-reviewed, ' +
+      'money-critical lock for this comparatively low-severity, low-frequency window; flagged ' +
+      'rather than silently left undocumented.',
+  },
+  {
+    field: 'retitleClaimedByWorker',
+    type: 'String',
+    writer: 'both',
+    role: 'retitle',
+    note:
+      'The retitle lease — a field DISJOINT from claimedByWorker (mint-time render), ' +
+      'regenerateClaimedByWorker (regenerate), AND titlingNeeded (renderer->titler handoff), so ' +
+      'none of the four LEASE FIELDS can collide. This is NOT the same as "none of the four ' +
+      'operations can run concurrently" — see the regenerate-vs-retitle residual noted on the ' +
+      'retitleRequest entry above. CORRECTED 2026-08-28 (adversarial Grok review caught the ' +
+      'first draft overclaiming "confirmed FREE"): retitle makes no NEW Atlas VIDEO-GENERATION ' +
+      'submit, but does make the same real, pre-existing vision-QC + face-detection Atlas LLM ' +
+      'calls every titling render already makes. Not a new cost; the guard here is against ' +
+      'DOUBLE EXECUTION of one request, which is why — unlike the regenerate claim — this one ' +
+      'is safe to let a stale-claim reclaim sweep clear (adgen retitleConsumer.js ' +
+      'reclaimStaleRetitleClaims, modeled on titler.js reclaimStaleTitlerClaims). Backend also ' +
+      'nulls this on its local-execution stamp write, same defense-in-depth reason as ' +
+      'regenerateClaimedByWorker.',
+  },
+  {
+    field: 'retitleClaimedAt',
+    type: 'Date',
+    writer: 'both',
+    role: 'retitle',
+    note: 'Stamped in the same $set as retitleClaimedByWorker; cleared with it. Drives the reclaim sweep.',
+  },
+  {
+    field: 'retitleResult',
+    type: 'Mixed',
+    writer: 'both',
+    role: 'retitle',
+    note:
+      'Result readout for the deferred path. Retitle has no regenerationHistory-style array of ' +
+      'its own, and renderUrl alone cannot signal success — a retitle overwrites the SAME ' +
+      'Cloudinary public_id in place, so the URL string is frequently unchanged on a ' +
+      'successful retitle too. Backend nulls it in the SAME write that stamps a new ' +
+      'retitleRequest (so a stale prior result can never be misread as the new request\'s ' +
+      'outcome); adgen writes {status,renderUrl,error,completedAt} in the SAME write that ' +
+      'clears retitleRequest and the claim pair.',
   },
 ];
 

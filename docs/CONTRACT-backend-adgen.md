@@ -1,6 +1,6 @@
 # The backend ↔ adgen handoff contract
 
-**Contract version: 1.0.0**
+**Contract version: 1.1.0**
 
 ## This is a pointer, not a copy
 

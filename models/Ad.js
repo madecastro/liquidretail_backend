@@ -273,6 +273,82 @@ const adSchema = new mongoose.Schema({
   regenerateClaimedByWorker: { type: String, default: null, index: true },
   regenerateClaimedAt:       { type: Date,   default: null },
 
+  // Ad-gen microservice handoff for manual RE-TITLE (2026-08-28), mirroring
+  // the regenerate pair above field-for-field — a THIRD, independent claim
+  // namespace, not a reuse of any existing one.
+  //
+  // WHY NOT REUSE titlingNeeded/claimedByWorker (the renderer->titler
+  // handoff)? That pair's claim (liquidretail_adgen/src/services/titler.js
+  // claimOne()) requires status:{$in:['rendering','draft']} — it exists
+  // exclusively for "a master just landed and has never been titled",
+  // never for "an operator wants to redo the titling on an ad that has
+  // already shipped". retitle-videos' own eligibility filter
+  // (routes/brand.js, baseFilter) has NO status restriction — its most
+  // common real target is status:'live', which the titler claim can never
+  // match. Reusing titlingNeeded would also risk colliding with
+  // titlingResumeService.buildResumeFilter (adRegenerateService.js's
+  // matchesTitlingResumeArm reads it for a DIFFERENT purpose — the
+  // regenerate in-flight guard) and with the automatic titling-resume
+  // sweep itself. A disjoint field pair removes all of that by
+  // construction, the same way regenerationRequest's own claim is disjoint
+  // from the mint-time render claim (see that field's comment above).
+  //
+  // retitleRequest: non-null ONLY when the backend decided (at request
+  // time, reading isAdgenRendererEnabled() once, synchronously — see
+  // routes/brand.js runRetitleJob) to DEFER a manual retitle to adgen
+  // rather than run it in this process. Carries the minimal pass-through
+  // shape services/handoffContract.js documents (kind:'manual-retitle',
+  // requestedBy, requestedAt) — retitle has no per-call prompt/model
+  // arguments the way regenerate does, so the payload is small, but the
+  // SAME $type:'object' discipline applies for the SAME money-adjacent
+  // reason regenerationRequest documents: {$ne:null} would also match rows
+  // where the field is simply ABSENT (every ad minted before this field
+  // existed), which is not what a claim query should ever match.
+  //
+  // The local (backend in-process) path explicitly writes null here on
+  // every stamp attempt it takes — same defense-in-depth reason
+  // regenerationRequest's local path writes null: a stale object left by a
+  // crashed deferred attempt must not let a NEW local-path run collide
+  // with a consumer that is still watching the old claim.
+  //
+  // CORRECTED 2026-08-28 (adversarial Grok review caught the first draft
+  // of this comment overclaiming "confirmed FREE"): retitle triggers NO
+  // NEW Atlas VIDEO-GENERATION submit (services/brandScriptExecutor.js
+  // never requires atlasVideoService, grep-verified in both repos), but
+  // it DOES still make the SAME real, pre-existing Atlas LLM calls every
+  // titling render already makes — vision QC (adVisionQcService ->
+  // atlasLlmService.chatCompletion) and face-detection for the safe-crop
+  // (basePlateCropService -> atlasLlmService.chatCompletion). That cost
+  // is not new here; it is the retitle-videos feature's existing cost,
+  // unaffected by this handoff either way. What this claim pair actually
+  // guards against is a DOUBLE EXECUTION of one operator-requested
+  // retitle (wasted Remotion compute, a duplicate Cloudinary upload, AND
+  // a duplicate vision-QC/face-detection LLM call for the SAME request)
+  // — real, but lower-severity than regenerate's double-Omni-submit
+  // hazard, which is why this claim (unlike regenerate's) is safe to let
+  // a stale-claim reclaim sweep clear — see retitleConsumer.js's
+  // staleness handling.
+  retitleRequest: { type: mongoose.Schema.Types.Mixed, default: null },
+  // Which adgen retitle-consumer worker (if any) has claimed a deferred
+  // retitleRequest. Atomic claim: findOneAndUpdate({retitleRequest:
+  // {$type:'object'}, retitleClaimedByWorker:null},
+  // {$set:{retitleClaimedByWorker, retitleClaimedAt}}) — same shape as the
+  // regenerate claim, disjoint field so it can never collide with it, the
+  // mint-time render claim, or the titler claim. Cleared on completion by
+  // the SAME write that clears retitleRequest.
+  retitleClaimedByWorker: { type: String, default: null, index: true },
+  retitleClaimedAt:       { type: Date,   default: null },
+  // Result readout for the deferred path — retitle has no regenerationHistory-
+  // style array of its own, and renderUrl alone cannot signal success: a
+  // retitle overwrites the SAME Cloudinary public_id in place, so the URL
+  // string is often unchanged on a successful retitle too. The backend poll
+  // loop (routes/brand.js runRetitleJob) reads this once after
+  // retitleRequest clears, then the NEXT stamped retitleRequest nulls it out
+  // (same request write, so a stale prior result can never be misread as
+  // this request's outcome). Shape: {status:'done'|'failed', renderUrl,
+  // error, completedAt}.
+  retitleResult: { type: mongoose.Schema.Types.Mixed, default: null },
+
   // sha256 over identity inputs (campaignId, productId, mediaId,
   // template, aspectRatio, variantKind, paletteSource, ctaText,
   // ctaUrl, ctaUrlParams, rafflePrizeMediaId). Computed at queue time;

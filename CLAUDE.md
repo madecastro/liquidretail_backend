@@ -1596,6 +1596,30 @@ Video never launches a browser.
   would strand a paid master). Gate is inside `resumeUntitledMasters`, not the
   interval, so an in-flight pass finishes and a dashboard flip needs no redeploy.
   Pinned by `scripts/verifyTitlingResumeAdgenGate.js`.
+- **Manual retitle (`/retitle-videos`) can now defer to adgen — a FOURTH
+  claim namespace, not a reuse of `titlingNeeded`/`claimedByWorker`
+  (2026-08-28).** That claim is built exclusively for "a master just
+  landed and has never been titled" (requires
+  `status:{$in:['rendering','draft']}`); manual retitle's real target is
+  commonly `status:'live'`, delivered days or weeks earlier, which it can
+  never match. `runRetitleJobViaAdgen` stamps `Ad.retitleRequest`
+  (filter requires `titlingNeeded:{$ne:true}` AND `regenerating:{$ne:true}`
+  — the latter added after two independent adversarial Grok reviews
+  found the same gap: without it, a retitle could be stamped on an ad a
+  regenerate is actively rewriting), adgen's `retitleConsumer.js` claims +
+  executes. Known, narrower, NOT fixed: the reverse (a regenerate starting
+  while a retitle is already claimed) — see `docs/CONTRACT-backend-adgen
+  .md` §4a. `title-still` and `title-spec/modify` do NOT get this treatment — the
+  first is a synchronous interactive preview loop an async worker would
+  slow down, the second is an LLM spec-editor with no Remotion render in
+  it. **Also fixed here, independent of the flag:**
+  `brandScriptExecutor.uploadRenderAndStamp` forced `status:'draft'`
+  unconditionally, so every manual retitle of an already-delivered ad was
+  silently un-publishing it — opt-in `preserveAdStatus`/`retitleMode` now
+  guards it, both repos. `services/handoffContract.js` v1.1.0. Pinned by
+  `scripts/verifyRetitleAdgenHandoff.js`. Full write-up:
+  `session.d/2026-08-28_retitle-adgen-handoff.md`; field contract:
+  `docs/CONTRACT-backend-adgen.md` §4a (canonical copy in adgen).
 - **The resume state lives on `Ad.titlingResumeState` — NEVER on `renderStage`,
   and this was got wrong once.** The first design parked the sentinel in
   `renderStage`, reasoning that reusing an existing field dodges the

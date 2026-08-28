@@ -66,7 +66,30 @@ it clears it back to this placeholder in the same commit that closes it out.)_
 
 ## CURRENT STATE
 
-*(Replaced 2026-08-25 ~12:45 UTC. Narrative:
+**2026-08-28: manual retitle → adgen handoff (PR pending,
+`fix/retitle-adgen-handoff-be` + companion adgen
+`fix/retitle-adgen-handoff-ag`).** Owner asked whether backend's manual
+retitle routes would genuinely be "more scalable" routed through adgen's
+titler. Verdict: yes for `/retitle-videos` only (`title-still` is a
+synchronous interactive preview loop, `title-spec/modify` isn't a Remotion
+render at all — neither belongs in the move). Built the stamp-then-poll
+deferral (mirrors the regenerate handoff pattern, `handoffContract.js`
+v1.0.0→v1.1.0). **Found and fixed a live production bug along the way,
+independent of this work:** `brandScriptExecutor.uploadRenderAndStamp`
+forces `status:'draft'` unconditionally in BOTH repos, so every manual
+retitle of an already-delivered (`'live'`) ad has been silently
+un-publishing it, today, regardless of `ADGEN_RENDERER_ENABLED`. Fixed via
+an opt-in `preserveAdStatus`/`retitleMode` flag, both repos, revert-proven.
+Two adversarial Grok xhigh review passes (one per repo) found a real gap
+— the stamp filter also needed `regenerating:{$ne:true}` — and corrected
+an overclaim: retitle makes no NEW Atlas video-gen submit, but it does
+still make the pre-existing vision-QC/face-detection Atlas LLM calls
+every titling render makes. `scripts/verifyRetitleAdgenHandoff.js` grew
+13→16 checks. Full narrative:
+`session.d/2026-08-28_retitle-adgen-handoff.md`. **Do not merge without
+the companion adgen PR** — paired cross-repo contract change.
+
+*(Prior state replaced 2026-08-25 ~12:45 UTC. Narrative:
 `session.d/2026-08-25_review-coverage-corrected-and-ingest-mechanics.md` then
 `session.d/2026-08-25_readiness-gate-headless-tier-and-preview-underquote.md`.)*
 

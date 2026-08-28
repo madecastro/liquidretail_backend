@@ -561,13 +561,55 @@ async function runRetitleJob(jobId, brand, eligible, concurrency, seedErrors) {
         const id = String(adDoc._id);
         console.log(`🎬 retitle-videos[brand=${brand._id}]: (${i + 1}/${eligible.length}) ad=${id} starting`);
         try {
+          // Defense-in-depth against a stale OR live deferred request on
+          // this SAME ad (adversarial Grok review, 2026-08-28 — real
+          // finding, independently reproduced from both repos). Atomic:
+          // only proceeds when adgen does NOT currently hold a claim on
+          // this ad (retitleClaimedByWorker:null). Two shapes this
+          // guards against:
+          //   (a) a STALE retitleRequest sitting unclaimed (e.g. it was
+          //       stamped while the flag was on, then the flag flipped
+          //       off before adgen's consumer picked it up) — nulled
+          //       here so a LATER deferred stamp/claim on this ad cannot
+          //       collide with the local render this call is about to
+          //       run.
+          //   (b) an ACTIVE claim (retitleClaimedByWorker set — adgen is
+          //       right now mid-render on this ad, e.g. the flag flipped
+          //       off in the middle of an in-flight deferred retitle).
+          //       modifiedCount===0 in that case, and the local path
+          //       MUST NOT also render it — same principle as
+          //       adRegenerateService's notInFlight lock, applied here.
+          const localLockResult = await Ad.updateOne(
+            { _id: adDoc._id, retitleClaimedByWorker: null },
+            { $set: { retitleRequest: null, retitleClaimedByWorker: null, retitleClaimedAt: null, retitleResult: null } }
+          );
+          if (localLockResult.modifiedCount === 0) {
+            results.push({ id, ok: false, error: 'adgen currently holds an active claim on this ad — try again once it completes' });
+            done += 1;
+            const prevSkip = retitleJobs.get(jobId) || {};
+            retitleJobs.set(jobId, {
+              ...prevSkip,
+              status:   'running',
+              progress: { done, total },
+              results:  results.slice(),
+              errors:   errors.length ? errors : undefined,
+            });
+            continue;
+          }
           // Re-load as a Mongoose doc so updateOne in the save path works
           // cleanly, and renderBrandScriptAndSave can read fields.
           const ad = await Ad.findById(adDoc._id);
           if (!ad) {
             results.push({ id, ok: false, error: 'ad disappeared' });
           } else {
-            const result = await renderBrandScriptAndSave({ ad, brand });
+            // retitleMode:true — this ad is commonly already status:'live'
+            // (delivered); without this the terminal write in
+            // brandScriptExecutor would silently force it back to 'draft'
+            // on every retitle. Pre-existing bug in this exact call,
+            // independent of the adgen handoff added alongside it — see
+            // brandScriptExecutor.uploadRenderAndStamp's preserveAdStatus
+            // header.
+            const result = await renderBrandScriptAndSave({ ad, brand, retitleMode: true });
             if (result?.skipped) {
               results.push({ id, ok: true, skipped: true, renderUrl: ad.renderUrl || null });
               console.log(`🎬 retitle-videos[brand=${brand._id}]: ad=${id} skipped (${result.reason || 'no-chrome'})`);
@@ -623,6 +665,255 @@ async function runRetitleJob(jobId, brand, eligible, concurrency, seedErrors) {
     });
     reapRetitleJob(jobId);
   }
+}
+
+// Ad-gen handoff (2026-08-28) — the deferred sibling of runRetitleJob
+// above. When adgen owns rendering (isAdgenRendererEnabled()), this
+// repo's own in-process Remotion render competes with HTTP request
+// handling on the SAME process — the CPU-bound-Remotion finding this
+// codebase already established for the mint-time render loop (see
+// CLAUDE.md's Remotion memory-budget notes) applies identically here,
+// because retitle calls the exact same renderBrandScriptAndSave() the
+// render loop calls, just against an already-delivered ad instead of a
+// freshly-minted one.
+//
+// Mechanism mirrors services/adRegenerateService.regenerateAd's
+// stamp-then-return pattern (see services/handoffContract.js for the
+// field contract this repo shares with liquidretail_adgen): stamp
+// Ad.retitleRequest per ad instead of calling renderBrandScriptAndSave
+// in this process, then poll Mongo for completion. adgen's
+// src/services/retitleConsumer.js is the other half — it polls for
+// stamped-but-unclaimed requests, atomically claims one via
+// retitleClaimedByWorker (a field pair DISJOINT from the mint-time
+// render claim, the titler claim, AND the regenerate claim — see
+// models/Ad.js's retitleRequest doc comment for why a shared field would
+// have been unsafe), and runs it through ITS OWN copy of
+// brandScriptExecutor.renderBrandScriptAndSave.
+//
+// WHY A SEPARATE FUNCTION rather than branching inside runRetitleJob:
+// runRetitleJob above is the dormant fallback per this repo's convention
+// for every other migrated handoff (generate, regenerate) — it must stay
+// exactly as it was. Reusing its worker-pool/cursor machinery for a
+// claim-and-poll flow would risk changing local-path behavior too. This
+// function writes the SAME job-store shape
+// ({status,progress,results,errors,completedAt}) so the existing GET
+// /:id/retitle-videos/:jobId poll endpoint needs no change either way.
+//
+// CORRECTED 2026-08-28 (adversarial Grok review): this triggers NO NEW
+// Atlas VIDEO-GENERATION submit (brandScriptExecutor.js never requires
+// atlasVideoService, grep-verified in both repos) — but DOES still make
+// the SAME real, pre-existing Atlas LLM calls every titling render
+// already makes (vision QC + face-detection safe-crop, both via
+// atlasLlmService.chatCompletion). Not a NEW cost introduced here; the
+// claim-safety concern that matters is DOUBLE EXECUTION of one request
+// (wasted Remotion compute + a duplicate Cloudinary upload + a duplicate
+// vision-QC/face-detection call for the SAME retitle) — real, but lower-
+// severity than regenerate's double-Omni-submit hazard, which is why,
+// unlike regenerate's claim, a stale retitle claim is safe to let a
+// reclaim sweep clear (adgen's retitleConsumer does this on an interval,
+// mirroring titler.js's reclaimStaleTitlerClaims).
+const RETITLE_POLL_MS            = Math.max(500,   Number(process.env.ADGEN_RETITLE_POLL_MS)    || 2000);
+const RETITLE_STAMP_MAX_WAIT_MS  = Math.max(30000, Number(process.env.ADGEN_RETITLE_MAX_WAIT_MS) || 5 * 60 * 1000);
+
+async function runRetitleJobViaAdgen(jobId, brand, eligible, seedErrors, requestedBy) {
+  const Ad = require('../models/Ad');
+  const results = [];
+  const errors = seedErrors ? seedErrors.slice() : [];
+  const total = eligible.length;
+
+  const prev0 = retitleJobs.get(jobId) || {};
+  retitleJobs.set(jobId, {
+    ...prev0,
+    status:   'running',
+    progress: { done: 0, total },
+    results,
+    errors: errors.length ? errors : undefined,
+  });
+
+  function reportProgress() {
+    const prev = retitleJobs.get(jobId) || {};
+    retitleJobs.set(jobId, {
+      ...prev,
+      status:   'running',
+      progress: { done: results.length, total },
+      results:  results.slice(),
+      errors:   errors.length ? errors : undefined,
+    });
+  }
+
+  try {
+    // ── Stamp phase ──────────────────────────────────────────────────
+    // One atomic updateOne per ad, so a concurrently already-pending or
+    // mid-first-titling ad is skipped rather than clobbered. The filter
+    // NEVER matches an ad already carrying a retitleRequest object — a
+    // stray double-POST (impatient double-click, retry) cannot orphan a
+    // consumer's live claim by overwriting the payload out from under it.
+    const pending = new Set();
+    for (const adDoc of eligible) {
+      const id = String(adDoc._id);
+      // eslint-disable-next-line no-await-in-loop
+      const stamp = await Ad.updateOne(
+        {
+          _id: adDoc._id,
+          // Never stamp mid-first-titling. That row belongs to the
+          // renderer->titler handoff (titlingNeeded:true) — a claim
+          // namespace this must never race. See models/Ad.js's
+          // retitleRequest doc comment for the full argument.
+          titlingNeeded:  { $ne: true },
+          // Never stamp while a regenerate is in flight (adversarial
+          // Grok review, 2026-08-28 — a real finding, independently
+          // reproduced from both repos). `regenerating` is shared by
+          // BOTH the local-execution regenerate path AND the deferred
+          // one (services/handoffContract.js), so this one term covers
+          // both without needing to also read regenerationRequest. A
+          // regenerate in flight may replace this ad's veoVideoUrl (and
+          // therefore its renderUrl) entirely — titling the OLD master
+          // concurrently wastes a Remotion slot, a Cloudinary upload,
+          // AND a real Atlas vision-QC LLM call on a result that is
+          // about to be superseded, and risks a last-writer-wins clobber
+          // of whichever finishes second.
+          regenerating:   { $ne: true },
+          retitleRequest: null,
+        },
+        {
+          $set: {
+            retitleRequest: {
+              kind:        'manual-retitle',
+              requestedBy: requestedBy || null,
+              requestedAt: new Date(),
+            },
+            retitleResult: null,
+          },
+        }
+      );
+      if (stamp.modifiedCount === 0) {
+        // eslint-disable-next-line no-await-in-loop
+        const current = await Ad.findById(adDoc._id).select('titlingNeeded retitleRequest').lean();
+        if (!current) {
+          results.push({ id, ok: false, error: 'ad disappeared' });
+        } else if (current.titlingNeeded === true) {
+          results.push({ id, ok: false, error: 'ad is mid-first-titling — retry once that completes' });
+        } else {
+          results.push({ id, ok: false, error: 'a retitle is already pending for this ad' });
+        }
+        reportProgress();
+        continue;
+      }
+      console.log(`🎬 retitle-videos[${jobId}]: ad=${id} stamped retitleRequest — adgen will claim it`);
+      pending.add(id);
+    }
+
+    // ── Poll phase ───────────────────────────────────────────────────
+    // Watch the stamped set until retitleRequest clears (adgen's
+    // retitleConsumer completed it, success or fail) or the per-ad wait
+    // ceiling is hit. Per-ad, not per-batch, so one slow render cannot
+    // starve reporting on the rest of the batch.
+    const deadlineByAd = new Map();
+    const startedAt = Date.now();
+    for (const id of pending) deadlineByAd.set(id, startedAt + RETITLE_STAMP_MAX_WAIT_MS);
+
+    while (pending.size > 0) {
+      const ids = Array.from(pending);
+      // eslint-disable-next-line no-await-in-loop
+      const rows = await Ad.find({ _id: { $in: ids } })
+        .select('retitleRequest retitleResult retitleClaimedByWorker renderUrl')
+        .lean();
+      const byId = new Map(rows.map((r) => [String(r._id), r]));
+      const now = Date.now();
+
+      for (const id of ids) {
+        const row = byId.get(id);
+        if (!row) {
+          results.push({ id, ok: false, error: 'ad disappeared while retitling' });
+          pending.delete(id);
+          continue;
+        }
+        if (row.retitleRequest == null) {
+          // Consumer completed via settle() (success or fail — settle()
+          // ALWAYS writes retitleResult in the same $set that clears
+          // retitleRequest, so a genuine completion always has one).
+          const res = row.retitleResult || null;
+          if (res && res.status === 'failed') {
+            results.push({ id, ok: false, error: res.error || 'retitle failed' });
+          } else if (res && res.status === 'done') {
+            results.push({ id, ok: true, renderUrl: res.renderUrl || row.renderUrl || null });
+          } else {
+            // retitleRequest cleared with NO retitleResult — this is NOT
+            // a success shape (adversarial Grok review, 2026-08-28: an
+            // earlier version of this branch assumed success here, which
+            // is wrong). settle() never clears retitleRequest without
+            // also writing retitleResult in the same write, so the only
+            // way to reach this is something OTHER than settle() nulling
+            // it — the local path's own defensive re-stamp-guard write
+            // (this file, the worker loop above) is the one case that
+            // does, and only when a DIFFERENT, later local retitle call
+            // won a race against this exact deferred request. Report it
+            // honestly as indeterminate rather than guessing success.
+            results.push({ id, ok: false, error: 'retitle request was cleared with no recorded outcome — indeterminate, retry' });
+          }
+          pending.delete(id);
+          continue;
+        }
+        if (now > deadlineByAd.get(id)) {
+          results.push({
+            id, ok: false,
+            error: `retitle did not complete within ${Math.round(RETITLE_STAMP_MAX_WAIT_MS / 1000)}s — still pending`,
+          });
+          pending.delete(id);
+          // Only free the request if nobody is actually working on it
+          // right now. An active claim means adgen is genuinely mid-
+          // render, just slower than this poll's patience — clearing
+          // retitleRequest out from under a LIVE claim would let a
+          // brand-new stamp collide with it the moment this write lands
+          // (adversarial Grok review, 2026-08-28). If it's unclaimed,
+          // nobody will EVER finish it (adgen never picked it up, or the
+          // handoff flag flipped off after the stamp), so it is safe —
+          // and necessary — to free it or every future retitle attempt
+          // on this ad refuses with "already pending" forever. Fire-and-
+          // forget on purpose: this loop must not block on it, and a
+          // failed cleanup write just means the next attempt also times
+          // out and retries the cleanup — never a money or claim-safety
+          // issue, since the write only fires when retitleClaimedByWorker
+          // is confirmed null (nothing to clobber).
+          Ad.updateOne(
+            { _id: id, retitleClaimedByWorker: null },
+            { $set: { retitleRequest: null, retitleResult: null } }
+          ).catch((err) => console.warn(`🎬 retitle-videos[${jobId}]: ad=${id} timeout cleanup write failed — ${err.message}`));
+        }
+      }
+      reportProgress();
+      if (pending.size > 0) {
+        // eslint-disable-next-line no-await-in-loop
+        await new Promise((r) => setTimeout(r, RETITLE_POLL_MS));
+      }
+    }
+  } catch (err) {
+    console.error(`🎬 retitle-videos[${jobId}]: adgen handoff FAILED — ${err.message}`);
+    const prev = retitleJobs.get(jobId) || {};
+    retitleJobs.set(jobId, {
+      ...prev,
+      status:      'failed',
+      error:       err.message || 'retitle-videos failed',
+      progress:    { done: results.length, total },
+      results,
+      errors:      errors.length ? errors : undefined,
+      completedAt: Date.now(),
+    });
+    reapRetitleJob(jobId);
+    return;
+  }
+
+  const prev = retitleJobs.get(jobId) || {};
+  retitleJobs.set(jobId, {
+    ...prev,
+    status:      'done',
+    progress:    { done: results.length, total },
+    results,
+    errors:      errors.length ? errors : undefined,
+    completedAt: Date.now(),
+  });
+  reapRetitleJob(jobId);
+  console.log(`🎬 retitle-videos[${jobId}]: DONE (adgen) brand=${brand._id} ${results.length}/${total}`);
 }
 
 // POST /api/brand/:id/retitle-videos
@@ -762,9 +1053,21 @@ router.post('/:id/retitle-videos', express.json(), async (req, res) => {
     });
     console.log(`🎬 retitle-videos[${jobId}]: brand=${brand._id} count=${eligible.length} concurrency=${concurrency}${truncated ? ` truncated from ${totalMatched}` : ''}`);
 
+    // Ad-gen handoff (2026-08-28) — read once, synchronously, before
+    // kicking off the job, same call-time convention every other
+    // adgen-handoff gate in this repo uses (adgenBridge.js). See
+    // runRetitleJobViaAdgen's header for the full argument.
+    const { isAdgenRendererEnabled } = require('../services/adgenBridge');
+    const requestedBy = req.user?.userId || req.user?.email || null;
+
     // Fire-and-forget. Runner flips the job to done/failed; per-ad errors
     // land in results, never crash the process.
-    runRetitleJob(jobId, brand, eligible, concurrency, errors);
+    if (isAdgenRendererEnabled()) {
+      console.log(`🎬 retitle-videos[${jobId}]: deferring to adgen (ADGEN_RENDERER_ENABLED=true)`);
+      runRetitleJobViaAdgen(jobId, brand, eligible, errors, requestedBy);
+    } else {
+      runRetitleJob(jobId, brand, eligible, concurrency, errors);
+    }
 
     res.status(202).json({
       ok: true,
