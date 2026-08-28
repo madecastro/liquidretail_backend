@@ -62,12 +62,24 @@ path restages the scene; relocation only trades one collision for another.
   grants) — whoever picks this up should re-read that file's own
   instructions before touching the gate. Untouched by this PR (out of
   scope — this PR is build infra only).
-- **`verifyVendorDrift.js` is currently RED on `origin/master`** (not
-  allowlisted, not caused by this PR) — 12 vendored files drifted vs the
-  sibling backend (`ba99a59f` / #329) since the manifest's last recorded
-  look (`b7b8cae6`). Needs a human to look at each file and either port the
-  backend change or re-attest with `node scripts/verifyVendorDrift.js
-  --reconcile <path> --reason "…"`. Listed files (2026-08-24):
+- ~~`verifyVendorDrift.js` is currently RED on `origin/master`~~ — **FIXED
+  2026-08-28** (PR #94, `session.d/2026-08-28_ci-red-budget-and-vendor-drift.md`).
+  This bullet's 2026-08-24 file list is stale on its own terms (most of those
+  12 were reconciled by intervening PRs, e.g. #62) and was superseded by a
+  fresh round of drift (11 different files) that #94 reconciled individually.
+  `verifyRemotionMemoryBudget.js` was ALSO red at the same trunk tip
+  (`a108753`'s unbudgeted `REMOTION_QUEUE_CONCURRENCY` 2→3 bump) and is fixed
+  in the same PR. **Two real, unrelated, still-open debts came OUT of that
+  reconciliation pass, left deliberately `unported` rather than silently
+  cleared** — `services/brandScriptExecutor.js` (backend still lacks the
+  titling resumable-retry-cap mechanism, #81) and
+  `services/adRegenerateService.js` (backend's `runVideoFull`/`runImage`
+  lack the `assertNotInFlightBeforeSubmit()` execute-time re-check, #90) —
+  see the manifest entries for the full reasoning. If `verifyVendorDrift.js`
+  is red again by the time you read this, trunk has moved again since
+  2026-08-28; re-run it and diff fresh rather than assuming this list still
+  applies. (Prior 2026-08-24 file list retained below for archaeology only —
+  do NOT treat it as current.)
   `services/adVisionQcService.js`, `aiVideoPosterService.js`,
   `atlasVideoService.js`, `basePlateCropService.js`,
   `brandEnrichmentService.js`, `directImageRenderService.js`,

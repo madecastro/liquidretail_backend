@@ -1,17 +1,15 @@
 {
   "version": 2,
   "backendRef": "origin/main",
-  "backendHead": "8bd9eebd549fe5384bef79648688462eace907ed",
-  "generatedAt": "2026-08-28T02:47:44.204Z",
+  "backendHead": "abf7e0c2053d9e2d633cc3b3a62bad48531e3271",
+  "generatedAt": "2026-08-28T18:16:59.908Z",
   "files": {
     "models/Ad.js": {
-      "backendHash": "4caa2896cc4a2dcd56f5ccb4ba73c37d9675c9c4f59993f235befbc1b0d6672e",
+      "backendHash": "394d26a1cb8ad64b23bde73312f3473f332520dd9640b9d5e4bb8eec22d6138d",
       "adgenHash": "ca2d4d7078832e571686db189031815597bda44be9faa21137d2c1f2ef07d2a9",
-      "backendSha": "a1df77e95159ea70653d26cfe59e3dece6e52d7f",
+      "backendSha": "c77a4774c3d0837b7d44e9872a9d81abd77218f6",
       "status": "fork",
-      "reason": "fork — comment-only plus pre-existing schema-doc divergence. adgen documents the AD_VISION_QC_ENABLED env fallback its systemConfigService still honours; backend retired that fallback and its comment. regenerationRequest/regenerateClaimedByWorker/regenerateClaimedAt now exist on both sides (backend #345). adgen's schema comment documents the live claim filter as regenerationRequest:{$type:'object'} (Mongo $ne:null matches absent fields and was the double-claim bug); backend #345 still documents {$ne:null} in models/Ad.js. titlingNeeded declared on both sides (backend #332). Reconciled after #345 merged to origin/main.",
-      "portTo": null,
-      "owedSince": null
+      "reason": "Re-looked after backend #347 (c77a4774): backend corrected its OWN Ad.js comment from the stale $ne:null claim-filter description to $type:'object' — matching what adgen's copy has documented since the double-claim fix (verifyRegenerateConsumerClaim.js A3/B7). Nothing to port into adgen; backend caught up to adgen's already-correct comment. Prior fork reasons still hold: adgen documents the AD_VISION_QC_ENABLED env fallback (backend retired it); regenerationRequest/regenerateClaimedByWorker/regenerateClaimedAt and titlingNeeded exist on both sides (backend #345/#332)."
     },
     "models/Advertiser.js": {
       "backendHash": "0a7e1bb9ca5e0fbbfc6972f9c96d87f839b0a86175831b5446ae27095137ba3f",
@@ -635,11 +633,11 @@
       "owedSince": null
     },
     "services/adRegenerateService.js": {
-      "backendHash": "dfec3b32a2723140759bafe7ab3ec3bb7c2637426d61cc8be9c2eb977afdf105",
-      "adgenHash": "1963f7eb5f7bf29ccc161ab150dd6497ef74d5bb24e45b489286b55c9b11e748",
-      "backendSha": "a4cf61c733611811c3d5a81346a2bd63fff94ac5",
+      "backendHash": "792d72558e453ad9373478a3fd2dd479fe976c1664782871f84f670320bb7c43",
+      "adgenHash": "59e05a1487893ba2918d8a8dffee5a7124060017ac926c01e6c84385ac965f60",
+      "backendSha": "abf7e0c2053d9e2d633cc3b3a62bad48531e3271",
       "status": "unported",
-      "reason": "OWES PORTS IN BOTH DIRECTIONS -- a single portTo cannot express that, so read this whole reason. (a) BACKEND OWES adgen: #74's static resume-from-receipt threading (allowResume through to renderDirectImage); shouldResumeImageAttempt/submitAndPollWithResume are absent from backend. A recovered attempt at this port exists but is INCOMPLETE and must not be finished on a guess: it threads the flag through the atlas layer but the mint-path caller never passes it (so the path is dead code) and nothing consumes err.unsettledAtResume (so adding only the opt-in would terminal-fail an already-paid prediction and sever it from bootRecovery). See docs/CONTRACT-backend-adgen.md, 'What a COMPLETE port looks like in each direction'. (b) ADGEN OWES backend: #349's in-flight regenerate gate -- backend has inFlightRefusal (5x) and notInFlight (4x) in this file; adgen has 0 of each. NOTE the port target is NOT a mirror: backend puts notInFlight on regenerateAd's updateOne, but adgen's regenerateAd is UNREACHABLE in adgen production (capabilityRegistry has zero importers per scripts/lib/requireGraph.js; the live path is renderer -> regenerateConsumer -> runClaimedRegeneration). Porting it there would harden dead code. CORRECTED 2026-08-27: an earlier version of this entry claimed a THIRD divergence -- that backend's runVideoFull omits allowResume and 'defaults true', so a flag-off backend regenerate resumes a paid prediction where adgen submits fresh. That is FALSE. backend/services/atlasVideoService.js contains ZERO occurrences of allowResume; generateForAd has no such parameter and cannot resume, keeping resume in a separate resumeForAd() that must never submit. Both repos submit fresh here. The real asymmetry runs the OTHER way: adgen's generateForAd defaults allowResume TRUE, so adgen's explicit allowResume:false at the regenerate call site is load-bearing and must never be dropped.",
+      "reason": "Adgen master advanced further (PR #92, cf4e7d1, merged after this branch was cut) while this PR was open — rebased onto it. #92 adds a new catch(err.unsettledAtTimeout) branch inside runClaimedRegeneration (adgen-only, the lease/reclaim consumer PR #76 added) that deliberately does NOT call markComplete or touch the claim fields, so an unsettled poll timeout doesn't destroy the reclaim baseline before the 45-min lease can engage arm 2 — plus a receipt backfill and a lazy-require reorg. This mechanism is INHERENTLY adgen-only: it exists specifically to protect the lease/reclaim state machine backend does not have (no claimOne arm 2, no reclaim lease — confirmed, backend's adRegenerateService.js has zero occurrences of 'unsettledAtTimeout'). CANDIDATE GAP, NOT FULLY RESOLVED IN THIS PASS: backend's performRegeneration catch has no special case for err.unsettledAtTimeout either (it falls through to the generic markComplete(status:'failed')) — whether that is a real problem for backend depends on whether an operator-visible 'failed' regenerate that might still complete and bill is an acceptable outcome given backend has no automatic reclaim/retry mechanism at all (unlike adgen, nothing there would ever revisit the row automatically either way). Flagging as an open question rather than asserting either verdict — did not have confidence to resolve it definitively in this pass. Prior finding (assertNotInFlightBeforeSubmit / allowResume) is unaffected by #92 and remains the primary, confirmed gap. owedSince carries forward.",
       "portTo": "backend",
       "owedSince": "2026-08-27T10:28:51.314Z"
     },
@@ -653,12 +651,11 @@
       "owedSince": null
     },
     "services/adTitlingTruth.js": {
-      "backendHash": "217adb4910d27b03e7fdffc57c43e70df0ec153094d21d48db58286c630078f0",
+      "backendHash": "fda9f5e21fd1d510848bb6a52c870fa47e26f02441a8ea356bd6f0302df12837",
       "adgenHash": "217adb4910d27b03e7fdffc57c43e70df0ec153094d21d48db58286c630078f0",
-      "backendSha": "9d6322978bc28b080da3db6aaf510d113b0ea216",
-      "status": "synced",
-      "portTo": null,
-      "owedSince": null
+      "backendSha": "abf7e0c2053d9e2d633cc3b3a62bad48531e3271",
+      "status": "fork",
+      "reason": "Backend origin/main advanced to abf7e0c2 (#360, in-process titling removal) while this PR was in progress. Re-diffed: comment-only (drops a reference to the now-deleted scripts/backfillUntitledOrphans.js). No functional change; still synced."
     },
     "services/adVisionQcService.js": {
       "backendHash": "ec26acfea7dfb97e3537cf471da36f8dc440b13748e85b20a450b0d7fb7dc586",
@@ -763,11 +760,11 @@
       "owedSince": null
     },
     "services/atlasImageService.js": {
-      "backendHash": "b9806803b902b482703a8ea78465390ebd4af0fcdc8f8eebfb39b1b635d0264c",
+      "backendHash": "b24b691e1c18843ca9c73d3ade7f686a3c9f354833be39b7ccdf07ae733318ca",
       "adgenHash": "ddf91227da01f956b6051211f667b828c4b115e77162cfaa9cdbc57560e2c7e9",
-      "backendSha": "39231220ca43a37e68bcf908fc54d1af77fb6aa3",
+      "backendSha": "b557b492ad1373340831316bb21610c9bb6b1557",
       "status": "unported",
-      "reason": "MONEY, adgen-only as of #74 (945f8cb): shouldResumeImageAttempt + submitAndPollWithResume give the static/image charge point a resume-from-receipt guard, mirroring atlasVideoService.shouldResumeAttempt. Verified ABSENT from backend origin/main f8b3d6b1 (0 occurrences of either symbol in backend/services/atlasImageService.js, vs 7 here), so backend still submits a NEW gpt-image-2 generation on every renderDirectImage re-entry with no check of Ad.imageGeneration.predictionId -- the exact gap PR #40's own message admitted. Backend owes this port while its flag-off in-process render path is still live.",
+      "reason": "Backend origin/main advanced to abf7e0c2/#358 while this PR was in progress. Re-diffed: comment-only (notes services/openaiImageService.js, an unrelated dead mask-inpainting fallback, was deleted as confirmed-dead code). Does not touch the resume-from-receipt gap this entry tracks. Prior unported reason (PR #74/945f8cb: shouldResumeImageAttempt + submitAndPollWithResume, confirmed absent from backend, 0 vs 7 occurrences) still holds and owedSince carries forward.",
       "portTo": "backend",
       "owedSince": "2026-08-27T10:28:36.278Z"
     },
@@ -789,13 +786,11 @@
       "owedSince": null
     },
     "services/atlasModelMap.js": {
-      "backendHash": "08a683a04ca018fd02b38dcb8538c4d54bde6eb1b18cca1e2962a9d89ee49c44",
+      "backendHash": "c63de75b3de0534275500a3da94835a61fe9b32301da1dd943bff8d796cf4626",
       "adgenHash": "0dc008f35e1f1e4c3eb95c8744e7ab9293082d4e4a85ead90f49dae1be8ce48c",
-      "backendSha": "aff3488d494ee7484d27971920a2b96e438e60fd",
+      "backendSha": "1d8a9d8f965c3f2b3c12cfb803794ec470537296",
       "status": "fork",
-      "reason": "adgen routing table is a narrower extract; not a wholesale copy",
-      "portTo": null,
-      "owedSince": null
+      "reason": "Re-looked after backend 1d8a9d8f: backend nulled the 'director' role's Anthropic direct-twin fallback (temporarily, per its own comment) because neither backend-web nor backend-worker has ANTHROPIC_API_KEY on Render, which was causing 2x [LLM_AUTH_MISSING] log noise per Director round with no functional effect (transport skips a keyless direct twin for free). Not ported: adgen's 'director' role entry is currently UNREACHABLE in production — aiCreativeDirectorService.js (the only adgen caller of DIRECTOR_ROUND_MODEL='director') is vendored but not invoked from any live path (orchestrator.js is still Phase 0 no-op; Phase B expansion has not started here), so this has zero live effect on adgen today either way. Recorded rather than silently matched: whoever wires Phase B expansion should check ANTHROPIC_API_KEY provisioning on adgen's own Render services (adgen-orchestrator / adgen-api) before relying on this role's direct fallback — not verified in this pass. Standing fork reason still holds: adgen's routing table is a narrower extract of backend's, not a wholesale copy."
     },
     "services/atlasTextService.js": {
       "backendHash": "55704dd5ac0061595e5b03840e1b972ac8509ae96d5875c88c7b32c7e954651c",
@@ -807,11 +802,11 @@
       "owedSince": null
     },
     "services/atlasVideoService.js": {
-      "backendHash": "62ab39d8f0557efbc87a6136b6d5039b82d9918c6baf4b40b00b5976ffc64267",
-      "adgenHash": "b012c3c883bbcc2dc584d28a5b128a015f3352bc7c113a9acaeacc585d30e384",
-      "backendSha": "8bd9eebd549fe5384bef79648688462eace907ed",
+      "backendHash": "62b505c09e67482c557573c10f58e2fae9be4863387d49b1da798f12c555aa6f",
+      "adgenHash": "d79651947022dc1297fbe3c7c9e5efdd0f150757d9b4d1cf081417077806c3fc",
+      "backendSha": "4a519da094dcbdbb466dec10a2ba3671bd148136",
       "status": "unported",
-      "reason": "OWED PORT as of #82 (8eb3e5d, 2026-08-27). Reason rewritten 2026-08-27 after two of its three original arguments were refuted, both in the reassuring direction — read this version, not the summary in #84.\n\nLEAD WITH THE MECHANISM, NOT THE ARITHMETIC: BACKEND LEAKS A REFRAME CLAIM ON EVERY DEPLOY. adgen registers each live claim in _activeReframeClaims and evicts the set from its SIGTERM path (releaseAllActiveReframeClaims, called from renderer.js). Backend has NEITHER identifier anywhere on origin/main (verified: zero occurrences). Backend web deployed 12+ times today, and there are two live orphaned reframe claims with dead holders in Media right now — exactly that shape. Porting the SIGTERM eviction is worth more than porting the constant, and is the single highest-value item here.\n\nTHE CONSTANT, still owed: #82 raised MAX_POLL_MS 600000 -> 900000 on the adgen side only (the 'const MAX_POLL_MS' assignment in src/services/atlasVideoService.js, at line 355 as of 8eb3e5d; backend services/atlasVideoService.js:314 on origin/main 8bd9eebd, the currently deployed commit — re-verified there after backend #352 moved that file: still || 600000, still Math.max(configured, MAX_POLL_MS + 10*60*1000) at :215, and still zero occurrences of the SIGTERM eviction). It matters because REFRAME_CLAIM_TTL_MS is floored at MAX_POLL_MS + 10 min in BOTH repos and the claim it guards is a field on the SHARED Media document (metadata.reframes.<aspect>.claim.at) in the SHARED database, each side stealing on claim.at < now - its OWN TTL. Adgen 25 min, backend 20 min. How each gets its value: ATLAS_TIMEOUT_MS is on no Render service and in no env group, but adgen's src/config.js dotenv-loads config/defaults.env which DECLARES ATLAS_TIMEOUT_MS=900000, so adgen parses 900000; backend's defaults.env does not declare it, so backend hits its || 600000.\n\nRETRACTED (this said we were safe; it was wrong): the earlier '~18 min structured worst case, under backend's 20 min line'. It omitted the trailing poll GET. pollPrediction's while-condition tests its per-invocation budget (the maxPollMs option #83 introduced, defaulting to the module constant; the reframe caller passes no options so its budget IS the 900000) only at the TOP of the loop, then sleeps POLL_INTERVAL + jitter (15000 + <=3000 in prod) and only AFTERWARDS issues its GET with a 30s timeout, so an iteration can begin 1ms inside the deadline and run ~48s past it. VERIFIED on master 9f41215 that #83 changed WHICH budget is enforced and NOT the overshoot: the loop body has no deadline-aware clamp on either the sleep or the GET, so this term is still live. The peer's poll-overshoot fix will retire it once it lands; it has not landed. Corrected bounded non-poll work is 602.5s (10.04 min) against the +10 min slack: -2.5s margin, in BOTH repos, since the slack and the non-poll code are identical on each side. The floor is marginally negative, not conservative.\n\nFRAME THAT ENVELOPE OR IT MISLEADS: 602.5s is a fully adversarial stack (source needing re-encode, a rate limit landing precisely at the deadline, the outpaint upload failing so the pad fallback also runs, every axios timeout firing at its limit). TYPICAL HOLD IS ~1-2 MIN. So: typical ~1-2 min, worst-case envelope ~10 min on top of the poll, floor sized against the envelope with no margin left. A -2.5s margin is a paper result; the deploy-time leak above is the actionable one.\n\nRETRACTED: 'the untimed Cloudinary upload'. It is timed — cloudinary 2.10.1 calls post_request.setTimeout(options.timeout ?? 60000) and aborts (node_modules/cloudinary/lib/uploader.js:609), and cloudinaryService.js's cloudinary.config() passes no timeout, so 60s applies. Narrower true caveat: that is Node's socket-INACTIVITY timeout, not a total-duration deadline, so a slowly trickling transfer can exceed 60s while a hung socket cannot.\n\nRETRACTED: the '5m19s cold reframe stage'. Never a measurement — it appears twice in the file as prose, the second instance citing 'this file's own notes'. Real distribution: n=60, p50 48.5s, p95 136.6s, max 232s; 900000 is 3.9x that max; ZERO of 126 billed reframes timed out in 7 days. So raising the ceiling lengthened adgen's LEASE without lengthening its HOLD.\n\nFREQUENCY IS TWO NUMBERS, DO NOT LET ONE COVER BOTH: steal path zero observed; claim contention 11+ hits in 7 days plus the two live orphans. An earlier version let a single 'most likely zero' stand for both and understated a real, present, observable condition.\n\nBackend's sharer is live and ungated on ADGEN_RENDERER_ENABLED: POST /api/ads/video-ref-prewarm (routes/ads.js:4278) -> videoRefPrewarmService.js:237 buildReferenceImages -> reframeReferenceForAspect -> pollPrediction; the route's own switch is VIDEO_REF_PREWARM_ENABLED (default true) and reframeReferenceForAspect's is REFRAME_ENABLED (default true). Backend's acquire carries no holder-identity/fence/receipt/idempotency guard so a steal goes straight to a billable POST, and releaseReframeClaim is scoped to claim.by so the robbed holder's release no-ops.\n\nA peer is landing the real fix as PRs: a ~300s reframe poll budget on its own env key, a floor held at 20 min in BOTH repos derived from nothing, the SIGTERM eviction port, durationMs instrumentation, and the poll-overshoot fix (which retires the 48s term). Recorded unported/portTo=backend rather than as a plain whole-file fork so this cannot be absorbed silently.",
+      "reason": "PARTIALLY RESOLVED, re-verified by direct diff (not relayed): the reframe-claim-eviction + poll-budget-decoupling debt this entry previously tracked IS NOW SYNCED. Backend #355 (6535be5f, MERGED — verified via git merge-base --is-ancestor against origin/main, not the stale local backend working tree which is behind origin/main for this exact file) and adgen #89 (40f9003, MERGED) both landed. Directly diffed the specific mechanisms: _activeReframeClaims registry + releaseAllActiveReframeClaims() SIGTERM/crash sweep — same logic, comments reworded only; REFRAME_POLL_MS()/REFRAME_CLAIM_TTL_FLOOR_MS/REFRAME_BOUNDED_NON_POLL_MS/REFRAME_MIN_LEASE_MARGIN_MS — byte-identical function body on both sides; releaseReframeClaim's emptyUrl handling — present on both. This piece of the debt is closed. STILL GENUINELY OWED, unrelated to the above: the video-master-timeout-livelock fix (#82, MAX_POLL_MS 600000->900000 plus the unsettledAtTimeout/hold handling) is confirmed STILL NOT ported — backend's MAX_POLL_MS is still 600000 (services/atlasVideoService.js:345 on origin/main) vs adgen's 900000 (src/services/atlasVideoService.js:559). The file is ~720 lines longer in adgen than backend (5702 vs 4982) with 28 remaining diff hunks, some large (a 282-line and a 211-line block collapse to 16/6 lines respectively on backend's side) — this reconcile pass verified ONLY the specific reframe-claim/poll-budget mechanism named in its prior entry, per instruction; it did NOT re-audit the full remaining ~700-line divergence (the #82 debt and whatever else has accumulated) line-by-line. Flagging that as a real, separate, still-substantial follow-up — do not read 'unported' here as fully characterized, and do not silently downgrade to fork without a fresh full read given the file's money-criticality and size.",
       "portTo": "backend",
       "owedSince": "2026-08-27T16:49:12.296Z"
     },
@@ -834,13 +829,11 @@
       "owedSince": null
     },
     "services/bootRecoveryService.js": {
-      "backendHash": "1d00e706cb433078d61bba46abc41cb12ffedcd046062a8469f780de6be9429f",
+      "backendHash": "23c6c84aed1a3cc6ec0e3ae4cd003f5de614c14e4670f376e35fa71a2bf716cb",
       "adgenHash": "4ada172fccc5099bf1c7539a168ecc229f4b2afbfacf81b902ce2658ea94dac0",
-      "backendSha": "f8b3d6b152a848a3c9f5665f45cc6c00500ce0cb",
+      "backendSha": "abf7e0c2053d9e2d633cc3b3a62bad48531e3271",
       "status": "fork",
-      "reason": "Genuine FORK as of 2026-08-26, not a debt: both repos fixed the same titler-handoff race with DIFFERENT, role-appropriate fixes. Backend #346 (f8b3d6b1) makes its sweep stand down on isAdgenRendererEnabled() and adds claim-awareness, SCOPED TO VIDEO RECOVERY ONLY (static-image recovery stays unconditional). adgen #75 (c02c7ff) instead makes ITS sweep stop stomping its own titler handoff, because on adgen's side the dangerous row has no claim at all. Neither side should take the other's patch verbatim. Consequence worth knowing (backend #346's own comment): with backend gated off, a claim stuck past AD_HEARTBEAT_MAX_MS no longer fails over to backend -- recovery depends entirely on adgen's own sweep.",
-      "portTo": null,
-      "owedSince": null
+      "reason": "Backend origin/main advanced to abf7e0c2 (#360, in-process titling removal) while this PR was in progress. Re-diffed: mechanical only — STATE_PENDING/TITLING_PENDING/fallbackPosterUrl are now inlined directly (their prior source, services/titlingResumeService.js, was deleted entirely) with updated comments noting the sentinel is now a breadcrumb with no consumer on backend's side. Same values, same behavior. Prior fork reason still holds (backend #346 / adgen #75 solved the same titler-handoff race with different, role-appropriate fixes; neither should take the other's patch verbatim)."
     },
     "services/brandCatalogService.js": {
       "backendHash": "d7b9a4558ffaeffe30d0f4708ffb0800896465e12b5ce881e2278a681a837616",
@@ -885,12 +878,12 @@
     },
     "services/brandScriptExecutor.js": {
       "backendHash": "bc87bd56fa996f2aca33e581712496b35e68ea4fda285e5dec79491e9c1c8165",
-      "adgenHash": "077e1c05b344f569fb085dcbd415d1875c633534e7b6f3c23b1a5b1b13cee9ed",
+      "adgenHash": "991c2a87063e682fdc1af021e67e80cce74c2a5d510c46bdc2a633719fe8f15d",
       "backendSha": "2d93ace1f79a7d91c7aede75667fb4d8c4e48a23",
-      "status": "fork",
-      "reason": "adgen video QC/titling path (Remotion child OOM/timeout); colourway gate hunk-ported from backend #324. FIXED 2026-08-24: the #307 port (below, plateIntelService.js) left both renderTitles({...}) call sites here computing platformFormat but never deriving safeZoneKey from it, so bandsFor(safeZoneKey) always got undefined and silently used pre-#307 BANDS on every real render — the fix was reachable but never actually exercised. Now computes `const safeZoneKey = resolveSafeZoneKeyCjs({format, platformFormat})` once and forwards it to both call sites. Same gap independently found and fixed on backend main the same day (unmerged there too as of this reason). Verified via scripts/verifyKeepOutBandGeometry.mjs groups I/J/K, mutation-proven (dropping the call-site arg, and a decoy hardcoded null, each turn a check red).",
-      "portTo": null,
-      "owedSince": null
+      "status": "unported",
+      "reason": "UPDATE (backend origin/main advanced to abf7e0c2, PR #360, mid-session): the titling-removal task flagged as possibly in-flight in the prior reconcile HAS NOW LANDED — but via a fresh PR (#360), not through either worktree checked earlier (.wt-remove-backend-titling / .wt-remove-dead-code-be, both still empty). PR #360's own commit message explicitly EXCLUDES this file: 'brandScriptExecutor.js (the Remotion titling engine itself...) ... unchanged and stay alive as shared helpers' — backend's manual retitle HTTP endpoints (routes/brand.js: /retitle-videos, /title-still, /title-spec/modify) still call renderBrandScriptAndSave directly. Confirmed by diff: brandScriptExecutor.js itself has ZERO changes in #360 (not in its changed-files list). So the port question is NOT moot — the file is still live, just reached through a narrower (manual-trigger-only) surface instead of the automatic render-loop, which #360 DID remove the callers from (routes/ads.js's runRenderLoop, adRegenerateService.js's runVideoFull). The underlying gap (backend structurally lacks stampTitlingFailureAndThrow/TITLING_ATTEMPTS_MAX) is unchanged and still real, just narrower blast radius now. owedSince carries forward.",
+      "portTo": "backend",
+      "owedSince": "2026-08-28T17:47:48.113Z"
     },
     "services/brandScriptRunner.child.js": {
       "backendHash": "c8f60343c015bda7e03d69bfa07b8d01cb91c3347701a11773412537a6e36b76",
@@ -985,12 +978,13 @@
       "owedSince": null
     },
     "services/campaignAdsGenerationService.js": {
-      "backendHash": "def174e4b6444f63ed1661ac891a7574a6deeeadfe8164be3d170ba0c02883e0",
+      "backendHash": "21c4577d9264cdc6a504aa7036799f0183575c1a85a928ee1aee2f8e9ef02713",
       "adgenHash": "def174e4b6444f63ed1661ac891a7574a6deeeadfe8164be3d170ba0c02883e0",
-      "backendSha": "c5a378f16ffe1a9fe5a959c877a3b63c16c81620",
-      "status": "synced",
-      "portTo": null,
-      "owedSince": null
+      "backendSha": "0a7a69b984c77477dce17b45c0d9c15e9e005fe0",
+      "status": "unported",
+      "reason": "Fresh diff (no prior context): backend rewrote isSharedPortraitPlatePromptCoherent() (used only inside resolvePortraitMasterFormat/planDeterministicVideoAds, the MINT-TIME shared-portrait-master decision) to drop the isHookFirstVideoPromptEnabled() gate and test camera-directive equality alone, per an explicit 2026-08-26 owner decision recorded at length in the backend comment ('Decouple them but leave them sharing a plate... right now they should share the plate'). Adgen's copy still has the OLD gate (hookFirst===true required to share), which — since VIDEO_HOOK_FIRST_PROMPT/PMAX_VIDEO_DIRECTIVES are OFF by default on both repos — would fail closed and mint TWO billable ~$0.90 portrait masters instead of one shared master, exactly the double-bill this function exists to prevent. VERIFIED THIS IS CURRENTLY DEAD CODE IN ADGEN, not a live bug: isSharedPortraitPlatePromptCoherent/resolvePortraitMasterFormat/planDeterministicVideoAds are reachable only from expansion/mint (expandWizardJob, runConceptDrivenExpansion), which adgen's orchestrator.js explicitly does not run (still Phase 0, its own header comment: 'Do not wire expandWizardJob, Director, Judge, mint, or brief-derivation') — expansion is 100% backend today. The one function this file exports that IS live in adgen, resolveDeriveFromMaster (required by renderer.js:141), is BYTE-IDENTICAL between the two repos — confirmed by direct diff. So there is no money impact today, but this MUST be ported before any Phase B work wires expansion into this repo, or the double-bill reopens the moment the code goes live here. Recorded as owed-to-adgen debt rather than a fork so it cannot be silently forgotten by the time Phase B lands.",
+      "portTo": "adgen",
+      "owedSince": "2026-08-28T17:44:28.333Z"
     },
     "services/campaignBriefDerivationService.js": {
       "backendHash": "f08c591b1cfeb0c971d43afa316ebca613570e483654cebd9bd7655d6c69230e",
@@ -1001,12 +995,11 @@
       "owedSince": null
     },
     "services/campaignRunGuards.js": {
-      "backendHash": "891af0dcbd31ff71427f4444f52a6c002f193c76e6f6f5cfb9e6998a8c35f345",
+      "backendHash": "80db25af248528b92dc7d5ec91d394333d7d099d3a48632b918911f2bffe6f40",
       "adgenHash": "891af0dcbd31ff71427f4444f52a6c002f193c76e6f6f5cfb9e6998a8c35f345",
-      "backendSha": "c27df03909ad9b54df9dfc8d27b4c52fdadbadce",
-      "status": "synced",
-      "portTo": null,
-      "owedSince": null
+      "backendSha": "abf7e0c2053d9e2d633cc3b3a62bad48531e3271",
+      "status": "fork",
+      "reason": "Backend origin/main advanced to abf7e0c2 (#360) while this PR was in progress. Re-diffed: comment-only (corrects classifyRunAdOutcome's doc comment now that titlingResumeService no longer exists to reclaim a stranded video ad — backend titles exclusively via the narrow manual-retitle endpoints now, adgen owns the automatic path). No functional change to the classification logic; still synced."
     },
     "services/campaignRunHeartbeat.js": {
       "backendHash": "6afcd696fa4b20916b535ade7c3d3cfc87362e51f5f2f46b63a0f3d90e39c0de",
@@ -1083,13 +1076,11 @@
       "owedSince": null
     },
     "services/concurrency.js": {
-      "backendHash": "019ff6bfee1808f92e9f55dd91ca052e9a4c242bd8bab40525ca3669dad45a16",
+      "backendHash": "a11369b975d38981e9c4efc167ccf2401f9f83390f0e4ca2db9a4ff653e9e152",
       "adgenHash": "e3ea6e93a9f0310ce31c422a8ada44e4033f126a4222507da8da1df6174f6a7e",
-      "backendSha": "8fc602d6d080871456e0ad37b6934b86a7bb6e04",
+      "backendSha": "abf7e0c2053d9e2d633cc3b3a62bad48531e3271",
       "status": "fork",
-      "reason": "adgen-only: SPEC fallback lowered 4->2 (4 is the measured OOM-fatal value on an 8 GiB box; a degraded-boot fallback must be the most conservative survived value), plus a correction to the why-note — the old ~0.9 GiB/slot figure divided a 7.57 GiB peak by 8 permits when only 4 were rendering; real figure is ~1.97 GiB/slot. adgen tuned operating value lives in config/defaults.env (3). Backend still carries default 4 in its own copy; see handoff follow-up.",
-      "portTo": null,
-      "owedSince": null
+      "reason": "Backend origin/main advanced to abf7e0c2 (#360, in-process titling removal) while this PR was in progress. Re-diffed: backend removed its VEO_TITLING_CONCURRENCY entry entirely (governed routes/ads.js's now-deleted in-process titling call; REMOTION_QUEUE_CONCURRENCY is the separate, still-live knob and is untouched). Adgen still uses VEO_TITLING_CONCURRENCY for its own live titling-prep permit (src/services/renderer.js) — this is NOT something to remove here, backend's removal reflects ITS OWN dead call site, not a shared decision. Prior fork reason (adgen-only SPEC fallback 4->2, tuned operating value 3 in defaults.env) still holds."
     },
     "services/copyDerivationService.js": {
       "backendHash": "d7e3d8dfd47fbbd22443452c542dba8f71d800ddcf5b914d8f6848b4f8401669",
@@ -1192,6 +1183,13 @@
       "reason": "backend /generate 409 gate; adgen is downstream of the mint (look before wiring)",
       "portTo": null,
       "owedSince": null
+    },
+    "services/handoffContract.js": {
+      "backendHash": "ffff241ed1e811fe493ff6369ac9e5d53457f24e07b16d0af0d5e7161835f8f8",
+      "adgenHash": "ffff241ed1e811fe493ff6369ac9e5d53457f24e07b16d0af0d5e7161835f8f8",
+      "backendSha": "c77a4774c3d0837b7d44e9872a9d81abd77218f6",
+      "status": "unused",
+      "reason": "Not required from src/ production code (verifyVendorDrift's dead-module check only walks the src/ requirer graph), but it is NOT actually dead: scripts/verifyHandoffContract.js requires it directly and holds it byte-identical to backend's copy (its own check E) as the versioned Ad-handoff contract declaration (PR #78, docs/CONTRACT-backend-adgen.md). Consumed by test tooling, not runtime code — same pattern as a schema/fixture file. Backend's origin/main copy (git show origin/main:services/handoffContract.js) is byte-for-byte identical to adgen's, so verifyHandoffContract.js's own check E is currently green; first-seen in the manifest, was never seeded when PR #78 landed."
     },
     "services/httpScrapeClient.js": {
       "backendHash": "5c6a39f31715b90374ef2fc5783b66a0604783fb9585c3d44a23618f4f3f0242",
@@ -1344,15 +1342,6 @@
       "portTo": null,
       "owedSince": null
     },
-    "services/nerService.js": {
-      "backendHash": "68bd7068e9f871899d02d94048ba2ba28bd94eff024cc54dfcd36c95ebebbcc4",
-      "adgenHash": "68bd7068e9f871899d02d94048ba2ba28bd94eff024cc54dfcd36c95ebebbcc4",
-      "backendSha": "872c40ef6b92738038a5d89903afa67954263b1d",
-      "status": "unused",
-      "reason": "backend NER; adgen does not call it",
-      "portTo": null,
-      "owedSince": null
-    },
     "services/openaiService.js": {
       "backendHash": "81669aad712ccf6e38a8de49ce3dbcea380c861fa275d492ccbc8f64753cf6d6",
       "adgenHash": "81669aad712ccf6e38a8de49ce3dbcea380c861fa275d492ccbc8f64753cf6d6",
@@ -1396,12 +1385,11 @@
       "owedSince": null
     },
     "services/platformFormats.js": {
-      "backendHash": "6e0a24cbf76a019e1425599a2c6411d8012962f80915fb474a699c3e003a8cde",
+      "backendHash": "1bcafb97fca91a099e62446a50fc31b51d0596ad3a3b5b1f58376cd786578ee5",
       "adgenHash": "6e0a24cbf76a019e1425599a2c6411d8012962f80915fb474a699c3e003a8cde",
-      "backendSha": "d143161a6927f877800852e8416f90e87da64ff4",
-      "status": "synced",
-      "portTo": null,
-      "owedSince": null
+      "backendSha": "b557b492ad1373340831316bb21610c9bb6b1557",
+      "status": "fork",
+      "reason": "Backend origin/main advanced to abf7e0c2/#358 while this PR was in progress. Re-diffed: backend deleted the already-dead 'companions' field (zero consumers, per its own comment) and updated surrounding prose accordingly. Adgen's copy still carries that same dead field (harmless, matches adgen's own no-action-needed convention for confirmed-dead data elsewhere in this manifest). No functional change; still synced."
     },
     "services/pmaxSplitStrategy.js": {
       "backendHash": "d227762c157ac3a788b3ad02da73dd9c393e127bdb3c70e39d67d2f3d4a9552c",
@@ -1679,22 +1667,19 @@
       "portTo": null,
       "owedSince": null
     },
-    "services/semaphore.js": {
-      "backendHash": "aac2d3668b0e13db95c7ba67cfb83c2524165867821022d06f3873289badec40",
-      "adgenHash": "aac2d3668b0e13db95c7ba67cfb83c2524165867821022d06f3873289badec40",
-      "backendSha": "2137944c70a26ba115c72379a846d39ec4eb6e76",
-      "status": "unused",
-      "reason": "backend semaphore helper; no adgen caller",
-      "portTo": null,
-      "owedSince": null
-    },
     "services/shotTypeRank.js": {
       "backendHash": "10d365dae48beedf6c035665fbdca87f479962475a11fd83600ba1268ede6776",
       "adgenHash": "392d03a90dede955a61b0768b2a60d287d0a2e886c1d39ad0301b7ef24012603",
       "backendSha": "6c59c64ee0c353c3121beaa0e9738b96241fbf08",
-      "status": "synced",
-      "portTo": null,
-      "owedSince": null
+      "status": "fork",
+      "reason": "Fresh diff (no prior context): adgen added APPAREL_SHOT_TYPE_RANK + rankOf/rankByShotType's apparelSafe option (e24b182, feat/apparel category-aware safety hardening) — backend has neither. Deliberate adgen-only addition, not accidental drift: it exists to mitigate OpenAI gpt-image-2/edit's safety-classifier false positives on apparel/swimwear catalog photography (measured 2026-08-25, run_1787684512013_e5feaf12, 4/9 Pelagic swimwear statics flagged safety_violations=[sexual]), and adgen is the repo that actually renders images against OpenAI in production today (backend no longer renders — see backend session.md). Backend does not need this: it never calls directImageRenderService/gpt-image-2 in production, so there is nothing for it to mitigate. Noted in passing, not part of this reconcile: the reference-side half of the mitigation (apparelSafe:true / APPAREL_SHOT_TYPE_RANK) is defined but its one call site (campaignAdsGenerationService.js:2625) still calls rankByShotType(medias) with the default apparelSafe:false — only the prompt-side half (staticAdIntents.js isApparelCategory clause) is actually wired today. Not a reconcile question (wiring, not vendor drift); flagging for whoever owns that feature."
+    },
+    "services/singletonLease.js": {
+      "backendHash": "6ade006903b2903f27950340b1e265796f3efed73ba9ae7d10504f36331d86e8",
+      "adgenHash": "5be1ed86115ddb3cd712c74ad9cb78777cf8cdc8c1c097e5a1c38d702ffc7254",
+      "backendSha": "279061d84d65aa5f19f93bc74e3e617eac41cae3",
+      "status": "fork",
+      "reason": "Deliberate fork, not a port — PR #79 (feat/distributed-lease, merged 2026-08-27). Adgen's version solves a different problem (orchestrator-side expansion singleton across N instances) than backend's (worker housekeeping singleton for scheduledSyncService/backlogWatchdog); file's own header says 'modelled on backend services/singletonLease.js but NOT a port of it.' Shares the collection name (singleton_leases) with backend by design but uses different lease NAMES, so no cross-service collision. Required from src/services/orchestrator.js:34 (createSingletonLease) — not dead. First-seen in the manifest; was never seeded when PR #79 landed."
     },
     "services/slackRunVerbosity.js": {
       "backendHash": "9b6cc15dfdb39bb3c0fdb331c67a477d994ce4461facea66762a570d65702260",
@@ -1722,13 +1707,11 @@
       "owedSince": null
     },
     "services/spendReceipt.js": {
-      "backendHash": "12b7b031888b682b9f7a9f7490f08cb894b173d90d9197bea554419340b6cdc6",
-      "adgenHash": "12b7b031888b682b9f7a9f7490f08cb894b173d90d9197bea554419340b6cdc6",
-      "backendSha": "322bc3a1bbd5f9bca5c4360c7c89c2e550f2e935",
-      "status": "unused",
-      "reason": "only reached from unused spendGuard (look before wiring — money-adjacent)",
-      "portTo": null,
-      "owedSince": null
+      "backendHash": "1fb921cb24e9f159fb268909b495f185b73b8d9d4548aaec5fed6160cc40bd9a",
+      "adgenHash": "41a857ecdee5e887c184191e3b7e1787841fcba0aebf4cd894370806b51bac46",
+      "backendSha": "b5a42717c4a15f800224e374bcbe11cae7046398",
+      "status": "fork",
+      "reason": "STATUS LABEL WAS WRONG, fixed in this pass: prior entry said status=unused ('only reached from unused spendGuard') — VERIFIED FALSE by grep. This file is live-wired into money-critical code: renderer.js requires and calls resolveUnsettledTimeoutAction (:1944,1959, the video-master-timeout-livelock fix, PR #82) and receiptFree (:2744,2746, the requeue-guard composer), and bootRecoveryService.js requires and uses HAS_RECEIPT (:96,194, the boot-recovery selector). Re-diffed fresh: adgen added resolveUnsettledTimeoutAction (the hold/terminal/release decision for an unsettled poll timeout against adgen's OWN atomic multi-worker claim) since the last look; backend separately added adSpendReceipts/receiptId (2026-08-27, a READ-SIDE helper so routes/ads.js projectAd and routes/catalog.js's ads-detail allowlist expose the receipt over HTTP without disagreeing on field shape). Neither needs porting to the other: adgen has no HTTP API (GET /health only, per CLAUDE.md) so has no consumer for the read-side helper; backend's OWN unsettled-timeout handling (routes/ads.js:3266, err.unsettledAtTimeout) is structurally different from adgen's — it never releases the claim or flips status in the first place, so it does not obviously have the release-then-immediate-reclaim race PR #82 fixed on adgen's atomic-claim architecture, though a full audit of backend's own claim semantics is out of scope for this reconcile pass and is NOT asserted safe with confidence — flagging as a possible follow-up rather than a verified non-issue. Recorded as fork (not unported): porting adgen's hold/cap state machine into backend's differently-shaped, currently-inert (ADGEN_RENDERER_ENABLED=true in prod) render loop is real design work, not a mechanical port."
     },
     "services/staleness.js": {
       "backendHash": "136732eeb99b3d46f9d39910319803759bd45fd58d6eb810ec1492a41c8a1aa6",
@@ -1823,15 +1806,6 @@
       "portTo": null,
       "owedSince": null
     },
-    "services/titlingResumeService.js": {
-      "backendHash": "fd938acd3cbd1060ae81351da372442d53dd5dafc1bd728908226f15ff9d758d",
-      "adgenHash": "74cc31a25e9f56fec8abedbcbb14942556434836b7df96d07044e2abc03844a6",
-      "backendSha": "e5f4a3ffb9890f84858fb1ad453a9c9f7059d58d",
-      "status": "unused",
-      "reason": "adgen-only QC-verdict guard + remotion-child-OOM retry; only required from unwired bootRecoveryService. Looked at backend #326 child-tail persist — already present.",
-      "portTo": null,
-      "owedSince": null
-    },
     "services/ugcVideoPipeline.js": {
       "backendHash": "2a7c1390a0bd0c46f2f361fb6eb445a9b55bbb225ada35adb6fdc84b5601d78e",
       "adgenHash": "2a7c1390a0bd0c46f2f361fb6eb445a9b55bbb225ada35adb6fdc84b5601d78e",
@@ -1842,13 +1816,11 @@
       "owedSince": null
     },
     "services/veoPromptBuilder.js": {
-      "backendHash": "5b86ddd125b465106d14cd9eb7ec7bc3d907ac2ce3f259f929b0c13393593c6b",
-      "adgenHash": "630344943f9fa2ee13039e68f9a5fee8a21d54b4ea72c24c3a08061415fc25b9",
-      "backendSha": "9531ae9f73d5ad9773bddff9c87d19890873ea59",
-      "status": "unported",
-      "reason": "Catalog-title interpolation fix (Vaportek incident 2026-08-26): adgen stopped interpolating 'Product: {title}' into the Omni camera prompt after Omni rendered the catalog title as an on-garment brand lockup and vision-QC terminal-rejected a $0.90 Pelagic master. The backend copy is still the pre-fix blob. Was recorded as status=fork with this obligation in prose, which nothing could act on; it is a debt, not a deliberate divergence.",
-      "portTo": "backend",
-      "owedSince": "2026-08-27T02:05:09.135Z"
+      "backendHash": "027d0d46214b7303f0a1c83793ea4d280eaf6fe840fe82d2771a39dbe44b752a",
+      "adgenHash": "2e624b9cde0b757a8827a11be13a72c7586eff9433937da564fa6997072bd6b2",
+      "backendSha": "8bd9eebd549fe5384bef79648688462eace907ed",
+      "status": "fork",
+      "reason": "Owner directive 2026-08-28 (stated twice this session): liquidretail_backend's prompt-building code is not maintained as first-class any more, and prompt-safety fixes made here are not ported there going forward. This SUPERSEDES the prior 'unported, port-to-backend' entry for the operator-prompt-override fix (PR #77, d681425): backend's copy still carries the unsafe 'OPERATOR REFINEMENT (HIGHEST PRIORITY — overrides conflicting guidance below)' framing that let free text override product-fidelity/no-fabricated-branding rules (the Vaportek-through-the-operator-door incident), and that is now DELIBERATELY staying unfixed on the backend side per the directive above, not an oversight. Re-verified the rest of the current diff before reconciling: backend separately hoisted its seedHasText burned-in-text guard into an exported SEED_BURNED_IN_TEXT_GUARD_LINE constant (2026-08-27) so its generation-inspector route can string-match a persisted prompt — the guard TEXT is byte-identical to adgen's inline version (verified directly), so this is a backend-only diagnostic refactor adgen has no consumer for (no inspector HTTP route here), not a missing fix. The applyByteCap/logByteCap/enforceByteCap split is an incidental adgen-side refactor from the same PR #77, not independently consequential. Recorded here so the next reader does not re-open the port question."
     },
     "services/veoStoryboardService.js": {
       "backendHash": "4e3d420b3a6219b72f25dc95aac6afa679ea5c23a7c3627d1abcb9ba9f5bf344",
@@ -1931,15 +1903,6 @@
       "backendSha": "87cfdd0085127c63b70ff69b13cd16db463eca1d",
       "status": "fork",
       "reason": "threads generateForAd's new allowResume parameter through to atlasVideoService.generateForAd — see services/atlasVideoService.js's reconcile reason for the full context. Backend's videoRouter.js does not need this yet since it doesn't have the parameter to thread.",
-      "portTo": null,
-      "owedSince": null
-    },
-    "services/whisperService.js": {
-      "backendHash": "5d6e707d7298527e9de75225a5210219ab565e55c46ebd97d72c078df5402ba3",
-      "adgenHash": "5d6e707d7298527e9de75225a5210219ab565e55c46ebd97d72c078df5402ba3",
-      "backendSha": "9c6e1147d53cf16c59c0cf8ddde49e8908f67569",
-      "status": "unused",
-      "reason": "backend transcription; adgen does not call it",
       "portTo": null,
       "owedSince": null
     },
