@@ -567,7 +567,14 @@ async function runRetitleJob(jobId, brand, eligible, concurrency, seedErrors) {
           if (!ad) {
             results.push({ id, ok: false, error: 'ad disappeared' });
           } else {
-            const result = await renderBrandScriptAndSave({ ad, brand });
+            // retitleMode:true — this ad is commonly already status:'live'
+            // (delivered); without this the terminal write in
+            // brandScriptExecutor would silently force it back to 'draft'
+            // on every retitle. Pre-existing bug in this exact call,
+            // independent of the adgen handoff added alongside it — see
+            // brandScriptExecutor.uploadRenderAndStamp's preserveAdStatus
+            // header.
+            const result = await renderBrandScriptAndSave({ ad, brand, retitleMode: true });
             if (result?.skipped) {
               results.push({ id, ok: true, skipped: true, renderUrl: ad.renderUrl || null });
               console.log(`🎬 retitle-videos[brand=${brand._id}]: ad=${id} skipped (${result.reason || 'no-chrome'})`);
@@ -623,6 +630,208 @@ async function runRetitleJob(jobId, brand, eligible, concurrency, seedErrors) {
     });
     reapRetitleJob(jobId);
   }
+}
+
+// Ad-gen handoff (2026-08-28) — the deferred sibling of runRetitleJob
+// above. When adgen owns rendering (isAdgenRendererEnabled()), this
+// repo's own in-process Remotion render competes with HTTP request
+// handling on the SAME process — the CPU-bound-Remotion finding this
+// codebase already established for the mint-time render loop (see
+// CLAUDE.md's Remotion memory-budget notes) applies identically here,
+// because retitle calls the exact same renderBrandScriptAndSave() the
+// render loop calls, just against an already-delivered ad instead of a
+// freshly-minted one.
+//
+// Mechanism mirrors services/adRegenerateService.regenerateAd's
+// stamp-then-return pattern (see services/handoffContract.js for the
+// field contract this repo shares with liquidretail_adgen): stamp
+// Ad.retitleRequest per ad instead of calling renderBrandScriptAndSave
+// in this process, then poll Mongo for completion. adgen's
+// src/services/retitleConsumer.js is the other half — it polls for
+// stamped-but-unclaimed requests, atomically claims one via
+// retitleClaimedByWorker (a field pair DISJOINT from the mint-time
+// render claim, the titler claim, AND the regenerate claim — see
+// models/Ad.js's retitleRequest doc comment for why a shared field would
+// have been unsafe), and runs it through ITS OWN copy of
+// brandScriptExecutor.renderBrandScriptAndSave.
+//
+// WHY A SEPARATE FUNCTION rather than branching inside runRetitleJob:
+// runRetitleJob above is the dormant fallback per this repo's convention
+// for every other migrated handoff (generate, regenerate) — it must stay
+// exactly as it was. Reusing its worker-pool/cursor machinery for a
+// claim-and-poll flow would risk changing local-path behavior too. This
+// function writes the SAME job-store shape
+// ({status,progress,results,errors,completedAt}) so the existing GET
+// /:id/retitle-videos/:jobId poll endpoint needs no change either way.
+//
+// NOT billable either way — services/brandScriptExecutor.js never
+// requires an Atlas billing client in either repo (grep-verified) — so
+// the claim-safety concern here is wasted compute + a duplicate
+// Cloudinary upload racing the same renderUrl identity, not a double
+// charge. That is why, unlike regenerate's claim, a stale retitle claim
+// is safe to let a reclaim sweep clear (adgen's retitleConsumer does
+// this on an interval, mirroring titler.js's reclaimStaleTitlerClaims).
+const RETITLE_POLL_MS            = Math.max(500,   Number(process.env.ADGEN_RETITLE_POLL_MS)    || 2000);
+const RETITLE_STAMP_MAX_WAIT_MS  = Math.max(30000, Number(process.env.ADGEN_RETITLE_MAX_WAIT_MS) || 5 * 60 * 1000);
+
+async function runRetitleJobViaAdgen(jobId, brand, eligible, seedErrors, requestedBy) {
+  const Ad = require('../models/Ad');
+  const results = [];
+  const errors = seedErrors ? seedErrors.slice() : [];
+  const total = eligible.length;
+
+  const prev0 = retitleJobs.get(jobId) || {};
+  retitleJobs.set(jobId, {
+    ...prev0,
+    status:   'running',
+    progress: { done: 0, total },
+    results,
+    errors: errors.length ? errors : undefined,
+  });
+
+  function reportProgress() {
+    const prev = retitleJobs.get(jobId) || {};
+    retitleJobs.set(jobId, {
+      ...prev,
+      status:   'running',
+      progress: { done: results.length, total },
+      results:  results.slice(),
+      errors:   errors.length ? errors : undefined,
+    });
+  }
+
+  try {
+    // ── Stamp phase ──────────────────────────────────────────────────
+    // One atomic updateOne per ad, so a concurrently already-pending or
+    // mid-first-titling ad is skipped rather than clobbered. The filter
+    // NEVER matches an ad already carrying a retitleRequest object — a
+    // stray double-POST (impatient double-click, retry) cannot orphan a
+    // consumer's live claim by overwriting the payload out from under it.
+    const pending = new Set();
+    for (const adDoc of eligible) {
+      const id = String(adDoc._id);
+      // eslint-disable-next-line no-await-in-loop
+      const stamp = await Ad.updateOne(
+        {
+          _id: adDoc._id,
+          // Never stamp mid-first-titling. That row belongs to the
+          // renderer->titler handoff (titlingNeeded:true) — a claim
+          // namespace this must never race. See models/Ad.js's
+          // retitleRequest doc comment for the full argument.
+          titlingNeeded:  { $ne: true },
+          retitleRequest: null,
+        },
+        {
+          $set: {
+            retitleRequest: {
+              kind:        'manual-retitle',
+              requestedBy: requestedBy || null,
+              requestedAt: new Date(),
+            },
+            retitleResult: null,
+          },
+        }
+      );
+      if (stamp.modifiedCount === 0) {
+        // eslint-disable-next-line no-await-in-loop
+        const current = await Ad.findById(adDoc._id).select('titlingNeeded retitleRequest').lean();
+        if (!current) {
+          results.push({ id, ok: false, error: 'ad disappeared' });
+        } else if (current.titlingNeeded === true) {
+          results.push({ id, ok: false, error: 'ad is mid-first-titling — retry once that completes' });
+        } else {
+          results.push({ id, ok: false, error: 'a retitle is already pending for this ad' });
+        }
+        reportProgress();
+        continue;
+      }
+      console.log(`🎬 retitle-videos[${jobId}]: ad=${id} stamped retitleRequest — adgen will claim it`);
+      pending.add(id);
+    }
+
+    // ── Poll phase ───────────────────────────────────────────────────
+    // Watch the stamped set until retitleRequest clears (adgen's
+    // retitleConsumer completed it, success or fail) or the per-ad wait
+    // ceiling is hit. Per-ad, not per-batch, so one slow render cannot
+    // starve reporting on the rest of the batch.
+    const deadlineByAd = new Map();
+    const startedAt = Date.now();
+    for (const id of pending) deadlineByAd.set(id, startedAt + RETITLE_STAMP_MAX_WAIT_MS);
+
+    while (pending.size > 0) {
+      const ids = Array.from(pending);
+      // eslint-disable-next-line no-await-in-loop
+      const rows = await Ad.find({ _id: { $in: ids } })
+        .select('retitleRequest retitleResult renderUrl')
+        .lean();
+      const byId = new Map(rows.map((r) => [String(r._id), r]));
+      const now = Date.now();
+
+      for (const id of ids) {
+        const row = byId.get(id);
+        if (!row) {
+          results.push({ id, ok: false, error: 'ad disappeared while retitling' });
+          pending.delete(id);
+          continue;
+        }
+        if (row.retitleRequest == null) {
+          // Consumer completed (or the request was reclaimed and has not
+          // yet been re-stamped — indistinguishable from here; both read
+          // as "not pending anymore", and retitleResult disambiguates).
+          const res = row.retitleResult || null;
+          if (res && res.status === 'failed') {
+            results.push({ id, ok: false, error: res.error || 'retitle failed' });
+          } else if (res && res.status === 'done') {
+            results.push({ id, ok: true, renderUrl: res.renderUrl || row.renderUrl || null });
+          } else {
+            // Cleared with no result readout — mirrors the local path's
+            // success shape rather than guessing at a failure.
+            results.push({ id, ok: true, renderUrl: row.renderUrl || null });
+          }
+          pending.delete(id);
+          continue;
+        }
+        if (now > deadlineByAd.get(id)) {
+          results.push({
+            id, ok: false,
+            error: `retitle did not complete within ${Math.round(RETITLE_STAMP_MAX_WAIT_MS / 1000)}s — still pending`,
+          });
+          pending.delete(id);
+        }
+      }
+      reportProgress();
+      if (pending.size > 0) {
+        // eslint-disable-next-line no-await-in-loop
+        await new Promise((r) => setTimeout(r, RETITLE_POLL_MS));
+      }
+    }
+  } catch (err) {
+    console.error(`🎬 retitle-videos[${jobId}]: adgen handoff FAILED — ${err.message}`);
+    const prev = retitleJobs.get(jobId) || {};
+    retitleJobs.set(jobId, {
+      ...prev,
+      status:      'failed',
+      error:       err.message || 'retitle-videos failed',
+      progress:    { done: results.length, total },
+      results,
+      errors:      errors.length ? errors : undefined,
+      completedAt: Date.now(),
+    });
+    reapRetitleJob(jobId);
+    return;
+  }
+
+  const prev = retitleJobs.get(jobId) || {};
+  retitleJobs.set(jobId, {
+    ...prev,
+    status:      'done',
+    progress:    { done: results.length, total },
+    results,
+    errors:      errors.length ? errors : undefined,
+    completedAt: Date.now(),
+  });
+  reapRetitleJob(jobId);
+  console.log(`🎬 retitle-videos[${jobId}]: DONE (adgen) brand=${brand._id} ${results.length}/${total}`);
 }
 
 // POST /api/brand/:id/retitle-videos
@@ -762,9 +971,21 @@ router.post('/:id/retitle-videos', express.json(), async (req, res) => {
     });
     console.log(`🎬 retitle-videos[${jobId}]: brand=${brand._id} count=${eligible.length} concurrency=${concurrency}${truncated ? ` truncated from ${totalMatched}` : ''}`);
 
+    // Ad-gen handoff (2026-08-28) — read once, synchronously, before
+    // kicking off the job, same call-time convention every other
+    // adgen-handoff gate in this repo uses (adgenBridge.js). See
+    // runRetitleJobViaAdgen's header for the full argument.
+    const { isAdgenRendererEnabled } = require('../services/adgenBridge');
+    const requestedBy = req.user?.userId || req.user?.email || null;
+
     // Fire-and-forget. Runner flips the job to done/failed; per-ad errors
     // land in results, never crash the process.
-    runRetitleJob(jobId, brand, eligible, concurrency, errors);
+    if (isAdgenRendererEnabled()) {
+      console.log(`🎬 retitle-videos[${jobId}]: deferring to adgen (ADGEN_RENDERER_ENABLED=true)`);
+      runRetitleJobViaAdgen(jobId, brand, eligible, errors, requestedBy);
+    } else {
+      runRetitleJob(jobId, brand, eligible, concurrency, errors);
+    }
 
     res.status(202).json({
       ok: true,
