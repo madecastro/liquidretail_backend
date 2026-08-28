@@ -488,6 +488,42 @@ ok('E5b claimedAt staleness is an EXPLICIT null-OR, not a bare $lt — productio
     'a bare `claimedAt: { $lt: claimCutoff }` with no null arm is the exact production bug this pins');
 });
 
+// ── Group E6-E8: recovered-branch viewability + no-requeue, ported from the
+// deleted scripts/verifyTitlingResume.js (2026-08-28, backend titling
+// removal). These three checks are about bootRecoveryService's OWN
+// recovered-branch $set, not the deleted titlingResumeService.js sweeper —
+// they stay valuable independent of that removal. See the STATE_PENDING /
+// TITLING_PENDING / fallbackPosterUrl comment near the top of
+// bootRecoveryService.js for why those three are now inlined there instead
+// of imported.
+function recoveredSetBlock(src) {
+  const marker = "r.state === 'done' && r.videoUrl";
+  const at = src.indexOf(marker);
+  if (at < 0) return '';
+  const setAt = src.indexOf('$set', at);
+  if (setAt < 0 || setAt - at > 2000) return '';
+  const stop = src.indexOf('continue;', setAt);
+  return src.slice(at, stop > setAt ? stop : at + 1500);
+}
+const recBlock = recoveredSetBlock(serviceSrc);
+ok('E6 recovered-branch $set writes renderUrl, posterUrl, kind, titlingResumeState (viewable + stamped)', () => {
+  assert.ok(recBlock.length > 0, 'could not locate the recovered branch');
+  assert.ok(/renderUrl:\s*r\.videoUrl/.test(recBlock)
+    && /posterUrl:\s*poster\s*\|\|\s*r\.videoUrl/.test(recBlock)
+    && /kind:\s*'video'/.test(recBlock)
+    && /titlingResumeState:\s*STATE_PENDING/.test(recBlock),
+    'a recovered ad without renderUrl is invisible (projectAd has no veoVideoUrl fallback)');
+});
+ok('E7 recovered-branch update still filters on status: \'rendering\' (no lease — filter IS the concurrency control)', () => {
+  assert.ok(/\{\s*_id:\s*ad\._id,\s*status:\s*'rendering'\s*\}/.test(recBlock));
+});
+ok('E8 MONEY: bootRecoveryService contains no status:\'queued\' — a recovered master must never be requeued', () => {
+  // routes/ads.js declares veoVideoUrl fresh and never reads ad.veoVideoUrl,
+  // so a requeue re-submits to Omni (~$0.90) for a master already paid for.
+  assert.ok(!/status:\s*['"]queued['"]/.test(serviceSrc),
+    'a recovered ad must never be requeued — that re-submits to Omni');
+});
+
 // ── Group F: the TTL relationship is real, checked two independent ways ──
 ok('F1 RESUME_CLAIM_STALE_MIN >= 3x RESUME_STALE_MIN on the REAL, LIVE, already-executed constants', () => {
   // Uses the constants this file imported from the real module at the top —

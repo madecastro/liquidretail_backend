@@ -154,15 +154,40 @@ const { recoverImageAd } = require('./imageRecoveryService');
 // is that a charge must be CONFIRMED, never assumed — see the charge block below.
 const { reconcileCost } = require('./costTracker');
 const alerts = require('./alertService');
-// Single source of the recovery→titling state and the poster derivation, so the
-// writer here and the reader there can never drift. Requiring this module is cheap
-// on the worker: titlingResumeService lazy-requires brandScriptExecutor, so no
-// remotion/ffmpeg weight is pulled in at boot (asserted by verifyTitlingResume).
-const {
-  STATE_PENDING,
-  TITLING_PENDING,
-  fallbackPosterUrl
-} = require('./titlingResumeService');
+// Recovery→titling sentinel + poster derivation. INLINED HERE (2026-08-28) —
+// these three used to be imported from services/titlingResumeService.js, which
+// was the sweeper that actually consumed this sentinel (claim it, run
+// Remotion, clear it). That sweeper is REMOVED — "remove and disable the
+// backend titling function" (owner directive) — because adgen now owns
+// titling exclusively and the sweeper could still race adgen's own
+// titling-resume path. Nothing sweeps `titlingResumeState: STATE_PENDING`
+// any more.
+//
+// These three definitions survive here, unchanged, ONLY because this
+// function (resumeInFlightAds, below) still stamps the sentinel as an
+// honest breadcrumb ("a paid master landed and still owes a title") even
+// though nothing acts on it today. Removing the stamp entirely would be a
+// judgment call about bootRecoveryService's own behavior, which is OUT OF
+// SCOPE for this removal — bootRecoveryService itself is a separate
+// concern (asset recovery, not titling) and was not named for removal.
+// See the module-level ADGEN OWNERSHIP comment above: this whole sweep
+// already stands down when isAdgenRendererEnabled() is true, so in current
+// production config this branch — like the removed sweeper — does not run.
+// KNOWN RESIDUAL, flagged rather than resolved: if ADGEN_RENDERER_ENABLED
+// were ever flipped back off, a recovered master would sit
+// titlingResumeState:'pending' forever with no sweeper. That is a decision
+// about bootRecoveryService's own design, not this removal.
+const STATE_PENDING = 'pending';
+const TITLING_PENDING = 'master recovered; titling pending';
+// Mirrors routes/ads.js's Cloudinary video-poster transform exactly — kept
+// in sync by hand (same convention the deleted module used).
+function fallbackPosterUrl(videoUrl) {
+  return videoUrl?.includes('/video/upload/')
+    ? videoUrl
+        .replace('/video/upload/', '/video/upload/so_2,f_jpg,q_auto:good/')
+        .replace(/\.(mp4|mov|webm|m4v)(\?.*)?$/i, '.jpg$2')
+    : null;
+}
 
 // Five missed 60s heartbeats. Lower than REAP_STALE_MIN (15) on purpose: the
 // point is to recover the asset BEFORE the reaper or a re-run gets involved.
@@ -568,8 +593,12 @@ async function resumeInFlightAds({
         // projectAd can serialise an asset) and is claimed for titling via the
         // renderStage sentinel (TITLING_PENDING). Do NOT requeue — the normal
         // render path declares veoVideoUrl fresh and never reads ad.veoVideoUrl,
-        // so a requeue would re-submit to Omni. Titling is resumed by
-        // services/titlingResumeService on the web process.
+        // so a requeue would re-submit to Omni.
+        // CORRECTED 2026-08-28: this comment used to say titling is resumed by
+        // services/titlingResumeService on the web process — that sweeper is
+        // REMOVED (backend no longer titles in-process at all; adgen owns
+        // titling exclusively). The sentinel below is now a breadcrumb with
+        // no consumer — see the STATE_PENDING/TITLING_PENDING comment above.
         // The alternative — leaving it `rendering` — invites the reaper and a
         // re-buy, which is the whole thing we are fixing.
         const poster = fallbackPosterUrl(r.videoUrl);
@@ -597,7 +626,7 @@ async function resumeInFlightAds({
         if (res.modifiedCount > 0) {
           out.recovered++;
           console.log(
-            `   ✅ bootRecovery[${ad._id}]: master recovered from receipt ${r.predictionId} — queued for titling`
+            `   ✅ bootRecovery[${ad._id}]: master recovered from receipt ${r.predictionId} — shipped untitled (backend titling removed; nothing sweeps this)`
           );
           // COST RECONCILE (2026-08-19). Recovering the asset used to leave the
           // charge-point CostLog row exactly as it was written at submit —

@@ -328,19 +328,22 @@ function buildStaleRunningReapUpdate(staleMin) {
  * `queued`/`rendering` are the only two non-terminal shapes.
  *
  * ⚠️ `draft` ALONE IS NOT "SUCCEEDED" FOR A VIDEO AD (fixed 2026-08-20).
- * The normal render path, `bootRecoveryService`, and `titlingResumeService`
- * all stamp `status:'draft'` + `renderUrl:veoVideoUrl` the INSTANT a paid
- * master lands — before Remotion titling has even started — specifically so
- * the asset is viewable immediately (see routes/ads.js's money-guard comment
- * and titlingResumeService.js's header). If the process then dies mid-title
- * (measured 2026-08-20: an autoscale replacement mid-Remotion-render), the
- * Ad sits `draft`+untitled forever unless titlingResumeService's own
- * stale-claim sweep gets to it. Counting that as `succeeded` here — the
- * exact bug this reconciliation function exists to fix in the OTHER
- * direction (undercounting) — would launder an untitled master into a
- * `'done'` run with an honest-looking succeeded count. `isVideoTitlingSettled`
- * is the one function in this repo that tells a real composite apart from a
- * raw master parked on `renderUrl`; see services/adTitlingTruth.js.
+ * The normal render path and `bootRecoveryService` both stamp
+ * `status:'draft'` + `renderUrl:veoVideoUrl` the INSTANT a paid master
+ * lands — specifically so the asset is viewable immediately (see
+ * routes/ads.js's money-guard comment). CORRECTED 2026-08-28: this used to
+ * also name `titlingResumeService` as a third stamper whose stale-claim
+ * sweep could reclaim an ad stranded mid-title — that service is REMOVED
+ * (backend titling removal, owner directive: "remove and disable the
+ * backend titling function"). Backend no longer runs Remotion titling
+ * in-process at all, so a video ad's `renderUrl` now equals its raw
+ * `veoVideoUrl` for every ad this repo ships going forward (adgen titles
+ * everything). Counting that as `succeeded` here — the exact bug this
+ * reconciliation function exists to fix in the OTHER direction
+ * (undercounting) — would launder an untitled master into a `'done'` run
+ * with an honest-looking succeeded count. `isVideoTitlingSettled` is the
+ * one function in this repo that tells a real composite apart from a raw
+ * master parked on `renderUrl`; see services/adTitlingTruth.js.
  */
 function classifyRunAdOutcome(adDocs) {
   let succeeded = 0, failed = 0, stillRendering = 0, requeuedAway = 0, titlingIncomplete = 0;

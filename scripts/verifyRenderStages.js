@@ -164,27 +164,31 @@ checkTrue('D8 layoutInput derive failure calls noteRenderIssue',
 checkTrue('D9 basePlate skip persists reason via noteRenderIssue',
   /noteRenderIssue[\s\S]{0,120}face-safe crop skipped|persistSkip[\s\S]{0,300}noteRenderIssue/.test(cropSrc));
 
-// ── E. Task 4 — titling failure is not a clean success ────────────────
+// ── E. Task 4 — an untitled master is not counted as success ──────────
+// REWRITTEN 2026-08-28 (backend titling removal, owner directive: "remove
+// and disable the backend titling function, we are not going to go back to
+// it"). routes/ads.js no longer attempts Remotion titling in-process at
+// all (brandScriptExecutor.renderBrandScriptAndSave is no longer called
+// from here), so there is no more "titling failure" outcome to distinguish
+// from success — every video ad this loop ships goes through
+// qcAndStampVideoAd unconditionally. E2/E3/E4/E6 (which pinned the
+// titlingFailed branch's status/$inc/gating) are retired with the branch
+// they tested; E1/E5 (below) still hold structurally against a hypothetical
+// reintroduction. The real remaining "not a clean success" gate on this
+// path is vision QC, which is still live: a real failure still stamps
+// status:'failed' via qcAndStampVideoAd → buildVideoQcFailureFields
+// (brandScriptExecutor.js), and the promotion write below is still
+// allowlist-guarded ($in:['rendering','draft']) so it can never resurrect
+// that verdict — see E7.
 console.log('\nE. Task 4 — untitled master is not counted as success');
-checkTrue('E1 titling catch does not only console.warn',
+checkTrue('E1 no titling catch that only console.warns survives (there is no more titling catch at all)',
   !/catch\s*\(\s*scriptErr\s*\)\s*\{\s*console\.warn\(`⚠️ brandScript/.test(adsSrc));
-checkTrue('E2 titling failure sets status failed',
-  /titlingFailed[\s\S]{0,400}status:\s*['"]failed['"]/.test(adsSrc) ||
-  /master rendered; titling failed[\s\S]{0,200}status:\s*['"]failed['"]/.test(adsSrc));
-checkTrue('E3 titling failure increments failed not succeeded',
-  /titlingFailed[\s\S]{0,600}\$inc:\s*\{\s*failed:\s*1/.test(adsSrc) ||
-  /titlingFailed[\s\S]{0,600}failed:\s*1/.test(adsSrc));
-// Intermediate stamp may set draft (reaper money guard) but succeeded++
-// must only run on the post-titling branch, never immediately after the
-// master stamp.
-checkTrue('E4 succeeded++ is gated on !titlingFailed (not post-master)',
-  /if\s*\(\s*titlingFailed\s*\)[\s\S]{0,2000}else\s*\{[\s\S]{0,600}succeeded:\s*1/.test(adsSrc));
-checkTrue('E5 raw master kept on titling failure (renderUrl not deleted)',
-  /titlingFailed[\s\S]{0,400}Keep renderUrl|master kept|do not delete/i.test(adsSrc) ||
-  /titlingFailed[\s\S]{0,300}status:\s*['"]failed['"]/.test(adsSrc));
-checkTrue('E6 success path only after titling (or no-chrome)',
-  /if\s*\(\s*titlingFailed\s*\)[\s\S]{0,2000}else\s*\{[\s\S]{0,600}succeeded:\s*1/.test(adsSrc) &&
-  /adStage\([^)]*done/.test(adsSrc));
+checkTrue('E5 [REVERT GUARD] "titlingFailed" does not reappear without this file being updated',
+  !/titlingFailed/.test(adsSrc),
+  'if this fails, someone reintroduced a titling-failure branch — update this Group E to pin it again');
+checkTrue('E7 the promotion write is still allowlist-guarded against an already-stamped verdict',
+  /status:\s*\{\s*\$in:\s*\[\s*['"]rendering['"],\s*['"]draft['"]\s*\]\s*\}/.test(adsSrc),
+  'a video ad promoted to draft without this guard can overwrite a real vision-QC failure');
 
 // ── F. claimAdsForRun untouched (structural smoke) ────────────────────
 console.log('\nF. money claim path still present (smoke — full proof is verifyRunsClaim)');

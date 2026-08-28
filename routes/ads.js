@@ -294,19 +294,12 @@ const RENDER_CONCURRENCY    = CONC.RENDER_CONCURRENCY;
 const VEO_CONCURRENCY       = CONC.VEO_CONCURRENCY;
 const MAX_CREATIVES_PER_RUN = CONC.MAX_CREATIVES_PER_RUN;
 
-// MODULE-LEVEL ON PURPOSE — one permit pool for the whole process, not one per
-// campaign run. A per-run semaphore would let two concurrent runs each open
-// VEO_TITLING_CONCURRENCY slots. See services/semaphore.js for why in-process
-// is the correct scope for a memory guard (and the wrong one for a provider
-// rate limit).
-//
-// WHAT THIS BOUNDS, CORRECTED. It used to be described as the cap on
-// simultaneous Remotion renders. It never was — remotionRenderService ran a
-// concurrency-1 promise chain, so one render happened regardless. This permit
-// bounds the CHEAP prep half (copy cascade, Mongo reads, font resolution); the
-// memory guard is REMOTION_QUEUE_CONCURRENCY inside that service.
-const { Semaphore } = require('../services/semaphore');
-const veoTitlingSemaphore = new Semaphore(CONC.VEO_TITLING_CONCURRENCY, 'veo-titling');
+// veoTitlingSemaphore / titlingQueueDepth() REMOVED 2026-08-28 along with
+// the in-process titling calls they existed to gate (both call sites, this
+// file — see the TITLING REMOVED comments below). Backend no longer runs
+// Remotion titling in-process at all; adgen owns titling exclusively.
+// VEO_TITLING_CONCURRENCY (services/concurrency.js, config/defaults.env)
+// removed in the same change — nothing reads it any more.
 
 // The one function that knows whether a video Ad's titling actually
 // settled, as opposed to `renderUrl` merely being non-null (true from the
@@ -314,22 +307,6 @@ const veoTitlingSemaphore = new Semaphore(CONC.VEO_TITLING_CONCURRENCY, 'veo-tit
 // header. Used by projectAd below so `titled` is never inferred twice, once
 // correctly here and once wrong on a client.
 const { isAdHonestlyDelivered } = require('../services/adTitlingTruth');
-
-// Live titling queue depth, read from the pool that ads ACTUALLY wait in.
-//
-// DIAGNOSTICS MUST BE TRUE OR THEY COST MORE THAN THEY GIVE (owner rule): a
-// stage line reading "0 ahead" while an ad sits twelfth in line does not merely
-// under-inform, it actively misdirects whoever is debugging a slow run. Lazy
-// require keeps this route file free of Remotion's load cost at boot, and the
-// fallback means a require failure degrades the message rather than the render.
-function titlingQueueDepth() {
-  try {
-    // eslint-disable-next-line global-require
-    return require('../services/remotionRenderService').renderQueueStats();
-  } catch {
-    return { concurrency: 1, active: 0, waiting: 0 };
-  }
-}
 
 // POST /api/ads/preview
 // Same body as /generate. Runs the entire seed assembly + cartesian +
@@ -2376,10 +2353,17 @@ function masterAdDiagnosticQuery({ ad, masterPlatformFormat, brandId }) {
  *
  * ⚠️ A FAILED MASTER IS THE PRIMARY CASE. This block exists so an operator can
  * QC a master whose output was wrong, so it reports `failed` alongside the URLs
- * rather than instead of them: on a titling failure the master is stamped
- * `failed` with "master rendered; titling failed" and the paid plate is KEPT, so
- * a failed master usually still has an inspectable video. `hasVideo` is computed
- * from the URLs actually present and is independent of `status`.
+ * rather than instead of them: the paid plate is KEPT on a failure, so a
+ * failed master usually still has an inspectable video. CORRECTED 2026-08-28
+ * — this used to cite backend's own in-process "master rendered; titling
+ * failed" terminal outcome as the example; that code path is removed
+ * (backend no longer titles in-process — see the TITLING REMOVED comments
+ * on this function's render loop). The still-live mechanisms producing this
+ * exact shape today are a real video vision-QC failure
+ * (qcAndStampVideoAd/buildVideoQcFailureFields, still stamps `failed` +
+ * keeps the URL) and adgen's own titling failure on its side of the
+ * pipeline. `hasVideo` is computed from the URLs actually present and is
+ * independent of `status`.
  */
 function buildMasterBlock({ deriveFmt, master }) {
   if (!deriveFmt) return null;
@@ -2771,13 +2755,9 @@ async function renderDeriveOnlyVideoAd({
       ? master.basePlate
       : null;
 
-  // Load brand for titling (same projection as the master path).
-  const sourceMedia = await Media.findById(ad.mediaId)
-    .select('fileType fileUrl brandId').lean();
-  const brandDoc = sourceMedia?.brandId
-    ? await Brand.findById(sourceMedia.brandId)
-        .select('name styleScript styleScriptVertical styleScriptLandscape styleTheme tagline logoUrl websiteUrl primaryColor secondaryColor accentColor fontFamily fontSource curatedFields tailwindTheme websiteFontUsage customFonts derivedVoice videoSettings titleStyleSpec titleStylePreset brandReviews').lean()
-    : null;
+  // Brand/media lookup REMOVED 2026-08-28 — it existed solely to resolve
+  // brandDoc for the (now-removed) titling call below. See the TITLING
+  // REMOVED comment further down this function.
 
   // Stamp draft + plate BEFORE titling — same money discipline as the
   // master path: untitled is not success; reaper must not requeue a
@@ -2819,66 +2799,35 @@ async function renderDeriveOnlyVideoAd({
   );
 
   const adFinal = await Ad.findById(adId).lean();
-  let titlingFailed = null;
-  if (brandDoc) {
-    try {
-      const { renderBrandScriptAndSave } = require('../services/brandScriptExecutor');
-      // Depth from the render pool, not this semaphore — see the note on the
-      // master path. A diagnostic that reports 0 while twelve ads are ahead is
-      // worse than no diagnostic: it sends the reader looking somewhere else.
-      const q = titlingQueueDepth();
-      if (q.waiting > 0 || q.active >= q.concurrency) {
-        adStage(adId, `queued for titling (${q.waiting} ahead)`);
-      }
-      const chromeOut = await veoTitlingSemaphore.withPermit(async () => {
-        adStage(adId, `titling ${adFinal.aspectRatio || ad.aspectRatio || '1:1'} (derive-only)`);
-        return renderBrandScriptAndSave({ ad: adFinal, brand: brandDoc });
-      });
-      if (chromeOut?.skipped) {
-        adStage(adId, `no titling (${chromeOut.reason || 'no-chrome'}) — shipping derived plate`);
-      }
-    } catch (scriptErr) {
-      titlingFailed = scriptErr;
-      console.warn(
-        `⚠️ brandScript[ad=${adId}] derive-only: titling failed — plate kept, not counted as success: ${scriptErr.message}`
-      );
-    }
-  } else {
-    // NO BRAND RESOLVED — same gap as the master path above: this never
-    // reaches renderBrandScriptAndSave, so it never reaches vision QC
-    // either. The derived plate would otherwise ship with NO Ad.visionQc
-    // at all.
-    const { qcAndStampVideoAd } = require('../services/brandScriptExecutor');
-    await qcAndStampVideoAd({ ad: adFinal, deliveredUrl: veoVideoUrl });
-  }
+  // TITLING REMOVED 2026-08-28 (owner directive: "remove and disable the
+  // backend titling function, we are not going to go back to it"). This
+  // branch used to call brandScriptExecutor.renderBrandScriptAndSave when a
+  // brand resolved (Remotion chrome) and qcAndStampVideoAd only on the
+  // no-brand fallback. adgen now titles every master exclusively — backend
+  // no longer attempts Remotion compositing in-process at all, brand or no
+  // brand, so this branch is unconditional. This whole function is already
+  // unreachable in production (gated behind isAdgenRendererEnabled() at the
+  // top of runRenderLoop), but if it is ever reached the derived plate ships
+  // untitled — exactly the pre-existing "no brand resolved" behavior below,
+  // now the only behavior. Vision QC still runs so the ad is never delivered
+  // with zero visibility.
+  //
+  // The renderStage write below matters even though this whole function is
+  // dead: services/adTitlingTruth.js's isVideoTitlingSettled treats
+  // `renderUrl === veoVideoUrl` as settled ONLY when renderStage matches
+  // `/^no titling \(/i` (every other intentional-ship call site in this
+  // repo writes that exact prefix). Without it, an ad shipped by this path
+  // would read as a stuck/abandoned titling debt, not a deliberate bare
+  // ship — closing a gap the pre-existing no-brand branch already had.
+  adStage(adId, 'no titling (backend titling removed) — shipping derived plate');
+  const { qcAndStampVideoAd } = require('../services/brandScriptExecutor');
+  await qcAndStampVideoAd({ ad: adFinal, deliveredUrl: veoVideoUrl });
 
-  if (titlingFailed) {
-    const tmsg = `derived plate ready; titling failed: ${titlingFailed.message || titlingFailed}`;
-    await Ad.updateOne(
-      { _id: adId },
-      {
-        $set: {
-          status: 'failed',
-          renderError: { message: tmsg, stage: 'titling', at: new Date(), ...childTailsFrom(titlingFailed) },
-          renderStage: 'derived plate ready; titling failed',
-          renderStageAt: new Date(),
-          updatedAt: new Date(),
-          titlingResumeState: null
-        }
-      }
-    );
-    await CampaignRun.updateOne(
-      { _id: run._id },
-      {
-        $inc:  { failed: 1 },
-        $push: { errors: buildErrorEntry(creative, index, 'titling', titlingFailed) }
-      }
-    );
-  } else {
-    // GUARDED — same reasoning as the master arm below: vision QC does not
-    // throw, so `titlingFailed` is null and this write used to overwrite the
-    // status:'failed' that buildVideoQcFailureFields just stamped. Allowlist,
-    // not denylist, so an unknown status is left alone rather than resurrected.
+  {
+    // GUARDED — vision QC does not throw, so this write used to be able to
+    // race a status:'failed' that buildVideoQcFailureFields just stamped.
+    // Allowlist, not denylist, so an unknown status is left alone rather
+    // than resurrected.
     const promoted = await Ad.updateOne(
       { _id: adId, status: { $in: ['rendering', 'draft'] } },
       {
@@ -3000,25 +2949,18 @@ async function renderOneInner(run, job, adId, index, renderToken) {
         return;
       }
 
-      // Load brand + source media up front. The Grok-skip check needs
-      // sourceMedia.fileType; the brand-script overlay needs brandDoc.
+      // Load source media up front — the Grok-skip check needs
+      // sourceMedia.fileType.
+      //
+      // The brand lookup that used to sit here (brandDoc, projected for the
+      // brand-script overlay's proof beat — brandReviews etc.) is REMOVED
+      // 2026-08-28 along with the titling call it existed to serve; see the
+      // TITLING REMOVED comment further down this function. Nothing else in
+      // this function reads a brand doc. adRegenerateService.loadBrand keeps
+      // its own equivalent projection for its own (also-dead, adgen-deferred)
+      // titling call — no longer "kept in sync" with anything here.
       const sourceMedia = await Media.findById(ad.mediaId)
         .select('fileType fileUrl brandId').lean();
-      // brandReviews is LOAD-BEARING for the proof beat, not optional metadata:
-      // buildMetaForAd reads brand.brandReviews for the atomic rating+count pair
-      // (services/ratingDisplay.resolveAtomicRatingPair). Omitting it from this
-      // projection made brandPair null, so resolveAtomicRatingPair returned
-      // source=none and EVERY generated ad rendered with no stars and no review
-      // count — including brands that clear the >4.5 gate outright (Vuori 4.58 /
-      // 15,545 reviews shipped bare). The bug was invisible because a projection
-      // omission looks identical to a brand with no review data, and because
-      // routes/brand.js re-titles load the full doc and therefore worked.
-      // Keep this list in sync with adRegenerateService.loadBrand; both are
-      // pinned by scripts/verifyProofBeat.js P1.
-      const brandDoc = sourceMedia?.brandId
-        ? await Brand.findById(sourceMedia.brandId)
-            .select('name styleScript styleScriptVertical styleScriptLandscape styleTheme tagline logoUrl websiteUrl primaryColor secondaryColor accentColor fontFamily fontSource curatedFields tailwindTheme websiteFontUsage customFonts derivedVoice videoSettings titleStyleSpec titleStylePreset brandReviews').lean()
-        : null;
 
       // Grok-skip branch — when the seed is already a video, we keep
       // its real motion instead of asking Grok to invent new motion
@@ -3238,120 +3180,44 @@ async function renderOneInner(run, job, adId, index, renderToken) {
         }
       );
 
-      // Stage 3 — brand-script canvas overlay (titling). Resolver picks the
-      // right script based on the ad's format. When no chrome is configured,
-      // the raw master is the final deliverable and counts as success.
-      // Titling failure is NO LONGER counted as success: the master is kept
-      // (paid for), but the outcome is "master rendered, titling failed".
+      // TITLING REMOVED 2026-08-28 (owner directive: "remove and disable the
+      // backend titling function, we are not going to go back to it"). This
+      // stage used to call brandScriptExecutor.renderBrandScriptAndSave when
+      // a brand resolved (Remotion chrome, behind its own concurrency
+      // permit — VEO_TITLING_CONCURRENCY / veoTitlingSemaphore, both removed
+      // in the same change) and qcAndStampVideoAd only on the no-brand
+      // fallback. adgen now titles every master exclusively — backend no
+      // longer attempts Remotion compositing in-process at all, brand or no
+      // brand, so this stage is unconditional. This whole function is
+      // already unreachable in production (gated behind
+      // isAdgenRendererEnabled() at the top of runRenderLoop), but if it is
+      // ever reached the master ships untitled — exactly the pre-existing
+      // "no brand resolved" behavior below, now the only behavior. Vision QC
+      // still runs so the ad is never delivered with zero visibility.
+      //
+      // The renderStage write below matters even though this whole function
+      // is dead: services/adTitlingTruth.js's isVideoTitlingSettled treats
+      // `renderUrl === veoVideoUrl` as settled ONLY when renderStage matches
+      // `/^no titling \(/i` (every other intentional-ship call site in this
+      // repo writes that exact prefix). Without it, an ad shipped by this
+      // path would read as a stuck/abandoned titling debt, not a deliberate
+      // bare ship — closing a gap the pre-existing no-brand branch already had.
+      adStage(adId, 'no titling (backend titling removed) — shipping master');
       const adFinal = await Ad.findById(adId).lean();
-      let titlingFailed = null;
-      if (brandDoc) {
-        try {
-          const { renderBrandScriptAndSave } = require('../services/brandScriptExecutor');
-          // ── THE SECOND PERMIT ────────────────────────────────────────────
-          // Everything above this point was remote and idle: an Omni submit and
-          // a ~2 minute poll. Everything below is Remotion renderMedia —
-          // headless Chrome + an ffmpeg 1080p encode, IN THIS PROCESS.
-          //
-          // The veo lane used to gate both halves on one number, so
-          // VEO_CONCURRENCY had to be small enough for the expensive half, which
-          // throttled the cheap half for nothing. The lane now dispatches wide
-          // (VEO_CONCURRENCY, default 12) and only this section is narrow
-          // (VEO_TITLING_CONCURRENCY, default 4 — deliberately identical to the
-          // old combined value, so the split cannot increase local memory
-          // pressure on its first outing).
-          //
-          // withPermit releases in a `finally`, so the throw handled below
-          // cannot leak a permit and wedge every later titling job. The wait is
-          // OUTSIDE the try's billable concern: the master is already paid for
-          // and already persisted (status:'draft' + veoVideoUrl, stamped above),
-          // so queueing here risks nothing but latency — and an ad waiting for a
-          // titling permit is reaper-safe for exactly that reason.
-          //
-          // DEPTH COMES FROM THE RENDER POOL, NOT THIS SEMAPHORE. It used to read
-          // veoTitlingSemaphore.waiting, which was right while the permit (4) was
-          // the narrowest thing in the path. It no longer is: the permit is now
-          // wide (48) and bounds only cheap prep, while the real wait is
-          // remotionRenderService's bounded pool. Left as it was, this line would
-          // report "0 ahead" for an ad genuinely twelfth in line — silently
-          // deleting the one number that makes a slow run legible.
-          const q = titlingQueueDepth();
-          if (q.waiting > 0 || q.active >= q.concurrency) {
-            adStage(adId, `queued for titling (${q.waiting} ahead)`);
-          }
-          const chromeOut = await veoTitlingSemaphore.withPermit(async () => {
-            // Titling names its target aspect: this is the stage that face-crops
-            // the 9:16 master down (basePlateCropService) and composites the
-            // overlay, so "titling 1:1" and "master video generation" being
-            // distinct is what makes a stall attributable.
-            adStage(adId, `titling ${adFinal.aspectRatio || ad.aspectRatio || '9:16'}`);
-            return renderBrandScriptAndSave({ ad: adFinal, brand: brandDoc });
-          });
-          // no-chrome is intentional success (raw master is the deliverable).
-          if (chromeOut?.skipped) {
-            adStage(adId, `no titling (${chromeOut.reason || 'no-chrome'}) — shipping master`);
-          }
-        } catch (scriptErr) {
-          titlingFailed = scriptErr;
-          console.warn(
-            `⚠️ brandScript[ad=${adId}]: titling failed — master kept, not counted as success: ${scriptErr.message}`
-          );
-        }
-      } else {
-        // NO BRAND RESOLVED (sourceMedia carried no brandId, or the lookup
-        // came back empty) — this NEVER reaches renderBrandScriptAndSave, so
-        // it never reaches uploadRenderAndStamp or the no-chrome branch
-        // either. Both of those call vision QC before the ad is considered
-        // delivered; this branch used to ship the raw master straight to
-        // 'draft' below with no equivalent call at all — a video ad with
-        // NO Ad.visionQc whatsoever, not even the {skipped:true,
-        // disabled:true} stub PR #260 added for exactly this visibility.
-        const { qcAndStampVideoAd } = require('../services/brandScriptExecutor');
-        await qcAndStampVideoAd({ ad: adFinal, deliveredUrl: veoVideoUrl });
-      }
+      const { qcAndStampVideoAd } = require('../services/brandScriptExecutor');
+      await qcAndStampVideoAd({ ad: adFinal, deliveredUrl: veoVideoUrl });
 
-      if (titlingFailed) {
-        const tmsg = `master rendered; titling failed: ${titlingFailed.message || titlingFailed}`;
-        await Ad.updateOne(
-          { _id: adId },
-          {
-            $set: {
-              // Keep renderUrl = raw master. Do not delete the paid asset.
-              status: 'failed',
-              renderError: { message: tmsg, stage: 'titling', at: new Date(), ...childTailsFrom(titlingFailed) },
-              renderStage: 'master rendered; titling failed',
-              renderStageAt: new Date(),
-              updatedAt: new Date(),
-              // Debt settled: titling ran and lost. This is a TERMINAL verdict,
-              // so clearing is what stops the sweeper retrying a render that
-              // already failed on its merits rather than from a process death.
-              titlingResumeState: null
-            }
-          }
-        );
-        await CampaignRun.updateOne(
-          { _id: run._id },
-          {
-            $inc:  { failed: 1 },
-            $push: { errors: buildErrorEntry(creative, index, 'titling', titlingFailed) }
-          }
-        );
-      } else {
-        // Title landed (or no chrome / no brand). Promote to draft now.
-        // Soft notes written mid-pipeline (face-crop skip etc.) stay on
-        // renderError so the board still shows "what degraded" after ship.
-        //
-        // GUARDED ON status — titling is not the only writer of a terminal
-        // verdict. `titlingFailed` catches a Remotion THROW, but vision QC
-        // does not throw: brandScriptExecutor.buildVideoQcFailureFields
-        // stamps status:'failed' inside uploadRenderAndStamp (PR #282,
-        // "deliver a QC-failed ad as failed with the exact Slack reason").
-        // This write used to be a bare { _id }, so it overwrote that verdict
-        // with 'draft' and counted the ad succeeded. MEASURED in prod
-        // 2026-08-24: 47 video ads with visionQc.passed:false sitting in
-        // 'draft', ZERO in 'failed' — the verdict never survived once.
-        // "Counting an untitled master as success is forbidden" (§2) has
-        // always been the rule; this closes the QC arm of it.
+      {
+        // GUARDED ON status — vision QC does not throw, but
+        // brandScriptExecutor.buildVideoQcFailureFields stamps
+        // status:'failed' inside qcAndStampVideoAd on a real QC failure (PR
+        // #282, "deliver a QC-failed ad as failed with the exact Slack
+        // reason"). A bare { _id } write would overwrite that verdict with
+        // 'draft' and count the ad succeeded. MEASURED in prod 2026-08-24:
+        // 47 video ads with visionQc.passed:false sitting in 'draft', ZERO
+        // in 'failed' — the verdict never survived once. "Counting an
+        // untitled master as success is forbidden" (§2) has always been the
+        // rule; this closes the QC arm of it.
         //
         // ALLOWLIST, NOT DENYLIST — the direction is the safety property. A
         // $nin:['failed','archived'] fails OPEN: any status nobody enumerated
@@ -3359,9 +3225,9 @@ async function renderOneInner(run, job, adId, index, renderToken) {
         // moved to 'queued' (processAlerts SIGTERM, the /generate and /runs
         // crash catches) and DEMOTES an ad an operator promoted to 'live'.
         // $in admits only the two states this point legitimately owns:
-        // 'rendering' (no-chrome / no-brand — titling never ran) and 'draft'
-        // (uploadRenderAndStamp already promoted it). Unknown state => the
-        // settle-only arm, which clears the debt without touching status.
+        // 'rendering' (titling never ran — always true now) and 'draft'
+        // (already promoted, e.g. by a concurrent write). Unknown state =>
+        // the settle-only arm, which clears the debt without touching status.
         const promoted = await Ad.updateOne(
           { _id: adId, status: { $in: ['rendering', 'draft'] } },
           {
@@ -3369,10 +3235,11 @@ async function renderOneInner(run, job, adId, index, renderToken) {
               status:     'draft',
               renderedAt: new Date(),
               updatedAt:  new Date(),
-              // Debt settled: titled, or deliberately shipped bare (no-chrome /
-              // no-brand). Clearing here is what keeps the no-chrome ad — whose
-              // renderUrl legitimately stays equal to veoVideoUrl forever — from
-              // being re-titled on every sweep for the rest of its life.
+              // Debt settled: shipped bare (no titling ever runs now). Clearing
+              // here is what keeps this ad — whose renderUrl legitimately stays
+              // equal to veoVideoUrl forever — from being re-swept for the
+              // rest of its life (moot in practice: the sweeper that used to
+              // read this field, titlingResumeService, is also removed).
               titlingResumeState: null
             }
           }
@@ -3382,8 +3249,8 @@ async function renderOneInner(run, job, adId, index, renderToken) {
           adStage(adId, 'done');
         } else {
           // A terminal verdict is already on the row. Do NOT resurrect it —
-          // but the titling debt is still ours to settle, or titlingResumeService
-          // re-renders this ad on its next sweep.
+          // but the titling-debt field is still ours to settle so no other
+          // reader mistakes this row for one still owing a title.
           const kept = await Ad.findOneAndUpdate(
             { _id: adId },
             { $set: { titlingResumeState: null, updatedAt: new Date() } },
