@@ -153,6 +153,37 @@ check('B4 a stamp refusal (modifiedCount===0) is reported per-ad, never silently
   assert.ok(/results\.push\(\s*\{\s*id,\s*ok:\s*false/.test(fnBody));
 });
 
+check('B5 the stamp filter requires regenerating:{$ne:true} (adversarial review finding, 2026-08-28)', () => {
+  const fnBody = functionBody(BRAND_ROUTE_SRC, /async function runRetitleJobViaAdgen\s*\([^)]*\)\s*\{/);
+  const updateOneArgs = callArgs(fnBody, 'await Ad.updateOne(');
+  assert.ok(/regenerating:\s*\{\s*\$ne:\s*true\s*\}/.test(updateOneArgs),
+    'without this, a manual retitle can be stamped on an ad a regenerate is currently rewriting — the ' +
+    'regenerate may replace veoVideoUrl/renderUrl entirely while adgen titles the OLD master, wasting a ' +
+    'Remotion slot, a Cloudinary upload, AND a real Atlas vision-QC LLM call on a result about to be superseded');
+});
+
+check('B6 the poll loop does NOT treat retitleRequest:null with no retitleResult as success', () => {
+  const fnBody = functionBody(BRAND_ROUTE_SRC, /async function runRetitleJobViaAdgen\s*\([^)]*\)\s*\{/);
+  // The "cleared, no result" branch — the final else of the res.status if/else
+  // chain inside the retitleRequest==null block — must push ok:false.
+  const nullBlock = /if\s*\(\s*row\.retitleRequest\s*==\s*null\s*\)\s*\{[\s\S]*?\n\s{8}\}/.exec(fnBody);
+  assert.ok(nullBlock, 'could not locate the retitleRequest==null handling block');
+  const elseMatch = /\}\s*else\s*\{\s*\n([\s\S]*?)\n\s*\}\s*\n\s*pending\.delete/.exec(nullBlock[0]);
+  assert.ok(elseMatch, 'could not locate the "cleared with no result" else branch');
+  assert.ok(/ok:\s*false/.test(elseMatch[1]),
+    'a null retitleRequest with no retitleResult must be reported as an indeterminate FAILURE, not a success — ' +
+    'settle() always writes retitleResult in the same $set that clears retitleRequest, so the only way to see ' +
+    'this shape is something ELSE clearing the field (the local path\'s own defensive re-stamp guard)');
+});
+
+check('B7 the LOCAL runRetitleJob refuses to render an ad adgen currently holds an active claim on', () => {
+  const fnBody = functionBody(BRAND_ROUTE_SRC, /async function runRetitleJob\s*\([^)]*\)\s*\{/);
+  assert.ok(/retitleClaimedByWorker:\s*null\s*\}/.test(fnBody) && /localLockResult\.modifiedCount\s*===\s*0/.test(fnBody),
+    'without this, a flag flip mid-flight (ADGEN_RENDERER_ENABLED true->false) can let the local in-process ' +
+    'path render an ad while adgen\'s retitleConsumer is still actively rendering the SAME ad — a genuine ' +
+    'concurrent-Remotion dual-render, adversarial review finding 2026-08-28');
+});
+
 // ═════════════════════════════════════════════════════════════════════════
 // C — the LOCAL (dormant fallback) runner must still exist unmodified in
 // shape, and must ALSO carry the status-preservation fix — this bug is

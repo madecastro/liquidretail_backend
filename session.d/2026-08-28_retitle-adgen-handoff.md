@@ -120,11 +120,59 @@ by design — see that harness's own comment) — it cannot see this
 uncommitted/unmerged work yet and will pass once both PRs land. Confirmed
 NOT a real defect: `diff`-identical against the actual adgen worktree.
 
-PR: (fill in link once opened) — `fix/retitle-adgen-handoff-be`.
-Companion adgen PR: `fix/retitle-adgen-handoff-ag`.
+PR: https://github.com/Emami-RS-Project/liquidretail_backend/pull/359 —
+`fix/retitle-adgen-handoff-be`. Companion adgen PR:
+https://github.com/Emami-RS-Project/liquidretail_adgen/pull/93 —
+`fix/retitle-adgen-handoff-ag`.
 
 **Do not merge without the companion adgen PR** — this is a paired,
 cross-repo contract change; landing one without the other leaves
 `verifyHandoffContract.js` and `verifyModelParity.js` red on whichever
 repo's trunk gets the change first (both are expected, transient, and
 resolve once the second PR merges).
+
+## Adversarial review (two independent Grok xhigh passes, one per repo)
+
+Run before either PR was called done. Both converged on the same real
+defect from opposite sides, plus corrected the money framing:
+
+1. **Real: the stamp filter needed `regenerating:{$ne:true}` too.** Fixed
+   — without it, a manual retitle could be stamped on an ad a regenerate
+   is actively rewriting, wasting a Remotion slot, a Cloudinary upload,
+   and a real vision-QC/face-detection Atlas LLM call on a result about
+   to be superseded. `scripts/verifyRetitleAdgenHandoff.js` grew 13→16
+   checks (B5/B6/B7), all revert-proven.
+2. **Real: the local `runRetitleJob` never defensively cleared a stale or
+   active deferred request on the same ad before rendering it locally**
+   — fixed with an atomic lock write (`retitleClaimedByWorker:null` in
+   the filter) that REFUSES to render locally if adgen currently holds an
+   active claim (B7), and nulls a stale unclaimed request otherwise. The
+   poll loop's "retitleRequest cleared, no result" branch was also wrong
+   — it assumed success; fixed to report indeterminate failure instead
+   (B6), since the only way to reach that shape is the NEW local-path
+   guard racing an in-flight poll. A poll timeout now only clears
+   `retitleRequest` when the row is confirmed unclaimed at that moment,
+   never when adgen genuinely still holds it.
+3. **Corrected: "retitle is confirmed FREE" overclaimed.** Vision QC
+   (`adVisionQcService`) and face-detection for the safe-crop
+   (`basePlateCropService`) both require `atlasLlmService.chatCompletion`
+   — a real, billed Atlas LLM call made on every titling render
+   (pre-existing, not something this change adds or removes). Accurate
+   claim: no NEW Atlas VIDEO-GENERATION submit; the claim-safety concern
+   is double EXECUTION of one request, not a double video charge.
+   Corrected in `models/Ad.js`, `routes/brand.js`, `services
+   /handoffContract.js`, this file, `session.md`, `CLAUDE.md`, and the
+   canonical `docs/CONTRACT-backend-adgen.md` (adgen repo).
+4. **Known, narrower, NOT fixed: a regenerate can still start while a
+   retitle is already claimed and rendering** (the reverse of #1). Worst
+   case is a last-writer-wins clobber between the retitle's stale output
+   and the regenerate's fresh master — not a double bill (regenerate
+   still submits exactly one Omni generation regardless). Judged
+   disproportionate to fix by touching regenerate's own already-
+   adversarially-reviewed, money-critical lock for this narrower,
+   lower-frequency window. Flagged, not silently left undocumented.
+5. Confirmed clean by both reviews: schema declarations match the writes;
+   the titled-path status-preservation fix is correctly threaded through
+   all three `stampTitlingFailureAndThrow` call sites (adgen); SIGTERM
+   handling is sound; the no-chrome residual (already known/flagged) is
+   confirmed unreachable today.

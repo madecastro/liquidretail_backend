@@ -1603,9 +1603,13 @@ Video never launches a browser.
   `status:{$in:['rendering','draft']}`); manual retitle's real target is
   commonly `status:'live'`, delivered days or weeks earlier, which it can
   never match. `runRetitleJobViaAdgen` stamps `Ad.retitleRequest`
-  (filter requires `titlingNeeded:{$ne:true}` so it can never race the
-  renderer→titler handoff), adgen's `retitleConsumer.js` claims + executes.
-  `title-still` and `title-spec/modify` do NOT get this treatment — the
+  (filter requires `titlingNeeded:{$ne:true}` AND `regenerating:{$ne:true}`
+  — the latter added after two independent adversarial Grok reviews
+  found the same gap: without it, a retitle could be stamped on an ad a
+  regenerate is actively rewriting), adgen's `retitleConsumer.js` claims +
+  executes. Known, narrower, NOT fixed: the reverse (a regenerate starting
+  while a retitle is already claimed) — see `docs/CONTRACT-backend-adgen
+  .md` §4a. `title-still` and `title-spec/modify` do NOT get this treatment — the
   first is a synchronous interactive preview loop an async worker would
   slow down, the second is an LLM spec-editor with no Remotion render in
   it. **Also fixed here, independent of the flag:**

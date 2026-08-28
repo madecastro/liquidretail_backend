@@ -289,7 +289,20 @@ const CONTRACT_FIELDS = [
       'the same stamp write, to clear a stale payload left by a crashed deferred attempt. ' +
       'Same $type:"object" discipline as regenerationRequest and the same reason: {$ne:null} ' +
       'also matches every ad where the field is simply ABSENT. Cleared by the retitle ' +
-      'consumer alongside retitleResult, retitleClaimedByWorker, retitleClaimedAt.',
+      'consumer alongside retitleResult, retitleClaimedByWorker, retitleClaimedAt. The stamp ' +
+      'filter ALSO requires regenerating:{$ne:true} (added 2026-08-28 after adversarial review ' +
+      'independently found the same gap from both repos) — without it a retitle could be ' +
+      'stamped on an ad a regenerate is actively rewriting, wasting a Remotion slot and a ' +
+      'vision-QC/face-detection LLM call on a master about to be replaced. ' +
+      '⚠️ KNOWN RESIDUAL, NOT FIXED, NARROWER DIRECTION: the reverse is not guarded — ' +
+      'adRegenerateService\'s existing in-flight lock does not check retitleRequest / ' +
+      'retitleClaimedByWorker, so a regenerate CAN start while a retitle is already claimed ' +
+      'and rendering on the same ad. Worst case is a last-writer-wins clobber between the ' +
+      'retitle\'s stale-master output and the regenerate\'s fresh (paid) master — not a double ' +
+      'bill (regenerate still submits exactly one Omni generation regardless). Judged ' +
+      'disproportionate to fix by modifying regenerate\'s own already-adversarially-reviewed, ' +
+      'money-critical lock for this comparatively low-severity, low-frequency window; flagged ' +
+      'rather than silently left undocumented.',
   },
   {
     field: 'retitleClaimedByWorker',
@@ -297,14 +310,19 @@ const CONTRACT_FIELDS = [
     writer: 'both',
     role: 'retitle',
     note:
-      'The retitle lease. Held on a field DISJOINT from claimedByWorker (mint-time render), ' +
-      'regenerateClaimedByWorker (regenerate), AND titlingNeeded (renderer->titler handoff) — ' +
-      'by construction none of the four claims can collide on the same document. Retitle is ' +
-      'confirmed FREE (brandScriptExecutor.js never requires an Atlas billing client in ' +
-      'either repo), so unlike the regenerate claim this ONE is safe to let a stale-claim ' +
-      'reclaim sweep clear — see adgen retitleConsumer.js reclaimStaleRetitleClaims, modeled ' +
-      'on titler.js reclaimStaleTitlerClaims. Backend also nulls this on its local-execution ' +
-      'stamp write, same defense-in-depth reason as regenerateClaimedByWorker.',
+      'The retitle lease — a field DISJOINT from claimedByWorker (mint-time render), ' +
+      'regenerateClaimedByWorker (regenerate), AND titlingNeeded (renderer->titler handoff), so ' +
+      'none of the four LEASE FIELDS can collide. This is NOT the same as "none of the four ' +
+      'operations can run concurrently" — see the regenerate-vs-retitle residual noted on the ' +
+      'retitleRequest entry above. CORRECTED 2026-08-28 (adversarial Grok review caught the ' +
+      'first draft overclaiming "confirmed FREE"): retitle makes no NEW Atlas VIDEO-GENERATION ' +
+      'submit, but does make the same real, pre-existing vision-QC + face-detection Atlas LLM ' +
+      'calls every titling render already makes. Not a new cost; the guard here is against ' +
+      'DOUBLE EXECUTION of one request, which is why — unlike the regenerate claim — this one ' +
+      'is safe to let a stale-claim reclaim sweep clear (adgen retitleConsumer.js ' +
+      'reclaimStaleRetitleClaims, modeled on titler.js reclaimStaleTitlerClaims). Backend also ' +
+      'nulls this on its local-execution stamp write, same defense-in-depth reason as ' +
+      'regenerateClaimedByWorker.',
   },
   {
     field: 'retitleClaimedAt',

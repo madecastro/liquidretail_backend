@@ -311,13 +311,23 @@ const adSchema = new mongoose.Schema({
   // crashed deferred attempt must not let a NEW local-path run collide
   // with a consumer that is still watching the old claim.
   //
-  // retitle is confirmed FREE — services/brandScriptExecutor.js never
-  // requires any Atlas billing client (grep-verified in both repos), so
-  // this pair guards against WASTED COMPUTE and a duplicate Cloudinary
-  // upload racing the SAME renderUrl identity, not a double charge. That
-  // is a real but lower-severity hazard than regenerate's, which is why
-  // this claim (unlike regenerate's) is safe to let a stale-claim reclaim
-  // sweep clear — see retitleConsumer.js's staleness handling.
+  // CORRECTED 2026-08-28 (adversarial Grok review caught the first draft
+  // of this comment overclaiming "confirmed FREE"): retitle triggers NO
+  // NEW Atlas VIDEO-GENERATION submit (services/brandScriptExecutor.js
+  // never requires atlasVideoService, grep-verified in both repos), but
+  // it DOES still make the SAME real, pre-existing Atlas LLM calls every
+  // titling render already makes — vision QC (adVisionQcService ->
+  // atlasLlmService.chatCompletion) and face-detection for the safe-crop
+  // (basePlateCropService -> atlasLlmService.chatCompletion). That cost
+  // is not new here; it is the retitle-videos feature's existing cost,
+  // unaffected by this handoff either way. What this claim pair actually
+  // guards against is a DOUBLE EXECUTION of one operator-requested
+  // retitle (wasted Remotion compute, a duplicate Cloudinary upload, AND
+  // a duplicate vision-QC/face-detection LLM call for the SAME request)
+  // — real, but lower-severity than regenerate's double-Omni-submit
+  // hazard, which is why this claim (unlike regenerate's) is safe to let
+  // a stale-claim reclaim sweep clear — see retitleConsumer.js's
+  // staleness handling.
   retitleRequest: { type: mongoose.Schema.Types.Mixed, default: null },
   // Which adgen retitle-consumer worker (if any) has claimed a deferred
   // retitleRequest. Atomic claim: findOneAndUpdate({retitleRequest:

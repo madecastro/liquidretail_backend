@@ -80,8 +80,14 @@ forces `status:'draft'` unconditionally in BOTH repos, so every manual
 retitle of an already-delivered (`'live'`) ad has been silently
 un-publishing it, today, regardless of `ADGEN_RENDERER_ENABLED`. Fixed via
 an opt-in `preserveAdStatus`/`retitleMode` flag, both repos, revert-proven.
-Full narrative: `session.d/2026-08-28_retitle-adgen-handoff.md`. **Do not
-merge without the companion adgen PR** — paired cross-repo contract change.
+Two adversarial Grok xhigh review passes (one per repo) found a real gap
+— the stamp filter also needed `regenerating:{$ne:true}` — and corrected
+an overclaim: retitle makes no NEW Atlas video-gen submit, but it does
+still make the pre-existing vision-QC/face-detection Atlas LLM calls
+every titling render makes. `scripts/verifyRetitleAdgenHandoff.js` grew
+13→16 checks. Full narrative:
+`session.d/2026-08-28_retitle-adgen-handoff.md`. **Do not merge without
+the companion adgen PR** — paired cross-repo contract change.
 
 *(Prior state replaced 2026-08-25 ~12:45 UTC. Narrative:
 `session.d/2026-08-25_review-coverage-corrected-and-ingest-mechanics.md` then
