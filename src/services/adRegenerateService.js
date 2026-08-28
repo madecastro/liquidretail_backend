@@ -50,19 +50,13 @@ const { resolveDeriveFromMaster } = require('./campaignAdsGenerationService');
 const { isUgcFirstSeedingEnabled } = require('./seededUniverseService');
 const ugcVideoPipeline             = require('./ugcVideoPipeline');
 // Receipt peek for the reclaim path ONLY (runClaimedRegeneration's receipt
-// gate). Required DIRECTLY off atlasVideoService, not through videoRouter,
-// because videoRouter deliberately exports only generateForAd /
-// prepareStoryboard / activeProvider — the same coupling shape
-// bootRecoveryService.js already uses for exactly this purpose. resumeForAd is
-// a free GET over an existing prediction id and CANNOT submit; that is its
-// entire reason to exist. Nothing here calls generateForAd — the only
-// generateForAd on any regenerate path remains runVideoFull's frozen
-// allowResume:false literal.
-const {
-  resumeForAd,
-  reconcileVideoCostFromTerminal,
-  resolveFailureCostReconcile
-} = require('./atlasVideoService');
+// gate) — resumeForAd / reconcileVideoCostFromTerminal / resolveFailureCostReconcile.
+// DELIBERATELY LAZY-REQUIRED, not top-level: see the require() inside
+// runClaimedRegeneration below for the full reasoning (atlasVideoService pulls
+// in models/Campaign.js, which broke scripts/verifyRegenerateInFlightGate.js's
+// mongoose-stub interception window at module-load time — confirmed by
+// bisection, not suspected). All three names are used ONLY inside
+// runClaimedRegeneration; nothing else in this file touches them.
 const { reconcileCost } = require('./costTracker');
 // Titling handoff for a recovered master — same sentinel pair
 // bootRecoveryService stamps, so the two writers cannot drift.
@@ -1122,6 +1116,22 @@ async function runClaimedRegeneration(ad, req = {}) {
     && String(currentPredictionId) !== String(req.priorVeoPredictionId || '');
 
   if (hasFreshReceipt) {
+    // Lazy-required, DELIBERATELY not top-level (see the module-header
+    // comment near the other requires). atlasVideoService.js top-level
+    // `require('../models/Campaign')` — pulling that into this file's own
+    // top-level require graph broke scripts/verifyRegenerateInFlightGate.js's
+    // mongoose-stub interception window at module-load time
+    // (`TypeError: Cannot read properties of undefined (reading 'Types')`,
+    // bisected to this exact require). Every other lazy require in this file
+    // (./alertService, ./progressService, ../models/Brand) follows the same
+    // pattern for the same reason: keep this file's own top-level require
+    // graph narrow so a sibling harness's stub window isn't forced open by a
+    // dependency this path only needs when hasFreshReceipt is actually true.
+    const {
+      resumeForAd,
+      reconcileVideoCostFromTerminal,
+      resolveFailureCostReconcile
+    } = require('./atlasVideoService');
     // resumeForAd → peekPrediction: one free GET, structurally incapable of
     // submitting. Pass the FRESH receipt, not the claimed doc's stale copy.
     let peek;
@@ -1365,6 +1375,116 @@ async function runClaimedRegeneration(ad, req = {}) {
     // and so it cannot fall through into a second markComplete below.
     if (err instanceof InFlightRefusalError) {
       await unwindInFlightRefusal(adId, startedAt, err, progressRun);
+      return;
+    }
+    // ⚠️ MONEY — AN UNSETTLED POLL TIMEOUT IS NOT A CONFIRMED FAILURE, AND
+    // MUST NOT GO THROUGH markComplete. Set by atlasVideoService's
+    // resolveTimeoutOutcome (atlasVideoService.js:4409-4422) when
+    // generateForAd's poll hits MAX_POLL_MS (atlasVideoService.js:559) while
+    // Atlas's own final free peek still says 'processing'/'unknown' — Atlas
+    // may genuinely still be rendering a master this attempt already paid
+    // for (veoPredictionId is stamped at the charge point before polling, so
+    // a receipt can exist even though the throw carries no video).
+    //
+    // markComplete (used by every other branch here) does ONE $set that
+    // clears regenerating, regenerationRequest — THE RECLAIM BASELINE
+    // (priorVeoPredictionId / priorVeoPredictionSetAt) LIVES INSIDE THAT
+    // FIELD — and both claim markers, all at once. Calling it here would
+    // terminal-fail the row before the 45-minute lease this PR adds could
+    // ever engage on exactly the case it exists for: the row would look
+    // permanently failed, indistinguishable from a real failure, with no
+    // baseline left for a later reclaim to judge a resubmit against.
+    //
+    // THE FIX: do nothing to the Ad document at all. In particular, do NOT
+    // null out regenerateClaimedByWorker/regenerateClaimedAt either — that
+    // would route the row through claimOne's ARM 1 (fresh claim) on the very
+    // next regenerate-consumer tick, and arm 1 UNCONDITIONALLY RE-SNAPSHOTS
+    // the baseline onto whatever veoPredictionId is on the ad right now
+    // (regenerateConsumer.js claimOne, the post-`fresh` baseline write) —
+    // which, on this exact error, is the id THIS timed-out attempt just
+    // stamped. That would silently overwrite the true "what existed before
+    // this regenerate began" baseline with the very receipt the reclaim path
+    // is supposed to be judging, collapsing hasFreshReceipt to false on the
+    // next pass and reopening a blind resubmit. (Traced and confirmed before
+    // writing this: this is precisely the shape of the double-billing
+    // incident this PR exists to close.)
+    //
+    // Leaving every claim field untouched is what makes the row eligible for
+    // ARM 2 (reclaim-after-lease-expiry) instead of arm 1 once
+    // regenerateClaimedAt ages past CLAIM_STALE_MIN — arm 2 deliberately
+    // never restamps the baseline (regenerateConsumer.js claimOne, "arm 2
+    // does NOT restamp"), so runClaimedRegeneration's receipt gate sees the
+    // ORIGINAL pre-regenerate veoPredictionId as `priorVeoPredictionId` and
+    // can correctly detect a fresh receipt via resumeForAd (a free GET that
+    // structurally cannot submit) before anything considers a resubmit. This
+    // is the SAME posture regenerateConsumer.js's drainOnShutdown already
+    // takes on SIGTERM ("This does NOT release the claim ... the lease
+    // reclaims it ... and the receipt check then decides whether a resubmit
+    // is legal") — this branch is the equivalent for an in-process timeout
+    // rather than a process death.
+    if (err && err.unsettledAtTimeout) {
+      console.warn(
+        `🔁 regenerate[ad=${adId}]: unsettled at Atlas poll timeout after ${Math.round(durationMs / 1000)}s ` +
+        `(receipt ${err.predictionId || 'unknown'}) — Atlas may still be rendering. NOT terminal-failing: ` +
+        'leaving the claim and the reclaim baseline untouched so the 45-minute lease can reclaim this row and ' +
+        're-peek the receipt via resumeForAd before anything resubmits.'
+      );
+      // ⚠️ MONEY — BACKFILL THE RECEIPT IF THE CHARGE POINT DID NOT.
+      // atlasVideoService's veoPredictionId $set at the charge point is
+      // deliberately best-effort (wrapped in its own non-fatal try/catch —
+      // "a telemetry or bookkeeping failure must never fail a generation
+      // post-payment"). So a genuinely-billed prediction can exist ONLY on
+      // this thrown error (err.predictionId) if that write failed. Without
+      // this backfill, Ad.veoPredictionId would still read the PRE-regenerate
+      // baseline id 45 minutes from now when arm 2 reclaims: `hasFreshReceipt`
+      // compares the ad's CURRENT veoPredictionId against the baseline, they
+      // would look IDENTICAL (nothing changed the current one), the receipt
+      // gate would be skipped entirely, and the reclaim would fall straight
+      // through to a brand-new billable generateForAd — while this attempt's
+      // prediction may still be actively rendering (or already delivered) at
+      // Atlas. Found by adversarial review (Grok xhigh) — this is the same
+      // class of gap renderer.js's settleUnsettledVideoTimeout already closes
+      // on the mint-time hold branch, adapted here: that code gates on
+      // `veoPredictionId: {$in:[null,'']}` because a fresh mint starts empty;
+      // a regenerate's veoPredictionId is essentially ALWAYS already populated
+      // (it holds the old master), so gating on "empty" would never fire here.
+      // Instead this ALWAYS (re)stamps THIS attempt's own predictionId — safe
+      // even if it overwrites a still-present older id, because that older id
+      // already went through its own receipt-check pass to get here (nothing
+      // reaches a SECOND submit without the first one having been peeked and
+      // reconciled as unbilled). The write touches ONLY veoPredictionId — never
+      // regenerationRequest (the baseline) and never the claim fields — so it
+      // cannot trip the arm-1-restamp trap the rest of this branch exists to
+      // avoid. Claim-scoped (regenerateClaimedByWorker) so a row a DIFFERENT
+      // worker has already reclaimed in the meantime is left untouched rather
+      // than clobbered. Best-effort: a failure here must not turn an already
+      // money-safe park into an exception.
+      if (err.predictionId && ad.regenerateClaimedByWorker) {
+        try {
+          await Ad.updateOne(
+            { _id: adId, regenerateClaimedByWorker: ad.regenerateClaimedByWorker },
+            { $set: { veoPredictionId: err.predictionId } }
+          );
+        } catch (backfillErr) {
+          console.warn(
+            `🔁 regenerate[ad=${adId}]: could not backfill veoPredictionId=${err.predictionId} — ` +
+            `${backfillErr.message}; the next reclaim's receipt gate may not see this attempt's own submit`
+          );
+        }
+      }
+      try {
+        require('./alertService').notifyAsync({
+          level: 'warn',
+          title: 'Regenerate unsettled at poll timeout — awaiting lease reclaim',
+          key:   `regenerate-unsettled:${adId}`,
+          fields: {
+            adId, kind, predictionId: err.predictionId || null,
+            note: 'claim + baseline intentionally left in place; the lease reclaims and re-peeks before any resubmit'
+          }
+        });
+      } catch (alertErr) {
+        console.warn(`🔁 regenerate[ad=${adId}]: unsettled-timeout alert failed — ${alertErr.message}`);
+      }
       return;
     }
     console.error(`❌ regenerate[ad=${adId}]: failed after ${Math.round(durationMs / 1000)}s — ${err.message}`);
