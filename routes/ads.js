@@ -2306,6 +2306,117 @@ async function findSiblingMasterAd(ad, masterPlatformFormat) {
 }
 
 /**
+ * Cloudinary still-frame URL for a video, or null when the URL is not a
+ * Cloudinary video delivery URL. Same transform the inspector's existing
+ * `derivedFrom` block uses — kept here as one expression so the two cannot
+ * drift into showing different frames for the same asset.
+ */
+function videoStillUrl(videoUrl) {
+  if (typeof videoUrl !== 'string' || !videoUrl.includes('/video/upload/')) return null;
+  return videoUrl
+    .replace('/video/upload/', '/video/upload/so_2,f_jpg,q_auto:good,w_360/')
+    .replace(/\.(mp4|mov|webm|m4v)(\?.*)?$/i, '.jpg$2');
+}
+
+/**
+ * PURE. The Mongo filter locating the master Ad for DIAGNOSTIC display.
+ *
+ * ⚠️ THIS IS DELIBERATELY *NOT* `findSiblingMasterAd`'s FILTER, AND THE
+ * DIFFERENCE IS THE WHOLE POINT. That function answers an ELIGIBILITY question —
+ * "may this ad legally derive from that master?" — and so carries an
+ * unconditional `videoDurationSec: { $gte: GOOGLE_PMAX_VIDEO_DURATION_SEC }`
+ * clause (routes/ads.js, in findSiblingMasterAd) because Google rejects PMax
+ * video under 10s. `$gte` matches neither null nor an absent field, so reusing
+ * that filter here would report every legacy master — an 8s Meta master, or any
+ * row minted before `videoDurationSec` was stamped — as NOT FOUND, i.e. would
+ * tell an operator the master was deleted when it is sitting right there. On a
+ * diagnostic that is a lie, and it would fire on exactly the older inventory an
+ * operator is most likely to be investigating.
+ *
+ * This filter therefore answers the different, honest question: "WHICH ad is the
+ * master of this derive?" — no duration gate, no status gate (an archived or
+ * failed master must still be reported, with its status; "the master was
+ * archived" IS the diagnosis).
+ *
+ * `brandId` is REQUIRED and is the tenancy boundary. findSiblingMasterAd omits
+ * it — correct for the in-process renderer, never sufficient for an HTTP join
+ * where a second document reaches a client. Pinned by
+ * scripts/verifyMasterAdLinkSurfacing.js.
+ */
+function masterAdDiagnosticQuery({ ad, masterPlatformFormat, brandId }) {
+  if (!ad || !masterPlatformFormat || !brandId) return null;
+  return {
+    brandId,                        // TENANCY — never remove
+    campaignId:     ad.campaignId,
+    productId:      ad.productId,
+    platformFormat: masterPlatformFormat,
+    kind:           'video',
+    _id:            { $ne: ad._id },
+    // True master only — no derive marker, no funnel retitle. Mirrors
+    // findSiblingMasterAd's true-master predicate, which is what makes a staged
+    // retitle resolve to the MASTER rather than to its unstaged parent derive.
+    $and: [
+      { $or: [{ deriveFromMaster: null }, { deriveFromMaster: { $exists: false } }] },
+      { $or: [{ funnelStage: null }, { funnelStage: { $exists: false } }] }
+    ]
+  };
+}
+
+/**
+ * PURE. Shape the generation-inspector's `master` block for a DERIVATIVE ad.
+ *
+ * Exported and driven behaviourally by scripts/verifyMasterAdLinkSurfacing.js —
+ * a source-text check would pass against a reimplementation that kept the key
+ * and returned undefined, which is the failure mode that matters here.
+ *
+ * `deriveFmt` is the value of `resolveDeriveFromMaster(ad)`: the MASTER'S
+ * platformFormat STRING. `Ad.deriveFromMaster` does NOT hold an ad id — there is
+ * no persisted master id anywhere — so `master` is resolved by sibling query and
+ * "not found" is a real, expected outcome, not an error.
+ *
+ * ⚠️ A FAILED MASTER IS THE PRIMARY CASE. This block exists so an operator can
+ * QC a master whose output was wrong, so it reports `failed` alongside the URLs
+ * rather than instead of them: on a titling failure the master is stamped
+ * `failed` with "master rendered; titling failed" and the paid plate is KEPT, so
+ * a failed master usually still has an inspectable video. `hasVideo` is computed
+ * from the URLs actually present and is independent of `status`.
+ */
+function buildMasterBlock({ deriveFmt, master }) {
+  if (!deriveFmt) return null;
+  const platformFormat = String(deriveFmt);
+  if (!master) {
+    return {
+      platformFormat,
+      found:  false,
+      reason: 'No master ad matching this format was found on the same campaign and product — it was most likely deleted or archived.'
+    };
+  }
+  const str = (v) => (typeof v === 'string' && v.trim() ? v : null);
+  // The master's DELIVERED (titled) render, and its RAW pre-titling plate. Both
+  // are reported when present; neither is invented from the other.
+  const previewUrl  = str(master.renderUrl);
+  const rawVideoUrl = str(master.veoVideoUrl);
+  return {
+    platformFormat,
+    found:          true,
+    adId:           master._id ? String(master._id) : null,
+    aspectRatio:    str(master.aspectRatio) || str(master.veoAspectRatio),
+    status:         str(master.status),
+    previewUrl,
+    rawVideoUrl,
+    posterUrl:      str(master.posterUrl),
+    thumbnailUrl:   videoStillUrl(previewUrl) || videoStillUrl(rawVideoUrl),
+    predictionId:   str(master.veoPredictionId),   // the spend receipt
+    visionQc:       summarizeVisionQc(master.visionQc, { categories: true }),
+    failed:         master.status === 'failed',
+    failureMessage: str(master.renderError && master.renderError.message),
+    failureStage:   str(master.renderError && master.renderError.stage),
+    // Independent of `failed` ON PURPOSE — see the header note.
+    hasVideo:       !!(previewUrl || rawVideoUrl)
+  };
+}
+
+/**
  * One Slack notice per derive-wait BACKUP EPISODE — not one per ad, not one
  * per poll (owner 2026-08-20: "send a slack explaining the backup").
  *
@@ -5184,6 +5295,79 @@ router.get('/:id/generation-inspector', async (req, res) => {
     }
     out.seed = seed;
 
+    // ── The MASTER video ad this ad was derived from ──
+    // Owner ask 2026-08-28, verbatim: "We need this to properly QC analyze
+    // errors in the master video used to produce derivatives." A derivative
+    // inherits its master's outcome, so when a derive looks wrong the defect is
+    // usually IN THE MASTER — and there was no way to get from the derive to it.
+    //
+    // Served from HERE and deliberately NOT from projectAd():
+    //   1. projectAd() backs the LIST (`GET /`). The linkage is a platformFormat
+    //      STRING, not a joinable id, so resolving a master costs a SECOND query
+    //      PER ROW — an N+1 across the whole gallery. This endpoint is per-ad.
+    //   2. scripts/verifySpendReceiptSurfacing.js E1 mechanically forbids the
+    //      verbose veo* fields on projectAd (the prompt measured +398% on every
+    //      row). That exclusion is a measured decision; this respects it.
+    //   3. This is already the diagnostic endpoint the Generation Details modal
+    //      fetches, so there is no new network call and zero list-payload delta.
+    //
+    // NOT the same thing as `video.derivedFrom` below: that is a URL-shape
+    // heuristic over THIS ad's own veoVideoUrl. It has no ad id, cannot name the
+    // master, and is null whenever this ad has no video — i.e. it disappears in
+    // exactly the failed-master case this block exists to serve.
+    // Hoisted so the catch below can still name WHICH master it failed to
+    // resolve — a `found:false` with no platformFormat cannot be rendered
+    // usefully, and the client's type requires it.
+    let deriveFmt = null;
+    try {
+      deriveFmt = resolveDeriveFromMaster(ad);
+      if (deriveFmt) {
+        // ⚠️ TENANCY + HONESTY. Uses masterAdDiagnosticQuery, NOT
+        // findSiblingMasterAd: `brandId` (already cleared by assertBrandInTenant
+        // above) is IN the Mongo filter, and the renderer's 10s duration
+        // eligibility gate is deliberately absent so a legacy 8s master is not
+        // reported as deleted. Both reasons are spelled out on that function.
+        const q = masterAdDiagnosticQuery({ ad, masterPlatformFormat: deriveFmt, brandId });
+        let master = q ? await Ad.findOne(q).sort({ generatedAt: -1 }).lean() : null;
+        // Belt-and-braces on the tenancy boundary: the filter already pins
+        // brandId, so this can only ever fail closed. Convention is omit, never
+        // 403 — a distinct "exists but not yours" reason would itself leak.
+        if (master && String(master.brandId) !== String(brandId)) master = null;
+        out.master = buildMasterBlock({ deriveFmt, master });
+
+        if (out.master && out.master.found === false) {
+          out.warnings.push({
+            code: 'master-not-found',
+            message: `This ad is a derivative of the ${deriveFmt} master, but no such master could be found on this campaign and product — it was most likely deleted or archived. Its generation inputs cannot be inspected.`
+          });
+        } else if (out.master && out.master.failed) {
+          out.warnings.push({
+            code: 'master-failed',
+            message: `The ${deriveFmt} master this ad derives from FAILED${out.master.failureStage ? ` at stage "${out.master.failureStage}"` : ''}. This ad inherited that outcome — diagnose the master, not this ad.`
+          });
+        }
+        if (out.master && out.master.found && !out.master.hasVideo) {
+          out.warnings.push({
+            code: 'master-has-no-video',
+            message: `The ${deriveFmt} master produced no video plate (neither a delivered render nor a raw master URL is stored), so there is nothing to preview — and that is why this derivative has no output.`
+          });
+        }
+      }
+    } catch (err) {
+      // A diagnostic must never take down the diagnostic. Same posture as the
+      // titling reconstruction below: report the failure, keep serving the rest.
+      // Only emit a block at all if we know this ad IS a derivative — otherwise
+      // a transient failure would label a plain master as one.
+      if (deriveFmt) {
+        out.master = {
+          platformFormat: String(deriveFmt),
+          found:  false,
+          reason: `The master could not be resolved: ${err.message}`
+        };
+      }
+      console.warn(`generation-inspector: master lookup failed for ad ${ad._id}: ${err.message}`);
+    }
+
     // ── Video generation inputs ──
     if (ad.kind === 'video' || ad.veoPrompt || ad.veoVideoUrl) {
       // The reference-image stack the model ACTUALLY received (pos 0 = seed),
@@ -5983,6 +6167,16 @@ module.exports.resolveDeriveFromMaster = resolveDeriveFromMaster;
 // an adversarial review flagged in this exact function (a regex proving an
 // assignment exists proves nothing about what the query actually excludes).
 module.exports.findSiblingMasterAd = findSiblingMasterAd;
+// PURE shaper for the generation-inspector's `master` block. Exported so
+// scripts/verifyMasterAdLinkSurfacing.js drives the REAL function rather than
+// regexing the route — a source check would pass against a reimplementation
+// that kept the key and returned undefined.
+module.exports.buildMasterBlock = buildMasterBlock;
+module.exports.videoStillUrl = videoStillUrl;
+// Exported so the harness can inspect the LITERAL query object (same pattern as
+// verifyPmaxFunnelVariants' use of findSiblingMasterAd): it must carry brandId
+// and must NOT carry the renderer's videoDurationSec eligibility gate.
+module.exports.masterAdDiagnosticQuery = masterAdDiagnosticQuery;
 // Exported so scripts/verifyStageVisibility.js can assert the SERIALISED SHAPE
 // by calling it, rather than regexing the object literal. The gallery can only
 // show a stage it is actually sent, so "does the payload carry it" is the whole
