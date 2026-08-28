@@ -428,6 +428,91 @@ check('H3 [REVERT-PROOF] immediate path using recordFlatCost would fail F3', () 
   assert.ok(wouldFail, 'recordFlatCost mutation not detected by F3-style scan');
 });
 
+// ── I. PRICE TYPE DISCIPLINE (MONEY) ─────────────────────────────────────
+//
+// A price is decided by TYPE and literal form, never by coercion. Number()
+// turns several non-prices into real-looking figures, and every one of them
+// reaching an `n > 0` / `n >= 0` test invents a settled amount:
+//
+//   Number([])    === 0     Number([5])   === 5
+//   Number(true)  === 1     Number(false) === 0
+//   Number(' ')   === 0     Number('\n')  === 0
+//
+// Before this guard, confirmedCharge({status:'failed', price:[5]}) returned
+// charged:true / $5, and price:true returned charged:true / $1 — a settled
+// charge fabricated from a value that was never a price. classifyRow's
+// success arm had the same shape and would WRITE those figures.
+const { isPublishedPrice, confirmedCharge } = require(VID_PATH);
+
+check('I1 isPublishedPrice is exported and is a function', () => {
+  assert.strictEqual(typeof isPublishedPrice, 'function');
+});
+
+check('I2 [MONEY] isPublishedPrice accepts every real Atlas price shape', () => {
+  // Atlas sends price as a STRING (measured "0.9", "0.75"). A number-only
+  // rule would reject every real price and disable the reconcile entirely.
+  for (const good of [0, 0.9, 0.072272, '0', '0.9', '0.75', '-1', -1]) {
+    assert.strictEqual(isPublishedPrice(good), true,
+      `isPublishedPrice(${JSON.stringify(good)}) must be true — rejecting a real Atlas price shape `
+      + 'sends genuine settlements to the "unknown" path and the ledger never settles.');
+  }
+});
+
+check('I3 [MONEY] isPublishedPrice rejects every value Number() would fabricate a figure from', () => {
+  for (const bad of ['', ' ', '\n', '\t  ', 'abc', null, undefined, [], [5], [1, 2], {}, true, false, NaN, Infinity]) {
+    const lbl = typeof bad === 'string' ? JSON.stringify(bad)
+      : (bad && typeof bad === 'object') ? JSON.stringify(bad) : String(bad);
+    assert.strictEqual(isPublishedPrice(bad), false,
+      `isPublishedPrice(${lbl}) must be false — Number(${lbl}) is ${String(Number(bad))}, `
+      + 'so a coercion-based test would treat it as a settled price.');
+  }
+});
+
+check('I4 [MONEY] confirmedCharge never fabricates a charge from a non-price', () => {
+  // These previously returned a VERDICT. They must now be "unknown" (null),
+  // which every caller already handles (bootRecoveryService reads
+  // `r?.charged === true`; err.chargeConfirmed is documented true|false|null).
+  for (const bad of [[], [5], true, false, {}, 'abc']) {
+    const lbl = typeof bad === 'string' ? JSON.stringify(bad) : JSON.stringify(bad);
+    const got = confirmedCharge({ status: 'failed', price: bad });
+    assert.strictEqual(got.charged, null,
+      `confirmedCharge(price:${lbl}).charged === ${got.charged} (priceUsd ${got.priceUsd}) — expected null. `
+      + `Number(${lbl}) is ${String(Number(bad))}, so this is a charge verdict derived from a value that is not a price.`);
+  }
+});
+
+check('I5 confirmedCharge still treats a genuinely ABSENT price as unbilled', () => {
+  // The measured rule this path ships on: Atlas refunds failures, so a
+  // terminal record with no price means nothing was billed. Whitespace-only
+  // is absent too — otherwise Number(' ') === 0 reads as a published zero.
+  for (const absent of [undefined, null, '', ' ', '\n']) {
+    const got = confirmedCharge({ status: 'failed', price: absent });
+    assert.strictEqual(got.charged, false,
+      `confirmedCharge(price:${JSON.stringify(absent)}).charged must be false (absent === unbilled)`);
+    assert.strictEqual(got.priceUsd, 0);
+  }
+});
+
+check('I6 confirmedCharge is unchanged for every real price (no regression on the live path)', () => {
+  assert.deepStrictEqual(confirmedCharge({ status: 'failed', price: '0.45' }), { charged: true, priceUsd: 0.45 });
+  assert.deepStrictEqual(confirmedCharge({ status: 'failed', price: 0.45 }),  { charged: true, priceUsd: 0.45 });
+  assert.deepStrictEqual(confirmedCharge({ status: 'failed', price: 0 }),     { charged: false, priceUsd: 0 });
+  assert.deepStrictEqual(confirmedCharge({ status: 'failed', price: '0' }),   { charged: false, priceUsd: 0 });
+  assert.deepStrictEqual(confirmedCharge({ status: 'processing', price: 5 }), { charged: null, priceUsd: null });
+});
+
+check('I7 [REVERT-PROOF] backfillCostReconcile\'s success arm uses the predicate, not a coercion test', () => {
+  const src = fs.readFileSync(path.join(__dirname, 'backfillCostReconcile.js'), 'utf8');
+  const i = src.indexOf('if (TERMINAL_OK_STATUSES.has(status))');
+  assert.ok(i > 0, 'classifyRow\'s success arm is gone — re-derive this check');
+  const arm = src.slice(i, src.indexOf('\n  }', i));
+  assert.ok(/isPublishedPrice\(\s*raw\s*\)/.test(arm),
+    'the success arm no longer gates on isPublishedPrice. A bare Number()-based test writes '
+    + '$0 for price:[] and $5 for price:[5] onto rows for real billed generations.');
+  assert.ok(!/raw\s*!==\s*''/.test(arm),
+    'the old coercion test (raw !== \'\') is back in the success arm alongside or instead of the predicate');
+});
+
 // ── Summary ──────────────────────────────────────────────────────────────
 const total = pass + failures.length;
 console.log(`\n${failures.length ? '✗' : '✓'} verifyVideoCostReconcile: ${pass}/${total} passed`);
