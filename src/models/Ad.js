@@ -261,6 +261,48 @@ const adSchema = new mongoose.Schema({
   regenerateClaimedByWorker: { type: String, default: null, index: true },
   regenerateClaimedAt:       { type: Date,   default: null },
 
+  // Ad-gen microservice handoff for manual RE-TITLE (2026-08-28), mirroring
+  // the regenerate pair above field-for-field — a THIRD, independent claim
+  // namespace, not a reuse of any existing one (titlingNeeded/claimedByWorker
+  // exists only for the immediately-post-generation handoff and cannot match
+  // the common manual-retitle target: status:'live', delivered days or weeks
+  // earlier — see services/handoffContract.js's retitleRequest entry for the
+  // full argument).
+  //
+  // retitleRequest: non-null ONLY when backend decided to DEFER a manual
+  // retitle (routes/brand.js retitle-videos / title-still) to this service.
+  // Same $type:'object' claim discipline as regenerationRequest, same reason.
+  // See services/retitleConsumer.js (claim + execution — retitle has no
+  // separate execution service the way regenerate does, because it is a
+  // single call into brandScriptExecutor.renderBrandScriptAndSave, not a
+  // multi-stage image/video dispatch).
+  retitleRequest: { type: mongoose.Schema.Types.Mixed, default: null },
+  // Which retitle-consumer worker (if any) has claimed a deferred
+  // retitleRequest. Atomic claim: findOneAndUpdate({retitleRequest:
+  // {$type:'object'}, retitleClaimedByWorker:null},
+  // {$set:{retitleClaimedByWorker, retitleClaimedAt}}) — disjoint LEASE
+  // FIELD from claimedByWorker, regenerateClaimedByWorker, AND
+  // titlingNeeded, so none of the four can collide on the SAME lease. This
+  // is narrower than "the four operations can never run concurrently" —
+  // see the regenerate-vs-retitle residual on backend's
+  // services/handoffContract.js retitleRequest entry (the canonical write-up
+  // is docs/CONTRACT-backend-adgen.md §4a). CORRECTED 2026-08-28
+  // (adversarial Grok review caught the first draft overclaiming "confirmed
+  // FREE"): retitle makes no NEW Atlas VIDEO-GENERATION submit, but does
+  // make the same real, pre-existing vision-QC + face-detection Atlas LLM
+  // calls every titling render already makes. Not a new cost; the hazard
+  // this claim guards against is DOUBLE EXECUTION of one request, which is
+  // why — unlike the regenerate claim — a stale claim here is safe to let
+  // a reclaim sweep clear — see retitleConsumer.js reclaimStaleRetitleClaims,
+  // modeled on titler.js reclaimStaleTitlerClaims.
+  retitleClaimedByWorker: { type: String, default: null, index: true },
+  retitleClaimedAt:       { type: Date,   default: null },
+  // Result readout for the deferred path — see backend models/Ad.js for the
+  // full reasoning (renderUrl alone cannot signal success/failure here).
+  // Written by retitleConsumer.js in the SAME $set that clears
+  // retitleRequest and the claim pair.
+  retitleResult: { type: mongoose.Schema.Types.Mixed, default: null },
+
   // sha256 over identity inputs (campaignId, productId, mediaId,
   // template, aspectRatio, variantKind, paletteSource, ctaText,
   // ctaUrl, ctaUrlParams, rafflePrizeMediaId). Computed at queue time;

@@ -1,10 +1,13 @@
 # The backend ↔ adgen handoff contract
 
-**Contract version: 1.0.0** (`HANDOFF_CONTRACT_VERSION`, declared in
+**Contract version: 1.1.0** (`HANDOFF_CONTRACT_VERSION`, declared in
 `src/services/handoffContract.js`)
 
 Verified against **`liquidretail_backend` `origin/main` @ `6042073c`** and
 **`liquidretail_adgen` `origin/master` @ `c02c7ff`**, read on 2026-08-27.
+Protocol D (§4a, the manual-retitle deferral) added 2026-08-28 against
+branches `fix/retitle-adgen-handoff-be` / `fix/retitle-adgen-handoff-ag`,
+not yet merged to either trunk as of this version bump.
 
 > ⚠️ **Both trunks move fast — treat the SHAs above as this document's expiry
 > date, not decoration.** While it was being written, backend `origin/main`
@@ -646,6 +649,221 @@ then fires a **loud alert naming the ad** rather than releasing the claim
 `markComplete` clears `regenerating` and all three regenerate fields, on
 whichever side executed (`backend/services/adRegenerateService.js:1163`;
 adgen's vendored copy does the same).
+
+---
+
+## 4a. Protocol D — the manual retitle deferral
+
+Landed 2026-08-28, backend `services/handoffContract.js` v1.1.0. Backend's
+`POST /:id/retitle-videos` (`routes/brand.js`) funnels into
+`runRetitleJobViaAdgen()`; adgen's `src/services/retitleConsumer.js` is the
+other half.
+
+**Origin.** An owner ask to confirm whether backend's manual retitle route
+— which runs Remotion in-process on the web server, the exact CPU-isolation
+problem adgen's titler role exists to solve for the automatic
+post-generation path — would genuinely become more scalable by routing
+through adgen. Investigation found the claim held for `retitle-videos` but
+NOT for the OTHER two manual-titling routes: `title-still` is a synchronous
+~1-3s interactive preview loop ("Powers /title-playground") that an async
+claim-based worker would make unpredictably slower, and `title-spec/modify`
+is an LLM spec-editing call with no Remotion render in it at all. Neither is
+part of this protocol; both stay local-only.
+
+### Why this is a FOURTH claim namespace, not a reuse of the titler's
+
+adgen's existing titler claim (`titlingNeeded` / `claimedByWorker`, Protocol
+A) exists exclusively for "a master just landed and has never been titled"
+— its filter requires `status:{$in:['rendering','draft']}`. A manual
+retitle's real-world target is commonly `status:'live'`, delivered days or
+weeks earlier, which that claim can never match. Reusing `titlingNeeded`
+would also risk colliding with `titlingResumeService`'s automatic sweep and
+with `adRegenerateService`'s `matchesTitlingResumeArm` in-flight guard
+(Protocol B), both of which read that field for unrelated purposes.
+
+### Fields
+
+| Field | Type / default | Writer | Notes |
+|---|---|---|---|
+| `retitleRequest` | `Mixed`, `null` | backend only | THE deferral bit. `backend/models/Ad.js:321`, `adgen/src/models/Ad.js:279`. |
+| `retitleClaimedByWorker` | `String`, `null`, indexed | adgen | `adgen/src/models/Ad.js:~283` |
+| `retitleClaimedAt` | `Date`, `null` | adgen | Companion timestamp. |
+| `retitleResult` | `Mixed`, `null` | both | Result readout — see "why renderUrl cannot signal success" below. |
+
+### Backend's stamp write (`routes/brand.js:677` `runRetitleJobViaAdgen`)
+
+One `Ad.updateOne` per ad, filter:
+
+```js
+{
+  _id: adDoc._id,
+  titlingNeeded: { $ne: true },
+  regenerating:  { $ne: true },
+  retitleRequest: null,
+}
+```
+
+`titlingNeeded:{$ne:true}` is the safety boundary that makes the fourth
+claim namespace safe WITHOUT adgen's claim query itself needing to exclude
+it — a row mid-first-titling can never be stamped, full stop.
+`regenerating:{$ne:true}` was **added after adversarial review** (two
+independent Grok xhigh passes, one per repo, both found the same gap): a
+retitle stamped on an ad a regenerate is currently rewriting wastes a
+Remotion slot, a Cloudinary upload, and a real vision-QC/face-detection
+Atlas LLM call on a result the regenerate is about to supersede — and
+risks a last-writer-wins clobber. `retitleRequest:null` stops a stray
+double-POST from overwriting a payload a live consumer is currently
+reading. On a refusal (`stamp.modifiedCount===0`) the ad is reported
+per-ad in the job's `errors`/`results`, never silently dropped from the
+batch.
+
+⚠️ **This is directional, not mutual.** `regenerating:{$ne:true}` stops a
+retitle from being stamped while a regenerate is in flight. It does
+**not** stop the reverse: `adRegenerateService`'s existing in-flight lock
+does not check `retitleRequest`/`retitleClaimedByWorker`, so a regenerate
+CAN start while a retitle is already claimed and rendering. See the known
+residual near the end of this section.
+
+**Backend's local (non-deferred) runner also defends against this SAME
+class of collision, one level down** — `runRetitleJob`'s worker loop now
+opens with an atomic `Ad.updateOne({_id, retitleClaimedByWorker: null},
+{$set: {retitleRequest: null, retitleClaimedByWorker: null,
+retitleClaimedAt: null, retitleResult: null}})` before every local render.
+A `modifiedCount:0` means adgen currently holds an ACTIVE claim on this
+ad, and the local path refuses to also render it rather than risking a
+concurrent dual-render (found by adversarial review — the first draft of
+this handoff cleared no stale state on the local path at all, so a
+flag-off flip mid-flight could let the in-process path race a still-
+rendering deferred claim). A `modifiedCount:1` clears any merely STALE,
+unclaimed leftover so a later deferred attempt on this ad can't collide
+with the local render about to run.
+
+### Adgen's claim query (`src/services/retitleConsumer.js:94` `claimOne`)
+
+```js
+Ad.findOneAndUpdate(
+  { retitleRequest: { $type: 'object' }, retitleClaimedByWorker: null },
+  { $set: { retitleClaimedByWorker: WORKER_ID, retitleClaimedAt: new Date() } },
+  { new: true, sort: { updatedAt: 1 } }
+);
+```
+
+Same `$type:'object'`, not `$ne:null`, discipline as Protocol B, same
+reason. Gated on `isAdgenRendererEnabled()`, read at call time.
+
+### ⚠️ retitleMode:true is not optional — the severest defect found in this whole investigation
+
+`brandScriptExecutor.uploadRenderAndStamp` forces `status:'draft'` on
+**every** call by default — correct for the first titling pass right after
+generation, and a **live production bug, independent of this protocol or
+of `ADGEN_RENDERER_ENABLED`**, for a manual retitle of an already-delivered
+ad: it would silently un-publish a `status:'live'` ad on every single
+retitle, success or a QC fail, because the function was written for a
+lifecycle a manual retitle is not in. Found while building this protocol,
+fixed in **both** repos' `brandScriptExecutor.js` (same bug, same fix,
+independently applied to each vendored copy — `services/handoffContract.js`
+is not the only place these two files must agree):
+
+- `uploadRenderAndStamp({..., preserveAdStatus = false})` — skips forcing
+  `status:'draft'`, and skips the QC-failure `status:'failed'` override,
+  when `true`.
+- `renderWithRemotionAndSave({..., retitleMode = false})` threads
+  `preserveAdStatus: retitleMode` into that call, AND routes a Remotion
+  child failure to a plain `throw` instead of
+  `stampTitlingFailureAndThrow` at all three of its call sites — that
+  function's whole job (bound FIRST-titling retries via the shared
+  `Ad.titlingAttempts` cap, hand an unfinished master to
+  `titlingResumeState:'pending'`) describes a lifecycle a retitle of an
+  already-titled ad is not in. Reusing it would burn the automatic path's
+  retry budget for an unrelated reason and could still force
+  `status:'draft'`/`'failed'` on a `'live'` ad on a capExceeded write.
+- `renderBrandScriptAndSave({..., retitleMode = false})` threads it through.
+- `retitleConsumer.processClaimed()` is the only caller that ever passes
+  `retitleMode:true`. Every existing caller (first-pass titling, the
+  render-script debug route, backend's OWN local retitle-videos fallback)
+  omits it and is unaffected — this is opt-in, not a behavior change to the
+  automatic path.
+
+Backend's LOCAL retitle-videos runner (`runRetitleJob`, the dormant
+fallback when the handoff flag is off) also now passes `retitleMode:true`
+— **this half of the fix applies whether or not `ADGEN_RENDERER_ENABLED` is
+ever flipped on**, because it closes a defect in the CURRENT, already-live
+in-process path.
+
+Pinned, and revert-proven against the exact mutations above, by
+`backend/scripts/verifyRetitleAdgenHandoff.js` and
+`adgen/scripts/verifyRetitleConsumerClaim.js`.
+
+### Why `renderUrl` alone cannot report success
+
+A retitle overwrites the SAME Cloudinary `public_id` in place
+(`overwrite:true`), so the delivered URL string is frequently unchanged on
+a *successful* retitle too. `retitleResult` (`{status, renderUrl, error,
+completedAt}`) is the readout backend's poll loop reads once
+`retitleRequest` clears; backend nulls it in the SAME `$set` that stamps a
+new request, so a stale prior outcome can never be misread as the new
+request's result.
+
+### Claim-safety, mostly not money-safety — CORRECTED after adversarial review
+
+The first draft of this section claimed retitle is "confirmed FREE".
+That overclaimed. `brandScriptExecutor.js` never requires
+`atlasVideoService` in either repo (grep-verified) — manual retitle makes
+NO NEW Atlas VIDEO-GENERATION submit, and recomposites chrome onto an
+already-paid master. But `uploadRenderAndStamp`'s success path
+unconditionally calls `runVideoVisionQcForAd` (→ `adVisionQcService` →
+`atlasLlmService.chatCompletion`, a real billed LLM call) and the earlier
+face-safe-crop step calls `basePlateCropService` (same
+`atlasLlmService.chatCompletion` dependency) — **both fire on every
+titling render, retitle included, and always have; this protocol neither
+adds nor removes that cost.**
+
+So the accurate statement: the hazard a dual claim guards against here is
+DOUBLE EXECUTION of one operator-requested retitle — wasted Remotion
+compute, a duplicate Cloudinary upload, AND a duplicate (small, but real)
+vision-QC/face-detection LLM call for the SAME request — not a double
+charge for two different things. That is still meaningfully lower-stakes
+than regenerate's double-Omni-submit hazard, which is why, **unlike** the
+regenerate consumer (Protocol B, which deliberately has no reclaim
+sweep), this consumer runs `reclaimStaleRetitleClaims()`
+(`retitleConsumer.js:197`) on a 20-minute default TTL, mirroring the
+titler's own `reclaimStaleTitlerClaims` — a stuck claim is safe to release
+automatically because a re-run costs only time, a render slot, and a
+repeat of an already-inherent small LLM cost, not a second video charge.
+
+### Known, narrow, accepted residual — NOT fixed here
+
+The "no chrome configured for this format" skip branch inside
+`renderBrandScriptAndSave` calls the SHARED `qcAndStampVideoAd` helper
+(five call sites across both repos: two backend mint paths, the regenerate
+titling-throw fallback, the titling-resume give-up branch, and this one),
+whose QC-failure `status:'failed'` flip is an explicit 2026-08-20 owner
+decision and was NOT threaded with `preserveAdStatus` — doing so would
+touch four unrelated call sites for a narrow edge case (retitling a brand
+with no titling chrome configured at all, which has no titling to redo in
+the first place). A manual retitle hitting exactly this edge case could
+still flip a `'live'` ad to `'failed'` on a QC fail. Flagged, not silently
+worked around.
+
+**Second residual, found by adversarial review (2026-08-28): a regenerate
+CAN start while a retitle is already claimed and rendering (the reverse
+of the `regenerating:{$ne:true}` stamp guard above).**
+`adRegenerateService`'s existing in-flight lock checks `status`,
+`titlingResumeState`, and `regenerating` — it does not check
+`retitleRequest` / `retitleClaimedByWorker`, because that pair did not
+exist when the lock was written and reasonably-scoped adversarial review
+of THIS change did not extend into modifying regenerate's own already-
+adversarially-reviewed, money-critical lock. Worst case: a last-writer-
+wins clobber between the retitle's stale-master titled output and the
+regenerate's fresh (paid) master's own titling — not a double bill,
+because regenerate still submits exactly one Omni generation regardless
+of a concurrent retitle. Lower frequency than the forward direction (it
+needs an operator or automation to fire regenerate WHILE a retitle this
+same ad is mid-render), and recoverable (another retitle re-fixes the
+regenerated master's chrome). Flagged rather than silently left
+undocumented; closing it would mean adding a fifth field read to
+regenerate's `notInFlight`/`inFlightRefusal` pair, which is out of scope
+for this protocol.
 
 ---
 

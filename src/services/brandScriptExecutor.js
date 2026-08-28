@@ -2006,7 +2006,19 @@ function buildVideoQcFailureFields(videoVisionQc) {
 // Shared tail of both engines: upload the rendered mp4, stamp
 // Ad.renderUrl, clean up. Retains tempDir on failure when
 // BRAND_SCRIPT_RETAIN_TMP is set for post-mortem.
-async function uploadRenderAndStamp({ ad, finalPath, tempDir, timings, titlingSnapshot = null, brandName = null }) {
+// preserveAdStatus (2026-08-28) — manual RE-TITLE support. Every existing
+// caller (the renderer's first-pass titling, the titler role's out-of-
+// process titling) omits this and gets the ORIGINAL, unconditional
+// `status:'draft'` behavior below — nothing about the automatic path
+// changes. It exists ONLY for retitleConsumer.js's on-demand retitle of an
+// ALREADY-DELIVERED ad (commonly status:'live'), where this function's
+// hard-coded promotion to 'draft' would silently un-publish it on every
+// single retitle — success OR a QC fail — purely because this function was
+// written for the "first titling pass after generation" lifecycle and never
+// anticipated being called again on a row that had already left it. See
+// services/handoffContract.js's retitleRequest entry and
+// docs/CONTRACT-backend-adgen.md Protocol D for the full argument.
+async function uploadRenderAndStamp({ ad, finalPath, tempDir, timings, titlingSnapshot = null, brandName = null, preserveAdStatus = false }) {
   const fs = require('fs');
   const { uploadFileToCloudinary } = require('./cloudinaryService');
   const Ad = require('../models/Ad');
@@ -2027,13 +2039,18 @@ async function uploadRenderAndStamp({ ad, finalPath, tempDir, timings, titlingSn
     });
     const set = {
       renderUrl:  uploaded.secure_url,
-      // Titling is the last required step — promote to draft here so a
-      // mid-titling crash leaves status:'rendering' (or the caller's
-      // failure path), not a false draft success with an untitled master.
-      status:     'draft',
       renderedAt: new Date(),
       updatedAt:  new Date()
     };
+    if (!preserveAdStatus) {
+      // Titling is the last required step — promote to draft here so a
+      // mid-titling crash leaves status:'rendering' (or the caller's
+      // failure path), not a false draft success with an untitled master.
+      // SKIPPED under preserveAdStatus (manual retitle of an already-
+      // delivered ad) — see this function's header. The ad's existing
+      // status (commonly 'live') is exactly what a retitle must not touch.
+      set.status = 'draft';
+    }
     // Rebuild the poster from the TITLED upload. posterUrl was stamped pre-chrome from the raw
     // base video (routes/ads.js), so without this a video ad's poster stays an UNCROPPED,
     // UNTITLED 9:16 still — the wrong aspect and missing the titles — and that poster is the
@@ -2077,7 +2094,13 @@ async function uploadRenderAndStamp({ ad, finalPath, tempDir, timings, titlingSn
       // 'draft' this function handed it. Pinned by a structural harness check
       // (grep for buildVideoQcFailureFields position) precisely because this
       // margin is invisible to any check that only reads the terminal write.
-      Object.assign(set, buildVideoQcFailureFields(videoVisionQc));
+      const qcFailureFields = buildVideoQcFailureFields(videoVisionQc);
+      // preserveAdStatus: a retitle QC fail must not take an already-
+      // delivered ad down — report the failure (visionQc + renderError
+      // above already record it) without touching status. See this
+      // function's header.
+      if (preserveAdStatus) delete qcFailureFields.status;
+      Object.assign(set, qcFailureFields);
     }
     await Ad.updateOne(
       { _id: ad._id },
@@ -2294,7 +2317,23 @@ async function stampTitlingFailureAndThrow(ad, err) {
 // Remotion path: spec + tokens resolved server-side, composition rendered
 // by services/remotionRenderService. Never "no chrome" — the canonical
 // preset always exists.
-async function renderWithRemotionAndSave({ ad, brand, format, presetOverride = null }) {
+// retitleMode (2026-08-28) — see uploadRenderAndStamp's preserveAdStatus
+// header for the full argument. Every existing caller omits this and gets
+// UNCHANGED behavior. When true (retitleConsumer.js only): a Remotion
+// child failure propagates as a plain throw instead of routing through
+// stampTitlingFailureAndThrow, because that function's entire job —
+// bounding FIRST-titling retries via Ad.titlingAttempts and handing an
+// unfinished master to titlingResumeState:'pending' for the automatic
+// resume sweep to pick up — describes a lifecycle a manual retitle of an
+// already-titled, already-delivered ad is not in. Reusing it here would
+// (a) burn the SAME attempt cap the automatic first-pass titling relies
+// on, for a wholly unrelated operator-initiated retry, and (b) on a
+// capExceeded write, force status:'draft'/'failed' onto an ad that may be
+// 'live' — exactly the un-publish hazard this whole change exists to
+// avoid. A plain throw is not a regression here: it is what this exact
+// call site did before stampTitlingFailureAndThrow existed (see the
+// preserved comment on the no-retry branch below).
+async function renderWithRemotionAndSave({ ad, brand, format, presetOverride = null, retitleMode = false }) {
   if (!ad?.veoVideoUrl) {
     const e = new Error('ad has no veoVideoUrl — Grok has not rendered yet');
     e.status = 400;
@@ -2455,6 +2494,7 @@ async function renderWithRemotionAndSave({ ad, brand, format, presetOverride = n
     // cause, only spend a second slot on the same failure class. Both go
     // straight to the shared stamp/cap decision instead of retrying.
     if (isRemotionChildOomError(err) || isRemotionChildTimeoutError(err)) {
+      if (retitleMode) throw err;
       await stampTitlingFailureAndThrow(ad, err);
     }
     // A cropped-plate failure must NEVER cost the titles: renderBrandScriptAndSave's callers
@@ -2488,7 +2528,9 @@ async function renderWithRemotionAndSave({ ad, brand, format, presetOverride = n
       } catch (err2) {
         // Any failure on the RAW plate — the fallback of last resort — is a
         // real titling failure of THIS attempt, whatever kind. Same shared
-        // decision as above (OOM/timeout/generic all route through it).
+        // decision as above (OOM/timeout/generic all route through it),
+        // EXCEPT under retitleMode — see this function's header.
+        if (retitleMode) throw err2;
         await stampTitlingFailureAndThrow(ad, err2);
       }
     } else {
@@ -2497,13 +2539,17 @@ async function renderWithRemotionAndSave({ ad, brand, format, presetOverride = n
       // previously fell through to a bare `throw err`, which NEVER stamped
       // titlingResumeState:'pending' — the ad was stranded even though the
       // paid master sat right there on renderUrl. Route it through the same
-      // shared decision instead.
+      // shared decision instead, EXCEPT under retitleMode — see this
+      // function's header (that bare-throw behavior is exactly what
+      // retitleMode restores, deliberately, for a different reason).
+      if (retitleMode) throw err;
       await stampTitlingFailureAndThrow(ad, err);
     }
   }
   return uploadRenderAndStamp({
     ad, finalPath: result.finalPath, tempDir: result.tempDir, timings: result.timings,
     brandName: brand?.name || null,
+    preserveAdStatus: retitleMode,
     titlingSnapshot: {
       engine: 'remotion',
       format,
@@ -2523,10 +2569,14 @@ async function renderWithRemotionAndSave({ ad, brand, format, presetOverride = n
 // timings. Caller decides how to handle errors — this helper doesn't
 // swallow them, so both fatal (pipeline) and non-fatal (script preview)
 // call sites can choose behavior.
-async function renderBrandScriptAndSave({ ad, brand, presetOverride = null }) {
+// retitleMode (2026-08-28): pass true for a MANUAL retitle of an
+// already-delivered ad (retitleConsumer.js) so the terminal write preserves
+// the ad's current status instead of forcing 'draft' — see
+// uploadRenderAndStamp's preserveAdStatus header.
+async function renderBrandScriptAndSave({ ad, brand, presetOverride = null, retitleMode = false }) {
   const engineChoice = resolveTitlingEngine(brand, ad);
   if (engineChoice.engine === 'remotion') {
-    return renderWithRemotionAndSave({ ad, brand, format: engineChoice.format, presetOverride });
+    return renderWithRemotionAndSave({ ad, brand, format: engineChoice.format, presetOverride, retitleMode });
   }
   if (engineChoice.source === 'custom-script') {
     console.log(`🎨 brandScript[ad=${ad._id}]: custom ${engineChoice.format} script → canvas engine`);
@@ -2575,6 +2625,7 @@ async function renderBrandScriptAndSave({ ad, brand, presetOverride = null }) {
   // Upload + persist renderUrl + the titling snapshot (shared tail).
   return uploadRenderAndStamp({
     ad, finalPath: result.finalPath, tempDir: result.tempDir, timings: result.timings,
+    preserveAdStatus: retitleMode,
     titlingSnapshot: {
       engine: 'canvas',
       format: renderer.format,

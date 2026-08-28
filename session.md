@@ -14,7 +14,27 @@ it clears it back to this placeholder.)_
 
 ## CURRENT STATE
 
-*(Replaced 2026-08-25 ~12:30 UTC. Trunk `master` @ the commit after #66. Narrative:
+**2026-08-28: `src/services/retitleConsumer.js` (PR pending,
+`fix/retitle-adgen-handoff-ag` + companion backend
+`fix/retitle-adgen-handoff-be`).** A fourth claim namespace
+(`retitleRequest`/`retitleClaimedByWorker`) so backend's manual
+`/retitle-videos` can defer to this service — mirrors the regenerate
+handoff, but with a stale-claim reclaim sweep (no NEW Atlas video-gen
+submit, unlike regenerate — it still makes the pre-existing vision-QC/
+face-detection LLM calls every titling render makes). **Found and fixed a
+live production bug along the way:** `brandScriptExecutor
+.uploadRenderAndStamp` forces `status:'draft'` unconditionally in both
+repos, so a manual retitle of an already-delivered ad has been silently
+un-publishing it. Fixed via opt-in `preserveAdStatus`/`retitleMode`,
+revert-proven (`scripts/verifyRetitleConsumerClaim.js`, 18/18). Two
+adversarial Grok review passes (one per repo) independently found a real
+gap — the BACKEND stamp filter also needed `regenerating:{$ne:true}` —
+fixed there (`liquidretail_backend/scripts/verifyRetitleAdgenHandoff.js`
+grew 13→16). `handoffContract.js` v1.0.0→v1.1.0. Full narrative:
+`session.d/2026-08-28_retitle-adgen-handoff.md`. **Land together with the
+backend PR.**
+
+*(Prior state replaced 2026-08-25 ~12:30 UTC. Trunk `master` @ the commit after #66. Narrative:
 `session.d/2026-08-25_overnight-video-chain-and-review-coverage.md` then
 `session.d/2026-08-25_e2e-rounds-and-qc-findings.md`.)*
 

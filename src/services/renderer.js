@@ -664,6 +664,7 @@ let titlingResumeSweep = null;   // set by run(), stopped by shutdown()
 let bootRecoverySweep  = null;   // set by run(), stopped by shutdown()
 let costReconcileSweep = null;   // set by run(), stopped by shutdown()
 let regenerateConsumer = null;   // set by run(), stopped by shutdown()
+let retitleConsumer    = null;   // set by run(), stopped by shutdown()
 
 async function claimOne() {
   // GATED ON ADGEN_RENDERER_ENABLED, read HERE — not only by poll()'s
@@ -2643,6 +2644,11 @@ async function run() {
   // above; not folded into poll()/claimOne() above because its claim
   // filter is deliberately disjoint from the mint-time render claim.
   regenerateConsumer = require('./regenerateConsumer').start();
+  // Ad-gen manual RE-TITLE consumer (2026-08-28) — see
+  // services/retitleConsumer.js header for the full argument (a THIRD
+  // independent claim namespace, not billable, safe to reclaim on a stale
+  // claim unlike the regenerate consumer above).
+  retitleConsumer = require('./retitleConsumer').start();
 }
 
 // Graceful shutdown. Render fires SIGTERM ~30s before SIGKILL on deploy /
@@ -2679,6 +2685,11 @@ async function shutdown() {
   // shutdown() as a whole does not proceed to release claims / disconnect
   // Mongo until BOTH drains have had their full window.
   const regenerateStopPromise = regenerateConsumer ? regenerateConsumer.stop() : Promise.resolve();
+  // retitleConsumer.stop() — same concurrent-drain reasoning as
+  // regenerateConsumer's above. Not billable, so its own drain is a
+  // shorter, best-effort wait (see that file's header) — still started
+  // here, not sequenced after, for the same 2x-shutdown-time reason.
+  const retitleStopPromise = retitleConsumer ? retitleConsumer.stop() : Promise.resolve();
   const t0 = Date.now();
   console.log(`renderer[${WORKER_ID}] shutting down — inflight=${inFlight}, drain up to ${SHUTDOWN_DRAIN_MS}ms`);
   const deadline = t0 + SHUTDOWN_DRAIN_MS;
@@ -2686,6 +2697,7 @@ async function shutdown() {
     await new Promise(r => setTimeout(r, 500));
   }
   await regenerateStopPromise;
+  await retitleStopPromise;
   const drainedMs = Date.now() - t0;
   if (inFlight > 0) {
     console.warn(`renderer[${WORKER_ID}] drain window elapsed (${drainedMs}ms), ${inFlight} still in flight — releasing claims for peer pickup`);

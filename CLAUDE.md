@@ -130,6 +130,50 @@ with the code that uses them. If you edit one copy, edit the other.
 Pinned by `scripts/verifyTitlerHandoff.js` (44 checks, revert-proven on
 10 targeted mutations covering both sides + config + render.yaml).
 
+### The retitle handoff — a FOURTH claim namespace (2026-08-28)
+
+`src/services/retitleConsumer.js` lets backend's manual
+`POST /:id/retitle-videos` defer to this service, gated on
+`isAdgenRendererEnabled()` like everything else in this file. It is
+deliberately NOT a reuse of the titler claim above: that claim requires
+`status:{$in:['rendering','draft']}` — built exclusively for "a master just
+landed and has never been titled" — while a manual retitle's real target is
+commonly `status:'live'`, delivered days or weeks earlier. Backend stamps
+`Ad.retitleRequest` (filter requires `titlingNeeded:{$ne:true}`, so it can
+never race the renderer→titler handoff above); this service claims via a
+DISJOINT field pair (`retitleClaimedByWorker`/`retitleClaimedAt`) and
+executes via `brandScriptExecutor.renderBrandScriptAndSave({...,
+retitleMode: true})`.
+
+**`retitleMode:true` is not optional.** `uploadRenderAndStamp` forces
+`status:'draft'` unconditionally by default — correct for the first
+titling pass, and a real bug for a retitle of an already-delivered ad
+(would silently un-publish it). `retitleMode` skips that AND routes a
+Remotion child failure at all three call sites to a plain throw instead of
+`stampTitlingFailureAndThrow`, whose entire job (bound FIRST-titling
+retries via the shared `Ad.titlingAttempts` cap) is a lifecycle a retitle
+isn't in. Found and fixed in BOTH repos' `brandScriptExecutor.js` — see
+`docs/CONTRACT-backend-adgen.md` §4a for the full mechanism, and
+`session.d/2026-08-28_retitle-adgen-handoff.md` for the investigation.
+
+Unlike the regenerate consumer, this one runs a stale-claim reclaim sweep
+(`reclaimStaleRetitleClaims`, mirroring `reclaimStaleTitlerClaims` above) —
+retitle makes no NEW Atlas video-generation submit, so an auto-release on
+a stuck claim costs only time and a re-run of the same (already
+pre-existing, unavoidable) vision-QC/face-detection LLM calls every
+titling render makes — not a double VIDEO charge, which is what the
+regenerate consumer's own no-reclaim design guards against.
+
+⚠️ **Two adversarial Grok review passes (2026-08-28) independently found
+the stamp filter needed `regenerating:{$ne:true}` too** (fixed in backend)
+— without it a retitle could be stamped on an ad a regenerate is actively
+rewriting. The REVERSE direction (a regenerate starting while a retitle is
+already claimed) is a known, narrower residual, not fixed — see
+`docs/CONTRACT-backend-adgen.md` §4a.
+
+Pinned by `scripts/verifyRetitleConsumerClaim.js` (18 checks, revert-proven
+on the claim-safety and status-preservation guards).
+
 ---
 
 ## Render lifecycle (`src/services/renderer.js`)
