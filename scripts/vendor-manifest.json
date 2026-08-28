@@ -1,8 +1,8 @@
 {
   "version": 2,
   "backendRef": "origin/main",
-  "backendHead": "c77a4774c3d0837b7d44e9872a9d81abd77218f6",
-  "generatedAt": "2026-08-27T17:03:09.613Z",
+  "backendHead": "8bd9eebd549fe5384bef79648688462eace907ed",
+  "generatedAt": "2026-08-28T01:37:30.297Z",
   "files": {
     "models/Ad.js": {
       "backendHash": "4caa2896cc4a2dcd56f5ccb4ba73c37d9675c9c4f59993f235befbc1b0d6672e",
@@ -479,11 +479,11 @@
       "reason": "unused in adgen — the readiness gate runs on backend routes (campaigns create / ads generate), nothing under adgen/src requires it. Re-attested after backend #340, which REMOVED the catalog-detect-not-started blocker: catalog detect is deferred (CATALOG_DETECT_PRECOMPUTE=false) and the only creator of a catalog DetectRun runs inside the request the gate was refusing, so it deadlocked every brand onboarded after deferral. If this copy is ever wired up in adgen, port that fix first — this vendored copy predates it."
     },
     "services/adRegenerateService.js": {
-      "backendHash": "8a0512ba08a3f5543e9d9bed0430a9112de7796c361baad559c6b08414893a3e",
+      "backendHash": "dfec3b32a2723140759bafe7ab3ec3bb7c2637426d61cc8be9c2eb977afdf105",
       "adgenHash": "1963f7eb5f7bf29ccc161ab150dd6497ef74d5bb24e45b489286b55c9b11e748",
-      "backendSha": "a1df77e95159ea70653d26cfe59e3dece6e52d7f",
+      "backendSha": "a4cf61c733611811c3d5a81346a2bd63fff94ac5",
       "status": "unported",
-      "reason": "Carries the #74 (945f8cb) static resume-from-receipt threading (allowResume through to renderDirectImage), absent from backend. Note the INVERSE debt also exists in this file and is documented in docs/CONTRACT-backend-adgen.md section 4: adgen's runVideoFull passes allowResume:false explicitly (:879) while backend's passes nothing and defaults true, so a flag-off backend regenerate RESUMES a paid prediction where adgen submits fresh. Both directions need a human decision; portTo=backend covers the #74 half.",
+      "reason": "OWES PORTS IN BOTH DIRECTIONS -- a single portTo cannot express that, so read this whole reason. (a) BACKEND OWES adgen: #74's static resume-from-receipt threading (allowResume through to renderDirectImage); shouldResumeImageAttempt/submitAndPollWithResume are absent from backend. A recovered attempt at this port exists but is INCOMPLETE and must not be finished on a guess: it threads the flag through the atlas layer but the mint-path caller never passes it (so the path is dead code) and nothing consumes err.unsettledAtResume (so adding only the opt-in would terminal-fail an already-paid prediction and sever it from bootRecovery). See docs/CONTRACT-backend-adgen.md, 'What a COMPLETE port looks like in each direction'. (b) ADGEN OWES backend: #349's in-flight regenerate gate -- backend has inFlightRefusal (5x) and notInFlight (4x) in this file; adgen has 0 of each. NOTE the port target is NOT a mirror: backend puts notInFlight on regenerateAd's updateOne, but adgen's regenerateAd is UNREACHABLE in adgen production (capabilityRegistry has zero importers per scripts/lib/requireGraph.js; the live path is renderer -> regenerateConsumer -> runClaimedRegeneration). Porting it there would harden dead code. CORRECTED 2026-08-27: an earlier version of this entry claimed a THIRD divergence -- that backend's runVideoFull omits allowResume and 'defaults true', so a flag-off backend regenerate resumes a paid prediction where adgen submits fresh. That is FALSE. backend/services/atlasVideoService.js contains ZERO occurrences of allowResume; generateForAd has no such parameter and cannot resume, keeping resume in a separate resumeForAd() that must never submit. Both repos submit fresh here. The real asymmetry runs the OTHER way: adgen's generateForAd defaults allowResume TRUE, so adgen's explicit allowResume:false at the regenerate call site is load-bearing and must never be dropped.",
       "portTo": "backend",
       "owedSince": "2026-08-27T10:28:51.314Z"
     },

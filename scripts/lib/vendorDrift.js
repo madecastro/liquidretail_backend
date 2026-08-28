@@ -33,6 +33,23 @@ const { buildProjectRequireGraph, looksLikeModuleExport } = require('./requireGr
 //     status=fork with a reason reading "a human must apply the same edit in
 //     liquidretail_backend" — true, unactioned, and permanently green.
 //
+// ── KNOWN LIMIT OF v2: `portTo` IS SINGLE-VALUED, DEBTS ARE NOT ────────
+// Hit for real on services/adRegenerateService.js, which currently owes
+// ports in BOTH directions at once: backend owes adgen #74's static
+// resume-from-receipt guard, and adgen owes backend #349's in-flight
+// regenerate gate. One `portTo` cannot say that, so today the field records
+// the more concrete obligation and the rest lives in `reason` prose — which
+// is precisely the weakness `unported` was introduced to fix, reappearing
+// one level down. It is recorded here rather than quietly tolerated.
+//
+// Do NOT "fix" this by widening portTo to an array without also deciding
+// what the grace clock means when the two directions were incurred on
+// different dates: a single owedSince cannot age two debts, and a shared
+// clock would let the older obligation hide behind the newer one. The
+// honest shape is probably a list of {portTo, owedSince, reason} objects
+// with the check failing on the OLDEST overdue member. That is a v3 change,
+// not a field tweak.
+//
 const MANIFEST_VERSION = 2;
 const STATUSES = new Set(['synced', 'fork', 'unported', 'unused']);
 const PORT_TARGETS = new Set(['backend', 'adgen']);

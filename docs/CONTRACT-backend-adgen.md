@@ -433,6 +433,124 @@ and refused **neither** `status:'rendering'` **nor** `titlingNeeded`.
 > future change to regenerate preflight or to that lock filter can reopen this,
 > and nothing about the lease fields will warn you.
 
+#### ⚠️ …and it is closed on ONE side only — the two halves now disagree
+
+`#349` landed in **backend**. Adgen's vendored copy of the same service **did
+not get it**, and the difference is verified, not inferred:
+
+| | `inFlightRefusal` | `notInFlight` | Preflight refuses an in-flight render? |
+|---|---|---|---|
+| `backend/services/adRegenerateService.js` @ `origin/main` | 5 occurrences | 4 | **yes** |
+| `adgen/src/services/adRegenerateService.js` @ `origin/master` | **0** | **0** | **no** — still only the original four (derive-only, meta-synced, already-regenerating, daily cap) |
+
+Adgen's copy says so **in its own source**, verbatim, at
+`adgen/src/services/adRegenerateService.js:979-980`:
+
+> *"…it must never resume the ad's existing `imageGeneration.predictionId`,
+> which may still belong to a DIFFERENT, currently in-flight mint-time render of
+> the same Ad (`preflight()` does not gate on `ad.status`)."*
+
+**Adgen's protection is therefore not a gate at all — it is an obligation on the
+caller.** The defence lives at the call site (`:986-987`), which forces
+`existingPredictionId: null` and `allowResume: false` on the image path,
+mirroring what `runVideoFull` already did for video.
+
+This is the framing that matters, and getting it wrong is expensive in both
+directions:
+
+- A future reader of adgen's ungated `preflight()` concludes the path is
+  **unprotected**. Wrong — it is protected, just not there.
+- A future *caller* omits `existingPredictionId: null` and silently breaks the
+  protection. Worse — nothing fails, and a regenerate can resume a prediction
+  belonging to a concurrent mint-time render of the same Ad.
+
+**A documented gap plus a call-site defence is not a fixed gap.** It holds only
+while every caller cooperates, and it cannot be verified by reading the
+preflight. Which path is live matters here: backend's preflight runs
+synchronously before the 202 on the HTTP route and adgen's consumer deliberately
+does not re-run it, so the HTTP path *is* covered by `#349`. Adgen's ungated
+copy governs anything that reaches `regenerateAd` inside adgen — and the
+call-site invariant is the only thing holding it.
+
+`scripts/vendor-manifest.json` records this path as owing ports in **both**
+directions; see the note there on why a single `portTo` cannot express that.
+
+#### What a COMPLETE port looks like in each direction
+
+Recorded here because both directions have been **attempted and abandoned
+half-finished**, and in both cases the partial state is more dangerous than the
+untouched state. Anyone picking either up should treat "the hard part is already
+done" as false until they have checked the specific items below.
+
+**(a) backend owes adgen — the #74 static resume.** Threading `allowResume` down
+through `atlasImageService` / `directImageRenderService` is the *easy* two-thirds.
+A complete port also needs, and an attempt that stopped after the threading did
+not have:
+
+1. **The mint-path opt-in.** `renderService.renderCreative` must actually pass
+   `existingPredictionId: ad.imageGeneration?.predictionId || null` and
+   `allowResume: true` into `renderDirectImage` (adgen does this in
+   `renderStatic`). Selecting `imageGeneration` in the `Ad.findById(...).select(...)`
+   without reading it leaves `allowResume` at its default `false`, so
+   `shouldResumeImageAttempt` is *always* false and the whole resume path is dead
+   code that still bills a fresh prediction on every re-entry.
+2. **A consumer for `err.unsettledAtResume`** — and this is the part that makes a
+   partial port worse than none. adgen releases the claim and leaves the ad
+   `status:'rendering'` (its `processAd` catch). Backend's static failure path
+   writes `status:'failed'`. If the opt-in above is added *without* this, an
+   ambiguous resumed poll terminal-fails an ad **whose prediction has already been
+   paid for**, and `bootRecoveryService` — which keys on `status:'rendering'` plus
+   a receipt — can no longer recover it for free. The money loss is larger after
+   the "fix" than before it.
+3. **Flag propagation through the wrap.** Backend's static error wrap copies
+   `predictionId` / `charged` / `atlasCode` / `alertLevel` / `code` / `retryable`
+   onto a new `Error`, and `failed()` builds the result object the route sees.
+   Neither carries `unsettledAtResume` today, so a consumer added only at the
+   route cannot see a flag the wrap discarded. Thread it, or handle it before the
+   wrap.
+4. **The explicit pin on the regenerate call site** (`buildDirectImageArgsFromAd`:
+   `existingPredictionId: null, allowResume: false`). Backend's defaults already
+   refuse resume, so this is not a live hole — but it is the grep-able invariant
+   adgen's harness exists to protect, and it is the same function in both repos.
+
+**(b) adgen owes backend — the #349 in-flight gate.** The read half
+(`inFlightRefusal`, called from `preflight`) is the visible half and is *not*
+sufficient. A complete port also needs:
+
+1. **The write half.** Backend ANDs `notInFlight()` into `regenerateAd`'s atomic
+   `Ad.updateOne` lock. `preflight` is a `.lean()` read, and callers 202 then
+   `setImmediate(regenerateAd)`, so the row can enter an in-flight state inside
+   that window. Without the write half, a regenerate and a first-time render hold
+   **disjoint** locks (`regenerating` vs `status`), both filters match the same
+   document, and both bill. Note the correct lock is `regenerateAd`'s `updateOne`
+   — *not* the consumer's `claimOne`, which is a different write with a different
+   filter.
+2. **A harness that drives the real `regenerateAd`.** Backend's own harness header
+   records that an earlier revision of it asserted only the exported helper, and
+   that a mutation removing `notInFlight()` from the lock entirely **left it fully
+   green**. Helper-level checks cannot see a missing call site. Any adgen harness
+   for this must include the equivalent of backend's group **D** (drive
+   `regenerateAd`, inspect the filter it genuinely hands to `Ad.updateOne`), or it
+   will pass while the money guard is absent.
+3. **A decision on non-`draft` titling states.** Backend's read half tests
+   `titlingResumeState` in `('pending','claimed')` *without* requiring
+   `status:'draft'`. A port that only consults titling state on `draft` rows
+   classifies `failed`/`live`/`archived` + `titlingResumeState:'claimed'`
+   differently from backend. No writer stamping that combination has been
+   identified, so this is a classification divergence rather than a proven live
+   hole — but the two copies should agree deliberately, not by accident.
+4. **Keeping the call-site obligation.** `existingPredictionId: null,
+   allowResume: false` guards a *different* thing (resume-from-receipt on an
+   allowed regenerate) than the gate does (status/titling). The gate does not
+   subsume it. Removing the flags while adding the gate trades one money bug for
+   another.
+
+Both exclusion/inclusion lists are **fail-open on an unknown status value** in
+both repos: a new `Ad.status` is simply absent from `$nin` (backend) and matches
+no `===` arm (adgen), so it is permitted by default. Backend's harness now pins
+its own enum against an explicit classification for exactly this reason; adgen's
+should too when (b) lands.
+
 > #### ⚠️ A documentation divergence on this exact operator — fixed by this change set
 >
 > **This is the one thing that required editing the backend repo**, so it is
@@ -478,14 +596,45 @@ explicitly (`adgen/src/services/adRegenerateService.js:879`) — an operator
 regenerate always wants a *fresh* video, never a resumed one — so a naive
 retry would be a **second billable Omni submit**.
 
-⚠️ **This is an adgen-only property; do not attribute it to backend.** Backend's
-own `runVideoFull` calls
-`veoService.generateForAd({ad, operatorPrompt, storyboard, modelOverride})`
-(`backend/services/adRegenerateService.js:867-872`) with **no `allowResume`
-argument**, and it defaults to `true`. So on the flag-**off** local path a
-backend regenerate of a row still holding a `veoPredictionId` will **resume**
-rather than submit fresh. That is a real behavioural difference between the two
-halves of this contract, on a money path. It also matches the
+> #### ✅ CORRECTION (supersedes the paragraph this replaces)
+>
+> **An earlier version of this section claimed backend's `generateForAd`
+> "defaults `allowResume` to `true`", so that a flag-off backend regenerate
+> would RESUME a paid prediction where adgen submits fresh. That is FALSE, and
+> it was wrong when it landed.** It is corrected here rather than deleted,
+> because it was a money claim and anyone who read it should see it withdrawn.
+>
+> Measured on `liquidretail_backend` `origin/main` (`services/atlasVideoService.js`,
+> 244,367 bytes): **`allowResume` occurs ZERO times in the entire file**, as do
+> `shouldResumeAttempt`, `existingPredictionId` and `resumeFrom`.
+> `generateForAd` destructures exactly
+> `{ ad, operatorPrompt, storyboard, modelOverride, campaignRunId }` — there is
+> no such parameter, so there is no default to inherit.
+>
+> **The two repos behave the SAME on this path: both submit fresh.** Backend's
+> regenerate omitting `allowResume` is not a latent resume; it is a call to a
+> function that has no resume behaviour at all.
+>
+> What actually differs is **structural, not behavioural**, and it is worth
+> knowing for the opposite reason to the one originally given:
+>
+> | | how resume is reached | what omitting the flag does |
+> |---|---|---|
+> | **backend** | a separate `resumeForAd({ ad })`, whose header states it **MUST NEVER SUBMIT** | nothing — `generateForAd` cannot resume |
+> | **adgen** | folded into `generateForAd` behind `allowResume`, which **defaults `true`** | **resumes** |
+>
+> So the risk sits on **adgen's** side, not backend's: adgen's shape means a
+> caller who forgets the flag resumes a paid prediction, which is precisely why
+> `runVideoFull`'s explicit `allowResume: false` (above) must never be dropped.
+> Backend is safe here by construction rather than by convention.
+>
+> Cite these by **symbol** (`generateForAd`, `resumeForAd`, `allowResume`), not
+> by line: the superseded paragraph pointed at
+> `backend/services/adRegenerateService.js:867-872` for a call that is actually
+> at **`:988`** — roughly 120 lines stale, and that staleness is part of why the
+> claim went unchecked.
+
+The retry/release reasoning below still stands unchanged. It also matches the
 pre-existing backend-only behaviour exactly: a backend crash mid-`regenerateAd`
 today also leaves `regenerating: true` forever with no retry. Adding a retry
 here would be a regression unless the retry is itself resume-aware.
