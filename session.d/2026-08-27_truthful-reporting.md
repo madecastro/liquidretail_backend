@@ -4,6 +4,22 @@ Branch `fix/truthful-reporting-be` (backend) + `fix/truthful-reporting-fe` (fron
 Backend must land first — the SPA reads two new response fields and is written to render
 unchanged without them.
 
+**Landed:** backend `#352` → `8bd9eebd` on `main`; frontend `#80` → `c1095e0` on **`master`**;
+follow-up `#354` carries the sort checks and two retractions.
+
+> ⚠️ **VERIFYING THE FRONTEND MERGE — use `origin/master`, not `origin/main`.** A checker who
+> reaches for the conventional trunk name gets a **false negative** and may "correct" a true
+> claim. Measured: in `liquidretail`, `origin/main` holds **1 commit** ("Initial commit",
+> `0e20437`) against **557** on `origin/master`, and `c1095e0` is an ancestor of `master` and
+> **not** of `main`. Both repos in one line, so neither has to be guessed:
+> ```
+> git -C liquidretail_backend merge-base --is-ancestor 8bd9eebd origin/main    # backend  → true
+> git -C liquidretail         merge-base --is-ancestor c1095e0  origin/master  # frontend → true
+> ```
+> And for anything squash-merged, prefer a **content** test over ancestry — a squash makes every
+> original commit report "not an ancestor" even when its content is fully present. That is exactly
+> how the orphaned `#354` commit was found: trunk had 76 harness `check(` calls, the branch had 81.
+
 All four defects were found by driving the real app. They share a theme: **each caused the
 system to report something untrue to whoever was looking**, and one had been actively
 distorting a live investigation.
@@ -87,9 +103,38 @@ profile at a 4096 cap:
 | preview (guard off) | 3,885 | present |
 | real (guard on) | **4,168** | **dropped** |
 
-4,168 is within **2 bytes** of the 4,170 measured on the real ad. Same builder, different
-budget. **And 4,168 > 4,096** — after every droppable line is gone, so `enforceByteCap` logs
-*"Atlas will reject"*. Flagged as a finding in its own right; pinned by B4d.
+Same builder, different budget. **And 4,168 > 4,096** — after every droppable line is gone, so
+`enforceByteCap` logs *"Atlas will reject"* **and returns the over-cap prompt anyway rather than
+truncating it**, so the over-cap body is what gets submitted. Pinned by B4d.
+
+> **⚠️ SCOPE CORRECTION — peer evidence, same day.** I originally wrote that 4,168 was "within 2
+> bytes of the 4,170 measured on the real ad", implying the real submission was over cap. **That
+> inference is refuted.** The Marine Layer master ran `paramShape: 'gemini-omni'`, and its own
+> persisted `renderStages.videoSubmission` records `promptBytes: 4170, promptByteCap: 20000` — 21%
+> of budget, nothing dropped. The 4,168/4,170 closeness is a coincidence of prompt SIZE, not
+> evidence of the drop mechanism; I had inferred the wrong cap from the missing `Product:` line.
+> Since nothing is dropped at cap 20,000, that line's absence needs a different explanation — most
+> likely a falsy `product.title` — which I have **not** verified and will not assert.
+>
+> What stands, and is arguably worse than I first framed it: `enforceByteCap` uses
+> `caps?.promptByteCap || DEFAULT_BYTE_CAP`, so **any** call site reaching it with `caps` absent or
+> a falsy `promptByteCap` silently gets 4,096. The same frozen prompt text that sits at 21% of
+> budget on gemini-omni is **over cap** on the **three** registered 4096-capped models
+> (`grok-imagine-video-v1.5/i2v`, `grok-imagine-video/reference-to-video`, `veo3.1/i2v`) — a latent
+> defect, and exactly the "frozen invariant text that fits one cap but not another" trap. My earlier
+> "four … generic" was a miscount: I was counting the `|| 4096` display fallback as if it were a
+> model shape. `BUILT_IN_DEFAULT_MODEL` is gemini-omni, so a 4096 cap is reached only by an explicit
+> override. Two open questions: whether any live tenant overrides onto one at this prompt length
+> (not chased), and whether it truncates — **answered: it does not, it logs and sends.**
+>
+> **A second hypothesis, also checked and REFUTED.** It was suggested that the preview might be
+> built with `caps` absent (hence a default 4,096) while the real submit carries Omni's 20,000 —
+> which would make the preview *more* truncated than the submission. `buildPromptScaffold` **does**
+> pass `caps`, resolved by the same `resolveModelAndAspect` the real path uses; the
+> `caps?.promptByteCap || 4096` in its return is the reported `byteCap` field, not a build input. So
+> caps are not the mechanism on either side, and the preview/submit gap remains what the
+> `approximation` block already says: hardcoded `seedHasText: false` (+283 bytes) and
+> `hasProductReference: true` (221 bytes).
 
 **Fix = label, not close.** The destination-less scaffold prompt is a documented frozen
 invariant (`CLAUDE.md` §00, pinned by `verifyPostPilotBatch` B14 against the `9531ae9f`
@@ -144,8 +189,42 @@ had **all failed** with zero assets — same response: `draftCount: 0, liveCount
 readyToExport: 0`. Header advanced 18 → 30 "ADS CREATED" and "1 of 200" → "2 of 200
 products".
 
-Coverage divided `adCount` (a bare `$sum: 1`) by `TARGET_ADS_PER_PRODUCT`. `Ad.status` has six
-values; only `archived` was excluded, so `failed`, `queued` and `rendering` all counted.
+`Ad.status` has six values; only `archived` was excluded, so `failed`, `queued` and `rendering`
+all counted. **The two endpoints use DIFFERENT formulas** — catalog is an ad-count ratio
+`min(100, round(adCount/TARGET × 100))`, campaigns is a product ratio
+`productsWithAds/matchedProductIds.length` — but both were fed by the same status-blind `$sum: 1`,
+so the conclusion holds for both while the arithmetic does not transfer.
+
+**Measured on live production data.** Marine Layer product `6a8d47cfd9e1e0e1dccee389`: 12
+non-archived rows, all `failed`, zero assets → `min(100, round(12/5 × 100)) = 100`. Re-checked
+under the strict `isAdHonestlyDelivered` predicate: 0 of 12 holds there too, and no
+paid-but-unchromed master is hiding (`veoVideoUrl: null`, `renderUrl: null`,
+`titlingNeeded: false`, `titlingResumeState: null`), so the fix cannot be accused of turning a
+nearly-delivered ad into a reported failure.
+
+### ⚠️ The sort consequence — the functional half
+
+`routes/catalog.js` sorts `lastActivityAt` DESC then `coveragePct` **ASC**, and the comment above
+it says that tiebreak exists *"so products needing attention surface above well-covered ones."*
+Scoring an all-failed product at 100 inverted exactly that signal. Executed over the real
+comparator at equal recency:
+
+| | trunk | fixed |
+|---|---|---|
+| 1st | untouched, 0% | **ALL-FAILED, 0%** |
+| 2nd | half-covered, 40% | untouched, 0% |
+| 3rd | **ALL-FAILED, 100%** | half-covered, 40% |
+
+The worst-off product sorted **last** in the list built to surface products needing attention.
+
+*Scope, stated precisely because the first framing of this overreached:* the burial is **within a
+recency group**, not absolute. `models/Ad.js:735` gives `generatedAt` a `default: Date.now` and
+`AD_RECENCY_EXPR` is `$ifNull[renderedAt, generatedAt]`, so a freshly-failed product has a recent
+`lastActivityAt` and still sorts near the top on the primary key. The durable harm is that as the
+failure ages it drifts down while still claiming 100% covered, so it never resurfaces.
+
+**`failedCount` already existed on trunk** — computed in the same `$group` since `ed3e6d83`, never
+projected. The honest number was computed server-side and discarded one line later.
 
 **Checked for a prior deliberate decision before changing anything — there is none.** Coverage
 shipped in `ed3e6d83` explicitly as a *"placeholder formula: adCount / 5, capped at 100"*; the
@@ -191,12 +270,12 @@ contradict itself. Clause is now scoped to the images arm and names its unit.
 
 ## Verification
 
-- `scripts/verifyTruthfulReporting.js` — **75/75** with mongod (51 offline + 24 group D).
+- `scripts/verifyTruthfulReporting.js` — **80/80** with mongod (56 offline + 24 group D).
   Behavioural: every check calls the real exported function or runs the real `$group`
   accumulators through a real mongod. Group D **skips loudly** without
   `TRUTHFUL_VERIFY_MONGODB_URI`.
-- **20/20 mutations caught RED, 0 vacuous** (`scripts/mutateTruthfulReporting.sh`), tree
-  byte-restored after each.
+- **21/21 mutations caught RED, 0 vacuous** (`scripts/mutateTruthfulReporting.sh`), tree
+  byte-restored after each. M21 reverses the coveragePct tiebreak and must stay red.
 - Guard-line hoist byte-identical to `origin/main` over 288 input combinations, with arm
   checks proving the sweep was not vacuous.
 - Suite **208/211** after rebasing onto `b5a42717`, with the same three pre-existing failures

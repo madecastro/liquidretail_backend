@@ -139,6 +139,10 @@ mutate "M19 distinctOnDelivered reverts to status-only" m19
 m20() { perl -0pi -e "s/    untitledDeliverableCount: \{/    unusedRenamed: {/" services/adDeliveryCounts.js; }
 mutate "M20 untitledDeliverableCount no longer returned" m20
 
+# 21 — reverse the coveragePct tiebreak, re-burying all-failed products.
+m21() { perl -0pi -e "s/      return a\.coveragePct - b\.coveragePct;/      return b.coveragePct - a.coveragePct;/" routes/catalog.js; }
+mutate "M21 coveragePct tiebreak reversed (failures re-buried)" m21
+
 echo
 echo "=== final restore verification ==="
 restore

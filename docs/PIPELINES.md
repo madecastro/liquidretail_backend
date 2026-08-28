@@ -1426,7 +1426,17 @@ Commit `134db56` (PR #61) added three camera-prompt changes in `services/veoProm
 
 **Wizard Advanced editor feed:** `GET /api/ads/veo-prompt-scaffold?campaignId=&productId?&platformFormat?&durationSec?` → `buildPromptScaffold` returns `{ prompt, model, aspectRatio, durationSec, byteCap, maxReferenceImages, defaultReferenceCount, referenceDefaults, approximation }`.
 
-⚠️ **`prompt` IS AN APPROXIMATION OF WHAT GETS SUBMITTED, not a copy of it.** This line used to call it "canonical prompt", which read as byte-exact and is how an investigator ended up debugging from a prompt that was never sent (2026-08-27). It IS built by the canonical `buildVeoPrompt` — there is no second builder — but the scaffold runs *before an ad exists*, so it feeds different inputs: `seedHasText: false` and `hasProductReference: true` are **hardcoded**, `media` is `null`, and `layoutInput` / `sourceMedia` / `storyboard` / `seedStyle` / `variantKind` are not passed at all. Measured consequences: the burned-in-text guard block (+283 bytes) can never appear here, and at a 4096-byte cap its absence is why a `Product: ` line can survive in the preview and be dropped from the real submission (`/^Product: /` heads `enforceByteCap`'s `DROP_PRIORITY`). The response now carries an `approximation` block naming every assumed and omitted input; the SPA renders it beside the editor.
+⚠️ **`prompt` IS AN APPROXIMATION OF WHAT GETS SUBMITTED, not a copy of it.** This line used to call it "canonical prompt", which read as byte-exact and is how an investigator ended up debugging from a prompt that was never sent (2026-08-27). It IS built by the canonical `buildVeoPrompt` — there is no second builder — but the scaffold runs *before an ad exists*, so it feeds different inputs: `seedHasText: false` and `hasProductReference: true` are **hardcoded**, `media` is `null`, and `layoutInput` / `sourceMedia` / `storyboard` / `seedStyle` / `variantKind` are not passed at all. Measured consequences: the burned-in-text guard block (+283 bytes) can never appear here, and **at a 4096-byte cap** its absence is why a `Product: ` line can survive in the preview and be dropped from the real submission (`/^Product: /` heads `enforceByteCap`'s `DROP_PRIORITY`). **That cap qualifier is load-bearing** — `MODEL_CAPS` carries `promptByteCap: 20000` for the two gemini-omni shapes and `4096` for grok-i2v ×2 / veo3.1 / generic, so which mechanism applies depends entirely on `paramShape`, and at 20,000 nothing is dropped at all.
+
+**`promptByteCap` is PER-MODEL — executed census, not grepped:** `20000` on both `gemini-omni-flash` shapes (`image-to-video-developer`, `reference-to-video-developer`) and `4096` on the three others (`grok-imagine-video-v1.5/image-to-video`, `grok-imagine-video/reference-to-video`, `veo3.1/image-to-video`). `BUILT_IN_DEFAULT_MODEL` is a gemini-omni shape, so **a 4096 cap is reached only by an explicit per-brand/per-product `videoSettings.model` override.**
+
+✅ **`buildPromptScaffold` DOES pass `caps`** — resolved by the same `resolveModelAndAspect` the real submit path uses. So the preview is **not** built at a default 4096 while the real path gets 20000; a hypothesis to that effect was checked and refuted. The `caps?.promptByteCap || 4096` in the scaffold's return is the **reported `byteCap` field only**, not a build input.
+
+⚠️ **Latent, flagged not fixed, and NOT reachable on the Omni path.** `enforceByteCap` uses `caps?.promptByteCap || DEFAULT_BYTE_CAP`, so any call site reaching it with `caps` absent or falsy silently gets 4,096; and when still over cap after every `DROP_PRIORITY` line is gone it logs *"Atlas will reject"* **and returns the over-cap prompt anyway — it does not truncate**, so the over-cap body is submitted (contrast `enforceRawByteCap`, which *does* hard-truncate on a UTF-8 boundary). That asymmetry between the two paths is the filable bug. A 4,168-byte prompt is ~21% of Omni's budget and over cap only on the three 4096-capped models. Open, not chased: whether any live tenant overrides onto one at this prompt length.
+
+**One residual input divergence, now declared.** The scaffold hardcodes `hasVideoSeed: false` while the real path passes `media.fileType === 'video'`, so a video-seeded ad can resolve a different MODEL than the preview. It **cannot** change the cap: the only `requiresVideoSeed` model (`gemini-omni-flash/reference-to-video-developer`, 20000) degrades to `BUILT_IN_DEFAULT_MODEL` (also 20000). Named in the `approximation` block for completeness, not as a cap story.
+
+The response carries that `approximation` block naming every assumed and omitted input; the SPA renders it beside the editor.
 
 **Its prompt text is a frozen invariant** — the destination-less scaffold path is pinned byte-identical by `verifyPostPilotBatch` B14 (see §00 of `CLAUDE.md`), so do NOT "improve" the preview by changing what `buildPromptScaffold` passes to the builder. The exact submitted prompt for a generated ad is at `GET /api/ads/:id/generation-inspector` → `video.submission.prompt`.
 
@@ -1771,10 +1781,36 @@ endpoints — never re-implemented per route.** `deliveredExpr()` is the aggrega
 non-archived population) **AND**, for video, `isVideoTitlingSettled`. Parity with the JS function
 is proven by execution against a real mongod, not by reading.
 
-- **The defect:** coverage divided `adCount` (a bare `$sum: 1`) by `TARGET_ADS_PER_PRODUCT`, so a
-  product whose 12 ads had ALL FAILED with zero assets reported `coveragePct: 100` while the same
-  response said `draftCount: 0, liveCount: 0, readyToExport: 0`. `Ad.status` has six values and
-  only `archived` was ever excluded, so `failed`, `queued` and `rendering` all counted as coverage.
+- **The defect.** `Ad.status` has six values and only `archived` was ever excluded, so `failed`,
+  `queued` and `rendering` all counted as coverage. **The two endpoints used DIFFERENT formulas** —
+  do not state one as shared — but both were fed by the same status-blind `$sum: 1`, so the
+  conclusion holds for both while the arithmetic does not transfer:
+  - `routes/catalog.js` — an ad-count ratio, `min(100, round(adCount / TARGET_ADS_PER_PRODUCT * 100))`.
+  - `routes/campaigns.js` — a product ratio, `productsWithAds / matchedProductIds.length`.
+- **Measured on live production data.** Marine Layer product `6a8d47cfd9e1e0e1dccee389`: 12
+  non-archived ad rows, **all `failed`, zero assets**. Catalog's formula gives
+  `min(100, round(12/5 × 100)) = 100`, reported beside `draftCount: 0, liveCount: 0,
+  readyToExport: 0`. Independently re-checked under the strict `isAdHonestlyDelivered` predicate —
+  0 of 12 holds there too, and no paid-but-unchromed master is hiding (the master carries
+  `veoVideoUrl: null`, `renderUrl: null`, `titlingNeeded: false`, `titlingResumeState: null`), so
+  the fix cannot be accused of turning a nearly-delivered ad into a reported failure.
+- **⚠️ THE SORT CONSEQUENCE — this is the functional half, not a cosmetic one.** `routes/catalog.js`
+  sorts `lastActivityAt` DESC then `coveragePct` **ASC**, and the comment above it says that
+  ascending tiebreak exists *"so products needing attention surface above well-covered ones"*.
+  Scoring an all-failed product at 100 **inverted exactly that signal**: executed over the real
+  comparator with equal recency, trunk ordered `untouched 0% → half-covered 40% → ALL-FAILED 100%`,
+  putting the worst-off product **last** in the list built to surface products needing attention.
+  After the fix it scores 0 and sorts **first**. Pinned by C6/C6e, and M21 (reversing the tiebreak)
+  must stay red.
+  *Scope, stated precisely because the first framing of this overreached:* the burial is **within a
+  recency group**, not absolute — `models/Ad.js:735` gives `generatedAt` a `default: Date.now` and
+  `AD_RECENCY_EXPR` is `$ifNull[renderedAt, generatedAt]`, so a freshly-failed product still has a
+  recent `lastActivityAt` and sorts near the top on the primary key. The durable harm is that as
+  the failure ages it drifts down while still claiming 100% covered, so it never resurfaces.
+- **`failedCount` already existed on trunk** (`routes/catalog.js`, computed in the same `$group`
+  since `ed3e6d83`) and was simply never projected into the response — the honest number was
+  computed server-side and discarded one line later. Projecting it is the minimum viable fix; the
+  sort predicate is where the real design decision lives.
 - **Both conjuncts are required.** A status-only cut leaves an untitled video draft (paid master
   landed, chrome never composited) counting as coverage while `titled: isAdHonestlyDelivered(a)`
   — projected on ads-**detail** in the same two files — says it is not delivered. Two definitions
