@@ -230,8 +230,16 @@ const REFRAME_CLAIM_TTL_MS = () => {
 
 // How long a claim LOSER polls for the winner's reframe before degrading to
 // the deterministic crop. waitForReframeUrl sleeps 1s,2s,…,Ns between reads,
-// so attempts=26 ≈ 5m51s — sized to the measured worst-case cold reframe
-// stage (5m19s, 3 serialized outpaints). Raised from the historical 3 (~6s)
+// so attempts=26 ≈ 5m51s — sized to what this file calls "the measured
+// worst-case cold reframe stage (5m19s, 3 serialized outpaints)".
+// ⚠️ THAT 5m19s WAS NEVER A MEASUREMENT (flagged 2026-08-27). It appears
+// twice in this file as prose and the other instance cites "this file's own
+// notes" — i.e. itself. The real reframe distribution is n=60, p50 48.5s,
+// p95 136.6s, max 232s, with zero of 126 billed reframes timing out in 7
+// days. 26 attempts is still comfortably above that max, so the VALUE is
+// fine and is not being changed here; the JUSTIFICATION is what was
+// unearned. A peer's reframe-poll-budget PR reworks this block properly.
+// Raised from the historical 3 (~6s)
 // when the wizard prewarm landed: a Generate clicked while a prewarm outpaint
 // is mid-flight used to lose the claim, give up after 6s, and silently ship a
 // CROPPED reference where every other run got the generative one. Waiting for
@@ -370,7 +378,7 @@ const POLL_INTERVAL = parseInt(process.env.ATLAS_POLL_INTERVAL_MS, 10) || 5000;
 //
 //     adgen   (this file, master 8eb3e5d)          900000 → TTL 25 min
 //     backend (services/atlasVideoService.js:314,
-//              origin/main c77a4774 = deployed)    600000 → TTL 20 min
+//              origin/main 8bd9eebd = deployed)    600000 → TTL 20 min
 //
 // HOW EACH SIDE ACTUALLY GETS ITS VALUE (corrected — an earlier version of
 // this block said "empty env, so each side takes its own code fallback", which
@@ -382,35 +390,83 @@ const POLL_INTERVAL = parseInt(process.env.ATLAS_POLL_INTERVAL_MS, 10) || 5000;
 // Backend's config/defaults.env does not declare the key, so backend really
 // does hit its `|| 600000`. Different mechanisms, same two numbers.
 //
-// WHAT THE STEAL WINDOW ACTUALLY REQUIRES — do not overstate this. The claim is
-// held across ONE submitImageGeneration and ONE pollPrediction; there is no
-// poll retry ladder inside the claimed region. The structured worst case is
-// the 15 min poll ceiling, plus at most one leftover interval and rate-limit
-// backoff, plus fetchOutpaintOutput (3 attempts × 30s timeout with 1.5s/3s
-// backoff ≈ 95s), plus pad build and Cloudinary upload. That lands near 18
-// min — UNDER backend's 20 min line. Reaching 20+ min needs something
-// genuinely unbounded, and the honest candidate is the Cloudinary upload,
-// which has no timeout.
+// ⚠️ THE MECHANISM THAT ACTUALLY LOSES CLAIMS IS A MISSING SIGTERM EVICTION
+// ON THE BACKEND SIDE — not the arithmetic below. This repo registers every
+// live claim in `_activeReframeClaims` and evicts the whole set from its
+// SIGTERM path (`releaseAllActiveReframeClaims`, called from renderer.js), so
+// an adgen deploy hands its claims back. BACKEND HAS NEITHER: zero
+// occurrences of either identifier anywhere on origin/main. So every backend
+// web deploy abandons whatever reframe claim was in flight — and backend web
+// deployed twelve or more times today. Two orphaned claims with dead holders
+// are live in Media right now, and that is exactly their shape. Porting the
+// eviction is worth more than porting the constant.
+//
+// ── THE TTL ARITHMETIC, RETRACTED AND REDONE ────────────────────────────
+// An earlier version of this block claimed a "~18 min structured worst case,
+// UNDER backend's 20 min line". THAT IS RETRACTED, not softened — it was the
+// half of the argument asserting we were safe, and it omitted a term.
+// pollPrediction's while-condition tests its per-invocation budget (the
+// `maxPollMs` option #83 introduced, defaulting to the module constant; the
+// reframe caller passes no options, so its budget IS the 900000) only at the
+// TOP of the loop. The body then sleeps POLL_INTERVAL + jitter (15000 + ≤3000
+// in production) and only AFTERWARDS issues its GET with a 30s timeout — so an
+// iteration can begin one millisecond inside the deadline and run ~48s past
+// it.
+//
+// #83 CHANGED WHICH BUDGET IS ENFORCED, NOT THE OVERSHOOT. Verified on master
+// 9f41215: the loop body has no deadline-aware clamp on either the sleep or
+// the GET, so the ~48s term below is still live. A peer's poll-overshoot fix
+// is still in flight and WILL retire it — do not pre-credit it here.
+//
+// Corrected bounded non-poll work is 602.5s (10.04 min) against the +10 min
+// slack: −2.5s of margin. That holds in BOTH repos, since the slack and the
+// non-poll code are identical on each side. The floor is not conservatively
+// sized; it is marginally negative.
+//
+// READ THAT ENVELOPE HONESTLY OR IT MISLEADS. 602.5s is a FULLY ADVERSARIAL
+// stack — a source needing re-encode, a rate limit landing precisely at the
+// deadline, the outpaint upload failing so the pad fallback runs too, and
+// every axios timeout firing at its limit. TYPICAL HOLD IS ~1–2 MIN. State
+// both: typical ~1–2 min, worst-case envelope ~10 min on top of the poll, and
+// a floor sized against that envelope with no margin left.
+//
+// The Cloudinary upload is NOT untimed — another retraction. cloudinary 2.10.1
+// calls post_request.setTimeout(options.timeout ?? 60000) and aborts
+// (node_modules/cloudinary/lib/uploader.js:609), and cloudinaryService.js's
+// cloudinary.config() passes no timeout, so 60s applies. The narrower true
+// caveat: that is Node's socket-INACTIVITY timeout, not a total-duration
+// deadline — a slowly trickling transfer can still exceed 60s, while a
+// genuinely hung socket cannot.
 //
 // AND THE CEILING WAS NOT SIZED FOR THIS PATH. The 900000 derivation below is
-// the VIDEO distribution (n=68 Omni image-to-video masters, max 760s). Reframe
-// runs a different model (REFRAME_OUTPAINT_MODEL, google/nano-banana-2/edit),
-// whose measured cold stage in this file's own notes is 5m19s for THREE
-// serialized outpaints. So "a poll out to 15 min" is not something this
-// ceiling was ever measured to permit for a reframe — it is a tail
-// hypothetical, and raising MAX_POLL_MS lengthened adgen's LEASE without
-// lengthening its HOLD.
+// the VIDEO distribution (n=68 Omni image-to-video masters, max 760s).
+// Reframe runs REFRAME_OUTPAINT_MODEL (google/nano-banana-2/edit), whose real
+// distribution is n=60, p50 48.5s, p95 136.6s, max 232s — 900000 is 3.9× that
+// max, and ZERO of 126 billed reframes timed out in 7 days. The "5m19s cold
+// stage" figure this file repeats twice was NEVER a measurement (the second
+// instance cites "this file's own notes", i.e. itself); do not size anything
+// off it. So raising MAX_POLL_MS lengthened adgen's LEASE without lengthening
+// its HOLD.
 //
-// SO THE DEFECT IS THE DISAGREEMENT, NOT AN IMMINENT CHARGE. The 20→25 min
-// band is a band this side calls a live holder and the other side calls a
-// corpse, over a claim they share. A backend steal inside it goes straight to
-// a billable POST /model/generateImage (its acquire has no holder-identity,
-// fence, receipt or idempotency guard), and releaseReframeClaim is scoped to
-// claim.by — which the steal overwrites — so the original holder's release
-// becomes a no-op and both flights persist. Frequency: NOT MEASURED, and per
-// the bound above, most likely zero today. Treat this as an invariant that no
-// longer holds, which will bite when either side's latency or ceiling moves
-// again — not as a fire.
+// FREQUENCY — TWO DIFFERENT NUMBERS. DO NOT LET ONE COVER BOTH. The steal
+// path: zero observed. Claim contention generally: 11+ hits in 7 days, plus
+// the two live orphans above. An earlier version of this comment said
+// "frequency: not measured, most likely zero today" and let that single zero
+// stand for both, which understated a real, present, observable condition.
+//
+// SO THE DEFECT IS THE DISAGREEMENT *PLUS* THE LEAK. The 20→25 min band is a
+// band this side calls a live holder and the other side calls a corpse, over a
+// claim they share. A backend steal inside it goes straight to a billable
+// POST /model/generateImage (its acquire has no holder-identity, fence,
+// receipt or idempotency guard), and releaseReframeClaim is scoped to
+// claim.by — which the steal overwrites — so the robbed holder's release
+// becomes a no-op and both flights persist.
+//
+// A peer is landing the real fix as PRs: a ~300s reframe poll budget on its
+// own env key, a floor held at 20 min in BOTH repos and derived from nothing,
+// the SIGTERM eviction port, durationMs instrumentation, and the
+// poll-overshoot fix — which WILL retire the 48s term above once it lands.
+// #83 has landed the per-invocation budget; the overshoot clamp has not.
 //
 // Narrowing it further: the wizard fires prewarm ~1.5s after a product pick
 // (frontend Step2Picker), i.e. BEFORE Generate, while adgen holds during
