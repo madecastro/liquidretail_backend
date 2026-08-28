@@ -38,7 +38,6 @@
 const mongoose              = require('mongoose');
 const Ad                    = require('../models/Ad');
 const Media                 = require('../models/Media');
-const Brand                 = require('../models/Brand');
 const CampaignRun           = require('../models/CampaignRun');
 const veoService            = require('./videoRouter');
 const brandScriptExecutor   = require('./brandScriptExecutor');
@@ -886,18 +885,9 @@ async function performRegeneration({
 
 // Load brand — one Media + one Brand lookup — with all fields the
 // brand-script executor's format-aware resolver needs.
-async function loadBrand(adId) {
-  const ad = await Ad.findById(adId).select('mediaId').lean();
-  const media = ad?.mediaId ? await Media.findById(ad.mediaId).select('brandId').lean() : null;
-  // brandReviews is load-bearing for the proof beat — see the same note in
-  // routes/ads.js. Without it buildMetaForAd's brandPair is null and every
-  // regenerated ad loses its stars AND its review count, even for brands that
-  // clear the >4.5 gate. Pinned by scripts/verifyProofBeat.js P1.
-  return media?.brandId
-    ? await Brand.findById(media.brandId)
-        .select('name styleScript styleScriptVertical styleScriptLandscape styleTheme tagline logoUrl websiteUrl primaryColor secondaryColor accentColor fontFamily fontSource curatedFields tailwindTheme websiteFontUsage customFonts videoSettings titleStyleSpec titleStylePreset brandReviews').lean()
-    : null;
-}
+// loadBrand() REMOVED 2026-08-28 — it existed solely to resolve the brand
+// doc for the (now-removed) titling call in runVideoFull below. It had
+// exactly one caller.
 
 // Video regen — always full. Regenerates the storyboard + Grok base
 // video, then applies brand-script chrome (or no chrome, per resolver).
@@ -1012,38 +1002,23 @@ async function runVideoFull(adId, prompt, progressRun = null, videoModel = null,
     }
   });
 
-  // Stage 3 — brand-script canvas overlay. Resolver picks the right
-  // script by format; returns skipped when no chrome is configured
-  // (raw Grok video stays as renderUrl in that case). Failure is
-  // non-fatal for the same reason.
+  // Stage 3 — TITLING REMOVED 2026-08-28 (owner directive: "remove and
+  // disable the backend titling function, we are not going to go back to
+  // it"). This stage used to call brandScriptExecutor.renderBrandScriptAndSave
+  // when a brand resolved (Remotion chrome) and qcAndStampVideoAd only on
+  // the no-brand fallback (or on a chrome failure). adgen now titles every
+  // master exclusively — backend no longer attempts Remotion compositing
+  // in-process at all, brand or no brand, so this stage is unconditional.
+  // This whole function is already unreachable in production
+  // (regenerateAd returns before calling performRegeneration whenever
+  // shouldDeferToAdgen() is true), but if it is ever reached the raw
+  // regenerated master ships untitled — exactly the pre-existing "no brand
+  // resolved" behavior below, now the only behavior. Vision QC still runs
+  // so the ad is never delivered with zero visibility.
   if (progressRun) { await progressRun.checkpoint(); progressRun.stage('compositing'); }
   await setStage(adId, 'composite');
-  const brand = await loadBrand(adId);
-  if (brand) {
-    const adFinal = await Ad.findById(adId).lean();
-    try {
-      await brandScriptExecutor.renderBrandScriptAndSave({ ad: adFinal, brand });
-    } catch (scriptErr) {
-      console.warn(`🔁 regenerate[ad=${adId}]: brand-script failed (non-fatal) — ${scriptErr.message}`);
-      // Chrome/titling threw before ever reaching uploadRenderAndStamp, so
-      // vision QC never ran on this render either — and because this catch
-      // is deliberately non-fatal (the raw master, already stamped as
-      // renderUrl above, is a perfectly good fallback), the ad keeps
-      // looking "delivered" with a brand new render nobody inspected. QC
-      // the raw plate now so an operator can tell "titling failed but this
-      // was checked" from "titling failed and nobody looked".
-      await brandScriptExecutor.qcAndStampVideoAd({ ad: adFinal, deliveredUrl: veoResult.videoUrl, brandName: brand?.name || null });
-    }
-  } else {
-    // NO BRAND RESOLVED — this never reaches renderBrandScriptAndSave, so it
-    // never reaches vision QC either (uploadRenderAndStamp and the
-    // no-chrome branch both live inside renderBrandScriptAndSave's call
-    // graph). The raw regenerated master ships as renderUrl regardless
-    // (stamped above); without this it would ship with NO Ad.visionQc at
-    // all — same gap as the two no-brand branches in routes/ads.js.
-    const adFinal = await Ad.findById(adId).lean();
-    await brandScriptExecutor.qcAndStampVideoAd({ ad: adFinal, deliveredUrl: veoResult.videoUrl });
-  }
+  const adFinal = await Ad.findById(adId).lean();
+  await brandScriptExecutor.qcAndStampVideoAd({ ad: adFinal, deliveredUrl: veoResult.videoUrl });
 }
 
 /**

@@ -38,14 +38,13 @@ const SPEC = Object.freeze({
     ceiling: 'SELF-IMPOSED',
     why: 'In-flight video ads per campaign run — now the SUBMIT+POLL half only. Raised 1→4 (2026-08-02) as a probe; 4→12 (2026-08-05) once titling moved behind its own permit (VEO_TITLING_CONCURRENCY). The 4 was never really about Omni: this lane also ran Remotion renderMedia (headless Chrome + ffmpeg, 1080p) IN-PROCESS, so the number was pinned to what local RAM/CPU could take, while being documented against Omni RPS. Splitting them lets the idle half (an Omni poll is ~2min of waiting; measured p50 117s / p99 247s) run wide without touching the memory-bound half. Omni RPS remains unpublished and no Omni 429 has ever been recorded; submit RATE is still governed by pacedModelSubmit + ATLAS_SUBMIT_SPACING_MS, and Grok stays <=1 RPS via GROK_MAX_RPS regardless of this value. 12 bounds in-flight video submits/polls per run — a wave size under the effectively-uncapped claim. RAISED 12→24 on 2026-08-20 (owner-approved): still submit+poll only, no Omni 429 ever recorded, Grok paced independently, so low-risk. Moved together with REMOTION_QUEUE_CONCURRENCY 4→8 — raising this alone would only make titling a harder bottleneck (masters queue longer for a titling slot).'
   },
-  VEO_TITLING_CONCURRENCY: {
-    env: 'VEO_TITLING_CONCURRENCY',
-    default: 48,
-    min: 1,
-    max: 64,
-    ceiling: 'SELF-IMPOSED',
-    why: 'How many ads may be INSIDE the titling call at once. 4 -> 48 (owner-directed 2026-08-13) and the note below is rewritten because the old one was wrong about what this bounds. It said "simultaneous Remotion titling renders", but remotionRenderService ran a concurrency-1 promise CHAIN, so only ever ONE render happened regardless of this number — the other permit holders sat idle. That is the whole explanation for the measured 926s / 83%-idle titling tail on a 20-ad run: 13 renders strictly back to back. What this permit actually bounds is the CHEAP prep half — buildMetaForAd, the copy cascade, product/category reads, font resolution. Those are Mongo/disk, not memory-heavy, so a wide value is safe and 48 matches RENDER_CONCURRENCY in being deliberately non-binding. THE MEMORY GUARD IS NOW REMOTION_QUEUE_CONCURRENCY, which is the number to move carefully. One caveat that survives the rewrite: ~$0.02 of billable face-detection vision runs inside this permit per ad (basePlateCropService), so a wide value bursts those calls concurrently — same total spend, higher instantaneous rate.'
-  },
+  // VEO_TITLING_CONCURRENCY REMOVED 2026-08-28 — it gated routes/ads.js's
+  // own in-process titling call (veoTitlingSemaphore), which is deleted
+  // (backend no longer titles in-process; adgen owns titling exclusively).
+  // REMOTION_QUEUE_CONCURRENCY below is a DIFFERENT knob — it bounds
+  // services/remotionRenderService.js's own render queue, which is still
+  // live (used by routes/brand.js's manual retitle endpoints) — do not
+  // confuse the two or re-add this entry to backfill it.
 
   REMOTION_QUEUE_CONCURRENCY: {
     env: 'REMOTION_QUEUE_CONCURRENCY',

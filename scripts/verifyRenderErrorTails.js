@@ -176,15 +176,12 @@ function stripComments(src) {
   return src.replace(/\/\*[\s\S]*?\*\//g, '').split('\n').map((l) => l.replace(/\/\/.*$/, '')).join('\n');
 }
 
-check('C1 titlingResumeService spreads childTailsFrom(err) onto the terminal renderError', () => {
-  const src = stripComments(srcOf('services/titlingResumeService.js'));
-  assert.match(src, /childTailsFrom\(err\)/, 'terminal titling failure persist dropped the tails');
-});
-check('C2 routes/ads.js master-titling persist spreads childTailsFrom(titlingFailed)', () => {
-  const src = stripComments(srcOf('routes/ads.js'));
-  const hits = src.match(/childTailsFrom\(titlingFailed\)/g) || [];
-  assert.ok(hits.length >= 2, `expected both master and derive titling persists, got ${hits.length}`);
-});
+// C1 (services/titlingResumeService.js) and C2 (routes/ads.js's
+// childTailsFrom(titlingFailed) master/derive titling persists) REMOVED
+// 2026-08-28 — backend titling removal (owner directive: "remove and
+// disable the backend titling function"). titlingResumeService.js is
+// deleted; routes/ads.js no longer has a titlingFailed terminal outcome to
+// persist a renderError for (there is no more in-process titling to fail).
 check('C3 routes/ads.js crash and veo persists spread childTailsFrom(err)', () => {
   const src = stripComments(srcOf('routes/ads.js'));
   assert.match(src, /stage:\s*'veo'[\s\S]{0,200}childTailsFrom\(err\)/);

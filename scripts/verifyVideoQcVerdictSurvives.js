@@ -3,8 +3,13 @@
 //
 // verifyVideoQcVerdictSurvives (backend) — mirror of the adgen harness of the
 // same name. A vision-QC 'failed' verdict must survive every terminal write
-// in THIS repo too: routes/ads.js (master + derive) and
-// services/titlingResumeService.js (titled + no-brand arms).
+// in THIS repo too: routes/ads.js (master + derive).
+//
+// Used to also pin services/titlingResumeService.js (titled + no-brand
+// arms) — that file is DELETED 2026-08-28 (backend titling removal, owner
+// directive: "remove and disable the backend titling function"). Nothing
+// in this repo runs Remotion titling in-process any more, so there is no
+// second writer left to guard.
 //
 // WHY THIS FILE EXISTS SEPARATELY FROM E3 (verifyTitlingOrphanResume.js).
 // E3 counts `titlingResumeState: null` occurrences — that pins "every
@@ -46,7 +51,6 @@ const assert = require('assert');
 
 const ROOT = path.resolve(__dirname, '..');
 const ADS_RAW = fs.readFileSync(path.join(ROOT, 'routes/ads.js'), 'utf8');
-const TRS_RAW = fs.readFileSync(path.join(ROOT, 'services/titlingResumeService.js'), 'utf8');
 
 function stripComments(src) {
   let out = ''; let i = 0;
@@ -72,7 +76,6 @@ function stripComments(src) {
 }
 
 const ADS_SRC = stripComments(ADS_RAW);
-const TRS_SRC = stripComments(TRS_RAW);
 
 let failures = 0, passes = 0;
 function check(name, fn) {
@@ -151,9 +154,6 @@ function assertGuarded(writes, label) {
 (async () => {
   console.log('\n── routes/ads.js (master + derive terminal writes) ──');
   assertGuarded(terminalDraftWrites(ADS_SRC), 'ads.js');
-
-  console.log('\n── services/titlingResumeService.js (titled + no-brand arms) ──');
-  assertGuarded(terminalDraftWrites(TRS_SRC), 'titlingResumeService.js');
 
   console.log('\n── the upstream QC-verdict writer cannot be silently defeated (behavioural) ──');
 

@@ -147,70 +147,34 @@ function makeProbe(state, ms = 40) {
     assert.strictEqual(s.waiting, 0, `${s.waiting} still waiting after all work settled`);
   });
 
-  // ── D: config. The two knobs mean different things and confusing them is how
-  // the original defect survived so long.
+  // ── D: config.
+  // D1 (VEO_TITLING_CONCURRENCY=48) and the "render <= titling" half of D2,
+  // and all of D3 (the outer permit's misleading config note) REMOVED
+  // 2026-08-28 — that knob and the in-process titling call it gated
+  // (routes/ads.js's veoTitlingSemaphore) are both deleted (owner directive:
+  // "remove and disable the backend titling function"; adgen owns titling
+  // exclusively now). REMOTION_QUEUE_CONCURRENCY is a different, still-live
+  // knob (services/remotionRenderService.js's own render queue — this is
+  // the file that owns it) and keeps its own ceiling check below.
   const ROOT = path.join(__dirname, '..');
-  const CONC = require('../services/concurrency');
   const envFile = fs.readFileSync(path.join(ROOT, 'config', 'defaults.env'), 'utf8');
 
-  await ok('D1 VEO_TITLING_CONCURRENCY is 48 (owner-directed)', async () => {
-    assert.ok(/^VEO_TITLING_CONCURRENCY=48$/m.test(envFile),
-      'config/defaults.env must set VEO_TITLING_CONCURRENCY=48');
-  });
-
-  await ok('D2 REMOTION_QUEUE_CONCURRENCY exists and is the smaller, guarded knob', async () => {
+  await ok('D2 REMOTION_QUEUE_CONCURRENCY exists and stays within its documented ceiling', async () => {
     const m = envFile.match(/^REMOTION_QUEUE_CONCURRENCY=(\d+)$/m);
     assert.ok(m, 'config/defaults.env must declare REMOTION_QUEUE_CONCURRENCY');
     const render = Number(m[1]);
-    const titling = Number(envFile.match(/^VEO_TITLING_CONCURRENCY=(\d+)$/m)[1]);
-    assert.ok(render <= titling,
-      'the memory-bound render pool must not exceed the cheap outer permit');
     assert.ok(render <= 16,
       `REMOTION_QUEUE_CONCURRENCY=${render} exceeds the documented ceiling — this is the OOM knob`);
   });
 
-  await ok('D3 the config note no longer claims the permit bounds Remotion renders', async () => {
-    // The stale claim is what hid the serial queue for so long: the number said
-    // "4 simultaneous renders" and everyone believed it.
-    const why = CONC.LIMITS?.VEO_TITLING_CONCURRENCY?.why
-      || require('../services/concurrency.js').LIMITS?.VEO_TITLING_CONCURRENCY?.why
-      || '';
-    if (why) {
-      assert.ok(!/^Simultaneous Remotion titling renders/.test(why),
-        'VEO_TITLING_CONCURRENCY still documents itself as the render limit — it is not');
-    }
-    assert.ok(/REMOTION_QUEUE_CONCURRENCY/.test(envFile),
-      'defaults.env must point readers at the knob that really guards memory');
-  });
-
   // ── E: the "N ahead" diagnostic must be TRUE.
   // Owner rule: generation indicators are diagnostic, so an inaccurate one is
-  // worse than none — it sends the reader looking in the wrong place. When the
-  // permit was the narrowest thing in the path, reading its `.waiting` was
-  // correct. It is now 48 and bounds only cheap prep, so that same read would
-  // report "0 ahead" for an ad genuinely twelfth in the render queue.
-  const adsSrc = fs.readFileSync(path.join(ROOT, 'routes', 'ads.js'), 'utf8')
-    .replace(/\/\*[\s\S]*?\*\//g, '')
-    .split('\n').map(l => l.replace(/\/\/.*$/, '')).join('\n');
-
-  await ok('E1 queue depth is NOT read from the titling semaphore', async () => {
-    assert.ok(!/veoTitlingSemaphore\.waiting/.test(adsSrc),
-      'the permit is wide now — its .waiting is ~always 0 and would report a false "0 ahead"');
-  });
-
-  await ok('E2 both titling paths report depth from the render pool', async () => {
-    const sites = adsSrc.match(/queued for titling \(\$\{[^}]+\} ahead\)/g) || [];
-    assert.strictEqual(sites.length, 2,
-      `expected the master + derive-only stage lines, found ${sites.length}`);
-    for (const s of sites) {
-      assert.ok(/q\.waiting/.test(s),
-        `stage line "${s}" does not source its depth from the render pool`);
-    }
-    const helpers = adsSrc.match(/function titlingQueueDepth\(\)/g) || [];
-    assert.strictEqual(helpers.length, 1,
-      'titlingQueueDepth must be defined once and shared, not copied per call site');
-  });
-
+  // worse than none — it sends the reader looking in the wrong place.
+  // E1/E2 (the outer titling-permit stage lines reading depth from this pool)
+  // REMOVED 2026-08-28 along with routes/ads.js's titlingQueueDepth() helper
+  // and both call sites it served (both deleted with the in-process titling
+  // calls). E3 is unaffected — it drives THIS module's own enqueue/
+  // renderQueueStats directly, never routes/ads.js.
   await ok('E3 the depth helper reports the pool truthfully under load', async () => {
     // Not a source check: run more work than the pool can take and assert the
     // helper actually observes a backlog. A helper that always returns zero

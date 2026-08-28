@@ -130,14 +130,25 @@ ok('B1 every ads-detail $project includes renderStage and renderStageAt', () => 
 // UI regression unless something in THIS repo fails, so this is the contract.
 const STAGE_CONTRACT = [
   // [literal fragment that must survive, why the UI needs it]
-  ['queued for titling',        'the one the operator complained about — carries queue depth'],
+  //
+  // 'queued for titling (N ahead)' and 'master rendered; titling failed'
+  // REMOVED from this contract 2026-08-28 (backend titling removal, owner
+  // directive: "remove and disable the backend titling function"). Both
+  // were emitted ONLY by the in-process titling call in routes/ads.js
+  // (the queue-depth diagnostic and the titling-failed terminal outcome),
+  // which is deleted along with the call — there is no more Remotion
+  // titling in-process to queue behind or fail. Confirmed zero remaining
+  // occurrences (grep across every file this contract scans; the sole
+  // surviving "queued for titling" substring is an unrelated
+  // bootRecoveryService.js console.log, not in the scanned list and not an
+  // adStage/renderStage write). Do not re-add either fragment without
+  // re-adding the code that produced it.
   ['titling ',                  'the active titling label'],
   ['face-safe crop',            'distinguishes cropping from titling in the tail'],
   ['uploading titled video',    'the last video step before done'],
   ['no titling (',              'deliberate bare-master ship — must not read as failure'],
   ['master video generation',   'the paid, slow step'],
   ['preparing video context',   'pre-master, otherwise a bare Queued'],
-  ['master rendered; titling failed', 'terminal video verdict'],
   ['deriving layout',           'first static step'],
   ['plate submit',              'the billable static submit'],
   ['vision QC',                 'static quality gate'],
@@ -148,7 +159,7 @@ const STAGE_CONTRACT = [
 ok('C1 every stage string the UI maps still exists in the backend', () => {
   const sources = ['routes/ads.js', 'services/atlasImageService.js', 'services/atlasVideoService.js',
     'services/brandScriptExecutor.js', 'services/directImageRenderService.js',
-    'services/renderService.js', 'services/titlingResumeService.js']
+    'services/renderService.js']
     .map(read).join('\n');
   const missing = STAGE_CONTRACT.filter(([frag]) => !sources.includes(frag));
   assert.strictEqual(missing.length, 0,
@@ -158,13 +169,14 @@ ok('C1 every stage string the UI maps still exists in the backend', () => {
 
 ok('C2 "done" remains the exact terminal sentinel', () => {
   // The UI treats `renderStage === 'done'` as "not in progress". Any drift here
-  // makes every finished ad render as still working.
+  // makes every finished ad render as still working. Used to also assert
+  // services/titlingResumeService.js stamped the same literal on its own
+  // success path — that file is deleted (backend titling removal,
+  // 2026-08-28); routes/ads.js is now the only writer of this sentinel on
+  // the video path.
   const src = stripComments(read('routes/ads.js'));
   assert.ok(/adStage\(adId,\s*'done'\)/.test(src),
     "routes/ads.js must still stamp the literal 'done'");
-  const resume = stripComments(read('services/titlingResumeService.js'));
-  assert.ok(/renderStage:\s*'done'/.test(resume),
-    "titlingResumeService must stamp the same literal on its success path");
 });
 
 ok('C3 adStage still writes renderStageAt beside renderStage', () => {

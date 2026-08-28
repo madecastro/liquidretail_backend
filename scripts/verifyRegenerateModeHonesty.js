@@ -109,7 +109,7 @@ function loadServiceWithStubs() {
 
   const calls = {
     generateForAd: 0, prepareStoryboard: 0, renderDirectImage: 0,
-    chrome: 0, stages: [], log: [], unstubbed: []
+    chrome: 0, qc: 0, stages: [], log: [], unstubbed: []
   };
 
   const videoAd = {
@@ -139,8 +139,12 @@ function loadServiceWithStubs() {
     MODEL_CAPS: {}
   });
   need('./brandScriptExecutor', {
+    // renderBrandScriptAndSave is kept on the stub (never expected to be
+    // called after the 2026-08-28 titling removal — see B6) so a stray
+    // call fails loudly as "is not a function" would if it were dropped
+    // entirely by mistake, rather than silently no-op'ing.
     renderBrandScriptAndSave: async () => { calls.chrome++; return { skipped: false }; },
-    qcAndStampVideoAd: async () => ({})
+    qcAndStampVideoAd: async () => { calls.qc++; return {}; }
   });
   need('./cloudinaryService',        { uploadBufferToCloudinary: async () => ({ secure_url: 'https://cdn/x.png' }) });
   need('./directImageRenderService', { renderDirectImage: async () => { calls.renderDirectImage++; return { url: 'https://cdn/i.png' }; } });
@@ -242,10 +246,18 @@ async function groupB() {
   check('B5 mode:light on a video ad submits EXACTLY ONE billable video generation',
     calls.generateForAd === 1, `generateForAd=${calls.generateForAd}`);
 
-  // Chrome ran as well, so "otherwise only the chrome regenerates" never even
-  // described a cheaper subset — it described a strict subset of what ran.
-  check('B6 chrome/titling also ran, so light was never a subset of this path',
-    calls.chrome === 1, `chrome=${calls.chrome}`);
+  // CORRECTED 2026-08-28 (backend titling removal, owner directive: "remove
+  // and disable the backend titling function"). This used to assert chrome
+  // (renderBrandScriptAndSave) ran once, so "otherwise only the chrome
+  // regenerates" never even described a cheaper subset — it described a
+  // strict subset of what ran. runVideoFull no longer calls
+  // renderBrandScriptAndSave at all (brand or no brand); it always ships
+  // the raw regenerated master through qcAndStampVideoAd instead. The money
+  // point survives unchanged: mode:'light' still buys a full video worth of
+  // work (Omni submit above, plus this vision-QC pass), not a cheaper
+  // subset.
+  check('B6 chrome/titling never runs any more (backend titling removed) — qcAndStampVideoAd ran instead',
+    calls.chrome === 0 && calls.qc === 1, `chrome=${calls.chrome} qc=${calls.qc}`);
 }
 
 // ── C — the route reports the mode it will RUN, never the one asked for ───
