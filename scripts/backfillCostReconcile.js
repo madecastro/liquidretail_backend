@@ -61,7 +61,7 @@
 const mongoose = require('mongoose');
 const axios = require('axios');
 const CostLog = require('../models/CostLog');
-const { confirmedCharge, SETTLED_POLL_STATUSES, TERMINAL_OK_STATUSES } = require('../services/atlasVideoService');
+const { confirmedCharge, isPublishedPrice, SETTLED_POLL_STATUSES, TERMINAL_OK_STATUSES } = require('../services/atlasVideoService');
 const { reconcileCost } = require('../services/costTracker');
 
 // Atlas WAFs default python-urllib/curl/axios user agents with a 403 — see
@@ -132,7 +132,11 @@ function classifyRow({ httpStatus, data }) {
   if (TERMINAL_OK_STATUSES.has(status)) {
     const raw = data.price;
     const n = Number(raw);
-    if (raw !== undefined && raw !== null && raw !== '' && Number.isFinite(n) && n >= 0) {
+    // MONEY: isPublishedPrice decides by TYPE, never by coercion. The previous
+    // test admitted anything Number() could turn into a finite number, so
+    // `price: []` (Number([]) === 0) wrote a settled $0 over a real estimate
+    // and `price: [5]` wrote $5. See its doc comment in atlasVideoService.
+    if (isPublishedPrice(raw) && n >= 0) {
       return { action: 'reconcile', costUsd: n, costSource: 'actual' };
     }
     // Delivered successfully but Atlas has not (yet, or ever, for an old

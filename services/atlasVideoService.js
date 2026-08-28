@@ -3141,13 +3141,49 @@ function resolveFailureCostReconcile({ chargeConfirmed, chargePriceUsd } = {}) {
   return null;
 }
 
+/**
+ * Is `raw` a price Atlas actually PUBLISHED, as opposed to an absent or
+ * malformed one? Decides by TYPE and literal form, never by coercion.
+ *
+ * MONEY. `Number()` collapses several non-prices onto a real-looking figure:
+ *
+ *   Number([])   === 0     Number([5])    === 5     Number(false) === 0
+ *   Number(true) === 1     Number(' ')    === 0     Number('\n')  === 0
+ *
+ * Anything reaching an `n > 0` or `n >= 0` test through one of those is a
+ * settled figure invented out of a value that was never a price.
+ *
+ * A JSON number is not sufficient on its own: Atlas sends `price` as a
+ * STRING (measured "0.9", "0.75" — see parseAtlasSettledPrice below), so a
+ * number-only rule would reject every real price. A numeric string is
+ * accepted, but only as a well-formed literal — a string that is empty or
+ * whitespace is an ABSENT price wearing a string's type.
+ */
+function isPublishedPrice(raw) {
+  if (typeof raw === 'number') return Number.isFinite(raw);
+  if (typeof raw === 'string') {
+    if (raw.trim() === '') return false;
+    return Number.isFinite(Number(raw));
+  }
+  return false;
+}
+
 function confirmedCharge(data) {
   const status = String(data?.status || '').toLowerCase();
   if (!SETTLED_POLL_STATUSES.has(status)) return { charged: null, priceUsd: null };
   const raw = data.price;
-  if (raw === undefined || raw === null || raw === '') return { charged: false, priceUsd: 0 };
+  // ABSENT on a settled record. Measured rule: Atlas refunds failures, so a
+  // missing price on a terminal record means unbilled. Whitespace-only counts
+  // as absent — otherwise Number(' ') === 0 reads as a published zero.
+  if (raw === undefined || raw === null || (typeof raw === 'string' && raw.trim() === '')) {
+    return { charged: false, priceUsd: 0 };
+  }
+  // MALFORMED is not the same as absent. An array / object / boolean where a
+  // price belongs tells us nothing, so never derive a verdict from it — fall
+  // into the same "unknown" bucket as an unparseable number. Previously
+  // `price: [5]` returned charged:true/$5 and `price: true` charged:true/$1.
+  if (!isPublishedPrice(raw)) return { charged: null, priceUsd: null };
   const n = Number(raw);
-  if (!Number.isFinite(n)) return { charged: null, priceUsd: null };
   return { charged: n > 0, priceUsd: n };
 }
 
@@ -4586,6 +4622,7 @@ module.exports = {
   // exposed for verify harnesses (Claude-5-era provider-fault retry gate)
   mayRetryAfterFailure,
   confirmedCharge,
+  isPublishedPrice,
   // Shared tri-state cost-reconcile decision for a FINAL video failure — used
   // here and (via delegation) by bootRecoveryService.resolveRecoveredVideoFailureCharge.
   resolveFailureCostReconcile,
