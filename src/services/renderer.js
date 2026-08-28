@@ -662,6 +662,7 @@ async function alertOrphanedClaimsOnBoot() {
 let stopping = false;
 let titlingResumeSweep = null;   // set by run(), stopped by shutdown()
 let bootRecoverySweep  = null;   // set by run(), stopped by shutdown()
+let costReconcileSweep = null;   // set by run(), stopped by shutdown()
 let regenerateConsumer = null;   // set by run(), stopped by shutdown()
 
 async function claimOne() {
@@ -2538,6 +2539,66 @@ function startTitlingResumeSweep() {
   };
 }
 
+// Durable cost-reconcile sweep. The in-process setTimeout chain in
+// atlasImageService.scheduleCostReconcile / atlasVideoService.scheduleVideoCostReconcile
+// is the only mechanism that upgrades a charge-point CostLog row from
+// costSource:'estimated' to Atlas's settled price. That chain dies with
+// the process (deploy SIGTERM, OOM, crash) anywhere in its ~8.7 min
+// window, leaving the row estimated forever — frequently ~33% HIGH
+// (video MODEL_CAPS) or ~7x LOW (image base_price). This sweep is the
+// durable backstop: it re-finds those rows in CostLog (no new schema)
+// and peeks the free Atlas GET.
+//
+// Money-safe by construction (see costReconcileSweep.js header):
+//   - only a free GET, never a billable POST
+//   - write is costTracker.reconcileCost, which only upgrades
+//     costSource:'estimated' (already-actual is a no-op)
+//   - no claim/lease — two autoscaled instances racing the same row
+//     at worst both $set the identical settled price
+//
+// Gated on isAdgenRendererEnabled() — same rationale as the other two
+// sweeps: when the flag is OFF (rollback), the backend owns this
+// collection and adgen must stand down. Initial delay 60s so this tick
+// does not collide with boot-recovery (10s) or titling-resume (90s)
+// on every boot.
+function startCostReconcileSweep() {
+  const { sweepCostReconcile } = require('./costReconcileSweep');
+  const intervalMin = Math.max(1, parseInt(process.env.COST_RECONCILE_INTERVAL_MIN, 10) || 5);
+  let inFlightPass = false;
+  let timeoutHandle = null;
+  let intervalHandle = null;
+
+  const tick = () => {
+    if (stopping || inFlightPass) return;
+    if (!isAdgenRendererEnabled()) return;   // backend owns this collection right now
+    inFlightPass = true;
+    sweepCostReconcile()
+      .then((out) => {
+        if (out && out.considered > 0) {
+          console.log(
+            `renderer[${WORKER_ID}]: cost reconcile — considered=${out.considered} ` +
+            `reconciled=${out.reconciled} stillPending=${out.stillPending} ` +
+            `reportedUnbilled=${out.reportedUnbilled} errors=${out.errors}`
+          );
+        }
+      })
+      .catch(err => console.warn(`renderer[${WORKER_ID}]: cost reconcile failed — ${err.message}`))
+      .finally(() => { inFlightPass = false; });
+  };
+
+  timeoutHandle = setTimeout(tick, 60 * 1000);
+  intervalHandle = setInterval(tick, intervalMin * 60 * 1000);
+  if (typeof timeoutHandle.unref === 'function') timeoutHandle.unref();
+  if (typeof intervalHandle.unref === 'function') intervalHandle.unref();
+
+  return {
+    stop() {
+      clearTimeout(timeoutHandle);
+      clearInterval(intervalHandle);
+    }
+  };
+}
+
 async function run() {
   const gated = isAdgenRendererEnabled();
   console.log(
@@ -2575,9 +2636,10 @@ async function run() {
   }, 30_000).unref();
   titlingResumeSweep = startTitlingResumeSweep();
   bootRecoverySweep  = startBootRecoverySweep();
+  costReconcileSweep = startCostReconcileSweep();
   // Ad-gen regenerate consumer (routing fix, 2026-08-26) — see
   // services/regenerateConsumer.js header for the full money argument.
-  // Own poll loop, own {stop()}, same lifecycle shape as the two sweeps
+  // Own poll loop, own {stop()}, same lifecycle shape as the sweeps
   // above; not folded into poll()/claimOne() above because its claim
   // filter is deliberately disjoint from the mint-time render claim.
   regenerateConsumer = require('./regenerateConsumer').start();
@@ -2604,6 +2666,7 @@ async function shutdown() {
   stopping = true;
   if (titlingResumeSweep) titlingResumeSweep.stop();
   if (bootRecoverySweep)  bootRecoverySweep.stop();
+  if (costReconcileSweep) costReconcileSweep.stop();
   // regenerateConsumer.stop() is ASYNC — it runs its own internal drain
   // (same SHUTDOWN_DRAIN_MS budget, read independently) and alerts if a
   // regenerate is still in flight when that budget expires (see that
