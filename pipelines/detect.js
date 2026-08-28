@@ -15,9 +15,11 @@
 //     video:  [yolo-video (hero-frame) → image pipeline on the hero JPEG]
 //              — whisper transcription + NER were removed 2026-08-17;
 //              captions are surface-level, the visual hero carries more
-//              product signal (services/whisperService + nerService
-//              retained for standalone use elsewhere, but not called from
-//              this pipeline).
+//              product signal. services/whisperService.js and
+//              services/nerService.js were deleted 2026-08-28 as confirmed
+//              dead code (the "retained for standalone use elsewhere" claim
+//              above did not hold up — zero callers existed anywhere in the
+//              repo).
 //
 //   crop-judge (sequential — judge depends on YOLO + subjects + crops)
 //     smart-crops → judge → CropArtifact persist

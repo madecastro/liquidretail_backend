@@ -10,8 +10,10 @@
 // on Atlas failure, generate/edit replay against direct OpenAI images
 // with the caller's fallbackModel (default gpt-image-1) when
 // OPENAI_API_KEY is present. Mask inpainting is NOT offered here at all
-// — no Atlas edit model accepts masks (schemas verified 2026-07-21), so
-// openaiImageService stays direct by design.
+// — no Atlas edit model accepts masks (schemas verified 2026-07-21), and
+// as of 2026-08-28 there is no mask-inpainting service in this repo at
+// all (services/openaiImageService.js, the prior owner of that
+// capability, was deleted as confirmed dead code — zero callers).
 //
 // Model IDs verified against the live catalog 2026-07-21:
 //   openai/gpt-image-1.5/text-to-image   (size/quality params)
@@ -734,8 +736,10 @@ function warnIfDoublePaying(err, kind) {
 /**
  * editImage({ prompt, images (Buffers or URLs, 1..10), size?, quality?,
  *             inputFidelity?, model?, fallbackModel?, meta? })
- * → { data: [{ b64_json }], url }. NO mask support — mask inpainting
- * stays on direct OpenAI (openaiImageService) by design.
+ * → { data: [{ b64_json }], url }. NO mask support — no Atlas edit model
+ * accepts masks, and there is no direct-provider fallback for it either
+ * (services/openaiImageService.js, the prior mask-inpainting service, was
+ * deleted 2026-08-28 as confirmed dead code — zero callers).
  */
 async function editImage({
   prompt, images = [], size, quality, inputFidelity, model, fallbackModel,
