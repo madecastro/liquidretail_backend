@@ -19,6 +19,11 @@
 // instead of a duration-derived plan) — added for
 // services/videoQcFrameSelectionService.js's dense pre-filter, which needs
 // to fetch a caller-supplied timestamp list rather than re-deriving one.
+//
+// planAdditionalTimestamps / buildAdditionalFrameUrls are similarly additive
+// (gap-midpoint extra samples for basePlateCropService's one-shot
+// face-quorum retry). They reuse evenlySpaced / round1 / dedupeSorted;
+// planTimestamps itself is unchanged.
 
 const axios = require('axios');
 
@@ -152,6 +157,74 @@ function buildFrameUrlsAtTimestamps(videoUrl, timestamps, opts = {}) {
     .sort((a, b) => a.timestampSec - b.timestampSec);
 }
 
+/**
+ * Additional timestamps that sit in the gaps of an already-sampled plan.
+ * Reuses evenlySpaced (the same midpoint/even-grid primitive as
+ * planDenseTimestamps) — does NOT change planTimestamps.
+ *
+ * Places `count` new points at the midpoints of the largest gaps between
+ * existing samples (including [0, first] and [last, duration]), never
+ * repeating an already-sampled timestamp. Equal-size gaps (typical 8s
+ * reel quartile plan) are picked evenly along the timeline so two of
+ * four land at the first AND last gap (around the existing samples)
+ * rather than clustering in the first half.
+ */
+function planAdditionalTimestamps(durationSec, existingTimestamps, count) {
+  const d = Number(durationSec);
+  const n = Number(count);
+  if (!Number.isFinite(d) || d <= 0) return [];
+  if (!Number.isInteger(n) || n < 1) return [];
+
+  const existing = dedupeSorted(existingTimestamps || [], d);
+  const bounds = [0, ...existing, d];
+  const gaps = [];
+  for (let i = 0; i < bounds.length - 1; i++) {
+    const start = bounds[i];
+    const end = bounds[i + 1];
+    if (!(end > start)) continue;
+    const [mid] = evenlySpaced(start, end, 1);
+    const r = round1(mid);
+    if (r > 0 && r < d && !existing.includes(r)) {
+      gaps.push({ start, end, size: end - start, mid: r });
+    }
+  }
+  if (!gaps.length) return [];
+
+  const maxSize = Math.max(...gaps.map((g) => g.size));
+  const top = gaps.filter((g) => g.size >= maxSize * 0.9);
+  const rest = gaps.filter((g) => g.size < maxSize * 0.9)
+    .sort((a, b) => b.size - a.size || a.start - b.start);
+
+  function pickEvenly(arr, k) {
+    if (k <= 0 || !arr.length) return [];
+    if (k >= arr.length) return arr.slice();
+    if (k === 1) return [arr[Math.floor(arr.length / 2)]];
+    const out = [];
+    const used = new Set();
+    for (let i = 0; i < k; i++) {
+      let idx = Math.round((i * (arr.length - 1)) / (k - 1));
+      while (used.has(idx) && idx < arr.length - 1) idx += 1;
+      while (used.has(idx) && idx > 0) idx -= 1;
+      if (used.has(idx)) continue;
+      used.add(idx);
+      out.push(arr[idx]);
+    }
+    return out;
+  }
+
+  const chosen = pickEvenly(top, n);
+  if (chosen.length < n) chosen.push(...rest.slice(0, n - chosen.length));
+  return chosen.map((g) => g.mid).sort((a, b) => a - b);
+}
+
+// Same as buildFrameUrls, but for timestamps that fill the gaps of an
+// already-sampled plan. `opts.count` is the number of extra stills.
+function buildAdditionalFrameUrls(videoUrl, durationSec, existingTimestamps, opts = {}) {
+  const count = Number.isInteger(opts.count) && opts.count > 0 ? opts.count : 0;
+  const stamps = planAdditionalTimestamps(durationSec, existingTimestamps, count);
+  return buildFrameUrlsAtTimestamps(videoUrl, stamps, opts);
+}
+
 // Shared fetch plumbing for a already-built frame-descriptor list. Each
 // frame is fetched independently and a 4xx on one frame doesn't poison
 // the batch.
@@ -194,9 +267,11 @@ module.exports = {
   DEFAULT_EARLY_WINDOW_SEC,
   planTimestamps,
   planDenseTimestamps,
+  planAdditionalTimestamps,
   buildFrameUrl,
   buildFrameUrls,
   buildFrameUrlsAtTimestamps,
+  buildAdditionalFrameUrls,
   fetchFrameBuffers,
   fetchFrameBuffersAtTimestamps
 };

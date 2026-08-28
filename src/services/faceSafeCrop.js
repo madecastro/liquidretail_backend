@@ -332,6 +332,20 @@ function unionBoxes(boxes) {
 const FACE_MIN_FRAMES = 2;
 
 /**
+ * Extra frames detectClipBoxes samples ONCE when the initial batch produces
+ * exactly one head (faceHits=1) but consensusFaceBox still returns null
+ * (quorum miss). 2 is enough to reach FACE_MIN_FRAMES if a real face is
+ * present in another still; it is NOT a loop, and it does not fire on
+ * faceHits=0 (true headless) or faceHits>=2 (already quorum).
+ *
+ * Lives here next to FACE_MIN_FRAMES so the two numbers that define "do we
+ * trust this head" stay in one file. The I/O that spends them is in
+ * detectClipBoxes — this module stays pure. Plain code constant, not env:
+ * this is a cost bound, not an operator knob.
+ */
+const FACE_QUORUM_RETRY_FRAMES = 2;
+
+/**
  * Union of the per-frame head boxes — but only once ENOUGH frames agree a head is there.
  *
  * WHY A QUORUM: a single hallucinated head box flips a headless product into face mode, and face
@@ -401,4 +415,5 @@ module.exports = {
   FACE_TOP_CROP_ALLOWANCE_FRAC,
   FACE_MAX_SUBJECT_AREA_FRAC,
   FACE_MIN_FRAMES,
+  FACE_QUORUM_RETRY_FRAMES,
 };

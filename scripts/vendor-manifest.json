@@ -1,8 +1,8 @@
 {
   "version": 2,
   "backendRef": "origin/main",
-  "backendHead": "abf7e0c2053d9e2d633cc3b3a62bad48531e3271",
-  "generatedAt": "2026-08-28T18:43:46.390Z",
+  "backendHead": "5d1cfc74cbc6ccd77e88f2eb70ee348d9e123700",
+  "generatedAt": "2026-08-28T19:53:10.615Z",
   "files": {
     "models/Ad.js": {
       "backendHash": "394d26a1cb8ad64b23bde73312f3473f332520dd9640b9d5e4bb8eec22d6138d",
@@ -818,12 +818,12 @@
     },
     "services/basePlateCropService.js": {
       "backendHash": "03d13d046489c24734fc54a97edb158ed9abc4f7ad03e2ec4a84c8b0ad3b6aeb",
-      "adgenHash": "b77f416431353b9da7231c0b108e964651007207de875030458d2350a1728c49",
+      "adgenHash": "54cc851d0d87014150cb1d68986ed5116a15d6aaf41b645ca4a742d91cdee1a9",
       "backendSha": "ba99a59f10619bbd940be9442c8852dc32ae278a",
-      "status": "fork",
-      "reason": "Backend #329 added productId: ad.productId || null to both detectClipBoxes call sites (resolveBasePlateVideoUrl, ensureFaceDetectionForKeepOut); adgen already threads campaignRunId/brandId/productId/adId through detectFrameBoxes/detectClipBoxes (basePlateCropService.js:398,442) and both call sites already pass productId: ad.productId || null (adgen #43) — verified byte-identical outcome for this hunk.",
-      "portTo": null,
-      "owedSince": null
+      "status": "unported",
+      "reason": "adgen-side change 2026-08-28: added a one-shot face-quorum-retry (detectClipBoxes samples FACE_QUORUM_RETRY_FRAMES=2 new gap-midpoint timestamps exactly once when head===null && initialHits===1, closing the measured 56/625 boundary-miss face-clip bug). Confirmed via traced call path (routes/brand.js runRetitleJob -> renderBrandScriptAndSave -> renderWithRemotionAndSave -> basePlateCropService.resolveBasePlateVideoUrl/ensureFaceDetectionForKeepOut) that backend's manual /retitle-videos admin flow still calls this exact code and DOES recompute a fresh crop on an Ad.basePlate cache miss (different format or source video) -- so backend's un-retried copy can still exhibit the same face-clip bug on that path, just at lower (manual-trigger-only) frequency than the primary adgen-generated volume this was measured against. Not ported in this PR -- flagged to the owner as a separate follow-up decision, not assumed out of scope.",
+      "portTo": "backend",
+      "owedSince": "2026-08-28T19:52:53.994Z"
     },
     "services/blockClassifier.js": {
       "backendHash": "505108cca42df8bb500c620f032f1455f9023fa6cd7b5e554672a4fe1cb5d893",
@@ -1139,11 +1139,12 @@
     },
     "services/faceSafeCrop.js": {
       "backendHash": "986126268359d4f9d28f8b8075e930689a541cf369025ffbe83c9a2f61cf90a5",
-      "adgenHash": "986126268359d4f9d28f8b8075e930689a541cf369025ffbe83c9a2f61cf90a5",
+      "adgenHash": "17d617868dc4334c1b922f79b21b690bedee79ef3808c622032f77623683d64f",
       "backendSha": "1a50b5b3611836cf7489971871f66d9080d1c4a0",
-      "status": "synced",
-      "portTo": null,
-      "owedSince": null
+      "status": "unported",
+      "reason": "adgen-side change 2026-08-28: added FACE_QUORUM_RETRY_FRAMES=2 constant (paired with basePlateCropService.js's new retry -- see that file's manifest entry for the full rationale and the confirmed-live backend manual-retitle call path). consensusFaceBox/FACE_MIN_FRAMES unchanged. Same port-to-backend follow-up question as basePlateCropService.js.",
+      "portTo": "backend",
+      "owedSince": "2026-08-28T19:53:02.477Z"
     },
     "services/fontClassification.js": {
       "backendHash": "4bfdfad23281c4a29f8306dc91d9bbc774b5d7f226bf6c600aa320fd20ea3364",
@@ -1873,11 +1874,12 @@
     },
     "services/videoFrameService.js": {
       "backendHash": "de07c2f311c16c97b9fd08103a5fdf1165999ad2f9a9b8a2ba407cc5da95607c",
-      "adgenHash": "de07c2f311c16c97b9fd08103a5fdf1165999ad2f9a9b8a2ba407cc5da95607c",
+      "adgenHash": "8834a11395e44d3a75b78855b02d20a97fd895592faddf99fbfda2841624b894",
       "backendSha": "b06248af38a4e88139c5c0fd438b997ff7084b55",
-      "status": "synced",
-      "portTo": null,
-      "owedSince": null
+      "status": "unported",
+      "reason": "adgen-side change 2026-08-28: added planAdditionalTimestamps/buildAdditionalFrameUrls (gap-midpoint extra-frame sampling for basePlateCropService's new one-shot face-quorum retry -- see that file's manifest entry). planTimestamps/buildFrameUrls/existing exports unchanged. Same port-to-backend follow-up question as basePlateCropService.js.",
+      "portTo": "backend",
+      "owedSince": "2026-08-28T19:53:10.614Z"
     },
     "services/videoHeadlineService.js": {
       "backendHash": "568b6409d5c81f8290aea4f9566294ab3b65e55fa5e1f5df2fad903b704eaa46",

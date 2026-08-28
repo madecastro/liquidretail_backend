@@ -44,22 +44,28 @@
  *                          centre crop. Only a face-verified rect may replace the plate.
  *   liveness               range-GET on the derived URL must return 200/206 before it is trusted.
  *
- * COST: ~4 vision calls per ad that ACTUALLY NEEDS a crop (~$0.02, ledgered automatically via
- * chatCompletion -> trackLlmCall). $0 for cached re-titles (Ad.basePlate). $0 for every gated-out
- * ad. $0 on the crop path when cropCouldBeNeeded is false (full-frame 9:16→9:16 / 16:9→16:9).
- * Title keep-out may still pay detectClipBoxes ONCE if facesComputed is not already on the ad —
- * that answers "where are the heads", not "do we need a crop", and is not a second crop-decision
- * submit. No ffmpeg, no video download — frames are Cloudinary so_<sec> stills at the CDN edge.
+ * COST: 3-4 vision calls per ad that ACTUALLY NEEDS a crop (~$0.02, ledgered automatically via
+ * chatCompletion -> trackLlmCall). planTimestamps({isReel:true}) yields 1 still (tiny ≤4s), 3
+ * (typical 8s reel; the default durationSec), or at most 4 (long reel). Boundary-miss retry
+ * (head===null AND faceHits===1, measured ~9% of crop-eligible ads): +FACE_QUORUM_RETRY_FRAMES
+ * (2) extra vision calls, ONCE, on new timestamps — worst case 4+2=6 calls (~$0.03). 0-hit ads
+ * and already-quorum ads do not pay the retry. $0 for cached re-titles (Ad.basePlate). $0 for
+ * every gated-out ad. $0 on the crop path when cropCouldBeNeeded is false (full-frame 9:16→9:16
+ * / 16:9→16:9). Title keep-out may still pay detectClipBoxes ONCE if facesComputed is not
+ * already on the ad — that answers "where are the heads", not "do we need a crop", and is not a
+ * second crop-decision submit. No ffmpeg, no video download — frames are Cloudinary so_<sec>
+ * stills at the CDN edge.
  */
 
 const axios = require('axios');
 const sharp = require('sharp');
 const Ad = require('../models/Ad');
 const { chatCompletion } = require('./atlasLlmService');
-const { buildFrameUrls } = require('./videoFrameService');
+const { buildFrameUrls, buildAdditionalFrameUrls } = require('./videoFrameService');
 const { aspectRatioForPlatformFormat } = require('./platformFormats');
 const {
   computeGravityCropRect, parseAspect, windowFor, unionBoxes, consensusFaceBox,
+  FACE_QUORUM_RETRY_FRAMES,
 } = require('./faceSafeCrop');
 const {
   buildVideoCropUrl, isTransformableVideoUrl, hasExistingCropTransform,
@@ -433,6 +439,12 @@ async function detectFrameBoxes(frameUrl, { campaignRunId = null, brandId = null
  * Returns { subject, head, frames, faceHits, envelope, faceSamples } —
  * head is null without a quorum.
  *
+ * `frames` and `faceHits` count the COMBINED sample: the initial
+ * planTimestamps batch plus, when the boundary-miss retry fired,
+ * FACE_QUORUM_RETRY_FRAMES extra timestamps. This is what Ad.basePlate.frames
+ * / .faceHits persist, so production diagnostics see the actual vision-call
+ * count (not first-pass-only). faceSamples is the same combined set.
+ *
  * faceSamples: [{ atSec, face }] per sampled still (face may be null).
  * Coordinate space: face boxes are NORMALIZED FRACTIONS 0..1 of the
  * SOURCE frame (see DETECT_SYSTEM_PROMPT) — not pixel rects. Stills are
@@ -440,8 +452,10 @@ async function detectFrameBoxes(frameUrl, { campaignRunId = null, brandId = null
  * frame, so no pixel conversion is needed for keep-out mapping.
  */
 async function detectClipBoxes(sourceUrl, durationSec, { campaignRunId = null, brandId = null, productId = null, adId = null, ...meta } = {}) {
-  const frames = buildFrameUrls(sourceUrl, durationSec, { width: 640, isReel: true });
-  if (!frames.length) {
+  const frameOpts = { width: 640, isReel: true };
+  const detectMeta = { campaignRunId, brandId, productId, adId, ...meta };
+  const initialFrames = internals.buildFrameUrls(sourceUrl, durationSec, frameOpts);
+  if (!initialFrames.length) {
     return { subject: null, head: null, frames: 0, faceHits: 0, envelope: null, faceSamples: [] };
   }
 
@@ -449,12 +463,38 @@ async function detectClipBoxes(sourceUrl, durationSec, { campaignRunId = null, b
   // Serial, deliberately: 3-4 frames, and vision RPS buckets are shared with the rest of the
   // pipeline. Latency (~2-6s total) is fine — this runs post-generation, pre-titling, not in any
   // interactive request path.
-  for (const f of frames) results.push(await detectFrameBoxes(f.url, { campaignRunId, brandId, productId, adId, ...meta }));
+  for (const f of initialFrames) {
+    results.push(await internals.detectFrameBoxes(f.url, detectMeta));
+  }
 
-  const frameBoxes = results.map((r) => r?.subject ?? null);
-  const frameFaces = results.map((r) => r?.face ?? null);
+  let frames = initialFrames;
+  let frameBoxes = results.map((r) => r?.subject ?? null);
+  let frameFaces = results.map((r) => r?.face ?? null);
+  let head = consensusFaceBox(frameBoxes, frameFaces);
+  const initialHits = frameFaces.filter(Boolean).length;
+
+  // Boundary miss: exactly one sampled frame found a head, but quorum still
+  // failed (detectedFrames > 1, so consensusFaceBox's single-detection
+  // exception did not fire). Sample FACE_QUORUM_RETRY_FRAMES new timestamps
+  // ONCE — no loop, no recursive retry. 0-hit (true headless) and already-
+  // quorum (>=2) ads must not pay these extra vision calls.
+  if (head === null && initialHits === 1) {
+    const extra = internals.buildAdditionalFrameUrls(
+      sourceUrl,
+      durationSec,
+      initialFrames.map((f) => f.timestampSec),
+      { ...frameOpts, count: FACE_QUORUM_RETRY_FRAMES },
+    );
+    for (const f of extra) {
+      results.push(await internals.detectFrameBoxes(f.url, detectMeta));
+    }
+    frames = initialFrames.concat(extra);
+    frameBoxes = results.map((r) => r?.subject ?? null);
+    frameFaces = results.map((r) => r?.face ?? null);
+    head = consensusFaceBox(frameBoxes, frameFaces);
+  }
+
   const subject = unionBoxes(frameBoxes);
-  const head = consensusFaceBox(frameBoxes, frameFaces);
   const envelope = unionBoxes(frameFaces);
   const faceSamples = frames.map((f, i) => ({
     atSec: f.timestampSec,
@@ -512,9 +552,12 @@ async function probeUrlLive(url) {
 // a no-op — verifyFaceKeepOut B2/B3 already stub this way.
 const internals = {
   detectClipBoxes,
+  detectFrameBoxes,
   measureDeliveryDims,
   probeUrlLive,
   cropCouldBeNeeded,
+  buildFrameUrls,
+  buildAdditionalFrameUrls,
 };
 
 // ── orchestrator ───────────────────────────────────────────────────────────────────────────────
