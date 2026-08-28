@@ -447,10 +447,269 @@ async function deriveFirstCatalogMediaId({ productId, brandId }) {
   return null;
 }
 
+// ── The in-flight-render gate (MONEY) ─────────────────────────────────
+//
+// Returns a refusal `{ arm, message }` when starting a regenerate on this ad
+// would put a second billable provider submit against work the ad has already
+// bought or is about to buy — otherwise null.
+//
+// This is the adgen side of the same rule liquidretail_backend enforces in its
+// own copy of preflight() (PR #349). The two MUST agree: they are one money
+// rule on two sides of a repo boundary, and the transition plan moves this
+// path here. Arms and reasoning are deliberately kept in the same order as
+// backend's so a reader can diff them.
+//
+// ── THE THREE REFUSED SHAPES ──
+//
+// 1. `status:'rendering'` — the first-time render's own claim. renderer.js has
+//    claimed the row (or released it for resume) with a provider submit
+//    possibly outstanding; a regenerate here submits a second one concurrently
+//    against the same Ad document.
+//
+// 2. `status:'queued'` — and this one is a DETERMINISTIC double charge, not a
+//    race. Because the regenerate path never writes `Ad.status` (see below),
+//    the row STAYS `'queued'` after the regenerate has already paid for a
+//    plate — so backend's `claimAdsForRun` ({status:'queued'} → 'rendering')
+//    subsequently claims it and adgen's renderer renders it AGAIN. Two
+//    submits, guaranteed, no interleaving required.
+//
+// 3. A paid video master still owed titling — every shape
+//    titlingResumeService.buildResumeFilter sweeps: the explicit
+//    `pending`/`claimed` stamp, AND its third (migration) arm, a `'draft'`
+//    holding `veoVideoUrl` with `renderUrl` still null, which carries no stamp
+//    at all. Those rows hold an Omni master that is PAID FOR and has never
+//    been delivered; a regenerate throws it away and buys another, and races
+//    the titling sweep for the same fields (both write renderUrl/status).
+//    The arms are read off buildResumeFilter itself rather than restated, so a
+//    fourth arm added there is honoured here automatically. The staleness
+//    sub-condition on arm 2 is deliberately IGNORED for refusal purposes: a
+//    `claimed` row is titling-in-flight whether or not the claim has gone
+//    stale.
+//
+// Still regenerable, unchanged: a titled `'draft'`, `'live'`, `'failed'`,
+// `'archived'`.
+//
+// ⚠️ I ORIGINALLY SCOPED ARM 3 OUT, and was wrong. The reasoning was that no
+// billable provider submit is reachable from the titling path
+// (scripts/verifyTitlingResumeNeverResubmits.js proves atlasVideoService is
+// unreachable from titlingResumeService's transitive require graph), so a
+// regenerate there could only be the operator's own intended fresh submit.
+// That is true and it is not the whole exposure: it addresses the
+// double-SUBMIT axis only, and misses that the row holds an already-paid,
+// never-delivered master which the regenerate discards, plus the concurrent
+// clobber of the same fields. Recorded because the narrow reading is the
+// tempting one.
+//
+// WHY STATUS IS THE SIGNAL, AND WHY IT CANNOT SELF-TRIP. The regenerate path
+// NEVER writes `Ad.status`: every `status:` write in this file targets a
+// `regenerationHistory` entry, not the Ad. So this gate can never refuse a
+// regenerate because of a regenerate. Every terminal render write moves the
+// row to `'draft'`/`'failed'`, so a delivered, settled ad is never sitting at
+// `'rendering'`.
+//
+// ⚠️ REJECTED — keying on the spend receipt, which looks like the more
+// money-relevant signal and is not. No site in either repo ever CLEARS
+// `veoPredictionId` or `imageGeneration.predictionId`; they are stamped at
+// submit and kept as the record of the charge. So a receipt means "has ever
+// spent", not "is spending now": a receipt-keyed guard refuses every
+// successfully-rendered draft/live ad and every failed video ad, while still
+// PERMITTING `'queued'` and receipt-free `'rendering'` — the two pre-submit
+// shapes where the double bill is actually reachable. Backend measured the
+// same alternative by execution at 6-of-10 wrong. Worse, models/Ad.js's
+// `renderRequeued` comment records that the receipt is written only AFTER the
+// billable POST returns ("a genuinely-billed ad is receipt-free for one HTTP
+// round-trip"), so a receipt-keyed gate is OPEN in the window a double submit
+// costs the most. Swept over realistic row shapes in
+// scripts/verifyRegenerateInFlightGate.js group F.
+//
+// ⚠️ REJECTED — additionally requiring an empty `renderUrl` to mean "hasn't
+// delivered yet". renderer.js's video-master persist (`$setMaster`) stamps
+// `renderUrl` with the paid Omni master while leaving `status` at
+// `'rendering'` for the titling pass, so "rendering AND renderUrl empty"
+// would exempt a $1.20–$5.00 Omni master mid-titling — the single most
+// expensive in-flight state in the system.
+//
+// ⚠️ REJECTED — a stale-claim escape hatch, even though rows genuinely do get
+// stranded here (scripts/verifyTitlerClaimReclaim.js records three dead
+// workers holding eight video ads, `claimedAt` 27 min to 14.7h stale, and
+// regenerating such a row is a real operator need). renderer.js CAPS its own
+// ad heartbeat at `AD_HEARTBEAT_MAX_MS` (~60.8 min, renderer.js:322-328) and
+// then stops beating while KEEPING the claim, so a genuinely-live long render
+// is indistinguishable from a dead one by the orphan thresholds. Those exist
+// to PAGE A HUMAN; a paging heuristic must not double as authorization to
+// spend, and the ads it would misjudge are the longest-running, i.e. the most
+// expensive. Stranded rows are moved off these states by the sweeps that own
+// them — bootRecoveryService for receipt-holding rows, backend's reaper for
+// receipt-free ones, titlingResumeService for untitled masters. The residual
+// cost is named honestly: while a row is stranded, this gate refuses
+// regenerates on it until a sweep resolves it. The refusal messages say so
+// rather than inviting a retry loop.
+function inFlightRefusal(ad) {
+  if (!ad) return null;
+
+  if (ad.status === 'rendering') {
+    return {
+      arm:     'rendering',
+      message: 'This ad is still completing its first render — regenerating now '
+             + 'would bill a second provider submit for the same ad. Wait for '
+             + 'the render to finish (or fail), then regenerate.'
+    };
+  }
+
+  if (ad.status === 'queued') {
+    return {
+      arm:     'queued',
+      message: 'This ad has not been rendered yet — it is queued. Regenerating '
+             + 'now would pay for a plate and then be rendered again when the '
+             + 'queue reaches it, billing twice. Let the first render complete, '
+             + 'then regenerate.'
+    };
+  }
+
+  // Arm 3 — read the shapes off titlingResumeService's own sweep filter so the
+  // two cannot drift. Only the `status:'draft'` family is relevant; the
+  // staleness bound on the `claimed` arm is intentionally not applied here.
+  //
+  // FAILS CLOSED IF THE FILTER OUTGROWS THE MATCHER. matchesTitlingResumeArm
+  // throws rather than silently no-matching when buildResumeFilter gains a
+  // shape it cannot interpret (a dotted path, a new operator). That throw must
+  // not escape: this function is called from runClaimedRegeneration OUTSIDE its
+  // try block, so an exception would reach regenerateConsumer's
+  // "crashed outside performRegeneration" catch, which deliberately leaves the
+  // row locked (`regenerating:true`, claimed) with no retry — money-safe but a
+  // stuck row and a misleading log. Converting it to an ordinary REFUSAL keeps
+  // the fail-closed money property AND releases the lock with an actionable
+  // message. "Cannot evaluate the titling state" must never read as "not owed
+  // titling", because that would re-buy a paid master.
+  if (ad.status === 'draft') {
+    let owed;
+    try {
+      owed = matchesTitlingResumeArm(ad);
+    } catch (err) {
+      console.error(
+        `⚠️  inFlightRefusal: cannot evaluate titlingResumeService.buildResumeFilter `
+        + `— refusing the regenerate rather than risking a re-buy. ${err.message}`
+      );
+      return {
+        arm:     'titling-indeterminate',
+        message: 'This ad\'s titling state could not be determined, so the '
+               + 'regenerate was refused rather than risk discarding an '
+               + 'already-paid video master. This is a bug in the in-flight '
+               + 'gate, not a problem with the ad — it needs an engineer.'
+      };
+    }
+    if (owed) {
+      return {
+        arm:     'titling-owed',
+        message: 'This ad holds a paid video master that has not finished titling '
+               + 'yet — regenerating now would discard an already-paid master and '
+               + 'buy another, while the titling pass is still writing to this ad. '
+               + 'Wait for titling to complete, then regenerate.'
+      };
+    }
+  }
+
+  return null;
+}
+
+// True when `ad` matches any arm of titlingResumeService.buildResumeFilter's
+// `$or` (evaluated against the `status:'draft'` family only — the caller has
+// already established that). Derived from that filter object rather than
+// restating its arms, so a new arm there is covered here without an edit.
+// Only the two shapes that filter actually uses are interpreted — an equality
+// on a scalar, and `{$ne: null}` / `null` presence tests — and an arm using
+// anything else throws loudly rather than being silently treated as no-match,
+// which is how a hand-rolled matcher quietly stops gating (this repo hardened
+// four other matchers for exactly that reason in PR #80).
+function matchesTitlingResumeArm(ad) {
+  const { buildResumeFilter } = require('./titlingResumeService');
+  const arms = buildResumeFilter(new Date()).$or || [];
+  return arms.some(arm =>
+    Object.entries(arm).every(([field, cond]) => {
+      if (field.includes('.')) {
+        throw new Error(
+          `inFlightRefusal: titlingResumeService.buildResumeFilter arm uses a dotted `
+          + `path (${field}) this matcher does not resolve — update it rather than `
+          + `letting the titling gate silently stop matching.`
+        );
+      }
+      const val = ad[field];
+      if (cond === null) return val === null || val === undefined;
+      if (cond && typeof cond === 'object') {
+        if ('$ne' in cond && Object.keys(cond).length === 1) {
+          return cond.$ne === null ? (val !== null && val !== undefined) : val !== cond.$ne;
+        }
+        // `updatedAt: {$lt: cutoff}` — the staleness bound, deliberately not
+        // applied to a refusal (see arm 3's note). Treat as satisfied.
+        if ('$lt' in cond && Object.keys(cond).length === 1) return true;
+        throw new Error(
+          `inFlightRefusal: unsupported operator in buildResumeFilter arm `
+          + `(${field}: ${JSON.stringify(cond)}) — update this matcher.`
+        );
+      }
+      return val === cond;
+    })
+  );
+}
+
+// Fields inFlightRefusal actually reads. Shared so the execute-time select
+// and the late re-check cannot drop a field independently — a select that
+// omits one silently turns the gate into a no-op, which is worse than no gate.
+// `updatedAt` is deliberately absent: matchesTitlingResumeArm treats the
+// sweep's `$lt` staleness bound as satisfied without reading it.
+const IN_FLIGHT_SELECT = 'status titlingResumeState veoVideoUrl renderUrl';
+
+class InFlightRefusalError extends Error {
+  constructor(refusal) {
+    super(refusal.message);
+    this.name = 'InFlightRefusalError';
+    this.arm = refusal.arm;
+  }
+}
+
+// MONEY — the last in-flight re-check before a billable submit.
+//
+// A NEW find, deliberately not a reuse of runImage's `ad` / runVideoFull's
+// `ad1`. Those are un-narrowed full .lean() documents and WOULD carry these
+// fields, but they are loaded before the UGC / catalog-reseed /
+// prepareStoryboard awaits — reusing them would leave exactly the window this
+// exists to close.
+//
+// THROWS rather than returning. Both call sites sit inside their caller's
+// try, so a plain return would fall through to markComplete({status:'done'})
+// and report a refused regenerate as a success.
+async function assertNotInFlightBeforeSubmit(adId) {
+  const snap = await Ad.findById(adId).select(IN_FLIGHT_SELECT).lean();
+  if (!snap) throw new Error(`Ad ${adId} not found`);
+  const refusal = inFlightRefusal(snap);
+  if (refusal) throw new InFlightRefusalError(refusal);
+}
+
+// One ad-row unwind, shared by the execute-time gate and the late throw, so
+// the two cannot drift. Exactly ONE markComplete: a second call would no-op
+// against the already-stamped history slot and read as a bug later.
+// progressRun is null at the execute-time gate (startRun has not run yet) and
+// non-null after it, where the OperationRun must be failed or it sits in
+// 'running' until the stale-run sweeper gets to it.
+async function unwindInFlightRefusal(adId, startedAt, refusal, progressRun = null) {
+  console.log(
+    `🔀 regenerate-consumer[ad=${adId}]: refused at execute time — first-time render in flight (${refusal.arm})`
+  );
+  await markComplete(adId, {
+    status: 'failed',
+    durationMs: Date.now() - startedAt,
+    error: refusal.message
+  });
+  if (progressRun && typeof progressRun.fail === 'function') {
+    await progressRun.fail(refusal instanceof Error ? refusal : new Error(refusal.message));
+  }
+}
+
 // ── Public API ────────────────────────────────────────────────────────
 
-// Validate: not exported, not regenerating, under daily cap. Throws an
-// Error with .status (400/409/429) so the route can return clean codes.
+// Validate: not exported, not regenerating, not mid-first-render / queued /
+// owed-titling, under daily cap. Throws an Error with .status (400/409/429) so
+// the route can return clean codes.
 async function preflight(adId, brandId) {
   const ad = await Ad.findOne({ _id: adId, brandId }).lean();
   if (!ad) { const e = new Error('Ad not found');                         e.status = 404; throw e; }
@@ -490,6 +749,27 @@ async function preflight(adId, brandId) {
   }
   if (ad.regenerating) {
     const e = new Error('A regeneration is already in progress for this ad.');
+    e.status = 409; throw e;
+  }
+  // ⚠️ MONEY — the ad's own first-time render (or its queued place in line, or
+  // its unfinished titling) must not be raced by a regenerate. See
+  // inFlightRefusal for the three shapes and for the three narrower signals
+  // that were rejected.
+  //
+  // ⚠️ REACH — THIS FUNCTION IS NOT ON THE LIVE PATH IN THIS REPO. Its only
+  // caller is services/capabilityExecutors/adRegenerate.js, reachable only
+  // from services/capabilityRegistry.js, which nothing in src/ requires
+  // (scripts/verifyRequireGraph.js reports it unreferenced, and
+  // scripts/vendor-manifest.json records the executor as "only required from
+  // unused capabilityRegistry"). A real Regenerate press is gated by
+  // liquidretail_backend's copy of this function, which returns the
+  // user-facing 409 (backend PR #349). This arm is here for PARITY with that
+  // copy — it does not itself close a user-facing hole. The gate that actually
+  // fires in this repo is the execute-time one in runClaimedRegeneration
+  // below, on the deferred consumer path.
+  const inFlight = inFlightRefusal(ad);
+  if (inFlight) {
+    const e = new Error(inFlight.message);
     e.status = 409; throw e;
   }
   const since = Date.now() - 24 * 60 * 60 * 1000;
@@ -638,6 +918,13 @@ async function regenerateAd({
       await markComplete(adId, { status: 'failed', durationMs, error: 'cancelled by operator' });
       return;
     }
+    // A late in-flight refusal is not a crash. Route it through the SAME
+    // unwind the execute-time gate uses so the ad row settles identically,
+    // and so it cannot fall through into a second markComplete below.
+    if (err instanceof InFlightRefusalError) {
+      await unwindInFlightRefusal(adId, startedAt, err, progressRun);
+      return;
+    }
     console.error(`❌ regenerate[ad=${adId}]: failed after ${Math.round(durationMs / 1000)}s — ${err.message}`);
     await markComplete(adId, { status: 'failed', durationMs, error: err.message || String(err) });
     await progressRun.fail(err);
@@ -693,7 +980,34 @@ async function runClaimedRegeneration(ad, req = {}) {
   // provider call — same shape as the original preflight 409s, just
   // surfaced through regenerationHistory instead of an HTTP response
   // (nobody is holding an open connection to return a 409 to).
-  const staleCheck = await Ad.findById(adId).select('metaSyncStatus platformFormat deriveFromMaster').lean();
+  //
+  // ── AND the in-flight-render gate, which is a THIRD kind of staleness ──
+  // Unlike the cap and the `regenerating` lock, the ad's RENDER state can
+  // genuinely change while this request sits queued — and it is the one gate
+  // whose failure costs a duplicate provider submit rather than a stale
+  // decision. It is also the only gate on this path that fires at all: backend
+  // refuses these shapes at the 202 (PR #349), but minutes can pass between
+  // that check and this execution, during which the row can be reaper-requeued
+  // to 'queued', re-claimed to 'rendering', or land in titling. This is the
+  // LIVE adgen-side gate; preflight()'s copy above is parity-only.
+  //
+  // ⚠️ THIS IS NOT ENFORCED ON regenerateConsumer's CLAIM FILTER, deliberately.
+  // Making claimOne skip in-flight rows would leave the request stamped
+  // `regenerating:true` and unclaimed forever — a stuck row with no operator
+  // feedback, which is worse than a refusal. A queue consumer's correct shape
+  // is to claim, then refuse at execute time via markComplete so the lock is
+  // released and the reason lands in regenerationHistory. Backend's copy ANDs
+  // the rule into its atomic lock instead, because there a caller is still
+  // holding a connection that can receive the 409.
+  //
+  // ⚠️ `status` IS LOAD-BEARING IN THIS SELECT. Mongoose returns only projected
+  // paths, so dropping any field inFlightRefusal reads turns this gate into a
+  // silent no-op that still prints green. Pinned by group B of
+  // scripts/verifyRegenerateInFlightGate.js, which captures the select string
+  // at runtime and honours the projection.
+  const staleCheck = await Ad.findById(adId)
+    .select(`metaSyncStatus platformFormat deriveFromMaster ${IN_FLIGHT_SELECT}`)
+    .lean();
   if (staleCheck?.metaSyncStatus === 'synced') {
     console.log(`🔀 regenerate-consumer[ad=${adId}]: refused at execute time — exported to Meta while queued`);
     await markComplete(adId, {
@@ -709,6 +1023,16 @@ async function runClaimedRegeneration(ad, req = {}) {
       status: 'failed', durationMs: Date.now() - startedAt,
       error: `This ad is derived from the already-paid ${derivedFrom} master (it has no generation of its own) — regenerate that master instead.`
     });
+    return;
+  }
+  // ⚠️ MONEY — THE LIVE IN-FLIGHT-RENDER GATE. This is the one that actually
+  // fires in this repo (preflight()'s copy is parity-only — see its note).
+  // Placed after the two permanent refusals so those keep owning the message
+  // when both apply, and BEFORE progressService/startRun so a refusal costs
+  // nothing and leaves no orphan run.
+  const inFlight = inFlightRefusal(staleCheck);
+  if (inFlight) {
+    await unwindInFlightRefusal(adId, startedAt, inFlight);
     return;
   }
 
@@ -751,6 +1075,13 @@ async function runClaimedRegeneration(ad, req = {}) {
     if (err instanceof CancelledError) {
       console.log(`🔁 regenerate[ad=${adId}]: cancelled by operator after ${Math.round(durationMs / 1000)}s`);
       await markComplete(adId, { status: 'failed', durationMs, error: 'cancelled by operator' });
+      return;
+    }
+    // A late in-flight refusal is not a crash. Route it through the SAME
+    // unwind the execute-time gate uses so the ad row settles identically,
+    // and so it cannot fall through into a second markComplete below.
+    if (err instanceof InFlightRefusalError) {
+      await unwindInFlightRefusal(adId, startedAt, err, progressRun);
       return;
     }
     console.error(`❌ regenerate[ad=${adId}]: failed after ${Math.round(durationMs / 1000)}s — ${err.message}`);
@@ -871,6 +1202,11 @@ async function runVideoFull(adId, prompt, progressRun = null, videoModel = null,
     // submitting the new one the operator asked for and paid for — the
     // regenerate would appear to do nothing. See atlasVideoService.js's
     // shouldResumeAttempt doc comment for the full reasoning.
+    // MONEY — last gate before the billable Omni submit. Everything between
+    // runClaimedRegeneration's execute-time check and here (UGC, storyboard
+    // prep, a possible layout rebuild) is a yield the reaper / claimAdsForRun
+    // / titlingResumeService can win.
+    await assertNotInFlightBeforeSubmit(adId);
     veoResult = await veoService.generateForAd({
       ad: adForGen,
       operatorPrompt,
@@ -976,8 +1312,11 @@ function buildDirectImageArgsFromAd(ad, {
     // QC-driven) request for a genuinely NEW image, not a recovery of a
     // crashed prior attempt — it must never resume the ad's existing
     // imageGeneration.predictionId, which may still belong to a DIFFERENT,
-    // currently in-flight mint-time render of the same Ad (preflight() does
-    // not gate on ad.status). Both already default to this same safe shape
+    // currently in-flight mint-time render of the same Ad. (That concurrency
+    // is now itself refused up front — see inFlightRefusal — but this stays
+    // explicit: the two are independent guards, and allowResume:false is
+    // correct here on its own merits even with the gate in place.) Both
+    // already default to this same safe shape
     // inside renderDirectImage; stated here anyway so the invariant is
     // grep-able at the one call site that must never flip it, same as the
     // video path's convention.
@@ -1094,6 +1433,11 @@ async function runImage(adId, prompt, progressRun = null, promptOverride = null)
     }
   }
 
+  // MONEY — last gate before the billable image submit. Deliberately OUTSIDE
+  // the try below: a refusal is not a charged failure and must not be
+  // classified as one.
+  await assertNotInFlightBeforeSubmit(adId);
+
   let output;
   try {
     // Pure arg assembly is exported for the offline harness — if variantKind
@@ -1198,9 +1542,16 @@ async function markComplete(adId, { status, durationMs, error }) {
 module.exports = {
   preflight,
   regenerateAd,
+  // The in-flight-render gate, exported so scripts/verifyRegenerateInFlightGate.js
+  // executes the REAL rule rather than a reimplementation that keeps the name.
+  inFlightRefusal,
+  InFlightRefusalError,
   // Exported so the offline harness can assert the direct-image path
   // (no aiCanvasArtifactId precondition) without invoking providers.
   runImage,
+  // Symmetric with runImage: lets the harness drive the REAL video worker up
+  // to generateForAd without going through runClaimedRegeneration's early gate.
+  runVideoFull,
   // Pure arg assembly — verifyLifestylePreserve asserts variantKind is threaded.
   buildDirectImageArgsFromAd,
   DAILY_CAP,
