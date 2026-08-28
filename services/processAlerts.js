@@ -55,6 +55,37 @@ function flush(promise) {
   ]).catch(() => false);
 }
 
+// Evict the reframe billing claims THIS process holds, best-effort.
+//
+// WHY (2026-08-27). liquidretail_adgen had an active-claims registry and a
+// shutdown sweep; this repo had neither. So every backend process death —
+// twelve or more web deploys on 2026-08-27 alone — left this process's reframe
+// claims standing in Mongo with no live holder. Two such orphans, both with
+// dead holders, were found in production. Nothing recovered them but the ~20
+// min lease TTL, and until it expired every peer wanting that (media, aspect)
+// either waited out its claim-loser budget or shipped a CROPPED reference
+// where every other run got the generative one.
+//
+// Called from BOTH the crash handler and the signal handler: an
+// uncaughtException strands a claim exactly as thoroughly as a SIGTERM, so the
+// rule is that every path which persists orphans also evicts claims.
+//
+// Required lazily and never allowed to throw: atlasVideoService is a heavy
+// require, this module is loaded by both the web and worker entrypoints, and a
+// shutdown path must not be the thing that fails. Callers put this inside
+// flush(), so a hung Mongo cannot stall the exit.
+async function releaseReframeClaimsBestEffort(kind) {
+  try {
+    const atlasVideo = require('./atlasVideoService');
+    const cleared = await atlasVideo.releaseAllActiveReframeClaims();
+    if (cleared) console.log(`🔓 ${kind}: released ${cleared} reframe claim(s)`);
+    return cleared;
+  } catch (e) {
+    console.warn(`⚠️  ${kind}: reframe-claim release-on-shutdown failed — ${e && e.message}`);
+    return 0;
+  }
+}
+
 function inFlightFields() {
   const s = inFlight.snapshot();
   if (s.runCount === 0) return { fields: { 'in flight': 'nothing' }, detail: null };
@@ -279,7 +310,8 @@ function installProcessAlerts({ role = 'web' } = {}) {
           fields: { error: msg, ...fields },
           detail: [(thrown && thrown.stack) ? thrown.stack : msg, detail].filter(Boolean).join('\n\n')
         }),
-        persistOrphans({ signal: kind, role })
+        persistOrphans({ signal: kind, role }),
+        releaseReframeClaimsBestEffort(kind)
       ]));
     } catch (e) {
       try { console.error(`💥 ${kind} handler itself failed: ${e && e.message}`); } catch { /* ignore */ }
@@ -320,7 +352,9 @@ function installProcessAlerts({ role = 'web' } = {}) {
             fields: { signal: sig, ...fields },
             detail
           }),
-          persistOrphans({ signal: sig, role })
+          persistOrphans({ signal: sig, role }),
+          // Every deploy lands here. See releaseReframeClaimsBestEffort.
+          releaseReframeClaimsBestEffort(sig)
         ]));
       } catch (e) {
         try { console.error(`🛑 ${sig} handler failed: ${e && e.message}`); } catch { /* ignore */ }

@@ -963,6 +963,22 @@ Video never launches a browser.
   separately from `ingested` so a re-scan is never reported as having found new
   content; and **5f asserts the absence of the cap**, so wiring one in fails the
   harness and forces this bullet to be updated in the same commit.
+- **The reframe claim is evicted on shutdown, and its poll budget / lease floor
+  are INDEPENDENT constants (2026-08-27).** This repo had no
+  `_activeReframeClaims` registry and no shutdown sweep (adgen did), so every
+  process death — 12+ web deploys in a day — left reframe billing claims in Mongo
+  with no live holder (two live orphans measured); peers then cropped or waited out
+  the lease. Now swept in `processAlerts.js` on **both** the SIGTERM and crash
+  paths, inside the bounded `flush()`. Separately: `reframeReferenceForAspect`
+  called `pollPrediction(id)` with no options and so inherited the VIDEO ceiling by
+  omission — now an explicit `REFRAME_POLL_MS` (300s; measured reframe max is
+  232s, n=60). **Do NOT re-derive `REFRAME_CLAIM_TTL_FLOOR_MS` from any poll
+  ceiling** — that arithmetic link is the defect: it drifted this repo (20 min) from
+  adgen (25 min) over one shared `Media` claim, and its "+10 min" was already spent
+  (602.5s of bounded non-poll work → **−2.5s** real margin). Poll budget is a
+  latency choice; the floor is a money guard. Pinned by
+  `scripts/verifyReframeHoldBounded.js` (28 checks, revert-proven on 7 mutations).
+  Full write-up: `session.d/2026-08-27_reframe-hold-bounded.md`.
 - **Never leave a paid Omni master in `status:'rendering'`.** Stamp `draft`
   with `veoVideoUrl` before titling (`routes/ads.js:1258-1294`). Titling failure
   → `failed` + keep master; success/no-chrome → finished. Counting an untitled
