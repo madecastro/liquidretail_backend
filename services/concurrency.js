@@ -123,6 +123,16 @@ const SPEC = Object.freeze({
     ceiling: 'SELF-IMPOSED',
     why: 'Concurrent image fetches for zero-cost ingest-time shot-style classification. Per-sync wall-clock budget is separate (CATALOG_INGEST_SHOT_CLASSIFY_BUDGET_MS).'
   },
+  // Ingest-time YOLO+refine for catalog Media (services/catalogYoloDetectionService.js).
+  // Peer of CATALOG_ENRICHMENT_CONCURRENCY and CATALOG_INGEST_SHOT_CLASSIFY_CONCURRENCY.
+  CATALOG_YOLO_CONCURRENCY: {
+    env: 'CATALOG_YOLO_CONCURRENCY',
+    default: 6,
+    min: 1,
+    max: 32,
+    ceiling: 'SELF-IMPOSED',
+    why: 'Products in flight during catalog YOLO detection. Each product processes CATALOG_YOLO_ALT_LIMIT+1 Media serially, so effective HTTP load on yolo_microservice is CATALOG_YOLO_CONCURRENCY × (ALT_LIMIT+1) — with defaults 6 × 8 = 48 sequential calls per product wave. yolo_microservice today runs GUNICORN_WORKERS=2 so most requests queue there; raising here without raising there just moves the queue. YOLOv8x holds ~500MB RSS per worker — budget headroom before scaling the microservice.'
+  },
 
   // ── Hardcoded literals moved here (current behaviour as defaults) ───
   CAMPAIGN_BRIEF_CONCURRENCY: {

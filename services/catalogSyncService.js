@@ -433,6 +433,27 @@ async function syncCatalogForCred(cred, run = null) {
       .catch(err => console.warn(`   ⚠️  catalog enrichment enqueue failed: ${err.message}`))
   );
 
+  // Materialize hero + top-N alts as Media docs, then run YOLO+refine so
+  // Media.refinedProducts[] is populated for downstream consumers (reframe,
+  // videoProductAnchor, pmaxSplitStrategy, quoteProvenance) BEFORE ad-gen
+  // fires. Without this, reframe falls to paid nano-banana outpaint (~$0.08
+  // + 54s per master) at render time. Chained (materialize before YOLO)
+  // because YOLO detection reads Media docs that materialize creates.
+  // Fire-and-forget from sync-response POV; wrapped in backgroundWork so
+  // the OperationRun watchdog tracks it.
+  backgroundWork.push((async () => {
+    try {
+      await require('./catalogMediaMaterializeService').ensureBrandCatalogMediaMaterialized(brandId);
+    } catch (err) {
+      console.warn(`   ⚠️  catalog media materialize failed: ${err.message}`);
+    }
+    try {
+      await require('./catalogYoloDetectionService').enqueueBrandProductYoloDetection(brandId);
+    } catch (err) {
+      console.warn(`   ⚠️  catalog YOLO detect enqueue failed: ${err.message}`);
+    }
+  })());
+
   // JSON-LD category inference. Scrapes each product's productUrl for
   // BreadcrumbList structured data and builds the Category tree from
   // the brand's actual site collections — far richer than Meta's coarse

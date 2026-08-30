@@ -484,6 +484,23 @@ async function syncBrandGenericCatalog(brand, run, { isBrandAborted, categories 
         .catch(err => console.warn(`   ⚠️  ${LOG}  catalog enrichment enqueue failed: ${err.message}`))
     );
 
+    // Materialize + YOLO detect chain. Populates Media.refinedProducts[] so
+    // reframe / videoProductAnchor / pmaxSplitStrategy / quoteProvenance find
+    // subject bboxes at ad-gen time and skip the paid nano-banana outpaint.
+    // See services/catalogYoloDetectionService.js header for the full flow.
+    backgroundWork.push((async () => {
+      try {
+        await require('./catalogMediaMaterializeService').ensureBrandCatalogMediaMaterialized(brand._id);
+      } catch (err) {
+        console.warn(`   ⚠️  ${LOG}  catalog media materialize failed: ${err.message}`);
+      }
+      try {
+        await require('./catalogYoloDetectionService').enqueueBrandProductYoloDetection(brand._id);
+      } catch (err) {
+        console.warn(`   ⚠️  ${LOG}  catalog YOLO detect enqueue failed: ${err.message}`);
+      }
+    })());
+
     backgroundWork.push((async () => {
       let catRun = null;
       try {

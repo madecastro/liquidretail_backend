@@ -926,6 +926,23 @@ async function syncBrandShopifyDirect(brand, run, { isBrandAborted } = {}) {
         .catch(err => console.warn(`   ⚠️  🛍  catalog enrichment enqueue failed: ${err.message}`))
     );
 
+    // Materialize + YOLO detect chain. Populates Media.refinedProducts[] so
+    // reframe / videoProductAnchor / pmaxSplitStrategy / quoteProvenance find
+    // subject bboxes at ad-gen time and skip the paid nano-banana outpaint.
+    // See services/catalogYoloDetectionService.js header for the full flow.
+    backgroundWork.push((async () => {
+      try {
+        await require('./catalogMediaMaterializeService').ensureBrandCatalogMediaMaterialized(brand._id);
+      } catch (err) {
+        console.warn(`   ⚠️  🛍  catalog media materialize failed: ${err.message}`);
+      }
+      try {
+        await require('./catalogYoloDetectionService').enqueueBrandProductYoloDetection(brand._id);
+      } catch (err) {
+        console.warn(`   ⚠️  🛍  catalog YOLO detect enqueue failed: ${err.message}`);
+      }
+    })());
+
     backgroundWork.push((async () => {
       try {
         const inference = require('./productCategoryInferenceService');

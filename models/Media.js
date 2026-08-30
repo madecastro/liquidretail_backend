@@ -89,6 +89,14 @@ const mediaSchema = new mongoose.Schema({
   // are in this Media."
   refinedProducts:    { type: [mongoose.Schema.Types.Mixed], default: [] },
   lastDetectedAt:     Date,
+  // ── Ingest-time YOLO detection (services/mediaYoloRefine.js) ──────────
+  // Stamped when the ingest-time YOLO+refine job populates refinedProducts[].
+  // Distinct from lastDetectedAt (which tracks the FULL detect pipeline);
+  // this lets us tell "YOLO ran at ingest and populated boxes" from
+  // "the full paid pipeline ran". Backfill query gates on refinedProducts
+  // emptiness, not this field, but this field is the observability signal.
+  // Indexed so a "detected-in-last-N-days" audit query is cheap.
+  yoloDetectedAt:     { type: Date, default: null, index: true },
 
   // Phase 2d — relational match results denormalized for fast reads. The
   // source of truth is ProductMatchArtifact (per-run audit), but these

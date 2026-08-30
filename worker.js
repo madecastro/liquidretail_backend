@@ -295,6 +295,60 @@ mongoose.connect(process.env.MONGODB_URI, {
     setInterval(archiveTick, archiveIntervalMin * 60 * 1000);
     console.log(`🗃️  queued archive: every ${archiveIntervalMin}m (after ${process.env.QUEUED_ARCHIVE_AFTER_H || 24}h, max ${process.env.QUEUED_ARCHIVE_MAX_ADS || 200}/pass)`);
   }
+  // CATALOG YOLO BACKFILL — drain Media created by non-sync paths
+  // (materializeMissingHero, admin uploads, ingest jobs that partially failed
+  // due to YOLO service outage). Ingest itself does its own YOLO detect on
+  // the products it touches; this sweep catches the residuals.
+  //
+  // NEVER renders, NEVER submits Atlas, NEVER creates DetectRuns. Reads
+  // catalog-product Media with empty refinedProducts[], runs
+  // mediaYoloRefine.detectYoloForMedia on each (which forks: catalog + YOLO
+  // hits = synthesized from CatalogProduct metadata for $0; catalog + YOLO
+  // empty = paid GPT-4.1 refine ~$0.03/media). Leader-gated with the rest.
+  const CATALOG_YOLO_BACKFILL_ENABLED = String(process.env.CATALOG_YOLO_BACKFILL_ENABLED ?? 'true').toLowerCase() !== 'false';
+  if (!CATALOG_YOLO_BACKFILL_ENABLED) {
+    console.log('🎯 catalog YOLO backfill: disabled (CATALOG_YOLO_BACKFILL_ENABLED=false)');
+  } else {
+    const yoloBackfillIntervalMin = Math.max(1, parseInt(process.env.CATALOG_YOLO_BACKFILL_INTERVAL_MIN, 10) || 15);
+    const yoloBackfillBatchSize   = Math.max(1, parseInt(process.env.CATALOG_YOLO_BACKFILL_BATCH_SIZE, 10) || 20);
+    const yoloBackfillTick = async () => {
+      if (!housekeepingLease.holds()) return;
+      try {
+        const Media = require('./models/Media');
+        const { detectYoloForMedia } = require('./services/mediaYoloRefine');
+        const stale = await Media.find({
+          source: 'catalog-product',
+          $or: [
+            { refinedProducts: { $exists: false } },
+            { refinedProducts: { $size: 0 } }
+          ]
+        })
+          .sort({ createdAt: 1 })
+          .limit(yoloBackfillBatchSize)
+          .lean();
+        if (!stale.length) return;
+        console.log(`🎯 yolo backfill: draining ${stale.length} stale catalog Media`);
+        let ok = 0, failed = 0, skipped = 0;
+        for (const media of stale) {
+          try {
+            const r = await detectYoloForMedia(media, { trigger: 'backfill' });
+            if (r.status === 'ok') ok++;
+            else skipped++;
+          } catch (err) {
+            failed++;
+            console.warn(`   ⚠️  yolo backfill ${media._id}: ${err.message}`);
+          }
+        }
+        console.log(`🎯 yolo backfill done — ok=${ok} skipped=${skipped} failed=${failed}`);
+      } catch (err) {
+        console.warn(`⚠️  yolo backfill tick failed: ${err.message}`);
+      }
+    };
+    setTimeout(yoloBackfillTick, 90 * 1000);
+    setInterval(yoloBackfillTick, yoloBackfillIntervalMin * 60 * 1000);
+    console.log(`🎯 catalog YOLO backfill: every ${yoloBackfillIntervalMin}m (batch=${yoloBackfillBatchSize})`);
+  }
+
   // QC-insights aggregation — never renders, never submits. Reads
   // Ad.visionQc verdicts and writes QcInsightsReport. Leader-gated with
   // the rest of worker housekeeping.
