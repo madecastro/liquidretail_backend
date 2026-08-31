@@ -59,6 +59,21 @@ function igWasAttempted(igResult) {
   return igResult != null && !igResult.skipped;
 }
 
+/**
+ * resolveCatalogMethod(cfg) → 'apify' | 'generic-sitemap' | 'shopify-direct'
+ *
+ * Pure resolution of which catalog ingest method actually runs for a demo
+ * brand's Shopify sync, independent of what (if anything) is persisted on
+ * Brand.apifyDemo.method — a run with method:null still resolves (and
+ * runs) as 'shopify-direct' whenever a shopifyUrl is set. Exported so a
+ * caller reporting on a run (e.g. Slack ingest-status projection) states
+ * the method THAT ACTUALLY RAN without re-deriving or duplicating this
+ * ternary — see the same expression at the syncBrandApify call site below.
+ */
+function resolveCatalogMethod(cfg = {}) {
+  return ['apify', 'generic-sitemap'].includes(cfg.method) ? cfg.method : 'shopify-direct';
+}
+
 // Orchestrator — runs whichever sub-syncs the brand has configured.
 // Returns per-source summaries so the route response is easy to
 // display in the Sales UI.
@@ -111,7 +126,7 @@ async function syncBrandApify(brandId, { skipInstagram = false } = {}) {
   // 'generic-sitemap' runs the client-agnostic XML-sitemap + schema.org
   // JSON-LD scraper for non-Shopify server-rendered stores (uses
   // cfg.shopifyUrl as the target). IG stays on Apify regardless (hybrid).
-  const method = ['apify', 'generic-sitemap'].includes(cfg.method) ? cfg.method : 'shopify-direct';
+  const method = resolveCatalogMethod(cfg);
   const out = { ok: true, brandId: String(brand._id), ig: null, shopify: null, method, _run: run };
   const t0 = Date.now();
 
@@ -882,5 +897,8 @@ module.exports = {
   // Pure money-guard decisions — exported so scripts/verifyApifyCatalogOnlyGuard.js
   // can pin them offline, no live DB required.
   shouldRunInstagramSync,
-  igWasAttempted
+  igWasAttempted,
+  // Pure catalog-method resolution — exported so ingestStatusFeedService can
+  // report the method that actually ran (see docstring above).
+  resolveCatalogMethod
 };

@@ -44,6 +44,28 @@ const operationRunSchema = new mongoose.Schema({
   stage: { type: String, default: null },
   note:  { type: String, default: null },
 
+  // Closed-stage history. progressService.stage() pushes one entry here
+  // the moment it transitions AWAY from a named stage (and the terminal
+  // succeed()/fail()/markCancelled() close whatever stage was still open),
+  // capturing that stage's own elapsed time + its last itemsDone/itemsTotal/
+  // note — the values `stage`/`note`/`itemsDone`/`itemsTotal` above are about
+  // to be overwritten by the next stage's own progress. Additive: nothing
+  // else reads or requires this array, so it is safe to add without a
+  // migration. See services/ingestStatusFeedService.js, the first consumer.
+  stages: {
+    type: [{
+      name:        { type: String },
+      startedAt:   { type: Date },
+      endedAt:     { type: Date },
+      durationMs:  { type: Number },
+      itemsDone:   { type: Number },
+      itemsTotal:  { type: Number },
+      note:        { type: String },
+      _id: false
+    }],
+    default: []
+  },
+
   // 0..1 when known; null when indeterminate (no total yet).
   pct:        { type: Number, default: null },
   itemsDone:  { type: Number, default: 0 },
@@ -61,7 +83,19 @@ const operationRunSchema = new mongoose.Schema({
   // (also re-checked against CANCELLABLE_KINDS in the cancel route).
   cancellable:     { type: Boolean, default: false },
 
-  meta: { type: mongoose.Schema.Types.Mixed, default: null }
+  meta: { type: mongoose.Schema.Types.Mixed, default: null },
+
+  // Slack ingest-status live message for this run (services/
+  // ingestStatusFeedService.js). Same shape and same conditional-claim
+  // convention as CampaignRun.slackFeed (services/runFeedService.js) —
+  // winner of the conditional updateOne writes this; a losing process
+  // re-reads it and edits the winner's message instead of posting a
+  // second parent. null/unset means no Slack message exists yet for
+  // this run (feature unconfigured, or not yet flushed).
+  slackFeed: {
+    ts:      { type: String, default: null },
+    channel: { type: String, default: null }
+  }
 }, { timestamps: false });
 
 operationRunSchema.index({ advertiserId: 1, status: 1, startedAt: -1 });
