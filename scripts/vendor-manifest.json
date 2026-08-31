@@ -1,8 +1,8 @@
 {
   "version": 2,
   "backendRef": "origin/main",
-  "backendHead": "5d1cfc74cbc6ccd77e88f2eb70ee348d9e123700",
-  "generatedAt": "2026-08-28T19:53:10.615Z",
+  "backendHead": "799c339ed1246da5e252688b45e42a8769e38328",
+  "generatedAt": "2026-08-31T20:35:02.189Z",
   "files": {
     "models/Ad.js": {
       "backendHash": "394d26a1cb8ad64b23bde73312f3473f332520dd9640b9d5e4bb8eec22d6138d",
@@ -394,19 +394,21 @@
     },
     "remotion/presets/babyboo-editorial-monochrome.json": {
       "backendHash": "54ec34d8bb80871105f2afde4626cdfbc48197698bf2b32ba73d3df4e73cae1e",
-      "adgenHash": "54ec34d8bb80871105f2afde4626cdfbc48197698bf2b32ba73d3df4e73cae1e",
+      "adgenHash": "9a2df5e38efa6872b25cb75a638f7302bfaa05f2c60556fe31763dba93d63335",
       "backendSha": "230d2a575d58eb81ec693fef312834915c5e07a7",
-      "status": "synced",
-      "portTo": null,
-      "owedSince": null
+      "status": "unported",
+      "reason": "2026-08-31 title-group overlap fix (owner-directed): removed the pinned in-creative brandPill wordmark (visible:false, matching canonical.json's 2026-08-04 decision) — a persistent group at `top` is the only keep-out chain that can walk DOWN onto other bands, so it could be pushed into live editorial copy. soludos-summer-postcard vertical additionally re-timed so its quote and product stacks are sequential. Backend renders these same presets via its own brandScriptExecutor/retitle path and needs the same fix.",
+      "portTo": "backend",
+      "owedSince": "2026-08-31T20:34:05.587Z"
     },
     "remotion/presets/babyboo-main-character.json": {
       "backendHash": "7263f12dcbcd907a026ea66e602448dec10d819bc0213db2966a481d3a9e892f",
-      "adgenHash": "7263f12dcbcd907a026ea66e602448dec10d819bc0213db2966a481d3a9e892f",
+      "adgenHash": "55f26d07281894a589a459773bd7f55096981e792e4be0c456839855225b4ed9",
       "backendSha": "230d2a575d58eb81ec693fef312834915c5e07a7",
-      "status": "synced",
-      "portTo": null,
-      "owedSince": null
+      "status": "unported",
+      "reason": "2026-08-31 title-group overlap fix (owner-directed): removed the pinned in-creative brandPill wordmark (visible:false, matching canonical.json's 2026-08-04 decision) — a persistent group at `top` is the only keep-out chain that can walk DOWN onto other bands, so it could be pushed into live editorial copy. soludos-summer-postcard vertical additionally re-timed so its quote and product stacks are sequential. Backend renders these same presets via its own brandScriptExecutor/retitle path and needs the same fix.",
+      "portTo": "backend",
+      "owedSince": "2026-08-31T20:26:24.042Z"
     },
     "remotion/presets/canonical-awareness-pmax10.json": {
       "backendHash": "b3847d4e2d771c13b6a4487e7f4deae252582de7416257cb9dcd4f65543f7404",
@@ -418,11 +420,12 @@
     },
     "remotion/presets/canonical-awareness.json": {
       "backendHash": "484a2d73ce5c888404a6ce80a4488baf3001126f88692fea30d9fee3e8421cde",
-      "adgenHash": "484a2d73ce5c888404a6ce80a4488baf3001126f88692fea30d9fee3e8421cde",
+      "adgenHash": "460a0eb1c9478d76385f9a37505cd5fbb2d6bca94df9f059d32623045a8eb161",
       "backendSha": "230d2a575d58eb81ec693fef312834915c5e07a7",
-      "status": "synced",
-      "portTo": null,
-      "owedSince": null
+      "status": "unported",
+      "reason": "2026-08-31 title-group overlap fix: vertical presets re-timed so no two (phase,anchor) groups are on screen simultaneously (keep-out could shift both onto one band -> text-on-text, measured on delivered ads 6a93ade2e4f1d02784398630 / ...626), plus offsetY 0.105 on vertical upperThird so copy clears the model's face. Backend renders these same presets via its own brandScriptExecutor/retitle path and needs the same fix.",
+      "portTo": "backend",
+      "owedSince": "2026-08-31T20:26:12.651Z"
     },
     "remotion/presets/canonical-consideration-pmax10.json": {
       "backendHash": "ed9e6c24e2abfddabba2b2152b91b95ba0fe8fec77ca6b4f9bf12eecdccfc984",
@@ -442,43 +445,48 @@
     },
     "remotion/presets/canonical-conversion-pmax10.json": {
       "backendHash": "eb7a4687ffd3436009b2d40392d277a0da6618644c17587de730c7a176c5e462",
-      "adgenHash": "eb7a4687ffd3436009b2d40392d277a0da6618644c17587de730c7a176c5e462",
+      "adgenHash": "074bcc45075d86d058ba466a7c5cea92073e3f7e8a0018bf5f6896a020979293",
       "backendSha": "230d2a575d58eb81ec693fef312834915c5e07a7",
-      "status": "synced",
-      "portTo": null,
-      "owedSince": null
+      "status": "unported",
+      "reason": "2026-08-31 title-group overlap fix: vertical presets re-timed so no two (phase,anchor) groups are on screen simultaneously (keep-out could shift both onto one band -> text-on-text, measured on delivered ads 6a93ade2e4f1d02784398630 / ...626), plus offsetY 0.105 on vertical upperThird so copy clears the model's face. Backend renders these same presets via its own brandScriptExecutor/retitle path and needs the same fix.",
+      "portTo": "backend",
+      "owedSince": "2026-08-31T20:26:05.245Z"
     },
     "remotion/presets/canonical-conversion.json": {
       "backendHash": "7804ca2615acdf510721aaef320e7eaebf499e9bb6425294aef6cc3f2c824589",
-      "adgenHash": "7804ca2615acdf510721aaef320e7eaebf499e9bb6425294aef6cc3f2c824589",
+      "adgenHash": "fe60de2ab6516903ce90fa6238e8a0680750d2ceb704d745ce52866d91abd321",
       "backendSha": "230d2a575d58eb81ec693fef312834915c5e07a7",
-      "status": "synced",
-      "portTo": null,
-      "owedSince": null
+      "status": "unported",
+      "reason": "2026-08-31 title-group overlap fix: vertical presets re-timed so no two (phase,anchor) groups are on screen simultaneously (keep-out could shift both onto one band -> text-on-text, measured on delivered ads 6a93ade2e4f1d02784398630 / ...626), plus offsetY 0.105 on vertical upperThird so copy clears the model's face. Backend renders these same presets via its own brandScriptExecutor/retitle path and needs the same fix.",
+      "portTo": "backend",
+      "owedSince": "2026-08-31T20:25:56.118Z"
     },
     "remotion/presets/canonical.json": {
       "backendHash": "630898eece7b539b3cbcc7b5f7c6f711864db2ac73edc706b0c3c901489f64e1",
-      "adgenHash": "630898eece7b539b3cbcc7b5f7c6f711864db2ac73edc706b0c3c901489f64e1",
+      "adgenHash": "937ad6e610e13c58eb54f889bbe002045b609789793fda2a8df2b5ab30156d73",
       "backendSha": "230d2a575d58eb81ec693fef312834915c5e07a7",
-      "status": "synced",
-      "portTo": null,
-      "owedSince": null
+      "status": "unported",
+      "reason": "2026-08-31 title-group overlap fix: vertical presets re-timed so no two (phase,anchor) groups are on screen simultaneously (keep-out could shift both onto one band -> text-on-text, measured on delivered ads 6a93ade2e4f1d02784398630 / ...626), plus offsetY 0.105 on vertical upperThird so copy clears the model's face. Backend renders these same presets via its own brandScriptExecutor/retitle path and needs the same fix.",
+      "portTo": "backend",
+      "owedSince": "2026-08-31T20:25:43.236Z"
     },
     "remotion/presets/pelagic-bluewater-editorial.json": {
       "backendHash": "a796fd0977ae4fb8450109630968ac5c6b9c5a2bf02d5a230ca4e41c2114ca1d",
-      "adgenHash": "a796fd0977ae4fb8450109630968ac5c6b9c5a2bf02d5a230ca4e41c2114ca1d",
+      "adgenHash": "504d078886e055dbde187e44029aa4beb11900c9099c3139f4b5ed85f00dceaf",
       "backendSha": "230d2a575d58eb81ec693fef312834915c5e07a7",
-      "status": "synced",
-      "portTo": null,
-      "owedSince": null
+      "status": "unported",
+      "reason": "2026-08-31 title-group overlap fix (owner-directed): removed the pinned in-creative brandPill wordmark (visible:false, matching canonical.json's 2026-08-04 decision) — a persistent group at `top` is the only keep-out chain that can walk DOWN onto other bands, so it could be pushed into live editorial copy. soludos-summer-postcard vertical additionally re-timed so its quote and product stacks are sequential. Backend renders these same presets via its own brandScriptExecutor/retitle path and needs the same fix.",
+      "portTo": "backend",
+      "owedSince": "2026-08-31T20:26:35.913Z"
     },
     "remotion/presets/pelagic-offshore-bold.json": {
       "backendHash": "306434859f422aa075d92c04f4187b9bc42ecf75b038befc705ed6384e7016cd",
-      "adgenHash": "306434859f422aa075d92c04f4187b9bc42ecf75b038befc705ed6384e7016cd",
+      "adgenHash": "e3ef69a608e45543130c626aae585f1de45e2b14953acc6272cc53a8982e3792",
       "backendSha": "facf09d49eaeeec41b1d7e562ac6c44dd4b0e0fc",
-      "status": "synced",
-      "portTo": null,
-      "owedSince": null
+      "status": "unported",
+      "reason": "2026-08-31 title-group overlap fix (owner-directed): removed the pinned in-creative brandPill wordmark (visible:false, matching canonical.json's 2026-08-04 decision) — a persistent group at `top` is the only keep-out chain that can walk DOWN onto other bands, so it could be pushed into live editorial copy. soludos-summer-postcard vertical additionally re-timed so its quote and product stacks are sequential. Backend renders these same presets via its own brandScriptExecutor/retitle path and needs the same fix.",
+      "portTo": "backend",
+      "owedSince": "2026-08-31T20:26:43.700Z"
     },
     "remotion/presets/proto-bottom-editorial.json": {
       "backendHash": "0febc9a6672147059d92216a287c9d08fcb17c7d76d3e663b53dad1b10c5a88a",
@@ -498,19 +506,21 @@
     },
     "remotion/presets/soludos-mediterranean-editorial.json": {
       "backendHash": "d63ffa7309973ec329c4eb47504567fe5299d30c29d77345d03fa9b39423ed9b",
-      "adgenHash": "d63ffa7309973ec329c4eb47504567fe5299d30c29d77345d03fa9b39423ed9b",
+      "adgenHash": "85de97ce421d66618f64d531bb76de01cac02d932737e01b916720e2346d5c98",
       "backendSha": "230d2a575d58eb81ec693fef312834915c5e07a7",
-      "status": "synced",
-      "portTo": null,
-      "owedSince": null
+      "status": "unported",
+      "reason": "2026-08-31 title-group overlap fix (owner-directed): removed the pinned in-creative brandPill wordmark (visible:false, matching canonical.json's 2026-08-04 decision) — a persistent group at `top` is the only keep-out chain that can walk DOWN onto other bands, so it could be pushed into live editorial copy. soludos-summer-postcard vertical additionally re-timed so its quote and product stacks are sequential. Backend renders these same presets via its own brandScriptExecutor/retitle path and needs the same fix.",
+      "portTo": "backend",
+      "owedSince": "2026-08-31T20:34:45.189Z"
     },
     "remotion/presets/soludos-summer-postcard.json": {
       "backendHash": "be165be2e98c78eea15c14a3d11ee92aa6c1a5b77f40b5ca611fe7ea5ca58d57",
-      "adgenHash": "be165be2e98c78eea15c14a3d11ee92aa6c1a5b77f40b5ca611fe7ea5ca58d57",
+      "adgenHash": "1f6a257120c1e447b48833149de140b0efd1845b212e9d945132884826051a73",
       "backendSha": "230d2a575d58eb81ec693fef312834915c5e07a7",
-      "status": "synced",
-      "portTo": null,
-      "owedSince": null
+      "status": "unported",
+      "reason": "2026-08-31 title-group overlap fix (owner-directed): removed the pinned in-creative brandPill wordmark (visible:false, matching canonical.json's 2026-08-04 decision) — a persistent group at `top` is the only keep-out chain that can walk DOWN onto other bands, so it could be pushed into live editorial copy. soludos-summer-postcard vertical additionally re-timed so its quote and product stacks are sequential. Backend renders these same presets via its own brandScriptExecutor/retitle path and needs the same fix.",
+      "portTo": "backend",
+      "owedSince": "2026-08-31T20:35:02.189Z"
     },
     "schemas/contracts/ai_canvas_html.v1.json": {
       "backendHash": "99853ed40eda1f159aa1be3471b87fdf994543ac6cf7f7f71c1d7d9a1bf8bc5d",
@@ -1527,12 +1537,12 @@
     },
     "services/remotionRenderService.js": {
       "backendHash": "52604a214dd53d237632c0b76581e4aeca7c82e043d008a1630e34f3f7d4978a",
-      "adgenHash": "a1220c1dcf518e3464b7b01e1b1b63e828454ce0c7941f4a949a435024ee6229",
+      "adgenHash": "1565a91d4f8cbedd3aae46ccbe41abd4f8283ad9dc4cd7cd12cc325ca15a9e0b",
       "backendSha": "dabceaf47fc8db7671a7d8f812024d550e66287a",
-      "status": "fork",
-      "reason": "adgen child-supervisor / isolation path; not a wholesale copy. PORTED 2026-08-24: backend #307 (dabceaf4) safeZoneKey threading — renderTitlesJob's analyzePlate call now passes safeZoneKey alongside adgen's existing brandId/productId/adId/campaignRunId params, its applyFaceKeepOut call now passes safeZoneKey, and both of renderPreview's analyzePlate calls now pass safeZoneKey. Without this the plateIntelService.js #307 fix is reachable in code but never exercised (a caller-supplied safeZoneKey would be silently dropped) — see scripts/verifyKeepOutBandGeometry.mjs groups E/H, mutation-proven to catch exactly this drop.",
-      "portTo": null,
-      "owedSince": null
+      "status": "unported",
+      "reason": "2026-08-31: renderPreview() gains an optional plateHintsOverride param (default null = byte-identical to before). Offline-repro hook only, used by scripts/renderTitlePreview.js to inject hand-built plate hints so a title-placement defect can be reproduced with no DB, no footage and no vision call. Backend has the same renderPreview and would want the same hook.",
+      "portTo": "backend",
+      "owedSince": "2026-08-31T20:27:00.586Z"
     },
     "services/renderErrorFields.js": {
       "backendHash": "0efda9eab3d25ab7f1a1efa8f8ca3cc8f5f2ca93a9a56319f0ecb3de0aa0d748",

@@ -16,3 +16,6 @@ dist/
 # this by scripts/verifyRemotionBrowserPrewarm.js) or by runtime; local-only.
 .remotion-browser-path
 probe-results/
+# scripts/renderTitlePreview.js default output dir — local debug PNGs/MP4s,
+# never committed (same pattern as probe-results/ above).
+title-preview-output/

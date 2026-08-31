@@ -14,112 +14,129 @@ it clears it back to this placeholder.)_
 
 ## CURRENT STATE
 
-*(Replaced 2026-08-28 ~20:15 UTC. Trunk `master` @ `987ec51f` (#96). All four Render
-services — `adgen-orchestrator`, `adgen-renderer`, `adgen-titler`, `adgen-api` —
-confirmed `live` on this commit.)*
+*(Replaced 2026-08-31. Trunk `master`. Previous entry (PR #96 crop-fix, 2026-08-28) is
+superseded; its content is in `session.d/`.)*
 
-**Fixed 2026-08-28: face-safe-crop no-face-quorum boundary miss + turned on the
-Gemini plate scan (PR #96).** Measured directly against production (Render one-off
-Mongo query): **56/625 (9%) of crop-eligible ads** had a real face detected in
-exactly one sampled frame, failed the `FACE_MIN_FRAMES=2` anti-hallucination quorum
-(`faceSafeCrop.js`), and fell back to a blind full-frame crop that could clip the
-face. `detectClipBoxes()` (`basePlateCropService.js`) now samples
-`FACE_QUORUM_RETRY_FRAMES=2` new gap-midpoint timestamps
-(`videoFrameService.js`: `planAdditionalTimestamps`/`buildAdditionalFrameUrls`)
-**exactly once** when `head === null && initialHits === 1`, and re-runs consensus on
-the combined set. Worst case 4+2=6 vision calls (~$0.03/ad); 0-hit and
-already-quorum ads pay nothing extra. Ported `verifyBasePlateCrop.js` (40
-checks)/`verifyFaceSafeCrop.js` (98)/`verifyFaceKeepOut.js` (31) from backend — adgen
-had none. Also flipped `TITLE_PLATE_SCAN=gemini` as the live default
-(`config/defaults.env`) — production had been silently running the free `basic`
-(sharp luminance-only) scan only; `gemini` adds one billable `gemini-2.5-flash` call
-per video marking bands to avoid for face/product/focal-point coverage. **Cost not
-yet reconciled against a real settled CostLog row** — confirm the per-video price
-once live titling runs have accrued.
+**Fixed 2026-08-31: TEXT-ON-TEXT on delivered vertical video ads (the "overlapping
+titles" defect).** Reported against ad `6a93ade2e4f1d02784398630` (`meta_reels_9_16`,
+conversion) and reproduced on `6a93ade1e4f1d02784398626` (`meta_stories_9_16`): the
+headline and the productName/rating/deliveryLine stack rendered on top of each other
+from ~1.5s, both illegible.
 
-⚠️ **Traced but NOT ported: backend's manual `/retitle-videos` admin flow still calls
-this same crop code live** (`routes/brand.js` `runRetitleJob` →
-`renderBrandScriptAndSave` → `renderWithRemotionAndSave` →
-`basePlateCropService.resolveBasePlateVideoUrl`/`ensureFaceDetectionForKeepOut`), and
-DOES recompute a fresh crop — paying the same no-quorum bug, un-retried — on an
-`Ad.basePlate` cache miss (different format or source video). Reconciled in
-`scripts/vendor-manifest.json` as an owed port-to-backend debt on
-`basePlateCropService.js`/`faceSafeCrop.js`/`videoFrameService.js`, not silently
-ignored — needs an owner decision on priority, not ported in this PR.
+**Mechanism.** `Canonical.jsx` groups slots by `(phase, position.anchor)` and resolves
+ONE anchor per group via `resolveGroupAnchor`'s keep-out walk; `stackContainerStyle`
+then positions `position:absolute` from that anchor alone. Each group walks
+`KEEP_OUT_CANDIDATES` **independently**, with no knowledge of where other groups
+landed, and the chains overlap heavily — so two SIMULTANEOUSLY-VISIBLE groups can
+resolve onto the same band and paint through each other. `canonical-conversion`
+vertical authored its close stack in the `hook` phase from 1.5s with **no exit**, so it
+shared the frame with `hook|upperThird` and then `proof|upperThird`; the plate scan
+flags the middle+bottom bands (the model *wears* the product, so those bands ARE the
+product), keep-out walked the close stack up to `upperThird`, and it landed on the live
+headline. Two natural controls on the SAME footage/run isolate it: `…398612` (plain
+`canonical`, strictly sequential) and `…39863a` (feed, single group) were both clean.
 
-**A drafted retry condition had a real operator-precedence money bug, caught before
-merge:** `head === null && initialHits === 1 || initialHits >= 2` parses (`&&` binds
-tighter than `||`) as `(head===null && initialHits===1) || (initialHits>=2)` —
-`consensusFaceBox` guarantees `head` is non-null whenever `faceHits>=2`, so that
-clause fired two wasted vision calls on every ad that had already resolved a good
-crop. Fixed to the bare `head === null && initialHits === 1`. An independent
-xhigh-effort adversarial Grok review (fresh session, not a fork) confirmed the fix
-and flagged one harness-coverage gap — Q1–Q4 stubbed `buildAdditionalFrameUrls`
-without ever asserting the call site actually passes `count`, so a regression that
-silently dropped it would have kept those tests green. Closed with a new
-count-assertion plus a single-frame-already-trusted regression test (Q5), both
-revert-proven against the exact regressions they target.
+**Fix is TEMPLATE-LEVEL, not engine-level — owner decision 2026-08-31.** An engine
+collision-avoidance pass was drafted and deliberately reverted; its fallback ("if no
+band is free, keep the authored one") means sitting on a face, which the owner ruled
+unacceptable. Three template changes instead:
+1. **Sequential re-timing** of `canonical-conversion` + `canonical-conversion-pmax10`
+   vertical (cuts kept ON the Omni camera beats 2.67/5.12 and 3.125/6.375), and of
+   `soludos-summer-postcard` vertical. Each carries a `_layoutInvariant` field
+   explaining why it must stay sequential.
+2. **Removed the pinned in-creative `brandPill` wordmark** (`visible:false`, 18 slots
+   across all 6 brand presets), matching `canonical.json`'s own 2026-08-04 owner
+   decision. This alone cleared 12 combinations. A persistent group at `top` is
+   uniquely dangerous: `top` is the ONLY keep-out chain that can walk DOWN onto another
+   band — no other anchor's chain contains `top` — so it can be pushed into live copy
+   while nothing can be pushed onto it.
+3. **`offsetY: 0.105` on every vertical `upperThird` slot** in `canonical` +
+   `canonical-conversion` + `canonical-conversion-pmax10`, so hook/proof copy clears the
+   model's head on a full-body 9:16 shot. Owner rule: copy over the BODY is fine, copy
+   over the FACE is not. NOTE `Canonical.jsx` uses `first.position.offsetY` — only the
+   FIRST slot in a group positions the container — so the value is set on every slot in
+   the group for robustness.
 
-**Prior CURRENT STATE entries, compressed (both confirmed merged, full narrative in
-`session.d/`):** `src/services/retitleConsumer.js` (**PR #93**, merged) — a fourth
-claim namespace (`retitleRequest`/`retitleClaimedByWorker`) so backend's manual
-`/retitle-videos` can defer to this service; found and fixed a live production bug
-along the way (`brandScriptExecutor.uploadRenderAndStamp` was unconditionally forcing
-`status:'draft'`, silently un-publishing already-live ads on manual retitle) via
-opt-in `preserveAdStatus`/`retitleMode`; `handoffContract.js` v1.0.0→v1.1.0. Landed
-together with backend PR #359. Full narrative:
-`session.d/2026-08-28_retitle-adgen-handoff.md`. Vendor-drift + Remotion-memory-budget
-reconciliation (**PR #94**, merged) — see KNOWN-OPEN below for the CURRENT drift
-status, which has moved twice since (#94 itself, then this PR); don't trust either
-PR's own narrative as up to date on that specific check.
+**Result: 0 of 15 vertical preset+format combinations overlap (was 9).** All Meta
+9:16 / 4:5 / 1:1 layouts are clean except the two `proto-*` prototypes. Verified
+visually against the REAL delivered plate at 4+ timestamps, on both a canonical and a
+brand preset. Pinned by `scripts/verifyTitleGroupsNeverOverlap.js` (54 combos checked,
+18-entry explicit baseline for the not-yet-fixed landscape/proto set).
 
-**Also confirmed merged since the last full pass through this file (re-verified
-2026-08-28 via `gh pr view`, not re-narrated in detail here):** #75 (adgen's own
-sweep no longer stomps the titler handoff), #80 (the four hand-rolled Mongo matchers
-fail loud on a dotted path), and #81/#79/#78/#77/#76 (previously listed as still
-open — all five are MERGED).
+**Three new tools (none are `verify*`; none touch the suite):**
+- `scripts/renderTitlePreview.js` — renders any preset/format/face-scenario to a still
+  in ~5s with NO database, network, or vision call. Supports `--plate-video` for real
+  footage. **Its output uses HARNESS DEFAULT FONTS (Playfair/Inter/Lora), not brand
+  fonts** — it prints a banner saying so, because its serif output was once mistaken
+  for a production font regression. Judge geometry from it, never typeface.
+- `scripts/inspectAd.js` — read-only Ad inspector by `_id`. Structurally incapable of
+  writing (find/findOne only, caller supplies ObjectIds not filters, allow-listed field
+  projection, URI redacted from all output incl. error messages).
+- `scripts/verifyTitleGroupsNeverOverlap.js` — the regression pin above.
 
-**Video generation works** — the PR #43 IPC regression is fixed and proven in production
-data. **Static creative is reliable**: ~160 images across four E2E rounds with essentially
-zero final-attempt fidelity failures.
+`renderPreview()` in `remotionRenderService.js` gained an optional
+`plateHintsOverride` (default null = byte-identical); it is the hook the preview
+harness uses to inject synthetic face flags.
 
-**What you must not trust: the VIDEO QC judge.** It is confidently wrong in both
-directions — it fabricated specific defects on two masters (one claim reproduced
-identically by four separate QC calls, visible in no frame) and caught a genuinely hidden
-real one on a third. Video has NO regeneration, so a fabricated verdict terminally
-discards a paid master. Before acting on this, note the confound: round 4 used a
-single-image seed override instead of the default 3-image reference stack — which, per a
-since-fixed content-dedupe bug (`buildReferenceImages`'s `seenUrls` set,
-`atlasVideoService.js:3253+`, confirmed present on `origin/master` as of commit
-`40f9003`), was shipping two distinct views under a 3-slot label, not three. Re-run
-with the current default stack.
+**Suite: 84/87.** The 2 non-expected reds (`verifyModelParity`, `verifyVendorDrift`)
+were confirmed PRE-EXISTING by stashing and re-running on a clean tree. All 10 changed
+files reconciled in `vendor-manifest.json` as owed ports to backend — backend renders
+these same presets through its own `brandScriptExecutor`/retitle path and does NOT yet
+have any of this.
 
-**Fixes shipped from here recently:** #63 (renderer claim excludes titler-handoff rows —
-`ADGEN_TITLER_ENABLED` is now unblocked and needs only a dashboard flip after a watched
-video run), #65 (QC can see a logo composited on top of the product), #66 (terminal static
-failures persist their verdict — verified by a natural before/after in production, 0 of 10
-before the deploy, 16 of 16 after), #75, #80 (see above).
-
-**Concurrency knobs, re-checked 2026-08-28 (do not trust the previous "dashboard is
-2" claim — it's more nuanced now):** `ADGEN_TITLER_ENABLED` is still `false` in
-`config/defaults.env`. `REMOTION_QUEUE_CONCURRENCY`'s FILE default moved 2→3 same-day
-(commit `a108753`, "staging tolerance") — its own commit message is explicit that
-**production stays at 2 via the `adgen-renderer`/`adgen-titler` dashboard overrides
-until the staging measurement is in**; read that commit directly rather than a second-
-hand summary here if you need the current live value.
-
-**Do not build subject-aware logo placement** — see the session.d entry. #65's QC-retry
-path restages the scene; relocation only trades one collision for another.
-
-**Suite:** `node scripts/runVerifySuite.js` → 84/86 as of 2026-08-28 (re-run directly,
-not carried over from a stale count), the one non-expected red being
-`verifyVendorDrift.js` (pre-existing backend-side drift, unrelated to PR #96 — see
-KNOWN-OPEN), the one expected red being `verifyRunFinalizesOnSettle_KNOWN_OPEN`, red
-by design. **Never set NODE_PATH and never run `npm ci` in an adgen worktree.**
+**FONT AUDIT (2026-08-31) — the "fonts look wrong" report was a FALSE ALARM, and the
+real finding is different.** Production fonts are correct: website font capture
+(`brandFontIngestService`) works and 8 of 9 brands have real downloaded font files
+(Soludos 8, Gymshark 9, PB5star 7, Marine Layer 6, Peloton 5, Pelagic 1 = `ArchivoV`,
+which is exactly what the delivered ad logged). The wrong-looking type came from the
+new preview harness's empty tokens — now banner-warned. What IS broken, measured
+directly:
+- **Meta-ads font scanning returns nothing for every brand.** `metaAdsFontService` is
+  wired, enabled (`META_ADS_FONTS_ENABLED=true`), and has RUN for all 9 brands
+  (`metaFontsIngestedAt` set) — but every one has
+  `metaAdsFontUsage: {heading:null, body:null, evidence:[]}`. 0/9 with zero evidence is
+  not a real "no fonts found". It sources ad images in 3 tiers (persisted Campaigns →
+  connected Meta ad account → public Ad Library via Apify); tier 3 is OFF because
+  `APIFY_ADLIB_ACTOR` is blank in `config/defaults.env:1790`. **Check whether it is set
+  on the BACKEND Render service** — brand enrichment runs there, not in adgen.
+- **`Reach Social` website scan failed permanently**: `could not fetch
+  https://reach-social.io`, and `fontIngestedAt` is stamped on failure so it never
+  retries. 0 usable font files.
+- Latent, NOT currently biting: the 6 brand presets hardcode generic Google fonts in
+  `tokenOverrides.fonts` (Poppins/Montserrat/Saira/Barlow/Fraunces), and that override
+  is the FIRST ladder entry in `fontResolverService.buildFontLadders` — above `ownFace`,
+  and not exact-gated — so it would beat a brand's real captured font. Verified
+  harmless today ONLY because **no brand has `titleStylePreset` set**. Setting one
+  would immediately override that brand's real font.
 
 ---
 
 ## KNOWN-OPEN
+
+- **Title-group simultaneity still open on 14 LANDSCAPE + 2 proto combos
+  (2026-08-31).** The 2026-08-31 vertical fix cleared every vertical and every
+  Meta feed/square layout, but 18 preset+format combinations still have two
+  groups on screen at once and are listed explicitly in
+  `scripts/verifyTitleGroupsNeverOverlap.js`'s ACCEPTED baseline. 14 are
+  `landscape` (16:9 PMax/YouTube — NOT a Meta surface), all the same shape
+  (`main|upperThird X main|lowerThird`); landscape additionally has the
+  `panelColumnStyle` split-stage geometry, so whether they can actually collide
+  there needs its own look and was NOT audited. 2 are `proto-bottom-editorial` /
+  `proto-kinetic-center` on feed+square (prototypes). Removing a line from that
+  baseline as each is fixed is the goal; ADDING one to silence a red run is the
+  exact regression the harness exists to catch.
+- **Meta-ads font capture produces zero evidence for all 9 brands (2026-08-31).**
+  See CURRENT STATE for the measurement. Next concrete step: check whether
+  `APIFY_ADLIB_ACTOR` / `APIFY_TOKEN` are set on the **backend** Render service
+  (brand enrichment runs there, not adgen); the committed default is blank.
+  Separately, `Reach Social`'s website font scan failed permanently and will
+  never retry — its `fontIngestedAt` stamp needs clearing to re-attempt.
+- **An engine-level anchor-collision guard was drafted and reverted (2026-08-31).**
+  Owner chose the template fix instead. If the landscape/proto set is ever tackled
+  generically rather than per-preset, note the design constraint that killed the
+  first attempt: its "no free band, so keep the authored anchor" fallback means
+  sitting on a face, which the owner ruled unacceptable. Any revival needs a
+  better answer for that case than the one that was written.
 
 - **Director-side reservation gate widening (`aiCreativeDirectorService.js`
   PROOF PRESENCE comment, correction 1) — owner decision, not started, now

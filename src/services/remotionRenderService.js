@@ -844,7 +844,7 @@ async function renderTitles(args) {
  * plateHints, fps, durationSec } to preserve the existing preview contract,
  * and optionally still frames.
  */
-async function renderPreview({ meta, spec, tokens, format, plateImagePath = null, plateVideoPath = null, plateColor = '#3D3D3D', scale = 0.5, durationSec = 8, stillTimesSec = null, includeVideo = true, placementMode = null, brand = null, platformFormat = null, safeZoneKey = null }) {
+async function renderPreview({ meta, spec, tokens, format, plateImagePath = null, plateVideoPath = null, plateColor = '#3D3D3D', scale = 0.5, durationSec = 8, stillTimesSec = null, includeVideo = true, placementMode = null, brand = null, platformFormat = null, safeZoneKey = null, plateHintsOverride = null }) {
   const compositionId = COMPOSITION_BY_FORMAT[format];
   if (!compositionId) throw new Error(`renderPreview: unknown format '${format}'`);
 
@@ -903,6 +903,12 @@ async function renderPreview({ meta, spec, tokens, format, plateImagePath = null
           }
         }
       }
+      // Offline-repro hook only: lets a local harness feed a hand-built
+      // plateHints (e.g. a synthetic face position via
+      // plateIntelService.applyFaceKeepOut) without real footage or a vision
+      // API call. Unset (the default) leaves this byte-identical to before.
+      if (plateHintsOverride) plateHints = plateHintsOverride;
+
       const durationInFrames = Math.max(1, Math.round(durationSec * fps));
 
       const cleanMeta = { ...stripHeavyMeta(meta), brandWebsiteDomain: websiteDomain(meta?.brandWebsiteUrl) };
