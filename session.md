@@ -63,6 +63,29 @@ visually against the REAL delivered plate at 4+ timestamps, on both a canonical 
 brand preset. Pinned by `scripts/verifyTitleGroupsNeverOverlap.js` (54 combos checked,
 18-entry explicit baseline for the not-yet-fixed landscape/proto set).
 
+**PORTED TO BACKEND 2026-08-31 (same day): `liquidretail_backend` PR #361, merged `e7aa605`,
+deployed live on backend web + worker.** All 15 preset files verified byte-identical across the
+two repos by sha256 after the merge, and `scripts/verifyTitleGroupsNeverOverlap.js` was ported
+too (its ACCEPTED baseline regenerated from BACKEND's own preset set, not copied). Manifest
+reconciled: the 10 preset files are now `synced`; `services/remotionRenderService.js` was
+returned to `fork` — its `plateHintsOverride` debt is PAID (verified at backend `:620`/`:683`),
+and the residual ~336-line divergence is adgen's DELIBERATE child-process render architecture
+(`remotionChildSupervisor.js` / `remotionRender.child.js` / prebuilt `.remotion-bundle`), which
+backend does not have and is not expected to adopt. Marking that whole file `unported` earlier
+the same day was too broad.
+
+⚠️ **BACKEND HAS NO CI.** `gh pr checks` reports zero checks on a backend branch, so #361 merged
+on the strength of a local suite run only (210/214, identical to a stashed clean-tree baseline).
+adgen has CI; backend does not — and a backend merge AUTO-DEPLOYS the main API. Worth closing.
+
+**CORRECTION to a claim made earlier the same day:** "backend still renders the old broken
+layouts on retitle" was OUT OF DATE even before this port. Backend #359/#360 already route manual
+retitle to adgen's `retitleConsumer` when `ADGEN_RENDERER_ENABLED=true` (live). The port still
+mattered, but for narrower reasons: the two UNGATED `renderPreview()` call sites in
+`routes/brand.js` (operator title-still previews, ~`:1162`/`:1438`), and the dormant in-process
+fallback at ~`:612` that would resurrect the defect if the flag were ever flipped off.
+
+
 **Three new tools (none are `verify*`; none touch the suite):**
 - `scripts/renderTitlePreview.js` — renders any preset/format/face-scenario to a still
   in ~5s with NO database, network, or vision call. Supports `--plate-video` for real
