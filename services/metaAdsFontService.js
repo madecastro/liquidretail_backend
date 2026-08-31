@@ -277,7 +277,11 @@ async function fetchCreativeIdsFromAccount(adAccountId, token, limit) {
 }
 
 // ── Tier 2: the brand's connected ad account. Free (Graph API). ─────────────
-async function gatherFromConnected(brand, cap, knownCreativeIds, errors, deps) {
+// `state` is mutated in place (not returned) on purpose: it must survive an
+// exception thrown ANYWHERE after the credential resolves, so the caller's
+// tier-3 decision below can never be fooled into paying Apify for a brand
+// that does have a working Meta Ads connection.
+async function gatherFromConnected(brand, cap, knownCreativeIds, errors, deps, state = {}) {
   const resolve = deps.resolveMetaAdsCred || resolveMetaAdsCred;
   const fetchBatch = deps.fetchCreativeBatch || fetchCreativeBatch;
   const fetchIds = deps.fetchCreativeIdsFromAccount || fetchCreativeIdsFromAccount;
@@ -285,6 +289,10 @@ async function gatherFromConnected(brand, cap, knownCreativeIds, errors, deps) {
   let token, adAccountId;
   try {
     ({ token, adAccountId } = await resolve(brand._id || brand.id));
+    // A credential resolved: this brand HAS connected Meta Ads. Their own ad
+    // account is the authoritative source for their creatives from here on,
+    // whatever this tier goes on to return.
+    state.credentialed = true;
   } catch (err) {
     // no-meta-ads-cred / no-ad-account / decrypt are expected for brands that
     // never connected Meta — a recorded soft failure, not an exception.
@@ -532,18 +540,37 @@ async function identifyBrandAdFonts(brand, { maxImages = DEFAULT_MAX_IMAGES } = 
   // (metaAdsCreativeMatcher skips creative fetch once a product set resolves),
   // so the docs tier legitimately comes up short for the most product-shaped
   // campaigns and this tier is the normal path, not a rare fallback.
+  const connectedState = { credentialed: false };
   if (images.length < MIN_USABLE_IMAGES) {
     try {
-      const fromConnected = await gatherFromConnected(brand, cap, knownCreativeIds, errors, deps);
+      const fromConnected = await gatherFromConnected(brand, cap, knownCreativeIds, errors, deps, connectedState);
       for (const img of fromConnected) pushImage(images, seen, img, cap);
     } catch (err) {
       errors.push(`connected: ${err.message}`);
     }
   }
 
-  // Tier 3 — billable public scrape, only when nothing free worked at all.
+  // Tier 3 — billable public scrape. Only when nothing free worked at all AND
+  // the brand has NOT connected Meta Ads.
+  //
+  // THE CONNECTED-ACCOUNT RULE (owner, 2026-08-31). Apify exists to see the ads
+  // of a brand we have no direct access to. Once a brand connects their Meta Ads
+  // account we are reading their creatives from the source, for free, over the
+  // Graph API — so paying a third party to scrape the PUBLIC Ad Library for the
+  // same brand is pure waste, and it is a worse signal besides (the Ad Library
+  // shows only currently-active public ads, while the connected account exposes
+  // the brand's own creative objects directly).
+  //
+  // Note this is deliberately keyed on "a credential resolved", NOT on "tier 2
+  // returned images". A connected account that legitimately has zero creatives,
+  // or that hit a transient Graph error, must still suppress the paid scrape:
+  // in both cases the right answer is to come back later for free, not to spend
+  // money working around an integration we already have.
   let apifyBilled = false;
-  if (images.length === 0) {
+  if (images.length === 0 && connectedState.credentialed) {
+    errors.push('adlibrary: skipped (brand has Meta Ads connected — its own ad account is '
+      + 'authoritative; not paying for a public Ad Library scrape)');
+  } else if (images.length === 0) {
     try {
       const fromLib = await gatherFromAdLibrary(brand, cap, errors, deps);
       apifyBilled = !!fromLib.billed;

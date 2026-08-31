@@ -81,6 +81,12 @@ const ZERO_SPEND_PATTERNS = [
                                                           // no ad creatives) happens before or during an
                                                           // unbilled call.
   /^adlibrary: skipped \(APIFY_ADLIB_ACTOR not set\)$/,  // tier 3 never invoked — actor unconfigured
+  /^adlibrary: skipped \(brand has Meta Ads connected/,  // tier 3 never invoked — connected-account
+                                                          // rule (owner 2026-08-31): a brand with a
+                                                          // working Meta Ads credential never pays for
+                                                          // a public Ad Library scrape. Nothing
+                                                          // submitted, nothing billed.
+
   /^adlibrary: brand has neither name nor website to search by$/, // tier 3 never invoked — no search key
   /^disabled: META_ADS_FONTS_ENABLED=false$/,            // kill switch, before any tier ran
   /^brand has no id$/,                                   // guard clause, before any tier ran

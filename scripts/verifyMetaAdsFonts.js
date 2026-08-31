@@ -570,6 +570,86 @@ check('K1 META_ADS_FONTS_ENABLED=false short-circuits before any spend', async (
   }
 });
 
+// ── C1-C3: THE CONNECTED-ACCOUNT RULE (owner, 2026-08-31) ──────────────────
+// A brand that has connected Meta Ads must NEVER trigger the billable Apify
+// public-Ad-Library scrape. Their own ad account is authoritative and free;
+// paying a third party to scrape the same brand's public ads is waste. Keyed
+// on "a credential resolved", NOT on "tier 2 returned images" — a connected
+// account with zero creatives, or one that hit a transient Graph error, must
+// still suppress the paid scrape.
+check('C1 connected account with ZERO creatives must NOT fall through to billable Apify', async () => {
+  const prevActor = process.env.APIFY_ADLIB_ACTOR;
+  process.env.APIFY_ADLIB_ACTOR = 'some/actor';   // actor IS configured — only the rule can stop it
+  try {
+    let apifyCalls = 0;
+    const res = await identifyBrandAdFonts(
+      { _id: 'c1', name: 'ConnectedNoAds' },
+      {},
+      {
+        Campaign: { find: () => ({ select: () => ({ lean: async () => [] }) }) },
+        resolveMetaAdsCred: async () => ({ token: 't', adAccountId: 'act_1' }),
+        fetchCreativeIdsFromAccount: async () => [],          // connected, but no creatives
+        chatCompletion: async () => { throw new Error('vision must never be reached'); },
+        runActorSync: async () => { apifyCalls++; return []; },
+      }
+    );
+    assert.strictEqual(apifyCalls, 0, 'a connected brand must never reach the paid Apify scrape');
+    assert.strictEqual(res.billableAttempted, false, 'nothing was spent');
+    assert.ok(res.errors.some((e) => /adlibrary: skipped \(brand has Meta Ads connected/.test(e)),
+      'the skip reason must be recorded so the remediation classifier can read it');
+  } finally {
+    if (prevActor === undefined) delete process.env.APIFY_ADLIB_ACTOR;
+    else process.env.APIFY_ADLIB_ACTOR = prevActor;
+  }
+});
+check('C2 connected account whose Graph call ERRORS must still NOT fall through to Apify', async () => {
+  const prevActor = process.env.APIFY_ADLIB_ACTOR;
+  process.env.APIFY_ADLIB_ACTOR = 'some/actor';
+  try {
+    let apifyCalls = 0;
+    const res = await identifyBrandAdFonts(
+      { _id: 'c2', name: 'ConnectedGraphError' },
+      {},
+      {
+        Campaign: { find: () => ({ select: () => ({ lean: async () => [] }) }) },
+        resolveMetaAdsCred: async () => ({ token: 't', adAccountId: 'act_2' }),
+        fetchCreativeIdsFromAccount: async () => { throw new Error('rate limited'); },
+        chatCompletion: async () => { throw new Error('vision must never be reached'); },
+        runActorSync: async () => { apifyCalls++; return []; },
+      }
+    );
+    assert.strictEqual(apifyCalls, 0,
+      'a transient Graph failure on a CONNECTED brand must not be worked around with money');
+    assert.strictEqual(res.billableAttempted, false, 'nothing was spent — retry later for free');
+  } finally {
+    if (prevActor === undefined) delete process.env.APIFY_ADLIB_ACTOR;
+    else process.env.APIFY_ADLIB_ACTOR = prevActor;
+  }
+});
+check('C3 NOT-connected brand still DOES reach Apify (the rule must not disable the tier outright)', async () => {
+  const prevActor = process.env.APIFY_ADLIB_ACTOR;
+  process.env.APIFY_ADLIB_ACTOR = 'some/actor';
+  try {
+    let apifyCalls = 0;
+    await identifyBrandAdFonts(
+      { _id: 'c3', name: 'NotConnected', website: 'https://x.example' },
+      {},
+      {
+        Campaign: { find: () => ({ select: () => ({ lean: async () => [] }) }) },
+        resolveMetaAdsCred: async () => { const e = new Error('none'); e.code = 'no-meta-ads-cred'; throw e; },
+        chatCompletion: async () => { throw new Error('vision must never be reached'); },
+        runActorSync: async () => { apifyCalls++; return []; },
+        recordFlatCost: async () => {},
+      }
+    );
+    assert.strictEqual(apifyCalls, 1,
+      'Apify is exactly what an UNCONNECTED brand is for — the rule must be narrow');
+  } finally {
+    if (prevActor === undefined) delete process.env.APIFY_ADLIB_ACTOR;
+    else process.env.APIFY_ADLIB_ACTOR = prevActor;
+  }
+});
+
 (async () => {
   for (const run of queue) await run();
   console.log(`\n  ${pass} passed, ${failures.length} failed\n`);
