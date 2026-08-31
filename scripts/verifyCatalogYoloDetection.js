@@ -324,6 +324,77 @@ try {
   }
 }
 
+// ── N: PERMANENT-failure marker + backfill query ──
+// This entire group protects the "poisoned URL doesn't re-queue every
+// 15 minutes forever" invariant. Root cause of the 2026-08-31 500-flood:
+// yolo microservice raised PIL.UnidentifiedImageError on Cloudinary
+// error-page bytes, Flask HTML 500 came back, backend re-queued the
+// same Media every tick. Fixes: yolo emits JSON `code`, backend marks
+// PERMANENT, mediaYoloRefine stamps Media.yoloFailReason, backfill
+// query gates on yoloDetectedAt so stamped rows exit.
+const yoloSvcSrc = readFile('services/yoloService.js');
+if (/PERMANENT_YOLO_CODES\s*=\s*new Set/.test(yoloSvcSrc) && /unidentified-image/.test(yoloSvcSrc)) {
+  pass('N1', 'yoloService declares PERMANENT_YOLO_CODES including unidentified-image');
+} else {
+  fail('N1', 'yoloService missing PERMANENT_YOLO_CODES set — 4xx responses cannot be classified as permanent');
+}
+if (/e\.permanent\s*=\s*permanent/.test(yoloSvcSrc) && /e\.yoloCode\s*=/.test(yoloSvcSrc)) {
+  pass('N2', 'yoloService attaches err.permanent + err.yoloCode on thrown non-transient failures');
+} else {
+  fail('N2', 'yoloService thrown error missing permanent/yoloCode fields — callers cannot fork on permanence');
+}
+
+const mediaSrc2 = readFile('models/Media.js');
+if (/yoloFailReason:\s*\{[\s\S]{0,200}String/.test(mediaSrc2)) {
+  pass('N3', 'Media.yoloFailReason declared as String — strict-schema-safe write');
+} else {
+  fail('N3', 'Media.yoloFailReason MISSING from schema — Mongoose strict will silently drop the write');
+}
+
+const refineSrc2 = readFile('services/mediaYoloRefine.js');
+if (/err\s*&&\s*err\.permanent[\s\S]{0,400}yoloFailReason/.test(refineSrc2)) {
+  pass('N4', 'detectYoloForMedia catches err.permanent and stamps yoloFailReason');
+} else {
+  fail('N4', 'detectYoloForMedia does NOT stamp yoloFailReason on permanent errors — poisoned URLs will re-queue');
+}
+if (/PERMANENT_SLOT_CODES/.test(refineSrc2) && /slotCode[\s\S]{0,200}yoloFailReason:\s*slotCode/.test(refineSrc2)) {
+  pass('N5', 'detectYoloForMediaBatch stamps yoloFailReason on per-slot PERMANENT codes');
+} else {
+  fail('N5', 'detectYoloForMediaBatch does NOT mark per-slot permanent failures — batch caller re-queues poisoned URLs');
+}
+
+const workerSrc2 = readFile('worker.js');
+if (/yoloDetectedAt:\s*null[\s\S]{0,300}refinedProducts/.test(workerSrc2)) {
+  pass('N6', 'worker.js backfill query filters on yoloDetectedAt:null (stamped rows exit the queue)');
+} else {
+  fail('N6', 'worker.js backfill query does NOT gate on yoloDetectedAt — permanent failures will still re-queue every tick');
+}
+
+// N7: yolo microservice side — JSON errors, not Flask HTML. This is
+// a SOURCE-text scan against the sibling repo; if the yolo repo isn't
+// where we expect, skip gracefully (harness is backend-owned, not
+// cross-repo enforced).
+try {
+  const yoloPyPath = path.join(__dirname, '..', '..', '..', 'yolo_microservice', 'yolo_service.py');
+  if (fs.existsSync(yoloPyPath)) {
+    const pySrc = fs.readFileSync(yoloPyPath, 'utf8');
+    if (/class _DecodeError/.test(pySrc) && /'unidentified-image'/.test(pySrc)) {
+      pass('N7', 'yolo_service.py declares _DecodeError with code unidentified-image');
+    } else {
+      fail('N7', 'yolo_service.py MISSING _DecodeError or unidentified-image code');
+    }
+    if (/@app\.errorhandler\(Exception\)/.test(pySrc)) {
+      pass('N8', 'yolo_service.py registers Flask errorhandler(Exception) — no HTML 500 fallthrough');
+    } else {
+      fail('N8', 'yolo_service.py missing errorhandler(Exception) — uncaught exceptions still return HTML 500');
+    }
+  } else {
+    info('N7', 'yolo_microservice/yolo_service.py not adjacent — cross-repo pins skipped');
+  }
+} catch (e) {
+  info('N7', `cross-repo scan failed: ${e.message}`);
+}
+
 // ── Summary ──
 console.log(`\n──── ${RESULTS.pass} pass, ${RESULTS.fail} fail, ${RESULTS.info} info ────`);
 process.exit(RESULTS.fail > 0 ? 1 : 0);

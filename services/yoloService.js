@@ -84,7 +84,13 @@ async function detectBatch(items) {
           return {
             width:  r?.width  || 0,
             height: r?.height || 0,
+            // Preserve per-slot code so the batch caller
+            // (mediaYoloRefine.detectYoloForMediaBatch) can mark a
+            // Media as PERMANENT bad-source when the microservice
+            // reports 'unidentified-image' on THAT slot, without
+            // affecting the other slots' persistence.
             error:  r?.error || null,
+            code:   r?.code  || null,
             detections: dets.map((det, i) => ({
               id: `p${i + 1}`,
               cropBuffer: det.base64 ? Buffer.from(det.base64, 'base64') : Buffer.alloc(0),
@@ -101,9 +107,12 @@ async function detectBatch(items) {
       lastErr = err;
       if (!isTransientYoloError(err)) {
         const kind = classifyYoloError(err);
-        console.error(`❌ YOLO batch failed (non-transient, ${kind}):`, err.response?.data || err.message);
+        const permanent = isPermanentYoloError(err);
+        console.error(`❌ YOLO batch failed (non-transient${permanent ? ', PERMANENT' : ''}, ${kind}):`, err.response?.data || err.message);
         const e = new Error(`yolo-batch:${kind}: ${err.message || 'call failed'}`);
         e.yoloKind = kind;
+        e.yoloCode = readYoloBodyCode(err);
+        e.permanent = permanent;
         throw e;
       }
       console.warn(`⚠️  YOLO batch transient failure (attempt ${attempt + 1}): ${err.code || err.message}`);
@@ -140,9 +149,17 @@ function isTransientYoloError(err) {
 // Previously every failure collapsed to the literal string
 // "Object detection failed", which made 23% of runs indistinguishable
 // from each other in the DetectRun flags.
+//
+// When yolo_microservice returns a JSON body with an explicit `code`
+// field (e.g. 'unidentified-image' on a Cloudinary error page), the
+// code from the BODY wins over the HTTP-status bucket — that gives
+// callers a specific reason to mark the Media as bad-source rather
+// than a generic http-400 that could mean anything.
 function classifyYoloError(err) {
   const code = err?.code;
   const status = err?.response?.status;
+  const bodyCode = readYoloBodyCode(err);
+  if (bodyCode) return bodyCode;
   if (code === 'ECONNABORTED') return 'client-timeout';
   if (code === 'ECONNRESET')   return 'conn-reset';
   if (code === 'ETIMEDOUT')    return 'conn-timeout';
@@ -152,6 +169,39 @@ function classifyYoloError(err) {
   }
   if (typeof err?.message === 'string' && /timeout/i.test(err.message)) return 'client-timeout';
   return code ? String(code).toLowerCase() : 'unknown';
+}
+
+// axios delivers a JSON response body as an already-parsed object on
+// `err.response.data`, but the yolo microservice historically emitted
+// HTML on unhandled exceptions — after the outer errorhandler shipped
+// (yolo_service.py `_json_uncaught`), every failure carries JSON with
+// a `code` field. This reads that code, tolerating the transitional
+// window where a mixed cluster (old + new instances) may still return
+// a string body.
+function readYoloBodyCode(err) {
+  const data = err?.response?.data;
+  if (!data) return null;
+  if (typeof data === 'object' && typeof data.code === 'string') return data.code;
+  return null;
+}
+
+// A "permanent" yolo error is one where retrying will produce the
+// same failure — always. Bad source bytes, an unrecognizable image,
+// zero-byte body. Callers can safely mark the input as failed and
+// move on; the retry budget is reserved for genuinely transient
+// causes (network churn, worker warm-up, 5xx from an overloaded
+// pool). Anchored on the microservice's JSON `code` field, not on
+// HTTP status alone, because a 4xx without a code could still be a
+// caller-side bug worth surfacing distinctly.
+const PERMANENT_YOLO_CODES = new Set([
+  'unidentified-image',
+  'decode-error',
+  'empty-body',
+  'missing-image'
+]);
+function isPermanentYoloError(err) {
+  const bodyCode = readYoloBodyCode(err);
+  return !!(bodyCode && PERMANENT_YOLO_CODES.has(bodyCode));
 }
 
 async function _callYolo(url, form) {
@@ -197,9 +247,12 @@ async function _callYolo(url, form) {
       // Non-transient failures (4xx, parse errors, etc.) → fail fast
       if (!isTransientYoloError(err)) {
         const kind = classifyYoloError(err);
-        console.error(`❌ YOLO detection failed (non-transient, ${kind}):`, detail);
+        const permanent = isPermanentYoloError(err);
+        console.error(`❌ YOLO detection failed (non-transient${permanent ? ', PERMANENT' : ''}, ${kind}):`, detail);
         const e = new Error(`yolo:${kind}: ${err.message || 'call failed'}`);
         e.yoloKind = kind;
+        e.yoloCode = readYoloBodyCode(err);
+        e.permanent = permanent;
         throw e;
       }
       console.warn(`⚠️  YOLO transient failure (attempt ${attempt + 1}): ${err.code || err.message}`);

@@ -316,8 +316,22 @@ mongoose.connect(process.env.MONGODB_URI, {
       try {
         const Media = require('./models/Media');
         const { detectYoloForMedia } = require('./services/mediaYoloRefine');
+        // Filter on yoloDetectedAt:null — NOT refinedProducts emptiness.
+        // A Media that fails PERMANENTLY (Cloudinary error page, bad
+        // bytes, decode failure) stamps yoloDetectedAt + yoloFailReason
+        // in mediaYoloRefine so it exits the queue after one attempt;
+        // a Media that succeeds also stamps yoloDetectedAt. The old
+        // query re-drove poisoned URLs every tick forever (Prod 500s
+        // 2026-08-31 traced to exactly that loop). Transient failures
+        // don't stamp anything and roll around next tick as intended.
+        //
+        // Legacy Media that pre-date yoloDetectedAt (pre-bb91303) may
+        // have non-empty refinedProducts + null yoloDetectedAt; those
+        // enter this query and short-circuit inside detectYoloForMedia
+        // via the already-refined check — cheap DB read, no HTTP call.
         const stale = await Media.find({
           source: 'catalog-product',
+          yoloDetectedAt: null,
           $or: [
             { refinedProducts: { $exists: false } },
             { refinedProducts: { $size: 0 } }

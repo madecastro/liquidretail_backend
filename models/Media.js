@@ -90,13 +90,25 @@ const mediaSchema = new mongoose.Schema({
   refinedProducts:    { type: [mongoose.Schema.Types.Mixed], default: [] },
   lastDetectedAt:     Date,
   // ── Ingest-time YOLO detection (services/mediaYoloRefine.js) ──────────
-  // Stamped when the ingest-time YOLO+refine job populates refinedProducts[].
+  // Stamped when the ingest-time YOLO+refine job runs on this Media —
+  // regardless of whether YOLO returned detections or the paid GPT-4.1
+  // refine populated `refinedProducts`, AND regardless of whether the
+  // yolo microservice reported a PERMANENT failure (see yoloFailReason).
   // Distinct from lastDetectedAt (which tracks the FULL detect pipeline);
-  // this lets us tell "YOLO ran at ingest and populated boxes" from
-  // "the full paid pipeline ran". Backfill query gates on refinedProducts
-  // emptiness, not this field, but this field is the observability signal.
+  // this lets us tell "YOLO ran at ingest" from "the full paid pipeline
+  // ran". The BACKFILL QUERY (worker.js yoloBackfillTick) gates on this
+  // being null so success + permanent-fail rows exit the queue after
+  // one round-trip; only transient failures roll around next tick.
   // Indexed so a "detected-in-last-N-days" audit query is cheap.
   yoloDetectedAt:     { type: Date, default: null, index: true },
+  // Companion PERMANENT-failure marker for yoloDetectedAt. Set with the
+  // microservice's JSON `code` (e.g. 'unidentified-image' when a stale
+  // Cloudinary URL returned an HTML error page). Presence means "we
+  // tried and the source is bad" — declared here rather than left
+  // undeclared because Mongoose's strict schema silently drops writes
+  // to undeclared paths (§0 trap), and this field must be reliably
+  // readable by any audit that wants to purge poisoned Media.
+  yoloFailReason:     { type: String, default: null, index: true },
 
   // Phase 2d — relational match results denormalized for fast reads. The
   // source of truth is ProductMatchArtifact (per-run audit), but these

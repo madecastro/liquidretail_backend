@@ -45,6 +45,18 @@ const IMAGE_FETCH_TIMEOUT_MS = Math.max(
   parseInt(process.env.MEDIA_YOLO_IMAGE_FETCH_TIMEOUT_MS, 10) || 60_000
 );
 
+// yolo_microservice slot-level codes that mean the SOURCE is bad and no
+// number of retries will change that. Must match the single-call
+// PERMANENT_YOLO_CODES set in services/yoloService.js so batch and
+// single paths mark Media identically. Any code the microservice can
+// emit that requires human data-cleanup should live in BOTH sets.
+const PERMANENT_SLOT_CODES = new Set([
+  'unidentified-image',
+  'decode-error',
+  'empty-body',
+  'missing-image'
+]);
+
 // Refuse to buffer huge assets — YOLO service has its own limit but a wild
 // upstream file can OOM this process's HTTP client before we even reach the
 // microservice. Matches ingestShotClassifyService.maxBytes shape.
@@ -213,9 +225,33 @@ async function detectYoloForMedia(media, { trigger = 'ingest' } = {}) {
   }
 
   const buffer = await downloadImageBuffer(media.fileUrl);
-  const yolo   = await yoloService.detectMultipleProducts(buffer, {
-    prompt: openVocabPrompt,   // null / omitted for UGC = existing behaviour
-  });
+  let yolo;
+  try {
+    yolo = await yoloService.detectMultipleProducts(buffer, {
+      prompt: openVocabPrompt,   // null / omitted for UGC = existing behaviour
+    });
+  } catch (err) {
+    // Permanent yolo failures — bad image bytes, HTML error page from
+    // Cloudinary at media.fileUrl, decode error — must not roll around
+    // next backfill tick. Stamp yoloDetectedAt + yoloFailReason so the
+    // worker's yoloBackfillTick query (filters on yoloDetectedAt:null)
+    // excludes this Media from now on. refinedProducts stays empty —
+    // downstream consumers already treat empty as "no detections".
+    // Transient errors (ECONNRESET, timeout) re-throw so caller /
+    // backfill sees them as retryable and picks the Media up again.
+    if (err && err.permanent) {
+      await Media.updateOne(
+        { _id: media._id },
+        { $set: {
+            yoloDetectedAt: new Date(),
+            yoloFailReason: err.yoloCode || err.yoloKind || 'permanent-failure'
+        } }
+      );
+      console.warn(`⚠️  detectYoloForMedia[${media._id}]: PERMANENT ${err.yoloCode || err.yoloKind} — stamped, will not re-queue`);
+      return { status: 'skipped', reason: err.yoloCode || 'permanent-failure' };
+    }
+    throw err;
+  }
   const yoloDetections = yolo?.detections || [];
 
   // Fork on media.source + YOLO signal.
@@ -347,14 +383,48 @@ async function detectYoloForMediaBatch(mediaList, { product = null, trigger = 'i
   }
   if (!batchItems.length) return results;
 
-  const { results: yoloResults } = await yoloService.detectBatch(batchItems);
+  let yoloResults;
+  try {
+    ({ results: yoloResults } = await yoloService.detectBatch(batchItems));
+  } catch (err) {
+    // Whole-batch permanent failure — bubble up so the orchestrator counts
+    // each target as failed. Whole-batch transient failures are already
+    // handled by yoloService.detectBatch's retry loop; if that exhausted,
+    // let the caller retry the whole product on the next backfill tick.
+    throw err;
+  }
 
-  // Per-Media fork on the returned slots. If the microservice reported a
-  // per-slot error, treat that slot as YOLO-empty (falls through to paid
-  // refine on UGC, or synthesizes a whole-image fallback on catalog).
+  // Per-Media fork on the returned slots. Three cases:
+  //   (a) slot carries a PERMANENT code — mark that Media as bad-source,
+  //       do NOT let it re-queue (yoloDetectedAt stamp + yoloFailReason).
+  //   (b) slot has detections — fork on media.source (catalog synthesize
+  //       or paid refine).
+  //   (c) slot has no detections + no code — treated as legitimate empty,
+  //       falls through to catalog synthesize (fallback bbox) or paid
+  //       refine on UGC. Existing behaviour.
   await Promise.all(batchToIdx.map(async (idx, k) => {
     const media = inList[idx];
     const yolo = yoloResults[k] || { detections: [] };
+    const slotCode = yolo.code || null;
+    // Per-slot permanent failure — must not re-queue on the next
+    // backfill tick. Kept out of the persist branch below because we
+    // set yoloFailReason and skip refinedProducts entirely.
+    if (slotCode && PERMANENT_SLOT_CODES.has(slotCode)) {
+      try {
+        await Media.updateOne(
+          { _id: media._id },
+          { $set: {
+              yoloDetectedAt: new Date(),
+              yoloFailReason: slotCode
+          } }
+        );
+        console.warn(`⚠️  detectYoloForMediaBatch[${media._id}]: PERMANENT ${slotCode} — stamped, will not re-queue`);
+        results[idx] = { mediaId: media._id, status: 'skipped', reason: slotCode };
+      } catch (err) {
+        results[idx] = { mediaId: media._id, status: 'failed', reason: 'persist-failed', error: err.message };
+      }
+      return;
+    }
     const yoloDetections = yolo.detections || [];
     const isCatalog = media.source === 'catalog-product';
 
