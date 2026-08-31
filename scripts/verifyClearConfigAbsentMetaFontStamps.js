@@ -92,6 +92,45 @@ check('N7 a totally unrecognised message must NEVER classify as zero-spend', () 
   assert.strictEqual(classify('something a future code change might say that this list has never seen').zeroSpend, false);
 });
 
+// ── N8-N11: the EVIDENCE GATE (added on review of PR #362, before the script
+// was ever run against production). metaAdsFontService gates tier 2 on
+// `images.length < MIN_USABLE_IMAGES` (2), NOT on `=== 0`. So tier 1 can hand
+// over exactly ONE image, tier 2 then runs and pushes a `connected: …` error,
+// tier 3 is skipped (needs images.length === 0), and the BILLABLE vision call
+// runs anyway on that one image. The persisted row then reads
+// metaFontsIngestError = "connected: …" — which every ZERO_SPEND_PATTERN
+// accepts — while a vision call was in fact paid for. Clearing that stamp
+// makes the next enrichment run re-pay it. The usage argument closes it.
+check('N8 a connected:-only string WITH a persisted evidence row is NOT zero-spend', () => {
+  const r = classify('connected: no-ad-account', {
+    heading: null, body: null,
+    evidence: [{ family: 'Inter', creativeId: 'abc', confidence: 'low' }],
+  });
+  assert.strictEqual(r.zeroSpend, false, r.reason);
+});
+check('N9 a connected:-only string WITH an identified heading is NOT zero-spend', () => {
+  const r = classify('connected: creative batch failed', {
+    heading: { family: 'Montserrat', confidence: 'high' }, body: null, evidence: [],
+  });
+  assert.strictEqual(r.zeroSpend, false, r.reason);
+});
+check('N10 a connected:-only string WITH an identified body is NOT zero-spend', () => {
+  const r = classify('connected: no-ad-account', {
+    heading: null, body: { family: 'Inter', confidence: 'medium' }, evidence: [],
+  });
+  assert.strictEqual(r.zeroSpend, false, r.reason);
+});
+check('N11 the REAL production shape (empty usage + config-absence string) still clears', () => {
+  // All 9 live brands measured 2026-08-31 carry exactly this pair. The
+  // evidence gate must not make the script a no-op on the rows it exists for.
+  const r = classify(
+    'connected: no-meta-ads-cred: Brand has no active Meta Ads credential. Connect Meta Ads first.; '
+    + 'adlibrary: skipped (APIFY_ADLIB_ACTOR not set)',
+    { heading: null, body: null, evidence: [] },
+  );
+  assert.strictEqual(r.zeroSpend, true, r.reason);
+});
+
 console.log(`\n  ${pass} passed, ${failures.length} failed\n`);
 if (failures.length) {
   for (const f of failures) console.error(`  ❌ ${f}`);

@@ -96,7 +96,50 @@ const ZERO_SPEND_PATTERNS = [
 // submitted and either threw after starting or returned unusable items —
 // Apify bills on submit, not on a useful result).
 
-function classify(errorText) {
+/**
+ * @param {string|null} errorText  the row's frozen `metaFontsIngestError`
+ * @param {object|null} usage      the row's `metaAdsFontUsage` — REQUIRED to
+ *   close the gap documented immediately below. Omitting it falls back to the
+ *   string-only judgement, which is NOT safe on its own.
+ */
+function classify(errorText, usage = null) {
+  // ── EVIDENCE GATE (added on review, before this script was ever run) ──
+  //
+  // The string match alone is NOT sufficient, because `connected: …` is
+  // whitelisted wholesale as free (true — the Graph API does not bill) while
+  // a `connected:` segment does NOT imply the run stopped there:
+  //   metaAdsFontService gates tier 2 on `images.length < MIN_USABLE_IMAGES`
+  //   (2), not on `images.length === 0`. So tier 1 can supply exactly ONE
+  //   image, tier 2 then runs and pushes e.g. `connected: no-ad-account`,
+  //   tier 3 is skipped (it needs images.length === 0), and the BILLABLE
+  //   vision call runs anyway on that single image. On success the row is
+  //   persisted with metaFontsIngestError = "connected: no-ad-account" and
+  //   nothing else — a string that every pattern above happily accepts.
+  //   Clearing that stamp makes the next enrichment run re-pay the vision
+  //   call. Small money, but this whole PR exists to stop exactly that.
+  //
+  // A persisted identification result is positive proof the vision call ran,
+  // independent of how innocuous the error text looks. `evidence` is the
+  // strongest signal (it is only ever built from a parsed vision response),
+  // and heading/body cover a result shape that carried a family without
+  // per-image evidence rows.
+  //
+  // Residual, stated honestly: a vision call that ran and identified NOTHING
+  // leaves usage empty AND may leave only `connected:` text, so it is still
+  // indistinguishable from a true non-run using persisted fields alone —
+  // `imagesUsed` and `billableAttempted` are not stored on the Brand. That
+  // case over-clears by one free retry of a brand that has ~no readable ads.
+  // Bounded and much rarer than the success case this now catches; closing it
+  // properly would need a schema field, which is out of scope for a one-off.
+  if (usage && (usage.heading || usage.body
+    || (Array.isArray(usage.evidence) && usage.evidence.length > 0))) {
+    return {
+      zeroSpend: false,
+      reason: 'metaAdsFontUsage holds an identification result — the vision call ran (billable), '
+        + 'regardless of the error text',
+    };
+  }
+
   if (!errorText || !String(errorText).trim()) {
     // No error text recorded at all. We cannot positively prove this was a
     // config-absence non-run (it could equally be a genuine success that
@@ -180,7 +223,7 @@ async function main() {
     if (!brands.length) console.log(`  "${one.name}" has no metaFontsIngestedAt stamp — nothing to do.`);
   } else {
     brands = await Brand.find({ metaFontsIngestedAt: { $ne: null } })
-      .select('name metaFontsIngestedAt metaFontsIngestError')
+      .select('name metaFontsIngestedAt metaFontsIngestError metaAdsFontUsage')
       .sort({ name: 1 });
   }
   if (opts.limit) brands = brands.slice(0, opts.limit);
@@ -189,7 +232,7 @@ async function main() {
   const toClear = [];
   const leaveAlone = [];
   for (const b of brands) {
-    const { zeroSpend, reason } = classify(b.metaFontsIngestError);
+    const { zeroSpend, reason } = classify(b.metaFontsIngestError, b.metaAdsFontUsage);
     const row = {
       id: String(b._id),
       name: b.name || String(b._id),
