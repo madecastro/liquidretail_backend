@@ -11,6 +11,11 @@
 // boundaries — it throws CancelledError when cancel was requested.
 
 const OperationRun = require('../models/OperationRun');
+// Slack ingest-status projection. Single integration point: touch(runId,
+// kind) — safe to call unconditionally, never throws, gates itself on
+// config + a kind whitelist, and does its own Mongo re-reads on a detached
+// timer. See that module's header for the full design rationale.
+const ingestStatusFeed = require('./ingestStatusFeedService');
 
 const THROTTLE_MS = 1000;
 const HEARTBEAT_INTERVAL_MS = 30 * 1000;
@@ -80,6 +85,7 @@ function makeNoopHandle() {
 
 function makeHandle(doc) {
   const id = doc._id;
+  const kind = doc.kind;
   const openedAt = Date.now();
   let lastWriteAt = 0;
   let pending = null;
@@ -88,9 +94,37 @@ function makeHandle(doc) {
   let cancelCached = !!doc.cancelRequested;
   let cancelCheckedAt = 0;
   let lastStage = null;
+  // Start of whatever stage is currently "open" — the implicit pre-first-
+  // stage period counts too, so a run whose very first .stage() call closes
+  // immediately still gets a real durationMs instead of 0.
+  let currentStageStartedAt = openedAt;
   let itemsDone = doc.itemsDone || 0;
   let itemsTotal = doc.itemsTotal != null ? doc.itemsTotal : null;
+  let lastNote = doc.note || null;
   let warned = false;
+
+  // Close whatever stage is currently open (if any) into a {name, startedAt,
+  // endedAt, durationMs, itemsDone, itemsTotal, note} record for OperationRun
+  // .stages[]. Returns null when no stage was ever opened (kinds that only
+  // use tick()/label, never .stage() — unaffected by this addition). Called
+  // from BOTH a normal stage() transition and every terminal write, so the
+  // very last stage a run was in always gets its own timed, counted entry
+  // instead of being left open forever.
+  function closeOpenStagePush() {
+    if (lastStage == null) return null;
+    const now = Date.now();
+    const push = {
+      name: lastStage,
+      startedAt: new Date(currentStageStartedAt),
+      endedAt: new Date(now),
+      durationMs: now - currentStageStartedAt,
+      itemsDone,
+      itemsTotal,
+      note: lastNote
+    };
+    lastStage = null; // closed — guards against a double-push if called twice
+    return push;
+  }
 
   function warnOnce(err, where) {
     if (warned) return;
@@ -110,11 +144,14 @@ function makeHandle(doc) {
     if (writeTimer.unref) writeTimer.unref();
   }
 
-  async function flush(extra = {}, { force = false } = {}) {
+  async function flush(extra = {}, { force = false, push = null } = {}) {
     if (closed && !force) return;
 
     if (!force && Date.now() - lastWriteAt < THROTTLE_MS) {
       pending = Object.assign(pending || {}, extra);
+      // `push` is only ever passed alongside force:true call sites (a stage
+      // transition or a terminal write), so there is no batched-push case to
+      // handle here — nothing is lost by not merging it into `pending`.
       scheduleFlush();
       return;
     }
@@ -131,10 +168,31 @@ function makeHandle(doc) {
     payload.updatedAt = ts;
     payload.heartbeatAt = ts;
 
+    const update = { $set: payload };
+    if (push) update.$push = { stages: push };
+
     try {
-      await OperationRun.updateOne({ _id: id }, { $set: payload });
+      await OperationRun.updateOne({ _id: id }, update);
     } catch (err) {
       warnOnce(err, 'flush');
+      // A $push + $set combined in one updateOne is one atomic write — if
+      // it throws (a bad value, a transient Mongo error), the WHOLE write
+      // is lost, not just the stage-history push. That is fine for a
+      // regular tick()/note() flush (no push involved, unchanged from
+      // before this feature). But `push` only ever accompanies a stage
+      // transition or a TERMINAL write (succeed/fail/markCancelled/cancel)
+      // — losing one of those is worse than losing a stages[] entry: the
+      // reaper would otherwise fail the run later with a generic "process
+      // restarted" instead of its real status/error. Retry once WITHOUT
+      // the push so the terminal status still lands even if the stage
+      // history entry does not.
+      if (push) {
+        try {
+          await OperationRun.updateOne({ _id: id }, { $set: payload });
+        } catch (err2) {
+          warnOnce(err2, 'flush (retry without push)');
+        }
+      }
     }
   }
 
@@ -167,9 +225,45 @@ function makeHandle(doc) {
     stage(name) {
       if (closed) return handle;
       const firstOfStage = lastStage !== name;
+      // Close the PREVIOUS stage (if this is a real transition, not a
+      // repeat of the same name) before opening the new one, so its own
+      // elapsed time + final counts land in stages[] rather than being
+      // silently overwritten by the next stage's progress.
+      const push = firstOfStage ? closeOpenStagePush() : null;
+      const resetUpdate = {};
+      if (firstOfStage) {
+        currentStageStartedAt = Date.now();
+        // Some real call chains open a stage that is itself immediately
+        // superseded by a NESTED call's own .stage() (e.g. apifyIngestService
+        // .syncBrandApify's 'shopify catalog' dispatch stage, closed almost
+        // instantly by shopifyPublicIngestService.syncBrandShopifyDirect's
+        // first 'resolving catalog access' stage on the SAME handle) —
+        // without progress of its own in between, that dispatch-only stage
+        // would otherwise inherit whatever note/counts the PREVIOUS,
+        // unrelated stage last left behind (e.g. an Instagram tally showing
+        // up against a "shopify catalog" entry, or a first empty credential
+        // in postSyncService.js inheriting a prior credential's count).
+        // Reset ALL THREE here — note AND the counts — so a stage that
+        // never calls tick()/note() of its own closes (and, until its own
+        // first tick(), currently DISPLAYS) as empty rather than stale and
+        // misattributed. Included in the SAME $set as `stage` below, not
+        // just the in-memory closure, so the live "current stage" reader
+        // (services/ingestStatusFeedService.js) never shows carried-over
+        // numbers either, not only the closed stages[] history.
+        lastNote = null;
+        itemsDone = 0;
+        itemsTotal = null;
+        resetUpdate.note = null;
+        resetUpdate.itemsDone = 0;
+        resetUpdate.itemsTotal = null;
+        // pct is meaningless without itemsTotal — same convention tick()
+        // already uses (only sets pct when itemsTotal is a positive number).
+        resetUpdate.pct = null;
+      }
       lastStage = name;
       // First call of each stage always flushes; later updates throttle.
-      flush({ stage: name }, { force: firstOfStage }).catch(() => {});
+      flush({ stage: name, ...resetUpdate }, { force: firstOfStage, push }).catch(() => {});
+      if (firstOfStage) ingestStatusFeed.touch(id, kind);
       return handle;
     },
 
@@ -177,6 +271,7 @@ function makeHandle(doc) {
       if (closed) return handle;
       itemsDone = done;
       if (total != null) itemsTotal = total;
+      if (note != null) lastNote = note;
       const update = { itemsDone: done };
       if (total != null) update.itemsTotal = total;
       if (note != null) update.note = note;
@@ -184,12 +279,15 @@ function makeHandle(doc) {
         update.pct = Math.min(1, Math.max(0, itemsDone / itemsTotal));
       }
       flush(update).catch(() => {});
+      ingestStatusFeed.touch(id, kind);
       return handle;
     },
 
     note(text) {
       if (closed) return handle;
+      lastNote = text;
       flush({ note: text }).catch(() => {});
+      ingestStatusFeed.touch(id, kind);
       return handle;
     },
 
@@ -202,6 +300,7 @@ function makeHandle(doc) {
     // Terminal — always flush immediately; never reject to the caller.
     succeed(summary) {
       closeTimers();
+      const push = closeOpenStagePush();
       const update = { status: 'succeeded', endedAt: new Date() };
       if (itemsTotal != null) {
         update.itemsDone = itemsTotal;
@@ -211,7 +310,9 @@ function makeHandle(doc) {
         if (typeof summary === 'string') update.note = summary;
         else if (typeof summary === 'object') update.meta = summary;
       }
-      return flush(update, { force: true }).catch(() => {});
+      const p = flush(update, { force: true, push }).catch(() => {});
+      ingestStatusFeed.touch(id, kind);
+      return p;
     },
 
     // Optional second `meta` arg mirrors succeed(summary): object →
@@ -220,10 +321,13 @@ function makeHandle(doc) {
     // per-source diagnostics (the case operators most need them).
     fail(err, meta) {
       closeTimers();
+      const push = closeOpenStagePush();
       const message = err && err.message ? err.message : String(err || 'failed');
       const update = { status: 'failed', endedAt: new Date(), error: message, note: message };
       if (meta != null && typeof meta === 'object') update.meta = meta;
-      return flush(update, { force: true }).catch(() => {});
+      const p = flush(update, { force: true, push }).catch(() => {});
+      ingestStatusFeed.touch(id, kind);
+      return p;
     },
 
     // Refresh cancelRequested from Mongo at most 1/s (cached in between).
@@ -244,10 +348,12 @@ function makeHandle(doc) {
 
       if (cancelCached) {
         closeTimers();
+        const push = closeOpenStagePush();
         await flush(
           { status: 'cancelled', endedAt: new Date(), note: 'Cancelled — partial results kept' },
-          { force: true }
+          { force: true, push }
         );
+        ingestStatusFeed.touch(id, kind);
         throw new CancelledError();
       }
       return true;
@@ -262,10 +368,13 @@ function makeHandle(doc) {
     // break-style abort flow (e.g. apify demo sync's legacy /abort flag).
     markCancelled(note) {
       closeTimers();
-      return flush(
+      const push = closeOpenStagePush();
+      const p = flush(
         { status: 'cancelled', endedAt: new Date(), note: note || 'Cancelled — partial results kept' },
-        { force: true }
+        { force: true, push }
       ).catch(() => {});
+      ingestStatusFeed.touch(id, kind);
+      return p;
     }
   };
 
@@ -318,6 +427,7 @@ async function startRun({
       meta: meta || null
     });
 
+    ingestStatusFeed.touch(doc._id, doc.kind);
     return makeHandle(doc);
   } catch (err) {
     console.warn('[progressService] startRun failed — returning no-op handle:', err && err.message ? err.message : err);
@@ -333,6 +443,19 @@ async function sweepStaleRuns() {
   const cutoff = new Date(Date.now() - STALE_HEARTBEAT_MS);
   const now = new Date();
   try {
+    // Snapshot which runs are about to be reaped BEFORE the write, so the
+    // Slack ingest-status feed (if it was tracking any of them) can render
+    // the now-terminal doc instead of leaving its message stuck "in
+    // progress" forever — mirrors this same reaper on the DB side. Same
+    // filter as the updateMany below; a failure here must never block the
+    // actual reap write, so it is its own try/catch and best-effort.
+    let reaped = [];
+    try {
+      reaped = await OperationRun.find(
+        { status: { $in: ['running', 'cancelling'] }, heartbeatAt: { $lt: cutoff } }
+      ).select('_id kind').lean();
+    } catch (_) { /* best-effort snapshot only */ }
+
     const res = await OperationRun.updateMany(
       { status: { $in: ['running', 'cancelling'] }, heartbeatAt: { $lt: cutoff } },
       {
@@ -347,6 +470,10 @@ async function sweepStaleRuns() {
     );
     const n = res.modifiedCount != null ? res.modifiedCount : res.nModified;
     if (n) console.warn(`[progressService] sweepStaleRuns: marked ${n} run(s) failed`);
+
+    for (const r of reaped) {
+      ingestStatusFeed.touch(r._id, r.kind);
+    }
     return res;
   } catch (err) {
     console.warn('[progressService] sweepStaleRuns failed:', err && err.message ? err.message : err);

@@ -59,6 +59,21 @@ function igWasAttempted(igResult) {
   return igResult != null && !igResult.skipped;
 }
 
+/**
+ * resolveCatalogMethod(cfg) → 'apify' | 'generic-sitemap' | 'shopify-direct'
+ *
+ * Pure resolution of which catalog ingest method actually runs for a demo
+ * brand's Shopify sync, independent of what (if anything) is persisted on
+ * Brand.apifyDemo.method — a run with method:null still resolves (and
+ * runs) as 'shopify-direct' whenever a shopifyUrl is set. Exported so a
+ * caller reporting on a run (e.g. Slack ingest-status projection) states
+ * the method THAT ACTUALLY RAN without re-deriving or duplicating this
+ * ternary — see the same expression at the syncBrandApify call site below.
+ */
+function resolveCatalogMethod(cfg = {}) {
+  return ['apify', 'generic-sitemap'].includes(cfg.method) ? cfg.method : 'shopify-direct';
+}
+
 // Orchestrator — runs whichever sub-syncs the brand has configured.
 // Returns per-source summaries so the route response is easy to
 // display in the Sales UI.
@@ -111,7 +126,7 @@ async function syncBrandApify(brandId, { skipInstagram = false } = {}) {
   // 'generic-sitemap' runs the client-agnostic XML-sitemap + schema.org
   // JSON-LD scraper for non-Shopify server-rendered stores (uses
   // cfg.shopifyUrl as the target). IG stays on Apify regardless (hybrid).
-  const method = ['apify', 'generic-sitemap'].includes(cfg.method) ? cfg.method : 'shopify-direct';
+  const method = resolveCatalogMethod(cfg);
   const out = { ok: true, brandId: String(brand._id), ig: null, shopify: null, method, _run: run };
   const t0 = Date.now();
 
@@ -277,7 +292,9 @@ async function syncBrandInstagram(brand, run = null) {
 
   const summary = { ok: true, fetched: posts.length, ingested: 0, skipped: 0, errors: 0, queuedRunIds: [], aborted: false };
 
+  let idx = 0;
   for (const post of posts) {
+    idx += 1;
     if (await isBrandAborted(brand._id, run)) {
       summary.aborted = true;
       console.log(`   · Apify IG ingest aborted mid-loop for brand=${brand._id}`);
@@ -294,6 +311,15 @@ async function syncBrandInstagram(brand, run = null) {
       console.warn(`   ⚠️  Apify IG ingest failed for ${post.externalId}: ${err.message}`);
       summary.errors++;
     }
+    // Same tick() convention as shopifyPublicIngestService.js's product
+    // upsert loop — real per-item counts, not the whole-run summary, so
+    // an in-progress Slack render (and this stage's own closed-stage
+    // record) shows genuine numbers instead of nothing at all.
+    run?.tick?.(
+      idx,
+      posts.length,
+      `${idx}/${posts.length} fetched · ${summary.ingested} ingested · ${summary.skipped} skipped`
+    );
   }
 
   // Fire brand-level enrichment in the background so downstream ad
@@ -540,8 +566,10 @@ async function syncBrandShopify(brand, run = null) {
   // ARCHITECTURE: upsert NEVER awaits image classify. Post-loop pass only.
   const shotSession = ingestShotClassify.createSession();
   const pendingClassify = [];
+  let idx = 0;
   try {
   for (const p of products) {
+    idx += 1;
     if (await isBrandAborted(brand._id, run)) {
       summary.aborted = true;
       console.log(`   · Apify Shopify ingest aborted mid-loop for brand=${brand._id}`);
@@ -629,6 +657,15 @@ async function syncBrandShopify(brand, run = null) {
       console.warn(`   ⚠️  Apify Shopify upsert failed for ${p.externalId}: ${err.message}`);
       summary.errors++;
     }
+    // Same tick() convention as shopifyPublicIngestService.js's product
+    // upsert loop — this method never reported per-item progress at all
+    // before, so a run using it showed no counts under 'shopify catalog'
+    // beyond the outer dispatch stage.
+    run?.tick?.(
+      idx,
+      products.length,
+      `products ${idx}/${products.length} · ${summary.added} added · ${summary.updated} updated`
+    );
   }
 
   // Post-loop classify pass — products already persisted.
@@ -882,5 +919,8 @@ module.exports = {
   // Pure money-guard decisions — exported so scripts/verifyApifyCatalogOnlyGuard.js
   // can pin them offline, no live DB required.
   shouldRunInstagramSync,
-  igWasAttempted
+  igWasAttempted,
+  // Pure catalog-method resolution — exported so ingestStatusFeedService can
+  // report the method that actually ran (see docstring above).
+  resolveCatalogMethod
 };
