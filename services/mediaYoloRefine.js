@@ -1,20 +1,23 @@
 // Per-Media YOLO+refine helper.
 //
-// Populates Media.refinedProducts[] from raw YOLO detections. Two paths,
+// Populates Media.refinedProducts[] from YOLO service detections. Two paths,
 // forked on media.source, both writing the SAME shape so downstream consumers
 // (reframeStrategyChooser, videoProductAnchor, pmaxSplitStrategy,
 // quoteProvenance) don't care which fired:
 //
-//   catalog-product + YOLO detected  → SYNTHESIZE from CatalogProduct
-//     metadata ($0, label = product.title which is more specific than
-//     GPT-4.1 Vision's generic "shoe"/"handbag").
-//   catalog-product + YOLO empty     → PAID GPT-4.1 Vision refine
-//     (~$0.03/media). YOLOv8x's COCO classes miss fashion / beauty /
-//     jewelry SKUs; refine's vision model can find them, and paying
-//     is preferable to synthesizing whole-image which degrades geometric
-//     consumers (pmaxSplitStrategy centroid, reframe crop-first fit).
-//   any other source (UGC, etc.)     → PAID GPT-4.1 Vision refine.
-//     UGC identification is the whole point of refine on those paths.
+//   catalog-product  → sends a PROMPT (built from CatalogProduct.category
+//     + title) to yolo_microservice, which routes through Grounding DINO
+//     (open-vocab detection). Eval showed 100% detection + 100% correct
+//     labels vs COCO's 78%/22%. If detections hit → SYNTHESIZE with
+//     product.title as the label ($0, no paid refine). If open-vocab
+//     returned empty → PAID GPT-4.1 Vision refine (~$0.03/media) as
+//     fallback, though this branch fires rarely at Grounding DINO's
+//     recall rate.
+//
+//   any other source (UGC, etc.)     → No prompt; yolo_microservice runs
+//     YOLOv8x-COCO + OpenCV + OAI (existing pipeline). Then PAID GPT-4.1
+//     Vision refine — UGC identification is the whole point of refine on
+//     those paths.
 //
 // Every refined entry carries a `source` field ('synthesized' | 'gpt-refine' |
 // 'backfill') so a future audit can tell how each bbox was produced without
@@ -128,6 +131,41 @@ function stampGptRefineSource(refined) {
   return refined.map((r) => ({ ...r, source: 'gpt-refine' }));
 }
 
+// Build a Grounding DINO prompt from CatalogProduct metadata. Period-
+// separated class strings ("shoe. sneaker. espadrille.") — that's what
+// Grounding DINO expects. Prioritizes category (most reliable signal),
+// then trailing tokens from title (usually noun-ish), then generic
+// fallbacks so the model always has something to work with.
+//
+// Pure — no I/O. Exported for the verify harness so it can pin the
+// heuristic on fixtures.
+function buildOpenVocabPrompt({ title, category, brand } = {}) {
+  const parts = [];
+  if (category && typeof category === 'string') {
+    parts.push(
+      ...category.split(/[>|/,;]/).map((s) => s.trim().toLowerCase()).filter(Boolean)
+    );
+  }
+  if (title && typeof title === 'string') {
+    const tokens = title.toLowerCase().match(/[a-z]+/g) || [];
+    if (tokens.length) {
+      parts.push(tokens[tokens.length - 1]);
+      if (tokens.length >= 2) parts.push(tokens.slice(-2).join(' '));
+    }
+  }
+  parts.push('product', 'object');
+  const seen = new Set();
+  const out = [];
+  for (const p of parts) {
+    const norm = (p || '').trim().toLowerCase();
+    if (norm && !seen.has(norm) && norm.length <= 30) {
+      seen.add(norm);
+      out.push(norm);
+    }
+  }
+  return out.slice(0, 8).join('. ') + '.';
+}
+
 /**
  * Detect YOLO on ONE Media doc and write refinedProducts + yoloProducts +
  * yoloDetectedAt. Idempotent — short-circuits when refinedProducts is
@@ -151,17 +189,39 @@ async function detectYoloForMedia(media, { trigger = 'ingest' } = {}) {
     return { status: 'skipped', reason: 'no-fileUrl' };
   }
 
+  const isCatalog = media.source === 'catalog-product';
+
+  // For catalog Media: load CatalogProduct FIRST so we can:
+  //   (a) build the open-vocab prompt from category/title
+  //   (b) synthesize refinedProducts with product.title as label if
+  //       Grounding DINO returns hits
+  // For UGC/other: skip the product load, skip the prompt — yolo_service
+  // will run the existing COCO+rects+OAI pipeline and we fall through to
+  // paid refine (unchanged behaviour).
+  let product = null;
+  let openVocabPrompt = null;
+  if (isCatalog) {
+    const productId = media.metadata?.catalogProductId || media.productId || null;
+    if (productId) {
+      product = await CatalogProduct.findById(productId).select('title brand category').lean();
+    }
+    openVocabPrompt = buildOpenVocabPrompt({
+      title:    product?.title,
+      category: product?.category,
+      brand:    product?.brand,
+    });
+  }
+
   const buffer = await downloadImageBuffer(media.fileUrl);
-  const yolo   = await yoloService.detectMultipleProducts(buffer);
+  const yolo   = await yoloService.detectMultipleProducts(buffer, {
+    prompt: openVocabPrompt,   // null / omitted for UGC = existing behaviour
+  });
   const yoloDetections = yolo?.detections || [];
 
   // Fork on media.source + YOLO signal.
   let refined = [];
   let path;
-  const isCatalog = media.source === 'catalog-product';
   if (isCatalog && yoloDetections.length > 0) {
-    const productId = media.metadata?.catalogProductId || media.productId || null;
-    const product = productId ? await CatalogProduct.findById(productId).select('title brand category').lean() : null;
     refined = synthesizeRefinedFromCatalog({ yolo, media, product });
     path = 'synthesized';
     // Backfill trigger overrides so audits can distinguish backfill drainage
@@ -201,12 +261,14 @@ async function detectYoloForMedia(media, { trigger = 'ingest' } = {}) {
 
 module.exports = {
   detectYoloForMedia,
+  buildOpenVocabPrompt,
   // Exported for the verify harness — pure helpers so fixtures can
   // exercise the fork without HTTP.
   __test: {
     pickBestDetection,
     buildCloudinaryCropUrl,
     synthesizeRefinedFromCatalog,
-    stampGptRefineSource
+    stampGptRefineSource,
+    buildOpenVocabPrompt
   }
 };

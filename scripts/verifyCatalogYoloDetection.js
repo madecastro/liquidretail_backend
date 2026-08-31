@@ -35,6 +35,8 @@ try {
   else fail('A1', 'mediaYoloRefine.detectYoloForMedia MISSING');
   if (mod.__test && typeof mod.__test.synthesizeRefinedFromCatalog === 'function') pass('A2', 'mediaYoloRefine.__test.synthesizeRefinedFromCatalog exported');
   else fail('A2', 'mediaYoloRefine.__test.synthesizeRefinedFromCatalog MISSING');
+  if (typeof mod.buildOpenVocabPrompt === 'function') pass('A2b', 'mediaYoloRefine.buildOpenVocabPrompt exported');
+  else fail('A2b', 'mediaYoloRefine.buildOpenVocabPrompt MISSING — Grounding DINO fork needs this');
 } catch (e) { fail('A1', `require mediaYoloRefine threw: ${e.message}`); }
 
 try {
@@ -195,6 +197,58 @@ try {
   }
 } catch (e) {
   fail('I', `synthesizer fixture threw: ${e.stack || e.message}`);
+}
+
+// ── K: open-vocab prompt builder (Grounding DINO fork) ──
+try {
+  const { buildOpenVocabPrompt } = require('../services/mediaYoloRefine');
+  {
+    const p = buildOpenVocabPrompt({ title: 'Women\'s Marseille Wedge Espadrille', category: 'Shoes > Espadrilles', brand: 'Soludos' });
+    // Should be a period-separated string with prominent product tokens.
+    if (p.includes('espadrilles') && p.includes('shoes') && p.endsWith('.')) {
+      pass('K1', `prompt derived correctly: '${p}'`);
+    } else {
+      fail('K1', `prompt missing key tokens or malformed: '${p}'`);
+    }
+  }
+  {
+    // Empty category + title falls back to generic tokens so Grounding DINO
+    // isn't sent an empty prompt (would return 0 detections).
+    const p = buildOpenVocabPrompt({});
+    if (p.includes('product') && p.includes('object')) pass('K2', `prompt fallback OK: '${p}'`);
+    else fail('K2', `prompt fallback missing generic tokens: '${p}'`);
+  }
+  {
+    // Dedup: exact same class-string should not appear twice as a period-
+    // separated token. Multi-word phrases containing the same word are
+    // fine — Grounding DINO treats "shoe" and "cool shoe" as distinct
+    // class strings (both useful signals).
+    const p = buildOpenVocabPrompt({ title: 'Some Cool Shoe', category: 'Footwear > Shoe' });
+    const tokens = p.replace(/\.$/, '').split('.').map((s) => s.trim());
+    const uniques = new Set(tokens);
+    if (uniques.size === tokens.length) pass('K3', `dedup OK: no exact-token duplicates in '${p}'`);
+    else fail('K3', `dedup broken: exact-token duplicates in '${p}'`);
+  }
+} catch (e) {
+  fail('K', `open-vocab prompt fixture threw: ${e.stack || e.message}`);
+}
+
+// ── L: prompt is threaded from mediaYoloRefine → yoloService ──
+{
+  const src = readFile('services/mediaYoloRefine.js');
+  const yoloSrc = readFile('services/yoloService.js');
+  // detectYoloForMedia builds the prompt and passes it as opts.prompt.
+  if (/detectMultipleProducts\(buffer,\s*\{[\s\S]{0,80}prompt/.test(src)) {
+    pass('L1', 'mediaYoloRefine passes prompt to yoloService.detectMultipleProducts');
+  } else {
+    fail('L1', 'mediaYoloRefine does NOT pass prompt — Grounding DINO fork unreachable');
+  }
+  // yoloService accepts and forwards the prompt to the microservice.
+  if (/opts\.prompt/.test(yoloSrc) && /form\.append\(['"]prompt['"]/.test(yoloSrc)) {
+    pass('L2', 'yoloService threads opts.prompt into multipart form field');
+  } else {
+    fail('L2', 'yoloService does NOT append prompt to form — microservice will never receive it');
+  }
 }
 
 // ── J: no accidental paid path on catalog + YOLO-hit ──

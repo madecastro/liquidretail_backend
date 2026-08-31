@@ -7,9 +7,18 @@ const FormData = require('form-data');
 // legacy) still works.
 const YOLO_URL = process.env.YOLO_SERVICE_URL || 'https://yolo-microservice.onrender.com';
 
-async function detectMultipleProducts(imageBuffer) {
+async function detectMultipleProducts(imageBuffer, opts = {}) {
   const form = new FormData();
   form.append('image', imageBuffer, { filename: 'upload.jpg' });
+  // Optional prompt — when provided AND the microservice has
+  // YOLO_OPEN_VOCAB_ENABLED, /detect routes through Grounding DINO
+  // instead of the YOLOv8x-COCO+rects+OAI pipeline. Period-separated
+  // class-string format ("shoe. sneaker. espadrille.") is what
+  // Grounding DINO expects. Backend builds this from CatalogProduct
+  // category+title in services/mediaYoloRefine.buildOpenVocabPrompt.
+  if (opts.prompt && typeof opts.prompt === 'string' && opts.prompt.trim()) {
+    form.append('prompt', opts.prompt.trim());
+  }
   return _callYolo(`${YOLO_URL}/detect`, form);
 }
 
