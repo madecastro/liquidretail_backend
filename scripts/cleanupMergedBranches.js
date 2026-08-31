@@ -24,10 +24,10 @@
  *     worktree, including the main checkout) — checked via `git worktree
  *     list`, not by name-guessing.
  *   - NEVER deletes a branch with commits that are not reachable from ANY
- *     remote-tracking ref (re-checked here directly, per branch, at the
- *     moment of deletion — not read from a stale audit report).
+ *     remote-tracking ref (checked directly per branch — not read from a
+ *     stale audit report).
  *   - NEVER deletes/removes a worktree with uncommitted or untracked
- *     changes (`git status --porcelain`, checked at the moment of deletion).
+ *     changes (`git status --porcelain`).
  *   - NEVER touches a LOCKED worktree — reports it instead of unlocking it
  *     for you (a `git worktree lock` is a deliberate human decision; only a
  *     human should undo it).
@@ -38,6 +38,16 @@
  *     equivalence check against trunk's own history, the same mechanism
  *     the well-known "git-delete-squashed" script uses.
  *   - Anything ambiguous is SKIPPED and reported, never guessed through.
+ *   - TWO-PHASE, not classify-then-blindly-trust: classifyBranch() runs
+ *     once up front to decide WHAT to show/delete, but performDelete()
+ *     independently calls reverifyStillSafeToDelete() — a from-scratch
+ *     re-classification with freshly re-listed worktrees — immediately
+ *     before touching that specific branch, and aborts if anything changed.
+ *     This matters because a run over hundreds of branches can take tens of
+ *     seconds, and these two repos explicitly run with multiple concurrent
+ *     sessions/agents as the norm, not the exception — plenty of window for
+ *     another session to check out a worktree, push new commits, or dirty a
+ *     tree on a branch this run already classified minutes earlier.
  *
  * WHY `git branch -D` (force) FOR THE SQUASH CASE, NOT `-d`: git's own `-d`
  * only trusts literal ancestry (exactly the "ancestor" method above) — it
@@ -175,8 +185,41 @@ function classifyBranch(repoRoot, branch, trunk, trunkRef, worktrees, checkedOut
   return result;
 }
 
-function performDelete(repoRoot, item, log) {
+// Re-runs classifyBranch() from scratch, with FRESHLY re-listed worktrees,
+// immediately before acting on a single branch. Guards the TOCTOU window
+// between the up-front classification pass (which can take tens of seconds
+// across hundreds of branches — plenty of time for another session to check
+// out a worktree, push new commits, or dirty a tree in the interim, and this
+// task's own brief warns that concurrent sessions are the norm here, not the
+// exception) and the moment this specific branch is actually deleted. Cheap
+// insurance: a handful of extra git calls per branch actually being deleted,
+// never per branch merely being reported.
+function reverifyStillSafeToDelete(repoRoot, item, trunk, trunkRef) {
+  const freshWorktrees = listWorktrees(repoRoot);
+  const freshCheckedOut = branchesCheckedOutSomewhere(freshWorktrees);
+  const fresh = classifyBranch(repoRoot, item.branch, trunk, trunkRef, freshWorktrees, freshCheckedOut);
+  if (fresh.action !== 'delete') {
+    return { ok: false, reason: `re-check at delete-time now says: ${fresh.reason}` };
+  }
+  if (fresh.mergeMethod !== item.mergeMethod || fresh.worktreePath !== item.worktreePath) {
+    return {
+      ok: false,
+      reason: `re-check at delete-time disagrees with the earlier classification (method ${item.mergeMethod}->${fresh.mergeMethod}, worktree ${item.worktreePath}->${fresh.worktreePath}) — refusing to guess which is right`,
+    };
+  }
+  return { ok: true, fresh };
+}
+
+function performDelete(repoRoot, item, trunk, trunkRef, log) {
   const outcome = { branch: item.branch, steps: [], ok: true };
+
+  const recheck = reverifyStillSafeToDelete(repoRoot, item, trunk, trunkRef);
+  if (!recheck.ok) {
+    outcome.ok = false;
+    outcome.steps.push(`ABORTED — ${recheck.reason}`);
+    log(`  ${item.branch}: ${outcome.steps[outcome.steps.length - 1]}`);
+    return outcome;
+  }
 
   if (item.worktreePath) {
     const r = runGit(repoRoot, ['worktree', 'remove', item.worktreePath]);
@@ -277,7 +320,7 @@ function main() {
   if (opts.apply && toDelete.length) {
     console.log(`Applying ${toDelete.length} deletion(s)...`);
     for (const item of toDelete) {
-      const outcome = performDelete(repoRoot, item, (line) => console.log(line));
+      const outcome = performDelete(repoRoot, item, trunk, trunkRef, (line) => console.log(line));
       if (!outcome.ok) failures += 1;
     }
     const pruneR = runGit(repoRoot, ['worktree', 'prune', '-v']);
@@ -293,4 +336,4 @@ if (require.main === module) {
   main();
 }
 
-module.exports = { classifyBranch, performDelete };
+module.exports = { classifyBranch, performDelete, reverifyStillSafeToDelete };
