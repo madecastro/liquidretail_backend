@@ -14,127 +14,122 @@ it clears it back to this placeholder.)_
 
 ## CURRENT STATE
 
-*(Replaced 2026-08-31. Trunk `master`. Previous entry (PR #96 crop-fix, 2026-08-28) is
-superseded; its content is in `session.d/`.)*
+*(Replaced 2026-08-31 late. adgen trunk `master` @ `9cc9b6f` (#98) — renderer + titler both
+confirmed Live. Backend trunk `main` @ `f9efb43` — web + worker both Live.)*
 
-**Fixed 2026-08-31: TEXT-ON-TEXT on delivered vertical video ads (the "overlapping
-titles" defect).** Reported against ad `6a93ade2e4f1d02784398630` (`meta_reels_9_16`,
-conversion) and reproduced on `6a93ade1e4f1d02784398626` (`meta_stories_9_16`): the
-headline and the productName/rating/deliveryLine stack rendered on top of each other
-from ~1.5s, both illegible.
+**FIVE THINGS SHIPPED AND DEPLOYED TODAY.** All merged and live in production:
 
-**Mechanism.** `Canonical.jsx` groups slots by `(phase, position.anchor)` and resolves
-ONE anchor per group via `resolveGroupAnchor`'s keep-out walk; `stackContainerStyle`
-then positions `position:absolute` from that anchor alone. Each group walks
-`KEEP_OUT_CANDIDATES` **independently**, with no knowledge of where other groups
-landed, and the chains overlap heavily — so two SIMULTANEOUSLY-VISIBLE groups can
-resolve onto the same band and paint through each other. `canonical-conversion`
-vertical authored its close stack in the `hook` phase from 1.5s with **no exit**, so it
-shared the frame with `hook|upperThird` and then `proof|upperThird`; the plate scan
-flags the middle+bottom bands (the model *wears* the product, so those bands ARE the
-product), keep-out walked the close stack up to `upperThird`, and it landed on the live
-headline. Two natural controls on the SAME footage/run isolate it: `…398612` (plain
-`canonical`, strictly sequential) and `…39863a` (feed, single group) were both clean.
+1. **Title TEXT-ON-TEXT fixed** (adgen #97 → backend #361). Delivered vertical ads printed the
+   headline and the productName/rating stack on top of each other. Cause: `resolveGroupAnchor`
+   moves each slot group off a face/product band INDEPENDENTLY, with no knowledge of where other
+   groups landed, so two SIMULTANEOUSLY-VISIBLE groups could resolve onto one band.
+   Fix was TEMPLATE-level (owner choice): verticals re-timed strictly sequential, the pinned
+   in-creative `brandPill` removed across all 6 brand presets (cleared 12 combos by itself), and
+   `offsetY 0.105` on vertical upperThird so copy clears the model's head. **0 of 15 vertical
+   combos overlap, was 9.** Pinned by `scripts/verifyTitleGroupsNeverOverlap.js`.
 
-**Fix is TEMPLATE-LEVEL, not engine-level — owner decision 2026-08-31.** An engine
-collision-avoidance pass was drafted and deliberately reverted; its fallback ("if no
-band is free, keep the authored one") means sitting on a face, which the owner ruled
-unacceptable. Three template changes instead:
-1. **Sequential re-timing** of `canonical-conversion` + `canonical-conversion-pmax10`
-   vertical (cuts kept ON the Omni camera beats 2.67/5.12 and 3.125/6.375), and of
-   `soludos-summer-postcard` vertical. Each carries a `_layoutInvariant` field
-   explaining why it must stay sequential.
-2. **Removed the pinned in-creative `brandPill` wordmark** (`visible:false`, 18 slots
-   across all 6 brand presets), matching `canonical.json`'s own 2026-08-04 owner
-   decision. This alone cleared 12 combinations. A persistent group at `top` is
-   uniquely dangerous: `top` is the ONLY keep-out chain that can walk DOWN onto another
-   band — no other anchor's chain contains `top` — so it can be pushed into live copy
-   while nothing can be pushed onto it.
-3. **`offsetY: 0.105` on every vertical `upperThird` slot** in `canonical` +
-   `canonical-conversion` + `canonical-conversion-pmax10`, so hook/proof copy clears the
-   model's head on a full-body 9:16 shot. Owner rule: copy over the BODY is fine, copy
-   over the FACE is not. NOTE `Canonical.jsx` uses `first.position.offsetY` — only the
-   FIRST slot in a group positions the container — so the value is set on every slot in
-   the group for robustness.
+2. **Title LOW-CONTRAST legibility** (adgen #98). Contrast is now part of BAND SELECTION, not just
+   ink colour — the scan measured contrast and threw it away at the one moment it could act. Plus
+   a `paint-order:stroke fill` contour + weight bump, gated on WORST-CASE sub-AA contrast (matching
+   what placement already did). Social-proof sizes bumped (quote 1.15→1.30, rating 1.25→1.60).
+   ⚠️ **OWNER DECISION STILL OPEN**: the contour fires on ~1 ad in 5. To make it rarer, revert
+   `escalationInk` → `bandInk` at the three gates in Canonical.jsx. One line, everything else stands.
 
-**Result: 0 of 15 vertical preset+format combinations overlap (was 9).** All Meta
-9:16 / 4:5 / 1:1 layouts are clean except the two `proto-*` prototypes. Verified
-visually against the REAL delivered plate at 4+ timestamps, on both a canonical and a
-brand preset. Pinned by `scripts/verifyTitleGroupsNeverOverlap.js` (54 combos checked,
-18-entry explicit baseline for the not-yet-fixed landscape/proto set).
+3. **Meta-ads font retry** (backend #362). `metaFontsIngestedAt` was stamped even when NO source was
+   configured, permanently disabling retry. All 9 brands were stuck in exactly that state, so
+   connecting Meta later would have changed nothing. Now gated on a typed `billableAttempted`.
+   Also: a brand with Meta Ads connected NEVER pays for the Apify scrape (owner rule).
+   `scripts/clearConfigAbsentMetaFontStamps.js` unsticks existing rows — DRY-RUN by default,
+   **has not been run**.
 
-**PORTED TO BACKEND 2026-08-31 (same day): `liquidretail_backend` PR #361, merged `e7aa605`,
-deployed live on backend web + worker.** All 15 preset files verified byte-identical across the
-two repos by sha256 after the merge, and `scripts/verifyTitleGroupsNeverOverlap.js` was ported
-too (its ACCEPTED baseline regenerated from BACKEND's own preset set, not copied). Manifest
-reconciled: the 10 preset files are now `synced`; `services/remotionRenderService.js` was
-returned to `fork` — its `plateHintsOverride` debt is PAID (verified at backend `:620`/`:683`),
-and the residual ~336-line divergence is adgen's DELIBERATE child-process render architecture
-(`remotionChildSupervisor.js` / `remotionRender.child.js` / prebuilt `.remotion-bundle`), which
-backend does not have and is not expected to adopt. Marking that whole file `unported` earlier
-the same day was too broad.
+4. **Ad-phase parity** (backend #365, rescued from a 5-day-stale unpushed branch). `deriveAdPhase`
+   is now one canonical answer to "where is this ad", replacing three surfaces that each derived it
+   separately and could disagree. Fixed a LIVE bug: `routes/campaigns.js` never projected
+   `visionQc`/`renderError` at all, so that endpoint couldn't tell a QC fail from a render fail.
 
-⚠️ **BACKEND HAS NO CI.** `gh pr checks` reports zero checks on a backend branch, so #361 merged
-on the strength of a local suite run only (210/214, identical to a stashed clean-tree baseline).
-adgen has CI; backend does not — and a backend merge AUTO-DEPLOYS the main API. Worth closing.
+5. **Shopify theme fonts** (backend #363) + **Slack ingest status** (backend #364). The former pulls
+   REAL font files from a shop's theme (proven live: 5 Inter .woff2 off Peloton Apparel), authed +
+   public, gated only on a shopifyUrl — NOT on ingest method. The latter reports every ingest stage
+   with counts, per-stage and total timings, and the method, as one Slack message edited in place.
 
-**CORRECTION to a claim made earlier the same day:** "backend still renders the old broken
-layouts on retitle" was OUT OF DATE even before this port. Backend #359/#360 already route manual
-retitle to adgen's `retitleConsumer` when `ADGEN_RENDERER_ENABLED=true` (live). The port still
-mattered, but for narrower reasons: the two UNGATED `renderPreview()` call sites in
-`routes/brand.js` (operator title-still previews, ~`:1162`/`:1438`), and the dormant in-process
-fallback at ~`:612` that would resurrect the defect if the flag were ever flipped off.
+**MEASUREMENTS THAT OVERTURNED DELEGATED CLAIMS — verify numbers before acting on them.** Two
+adversarial reviews produced headline figures that did not survive re-measurement:
+  - "HIGH severity: the contrast term worsens landscape collisions." Swept the real formula over
+    1,157,625 band conditions: **+0.73pp** (72.00%→72.73%), and lowering CONTRAST_WEIGHT recovers
+    NONE of it. The real find is the **72% BASELINE** — see KNOWN-OPEN.
+  - "73% of real bands are worst-case marginal." Re-measured the same 5 delivered plates: **20%**
+    (3/15). That changed the decision from "the contour becomes the default look" to "it stays a
+    rescue for 1 ad in 5".
+Both reviews DID also find real bugs. The lesson is not "ignore reviews" — it is "re-derive any
+number you are about to act on".
 
+**PRE-EXISTING BUGS FOUND WHILE IN THERE (all fixed):** `BadgeSlot` painted plain text on footage
+with NEITHER shadow NOR contour — the only text-on-plate slot with zero legibility treatment, ever
+since its pill was removed 2026-08-03. `RatingSlot` hardcoded fontWeight 700/500, silently
+swallowing the treatment, so the star/score lockup an owner report called illegible was the one
+part that could not be reinforced. The contour could be clipped by its own `overflow:hidden`
+(proven in the same chrome-headless-shell Remotion uses: 2px horizontal, 1px on Verdana below the
+baseline) — `strokeClipGuard` fixes it.
 
-**Three new tools (none are `verify*`; none touch the suite):**
-- `scripts/renderTitlePreview.js` — renders any preset/format/face-scenario to a still
-  in ~5s with NO database, network, or vision call. Supports `--plate-video` for real
-  footage. **Its output uses HARNESS DEFAULT FONTS (Playfair/Inter/Lora), not brand
-  fonts** — it prints a banner saying so, because its serif output was once mistaken
-  for a production font regression. Judge geometry from it, never typeface.
-- `scripts/inspectAd.js` — read-only Ad inspector by `_id`. Structurally incapable of
-  writing (find/findOne only, caller supplies ObjectIds not filters, allow-listed field
-  projection, URI redacted from all output incl. error messages).
-- `scripts/verifyTitleGroupsNeverOverlap.js` — the regression pin above.
+**NEW TOOLING.** `scripts/renderTitlePreview.js` renders ANY preset/format/scenario to a still in
+~5s with NO database, network or vision call — `--plate-video` for real footage, `--real-scan` to
+run the real plate scan over actual frames, `--lum`/`--busy` to force a hostile band. **Its fonts
+are HARNESS DEFAULTS, not brand fonts** — it prints a banner saying so, because its serif output
+was once mistaken for a production font regression. Also `scripts/inspectAd.js` (read-only Ad
+inspector, structurally incapable of writing) and `scripts/verifyTitleGroupsNeverOverlap.js`.
 
-`renderPreview()` in `remotionRenderService.js` gained an optional
-`plateHintsOverride` (default null = byte-identical); it is the hook the preview
-harness uses to inject synthetic face flags.
-
-**Suite: 84/87.** The 2 non-expected reds (`verifyModelParity`, `verifyVendorDrift`)
-were confirmed PRE-EXISTING by stashing and re-running on a clean tree. All 10 changed
-files reconciled in `vendor-manifest.json` as owed ports to backend — backend renders
-these same presets through its own `brandScriptExecutor`/retitle path and does NOT yet
-have any of this.
-
-**FONT AUDIT (2026-08-31) — the "fonts look wrong" report was a FALSE ALARM, and the
-real finding is different.** Production fonts are correct: website font capture
-(`brandFontIngestService`) works and 8 of 9 brands have real downloaded font files
-(Soludos 8, Gymshark 9, PB5star 7, Marine Layer 6, Peloton 5, Pelagic 1 = `ArchivoV`,
-which is exactly what the delivered ad logged). The wrong-looking type came from the
-new preview harness's empty tokens — now banner-warned. What IS broken, measured
-directly:
-- **Meta-ads font scanning returns nothing for every brand.** `metaAdsFontService` is
-  wired, enabled (`META_ADS_FONTS_ENABLED=true`), and has RUN for all 9 brands
-  (`metaFontsIngestedAt` set) — but every one has
-  `metaAdsFontUsage: {heading:null, body:null, evidence:[]}`. 0/9 with zero evidence is
-  not a real "no fonts found". It sources ad images in 3 tiers (persisted Campaigns →
-  connected Meta ad account → public Ad Library via Apify); tier 3 is OFF because
-  `APIFY_ADLIB_ACTOR` is blank in `config/defaults.env:1790`. **Check whether it is set
-  on the BACKEND Render service** — brand enrichment runs there, not in adgen.
-- **`Reach Social` website scan failed permanently**: `could not fetch
-  https://reach-social.io`, and `fontIngestedAt` is stamped on failure so it never
-  retries. 0 usable font files.
-- Latent, NOT currently biting: the 6 brand presets hardcode generic Google fonts in
-  `tokenOverrides.fonts` (Poppins/Montserrat/Saira/Barlow/Fraunces), and that override
-  is the FIRST ladder entry in `fontResolverService.buildFontLadders` — above `ownFace`,
-  and not exact-gated — so it would beat a brand's real captured font. Verified
-  harmless today ONLY because **no brand has `titleStylePreset` set**. Setting one
-  would immediately override that brand's real font.
+**FONT PIPELINE REALITY CHECK.** Website font capture WORKS — 8 of 9 brands have real downloaded
+font files. The "fonts look wrong" report was a FALSE ALARM caused by the preview harness's
+placeholder fonts. What is actually broken needs OWNER action, not code: no brand has a Meta Ads
+credential; `APIFY_ADLIB_ACTOR` is unset; and `Reach Social`'s own `websiteUrl`
+(`https://reach-social.io`) returns **404**, which is why that brand has zero fonts.
 
 ---
 
 ## KNOWN-OPEN
+
+- **LANDSCAPE title groups collide across ~72% of the condition space — PRE-EXISTING, measured
+  2026-08-31, bigger than anything fixed today.** Sweeping the real `resolveGroupAnchor` formula
+  over 1,157,625 band conditions on the landscape shape (`main|upperThird` simultaneous with
+  `main|lowerThird`) shows they converge on one band ~72% of the time **with no contrast term at
+  all**. Cause: their keep-out chains (`['upperThird','center','lowerThird']` and
+  `['lowerThird','center','upperThird']`) contain the SAME three candidates, separated only by
+  `BAND_SWITCH_MARGIN` (0.03) — far too small to hold them apart. **`BAND_SWITCH_MARGIN` is the
+  lever, not CONTRAST_WEIGHT** (which costs only +0.73pp and buys back nothing when lowered).
+  Landscape is 16:9 PMax/YouTube, NOT a Meta surface, and it additionally has the
+  `panelColumnStyle` split-stage geometry, so whether these collide in *practice* was NOT audited —
+  do that before sizing a fix. The 18 affected combos are listed explicitly in
+  `scripts/verifyTitleGroupsNeverOverlap.js`'s ACCEPTED baseline. Rate is over a uniform sweep, not
+  a prediction of the real-ad rate.
+- **The title contour's firing rate is an OPEN OWNER DECISION.** It currently fires on ~1 ad in 5
+  (worst-case-across-clip reading, matching placement). Reverting `escalationInk` → `bandInk` at
+  the three gates in `Canonical.jsx` makes it rarer but reintroduces the inconsistency where a
+  group is MOVED because a band fails later in the clip yet denied the treatment for that same
+  failure. Rendered comparisons on real ads exist; the effect is subtle (0.95–6.6% of frame pixels).
+- **The final adversarial Grok pass on the title-legibility diff NEVER RAN** — it timed out at 10
+  minutes and #98 merged without it. The FIRST review completed and every finding was fixed and
+  independently verified, and a separate agent proved the clipping empirically, so it is not
+  unreviewed — but the second look at the fixes did not happen. Re-running it against `master`
+  retroactively is cheap and would close this honestly.
+- **Owner/ops actions that no code change can substitute for:**
+  (a) no brand has a Meta Ads credential, so meta-ads font capture cannot run at all;
+  (b) `APIFY_ADLIB_ACTOR` is unset, so the public Ad Library tier is off;
+  (c) `Reach Social`'s `websiteUrl` `https://reach-social.io` returns **404** (verified live, both
+      plain and browser UA) — that is why the brand has zero captured fonts, and its
+      `fontIngestedAt` stamp also needs clearing to re-attempt;
+  (d) Slack ingest status ships INERT until `SLACK_INGEST_STATUS_CHANNEL` is set;
+  (e) `scripts/clearConfigAbsentMetaFontStamps.js` (backend) has NOT been run — it is dry-run by
+      default and unsticks the 9 brands whose stamps currently block any retry.
+- **BACKEND HAS NO CI.** `gh pr checks` reports zero checks on a backend branch, yet a backend merge
+  AUTO-DEPLOYS the main API. Four backend PRs merged today on local suite runs alone. adgen has CI
+  and it earned its keep — it caught an unreconciled vendor manifest on #98 that would otherwise
+  have shipped. Worth closing this gap.
+- **PARALLEL SESSIONS IN ONE WORKING TREE MAKE LOCAL VERIFY RUNS UNRELIABLE.** While #98 was in
+  flight, another session had uncommitted work in `src/services/quoteProvenance.js` and
+  `src/services/providers/geminiSearchProvider.js` in the SAME directory. `verifyVendorDrift`
+  hashes the working tree, so their files showed as adgen-side drift in my local run and did not
+  exist in CI. Stage by explicit path, never `git add -A`, and attribute a local red against a
+  clean tree before believing it.
 
 - **Title-group simultaneity still open on 14 LANDSCAPE + 2 proto combos
   (2026-08-31).** The 2026-08-31 vertical fix cleared every vertical and every
