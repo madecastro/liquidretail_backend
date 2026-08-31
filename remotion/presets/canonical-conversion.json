@@ -1,6 +1,6 @@
 {
   "name": "canonical-conversion",
-  "description": "Funnel variant — CONVERSION (static social_proof_led twin). productName + rating + deliveryLine + CTA from ~1.5s, CTA persistent to end. Quote/reviewer proof mid-clip. Social proof led, clear shop intent. Camera-beat alignment (Fable direction 2026-08-04): the canonical Omni prompt shoots pan 0-2.67, logo zoom 2.67-5.12, full-product reveal 5.12-8 (buildVeoPrompt scene marks dur/3, 0.64*dur). Text phases cut ON the camera cuts (2.7/5.1) so transitions feel intentional and the close (productName+CTA) rides the reveal shot.",
+  "description": "Funnel variant — CONVERSION (static social_proof_led twin). Social proof led, clear shop intent: hook claim, then quote/reviewer proof, then the productName + rating + deliveryLine + CTA close. Camera-beat alignment (Fable direction 2026-08-04): the canonical Omni prompt shoots pan 0-2.67, logo zoom 2.67-5.12, full-product reveal 5.12-8 (buildVeoPrompt scene marks dur/3, 0.64*dur). Text phases cut ON the camera cuts (2.67/5.12) so transitions feel intentional and the close (productName+rating+CTA) rides the reveal shot. VERTICAL IS STRICTLY SEQUENTIAL — read byFormat.vertical._layoutInvariant before re-timing it.",
   "byFormat": {
     "vertical": {
       "version": 1,
@@ -8,16 +8,16 @@
         {
           "key": "hook",
           "startSec": 0,
-          "endSec": 2.5
+          "endSec": 2.67
         },
         {
           "key": "proof",
-          "startSec": 2.5,
-          "endSec": 5.1
+          "startSec": 2.67,
+          "endSec": 5.12
         },
         {
           "key": "close",
-          "startSec": 5.1,
+          "startSec": 5.12,
           "endSec": 8
         }
       ],
@@ -58,7 +58,8 @@
           "position": {
             "anchor": "upperThird",
             "align": "left",
-            "maxWidthPct": 0.9
+            "maxWidthPct": 0.9,
+            "offsetY": 0.105
           },
           "timing": {
             "enterAtSec": 0.4,
@@ -86,7 +87,7 @@
             "anchor": "upperThird",
             "align": "left",
             "maxWidthPct": 0.9,
-            "offsetY": 0.05
+            "offsetY": 0.105
           },
           "timing": {
             "enterAtSec": 0.2,
@@ -109,14 +110,14 @@
         },
         {
           "key": "productName",
-          "phase": "hook",
+          "phase": "close",
           "position": {
             "anchor": "lowerThird",
             "align": "left",
             "maxWidthPct": 0.9
           },
           "timing": {
-            "enterAtSec": 1.5,
+            "enterAtSec": 5.12,
             "exitAtSec": null,
             "enterDurationSec": 0.6
           },
@@ -135,13 +136,13 @@
         },
         {
           "key": "rating",
-          "phase": "hook",
+          "phase": "close",
           "position": {
             "anchor": "lowerThird",
             "align": "left"
           },
           "timing": {
-            "enterAtSec": 1.5,
+            "enterAtSec": 5.12,
             "exitAtSec": null,
             "enterDurationSec": 0.6
           },
@@ -160,14 +161,14 @@
         },
         {
           "key": "deliveryLine",
-          "phase": "hook",
+          "phase": "close",
           "position": {
             "anchor": "lowerThird",
             "align": "left",
             "row": "ctaRow"
           },
           "timing": {
-            "enterAtSec": 1.6,
+            "enterAtSec": 5.22,
             "exitAtSec": null,
             "enterDurationSec": 0.5
           },
@@ -186,14 +187,14 @@
         },
         {
           "key": "cta",
-          "phase": "hook",
+          "phase": "close",
           "position": {
             "anchor": "lowerThird",
             "align": "right",
             "row": "ctaRow"
           },
           "timing": {
-            "enterAtSec": 1.5,
+            "enterAtSec": 5.12,
             "exitAtSec": null,
             "enterDurationSec": 0.5
           },
@@ -219,11 +220,12 @@
           "position": {
             "anchor": "upperThird",
             "align": "left",
-            "maxWidthPct": 0.92
+            "maxWidthPct": 0.92,
+            "offsetY": 0.105
           },
           "timing": {
-            "enterAtSec": 2.7,
-            "exitAtSec": 4.8,
+            "enterAtSec": 2.67,
+            "exitAtSec": 4.85,
             "enterDurationSec": 0.7,
             "exitDurationSec": 0.25
           },
@@ -246,11 +248,12 @@
           "position": {
             "anchor": "upperThird",
             "align": "left",
-            "maxWidthPct": 0.92
+            "maxWidthPct": 0.92,
+            "offsetY": 0.105
           },
           "timing": {
-            "enterAtSec": 2.7,
-            "exitAtSec": 4.8,
+            "enterAtSec": 2.67,
+            "exitAtSec": 4.85,
             "enterDurationSec": 0.7,
             "exitDurationSec": 0.25
           },
@@ -278,11 +281,12 @@
           "position": {
             "anchor": "upperThird",
             "align": "left",
-            "maxWidthPct": 0.9
+            "maxWidthPct": 0.9,
+            "offsetY": 0.105
           },
           "timing": {
-            "enterAtSec": 3.0,
-            "exitAtSec": 4.8,
+            "enterAtSec": 2.95,
+            "exitAtSec": 4.85,
             "enterDurationSec": 0.6,
             "exitDurationSec": 0.25
           },
@@ -300,7 +304,8 @@
             "trackingPx": 1.5
           }
         }
-      ]
+      ],
+      "_layoutInvariant": "VERTICAL IS STRICTLY SEQUENTIAL — at no instant may two (phase,anchor) groups both be on screen. Windows incl. exit fade: hook|upperThird 0.2-2.45, proof|upperThird 2.67-5.10, close|lowerThird 5.12-end. WHY: Canonical.jsx resolveGroupAnchor shifts each group off a face/product band INDEPENDENTLY, with no knowledge of where other groups landed, and stackContainerStyle then positions purely from the resolved anchor — so two simultaneous groups whose keep-out chains converge paint on top of each other. Overlapping windows were the cause of the delivered text-on-text defect on ads 6a93ade2e4f1d02784398630 / 6a93ade1e4f1d02784398626 (2026-08-30), where the close stack (then authored in `hook` from 1.5s with no exit) was pushed onto upperThird through the live headline. Pinned by scripts/verifyTitleGroupsNeverOverlap.js — if you re-time this preset and that harness goes red, the collision is back; do not relax it."
     },
     "feed": {
       "version": 1,

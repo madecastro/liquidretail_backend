@@ -219,7 +219,7 @@
             "align": "center"
           },
           "timing": {
-            "enterAtSec": 5,
+            "enterAtSec": 5.2,
             "exitAtSec": null,
             "enterDurationSec": 0.25
           },
@@ -239,7 +239,9 @@
             "weight": 700,
             "maxLines": 1,
             "trackingPx": 3
-          }
+          },
+          "visible": false,
+          "_note": "hidden 2026-08-31 (owner): pinned in-creative brand wordmark removed. Same reasoning canonical.json recorded on 2026-08-04 — Meta draws the page name/avatar in its own chrome, so an in-creative wordmark is redundant double-branding — and this preset family had simply never followed suit. It was also a real LAYOUT hazard: a persistent (exitAtSec:null) group at `top` is on screen alongside every other group for the whole clip, and `top` is the ONLY keep-out chain that can walk DOWN onto another band (no other anchor chain contains `top`), so a face-flagged top band pushed this wordmark straight into live editorial copy — the text-on-text defect measured on 2026-08-30. Flip visible:true per-brand if wanted, but re-run scripts/verifyTitleGroupsNeverOverlap.js if you do."
         },
         {
           "key": "productName",
@@ -396,7 +398,9 @@
             "weight": 700,
             "maxLines": 1,
             "trackingPx": 3
-          }
+          },
+          "visible": false,
+          "_note": "hidden 2026-08-31 (owner): pinned in-creative brand wordmark removed. Same reasoning canonical.json recorded on 2026-08-04 — Meta draws the page name/avatar in its own chrome, so an in-creative wordmark is redundant double-branding — and this preset family had simply never followed suit. It was also a real LAYOUT hazard: a persistent (exitAtSec:null) group at `top` is on screen alongside every other group for the whole clip, and `top` is the ONLY keep-out chain that can walk DOWN onto another band (no other anchor chain contains `top`), so a face-flagged top band pushed this wordmark straight into live editorial copy — the text-on-text defect measured on 2026-08-30. Flip visible:true per-brand if wanted, but re-run scripts/verifyTitleGroupsNeverOverlap.js if you do."
         },
         {
           "key": "badge",
@@ -679,7 +683,9 @@
             "weight": 700,
             "maxLines": 1,
             "trackingPx": 3
-          }
+          },
+          "visible": false,
+          "_note": "hidden 2026-08-31 (owner): pinned in-creative brand wordmark removed. Same reasoning canonical.json recorded on 2026-08-04 — Meta draws the page name/avatar in its own chrome, so an in-creative wordmark is redundant double-branding — and this preset family had simply never followed suit. It was also a real LAYOUT hazard: a persistent (exitAtSec:null) group at `top` is on screen alongside every other group for the whole clip, and `top` is the ONLY keep-out chain that can walk DOWN onto another band (no other anchor chain contains `top`), so a face-flagged top band pushed this wordmark straight into live editorial copy — the text-on-text defect measured on 2026-08-30. Flip visible:true per-brand if wanted, but re-run scripts/verifyTitleGroupsNeverOverlap.js if you do."
         },
         {
           "key": "badge",
