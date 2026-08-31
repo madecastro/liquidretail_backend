@@ -1056,6 +1056,18 @@ async function ingestBrandFontsInner(brand, run) {
           `"${face.family}" ${face.weight} ${face.style} from ${face.url}: ${err.message}`
         );
         flagged.push({ ...entryBase, url: null, needsLicense: true });
+      } else {
+        // Previously silent at the ops-log level — only the bare summary
+        // count below reached the server log; the per-face detail landed
+        // only in the returned `errors` array (persisted to
+        // brand.fontIngestError, visible only by reading the DB later). This
+        // is the common path (open/self-hosted faces, no license gate), so a
+        // systemic issue — Cloudinary down, a CDN blocking our UA — would
+        // otherwise produce zero real-time signal.
+        console.warn(
+          `🔤 brand font ingest: non-commercial face not mirrored (${failClass}) ` +
+          `"${face.family}" ${face.weight} ${face.style} from ${face.url}: ${err.message}`
+        );
       }
     }
   }

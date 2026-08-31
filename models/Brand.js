@@ -438,7 +438,11 @@ const brandSchema = new mongoose.Schema({
   websiteFontUsage: { type: mongoose.Schema.Types.Mixed, default: null },
   // Successful or attempted automatic website-font scan. A timestamp is
   // recorded even when the site exposes no reusable faces so render-time
-  // resolution does not repeatedly crawl the storefront.
+  // resolution does not repeatedly crawl the storefront. CORRECTED
+  // 2026-08-31: it is NOT recorded on a fetch/parse EXCEPTION (see
+  // brandEnrichmentService.js's website-fonts catch) — this scan is a plain
+  // free HTTP fetch, so a transient 404/DNS blip must stay retryable rather
+  // than permanently disabling the scan for that brand.
   fontIngestedAt: { type: Date, default: null },
   fontIngestError: { type: String, default: null },
 
@@ -453,9 +457,19 @@ const brandSchema = new mongoose.Schema({
   // 'high'-confidence entry may outrank a curated theme, and then only when the
   // name resolves to an actual file; see buildFontLadders.
   metaAdsFontUsage: { type: mongoose.Schema.Types.Mixed, default: null },
-  // Attempted, not necessarily successful — stamped even when no creative was
-  // found, so a coverage backfill does not re-pay the vision call every run.
-  // Mirrors the fontIngestedAt / fontIngestError pair above.
+  // A MONEY-GATED attempt stamp, not a plain "we looked" mark — CORRECTED
+  // 2026-08-31, this comment previously said it was set even when no
+  // creative was found, full stop, which was true and also the bug: it
+  // stamped on a config-absence non-run (no Meta Ads credential connected,
+  // APIFY_ADLIB_ACTOR unset) exactly the same as on a genuine paid miss,
+  // permanently disabling the scan for a brand that had never actually been
+  // looked at. It is set only when a billable call actually ran (a vision
+  // call, or an Apify actor submit) — see
+  // metaAdsFontService.identifyBrandAdFonts's `billableAttempted` and
+  // brandFontPersistenceService.applyMetaFontsResult. All 9 production
+  // brands were found stamped from the config-absence branch on
+  // 2026-08-31; scripts/clearConfigAbsentMetaFontStamps.js is the one-off
+  // remediation for rows stamped before this fix.
   metaFontsIngestedAt: { type: Date, default: null },
   metaFontsIngestError: { type: String, default: null },
 

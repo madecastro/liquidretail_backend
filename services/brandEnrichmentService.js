@@ -710,7 +710,18 @@ async function runEnrichment(brand, brandId, run = null) {
         `body=${fontResult.usage?.body || 'unknown'}`
       );
     } catch (err) {
-      brand.fontIngestedAt = new Date();
+      // CORRECTED 2026-08-31 — this used to also set
+      // `brand.fontIngestedAt = new Date()`, permanently disabling retry.
+      // Unlike the meta-ads path below, this path is entirely FREE (a plain
+      // HTTP fetch + CSS parse + font downloads — no billable call anywhere
+      // in it), so there is no cost-avoidance reason to ever give up on it
+      // for good. A transient 404/DNS blip/server hiccup fetching the
+      // homepage must not turn into a lifetime ban on ever scanning that
+      // brand's website fonts again. Measured: brand "Reach Social"
+      // (https://reach-social.io) failed once with a plain
+      // "Request failed with status code 404" and was stuck forever.
+      // Record the error for visibility; leave fontIngestedAt untouched so
+      // the next enrichment run retries for free.
       brand.fontIngestError = String(err.message || err).slice(0, 2000);
       await brand.save().catch(() => {});
       console.warn(`   ⚠️  website font ingest failed for "${brand.name}": ${err.message}`);
@@ -725,11 +736,15 @@ async function runEnrichment(brand, brandId, run = null) {
   // BILLABLE (~$0.02-0.03). Best-effort: never fail the rest of enrichment.
   if (wantMetaFonts) {
     if (run) { await run.checkpoint(); run.stage('meta-ads fonts'); }
+    // Hoisted so the catch below can see whether identifyBrandAdFonts
+    // actually completed (and if so, whether it spent money) before
+    // deciding whether this exception may permanently disable retry.
+    let metaResult = null;
     try {
       const { identifyBrandAdFonts } = require('./metaAdsFontService');
       const { applyMetaFontsResult } = require('./brandFontPersistenceService');
       const maxImages = Number(process.env.META_ADS_FONTS_MAX_IMAGES) || 4;
-      const metaResult = await identifyBrandAdFonts(brand, { maxImages });
+      metaResult = await identifyBrandAdFonts(brand, { maxImages });
       applyMetaFontsResult(brand, metaResult);
       await brand.save();
       console.log(
@@ -739,9 +754,25 @@ async function runEnrichment(brand, brandId, run = null) {
         `body=${metaResult.usage.body?.family || 'none'}`
       );
     } catch (err) {
-      // Stamp anyway: without this a brand whose ads cannot be read re-pays the
-      // vision call on every future enrichment run.
-      brand.metaFontsIngestedAt = new Date();
+      // CORRECTED 2026-08-31 — this used to stamp unconditionally. The
+      // billable-cost reasoning ("a brand whose ads cannot be read must not
+      // re-pay the vision call every run") is real but only applies when
+      // money was actually put at risk. `identifyBrandAdFonts` itself never
+      // throws in normal operation (every step that can fail is caught
+      // internally and folded into a normal return with `billableAttempted`
+      // set correctly) — so if we get here WITH a metaResult, the exception
+      // came from applyMetaFontsResult/brand.save() *after* identification
+      // already completed, and metaResult.billableAttempted tells us
+      // truthfully whether a billable call happened. Stamping on a bare
+      // save() failure for a config-absent (nothing-attempted) result would
+      // silently reintroduce the exact bug this fix closes. If metaResult is
+      // still null, identifyBrandAdFonts threw before returning at all —
+      // an unexpected code fault, not the documented config-absence path —
+      // so fall back to the old conservative behaviour and stamp.
+      const billableAttempted = !metaResult || metaResult.billableAttempted === true;
+      if (billableAttempted) {
+        brand.metaFontsIngestedAt = new Date();
+      }
       brand.metaFontsIngestError = String(err.message || err).slice(0, 2000);
       await brand.save().catch(() => {});
       console.warn(`   ⚠️  meta-ads font identification failed for "${brand.name}": ${err.message}`);

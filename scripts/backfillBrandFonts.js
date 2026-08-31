@@ -297,9 +297,14 @@ async function applyToBrand(brand, row) {
   const canMeta = !opts.skipMeta && identifyBrandAdFonts && metaAdsFontsEnabled();
   let didMeta = false;
   if (stillNoFace && !fresh.metaFontsIngestedAt && canMeta) {
+    // metaResult stays visible to the catch below so it can tell a genuine
+    // paid miss from a config-absence non-run before deciding whether this
+    // exception may permanently disable retry — same fix as
+    // brandEnrichmentService.js / routes/brand.js ingest-meta-fonts.
+    let metaResult = null;
     try {
       const maxImages = Number(process.env.META_ADS_FONTS_MAX_IMAGES) || 4;
-      const metaResult = await identifyBrandAdFonts(fresh, { maxImages });
+      metaResult = await identifyBrandAdFonts(fresh, { maxImages });
       applyMetaFontsResult(fresh, metaResult);
       await fresh.save();
       didMeta = true;
@@ -309,7 +314,8 @@ async function applyToBrand(brand, row) {
         `${metaResult.usage.heading ? ` (${metaResult.usage.heading.confidence})` : ''}`
       );
     } catch (err) {
-      fresh.metaFontsIngestedAt = new Date();
+      const billableAttempted = !metaResult || metaResult.billableAttempted === true;
+      if (billableAttempted) fresh.metaFontsIngestedAt = new Date();
       fresh.metaFontsIngestError = String(err.message || err).slice(0, 2000);
       await fresh.save().catch(() => {});
       console.log(`    · meta-ads FAILED: ${err.message}`);

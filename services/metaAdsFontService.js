@@ -130,11 +130,22 @@ function parseFontIdentification(raw) {
   };
 }
 
-function emptyResult(via, errors) {
+// `billableAttempted` is the sentinel `applyMetaFontsResult` uses to decide
+// whether `Brand.metaFontsIngestedAt` may be stamped. It is deliberately a
+// typed field on the result, not something the caller re-derives by matching
+// substrings of `errors` — that would rot the moment a message is reworded.
+// true whenever this invocation actually risked spending money: the vision
+// call was invoked (succeeded or not) or an Apify actor run was submitted
+// (succeeded, errored, or returned zero usable images — Apify bills on
+// submit, not on a useful result). false means every reachable tier came
+// back for free — no credential, no Apify actor configured, an empty
+// connected account, etc. — so nothing was attempted and nothing was spent.
+function emptyResult(via, errors, billableAttempted = false) {
   return {
     usage: { heading: null, body: null, evidence: [] },
     via: via || 'none',
     imagesUsed: 0,
+    billableAttempted,
     errors: Array.isArray(errors) ? errors : [],
   };
 }
@@ -266,7 +277,11 @@ async function fetchCreativeIdsFromAccount(adAccountId, token, limit) {
 }
 
 // ── Tier 2: the brand's connected ad account. Free (Graph API). ─────────────
-async function gatherFromConnected(brand, cap, knownCreativeIds, errors, deps) {
+// `state` is mutated in place (not returned) on purpose: it must survive an
+// exception thrown ANYWHERE after the credential resolves, so the caller's
+// tier-3 decision below can never be fooled into paying Apify for a brand
+// that does have a working Meta Ads connection.
+async function gatherFromConnected(brand, cap, knownCreativeIds, errors, deps, state = {}) {
   const resolve = deps.resolveMetaAdsCred || resolveMetaAdsCred;
   const fetchBatch = deps.fetchCreativeBatch || fetchCreativeBatch;
   const fetchIds = deps.fetchCreativeIdsFromAccount || fetchCreativeIdsFromAccount;
@@ -274,6 +289,10 @@ async function gatherFromConnected(brand, cap, knownCreativeIds, errors, deps) {
   let token, adAccountId;
   try {
     ({ token, adAccountId } = await resolve(brand._id || brand.id));
+    // A credential resolved: this brand HAS connected Meta Ads. Their own ad
+    // account is the authoritative source for their creatives from here on,
+    // whatever this tier goes on to return.
+    state.credentialed = true;
   } catch (err) {
     // no-meta-ads-cred / no-ad-account / decrypt are expected for brands that
     // never connected Meta — a recorded soft failure, not an exception.
@@ -357,11 +376,17 @@ function extractUrlsFromAdLibraryItem(item) {
 }
 
 // ── Tier 3: public Ad Library via Apify. BILLABLE. ─────────────────────────
+// Returns { images, billed }. `billed` is true the instant the actor run is
+// actually submitted — even when it throws or comes back with nothing usable
+// — because Apify charges on submit, not on a useful result. `images.length
+// === 0` is NOT a safe proxy for "nothing was spent": an actor can burn the
+// full cost and still hand back zero extractable URLs (see the 'actor
+// returned no usable image URLs' branch below).
 async function gatherFromAdLibrary(brand, cap, errors, deps) {
   const actorId = process.env.APIFY_ADLIB_ACTOR;
   if (!actorId) {
     errors.push('adlibrary: skipped (APIFY_ADLIB_ACTOR not set)');
-    return [];
+    return { images: [], billed: false };
   }
   const runSync = deps.runActorSync || runActorSync;
   const recordCost = deps.recordFlatCost || recordFlatCost;
@@ -369,7 +394,7 @@ async function gatherFromAdLibrary(brand, cap, errors, deps) {
   const name = brand.name || domain || null;
   if (!name) {
     errors.push('adlibrary: brand has neither name nor website to search by');
-    return [];
+    return { images: [], billed: false };
   }
 
   // Community actors take different input keys for the same search; extras are
@@ -418,7 +443,7 @@ async function gatherFromAdLibrary(brand, cap, errors, deps) {
     // is the distinction CostLog.COST_STATUSES exists to record.
     await ledgerApifyRun('error');
     errors.push(`adlibrary: ${err.message}`);
-    return [];
+    return { images: [], billed: true };
   }
 
   await ledgerApifyRun('ok');
@@ -429,11 +454,11 @@ async function gatherFromAdLibrary(brand, cap, errors, deps) {
     const creativeId = item?.adArchiveID || item?.ad_archive_id || item?.adId || item?.id || null;
     for (const url of extractUrlsFromAdLibraryItem(item)) {
       pushImage(images, seen, { url, creativeId, via: 'adlibrary' }, cap);
-      if (images.length >= cap) return images;
+      if (images.length >= cap) return { images, billed: true };
     }
   }
   if (!images.length) errors.push('adlibrary: actor returned no usable image URLs');
-  return images;
+  return { images, billed: true };
 }
 
 function buildVisionUserContent(images) {
@@ -515,29 +540,53 @@ async function identifyBrandAdFonts(brand, { maxImages = DEFAULT_MAX_IMAGES } = 
   // (metaAdsCreativeMatcher skips creative fetch once a product set resolves),
   // so the docs tier legitimately comes up short for the most product-shaped
   // campaigns and this tier is the normal path, not a rare fallback.
+  const connectedState = { credentialed: false };
   if (images.length < MIN_USABLE_IMAGES) {
     try {
-      const fromConnected = await gatherFromConnected(brand, cap, knownCreativeIds, errors, deps);
+      const fromConnected = await gatherFromConnected(brand, cap, knownCreativeIds, errors, deps, connectedState);
       for (const img of fromConnected) pushImage(images, seen, img, cap);
     } catch (err) {
       errors.push(`connected: ${err.message}`);
     }
   }
 
-  // Tier 3 — billable public scrape, only when nothing free worked at all.
-  if (images.length === 0) {
+  // Tier 3 — billable public scrape. Only when nothing free worked at all AND
+  // the brand has NOT connected Meta Ads.
+  //
+  // THE CONNECTED-ACCOUNT RULE (owner, 2026-08-31). Apify exists to see the ads
+  // of a brand we have no direct access to. Once a brand connects their Meta Ads
+  // account we are reading their creatives from the source, for free, over the
+  // Graph API — so paying a third party to scrape the PUBLIC Ad Library for the
+  // same brand is pure waste, and it is a worse signal besides (the Ad Library
+  // shows only currently-active public ads, while the connected account exposes
+  // the brand's own creative objects directly).
+  //
+  // Note this is deliberately keyed on "a credential resolved", NOT on "tier 2
+  // returned images". A connected account that legitimately has zero creatives,
+  // or that hit a transient Graph error, must still suppress the paid scrape:
+  // in both cases the right answer is to come back later for free, not to spend
+  // money working around an integration we already have.
+  let apifyBilled = false;
+  if (images.length === 0 && connectedState.credentialed) {
+    errors.push('adlibrary: skipped (brand has Meta Ads connected — its own ad account is '
+      + 'authoritative; not paying for a public Ad Library scrape)');
+  } else if (images.length === 0) {
     try {
       const fromLib = await gatherFromAdLibrary(brand, cap, errors, deps);
-      for (const img of fromLib) pushImage(images, seen, img, cap);
+      apifyBilled = !!fromLib.billed;
+      for (const img of fromLib.images) pushImage(images, seen, img, cap);
     } catch (err) {
       errors.push(`adlibrary: ${err.message}`);
     }
   }
 
   // ZERO SPEND ON NOTHING. The vision call is billable; without a creative
-  // there is nothing to look at.
+  // there is nothing to look at. `apifyBilled` still needs to ride along:
+  // Tier 3 can burn its full cost and still land here with zero usable
+  // images (see gatherFromAdLibrary's comment), and that IS a billable
+  // attempt even though imagesUsed stays 0.
   if (images.length === 0) {
-    return emptyResult('none', errors.length ? errors : ['no ad creatives found']);
+    return emptyResult('none', errors.length ? errors : ['no ad creatives found'], apifyBilled);
   }
 
   // The reported path is whichever tier actually supplied the most images.
@@ -571,7 +620,9 @@ async function identifyBrandAdFonts(brand, { maxImages = DEFAULT_MAX_IMAGES } = 
     raw = res?.choices?.[0]?.message?.content ?? null;
   } catch (err) {
     errors.push(`vision: ${err.message}`);
-    return { ...emptyResult(via, errors), imagesUsed: images.length };
+    // The vision call was invoked (that's the billable action) regardless of
+    // whether it errored — billableAttempted must be true here.
+    return { ...emptyResult(via, errors, true), imagesUsed: images.length };
   }
 
   const parsed = parseFontIdentification(raw);
@@ -586,6 +637,7 @@ async function identifyBrandAdFonts(brand, { maxImages = DEFAULT_MAX_IMAGES } = 
     },
     via,
     imagesUsed: images.length,
+    billableAttempted: true,
     errors,
   };
 }

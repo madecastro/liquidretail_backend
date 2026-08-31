@@ -1705,6 +1705,12 @@ router.post('/:id/ingest-fonts', express.json(), async (req, res) => {
 // Produces a NAME, never a font file, and deliberately does not touch
 // brand.fontFamily; see brandFontPersistenceService.applyMetaFontsResult.
 router.post('/:id/ingest-meta-fonts', express.json(), async (req, res) => {
+  // Hoisted so the catch below can see whether identifyBrandAdFonts actually
+  // completed (and if so, whether it spent money) before deciding whether
+  // this exception may permanently disable the automatic enrichment tier's
+  // retry — see brandEnrichmentService.js's matching fix for the full
+  // rationale.
+  let result = null;
   try {
     const brand = await Brand.findOne(tenantFilter(req, { _id: req.params.id }));
     if (!brand) return res.status(404).json({ error: 'brand not found' });
@@ -1714,7 +1720,7 @@ router.post('/:id/ingest-meta-fonts', express.json(), async (req, res) => {
       return res.status(409).json({ error: 'meta-ads font identification is disabled (META_ADS_FONTS_ENABLED=false)' });
     }
     const maxImages = Number(req.body?.maxImages) || Number(process.env.META_ADS_FONTS_MAX_IMAGES) || 4;
-    const result = await identifyBrandAdFonts(brand, { maxImages });
+    result = await identifyBrandAdFonts(brand, { maxImages });
     const { applyMetaFontsResult } = require('../services/brandFontPersistenceService');
     applyMetaFontsResult(brand, result);
     await brand.save();
@@ -1739,12 +1745,20 @@ router.post('/:id/ingest-meta-fonts', express.json(), async (req, res) => {
     // enrichment tier still sees `!brand.metaFontsIngestedAt` and pays for the
     // very same brand again. Best-effort and never rethrown: failing to record
     // the attempt must not also turn a 500 into a crash.
+    //
+    // CORRECTED 2026-08-31 — this used to stamp unconditionally, which
+    // permanently disabled the automatic enrichment tier for any brand an
+    // operator manually tried here while Meta Ads / Apify were not yet
+    // configured. `result` (hoisted above) tells us truthfully whether a
+    // billable call actually ran; only stamp when it did, or when we have no
+    // result at all (identifyBrandAdFonts threw before returning — an
+    // unexpected fault, not the documented config-absence path).
     try {
+      const billableAttempted = !result || result.billableAttempted === true;
       const BrandModel = require('../models/Brand');
-      await BrandModel.updateOne(
-        { _id: req.params.id },
-        { $set: { metaFontsIngestedAt: new Date(), metaFontsIngestError: String(err.message || err).slice(0, 2000) } }
-      );
+      const update = { metaFontsIngestError: String(err.message || err).slice(0, 2000) };
+      if (billableAttempted) update.metaFontsIngestedAt = new Date();
+      await BrandModel.updateOne({ _id: req.params.id }, { $set: update });
     } catch (stampErr) {
       console.error(`ingest-meta-fonts: could not stamp attempt (${stampErr.message}) — this brand may re-pay the vision call`);
     }

@@ -93,14 +93,34 @@ function applyFontIngestResult(brand, result, { error = null } = {}) {
  * into the field the whole resolver treats as the brand's scanned face, ahead of
  * a curated theme. The name reaches resolution through the ladder's exact-only
  * tier instead, where it must resolve to a real file to win anything.
+ *
+ * `metaFontsIngestedAt` is a MONEY-GATED stamp, not a plain "we looked" mark —
+ * CORRECTED, this used to be unconditional. It must be set on a genuine paid
+ * result (a vision call was invoked, or an Apify run was submitted) so a
+ * coverage backfill does not re-pay for a brand whose ads truly could not be
+ * read. It must NOT be set when `result.billableAttempted` is false — that
+ * means every reachable tier came back for free (no Meta credential
+ * connected, APIFY_ADLIB_ACTOR unset, a connected account with zero
+ * creatives, …), so nothing was spent and nothing should be permanently
+ * disabled. Measured 2026-08-31: all 9 brands in production were stamped
+ * done from exactly this branch despite zero vision calls ever having run,
+ * which meant connecting Meta Ads or configuring Apify later would never
+ * re-trigger the scan for any of them. The `error` override param (used by a
+ * caller that caught a genuine exception of its own) always stamps — an
+ * explicit caller-supplied error is assumed to mean the caller already
+ * decided a billable attempt happened.
  */
 function applyMetaFontsResult(brand, result, { error = null } = {}) {
   brand.metaAdsFontUsage = result?.usage || brand.metaAdsFontUsage || null;
-  // Stamped even on a miss, so a coverage backfill does not re-pay the vision
-  // call for a brand that genuinely has no ads.
-  brand.metaFontsIngestedAt = new Date();
-  brand.metaFontsIngestError =
-    error || (result?.errors?.length ? result.errors.join('; ').slice(0, 2000) : null);
+  const priorErrors = result?.errors?.length ? result.errors.join('; ').slice(0, 2000) : null;
+  brand.metaFontsIngestError = error || priorErrors;
+  if (error || result?.billableAttempted) {
+    brand.metaFontsIngestedAt = new Date();
+  }
+  // else: nothing billable was attempted — leave metaFontsIngestedAt as-is
+  // (unset, or whatever it already was) so the NEXT enrichment run retries
+  // for free the moment config changes. The error string above still records
+  // WHY, for ops visibility, without blocking the retry.
   brand.markModified?.('metaAdsFontUsage');
   return brand;
 }
