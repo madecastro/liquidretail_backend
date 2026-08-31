@@ -125,9 +125,81 @@ function applyMetaFontsResult(brand, result, { error = null } = {}) {
   return brand;
 }
 
+/**
+ * Persist a shopifyThemeFontService result. Deliberately SIBLING to
+ * applyFontIngestResult, not a call into it: both write real FILES into the
+ * SAME Brand.customFonts / Brand.websiteFontUsage fields (so
+ * fontResolverService needs no changes at all), but the two sources need
+ * their own independent retry gate — Brand.shopifyFontsIngestedAt, not
+ * Brand.fontIngestedAt. Conflating them would mean a Shopify-theme success
+ * silently satisfies (or a Shopify-theme failure silently blocks) the
+ * UNRELATED "have we scanned the marketing homepage" gate brandEnrichment
+ * Service.runEnrichment's wantFontIngest reads, and vice versa — two
+ * genuinely different scans (different origin, different discovery ladder)
+ * collapsed onto one stamp.
+ *
+ * RETRYABILITY mirrors applyFontIngestResult / the 078dc07 website-path fix,
+ * not the billable meta-ads path: this function is ONLY ever called from
+ * the success branch of its caller (see brandEnrichmentService.js's
+ * shopify-theme-fonts tier) — a failure never reaches here at all, so
+ * shopifyFontsIngestedAt is never stamped on a free-path failure. There is
+ * no `error` override parameter (unlike applyFontIngestResult /
+ * applyMetaFontsResult) for exactly that reason: every call to this
+ * function represents an attempt that is safe to mark done.
+ *
+ * websiteFontUsage is a SHARED field with the website-scrape path. A later,
+ * weaker Shopify-theme scan must never clobber an earlier, real signal
+ * already sitting there (same "do not downgrade" principle
+ * mergeFontEntries applies to customFonts) — so this only overwrites it when
+ * the incoming result actually has heading/body/button signal, or the field
+ * was empty to begin with.
+ *
+ * Promotion to Brand.fontFamily is deliberately narrower than
+ * applyFontIngestResult's: it never overrides an already-'website'-sourced
+ * fontFamily. The generic website scan runs first in
+ * brandEnrichmentService.runEnrichment specifically because it is the
+ * established, already-trusted signal; Shopify-theme promotion exists to
+ * fill the gap when that scan found nothing usable, not to relitigate a
+ * brand that already has a good website-sourced font.
+ */
+function applyShopifyFontIngestResult(brand, result) {
+  brand.customFonts = mergeFontEntries(brand.customFonts, result);
+  brand.markModified?.('customFonts');
+
+  const incoming = result?.usage || null;
+  const existing = brand.websiteFontUsage || null;
+  const incomingHasSignal = !!(incoming && (incoming.heading || incoming.body || incoming.button));
+  const existingHasSignal = !!(existing && (existing.heading || existing.body || existing.button));
+  if (incomingHasSignal || !existingHasSignal) {
+    brand.websiteFontUsage = incoming || existing || null;
+    brand.markModified?.('websiteFontUsage');
+  }
+
+  brand.shopifyFontsIngestedAt = new Date();
+  brand.shopifyFontsIngestError = result?.errors?.length ? result.errors.join('; ').slice(0, 2000) : null;
+
+  const assumeLicensed = String(process.env.BRAND_FONT_ASSUME_LICENSED ?? 'true').toLowerCase() !== 'false';
+  const curated = Array.isArray(brand.curatedFields) && brand.curatedFields.includes('fontFamily');
+  const effectiveUsage = incomingHasSignal ? incoming : existing;
+  const observed = effectiveUsage?.heading || effectiveUsage?.body || null;
+  const observedKey = normalizeFamily(observed);
+  const usable = (brand.customFonts || []).some((font) =>
+    font?.url &&
+    font?.needsLicense !== true &&
+    (font?.license !== 'commercial' || assumeLicensed) &&
+    normalizeFamily(font.family) === observedKey
+  );
+  if (!curated && brand.fontSource !== 'tailwind' && brand.fontSource !== 'website' && observed && usable) {
+    brand.fontFamily = observed;
+    brand.fontSource = 'shopify-theme';
+  }
+  return brand;
+}
+
 module.exports = {
   normalizeFamily,
   mergeFontEntries,
   applyMetaFontsResult,
-  applyFontIngestResult
+  applyFontIngestResult,
+  applyShopifyFontIngestResult
 };
