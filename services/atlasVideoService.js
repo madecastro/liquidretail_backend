@@ -4263,13 +4263,21 @@ async function generateForAd({
   // re-deriving. Derivation runs at the TARGET (platform) aspect since
   // the derived layout describes chrome sized to the final canvas, not
   // the raw video render aspect. Non-fatal on failure.
-  let layoutInput = layoutInputInitial;
-  layoutInput = await refreshStaleLayoutInput({
-    layoutInput, ad, media, brand, product, categories, campaign, targetAspect, campaignRunId
-  });
-
-  const lpInput    = layoutInput?.input || null;
-  const lpSrcMedia = lpInput?.source_media || null;
+  //
+  // MASTER-PATH PARALLELIZATION (2026-08-31): layoutInput derivation
+  // (~43s wall on cache-miss) and buildReferenceImages / reframe
+  // (~54s wall on cold reframe) are INDEPENDENT — reframe reads only
+  // media + catalogMedias + aspectRatio, layoutInput reads brand /
+  // product / campaign context. Running them sequentially costs
+  // 43s + 54s = 97s per master; Promise.all makes it max(43, 54) =
+  // 54s. All buildReferenceImages inputs — orderedReferenceMedia,
+  // lifestylePlan, referenceCount — are derived above the parallel
+  // block so both branches start cleanly. `lpInput` / `lpSrcMedia`
+  // are read AFTER the block since promptArgs downstream is the
+  // first consumer. Error semantics preserved: refreshStaleLayoutInput
+  // swallows internally (noteRenderIssue on failure), buildReferenceImages
+  // may throw on empty stack — the empty-stack throw stays exactly
+  // where it was.
 
   // Storyboard retired on the Atlas path — the Ken Burns prompt fully
   // specifies camera + timeline, so nothing is generated here. A
@@ -4328,20 +4336,32 @@ async function generateForAd({
       `(seed only; ${orderedReferenceMedia.length} operator picks reduced)`
     );
   }
-  adStage(ad._id, `reference reframe (${aspectRatio})`);
-  const imageUrls = await buildReferenceImages({
-    media, product, catalogMedias, aspectRatio, caps,
-    // Effective count from the plan — never pass baseReferenceCount here.
-    referenceCount,
-    brand,
-    // Lifestyle: ignore multi-pick ordered stacks — seed only (media at pos 0).
-    orderedReferenceMedia: lifestylePlan.forceSeedOnly ? null : orderedReferenceMedia,
-    brandId: ad.brandId || media.brandId || null,
-    productId: ad.productId || product?._id || null,
-    adId: ad._id || null,
-    campaignRunId: campaignRunId || null
-  });
+  adStage(ad._id, `reference reframe (${aspectRatio}) + layoutInput`);
+  const tParallel0 = Date.now();
+  const [layoutInput, imageUrls] = await Promise.all([
+    refreshStaleLayoutInput({
+      layoutInput: layoutInputInitial, ad, media, brand, product, categories, campaign, targetAspect, campaignRunId
+    }),
+    buildReferenceImages({
+      media, product, catalogMedias, aspectRatio, caps,
+      // Effective count from the plan — never pass baseReferenceCount here.
+      referenceCount,
+      brand,
+      // Lifestyle: ignore multi-pick ordered stacks — seed only (media at pos 0).
+      orderedReferenceMedia: lifestylePlan.forceSeedOnly ? null : orderedReferenceMedia,
+      brandId: ad.brandId || media.brandId || null,
+      productId: ad.productId || product?._id || null,
+      adId: ad._id || null,
+      campaignRunId: campaignRunId || null
+    })
+  ]);
+  console.log(
+    `⚡ atlasVideo[ad=${ad._id}]: parallel(refreshStaleLayoutInput + buildReferenceImages) in ${Date.now() - tParallel0}ms`
+  );
   if (!imageUrls.length) throw new Error(`atlasVideo[ad=${ad._id}]: no reference images available`);
+
+  const lpInput    = layoutInput?.input || null;
+  const lpSrcMedia = lpInput?.source_media || null;
 
   // Does the stack actually contain CATALOG imagery for this product, beyond
   // just having more than one image?
