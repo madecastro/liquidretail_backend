@@ -21,6 +21,11 @@
  *   (5) visionImages passed to the ledger → V1
  *   (6) no vision call with zero images → Z1/Z2
  *   (7) ladder wiring: high→exact-only, low→substitutable, theme guard → W*
+ *   (8) metaFontsIngestedAt stamped ONLY on a genuine billable attempt, never
+ *       on a config-absence non-run (no Meta cred, no APIFY_ADLIB_ACTOR) →
+ *       Z1/L1/S* below. CORRECTED 2026-08-31: this used to be unconditional
+ *       and all 9 production brands were permanently stuck as a result —
+ *       see brandFontPersistenceService.applyMetaFontsResult.
  *
  * No DB, no network, no API key. Safe in CI.
  *   node scripts/verifyMetaAdsFonts.js
@@ -216,6 +221,30 @@ check('Z1 zero creatives → NO vision call', async () => {
   assert.strictEqual(res.usage.heading, null);
   assert.ok(res.errors.length, 'the reason must be recorded');
 });
+check('Z1b THE MEASURED PRODUCTION SCENARIO — no Meta cred + no Apify actor → billableAttempted must be false (8)', async () => {
+  const prevActor = process.env.APIFY_ADLIB_ACTOR;
+  delete process.env.APIFY_ADLIB_ACTOR;
+  try {
+    const res = await identifyBrandAdFonts(
+      { _id: 'b1b', name: 'NoAdsNoActor' },
+      {},
+      {
+        Campaign: { find: () => ({ select: () => ({ lean: async () => [] }) }) },
+        resolveMetaAdsCred: async () => { const e = new Error('Brand has no active Meta Ads credential. Connect Meta Ads first.'); e.code = 'no-meta-ads-cred'; throw e; },
+        chatCompletion: async () => { throw new Error('vision must never be reached'); },
+        runActorSync: async () => { throw new Error('apify must never be reached'); },
+      }
+    );
+    assert.strictEqual(res.billableAttempted, false,
+      'nothing was configured to attempt, nothing was spent — must not permanently disable retry');
+    assert.strictEqual(res.errors.join('; '),
+      'connected: no-meta-ads-cred: Brand has no active Meta Ads credential. Connect Meta Ads first.; adlibrary: skipped (APIFY_ADLIB_ACTOR not set)',
+      'must reproduce the exact string measured in production 2026-08-31');
+  } finally {
+    if (prevActor === undefined) delete process.env.APIFY_ADLIB_ACTOR;
+    else process.env.APIFY_ADLIB_ACTOR = prevActor;
+  }
+});
 check('Z2 with creatives → exactly ONE vision call, visionImages matches', async () => {
   let meta = null;
   let calls = 0;
@@ -238,6 +267,7 @@ check('Z2 with creatives → exactly ONE vision call, visionImages matches', asy
   assert.strictEqual(res.via, 'campaign-docs');
   assert.strictEqual(res.usage.heading.family, 'Futura');
   assert.strictEqual(res.usage.evidence[0].usableForExact, true);
+  assert.strictEqual(res.billableAttempted, true, 'a vision call ran — this is a genuine paid result (8)');
 });
 check('Z3 a thrown vision call degrades to no face, not an exception', async () => {
   const ads = [{ creative: { imageUrl: 'https://cdn/a.jpg' } }];
@@ -250,6 +280,8 @@ check('Z3 a thrown vision call degrades to no face, not an exception', async () 
   );
   assert.strictEqual(res.usage.heading, null);
   assert.ok(res.errors.some((e) => /vision/.test(e)), JSON.stringify(res.errors));
+  assert.strictEqual(res.billableAttempted, true,
+    'the vision call was invoked (and billed) even though it then errored (8)');
 });
 check('Z4 free tiers satisfied → the BILLABLE scrape never runs', async () => {
   const prev = process.env.APIFY_ADLIB_ACTOR;
@@ -301,6 +333,32 @@ check('L1 an Apify run is LEDGERED, even when it yields no usable images', async
     else process.env.APIFY_ADLIB_ACTOR = prev;
   }
 });
+check('L1b Apify billed but yielded nothing usable → billableAttempted must STILL be true (8)', async () => {
+  const prev = process.env.APIFY_ADLIB_ACTOR;
+  process.env.APIFY_ADLIB_ACTOR = 'someone/ad-library';
+  try {
+    // imagesUsed stays 0 (no usable URL in the item), but the run was
+    // submitted and billed — this must NOT be mistaken for "nothing
+    // attempted", or a legacy-stamp-style remediation retrying it would
+    // quietly re-bill Apify every single run forever.
+    const res = await identifyBrandAdFonts(
+      { _id: 'b5b', name: 'ScrapedNothing' }, {},
+      {
+        Campaign: { find: () => ({ select: () => ({ lean: async () => [] }) }) },
+        resolveMetaAdsCred: async () => { const e = new Error('no cred'); e.code = 'no-meta-ads-cred'; throw e; },
+        runActorSync: async () => [{ irrelevant: 'no urls here' }],
+        recordFlatCost: async () => {},
+      }
+    );
+    assert.strictEqual(res.imagesUsed, 0);
+    assert.strictEqual(res.via, 'none');
+    assert.strictEqual(res.billableAttempted, true,
+      'Apify bills on submit, not on a useful result — imagesUsed===0 is NOT a safe proxy for zero spend');
+  } finally {
+    if (prev === undefined) delete process.env.APIFY_ADLIB_ACTOR;
+    else process.env.APIFY_ADLIB_ACTOR = prev;
+  }
+});
 check('L2 a ledger failure does not abort identification', async () => {
   const prev = process.env.APIFY_ADLIB_ACTOR;
   process.env.APIFY_ADLIB_ACTOR = 'someone/ad-library';
@@ -338,6 +396,7 @@ check('L3 the scrape tier is INERT when no actor is configured', async () => {
     );
     assert.strictEqual(ran, 0, 'a blank APIFY_ADLIB_ACTOR must not spend');
     assert.ok(res.errors.some((e) => /APIFY_ADLIB_ACTOR not set/.test(e)));
+    assert.strictEqual(res.billableAttempted, false, 'a blank actor config must not disable retry (8)');
   } finally {
     if (prev !== undefined) process.env.APIFY_ADLIB_ACTOR = prev;
   }
@@ -355,6 +414,52 @@ check('O1 gathering runs campaign-docs → connected → adlibrary', () => {
 check('O2 the billable scrape is guarded on having found NOTHING', () => {
   const guard = /if \(images\.length === 0\) \{\s*try \{\s*const fromLib = await gatherFromAdLibrary/;
   assert.ok(guard.test(SRC), 'the adlibrary tier must be gated on images.length === 0');
+});
+
+// ── R. Revert guards on the three OTHER call sites of applyMetaFontsResult's
+// catch-block sibling pattern. Fails if (8) is reverted at any of them.
+// brandEnrichmentService.js / routes/brand.js / backfillBrandFonts.js each
+// have their own try/catch around identifyBrandAdFonts + applyMetaFontsResult
+// + brand.save(), and each catch used to stamp metaFontsIngestedAt
+// unconditionally on ANY exception — including one thrown by brand.save()
+// itself AFTER a config-absence (nothing-attempted) result, which would
+// silently re-introduce this bug through the back door even with
+// applyMetaFontsResult itself fixed. These are structural source checks
+// (not execution — Mongoose save() is not mocked here), matching this file's
+// own O1/O2 pattern, because that back door is a real hazard, not a
+// hypothetical one: the SUCCESS-path call to applyMetaFontsResult already
+// stops stamping on a config-absence result, so a save() failure right after
+// it is exactly the moment a naive unconditional catch would fire again. ──
+const ENRICH_SRC = fs.readFileSync(path.join(__dirname, '..', 'services', 'brandEnrichmentService.js'), 'utf8');
+const ROUTE_SRC = fs.readFileSync(path.join(__dirname, '..', 'routes', 'brand.js'), 'utf8');
+const BACKFILL_SRC = fs.readFileSync(path.join(__dirname, '..', 'scripts', 'backfillBrandFonts.js'), 'utf8');
+check('R1 brandEnrichmentService.js catch: metaResult is hoisted and gated on billableAttempted', () => {
+  assert.ok(/let metaResult = null;/.test(ENRICH_SRC),
+    'metaResult must be visible in the catch scope, not const-scoped inside the try');
+  assert.ok(/!metaResult \|\| metaResult\.billableAttempted === true/.test(ENRICH_SRC),
+    'the catch must only stamp when a billable attempt is proven (or metaResult is unknown)');
+});
+check('R2 brandEnrichmentService.js website-fonts catch does NOT stamp fontIngestedAt (free path, separate concern)', () => {
+  const catchBlock = ENRICH_SRC.slice(
+    ENRICH_SRC.indexOf('if (wantFontIngest && brand.websiteUrl)'),
+    ENRICH_SRC.indexOf('Fonts identified in the brand')
+  );
+  // Strip `//` line comments first — the corrected code's own explanatory
+  // comment quotes the OLD line verbatim (`brand.fontIngestedAt = new
+  // Date()`) as documentation of what was removed, which would otherwise
+  // fool a naive regex into a false failure (the exact trap this file's own
+  // header warns about for a sibling check elsewhere in this repo).
+  const codeOnly = catchBlock.split('\n').map((line) => line.replace(/\/\/.*$/, '')).join('\n');
+  assert.ok(!/brand\.fontIngestedAt\s*=\s*new Date\(\)/.test(codeOnly),
+    'the website scan is entirely free — its catch must never permanently disable retry');
+});
+check('R3 routes/brand.js ingest-meta-fonts catch: result is hoisted and gated on billableAttempted', () => {
+  assert.ok(/let result = null;/.test(ROUTE_SRC));
+  assert.ok(/!result \|\| result\.billableAttempted === true/.test(ROUTE_SRC));
+});
+check('R4 backfillBrandFonts.js meta-ads catch: metaResult is hoisted and gated on billableAttempted', () => {
+  assert.ok(/let metaResult = null;/.test(BACKFILL_SRC));
+  assert.ok(/!metaResult \|\| metaResult\.billableAttempted === true/.test(BACKFILL_SRC));
 });
 
 // ── V. Ledger linkage on the vision call. Fails if (5) is reverted. ──────
@@ -397,6 +502,7 @@ check('S1 applyMetaFontsResult does NOT write fontFamily/fontSource', () => {
   const brand = { fontFamily: 'Oswald', fontSource: 'website', markModified() {} };
   applyMetaFontsResult(brand, {
     usage: { heading: { family: 'Futura', confidence: 'high' }, body: null, evidence: [] },
+    billableAttempted: true,
     errors: [],
   });
   assert.strictEqual(brand.fontFamily, 'Oswald', 'a NAME read off a JPEG must not become the scanned face');
@@ -404,11 +510,45 @@ check('S1 applyMetaFontsResult does NOT write fontFamily/fontSource', () => {
   assert.strictEqual(brand.metaAdsFontUsage.heading.family, 'Futura');
   assert.ok(brand.metaFontsIngestedAt instanceof Date);
 });
-check('S2 the attempt is stamped even when nothing was identified', () => {
+check('S2 a GENUINE PAID miss (billableAttempted:true, nothing identifiable) is still stamped (8)', () => {
+  const brand = { markModified() {} };
+  applyMetaFontsResult(brand, {
+    usage: { heading: null, body: null, evidence: [] },
+    billableAttempted: true,
+    errors: ['vision: could not identify any typeface with confidence'],
+  });
+  assert.ok(brand.metaFontsIngestedAt instanceof Date,
+    'a genuine paid miss must still stamp, or a backfill re-pays forever');
+  assert.ok(/could not identify/.test(brand.metaFontsIngestError));
+});
+check('S3 a CONFIG-ABSENCE non-run (billableAttempted:false) must NOT be stamped — the fixed bug (8)', () => {
+  const brand = { markModified() {} };
+  applyMetaFontsResult(brand, {
+    usage: { heading: null, body: null, evidence: [] },
+    billableAttempted: false,
+    errors: [
+      'connected: no-meta-ads-cred: Brand has no active Meta Ads credential. Connect Meta Ads first.',
+      'adlibrary: skipped (APIFY_ADLIB_ACTOR not set)',
+    ],
+  });
+  assert.strictEqual(brand.metaFontsIngestedAt, undefined,
+    'nothing was spent — the automatic enrichment tier must retry this brand for free once config changes');
+  // The reason is still recorded for ops visibility even though we did not stamp.
+  assert.ok(/no-meta-ads-cred/.test(brand.metaFontsIngestError));
+});
+check('S4 a result with no billableAttempted field at all defaults to NOT stamping (fail closed)', () => {
+  // Guards against a future caller that forgets to thread the field through —
+  // the safe default must be "do not permanently disable retry", not the
+  // reverse.
   const brand = { markModified() {} };
   applyMetaFontsResult(brand, { usage: { heading: null, body: null, evidence: [] }, errors: ['no ad creatives found'] });
-  assert.ok(brand.metaFontsIngestedAt instanceof Date, 'a miss must still stamp, or a backfill re-pays forever');
-  assert.ok(/no ad creatives/.test(brand.metaFontsIngestError));
+  assert.strictEqual(brand.metaFontsIngestedAt, undefined);
+});
+check('S5 an explicit caller-supplied error ALWAYS stamps, independent of billableAttempted', () => {
+  const brand = { markModified() {} };
+  applyMetaFontsResult(brand, { usage: { heading: null, body: null, evidence: [] }, billableAttempted: false, errors: [] }, { error: 'brand.save() failed after a real spend' });
+  assert.ok(brand.metaFontsIngestedAt instanceof Date, 'an explicit error override is the caller asserting a paid attempt happened');
+  assert.strictEqual(brand.metaFontsIngestError, 'brand.save() failed after a real spend');
 });
 
 // ── K. Kill switch ──────────────────────────────────────────────────────
