@@ -230,7 +230,7 @@
             "maxWidthPct": 0.9
           },
           "timing": {
-            "enterAtSec": 6.5,
+            "enterAtSec": 6.6,
             "exitAtSec": null,
             "enterDurationSec": 0.7
           },
@@ -255,7 +255,7 @@
             "align": "right"
           },
           "timing": {
-            "enterAtSec": 6.8,
+            "enterAtSec": 6.9,
             "exitAtSec": null,
             "enterDurationSec": 0.6
           },
