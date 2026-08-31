@@ -280,10 +280,20 @@ async function runEnrichment(brand, brandId, run = null) {
   // @font-face in the fetched HTML). Gated on its own stamp so the billable
   // vision call is paid at most once per brand.
   const wantMetaFonts    = metaAdsFontsEnabled() && !brand.metaFontsIngestedAt;
+  // Shopify theme font scan (added 2026-08-31) — a THIRD, independent font
+  // source alongside the website scan above and the meta-ads vision scan
+  // below. Gated purely on "does this brand have a Shopify URL configured"
+  // (the same apifyDemo.shopifyUrl field resolveStoreOrigin reads), NOT on
+  // Brand.apifyDemo.method or Brand.isDemo — owner directive: this must run
+  // for any brand with a Shopify connection regardless of which catalog-
+  // ingest method (if any) that brand uses. Own retry stamp
+  // (shopifyFontsIngestedAt), independent of fontIngestedAt — see
+  // brandFontPersistenceService.applyShopifyFontIngestResult's header.
+  const wantShopifyFonts = !!(brand.apifyDemo?.shopifyUrl) && !brand.shopifyFontsIngestedAt;
   const logoIsCurated    = Array.isArray(brand.curatedFields) && brand.curatedFields.includes('logoUrl');
   const wantLogoIngest   = !logoIsCurated && !brand.logoIngestedAt;
 
-  if (!wantBrandfetch && !wantTailwind && !wantScraped && !wantGpt && !wantBrandReviews && !wantFontIngest && !wantLogoIngest && !wantMetaFonts) {
+  if (!wantBrandfetch && !wantTailwind && !wantScraped && !wantGpt && !wantBrandReviews && !wantFontIngest && !wantLogoIngest && !wantMetaFonts && !wantShopifyFonts) {
     return { ok: false, reason: `nothing to add — sources already attempted: ${[...sourcesAttempted].join(', ') || 'none'}` };
   }
 
@@ -297,6 +307,7 @@ async function runEnrichment(brand, brandId, run = null) {
   if (wantFontIngest)   planParts.push('website-fonts');
   if (wantLogoIngest)   planParts.push('website-logo');
   if (wantMetaFonts)    planParts.push('meta-ads-fonts');
+  if (wantShopifyFonts) planParts.push('shopify-theme-fonts');
   console.log(`🌐 brand enrichment: ${brand.websiteUrl} for "${brand.name}" — running ${planParts.join('+')}${sourcesAttempted.size ? ` (already have: ${[...sourcesAttempted].join(', ')})` : ''}`);
 
   // ── Tier 1: Brandfetch ──
@@ -728,6 +739,37 @@ async function runEnrichment(brand, brandId, run = null) {
     }
   }
 
+  // Fonts from the brand's Shopify THEME (added 2026-08-31) — a second real-
+  // FILE source, independent of the marketing-homepage scan above. Runs
+  // right after it (both yield files; neither is a weaker fallback for the
+  // other) and before the meta-ads vision tier below (a NAME-only source
+  // should never be tried ahead of a source that can hand back an actual
+  // file). FREE (plain HTTP, or Admin API billed to the merchant's own
+  // Shopify plan — see shopifyThemeFontService.js's header) — like the
+  // website scan above, a failure must NEVER permanently disable retry, so
+  // applyShopifyFontIngestResult (which stamps shopifyFontsIngestedAt) is
+  // only called on success; the catch below records the error and nothing
+  // else.
+  if (wantShopifyFonts) {
+    if (run) { await run.checkpoint(); run.stage('shopify theme fonts'); }
+    try {
+      const { ingestShopifyThemeFonts } = require('./shopifyThemeFontService');
+      const { applyShopifyFontIngestResult } = require('./brandFontPersistenceService');
+      const shopifyFontResult = await ingestShopifyThemeFonts(brand);
+      applyShopifyFontIngestResult(brand, shopifyFontResult);
+      await brand.save();
+      console.log(
+        `   · shopify theme fonts: via=${shopifyFontResult.via} ${shopifyFontResult.ingested.length} usable, ` +
+        `${shopifyFontResult.flagged.length} flagged, heading=${shopifyFontResult.usage?.heading || 'unknown'}, ` +
+        `body=${shopifyFontResult.usage?.body || 'unknown'}`
+      );
+    } catch (err) {
+      brand.shopifyFontsIngestError = String(err.message || err).slice(0, 2000);
+      await brand.save().catch(() => {});
+      console.warn(`   ⚠️  shopify theme font ingest failed for "${brand.name}": ${err.message}`);
+    }
+  }
+
   // Fonts identified in the brand's OWN Meta ads. Runs after the website scan on
   // purpose: the website can yield real FILES, and this only yields a NAME, so
   // there is no point paying for the weaker signal first. It still runs even when
@@ -799,7 +841,8 @@ async function runEnrichment(brand, brandId, run = null) {
     (wantGpt && !skipLLM) ? 'gpt'  : null,
     wantBrandReviews ? 'brand-reviews' : null,
     wantFontIngest ? 'website-fonts' : null,
-    wantLogoIngest ? 'website-logo' : null
+    wantLogoIngest ? 'website-logo' : null,
+    wantShopifyFonts ? 'shopify-theme-fonts' : null
   ].filter(Boolean).join('+');
   console.log(`   ✓ brand enrichment done for "${brand.name}" via ${ranThisTime || 'no-op'} — ${overrides.length} field change(s), ${brand.demographics?.length || 0} demographic(s), ${brand.brandReviews?.quotes?.length || 0} brand review(s), all-time sources: [${brand.enrichmentSources.join(', ')}] in ${Date.now() - t0}ms`);
   return { ok: true, brand, overrides };

@@ -857,6 +857,105 @@ function familySlug(family) {
   return String(family).toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '') || 'font';
 }
 
+// ── Shared face mirror (website ingest + services/shopifyThemeFontService.js) ──
+
+/**
+ * Classify, licence-gate, download, byte-validate and Cloudinary-mirror ONE
+ * already-PARSED @font-face face. Extracted out of ingestBrandFontsInner's
+ * loop 2026-08-31 so shopifyThemeFontService (a second discoverer of the same
+ * shape of face — Shopify theme CSS instead of a marketing homepage) shares
+ * the exact same validation/licensing/mirroring code path instead of a second,
+ * divergently-maintained copy. The website loop below and that module BOTH
+ * call this; behaviour for the website path is unchanged — this is a pure
+ * extraction, not a logic change.
+ *
+ * `mirrorCounts` is mutated in place and must be the SAME object across every
+ * face in one ingest run (open/commercial budgets are enforced per-run, not
+ * per-caller).
+ *
+ * `classify` defaults to classifyFontSource; a caller with its own hostname
+ * knowledge (e.g. Shopify's font-library CDN, licensed to the merchant, not
+ * to us) can pass a wrapping classifier instead — see
+ * shopifyThemeFontService.classifyShopifyFontSource. It must still return one
+ * of 'google' | 'commercial' | 'open' | 'unknown'.
+ *
+ * @param {{family, weight, weightMin, weightMax, style, format, url}} face
+ * @param {{pageUrl: string, brandId: string, mirrorCounts: object,
+ *          source?: string, classify?: (url:string)=>string}} opts
+ * @returns {Promise<{ingested: object|null, flagged: object|null, error: string|null}>}
+ *   At most one of ingested/flagged is set; both null means the face was
+ *   dropped silently by a per-class budget cap (matches the pre-extraction
+ *   `continue` — never an error, never a flag).
+ */
+async function mirrorDiscoveredFace(face, { pageUrl, brandId, mirrorCounts, source = 'website', classify = classifyFontSource } = {}) {
+  const license = classify(face.url);
+  const entryBase = {
+    family: face.family,
+    weight: face.weight,
+    weightMin: face.weightMin,
+    weightMax: face.weightMax,
+    style: face.style,
+    format: face.format,
+    sourceUrl: face.url,
+    source,
+    license,
+    ingestedAt: new Date().toISOString()
+  };
+
+  // Flag OFF: commercial faces are never downloaded (legacy gate).
+  // Flag ON: attempt download below; license stays 'commercial' for audit.
+  if (license === 'commercial' && !brandFontAssumeLicensed()) {
+    return { ingested: null, flagged: { ...entryBase, url: null, needsLicense: true }, error: null };
+  }
+  // Class-specific caps (see canMirrorFace / MAX_* constants above).
+  if (!canMirrorFace(license, mirrorCounts)) {
+    return { ingested: null, flagged: null, error: null };
+  }
+
+  try {
+    const buf = await downloadFontFile(face.url, { referer: pageUrl });
+
+    // THE FILE OUTRANKS THE CSS ON THE WEIGHT AXIS — see the long comment this
+    // was extracted from (Pelagic Gear ArchivoV variable-font case) for why.
+    const axis = probeVariableWeightAxis(buf);
+    if (axis && !Number.isFinite(face.weightMin) && !Number.isFinite(face.weightMax)) {
+      entryBase.weightMin = axis.weightMin;
+      entryBase.weightMax = axis.weightMax;
+      entryBase.weight = Math.min(Math.max(face.weight, axis.weightMin), axis.weightMax);
+      console.log(
+        `🔤 brand font: "${face.family}" is VARIABLE (wght ${axis.weightMin}..${axis.weightMax}, ` +
+        `default ${axis.weightDefault}) — CSS declared no range, using the file's axis` +
+        (entryBase.weight !== face.weight ? ` [nominal ${face.weight} → ${entryBase.weight}]` : '')
+      );
+    }
+
+    const styleSuffix = face.style === 'italic' ? 'i' : '';
+    const uploaded = await cloudinaryService.uploadBufferToCloudinary(buf, {
+      folder: 'liquidretail/brand_fonts',
+      resourceType: 'raw',
+      publicId: `${brandId}-${familySlug(face.family)}-${entryBase.weight}${styleSuffix}.${face.format}`,
+      overwrite: true
+    });
+    bumpMirrorCount(license, mirrorCounts);
+    return { ingested: { ...entryBase, url: uploaded.secure_url, needsLicense: false }, flagged: null, error: null };
+  } catch (err) {
+    const failClass = downloadFailureClass(err);
+    const msg = `ingest failed for "${face.family}" ${face.weight} ${face.style} [${failClass}]: ${err.message}`;
+    if (license === 'commercial') {
+      console.warn(
+        `🔤 brand font ingest: commercial CDN face not mirrored (${failClass}) ` +
+        `"${face.family}" ${face.weight} ${face.style} from ${face.url}: ${err.message}`
+      );
+      return { ingested: null, flagged: { ...entryBase, url: null, needsLicense: true }, error: msg };
+    }
+    console.warn(
+      `🔤 brand font ingest: non-commercial face not mirrored (${failClass}) ` +
+      `"${face.family}" ${face.weight} ${face.style} from ${face.url}: ${err.message}`
+    );
+    return { ingested: null, flagged: null, error: msg };
+  }
+}
+
 // ── Main ingest ────────────────────────────────────────────────────────
 
 /**
@@ -965,111 +1064,11 @@ async function ingestBrandFontsInner(brand, run) {
       throw err;
     }
     run.tick(++faceIdx, faces.length);
-    const license = classifyFontSource(face.url);
-    const entryBase = {
-      family: face.family,
-      weight: face.weight,
-      weightMin: face.weightMin,
-      weightMax: face.weightMax,
-      style: face.style,
-      format: face.format,
-      sourceUrl: face.url,
-      source: 'website',
-      license,
-      ingestedAt: new Date().toISOString()
-    };
-
-    // Flag OFF: commercial faces are never downloaded (legacy gate).
-    // Flag ON: attempt download below; license stays 'commercial' for audit.
-    if (license === 'commercial' && !brandFontAssumeLicensed()) {
-      flagged.push({ ...entryBase, url: null, needsLicense: true });
-      continue;
-    }
-    // Class-specific caps (see canMirrorFace / MAX_* constants above).
-    if (!canMirrorFace(license, mirrorCounts)) continue;
-
-    try {
-      const buf = await downloadFontFile(face.url, { referer: pageUrl });
-
-      // THE FILE OUTRANKS THE CSS ON THE WEIGHT AXIS — but only when the CSS
-      // said nothing. A `@font-face` may legally omit `font-weight` entirely,
-      // and for a VARIABLE font that omission is not "this face is 400", it is
-      // "the author did not say". Pelagic Gear is the measured case:
-      //
-      //   @font-face { font-family: "ArchivoV";
-      //     src: url(.../Archivo-Variable.woff2) format('woff2');
-      //     font-display: swap; }
-      //
-      // parseWeight() returns its 400 default and parseWeightRange() returns
-      // {null,null}, so a wght 100..900 file was persisted as a static 400 cut.
-      // fontResolverService.resolveCustomFont gates the variable path on those
-      // two fields being finite, so EVERY weight request collapsed to 400 —
-      // and headings ask for 700, which meant every headline in every render
-      // was drawn with SYNTHETIC bold instead of the brand's real bold.
-      //
-      // Only fills a GAP: an explicit `font-weight: 100 900` still wins, so a
-      // deliberate author narrowing (shipping a variable file but declaring a
-      // sub-range) is preserved rather than widened back out.
-      const axis = probeVariableWeightAxis(buf);
-      if (axis && !Number.isFinite(face.weightMin) && !Number.isFinite(face.weightMax)) {
-        entryBase.weightMin = axis.weightMin;
-        entryBase.weightMax = axis.weightMax;
-        // Re-seat the nominal weight on the axis. It is what matchCustomFont
-        // sorts by when a request falls OUTSIDE the range, and the CSS-derived
-        // 400 can sit outside the file's own range entirely (a 600..900 display
-        // cut would be labelled 400 and picked for body text). Clamp rather
-        // than adopt the axis default blindly, so a real declared weight inside
-        // the range is left alone.
-        entryBase.weight = Math.min(Math.max(face.weight, axis.weightMin), axis.weightMax);
-        console.log(
-          `🔤 brand font: "${face.family}" is VARIABLE (wght ${axis.weightMin}..${axis.weightMax}, ` +
-          `default ${axis.weightDefault}) — CSS declared no range, using the file's axis` +
-          (entryBase.weight !== face.weight ? ` [nominal ${face.weight} → ${entryBase.weight}]` : '')
-        );
-      }
-
-      // 'i' suffix keeps italic cuts from colliding with the roman at the
-      // same weight; extension lives IN the public_id for raw resources so
-      // the delivered URL keeps its .woff2/.ttf suffix.
-      const styleSuffix = face.style === 'italic' ? 'i' : '';
-      const uploaded = await cloudinaryService.uploadBufferToCloudinary(buf, {
-        folder: 'liquidretail/brand_fonts',
-        resourceType: 'raw',
-        publicId: `${brandId}-${familySlug(face.family)}-${entryBase.weight}${styleSuffix}.${face.format}`,
-        // Re-ingest must refresh the mirror — the helper defaults to
-        // overwrite:false, which silently returns the OLD asset forever.
-        overwrite: true
-      });
-      // Success: real url, usable by matchCustomFont when flag is on.
-      // needsLicense:false = machine cleared; human may still set true later.
-      ingested.push({ ...entryBase, url: uploaded.secure_url, needsLicense: false });
-      bumpMirrorCount(license, mirrorCounts);
-    } catch (err) {
-      const failClass = downloadFailureClass(err);
-      const msg = `ingest failed for "${face.family}" ${face.weight} ${face.style} [${failClass}]: ${err.message}`;
-      errors.push(msg);
-      if (license === 'commercial') {
-        // Never leave a half-written commercial entry — flag cleanly so
-        // library-match fallback still runs. Distinct log for ops.
-        console.warn(
-          `🔤 brand font ingest: commercial CDN face not mirrored (${failClass}) ` +
-          `"${face.family}" ${face.weight} ${face.style} from ${face.url}: ${err.message}`
-        );
-        flagged.push({ ...entryBase, url: null, needsLicense: true });
-      } else {
-        // Previously silent at the ops-log level — only the bare summary
-        // count below reached the server log; the per-face detail landed
-        // only in the returned `errors` array (persisted to
-        // brand.fontIngestError, visible only by reading the DB later). This
-        // is the common path (open/self-hosted faces, no license gate), so a
-        // systemic issue — Cloudinary down, a CDN blocking our UA — would
-        // otherwise produce zero real-time signal.
-        console.warn(
-          `🔤 brand font ingest: non-commercial face not mirrored (${failClass}) ` +
-          `"${face.family}" ${face.weight} ${face.style} from ${face.url}: ${err.message}`
-        );
-      }
-    }
+    const { ingested: gotIngested, flagged: gotFlagged, error: gotError } =
+      await mirrorDiscoveredFace(face, { pageUrl, brandId, mirrorCounts, source: 'website' });
+    if (gotIngested) ingested.push(gotIngested);
+    if (gotFlagged) flagged.push(gotFlagged);
+    if (gotError) errors.push(gotError);
   }
 
   console.log(
@@ -1100,6 +1099,17 @@ module.exports = {
   isPseudoElementSelector,
   isOnlyPseudoElementSelectors,
   NON_BRAND_FAMILIES,
+  // Exported 2026-08-31 for services/shopifyThemeFontService.js — the Shopify
+  // theme font path is a SECOND discoverer of the same face shape (Shopify
+  // theme CSS instead of a marketing homepage) and shares this exact
+  // validation/download/licence-gate/Cloudinary-mirror code via
+  // mirrorDiscoveredFace rather than a second, divergent copy.
+  mirrorDiscoveredFace,
+  downloadFontFile,
+  dedupeFaces,
+  familySlug,
+  GOOGLE_FONT_HOSTS,
+  COMMERCIAL_FOUNDRY_HOSTS,
   // Exported for scripts/backfillBrandFontGenerics.js, which re-derives the
   // first-party generics for brands ingested before they were captured. It
   // reuses these PURE extractors (and UA/MAX_STYLESHEETS) rather than making

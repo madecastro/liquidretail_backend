@@ -1767,6 +1767,56 @@ router.post('/:id/ingest-meta-fonts', express.json(), async (req, res) => {
   }
 });
 
+// POST /api/brand/:id/ingest-shopify-fonts — pull REAL FONT FILES from the
+// brand's Shopify THEME (added 2026-08-31). A third font source alongside
+// /ingest-fonts (marketing homepage) and /ingest-meta-fonts (vision-model
+// NAME from ad creatives) — see services/shopifyThemeFontService.js's file
+// header for the full mechanism (authed Admin API tried first, public
+// storefront-HTML fallback, myshopify-headless discovery, licensing gate on
+// Shopify's own font-library CDN).
+//
+// Requires brand.apifyDemo.shopifyUrl (or shopifyUrl/websiteUrl —
+// resolveStoreOrigin's cascade) — NOT gated on apifyDemo.method or isDemo.
+// FREE (plain HTTP; the optional Admin API call is billed to the merchant's
+// own Shopify plan, never to us). Unlike /ingest-meta-fonts this does NOT
+// stamp on failure at all — matching the corrected free-website-path
+// behaviour from 078dc07, not the billable meta-ads route above: a
+// transient fetch/parse failure must stay retryable.
+router.post('/:id/ingest-shopify-fonts', express.json(), async (req, res) => {
+  try {
+    const brand = await Brand.findOne(tenantFilter(req, { _id: req.params.id }));
+    if (!brand) return res.status(404).json({ error: 'brand not found' });
+
+    const { ingestShopifyThemeFonts } = require('../services/shopifyThemeFontService');
+    const result = await ingestShopifyThemeFonts(brand);
+    const { applyShopifyFontIngestResult } = require('../services/brandFontPersistenceService');
+    applyShopifyFontIngestResult(brand, result);
+    await brand.save();
+
+    console.log(
+      `🛍🔤 ingest-shopify-fonts[${brand.name}]: via=${result.via} ${result.ingested.length} ingested, ` +
+      `${result.flagged.length} flagged, ${result.errors.length} errors`
+    );
+    res.json({ ok: true, via: result.via, ingested: result.ingested, flagged: result.flagged, errors: result.errors, usage: result.usage, customFonts: brand.customFonts });
+  } catch (err) {
+    // NEVER stamp shopifyFontsIngestedAt here — this path is free, and an
+    // unreachable/mis-configured store must stay retryable on the very next
+    // automatic enrichment pass, not get permanently disabled by one manual
+    // operator click. Best-effort error visibility only.
+    try {
+      const BrandModel = require('../models/Brand');
+      await BrandModel.updateOne(
+        { _id: req.params.id },
+        { $set: { shopifyFontsIngestError: String(err.message || err).slice(0, 2000) } }
+      );
+    } catch (stampErr) {
+      console.error(`ingest-shopify-fonts: could not record error (${stampErr.message})`);
+    }
+    console.error('ingest-shopify-fonts failed:', err.message);
+    res.status(err.status || 500).json({ error: err.message || 'shopify theme font ingest failed' });
+  }
+});
+
 // GET /api/brand/:id/meta-cascades — every meta field the titling
 // engine consumes, with its effective source cascade (brand overrides
 // merged over shipped defaults) and a human label for each field.
