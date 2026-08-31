@@ -307,6 +307,12 @@ const MAX_CREATIVES_PER_RUN = CONC.MAX_CREATIVES_PER_RUN;
 // header. Used by projectAd below so `titled` is never inferred twice, once
 // correctly here and once wrong on a client.
 const { isAdHonestlyDelivered } = require('../services/adTitlingTruth');
+// Canonical per-ad phase — services/adPhase.js. THE single source every
+// surface that shows "where is this ad" (this endpoint's `projectAd`, the
+// render-activity board below, GET /runs, and Slack) must call instead of
+// re-deriving a label from status/renderStage/visionQc independently. See
+// that file's header for the 2026-08-26 audit this responds to.
+const { deriveAdPhase, describeAdFailure } = require('../services/adPhase');
 
 // POST /api/ads/preview
 // Same body as /generate. Runs the entire seed assembly + cartesian +
@@ -3670,7 +3676,7 @@ router.get('/runs/:runId', async (req, res) => {
     // skips titling AND QC entirely and still ships `draft` — is a genuine,
     // actionable "not inspected" case (arguably worse, since it also never
     // got titled), so it is correctly INCLUDED here, not filtered out.
-    const [queuedRemaining, stages, failureSummary, shippedWithoutQcCount, qcFailedCount, qcdOnRetryCount, qcDisabledCount, qcUnavailableCount] = await Promise.all([
+    const [queuedRemaining, stages, failureSummary, shippedWithoutQcCount, qcFailedCount, qcdOnRetryCount, qcDisabledCount, qcUnavailableCount, phaseCountAds] = await Promise.all([
       Ad.countDocuments({
         campaignId: run.campaignId,
         status:     'queued'
@@ -3747,8 +3753,30 @@ router.get('/runs/:runId', async (req, res) => {
         status: { $in: AD_STATUSES },
         'visionQc.skipped': true,
         'visionQc.disabled': false
-      }).catch(() => 0)
+      }).catch(() => 0),
+      // Inputs for `phaseCounts` below — one extra find, not one per phase.
+      // Owner requirement: the Rendering-window counters must reflect real
+      // Ad truth, self-healing, not the stored succeeded/failed/skipped
+      // counters alone (those are correct once `maybeFinalizeRun`/the
+      // reaper reconcile them, but can lag or — the titler-handoff
+      // incident this whole pass responds to — sit wrong indefinitely if
+      // nothing ever re-derives them). `phaseCounts` is computed FRESH on
+      // every poll from the canonical services/adPhase.js, the same
+      // function every other surface (UI, Slack) now uses, so a stuck run
+      // is visible here immediately rather than only after the next
+      // worker.js reap tick.
+      Ad.find({ campaignRunIds: run.runId })
+        .select('status kind renderUrl veoVideoUrl titlingResumeState renderStage renderStageAt claimedByWorker claimedAt titlingNeeded deriveFromMaster visionQc renderError updatedAt')
+        .lean()
+        .catch(() => [])
     ]);
+    // One pass over the same claimed-ads read above, through the identical
+    // deriveAdPhase() every other surface calls — never a re-derivation.
+    const phaseCounts = {};
+    for (const ad of (phaseCountAds || [])) {
+      const p = deriveAdPhase(ad);
+      phaseCounts[p] = (phaseCounts[p] || 0) + 1;
+    }
     res.json({
       runId:           run.runId,
       brandId:         String(run.brandId),
@@ -3766,6 +3794,19 @@ router.get('/runs/:runId', async (req, res) => {
       failed:          run.failed,
       status:          run.status,
       queuedRemaining,
+      // Self-healing counters (2026-08-26) — a per-phase count of this
+      // run's claimed Ads, freshly computed every poll from
+      // services/adPhase.js. Unlike `succeeded`/`skipped`/`failed` above
+      // (stored on CampaignRun, written by bumpRunCounter/
+      // maybeFinalizeRun/the reaper), this can never sit wrong: it is not
+      // a counter that gets incremented and can drift, it is recomputed
+      // from the real Ad documents on every single request. Use this to
+      // detect "stuck" — e.g. a nonzero `awaiting-titler` or `stalled`
+      // count on a run that has been 'running' for a while is exactly the
+      // titler-handoff-stranded shape worker.js's background scan also
+      // pages for — while `succeeded+failed+skipped` can undercount
+      // `total` forever if nothing ever settles those ads.
+      phaseCounts,
       errors:          run.errors || [],
       // What stage this run's in-flight (status:'rendering') ads are in,
       // grouped and counted — e.g. [{stage:'titling 9:16', count:3}]. Empty
@@ -4128,6 +4169,14 @@ router.get('/render-activity', async (req, res) => {
               'renderUrl renderError renderAttempts renderStages imageGeneration ' +
               'intentResolution visionQc veoPredictionId veoAspectRatio veoVideoUrl ' +
               'campaignId campaignRunIds productId mediaId brandId conceptId ' +
+              // deriveFromMaster/funnelStage: real lineage (see the fixed
+              // `derivedFromMaster` field below). claimedByWorker/claimedAt/
+              // titlingNeeded/titlingResumeState: needed by deriveAdPhase —
+              // an unselected field here silently mis-derives phase the same
+              // way an unselected `kind` used to silently defeat the titling
+              // check in services/campaignRunGuards.js.
+              'deriveFromMaster funnelStage claimedByWorker claimedAt ' +
+              'titlingNeeded titlingResumeState ' +
               'queuedAt renderedAt updatedAt')
       .sort({ updatedAt: -1 })
       .limit(limit)
@@ -4184,9 +4233,30 @@ router.get('/render-activity', async (req, res) => {
         pipeline:      a.imageGeneration?.pipeline || (a.kind === 'video' ? 'veo' : null),
         model:         a.imageGeneration?.model || null,
         predictionId,
-        // Provenance for the multi-size video story: a 1:1 or 4:5 video whose
-        // veoAspectRatio is 9:16 was CROPPED from a master, not generated.
-        derivedFromMaster: a.kind === 'video' && a.veoAspectRatio === '9:16' && a.aspectRatio !== '9:16',
+        // Provenance for the multi-size video story. FIXED 2026-08-26 — this
+        // used to infer lineage from a URL/aspect heuristic
+        // (`veoAspectRatio === '9:16' && aspectRatio !== '9:16'`), which is
+        // wrong for a 9:16 derivative sharing a 9:16 master (the Meta Reels
+        // retitle, or the shared-portrait-master case documented in
+        // CLAUDE.md §2) and for a 16:9 derivative (PMax's landscape master
+        // has no 9:16 anywhere in this test). Real lineage is the
+        // `Ad.deriveFromMaster` field itself — stamped once at mint time by
+        // `planDeterministicVideoAds` and never re-derived — see that
+        // file's own comment: "the render loop and the regenerate preflight
+        // read that stamp back... neither re-derives the condition, so
+        // planner and renderer cannot disagree."
+        derivedFromMaster: !!a.deriveFromMaster,
+        // THE canonical phase — same services/adPhase.js every other
+        // surface (UI, Slack) now uses. `stalled` here reads as `stalled:
+        // true` too (see the field just above) — the two can disagree in
+        // one direction only: this board's `stalled` is a per-stage 600s
+        // heuristic scoped to `status:'rendering'` only, `phase` is the
+        // fuller 15-minute cross-phase check, so a `phase:'stalled'` row
+        // with `stalled:false` is a real, slightly different signal — a
+        // titler-handoff ad stuck `awaiting-titler`, for example, is never
+        // `status:'rendering'`-with-a-fresh-stage in the way the narrower
+        // check requires.
+        phase:         deriveAdPhase(a),
         timingsMs:     { derive: t.deriveMs ?? null, render: t.renderMs ?? null, upload: t.uploadMs ?? null },
         intent:        a.intentResolution
           ? { requested: a.intentResolution.requested, delivered: a.intentResolution.delivered,
@@ -5903,6 +5973,13 @@ function projectAd(ad, full = false, extras = {}) {
     // `full` below upgrades it with the per-category breakdown.
     visionQc:           summarizeVisionQc(ad.visionQc)
   };
+  // THE canonical phase — services/adPhase.js. Every UI surface should read
+  // THIS field for its status pill instead of re-deriving one from `status`
+  // + `renderStage` (the drift that let /ads and ProductAds disagree about
+  // the same ad — see that file's header). Always present, not gated on
+  // `full`: a list tile needs to know "stalled" / "awaiting-titler" just as
+  // much as the detail modal does.
+  base.phase = deriveAdPhase(ad);
   // A failed ad in the LIST needs to say WHY. renderError itself stays behind
   // `full` (it carries other internals), so surface just
   // the operator-facing headline — which since 2026-08-05 leads with the policy
@@ -5914,6 +5991,13 @@ function projectAd(ad, full = false, extras = {}) {
     base.renderErrorMessage = String(ad.renderError.message);
     base.chargeState        = ad.renderError.chargeState || null;
   }
+  // Owner requirement 2026-08-26: "for QC failures it should specifically be
+  // noted as a QC Fail, not just Failed." `failure` is null on every phase
+  // except failed-terminal/qc-failed-kept, so a passing/in-flight ad's
+  // payload is unchanged. See services/adPhase.js describeAdFailure — same
+  // function Slack alerts use, so the label can never disagree.
+  const failure = describeAdFailure(ad, base.phase);
+  if (failure) base.failure = failure;
 
   if (full) {
     base.layoutInputArtifactId = ad.layoutInputArtifactId ? String(ad.layoutInputArtifactId) : null;

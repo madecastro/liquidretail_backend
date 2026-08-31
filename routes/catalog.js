@@ -55,6 +55,14 @@ const { isAdHonestlyDelivered } = require('../services/adTitlingTruth');
 // not get a second, drifting derivation between the flat ads list and this
 // product-detail expansion.
 const { adSpendReceipts } = require('../services/spendReceipt');
+// Canonical per-ad phase — services/adPhase.js. See routes/ads.js's
+// projectAd for the full rationale; this endpoint (the primary Product Ads
+// surface) is exactly the one Grok's 2026-08-26 preview-consolidation audit
+// found silently dropping the fields a status pill needs (D3) — fixed here
+// by projecting the fields deriveAdPhase needs and stamping the same
+// `phase`/`failure` shape projectAd emits, so a frontend adapter that
+// forwards them through unchanged gets parity for free.
+const { deriveAdPhase, describeAdFailure } = require('../services/adPhase');
 void assertMediaInTenant;     // kept for future :id verification helpers
 
 function escapeRegex(s) { return String(s || '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); }
@@ -1031,7 +1039,13 @@ router.get('/:id/ads-detail', async (req, res) => {
           // NOTE the sub-path projection. `imageGeneration` is Mixed and also
           // carries the full generation prompt; projecting the whole object to
           // reach one id would drag several KB per row onto a 60-row grid.
-          veoPredictionId: 1, 'imageGeneration.predictionId': 1
+          veoPredictionId: 1, 'imageGeneration.predictionId': 1,
+          // Inputs deriveAdPhase() needs beyond the above — an unprojected
+          // field here silently mis-derives phase the same way an
+          // unprojected `kind` used to silently defeat the titling check
+          // elsewhere in this repo (see services/campaignRunGuards.js's own
+          // comment on the identical trap).
+          deriveFromMaster: 1, titlingNeeded: 1, claimedByWorker: 1, claimedAt: 1
       } }
     ], { allowDiskUse: true });
 
@@ -1095,7 +1109,10 @@ router.get('/:id/ads-detail', async (req, res) => {
     // frontend whether to display photorealUrl in place of renderUrl.
     // Same projection shape /api/ads emits so the frontend thumbnail
     // code can be shared.
-    const adRows = ads.map(a => ({
+    const adRows = ads.map(a => {
+    const phase = deriveAdPhase(a);
+    const failure = describeAdFailure(a, phase);
+    return {
       adId:           String(a._id),
       campaignId:     a.campaignId ? String(a.campaignId) : null,
       template:       a.template,
@@ -1173,6 +1190,12 @@ router.get('/:id/ads-detail', async (req, res) => {
       // (services/adTitlingTruth.js), so this page can never disagree with
       // those about what "delivered" means.
       titled:         isAdHonestlyDelivered(a),
+      // THE canonical phase — same services/adPhase.js routes/ads.js
+      // projectAd uses. `failure` is null on every phase except
+      // failed-terminal/qc-failed-kept (owner requirement: a QC rejection
+      // must read "QC Fail", not a generic "Failed" — see that file).
+      phase,
+      ...(failure ? { failure } : {}),
       regenerating:   !!a.regenerating,
       regenerationStage: a.regenerationStage || null,
       regenerationHistory: Array.isArray(a.regenerationHistory)
@@ -1197,7 +1220,8 @@ router.get('/:id/ads-detail', async (req, res) => {
       sourceMedia:  (a.variantKind === 'ugc' && a.mediaId)
         ? (sourceMediaMap.get(String(a.mediaId)) || null)
         : null
-    }));
+    };
+    });
 
     res.json({ campaigns, ads: adRows });
   } catch (err) {
