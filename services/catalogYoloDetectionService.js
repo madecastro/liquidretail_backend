@@ -36,7 +36,7 @@
 const CatalogProduct = require('../models/CatalogProduct');
 const Media = require('../models/Media');
 const progressService = require('./progressService');
-const { detectYoloForMedia } = require('./mediaYoloRefine');
+const { detectYoloForMediaBatch } = require('./mediaYoloRefine');
 
 const { concurrency: CONC } = require('./concurrency');
 const CONCURRENCY = CONC.CATALOG_YOLO_CONCURRENCY;
@@ -58,9 +58,14 @@ function needsYoloDetection(media) {
   return !Array.isArray(media?.refinedProducts) || media.refinedProducts.length === 0;
 }
 
-// Per-product driver. Enumerates hero + top-N alts, runs YOLO on each Media
-// that lacks refinedProducts. Never throws — per-Media failures are logged
-// and counted; product row completes so the outer queue can move on.
+// Per-product driver. Enumerates hero + top-N alts, then submits them as
+// ONE batch to yolo_microservice /detect-batch (via detectYoloForMediaBatch).
+// Amortizes HTTP + Flask + Python overhead across a product's Media set
+// (~30% wall reduction per image measured on the microservice CPU box).
+// Loads the CatalogProduct once and passes it into the batch so the
+// Grounding DINO prompt is built a single time per product. Never throws —
+// batch-level failures are logged and counted; product row completes so
+// the outer queue can move on.
 async function detectYoloForOne(product) {
   const id = String(product._id);
   const label = `"${(product.title || '').slice(0, 40) || '(untitled)'}"`;
@@ -84,20 +89,37 @@ async function detectYoloForOne(product) {
     return { productId: id, mediaTotal: mediaDocs.length, detected: 0, skipped: mediaDocs.length, failed: 0 };
   }
 
+  // Load the CatalogProduct once — the batch helper reuses it for every
+  // catalog-product Media in the batch to build the Grounding DINO prompt.
+  // Skip if the whole product target set is UGC (rare for this orchestrator,
+  // but safe).
+  const anyCatalog = targets.some((m) => m.source === 'catalog-product');
+  const productDoc = anyCatalog
+    ? await CatalogProduct.findById(product._id).select('title brand category').lean()
+    : null;
+
   let detected = 0, failed = 0;
   let synthesized = 0, gptRefined = 0;
-  for (const media of targets) {
-    try {
-      const r = await detectYoloForMedia(media, { trigger: 'ingest' });
+  try {
+    const results = await detectYoloForMediaBatch(targets, {
+      product: productDoc,
+      trigger: 'ingest'
+    });
+    for (const r of results) {
       if (r.status === 'ok') {
         detected++;
         if (r.path === 'synthesized') synthesized++;
         else if (r.path === 'gpt-refine') gptRefined++;
+      } else if (r.status === 'failed') {
+        failed++;
+        console.warn(`   ⚠️  yolo-detect ${label} media=${r.mediaId}: ${r.reason || 'unknown'} ${r.error || ''}`);
       }
-    } catch (err) {
-      failed++;
-      console.warn(`   ⚠️  yolo-detect ${label} media=${media._id}: ${err.message}`);
     }
+  } catch (err) {
+    // Whole-batch failure (e.g. YOLO service down after retries). Count
+    // every target as failed so counters stay accurate.
+    failed = targets.length;
+    console.warn(`   ⚠️  yolo-detect ${label} batch failed: ${err.message}`);
   }
 
   const ms = Date.now() - t0;

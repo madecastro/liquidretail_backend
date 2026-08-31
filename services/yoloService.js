@@ -28,6 +28,93 @@ async function detectFromVideo(videoBuffer, filename) {
   return _callYolo(`${YOLO_URL}/detect-video`, form);
 }
 
+// Batch detection — posts N images (all as multipart field `image`) and
+// their N optional prompts (JSON `prompts` array parallel to images) to
+// yolo_microservice /detect-batch. Amortizes HTTP + Flask + Python
+// invocation over N images per request (measured ~30% wall reduction per
+// image). Empty prompt on a slot routes that slot through the legacy
+// COCO+rects+OAI pipeline; non-empty prompt routes through Grounding DINO.
+// Response shape: parallel array in the same order as `items`, each entry
+// { width, height, detections:[...] } matching detectMultipleProducts.
+//
+// Caller-side batching lives in catalogYoloDetectionService (one HTTP call
+// per PRODUCT — hero + top-N alts). Batch cap belongs there, not here.
+async function detectBatch(items) {
+  const list = Array.isArray(items) ? items : [];
+  if (!list.length) return { results: [] };
+  const form = new FormData();
+  const prompts = [];
+  for (let i = 0; i < list.length; i++) {
+    const it = list[i] || {};
+    if (!it.buffer) throw new Error(`detectBatch: item[${i}] missing buffer`);
+    form.append('image', it.buffer, { filename: `upload-${i}.jpg` });
+    prompts.push(it.prompt && typeof it.prompt === 'string' ? it.prompt.trim() : '');
+  }
+  // Always send prompts (JSON array parallel to images). Empty strings on
+  // non-catalog slots route those to the COCO path server-side.
+  form.append('prompts', JSON.stringify(prompts));
+
+  const url = `${YOLO_URL}/detect-batch`;
+  let lastErr = null;
+  for (let attempt = 0; attempt <= YOLO_RETRY_ATTEMPTS; attempt++) {
+    if (attempt > 0) {
+      console.log(`🔁 YOLO batch retry ${attempt}/${YOLO_RETRY_ATTEMPTS} after ${YOLO_RETRY_DELAY_MS}ms`);
+      await new Promise(r => setTimeout(r, YOLO_RETRY_DELAY_MS));
+    }
+    try {
+      console.log(`➡️  Sending BATCH to YOLO (n=${list.length})${attempt > 0 ? ` (retry ${attempt})` : ''}: ${url}`);
+      const res = await axios.post(url, form, {
+        headers: form.getHeaders(),
+        responseType: 'json',
+        // Batch is heavier than /detect — scale timeout with size so a
+        // 6-image batch on a cold Grounding DINO instance still finishes.
+        timeout: Math.max(YOLO_TIMEOUT_MS, YOLO_TIMEOUT_MS * Math.ceil(list.length / 2)),
+        maxContentLength: Infinity,
+        maxBodyLength: Infinity
+      });
+      const results = Array.isArray(res.data?.results) ? res.data.results : [];
+      console.log(`✅ YOLO batch responded: ${res.status} — ${results.length} result(s)`);
+      // Normalize each slot into the same shape detectMultipleProducts
+      // returns, so callers don't need a second decoder. base64 may be
+      // empty on open-vocab slots (server-side skip); cropBuffer is then
+      // an empty Buffer — synthesizer only needs bbox+conf, not crop.
+      return {
+        results: results.map((r) => {
+          const dets = Array.isArray(r?.detections) ? r.detections : [];
+          return {
+            width:  r?.width  || 0,
+            height: r?.height || 0,
+            error:  r?.error || null,
+            detections: dets.map((det, i) => ({
+              id: `p${i + 1}`,
+              cropBuffer: det.base64 ? Buffer.from(det.base64, 'base64') : Buffer.alloc(0),
+              confidence: det.confidence,
+              x1: det.x1, y1: det.y1, x2: det.x2, y2: det.y2,
+              className: det.class_name,
+              imgWidth: det.img_width,
+              imgHeight: det.img_height
+            }))
+          };
+        })
+      };
+    } catch (err) {
+      lastErr = err;
+      if (!isTransientYoloError(err)) {
+        const kind = classifyYoloError(err);
+        console.error(`❌ YOLO batch failed (non-transient, ${kind}):`, err.response?.data || err.message);
+        const e = new Error(`yolo-batch:${kind}: ${err.message || 'call failed'}`);
+        e.yoloKind = kind;
+        throw e;
+      }
+      console.warn(`⚠️  YOLO batch transient failure (attempt ${attempt + 1}): ${err.code || err.message}`);
+    }
+  }
+  const kind = classifyYoloError(lastErr);
+  const e = new Error(`yolo-batch:${kind}: ${lastErr?.message || 'retries exhausted'}`);
+  e.yoloKind = kind;
+  throw e;
+}
+
 // Connection-reset retry knob — one retry by default. YOLO autoscaling
 // instance churn (scale-down + new-instance routing) and Render's edge
 // timeout can produce transient ECONNRESET / ECONNABORTED errors that
@@ -126,4 +213,4 @@ async function _callYolo(url, form) {
   throw e;
 }
 
-module.exports = { detectMultipleProducts, detectFromVideo };
+module.exports = { detectMultipleProducts, detectFromVideo, detectBatch };

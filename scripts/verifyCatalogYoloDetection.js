@@ -271,6 +271,59 @@ try {
   }
 }
 
+// ── M: batch endpoint (Tier 3 scaling) — client + helper + orchestrator ──
+// The whole point of batching is per-request overhead amortization; a
+// green suite that misses one thread is silently a serial pipeline again.
+try {
+  const yoloSvc = require('../services/yoloService');
+  if (typeof yoloSvc.detectBatch === 'function') pass('M1', 'yoloService.detectBatch exported');
+  else fail('M1', 'yoloService.detectBatch MISSING — orchestrator cannot batch');
+} catch (e) { fail('M1', `require yoloService threw: ${e.message}`); }
+
+{
+  const yoloSrc = readFile('services/yoloService.js');
+  if (/\/detect-batch/.test(yoloSrc)) pass('M2', 'yoloService posts to /detect-batch route');
+  else fail('M2', 'yoloService missing /detect-batch URL — batch call unreachable');
+  if (/form\.append\(['"]prompts['"]/.test(yoloSrc) && /JSON\.stringify/.test(yoloSrc)) {
+    pass('M3', 'yoloService threads JSON prompts[] array alongside batched image files');
+  } else {
+    fail('M3', 'yoloService missing JSON prompts[] append — microservice will treat every slot as UGC');
+  }
+}
+
+try {
+  const mod = require('../services/mediaYoloRefine');
+  if (typeof mod.detectYoloForMediaBatch === 'function') pass('M4', 'mediaYoloRefine.detectYoloForMediaBatch exported');
+  else fail('M4', 'mediaYoloRefine.detectYoloForMediaBatch MISSING — orchestrator cannot batch');
+} catch (e) { fail('M4', `require mediaYoloRefine threw: ${e.message}`); }
+
+{
+  const batchRefineSrc = readFile('services/mediaYoloRefine.js');
+  // The batch helper must build the prompt ONCE per group and per-Media
+  // still fork on media.source (synthesize vs paid refine).
+  if (/detectYoloForMediaBatch[\s\S]{0,4000}yoloService\.detectBatch\(/.test(batchRefineSrc)) {
+    pass('M5', 'detectYoloForMediaBatch calls yoloService.detectBatch');
+  } else {
+    fail('M5', 'detectYoloForMediaBatch does NOT call yoloService.detectBatch — fell back to serial or missing wiring');
+  }
+  if (/detectYoloForMediaBatch[\s\S]{0,4000}synthesizeRefinedFromCatalog[\s\S]{0,4000}refineDetectionCrops/.test(batchRefineSrc)) {
+    pass('M6', 'detectYoloForMediaBatch applies per-Media fork (synthesize + refine paths present)');
+  } else {
+    fail('M6', 'detectYoloForMediaBatch missing per-Media fork — money-safe path unreachable');
+  }
+}
+
+{
+  const orch2Src = readFile('services/catalogYoloDetectionService.js');
+  if (/detectYoloForMediaBatch/.test(orch2Src)) pass('M7', 'catalogYoloDetectionService imports detectYoloForMediaBatch');
+  else fail('M7', 'catalogYoloDetectionService still uses serial per-Media path — Tier 3 batching not wired');
+  if (/CatalogProduct\.findById[\s\S]{0,120}\.select\(['"]title brand category['"]\)/.test(orch2Src)) {
+    pass('M8', 'catalogYoloDetectionService loads product once per batch for shared prompt');
+  } else {
+    fail('M8', 'catalogYoloDetectionService missing per-product CatalogProduct load — prompt built from stub');
+  }
+}
+
 // ── Summary ──
 console.log(`\n──── ${RESULTS.pass} pass, ${RESULTS.fail} fail, ${RESULTS.info} info ────`);
 process.exit(RESULTS.fail > 0 ? 1 : 0);
