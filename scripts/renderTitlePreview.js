@@ -300,6 +300,14 @@ Usage: node scripts/renderTitlePreview.js [flags]
   --scale=<n>                                 default: 1
   --duration=<sec>                            default: 8
   --plate-color=<#RRGGBB>                     default: #3D3D3D
+  --lum=<0..1 | top:0.5,middle:0.2>           synthetic band luminance. Sub-AA ONLY for
+                                              0.470-0.500 (worst 0.485 = 4.24:1); 0.45 and 0.55
+                                              both CLEAR AA. Use --lum=0.485 for worst case.
+  --busy=<0..1>                               synthetic texture; >0.45 trips the busy escalation
+  --real-scan                                 IGNORE --lum/--busy/--face and run the REAL
+                                              plateIntelService scan over --plate-video's actual
+                                              frames. The only honest way to ask whether a REAL
+                                              delivered ad is hard to read. Free (basic scan).
   --plate-video=<path.mp4>                    real base plate instead of a flat colour;
                                               probes true fps/duration. Use an ad's
                                               UNTITLED veoVideoUrl (not renderUrl, which
@@ -334,6 +342,9 @@ function parseArgs(argv) {
     duration: 8,
     plateColor: '#3D3D3D',
     plateVideo: null,
+    lum: null,
+    busy: null,
+    realScan: false,
     listPresets: false,
     listFaces: false,
     help: false,
@@ -343,6 +354,7 @@ function parseArgs(argv) {
     else if (a === '--list-presets') args.listPresets = true;
     else if (a === '--list-faces') args.listFaces = true;
     else if (a === '--include-video') args.includeVideo = true;
+    else if (a === '--real-scan') args.realScan = true;
     else if (a.startsWith('--format=')) args.format = a.split('=')[1];
     else if (a.startsWith('--preset=')) args.preset = a.split('=')[1];
     else if (a.startsWith('--at=')) {
@@ -365,6 +377,10 @@ function parseArgs(argv) {
       args.plateColor = a.slice('--plate-color='.length);
     } else if (a.startsWith('--plate-video=')) {
       args.plateVideo = a.slice('--plate-video='.length);
+    } else if (a.startsWith('--lum=')) {
+      args.lum = a.slice('--lum='.length);
+    } else if (a.startsWith('--busy=')) {
+      args.busy = Number(a.slice('--busy='.length));
     } else {
       console.warn(`renderTitlePreview: ignoring unrecognized flag '${a}'`);
     }
@@ -392,19 +408,62 @@ function listFaceScenarios(format) {
 
 // Baseline plateHints: one sample, nothing flagged. Shape matches
 // plateIntelService.analyzePlate's real output (see that file's header).
-function controlPlateHints(atSec) {
+// Synthetic plate hints. The defaults (lum 0.4 / busy 0.1) describe a well-behaved
+// plate: worst-case ink there measures ~5.74:1, comfortably above the 4.5:1 AA
+// floor, so every legibility escalation in Canonical.jsx correctly stays DORMANT.
+// That is the right default for placement/overlap work — and useless for testing
+// the escalations themselves, which is what --lum / --busy are for.
+//
+//   --lum   0..1 band luminance. The genuinely sub-AA window is NARROW and was
+//           computed, not guessed: best-ink contrast dips below 4.5:1 ONLY for
+//           lum 0.470-0.500, bottoming at 0.485 (4.24:1). Neighbours are fine —
+//           0.45 gives 4.76:1 and 0.55 gives 5.30:1, both clearing AA. Use
+//           --lum=0.485 for the worst case; 0.0 and 1.0 are the EASY ends.
+//           (An earlier version of this note claimed "0.45-0.55 is hostile".
+//           That was wrong at both ends — corrected against the real sRGB
+//           relative-luminance maths, INK_DARK_LUM 0.0091 / INK_LIGHT_LUM 1.0.)
+//
+//           CONSEQUENCE WORTH KNOWING: because that window is only ~3 points
+//           wide, the marginal-gated treatments (contour stroke, weight bump)
+//           fire rarely on a STATIC band. They fire more often than that window
+//           suggests on real footage because placement scores WORST-CASE across
+//           all time samples — a clip whose band merely PASSES THROUGH 0.47-0.50
+//           at any sampled moment is penalised.
+//   --busy  0..1 local luma variance. Above BUSY_SHADOW_THRESHOLD (0.45) the
+//           band is treated as too textured to read on regardless of its mean
+//           contrast, which also triggers the escalations.
+//
+// Per-band overrides use `top:0.5` syntax so a single band can be made hostile
+// while its neighbours stay clean — the shape needed to exercise the contrast
+// term in resolveGroupAnchor's band SELECTION (a stack should walk off a
+// mid-tone band toward a legible one).
+function controlPlateHints(atSec, { lum = 0.4, busy = 0.1, perBand = {} } = {}) {
+  const band = (name) => ({
+    lum: Number.isFinite(perBand[name]) ? perBand[name] : lum,
+    busy,
+    avoid: false,
+  });
   return {
     samples: [
       {
         atSec,
-        bands: {
-          top: { lum: 0.4, busy: 0.1, avoid: false },
-          middle: { lum: 0.4, busy: 0.1, avoid: false },
-          bottom: { lum: 0.4, busy: 0.1, avoid: false },
-        },
+        bands: { top: band('top'), middle: band('middle'), bottom: band('bottom') },
       },
     ],
   };
+}
+
+/** `0.5` -> {lum:0.5}; `top:0.5,middle:0.2` -> per-band. */
+function parseLumArg(raw) {
+  const str = String(raw || '').trim();
+  if (!str) return { lum: undefined, perBand: {} };
+  if (!str.includes(':')) return { lum: Number(str), perBand: {} };
+  const perBand = {};
+  for (const part of str.split(',')) {
+    const [k, v] = part.split(':').map((x) => x.trim());
+    if (['top', 'middle', 'bottom'].includes(k) && Number.isFinite(Number(v))) perBand[k] = Number(v);
+  }
+  return { lum: undefined, perBand };
 }
 
 function faceRectForScenario(face, format, faceBoxArg) {
@@ -530,11 +589,16 @@ function loadMeta(args) {
     process.exit(1);
   }
   const baseAtSec = Math.min(args.duration - 0.1, Math.max(0.1, args.duration / 2));
+  const parsedLum = parseLumArg(args.lum);
+  const hintOpts = {};
+  if (Number.isFinite(parsedLum.lum)) hintOpts.lum = parsedLum.lum;
+  if (Object.keys(parsedLum.perBand).length) hintOpts.perBand = parsedLum.perBand;
+  if (Number.isFinite(args.busy)) hintOpts.busy = args.busy;
   if (!faceRect) {
-    plateHints = controlPlateHints(baseAtSec);
+    plateHints = controlPlateHints(baseAtSec, hintOpts);
   } else {
     const faceSamples = [{ atSec: null, face: faceRect }]; // envelope — applies to whole clip
-    plateHints = applyFaceKeepOut(controlPlateHints(baseAtSec), faceSamples, { safeZoneKey });
+    plateHints = applyFaceKeepOut(controlPlateHints(baseAtSec, hintOpts), faceSamples, { safeZoneKey });
   }
 
   console.log(`renderTitlePreview: preset=${args.preset} format=${args.format} safeZoneKey=${safeZoneKey} face=${args.face}`);
@@ -585,7 +649,16 @@ function loadMeta(args) {
     durationSec: args.duration,
     stillTimesSec: args.at,
     includeVideo: args.includeVideo,
-    plateHintsOverride: plateHints,
+    // --real-scan: hand renderPreview NOTHING, so it runs the REAL
+    // plateIntelService.analyzePlate over the REAL frames of --plate-video and
+    // the composition reads genuine measured luminance/texture instead of a
+    // hand-built fixture. This is the only mode that can answer "is this
+    // ACTUAL delivered ad hard to read", which a synthetic plate cannot.
+    // Keep TITLE_PLATE_SCAN=basic (the default) for it: basic is pure local
+    // sharp luminance — free, no network, no vision call. `gemini` would add a
+    // billable per-video call and only contributes `avoid` flags, which are a
+    // placement signal, not a contrast one.
+    plateHintsOverride: args.realScan ? null : plateHints,
   });
 
   // 6. Write output(s).
@@ -612,6 +685,14 @@ function loadMeta(args) {
     console.log(`renderTitlePreview: wrote video -> ${videoPath} (${result.sizeBytes} bytes)`);
   }
 
+  if (args.realScan && result.plateHints?.samples?.length) {
+    console.log('renderTitlePreview: REAL measured bands from the actual footage:');
+    for (const smp of result.plateHints.samples) {
+      console.log(`    t=${String(smp.atSec).padStart(5)}s  ${JSON.stringify(smp.bands)}`);
+    }
+  } else if (args.realScan) {
+    console.log('renderTitlePreview: --real-scan produced NO hints (scan off, or plate unreadable).');
+  }
   console.log(`renderTitlePreview: done. timings=${JSON.stringify(result.timings)}`);
   console.log('renderTitlePreview: scan the log above for keepOut:/inkVote:/inkBand: lines to see what Canonical.jsx actually decided.');
   process.exit(0);

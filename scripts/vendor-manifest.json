@@ -1,8 +1,8 @@
 {
   "version": 2,
   "backendRef": "origin/main",
-  "backendHead": "e7aa605e688ca93a0b29f8447321d38ad9a1ac27",
-  "generatedAt": "2026-08-31T21:16:07.222Z",
+  "backendHead": "f9efb439b58f2bc5e8936868a1dd4308d58e84f5",
+  "generatedAt": "2026-08-31T23:20:25.223Z",
   "files": {
     "models/Ad.js": {
       "backendHash": "394d26a1cb8ad64b23bde73312f3473f332520dd9640b9d5e4bb8eec22d6138d",
@@ -297,19 +297,21 @@
     },
     "remotion/components/slotRenderers.jsx": {
       "backendHash": "8ac6dc648ad345edfd9943a86385ada0068144ee8cb2da294d65455ed008d692",
-      "adgenHash": "8ac6dc648ad345edfd9943a86385ada0068144ee8cb2da294d65455ed008d692",
+      "adgenHash": "5aba008e5b432077af713adf196f6bb0819d47c2505c0ec8a2c60094e01d4965",
       "backendSha": "119b668472c4dffbdb63c3d3dc588a16b9573103",
-      "status": "synced",
-      "portTo": null,
-      "owedSince": null
+      "status": "unported",
+      "reason": "2026-08-31 low-contrast title legibility (adgen PR #98): contrast-aware band selection in resolveGroupAnchor; a paint-order:stroke-fill contour + weight bump gated on worst-case sub-AA contrast; strokeClipGuard so the contour is not clipped by its own overflow:hidden; BadgeSlot given the shadow+contour it never had after its pill was removed; RatingSlot's hardcoded 700/500 weights now honour the treatment; social-proof size bumps. Backend renders these same presets and slot renderers through its own brandScriptExecutor / title-still preview path, so it needs the same fix.",
+      "portTo": "backend",
+      "owedSince": "2026-08-31T23:19:54.474Z"
     },
     "remotion/compositions/Canonical.jsx": {
       "backendHash": "5d651e994a55f2e0122f60ea0a78a631c77ce91adfdf878c8b8a0b79435978ef",
-      "adgenHash": "5d651e994a55f2e0122f60ea0a78a631c77ce91adfdf878c8b8a0b79435978ef",
+      "adgenHash": "91fa9b8de3c8cdd7495c893f12ca5ed9d0b9cba145854a3898ec32f7da345bca",
       "backendSha": "119b668472c4dffbdb63c3d3dc588a16b9573103",
-      "status": "synced",
-      "portTo": null,
-      "owedSince": null
+      "status": "unported",
+      "reason": "2026-08-31 low-contrast title legibility (adgen PR #98): contrast-aware band selection in resolveGroupAnchor; a paint-order:stroke-fill contour + weight bump gated on worst-case sub-AA contrast; strokeClipGuard so the contour is not clipped by its own overflow:hidden; BadgeSlot given the shadow+contour it never had after its pill was removed; RatingSlot's hardcoded 700/500 weights now honour the treatment; social-proof size bumps. Backend renders these same presets and slot renderers through its own brandScriptExecutor / title-still preview path, so it needs the same fix.",
+      "portTo": "backend",
+      "owedSince": "2026-08-31T23:20:03.277Z"
     },
     "remotion/index.jsx": {
       "backendHash": "0e5c37e862d456eafeca548add2112fb6eb150d1b08ee3598491d8b02a67b52e",
@@ -378,11 +380,12 @@
     },
     "remotion/lib/tokens.js": {
       "backendHash": "fe2fecac71cca8d9301a1e6af108fdc6589be4a5aefdfbc8243eb5050c09a8ba",
-      "adgenHash": "fe2fecac71cca8d9301a1e6af108fdc6589be4a5aefdfbc8243eb5050c09a8ba",
+      "adgenHash": "15aebc71db287446a7dcb4b2cac004972b037ca76b10b87f0052436d4735c950",
       "backendSha": "4a408819daea8628ae476fd1cbe1bc73fd042cca",
-      "status": "synced",
-      "portTo": null,
-      "owedSince": null
+      "status": "unported",
+      "reason": "2026-08-31 low-contrast title legibility (adgen PR #98): contrast-aware band selection in resolveGroupAnchor; a paint-order:stroke-fill contour + weight bump gated on worst-case sub-AA contrast; strokeClipGuard so the contour is not clipped by its own overflow:hidden; BadgeSlot given the shadow+contour it never had after its pill was removed; RatingSlot's hardcoded 700/500 weights now honour the treatment; social-proof size bumps. Backend renders these same presets and slot renderers through its own brandScriptExecutor / title-still preview path, so it needs the same fix.",
+      "portTo": "backend",
+      "owedSince": "2026-08-31T23:20:10.681Z"
     },
     "remotion/package.json": {
       "backendHash": "3787f7bb65b2c686b59eba69c5c4313a5c17b1c1336e2b72b1c8805c45d30898",
@@ -442,15 +445,21 @@
     },
     "remotion/presets/canonical-conversion.json": {
       "backendHash": "fe60de2ab6516903ce90fa6238e8a0680750d2ceb704d745ce52866d91abd321",
-      "adgenHash": "fe60de2ab6516903ce90fa6238e8a0680750d2ceb704d745ce52866d91abd321",
+      "adgenHash": "587c3dc8398e22358b36209a581c609198e31db45656c6c22f19046e1e6ff53a",
       "backendSha": "e7aa605e688ca93a0b29f8447321d38ad9a1ac27",
-      "status": "synced"
+      "status": "unported",
+      "reason": "2026-08-31 low-contrast title legibility (adgen PR #98): contrast-aware band selection in resolveGroupAnchor; a paint-order:stroke-fill contour + weight bump gated on worst-case sub-AA contrast; strokeClipGuard so the contour is not clipped by its own overflow:hidden; BadgeSlot given the shadow+contour it never had after its pill was removed; RatingSlot's hardcoded 700/500 weights now honour the treatment; social-proof size bumps. Backend renders these same presets and slot renderers through its own brandScriptExecutor / title-still preview path, so it needs the same fix.",
+      "portTo": "backend",
+      "owedSince": "2026-08-31T23:20:17.938Z"
     },
     "remotion/presets/canonical.json": {
       "backendHash": "937ad6e610e13c58eb54f889bbe002045b609789793fda2a8df2b5ab30156d73",
-      "adgenHash": "937ad6e610e13c58eb54f889bbe002045b609789793fda2a8df2b5ab30156d73",
+      "adgenHash": "0da8693ed32df8f3498fe5d1acbbad850561224b1ebb880071f238cff44495d3",
       "backendSha": "e7aa605e688ca93a0b29f8447321d38ad9a1ac27",
-      "status": "synced"
+      "status": "unported",
+      "reason": "2026-08-31 low-contrast title legibility (adgen PR #98): contrast-aware band selection in resolveGroupAnchor; a paint-order:stroke-fill contour + weight bump gated on worst-case sub-AA contrast; strokeClipGuard so the contour is not clipped by its own overflow:hidden; BadgeSlot given the shadow+contour it never had after its pill was removed; RatingSlot's hardcoded 700/500 weights now honour the treatment; social-proof size bumps. Backend renders these same presets and slot renderers through its own brandScriptExecutor / title-still preview path, so it needs the same fix.",
+      "portTo": "backend",
+      "owedSince": "2026-08-31T23:20:25.221Z"
     },
     "remotion/presets/pelagic-bluewater-editorial.json": {
       "backendHash": "504d078886e055dbde187e44029aa4beb11900c9099c3139f4b5ed85f00dceaf",

@@ -125,6 +125,114 @@ export function textShadowFor(name, inkHex) {
   return lum != null && lum < 0.5 ? TEXT_SHADOWS_ON_LIGHT[key] : TEXT_SHADOWS[key];
 }
 
+// ── CONTOUR STROKE, for bands where even the better ink is below AA ────────
+//
+// THIS IS NOT THE HALO THAT WAS REJECTED. The owner's "the halo is way too much
+// the copy doesn't look crisp" was about a WIDE, HIGH-ALPHA BLURRED SPREAD
+// (3px at 0.92 plus a 14px diffuse layer) painted BEHIND the glyph: blur has no
+// edge, so it fogs the counters and reads as a milky outline. This is the
+// opposite construction — a hard, unblurred stroke on the glyph's own outline,
+// the technique broadcast captions use, which sharpens the letterform instead of
+// softening it.
+//
+// `paint-order: stroke fill` is the load-bearing part and is NOT optional.
+// Without it, -webkit-text-stroke centres the stroke ON the outline, so half of
+// it eats INWARD into the glyph — thinning the letter and closing up counters at
+// exactly the sizes where legibility is already marginal. With it, the stroke is
+// painted first and the fill lands on top, so only the outer half survives: the
+// letterform keeps its full weight and gains a clean edge. Chromium (what
+// Remotion renders in) honours paint-order on HTML text.
+//
+// Width tracks font size (2.2%) rather than being fixed: a fixed 2px is a
+// hairline on a 73px quote and a slab on a 22px delivery line. Clamped to >=1px
+// so it never rounds away to nothing, and capped so a huge headline cannot turn
+// into an outline-drawn poster.
+//
+// Polarity follows the INK, exactly like textShadowFor: dark type gets a light
+// contour, light type gets a dark one. Getting this backwards paints a black
+// edge around black text and separates nothing — the same bug the shadow table
+// had before TEXT_SHADOWS_ON_LIGHT existed.
+// 0.028em: ~2px on a 68-73px headline/quote, ~1px on the small rating lines.
+// Raised from an initial 0.022 after measuring the result — the stroke now only
+// fires as a LAST RESORT (marginal contrast that placement could not escape), so
+// it has to actually register; at 0.022 it moved 53 pixels of a 2M-pixel frame.
+// Still a hairline by construction, and still clamped below.
+export const STROKE_WIDTH_EM = 0.028;
+export const STROKE_WIDTH_MAX_PX = 3;
+export const STROKE_ON_DARK_INK = 'rgba(0,0,0,0.85)';   // light type -> dark contour
+export const STROKE_ON_LIGHT_INK = 'rgba(255,255,255,0.92)'; // dark type -> light contour
+
+/**
+ * Style fragment adding a contour stroke to text. Returns an EMPTY object when
+ * `enabled` is false, so every existing caller spreads nothing and is
+ * byte-identical to before this existed.
+ *
+ * @param {boolean} enabled   only true on a band flagged MARGINAL (sub-AA contrast).
+ *                          NOT the busy/texture escalation — a contour separates ink from a
+ *                          backdrop of similar LUMINANCE and does little for high-contrast
+ *                          type on merely textured footage.
+ * @param {string}  inkHex    the resolved ink, for polarity
+ * @param {number}  fontPx    rendered font size, for width scaling
+ */
+export function textStrokeStyle(enabled, inkHex, fontPx) {
+  if (!enabled) return {};
+  const lum = hexLuminance(inkHex);
+  // Unparseable ink → assume light type on dark footage, matching textShadowFor's
+  // own fallback, rather than guessing the inverse and painting the wrong edge.
+  const inkIsDark = lum != null && lum < 0.5;
+  const px = Math.min(
+    STROKE_WIDTH_MAX_PX,
+    Math.max(1, Math.round((Number(fontPx) || 24) * STROKE_WIDTH_EM))
+  );
+  return {
+    WebkitTextStrokeWidth: `${px}px`,
+    WebkitTextStrokeColor: inkIsDark ? STROKE_ON_LIGHT_INK : STROKE_ON_DARK_INK,
+    paintOrder: 'stroke fill',
+  };
+}
+
+/**
+ * Padding that keeps a contour stroke from being clipped by the SAME element's
+ * own `overflow: hidden`.
+ *
+ * MEASURED, NOT THEORISED (2026-08-31). `paint-order: stroke fill` paints the
+ * stroke's outer half OUTSIDE the glyph outline, so on an element that also
+ * clips (textCoreStyle's `-webkit-box` + `-webkit-line-clamp` + `overflow:hidden`,
+ * and DeliverySlot's nowrap-ellipsis span) the contour can be shaved off at the
+ * box edge. Proved by rendering identical CSS in the very chrome-headless-shell
+ * binary Remotion uses, production config vs. an `overflow:visible` control:
+ *   - horizontally, a line wrapping flush to the box width lost 2px of contour
+ *     at the left edge (ink started at x=40 clipped vs x=38 unclipped);
+ *   - vertically there is 11-14px of leading slack above the ascender (never at
+ *     risk), but only 1-2px below the last baseline — enough that Verdana-700
+ *     measurably lost 1px, while Arial and Georgia only just survived.
+ * Content-dependent, so it does not fire on every render — which is exactly why
+ * eyeballing one still frame was not sufficient evidence either way.
+ *
+ * The fix is padding to make room, plus an equal NEGATIVE MARGIN so the element
+ * occupies the same space in its flex column as before and the layout does not
+ * shift. `boxSizing: 'border-box'` keeps the padding inside the declared width.
+ *
+ * COSTS, stated honestly and bounded (both <= 2*strokePx, i.e. <= 6px):
+ *   - the rendered box grows slightly taller than stackFit's arithmetic estimate
+ *     (which models `lines * fontPx * lineHeight` and has never accounted for DOM
+ *     padding), eating a little of its existing safety cushion;
+ *   - with border-box the content area narrows slightly versus what deriveCharCap
+ *     assumed, so a line could clamp one word earlier.
+ * Both are smaller than the weight bump's already-accepted char-cap blindness,
+ * and both only occur on a band already judged marginal.
+ *
+ * Returns {} when disabled, so every caller is byte-identical without a stroke.
+ */
+export function strokeClipGuard(enabled, fontPx) {
+  if (!enabled) return {};
+  const px = Math.min(
+    STROKE_WIDTH_MAX_PX,
+    Math.max(1, Math.round((Number(fontPx) || 24) * STROKE_WIDTH_EM))
+  );
+  return { padding: `${px}px`, margin: `-${px}px`, boxSizing: 'border-box' };
+}
+
 export const BOX_SHADOWS = {
   layered: '0 2px 6px rgba(0,0,0,0.25), 0 12px 36px rgba(0,0,0,0.28)',
   soft: '0 4px 14px rgba(0,0,0,0.20)',

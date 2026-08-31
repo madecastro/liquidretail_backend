@@ -148,6 +148,82 @@ const BAND_SWITCH_MARGIN = 0.03;
  */
 const FACE_DISQUALIFIES = true;
 
+// ── CONTRAST IS PART OF THE PLACEMENT DECISION (2026-08-31) ───────────────
+//
+// THE GAP THIS CLOSES. The plate scan measures band luminance, and inkForBand /
+// worstCaseInkForBand already turn that into a real contrast ratio — but ONLY to
+// pick the INK. Nothing ever fed it back into WHERE the text goes.
+// resolveGroupAnchor scored candidates on `busy` alone, so a smooth mid-tone band
+// (the worst case for legibility — neither black nor white clears AA on ~0.45
+// luminance) beat a slightly busier neighbour with excellent contrast, every time.
+// The system was measuring the thing that decides readability and then discarding
+// it at the one moment it could have acted on it.
+//
+// INERT BY DEFAULT, WHICH IS THE POINT. The penalty is exactly 0 for any band that
+// already clears AA (4.5:1), so on the overwhelming majority of ads every candidate
+// scores 0 here and the ranking collapses to `busy` — byte-identical to the previous
+// behaviour. It only bites where a band genuinely fails, which is precisely where
+// the old scoring was blind.
+//
+// WORST-CASE, NOT NEAREST-SAMPLE. A group's anchor is ONE decision for the WHOLE
+// clip, so the honest question is "how bad does this band get at any point while
+// the text is up", not "how is it the instant the text arrives" — the same
+// reasoning bandStateFor already applies to `avoid` and `busy`. worstCaseInkForBand
+// answers exactly that. (This does NOT double-count the ink vote: that vote is a
+// separate, later decision about which colour to use once the band is chosen.)
+const CONTRAST_AA = 4.5;
+/**
+ * Weight of the contrast penalty relative to `busy` (both normalised 0..1).
+ *
+ * KEPT AT 1.0 ON MEASURED EVIDENCE, not by feel. A reviewer flagged this as the
+ * change's biggest risk: because `busy` and `contrastPenalty` are both
+ * properties of the BAND — identical for every group evaluating it — they push
+ * all groups toward the same "best" band, and two SIMULTANEOUSLY-VISIBLE groups
+ * landing on one band paint through each other. Every vertical layout is
+ * strictly sequential and therefore immune, but the 18 combos in
+ * scripts/verifyTitleGroupsNeverOverlap.js's ACCEPTED baseline are not.
+ *
+ * So it was swept, over the landscape shape that dominates that baseline
+ * (main|upperThird simultaneous with main|lowerThird), across the full band
+ * condition space (lum 0..1 x busy 0..1 per band, 1,157,625 combinations),
+ * driving this exact scoring formula:
+ *
+ *     CONTRAST_WEIGHT   collision rate
+ *     0.00 (before)     72.00%
+ *     0.25              72.73%
+ *     0.50              72.73%
+ *     0.75              72.73%
+ *     1.00              72.73%
+ *
+ * The change costs +0.73 percentage points, and lowering the weight buys back
+ * NONE of it — so trading legibility away for a smaller weight would be paying
+ * for nothing.
+ *
+ * THE REAL FINDING IS THE BASELINE, and it belongs in KNOWN-OPEN rather than
+ * here: those landscape pairs already converge across ~72% of the space WITHOUT
+ * any contrast term, because `upperThird` and `lowerThird` have chains
+ * (['upperThird','center','lowerThird'] and ['lowerThird','center','upperThird'])
+ * containing the SAME three candidates, separated only by BAND_SWITCH_MARGIN's
+ * 0.03. Raising that margin is the lever that would actually move this number;
+ * it is not this change's job. (Rate is over a uniform sweep of the condition
+ * space, NOT a prediction of the real-ad rate — real plates have correlated
+ * bands. It measures the shape of the exposure, not its frequency.)
+ */
+const CONTRAST_WEIGHT = 1.0;
+
+/**
+ * 0 when the band clears AA (contrast is not a differentiator), ramping to 1 as
+ * the BETTER of the two inks falls toward 1:1 (invisible). Null hints / no
+ * samples → 0, so a missing scan can never move a stack.
+ */
+function contrastPenaltyFor(plateHints, anchor) {
+  const bandKey = BAND_FOR_ANCHOR[anchor] || 'middle';
+  const wc = worstCaseInkForBand(plateHints, bandKey, INK_DARK_LUM, INK_LIGHT_LUM);
+  const best = wc && Number.isFinite(wc.best) ? wc.best : null;
+  if (best == null || best >= CONTRAST_AA) return 0;
+  return Math.min(1, Math.max(0, (CONTRAST_AA - best) / (CONTRAST_AA - 1)));
+}
+
 // Stable per-group keep-out decision: one anchor for the whole group for the
 // whole clip (no per-slot divergence, no mid-phase jumping). Evaluated at the
 // group's first slot enter time (+0.5s into the visible window).
@@ -183,8 +259,12 @@ function resolveGroupAnchor(plateHints, authoredAnchor, atSec, { logShift = fals
   for (const s of clear) {
     // Lower is better. The authored band gets the margin as a head start so a
     // negligible texture win never overrides the template's composition.
-    const score = s.busy - (s.cand === authoredAnchor ? BAND_SWITCH_MARGIN : 0);
-    if (!best || score < best.score) best = { ...s, score };
+    // `contrast` is 0 for any band that clears AA, so this reduces exactly to
+    // the previous `busy`-only ranking on a normal plate — see CONTRAST_AA.
+    const contrast = contrastPenaltyFor(plateHints, s.cand);
+    const score = s.busy + CONTRAST_WEIGHT * contrast
+      - (s.cand === authoredAnchor ? BAND_SWITCH_MARGIN : 0);
+    if (!best || score < best.score) best = { ...s, score, contrast };
   }
   if (!best) return authoredAnchor;
 
@@ -193,12 +273,17 @@ function resolveGroupAnchor(plateHints, authoredAnchor, atSec, { logShift = fals
     // band we landed on — an earlier version read `best.avoid` and so reported
     // "busier band" on every face escape.
     const authored = scored.find((s) => s.cand === authoredAnchor);
-    const why = authored?.avoid ? 'face band' : 'busier band';
+    const authoredContrast = contrastPenaltyFor(plateHints, authoredAnchor);
+    // Attribute honestly across all three reasons a group can move now.
+    const why = authored?.avoid
+      ? 'face band'
+      : (authoredContrast > best.contrast ? 'low-contrast band' : 'busier band');
     // Render console — sweeps grep `keepOut:`.
     // eslint-disable-next-line no-console
     console.log(
       `keepOut: ${authoredAnchor}->${best.cand} (${why}; ` +
-      `authored busy ${(authored?.busy ?? 0).toFixed(3)} -> ${best.busy.toFixed(3)})`
+      `authored busy ${(authored?.busy ?? 0).toFixed(3)} -> ${best.busy.toFixed(3)}; ` +
+      `contrastPenalty ${authoredContrast.toFixed(3)} -> ${best.contrast.toFixed(3)})`
     );
   }
   return best.cand;
@@ -356,11 +441,39 @@ export const Canonical = ({ format = 'feed', safeZoneKey = null, platformFormat 
         // and keeps it while the plate turns dark — measured as dark-on-black
         // on a delivered ad that had logged 9.77:1. Meta keeps the instant
         // reading, so its output is byte-identical.
-        const bandInk =
-          (isPmaxSurface
-            ? worstCaseInkForBand(plateHints, BAND_FOR_ANCHOR[effectiveAnchor] || 'middle', INK_DARK_LUM, INK_LIGHT_LUM)
-            : null) || inkForBand(bandLum);
+        const worstBandInk = worstCaseInkForBand(
+          plateHints, BAND_FOR_ANCHOR[effectiveAnchor] || 'middle', INK_DARK_LUM, INK_LIGHT_LUM
+        );
+        const bandInk = (isPmaxSurface ? worstBandInk : null) || inkForBand(bandLum);
         const inkOnLight = bandInk ? bandInk.onLight : inkOnLightGlobal;
+
+        // ── WHICH READING GATES THE *ESCALATIONS* (2026-08-31) ──────────────
+        //
+        // Two different questions get two different readings, deliberately:
+        //
+        //   WHICH COLOUR should the ink be?  -> `bandInk`, above. On Meta this
+        //     stays the NEAREST-sample reading, so Meta's rendered ink is
+        //     byte-identical to what shipped. That promise is kept.
+        //
+        //   IS THIS TEXT IN TROUBLE at any point while it is on screen?
+        //     -> WORST CASE across the whole clip, on EVERY surface.
+        //
+        // The inconsistency this closes: placement (contrastPenaltyFor) already
+        // reasons in whole-clip worst-case terms on every surface, but the
+        // escalation gate read a single instant on Meta. So a Meta group could
+        // be MOVED because a band fails later in the clip and then be denied the
+        // shadow/contour for that same failure, because the instant the text
+        // happened to arrive looked fine. A group's anchor is one decision for
+        // the whole clip; so is its treatment. Both should ask the same question.
+        //
+        // BLAST RADIUS, MEASURED — and materially smaller than first reported.
+        // Across 5 real delivered plates x 3 bands (plateIntelService.analyzePlate,
+        // free offline scan): 3 of 15 bands are worst-case marginal = 20%. An
+        // earlier review put this at 11/15 (73%); re-measuring against the same
+        // files did not reproduce that, and 20% is the figure this comment stands
+        // behind. So the contour stays a rescue for roughly 1 ad in 5, NOT the
+        // default look — which was the whole concern about widening it.
+        const escalationInk = worstBandInk || bandInk;
         // Even the better ink is below AA on this band: placement cannot carry it,
         // so the strongest authored shadow does. 'layered' is an existing validated
         // treatment value, not a new one.
@@ -388,14 +501,14 @@ export const Canonical = ({ format = 'feed', safeZoneKey = null, platformFormat 
         const BUSY_SHADOW_THRESHOLD = 0.45;
         const bandBusy = Number.isFinite(groupBandState.busy) ? groupBandState.busy : null;
         const busyReinforce = bandBusy != null && bandBusy > BUSY_SHADOW_THRESHOLD;
-        const reinforceShadow = !!bandInk?.marginal || busyReinforce;
+        const reinforceShadow = !!escalationInk?.marginal || busyReinforce;
         // eslint-disable-next-line no-console
         console.log(
           `inkBand: ${group.phase}|${effectiveAnchor} lum=${bandLum == null ? '?' : bandLum.toFixed(2)} ` +
           `busy=${bandBusy == null ? '?' : bandBusy.toFixed(2)} ` +
           `-> ${inkOnLight ? 'dark ink (on-light tokens)' : 'light ink'}` +
           `${bandInk ? ` best=${bandInk.best}:1` : ' (no band data -> global vote)'}` +
-          `${reinforceShadow ? ` ${bandInk?.marginal ? 'MARGINAL' : 'BUSY'} -> layered shadow` : ''}`
+          `${reinforceShadow ? ` ${escalationInk?.marginal ? 'MARGINAL(worst-case)' : 'BUSY'} -> layered shadow` : ''}`
         );
         const container = stackContainerStyle({
           format,
@@ -545,6 +658,76 @@ export const Canonical = ({ format = 'feed', safeZoneKey = null, platformFormat 
                             ? contrastToken(mergedTokens, rawSlot.treatment.colorToken, true)
                             : rawSlot.treatment.colorToken,
                           shadow: reinforceShadow ? 'layered' : rawSlot.treatment.shadow,
+                          // CONTOUR STROKE (2026-08-31). Gated on MARGINAL
+                          // CONTRAST ONLY — deliberately NARROWER than the
+                          // layered-shadow escalation above, which also fires on
+                          // texture (busy).
+                          //
+                          // Measured while building this: on a real delivered
+                          // plate whose band was flagged busy=0.56 but whose
+                          // contrast was 12.1:1, the stroke changed 53 pixels of
+                          // a 2M-pixel frame — it was decorating type that was
+                          // already twice the AA floor. A contour separates ink
+                          // from a backdrop of SIMILAR LUMINANCE; it does
+                          // essentially nothing for high-contrast type on a
+                          // merely textured backdrop, which is what the layered
+                          // shadow and the keep-out scoring are already for.
+                          // Firing it there would be cost (a visual treatment on
+                          // most busy plates) with no benefit.
+                          //
+                          // NOT the rejected halo: see the long note above
+                          // textStrokeStyle in remotion/lib/tokens.js for why a
+                          // hard `paint-order: stroke fill` contour is the
+                          // opposite construction to a blurred spread.
+                          stroke: (escalationInk?.marginal ? true : undefined),
+                          // WEIGHT BUMP (2026-08-31). More ink per glyph is more
+                          // signal against a backdrop close to the type's own
+                          // luminance. One 100-step notch: enough to thicken,
+                          // small enough that a static font lacking that cut
+                          // snaps to its nearest rather than lurching two
+                          // grades. Capped at 900 (the CSS maximum).
+                          //
+                          // GATED ON MARGINAL CONTRAST ONLY — the same gate as
+                          // the stroke above, and deliberately NARROWER than the
+                          // layered-shadow escalation, which also fires on
+                          // texture (busy > 0.45).
+                          //
+                          // An earlier revision of this block rode
+                          // `reinforceShadow` (marginal OR busy) while its
+                          // comment claimed "only ever ... marginal". That was
+                          // simply false, and the gap mattered: `busy` is the
+                          // COMMON product-texture path (a delivered Marine
+                          // Layer plate measured busy=0.496 at a perfectly
+                          // healthy 10.87:1), so the bump fired routinely rather
+                          // than as a last resort. That matters because of the
+                          // ordering below.
+                          //
+                          // THE ORDERING HAZARD, stated rather than hidden.
+                          // Bolder glyphs are WIDER, and NEITHER the character
+                          // cap (slotContent.js deriveCharCap, AVG_CHAR_WIDTH_EM
+                          // 0.70) NOR the fit planner (stackFit.js
+                          // estimateSlotHeightPx) models weight — and both run
+                          // BEFORE this override is applied in the render map.
+                          // So a slot the planner budgeted at 2 lines could wrap
+                          // to 3 and meet `overflow:hidden`, which is the clip
+                          // class stackFit exists to prevent.
+                          // Why it is bounded in practice, in order:
+                          //   1. CHAR_CAP_SAFETY (0.91) already withholds ~9% of
+                          //      the modelled width; one 100-step weight notch
+                          //      widens average advance by low single-digit
+                          //      percent, well inside that reserve.
+                          //   2. Restricting to `marginal` keeps it off the
+                          //      common busy path entirely — it now fires only
+                          //      where placement could not find a legible band,
+                          //      which is rare.
+                          //   3. maxLines:1 slots cannot gain a line at all;
+                          //      they clamp with a trailing ellipsis.
+                          // Verified empirically at the sizes that matter: the
+                          // 3-line-max vertical quote renders the same 2 lines
+                          // bumped and unbumped on the marginal fixture.
+                          ...(escalationInk?.marginal && Number.isFinite(rawSlot.treatment?.weight)
+                            ? { weight: Math.min(900, rawSlot.treatment.weight + 100) }
+                            : null),
                         } : null),
                         ...(needsScaleOverride ? {
                           sizeScale: (Number.isFinite(rawSlot.treatment?.sizeScale)

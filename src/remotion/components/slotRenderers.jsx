@@ -16,6 +16,8 @@ import {
   TEXT_SHADOWS_ON_LIGHT,
   BOX_SHADOWS,
   textShadowFor,
+  textStrokeStyle,
+  strokeClipGuard,
 } from '../lib/tokens.js';
 import {
   STAR_COUNT,
@@ -118,10 +120,18 @@ function textCoreStyle(slot, tokens, dims, format) {
   const t = slot.treatment;
   const font = tokenFont(tokens, t.fontRole);
   const ink = tokenColor(tokens, t.colorToken);
+  const fontPx = baseSize(slot.key, format, t.sizeScale);
   return {
     fontFamily: fontFamilyCss(font),
     fontWeight: t.weight,
-    fontSize: baseSize(slot.key, format, t.sizeScale),
+    fontSize: fontPx,
+    // Contour stroke, ONLY on a band Canonical.jsx flagged marginal/busy — it
+    // sets treatment.stroke alongside the shadow escalation. Absent/false
+    // spreads {} (see textStrokeStyle), so every other slot is unchanged.
+    ...textStrokeStyle(t.stroke, ink, fontPx),
+    // This element carries the clamp AND `overflow:hidden` below, so it can clip
+    // its own contour — measured. See strokeClipGuard in tokens.js.
+    ...strokeClipGuard(t.stroke, fontPx),
     letterSpacing: t.trackingPx ? `${t.trackingPx}px` : 'normal',
     color: ink,
     // Shadow polarity follows the INK, not the token table — see textShadowFor.
@@ -393,9 +403,17 @@ export const RatingSlot = ({ slot, content, tokens, dims, format, timeScale = 1 
           style={{
             color: tokenColor(tokens, secondaryToken),
             fontSize: Math.round(size * 0.82),
-            fontWeight: 500,
+            // Hardcoded 500 previously ignored the treatment, so the smallest
+            // type in the lockup could never be reinforced. Floor at 500 so
+            // nothing gets lighter than it renders today.
+            fontWeight: Math.max(500, Number(t.weight) || 0),
             fontFamily: fontFamilyCss(font),
             textShadow: textShadowFor(t.shadow, tokenColor(tokens, secondaryToken)),
+            // Contour stroke on a marginal band. This line specifically is the
+            // one the owner called out as "simply not legible" on a delivered
+            // ad — it is the SMALLEST type in the lockup (0.82x the star size)
+            // and therefore the first thing to fail on low contrast.
+            ...textStrokeStyle(t.stroke, tokenColor(tokens, secondaryToken), Math.round(size * 0.82)),
             maxWidth: '100%',
             // Tabular figures keep the rolling digits from jittering row width.
             fontVariantNumeric: 'tabular-nums',
@@ -417,9 +435,17 @@ export const RatingSlot = ({ slot, content, tokens, dims, format, timeScale = 1 
           style={{
             color: tokenColor(tokens, secondaryToken),
             fontSize: Math.round(size * 0.82),
-            fontWeight: 500,
+            // Hardcoded 500 previously ignored the treatment, so the smallest
+            // type in the lockup could never be reinforced. Floor at 500 so
+            // nothing gets lighter than it renders today.
+            fontWeight: Math.max(500, Number(t.weight) || 0),
             fontFamily: fontFamilyCss(font),
             textShadow: textShadowFor(t.shadow, tokenColor(tokens, secondaryToken)),
+            // Contour stroke on a marginal band. This line specifically is the
+            // one the owner called out as "simply not legible" on a delivered
+            // ad — it is the SMALLEST type in the lockup (0.82x the star size)
+            // and therefore the first thing to fail on low contrast.
+            ...textStrokeStyle(t.stroke, tokenColor(tokens, secondaryToken), Math.round(size * 0.82)),
             maxWidth: '100%',
             opacity: op,
           }}
@@ -466,7 +492,22 @@ export const RatingSlot = ({ slot, content, tokens, dims, format, timeScale = 1 
             localFrame={localFrame}
             fps={fps}
           />
-          <span style={{ color: tokenColor(tokens, t.colorToken), fontSize: size, fontWeight: 700, fontFamily: fontFamilyCss(font), textShadow: textShadowFor(t.shadow, tokenColor(tokens, t.colorToken)) }}>
+          <span
+            style={{
+              color: tokenColor(tokens, t.colorToken),
+              fontSize: size,
+              // WAS a hardcoded 700, which silently swallowed BOTH the preset's
+              // authored weight AND Canonical.jsx's low-contrast weight bump —
+              // so the star/score lockup, the very thing an owner report called
+              // out as illegible, was the one part of the stack that could not
+              // be reinforced. Honor the treatment, floor at the previous 700 so
+              // no existing render gets LIGHTER than it was.
+              fontWeight: Math.max(700, Number(t.weight) || 0),
+              fontFamily: fontFamilyCss(font),
+              textShadow: textShadowFor(t.shadow, tokenColor(tokens, t.colorToken)),
+              ...textStrokeStyle(t.stroke, tokenColor(tokens, t.colorToken), size),
+            }}
+          >
             {rating.toFixed(1)}/5
           </span>
         </div>
@@ -528,6 +569,16 @@ export const BadgeSlot = ({ slot, content, tokens, dims, format }) => {
           letterSpacing: `${t.trackingPx ?? 1.5}px`,
           color: tokenColor(tokens, t.colorToken || 'textPrimary'),
           whiteSpace: 'nowrap',
+          // ADDED 2026-08-31. This slot paints PLAIN TEXT straight onto footage
+          // — the owner removed its filled pill on 2026-08-03 ("Plain text, no
+          // pill") because the pill read as the scrim the no-scrim standard
+          // exists to remove. But nothing replaced the contrast protection that
+          // opaque pill had been silently providing, which left `badge` as the
+          // ONLY text-on-plate slot in this file carrying NEITHER a shadow NOR a
+          // contour. Pre-existing, and unrelated to the stroke work that
+          // surfaced it.
+          textShadow: textShadowFor(t.shadow, tokenColor(tokens, t.colorToken || 'textPrimary')),
+          ...textStrokeStyle(t.stroke, tokenColor(tokens, t.colorToken || 'textPrimary'), size),
         }}
       >
         {applyCasing(content, t.casing === 'none' ? 'upper' : t.casing)}
@@ -657,6 +708,11 @@ export const DeliverySlot = ({ slot, content, tokens, dims, format, meta }) => {
           overflow: 'hidden',
           textOverflow: 'ellipsis',
           textShadow: textShadowFor(t.shadow, color),
+          ...textStrokeStyle(t.stroke, color, size),
+          // This span sets its OWN overflow:hidden (for the nowrap ellipsis), so
+          // unlike the other slots below it CAN clip its own contour — see the
+          // strokeClipGuard note in tokens.js.
+          ...strokeClipGuard(t.stroke, size),
         }}
       >
         {applyCasing(content, t.casing)}
@@ -712,7 +768,7 @@ export const LikesSlot = ({ slot, content, tokens, dims, format }) => {
       <svg width={Math.round(size * 1.05)} height={Math.round(size * 1.05)} viewBox="0 0 24 24" style={{ display: 'block' }}>
         <path d="M12 21s-7.5-4.6-9.6-9.5C.9 7.6 3.5 4 7 4c2 0 3.5 1 5 2.7C13.5 5 15 4 17 4c3.5 0 6.1 3.6 4.6 7.5C19.5 16.4 12 21 12 21z" fill={color} />
       </svg>
-      <span style={{ fontFamily: fontFamilyCss(font), fontWeight: t.weight, fontSize: size, color, textShadow: textShadowFor(t.shadow, color) }}>
+      <span style={{ fontFamily: fontFamilyCss(font), fontWeight: t.weight, fontSize: size, color, textShadow: textShadowFor(t.shadow, color), ...textStrokeStyle(t.stroke, color, size) }}>
         {applyCasing(label, t.casing)}
       </span>
     </div>
@@ -822,13 +878,13 @@ function renderMultiValue({ slot, content, tokens, dims, format, progress, sizeK
           return (
             <div key={i} style={{ ...commonSpan, display: 'inline-flex', alignItems: 'baseline', gap: Math.round(size * 0.4), fontFamily: fontFamilyCss(font) }}>
               <span style={{ width: Math.round(size * 0.4), height: Math.round(size * 0.4), borderRadius: '50%', backgroundColor: fg, display: 'inline-block', alignSelf: 'center' }} />
-              <span style={{ fontSize: size, fontWeight: t.weight, color: fg, textShadow: textShadowFor(t.shadow, fg) }}>{label}</span>
+              <span style={{ fontSize: size, fontWeight: t.weight, color: fg, textShadow: textShadowFor(t.shadow, fg), ...textStrokeStyle(t.stroke, fg, size) }}>{label}</span>
             </div>
           );
         }
         // plain
         return (
-          <span key={i} style={{ ...commonSpan, fontSize: size, fontWeight: t.weight, color: fg, fontFamily: fontFamilyCss(font), textShadow: textShadowFor(t.shadow, fg) }}>
+          <span key={i} style={{ ...commonSpan, fontSize: size, fontWeight: t.weight, color: fg, fontFamily: fontFamilyCss(font), textShadow: textShadowFor(t.shadow, fg), ...textStrokeStyle(t.stroke, fg, size) }}>
             {label}
           </span>
         );
