@@ -175,6 +175,24 @@ function makeHandle(doc) {
       await OperationRun.updateOne({ _id: id }, update);
     } catch (err) {
       warnOnce(err, 'flush');
+      // A $push + $set combined in one updateOne is one atomic write — if
+      // it throws (a bad value, a transient Mongo error), the WHOLE write
+      // is lost, not just the stage-history push. That is fine for a
+      // regular tick()/note() flush (no push involved, unchanged from
+      // before this feature). But `push` only ever accompanies a stage
+      // transition or a TERMINAL write (succeed/fail/markCancelled/cancel)
+      // — losing one of those is worse than losing a stages[] entry: the
+      // reaper would otherwise fail the run later with a generic "process
+      // restarted" instead of its real status/error. Retry once WITHOUT
+      // the push so the terminal status still lands even if the stage
+      // history entry does not.
+      if (push) {
+        try {
+          await OperationRun.updateOne({ _id: id }, { $set: payload });
+        } catch (err2) {
+          warnOnce(err2, 'flush (retry without push)');
+        }
+      }
     }
   }
 
@@ -212,6 +230,7 @@ function makeHandle(doc) {
       // elapsed time + final counts land in stages[] rather than being
       // silently overwritten by the next stage's progress.
       const push = firstOfStage ? closeOpenStagePush() : null;
+      const resetUpdate = {};
       if (firstOfStage) {
         currentStageStartedAt = Date.now();
         // Some real call chains open a stage that is itself immediately
@@ -219,21 +238,31 @@ function makeHandle(doc) {
         // .syncBrandApify's 'shopify catalog' dispatch stage, closed almost
         // instantly by shopifyPublicIngestService.syncBrandShopifyDirect's
         // first 'resolving catalog access' stage on the SAME handle) —
-        // without a note of its own in between, that dispatch-only stage
-        // would otherwise inherit whatever note the PREVIOUS, unrelated
-        // stage last left behind (e.g. an Instagram tally showing up
-        // against a "shopify catalog" entry). Clear it here so a stage
-        // that never calls tick()/note() closes with no note rather than
-        // a stale, misattributed one. itemsDone/itemsTotal are left alone
-        // — they already get overwritten by that stage's own first tick()
-        // exactly as before this change, and this only affects what a
-        // NEVER-ticked stage's OWN closed record shows, not any existing
-        // top-level field another caller reads.
+        // without progress of its own in between, that dispatch-only stage
+        // would otherwise inherit whatever note/counts the PREVIOUS,
+        // unrelated stage last left behind (e.g. an Instagram tally showing
+        // up against a "shopify catalog" entry, or a first empty credential
+        // in postSyncService.js inheriting a prior credential's count).
+        // Reset ALL THREE here — note AND the counts — so a stage that
+        // never calls tick()/note() of its own closes (and, until its own
+        // first tick(), currently DISPLAYS) as empty rather than stale and
+        // misattributed. Included in the SAME $set as `stage` below, not
+        // just the in-memory closure, so the live "current stage" reader
+        // (services/ingestStatusFeedService.js) never shows carried-over
+        // numbers either, not only the closed stages[] history.
         lastNote = null;
+        itemsDone = 0;
+        itemsTotal = null;
+        resetUpdate.note = null;
+        resetUpdate.itemsDone = 0;
+        resetUpdate.itemsTotal = null;
+        // pct is meaningless without itemsTotal — same convention tick()
+        // already uses (only sets pct when itemsTotal is a positive number).
+        resetUpdate.pct = null;
       }
       lastStage = name;
       // First call of each stage always flushes; later updates throttle.
-      flush({ stage: name }, { force: firstOfStage, push }).catch(() => {});
+      flush({ stage: name, ...resetUpdate }, { force: firstOfStage, push }).catch(() => {});
       if (firstOfStage) ingestStatusFeed.touch(id, kind);
       return handle;
     },

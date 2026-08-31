@@ -292,7 +292,9 @@ async function syncBrandInstagram(brand, run = null) {
 
   const summary = { ok: true, fetched: posts.length, ingested: 0, skipped: 0, errors: 0, queuedRunIds: [], aborted: false };
 
+  let idx = 0;
   for (const post of posts) {
+    idx += 1;
     if (await isBrandAborted(brand._id, run)) {
       summary.aborted = true;
       console.log(`   · Apify IG ingest aborted mid-loop for brand=${brand._id}`);
@@ -309,6 +311,15 @@ async function syncBrandInstagram(brand, run = null) {
       console.warn(`   ⚠️  Apify IG ingest failed for ${post.externalId}: ${err.message}`);
       summary.errors++;
     }
+    // Same tick() convention as shopifyPublicIngestService.js's product
+    // upsert loop — real per-item counts, not the whole-run summary, so
+    // an in-progress Slack render (and this stage's own closed-stage
+    // record) shows genuine numbers instead of nothing at all.
+    run?.tick?.(
+      idx,
+      posts.length,
+      `${idx}/${posts.length} fetched · ${summary.ingested} ingested · ${summary.skipped} skipped`
+    );
   }
 
   // Fire brand-level enrichment in the background so downstream ad
@@ -555,8 +566,10 @@ async function syncBrandShopify(brand, run = null) {
   // ARCHITECTURE: upsert NEVER awaits image classify. Post-loop pass only.
   const shotSession = ingestShotClassify.createSession();
   const pendingClassify = [];
+  let idx = 0;
   try {
   for (const p of products) {
+    idx += 1;
     if (await isBrandAborted(brand._id, run)) {
       summary.aborted = true;
       console.log(`   · Apify Shopify ingest aborted mid-loop for brand=${brand._id}`);
@@ -644,6 +657,15 @@ async function syncBrandShopify(brand, run = null) {
       console.warn(`   ⚠️  Apify Shopify upsert failed for ${p.externalId}: ${err.message}`);
       summary.errors++;
     }
+    // Same tick() convention as shopifyPublicIngestService.js's product
+    // upsert loop — this method never reported per-item progress at all
+    // before, so a run using it showed no counts under 'shopify catalog'
+    // beyond the outer dispatch stage.
+    run?.tick?.(
+      idx,
+      products.length,
+      `products ${idx}/${products.length} · ${summary.added} added · ${summary.updated} updated`
+    );
   }
 
   // Post-loop classify pass — products already persisted.

@@ -307,12 +307,21 @@ async function main() {
     restoreFetch();
   });
 
-  // ── A2. a dispatch-only stage does not inherit a stale note ───────────
+  // ── A2. a dispatch-only stage does not inherit a stale note OR counts ──
   // Mirrors the REAL apifyIngestService.syncBrandApify → shopifyPublicIngestService
   // .syncBrandShopifyDirect call chain: an OUTER run.stage('shopify catalog')
   // is closed almost immediately by an INNER run.stage('resolving catalog
   // access') on the SAME handle, with no tick()/note() call in between.
-  console.log('\nA2. a stage closed with no tick()/note() of its own does not inherit the PREVIOUS stage\'s note');
+  // REGRESSION covered here (found by adversarial review, not by the
+  // original version of this test): an earlier fix cleared only the NOTE
+  // on a stage transition and left itemsDone/itemsTotal carrying over —
+  // countBitFor() falls back to rendering those numbers when note is
+  // null, so the dispatch-only stage still rendered the PREVIOUS stage's
+  // count (e.g. "shopify catalog — 9/9", Instagram's tally). This section
+  // now asserts the counts too, AND renders through buildStatusText (not
+  // just the raw stored doc) so a misattributed count in the actual Slack
+  // text cannot slip past an assertion that only checks the stored field.
+  console.log('\nA2. a stage closed with no tick()/note() of its own inherits NEITHER the previous stage\'s note NOR its counts');
   await withEnv(CFG, async () => {
     opRunStore.reset();
     feed._resetState();
@@ -330,8 +339,57 @@ async function main() {
     const shopifyEntry = doc2.stages.find((s) => s.name === 'shopify catalog');
     checkTrue('A2a the dispatch-only stage entry exists', !!shopifyEntry);
     check('A2b it does NOT inherit the previous stage\'s note', shopifyEntry && shopifyEntry.note, null);
+    check('A2b2 it does NOT inherit the previous stage\'s itemsDone', shopifyEntry && shopifyEntry.itemsDone, 0);
+    check('A2b3 it does NOT inherit the previous stage\'s itemsTotal', shopifyEntry && shopifyEntry.itemsTotal, null);
     const igEntry = doc2.stages.find((s) => s.name === 'instagram posts');
     check('A2c the REAL prior stage keeps its own note untouched', igEntry && igEntry.note, '9 fetched · 8 ingested');
+    check('A2c2 the REAL prior stage keeps its own itemsDone/itemsTotal untouched', igEntry && `${igEntry.itemsDone}/${igEntry.itemsTotal}`, '9/9');
+
+    // The actual Slack text, not just the stored doc: neither "9/9" nor
+    // "9 fetched" may appear anywhere near the "shopify catalog" line.
+    const rendered = feed.buildStatusText(doc2, {});
+    const shopifyLineMatch = rendered.match(/✅ shopify catalog[^\n]*/);
+    checkTrue('A2d rendered "shopify catalog" line exists', !!shopifyLineMatch);
+    checkTrue('A2e rendered "shopify catalog" line carries NO count at all (dispatch-only stage)',
+      !!shopifyLineMatch && !/—/.test(shopifyLineMatch[0]));
+    checkTrue('A2f Instagram\'s own count is NOT the shopify catalog line', !/shopify catalog — 9\/9/.test(rendered));
+  });
+
+  // ── A3. Method: only ever renders for demo-sync, never other kinds ────
+  // Found by adversarial review: an earlier version gated the Method line
+  // on Brand.apifyDemo.shopifyUrl ALONE, so ANY watched kind for a demo
+  // brand that happens to have a shopifyUrl configured — e.g. its OWN
+  // 'enrichment' run (brandfetch/scrape/GPT, nothing to do with catalog
+  // ingest) — printed a real but misleading "Method: shopify-direct" line.
+  console.log('\nA3. Method: line is gated on KIND (demo-sync only), not merely on the brand having a shopifyUrl');
+  await withEnv(CFG, async () => {
+    opRunStore.reset();
+    feed._resetState();
+    const brands = new Map();
+    brands.set('brand_enrich', {
+      _id: 'brand_enrich',
+      name: 'Acme Co',
+      apifyDemo: { method: null, shopifyUrl: 'https://acme.example/shop' } // same brand, catalog method WOULD resolve
+    });
+    feed._setDeps({ OperationRun: opRunStore, Brand: makeBrandStub(brands) });
+    installFetch(async (url) => {
+      if (String(url).includes('chat.postMessage')) return jsonRes(200, { ok: true, ts: '333.ccc', channel: 'C_INGEST_VERIFY' });
+      return jsonRes(200, { ok: true });
+    });
+
+    const run = await progressService.startRun({ kind: 'enrichment', advertiserId: 'adv_1', brandId: 'brand_enrich', label: 'Brand enrichment' });
+    run.stage('brandfetch');
+    await run.succeed({ ok: true });
+    await feed._flushOnce();
+
+    const updateCalls = fetchCalls.filter((c) => c.url.includes('chat.update'));
+    checkTrue('A3a a Slack message was rendered for this enrichment run', updateCalls.length >= 1);
+    const text = JSON.parse(updateCalls[updateCalls.length - 1].opts.body).text;
+    checkTrue('A3b an enrichment run for a brand WITH shopifyUrl set does NOT show Method:', !/Method:/.test(text));
+    checkTrue('A3c but the SAME resolver would have said shopify-direct for demo-sync (sanity, not a regression check)',
+      require('../services/apifyIngestService').resolveCatalogMethod({ method: null, shopifyUrl: 'x' }) === 'shopify-direct');
+
+    restoreFetch();
   });
 
   // ── C. Slack failure cannot break ingest ─────────────────────────────
@@ -406,15 +464,19 @@ async function main() {
       await feed._flushOnce();
     }
     const updateCallsBurst = fetchCalls.filter((c) => c.url.includes('chat.update'));
-    // First flush creates the parent (chat.postMessage), not chat.update.
-    // Every flush AFTER that inside the 5s window must be throttled away.
-    checkTrue('D1 burst inside one throttle window produced at most 1 chat.update', updateCallsBurst.length <= 1);
+    // The FIRST flush both creates the parent (chat.postMessage) AND does
+    // its first chat.update in the same call — exactly one. Every flush
+    // AFTER that inside the 5s throttle window must be coalesced away
+    // (the fake clock here never advances mid-burst, so this is a real,
+    // tight assertion, not "at most 1" which a burst of zero updates
+    // would also satisfy).
+    check('D1 burst inside one throttle window produced EXACTLY 1 chat.update', updateCallsBurst.length, 1);
 
     advance(6000); // past the throttle window
     run.tick(20, 20, 'products 20/20 — done');
     await feed._flushOnce();
     const updateCallsAfter = fetchCalls.filter((c) => c.url.includes('chat.update'));
-    checkTrue('D2 a flush past the throttle window fires a new chat.update', updateCallsAfter.length >= updateCallsBurst.length + 1 || updateCallsAfter.length >= 1);
+    check('D2 a flush past the throttle window fires EXACTLY one new chat.update', updateCallsAfter.length, updateCallsBurst.length + 1);
 
     restoreFetch();
   });

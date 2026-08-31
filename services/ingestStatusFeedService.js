@@ -51,6 +51,17 @@
 
 const OperationRunModel = () => require('../models/OperationRun');
 const BrandModel = () => require('../models/Brand');
+// Loaded eagerly (module load time, alongside progressService's own
+// require chain at process boot) rather than lazily inside enrichBrand()
+// on the first Slack flush — a lazy require here would pull in
+// apifyIngestService's own dependency graph (Brand/Media/DetectRun/
+// CatalogProduct/apifyPullService/cloudinaryService/...) as a synchronous,
+// unpredictable hitch on the shared event loop the first time an ingest
+// run's Slack message is rendered, rather than once, predictably, at boot.
+let resolveCatalogMethodFn = null;
+try {
+  ({ resolveCatalogMethod: resolveCatalogMethodFn } = require('./apifyIngestService'));
+} catch { /* degrades to the raw stored value in enrichBrand below */ }
 
 // ── config (lazy — so a Render env change or a test can flip these live) ──
 const BOT_TOKEN = () => (process.env.SLACK_BOT_TOKEN || '').trim();
@@ -335,6 +346,16 @@ async function claimParentTs(runId, channel, ts, OperationRun = OperationRunDep(
 }
 
 // ── brand enrichment (name + resolved ingest method, best-effort, once) ───
+// Kinds where "ingest method" is actually meaningful — today that is
+// EXACTLY 'demo-sync' (apifyIngestService.syncBrandApify is the only call
+// site that resolves/uses Brand.apifyDemo.method at all). Gating on
+// shopifyUrl ALONE (an earlier version of this function did) is wrong: a
+// demo brand's OWN 'enrichment' or 'social-ingest' run has nothing to do
+// with catalog-method selection, but would still show a shopifyUrl on the
+// SAME Brand doc — which produced a real, misleading "Method: shopify-
+// direct" line on runs that never touched the catalog.
+const METHOD_AWARE_KINDS = new Set(['demo-sync']);
+
 async function enrichBrand(st, brandId) {
   st.brandTried = true;
   try {
@@ -342,18 +363,15 @@ async function enrichBrand(st, brandId) {
     const b = await Brand.findById(brandId).select('name apifyDemo.method apifyDemo.shopifyUrl').lean();
     if (!b) return;
     st.brandName = b.name || null;
+    if (!METHOD_AWARE_KINDS.has(st.kind)) return;
     // Only meaningful when a catalog sync actually runs for this brand —
     // resolveCatalogMethod mirrors apifyIngestService.js's own resolution
     // (method:null still runs as 'shopify-direct' whenever shopifyUrl is
     // set) so this never reports a misleading blank for the common case.
     const apifyDemo = b.apifyDemo || {};
     if (apifyDemo.shopifyUrl) {
-      let resolveCatalogMethod;
-      try {
-        ({ resolveCatalogMethod } = require('./apifyIngestService'));
-      } catch { /* ignore — degrade to raw stored value below */ }
-      st.method = typeof resolveCatalogMethod === 'function'
-        ? resolveCatalogMethod(apifyDemo)
+      st.method = typeof resolveCatalogMethodFn === 'function'
+        ? resolveCatalogMethodFn(apifyDemo)
         : (apifyDemo.method || null);
     }
   } catch { /* best-effort — leave brandName/method unset */ }
