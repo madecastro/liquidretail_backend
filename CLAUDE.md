@@ -152,6 +152,86 @@ or this file.** §1-5 are decomposition plans that are deliberately NOT executed
 six agents were mid-flight on those exact files. That deferral is a live
 decision, not an oversight; §7 is the safe slice that shipped instead.
 
+### Stranded-work tooling (2026-08-31) — complements, does not replace, the five checks above
+
+Built after three real incidents in one night, across this repo and
+`liquidretail_adgen`: a branch sat **5 days** with 9 commits never pushed to
+any remote, inside a nested worktree locked by a dead PID — nearly lost a
+live production bug fix, and would have gone undetected by the checks above
+too, since none of them look at worktree location or lock state. An agent
+separately accumulated ~52KB across 6 files with **zero commits** and ended
+its turn. Plus dozens of `.wt-*` worktrees for branches already merged, and
+`prunable` entries under `/private/tmp`, nobody had cleaned up.
+
+**`scripts/auditStrandedWork.js`** (read-only, `npm run check:stranded-work`)
+is git/filesystem-only — no `gh` CLI, no network, works offline — and adds
+what `findOrphanedBranches.js`/`findStaleUncommittedWork.js` above do not:
+any worktree (including the main checkout) nested inside this repo directory
+(the exact hazard class the false-positive story two sections up is about);
+worktrees git itself reports prunable; and branches already merged into
+trunk (by literal ancestry OR detected squash-equivalence — this repo's
+history is a mix of real merge commits and GitHub squash merges, so a plain
+`git merge-base --is-ancestor` check alone misses most of them) whose
+branch/worktree still lingers — pure cleanup fodder for the companion tool
+below. It also re-derives "commits on no remote" directly from git
+(`git log --branches --not --remotes`), which is complementary to
+`findOrphanedBranches.js`'s `gh pr list`-based ORPHANED/PUSHED_NO_PR/STALE
+classification, not a duplicate of it: that tool answers "does a PR exist
+for this branch name," this one answers "does this branch/worktree exist
+safely anywhere outside this one disk," and it works identically in
+`liquidretail_adgen`, which has no `gh`-aware equivalent at all. Exit code 1
+iff a genuinely at-risk category was found (unpushed-anywhere branch, dirty
+worktree, nested worktree); 0 for mere tidiness (prunable / merged-lingering)
+— `--json`, `--fast` (skips the full-branch-list merged-lingering scan —
+much faster on 400+ local branches, categories 1-3 unaffected), `--repo=<path>`.
+
+**`scripts/cleanupMergedBranches.js`** (`npm run cleanup:merged-branches`,
+**dry-run by default**, `--apply` required to write) deletes a branch's
+local ref, remote ref, and worktree only after independently re-verifying,
+at the moment of deletion, that it isn't trunk, isn't checked out in ANY
+worktree, has zero commits unreachable from any remote, and has a
+clean-or-absent worktree — never a LOCKED one. Uses `git branch -D` (not
+`-d`) specifically for the squash-equivalent case, because git's own `-d`
+only trusts literal ancestry and would refuse a squash-merged branch as "not
+fully merged" even though its content is already safely in trunk under a
+different commit SHA — see `scripts/lib/gitAudit.js`'s
+`isSquashMergedIntoTrunk` header for the mechanism (a variant of the
+well-known "git-delete-squashed" trick, with one correction found by testing
+against this repo's real 400+-branch history: the synthetic probe commit
+must be parented at the branch/trunk merge-base, not trunk's current tip, or
+a trunk that has moved on even one commit since the merge makes every
+squash-merged branch look unmerged). Proven against a scratch fixture repo
+with a real bare origin, not just assertions: an unpushed branch, a
+dirty-worktree branch, and trunk were all refused (the dirty-worktree check
+was also unit-tested in isolation, since in the CLI it is normally
+pre-empted by the stronger "checked out anywhere" gate — any branch with a
+worktree is by definition checked out there), while a genuinely
+squash-merged-and-clean branch was deleted end to end (local + remote) with
+the other three left byte-for-byte untouched.
+
+**Duplication, deliberate:** `scripts/lib/gitAudit.js` plus these two
+callers are hand-synced, byte-identical, with `liquidretail_adgen`'s
+copies — NOT routed through that repo's `scripts/vendor-manifest.json`
+(there is no equivalent manifest here either). That system, where it exists,
+hashes backend↔adgen **production** modules under `models/`/`services/`
+against a debt-tracking grace period built for code that writes the shared
+Mongo collections; a git-ops utility with zero Mongo/business-logic coupling
+doesn't fit that shape. Diff the three files against the sibling repo before
+editing either copy.
+
+**Wired into the habit via the SessionEnd hook** in the `.claude/settings.json`
+already committed to this repo (previously SessionStart-only, for the
+`node_modules` gap fix — see `.claude/hooks/session-start.sh`): a new
+`.claude/hooks/session-end-audit.sh` runs at the end of every session,
+always exits 0 (`|| true`, and `auditStrandedWork.js --hook` independently
+guarantees the same), and prints one terse `{"systemMessage": "..."}` line —
+by design, not the full report, so the finding is impossible to miss at the
+one moment a human is guaranteed to glance at the terminal, without
+replacing `npm run check:stranded-work` for an actual full read. Chosen over
+"just document the manual command" precisely because this repo already had
+exactly that — `docs/PARALLEL_WORK.md` §7's tooling sat on `main`, working,
+unused, for the same reason a hook now exists.
+
 ---
 
 ## 00. THE CATALOG PRODUCT-AD PIPELINE — owner-stated, 2026-08-02
