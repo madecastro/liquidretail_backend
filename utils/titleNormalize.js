@@ -142,4 +142,4 @@ function displayNormalizeTitle(s) {
   return out;
 }
 
-module.exports = { normalizeTitle, displayNormalizeTitle, titleSimilarity };
+module.exports = { normalizeTitle, displayNormalizeTitle, titleSimilarity, tokens };
