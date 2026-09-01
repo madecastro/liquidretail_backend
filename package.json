@@ -17,7 +17,9 @@
     "setup:worktree": "bash bin/setup-worktree.sh",
     "check:stale-work": "node scripts/findStaleUncommittedWork.js",
     "check:rebase": "node scripts/checkRebaseContainment.js",
-    "check:orphaned-branches": "node scripts/findOrphanedBranches.js"
+    "check:orphaned-branches": "node scripts/findOrphanedBranches.js",
+    "check:stranded-work": "node scripts/auditStrandedWork.js",
+    "cleanup:merged-branches": "node scripts/cleanupMergedBranches.js"
   },
   "devDependencies": {
     "eslint": "^9.39.5"
