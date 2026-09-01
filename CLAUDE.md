@@ -349,9 +349,8 @@ globs `scripts/verify*.{js,mjs}` at run time and **never** hardcodes a
 count (`scripts/runVerifySuite.js:14-22`). Default timeout 120s,
 concurrency `min(8, cpus)`. Exit 0 iff every selected script exits 0.
 
-Two files are named `*_KNOWN_OPEN.js`. Their headers say they are
-**expected to fail** until the defect is wired. Do not "fix" them by
-relaxing assertions.
+Files named `*_KNOWN_OPEN.js` are **expected to fail** until the defect is
+wired. Do not "fix" them by relaxing assertions. There are currently none.
 
 Sibling backend location for cross-repo checks:
 `ADGEN_BACKEND_PATH` or `../liquidretail_backend`
@@ -371,7 +370,7 @@ Sibling backend location for cross-repo checks:
 | `verifyPmaxVideoExpansion.js` | PMax video minting money rules against vendored `campaignAdsGenerationService` / `platformFormats`; derive branch extracted from `renderer.js` instead of backend `routes/ads.js`. |
 | `verifySharedPortraitMaster.js` | Mixed Meta+PMax shares one 9:16 master (one billable portrait plate). |
 | `verifyQuoteProvenanceStamp.js` | `stampQuoteOrigins` reads `container.quotesOrigin`; flag-off baseline is an embedded snapshot of backend commit `3e4561e2` (that SHA is not in this repo's history). |
-| `verifyRunFinalizesOnSettle_KNOWN_OPEN.js` | Originally: CampaignRun never reaches `done` because `bumpRunCounter` only `$inc`s. **On `origin/master`, `bumpRunCounter` now also calls `maybeFinalizeRun` (`renderer.js:160, 202-227`).** This harness still extracts **only** the `$inc` update and still labels itself expected-fail. Treat its Group A as a description of the **old** defect; Group C2 (call-site scan for `classifyRunAdOutcome`) should now see `renderer.js`. Current pass/fail: **unverified** (not re-run in this docs pass). |
+| `verifyRunFinalizesOnSettle.js` | CampaignRun reaches `done` once every claimed ad has settled. Replays source-extracted `bumpRunCounter` (including its `maybeFinalizeRun` call at `renderer.js:744`) against the measured incident shape (succeeded=2, failed=1, total=3). Pins that `classifyRunAdOutcome` + `buildRunReconciliationUpdate` are called from `renderer.js`, and that a run does **not** finalize while a claimed ad is still `rendering`. |
 | `verifyCampaignRunHeartbeatWired.js` | **Now passing — this was fixed on 2026-08-24 and the harness was renamed (the `_KNOWN_OPEN` suffix is gone).** It previously pinned an expected-fail: `startRunHeartbeat` was exported from `campaignRunHeartbeat.js` with **zero** call sites in `src/`. `startRunHeartbeat` now appears 4× in `renderer.js` on `origin/master`. Why it mattered: without the beat, `CampaignRun.updatedAt` only moves when an ad *settles*, so a long video-titling gap could drop the backend duplicate-generation gate's running arm. |
 | `verifyTitlingRecoverability.js` | Titling-failure recoverability (2026-08-25): (A) `brandScriptExecutor.stampTitlingFailureAndThrow` decides resumable-vs-terminal correctly for OOM/timeout/generic, bounded by a shared `TITLING_ATTEMPTS_MAX` ceiling (execution, real function, stubbed `Ad`). (B) the resume sweep is wired from `renderer.js` (not the RAM-inadequate `orchestrator.js` — see CLAUDE.md's titlingResumeService note), gated on `isAdgenRendererEnabled()`, `orchestrator.js` does NOT run it, and `titler.js`'s own titling call site was mirrored to the same gate (structural). (C) two REAL concurrent `resumeUntitledMasters()` passes racing the same ad — only one titles it (execution, in-memory Mongo-like stub, `scripts/lib/miniMongoStub.js`, whose `findOneAndUpdate` correctly models Mongoose's `{new:true/false}` pre/post-image semantics — an earlier version of the stub ignored `opts` and would have hidden a real sign/timing bug in the attempt-cap read-back). (D) a cap-exceeded titling failure keeps its detailed `renderError` — `processAd`'s unscoped `noteRenderIssue` no longer clobbers the stamp's message/code with a generic one. |
 | `verifyTitlingResumeNeverResubmits.js` | THE MONEY CHECK: a resumed titling attempt can never re-submit a paid Atlas Omni generation. `atlasVideoService.submitGeneration` has exactly one call site, structurally inside the `else` of `if (isResuming)`; a real require-graph BFS (Node's own `require.resolve`) proves `atlasVideoService.js` is unreachable from `titlingResumeService.js`'s or `brandScriptExecutor.js`'s entire transitive require graph, with a positive control (same BFS from `renderer.js`, which DOES require it) ruling out a vacuous pass. |
@@ -500,7 +499,7 @@ shared walk helpers: `scripts/lib/requireGraph.js` (backs
 `verifyVendorDrift.js`), `scripts/runVerifySuite.js` itself, and four
 harnesses that walk directly: `verifyAdgenRunHeartbeat.js`,
 `verifyCampaignRunHeartbeatWired.js`, `verifyModelParity.js`,
-`verifyRunFinalizesOnSettle_KNOWN_OPEN.js`.
+`verifyRunFinalizesOnSettle.js`.
 
 Unlike `liquidretail_backend` (4 of 22 safe, 18 exposed — see that repo's
 `CLAUDE.md`), **all 8 of adgen's are currently safe**: the four direct

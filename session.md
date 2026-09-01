@@ -234,8 +234,6 @@ credential; `APIFY_ADLIB_ACTOR` is unset; and `Reach Social`'s own `websiteUrl`
   This is a standing, repo-wide config change — deliberately not done by
   this session; the auto-rebase workflow (above) is the no-admin-needed
   alternative shipped instead.
-- **`verifyRunFinalizesOnSettle_KNOWN_OPEN.js`** — still labelled expected-fail;
-  `maybeFinalizeRun` is wired on this branch. Group A only replays the `$inc`.
 - **`verifyArchiveDigestRelease.js` E3/E14** — self-diagnosed broken ported scans.
 - **`verifyModelParity.js`** — currently red on `origin/master` for a
   content reason, not a tooling one (re-confirmed 2026-08-25 by stashing):

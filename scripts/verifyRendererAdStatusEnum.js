@@ -6,14 +6,13 @@
 // that services/campaignRunGuards.js's classifyRunAdOutcome actually
 // recognises. That second half matters more than it looks: the reaper's
 // cross-service reconciliation (classifyRunAdOutcome, vendored from the
-// backend — see verifyRunFinalizesOnSettle_KNOWN_OPEN.js for why it isn't
-// wired up YET) switches on Ad.status to decide succeeded/failed/
-// stillRendering/requeuedAway. A renderer that ever writes a status value
-// outside that switch's case labels would have its ads silently fall into
-// the `default: break` branch — counted as NEITHER succeeded nor failed,
-// invisible to reconciliation the moment it does get wired in. A drift
-// here today would look harmless (nothing currently reads the miscount)
-// and turn into a silent undercount the day #2's fix ships.
+// backend — wired from renderer.js maybeFinalizeRun; see
+// verifyRunFinalizesOnSettle.js) switches on Ad.status to decide
+// succeeded/failed/stillRendering/requeuedAway. A renderer that ever writes
+// a status value outside that switch's case labels would have its ads
+// silently fall into the `default: break` branch — counted as NEITHER
+// succeeded nor failed, invisible to reconciliation. A drift here would
+// undercount a finalized CampaignRun.
 //
 // THIS HARNESS CURRENTLY PASSES — renderer.js only ever writes 'draft',
 // 'failed', and 'rendering' (the requeue-for-retry case), and never

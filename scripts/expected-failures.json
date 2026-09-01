@@ -12,10 +12,5 @@
     "",
     "Every entry needs a reason someone can act on. 'flaky' is not a reason."
   ],
-  "expectedFailures": {
-    "verifyRunFinalizesOnSettle_KNOWN_OPEN.js": {
-      "reason": "RED BY DESIGN. This harness exists to stay red until the known-open run-finalization bug is fixed; the _KNOWN_OPEN suffix is the contract. It is the reason a zero-red gate could not previously be adopted at all.",
-      "removeWhen": "the run-finalization bug is fixed — delete the harness's _KNOWN_OPEN suffix and this entry together"
-    }
-  }
+  "expectedFailures": {}
 }

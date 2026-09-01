@@ -1,10 +1,22 @@
 'use strict';
 //
 // PORTED from liquidretail_backend/scripts/lib/sourceWalk.js (pre-2026-08-24
-// snapshot) into liquidretail_adgen. This is a verbatim port — no logic
+// snapshot) into liquidretail_adgen. Originally a verbatim port — no logic
 // changed. See the backend file for the original history/incident notes.
 // Needed here because verifyArchiveDigestRelease.js (ported alongside this
 // file) requires it for its whole-repo source scan.
+//
+// 2026-08-31: ported forward ONE fix from backend (not a full re-sync).
+// walkSource() returned dot-prefixed FILE names too — skipDotNames only
+// gates recursing INTO dot-directories. verifyQuoteColourway.js and
+// verifyQuoteSnippetProofBarGate.js each briefly write a transient sibling
+// `.__revertprove_*.js` into src/services/ while mutation-testing; under
+// runVerifySuite.js's parallel pool, verifyArchiveDigestRelease.js's
+// whole-repo walkSource(ROOT) scan could collect that name and then ENOENT
+// reading it once the writer's own cleanup deleted it first — the same race
+// already reproduced and fixed in backend's verifyMetaApiVersion.js. Fixed
+// at the file-match check below, unconditionally (no real source file is
+// dot-prefixed).
 //
 // sourceWalk — ONE filesystem walk for every verify* harness that scans source.
 //
@@ -101,7 +113,7 @@ function walkSource(rootDir, opts) {
       if (entry.isDirectory()) {
         if (shouldSkipDir(full, entry.name, skip, skipDotNames)) continue;
         walk(full);
-      } else if (entry.isFile() && hasExtension(entry.name, extensions)) {
+      } else if (entry.isFile() && !entry.name.startsWith('.') && hasExtension(entry.name, extensions)) {
         out.push(full);
       }
     }
