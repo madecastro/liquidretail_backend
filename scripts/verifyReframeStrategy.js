@@ -20,7 +20,10 @@ require('dotenv').config({ path: path.join(__dirname, '..', 'config', 'defaults.
 
 const chooser = require('../services/reframeStrategyChooser');
 const { chooseStrategy, isCropFirstEnabled, __test } = chooser;
-const { parseAspect, subjectUnionBbox, computeCropRect, buildCloudinaryCropUrl } = __test;
+const {
+  parseAspect, subjectUnionBbox, computeCropRect, buildCloudinaryCropUrl,
+  overfitTolerancePct, OVERFIT_TOLERANCE_PCT_DEFAULT
+} = __test;
 
 const results = [];
 function check(name, fn) {
@@ -118,8 +121,10 @@ check('taller source → crop vertically', () => {
   assert.strictEqual(r.w, 720, 'width equals source');
   assert.strictEqual(r.h, 720, 'height matches 1:1 of width');
 });
-check('subject too wide to fit → null (b13 fixture)', () => {
-  // 4 person unions from prod b13: 302→1672 (1370px wide) into 1135-wide 9:16 window
+check('subject too wide to fit → null (b13 fixture, tolerance=0)', () => {
+  // 4 person unions from prod b13: 302→1672 (1370px wide) into 1135-wide 9:16 window.
+  // At zero tolerance (the legacy behaviour) this defers, same as before this file
+  // gained a tolerance param.
   const r = computeCropRect({
     sourceW: 1692, sourceH: 2018,
     targetAspect: 9 / 16,
@@ -127,7 +132,46 @@ check('subject too wide to fit → null (b13 fixture)', () => {
   });
   assert.strictEqual(r, null, 'expected null — union 1370px > 1135px window');
 });
-check('subject exactly at crop-width boundary defers (safety margin)', () => {
+check('subject too wide even at 10% tolerance → null (b13 stays deferred)', () => {
+  // Same b13 subject, this time with default 10% tolerance. Over-fit is
+  // (1370+16)/1135 - 1 ≈ 22% (with safety margin), still above 10%.
+  const r = computeCropRect({
+    sourceW: 1692, sourceH: 2018,
+    targetAspect: 9 / 16,
+    subject: { x1: 302, y1: 0, x2: 1672, y2: 2007 },
+    tolerancePct: 0.10
+  });
+  assert.strictEqual(r, null, 'b13 exceeds 10% tolerance');
+});
+check('subject 5% oversized → crop with default 10% tolerance', () => {
+  // Marginal case: subject just barely too wide for a strict crop but well
+  // under the 10% ceiling. Should crop (centred) rather than defer.
+  const cropW = Math.round(2018 * 9 / 16);   // 1135
+  const subjW = Math.round(cropW * 1.05);    // 1192, 5% over
+  const startX = Math.round((1692 - subjW) / 2);
+  const r = computeCropRect({
+    sourceW: 1692, sourceH: 2018,
+    targetAspect: 9 / 16,
+    subject: { x1: startX, y1: 100, x2: startX + subjW, y2: 500 },
+    tolerancePct: 0.10
+  });
+  assert.ok(r, `expected crop at 5% over-fit, got ${r}`);
+  assert.strictEqual(r.w, cropW);
+});
+check('subject 15% oversized → null even at 10% tolerance', () => {
+  // Above tolerance ceiling — must defer regardless.
+  const cropW = Math.round(2018 * 9 / 16);
+  const subjW = Math.round(cropW * 1.15);
+  const startX = Math.round((1692 - subjW) / 2);
+  const r = computeCropRect({
+    sourceW: 1692, sourceH: 2018,
+    targetAspect: 9 / 16,
+    subject: { x1: startX, y1: 100, x2: startX + subjW, y2: 500 },
+    tolerancePct: 0.10
+  });
+  assert.strictEqual(r, null, '15% over-fit must not crop at 10% tolerance');
+});
+check('subject exactly at crop-width boundary defers (safety margin, tolerance=0)', () => {
   // Subject that would fit without margin but not with the 8px CROP_SAFETY_MARGIN_PX
   const cropW = Math.round(2018 * 9 / 16);
   const subjW = cropW;
@@ -138,6 +182,48 @@ check('subject exactly at crop-width boundary defers (safety margin)', () => {
   });
   assert.strictEqual(r, null, 'safety margin should push over');
 });
+
+console.log('\n== overfitTolerancePct ==');
+{
+  const prior = process.env.REFRAME_OVERFIT_TOLERANCE_PCT;
+  try {
+    check('default is 0.10', () => {
+      assert.strictEqual(OVERFIT_TOLERANCE_PCT_DEFAULT, 0.10);
+    });
+    check('unset env → default', () => {
+      delete process.env.REFRAME_OVERFIT_TOLERANCE_PCT;
+      assert.strictEqual(overfitTolerancePct(), 0.10);
+    });
+    check('empty string → default', () => {
+      process.env.REFRAME_OVERFIT_TOLERANCE_PCT = '';
+      assert.strictEqual(overfitTolerancePct(), 0.10);
+    });
+    check('valid override respected', () => {
+      process.env.REFRAME_OVERFIT_TOLERANCE_PCT = '0.05';
+      assert.strictEqual(overfitTolerancePct(), 0.05);
+    });
+    check('zero respected (opts out of tolerance)', () => {
+      process.env.REFRAME_OVERFIT_TOLERANCE_PCT = '0';
+      assert.strictEqual(overfitTolerancePct(), 0);
+    });
+    check('negative → default (clamped)', () => {
+      process.env.REFRAME_OVERFIT_TOLERANCE_PCT = '-0.1';
+      assert.strictEqual(overfitTolerancePct(), 0.10);
+    });
+    check('above 0.5 → default (ceiling)', () => {
+      // A 90% tolerance would crop a person's face in half — safety ceiling.
+      process.env.REFRAME_OVERFIT_TOLERANCE_PCT = '0.9';
+      assert.strictEqual(overfitTolerancePct(), 0.10);
+    });
+    check('garbage → default', () => {
+      process.env.REFRAME_OVERFIT_TOLERANCE_PCT = 'foo';
+      assert.strictEqual(overfitTolerancePct(), 0.10);
+    });
+  } finally {
+    if (prior === undefined) delete process.env.REFRAME_OVERFIT_TOLERANCE_PCT;
+    else process.env.REFRAME_OVERFIT_TOLERANCE_PCT = prior;
+  }
+}
 
 console.log('\n== buildCloudinaryCropUrl ==');
 check('inserts c_crop into Cloudinary URL', () => {
@@ -226,7 +312,10 @@ try {
     assert.ok(s.rect.w > 0 && s.rect.h > 0);
   });
 
-  check('b13 fixture (4 people, union 1370px wide) → defer', () => {
+  check('b13 fixture (4 people, union 1370px wide) → composite-mask', () => {
+    // At default 10% tolerance this now returns 'composite-mask' (was
+    // 'defer' before this file gained the tolerance + composite path).
+    // Over-fit ~22% > 10% — composite branch takes it.
     const s = chooseStrategy({
       media: {
         width: 1692, height: 2018,
@@ -240,9 +329,32 @@ try {
       aspectRatio: '9:16',
       sourceUrl: 'https://res.cloudinary.com/reach-social-prod/image/upload/v1785944632/catalog-product/x/y.jpg'
     });
-    assert.strictEqual(s.action, 'defer', `expected defer, got ${s.action} (${s.reason})`);
-    assert.match(s.reason, /doesn't fit target-aspect crop window/);
-    assert.ok(s.subjectUnion, 'subjectUnion should be surfaced on defer');
+    assert.strictEqual(s.action, 'composite-mask', `expected composite-mask, got ${s.action} (${s.reason})`);
+    assert.match(s.reason, /exceeds target-aspect crop window beyond \d+% tolerance/);
+    assert.ok(s.subjectUnion, 'subjectUnion should be surfaced on composite-mask');
+    assert.ok(s.sourceDims && s.sourceDims.width === 1692 && s.sourceDims.height === 2018,
+      'sourceDims should be surfaced on composite-mask');
+    assert.strictEqual(typeof s.tolerancePct, 'number');
+  });
+
+  check('marginal fixture (subject 5% oversized) → crop with default tolerance', () => {
+    // Same source, but ONE subject that just barely overflows the crop
+    // window — tolerance 10% flips this from defer to crop.
+    const cropW = Math.round(2018 * 9 / 16);
+    const subjW = Math.round(cropW * 1.05);
+    const startX = Math.round((1692 - subjW) / 2);
+    const s = chooseStrategy({
+      media: {
+        width: 1692, height: 2018,
+        refinedProducts: [
+          { x1: startX, y1: 100, x2: startX + subjW, y2: 500 }
+        ]
+      },
+      aspectRatio: '9:16',
+      sourceUrl: 'https://res.cloudinary.com/reach-social-prod/image/upload/v1785944632/catalog-product/x/y.jpg'
+    });
+    assert.strictEqual(s.action, 'crop', `expected crop, got ${s.action} (${s.reason})`);
+    assert.match(s.reason, /tolerance \d+%/);
   });
 
   check('non-Cloudinary source → defer', () => {
