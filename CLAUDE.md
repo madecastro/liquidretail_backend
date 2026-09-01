@@ -209,6 +209,21 @@ worktree is by definition checked out there), while a genuinely
 squash-merged-and-clean branch was deleted end to end (local + remote) with
 the other three left byte-for-byte untouched.
 
+**Adversarial review (Grok grok-4.6, `--effort high`, 2026-08-31) found real
+bugs here, since fixed.** (1) the remote delete had no lease, so a
+same-named `origin/<branch>` that moved between our fetch and the delete
+could have new commits destroyed alongside the branch — fixed with
+`--force-with-lease` on a SHA observed as late as possible; (2) remote
+delete used to run even when the local `-D` failed — now gated; (3) the
+squash-equivalence check matches against ANY point in trunk's history,
+including a commit trunk has since reverted or superseded — demonstrated
+concretely and fixed with a second gate requiring the branch's added lines
+to still be found in trunk's CURRENT file content (a ratio threshold, not
+literal 100% — a stricter version broke on this repo's own auto-regenerated
+manifest-style files). All ten properties are now pinned by
+`scripts/verifyCleanupMergedBranchesSafety.js` against a real disposable
+fixture repo — added to `npm test`.
+
 **Duplication, deliberate:** `scripts/lib/gitAudit.js` plus these two
 callers are hand-synced, byte-identical, with `liquidretail_adgen`'s
 copies — NOT routed through that repo's `scripts/vendor-manifest.json`
