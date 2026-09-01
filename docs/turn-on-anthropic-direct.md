@@ -2,13 +2,32 @@
 
 Short doc. Read it when you're about to add `ANTHROPIC_API_KEY` to Render.
 
+**UPDATE (2026-08-31): the named-skip restoration described below already
+happened, independently of the key landing.** `verifyDirectorFallbackChain.js`
+E5 caught that the 2026-08-25 `direct: null` change (described in "Context"
+below as reducing log noise) had an unintended side effect: it didn't just
+silence the log line, it skipped the transport's `if (direct && !directKey)`
+branch ENTIRELY, so the auth-missing skip stopped being *recorded* too — the
+identical shape of hole the 2026-08-18 outage exposed, reintroduced by the
+noise fix itself. `MAP.director`'s two Anthropic links are therefore back to
+their original `direct: { provider: 'anthropic', model: '...' }` shape as of
+this update — see the `RESTORED` comment on `MAP.director` in
+`atlasModelMap.js`. This did **not** wait for `ANTHROPIC_API_KEY`: no key
+means `DIRECT_KEYS['anthropic']` is still undefined (see "Also worth doing
+at the same time" below, still open), so the transport still makes zero live
+Anthropic HTTP calls — it just goes back to *recording* the skip instead of
+silently no-op'ing it. The steps below, from "When to re-enable" onward, are
+about the SEPARATE remaining follow-up: making the direct twin actually
+dispatch once a key exists. Sections above that line are historical context
+for how the hole got there.
+
 ## Context
 
 `services/atlasModelMap.js`'s `MAP.director` chain is:
 
 ```
-1. anthropic/claude-sonnet-5 (Atlas)  →  direct: anthropic/claude-sonnet-5   ← disabled 2026-08-25
-2. anthropic/claude-opus-5   (Atlas)  →  direct: anthropic/claude-opus-5     ← disabled 2026-08-25
+1. anthropic/claude-sonnet-5 (Atlas)  →  direct: anthropic/claude-sonnet-5   ← named skip restored 2026-08-31, key still absent
+2. anthropic/claude-opus-5   (Atlas)  →  direct: anthropic/claude-opus-5     ← named skip restored 2026-08-31, key still absent
 3. openai/gpt-5.6-terra      (Atlas)  →  direct: openai/gpt-4.1              ← still live
 ```
 
@@ -24,12 +43,14 @@ advancing. Pure noise: the transport's own `direct && !directKey` guard at
 `services/atlasLlmService.js:393-407` skipped them in 0.0s anyway.
 
 To reduce log noise until the key lands, both Anthropic direct twins were
-replaced with `direct: null`. Transport treats null identically to the
-missing-key path (skips the direct branch entirely) except without the log
-line. Functionally a no-op. See the `TURN BACK ON` comment on `MAP.director`
-in `atlasModelMap.js`.
+replaced with `direct: null` on 2026-08-25. That went further than intended:
+`direct: null` doesn't reach the `direct && !directKey` guard at all (its
+`direct &&` half is false), so the skip was no longer *recorded* — not the
+"transport treats null identically to the missing-key path" behaviour this
+doc originally claimed. `verifyDirectorFallbackChain.js` E5 exists precisely
+to catch that gap and went red until the 2026-08-31 restore above.
 
-## When to re-enable
+## When to re-enable (making the direct twin actually DISPATCH — still open)
 
 The moment `ANTHROPIC_API_KEY` is added to Render — on **both** services:
 
@@ -38,12 +59,11 @@ The moment `ANTHROPIC_API_KEY` is added to Render — on **both** services:
 
 ## Exact restoration steps
 
-1. Open `services/atlasModelMap.js`
-2. Find `'director':` entry (~line 176)
-3. Remove the ⚠️ TURN BACK ON comment block
-4. Restore the two Anthropic links to their original two-line shape. The
-   original values (kept verbatim in commented-out lines above each `direct:
-   null` for zero-guesswork restoration):
+**The `MAP.director` half of this (step 4) is DONE as of 2026-08-31** — the
+two Anthropic links already carry this exact shape. What remains is adding
+the `anthropic:` entry to `DIRECT_KEYS`/`DIRECT_URLS` in
+`services/atlasLlmService.js` (see "Also worth doing at the same time"
+below) once the key exists on Render.
 
 ```js
 'director': {
@@ -57,7 +77,8 @@ The moment `ANTHROPIC_API_KEY` is added to Render — on **both** services:
 },
 ```
 
-5. Delete this file. Its purpose is done.
+5. Once `DIRECT_KEYS`/`DIRECT_URLS` also carry the `anthropic:` entry (the
+   remaining step), this file's purpose is done and it can be deleted.
 
 ## Expected latency win after restore
 

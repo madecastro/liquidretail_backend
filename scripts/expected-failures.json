@@ -15,10 +15,5 @@
     "",
     "Every entry needs a reason someone can act on. 'flaky' is not a reason."
   ],
-  "expectedFailures": {
-    "verifyDirectorFallbackChain.js": {
-      "reason": "46/47 checks pass. E5: only the OpenAI direct twin (gpt-4.1) is coded as a NAMED LLM_AUTH_MISSING skip when its key is absent — the two Anthropic direct twins in the director chain (claude-sonnet-5, claude-opus-5) still fail silently on a keyless Anthropic outage, which is the exact hole E5 exists to catch (see CLAUDE.md's Director fallback-chain section on the outage this chain was built to prevent).",
-      "removeWhen": "the two Anthropic direct twins get the same named auth-missing skip the OpenAI twin already has — delete this entry in the same commit."
-    }
-  }
+  "expectedFailures": {}
 }
