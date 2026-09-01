@@ -178,8 +178,17 @@ async function ensureBrandCatalogMediaMaterialized(brandId, opts = {}) {
   const t0 = Date.now();
   const altLimit = Math.max(0, opts.altLimit != null ? opts.altLimit : DEFAULT_ALT_LIMIT);
 
+  // brandId is REQUIRED in the projection — materializeImage reads
+  // product.brandId when building the Media doc, and Mongoose's strict
+  // schema does NOT default a missing brandId to null-safe behavior:
+  // the created Media just has brandId=null. Measured 2026-09-01 on
+  // Pelagic Gear 4 Demos: 928 of 981 newly-created catalog Media had
+  // brandId=null, invisible to every brand-scoped read (backfill query,
+  // reconcile sweep, adReadinessService, ad-gen reference stack). Same
+  // ".select() silently drops a required field" trap CLAUDE.md §4a
+  // records for the shopifyUrl and description cases.
   const rows = await CatalogProduct.find({ brandId, draft: { $ne: true } })
-    .select('_id advertiserId title imageUrl additionalImages imageMediaId additionalImageMediaIds')
+    .select('_id brandId advertiserId title imageUrl additionalImages imageMediaId additionalImageMediaIds')
     .lean();
 
   const targets = rows.slice(0, MAX_PER_RUN);
