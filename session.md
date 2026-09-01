@@ -14,10 +14,57 @@ it clears it back to this placeholder.)_
 
 ## CURRENT STATE
 
-*(Replaced 2026-08-31 late. adgen trunk `master` @ `7a545a3` (#101) — renderer + titler both
-confirmed Live. Backend trunk `main` @ `55c1709` (#369) — web + worker both Live.)*
+*(Replaced 2026-09-01 morning. adgen trunk `master` @ `6d93686` (#102) — api/orchestrator/
+renderer/titler all confirmed Live. Backend trunk `main` @ `175968d` (#374) — web + worker
+both Live.)*
 
-**SIX THINGS SHIPPED AND DEPLOYED TODAY.** All merged and live in production:
+**adgen #102 + backend #374 landed and deployed — CI verify-suite dotfile-ENOENT-race
+hardening, completing what PR #367 (backend CI) started.** Both were built as
+build-complete, cross-model-reviewed diffs sitting uncommitted in worktrees, and both hit
+the same real-world surprise on landing: **origin had moved substantially since the diffs
+were drafted, in both repos, from other concurrent sessions.**
+
+- **adgen #102**: `scripts/lib/sourceWalk.js` filename-dot-skip (this repo's independent
+  vendored copy of the same shared helper backend has — same bug, same fix: the walk
+  skipped dot-prefixed *directories* but not dot-prefixed *filenames*, so a transient
+  `.__revertprove_*.js` mutation-test sibling could still be caught mid-write by
+  `verifyArchiveDigestRelease.js`'s whole-repo scan and ENOENT under `--concurrency=4`).
+  Plus `scripts/verifyRunFinalizesOnSettle_KNOWN_OPEN.js` → `scripts/verifyRunFinalizesOnSettle.js`:
+  the harness's expected-fail theory ("renderer.js never wired run-finalization") was
+  simply wrong — `renderer.js`'s `bumpRunCounter` (:733) already awaits `maybeFinalizeRun`
+  (:744) — so it was rewritten to source-extract and replay the real live completion path
+  instead of a hand-copied pre-fix shape. Suite: 89/89, zero expected-failures.
+- **backend #374**: the other 10 `verify*.js` harnesses that do their own directory walk
+  got the identical dot-skip PR #367 gave `verifyMetaApiVersion.js`. Suite: 220/220, zero
+  expected-failures.
+- **The surprise, worth internalizing for next time**: backend's PR #367 — titled
+  "**DO NOT MERGE**", with its own body checklist explicitly unchecked on that line — got
+  merged anyway by the owner (`nicknsheth-beep`) while this session's diff was in flight,
+  and its four documented known-failures (`verifyCostAttribution.js`,
+  `verifyDirectorFallbackChain.js` / `atlasModelMap.js`, `verifyIngestBackgroundWorkSurvives.js`,
+  `verifyPreparingReap.js` F2) were *each independently fixed and merged as their own PRs*
+  (#370, #371, #372, #373) — apparently by another concurrent session — in the ~20 minutes
+  before this session went to land its own copy of overlapping work. Caught by re-diffing
+  against a freshly-fetched `origin/main` rather than trusting the old local base: this
+  session's local uncommitted versions of `routes/ads.js` and `services/atlasModelMap.js`
+  were byte-identical to what had already landed; `scripts/verifyCostAttribution.js` and
+  `scripts/verifyIngestBackgroundWorkSurvives.js` were functionally the same fix with
+  different (and in `verifyCostAttribution.js`'s case, *more robust* — brace-balanced vs.
+  naive `indexOf`) implementations. Adopted origin's already-merged, already-reviewed
+  versions of those four files rather than re-landing a competing copy, rebased the
+  branch onto current `origin/main`, and opened a **new** PR (#374, `ci/github-actions-verify-suite`
+  was already closed) carrying only the genuinely-still-outstanding 11-file dotfile fix.
+  Full narrative + the adversarial-reviewer's (opus) findings on the three
+  already-merged money/lifecycle changes (all SHIP, two small non-blocking follow-ups —
+  stale `docs/turn-on-anthropic-direct.md`, missing `DIRECT_URLS.anthropic` entry) live in
+  `liquidretail_backend/session.d/2026-09-01_verify-suite-dotfile-race-remaining-walks.md`.
+  **Lesson for any session landing a build-complete diff that sat uncommitted for a
+  while: re-diff against a fresh `origin` fetch before committing, every time — don't
+  trust the branch state the diff was originally built against.**
+
+---
+
+**SIX THINGS SHIPPED AND DEPLOYED 2026-08-31.** All merged and live in production:
 
 1. **Title TEXT-ON-TEXT fixed** (adgen #97 → backend #361). Delivered vertical ads printed the
    headline and the productName/rating stack on top of each other. Cause: `resolveGroupAnchor`
