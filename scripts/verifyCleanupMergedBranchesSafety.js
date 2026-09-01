@@ -294,8 +294,15 @@ check('G: lease-protected remote delete refuses when the remote branch has moved
   // origin/feature/remote-race is stale on purpose — this is the exact
   // window performDelete's lease must protect.
   const outcome = performDelete(workDir, item, 'main', 'origin/main', () => {});
+  // `cwd` is load-bearing, not cosmetic: without it this spawnSync inherits
+  // the test RUNNER's own cwd, and `git ls-remote <path>` still needs to
+  // resolve an enclosing repository to run at all. Caught during development
+  // by running this harness from a copied linked-worktree checkout (a stale
+  // `.git` worktree pointer at that inherited cwd made every git invocation
+  // fail with "fatal: not a git repository", producing a false failure here
+  // that had nothing to do with cleanupMergedBranches.js itself).
   const remoteStillHasTeammateCommit = spawnSync(
-    'git', ['ls-remote', originDir, 'refs/heads/feature/remote-race'], { encoding: 'utf8' },
+    'git', ['ls-remote', originDir, 'refs/heads/feature/remote-race'], { encoding: 'utf8', cwd: originDir },
   ).stdout.includes(teammateSha);
 
   if (!remoteStillHasTeammateCommit) {

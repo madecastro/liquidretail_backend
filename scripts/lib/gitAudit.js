@@ -45,6 +45,30 @@ function runGit(repoRoot, args) {
   });
 }
 
+// A fresh CI runner (no ~/.gitconfig, no real GECOS name, hostname like
+// "8522a558aa8d.(none)") has no identity `commit-tree` can auto-detect and
+// fails outright ("fatal: unable to auto-detect email address") — confirmed
+// by reproducing the exact CI failure in a clean node:20-bullseye container.
+// A real dev machine usually has a usable GECOS/hostname fallback (git only
+// warns), which is why this passed locally and only broke in CI. The probe
+// commit this identity is attached to is synthetic and never referenced by
+// any ref (see isSquashMergedIntoTrunk's header), so a fixed, meaningless
+// identity is fine — this must never depend on ambient config.
+const PROBE_COMMIT_ENV = Object.assign({}, process.env, {
+  GIT_AUTHOR_NAME: 'auditStrandedWork',
+  GIT_AUTHOR_EMAIL: 'auditStrandedWork@localhost',
+  GIT_COMMITTER_NAME: 'auditStrandedWork',
+  GIT_COMMITTER_EMAIL: 'auditStrandedWork@localhost',
+});
+
+function runGitWithProbeIdentity(repoRoot, args) {
+  return spawnSync('git', ['-c', 'color.ui=never', '-C', repoRoot, ...args], {
+    encoding: 'utf8',
+    maxBuffer: GIT_MAX_BUFFER,
+    env: PROBE_COMMIT_ENV,
+  });
+}
+
 function gitOut(repoRoot, args) {
   const r = runGit(repoRoot, args);
   if (r.status !== 0) return null;
@@ -289,7 +313,7 @@ function isSquashMergedIntoTrunk(repoRoot, branch, trunkRef) {
   const treeR = runGit(repoRoot, ['rev-parse', `${qualifyBranchRef(branch)}^{tree}`]);
   if (treeR.status !== 0) return false;
   const tree = treeR.stdout.trim();
-  const commitR = runGit(repoRoot, [
+  const commitR = runGitWithProbeIdentity(repoRoot, [
     'commit-tree', tree, '-p', mergeBase, '-m', 'auditStrandedWork squash-merge probe (dangling, harmless)',
   ]);
   if (commitR.status !== 0) return false;
