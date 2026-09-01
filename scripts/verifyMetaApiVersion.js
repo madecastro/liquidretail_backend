@@ -80,7 +80,17 @@ function check(label, cond, detail) {
 function walkFiles(dir, acc = []) {
   if (!fs.existsSync(dir)) return acc;
   for (const ent of fs.readdirSync(dir, { withFileTypes: true })) {
-    if (ent.name === 'node_modules' || ent.name === '.git') continue;
+    // Skip node_modules/.git AND any dotfile/dotdir — same convention
+    // scripts/lib/sourceWalk.js already uses. Load-bearing, not cosmetic:
+    // several other verify* harnesses (grep scripts/ for "revertprove")
+    // do a real-time mutate-check-restore against a REAL routes/services
+    // file via a transient `.__revertprove_<name>_<pid>_<ts>_<rand>.js`
+    // sibling. Without this skip, a concurrent run of this harness can
+    // readdirSync a directory mid-mutation, queue that transient dotfile
+    // for reading, and then hit ENOENT once the other script's cleanup
+    // deletes it before this one's readFileSync runs — a real, reproduced
+    // (not hypothetical) race under runVerifySuite.js's parallel pool.
+    if (ent.name === 'node_modules' || ent.name.startsWith('.')) continue;
     const full = path.join(dir, ent.name);
     if (ent.isDirectory()) walkFiles(full, acc);
     else if (/\.(js|json|md|env|ts)$/.test(ent.name) || !ent.name.includes('.')) {
