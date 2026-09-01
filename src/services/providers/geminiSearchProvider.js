@@ -1108,6 +1108,14 @@ async function lookupBrandReviews({ brandName, brandUrl, brandId = null }) {
     `testimonials. Prefer MORE quotes from a strong source over one-per-source variety — several ` +
     `excellent Reddit or Trustpilot quotes beat a token spread.\n\n` +
     `${AD_USABLE_QUOTE_DIRECTIVE}\n\n` +
+    `SCOPE — BRAND, NOT PRODUCT. This pool is used as a fallback testimonial on ANY of ${brandName}'s ` +
+    `products, so a quote must be a general statement about ${brandName} AS A COMPANY — its quality, ` +
+    `values, materials, service, or overall experience — never about one specific product, SKU, ` +
+    `colorway, or item. Exclude anything that only makes sense about a single thing the reviewer ` +
+    `bought, even when it never names a product type: a specific quantity ("I've got two pairs of ` +
+    `these", "bought three of them"), a specific fit, size, or colorway, or a feature only one item ` +
+    `has. If a quote reads as being about ONE product rather than the brand as a whole, leave it out ` +
+    `— it belongs to that product's own review pool, not the brand's.\n\n` +
     `For each quote, give the source platform and the author/handle if visible, and the funnel stage ` +
     `it serves. Write naturally — do not format as JSON.`;
 

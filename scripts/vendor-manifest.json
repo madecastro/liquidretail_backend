@@ -1,8 +1,8 @@
 {
   "version": 2,
   "backendRef": "origin/main",
-  "backendHead": "f9efb439b58f2bc5e8936868a1dd4308d58e84f5",
-  "generatedAt": "2026-09-01T00:23:46.824Z",
+  "backendHead": "88fc294093d1cc04e6d80d6d404b64fa893c2059",
+  "generatedAt": "2026-09-01T06:37:39.828Z",
   "files": {
     "models/Ad.js": {
       "backendHash": "394d26a1cb8ad64b23bde73312f3473f332520dd9640b9d5e4bb8eec22d6138d",
@@ -399,13 +399,17 @@
       "backendHash": "9a2df5e38efa6872b25cb75a638f7302bfaa05f2c60556fe31763dba93d63335",
       "adgenHash": "9a2df5e38efa6872b25cb75a638f7302bfaa05f2c60556fe31763dba93d63335",
       "backendSha": "e7aa605e688ca93a0b29f8447321d38ad9a1ac27",
-      "status": "synced"
+      "status": "synced",
+      "portTo": null,
+      "owedSince": null
     },
     "remotion/presets/babyboo-main-character.json": {
       "backendHash": "55f26d07281894a589a459773bd7f55096981e792e4be0c456839855225b4ed9",
       "adgenHash": "55f26d07281894a589a459773bd7f55096981e792e4be0c456839855225b4ed9",
       "backendSha": "e7aa605e688ca93a0b29f8447321d38ad9a1ac27",
-      "status": "synced"
+      "status": "synced",
+      "portTo": null,
+      "owedSince": null
     },
     "remotion/presets/canonical-awareness-pmax10.json": {
       "backendHash": "b3847d4e2d771c13b6a4487e7f4deae252582de7416257cb9dcd4f65543f7404",
@@ -419,7 +423,9 @@
       "backendHash": "460a0eb1c9478d76385f9a37505cd5fbb2d6bca94df9f059d32623045a8eb161",
       "adgenHash": "460a0eb1c9478d76385f9a37505cd5fbb2d6bca94df9f059d32623045a8eb161",
       "backendSha": "e7aa605e688ca93a0b29f8447321d38ad9a1ac27",
-      "status": "synced"
+      "status": "synced",
+      "portTo": null,
+      "owedSince": null
     },
     "remotion/presets/canonical-consideration-pmax10.json": {
       "backendHash": "ed9e6c24e2abfddabba2b2152b91b95ba0fe8fec77ca6b4f9bf12eecdccfc984",
@@ -441,7 +447,9 @@
       "backendHash": "074bcc45075d86d058ba466a7c5cea92073e3f7e8a0018bf5f6896a020979293",
       "adgenHash": "074bcc45075d86d058ba466a7c5cea92073e3f7e8a0018bf5f6896a020979293",
       "backendSha": "e7aa605e688ca93a0b29f8447321d38ad9a1ac27",
-      "status": "synced"
+      "status": "synced",
+      "portTo": null,
+      "owedSince": null
     },
     "remotion/presets/canonical-conversion.json": {
       "backendHash": "fe60de2ab6516903ce90fa6238e8a0680750d2ceb704d745ce52866d91abd321",
@@ -465,13 +473,17 @@
       "backendHash": "504d078886e055dbde187e44029aa4beb11900c9099c3139f4b5ed85f00dceaf",
       "adgenHash": "504d078886e055dbde187e44029aa4beb11900c9099c3139f4b5ed85f00dceaf",
       "backendSha": "e7aa605e688ca93a0b29f8447321d38ad9a1ac27",
-      "status": "synced"
+      "status": "synced",
+      "portTo": null,
+      "owedSince": null
     },
     "remotion/presets/pelagic-offshore-bold.json": {
       "backendHash": "e3ef69a608e45543130c626aae585f1de45e2b14953acc6272cc53a8982e3792",
       "adgenHash": "e3ef69a608e45543130c626aae585f1de45e2b14953acc6272cc53a8982e3792",
       "backendSha": "e7aa605e688ca93a0b29f8447321d38ad9a1ac27",
-      "status": "synced"
+      "status": "synced",
+      "portTo": null,
+      "owedSince": null
     },
     "remotion/presets/proto-bottom-editorial.json": {
       "backendHash": "0febc9a6672147059d92216a287c9d08fcb17c7d76d3e663b53dad1b10c5a88a",
@@ -493,13 +505,17 @@
       "backendHash": "85de97ce421d66618f64d531bb76de01cac02d932737e01b916720e2346d5c98",
       "adgenHash": "85de97ce421d66618f64d531bb76de01cac02d932737e01b916720e2346d5c98",
       "backendSha": "e7aa605e688ca93a0b29f8447321d38ad9a1ac27",
-      "status": "synced"
+      "status": "synced",
+      "portTo": null,
+      "owedSince": null
     },
     "remotion/presets/soludos-summer-postcard.json": {
       "backendHash": "1f6a257120c1e447b48833149de140b0efd1845b212e9d945132884826051a73",
       "adgenHash": "1f6a257120c1e447b48833149de140b0efd1845b212e9d945132884826051a73",
       "backendSha": "e7aa605e688ca93a0b29f8447321d38ad9a1ac27",
-      "status": "synced"
+      "status": "synced",
+      "portTo": null,
+      "owedSince": null
     },
     "schemas/contracts/ai_canvas_html.v1.json": {
       "backendHash": "99853ed40eda1f159aa1be3471b87fdf994543ac6cf7f7f71c1d7d9a1bf8bc5d",
@@ -1423,10 +1439,10 @@
     },
     "services/providers/geminiSearchProvider.js": {
       "backendHash": "cbecc38bf7bb05c8a49b07ef3fcb8440f4295d0db1e39eff5201e39571fd6287",
-      "adgenHash": "780f22b15aee607fe4f35580e344f88fc859a718c76c29dc7462812e5d717b7f",
+      "adgenHash": "f32d8c0d68f0463651d0f94bb331693912adad5997e870a5127b59385a4801bb",
       "backendSha": "1acb49bd9775eb79848fcb05d9a7289bbd3efa6b",
       "status": "fork",
-      "reason": "NOT PORTED, deliberately. Backend #331 threaded brandId/productId through this and three other previously unledgered cost producers so their CostLog rows attribute correctly. This provider runs BACKEND-side only (the Gemini grounded-search review gap-fill); adgen's copy is unwired, so the attribution fix has nothing to attribute here. NOTE: this module produces the llm-web review quotes, which print TEXT ONLY with every byline stripped — read services/quoteProvenance.js before wiring this copy.",
+      "reason": "Added a SCOPE — BRAND, NOT PRODUCT paragraph to lookupBrandReviews's Gemini prompt, naming the exact 'two pairs of these on a t-shirt' failure pattern as an exclusion example. Identical text ported to backend same day (2026-08-31) — backend's copy is the live-firing one per the prior fork note (adgen's copy of this provider is unwired); the two files otherwise still differ only in the pre-existing match() brandId cost-ledger threading (PR #331) this fork was already recording.",
       "portTo": null,
       "owedSince": null
     },
@@ -1458,10 +1474,10 @@
     },
     "services/quoteProvenance.js": {
       "backendHash": "60b30bc103fe267f5a82ca0a29237c32dcb0fc61e1a7471e74ff1d3fb32bdcd7",
-      "adgenHash": "c8dbb41a0e305fcfd218be0c04d104182ee7ee17eee04541f4380c7fa72d50c5",
+      "adgenHash": "b6b2c790ba35e1e35e90aec42af1c04d0348c22c1d27fcd3a73a1aa7c523ff5f",
       "backendSha": "d8c133011275d62fa4133ed939b5e47fe5e90bdc",
       "status": "fork",
-      "reason": "comment-only: adgen dropped CLAUDE.md §4 cross-ref; colourway sibling comment ported from backend #324",
+      "reason": "Second pass after adversarial re-review (Grok, high effort): reordered case 4 to run before the named-noun check (closes a bypass where a quote implying a pair-sold item but also naming an unrelated noun could dodge the drop), fixed the fromLabel short/shorts recovery to be match-local instead of whole-string tested (closes a 2+-space and non-ASCII-dash miss, and a false-suppression when a genuine 'Kore Short'-style title is concatenated with an unrelated Short Sleeve media label), and widened PAIR_REFERENCE_RE to also match singular this. Identical fix ported to backend same day (2026-08-31).",
       "portTo": null,
       "owedSince": null
     },
@@ -1519,7 +1535,9 @@
       "adgenHash": "1565a91d4f8cbedd3aae46ccbe41abd4f8283ad9dc4cd7cd12cc325ca15a9e0b",
       "backendSha": "e7aa605e688ca93a0b29f8447321d38ad9a1ac27",
       "status": "fork",
-      "reason": "The specific debt is PAID: the plateHintsOverride param landed in backend via PR #361 (merged e7aa605) — verified present at backend services/remotionRenderService.js:620 and :683. Returning this file to 'fork', which is what it was before 2026-08-31; labelling the WHOLE file 'unported' that day was too broad, since only the small plateHintsOverride addition was ever owed. The residual ~336-line divergence is adgen's DELIBERATE child-process render architecture (remotionChildSupervisor.js / remotionRender.child.js / prebuilt .remotion-bundle, for Chrome+ffmpeg OOM isolation per adgen CLAUDE.md) which backend does not have and is not expected to adopt."
+      "reason": "The specific debt is PAID: the plateHintsOverride param landed in backend via PR #361 (merged e7aa605) — verified present at backend services/remotionRenderService.js:620 and :683. Returning this file to 'fork', which is what it was before 2026-08-31; labelling the WHOLE file 'unported' that day was too broad, since only the small plateHintsOverride addition was ever owed. The residual ~336-line divergence is adgen's DELIBERATE child-process render architecture (remotionChildSupervisor.js / remotionRender.child.js / prebuilt .remotion-bundle, for Chrome+ffmpeg OOM isolation per adgen CLAUDE.md) which backend does not have and is not expected to adopt.",
+      "portTo": null,
+      "owedSince": null
     },
     "services/renderErrorFields.js": {
       "backendHash": "0efda9eab3d25ab7f1a1efa8f8ca3cc8f5f2ca93a9a56319f0ecb3de0aa0d748",
