@@ -208,8 +208,18 @@ checkTrue('D9 null/undefined ad never throws and never counts as delivered',
     && outcomeClaimedVideo.succeeded === 0 && outcomeClaimedVideo.failed === 0);
 }
 
-checkTrue('C6 campaignRunGuards imports the discriminator, does not re-derive its own',
-  /require\(['"]\.\/adTitlingTruth['"]\)/.test(GUARDS_CODE));
+// UPDATED 2026-08-31 (adPhase.js parity pass): classifyRunAdOutcome now
+// reads succeeded/failed off deriveAdPhase() (services/adPhase.js) instead
+// of calling isVideoTitlingSettled directly — see that function's own
+// updated header for the equivalence proof. adPhase.js itself requires
+// adTitlingTruth.js, so the intent this check has always pinned ("does not
+// re-derive its own titling-truth/failure logic") still holds; only the
+// direct import moved one layer up. Either require satisfies it — a
+// regression back to a THIRD, ad-hoc derivation (neither module) is what
+// this must still catch.
+checkTrue('C6 campaignRunGuards imports the discriminator (directly or via services/adPhase.js), does not re-derive its own',
+  /require\(['"]\.\/adTitlingTruth['"]\)/.test(GUARDS_CODE)
+  || /require\(['"]\.\/adPhase['"]\)/.test(GUARDS_CODE));
 
 // ── W: worker.js's reconciliation call site must fetch what C needs ───
 // The single most dangerous way to silently defeat the whole fix: narrow
