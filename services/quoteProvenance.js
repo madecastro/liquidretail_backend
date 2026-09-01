@@ -197,6 +197,30 @@ function isPrintableCustomerQuote(q) {
 //      in both (1) and (2). A generic "I love this brand's quality" line
 //      is not attributed to any garment, so it cannot be attributed to the
 //      WRONG one; withholding it would be provenance theatre, not safety.
+//   4. EXCEPTION to (3), added 2026-08-31: a quote can be about ONE specific
+//      item without ever naming it — "I've got two pairs of these" — which
+//      is not brand-generic, just noun-less. See impliesPairSoldItem below:
+//      such a quote is DROPPED from the brand tier outright, unconditionally
+//      — not "kept when the scope happens to be a pair-sold category". An
+//      earlier draft of this fix tried the latter (compare allowedLabelText
+//      against a fixed pair-sold noun set) and an adversarial pass (Grok,
+//      high effort) found it exploitable two ways: allowedLabelText is a
+//      UNION of every label the ad's media/match carries, so a stray
+//      secondary detection (e.g. pants visible on a model also wearing the
+//      shirt actually being sold) could satisfy it for the WRONG product;
+//      and the fromLabel 'short'->'shorts' recovery a few lines below
+//      (fixed in the same pass, but independently) meant any title
+//      containing "Short Sleeve" satisfied it too. There is no reliable
+//      per-quote signal for WHICH pair-sold item this text means, so brand
+//      tier — a fallback used across the WHOLE catalog — never gets to
+//      guess. This does not withhold the quote from the product it is
+//      genuinely about: PRODUCT/category tiers bypass this gate entirely
+//      (applyStrictQuoteScope), so if this exact review is also stored as
+//      that product's own quote, it still prints there unaffected.
+//      Measured live: this exact review text sat in a brand's quote pool
+//      (source: gemini-search brand-review harvest) and printed on a
+//      t-shirt ad (6a9600196c6bffaf965a99e9) though the same brand also
+//      sells the pants this quote is actually about.
 //
 // Kill switch unchanged in shape, flipped in default: QUOTE_PROVENANCE_STRICT
 // (config/defaults.env) now defaults 'true'. Setting it 'false' restores the
@@ -218,6 +242,23 @@ const NOUN_SYNONYM_GROUPS = Object.freeze([
   ['shirt', 'tee', 't-shirt', 'tshirt'],
   ['sneaker', 'shoe']
 ]);
+
+// A noun-less phrasing that implies ONE specific item was bought without
+// ever naming it — "I've got two pairs of these", "a pair of them". Used
+// ONLY to DROP such a quote from the brand tier (case 4 above); deliberately
+// not mapped to a noun set to compare against — see that comment for why
+// (an earlier version of this fix tried that and was exploitable). NOT
+// exhaustive of every implicit-count phrasing — this covers the reported
+// construction, not the general problem: numeral word list stops at "six"
+// ("ten pairs of these" is a known miss), and noun-less phrasing with no
+// "pair(s)" at all ("I bought two of these") is not covered either. See
+// impliesPairSoldItem's own callers for the boundary.
+const PAIR_REFERENCE_RE =
+  /\b(?:a\s+pair|(?:\d+|one|two|three|four|five|six|several|multiple|few|a\s+couple(?:\s+of)?)\s+pairs?)\s+of\s+(?:these|them|those|it|this)\b/i;
+
+function impliesPairSoldItem(text) {
+  return PAIR_REFERENCE_RE.test(String(text || ''));
+}
 
 // Media fields collectScopeLabelText reads. Live render callers must
 // select at least these or the seed-label rule is a no-op.
@@ -318,7 +359,31 @@ function productNounsIn(text, opts = {}) {
   }
   // Label-only: a product titled "Kore Short" must unlock shorts quotes.
   // Quote text never takes this path — "short delivery" stays generic.
-  if (opts.fromLabel && /\bshort\b/i.test(src) && !seen.has('shorts')) {
+  // EXCLUDES "short sleeve"/"short-sleeve" (any spacing, any dash, or none):
+  // "short" there is an adjective on a SHIRT, not a shorthand product name
+  // for shorts — a t-shirt titled "Short Sleeve Rusted Icon Tee" is not a
+  // shorts product. Pre-existing bug, found live 2026-08-31 by an
+  // adversarial pass on case 4 above: without this exclusion, an explicit
+  // "these shorts are great" quote would wrongly pass scope on ANY
+  // short-sleeve tee (unrelated to case 4, which does not consult this
+  // recovery at all — impliesPairSoldItem rejects unconditionally, never
+  // by matching back to allowedLabelText).
+  //
+  // MATCH-LOCAL, not whole-string. A first version tested
+  // /\bshort[-\s]?sleeve/i against the entire concatenated label blob —
+  // that both under- and over-excluded: `[-\s]?` allows only ONE separator
+  // char, so "Short  Sleeve" (two spaces) or an en/em dash slipped through
+  // unexcluded; and testing the WHOLE blob meant a genuine shorts product
+  // ("Kore Short") concatenated with an unrelated "Short Sleeve" media
+  // label (collectScopeLabelText joins title + detected subjects into one
+  // string) would wrongly suppress its OWN shorts recovery. The negative
+  // lookahead below is anchored to the SPECIFIC "short" match under
+  // consideration — a different "short" elsewhere in the blob cannot
+  // affect it — and accepts any run of whitespace plus common dash forms
+  // (hyphen, non-breaking hyphen, figure/en/em dash, minus sign) between
+  // "short" and "sleeve", including none at all ("shortsleeve").
+  const SHORT_NOT_SLEEVE_RE = /\bshort\b(?!\s*[-‐-―−]?\s*sleeve)/i;
+  if (opts.fromLabel && SHORT_NOT_SLEEVE_RE.test(src) && !seen.has('shorts')) {
     seen.add('shorts');
     found.push('shorts');
   }
@@ -394,10 +459,25 @@ function collectScopeLabelText({ productTitle, media, match, extraText } = {}) {
 /**
  * True when every product-type noun the quote names also appears (as that
  * noun or its plural) in the allowed label text. A quote that names none
- * of the listed nouns is GENERIC and is allowed.
+ * of the listed nouns is GENERIC and is allowed — UNLESS it implies one
+ * specific pair-sold item without naming it ("two pairs of these"), in
+ * which case it is DROPPED FROM BRAND TIER UNCONDITIONALLY (case 4 above) —
+ * never matched back against a scope. See case 4's comment for why: an
+ * earlier draft tried the match-back and was exploitable.
  */
 function quoteAllowedForScope(quote, allowedLabelText) {
-  const named = productNounsIn(quoteTextOf(quote));
+  const text = quoteTextOf(quote);
+
+  // Case 4 runs FIRST, before the named-noun check below, and is
+  // unconditional. It must not be reachable only when the quote names NO
+  // noun at all: "I've got two pairs of these and they go with any shirt"
+  // names 'shirt' (an incidental styling mention, not what "these" refers
+  // to) — checking named-noun first would let the noun match short-circuit
+  // straight past the pair-reference entirely. Running this first closes
+  // that regardless of what else the quote happens to mention.
+  if (impliesPairSoldItem(text)) return false;
+
+  const named = productNounsIn(text);
   if (!named.length) return true;
   const allowed = new Set(productNounsIn(allowedLabelText, { fromLabel: true }));
   return named.every((noun) => allowed.has(noun));
@@ -413,15 +493,18 @@ function isBrandQuoteAllowedForSeed(quote, scope = {}) {
  *
  * Flag-on noun-filters EVERY caller, product-attached or not — reversed
  * 2026-08-19, see the QUOTE_PROVENANCE_STRICT header above. A quote naming
- * no product-type noun (GENERIC) always passes, on both branches, so
- * QUOTE_BRAND_TIER_FALLBACK's last-resort role on a product ad is
- * unaffected for the common case (a brand-wide compliment with no garment
- * word). What is newly refused is a brand quote that names a DIFFERENT
- * specific garment than the one this ad is for — `opts.productTitle`
+ * no product-type noun AND no implicit pair-sold reference (GENERIC) always
+ * passes, on both branches, so QUOTE_BRAND_TIER_FALLBACK's last-resort role
+ * on a product ad is unaffected for the common case (a brand-wide compliment
+ * with no garment word). What is newly refused is a brand quote that names a
+ * DIFFERENT specific garment than the one this ad is for — `opts.productTitle`
  * (already threaded by every caller of this function) is folded into the
  * allowed label text precisely so a quote about THIS product's own
  * garment type ("tee"/"shirt" on a tee ad) still passes; only a mismatch
- * is dropped. Never mutates quote objects.
+ * is dropped. A quote implying ONE specific pair-sold item without naming
+ * it ("two pairs of these") is refused unconditionally instead (case 4) —
+ * that one never gets a chance to match `opts.productTitle` at all, even
+ * when the scope genuinely is that item. Never mutates quote objects.
  */
 function selectBrandQuotesForScope(quotes, opts = {}) {
   const list = Array.isArray(quotes) ? quotes : [];
@@ -557,6 +640,7 @@ module.exports = {
   isPrintableCustomerQuote,
   PRODUCT_NOUNS,
   NOUN_SYNONYM_GROUPS,
+  impliesPairSoldItem,
   QUOTE_SCOPE_MEDIA_SELECT,
   quoteProvenanceStrictEnabled,
   productNounsIn,
