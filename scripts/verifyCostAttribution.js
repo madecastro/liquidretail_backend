@@ -100,6 +100,36 @@ function captureMeta(block, stageMarker) {
   return modelIdx > ci ? block.slice(ci, modelIdx) : null;
 }
 
+// Capture a call's argument-object body by its bare "fnName({" marker,
+// brace-balanced to the TRUE matching "}" — independent of what precedes the
+// call (a sequential "x = await fn(" vs a bare array element inside
+// Promise.all) or what follows the closing paren ("});" vs "})," vs "})").
+// A literal-text anchor bounded by a hardcoded "});" breaks the moment a
+// refactor moves the call into a different syntactic position (2026-08-31:
+// generateForAd's refreshStaleLayoutInput/buildReferenceImages calls moved
+// from sequential "x = await fn({...});" into a Promise.all array — no "="
+// precedes either call any more, and they close with "})," / "})", never
+// "});"). `marker` must end in "({" — the object literal's opening brace is
+// its last character. Returns the text strictly BETWEEN the outer braces
+// (not including them), or null if the marker isn't found or the braces
+// never balance before EOF.
+function captureCallArgs(block, marker) {
+  if (!block) return null;
+  const ci = block.indexOf(marker);
+  if (ci < 0) return null;
+  const openIdx = ci + marker.length - 1;
+  if (block[openIdx] !== '{') return null;
+  let depth = 0;
+  for (let i = openIdx; i < block.length; i++) {
+    if (block[i] === '{') depth++;
+    else if (block[i] === '}') {
+      depth--;
+      if (depth === 0) return block.slice(openIdx + 1, i);
+    }
+  }
+  return null;
+}
+
 const ATTR_FIELDS = ['brandId', 'productId', 'adId', 'campaignRunId'];
 function hasAllAttrFields(block) {
   return !!block && ATTR_FIELDS.every(f => new RegExp(`\\b${f}\\b`).test(block));
@@ -336,17 +366,15 @@ console.log('\nCOST ATTRIBUTION — six 2026-08-24 stages carry brand/product/ad
     })());
   check('7k generateForAd\'s refreshStaleLayoutInput call DOES pass campaignRunId',
     (() => {
-      const ci = gfaBlock.indexOf('layoutInput = await refreshStaleLayoutInput({');
-      if (ci < 0) return false;
-      const call = gfaBlock.slice(ci, gfaBlock.indexOf('});', ci));
+      const call = captureCallArgs(gfaBlock, 'refreshStaleLayoutInput({');
+      if (call == null) return false;
       return /,\s*campaignRunId\s*$/.test(call.trim());
     })());
 
   check('7l generateForAd\'s buildReferenceImages call threads real ad/media-derived attribution',
     (() => {
-      const ci = gfaBlock.indexOf('const imageUrls = await buildReferenceImages({');
-      if (ci < 0) return false;
-      const call = gfaBlock.slice(ci, gfaBlock.indexOf('});', ci));
+      const call = captureCallArgs(gfaBlock, 'buildReferenceImages({');
+      if (call == null) return false;
       return /brandId:\s*ad\.brandId \|\| media\.brandId \|\| null/.test(call)
         && /adId:\s*ad\._id \|\| null/.test(call)
         && /campaignRunId:\s*campaignRunId \|\| null/.test(call);
