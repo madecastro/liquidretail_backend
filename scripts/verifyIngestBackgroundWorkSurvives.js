@@ -154,12 +154,32 @@ check('B4: apifyIngestService.js forwards both rate-limit flags onto out.shopify
 // All three are now converted to the same shape and pinned here:
 //
 //   C. catalogSyncService.js#syncCatalogForCred — the Meta / IG-Commerce
-//      OAuth path. TWO triggers (enrichment + category inference).
+//      OAuth path. THREE triggers (enrichment + materialize/YOLO-detect
+//      chain + category inference).
 //   D. genericCatalogIngestService.js#syncBrandGenericCatalog — the
-//      XML-sitemap + JSON-LD path for non-Shopify stores. TWO triggers.
+//      XML-sitemap + JSON-LD path for non-Shopify stores. THREE triggers
+//      (same three as C).
 //   E. apifyIngestService.js#syncBrandShopify — the LEGACY `apify` method
 //      path (distinct from the shopify-direct and IG paths already fixed).
-//      ONE trigger.
+//      TWO triggers (enrichment + materialize/YOLO-detect chain — this
+//      legacy path has no category-inference trigger).
+//
+//   The materialize/YOLO-detect chain (catalogMediaMaterializeService +
+//   catalogYoloDetectionService, both idempotent — see their own headers)
+//   was added to ALL FOUR sync paths (catalog-sync, shopify-public, apify,
+//   generic) by a later commit — bb91303c "feat(catalog): ingest-time
+//   YOLO detection + materialize peer to enrichment" — landed AFTER this
+//   harness's Group C/D/E were written against PR #235's two/two/one
+//   trigger counts. It is a genuine new, non-duplicate background task —
+//   it populates Media.refinedProducts[] for reframe / videoProductAnchor
+//   / pmaxSplitStrategy / quoteProvenance so ad-gen can skip the paid
+//   nano-banana outpaint, something neither the enrichment nor the
+//   category-inference trigger touches — chained after the existing
+//   enrichment push in each path, per that commit's own message.
+//   shopifyPublicIngestService.js (Groups A/F) was never pinned to an
+//   EXACT trigger count, so it did not go red when the new chain landed;
+//   C/D/E were pinned to exact counts and did. The counts below (3/3/2)
+//   are corrected to match the current, intentional shape.
 //
 // "No setImmediate" is asserted against COMMENT-STRIPPED source, because
 // every one of these call sites now carries a ROBUSTNESS comment that
@@ -207,7 +227,7 @@ check('C1: syncCatalogForCred\'s end-of-run triggers contain no setImmediate COD
   assert.ok(r.includes('backgroundWork.push('), 'the triggers must collect their promises for the caller to await');
 });
 
-check('C2: BOTH catalogSyncService triggers are collected (enrichment AND category inference)', () => {
+check('C2: ALL THREE catalogSyncService triggers are collected (enrichment, materialize+YOLO-detect chain, category inference)', () => {
   const r = region(
     catalogSyncSrc,
     '  const backgroundWork = [];\n\n  // Eager review + commerce enrichment',
@@ -215,10 +235,16 @@ check('C2: BOTH catalogSyncService triggers are collected (enrichment AND catego
     'C2'
   );
   assert.ok(r.includes("require('./catalogProductEnrichmentService')"), 'enrichment trigger missing from the collected region');
+  assert.ok(
+    r.includes("require('./catalogMediaMaterializeService')") && r.includes("require('./catalogYoloDetectionService')"),
+    'materialize+YOLO-detect chain missing from the collected region (added bb91303c, feat(catalog): ingest-time YOLO detection + materialize peer to enrichment)'
+  );
   assert.ok(r.includes("require('./productCategoryInferenceService')"), 'category-inference trigger missing from the collected region');
-  // Exactly two pushes — a third would mean an uncollected trigger crept in
-  // or one was duplicated.
-  assert.equal((r.match(/backgroundWork\.push\(/g) || []).length, 2, 'expected exactly 2 collected triggers in syncCatalogForCred');
+  // Exactly three pushes: enrichment, the materialize+YOLO-detect chain
+  // (one push wrapping two chained awaits), and category inference. A
+  // fourth would mean an uncollected trigger crept in or one was
+  // duplicated.
+  assert.equal((r.match(/backgroundWork\.push\(/g) || []).length, 3, 'expected exactly 3 collected triggers in syncCatalogForCred');
 });
 
 check('C3: syncCatalogForCred returns backgroundWork on its result object', () => {
@@ -256,16 +282,23 @@ check('C5: the sync-catalog HTTP route strips backgroundWork before res.json', (
 
 // ── Group D: genericCatalogIngestService.js (sitemap + JSON-LD path) ─────
 
-check('D1: syncBrandGenericCatalog\'s end-of-run trio contains no setImmediate CODE', () => {
+check('D1: syncBrandGenericCatalog\'s end-of-run triggers contain no setImmediate CODE', () => {
   const r = region(
     genericSrc,
     '  const backgroundWork = [];\n  if (!cancelled) {',
     '  const durationMs = Date.now() - t0;',
     'D1'
   );
-  assert.ok(!stripComments(r).includes('setImmediate('), 'the end-of-run trio must not defer via setImmediate — see the ROBUSTNESS comment');
-  assert.equal((r.match(/backgroundWork\.push\(/g) || []).length, 2, 'expected exactly 2 collected triggers (enrichment + category inference)');
+  assert.ok(!stripComments(r).includes('setImmediate('), 'the end-of-run triggers must not defer via setImmediate — see the ROBUSTNESS comment');
+  assert.equal(
+    (r.match(/backgroundWork\.push\(/g) || []).length, 3,
+    'expected exactly 3 collected triggers (enrichment + materialize/YOLO-detect chain + category inference)'
+  );
   assert.ok(r.includes("require('./catalogProductEnrichmentService')"), 'enrichment trigger missing from the collected region');
+  assert.ok(
+    r.includes("require('./catalogMediaMaterializeService')") && r.includes("require('./catalogYoloDetectionService')"),
+    'materialize+YOLO-detect chain missing from the collected region (added bb91303c)'
+  );
   assert.ok(r.includes("require('./productCategoryInferenceService')"), 'category-inference trigger missing from the collected region');
 });
 
@@ -290,16 +323,23 @@ check('D4: apifyIngestService forwards genericCatalogIngestService\'s background
 
 // ── Group E: apifyIngestService.js legacy syncBrandShopify (`apify`) ─────
 
-check('E1: legacy syncBrandShopify\'s enrichment trigger contains no setImmediate CODE', () => {
+check('E1: legacy syncBrandShopify\'s background triggers contain no setImmediate CODE', () => {
   const r = region(
     apifySrc,
     '  const backgroundWork = [];\n  if (!summary.aborted',
     '  summary.durationMs = Date.now() - t0;',
     'E1'
   );
-  assert.ok(!stripComments(r).includes('setImmediate('), 'the legacy path\'s enrichment trigger must not defer via setImmediate — see the ROBUSTNESS comment');
-  assert.equal((r.match(/backgroundWork\.push\(/g) || []).length, 1, 'expected exactly 1 collected trigger (catalog enrichment)');
+  assert.ok(!stripComments(r).includes('setImmediate('), 'the legacy path\'s background triggers must not defer via setImmediate — see the ROBUSTNESS comment');
+  assert.equal(
+    (r.match(/backgroundWork\.push\(/g) || []).length, 2,
+    'expected exactly 2 collected triggers (catalog enrichment + materialize/YOLO-detect chain)'
+  );
   assert.ok(r.includes("require('./catalogProductEnrichmentService')"), 'enrichment trigger missing from the collected region');
+  assert.ok(
+    r.includes("require('./catalogMediaMaterializeService')") && r.includes("require('./catalogYoloDetectionService')"),
+    'materialize+YOLO-detect chain missing from the collected region (added bb91303c) — this legacy path has no category-inference trigger'
+  );
 });
 
 check('E2: legacy syncBrandShopify exposes backgroundWork on its summary', () => {
