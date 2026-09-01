@@ -368,6 +368,49 @@ mongoose.connect(process.env.MONGODB_URI, {
     console.log(`🎯 catalog YOLO backfill: every ${yoloBackfillIntervalMin}m (batch=${yoloBackfillBatchSize})`);
   }
 
+  // Catalog post-sync chain RECONCILE — recovery for brands whose
+  // sync-time materialize+yolo chain didn't complete (SIGTERM mid-work,
+  // downstream service outage, silent Cloudinary rate-limit).
+  //
+  // Distinct from yoloBackfillTick above: THIS tick reconciles at the
+  // BRAND level (re-fires the whole chain via runPostSyncChain), while
+  // yoloBackfillTick only fills gaps at the MEDIA level (per-Media
+  // detectYoloForMedia). Both are needed — the yolo backfill handles
+  // Media-level drift, this handles chain-level failures that also
+  // left materialize incomplete.
+  //
+  // Discovered 2026-09-01 while inspecting Pelagic Gear 4 Demos:
+  // 0/53 catalog Media had yoloDetectedAt stamped because the sync
+  // fired during the yolo microservice's WORKER TIMEOUT loop, and
+  // the old fire-and-forget try/try block silently swallowed every
+  // failure. See services/catalogPostSyncOrchestrator.js header.
+  const POST_SYNC_RECONCILE_ENABLED = String(process.env.POST_SYNC_RECONCILE_ENABLED ?? 'true').toLowerCase() !== 'false';
+  if (!POST_SYNC_RECONCILE_ENABLED) {
+    console.log('🔗 post-sync reconcile: disabled (POST_SYNC_RECONCILE_ENABLED=false)');
+  } else {
+    const postSyncIntervalMin  = Math.max(1, parseInt(process.env.POST_SYNC_RECONCILE_INTERVAL_MIN, 10) || 30);
+    const postSyncBatchSize    = Math.max(1, parseInt(process.env.POST_SYNC_RECONCILE_BATCH_SIZE, 10) || 5);
+    const postSyncStaleMinutes = Math.max(1, parseInt(process.env.POST_SYNC_RECONCILE_STALE_MIN, 10) || 30);
+    const postSyncReconcileTick = async () => {
+      if (!housekeepingLease.holds()) return;
+      try {
+        const { sweepIncompleteBrands } = require('./services/catalogPostSyncOrchestrator');
+        await sweepIncompleteBrands({
+          batchSize:    postSyncBatchSize,
+          staleMinutes: postSyncStaleMinutes
+        });
+      } catch (err) {
+        console.warn(`⚠️  post-sync reconcile tick failed: ${err.message}`);
+      }
+    };
+    // First fire delayed 3min so a fresh boot doesn't race with in-flight
+    // sync-triggered runs. Same shape as yoloBackfillTick's 90s delay,
+    // scaled to the longer interval.
+    setTimeout(postSyncReconcileTick, 3 * 60 * 1000);
+    setInterval(postSyncReconcileTick, postSyncIntervalMin * 60 * 1000);
+    console.log(`🔗 post-sync reconcile: every ${postSyncIntervalMin}m (batch=${postSyncBatchSize}, stale=${postSyncStaleMinutes}m)`);
+  }
+
   // QC-insights aggregation — never renders, never submits. Reads
   // Ad.visionQc verdicts and writes QcInsightsReport. Leader-gated with
   // the rest of worker housekeeping.

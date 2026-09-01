@@ -484,22 +484,15 @@ async function syncBrandGenericCatalog(brand, run, { isBrandAborted, categories 
         .catch(err => console.warn(`   ⚠️  ${LOG}  catalog enrichment enqueue failed: ${err.message}`))
     );
 
-    // Materialize + YOLO detect chain. Populates Media.refinedProducts[] so
-    // reframe / videoProductAnchor / pmaxSplitStrategy / quoteProvenance find
-    // subject bboxes at ad-gen time and skip the paid nano-banana outpaint.
-    // See services/catalogYoloDetectionService.js header for the full flow.
-    backgroundWork.push((async () => {
-      try {
-        await require('./catalogMediaMaterializeService').ensureBrandCatalogMediaMaterialized(brand._id);
-      } catch (err) {
-        console.warn(`   ⚠️  ${LOG}  catalog media materialize failed: ${err.message}`);
-      }
-      try {
-        await require('./catalogYoloDetectionService').enqueueBrandProductYoloDetection(brand._id);
-      } catch (err) {
-        console.warn(`   ⚠️  ${LOG}  catalog YOLO detect enqueue failed: ${err.message}`);
-      }
-    })());
+    // Materialize + YOLO detect chain via the resilient orchestrator.
+    // Wraps both phases in OperationRun(kind='catalog-post-sync') so a
+    // transient failure (SIGTERM mid-work, yolo microservice outage,
+    // Cloudinary rate-limit) leaves a persistent signal that worker.js
+    // postSyncReconcileTick can retry. See catalogPostSyncOrchestrator.js
+    // header for why the inline try/try version silently stranded brands.
+    backgroundWork.push(
+      require('./catalogPostSyncOrchestrator').runPostSyncChain(brand._id, { trigger: 'sync' })
+    );
 
     backgroundWork.push((async () => {
       let catRun = null;

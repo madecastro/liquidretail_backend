@@ -439,20 +439,13 @@ async function syncCatalogForCred(cred, run = null) {
   // fires. Without this, reframe falls to paid nano-banana outpaint (~$0.08
   // + 54s per master) at render time. Chained (materialize before YOLO)
   // because YOLO detection reads Media docs that materialize creates.
-  // Fire-and-forget from sync-response POV; wrapped in backgroundWork so
-  // the OperationRun watchdog tracks it.
-  backgroundWork.push((async () => {
-    try {
-      await require('./catalogMediaMaterializeService').ensureBrandCatalogMediaMaterialized(brandId);
-    } catch (err) {
-      console.warn(`   ⚠️  catalog media materialize failed: ${err.message}`);
-    }
-    try {
-      await require('./catalogYoloDetectionService').enqueueBrandProductYoloDetection(brandId);
-    } catch (err) {
-      console.warn(`   ⚠️  catalog YOLO detect enqueue failed: ${err.message}`);
-    }
-  })());
+  // Fire-and-forget from sync-response POV via runPostSyncChain, which
+  // wraps both phases in OperationRun(kind='catalog-post-sync') so the
+  // reconcile tick can retry on failure. See catalogPostSyncOrchestrator.js
+  // header for why the old inline try/try version silently stranded brands.
+  backgroundWork.push(
+    require('./catalogPostSyncOrchestrator').runPostSyncChain(brandId, { trigger: 'sync' })
+  );
 
   // JSON-LD category inference. Scrapes each product's productUrl for
   // BreadcrumbList structured data and builds the Category tree from
