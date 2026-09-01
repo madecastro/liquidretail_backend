@@ -1855,7 +1855,7 @@ async function runRenderLoop(run, job, adIds, renderToken) {
     );
     await CampaignRun.updateOne(
       { _id: run._id, status: 'preparing' },
-      { $set: { status: 'running', startedAt: run.startedAt || new Date(), updatedAt: new Date() } }
+      { $set: { status: 'running', updatedAt: new Date() } }
     ).catch((err) => console.error(`⚠️  [campaignRun ${run.runId}] ADGEN handoff: preparing→running flip failed: ${err.message}`));
     return;
   }
