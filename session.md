@@ -14,10 +14,10 @@ it clears it back to this placeholder.)_
 
 ## CURRENT STATE
 
-*(Replaced 2026-08-31 late. adgen trunk `master` @ `9cc9b6f` (#98) — renderer + titler both
-confirmed Live. Backend trunk `main` @ `f9efb43` — web + worker both Live.)*
+*(Replaced 2026-08-31 late. adgen trunk `master` @ `7a545a3` (#101) — renderer + titler both
+confirmed Live. Backend trunk `main` @ `55c1709` (#369) — web + worker both Live.)*
 
-**FIVE THINGS SHIPPED AND DEPLOYED TODAY.** All merged and live in production:
+**SIX THINGS SHIPPED AND DEPLOYED TODAY.** All merged and live in production:
 
 1. **Title TEXT-ON-TEXT fixed** (adgen #97 → backend #361). Delivered vertical ads printed the
    headline and the productName/rating stack on top of each other. Cause: `resolveGroupAnchor`
@@ -51,6 +51,32 @@ confirmed Live. Backend trunk `main` @ `f9efb43` — web + worker both Live.)*
    REAL font files from a shop's theme (proven live: 5 Inter .woff2 off Peloton Apparel), authed +
    public, gated only on a shopifyUrl — NOT on ingest method. The latter reports every ingest stage
    with counts, per-stage and total timings, and the method, as one Slack message edited in place.
+
+6. **Brand-tier quote can't attribute an implicit-SKU review to the wrong product** (adgen #101 →
+   backend #369). Ad `6a9600196c6bffaf965a99e9` (product "Rusted Icon", a T-Shirt, brand "Pelagic
+   Gear 4 Demos") printed a brand-pool testimonial — "I've got two pairs of these and they fit
+   great..." — that is a genuine review of a DIFFERENT product in the same catalog ("Flyline Stretch
+   Pant", pants). Root cause: `quoteAllowedForScope`'s (`services/quoteProvenance.js`) noun-scope
+   gate only rejects a brand-tier quote that EXPLICITLY names the wrong garment; this quote names
+   none ("pairs"/"these" aren't tracked nouns), so it was treated as brand-generic and allowed onto
+   any product. Fix: a quote implying one specific pair-sold item ("N pairs of these/them/those/it")
+   is now dropped from the brand tier UNCONDITIONALLY — never matched back against the ad's own
+   scope labels. Two earlier draft designs that DID try to match back were adversarially reviewed
+   (Grok, high effort, two independent passes) and found exploitable: a secondary detected label in
+   the same photo, and the pre-existing `fromLabel` "short"→"shorts" recovery, which ANY "Short
+   Sleeve" title satisfied and needed its own match-local (not whole-string) fix. The genuinely
+   matching product still gets the review via its own product-tier pool, which bypasses this gate
+   entirely — only the brand-wide last-resort guess is closed. Companion producer-side fix:
+   `lookupBrandReviews`'s Gemini prompt (`services/providers/geminiSearchProvider.js`) now explicitly
+   asks for brand-wide-only statements, naming this exact pattern as an exclusion example — that
+   provider is BACKEND-live (adgen's copy is a documented, deliberately-unwired vendor fork), so the
+   backend port is what actually changes future quote harvests. Pinned by
+   `scripts/verifyQuoteScopeImplicitPairs.js` (39 checks, structural revert-proves against the
+   shipped source, not stub reimplementations). While landing this, discovered ANOTHER concurrent
+   Claude session had reset `liquidretail_backend` to `origin/main` mid-edit, silently wiping the
+   first attempt at the backend-side port before it was ever committed — recovered cleanly (adgen
+   was never touched; the other session's own stashed WIP was left fully intact) but worth knowing
+   this repo's working tree is not safe to leave uncommitted for long right now.
 
 **MEASUREMENTS THAT OVERTURNED DELEGATED CLAIMS — verify numbers before acting on them.** Two
 adversarial reviews produced headline figures that did not survive re-measurement:
