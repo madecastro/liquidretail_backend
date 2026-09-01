@@ -17,7 +17,7 @@ import { useBrandFonts } from '../components/FontLoader.jsx';
 import { SLOT_RENDERERS, baseSize } from '../components/slotRenderers.jsx';
 import { slotEnvelope, slotProgress, specTimeScale } from '../lib/timing.js';
 import { stackContainerStyle, panelColumnStyle, resolveSafeZone, resolveSafeZoneKey } from '../lib/safeZones.js';
-import { contrastToken } from '../lib/tokens.js';
+import { contrastToken, containerStrokeBleedGuard } from '../lib/tokens.js';
 import { resolveSlotContent } from '../lib/slotContent.js';
 import { decideInkOnLight, worstCaseInkForBand, usesWorstCaseInk } from '../lib/plateHints.js';
 import { estimateSlotHeightPx, planGroupFit } from '../lib/stackFit.js';
@@ -619,7 +619,22 @@ export const Canonical = ({ format = 'feed', safeZoneKey = null, platformFormat 
           : { scale: 1, dropReviewsRowId: null, droppedRowIds: new Set() };
 
         return (
-          <div key={`${group.phase}|${group.anchor}`} style={{ ...placed, gap: rowGapPx }}>
+          <div
+            key={`${group.phase}|${group.anchor}`}
+            style={{
+              ...placed,
+              // Fixes a SECOND clip boundary the stroke work missed: the
+              // group's own overflow:hidden sits flush against an align:'left'/
+              // 'right' slot's edge, so it can clip the contour's outward bleed
+              // even though strokeClipGuard already fixed the TEXT element's
+              // own clipping. See containerStrokeBleedGuard in tokens.js for
+              // the full mechanism + measurement. Horizontal-only, so the
+              // documented vertical floor guard is untouched. {} when no slot
+              // in this group has an active stroke — byte-identical then.
+              ...containerStrokeBleedGuard(!!escalationInk?.marginal),
+              gap: rowGapPx,
+            }}
+          >
             {rows.map((row, ri) => {
               const rowId = `row-${ri}`;
               // Whole-row drop (stackFit.js step 3) — never a partial row.

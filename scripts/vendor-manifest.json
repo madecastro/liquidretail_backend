@@ -2,7 +2,7 @@
   "version": 2,
   "backendRef": "origin/main",
   "backendHead": "f9efb439b58f2bc5e8936868a1dd4308d58e84f5",
-  "generatedAt": "2026-08-31T23:20:25.223Z",
+  "generatedAt": "2026-09-01T00:23:46.824Z",
   "files": {
     "models/Ad.js": {
       "backendHash": "394d26a1cb8ad64b23bde73312f3473f332520dd9640b9d5e4bb8eec22d6138d",
@@ -306,10 +306,10 @@
     },
     "remotion/compositions/Canonical.jsx": {
       "backendHash": "5d651e994a55f2e0122f60ea0a78a631c77ce91adfdf878c8b8a0b79435978ef",
-      "adgenHash": "91fa9b8de3c8cdd7495c893f12ca5ed9d0b9cba145854a3898ec32f7da345bca",
+      "adgenHash": "1ed03acb6083629a35c0451f0c1c82f86cdc1db53e5fab0515a5ec861b888865",
       "backendSha": "119b668472c4dffbdb63c3d3dc588a16b9573103",
       "status": "unported",
-      "reason": "2026-08-31 low-contrast title legibility (adgen PR #98): contrast-aware band selection in resolveGroupAnchor; a paint-order:stroke-fill contour + weight bump gated on worst-case sub-AA contrast; strokeClipGuard so the contour is not clipped by its own overflow:hidden; BadgeSlot given the shadow+contour it never had after its pill was removed; RatingSlot's hardcoded 700/500 weights now honour the treatment; social-proof size bumps. Backend renders these same presets and slot renderers through its own brandScriptExecutor / title-still preview path, so it needs the same fix.",
+      "reason": "PR #98 follow-up hotfix: containerStrokeBleedGuard fixes a second, outer overflow:hidden clip boundary (stackContainerStyle's group container) that strokeClipGuard's inner fix did not cover — align:left/right slots on non-center anchors were silently clipping the new contour stroke's outward bleed. Backend renders the same Canonical.jsx through its title-still preview path and needs the same fix.",
       "portTo": "backend",
       "owedSince": "2026-08-31T23:20:03.277Z"
     },
@@ -380,10 +380,10 @@
     },
     "remotion/lib/tokens.js": {
       "backendHash": "fe2fecac71cca8d9301a1e6af108fdc6589be4a5aefdfbc8243eb5050c09a8ba",
-      "adgenHash": "15aebc71db287446a7dcb4b2cac004972b037ca76b10b87f0052436d4735c950",
+      "adgenHash": "b17b5a35eef24d6ba7635083f09418cf2c2ca3c90c853430f4e0018b67a4d388",
       "backendSha": "4a408819daea8628ae476fd1cbe1bc73fd042cca",
       "status": "unported",
-      "reason": "2026-08-31 low-contrast title legibility (adgen PR #98): contrast-aware band selection in resolveGroupAnchor; a paint-order:stroke-fill contour + weight bump gated on worst-case sub-AA contrast; strokeClipGuard so the contour is not clipped by its own overflow:hidden; BadgeSlot given the shadow+contour it never had after its pill was removed; RatingSlot's hardcoded 700/500 weights now honour the treatment; social-proof size bumps. Backend renders these same presets and slot renderers through its own brandScriptExecutor / title-still preview path, so it needs the same fix.",
+      "reason": "PR #98 follow-up hotfix: adds containerStrokeBleedGuard (new export) alongside textStrokeStyle/strokeClipGuard — reserves horizontal padding on the group container so the contour stroke's outward bleed is not clipped by stackContainerStyle's own overflow:hidden. Backend needs the same helper for its title-still preview path.",
       "portTo": "backend",
       "owedSince": "2026-08-31T23:20:10.681Z"
     },

@@ -233,6 +233,73 @@ export function strokeClipGuard(enabled, fontPx) {
   return { padding: `${px}px`, margin: `-${px}px`, boxSizing: 'border-box' };
 }
 
+/**
+ * Horizontal padding on the GROUP CONTAINER (Canonical.jsx's `stackContainerStyle`
+ * box) so a contour stroke's outward bleed is not clipped by THAT box's OWN
+ * `overflow:hidden` — a SECOND, OUTER clipping boundary, separate from the one
+ * `strokeClipGuard` fixes above.
+ *
+ * WHY THIS EXISTS (found on retroactive review of the stroke feature, then
+ * MEASURED, not theorised — 2026-08-31, same method as strokeClipGuard's own
+ * proof: identical CSS in production vs. an `overflow:visible` control on the
+ * real chrome-headless-shell binary Remotion renders with). `strokeClipGuard`
+ * reserves room inside the TEXT element's own box so its own line-clamp
+ * `overflow:hidden` does not shave the stroke. But `stackContainerStyle`
+ * (safeZones.js) ALSO sets `overflow:hidden` on the GROUP box, for every anchor
+ * except `center` — and an `align:'left'`/`align:'right'` slot renders flush
+ * against that group box's own edge with ZERO gap (`alignSelf:'flex-start'`/
+ * `'flex-end'`, no margin). `strokeClipGuard`'s padding+negative-margin trick
+ * deliberately leaves the flex item's occupied space (margin-box) UNCHANGED —
+ * that is what keeps sibling layout from shifting — which means it cannot, by
+ * construction, push this SECOND boundary outward. Measured on a real render
+ * (headline, `upperThird`, `align:'left'`, marginal contrast, stroke active):
+ * production (group `overflow:hidden` in place) clips the contour to a flat
+ * background at the group's left edge; an identical render with only that one
+ * `overflow` value flipped to `visible` shows the same contour's anti-aliased
+ * bleed extending ~3-4px further left, confirming the group boundary — not
+ * just the text element's own — was eating real, already-painted pixels.
+ *
+ * FIX: the same padding+negative-margin+border-box trick, one level up. Per
+ * the same box-model identity strokeClipGuard relies on (padding P and margin
+ * -P cancel in the CONTENT-width equation regardless of what determines that
+ * width — here `stackContainerStyle`'s own `left`/`right` position offsets,
+ * not shrink-to-fit), the group's CONTENT width (and therefore every
+ * safe-zone-derived measurement taken from it — `deriveCharCap`'s
+ * `usableWidthPx`, the panel column math, etc.) is UNCHANGED. Only the
+ * `overflow:hidden` PADDING-BOX — what the clip actually measures against —
+ * moves outward, borrowing a few px from the safe-zone margin outside it
+ * (generous: 6-15% of frame width) rather than from the group's own content.
+ *
+ * Deliberately HORIZONTAL ONLY (`paddingLeft`/`paddingRight`, not top/bottom):
+ * the vertical `overflow:hidden` on `top`/`upperThird`/`lowerThird`/`bottom` is
+ * a documented, load-bearing safety net against platform UI overlap (see
+ * `stackContainerStyle`'s "THE FLOOR" comment) — unrelated to this stroke bleed
+ * and not to be loosened by it.
+ *
+ * Uses the WORST-CASE stroke width (`STROKE_WIDTH_MAX_PX`), not a per-slot
+ * value: this runs before the group's slots are resolved (before per-slot
+ * `fontPx` is known), and the safe-zone margin it borrows from is large enough
+ * that reserving the max (3px) rather than the exact value costs nothing
+ * observable. Gate on whether ANY slot in the group could have an active
+ * stroke (i.e. the same `escalationInk.marginal` check Canonical.jsx already
+ * makes) — applying it when no stroke is active, or to a `center`-anchored
+ * group with no clip boundary at all, is a harmless no-op (content width is
+ * unchanged either way), so no extra branching on anchor/align is needed here.
+ *
+ * Returns {} when disabled, so every existing group is byte-identical.
+ */
+export function containerStrokeBleedGuard(enabled) {
+  if (!enabled) return {};
+  const px = STROKE_WIDTH_MAX_PX;
+  return {
+    paddingLeft: `${px}px`,
+    paddingRight: `${px}px`,
+    marginLeft: `-${px}px`,
+    marginRight: `-${px}px`,
+    boxSizing: 'border-box',
+  };
+}
+
 export const BOX_SHADOWS = {
   layered: '0 2px 6px rgba(0,0,0,0.25), 0 12px 36px rgba(0,0,0,0.28)',
   soft: '0 4px 14px rgba(0,0,0,0.20)',
