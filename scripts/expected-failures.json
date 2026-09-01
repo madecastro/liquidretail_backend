@@ -15,10 +15,5 @@
     "",
     "Every entry needs a reason someone can act on. 'flaky' is not a reason."
   ],
-  "expectedFailures": {
-    "verifyIngestBackgroundWorkSurvives.js": {
-      "reason": "18/21 checks pass. C2, D1, and E1 each collect one MORE background-work trigger than the harness expects (3 vs 2 in catalogSyncService and syncBrandGenericCatalog, 2 vs 1 in the legacy syncBrandShopify path) — an extra trigger site that has not yet been reconciled against the harness's expected counts.",
-      "removeWhen": "the extra collected trigger in each of C2/D1/E1 is investigated and either the code is de-duplicated or the harness's expected count is corrected to match an intentional extra trigger — delete this entry in the same commit."
-    }
-  }
+  "expectedFailures": {}
 }
