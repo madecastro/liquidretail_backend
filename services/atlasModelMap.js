@@ -174,31 +174,33 @@ const MAP = Object.freeze({
   // line away and deliberately NOT added: the owner named a three-link order,
   // and every extra link raises the worst-case paid-attempt count.
   'director':         {
-    // ANTHROPIC DIRECT TWIN TEMPORARILY DISABLED (2026-08-25).
-    // Reason: no ANTHROPIC_API_KEY on either Render service (WEB
-    // srv-d1vuktqli9vc73ft07ng: 24 vars, WORKER srv-d8128c1o3t8c73e8kb30:
-    // 15 vars, no anthropic among them). Every Director round was logging
-    // TWO `[LLM_AUTH_MISSING] role=director provider=anthropic` lines
-    // before advancing to the next Atlas link — pure log noise, no
-    // functional effect (the transport skips a keyless direct twin for
-    // free, 0.0s, no request). Silencing the noise so the real signals
-    // (Atlas 429s, chain advancement) stand out.
+    // ANTHROPIC DIRECT TWINS RESTORED (2026-08-31, PR #369-adjacent
+    // director-fallback fix). The 2026-08-25 `direct: null` change below
+    // (kept here, struck through in spirit, for the record) silenced the
+    // per-round `[LLM_AUTH_MISSING] role=director provider=anthropic` log
+    // lines by skipping the transport's named-skip branch ENTIRELY —
+    // `atlasLlmService.js`'s `if (direct && !directKey)` guard never runs
+    // when `direct` is null, so the skip stopped being RECORDED, not just
+    // quiet. That is the identical shape of hole the 2026-08-18 outage
+    // exposed (a configured-but-unreachable fallback failing silently),
+    // reintroduced by the noise fix and caught by
+    // scripts/verifyDirectorFallbackChain.js E5. Restored to named,
+    // coded skips: still zero live Anthropic HTTP calls (DIRECT_KEYS in
+    // atlasLlmService.js has no `anthropic:` entry, so `directKey` is
+    // always undefined for this provider — adding a real key there is a
+    // SEPARATE follow-up, gated on ANTHROPIC_API_KEY landing on Render,
+    // tracked in docs/turn-on-anthropic-direct.md, and deliberately not
+    // done here). The 24-lines-per-run log volume this reintroduces is
+    // the intended trade: a recorded, actionable skip beats an invisible
+    // one — see verifyDirectorFallbackChain.js E5's own assertion text.
     //
-    // ⚠️ TURN BACK ON WHEN ANTHROPIC_API_KEY LANDS on Render env.
-    //    Replace the two `direct: null` entries below with the twins
-    //    (still preserved verbatim in the comment block above each) and
-    //    delete this note. See docs/turn-on-anthropic-direct.md for the
-    //    exact restoration steps + expected latency win (~50s per
-    //    Director round in the current Atlas-Anthropic-starved state).
-    //
-    // The OpenAI direct twin on the terra link is UNTOUCHED — that one
-    // has a key on Render (OPENAI_API_KEY is set) and is a real fallback.
-    atlas: 'anthropic/claude-sonnet-5', direct: null,
+    // The OpenAI direct twin on the terra link is unaffected either way —
+    // it has a key on Render (OPENAI_API_KEY is set) and is a real
+    // fallback, not a named skip.
+    atlas: 'anthropic/claude-sonnet-5', direct: { provider: 'anthropic', model: 'claude-sonnet-5' },
     chain: [
-      // { atlas: 'anthropic/claude-sonnet-5', direct: { provider: 'anthropic', model: 'claude-sonnet-5' } },
-      { atlas: 'anthropic/claude-sonnet-5', direct: null },
-      // { atlas: 'anthropic/claude-opus-5',   direct: { provider: 'anthropic', model: 'claude-opus-5'   } },
-      { atlas: 'anthropic/claude-opus-5',   direct: null },
+      { atlas: 'anthropic/claude-sonnet-5', direct: { provider: 'anthropic', model: 'claude-sonnet-5' } },
+      { atlas: 'anthropic/claude-opus-5',   direct: { provider: 'anthropic', model: 'claude-opus-5'   } },
       { atlas: 'openai/gpt-5.6-terra',      direct: { provider: 'openai',    model: 'gpt-4.1'         } },
     ],
   },
