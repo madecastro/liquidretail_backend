@@ -92,6 +92,7 @@ const {
   statusPorcelain,
   branchesCheckedOutSomewhere,
   remoteRefExists,
+  remoteRefSha,
   runGit,
 } = require('./lib/gitAudit');
 
@@ -222,7 +223,7 @@ function performDelete(repoRoot, item, trunk, trunkRef, log) {
   }
 
   if (item.worktreePath) {
-    const r = runGit(repoRoot, ['worktree', 'remove', item.worktreePath]);
+    const r = runGit(repoRoot, ['worktree', 'remove', '--', item.worktreePath]);
     if (r.status === 0) {
       outcome.steps.push(`removed worktree ${item.worktreePath}`);
     } else {
@@ -234,21 +235,48 @@ function performDelete(repoRoot, item, trunk, trunkRef, log) {
   }
 
   const deleteFlag = item.mergeMethod === 'ancestor' ? '-d' : '-D';
-  const branchDel = runGit(repoRoot, ['branch', deleteFlag, item.branch]);
+  const branchDel = runGit(repoRoot, ['branch', deleteFlag, '--', item.branch]);
   if (branchDel.status === 0) {
     outcome.steps.push(`deleted local branch (git branch ${deleteFlag})`);
   } else {
     outcome.ok = false;
     outcome.steps.push(`FAILED to delete local branch: ${(branchDel.stderr || '').trim()}`);
+    // Adversarial-review finding (Grok, 2026-08-31): the remote delete used
+    // to run regardless of whether the local delete succeeded. If `-D`
+    // failed (e.g. a race — the branch got checked out in a brand-new
+    // worktree between the re-check above and this exact instant), the
+    // remote copy is the LAST place those commits are safe. Never delete it
+    // when we don't even know the local delete itself succeeded.
+    for (const s of outcome.steps) log(`  ${item.branch}: ${s}`);
+    return outcome;
   }
 
   if (item.remoteExists) {
-    const remoteDel = runGit(repoRoot, ['push', REMOTE, '--delete', item.branch]);
-    if (remoteDel.status === 0) {
-      outcome.steps.push(`deleted remote branch ${REMOTE}/${item.branch}`);
+    // Adversarial-review finding (Grok, 2026-08-31), P0: the old
+    // `git push origin --delete <branch>` only checked THAT origin/<branch>
+    // existed, never that it still pointed at the SHA we actually verified.
+    // If anyone (a teammate, another machine, another session) pushed NEW
+    // commits to that same-named remote branch after our own fetch/classify
+    // pass, a plain --delete would destroy them right along with the branch
+    // — reproduced directly against a real bare remote and a second clone
+    // pushing a new commit mid-run. `--force-with-lease` on a delete refuses
+    // if the remote has moved since the SHA we name, which is exactly the
+    // guarantee needed here: observe the CURRENT remote SHA as late as
+    // possible (right now, immediately before the push) and let git itself
+    // refuse the delete if it no longer matches.
+    const observedRemoteSha = remoteRefSha(repoRoot, REMOTE, item.branch);
+    if (!observedRemoteSha) {
+      outcome.steps.push(`remote ${REMOTE}/${item.branch} disappeared between the re-check and now — nothing to delete, treating as already gone`);
     } else {
-      outcome.ok = false;
-      outcome.steps.push(`FAILED to delete remote branch: ${(remoteDel.stderr || '').trim()}`);
+      const remoteDel = runGit(repoRoot, [
+        'push', `--force-with-lease=refs/heads/${item.branch}:${observedRemoteSha}`, REMOTE, '--delete', '--', item.branch,
+      ]);
+      if (remoteDel.status === 0) {
+        outcome.steps.push(`deleted remote branch ${REMOTE}/${item.branch} (lease-protected on ${observedRemoteSha.slice(0, 8)})`);
+      } else {
+        outcome.ok = false;
+        outcome.steps.push(`FAILED to delete remote branch (lease rejected — remote moved since we observed it): ${(remoteDel.stderr || '').trim()}`);
+      }
     }
   }
 
@@ -273,7 +301,19 @@ function main() {
     console.log(`Fetching ${REMOTE} (--prune) for an up-to-date view before classifying anything...`);
     const f = runGit(repoRoot, ['fetch', REMOTE, '--prune']);
     if (f.status !== 0) {
-      console.error(`cleanupMergedBranches: git fetch failed, continuing with possibly-stale remote-tracking refs:\n${(f.stderr || '').trim()}`);
+      // Adversarial-review finding (Grok, 2026-08-31), P2: continuing with
+      // stale remote-tracking refs under --apply is exactly how a remote
+      // that has moved (or a same-named branch someone pushed after our
+      // last successful fetch) gets misjudged as unpushed-nowhere or
+      // safely-mergeable when it is neither. A dry-run can tolerate a
+      // failed fetch (nothing gets deleted either way, and a stale-but-
+      // readable view is still useful information) — --apply cannot.
+      const msg = `cleanupMergedBranches: git fetch failed:\n${(f.stderr || '').trim()}`;
+      if (opts.apply) {
+        console.error(`${msg}\nRefusing to --apply against possibly-stale remote-tracking refs. Re-run once network/auth is fixed, or pass --no-fetch only if you accept that risk knowingly.`);
+        process.exit(2);
+      }
+      console.error(`${msg}\ncontinuing in dry-run mode with possibly-stale remote-tracking refs (nothing will be deleted).`);
     }
   }
 

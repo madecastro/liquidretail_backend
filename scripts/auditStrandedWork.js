@@ -354,8 +354,14 @@ function printHuman(report) {
     for (const w of f.lockedWorktrees) {
       let pidNote = '';
       if (w.pidCheck) {
+        // "alive" is best-effort and can false-positive on PID reuse (a dead
+        // process's PID handed to an unrelated new one) — that only ever
+        // makes this UNDER-report staleness (never auto-unlocked either
+        // way), so it is hedged rather than stated flatly. "dead" cannot
+        // false-positive the same way (a PID that fails ESRCH is not
+        // running, full stop), so that direction is stated plainly.
         pidNote = w.pidCheck.alive === true
-          ? `  [reason names pid ${w.pidCheck.pid} — still ALIVE]`
+          ? `  [reason names pid ${w.pidCheck.pid} — a process with that PID exists (could be the original, or an unrelated process that reused the PID)]`
           : w.pidCheck.alive === false
             ? `  [reason names pid ${w.pidCheck.pid} — DEAD, this lock is almost certainly stale]`
             : `  [reason names pid ${w.pidCheck.pid} — liveness unknown]`;
