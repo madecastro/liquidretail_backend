@@ -88,10 +88,17 @@ async function enqueueRematchForUnmatchedPosts({ brandId }) {
   const strongSet = new Set(strongMatchMediaIds.map(id => String(id)));
 
   // Source filter: only post-side Media (skip catalog-product, manual
-  // upload). source='instagram' covers every IG-ingested post; future
-  // platforms (TikTok, etc.) would be added here.
+  // upload). Two IG-ingest sources exist:
+  //   'instagram' — OAuth-connected real brands (routes/integrations,
+  //                 instagramIngestService)
+  //   'apify-ig'  — demo brands via Apify actor (apifyIngestService)
+  // Measured 2026-09-01 on Pelagic Gear 4 Demos: filtering on
+  // 'instagram' alone matched 0 of 30 post Media because every one
+  // was stored as 'apify-ig' — this bug silently disabled the paid
+  // re-detect phase for every demo brand. Future platforms (TikTok,
+  // etc.) would be added here.
   const candidateMedia = await Media.find({
-    brandId, source: 'instagram'
+    brandId, source: { $in: ['instagram', 'apify-ig'] }
   }).select('_id advertiserId brandId').lean();
 
   const targets = candidateMedia.filter(m => !strongSet.has(String(m._id))).slice(0, REMATCH_BATCH_LIMIT);

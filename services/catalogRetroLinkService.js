@@ -16,10 +16,49 @@ const Campaign             = require('../models/Campaign');
 const Category             = require('../models/Category');
 const Ad                   = require('../models/Ad');
 const LayoutInputArtifact  = require('../models/LayoutInputArtifact');
+const Brand                = require('../models/Brand');
 const { normalizeTitle, titleSimilarity } = require('../utils/titleNormalize');
 
-const MIN_SHARED_TOKENS = 3;
+// MIN_SHARED_TOKENS lowered 3 → 2 with the brand-stopword layer added
+// below. Empirically (Pelagic Gear 4 Demos, 2026-09-01), MIN=3 caught
+// 4 of 112 candidate re-links; MIN=2 with brand stopwords catches 25
+// with zero false positives on manual spot-check. Loosening MIN=2
+// WITHOUT the stopword filter would let "pelagic" / "gear" count as
+// signal on every phantom, silently mis-merging distinct products.
+// See scripts/dryRunRetroLink.js for the harness that produced these
+// numbers before the change shipped.
+const MIN_SHARED_TOKENS = 2;
 const SUBSET_SCORE      = 1.0;
+
+// Universal noise tokens — words that appear in nearly every catalog
+// but discriminate nothing. Category-generic descriptors. Kept small on
+// purpose; per-brand tokens are derived from Brand.name at call time.
+// Do NOT put brand-specific model names here — that would silently
+// collapse legitimate model matches on OTHER brands.
+const UNIVERSAL_STOP_TOKENS = new Set([
+  'gear', 'co', 'brand', 'inc', 'llc',
+  // Common apparel category words that appear on both sides but don't
+  // discriminate one SKU from another.
+  'shirt', 'jacket', 'hat', 'cap', 'trucker', 'visor', 'hoodie',
+  'top', 'bottom', 'shorts', 'pants',
+  'hooded', 'performance', 'fishing', 'style',
+  'mens', 'womens', 'ws', 'youth', 'kids',
+  'new', 'sale', 'best'
+]);
+
+// brandStopTokens(brandName) returns a Set of tokens derived from the
+// brand's own name that should NOT count as shared signal — otherwise
+// every phantom carrying the brand name in its marketing string would
+// artificially inflate the shared-token count against every synced row.
+// Combined with UNIVERSAL_STOP_TOKENS to form the extraStop set passed
+// to titleSimilarity.
+function brandStopTokens(brandName) {
+  const extra = new Set(UNIVERSAL_STOP_TOKENS);
+  if (!brandName) return extra;
+  const brandTokens = normalizeTitle(String(brandName)).split(' ').filter(Boolean);
+  for (const t of brandTokens) if (t.length > 1) extra.add(t);
+  return extra;
+}
 
 async function runBrandWide({ brandId }) {
   if (!brandId) return { ok: false, reason: 'brandId required' };
@@ -33,6 +72,14 @@ async function runBrandWide({ brandId }) {
 
 async function runImpl(brandId) {
   const startedAt = Date.now();
+
+  // Resolve the per-brand stopword set once — used as extraStop in every
+  // findBestSyncedTwin comparison below. Auto-derived from Brand.name so
+  // a brand named "Pelagic Gear" contributes tokens {pelagic, gear} and
+  // those never count as shared signal against a phantom titled
+  // "PELAGIC Trucker - Flybridge Deluxe". See MIN_SHARED_TOKENS comment.
+  const brandDoc = await Brand.findById(brandId).select('name').lean();
+  const extraStop = brandStopTokens(brandDoc?.name || '');
 
   // Pull all synced (non-detect-identified) non-draft rows once. These
   // are the candidate targets for any unlinked / phantom-linked
@@ -65,7 +112,7 @@ async function runImpl(brandId) {
 
   const aLinks = new Map(); // catalogProductId → [artifactId, ...]
   for (const a of unlinked) {
-    const target = findBestSyncedTwin(a.identification?.productName, synced);
+    const target = findBestSyncedTwin(a.identification?.productName, synced, extraStop);
     if (!target) continue;
     const k = String(target._id);
     if (!aLinks.has(k)) aLinks.set(k, []);
@@ -92,7 +139,7 @@ async function runImpl(brandId) {
   const touchedCpIds = new Set();   // synced rows that received artifacts — rebuild matchedMedia[] at end
 
   for (const phantom of phantoms) {
-    const twin = findBestSyncedTwin(phantom.normalizedTitle || phantom.title, synced);
+    const twin = findBestSyncedTwin(phantom.normalizedTitle || phantom.title, synced, extraStop);
     if (!twin) continue;
     const r = await reparentAllRefs(phantom._id, twin._id);
     await CatalogProduct.deleteOne({ _id: phantom._id });
@@ -128,11 +175,15 @@ async function runImpl(brandId) {
 // Subset matcher: same criterion as ensureCatalogProductForMatch step
 // 2b and the reparent script. Returns the synced row with the most
 // shared tokens (tiebreak prefers brand+variant matches over brand-only).
-function findBestSyncedTwin(candidateName, syncedRows) {
+// extraStop threads a per-brand stopword set into titleSimilarity so
+// generic tokens (brand name, category words) never count as signal —
+// see the MIN_SHARED_TOKENS + brandStopTokens comments above.
+function findBestSyncedTwin(candidateName, syncedRows, extraStop = null) {
   if (!candidateName) return null;
   let best = null;
+  const opts = extraStop ? { extraStop } : undefined;
   for (const r of syncedRows) {
-    const { score, shared } = titleSimilarity(r.normalizedTitle || r.title, candidateName);
+    const { score, shared } = titleSimilarity(r.normalizedTitle || r.title, candidateName, opts);
     if (shared >= MIN_SHARED_TOKENS && score >= SUBSET_SCORE) {
       if (!best || shared > best.shared) best = { ...r, score, shared };
     }
@@ -211,4 +262,11 @@ async function rebuildMatchedMedia(catalogProductId) {
   }
 }
 
-module.exports = { runBrandWide };
+module.exports = {
+  runBrandWide,
+  // Exported for the verify harness + scripts/dryRunRetroLink.js so the
+  // preview and the production runner agree on stopword derivation.
+  brandStopTokens,
+  MIN_SHARED_TOKENS,
+  UNIVERSAL_STOP_TOKENS
+};
