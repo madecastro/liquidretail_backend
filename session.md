@@ -66,6 +66,17 @@ it clears it back to this placeholder in the same commit that closes it out.)_
 
 ## CURRENT STATE
 
+**2026-09-01: verify-suite dotfile-race hardening finished (PR #374, merged
++ deployed); PR #367 ("DO NOT MERGE") got merged mid-flight along with four
+independent follow-up PRs (#370-373) fixing its known-failures.** Full
+narrative, including two non-blocking follow-ups an adversarial review
+surfaced on the already-merged Director-fallback/CampaignRun changes
+(`docs/turn-on-anthropic-direct.md` is now stale; `DIRECT_URLS` has no
+`anthropic` entry, so following that stale doc's own next step would throw):
+`session.d/2026-09-01_verify-suite-dotfile-race-remaining-walks.md`.
+
+*(Prior state replaced 2026-08-28. Narrative: session.d/2026-08-28_retitle-adgen-handoff.md.)*
+
 **2026-08-28: manual retitle → adgen handoff (PR pending,
 `fix/retitle-adgen-handoff-be` + companion adgen
 `fix/retitle-adgen-handoff-ag`).** Owner asked whether backend's manual
