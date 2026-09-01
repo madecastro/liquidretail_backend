@@ -20,10 +20,6 @@
       "reason": "70/72 checks pass. Two 2026-08-24 cost-attribution follow-up gaps are still open (7k/7l): generateForAd's refreshStaleLayoutInput call and its buildReferenceImages call do not yet thread real campaignRunId / ad-derived attribution onto the spend they cause.",
       "removeWhen": "7k and 7l are wired to pass real campaignRunId / ad-derived attribution the same way the other five stages already do — delete this entry in the same commit."
     },
-    "verifyDirectorFallbackChain.js": {
-      "reason": "46/47 checks pass. E5: only the OpenAI direct twin (gpt-4.1) is coded as a NAMED LLM_AUTH_MISSING skip when its key is absent — the two Anthropic direct twins in the director chain (claude-sonnet-5, claude-opus-5) still fail silently on a keyless Anthropic outage, which is the exact hole E5 exists to catch (see CLAUDE.md's Director fallback-chain section on the outage this chain was built to prevent).",
-      "removeWhen": "the two Anthropic direct twins get the same named auth-missing skip the OpenAI twin already has — delete this entry in the same commit."
-    },
     "verifyIngestBackgroundWorkSurvives.js": {
       "reason": "18/21 checks pass. C2, D1, and E1 each collect one MORE background-work trigger than the harness expects (3 vs 2 in catalogSyncService and syncBrandGenericCatalog, 2 vs 1 in the legacy syncBrandShopify path) — an extra trigger site that has not yet been reconciled against the harness's expected counts.",
       "removeWhen": "the extra collected trigger in each of C2/D1/E1 is investigated and either the code is de-duplicated or the harness's expected count is corrected to match an intentional extra trigger — delete this entry in the same commit."
