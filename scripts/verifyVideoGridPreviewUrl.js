@@ -197,7 +197,11 @@ check('P8 no second, hand-rolled grid transform anywhere in routes/services', ()
   const offenders = [];
   for (const d of dirs) {
     for (const f of fs.readdirSync(path.join(ROOT, d))) {
-      if (!f.endsWith('.js') || f === 'videoPreviewUrl.js') continue;
+      // f.startsWith('.') skip — same convention as verifyMetaApiVersion.js's
+      // fix (real, reproduced revertprove-race in CI: a sibling harness
+      // briefly writes a `.__revertprove_*.js` transient into routes/ or
+      // services/, both scanned here).
+      if (!f.endsWith('.js') || f === 'videoPreviewUrl.js' || f.startsWith('.')) continue;
       const src = fs.readFileSync(path.join(ROOT, d, f), 'utf8');
       if (/c_scale,w_\d+,q_auto,f_auto/.test(src)) offenders.push(`${d}/${f}`);
     }

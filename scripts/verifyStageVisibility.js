@@ -104,7 +104,10 @@ ok('B1 every ads-detail $project includes renderStage and renderStageAt', () => 
   const routesDir = path.join(ROOT, 'routes');
   const offenders = [];
   let scanned = 0;
-  for (const file of fs.readdirSync(routesDir).filter(f => f.endsWith('.js'))) {
+  // !f.startsWith('.') — same convention as verifyMetaApiVersion.js's fix
+  // (real, reproduced revertprove-race in CI: a sibling harness briefly
+  // writes a `.__revertprove_*.js` transient into routes/).
+  for (const file of fs.readdirSync(routesDir).filter(f => f.endsWith('.js') && !f.startsWith('.'))) {
     const src = stripComments(fs.readFileSync(path.join(routesDir, file), 'utf8'));
     // A $project that names the ad-tile shape. `renderUrl` + `posterUrl`
     // together are the signature of an ad-tile projection specifically — a

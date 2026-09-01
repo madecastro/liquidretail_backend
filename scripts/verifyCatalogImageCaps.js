@@ -325,8 +325,11 @@ check(
 // require` is at column 0. An indented `const {…} = require(...)` or
 // bare `require(...)` is the lazy form.
 const servicesDir = path.join(ROOT, 'services');
+// !f.startsWith('.') — same convention as verifyMetaApiVersion.js's fix
+// (real, reproduced revertprove-race in CI: a sibling harness briefly
+// writes a `.__revertprove_*.js` transient into services/).
 const serviceFiles = fs.readdirSync(servicesDir)
-  .filter((f) => f.endsWith('.js'))
+  .filter((f) => f.endsWith('.js') && !f.startsWith('.'))
   .map((f) => path.join(servicesDir, f));
 
 for (const filePath of serviceFiles) {

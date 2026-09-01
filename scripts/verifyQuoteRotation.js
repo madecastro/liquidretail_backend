@@ -229,7 +229,11 @@ check('A6 no downstream code assumes a 10-quote productReviews pool', () => {
   const hits = [];
   const walk = (dir) => {
     for (const ent of fs.readdirSync(dir, { withFileTypes: true })) {
-      if (ent.name === 'node_modules' || ent.name === '.git') continue;
+      // Skip node_modules AND any dotfile/dotdir — same convention as
+      // verifyMetaApiVersion.js's fix (real, reproduced revertprove-race in
+      // CI: a sibling harness briefly writes a `.__revertprove_*.js`
+      // transient into services/ or routes/, both scanned here).
+      if (ent.name === 'node_modules' || ent.name.startsWith('.')) continue;
       const p = path.join(dir, ent.name);
       if (ent.isDirectory()) { walk(p); continue; }
       if (!ent.name.endsWith('.js')) continue;

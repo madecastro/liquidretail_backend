@@ -594,6 +594,10 @@ check('E9 every fetchProductDetails CALL SITE passes catalogProductId AND brandI
   const offenders = [];
   const walk = (dir) => {
     for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
+      // Skip dotfiles/dotdirs — same convention as verifyMetaApiVersion.js's
+      // fix (real, reproduced revertprove-race in CI: a sibling harness
+      // briefly writes a `.__revertprove_*.js` transient into services/).
+      if (e.name.startsWith('.')) continue;
       const full = path.join(dir, e.name);
       if (e.isDirectory()) { walk(full); continue; }
       if (!e.name.endsWith('.js') || e.name === 'productDetailsService.js') continue;
