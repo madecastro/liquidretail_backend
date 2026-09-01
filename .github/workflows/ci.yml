@@ -1,0 +1,59 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  ci:
+    runs-on: ubuntu-latest
+    steps:
+      # fetch-depth: 0 is LOAD-BEARING, not a default worth trimming — same
+      # reasoning as liquidretail_adgen's CI (see that repo's ci.yml comment).
+      # Several harnesses here pin a baseline SHA and extract the pre-change
+      # source with `git show` to compare old vs new behaviour (grep for
+      # BASELINE_SHA / execFileSync('git', ['show', ...]) across scripts/verify*
+      # — currently verifyPostPilotBatch.js, verifyQuoteProvenanceStamp.js,
+      # verifyQuoteStageAware.js, verifyLifestylePreserve.js,
+      # verifyPmaxPromptOverlay.js). actions/checkout defaults to fetch-depth: 1
+      # (tip commit only), which makes `git show <pinned SHA>` fail with "fatal:
+      # invalid object name" and those harnesses exit 1 without running a single
+      # check — the same failure mode adgen already hit and fixed this way.
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+
+      - run: npm ci
+
+      - run: npm run lint
+
+      - run: npm test
+
+  # No Mongo service container and no boot smoke-test here (unlike adgen's
+  # ci.yml, which boots ADGEN_ROLE=api and curls /health). Two reasons:
+  #   1. scripts/runVerifySuite.js's own header confirms no verify* script
+  #      talks to a live DB or network — the 218-script suite above needs
+  #      neither Mongo nor real secrets to be a meaningful gate.
+  #   2. Booting this repo's actual index.js is a heavier lift than adgen's
+  #      single-route ADGEN_ROLE=api process: it wires Express sessions,
+  #      passport Google OAuth (GoogleStrategy throws synchronously without a
+  #      clientID/clientSecret), Cloudinary, and ~15 route modules, several of
+  #      which read provider keys (Atlas/OpenAI/Gemini) at require time. Doing
+  #      this safely needs its own investigation into which of those envs are
+  #      load-bearing at boot vs. only at request time, which is out of scope
+  #      for the CI gate this PR exists to add. Recommended as a fast-follow —
+  #      see the PR description / session notes for the specific risk items
+  #      found while scoping it (GOOGLE_CLIENT_ID has a public, non-secret
+  #      default in config/defaults.env; GOOGLE_CLIENT_SECRET and
+  #      SESSION_SECRET do not and would need CI-only dummy values).
