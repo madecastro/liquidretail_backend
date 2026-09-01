@@ -54,6 +54,19 @@
 //   Symlinked directories are not followed (Dirent.isDirectory() is false
 //   for a symlink-to-dir). That is the other-repo fence at the fs layer.
 //
+//   4. Any FILE whose name starts with `.`, UNCONDITIONALLY — independent of
+//      skipDotNames, which only gates recursing INTO dot-directories. Found
+//      2026-08-31: several "revertprove" harnesses (grep scripts/ for
+//      "revertprove") briefly write a transient SIBLING file named
+//      `.__revertprove_<base>_<pid>_<ts>_<rand>.js` directly into a real
+//      routes/ or services/ file's own directory while mutation-testing.
+//      Before this rule, a walkSource() caller scanning that directory could
+//      collect that dotted name (it has a matching extension) and then hit
+//      ENOENT reading it once the writer's cleanup deleted it first — the
+//      exact race already reproduced in CI for verifyMetaApiVersion.js's own
+//      hand-rolled walk. No real source file is dot-prefixed, so this is
+//      unconditional, not an opt-in.
+//
 // OPTS
 //   extensions     default ['.js', '.mjs', '.jsx', '.cjs']
 //                  matched with String#endsWith, same as the walks this
@@ -142,7 +155,7 @@ function walkSource(rootDir, opts) {
       if (entry.isDirectory()) {
         if (shouldSkipDir(full, entry.name, skip, skipDotNames)) continue;
         walk(full);
-      } else if (entry.isFile() && hasExtension(entry.name, extensions)) {
+      } else if (entry.isFile() && !entry.name.startsWith('.') && hasExtension(entry.name, extensions)) {
         out.push(full);
       }
     }

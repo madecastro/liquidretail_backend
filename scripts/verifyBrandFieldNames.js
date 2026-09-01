@@ -66,7 +66,14 @@ function listJsFiles(dirRel) {
   const out = [];
   function walk(d) {
     for (const ent of fs.readdirSync(d, { withFileTypes: true })) {
-      if (ent.name === 'node_modules' || ent.name === '.git') continue;
+      // Skip node_modules AND any dotfile/dotdir — same convention as
+      // verifyMetaApiVersion.js's fix: a "revertprove" harness elsewhere in
+      // this suite briefly writes a transient sibling file named
+      // `.__revertprove_*.js` into services/ or routes/ while mutation-
+      // testing; under the parallel runner this walk can otherwise catch
+      // that file mid-write and ENOENT when it reads a name that's since
+      // been deleted.
+      if (ent.name === 'node_modules' || ent.name.startsWith('.')) continue;
       const p = path.join(d, ent.name);
       if (ent.isDirectory()) walk(p);
       else if (ent.isFile() && ent.name.endsWith('.js')) out.push(p);

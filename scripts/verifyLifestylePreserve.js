@@ -1884,7 +1884,10 @@ console.log('\n=== buildPrompt caller enumeration (staticAdIntents) ===\n');
   function scanDir(dir, label) {
     let files = [];
     try {
-      files = fs.readdirSync(dir).filter((f) => f.endsWith('.js'));
+      // !f.startsWith('.') — same convention as verifyMetaApiVersion.js's
+      // fix (real, reproduced revertprove-race in CI: a sibling harness
+      // briefly writes a `.__revertprove_*.js` transient into services/).
+      files = fs.readdirSync(dir).filter((f) => f.endsWith('.js') && !f.startsWith('.'));
     } catch (_) { return; }
     for (const f of files) {
       const full = path.join(dir, f);

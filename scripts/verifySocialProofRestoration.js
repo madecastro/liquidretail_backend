@@ -429,6 +429,11 @@ check('D3 ONLY the static path opts in — recursive over services/ AND routes/'
   const hits = [];
   const walk = (dir) => {
     for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
+      // Skip dotfiles/dotdirs — same convention as verifyMetaApiVersion.js's
+      // fix (real, reproduced revertprove-race in CI: a sibling harness
+      // briefly writes a `.__revertprove_*.js` transient into services/ or
+      // routes/, both scanned here).
+      if (e.name.startsWith('.')) continue;
       const full = path.join(dir, e.name);
       if (e.isDirectory()) { if (e.name !== 'node_modules') walk(full); continue; }
       if (!e.name.endsWith('.js')) continue;

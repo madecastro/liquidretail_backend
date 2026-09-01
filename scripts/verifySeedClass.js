@@ -676,6 +676,11 @@ function walkJs(dir) {
   try { entries = fs.readdirSync(dir, { withFileTypes: true }); }
   catch (_) { return; }
   for (const e of entries) {
+    // Skip dotfiles/dotdirs — same convention as verifyMetaApiVersion.js's
+    // fix (real, reproduced revertprove-race in CI: a sibling harness
+    // briefly writes a `.__revertprove_*.js` transient into services/ or
+    // routes/, both scanned here).
+    if (e.name.startsWith('.')) continue;
     const p = path.join(dir, e.name);
     if (e.isDirectory()) { walkJs(p); continue; }
     if (!e.name.endsWith('.js')) continue;
