@@ -559,6 +559,134 @@ concurrently.
 
 ---
 
+## Stranded-work tooling (2026-08-31)
+
+Built after three real incidents in one night across this repo and
+`liquidretail_backend`: a branch sat **5 days** with 9 commits never pushed to
+any remote, inside a nested worktree locked by a dead PID (nearly lost a live
+production bug fix); a running agent accumulated ~52KB across 6 files with
+**zero commits**, then ended its turn waiting on a background review that
+could never wake it; a nested worktree sat inside this repo directory
+violating the documented rule two sections up. Plus, unrelated but
+discovered while auditing: dozens of `.wt-*` sibling worktrees for branches
+already merged, and several `prunable` worktrees under `/private/tmp`
+nobody had cleaned up.
+
+**`scripts/auditStrandedWork.js`** (read-only) reports, for the repo it runs
+in: local branches with commits on **no** remote (the 5-day case); any
+worktree — including the main checkout — with uncommitted/untracked changes
+(the 52KB case); any worktree nested inside this repo directory (the
+documented-rule violation); worktrees git itself reports prunable; and
+branches already merged into trunk (by literal ancestry OR detected
+squash-equivalence — this repo's PR history is almost entirely GitHub squash
+merges, see the commit-message evidence right below the codemap warning at
+the top of this file, so a plain `git merge-base --is-ancestor` check alone
+would find almost nothing) whose branch or worktree still lingers. Exit code
+1 iff anything in the first three (genuinely at-risk) categories was found;
+0 for the last two (mere tidiness) — so it can gate something later without
+crying wolf over ordinary end-of-session dirty state.
+
+`npm run check:stranded-work` runs it. `--json` for machine consumption,
+`--fast` to skip the full-branch-list merged-lingering scan (much faster on
+a repo with 100+ local branches, at the cost of under-reporting cleanup
+fodder — categories 1-3 are unaffected), `--repo=<path>` for another
+checkout.
+
+**`scripts/cleanupMergedBranches.js`** is the companion that actually
+deletes — **dry-run by default**, `--apply` required to write anything. It
+independently re-verifies, at the moment of deletion, that a candidate
+branch: is not trunk; is not checked out in ANY worktree (main or linked);
+has zero commits unreachable from any remote (re-checked here, not read from
+a stale audit report); has a clean worktree if one exists; is not behind a
+LOCKED worktree (reported, never auto-unlocked). Anything ambiguous is
+skipped and reported, never guessed through. `npm run cleanup:merged-branches`
+(add `-- --apply` to actually delete). Proven against a scratch fixture repo
+with a real bare "origin" (not just assertions): a branch with commits
+pushed nowhere was refused, a branch with a dirty worktree was refused
+(both the "checked out anywhere" gate AND, unit-tested in isolation, the
+dirty-worktree check itself), trunk was refused, and a genuinely
+squash-merged-and-clean branch was deleted (local branch + its remote
+counterpart) while the other three were left byte-for-byte untouched.
+
+**Why `git branch -D` (force) for the squash case, not `-d`:** git's own
+`-d` only trusts literal ancestry — it refuses a squash-merged branch as
+"not fully merged" even though its content is safely in trunk under a
+different commit SHA, which is exactly why this tool exists instead of a
+bare `git branch --merged` loop. `-D` is used only after independently
+verifying squash-equivalence (a patch-id comparison against trunk's history
+— the same mechanism behind the well-known "git-delete-squashed" script,
+with one correction found by testing against this repo's real history: the
+synthetic probe commit must be parented at the branch/trunk **merge-base**,
+not trunk's current tip, or a trunk that has moved on even one commit since
+the merge makes every squash-merged branch look unmerged) AND confirming
+zero unpushed commits AND a clean-or-absent worktree AND not checked out
+anywhere.
+
+**Adversarial review (Grok grok-4.6, `--effort high`, 2026-08-31) found real
+bugs here, since fixed.** Worth recording because they were genuinely
+subtle: (1) the remote delete had no lease, so a same-named `origin/<branch>`
+that moved (someone pushed new commits) between our fetch and the delete
+could have those commits destroyed alongside the branch — fixed with
+`--force-with-lease` on an SHA observed as late as possible; (2) remote
+delete used to run even when the local `-D` failed — now gated so a failed
+local delete never reaches the remote step; (3) the squash-equivalence check
+above (patch-id via `git cherry`) matches against ANY point in trunk's
+history, including a commit trunk has since reverted or superseded —
+demonstrated concretely (a branch bumps a setting, gets squash-merged, trunk
+later independently changes the same setting again — the patch-id check
+alone still said "merged"). Fixed with a second gate requiring the branch's
+added lines to still be found in trunk's CURRENT file content (a ratio
+threshold, not literal 100% — a stricter whole-file-identity version was
+tried first and broke on this repo's own auto-regenerated
+`scripts/vendor-manifest.json`, whose timestamps/hashes legitimately churn
+on every unrelated reconciliation). All ten of these properties, plus the
+original refusal-path proofs, are now pinned by
+`scripts/verifyCleanupMergedBranchesSafety.js` against a real disposable
+fixture repo — added to `npm test`, not just asserted in a PR description.
+
+**Duplication, deliberate:** `scripts/lib/gitAudit.js` plus these two callers
+are hand-synced, byte-identical, with `liquidretail_backend`'s copies — NOT
+routed through `scripts/vendor-manifest.json`/`verifyVendorDrift.js`. That
+system hashes backend↔adgen **production** modules under `models/`/`services/`
+with a debt-tracking grace period (`UNPORTED_GRACE_DAYS_DEFAULT`) built for
+code that writes the shared Mongo collections; a git-ops utility with zero
+Mongo/business-logic coupling doesn't fit that shape, and forcing it through
+a system built around "these two sides may legitimately drift for up to N
+days" would be actively misleading for a file that has no reason to ever
+drift. Diff the three files against the sibling repo before editing either
+copy.
+
+**Backend also has `scripts/findOrphanedBranches.js` / `findStaleUncommittedWork.js`
+(gh-CLI/GitHub-PR-aware) — complementary, not superseded.** Those answer "does
+a PR exist for this branch name"; this pair answers "does this branch/worktree
+exist safely anywhere outside this one disk," entirely offline, and (unlike
+the backend-only originals) the same way in both repos. adgen has no
+GitHub-PR-aware equivalent and isn't getting one here — `gh` cross-referencing
+stays a backend-only tool as of this writing.
+
+**Wired into the habit via a committed SessionEnd hook**, not left as a
+script nobody runs: `.claude/settings.json` (committed — note `.gitignore`
+now reads `.claude/*` with explicit `!.claude/settings.json` /
+`!.claude/hooks/` re-includes, not a blanket `.claude/` ignore, so
+`.claude/settings.local.json` and Claude Code's own `.claude/worktrees/`
+scratch dir stay ignored) runs `.claude/hooks/session-end-audit.sh` at the
+end of every session. That wrapper always exits 0 (`|| true`) and delegates
+to `auditStrandedWork.js --hook`, which independently guarantees the same
+(try/catch around everything, always `process.exit(0)`) and prints exactly
+one `{"systemMessage": "..."}` line — a terse one-liner, not the full
+report, by design: the hook's job is to make the finding impossible to miss
+at the one moment a human is guaranteed to glance at the terminal, not to
+replace `npm run check:stranded-work` for a full read. Chosen over "just
+document the manual command" because the exact incidents this tool exists
+for are ones where nobody thought to run a manual command — `docs/PARALLEL_WORK.md`
+§7 tooling existed on `main` in the sibling backend repo, unused, for the
+same reason. This mirrors backend's own pre-existing committed
+`.claude/settings.json` + `.claude/hooks/session-start.sh` pattern, so
+`liquidretail_adgen` gains a shared, git-tracked hook precedent rather than
+diverging on one.
+
+---
+
 ## Reframe claim: poll budget and lease floor are INDEPENDENT (2026-08-27)
 
 `reframeReferenceForAspect` called `pollPrediction(id)` with **no options**, so the

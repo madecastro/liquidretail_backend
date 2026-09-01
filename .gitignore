@@ -4,7 +4,14 @@ node_modules/
 *.log
 .DS_Store
 dist/
-.claude/
+.claude/*
+# Committed hook wiring for the stranded-work audit (see CLAUDE.md's
+# "Stranded-work tooling" section) — un-ignore just these two paths.
+# settings.local.json (per-developer overrides) and .claude/worktrees
+# (Claude Code's own scratch worktrees) stay ignored via the .claude/*
+# blanket rule above.
+!.claude/settings.json
+!.claude/hooks/
 .codegraph/
 .codemap/
 # Remotion webpack bundle — built at Docker build time by

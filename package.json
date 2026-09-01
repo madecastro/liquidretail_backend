@@ -9,7 +9,9 @@
     "dev": "node src/entrypoint.js",
     "lint": "eslint .",
     "test": "node scripts/runVerifySuite.js",
-    "setup:worktree": "node scripts/setupMergeDrivers.js"
+    "setup:worktree": "node scripts/setupMergeDrivers.js",
+    "check:stranded-work": "node scripts/auditStrandedWork.js",
+    "cleanup:merged-branches": "node scripts/cleanupMergedBranches.js"
   },
   "engines": {
     "node": ">=20.0.0"
