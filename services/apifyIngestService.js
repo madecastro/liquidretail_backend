@@ -292,8 +292,21 @@ async function syncBrandInstagram(brand, run = null) {
 
   const summary = { ok: true, fetched: posts.length, ingested: 0, skipped: 0, errors: 0, queuedRunIds: [], aborted: false };
 
+  // Universal ingest cap — see services/ingestLimits.js. Env
+  // SOCIAL_INGEST_LIMIT bounds how many posts persist per pass; default
+  // 10. Deliberately capping the persist loop rather than the fetch —
+  // Apify actor pricing is per-run, not per-post-returned, so shrinking
+  // the fetch wouldn't save credits.
+  const { socialIngestLimit } = require('./ingestLimits');
+  const socialCap = socialIngestLimit();
+  let socialPersisted = 0;
+
   let idx = 0;
   for (const post of posts) {
+    if (socialCap != null && socialPersisted >= socialCap) {
+      console.log(`   · Apify IG ingest hit SOCIAL_INGEST_LIMIT=${socialCap} — stopping after ${socialPersisted} post(s)`);
+      break;
+    }
     idx += 1;
     if (await isBrandAborted(brand._id, run)) {
       summary.aborted = true;
@@ -306,7 +319,7 @@ async function syncBrandInstagram(brand, run = null) {
       // re-enqueues detect for already-ingested media.
       if (r?.runId) summary.queuedRunIds.push(String(r.runId));
       if (r?.skipped) summary.skipped++;
-      else if (r?.mediaId) summary.ingested++;
+      else if (r?.mediaId) { summary.ingested++; socialPersisted++; }
     } catch (err) {
       console.warn(`   ⚠️  Apify IG ingest failed for ${post.externalId}: ${err.message}`);
       summary.errors++;
@@ -434,6 +447,26 @@ async function ingestIgPost(brand, post) {
   // skipped reflects INGESTION (media already existed) — a resumed post
   // can be skipped for counting yet still re-enqueue detect below.
   if (existingActive) return { mediaId: media._id, runId: null, skipped: !!existing };
+
+  // DEFERRED DETECT (2026-09-02, POST_DETECT_DEFER_TO_CATALOG=true by
+  // default). Skip the per-post apify-sync DetectRun at ingest — the
+  // vision-match phase inside detect needs catalog products to already
+  // have refinedProducts + titleEmbedding to find them, and those are
+  // populated by catalog-sync detects that fire LATER via
+  // catalogPostSyncOrchestrator. Matching against a bare catalog wastes
+  // a Gemini-vision call per post (measured 30 UGC × ~$0.04 = ~$1.20
+  // per resync) AND permanently misses the products whose detect
+  // hadn't run yet. Instead, catalogPostSyncOrchestrator now fires
+  // rematchAfterCatalogDetect({full:true}) after catalog drain, which
+  // enqueues a single full-brand rematch against the fresh refined
+  // catalog. Kill switch reverts to the legacy immediate-detect path;
+  // used together with full=false to keep the pre-2026-09-02 cost
+  // shape (rematch-after-catalog then only touches UNMATCHED posts,
+  // avoiding a duplicate paid match on ones ingest-time already did).
+  const { isDeferPostDetectEnabled } = require('./postRematchAfterCatalogService');
+  if (isDeferPostDetectEnabled()) {
+    return { mediaId: media._id, runId: null, skipped: !!existing, deferred: true };
+  }
 
   let run;
   try {
@@ -563,12 +596,22 @@ async function syncBrandShopify(brand, run = null) {
   }
 
   const summary = { ok: true, fetched: products.length, added: 0, updated: 0, errors: 0, aborted: false };
+  // Universal ingest cap — see services/ingestLimits.js. Env
+  // CATALOG_INGEST_LIMIT bounds how many rows this pass persists;
+  // default 10.
+  const { catalogIngestLimit } = require('./ingestLimits');
+  const catalogCap = catalogIngestLimit();
+  let catalogPersisted = 0;
   // ARCHITECTURE: upsert NEVER awaits image classify. Post-loop pass only.
   const shotSession = ingestShotClassify.createSession();
   const pendingClassify = [];
   let idx = 0;
   try {
   for (const p of products) {
+    if (catalogCap != null && catalogPersisted >= catalogCap) {
+      console.log(`   · Apify Shopify ingest hit CATALOG_INGEST_LIMIT=${catalogCap} — stopping after ${catalogPersisted} product(s)`);
+      break;
+    }
     idx += 1;
     if (await isBrandAborted(brand._id, run)) {
       summary.aborted = true;
@@ -622,6 +665,7 @@ async function syncBrandShopify(brand, run = null) {
       );
       if (result?.lastErrorObject?.updatedExisting) summary.updated++;
       else                                           summary.added++;
+      catalogPersisted++;
       // Defer classify to post-loop pass — never block remaining upserts.
       const row = result?.value || result;
 
@@ -748,22 +792,12 @@ async function syncBrandShopify(brand, run = null) {
         .catch(err => console.warn(`   ⚠️  catalog enrichment enqueue failed: ${err.message}`))
     );
 
-    // Materialize + YOLO detect chain. Populates Media.refinedProducts[] so
-    // reframe / videoProductAnchor / pmaxSplitStrategy / quoteProvenance find
-    // subject bboxes at ad-gen time and skip the paid nano-banana outpaint.
-    // See services/catalogYoloDetectionService.js header for the full flow.
-    backgroundWork.push((async () => {
-      try {
-        await require('./catalogMediaMaterializeService').ensureBrandCatalogMediaMaterialized(brand._id);
-      } catch (err) {
-        console.warn(`   ⚠️  catalog media materialize failed: ${err.message}`);
-      }
-      try {
-        await require('./catalogYoloDetectionService').enqueueBrandProductYoloDetection(brand._id);
-      } catch (err) {
-        console.warn(`   ⚠️  catalog YOLO detect enqueue failed: ${err.message}`);
-      }
-    })());
+    // Materialize + YOLO detect chain via the resilient orchestrator.
+    // See services/catalogPostSyncOrchestrator.js header for the failure
+    // modes the old inline try/try version silently absorbed.
+    backgroundWork.push(
+      require('./catalogPostSyncOrchestrator').runPostSyncChain(brand._id, { trigger: 'sync' })
+    );
   }
 
   // Awaitable by a caller that owns its own connection lifecycle (see the

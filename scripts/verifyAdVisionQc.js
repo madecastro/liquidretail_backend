@@ -2007,7 +2007,7 @@ check('B4 judgeRender payload carries visionImages:2 meta (ledger)', async () =>
     { timestampSec: 7.5, url: 'https://res.cloudinary.com/x/video/upload/so_7.5,f_jpg/v1/a.jpg' }
   ];
 
-  check('O1 buildVideoVisionUserContent: seed first, N frames in order, correctly labelled', () => {
+  check('O1 buildVideoVisionUserContent (M=1): seed first, N frames in order, correctly labelled', () => {
     const content = qc.buildVideoVisionUserContent({
       originalProductUrl: 'https://cdn.example/seed.jpg',
       frames: SAMPLE_FRAMES,
@@ -2019,14 +2019,64 @@ check('B4 judgeRender payload carries visionImages:2 meta (ledger)', async () =>
     assert.strictEqual(imageParts[1].image_url.url, SAMPLE_FRAMES[0].url);
     assert.strictEqual(imageParts[3].image_url.url, SAMPLE_FRAMES[2].url);
     const labels = content.filter((c) => c.type === 'text').map((c) => c.text);
-    assert.ok(labels.some((t) => /ORIGINAL PRODUCT PHOTO/.test(t)));
+    // Label renamed from "ORIGINAL PRODUCT PHOTO" → "ORIGINAL PRODUCT
+    // REFERENCE" in 2026-09-02 multi-ref work so the M>1 phrasing reads
+    // naturally alongside the M=1 case ("PHOTOS" alone was ambiguous at
+    // M>1 — different SIDES of a reversible product, different colorways
+    // of the same SKU — see buildVideoVisionUserContent's docstring).
+    assert.ok(labels.some((t) => /ORIGINAL PRODUCT REFERENCE/.test(t)));
     assert.ok(labels.some((t) => /VIDEO FRAME @ t=2\.5s/.test(t)));
     assert.ok(labels.some((t) => /VIDEO FRAME @ t=7\.5s/.test(t)));
   });
 
-  check('O1b buildVideoVisionUserContent requires originalProductUrl and frames', () => {
+  check('O1-multi buildVideoVisionUserContent (M=3): every ref labelled, references before frames, dedup + strip falsy', () => {
+    // Multi-ref shape: pass the reference stack the video model actually
+    // saw (backend/adgen brandScriptExecutor pulls ad.veoReferenceImages
+    // wholesale). Also stress the coercion — a stray null, an empty
+    // string, and a duplicate should all be dropped before the payload
+    // is built, so an accidental `[url, null, url, ""]` shipped by a
+    // caller doesn't produce a broken vision call.
+    const content = qc.buildVideoVisionUserContent({
+      originalProductUrls: [
+        'https://cdn.example/ref1.jpg',
+        null,
+        'https://cdn.example/ref2.jpg',
+        '',
+        'https://cdn.example/ref1.jpg',
+        'https://cdn.example/ref3.jpg'
+      ],
+      frames: SAMPLE_FRAMES,
+      brandName: 'Vuori'
+    });
+    const imageParts = content.filter((c) => c.type === 'image_url');
+    assert.strictEqual(imageParts.length, 6, 'expected 3 refs + 3 frames after dedup / falsy strip');
+    assert.strictEqual(imageParts[0].image_url.url, 'https://cdn.example/ref1.jpg');
+    assert.strictEqual(imageParts[1].image_url.url, 'https://cdn.example/ref2.jpg');
+    assert.strictEqual(imageParts[2].image_url.url, 'https://cdn.example/ref3.jpg');
+    assert.strictEqual(imageParts[3].image_url.url, SAMPLE_FRAMES[0].url,
+      'first frame must come AFTER the last reference');
+    const labels = content.filter((c) => c.type === 'text').map((c) => c.text);
+    assert.ok(labels.some((t) => /IMAGE 1 — ORIGINAL PRODUCT REFERENCE 1 of 3/.test(t)));
+    assert.ok(labels.some((t) => /IMAGE 3 — ORIGINAL PRODUCT REFERENCE 3 of 3/.test(t)));
+    // Frames should be renumbered 4-6 (M+1 .. M+N), not 2-4 as they would
+    // be under the single-ref shape.
+    assert.ok(labels.some((t) => /IMAGE 4 — VIDEO FRAME @ t=2\.5s/.test(t)));
+    assert.ok(labels.some((t) => /IMAGE 6 — VIDEO FRAME @ t=7\.5s/.test(t)));
+    // Prompt text should mention the LEGITIMATE VARIATION allowance so
+    // the judge does not flag a reversible/multi-colorway product's
+    // legitimate side changes as fidelity drift.
+    const prompt = content[0].text;
+    assert.match(prompt, /LEGITIMATE VARIATION/i);
+    assert.match(prompt, /reversible/i);
+  });
+
+  check('O1b buildVideoVisionUserContent requires an originalProductUrl (any shape) and frames', () => {
     assert.throws(() => qc.buildVideoVisionUserContent({ frames: SAMPLE_FRAMES }), /originalProductUrl/);
+    assert.throws(() => qc.buildVideoVisionUserContent({ originalProductUrls: [null, ''], frames: SAMPLE_FRAMES }), /originalProductUrl/);
     assert.throws(() => qc.buildVideoVisionUserContent({ originalProductUrl: 'x', frames: [] }), /frames/);
+    // Array shape with at least one valid URL passes.
+    const ok = qc.buildVideoVisionUserContent({ originalProductUrls: ['x'], frames: SAMPLE_FRAMES });
+    assert.ok(Array.isArray(ok) && ok.length > 0);
   });
 
   check('O2 buildVideoVisionUserContent scopes text_defects to product-intrinsic text only', () => {

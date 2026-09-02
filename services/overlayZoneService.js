@@ -369,4 +369,45 @@ function downsampledCloudinaryUrl(url, maxWidth) {
   return url.replace('/upload/', `/upload/${transform}/`);
 }
 
-module.exports = { analyzeOverlayZones, isEnabled, RESTRICTION_CLASSES, SCHEMA_VERSION };
+// 2026-09-02 — shared brightness+dims probe for the DINO overlay-zones
+// path (services/dinoOverlayZoneService.js). The Gemini path already
+// downloads the image and computes brightnessGrid + reads sharp
+// metadata as part of analyzeOverlayZones; extracting that into a
+// standalone entry lets the DINO path reuse the same implementation
+// without pulling axios+sharp deps into dinoOverlayZoneService itself.
+// Failure-safe: returns null on any error, callers treat as "no
+// brightness signal" and emit an empty brightness grid.
+async function computeBrightnessGridFromUrl(imageUrl, { ratio = null, cols = null, rows = null } = {}) {
+  if (!imageUrl) return null;
+  try {
+    const fetchUrl = downsampledCloudinaryUrl(imageUrl, 1024);
+    const imgRes = await axios.get(fetchUrl, { responseType: 'arraybuffer', timeout: 20000 });
+    const imgBuf = Buffer.from(imgRes.data);
+    let imageWidth = null, imageHeight = null;
+    try {
+      const meta = await sharp(imgBuf).metadata();
+      imageWidth = meta.width || null;
+      imageHeight = meta.height || null;
+    } catch (_) { /* dims stay null */ }
+
+    // Grid dims default: 8×6 landscape, 6×8 portrait, 6×10 very tall.
+    // Same guidance the Gemini prompt uses so the two paths' output
+    // grids match in shape when consumers correlate density with
+    // brightness on the same cell.
+    let gridCols = Number(cols) || 0;
+    let gridRows = Number(rows) || 0;
+    if (!(gridCols > 0 && gridRows > 0)) {
+      const r = String(ratio || '').trim();
+      if (r === '9:16' || r === '4:5' || r === '3:4') { gridCols = 6; gridRows = 10; }
+      else if (r === '1:1') { gridCols = 6; gridRows = 6; }
+      else { gridCols = 8; gridRows = 6; }
+    }
+    const brightnessGrid = await computeBrightnessGrid(imgBuf, gridCols, gridRows);
+    return { brightnessGrid, imageWidth, imageHeight };
+  } catch (err) {
+    console.warn(`   ⚠️  computeBrightnessGridFromUrl: ${err.message}`);
+    return null;
+  }
+}
+
+module.exports = { analyzeOverlayZones, isEnabled, RESTRICTION_CLASSES, SCHEMA_VERSION, computeBrightnessGridFromUrl };

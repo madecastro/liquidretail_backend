@@ -1737,20 +1737,33 @@ async function runVideoVisionQcForAd({ ad, deliveredUrl, brandName = null }) {
     const videoFrameService = require('./videoFrameService');
     const { adStage, noteRenderIssue } = require('./adStage');
 
-    // ORIGINAL product photo — prefer the EXACT reference actually sent to
-    // the video model (veoReferenceImages[0]; models/Ad.js: "pos 0 = seed"),
-    // same "first reference we actually sent" philosophy the static path
-    // uses (directImageRenderService.js). Derive-only ads (cropped from a
-    // sibling master, models/Ad.js `deriveFromMaster`) never populate their
-    // own veoReferenceImages, so fall back to the catalog hero.
-    let originalProductUrl = (Array.isArray(ad.veoReferenceImages) && ad.veoReferenceImages.length)
-      ? ad.veoReferenceImages[0]
-      : null;
-    if (!originalProductUrl && ad.productId) {
+    // ORIGINAL product photos — the EXACT reference stack actually sent to
+    // the video model (veoReferenceImages[]; models/Ad.js: "pos 0 = seed",
+    // 1..N = additional refs) so the vision judge scores frames against
+    // the same visual ground truth the video model had. The pre-2026-09-02
+    // behaviour was to pass ONLY veoReferenceImages[0] — which flagged
+    // every legitimate colorway change (reversible swimsuits, multi-print
+    // shirts photographed on-model + packshot) as product_fidelity drift,
+    // and every legitimate branding element that lived on a back panel /
+    // hang tag visible only in an ALT reference as invented competitor
+    // mark. Passing the whole array as originalProductUrls lets the judge
+    // treat the union as ground truth (see buildVideoVisionUserContent).
+    //
+    // Derive-only ads (cropped from a sibling master, models/Ad.js
+    // `deriveFromMaster`) never populate their own veoReferenceImages
+    // — a derive is retitled from the master's already-paid clip and
+    // never submits to Omni itself — so fall back to the catalog hero.
+    // A catalog fallback of ONE image reproduces the pre-2026-09-02 M=1
+    // behaviour for these ads exactly, so this is not a regression on
+    // the derive path.
+    let originalProductUrls = (Array.isArray(ad.veoReferenceImages) && ad.veoReferenceImages.length)
+      ? ad.veoReferenceImages.filter((u) => typeof u === 'string' && u.trim())
+      : [];
+    if (!originalProductUrls.length && ad.productId) {
       try {
         const CatalogProduct = require('../models/CatalogProduct');
         const prod = await CatalogProduct.findById(ad.productId).select('imageUrl').lean();
-        originalProductUrl = prod?.imageUrl || null;
+        if (prod?.imageUrl) originalProductUrls = [prod.imageUrl];
       } catch { /* falls through to the skipped verdict below */ }
     }
 
@@ -1813,7 +1826,7 @@ async function runVideoVisionQcForAd({ ad, deliveredUrl, brandName = null }) {
     adStage(ad._id, 'vision QC (video)');
     const qcResult = await adVisionQc.runVideoPostRenderQc({
       enabled: true,
-      originalProductUrl,
+      originalProductUrls,
       frames,
       brandName: resolvedBrandName,
       brandId: ad.brandId || null,

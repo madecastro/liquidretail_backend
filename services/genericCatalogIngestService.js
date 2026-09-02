@@ -226,8 +226,19 @@ async function syncBrandGenericCatalog(brand, run, { isBrandAborted, categories 
   let cancelled = resolverCancelled;
   let partial = !!access.partial;
   let partialReason = access.partialReason || null;
+  // Universal ingest cap — see services/ingestLimits.js. Env
+  // CATALOG_INGEST_LIMIT bounds how many rows this pass persists;
+  // default 10. Stops the loop at the cap without changing what the
+  // upstream fetch returned.
+  const { catalogIngestLimit } = require('./ingestLimits');
+  const ingestCap = catalogIngestLimit();
+  let persistedCount = 0;
   try {
   for (const p of products) {
+    if (ingestCap != null && persistedCount >= ingestCap) {
+      console.log(`   · ${LOG}  hit CATALOG_INGEST_LIMIT=${ingestCap} — stopping after ${persistedCount} product(s)`);
+      break;
+    }
     idx += 1;
     if (!resolverCancelled) {
       let midAbort = false;
@@ -349,6 +360,7 @@ async function syncBrandGenericCatalog(brand, run, { isBrandAborted, categories 
         { upsert: true, new: true }
       );
       productsUpserted += 1;
+      persistedCount += 1;
 
       // Post-upsert category stamp. Two candidate stamps: the JSON-LD
       // scanner-derived leaf (categoryRefId, set at line 254) or the
@@ -484,22 +496,15 @@ async function syncBrandGenericCatalog(brand, run, { isBrandAborted, categories 
         .catch(err => console.warn(`   ⚠️  ${LOG}  catalog enrichment enqueue failed: ${err.message}`))
     );
 
-    // Materialize + YOLO detect chain. Populates Media.refinedProducts[] so
-    // reframe / videoProductAnchor / pmaxSplitStrategy / quoteProvenance find
-    // subject bboxes at ad-gen time and skip the paid nano-banana outpaint.
-    // See services/catalogYoloDetectionService.js header for the full flow.
-    backgroundWork.push((async () => {
-      try {
-        await require('./catalogMediaMaterializeService').ensureBrandCatalogMediaMaterialized(brand._id);
-      } catch (err) {
-        console.warn(`   ⚠️  ${LOG}  catalog media materialize failed: ${err.message}`);
-      }
-      try {
-        await require('./catalogYoloDetectionService').enqueueBrandProductYoloDetection(brand._id);
-      } catch (err) {
-        console.warn(`   ⚠️  ${LOG}  catalog YOLO detect enqueue failed: ${err.message}`);
-      }
-    })());
+    // Materialize + YOLO detect chain via the resilient orchestrator.
+    // Wraps both phases in OperationRun(kind='catalog-post-sync') so a
+    // transient failure (SIGTERM mid-work, yolo microservice outage,
+    // Cloudinary rate-limit) leaves a persistent signal that worker.js
+    // postSyncReconcileTick can retry. See catalogPostSyncOrchestrator.js
+    // header for why the inline try/try version silently stranded brands.
+    backgroundWork.push(
+      require('./catalogPostSyncOrchestrator').runPostSyncChain(brand._id, { trigger: 'sync' })
+    );
 
     backgroundWork.push((async () => {
       let catRun = null;

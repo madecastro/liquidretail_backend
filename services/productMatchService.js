@@ -2348,6 +2348,58 @@ async function ensureCatalogProductForMatch(match, ctx) {
     return null;
   }
 
+  // 2c. CATALOG-SUBSET COLLAPSE (2026-09-02, live-fix for backend cc95cb5's
+  // dead code path). The originally-shipped collapse in
+  // catalogProductDraftService.tryCreate only fires from the manual "Save as
+  // draft product" capability (with force:true, which bypasses collapse
+  // anyway). The AUTOMATIC detect-identified minting path never reaches
+  // tryCreate — it lands directly on CatalogProduct.create below — so 30%
+  // of Pelagic-shape catalogs still mint drafts that ARE subsets of existing
+  // synced rows. Re-check the same subset rule HERE, right before the
+  // create, so the automatic path finally gets what cc95cb5 was meant to
+  // ship.
+  //
+  // Applies regardless of the draft vs auto-promoted distinction: a subset
+  // match means the product already exists in the catalog, and we should
+  // return the existing row's _id rather than mint a duplicate in either
+  // shape (a duplicate synced row is worse than a duplicate draft — it
+  // stays visible to the wizard, competes for ad-gen selection, and needs
+  // manual cleanup).
+  //
+  // Kill switch: DRAFT_COLLAPSE_TO_CATALOG=false / 0 / off reverts to the
+  // pre-fix behaviour (mint always). Same env as the tryCreate path so ops
+  // flip one flag to opt out of both call sites.
+  const catalogProductDraftService = require('./catalogProductDraftService');
+  const { findCatalogSubsetMatch, draftCollapseStopwords, isCollapseToCatalogEnabled } = catalogProductDraftService.__test;
+  if (isCollapseToCatalogEnabled() && ident.productName) {
+    try {
+      // Look up brand name for stopwords — cheap read, gated on the flag so
+      // it never fires when collapse is disabled. Not shared with the Brand
+      // read below because that read pulls uploadSettings (a different
+      // projection) and both are single-doc lookups.
+      const brandForStops = await Brand.findById(ctx.brandId).select('name').lean();
+      const extraStop = draftCollapseStopwords(brandForStops?.name);
+      const catalogRows = await CatalogProduct
+        .find({ brandId: ctx.brandId, draft: { $ne: true }, deletedAt: null })
+        .select('_id title').lean();
+      const subsetMatch = findCatalogSubsetMatch(ident.productName, catalogRows, extraStop);
+      if (subsetMatch) {
+        console.log(
+          `   ↔️  ensureCatalogProduct[${match.productIndex || 'primary'}]: collapse → ` +
+          `"${ident.productName}" is a superset of existing catalog "${subsetMatch.row.title}" ` +
+          `(${subsetMatch.row._id}) — reusing instead of minting`
+        );
+        return subsetMatch.row._id;
+      }
+    } catch (err) {
+      // Never let the collapse check block a mint that would otherwise
+      // succeed — a query throw here degrades to the pre-fix behaviour,
+      // not a total failure. Same fail-safe stance as catalogProductDraft
+      // Service.tryCreate.
+      console.warn(`   ⚠️  ensureCatalogProduct[${match.productIndex || 'primary'}]: subset check threw: ${err.message} — falling through to create`);
+    }
+  }
+
   // 3. Create a new detect-identified row. Draft state is gated by the
   // brand toggle: opted-in → not a draft (auto-promoted); opted-out → draft.
   const brand = await Brand.findById(ctx.brandId).select('uploadSettings').lean();
@@ -2431,6 +2483,57 @@ function slugify(s) {
 // dialed without a deploy.
 const CATALOG_VISUAL_MATCH_MAX_IMAGES = Math.max(1, parseInt(process.env.CATALOG_VISUAL_MATCH_MAX_IMAGES, 10) || 1);
 
+// D2 (2026-09-02) — process-local LRU on the (ugcCropImageUrl,
+// product._id) pair. compareUgcCropToCatalogProduct's result depends
+// deterministically on those two inputs (target crops, hero image,
+// vision model) for the process's lifetime, so caching skips the whole
+// visual-scoring batch when a UGC has already been compared to a
+// specific catalog product in this process. Bounded by
+// SKU_VISUAL_MATCH_CACHE_MAX (default 500 entries) with TTL from
+// SKU_VISUAL_MATCH_CACHE_TTL_MS (default 30m). Insertion-order Map
+// evicts the oldest entry when full — good enough for a first pass,
+// no LRU access-order accounting needed. Kill switch:
+// SKU_VISUAL_MATCH_CACHE_ENABLED=false disables the cache and every
+// call falls through to the batch/serial path.
+const VISUAL_MATCH_CACHE_MAX = (() => {
+  const v = parseInt(process.env.SKU_VISUAL_MATCH_CACHE_MAX, 10);
+  return Number.isFinite(v) && v >= 1 && v <= 100_000 ? v : 500;
+})();
+const VISUAL_MATCH_CACHE_TTL_MS = (() => {
+  const v = parseInt(process.env.SKU_VISUAL_MATCH_CACHE_TTL_MS, 10);
+  return Number.isFinite(v) && v >= 60_000 && v <= 24 * 60 * 60 * 1000 ? v : 30 * 60 * 1000;
+})();
+function isVisualMatchCacheEnabled() {
+  const raw = String(process.env.SKU_VISUAL_MATCH_CACHE_ENABLED || 'true').toLowerCase().trim();
+  return raw !== 'false' && raw !== '0' && raw !== 'off';
+}
+const _visualMatchCache = new Map();
+let _visualMatchCacheHits = 0, _visualMatchCacheMisses = 0;
+function _cacheKey(ugcCropImageUrl, productId) {
+  return `${ugcCropImageUrl}::${productId}`;
+}
+function _cacheGet(key) {
+  const entry = _visualMatchCache.get(key);
+  if (!entry) return null;
+  if (Date.now() - entry.cachedAt > VISUAL_MATCH_CACHE_TTL_MS) {
+    _visualMatchCache.delete(key);
+    return null;
+  }
+  return entry.value;
+}
+function _cacheSet(key, value) {
+  // Insertion-order eviction: when at cap, drop the oldest entry.
+  // Map iteration order is insertion order, so the first key is oldest.
+  if (_visualMatchCache.size >= VISUAL_MATCH_CACHE_MAX) {
+    const firstKey = _visualMatchCache.keys().next().value;
+    if (firstKey !== undefined) _visualMatchCache.delete(firstKey);
+  }
+  _visualMatchCache.set(key, { value, cachedAt: Date.now() });
+}
+function visualMatchCacheStats() {
+  return { size: _visualMatchCache.size, hits: _visualMatchCacheHits, misses: _visualMatchCacheMisses };
+}
+
 // Compare a UGC refined crop against up to CATALOG_VISUAL_MATCH_MAX_IMAGES
 // visual representations of a catalog product. Targets are ordered
 // hero-refined-crops first, then alt-refined-crops, then the canonical
@@ -2440,6 +2543,19 @@ const CATALOG_VISUAL_MATCH_MAX_IMAGES = Math.max(1, parseInt(process.env.CATALOG
 // matchedAgainst } across the chosen targets.
 async function compareUgcCropToCatalogProduct(ugcCropImageUrl, product, { brandId = null } = {}) {
   if (!ugcCropImageUrl || !product) return null;
+
+  // D2 cache check — skips the whole batch/serial path on hit.
+  const productKey = product._id ? String(product._id) : null;
+  const cacheEnabled = productKey && isVisualMatchCacheEnabled();
+  const cacheKey = cacheEnabled ? _cacheKey(ugcCropImageUrl, productKey) : null;
+  if (cacheKey) {
+    const hit = _cacheGet(cacheKey);
+    if (hit !== null) {
+      _visualMatchCacheHits++;
+      return hit;
+    }
+    _visualMatchCacheMisses++;
+  }
 
   // Refined crops first (tight YOLO bbox of the product, less
   // background noise than the raw Shopify imageUrl). Hero-first
@@ -2453,7 +2569,49 @@ async function compareUgcCropToCatalogProduct(ugcCropImageUrl, product, { brandI
     ordered.push(product.imageUrl);
   }
   const targets = ordered.slice(0, CATALOG_VISUAL_MATCH_MAX_IMAGES);
-  if (!targets.length) return null;
+  if (!targets.length) {
+    if (cacheKey) _cacheSet(cacheKey, null);
+    return null;
+  }
+
+  // D1 BATCH (2026-09-02). Single Gemini call scoring all N targets in
+  // one request, replacing the pre-2026-09-02 N-parallel calls.
+  // Amortises HTTP overhead + Gemini queue wait — measured as the single
+  // largest per-call time sink on the 1.2m-avg product-match stage.
+  //
+  // Falls through to the serial Promise.all path when the batch API is
+  // disabled OR when it returned null (whole batch failed) — the serial
+  // path has per-call failure isolation, so a batch failure doesn't
+  // permanently lose the visual signal, just costs one Gemini call
+  // before the fallback and N more if the batch really was infrastructure
+  // (not model) failure.
+  if (visualCatalogMatch.isBatchEnabled && visualCatalogMatch.isBatchEnabled()) {
+    try {
+      const batchOut = await visualCatalogMatch.compareCropToCandidatesBatch({
+        cropImageUrl: ugcCropImageUrl,
+        candidates:   targets.map((url) => ({ key: url, imageUrl: url, title: product.title })),
+        brandId:      brandId || product.brandId || null,
+        productId:    product._id || null
+      });
+      if (batchOut && batchOut.length) {
+        let best = null;
+        for (const r of batchOut) {
+          if (!r) continue;
+          if (!best || (r.score || 0) > (best.score || 0)) best = r;
+        }
+        if (best) {
+          if (cacheKey) _cacheSet(cacheKey, best);
+          return best;
+        }
+      }
+      // batchOut null OR every entry null → fall through to serial. Log so
+      // we can see if batch is systematically failing for this brand and
+      // ops flip the kill switch off.
+      console.warn(`   ⚠️  visualCatalogMatch: batch returned no result for product ${product._id} — falling through to serial`);
+    } catch (err) {
+      console.warn(`   ⚠️  visualCatalogMatch: batch threw for product ${product._id}: ${err.message} — falling through to serial`);
+    }
+  }
 
   const results = await Promise.all(targets.map(async (url) => {
     const r = await visualCatalogMatch.compareCropToCandidate({
@@ -2470,6 +2628,7 @@ async function compareUgcCropToCatalogProduct(ugcCropImageUrl, product, { brandI
     if (!r) continue;
     if (!best || (r.score || 0) > (best.score || 0)) best = r;
   }
+  if (cacheKey) _cacheSet(cacheKey, best);
   return best;
 }
 
@@ -2628,6 +2787,47 @@ async function catalogFirstMatchOneRefined(refined, { brandId, brandName = null,
     }
     console.log(`   · catalog-first[${refined.id}] (visual-only fallback): visual=${bestV.visualScore.toFixed(2)} pool=${visualCandidates.length} → "${bestV.catalogMatch.product.title}"`);
     return bestV;
+  }
+
+  // D3 EARLY EXIT (2026-09-02). Text search returned ≥1 candidate above
+  // SKU_TEXT_SCORE_FLOOR (default 0.25). If the LEADER's text score is
+  // already very confident (SKU_TEXT_EARLY_EXIT_THRESHOLD, default 0.85),
+  // skip the visual scoring pass entirely — a 0.85 token-overlap match on
+  // the leader is already a stronger signal than what visual comparison
+  // typically breaks between the top-3.
+  //
+  // Cost: visual scoring is (up to 3 candidates × 3-5 images) = 9-15
+  // Gemini vision calls per product-match invocation, ~$0.005-$0.02 in
+  // aggregate + ~2-3 seconds wall time even with Promise.all parallelism.
+  // Skipping when text is already high-confidence measured on the Pelagic
+  // resync as the single largest achievable savings on product-match
+  // stage (currently 1.2m avg, 1.7m p95, 2.4m max).
+  //
+  // Kill switch: SKU_TEXT_EARLY_EXIT_THRESHOLD=0 disables (falls through
+  // to visual scoring on every text-candidate hit, byte-identical to
+  // pre-D3 behaviour). Threshold is env-tunable; a lower value trades
+  // more early exits for lower precision on borderline text matches.
+  const SKU_TEXT_EARLY_EXIT_THRESHOLD = (() => {
+    const raw = process.env.SKU_TEXT_EARLY_EXIT_THRESHOLD;
+    if (raw == null || raw === '') return 0.85;
+    const v = parseFloat(raw);
+    if (!Number.isFinite(v) || v < 0 || v > 1) return 0.85;
+    return v;
+  })();
+  const leaderText = textCandidates[0];
+  if (SKU_TEXT_EARLY_EXIT_THRESHOLD > 0 && leaderText && leaderText.textScore >= SKU_TEXT_EARLY_EXIT_THRESHOLD) {
+    console.log(
+      `   · catalog-first[${refined.id}]: text early-exit textScore=${leaderText.textScore.toFixed(2)} ` +
+      `≥ threshold=${SKU_TEXT_EARLY_EXIT_THRESHOLD} → skipping visual scoring, ` +
+      `winner="${leaderText.product.title}"`
+    );
+    return {
+      catalogMatch:   leaderText,
+      visualResult:   null,
+      textScore:      leaderText.textScore,
+      visualScore:    0,
+      combinedScore:  leaderText.textScore
+    };
   }
 
   // Visual scoring per text candidate: compare the UGC refined crop
@@ -2814,5 +3014,16 @@ module.exports = {
   findPerProductMatches,      // Phase 1.7 per-refined-product orchestrator
   findCatalogMatchByText,     // Phase 1.7 text-only catalog scorer with category scoping
   catalogFirstMatchOneRefined, // Phase 1.7 per-product catalog-first (text + visual)
-  maybeFetchProductReviewsCached // cache-aware Gemini grounded-search reviews fetch; called by catalogProductEnrichmentService on sync
+  maybeFetchProductReviewsCached, // cache-aware Gemini grounded-search reviews fetch; called by catalogProductEnrichmentService on sync
+  visualMatchCacheStats,      // D2 — introspection for harness / ops (hits, misses, size)
+  __test: {
+    // Exposed for scripts/verifyVisualMatchCache.js — never call from prod.
+    _cacheKey,
+    _cacheGet,
+    _cacheSet,
+    _visualMatchCache,
+    isVisualMatchCacheEnabled,
+    VISUAL_MATCH_CACHE_MAX,
+    VISUAL_MATCH_CACHE_TTL_MS
+  }
 };

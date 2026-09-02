@@ -15,12 +15,32 @@
 // (e.g. Shopify's 10+ angle shots per SKU) doesn't blow up the bill.
 
 const mongoose = require('mongoose');
+const axios = require('axios');
+const sharp = require('sharp');
 const Media = require('../models/Media');
 const DetectRun = require('../models/DetectRun');
 const CatalogProduct = require('../models/CatalogProduct');
 const { uploadUrlToCloudinary } = require('./cloudinaryService');
 const { normalizeBrandName } = require('../models/Brand');
 const progressService = require('./progressService');
+
+// Bounded source-URL probe so a Cloudinary-mirror-failed materialize
+// still records Media.width/height. sharp.metadata() reads the header
+// only, but we still have to download bytes; cap at 12MB with a 15s
+// timeout so a huge PDF or a stalled origin can't wedge materialize.
+async function probeImageDims(sourceUrl) {
+  if (!sourceUrl || typeof sourceUrl !== 'string') return null;
+  const res = await axios.get(sourceUrl, {
+    responseType:      'arraybuffer',
+    timeout:           15_000,
+    maxContentLength:  12 * 1024 * 1024,
+    maxBodyLength:     12 * 1024 * 1024,
+    validateStatus:    (s) => s >= 200 && s < 300
+  });
+  const meta = await sharp(Buffer.from(res.data)).metadata();
+  if (!(meta.width > 0 && meta.height > 0)) return null;
+  return { width: meta.width, height: meta.height };
+}
 const {
   storedStyleForUrl,
   technicalInsightsFromStored,
@@ -681,6 +701,7 @@ async function materializeImage({ sourceUrl, product, imageRole, feedIndex = nul
 
   let mirroredUrl;
   let uploadResult = null;
+  let probedDims = null;   // { width, height } sniffed from source when mirror fails
   try {
     uploadResult = await uploadUrlToCloudinary(sourceUrl, {
       folder: `catalog-product/${product.brandId}`
@@ -692,6 +713,23 @@ async function materializeImage({ sourceUrl, product, imageRole, feedIndex = nul
     // Detect can still run against the source URL.
     console.warn(`   ⚠️  Cloudinary mirror failed (${product._id} ${imageRole}): ${err.message}`);
     mirroredUrl = sourceUrl;
+    // Diagnosed 2026-09-01 (Pelagic Gear 981-asset bulk recovery hit
+    // Cloudinary rate limits): before this, a mirror failure left
+    // Media.width/height undefined. That silently broke reframe —
+    // reframeStrategyChooser returns { action: 'defer', reason:
+    // 'source dims unknown' } on any Media without dims, forcing 100%
+    // paid nano-banana outpaint on the affected product. Sniff dims
+    // from the source URL directly so the fallback Media at least
+    // carries usable geometry. Bounded fetch (small responseType,
+    // short timeout) so a slow origin can't hang materialize.
+    try {
+      const sniffed = await probeImageDims(sourceUrl);
+      if (sniffed?.width > 0 && sniffed?.height > 0) {
+        probedDims = { width: sniffed.width, height: sniffed.height };
+      }
+    } catch (probeErr) {
+      console.warn(`   ⚠️  Dim probe also failed (${product._id} ${imageRole}): ${probeErr.message}`);
+    }
   }
 
   try {
@@ -718,9 +756,18 @@ async function materializeImage({ sourceUrl, product, imageRole, feedIndex = nul
         productTitle:     product.title || null
       }
     };
-    // Only set when present — mirror fallback path may not have dims.
+    // Prefer Cloudinary upload dims (present on the happy path). On
+    // the Cloudinary-failed fallback path, we've already probed the
+    // source URL for dims above (probedDims) so reframe can still work
+    // against the source-URL Media even without a Cloudinary transform
+    // (reframeStrategyChooser's non-Cloudinary URL check will still
+    // reject c_crop, but at least the "source dims unknown" defer no
+    // longer fires and other consumers — subject-anchor selection,
+    // adReadinessService — get honest geometry).
     if (typeof uploadResult?.width === 'number' && uploadResult.width > 0) doc.width = uploadResult.width;
+    else if (probedDims?.width > 0) doc.width = probedDims.width;
     if (typeof uploadResult?.height === 'number' && uploadResult.height > 0) doc.height = uploadResult.height;
+    else if (probedDims?.height > 0) doc.height = probedDims.height;
     // Free hand-forward of ingest classification — no sharp, no fetch.
     if (storedShot) doc.technicalInsights = storedShot;
     return await Media.create(doc);

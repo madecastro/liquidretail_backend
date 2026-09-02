@@ -69,13 +69,27 @@ const STOP = new Set([
   'is','are','be','this','that','it','as','if','so','do','not','no'
 ]);
 
-function tokens(normalized) {
-  return String(normalized || '').split(' ').filter(t => t && t.length > 1 && !STOP.has(t));
+function tokens(normalized, extraStop = null) {
+  const src = String(normalized || '').split(' ');
+  if (!extraStop) {
+    return src.filter(t => t && t.length > 1 && !STOP.has(t));
+  }
+  return src.filter(t => t && t.length > 1 && !STOP.has(t) && !extraStop.has(t));
 }
 
-function titleSimilarity(a, b) {
-  const ta = new Set(tokens(normalizeTitle(a)));
-  const tb = new Set(tokens(normalizeTitle(b)));
+// titleSimilarity(a, b, [opts])
+//   opts.extraStop  — Set of additional tokens to filter out on BOTH
+//                     sides before counting shared. Callers pass a
+//                     per-brand stopword set (e.g. brand name tokens
+//                     + category-generic terms) so catalogRetroLink
+//                     can safely lower MIN_SHARED_TOKENS from 3 to 2
+//                     without letting "gear" or "pelagic" count as
+//                     signal. Optional — omit for base behaviour, no
+//                     regression for existing callers.
+function titleSimilarity(a, b, opts = {}) {
+  const extraStop = opts.extraStop || null;
+  const ta = new Set(tokens(normalizeTitle(a), extraStop));
+  const tb = new Set(tokens(normalizeTitle(b), extraStop));
   if (!ta.size || !tb.size) return { score: 0, shared: 0 };
   let shared = 0;
   for (const t of ta) if (tb.has(t)) shared++;
@@ -128,4 +142,4 @@ function displayNormalizeTitle(s) {
   return out;
 }
 
-module.exports = { normalizeTitle, displayNormalizeTitle, titleSimilarity };
+module.exports = { normalizeTitle, displayNormalizeTitle, titleSimilarity, tokens };

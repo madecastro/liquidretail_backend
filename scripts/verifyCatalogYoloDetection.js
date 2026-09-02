@@ -75,10 +75,21 @@ const syncFiles = [
 ];
 for (const [i, rel] of syncFiles.entries()) {
   const src = readFile(rel);
+  // Two acceptable shapes:
+  //   (old) direct in-line try/try block that calls both services
+  //   (new) delegates to catalogPostSyncOrchestrator.runPostSyncChain
+  // The orchestrator itself is separately pinned by
+  // scripts/verifyPostSyncOrchestrator.js — that harness owns the
+  // "orchestrator actually calls both underlying services" assertion,
+  // so we can accept the delegation here without duplicating the check.
   const hasMat = /catalogMediaMaterializeService[\s\S]{0,200}ensureBrandCatalogMediaMaterialized/.test(src);
   const hasYolo = /catalogYoloDetectionService[\s\S]{0,200}enqueueBrandProductYoloDetection/.test(src);
-  if (hasMat && hasYolo) pass(`C${1 + i}`, `${rel} wires materialize + YOLO detect`);
-  else fail(`C${1 + i}`, `${rel} MISSING materialize=${hasMat} yolo=${hasYolo}`);
+  const hasOrchestrator = /catalogPostSyncOrchestrator[\s\S]{0,80}runPostSyncChain/.test(src);
+  if ((hasMat && hasYolo) || hasOrchestrator) {
+    pass(`C${1 + i}`, `${rel} wires materialize + YOLO detect ${hasOrchestrator ? '(via orchestrator)' : '(inline)'}`);
+  } else {
+    fail(`C${1 + i}`, `${rel} MISSING materialize=${hasMat} yolo=${hasYolo} orchestrator=${hasOrchestrator}`);
+  }
 }
 
 // ── D: money-safe fork on media.source ──

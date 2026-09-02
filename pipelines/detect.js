@@ -339,7 +339,25 @@ async function runImagePipeline(run, media, buffer, sourceUrlOverride = null) {
   // Failure is logged but non-fatal — extended-crops + overlay-zones
   // are optional polish. applyMediaLibraryDerivations rides along
   // since it consumes overlayDoc.
-  runExtendedAndOverlayChain(run, media, sourceUrl, null, crops, judge, primarySubjectDesc, background, text, false, { safeRect, imgW, imgH })
+  //
+  // INGEST_EXTENDED_CROPS_ENABLED (2026-09-02, default false). Extended
+  // crops (nano-banana-2/edit generation of 9:16 + 1.91:1 variants) fail
+  // ~75% of the time on this brand's UGC path because nano-banana rejects
+  // those aspect_ratio values ("Request parameters are invalid"). Measured:
+  // 486 calls / 366 failures / ~$7 wasted per resync AND the successful
+  // 25% add another $3 in real spend — for a pipeline whose output is
+  // already covered by the reframe path at ad-gen time (yolo-crop /
+  // composite-mask / composite-outpaint from da22486 + ecbea9c handle
+  // 9:16 and 16:9; 1.91:1 goes through the same reframe worker).
+  //
+  // Default off means UGC gets the same treatment catalog-product already
+  // had via the hardcoded skipExtendedCrops:true a few sites down. Ops can
+  // flip INGEST_EXTENDED_CROPS_ENABLED=true to restore the old speculative
+  // pre-compute if the reframe path is regressed for a specific brand and
+  // we need the ingest-time cache back.
+  const extendedCropsIngestEnabled = String(process.env.INGEST_EXTENDED_CROPS_ENABLED || 'false')
+    .toLowerCase().trim() === 'true';
+  runExtendedAndOverlayChain(run, media, sourceUrl, null, crops, judge, primarySubjectDesc, background, text, false, { safeRect, imgW, imgH, skipExtendedCrops: !extendedCropsIngestEnabled })
     .then(async ({ extendedDoc, overlayDoc }) => {
       await updateMediaLatestArtifacts(media, {
         extended:     extendedDoc?._id,
@@ -1469,7 +1487,24 @@ async function runExtendedAndOverlayChain(run, media, sourceImageUrl, sourceVide
           sourceImageUrl, crops, judge, extendedCrops: extendedCandidates,
           forbiddenRectsPct,
           brandId: run.brandId || media.brandId || null,
-          productId: media.metadata?.catalogProductId || null
+          productId: media.metadata?.catalogProductId || null,
+          // 2026-09-02 — extra inputs for the DINO overlay-zone mode
+          // (OVERLAY_ZONES_MODE=dino). Ignored by the Gemini path.
+          // refinedProducts is the already-computed source-space bbox
+          // set — reprojected per-crop by dinoOverlayZoneService and
+          // used to derive restrictions[] + densityGrid without a paid
+          // vision call. mediaImgW/H are the source dims used for the
+          // reprojection.
+          refinedProducts:  media?.refinedProducts,
+          sourceWidth:      ctx.imgW,
+          sourceHeight:     ctx.imgH,
+          // Primary subject resolution: prefer judge.subjects.primaryId
+          // when the judge picked one; else the DINO service's own
+          // largest-bbox fallback in dinoOverlayZoneService kicks in.
+          // primarySubjectDesc's caller in this function derives the id
+          // from the same judge shape, so we forward the id directly
+          // instead of the derived description.
+          primarySubjectId: judge?.subjects?.primaryId || null
         });
       } catch (err) {
         console.warn('⚠️  Overlay zones:', err.message);
@@ -1641,13 +1676,72 @@ function buildCloudinaryCropUrl(videoUrl, crop) {
 //   - Analyze the actually-rendered self-underlay video. Use Cloudinary
 //     `so_<sec>` transform to extract N frames from the composed output
 //     URL. Cheap, but serializes compose→analyze which is currently parallel.
-async function runOverlayZoneAnalysis({ sourceImageUrl, crops, judge, extendedCrops, forbiddenRectsPct, brandId = null, productId = null, adId = null, campaignRunId = null }) {
+async function runOverlayZoneAnalysis({ sourceImageUrl, crops, judge, extendedCrops, forbiddenRectsPct, brandId = null, productId = null, adId = null, campaignRunId = null, refinedProducts = null, sourceWidth = null, sourceHeight = null, primarySubjectId = null }) {
   const inputs = pickOverlayZoneInputs({ sourceImageUrl, crops, judge, extendedCrops });
   if (!inputs.length) return {};
 
-  const settled = await Promise.allSettled(inputs.map(i =>
-    analyzeOverlayZones({ imageUrl: i.imageUrl, label: i.label, ratio: i.ratio, forbiddenRectsPct, brandId, productId, adId, campaignRunId })
-  ));
+  // OVERLAY_ZONES_MODE (2026-09-02, default 'gemini' initially for a safe
+  // rollout — flip to 'dino' via env once the artifact-shape parity is
+  // validated on real ad-gen output). Gemini path costs $0.039/call and
+  // was measured 2026-09-02 as 64% of the ingest run's total external
+  // spend ($143 of $223 on the Pelagic Gear resync); DINO path re-uses
+  // the already-computed Media.refinedProducts bboxes for $0 and no
+  // vision-model latency (typically <50ms of pure math per input vs
+  // ~50s for a Gemini call). See services/dinoOverlayZoneService.js
+  // for the classification mapping + reprojection math.
+  //
+  // 'dino' falls back to 'gemini' PER INPUT when the required data is
+  // missing (no refinedProducts, no cropRect for that ratio, non-base
+  // ratio like extended crops the DINO service isn't designed for).
+  // That way flipping the env to 'dino' on a brand without full DINO
+  // coverage still ships an artifact — just paying for a Gemini call
+  // on the gap.
+  const overlayMode = String(process.env.OVERLAY_ZONES_MODE || 'gemini').toLowerCase().trim();
+  const dinoEligible = (input) => (
+    overlayMode === 'dino' &&
+    input.cropRect &&
+    Array.isArray(refinedProducts) && refinedProducts.length > 0
+  );
+
+  const settled = await Promise.allSettled(inputs.map(async (i) => {
+    if (dinoEligible(i)) {
+      const { analyzeFromRefinedProducts } = require('../services/dinoOverlayZoneService');
+      // brightnessGrid needs the crop image bytes — for the DINO path we
+      // still fetch and probe the image so the density + brightness data
+      // is coherent with the same file the ad-gen renderer will use, but
+      // NO Gemini call fires. That's the ~$0.039/call savings landing
+      // here. Computed inline via overlayZoneService's exported helper
+      // so the two paths share ONE brightness implementation.
+      const { computeBrightnessGridFromUrl } = require('../services/overlayZoneService');
+      let brightnessGrid = null, imageWidth = null, imageHeight = null;
+      if (computeBrightnessGridFromUrl) {
+        try {
+          const probe = await computeBrightnessGridFromUrl(i.imageUrl, { ratio: i.ratio });
+          if (probe) {
+            brightnessGrid = probe.brightnessGrid || null;
+            imageWidth = probe.imageWidth || null;
+            imageHeight = probe.imageHeight || null;
+          }
+        } catch (err) {
+          console.warn(`   · overlay-zones[${i.label}] (dino): brightness probe failed — ${err.message}`);
+        }
+      }
+      const zone = analyzeFromRefinedProducts({
+        refinedProducts,
+        cropRect:         i.cropRect,
+        primarySubjectId,
+        ratio:            i.ratio,
+        brightnessGrid,
+        forbiddenRectsPct,
+        imageWidth,
+        imageHeight,
+        label:            i.label
+      });
+      if (zone) return zone;
+      // Fall through to Gemini when DINO returns null (unusable inputs).
+    }
+    return analyzeOverlayZones({ imageUrl: i.imageUrl, label: i.label, ratio: i.ratio, forbiddenRectsPct, brandId, productId, adId, campaignRunId });
+  }));
 
   const artifact = {};
   inputs.forEach((input, idx) => {
@@ -1663,7 +1757,8 @@ async function runOverlayZoneAnalysis({ sourceImageUrl, crops, judge, extendedCr
   });
 
   const ok = Object.values(artifact).flat().filter(e => e.analysis).length;
-  console.log(`🎯 Overlay zones: ${ok}/${inputs.length} analyses complete`);
+  const dinoCount = Object.values(artifact).flat().filter(e => e.analysis?.schemaVersion === '3.0-dino').length;
+  console.log(`🎯 Overlay zones: ${ok}/${inputs.length} analyses complete (${dinoCount} via DINO, ${ok - dinoCount} via Gemini)`);
   return artifact;
 }
 
@@ -1685,7 +1780,12 @@ function pickOverlayZoneInputs({ sourceImageUrl, crops, judge, extendedCrops }) 
     if (!imageUrl) continue;
     inputs.push({
       ratio, provider: null, variant: 'base', candidateId: winner.id, imageUrl,
-      label: `${ratio} base`
+      label: `${ratio} base`,
+      // 2026-09-02 — cropRect in source pixels for the DINO overlay-zone
+      // path. Winner carries {x1,y1,x2,y2} in source coords; forwarded
+      // as-is so dinoOverlayZoneService can reproject bboxes without
+      // needing to re-parse the c_crop transform URL.
+      cropRect: winner
     });
   }
 
