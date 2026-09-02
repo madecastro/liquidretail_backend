@@ -275,8 +275,21 @@ async function syncPostsForCred(cred, options = {}) {
     queuedRunIds: []
   };
 
+  // Universal ingest cap — see services/ingestLimits.js. Env
+  // SOCIAL_INGEST_LIMIT bounds how many posts persist per pass; default
+  // 10. Idempotent 'already-ingested' skips do NOT count toward the cap
+  // — a resumed sync of a brand at 8/10 needs to be able to see the
+  // remaining 2 posts get counted, not stall on the historical 8.
+  const { socialIngestLimit } = require('./ingestLimits');
+  const socialCap = socialIngestLimit();
+  let socialPersisted = 0;
+
   let postIdx = 0;
   for (const post of posts) {
+    if (socialCap != null && socialPersisted >= socialCap) {
+      console.log(`   · Instagram sync hit SOCIAL_INGEST_LIMIT=${socialCap} — stopping after ${socialPersisted} new post(s)`);
+      break;
+    }
     // Cooperative cancel + live counter for the ActivityDock.
     if (options.run) {
       if (++postIdx % 5 === 0) await options.run.checkpoint();
@@ -307,6 +320,7 @@ async function syncPostsForCred(cred, options = {}) {
       });
       if (ingested?.mediaId) {
         if (existing) summary.reIngested++; else summary.ingested++;
+        socialPersisted++;
         if (ingested.runId) {
           summary.queuedRunIds.push(String(ingested.runId));
           if (runsRemaining != null) runsRemaining--;

@@ -292,8 +292,21 @@ async function syncBrandInstagram(brand, run = null) {
 
   const summary = { ok: true, fetched: posts.length, ingested: 0, skipped: 0, errors: 0, queuedRunIds: [], aborted: false };
 
+  // Universal ingest cap — see services/ingestLimits.js. Env
+  // SOCIAL_INGEST_LIMIT bounds how many posts persist per pass; default
+  // 10. Deliberately capping the persist loop rather than the fetch —
+  // Apify actor pricing is per-run, not per-post-returned, so shrinking
+  // the fetch wouldn't save credits.
+  const { socialIngestLimit } = require('./ingestLimits');
+  const socialCap = socialIngestLimit();
+  let socialPersisted = 0;
+
   let idx = 0;
   for (const post of posts) {
+    if (socialCap != null && socialPersisted >= socialCap) {
+      console.log(`   · Apify IG ingest hit SOCIAL_INGEST_LIMIT=${socialCap} — stopping after ${socialPersisted} post(s)`);
+      break;
+    }
     idx += 1;
     if (await isBrandAborted(brand._id, run)) {
       summary.aborted = true;
@@ -306,7 +319,7 @@ async function syncBrandInstagram(brand, run = null) {
       // re-enqueues detect for already-ingested media.
       if (r?.runId) summary.queuedRunIds.push(String(r.runId));
       if (r?.skipped) summary.skipped++;
-      else if (r?.mediaId) summary.ingested++;
+      else if (r?.mediaId) { summary.ingested++; socialPersisted++; }
     } catch (err) {
       console.warn(`   ⚠️  Apify IG ingest failed for ${post.externalId}: ${err.message}`);
       summary.errors++;
@@ -583,12 +596,22 @@ async function syncBrandShopify(brand, run = null) {
   }
 
   const summary = { ok: true, fetched: products.length, added: 0, updated: 0, errors: 0, aborted: false };
+  // Universal ingest cap — see services/ingestLimits.js. Env
+  // CATALOG_INGEST_LIMIT bounds how many rows this pass persists;
+  // default 10.
+  const { catalogIngestLimit } = require('./ingestLimits');
+  const catalogCap = catalogIngestLimit();
+  let catalogPersisted = 0;
   // ARCHITECTURE: upsert NEVER awaits image classify. Post-loop pass only.
   const shotSession = ingestShotClassify.createSession();
   const pendingClassify = [];
   let idx = 0;
   try {
   for (const p of products) {
+    if (catalogCap != null && catalogPersisted >= catalogCap) {
+      console.log(`   · Apify Shopify ingest hit CATALOG_INGEST_LIMIT=${catalogCap} — stopping after ${catalogPersisted} product(s)`);
+      break;
+    }
     idx += 1;
     if (await isBrandAborted(brand._id, run)) {
       summary.aborted = true;
@@ -642,6 +665,7 @@ async function syncBrandShopify(brand, run = null) {
       );
       if (result?.lastErrorObject?.updatedExisting) summary.updated++;
       else                                           summary.added++;
+      catalogPersisted++;
       // Defer classify to post-loop pass — never block remaining upserts.
       const row = result?.value || result;
 

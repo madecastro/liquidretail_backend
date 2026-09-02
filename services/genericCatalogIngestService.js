@@ -226,8 +226,19 @@ async function syncBrandGenericCatalog(brand, run, { isBrandAborted, categories 
   let cancelled = resolverCancelled;
   let partial = !!access.partial;
   let partialReason = access.partialReason || null;
+  // Universal ingest cap — see services/ingestLimits.js. Env
+  // CATALOG_INGEST_LIMIT bounds how many rows this pass persists;
+  // default 10. Stops the loop at the cap without changing what the
+  // upstream fetch returned.
+  const { catalogIngestLimit } = require('./ingestLimits');
+  const ingestCap = catalogIngestLimit();
+  let persistedCount = 0;
   try {
   for (const p of products) {
+    if (ingestCap != null && persistedCount >= ingestCap) {
+      console.log(`   · ${LOG}  hit CATALOG_INGEST_LIMIT=${ingestCap} — stopping after ${persistedCount} product(s)`);
+      break;
+    }
     idx += 1;
     if (!resolverCancelled) {
       let midAbort = false;
@@ -349,6 +360,7 @@ async function syncBrandGenericCatalog(brand, run, { isBrandAborted, categories 
         { upsert: true, new: true }
       );
       productsUpserted += 1;
+      persistedCount += 1;
 
       // Post-upsert category stamp. Two candidate stamps: the JSON-LD
       // scanner-derived leaf (categoryRefId, set at line 254) or the

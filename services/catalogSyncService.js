@@ -184,6 +184,14 @@ async function syncCatalogForCred(cred, run = null) {
   let url = `${META_GRAPH_ROOT}/${cred.catalogId}/products`;
   let params = { fields: FIELDS, limit: PAGE_SIZE, access_token: token };
   let added = 0, updated = 0, errors = 0, fetched = 0;
+  // Universal ingest cap — see services/ingestLimits.js. Env
+  // CATALOG_INGEST_LIMIT bounds how many rows this pass persists;
+  // default 10. Applied across paginated Meta Graph pages: the outer
+  // `while (url && ...)` loop exits when the persisted count hits the
+  // cap, so a 250-item page fetches but only the first N are written.
+  const { catalogIngestLimit } = require('./ingestLimits');
+  const catalogCap = catalogIngestLimit();
+  let catalogPersisted = 0;
   // ARCHITECTURE: upsert NEVER awaits image classify. Collect work during
   // the page loop; run a post-loop pass so hung DNS cannot truncate the
   // catalog. try/finally guarantees logSummary on every exit (incl. fatal
@@ -197,6 +205,12 @@ async function syncCatalogForCred(cred, run = null) {
   try {
 
   while (url && fetched < MAX_ITEMS) {
+    if (catalogCap != null && catalogPersisted >= catalogCap) {
+      // Inner for-loop already broke when the cap was reached; the outer
+      // while-loop would happily paginate more Meta pages we'd discard,
+      // so short-circuit here too.
+      break;
+    }
     // Cooperative cancel boundary: between pages (and every 25 items
     // below). Throws CancelledError — syncCatalog handles it; partial
     // upserts stay in Mongo.
@@ -222,6 +236,10 @@ async function syncCatalogForCred(cred, run = null) {
     fetched += items.length;
     let pageIdx = 0;
     for (const item of items) {
+      if (catalogCap != null && catalogPersisted >= catalogCap) {
+        console.log(`   · 📦 catalog sync hit CATALOG_INGEST_LIMIT=${catalogCap} — stopping after ${catalogPersisted} product(s)`);
+        break;
+      }
       if (++pageIdx % 25 === 0) await progress.checkpoint();
       const externalId = String(item.id || '').trim();
       if (!externalId) { errors++; continue; }
@@ -268,6 +286,7 @@ async function syncCatalogForCred(cred, run = null) {
         // updatedExisting=false means this was an insert.
         if (result?.lastErrorObject?.updatedExisting) updated++;
         else                                          added++;
+        catalogPersisted++;
 
         // Stamp / restamp the Category leaf. applyFeedTruthStamp
         // handles the three cases uniformly:

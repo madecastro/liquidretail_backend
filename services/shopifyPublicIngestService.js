@@ -452,9 +452,21 @@ async function syncBrandShopifyDirect(brand, run, { isBrandAborted } = {}) {
   const shotSession = ingestShotClassify.createSession();
   const pendingClassify = [];
   let midUpsertCancelled = false;
+  // Universal ingest cap (2026-09-02, services/ingestLimits.js). Bounded
+  // by CATALOG_INGEST_LIMIT env; defaults to 10 rows per pass. Stops the
+  // persist loop the moment the cap is reached rather than filtering
+  // upstream — the fetch may have returned a full page, we simply choose
+  // to write only N.
+  const { catalogIngestLimit } = require('./ingestLimits');
+  const ingestCap = catalogIngestLimit();
+  let persistedCount = 0;
   try {
   let idx = 0;
   for (const p of products) {
+    if (ingestCap != null && persistedCount >= ingestCap) {
+      console.log(`   · 🛍  hit CATALOG_INGEST_LIMIT=${ingestCap} — stopping after ${persistedCount} product(s)`);
+      break;
+    }
     idx += 1;
     if (await abortCheck(brand._id, run)) {
       console.log(`   · 🛍  aborted mid-upsert for brand=${brand._id}`);
@@ -510,6 +522,7 @@ async function syncBrandShopifyDirect(brand, run, { isBrandAborted } = {}) {
         { upsert: true, new: true }
       );
       productsUpserted += 1;
+      persistedCount += 1;
 
       // Stamp / restamp categoryRef via applyFeedTruthStamp. Handles
       // insert (fresh row), noop (ref already matches), and rename
