@@ -2483,6 +2483,57 @@ function slugify(s) {
 // dialed without a deploy.
 const CATALOG_VISUAL_MATCH_MAX_IMAGES = Math.max(1, parseInt(process.env.CATALOG_VISUAL_MATCH_MAX_IMAGES, 10) || 1);
 
+// D2 (2026-09-02) — process-local LRU on the (ugcCropImageUrl,
+// product._id) pair. compareUgcCropToCatalogProduct's result depends
+// deterministically on those two inputs (target crops, hero image,
+// vision model) for the process's lifetime, so caching skips the whole
+// visual-scoring batch when a UGC has already been compared to a
+// specific catalog product in this process. Bounded by
+// SKU_VISUAL_MATCH_CACHE_MAX (default 500 entries) with TTL from
+// SKU_VISUAL_MATCH_CACHE_TTL_MS (default 30m). Insertion-order Map
+// evicts the oldest entry when full — good enough for a first pass,
+// no LRU access-order accounting needed. Kill switch:
+// SKU_VISUAL_MATCH_CACHE_ENABLED=false disables the cache and every
+// call falls through to the batch/serial path.
+const VISUAL_MATCH_CACHE_MAX = (() => {
+  const v = parseInt(process.env.SKU_VISUAL_MATCH_CACHE_MAX, 10);
+  return Number.isFinite(v) && v >= 1 && v <= 100_000 ? v : 500;
+})();
+const VISUAL_MATCH_CACHE_TTL_MS = (() => {
+  const v = parseInt(process.env.SKU_VISUAL_MATCH_CACHE_TTL_MS, 10);
+  return Number.isFinite(v) && v >= 60_000 && v <= 24 * 60 * 60 * 1000 ? v : 30 * 60 * 1000;
+})();
+function isVisualMatchCacheEnabled() {
+  const raw = String(process.env.SKU_VISUAL_MATCH_CACHE_ENABLED || 'true').toLowerCase().trim();
+  return raw !== 'false' && raw !== '0' && raw !== 'off';
+}
+const _visualMatchCache = new Map();
+let _visualMatchCacheHits = 0, _visualMatchCacheMisses = 0;
+function _cacheKey(ugcCropImageUrl, productId) {
+  return `${ugcCropImageUrl}::${productId}`;
+}
+function _cacheGet(key) {
+  const entry = _visualMatchCache.get(key);
+  if (!entry) return null;
+  if (Date.now() - entry.cachedAt > VISUAL_MATCH_CACHE_TTL_MS) {
+    _visualMatchCache.delete(key);
+    return null;
+  }
+  return entry.value;
+}
+function _cacheSet(key, value) {
+  // Insertion-order eviction: when at cap, drop the oldest entry.
+  // Map iteration order is insertion order, so the first key is oldest.
+  if (_visualMatchCache.size >= VISUAL_MATCH_CACHE_MAX) {
+    const firstKey = _visualMatchCache.keys().next().value;
+    if (firstKey !== undefined) _visualMatchCache.delete(firstKey);
+  }
+  _visualMatchCache.set(key, { value, cachedAt: Date.now() });
+}
+function visualMatchCacheStats() {
+  return { size: _visualMatchCache.size, hits: _visualMatchCacheHits, misses: _visualMatchCacheMisses };
+}
+
 // Compare a UGC refined crop against up to CATALOG_VISUAL_MATCH_MAX_IMAGES
 // visual representations of a catalog product. Targets are ordered
 // hero-refined-crops first, then alt-refined-crops, then the canonical
@@ -2492,6 +2543,19 @@ const CATALOG_VISUAL_MATCH_MAX_IMAGES = Math.max(1, parseInt(process.env.CATALOG
 // matchedAgainst } across the chosen targets.
 async function compareUgcCropToCatalogProduct(ugcCropImageUrl, product, { brandId = null } = {}) {
   if (!ugcCropImageUrl || !product) return null;
+
+  // D2 cache check — skips the whole batch/serial path on hit.
+  const productKey = product._id ? String(product._id) : null;
+  const cacheEnabled = productKey && isVisualMatchCacheEnabled();
+  const cacheKey = cacheEnabled ? _cacheKey(ugcCropImageUrl, productKey) : null;
+  if (cacheKey) {
+    const hit = _cacheGet(cacheKey);
+    if (hit !== null) {
+      _visualMatchCacheHits++;
+      return hit;
+    }
+    _visualMatchCacheMisses++;
+  }
 
   // Refined crops first (tight YOLO bbox of the product, less
   // background noise than the raw Shopify imageUrl). Hero-first
@@ -2505,7 +2569,10 @@ async function compareUgcCropToCatalogProduct(ugcCropImageUrl, product, { brandI
     ordered.push(product.imageUrl);
   }
   const targets = ordered.slice(0, CATALOG_VISUAL_MATCH_MAX_IMAGES);
-  if (!targets.length) return null;
+  if (!targets.length) {
+    if (cacheKey) _cacheSet(cacheKey, null);
+    return null;
+  }
 
   // D1 BATCH (2026-09-02). Single Gemini call scoring all N targets in
   // one request, replacing the pre-2026-09-02 N-parallel calls.
@@ -2532,7 +2599,10 @@ async function compareUgcCropToCatalogProduct(ugcCropImageUrl, product, { brandI
           if (!r) continue;
           if (!best || (r.score || 0) > (best.score || 0)) best = r;
         }
-        if (best) return best;
+        if (best) {
+          if (cacheKey) _cacheSet(cacheKey, best);
+          return best;
+        }
       }
       // batchOut null OR every entry null → fall through to serial. Log so
       // we can see if batch is systematically failing for this brand and
@@ -2558,6 +2628,7 @@ async function compareUgcCropToCatalogProduct(ugcCropImageUrl, product, { brandI
     if (!r) continue;
     if (!best || (r.score || 0) > (best.score || 0)) best = r;
   }
+  if (cacheKey) _cacheSet(cacheKey, best);
   return best;
 }
 
@@ -2943,5 +3014,16 @@ module.exports = {
   findPerProductMatches,      // Phase 1.7 per-refined-product orchestrator
   findCatalogMatchByText,     // Phase 1.7 text-only catalog scorer with category scoping
   catalogFirstMatchOneRefined, // Phase 1.7 per-product catalog-first (text + visual)
-  maybeFetchProductReviewsCached // cache-aware Gemini grounded-search reviews fetch; called by catalogProductEnrichmentService on sync
+  maybeFetchProductReviewsCached, // cache-aware Gemini grounded-search reviews fetch; called by catalogProductEnrichmentService on sync
+  visualMatchCacheStats,      // D2 — introspection for harness / ops (hits, misses, size)
+  __test: {
+    // Exposed for scripts/verifyVisualMatchCache.js — never call from prod.
+    _cacheKey,
+    _cacheGet,
+    _cacheSet,
+    _visualMatchCache,
+    isVisualMatchCacheEnabled,
+    VISUAL_MATCH_CACHE_MAX,
+    VISUAL_MATCH_CACHE_TTL_MS
+  }
 };
