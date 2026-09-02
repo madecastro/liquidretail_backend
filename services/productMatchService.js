@@ -2507,6 +2507,42 @@ async function compareUgcCropToCatalogProduct(ugcCropImageUrl, product, { brandI
   const targets = ordered.slice(0, CATALOG_VISUAL_MATCH_MAX_IMAGES);
   if (!targets.length) return null;
 
+  // D1 BATCH (2026-09-02). Single Gemini call scoring all N targets in
+  // one request, replacing the pre-2026-09-02 N-parallel calls.
+  // Amortises HTTP overhead + Gemini queue wait — measured as the single
+  // largest per-call time sink on the 1.2m-avg product-match stage.
+  //
+  // Falls through to the serial Promise.all path when the batch API is
+  // disabled OR when it returned null (whole batch failed) — the serial
+  // path has per-call failure isolation, so a batch failure doesn't
+  // permanently lose the visual signal, just costs one Gemini call
+  // before the fallback and N more if the batch really was infrastructure
+  // (not model) failure.
+  if (visualCatalogMatch.isBatchEnabled && visualCatalogMatch.isBatchEnabled()) {
+    try {
+      const batchOut = await visualCatalogMatch.compareCropToCandidatesBatch({
+        cropImageUrl: ugcCropImageUrl,
+        candidates:   targets.map((url) => ({ key: url, imageUrl: url, title: product.title })),
+        brandId:      brandId || product.brandId || null,
+        productId:    product._id || null
+      });
+      if (batchOut && batchOut.length) {
+        let best = null;
+        for (const r of batchOut) {
+          if (!r) continue;
+          if (!best || (r.score || 0) > (best.score || 0)) best = r;
+        }
+        if (best) return best;
+      }
+      // batchOut null OR every entry null → fall through to serial. Log so
+      // we can see if batch is systematically failing for this brand and
+      // ops flip the kill switch off.
+      console.warn(`   ⚠️  visualCatalogMatch: batch returned no result for product ${product._id} — falling through to serial`);
+    } catch (err) {
+      console.warn(`   ⚠️  visualCatalogMatch: batch threw for product ${product._id}: ${err.message} — falling through to serial`);
+    }
+  }
+
   const results = await Promise.all(targets.map(async (url) => {
     const r = await visualCatalogMatch.compareCropToCandidate({
       cropImageUrl: ugcCropImageUrl,

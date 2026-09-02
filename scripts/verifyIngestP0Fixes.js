@@ -209,6 +209,92 @@ check('D3-6 defaults.env commits SKU_TEXT_EARLY_EXIT_THRESHOLD=0.85', () => {
   assert.match(defaultsEnv, /^SKU_TEXT_EARLY_EXIT_THRESHOLD=0\.85$/m);
 });
 
+// ── SECTION D1 — visual match batching ─────────────────────────────────
+
+console.log('\n== D1. visualCatalogMatchService batch API + productMatchService caller ==');
+
+const visualMatchSrc = fs.readFileSync(
+  path.join(__dirname, '..', 'services', 'visualCatalogMatchService.js'), 'utf8'
+);
+
+check('D1-1 visualCatalogMatchService exports compareCropToCandidatesBatch', () => {
+  const svc = require('../services/visualCatalogMatchService');
+  assert.strictEqual(typeof svc.compareCropToCandidatesBatch, 'function');
+});
+
+check('D1-2 visualCatalogMatchService exports isBatchEnabled with correct default', () => {
+  const svc = require('../services/visualCatalogMatchService');
+  assert.strictEqual(typeof svc.isBatchEnabled, 'function');
+  const prior = process.env.SKU_VISUAL_MATCH_BATCH_ENABLED;
+  try {
+    delete process.env.SKU_VISUAL_MATCH_BATCH_ENABLED;
+    assert.strictEqual(svc.isBatchEnabled(), true, 'default (unset) → true');
+    process.env.SKU_VISUAL_MATCH_BATCH_ENABLED = 'false';
+    assert.strictEqual(svc.isBatchEnabled(), false, '"false" → false');
+    process.env.SKU_VISUAL_MATCH_BATCH_ENABLED = '0';
+    assert.strictEqual(svc.isBatchEnabled(), false, '"0" → false');
+    process.env.SKU_VISUAL_MATCH_BATCH_ENABLED = 'off';
+    assert.strictEqual(svc.isBatchEnabled(), false, '"off" → false');
+    process.env.SKU_VISUAL_MATCH_BATCH_ENABLED = 'garbage';
+    assert.strictEqual(svc.isBatchEnabled(), true, 'garbage → true (defaults on)');
+  } finally {
+    if (prior === undefined) delete process.env.SKU_VISUAL_MATCH_BATCH_ENABLED;
+    else process.env.SKU_VISUAL_MATCH_BATCH_ENABLED = prior;
+  }
+});
+
+check('D1-3 batch response schema has stable 1-indexed candidate field', () => {
+  // A regression to 0-indexed would silently shift every result by one
+  // (candidate N would map to the wrong target's imageUrl in the caller).
+  // Pinning the schema shape prevents that class of bug.
+  assert.match(
+    visualMatchSrc,
+    /candidate:\s*\{\s*type:\s*['"]integer['"]/,
+    'expected `candidate` field on the batch response schema (1-indexed)'
+  );
+});
+
+check('D1-4 batch result rehydrates ORIGINAL-INDEX null slots for dropped candidates', () => {
+  // Structural: a candidate whose image download failed must return null at
+  // its input index, not shift subsequent candidates up. The caller's best-
+  // score loop tolerates null but relies on stable positional indexing.
+  const fnStart = visualMatchSrc.indexOf('async function compareCropToCandidatesBatch');
+  const fnEnd = visualMatchSrc.indexOf('module.exports', fnStart);
+  const fn = visualMatchSrc.slice(fnStart, fnEnd);
+  assert.match(fn, /new Array\(candidates\.length\)\.fill\(null\)/,
+    'expected output array sized to input length filled with null');
+  assert.match(fn, /out\[scored\[i\]\.inputIdx\]\s*=/,
+    'expected results to be placed at inputIdx (original candidate position)');
+});
+
+check('D1-5 productMatchService prefers batch, falls through to serial on failure', () => {
+  // The caller MUST retain the serial Promise.all path as a fallback —
+  // batch failure should not permanently lose the visual signal for a
+  // product. Structural pin: `compareCropToCandidatesBatch` call exists
+  // AND the serial `Promise.all(targets.map(async (url) => ...))` also
+  // exists AND the batch call precedes the serial map.
+  const batchIdx = productMatchSrc.indexOf('compareCropToCandidatesBatch(');
+  const serialMapIdx = productMatchSrc.indexOf('const results = await Promise.all(targets.map(async (url) =>');
+  assert.ok(batchIdx > 0, 'expected compareCropToCandidatesBatch call');
+  assert.ok(serialMapIdx > 0, 'expected serial fallback Promise.all to remain');
+  assert.ok(batchIdx < serialMapIdx, 'batch must be tried BEFORE the serial fallback');
+});
+
+check('D1-6 batch gated on isBatchEnabled() at the caller (kill switch honored)', () => {
+  // Structural: the batch call site checks isBatchEnabled() so
+  // SKU_VISUAL_MATCH_BATCH_ENABLED=false actually skips the batch attempt
+  // and goes straight to serial. Missing this gate would waste one batch
+  // call per product even when ops flipped the switch off.
+  const batchIdx = productMatchSrc.indexOf('compareCropToCandidatesBatch(');
+  const upstream = productMatchSrc.slice(Math.max(0, batchIdx - 500), batchIdx);
+  assert.match(upstream, /isBatchEnabled/,
+    'expected isBatchEnabled() check upstream of compareCropToCandidatesBatch call');
+});
+
+check('D1-7 defaults.env commits SKU_VISUAL_MATCH_BATCH_ENABLED=true', () => {
+  assert.match(defaultsEnv, /^SKU_VISUAL_MATCH_BATCH_ENABLED=true$/m);
+});
+
 // ── Summary ─────────────────────────────────────────────────────────────
 
 const total = results.length;
