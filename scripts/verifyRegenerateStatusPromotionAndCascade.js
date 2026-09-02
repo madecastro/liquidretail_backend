@@ -114,6 +114,17 @@ function matches(doc, filter) {
     if (cond && typeof cond === 'object' && !Array.isArray(cond)) {
       return Object.entries(cond).every(([op, opVal]) => {
         if (op === '$ne') return val !== opVal;
+        // Array-field $in/$nin (added 2026-09-02 for campaignRunIds
+        // scoping): Mongo's $in against an array field matches when ANY
+        // element of the array is in the list (array-contains-any), not
+        // scalar equality of the whole array. Scalar fields fall through to
+        // plain membership, matching the pre-existing callers.
+        if (op === '$in') {
+          return Array.isArray(val) ? val.some((v) => opVal.includes(v)) : opVal.includes(val);
+        }
+        if (op === '$nin') {
+          return Array.isArray(val) ? !val.some((v) => opVal.includes(v)) : !opVal.includes(val);
+        }
         throw new Error(`unsupported operator ${op}`);
       });
     }
@@ -201,9 +212,13 @@ function baseAd(over = {}) {
     regenerating: false,
     claimedByWorker: null,
     retitleClaimedByWorker: null,
+    titlingNeeded: false,
     veoVideoUrl: null,
     veoAspectRatio: null,
+    renderUrl: null,
     basePlate: undefined,
+    campaignRunIds: ['run-1'],
+    visionQc: null,
     ...over
   };
 }
@@ -245,7 +260,11 @@ function baseAd(over = {}) {
   });
 
   await checkAsync('A6 an Ad.updateOne throw is swallowed (never fatal to the caller)', async () => {
-    stub(AD, { updateOne: async () => { throw new Error('simulated Mongo error'); } });
+    AdCol = new MiniCollection([baseAd({ status: 'failed' })]);
+    stub(AD, { find: (f) => AdCol.find(f), findById: (id) => AdCol.findById(id), updateOne: (f, u) => AdCol.updateOne(f, u) });
+    // See C4's own comment for why AdCol.updateOne is overridden in place
+    // rather than re-calling stub(AD, {...}) with a brand-new object.
+    AdCol.updateOne = async () => { throw new Error('simulated Mongo error'); };
     await svc.promoteFailedToDraft('a0000000000000000000000'); // must not throw
   });
 
@@ -253,25 +272,39 @@ function baseAd(over = {}) {
   // GROUP B — findDerivativesOfMaster (inverts findSiblingMasterAd)
   // ═══════════════════════════════════════════════════════════════════
   function buildFamily() {
-    const master = baseAd({ _id: 'm0000000000000000000000', deriveFromMaster: null, veoVideoUrl: 'https://old.example/master' });
-    const eligible = baseAd({ _id: 's1000000000000000000000', deriveFromMaster: master.platformFormat });
-    const claimed  = baseAd({ _id: 's2000000000000000000000', deriveFromMaster: master.platformFormat, claimedByWorker: 'renderer-x' });
-    const regening = baseAd({ _id: 's3000000000000000000000', deriveFromMaster: master.platformFormat, regenerating: true });
-    const retitled = baseAd({ _id: 's4000000000000000000000', deriveFromMaster: master.platformFormat, retitleClaimedByWorker: 'titler-x' });
-    const otherCamp = baseAd({ _id: 's5000000000000000000000', deriveFromMaster: master.platformFormat, campaignId: 'zzzzzzzzzzzzzzzzzzzzzzzz' });
-    const otherProd = baseAd({ _id: 's6000000000000000000000', deriveFromMaster: master.platformFormat, productId: 'zzzzzzzzzzzzzzzzzzzzzzzz' });
-    const wrongFmt  = baseAd({ _id: 's7000000000000000000000', deriveFromMaster: 'pmax_video_9_16' });
-    const trueMaster = baseAd({ _id: 's8000000000000000000000', deriveFromMaster: null });
-    return { master, docs: [master, eligible, claimed, regening, retitled, otherCamp, otherProd, wrongFmt, trueMaster] };
+    const master = baseAd({ _id: 'm0000000000000000000000', deriveFromMaster: null, veoVideoUrl: 'https://old.example/master', campaignRunIds: ['run-1'] });
+    const eligible  = baseAd({ _id: 's1000000000000000000000', deriveFromMaster: master.platformFormat, campaignRunIds: ['run-1'] });
+    const claimed   = baseAd({ _id: 's2000000000000000000000', deriveFromMaster: master.platformFormat, claimedByWorker: 'renderer-x', campaignRunIds: ['run-1'] });
+    const regening  = baseAd({ _id: 's3000000000000000000000', deriveFromMaster: master.platformFormat, regenerating: true, campaignRunIds: ['run-1'] });
+    const retitled  = baseAd({ _id: 's4000000000000000000000', deriveFromMaster: master.platformFormat, retitleClaimedByWorker: 'titler-x', campaignRunIds: ['run-1'] });
+    const otherCamp = baseAd({ _id: 's5000000000000000000000', deriveFromMaster: master.platformFormat, campaignId: 'zzzzzzzzzzzzzzzzzzzzzzzz', campaignRunIds: ['run-1'] });
+    const otherProd = baseAd({ _id: 's6000000000000000000000', deriveFromMaster: master.platformFormat, productId: 'zzzzzzzzzzzzzzzzzzzzzzzz', campaignRunIds: ['run-1'] });
+    const wrongFmt  = baseAd({ _id: 's7000000000000000000000', deriveFromMaster: 'pmax_video_9_16', campaignRunIds: ['run-1'] });
+    const trueMaster = baseAd({ _id: 's8000000000000000000000', deriveFromMaster: null, campaignRunIds: ['run-1'] });
+    const titlerOwned = baseAd({ _id: 's9000000000000000000000', deriveFromMaster: master.platformFormat, titlingNeeded: true, campaignRunIds: ['run-1'] });
+    const stillRendering = baseAd({ _id: 'sA000000000000000000000', deriveFromMaster: master.platformFormat, status: 'rendering', campaignRunIds: ['run-1'] });
+    const archived = baseAd({ _id: 'sB000000000000000000000', deriveFromMaster: master.platformFormat, status: 'archived', campaignRunIds: ['run-1'] });
+    // A genuine sibling minted in a LATER run than the master's own
+    // campaignRunIds snapshot (e.g. a funnel-variant added on a later
+    // Generate) — MUST still be found. An earlier version of this fix
+    // scoped by campaignRunIds and would have missed this row; removed
+    // after a second adversarial review pass proved that scoping wrong in
+    // the harmful direction (see findDerivativesOfMaster's own comment).
+    const laterRunSibling = baseAd({ _id: 'sC000000000000000000000', deriveFromMaster: master.platformFormat, campaignRunIds: ['run-9'] });
+    return {
+      master,
+      docs: [master, eligible, claimed, regening, retitled, otherCamp, otherProd, wrongFmt, trueMaster, titlerOwned, stillRendering, archived, laterRunSibling]
+    };
   }
 
-  await checkAsync('B1 finds the one eligible sibling', async () => {
+  await checkAsync('B1 finds the eligible siblings, INCLUDING one from a later campaign run', async () => {
     const { master, docs } = buildFamily();
     AdCol = new MiniCollection(docs);
     stub(AD, { find: (f) => AdCol.find(f), findById: (id) => AdCol.findById(id), updateOne: (f, u) => AdCol.updateOne(f, u) });
     const found = await svc.findDerivativesOfMaster(master);
-    assert.strictEqual(found.length, 1, `expected exactly 1, got ${found.length}: ${found.map((d) => d._id)}`);
-    assert.strictEqual(found[0]._id, 's1000000000000000000000');
+    const foundIds = found.map((d) => d._id).sort();
+    assert.deepStrictEqual(foundIds, ['s1000000000000000000000', 'sC000000000000000000000'].sort(),
+      `expected exactly the same-run and later-run siblings, got ${foundIds}`);
   });
 
   const exclusions = [
@@ -281,7 +314,10 @@ function baseAd(over = {}) {
     ['B5 excludes a different campaignId', 's5000000000000000000000'],
     ['B6 excludes a different productId', 's6000000000000000000000'],
     ['B7 excludes a different deriveFromMaster value (wrong master format)', 's7000000000000000000000'],
-    ['B8 excludes an unrelated true master (deriveFromMaster:null)', 's8000000000000000000000']
+    ['B8 excludes an unrelated true master (deriveFromMaster:null)', 's8000000000000000000000'],
+    ['B9 [MONEY] excludes a titler-owned sibling (titlingNeeded:true)', 's9000000000000000000000'],
+    ['B10a excludes a sibling still mid-first-render (status:rendering)', 'sA000000000000000000000'],
+    ['B10b [MONEY] excludes an archived sibling', 'sB000000000000000000000']
   ];
   for (const [label, excludedId] of exclusions) {
     await checkAsync(label, async () => {
@@ -293,7 +329,7 @@ function baseAd(over = {}) {
     });
   }
 
-  await checkAsync('B9 [MONEY] never returns the master\'s own document', async () => {
+  await checkAsync('B11 [MONEY] never returns the master\'s own document', async () => {
     const master = baseAd({ _id: 'm0000000000000000000000', deriveFromMaster: 'meta_stories_9_16', platformFormat: 'meta_stories_9_16' });
     AdCol = new MiniCollection([master]);
     stub(AD, { find: (f) => AdCol.find(f), findById: (id) => AdCol.findById(id), updateOne: (f, u) => AdCol.updateOne(f, u) });
@@ -302,66 +338,58 @@ function baseAd(over = {}) {
   });
 
   // ═══════════════════════════════════════════════════════════════════
-  // GROUP C — recascadeDerivativeSibling (no titling in this repo — see
-  // the function's own doc comment on this file's now-titling-free posture)
+  // GROUP C — recascadeDerivativeSibling — THIS REPO CANNOT COMPOSITE A
+  // SIBLING AT ALL (no titling since abf7e0c2) — see the function's own
+  // doc comment. It only ever updates PROVENANCE fields (veoVideoUrl etc.)
+  // and clears stale basePlate; renderUrl/posterUrl/visionQc/status are
+  // NEVER touched, and qcAndStampVideoAd/promoteFailedToDraft are NEVER
+  // called on a sibling here.
   // ═══════════════════════════════════════════════════════════════════
   function freshMaster(over = {}) {
     return baseAd({ _id: 'm0000000000000000000000', veoVideoUrl: 'https://new.example/master-v2', veoAspectRatio: '9:16', platformFormat: 'meta_stories_9_16', ...over });
   }
 
-  await checkAsync('C1 copies the NEW master plate onto the sibling, stamps the derive-from marker, and clears stale basePlate', async () => {
+  await checkAsync('C1 [MONEY/INTEGRITY] updates provenance, clears stale basePlate, and NEVER writes renderUrl/posterUrl/status', async () => {
     const master = freshMaster();
-    const sibling = baseAd({ _id: 's1000000000000000000000', deriveFromMaster: master.platformFormat, veoVideoUrl: 'https://old.example/sibling-v1', basePlate: { sourceUrl: 'https://old.example/sibling-v1' }, status: 'live' });
+    const sibling = baseAd({ _id: 's1000000000000000000000', deriveFromMaster: master.platformFormat, veoVideoUrl: 'https://old.example/sibling-v1', renderUrl: 'https://old.example/titled-sibling-v1.mp4', basePlate: { sourceUrl: 'https://old.example/sibling-v1' }, status: 'live' });
     AdCol = new MiniCollection([master, sibling]);
     stub(AD, { find: (f) => AdCol.find(f), findById: (id) => AdCol.findById(id), updateOne: (f, u) => AdCol.updateOne(f, u) });
     await svc.recascadeDerivativeSibling(sibling, master);
     const after = await AdCol.findById(sibling._id).lean();
-    assert.strictEqual(after.veoVideoUrl, master.veoVideoUrl);
-    assert.strictEqual(after.renderUrl, master.veoVideoUrl);
+    assert.strictEqual(after.veoVideoUrl, master.veoVideoUrl, 'provenance DOES update');
     assert.strictEqual(after.veoModel, `derive-from:${master.platformFormat}`);
     assert.strictEqual(after.basePlate, undefined, 'a stale crop-rect from a DIFFERENT video must not survive');
+    assert.strictEqual(after.renderUrl, 'https://old.example/titled-sibling-v1.mp4', 'this repo cannot composite — the titled, already-live renderUrl must NEVER be replaced with the raw master');
+    assert.strictEqual(after.status, 'live', 'status must never move — nothing was actually delivered for this sibling');
   });
 
-  await checkAsync('C2 [MONEY-ADJACENT] a QC-passing re-composite promotes a previously-failed sibling to draft', async () => {
+  await checkAsync('C2 [MONEY/INTEGRITY] a sibling claimed by another process between find() and write is skipped, not overwritten (CAS)', async () => {
+    const master = freshMaster();
+    const sibling = baseAd({ _id: 's1000000000000000000000', deriveFromMaster: master.platformFormat, veoVideoUrl: 'https://old.example/sibling-v1', claimedByWorker: 'renderer-x' /* claimed AFTER the find() this test skips straight to the write */ });
+    AdCol = new MiniCollection([master, sibling]);
+    stub(AD, { find: (f) => AdCol.find(f), findById: (id) => AdCol.findById(id), updateOne: (f, u) => AdCol.updateOne(f, u) });
+    await svc.recascadeDerivativeSibling(sibling, master);
+    const after = await AdCol.findById(sibling._id).lean();
+    assert.strictEqual(after.veoVideoUrl, 'https://old.example/sibling-v1', 'the CAS write must not have matched a now-claimed row');
+  });
+
+  await checkAsync('C3 never calls promoteFailedToDraft on a sibling (nothing was actually delivered)', async () => {
     const master = freshMaster();
     const sibling = baseAd({ _id: 's1000000000000000000000', deriveFromMaster: master.platformFormat, status: 'failed' });
     AdCol = new MiniCollection([master, sibling]);
     stub(AD, { find: (f) => AdCol.find(f), findById: (id) => AdCol.findById(id), updateOne: (f, u) => AdCol.updateOne(f, u) });
-    bseState.visionQc = { passed: true, skipped: false, disabled: false };
     await svc.recascadeDerivativeSibling(sibling, master);
     const after = await AdCol.findById(sibling._id).lean();
-    assert.strictEqual(after.status, 'draft');
+    assert.strictEqual(after.status, 'failed', 'a still-failed sibling must stay failed — this repo did not fix anything for it');
   });
 
-  await checkAsync('C3 [MONEY] a QC-passing re-composite NEVER touches a sibling that was live', async () => {
-    const master = freshMaster();
-    const sibling = baseAd({ _id: 's1000000000000000000000', deriveFromMaster: master.platformFormat, status: 'live' });
-    AdCol = new MiniCollection([master, sibling]);
-    stub(AD, { find: (f) => AdCol.find(f), findById: (id) => AdCol.findById(id), updateOne: (f, u) => AdCol.updateOne(f, u) });
-    bseState.visionQc = { passed: true, skipped: false, disabled: false };
-    await svc.recascadeDerivativeSibling(sibling, master);
-    const after = await AdCol.findById(sibling._id).lean();
-    assert.strictEqual(after.status, 'live');
-  });
-
-  await checkAsync('C4 [MONEY] a fresh real QC FAILURE is never overwritten back to draft by this cascade\'s own promotion', async () => {
-    const master = freshMaster();
-    const sibling = baseAd({ _id: 's1000000000000000000000', deriveFromMaster: master.platformFormat, status: 'failed' });
-    AdCol = new MiniCollection([master, sibling]);
-    stub(AD, { find: (f) => AdCol.find(f), findById: (id) => AdCol.findById(id), updateOne: (f, u) => AdCol.updateOne(f, u) });
-    bseState.visionQc = { passed: false, skipped: false, disabled: false, attempts: [{ summary: 'sim' }] };
-    await svc.recascadeDerivativeSibling(sibling, master);
-    const after = await AdCol.findById(sibling._id).lean();
-    assert.strictEqual(after.status, 'failed', 'qcJustFailed must gate OUT the promoteFailedToDraft call');
-  });
-
-  await checkAsync('C5 a per-sibling failure never throws out of recascadeDerivativeSibling (master regenerate unaffected)', async () => {
+  await checkAsync('C4 a per-sibling failure never throws out of recascadeDerivativeSibling (master regenerate unaffected)', async () => {
     const master = freshMaster();
     const sibling = baseAd({ _id: 's1000000000000000000000', deriveFromMaster: master.platformFormat });
     stub(AD, {
       find:      () => ({ lean: async () => [] }),
       findById:  () => ({ lean: async () => { throw new Error('simulated DB error'); } }),
-      updateOne: async () => ({ matchedCount: 0, modifiedCount: 0 })
+      updateOne: async () => { throw new Error('simulated DB error on the CAS write'); }
     });
     await svc.recascadeDerivativeSibling(sibling, master); // must not throw
   });
@@ -369,20 +397,18 @@ function baseAd(over = {}) {
   // ═══════════════════════════════════════════════════════════════════
   // GROUP D — cascadeRegenerateToDerivatives (end-to-end)
   // ═══════════════════════════════════════════════════════════════════
-  await checkAsync('D1 cascades to an eligible sibling and leaves an ineligible (claimed) one untouched', async () => {
+  await checkAsync('D1 cascades provenance to an eligible sibling and leaves an ineligible (claimed) one untouched', async () => {
     const master = freshMaster({ status: 'draft' });
     const eligible = baseAd({ _id: 's1000000000000000000000', deriveFromMaster: master.platformFormat, status: 'failed', veoVideoUrl: 'https://old.example/s1' });
     const claimed = baseAd({ _id: 's2000000000000000000000', deriveFromMaster: master.platformFormat, status: 'failed', claimedByWorker: 'renderer-x', veoVideoUrl: 'https://old.example/s2' });
     AdCol = new MiniCollection([master, eligible, claimed]);
     stub(AD, { find: (f) => AdCol.find(f), findById: (id) => AdCol.findById(id), updateOne: (f, u) => AdCol.updateOne(f, u) });
-    bseState.visionQc = { passed: true, skipped: false, disabled: false };
     await svc.cascadeRegenerateToDerivatives(master._id);
     const afterEligible = await AdCol.findById(eligible._id).lean();
     const afterClaimed  = await AdCol.findById(claimed._id).lean();
-    assert.strictEqual(afterEligible.veoVideoUrl, master.veoVideoUrl, 'the eligible sibling must be re-composited');
-    assert.strictEqual(afterEligible.status, 'draft', 'and promoted off failed');
+    assert.strictEqual(afterEligible.veoVideoUrl, master.veoVideoUrl, 'the eligible sibling\'s provenance must update');
+    assert.strictEqual(afterEligible.status, 'failed', 'status must NOT be promoted — this repo delivered nothing new');
     assert.strictEqual(afterClaimed.veoVideoUrl, 'https://old.example/s2', 'a claimed sibling must be left alone this pass');
-    assert.strictEqual(afterClaimed.status, 'failed');
   });
 
   await checkAsync('D2 a no-op when the ad has no siblings', async () => {
@@ -416,6 +442,16 @@ function baseAd(over = {}) {
     await svc.cascadeRegenerateToDerivatives(master._id);
     const after = await AdCol.findById(sibling._id).lean();
     assert.strictEqual(after.veoVideoUrl, 'https://old.example/s1');
+  });
+
+  await checkAsync('D6 [MONEY] a master with a real QC-FAILED visionQc never fans out to siblings', async () => {
+    const master = freshMaster({ status: 'failed', visionQc: { passed: false, skipped: false, disabled: false, attempts: [{ summary: 'sim' }] } });
+    const sibling = baseAd({ _id: 's1000000000000000000000', deriveFromMaster: master.platformFormat, veoVideoUrl: 'https://old.example/s1', status: 'live' });
+    AdCol = new MiniCollection([master, sibling]);
+    stub(AD, { find: (f) => AdCol.find(f), findById: (id) => AdCol.findById(id), updateOne: (f, u) => AdCol.updateOne(f, u) });
+    await svc.cascadeRegenerateToDerivatives(master._id);
+    const after = await AdCol.findById(sibling._id).lean();
+    assert.strictEqual(after.veoVideoUrl, 'https://old.example/s1', 'a REJECTED master plate must never fan out to a live sibling');
   });
 
   // ═══════════════════════════════════════════════════════════════════
@@ -455,6 +491,24 @@ function baseAd(over = {}) {
   check('E4 [MONEY] cascadeRegenerateToDerivatives consults resolveDeriveFromMaster before doing anything else', () => {
     const body = functionBody(/async function cascadeRegenerateToDerivatives\(/);
     assert.ok(/resolveDeriveFromMaster\(masterAd\)/.test(body), 'the defense-in-depth derive guard must be present');
+  });
+  check('E5 [MONEY] cascadeRegenerateToDerivatives re-derives its own qcJustFailed gate (defense in depth against a future standalone caller)', () => {
+    const body = functionBody(/async function cascadeRegenerateToDerivatives\(/);
+    assert.ok(/buildVideoQcFailureFields\(masterAd\.visionQc\)/.test(body), 'the internal qcJustFailed re-derivation must be present');
+  });
+  check('E6 [MONEY/INTEGRITY] recascadeDerivativeSibling never writes renderUrl/posterUrl', () => {
+    const body = functionBody(/async function recascadeDerivativeSibling\(/);
+    assert.ok(!/renderUrl\s*:/.test(body), 'this repo cannot composite a sibling — must never stamp renderUrl');
+    assert.ok(!/posterUrl\s*:/.test(body), 'this repo cannot composite a sibling — must never stamp posterUrl');
+  });
+  check('E7 [MONEY/INTEGRITY] recascadeDerivativeSibling never calls qcAndStampVideoAd or promoteFailedToDraft on a sibling', () => {
+    const body = functionBody(/async function recascadeDerivativeSibling\(/);
+    assert.ok(!/qcAndStampVideoAd/.test(body), 'qcAndStampVideoAd has no preserveAdStatus concept — must never run on a sibling');
+    assert.ok(!/promoteFailedToDraft/.test(body), 'nothing is actually delivered for a sibling here — must never promote its status');
+  });
+  check('E8 [MONEY/INTEGRITY] the sibling CAS write re-asserts siblingStillEligible, not a bare {_id}', () => {
+    const body = functionBody(/async function recascadeDerivativeSibling\(/);
+    assert.ok(/siblingStillEligible\(sibling\)/.test(body), 'the write must re-assert the same exclusion filter as the read, not a plain {_id}');
   });
 
   console.log(`\n${checks} passed, ${failures.length} failed\n`);
