@@ -1045,7 +1045,12 @@ router.get('/:id/ads-detail', async (req, res) => {
           // unprojected `kind` used to silently defeat the titling check
           // elsewhere in this repo (see services/campaignRunGuards.js's own
           // comment on the identical trap).
-          deriveFromMaster: 1, titlingNeeded: 1, claimedByWorker: 1, claimedAt: 1
+          deriveFromMaster: 1, titlingNeeded: 1, claimedByWorker: 1, claimedAt: 1,
+          // Operator QC-override audit trail (POST /:id/override-qc) —
+          // orthogonal to approved/approvedAt above. Projected so the detail
+          // modal can show "QC overridden by X — reason" persistently, not
+          // just react to the immediate response of the override call.
+          qcOverridden: 1, qcOverriddenAt: 1, qcOverriddenBy: 1, qcOverrideReason: 1
       } }
     ], { allowDiskUse: true });
 
@@ -1196,6 +1201,12 @@ router.get('/:id/ads-detail', async (req, res) => {
       // must read "QC Fail", not a generic "Failed" — see that file).
       phase,
       ...(failure ? { failure } : {}),
+      // See models/Ad.js qcOverridden* comment — a human override of a
+      // vision-QC rejection, orthogonal to approved/approvedAt above.
+      qcOverridden:     !!a.qcOverridden,
+      qcOverriddenAt:   a.qcOverriddenAt ? new Date(a.qcOverriddenAt).toISOString() : null,
+      qcOverriddenBy:   a.qcOverriddenBy || null,
+      qcOverrideReason: a.qcOverrideReason || null,
       regenerating:   !!a.regenerating,
       regenerationStage: a.regenerationStage || null,
       regenerationHistory: Array.isArray(a.regenerationHistory)
