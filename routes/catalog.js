@@ -63,6 +63,12 @@ const { adSpendReceipts } = require('../services/spendReceipt');
 // `phase`/`failure` shape projectAd emits, so a frontend adapter that
 // forwards them through unchanged gets parity for free.
 const { deriveAdPhase, describeAdFailure } = require('../services/adPhase');
+// THE canonical "is this ad a true video master" predicate — same
+// definition routes/ads.js projectAd uses for its `isMaster` field (see
+// that file + services/campaignAdsGenerationService.js for the four
+// conditions). Reused here, not re-derived, so the Product Ads gallery
+// and the flat /api/ads list can never disagree about what a master is.
+const { isMasterVideoAd } = require('../services/campaignAdsGenerationService');
 void assertMediaInTenant;     // kept for future :id verification helpers
 
 function escapeRegex(s) { return String(s || '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); }
@@ -1046,6 +1052,12 @@ router.get('/:id/ads-detail', async (req, res) => {
           // elsewhere in this repo (see services/campaignRunGuards.js's own
           // comment on the identical trap).
           deriveFromMaster: 1, titlingNeeded: 1, claimedByWorker: 1, claimedAt: 1,
+          // Input to isMasterVideoAd's duration-floor check (see that
+          // function + routes/ads.js findSiblingMasterAd) — powers the
+          // frontend "Master" badge below. Same allowlist-omission trap the
+          // comments throughout this $project already document: missing here
+          // silently defeats the check regardless of what's on the document.
+          videoDurationSec: 1,
           // Operator QC-override audit trail (POST /:id/override-qc) —
           // orthogonal to approved/approvedAt above. Projected so the detail
           // modal can show "QC overridden by X — reason" persistently, not
@@ -1230,7 +1242,13 @@ router.get('/:id/ads-detail', async (req, res) => {
       mediaId:      a.mediaId ? String(a.mediaId) : null,
       sourceMedia:  (a.variantKind === 'ugc' && a.mediaId)
         ? (sourceMediaMap.get(String(a.mediaId)) || null)
-        : null
+        : null,
+      // Frontend "Master" badge — same isMasterVideoAd predicate
+      // routes/ads.js projectAd uses (see require comment above). Deliberately
+      // placed at the END of this shaped row, not up near funnelStage/kind,
+      // so it never pushes visionQc/renderErrorMessage past
+      // verifyAdVisionQcSurfacing.js G3's fixed 4000-char scan window.
+      isMaster:     isMasterVideoAd(a)
     };
     });
 

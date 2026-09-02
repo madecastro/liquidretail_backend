@@ -78,7 +78,12 @@ const {
   GOOGLE_PMAX_VIDEO_DURATION_SEC,
   // THE shared derive-only gate (money) — one definition, imported by both
   // this render loop and services/adRegenerateService. Do not re-implement.
-  resolveDeriveFromMaster
+  resolveDeriveFromMaster,
+  // THE canonical "is this ad a true video master" predicate — same four
+  // conditions findSiblingMasterAd's own query filter checks below, factored
+  // out so projectAd's isMaster badge field can reuse the identical
+  // definition instead of a second, driftable approximation.
+  isMasterVideoAd
 } = require('../services/campaignAdsGenerationService');
 const { summarizeEmptyExpansion, REASON: PER_PRODUCT_REASON } = require('../services/perProductReasons');
 const { assertGeneratablePlatformFormat, resolveExplicitFormats } = require('../services/platformFormats');
@@ -2223,6 +2228,13 @@ async function runRenderLoop(run, job, adIds, renderToken) {
  * query can return a sibling variant that never holds its own plate —
  * the waiter would then hang on a free surface that itself is waiting.
  * A true master has no deriveFromMaster and no funnelStage.
+ *
+ * The four per-ad conditions below (kind, deriveFromMaster, funnelStage,
+ * videoDurationSec floor) are also available as a single-ad predicate —
+ * services/campaignAdsGenerationService.js's isMasterVideoAd — for callers
+ * that need to answer "is THIS ad a master" without a candidate search (see
+ * projectAd's `isMaster` field below). Keep both in sync if this filter
+ * shape ever changes.
  */
 async function findSiblingMasterAd(ad, masterPlatformFormat) {
   const base = {
@@ -6120,6 +6132,15 @@ function projectAd(ad, full = false, extras = {}) {
     // the UI's point of view even though the render pipeline treats it that
     // way internally (see the model's own field comment).
     funnelStage:        ad.funnelStage || null,
+    // Frontend "Master" badge (gallery/list card, not gated on `full` — a
+    // list tile needs this at a glance same as `phase`/`visionQc` below).
+    // THE canonical definition — services/campaignAdsGenerationService.js
+    // isMasterVideoAd, the exact same four conditions findSiblingMasterAd's
+    // own query filter checks. Always false for a non-video ad, a stamped
+    // derivative/funnel-retitle, or a video ad whose videoDurationSec is
+    // below Google's PMax floor (including one minted before that field was
+    // ever stamped — never guessed true).
+    isMaster:           isMasterVideoAd(ad),
     sourceFileType:     ad.sourceFileType || null,
     renderUrl:          ad.renderUrl,
     // Phase B — gpt-image-1 polished version (AiFullRenderArtifact.imageUrl)

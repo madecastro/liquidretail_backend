@@ -472,6 +472,44 @@ function resolveDeriveFromMaster(ad) {
 }
 
 /**
+ * THE canonical "is this ad a true video master" predicate — the exact same
+ * four conditions routes/ads.js's findSiblingMasterAd requires of a
+ * candidate master, factored out here so a frontend-facing "Master" badge
+ * (routes/ads.js projectAd, routes/catalog.js + routes/campaigns.js
+ * ads-detail) can answer the identical question about a SINGLE ad without
+ * re-deriving a looser, driftable approximation:
+ *
+ *   1. kind === 'video' — never badge a static ad.
+ *   2. no `deriveFromMaster` marker — a stamped derivative is never itself
+ *      a master, however findSiblingMasterAd's OWN query additionally scopes
+ *      by campaignId/productId/platformFormat/`_id !== self`; those are
+ *      candidate-search scoping, not properties of a single ad, so they are
+ *      deliberately not reproduced here.
+ *   3. no `funnelStage` — a funnel retitle is a free variant of an
+ *      already-paid plate, never a master in its own right.
+ *   4. `videoDurationSec >= GOOGLE_PMAX_VIDEO_DURATION_SEC` — the same
+ *      duration-compatibility floor findSiblingMasterAd gates on (see that
+ *      function's long comment on why this is a duration guard, not a
+ *      calendar-day one). A video ad minted before this field was stamped
+ *      reads `undefined`/non-finite and correctly fails this check — it is
+ *      NOT retroactively guessed to be a master.
+ *
+ * Deliberately NOT a query — this only ever needs to answer the question for
+ * one already-loaded Ad doc (or a plain projected object carrying these same
+ * four fields), so no DB round trip. Do not re-derive a second definition of
+ * "master" elsewhere; import this one.
+ */
+function isMasterVideoAd(ad) {
+  if (!ad) return false;
+  if (ad.kind !== 'video') return false;
+  const deriveMarker = ad[DERIVE_FROM_MASTER_FIELD];
+  if (typeof deriveMarker === 'string' && deriveMarker) return false;
+  const stage = ad[FUNNEL_STAGE_FIELD] || ad.funnelStage;
+  if (stage) return false;
+  return Number.isFinite(ad.videoDurationSec) && ad.videoDurationSec >= GOOGLE_PMAX_VIDEO_DURATION_SEC;
+}
+
+/**
  * True for the Phase A Google PMax VIDEO surfaces (two billable masters +
  * the derive-only square). Used to scope digest inputs: see the money note
  * on computeDeterministicVideoDigest — these formats have no history, so
@@ -4500,5 +4538,11 @@ module.exports = {
   // video submit imports this one (render loop + regenerate). See its
   // doc comment: a per-caller copy is how the regenerate hole opened.
   // Also covers funnel-variant ads (fail-closed on funnelStage).
-  resolveDeriveFromMaster
+  resolveDeriveFromMaster,
+  // THE canonical "is this ad a true video master" predicate — same four
+  // conditions findSiblingMasterAd's query filter checks (routes/ads.js),
+  // factored out for the frontend-facing Master badge. See its own doc
+  // comment for why campaignId/productId/platformFormat scoping is
+  // deliberately NOT reproduced here.
+  isMasterVideoAd
 };

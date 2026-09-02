@@ -36,6 +36,11 @@ const {
 // itself, not a frontend adapter stripping fields the endpoint already sent.
 const { deriveAdPhase, describeAdFailure } = require('../services/adPhase');
 const { summarizeVisionQc } = require('../services/adVisionQcService');
+// THE canonical "is this ad a true video master" predicate — same
+// definition routes/ads.js projectAd + catalog.js's sibling ads-detail use
+// (see services/campaignAdsGenerationService.js for the four conditions).
+// Reused here, not re-derived, so all three surfaces agree.
+const { isMasterVideoAd } = require('../services/campaignAdsGenerationService');
 
 // GET /api/campaigns?brandId=X[&platform=meta-ads|google-ads][&status=ACTIVE]
 // Lightweight list for the Campaigns page. Returns a projection that
@@ -490,7 +495,11 @@ router.get('/:id/ads-detail', async (req, res) => {
           // in-flight video derive/handoff ad could not be told apart from
           // a stalled one.
           visionQc: 1, renderError: 1,
-          deriveFromMaster: 1, titlingNeeded: 1, claimedByWorker: 1, claimedAt: 1
+          deriveFromMaster: 1, titlingNeeded: 1, claimedByWorker: 1, claimedAt: 1,
+          // Input to isMasterVideoAd's duration-floor check — powers the
+          // frontend "Master" badge below. Same allowlist-omission trap the
+          // comments throughout this $project already document.
+          videoDurationSec: 1
       } }
     ], { allowDiskUse: true });
 
@@ -585,6 +594,11 @@ router.get('/:id/ads-detail', async (req, res) => {
       // Intent profile — see models/Ad.js funnelStage. Absent renders as
       // nothing on the frontend, never a raw token.
       funnelStage:    a.funnelStage || null,
+      // Frontend "Master" badge — same isMasterVideoAd predicate
+      // routes/ads.js projectAd + catalog.js's sibling ads-detail use (see
+      // require comment above). Always false for a non-video ad, a stamped
+      // derivative/funnel-retitle, or one below Google's PMax duration floor.
+      isMaster:       isMasterVideoAd(a),
       // Retailer's own product-page link, brand-scoped — null when
       // there's no productId, an unlinked/soft-deleted product, or no
       // URL on file.
