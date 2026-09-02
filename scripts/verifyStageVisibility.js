@@ -100,6 +100,37 @@ ok('A5 the full projection is a superset of the list projection', () => {
 // DERIVED BY SCANNING, not a hardcoded file list: the lesson from the
 // receiptFree incident is that a hardcoded list leaves the next call site
 // unguarded. Any route that $projects an ad list must opt in.
+// Finds every `$project: { ... }` object body in `src` by walking brace depth
+// from each `$project:` marker to its TRUE matching close, instead of a fixed
+// character window. A fixed window (formerly {0,1400}) silently stops
+// "scanning" a real projection the moment unrelated, legitimate growth pushes
+// its body past the guess — exactly the failure mode
+// scripts/verifyCostAttribution.js's `captureCallArgs` helper was already
+// fixed for elsewhere in this repo; same defect class, same fix shape here.
+// Blind to braces inside string literals (property values in a Mongo
+// projection are simple `1`/`0`/field-path strings without embedded braces in
+// this codebase today), consistent with that same known, documented
+// limitation.
+function findProjectBodies(src) {
+  const bodies = [];
+  const marker = /\$project\s*:\s*\{/g;
+  for (let m = marker.exec(src); m; m = marker.exec(src)) {
+    const openIdx = m.index + m[0].length - 1; // index of the opening '{'
+    let depth = 0;
+    let closeIdx = -1;
+    for (let i = openIdx; i < src.length; i++) {
+      const c = src[i];
+      if (c === '{') depth++;
+      else if (c === '}') {
+        depth--;
+        if (depth === 0) { closeIdx = i; break; }
+      }
+    }
+    if (closeIdx !== -1) bodies.push(src.slice(openIdx + 1, closeIdx));
+  }
+  return bodies;
+}
+
 ok('B1 every ads-detail $project includes renderStage and renderStageAt', () => {
   const routesDir = path.join(ROOT, 'routes');
   const offenders = [];
@@ -112,9 +143,7 @@ ok('B1 every ads-detail $project includes renderStage and renderStageAt', () => 
     // A $project that names the ad-tile shape. `renderUrl` + `posterUrl`
     // together are the signature of an ad-tile projection specifically — a
     // product or media projection has neither.
-    const re = /\{\s*\$project:\s*\{([\s\S]{0,1400}?)\}\s*\}/g;
-    for (let m = re.exec(src); m; m = re.exec(src)) {
-      const body = m[1];
+    for (const body of findProjectBodies(src)) {
       if (!/renderUrl:\s*1/.test(body) || !/posterUrl:\s*1/.test(body)) continue;
       scanned += 1;
       const missing = ['renderStage', 'renderStageAt']
