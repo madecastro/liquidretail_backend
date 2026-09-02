@@ -136,6 +136,38 @@ async function runPostSyncChain(brandId, { trigger = 'sync' } = {}) {
     console.warn(`${LOG}[brand=${brandId}] OperationRun close failed: ${err.message}`);
   }
 
+  // Phase 3 (fire-and-forget, 2026-09-02): trigger post-detect rematch
+  // AFTER the catalog-sync detect queue drains. Only fires when phase 2
+  // (yolo-detect enqueue) succeeded — no point re-matching UGC against
+  // a catalog whose detects couldn't even start.
+  //
+  // Runs OUTSIDE this OperationRun's lifecycle by design: rematch's own
+  // poll waits up to POST_REMATCH_POLL_MAX_MS (60 min default) for the
+  // detect queue to drain, well past this OperationRun's ~seconds-long
+  // window. Extending phase 2's total from 2→3 and holding the
+  // OperationRun open through the poll would break the reconcile
+  // tick's `updatedAt > STALE_MIN` heuristic. Rematch has its own
+  // failure logging and no retry — a one-shot post-catalog rematch is
+  // the semantic, and a re-fire would only happen on the next catalog
+  // sync of this brand.
+  //
+  // full=<POST_DETECT_DEFER_TO_CATALOG>: deferred design skipped the
+  // per-post detect at ingest, so nothing is matched yet and we need to
+  // enqueue every UGC media (full=true). Legacy immediate-detect mode
+  // already matched at ingest, so rematch only touches UNMATCHED posts
+  // (full=false) — avoids paying twice for the same vision-match.
+  if (phases.yoloDetect === 'ok') {
+    setImmediate(async () => {
+      try {
+        const { rematchAfterCatalogDetect, isDeferPostDetectEnabled } = require('./postRematchAfterCatalogService');
+        const full = isDeferPostDetectEnabled();
+        await rematchAfterCatalogDetect({ brandId, full });
+      } catch (err) {
+        console.warn(`${LOG}[brand=${brandId}] post-rematch trigger failed: ${err.message}`);
+      }
+    });
+  }
+
   return { status, phases, runId: String(run.id || run._id || '') };
 }
 

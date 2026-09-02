@@ -435,6 +435,26 @@ async function ingestIgPost(brand, post) {
   // can be skipped for counting yet still re-enqueue detect below.
   if (existingActive) return { mediaId: media._id, runId: null, skipped: !!existing };
 
+  // DEFERRED DETECT (2026-09-02, POST_DETECT_DEFER_TO_CATALOG=true by
+  // default). Skip the per-post apify-sync DetectRun at ingest — the
+  // vision-match phase inside detect needs catalog products to already
+  // have refinedProducts + titleEmbedding to find them, and those are
+  // populated by catalog-sync detects that fire LATER via
+  // catalogPostSyncOrchestrator. Matching against a bare catalog wastes
+  // a Gemini-vision call per post (measured 30 UGC × ~$0.04 = ~$1.20
+  // per resync) AND permanently misses the products whose detect
+  // hadn't run yet. Instead, catalogPostSyncOrchestrator now fires
+  // rematchAfterCatalogDetect({full:true}) after catalog drain, which
+  // enqueues a single full-brand rematch against the fresh refined
+  // catalog. Kill switch reverts to the legacy immediate-detect path;
+  // used together with full=false to keep the pre-2026-09-02 cost
+  // shape (rematch-after-catalog then only touches UNMATCHED posts,
+  // avoiding a duplicate paid match on ones ingest-time already did).
+  const { isDeferPostDetectEnabled } = require('./postRematchAfterCatalogService');
+  if (isDeferPostDetectEnabled()) {
+    return { mediaId: media._id, runId: null, skipped: !!existing, deferred: true };
+  }
+
   let run;
   try {
     run = await DetectRun.create({
