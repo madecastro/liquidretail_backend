@@ -2348,6 +2348,58 @@ async function ensureCatalogProductForMatch(match, ctx) {
     return null;
   }
 
+  // 2c. CATALOG-SUBSET COLLAPSE (2026-09-02, live-fix for backend cc95cb5's
+  // dead code path). The originally-shipped collapse in
+  // catalogProductDraftService.tryCreate only fires from the manual "Save as
+  // draft product" capability (with force:true, which bypasses collapse
+  // anyway). The AUTOMATIC detect-identified minting path never reaches
+  // tryCreate — it lands directly on CatalogProduct.create below — so 30%
+  // of Pelagic-shape catalogs still mint drafts that ARE subsets of existing
+  // synced rows. Re-check the same subset rule HERE, right before the
+  // create, so the automatic path finally gets what cc95cb5 was meant to
+  // ship.
+  //
+  // Applies regardless of the draft vs auto-promoted distinction: a subset
+  // match means the product already exists in the catalog, and we should
+  // return the existing row's _id rather than mint a duplicate in either
+  // shape (a duplicate synced row is worse than a duplicate draft — it
+  // stays visible to the wizard, competes for ad-gen selection, and needs
+  // manual cleanup).
+  //
+  // Kill switch: DRAFT_COLLAPSE_TO_CATALOG=false / 0 / off reverts to the
+  // pre-fix behaviour (mint always). Same env as the tryCreate path so ops
+  // flip one flag to opt out of both call sites.
+  const catalogProductDraftService = require('./catalogProductDraftService');
+  const { findCatalogSubsetMatch, draftCollapseStopwords, isCollapseToCatalogEnabled } = catalogProductDraftService.__test;
+  if (isCollapseToCatalogEnabled() && ident.productName) {
+    try {
+      // Look up brand name for stopwords — cheap read, gated on the flag so
+      // it never fires when collapse is disabled. Not shared with the Brand
+      // read below because that read pulls uploadSettings (a different
+      // projection) and both are single-doc lookups.
+      const brandForStops = await Brand.findById(ctx.brandId).select('name').lean();
+      const extraStop = draftCollapseStopwords(brandForStops?.name);
+      const catalogRows = await CatalogProduct
+        .find({ brandId: ctx.brandId, draft: { $ne: true }, deletedAt: null })
+        .select('_id title').lean();
+      const subsetMatch = findCatalogSubsetMatch(ident.productName, catalogRows, extraStop);
+      if (subsetMatch) {
+        console.log(
+          `   ↔️  ensureCatalogProduct[${match.productIndex || 'primary'}]: collapse → ` +
+          `"${ident.productName}" is a superset of existing catalog "${subsetMatch.row.title}" ` +
+          `(${subsetMatch.row._id}) — reusing instead of minting`
+        );
+        return subsetMatch.row._id;
+      }
+    } catch (err) {
+      // Never let the collapse check block a mint that would otherwise
+      // succeed — a query throw here degrades to the pre-fix behaviour,
+      // not a total failure. Same fail-safe stance as catalogProductDraft
+      // Service.tryCreate.
+      console.warn(`   ⚠️  ensureCatalogProduct[${match.productIndex || 'primary'}]: subset check threw: ${err.message} — falling through to create`);
+    }
+  }
+
   // 3. Create a new detect-identified row. Draft state is gated by the
   // brand toggle: opted-in → not a draft (auto-promoted); opted-out → draft.
   const brand = await Brand.findById(ctx.brandId).select('uploadSettings').lean();
@@ -2628,6 +2680,47 @@ async function catalogFirstMatchOneRefined(refined, { brandId, brandName = null,
     }
     console.log(`   · catalog-first[${refined.id}] (visual-only fallback): visual=${bestV.visualScore.toFixed(2)} pool=${visualCandidates.length} → "${bestV.catalogMatch.product.title}"`);
     return bestV;
+  }
+
+  // D3 EARLY EXIT (2026-09-02). Text search returned ≥1 candidate above
+  // SKU_TEXT_SCORE_FLOOR (default 0.25). If the LEADER's text score is
+  // already very confident (SKU_TEXT_EARLY_EXIT_THRESHOLD, default 0.85),
+  // skip the visual scoring pass entirely — a 0.85 token-overlap match on
+  // the leader is already a stronger signal than what visual comparison
+  // typically breaks between the top-3.
+  //
+  // Cost: visual scoring is (up to 3 candidates × 3-5 images) = 9-15
+  // Gemini vision calls per product-match invocation, ~$0.005-$0.02 in
+  // aggregate + ~2-3 seconds wall time even with Promise.all parallelism.
+  // Skipping when text is already high-confidence measured on the Pelagic
+  // resync as the single largest achievable savings on product-match
+  // stage (currently 1.2m avg, 1.7m p95, 2.4m max).
+  //
+  // Kill switch: SKU_TEXT_EARLY_EXIT_THRESHOLD=0 disables (falls through
+  // to visual scoring on every text-candidate hit, byte-identical to
+  // pre-D3 behaviour). Threshold is env-tunable; a lower value trades
+  // more early exits for lower precision on borderline text matches.
+  const SKU_TEXT_EARLY_EXIT_THRESHOLD = (() => {
+    const raw = process.env.SKU_TEXT_EARLY_EXIT_THRESHOLD;
+    if (raw == null || raw === '') return 0.85;
+    const v = parseFloat(raw);
+    if (!Number.isFinite(v) || v < 0 || v > 1) return 0.85;
+    return v;
+  })();
+  const leaderText = textCandidates[0];
+  if (SKU_TEXT_EARLY_EXIT_THRESHOLD > 0 && leaderText && leaderText.textScore >= SKU_TEXT_EARLY_EXIT_THRESHOLD) {
+    console.log(
+      `   · catalog-first[${refined.id}]: text early-exit textScore=${leaderText.textScore.toFixed(2)} ` +
+      `≥ threshold=${SKU_TEXT_EARLY_EXIT_THRESHOLD} → skipping visual scoring, ` +
+      `winner="${leaderText.product.title}"`
+    );
+    return {
+      catalogMatch:   leaderText,
+      visualResult:   null,
+      textScore:      leaderText.textScore,
+      visualScore:    0,
+      combinedScore:  leaderText.textScore
+    };
   }
 
   // Visual scoring per text candidate: compare the UGC refined crop

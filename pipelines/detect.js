@@ -339,7 +339,25 @@ async function runImagePipeline(run, media, buffer, sourceUrlOverride = null) {
   // Failure is logged but non-fatal — extended-crops + overlay-zones
   // are optional polish. applyMediaLibraryDerivations rides along
   // since it consumes overlayDoc.
-  runExtendedAndOverlayChain(run, media, sourceUrl, null, crops, judge, primarySubjectDesc, background, text, false, { safeRect, imgW, imgH })
+  //
+  // INGEST_EXTENDED_CROPS_ENABLED (2026-09-02, default false). Extended
+  // crops (nano-banana-2/edit generation of 9:16 + 1.91:1 variants) fail
+  // ~75% of the time on this brand's UGC path because nano-banana rejects
+  // those aspect_ratio values ("Request parameters are invalid"). Measured:
+  // 486 calls / 366 failures / ~$7 wasted per resync AND the successful
+  // 25% add another $3 in real spend — for a pipeline whose output is
+  // already covered by the reframe path at ad-gen time (yolo-crop /
+  // composite-mask / composite-outpaint from da22486 + ecbea9c handle
+  // 9:16 and 16:9; 1.91:1 goes through the same reframe worker).
+  //
+  // Default off means UGC gets the same treatment catalog-product already
+  // had via the hardcoded skipExtendedCrops:true a few sites down. Ops can
+  // flip INGEST_EXTENDED_CROPS_ENABLED=true to restore the old speculative
+  // pre-compute if the reframe path is regressed for a specific brand and
+  // we need the ingest-time cache back.
+  const extendedCropsIngestEnabled = String(process.env.INGEST_EXTENDED_CROPS_ENABLED || 'false')
+    .toLowerCase().trim() === 'true';
+  runExtendedAndOverlayChain(run, media, sourceUrl, null, crops, judge, primarySubjectDesc, background, text, false, { safeRect, imgW, imgH, skipExtendedCrops: !extendedCropsIngestEnabled })
     .then(async ({ extendedDoc, overlayDoc }) => {
       await updateMediaLatestArtifacts(media, {
         extended:     extendedDoc?._id,
