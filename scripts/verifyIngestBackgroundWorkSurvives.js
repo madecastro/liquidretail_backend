@@ -210,6 +210,25 @@ function region(src, startAnchor, endAnchor, label) {
   return src.slice(a, b);
 }
 
+// Two acceptable shapes for the materialize+YOLO-detect chain
+// (C2 / D1 / E1):
+//   (old) direct in-line require of catalogMediaMaterializeService +
+//         catalogYoloDetectionService — landed bb91303c
+//   (new) delegates to catalogPostSyncOrchestrator.runPostSyncChain
+//         — commit 31469b82 "fix(catalog-post-sync): resilient
+//         orchestrator + reconcile tick"
+// The orchestrator itself is separately pinned by
+// scripts/verifyPostSyncOrchestrator.js — that harness owns the
+// "orchestrator actually calls both underlying services" assertion,
+// so we can accept the delegation here without duplicating the check.
+function hasMaterializeYoloChain(r) {
+  const inline = r.includes("require('./catalogMediaMaterializeService')") &&
+    r.includes("require('./catalogYoloDetectionService')");
+  const viaOrchestrator = r.includes("require('./catalogPostSyncOrchestrator')") &&
+    /runPostSyncChain\(/.test(r);
+  return inline || viaOrchestrator;
+}
+
 const catalogSyncSrc = fs.readFileSync(path.join(__dirname, '../services/catalogSyncService.js'), 'utf8');
 const genericSrc = fs.readFileSync(path.join(__dirname, '../services/genericCatalogIngestService.js'), 'utf8');
 const integrationsSrc = fs.readFileSync(path.join(__dirname, '../routes/integrations.js'), 'utf8');
@@ -236,8 +255,8 @@ check('C2: ALL THREE catalogSyncService triggers are collected (enrichment, mate
   );
   assert.ok(r.includes("require('./catalogProductEnrichmentService')"), 'enrichment trigger missing from the collected region');
   assert.ok(
-    r.includes("require('./catalogMediaMaterializeService')") && r.includes("require('./catalogYoloDetectionService')"),
-    'materialize+YOLO-detect chain missing from the collected region (added bb91303c, feat(catalog): ingest-time YOLO detection + materialize peer to enrichment)'
+    hasMaterializeYoloChain(r),
+    'materialize+YOLO-detect chain missing from the collected region — expected either the inline catalogMediaMaterializeService + catalogYoloDetectionService requires (bb91303c) or catalogPostSyncOrchestrator.runPostSyncChain (31469b82)'
   );
   assert.ok(r.includes("require('./productCategoryInferenceService')"), 'category-inference trigger missing from the collected region');
   // Exactly three pushes: enrichment, the materialize+YOLO-detect chain
@@ -296,8 +315,8 @@ check('D1: syncBrandGenericCatalog\'s end-of-run triggers contain no setImmediat
   );
   assert.ok(r.includes("require('./catalogProductEnrichmentService')"), 'enrichment trigger missing from the collected region');
   assert.ok(
-    r.includes("require('./catalogMediaMaterializeService')") && r.includes("require('./catalogYoloDetectionService')"),
-    'materialize+YOLO-detect chain missing from the collected region (added bb91303c)'
+    hasMaterializeYoloChain(r),
+    'materialize+YOLO-detect chain missing from the collected region — expected either the inline catalogMediaMaterializeService + catalogYoloDetectionService requires (bb91303c) or catalogPostSyncOrchestrator.runPostSyncChain (31469b82)'
   );
   assert.ok(r.includes("require('./productCategoryInferenceService')"), 'category-inference trigger missing from the collected region');
 });
@@ -337,8 +356,8 @@ check('E1: legacy syncBrandShopify\'s background triggers contain no setImmediat
   );
   assert.ok(r.includes("require('./catalogProductEnrichmentService')"), 'enrichment trigger missing from the collected region');
   assert.ok(
-    r.includes("require('./catalogMediaMaterializeService')") && r.includes("require('./catalogYoloDetectionService')"),
-    'materialize+YOLO-detect chain missing from the collected region (added bb91303c) — this legacy path has no category-inference trigger'
+    hasMaterializeYoloChain(r),
+    'materialize+YOLO-detect chain missing from the collected region — expected either the inline catalogMediaMaterializeService + catalogYoloDetectionService requires (bb91303c) or catalogPostSyncOrchestrator.runPostSyncChain (31469b82) — this legacy path has no category-inference trigger'
   );
 });
 
