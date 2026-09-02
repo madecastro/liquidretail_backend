@@ -1,8 +1,8 @@
 {
   "version": 2,
   "backendRef": "origin/main",
-  "backendHead": "88fc294093d1cc04e6d80d6d404b64fa893c2059",
-  "generatedAt": "2026-09-01T06:37:39.828Z",
+  "backendHead": "ecbea9c7f2e344dfcd4e3a06d2455a03bba5d237",
+  "generatedAt": "2026-09-02T04:32:41.922Z",
   "files": {
     "models/Ad.js": {
       "backendHash": "394d26a1cb8ad64b23bde73312f3473f332520dd9640b9d5e4bb8eec22d6138d",
@@ -813,11 +813,11 @@
       "owedSince": null
     },
     "services/atlasVideoService.js": {
-      "backendHash": "62b505c09e67482c557573c10f58e2fae9be4863387d49b1da798f12c555aa6f",
-      "adgenHash": "d79651947022dc1297fbe3c7c9e5efdd0f150757d9b4d1cf081417077806c3fc",
-      "backendSha": "4a519da094dcbdbb466dec10a2ba3671bd148136",
+      "backendHash": "155341702d6825754a928c0f332bf127a46292a05d90e14f04cb5f0231d6a07f",
+      "adgenHash": "df6c4d756b23057e6abf4610d27e97463e0225914a3edc50c743943668b889a2",
+      "backendSha": "ecbea9c7f2e344dfcd4e3a06d2455a03bba5d237",
       "status": "unported",
-      "reason": "PARTIALLY RESOLVED, re-verified by direct diff (not relayed): the reframe-claim-eviction + poll-budget-decoupling debt this entry previously tracked IS NOW SYNCED. Backend #355 (6535be5f, MERGED — verified via git merge-base --is-ancestor against origin/main, not the stale local backend working tree which is behind origin/main for this exact file) and adgen #89 (40f9003, MERGED) both landed. Directly diffed the specific mechanisms: _activeReframeClaims registry + releaseAllActiveReframeClaims() SIGTERM/crash sweep — same logic, comments reworded only; REFRAME_POLL_MS()/REFRAME_CLAIM_TTL_FLOOR_MS/REFRAME_BOUNDED_NON_POLL_MS/REFRAME_MIN_LEASE_MARGIN_MS — byte-identical function body on both sides; releaseReframeClaim's emptyUrl handling — present on both. This piece of the debt is closed. STILL GENUINELY OWED, unrelated to the above: the video-master-timeout-livelock fix (#82, MAX_POLL_MS 600000->900000 plus the unsettledAtTimeout/hold handling) is confirmed STILL NOT ported — backend's MAX_POLL_MS is still 600000 (services/atlasVideoService.js:345 on origin/main) vs adgen's 900000 (src/services/atlasVideoService.js:559). The file is ~720 lines longer in adgen than backend (5702 vs 4982) with 28 remaining diff hunks, some large (a 282-line and a 211-line block collapse to 16/6 lines respectively on backend's side) — this reconcile pass verified ONLY the specific reframe-claim/poll-budget mechanism named in its prior entry, per instruction; it did NOT re-audit the full remaining ~700-line divergence (the #82 debt and whatever else has accumulated) line-by-line. Flagging that as a real, separate, still-substantial follow-up — do not read 'unported' here as fully characterized, and do not silently downgrade to fork without a fresh full read given the file's money-criticality and size.",
+      "reason": "PARTIALLY RESOLVED — three separate debt threads, tracked here rather than split into three entries because they all live on the same money-critical file. THREAD 1 (reframe-claim eviction + poll-budget decoupling): CLOSED, re-verified by direct diff. Backend #355 (6535be5f) + adgen #89 (40f9003) both landed. _activeReframeClaims registry + releaseAllActiveReframeClaims() SIGTERM/crash sweep — same logic on both sides, comments reworded only. REFRAME_POLL_MS()/REFRAME_CLAIM_TTL_FLOOR_MS/REFRAME_BOUNDED_NON_POLL_MS/REFRAME_MIN_LEASE_MARGIN_MS — byte-identical function bodies. releaseReframeClaim emptyUrl handling — present both sides. THREAD 2 (reframe fabrication reduction — tolerance + composite-mask + Cloudinary mirror): CLOSED as of this reconcile. Ports backend da22486 (10% over-fit tolerance in computeCropRect + composite-mask action from chooser) and ecbea9c (ensureCloudinaryMirror + 5a-mirror step). Three additions in adgen's copy: (a) reframePromptForCompositeCanvas + reframeOutpaintPrompt routing when ctx.compositeCanvas is true, (b) ensureCloudinaryMirror helper + 5a-mirror step in reframeReferenceForAspect that lazily mirrors non-Cloudinary sources so downstream URL-transformation steps (cloudinaryPadUrl, buildCloudinaryCropUrl) work, (c) composite-mask branch inside tryClaimReframe mutex that sharp-composites the source scaled-to-fit on a target-dim canvas via padSolidBuffer, ships product_only as $0 composite-pad and hands lifestyle composite to nano-banana with a margins-only prompt. Method stamped as composite-pad / composite-outpaint / yolo-crop on the persisted Media.metadata.reframes entry. Kill switches: REFRAME_STRATEGY=outpaint-only reverts everything, REFRAME_OVERFIT_TOLERANCE_PCT=0 reverts the tolerance half. Fixes Pelagic Gear's specific fabrication class where 94% of catalog-product Media are on cdn.shopify.com and were falling through to raw-source outpaint on every reframe. THREAD 3 (video-master-timeout-livelock, backend #82: MAX_POLL_MS 600000->900000 + unsettledAtTimeout/hold handling): STILL GENUINELY OWED. Backend's MAX_POLL_MS remains 600000 on origin/main; adgen's is 900000. Independent of Thread 2 above, which raises no poll ceilings. STILL UNAUDITED — as of thread 1's reconcile the file was ~720 lines longer in adgen than backend with 28 remaining diff hunks (some large: 282-line and 211-line blocks collapse to 16/6 lines on backend). Thread 2 added roughly 180 more lines to adgen. The known Thread 3 debt is a subset of that divergence; anything else in it has never been individually audited — do not silently downgrade this status without a full line-by-line pass given the file's money-criticality and size.",
       "portTo": "backend",
       "owedSince": "2026-08-27T16:49:12.296Z"
     },
@@ -1523,12 +1523,11 @@
       "owedSince": null
     },
     "services/reframeStrategyChooser.js": {
-      "backendHash": "d551435320a09e987b3d721f9e7207eadc26045c58529716d05b75f45e1ca3ce",
-      "adgenHash": "d551435320a09e987b3d721f9e7207eadc26045c58529716d05b75f45e1ca3ce",
-      "backendSha": "3831681af745c2e2cb062e996f29c1e53e6d8712",
-      "status": "synced",
-      "portTo": null,
-      "owedSince": null
+      "backendHash": "693141d99726dbfeaf512bb38af68515a30116a25af3df87c779faafdb460398",
+      "adgenHash": "7dc0388eccd5abbf907b9ec452c3a4bd3ac7a83102f2d573001a8bae540b16a3",
+      "backendSha": "da22486fe91d99e1ab90a7c654744faba175da12",
+      "status": "fork",
+      "reason": "Sync backend da22486 (tolerance + composite-mask): overfitTolerancePct + computeCropRect tolerancePct param + chooseStrategy returns 'composite-mask' when subject over-fit exceeds tolerance. Ported wholesale from backend since chooser is pure and had no adgen-specific divergence."
     },
     "services/remotionRenderService.js": {
       "backendHash": "d31da9813ceeff6ff78ca396c609c2e1f19c4e8628d8e09a447028d2384f9891",

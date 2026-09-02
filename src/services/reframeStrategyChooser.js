@@ -57,9 +57,31 @@ const ASPECT_MATCH_THRESHOLD = 0.985;
 // point that YOLO's box slightly under-measured.
 const CROP_SAFETY_MARGIN_PX = 8;
 
+// Default tolerance for subject-vs-crop-window over-fit. When the subject
+// union exceeds the target-aspect crop window by up to this fraction in
+// the constraining dimension, we still crop (centred on the subject) and
+// let the subject clip evenly — half of the overflow on each side. Above
+// this, the chooser returns action:'composite-mask' so the caller can
+// pre-compose the source onto a target-dim canvas and either $0-pad
+// (product_only) or outpaint the margins (lifestyle) without letting
+// nano-banana re-synthesise the whole frame. Overridable per-deployment
+// via REFRAME_OVERFIT_TOLERANCE_PCT — see docs/PIPELINES.md.
+const OVERFIT_TOLERANCE_PCT_DEFAULT = 0.10;
+
 function isCropFirstEnabled() {
   const v = String(process.env.REFRAME_STRATEGY || 'outpaint-only').toLowerCase().trim();
   return v === 'crop-first';
+}
+
+// Read and clamp REFRAME_OVERFIT_TOLERANCE_PCT. Fail-safe to the default
+// on any unparseable / out-of-range value — a runaway 0.9 tolerance would
+// crop a person's face in half, so the ceiling is deliberate.
+function overfitTolerancePct() {
+  const raw = process.env.REFRAME_OVERFIT_TOLERANCE_PCT;
+  if (raw == null || raw === '') return OVERFIT_TOLERANCE_PCT_DEFAULT;
+  const v = parseFloat(raw);
+  if (!Number.isFinite(v) || v < 0 || v > 0.5) return OVERFIT_TOLERANCE_PCT_DEFAULT;
+  return v;
 }
 
 function parseAspect(a) {
@@ -107,10 +129,19 @@ function buildCloudinaryCropUrl(sourceUrl, { x, y, w, h }) {
 
 // Compute a target-aspect crop window that contains the subject union with
 // CROP_SAFETY_MARGIN_PX breathing room, centered on the subject centroid,
-// clamped to source bounds. Returns null when the subject won't fit — that
-// includes the multi-subject lifestyle case where the union spans more of
-// the abundant dimension than a target-aspect window has room for.
-function computeCropRect({ sourceW, sourceH, targetAspect, subject }) {
+// clamped to source bounds. Returns null when the subject won't fit even
+// with the caller's over-fit tolerance — that includes the multi-subject
+// lifestyle case where the union spans much more of the abundant dimension
+// than a target-aspect window plus tolerance can accommodate.
+//
+// tolerancePct: when the padded subject union exceeds the crop window by up
+// to this fraction in either dimension, we still crop and let the subject
+// clip evenly (half the overflow on each side). Above this, return null so
+// the caller can pick a composite-mask / outpaint path rather than shipping
+// a crop that slices through faces or product edges. Default 0 keeps the
+// pre-tolerance strict-fit behaviour, so callers that don't opt in are
+// unchanged.
+function computeCropRect({ sourceW, sourceH, targetAspect, subject, tolerancePct = 0 }) {
   const sourceAspect = sourceW / sourceH;
 
   // Aspects match — no crop needed. Caller should have hit the 'skip' branch
@@ -141,10 +172,21 @@ function computeCropRect({ sourceW, sourceH, targetAspect, subject }) {
   const subjW = sX2 - sX1;
   const subjH = sY2 - sY1;
 
-  // Reject when the target-aspect window can't contain the padded subject
-  // union in EITHER dimension. This is the b13-style failure mode: 4
-  // people spanning 1370px horizontally cannot fit a 1135px-wide crop.
-  if (cropW < subjW || cropH < subjH) return null;
+  // Over-fit gate. When the subject overflows the target-aspect window by
+  // more than the caller's tolerance, refuse — a lifestyle frame with 4
+  // people spanning 1370px in a 1135px window (20% over) shouldn't ship a
+  // crop that clips two of the faces. The composite-mask branch upstream
+  // handles that case without paying nano-banana to redraw the whole scene.
+  if (cropW < subjW || cropH < subjH) {
+    const overW = cropW < subjW ? (subjW / cropW - 1) : 0;
+    const overH = cropH < subjH ? (subjH / cropH - 1) : 0;
+    const over = Math.max(overW, overH);
+    if (over > tolerancePct) return null;
+    // Within tolerance: fall through to the centring math. The subject will
+    // clip by (over / 2) on each side of the constraining dimension — that
+    // is the cost of avoiding a paid re-synthesis, and is capped by
+    // OVERFIT_TOLERANCE_PCT_DEFAULT's 10% ceiling.
+  }
 
   // Center the window on the subject centroid, clamp to source. Clamping is
   // load-bearing when the subject sits near a source edge — a naive centre
@@ -187,14 +229,23 @@ function chooseStrategy({ media, aspectRatio, sourceUrl }) {
     return { action: 'defer', reason: 'no YOLO subject bbox on media.refinedProducts[]' };
   }
 
-  const rect = computeCropRect({ sourceW, sourceH, targetAspect, subject });
+  const tolerancePct = overfitTolerancePct();
+  const rect = computeCropRect({ sourceW, sourceH, targetAspect, subject, tolerancePct });
   if (!rect) {
     const subjW = subject.x2 - subject.x1;
     const subjH = subject.y2 - subject.y1;
+    // Over-fit exceeds tolerance (or aspects already match, which shouldn't
+    // reach here). Surface the bboxes + source dims so the caller can
+    // pre-compose the source onto a target-dim canvas: product-only shots
+    // ship as a $0 solid-pad reference; lifestyle shots go through the
+    // outpaint model with the composed canvas as source so nano-banana
+    // fills only the pad margins rather than re-synthesising the frame.
     return {
-      action: 'defer',
-      reason: `subject union (${subject.count} bbox, ${subjW}×${subjH}) doesn't fit target-aspect crop window`,
-      subjectUnion: subject
+      action: 'composite-mask',
+      reason: `subject union (${subject.count} bbox, ${subjW}×${subjH}) exceeds target-aspect crop window beyond ${(tolerancePct * 100).toFixed(0)}% tolerance`,
+      subjectUnion: subject,
+      sourceDims: { width: sourceW, height: sourceH },
+      tolerancePct
     };
   }
 
@@ -205,16 +256,18 @@ function chooseStrategy({ media, aspectRatio, sourceUrl }) {
 
   return {
     action: 'crop',
-    reason: `bbox-guided crop (${subject.count} detection${subject.count > 1 ? 's' : ''}, window ${rect.w}×${rect.h})`,
+    reason: `bbox-guided crop (${subject.count} detection${subject.count > 1 ? 's' : ''}, window ${rect.w}×${rect.h}, tolerance ${(tolerancePct * 100).toFixed(0)}%)`,
     rect,
     url,
-    method: 'yolo-crop'
+    method: 'yolo-crop',
+    tolerancePct
   };
 }
 
 module.exports = {
   chooseStrategy,
   isCropFirstEnabled,
+  overfitTolerancePct,
   // Promoted from __test-only to a real consumer-facing export: the PMax
   // split-stage video decision layer (services/pmaxSplitStrategy.js) needs
   // the same YOLO subject-union math to decide which side of the frame the
@@ -230,7 +283,9 @@ module.exports = {
     subjectUnionBbox,
     computeCropRect,
     buildCloudinaryCropUrl,
+    overfitTolerancePct,
     ASPECT_MATCH_THRESHOLD,
-    CROP_SAFETY_MARGIN_PX
+    CROP_SAFETY_MARGIN_PX,
+    OVERFIT_TOLERANCE_PCT_DEFAULT
   }
 };

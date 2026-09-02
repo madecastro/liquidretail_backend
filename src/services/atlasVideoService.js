@@ -1650,9 +1650,67 @@ function reframeOutpaintPrompt(aspectRatio, ctx = {}) {
   if (ctx.subjectSide === 'east' || ctx.subjectSide === 'west') {
     return reframePromptForSplitAspect(aspectRatio, ctx.subjectSide, ctx);
   }
+  // COMPOSITE-MASK (subject too wide/tall for a strict crop even with
+  // tolerance, 2026-09-01). The caller has pre-composed the source
+  // scaled-to-fit onto a target-dim canvas with plain solid margins on the
+  // over-sized dimension. Skips 'uncrop' style entirely — same reasoning as
+  // the split case: "continue the subject" is exactly the fabrication we're
+  // trying to avoid on a canvas whose subject pixels are already placed.
+  if (ctx.compositeCanvas === true) {
+    return reframePromptForCompositeCanvas(aspectRatio, ctx);
+  }
   return REFRAME_PROMPT_STYLE() === 'uncrop'
     ? uncropPromptForAspect(aspectRatio)
     : reframePromptForAspect(aspectRatio, ctx);
+}
+
+/**
+ * Outfill prompt for a centre-anchored pre-composed canvas.
+ *
+ * Contract: the input to nano-banana is already at target aspect, with the
+ * source scaled-to-fit centred in the frame and plain solid pad margins on
+ * the over-sized dimension (top+bottom for a portrait target on a landscape
+ * source, or left+right for the inverse). Prompt tells the model to fill
+ * ONLY the pad margins — the centred content is the ground truth and must
+ * ship byte-for-byte.
+ *
+ * Same maskless-steer rationale as reframePromptForSplitAspect: nano-banana
+ * has no mask parameter, so the pre-composed asymmetric frame IS the mask,
+ * and the prompt reinforces which region is which.
+ */
+function reframePromptForCompositeCanvas(aspectRatio, ctx = {}) {
+  const [wr, hr] = String(aspectRatio).split(':').map(Number);
+  const marginSide = wr > hr
+    ? 'left and right sides'
+    : wr < hr
+      ? 'top and bottom'
+      : 'edges';
+
+  const clauses = [
+    `This image is already a ${wr}:${hr} composition. The centred content is the source of truth: keep it EXACTLY where it is, at its current size, scale and position, fully visible and pixel-identical. Do NOT move, re-centre, rescale, redraw or duplicate it. ` +
+    `Build out ONLY the plain solid ${marginSide} of the frame by naturally continuing the existing background, surface, lighting and palette from the centred content into those margins. The margins must stay calm, open and uncluttered — plain continued background with no new objects, props, people, patterns or text of any kind. ` +
+    `Seamless and photorealistic, with no visible seam, border, band or colour step where the centred content ends and the extension begins.`
+  ];
+
+  const title = typeof ctx.productTitle === 'string' && ctx.productTitle.trim()
+    ? ctx.productTitle.trim() : null;
+  if (title) {
+    clauses.push(
+      `SUBJECT IDENTITY: The primary subject is "${title}". Preserve its shape, colors, materials, stitching, label text, and every logo or badge exactly as they appear in the source. Do NOT invent alternate garment styles, invent product text, or add branding that isn't in the source.`
+    );
+  }
+  clauses.push(
+    `PHYSICAL ACCURACY: If people are visible, keep hands anatomically correct (5 fingers per hand), keep faces symmetric with paired eyes, and preserve body proportions. Do NOT invent extra digits, mismatched eyes, warped features, or impossible poses. Do NOT alter the identity, hair, skin tone, or facial features of any person from the source.`
+  );
+  // Unconditional here, same reasoning as the split prompt: on a
+  // centre-anchored composite the subject is by construction at the
+  // composited image's own edges (the source's real edges), so
+  // source-edge invention is always a live risk.
+  clauses.push(
+    `SOURCE-EDGE PROTECTION: Do NOT invent unseen anatomy, garment or product beyond the visible portions of the centred content. Extend the background and setting only into the plain solid margin regions; leave the centred content's boundaries exactly where the source ends.`
+  );
+
+  return clauses.join(' ');
 }
 
 /**
@@ -1846,6 +1904,79 @@ async function normalizeReframeSource(sourceUrl) {
     return { buffer, url, mirrored: true };
   } catch (err) {
     console.warn(`⚠️  normalizeReframeSource: ${err.message}`);
+    return null;
+  }
+}
+
+/**
+ * Ensure a source URL is a Cloudinary /image/upload/ asset so the
+ * downstream URL-transformation steps can work — chooseStrategy's
+ * c_crop for yolo-crop, and cloudinaryPadUrl for the solid-pad
+ * reframe on product-only shots. Returns the URL unchanged if it's
+ * already Cloudinary; otherwise fetches the bytes and uploads to
+ * Cloudinary, returning the mirror URL. Returns null on any failure
+ * so callers can fall back to the original URL — outpaint still
+ * runs (normalizeReframeSource mirrors on its own for alpha / EXIF /
+ * non-https shapes), chooser still defers honestly.
+ *
+ * Why this exists: liquidretail_backend's catalogProductDetectService
+ * materialize path writes Media.fileUrl = source-URL when the initial
+ * Cloudinary upload fails (rate limits, transient network — the class
+ * the probeImageDims fix in backend commit df6cbdb covers for dims).
+ * Those rows still carry a non-Cloudinary fileUrl. c_crop can't be
+ * inserted into a cdn.shopify.com URL, so reframeStrategyChooser
+ * correctly returns `defer` and every affected Media falls through to
+ * raw-source nano-banana outpaint on every reframe — the exact
+ * fabrication class the composite-mask work (backend da22486, ported
+ * to adgen in this same commit) exists to reduce.
+ *
+ * Deliberately does NOT re-encode the bytes: we want the Cloudinary
+ * mirror to be byte-identical to what the source URL returned, so
+ * downstream QC / vision passes see the same asset either way. This
+ * is different from normalizeReframeSource, which re-encodes to
+ * strip alpha / apply EXIF rotation / rewrite non-https — those are
+ * corrections nano-banana needs, not correctness for a mirror.
+ *
+ * Bounded identically to normalizeReframeSource (REFRAME_MAX_SOURCE_BYTES,
+ * 20s, 3 redirects) — same host is fetched by both functions on the
+ * same reframe, so the same guard rails apply.
+ */
+async function ensureCloudinaryMirror(sourceUrl) {
+  if (!sourceUrl || typeof sourceUrl !== 'string') return null;
+  // Fast path — already on Cloudinary /image/upload/. No I/O, no cost.
+  // This is the branch that fires on every previously-mirrored Media,
+  // so it MUST stay a pure string check; a network probe here would
+  // pay a full RTT on every reframe of a healthy Media.
+  if (sourceUrl.includes('/image/upload/')) return sourceUrl;
+
+  try {
+    if (isBlockedFetchHost(sourceUrl)) {
+      console.warn('⚠️  ensureCloudinaryMirror: blocked host — refusing to fetch');
+      return null;
+    }
+    const res = await axios.get(sourceUrl, {
+      responseType: 'arraybuffer',
+      timeout: 20000,
+      maxRedirects: 3,
+      maxContentLength: REFRAME_MAX_SOURCE_BYTES(),
+      maxBodyLength: REFRAME_MAX_SOURCE_BYTES()
+    });
+    const raw = Buffer.from(res.data);
+    // Sanity via sharp — a rate-limited CDN sometimes serves an HTML
+    // error body as an image content-type, which we do NOT want in
+    // Cloudinary permanently. sharp.metadata throws on non-images.
+    const md = await sharp(raw).metadata();
+    if (!(md.width > 0 && md.height > 0)) {
+      console.warn(`⚠️  ensureCloudinaryMirror: not a valid image (${md.width}x${md.height})`);
+      return null;
+    }
+    // Distinct folder from reframes/src (which stores re-encoded
+    // outpaint inputs) so an ops audit can distinguish "this is a
+    // catalog source mirror" from "this is a reframe intermediate".
+    const up = await uploadBufferToCloudinary(raw, { folder: 'liquidretail/catalog-mirror' });
+    return up?.secure_url || up?.url || null;
+  } catch (err) {
+    console.warn(`⚠️  ensureCloudinaryMirror: ${err.message}`);
     return null;
   }
 }
@@ -2458,6 +2589,37 @@ async function reframeReferenceForAspect({ media, sourceUrl, aspectRatio, brand,
         }
       }
 
+      // 5a-mirror. CLOUDINARY MIRROR GUARD. Every downstream step from
+      //     here on either transforms sourceUrl by URL insertion
+      //     (5b's cloudinaryPadUrl → c_pad; 5c's chooseStrategy /
+      //     buildCloudinaryCropUrl → c_crop) or fetches its bytes
+      //     directly (composite branch, outpaint's
+      //     normalizeReframeSource). URL-transformation ONLY works on
+      //     a Cloudinary /image/upload/ asset, so a Media whose
+      //     fileUrl is still a Shopify (or other CDN) source — the
+      //     class the probeImageDims fallback leaves behind when
+      //     materialize hits a Cloudinary rate limit — deterministic
+      //     crop AND product-only pad silently fail their URL check
+      //     and every reframe falls through to raw-source nano-banana
+      //     outpaint. Mirror once here so 5b, 5c and 6 all see a
+      //     Cloudinary URL. Fast-path is a pure string check for
+      //     healthy Media, so this costs nothing on the common path.
+      //
+      //     Fail-safe: mirror failure keeps the original URL and
+      //     lets the outpaint branch handle it — same behaviour as
+      //     before this guard existed, no regression.
+      if (typeof sourceUrl === 'string' && !sourceUrl.includes('/image/upload/')) {
+        const mirrored = await ensureCloudinaryMirror(sourceUrl);
+        if (mirrored && mirrored !== sourceUrl) {
+          let host = 'unknown';
+          try { host = new URL(sourceUrl).host; } catch { /* preserve default */ }
+          console.log(`   🪞 reframe[${aspectKey}]: mirrored source (${host}) → Cloudinary`);
+          sourceUrl = mirrored;
+        } else {
+          console.warn(`   ⚠️  reframe[${aspectKey}]: source is non-Cloudinary and mirror failed — outpaint path only`);
+        }
+      }
+
       // 5b. PRODUCT-ONLY → deterministic pad, NEVER generative, NEVER billed.
       //     See REFRAME_PRODUCT_ONLY_PAD for the measured reasoning: generative
       //     outpaint fabricates merchandise on flat-lay/studio shots. c_pad
@@ -2541,14 +2703,24 @@ async function reframeReferenceForAspect({ media, sourceUrl, aspectRatio, brand,
         await persistReframe(media, aspectKey, aspectRatio, strategy.url, strategy.method);
         return strategy.url;
       }
-      // Any non-'crop' outcome (skip / defer) falls through. 'skip' is
-      // already handled by the ALREADY-CORRECT guard at step 5, so in
-      // practice we only reach here on 'defer' — logged verbosely so a
-      // spike of deferrals is visible in Render logs before the ledger
-      // shows the outpaint spend.
+      // Any non-'crop' outcome (skip / defer / composite-mask) falls through.
+      // 'skip' is already handled by the ALREADY-CORRECT guard at step 5. In
+      // practice we only reach here on 'defer' or 'composite-mask' — both
+      // logged verbosely so a spike is visible in Render logs before the
+      // ledger shows the outpaint spend. 'composite-mask' triggers the
+      // pre-composed canvas branch below.
       if (strategy.action === 'defer' && strategy.reason !== 'REFRAME_STRATEGY!=crop-first') {
         console.log(`   ↪️  reframe[${aspectKey}]: crop-first deferred → ${strategy.reason}`);
       }
+      if (strategy.action === 'composite-mask') {
+        console.log(`   🧩 reframe[${aspectKey}]: ${strategy.reason} → composite fallback`);
+      }
+      // The composite branch below reads this flag to pick between the $0
+      // solid-pad ship (product_only) and the outpaint fill (lifestyle).
+      // Also passed into the outpaint prompt via ctx.compositeCanvas so the
+      // model gets the centre-anchored instruction rather than the "grow the
+      // canvas" default that would try to re-synthesise the whole frame.
+      const useCompositeCanvas = strategy.action === 'composite-mask';
 
       // 6. NORMALIZE → OUTPAINT → VALIDATE → PAD. Ported from the LLM
       //    Expander's runSafeZoneReframe (media.ts:1117-1227). `billed` flips
@@ -2634,14 +2806,96 @@ async function reframeReferenceForAspect({ media, sourceUrl, aspectRatio, brand,
           return fallback();
         }
 
+        // COMPOSITE-MASK BRANCH. Chooser returned 'composite-mask' because
+        // the subject union exceeded the target-aspect crop window past
+        // tolerance — a strict crop would clip a face or product edge, and
+        // sending the raw source to nano-banana would let it re-synthesise
+        // the whole frame (the fabrication class the § doNot list exists
+        // for). Instead, sharp-composite the source scaled-to-fit onto a
+        // target-dim canvas with a plain solid fill sampled from the
+        // border, then either ship it straight through ($0, product_only)
+        // or hand the composite to nano-banana with a "fill only the plain
+        // margins" prompt (lifestyle) — the visible content is already
+        // placed so the model can only invent the pad regions.
+        //
+        // Failure at any step falls through to the standard outpaint below
+        // rather than throwing: a wrong composite would ship a mis-framed
+        // reference; a fall-through just accepts the raw-source outpaint
+        // this branch was trying to improve on.
+        //
+        // Kept fully inside the tryClaimReframe mutex so two workers racing
+        // on the same (media, aspect) cannot both upload composites and
+        // both submit the paid outpaint.
+        let outpaintSourceUrl = srcNorm.url;
+        let compositeCanvasFlag = false;
+        let compositeMethod = null;
+        if (useCompositeCanvas) {
+          try {
+            const sample = await fetchBorderSample(sourceUrl);
+            const srcRatio = media.width > 0 && media.height > 0
+              ? media.width / media.height
+              : null;
+            const fill = sample && srcRatio
+              ? await detectBorderFill(sample, srcRatio, wr / hr)
+              : { uniform: false, hex: null };
+            // Solid margin fill: prefer sampled border hex when the source
+            // has a flat edge palette; else white (a neutral, matches the
+            // Cloudinary-mirror default and reads as "empty" to nano-banana
+            // in the lifestyle branch below).
+            const hex = fill?.hex || 'ffffff';
+            const compBuf = await padSolidBuffer(srcNorm.buffer, W, H, hex);
+            const fitted = compBuf
+              ? await fitBufferForCloudinary(compBuf, `reframe-composite[${aspectKey}]`)
+              : null;
+            let compositeUrl = null;
+            if (fitted) {
+              const up = await uploadBufferToCloudinary(fitted, { folder: 'liquidretail/reframes' });
+              compositeUrl = up.secure_url || up.url || null;
+            }
+            if (compositeUrl) {
+              if (isProductOnlyShot(media)) {
+                // product_only → $0 pad-composite. Product pixels centred,
+                // solid margins, no AI, no bill. Ships now; the outpaint
+                // step below never runs for this branch.
+                console.log(
+                  `   🧺 reframe[${aspectKey}]: composite pad-only (${W}×${H}, fill=#${hex}) → $0`
+                );
+                await persistReframe(media, aspectKey, aspectRatio, compositeUrl, 'composite-pad');
+                return compositeUrl;
+              }
+              // lifestyle → hand the composite to nano-banana with the
+              // compositeCanvas prompt so it fills only the plain margins.
+              console.log(
+                `   🧩 reframe[${aspectKey}]: composite outpaint (${W}×${H}, fill=#${hex}) → nano-banana`
+              );
+              outpaintSourceUrl = compositeUrl;
+              compositeCanvasFlag = true;
+              compositeMethod = 'composite-outpaint';
+            } else {
+              console.warn(
+                `⚠️  reframeReferenceForAspect[${aspectKey}]: composite build/upload failed — falling through to raw outpaint`
+              );
+            }
+          } catch (err) {
+            console.warn(
+              `⚠️  reframeReferenceForAspect[${aspectKey}]: composite branch threw — ${err.message}, falling through to raw outpaint`
+            );
+          }
+        }
+
         try {
           const id = await submitImageGeneration({
             model: REFRAME_OUTPAINT_MODEL(),
-            images: [srcNorm.url],
+            images: [outpaintSourceUrl],
             // splitSide rides in the prompt context so reframeOutpaintPrompt can
             // switch to the directional instruction. null for every existing
             // caller, which keeps their prompt byte-identical.
-            prompt: reframeOutpaintPrompt(aspectRatio, { ...reframePromptContext(media), subjectSide: splitSide }),
+            // compositeCanvas routes to reframePromptForCompositeCanvas when
+            // the composite branch above rebuilt the source; the split
+            // branch takes precedence because both use pre-composed canvases
+            // and only one shape can be true at once (splitSide is set only
+            // for pmax_video_16_9 where the composite-mask path never runs).
+            prompt: reframeOutpaintPrompt(aspectRatio, { ...reframePromptContext(media), subjectSide: splitSide, compositeCanvas: compositeCanvasFlag }),
             aspectRatio,
             resolution: REFRAME_RESOLUTION()
           });
@@ -2685,7 +2939,13 @@ async function reframeReferenceForAspect({ media, sourceUrl, aspectRatio, brand,
             } else {
               const up = await uploadBufferToCloudinary(fitted, { folder: 'liquidretail/reframes' });
               const url = up.secure_url || up.url;
-              if (url) { resultUrl = url; method = 'outpaint'; }
+              // compositeMethod records that the outpaint ran on a
+              // pre-composed centre-anchored canvas rather than the raw
+              // source — reads back as 'composite-outpaint' on
+              // Media.metadata.reframes so ledger / QC can tell the two
+              // apart. Falls through to plain 'outpaint' whenever the
+              // composite branch above bailed and the raw source was used.
+              if (url) { resultUrl = url; method = compositeMethod || 'outpaint'; }
             }
           } else {
             console.warn(`⚠️  reframeReferenceForAspect[${aspectKey}]: output rejected (bytes=${outBuf.length}) — pad fallback`);
@@ -5687,6 +5947,12 @@ module.exports = {
   // so the harness can prove a >20 MiB 4K outpaint is refitted rather than lost.
   fitBufferForCloudinary,
   CLOUDINARY_MAX_UPLOAD_BYTES,
+  // Source URL → Cloudinary mirror. Exported so a one-off repair sweep
+  // (scripts/mirrorCatalogSourcesToCloudinary.js in the backend repo, and
+  // any equivalent script here in the future) can share ONE implementation
+  // of "how do we build a mirror" — folder, size caps, sanity check, all
+  // identical.
+  ensureCloudinaryMirror,
   // Resume-from-receipt. Exported for scripts/verifyVideoResume.js, which pins
   // that neither of these can ever submit.
   peekPrediction,
