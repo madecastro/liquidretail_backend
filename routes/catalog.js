@@ -1057,7 +1057,12 @@ router.get('/:id/ads-detail', async (req, res) => {
           // frontend "Master" badge below. Same allowlist-omission trap the
           // comments throughout this $project already document: missing here
           // silently defeats the check regardless of what's on the document.
-          videoDurationSec: 1
+          videoDurationSec: 1,
+          // Operator QC-override audit trail (POST /:id/override-qc) —
+          // orthogonal to approved/approvedAt above. Projected so the detail
+          // modal can show "QC overridden by X — reason" persistently, not
+          // just react to the immediate response of the override call.
+          qcOverridden: 1, qcOverriddenAt: 1, qcOverriddenBy: 1, qcOverrideReason: 1
       } }
     ], { allowDiskUse: true });
 
@@ -1208,6 +1213,12 @@ router.get('/:id/ads-detail', async (req, res) => {
       // must read "QC Fail", not a generic "Failed" — see that file).
       phase,
       ...(failure ? { failure } : {}),
+      // See models/Ad.js qcOverridden* comment — a human override of a
+      // vision-QC rejection, orthogonal to approved/approvedAt above.
+      qcOverridden:     !!a.qcOverridden,
+      qcOverriddenAt:   a.qcOverriddenAt ? new Date(a.qcOverriddenAt).toISOString() : null,
+      qcOverriddenBy:   a.qcOverriddenBy || null,
+      qcOverrideReason: a.qcOverrideReason || null,
       regenerating:   !!a.regenerating,
       regenerationStage: a.regenerationStage || null,
       regenerationHistory: Array.isArray(a.regenerationHistory)
