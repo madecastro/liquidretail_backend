@@ -4573,6 +4573,192 @@ router.post('/:id/approve', express.json(), async (req, res) => {
   }
 });
 
+// POST /api/ads/:id/override-qc — operator manually revives a QC-rejected
+// ad, flipping status:'failed' -> 'draft'. A DELIBERATE HUMAN ACTION,
+// distinct from regenerating: no provider call, no re-render, no touch of
+// renderUrl/veoVideoUrl/renderError/visionQc/copy — a pure status + audit
+// write. Separate from (never conflated with) the `approved` flag from
+// POST /:id/approve: an ad can be un-approved but QC-overridden, or
+// approved but never QC-overridden — orthogonal booleans.
+//
+// Body: { reason: string } — REQUIRED, 3-1000 chars trimmed. This is a
+// human vouching for an ad that automated vision QC rejected; the whole
+// point of a distinct endpoint (vs. the generic PATCH /:id status editor,
+// which already lets an admin force-set status with no guard at all) is
+// leaving a clear, mandatory WHY for later review — see qcOverrideReason
+// on the model.
+//
+// GUARDS (in order):
+//   1. ad.status must be 'failed'. This is not a general status editor —
+//      PATCH /:id already exists for that. 409 otherwise.
+//   2. The failure must actually BE a QC rejection — computed via the
+//      SAME services/adPhase.js deriveAdPhase + describeAdFailure every
+//      other surface (Slack, the Ads list `failure` field) uses, so this
+//      can never disagree with what the operator sees labeled "QC Fail"
+//      elsewhere. HARD REFUSAL (409) for a non-QC failure (render error,
+//      timeout, crop failure, reclaimed stale claim, etc.) — deliberately
+//      NOT a soft warning. This endpoint's entire reason to exist is
+//      "override a QC rejection specifically"; a render/timeout/crash
+//      failure is a different, non-QC problem that reviving via this
+//      endpoint would mislabel in the audit trail (a reviewer reading
+//      qcOverriddenAt/qcOverriddenBy later would reasonably conclude QC
+//      was the failure mode, when it demonstrably was not). An operator
+//      who genuinely wants to force a non-QC failure back to draft has
+//      PATCH /:id for that, under its own, differently-labeled audit
+//      trail (none, today) — a deliberate asymmetry: reviving a QC call
+//      is common enough and sensitive enough to deserve its own gate and
+//      trail; forcing past a hard render failure is rarer and already
+//      has a path.
+//   3. No in-flight collision. Mirrors adRegenerateService's in-flight
+//      guard (same rule, same reason: an atomic CAS-style filter, not
+//      just a pre-check, so the read-then-write window can't race a
+//      concurrent claim):
+//        - regenerating:true covers BOTH the local AND adgen-deferred
+//          regenerate path in ONE flag (see models/Ad.js
+//          regenerationRequest comment — the lock write that sets
+//          regenerating:true is the SAME write that stamps
+//          regenerationRequest, so this one flag fully covers "is a
+//          regenerate touching this ad right now").
+//        - claimedByWorker is the mint-time render claim. Should already
+//          be null on any status:'failed' row (every terminal write
+//          clears it — adgen CLAUDE.md, verifyRendererAtomicClaim.js) but
+//          checked anyway: defense in depth costs nothing here.
+//        - retitleRequest/retitleClaimedByWorker guard the manual-retitle
+//          handoff (routes/brand.js, models/Ad.js). retitle-videos'
+//          eligibility filter has NO status restriction (kind:'video' +
+//          veoVideoUrl present only), so a QC-failed-but-kept-asset video
+//          ad (phase 'qc-failed-kept', which requires renderUrl truthy —
+//          the SAME shape retitle targets) really can be mid-retitle
+//          while status is still 'failed'. Overriding status to 'draft'
+//          out from under that would race the retitle's own terminal
+//          write.
+//   On any lost race (the atomic write's filter no longer matches by the
+//   time it runs), 409 — never silently no-op or re-check-and-retry
+//   server-side; the operator sees a clean "state changed, try again".
+//
+// On success: ONE $set — status:'draft', qcOverridden:true,
+// qcOverriddenAt, qcOverriddenBy, qcOverrideReason. Nothing else. Does
+// NOT clear renderError/visionQc — that is the historical record of what
+// QC actually said, kept for exactly the same "let a reviewer see both
+// sides" reason the audit trail exists at all.
+// Pure predicate — read side of the in-flight guard. Returns a refusal
+// message string, or null if the ad is safe to override right now. Mirrors
+// adRegenerateService.inFlightRefusal's shape/rationale (same file's
+// preflight() is the precedent this whole guard follows) so the two
+// "is something actively touching this ad" checks in this codebase read
+// the same way. Exported (see module.exports below) so a harness can drive
+// it directly against synthetic docs without spinning up Express or Mongo.
+function overrideQcInFlightRefusal(ad) {
+  if (ad.regenerating) {
+    return 'a regeneration is currently in progress for this ad — wait for it to finish before overriding QC.';
+  }
+  if (ad.claimedByWorker) {
+    return 'this ad is currently claimed by a renderer worker — wait for it to release before overriding QC.';
+  }
+  if (ad.retitleClaimedByWorker || (ad.retitleRequest && typeof ad.retitleRequest === 'object')) {
+    return 'a retitle is currently in progress (or queued) for this ad — wait for it to finish before overriding QC.';
+  }
+  return null;
+}
+
+// The write-side twin — the atomic CAS filter for the terminal $set. Composed
+// as a plain object (not $and) since every clause here is a simple equality/
+// $ne on a distinct field, so there is no risk of a caller's own $and being
+// spread-dropped the way adRegenerateService.notInFlight guards against.
+// MUST stay in lockstep with overrideQcInFlightRefusal above — same fields,
+// same semantics — so the read-then-write window cannot let a race through
+// that the pre-check would have caught. `status: 'failed'` doubles as the
+// step-1 guard (never a non-failed row) AND the CAS itself (never a row that
+// moved to a different status between the read and this write).
+function buildOverrideQcCasFilter({ id, brandId }) {
+  return {
+    _id: id,
+    brandId,
+    status: 'failed',
+    regenerating: { $ne: true },
+    claimedByWorker: null,
+    retitleClaimedByWorker: null,
+    retitleRequest: null
+  };
+}
+
+router.post('/:id/override-qc', express.json(), async (req, res) => {
+  try {
+    const brandId = req.query.brandId || req.headers['x-brand-id'];
+    if (!brandId) return res.status(400).json({ error: 'brandId required' });
+    try {
+      await assertBrandInTenant(brandId, req);
+    } catch (e) {
+      if (e.status === 404) return res.status(404).json({ error: e.message });
+      throw e;
+    }
+
+    const reason = String(req.body?.reason || '').trim();
+    if (reason.length < 3) {
+      return res.status(400).json({ error: 'reason is required (min 3 characters) — record why this QC rejection is being overridden' });
+    }
+    if (reason.length > 1000) {
+      return res.status(400).json({ error: 'reason is too long (max 1000 chars)' });
+    }
+
+    const ad = await Ad.findOne({ _id: req.params.id, brandId }).lean();
+    if (!ad) return res.status(404).json({ error: 'ad not found' });
+
+    if (ad.status !== 'failed') {
+      return res.status(409).json({
+        error: `override-qc only applies to a failed ad — this ad's status is '${ad.status}'. `
+          + 'Use PATCH /api/ads/:id for a general status change.'
+      });
+    }
+
+    // Same classification every other surface (Slack, the Ads list
+    // `failure` field on projectAd) uses — never re-derived independently.
+    const phase = deriveAdPhase(ad);
+    const failure = describeAdFailure(ad, phase);
+    if (!failure || !failure.isQc) {
+      const label = failure ? failure.label : 'Failed';
+      return res.status(409).json({
+        error: `this ad's failure was not a QC rejection (${label}) — override-qc only reverses a vision-QC `
+          + 'rejection. Use PATCH /api/ads/:id if you need to force this ad\'s status directly.',
+        stage: (failure && failure.stage) || (ad.renderError && ad.renderError.stage) || null
+      });
+    }
+
+    const inFlight = overrideQcInFlightRefusal(ad);
+    if (inFlight) return res.status(409).json({ error: inFlight });
+
+    const requestedBy = req.user?.userId || req.user?.email || null;
+    const now = new Date();
+    const updated = await Ad.findOneAndUpdate(
+      buildOverrideQcCasFilter({ id: req.params.id, brandId }),
+      {
+        $set: {
+          status: 'draft',
+          qcOverridden: true,
+          qcOverriddenAt: now,
+          qcOverriddenBy: requestedBy,
+          qcOverrideReason: reason,
+          updatedAt: now
+        }
+      },
+      { new: true }
+    ).lean();
+
+    if (!updated) {
+      // Lost the race — something changed between the read above and this
+      // write (a regenerate started, a retitle claimed it, the status
+      // moved). Never silently no-op.
+      return res.status(409).json({ error: 'this ad\'s state changed before the override could be applied — please retry.' });
+    }
+
+    console.log(`✅ override-qc[ad=${updated._id}]: status failed -> draft by ${requestedBy || 'unknown'} (${reason.slice(0, 80)})`);
+    res.json({ ad: projectAd(updated, /* full */ true) });
+  } catch (err) {
+    console.error('ad override-qc failed:', err);
+    res.status(500).json({ error: err.message || 'ad override-qc failed' });
+  }
+});
+
 // POST /api/ads/:id/regenerate — re-run the render pipeline for this
 // ad with an operator refinement prompt, OR a verbatim prompt override.
 // Body: { prompt?, mode?, promptOverride?, videoPromptRaw?,
@@ -5923,6 +6109,13 @@ function projectAd(ad, full = false, extras = {}) {
     // with-prompt. Polled by AdDetailModal while a regen is in flight.
     approved:           !!ad.approved,
     approvedAt:         ad.approvedAt || null,
+    // Orthogonal to `approved` above — a human override of a vision-QC
+    // rejection (POST /:id/override-qc), not a publish approval. See
+    // models/Ad.js's qcOverridden* field comment.
+    qcOverridden:       !!ad.qcOverridden,
+    qcOverriddenAt:     ad.qcOverriddenAt || null,
+    qcOverriddenBy:     ad.qcOverriddenBy || null,
+    qcOverrideReason:   ad.qcOverrideReason || null,
     regenerating:       !!ad.regenerating,
     regenerationStage:  ad.regenerationStage || null,
     regenerationHistory: Array.isArray(ad.regenerationHistory)
@@ -6152,3 +6345,11 @@ module.exports.buildModerationRollup = buildModerationRollup;
 // not assumed.
 module.exports.handleDeriveMasterBackup = handleDeriveMasterBackup;
 module.exports.notifyDeriveWaitBackup = notifyDeriveWaitBackup;
+// QC OVERRIDE (2026-09-02) — exported for behavioural pinning by
+// scripts/verifyOverrideQcGuard.js. Same rationale as every other pair above:
+// a source-text regex cannot tell a working guard from a comment describing
+// one, so the harness drives these two REAL functions (and, separately, the
+// real services/adPhase.js classifier POST /:id/override-qc reuses) against
+// synthetic Ad docs.
+module.exports.overrideQcInFlightRefusal = overrideQcInFlightRefusal;
+module.exports.buildOverrideQcCasFilter = buildOverrideQcCasFilter;
