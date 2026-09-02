@@ -59,7 +59,8 @@ console.log('\nQC override endpoint (POST /:id/override-qc) — guard + wiring b
 
 const {
   overrideQcInFlightRefusal,
-  buildOverrideQcCasFilter
+  buildOverrideQcCasFilter,
+  isGenuineQcFailureStage
 } = require('../routes/ads.js');
 const { deriveAdPhase, describeAdFailure } = require('../services/adPhase');
 
@@ -246,6 +247,59 @@ check('C7 a non-failed ad never produces a truthy failure description', () => {
   assert.strictEqual(failure, null);
 });
 
+// ── Group C (cont'd) — THE PROVEN GAP (2026-09-02 adversarial review) ────
+// describeAdFailure(...).isQc is a PRESENCE test (deriveAdPhase's
+// qc-failed-kept branch never looks at renderError.stage) — it does NOT mean
+// "the CURRENT failure IS a QC rejection". A doc shaped exactly like a real
+// QC-failed-kept ad but carrying an UNRELATED stage (a stale visionQc verdict
+// left over from an earlier attempt, sitting next to a later, different
+// failure) still classifies isQc:true at THIS layer. adPhase.js is
+// deliberately UNCHANGED by this fix (it also drives non-safety-critical UI
+// labeling elsewhere) — the route's NEW isGenuineQcFailureStage predicate is
+// the actual safety gate, checked in ADDITION to failure.isQc. These cases
+// document the gap AND prove the new predicate closes it.
+check("C8 [GAP, still true] a qc-failed-kept-shaped doc with an UNRELATED stage (reaper) still classifies isQc:true at the raw adPhase.js layer — this is exactly why routes/ads.js cannot trust failure.isQc alone", () => {
+  const { phase, failure } = classify(baseAd({
+    renderUrl: 'https://cdn/x.png',
+    visionQc: { passed: false, skipped: false },
+    renderError: { stage: 'reaper' }
+  }));
+  assert.strictEqual(phase, 'qc-failed-kept');
+  assert.ok(failure && failure.isQc === true, 'expected the pre-existing (unfixed) presence-test behaviour: isQc true');
+});
+check('C9 [SAFETY] isGenuineQcFailureStage is exported and callable', () => {
+  assert.strictEqual(typeof isGenuineQcFailureStage, 'function');
+});
+check('C10 [SAFETY] isGenuineQcFailureStage(reaper/titling/face-safe-crop/shutdown, any kind) is false', () => {
+  for (const stage of ['reaper', 'titling', 'face-safe-crop', 'shutdown']) {
+    for (const kind of ['image', 'video']) {
+      assert.strictEqual(isGenuineQcFailureStage(stage, kind), false, `${stage}/${kind} should not be genuine QC`);
+    }
+  }
+});
+check('C11 isGenuineQcFailureStage(vision-qc / vision-qc-recovery, either kind) is true', () => {
+  for (const stage of ['vision-qc', 'vision-qc-recovery']) {
+    for (const kind of ['image', 'video']) {
+      assert.strictEqual(isGenuineQcFailureStage(stage, kind), true, `${stage}/${kind} should be genuine QC`);
+    }
+  }
+});
+check("C12 isGenuineQcFailureStage('render', 'image') is true — the static direct-image QC-exhaustion throw is stamped with this exact generic stage in both this repo's legacy path and the live adgen renderer; excluding it would refuse the majority real-world static QC override", () => {
+  assert.strictEqual(isGenuineQcFailureStage('render', 'image'), true);
+});
+check("C13 [SAFETY] isGenuineQcFailureStage('render', 'video') is false — no video code path ever attaches a fresh visionQc to a thrown error (buildVideoQcFailureFields is a direct terminal $set, never a throw), so 'render' next to a video ad's visionQc is always stale", () => {
+  assert.strictEqual(isGenuineQcFailureStage('render', 'video'), false);
+});
+check("C14 [SAFETY, THE EXACT PROVEN-DEFECT SHAPE] combining failure.isQc with isGenuineQcFailureStage correctly REFUSES the qc-failed-kept-shaped/reaper-stage doc from C8", () => {
+  const { failure } = classify(baseAd({
+    renderUrl: 'https://cdn/x.png',
+    visionQc: { passed: false, skipped: false },
+    renderError: { stage: 'reaper' }
+  }));
+  const wouldOverride = !!(failure && failure.isQc && isGenuineQcFailureStage(failure.stage, 'image'));
+  assert.strictEqual(wouldOverride, false, 'the combined guard must refuse — this is the exact shape that returned 200 before the fix');
+});
+
 // ── Group D — WIRING: drive the REAL Express handler end-to-end ──────────
 const AdModel = require('../models/Ad');
 const BrandModel = require('../models/Brand');
@@ -358,6 +412,47 @@ const CLEAN_QC_FAILED_VIDEO = () => baseAd({
     assert.ok(/not a QC rejection/i.test(nonQc.jsonBody.error), `wrong message: ${nonQc.jsonBody.error}`);
   });
 
+  // ── D6a-f — THE EXACT PROVEN-DEFECT SHAPE, end-to-end (2026-09-02) ──────
+  // Every case below is a qc-failed-kept-shaped doc (status:'failed',
+  // visionQc.passed:false/!skipped, renderUrl SET) — the shape the ORIGINAL
+  // (pre-fix) guard accepted unconditionally because it only checked
+  // failure.isQc, which qc-failed-kept always satisfies regardless of
+  // renderError.stage. This is the exact 5-stage proof (render, titling,
+  // reaper, face-safe-crop, shutdown) an independent adversarial review drove
+  // against the real handler and found all five wrongly returned 200.
+  const QC_FAILED_KEPT_WITH_STAGE = (stage, over = {}) => baseAd({
+    renderUrl: 'https://cdn/x.png',
+    visionQc: { passed: false, skipped: false },
+    renderError: { stage },
+    ...over
+  });
+  for (const stage of ['titling', 'reaper', 'face-safe-crop', 'shutdown']) {
+    const label = `D6-${stage}`;
+    const result = await callRoute({ row: QC_FAILED_KEPT_WITH_STAGE(stage) });
+    check(`${label} [SAFETY, PROVEN-DEFECT SHAPE] a qc-failed-kept-shaped doc with stage:'${stage}' is REFUSED 409, not silently revived`, () => {
+      assert.strictEqual(result.statusCode, 409, `expected 409, got ${result.statusCode} — body: ${JSON.stringify(result.jsonBody)}`);
+      assert.ok(/not a QC rejection/i.test(result.jsonBody.error), `wrong message: ${result.jsonBody.error}`);
+    });
+  }
+  // 'render' + kind:'video' is the newly-identified extra closure — no video
+  // code path ever attaches a fresh visionQc to a thrown error, so this
+  // combination is always stale and must be refused exactly like the other
+  // four.
+  const renderVideoResult = await callRoute({ row: QC_FAILED_KEPT_WITH_STAGE('render', { kind: 'video' }) });
+  check("D6-render-video [SAFETY, PROVEN-DEFECT SHAPE] a qc-failed-kept-shaped VIDEO doc with stage:'render' is REFUSED 409", () => {
+    assert.strictEqual(renderVideoResult.statusCode, 409, `expected 409, got ${renderVideoResult.statusCode} — body: ${JSON.stringify(renderVideoResult.jsonBody)}`);
+    assert.ok(/not a QC rejection/i.test(renderVideoResult.jsonBody.error), `wrong message: ${renderVideoResult.jsonBody.error}`);
+  });
+  // The one deliberate exception: 'render' + kind:'image' (the default) IS a
+  // genuine QC-failure carrier in production (the static direct-image path's
+  // QC-exhaustion throw — see isGenuineQcFailureStage's doc comment) and must
+  // stay revivable, or this fix breaks the majority real-world use case.
+  const renderImageResult = await callRoute({ row: QC_FAILED_KEPT_WITH_STAGE('render', { kind: 'image' }) });
+  check("D6-render-image [NOT A REGRESSION] a qc-failed-kept-shaped IMAGE doc with stage:'render' is STILL revivable (200) — the real static-image QC-exhaustion path uses exactly this stage", () => {
+    assert.strictEqual(renderImageResult.statusCode, 200, `expected 200, got ${renderImageResult.statusCode} — body: ${JSON.stringify(renderImageResult.jsonBody)}`);
+    assert.strictEqual(renderImageResult.jsonBody.ad.status, 'draft');
+  });
+
   const inFlight = await callRoute({ row: baseAd({ regenerating: true }) });
   check('D7 [SAFETY] an in-flight regenerate is refused 409 (the same phrase as the pure predicate)', () => {
     assert.strictEqual(inFlight.statusCode, 409);
@@ -377,6 +472,19 @@ const CLEAN_QC_FAILED_VIDEO = () => baseAd({
   const longReason = await callRoute({ row: CLEAN_QC_FAILED_VIDEO(), body: { reason: 'x'.repeat(1001) } });
   check('D10 an over-long reason is refused 400', () => {
     assert.strictEqual(longReason.statusCode, 400);
+  });
+
+  // 2026-09-02: silently String()-coercing a non-string reason used to pass
+  // the length check and persist a coerced value like "[object Object]" as
+  // the mandatory audit WHY.
+  const objectReason = await callRoute({ row: CLEAN_QC_FAILED_VIDEO(), body: { reason: { note: 'not a string' } } });
+  check('D10a [SAFETY] a non-string (object) reason is refused 400, not silently coerced', () => {
+    assert.strictEqual(objectReason.statusCode, 400, `expected 400, got ${objectReason.statusCode}`);
+    assert.ok(/must be a string/i.test(objectReason.jsonBody.error), `wrong message: ${objectReason.jsonBody.error}`);
+  });
+  const arrayReason = await callRoute({ row: CLEAN_QC_FAILED_VIDEO(), body: { reason: ['a', 'b', 'c'] } });
+  check('D10b [SAFETY] a non-string (array) reason is refused 400', () => {
+    assert.strictEqual(arrayReason.statusCode, 400, `expected 400, got ${arrayReason.statusCode}`);
   });
 
   const lostRace = await callRoute({ row: CLEAN_QC_FAILED_VIDEO(), findOneAndUpdateResult: null });

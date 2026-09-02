@@ -4588,6 +4588,30 @@ router.post('/:id/approve', express.json(), async (req, res) => {
 // leaving a clear, mandatory WHY for later review — see qcOverrideReason
 // on the model.
 //
+// NO ROLE CHECK (deliberate, considered 2026-09-02). This is a brand-safety
+// bypass, which argues for gating it to req.user.role/isSuperAdmin
+// (middleware/requireAuth.js exposes both). NOT added here: POST /:id/approve
+// and PATCH /:id — this endpoint's two closest siblings, one of which is the
+// GENERAL status editor with literally no guard at all — also have no role
+// check, so adding one only to override-qc would make it stricter than the
+// unguarded escape hatch (PATCH /:id) it exists to discourage using for this
+// purpose. That is a real inconsistency worth revisiting, but as a decision
+// about this whole authorization surface (approve / PATCH / override-qc
+// together), not a one-off tightened in isolation while fixing an unrelated
+// guard bug. Flagged for a follow-up, not silently skipped.
+//
+// AUDIT TRAIL IS LAST-WRITE-WINS, NOT APPEND-ONLY (deliberate, considered
+// 2026-09-02). regenerationHistory[] (this same file/model) is the existing
+// append-only precedent, and a SECOND override-qc call on the same ad is a
+// real scenario (override -> draft -> later regenerate -> fails QC again ->
+// override again) that would silently overwrite the FIRST override's
+// qcOverriddenAt/By/Reason with the second's. NOT changed here: this fix's
+// scope is the proven stage-blindness defect (see isGenuineQcFailureStage
+// below); an array-based history needs its own schema field, its own
+// projectAd() surfacing, and its own test coverage — a separate, considered
+// enhancement, not a one-line addition to a security patch. Worth doing, but
+// as its own change.
+//
 // GUARDS (in order):
 //   1. ad.status must be 'failed'. This is not a general status editor —
 //      PATCH /:id already exists for that. 409 otherwise.
@@ -4619,10 +4643,18 @@ router.post('/:id/approve', express.json(), async (req, res) => {
 //          regenerating:true is the SAME write that stamps
 //          regenerationRequest, so this one flag fully covers "is a
 //          regenerate touching this ad right now").
-//        - claimedByWorker is the mint-time render claim. Should already
-//          be null on any status:'failed' row (every terminal write
-//          clears it — adgen CLAUDE.md, verifyRendererAtomicClaim.js) but
-//          checked anyway: defense in depth costs nothing here.
+//        - claimedByWorker is the mint-time render claim. NOT always null on
+//          a status:'failed' row — corrected 2026-09-02, the claim used to
+//          read "should already be null... every terminal write clears it",
+//          which is false: this file's own crash-catch write (renderOneInner,
+//          ~:3491-3524) sets status:'failed' + renderError.stage:'crash' on
+//          an unexpected throw WITHOUT clearing claimedByWorker/claimedAt —
+//          an ad whose in-process render crashed mid-claim can land 'failed'
+//          with a stale, non-null claim still on it. adgen's OWN terminal
+//          writes do clear it consistently (verifyRendererAtomicClaim.js
+//          pins that repo), but this route's legacy in-process crash path
+//          does not, and that gap is exactly why this check exists rather
+//          than being redundant — not "defense in depth [for] nothing".
 //        - retitleRequest/retitleClaimedByWorker guard the manual-retitle
 //          handoff (routes/brand.js, models/Ad.js). retitle-videos'
 //          eligibility filter has NO status restriction (kind:'video' +
@@ -4641,6 +4673,70 @@ router.post('/:id/approve', express.json(), async (req, res) => {
 // NOT clear renderError/visionQc — that is the historical record of what
 // QC actually said, kept for exactly the same "let a reviewer see both
 // sides" reason the audit trail exists at all.
+// ⚠️ SAFETY FIX (2026-09-02, adversarial review). describeAdFailure(...).isQc
+// does NOT mean "this ad failed because of QC" — deriveAdPhase's
+// qc-failed-kept branch (services/adPhase.js:~158) is a pure PRESENCE test
+// (status:'failed' && visionQc.passed:false && !skipped && renderUrl), never
+// cross-checked against renderError.stage. Driving the real handler with
+// docs shaped {status:'failed', visionQc:{passed:false,skipped:false},
+// renderUrl:'...', renderError:{stage:X}} for X in render/titling/reaper/
+// face-safe-crop/shutdown all returned 200 and revived the ad — every one of
+// those stages is a NON-QC failure (a stale/unrelated visionQc verdict left
+// over from an earlier attempt), yet the endpoint could not tell the
+// difference. This predicate is the fix: require the CURRENT failure's own
+// stage to be one this codebase actually writes for a genuine QC rejection.
+//
+// The allow-list is NOT simply ['vision-qc','vision-qc-recovery'] — verified
+// against every production write site in BOTH this repo and liquidretail_adgen
+// (2026-09-02):
+//   - 'vision-qc'          — video, services/brandScriptExecutor.js
+//                            buildVideoQcFailureFields; a direct terminal
+//                            $set, never a throw.
+//   - 'vision-qc-recovery' — image recovery, services/imageRecoveryService.js.
+//   - 'render'             — ALSO a genuine QC-failure carrier, but ONLY for
+//                            kind:'image'. The static direct-image path's
+//                            QC-exhaustion throw (services/
+//                            directImageRenderService.js:~3044-3052, the only
+//                            place in either repo's codebase that assigns
+//                            `err.visionQc` on a THROWN error — grepped both
+//                            repos, confirmed) is caught by a GENERIC 'render'
+//                            stage stamp in both the legacy in-process static
+//                            path (this file, renderCreative -> renderStage,
+//                            `failed(jobId,'render',err)`) and the LIVE adgen
+//                            renderer (liquidretail_adgen/src/services/
+//                            renderer.js processAd's catch, ~:2283-2345 —
+//                            that code's own comment: "PERSIST THE QC VERDICT
+//                            ON A TERMINAL FAILURE ... directImageRenderService
+//                            attaches err.visionQc on a QC-exhausted static").
+//                            Excluding 'render' outright would make this
+//                            endpoint refuse the majority real-world case
+//                            (a genuine static-image QC rejection) — a
+//                            regression at least as bad as the hole being
+//                            closed. But 'render' + kind:'video' can NEVER be
+//                            a fresh QC event (no video code path ever
+//                            assigns err.visionQc on a throw — a real video
+//                            QC failure is always the direct 'vision-qc' $set
+//                            above, which never throws), so that combination
+//                            is excluded — closing the gap for video the same
+//                            way it's closed for every other non-QC stage.
+// Every other stage (titling/reaper/face-safe-crop/shutdown/crash/claim/...)
+// is written ONLY at a pipeline point that precedes or is disjoint from
+// vision QC (crop happens pre-QC and NEVER throws — basePlateCropService.js
+// is a soft `noteRenderIssue`, not a status:'failed' write; reaper reclaims a
+// stuck 'rendering' claim; shutdown is a deploy interrupt) — a fresh QC
+// verdict is never attached alongside them, so any visionQc.passed:false
+// found next to one of them is necessarily stale from an earlier, unrelated
+// attempt. NOT allowing a bare null/undefined stage either: grepping every
+// site that ever sets visionQc.passed:false && !skipped on a status:'failed'
+// write, every one of them also stamps an explicit renderError.stage — there
+// is no confirmed production path that leaves stage null on a genuine QC
+// rejection.
+function isGenuineQcFailureStage(stage, kind) {
+  if (stage === 'vision-qc' || stage === 'vision-qc-recovery') return true;
+  if (stage === 'render' && kind !== 'video') return true;
+  return false;
+}
+
 // Pure predicate — read side of the in-flight guard. Returns a refusal
 // message string, or null if the ad is safe to override right now. Mirrors
 // adRegenerateService.inFlightRefusal's shape/rationale (same file's
@@ -4693,7 +4789,18 @@ router.post('/:id/override-qc', express.json(), async (req, res) => {
       throw e;
     }
 
-    const reason = String(req.body?.reason || '').trim();
+    // Require an ACTUAL string. Silently String()-coercing arbitrary input
+    // (an object, array, or number) would happily pass the length check and
+    // persist a coerced value like "[object Object]" as the mandatory audit
+    // WHY — defeating the entire point of qcOverrideReason. undefined/null
+    // (the common "missing" shape) still fall through to the empty-string
+    // min-length check below so the existing "reason is required" message
+    // is unchanged; only a genuinely wrong-typed value is refused here.
+    const rawReason = req.body?.reason;
+    if (rawReason !== undefined && rawReason !== null && typeof rawReason !== 'string') {
+      return res.status(400).json({ error: 'reason must be a string' });
+    }
+    const reason = String(rawReason || '').trim();
     if (reason.length < 3) {
       return res.status(400).json({ error: 'reason is required (min 3 characters) — record why this QC rejection is being overridden' });
     }
@@ -4715,7 +4822,12 @@ router.post('/:id/override-qc', express.json(), async (req, res) => {
     // `failure` field on projectAd) uses — never re-derived independently.
     const phase = deriveAdPhase(ad);
     const failure = describeAdFailure(ad, phase);
-    if (!failure || !failure.isQc) {
+    // failure.isQc alone is NOT sufficient — see isGenuineQcFailureStage's
+    // doc comment. qc-failed-kept is a pure presence test on visionQc/
+    // renderUrl; it never confirms the CURRENT terminal failure (renderError.
+    // stage) is actually the QC rejection, vs a stale QC verdict left over
+    // from an earlier attempt sitting next to an unrelated later failure.
+    if (!failure || !failure.isQc || !isGenuineQcFailureStage(failure.stage, ad.kind)) {
       const label = failure ? failure.label : 'Failed';
       return res.status(409).json({
         error: `this ad's failure was not a QC rejection (${label}) — override-qc only reverses a vision-QC `
@@ -6353,3 +6465,8 @@ module.exports.notifyDeriveWaitBackup = notifyDeriveWaitBackup;
 // synthetic Ad docs.
 module.exports.overrideQcInFlightRefusal = overrideQcInFlightRefusal;
 module.exports.buildOverrideQcCasFilter = buildOverrideQcCasFilter;
+// 2026-09-02 adversarial-review fix — isQc alone is not enough (see the
+// function's own doc comment). Exported so the harness can prove the
+// allow-list directly, and revert-prove it against the exact 5-stage synthetic
+// proof that found the original hole.
+module.exports.isGenuineQcFailureStage = isGenuineQcFailureStage;
