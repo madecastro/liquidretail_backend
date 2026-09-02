@@ -1466,6 +1466,78 @@ async function normalizeReframeSource(sourceUrl) {
   }
 }
 
+/**
+ * Ensure a source URL is a Cloudinary /image/upload/ asset so the
+ * downstream URL-transformation steps can work — chooseStrategy's
+ * c_crop for yolo-crop, and cloudinaryPadUrl for the solid-pad
+ * reframe on product-only shots. Returns the URL unchanged if it's
+ * already Cloudinary; otherwise fetches the bytes and uploads to
+ * Cloudinary, returning the mirror URL. Returns null on any failure
+ * so callers can fall back to the original URL — outpaint still
+ * runs (normalizeReframeSource mirrors on its own for alpha / EXIF /
+ * non-https shapes), chooser still defers honestly.
+ *
+ * Why this exists: catalogProductDetectService's materialize path
+ * writes Media.fileUrl = source-URL when the initial Cloudinary
+ * upload fails (rate limits, transient network — the class the
+ * probeImageDims fix in df6cbdb covers for dims). Those rows still
+ * carry a non-Cloudinary fileUrl. c_crop can't be inserted into a
+ * cdn.shopify.com URL, so reframeStrategyChooser correctly returns
+ * `defer` and every affected Media falls through to raw-source
+ * nano-banana outpaint on every reframe — the exact fabrication
+ * class the composite-mask work (da22486) exists to reduce.
+ *
+ * Deliberately does NOT re-encode the bytes: we want the Cloudinary
+ * mirror to be byte-identical to what the source URL returned, so
+ * downstream QC / vision passes see the same asset either way. This
+ * is different from normalizeReframeSource, which re-encodes to
+ * strip alpha / apply EXIF rotation / rewrite non-https — those are
+ * corrections nano-banana needs, not correctness for a mirror.
+ *
+ * Bounded identically to normalizeReframeSource (REFRAME_MAX_SOURCE_BYTES,
+ * 20s, 3 redirects) — same host is fetched by both functions on the
+ * same reframe, so the same guard rails apply.
+ */
+async function ensureCloudinaryMirror(sourceUrl) {
+  if (!sourceUrl || typeof sourceUrl !== 'string') return null;
+  // Fast path — already on Cloudinary /image/upload/. No I/O, no cost.
+  // This is the branch that fires on every previously-mirrored Media,
+  // so it MUST stay a pure string check; a network probe here would
+  // pay a full RTT on every reframe of a healthy Media.
+  if (sourceUrl.includes('/image/upload/')) return sourceUrl;
+
+  try {
+    if (isBlockedFetchHost(sourceUrl)) {
+      console.warn('⚠️  ensureCloudinaryMirror: blocked host — refusing to fetch');
+      return null;
+    }
+    const res = await axios.get(sourceUrl, {
+      responseType: 'arraybuffer',
+      timeout: 20000,
+      maxRedirects: 3,
+      maxContentLength: REFRAME_MAX_SOURCE_BYTES(),
+      maxBodyLength: REFRAME_MAX_SOURCE_BYTES()
+    });
+    const raw = Buffer.from(res.data);
+    // Sanity via sharp — a rate-limited CDN sometimes serves an HTML
+    // error body as an image content-type, which we do NOT want in
+    // Cloudinary permanently. sharp.metadata throws on non-images.
+    const md = await sharp(raw).metadata();
+    if (!(md.width > 0 && md.height > 0)) {
+      console.warn(`⚠️  ensureCloudinaryMirror: not a valid image (${md.width}x${md.height})`);
+      return null;
+    }
+    // Distinct folder from reframes/src (which stores re-encoded
+    // outpaint inputs) so an ops audit can distinguish "this is a
+    // catalog source mirror" from "this is a reframe intermediate".
+    const up = await uploadBufferToCloudinary(raw, { folder: 'liquidretail/catalog-mirror' });
+    return up?.secure_url || up?.url || null;
+  } catch (err) {
+    console.warn(`⚠️  ensureCloudinaryMirror: ${err.message}`);
+    return null;
+  }
+}
+
 // $0 deterministic pad: fit the WHOLE source inside a W×H frame (letterbox,
 // nothing cropped/lost) over a blurred cover of itself. Port of media.ts:padToRatio
 // (gblur=sigma=24). Never throws; returns JPEG Buffer or null.
@@ -2079,6 +2151,37 @@ async function reframeReferenceForAspect({ media, sourceUrl, aspectRatio, brand,
           // Persist exact-fit too so every aspect is on file for reuse.
           await persistReframe(media, aspectKey, aspectRatio, exactUrl, 'exact');
           return exactUrl;
+        }
+      }
+
+      // 5a-mirror. CLOUDINARY MIRROR GUARD. Every downstream step from
+      //     here on either transforms sourceUrl by URL insertion
+      //     (5b's cloudinaryPadUrl → c_pad; 5c's chooseStrategy /
+      //     buildCloudinaryCropUrl → c_crop) or fetches its bytes
+      //     directly (composite branch, outpaint's
+      //     normalizeReframeSource). URL-transformation ONLY works on
+      //     a Cloudinary /image/upload/ asset, so a Media whose
+      //     fileUrl is still a Shopify (or other CDN) source — the
+      //     class the probeImageDims fallback leaves behind when
+      //     materialize hits a Cloudinary rate limit — deterministic
+      //     crop AND product-only pad silently fail their URL check
+      //     and every reframe falls through to raw-source nano-banana
+      //     outpaint. Mirror once here so 5b, 5c and 6 all see a
+      //     Cloudinary URL. Fast-path is a pure string check for
+      //     healthy Media, so this costs nothing on the common path.
+      //
+      //     Fail-safe: mirror failure keeps the original URL and
+      //     lets the outpaint branch handle it — same behaviour as
+      //     before this guard existed, no regression.
+      if (typeof sourceUrl === 'string' && !sourceUrl.includes('/image/upload/')) {
+        const mirrored = await ensureCloudinaryMirror(sourceUrl);
+        if (mirrored && mirrored !== sourceUrl) {
+          let host = 'unknown';
+          try { host = new URL(sourceUrl).host; } catch { /* preserve default */ }
+          console.log(`   🪞 reframe[${aspectKey}]: mirrored source (${host}) → Cloudinary`);
+          sourceUrl = mirrored;
+        } else {
+          console.warn(`   ⚠️  reframe[${aspectKey}]: source is non-Cloudinary and mirror failed — outpaint path only`);
         }
       }
 
@@ -5147,6 +5250,13 @@ module.exports = {
   // so the harness can prove a >20 MiB 4K outpaint is refitted rather than lost.
   fitBufferForCloudinary,
   CLOUDINARY_MAX_UPLOAD_BYTES,
+  // Source URL → Cloudinary mirror. Exported for
+  // scripts/mirrorCatalogSourcesToCloudinary.js (the one-off repair
+  // sweep for pre-2026-09-01 Media whose materialize hit a Cloudinary
+  // rate limit and kept a Shopify URL) so the sweep and the reframe
+  // worker share ONE implementation of "how do we build a mirror" —
+  // folder, size caps, sanity check, all identical.
+  ensureCloudinaryMirror,
   // Resume-from-receipt. Exported for scripts/verifyVideoResume.js, which pins
   // that neither of these can ever submit.
   peekPrediction,
