@@ -1842,26 +1842,57 @@ async function runPostRenderQc({
  *     safeBoxInDeliveredPx) — is the product's branding area in-frame, and
  *     does the caption overlay ever fully obscure the product.
  */
-function buildVideoVisionUserContent({ originalProductUrl, frames, brandName }) {
-  if (!originalProductUrl) throw new Error('adVisionQc: originalProductUrl required');
+function buildVideoVisionUserContent({ originalProductUrl, originalProductUrls, frames, brandName }) {
+  // Accept either shape — array (new, multi-ref) or single URL (legacy).
+  // Callers migrating in gain multi-ref evaluation transparently; anything
+  // that still passes originalProductUrl keeps its exact pre-2026-09-02
+  // behaviour (M=1). Also de-duplicates and drops falsy entries so a caller
+  // that stitches together veoReferenceImages + a catalog fallback doesn't
+  // double-count the seed or ship an undefined into the vision payload.
+  const refInputs = Array.isArray(originalProductUrls) && originalProductUrls.length
+    ? originalProductUrls
+    : (originalProductUrl ? [originalProductUrl] : []);
+  const refUrls = [];
+  const seen = new Set();
+  for (const u of refInputs) {
+    if (typeof u !== 'string' || !u.trim()) continue;
+    if (seen.has(u)) continue;
+    seen.add(u);
+    refUrls.push(u);
+  }
+  if (!refUrls.length) throw new Error('adVisionQc: at least one originalProductUrl required');
   if (!Array.isArray(frames) || !frames.length) throw new Error('adVisionQc: frames required');
 
+  const M = refUrls.length;
+  const N = frames.length;
   const brand = brandName || 'the advertiser';
   const frameList = frames
-    .map((f) => `  - t=${Number(f.timestampSec).toFixed(1)}s`)
+    .map((f, i) => `  - IMAGE ${M + 1 + i}: t=${Number(f.timestampSec).toFixed(1)}s`)
     .join('\n');
+
+  // Reference block header: singular vs plural phrasing keeps the M=1 case
+  // reading naturally (the vast majority of the corpus today), while M>1
+  // makes it clear these are the same asset seen from multiple angles /
+  // colorways / sides that the video model was given as input.
+  const referenceHeader = M === 1
+    ? `  IMAGE 1 — ORIGINAL PRODUCT REFERENCE (the source photo the video was generated from)`
+    : `  IMAGES 1-${M} — ORIGINAL PRODUCT REFERENCES (${M} reference photos sent to the video model — same product from different angles / colorways / sides. Treat the UNION of these as ground truth.)`;
+  const referenceAntecedent = M === 1 ? 'the product in IMAGE 1' : `the product across IMAGES 1-${M}`;
+  const referenceAntecedentAny = M === 1 ? 'from IMAGE 1' : `from any of IMAGES 1-${M}`;
 
   const prompt = `You are a post-render quality inspector for direct-response VIDEO product ads.
 
-You are given ${frames.length + 1} images in this exact order:
-  IMAGE 1 — ORIGINAL PRODUCT PHOTO (the source/hero reference the video was generated from)
-  IMAGE 2-${frames.length + 1} — FRAMES SAMPLED FROM THE DELIVERED VIDEO, in this order:
+You are given ${M + N} images in this exact order:
+${referenceHeader}
+  IMAGES ${M + 1}-${M + N} — FRAMES SAMPLED FROM THE DELIVERED VIDEO, in this order:
 ${frameList}
 
 Treat the sampled frames as evidence about the WHOLE clip, not independent
 ads: if a defect appears in ANY ONE frame, the category fails for the video.
 
-Brand name: ${brand}
+${M > 1 ? `The reference set may show LEGITIMATE VARIATION — different angles (front/back/detail), different colorways of the same SKU (e.g. a reversible garment shown on both sides), or the product both on-model and packshot. A frame that matches ANY reference on colourway / silhouette / print / branding is FINE — you are checking that the video did not INVENT anything that is not in ANY reference. Variation the references support is not a defect.
+
+` : ''}Brand name: ${brand}
 
 Score EACH category 0-10 (integer) and list concrete findings, citing which
 frame(s) (by timestamp) show the problem. Return ONLY JSON.
@@ -1870,20 +1901,22 @@ CATEGORIES
 
 1. competitor_marks (PRIMARY)
    Logos, wordmarks, emblems, badges, tree/animal/crest marks, or other brand
-   devices present ON THE PRODUCT in any sampled frame that are ABSENT from
-   the product in IMAGE 1, OR that belong to a DIFFERENT brand than ${brand}.
-   IMPORTANT: ${brand}'s OWN logo composited into a corner as ad chrome is
+   devices present ON THE PRODUCT in any sampled frame that are ABSENT
+   ${referenceAntecedentAny}, OR that belong to a DIFFERENT brand than ${brand}.
+   ${M > 1 ? `A mark is "absent" only if it does NOT appear on the product in ANY of the reference images — check every reference before flagging.
+   ` : ''}IMPORTANT: ${brand}'s OWN logo composited into a corner as ad chrome is
    EXPECTED and must NOT be flagged. Only invent marks on the product surface
    (hardware, woven labels, hang tags) that were not on the original product.
 
 2. product_fidelity (PRIMARY)
    Silhouette, COLOURWAY, materials, panel/pocket count, orientation, and
-   construction drift from IMAGE 1, checked against EVERY sampled frame. A
-   generative video model can drift the product's colour or shape partway
-   through a clip even when the opening frame is correct -- score the WORST
-   frame, not the average. Scene/background/model/lighting change is fine;
-   product identity or colour drift is not.
-
+   construction drift from ${referenceAntecedent}, checked against EVERY sampled
+   frame. A generative video model can drift the product's colour or shape
+   partway through a clip even when the opening frame is correct -- score the
+   WORST frame, not the average. Scene/background/model/lighting change is
+   fine; product identity or colour drift is not.
+   ${M > 1 ? `When the references show more than one colorway or view (e.g. a reversible garment shown on both sides), a frame that matches ANY reference's colorway is fine — the clip may legitimately animate through the variants the references contain. Only flag colour/shape features present in NO reference.
+   ` : ''}
 3. text_defects (product-intrinsic only -- NOT the ad's caption overlay)
    Misspelled, mangled, gibberish, or nonsensical text/lettering that is part
    of the PRODUCT ITSELF or the scene (woven labels, hang tags, embossed or
@@ -1909,13 +1942,16 @@ JSON SHAPE (no prose outside it):
   "summary": "one-line overall"
 }`;
 
-  const content = [
-    { type: 'text', text: prompt },
-    { type: 'text', text: 'IMAGE 1 — ORIGINAL PRODUCT PHOTO:' },
-    { type: 'image_url', image_url: { url: originalProductUrl } }
-  ];
+  const content = [{ type: 'text', text: prompt }];
+  refUrls.forEach((url, i) => {
+    const label = M === 1
+      ? 'IMAGE 1 — ORIGINAL PRODUCT REFERENCE:'
+      : `IMAGE ${i + 1} — ORIGINAL PRODUCT REFERENCE ${i + 1} of ${M}:`;
+    content.push({ type: 'text', text: label });
+    content.push({ type: 'image_url', image_url: { url } });
+  });
   frames.forEach((f, i) => {
-    content.push({ type: 'text', text: `IMAGE ${i + 2} — VIDEO FRAME @ t=${Number(f.timestampSec).toFixed(1)}s:` });
+    content.push({ type: 'text', text: `IMAGE ${M + 1 + i} — VIDEO FRAME @ t=${Number(f.timestampSec).toFixed(1)}s:` });
     content.push({ type: 'image_url', image_url: { url: f.url } });
   });
   return content;
@@ -1930,6 +1966,7 @@ JSON SHAPE (no prose outside it):
  */
 async function judgeVideoRender({
   originalProductUrl,
+  originalProductUrls,
   frames,
   brandName,
   brandId = null,
@@ -1940,7 +1977,12 @@ async function judgeVideoRender({
 }, deps = {}) {
   const chat = deps.chatCompletion || chatCompletion;
   const model = deps.model || resolveQcModel();
-  const userContent = buildVideoVisionUserContent({ originalProductUrl, frames, brandName });
+  const userContent = buildVideoVisionUserContent({ originalProductUrl, originalProductUrls, frames, brandName });
+  // Number of reference images actually used — mirrors buildVideoVisionUserContent's
+  // own coercion so the CostLog vision count is accurate for multi-ref calls.
+  const referenceCount = Array.isArray(originalProductUrls) && originalProductUrls.length
+    ? new Set(originalProductUrls.filter((u) => typeof u === 'string' && u.trim())).size
+    : (originalProductUrl ? 1 : 0);
 
   // ── MONEY: billable vision LLM call ──────────────────────────────
   const res = await chat(
@@ -1948,7 +1990,7 @@ async function judgeVideoRender({
       stage: 'ad_video_vision_qc',
       service: 'adVisionQcService',
       purposeTag: 'post_render_video_qc',
-      visionImages: frames.length + 1,
+      visionImages: frames.length + referenceCount,
       brandId,
       productId,
       adId,
@@ -2011,6 +2053,7 @@ async function judgeVideoRender({
 async function runVideoPostRenderQc({
   enabled,
   originalProductUrl,
+  originalProductUrls,
   frames,
   brandName,
   brandId = null,
@@ -2041,7 +2084,15 @@ async function runVideoPostRenderQc({
     };
   }
 
-  if (!originalProductUrl) {
+  // Coerce reference input to the multi-URL array shape so the downstream
+  // gate + judge signature stays uniform. Preserves the pre-2026-09-02
+  // shape for callers that still pass a single originalProductUrl.
+  const refUrlArray = Array.isArray(originalProductUrls) && originalProductUrls.length
+    ? originalProductUrls.filter((u) => typeof u === 'string' && u.trim())
+    : (originalProductUrl && typeof originalProductUrl === 'string' && originalProductUrl.trim()
+        ? [originalProductUrl]
+        : []);
+  if (!refUrlArray.length) {
     return { ok: true, skipped: true, visionQc: buildSkippedVerdict('no original product URL') };
   }
   if (!Array.isArray(frames) || !frames.length) {
@@ -2060,7 +2111,7 @@ async function runVideoPostRenderQc({
   let verdict;
   try {
     verdict = await judge({
-      originalProductUrl, frames, brandName, brandId, productId, adId, campaignId, campaignRunId
+      originalProductUrls: refUrlArray, frames, brandName, brandId, productId, adId, campaignId, campaignRunId
     });
   } catch (err) {
     const msg = (err && err.message) ? err.message : String(err || 'unknown');

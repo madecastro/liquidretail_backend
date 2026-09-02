@@ -2,7 +2,7 @@
   "version": 2,
   "backendRef": "origin/main",
   "backendHead": "ecbea9c7f2e344dfcd4e3a06d2455a03bba5d237",
-  "generatedAt": "2026-09-02T04:32:41.922Z",
+  "generatedAt": "2026-09-02T14:00:38.568Z",
   "files": {
     "models/Ad.js": {
       "backendHash": "394d26a1cb8ad64b23bde73312f3473f332520dd9640b9d5e4bb8eec22d6138d",
@@ -667,13 +667,11 @@
       "owedSince": null
     },
     "services/adVisionQcService.js": {
-      "backendHash": "ec26acfea7dfb97e3537cf471da36f8dc440b13748e85b20a450b0d7fb7dc586",
-      "adgenHash": "e14898983e45e1820bd724af41cb7ab24442da649bbef208bf8a3fc0507c9e1c",
-      "backendSha": "e955b04891fcb861bbf64a5bc8642aa2fbe7a0bc",
+      "backendHash": "bdd77df5c81c246458d5e3c5b51c1ff15c84a9d3ceb2221cf41b296a5cd31eef",
+      "adgenHash": "b93a691b260bca465461bd2c3e779daa99598b71dbd96dac1ff514492775bf12",
+      "backendSha": "be8ea6b53f544ec5a07f1f5d859805cd42eb38a6",
       "status": "fork",
-      "reason": "Backend #329 threads campaignRunId through judgeRender/runPostRenderQc/judgeVideoRender/runVideoPostRenderQc; adgen already carries campaignRunId in all four (via adgen's own #43 cost-ledger attribution work) — same shape, verified at each call site (adVisionQcService.js:1088,1389,1756,1837 + their internal judge() calls). Residual divergence unchanged from prior look: env-var fallback removed + buildPersistedVerdict invariant restored to match backend; backend's isStaticEnabled()/isVideoEnabled() synchronous pipeline gates remain unported (unused by any adgen caller).",
-      "portTo": null,
-      "owedSince": null
+      "reason": "Fork carries the same #329 campaignRunId residual + env-var fallback removal as before. NEW as of 2026-09-02: multi-reference video QC (backend-side commit staged for same day) — buildVideoVisionUserContent + judgeVideoRender + runVideoPostRenderQc accept originalProductUrls[] array (backward compat with single originalProductUrl). Prompt updated: M=1 keeps the legacy 'ORIGINAL PRODUCT PHOTO' semantics with a renamed 'ORIGINAL PRODUCT REFERENCE' label; M>1 adds a LEGITIMATE VARIATION allowance so a reversible garment / multi-colorway SKU / on-model+packshot ref stack does not trip product_fidelity or competitor_marks against variation the references support. Byte-identical to backend for the new branch; adgen residual (isStaticEnabled/isVideoEnabled pipeline gates) unchanged."
     },
     "services/adgenBridge.js": {
       "backendHash": "49ac3bb8c5a63a35d538e9cbd798bd1af1789ef9f121770b8e2d25659efd6496",
@@ -890,11 +888,11 @@
       "owedSince": null
     },
     "services/brandScriptExecutor.js": {
-      "backendHash": "bc87bd56fa996f2aca33e581712496b35e68ea4fda285e5dec79491e9c1c8165",
-      "adgenHash": "4a35cef56be39a9b3119f5bd720124a4ef1b2b9479bb0f177cbca90c509aef33",
-      "backendSha": "2d93ace1f79a7d91c7aede75667fb4d8c4e48a23",
+      "backendHash": "d041a084b448940b4702f76d0cd915ade4a1b3e1393a0a00a4fde83af1636a14",
+      "adgenHash": "d9bfc5aa37b9483e169a79745e48fa275e506fe8a3d1aa1000a17daf481145f9",
+      "backendSha": "5d1cfc74cbc6ccd77e88f2eb70ee348d9e123700",
       "status": "unported",
-      "reason": "MERGED 2026-08-28 from two independent reconciliations that both landed the same day and describe different, non-conflicting aspects of this file. (1) The retitle-handoff work (#93/#359) applied a coordinated preserveAdStatus/retitleMode fix to BOTH repos' copies in the same session (manual-retitle status-preservation bug — see docs/CONTRACT-backend-adgen.md Protocol D) — that specific aspect is now synced, not owed. (2) Separately and still real: backend origin/main advanced to abf7e0c2 (#360, in-process titling removal) mid-session; #360's own commit message explicitly EXCLUDES this file ('brandScriptExecutor.js (the Remotion titling engine itself...) ... unchanged and stay alive as shared helpers') because backend's manual retitle HTTP endpoints (routes/brand.js: /retitle-videos, /title-still, /title-spec/modify) still call renderBrandScriptAndSave directly. So backend structurally still lacks stampTitlingFailureAndThrow/TITLING_ATTEMPTS_MAX — a pre-existing, unrelated gap, just with a narrower (manual-trigger-only) blast radius now that #360 removed the automatic render-loop callers. owedSince carries forward for THIS gap only; the retitle-status-preservation gap is closed.",
+      "reason": "Pre-existing debt from #93/#359/#360 unchanged in direction — backend still lacks stampTitlingFailureAndThrow/TITLING_ATTEMPTS_MAX on its manual retitle path (routes/brand.js: /retitle-videos, /title-still, /title-spec/modify → renderBrandScriptAndSave). NEW 2026-09-02: runVideoVisionQcForAd now passes ad.veoReferenceImages[] (all refs, not just [0]) to runVideoPostRenderQc as originalProductUrls. Same change landed byte-identical in backend for the same-day multi-ref QC work. Applies to both master path (has veoReferenceImages) and derive path (falls back to CatalogProduct.imageUrl as a single-element array, reproducing pre-2026-09-02 M=1 behaviour exactly). owedSince carries forward for the titling-attempts gap only.",
       "portTo": "backend",
       "owedSince": "2026-08-28T17:47:48.113Z"
     },
