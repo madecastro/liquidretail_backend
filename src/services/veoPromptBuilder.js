@@ -57,7 +57,7 @@ const PLATFORM_FORMAT_ASPECT = Object.fromEntries(
 // Burns directives are authored once per profile so Omni (20k headroom),
 // Grok (4,096), and hook_first (destination overlay on Omni) can be tuned
 // independently; shared dynamic lines (operator lead, duration-scaled
-// Timeline/Output, PRODUCT FIDELITY, compositing, seedHasText) stay in
+// Timeline/Output, PRODUCT FIDELITY, compositing) stay in
 // buildVeoPrompt. hook_first also adds aspect-aware Frame lines there.
 const PROMPT_PROFILES = {
   'gemini-omni': {
@@ -563,6 +563,25 @@ const UI_CHROME_GUARD_LINE =
   `hamburger icons, shopping-cart/bag icons, buttons, price tags, banners, or any screen-within-the-screen. ` +
   `This is a real-world camera shot of a physical product, never a screenshot, mockup, or render of a web page or app.`;
 
+// KILL SWITCH: VIDEO_RAW_CATALOG_REFERENCES, DEFAULT OFF. Same name as
+// atlasVideoService — duplicated here so this file does not require the
+// video service (cycle). When on, lifestyle role/sourceImages drop the
+// "fitted to this aspect upstream" claim because we no longer reframe.
+function isVideoRawCatalogReferencesEnabled() {
+  const raw = process.env.VIDEO_RAW_CATALOG_REFERENCES;
+  if (raw == null || String(raw).trim() === '') return false;
+  return !/^(0|false|no|off)$/i.test(String(raw).trim());
+}
+
+const RAW_CATALOG_LIFESTYLE_ROLE =
+  `Role: Lifestyle motion editor. Bring the lifestyle photograph to life as an authentic, lived-in moment — ` +
+  `do NOT rebuild, restyle, restage, recompose, or replace the scene. ` +
+  `The image as handed to you is the catalog photograph at native resolution and the source of truth. ` +
+  `Output aspect is a separate parameter — do NOT crop, pad, letterbox, or reframe the product to fill the frame, and do NOT extend the scene.`;
+const RAW_CATALOG_LIFESTYLE_SOURCE_IMAGES =
+  `Source images: Use only the image as handed to you. One lifestyle seed at native catalog resolution — ` +
+  `do not invent additional views, and do not crop, pad, or reframe it.`;
+
 /**
  * Lifestyle video prompt branch is active only when the flag is on AND
  * (seed is lifestyle OR variantKind is ugc). Matches static preserve trigger
@@ -676,7 +695,6 @@ function buildVeoPrompt({
   layoutInput = null,     // eslint-disable-line no-unused-vars
   sourceMedia = null,     // eslint-disable-line no-unused-vars
   aspectRatio = '1:1',
-  seedHasText = false,
   hasProductReference = false,
   operatorPrompt = null,
   storyboard = null,      // eslint-disable-line no-unused-vars
@@ -718,7 +736,10 @@ function buildVeoPrompt({
   // Lifestyle is a sibling directive set for scene/motion — it does NOT
   // suppress the hook-first destination profile. Packshot path still uses
   // profile selection exactly as before (B14).
-  const d = lifestyle ? LIFESTYLE_DIRECTIVES : directivesForProfile(profile);
+  const dBase = lifestyle ? LIFESTYLE_DIRECTIVES : directivesForProfile(profile);
+  const d = (lifestyle && isVideoRawCatalogReferencesEnabled())
+    ? { ...dBase, role: RAW_CATALOG_LIFESTYLE_ROLE, sourceImages: RAW_CATALOG_LIFESTYLE_SOURCE_IMAGES }
+    : dBase;
   // Orthogonal: hook-first destination treatment composes with lifestyle,
   // never gets dropped because the seed is lifestyle.
   //
@@ -1160,13 +1181,11 @@ function buildVeoPrompt({
     lines.push(UI_CHROME_GUARD_LINE);
   }
 
-  if (seedHasText) {
-    lines.push(
-      `The reference image contains text overlays / captions / stickers / watermarks burned into the source frame. ` +
-      `Treat that burned-in text as part of the locked photograph — do not read, reproduce, extend, or generate more of it. ` +
-      `The chrome layer will composite all ad copy downstream.`
-    );
-  }
+  // The overlay/sticker "do not reproduce" block and the on-product "reproduce
+  // faithfully" lock line were stripped 2026-09-03. They contradicted
+  // OMNI_DIRECTIVES.noText (which already says both halves, unconditionally,
+  // in every production prompt) and keyed on Media.text[].type — a classifier
+  // proven wrong three ways tonight. noText is the sole text directive.
 
   lines.push(d.physicalAccuracy);
 

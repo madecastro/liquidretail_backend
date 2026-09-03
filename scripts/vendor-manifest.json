@@ -2,7 +2,7 @@
   "version": 2,
   "backendRef": "origin/main",
   "backendHead": "b4eb6435c7d9717aaafe191c28d5bdf8b22a2691",
-  "generatedAt": "2026-09-03T05:19:00.697Z",
+  "generatedAt": "2026-09-03T14:26:44.377Z",
   "files": {
     "models/Ad.js": {
       "backendHash": "394d26a1cb8ad64b23bde73312f3473f332520dd9640b9d5e4bb8eec22d6138d",
@@ -199,12 +199,11 @@
       "owedSince": null
     },
     "models/Media.js": {
-      "backendHash": "09942486e8def86c89baddadc670f61e624a93a6c3b9ab45f31ee7f56e909d53",
-      "adgenHash": "09942486e8def86c89baddadc670f61e624a93a6c3b9ab45f31ee7f56e909d53",
-      "backendSha": "8123961dd005fa1687d8a22acb43a6f625fad10e",
-      "status": "synced",
-      "portTo": null,
-      "owedSince": null
+      "backendHash": "a9e71dc79fb4e6c536c5ad257cc8a640e7ac8cedb6edfe216d637e6b60ad6818",
+      "adgenHash": "c8c2189c3810dc2950686779d18829f1962f23561fcf6df7350ee0620f8a72de",
+      "backendSha": "a1d03573e0dffb495cf20eceb683de4d880fef0f",
+      "status": "fork",
+      "reason": "2026-09-03: declared classification.faceVisible (Boolean, default null) so mongoose strict mode cannot drop the field on renderer reads/writes. Backend ingest (subjectTextService/detect.js) is the writer and already has this field on the backend working tree from earlier tonight. Not --unported: the schema addition matches backend working tree. origin/main will sync when that ingest work lands. Do not default false — null means never assessed."
     },
     "models/OperationRun.js": {
       "backendHash": "cf5078a88a5e6eba12dba7b5a0a31a64a3e4a512f6b1430a87754f73ca4a8352",
@@ -726,11 +725,10 @@
     },
     "services/aiVideoReferenceService.js": {
       "backendHash": "5605a8da64af1774e9955e65269225083c0a5e3e3708bc0e0c7779e7499a2fdd",
-      "adgenHash": "5605a8da64af1774e9955e65269225083c0a5e3e3708bc0e0c7779e7499a2fdd",
+      "adgenHash": "865688405806741ce0550bdd2eef36413384cf6fdc9dbc0d408374a0854f92d5",
       "backendSha": "21f68ad80e38c187b7682c2cd8d676bb8a1cdae1",
-      "status": "synced",
-      "portTo": null,
-      "owedSince": null
+      "status": "fork",
+      "reason": "2026-09-03 STRIP: overlay seedHasText removed from the legacy Veo path (AI_VEO_REELS, not production Atlas). Matching strip on backend working tree. Not --unported."
     },
     "services/aiVocabulary.js": {
       "backendHash": "1bb6e7268c8431326d6091df1e41d4be9f0c183c442575e9fa8f30785a9561a4",
@@ -812,10 +810,10 @@
     },
     "services/atlasVideoService.js": {
       "backendHash": "2d16c3162e339880b748bff3e4f621fed9df8c0493dcd4d7723eb381e032a288",
-      "adgenHash": "eb313adb5a4781c04a5833e74a0d39622057ddb3c0b7d38ef8af679e0d4e8aa2",
+      "adgenHash": "4da44017fb383fd1e9b7ac8198d88580f175e5c38b1ef1fda398f9f7e90aaf6b",
       "backendSha": "be56edfd6c1456b4c75b2f26818ef5ed046b95af",
       "status": "unported",
-      "reason": "PARTIALLY RESOLVED — three prior debt threads plus one adgen-only landing. THREAD 1 (reframe-claim eviction + poll-budget decoupling): CLOSED. THREAD 2 (tolerance + composite-mask + Cloudinary mirror): CLOSED. THREAD 3 (video-master-timeout-livelock, backend #82: MAX_POLL_MS 600000->900000 + unsettledAtTimeout/hold handling): STILL GENUINELY OWED. Backend MAX_POLL_MS remains 600000 on origin/main; adgen is 900000. Do not silently downgrade without a line-by-line pass. THREAD 4 (2026-09-02, adgen-only, NOT owed to backend): pad-at-source-scale (padCanvasDims + method-gated padGeometryVersion invalidation + REFRAME_PASSTHROUGH_BRAND_IDS) and the refinedProducts catalog .select() so subjectUnionBbox can take the DINO crop path instead of paid nano-banana defer. Follow-up: byte-pad and composite-pad use padCanvasDims, not imageDimsForAspect. Live renderer is adgen (ADGEN_RENDERER_ENABLED=true); backend copy does not execute. Do not port Thread 4.",
+      "reason": "PARTIALLY RESOLVED — prior threads stand. THREAD 1 CLOSED. THREAD 2 CLOSED. THREAD 3 (MAX_POLL_MS 900000 vs backend 600000) STILL OWED. THREAD 4 pad-at-source-scale / REFRAME_PASSTHROUGH is adgen-only, do not port. THREAD 5 ranking/raw-refs already on backend working tree. THREAD 6 (2026-09-03 STRIP): seedHasText/seedHasOnProductMarks removed from generateForAd + scaffold; overlay guard no longer in the submit prompt. Same strip on backend working tree. Not a new owed port. owedSince carried.",
       "portTo": "backend",
       "owedSince": "2026-08-27T16:49:12.296Z"
     },
@@ -1514,11 +1512,10 @@
     },
     "services/referenceDefaultsService.js": {
       "backendHash": "3ff6f2822ea75fb6c49de2272d32ab32cc3f0af2a115cdfcb32ec77f50fb34fd",
-      "adgenHash": "3ff6f2822ea75fb6c49de2272d32ab32cc3f0af2a115cdfcb32ec77f50fb34fd",
+      "adgenHash": "ecebff431415f819c7780215c09e9181c5c8612554cdc8428516afb313614577",
       "backendSha": "d059ffadb41ca760ac364ab58580de74e061286d",
-      "status": "synced",
-      "portTo": null,
-      "owedSince": null
+      "status": "fork",
+      "reason": "2026-09-03 packshot-protected ranking + faceVisible consumer + remove-by-index fix. PORTED to backend in PR #382 (services/referenceDefaultsService.js); both copies execute identically over the same inputs, verified by running orderByPackshotProtectedRanking in both repos over 8 shapes incl. duplicate-object. Not a fork."
     },
     "services/reframeStrategyChooser.js": {
       "backendHash": "693141d99726dbfeaf512bb38af68515a30116a25af3df87c779faafdb460398",
@@ -1842,10 +1839,10 @@
     },
     "services/veoPromptBuilder.js": {
       "backendHash": "027d0d46214b7303f0a1c83793ea4d280eaf6fe840fe82d2771a39dbe44b752a",
-      "adgenHash": "ded6884251e1d3de8af7c7e4cd1e2162352ab76607351d2f9eb2b7e918b8d92f",
+      "adgenHash": "6b08869e0011151eaaa6b312c7d00d1a2bdbb249d6ef238ee676ef2b99933e6c",
       "backendSha": "8bd9eebd549fe5384bef79648688462eace907ed",
       "status": "fork",
-      "reason": "Owner directive 2026-08-28: backend prompt-building is not first-class; prompt-safety fixes made here are not ported there. Backend still carries the unsafe OPERATOR REFINEMENT (HIGHEST PRIORITY) framing by that directive, not an oversight. 2026-09-02: frozen-else Scene 2 no longer zooms toward the most distinctive product detail (invention invitation on Pelagic t=5.0s); it zooms in on the product as already shown. The longer 'Do not search for a logo...' draft blew grok 4096 D1 (old=3959 -> VEO_PROMPT_OVER_CAP via the 4000 inner drop). Hook-first and lifestyle Scene 2 untouched. Adgen-only; do not port."
+      "reason": "Prior fork stands: 2026-08-28 owner directive that backend prompt-building is not first-class; 2026-09-02 frozen-else Scene 2 is adgen-only. 2026-09-03 STRIP: overlay/sticker SEED_BURNED_IN_TEXT_GUARD_LINE and on-product lock line removed from buildVeoPrompt (contradicted OMNI_DIRECTIVES.noText; keyed on untrustworthy Media.text[].type). Same strip landed on liquidretail_backend working tree. seedHasText param retired. Not --unported."
     },
     "services/veoStoryboardService.js": {
       "backendHash": "4e3d420b3a6219b72f25dc95aac6afa679ea5c23a7c3627d1abcb9ba9f5bf344",

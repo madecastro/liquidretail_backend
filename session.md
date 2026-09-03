@@ -14,9 +14,17 @@ it clears it back to this placeholder.)_
 
 ## CURRENT STATE
 
-*(Replaced 2026-09-02 night. Worktree `/Volumes/Sayulita/Projects/RS/.wt-pad-source-scale`,
-branch `fix/pad-at-source-scale`, rebased onto `origin/master` `b4edfc2`. **Do not touch
-the main `liquidretail_adgen` checkout.**)*
+**2026-09-03: VIDEO refs implementation, UNCOMMITTED, no push.** Packshot-protected
+ranking + raw catalog refs, both flag-off. Seed-text prompt machinery **stripped
+entirely** (not flag-gated): `OMNI_DIRECTIVES.noText` is the sole text directive;
+the overlay guard contradicted it live at flag-off. Strip report:
+`/Volumes/Sayulita/Projects/RS/scratchpad/SEEDTEXT-STRIPPED.md`. Ranking/raw-refs:
+`/Volumes/Sayulita/Projects/RS/scratchpad/IMPLEMENT-VIDEO-REFS-GROK.md`. Claude
+reviews the diff next. Do not flip `VIDEO_RAW_CATALOG_REFERENCES` until two
+production-route Atlas gens (9:16 and 16:9 raw squares, ~$2).
+
+*(Prior 2026-09-02 night. Worktree `/Volumes/Sayulita/Projects/RS/.wt-pad-source-scale`,
+branch `fix/pad-at-source-scale`, rebased onto `origin/master` `b4edfc2`.)*
 
 **This branch is the pad-at-source-scale + refinedProducts + Scene 2 landing for the
 Pelagic fidelity experiment. Not pushed.**

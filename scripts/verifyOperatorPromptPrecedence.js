@@ -187,7 +187,7 @@ const SHAPES = [
   { name: 'omni packshot 9:16',   args: { caps: CAPS_OMNI, aspectRatio: '9:16' } },
   { name: 'grok packshot 1:1',    args: { caps: CAPS_GROK, aspectRatio: '1:1' } },
   { name: 'omni + product refs',  args: { caps: CAPS_OMNI, aspectRatio: '1:1', hasProductReference: true } },
-  { name: 'omni + seedHasText',   args: { caps: CAPS_OMNI, aspectRatio: '1:1', seedHasText: true } },
+  { name: 'omni packshot 1:1 (dup-check after seedHasText retired)', args: { caps: CAPS_OMNI, aspectRatio: '1:1' } },
   { name: 'hook_first meta 9:16', args: { caps: CAPS_OMNI, aspectRatio: '9:16', platformFormat: 'meta_reels_9_16' } },
   { name: 'hook_first pmax 16:9', args: { caps: CAPS_OMNI, aspectRatio: '16:9', platformFormat: 'pmax_video_16_9' } },
   { name: 'pmax 16:9 split east', args: { caps: CAPS_OMNI, aspectRatio: '16:9', platformFormat: 'pmax_video_16_9', subjectSide: 'east' } },

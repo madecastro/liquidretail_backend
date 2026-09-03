@@ -102,6 +102,23 @@ function isReframePassthroughBrand(brandId) {
   if (!brandId) return false;
   return REFRAME_PASSTHROUGH_BRAND_IDS().includes(String(brandId));
 }
+
+// KILL SWITCH: VIDEO_RAW_CATALOG_REFERENCES, DEFAULT OFF.
+// OFF → today's path: every assembled ref goes through reframeReferenceForAspect
+//        (pad / crop-first / generative outpaint / cache).
+// ON  → skip that ladder entirely and send the catalog fileUrl at native
+//        resolution. No Cloudinary transform, no re-encode, no billed
+//        nano-banana outpaint. The reframe machinery (claims, TTL, shutdown
+//        sweep, poll) stays in this file; this flag is the only thing that
+//        makes it unreachable from the video path.
+// THIS IS NOT REFRAME_ENABLED=false (that c_fill-crops). It is the global
+// form of REFRAME_PASSTHROUGH_BRAND_IDS, still default-off so a deploy
+// does not change in-flight brands until an operator flips it.
+function isVideoRawCatalogReferencesEnabled() {
+  const raw = process.env.VIDEO_RAW_CATALOG_REFERENCES;
+  if (raw == null || String(raw).trim() === '') return false;
+  return !/^(0|false|no|off)$/i.test(String(raw).trim());
+}
 // Model tier: for THIS model ('google/nano-banana-2/edit') '-developer' is a BILLING
 // variant, not a quality tier. Verified against the live Atlas catalogue
 // (2026-07-24): it carries the same price.origin.base_price ($0.08) as plain /edit
@@ -3690,48 +3707,86 @@ async function buildReferenceImages({
     usedOrdered = ids.length > 0;
   }
   if (!usedOrdered) {
-    // SEED first — position 0.
-    if (media?.fileUrl) {
-      ids.push({ mediaDoc: media, sourceUrl: media.fileUrl });
-      if (media._id) seenMediaIds.add(String(media._id));
-      seenUrls.add(media.fileUrl);
-    }
+    // VIDEO_PACKSHOT_PROTECTED_RANKING (default OFF). When on, slot 0 is
+    // the first product_only in the feed-ordered universe (seed + catalog,
+    // deduped); remaining slots follow lifestyle → on-figure+face →
+    // on-figure → flat_lay → detail. Operator stacks never reach this
+    // branch. Lifestyle (maxImages < 2) keeps today's seed-first so a
+    // lifestyle seed is not replaced by a packshot. Unclassified catalogs
+    // (no shotType, no product_only) rank as unknown and keep feed order,
+    // which with seed first is byte-identical to today's empty-preference
+    // path. VIDEO_DEFAULT_REFERENCE_SHOT_TYPES is ignored while this flag
+    // is on — the ranking IS the preference.
+    const packshotRanking = referenceDefaultsService.isPackshotProtectedRankingEnabled()
+      && maxImages >= 2;
+    if (packshotRanking) {
+      const universe = [];
+      const seenUniverseIds = new Set();
+      const consider = (m) => {
+        if (!m?.fileUrl) return;
+        const mid = m._id != null ? String(m._id) : null;
+        if (mid) {
+          if (seenUniverseIds.has(mid)) return;
+          seenUniverseIds.add(mid);
+        }
+        universe.push(m);
+      };
+      consider(media);
+      for (const cm of catalogMedias || []) consider(cm);
+      const ranked = referenceDefaultsService.orderByPackshotProtectedRanking(universe);
+      for (const cm of ranked) {
+        if (!cm?.fileUrl) continue;
+        const mid = cm._id != null ? String(cm._id) : null;
+        if (mid && seenMediaIds.has(mid)) continue;
+        if (mid) seenMediaIds.add(mid);
+        if (seenUrls.has(cm.fileUrl)) continue;
+        seenUrls.add(cm.fileUrl);
+        ids.push({ mediaDoc: cm, sourceUrl: cm.fileUrl });
+      }
+    } else {
+      // SEED first — position 0.
+      if (media?.fileUrl) {
+        ids.push({ mediaDoc: media, sourceUrl: media.fileUrl });
+        if (media._id) seenMediaIds.add(String(media._id));
+        seenUrls.add(media.fileUrl);
+      }
 
-    // Catalog mirrors, skip seed id.
-    //
-    // `catalogMedias` ARRIVES IN MERCHANT FEED ORDER — generateForAd runs it
-    // through sortCatalogMediasForReferenceStack (metadata.feedIndex asc,
-    // unstamped last), per the owner's 2026-08-05 directive that refs 1/2 be
-    // "the first and second other images in the feed, as they appear in the
-    // feed". That replaced the old `.sort({createdAt:1})`, whose own comment
-    // claimed createdAt ≈ hero-first — disproved on real Gymshark data where
-    // the hero materialised AFTER its alts.
-    //
-    // Reordered by the configured shot-type PREFERENCE on top of that
-    // (VIDEO_DEFAULT_REFERENCE_SHOT_TYPES). Unset by default, in which case
-    // this is a strict no-op and the array keeps pure feed order — so the two
-    // mechanisms COMPOSE: feed order is the base, shot-type preference is an
-    // opt-in reorder over it. A pure reorder, never a filter: shotType is
-    // absent until detect runs, so dropping on it would empty the stack for
-    // freshly ingested products.
-    //
-    // The SOURCE dial is deliberately NOT applied here. This branch is the AUTO
-    // assembly, but `catalogMedias` is also where callers deliberately place
-    // operator-chosen lifestyle/social media (the source:'catalog-product'
-    // filter was removed upstream precisely so those picks survive), so
-    // narrowing at this depth could discard media a caller meant to include.
-    // Source scoping stays with the callers and the picker default.
-    const orderedCatalogMedias = referenceDefaultsService.orderByShotTypePreference(
-      catalogMedias || [],
-      referenceDefaultsService.videoReferenceDefaults().shotTypes
-    );
-    for (const cm of orderedCatalogMedias) {
-      if (!cm?.fileUrl) continue;
-      if (media?._id && String(cm._id) === String(media._id)) continue;
-      const mid = cm._id != null ? String(cm._id) : null;
-      if (mid && seenMediaIds.has(mid)) continue;
-      if (mid) seenMediaIds.add(mid);
-      ids.push({ mediaDoc: cm, sourceUrl: cm.fileUrl });
+      // Catalog mirrors, skip seed id.
+      //
+      // `catalogMedias` ARRIVES IN MERCHANT FEED ORDER — generateForAd runs it
+      // through sortCatalogMediasForReferenceStack (metadata.feedIndex asc,
+      // unstamped last), per the owner's 2026-08-05 directive that refs 1/2 be
+      // "the first and second other images in the feed, as they appear in the
+      // feed". That replaced the old `.sort({createdAt:1})`, whose own comment
+      // claimed createdAt ≈ hero-first — disproved on real Gymshark data where
+      // the hero materialised AFTER its alts.
+      //
+      // Reordered by the configured shot-type PREFERENCE on top of that
+      // (VIDEO_DEFAULT_REFERENCE_SHOT_TYPES). Unset by default, in which case
+      // this is a strict no-op and the array keeps pure feed order — so the two
+      // mechanisms COMPOSE: feed order is the base, shot-type preference is an
+      // opt-in reorder over it. A pure reorder, never a filter: shotType is
+      // absent until detect runs, so dropping on it would empty the stack for
+      // freshly ingested products.
+      //
+      // The SOURCE dial is deliberately NOT applied here. This branch is the AUTO
+      // assembly, but `catalogMedias` is also where callers deliberately place
+      // operator-chosen lifestyle/social media (the source:'catalog-product'
+      // filter was removed upstream precisely so those picks survive), so
+      // narrowing at this depth could discard media a caller meant to include.
+      // Source scoping stays with the callers and the picker default.
+      const orderedCatalogMedias = referenceDefaultsService.orderByShotTypePreference(
+        catalogMedias || [],
+        referenceDefaultsService.videoReferenceDefaults().shotTypes
+      );
+      for (const cm of orderedCatalogMedias) {
+        if (!cm?.fileUrl) continue;
+        if (media?._id && String(cm._id) === String(media._id)) continue;
+        const mid = cm._id != null ? String(cm._id) : null;
+        if (mid && seenMediaIds.has(mid)) continue;
+        if (mid) seenMediaIds.add(mid);
+        ids.push({ mediaDoc: cm, sourceUrl: cm.fileUrl });
+      }
     }
 
     // FALLBACK when still < 2: product originals (no mediaDoc → no cache).
@@ -3795,6 +3850,23 @@ async function buildReferenceImages({
       `${repeatEnabled ? ', REPEAT_PRIMARY_REFERENCE reserves 1 closing slot' : ''}) — ` +
       `using the first ${distinctCap} in pick order`
     );
+  }
+
+  // VIDEO_RAW_CATALOG_REFERENCES (default OFF). When on, skip the entire
+  // reframe ladder — pad, crop-first, generative outpaint, claim/lease —
+  // and ship the catalog fileUrl as-is. The functions below stay in this
+  // file; this branch is what makes them unreachable from the video path.
+  // Operator stacks take this too: ranking is overridden, degradation is not.
+  if (isVideoRawCatalogReferencesEnabled()) {
+    const rawOut = [];
+    const seenRaw = new Set();
+    for (const id of capped) {
+      const u = id.sourceUrl;
+      if (!u || seenRaw.has(u)) continue;
+      seenRaw.add(u);
+      rawOut.push(u);
+    }
+    return appendPrimaryReferenceRepeat(rawOut, { enabled: repeatEnabled, totalCap });
   }
 
   // Reframe all in parallel; preserve order.
@@ -5280,6 +5352,10 @@ async function generateForAd({
           // subjectUnionBbox returns null, chooseStrategy defers,
           // outpaint fires. Same class of bug as videoRefPrewarmService's
           // sister projection; both must stay in sync.
+          // KEEP this projection even when VIDEO_RAW_CATALOG_REFERENCES is
+          // on: that flag is default OFF, and the RAW branch never reads
+          // refinedProducts, but the OFF path still does. Do not drop it
+          // as a "RAW cleanup" — that would re-bill the default path.
           // Order is applied below in JS — see sortCatalogMediasForReferenceStack —
           // because it is conditional on CATALOG_FEED_ORDER_SEEDING.
           .lean()
@@ -5453,13 +5529,11 @@ async function generateForAd({
   // Priority: (1) explicit operatorPrompt param (regenerate) → buildVeoPrompt
   // prepend; (2) ad.videoPromptRaw → full replacement, bypass buildVeoPrompt;
   // (3) guidance cascade → buildVeoPrompt prepend.
-  const seedHasText = Array.isArray(media.text) && media.text.length > 0;
   const promptArgs = {
     brand, product, media,
     layoutInput:  lpInput,
     sourceMedia:  lpSrcMedia,
     aspectRatio,
-    seedHasText,
     // Lifestyle path always ships 1 ref → seed-only fidelity wording.
     hasProductReference: lifestylePlan.forceSeedOnly ? false : hasProductAnchor,
     storyboard,
@@ -5978,7 +6052,6 @@ async function buildPromptScaffold({
     product: productForPrompt,
     media: null,
     aspectRatio,
-    seedHasText: false,
     hasProductReference: true,
     operatorPrompt: null,
     caps,
@@ -6086,6 +6159,7 @@ module.exports = {
   cropImageUrlForAspect,
   buildVideoSegmentUrl,
   buildReferenceImages,
+  isVideoRawCatalogReferencesEnabled,
   // Feed-order reference stack ordering — scripts/verifyCatalogFeedOrderSeeding.js.
   sortCatalogMediasForReferenceStack,
   // Pure helpers for scripts/verifyPrimaryReferenceRepeat.js (offline).
