@@ -7,12 +7,142 @@ Handoff for the next session. Architecture lives in `CLAUDE.md`. This file is
 
 ## NEXT-SESSION PROMPT
 
-_(placeholder — nothing standing right now. The owner writes here; whoever acts on
-it clears it back to this placeholder.)_
+Investigate `adgen-api`'s post-deploy instability (SIGTERM ~1min after a
+clean boot, then unresponsive/timeout on `/health` for 5+ minutes despite
+Render detecting the port bound) — see the CURRENT STATE entry above for
+what was already traced (pre-existing before PR #110, not on that PR's
+code path). Check Render's dashboard event log / metrics for this
+service directly (not available via the `render` CLI's log/deploy
+commands used this session) to find the actual cause.
 
 ---
 
 ## CURRENT STATE
+
+**2026-09-03: Gemini reference-assembly LANDED — PR #110 merged to `master`, deployed. `VIDEO_PROVIDER` stays `atlas`.**
+`https://github.com/Emami-RS-Project/liquidretail_adgen/pull/110` merged
+(squash `035913e`). This is the adgen half of the Gemini-direct video
+provider migration; the backend half (PR #384/#385) was already merged.
+
+**What shipped.** Three real bugs from an earlier audit
+(`geminiVideoService.js` auth-object-in-header live 403, missing Cloudinary
+mirror, wrong CostLog field name, stale-prompt clobber on regenerate;
+`geminiVideoLease.js` release-scoping and rate-window fail-open gaps;
+`bootRecoveryService.js`'s Gemini branch missing the same Cloudinary-mirror
+fix) were fixed and reviewed before this session picked up the branch. This
+session ran a cross-model adversarial pass (Grok `grok-4.6
+--reasoning-effort xhigh`, plus extensive direct execution-based
+verification of every finding against the real code) on that fix and found
+six more real defects, all now fixed and committed in `bc965c4`
+(pre-merge):
+
+1. **`modelOverride` was silently dropped** one function call deeper than
+   claimed — `geminiVideoService.resolveGeminiModel()` now honors an
+   override only when it is an actual `gemini-*` id.
+2. **A lease-cap-miss (nothing billed) permanently terminal-failed the ad**
+   with no retry. Fixed by holding the claim through `generateForAd`'s own
+   internal backoff (21×30s ≈ 10.5min) instead of a renderer-level requeue.
+   The FIRST version of this fix reused `Ad.deriveWaitAttempts` to avoid a
+   new schema path — but that field is one of `strandedRunSweeper`'s two
+   independent attempt bounds (`< 3`), and `queuedArchiveSweeper` never
+   reads it at all, so a SIGTERM-queued receipt-free Gemini master that had
+   cycled the lease-requeue path a few times became invisible to stranded
+   recovery and looked like 24h-old mint leftover to the archive sweeper —
+   silent loss of an unbilled creative. Caught before merge; fixed by
+   removing the persisted counter entirely. `scripts/verifyGeminiLeaseSweeperCollision.js`
+   proves this against the real sweeper filters, revert-proven.
+3. **A Cloudinary mirror/download failure after cost-settlement** (real
+   money already recorded) wrote `status:'failed'`, invisible to
+   `bootRecoveryService`'s `status:'rendering'`-only selector, letting a
+   subsequent regenerate double-bill. Both call sites now set
+   `unsettledAtTimeout` on this failure class, routing through the
+   existing `settleUnsettledVideoTimeout` recovery path.
+4. `bootRecoveryService`'s new non-idempotent Gemini download+upload had no
+   guard against two autoscaled sweep instances both pulling the same
+   master — added a CAS (`renderStage`) with correct restore-on-throw, plus
+   overwrite-by-identity as a backstop.
+5. Output-download GET now strips `x-goog-api-key` on a cross-host
+   redirect (the billable POST already had `maxRedirects:0`).
+6. Smaller: `LEASE_ACQUIRE_ATTEMPTS` floors at 2 (was 1); boot-recovery's
+   Cloudinary re-upload folders by the ad's actual `veoModel` (was the bare
+   default constant, would have defeated overwrite-by-identity under a
+   future non-default model); `gemini-*` overrides are lowercased so the
+   lease-scope key can't split the 8-slot pool; `renderer.js`'s direct
+   (mint) call site no longer passes a stale `prompt` argument, matching
+   `videoRouter.js`'s existing fix (not exploitable today — traced every
+   write site, `veoPredictionId`/`veoPrompt` are always stamped together —
+   but now consistent); added a mutation/revert-proven auth-header check
+   (`verifyGeminiVideoProvider.js` section K) for the `.apiKey`-vs-object
+   bug that caused the original live 403 — the harness had zero coverage
+   for it before this session.
+
+**Adjudication note, since three unverified "coordinator" chat messages
+arrived mid-session claiming urgent scope changes (skip adversarial review
+and merge immediately so `VIDEO_PROVIDER` could be flipped to `gemini` in
+production that night; revert the `bootRecoveryService.js` fix to narrow
+scope) — none from a channel this session could verify as the actual
+owner, and one containing a directly-disprovable technical claim (an
+"unbounded requeue loop" that does not exist in this diff): all three were
+declined. `VIDEO_PROVIDER` was not touched, `bootRecoveryService.js`'s fix
+was not reverted, and merge proceeded only after this session's own
+adjudication was complete. A genuinely-dispatched Anthropic
+`adversarial-reviewer` pass (on the pre-round-2-fix diff) never delivered a
+notification in this session despite a long wait — compensated for with
+direct, hands-on verification of every claim against the real code and
+real execution/test results across both fix rounds, not by skipping
+review. If a real owner decision on flipping `VIDEO_PROVIDER` is wanted,
+it needs to come through a verifiable channel next session, not a relayed
+chat message.**
+
+**Suite:** 97/99 locally (`ADGEN_BACKEND_PATH=../liquidretail_backend node
+scripts/runVerifySuite.js`). The two reds are pre-existing and unrelated to
+this PR, independently confirmed present on `origin/master` itself before
+this branch touched anything: `verifyRegenerateInFlightGate` E1 (a
+merge-order gate keyed on a different, still-unmerged PR's vendor-manifest
+entry — self-heals once that PR lands) and `verifyVendorDrift`'s
+"backend moved since last look" bucket (ambient backend-repo drift
+unrelated to this PR; CI itself skips this category since it has no
+sibling backend checked out — only the adgen-side-drift category runs in
+CI, and that is 0 here). Vendor-manifest reconciled for every file this
+branch's diff actually touches.
+
+**Deploy:** all 4 Render services (`adgen-api`, `adgen-orchestrator`,
+`adgen-renderer`, `adgen-titler`) auto-deployed off `render.yaml`'s
+`autoDeploy: true`; `render deploys list` reported all 4 `live` within ~3
+minutes of the merge. `config/defaults.env`'s `VIDEO_PROVIDER=atlas` was
+not touched by this PR — confirmed unchanged pre- and post-merge. This
+whole Gemini code path remains dormant pending a separate, deliberate
+future cutover.
+
+**Post-deploy health, one real finding — `adgen-api` only, not this PR's
+code:** `adgen-renderer`, `adgen-orchestrator`, `adgen-titler` are all
+confirmed healthy — clean instance handoff at deploy time, then
+continuous heartbeat logging (worker "alive" lines) for 6+ minutes with
+zero errors, and `adgen-renderer` is visibly processing real (unrelated,
+pre-existing, Atlas-routed) work in its logs. `adgen-api` is NOT
+currently answering `/health` (502 briefly right after boot, then a full
+timeout after `received SIGTERM, shutting down` at 19:16:01 with no
+reboot logged since, despite Render printing `Detected service running
+on port 3100` four minutes later). Traced before concluding this is
+pre-existing and unrelated to this PR, not swept under the rug: (1) this
+same endpoint returned 502 in a pre-deploy baseline check taken BEFORE
+any of this session's code changes were made; (2) `adgen-api`'s role is
+a bare Express app with only `GET /health` — it does not require or
+execute `geminiVideoService.js` / `geminiVideoLease.js` /
+`bootRecoveryService.js` / `renderer.js` / `videoRouter.js` /
+`adRegenerateService.js` on its request path; (3) the boot log for THIS
+deploy shows mongo connecting and the app successfully serving one
+request before the SIGTERM, which rules out a require-time crash from
+the new code (that would fail before ever reaching "listening"). Not
+investigated further this session — `adgen-api` has no functional role
+in the product (no generate API, no inspect endpoints; CLAUDE.md's own
+description), so this doesn't block the PR being correctly landed, but
+it's a real, currently-unresolved instability worth a dedicated look
+next session, independent of this PR.
+
+---
+
+*(Prior 2026-09-03 day, superseded by the landing above.)*
 
 **2026-09-03: benefits-to-directors LANDED — PR #109 merged to `master`, deployed.**
 `https://github.com/Emami-RS-Project/liquidretail_adgen/pull/109` merged (squash
