@@ -77,6 +77,10 @@
 //   recascadeDerivativeSibling provenance-only-writes an inherited
 //     sibling (renderUrl left on the OLD plate)                         → C5
 //   findDerivativesOfMaster drops the PMax videoDurationSec join        → B21
+//   findDerivativesOfMaster drops the ctaUrl / ctaUrlParams /
+//     videoPromptGuidance join                                          → B26-B28
+//   buildDerivativesOfMasterFilter fails to refuse a missing campaignId /
+//     productId / empty-media master (BSON would drop the key)          → B29-B31
 //   cascadeRegenerateToDerivatives fails to skip a derivative master     → D4
 //   a submit helper becomes reachable from any of the three functions    → E1-E3
 //
@@ -555,6 +559,93 @@ function baseAd(over = {}) {
     assert.ok(/isGooglePmaxVideoFormat\(masterAd\.platformFormat\)/.test(filterFn));
     assert.ok(!/pmax_video_9_16/.test(filterFn),
       'filter builder must not duplicate the PMax format-set; got a local pmax_video_9_16');
+  });
+
+  await checkAsync('B26 [BLOCKER 1] a sibling with a different ctaUrl is excluded', async () => {
+    const master = baseAd({ _id: 'm0000000000000000000000', deriveFromMaster: null, ctaUrl: 'https://brand.example/a', veoVideoUrl: 'https://m1' });
+    const sameFamily = baseAd({ _id: 's1000000000000000000000', deriveFromMaster: master.platformFormat, ctaUrl: 'https://brand.example/a' });
+    const otherUrl = baseAd({ _id: 'sI000000000000000000000', deriveFromMaster: master.platformFormat, ctaUrl: 'https://brand.example/b' });
+    AdCol = new MiniCollection([master, sameFamily, otherUrl]);
+    stub(AD, { find: (f) => AdCol.find(f), findById: (id) => AdCol.findById(id), updateOne: (f, u) => AdCol.updateOne(f, u) });
+    const filter = svc.buildDerivativesOfMasterFilter(master);
+    assert.ok(filter);
+    assert.strictEqual(filter.ctaUrl, 'https://brand.example/a');
+    const found = await svc.findDerivativesOfMaster(master);
+    assert.deepStrictEqual(found.map((d) => d._id), ['s1000000000000000000000']);
+  });
+
+  await checkAsync('B27 [BLOCKER 1] a sibling with a different ctaUrlParams is excluded', async () => {
+    const master = baseAd({ _id: 'm0000000000000000000000', deriveFromMaster: null, ctaUrlParams: 'utm_source=ig', veoVideoUrl: 'https://m1' });
+    const sameFamily = baseAd({ _id: 's1000000000000000000000', deriveFromMaster: master.platformFormat, ctaUrlParams: 'utm_source=ig' });
+    const otherParams = baseAd({ _id: 'sJ000000000000000000000', deriveFromMaster: master.platformFormat, ctaUrlParams: 'utm_source=fb' });
+    AdCol = new MiniCollection([master, sameFamily, otherParams]);
+    stub(AD, { find: (f) => AdCol.find(f), findById: (id) => AdCol.findById(id), updateOne: (f, u) => AdCol.updateOne(f, u) });
+    const filter = svc.buildDerivativesOfMasterFilter(master);
+    assert.ok(filter);
+    assert.strictEqual(filter.ctaUrlParams, 'utm_source=ig');
+    const found = await svc.findDerivativesOfMaster(master);
+    assert.deepStrictEqual(found.map((d) => d._id), ['s1000000000000000000000']);
+  });
+
+  await checkAsync('B28 [BLOCKER 1] a sibling with a different videoPromptGuidance is excluded', async () => {
+    const master = baseAd({ _id: 'm0000000000000000000000', deriveFromMaster: null, videoPromptGuidance: 'slow pan left', veoVideoUrl: 'https://m1' });
+    const sameFamily = baseAd({ _id: 's1000000000000000000000', deriveFromMaster: master.platformFormat, videoPromptGuidance: 'slow pan left' });
+    const otherGuidance = baseAd({ _id: 'sK000000000000000000000', deriveFromMaster: master.platformFormat, videoPromptGuidance: 'fast push-in' });
+    AdCol = new MiniCollection([master, sameFamily, otherGuidance]);
+    stub(AD, { find: (f) => AdCol.find(f), findById: (id) => AdCol.findById(id), updateOne: (f, u) => AdCol.updateOne(f, u) });
+    const filter = svc.buildDerivativesOfMasterFilter(master);
+    assert.ok(filter);
+    assert.strictEqual(filter.videoPromptGuidance, 'slow pan left');
+    const found = await svc.findDerivativesOfMaster(master);
+    assert.deepStrictEqual(found.map((d) => d._id), ['s1000000000000000000000']);
+  });
+
+  await checkAsync('B29 [BLOCKER 2] missing campaignId returns [] AND never queries (BSON would drop the key)', async () => {
+    const master = baseAd({ _id: 'm0000000000000000000000', campaignId: undefined, deriveFromMaster: null, veoVideoUrl: 'https://m1' });
+    const wouldMatchIfDropped = baseAd({ _id: 's1000000000000000000000', deriveFromMaster: 'meta_stories_9_16' });
+    AdCol = new MiniCollection([master, wouldMatchIfDropped]);
+    stub(AD, { find: (f) => AdCol.find(f), findById: (id) => AdCol.findById(id), updateOne: (f, u) => AdCol.updateOne(f, u) });
+    assert.strictEqual(svc.buildDerivativesOfMasterFilter(master), null);
+    let findCalled = false;
+    const origFind = AdCol.find.bind(AdCol);
+    AdCol.find = (f) => { findCalled = true; return origFind(f); };
+    const found = await svc.findDerivativesOfMaster(master);
+    assert.strictEqual(found.length, 0);
+    assert.strictEqual(findCalled, false, 'must not query at all — BSON drops campaignId:undefined and would match every video ad of this product/format, including other families');
+  });
+
+  await checkAsync('B30 [BLOCKER 2] missing productId returns [] AND never queries (BSON would drop the key)', async () => {
+    const master = baseAd({ _id: 'm0000000000000000000000', productId: undefined, deriveFromMaster: null, veoVideoUrl: 'https://m1' });
+    const wouldMatchIfDropped = baseAd({ _id: 's1000000000000000000000', deriveFromMaster: 'meta_stories_9_16' });
+    AdCol = new MiniCollection([master, wouldMatchIfDropped]);
+    stub(AD, { find: (f) => AdCol.find(f), findById: (id) => AdCol.findById(id), updateOne: (f, u) => AdCol.updateOne(f, u) });
+    assert.strictEqual(svc.buildDerivativesOfMasterFilter(master), null);
+    let findCalled = false;
+    const origFind = AdCol.find.bind(AdCol);
+    AdCol.find = (f) => { findCalled = true; return origFind(f); };
+    const found = await svc.findDerivativesOfMaster(master);
+    assert.strictEqual(found.length, 0);
+    assert.strictEqual(findCalled, false, 'must not query at all — BSON drops productId:undefined and would match every video ad of this campaign/format, including other families');
+  });
+
+  await checkAsync('B31 [BLOCKER 2] mediaId == null with empty referenceMediaIds returns [] AND never queries', async () => {
+    const master = baseAd({
+      _id: 'm0000000000000000000000',
+      mediaId: null,
+      referenceMediaIds: [],
+      deriveFromMaster: null,
+      veoVideoUrl: 'https://m1'
+    });
+    const wouldMatchIfDropped = baseAd({ _id: 's1000000000000000000000', deriveFromMaster: 'meta_stories_9_16' });
+    AdCol = new MiniCollection([master, wouldMatchIfDropped]);
+    stub(AD, { find: (f) => AdCol.find(f), findById: (id) => AdCol.findById(id), updateOne: (f, u) => AdCol.updateOne(f, u) });
+    assert.strictEqual(svc.buildDerivativesOfMasterFilter(master), null);
+    let findCalled = false;
+    const origFind = AdCol.find.bind(AdCol);
+    AdCol.find = (f) => { findCalled = true; return origFind(f); };
+    const found = await svc.findDerivativesOfMaster(master);
+    assert.strictEqual(found.length, 0);
+    assert.strictEqual(findCalled, false, 'must not query at all — a master with no media identity would otherwise match every same-campaign/product/format video derive');
   });
 
   // ═══════════════════════════════════════════════════════════════════
