@@ -190,12 +190,20 @@ async function prewarmVideoRefsForProducts({ brandId, productIds }) {
       }
 
       // SAME catalogMedias query as generateForAd (atlasVideoService.js
-      // generateForAd load block) — incl. width/height for the skip guard.
+      // generateForAd load block) — incl. width/height for the skip guard
+      // and refinedProducts for the DINO-derived crop path in
+      // reframeStrategyChooser.subjectUnionBbox. Dropping refinedProducts
+      // silently forces every alt through paid nano-banana outpaint even
+      // though the DINO bboxes are already on the Media doc; Mongoose
+      // `.select()` of an unrequested field returns undefined without a
+      // warning, and `Array.isArray(undefined)` is false, so
+      // subjectUnionBbox returns null → chooseStrategy defers → outpaint.
+      // Fix restores the DINO → crop path 7758b32+da22486 shipped.
       const catalogMedias = await Media.find({
         source: 'catalog-product',
         'metadata.catalogProductId': productOid
       })
-        .select('_id fileUrl classification adSuitability metadata width height')
+        .select('_id fileUrl classification adSuitability metadata width height refinedProducts')
         .sort({ createdAt: 1 })
         .lean();
 
