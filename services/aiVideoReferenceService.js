@@ -297,12 +297,6 @@ async function generateForAd({ ad, operatorPrompt = null }) {
     concept = direction?.concepts?.find(c => c.concept_id === ad.conceptId) || null;
   }
 
-  // OCR text the detect pipeline found on this seed. Non-empty means the
-  // seed has burned-in captions / stickers / watermarks that Veo's
-  // image-to-video mode will faithfully animate into the output — we
-  // can't remove them after the fact. Tell Veo to ignore overlay text.
-  const seedHasText = Array.isArray(media.text) && media.text.length > 0;
-
   // hasProductReference reflects what we'll ACTUALLY send — gated by
   // referenceImagesEnabled() (default false because Veo 3.1's preview
   // rejects seed + refImages together). When off, the prompt falls
@@ -333,7 +327,6 @@ async function generateForAd({ ad, operatorPrompt = null }) {
     layoutInput:  lpInput,
     sourceMedia:  lpSrcMedia,
     aspectRatio,
-    seedHasText,
     hasProductReference: willSendRefs,
     operatorPrompt,
     storyboard
@@ -345,7 +338,7 @@ async function generateForAd({ ad, operatorPrompt = null }) {
     : `aspect=${aspectRatio} (veo=${veoAspect}, will crop)`;
   console.log(
     `🎬 veoReference[ad=${ad._id}]: track=${track} ${aspectLabel} ` +
-    `media=${media._id} (${media.fileType})${seedHasText ? ` seedHasText=true (${media.text.length} regions)` : ''} submitting...`
+    `media=${media._id} (${media.fileType}) submitting...`
   );
 
   // fetchAsImage validates content-type so a Cloudinary transform that

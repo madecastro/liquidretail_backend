@@ -434,15 +434,22 @@ let b14SkipReason = null;
     for (const [capName, caps] of CAPSETS) {
       for (const hasProductReference of [true, false]) {
         for (const durationSec of [4, 8, 15]) {
-          for (const seedHasText of [false, true]) {
-            const args = {
-              product: { title: 'Wool Runner' },
-              hasProductReference, durationSec, seedHasText, caps,
-            };
-            const label = `caps=${capName} productRef=${hasProductReference} dur=${durationSec} seedText=${seedHasText}`;
-            check(`B14 dest=none built prompt is byte-identical to the 9531ae9f prompt (${label})`,
-              buildVeoPrompt({ ...args }), oldMod.buildVeoPrompt({ ...args }));
-          }
+          // 2026-09-03: overlay guard stripped. 9531ae9f still emits it when
+          // seedHasText=true; we no longer match that axis. seedHasText=false
+          // remains byte-identical (the rollback guarantee). seedHasText=true
+          // is now a no-op — same bytes as false, no overlay sentence.
+          const argsOff = {
+            product: { title: 'Wool Runner' },
+            hasProductReference, durationSec, seedHasText: false, caps,
+          };
+          const label = `caps=${capName} productRef=${hasProductReference} dur=${durationSec}`;
+          check(`B14 dest=none built prompt is byte-identical to the 9531ae9f prompt (${label} seedText=false)`,
+            buildVeoPrompt({ ...argsOff }), oldMod.buildVeoPrompt({ ...argsOff }));
+          const on = buildVeoPrompt({ ...argsOff, seedHasText: true });
+          const off = buildVeoPrompt({ ...argsOff });
+          check(`B14 seedHasText is a retired no-op (${label})`, on, off);
+          falsy(`B14 retired overlay guard is absent (${label})`,
+            /text overlays \/ captions \/ stickers \/ watermarks/.test(on));
         }
       }
     }
@@ -507,17 +514,20 @@ let b14SkipReason = null;
     for (const dest of META_DESTINATIONS) {
       for (const hasProductReference of [true, false]) {
         for (const durationSec of [4, 8, 15]) {
-          for (const seedHasText of [false, true]) {
-            const args = {
-              product: { title: 'Wool Runner' },
-              hasProductReference, durationSec, seedHasText,
-              caps: OMNI_CAPS, aspectRatio: '9:16', platformFormat: dest,
-            };
-            const label = `dest=${dest} productRef=${hasProductReference} dur=${durationSec} seedText=${seedHasText}`;
-            check(`B15 switch=OFF Meta prompt is STILL byte-identical to 9531ae9f — the surviving PR #61 rollback guarantee (${label})`,
-              withSwitch('false', () => buildVeoPrompt({ ...args })),
-              oldMod.buildVeoPrompt({ ...args }));
-          }
+          // 2026-09-03: overlay guard stripped. seedHasText=false remains
+          // the PR #61 rollback guarantee. seedHasText=true is a no-op.
+          const argsOff = {
+            product: { title: 'Wool Runner' },
+            hasProductReference, durationSec, seedHasText: false,
+            caps: OMNI_CAPS, aspectRatio: '9:16', platformFormat: dest,
+          };
+          const label = `dest=${dest} productRef=${hasProductReference} dur=${durationSec}`;
+          check(`B15 switch=OFF Meta prompt is STILL byte-identical to 9531ae9f — the surviving PR #61 rollback guarantee (${label} seedText=false)`,
+            withSwitch('false', () => buildVeoPrompt({ ...argsOff })),
+            oldMod.buildVeoPrompt({ ...argsOff }));
+          const on = withSwitch('false', () => buildVeoPrompt({ ...argsOff, seedHasText: true }));
+          const off = withSwitch('false', () => buildVeoPrompt({ ...argsOff }));
+          check(`B15 seedHasText is a retired no-op (${label})`, on, off);
         }
       }
     }
@@ -575,21 +585,25 @@ let b14SkipReason = null;
 
     for (const hasProductReference of [true, false]) {
       for (const durationSec of [4, 8, 15]) {
-        for (const seedHasText of [false, true]) {
-          const args = {
-            product: { title: 'Wool Runner' },
-            hasProductReference, durationSec, seedHasText,
-            caps: OMNI_CAPS, aspectRatio: '9:16',
-            platformFormat: 'meta_stories_9_16',
-          };
-          const label = `productRef=${hasProductReference} dur=${durationSec} seedText=${seedHasText}`;
-          const frozen = oldMod.buildVeoPrompt({ ...args });
-          const { out: expected, notApplied } = applyHookFirstDelta(frozen, durationSec);
-          check(`B16 all five documented hook-first edits still apply to the frozen base (${label})`,
-            notApplied, []);
-          check(`B16 switch=ON Meta prompt equals the frozen prompt plus EXACTLY the documented delta (${label})`,
-            withSwitch('true', () => buildVeoPrompt({ ...args })), expected);
-        }
+        // 2026-09-03: overlay guard stripped. B16 identity is against the
+        // seedHasText=false frozen base (the guard is no longer in either
+        // arm). seedHasText=true is a no-op on current.
+        const args = {
+          product: { title: 'Wool Runner' },
+          hasProductReference, durationSec, seedHasText: false,
+          caps: OMNI_CAPS, aspectRatio: '9:16',
+          platformFormat: 'meta_stories_9_16',
+        };
+        const label = `productRef=${hasProductReference} dur=${durationSec}`;
+        const frozen = oldMod.buildVeoPrompt({ ...args });
+        const { out: expected, notApplied } = applyHookFirstDelta(frozen, durationSec);
+        check(`B16 all five documented hook-first edits still apply to the frozen base (${label})`,
+          notApplied, []);
+        check(`B16 switch=ON Meta prompt equals the frozen prompt plus EXACTLY the documented delta (${label})`,
+          withSwitch('true', () => buildVeoPrompt({ ...args })), expected);
+        check(`B16 seedHasText is a retired no-op (${label})`,
+          withSwitch('true', () => buildVeoPrompt({ ...args, seedHasText: true })),
+          withSwitch('true', () => buildVeoPrompt({ ...args })));
       }
     }
 

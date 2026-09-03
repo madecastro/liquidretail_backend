@@ -57,7 +57,7 @@ const PLATFORM_FORMAT_ASPECT = Object.fromEntries(
 // Burns directives are authored once per profile so Omni (20k headroom),
 // Grok (4,096), and hook_first (destination overlay on Omni) can be tuned
 // independently; shared dynamic lines (operator lead, duration-scaled
-// Timeline/Output, PRODUCT FIDELITY, compositing, seedHasText) stay in
+// Timeline/Output, PRODUCT FIDELITY, compositing) stay in
 // buildVeoPrompt. hook_first also adds aspect-aware Frame lines there.
 const PROMPT_PROFILES = {
   'gemini-omni': {
@@ -563,26 +563,30 @@ const UI_CHROME_GUARD_LINE =
   `hamburger icons, shopping-cart/bag icons, buttons, price tags, banners, or any screen-within-the-screen. ` +
   `This is a real-world camera shot of a physical product, never a screenshot, mockup, or render of a web page or app.`;
 
-// The `seedHasText` guard block, hoisted out of buildVeoPrompt's assembly and
-// EXPORTED so a diagnostic can detect, from a PERSISTED prompt, that the
-// render path actually computed seedHasText=true. Same pattern (and the same
-// reason it lives outside every directive object) as UI_CHROME_GUARD_LINE
-// above: no directive text changes, so the frozen OMNI/GROK strings and the
-// B14/B15 byte-identity pins are untouched — `lines.push(CONST)` emits the
-// identical bytes the inline template literal did.
-//
-// WHY A DIAGNOSTIC NEEDS THIS (2026-08-27): the inspector used to re-derive
-// `seedHasText` from Media.text at READ time and disagreed with the render
-// path, which suppressed the `seed-has-burned-in-text` warning on exactly the
-// ads where the render had detected the condition. The submitted prompt is
-// already persisted on Ad.veoPrompt, so its containing this sentence is the
-// strongest available evidence of what the render actually decided — stronger
-// than any later re-read of Media, which can be overwritten by a subsequent
-// detect run. See routes/ads.js's generation-inspector seed block.
-const SEED_BURNED_IN_TEXT_GUARD_LINE =
-  `The reference image contains text overlays / captions / stickers / watermarks burned into the source frame. ` +
-  `Treat that burned-in text as part of the locked photograph — do not read, reproduce, extend, or generate more of it. ` +
-  `The chrome layer will composite all ad copy downstream.`;
+// Overlay/sticker guard + on-product lock line stripped 2026-09-03. They
+// contradicted OMNI_DIRECTIVES.noText (which already says both halves) and
+// keyed on Media.text[].type. Historical persisted prompts may still contain
+// the retired sentence — seedTextTruth.RETIRED_SEED_BURNED_IN_TEXT_GUARD_LINE
+// is the read-side matcher. This file no longer emits it.
+
+// KILL SWITCH: VIDEO_RAW_CATALOG_REFERENCES, DEFAULT OFF. Same name as
+// atlasVideoService — duplicated here so this file does not require the
+// video service (cycle). When on, lifestyle role/sourceImages drop the
+// "fitted to this aspect upstream" claim because we no longer reframe.
+function isVideoRawCatalogReferencesEnabled() {
+  const raw = process.env.VIDEO_RAW_CATALOG_REFERENCES;
+  if (raw == null || String(raw).trim() === '') return false;
+  return !/^(0|false|no|off)$/i.test(String(raw).trim());
+}
+
+const RAW_CATALOG_LIFESTYLE_ROLE =
+  `Role: Lifestyle motion editor. Bring the lifestyle photograph to life as an authentic, lived-in moment — ` +
+  `do NOT rebuild, restyle, restage, recompose, or replace the scene. ` +
+  `The image as handed to you is the catalog photograph at native resolution and the source of truth. ` +
+  `Output aspect is a separate parameter — do NOT crop, pad, letterbox, or reframe the product to fill the frame, and do NOT extend the scene.`;
+const RAW_CATALOG_LIFESTYLE_SOURCE_IMAGES =
+  `Source images: Use only the image as handed to you. One lifestyle seed at native catalog resolution — ` +
+  `do not invent additional views, and do not crop, pad, or reframe it.`;
 
 /**
  * Lifestyle video prompt branch is active only when the flag is on AND
@@ -697,7 +701,6 @@ function buildVeoPrompt({
   layoutInput = null,     // eslint-disable-line no-unused-vars
   sourceMedia = null,     // eslint-disable-line no-unused-vars
   aspectRatio = '1:1',
-  seedHasText = false,
   hasProductReference = false,
   operatorPrompt = null,
   storyboard = null,      // eslint-disable-line no-unused-vars
@@ -739,7 +742,10 @@ function buildVeoPrompt({
   // Lifestyle is a sibling directive set for scene/motion — it does NOT
   // suppress the hook-first destination profile. Packshot path still uses
   // profile selection exactly as before (B14).
-  const d = lifestyle ? LIFESTYLE_DIRECTIVES : directivesForProfile(profile);
+  const dBase = lifestyle ? LIFESTYLE_DIRECTIVES : directivesForProfile(profile);
+  const d = (lifestyle && isVideoRawCatalogReferencesEnabled())
+    ? { ...dBase, role: RAW_CATALOG_LIFESTYLE_ROLE, sourceImages: RAW_CATALOG_LIFESTYLE_SOURCE_IMAGES }
+    : dBase;
   // Orthogonal: hook-first destination treatment composes with lifestyle,
   // never gets dropped because the seed is lifestyle.
   //
@@ -1102,9 +1108,9 @@ function buildVeoPrompt({
     lines.push(UI_CHROME_GUARD_LINE);
   }
 
-  if (seedHasText) {
-    lines.push(SEED_BURNED_IN_TEXT_GUARD_LINE);
-  }
+  // Overlay/sticker "do not reproduce" + on-product lock line stripped
+  // 2026-09-03. Contradicted noText; keyed on untrustworthy Media.text[].type.
+  // noText is the sole text directive.
 
   lines.push(d.physicalAccuracy);
 
@@ -1265,8 +1271,5 @@ module.exports = {
   // verify harness only; no other caller should read the env var directly.
   isVideoUiChromeGuardEnabled,
   UI_CHROME_GUARD_LINE,
-  // Exported so the generation inspector can detect the guard block in a
-  // PERSISTED Ad.veoPrompt rather than re-deriving seedHasText from Media.
-  SEED_BURNED_IN_TEXT_GUARD_LINE,
 };
 

@@ -166,10 +166,81 @@ function orderByShotTypePreference(medias, shotTypes) {
     .map(x => x.m);
 }
 
+// KILL SWITCH: VIDEO_PACKSHOT_PROTECTED_RANKING, DEFAULT OFF.
+// OFF → today's auto-assembly: seed first, then VIDEO_DEFAULT_REFERENCE_SHOT_TYPES
+//        preference over feed-ordered catalog (empty preference = feed order).
+// ON  → slot 0 reserved for product_only (never displaced by the preference);
+//        slots 1–2 lifestyle → on-figure WITH a confirmed face → on-figure
+//        without → flat_lay → detail. Operator Ad.referenceMediaIds still
+//        bypasses this entirely (buildReferenceImages orderedReferenceMedia).
+function isPackshotProtectedRankingEnabled() {
+  const raw = process.env.VIDEO_PACKSHOT_PROTECTED_RANKING;
+  if (raw == null || String(raw).trim() === '') return false;
+  return !/^(0|false|no|off)$/i.test(String(raw).trim());
+}
+
+function shotTypeOf(media) {
+  return String(media?.classification?.shotType || '').toLowerCase();
+}
+
+// null and false are both "no confirmed face". Historical Media has no
+// backfill — faceVisible is null on every existing doc — so treating null
+// as a face would silently promote every on_model shot. Only === true
+// ranks into the with-face tier; re-classified products start benefiting
+// without a migration.
+function hasConfirmedFace(media) {
+  return media?.classification?.faceVisible === true;
+}
+
+// Preference buckets for everything that is NOT the reserved slot-0 packshot.
+// Extra product_only (after slot 0 took the first one) sit AFTER detail
+// and before packaging / unknown / unclassified.
+//
+// ⚠️ OWNER DECISION TO CONFIRM. The owner's literal spec was
+// "lifestyle → on-figure+face → on-figure → flat_lay → detail" for slots
+// 1–2, which does not mention a second packshot. Ranking a spare
+// product_only BELOW detail (bucket 5 vs 4) is a deliberate deviation:
+// once slot 0 already holds the packshot seed, a second studio packshot
+// adds less identity signal than a detail of the same garment (the
+// Chubasco finding was "drop the packshot and the wordmark garbles",
+// not "two packshots beat a cuff/label close-up"). Leave this as-is
+// until the owner confirms or reverses it. Do not silently swap 4 and 5.
+function packshotRemainingBucket(m) {
+  const st = shotTypeOf(m);
+  if (st === 'lifestyle') return 0;
+  if (st === 'on_model') return hasConfirmedFace(m) ? 1 : 2;
+  if (st === 'flat_lay') return 3;
+  if (st === 'detail') return 4;
+  if (st === 'product_only') return 5;
+  if (st === 'packaging') return 6;
+  return 7;
+}
+
+// SORT, never a filter — same members out as in, matching
+// orderByShotTypePreference. Input is already feed-ordered; feed index is
+// the tiebreak inside each bucket.
+//
+// No product_only in the list → preference order fills slot 0 too. We do
+// not invent a packshot and we do not silently keep seed-first.
+function orderByPackshotProtectedRanking(medias) {
+  const list = Array.isArray(medias) ? medias.slice() : [];
+  if (list.length < 2) return list;
+
+  const firstPackshot = list.find((m) => shotTypeOf(m) === 'product_only') || null;
+  const rest = firstPackshot ? list.filter((m) => m !== firstPackshot) : list;
+  const orderedRest = rest
+    .map((m, i) => ({ m, i, b: packshotRemainingBucket(m) }))
+    .sort((a, b) => (a.b !== b.b ? a.b - b.b : a.i - b.i))
+    .map((x) => x.m);
+  return firstPackshot ? [firstPackshot, ...orderedRest] : orderedRest;
+}
+
 module.exports = {
   videoReferenceDefaults,
   imageReferenceDefaults,
   orderByShotTypePreference,
+  isPackshotProtectedRankingEnabled,
+  orderByPackshotProtectedRanking,
   MAX_VIDEO_COUNT,
   MAX_IMAGE_COUNT,
   VALID_SHOT_TYPES

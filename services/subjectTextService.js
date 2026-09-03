@@ -27,7 +27,8 @@ const { chatCompletion } = require('./atlasLlmService');
 //     background:{ description, setting, palette, lighting, style, notes,
 //                  mood, sceneType },
 //     primarySubjectLabel:   string | null,
-//     secondaryElementsTags: string[]
+//     secondaryElementsTags: string[],
+//     faceVisible:           true | false | null  // null = not assessed
 //   }
 async function detectSubjectsAndText(imageUrl, hints = {}) {
   const { brand, category, caption, brandId = null, productId = null, adId = null, campaignRunId = null } = hints;
@@ -95,6 +96,8 @@ async function detectSubjectsAndText(imageUrl, hints = {}) {
 "shotTypeConfidence": 0.0-1.0 — confidence in the shot type classification.
 
 "shotTypeReason": one short sentence citing the visual signal (e.g. "Bottle held over a steaming bowl of noodles on a wooden table", "Studio shot of bottle on white seamless"). Max 120 chars.
+
+"faceVisible": true or false — is a human face (even partially, even cropped) visible in the frame? Only meaningful when shotType is "on_model". Use false for product_only / flat_lay / detail / packaging with no person. Omit the field if you cannot assess.
 
 The PRIMARY subject's description should be detailed enough to search for it online — include material, color, cut/silhouette, notable features, and any product name/label you can read.${hintBlock}
 
@@ -192,11 +195,22 @@ Return ONLY valid JSON, no markdown, no explanation.`
     ? parsed.shotTypeReason.trim().slice(0, 120)
     : null;
 
+  // Face-visible — piggybacks this same GPT-4.1 call. null = not assessed
+  // (model omitted the field); false = assessed, no face; true = a face
+  // is visible. Do not coerce omit → false.
+  const rawFace = parsed.faceVisible;
+  const faceVisible = (rawFace === true || rawFace === 'true' || rawFace === 1 || rawFace === '1')
+    ? true
+    : (rawFace === false || rawFace === 'false' || rawFace === 0 || rawFace === '0')
+      ? false
+      : null;
+
   return {
     subjects, text, background,
     primarySubjectLabel, secondaryElementsTags,
     contentNature, contentNatureConfidence, contentNatureReason,
-    shotType, shotTypeConfidence, shotTypeReason
+    shotType, shotTypeConfidence, shotTypeReason,
+    faceVisible
   };
 }
 

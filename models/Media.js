@@ -297,7 +297,12 @@ const mediaSchema = new mongoose.Schema({
       default: undefined
     },
     shotTypeConfidence: { type: Number, default: undefined },
-    shotTypeReason:     { type: String, default: undefined }
+    shotTypeReason:     { type: String, default: undefined },
+    // Piggybacks the same ingest GPT-4.1 call as shotType. null = never
+    // assessed (historical docs, or the model omitted the field); false =
+    // assessed, no face; true = a face is visible. Do not default false —
+    // Mongoose would otherwise collapse "not assessed" into "no face".
+    faceVisible:        { type: Boolean, default: null }
   },
 
   createdAt: { type: Date, default: Date.now },

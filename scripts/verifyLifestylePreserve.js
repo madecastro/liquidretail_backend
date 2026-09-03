@@ -882,16 +882,20 @@ console.log('\n=== VIDEO lifestyle directives ===\n');
     for (const [caps] of CAPSETS) {
       for (const hasProductReference of [true, false]) {
         for (const durationSec of [4, 8, 15]) {
-          for (const seedHasText of [false, true]) {
-            const args = {
-              product: { title: 'Wool Runner' },
-              hasProductReference, durationSec, seedHasText, caps
-            };
-            check(
-              `V2 prompt byte-identical to 9531ae9f (ref=${hasProductReference} dur=${durationSec} text=${seedHasText} caps=${caps ? 'omni' : 'def'})`,
-              mod.buildVeoPrompt(args) === oldMod.buildVeoPrompt(args)
-            );
-          }
+          // 2026-09-03: overlay guard stripped. seedHasText=false remains
+          // byte-identical to 9531ae9f. seedHasText=true is a no-op.
+          const argsOff = {
+            product: { title: 'Wool Runner' },
+            hasProductReference, durationSec, seedHasText: false, caps
+          };
+          check(
+            `V2 prompt byte-identical to 9531ae9f (ref=${hasProductReference} dur=${durationSec} text=false caps=${caps ? 'omni' : 'def'})`,
+            mod.buildVeoPrompt(argsOff) === oldMod.buildVeoPrompt(argsOff)
+          );
+          check(
+            `V2 seedHasText is a retired no-op (ref=${hasProductReference} dur=${durationSec} caps=${caps ? 'omni' : 'def'})`,
+            mod.buildVeoPrompt({ ...argsOff, seedHasText: true }) === mod.buildVeoPrompt(argsOff)
+          );
         }
       }
     }

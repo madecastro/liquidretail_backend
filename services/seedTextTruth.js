@@ -1,6 +1,19 @@
 'use strict';
 
 /**
+ * Retired 2026-09-03. The overlay "do not reproduce" sentence is no longer
+ * emitted — it contradicted OMNI_DIRECTIVES.noText, which already says both
+ * halves unconditionally. Kept here so the inspector can still RECOGNISE it
+ * in historical persisted Ad.veoPrompt rows. Never re-export from the
+ * prompt builder; never push it into a new prompt.
+ */
+const RETIRED_SEED_BURNED_IN_TEXT_GUARD_LINE =
+  `The reference image contains text overlays / captions / stickers / watermarks burned into the source frame. ` +
+  `Treat that burned-in text as part of the locked photograph — do not read, reproduce, extend, or generate more of it. ` +
+  `The chrome layer will composite all ad copy downstream.`;
+
+
+/**
  * seedTextTruth — decide, HONESTLY, whether an ad's seed image carried
  * burned-in text, and say which signal answered.
  *
@@ -11,8 +24,11 @@
  * guard block was in the submitted prompt). Measured 2026-08-27.
  *
  * ROOT CAUSE was a DECODE MISMATCH, not staleness and not a missing write:
- *   • producer (render): `Array.isArray(media.text) && media.text.length > 0`
- *     — atlasVideoService / aiVideoReferenceService. A RAW LENGTH COUNT.
+ *   • producer (render, until 2026-09-03): raw length
+ *     `Array.isArray(media.text) && media.text.length > 0`. The overlay
+ *     guard that used this boolean was then stripped because it contradicted
+ *     OMNI_DIRECTIVES.noText. Inspector seedHasText now means "the seed
+ *     Media row has OCR text", not "the prompt contains the retired guard".
  *   • reader (inspector): mapped each element through `t?.text || t?.value`,
  *     `filter(Boolean)`, then took `.length > 0` of THAT.
  * The only production writer of `Media.text` is subjectTextService, whose
@@ -40,8 +56,9 @@
  *      `$set`s that array wholesale, including to `[]` when its subjects-text
  *      stage fails — so a later honest re-read can go empty on an ad whose
  *      render really did fire).
- *   2. `seed-media` — the RAW element count, mirroring the producer term for
- *      term. Used when the prompt says nothing: none persisted, or the
+ *   2. `seed-media` — raw Media.text length. Used when the prompt says
+ *      nothing (or is a raw override), or when the prompt is a new
+ *      canonical build that no longer emits the retired guard.
  *      persisted prompt IS a raw override (identified by a prefix test on the
  *      prompt itself, NOT by `videoPromptRaw` merely being set — see
  *      promptCarriesSeedTextGuard), so the guard's absence proves nothing.
@@ -49,8 +66,10 @@
  *
  * BOTH directions of prompt-vs-media disagreement are reported, each as its own
  * flag, because they mean different things and need different action:
- * `recordChangedSinceRender` (prompt yes, record no) and `guardMissingAtRender`
- * (prompt no, record yes — the model got text-bearing pixels unguarded).
+ * `recordChangedSinceRender` (historical prompt still carries the retired
+ * guard, live Media.text is empty). `guardMissingAtRender` is always false
+ * as of 2026-09-03: the overlay guard is retired, so its absence is the
+ * intended state, not a defect.
  *
  * The decoded strings remain a human-readable convenience ONLY. They must never
  * drive the boolean: an element whose `content` is an empty string still counts
@@ -72,11 +91,10 @@ function decodeSeedTextElement(el) {
 }
 
 /**
- * Mirror of the render path's producer, term for term.
- * atlasVideoService: `const seedHasText = Array.isArray(media.text) && media.text.length > 0;`
- *
- * Deliberately a RAW COUNT with no decode. If this ever starts decoding, the
- * inspector and the render path can disagree again.
+ * Does the seed Media row record any OCR text elements?
+ * Raw count, no decode, no type filter. Media.text[].type is not
+ * trustworthy (competitor hallucination, sanitisation, misclassification
+ * all measured 2026-09-03).
  */
 function seedHasTextFromMedia(media) {
   return Array.isArray(media?.text) && media.text.length > 0;
@@ -143,9 +161,8 @@ function promptCarriesSeedTextGuard({ veoPrompt, videoPromptRaw, guardLine }) {
  *
  * @param {object}  media      the seed Media row (lean); needs `.text`
  * @param {object}  ad         the Ad row; needs `.veoPrompt`, `.videoPromptRaw`
- * @param {string}  guardLine  veoPromptBuilder.SEED_BURNED_IN_TEXT_GUARD_LINE —
- *                             passed in, never re-declared here, so a reworded
- *                             builder cannot silently stop matching.
+ * @param {string}  [guardLine]  defaults to RETIRED_SEED_BURNED_IN_TEXT_GUARD_LINE.
+ *                               Used only to recognise HISTORICAL prompts.
  * @returns {{
  *   seedHasText: boolean,
  *   seedHasTextSource: 'render-prompt'|'seed-media'|'none',
@@ -164,7 +181,7 @@ function resolveSeedTextTruth({ media, ad, guardLine } = {}) {
   const fromPrompt = promptCarriesSeedTextGuard({
     veoPrompt:      ad?.veoPrompt,
     videoPromptRaw: ad?.videoPromptRaw,
-    guardLine
+    guardLine: guardLine || RETIRED_SEED_BURNED_IN_TEXT_GUARD_LINE
   });
 
   // The prompt WINS when it says true — it is the only signal that describes
@@ -200,21 +217,18 @@ function resolveSeedTextTruth({ media, ad, guardLine } = {}) {
     // submission; trust the prompt.
     recordChangedSinceRender: fromPrompt === true && !fromMedia,
 
-    // Prompt did NOT carry the guard, but the seed record HAS text → the model
-    // was handed text-bearing pixels with no instruction to leave that text
-    // alone. This is the more actionable direction of the two: it is a live
-    // candidate cause of garbled on-screen text, not merely a stale record.
-    // Either the text was detected after the render, or seedHasText was false
-    // at submit while the media already carried detections.
-    guardMissingAtRender: fromPrompt === false && fromMedia
+    // Retired 2026-09-03. The overlay guard is no longer emitted, so its
+    // absence on a canonical prompt is the intended state — not a defect.
+    // Historical prompts that still contain the sentence are reported via
+    // promptCarriesSeedTextGuard / recordChangedSinceRender.
+    guardMissingAtRender: false
   };
 }
 
 module.exports = {
   resolveSeedTextTruth,
-  // Exported for scripts/verifyTruthfulReporting.js — behavioural checks call
-  // these directly rather than scanning route source text.
   decodeSeedTextElement,
   seedHasTextFromMedia,
-  promptCarriesSeedTextGuard
+  promptCarriesSeedTextGuard,
+  RETIRED_SEED_BURNED_IN_TEXT_GUARD_LINE
 };

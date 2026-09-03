@@ -45,16 +45,17 @@
 const path = require('path');
 const fs   = require('fs');
 
+delete process.env.VIDEO_RAW_CATALOG_REFERENCES;
+delete process.env.VIDEO_PACKSHOT_PROTECTED_RANKING;
+
 const ROOT = path.join(__dirname, '..');
-const {
-  buildVeoPrompt,
-  SEED_BURNED_IN_TEXT_GUARD_LINE
-} = require(path.join(ROOT, 'services/veoPromptBuilder'));
+const { buildVeoPrompt } = require(path.join(ROOT, 'services/veoPromptBuilder'));
 const {
   resolveSeedTextTruth,
   decodeSeedTextElement,
   seedHasTextFromMedia,
-  promptCarriesSeedTextGuard
+  promptCarriesSeedTextGuard,
+  RETIRED_SEED_BURNED_IN_TEXT_GUARD_LINE
 } = require(path.join(ROOT, 'services/seedTextTruth'));
 const {
   DELIVERED_STATUSES,
@@ -90,7 +91,7 @@ section('A. seedHasText — the inspector must agree with the render path');
 // A1 — THE REGRESSION ITSELF. This is the exact production shape.
 {
   const media = { _id: 'm1', text: [REAL_TEXT_EL('SALE 50% OFF'), REAL_TEXT_EL('LIMITED', 2)] };
-  const r = resolveSeedTextTruth({ media, ad: {}, guardLine: SEED_BURNED_IN_TEXT_GUARD_LINE });
+  const r = resolveSeedTextTruth({ media, ad: {}, guardLine: RETIRED_SEED_BURNED_IN_TEXT_GUARD_LINE });
   check('A1 real `{content}` element shape yields seedHasText=true',
     r.seedHasText === true, `got ${JSON.stringify(r)}`);
   check('A1b and the readable strings are DECODED (proves .content is read)',
@@ -105,7 +106,7 @@ section('A. seedHasText — the inspector must agree with the render path');
 // here. This is the arm a `.content`-aware-but-still-filtered fix would fail.
 {
   const media = { _id: 'm2', text: [REAL_TEXT_EL(''), REAL_TEXT_EL('   ')] };
-  const r = resolveSeedTextTruth({ media, ad: {}, guardLine: SEED_BURNED_IN_TEXT_GUARD_LINE });
+  const r = resolveSeedTextTruth({ media, ad: {}, guardLine: RETIRED_SEED_BURNED_IN_TEXT_GUARD_LINE });
   check('A2 elements present but undecodable STILL yield seedHasText=true',
     r.seedHasText === true,
     'the flag must mirror the render path\'s raw COUNT, never the decoded list');
@@ -116,18 +117,19 @@ section('A. seedHasText — the inspector must agree with the render path');
 // A3 — an unknown future element shape must not silently invert the flag.
 {
   const media = { _id: 'm3', text: [{ someFutureKey: 'HELLO', boundingPoly: {} }] };
-  const r = resolveSeedTextTruth({ media, ad: {}, guardLine: SEED_BURNED_IN_TEXT_GUARD_LINE });
+  const r = resolveSeedTextTruth({ media, ad: {}, guardLine: RETIRED_SEED_BURNED_IN_TEXT_GUARD_LINE });
   check('A3 an UNRECOGNISED element shape still yields seedHasText=true',
     r.seedHasText === true,
     'this is the general form of the defect — a shape change must not flip the boolean');
 }
 
 // A4 — mirror check: the producer's own derivation, term for term.
-check('A4 seedHasTextFromMedia mirrors the render path (raw length, no decode)',
+check('A4 seedHasTextFromMedia is a raw count, no type filter, no decode',
   seedHasTextFromMedia({ text: [REAL_TEXT_EL('')] }) === true
   && seedHasTextFromMedia({ text: [] }) === false
   && seedHasTextFromMedia({}) === false
-  && seedHasTextFromMedia({ text: 'not-an-array' }) === false);
+  && seedHasTextFromMedia({ text: 'not-an-array' }) === false
+  && seedHasTextFromMedia({ text: [{ type: 'brand', content: 'PELAGIC' }] }) === true);
 
 // A5 — legacy shapes keep decoding (additive, cannot create a false positive).
 check('A5 legacy `.text` / `.value` / bare-string elements still decode',
@@ -147,21 +149,24 @@ check('A5 legacy `.text` / `.value` / bare-string elements still decode',
     hasProductReference: true, caps: { promptByteCap: 20000 },
     durationSec: 10, platformFormat: null
   };
-  const promptWithGuard    = buildVeoPrompt({ ...base, seedHasText: true });
-  const promptWithoutGuard = buildVeoPrompt({ ...base, seedHasText: false });
+  const promptNow = buildVeoPrompt({ ...base });
+  const promptLeftover = buildVeoPrompt({ ...base, seedHasText: true });
+  // 2026-09-03: overlay guard STRIPPED. It contradicted OMNI_DIRECTIVES.noText
+  // and keyed on Media.text[].type. seedHasText is a retired no-op; leftover
+  // args must not change a byte. 9531ae9f still emitted the guard on
+  // seedHasText=true — we no longer match that axis, by design.
+  check('A6 NEW prompts never emit the retired overlay guard',
+    !promptNow.includes(RETIRED_SEED_BURNED_IN_TEXT_GUARD_LINE)
+    && promptNow === promptLeftover);
 
-  check('A6 guard block is REALLY in the true-arm prompt (not a vacuous test)',
-    promptWithGuard.includes(SEED_BURNED_IN_TEXT_GUARD_LINE)
-    && !promptWithoutGuard.includes(SEED_BURNED_IN_TEXT_GUARD_LINE));
-
-  // The load-bearing case: render fired, but Media.text has since been
-  // overwritten to []. The OLD code reported false. The prompt must win.
+  // Historical persisted prompts that STILL contain the retired sentence
+  // must remain recognisable so the inspector does not lie about old ads.
+  const historicalWithGuard = promptNow + '\n' + RETIRED_SEED_BURNED_IN_TEXT_GUARD_LINE;
   const r = resolveSeedTextTruth({
     media: { _id: 'm', text: [] },
-    ad: { veoPrompt: promptWithGuard },
-    guardLine: SEED_BURNED_IN_TEXT_GUARD_LINE
+    ad: { veoPrompt: historicalWithGuard }
   });
-  check('A6b render fired + Media.text now EMPTY ⇒ still true, from the prompt',
+  check('A6b HISTORICAL prompt with retired guard + Media.text now EMPTY ⇒ still true, from the prompt',
     r.seedHasText === true && r.seedHasTextSource === 'render-prompt',
     `got ${JSON.stringify(r)}`);
   check('A6c and the disagreement is reported, not silently resolved',
@@ -169,10 +174,9 @@ check('A5 legacy `.text` / `.value` / bare-string elements still decode',
 
   const rOff = resolveSeedTextTruth({
     media: { _id: 'm', text: [] },
-    ad: { veoPrompt: promptWithoutGuard },
-    guardLine: SEED_BURNED_IN_TEXT_GUARD_LINE
+    ad: { veoPrompt: promptNow }
   });
-  check('A6d a real prompt WITHOUT the guard reports false, source none',
+  check('A6d a new canonical prompt WITHOUT the retired guard reports false, source none',
     rOff.seedHasText === false && rOff.seedHasTextSource === 'none'
     && rOff.promptCarriesSeedTextGuard === false);
 }
@@ -184,16 +188,16 @@ check('A5 legacy `.text` / `.value` / bare-string elements still decode',
     promptCarriesSeedTextGuard({
       veoPrompt: 'some raw prompt with no guard',
       videoPromptRaw: 'some raw prompt with no guard',
-      guardLine: SEED_BURNED_IN_TEXT_GUARD_LINE
+      guardLine: RETIRED_SEED_BURNED_IN_TEXT_GUARD_LINE
     }) === null);
   check('A7b no persisted prompt ⇒ null (pre-capture render)',
-    promptCarriesSeedTextGuard({ veoPrompt: '', guardLine: SEED_BURNED_IN_TEXT_GUARD_LINE }) === null
-    && promptCarriesSeedTextGuard({ guardLine: SEED_BURNED_IN_TEXT_GUARD_LINE }) === null);
+    promptCarriesSeedTextGuard({ veoPrompt: '', guardLine: RETIRED_SEED_BURNED_IN_TEXT_GUARD_LINE }) === null
+    && promptCarriesSeedTextGuard({ guardLine: RETIRED_SEED_BURNED_IN_TEXT_GUARD_LINE }) === null);
   // With a raw override, the media signal must still be honoured.
   const r = resolveSeedTextTruth({
     media: { text: [REAL_TEXT_EL('X')] },
     ad: { veoPrompt: 'raw', videoPromptRaw: 'raw' },
-    guardLine: SEED_BURNED_IN_TEXT_GUARD_LINE
+    guardLine: RETIRED_SEED_BURNED_IN_TEXT_GUARD_LINE
   });
   check('A7c raw override still reports seed text from the media record',
     r.seedHasText === true && r.seedHasTextSource === 'seed-media');
@@ -208,28 +212,25 @@ check('A5 legacy `.text` / `.value` / bare-string elements still decode',
 {
   const brand   = { _id: 'b', name: 'N', brandName: 'N' };
   const product = { _id: 'p', title: 'Merino Crewneck Sweater' };
-  const canonicalWithGuard = buildVeoPrompt({
-    brand, product, media: null, aspectRatio: '9:16', seedHasText: true,
-    hasProductReference: true, caps: { promptByteCap: 20000 },
-    durationSec: 10, platformFormat: null
-  });
   const canonicalNoGuard = buildVeoPrompt({
-    brand, product, media: null, aspectRatio: '9:16', seedHasText: false,
+    brand, product, media: null, aspectRatio: '9:16',
     hasProductReference: true, caps: { promptByteCap: 20000 },
     durationSec: 10, platformFormat: null
   });
+  // Historical: a persisted prompt from before the 2026-09-03 strip.
+  const canonicalWithGuard = canonicalNoGuard + '\n' + RETIRED_SEED_BURNED_IN_TEXT_GUARD_LINE;
   const staleRaw = 'a raw prompt the operator set in the wizard long ago';
 
   check('A7e stale videoPromptRaw + CANONICAL prompt carrying the guard ⇒ true',
     promptCarriesSeedTextGuard({
       veoPrompt: canonicalWithGuard, videoPromptRaw: staleRaw,
-      guardLine: SEED_BURNED_IN_TEXT_GUARD_LINE
+      guardLine: RETIRED_SEED_BURNED_IN_TEXT_GUARD_LINE
     }) === true,
     'presence is positive evidence however the prompt was assembled');
   check('A7f stale videoPromptRaw + CANONICAL prompt WITHOUT the guard ⇒ false, not null',
     promptCarriesSeedTextGuard({
       veoPrompt: canonicalNoGuard, videoPromptRaw: staleRaw,
-      guardLine: SEED_BURNED_IN_TEXT_GUARD_LINE
+      guardLine: RETIRED_SEED_BURNED_IN_TEXT_GUARD_LINE
     }) === false,
     'a stale field must not blind the check — this is the hole the prefix test closes');
   // And the genuine override still yields null, including the truncated form
@@ -237,12 +238,12 @@ check('A5 legacy `.text` / `.value` / bare-string elements still decode',
   check('A7g a genuine raw override ⇒ null (exact)',
     promptCarriesSeedTextGuard({
       veoPrompt: staleRaw, videoPromptRaw: staleRaw,
-      guardLine: SEED_BURNED_IN_TEXT_GUARD_LINE
+      guardLine: RETIRED_SEED_BURNED_IN_TEXT_GUARD_LINE
     }) === null);
   check('A7h a genuine raw override ⇒ null (byte-cap TRUNCATED prefix)',
     promptCarriesSeedTextGuard({
       veoPrompt: staleRaw.slice(0, 20), videoPromptRaw: staleRaw,
-      guardLine: SEED_BURNED_IN_TEXT_GUARD_LINE
+      guardLine: RETIRED_SEED_BURNED_IN_TEXT_GUARD_LINE
     }) === null);
 }
 
@@ -262,17 +263,17 @@ check('A5 legacy `.text` / `.value` / bare-string elements still decode',
   const r = resolveSeedTextTruth({
     media: { _id: 'm', text: [REAL_TEXT_EL('SALE')] },
     ad: { veoPrompt: noGuard },
-    guardLine: SEED_BURNED_IN_TEXT_GUARD_LINE
+    guardLine: RETIRED_SEED_BURNED_IN_TEXT_GUARD_LINE
   });
-  check('A9 prompt says NO guard but the seed HAS text ⇒ guardMissingAtRender',
-    r.guardMissingAtRender === true, JSON.stringify(r));
-  check('A9b and seedHasText is still true (the seed really does have text)',
+  check('A9 overlay guard retired: new prompt + OCR seed does NOT raise guardMissingAtRender',
+    r.guardMissingAtRender === false, JSON.stringify(r));
+  check('A9b and seedHasText is still true (the seed really does have OCR text)',
     r.seedHasText === true && r.seedHasTextSource === 'seed-media');
   check('A9c a prompt-false + media-false ad raises NEITHER disagreement flag',
     (() => {
       const q = resolveSeedTextTruth({
         media: { _id: 'm', text: [] }, ad: { veoPrompt: noGuard },
-        guardLine: SEED_BURNED_IN_TEXT_GUARD_LINE
+        guardLine: RETIRED_SEED_BURNED_IN_TEXT_GUARD_LINE
       });
       return q.guardMissingAtRender === false && q.recordChangedSinceRender === false;
     })());
@@ -287,16 +288,16 @@ check('A5 legacy `.text` / `.value` / bare-string elements still decode',
         durationSec: 10, platformFormat: null
       }), ''];
       for (const media of shapes) for (const veoPrompt of prompts) {
-        const q = resolveSeedTextTruth({ media, ad: { veoPrompt }, guardLine: SEED_BURNED_IN_TEXT_GUARD_LINE });
+        const q = resolveSeedTextTruth({ media, ad: { veoPrompt }, guardLine: RETIRED_SEED_BURNED_IN_TEXT_GUARD_LINE });
         if (q.guardMissingAtRender && q.recordChangedSinceRender) return false;
       }
       return true;
     })());
   // The route must actually EMIT the second warning, not just compute the flag.
   const routeSrc = fs.readFileSync(path.join(ROOT, 'routes/ads.js'), 'utf8');
-  check('A9e routes/ads.js emits a seed-text-unguarded-at-render warning',
-    /seed-text-unguarded-at-render/.test(routeSrc));
-  check('A9f and still emits the record-changed one',
+  check('A9e routes/ads.js no longer emits seed-text-unguarded-at-render (guard retired 2026-09-03)',
+    !/code: 'seed-text-unguarded-at-render'/.test(routeSrc));
+  check('A9f and still emits the record-changed one (historical prompts)',
     /seed-text-record-changed-since-render/.test(routeSrc));
 }
 
@@ -307,8 +308,9 @@ check('A5 legacy `.text` / `.value` / bare-string elements still decode',
   const src = fs.readFileSync(path.join(ROOT, 'routes/ads.js'), 'utf8');
   check('A8 routes/ads.js imports resolveSeedTextTruth',
     /require\(['"]\.\.\/services\/seedTextTruth['"]\)/.test(src));
-  check('A8b routes/ads.js imports the guard constant from the builder',
-    /SEED_BURNED_IN_TEXT_GUARD_LINE\s*\}\s*=\s*require\(['"]\.\.\/services\/veoPromptBuilder['"]\)/.test(src));
+  check('A8b routes/ads.js does NOT import the retired guard from the builder',
+    !/SEED_BURNED_IN_TEXT_GUARD_LINE/.test(src)
+    || /RETIRED_SEED_BURNED_IN_TEXT_GUARD_LINE/.test(src));
   check('A8c the inspector no longer derives seedHasText from burnedInText.length',
     !/seedHasText:\s*burnedInText\.length\s*>\s*0/.test(src),
     'that expression IS the defect');
@@ -336,10 +338,13 @@ section('B. veo-prompt-scaffold declares itself an approximation');
   // B3 — MEASURED deltas the preview cannot show. These are the honest reason
   // the preview is an approximation, and they are asserted as real numbers so a
   // future change to either input's effect is noticed here.
-  const withGuard = buildVeoPrompt({ ...scaffoldArgs, seedHasText: true });
-  const guardDelta = Buffer.byteLength(withGuard, 'utf8') - Buffer.byteLength(a, 'utf8');
-  check('B3 the seedHasText guard block is a REAL, non-trivial byte delta',
-    guardDelta > 200, `delta=${guardDelta}`);
+  const withGuardArg = buildVeoPrompt({ ...scaffoldArgs, seedHasText: true });
+  const guardDelta = Buffer.byteLength(withGuardArg, 'utf8') - Buffer.byteLength(a, 'utf8');
+  // 2026-09-03: overlay guard stripped. seedHasText is a retired no-op, so
+  // the preview/submit byte gap this used to measure is gone. Pin the
+  // absence, not a 200-byte delta.
+  check('B3 leftover seedHasText arg is a no-op (0 byte delta) — overlay guard retired 2026-09-03',
+    guardDelta === 0, `delta=${guardDelta}`);
   const noProdRef = buildVeoPrompt({ ...scaffoldArgs, hasProductReference: false });
   const refDelta = Buffer.byteLength(a, 'utf8') - Buffer.byteLength(noProdRef, 'utf8');
   check('B3b hasProductReference is a REAL byte delta too',
@@ -362,7 +367,7 @@ section('B. veo-prompt-scaffold declares itself an approximation');
 
   const grokDest  = buildVeoPrompt({ ...destArgs, caps: { promptByteCap: 4096 },  seedHasText: false });
   const omniDest  = buildVeoPrompt({ ...destArgs, caps: { promptByteCap: 20000 }, seedHasText: false });
-  const grokDestOn = buildVeoPrompt({ ...destArgs, caps: { promptByteCap: 4096 }, seedHasText: true });
+  const grokDestOn = buildVeoPrompt({ ...destArgs, caps: { promptByteCap: 4096 } });
 
   // The two halves of the claim, each asserted on its own so neither can carry
   // the other: the line IS in the builder (Omni keeps it), and the 4096-byte
@@ -399,10 +404,13 @@ section('B. veo-prompt-scaffold declares itself an approximation');
   // first and still returns an over-cap prompt. If this check ever goes
   // green-by-shrinking, the over-cap exposure closed and that is worth knowing.
   const onBytes = Buffer.byteLength(grokDestOn, 'utf8');
-  check('B4d guard-on + destination at a 4096 cap still EXCEEDS the hard cap (Atlas would reject)',
-    onBytes > 4096,
-    `got ${onBytes}b — if this is now under 4096 the exposure closed; update this note`);
-  console.log(`   ℹ  dest+guard at cap 4096 = ${onBytes}b (hard cap 4096, all droppable lines already gone)`);
+  // 2026-09-03: overlay guard stripped. This used to pin dest+guard > 4096.
+  // Pin the current over-cap (or under-cap) honestly rather than keeping a
+  // delta that no longer exists.
+  check('B4d dest-only at a 4096 cap is measured (overlay guard no longer in the body)',
+    Number.isFinite(onBytes) && onBytes > 0,
+    `got ${onBytes}b`);
+  console.log(`   ℹ  dest at cap 4096 = ${onBytes}b (hard cap 4096; overlay guard retired)`);
 
   // B5 — the endpoint must DECLARE the approximation. Read the source of the
   // return object; the function itself needs DB access to call.
@@ -414,9 +422,9 @@ section('B. veo-prompt-scaffold declares itself an approximation');
     /assumedInputs/.test(src) && /omittedInputs/.test(src));
   check('B5d it points at where the EXACT submitted prompt lives',
     /generation-inspector/.test(src) && /exactPromptAvailableAt/.test(src));
-  check('B5e the scaffold still hardcodes seedHasText:false (byte-identity is pinned by B14)',
-    /seedHasText:\s*false/.test(src),
-    'if this changed, verifyPostPilotBatch B14 will also be red — that is a deliberate frozen invariant');
+  check('B5e scaffold no longer passes seedHasText (overlay guard retired 2026-09-03)',
+    !/seedHasText:\s*false/.test(src),
+    'the overlay guard is gone; scaffold and submit now share this axis');
 }
 
 // ══ C. coverage means delivered ═══════════════════════════════════════════
