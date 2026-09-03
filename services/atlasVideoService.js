@@ -4475,9 +4475,17 @@ async function generateForAd({
       ? Media.find({
           source: 'catalog-product',
           'metadata.catalogProductId': ad.productId
-        }).select('_id fileUrl classification adSuitability metadata width height createdAt')
-          // width/height feed the reframe already-correct skip guard. Order
-          // is applied below in JS — see sortCatalogMediasForReferenceStack —
+        }).select('_id fileUrl classification adSuitability metadata width height refinedProducts createdAt')
+          // width/height feed the reframe already-correct skip guard.
+          // refinedProducts feeds reframeStrategyChooser.subjectUnionBbox
+          // for the DINO-derived crop path (7758b32 + da22486). Dropping
+          // it silently forces every alt through paid nano-banana
+          // outpaint — Mongoose `.select()` of an unrequested field
+          // returns undefined, `Array.isArray(undefined)` is false,
+          // subjectUnionBbox returns null, chooseStrategy defers,
+          // outpaint fires. Same class of bug as videoRefPrewarmService's
+          // sister projection; both must stay in sync.
+          // Order is applied below in JS — see sortCatalogMediasForReferenceStack —
           // because it is conditional on CATALOG_FEED_ORDER_SEEDING.
           .lean()
           .then(sortCatalogMediasForReferenceStack)

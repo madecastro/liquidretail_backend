@@ -100,9 +100,29 @@ function check(id, cond, detail) {
 // ── C: postRematchAfterCatalogService source filter ──
 {
   const src = read('services/postRematchAfterCatalogService.js');
+  // Two acceptable shapes (invariant: rematch queries both real-IG and
+  // demo-brand sources). Old: literal `source: { $in: ['instagram',
+  // 'apify-ig'] }` (8142028e). New (a1c5407d "feat(detect): defer
+  // per-post apify-sync detect + full-brand rematch after catalog
+  // drain"): extracts a shared `UGC_SOURCES = ['instagram', 'apify-ig']`
+  // constant and references it as `source: { $in: UGC_SOURCES }` at
+  // both query sites — same query, one place to add future platforms.
+  const inlineIn = /source:\s*\{\s*\$in:\s*\[\s*['"]instagram['"]\s*,\s*['"]apify-ig['"]\s*\]/.test(src);
+  const decls = src.match(/(?:const|let|var)\s+[A-Za-z_][A-Za-z0-9_]*\s*=\s*\[[^\]]+\]/g) || [];
+  let viaConst = false;
+  for (const decl of decls) {
+    const m = decl.match(/(?:const|let|var)\s+([A-Za-z_][A-Za-z0-9_]*)\s*=\s*\[([^\]]+)\]/);
+    if (!m) continue;
+    const [, name, body] = m;
+    if (!/['"]instagram['"]/.test(body) || !/['"]apify-ig['"]/.test(body)) continue;
+    if (new RegExp(`source:\\s*\\{\\s*\\$in:\\s*${name}\\b`).test(src)) {
+      viaConst = true;
+      break;
+    }
+  }
   check('C1: source filter includes apify-ig (demo brands)',
-    /source:\s*\{\s*\$in:\s*\[\s*['"]instagram['"]\s*,\s*['"]apify-ig['"]\s*\]/.test(src),
-    'query must accept both real-IG-connected brands and demo brands');
+    inlineIn || viaConst,
+    'query must accept both real-IG-connected brands and demo brands (inline $in: [\'instagram\', \'apify-ig\'], or a UGC_SOURCES-style constant containing both used as source: { $in: <name> })');
   check('C2: NO residual bare source: "instagram" query on candidate media',
     !/source:\s*['"]instagram['"]\s*\}\)\.select/.test(src),
     'old single-source filter would silently zero every demo brand rematch');
