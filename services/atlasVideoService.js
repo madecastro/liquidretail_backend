@@ -168,18 +168,31 @@ const REFRAME_BORDER_STD_MAX = () => {
 };
 // Ladder id persisted on Media.metadata.reframes[*]. BUMP THIS whenever the
 // ladder changes in a way that should invalidate previously-derived assets.
-//   uncrop-v1 → the first port (1k + uncrop prompt, no product-only routing)
+//   uncrop-v1  → the first port (1k + uncrop prompt, no product-only routing)
 //   reframe-v2 → 4k + conservative 'reframe' prompt, product-only $0
 //                pad routing, output ratio validation, solid-preferred pad
-//   reframe-v3 → 2026-09-03: pad-product-only shifted from fixed 720×1280
-//                (Atlas 720p cap era) to SOURCE-NATIVE dims so Omni gets
-//                more edge detail on on-garment graphics. Bump forces a
-//                one-time re-derive on every cached pad so backend + adgen
-//                converge on the same dims and any low-res pad we already
-//                shipped gets invalidated without a manual sweep. Governed
-//                by REFRAME_PAD_TARGET (default 'source-native'); a value
-//                of 'model-720p' restores pre-change behaviour byte-for-byte.
-const REFRAME_LADDER_VERSION = 'reframe-v3';
+//   reframe-v3 → 2026-09-03 EARLIER TODAY: pad-product-only shifted from
+//                fixed 720×1280 (Atlas 720p cap era) to SOURCE-NATIVE dims
+//                so Omni gets more edge detail on on-garment graphics.
+//                REVERTED to 'reframe-v2' on 2026-09-03 LATER TODAY because
+//                the live adgen renderer still ships 'reframe-v2', its
+//                stale check is `entry.ladderVersion !== current`, and it
+//                was treating every backend-written 'reframe-v3' entry as
+//                stale — then re-deriving the alt with its old code path
+//                (composite-outpaint, no force-crop) and OVERWRITING our
+//                clean crop with a paid Nano Banana asset. Measured: eight
+//                of the last fifteen runs paid $0.08-$0.32 in fresh
+//                reframe-outpaint that force-crop would have made $0.
+//
+//                The source-native pad and force-crop code both STAY —
+//                each is a strict shape/method improvement to output that
+//                adgen recognises as v2. Only the tag reverts, so both
+//                services agree and adgen stops re-deriving.
+//
+//                Re-bump only after adgen has been ported to the same
+//                v3-shape and stale semantics, or after we switch to a
+//                strictly-older-than stale predicate on both sides.
+const REFRAME_LADDER_VERSION = 'reframe-v2';
 // Additive prompt hardening. When true, reframePromptForAspect appends
 // SUBJECT IDENTITY, PHYSICAL ACCURACY, and (when the source has YOLO subjects
 // touching a frame edge) SOURCE-EDGE PROTECTION clauses. When false — the

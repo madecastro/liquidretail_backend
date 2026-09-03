@@ -213,18 +213,27 @@ check('C7 b_auto:predominant_gradient fallback when hex is null', () => {
   });
 });
 
-// ── Section D — REFRAME_LADDER_VERSION bump ──────────────────────────
+// ── Section D — REFRAME_LADDER_VERSION ──────────────────────────────
 //
-// Bumping the ladder is what makes the change safe to ship without a
-// backfill: every existing Media.metadata.reframes[*] entry ships with
-// ladderVersion 'reframe-v2', and REFRAME_REDERIVE_STALE (default true)
-// re-derives any entry whose ladderVersion !== the current constant.
-// So one flip here is the whole migration.
+// Bumped from 'reframe-v2' to 'reframe-v3' earlier 2026-09-03 to force
+// a one-time re-derive of every cached low-res pad. REVERTED the same
+// day back to 'reframe-v2' because the live adgen renderer still ships
+// 'reframe-v2', its stale check is `entry.ladderVersion !== current`,
+// and it was treating every backend-written 'reframe-v3' entry as stale
+// — then re-deriving with its old composite-outpaint code path (no
+// force-crop) and OVERWRITING our clean crop with a paid Nano Banana
+// asset. Measured: eight of the last fifteen runs paid $0.08-$0.32 in
+// fresh reframe-outpaint that force-crop would have made $0.
+//
+// Source-native pad and force-crop code are UNCHANGED — each is a
+// strict shape/method improvement to output that adgen recognises as
+// v2. Only the tag reverts, so both services agree and adgen stops
+// re-deriving. Re-bump only after adgen has been ported.
 
-console.log('\n== D. REFRAME_LADDER_VERSION bump ==');
+console.log('\n== D. REFRAME_LADDER_VERSION ==');
 
-check('D1 constant is reframe-v3 (bumped 2026-09-03)', () => {
-  assert.strictEqual(REFRAME_LADDER_VERSION, 'reframe-v3');
+check('D1 constant is reframe-v2 (v3 was reverted 2026-09-03 for adgen alignment)', () => {
+  assert.strictEqual(REFRAME_LADDER_VERSION, 'reframe-v2');
 });
 
 // ── Section E — defaults.env commits the shipped value ───────────────
