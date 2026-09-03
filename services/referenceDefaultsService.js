@@ -226,8 +226,17 @@ function orderByPackshotProtectedRanking(medias) {
   const list = Array.isArray(medias) ? medias.slice() : [];
   if (list.length < 2) return list;
 
-  const firstPackshot = list.find((m) => shotTypeOf(m) === 'product_only') || null;
-  const rest = firstPackshot ? list.filter((m) => m !== firstPackshot) : list;
+  // Remove the chosen packshot by INDEX, never by reference identity.
+  // `list.filter((m) => m !== firstPackshot)` drops EVERY copy of that object,
+  // so the same doc appearing twice in the input returned 2 members for 3 in —
+  // violating this function's own "same members out as in" contract and
+  // silently shipping one fewer reference into a ~$0.90 generation.
+  // buildReferenceImages' `consider()` dedups by _id, so today's live caller
+  // cannot hit it, but this is exported and the contract must hold for any
+  // caller. Found by executing the membership property, not by reading it.
+  const packshotIdx = list.findIndex((m) => shotTypeOf(m) === 'product_only');
+  const firstPackshot = packshotIdx >= 0 ? list[packshotIdx] : null;
+  const rest = packshotIdx >= 0 ? list.filter((_, i) => i !== packshotIdx) : list;
   const orderedRest = rest
     .map((m, i) => ({ m, i, b: packshotRemainingBucket(m) }))
     .sort((a, b) => (a.b !== b.b ? a.b - b.b : a.i - b.i))

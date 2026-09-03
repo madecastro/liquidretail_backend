@@ -112,6 +112,36 @@ console.log('\n2. Packshot ranking — slot 0 protected, preference for 1–2');
     out.length === feed.length && feed.every((m) => out.includes(m)));
 }
 
+// The check above uses DISTINCT objects, so it passes even when the packshot
+// is removed by reference identity — which is exactly the bug it missed.
+// `list.filter((m) => m !== firstPackshot)` drops EVERY copy of that object,
+// so the same doc twice returned 2 members for 3 in. Found by executing the
+// membership property over adversarial shapes, not by reading the code.
+// buildReferenceImages' consider() dedups by _id so today's live caller
+// cannot reach it, but this function is exported and its contract is
+// "same members out as in" unconditionally.
+console.log('\n2b. Packshot ranking — membership holds for adversarial shapes');
+{
+  const dup = M(1, 'product_only');
+  const noId = { fileUrl: 'https://example.test/noid.jpg', classification: { shotType: 'product_only' } };
+  const shapes = [
+    ['empty',                []],
+    ['single',               [M(1, 'product_only')]],
+    ['no product_only',      [M(1, 'detail'), M(2, 'lifestyle'), M(3, 'on_model')]],
+    ['all unclassified',     [M(1), M(2), M(3)]],
+    ['two product_only',     [M(1, 'product_only'), M(2, 'product_only'), M(3, 'detail')]],
+    ['SAME OBJECT TWICE',    [dup, dup, M(2, 'detail')]],
+    ['packshot with no _id', [noId, M(2, 'detail')]],
+    ['every item packshot',  [M(1, 'product_only'), M(2, 'product_only')]]
+  ];
+  for (const [name, input] of shapes) {
+    const o = refDefaults.orderByPackshotProtectedRanking(input);
+    check(`membership preserved: ${name}`,
+      o.length === input.length && input.every((m) => o.includes(m)),
+      `in=${input.length} out=${o.length}`);
+  }
+}
+
 console.log('\n3. Packshot ranking — no product_only falls through to preference');
 {
   const feed = [
