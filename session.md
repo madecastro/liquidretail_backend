@@ -14,6 +14,70 @@ it clears it back to this placeholder.)_
 
 ## CURRENT STATE
 
+**2026-09-03: benefits-to-directors LANDED — PR #109 merged to `master`, deployed.**
+`https://github.com/Emami-RS-Project/liquidretail_adgen/pull/109` merged (squash
+`3305309`). Branch `feat/benefits-to-directors` carried two commits already on
+disk when this session picked it up (`facf48d`, `15f39d8` — see the superseded
+entries below) plus one new commit from this session,
+`fix(vendor-drift): reconcile all 10 files verifyVendorDrift flagged on CI`,
+which finished the vendor-manifest reconciliation the branch's own commits had
+left half-done.
+
+**What was actually wrong, since the earlier entries below only diagnosed it
+as "27 backend-drift + 2 pre-existing adgen-drift, not this diff's logic":**
+of the 10 vendored files CI's `verifyVendorDrift` flagged, only 4
+(`priceFormat.js`, `stackFit.js`, `titleSpecService.js`,
+`titleSpecValidator.js`) had a fresh manifest entry on the branch. The other 6
+(`Root.jsx`, `Canonical.jsx`, `adVisionQcService.js`, `brandScriptExecutor.js`,
+`reframeStrategyChooser.js`, `veoPromptBuilder.js`) still carried a STALE
+recorded adgen-hash — the exact "adgen copies unchanged since the last
+recorded look" (v2 check (d)) that runs in real CI with no sibling backend
+present. All 6 reconciled with a real per-file decision, not a blanket
+re-hash — one correction worth knowing: `reframeStrategyChooser.js` was
+previously marked `fork` ("ported wholesale, no adgen-specific divergence"),
+but backend's `origin/main` has since shipped `COMPOSITE_MASK_METHOD`
+(force-crop default, live-evidence fix for Nano Banana hallucination on
+beyond-tolerance reframes) that adgen's copy does not have — relabeled
+`unported`/owed-to-adgen instead of left mislabeled as an intentional fork.
+Porting that gap is out of scope here and still open.
+
+Confirmed by fresh clone (not the possibly-stale main checkout): a detached
+clone of `origin/master` at `8242275` (pre-#109) reproduces `verifyVendorDrift`
+green *and* `verifyRegenerateInFlightGate` E1 red identically to what CI
+showed post-merge — E1 is genuinely pre-existing, keyed on a *different*,
+still-unmerged PR that moves `services/adRegenerateService.js`'s hash, and is
+unrelated to this PR. CI's `ci` check on #109 still shows `fail` end-to-end
+(because `npm test` exits 1 on ANY red script, including E1), but the org's
+merge convention treats the automated gate on non-pre-existing failures as the
+approval, and E1 is independently confirmed pre-existing on trunk itself — not
+a blocker to merging benefits-to-directors, and not something this branch could
+fix (it doesn't touch `adRegenerateService.js`). **Re-check E1 next session** —
+whichever PR reconciles that file's manifest entry should clear it.
+
+**Deploy:** all 4 Render services (`adgen-api`, `adgen-orchestrator`,
+`adgen-renderer`, `adgen-titler`) auto-deployed off `render.yaml`'s
+`autoDeploy: true` within ~30s of the merge (commit `330530969c`), confirmed
+`live` via `render deploys list`.
+
+**Left uncommitted, out of scope, flagged rather than acted on:** the worktree
+also carried an untracked `scripts/verifyDocCitations.js` (74KB, well-written,
+portable cross-repo doc-citation CI gate — clearly a graduated version of the
+`scripts/wip/docCitations.needsWork.js` this branch's own `15f39d8` commit
+message describes as "left as a starting point, not a gate") that currently
+FAILS when run (locally flags real findings) and was never mentioned in this
+session's brief. Left untracked and unpushed — do not commit it blind, it
+needs its own review pass. Companion finding in the backend worktree: a
+"REVERT-PROVE INJECTION" test comment citing a fictitious
+`services/nonexistentGuardModule.js` was found appended to
+`services/bootRecoveryService.js` — almost certainly leftover scaffolding from
+whoever built that same doc-citations script, proving the two are from the
+same abandoned thread. Stripped before landing backend's fix; see backend's
+own `session.md`/commit `30fa281b` for detail.
+
+---
+
+*(Prior 2026-09-03 night, superseded by the landing above.)*
+
 **2026-09-03: VIDEO refs implementation, UNCOMMITTED, no push.** Packshot-protected
 ranking + raw catalog refs, both flag-off. Seed-text prompt machinery **stripped
 entirely** (not flag-gated): `OMNI_DIRECTIVES.noText` is the sole text directive;
