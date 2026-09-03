@@ -938,11 +938,12 @@ function cleanProductNameForDisplay(name, brandName = null) {
 // pipeline (routes/ads.js Veo path) and the manual trigger endpoint
 // (routes/brand.js) so meta shape stays consistent.
 //
-// opts.presetOverride — MUST match the preset resolveSpec will use for
-// the actual Remotion render. Funnel-variant ads pass the same value
-// from renderWithRemotionAndSave so the quote-slot bind list cannot
-// desync from the composition. When omitted, derived from ad.funnelStage
-// (PMax video only) so callers that only pass {ad, brand} still agree.
+// opts.presetOverride — explicit CLI/operator named preset (TIER 0).
+// opts.intentPreset — funnel-stage default floor (TIER 2.5), NOT a
+// whole-spec replace. renderWithRemotionAndSave passes the same pair so
+// the quote-slot bind list cannot desync from the composition. When
+// intentPreset is omitted, derived from ad.funnelStage so a solo
+// buildMetaForAd call still matches.
 async function buildMetaForAd(ad, brand, opts = {}) {
   // Load raw context docs. Every non-derived meta field is resolved
   // downstream by the cascade engine (services/metaCascadeResolver.js)
@@ -1076,7 +1077,11 @@ async function buildMetaForAd(ad, brand, opts = {}) {
       // BEFORE the provenance gate, matching the static path. MUST stay
       // declared on catalogProductSchema. lastQuoteFingerprint is the
       // replay key — siblings must not re-hash a different-length pool.
-      catalogProduct = await CatalogProduct.findById(ad.productId).select('title description price rating productReviews imageUrl titleStyleSpec categoryRef recentQuoteKeys lastQuoteRunId lastQuoteFingerprint').lean();
+      // shortBenefits: same CatalogProduct field the static Director reads.
+      // Without it the cascade's catalogProduct.shortBenefits source is
+      // permanently undefined (silent .select() omission) and video falls
+      // through to a stale LayoutInputArtifact.
+      catalogProduct = await CatalogProduct.findById(ad.productId).select('title description price rating productReviews imageUrl titleStyleSpec categoryRef recentQuoteKeys lastQuoteRunId lastQuoteFingerprint shortBenefits').lean();
     } catch { /* optional */ }
   }
 
@@ -1285,8 +1290,8 @@ async function buildMetaForAd(ad, brand, opts = {}) {
   // meta.quote` is WRONG: the live binding is a per-slot BIND LIST
   // (titleSpecValidator.DEFAULT_BIND.quote = ['quoteSnippet','quote']),
   // itself resolved per format via titleSpecService.resolveSpec's tier
-  // ladder (presetOverride -> ad/product/category/brand titleStyleSpec ->
-  // brand.titleStylePreset -> canonical), and the bind list is overridable
+  // ladder (explicit presetOverride -> persisted titleStyleSpec ->
+  // brand.titleStylePreset -> intentPreset -> canonical), and the bind list is overridable
   // per slot.
   // renderWithRemotionAndSave calls resolveSpec with these SAME inputs
   // moments after this function returns — reproduce that resolution here
@@ -1315,20 +1320,27 @@ async function buildMetaForAd(ad, brand, opts = {}) {
           categoriesForSpec = await loadCategoryChainForProduct(catalogProduct);
         } catch { /* spec still resolves via the preset/canonical tiers */ }
       }
-      // SAME preset the render path will use. renderWithRemotionAndSave
-      // passes its resolved override in opts; when absent we re-derive
-      // from ad.funnelStage so a solo buildMetaForAd call still matches.
-      let presetOverride = opts.presetOverride;
-      if (presetOverride === undefined) {
+      // SAME spec the render path will use. Explicit presetOverride
+      // (CLI --preset=) is TIER 0; funnel stage is intentPreset (TIER 2.5
+      // floor), never a whole-spec replace. When omitted we re-derive the
+      // intent floor from ad.funnelStage so a solo buildMetaForAd call
+      // still matches renderWithRemotionAndSave.
+      const presetOverride = opts.presetOverride != null && String(opts.presetOverride).trim() !== ''
+        ? String(opts.presetOverride).trim()
+        : null;
+      let intentPreset = opts.intentPreset;
+      if (intentPreset === undefined) {
         try {
           const { resolveFunnelPresetOverride } = require('./campaignAdsGenerationService');
-          presetOverride = resolveFunnelPresetOverride(ad);
+          intentPreset = resolveFunnelPresetOverride(ad);
         } catch {
-          presetOverride = null;
+          intentPreset = null;
         }
       }
+      if (presetOverride) intentPreset = null;
       const { spec: resolvedTitleSpec } = resolveSpec({
-        brand, product: catalogProduct, ad, format, categories: categoriesForSpec, presetOverride,
+        brand, product: catalogProduct, ad, format, categories: categoriesForSpec,
+        presetOverride, intentPreset,
       });
       const quoteSlot = resolvedTitleSpec?.slots?.find((s) => s.key === 'quote') || null;
       if (quoteSlot) {
@@ -2355,27 +2367,28 @@ async function renderWithRemotionAndSave({ ad, brand, format, presetOverride = n
   const { resolveSpec, buildBrandTokens } = require('./titleSpecService');
   const { renderTitles } = require('./remotionRenderService');
 
-  // Resolve the funnel preset ONCE and thread it into BOTH consumers:
-  // buildMetaForAd (quote-slot bind / social-proof gate) and resolveSpec
-  // (actual composition). If only the render path got the override the
-  // bind list would desync from the titled output. Explicit arg wins;
-  // else ad.funnelStage → canonical-<stage>-pmax10 for PMax video.
-  let resolvedPreset = presetOverride;
-  if (resolvedPreset == null) {
-    try {
-      const { resolveFunnelPresetOverride } = require('./campaignAdsGenerationService');
-      resolvedPreset = resolveFunnelPresetOverride(ad);
-    } catch {
-      resolvedPreset = null;
-    }
+  // Explicit named-preset arg (CLI --preset=) is TIER 0. Funnel stage is
+  // NOT a whole-spec replace: it is the intent floor (TIER 2.5) so a
+  // persisted Title Studio spec actually applies to staged ads. Thread
+  // BOTH into buildMetaForAd and resolveSpec so the quote-slot bind list
+  // cannot desync from the composition.
+  const resolvedPreset = presetOverride != null && String(presetOverride).trim() !== ''
+    ? String(presetOverride).trim()
+    : null;
+  let intentPreset = null;
+  try {
+    const { resolveFunnelPresetOverride } = require('./campaignAdsGenerationService');
+    intentPreset = resolveFunnelPresetOverride(ad);
+  } catch {
+    intentPreset = null;
   }
+  if (resolvedPreset) intentPreset = null;
 
-  const meta = await buildMetaForAd(ad, brand, { presetOverride: resolvedPreset });
-  // Resolve the spec for RENDER. One cascade, shared with Title Studio:
-  // presetOverride (argument only, never persisted) → persisted
-  // ad/product/category/brand titleStyleSpec → brand.titleStylePreset →
-  // canonical. Product/category are fetched so a per-product or per-
-  // category spec can win when present.
+  const meta = await buildMetaForAd(ad, brand, { presetOverride: resolvedPreset, intentPreset });
+  // Resolve the spec for RENDER. Cascade: explicit presetOverride →
+  // persisted ad/product/category/brand titleStyleSpec → brand.titleStylePreset
+  // → intentPreset (funnel floor) → canonical. Product/category are
+  // fetched so a per-product or per-category spec can win when present.
   let productForSpec = null;
   let categories = [];
   if (ad.productId) {
@@ -2388,10 +2401,29 @@ async function renderWithRemotionAndSave({ ad, brand, format, presetOverride = n
       }
     } catch { /* non-fatal — falls back to brand/canonical */ }
   }
-  // SAME resolvedPreset that buildMetaForAd used for the quote gate.
-  const { spec, source } = resolveSpec({
-    brand, product: productForSpec, ad, format, categories, presetOverride: resolvedPreset,
+  // SAME pair that buildMetaForAd used for the quote gate.
+  const resolved = resolveSpec({
+    brand, product: productForSpec, ad, format, categories,
+    presetOverride: resolvedPreset, intentPreset,
   });
+  const { applyBenefitsPlacement } = require('./videoBenefitsDirector');
+  const placed = applyBenefitsPlacement({
+    spec: resolved.spec,
+    meta,
+    format,
+    direction: ad.videoTitleDirection,
+  });
+  const spec = placed.spec;
+  const source = placed.sourceSuffix
+    ? `${resolved.source}+${placed.sourceSuffix}`
+    : resolved.source;
+  if (placed.decision && placed.decision.reason !== 'flag-off') {
+    console.log(
+      `🎬 benefits[ad=${ad._id}]: include=${placed.decision.include} reason=${placed.decision.reason}` +
+      (placed.decision.phase ? ` phase=${placed.decision.phase}` : '') +
+      (placed.decision.surface ? ` surface=${placed.decision.surface}` : '')
+    );
+  }
   // Same LayoutInputArtifact tier buildMetaForAd uses — brands without
   // explicit color/font fields still inherit the creative director's
   // brand block (input.brand.primary_color / font_family / …).

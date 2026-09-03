@@ -36,9 +36,18 @@
  * WHAT THIS PROTECTS. A mixed Meta+PMax run used to pay for THREE Omni
  * masters per product — meta_stories_9_16, pmax_video_9_16, pmax_video_16_9
  * — at a measured $0.90 each ($2.70). Two of those are the same 9:16 plate
- * at byte-identical delivery dims. When conjunct 4 (the hook-first camera
- * switch) is ON, ONE portrait plate is minted and the PMax portrait family
- * derives from it for free, so a mixed run pays $1.80 instead.
+ * at byte-identical delivery dims. ONE portrait plate is minted and the
+ * PMax portrait family derives from it for free, so a mixed run pays $1.80
+ * instead of $2.70. 16:9 stays a separate billable master.
+ *
+ * ⚠️ CONJUNCT 4 REMOVED, 2026-09-03 — owner: mint a single 9:16 master
+ * for Meta+PMax regardless of hook-first. The live (non-hook-first)
+ * prompt is the shared camera; PMax vs Meta differences stay in TITLING.
+ * VIDEO_HOOK_FIRST_PROMPT / PMAX_VIDEO_DIRECTIVES stay false and are
+ * irrelevant to this decision. Sharing still fails closed on: kill
+ * switch off, Meta master not in this run, PMax portrait not in this
+ * run, Meta 10s floor off. Camera-prompt inequality no longer bills a
+ * second 9:16.
  *
  * Offline: no DB, no network, no API key.
  */
@@ -119,9 +128,15 @@ const PROD_ENV = { PMAX_FUNNEL_VARIANTS: 'true', META_VIDEO_DERIVATIVES: 'true',
   UNIFIED_VIDEO_9_16_MASTER: 'true', META_VIDEO_DURATION_SEC: undefined,
   VIDEO_HOOK_FIRST_PROMPT: undefined, PMAX_VIDEO_DIRECTIVES: undefined };
 
-const shared = (fn) => withPromptModule(HOOK_ON, () => withEnv(PROD_ENV, fn));
-const unshared = (fn) =>
-  withPromptModule(HOOK_OFF_PROFILES_EQUAL, () => withEnv(PROD_ENV, fn));
+function stripComments(src) {
+  return String(src).replace(/\/\*[\s\S]*?\*\//g, '').replace(/(^|[^:])\/\/.*$/gm, '$1');
+}
+
+// Sharing no longer depends on the prompt module. PROD_ENV (kill switch
+// on, Meta 10s floor on, both masters in the run) is sufficient.
+const shared = (fn) => withEnv(PROD_ENV, fn);
+const killed = (fn) => withEnv(
+  { PMAX_FUNNEL_VARIANTS: 'true', UNIFIED_VIDEO_9_16_MASTER: 'false' }, fn);
 
 const plan  = (masters) => svc.planDeterministicVideoAds(masters);
 const bill  = (p) => p.filter((r) => r.billable);
@@ -243,11 +258,11 @@ check('A4 [MONEY] resolvePortraitMasterFormat is DEFINED once and CALLED once',
     p.filter((r) => r.platformFormat === META_MASTER && !r.funnelStage).length === 1,
     'two portrait masters would be the double-mint this change exists to remove');
 
-  const q = unshared(() => plan(MIXED));
+  const q = killed(() => plan(MIXED));
   const qMasters = new Set(q.filter((r) => !r.deriveFromMaster).map((r) => r.platformFormat));
-  check('D4 unshared mixed run: no orphan derives either',
+  check('D4 kill-switch mixed run: no orphan derives either',
     q.filter((r) => r.deriveFromMaster && !qMasters.has(r.deriveFromMaster)).length === 0);
-  check('D4a unshared mixed run: the 1:1 rides PMax\'s own 9:16',
+  check('D4a kill-switch mixed run: the 1:1 rides PMax\'s own 9:16',
     rowsOf(q, PMAX_1_1).every((r) => r.deriveFromMaster === PMAX_9));
 }
 
@@ -276,7 +291,7 @@ check('A4 [MONEY] resolvePortraitMasterFormat is DEFINED once and CALLED once',
 
   const floorOff = { META_VIDEO_DURATION_SEC: '0',
     PMAX_FUNNEL_VARIANTS: 'true', UNIFIED_VIDEO_9_16_MASTER: 'true' };
-  const withFloorOff = (fn) => withPromptModule(HOOK_ON, () => withEnv(floorOff, fn));
+  const withFloorOff = (fn) => withEnv(floorOff, fn);
   check('E3 [MONEY/SOUNDNESS] Meta floor OFF ⇒ sharing refuses (bills 3, ships nothing broken)',
     withFloorOff(() => svc.resolvePortraitMasterFormat(MIXED)) === PMAX_9,
     'with no Meta floor a shared plate is an 8s PAID render Google rejects — '
@@ -284,9 +299,9 @@ check('A4 [MONEY] resolvePortraitMasterFormat is DEFINED once and CALLED once',
   check('E3a and that arm really does bill 3 again',
     withFloorOff(() => bill(plan(MIXED)).length) === 3);
   check('E3a2 [PREMISE] and every OTHER conjunct is satisfied in that arm',
-    withPromptModule(HOOK_ON, () => withEnv(
+    withEnv(
       { PMAX_FUNNEL_VARIANTS: 'true', UNIFIED_VIDEO_9_16_MASTER: 'true' },
-      () => svc.resolvePortraitMasterFormat(MIXED))) === META_MASTER,
+      () => svc.resolvePortraitMasterFormat(MIXED)) === META_MASTER,
     'if this fails, E3/E3a are passing for the wrong reason — something other '
     + 'than the Meta floor is already blocking the share');
   check('E3b the Meta floor is still revertible with no deploy',
@@ -301,79 +316,53 @@ check('A4 [MONEY] resolvePortraitMasterFormat is DEFINED once and CALLED once',
     'the universal floor replaced it; two duration rules would drift');
 }
 
-// ── F. [MONEY] every conjunct of the gate fails closed ─────────────────
+// ── F. [MONEY] sharing is unconditional on camera / hook-first ─────────
 {
-  check('F1 [MONEY] camera standardization OFF ⇒ NO sharing (2 bills become 3)',
-    unshared(() => bill(plan(MIXED)).length) === 3,
-    'sharing a plate that was not shot with the standardized camera delivers '
-    + 'Meta\'s pan to YouTube Shorts');
-  check('F1a and the coherence probe reports it honestly',
-    unshared(() => svc.isSharedPortraitPlatePromptCoherent()) === false
-      && shared(() => svc.isSharedPortraitPlatePromptCoherent()) === true);
-  check('F2 the gate is a real probe of veoPromptBuilder, not a constant',
-    /require\(['"]\.\/veoPromptBuilder['"]\)/.test(svcSrc)
-      && /isHookFirstVideoPromptEnabled/.test(svcSrc),
-    'a hard-coded true here removes the only protection against a plate '
-    + 'that was shot for the wrong destination');
+  const resolveFn = svcSrc.slice(
+    svcSrc.indexOf('function resolvePortraitMasterFormat'),
+    svcSrc.indexOf('function planDeterministicVideoAds')
+  );
+  check('F2 [MONEY] resolvePortraitMasterFormat does not call camera coherence',
+    !/isSharedPortraitPlatePromptCoherent\s*\(/.test(stripComments(resolveFn)),
+    're-adding the conjunct re-opens $2.70 mixed runs when cameras diverge');
+  check('F2a hook-first switch is not read inside the sharing decision',
+    !/isHookFirstVideoPromptEnabled/.test(stripComments(resolveFn))
+      && !/VIDEO_HOOK_FIRST_PROMPT/.test(stripComments(resolveFn))
+      && !/PMAX_VIDEO_DIRECTIVES/.test(stripComments(resolveFn)));
 
-  check('F6 [MONEY] switch OFF but profiles EQUAL ⇒ still refuses to share',
-    withPromptModule(HOOK_OFF_PROFILES_EQUAL, () => withEnv(PROD_ENV, () => {
-      const profilesAgree =
-        HOOK_OFF_PROFILES_EQUAL.promptProfileFor(null, { platformFormat: META_MASTER })
-        === HOOK_OFF_PROFILES_EQUAL.promptProfileFor(null, { platformFormat: PMAX_9 });
-      return profilesAgree
-        && svc.isSharedPortraitPlatePromptCoherent() === false
-        && svc.resolvePortraitMasterFormat(MIXED) === PMAX_9
-        && bill(plan(MIXED)).length === 3;
+  check('F1 [MONEY] hook-first OFF + mixed ⇒ SHARES, bills 2 (shipped config)',
+    withPromptModule(HOOK_OFF_PROFILES_EQUAL, () => withEnv(PROD_ENV, () =>
+      svc.resolvePortraitMasterFormat(MIXED) === META_MASTER
+      && bill(plan(MIXED)).length === 2)),
+    'shipped VIDEO_HOOK_FIRST_PROMPT=false must not cost a second 9:16');
+  check('F1b hook-first ON + mixed ⇒ still shares, bills 2',
+    withPromptModule(HOOK_ON, () => withEnv(PROD_ENV, () =>
+      svc.resolvePortraitMasterFormat(MIXED) === META_MASTER
+      && bill(plan(MIXED)).length === 2)));
+  check('F6 [MONEY] cameras genuinely DIFFER ⇒ still SHARES, bills 2',
+    withPromptModule(HOOK_ON_PROFILES_DIFFER, () => withEnv(PROD_ENV, () => {
+      const profilesDiffer =
+        HOOK_ON_PROFILES_DIFFER.promptProfileFor(null, { platformFormat: META_MASTER })
+        !== HOOK_ON_PROFILES_DIFFER.promptProfileFor(null, { platformFormat: PMAX_9 });
+      return profilesDiffer
+        && svc.resolvePortraitMasterFormat(MIXED) === META_MASTER
+        && bill(plan(MIXED)).length === 2;
     })),
-    'equality-only gating is vacuous — it is TRUE in both switch states, so '
-    + 'it gates nothing at all once the prompt lane lands');
-  check('F6a the load-bearing conjunct is the SWITCH, not profile equality',
-    /isHookFirstVideoPromptEnabled\(\) !== true/.test(svcSrc),
-    'the gate must ask "did both get the standardized camera?", not merely '
-    + '"do both agree?"');
-  check('F6b a missing switch export fails CLOSED (bills rather than shares)',
-    withPromptModule(
-      { promptProfileFor: () => 'hook_first', directivesForProfile: () => ({}) },
-      () => withEnv(PROD_ENV, () => svc.isSharedPortraitPlatePromptCoherent())
-    ) === false,
-    'an older veoPromptBuilder without the export must not unlock free 9:16');
-  check('F6c a throwing switch fails CLOSED',
-    withPromptModule(
-      { isHookFirstVideoPromptEnabled: () => { throw new Error('boom'); },
-        promptProfileFor: () => 'hook_first', directivesForProfile: () => ({}) },
-      () => withEnv(PROD_ENV, () => svc.isSharedPortraitPlatePromptCoherent())
-    ) === false);
-  check('F6d switch ON but a destination escaped it ⇒ still refuses (belt-and-braces)',
-    withPromptModule(HOOK_ON_PROFILES_DIFFER,
-      () => withEnv(PROD_ENV, () => svc.isSharedPortraitPlatePromptCoherent())) === false,
-    'the equality comparison is retained as a SECOND conjunct and must still bite');
-  const svcCode = svcSrc
-    .replace(/\/\*[\s\S]*?\*\//g, '')
-    .replace(/(^|[^:])\/\/.*$/gm, '$1');
-  check('F6e the two switch env names are NOT re-implemented here',
-    !/process\.env\.VIDEO_HOOK_FIRST_PROMPT/.test(svcCode)
-      && !/process\.env\.PMAX_VIDEO_DIRECTIVES/.test(svcCode)
-      && !/process\.env\[/.test(svcCode),
-    'duplicating the switch parsing is exactly the drift this file argues '
-    + 'against — the legacy-alias fail-safe OR must have exactly one owner');
-  check('F5 the gate survives the REAL veoPromptBuilder on disk',
-    typeof svc.isSharedPortraitPlatePromptCoherent() === 'boolean');
-  const killed = (fn) => withPromptModule(HOOK_ON, () => withEnv(
-    { PMAX_FUNNEL_VARIANTS: 'true', UNIFIED_VIDEO_9_16_MASTER: 'false' }, fn));
+    'owner 2026-09-03: one 9:16 master regardless of hook-first / camera name');
+  check('F6env VIDEO_HOOK_FIRST_PROMPT=false does not change the mixed bill',
+    withEnv({ ...PROD_ENV, VIDEO_HOOK_FIRST_PROMPT: 'false', PMAX_VIDEO_DIRECTIVES: 'false' },
+      () => bill(plan(MIXED)).length) === 2);
+  check('F6envOn VIDEO_HOOK_FIRST_PROMPT=true does not change the mixed bill',
+    withEnv({ ...PROD_ENV, VIDEO_HOOK_FIRST_PROMPT: 'true', PMAX_VIDEO_DIRECTIVES: 'true' },
+      () => bill(plan(MIXED)).length) === 2);
+
   check('F3 [MONEY] UNIFIED_VIDEO_9_16_MASTER=false restores 3 billable masters',
     killed(() => bill(plan(MIXED)).length) === 3);
-  check('F3a and flag-off is byte-identical to the unshared plan',
-    JSON.stringify(killed(() => plan(MIXED)))
-      === JSON.stringify(unshared(() => plan(MIXED))));
   check('F3b [PREMISE] the kill switch is genuinely what refuses in F3',
-    withPromptModule(HOOK_ON, () => withEnv(
+    withEnv(
       { PMAX_FUNNEL_VARIANTS: 'true', UNIFIED_VIDEO_9_16_MASTER: 'true' },
-      () => svc.resolvePortraitMasterFormat(MIXED))) === META_MASTER,
+      () => svc.resolvePortraitMasterFormat(MIXED)) === META_MASTER,
     'with the switch back on the same config must SHARE, or F3 proves nothing');
-  check('F4 [MONEY] the coherence probe is wrapped so a throw means DO NOT SHARE',
-    /catch\s*\([\s\S]{0,40}\)\s*\{\s*return false;/.test(svcSrc),
-    'an exception must not be able to unlock free 9:16');
 }
 
 // ── G. Untouched neighbours ────────────────────────────────────────────
@@ -585,7 +574,8 @@ if (failures.length) {
   process.exit(1);
 }
 console.log(`✅ verifySharedPortraitMaster: ${passed}/${total} checks passed`);
-console.log('   mixed run = 21 ads / 2 billable when hook-first is ON ($1.80); ' +
-  '3 billable when OFF ($2.70)');
+console.log('   mixed run = 21 ads / 2 billable ($1.80) unconditionally ' +
+  '(hook-first ON or OFF); 3 billable ($2.70) only when UNIFIED_VIDEO_9_16_MASTER=false ' +
+  'or the Meta 10s floor is off');
 console.log('   PMax-only = 9 ads / 2 billable (fail-closed, unchanged)');
 console.log('   Meta-only = 12 ads / 1 billable (unchanged)');

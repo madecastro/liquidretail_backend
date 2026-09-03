@@ -1,15 +1,15 @@
 {
   "version": 2,
   "backendRef": "origin/main",
-  "backendHead": "01a62e865a69d1d9e7fb21f0b0e9f23283c04bc7",
-  "generatedAt": "2026-09-03T19:44:03.150Z",
+  "backendHead": "fba815887c3240d617c9c3a1bbfd6daecd791215",
+  "generatedAt": "2026-09-03T20:26:35.708Z",
   "files": {
     "models/Ad.js": {
-      "backendHash": "e97c8737fdbc8c630cd027fddcd7dbd84636395a0b1af55f21c12703dd41b72d",
-      "adgenHash": "0816d6f2989c80acb773886417c485be9d3b4ce890a58ce46a635f80b9261d1d",
-      "backendSha": "81b93a3e0dd7d1e0cb332a03e48bf4b4bd12d7e2",
+      "backendHash": "812961d1ad30f5f87891dcace58fbe44ce5e07a5789f34b927fe8208dc2db966",
+      "adgenHash": "aca8e06a9d335d1ba97de600bdabc1dae8430c750f2b988d4b5b64b31cf7ccf6",
+      "backendSha": "fba815887c3240d617c9c3a1bbfd6daecd791215",
       "status": "fork",
-      "reason": "PR #110: veoProvider/veoResolution now declared on both repos (backend PR #384/#385 merged), closing THIS PR's own new debt. Re-diffed the full file against backend origin/main: the retitle-handoff fields owed since 2026-08-28 (retitleRequest/retitleClaimedByWorker/retitleClaimedAt/retitleResult) are also now present on backend (paired backend PR #359 landed), and titlingNeeded/titlingAttempts/renderError stderr-stdout tails are all present on both sides too -- confirmed by grep against backend origin/main, satisfying verifyModelParity's adgen-schema-paths-subset-of-backend rule. Remaining differences are legitimate ongoing fork divergence: backend-only qcOverridden/qcOverriddenAt/qcOverriddenBy/qcOverrideReason and a stageTiming planned-expansion comment (neither needed by adgen), plus independently-worded comments on fields both sides share. Genuinely not a debt any more -- downgrading rather than re-attesting a closed obligation."
+      "reason": "PR #386: added Ad.videoTitleDirection (mint stamp, Mixed). Remaining differences are legitimate ongoing fork divergence (adgen-only titling/QC comments and fields backend does not need)."
     },
     "models/Advertiser.js": {
       "backendHash": "0a7e1bb9ca5e0fbbfc6972f9c96d87f839b0a86175831b5446ae27095137ba3f",
@@ -93,12 +93,10 @@
       "owedSince": null
     },
     "models/CatalogProduct.js": {
-      "backendHash": "c4ea01fde561687af7fcb2ce0c7bd22df82ecfb5fcc953ce483d2e91168c8561",
-      "adgenHash": "c4ea01fde561687af7fcb2ce0c7bd22df82ecfb5fcc953ce483d2e91168c8561",
-      "backendSha": "8db473c665169c97bcbb57170f7ff41786de484d",
-      "status": "synced",
-      "portTo": null,
-      "owedSince": null
+      "backendHash": "53ddad6046cb0de67a74ab33bbf045b82c2a8e9371d398a3554b71ccdc475fc1",
+      "adgenHash": "53ddad6046cb0de67a74ab33bbf045b82c2a8e9371d398a3554b71ccdc475fc1",
+      "backendSha": "47be257c468e85c3f1d1c562abd087ea8625e98c",
+      "status": "synced"
     },
     "models/Category.js": {
       "backendHash": "58e0c5c2b9b4bae826ef12adf04425b52d527818b2968191633c4bf4b2218583",
@@ -677,13 +675,11 @@
       "owedSince": null
     },
     "services/aiCreativeDirectorService.js": {
-      "backendHash": "38f01d5f9dbb060b8e51aea2b94d9a1459dd001bf1228cae8abc6ac1309193ec",
+      "backendHash": "8fe6c33a1a2690393ec7e80aa903f052a25334c5a4833eb10b86b292435a270c",
       "adgenHash": "4aafee2c1d7cc90487d59d1983df38c0e6b7fb872315cc980161818486decc22",
-      "backendSha": "d8c133011275d62fa4133ed939b5e47fe5e90bdc",
+      "backendSha": "fba815887c3240d617c9c3a1bbfd6daecd791215",
       "status": "fork",
-      "reason": "comment-only: the reserved proof-led slot's correction 1 is annotated for adgen's ADGEN-ONLY social_proof_led eligibility widening (STATIC_SOCIAL_PROOF_QUOTE_ELIGIBLE, PR #34). Backend eligibility is still rating-only, so the original unqualified wording is still accurate THERE and must not be ported back. No behaviour change either side.",
-      "portTo": null,
-      "owedSince": null
+      "reason": "2026-09-03: deliberately did not port backend PR #386's static COPY prompt tightening (product_signal.benefits 'never invent' clause). Adgen does not mint static ads / does not run the Director round — expansion stays backend. Remaining fork is the pre-existing comment-only reserved-proof-slot annotation (PR #34 ADGEN-ONLY eligibility widening) plus that static-prompt delta."
     },
     "services/aiCreativeV2Helpers.js": {
       "backendHash": "52130701af3ed3c383e084355cf898e48bd170e072fc3df193b9948416e2c013",
@@ -879,11 +875,11 @@
       "owedSince": null
     },
     "services/brandScriptExecutor.js": {
-      "backendHash": "2aae3041e3c3c3e7f554f1135879f6f2005a17e8a371d9dea52cec58911bd4c4",
-      "adgenHash": "af9dd873705357969ca8ec3bce4852ed2922442f8714df931aba6652d70b15ba",
-      "backendSha": "2b58cf31766b6ecf9fde711770c87dc2174cbd29",
+      "backendHash": "4ca8f1429054d0783488a89f44ef2dcad0f9b7f2a7f85087836133d7c8ab691c",
+      "adgenHash": "50a7173a48dddcbd691d4fcf748156363d00e81d2516a81446e176c887a19af5",
+      "backendSha": "fba815887c3240d617c9c3a1bbfd6daecd791215",
       "status": "unported",
-      "reason": "2026-09-03: adgen-ONLY doc-comment update on renderBrandScriptAndSave's retitleMode header -- runVideoFull no longer passes retitleMode (that expansion was reverted); recascadeDerivativeSibling still always-true. No functional change to this file. Pre-existing debt UNCHANGED: backend's manual retitle path still lacks stampTitlingFailureAndThrow/TITLING_ATTEMPTS_MAX. owedSince carries forward for the titling-attempts gap only.",
+      "reason": "2026-09-03: ported backend PR #386 applyBenefitsPlacement into renderWithRemotionAndSave (covers renderer + titler + retitle + regenerate), plus intentPreset TIER 2.5 wiring and CatalogProduct.shortBenefits .select(). Pre-existing debt UNCHANGED: backend's manual retitle path still lacks stampTitlingFailureAndThrow/TITLING_ATTEMPTS_MAX. owedSince carries forward for the titling-attempts gap only.",
       "portTo": "backend",
       "owedSince": "2026-08-28T17:47:48.113Z"
     },
@@ -980,11 +976,11 @@
       "owedSince": null
     },
     "services/campaignAdsGenerationService.js": {
-      "backendHash": "6e11c80c71596c2a947254d9b70fcdd27e27d0edc8d73578f4992909b0f6aa51",
-      "adgenHash": "325c8489b3ae9fe873fa7082def68ac5ecb3f1cb0f7922ffe3bc83b6815cfa7f",
-      "backendSha": "659ed76cbddcaf7d16fd6ab86e68d498e6140cce",
+      "backendHash": "56f4e86e8ee520eee292f2d83e7f111a3d492a44033e94b79fcb62418299a79d",
+      "adgenHash": "6104d41ec534afd0c2c45fd6502413a5d35a0a8d1343f7ed58dcc202191ae4b2",
+      "backendSha": "fba815887c3240d617c9c3a1bbfd6daecd791215",
       "status": "unported",
-      "reason": "exported isGooglePmaxVideoFormat (was module-private) so the regenerate-cascade fix could join PMax video-duration identity without duplicating the format-set predicate. Pure additive export, no behavior change to any existing caller. Equivalent export landed in backend PR #380's matching file in the same session.",
+      "reason": "2026-09-03: ported backend PR #386 sharing (removed hook-first conjunct from resolvePortraitMasterFormat) + mint-time videoTitleDirection stamp. Remaining debt UNCHANGED: backend-only isMasterVideoAd (frontend Master badge, not used by adgen) and isSharedPortraitPlatePromptCoherent body still on the pre-2026-08-26 hook-first-inside-function shape (dead for sharing — the decision no longer calls it). owedSince carries forward.",
       "portTo": "backend",
       "owedSince": "2026-08-28T17:44:28.333Z"
     },
@@ -1328,12 +1324,10 @@
       "owedSince": null
     },
     "services/metaCascadeConfig.js": {
-      "backendHash": "991b6974b18190bd16dc1902ed8b05dcfb9b06ae3d0f734d387abfe1a012a1fe",
-      "adgenHash": "991b6974b18190bd16dc1902ed8b05dcfb9b06ae3d0f734d387abfe1a012a1fe",
-      "backendSha": "119b668472c4dffbdb63c3d3dc588a16b9573103",
-      "status": "synced",
-      "portTo": null,
-      "owedSince": null
+      "backendHash": "5605fea3914ab15d6b5783cd8d1db29b51d9ab870de098133a5d5bf5a228b9e5",
+      "adgenHash": "5605fea3914ab15d6b5783cd8d1db29b51d9ab870de098133a5d5bf5a228b9e5",
+      "backendSha": "fba815887c3240d617c9c3a1bbfd6daecd791215",
+      "status": "synced"
     },
     "services/metaCascadeResolver.js": {
       "backendHash": "5eb1c61fd3c9d19b79c832f93a31153b4597f7fedc0d4a06c800a7186573063c",
@@ -1807,12 +1801,17 @@
       "portTo": null,
       "owedSince": null
     },
+    "services/titleSpecContentSample.js": {
+      "backendHash": "328b969d654c1e128ac5800c2c45088f8bb553b75bf0736f006fafb8cc17decc",
+      "adgenHash": "328b969d654c1e128ac5800c2c45088f8bb553b75bf0736f006fafb8cc17decc",
+      "backendSha": "fba815887c3240d617c9c3a1bbfd6daecd791215",
+      "status": "synced"
+    },
     "services/titleSpecService.js": {
-      "backendHash": "8a917f9e8acec42c94bca8db1f13effe9fab96e464d051c8d2ab308a0b60286d",
-      "adgenHash": "df5e154caaf47627d828f48b06c92bde8d9b1b06fefd7f22bda7eda42b216e28",
-      "backendSha": "d646c2fde5ef64ccb83ea0c464dbd893a041228e",
-      "status": "fork",
-      "reason": "2026-09-03: ported backend's TITLE_SPEC_IGNORE_PERSISTED removal (always-honour persisted specs — 0 persisted specs found in prod audit, so the flag guarded an empty population). Byte-identical to backend."
+      "backendHash": "fb96be0a835499e35fb0d725163fc07dac7b8708499af46fc5ec960e53f0be80",
+      "adgenHash": "fb96be0a835499e35fb0d725163fc07dac7b8708499af46fc5ec960e53f0be80",
+      "backendSha": "fba815887c3240d617c9c3a1bbfd6daecd791215",
+      "status": "synced"
     },
     "services/titleSpecValidator.js": {
       "backendHash": "a5115a6bea073308c780d5cd3cdeb51dbdd948272d34af780f2365dc1c40b122",
@@ -1844,6 +1843,12 @@
       "status": "synced",
       "portTo": null,
       "owedSince": null
+    },
+    "services/videoBenefitsDirector.js": {
+      "backendHash": "c7bababe519779b52488a8f22c793188cfd90c37eb67d1f2efc52b7fc6ba7758",
+      "adgenHash": "c7bababe519779b52488a8f22c793188cfd90c37eb67d1f2efc52b7fc6ba7758",
+      "backendSha": "fba815887c3240d617c9c3a1bbfd6daecd791215",
+      "status": "synced"
     },
     "services/videoCompositeService.js": {
       "backendHash": "5f146c94b3f93c548e34d50fe1a7d2be725e17975c0094669f92030e484d6625",

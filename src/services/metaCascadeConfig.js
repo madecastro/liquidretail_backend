@@ -152,6 +152,10 @@ const DEFAULT_META_CASCADES = {
     { type: 'literal', value: [] },
   ],
   benefits: [
+    // CatalogProduct.shortBenefits is the same source the static Director
+    // reads (assembleSignals). LayoutInput is a fallback for historical
+    // artifacts derived before the catalog field existed.
+    { type: 'doc', doc: 'catalogProduct', path: 'shortBenefits' },
     { type: 'doc', doc: 'layoutInput', path: 'input.product.short_benefits' },
     { type: 'doc', doc: 'layoutInput', path: 'input.product.benefits' },
     { type: 'literal', value: [] },
