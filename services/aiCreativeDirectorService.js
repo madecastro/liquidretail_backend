@@ -49,6 +49,7 @@ const {
 const { formatBrandReviewsText, formatProductReviewsText } = require('./ratingDisplay');
 const { resolveDirectorProductRatingPair } = require('./ratingPairAtomic');
 const { ratingFurnitureEnabled, copyFailsCompliance } = require('./adCopyGuards');
+const { normalizeBenefitList } = require('./titleSpecContentSample');
 
 // Master switch for the proof MENU (category tier + social_proof_signal.
 // proof_options[] + routing.proof_pick). Default OFF: assembleSignals'
@@ -77,6 +78,18 @@ function directorQuotePoolAlignedEnabled() {
 // Flag-off Meta prompt/schema stay byte-identical.
 function directorFunnelStageAllEnabled() {
   return String(process.env.DIRECTOR_FUNNEL_STAGE_ALL || 'false').toLowerCase() === 'true';
+}
+
+// DIRECTOR_PRODUCT_BENEFITS (default true in config/defaults.env).
+// Parser is strictly === 'true' — a truthy check would let the string
+// "false" enable it (CLAUDE.md §4). Unset (no file, no dashboard) is OFF,
+// so existing harnesses that don't load defaults.env keep the pre-change
+// prompt. File default is true, so a real boot with dotenv is ON.
+// Flag-off OMITS product_signal.benefits (the key itself, not []) AND
+// omits the two prompt sentences — byte-identical to the pre-change
+// buildPromptRound output.
+function directorProductBenefitsEnabled() {
+  return process.env.DIRECTOR_PRODUCT_BENEFITS === 'true';
 }
 
 function shouldEmitFunnelStage(platformFormat) {
@@ -395,7 +408,8 @@ const MAX_TOKENS  = 3500;         // bumped from 2000 — each concept ~300-400 
 // invalidates existing CreativeDirectionArtifact rows so the Director
 // re-runs and emits the new count / shape. Mirrors aiCanvasSpec-
 // Service.SPEC_SCHEMA_VERSION.
-const DIRECTOR_SIGNALS_VERSION = '3.4.0';   // BUMPED 2026-08-12: aligned proof_options pool + quotes_by_stage (QUOTE_STAGE_AWARE).
+const DIRECTOR_SIGNALS_VERSION = '3.5.0';   // BUMPED 2026-09-03: product_signal.benefits from CatalogProduct.shortBenefits (DIRECTOR_PRODUCT_BENEFITS). Same product → same brief on first generate and every regenerate; empty until ingest/backfill has derived. Never a derivation, never an artifact read.
+// 3.4: aligned proof_options pool + quotes_by_stage (QUOTE_STAGE_AWARE).
 // 3.3: PMax-only round brief adds FUNNEL SPREAD (one concept each of awareness /
 // consideration / conversion via routing.funnel_stage) and SOCIAL-PROOF HIERARCHY
 // (one dominant proof element; env-backed rating/count thresholds). Meta prompts
@@ -720,7 +734,6 @@ async function assembleSignals({ brandId, productId, campaignKind, seededUnivers
     price:          product?.price ?? null,
     currency:       product?.currency    || null,
     availability:   product?.availability || null,
-    // shortBenefits is not on CatalogProduct schema (always sent []); benefits would have to come from the layout derivation artifact instead.
     review_summary: snippetText(product?.reviewSummary?.summary || product?.productReviews?.summary, 240),
     // REAL PRODUCT FACTS — fabric, fit, construction, care, dimensions.
     // `product` is loaded with a bare findById().lean() (no projection), so
@@ -735,6 +748,29 @@ async function assembleSignals({ brandId, productId, campaignKind, seededUnivers
                     campaignKind === 'brand'   ? 'medium' :
                     'medium'
   };
+
+  // OPTIONAL derived benefits. Flag-off omits the key entirely (same trick
+  // as category_signal below) so buildPromptRound + JSON.stringify of the
+  // signal is byte-identical to the pre-change shape. Flag-on always sets
+  // an array (never null) so the prompt can test `.length`.
+  //
+  // Source is CatalogProduct.shortBenefits, persisted once at ingest.
+  // `product` is loaded with a bare findById().lean() (no projection) at
+  // :641-644, so shortBenefits is already in memory on every Director
+  // call — the same "already in memory and simply never forwarded"
+  // situation the specs comment above describes. ZERO added I/O. This
+  // function is a pure function of the product doc for this field: no
+  // LayoutInputArtifact, no render history, same product → same brief
+  // on first generate and every regenerate.
+  //
+  // MONEY: assembleSignals runs on EVERY live directConceptsRound with
+  // NO cache gate. Do not derive here. Do not read LayoutInputArtifact.
+  // Empty until ingest/backfill has written the field → [] — full stop.
+  if (directorProductBenefitsEnabled()) {
+    productSignal.benefits = productId
+      ? normalizeBenefitList(product?.shortBenefits)
+      : [];
+  }
 
   // ── Category signal — new tier, previously absent from the Director brief
   // entirely. Only key that ever gets omitted outright (not just null-valued)
@@ -2993,7 +3029,9 @@ function buildPromptRound({ inputSummary, creativeIntent, platformFormat, univer
     `    social_proof_led  → a specific quote, PRODUCT TIER FIRST. Only proof_options[] entries with tier="product" describe THIS item and may be quoted or paraphrased as its testimonial. Paraphrase or excerpt honestly; keep the reviewer's own concrete detail rather than flattening it to "great quality".`,
     `    social_proof_led (no product-tier quote available) → do NOT promote a category or brand quote into this product's voice: those may describe a different item in the catalogue. Use the tier's scoped NUMBER instead (proof_options[].reviews_text, already phrased for its tier), or switch this concept to a spec or brand-voice angle. Never attribute another SKU's words to this one.`,
     `    ugc_led           → a quote or a top_comment, in the reviewer's/creator's own register — first person, casual, unpolished. Not marketing voice.`,
-    `    editorial         → product_signal.specs. Name ONE concrete fact (fabric, construction, weight, dimension, care) and build the line on it. A specific verb about a real property beats two adjectives. This is the style that should read as reported, not sold.`,
+    directorProductBenefitsEnabled()
+      ? `    editorial         → product_signal.specs. Name ONE concrete fact (fabric, construction, weight, dimension, care) and build the line on it. A specific verb about a real property beats two adjectives. This is the style that should read as reported, not sold. product_signal.benefits MAY colour a line — they are DERIVED buyer-facing phrases (derived once at catalog ingest from this product's own title/description/specs), NOT verified catalog facts. Specs remain the fact source.`
+      : `    editorial         → product_signal.specs. Name ONE concrete fact (fabric, construction, weight, dimension, care) and build the line on it. A specific verb about a real property beats two adjectives. This is the style that should read as reported, not sold.`,
     `    brand_led         → brand_signal (tone, summary, tagline). This is the ONLY style that should lean on brand voice — it is the fallback of last resort for every other style, not their first move.`,
     ...(allowedStyles.includes(PROMOTIONAL_STYLE) ? [
       `    promotional       → urgency or scarcity grounded in the PRODUCT — a limited colourway, a seasonal window, a use-case moment — plus one hard fact from product_signal (a spec, a material, availability). Verbs first. NOT a price and NOT a discount: this style is subject to the pricing ban below exactly like every other.`
@@ -3095,7 +3133,9 @@ function buildPromptRound({ inputSummary, creativeIntent, platformFormat, univer
     // rules above tell each style to reach for. Leaving them out here would
     // have the two blocks disagree, and this is the one the model treats as the
     // definition of "allowed to ground on".
-    `- COPY: write the final strings the renderer will ship under copy.{headline,subheadline,eyebrow,cta}. Pull from brand_signal.tagline / description / brand_reviews_summary, product_signal.description, product_signal.specs (real specification facts for THIS product — fabric, construction, weight, dimensions, care), social_proof_signal.primary_quote, and the wider quote pool in social_proof_signal.proof_options[].quotes when grounding. Use null for any role the concept intentionally omits (e.g. eyebrow=null when the design has no eyebrow rule). Storyboard beats reference copy by role — each beat's role MUST map to a non-null copy field (e.g. role=headline beat requires copy.headline non-null).`,
+    directorProductBenefitsEnabled()
+      ? `- COPY: write the final strings the renderer will ship under copy.{headline,subheadline,eyebrow,cta}. Pull from brand_signal.tagline / description / brand_reviews_summary, product_signal.description, product_signal.specs (real specification facts for THIS product — fabric, construction, weight, dimensions, care), product_signal.benefits (derived buyer-facing phrases — optional colour, not verified facts), social_proof_signal.primary_quote, and the wider quote pool in social_proof_signal.proof_options[].quotes when grounding. Use null for any role the concept intentionally omits (e.g. eyebrow=null when the design has no eyebrow rule). Storyboard beats reference copy by role — each beat's role MUST map to a non-null copy field (e.g. role=headline beat requires copy.headline non-null).`
+      : `- COPY: write the final strings the renderer will ship under copy.{headline,subheadline,eyebrow,cta}. Pull from brand_signal.tagline / description / brand_reviews_summary, product_signal.description, product_signal.specs (real specification facts for THIS product — fabric, construction, weight, dimensions, care), social_proof_signal.primary_quote, and the wider quote pool in social_proof_signal.proof_options[].quotes when grounding. Use null for any role the concept intentionally omits (e.g. eyebrow=null when the design has no eyebrow rule). Storyboard beats reference copy by role — each beat's role MUST map to a non-null copy field (e.g. role=headline beat requires copy.headline non-null).`,
     `- ONE PRODUCT ONLY: every string you write describes product_signal.name and nothing else. brand_signal.* and brand_reviews_summary cover the WHOLE catalog — they are there for voice and tone, never for product facts. Never name, describe, or borrow the attributes of another item (a different garment, cut, fabric, or use case) even when the brand material talks about it. If the brand voice material is about a different product, take only its register and write fresh copy about THIS one. Concretely: a t-shirt ad never mentions leggings, joggers, or their fit.`,
     // CREATIVE STYLE. This was a bare enum listing with no selection criteria,
     // and routing.creative_style is what mints Ad.template downstream
@@ -3688,6 +3728,7 @@ module.exports = {
   // Exported for the same reason: the harness ranks/normalises with the shipped
   // functions, so it cannot drift from what the Director actually receives.
   normalizeProductSpecs,
+  directorProductBenefitsEnabled,
   scoreQuoteSafe,
   buildDirectorProofOptions,
   directorProofMenuEnabled,

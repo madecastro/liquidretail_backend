@@ -220,6 +220,7 @@ async function syncBrandGenericCatalog(brand, run, { isBrandAborted, categories 
   // Collect work; post-loop pass classifies. Hung DNS cannot truncate.
   const shotSession = ingestShotClassify.createSession();
   const pendingClassify = [];
+  const pendingBenefits = [];
   // Upsert budget is a SEPARATE clock from the scan (DB-bound work).
   const upsertBudget = createBudget({ totalMs: UPSERT_BUDGET_MS });
   let idx = 0;
@@ -351,14 +352,16 @@ async function syncBrandGenericCatalog(brand, run, { isBrandAborted, categories 
       // every re-sync.
 
       // Upsert only — no await on classify (image network work).
-      const doc = await CatalogProduct.findOneAndUpdate(
+      const upsertResult = await CatalogProduct.findOneAndUpdate(
         { brandId: brand._id, externalId },
         {
           $set: set,
           $setOnInsert: { firstSeenAt: new Date() }
         },
-        { upsert: true, new: true }
+        { upsert: true, new: true, rawResult: true }
       );
+      const doc = upsertResult?.value || upsertResult;
+      require('./productBenefitsService').collectIfNew(upsertResult, pendingBenefits);
       productsUpserted += 1;
       persistedCount += 1;
 
@@ -556,6 +559,10 @@ async function syncBrandGenericCatalog(brand, run, { isBrandAborted, categories 
       }
     })());
   }
+
+  require('./productBenefitsService').enqueueFromPending({
+    pending: pendingBenefits, brand, backgroundWork
+  });
 
   const durationMs = Date.now() - t0;
   console.log(

@@ -5,15 +5,16 @@ Express + Mongoose backend for Reach Social's ad-generation product. Deploys to
 (`Emami-RS-Project/liquidretail`, trunk `master`) deployed to **Netlify**
 (`staging.reach-social.io`). Trunk here is `main`.
 
-**Render ownership (2026-08-24):** when Render-dashboard
-`ADGEN_RENDERER_ENABLED=true`, **this process does not render ads.**
-`runRenderLoop` (`routes/ads.js:1715-1723`) flips the CampaignRun to
-`running` and returns; `liquidretail_adgen`'s renderer claims
-`Ad.status='rendering'` rows and runs Atlas + Remotion. This repo still
-owns HTTP generate, expansion, mint, and claim. The in-process loop below
-this gate is the **fallback** for when the flag is not `'true'` (committed
-default in `config/defaults.env` is `false`). See
-`services/adgenBridge.js` and `../liquidretail_adgen/CLAUDE.md`. Older
+**Render ownership (2026-08-24, file default aligned 2026-09-03):**
+`ADGEN_RENDERER_ENABLED=true` in `config/defaults.env` — **adgen owns
+rendering in production.** `runRenderLoop` (`routes/ads.js:1715-1723`)
+flips the CampaignRun to `running` and returns; `liquidretail_adgen`'s
+renderer claims `Ad.status='rendering'` rows and runs Atlas + Remotion.
+This repo still owns HTTP generate, expansion, mint, and claim. The
+in-process loop below this gate is the **fallback** for when the flag
+is not the string `'true'`. See `services/adgenBridge.js` and
+`../liquidretail_adgen/CLAUDE.md`. Write-up:
+`session.d/2026-09-03_overlay-skip-catalog-and-config-truth.md`. Older
 docs in `docs/PIPELINES.md` / `docs/ALERTING.md` / `docs/TITLING.md` that
 say the **web process** runs `runRenderLoop` describe that fallback (and
 the pre-cutover architecture). Titling resume being "web-only"
@@ -334,9 +335,20 @@ is unchanged at two.
    `remotion/lib/stackFit.js` (new) sizes the whole GROUP to its box before
    paint — shrink (bounded) → drop the reviews line → drop whole trailing
    rows, protecting the hero — so `overflow:hidden` is a backstop, not the
-   mechanism. Not Reels-specific: `verticalYt`/`landscapeYt` share the same
+   mechanism. Multi slots (`benefits`/`badges`) estimate by item count ×
+   `itemLayout`, not a joined string (2026-09-03; `scripts/verifyMultiSlotStackFit.mjs`).
+   Not Reels-specific: `verticalYt`/`landscapeYt` share the same
    tight-box exposure and go through the identical code path. Pinned by
-   `scripts/verifyReelsOverflowSafety.mjs`.
+   `scripts/verifyReelsOverflowSafety.mjs`. Title-spec cascade is always-honour
+   as of 2026-09-03 (`TITLE_SPEC_IGNORE_PERSISTED` deleted; prod audit: 0
+   persisted specs). Write-up: `session.d/2026-09-03_benefits-to-directors-part-b-d.md`.
+   Titling director gets a live benefits+attributes sample (Part A); static
+   Director gets optional `product_signal.benefits` from
+   `CatalogProduct.shortBenefits` (Part C, `DIRECTOR_PRODUCT_BENEFITS`;
+   already in memory on the bare findById, never an artifact read, never
+   a derivation). Ingest derives the field once via gemini-2.5-flash
+   (`PRODUCT_BENEFITS_DERIVATION`, CostLog `product_benefits`). Write-up:
+   `session.d/2026-09-03_catalog-product-shortbenefits.md`.
    **What `safeArea` IS for, so nobody deletes it as dead:** it is live on the
    **static image** path — `staticAdIntents.computeSurface` turns it into the
    geometry box in the billable gpt-image-2 prompt and into Sharp logomark
@@ -1734,26 +1746,31 @@ Video never launches a browser.
   **What replaced it, and it is a DIFFERENT invariant — see §2 below:** a
   recovered master must be TITLED, and must never be requeued to get there.
 - **A RECOVERED MASTER MUST NEVER BE REQUEUED — `status:'queued'` costs ~$0.75.**
-  This reads as the obvious way to "finish" a recovered ad and it is a
-  double-charge. `routes/ads.js:1342` declares `veoVideoUrl` **fresh** every
-  render and the path **never reads `ad.veoVideoUrl`**, so `if (!veoVideoUrl)`
-  (`:1367`) is TRUE for an ad that already holds a paid master — it falls
-  straight into `veoGenerateForAd` and submits to Omni a second time. Titling is
-  therefore resumed **titling-only** by `services/titlingResumeService.js`
-  (claim → `renderBrandScriptAndSave`), never by re-entering the render queue.
-  Pinned by `scripts/verifyTitlingResume.js` **T6** (neither service may contain
-  `status: 'queued'`) and **T10** (the sweeper may not even require
-  `atlasVideoService`, so it is structurally incapable of spending).
-- **Titling resume is WEB-ONLY and that is not arbitrary.** Remotion is warmed in
-  `index.js`; `worker.js` has **zero** remotion references. So the worker
-  recovers the asset (`bootRecoveryService`) and the web process titles it
-  (`titlingResumeService`, on an interval with a re-entrancy guard).
-- **Titling resume stands down when adgen owns rendering.** Same helper as the
-  render-loop handoff (`adgenBridge.isAdgenRendererEnabled`, call-time). Missing
-  or malformed ⇒ this repo still sweeps (adgen only claims on `'true'`; dual-none
-  would strand a paid master). Gate is inside `resumeUntitledMasters`, not the
-  interval, so an in-flight pass finishes and a dashboard flip needs no redeploy.
-  Pinned by `scripts/verifyTitlingResumeAdgenGate.js`.
+  The hazard is unchanged and still real on the in-process fallback:
+  `routes/ads.js` declares `veoVideoUrl` **fresh** every render and never reads
+  `ad.veoVideoUrl`, so `if (!veoVideoUrl)` is TRUE for an ad that already holds
+  a paid master and it re-submits to Omni. Requeueing to "finish" a recovered
+  ad is a double-charge.
+  ⚠️ **THE BACKEND MECHANISM THAT ENFORCED THIS IS GONE — corrected 2026-09-03.**
+  `services/titlingResumeService.js` and its pins
+  (`scripts/verifyTitlingResume.js`, `scripts/verifyTitlingResumeAdgenGate.js`)
+  were DELETED on 2026-08-28 in `abf7e0c2` — *"remove(titling): delete
+  backend's in-process titling function (MONEY) (#360)"*, owner directive
+  *"remove and disable the backend titling function, we are not going to go
+  back to it."* For ~6 days this section described those three files as the
+  live guard, in the money-invariants section, under a MUST NEVER heading.
+  Nothing enforced what it promised. **Do not cite them again.**
+  Current reality: **adgen owns titling and titling-resume** (its own
+  `src/services/titlingResumeService.js` + `TITLING_RESUME_*` config).
+  Backend still RECOVERS the paid asset via `services/bootRecoveryService.js`;
+  it no longer titles in-process at all. `docs/PIPELINES.md`'s concurrency
+  table already records the same removal correctly (struck-through
+  `VEO_TITLING_CONCURRENCY` row) — model any future edit on that, not on this.
+  **Open, and stated rather than implied:** with the backend arm deleted, the
+  in-process fallback (`ADGEN_RENDERER_ENABLED` not `'true'`) has no
+  titling-resume of its own. That path is not live today, but a recovered
+  master on it would sit untitled rather than being resumed.
+
 - **Manual retitle (`/retitle-videos`) can now defer to adgen — a FOURTH
   claim namespace, not a reuse of `titlingNeeded`/`claimedByWorker`
   (2026-08-28).** That claim is built exclusively for "a master just
@@ -1791,9 +1808,11 @@ Video never launches a browser.
   exists to close. The trap is about *undeclared* paths; **declaring** the field
   (`models/Ad.js`, `enum:['pending','claimed',null]`) removes it. `renderStage`
   is still written alongside as a human breadcrumb, but nothing queries it.
-  `scripts/verifyTitlingResume.js` **G1/G2** forbid keying any query or claim
-  filter on `renderStage`, and **G3** asserts the schema declaration exists — so
-  neither half of that mistake can come back.
+  ⚠️ Those pins are GONE: `scripts/verifyTitlingResume.js` (G1/G2/G3) was
+  deleted with the resume service in `abf7e0c2` (2026-08-28). The FIELD still
+  exists on `models/Ad.js`, and the reasoning below is still the right lesson
+  about `renderStage` being owned by `services/adStage.js` — but nothing
+  enforces it any more. Treat this bullet as a design note, not a guarantee.
   **Corollary worth knowing:** the same mid-titling crash leaves the identical
   orphan on the NORMAL render path today (`routes/ads.js:1437-1460` stamps
   `draft` + `renderUrl` *before* titling at `:1477`), and no sweeper catches that
@@ -1869,10 +1888,13 @@ Full detail in `docs/ATLAS.md` §7 and `docs/CLOUDINARY-VIDEO.md`. Headlines:
   (`aiCreativeDirectorService.js:149`). A code fix that feeds better brand /
   product signal **without** bumping the version leaves every product that
   already has a `CreativeDirectionArtifact` serving concepts built from the old
-  brief — the fix looks deployed and is a no-op. Current value **`3.3.0`**
-  (Phase B PMax funnel + proof hierarchy). Prior bumps: `3.0.0→3.1.0`
-  starved-brief (`summary` / `logoUrl`); `3.1.0→3.2.0` social-proof menu.
-  Any future signal-shape change needs the same bump.
+  brief — the fix looks deployed and is a no-op. Current value **`3.5.0`**
+  (`product_signal.benefits` from `CatalogProduct.shortBenefits`, 2026-09-03).
+  Prior bumps: `3.4.0` quote-stage alignment; `3.3.0` PMax funnel + proof
+  hierarchy; `3.0.0→3.1.0` starved-brief (`summary` / `logoUrl`);
+  `3.1.0→3.2.0` social-proof menu. Any future signal-shape change needs the
+  same bump. Write-up: `session.d/2026-09-03_catalog-product-shortbenefits.md`.
+- **`OVERLAY_ZONES_SKIP_CATALOG` default true.** Catalog ingest skips overlay-zone analysis (no `OverlayZoneArtifact` — missing is honest; `zones:{}` would look like analysis ran and found nothing). Gate is `catalogOverlayChainCtx` at the catalog call site, not a `media.source` sniff. Parser `!== 'false'` only. UGC (`runImagePipeline`) is untouched. Pinned by `scripts/verifyOverlayZonesSkipCatalog.js`. Write-up: `session.d/2026-09-03_overlay-skip-catalog-and-config-truth.md`.
 - **PMax Director hierarchy PRECEDENCE SENTENCE — do not delete or "harmonise".**
   The shared DR block still says "≥4.5 from ≥50" (Meta-tuned, deliberately
   untouched). The PMax-only social-proof hierarchy block uses env-interpolated

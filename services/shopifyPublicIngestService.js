@@ -451,6 +451,7 @@ async function syncBrandShopifyDirect(brand, run, { isBrandAborted } = {}) {
   // Collect classify work during the loop; run it as a post-loop pass.
   const shotSession = ingestShotClassify.createSession();
   const pendingClassify = [];
+  const pendingBenefits = [];
   let midUpsertCancelled = false;
   // Universal ingest cap (2026-09-02, services/ingestLimits.js). Bounded
   // by CATALOG_INGEST_LIMIT env; defaults to 10 rows per pass. Stops the
@@ -486,7 +487,7 @@ async function syncBrandShopifyDirect(brand, run, { isBrandAborted } = {}) {
       const externalId = flat.externalId;
 
       // Upsert only — no await on classify (image network work).
-      const doc = await CatalogProduct.findOneAndUpdate(
+      const upsertResult = await CatalogProduct.findOneAndUpdate(
         { brandId: brand._id, externalId },
         {
           $set: {
@@ -519,8 +520,10 @@ async function syncBrandShopifyDirect(brand, run, { isBrandAborted } = {}) {
           },
           $setOnInsert: { firstSeenAt: new Date() }
         },
-        { upsert: true, new: true }
+        { upsert: true, new: true, rawResult: true }
       );
+      const doc = upsertResult?.value || upsertResult;
+      require('./productBenefitsService').collectIfNew(upsertResult, pendingBenefits);
       productsUpserted += 1;
       persistedCount += 1;
 
@@ -972,6 +975,10 @@ async function syncBrandShopifyDirect(brand, run, { isBrandAborted } = {}) {
       }
     })());
   }
+
+  require('./productBenefitsService').enqueueFromPending({
+    pending: pendingBenefits, brand, backgroundWork
+  });
 
   const durationMs = Date.now() - t0;
   console.log(

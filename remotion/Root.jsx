@@ -10,8 +10,8 @@
 //
 // Square deliberately reuses feed's STYLE (safe zones, base text sizes, title
 // specs) because both are 1080 wide, so the horizontal text budget is identical
-// and only the height differs. Only the geometry is new. See SPEC_FORMAT_ALIAS in
-// brandScriptExecutor.js.
+// and only the height differs. Only the geometry is new. See SIZE_FORMAT_ALIAS in
+// remotion/components/slotRenderers.jsx.
 
 import React from 'react';
 import { Composition } from 'remotion';

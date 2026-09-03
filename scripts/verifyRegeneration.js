@@ -21,6 +21,8 @@
  *
  * Run: node scripts/verifyRegeneration.js
  */
+const fs = require('fs');
+const path = require('path');
 const gen = require('../services/campaignAdsGenerationService');
 const pf = require('../services/platformFormats');
 
@@ -777,7 +779,10 @@ const atRaw        = 'r'.repeat(4000);
 
   // ── R6a: the decision reads the SAME call-time flag as the render loop
   // and titling resume gates (adgenBridge.isAdgenRendererEnabled) ────────
-  check('R6a unset ADGEN_RENDERER_ENABLED -> local execution (matches file default false)',
+  // Parser fail-safe: UNSET is OFF (backend renders). Distinct from the
+  // committed file default, which is true (adgen owns production rendering;
+  // dotenv-loaded at boot). Do not conflate the two.
+  check('R6a unset ADGEN_RENDERER_ENABLED -> local execution (parser fail-safe OFF; file default is true)',
     (() => { delete process.env.ADGEN_RENDERER_ENABLED; return regen.shouldDeferToAdgen() === false; })());
   check('R6a ADGEN_RENDERER_ENABLED=true -> defer to adgen',
     (() => { process.env.ADGEN_RENDERER_ENABLED = 'true'; return regen.shouldDeferToAdgen() === true; })());
@@ -790,6 +795,9 @@ const atRaw        = 'r'.repeat(4000);
 
   if (savedAdgenFlag === undefined) delete process.env.ADGEN_RENDERER_ENABLED;
   else process.env.ADGEN_RENDERER_ENABLED = savedAdgenFlag;
+
+  check('R6a config/defaults.env ships ADGEN_RENDERER_ENABLED=true (production; dashboard copy is redundant)',
+    /^ADGEN_RENDERER_ENABLED=true$/m.test(fs.readFileSync(path.join(__dirname, '..', 'config', 'defaults.env'), 'utf8')));
 
   // ── R6b: regenerationRequest payload shape — one definition, both sides
   // trust it (regenerateAd stamps it; the adgen consumer's

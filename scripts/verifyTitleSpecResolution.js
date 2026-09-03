@@ -4,20 +4,19 @@
  * verifyTitleSpecResolution — offline guard for the title-spec cascade.
  *
  * WHY THIS EXISTS
- * A live render logged `spec=brand`, meaning a PERSISTED Brand.titleStyleSpec
- * won over remotion/presets/canonical.json. Canonical's vertical slots all
- * carry scrim:"none" (no-scrim cinema standard, commits 0e885c5 / da1f2b4),
- * but the brand doc still had heavy grey scrims — so improving canonical
- * never reached any brand carrying a frozen override. Owner 2026-08-05:
- * all new renders ignore tier-1 persisted titleStyleSpec docs; named
- * curated presets (titleStylePreset → remotion/presets/<name>.json) and
- * canonical stay live.
+ * Cascade is plain always-honour (2026-09-03): presetOverride → persisted
+ * ad/product/category/brand titleStyleSpec → brand.titleStylePreset →
+ * canonical. The 2026-08-05 TITLE_SPEC_IGNORE_PERSISTED flag is gone — a
+ * prod audit found 0 persisted specs across all four tiers, so the stale-
+ * spec population that flag guarded is empty.
  *
- * Every check below pins that read-path change. No DB, no network, no key.
+ * DELIBERATE BEHAVIOUR FLIP vs the previous A1: a scrimmy persisted brand
+ * override now WINS (source==='brand'). The real no-scrim standard is the
+ * SHIPPED canonical files (D1/D2/G5), not "ignore whatever is stored".
  *
- * If these fail after a revert of the ignore gate (or after reintroducing
- * scrims into canonical.vertical), the harness exits non-zero. Comment on
- * each check names the failure mode.
+ * TIER 0 presetOverride still beats a persisted brand spec. TIER 2 named
+ * presets still apply when no tier-1 doc exists. Canonical remains the
+ * floor. No DB, no network, no key.
  *
  *   node scripts/verifyTitleSpecResolution.js
  */
@@ -35,17 +34,11 @@ function check(label, fn) {
 
 const ROOT = path.join(__dirname, '..');
 
-// Isolate the flag for this process — defaults.env is only loaded at boot
-// of index/worker; the harness drives process.env itself.
-const SAVED = process.env.TITLE_SPEC_IGNORE_PERSISTED;
-process.env.TITLE_SPEC_IGNORE_PERSISTED = 'true';
-
 const {
   resolveSpec,
   resolveSpecForBrand,
   loadPresetFile,
   clearPresetCache,
-  ignoresPersistedTitleSpecs,
   CANONICAL_PRESET,
 } = require('../services/titleSpecService');
 
@@ -68,82 +61,93 @@ const PRESET_NAME = 'soludos-summer-postcard';
 const presetFile = loadPresetFile(PRESET_NAME);
 assert.ok(presetFile?.byFormat?.vertical, `fixture preset '${PRESET_NAME}' must exist on disk`);
 
-console.log('\nverifyTitleSpecResolution — TITLE_SPEC_IGNORE_PERSISTED=true (render path)\n');
+console.log('\nverifyTitleSpecResolution — always-honour cascade (Title Studio = render)\n');
 
-// ── A. Render path ignores tier-1 persisted docs ──────────────────────────
-check('A1 brand.titleStyleSpec.vertical does NOT win (source !== brand)', () => {
-  // FAIL-IF-REVERTED: without the ignore gate, source would be 'brand'.
+// ── A. Persisted tier-1 docs WIN (deliberate flip of 2026-08-05 ignore) ───
+check('A1 brand.titleStyleSpec.vertical WINS (source === brand)', () => {
+  // DELIBERATE FLIP: the previous A1 asserted source==='canonical' under
+  // TITLE_SPEC_IGNORE_PERSISTED. Always-honour means a valid persisted
+  // brand spec wins, scrim and all. The no-scrim standard lives on the
+  // SHIPPED files (D1/G5), not on ignoring stored docs.
+  // FAIL-IF-IGNORE-RESTORED: re-adding the ignore branch makes this red.
   const brand = { titleStyleSpec: { vertical: SCRIMMY_OVERRIDE } };
   const { source, spec } = resolveSpec({ brand, format: 'vertical' });
-  assert.strictEqual(source, 'canonical', `expected canonical, got ${source}`);
-  assert.notStrictEqual(source, 'brand');
-  // And the winning slots must not carry the solid scrim from the override.
+  assert.strictEqual(source, 'brand', `expected brand, got ${source}`);
   const headline = spec.slots.find((s) => s.key === 'headline');
-  assert.ok(headline, 'canonical must have a headline slot');
-  assert.strictEqual(headline.treatment?.scrim, 'none',
-    'resolved headline still has solid scrim — brand override leaked through');
+  assert.ok(headline, 'brand override must have a headline slot');
+  assert.strictEqual(headline.treatment?.scrim, 'solid',
+    'brand override scrim must survive — always-honour');
 });
 
-check('A2 ad.titleStyleSpec is ignored on the render path', () => {
-  // FAIL-IF-REVERTED: source would be 'ad'.
+check('A2 ad.titleStyleSpec WINS (source === ad)', () => {
   const ad = { titleStyleSpec: { vertical: SCRIMMY_OVERRIDE } };
   const { source } = resolveSpec({ brand: {}, ad, format: 'vertical' });
-  assert.strictEqual(source, 'canonical', `expected canonical, got ${source}`);
+  assert.strictEqual(source, 'ad', `expected ad, got ${source}`);
 });
 
-check('A3 product.titleStyleSpec is ignored on the render path', () => {
-  // FAIL-IF-REVERTED: source would be 'product'.
+check('A3 product.titleStyleSpec WINS (source === product)', () => {
   const product = { titleStyleSpec: { vertical: SCRIMMY_OVERRIDE } };
   const { source } = resolveSpec({ brand: {}, product, format: 'vertical' });
-  assert.strictEqual(source, 'canonical', `expected canonical, got ${source}`);
+  assert.strictEqual(source, 'product', `expected product, got ${source}`);
 });
 
-check('A4 ad beats product only when honouring; both ignored on render path', () => {
-  // With ignore on, neither tier-1 doc wins even if both are present.
+check('A4 ad beats product when both persisted specs are valid', () => {
   const ad = { titleStyleSpec: { vertical: SCRIMMY_OVERRIDE } };
   const product = { titleStyleSpec: { vertical: SCRIMMY_OVERRIDE } };
   const { source } = resolveSpec({ brand: {}, ad, product, format: 'vertical' });
-  assert.strictEqual(source, 'canonical');
+  assert.strictEqual(source, 'ad', `expected ad (most-specific), got ${source}`);
 });
 
-// ── B. Tier 2 named presets still win ─────────────────────────────────────
+check('A5 category.titleStyleSpec WINS (source === category:<key>)', () => {
+  const categories = [{ breadcrumbKey: 'shoes', titleStyleSpec: { vertical: SCRIMMY_OVERRIDE } }];
+  const { source } = resolveSpec({ brand: {}, categories, format: 'vertical' });
+  assert.strictEqual(source, 'category:shoes', `expected category:shoes, got ${source}`);
+});
+
+// ── B. Tier 2 named presets still apply when no tier-1 doc exists ─────────
 check('B1 brand.titleStylePreset still resolves to that preset (tier 2 intact)', () => {
-  // FAIL-IF-REVERTED-AND-BROKEN: if tier 2 is accidentally disabled with tier 1,
-  // a brand with only a preset pin would fall to canonical.
+  // FAIL-IF-TIER-2-DROPPED: a brand with only a preset pin must not fall
+  // to canonical.
   const brand = { titleStylePreset: PRESET_NAME };
   const { source } = resolveSpec({ brand, format: 'vertical' });
   assert.strictEqual(source, `preset:${PRESET_NAME}`, `expected preset:${PRESET_NAME}, got ${source}`);
 });
 
-check('B2 persisted brand spec + named preset → preset wins (not brand, not canonical)', () => {
-  // The live bug case: brand had a frozen titleStyleSpec AND may have a
-  // preset pin. With ignore on, preset must win over the stored doc.
+check('B2 persisted brand spec + named preset → brand wins (tier 1 beats tier 2)', () => {
+  // DELIBERATE FLIP of the ignore-era B2 (which expected the preset).
+  // FAIL-IF-IGNORE-RESTORED: ignore would skip the brand doc and return the preset.
   const brand = {
     titleStyleSpec: { vertical: SCRIMMY_OVERRIDE },
     titleStylePreset: PRESET_NAME,
   };
   const { source } = resolveSpec({ brand, format: 'vertical' });
-  assert.strictEqual(source, `preset:${PRESET_NAME}`,
-    `expected preset:${PRESET_NAME}, got ${source} — brand override must not shadow the curated preset`);
+  assert.strictEqual(source, 'brand',
+    `expected brand (tier 1 beats pinned preset), got ${source}`);
 });
 
-// ── C. Floor + authoring opt-in ───────────────────────────────────────────
+// ── C. Floor + shared cascade (Title Studio = render) ─────────────────────
 check('C1 no overrides at all → canonical still wins', () => {
   const { source } = resolveSpec({ brand: {}, format: 'vertical' });
   assert.strictEqual(source, 'canonical');
 });
 
-check('C2 resolveSpecForBrand with honourPersistedOverrides still returns brand', () => {
-  // Authoring path must keep reading stored specs. FAIL-IF-AUTHORING-BROKEN.
+check('C2 resolveSpecForBrand (no extra opts) returns brand — same cascade as render', () => {
   const brand = { titleStyleSpec: { vertical: SCRIMMY_OVERRIDE } };
-  const { source } = resolveSpecForBrand(brand, 'vertical', { honourPersistedOverrides: true });
-  assert.strictEqual(source, 'brand', `authoring must see brand, got ${source}`);
+  const { source } = resolveSpecForBrand(brand, 'vertical');
+  assert.strictEqual(source, 'brand', `expected brand, got ${source}`);
 });
 
-check('C3 resolveSpec honourPersistedOverrides:true restores ad tier', () => {
-  const ad = { titleStyleSpec: { vertical: SCRIMMY_OVERRIDE } };
-  const { source } = resolveSpec({ brand: {}, ad, format: 'vertical', honourPersistedOverrides: true });
-  assert.strictEqual(source, 'ad');
+check('C3 TIER 0 presetOverride beats a persisted brand spec', () => {
+  // FAIL-IF-TIER-0-DEAD: an explicit named-preset arg must still win over
+  // a stored brand.titleStyleSpec. Staged funnel rows rely on this.
+  const brand = { titleStyleSpec: { vertical: SCRIMMY_OVERRIDE } };
+  const { source } = resolveSpec({
+    brand,
+    format: 'vertical',
+    presetOverride: 'canonical-conversion',
+  });
+  assert.strictEqual(source, 'override:canonical-conversion',
+    `expected override:canonical-conversion, got ${source}`);
 });
 
 // ── D. Canonical no-scrim cinema standard (vertical) ──────────────────────
@@ -171,32 +175,9 @@ check('D2 resolved canonical vertical also normalizes to scrim none', () => {
   assert.strictEqual(bad.length, 0, `normalized vertical slots with scrim: ${bad.join(', ')}`);
 });
 
-// ── E. Flag flip restores old override behaviour ──────────────────────────
-check('E1 TITLE_SPEC_IGNORE_PERSISTED=false restores brand override win', () => {
-  // FAIL-IF-FLAG-DEAD: the env kill-switch must be live, not a dead constant.
-  process.env.TITLE_SPEC_IGNORE_PERSISTED = 'false';
-  assert.strictEqual(ignoresPersistedTitleSpecs(), false);
-  const brand = { titleStyleSpec: { vertical: SCRIMMY_OVERRIDE } };
-  const { source } = resolveSpec({ brand, format: 'vertical' });
-  assert.strictEqual(source, 'brand', `flag off should honour brand, got ${source}`);
-  // Restore default for any subsequent checks / process exit hygiene.
-  process.env.TITLE_SPEC_IGNORE_PERSISTED = 'true';
-  assert.strictEqual(ignoresPersistedTitleSpecs(), true);
-});
+// ── E. (removed) TITLE_SPEC_IGNORE_PERSISTED flag — deleted 2026-09-03 ──
 
-check('E2 after flag restore, brand override is ignored again', () => {
-  const brand = { titleStyleSpec: { vertical: SCRIMMY_OVERRIDE } };
-  const { source } = resolveSpec({ brand, format: 'vertical' });
-  assert.strictEqual(source, 'canonical');
-});
-
-// ── F. Helper + default ───────────────────────────────────────────────────
-check('F1 ignoresPersistedTitleSpecs defaults to true when env unset', () => {
-  delete process.env.TITLE_SPEC_IGNORE_PERSISTED;
-  assert.strictEqual(ignoresPersistedTitleSpecs(), true);
-  process.env.TITLE_SPEC_IGNORE_PERSISTED = 'true';
-});
-
+// ── F. Canonical floor name ───────────────────────────────────────────────
 check('F2 CANONICAL_PRESET is the floor name', () => {
   assert.strictEqual(CANONICAL_PRESET, 'canonical');
   clearPresetCache();
@@ -738,10 +719,79 @@ check('I5 resolveSlotContent: visibleWhenEmpty:quote yields content only when qu
   assert.strictEqual(emptyStr, 'All-day comfort');
 });
 
-// ── report ────────────────────────────────────────────────────────────────
-if (SAVED === undefined) delete process.env.TITLE_SPEC_IGNORE_PERSISTED;
-else process.env.TITLE_SPEC_IGNORE_PERSISTED = SAVED;
+check('J1 multi slot with bind [{literal:[...]}] only is INVALID', () => {
+  // FAIL-IF-LITERAL-ONLY-LEGAL: a literal-only benefits bind would freeze
+  // one SKU's strings into a brand-wide spec. Prerequisite for shipping
+  // sample strings into the titling-director prompt (Part A).
+  const spec = minimalSpec([{
+    key: 'benefits',
+    phase: 'hook',
+    bind: [{ literal: ['Waterproof', 'Packable', 'UPF 50+'] }],
+    position: { anchor: 'lowerThird', align: 'left', maxWidthPct: 0.85 },
+    timing: { enterAtSec: 0.15, exitAtSec: 2.4 },
+    transition: { type: 'fade' },
+    treatment: { itemLayout: 'stack', itemStyle: 'bullet', maxItems: 4 },
+  }]);
+  const res = validateTitleSpec(spec, { format: 'vertical' });
+  assert.strictEqual(res.ok, false, 'literal-only multi bind must fail');
+  assert.ok(
+    (res.errors || []).some((e) => /literal-only|at least one of/.test(e)),
+    `expected multi-bind meta-field error, got: ${(res.errors || []).join('; ')}`
+  );
+});
 
+check('J2 multi slot with bind [\'benefits\', {literal:[...]}] is VALID', () => {
+  const spec = minimalSpec([{
+    key: 'benefits',
+    phase: 'hook',
+    bind: ['benefits', { literal: ['Waterproof', 'Packable'] }],
+    position: { anchor: 'lowerThird', align: 'left', maxWidthPct: 0.85 },
+    timing: { enterAtSec: 0.15, exitAtSec: 2.4 },
+    transition: { type: 'fade' },
+    treatment: { itemLayout: 'stack', itemStyle: 'bullet', maxItems: 4 },
+  }]);
+  const res = validateTitleSpec(spec, { format: 'vertical' });
+  assert.ok(res.ok, `expected ok, got: ${(res.errors || []).join('; ')}`);
+  const slot = res.normalized.slots.find((s) => s.key === 'benefits');
+  assert.ok(slot, 'normalized must retain benefits slot');
+  assert.strictEqual(slot.bind[0], 'benefits');
+  assert.deepStrictEqual(slot.bind[1], { literal: ['Waterproof', 'Packable'] });
+});
+
+check('J3 multi slot with a leading literal before the meta field is INVALID', () => {
+  // A leading literal always wins (first-non-empty), equivalent to literal-only.
+  const spec = minimalSpec([{
+    key: 'benefits',
+    phase: 'hook',
+    bind: [{ literal: ['Frozen SKU string'] }, 'benefits'],
+    position: { anchor: 'lowerThird', align: 'left', maxWidthPct: 0.85 },
+    timing: { enterAtSec: 0.15, exitAtSec: 2.4 },
+    transition: { type: 'fade' },
+    treatment: { itemLayout: 'stack' },
+  }]);
+  const res = validateTitleSpec(spec, { format: 'vertical' });
+  assert.strictEqual(res.ok, false, 'leading literal must fail');
+  assert.ok(
+    (res.errors || []).some((e) => /AFTER|leading literal/.test(e)),
+    `expected leading-literal error, got: ${(res.errors || []).join('; ')}`
+  );
+});
+
+check('J4 badges with bind [\'badges\'] (no literal) is VALID', () => {
+  const spec = minimalSpec([{
+    key: 'badges',
+    phase: 'hook',
+    bind: ['badges'],
+    position: { anchor: 'upperThird', align: 'left', maxWidthPct: 0.85 },
+    timing: { enterAtSec: 0.15, exitAtSec: 2.4 },
+    transition: { type: 'fade' },
+    treatment: { itemLayout: 'row', itemStyle: 'pill' },
+  }]);
+  const res = validateTitleSpec(spec, { format: 'vertical' });
+  assert.ok(res.ok, `expected ok, got: ${(res.errors || []).join('; ')}`);
+});
+
+// ── report ────────────────────────────────────────────────────────────────
 if (failures.length) {
   console.error(`❌ verifyTitleSpecResolution: ${failures.length} FAILED, ${pass} passed\n`);
   for (const f of failures) console.error(`   • ${f}`);

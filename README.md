@@ -29,6 +29,7 @@ titling harnesses.
 ## Config
 
 Non-secret defaults: `config/defaults.env`. Secrets live in the Render
-dashboard only. `ADGEN_RENDERER_ENABLED` defaults to `false` in that file;
-production sets it `true` so adgen takes the render loop
-(`services/adgenBridge.js`, `routes/ads.js` `runRenderLoop`).
+dashboard only. `ADGEN_RENDERER_ENABLED` defaults to `true` in that file
+— adgen owns rendering in production (`services/adgenBridge.js`,
+`routes/ads.js` `runRenderLoop`). The in-process loop is the fallback
+when the flag is not the string `'true'`.

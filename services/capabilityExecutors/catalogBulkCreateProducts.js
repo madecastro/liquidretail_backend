@@ -117,6 +117,7 @@ async function run({ req, args }) {
   let updated   = 0;
   const errors  = [];
   const results = [];   // per-row summaries in input order
+  const pendingBenefits = [];
 
   for (let i = 0; i < products.length; i++) {
     const raw = products[i];
@@ -190,6 +191,7 @@ async function run({ req, args }) {
     const isNew   = !result.lastErrorObject?.updatedExisting;
     succeeded++;
     if (isNew) created++; else updated++;
+    if (isNew && product) pendingBenefits.push(product);
 
     // Category stamp — applyFeedTruthStamp handles insert / noop /
     // rename uniformly. Never fatal.
@@ -216,6 +218,10 @@ async function run({ req, args }) {
       draft:      !!product.draft
     });
   }
+
+  require('../productBenefitsService').enqueueFromPending({
+    pending: pendingBenefits, brand
+  });
 
   return {
     ok: true,

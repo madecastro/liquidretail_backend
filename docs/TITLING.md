@@ -118,11 +118,13 @@ CTA default: every shipped preset ships its `cta` slot `visible: false` — all 
 
 Validation (`validateTitleSpec`, `validateTitleStyleSpecDoc`): normalizes optionals to defaults; rejects unknowns/duplicates/out-of-range; phases 1..4, slots <= SLOT_KEYS, times 0..MAX_CLIP_SEC (15). Treatment fallbacks: `scrim ?? 'none'`, `shadow ?? 'layered'` (no-scrim standard).
 
-Resolution (`services/titleSpecService.js` `resolveSpecForBrand`):
-- brand.titleStyleSpec[format] (validated) → 'brand'
+Resolution (`services/titleSpecService.js` `resolveSpec` / `resolveSpecForBrand`) — one cascade, Title Studio and render share it (plain always-honour as of 2026-09-03; `TITLE_SPEC_IGNORE_PERSISTED` deleted — prod audit found 0 persisted specs):
+- `presetOverride` arg (explicit, never persisted) → `override:<name>`
+- else ad/product/category(leaf→root)/brand `titleStyleSpec[format]` (validated) → that tier
 - else brand.titleStylePreset → loadPresetFile(name) → byFormat[format] (validated) → 'preset:<name>'
 - else canonical (remotion/presets/canonical.json) → 'canonical'
 - Throws only on canonical failure. `loadPresetFile` + `clearPresetCache`.
+- Multi slots (`benefits`/`badges`) must bind at least one of `BINDABLE_MULTI_META_FIELDS`; a `{literal:[...]}` is only a fallback AFTER that field. See `session.d/2026-09-03_benefits-to-directors-part-b-d.md`.
 
 Duration time-scaling: specs are authored against their own extent (max `phases[].endSec`, nominally 8s). At render, `specTimeScale` (remotion/lib/timing.js) compresses every enter/exit time proportionally when the probed plate is shorter (6s segment → ×0.75 — the CTA still lands), and entrances are hard-clamped inside the clip; longer plates keep authored pacing and hold-to-end slots hold longer. Positions are clamped to per-format safe zones in the composition (remotion/lib/safeZones.js).
 

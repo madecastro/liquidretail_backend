@@ -128,6 +128,9 @@ async function run({ req, args }) {
 
   const product = result.value;
   const isNew = !result.lastErrorObject?.updatedExisting;
+  if (isNew && product) {
+    require('../productBenefitsService').scheduleForProduct({ product, brand });
+  }
 
   // Stamp / restamp categoryRef via applyFeedTruthStamp — same
   // pattern the ingest paths use. Handles insert (fresh row), noop
