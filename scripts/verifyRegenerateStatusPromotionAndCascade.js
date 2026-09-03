@@ -10,16 +10,25 @@
 //    NOT simply restoring brandScriptExecutor.uploadRenderAndStamp's old
 //    unconditional preserveAdStatus:false default — see that function's
 //    header, and adgen's copy of this file, where the same-shaped call
-//    site still exists and needed a conditional retitleMode instead of
-//    just being removed).
+//    site still exists). An earlier draft of this PR tried to gate that
+//    stamp with retitleMode; that expansion was reverted (QC-quarantine /
+//    titling-resume / incomplete-branch defects). Regenerating an
+//    already-'live' video ad on adgen still silently un-publishes it —
+//    a known, unfixed follow-up, not this harness's job. This backend
+//    copy no longer calls that stamp (titling removed 2026-08-28).
 //
 //  FIX 2 — cascadeRegenerateToDerivatives / findDerivativesOfMaster /
 //    recascadeDerivativeSibling: after a master ad's video regenerate
-//    succeeds, its free derivative siblings (deriveFromMaster === the
+//    succeeds, its same-identity derivative siblings (deriveFromMaster === the
 //    master's own platformFormat) are re-composited from the NEW master
-//    plate, with ZERO Atlas/Omni submits — the same money invariant
+//    plate, with ZERO Atlas/Omni spend — the same money invariant
 //    resolveDeriveFromMaster / routes/ads.js's renderDeriveOnlyVideoAd
-//    protect at mint time, applied to the regenerate path.
+//    protect at mint time, applied to the regenerate path. Joins the
+//    rest of computeDeterministicVideoDigest's identity (mediaId /
+//    referenceMediaIds, CTA, prompt fields), not just
+//    campaignId+productId+deriveFromMaster — a second Generate with a
+//    different seed or CTA is a different family. Not scoped by
+//    campaignRunIds (that under-matches later-run same-family siblings).
 //
 // NOTE ON REACHABILITY: this file's runVideoFull (and therefore this whole
 // three-function chain) is currently unreachable in production — see
@@ -41,14 +50,14 @@
 // $unset — not a hand-waved reimplementation) and assert on the ACTUAL
 // persisted documents afterward.
 //
-// Group E is the money invariant proper, and IS source text — mirroring
-// scripts/verifyRendererVideoMoneyInvariants.js's own style: it extracts
-// findDerivativesOfMaster / recascadeDerivativeSibling /
-// cascadeRegenerateToDerivatives's function bodies from the REAL source
-// file (balanced-brace extraction, not a copy) and asserts none of them
-// reference veoService / atlasVideoService / generateForAd /
-// prepareStoryboard — a submit inside any of these three functions would be
-// a free-surface ad silently billing Omni on every master regenerate.
+// Group E is the money invariant proper: function-body scan PLUS a real
+// require-graph BFS (the pattern scripts/verifyTitlingResumeNeverResubmits.js
+// uses) starting from brandScriptExecutor.js — the only heavy callee of
+// the cascade. A body-text regex on the three functions cannot see a
+// helper they call that then requires atlasVideoService.
+//
+// Group F drives the REAL runVideoFull tail (fresh-verdict gate, promote,
+// cascade) against stubbed providers.
 //
 // Revert-prove — mutations confirmed to fail this harness (see each group):
 //   promoteFailedToDraft loses its status:'failed' filter clause → A2-A5
@@ -110,23 +119,37 @@ function stub(id, exports) {
 // top-level equality and $ne.
 function matches(doc, filter) {
   return Object.entries(filter).every(([key, cond]) => {
+    if (key === '$or') return cond.some((sub) => matches(doc, sub));
+    if (key === '$and') return cond.every((sub) => matches(doc, sub));
     const val = doc[key];
     if (cond && typeof cond === 'object' && !Array.isArray(cond)) {
       return Object.entries(cond).every(([op, opVal]) => {
         if (op === '$ne') return val !== opVal;
-        // Array-field $in/$nin (added 2026-09-02 for campaignRunIds
-        // scoping): Mongo's $in against an array field matches when ANY
-        // element of the array is in the list (array-contains-any), not
-        // scalar equality of the whole array. Scalar fields fall through to
-        // plain membership, matching the pre-existing callers.
+        // Array-field $in/$nin: Mongo's $in against an array field matches
+        // when ANY element of the array is in the list (array-contains-any),
+        // not scalar equality of the whole array. Missing fields are treated
+        // as null for $in, matching Mongo `{field: {$in:[null]}}` on a
+        // present-null (lean() docs in these tests always materialise the
+        // identity fields, so this is belt-and-braces).
         if (op === '$in') {
-          return Array.isArray(val) ? val.some((v) => opVal.includes(v)) : opVal.includes(val);
+          return Array.isArray(val)
+            ? val.some((v) => opVal.includes(v))
+            : opVal.includes(val === undefined ? null : val);
         }
         if (op === '$nin') {
-          return Array.isArray(val) ? !val.some((v) => opVal.includes(v)) : !opVal.includes(val);
+          return Array.isArray(val)
+            ? !val.some((v) => opVal.includes(v))
+            : !opVal.includes(val === undefined ? null : val);
         }
+        if (op === '$exists') return opVal ? val !== undefined : val === undefined;
+        if (op === '$size') return Array.isArray(val) && val.length === opVal;
         throw new Error(`unsupported operator ${op}`);
       });
+    }
+    // Mongo array equality is by value (order-significant), not JS reference.
+    if (Array.isArray(cond)) {
+      if (!Array.isArray(val) || val.length !== cond.length) return false;
+      return val.every((v, i) => v === cond[i] || String(v) === String(cond[i]));
     }
     return val === cond;
   });
@@ -166,9 +189,20 @@ function install() {
   });
   stub(MEDIA, { findById: () => ({ select: () => ({ lean: async () => null }) }), exists: async () => false });
   stub(RUN, { findOne: () => ({ select: () => ({ lean: async () => null }) }) });
-  stub(VEO, {});
+  stub(VEO, {
+    prepareStoryboard: async () => ({ storyboard: null }),
+    generateForAd: async () => ({
+      videoUrl: 'https://new.example/omni-master.mp4',
+      aspectRatio: '9:16',
+      prompt: 'p',
+      storyboard: null,
+      model: 'omni',
+      referenceImages: [],
+      skipped: false
+    })
+  });
   bseCalls = [];
-  bseState = { visionQc: { passed: true, skipped: false, disabled: false } };
+  bseState = { visionQc: { passed: true, skipped: false, disabled: false }, swallowQc: false };
   const buildVideoQcFailureFields = (visionQc) => {
     const failed = !!visionQc && visionQc.passed === false && !visionQc.skipped && !visionQc.disabled;
     if (!failed) return {};
@@ -178,6 +212,7 @@ function install() {
     buildVideoQcFailureFields,
     qcAndStampVideoAd: async ({ ad, deliveredUrl, brandName }) => {
       bseCalls.push({ fn: 'qcAndStampVideoAd', adId: String(ad._id), deliveredUrl, brandName });
+      if (bseState.swallowQc) return null;
       const verdict = bseState.visionQc;
       const fields = { visionQc: verdict, ...buildVideoQcFailureFields(verdict) };
       await AdCol.updateOne({ _id: ad._id }, { $set: fields });
@@ -205,6 +240,13 @@ function baseAd(over = {}) {
     _id: 'a0000000000000000000000',
     campaignId: 'c0000000000000000000000',
     productId:  'p0000000000000000000000',
+    mediaId:    'x0000000000000000000000',
+    referenceMediaIds: [],
+    ctaText: '',
+    ctaUrl: '',
+    ctaUrlParams: '',
+    videoPromptGuidance: null,
+    videoPromptRaw: null,
     platformFormat: 'meta_stories_9_16',
     deriveFromMaster: null,
     kind: 'video',
@@ -335,6 +377,88 @@ function baseAd(over = {}) {
     stub(AD, { find: (f) => AdCol.find(f), findById: (id) => AdCol.findById(id), updateOne: (f, u) => AdCol.updateOne(f, u) });
     const found = await svc.findDerivativesOfMaster(master);
     assert.strictEqual(found.length, 0, 'the _id:{$ne:...} clause must exclude the master itself');
+  });
+
+  await checkAsync('B12 [BLOCKER 1] a same-campaign/product/format sibling with a DIFFERENT mediaId is excluded (cross-family)', async () => {
+    const master = baseAd({ _id: 'm0000000000000000000000', deriveFromMaster: null, mediaId: 'media-family-1', veoVideoUrl: 'https://m1' });
+    const sameFamily = baseAd({ _id: 's1000000000000000000000', deriveFromMaster: master.platformFormat, mediaId: 'media-family-1' });
+    const otherFamily = baseAd({ _id: 'sD000000000000000000000', deriveFromMaster: master.platformFormat, mediaId: 'media-family-2' });
+    AdCol = new MiniCollection([master, sameFamily, otherFamily]);
+    stub(AD, { find: (f) => AdCol.find(f), findById: (id) => AdCol.findById(id), updateOne: (f, u) => AdCol.updateOne(f, u) });
+    const found = await svc.findDerivativesOfMaster(master);
+    const foundIds = found.map((d) => d._id);
+    assert.deepStrictEqual(foundIds, ['s1000000000000000000000']);
+  });
+
+  await checkAsync('B13 [BLOCKER 1] a sibling with a different ctaText is excluded', async () => {
+    const master = baseAd({ _id: 'm0000000000000000000000', deriveFromMaster: null, ctaText: 'SHOP NOW', veoVideoUrl: 'https://m1' });
+    const sameFamily = baseAd({ _id: 's1000000000000000000000', deriveFromMaster: master.platformFormat, ctaText: 'SHOP NOW' });
+    const otherCta = baseAd({ _id: 'sE000000000000000000000', deriveFromMaster: master.platformFormat, ctaText: 'BUY NOW' });
+    AdCol = new MiniCollection([master, sameFamily, otherCta]);
+    stub(AD, { find: (f) => AdCol.find(f), findById: (id) => AdCol.findById(id), updateOne: (f, u) => AdCol.updateOne(f, u) });
+    const found = await svc.findDerivativesOfMaster(master);
+    assert.deepStrictEqual(found.map((d) => d._id), ['s1000000000000000000000']);
+  });
+
+  await checkAsync('B14 [BLOCKER 1] a sibling with a different videoPromptRaw is excluded', async () => {
+    const master = baseAd({ _id: 'm0000000000000000000000', deriveFromMaster: null, videoPromptRaw: 'canonical A', veoVideoUrl: 'https://m1' });
+    const sameFamily = baseAd({ _id: 's1000000000000000000000', deriveFromMaster: master.platformFormat, videoPromptRaw: 'canonical A' });
+    const otherPrompt = baseAd({ _id: 'sF000000000000000000000', deriveFromMaster: master.platformFormat, videoPromptRaw: 'canonical B' });
+    AdCol = new MiniCollection([master, sameFamily, otherPrompt]);
+    stub(AD, { find: (f) => AdCol.find(f), findById: (id) => AdCol.findById(id), updateOne: (f, u) => AdCol.updateOne(f, u) });
+    const found = await svc.findDerivativesOfMaster(master);
+    assert.deepStrictEqual(found.map((d) => d._id), ['s1000000000000000000000']);
+  });
+
+  await checkAsync('B15 [BLOCKER 1] a sibling with a different referenceMediaIds stack is excluded', async () => {
+    const master = baseAd({ _id: 'm0000000000000000000000', deriveFromMaster: null, referenceMediaIds: ['r1', 'r2'], mediaId: 'r1', veoVideoUrl: 'https://m1' });
+    const sameFamily = baseAd({ _id: 's1000000000000000000000', deriveFromMaster: master.platformFormat, referenceMediaIds: ['r1', 'r2'], mediaId: 'r1' });
+    const otherRefs = baseAd({ _id: 'sG000000000000000000000', deriveFromMaster: master.platformFormat, referenceMediaIds: ['r9'], mediaId: 'r9' });
+    AdCol = new MiniCollection([master, sameFamily, otherRefs]);
+    stub(AD, { find: (f) => AdCol.find(f), findById: (id) => AdCol.findById(id), updateOne: (f, u) => AdCol.updateOne(f, u) });
+    const found = await svc.findDerivativesOfMaster(master);
+    assert.deepStrictEqual(found.map((d) => d._id), ['s1000000000000000000000']);
+  });
+
+  await checkAsync('B16 [BLOCKER 2] missing platformFormat returns [] AND never queries (BSON would drop the key)', async () => {
+    const master = baseAd({ _id: 'm0000000000000000000000', platformFormat: undefined, deriveFromMaster: null, veoVideoUrl: 'https://m1' });
+    const otherPaidMaster = baseAd({ _id: 's8000000000000000000000', deriveFromMaster: null, veoVideoUrl: 'https://other-master' });
+    const wouldMatchIfDropped = baseAd({ _id: 's1000000000000000000000', deriveFromMaster: 'meta_stories_9_16' });
+    AdCol = new MiniCollection([master, otherPaidMaster, wouldMatchIfDropped]);
+    stub(AD, { find: (f) => AdCol.find(f), findById: (id) => AdCol.findById(id), updateOne: (f, u) => AdCol.updateOne(f, u) });
+    // Spy on the LIVE collection — re-stubbing require.cache[AD] does not
+    // rebind adRegenerateService's `const Ad = require(...)` (see C4).
+    let findCalled = false;
+    const origFind = AdCol.find.bind(AdCol);
+    AdCol.find = (f) => { findCalled = true; return origFind(f); };
+    const found = await svc.findDerivativesOfMaster(master);
+    assert.strictEqual(found.length, 0);
+    assert.strictEqual(findCalled, false, 'must not query at all — BSON drops deriveFromMaster:undefined and would match every video ad in the product, including other paid masters');
+  });
+
+  check('B17 [BLOCKER 2] buildDerivativesOfMasterFilter returns null when platformFormat is missing', () => {
+    assert.strictEqual(typeof svc.buildDerivativesOfMasterFilter, 'function');
+    const filter = svc.buildDerivativesOfMasterFilter(baseAd({ platformFormat: undefined }));
+    assert.strictEqual(filter, null);
+  });
+
+  check('B18 [BLOCKER 2] JSON/BSON-style drop: an undefined deriveFromMaster key disappears from a naive filter (why the guard exists)', () => {
+    const naive = { campaignId: 'c', productId: 'p', deriveFromMaster: undefined, kind: 'video' };
+    const dropped = JSON.parse(JSON.stringify(naive));
+    assert.ok(!Object.prototype.hasOwnProperty.call(dropped, 'deriveFromMaster'),
+      'undefined keys are dropped on the wire; the guard must refuse before this filter is built');
+  });
+
+  check('B19 [BLOCKER 2] a valid filter keeps deriveFromMaster as a real string (never undefined)', () => {
+    const filter = svc.buildDerivativesOfMasterFilter(baseAd({ platformFormat: 'meta_stories_9_16' }));
+    assert.ok(filter);
+    assert.strictEqual(filter.deriveFromMaster, 'meta_stories_9_16');
+    const roundTripped = JSON.parse(JSON.stringify(filter));
+    assert.strictEqual(roundTripped.deriveFromMaster, 'meta_stories_9_16');
+  });
+
+  check('B20 sibling cap is a finite positive integer', () => {
+    assert.ok(Number.isInteger(svc.MAX_REGEN_CASCADE_SIBLINGS) && svc.MAX_REGEN_CASCADE_SIBLINGS >= 1);
   });
 
   // ═══════════════════════════════════════════════════════════════════
@@ -469,12 +593,25 @@ function baseAd(over = {}) {
   function functionBody(signatureRe) {
     const m = signatureRe.exec(SRC);
     assert.ok(m, `signature not found: ${signatureRe}`);
-    const brace = SRC.indexOf('{', m.index + m[0].length - 1);
-    const body = balanced(SRC, brace, '{', '}');
+    // Skip default-arg object literals (`opts = {}`) so we extract the
+    // function BODY brace, not a parameter initializer.
+    let i = m.index + m[0].length - 1;
+    let depth = 0;
+    let inParams = true;
+    for (; i < SRC.length; i++) {
+      const ch = SRC[i];
+      if (inParams) {
+        if (ch === '(') depth++;
+        else if (ch === ')') { depth--; if (depth === 0) inParams = false; }
+        continue;
+      }
+      if (ch === '{') break;
+    }
+    const body = balanced(SRC, i, '{', '}');
     assert.ok(body, `unterminated function body for ${signatureRe}`);
     return body;
   }
-  const FORBIDDEN = /veoService|atlasVideoService|generateForAd|prepareStoryboard/;
+  const FORBIDDEN = /veoService|atlasVideoService|atlasImageService|generateForAd|prepareStoryboard|submitGeneration|directImageRenderService/;
 
   check('E1 [MONEY] findDerivativesOfMaster never references a video-submit helper', () => {
     const body = functionBody(/async function findDerivativesOfMaster\(/);
@@ -509,6 +646,160 @@ function baseAd(over = {}) {
   check('E8 [MONEY/INTEGRITY] the sibling CAS write re-asserts siblingStillEligible, not a bare {_id}', () => {
     const body = functionBody(/async function recascadeDerivativeSibling\(/);
     assert.ok(/siblingStillEligible\(sibling\)/.test(body), 'the write must re-assert the same exclusion filter as the read, not a plain {_id}');
+  });
+
+  // Real require-graph BFS — same recipe as verifyTitlingResumeNeverResubmits.js.
+  // Starting from adRegenerateService.js itself is vacuous (that file
+  // requires videoRouter for runVideoFull). The cascade's only heavy callee
+  // is brandScriptExecutor (buildVideoQcFailureFields; adgen also calls
+  // renderBrandScriptAndSave). If THAT graph can reach a billable submit
+  // module, a cascade can spend.
+  function parseRequireSpecs(src) {
+    const specs = [];
+    const re = /require\(\s*(['"])((?:(?!\1).)+)\1\s*\)/g;
+    let m;
+    while ((m = re.exec(src))) specs.push(m[2]);
+    return specs;
+  }
+  function bfsRequireGraph(entryFiles) {
+    const visited = new Set();
+    const queue = [...entryFiles].map((f) => fs.realpathSync(f));
+    const edges = [];
+    while (queue.length) {
+      const file = queue.shift();
+      if (visited.has(file)) continue;
+      visited.add(file);
+      let src;
+      try { src = fs.readFileSync(file, 'utf8'); } catch { continue; }
+      for (const spec of parseRequireSpecs(src)) {
+        if (!spec.startsWith('.')) continue;
+        let resolved;
+        try { resolved = fs.realpathSync(require.resolve(spec, { paths: [path.dirname(file)] })); }
+        catch { continue; }
+        edges.push({ from: file, to: resolved });
+        if (!visited.has(resolved)) queue.push(resolved);
+      }
+    }
+    return { visited, edges };
+  }
+  const ATLAS_VIDEO = fs.realpathSync(path.join(ROOT, 'services', 'atlasVideoService.js'));
+  const ATLAS_IMAGE = fs.realpathSync(path.join(ROOT, 'services', 'atlasImageService.js'));
+  const VIDEO_ROUTER = fs.realpathSync(path.join(ROOT, 'services', 'videoRouter.js'));
+  const DIRECT_IMAGE = fs.realpathSync(path.join(ROOT, 'services', 'directImageRenderService.js'));
+
+  check('E9 [MONEY][POSITIVE CONTROL] BFS from adRegenerateService.js DOES reach atlasVideoService (via videoRouter)', () => {
+    const { visited } = bfsRequireGraph([SVC]);
+    assert.ok(visited.has(ATLAS_VIDEO), 'positive control: if this misses atlasVideoService, E10-E12 are vacuous');
+  });
+  check('E10 [MONEY] brandScriptExecutor.js require-graph never reaches atlasVideoService / atlasImageService / videoRouter / directImageRenderService', () => {
+    const { visited } = bfsRequireGraph([BSE]);
+    assert.ok(visited.size > 5, `graph looks too small (${visited.size}) — resolver may be broken`);
+    assert.ok(!visited.has(ATLAS_VIDEO), 'brandScriptExecutor must not reach atlasVideoService');
+    assert.ok(!visited.has(ATLAS_IMAGE), 'brandScriptExecutor must not reach atlasImageService');
+    assert.ok(!visited.has(VIDEO_ROUTER), 'brandScriptExecutor must not reach videoRouter');
+    assert.ok(!visited.has(DIRECT_IMAGE), 'brandScriptExecutor must not reach directImageRenderService');
+  });
+  check('E11 [MONEY] cascade function bodies never name atlasImageService / directImageRenderService / submitGeneration', () => {
+    for (const re of [
+      /async function findDerivativesOfMaster\(/,
+      /async function recascadeDerivativeSibling\(/,
+      /async function cascadeRegenerateToDerivatives\(/
+    ]) {
+      const body = functionBody(re);
+      assert.ok(!/atlasImageService|directImageRenderService|submitGeneration/.test(body), body);
+    }
+  });
+  check('E12 canvas-titling path is a documented latent landmine, not asserted permanently dead', () => {
+    const bseSrc = fs.readFileSync(BSE, 'utf8');
+    assert.ok(/restore when re-enabling the canvas path/.test(bseSrc),
+      'resolveTitlingEngine is hard-wired to remotion; recascadeDerivativeSibling not calling qcAndStampVideoAd is true TODAY because of that kill switch — do not claim the canvas path is permanently dead');
+  });
+
+  // ═══════════════════════════════════════════════════════════════════
+  // GROUP F — runVideoFull tail (fresh verdict, promote, cascade)
+  // ═══════════════════════════════════════════════════════════════════
+  const dummyProgress = { checkpoint: async () => {}, stage() {} };
+
+  function bindAd() {
+    stub(AD, { find: (f) => AdCol.find(f), findById: (id) => AdCol.findById(id), updateOne: (f, u) => AdCol.updateOne(f, u) });
+  }
+
+  await checkAsync('F1 [TAIL] successful regen of a failed master promotes it and recascades a same-family sibling', async () => {
+    const master = baseAd({ _id: 'a0000000000000000000000', status: 'failed', deriveFromMaster: null, veoVideoUrl: 'https://old.example/m', visionQc: { passed: false, skipped: false, disabled: false } });
+    const sibling = baseAd({ _id: 's1000000000000000000000', deriveFromMaster: master.platformFormat, status: 'draft', veoVideoUrl: 'https://old.example/s1' });
+    AdCol = new MiniCollection([master, sibling]);
+    bindAd();
+    bseState.visionQc = { passed: true, skipped: false, disabled: false };
+    bseState.swallowQc = false;
+    bseCalls = [];
+    await svc.runVideoFull(master._id, null, dummyProgress);
+    const afterMaster = await AdCol.findById(master._id).lean();
+    const afterSibling = await AdCol.findById(sibling._id).lean();
+    assert.strictEqual(afterMaster.status, 'draft', 'failed → draft on a genuine success');
+    assert.strictEqual(afterSibling.veoVideoUrl, 'https://new.example/omni-master.mp4', 'same-family sibling provenance must update');
+  });
+
+  await checkAsync('F2 [TAIL] a real QC failure does not promote and does not cascade', async () => {
+    const master = baseAd({ _id: 'a0000000000000000000000', status: 'failed', deriveFromMaster: null, veoVideoUrl: 'https://old.example/m' });
+    const sibling = baseAd({ _id: 's1000000000000000000000', deriveFromMaster: master.platformFormat, veoVideoUrl: 'https://old.example/s1' });
+    AdCol = new MiniCollection([master, sibling]);
+    bindAd();
+    bseState.visionQc = { passed: false, skipped: false, disabled: false, attempts: [{ summary: 'sim' }] };
+    bseState.swallowQc = false;
+    await svc.runVideoFull(master._id, null, dummyProgress);
+    const afterMaster = await AdCol.findById(master._id).lean();
+    const afterSibling = await AdCol.findById(sibling._id).lean();
+    assert.strictEqual(afterMaster.status, 'failed');
+    assert.strictEqual(afterSibling.veoVideoUrl, 'https://old.example/s1', 'rejected plate must not fan out');
+  });
+
+  await checkAsync('F3 [TAIL] swallowed QC (no fresh verdict) is fail-closed: no promote, no cascade, even if prior visionQc was a pass', async () => {
+    const master = baseAd({
+      _id: 'a0000000000000000000000',
+      status: 'failed',
+      deriveFromMaster: null,
+      veoVideoUrl: 'https://old.example/m',
+      visionQc: { passed: true, skipped: false, disabled: false }
+    });
+    const sibling = baseAd({ _id: 's1000000000000000000000', deriveFromMaster: master.platformFormat, veoVideoUrl: 'https://old.example/s1' });
+    AdCol = new MiniCollection([master, sibling]);
+    bindAd();
+    bseState.swallowQc = true;
+    await svc.runVideoFull(master._id, null, dummyProgress);
+    bseState.swallowQc = false;
+    const afterMaster = await AdCol.findById(master._id).lean();
+    const afterSibling = await AdCol.findById(sibling._id).lean();
+    assert.strictEqual(afterMaster.status, 'failed', 'must not promote off a stale prior pass');
+    assert.strictEqual(afterSibling.veoVideoUrl, 'https://old.example/s1', 'must not cascade with no fresh verdict');
+  });
+
+  await checkAsync('F4 [TAIL] a cross-family sibling (different mediaId) is not recascaded by runVideoFull', async () => {
+    const master = baseAd({ _id: 'a0000000000000000000000', status: 'failed', deriveFromMaster: null, mediaId: 'family-1', veoVideoUrl: 'https://old.example/m' });
+    const otherFamily = baseAd({ _id: 'sD000000000000000000000', deriveFromMaster: master.platformFormat, mediaId: 'family-2', veoVideoUrl: 'https://old.example/other' });
+    AdCol = new MiniCollection([master, otherFamily]);
+    bindAd();
+    bseState.visionQc = { passed: true, skipped: false, disabled: false };
+    bseState.swallowQc = false;
+    await svc.runVideoFull(master._id, null, dummyProgress);
+    const afterOther = await AdCol.findById(otherFamily._id).lean();
+    assert.strictEqual(afterOther.veoVideoUrl, 'https://old.example/other');
+  });
+
+  await checkAsync('F5 operator cancel mid-cascade is rethrown (does not swallow CancelledError)', async () => {
+    const master = freshMaster({ status: 'draft', veoVideoUrl: 'https://new.example/master-v2' });
+    const sibling = baseAd({ _id: 's1000000000000000000000', deriveFromMaster: master.platformFormat, veoVideoUrl: 'https://old.example/s1' });
+    AdCol = new MiniCollection([master, sibling]);
+    bindAd();
+    const cancelErr = Object.assign(new Error('Operation cancelled'), { name: 'CancelledError', code: 'CANCELLED' });
+    let threw = false;
+    try {
+      await svc.cascadeRegenerateToDerivatives(master._id, {
+        progressRun: { checkpoint: async () => { throw cancelErr; } }
+      });
+    } catch (err) {
+      threw = err === cancelErr || err.name === 'CancelledError';
+    }
+    assert.ok(threw, 'CancelledError must propagate so the caller can settle the run as cancelled');
   });
 
   console.log(`\n${checks} passed, ${failures.length} failed\n`);
