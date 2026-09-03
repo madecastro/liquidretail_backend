@@ -169,9 +169,17 @@ const REFRAME_BORDER_STD_MAX = () => {
 // Ladder id persisted on Media.metadata.reframes[*]. BUMP THIS whenever the
 // ladder changes in a way that should invalidate previously-derived assets.
 //   uncrop-v1 → the first port (1k + uncrop prompt, no product-only routing)
-//   reframe-v2 → current: 4k + conservative 'reframe' prompt, product-only $0
+//   reframe-v2 → 4k + conservative 'reframe' prompt, product-only $0
 //                pad routing, output ratio validation, solid-preferred pad
-const REFRAME_LADDER_VERSION = 'reframe-v2';
+//   reframe-v3 → 2026-09-03: pad-product-only shifted from fixed 720×1280
+//                (Atlas 720p cap era) to SOURCE-NATIVE dims so Omni gets
+//                more edge detail on on-garment graphics. Bump forces a
+//                one-time re-derive on every cached pad so backend + adgen
+//                converge on the same dims and any low-res pad we already
+//                shipped gets invalidated without a manual sweep. Governed
+//                by REFRAME_PAD_TARGET (default 'source-native'); a value
+//                of 'model-720p' restores pre-change behaviour byte-for-byte.
+const REFRAME_LADDER_VERSION = 'reframe-v3';
 // Additive prompt hardening. When true, reframePromptForAspect appends
 // SUBJECT IDENTITY, PHYSICAL ACCURACY, and (when the source has YOLO subjects
 // touching a frame edge) SOURCE-EDGE PROTECTION clauses. When false — the
@@ -1673,9 +1681,73 @@ async function detectBorderFill(buffer, srcRatio, targetRatio) {
 // plan (b_blurred needs an add-on we don't have — see
 // services/extendedCropsService.js:127-129). Returns null for non-Cloudinary
 // sources, which the caller handles by padding the bytes locally instead.
-function cloudinaryPadUrl(sourceUrl, aspectRatio, hex) {
+//
+// PAD TARGET SIZING (2026-09-03). Two modes, chosen by REFRAME_PAD_TARGET:
+//
+//   'source-native' (default) — preserve the source's PRIMARY dimension and
+//     extend the OTHER to reach the target aspect. For a 2000×2000 source
+//     going to 9:16, that's 2000×3556: source width intact, height extended
+//     with the solid pad. Omni sees every real product pixel at full source
+//     resolution and downsamples once, internally, from a maximally-detailed
+//     input. This matches adgen's already-live behaviour and is what closed
+//     the backend/adgen pad-dim divergence documented in the reframe-v3
+//     ladder bump above.
+//
+//   'model-720p' (legacy) — fixed 720×1280 (or the equivalent for other
+//     aspects) via imageDimsForAspect. This was correct in the Atlas
+//     720p-cap era; Omni now accepts higher-resolution inputs and the
+//     source-native path measurably preserves more graphic edge detail.
+//     Kept behind the switch so an operator can revert without a deploy
+//     if a specific product regresses at higher res.
+//
+// Fail-safe: source-native mode falls back to imageDimsForAspect when either
+// sourceW or sourceH is missing (unknown dims → no way to compute native
+// pad rect). Any other REFRAME_PAD_TARGET value also falls back to
+// source-native.
+function padTargetMode() {
+  const raw = String(process.env.REFRAME_PAD_TARGET || '').toLowerCase().trim();
+  if (raw === 'model-720p') return 'model-720p';
+  return 'source-native';
+}
+
+// Compute the (w, h) rect to c_pad the source onto for the target aspect.
+// Preserves the dimension the source is already at least as large as
+// (its "primary" dim relative to the target aspect) and extends the other.
+// Never invents pixels — c_pad on the returned rect is a pure Cloudinary
+// transform that composites the source onto a solid canvas of the returned
+// dims.
+function padDimsForSource(sourceW, sourceH, aspectRatio) {
+  const [wr, hr] = String(aspectRatio || '').split(':').map(Number);
+  if (!(wr > 0 && hr > 0)) return null;
+  const targetAspect = wr / hr;
+  const sourceAspect = sourceW / sourceH;
+  // Source WIDER than target → keep source width, extend height (add pad
+  // top/bottom). Portrait-going-tall case: 2000×2000 → 9:16 = 2000×3556.
+  // Source TALLER than target → keep source height, extend width (add
+  // pad left/right). Landscape-going-wide case: 2000×2000 → 16:9 = 3556×2000.
+  // Source aspect ~= target → tiny pad; still returns a valid rect.
+  if (sourceAspect > targetAspect) {
+    return { w: sourceW, h: Math.round(sourceW / targetAspect) };
+  }
+  return { w: Math.round(sourceH * targetAspect), h: sourceH };
+}
+
+function cloudinaryPadUrl(sourceUrl, aspectRatio, hex, sourceW = null, sourceH = null) {
   if (!sourceUrl || !sourceUrl.includes('/image/upload/')) return null;
-  const { w, h } = imageDimsForAspect(aspectRatio);
+  let w, h;
+  if (padTargetMode() === 'source-native' && Number.isFinite(sourceW) && Number.isFinite(sourceH) && sourceW > 0 && sourceH > 0) {
+    const nativeDims = padDimsForSource(sourceW, sourceH, aspectRatio);
+    if (nativeDims) {
+      w = nativeDims.w;
+      h = nativeDims.h;
+    }
+  }
+  if (w == null || h == null) {
+    // Fallback: legacy fixed-target dims. Fires when the switch is on
+    // 'model-720p', when source dims are unavailable, or when the aspect
+    // string is malformed.
+    ({ w, h } = imageDimsForAspect(aspectRatio));
+  }
   const bg = hex ? `b_rgb:${hex}` : 'b_auto:predominant_gradient';
   return sourceUrl.replace(
     '/image/upload/',
@@ -2234,7 +2306,10 @@ async function reframeReferenceForAspect({ media, sourceUrl, aspectRatio, brand,
         }
         const hex = padDec.hex;
 
-        let padUrl = cloudinaryPadUrl(sourceUrl, aspectRatio, hex);
+        // media.width/height feed padDimsForSource so REFRAME_PAD_TARGET=
+        // source-native pads to native resolution. Unknown dims silently
+        // fall back to the fixed 720×1280 model target — no throw.
+        let padUrl = cloudinaryPadUrl(sourceUrl, aspectRatio, hex, media?.width, media?.height);
         if (!padUrl && sample) {
           // Non-Cloudinary source: can't transform by URL, so pad the bytes.
           const { w: pw, h: ph } = imageDimsForAspect(aspectRatio);
@@ -5290,6 +5365,12 @@ module.exports = {
   validateVideoSettings,
   buildSubmissionBody,
   imageDimsForAspect,
+  // Exported for scripts/verifyReframePadDims.js — offline pins on the
+  // source-native pad math + the REFRAME_PAD_TARGET switch.
+  cloudinaryPadUrl,
+  padDimsForSource,
+  padTargetMode,
+  REFRAME_LADDER_VERSION,
   cropImageUrlForAspect,
   buildVideoSegmentUrl,
   buildReferenceImages,
