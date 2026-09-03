@@ -1,8 +1,8 @@
 {
   "version": 2,
   "backendRef": "origin/main",
-  "backendHead": "6fcd5e55731a408794a3df4dd0e28f0512e6b07a",
-  "generatedAt": "2026-09-03T19:07:28.803Z",
+  "backendHead": "01a62e865a69d1d9e7fb21f0b0e9f23283c04bc7",
+  "generatedAt": "2026-09-03T19:44:03.150Z",
   "files": {
     "models/Ad.js": {
       "backendHash": "e97c8737fdbc8c630cd027fddcd7dbd84636395a0b1af55f21c12703dd41b72d",
@@ -638,7 +638,7 @@
       "adgenHash": "bef1fc6ac70d9605a2feb42e4d161fba47332a18785214e47eff45e62e7f40c9",
       "backendSha": "b4eb6435c7d9717aaafe191c28d5bdf8b22a2691",
       "status": "unported",
-      "reason": "Pre-existing debt UNCHANGED (still owed, from 2026-08-27): regenerate status-promotion + free-derivative cascade fix -- equivalent fix independently landed in backend PR #380 in the same session, not byte-identical (backend has no Remotion, provenance-only vs adgen's real composite path), backend-side owed work if any is its own copy's equivalent logic, already done -- this repo's own vendor-manifest-correction PR (referenced by verifyRegenerateInFlightGate's E1 merge-order check) is the one that formally closes this, not this PR. ADDITIONALLY (PR #110): adRegenerateService parks a Gemini lease-exhausted skip on the existing regenerate claim rather than markComplete. Adgen-only -- backend has no Gemini video path. Second fix round: comment-only (renderer no longer requeues a cap-miss; generateForAd's internal backoff is the full mint-time budget).",
+      "reason": "OWES PORTS IN BOTH DIRECTIONS -- adgen has Gemini-lease-exhausted-skip handling (PR #110), the MAX_RECLAIMS reclaim ceiling, and titlingResumeService/costTracker requires backend's copy lacks (adgen-only, no Gemini video path on backend). Backend has its own additions adgen lacks: the isAdgenRendererEnabled/adgenBridge call-time handoff gate (2026-08-26 routing fix) and its accompanying doc comments. Neither side is a strict superset of the other -- each owes the other a port of what it's missing, tracked here rather than reconciled blind since the two files solve genuinely different problems (adgen renders for real, backend is provenance-only, no Remotion).",
       "portTo": "backend",
       "owedSince": "2026-08-27T10:28:51.314Z"
     },
