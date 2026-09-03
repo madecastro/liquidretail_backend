@@ -463,6 +463,17 @@ function notifyRenderFailure(ad, err) {
           key:    `video-unsettled:${msg.slice(0, 60)}`,
           fields: { ...commonFields, predictionId: err.predictionId || null, error: msg.slice(0, 300) }
         });
+      } else if (err && err.contentPolicyBlocked) {
+        // Distinct from the generic "Video generation failed" bucket below —
+        // a content-policy rejection is actionable differently (rephrase the
+        // prompt / review the source imagery / appeal to Google), not a bug
+        // in our own pipeline, so it gets its own title and dedupe key.
+        alerts.notifyAsync({
+          level:  'warn',
+          title:  '🚫 Video generation BLOCKED by Gemini content policy',
+          key:    `video-content-policy-blocked:${adId}`,
+          fields: { ...commonFields, predictionId: err.predictionId || null, error: msg.slice(0, 300) }
+        });
       } else {
         alerts.notifyAsync({
           level:  'error',

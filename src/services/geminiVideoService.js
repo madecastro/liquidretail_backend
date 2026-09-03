@@ -343,6 +343,12 @@ function estimateCost({ durationSec, resolution }) {
  */
 function classifyPoll(body) {
   const status = String(body?.status || '').toLowerCase();
+  // Gemini's error.code is NOT a short enum — it can be a full sentence
+  // (e.g. a content-policy rejection: "Unable to show the generated video.
+  // The video was filtered out because it violated Google's ... policy.").
+  // Match known short codes with equality; everything else that still HAS
+  // an error object falls through to the generic-error branch below rather
+  // than silently matching nothing.
   const errCode = String(body?.error?.code || '').toLowerCase();
 
   if (errCode === 'too_many_requests') {
@@ -354,6 +360,18 @@ function classifyPoll(body) {
     return { state: 'completed', billed: 'yes', retryable: false };
   }
   if (status === 'failed' || status === 'error') {
+    return { state: 'failed', billed: 'possible', retryable: false };
+  }
+  // GENERIC ERROR FALLBACK — live-confirmed gap (2026-09-03): a content-policy
+  // rejection body is `{error:{message,code}}` with NO top-level `status`
+  // field at all, so it matched none of the branches above and fell through
+  // to `pending` — the poll loop read that as "still processing" and looped
+  // until MAX_POLL_MS, then treated it as a mere timeout instead of the
+  // definitive rejection it already was. ANY body carrying a top-level
+  // `error` object that didn't match a more specific case above is terminal,
+  // not pending — this is a safety net for response shapes we haven't
+  // individually enumerated, not just the one observed shape.
+  if (body && body.error) {
     return { state: 'failed', billed: 'possible', retryable: false };
   }
   return { state: 'pending', billed: 'possible', retryable: false };
@@ -733,8 +751,19 @@ async function generateForAd({ ad, prompt = null, images = null, aspectRatio, du
     }
 
     if (verdict.state === 'failed') {
+      // Distinguish a content-policy rejection from any other terminal
+      // failure — live-confirmed shape (2026-09-03): error.message/code
+      // mention Google's Generative AI Prohibited Use policy, "filtered",
+      // or "blocked". This is actionable differently than a generic
+      // technical failure (rephrase the prompt / review the product
+      // image / escalate to Google), so it gets its own error code and,
+      // via notifyRenderFailure in renderer.js, its own Slack alert
+      // instead of being lumped into "Video generation failed".
+      const errBlob = `${body?.error?.message || ''} ${body?.error?.code || ''}`.toLowerCase();
+      const isContentPolicyBlock = /prohibited|content polic|filtered out|violat.*polic/.test(errBlob);
       const err = new Error(`gemini video: generation failed (${JSON.stringify(body?.error || {}).slice(0, 300)})`);
-      err.code = 'GEMINI_GENERATION_FAILED';
+      err.code = isContentPolicyBlock ? 'GEMINI_CONTENT_POLICY_BLOCKED' : 'GEMINI_GENERATION_FAILED';
+      err.contentPolicyBlocked = isContentPolicyBlock;
       err.billed = 'possible';
       err.predictionId = interactionId;
       throw err;
