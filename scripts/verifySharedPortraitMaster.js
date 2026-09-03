@@ -649,9 +649,10 @@ check('A4 [MONEY] resolvePortraitMasterFormat is DEFINED once and CALLED once',
   const regenSrc = fs.readFileSync(
     path.join(ROOT, 'services/adRegenerateService.js'), 'utf8');
   check('I1 [MONEY] regenerate preflight still uses the SHARED gate',
-    /const \{ resolveDeriveFromMaster \} = require\('\.\/campaignAdsGenerationService'\)/
+    /const \{[^}]*\bresolveDeriveFromMaster\b[^}]*\} = require\('\.\/campaignAdsGenerationService'\)/
       .test(regenSrc)
-      && /resolveDeriveFromMaster\(ad\)/.test(regenSrc));
+      && /resolveDeriveFromMaster\(ad\)/.test(regenSrc),
+    'the destructure may grow additional names from the same module; dropping resolveDeriveFromMaster itself re-opens the regenerate hole');
   check('I2 [MONEY] a shared-plate PMax 9:16 is refused by preflight',
     svc.resolveDeriveFromMaster({
       platformFormat: PMAX_9, deriveFromMaster: META_MASTER

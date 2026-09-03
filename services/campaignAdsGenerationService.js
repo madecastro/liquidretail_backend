@@ -4539,6 +4539,11 @@ module.exports = {
   // doc comment: a per-caller copy is how the regenerate hole opened.
   // Also covers funnel-variant ads (fail-closed on funnelStage).
   resolveDeriveFromMaster,
+  // Same predicate computeDeterministicVideoDigest uses to decide whether
+  // videoDurationSec is identity. Exported so the regenerate cascade
+  // family filter (adRegenerateService.buildDerivativesOfMasterFilter)
+  // joins duration on PMax without copying the format-set a third time.
+  isGooglePmaxVideoFormat,
   // THE canonical "is this ad a true video master" predicate — same four
   // conditions findSiblingMasterAd's query filter checks (routes/ads.js),
   // factored out for the frontend-facing Master badge. See its own doc

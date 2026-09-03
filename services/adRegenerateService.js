@@ -44,8 +44,11 @@ const brandScriptExecutor   = require('./brandScriptExecutor');
 const { uploadBufferToCloudinary } = require('./cloudinaryService');
 const directImage           = require('./directImageRenderService');
 // THE shared derive-only gate (money). Imported, never re-implemented —
-// see its doc comment in campaignAdsGenerationService.
-const { resolveDeriveFromMaster } = require('./campaignAdsGenerationService');
+// see its doc comment in campaignAdsGenerationService. isGooglePmaxVideoFormat
+// is the same predicate computeDeterministicVideoDigest uses to decide
+// whether videoDurationSec is identity — imported here so the cascade
+// family filter cannot drift from the digest by duplicating the format set.
+const { resolveDeriveFromMaster, isGooglePmaxVideoFormat } = require('./campaignAdsGenerationService');
 const { isUgcFirstSeedingEnabled } = require('./seededUniverseService');
 const ugcVideoPipeline             = require('./ugcVideoPipeline');
 // Ad-gen microservice handoff (routing fix, 2026-08-26). Same call-time-read
@@ -1018,7 +1021,411 @@ async function runVideoFull(adId, prompt, progressRun = null, videoModel = null,
   if (progressRun) { await progressRun.checkpoint(); progressRun.stage('compositing'); }
   await setStage(adId, 'composite');
   const adFinal = await Ad.findById(adId).lean();
-  await brandScriptExecutor.qcAndStampVideoAd({ ad: adFinal, deliveredUrl: veoResult.videoUrl });
+  // Use the RETURN value, not a re-read of Ad.visionQc. qcAndStampVideoAd's
+  // own catch swallows a QC infra failure and writes nothing — a re-read
+  // would then treat the PREVIOUS render's verdict as this pass's (and
+  // could promote/cascade a plate nobody inspected this time). No fresh
+  // verdict ⇒ not-promotable, not-cascadable.
+  const thisPassQc = await brandScriptExecutor.qcAndStampVideoAd({ ad: adFinal, deliveredUrl: veoResult.videoUrl });
+
+  // ── Fix — status promotion on a genuinely successful regenerate ────────
+  // qcAndStampVideoAd never forces 'draft' on success — it only ever stamps
+  // status on a REAL QC failure (buildVideoQcFailureFields) — so there is no
+  // un-publish hazard on this (now titling-free) path the way there is on
+  // adgen's copy of this file, which still calls uploadRenderAndStamp via
+  // renderBrandScriptAndSave. Reuse buildVideoQcFailureFields's own predicate
+  // (the exact function that decides "real QC failure" for the shared
+  // terminal write) rather than re-deriving it. See promoteFailedToDraft's
+  // doc comment for why the promotion itself is filter-scoped rather than a
+  // blanket stamp.
+  const qcJustFailed = !!brandScriptExecutor.buildVideoQcFailureFields(thisPassQc).status;
+  if (thisPassQc && !qcJustFailed) await promoteFailedToDraft(adId);
+
+  // Fix 2 — cascade this successful master regenerate to its same-identity
+  // derivative siblings. This path is currently unreachable in production
+  // (see this function's own header — regenerateAd returns before
+  // performRegeneration whenever shouldDeferToAdgen() is true); kept for
+  // parity with adgen's copy and for correctness if ADGEN_RENDERER_ENABLED
+  // is ever rolled back. MUST NOT run when THIS regenerate produced no
+  // fresh QC verdict, or when that verdict is a real fail — a rejected (or
+  // uninspected) plate has no business fanning out to every sibling.
+  // Never allowed to fail the master's own regenerate result. See
+  // cascadeRegenerateToDerivatives's own doc comment for the money invariant.
+  if (thisPassQc && !qcJustFailed) await cascadeRegenerateToDerivatives(adId, { progressRun });
+}
+
+// ── Fix 1 shared helper — status promotion on a genuinely successful
+// regenerate ────────────────────────────────────────────────────────────
+// Promote a previously-'failed' ad back to 'draft' after ITS OWN regenerate
+// (or, from the cascade below, its master's regenerate) just persisted a
+// real new render. Scoped in the FILTER, not by branching on a status value
+// read earlier in the call, so a status that changed between read and write
+// (another process, an operator) is respected — this can never touch
+// 'draft' / 'live' / 'archived'.
+//
+// History: this exact intent existed before 2026-08-28 via
+// brandScriptExecutor.uploadRenderAndStamp's default (preserveAdStatus:
+// false) stamp, reached from THIS file's runVideoFull whenever a brand
+// resolved. That stamp is UNCONDITIONAL (any prior status -> 'draft'),
+// which is unsafe on a 'live' ad (silently un-publishes it). adgen's copy
+// of this file still calls that stamp from runVideoFull; an earlier
+// revision of THIS PR tried to gate it with a conditional retitleMode and
+// that attempt was reverted — retitleMode suppresses the QC-fail
+// quarantine AND skips stampTitlingFailureAndThrow (see the follow-up
+// note on adgen's runVideoFull). The 2026-08-28 titling removal here
+// (commit abf7e0c2, owner directive "remove and disable the backend
+// titling function, we are not going to go back to it") deleted this
+// file's ONLY call into that stamp as a side effect of an unrelated,
+// titling-only directive — the status side-effect loss was collateral,
+// not the intent. This helper restores the INTENT (promote a
+// genuinely-successful regenerate off 'failed') without the hazard: it
+// only ever writes 'failed' -> 'draft', gated in the query itself, never
+// a blanket stamp. On this (titling-free) path there is no un-publish
+// of a live ad, because qcAndStampVideoAd never forces 'draft' on
+// success. adgen's live-unpublish on regenerate remains a known
+// production bug, unfixed by this PR.
+async function promoteFailedToDraft(adId) {
+  try {
+    await Ad.updateOne(
+      { _id: adId, status: 'failed' },
+      { $set: { status: 'draft', updatedAt: new Date() } }
+    );
+  } catch (err) {
+    console.warn(`🔁 regenerate[ad=${adId}]: status promotion failed (non-fatal) — ${err.message}`);
+  }
+}
+
+// ── Fix 2 — cascade a master's successful video regenerate to its
+// same-identity derivative siblings ─────────────────────────────────────
+//
+// ⚠️ MONEY — ZERO Atlas/Omni submits in this function or anything it calls,
+// STRUCTURALLY: neither this function nor recascadeDerivativeSibling below
+// requires or calls veoService / atlasVideoService. A derivative ad's whole
+// reason to exist is that it never pays for its own plate (resolveDeriveFrom
+// Master / routes/ads.js's renderDeriveOnlyVideoAd, the mint-time reference
+// for this exact zero-Omni-spend copy) — after a master regenerates, its
+// siblings get a provenance update from the NEW master plate the same way,
+// never re-submitted. THIS repo does not composite a sibling (no Remotion
+// here — adgen's copy is the one that actually re-titles). A titled
+// sibling is provenance-only; an inherited (never independently titled)
+// sibling also has renderUrl updated with the new plate so the mint-time
+// `renderUrl === veoVideoUrl` invariant holds. The sibling cap is shared
+// with adgen for parity (adgen's compositing copy is where a fan-out
+// actually costs Remotion slots), not because this file spends them.
+//
+// findDerivativesOfMaster inverts findSiblingMasterAd's filter shape
+// (routes/ads.js): every derivative row stamps deriveFromMaster to the
+// master's OWN platformFormat (campaignAdsGenerationService.
+// planDeterministicVideoAds — including same-format funnel-stage retitles,
+// which derive from their own unstaged master format), and a true master
+// row always carries deriveFromMaster:null, so this can never match the
+// master's own document.
+//
+// NOT scoped by campaignRunIds — tried in an earlier version of this fix
+// and DELIBERATELY REMOVED after a second adversarial review pass (Grok,
+// 2026-09-02) proved it wrong in the harmful direction. masters are NOT
+// $addToSet'd onto every run that logically depends on them the way
+// queued rows are (routes/ads.js's claimAdsForRun only $addToSet's
+// status:'queued' rows) — so a genuinely-current funnel-variant or
+// new-format sibling minted in a LATER run than the master's own
+// campaignRunIds snapshot would silently fail the {$in:
+// masterAd.campaignRunIds} filter and never get recascaded. That is
+// Fix 2 failing on an ordinary "Generate more / add funnel stages"
+// flow.
+//
+// ⚠️ THE UNIQUE (campaignId, identityDigest) INDEX DOES NOT MAKE
+// campaignId+productId+deriveFromMaster a complete family key.
+// computeDeterministicVideoDigest ALSO hashes refKey (referenceMediaIds
+// if non-empty, else mediaId), ctaText, ctaUrl, ctaUrlParams,
+// videoPromptGuidance and videoPromptRaw. A second Generate on the same
+// campaign+product with a different seed or a different CTA mints a
+// SECOND stories master with its own live derive family — both families
+// stamp the identical deriveFromMaster string. Joining only on
+// campaignId+productId+deriveFromMaster+kind would CAS-write M1's plate
+// onto D2. The filter therefore also joins the rest of that video
+// identity (mediaId / referenceMediaIds + CTA + prompt fields).
+// platformFormat / funnelStage differ WITHIN a family and must not be
+// joined on. Duration is the exception for Google PMax only — it IS
+// hashed into that family's identity digest (computeDeterministicVideoDigest
+// via isGooglePmaxVideoFormat), so a 10s PMax master and a 12s PMax
+// master are different families even when they stamp the same
+// deriveFromMaster string. Meta formats deliberately omit duration;
+// joining it there would under-match legitimate Meta siblings.
+//
+// An undefined masterAd.platformFormat is a hard refuse: mongoose keeps
+// `deriveFromMaster: undefined` through cast() and the BSON serializer
+// DROPS the key, so the query would degenerate to campaignId+productId+
+// kind:'video' and match every eligible video ad in that product —
+// including other paid masters. Same refuse for missing campaignId /
+// productId, and for a master with no mediaId and no reference stack.
+//
+// EXCLUDES (SIBLING_MID_FLIGHT_EXCLUSION, shared verbatim with the CAS
+// write below): any sibling mid-flight elsewhere right now (regenerating,
+// claimedByWorker, retitleClaimedByWorker — declared on this repo's
+// models/Ad.js for schema parity even though the retitle CONSUMER itself is
+// adgen-only, see adgen's copy of this function — titlingNeeded, the
+// mint-time renderer->titler handoff marker); any sibling still inside its
+// OWN first-render/derive-wait lifecycle (status:'rendering'/'queued'); and
+// 'archived' — a retired ad is not silently refreshed by a background
+// cascade the operator did not act on for that specific row. THIS IS A
+// READ-TIME FILTER ONLY — the write in recascadeDerivativeSibling
+// re-asserts every one of these conditions as a CAS on the update itself
+// (adversarial review, 2026-09-02 — this repo shares ONE Mongo collection
+// with adgen, and this file's own regenerate execution path is dormant
+// today only because of a feature flag on the WEB process; a concurrent
+// adgen render/titler/retitle claim on the same row is a real race the
+// moment this path is ever revived). Unlike adgen's copy, this repo's
+// recascadeDerivativeSibling makes exactly ONE write (provenance, plus
+// renderUrl only when the sibling is still inherited — see that
+// function's own header), so there is no separate later "delivery write"
+// for a concurrent claim to race — the CAS here is the whole operation,
+// not a lease-shaped residual.
+const SIBLING_MID_FLIGHT_EXCLUSION = {
+  regenerating:            { $ne: true },
+  claimedByWorker:          null,
+  retitleClaimedByWorker:   null,
+  titlingNeeded:            { $ne: true },
+  status:                   { $nin: ['rendering', 'queued', 'archived'] }
+};
+
+// Mixed Meta+PMax funnel fan-out is ~20 same-family derives of one portrait
+// plate (11 Meta + 9 PMax-portrait). 24 leaves headroom. The cascade is
+// zero Atlas/Omni spend. In THIS repo each sibling is a provenance update
+// (no compositing / no Remotion); the cap is shared with adgen for parity
+// so a rollback cannot unbounded-fanout the compositing copy either.
+const MAX_REGEN_CASCADE_SIBLINGS = Math.max(
+  1,
+  parseInt(process.env.REGEN_CASCADE_MAX_SIBLINGS, 10) || 24
+);
+
+function digestStringValue(value) {
+  return value == null ? '' : String(value);
+}
+
+// Duration join for PMax family matching. Uses digestStringValue for the
+// same null/empty-equality the other identity fields (and
+// computeDeterministicVideoDigest's duration part) already use, then
+// Number() because Ad.videoDurationSec is a Number — leaving the string
+// '10' would miss stored 10s rows.
+function digestDurationValue(value) {
+  if (digestStringValue(value) === '') return null;
+  const n = Number(value);
+  return Number.isFinite(n) ? n : null;
+}
+
+// Pure. Returns the Mongo filter, or null when the master is missing a
+// field the filter needs for selectivity (caller MUST NOT query). Exported
+// so the harness can assert the undefined-platformFormat refuse against the
+// REAL filter object — miniMongoStub treats `undefined` as a matchable
+// value, but BSON drops the key, which is the over-match this exists to
+// close.
+function buildDerivativesOfMasterFilter(masterAd) {
+  if (!masterAd) return null;
+  if (!masterAd.platformFormat || !masterAd.campaignId || !masterAd.productId) return null;
+  const refs = Array.isArray(masterAd.referenceMediaIds) ? masterAd.referenceMediaIds : [];
+  if (masterAd.mediaId == null && refs.length === 0) return null;
+  const filter = {
+    campaignId:          masterAd.campaignId,
+    productId:           masterAd.productId,
+    deriveFromMaster:    masterAd.platformFormat,
+    kind:                'video',
+    _id:                 { $ne: masterAd._id },
+    ...SIBLING_MID_FLIGHT_EXCLUSION,
+    referenceMediaIds:   refs,
+    ctaText:             digestStringValue(masterAd.ctaText),
+    ctaUrl:              digestStringValue(masterAd.ctaUrl),
+    ctaUrlParams:        digestStringValue(masterAd.ctaUrlParams),
+    videoPromptGuidance: masterAd.videoPromptGuidance || null,
+    videoPromptRaw:      masterAd.videoPromptRaw || null
+  };
+  if (masterAd.mediaId != null) filter.mediaId = masterAd.mediaId;
+  // Duration is identity for Google PMax video formats only. Omitting this
+  // clause matches a 12s PMax derive onto a 10s master's cascade (same
+  // deriveFromMaster stamp, different digest). Meta must not join here.
+  if (isGooglePmaxVideoFormat(masterAd.platformFormat)) {
+    filter.videoDurationSec = digestDurationValue(masterAd.videoDurationSec);
+  }
+  return filter;
+}
+
+async function findDerivativesOfMaster(masterAd) {
+  const filter = buildDerivativesOfMasterFilter(masterAd);
+  if (!filter) return [];
+  return Ad.find(filter).lean();
+}
+
+// The exact exclusion clauses findDerivativesOfMaster reads with, reused
+// verbatim (via SIBLING_MID_FLIGHT_EXCLUSION) as the CAS filter on the
+// sibling's own update below — ONE definition, so the read-time skip and
+// the write-time claim can never drift apart.
+function siblingStillEligible(sibling) {
+  return { _id: sibling._id, ...SIBLING_MID_FLIGHT_EXCLUSION };
+}
+
+// Re-composite ONE derivative sibling from its master's freshly-regenerated
+// plate. Mirrors routes/ads.js's renderDeriveOnlyVideoAd (the mint-time
+// reference for this exact free-copy) but for an ad that already exists and
+// already shipped once, so this does not touch renderAttempts /
+// deriveWaitAttempts (mint-time waiter bookkeeping) and does not wait for
+// the master — the master is settled by construction (this runs from inside
+// the master's OWN post-regenerate success path).
+//
+// ⚠️ THIS REPO CANNOT PRODUCE A GENUINE COMPOSITE FOR A SIBLING AT ALL, and
+// that is the whole reason this function is deliberately minimal (adversarial
+// review, 2026-09-02 — TWO independent Grok passes on the FIRST version of
+// this diff, run against both repos, converged on the same defect here).
+// Cropping a raw 9:16 master down to a 1:1/4:5/Reels surface only happens
+// INSIDE brandScriptExecutor.renderWithRemotionAndSave's Remotion pipeline
+// (basePlateCropService), and this file no longer calls
+// renderBrandScriptAndSave at all since the 2026-08-28 titling removal
+// (commit abf7e0c2) — adgen owns titling exclusively now. So there is no
+// safe way for THIS repo to write a correctly-cropped, aspect-correct
+// titled renderUrl for a sibling; an earlier version of this function wrote
+// `renderUrl: masterAd.veoVideoUrl` anyway — the RAW, uncropped 9:16 master
+// — directly into an already-LIVE, already-correctly-titled sibling's
+// renderUrl, and left a now-stale posterUrl behind it. On rollback that
+// would have silently stripped every live derivative's titling: Meta push
+// refuses an untitled asset and delivery counts drop it, and this repo has
+// no titling function left to repair it.
+//
+// So the write BRANCHES on whether the sibling is still inherited:
+//
+//   • renderUrl === veoVideoUrl (never independently titled — the mint-time
+//     derive stamps both to the shared plate, see renderDeriveOnlyVideoAd).
+//     Update BOTH to the new master's plate, atomically. A provenance-only
+//     write here would break that equality: veoVideoUrl = new plate,
+//     renderUrl = old plate. isVideoTitlingSettled then reads the
+//     inequality as "this ad IS titled", and ads DELETE treats the old
+//     shared Cloudinary file as this sibling's OWN asset and would destroy
+//     it (data-loss for every other untitled sibling still on that plate).
+//     The extra CAS fields (renderUrl + veoVideoUrl as we found them)
+//     refuse the write if a concurrent titler delivered a unique renderUrl
+//     after our find() — that is the same "raw plate must not overwrite a
+//     live titled asset" invariant, on the race window.
+//
+//   • they already differ (genuinely titled): provenance-only. veoVideoUrl
+//     / veoAspectRatio / veoModel / etc. update; renderUrl, posterUrl,
+//     visionQc, and status stay EXACTLY as they were. This is a provenance
+//     update, no compositing in this repo.
+//
+// qcAndStampVideoAd is deliberately NOT called: it has no preserveAdStatus
+// concept, so calling it here would let a background cascade flip an
+// untouched, still-perfectly-good sibling to status:'failed' purely because
+// this repo had nothing to composite, and it would inspect
+// masterAd.veoVideoUrl — content never actually served to this sibling.
+// promoteFailedToDraft is likewise NOT called: nothing was actually
+// composited for this sibling, so promoting it off 'failed' would be
+// dishonest.
+//
+// If this path is ever revived (ADGEN_RENDERER_ENABLED rolled back), a real
+// fix needs this repo to regain a crop/composite capability for derivatives
+// FIRST — a pre-existing gap this PR does not attempt to close, since
+// backend's whole derive-only pipeline (mint-time AND regenerate-cascade)
+// has been in this state since the titling removal, independent of this PR.
+//
+// KNOWN TRANSIENT (titled siblings only): a crash mid-cascade leaves
+// sibling veoVideoUrl pointing at the new master while renderUrl is still
+// the old titled composite. That mismatch is the designed provenance-only
+// state. Inherited siblings write both fields in one update, so they do
+// not take this shape. Adgen's compositing copy has the same
+// provenance/delivery split on a Remotion throw; there is no recovery arm
+// that re-titles from that shape.
+async function recascadeDerivativeSibling(sibling, masterAd) {
+  const siblingId = String(sibling._id);
+  try {
+    // Mint-time derive stamps renderUrl: veoVideoUrl (the shared plate).
+    // That equality is load-bearing (adTitlingTruth, ads DELETE).
+    const stillInherited = sibling.renderUrl === sibling.veoVideoUrl;
+    const $set = {
+      veoVideoUrl:        masterAd.veoVideoUrl,
+      veoAspectRatio:     masterAd.veoAspectRatio || null,
+      // Audit: no model ran for this ad — same marker
+      // renderDeriveOnlyVideoAd stamps at mint time, so cost
+      // reconcilers / inspectors never attribute an Omni charge here.
+      veoModel:           `derive-from:${masterAd.platformFormat}`,
+      veoPrompt:          null,
+      veoStoryboard:      null,
+      veoReferenceImages: [],
+      updatedAt:          new Date()
+    };
+    if (stillInherited) {
+      $set.renderUrl = masterAd.veoVideoUrl;
+    }
+    // ⚠️ CAS, not a plain findById+updateOne — see findDerivativesOfMaster's
+    // own comment on why the read-time filter alone is not enough on a
+    // collection adgen can claim concurrently. Inherited writes also
+    // re-assert the renderUrl/veoVideoUrl we observed, so a concurrent
+    // titler that delivered a unique asset after find() cannot be
+    // overwritten with the raw plate.
+    const casFilter = siblingStillEligible(sibling);
+    if (stillInherited) {
+      casFilter.renderUrl = sibling.renderUrl;
+      casFilter.veoVideoUrl = sibling.veoVideoUrl;
+    }
+    const claim = await Ad.updateOne(
+      casFilter,
+      {
+        $set,
+        // The sibling's cached face-detection (Ad.basePlate) is keyed to its
+        // OLD veoVideoUrl — now stale (a different video's pixels). Clear it
+        // so any future crop/detection (adgen's own titling, or a future
+        // revival of this repo's own pipeline) recomputes fresh against the
+        // NEW plate instead of applying a crop rect computed against
+        // different footage.
+        $unset: { basePlate: 1 }
+      }
+    );
+    if ((claim.modifiedCount ?? claim.n ?? 0) === 0) {
+      console.log(`🔁 regenerate-cascade[master=${masterAd._id}]: sibling=${siblingId} claimed/changed by another process — skipped this pass`);
+      return;
+    }
+    if (stillInherited) {
+      console.log(`🔁 regenerate-cascade[master=${masterAd._id}]: sibling=${siblingId} inherited plate updated (renderUrl === veoVideoUrl, both now the new master; provenance update, no compositing in this repo)`);
+    } else {
+      console.log(`🔁 regenerate-cascade[master=${masterAd._id}]: sibling=${siblingId} provenance updated to the new master plate — renderUrl left untouched (titled sibling; provenance update, no compositing in this repo)`);
+    }
+  } catch (err) {
+    console.warn(`🔁 regenerate-cascade[master=${masterAd._id}]: sibling=${siblingId} failed (non-fatal, master regenerate unaffected) — ${err.message}`);
+  }
+}
+
+async function cascadeRegenerateToDerivatives(adId, opts = {}) {
+  try {
+    const progressRun = opts && opts.progressRun;
+    const masterAd = await Ad.findById(adId).lean();
+    if (!masterAd) return;
+    // Defense in depth — runVideoFull only ever runs on a true master (the
+    // derive-only gate in preflight() already refuses a regenerate on a
+    // derivative before this function could ever be reached), but this
+    // guard is one cheap in-memory check and this function must NEVER
+    // cascade FROM a derivative.
+    if (masterAd.kind !== 'video' || resolveDeriveFromMaster(masterAd)) return;
+    if (!masterAd.veoVideoUrl) return;
+    // Defense in depth #2 (adversarial review, 2026-09-02) — the caller
+    // already gates this whole function call on a fresh !qcJustFailed for
+    // the common case, but re-derive it here too so a future/standalone
+    // caller of this exported function cannot fan out a rejected plate to
+    // every sibling by skipping that gate.
+    const qcJustFailed = !!brandScriptExecutor.buildVideoQcFailureFields(masterAd.visionQc).status;
+    if (qcJustFailed) return;
+    const siblings = await findDerivativesOfMaster(masterAd);
+    const capped = siblings.slice(0, MAX_REGEN_CASCADE_SIBLINGS);
+    if (siblings.length > MAX_REGEN_CASCADE_SIBLINGS) {
+      console.warn(
+        `🔁 regenerate-cascade[master=${adId}]: capping at ${MAX_REGEN_CASCADE_SIBLINGS} of ` +
+        `${siblings.length} siblings (zero Atlas/Omni spend; provenance update, no compositing in this repo)`
+      );
+    }
+    for (const sibling of capped) {
+      if (progressRun && typeof progressRun.checkpoint === 'function') {
+        await progressRun.checkpoint();
+      }
+      await recascadeDerivativeSibling(sibling, masterAd);
+    }
+  } catch (err) {
+    if (err && (err.name === 'CancelledError' || err.code === 'CANCELLED')) throw err;
+    console.warn(`🔁 regenerate-cascade[master=${adId}]: cascade failed (non-fatal) — ${err.message}`);
+  }
 }
 
 /**
@@ -1231,6 +1638,15 @@ async function runImage(adId, prompt, progressRun = null, promptOverride = null)
       }
     }
   );
+
+  // Fix — status promotion on a genuinely successful regenerate. The image
+  // path has no QC-driven status write to race (unlike the video path
+  // above) — renderDirectImage either returns a real buffer (this point) or
+  // throws (caught by the caller, which markComplete's 'failed' instead of
+  // reaching here) — so this can run unconditionally. See
+  // promoteFailedToDraft's own doc comment for why the write itself is
+  // filter-scoped rather than a blanket stamp.
+  await promoteFailedToDraft(adId);
 }
 
 // ── State helpers ──────────────────────────────────────────────────────
@@ -1313,5 +1729,17 @@ module.exports = {
   // harness) can drive the same dispatch regenerateAd uses internally.
   shouldDeferToAdgen,
   buildRegenerationRequest,
-  performRegeneration
+  performRegeneration,
+  // Status-promotion + derivative-cascade fix (see each function's own doc
+  // comment). Exported for verify harnesses to exercise the real functions
+  // against a stubbed Ad model rather than a reimplementation.
+  promoteFailedToDraft,
+  findDerivativesOfMaster,
+  recascadeDerivativeSibling,
+  cascadeRegenerateToDerivatives,
+  buildDerivativesOfMasterFilter,
+  MAX_REGEN_CASCADE_SIBLINGS,
+  // Exported so the cascade harness can drive the REAL runVideoFull tail
+  // (promote + cascade gates) against stubbed providers.
+  runVideoFull
 };
