@@ -21,8 +21,9 @@ require('dotenv').config({ path: path.join(__dirname, '..', 'config', 'defaults.
 const chooser = require('../services/reframeStrategyChooser');
 const { chooseStrategy, isCropFirstEnabled, __test } = chooser;
 const {
-  parseAspect, subjectUnionBbox, computeCropRect, buildCloudinaryCropUrl,
-  overfitTolerancePct, OVERFIT_TOLERANCE_PCT_DEFAULT
+  parseAspect, subjectUnionBbox, computeCropRect, computeForceCropRect,
+  buildCloudinaryCropUrl, overfitTolerancePct, compositeMaskMethod,
+  OVERFIT_TOLERANCE_PCT_DEFAULT
 } = __test;
 
 const results = [];
@@ -312,10 +313,18 @@ try {
     assert.ok(s.rect.w > 0 && s.rect.h > 0);
   });
 
-  check('b13 fixture (4 people, union 1370px wide) → composite-mask', () => {
-    // At default 10% tolerance this now returns 'composite-mask' (was
-    // 'defer' before this file gained the tolerance + composite path).
-    // Over-fit ~22% > 10% — composite branch takes it.
+  check('b13 fixture (4 people, union 1370px wide) — force-crop default routes to yolo-crop-forced', () => {
+    // Historical arc:
+    //   pre-tolerance     → 'defer' (subject union bigger than crop window)
+    //   +tolerance/mask   → 'composite-mask' (over-fit ~22% > 10% tolerance
+    //                       → composite outpaint via nano-banana)
+    //   +force-crop (now) → 'crop' with method 'yolo-crop-forced'
+    //                       (COMPOSITE_MASK_METHOD=force-crop, the shipped
+    //                       default from 2026-09-03). Same fixture, same
+    //                       tolerance, new disposition — the composite
+    //                       branch no longer hallucinates.
+    // For the legacy composite-mask disposition see the paired check
+    // 'beyond tolerance + composite-outpaint (legacy)' below in Section 3.
     const s = chooseStrategy({
       media: {
         width: 1692, height: 2018,
@@ -329,11 +338,11 @@ try {
       aspectRatio: '9:16',
       sourceUrl: 'https://res.cloudinary.com/reach-social-prod/image/upload/v1785944632/catalog-product/x/y.jpg'
     });
-    assert.strictEqual(s.action, 'composite-mask', `expected composite-mask, got ${s.action} (${s.reason})`);
-    assert.match(s.reason, /exceeds target-aspect crop window beyond \d+% tolerance/);
-    assert.ok(s.subjectUnion, 'subjectUnion should be surfaced on composite-mask');
-    assert.ok(s.sourceDims && s.sourceDims.width === 1692 && s.sourceDims.height === 2018,
-      'sourceDims should be surfaced on composite-mask');
+    assert.strictEqual(s.action, 'crop', `expected crop, got ${s.action} (${s.reason})`);
+    assert.strictEqual(s.method, 'yolo-crop-forced');
+    assert.match(s.reason, /bbox-forced crop/);
+    assert.match(s.reason, /edges clipped instead of outpainted/);
+    assert.match(s.url, /c_crop,w_1135/);
     assert.strictEqual(typeof s.tolerancePct, 'number');
   });
 
@@ -379,6 +388,214 @@ try {
 } finally {
   process.env.REFRAME_STRATEGY = prior;
 }
+
+// ── Section 3: force-crop mode (COMPOSITE_MASK_METHOD) ────────────────
+//
+// When the subject union exceeds REFRAME_OVERFIT_TOLERANCE_PCT, the
+// chooser used to always return action:'composite-mask' so the caller
+// dispatched a Nano Banana composite outpaint. Live evidence from the
+// Pelagic run 6a98d63a (2026-09-03) is that composite-outpaint still
+// hallucinates on-model shots — Nano Banana treats the empty margins
+// as a suggestion, not a constraint, and paints fake body parts /
+// props / logos into them. Those hallucinated refs then feed Omni's
+// stack and compound the master's fidelity failure.
+//
+// COMPOSITE_MASK_METHOD=force-crop (default) routes beyond-tolerance
+// cases to a bbox-centred Cloudinary c_crop URL instead — deterministic,
+// $0, no hallucination possible. Subject edges lose pixels but the
+// pixels that reach Omni are all real.
+
+console.log('\n== COMPOSITE_MASK_METHOD env parser ==');
+
+check('unset → default force-crop', () => {
+  const prior = process.env.COMPOSITE_MASK_METHOD;
+  try {
+    delete process.env.COMPOSITE_MASK_METHOD;
+    assert.strictEqual(compositeMaskMethod(), 'force-crop');
+  } finally {
+    if (prior === undefined) delete process.env.COMPOSITE_MASK_METHOD;
+    else process.env.COMPOSITE_MASK_METHOD = prior;
+  }
+});
+
+check('"force-crop" → force-crop', () => {
+  const prior = process.env.COMPOSITE_MASK_METHOD;
+  try {
+    process.env.COMPOSITE_MASK_METHOD = 'force-crop';
+    assert.strictEqual(compositeMaskMethod(), 'force-crop');
+  } finally {
+    if (prior === undefined) delete process.env.COMPOSITE_MASK_METHOD;
+    else process.env.COMPOSITE_MASK_METHOD = prior;
+  }
+});
+
+check('"composite-outpaint" → composite-outpaint', () => {
+  const prior = process.env.COMPOSITE_MASK_METHOD;
+  try {
+    process.env.COMPOSITE_MASK_METHOD = 'composite-outpaint';
+    assert.strictEqual(compositeMaskMethod(), 'composite-outpaint');
+  } finally {
+    if (prior === undefined) delete process.env.COMPOSITE_MASK_METHOD;
+    else process.env.COMPOSITE_MASK_METHOD = prior;
+  }
+});
+
+check('"FORCE-CROP" (case-insensitive) → force-crop', () => {
+  const prior = process.env.COMPOSITE_MASK_METHOD;
+  try {
+    process.env.COMPOSITE_MASK_METHOD = 'FORCE-CROP';
+    assert.strictEqual(compositeMaskMethod(), 'force-crop');
+  } finally {
+    if (prior === undefined) delete process.env.COMPOSITE_MASK_METHOD;
+    else process.env.COMPOSITE_MASK_METHOD = prior;
+  }
+});
+
+check('unrecognized value → falls back to force-crop', () => {
+  const prior = process.env.COMPOSITE_MASK_METHOD;
+  try {
+    process.env.COMPOSITE_MASK_METHOD = 'chunky-monkey';
+    assert.strictEqual(compositeMaskMethod(), 'force-crop');
+  } finally {
+    if (prior === undefined) delete process.env.COMPOSITE_MASK_METHOD;
+    else process.env.COMPOSITE_MASK_METHOD = prior;
+  }
+});
+
+console.log('\n== computeForceCropRect ==');
+
+check('9 person-bboxes covering nearly-whole 2000x2000 (Pelagic 6a988cf0 alt) → clean force-crop rect', () => {
+  // Real bboxes from the 6a988cf0 alt in run 6a98d63a. The union spans
+  // 2000×1877 which massively exceeds the 10% tolerance for a 9:16 target
+  // — this is the exact case composite-outpaint was firing on.
+  const subject = { x1: 0, y1: 0, x2: 2000, y2: 1877, count: 9 };
+  const rect = computeForceCropRect({
+    sourceW: 2000,
+    sourceH: 2000,
+    targetAspect: 9 / 16,
+    subject
+  });
+  assert.ok(rect, 'expected a rect, got null');
+  assert.strictEqual(rect.w, 1125);   // 2000 * (9/16) = 1125
+  assert.strictEqual(rect.h, 2000);
+  // Centred on subject centroid (1000, 938.5); clamped to source.
+  // x = 1000 - 562.5 = 437.5 → 438 (rounded)
+  // y = 938.5 - 1000 = -61.5 → 0 (clamped)
+  assert.strictEqual(rect.x, 438);
+  assert.strictEqual(rect.y, 0);
+});
+
+check('force-crop null when aspects already match', () => {
+  const r = computeForceCropRect({
+    sourceW: 1000, sourceH: 1000, targetAspect: 1,
+    subject: { x1: 100, y1: 100, x2: 900, y2: 900 }
+  });
+  assert.strictEqual(r, null);
+});
+
+check('force-crop clamps to source bounds when subject near edge', () => {
+  // Subject at far left, should clamp x to 0 (not go negative).
+  const r = computeForceCropRect({
+    sourceW: 2000, sourceH: 2000, targetAspect: 9 / 16,
+    subject: { x1: 0, y1: 0, x2: 200, y2: 2000 }
+  });
+  assert.ok(r);
+  assert.strictEqual(r.x, 0);
+  assert.strictEqual(r.w, 1125);
+});
+
+console.log('\n== chooseStrategy beyond-tolerance routing ==');
+
+// Force crop-first ON for this section.
+const priorStrategy = process.env.REFRAME_STRATEGY;
+const priorMethod = process.env.COMPOSITE_MASK_METHOD;
+try {
+  process.env.REFRAME_STRATEGY = 'crop-first';
+
+  check('beyond tolerance + force-crop (default) → action=crop with method yolo-crop-forced', () => {
+    delete process.env.COMPOSITE_MASK_METHOD;
+    const s = chooseStrategy({
+      media: {
+        width: 2000, height: 2000,
+        refinedProducts: [
+          { x1: 0, y1: 0, x2: 2000, y2: 1877 }  // near-whole-frame union
+        ]
+      },
+      aspectRatio: '9:16',
+      sourceUrl: 'https://res.cloudinary.com/f/image/upload/v1/x.jpg'
+    });
+    assert.strictEqual(s.action, 'crop', `got action=${s.action} reason='${s.reason}'`);
+    assert.strictEqual(s.method, 'yolo-crop-forced');
+    assert.match(s.reason, /bbox-forced crop/);
+    assert.match(s.reason, /edges clipped instead of outpainted/);
+    assert.match(s.url, /c_crop,w_1125,h_2000/);
+  });
+
+  check('beyond tolerance + composite-outpaint (legacy) → action=composite-mask', () => {
+    process.env.COMPOSITE_MASK_METHOD = 'composite-outpaint';
+    const s = chooseStrategy({
+      media: {
+        width: 2000, height: 2000,
+        refinedProducts: [{ x1: 0, y1: 0, x2: 2000, y2: 1877 }]
+      },
+      aspectRatio: '9:16',
+      sourceUrl: 'https://res.cloudinary.com/f/image/upload/v1/x.jpg'
+    });
+    assert.strictEqual(s.action, 'composite-mask',
+      `expected composite-mask for the legacy method; got action=${s.action}`);
+    assert.match(s.reason, /exceeds target-aspect crop window beyond 10% tolerance/);
+    assert.ok(s.subjectUnion);
+    assert.ok(s.sourceDims);
+  });
+
+  check('force-crop with non-Cloudinary source → falls through to composite-mask', () => {
+    delete process.env.COMPOSITE_MASK_METHOD;
+    const s = chooseStrategy({
+      media: {
+        width: 2000, height: 2000,
+        refinedProducts: [{ x1: 0, y1: 0, x2: 2000, y2: 1877 }]
+      },
+      aspectRatio: '9:16',
+      sourceUrl: 'https://cdn.shopify.com/x.jpg'  // not Cloudinary
+    });
+    assert.strictEqual(s.action, 'composite-mask',
+      `expected fall-through to composite-mask; got action=${s.action}`);
+  });
+
+  check('within tolerance → still normal crop (force-crop mode does not touch this path)', () => {
+    delete process.env.COMPOSITE_MASK_METHOD;
+    // Small union that fits well within a 9:16 crop window.
+    const s = chooseStrategy({
+      media: {
+        width: 2000, height: 2000,
+        refinedProducts: [{ x1: 800, y1: 400, x2: 1200, y2: 1600 }]
+      },
+      aspectRatio: '9:16',
+      sourceUrl: 'https://res.cloudinary.com/f/image/upload/v1/x.jpg'
+    });
+    assert.strictEqual(s.action, 'crop');
+    assert.strictEqual(s.method, 'yolo-crop', 'must NOT be yolo-crop-forced within tolerance');
+    assert.doesNotMatch(s.reason, /bbox-forced/);
+  });
+
+} finally {
+  process.env.REFRAME_STRATEGY = priorStrategy;
+  if (priorMethod === undefined) delete process.env.COMPOSITE_MASK_METHOD;
+  else process.env.COMPOSITE_MASK_METHOD = priorMethod;
+}
+
+// ── Section 4: defaults.env commits the shipped value ─────────────────
+
+console.log('\n== defaults.env commits force-crop as the shipped default ==');
+
+const defaults = require('fs').readFileSync(
+  require('path').join(__dirname, '..', 'config', 'defaults.env'),
+  'utf8'
+);
+
+check('COMPOSITE_MASK_METHOD=force-crop in defaults.env', () => {
+  assert.match(defaults, /^COMPOSITE_MASK_METHOD=force-crop$/m);
+});
 
 // ── Summary ───────────────────────────────────────────────────────────
 

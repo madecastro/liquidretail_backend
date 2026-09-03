@@ -84,6 +84,43 @@ function overfitTolerancePct() {
   return v;
 }
 
+// Beyond-tolerance behavior. When the subject union exceeds
+// REFRAME_OVERFIT_TOLERANCE_PCT, chooseStrategy has historically returned
+// action:'composite-mask' so the caller can dispatch a centre-anchored
+// Nano Banana outpaint (composite-canvas prompt at
+// atlasVideoService.reframePromptForCompositeCanvas). Live evidence from
+// the Pelagic run 6a98d63a (2026-09-03) is that composite-outpaint still
+// hallucinates on-model shots — the prompt forbids inventing objects but
+// Nano Banana treats the empty margins as suggestion, not constraint, and
+// paints fake body parts / props / logos into them. Those hallucinated
+// refs then feed Omni's stack and compound the master's fidelity failure.
+//
+// COMPOSITE_MASK_METHOD lets an operator route the beyond-tolerance case
+// away from Nano Banana:
+//
+//   force-crop        — (default 2026-09-03) ignore the tolerance gate
+//                       and ship a bbox-centred Cloudinary c_crop URL.
+//                       Zero cost, zero hallucination. Subject edges will
+//                       clip when overflow is large, but the pixels that
+//                       reach Omni are all real.
+//   composite-outpaint — legacy: return action:'composite-mask' so the
+//                        caller submits a Nano Banana outpaint. Kept for
+//                        A/B and revert.
+//
+// Fail-safe: any other value routes to force-crop. Force-crop also falls
+// through to composite-mask when the source URL isn't a Cloudinary
+// /image/upload/ asset (buildCloudinaryCropUrl returns null) — the caller
+// would defer for the same reason on the normal crop path, so failing to
+// composite-mask preserves whatever downstream recovery already exists.
+const COMPOSITE_MASK_METHOD_DEFAULT = 'force-crop';
+const COMPOSITE_MASK_METHODS = new Set(['force-crop', 'composite-outpaint']);
+
+function compositeMaskMethod() {
+  const raw = String(process.env.COMPOSITE_MASK_METHOD || '').toLowerCase().trim();
+  if (COMPOSITE_MASK_METHODS.has(raw)) return raw;
+  return COMPOSITE_MASK_METHOD_DEFAULT;
+}
+
 function parseAspect(a) {
   const m = String(a || '').trim().match(/^([\d.]+)\s*:\s*([\d.]+)$/);
   if (!m) return null;
@@ -201,6 +238,48 @@ function computeCropRect({ sourceW, sourceH, targetAspect, subject, tolerancePct
   return { x, y, w: cropW, h: cropH };
 }
 
+// Same target-aspect + subject-centering math as computeCropRect but
+// WITHOUT the tolerance gate. Callers invoke this only when
+// computeCropRect has already refused the "clean" tolerance-in-range
+// path — the beyond-tolerance branch — and only when force-crop mode
+// is on. Always returns a valid rect (clipping the subject union at
+// the source-edge boundary if necessary) for reasonable inputs;
+// returns null only on the physically-impossible-crop guard (target
+// aspect can't fit inside the source at all — e.g., a source narrower
+// than the target aspect's minimum width). subject.count is preserved
+// on the returned rect so callers can log detection counts alongside
+// the forced-crop reason.
+function computeForceCropRect({ sourceW, sourceH, targetAspect, subject }) {
+  const sourceAspect = sourceW / sourceH;
+  if (Math.abs(sourceAspect - targetAspect) < 1e-9) return null;
+
+  let cropW, cropH;
+  if (sourceAspect > targetAspect) {
+    cropH = sourceH;
+    cropW = Math.round(sourceH * targetAspect);
+  } else {
+    cropW = sourceW;
+    cropH = Math.round(sourceW / targetAspect);
+  }
+  if (cropW > sourceW || cropH > sourceH) return null;
+
+  // Centre on subject centroid; clamp to source. Deliberately skip the
+  // subject-fit assertion — the whole point of the force-crop branch
+  // is that we KNOW the subject doesn't fit and are choosing edge
+  // clipping over Nano Banana hallucination. computeCropRect's 8px
+  // safety margin is also skipped here for the same reason: the
+  // margin exists to keep from clipping YOLO's slight under-measure,
+  // but in the forced case we're already deliberately clipping.
+  const subjCenterX = (subject.x1 + subject.x2) / 2;
+  const subjCenterY = (subject.y1 + subject.y2) / 2;
+  let x = Math.round(subjCenterX - cropW / 2);
+  let y = Math.round(subjCenterY - cropH / 2);
+  x = Math.max(0, Math.min(sourceW - cropW, x));
+  y = Math.max(0, Math.min(sourceH - cropH, y));
+
+  return { x, y, w: cropW, h: cropH };
+}
+
 function chooseStrategy({ media, aspectRatio, sourceUrl }) {
   if (!isCropFirstEnabled()) {
     return { action: 'defer', reason: 'REFRAME_STRATEGY!=crop-first' };
@@ -235,11 +314,43 @@ function chooseStrategy({ media, aspectRatio, sourceUrl }) {
     const subjW = subject.x2 - subject.x1;
     const subjH = subject.y2 - subject.y1;
     // Over-fit exceeds tolerance (or aspects already match, which shouldn't
-    // reach here). Surface the bboxes + source dims so the caller can
-    // pre-compose the source onto a target-dim canvas: product-only shots
-    // ship as a $0 solid-pad reference; lifestyle shots go through the
-    // outpaint model with the composed canvas as source so nano-banana
-    // fills only the pad margins rather than re-synthesising the frame.
+    // reach here). Two dispositions, chosen by COMPOSITE_MASK_METHOD:
+    //
+    //   1. 'force-crop' (default) — compute a bbox-centred rect that
+    //      clips whatever excess doesn't fit, and ship the same $0
+    //      Cloudinary c_crop URL the clean path emits. Zero cost,
+    //      zero hallucination; subject edges lose pixels but nothing
+    //      is fabricated. Falls through to composite-mask (below) when
+    //      the source URL is non-Cloudinary or the forced rect is
+    //      degenerate — same recovery path.
+    //
+    //   2. 'composite-outpaint' (legacy) — return action:'composite-mask'
+    //      so the caller pre-composes the source onto a target-dim
+    //      canvas and dispatches a Nano Banana outpaint via
+    //      atlasVideoService.reframePromptForCompositeCanvas. Kept
+    //      byte-identical for A/B and revert.
+    const method = compositeMaskMethod();
+    if (method === 'force-crop') {
+      const forced = computeForceCropRect({ sourceW, sourceH, targetAspect, subject });
+      if (forced) {
+        const forcedUrl = buildCloudinaryCropUrl(sourceUrl, forced);
+        if (forcedUrl) {
+          return {
+            action: 'crop',
+            reason: `bbox-forced crop (${subject.count} detection${subject.count > 1 ? 's' : ''}, subject ${subjW}×${subjH} exceeds ${(tolerancePct * 100).toFixed(0)}% tolerance — window ${forced.w}×${forced.h}, edges clipped instead of outpainted)`,
+            rect: forced,
+            url: forcedUrl,
+            method: 'yolo-crop-forced',
+            tolerancePct
+          };
+        }
+        // Fall through — buildCloudinaryCropUrl returns null on a
+        // non-Cloudinary source URL. Same as the normal-path defer at
+        // the bottom of this function; here we route to composite-mask
+        // so callers with their own outpaint recovery get it.
+      }
+    }
+    // 'composite-outpaint' method, or force-crop couldn't build a URL.
     return {
       action: 'composite-mask',
       reason: `subject union (${subject.count} bbox, ${subjW}×${subjH}) exceeds target-aspect crop window beyond ${(tolerancePct * 100).toFixed(0)}% tolerance`,
@@ -282,10 +393,14 @@ module.exports = {
     parseAspect,
     subjectUnionBbox,
     computeCropRect,
+    computeForceCropRect,
     buildCloudinaryCropUrl,
     overfitTolerancePct,
+    compositeMaskMethod,
     ASPECT_MATCH_THRESHOLD,
     CROP_SAFETY_MARGIN_PX,
-    OVERFIT_TOLERANCE_PCT_DEFAULT
+    OVERFIT_TOLERANCE_PCT_DEFAULT,
+    COMPOSITE_MASK_METHOD_DEFAULT,
+    COMPOSITE_MASK_METHODS
   }
 };
