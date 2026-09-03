@@ -14,7 +14,41 @@ it clears it back to this placeholder.)_
 
 ## CURRENT STATE
 
-*(Replaced 2026-09-01 morning. adgen trunk `master` @ `6d93686` (#102) — api/orchestrator/
+*(Replaced 2026-09-02 night. Worktree `/Volumes/Sayulita/Projects/RS/.wt-pad-source-scale`,
+branch `fix/pad-at-source-scale`, rebased onto `origin/master` `b4edfc2`. **Do not touch
+the main `liquidretail_adgen` checkout.**)*
+
+**This branch is the pad-at-source-scale + refinedProducts + Scene 2 landing for the
+Pelagic fidelity experiment. Not pushed.**
+
+- `1473950` — pad at source scale (`padCanvasDims`, method-gated `pad-src-v1`, `$in`
+  claim fence, passthrough arm in code). Judged not shippable as-is.
+- Follow-up commits on top: (1) `refinedProducts` on both catalog `.select()`s so
+  cold siblings can crop-first; (2) byte-pad + composite-pad also use `padCanvasDims`
+  (else composite-pad invalidation freezes 720-short under `pad-src-v1`); drop
+  `REGENERATE_DAILY_CAP=1000` (no-op, does not belong here); document
+  `REFRAME_PASSTHROUGH_BRAND_IDS=` empty; (3) Scene 2 else-branch only — "on the
+  product as already shown". Designed extra "Do not search for a logo…" clause was
+  dropped: +48 bytes overflowed Grok 4096 on a 1000-char operator regenerate.
+
+**Suite:** 90/92. Reds are pre-existing, not this diff:
+- `verifyVendorDrift` — backend moved on ~20 vendored files since the last
+  look (same red on origin/master). This branch's three files
+  (atlasVideoService, veoPromptBuilder, videoRefPrewarm) are reconciled.
+- `verifyRegenerateInFlightGate` E1 — merge-order gate reading
+  `origin/master:scripts/vendor-manifest.json` for the phrase `OWES PORTS IN BOTH
+  DIRECTIONS` on `adRegenerateService.js`. That phrase is not on trunk. This
+  branch does not touch that file. Fails on origin/master itself.
+
+**Do not npm ci / NODE_PATH in this worktree.**
+
+**Experiment still not run.** Deploy order is in the 2026-09-02 design: code with
+passthrough empty → canary `6a985882` → control 14 → flip passthrough → canary →
+arm 1 14 → restore env. Prewarm off during the window.
+
+---
+
+*(Prior 2026-09-01 morning. adgen trunk `master` @ `6d93686` (#102) — api/orchestrator/
 renderer/titler all confirmed Live. Backend trunk `main` @ `175968d` (#374) — web + worker
 both Live.)*
 

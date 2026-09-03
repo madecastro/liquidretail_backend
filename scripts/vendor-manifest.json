@@ -1,8 +1,8 @@
 {
   "version": 2,
   "backendRef": "origin/main",
-  "backendHead": "659ed76cbddcaf7d16fd6ab86e68d498e6140cce",
-  "generatedAt": "2026-09-03T02:18:18.908Z",
+  "backendHead": "b4eb6435c7d9717aaafe191c28d5bdf8b22a2691",
+  "generatedAt": "2026-09-03T05:19:00.697Z",
   "files": {
     "models/Ad.js": {
       "backendHash": "394d26a1cb8ad64b23bde73312f3473f332520dd9640b9d5e4bb8eec22d6138d",
@@ -811,11 +811,11 @@
       "owedSince": null
     },
     "services/atlasVideoService.js": {
-      "backendHash": "155341702d6825754a928c0f332bf127a46292a05d90e14f04cb5f0231d6a07f",
-      "adgenHash": "df6c4d756b23057e6abf4610d27e97463e0225914a3edc50c743943668b889a2",
-      "backendSha": "ecbea9c7f2e344dfcd4e3a06d2455a03bba5d237",
+      "backendHash": "2d16c3162e339880b748bff3e4f621fed9df8c0493dcd4d7723eb381e032a288",
+      "adgenHash": "eb313adb5a4781c04a5833e74a0d39622057ddb3c0b7d38ef8af679e0d4e8aa2",
+      "backendSha": "be56edfd6c1456b4c75b2f26818ef5ed046b95af",
       "status": "unported",
-      "reason": "PARTIALLY RESOLVED — three separate debt threads, tracked here rather than split into three entries because they all live on the same money-critical file. THREAD 1 (reframe-claim eviction + poll-budget decoupling): CLOSED, re-verified by direct diff. Backend #355 (6535be5f) + adgen #89 (40f9003) both landed. _activeReframeClaims registry + releaseAllActiveReframeClaims() SIGTERM/crash sweep — same logic on both sides, comments reworded only. REFRAME_POLL_MS()/REFRAME_CLAIM_TTL_FLOOR_MS/REFRAME_BOUNDED_NON_POLL_MS/REFRAME_MIN_LEASE_MARGIN_MS — byte-identical function bodies. releaseReframeClaim emptyUrl handling — present both sides. THREAD 2 (reframe fabrication reduction — tolerance + composite-mask + Cloudinary mirror): CLOSED as of this reconcile. Ports backend da22486 (10% over-fit tolerance in computeCropRect + composite-mask action from chooser) and ecbea9c (ensureCloudinaryMirror + 5a-mirror step). Three additions in adgen's copy: (a) reframePromptForCompositeCanvas + reframeOutpaintPrompt routing when ctx.compositeCanvas is true, (b) ensureCloudinaryMirror helper + 5a-mirror step in reframeReferenceForAspect that lazily mirrors non-Cloudinary sources so downstream URL-transformation steps (cloudinaryPadUrl, buildCloudinaryCropUrl) work, (c) composite-mask branch inside tryClaimReframe mutex that sharp-composites the source scaled-to-fit on a target-dim canvas via padSolidBuffer, ships product_only as $0 composite-pad and hands lifestyle composite to nano-banana with a margins-only prompt. Method stamped as composite-pad / composite-outpaint / yolo-crop on the persisted Media.metadata.reframes entry. Kill switches: REFRAME_STRATEGY=outpaint-only reverts everything, REFRAME_OVERFIT_TOLERANCE_PCT=0 reverts the tolerance half. Fixes Pelagic Gear's specific fabrication class where 94% of catalog-product Media are on cdn.shopify.com and were falling through to raw-source outpaint on every reframe. THREAD 3 (video-master-timeout-livelock, backend #82: MAX_POLL_MS 600000->900000 + unsettledAtTimeout/hold handling): STILL GENUINELY OWED. Backend's MAX_POLL_MS remains 600000 on origin/main; adgen's is 900000. Independent of Thread 2 above, which raises no poll ceilings. STILL UNAUDITED — as of thread 1's reconcile the file was ~720 lines longer in adgen than backend with 28 remaining diff hunks (some large: 282-line and 211-line blocks collapse to 16/6 lines on backend). Thread 2 added roughly 180 more lines to adgen. The known Thread 3 debt is a subset of that divergence; anything else in it has never been individually audited — do not silently downgrade this status without a full line-by-line pass given the file's money-criticality and size.",
+      "reason": "PARTIALLY RESOLVED — three prior debt threads plus one adgen-only landing. THREAD 1 (reframe-claim eviction + poll-budget decoupling): CLOSED. THREAD 2 (tolerance + composite-mask + Cloudinary mirror): CLOSED. THREAD 3 (video-master-timeout-livelock, backend #82: MAX_POLL_MS 600000->900000 + unsettledAtTimeout/hold handling): STILL GENUINELY OWED. Backend MAX_POLL_MS remains 600000 on origin/main; adgen is 900000. Do not silently downgrade without a line-by-line pass. THREAD 4 (2026-09-02, adgen-only, NOT owed to backend): pad-at-source-scale (padCanvasDims + method-gated padGeometryVersion invalidation + REFRAME_PASSTHROUGH_BRAND_IDS) and the refinedProducts catalog .select() so subjectUnionBbox can take the DINO crop path instead of paid nano-banana defer. Follow-up: byte-pad and composite-pad use padCanvasDims, not imageDimsForAspect. Live renderer is adgen (ADGEN_RENDERER_ENABLED=true); backend copy does not execute. Do not port Thread 4.",
       "portTo": "backend",
       "owedSince": "2026-08-27T16:49:12.296Z"
     },
@@ -1842,12 +1842,10 @@
     },
     "services/veoPromptBuilder.js": {
       "backendHash": "027d0d46214b7303f0a1c83793ea4d280eaf6fe840fe82d2771a39dbe44b752a",
-      "adgenHash": "2e624b9cde0b757a8827a11be13a72c7586eff9433937da564fa6997072bd6b2",
+      "adgenHash": "ded6884251e1d3de8af7c7e4cd1e2162352ab76607351d2f9eb2b7e918b8d92f",
       "backendSha": "8bd9eebd549fe5384bef79648688462eace907ed",
       "status": "fork",
-      "reason": "Owner directive 2026-08-28 (stated twice this session): liquidretail_backend's prompt-building code is not maintained as first-class any more, and prompt-safety fixes made here are not ported there going forward. This SUPERSEDES the prior 'unported, port-to-backend' entry for the operator-prompt-override fix (PR #77, d681425): backend's copy still carries the unsafe 'OPERATOR REFINEMENT (HIGHEST PRIORITY — overrides conflicting guidance below)' framing that let free text override product-fidelity/no-fabricated-branding rules (the Vaportek-through-the-operator-door incident), and that is now DELIBERATELY staying unfixed on the backend side per the directive above, not an oversight. Re-verified the rest of the current diff before reconciling: backend separately hoisted its seedHasText burned-in-text guard into an exported SEED_BURNED_IN_TEXT_GUARD_LINE constant (2026-08-27) so its generation-inspector route can string-match a persisted prompt — the guard TEXT is byte-identical to adgen's inline version (verified directly), so this is a backend-only diagnostic refactor adgen has no consumer for (no inspector HTTP route here), not a missing fix. The applyByteCap/logByteCap/enforceByteCap split is an incidental adgen-side refactor from the same PR #77, not independently consequential. Recorded here so the next reader does not re-open the port question.",
-      "portTo": null,
-      "owedSince": null
+      "reason": "Owner directive 2026-08-28: backend prompt-building is not first-class; prompt-safety fixes made here are not ported there. Backend still carries the unsafe OPERATOR REFINEMENT (HIGHEST PRIORITY) framing by that directive, not an oversight. 2026-09-02: frozen-else Scene 2 no longer zooms toward the most distinctive product detail (invention invitation on Pelagic t=5.0s); it zooms in on the product as already shown. The longer 'Do not search for a logo...' draft blew grok 4096 D1 (old=3959 -> VEO_PROMPT_OVER_CAP via the 4000 inner drop). Hook-first and lifestyle Scene 2 untouched. Adgen-only; do not port."
     },
     "services/veoStoryboardService.js": {
       "backendHash": "4e3d420b3a6219b72f25dc95aac6afa679ea5c23a7c3627d1abcb9ba9f5bf344",
@@ -1917,13 +1915,11 @@
       "owedSince": null
     },
     "services/videoRefPrewarmService.js": {
-      "backendHash": "0fdd841a7e9d272a3d8e5dc7eb2b570162aca4d64dfa2e0206718cce97dd7dd1",
-      "adgenHash": "0fdd841a7e9d272a3d8e5dc7eb2b570162aca4d64dfa2e0206718cce97dd7dd1",
-      "backendSha": "0319c68ef8db75f520d104f7b5651d70d39a6995",
+      "backendHash": "7927ee374dbca7a604a509d68fbda2c637470f867a6f43099f11e084dcc598fc",
+      "adgenHash": "7927ee374dbca7a604a509d68fbda2c637470f867a6f43099f11e084dcc598fc",
+      "backendSha": "be56edfd6c1456b4c75b2f26818ef5ed046b95af",
       "status": "unused",
-      "reason": "backend ref-prewarm; no adgen caller",
-      "portTo": null,
-      "owedSince": null
+      "reason": "backend ref-prewarm; no adgen caller. 2026-09-02: added refinedProducts to the catalog .select() so this unused copy stays in lockstep with generateForAd (omitting it forces paid nano-banana via chooseStrategy defer). Live prewarm is backend routes/ads.js. Backend blob also moved (be56edfd); re-looked, no port of that backend change into this unused copy."
     },
     "services/videoRouter.js": {
       "backendHash": "f23861150ec146820336da11db4459c5abdf001b8ce926b518e28d328b7fe247",

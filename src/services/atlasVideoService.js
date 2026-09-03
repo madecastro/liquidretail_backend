@@ -70,6 +70,38 @@ const { buildLayoutInput, INPUT_SCHEMA_VERSION, resolveQuoteAssemblyOptions } = 
 // switch + model/resolution/skip-threshold are all env-tunable.
 // Ported from ReachSocialLLMExpander runSafeZoneReframe (uncrop-v1 ladder).
 const REFRAME_ENABLED = () => String(process.env.REFRAME_ENABLED ?? 'true').toLowerCase() !== 'false';
+// EXPERIMENT ARM (2026-09-02): send the PRISTINE catalog image as the reference —
+// no pad, no crop, no generative outpaint, no spend.
+//
+// ⚠️ THIS IS NOT REFRAME_ENABLED=false, AND THAT DISTINCTION IS THE WHOLE POINT.
+// That kill switch falls through to `fallback()` → `cropImageUrlForAspect` →
+// `c_fill,w_720,h_1280`, which CROPS a square source to 9:16 and cuts ~44% of the
+// product's width off. It is strictly MORE destructive than the pad it replaces,
+// so it can never serve as "just send the original".
+//
+// WHY THIS ARM EXISTS AT ALL. The founding decision (#10, 2026-07-23) is recorded
+// as "backed by a live crop-vs-pad-vs-outpaint comparison" — three REFRAMING
+// strategies. Sending the source untouched was never in that comparison; the
+// premise "product photos arrive square, ad canvases are 9:16, therefore reframe"
+// was assumed rather than measured. The Omni '-developer' schema (verified live
+// 2026-09-02) documents `images` as "character, scene, or style references" and
+// `aspect_ratio` as a separate OUTPUT parameter, so no published contract requires
+// a reference to match the delivered aspect.
+//
+// BRAND-SCOPED DELIBERATELY. A bare boolean would change every brand's references
+// the instant it landed on the renderer — mid-flight, on runs nobody is watching.
+// Comma-separated Brand ids; empty (the default) means nobody, so this is inert
+// until an operator names a brand.
+const REFRAME_PASSTHROUGH_BRAND_IDS = () =>
+  String(process.env.REFRAME_PASSTHROUGH_BRAND_IDS || '')
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean);
+
+function isReframePassthroughBrand(brandId) {
+  if (!brandId) return false;
+  return REFRAME_PASSTHROUGH_BRAND_IDS().includes(String(brandId));
+}
 // Model tier: for THIS model ('google/nano-banana-2/edit') '-developer' is a BILLING
 // variant, not a quality tier. Verified against the live Atlas catalogue
 // (2026-07-24): it carries the same price.origin.base_price ($0.08) as plain /edit
@@ -160,7 +192,29 @@ const REFRAME_BORDER_STD_MAX = () => {
 //   uncrop-v1 → the first port (1k + uncrop prompt, no product-only routing)
 //   reframe-v2 → current: 4k + conservative 'reframe' prompt, product-only $0
 //                pad routing, output ratio validation, solid-preferred pad
+// Do NOT bump this for pad-canvas geometry changes — that is
+// PAD_GEOMETRY_VERSION below. Bumping the ladder re-derives paid outpaint
+// entries (~$0.08–0.16 each) across the whole catalog.
 const REFRAME_LADDER_VERSION = 'reframe-v2';
+// Pad-canvas arithmetic id. Consulted ONLY for methods in
+// PAD_GEOMETRY_METHODS (both $0 to re-derive). Paid / already-correct
+// methods are incomparable on this field: a missing padGeometryVersion on
+// an 'outpaint' entry is NOT a stale signal. Bump when padCanvasDims
+// changes in a way that should rebuild cached pad URLs.
+const PAD_GEOMETRY_VERSION = 'pad-src-v1';
+const PAD_GEOMETRY_METHODS = Object.freeze(['pad-product-only', 'composite-pad']);
+function isPadGeometryMethod(method) {
+  return PAD_GEOMETRY_METHODS.includes(method);
+}
+// Ceiling on the pad canvas in megapixels. imageDimsForAspect is the FLOOR
+// (never regress a small source below today's 720-short-edge canvas). This
+// is the CAP so a 8000×8000 original padded to 9:16 cannot emit a 114 MP
+// Cloudinary transform (plan derived-image limit ~25 MP) or an Atlas
+// reference over 20 MB. <1 is rejected because it fights the floor.
+const REFRAME_PAD_MAX_MEGAPIXELS = () => {
+  const n = Number(process.env.REFRAME_PAD_MAX_MEGAPIXELS);
+  return Number.isFinite(n) && n >= 1 ? n : 25;
+};
 // Additive prompt hardening. When true, reframePromptForAspect appends
 // SUBJECT IDENTITY, PHYSICAL ACCURACY, and (when the source has YOLO subjects
 // touching a frame edge) SOURCE-EDGE PROTECTION clauses. When false — the
@@ -193,8 +247,15 @@ const REFRAME_REDERIVE_STALE = () =>
 function readReframeEntry(entry) {
   const url = entry?.url;
   if (typeof url !== 'string' || !url.trim()) return { url: null, stale: false };
-  const stale = REFRAME_REDERIVE_STALE() && entry?.ladderVersion !== REFRAME_LADDER_VERSION;
-  return { url: url.trim(), stale };
+  if (!REFRAME_REDERIVE_STALE()) return { url: url.trim(), stale: false };
+  const ladderStale = entry?.ladderVersion !== REFRAME_LADDER_VERSION;
+  // Method-gated. Unknown / missing method is treated as NOT pad-stale:
+  // a legacy entry might be a paid outpaint, and marking it stale would
+  // re-POST nano-banana. The method gate is what keeps a missing
+  // padGeometryVersion from claiming paid rows.
+  const padStale = isPadGeometryMethod(entry?.method)
+    && entry?.padGeometryVersion !== PAD_GEOMETRY_VERSION;
+  return { url: url.trim(), stale: ladderStale || padStale };
 }
 // Cross-process reframe claim lease. Web service and worker are separate Node
 // processes, so the in-process Map + fresh DB re-read alone cannot stop both
@@ -2101,9 +2162,51 @@ async function detectBorderFill(buffer, srcRatio, targetRatio) {
 // plan (b_blurred needs an add-on we don't have — see
 // services/extendedCropsService.js:127-129). Returns null for non-Cloudinary
 // sources, which the caller handles by padding the bytes locally instead.
-function cloudinaryPadUrl(sourceUrl, aspectRatio, hex) {
+// Pad canvas for a source-scale c_pad. Binding dimension keeps native
+// resolution; the other side is computed from the target aspect. Floor is
+// today's imageDimsForAspect (the video DELIVERY size) so a small source can
+// never regress below current behaviour. Cap is REFRAME_PAD_MAX_MEGAPIXELS.
+// Missing / non-positive source dims → floor, i.e. exactly pre-change output.
+function padCanvasDims(aspectRatio, sourceW, sourceH) {
+  const floor = imageDimsForAspect(aspectRatio);
+  const sw = Number(sourceW);
+  const sh = Number(sourceH);
+  const [wr, hr] = String(aspectRatio || '').split(':').map(Number);
+  const ta = (wr > 0 && hr > 0) ? wr / hr : (floor.h > 0 ? floor.w / floor.h : NaN);
+  if (!(sw > 0 && sh > 0) || !(ta > 0)) return { w: floor.w, h: floor.h };
+
+  let w;
+  let h;
+  if (sw / sh > ta) {
+    w = Math.round(sw);          // width binds: product keeps native width
+    h = Math.round(sw / ta);
+  } else {
+    w = Math.round(sh * ta);     // height binds (incl. already-correct aspect)
+    h = Math.round(sh);
+  }
+  if (!(w > 0 && h > 0) || w < floor.w || h < floor.h) return { w: floor.w, h: floor.h };
+
+  const maxPx = REFRAME_PAD_MAX_MEGAPIXELS() * 1e6;
+  const px = w * h;
+  if (px > maxPx) {
+    // FLOOR, NOT ROUND. `scale` makes the exact scaled product equal maxPx, so
+    // flooring each dimension can only move the product DOWN — the cap holds by
+    // construction. Math.round does not: it rounds the second dimension up from
+    // the already-rounded first, and 8000x8000 -> 9:16 then emits 3750x6667 =
+    // 25,001,250 px, 1,250 OVER a 25 MP cap. Caught in adversarial review; the
+    // original check missed it because its own tolerance (<= 25.01 MP) was
+    // looser than the violation it was written to catch.
+    const scale = Math.sqrt(maxPx / px);
+    if (sw / sh > ta) { w = Math.floor(w * scale); h = Math.floor(w / ta); }
+    else              { h = Math.floor(h * scale); w = Math.floor(h * ta); }
+    if (!(w > 0 && h > 0) || w < floor.w || h < floor.h) return { w: floor.w, h: floor.h };
+  }
+  return { w, h };
+}
+
+function cloudinaryPadUrl(sourceUrl, aspectRatio, hex, sourceW, sourceH) {
   if (!sourceUrl || !sourceUrl.includes('/image/upload/')) return null;
-  const { w, h } = imageDimsForAspect(aspectRatio);
+  const { w, h } = padCanvasDims(aspectRatio, sourceW, sourceH);
   const bg = hex ? `b_rgb:${hex}` : 'b_auto:predominant_gradient';
   return sourceUrl.replace(
     '/image/upload/',
@@ -2318,7 +2421,25 @@ async function tryClaimReframe(mediaId, aspectKey, claimBy) {
               // claimable and the aspect is stuck on crops forever.
               { [`${path}.url`]: { $not: /\S/ } },
               ...(REFRAME_REDERIVE_STALE()
-                ? [{ [`${path}.ladderVersion`]: { $ne: REFRAME_LADDER_VERSION } }]
+                ? [{ [`${path}.ladderVersion`]: { $ne: REFRAME_LADDER_VERSION } },
+                  // Pad-geometry reclaim, METHOD-GATED. Without this arm a
+                  // `composite-pad` entry on the old geometry is stale in
+                  // readReframeEntry but UNCLAIMABLE here (its url is present and
+                  // its ladder is current), so waitForReframeUrl hands back the old
+                  // URL, padGeometryVersion is never written, and every later
+                  // render pays the wait and keeps the old canvas — the change
+                  // would be silently inert for that method. `pad-product-only`
+                  // escapes only because step 5b returns before the claim.
+                  //
+                  // ⚠️ THE `$in` IS THE MONEY FENCE, NOT DECORATION. Mongo `$ne`
+                  // MATCHES A MISSING FIELD, so a bare padGeometryVersion clause
+                  // would make every pre-existing `outpaint` row (none of which
+                  // carry the field) claimable and re-POST nano-banana across the
+                  // catalog. Only $0 pad methods may match this arm.
+                  {
+                    [`${path}.method`]: { $in: [...PAD_GEOMETRY_METHODS] },
+                    [`${path}.padGeometryVersion`]: { $ne: PAD_GEOMETRY_VERSION }
+                  }]
                 : [])
             ]
           },
@@ -2501,6 +2622,28 @@ async function reframeReferenceForAspect({ media, sourceUrl, aspectRatio, brand,
     // 1. Kill-switch / Atlas unconfigured / missing source → crop only.
     if (!REFRAME_ENABLED() || !enabled() || !sourceUrl) return fallback();
 
+    // 1b. EXPERIMENT ARM — pristine passthrough for an allowlisted brand.
+    //     Returns the source URL untouched: no pad, no crop, no outpaint, $0.
+    //
+    //     PLACEMENT IS LOAD-BEARING, both above and below:
+    //       - ABOVE the cache read (step 3), because a Media that already holds a
+    //         720x1280 pad entry would otherwise be served that cached URL and this
+    //         arm would silently never fire on exactly the media we want to test.
+    //       - It must NEVER call persistReframe. Writing sourceUrl into
+    //         Media.metadata.reframes[aspectKey] would OUTLIVE the experiment:
+    //         flipping the brand back out of the allowlist would leave every media
+    //         it touched permanently serving an un-reframed URL from cache, on a
+    //         path that no longer intends it. This arm leaves zero durable trace,
+    //         so removing the brand id fully restores prior behaviour with no
+    //         backfill and no re-derive.
+    if (isReframePassthroughBrand(brandId)) {
+      console.log(
+        `   🧪 reframe[${aspectRatio}]: PASSTHROUGH (brand=${brandId}) — pristine source, ` +
+        `no pad/crop/outpaint, $0, not cached`
+      );
+      return sourceUrl;
+    }
+
     // 2. Mongo-safe aspect key: alphanumeric+underscore only, so ':' AND
     //    '.' are removed ('9:16'→'9_16', '1.91:1'→'1_91_1'). A raw dot would
     //    make the $set path nest and permanently miss the flat-key read.
@@ -2654,10 +2797,14 @@ async function reframeReferenceForAspect({ media, sourceUrl, aspectRatio, brand,
         }
         const hex = padDec.hex;
 
-        let padUrl = cloudinaryPadUrl(sourceUrl, aspectRatio, hex);
+        let padUrl = cloudinaryPadUrl(sourceUrl, aspectRatio, hex, media.width, media.height);
         if (!padUrl && sample) {
           // Non-Cloudinary source: can't transform by URL, so pad the bytes.
-          const { w: pw, h: ph } = imageDimsForAspect(aspectRatio);
+          // Same source-scale canvas as cloudinaryPadUrl. Using
+          // imageDimsForAspect here would persist pad-src-v1 on a 720-short
+          // canvas and freeze the old geometry (the Cloudinary path was
+          // updated in 1473950; this fallback was not).
+          const { w: pw, h: ph } = padCanvasDims(aspectRatio, media.width, media.height);
           const buf = await padSolidBuffer(sample, pw, ph, hex || 'ffffff');
           if (buf) {
             try {
@@ -2843,7 +2990,17 @@ async function reframeReferenceForAspect({ media, sourceUrl, aspectRatio, brand,
             // Cloudinary-mirror default and reads as "empty" to nano-banana
             // in the lifestyle branch below).
             const hex = fill?.hex || 'ffffff';
-            const compBuf = await padSolidBuffer(srcNorm.buffer, W, H, hex);
+            // product_only composite-pad must use the same source-scale canvas
+            // as cloudinaryPadUrl. Using imageDimsForAspect (W,H) here would
+            // re-derive a stale composite-pad at the OLD 720-short geometry,
+            // then persistReframe would stamp padGeometryVersion=pad-src-v1
+            // and freeze it. Lifestyle composite-outpaint stays on the
+            // delivery canvas — that path is billed and is NOT in
+            // PAD_GEOMETRY_METHODS.
+            const compDims = isProductOnlyShot(media)
+              ? padCanvasDims(aspectRatio, media.width, media.height)
+              : { w: W, h: H };
+            const compBuf = await padSolidBuffer(srcNorm.buffer, compDims.w, compDims.h, hex);
             const fitted = compBuf
               ? await fitBufferForCloudinary(compBuf, `reframe-composite[${aspectKey}]`)
               : null;
@@ -2858,7 +3015,7 @@ async function reframeReferenceForAspect({ media, sourceUrl, aspectRatio, brand,
                 // solid margins, no AI, no bill. Ships now; the outpaint
                 // step below never runs for this branch.
                 console.log(
-                  `   🧺 reframe[${aspectKey}]: composite pad-only (${W}×${H}, fill=#${hex}) → $0`
+                  `   🧺 reframe[${aspectKey}]: composite pad-only (${compDims.w}×${compDims.h}, fill=#${hex}) → $0`
                 );
                 await persistReframe(media, aspectKey, aspectRatio, compositeUrl, 'composite-pad');
                 return compositeUrl;
@@ -3311,6 +3468,10 @@ async function persistReframe(media, aspectKey, aspectRatio, finalUrl, method, {
     method,
     model: REFRAME_OUTPAINT_MODEL(),
     ladderVersion: REFRAME_LADDER_VERSION,
+    // Stamped ONLY on $0 pad methods. Absent on outpaint/exact/crop entries by
+    // design — readReframeEntry gates the comparison on method, so an entry
+    // without this field can never be judged pad-stale and re-billed.
+    ...(isPadGeometryMethod(method) ? { padGeometryVersion: PAD_GEOMETRY_VERSION } : {}),
     at: nowIso,
     // Omitted (undefined) when there was no claim, so free-tier entries keep
     // their historical shape exactly.
@@ -5109,9 +5270,17 @@ async function generateForAd({
       ? Media.find({
           source: 'catalog-product',
           'metadata.catalogProductId': ad.productId
-        }).select('_id fileUrl classification adSuitability metadata width height createdAt')
-          // width/height feed the reframe already-correct skip guard. Order
-          // is applied below in JS — see sortCatalogMediasForReferenceStack —
+        }).select('_id fileUrl classification adSuitability metadata width height refinedProducts createdAt')
+          // width/height feed the reframe already-correct skip guard.
+          // refinedProducts feeds reframeStrategyChooser.subjectUnionBbox
+          // for the DINO-derived crop path (7758b32 + da22486). Dropping
+          // it silently forces every alt through paid nano-banana
+          // outpaint — Mongoose `.select()` of an unrequested field
+          // returns undefined, `Array.isArray(undefined)` is false,
+          // subjectUnionBbox returns null, chooseStrategy defers,
+          // outpaint fires. Same class of bug as videoRefPrewarmService's
+          // sister projection; both must stay in sync.
+          // Order is applied below in JS — see sortCatalogMediasForReferenceStack —
           // because it is conditional on CATALOG_FEED_ORDER_SEEDING.
           .lean()
           .then(sortCatalogMediasForReferenceStack)

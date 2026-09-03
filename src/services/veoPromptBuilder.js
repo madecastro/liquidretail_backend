@@ -1012,7 +1012,13 @@ function buildVeoPrompt({
     lines.push(
       `Timeline (${dur.toFixed(1)}s): ` +
       `Scene 1 (0.0–${t1}s): slow horizontal pan left→right, ~10–15% movement. No zoom, rotation, or perspective shift. ` +
-      `Scene 2 (${t1}–${t2}s): slow zoom toward the most distinctive product detail (~8–10%), centered. No rotation or distortion. ` +
+      // Scene 2 "zoom toward the most distinctive product detail" invites
+      // invention (owner 2026-09-02). Pelagic failing-master defects
+      // (invented cuff logo, thumbholes, competitor collar label, garbled
+      // waistband text) cluster at the Scene 2 baseline (t=5.0s of a 10s
+      // clip). Keep the slow zoom; stop asking the model to hunt a detail.
+      // Do not reword Scene 1 / Scene 3 — B14 freeze still applies to those.
+      `Scene 2 (${t1}–${t2}s): slow zoom in (~8–10%) on the product as already shown, centered. No rotation or distortion. ` +
       `Scene 3 (${t2}–${dur.toFixed(1)}s): begin slightly cropped, slow zoom out ~10–12% to reveal the full product. Maintain center framing.`
     );
   }

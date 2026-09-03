@@ -59,6 +59,15 @@
  *      own comments cite — is a BACKEND harness and does NOT exist in this repo
  *      (verified 2026-08-26). Group A below is the ONLY pin on that property in
  *      adgen, so treat it as load-bearing. Carries a positive control.
+ *
+ *      2026-09-02 EXCEPTION — frozen-else Scene 2. The else-branch clause
+ *      "zoom toward the most distinctive product detail" is an invention
+ *      invitation (Pelagic t=5.0s cluster). The live packshot path now
+ *      zooms "on the product as already shown" instead. Group A still pins
+ *      everything else against 16e64e2; the baseline's else-Scene-2 is
+ *      rewritten to the new clause before compare so this harness does not
+ *      freeze the defect we are removing. Hook-first / lifestyle Scene 2
+ *      are untouched and must stay byte-identical without that rewrite.
  *   B. PRECEDENCE. The override claim is gone; the constraints sit after the
  *      operator text; CONSTRAINT SUPREMACY is the last thing the model reads.
  *      Checked on EVERY shape, not one.
@@ -216,6 +225,26 @@ console.log('A. no-operator path is byte-identical to the pre-change builder');
 const EMPTY_OPERATORS = [
   ['undefined', undefined], ['null', null], ["''", ''], ["'   '", '   '], ["'\\n\\t '", '\n\t ']
 ];
+// Unique to the frozen `else` timeline — hook-first Scene 3 says "centre-safe"
+// and is NOT rewritten here.
+const ELSE_SCENE2_OLD = 'slow zoom toward the most distinctive product detail (~8–10%), centered. No rotation or distortion. ';
+const ELSE_SCENE2_NEW = 'slow zoom in (~8–10%) on the product as already shown, centered. No rotation or distortion. ';
+const ELSE_SCENE3_MARK = 'Maintain center framing.';
+function withElseScene2Rewrite(s) {
+  const text = String(s);
+  const i = text.indexOf(ELSE_SCENE2_OLD);
+  if (i < 0) return text;
+  const after = text.slice(i, i + ELSE_SCENE2_OLD.length + 200);
+  if (!after.includes(ELSE_SCENE3_MARK)) return text;
+  return text.slice(0, i) + ELSE_SCENE2_NEW + text.slice(i + ELSE_SCENE2_OLD.length);
+}
+{
+  const packshot = build(current, SHAPES[0], null);
+  check('A-scene2: packshot empty-operator path carries the rewritten Scene 2',
+    packshot.includes(ELSE_SCENE2_NEW));
+  check('A-scene2: packshot empty-operator path no longer hunts a distinctive detail',
+    !packshot.includes('most distinctive product detail'));
+}
 for (const shape of SHAPES) {
   // Prove the shape actually entered the branch it names.
   if (shape.assertMark) {
@@ -227,7 +256,7 @@ for (const shape of SHAPES) {
   for (const [label, op] of EMPTY_OPERATORS) {
     let cur, base;
     try { cur = build(current, shape, op); } catch (err) { cur = `THREW: ${err.message}`; }
-    try { base = build(baseline, shape, op); } catch (err) { base = `THREW: ${err.message}`; }
+    try { base = withElseScene2Rewrite(build(baseline, shape, op)); } catch (err) { base = `THREW: ${err.message}`; }
     check(`A ${shape.name} / operatorPrompt=${label}: byte-identical`, cur === base,
       cur === base ? '' : `current=${Buffer.byteLength(String(cur))}B baseline=${Buffer.byteLength(String(base))}B`);
   }
