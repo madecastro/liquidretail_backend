@@ -198,6 +198,7 @@ async function syncCatalogForCred(cred, run = null) {
   // Graph errors that return early).
   const shotSession = ingestShotClassify.createSession();
   const pendingClassify = [];
+  const pendingBenefits = [];
   // Reason for abandonPending when the post-loop classify never runs
   // (Meta fatal early-return or CancelledError). Distinct from
   // skipBudget (phase ran, ceiling hit).
@@ -296,6 +297,7 @@ async function syncCatalogForCred(cred, run = null) {
         // Rename is what makes a merchant category rename propagate
         // through re-sync without a separate backfill.
         const row = result.value || result;
+        require('./productBenefitsService').collectIfNew(result, pendingBenefits);
         if (row) {
           try {
             const stamp = await stampFeedTruthCategoryRef({
@@ -383,6 +385,13 @@ async function syncCatalogForCred(cred, run = null) {
       console.warn(`   ⚠️  shot-classify batch failed: ${shotErr.message}`);
     });
   }
+
+  // Fire-and-forget: do not await. A derivation failure or latency must
+  // never stall or fail a catalog sync. Idempotent — only NEW inserts
+  // are in pendingBenefits.
+  require('./productBenefitsService').enqueueFromPending({
+    pending: pendingBenefits, brandId: cred.brandId
+  });
 
   // Update credential last-used + last-catalog-sync so the scheduler
   // knows when this tier last completed.

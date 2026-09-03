@@ -262,6 +262,9 @@ async function tryCreate({ media, productMatch, sceneImageUrl, yoloProducts, for
   const isNew = !result?.lastErrorObject?.updatedExisting;
   const draftId = result?.value?._id;
   if (isNew) {
+    if (result?.value) {
+      require('./productBenefitsService').scheduleForProduct({ product: result.value, brand });
+    }
     console.log(`📝 draft product auto-created: "${productName}" brand=${brand.name} cred=${draftId}`);
     return { created: true, draftId, productName, externalId };
   }

@@ -3,7 +3,8 @@
 This is the engineer reference for every background and creative pipeline in the LiquidRetail backend (Node/Express + Mongoose). For each pipeline: what triggers it, its stages, which models/APIs it calls (and rough cost), which env knobs tune it, how progress/cancel works, and what consumes its output. Facts are code-verified as of **2026-08-03** (prod `13cf679`) with **Phase A + Phase B PMax (2026-08-10/11)** documented against branch `feat/pmax-surfaces-phase-a2`, plus a **post-Phase-B addendum** (video cost reconciliation + adversarial corrections; offline suite **78** scripts green). Prefer this doc over tribal memory; when in doubt, open the cited files. Claims written against pre-`13cf679` binaries (including the long-running `a80ae0b` prod window) are suspect.
 
 > **Render cutover (2026-08-24) — read this before §5 / §6 / §8.**
-> When dashboard `ADGEN_RENDERER_ENABLED=true`, the **backend does not
+> When `ADGEN_RENDERER_ENABLED=true` (committed default, matches live
+> dashboard), the **backend does not
 > execute** `runRenderLoop`'s Atlas / Remotion work. `routes/ads.js:1715-1723`
 > returns after flipping `CampaignRun` to `running`;
 > `liquidretail_adgen` `src/services/renderer.js` claims each ad and runs
@@ -548,6 +549,8 @@ The string `social_proof_led` appeared **once** in `aiCreativeDirectorService.js
 **Paired with `DIRECTOR_SIGNALS_VERSION` 3.1.0 → 3.2.0.** ⚠️ **Scope, stated correctly — an earlier revision of this section overstated it:** the LIVE path `directConceptsRound` has **no** `signalsVersion` cache gate and calls `assembleSignals` every round, so the menu takes effect with or without the bump. The only cache-hit gate is `aiCreativeDirectorService.js:262`, inside the **shadow** `directConcepts` path. So the bump buys *shadow* correctness (artifacts built from the narrower shape stop being served as current) and is **not** what makes the flip work. **Accepted one-time cost:** that shadow call is `await`ed on live campaign expansion, so the bump forces one paid re-derive per unique (brand, product, campaignKind, creativeIntent, platformFormat) on next request. Bounded and self-healing. Pinned by `scripts/verifySocialProofRestoration.js` groups A/B.
 
 **Later bump (Phase B PMax, 2026-08-11): `3.2.0` → `3.3.0`.** Required for the PMax-only funnel-spread + social-proof hierarchy brief — without it every product that already has a `CreativeDirectionArtifact` keeps serving the pre-hierarchy brief. Meta round prompt stays byte-identical. Full write-up: [§6 *Director: funnel spread + social-proof hierarchy*](#director-funnel-spread--social-proof-hierarchy-phase-b).
+
+**Later bump (2026-09-03): `3.4.0` → `3.5.0`.** `product_signal.benefits` from `CatalogProduct.shortBenefits` (`DIRECTOR_PRODUCT_BENEFITS`). Already in memory on the Director's bare `findById().lean()` — zero added I/O, never an artifact read, never a derivation. Ingest persists the field once (`PRODUCT_BENEFITS_DERIVATION`, gemini-2.5-flash, CostLog `product_benefits`). Write-up: `session.d/2026-09-03_catalog-product-shortbenefits.md`.
 
 ### Proof coherence — a LABELLED brand rating may sit beside a product/comment quote (static only)
 

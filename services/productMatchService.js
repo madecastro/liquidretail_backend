@@ -2425,6 +2425,7 @@ async function ensureCatalogProductForMatch(match, ctx) {
     lastSyncedAt:        new Date()
   });
   console.log(`📝 catalog row auto-created[${match.productIndex || 'primary'}]: "${ident.productName}" (draft=${isDraft}) → ${cp._id}`);
+  require('./productBenefitsService').scheduleForProduct({ product: cp, brandId: ctx.brandId });
 
   // Fire-and-forget: materialize a source: 'catalog-product' Media doc +
   // crops + detection so the canonical input's productHero slot has

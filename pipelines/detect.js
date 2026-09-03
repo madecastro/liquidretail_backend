@@ -43,7 +43,7 @@ const { generateSmartCrops, computeSafeRect } = require('../services/smartCropSe
 const { judgeDetections, judgeExtendedCrops } = require('../services/judgeService');
 const { generateExtendedCrops } = require('../services/extendedCropsService');
 const { findProductMatches, findPerProductMatches } = require('../services/productMatchService');
-const { analyzeOverlayZones } = require('../services/overlayZoneService');
+const overlayZoneService = require('../services/overlayZoneService');
 const { computeFocus } = require('../services/imageQualityService');
 const {
   classifyShotStyle,
@@ -74,6 +74,35 @@ const CatalogProduct       = require('../models/CatalogProduct');
 const Comment              = require('../models/Comment');
 
 const { downloadBuffer } = require('./shared');
+
+// OVERLAY_ZONES_SKIP_CATALOG (2026-09-03, default true). Catalog ingest
+// used to fire overlay-zone analysis on every Media (up to 3 Gemini/DINO
+// calls — one per base ratio 5:4 / 1:1 / 4:5). Those artifacts have no
+// live generation consumer: seed rank, Director, and titling never read
+// OverlayZoneArtifact / Media.adSuitability. Skip creates NO artifact
+// (honest "not analysed" for the detect UI) rather than zones:{} (which
+// would look like analysis ran and found nothing). UGC keeps zones —
+// runImagePipeline is untouched and does not pass skipOverlayZones.
+//
+// Parser: only the string 'false' (any case, trimmed) re-enables catalog
+// overlay analysis. Unset / 'true' / garbage all skip. A truthy check
+// would treat the string "false" as skip-on (CLAUDE.md §4 trap).
+function isOverlayZonesSkipCatalogEnabled() {
+  return String(process.env.OVERLAY_ZONES_SKIP_CATALOG ?? 'true')
+    .toLowerCase()
+    .trim() !== 'false';
+}
+
+// Catalog lazy-enrichment ctx. skipExtendedCrops stays hardcoded true
+// (studio shots; INGEST_EXTENDED_CROPS_ENABLED must not reopen that
+// spend). skipOverlayZones follows the flag above.
+function catalogOverlayChainCtx(base = {}) {
+  return {
+    ...base,
+    skipExtendedCrops: true,
+    skipOverlayZones: isOverlayZonesSkipCatalogEnabled()
+  };
+}
 
 // ──────────────────────────────────────────────────────────────
 //  Entry point — worker calls this for every queued DetectRun
@@ -549,11 +578,11 @@ async function runCatalogProductPipeline(run, media, buffer) {
   }
 
   // ── Phase 1: detect fan-out — YOLO (skip identify) ‖ subjects/text ──
-  // We run the same vision passes as UGC media so catalog images carry
-  // safe-overlay zones, density + brightness grids, palette, etc. — the
-  // ad pipeline can then use catalog images as first-class creative
-  // sources. The only stage we skip is the dual-engine product identify
-  // (catalog metadata is the source of truth for brand/category/label).
+  // Same YOLO + subjects/text + crops as UGC so catalog images stay
+  // first-class creative sources. Overlay-zone analysis is skipped by
+  // default (OVERLAY_ZONES_SKIP_CATALOG) — no live generation consumer.
+  // Dual-engine product identify is also skipped (catalog metadata is
+  // the source of truth for brand/category/label).
   await setRunPhase(run, 'detect-fanout');
   const [yoloRes, subjectsRes] = await Promise.allSettled([
     runYoloChain(run, buffer, media, sourceUrl, { skipIdentify: true, imgW, imgH }),
@@ -688,14 +717,15 @@ async function runCatalogProductPipeline(run, media, buffer) {
     // extended + overlayZones land via the lazy chain below.
   });
 
-  // ── Lazy enrichment — overlay-zones only (extended-crops skipped) ──
-  // Overlay zones power brightness-grid + safe-zone restrictions on
-  // catalog product images so overlay-mode templates render properly.
+  // ── Lazy enrichment — extended-crops skipped; overlay-zones gated ──
   // Extended-crops (gpt-image-1 / Gemini Imagen variant generation) is
   // skipped — catalog hero shots are clean and isolated; AI extension
   // costs $0.10-0.30 per Media without meaningful quality lift over
   // Cloudinary c_crop on a centered product.
-  runExtendedAndOverlayChain(run, media, sourceUrl, null, crops, judge, primarySubjectDesc, background, text, false, { safeRect, imgW, imgH, skipExtendedCrops: true })
+  // Overlay-zones: OVERLAY_ZONES_SKIP_CATALOG (default true) skips
+  // analysis AND does not create an OverlayZoneArtifact. Flag-off
+  // restores today's unconditional create. UGC path is untouched.
+  runExtendedAndOverlayChain(run, media, sourceUrl, null, crops, judge, primarySubjectDesc, background, text, false, catalogOverlayChainCtx({ safeRect, imgW, imgH }))
     .then(async ({ extendedDoc, overlayDoc }) => {
       await updateMediaLatestArtifacts(media, {
         extended:     extendedDoc?._id,
@@ -1419,10 +1449,16 @@ async function runExtendedAndOverlayChain(run, media, sourceImageUrl, sourceVide
   // generation entirely. Catalog product images are clean isolated
   // studio shots — AI extension to 9:16 / 1.91:1 wastes $0.10-0.30
   // per Media without meaningful quality lift over plain Cloudinary
-  // c_crop. Overlay-zones (brightness grid + restrictions) still
-  // runs because it's cheap (~$0.01) and powers the overlay-mode
-  // contrast guards.
+  // c_crop.
+  //
+  // ctx.skipOverlayZones (catalog call site only, via
+  // catalogOverlayChainCtx) skips overlay-zone analysis AND does not
+  // create an OverlayZoneArtifact. An empty zones:{} doc would look
+  // like analysis ran and found nothing — missing is honest. UGC
+  // never passes this flag. The chain itself does not read
+  // OVERLAY_ZONES_SKIP_CATALOG or sniff media.source.
   const skipExtended = !!ctx.skipExtendedCrops;
+  const skipOverlay = !!ctx.skipOverlayZones;
 
   if (sourceImageUrl && !skipExtended) {
     await timeStage(run, 'extended-crops', async () => {
@@ -1486,44 +1522,47 @@ async function runExtendedAndOverlayChain(run, media, sourceImageUrl, sourceVide
     : null;
 
   let overlayZones = {};
-  if (sourceImageUrl) {
-    await timeStage(run, 'overlay-zones', async () => {
-      try {
-        overlayZones = await runOverlayZoneAnalysis({
-          sourceImageUrl, crops, judge, extendedCrops: extendedCandidates,
-          forbiddenRectsPct,
-          brandId: run.brandId || media.brandId || null,
-          productId: media.metadata?.catalogProductId || null,
-          // 2026-09-02 — extra inputs for the DINO overlay-zone mode
-          // (OVERLAY_ZONES_MODE=dino). Ignored by the Gemini path.
-          // refinedProducts is the already-computed source-space bbox
-          // set — reprojected per-crop by dinoOverlayZoneService and
-          // used to derive restrictions[] + densityGrid without a paid
-          // vision call. mediaImgW/H are the source dims used for the
-          // reprojection.
-          refinedProducts:  media?.refinedProducts,
-          sourceWidth:      ctx.imgW,
-          sourceHeight:     ctx.imgH,
-          // Primary subject resolution: prefer judge.subjects.primaryId
-          // when the judge picked one; else the DINO service's own
-          // largest-bbox fallback in dinoOverlayZoneService kicks in.
-          // primarySubjectDesc's caller in this function derives the id
-          // from the same judge shape, so we forward the id directly
-          // instead of the derived description.
-          primarySubjectId: judge?.subjects?.primaryId || null
-        });
-      } catch (err) {
-        console.warn('⚠️  Overlay zones:', err.message);
-        stampStageFailure(run, 'overlay', err);
-        persistLateStageFailure(run._id, 'overlay', err);
-      }
+  let overlayDoc = null;
+  if (!skipOverlay) {
+    if (sourceImageUrl) {
+      await timeStage(run, 'overlay-zones', async () => {
+        try {
+          overlayZones = await runOverlayZoneAnalysis({
+            sourceImageUrl, crops, judge, extendedCrops: extendedCandidates,
+            forbiddenRectsPct,
+            brandId: run.brandId || media.brandId || null,
+            productId: media.metadata?.catalogProductId || null,
+            // 2026-09-02 — extra inputs for the DINO overlay-zone mode
+            // (OVERLAY_ZONES_MODE=dino). Ignored by the Gemini path.
+            // refinedProducts is the already-computed source-space bbox
+            // set — reprojected per-crop by dinoOverlayZoneService and
+            // used to derive restrictions[] + densityGrid without a paid
+            // vision call. mediaImgW/H are the source dims used for the
+            // reprojection.
+            refinedProducts:  media?.refinedProducts,
+            sourceWidth:      ctx.imgW,
+            sourceHeight:     ctx.imgH,
+            // Primary subject resolution: prefer judge.subjects.primaryId
+            // when the judge picked one; else the DINO service's own
+            // largest-bbox fallback in dinoOverlayZoneService kicks in.
+            // primarySubjectDesc's caller in this function derives the id
+            // from the same judge shape, so we forward the id directly
+            // instead of the derived description.
+            primarySubjectId: judge?.subjects?.primaryId || null
+          });
+        } catch (err) {
+          console.warn('⚠️  Overlay zones:', err.message);
+          stampStageFailure(run, 'overlay', err);
+          persistLateStageFailure(run._id, 'overlay', err);
+        }
+      });
+    }
+
+    overlayDoc = await OverlayZoneArtifact.create({
+      mediaId: media._id, runId: run._id, advertiserId: media.advertiserId, brandId: media.brandId,
+      zones: overlayZones
     });
   }
-
-  const overlayDoc = await OverlayZoneArtifact.create({
-    mediaId: media._id, runId: run._id, advertiserId: media.advertiserId, brandId: media.brandId,
-    zones: overlayZones
-  });
 
   return { extendedDoc, overlayDoc };
 }
@@ -1746,7 +1785,7 @@ async function runOverlayZoneAnalysis({ sourceImageUrl, crops, judge, extendedCr
       if (zone) return zone;
       // Fall through to Gemini when DINO returns null (unusable inputs).
     }
-    return analyzeOverlayZones({ imageUrl: i.imageUrl, label: i.label, ratio: i.ratio, forbiddenRectsPct, brandId, productId, adId, campaignRunId });
+    return overlayZoneService.analyzeOverlayZones({ imageUrl: i.imageUrl, label: i.label, ratio: i.ratio, forbiddenRectsPct, brandId, productId, adId, campaignRunId });
   }));
 
   const artifact = {};
@@ -2026,5 +2065,10 @@ module.exports = {
   processDetectRun,
   // Exported for offline harnesses (verifyIngestShotClassify H3/H4) that
   // must exercise the carried-style branch for real — not re-implement it.
-  applyMediaLibraryDerivations
+  applyMediaLibraryDerivations,
+  // Overlay-zone catalog skip (verifyOverlayZonesSkipCatalog) — drive the
+  // real parser, catalog ctx builder, and chain with stubs.
+  isOverlayZonesSkipCatalogEnabled,
+  catalogOverlayChainCtx,
+  runExtendedAndOverlayChain
 };

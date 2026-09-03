@@ -156,6 +156,9 @@ router.post('/product', upload.single('image'), async (req, res) => {
 
     const product = result.value;
     const isNew   = !result.lastErrorObject?.updatedExisting;
+    if (isNew && product) {
+      require('../services/productBenefitsService').scheduleForProduct({ product, brand });
+    }
     console.log(`📦 manual product ${isNew ? 'created' : 'updated'}: brand=${brand.name} title="${title}" draft=${draft}`);
 
     res.status(isNew ? 201 : 200).json({

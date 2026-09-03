@@ -1388,11 +1388,8 @@ router.post('/:id/title-still', express.json({ limit: '1mb' }), async (req, res)
       if (!check.ok) return res.status(400).json({ error: `spec invalid: ${check.errors.slice(0, 5).join('; ')}`, errors: check.errors });
       spec = check.normalized;
     } else {
-      // Title Studio authoring: honour stored brand.titleStyleSpec so the
-      // operator can still preview/edit a saved override. Production render
-      // (brandScriptExecutor) uses resolveSpec without this flag and ignores
-      // tier-1 persisted docs when TITLE_SPEC_IGNORE_PERSISTED=true.
-      spec = resolveSpecForBrand(brand, rawFormat, { honourPersistedOverrides: true }).spec;
+      // Same cascade as render — persisted brand.titleStyleSpec wins when valid.
+      spec = resolveSpecForBrand(brand, rawFormat).spec;
     }
 
     const frames = (Array.isArray(req.body?.frames) ? req.body.frames : [1.5])
@@ -1577,8 +1574,7 @@ router.post('/:id/preview-script', express.json(), async (req, res) => {
         if (!specRes.ok) return res.status(400).json({ error: `spec invalid: ${specRes.errors.slice(0, 5).join('; ')}` });
         previewSpec = specRes.normalized;
       } else {
-        // Title Studio authoring — see honourPersistedOverrides note above.
-        previewSpec = resolveSpecForBrand(brand, format, { honourPersistedOverrides: true }).spec;
+        previewSpec = resolveSpecForBrand(brand, format).spec;
       }
       previewTokens = await buildBrandTokens(brand, { specFontOverrides: previewSpec.tokenOverrides?.fonts || {} });
     } else if (bodyScript) {
@@ -1875,9 +1871,7 @@ router.get('/:id/title-spec', async (req, res) => {
     const resolved = {};
     for (const format of TITLING_FORMATS) {
       try {
-        // Title Studio authoring — honour stored overrides so the operator
-        // sees/edits what is on the brand doc. Live renders ignore tier 1.
-        const { spec, source } = resolveSpecForBrand(brand, format, { honourPersistedOverrides: true });
+        const { spec, source } = resolveSpecForBrand(brand, format);
         // Hydrate stub entries for every SLOT_KEYS not present so the
         // Title Studio dropdown surfaces every available slot (all
         // visible: false — operator flips them on as needed). Doesn't
@@ -1989,7 +1983,7 @@ function titleSpecSchemaPrompt() {
     `    "key": one of the SLOT KEYS listed below,               // same key may appear twice (e.g. hook + proof claim)`,
     '    "visible": bool,                                            // set false to keep the slot in the spec but not render it',
     `    "bind": [meta fields — TEXT slots use ${V.BINDABLE_META_FIELDS.join(', ')};`,
-    `                            MULTI slots use ${V.BINDABLE_MULTI_META_FIELDS.join(', ')};`,
+    `                            MULTI slots use ${V.BINDABLE_MULTI_META_FIELDS.join(', ')} (at least one of those names is required; a {literal:[...]} is only a fallback AFTER a meta field, never alone);`,
     `                            IMAGE slots use ${V.BINDABLE_IMAGE_META_FIELDS.join(', ')};`,
     '                            first non-empty value in the chain wins]',
     '    "visibleWhenEmpty": str,                                    // optional: render ONLY when named sibling slot has no content',
@@ -2002,7 +1996,7 @@ function titleSpecSchemaPrompt() {
     `                   "shadow": ${V.SHADOWS.join('|')}, "casing": ${V.CASINGS.join('|')}, "fontRole": heading|body|quote,`,
     '                   "weight": 100-900, "sizeScale": 0.5..2, "maxLines": 1-4, "trackingPx": 0..8,',
     '                   "colorToken": color token, "accent": { "type": underline|bar|none, "colorToken": color token, "animate": bool },',
-    `                   // MULTI slots only: "itemLayout": ${V.ITEM_LAYOUTS.join('|')}, "itemStyle": ${V.ITEM_STYLES.join('|')}, "itemDelaySec": 0..2 (stagger between items), "itemGap": 0..0.05, "maxItems": 1..8`,
+    `                   // MULTI slots only: "itemLayout": ${V.ITEM_LAYOUTS.join('|')}, "itemStyle": ${V.ITEM_STYLES.join('|')}, "itemDelaySec": 0..2 (progress FRACTION of the slot's visible window, NOT wall-clock seconds; item i appears at i*delay/(n*delay+0.4)), "itemGap": 0..0.05, "maxItems": 1..8`,
     `                   // IMAGE slots only: "fit": ${V.IMAGE_FITS.join('|')}, "sizePct": 0.05..0.9 (fraction of canvas short edge), "radiusPct": 0..0.5, "borderWidthPct": 0..0.02, "borderColorToken": color token`,
     '                 }',
     '  }]',
@@ -2015,9 +2009,10 @@ function titleSpecSchemaPrompt() {
     '- Slots sharing (phase, anchor) stack top-to-bottom in array order; a shared position.row renders side by side.',
     '- Positions are safe-zone clamped at render time. Slots whose bound meta value is empty (or null / empty array) are skipped automatically.',
     '- visibleWhenEmpty:"quote" on a second headline is the proof claim fallback — shows the claim only when the quote is gated empty (stars never sit alone).',
-    '- MULTI slots iterate their bound array; use itemDelaySec > 0 to cascade item entrances one after the other.',
+    '- MULTI slots iterate their bound array; itemDelaySec is a progress fraction of the slot window (not seconds) — >0 cascades item entrances.',
     '- IMAGE slots draw a single <img> — sizePct is a fraction of the canvas short edge; radiusPct rounds the corners.',
     '- Set visible:true to enable a slot the current spec has hidden; the operator may reference any slot key from the SLOT KEYS list.',
+    '- Never copy LIVE CONTENT SAMPLE strings into bind literals or treatment copy.',
   ].join('\n');
 }
 
@@ -2044,8 +2039,22 @@ async function runModifyTitleSpec(jobId, brand, { format, currentSpec, request, 
   const { validateTitleSpec } = require('../services/titleSpecValidator');
   const { buildBrandTokens } = require('../services/titleSpecService');
   const { generate } = require('../services/atlasTextService');
+  const {
+    loadTitleSpecContentSample,
+    formatContentSampleBlock,
+    composeModifyTitleSpecUserMsg,
+    collectSampleStrings,
+    findFrozenSampleLiterals,
+  } = require('../services/titleSpecContentSample');
   try {
     const tokens = await buildBrandTokens(brand, {});
+    // C3: empty sample is the common case — still emits the labelled
+    // section, never looks like an error, never derives.
+    const contentSample = await loadTitleSpecContentSample(brand._id);
+    const sampleBlock = formatContentSampleBlock(contentSample);
+    // Keep the raw sample strings so a returned spec can be checked for
+    // literals COPIED from them — see findFrozenSampleLiterals.
+    const sampleStrings = collectSampleStrings(contentSample);
     const system = [
       'You are a video-ad title stylist. You edit a declarative "title style spec" that a rendering engine consumes.',
       'Apply the operator\'s requested modifications to the CURRENT SPEC and return the result as raw JSON.',
@@ -2064,14 +2073,21 @@ async function runModifyTitleSpec(jobId, brand, { format, currentSpec, request, 
       titleSpecSchemaPrompt(),
     ].join('\n');
     const historyBlock = formatChatHistoryForPrompt(history);
-    const userMsg = (extra) => [
-      `FORMAT: ${format}`,
-      `BRAND TOKENS (defaults the spec inherits — override via tokenOverrides only when asked): ${JSON.stringify({ colors: tokens.colors, fonts: Object.fromEntries(Object.entries(tokens.fonts).map(([r, f]) => [r, f.family])) })}`,
-      historyBlock,   // empty string when no history — filter(Boolean) below drops it
-      `CURRENT SPEC:\n${JSON.stringify(currentSpec, null, 2)}`,
-      `OPERATOR REQUEST: ${request}`,
-      extra || '',
-    ].filter(Boolean).join('\n\n');
+    const tokensJson = JSON.stringify({
+      colors: tokens.colors,
+      fonts: Object.fromEntries(Object.entries(tokens.fonts).map(([r, f]) => [r, f.family])),
+    });
+    // Sample sits AFTER BRAND TOKENS, BEFORE CURRENT SPEC. Labelling is
+    // load-bearing — see formatContentSampleBlock.
+    const userMsg = (extra) => composeModifyTitleSpecUserMsg({
+      format,
+      tokensJson,
+      sampleBlock,
+      historyBlock,
+      currentSpec,
+      request,
+      extra,
+    });
 
     // Parse the LLM response into { spec, summary }. Tolerant to both the
     // new envelope shape and the legacy bare-spec response, so a temporary
@@ -2107,6 +2123,23 @@ async function runModifyTitleSpec(jobId, brand, { format, currentSpec, request, 
         continue;
       }
       const check = validateTitleSpec(parsed.spec, { format });
+      // SAMPLE-COLLISION GUARD. The prompt shows real per-SKU benefit/spec
+      // strings; a literal copied from them would print one product's copy on
+      // every render for this brand+format, and since
+      // TITLE_SPEC_IGNORE_PERSISTED was removed a persisted spec always wins.
+      // Routed through lastErrors so the EXISTING one-shot corrective re-ask
+      // handles it — no new retry budget, no extra paid call beyond the one
+      // this loop already allows.
+      const frozen = check.ok ? findFrozenSampleLiterals(check.normalized, sampleStrings) : [];
+      if (check.ok && frozen.length) {
+        lastErrors = frozen.slice(0, 4).map(
+          (f) => `slot '${f.slotKey}'.${f.chain} hardcodes a LIVE CONTENT SAMPLE string as a literal ` +
+                 `(${JSON.stringify(f.value.slice(0, 60))}). Those strings belong to ONE product and would ` +
+                 `print on every render for this brand. Bind the meta field instead and remove the literal.`
+        );
+        console.warn(`🎨 modify-title-spec[${jobId}]: attempt ${attempt} froze ${frozen.length} sample string(s) — re-asking`);
+        continue;
+      }
       if (check.ok) {
         const prev = specJobs.get(jobId) || {};
         specJobs.set(jobId, {
@@ -2175,8 +2208,7 @@ router.post('/:id/title-spec/modify', express.json(), async (req, res) => {
       baseSpec = check.normalized;
       source = 'client';
     } else {
-      // Title Studio AI-modify base — honour stored brand titleStyleSpec.
-      const resolved = resolveSpecForBrand(brand, rawFormat, { honourPersistedOverrides: true });
+      const resolved = resolveSpecForBrand(brand, rawFormat);
       baseSpec = resolved.spec;
       source = resolved.source;
     }

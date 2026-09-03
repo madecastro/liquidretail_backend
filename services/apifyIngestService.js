@@ -605,6 +605,7 @@ async function syncBrandShopify(brand, run = null) {
   // ARCHITECTURE: upsert NEVER awaits image classify. Post-loop pass only.
   const shotSession = ingestShotClassify.createSession();
   const pendingClassify = [];
+  const pendingBenefits = [];
   let idx = 0;
   try {
   for (const p of products) {
@@ -668,6 +669,7 @@ async function syncBrandShopify(brand, run = null) {
       catalogPersisted++;
       // Defer classify to post-loop pass — never block remaining upserts.
       const row = result?.value || result;
+      require('./productBenefitsService').collectIfNew(result, pendingBenefits);
 
       // Stamp / restamp categoryRef via applyFeedTruthStamp — handles
       // insert (fresh row), noop (ref matches), and rename (merchant
@@ -799,6 +801,10 @@ async function syncBrandShopify(brand, run = null) {
       require('./catalogPostSyncOrchestrator').runPostSyncChain(brand._id, { trigger: 'sync' })
     );
   }
+
+  require('./productBenefitsService').enqueueFromPending({
+    pending: pendingBenefits, brand, backgroundWork
+  });
 
   // Awaitable by a caller that owns its own connection lifecycle (see the
   // ROBUSTNESS comment above). Ignored — safely — by every existing

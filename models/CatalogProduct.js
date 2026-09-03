@@ -239,6 +239,13 @@ const catalogProductSchema = new mongoose.Schema({
   ratingDistribution:  { type: [mongoose.Schema.Types.Mixed], default: [] },  // [{stars, count}, ...] from Immersive
   reviews:             { type: [mongoose.Schema.Types.Mixed], default: [] },  // individual review rows (top 10) from Immersive
   specs:               { type: mongoose.Schema.Types.Mixed, default: null },  // Immersive product_results.specifications
+  // Buyer-facing benefits, derived once at ingest (productBenefitsService,
+  // gemini-2.5-flash). default: undefined (NOT []) so assembleSignals and
+  // the backfill can distinguish "never derived" (field absent) from
+  // "derived, genuinely nothing" ([] + shortBenefitsDerivedAt set).
+  // Mongoose strict drops undeclared paths — declaring is mandatory.
+  shortBenefits:          { type: [String], default: undefined },
+  shortBenefitsDerivedAt: { type: Date, default: null },
   sellers:             { type: [mongoose.Schema.Types.Mixed], default: [] },  // Aggregated google_shopping shopping_results
   reviewSummary:       mongoose.Schema.Types.Mixed,                            // Gemini narrative — distinct from productReviews.summary
   detailsRefreshedAt:  Date,                                                    // 30-day TTL marker for the four Immersive fields above

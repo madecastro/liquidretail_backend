@@ -333,7 +333,9 @@ function validateTitleSpec(spec, { format = 'feed' } = {}) {
       // that renders directly when reached. Literals act as a floor
       // value — always non-empty by construction. Rating is composite
       // so an empty chain is legal; every other type needs at least
-      // one entry.
+      // one entry. Multi slots additionally require at least one of
+      // BINDABLE_MULTI_META_FIELDS, with any literal AFTER that field
+      // (a leading/only literal would freeze SKU strings into the spec).
       const bind = s.bind == null ? DEFAULT_BIND[s.key] : s.bind;
       const validFields = slotType === 'multi'  ? BINDABLE_MULTI_META_FIELDS
                         : slotType === 'image'  ? BINDABLE_IMAGE_META_FIELDS
@@ -379,6 +381,40 @@ function validateTitleSpec(spec, { format = 'feed' } = {}) {
           break;
         }
       }
+      // LIVE-FIELD-BEFORE-LITERAL. A leading (or only) {literal} freezes one
+      // SKU's strings into a spec, and two changes made that reachable rather
+      // than latent: TITLE_SPEC_IGNORE_PERSISTED is gone, so a persisted
+      // tier-1 spec now ALWAYS wins at render; and runModifyTitleSpec hands
+      // the authoring LLM real per-SKU benefit/spec sample strings, restrained
+      // otherwise only by prose. One Title Studio save would then print one
+      // product's copy on every render for that brand+format — invisibly,
+      // because the preview looks right for the SKU under review.
+      //
+      // SCOPE: MULTI ONLY. It deliberately does NOT apply to text slots.
+      // A literal-only TEXT bind is a supported operator feature, not a bug —
+      // adgen's scripts/verifyBrandTaglineNoInversion.js group F asserts
+      // `bind: [{literal:'Shop the whole collection today'}]` on a productName
+      // slot MUST validate, and tests that such an operator-authored literal
+      // is not run through the noun-preserving fitter. Banning it here broke
+      // that harness. (An adversarial review recommended the blanket ban; the
+      // suite caught that it destroys a documented capability. The real risk —
+      // the authoring LLM copying per-SKU SAMPLE strings into a literal — is
+      // guarded where the sample is actually in scope, in
+      // routes/brand.js runModifyTitleSpec, not here where it is invisible.)
+      // Multi slots have no equivalent legitimate literal-only case: their
+      // whole purpose is to iterate a live array.
+      // Also NOT applied to: rating (composite, empty chain legal) and image
+      // (a hardcoded asset URL is legitimate authoring).
+      if (!bindError && slotType === 'multi') {
+        const firstMetaIdx = cleanBind.findIndex(
+          (b) => typeof b === 'string' && validFields.includes(b)
+        );
+        if (firstMetaIdx < 0) {
+          bindError = `${where}.bind for a ${slotType} slot must include at least one of ${validFields.join('|')} (a literal-only bind would freeze SKU strings into the spec)`;
+        } else if (cleanBind.slice(0, firstMetaIdx).some((b) => isPlainObject(b) && Object.prototype.hasOwnProperty.call(b, 'literal'))) {
+          bindError = `${where}.bind: a ${slotType}-slot {literal} must come AFTER a live meta field (a leading literal always wins and freezes SKU strings)`;
+        }
+      }
       if (bindError) { err(bindError); continue; }
       out.bind = cleanBind;
 
@@ -408,6 +444,11 @@ function validateTitleSpec(spec, { format = 'feed' } = {}) {
             bmErr = `${where}.brandModeBind[${bi}]: expected string or { literal: <value> }`; break;
           }
         }
+        // NOTE: no live-field-before-literal rule here, for the same reason as
+        // `bind` above — brandModeBind is text-typed and an operator-authored
+        // literal is a legitimate brand-mode line. The sample-collision guard
+        // in routes/brand.js runModifyTitleSpec covers BOTH chains, because
+        // that is the only place the brand's sample strings are in scope.
         if (bmErr) { err(bmErr); continue; }
         bmBind = cleanBmBind;
       }

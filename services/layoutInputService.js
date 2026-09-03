@@ -87,7 +87,7 @@ const { RATING_CLAIM_MIN, SAMPLE_FLOOR } = require('./claimSubstantiationService
 // endpoint as the direct fallback inside the transport).
 const { chatCompletion, isConfigured: atlasConfigured } = require('./atlasLlmService');
 
-const GEMINI_MODEL = process.env.GEMINI_SEARCH_MODEL || 'gemini-2.5-pro';
+const GEMINI_MODEL = process.env.LAYOUT_DERIVATION_MODEL || 'gemini-2.5-pro';
 
 // Bump when the canonical input shape changes — cached LayoutInputArtifact
 // docs with a mismatching version are treated as cache misses and forced

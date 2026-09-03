@@ -125,16 +125,24 @@ export function estimateTextLines(text, { usableWidthPx, fontPx, maxLines = 1 } 
  *
  * Image slots (`productImage`/`brandLogo`) are sized by `sizePct` of the
  * canvas's short side (slotRenderers.jsx `renderImage`) — needs `dims`.
- * Multi-value slots (`badges`/`benefits`) are approximated by their own
- * authored `maxLines` at a single row's height; they are not part of the
- * incident this module closes, and the estimate errs toward "keep the box
- * honest" rather than exactness (see file header).
+ *
+ * Multi-value slots (`badges`/`benefits`) are LAYOUT-DEPENDENT. Joining the
+ * array into one string at maxLines 1 is honest for itemLayout:'row' (one
+ * flex line of chips) and FALSE for 'stack' — the validator default for
+ * benefits. A 4-item stack became one line, planGroupFit never shrank, and
+ * overflow:hidden clipped through items (the Vuori mid-star defect this
+ * module exists to prevent). Layout math lives HERE, not in Canonical.jsx:
+ * this file is vendor-synced with adgen; Canonical is not, so a fork that
+ * only grows estCtx still gets the right estimate via the slotKey defaults.
  *
  * @returns {number} px, never negative; 0 for empty/unrenderable content.
  */
 export function estimateSlotHeightPx(slotKey, content, ctx = {}) {
   if (content == null) return 0;
-  const { fontPx, usableWidthPx, maxLines, dims, sizePct, dropReviews = false } = ctx;
+  const {
+    fontPx, usableWidthPx, maxLines, dims, sizePct, dropReviews = false,
+    itemLayout, itemGap, maxItems,
+  } = ctx;
 
   if (slotKey === 'rating') {
     if (!Number.isFinite(fontPx) || fontPx <= 0) return 0;
@@ -156,9 +164,110 @@ export function estimateSlotHeightPx(slotKey, content, ctx = {}) {
   }
 
   if (!Number.isFinite(fontPx) || fontPx <= 0) return 0;
+
+  if (slotKey === 'badges' || slotKey === 'benefits') {
+    return estimateMultiSlotHeightPx(content, {
+      fontPx, usableWidthPx, maxLines, dims, itemLayout, itemGap, maxItems, slotKey,
+    });
+  }
+
   const text = Array.isArray(content) ? content.join(' ') : String(content ?? '');
   const lines = estimateTextLines(text, { usableWidthPx, fontPx, maxLines: maxLines || 1 });
   return lines * fontPx * TEXT_LINE_HEIGHT;
+}
+
+/**
+ * Height of a badges/benefits slot from its resolved item array.
+ *
+ *   stack — n rows, each item wraps on its own, plus (n-1) × gap.
+ *   row   — historical joined-text model (one flex line). wrap-to-next-line
+ *           via flexWrap is possible but the original "keep the box honest"
+ *           claim was true for this layout; we do not inflate it.
+ *   grid  — slotRenderers.jsx hardcodes 2 columns (`repeat(2, minmax(0,1fr))`),
+ *           so row count is ceil(n/2). Each cell wraps at ~half usable width;
+ *           a row's height is the taller of its two cells.
+ *
+ * maxItems (validator default 4) caps n — slotContent.js already slices the
+ * resolved array to that cap before paint. n=0 / empty array → 0.
+ *
+ * When itemLayout is omitted, use the validator default for the slot key
+ * (benefits→stack, badges→row) so a Canonical.jsx fork that has not yet
+ * grown estCtx still estimates benefits honestly.
+ */
+function estimateMultiSlotHeightPx(content, ctx) {
+  const rawItems = Array.isArray(content)
+    ? content
+    : (content == null ? [] : [content]);
+  const items = rawItems.map((x) => String(x ?? '')).filter((s) => s.length > 0);
+  if (!items.length) return 0;
+
+  const cap = Number.isInteger(ctx.maxItems) && ctx.maxItems > 0 ? ctx.maxItems : 4;
+  const shown = items.slice(0, cap);
+  const n = shown.length;
+  if (n === 0) return 0;
+
+  const layout = ctx.itemLayout
+    || (ctx.slotKey === 'benefits' ? 'stack' : 'row');
+  const gapPx = multiItemGapPx(ctx);
+  const lineH = ctx.fontPx * TEXT_LINE_HEIGHT;
+  const maxLines = ctx.maxLines || 1;
+
+  if (layout === 'stack') {
+    let total = 0;
+    for (const item of shown) {
+      const lines = estimateTextLines(item, {
+        usableWidthPx: ctx.usableWidthPx,
+        fontPx: ctx.fontPx,
+        maxLines,
+      });
+      total += lines * lineH;
+    }
+    return total + gapPx * Math.max(0, n - 1);
+  }
+
+  if (layout === 'grid') {
+    const cols = 2;
+    const rows = Math.ceil(n / cols);
+    const cellWidth = Number.isFinite(ctx.usableWidthPx) && ctx.usableWidthPx > 0
+      ? Math.max(1, (ctx.usableWidthPx - gapPx) / cols)
+      : ctx.usableWidthPx;
+    let total = 0;
+    for (let r = 0; r < rows; r++) {
+      let rowH = 0;
+      for (let c = 0; c < cols; c++) {
+        const item = shown[r * cols + c];
+        if (item == null) continue;
+        const lines = estimateTextLines(item, {
+          usableWidthPx: cellWidth,
+          fontPx: ctx.fontPx,
+          maxLines,
+        });
+        rowH = Math.max(rowH, lines * lineH);
+      }
+      total += rowH;
+    }
+    return total + gapPx * Math.max(0, rows - 1);
+  }
+
+  // 'row' and unknown: joined-text, historical model.
+  const text = shown.join(' ');
+  const lines = estimateTextLines(text, {
+    usableWidthPx: ctx.usableWidthPx,
+    fontPx: ctx.fontPx,
+    maxLines,
+  });
+  return lines * lineH;
+}
+
+function multiItemGapPx(ctx) {
+  const frac = Number.isFinite(ctx.itemGap) ? ctx.itemGap : 0.012;
+  if (ctx.dims && Number.isFinite(ctx.dims.width) && Number.isFinite(ctx.dims.height)) {
+    return Math.round(Math.min(ctx.dims.width, ctx.dims.height) * Math.max(0, frac));
+  }
+  // No canvas size: treat gap as 0 rather than inventing pixels. Stack
+  // still sums per-item text heights, so the under-estimate this module
+  // exists to prevent cannot come from a missing gap.
+  return 0;
 }
 
 /**

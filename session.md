@@ -124,6 +124,18 @@ billed $0.90 and wrote a new unique public_id whose bytes match Atlas
 `session.d/2026-09-03_veo-url-mismatch-is-unbilled-422.md`.
 
 *(Prior 2026-09-01: verify-suite dotfile-race hardening, PR #374. Narrative:
+
+**2026-09-03: overlay-zones skip catalog + committed config matches
+prod (worktree `feat/benefits-to-directors`, not committed).** Catalog
+ingest no longer computes overlay zones (`OVERLAY_ZONES_SKIP_CATALOG=true`;
+UGC untouched). `ADGEN_RENDERER_ENABLED=true` in committed defaults
+(adgen owns rendering). Write-up:
+`session.d/2026-09-03_overlay-skip-catalog-and-config-truth.md`.
+
+*(Prior: benefits-to-directors Parts A–D + catalog shortBenefits.
+`session.d/2026-09-03_catalog-product-shortbenefits.md`.)*
+
+*(Prior state replaced 2026-09-01. Narrative:
 `session.d/2026-09-01_verify-suite-dotfile-race-remaining-walks.md`.)*
 
 *(Prior state replaced 2026-08-28. Narrative: session.d/2026-08-28_retitle-adgen-handoff.md.)*

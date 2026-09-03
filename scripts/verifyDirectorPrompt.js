@@ -296,16 +296,16 @@ check(
   'brand.logo never existed — has_logo was permanently false'
 );
 check(
-  'E5 dead product.shortBenefits read is gone',
-  !/product\?\.shortBenefits/.test(fileSrc),
-  'shortBenefits is not on models/CatalogProduct.js — it always sent []'
+  'E5 assembleSignals reads product.shortBenefits (catalog field, already in memory)',
+  /product\?\.shortBenefits/.test(fileSrc),
+  'Part C source is CatalogProduct.shortBenefits — the findById().lean() already loaded it'
 );
 check(
   // Without the bump, the cache-hit test (cached.signalsVersion ===
   // DIRECTOR_SIGNALS_VERSION) keeps serving concepts derived from the starved
   // brief, and the fix above is a no-op on every existing artifact.
-  'E6 DIRECTOR_SIGNALS_VERSION bumped past the starved-brief 3.0.0',
-  /const DIRECTOR_SIGNALS_VERSION = '(?!3\.0\.0')/.test(fileSrc),
+  'E6 DIRECTOR_SIGNALS_VERSION is 3.5.0 (product_signal.benefits)',
+  /const DIRECTOR_SIGNALS_VERSION = '3\.5\.0'/.test(fileSrc),
   'signals version must be bumped so existing CreativeDirectionArtifacts re-derive'
 );
 check(
@@ -313,6 +313,110 @@ check(
   /cp\.headline == null\)/.test(fileSrc) && /headline is null/.test(fileSrc),
   'the all-four-null warning alone lets a headline-less concept log dirWarnings=0'
 );
+
+// ── F. DIRECTOR_PRODUCT_BENEFITS (optional colour, both arms) ────────────
+// Drive the REAL buildPromptRound. Flag-off must be byte-identical on the
+// HONESTY RULE and PROOF-LED strings (benefits are not proof — the
+// self-contradictory-prompt class that forced the PR #61 rollback).
+
+const EDITORIAL_OFF = '    editorial         → product_signal.specs. Name ONE concrete fact (fabric, construction, weight, dimension, care) and build the line on it. A specific verb about a real property beats two adjectives. This is the style that should read as reported, not sold.';
+const COPY_OFF = '- COPY: write the final strings the renderer will ship under copy.{headline,subheadline,eyebrow,cta}. Pull from brand_signal.tagline / description / brand_reviews_summary, product_signal.description, product_signal.specs (real specification facts for THIS product — fabric, construction, weight, dimensions, care), social_proof_signal.primary_quote, and the wider quote pool in social_proof_signal.proof_options[].quotes when grounding. Use null for any role the concept intentionally omits (e.g. eyebrow=null when the design has no eyebrow rule). Storyboard beats reference copy by role — each beat\'s role MUST map to a non-null copy field (e.g. role=headline beat requires copy.headline non-null).';
+
+function withBenefitsFlag(val, fn) {
+  const prev = process.env.DIRECTOR_PRODUCT_BENEFITS;
+  if (val === undefined) delete process.env.DIRECTOR_PRODUCT_BENEFITS;
+  else process.env.DIRECTOR_PRODUCT_BENEFITS = val;
+  try { return fn(); }
+  finally {
+    if (prev === undefined) delete process.env.DIRECTOR_PRODUCT_BENEFITS;
+    else process.env.DIRECTOR_PRODUCT_BENEFITS = prev;
+  }
+}
+
+function roundFor(flag, inputSummary) {
+  return withBenefitsFlag(flag, () => director.buildPromptRound({
+    inputSummary: inputSummary || { product_signal: { name: 'Test Tee' } },
+    creativeIntent: null,
+    platformFormat: 'meta_feed_1_1',
+    universe: universeOf(1),
+    roundIndex: 0,
+    avoidList: []
+  }));
+}
+
+{
+  const on = roundFor('true');
+  const off = roundFor('false');
+  check('F0 buildPromptRound returns on both arms',
+    typeof on.system === 'string' && typeof off.system === 'string');
+
+  check('F1 flag-on GROUNDING editorial mentions benefits MAY colour a line',
+    on.system.includes('product_signal.benefits MAY colour a line'));
+  check('F2 flag-on COPY lists product_signal.benefits as derived/optional',
+    on.system.includes('product_signal.benefits (derived buyer-facing phrases — optional colour, not verified facts)'));
+  // F2b: the PROVENANCE clause must describe where benefits actually come
+  // from. It said "(Gemini-authored at layout derivation)" — true when Part C
+  // read LayoutInputArtifact, FALSE once the source became
+  // CatalogProduct.shortBenefits written by productBenefitsService at ingest.
+  // An adversarial review caught it; nothing pinned it, so it could regress
+  // silently. The "NOT verified catalog facts" half must survive too — that is
+  // what stops the Director treating a derived phrase as substantiated proof.
+  check('F2b flag-on names the REAL benefits provenance (catalog ingest, not layout derivation)',
+    on.system.includes('derived once at catalog ingest') &&
+    !on.system.includes('layout derivation'));
+  check('F2c flag-on still labels benefits as NOT verified facts',
+    /benefits[\s\S]{0,240}NOT verified catalog facts/.test(on.system));
+
+  check('F3 flag-off editorial is byte-identical to the pre-change line',
+    off.system.includes(EDITORIAL_OFF) && !off.system.includes('product_signal.benefits MAY colour'));
+  check('F4 flag-off COPY is byte-identical to the pre-change line',
+    off.system.includes(COPY_OFF) && !off.system.includes('product_signal.benefits (derived'));
+
+  const honestyOn = (on.system.match(/- HONESTY RULE:[^\n]*/ ) || [null])[0];
+  const honestyOff = (off.system.match(/- HONESTY RULE:[^\n]*/ ) || [null])[0];
+  check('F5 HONESTY RULE is byte-identical across benefits-flag arms',
+    honestyOn != null && honestyOn === honestyOff,
+    `on=${honestyOn && honestyOn.slice(0, 80)} off=${honestyOff && honestyOff.slice(0, 80)}`);
+
+  const proofOn = (on.system.match(/- PROOF-LED COVERAGE:[^\n]*/ ) || [null])[0];
+  const proofOff = (off.system.match(/- PROOF-LED COVERAGE:[^\n]*/ ) || [null])[0];
+  check('F6 PROOF-LED COVERAGE is byte-identical across benefits-flag arms',
+    proofOn === proofOff,
+    `on=${proofOn} off=${proofOff}`);
+
+  check('F7 HONESTY RULE source does not mention benefits (benefits are not proof)',
+    !/HONESTY RULE:[^\n]*benefits/.test(fileSrc));
+  check('F8 NULLED HEADLINE escape hatch still names specs+description, not benefits',
+    /you almost certainly still have product_signal\.specs or a product description/.test(on.system) &&
+      /you almost certainly still have product_signal\.specs or a product description/.test(off.system) &&
+      !/NULLED HEADLINE[\s\S]{0,400}product_signal\.benefits/.test(on.system));
+
+  // assembleSignals: key present flag-on / ABSENT flag-off (source — the
+  // behavioural attach is scripts/verifyDirectorBenefits.js).
+  const assembleSrc = extractFunctionSource(fileSrc, 'assembleSignals') || '';
+  check('F9 assembleSignals assigns productSignal.benefits only inside directorProductBenefitsEnabled()',
+    /if \(directorProductBenefitsEnabled\(\)\)/.test(assembleSrc) &&
+      /productSignal\.benefits =/.test(assembleSrc));
+  check('F10 flag-off omits the key by not assigning it (no benefits: [])',
+    !/benefits:\s*\[\]/.test(assembleSrc) &&
+      !/benefits:\s*normalizeBenefitList/.test(assembleSrc));
+}
+
+{
+  // Rating-bearing summary so PROOF-LED actually fires — still must not
+  // disagree across the benefits flag (benefits are not proof).
+  const withRating = {
+    product_signal: { name: 'Test Tee' },
+    social_proof_signal: { rating: { value: 4.8, count: 120 } }
+  };
+  const on = roundFor('true', withRating);
+  const off = roundFor('false', withRating);
+  const proofOn = (on.system.match(/- PROOF-LED COVERAGE:[^\n]*/ ) || [null])[0];
+  const proofOff = (off.system.match(/- PROOF-LED COVERAGE:[^\n]*/ ) || [null])[0];
+  check('F11 PROOF-LED fires on a rating and is byte-identical across arms',
+    typeof proofOn === 'string' && proofOn === proofOff && /usable RATING/.test(proofOn),
+    `on=${proofOn && proofOn.slice(0, 100)}`);
+}
 
 if (failures.length) {
   console.error(`\n❌ director prompt: ${failures.length} FAILED, ${pass} passed\n`);

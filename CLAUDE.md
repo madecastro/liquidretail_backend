@@ -5,15 +5,16 @@ Express + Mongoose backend for Reach Social's ad-generation product. Deploys to
 (`Emami-RS-Project/liquidretail`, trunk `master`) deployed to **Netlify**
 (`staging.reach-social.io`). Trunk here is `main`.
 
-**Render ownership (2026-08-24):** when Render-dashboard
-`ADGEN_RENDERER_ENABLED=true`, **this process does not render ads.**
-`runRenderLoop` (`routes/ads.js:1715-1723`) flips the CampaignRun to
-`running` and returns; `liquidretail_adgen`'s renderer claims
-`Ad.status='rendering'` rows and runs Atlas + Remotion. This repo still
-owns HTTP generate, expansion, mint, and claim. The in-process loop below
-this gate is the **fallback** for when the flag is not `'true'` (committed
-default in `config/defaults.env` is `false`). See
-`services/adgenBridge.js` and `../liquidretail_adgen/CLAUDE.md`. Older
+**Render ownership (2026-08-24, file default aligned 2026-09-03):**
+`ADGEN_RENDERER_ENABLED=true` in `config/defaults.env` — **adgen owns
+rendering in production.** `runRenderLoop` (`routes/ads.js:1715-1723`)
+flips the CampaignRun to `running` and returns; `liquidretail_adgen`'s
+renderer claims `Ad.status='rendering'` rows and runs Atlas + Remotion.
+This repo still owns HTTP generate, expansion, mint, and claim. The
+in-process loop below this gate is the **fallback** for when the flag
+is not the string `'true'`. See `services/adgenBridge.js` and
+`../liquidretail_adgen/CLAUDE.md`. Write-up:
+`session.d/2026-09-03_overlay-skip-catalog-and-config-truth.md`. Older
 docs in `docs/PIPELINES.md` / `docs/ALERTING.md` / `docs/TITLING.md` that
 say the **web process** runs `runRenderLoop` describe that fallback (and
 the pre-cutover architecture). Titling resume being "web-only"
@@ -334,9 +335,20 @@ is unchanged at two.
    `remotion/lib/stackFit.js` (new) sizes the whole GROUP to its box before
    paint — shrink (bounded) → drop the reviews line → drop whole trailing
    rows, protecting the hero — so `overflow:hidden` is a backstop, not the
-   mechanism. Not Reels-specific: `verticalYt`/`landscapeYt` share the same
+   mechanism. Multi slots (`benefits`/`badges`) estimate by item count ×
+   `itemLayout`, not a joined string (2026-09-03; `scripts/verifyMultiSlotStackFit.mjs`).
+   Not Reels-specific: `verticalYt`/`landscapeYt` share the same
    tight-box exposure and go through the identical code path. Pinned by
-   `scripts/verifyReelsOverflowSafety.mjs`.
+   `scripts/verifyReelsOverflowSafety.mjs`. Title-spec cascade is always-honour
+   as of 2026-09-03 (`TITLE_SPEC_IGNORE_PERSISTED` deleted; prod audit: 0
+   persisted specs). Write-up: `session.d/2026-09-03_benefits-to-directors-part-b-d.md`.
+   Titling director gets a live benefits+attributes sample (Part A); static
+   Director gets optional `product_signal.benefits` from
+   `CatalogProduct.shortBenefits` (Part C, `DIRECTOR_PRODUCT_BENEFITS`;
+   already in memory on the bare findById, never an artifact read, never
+   a derivation). Ingest derives the field once via gemini-2.5-flash
+   (`PRODUCT_BENEFITS_DERIVATION`, CostLog `product_benefits`). Write-up:
+   `session.d/2026-09-03_catalog-product-shortbenefits.md`.
    **What `safeArea` IS for, so nobody deletes it as dead:** it is live on the
    **static image** path — `staticAdIntents.computeSurface` turns it into the
    geometry box in the billable gpt-image-2 prompt and into Sharp logomark
@@ -1869,10 +1881,13 @@ Full detail in `docs/ATLAS.md` §7 and `docs/CLOUDINARY-VIDEO.md`. Headlines:
   (`aiCreativeDirectorService.js:149`). A code fix that feeds better brand /
   product signal **without** bumping the version leaves every product that
   already has a `CreativeDirectionArtifact` serving concepts built from the old
-  brief — the fix looks deployed and is a no-op. Current value **`3.3.0`**
-  (Phase B PMax funnel + proof hierarchy). Prior bumps: `3.0.0→3.1.0`
-  starved-brief (`summary` / `logoUrl`); `3.1.0→3.2.0` social-proof menu.
-  Any future signal-shape change needs the same bump.
+  brief — the fix looks deployed and is a no-op. Current value **`3.5.0`**
+  (`product_signal.benefits` from `CatalogProduct.shortBenefits`, 2026-09-03).
+  Prior bumps: `3.4.0` quote-stage alignment; `3.3.0` PMax funnel + proof
+  hierarchy; `3.0.0→3.1.0` starved-brief (`summary` / `logoUrl`);
+  `3.1.0→3.2.0` social-proof menu. Any future signal-shape change needs the
+  same bump. Write-up: `session.d/2026-09-03_catalog-product-shortbenefits.md`.
+- **`OVERLAY_ZONES_SKIP_CATALOG` default true.** Catalog ingest skips overlay-zone analysis (no `OverlayZoneArtifact` — missing is honest; `zones:{}` would look like analysis ran and found nothing). Gate is `catalogOverlayChainCtx` at the catalog call site, not a `media.source` sniff. Parser `!== 'false'` only. UGC (`runImagePipeline`) is untouched. Pinned by `scripts/verifyOverlayZonesSkipCatalog.js`. Write-up: `session.d/2026-09-03_overlay-skip-catalog-and-config-truth.md`.
 - **PMax Director hierarchy PRECEDENCE SENTENCE — do not delete or "harmonise".**
   The shared DR block still says "≥4.5 from ≥50" (Meta-tuned, deliberately
   untouched). The PMax-only social-proof hierarchy block uses env-interpolated
