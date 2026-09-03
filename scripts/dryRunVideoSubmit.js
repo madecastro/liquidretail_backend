@@ -76,7 +76,7 @@ const { buildVeoPrompt, aspectRatioForPlatformFormat, promptProfileFor } = requi
   process.env.REFRAME_ENABLED = 'false';
   const imageUrls = await buildReferenceImages({ media, product, catalogMedias, aspectRatio, caps, referenceCount, brand });
   const hasProductAnchor = imageUrls.length >= 2;
-  const seedHasText = Array.isArray(media.text) && media.text.length > 0;
+
 
   // Same per-ad duration resolution as generateForAd (wizard-stamped
   // Ad.videoDurationSec, clamped/enum-snapped to the model's caps).
@@ -84,7 +84,7 @@ const { buildVeoPrompt, aspectRatioForPlatformFormat, promptProfileFor } = requi
 
   const prompt = buildVeoPrompt({
     concept: null, brand, product, media,
-    aspectRatio, seedHasText,
+    aspectRatio,
     hasProductReference: hasProductAnchor,
     operatorPrompt, storyboard: null, caps, durationSec
   });

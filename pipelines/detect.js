@@ -176,7 +176,7 @@ async function runImagePipeline(run, media, buffer, sourceUrlOverride = null) {
   const refinedProducts = yoloChainOut.refinedProducts;
   const { subjects, text, background, primarySubjectLabel, secondaryElementsTags,
           contentNature, contentNatureConfidence, contentNatureReason,
-          shotType, shotTypeConfidence, shotTypeReason } = subjectsRes.status === 'fulfilled'
+          shotType, shotTypeConfidence, shotTypeReason, faceVisible } = subjectsRes.status === 'fulfilled'
     ? subjectsRes.value
     : emptySubjectsText();
 
@@ -264,7 +264,8 @@ async function runImagePipeline(run, media, buffer, sourceUrlOverride = null) {
     'classification.contentNatureReason':     contentNatureReason || null,
     'classification.shotType':                shotType || 'unknown',
     'classification.shotTypeConfidence':      typeof shotTypeConfidence === 'number' ? shotTypeConfidence : 0,
-    'classification.shotTypeReason':          shotTypeReason || null
+    'classification.shotTypeReason':          shotTypeReason || null,
+    'classification.faceVisible':             faceVisible === true ? true : faceVisible === false ? false : null
   };
   await Media.updateOne({ _id: media._id }, { $set: { ...denorm, ...classificationDenorm } });
   // Keep the in-memory media in sync — subsequent stages (productMatch,
@@ -277,6 +278,7 @@ async function runImagePipeline(run, media, buffer, sourceUrlOverride = null) {
   media.classification.shotType                = shotType || 'unknown';
   media.classification.shotTypeConfidence      = typeof shotTypeConfidence === 'number' ? shotTypeConfidence : 0;
   media.classification.shotTypeReason          = shotTypeReason || null;
+  media.classification.faceVisible             = faceVisible === true ? true : faceVisible === false ? false : null;
 
   const cropDoc = await CropArtifact.create({
     mediaId: media._id, runId: run._id, advertiserId: media.advertiserId, brandId: media.brandId,
@@ -575,7 +577,7 @@ async function runCatalogProductPipeline(run, media, buffer) {
   const refinedProducts = yoloChainOut.refinedProducts;
   const { subjects, text, background, primarySubjectLabel, secondaryElementsTags,
           contentNature, contentNatureConfidence, contentNatureReason,
-          shotType, shotTypeConfidence, shotTypeReason } = subjectsRes.status === 'fulfilled'
+          shotType, shotTypeConfidence, shotTypeReason, faceVisible } = subjectsRes.status === 'fulfilled'
     ? subjectsRes.value
     : emptySubjectsText();
 
@@ -653,7 +655,8 @@ async function runCatalogProductPipeline(run, media, buffer) {
     'classification.contentNatureReason':     contentNatureReason || null,
     'classification.shotType':                shotType || 'unknown',
     'classification.shotTypeConfidence':      typeof shotTypeConfidence === 'number' ? shotTypeConfidence : 0,
-    'classification.shotTypeReason':          shotTypeReason || null
+    'classification.shotTypeReason':          shotTypeReason || null,
+    'classification.faceVisible':             faceVisible === true ? true : faceVisible === false ? false : null
   };
   await Media.updateOne({ _id: media._id }, { $set: { ...denormCp, ...classificationDenormCp } });
   Object.assign(media, denormCp);
@@ -664,6 +667,7 @@ async function runCatalogProductPipeline(run, media, buffer) {
   media.classification.shotType                = shotType || 'unknown';
   media.classification.shotTypeConfidence      = typeof shotTypeConfidence === 'number' ? shotTypeConfidence : 0;
   media.classification.shotTypeReason          = shotTypeReason || null;
+  media.classification.faceVisible             = faceVisible === true ? true : faceVisible === false ? false : null;
 
   const cropDoc = await CropArtifact.create({
     mediaId: media._id, runId: run._id, advertiserId: media.advertiserId, brandId: media.brandId,
@@ -1120,7 +1124,8 @@ async function runSubjectsTextChain(run, imageUrl, media) {
         contentNatureReason:     st.contentNatureReason     || null,
         shotType:                st.shotType                || 'unknown',
         shotTypeConfidence:      typeof st.shotTypeConfidence === 'number' ? st.shotTypeConfidence : 0.5,
-        shotTypeReason:          st.shotTypeReason          || null
+        shotTypeReason:          st.shotTypeReason          || null,
+        faceVisible:             st.faceVisible === true ? true : st.faceVisible === false ? false : null
       };
     } catch (err) {
       console.warn('⚠️  Subject/text:', err.message);
@@ -1135,7 +1140,8 @@ function emptySubjectsText() {
     subjects: [], text: [], background: null,
     primarySubjectLabel: null, secondaryElementsTags: [],
     contentNature: 'unknown', contentNatureConfidence: 0, contentNatureReason: null,
-    shotType: 'unknown', shotTypeConfidence: 0, shotTypeReason: null
+    shotType: 'unknown', shotTypeConfidence: 0, shotTypeReason: null,
+    faceVisible: null
   };
 }
 

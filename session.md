@@ -66,14 +66,65 @@ it clears it back to this placeholder in the same commit that closes it out.)_
 
 ## CURRENT STATE
 
-**2026-09-01: verify-suite dotfile-race hardening finished (PR #374, merged
-+ deployed); PR #367 ("DO NOT MERGE") got merged mid-flight along with four
-independent follow-up PRs (#370-373) fixing its known-failures.** Full
-narrative, including two non-blocking follow-ups an adversarial review
-surfaced on the already-merged Director-fallback/CampaignRun changes
-(`docs/turn-on-anthropic-direct.md` is now stale; `DIRECT_URLS` has no
-`anthropic` entry, so following that stale doc's own next step would throw):
-`session.d/2026-09-01_verify-suite-dotfile-race-remaining-walks.md`.
+**2026-09-03: VIDEO refs implementation, UNCOMMITTED, no push.** Same two
+flags as adgen (`VIDEO_PACKSHOT_PROTECTED_RANKING`,
+`VIDEO_RAW_CATALOG_REFERENCES`), both false. `VIDEO_SEED_TEXT_TYPE_FILTER`
+and the overlay/lock prompt machinery were **stripped** (not flag-gated) —
+`OMNI_DIRECTIVES.noText` is the sole text directive. Strip report:
+`/Volumes/Sayulita/Projects/RS/scratchpad/SEEDTEXT-STRIPPED.md`. Ranking/raw-refs:
+`/Volumes/Sayulita/Projects/RS/scratchpad/IMPLEMENT-VIDEO-REFS-GROK.md`.
+`npm test` 234/234 after the strip. Claude reviews the diff next. Ingest
+`faceVisible` (earlier tonight, also uncommitted) is what the ranking reads;
+no backfill.
+
+**2026-09-03: A/B/C score — C alone is enough.** Pristine catalog
+originals + generic CORE (no per-SKU marks) fixed all four headline
+SERIOUS defects, including the 8af4/8b0b stacked sleeve that B’s marks
+block could not kill. 69b4 C retry after unbilled `api_error` landed
+`$1.035` and copied catalog `PELAGIC` + `BUILT FOR FISHING` (B had
+omitted the second line). Staging is production-viable from existing
+`shotType`+`text[]` ($0 extra). Running Gemini ~$11.38. Narrative:
+`session.d/2026-09-03_abc-score-native-generic.md`. Pixels:
+scratchpad `gemini-direct/REPORT-ABC.md`.
+
+**2026-09-03: fidelity prompt + 4 Gemini r2v + Imagine $1.43.** Camera
+is never a defect. Headline SERIOUS marks fixed on 8ea0/69b4/8af4/8b0b
+except 8af4 sleeve print (on ref1). Imagine settled **$1.43** — not
+$0.08/job, not $0.50/sec. Running Gemini ~$6.20. Narrative:
+`session.d/2026-09-03_fidelity-prompt-gemini4-imagine.md`.
+
+**2026-09-03: Grok Imagine v1.5 r2v one POST failed unbilled — prompt
+over 4096.** Pred `96f0fcd79fbf4b2189e81834c4c0afd6`, executionTime 0,
+no price. 10s/9:16/3-ref mapped; Leaderman's 4162-byte prompt did not.
+$0.08 vs $0.50/sec still unresolved. Did not retry. Narrative:
+`session.d/2026-09-03_grok-imagine-leaderman-prompt-4096.md`.
+
+**2026-09-03: Gemini `image_to_video` (Leaderman, ref0 only) — invented
+side-angle FIXED, waistband WORSE (`PELARIC`).** One POST, never retried.
+i2v does not take a 3-ref stack (1 first-frame or 2 first+last). ~$1.03
+Google; running Gemini total ~$2.06. Narrative:
+`session.d/2026-09-03_gemini-omni-i2v-leaderman.md`.
+
+**2026-09-03: direct Gemini Omni 1.1 Flash 10s 9:16 3-ref WORKS.** One
+POST, never retried, Leaderman `6a986320eea5b7d839449c89` identical
+control_r1 prompt+refs. Model `gemini-omni-1.1-flash`, `duration:"10s"`
+now POSTed-confirmed on Developer REST. ~$1.04 on Google's account (not
+Atlas). Output is not a drop-in of the Atlas Ken Burns master (invented
+side angle). Narrative:
+`session.d/2026-09-03_gemini-omni-1.1-flash-direct-leaderman.md`.
+
+**2026-09-03: tonight's control-arm `veoVideoUrl` match is unbilled Atlas
+422, not a persist bug. Do not POST another 10s 9:16 Omni regenerate.**
+`7e75`/`8ea0`/`69b4`/`cbc` still show yesterday's Cloudinary masters
+because Atlas failed `omni_flash-10s-portrait does not exist` (`price:
+null`, `outputs: []`). Persist works when Atlas succeeds — `9c89`
+billed $0.90 and wrote a new unique public_id whose bytes match Atlas
+`outputs[0]`. Owner's `cbc` praise was the pre-run video. Halted leftover
+`regenerating` rows `cbc` and `478f`. Full forensic:
+`session.d/2026-09-03_veo-url-mismatch-is-unbilled-422.md`.
+
+*(Prior 2026-09-01: verify-suite dotfile-race hardening, PR #374. Narrative:
+`session.d/2026-09-01_verify-suite-dotfile-race-remaining-walks.md`.)*
 
 *(Prior state replaced 2026-08-28. Narrative: session.d/2026-08-28_retitle-adgen-handoff.md.)*
 

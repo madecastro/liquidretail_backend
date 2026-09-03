@@ -53,6 +53,7 @@ function check(label, cond, detail) {
 // not whatever this shell happens to export.
 for (const k of Object.keys(process.env)) {
   if (/^(VIDEO|IMAGE)_DEFAULT_REFERENCE_/.test(k)) delete process.env[k];
+  if (k === 'VIDEO_PACKSHOT_PROTECTED_RANKING') delete process.env[k];
 }
 
 const svc = require(path.join(ROOT, 'services', 'referenceDefaultsService.js'));

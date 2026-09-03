@@ -91,13 +91,6 @@ const { renderCreative }        = require('../services/renderService');
 const { childTailsFrom }        = require('../services/renderErrorFields');
 const { generateForAd: veoGenerateForAd, prepareStoryboard: veoPrepareStoryboard } = require('../services/videoRouter');
 const { buildVideoSegmentUrl, buildPromptScaffold } = require('../services/atlasVideoService');
-// The generation inspector detects this exact sentence inside a PERSISTED
-// Ad.veoPrompt to report what the render actually computed for seedHasText,
-// instead of re-deriving it from a Media row that may have changed since.
-// Imported, never re-implemented — a local copy would silently stop matching
-// the moment the builder's wording changed, and the warning would go quiet
-// again exactly as it did before 2026-08-27.
-const { SEED_BURNED_IN_TEXT_GUARD_LINE } = require('../services/veoPromptBuilder');
 const { resolveSeedTextTruth } = require('../services/seedTextTruth');
 const {
   lookupUrlsFor,
@@ -5476,8 +5469,7 @@ router.get('/:id/generation-inspector', async (req, res) => {
         // string that a reimplementation could satisfy while behaving wrongly.
         const truth = resolveSeedTextTruth({
           media: m,
-          ad,
-          guardLine: SEED_BURNED_IN_TEXT_GUARD_LINE
+          ad
         });
         const {
           burnedInText,
@@ -5485,8 +5477,7 @@ router.get('/:id/generation-inspector', async (req, res) => {
           seedHasTextSource,
           seedTextElementCount,
           promptCarriesSeedTextGuard: guardInPrompt,
-          recordChangedSinceRender,
-          guardMissingAtRender
+          recordChangedSinceRender
         } = truth;
 
         seed = {
@@ -5534,16 +5525,10 @@ router.get('/:id/generation-inspector', async (req, res) => {
             message: `The submitted prompt carries the burned-in-text guard, but the seed Media row now records ZERO text elements. Media.text is overwritten wholesale by each detect run (including to [] when its subjects-text stage fails), so the current record does not describe what this render was given. Trust the prompt.`
           });
         }
-        if (guardMissingAtRender) {
-          // The more actionable direction: the model was handed text-bearing
-          // pixels with NO instruction to leave that text alone. That is a live
-          // candidate cause of garbled on-screen text in the delivered asset,
-          // not merely a bookkeeping mismatch.
-          out.warnings.push({
-            code: 'seed-text-unguarded-at-render',
-            message: `The seed Media row records ${seedTextElementCount} burned-in text element(s), but the submitted prompt does NOT carry the burned-in-text guard — so the model was given text-bearing source pixels with no instruction to treat that text as locked. Either the text was detected after this render, or seedHasText was false at submit while the media already held detections. This is a candidate cause of garbled on-screen text in the delivered asset; the titling engine is a separate layer.`
-          });
-        }
+        // seed-text-unguarded-at-render retired 2026-09-03 with the overlay
+        // guard itself. Absence of that sentence is the intended state
+        // (OMNI_DIRECTIVES.noText is the sole text directive). Do not
+        // resurrect this warning.
       }
     }
     out.seed = seed;
