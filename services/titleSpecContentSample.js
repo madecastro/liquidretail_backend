@@ -3,14 +3,13 @@
 //
 // One definition, imported from runModifyTitleSpec — never reimplemented
 // per caller. Benefits resolve through the SAME cascade titling already
-// uses (DEFAULT_META_CASCADES.benefits → resolveField). Specs go through
-// the already-exported normalizeProductSpecs.
+// uses (DEFAULT_META_CASCADES.benefits → resolveField): CatalogProduct.
+// shortBenefits first, LayoutInputArtifact as historical fallback. Specs
+// go through the already-exported normalizeProductSpecs.
 //
-// C3: empty is the COMMON case (~1% of live products have a
-// benefits-bearing LayoutInputArtifact; the artifact is written at RENDER
-// time, the Director runs at EXPANSION). A miss must be cheap, silent, and
-// must never look like an error. Never call buildLayoutInput / any
-// derivation writer from this file — read already-existing artifacts only.
+// Empty is still cheap/silent/not-an-error (ingest/backfill has not
+// written the catalog field yet). Never call buildLayoutInput / any
+// derivation writer from this file.
 
 'use strict';
 
@@ -23,7 +22,7 @@ const BENEFIT_CHAR_CAP = 56;    // C1: longest live short_benefits string is 42
 const BENEFIT_ITEM_FLOOR = 3;   // C2: never truncate a list that has ≥3 items to fewer than 3
 const SAMPLE_BENEFITS_EXAMPLES = 3;
 const SAMPLE_SPECS_EXAMPLES = 3;
-const SAMPLE_CHAR_CAP = 1800; // ~1.5k plus the BENEFITS FORMATTING block; never clip warnings
+const SAMPLE_CHAR_CAP = 2100; // heading + examples + BENEFITS FORMATTING; never clip warnings
 const PRODUCT_QUERY_LIMIT = 20;
 const ARTIFACT_QUERY_LIMIT = 12;
 
@@ -42,11 +41,15 @@ function normalizeBenefitList(raw) {
   return out;
 }
 
-function benefitsFromArtifact(artifact) {
+function benefitsFromDocs({ catalogProduct = null, layoutInput = null } = {}) {
   // Same cascade brandScriptExecutor.buildMetaForAd uses for meta.benefits.
   // One definition (DEFAULT_META_CASCADES.benefits), imported, never copied.
-  const { value } = resolveField(DEFAULT_META_CASCADES.benefits, { layoutInput: artifact });
+  const { value } = resolveField(DEFAULT_META_CASCADES.benefits, { catalogProduct, layoutInput });
   return normalizeBenefitList(value);
+}
+
+function benefitsFromArtifact(artifact) {
+  return benefitsFromDocs({ layoutInput: artifact });
 }
 
 function specsFromProduct(product) {
@@ -95,19 +98,23 @@ function computeStats(nProducts, lists) {
   };
 }
 
-// MONEY / C3: plain findOne of an already-existing artifact. Never
+// MONEY: CatalogProduct.findById of an already-persisted field, then a
+// plain findOne of an already-existing artifact as fallback. Never
 // buildLayoutInput, never fetchAndCache, never LLM/Gemini, never write.
-// productId is indexed (models/LayoutInputArtifact.js:36). No schemaVersion
-// filter — same preference-not-filter as buildMetaForAd (:944-957).
 async function loadProductBenefits(productId) {
   if (!productId) return [];
   try {
+    const product = await CatalogProduct.findById(productId)
+      .select('shortBenefits')
+      .lean();
+    const fromCatalog = benefitsFromDocs({ catalogProduct: product });
+    if (fromCatalog.length) return fromCatalog;
     const artifact = await LayoutInputArtifact.findOne({ productId })
       .sort({ createdAt: -1 })
       .select('input.product.short_benefits input.product.benefits')
       .lean();
     if (!artifact) return [];
-    return benefitsFromArtifact(artifact);
+    return benefitsFromDocs({ catalogProduct: product, layoutInput: artifact });
   } catch (_) {
     return [];
   }
@@ -122,7 +129,7 @@ async function loadTitleSpecContentSample(brandId) {
     const products = await CatalogProduct.find({ brandId, deletedAt: null })
       .sort({ detailsRefreshedAt: -1, _id: -1 })
       .limit(PRODUCT_QUERY_LIMIT)
-      .select('_id specs')
+      .select('_id specs shortBenefits')
       .lean();
     const productIds = (products || []).map((p) => p._id).filter(Boolean);
 
@@ -130,9 +137,8 @@ async function loadTitleSpecContentSample(brandId) {
     if (productIds.length) {
       // productId is indexed (LayoutInputArtifact.js:36). createdAt is NOT
       // indexed — keep the limit tight (12) so the in-memory sort stays
-      // bounded. Do NOT filter schemaVersion: 722 of 738 prod artifacts are
-      // pre-4.1; dropping them would hide the only benefits we have
-      // (buildMetaForAd note :944-957).
+      // bounded. Artifact is a FALLBACK for products whose catalog field
+      // is empty; catalog shortBenefits is the primary source.
       artifacts = await LayoutInputArtifact.find({ productId: { $in: productIds } })
         .sort({ createdAt: -1 })
         .limit(ARTIFACT_QUERY_LIMIT)
@@ -140,16 +146,22 @@ async function loadTitleSpecContentSample(brandId) {
         .lean();
     }
 
+    const artifactByProduct = new Map();
+    for (const art of artifacts || []) {
+      const pid = String(art.productId || '');
+      if (pid && !artifactByProduct.has(pid)) artifactByProduct.set(pid, art);
+    }
+
     const allLists = [];
     const benefitsExamples = [];
-    const seenBenefitProducts = new Set();
-    for (const art of artifacts || []) {
-      const list = benefitsFromArtifact(art);
+    for (const p of products || []) {
+      const list = benefitsFromDocs({
+        catalogProduct: p,
+        layoutInput: artifactByProduct.get(String(p._id)) || null,
+      });
       if (!list.length) continue;
       allLists.push(list);
-      const pid = String(art.productId || '');
-      if (benefitsExamples.length < SAMPLE_BENEFITS_EXAMPLES && !seenBenefitProducts.has(pid)) {
-        seenBenefitProducts.add(pid);
+      if (benefitsExamples.length < SAMPLE_BENEFITS_EXAMPLES) {
         benefitsExamples.push(list);
       }
     }
@@ -174,14 +186,15 @@ async function loadTitleSpecContentSample(brandId) {
 }
 
 const SAMPLE_HEADING = 'LIVE CONTENT SAMPLE (illustrative of this brand - NOT copy to put in the spec)';
-const BIND_WARNING = 'To show benefits, bind:["benefits"] (the renderer fills per-ad from that ad\'s layoutInput). do NOT add {literal:[...]} with these words — that freezes one SKU into every video.';
+const BIND_WARNING = 'To show benefits, bind:["benefits"] (the renderer fills per-ad from CatalogProduct.shortBenefits). do NOT add {literal:[...]} with these words — that freezes one SKU into every video.';
 const SPECS_WARNING = 'there is no meta.specs field, do not invent a specs slot';
-const EMPTY_BENEFITS_LINE = 'this brand currently has no derived benefits today. That is expected (derived at render; absent on first generate for most products), not an error.';
+const EMPTY_BENEFITS_LINE = 'this brand currently has no derived catalog benefits. That is expected until ingest/backfill has written CatalogProduct.shortBenefits, not an error.';
 const FLOOR_LINE = 'This brand\'s derived benefits lists have at least 3 lines whenever benefits exist — you have at least 3 lines to work with.';
 
 const FORMATTING_BLOCK = [
   'BENEFITS FORMATTING:',
   '- Benefits belong in the `proof` or `close` phase, NOT as the hook hero. remotion/lib/stackFit.js planGroupFit never drops the FIRST contentful row (hero protection); a stack first in a tight box (Reels bottom 0.35) hits SHRINK_FLOOR 0.82 and still overflows.',
+  '- Funnel intent is a SIGNAL not a template wipe: consideration prefers `proof`; conversion only if `close` has room; awareness never as the hook. Live generate also runs services/videoBenefitsDirector.js per ad with the same rules.',
   '- On `vertical`/`reels` prefer maxItems 3; 4 is fine on feed/square/landscape. (Measured: real arrays are 3-4 items, longest single string 42 chars.)',
   '- Keep `scrim: "none"` on a multi slot. slotRenderers.jsx wraps the WHOLE list in one scrim panel, which reads as a block rather than a list.',
   '- `itemDelaySec` is a FRACTION of the slot\'s own window (0..1-ish), NOT wall-clock seconds. 0.12 (the validator default) is a good cascade; 1.5 is not "1.5 seconds", it is broken.',
@@ -364,6 +377,7 @@ module.exports = {
   FLOOR_LINE,
   FORMATTING_BLOCK,
   normalizeBenefitList,
+  benefitsFromDocs,
   benefitsFromArtifact,
   loadProductBenefits,
   loadTitleSpecContentSample,

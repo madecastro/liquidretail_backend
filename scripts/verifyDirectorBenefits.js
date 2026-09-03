@@ -274,21 +274,29 @@ async function runBehavioral() {
     unstubAssemble();
   }
 
-  // Direct helper: loadProductBenefits uses findOne, not buildLayoutInput.
+  // Direct helper: catalog field first, artifact fallback. Never derives.
   try {
     process.env.DIRECTOR_PRODUCT_BENEFITS = 'true';
+    CatalogProduct.findById = () => query({ shortBenefits: ['A', 'B', 'C', 'D'] });
     LayoutInputArtifact.findOne = () => query({
-      input: { product: { short_benefits: ['A', 'B', 'C', 'D'] } },
+      input: { product: { short_benefits: ['ignored-artifact'] } },
     });
     const list = await helper.loadProductBenefits('000000000000000000000002');
-    check('A12 loadProductBenefits returns the cascade-resolved list',
+    check('A12 loadProductBenefits prefers CatalogProduct.shortBenefits',
       list.length === 4 && list[0] === 'A',
       JSON.stringify(list));
+    CatalogProduct.findById = () => query({ shortBenefits: [] });
+    const fallback = await helper.loadProductBenefits('000000000000000000000002');
+    check('A12b empty catalog falls back to the layoutInput artifact',
+      fallback.length === 1 && fallback[0] === 'ignored-artifact',
+      JSON.stringify(fallback));
+    CatalogProduct.findById = () => query(null);
     LayoutInputArtifact.findOne = () => query(null);
     const empty = await helper.loadProductBenefits('000000000000000000000002');
     check('A13 loadProductBenefits miss → []',
       Array.isArray(empty) && empty.length === 0);
   } finally {
+    CatalogProduct.findById = origProductFindById;
     LayoutInputArtifact.findOne = origLiaFindOne;
   }
 
@@ -380,9 +388,12 @@ function runStructural() {
     helperHits.length === 0,
     `hits=${helperHits.join(',')}`);
 
-  check('B5 loadProductBenefits is a findOne (not findAndUpdate / create / save)',
-    /LayoutInputArtifact\.findOne\(/.test(loadSrc || '') &&
+  check('B5 loadProductBenefits reads CatalogProduct.shortBenefits (not a writer)',
+    /CatalogProduct\.findById\(/.test(loadSrc || '') &&
+      /shortBenefits/.test(loadSrc || '') &&
       !/\.(create|updateOne|findOneAndUpdate|save|insertMany)\(/.test(stripCommentsAndStrings(loadSrc || '')));
+  check('B5b loadProductBenefits may fall back to an artifact findOne (still not a writer)',
+    /LayoutInputArtifact\.findOne\(/.test(loadSrc || ''));
 
   check('B6 assembleSignals only assigns benefits under directorProductBenefitsEnabled()',
     /if \(directorProductBenefitsEnabled\(\)\)/.test(assembleSrc || '') &&

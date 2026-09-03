@@ -4,19 +4,14 @@
  * verifyTitleSpecResolution — offline guard for the title-spec cascade.
  *
  * WHY THIS EXISTS
- * Cascade is plain always-honour (2026-09-03): presetOverride → persisted
- * ad/product/category/brand titleStyleSpec → brand.titleStylePreset →
- * canonical. The 2026-08-05 TITLE_SPEC_IGNORE_PERSISTED flag is gone — a
- * prod audit found 0 persisted specs across all four tiers, so the stale-
- * spec population that flag guarded is empty.
+ * Cascade is plain always-honour (2026-09-03), with funnel stage as an
+ * intent FLOOR not a whole-spec replace:
+ *   explicit presetOverride (CLI) → persisted titleStyleSpec →
+ *   brand.titleStylePreset → intentPreset → canonical.
  *
- * DELIBERATE BEHAVIOUR FLIP vs the previous A1: a scrimmy persisted brand
- * override now WINS (source==='brand'). The real no-scrim standard is the
- * SHIPPED canonical files (D1/D2/G5), not "ignore whatever is stored".
- *
- * TIER 0 presetOverride still beats a persisted brand spec. TIER 2 named
- * presets still apply when no tier-1 doc exists. Canonical remains the
- * floor. No DB, no network, no key.
+ * TIER 0 presetOverride still beats a persisted brand spec (CLI --preset=).
+ * TIER 2.5 intentPreset does NOT — that was the staged-funnel hole.
+ * No DB, no network, no key.
  *
  *   node scripts/verifyTitleSpecResolution.js
  */
@@ -138,8 +133,9 @@ check('C2 resolveSpecForBrand (no extra opts) returns brand — same cascade as 
 });
 
 check('C3 TIER 0 presetOverride beats a persisted brand spec', () => {
-  // FAIL-IF-TIER-0-DEAD: an explicit named-preset arg must still win over
-  // a stored brand.titleStyleSpec. Staged funnel rows rely on this.
+  // FAIL-IF-TIER-0-DEAD: an explicit named-preset arg (CLI --preset=) must
+  // still win over a stored brand.titleStyleSpec. Live generate does NOT
+  // pass this — staged funnel rows use intentPreset (C3b).
   const brand = { titleStyleSpec: { vertical: SCRIMMY_OVERRIDE } };
   const { source } = resolveSpec({
     brand,
@@ -148,6 +144,40 @@ check('C3 TIER 0 presetOverride beats a persisted brand spec', () => {
   });
   assert.strictEqual(source, 'override:canonical-conversion',
     `expected override:canonical-conversion, got ${source}`);
+});
+
+check('C3b intentPreset does NOT beat a persisted brand spec', () => {
+  // FAIL-IF-FUNNEL-STILL-TIER-0: passing the funnel name as intentPreset
+  // (the live generate path) must honour the persisted spec.
+  const brand = { titleStyleSpec: { vertical: SCRIMMY_OVERRIDE } };
+  const { source } = resolveSpec({
+    brand,
+    format: 'vertical',
+    intentPreset: 'canonical-conversion',
+  });
+  assert.strictEqual(source, 'brand',
+    `expected brand (intent is a floor), got ${source}`);
+});
+
+check('C3c intentPreset wins over canonical when nothing more specific exists', () => {
+  const { source } = resolveSpec({
+    brand: {},
+    format: 'vertical',
+    intentPreset: 'canonical-consideration',
+  });
+  assert.strictEqual(source, 'intent:canonical-consideration',
+    `expected intent:canonical-consideration, got ${source}`);
+});
+
+check('C3d brand.titleStylePreset beats intentPreset', () => {
+  const brand = { titleStylePreset: PRESET_NAME };
+  const { source } = resolveSpec({
+    brand,
+    format: 'vertical',
+    intentPreset: 'canonical-conversion',
+  });
+  assert.strictEqual(source, `preset:${PRESET_NAME}`,
+    `expected preset:${PRESET_NAME}, got ${source}`);
 });
 
 // ── D. Canonical no-scrim cinema standard (vertical) ──────────────────────

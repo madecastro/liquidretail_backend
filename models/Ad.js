@@ -583,6 +583,12 @@ const adSchema = new mongoose.Schema({
   // is a read-only render-time audit copy, NOT a source of truth). Mixed →
   // callers MUST markModified('titleStyleSpec').
   titleStyleSpec:     { type: mongoose.Schema.Types.Mixed, default: null },
+  // Video-title Director decision, stamped at mint. One LLM call per
+  // (product × content-profile × master-size); derived surfaces inherit
+  // by carrying the same stamp. Shape:
+  //   { include, maxItems, phase, reason, size, profile, source }
+  // Mixed → callers MUST markModified('videoTitleDirection').
+  videoTitleDirection: { type: mongoose.Schema.Types.Mixed, default: null },
   // Operator INPUT fields for video prompt — distinct from the render-time
   // audit outputs veoPrompt / veoModel above. Guidance merges into
   // buildVeoPrompt as the operatorPrompt prepend; raw fully replaces the

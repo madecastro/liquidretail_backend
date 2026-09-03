@@ -553,22 +553,27 @@ for (const name of GENERIC8) {
   }
 }
 
-// ── T. Preset threading: buildMetaForAd + render get the SAME override ─
+// ── T. Preset threading: buildMetaForAd + render get the SAME pair ─
 const bseSrc = fs.readFileSync(path.join(ROOT, 'services/brandScriptExecutor.js'), 'utf8');
 check('T1 resolveFunnelPresetOverride is consulted in brandScriptExecutor',
   /resolveFunnelPresetOverride/.test(bseSrc));
 
-// renderWithRemotionAndSave resolves once into resolvedPreset and passes
-// that same binding to both buildMetaForAd and resolveSpec.
+// Funnel stage is the intent FLOOR, not a whole-spec TIER-0 replace.
 const remotionBody = functionBody(bseSrc, 'renderWithRemotionAndSave');
-check('T2 renderWithRemotionAndSave threads ONE resolvedPreset into buildMetaForAd',
+check('T2 renderWithRemotionAndSave threads intentPreset into buildMetaForAd',
   !!remotionBody
-    && /buildMetaForAd\s*\(\s*ad\s*,\s*brand\s*,\s*\{\s*presetOverride:\s*resolvedPreset\s*\}\s*\)/.test(remotionBody),
+    && /buildMetaForAd\s*\(\s*ad\s*,\s*brand\s*,\s*\{\s*presetOverride:\s*resolvedPreset,\s*intentPreset\s*\}\s*\)/.test(remotionBody),
   'without this the quote gate can desync from the composition');
-check('T3 renderWithRemotionAndSave threads the SAME resolvedPreset into resolveSpec',
+check('T3 renderWithRemotionAndSave threads the SAME pair into resolveSpec',
   !!remotionBody
     && /presetOverride:\s*resolvedPreset/.test(remotionBody)
-    && (remotionBody.match(/presetOverride:\s*resolvedPreset/g) || []).length >= 2);
+    && /intentPreset/.test(remotionBody)
+    && /intentPreset,/.test(remotionBody));
+check('T12 funnel mapping is assigned to intentPreset, never to resolvedPreset',
+  !!remotionBody
+    && /intentPreset = resolveFunnelPresetOverride/.test(remotionBody)
+    && !/resolvedPreset = resolveFunnelPresetOverride/.test(remotionBody),
+  'assigning the funnel name to presetOverride reopens the whole-spec replace');
 
 // buildMetaForAd accepts opts.presetOverride (not hardcoded null).
 const metaBody = functionBody(bseSrc, 'buildMetaForAd');
@@ -577,6 +582,8 @@ check('T4 buildMetaForAd no longer hardcodes presetOverride: null',
   'hardcoding null desyncs the quote gate from a funnel render');
 check('T5 buildMetaForAd reads opts.presetOverride',
   !!metaBody && /opts\.presetOverride/.test(metaBody));
+check('T5b buildMetaForAd reads opts.intentPreset',
+  !!metaBody && /opts\.intentPreset/.test(metaBody));
 
 // Behavioural map.
 check('T6 resolveFunnelPresetOverride maps awareness → canonical-awareness-pmax10',
