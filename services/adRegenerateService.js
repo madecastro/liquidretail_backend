@@ -44,8 +44,11 @@ const brandScriptExecutor   = require('./brandScriptExecutor');
 const { uploadBufferToCloudinary } = require('./cloudinaryService');
 const directImage           = require('./directImageRenderService');
 // THE shared derive-only gate (money). Imported, never re-implemented —
-// see its doc comment in campaignAdsGenerationService.
-const { resolveDeriveFromMaster } = require('./campaignAdsGenerationService');
+// see its doc comment in campaignAdsGenerationService. isGooglePmaxVideoFormat
+// is the same predicate computeDeterministicVideoDigest uses to decide
+// whether videoDurationSec is identity — imported here so the cascade
+// family filter cannot drift from the digest by duplicating the format set.
+const { resolveDeriveFromMaster, isGooglePmaxVideoFormat } = require('./campaignAdsGenerationService');
 const { isUgcFirstSeedingEnabled } = require('./seededUniverseService');
 const ugcVideoPipeline             = require('./ugcVideoPipeline');
 // Ad-gen microservice handoff (routing fix, 2026-08-26). Same call-time-read
@@ -1101,11 +1104,14 @@ async function promoteFailedToDraft(adId) {
 // reason to exist is that it never pays for its own plate (resolveDeriveFrom
 // Master / routes/ads.js's renderDeriveOnlyVideoAd, the mint-time reference
 // for this exact zero-Omni-spend copy) — after a master regenerates, its
-// siblings are re-composited from the NEW master plate the same way, never
-// re-submitted. "Zero Atlas/Omni spend" is NOT "free": each sibling still
-// costs a face-detect LLM call, a vision-QC judge call, a Remotion slot
-// and a Cloudinary upload, which is why the sibling count is capped
-// (MAX_REGEN_CASCADE_SIBLINGS).
+// siblings get a provenance update from the NEW master plate the same way,
+// never re-submitted. THIS repo does not composite a sibling (no Remotion
+// here — adgen's copy is the one that actually re-titles). A titled
+// sibling is provenance-only; an inherited (never independently titled)
+// sibling also has renderUrl updated with the new plate so the mint-time
+// `renderUrl === veoVideoUrl` invariant holds. The sibling cap is shared
+// with adgen for parity (adgen's compositing copy is where a fan-out
+// actually costs Remotion slots), not because this file spends them.
 //
 // findDerivativesOfMaster inverts findSiblingMasterAd's filter shape
 // (routes/ads.js): every derivative row stamps deriveFromMaster to the
@@ -1138,8 +1144,13 @@ async function promoteFailedToDraft(adId) {
 // campaignId+productId+deriveFromMaster+kind would CAS-write M1's plate
 // onto D2. The filter therefore also joins the rest of that video
 // identity (mediaId / referenceMediaIds + CTA + prompt fields).
-// platformFormat / funnelStage / duration differ WITHIN a family and
-// must not be joined on.
+// platformFormat / funnelStage differ WITHIN a family and must not be
+// joined on. Duration is the exception for Google PMax only — it IS
+// hashed into that family's identity digest (computeDeterministicVideoDigest
+// via isGooglePmaxVideoFormat), so a 10s PMax master and a 12s PMax
+// master are different families even when they stamp the same
+// deriveFromMaster string. Meta formats deliberately omit duration;
+// joining it there would under-match legitimate Meta siblings.
 //
 // An undefined masterAd.platformFormat is a hard refuse: mongoose keeps
 // `deriveFromMaster: undefined` through cast() and the BSON serializer
@@ -1164,10 +1175,11 @@ async function promoteFailedToDraft(adId) {
 // today only because of a feature flag on the WEB process; a concurrent
 // adgen render/titler/retitle claim on the same row is a real race the
 // moment this path is ever revived). Unlike adgen's copy, this repo's
-// recascadeDerivativeSibling makes exactly ONE write (provenance only — see
-// that function's own header on why it cannot composite at all), so there
-// is no separate later "delivery write" for a concurrent claim to race —
-// the CAS here is the whole operation, not a lease-shaped residual.
+// recascadeDerivativeSibling makes exactly ONE write (provenance, plus
+// renderUrl only when the sibling is still inherited — see that
+// function's own header), so there is no separate later "delivery write"
+// for a concurrent claim to race — the CAS here is the whole operation,
+// not a lease-shaped residual.
 const SIBLING_MID_FLIGHT_EXCLUSION = {
   regenerating:            { $ne: true },
   claimedByWorker:          null,
@@ -1178,8 +1190,9 @@ const SIBLING_MID_FLIGHT_EXCLUSION = {
 
 // Mixed Meta+PMax funnel fan-out is ~20 same-family derives of one portrait
 // plate (11 Meta + 9 PMax-portrait). 24 leaves headroom. The cascade is
-// zero Atlas/Omni spend but each sibling still costs face-detect + vision-QC
-// + Remotion + Cloudinary, so the count is not unbounded.
+// zero Atlas/Omni spend. In THIS repo each sibling is a provenance update
+// (no compositing / no Remotion); the cap is shared with adgen for parity
+// so a rollback cannot unbounded-fanout the compositing copy either.
 const MAX_REGEN_CASCADE_SIBLINGS = Math.max(
   1,
   parseInt(process.env.REGEN_CASCADE_MAX_SIBLINGS, 10) || 24
@@ -1187,6 +1200,17 @@ const MAX_REGEN_CASCADE_SIBLINGS = Math.max(
 
 function digestStringValue(value) {
   return value == null ? '' : String(value);
+}
+
+// Duration join for PMax family matching. Uses digestStringValue for the
+// same null/empty-equality the other identity fields (and
+// computeDeterministicVideoDigest's duration part) already use, then
+// Number() because Ad.videoDurationSec is a Number — leaving the string
+// '10' would miss stored 10s rows.
+function digestDurationValue(value) {
+  if (digestStringValue(value) === '') return null;
+  const n = Number(value);
+  return Number.isFinite(n) ? n : null;
 }
 
 // Pure. Returns the Mongo filter, or null when the master is missing a
@@ -1215,6 +1239,12 @@ function buildDerivativesOfMasterFilter(masterAd) {
     videoPromptRaw:      masterAd.videoPromptRaw || null
   };
   if (masterAd.mediaId != null) filter.mediaId = masterAd.mediaId;
+  // Duration is identity for Google PMax video formats only. Omitting this
+  // clause matches a 12s PMax derive onto a 10s master's cascade (same
+  // deriveFromMaster stamp, different digest). Meta must not join here.
+  if (isGooglePmaxVideoFormat(masterAd.platformFormat)) {
+    filter.videoDurationSec = digestDurationValue(masterAd.videoDurationSec);
+  }
   return filter;
 }
 
@@ -1250,7 +1280,7 @@ function siblingStillEligible(sibling) {
 // renderBrandScriptAndSave at all since the 2026-08-28 titling removal
 // (commit abf7e0c2) — adgen owns titling exclusively now. So there is no
 // safe way for THIS repo to write a correctly-cropped, aspect-correct
-// renderUrl for a sibling; the earlier version of this function wrote
+// titled renderUrl for a sibling; an earlier version of this function wrote
 // `renderUrl: masterAd.veoVideoUrl` anyway — the RAW, uncropped 9:16 master
 // — directly into an already-LIVE, already-correctly-titled sibling's
 // renderUrl, and left a now-stale posterUrl behind it. On rollback that
@@ -1258,17 +1288,34 @@ function siblingStillEligible(sibling) {
 // refuses an untitled asset and delivery counts drop it, and this repo has
 // no titling function left to repair it.
 //
-// So: PROVENANCE fields only (veoVideoUrl/veoAspectRatio/veoModel/etc, plus
-// clearing the now-stale basePlate cache) are updated here. renderUrl,
-// posterUrl, visionQc, and status are left EXACTLY as they were — the
-// sibling keeps whatever adgen most recently, correctly, titled for it.
+// So the write BRANCHES on whether the sibling is still inherited:
+//
+//   • renderUrl === veoVideoUrl (never independently titled — the mint-time
+//     derive stamps both to the shared plate, see renderDeriveOnlyVideoAd).
+//     Update BOTH to the new master's plate, atomically. A provenance-only
+//     write here would break that equality: veoVideoUrl = new plate,
+//     renderUrl = old plate. isVideoTitlingSettled then reads the
+//     inequality as "this ad IS titled", and ads DELETE treats the old
+//     shared Cloudinary file as this sibling's OWN asset and would destroy
+//     it (data-loss for every other untitled sibling still on that plate).
+//     The extra CAS fields (renderUrl + veoVideoUrl as we found them)
+//     refuse the write if a concurrent titler delivered a unique renderUrl
+//     after our find() — that is the same "raw plate must not overwrite a
+//     live titled asset" invariant, on the race window.
+//
+//   • they already differ (genuinely titled): provenance-only. veoVideoUrl
+//     / veoAspectRatio / veoModel / etc. update; renderUrl, posterUrl,
+//     visionQc, and status stay EXACTLY as they were. This is a provenance
+//     update, no compositing in this repo.
+//
 // qcAndStampVideoAd is deliberately NOT called: it has no preserveAdStatus
 // concept, so calling it here would let a background cascade flip an
 // untouched, still-perfectly-good sibling to status:'failed' purely because
 // this repo had nothing to composite, and it would inspect
 // masterAd.veoVideoUrl — content never actually served to this sibling.
-// promoteFailedToDraft is likewise NOT called: nothing was actually fixed
-// for this sibling, so promoting it off 'failed' would be dishonest.
+// promoteFailedToDraft is likewise NOT called: nothing was actually
+// composited for this sibling, so promoting it off 'failed' would be
+// dishonest.
 //
 // If this path is ever revived (ADGEN_RENDERER_ENABLED rolled back), a real
 // fix needs this repo to regain a crop/composite capability for derivatives
@@ -1276,33 +1323,49 @@ function siblingStillEligible(sibling) {
 // backend's whole derive-only pipeline (mint-time AND regenerate-cascade)
 // has been in this state since the titling removal, independent of this PR.
 //
-// KNOWN TRANSIENT: a crash mid-cascade leaves sibling veoVideoUrl pointing
-// at the new master while renderUrl is still the old titled composite.
-// This repo never writes renderUrl here, so that mismatch is the designed
-// (provenance-only) state, not a new hole. Adgen's compositing copy has
-// the same provenance/delivery split on a Remotion throw; there is no
-// recovery arm that re-titles from that shape.
+// KNOWN TRANSIENT (titled siblings only): a crash mid-cascade leaves
+// sibling veoVideoUrl pointing at the new master while renderUrl is still
+// the old titled composite. That mismatch is the designed provenance-only
+// state. Inherited siblings write both fields in one update, so they do
+// not take this shape. Adgen's compositing copy has the same
+// provenance/delivery split on a Remotion throw; there is no recovery arm
+// that re-titles from that shape.
 async function recascadeDerivativeSibling(sibling, masterAd) {
   const siblingId = String(sibling._id);
   try {
+    // Mint-time derive stamps renderUrl: veoVideoUrl (the shared plate).
+    // That equality is load-bearing (adTitlingTruth, ads DELETE).
+    const stillInherited = sibling.renderUrl === sibling.veoVideoUrl;
+    const $set = {
+      veoVideoUrl:        masterAd.veoVideoUrl,
+      veoAspectRatio:     masterAd.veoAspectRatio || null,
+      // Audit: no model ran for this ad — same marker
+      // renderDeriveOnlyVideoAd stamps at mint time, so cost
+      // reconcilers / inspectors never attribute an Omni charge here.
+      veoModel:           `derive-from:${masterAd.platformFormat}`,
+      veoPrompt:          null,
+      veoStoryboard:      null,
+      veoReferenceImages: [],
+      updatedAt:          new Date()
+    };
+    if (stillInherited) {
+      $set.renderUrl = masterAd.veoVideoUrl;
+    }
     // ⚠️ CAS, not a plain findById+updateOne — see findDerivativesOfMaster's
     // own comment on why the read-time filter alone is not enough on a
-    // collection adgen can claim concurrently.
+    // collection adgen can claim concurrently. Inherited writes also
+    // re-assert the renderUrl/veoVideoUrl we observed, so a concurrent
+    // titler that delivered a unique asset after find() cannot be
+    // overwritten with the raw plate.
+    const casFilter = siblingStillEligible(sibling);
+    if (stillInherited) {
+      casFilter.renderUrl = sibling.renderUrl;
+      casFilter.veoVideoUrl = sibling.veoVideoUrl;
+    }
     const claim = await Ad.updateOne(
-      siblingStillEligible(sibling),
+      casFilter,
       {
-        $set: {
-          veoVideoUrl:        masterAd.veoVideoUrl,
-          veoAspectRatio:     masterAd.veoAspectRatio || null,
-          // Audit: no model ran for this ad — same marker
-          // renderDeriveOnlyVideoAd stamps at mint time, so cost
-          // reconcilers / inspectors never attribute an Omni charge here.
-          veoModel:           `derive-from:${masterAd.platformFormat}`,
-          veoPrompt:          null,
-          veoStoryboard:      null,
-          veoReferenceImages: [],
-          updatedAt:          new Date()
-        },
+        $set,
         // The sibling's cached face-detection (Ad.basePlate) is keyed to its
         // OLD veoVideoUrl — now stale (a different video's pixels). Clear it
         // so any future crop/detection (adgen's own titling, or a future
@@ -1316,7 +1379,11 @@ async function recascadeDerivativeSibling(sibling, masterAd) {
       console.log(`🔁 regenerate-cascade[master=${masterAd._id}]: sibling=${siblingId} claimed/changed by another process — skipped this pass`);
       return;
     }
-    console.log(`🔁 regenerate-cascade[master=${masterAd._id}]: sibling=${siblingId} provenance updated to the new master plate — renderUrl left untouched (this repo cannot composite a sibling; see this function's own header)`);
+    if (stillInherited) {
+      console.log(`🔁 regenerate-cascade[master=${masterAd._id}]: sibling=${siblingId} inherited plate updated (renderUrl === veoVideoUrl, both now the new master; provenance update, no compositing in this repo)`);
+    } else {
+      console.log(`🔁 regenerate-cascade[master=${masterAd._id}]: sibling=${siblingId} provenance updated to the new master plate — renderUrl left untouched (titled sibling; provenance update, no compositing in this repo)`);
+    }
   } catch (err) {
     console.warn(`🔁 regenerate-cascade[master=${masterAd._id}]: sibling=${siblingId} failed (non-fatal, master regenerate unaffected) — ${err.message}`);
   }
@@ -1346,8 +1413,7 @@ async function cascadeRegenerateToDerivatives(adId, opts = {}) {
     if (siblings.length > MAX_REGEN_CASCADE_SIBLINGS) {
       console.warn(
         `🔁 regenerate-cascade[master=${adId}]: capping at ${MAX_REGEN_CASCADE_SIBLINGS} of ` +
-        `${siblings.length} siblings (zero Atlas/Omni spend; each sibling still costs ` +
-        `face-detect + vision-QC + Remotion + Cloudinary)`
+        `${siblings.length} siblings (zero Atlas/Omni spend; provenance update, no compositing in this repo)`
       );
     }
     for (const sibling of capped) {

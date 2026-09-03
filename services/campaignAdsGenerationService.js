@@ -4500,5 +4500,10 @@ module.exports = {
   // video submit imports this one (render loop + regenerate). See its
   // doc comment: a per-caller copy is how the regenerate hole opened.
   // Also covers funnel-variant ads (fail-closed on funnelStage).
-  resolveDeriveFromMaster
+  resolveDeriveFromMaster,
+  // Same predicate computeDeterministicVideoDigest uses to decide whether
+  // videoDurationSec is identity. Exported so the regenerate cascade
+  // family filter (adRegenerateService.buildDerivativesOfMasterFilter)
+  // joins duration on PMax without copying the format-set a third time.
+  isGooglePmaxVideoFormat
 };

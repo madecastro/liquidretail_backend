@@ -20,12 +20,15 @@
 //  FIX 2 — cascadeRegenerateToDerivatives / findDerivativesOfMaster /
 //    recascadeDerivativeSibling: after a master ad's video regenerate
 //    succeeds, its same-identity derivative siblings (deriveFromMaster === the
-//    master's own platformFormat) are re-composited from the NEW master
-//    plate, with ZERO Atlas/Omni spend — the same money invariant
+//    master's own platformFormat) get a provenance update from the NEW
+//    master plate, with ZERO Atlas/Omni spend — the same money invariant
 //    resolveDeriveFromMaster / routes/ads.js's renderDeriveOnlyVideoAd
-//    protect at mint time, applied to the regenerate path. Joins the
-//    rest of computeDeterministicVideoDigest's identity (mediaId /
-//    referenceMediaIds, CTA, prompt fields), not just
+//    protect at mint time, applied to the regenerate path. THIS repo does
+//    not composite (no Remotion); a titled sibling is provenance-only, an
+//    inherited sibling also updates renderUrl to keep renderUrl ===
+//    veoVideoUrl. Joins the rest of computeDeterministicVideoDigest's
+//    identity (mediaId / referenceMediaIds, CTA, prompt fields, and
+//    videoDurationSec for Google PMax only), not just
 //    campaignId+productId+deriveFromMaster — a second Generate with a
 //    different seed or CTA is a different family. Not scoped by
 //    campaignRunIds (that under-matches later-run same-family siblings).
@@ -65,9 +68,15 @@
 //   findDerivativesOfMaster drops the deriveFromMaster / campaignId /
 //     productId / kind clause, or any in-flight exclusion               → B2-B8
 //   findDerivativesOfMaster fails to exclude the master's own document   → B9
-//   recascadeDerivativeSibling re-promotes on top of a fresh QC failure  → C4
+//   recascadeDerivativeSibling re-promotes on top of a fresh QC failure  → C3
+//   recascadeDerivativeSibling's try/catch around the CAS write is
+//     deleted (C4 must FAIL — it used to be vacuous because a re-stub of
+//     require.cache[AD] never rebound the module's captured Ad)          → C4
 //   recascadeDerivativeSibling stamps veoModel without the derive-from
 //     marker, or fails to clear stale basePlate                         → C1-C2
+//   recascadeDerivativeSibling provenance-only-writes an inherited
+//     sibling (renderUrl left on the OLD plate)                         → C5
+//   findDerivativesOfMaster drops the PMax videoDurationSec join        → B21
 //   cascadeRegenerateToDerivatives fails to skip a derivative master     → D4
 //   a submit helper becomes reachable from any of the three functions    → E1-E3
 //
@@ -221,12 +230,20 @@ function install() {
   });
   stub(CLOUD, { uploadBufferToCloudinary: async () => ({}) });
   stub(DI, {});
-  stub(CAGS, { resolveDeriveFromMaster: (ad) => {
-    if (!ad) return null;
-    if (typeof ad.deriveFromMaster === 'string' && ad.deriveFromMaster) return ad.deriveFromMaster;
-    if (ad.platformFormat === 'pmax_video_1_1') return 'pmax_video_9_16';
-    return null;
-  } });
+  stub(CAGS, {
+    resolveDeriveFromMaster: (ad) => {
+      if (!ad) return null;
+      if (typeof ad.deriveFromMaster === 'string' && ad.deriveFromMaster) return ad.deriveFromMaster;
+      if (ad.platformFormat === 'pmax_video_1_1') return 'pmax_video_9_16';
+      return null;
+    },
+    // Same 3-format predicate as campaignAdsGenerationService.isGooglePmaxVideoFormat
+    // (GOOGLE_VIDEO_MASTER_SET ∪ PMAX_VIDEO_DERIVE_ONLY). Production code
+    // imports the real export; this stub exists because install() replaces
+    // the whole CAGS module before requiring the service.
+    isGooglePmaxVideoFormat: (fmt) =>
+      fmt === 'pmax_video_9_16' || fmt === 'pmax_video_16_9' || fmt === 'pmax_video_1_1'
+  });
   stub(SUS, { isUgcFirstSeedingEnabled: () => false });
   stub(UGC, { preparePassthroughMaster: async () => ({ passthrough: false, reason: 'stub' }) });
   stub(ADGEN, { isAdgenRendererEnabled: () => false });
@@ -461,13 +478,93 @@ function baseAd(over = {}) {
     assert.ok(Number.isInteger(svc.MAX_REGEN_CASCADE_SIBLINGS) && svc.MAX_REGEN_CASCADE_SIBLINGS >= 1);
   });
 
+  await checkAsync('B21 [BLOCKER] a PMax 10s master does NOT match a 12s same-family-otherwise derive', async () => {
+    const master10 = baseAd({
+      _id: 'm0000000000000000000000',
+      platformFormat: 'pmax_video_9_16',
+      deriveFromMaster: null,
+      videoDurationSec: 10,
+      veoVideoUrl: 'https://m10'
+    });
+    const derive10 = baseAd({
+      _id: 's1000000000000000000000',
+      platformFormat: 'pmax_video_1_1',
+      deriveFromMaster: 'pmax_video_9_16',
+      videoDurationSec: 10
+    });
+    const derive12 = baseAd({
+      _id: 'sH000000000000000000000',
+      platformFormat: 'pmax_video_1_1',
+      deriveFromMaster: 'pmax_video_9_16',
+      videoDurationSec: 12
+    });
+    AdCol = new MiniCollection([master10, derive10, derive12]);
+    const found = await svc.findDerivativesOfMaster(master10);
+    assert.deepStrictEqual(found.map((d) => d._id), ['s1000000000000000000000'],
+      `10s master must not cascade onto a 12s derive; got ${found.map((d) => d._id)}`);
+  });
+
+  await checkAsync('B22 Meta duration is NOT identity — an 8s master still finds a 10s sibling', async () => {
+    const master = baseAd({
+      _id: 'm0000000000000000000000',
+      platformFormat: 'meta_stories_9_16',
+      deriveFromMaster: null,
+      videoDurationSec: 8,
+      veoVideoUrl: 'https://m8'
+    });
+    const sibling10 = baseAd({
+      _id: 's1000000000000000000000',
+      deriveFromMaster: 'meta_stories_9_16',
+      videoDurationSec: 10
+    });
+    AdCol = new MiniCollection([master, sibling10]);
+    const found = await svc.findDerivativesOfMaster(master);
+    assert.deepStrictEqual(found.map((d) => d._id), ['s1000000000000000000000']);
+  });
+
+  check('B23 PMax filter joins videoDurationSec (null/empty → null, same helper as other identity fields)', () => {
+    const ten = svc.buildDerivativesOfMasterFilter(baseAd({ platformFormat: 'pmax_video_9_16', videoDurationSec: 10 }));
+    assert.ok(ten);
+    assert.strictEqual(ten.videoDurationSec, 10);
+    const empty = svc.buildDerivativesOfMasterFilter(baseAd({ platformFormat: 'pmax_video_9_16', videoDurationSec: null }));
+    assert.strictEqual(empty.videoDurationSec, null);
+    const blank = svc.buildDerivativesOfMasterFilter(baseAd({ platformFormat: 'pmax_video_9_16', videoDurationSec: '' }));
+    assert.strictEqual(blank.videoDurationSec, null);
+  });
+
+  check('B24 Meta filter does NOT join videoDurationSec', () => {
+    const filter = svc.buildDerivativesOfMasterFilter(baseAd({ platformFormat: 'meta_stories_9_16', videoDurationSec: 10 }));
+    assert.ok(filter);
+    assert.ok(!Object.prototype.hasOwnProperty.call(filter, 'videoDurationSec'),
+      'Meta duration is not identity; joining it would under-match a family');
+  });
+
+  check('B25 [STRUCT] duration join uses imported isGooglePmaxVideoFormat, not a local format-set', () => {
+    const src = fs.readFileSync(SVC, 'utf8');
+    const cagsSrc = fs.readFileSync(CAGS, 'utf8');
+    assert.ok(/isGooglePmaxVideoFormat/.test(src), 'adRegenerateService must call isGooglePmaxVideoFormat');
+    assert.ok(/isGooglePmaxVideoFormat/.test(src.split('require(\'./campaignAdsGenerationService\')')[0]),
+      'isGooglePmaxVideoFormat must be imported from campaignAdsGenerationService');
+    assert.ok(/function isGooglePmaxVideoFormat\(platformFormat\)/.test(cagsSrc));
+    assert.ok(/isGooglePmaxVideoFormat/.test(cagsSrc.slice(cagsSrc.indexOf('module.exports'))),
+      'campaignAdsGenerationService must export isGooglePmaxVideoFormat');
+    const start = src.indexOf('function buildDerivativesOfMasterFilter');
+    const end = src.indexOf('async function findDerivativesOfMaster');
+    assert.ok(start !== -1 && end > start, 'could not isolate buildDerivativesOfMasterFilter');
+    const filterFn = src.slice(start, end);
+    assert.ok(/isGooglePmaxVideoFormat\(masterAd\.platformFormat\)/.test(filterFn));
+    assert.ok(!/pmax_video_9_16/.test(filterFn),
+      'filter builder must not duplicate the PMax format-set; got a local pmax_video_9_16');
+  });
+
   // ═══════════════════════════════════════════════════════════════════
   // GROUP C — recascadeDerivativeSibling — THIS REPO CANNOT COMPOSITE A
   // SIBLING AT ALL (no titling since abf7e0c2) — see the function's own
-  // doc comment. It only ever updates PROVENANCE fields (veoVideoUrl etc.)
-  // and clears stale basePlate; renderUrl/posterUrl/visionQc/status are
-  // NEVER touched, and qcAndStampVideoAd/promoteFailedToDraft are NEVER
-  // called on a sibling here.
+  // doc comment. A TITLED sibling (renderUrl !== veoVideoUrl) is
+  // provenance-only: veoVideoUrl updates, renderUrl/posterUrl/status stay.
+  // An INHERITED sibling (renderUrl === veoVideoUrl, the mint-time
+  // derive shape) updates BOTH so the equality invariant holds.
+  // qcAndStampVideoAd/promoteFailedToDraft are NEVER called on a sibling.
   // ═══════════════════════════════════════════════════════════════════
   function freshMaster(over = {}) {
     return baseAd({ _id: 'm0000000000000000000000', veoVideoUrl: 'https://new.example/master-v2', veoAspectRatio: '9:16', platformFormat: 'meta_stories_9_16', ...over });
@@ -510,12 +607,55 @@ function baseAd(over = {}) {
   await checkAsync('C4 a per-sibling failure never throws out of recascadeDerivativeSibling (master regenerate unaffected)', async () => {
     const master = freshMaster();
     const sibling = baseAd({ _id: 's1000000000000000000000', deriveFromMaster: master.platformFormat });
-    stub(AD, {
-      find:      () => ({ lean: async () => [] }),
-      findById:  () => ({ lean: async () => { throw new Error('simulated DB error'); } }),
-      updateOne: async () => { throw new Error('simulated DB error on the CAS write'); }
-    });
+    AdCol = new MiniCollection([master, sibling]);
+    // Mutate the LIVE collection's method in place — the same pattern as A6.
+    // Re-stubbing require.cache[AD] does NOT rebind adRegenerateService's
+    // `const Ad = require(...)` captured at install(); that previous C4
+    // was vacuous (the throw never reached the code under test).
+    let hit = false;
+    AdCol.updateOne = async () => {
+      hit = true;
+      throw new Error('simulated DB error on the CAS write');
+    };
     await svc.recascadeDerivativeSibling(sibling, master); // must not throw
+    assert.ok(hit, 'AdCol.updateOne must actually be reached — a stub that never fires makes this check vacuous');
+  });
+
+  await checkAsync('C5 [BLOCKER] an inherited sibling (renderUrl === veoVideoUrl) updates BOTH to the new plate', async () => {
+    const master = freshMaster();
+    const oldPlate = 'https://old.example/inherited-plate.mp4';
+    const sibling = baseAd({
+      _id: 's1000000000000000000000',
+      deriveFromMaster: master.platformFormat,
+      veoVideoUrl: oldPlate,
+      renderUrl: oldPlate,
+      status: 'draft'
+    });
+    AdCol = new MiniCollection([master, sibling]);
+    await svc.recascadeDerivativeSibling(sibling, master);
+    const after = await AdCol.findById(sibling._id).lean();
+    assert.strictEqual(after.veoVideoUrl, master.veoVideoUrl, 'inherited veoVideoUrl must move to the new plate');
+    assert.strictEqual(after.renderUrl, master.veoVideoUrl, 'inherited renderUrl must move with it (mint-time invariant)');
+    assert.strictEqual(after.renderUrl, after.veoVideoUrl, 'renderUrl === veoVideoUrl must still hold after cascade');
+    assert.strictEqual(after.status, 'draft', 'status must not move');
+  });
+
+  await checkAsync('C6 [RACE] an inherited snapshot whose DB row was titled between find() and write is skipped', async () => {
+    const master = freshMaster();
+    const oldPlate = 'https://old.example/inherited-plate.mp4';
+    const titledUrl = 'https://old.example/just-titled-sibling.mp4';
+    const snapshot = baseAd({
+      _id: 's1000000000000000000000',
+      deriveFromMaster: master.platformFormat,
+      veoVideoUrl: oldPlate,
+      renderUrl: oldPlate
+    });
+    const dbRow = { ...snapshot, renderUrl: titledUrl };
+    AdCol = new MiniCollection([master, dbRow]);
+    await svc.recascadeDerivativeSibling(snapshot, master);
+    const after = await AdCol.findById(snapshot._id).lean();
+    assert.strictEqual(after.renderUrl, titledUrl, 'must not overwrite a concurrently-titled renderUrl with the raw plate');
+    assert.strictEqual(after.veoVideoUrl, oldPlate, 'CAS miss must leave provenance untouched too');
   });
 
   // ═══════════════════════════════════════════════════════════════════
@@ -633,10 +773,15 @@ function baseAd(over = {}) {
     const body = functionBody(/async function cascadeRegenerateToDerivatives\(/);
     assert.ok(/buildVideoQcFailureFields\(masterAd\.visionQc\)/.test(body), 'the internal qcJustFailed re-derivation must be present');
   });
-  check('E6 [MONEY/INTEGRITY] recascadeDerivativeSibling never writes renderUrl/posterUrl', () => {
+  check('E6 [MONEY/INTEGRITY] recascadeDerivativeSibling writes renderUrl ONLY on the inherited branch; never writes posterUrl', () => {
     const body = functionBody(/async function recascadeDerivativeSibling\(/);
-    assert.ok(!/renderUrl\s*:/.test(body), 'this repo cannot composite a sibling — must never stamp renderUrl');
-    assert.ok(!/posterUrl\s*:/.test(body), 'this repo cannot composite a sibling — must never stamp posterUrl');
+    assert.ok(/stillInherited/.test(body), 'must name the inherited/titled branch');
+    assert.ok(/sibling\.renderUrl === sibling\.veoVideoUrl/.test(body),
+      'must branch on the mint-time renderUrl === veoVideoUrl invariant');
+    assert.ok(/\$set\.renderUrl\s*=\s*masterAd\.veoVideoUrl/.test(body),
+      'inherited branch must stamp renderUrl to the new master plate');
+    assert.ok(!/posterUrl\s*:/.test(body) && !/\$set\.posterUrl/.test(body),
+      'must never stamp posterUrl (provenance update, no compositing in this repo)');
   });
   check('E7 [MONEY/INTEGRITY] recascadeDerivativeSibling never calls qcAndStampVideoAd or promoteFailedToDraft on a sibling', () => {
     const body = functionBody(/async function recascadeDerivativeSibling\(/);
