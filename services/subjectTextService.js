@@ -83,11 +83,11 @@ async function detectSubjectsAndText(imageUrl, hints = {}) {
 
 "contentNatureReason": one short sentence citing the specific signal (e.g. "Caption says 'Black Friday 50% off'", "Visible text reads 'Coming soon'", "Lifestyle product-in-use shot with no time-bound language"). Max 120 chars.
 
-"shotType": classify the photographic style. Look at framing, scene composition, and whether the product is isolated or in context:
-  - "lifestyle":     product shown in real-world context (in use, on a table, in a kitchen scene, held in hand, plated, etc.) — has scene, props, or ambient context
-  - "on_model":      person wearing, holding, or using the product (face may be cropped or full)
+"shotType": classify the photographic style. DECIDE THE SETTING FIRST — it takes precedence over what the subject is. If the product is in a REAL PLACE (anywhere populated with other objects, surfaces, or environment: a beach, a boat, a street, a step, a table in a room), the answer is "lifestyle" — whether or not a person is present or wearing it. Only when the background is a plain or graduated backdrop with nothing else in it do you choose from the remaining labels:
+  - "lifestyle":     product in a real place — a setting populated with other objects, surfaces, or environment. A person may or may not be wearing/holding it; that does NOT make it on_model. A shoe on a step is lifestyle; a shoe on a seamless backdrop is not.
+  - "on_model":      person wearing, holding, or using the product against a PLAIN or GRADUATED studio backdrop with nothing else in the frame (face may be cropped or full). If there is a real setting around them, it is "lifestyle" instead.
   - "product_only":  isolated studio shot — single product on plain or solid background (white, gray, transparent, gradient). No human, no scene.
-  - "flat_lay":      top-down arrangement of one or more items on a flat surface
+  - "flat_lay":      top-down arrangement of one or more items on a flat surface, plain backdrop
   - "detail":        close-up / macro of a specific feature or texture (not the full product)
   - "packaging":     box, label, or wrapper shot — emphasis on packaging, not the product itself
   - "unknown":       ambiguous or doesn't fit any of the above
