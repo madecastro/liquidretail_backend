@@ -524,6 +524,29 @@ const adSchema = new mongoose.Schema({
   // architecture problem"). Until then it is the audit trail that turns a silent
   // double-bill into a visible orphan.
   veoPredictionId:    { type: String, default: null },
+  // MUST STAY DECLARED, and this pair shipped UNDECLARED in adgen #108 —
+  // exactly the silent-drop this file warns about elsewhere.
+  //
+  // adgen's geminiVideoService stamps `veoProvider` in the same $set as the
+  // receipt above so the cost-reconcile sweep and bootRecoveryService can
+  // route by provider instead of guessing. Undeclared, Mongoose strict
+  // discarded it with no error — the receipt landed, the tag did not, and a
+  // Gemini `v1_…` interaction id would be handed to the Atlas prediction GET
+  // forever, never collecting the paid master.
+  //
+  // Declared HERE as well as in adgen because both repos write the SAME
+  // `ads` collection and verifyModelParity asserts adgen's paths are a subset
+  // of backend's. Adding it only to adgen makes that harness red — which is
+  // how this requirement was found rather than assumed.
+  //
+  // Values: 'atlas' | 'gemini'. Null on every pre-cutover row, which reads
+  // correctly as "Atlas era". Do NOT default it to 'atlas' — a null meaning
+  // "unknown" and a null meaning "asserted atlas" must stay distinguishable.
+  veoProvider:        { type: String, default: null },
+  // Gemini accepts 360p/720p/1080p/4k and only 720p/1080p have a published
+  // token rate, so the resolution a master was generated at is a cost-audit
+  // input rather than decoration.
+  veoResolution:      { type: String, default: null },
   // Face-safe base-plate crop + face keep-out cache, computed by
   // services/basePlateCropService.js before Remotion titling. Shape:
   // { version, format, sourceUrl, videoUrl|null, rect?, sourceW?, sourceH?,
