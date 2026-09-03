@@ -49,6 +49,30 @@ const {
   aspectRatioForPlatformFormat
 } = require('./platformFormats');
 
+// Aspects the pre-warm should cover. META_VIDEO_MASTER (9:16) is the primary
+// Meta portrait master and, via the shared-portrait rule, also serves PMax
+// portrait. `pmax_video_16_9` is the PMax landscape master and cannot be
+// derived from any 9:16 source — a mixed Meta+PMax run mints a separate
+// landscape master whose refs need 16:9 reframes.
+//
+// Historically only 9:16 was warmed here. That left `pmax_video_16_9`'s
+// alt reframes to fire at ad-gen time in adgen's renderer — and adgen still
+// ships the pre-force-crop code path, so beyond-tolerance subject unions
+// (common on on_model shots where a portrait-oriented subject overflows a
+// landscape crop) fell through to composite-outpaint. Measured on
+// run 6a99c372 (Chubasco Jacket): both PMax 16:9 alts silently outpainted
+// at $0.08 each, contaminating the ref stack with Nano Banana hallucinations
+// even though the SAME source medias had clean $0 crops for the 9:16 master
+// via backend's pre-warm.
+//
+// Warming both aspects here lets backend's force-crop path fire first on
+// both, so adgen serves the cached deterministic URLs as-is under the
+// matched ladder version. No cost when the tolerance passes (yolo-crop) or
+// when force-crop dispatches. Adds a second sequential buildReferenceImages
+// call per product; the reframe cache short-circuits any repeated work on
+// media the 9:16 pass already touched.
+const PREWARM_PLATFORM_FORMATS = [META_VIDEO_MASTER, 'pmax_video_16_9'];
+
 // Cap accepted productIds (route slices here too). Silent drop beyond this.
 const PREWARM_MAX_PRODUCTS = 12;
 
@@ -210,20 +234,6 @@ async function prewarmVideoRefsForProducts({ brandId, productIds }) {
       const brand = await Brand.findById(product.brandId).lean();
       const categories = await loadCategoryChainForProduct(product);
 
-      // Same model+aspect resolution as generateForAd for the live video
-      // master surface (META_VIDEO_MASTER = meta_stories_9_16 → 9:16).
-      const platformFormat = META_VIDEO_MASTER;
-      const platformAspect = aspectRatioForPlatformFormat(platformFormat) || '9:16';
-      const { caps, aspectRatio } = resolveModelAndAspect({
-        brand,
-        product,
-        categories,
-        canvasKeys: [platformFormat, platformAspect],
-        platformAspect,
-        modelOverride: null,
-        hasVideoSeed: media.fileType === 'video'
-      });
-
       const referenceCount = resolveReferenceImageCount({ brand, product });
 
       // SPEND CEILING — checked here, immediately before the only billable
@@ -231,6 +241,10 @@ async function prewarmVideoRefsForProducts({ brandId, productIds }) {
       // product is never marked warm. Exhausted → stop the whole loop: the
       // remaining products would each want the same budget, and logging 12
       // identical refusals is noise.
+      //
+      // The budget claim covers the whole PRODUCT — both aspects (9:16 and
+      // 16:9) share the same rolling cap so widening the pre-warm to a
+      // second aspect can't sidestep the ceiling.
       if (!claimBrandBudget(brandId)) {
         console.warn(
           `⚠️  prewarm: brand ${brandId} hit the rolling cap ` +
@@ -240,23 +254,49 @@ async function prewarmVideoRefsForProducts({ brandId, productIds }) {
         break;
       }
 
-      // Discard URLs — only the reframe side-effects (persistent cache)
-      // matter for prewarm. Capture length for the summary line.
-      const imageUrls = await buildReferenceImages({
-        media,
-        product,
-        catalogMedias,
-        aspectRatio,
-        caps,
-        referenceCount,
-        brand,
-        orderedReferenceMedia: null
-      });
+      // Warm each aspect the run may need. Per-aspect failures are logged
+      // and swallowed so a broken 16:9 pass doesn't lose the 9:16 warm we
+      // would otherwise have gotten. The reframe cache short-circuits
+      // repeated work on medias the earlier pass already resolved.
+      const totalRefsWarmed = [];
+      for (const platformFormat of PREWARM_PLATFORM_FORMATS) {
+        const platformAspect = aspectRatioForPlatformFormat(platformFormat) || '9:16';
+        try {
+          const { caps, aspectRatio } = resolveModelAndAspect({
+            brand,
+            product,
+            categories,
+            canvasKeys: [platformFormat, platformAspect],
+            platformAspect,
+            modelOverride: null,
+            hasVideoSeed: media.fileType === 'video'
+          });
+          // Discard URLs — only the reframe side-effects (persistent
+          // cache) matter for prewarm. Capture length for the summary.
+          const imageUrls = await buildReferenceImages({
+            media,
+            product,
+            catalogMedias,
+            aspectRatio,
+            caps,
+            referenceCount,
+            brand,
+            orderedReferenceMedia: null
+          });
+          totalRefsWarmed.push(imageUrls.length + ':' + platformAspect);
+        } catch (aspectErr) {
+          console.warn(
+            `⚠️  prewarm[${pid}][${platformFormat}]: ` +
+            `${aspectErr && aspectErr.message ? aspectErr.message : aspectErr}`
+          );
+        }
+      }
 
       markWarmed(brandId, pid);
       warmed += 1;
       console.log(
-        `🔥 prewarm[${pid}]: warmed ${imageUrls.length} refs (${Date.now() - pStart}ms)`
+        `🔥 prewarm[${pid}]: warmed ${totalRefsWarmed.join(' + ')} refs ` +
+        `(${Date.now() - pStart}ms)`
       );
     } catch (err) {
       console.warn(

@@ -73,6 +73,30 @@ check('prewarm service does NOT lazy-materialize / detect',
 check('prewarm service uses META_VIDEO_MASTER',
   svcSrc.includes('META_VIDEO_MASTER'));
 
+// Post-2026-09-03: the pre-warm walks a LIST of aspects (9:16 for
+// META_VIDEO_MASTER, 16:9 for pmax_video_16_9). Warming only 9:16 left
+// PMax landscape masters cold — adgen fired first, its stale-code path
+// composite-outpainted the beyond-tolerance alts, and the ~$0.16 per
+// affected product was avoidable. Pinning both aspects here so a
+// future refactor that drops the 16:9 branch fails loudly before it
+// silently re-opens the outpaint burn.
+check('prewarm service defines the multi-aspect list constant',
+  /PREWARM_PLATFORM_FORMATS\s*=/.test(svcSrc));
+check('prewarm service warms pmax_video_16_9 alongside META_VIDEO_MASTER',
+  /PREWARM_PLATFORM_FORMATS\s*=\s*\[[^\]]*META_VIDEO_MASTER[^\]]*pmax_video_16_9[^\]]*\]/.test(svcSrc));
+check('prewarm loops buildReferenceImages over PREWARM_PLATFORM_FORMATS',
+  /for\s*\(\s*const\s+platformFormat\s+of\s+PREWARM_PLATFORM_FORMATS\s*\)/.test(svcSrc));
+check('prewarm per-aspect failure is swallowed (broken 16:9 must not lose the 9:16 warm)',
+  /aspectErr[\s\S]{0,300}⚠️\s+prewarm/.test(svcSrc));
+check('brand budget is claimed ONCE per product (not per aspect)',
+  // Structural: claimBrandBudget must appear BEFORE the aspect loop, not inside it.
+  (() => {
+    const claimIdx = svcSrc.indexOf('claimBrandBudget(brandId)');
+    const loopIdx = svcSrc.indexOf('of PREWARM_PLATFORM_FORMATS');
+    return claimIdx > 0 && loopIdx > 0 && claimIdx < loopIdx;
+  })(),
+  'claimBrandBudget must sit above the aspect loop so both aspects share ONE cap slot per product');
+
 // ── 3. Route registered ABOVE first /:id ────────────────────────────
 const prewarmIdx = adsSrc.indexOf("'/video-ref-prewarm'");
 const firstIdIdx = adsSrc.search(/router\.(get|post|patch|delete)\('\/:id/);
