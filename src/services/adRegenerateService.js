@@ -1445,6 +1445,39 @@ async function runClaimedRegeneration(ad, req = {}) {
     // reclaims it ... and the receipt check then decides whether a resubmit
     // is legal") — this branch is the equivalent for an in-process timeout
     // rather than a process death.
+    if (err && err.leaseExhausted) {
+      // Cap miss BEFORE submit. Nothing billed, no new receipt. Do NOT
+      // markComplete('failed') — that is never picked up again. Leave the
+      // regenerate claim in place so claimOne's ARM 2 (reclaim after
+      // CLAIM_STALE_MIN) retries, bounded by MAX_RECLAIMS. Releasing here
+      // would send the row through ARM 1 on the next ~2s poll, which is a
+      // tight retry loop (generateForAd already slept its internal
+      // backoff, but ARM 1 also restamps the receipt baseline for no
+      // reason). Parking on the existing 45-min lease is the same family
+      // as the unsettled poll-timeout branch below. renderer.js, which
+      // has no 45-min regenerate claim, terminal-fails after the same
+      // internal budget — a persisted counter there collided with
+      // strandedRunSweeper.
+      console.warn(
+        `🔁 regenerate[ad=${adId}]: gemini lease exhausted after ${Math.round(durationMs / 1000)}s ` +
+        '— NOT terminal-failing: leaving the regenerate claim so the 45-minute lease can retry. ' +
+        'Nothing was submitted.'
+      );
+      try {
+        require('./alertService').notifyAsync({
+          level: 'warn',
+          title: 'Regenerate waiting on Gemini concurrency cap',
+          key:   `regenerate-lease-wait:${adId}`,
+          fields: {
+            adId, kind,
+            note: 'claim left in place; lease reclaim retries; nothing billed'
+          }
+        });
+      } catch (alertErr) {
+        console.warn(`🔁 regenerate[ad=${adId}]: lease-exhausted alert failed — ${alertErr.message}`);
+      }
+      return;
+    }
     if (err && err.unsettledAtTimeout) {
       console.warn(
         `🔁 regenerate[ad=${adId}]: unsettled at Atlas poll timeout after ${Math.round(durationMs / 1000)}s ` +
@@ -1640,7 +1673,22 @@ async function runVideoFull(adId, prompt, progressRun = null, videoModel = null,
       modelOverride: videoModel,
       allowResume: false
     });
-    if (veoResult.skipped) throw new Error(`Veo skipped: ${veoResult.reason}`);
+    if (veoResult.skipped) {
+      // A Gemini cap-miss is NOT a failure. generateForAd returns
+      // {skipped:true, retryable:true, code:'GEMINI_LEASE_EXHAUSTED'} when
+      // lease.acquire() is null after bounded internal backoff — nothing
+      // was billed. Throwing a plain Error here used to fall through to
+      // markComplete(status:'failed'), which is never re-claimed. Throw a
+      // tagged error so runClaimedRegeneration's catch can park the row
+      // the same way it parks an unsettled poll timeout.
+      if (veoResult.retryable || veoResult.code === 'GEMINI_LEASE_EXHAUSTED') {
+        const err = new Error(veoResult.reason || 'gemini video: no slot available');
+        err.leaseExhausted = true;
+        err.code = veoResult.code || 'GEMINI_LEASE_EXHAUSTED';
+        throw err;
+      }
+      throw new Error(`Veo skipped: ${veoResult.reason}`);
+    }
     veoResult.storyboard = veoResult.storyboard || storyboard || null;
   }
 

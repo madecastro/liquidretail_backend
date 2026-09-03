@@ -117,8 +117,14 @@ function load(...names) {
 // videoTokensOf must load in the SAME sandbox as computeCost — computeCost
 // calls it, so omitting it gives a ReferenceError at first use rather than a
 // failed assertion, which reads as a harness crash instead of a defect.
-const { buildRequestBody, computeCost, estimateCost, classifyPoll, videoTokensOf, extractVideoUri } =
-  load('videoTokensOf', 'buildRequestBody', 'computeCost', 'estimateCost', 'classifyPoll', 'extractVideoUri');
+const {
+  buildRequestBody, computeCost, estimateCost, classifyPoll, videoTokensOf, extractVideoUri,
+  resolveGeminiModel, stripGoogApiKeyOnCrossHostRedirect, makeUnsettledMirrorError
+} =
+  load(
+    'videoTokensOf', 'buildRequestBody', 'computeCost', 'estimateCost', 'classifyPoll', 'extractVideoUri',
+    'resolveGeminiModel', 'stripGoogApiKeyOnCrossHostRedirect', 'makeUnsettledMirrorError'
+  );
 
 console.log('\nverifyGeminiVideoProvider\n');
 
@@ -265,15 +271,23 @@ console.log('\nF. Atlas inferences that must NOT appear here');
   check('F5 the axios.post call was located', postCall.length > 0);
   check('F5a maxRedirects:0 is INSIDE the billable POST call (not merely somewhere in the file)',
     /maxRedirects:\s*0/.test(postCall), JSON.stringify(postCall.slice(0, 160)));
-  const getCall = (() => {
-    const i = PROVIDER_CODE.indexOf('axios.get(');
+  // SCOPED TO peekInteraction, not the first axios.get in the file.
+  // downloadOutputToBuffer is a later free GET that MUST follow redirects
+  // (Files API → storage.googleapis.com) and so does not set maxRedirects:0;
+  // a file-order-sensitive "first GET" check would fail the moment that
+  // helper is declared above peekInteraction (which it is).
+  const peekGetCall = (() => {
+    const i = PROVIDER_CODE.indexOf('async function peekInteraction');
     if (i < 0) return '';
     const rest = PROVIDER_CODE.slice(i);
-    const end = rest.indexOf('});');
-    return end < 0 ? rest : rest.slice(0, end + 3);
+    const axiosGet = rest.indexOf('axios.get(');
+    if (axiosGet < 0) return '';
+    const fromGet = rest.slice(axiosGet);
+    const end = fromGet.indexOf('});');
+    return end < 0 ? fromGet : fromGet.slice(0, end + 3);
   })();
-  check('F5b the free GET carries it too (a redirected GET is free but still wrong)',
-    /maxRedirects:\s*0/.test(getCall));
+  check('F5b peekInteraction GET carries maxRedirects:0 (a redirected peek is free but still wrong)',
+    /maxRedirects:\s*0/.test(peekGetCall));
   check('F6 the POST is the ONLY axios.post in the file',
     (PROVIDER_SRC.match(/axios\.post\(/g) || []).length === 1);
   check('F7 resume/peek use GET only',
@@ -287,8 +301,11 @@ console.log('\nG. concurrency lease — global, fails closed, safe under both re
 {
   check('G1 the lease lives in Mongo, not in process memory',
     /mongoose/.test(LEASE_SRC) && /findOneAndUpdate/.test(LEASE_SRC));
-  check('G2 no Mongo -> acquire returns null (FAIL CLOSED, never submit unproven)',
-    /if \(!c\) return null;/.test(LEASE_SRC));
+  // Widened 2026-09-03 (B6/B7 fixes) — acquire() now also requires the
+  // separate rate-event ledger collection to be reachable, and the guard
+  // became `if (!c || !events) return null;`. Still FAIL CLOSED either way.
+  check('G2 no Mongo (occupancy OR ledger collection unreachable) -> acquire returns null (FAIL CLOSED, never submit unproven)',
+    /if \(!c \|\| !events\) return null;/.test(LEASE_SRC));
   check('G3 holds BOTH an occupancy and a rate constraint (occupancy-vs-RPM unproven)',
     /acquiredInWindow >= MAX_SLOTS/.test(LEASE_SRC) && /slot < MAX_SLOTS/.test(LEASE_SRC));
   check('G4 default cap is 8 (the measured limit)', /:\s*8;/.test(LEASE_SRC));
@@ -296,14 +313,50 @@ console.log('\nG. concurrency lease — global, fails closed, safe under both re
     /11000/.test(LEASE_SRC));
   check('G6 a unique (scope, slot) index makes the race decidable',
     /createIndex\(\{ scope: 1, slot: 1 \}, \{ unique: true \}\)/.test(LEASE_SRC));
-  check('G7 release only clears OUR hold (a stolen slot is not released late)',
-    /\{ scope, slot, releasedAt: null \}/.test(LEASE_SRC));
+  // G7 was fixed 2026-09-03 (B5): the OLD filter here was literally
+  // `{ scope, slot, releasedAt: null }`, which is NOT holder-scoped — it
+  // matches whichever document currently occupies that slot, not the one
+  // THIS acquisition holds. Concretely: holder A stalls past the TTL,
+  // holder B steals the slot (a fresh doc generation, releasedAt:null
+  // again), and A's late release() still matches B's live row under the
+  // old filter, releasing B's slot while B is still using it — two
+  // workers believing they hold one slot. The fix is a per-acquisition
+  // `claimToken` minted in acquire() and required in both release filters
+  // (the normal release and the B6 rollback release), so a stale handle
+  // from a since-stolen acquisition matches zero documents instead of
+  // clobbering the new holder. This check now verifies the TOKEN is
+  // actually load-bearing, not just present as an unused field.
+  check('G7 release is scoped by a per-acquisition claim token, not just scope+slot (a stolen-then-reacquired slot is not released late)',
+    /claimToken/.test(LEASE_SRC) &&
+    /\{ scope, slot, claimToken, releasedAt: null \}/.test(LEASE_SRC));
+  check('G7b the claim token is minted fresh per acquisition attempt (inside the slot loop), not once per acquire() call',
+    /for \(let slot = 0; slot < MAX_SLOTS; slot \+= 1\) \{[\s\S]{0,200}const claimToken/.test(LEASE_SRC));
+  check('G7c the claim token is written into the SAME $set that wins the slot (so the filter and the stored value can never diverge)',
+    /claimToken\s*\n(\s*)\}\s*\},\s*\n\s*\{ upsert: true, returnDocument: 'after' \}/.test(LEASE_SRC));
   check('G8 the TTL is NOT derived from any poll ceiling (the REFRAME_CLAIM drift lesson)',
     /NOT DERIVED FROM THE POLL BUDGET/i.test(LEASE_SRC) && !/MAX_POLL_MS/.test(LEASE_CODE));
   check('G9 the TTL has a hard floor so a typo cannot make leases instantly stale',
     /Math\.max\(v, 120_000\)/.test(LEASE_SRC));
   check('G10 the lease is documented as a MONEY control, not politeness',
     /MONEY CONTROL|money control/i.test(LEASE_SRC));
+  // G11-G13 added 2026-09-03 (B6 fix): the rate constraint moved off the
+  // REUSED occupancy documents onto a separate APPEND-ONLY ledger. Without
+  // this, a single worker recycling one slot fast enough (measured: 20
+  // sequential acquire/release cycles in one 60s window, zero concurrency)
+  // silently blew through the cap, because countDocuments against a
+  // collection with at most MAX_SLOTS possible rows can never itself exceed
+  // MAX_SLOTS — see scripts/verifyGeminiVideoLease.js section B-sequential
+  // for the executed proof.
+  check('G11 the rate constraint is answered from a SEPARATE collection, not the reused occupancy documents',
+    /RATE_EVENTS_COLLECTION/.test(LEASE_SRC) && /rateEventsColl/.test(LEASE_SRC));
+  check('G12 acquisitions are recorded via an APPEND-ONLY insert, never an upsert/overwrite',
+    /events\.insertOne\(/.test(LEASE_SRC) && !/events\.findOneAndUpdate/.test(LEASE_SRC));
+  check('G13 a rate-window overrun rolls back BOTH the ledger row and the occupancy slot',
+    /events\.deleteOne\(\{ _id: eventId \}\)/.test(LEASE_SRC));
+  check('G14 the handle exposes heartbeat() that $sets acquiredAt matched by claimToken (a live poller is not stealable at TTL)',
+    /heartbeat:\s*async \(\) =>/.test(LEASE_SRC) &&
+    /\$set:\s*\{\s*acquiredAt:\s*new Date\(\)\s*\}/.test(LEASE_SRC) &&
+    /\{ scope, slot, claimToken, releasedAt: null \}/.test(LEASE_SRC));
 }
 
 // ── H. PROVIDER TAGGING — so recovery can route ───────────────────────────
@@ -370,6 +423,214 @@ console.log('\nI. real captured response — the two inferred-wrong shapes');
       Number(real.usage.total_thought_tokens) > 0 &&
       Number(real.usage.total_output_tokens) > Number(real.usage.total_thought_tokens));
   }
+}
+
+// ── J. EVERY FIELD THE PROVIDER WRITES MUST BE DECLARED ON THE SCHEMA ─────
+//
+// THIS SECTION EXISTS BECAUSE #108 SHIPPED THE BUG IT CATCHES.
+//
+// geminiVideoService's receipt $set includes `veoProvider` and
+// `veoResolution`. Neither was declared on models/Ad.js, and the schema is
+// strict — so Mongoose discarded both WITHOUT ERROR. The receipt landed and
+// the provider tag did not, which quietly breaks the one thing the tag exists
+// for: routing recovery by provider. A Gemini `v1_…` interaction id would be
+// handed to the Atlas prediction GET forever and the paid master never
+// collected. models/Ad.js warns about this exact silent-drop three separate
+// times; the code still shipped without the declaration.
+//
+// So this is the GENERAL form, not a check for those two names: extract every
+// key the provider writes and assert each is declared. The next undeclared
+// field fails here instead of in production.
+console.log('\nJ. schema declarations — Mongoose strict drops undeclared paths SILENTLY');
+{
+  const adSrc = fs.readFileSync(path.join(__dirname, '..', 'src', 'models', 'Ad.js'), 'utf8');
+
+  // Keys written by the provider's Ad.updateOne $set blocks.
+  const setBlocks = [...PROVIDER_CODE.matchAll(/\$set:\s*\{([\s\S]*?)\n\s*\}/g)].map((m) => m[1]);
+  check('J0 at least one $set block was found to inspect', setBlocks.length > 0);
+
+  const written = new Set();
+  for (const b of setBlocks) {
+    for (const m of b.matchAll(/^\s*([A-Za-z_][A-Za-z0-9_]*)\s*:/gm)) written.add(m[1]);
+  }
+  check('J1 the written-field set is non-empty', written.size > 0, [...written].join(','));
+
+  // Declared top-level paths on the Ad schema.
+  const declared = new Set(
+    [...adSrc.matchAll(/^\s{2}([A-Za-z_][A-Za-z0-9_]*)\s*:\s*\{/gm)].map((m) => m[1])
+  );
+  check('J2 the declared-path set looks sane (>50 paths)', declared.size > 50, String(declared.size));
+
+  for (const k of [...written].sort()) {
+    // updatedAt is a timestamps-managed path, not a declared literal.
+    if (k === 'updatedAt') continue;
+    check(`J3 provider writes "${k}" — declared on Ad schema`, declared.has(k),
+      'UNDECLARED: Mongoose strict will discard this write with no error');
+  }
+
+  // The two that actually shipped broken, named explicitly so a future reader
+  // sees them called out rather than buried in a loop.
+  check('J4 veoProvider is declared (shipped UNDECLARED in #108)', declared.has('veoProvider'));
+  check('J5 veoResolution is declared (shipped UNDECLARED in #108)', declared.has('veoResolution'));
+  // Do NOT default veoProvider to 'atlas': a null meaning "unknown/pre-cutover"
+  // and a null meaning "we asserted atlas" must stay distinguishable.
+  check('J6 veoProvider defaults to null, not to a provider name',
+    /veoProvider:\s*\{\s*type:\s*String,\s*default:\s*null\s*\}/.test(adSrc));
+}
+
+// ── K. AUTH HEADER IS A STRING, NOT `[object Object]` ─────────────────────
+//
+// THIS SECTION EXISTS BECAUSE #108 SHIPPED THE BUG IT CATCHES.
+//
+// resolveGeminiVideoApiKey() ALWAYS returns an object
+// ({apiKey, slot, fingerprint, length}) — never a string, never falsy.
+// Interpolating the object itself into `x-goog-api-key` sent the literal
+// header value "[object Object]" and produced a live 403. Fixed by reading
+// `.apiKey`. This is the pin that would have caught it before the live
+// incident; it was missing from this harness (zero occurrences of "apiKey"
+// in the file) until this pass.
+console.log('\nK. auth header reads .apiKey off the resolver object, never the object itself');
+{
+  function googApiKeyHeaderExprs(src) {
+    return [...src.matchAll(/['"]x-goog-api-key['"]\s*:\s*([^,}\n]+)/g)].map((m) => m[1].trim());
+  }
+  const exprs = googApiKeyHeaderExprs(PROVIDER_CODE);
+  check('K1 at least one x-goog-api-key header exists in the provider', exprs.length >= 1, String(exprs.length));
+  check('K2 every x-goog-api-key header reads a .apiKey property (never the resolver object)',
+    exprs.length >= 1 && exprs.every((e) => /\.apiKey\b/.test(e)),
+    JSON.stringify(exprs));
+  check('K3 none of those expressions is a bare identifier (the `[object Object]` shape)',
+    exprs.every((e) => !/^(?:key|dlKey|result|resolved)\s*$/.test(e)),
+    JSON.stringify(exprs));
+
+  const brsSrc = fs.readFileSync(path.join(SVC, 'bootRecoveryService.js'), 'utf8');
+  const brsCode = stripComments(brsSrc);
+  const brsExprs = googApiKeyHeaderExprs(brsCode);
+  check('K4 bootRecoveryService does not construct x-goog-api-key itself (single download helper)',
+    brsExprs.length === 0 && /downloadOutputToBuffer/.test(brsCode),
+    JSON.stringify(brsExprs));
+
+  // REVERT-PROOF against the actual pre-fix shape: `'x-goog-api-key': key`
+  // (interpolating the object). Mutating `.apiKey` off the live source must
+  // make K2 fail — that is the bug that shipped.
+  const broken = PROVIDER_CODE
+    .replace(/key\.apiKey/g, 'key')
+    .replace(/dlKey\.apiKey/g, 'dlKey');
+  const brokenExprs = googApiKeyHeaderExprs(broken);
+  check('K5 [REVERT-PROOF] the pre-fix `key` (object) shape would fail K2',
+    brokenExprs.some((e) => !/\.apiKey\b/.test(e)),
+    JSON.stringify(brokenExprs));
+}
+
+// ── L. MIRROR FAILURE AFTER SETTLEMENT STAYS RECOVERABLE ──────────────────
+console.log('\nL. download/mirror failure after settlement sets unsettledAtTimeout');
+{
+  const dlErr = makeUnsettledMirrorError('GEMINI_OUTPUT_DOWNLOAD_FAILED', 'download failed', 'v1_abc');
+  check('L1 download-failure helper sets unsettledAtTimeout',
+    dlErr.unsettledAtTimeout === true && dlErr.predictionId === 'v1_abc' && dlErr.billed === 'yes');
+  const mirErr = makeUnsettledMirrorError('GEMINI_OUTPUT_MIRROR_FAILED', 'mirror failed', 'v1_abc');
+  check('L2 Cloudinary-mirror-failure helper sets unsettledAtTimeout',
+    mirErr.unsettledAtTimeout === true && mirErr.code === 'GEMINI_OUTPUT_MIRROR_FAILED');
+
+  check('L3 generateForAd throws GEMINI_OUTPUT_DOWNLOAD_FAILED via makeUnsettledMirrorError',
+    /GEMINI_OUTPUT_DOWNLOAD_FAILED/.test(PROVIDER_SRC) &&
+    /makeUnsettledMirrorError\(\s*['"]GEMINI_OUTPUT_DOWNLOAD_FAILED['"]/.test(PROVIDER_CODE));
+  check('L4 generateForAd throws GEMINI_OUTPUT_MIRROR_FAILED via makeUnsettledMirrorError',
+    /makeUnsettledMirrorError\(\s*['"]GEMINI_OUTPUT_MIRROR_FAILED['"]/.test(PROVIDER_CODE));
+  check('L5 GEMINI_NO_OUTPUT_URI is the same class (completed, billed, not yet fetchable)',
+    /makeUnsettledMirrorError\(\s*['"]GEMINI_NO_OUTPUT_URI['"]/.test(PROVIDER_CODE));
+
+  // REVERT-PROOF: dropping unsettledAtTimeout from the helper must fail L1.
+  // Re-run L1's actual assertion (call the helper, inspect the flag) against
+  // the mutated source — not "delete the assignment, assert the assignment
+  // is gone".
+  const helperSrc = extract('makeUnsettledMirrorError');
+  const strippedHelper = helperSrc.replace(/err\.unsettledAtTimeout\s*=\s*true;/, '');
+  const mutatedMake = new Function(strippedHelper + '\nreturn makeUnsettledMirrorError;')();
+  const mutatedErr = mutatedMake('GEMINI_OUTPUT_DOWNLOAD_FAILED', 'dl failed', 'v1_abc');
+  check('L6 [REVERT-PROOF] removing unsettledAtTimeout from the helper defeats L1',
+    mutatedErr.unsettledAtTimeout !== true);
+}
+
+// ── M. A CAP MISS IS RETRYABLE AT THE PROVIDER, TERMINAL AT THE RENDERER ─
+console.log('\nM. lease exhaustion is retryable for regenerate; renderer terminal-fails after internal backoff');
+{
+  check('M1 acquire-null returns skipped + retryable + GEMINI_LEASE_EXHAUSTED',
+    /code:\s*['"]GEMINI_LEASE_EXHAUSTED['"]/.test(PROVIDER_CODE) &&
+    /retryable:\s*true/.test(PROVIDER_CODE) &&
+    /skipped:\s*true/.test(PROVIDER_CODE));
+  check('M2 generateForAd retries acquire with a bounded backoff, not a single shot',
+    /LEASE_ACQUIRE_ATTEMPTS/.test(PROVIDER_CODE) &&
+    /LEASE_ACQUIRE_BACKOFF_MS/.test(PROVIDER_CODE) &&
+    /for \(let attempt = 1; attempt <= LEASE_ACQUIRE_ATTEMPTS/.test(PROVIDER_CODE));
+  const rendererSrc = fs.readFileSync(path.join(SVC, 'renderer.js'), 'utf8');
+  check('M3 renderer throws on a skip (internal backoff is the full budget; no persisted requeue counter)',
+    /if \(veoResult\.skipped\) \{/.test(rendererSrc) &&
+    /throw new Error\(veoResult\.reason/.test(rendererSrc) &&
+    !/requeueGeminiLeaseForRetry/.test(rendererSrc));
+  check('M4 renderer does not $inc deriveWaitAttempts on the Gemini lease path (strandedRunSweeper bound)',
+    !/async function requeueGeminiLeaseForRetry/.test(rendererSrc));
+  const regenSrc = fs.readFileSync(path.join(SVC, 'adRegenerateService.js'), 'utf8');
+  check('M5 regenerate tags a cap-miss as err.leaseExhausted rather than a plain skipped throw',
+    /err\.leaseExhausted\s*=\s*true/.test(regenSrc));
+  const leaseCatch = (regenSrc.match(/if \(err && err\.leaseExhausted\) \{[\s\S]*?\n    \}/) || [''])[0];
+  check('M6 regenerate catch parks leaseExhausted (does not markComplete failed)',
+    /return;/.test(leaseCatch) &&
+    !/await markComplete/.test(leaseCatch));
+  check('M8 generateForAd heartbeats the lease on every poll tick',
+    /slot\.heartbeat/.test(PROVIDER_CODE));
+
+  const mutatedSkip = PROVIDER_CODE.replace(/retryable:\s*true,/, '');
+  check('M7 [REVERT-PROOF] dropping retryable:true from the skip return defeats M1',
+    !(/code:\s*['"]GEMINI_LEASE_EXHAUSTED['"]/.test(mutatedSkip) && /retryable:\s*true/.test(mutatedSkip)));
+}
+
+// ── N. modelOverride IS NOT A SILENT ATLAS-SLUG PASS-THROUGH ─────────────
+console.log('\nN. modelOverride — Gemini ids honored, Atlas slugs ignored');
+{
+  check('N1 Atlas slug falls back to the default MODEL',
+    resolveGeminiModel('xai/grok-imagine-video-v1.5/reference-to-video') === 'gemini-omni-1.1-flash');
+  check('N2 a real gemini-* id is honored',
+    resolveGeminiModel('gemini-omni-1.1-flash') === 'gemini-omni-1.1-flash');
+  check('N3 a different gemini-* id is honored (not forced to the default)',
+    resolveGeminiModel('gemini-other-model') === 'gemini-other-model');
+  check('N3b mixed-case gemini-* folds to lowercase (lease scope is case-sensitive)',
+    resolveGeminiModel('Gemini-Omni-1.1-Flash') === 'gemini-omni-1.1-flash');
+  check('N4 null/empty/whitespace uses the default',
+    resolveGeminiModel(null) === 'gemini-omni-1.1-flash' &&
+    resolveGeminiModel('') === 'gemini-omni-1.1-flash' &&
+    resolveGeminiModel('   ') === 'gemini-omni-1.1-flash');
+  check('N5 generateForAd destructures modelOverride (no longer dropped one call deeper)',
+    /async function generateForAd\(\{[^}]*modelOverride/.test(PROVIDER_SRC));
+  check('N6 videoRouter does not claim the operator dropdown is wired for Atlas slugs',
+    !/Previously dropped on the floor, so\s*\n\s*every regenerate went to the default model/.test(
+      fs.readFileSync(path.join(SVC, 'videoRouter.js'), 'utf8')
+    ));
+}
+
+// ── O. DOWNLOAD GET STRIPS THE CREDENTIAL ON CROSS-HOST REDIRECT ──────────
+console.log('\nO. download GET does not forward x-goog-api-key across hosts');
+{
+  const dlFn = (PROVIDER_CODE.match(/async function downloadOutputToBuffer[\s\S]*?\n\}/) || [''])[0];
+  check('O1 downloadOutputToBuffer uses beforeRedirect (not maxRedirects:0)',
+    /beforeRedirect/.test(dlFn) && !/maxRedirects:\s*0/.test(dlFn));
+  const headers = { 'x-goog-api-key': 'secret-key', 'Accept': 'video/mp4' };
+  const options = { hostname: 'storage.googleapis.com', headers };
+  stripGoogApiKeyOnCrossHostRedirect('generativelanguage.googleapis.com')(options);
+  check('O2 cross-host redirect strips x-goog-api-key',
+    options.headers['x-goog-api-key'] === undefined && options.headers.Accept === 'video/mp4');
+  const sameHost = { hostname: 'generativelanguage.googleapis.com', headers: { 'x-goog-api-key': 'secret-key' } };
+  stripGoogApiKeyOnCrossHostRedirect('generativelanguage.googleapis.com')(sameHost);
+  check('O3 same-host redirect KEEPS the key (a later Files API path still needs it)',
+    sameHost.headers['x-goog-api-key'] === 'secret-key');
+
+  const strippedHookSrc = extract('stripGoogApiKeyOnCrossHostRedirect')
+    .replace(/delete options\.headers\['x-goog-api-key'\];/, '');
+  const mutatedHook = new Function(strippedHookSrc + '\nreturn stripGoogApiKeyOnCrossHostRedirect;')();
+  const mutatedOpts = { hostname: 'storage.googleapis.com', headers: { 'x-goog-api-key': 'secret-key' } };
+  mutatedHook('generativelanguage.googleapis.com')(mutatedOpts);
+  check('O4 [REVERT-PROOF] dropping the lowercase delete leaves x-goog-api-key on a cross-host redirect',
+    mutatedOpts.headers['x-goog-api-key'] === 'secret-key');
 }
 
 console.log('');

@@ -167,6 +167,14 @@ const DERIVE_MASTER_WAIT_MS    = Number(process.env.DERIVE_MASTER_WAIT_MS    || 
 const DERIVE_MASTER_POLL_MS    = Number(process.env.DERIVE_MASTER_POLL_MS    || 5_000);   // 5s poll
 const MAX_DERIVE_WAIT_ATTEMPTS = Number(process.env.MAX_DERIVE_WAIT_ATTEMPTS || 60);      // 60 × ~60s = 60 min ceiling per derive
 
+// Gemini cap-miss retry lives ENTIRELY inside generateForAd (LEASE_ACQUIRE_
+// ATTEMPTS × LEASE_ACQUIRE_BACKOFF_MS, claim held). Do NOT add a renderer-
+// level requeue that persists a counter: deriveWaitAttempts is a stranded
+// sweeper bound (default < 3) and renderAttempts is an archive-sweeper
+// bound. Reusing either is how a receipt-free Gemini master vanished
+// after a SIGTERM. After the internal budget a skip throws, same as any
+// other unbilled render failure.
+
 // ── PER-AD TITLING HEARTBEAT ──────────────────────────────────────────────
 // Ported from liquidretail_backend routes/ads.js:2704. Read that, and
 // services/campaignRunHeartbeat.js, before changing anything here — the
@@ -1443,10 +1451,20 @@ async function renderVideo(ad) {
   if (videoProvider === 'atlas') {
     veoResult = await atlasVideo.generateForAd({ ad, storyboard, campaignRunId: runId, allowResume: true });
   } else if (videoProvider === 'gemini') {
+    // NO `prompt` ARGUMENT. Matches videoRouter.js's gemini branch.
+    // Passing `storyboard?.prompt || ad.veoPrompt` looks like a harmless
+    // default but is load-bearing in the wrong direction: storyboard is
+    // always null on the gemini path (prepareStoryboard no-ops for
+    // non-atlas), so this reduced to `ad.veoPrompt`. geminiVideoService's
+    // tier-1 "explicit prompt argument" then wins unconditionally over the
+    // isResuming gate — bypassing the stale-prompt fix this PR's design
+    // put inside the provider. veoPredictionId and veoPrompt are currently
+    // stamped together, so this is not observably wrong today, but any
+    // future path that clears the receipt without clearing veoPrompt
+    // would silently resubmit the old prompt. Let the provider own
+    // precedence on every call path, not just regenerate.
     veoResult = await geminiVideo.generateForAd({
       ad,
-      prompt: storyboard?.prompt || ad.veoPrompt,
-      images: storyboard?.images || [],
       aspectRatio: ad.aspectRatio || '9:16',
       durationSec: ad.videoDurationSec || 10,
       allowResume: true,
@@ -1460,6 +1478,9 @@ async function renderVideo(ad) {
     );
   }
   if (veoResult.skipped) {
+    // Includes GEMINI_LEASE_EXHAUSTED. generateForAd already held this
+    // claim through its internal backoff; a persisted requeue counter is
+    // how we collided with strandedRunSweeper. Nothing was billed.
     throw new Error(veoResult.reason || 'video generation skipped by provider');
   }
   noteFeed(ad, 'master video ready');
@@ -2006,10 +2027,10 @@ async function settleUnsettledVideoTimeout(ad, err) {
     // free-recovery sweep is switched off and parking would have stranded a paid
     // asset silently. A generic message would send someone hunting the wrong one.
     const message = decision.reason === 'no-free-poller'
-      ? `video master unsettled at Atlas and the free receipt sweep is DISABLED ` +
+      ? `video master unsettled at the provider and the free receipt sweep is DISABLED ` +
         `(RESUME_IN_FLIGHT_ON_BOOT=false) — failing instead of parking, because nothing ` +
         `would ever collect it; receipt ${receipt || 'absent'} preserved for reconciliation`
-      : `video master still unsettled at Atlas after ${attempts} poll timeout(s) ` +
+      : `video master still unsettled at the provider after ${attempts} poll timeout(s) ` +
         `(cap ${UNSETTLED_TIMEOUT_MAX_ATTEMPTS}) — not re-queued; ` +
         `receipt ${receipt || 'absent'} preserved for reconciliation`;
     await Ad.updateOne(
@@ -2269,8 +2290,11 @@ async function processAd(ad) {
       //
       // These two conditions shared ONE branch until this PR split them, and
       // they must STAY split. They are structurally disjoint — one per route:
-      // err.unsettledAtTimeout is set ONLY by atlasVideoService (:3945, the
-      // video poll deadline); err.unsettledAtResume ONLY by atlasImageService
+      // err.unsettledAtTimeout is set by atlasVideoService (poll deadline)
+      // AND by geminiVideoService (poll deadline, plus download/mirror
+      // failure AFTER a completed+settled generation — same recoverability:
+      // the paid master exists, status must stay 'rendering' so
+      // bootRecoveryService can collect it). err.unsettledAtResume ONLY by atlasImageService
       // (:726, an ambiguous static resume poll). No error can carry both, so
       // the order of these two ifs is not load-bearing — but the separation is.
       //

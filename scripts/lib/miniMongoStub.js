@@ -68,6 +68,32 @@ function matches(doc, filter) {
           // arrays whose length equals opVal; a missing/non-array field
           // does not match.
           case '$size': return Array.isArray(val) && val.length === opVal;
+          // $elemMatch / $not added 2026-09-03 for
+          // verifyGeminiLeaseSweeperCollision.js, which evaluates the REAL
+          // queuedArchiveSweeper.buildQueuedArchiveFilter. That filter's
+          // ownership clause is `campaignRunIds: { $in: ids, $not: {
+          // $elemMatch: { $nin: ids } } }` — "every element is in the
+          // terminal set", not merely "any element is". Without these
+          // operators the stub would throw (fail-loud, as designed) and
+          // the harness could not execute the real filter at all.
+          //
+          // $elemMatch: any array element matches the subfilter. Scalar
+          // elements (this repo's campaignRunIds is string[]) are wrapped
+          // so operator-only subfilters like `{ $nin: ids }` apply to the
+          // element value, matching Mongo.
+          // $not: negate a nested operator object on the same field.
+          case '$elemMatch': {
+            if (!Array.isArray(val)) return false;
+            return val.some((elem) => {
+              const isDoc = elem !== null && typeof elem === 'object'
+                && !Array.isArray(elem) && !(elem instanceof Date);
+              return isDoc
+                ? matches(elem, opVal)
+                : matches({ __elem: elem }, { __elem: opVal });
+            });
+          }
+          case '$not':
+            return !matches({ __v: val }, { __v: opVal });
           default: throw new Error(`miniMongoStub: unsupported operator ${op}`);
         }
       });

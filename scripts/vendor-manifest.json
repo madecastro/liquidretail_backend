@@ -1,17 +1,15 @@
 {
   "version": 2,
   "backendRef": "origin/main",
-  "backendHead": "81b93a3e0dd7d1e0cb332a03e48bf4b4bd12d7e2",
-  "generatedAt": "2026-09-03T16:37:36.286Z",
+  "backendHead": "6fcd5e55731a408794a3df4dd0e28f0512e6b07a",
+  "generatedAt": "2026-09-03T19:07:28.803Z",
   "files": {
     "models/Ad.js": {
-      "backendHash": "394d26a1cb8ad64b23bde73312f3473f332520dd9640b9d5e4bb8eec22d6138d",
-      "adgenHash": "77ecfc5fef6d47c0184f90e9c5e41eab4a7edc5718d474ed8fa0a8dff2da5edd",
-      "backendSha": "c77a4774c3d0837b7d44e9872a9d81abd77218f6",
-      "status": "unported",
-      "reason": "Adds the retitle-handoff claim fields (retitleRequest/retitleClaimedByWorker/retitleClaimedAt/retitleResult), paired with backend PR #359 declaring the same fields on its own Ad.js — both land together so neither side silently drops the other's write under Mongoose strict schema. Prior fork reason (funnel-stage retitle fields) still holds independently.",
-      "portTo": "backend",
-      "owedSince": "2026-08-28T18:30:24.751Z"
+      "backendHash": "e97c8737fdbc8c630cd027fddcd7dbd84636395a0b1af55f21c12703dd41b72d",
+      "adgenHash": "0816d6f2989c80acb773886417c485be9d3b4ce890a58ce46a635f80b9261d1d",
+      "backendSha": "81b93a3e0dd7d1e0cb332a03e48bf4b4bd12d7e2",
+      "status": "fork",
+      "reason": "PR #110: veoProvider/veoResolution now declared on both repos (backend PR #384/#385 merged), closing THIS PR's own new debt. Re-diffed the full file against backend origin/main: the retitle-handoff fields owed since 2026-08-28 (retitleRequest/retitleClaimedByWorker/retitleClaimedAt/retitleResult) are also now present on backend (paired backend PR #359 landed), and titlingNeeded/titlingAttempts/renderError stderr-stdout tails are all present on both sides too -- confirmed by grep against backend origin/main, satisfying verifyModelParity's adgen-schema-paths-subset-of-backend rule. Remaining differences are legitimate ongoing fork divergence: backend-only qcOverridden/qcOverriddenAt/qcOverriddenBy/qcOverrideReason and a stageTiming planned-expansion comment (neither needed by adgen), plus independently-worded comments on fields both sides share. Genuinely not a debt any more -- downgrading rather than re-attesting a closed obligation."
     },
     "models/Advertiser.js": {
       "backendHash": "0a7e1bb9ca5e0fbbfc6972f9c96d87f839b0a86175831b5446ae27095137ba3f",
@@ -636,11 +634,11 @@
       "owedSince": null
     },
     "services/adRegenerateService.js": {
-      "backendHash": "792d72558e453ad9373478a3fd2dd479fe976c1664782871f84f670320bb7c43",
-      "adgenHash": "16e5fa55a05a2b6af9cf86d8f1c57d390e748e4cfba240fd2df11a95e3065a5d",
-      "backendSha": "abf7e0c2053d9e2d633cc3b3a62bad48531e3271",
+      "backendHash": "b3da0931e6758c18cafe0b7686d75a98693b3323c07077c7bd2d57b1aba3ad3c",
+      "adgenHash": "bef1fc6ac70d9605a2feb42e4d161fba47332a18785214e47eff45e62e7f40c9",
+      "backendSha": "b4eb6435c7d9717aaafe191c28d5bdf8b22a2691",
       "status": "unported",
-      "reason": "regenerate status-promotion + free-derivative cascade fix (4 rounds of adversarial review closing 5 blockers + 2 identity-join gaps: cross-family over-match, undefined-platformFormat BSON-drop, retitleMode QC-quarantine bypass reverted, PMax duration identity join). Equivalent fix independently landed in backend PR #380 in the same session — NOT byte-identical (backend cannot composite a sibling in-process, no Remotion there; provenance-only vs adgen's real composite path), but both close the identical adversarially-found bug set. Backend-side owed work, if any, is genuinely just its own copy's equivalent logic, already done.",
+      "reason": "Pre-existing debt UNCHANGED (still owed, from 2026-08-27): regenerate status-promotion + free-derivative cascade fix -- equivalent fix independently landed in backend PR #380 in the same session, not byte-identical (backend has no Remotion, provenance-only vs adgen's real composite path), backend-side owed work if any is its own copy's equivalent logic, already done -- this repo's own vendor-manifest-correction PR (referenced by verifyRegenerateInFlightGate's E1 merge-order check) is the one that formally closes this, not this PR. ADDITIONALLY (PR #110): adRegenerateService parks a Gemini lease-exhausted skip on the existing regenerate claim rather than markComplete. Adgen-only -- backend has no Gemini video path. Second fix round: comment-only (renderer no longer requeues a cap-miss; generateForAd's internal backoff is the full mint-time budget).",
       "portTo": "backend",
       "owedSince": "2026-08-27T10:28:51.314Z"
     },
@@ -834,12 +832,10 @@
     },
     "services/bootRecoveryService.js": {
       "backendHash": "23c6c84aed1a3cc6ec0e3ae4cd003f5de614c14e4670f376e35fa71a2bf716cb",
-      "adgenHash": "4ada172fccc5099bf1c7539a168ecc229f4b2afbfacf81b902ce2658ea94dac0",
+      "adgenHash": "2fe1cda386f2cbb87b359ef97ac3bbb022387f30ae22bece1b6253b5b42b0e16",
       "backendSha": "abf7e0c2053d9e2d633cc3b3a62bad48531e3271",
       "status": "fork",
-      "reason": "Backend origin/main advanced to abf7e0c2 (#360, in-process titling removal) while this PR was in progress. Re-diffed: mechanical only — STATE_PENDING/TITLING_PENDING/fallbackPosterUrl are now inlined directly (their prior source, services/titlingResumeService.js, was deleted entirely) with updated comments noting the sentinel is now a breadcrumb with no consumer on backend's side. Same values, same behavior. Prior fork reason still holds (backend #346 / adgen #75 solved the same titler-handoff race with different, role-appropriate fixes; neither should take the other's patch verbatim).",
-      "portTo": null,
-      "owedSince": null
+      "reason": "PR #110 (2026-09-03): Gemini completed-master recovery Cloudinary-mirrors (not the raw Files API URI), CAS-guards the download+upload on renderStage='boot-recovery-gemini-mirror', and sets unsettledAtTimeout on mirror failure so recoverableNotCollected alerts. Second fix round: folder keys off ad.veoModel (the model this ad was generated with) not the bare MODEL constant; a thrown mirror failure restores the prior renderStage+updatedAt so the next sweep can retry (the CAS updatedAt write is a one-shot clock, not a heartbeat). Backend has no Gemini-provider recovery branch (Atlas-only) -- adgen-only fork, not a port debt."
     },
     "services/brandCatalogService.js": {
       "backendHash": "d7b9a4558ffaeffe30d0f4708ffb0800896465e12b5ce881e2278a681a837616",
@@ -1917,12 +1913,10 @@
     },
     "services/videoRouter.js": {
       "backendHash": "f23861150ec146820336da11db4459c5abdf001b8ce926b518e28d328b7fe247",
-      "adgenHash": "43f3cd3d6a555a50643aeb544e77c821c081da326166addbcef0f44aae6e6022",
+      "adgenHash": "a2fb88ca73e74ad0c501e3e0e437e6326faaa7eccd9f65d82c2b90f8dca49568",
       "backendSha": "87cfdd0085127c63b70ff69b13cd16db463eca1d",
       "status": "fork",
-      "reason": "threads generateForAd's new allowResume parameter through to atlasVideoService.generateForAd — see services/atlasVideoService.js's reconcile reason for the full context. Backend's videoRouter.js does not need this yet since it doesn't have the parameter to thread.",
-      "portTo": null,
-      "owedSince": null
+      "reason": "PR #110 follow-up fix pass (2026-09-03): gemini branch now threads modelOverride (honored only for gemini-* ids via resolveGeminiModel; Atlas slugs are correctly ignored, not silently mis-sent) alongside the already-fixed no-prompt-argument change. Backend has no gemini branch in videoRouter.js -- adgen-only fork."
     },
     "services/yoloService.js": {
       "backendHash": "af1180cc6933c63795970897f4c4534405124b1eea4d839416c5f02a809c2222",

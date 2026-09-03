@@ -456,6 +456,26 @@ const adSchema = new mongoose.Schema({
   // architecture problem"). Until then it is the audit trail that turns a silent
   // double-bill into a visible orphan.
   veoPredictionId:    { type: String, default: null },
+  // MUST STAY DECLARED — and this one shipped UNDECLARED in #108, which is
+  // exactly the silent-drop this file warns about three times over.
+  //
+  // geminiVideoService stamps `veoProvider` in the same $set as the receipt
+  // above, and its own comments claim that tag is what lets the cost-reconcile
+  // sweep and bootRecoveryService route by provider "instead of guessing".
+  // Undeclared, Mongoose strict discarded it without error: the receipt landed,
+  // the provider tag did not. A Gemini interaction id would then be handed to
+  // the Atlas prediction GET forever — the recovery path reads a v1_… id
+  // against the wrong API and the paid master is never collected.
+  //
+  // Values: 'atlas' | 'gemini'. Null on every pre-cutover row, which reads
+  // correctly as "Atlas era" — do NOT default it to 'atlas', because a null
+  // that means "unknown provider" and a null that means "we asserted atlas"
+  // must stay distinguishable for the sweep.
+  veoProvider:        { type: String, default: null },
+  // Declared for the same reason. Gemini accepts 360p/720p/1080p/4k and only
+  // 720p/1080p have a published token rate, so the resolution a master was
+  // actually generated at is a cost-audit input, not decoration.
+  veoResolution:      { type: String, default: null },
   // Face-safe base-plate crop + face keep-out cache, computed by
   // services/basePlateCropService.js before Remotion titling. Shape:
   // { version, format, sourceUrl, videoUrl|null, rect?, sourceW?, sourceH?,

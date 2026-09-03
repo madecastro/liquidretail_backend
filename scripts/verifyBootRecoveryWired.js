@@ -13,9 +13,9 @@
 // where money is at stake; a receipt-free stuck claim is a separate fix).
 //
 // The wired call is safe to run redundantly across autoscaled instances
-// (bootRecoveryService's own header: "NO CLAIM, ON PURPOSE — the only
-// provider call is a free GET. Two instances peeking the same prediction
-// wastes one HTTP request and nothing else.").
+// for the Atlas peek (free GET + guarded writes). The Gemini completed-
+// master branch CAS-claims on renderStage before its download+upload;
+// see bootRecoveryService.js's header.
 
 const path = require('path');
 const fs = require('fs');
@@ -83,19 +83,62 @@ if (shutdownBody) {
 check('D1: module-level `bootRecoverySweep` state var declared',
   /let bootRecoverySweep\s*=\s*null/.test(rendererSrc));
 
-// ── E. bootRecoveryService exports the expected entry point ────────────
-const brs = require(path.join(REPO, 'src', 'services', 'bootRecoveryService.js'));
-check('E1: bootRecoveryService exports resumeInFlightAds',
-  typeof brs.resumeInFlightAds === 'function');
-
-// ── F. Money-safety pins from bootRecoveryService (spot-check the receipt-scoped filter) ──
+// ── E/F. bootRecoveryService source pins (offline — do not require() the
+// module; a bare adgen worktree has no mongoose and requiring it would
+// crash this harness before the F-section checks run). ──
 const brsSrc = fs.readFileSync(path.join(REPO, 'src', 'services', 'bootRecoveryService.js'), 'utf8');
+check('E1: bootRecoveryService exports resumeInFlightAds',
+  /module\.exports\s*=\s*\{[\s\S]*\bresumeInFlightAds\b/.test(brsSrc));
 check('F1: bootRecoveryService only touches rendering + HAS_RECEIPT ads (money-safety)',
   /status:\s*['"]rendering['"][\s\S]*?HAS_RECEIPT/.test(brsSrc));
 check('F2: bootRecoveryService reads RESUME_STALE_MIN (default 5min heartbeat window)',
   /RESUME_STALE_MIN/.test(brsSrc));
 check('F3: bootRecoveryService never re-submits (imports resumeForAd, not submitGeneration)',
   /resumeForAd/.test(brsSrc) && !/submitGeneration/.test(brsSrc));
+
+// ── F. Gemini completed-master recovery must Cloudinary-mirror, not stamp
+// the raw Files API URI (same B1 defect generateForAd already closed). ──
+check('F4: gemini provider branch exists (recovery routes by veoProvider)',
+  /provider === ['"]gemini['"]/.test(brsSrc));
+check('F5: gemini recovery downloads via the shared downloadOutputToBuffer helper (single credential path)',
+  /downloadOutputToBuffer/.test(brsSrc));
+check('F6: gemini recovery does NOT construct x-goog-api-key itself (would duplicate the .apiKey bug class)',
+  !/['"]x-goog-api-key['"]/.test(brsSrc));
+check('F7: gemini recovery uploads via the shared uploadMirroredMaster helper (overwrite-by-identity)',
+  /uploadMirroredMaster/.test(brsSrc));
+check('F8: download failure throws GEMINI_OUTPUT_DOWNLOAD_FAILED (same code as generateForAd)',
+  /GEMINI_OUTPUT_DOWNLOAD_FAILED/.test(brsSrc));
+check('F9: Cloudinary failure throws GEMINI_OUTPUT_MIRROR_FAILED (same code as generateForAd)',
+  /GEMINI_OUTPUT_MIRROR_FAILED/.test(brsSrc));
+check('F10: recovered videoUrl is uploaded.secure_url, not extractVideoUri() itself',
+  /videoUrl:\s*uploaded\.secure_url/.test(brsSrc));
+check('F11: recovered cloudinaryPublicId is uploaded.public_id (same return field as generateForAd)',
+  /cloudinaryPublicId:\s*uploaded\.public_id/.test(brsSrc));
+check('F12: persist write stamps Ad.cloudinaryPublicId when the Gemini mirror produced one',
+  /cloudinaryPublicId:\s*r\.cloudinaryPublicId/.test(brsSrc)
+    && !/veoCloudinaryPublicId/.test(brsSrc));
+check('F13: Gemini download/mirror/no-uri failures increment recoverableNotCollected, not unknown',
+  /err\.code === ['"]GEMINI_OUTPUT_DOWNLOAD_FAILED['"]/.test(brsSrc)
+    && /err\.code === ['"]GEMINI_OUTPUT_MIRROR_FAILED['"]/.test(brsSrc)
+    && /recoverableNotCollected\+\+/.test(brsSrc));
+check('F14: [REVERT-PROOF] routing those codes through out.unknown++ would exclude them from the alert `touched` sum',
+  /const touched = out\.recovered \+ out\.failed \+ out\.recoverableNotCollected/.test(brsSrc)
+    && !/const touched = out\.recovered \+ out\.failed \+ out\.recoverableNotCollected \+ out\.unknown/.test(brsSrc));
+function f15Holds(src) {
+  return /boot-recovery-gemini-mirror/.test(src) && /findOneAndUpdate/.test(src);
+}
+check('F15: Gemini mirror I/O is CAS-guarded (findOneAndUpdate before download) so two sweeps do not double-upload',
+  f15Holds(brsSrc));
+check('F16: [REVERT-PROOF] dropping the CAS stage name OR findOneAndUpdate defeats F15',
+  f15Holds(brsSrc) === true
+    && f15Holds(brsSrc.replace(/boot-recovery-gemini-mirror/g, 'stripped')) === false
+    && f15Holds(brsSrc.replace(/findOneAndUpdate/g, 'findOne')) === false);
+check('F17: gemini recovery mirrors into ad.veoModel (the model this ad was generated with), not the bare default constant alone',
+  /uploadMirroredMaster\([\s\S]*?model:\s*ad\.veoModel/.test(brsSrc));
+check('F18: a thrown Gemini mirror failure restores the CAS (prior renderStage + updatedAt) so the next sweep can retry',
+  /restoreMirrorCas/.test(brsSrc)
+    && /await restoreMirrorCas\(\)/.test(brsSrc)
+    && /restore\.updatedAt\s*=\s*won\.updatedAt/.test(brsSrc));
 
 // ── G. Revert-proofs ───────────────────────────────────────────────────
 // If someone deletes the run() wiring, B2 must fail.

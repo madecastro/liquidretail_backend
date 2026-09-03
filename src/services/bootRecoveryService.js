@@ -14,9 +14,10 @@
 // asset. Nothing here can submit — it calls atlasVideoService.resumeForAd, whose
 // no-submit guarantee is asserted on its source by scripts/verifyVideoResume.js.
 //
-// ── NO LEASE, ON PURPOSE — BUT NOT CLAIM-BLIND ANY MORE ─────────────────────
+// ── NO LEASE ON THE PEEK; A LIGHT CAS ON THE GEMINI MIRROR ──────────────────
 // Autoscaling means several instances boot at once and will all run this. There
-// is deliberately NO claim/lease TAKEN BY THIS MODULE, for two reasons:
+// is deliberately NO claim/lease TAKEN BY THIS MODULE for the Atlas path, for
+// two reasons:
 //
 //   1. The only provider call is a free GET. Two instances peeking the same
 //      prediction wastes one HTTP request and nothing else.
@@ -27,9 +28,24 @@
 //      to undeclared paths (this repo has already lost `renderError.predictionId`
 //      that way; see models/Ad.js).
 //
-// Taking no lease is still right. NOT READING the ownership fields was not:
-// buildRecoverySweepFilter below now reads `claimedByWorker` / `claimedAt` and
-// the titler-handoff signal. See "WHAT THE STALENESS WINDOW DOES NOT COVER".
+// The Gemini completed-master branch is the exception that proves the rule.
+// Peeking is still a free GET and still claim-free. The download + Cloudinary
+// upload that follows is neither free nor naturally idempotent: two concurrent
+// sweeps can both see `completed`, both download ~100 MB, and both upload
+// distinct Cloudinary assets before the guarded Ad.updateOne decides a winner.
+// That branch therefore:
+//   (a) CAS-claims the row first via findOneAndUpdate on renderStage
+//       ('boot-recovery-gemini-mirror') + veoVideoUrl empty, so a second
+//       instance skips the I/O;
+//   (b) uploads with overwrite:true to a publicId derived from the
+//       interaction id, so even a lost race produces one Cloudinary asset
+//       rather than an orphan.
+// The Atlas path is unchanged — still no claim, still guarded writes.
+//
+// Taking no lease on the peek is still right. NOT READING the ownership fields
+// was not: buildRecoverySweepFilter below now reads `claimedByWorker` /
+// `claimedAt` and the titler-handoff signal. See "WHAT THE STALENESS WINDOW
+// DOES NOT COVER".
 //
 // ── WHY THE STALENESS WINDOW EXISTS ─────────────────────────────────────────
 // An ad being rendered RIGHT NOW by another live instance is also
@@ -307,9 +323,9 @@ async function resumeInFlightAds({
 } = {}) {
   const out = {
     considered: 0, recovered: 0, failed: 0, stillRunning: 0, unknown: 0, skipped: false,
-    // Static images whose paid output was located but finishPlate/upload could
-    // not complete this pass (fetch blip, geometry, etc.). Retried next sweep.
-    // NOT "we refuse to collect" — collection is recoverImageAd below.
+    // Paid output located but not collected this pass (static finishPlate
+    // blip, OR a Gemini completed-master whose download/Cloudinary mirror
+    // failed). Retried next sweep. NOT "we refuse to collect".
     recoverableNotCollected: 0
   };
   if (!enabled()) { out.skipped = 'RESUME_IN_FLIGHT_ON_BOOT=false'; return out; }
@@ -429,8 +445,181 @@ async function resumeInFlightAds({
 
     let r;
     try {
-      r = await resumeForAd({ ad });
+      // ── ROUTE BY PROVIDER. This is what Ad.veoProvider is FOR. ─────────
+      //
+      // Before this, `resumeForAd` was Atlas's, imported unconditionally at
+      // the top of this file and called on every receipt-holding ad. A Gemini
+      // receipt is a `v1_Chd0…` interaction id, and handing that to Atlas's
+      // `GET /model/prediction/{id}` returns garbage — so the sweep would
+      // classify a perfectly good, PAID Gemini master as unknown forever and
+      // never collect it. Not a double-bill (this path is GET-only and its
+      // header pins that it can never submit), but a silent ~$1 loss per
+      // affected ad, which is the same money either way.
+      //
+      // Fail-closed on an UNRECOGNISED provider rather than defaulting to
+      // Atlas: a null `veoProvider` legitimately means "pre-cutover, Atlas
+      // era" and routes to Atlas, but a value we do not know is a receipt we
+      // cannot safely interpret, and guessing is how a paid asset gets
+      // written off. Leaving it `unknown` keeps the ad in `rendering` with
+      // its receipt intact for a human or a later deploy to resolve.
+      const provider = String(ad.veoProvider || 'atlas').toLowerCase();
+      if (provider === 'atlas') {
+        r = await resumeForAd({ ad });
+      } else if (provider === 'gemini') {
+        const gemini = require('./geminiVideoService');
+        const peek = await gemini.resumeForAd(ad);
+        // Normalise onto the shape the rest of this pass consumes
+        // (`{ state, charged, priceUsd, videoUrl }`) — see the
+        // resolveTimeoutOutcome mirror below, which is driven by it.
+        //
+        // Gemini NEVER returns a `price`, on success or failure, so
+        // charge confirmation is deliberately left null rather than
+        // inferred. Atlas's "no price ⇒ unbilled" inference must not
+        // be carried here: it would mark every completion unbilled.
+        if (!peek?.resumed) {
+          r = { state: 'unknown', charged: null, priceUsd: null, videoUrl: null };
+        } else if (peek.state !== 'completed') {
+          r = {
+            state: peek.state === 'failed' ? 'failed' : 'processing',
+            videoUrl: null,
+            charged: null,
+            priceUsd: null
+          };
+        } else {
+          // ── MIRROR TO CLOUDINARY, same as geminiVideoService.generateForAd
+          // (the B1 fix). extractVideoUri returns a
+          // generativelanguage.googleapis.com/v1beta/files/... resource that
+          // needs x-goog-api-key to fetch and is not retained indefinitely.
+          // Stamping that URI onto Ad.veoVideoUrl / renderUrl / posterUrl
+          // would 403/expire the recovered master. Download once, upload
+          // once, stamp the durable Cloudinary URL — same contract Atlas
+          // already honors and generateForAd now returns.
+          const uri = gemini.extractVideoUri(peek.body);
+          if (!uri) {
+            // Completed at the provider, file still in the PROCESSING tail.
+            // Count as paid-but-uncollected so the sweep alerts; leave the
+            // row in 'rendering' for the next pass.
+            const pending = new Error('gemini video: completed but no output uri (file may still be PROCESSING)');
+            pending.code = 'GEMINI_NO_OUTPUT_URI';
+            pending.billed = 'yes';
+            pending.predictionId = ad.veoPredictionId;
+            throw pending;
+          }
+
+          // CAS before the non-idempotent download+upload. Two autoscaled
+          // instances can both peek `completed`; only one should pull bytes.
+          // Filter requires status:'rendering' AND no veoVideoUrl yet AND
+          // either not already in this mirror stage or the previous attempt
+          // went stale (2 min). This $set of updatedAt is a one-shot CAS
+          // clock, not a heartbeat: there is no loop refreshing it during
+          // download+upload. It exists so a concurrent sweep seeing the
+          // same completed peek loses the race (the row is now in
+          // MIRROR_STAGE with a fresh updatedAt, so the 2-min steal does
+          // not fire). A thrown mirror failure restores the prior
+          // renderStage and updatedAt so the next sweep can retry; a
+          // crash mid-mirror waits out RESUME_STALE_MIN because this write
+          // pushed updatedAt forward. overwrite-by-identity is the
+          // backstop if two later sweeps overlap.
+          const MIRROR_STAGE = 'boot-recovery-gemini-mirror';
+          const won = await Ad.findOneAndUpdate(
+            {
+              _id: ad._id,
+              status: 'rendering',
+              veoVideoUrl: { $in: [null, ''] },
+              $or: [
+                { renderStage: { $ne: MIRROR_STAGE } },
+                { updatedAt: { $lt: new Date(Date.now() - 2 * 60 * 1000) } }
+              ]
+            },
+            { $set: { renderStage: MIRROR_STAGE, updatedAt: new Date() } }
+          );
+          if (!won) {
+            r = { state: 'processing', videoUrl: null, charged: null, priceUsd: null };
+          } else {
+            const restoreMirrorCas = async () => {
+              try {
+                const restore = { renderStage: won.renderStage || null };
+                if (won.updatedAt) restore.updatedAt = won.updatedAt;
+                await Ad.updateOne(
+                  {
+                    _id: ad._id,
+                    status: 'rendering',
+                    renderStage: MIRROR_STAGE,
+                    veoVideoUrl: { $in: [null, ''] }
+                  },
+                  { $set: restore }
+                );
+              } catch { /* next sweep's 2-min steal is the backstop */ }
+            };
+            let videoBuffer;
+            try {
+              videoBuffer = await gemini.downloadOutputToBuffer(uri);
+            } catch (err) {
+              await restoreMirrorCas();
+              throw gemini.makeUnsettledMirrorError(
+                'GEMINI_OUTPUT_DOWNLOAD_FAILED',
+                `gemini video: output download failed (${err.message})`,
+                ad.veoPredictionId
+              );
+            }
+
+            let uploaded;
+            try {
+              uploaded = await gemini.uploadMirroredMaster(videoBuffer, {
+                // Folder keys off the model THIS ad was generated with
+                // (stamped on the receipt at submit). The bare MODEL
+                // constant would put a non-default gemini-* override in
+                // a different folder and defeat overwrite-by-identity.
+                model: ad.veoModel || gemini.MODEL,
+                interactionId: ad.veoPredictionId
+              });
+            } catch (err) {
+              await restoreMirrorCas();
+              throw gemini.makeUnsettledMirrorError(
+                'GEMINI_OUTPUT_MIRROR_FAILED',
+                `gemini video: Cloudinary mirror failed (${err.message})`,
+                ad.veoPredictionId
+              );
+            }
+
+            r = {
+              state: 'done',
+              videoUrl: uploaded.secure_url,
+              cloudinaryPublicId: uploaded.public_id,
+              charged: null,
+              priceUsd: null
+            };
+          }
+        }
+      } else {
+        out.unknown++;
+        console.warn(
+          `   ⚠️  bootRecovery[${ad._id}]: veoProvider=${JSON.stringify(ad.veoProvider)} ` +
+          `is not a provider this sweep can peek — leaving the receipt intact rather ` +
+          `than guessing. The ad stays in 'rendering' and is safe to retry once a ` +
+          `peek path exists.`
+        );
+        continue;
+      }
     } catch (err) {
+      // A Gemini mirror failure AFTER peek.state === 'completed' is
+      // paid-but-uncollected, not "we have no idea". out.unknown is
+      // deliberately excluded from the end-of-sweep `touched` sum, so
+      // routing this through unknown would fire neither the summary log
+      // nor alerts.notifyAsync — a fully paid master whose free recovery
+      // mirror keeps failing would go completely dark. recoverableNotCollected
+      // is the bucket the alert title already describes.
+      if (err && (
+        err.code === 'GEMINI_OUTPUT_DOWNLOAD_FAILED' ||
+        err.code === 'GEMINI_OUTPUT_MIRROR_FAILED' ||
+        err.code === 'GEMINI_NO_OUTPUT_URI'
+      )) {
+        out.recoverableNotCollected++;
+        console.warn(
+          `   ⚠️  bootRecovery[${ad._id}]: paid Gemini master located but not mirrored this pass — ${err.message}`
+        );
+        continue;
+      }
       // resume is not supposed to throw; if it does, that must not end
       // the pass and lose the remaining ads.
       out.unknown++;
@@ -464,6 +653,13 @@ async function resumeInFlightAds({
               kind: 'video',
               renderUrl: r.videoUrl,
               posterUrl: poster || r.videoUrl,
+              // generateForAd returns cloudinaryPublicId; renderer.js stamps
+              // it onto the schema-declared Ad.cloudinaryPublicId path (a
+              // veo-prefixed alias is undeclared and silent-dropped). This
+              // persist is the recovery analogue of that write. Atlas resume
+              // does not populate the field, so only set it when the Gemini
+              // mirror produced one.
+              ...(r.cloudinaryPublicId ? { cloudinaryPublicId: r.cloudinaryPublicId } : {}),
               // The real state the sweeper queries. NOT renderStage — adStage
               // (adStage.js:82-85) $sets renderStage all through titling, so a
               // sentinel parked there is clobbered seconds in and a crashed
@@ -596,7 +792,7 @@ async function resumeInFlightAds({
       title: out.recovered > 0
         ? `Recovered ${out.recovered} paid generation(s) after a restart`
         : out.recoverableNotCollected > 0
-          ? `${out.recoverableNotCollected} paid image(s) located but not finished this pass`
+          ? `${out.recoverableNotCollected} paid generation(s) located but not finished this pass`
           : `${out.failed} paid generation(s) confirmed failed after a restart`,
       key: 'boot-recovery',
       fields: {

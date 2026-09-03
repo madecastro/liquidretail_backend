@@ -191,7 +191,7 @@ check('B2 [INVARIANT 1] BOTH call sites sit AFTER (never inside) the derive if-b
 
 check('B3 the providers are EXCLUSIVE branches, not a fallback chain, and a skip still throws', () => {
   const seamIdx = afterIfBlock.search(SUBMIT_RE);
-  const seam = afterIfBlock.slice(seamIdx, seamIdx + 1800);
+  const seam = afterIfBlock.slice(seamIdx, seamIdx + 4500);
 
   // EXCLUSIVITY. The gemini call must be in an `else if`, so a completed
   // Atlas submit can never be followed by a Gemini one for the same ad.
@@ -204,11 +204,17 @@ check('B3 the providers are EXCLUSIVE branches, not a fallback chain, and a skip
   assert.ok(!/else\s*\{[\s\S]{0,200}(atlasVideo|geminiVideo)\.generateForAd\(/.test(seam),
     'the else arm must not submit to anything');
 
-  // The original property, unchanged: a skipped result throws rather than
-  // being treated as success. Bounded at the next syntactic boundary rather
-  // than a magic char count, which is what broke when the seam grew.
-  assert.match(seam, /if \(veoResult\.skipped\) \{\s*\n\s*throw new Error/,
-    'a skipped/rejected submission must throw, not attempt a second provider or a retry-submit');
+  // A skipped result must not be treated as success AND must not fall
+  // through to a second provider. generateForAd holds the claim through
+  // its internal lease backoff; after that budget ANY skip — including
+  // GEMINI_LEASE_EXHAUSTED — throws. A renderer-level requeue that
+  // persisted deriveWaitAttempts is what collided with strandedRunSweeper.
+  assert.match(seam, /if \(veoResult\.skipped\) \{/,
+    'a skipped submission must be inspected, not treated as success');
+  assert.match(seam, /throw new Error\(veoResult\.reason/,
+    'a skip must throw, not attempt a second provider or a retry-submit');
+  assert.ok(!/requeueGeminiLeaseForRetry/.test(seam),
+    'a Gemini cap-miss must not requeue at the renderer — that persisted a sweeper-bound counter');
 
   // No second submit-shaped call after the seam on either provider.
   const tail = afterIfBlock.slice(seamIdx).replace(SUBMIT_RE, '');
@@ -237,6 +243,7 @@ console.log(`✅ verifyRendererVideoMoneyInvariants: ${total}/${total} checks pa
  *      (e.g. a "retry via a different provider" branch)  → B1 fails
  *   4. Move the generateForAd call INSIDE the derive if-block
  *        → B2 fails
- *   5. Drop the `if (veoResult.skipped) throw ...` guard on the master
- *      path, or add a second submit call after it            → B3 fails
+ *   5. Drop the `if (veoResult.skipped)` guard on the master path, or
+ *      add a second submit call after it, or treat a Gemini cap-miss
+ *      as a throw (status:failed) / as success                → B3 fails
  */
