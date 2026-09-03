@@ -149,29 +149,71 @@ check('A5 the not-ready-yet branch requeues and returns — it does not submit e
 const ifBlockEndIdx = fnBody.text.indexOf(ifBlock.text) + ifBlock.text.length;
 const afterIfBlock = fnBody.text.slice(ifBlockEndIdx);
 
-check('B1 [INVARIANT 1] exactly one atlasVideo.generateForAd call exists in the entire file', () => {
-  const wholeFileMatches = [...SRC.matchAll(/atlasVideo\.generateForAd\(/g)];
-  assert.strictEqual(wholeFileMatches.length, 1,
-    `expected exactly 1 call to atlasVideo.generateForAd, found ${wholeFileMatches.length} — a second call site ` +
-    'needs its own derive-gate proof or it can bill a derive-only row');
+// ── RETARGETED 2026-09-03 for the provider seam. STRICTER, NOT LOOSER ─────
+//
+// There are now TWO billable submit call sites — atlasVideo.generateForAd and
+// geminiVideo.generateForAd — because production is cutting over to the direct
+// Gemini API. B1 used to assert "exactly one call in the file", which is the
+// right shape for one provider and the WRONG shape for two: it would force
+// whoever adds a provider to delete the check rather than extend it.
+//
+// So the invariant is restated at the level it actually lives: EVERY billable
+// submit, whichever provider, must sit after the derive gate and outside it —
+// and the providers must be MUTUALLY EXCLUSIVE BRANCHES, never a fallback
+// chain. A fallback would mean a failed Atlas submit silently buys a Gemini
+// one, i.e. two masters for one ad. That is a new failure mode this seam
+// could have introduced and B3 below now rules out explicitly.
+//
+// This is strictly more than the old form proved, because it additionally
+// pins that an UNRECOGNISED provider throws instead of falling through to a
+// billable default. videoRouter's own dispatch sends anything-not-'atlas' to
+// the deprecated Vertex path, so a typo (VIDEO_PROVIDER=gemeni) would
+// otherwise generate on a third provider entirely.
+const SUBMIT_RE = /(?:atlasVideo|geminiVideo)\.generateForAd\(/g;
+
+check('B1 [INVARIANT 1] every billable submit call site is accounted for', () => {
+  const all = [...SRC.matchAll(SUBMIT_RE)];
+  assert.strictEqual(all.length, 2,
+    `expected exactly 2 provider submit call sites (atlas + gemini), found ${all.length} — ` +
+    'a new one needs its own derive-gate proof or it can bill a derive-only row');
+  assert.strictEqual((SRC.match(/atlasVideo\.generateForAd\(/g) || []).length, 1);
+  assert.strictEqual((SRC.match(/geminiVideo\.generateForAd\(/g) || []).length, 1);
 });
 
-check('B2 [INVARIANT 1] that one call site sits AFTER (never inside) the derive if-block', () => {
-  assert.ok(/atlasVideo\.generateForAd\(/.test(afterIfBlock),
-    'generateForAd must be reachable only via the fall-through path after the derive gate\'s closing brace');
-  assert.ok(!/atlasVideo\.generateForAd\(/.test(ifBlock.text),
-    'generateForAd must not appear inside the derive if-block itself');
+check('B2 [INVARIANT 1] BOTH call sites sit AFTER (never inside) the derive if-block', () => {
+  for (const p of ['atlasVideo', 'geminiVideo']) {
+    assert.ok(new RegExp(`${p}\\.generateForAd\\(`).test(afterIfBlock),
+      `${p}.generateForAd must be reachable only via the fall-through path after the derive gate`);
+    assert.ok(!new RegExp(`${p}\\.generateForAd\\(`).test(ifBlock.text),
+      `${p}.generateForAd must not appear inside the derive if-block itself`);
+  }
 });
 
-check('B3 the master path itself has no secondary fallback submit — a skipped/failed Omni result just throws', () => {
-  const masterPathIdx = afterIfBlock.indexOf('atlasVideo.generateForAd(');
-  const nearby = afterIfBlock.slice(masterPathIdx, masterPathIdx + 400);
-  assert.match(nearby, /if\s*\(\s*veoResult\.skipped\s*\)\s*\{\s*\n\s*throw new Error/,
-    'a skipped/rejected Omni submission must throw, not attempt a second provider or a retry-submit');
-  // No second distinct submit function anywhere after the master call.
-  const secondSubmit = afterIfBlock.slice(masterPathIdx + 'atlasVideo.generateForAd('.length)
-    .match(/atlasVideo\.\w*(generate|submit)\w*\(/i);
-  assert.ok(!secondSubmit, `found a second submit-shaped call after the master submit: ${secondSubmit && secondSubmit[0]}`);
+check('B3 the providers are EXCLUSIVE branches, not a fallback chain, and a skip still throws', () => {
+  const seamIdx = afterIfBlock.search(SUBMIT_RE);
+  const seam = afterIfBlock.slice(seamIdx, seamIdx + 1800);
+
+  // EXCLUSIVITY. The gemini call must be in an `else if`, so a completed
+  // Atlas submit can never be followed by a Gemini one for the same ad.
+  assert.match(seam, /\}\s*else if \(videoProvider === 'gemini'\)/,
+    'the gemini submit must be an else-if branch of the atlas one — a sequential second call would buy two masters for one ad');
+
+  // FAIL CLOSED. An unknown provider throws before any submit.
+  assert.match(seam, /\}\s*else \{[\s\S]{0,400}throw new Error\(/,
+    'an unrecognised VIDEO_PROVIDER must throw, never fall through to a billable default');
+  assert.ok(!/else\s*\{[\s\S]{0,200}(atlasVideo|geminiVideo)\.generateForAd\(/.test(seam),
+    'the else arm must not submit to anything');
+
+  // The original property, unchanged: a skipped result throws rather than
+  // being treated as success. Bounded at the next syntactic boundary rather
+  // than a magic char count, which is what broke when the seam grew.
+  assert.match(seam, /if \(veoResult\.skipped\) \{\s*\n\s*throw new Error/,
+    'a skipped/rejected submission must throw, not attempt a second provider or a retry-submit');
+
+  // No second submit-shaped call after the seam on either provider.
+  const tail = afterIfBlock.slice(seamIdx).replace(SUBMIT_RE, '');
+  const second = tail.match(/(?:atlasVideo|geminiVideo)\.\w*(generate|submit)\w*\(/i);
+  assert.ok(!second, `found a second submit-shaped call after the seam: ${second && second[0]}`);
 });
 
 // ── report ───────────────────────────────────────────────────────────────

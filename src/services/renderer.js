@@ -147,6 +147,9 @@ const { classifyRunAdOutcome, buildRunReconciliationUpdate } = require('./campai
 // lastHeartbeatAt stays null until an ad settles.
 const { startRunHeartbeat } = require('./campaignRunHeartbeat');
 const atlasVideo = require('./atlasVideoService');
+// Provider seam — see the dispatch in renderVideo. Required unconditionally so
+// a missing module fails at boot, not on the first billable render.
+const geminiVideo = require('./geminiVideoService');
 const { renderBrandScriptAndSave } = require('./brandScriptExecutor');
 // videoRouter exports `prepareStoryboard`; the backend's routes/ads.js binds it
 // under the local alias `veoPrepareStoryboard`. Phase 1c ported the CALL from
@@ -1423,7 +1426,39 @@ async function renderVideo(ad) {
   // or any other requeue path, makes the row claimable again), so this is
   // precisely where resume-instead-of-resubmit has to be on.
   adStage(adId, `master video generation (${ad.aspectRatio || '9:16'})`);
-  const veoResult = await atlasVideo.generateForAd({ ad, storyboard, campaignRunId: runId, allowResume: true });
+  // ── PROVIDER SEAM. THIS is the live call — NOT videoRouter ────────────────
+  //
+  // videoRouter is used in this file ONLY for prepareStoryboard. A `gemini`
+  // branch added there would be a NO-OP that ships a dark provider while
+  // Atlas keeps billing, and the operator would believe they had cut over.
+  //
+  // FAILS CLOSED on an unrecognised VIDEO_PROVIDER. The router's own dispatch
+  // sends anything-not-'atlas' to the deprecated Vertex path, so a typo like
+  // VIDEO_PROVIDER=gemeni would silently generate on a third provider. Here
+  // an unknown value throws before any billable submit: refusing to render
+  // costs nothing, generating on the wrong provider costs a master and
+  // produces an asset nobody asked for.
+  const videoProvider = String(process.env.VIDEO_PROVIDER || 'atlas').toLowerCase();
+  let veoResult;
+  if (videoProvider === 'atlas') {
+    veoResult = await atlasVideo.generateForAd({ ad, storyboard, campaignRunId: runId, allowResume: true });
+  } else if (videoProvider === 'gemini') {
+    veoResult = await geminiVideo.generateForAd({
+      ad,
+      prompt: storyboard?.prompt || ad.veoPrompt,
+      images: storyboard?.images || [],
+      aspectRatio: ad.aspectRatio || '9:16',
+      durationSec: ad.videoDurationSec || 10,
+      allowResume: true,
+      campaignRunId: runId
+    });
+  } else {
+    throw new Error(
+      `VIDEO_PROVIDER=${JSON.stringify(videoProvider)} is not a recognised video provider ` +
+      `(expected 'atlas' or 'gemini'). Refusing to submit — an unknown provider must never ` +
+      `fall through to a billable default.`
+    );
+  }
   if (veoResult.skipped) {
     throw new Error(veoResult.reason || 'video generation skipped by provider');
   }
