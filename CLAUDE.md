@@ -1746,26 +1746,31 @@ Video never launches a browser.
   **What replaced it, and it is a DIFFERENT invariant — see §2 below:** a
   recovered master must be TITLED, and must never be requeued to get there.
 - **A RECOVERED MASTER MUST NEVER BE REQUEUED — `status:'queued'` costs ~$0.75.**
-  This reads as the obvious way to "finish" a recovered ad and it is a
-  double-charge. `routes/ads.js:1342` declares `veoVideoUrl` **fresh** every
-  render and the path **never reads `ad.veoVideoUrl`**, so `if (!veoVideoUrl)`
-  (`:1367`) is TRUE for an ad that already holds a paid master — it falls
-  straight into `veoGenerateForAd` and submits to Omni a second time. Titling is
-  therefore resumed **titling-only** by `services/titlingResumeService.js`
-  (claim → `renderBrandScriptAndSave`), never by re-entering the render queue.
-  Pinned by `scripts/verifyTitlingResume.js` **T6** (neither service may contain
-  `status: 'queued'`) and **T10** (the sweeper may not even require
-  `atlasVideoService`, so it is structurally incapable of spending).
-- **Titling resume is WEB-ONLY and that is not arbitrary.** Remotion is warmed in
-  `index.js`; `worker.js` has **zero** remotion references. So the worker
-  recovers the asset (`bootRecoveryService`) and the web process titles it
-  (`titlingResumeService`, on an interval with a re-entrancy guard).
-- **Titling resume stands down when adgen owns rendering.** Same helper as the
-  render-loop handoff (`adgenBridge.isAdgenRendererEnabled`, call-time). Missing
-  or malformed ⇒ this repo still sweeps (adgen only claims on `'true'`; dual-none
-  would strand a paid master). Gate is inside `resumeUntitledMasters`, not the
-  interval, so an in-flight pass finishes and a dashboard flip needs no redeploy.
-  Pinned by `scripts/verifyTitlingResumeAdgenGate.js`.
+  The hazard is unchanged and still real on the in-process fallback:
+  `routes/ads.js` declares `veoVideoUrl` **fresh** every render and never reads
+  `ad.veoVideoUrl`, so `if (!veoVideoUrl)` is TRUE for an ad that already holds
+  a paid master and it re-submits to Omni. Requeueing to "finish" a recovered
+  ad is a double-charge.
+  ⚠️ **THE BACKEND MECHANISM THAT ENFORCED THIS IS GONE — corrected 2026-09-03.**
+  `services/titlingResumeService.js` and its pins
+  (`scripts/verifyTitlingResume.js`, `scripts/verifyTitlingResumeAdgenGate.js`)
+  were DELETED on 2026-08-28 in `abf7e0c2` — *"remove(titling): delete
+  backend's in-process titling function (MONEY) (#360)"*, owner directive
+  *"remove and disable the backend titling function, we are not going to go
+  back to it."* For ~6 days this section described those three files as the
+  live guard, in the money-invariants section, under a MUST NEVER heading.
+  Nothing enforced what it promised. **Do not cite them again.**
+  Current reality: **adgen owns titling and titling-resume** (its own
+  `src/services/titlingResumeService.js` + `TITLING_RESUME_*` config).
+  Backend still RECOVERS the paid asset via `services/bootRecoveryService.js`;
+  it no longer titles in-process at all. `docs/PIPELINES.md`'s concurrency
+  table already records the same removal correctly (struck-through
+  `VEO_TITLING_CONCURRENCY` row) — model any future edit on that, not on this.
+  **Open, and stated rather than implied:** with the backend arm deleted, the
+  in-process fallback (`ADGEN_RENDERER_ENABLED` not `'true'`) has no
+  titling-resume of its own. That path is not live today, but a recovered
+  master on it would sit untitled rather than being resumed.
+
 - **Manual retitle (`/retitle-videos`) can now defer to adgen — a FOURTH
   claim namespace, not a reuse of `titlingNeeded`/`claimedByWorker`
   (2026-08-28).** That claim is built exclusively for "a master just
@@ -1803,9 +1808,11 @@ Video never launches a browser.
   exists to close. The trap is about *undeclared* paths; **declaring** the field
   (`models/Ad.js`, `enum:['pending','claimed',null]`) removes it. `renderStage`
   is still written alongside as a human breadcrumb, but nothing queries it.
-  `scripts/verifyTitlingResume.js` **G1/G2** forbid keying any query or claim
-  filter on `renderStage`, and **G3** asserts the schema declaration exists — so
-  neither half of that mistake can come back.
+  ⚠️ Those pins are GONE: `scripts/verifyTitlingResume.js` (G1/G2/G3) was
+  deleted with the resume service in `abf7e0c2` (2026-08-28). The FIELD still
+  exists on `models/Ad.js`, and the reasoning below is still the right lesson
+  about `renderStage` being owned by `services/adStage.js` — but nothing
+  enforces it any more. Treat this bullet as a design note, not a guarantee.
   **Corollary worth knowing:** the same mid-titling crash leaves the identical
   orphan on the NORMAL render path today (`routes/ads.js:1437-1460` stamps
   `draft` + `renderUrl` *before* titling at `:1477`), and no sweeper catches that

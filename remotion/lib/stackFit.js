@@ -141,7 +141,7 @@ export function estimateSlotHeightPx(slotKey, content, ctx = {}) {
   if (content == null) return 0;
   const {
     fontPx, usableWidthPx, maxLines, dims, sizePct, dropReviews = false,
-    itemLayout, itemGap, maxItems,
+    itemLayout, itemStyle, itemGap, maxItems,
   } = ctx;
 
   if (slotKey === 'rating') {
@@ -167,7 +167,7 @@ export function estimateSlotHeightPx(slotKey, content, ctx = {}) {
 
   if (slotKey === 'badges' || slotKey === 'benefits') {
     return estimateMultiSlotHeightPx(content, {
-      fontPx, usableWidthPx, maxLines, dims, itemLayout, itemGap, maxItems, slotKey,
+      fontPx, usableWidthPx, maxLines, dims, itemLayout, itemStyle, itemGap, maxItems, slotKey,
     });
   }
 
@@ -193,6 +193,54 @@ export function estimateSlotHeightPx(slotKey, content, ctx = {}) {
  * When itemLayout is omitted, use the validator default for the slot key
  * (benefits→stack, badges→row) so a Canonical.jsx fork that has not yet
  * grown estCtx still estimates benefits honestly.
+ *
+ * THE GRID UNDER-ESTIMATE (2026-09-03, adversarial review — reproduced BY
+ * EXECUTION: measured up to ~1.9x low with a realistic maxWidthPct + sizeScale
+ * combo). The cell-width arithmetic below (usable width minus one inter-
+ * column gap, split across 2 columns) was already correct — that part is
+ * literally what `slotRenderers.jsx`'s `gridTemplateColumns:
+ * repeat(2,minmax(0,1fr))` does. The bug was downstream of it: each item's
+ * wrapped-line count was capped at the SLOT's authored `maxLines`
+ * (`treatment.maxLines`, titleSpecValidator default 2) — but that cap is a
+ * `-webkit-line-clamp` concept, and `-webkit-line-clamp` is applied ONLY by
+ * `textCoreStyle` (single-value text slots: headline/quote/reviewer/…).
+ * `renderMultiValue` (badges/benefits — slotRenderers.jsx, the `bullet`/
+ * `plain`/`pill`/`chip` item spans, ~:790-836) sets no such clamp: a real
+ * benefit string wraps to as many lines as it needs, unbounded, in the real
+ * DOM. Reusing `maxLines` as the per-item cap here silently discarded any
+ * line past the 2nd, which is exactly how a ~29-45 char benefit in a
+ * halved-width cell (narrower still once `maxWidthPct`/`sizeScale` shrink the
+ * group or grow the type) came out shorter than it really renders.
+ * `estimateTextLines`'s own missing-width fallback still returns `maxLines`
+ * unchanged — that path is genuinely "no signal, assume the worst
+ * single-line-clamp case" and is untouched.
+ * Fix: for GRID ONLY, the per-item cap is `maxLines * cols` (`cols` fixed at
+ * 2, matching the renderer), not bare `maxLines`. This is not "uncapped" —
+ * literal Infinity would let one degenerate item (or an extreme
+ * maxWidthPct/sizeScale combo) balloon the estimate arbitrarily, which is
+ * safe in direction (over-count only costs an earlier shrink/drop) but not
+ * bounded. `cols×` keeps the SAME total "reading budget"
+ * (fontPx × maxLines × lineHeight, the author's real intent at full width) at
+ * the cell's own aspect: a cell that's ~1/cols as wide may fairly need up to
+ * ~cols× as many lines to show the same amount of text. 'stack'/'row' are
+ * UNTOUCHED — they are already fixed/pinned (2026-09-03, the join-fallthrough
+ * defect), this is additive to 'grid' only, and 'stack' items sit at the
+ * FULL usable width so the same defect is far less likely to bind there
+ * (not zero-risk, just out of THIS PR's scope).
+ *
+ * THE BULLET-WIDTH GAP (same review, `itemStyle:'bullet'`). slotRenderers.jsx
+ * (`renderMultiValue`, ~:822-825) reserves `size*0.4` for the bullet dot PLUS
+ * a `size*0.4` flex gap before the label starts — real horizontal room the
+ * estimator was not charging for, so every wrapped line was estimated with
+ * ~1 character more space than it actually has. Subtracted from the usable
+ * width fed to `estimateTextLines` for BOTH 'stack' and 'grid' (both do
+ * per-item width measurement; 'row' joins into one blob and was already
+ * documented as a coarser, deliberately-uninflated model — not touched).
+ * `itemStyle` is a NEW ctx field this file did not read before; Canonical.jsx
+ * (out of this file's scope) does not thread `rawSlot.treatment?.itemStyle`
+ * into `estCtx` yet, so on the live render path this is INERT today — it
+ * only takes effect for a caller (or this file's own harness) that passes
+ * `itemStyle` explicitly. Correct now rather than wrong-and-unexercised.
  */
 function estimateMultiSlotHeightPx(content, ctx) {
   const rawItems = Array.isArray(content)
@@ -208,15 +256,26 @@ function estimateMultiSlotHeightPx(content, ctx) {
 
   const layout = ctx.itemLayout
     || (ctx.slotKey === 'benefits' ? 'stack' : 'row');
+  const itemStyle = ctx.itemStyle
+    || (ctx.slotKey === 'benefits' ? 'bullet' : 'pill');
   const gapPx = multiItemGapPx(ctx);
   const lineH = ctx.fontPx * TEXT_LINE_HEIGHT;
-  const maxLines = ctx.maxLines || 1;
+  const maxLines = Math.max(1, Math.floor(ctx.maxLines) || 1);
+
+  // Dot (size*0.4) + the flex gap before the label (another size*0.4) —
+  // matches slotRenderers.jsx's two `Math.round(size * 0.4)` calls exactly
+  // (summed as two independently-rounded values, not one rounded sum, so
+  // this cannot drift from the renderer by a stray rounding px). Zero for
+  // every other itemStyle — pill/chip/plain reserve no such fixed dead space
+  // ahead of the label.
+  const bulletInsetPx = itemStyle === 'bullet' ? 2 * Math.round(ctx.fontPx * 0.4) : 0;
+  const withBulletInset = (w) => (Number.isFinite(w) ? Math.max(1, w - bulletInsetPx) : w);
 
   if (layout === 'stack') {
     let total = 0;
     for (const item of shown) {
       const lines = estimateTextLines(item, {
-        usableWidthPx: ctx.usableWidthPx,
+        usableWidthPx: withBulletInset(ctx.usableWidthPx),
         fontPx: ctx.fontPx,
         maxLines,
       });
@@ -231,6 +290,12 @@ function estimateMultiSlotHeightPx(content, ctx) {
     const cellWidth = Number.isFinite(ctx.usableWidthPx) && ctx.usableWidthPx > 0
       ? Math.max(1, (ctx.usableWidthPx - gapPx) / cols)
       : ctx.usableWidthPx;
+    const cellUsableWidthPx = withBulletInset(cellWidth);
+    // See the file-level comment above: a grid cell has no -webkit-line-clamp
+    // in the real DOM, so the per-item cap must not be the single-text-slot
+    // `maxLines` value — it is `maxLines * cols`, preserving the same total
+    // reading budget at the cell's own (narrower) width.
+    const gridItemMaxLines = maxLines * cols;
     let total = 0;
     for (let r = 0; r < rows; r++) {
       let rowH = 0;
@@ -238,9 +303,9 @@ function estimateMultiSlotHeightPx(content, ctx) {
         const item = shown[r * cols + c];
         if (item == null) continue;
         const lines = estimateTextLines(item, {
-          usableWidthPx: cellWidth,
+          usableWidthPx: cellUsableWidthPx,
           fontPx: ctx.fontPx,
-          maxLines,
+          maxLines: gridItemMaxLines,
         });
         rowH = Math.max(rowH, lines * lineH);
       }

@@ -1583,7 +1583,6 @@ Non-Cloudinary sources can't be transformed by URL, so they pad locally via `pad
 | `PMAX_PROOF_STRONG_RATING` | `4.5` | Phase B: interpolated into the PMax-only Director hierarchy (RATING-FIRST vs POPULARITY). Meta never sees it |
 | `PMAX_PROOF_MIN_REVIEW_COUNT` | `100` | Phase B: interpolated "substantial count" floor for the PMax hierarchy. Below this, omit the count |
 | `VEO_USE_GPT_STORYBOARD` | `true` | Storyboard on paths that still use it (not Atlas Ken Burns) |
-| `ATLAS_VIDEO_FORCE_CHROME` | `true` | Force chrome handling on Atlas path |
 | `ATLAS_POLL_INTERVAL_MS` | `15000` (`defaults.env`; code fallback `5000`) | Prediction poll interval (+ stage piggyback) |
 | `ATLAS_VIDEO_RESOLUTION` | `1080p` | Omni output; same list $ as 720p |
 | `ATLAS_VIDEO_MODEL` | (empty) | Optional model override in resolve chain; empty → Omni built-in |

@@ -490,6 +490,10 @@ export const Canonical = ({ format = 'feed', safeZoneKey = null, platformFormat 
               itemLayout: rawSlot.treatment?.itemLayout,
               itemGap: rawSlot.treatment?.itemGap,
               maxItems: rawSlot.treatment?.maxItems,
+              // itemStyle too: a bullet reserves a dot + gap before the label
+              // (slotRenderers renderMultiValue), which narrows usable width. Without
+              // this the bullet-inset correction in stackFit is unreachable.
+              itemStyle: rawSlot.treatment?.itemStyle,
             };
             const h = estimateSlotHeightPx(rawSlot.key, resolved.content, estCtx);
             const hNoRev = rawSlot.key === 'rating'
