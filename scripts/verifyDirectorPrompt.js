@@ -366,6 +366,9 @@ function roundFor(flag, inputSummary) {
     !on.system.includes('layout derivation'));
   check('F2c flag-on still labels benefits as NOT verified facts',
     /benefits[\s\S]{0,240}NOT verified catalog facts/.test(on.system));
+  check('F2d flag-on COPY tells the Director benefits are optional colour, never invented',
+    on.system.includes('Use product_signal.benefits only when they sharpen THIS concept') &&
+    on.system.includes('Empty array = skip, never invent'));
 
   check('F3 flag-off editorial is byte-identical to the pre-change line',
     off.system.includes(EDITORIAL_OFF) && !off.system.includes('product_signal.benefits MAY colour'));

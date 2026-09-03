@@ -4,13 +4,17 @@
 //   tokens = LOOK             (brand colors as hex, resolved font files)
 //
 // Spec resolution per format — one cascade, Title Studio and render share it:
-//   presetOverride arg → persisted ad/product/category/brand titleStyleSpec
-//   → brand.titleStylePreset → remotion/presets/canonical.json.
-// Persisted titleStyleSpec docs are ALWAYS honoured when valid (plain
-// always-honour). The 2026-08-05 TITLE_SPEC_IGNORE_PERSISTED flag is gone —
-// a 2026-09-03 prod audit found 0 persisted specs across all four tiers, so
-// the stale-spec population that flag guarded is empty. Named curated
-// presets (soludos-*, pelagic-*, babyboo-*) stay live via titleStylePreset.
+//   explicit presetOverride arg (CLI / retitleDriver --preset= only)
+//   → persisted ad/product/category/brand titleStyleSpec
+//   → brand.titleStylePreset
+//   → intentPreset (funnel stage as a DEFAULT FLOOR, never a replace)
+//   → remotion/presets/canonical.json.
+// Persisted titleStyleSpec docs are ALWAYS honoured when valid.
+// Funnel stage is an INPUT SIGNAL: it selects the consideration/conversion
+// template as the floor when nothing more specific exists. It does NOT
+// replace a director-authored or persisted spec (that was the 2026-09-03
+// staged-funnel hole). Named curated presets (soludos-*, pelagic-*,
+// babyboo-*) stay live via titleStylePreset.
 
 'use strict';
 
@@ -107,18 +111,26 @@ function clearPresetCache() {
  * complete, self-validated per-format spec that the scope-parameterized
  * Title Studio always saves in full; "revert to a broader scope" = clear
  * that tier's override). Tiers, highest→lowest:
- *   presetOverride arg            (explicit, never persisted) [TIER 0]
- *   ad.titleStyleSpec[format]      (per-video override)     [TIER 1]
- *   product.titleStyleSpec[format] (per-product override)   [TIER 1]
- *   category.titleStyleSpec[format] (each leaf→root)        [TIER 1]
- *   brand.titleStyleSpec[format]   (per-brand override)     [TIER 1]
- *   brand.titleStylePreset         (pinned named preset)    [TIER 2]
- *   canonical                      (guaranteed floor)       [TIER 3]
+ *   presetOverride arg            (explicit CLI/operator only) [TIER 0]
+ *   ad.titleStyleSpec[format]      (per-video override)        [TIER 1]
+ *   product.titleStyleSpec[format] (per-product override)      [TIER 1]
+ *   category.titleStyleSpec[format] (each leaf→root)           [TIER 1]
+ *   brand.titleStyleSpec[format]   (per-brand override)        [TIER 1]
+ *   brand.titleStylePreset         (pinned named preset)       [TIER 2]
+ *   intentPreset                   (funnel-stage default floor)[TIER 2.5]
+ *   canonical                      (guaranteed floor)          [TIER 3]
  *
  * TIER 0 (`presetOverride`) is a render-time ARGUMENT only — never written
- * to Brand/Ad/Product. A valid named file in remotion/presets/ wins over
- * every other tier (including a persisted brand.titleStyleSpec). Invalid/
- * missing names log a warning and fall through to the normal ladder.
+ * to Brand/Ad/Product, NEVER auto-filled from Ad.funnelStage. A valid
+ * named file in remotion/presets/ wins over every other tier. Invalid/
+ * missing names log a warning and fall through. Live generate does not
+ * pass this; scripts/retitleDriver.js --preset= does.
+ *
+ * TIER 2.5 (`intentPreset`) is the funnel template
+ * (`canonical-consideration` / `canonical-conversion` / `-pmax10`) used
+ * as the DEFAULT FLOOR when no persisted spec and no brand preset won.
+ * Staged ads keep their intent layout; a Title Studio spec now actually
+ * applies to them. Invalid/missing names fall through to canonical.
  *
  * TIER 1 is ALWAYS honoured when the per-format doc validates. Title Studio
  * and the render path share this cascade — there is no ignore flag.
@@ -126,7 +138,7 @@ function clearPresetCache() {
  * An invalid override validates+warns+falls through, never throws (only a
  * broken canonical throws — a deploy bug). Returns { spec, source } where
  * source ∈ 'override:<name>' | 'ad' | 'product' | 'category:<breadcrumbKey>'
- * | 'brand' | 'preset:<name>' | 'canonical'.
+ * | 'brand' | 'preset:<name>' | 'intent:<name>' | 'canonical'.
  *
  * Brand parity: with no product/ad/category overrides this is byte-identical
  * to the previous brand→preset→canonical resolver.
@@ -138,9 +150,11 @@ function resolveSpec({
   format,
   categories = [],
   presetOverride = null,
+  intentPreset = null,
 } = {}) {
-  // 0. explicit named-preset override (argument only — never persisted).
-  // Wins over brand.titleStylePreset and tier-1 docs when valid.
+  // 0. explicit named-preset override (argument only — never persisted,
+  // never auto-filled from funnelStage). Wins over every other tier
+  // when valid. Live generate does not pass this.
   if (presetOverride != null && String(presetOverride).trim() !== '') {
     const name = String(presetOverride).trim();
     const preset = loadPresetFile(name);
@@ -196,6 +210,27 @@ function resolveSpec({
     }
   }
 
+  // 2.5 intent floor — funnel-stage template when nothing more specific
+  // won. Not TIER 0: a persisted spec / brand preset still beats this.
+  if (intentPreset != null && String(intentPreset).trim() !== '') {
+    const name = String(intentPreset).trim();
+    const preset = loadPresetFile(name);
+    const raw = preset?.byFormat?.[format];
+    if (raw) {
+      const res = validateTitleSpec(raw, { format });
+      if (res.ok) {
+        return { spec: res.normalized, source: `intent:${name}` };
+      }
+      console.warn(
+        `🎬 titleSpec: intentPreset '${name}' invalid for ${format} (${res.errors[0]}) — falling through`
+      );
+    } else {
+      console.warn(
+        `🎬 titleSpec: intentPreset '${name}' missing or has no ${format} — falling through`
+      );
+    }
+  }
+
   // 3. canonical (guaranteed floor)
   const canonical = loadPresetFile(CANONICAL_PRESET);
   const spec = canonical?.byFormat?.[format];
@@ -210,7 +245,7 @@ function resolveSpec({
  * brand.titleStyleSpec wins when valid.
  * @param {object} brand
  * @param {string} format
- * @param {{ presetOverride?: string }} [opts]
+ * @param {{ presetOverride?: string, intentPreset?: string }} [opts]
  */
 function resolveSpecForBrand(brand, format, opts = {}) {
   return resolveSpec({ brand, format, ...opts });

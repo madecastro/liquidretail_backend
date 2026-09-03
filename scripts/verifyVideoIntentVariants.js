@@ -394,13 +394,9 @@ ok('N4 flag-off restores the pre-variant mint (PMax 3, Meta 4)', () => {
 
 ok('N5 mixed run keeps both platforms and does not double-mint Meta', () => {
   const plan = withFunnel(true, () => planAds([META_MASTER, PMAX_9, PMAX_16]));
-  // BILLABLE COUNT IS CONDITIONAL — see resolvePortraitMasterFormat. When the
-  // shared 9:16 master is active (kill switch on AND both masters in the run
-  // AND both destinations resolving to the same camera prompt) the mixed run
-  // pays for TWO masters: the shared portrait plate + the PMax 16:9. When any
-  // conjunct is false it pays for THREE, exactly as before. Assert against
-  // the same decision the planner made rather than a literal, so this check
-  // tracks the gate instead of pinning whichever side happens to be live.
+  // Owner 2026-09-03: mixed runs share the 9:16 plate unconditionally
+  // (hook-first is not a conjunct). Kill switch / 10s floor can still
+  // refuse; this check tracks the same decision the planner made.
   const shared = svc.resolvePortraitMasterFormat([META_MASTER, PMAX_9, PMAX_16])
     === META_MASTER;
   assert.strictEqual(plan.filter((p) => p.billable).length, shared ? 2 : 3,

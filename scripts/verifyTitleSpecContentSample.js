@@ -206,8 +206,9 @@ check('B7 constants are 5 / 56 / 3',
   });
   check('D1 empty sample still emits the labelled LIVE CONTENT SAMPLE heading',
     emptyBlock.includes(SAMPLE_HEADING));
-  check('D2 empty sample explains "this brand currently has no derived benefits today"',
-    emptyBlock.toLowerCase().includes('this brand currently has no derived benefits today'));
+  check('D2 empty sample explains there are no derived catalog benefits',
+    emptyBlock.includes(EMPTY_BENEFITS_LINE) ||
+      emptyBlock.toLowerCase().includes('no derived catalog benefits'));
   check('D3 empty sample does NOT look like an error (no "failed" / "missing"; "not an error" is the explicit C3 line)',
     !/\b(failed|missing)\b/i.test(emptyBlock) && /not an error/.test(emptyBlock));
   check('D4 empty sample still carries bind / no-literal / no-specs-slot warnings',
@@ -268,6 +269,10 @@ check('E9 0.12 (the validator default) is a good cascade; 1.5 is not seconds',
   fmt.includes('0.12 (the validator default)') && fmt.includes('1.5 is not "1.5 seconds"'));
 check('E10 itemStyle bullet + itemLayout stack is the default',
   fmt.includes("itemStyle: 'bullet'") && fmt.includes("itemLayout: 'stack'"));
+check('E11 funnel intent is a SIGNAL not a template wipe',
+  fmt.includes('Funnel intent is a SIGNAL not a template wipe'));
+check('E12 BIND_WARNING names CatalogProduct.shortBenefits as the fill source',
+  BIND_WARNING.includes('CatalogProduct.shortBenefits'));
 
 // ── F. userMsg composition ───────────────────────────────────────────────
 

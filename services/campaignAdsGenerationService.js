@@ -343,10 +343,17 @@ function funnelDeriveSource(platformFormat) {
 }
 
 /**
- * Map Ad.funnelStage → remotion preset name, or null.
+ * Map Ad.funnelStage → remotion INTENT-PRESET name, or null.
  * PMax video → canonical-<stage>-pmax10 (10s extent).
  * Meta video → canonical-<stage> (8s generic; stretches on a 10s plate).
- * Absent/unknown stage or a non-video format → null (today's cascade).
+ * Absent/unknown stage or a non-video format → null (canonical floor).
+ *
+ * THIS IS NOT A WHOLE-SPEC OVERRIDE. Callers must pass the returned name
+ * as resolveSpec's `intentPreset` (TIER 2.5 floor — persisted specs and
+ * brand presets still win). Passing it as `presetOverride` (TIER 0) is
+ * the 2026-09-03 staged-funnel hole: consideration/conversion ads never
+ * saw a director-authored benefits slot. The function name is kept so
+ * existing harnesses that pin the mapping stay valid.
  */
 function resolveFunnelPresetOverride(ad) {
   if (!ad) return null;
@@ -696,11 +703,12 @@ function isSharedPortraitPlatePromptCoherent() {
  *   1. the kill switch on;
  *   2. the Meta master minted IN THIS RUN (not merely on the campaign);
  *   3. the PMax portrait master requested IN THIS RUN;
- *   4. both destinations resolving to the same camera prompt.
- * On a PMax-only run there is no Meta plate to ride, so pmax_video_9_16
- * stays BILLABLE. That is not a missed saving: a derive whose master never
- * exists fails honestly, and the run would deliver NO 9:16 video at all —
- * strictly worse than paying $0.90 for one. When in doubt, bill.
+ *   4. the Meta 10s floor (Google rejects PMax video under 10s).
+ * Camera-prompt / hook-first is NOT a conjunct (owner 2026-09-03): the
+ * live (non-hook-first) prompt is the shared 9:16 camera for both
+ * platforms; PMax vs Meta differences stay in TITLING. On a PMax-only
+ * run there is no Meta plate to ride, so pmax_video_9_16 stays BILLABLE.
+ * When in doubt, bill.
  *
  * Same shape as isGoogleVideoMasterRun / isMetaVideoMasterRun: the gate is
  * the PRESENCE OF THE SOURCE in this run's master list, never a platform
@@ -712,7 +720,10 @@ function resolvePortraitMasterFormat(masterFormats) {
   // isGoogleVideoMasterRun IS "pmax_video_9_16 is in this run's master
   // list" — reused rather than re-tested so the two can never diverge.
   if (!isGoogleVideoMasterRun(masterFormats)) return PMAX_VIDEO_DERIVE_SOURCE;
-  if (!isSharedPortraitPlatePromptCoherent()) return PMAX_VIDEO_DERIVE_SOURCE;
+  // Camera-prompt / hook-first is deliberately NOT a conjunct. Owner
+  // 2026-09-03: mint one 9:16 master for mixed Meta+PMax regardless of
+  // VIDEO_HOOK_FIRST_PROMPT / PMAX_VIDEO_DIRECTIVES. The live prompt is
+  // the shared camera; PMax customization stays in titling.
   // ⚠️ SOUNDNESS CONJUNCT — the shared plate must be a LEGAL PMax asset.
   // Google rejects PMax video under 10s. Meta video is floored at 10s
   // universally (resolveVideoDurationForFormat, owner directive 2026-08-18),
@@ -3729,6 +3740,30 @@ async function expandDeterministicVideo({
       // Stamping the field on the Ad is the hand-off; this service
       // does not call assembleInput.
       payload[FUNNEL_STAGE_FIELD] = normalizedFunnelStage;
+    }
+    // Video-title Director: one LLM call per (product × profile × size),
+    // memoized across the 21 expandDeterministicVideo iterations of a
+    // mixed kit. Failure must not abort minting (Omni is the money).
+    try {
+      const {
+        getVideoTitleDirection,
+        isBenefitsPlacementEnabled,
+      } = require('./videoBenefitsDirector');
+      if (isBenefitsPlacementEnabled()) {
+        payload.videoTitleDirection = await getVideoTitleDirection({
+          brandId,
+          productId: pidStr,
+          campaignKind,
+          platformFormat,
+          funnelStage: normalizedFunnelStage,
+        });
+      }
+    } catch (err) {
+      payload.videoTitleDirection = {
+        include: false,
+        reason: `director-failed:${err && err.message ? err.message : 'unknown'}`,
+        source: 'director-failed',
+      };
     }
     payloads.push(payload);
     const successRow = {
