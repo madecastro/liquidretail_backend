@@ -99,6 +99,12 @@ const { buildVideoSegmentUrl, buildPromptScaffold } = require('../services/atlas
 // again exactly as it did before 2026-08-27.
 const { SEED_BURNED_IN_TEXT_GUARD_LINE } = require('../services/veoPromptBuilder');
 const { resolveSeedTextTruth } = require('../services/seedTextTruth');
+const {
+  lookupUrlsFor,
+  knownMediaIdsFor,
+  buildVideoReferenceMediaFilter,
+  buildReferenceImageEntries
+} = require('../services/videoReferenceLineage');
 const { buildGridPreviewVideoUrl } = require('../services/videoPreviewUrl');
 const { buildGridPreviewImageUrl } = require('../services/imagePreviewUrl');
 const ugcVideoPipeline = require('../services/ugcVideoPipeline');
@@ -5642,50 +5648,37 @@ router.get('/:id/generation-inspector', async (req, res) => {
       // now. A URL whose Media row was since deleted or re-uploaded resolves
       // to null and is labelled "not resolvable", rather than being given a
       // flattering guess — the same rule the empty-stack warning below follows.
+      //
+      // `originalUrl` / `sourceUrl` (same value; static-path convention) is
+      // the catalog Media.fileUrl BEFORE pad/crop/reframe. The submitted URL
+      // almost never equals that: reframeReferenceForAspect returns a cache
+      // hit, a new derivative, or a Cloudinary transform of fileUrl. Matching
+      // fileUrl alone therefore showed the frontend's "no original catalog
+      // media could be traced" warning on most non-seed refs even though the
+      // source was known at submit time. Reverse-resolved here — stripped
+      // transform AND metadata.reframes.*.url — so already-generated ads
+      // light up without a schema change. One definition:
+      // services/videoReferenceLineage.js.
       let referenceImages = referenceUrls;
       if (referenceUrls.length) {
-        let byUrl = new Map();
+        let refMedias = [];
         try {
-          const refMedias = await Media.find({ fileUrl: { $in: referenceUrls } })
-            .select('fileUrl source fileType metadata.imageRole metadata.feedIndex primarySubjectDesc')
-            .lean();
-          byUrl = new Map(refMedias.map(m => [m.fileUrl, m]));
+          const filter = buildVideoReferenceMediaFilter({
+            brandId,
+            productId: ad.productId || null,
+            knownMediaIds: knownMediaIdsFor(ad),
+            lookupUrls: lookupUrlsFor(referenceUrls)
+          });
+          if (filter) {
+            refMedias = await Media.find(filter)
+              .select('fileUrl source fileType metadata.imageRole metadata.feedIndex metadata.reframes metadata.catalogProductId primarySubjectDesc')
+              .lean();
+          }
         } catch (e) {
           // A diagnostic must never take down the page it explains.
           console.warn(`generation-inspector: reference-image lookup failed: ${e.message}`);
         }
-        referenceImages = referenceUrls.map((url, i) => {
-          const m = byUrl.get(url) || null;
-          const imageRole = m?.metadata?.imageRole || null;
-          const feedIndex = Number.isInteger(m?.metadata?.feedIndex) ? m.metadata.feedIndex : null;
-          // Position is the one thing the submit record DOES pin: pos 0 is
-          // the seed by construction (models/Ad.js on veoReferenceImages).
-          const describes = i === 0
-            ? 'seed — the frame the model animated'
-            : (!m
-                ? 'not resolvable — no Media row matches this URL now'
-                : feedIndex === 0
-                  ? 'catalog primary (merchant feed image 0)'
-                  : feedIndex != null
-                    ? `catalog alt (merchant feed image ${feedIndex})`
-                    : imageRole
-                      ? `catalog ${imageRole}`
-                      : `${m.source || 'unknown'} media`);
-          return {
-            url,
-            position:        i,
-            describes,
-            mediaId:         m ? String(m._id) : null,
-            mediaSource:     m?.source || null,
-            imageRole,
-            feedIndex,
-            // The merchant's own description of the subject. A mis-filed
-            // colourway photo is visible HERE before it is visible in the
-            // delivered clip.
-            primarySubjectDesc: m?.primarySubjectDesc || null,
-            resolvedFromUrl: true
-          };
-        });
+        referenceImages = buildReferenceImageEntries(referenceUrls, refMedias);
       }
       if (!referenceUrls.length) {
         // Empty is ambiguous — an unrecorded render and a genuinely
