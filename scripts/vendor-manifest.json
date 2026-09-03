@@ -1,8 +1,8 @@
 {
   "version": 2,
   "backendRef": "origin/main",
-  "backendHead": "ecbea9c7f2e344dfcd4e3a06d2455a03bba5d237",
-  "generatedAt": "2026-09-02T14:00:38.568Z",
+  "backendHead": "659ed76cbddcaf7d16fd6ab86e68d498e6140cce",
+  "generatedAt": "2026-09-03T02:18:18.908Z",
   "files": {
     "models/Ad.js": {
       "backendHash": "394d26a1cb8ad64b23bde73312f3473f332520dd9640b9d5e4bb8eec22d6138d",
@@ -641,10 +641,10 @@
     },
     "services/adRegenerateService.js": {
       "backendHash": "792d72558e453ad9373478a3fd2dd479fe976c1664782871f84f670320bb7c43",
-      "adgenHash": "59e05a1487893ba2918d8a8dffee5a7124060017ac926c01e6c84385ac965f60",
+      "adgenHash": "16e5fa55a05a2b6af9cf86d8f1c57d390e748e4cfba240fd2df11a95e3065a5d",
       "backendSha": "abf7e0c2053d9e2d633cc3b3a62bad48531e3271",
       "status": "unported",
-      "reason": "OWES PORTS IN BOTH DIRECTIONS. (1) backend needs adgen's lease/reclaim state machine (PR #76/#92: unsettledAtTimeout handling, 45-min lease/reclaim, assertNotInFlightBeforeSubmit()/allowResume execute-time re-check from PR #90) — backend's performRegeneration has none of this, confirmed zero occurrences of 'unsettledAtTimeout' or 'assertNotInFlightBeforeSubmit'. (2) adgen needs backend's retitle-handoff coordination (PR #359/#93, landing alongside this reconciliation): the stamp filter must exclude regenerating:{$ne:true} rows so a retitle claim can never race an in-flight regenerate — already applied on both sides as part of that pairing, tracked here so this entry does not go stale again the moment either PR lands. CANDIDATE GAP, NOT FULLY RESOLVED: whether backend needs the lease/reclaim port is an open product question (an operator-visible failed regenerate with no auto-retry vs. adgen's automatic reclaim) — flagged, not fixed, in either direction. owedSince carries forward from the original PR #90 finding.",
+      "reason": "regenerate status-promotion + free-derivative cascade fix (4 rounds of adversarial review closing 5 blockers + 2 identity-join gaps: cross-family over-match, undefined-platformFormat BSON-drop, retitleMode QC-quarantine bypass reverted, PMax duration identity join). Equivalent fix independently landed in backend PR #380 in the same session — NOT byte-identical (backend cannot composite a sibling in-process, no Remotion there; provenance-only vs adgen's real composite path), but both close the identical adversarially-found bug set. Backend-side owed work, if any, is genuinely just its own copy's equivalent logic, already done.",
       "portTo": "backend",
       "owedSince": "2026-08-27T10:28:51.314Z"
     },
@@ -888,11 +888,11 @@
       "owedSince": null
     },
     "services/brandScriptExecutor.js": {
-      "backendHash": "d041a084b448940b4702f76d0cd915ade4a1b3e1393a0a00a4fde83af1636a14",
-      "adgenHash": "d9bfc5aa37b9483e169a79745e48fa275e506fe8a3d1aa1000a17daf481145f9",
-      "backendSha": "5d1cfc74cbc6ccd77e88f2eb70ee348d9e123700",
+      "backendHash": "2aae3041e3c3c3e7f554f1135879f6f2005a17e8a371d9dea52cec58911bd4c4",
+      "adgenHash": "15c7045b2965a9f34bc2ecac16832a073044a949688621f38aa7ae137a51ba54",
+      "backendSha": "2b58cf31766b6ecf9fde711770c87dc2174cbd29",
       "status": "unported",
-      "reason": "Pre-existing debt from #93/#359/#360 unchanged in direction — backend still lacks stampTitlingFailureAndThrow/TITLING_ATTEMPTS_MAX on its manual retitle path (routes/brand.js: /retitle-videos, /title-still, /title-spec/modify → renderBrandScriptAndSave). NEW 2026-09-02: runVideoVisionQcForAd now passes ad.veoReferenceImages[] (all refs, not just [0]) to runVideoPostRenderQc as originalProductUrls. Same change landed byte-identical in backend for the same-day multi-ref QC work. Applies to both master path (has veoReferenceImages) and derive path (falls back to CatalogProduct.imageUrl as a single-element array, reproducing pre-2026-09-02 M=1 behaviour exactly). owedSince carries forward for the titling-attempts gap only.",
+      "reason": "2026-09-03: adgen-ONLY doc-comment update on renderBrandScriptAndSave's retitleMode header -- runVideoFull no longer passes retitleMode (that expansion was reverted); recascadeDerivativeSibling still always-true. No functional change to this file. Pre-existing debt UNCHANGED: backend's manual retitle path still lacks stampTitlingFailureAndThrow/TITLING_ATTEMPTS_MAX. owedSince carries forward for the titling-attempts gap only.",
       "portTo": "backend",
       "owedSince": "2026-08-28T17:47:48.113Z"
     },
@@ -989,12 +989,12 @@
       "owedSince": null
     },
     "services/campaignAdsGenerationService.js": {
-      "backendHash": "21c4577d9264cdc6a504aa7036799f0183575c1a85a928ee1aee2f8e9ef02713",
-      "adgenHash": "def174e4b6444f63ed1661ac891a7574a6deeeadfe8164be3d170ba0c02883e0",
-      "backendSha": "0a7a69b984c77477dce17b45c0d9c15e9e005fe0",
+      "backendHash": "6e11c80c71596c2a947254d9b70fcdd27e27d0edc8d73578f4992909b0f6aa51",
+      "adgenHash": "325c8489b3ae9fe873fa7082def68ac5ecb3f1cb0f7922ffe3bc83b6815cfa7f",
+      "backendSha": "659ed76cbddcaf7d16fd6ab86e68d498e6140cce",
       "status": "unported",
-      "reason": "Fresh diff (no prior context): backend rewrote isSharedPortraitPlatePromptCoherent() (used only inside resolvePortraitMasterFormat/planDeterministicVideoAds, the MINT-TIME shared-portrait-master decision) to drop the isHookFirstVideoPromptEnabled() gate and test camera-directive equality alone, per an explicit 2026-08-26 owner decision recorded at length in the backend comment ('Decouple them but leave them sharing a plate... right now they should share the plate'). Adgen's copy still has the OLD gate (hookFirst===true required to share), which — since VIDEO_HOOK_FIRST_PROMPT/PMAX_VIDEO_DIRECTIVES are OFF by default on both repos — would fail closed and mint TWO billable ~$0.90 portrait masters instead of one shared master, exactly the double-bill this function exists to prevent. VERIFIED THIS IS CURRENTLY DEAD CODE IN ADGEN, not a live bug: isSharedPortraitPlatePromptCoherent/resolvePortraitMasterFormat/planDeterministicVideoAds are reachable only from expansion/mint (expandWizardJob, runConceptDrivenExpansion), which adgen's orchestrator.js explicitly does not run (still Phase 0, its own header comment: 'Do not wire expandWizardJob, Director, Judge, mint, or brief-derivation') — expansion is 100% backend today. The one function this file exports that IS live in adgen, resolveDeriveFromMaster (required by renderer.js:141), is BYTE-IDENTICAL between the two repos — confirmed by direct diff. So there is no money impact today, but this MUST be ported before any Phase B work wires expansion into this repo, or the double-bill reopens the moment the code goes live here. Recorded as owed-to-adgen debt rather than a fork so it cannot be silently forgotten by the time Phase B lands.",
-      "portTo": "adgen",
+      "reason": "exported isGooglePmaxVideoFormat (was module-private) so the regenerate-cascade fix could join PMax video-duration identity without duplicating the format-set predicate. Pure additive export, no behavior change to any existing caller. Equivalent export landed in backend PR #380's matching file in the same session.",
+      "portTo": "backend",
       "owedSince": "2026-08-28T17:44:28.333Z"
     },
     "services/campaignBriefDerivationService.js": {

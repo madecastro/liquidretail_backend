@@ -782,7 +782,8 @@ function claimedRow(ageMin, over = {}) {
       renderDirectImage: async () => { throw new Error('directImage must not run on a video timeout path'); }
     });
     dSeed('src/services/campaignAdsGenerationService.js', {
-      resolveDeriveFromMaster: dResolveDeriveFromMaster
+      resolveDeriveFromMaster: dResolveDeriveFromMaster,
+      isGooglePmaxVideoFormat: (fmt) => fmt === 'pmax_video_9_16' || fmt === 'pmax_video_16_9' || fmt === 'pmax_video_1_1'
     });
     dSeed('src/services/seededUniverseService.js', {
       isUgcFirstSeedingEnabled: () => false

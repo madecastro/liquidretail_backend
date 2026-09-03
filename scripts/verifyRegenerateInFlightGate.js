@@ -235,7 +235,11 @@ seed('src/services/directImageRenderService.js', {
   }
 });
 seed('src/services/campaignAdsGenerationService.js', {
-  resolveDeriveFromMaster: resolveDeriveFromMasterStub
+  resolveDeriveFromMaster: resolveDeriveFromMasterStub,
+  // Cascade after markComplete calls isGooglePmaxVideoFormat; without this
+  // the destructure is undefined and a successful video regen TypeErrors
+  // inside the swallowed cascade.
+  isGooglePmaxVideoFormat: (fmt) => fmt === 'pmax_video_9_16' || fmt === 'pmax_video_16_9' || fmt === 'pmax_video_1_1'
 });
 seed('src/services/seededUniverseService.js', {
   isUgcFirstSeedingEnabled: () => false

@@ -4470,6 +4470,10 @@ module.exports = {
   resolveDeterministicVideoMasterFormats,
   resolveVideoDurationForFormat,
   isGoogleVideoMasterRun,
+  // Same predicate computeDeterministicVideoDigest uses for the PMax-only
+  // duration slot. Exported so the regenerate cascade joins on duration
+  // through this definition rather than a third copy of the format-set.
+  isGooglePmaxVideoFormat,
   isMetaVideoMasterRun,
   isMetaVideoDerivativesEnabled,
   isPmaxFunnelVariantsEnabled,

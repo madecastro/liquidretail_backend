@@ -44,17 +44,41 @@ function matches(doc, filter) {
           case '$ne':  return val !== opVal;
           case '$lt':  return val != null && val < opVal;
           case '$gt':  return val != null && val > opVal;
-          case '$in':  return opVal.includes(val === undefined ? null : val);
+          // Added 2026-09-02 for verifyRegenerateStatusPromotionAndCascade.js,
+          // which evaluates campaignRunIds:{$in:[...]} against a real ARRAY
+          // field — Mongo's $in against an array field matches when ANY
+          // element of the array is in the list (array-contains-any), not
+          // scalar equality of the whole array. Scalar fields (the pre-
+          // existing callers) are unaffected: Array.isArray(val) is false for
+          // them, so this falls through to the original scalar check.
+          case '$in':  return Array.isArray(val)
+            ? val.some((v) => opVal.includes(v))
+            : opVal.includes(val === undefined ? null : val);
           // $nin added 2026-08-26 for verifyBootRecoveryClaimAware, which
           // evaluates the REAL spendReceipt.HAS_RECEIPT (`$nin: [null, '']`)
           // rather than a stubbed stand-in. A missing field is normalised to
           // null on both sides, matching Mongo: `$nin:[null]` does NOT match an
-          // absent path.
-          case '$nin': return !opVal.includes(val === undefined ? null : val);
+          // absent path. Array-field case mirrors $in above.
+          case '$nin': return Array.isArray(val)
+            ? !val.some((v) => opVal.includes(v))
+            : !opVal.includes(val === undefined ? null : val);
           case '$exists': return opVal ? val !== undefined : val === undefined;
+          // $size added 2026-09-03 for findDerivativesOfMaster's empty
+          // referenceMediaIds arm (identity-family join). Mongo matches
+          // arrays whose length equals opVal; a missing/non-array field
+          // does not match.
+          case '$size': return Array.isArray(val) && val.length === opVal;
           default: throw new Error(`miniMongoStub: unsupported operator ${op}`);
         }
       });
+    }
+    // Mongo equality on arrays is by value (order-significant), not by
+    // JS reference. Without this, `{ referenceMediaIds: [] }` in a filter
+    // would never match a document that also has `[]` as a different
+    // instance — which is exactly how mint-time empty stacks look.
+    if (Array.isArray(cond)) {
+      if (!Array.isArray(val) || val.length !== cond.length) return false;
+      return val.every((v, i) => v === cond[i] || String(v) === String(cond[i]));
     }
     return val === cond;
   });
@@ -62,6 +86,15 @@ function matches(doc, filter) {
 
 function applyUpdate(doc, update) {
   if (update.$set) Object.assign(doc, update.$set);
+  // Added 2026-09-02 for verifyRegenerateStatusPromotionAndCascade.js, which
+  // drives the REAL recascadeDerivativeSibling — its stale-basePlate clear
+  // is a genuine $unset, not a $set:null (the crop/detection code this
+  // stub's callers stand in for distinguishes "absent" from "explicitly
+  // null" the same way ensureFaceDetectionForKeepOut's sourceUrl match does
+  // — see that function's own comment in brandScriptExecutor.js).
+  if (update.$unset) {
+    for (const k of Object.keys(update.$unset)) delete doc[k];
+  }
   if (update.$inc) {
     for (const [k, v] of Object.entries(update.$inc)) doc[k] = (doc[k] || 0) + v;
   }

@@ -2585,7 +2585,14 @@ async function renderWithRemotionAndSave({ ad, brand, format, presetOverride = n
 // retitleMode (2026-08-28): pass true for a MANUAL retitle of an
 // already-delivered ad (retitleConsumer.js) so the terminal write preserves
 // the ad's current status instead of forcing 'draft' — see
-// uploadRenderAndStamp's preserveAdStatus header.
+// uploadRenderAndStamp's preserveAdStatus header. Also passed (always true)
+// by adRegenerateService.js's recascadeDerivativeSibling — a background
+// cascade of already-shipped siblings is the same contract as a manual
+// retitle. NOT passed by runVideoFull: an earlier draft of the status-
+// promotion PR set `retitleMode = (priorStatus !== 'failed')` there and
+// was reverted (QC-quarantine / titling-resume / incomplete-branch
+// defects). Regenerating an already-'live' master still unconditionally
+// force-stamps status:'draft' today — a known, unfixed follow-up.
 async function renderBrandScriptAndSave({ ad, brand, presetOverride = null, retitleMode = false }) {
   const engineChoice = resolveTitlingEngine(brand, ad);
   if (engineChoice.engine === 'remotion') {

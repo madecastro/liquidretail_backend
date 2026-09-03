@@ -511,7 +511,7 @@ check('A4 [MONEY] resolvePortraitMasterFormat is DEFINED once and CALLED once',
   const regenSrc = fs.readFileSync(
     path.join(ROOT, 'src/services/adRegenerateService.js'), 'utf8');
   check('I1 [MONEY] regenerate preflight still uses the SHARED gate',
-    /const \{ resolveDeriveFromMaster \} = require\('\.\/campaignAdsGenerationService'\)/
+    /const \{[^}]*resolveDeriveFromMaster[^}]*\} = require\('\.\/campaignAdsGenerationService'\)/
       .test(regenSrc)
       && /resolveDeriveFromMaster\(ad\)/.test(regenSrc));
   check('I2 [MONEY] a shared-plate PMax 9:16 is refused by preflight',
