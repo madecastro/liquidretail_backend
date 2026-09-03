@@ -1285,9 +1285,9 @@ async function buildMetaForAd(ad, brand, opts = {}) {
   // meta.quote` is WRONG: the live binding is a per-slot BIND LIST
   // (titleSpecValidator.DEFAULT_BIND.quote = ['quoteSnippet','quote']),
   // itself resolved per format via titleSpecService.resolveSpec's tier
-  // ladder (ad/product/category/brand titleStyleSpec -> brand.titleStylePreset
-  // -> canonical — tier-1 persisted docs are skipped by default via
-  // TITLE_SPEC_IGNORE_PERSISTED), and the bind list is overridable per slot.
+  // ladder (presetOverride -> ad/product/category/brand titleStyleSpec ->
+  // brand.titleStylePreset -> canonical), and the bind list is overridable
+  // per slot.
   // renderWithRemotionAndSave calls resolveSpec with these SAME inputs
   // moments after this function returns — reproduce that resolution here
   // (not a hardcoded guess) so the compared string is what will really
@@ -2371,13 +2371,11 @@ async function renderWithRemotionAndSave({ ad, brand, format, presetOverride = n
   }
 
   const meta = await buildMetaForAd(ad, brand, { presetOverride: resolvedPreset });
-  // Resolve the spec for RENDER. With TITLE_SPEC_IGNORE_PERSISTED=true
-  // (default), tier-1 persisted titleStyleSpec docs (ad/product/category/
-  // brand) are skipped — only brand.titleStylePreset (curated file) or
-  // canonical apply. Optional `presetOverride` (argument only, never
-  // persisted) wins over brand.titleStylePreset when the named file
-  // validates. Product/category still fetched for cascade completeness
-  // when the flag is flipped off without a code change.
+  // Resolve the spec for RENDER. One cascade, shared with Title Studio:
+  // presetOverride (argument only, never persisted) → persisted
+  // ad/product/category/brand titleStyleSpec → brand.titleStylePreset →
+  // canonical. Product/category are fetched so a per-product or per-
+  // category spec can win when present.
   let productForSpec = null;
   let categories = [];
   if (ad.productId) {
@@ -2390,7 +2388,6 @@ async function renderWithRemotionAndSave({ ad, brand, format, presetOverride = n
       }
     } catch { /* non-fatal — falls back to brand/canonical */ }
   }
-  // No honourPersistedOverrides — render path must not use stored brand specs.
   // SAME resolvedPreset that buildMetaForAd used for the quote gate.
   const { spec, source } = resolveSpec({
     brand, product: productForSpec, ad, format, categories, presetOverride: resolvedPreset,

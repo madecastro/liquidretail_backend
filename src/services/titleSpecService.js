@@ -3,13 +3,14 @@
 //   spec   = WHAT/WHERE/WHEN  (slots, positions, timing, motion, treatments)
 //   tokens = LOOK             (brand colors as hex, resolved font files)
 //
-// Spec resolution per format (render path, TITLE_SPEC_IGNORE_PERSISTED=true
-// by default): brand.titleStylePreset → remotion/presets/<name>.json, else
-// the shipped canonical preset. Persisted titleStyleSpec docs on
-// ad/product/category/brand are IGNORED on render (stale brand specs were
-// shadowing the no-scrim cinema standard). Title Studio authoring passes
-// honourPersistedOverrides:true to still read them. Named curated presets
-// (soludos-*, pelagic-*, babyboo-*) stay live via titleStylePreset.
+// Spec resolution per format — one cascade, Title Studio and render share it:
+//   presetOverride arg → persisted ad/product/category/brand titleStyleSpec
+//   → brand.titleStylePreset → remotion/presets/canonical.json.
+// Persisted titleStyleSpec docs are ALWAYS honoured when valid (plain
+// always-honour). The 2026-08-05 TITLE_SPEC_IGNORE_PERSISTED flag is gone —
+// a 2026-09-03 prod audit found 0 persisted specs across all four tiers, so
+// the stale-spec population that flag guarded is empty. Named curated
+// presets (soludos-*, pelagic-*, babyboo-*) stay live via titleStylePreset.
 
 'use strict';
 
@@ -101,19 +102,6 @@ function clearPresetCache() {
 }
 
 /**
- * When true (default), the render path ignores persisted titleStyleSpec
- * override documents (ad/product/category/brand). Named presets
- * (`brand.titleStylePreset` → remotion/presets/<name>.json) and the
- * canonical floor still apply. Owner 2026-08-05: stale brand specs were
- * permanently shadowing the no-scrim cinema standard. Flip to false via
- * env (or pass honourPersistedOverrides:true for Title Studio authoring)
- * to restore the old override cascade without a deploy.
- */
-function ignoresPersistedTitleSpecs() {
-  return String(process.env.TITLE_SPEC_IGNORE_PERSISTED ?? 'true').toLowerCase() !== 'false';
-}
-
-/**
  * Resolve the normalized spec for a scope + format. Cascade, most-specific
  * wins, WHOLE per-format spec (not slot-merged — each override tier is a
  * complete, self-validated per-format spec that the scope-parameterized
@@ -129,14 +117,11 @@ function ignoresPersistedTitleSpecs() {
  *
  * TIER 0 (`presetOverride`) is a render-time ARGUMENT only — never written
  * to Brand/Ad/Product. A valid named file in remotion/presets/ wins over
- * every other tier (including brand.titleStylePreset). Invalid/missing
- * names log a warning and fall through to the normal ladder.
+ * every other tier (including a persisted brand.titleStyleSpec). Invalid/
+ * missing names log a warning and fall through to the normal ladder.
  *
- * TIER 1 is SKIPPED when ignoresPersistedTitleSpecs() is true (the default)
- * unless `honourPersistedOverrides: true` is passed — Title Studio
- * authoring/preview uses that so operators can still see/edit stored
- * specs. The live render path does NOT pass it. Stored docs stay on disk;
- * this is a read-path change only.
+ * TIER 1 is ALWAYS honoured when the per-format doc validates. Title Studio
+ * and the render path share this cascade — there is no ignore flag.
  *
  * An invalid override validates+warns+falls through, never throws (only a
  * broken canonical throws — a deploy bug). Returns { spec, source } where
@@ -152,11 +137,8 @@ function resolveSpec({
   ad = null,
   format,
   categories = [],
-  honourPersistedOverrides = false,
   presetOverride = null,
 } = {}) {
-  const ignorePersisted = !honourPersistedOverrides && ignoresPersistedTitleSpecs();
-
   // 0. explicit named-preset override (argument only — never persisted).
   // Wins over brand.titleStylePreset and tier-1 docs when valid.
   if (presetOverride != null && String(presetOverride).trim() !== '') {
@@ -178,7 +160,7 @@ function resolveSpec({
     }
   }
 
-  // 1. override documents, most-specific first
+  // 1. override documents, most-specific first. First valid doc wins.
   const overrideTiers = [
     ['ad',      ad?.titleStyleSpec],
     ['product', product?.titleStyleSpec],
@@ -188,25 +170,17 @@ function resolveSpec({
     ])),
     ['brand',   brand?.titleStyleSpec],
   ];
-  // When ignoring, remember the most-specific valid tier that WOULD have
-  // won so we can log it after resolving the real source. Silence here is
-  // what let stale brand specs hide for weeks.
-  let ignoredTier = null;
   for (const [tier, doc] of overrideTiers) {
     if (doc && typeof doc === 'object' && doc[format]) {
       const res = validateTitleSpec(doc[format], { format });
       if (res.ok) {
-        if (!ignorePersisted) return { spec: res.normalized, source: tier };
-        if (!ignoredTier) ignoredTier = tier;
-        // Keep scanning only long enough to find the winner for the log;
-        // lower tiers cannot win over this one.
-        break;
+        return { spec: res.normalized, source: tier };
       }
       console.warn(`🎬 titleSpec: ${tier} override has invalid ${format} spec (${res.errors[0]}) — falling through`);
     }
   }
 
-  // 2. pinned named preset (brand-level) — ALWAYS honoured (curated files)
+  // 2. pinned named preset (brand-level) — curated files on disk
   const presetName = brand?.titleStylePreset;
   if (presetName) {
     const preset = loadPresetFile(presetName);
@@ -214,11 +188,6 @@ function resolveSpec({
     if (spec) {
       const res = validateTitleSpec(spec, { format });
       if (res.ok) {
-        if (ignoredTier) {
-          console.log(
-            `🎬 titleSpec: ignoring persisted ${ignoredTier} override (brand-specific specs disabled) -> using preset:${presetName}`
-          );
-        }
         return { spec: res.normalized, source: `preset:${presetName}` };
       }
       console.warn(`🎬 titleSpec: preset '${presetName}' invalid for ${format} (${res.errors[0]}) — falling back to canonical`);
@@ -233,22 +202,15 @@ function resolveSpec({
   if (!spec) throw new Error(`canonical preset missing for format '${format}' (remotion/presets/canonical.json)`);
   const res = validateTitleSpec(spec, { format });
   if (!res.ok) throw new Error(`canonical preset invalid for '${format}': ${res.errors.join('; ')}`);
-  if (ignoredTier) {
-    console.log(
-      `🎬 titleSpec: ignoring persisted ${ignoredTier} override (brand-specific specs disabled) -> using canonical`
-    );
-  }
   return { spec: res.normalized, source: 'canonical' };
 }
 
 /**
- * Brand-only convenience wrapper.
+ * Brand-only convenience wrapper. Same cascade as resolveSpec — a stored
+ * brand.titleStyleSpec wins when valid.
  * @param {object} brand
  * @param {string} format
- * @param {{ honourPersistedOverrides?: boolean }} [opts]
- *   Pass honourPersistedOverrides:true for Title Studio authoring so a
- *   stored brand.titleStyleSpec is still readable for edit/preview.
- *   Production render uses resolveSpec() without that flag.
+ * @param {{ presetOverride?: string }} [opts]
  */
 function resolveSpecForBrand(brand, format, opts = {}) {
   return resolveSpec({ brand, format, ...opts });
@@ -388,7 +350,6 @@ module.exports = {
   hydrateAllSlotKeys,
   loadPresetFile,
   clearPresetCache,
-  ignoresPersistedTitleSpecs,
   PRESET_DIR,
   CANONICAL_PRESET,
 };

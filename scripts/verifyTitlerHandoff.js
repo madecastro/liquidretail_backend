@@ -48,7 +48,7 @@ check('A2 isTitlerEnabled reads ADGEN_TITLER_ENABLED with strict "true"',
 check('A3 config exports isTitlerEnabled',
   /module\.exports\s*=\s*Object\.freeze\(\{[^}]*isTitlerEnabled[^}]*\}\)/s.test(config));
 const defaultsEnv = fs.readFileSync(path.join(REPO, 'config', 'defaults.env'), 'utf8');
-check('A4 defaults.env commits ADGEN_TITLER_ENABLED=false',
+check('A4 defaults.env commits ADGEN_TITLER_ENABLED=false (local / api / orchestrator fallback; production is render.yaml)',
   /(^|\r?\n)ADGEN_TITLER_ENABLED=false(\r?\n|$)/.test(defaultsEnv));
 
 // B. Ad schema declaration.
@@ -174,8 +174,13 @@ check('G2 render.yaml titler runs on an 8GB plan (pro_plus)',
   'Chrome needs the RAM — Standard OOMs. Renamed from standard_plus 2026-08-24 (blueprint sync rejected the old name).');
 check('G3 render.yaml titler sets ADGEN_ROLE=titler',
   /name:\s*adgen-titler[\s\S]{0,1600}?ADGEN_ROLE[\s\S]{0,40}?titler/.test(renderYaml));
-check('G4 render.yaml titler ships with flag off (safe first deploy)',
-  /name:\s*adgen-titler[\s\S]{0,2000}?ADGEN_TITLER_ENABLED[\s\S]{0,40}?["']false["']/.test(renderYaml));
+check('G4 render.yaml titler ships ADGEN_TITLER_ENABLED=true (production; live since 2026-08-26)',
+  /name:\s*adgen-titler[\s\S]{0,2500}?ADGEN_TITLER_ENABLED[\s\S]{0,80}?["']true["']/.test(renderYaml));
+check('G5 render.yaml renderer also ships ADGEN_TITLER_ENABLED=true (dashboard had it on both; renderer must stamp titlingNeeded)',
+  /name:\s*adgen-renderer[\s\S]{0,2500}?ADGEN_TITLER_ENABLED[\s\S]{0,80}?["']true["']/.test(renderYaml));
+check('G6 render.yaml renderer + titler ship ADGEN_RENDERER_ENABLED=true',
+  /name:\s*adgen-renderer[\s\S]{0,2500}?ADGEN_RENDERER_ENABLED[\s\S]{0,80}?["']true["']/.test(renderYaml) &&
+  /name:\s*adgen-titler[\s\S]{0,2500}?ADGEN_RENDERER_ENABLED[\s\S]{0,80}?["']true["']/.test(renderYaml));
 
 // ── report
 console.log(`\nverifyTitlerHandoff: ${passes.length} pass, ${failures.length} fail`);
@@ -184,4 +189,4 @@ if (failures.length) {
   for (const f of failures) console.log('  ✗ ' + f);
   process.exit(1);
 }
-console.log('  ✓ Phase 3 handoff wired end-to-end — ready for env-var switchover');
+console.log('  ✓ Phase 3 handoff wired end-to-end — titler live in production');

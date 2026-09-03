@@ -230,9 +230,19 @@ async function resumeUntitledMasters({ limit = TITLING_RESUME_MAX } = {}) {
       }
       noteResumeFeed(adFresh, 'titling resume: claimed stuck ad');
 
-      // Resolve brand the same way routes/ads.js:1328-1331 does — via the ad's
-      // source Media brandId. Projection is load-bearing for the proof beat
-      // (brandReviews); keep the list in sync with routes/ads.js:1330.
+      // NOTE (2026-09-03): backend's in-process titling was deleted entirely
+      // in backend PR #360 (`abf7e0c2`, 2026-08-28) — `routes/ads.js` no
+      // longer resolves a brand or calls `renderBrandScriptAndSave` at all;
+      // every video master ships untitled from backend and this file is now
+      // the SOLE titling implementation for both repos. The `routes/ads.js`
+      // line references below this point (this function used to be kept in
+      // parity with a twin that lived there) are historical-parity notes
+      // only, describing the design this logic was originally modeled on —
+      // not a live sync obligation, and not resolvable against current
+      // backend source.
+      //
+      // Resolve brand via the ad's source Media brandId. Projection is
+      // load-bearing for the proof beat (brandReviews).
       const sourceMedia = await Media.findById(adFresh.mediaId)
         .select('fileType fileUrl brandId').lean();
       const brand = sourceMedia?.brandId
@@ -254,18 +264,18 @@ async function resumeUntitledMasters({ limit = TITLING_RESUME_MAX } = {}) {
           > BRAND_GIVEUP_MIN * 60 * 1000;
         if (tooOld) {
           // Past the window the brand is treated as genuinely absent, and then we
-          // MIRROR THE NORMAL PATH rather than invent a harsher outcome:
-          // routes/ads.js wraps titling in `if (brandDoc)` and its else-branch
-          // promotes the ad to draft and counts it a SUCCESS — with no
-          // brand there is no chrome to composite, so the raw master IS the
-          // deliverable. Marking it 'failed' here would write off a perfectly good
-          // paid ad for a condition the normal path ships happily, and would make
-          // the same ad's outcome depend on which code path titled it.
+          // promote the ad to draft and count it a SUCCESS rather than invent a
+          // harsher outcome — with no brand there is no chrome to composite, so
+          // the raw master IS the deliverable. Marking it 'failed' here would
+          // write off a perfectly good paid ad for a condition this file ships
+          // happily everywhere else. (Historical parity note: this mirrored
+          // `routes/ads.js`'s own no-brand branch when that code still existed;
+          // backend's in-process titling was deleted in PR #360 — see the note
+          // above the brand lookup, further up this function.)
           //
-          // Mirror that path's vision QC too, not just its "ship anyway"
-          // verdict — this branch never reaches renderBrandScriptAndSave, so
-          // without this the ad would ship with NO Ad.visionQc at all (same
-          // gap the routes/ads.js no-brand branches had). Lazy require —
+          // Vision QC still runs here too, not just on the titled arm — this
+          // branch never reaches renderBrandScriptAndSave, so without this the
+          // ad would ship with NO Ad.visionQc at all. Lazy require —
           // same reason as the one a few lines below (worker.js must not pay
           // the remotion/ffmpeg load at boot for a constant).
           const { qcAndStampVideoAd } = require('./brandScriptExecutor');
@@ -300,7 +310,7 @@ async function resumeUntitledMasters({ limit = TITLING_RESUME_MAX } = {}) {
           noteResumeFeed(adFresh, 'titling resume: done (no brand — shipping master)');
           console.warn(
             `   ⚠️  titlingResume[${ad._id}]: brand unresolvable for >${BRAND_GIVEUP_MIN}m — ` +
-            `shipping the untitled master (matches routes/ads.js no-brand behaviour)`
+            `shipping the untitled master`
           );
           continue;
         }
@@ -319,7 +329,8 @@ async function resumeUntitledMasters({ limit = TITLING_RESUME_MAX } = {}) {
         continue;
       }
 
-      // Lazy require — same call site pattern as routes/ads.js:1471.
+      // Lazy require — worker.js must not pay the remotion/ffmpeg load at
+      // boot for a constant.
       const { renderBrandScriptAndSave } = require('./brandScriptExecutor');
       //
       // ONLY A RENDER FAILURE IS TERMINAL. Everything above this line is DB reads
@@ -425,8 +436,7 @@ async function resumeUntitledMasters({ limit = TITLING_RESUME_MAX } = {}) {
       // BY DESIGN, and only for a real render failure: clear the state so a
       // permanently failing ad is retried once and then stops instead of
       // looping forever on a CPU-heavy Remotion render. The paid master
-      // stays on renderUrl and is never deleted. Mirror routes/ads.js:1490-1504
-      // exactly.
+      // stays on renderUrl and is never deleted.
       try {
         const msg = (err && err.message) ? String(err.message) : String(err);
         const tmsg = `master rendered; titling failed: ${msg}`;

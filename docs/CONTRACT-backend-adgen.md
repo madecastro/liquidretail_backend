@@ -154,16 +154,17 @@ off branch as defence in depth, even though `poll()` already checked
 
 | Source | Value |
 |---|---|
-| `backend/config/defaults.env:1166` | `ADGEN_RENDERER_ENABLED=false` |
-| `adgen/config/defaults.env:1348` | `ADGEN_RENDERER_ENABLED=false` |
+| `backend/config/defaults.env` | `ADGEN_RENDERER_ENABLED=true` |
+| `adgen/config/defaults.env` | `ADGEN_RENDERER_ENABLED=true` |
 | `backend/render.yaml` | **file does not exist** |
 | `adgen/render.yaml` | flag **not declared** |
 | SystemConfig (either repo) | **no override path exists** — checked `models/SystemConfig.js` and `services/systemConfigService.js` in both trees. Unlike the vision-QC flags, this one is env-only. |
 
-**So `config/defaults.env` ships `false` in both repos while production runs
-`true` via a Render dashboard override — both branches are live code.** The
-`true` branch is the entire handoff; the `false` branch is backend's
-in-process renderer, which is still present and still works.
+**So `config/defaults.env` ships `true` in both repos, matching production.**
+The `false` branch is backend's in-process renderer, which is still present
+and still works as the fallback when the flag is not the string `'true'`.
+Dashboard copies of this key are now redundant duplicates of the committed
+file.
 
 `dotenv` is called **without** `override: true` (`adgen/src/config.js:12-13`),
 so a dashboard/process env value always wins over `defaults.env`. The
@@ -175,13 +176,19 @@ committed `false` is a floor, not the effective value.
 
 ### What each read site switches
 
-**Backend** — three production readers:
+**Backend** — two production readers. ⚠️ **A third row used to sit here for
+`backend/services/titlingResumeService.js:141` — that file was deleted
+2026-08-28 in backend `abf7e0c2` (#360, "remove(titling): delete backend's
+in-process titling function (MONEY)"), along with its wiring in
+`backend/index.js`. Backend no longer titles video in-process at all, flag on
+or off — it only ever ships an untitled master and adgen's own
+`adgen/src/services/titlingResumeService.js` is the sole resume path.
+Corrected 2026-09-03; do not re-add this row.**
 
 | Site | Flag on | Flag off |
 |---|---|---|
 | `backend/routes/ads.js:1861-1870` (`runRenderLoop`) | Flip `CampaignRun` `preparing→running`, log, **return**. Adgen claims. | Render in-process. `claimedByWorker` stays `null` throughout. |
 | `backend/services/adRegenerateService.js:625` (`regenerateAd`, via `shouldDeferToAdgen()` at `:476`) | Win the `regenerating` lock, stamp `regenerationRequest`, **return**. | Win the same lock, **null** the three regenerate fields, execute locally. |
-| `backend/services/titlingResumeService.js:141` (`resumeUntitledMasters`) | Return immediately, no query. | Title recovered masters in the web process. |
 
 **Adgen** — every production read site, all call-time. (Deliberately not
 prefaced with a count: this repo's own `runVerifySuite.js` header documents
@@ -877,9 +884,15 @@ purpose. They are the least obvious part of the contract.
 | Backend reaper | `backend/worker.js` | **No.** Skips rows with `claimedByWorker` set. | receipt-free `rendering` → `queued` (`worker.js:399`) | `REAP_STALE_MIN` 15 |
 | Backend boot recovery | `backend/worker.js:222-224` | **No — ungated.** | `rendering` + receipt + stale → `draft`/`failed` | `RESUME_STALE_MIN` 5 |
 | Adgen boot recovery | `adgen/src/services/renderer.js:1977` | **Yes** — stands down when off | same | same |
-| Backend titling resume | `backend/index.js:404-417` — interval **ungated**; gate is inside the function at `titlingResumeService.js:141` | effectively yes | titles recovered masters; CAS on `titlingResumeState` | interval 5 min |
-| Adgen titling resume | `adgen/src/services/renderer.js:2022` | **Yes** | same | same |
+| Adgen titling resume | `adgen/src/services/renderer.js:2022` | **Yes** | titles recovered masters; CAS on `titlingResumeState` | interval 5 min |
 | Adgen regenerate consumer | `adgen/src/services/renderer.js` | **Yes** | regenerate claim | poll 2s |
+
+⚠️ **There is no "Backend titling resume" row any more.** `backend/index.js`'s
+90s-delay interval and `backend/services/titlingResumeService.js` (the whole
+file) were both deleted 2026-08-28, backend #360 (`abf7e0c2`) — see the note
+above §4's flag-read table for the same removal. Titling resume is now
+adgen-only, unconditionally (backend ships every video master untitled).
+Corrected 2026-09-03.
 
 Two consequences that follow from the table and are not obvious:
 
@@ -1015,12 +1028,10 @@ stuck row with no owner.
 and `veoVideoUrl ≠ null`, and it can claim a **`draft`** row, which the renderer
 never does.
 
-`ADGEN_TITLER_ENABLED` is committed `"false"` (`adgen/render.yaml:107-108`,
-`adgen/config/defaults.env:1360`). **That is the same class of evidence this
-document refuses to treat as production truth for `ADGEN_RENDERER_ENABLED`
-(§9.1)**, so "currently dark" is not claimed here either — the committed value
-is false and the live dashboard value was not read. It is a live coupling
-surface on the same lease field the moment that flag is on.
+`ADGEN_TITLER_ENABLED` is committed `"true"` on both `adgen-renderer` and
+`adgen-titler` in `adgen/render.yaml` (live since 2026-08-26).
+`adgen/config/defaults.env` ships `false` as the local / api / orchestrator
+fallback so a renderer without render.yaml still titles in-process.
 
 ---
 
@@ -1170,8 +1181,8 @@ Stated as unknown rather than guessed.
 
    | Claim | Rests on | Strength |
    |---|---|---|
-   | `ADGEN_RENDERER_ENABLED=true` in prod | `backend/README.md`, and adgen `CLAUDE.md` ("Production sets the dashboard override to `true`") | Prose in two repos. Not code, not a dashboard read. |
-   | `ADGEN_TITLER_ENABLED=true` in prod | the commit message of adgen #75 (`c02c7ff`), which states it as a production fact while fixing a live defect | An owner-authored commit message. Stronger than a peer report, still an assertion. **Note this directly contradicts the committed `"false"` in `render.yaml:107-108` and `defaults.env:1360`** — the committed value is a floor, not the effective value. |
+   | `ADGEN_RENDERER_ENABLED=true` in prod | committed `defaults.env` in both repos (aligned 2026-09-03) plus live dashboard | Code-visible. Dashboard copy is a redundant duplicate. |
+   | `ADGEN_TITLER_ENABLED=true` in prod | `adgen/render.yaml` renderer + titler both `"true"` (aligned 2026-09-03) plus live dashboard | Code-visible. Dashboard copies are redundant duplicates of render.yaml. |
    | `VIDEO_PROVIDER=atlas` in prod | committed `defaults.env:394` **and** the code default at `videoRouter.js:29` | Strongest of the four — two independent code-visible sources. Still overridable. |
 
    **Every "both paths are live" statement in this document rests on the first

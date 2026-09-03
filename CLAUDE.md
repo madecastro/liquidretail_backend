@@ -58,10 +58,11 @@ repos:
   claim). When it **is** `'true'`, this process atomically claims ads and
   does the Atlas / Remotion / Cloudinary work.
 
-Committed default in `config/defaults.env` is `ADGEN_RENDERER_ENABLED=false`
-(file comment: flip only when the service is deployed). Production sets the
-dashboard override to `true`. A boot without that override will not steal
-work from the backend's in-process `runRenderLoop`.
+Committed default in `config/defaults.env` is `ADGEN_RENDERER_ENABLED=true`
+— adgen owns rendering in production (matches the live dashboard). Parser
+fail-safe is still OFF when unset (`=== 'true'` only). A boot that does
+not load this file and does not set the flag will not steal work from
+backend's in-process `runRenderLoop`.
 
 There is **no** `ADGEN_SERVICE_ENABLED` / `ADGEN_ORCHESTRATOR_ENABLED` in
 this tree. Those names appear only in the stale Phase 0 README; do not
@@ -95,7 +96,7 @@ Mongo → start the matching role → install SIGTERM/SIGINT.
 | `api` | `adgen-api` (web, starter, `:3100/health`) | Express app with **only** `GET /health`. 200 if mongoose `readyState === 1`, else 503. No inspect endpoints, no generate API. |
 | `orchestrator` | `adgen-orchestrator` (worker, starter, singleton) | Polls `CampaignRun.countDocuments({ status: 'preparing' })` and logs. **No writes, no lease, no expansion**. Phase 2 is still a comment. |
 | `renderer` | `adgen-renderer` (worker, autoscale) | The live path. `renderer.run()` → `poll()` burst-claims up to `ADGEN_MAX_INFLIGHT` ads and fires `processAd` as unawaited promises. |
-| `titler` | `adgen-titler` (worker, autoscale, PHASE 3) | Out-of-process Remotion titling — polls for `{status:'rendering', veoVideoUrl:{$ne:null}, titlingNeeded:true, claimedByWorker:null}` when `ADGEN_TITLER_ENABLED=true`. Ships dark by default. |
+| `titler` | `adgen-titler` (worker, autoscale) | Out-of-process Remotion titling — polls for `{status:'rendering', veoVideoUrl:{$ne:null}, titlingNeeded:true, claimedByWorker:null}` when `ADGEN_TITLER_ENABLED=true`. Live in production (`render.yaml` ships `"true"` on renderer and titler). |
 
 Worker identity: `ADGEN_WORKER_ID` or auto `${ROLE}-${random}`. Stamped onto
 `Ad.claimedByWorker`.
@@ -119,7 +120,9 @@ are not resurrected to `draft`. The titler NEVER calls Atlas.
 **Rollback path.** Flip `ADGEN_TITLER_ENABLED=false` and the renderer
 titles in-process again — the renderer's Remotion path was NOT deleted
 (Phase 4 is when that goes away, after the switchover is proven stable).
-Both paths coexist; the flag chooses. `config/defaults.env` ships `false`.
+Both paths coexist; the flag chooses. `render.yaml` ships `"true"` on
+renderer and titler (production). `config/defaults.env` ships `false` as
+the local / api / orchestrator fallback.
 
 **Duplication.** `titler.js` duplicates several helpers from `renderer.js`
 (`startAdHeartbeat`, `bumpRunCounter`, `maybeFinalizeRun`,
@@ -394,7 +397,7 @@ Two layers:
 |---|---|---|---|
 | `ADGEN_MAX_INFLIGHT` | `src/config.js:58`, `render.yaml` renderer env `32` | 32 | Burst-claim ceiling per renderer instance (`poll` while `inFlight < MAX_INFLIGHT`). I/O-bound statics+video polls. |
 | `ADGEN_POLL_MS` | `src/config.js:68` | 500 | Claim poll interval (ms). |
-| `ADGEN_RENDERER_ENABLED` | `src/config.js:37-39`, `config/defaults.env` | `false` in file | Sleep vs claim. |
+| `ADGEN_RENDERER_ENABLED` | `src/config.js:37-39`, `config/defaults.env` | `true` in file | Sleep vs claim. |
 | `DERIVE_MASTER_WAIT_MS` | `renderer.js:106` | 60000 | How long a derive holds a slot waiting for the sibling master. |
 | `DERIVE_MASTER_POLL_MS` | `renderer.js:107` | 5000 | Poll interval inside that wait. |
 | `MAX_DERIVE_WAIT_ATTEMPTS` | `renderer.js:108` | 60 | Requeue ceiling (~60 min). |
@@ -748,18 +751,22 @@ revert-proven). Full write-up: `session.d/2026-08-27_reframe-hold-bounded.md`.
   `startRunHeartbeat`/`bumpRunCounter` above). See
   `scripts/verifyTitlingRecoverability.js` and
   `scripts/verifyTitlingResumeNeverResubmits.js`.
-  **KNOWN, NOT FIXED HERE (cross-repo):** `liquidretail_backend`'s OWN
-  `titlingResumeService` runs on its web process **ungated** on
-  `ADGEN_RENDERER_ENABLED` (confirmed absent from
-  `liquidretail_backend/index.js`'s wiring) and has no
-  `stampTitlingFailureAndThrow`/`titlingResumable` concept at all — if
-  backend's sweep wins the claim race on a resumable ad before adgen's
-  does, its Remotion failure immediately terminal-fails the ad
-  (`status:'failed'`) on the FIRST retry, undoing this fix's whole point
-  for that one ad. This pre-existed for the OOM-only case; this PR widens
-  which failures are exposed to it. The atomic claim still prevents a
-  double-title either way. Fixing it requires a change to the backend
-  repo — out of scope here, flagged for a follow-up.
+  **RESOLVED — SUPERSEDED, not by the gate this bullet asked for
+  (2026-09-03).** This used to flag a real cross-repo race:
+  `liquidretail_backend`'s own `titlingResumeService` ran on its web
+  process ungated on `ADGEN_RENDERER_ENABLED`, with no
+  `stampTitlingFailureAndThrow`/`titlingResumable` concept, so a claim race
+  it won could terminal-fail a resumable ad on the first retry. The
+  follow-up flagged here never landed as a narrower gate — instead
+  `liquidretail_backend` PR #360 (`abf7e0c2`, 2026-08-28, "remove(titling):
+  delete backend's in-process titling function (MONEY)") deleted
+  `services/titlingResumeService.js` and its `index.js` wiring entirely.
+  Backend no longer titles video in-process at all, so the race described
+  here cannot occur — there is nothing left on that side to race against.
+  This repo's `src/services/titlingResumeService.js` is now the sole
+  titling-resume path, unconditionally. Full removal is a strictly stronger
+  fix than the gate this bullet was asking for; do not re-open this as
+  outstanding work.
   **`bootRecoveryService` is WIRED as of 2026-08-26** — closes the
   273-minute-tail defect measured on run_1787699482964, where a stuck
   master claim (`renderer-7364c5b1` died holding cb7a91) blocked

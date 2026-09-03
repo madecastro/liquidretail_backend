@@ -5,8 +5,8 @@
 // directory's package.json declares "type":"module").
 //
 // WHY THIS EXISTS — see models/CatalogProduct.js's price unit-contract
-// comment and services/shopifyAccessResolver.js's verifyStoreCurrencyUsd for
-// the full incident writeup (Pelagic Gear catalog products carried a
+// comment and backend/services/shopifyAccessResolver.js's verifyStoreCurrencyUsd
+// for the full incident writeup (Pelagic Gear catalog products carried a
 // mislabeled foreign-currency number under CatalogProduct.price). Every
 // ingestion path + cascade tier feeding PriceSlot is documented to hand it a
 // USD-major-units number (150 means $150.00). This function is the LAST

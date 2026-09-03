@@ -1,8 +1,8 @@
 {
   "version": 2,
   "backendRef": "origin/main",
-  "backendHead": "b4eb6435c7d9717aaafe191c28d5bdf8b22a2691",
-  "generatedAt": "2026-09-03T14:26:44.377Z",
+  "backendHead": "81b93a3e0dd7d1e0cb332a03e48bf4b4bd12d7e2",
+  "generatedAt": "2026-09-03T16:37:36.286Z",
   "files": {
     "models/Ad.js": {
       "backendHash": "394d26a1cb8ad64b23bde73312f3473f332520dd9640b9d5e4bb8eec22d6138d",
@@ -272,11 +272,10 @@
     },
     "remotion/Root.jsx": {
       "backendHash": "86dcd8256972d71331dab7d2ba73b17ceeb2578a2a1f27d6f9d287611f411e51",
-      "adgenHash": "86dcd8256972d71331dab7d2ba73b17ceeb2578a2a1f27d6f9d287611f411e51",
+      "adgenHash": "f709596c388158f1fb6fca019f66ad278dd6887aef1f09705eae4bda679c9de1",
       "backendSha": "31512f0e17203820391993c98fbfe8a61024d079",
-      "status": "synced",
-      "portTo": null,
-      "owedSince": null
+      "status": "fork",
+      "reason": "2026-09-03: 15f39d8 fixed a stale citation from SPEC_FORMAT_ALIAS (never existed) to the real SIZE_FORMAT_ALIAS, and cited adgen's own src/remotion/components/slotRenderers.jsx (where that constant actually lives here) instead of backend's brandScriptExecutor.js. Comment-only, legitimately adgen-local since the two repos' constant lives in different files."
     },
     "remotion/components/BasePlate.jsx": {
       "backendHash": "3ffa4ecaf488c8d560d87659da8384e660120f7a41f18a34ad1b2bee03847e92",
@@ -305,10 +304,10 @@
     },
     "remotion/compositions/Canonical.jsx": {
       "backendHash": "5d651e994a55f2e0122f60ea0a78a631c77ce91adfdf878c8b8a0b79435978ef",
-      "adgenHash": "1ed03acb6083629a35c0451f0c1c82f86cdc1db53e5fab0515a5ec861b888865",
+      "adgenHash": "27ae7d595f21809652e9e696d7d25060ca81011ead1402ca03585039a90d8d88",
       "backendSha": "119b668472c4dffbdb63c3d3dc588a16b9573103",
       "status": "unported",
-      "reason": "PR #98 follow-up hotfix: containerStrokeBleedGuard fixes a second, outer overflow:hidden clip boundary (stackContainerStyle's group container) that strokeClipGuard's inner fix did not cover — align:left/right slots on non-center anchors were silently clipping the new contour stroke's outward bleed. Backend renders the same Canonical.jsx through its title-still preview path and needs the same fix.",
+      "reason": "Pre-existing debt UNCHANGED since 2026-08-31: containerStrokeBleedGuard (PR #98 outer-clip fix) is still absent from backend's copy -- confirmed absent from origin/main 2026-09-03. ADDITIONALLY today: itemLayout/itemGap/maxItems/itemStyle wired into estCtx here (facf48d+15f39d8, benefits-to-directors Part B/D) -- backend's own PR #383 carries the matching wiring in its still-uncommitted worktree diff, not yet on origin/main, so from adgen's CI vantage this also reads as owed-to-backend until that PR merges.",
       "portTo": "backend",
       "owedSince": "2026-08-31T23:20:03.277Z"
     },
@@ -330,11 +329,10 @@
     },
     "remotion/lib/priceFormat.js": {
       "backendHash": "0010c580df02ab7114c7c0665c80938180b08904412dd764a4e4a5a32fd8ca77",
-      "adgenHash": "0010c580df02ab7114c7c0665c80938180b08904412dd764a4e4a5a32fd8ca77",
+      "adgenHash": "3f66f84618c6175de506719e4da07340528f65668126e93e91ab9ea3ef03316b",
       "backendSha": "616d4c28c562d96145ab56547455f2a281789756",
-      "status": "synced",
-      "portTo": null,
-      "owedSince": null
+      "status": "fork",
+      "reason": "2026-09-03: comment-only fix — a citation of services/shopifyAccessResolver.js needed a backend/ prefix since that file is backend-only and adgen has no local copy. The prefix is meaningful only from adgen's side (backend's own copy references itself with no prefix), so this is legitimately adgen-local text even though the underlying file is otherwise synced."
     },
     "remotion/lib/ratingMotion.js": {
       "backendHash": "b5229a6a763ac59fcb917c07e589586431e7a30bf872b73bdf56b2ae28116f42",
@@ -363,11 +361,10 @@
     },
     "remotion/lib/stackFit.js": {
       "backendHash": "58d4e06f109f85aabdd7575aa0f8a2d23d33f70162e6235f2f022bbbc0eb493a",
-      "adgenHash": "58d4e06f109f85aabdd7575aa0f8a2d23d33f70162e6235f2f022bbbc0eb493a",
+      "adgenHash": "9a747dfd9cdda3cd13218f299c60d39ae63c97b782124f774ff3ea1d47cb9ce4",
       "backendSha": "e4d7102df64c5617110e0df9bdcaf9bb7dba4198",
-      "status": "synced",
-      "portTo": null,
-      "owedSince": null
+      "status": "fork",
+      "reason": "2026-09-03: ported backend's grid+bullet-width height fix (stack was already fixed; grid capped wrapped lines at maxLines, a webkit-line-clamp concept renderMultiValue never applies — 1.92x under-estimate measured). Byte-identical to backend, re-verified after port."
     },
     "remotion/lib/timing.js": {
       "backendHash": "0cabab5ca97492b2c1a5d648c54ac5fe651a1d8b64ddd89102b31e10301690c1",
@@ -666,11 +663,11 @@
       "owedSince": null
     },
     "services/adVisionQcService.js": {
-      "backendHash": "bdd77df5c81c246458d5e3c5b51c1ff15c84a9d3ceb2221cf41b296a5cd31eef",
-      "adgenHash": "b93a691b260bca465461bd2c3e779daa99598b71dbd96dac1ff514492775bf12",
-      "backendSha": "be8ea6b53f544ec5a07f1f5d859805cd42eb38a6",
+      "backendHash": "0458e60a40b7ef253e7e933efd13b041e3535f10bd9251e31ea227e9d3bcb9b0",
+      "adgenHash": "4f3f44ad8ed952a044ab33cce3332253a848f4140b6553dc68af39092ff7ec82",
+      "backendSha": "2b58cf31766b6ecf9fde711770c87dc2174cbd29",
       "status": "fork",
-      "reason": "Fork carries the same #329 campaignRunId residual + env-var fallback removal as before. NEW as of 2026-09-02: multi-reference video QC (backend-side commit staged for same day) — buildVideoVisionUserContent + judgeVideoRender + runVideoPostRenderQc accept originalProductUrls[] array (backward compat with single originalProductUrl). Prompt updated: M=1 keeps the legacy 'ORIGINAL PRODUCT PHOTO' semantics with a renamed 'ORIGINAL PRODUCT REFERENCE' label; M>1 adds a LEGITIMATE VARIATION allowance so a reversible garment / multi-colorway SKU / on-model+packshot ref stack does not trip product_fidelity or competitor_marks against variation the references support. Byte-identical to backend for the new branch; adgen residual (isStaticEnabled/isVideoEnabled pipeline gates) unchanged."
+      "reason": "Fork carries the same #329 campaignRunId residual + env-var fallback removal as before. Multi-reference video QC (buildVideoVisionUserContent + judgeVideoRender + runVideoPostRenderQc accept originalProductUrls[]) is byte-identical to backend for that branch; adgen residual (isStaticEnabled/isVideoEnabled pipeline gates) unchanged. Re-attested 2026-09-03 during benefits-to-directors vendor-drift reconciliation -- no new divergence found beyond what was already recorded."
     },
     "services/adgenBridge.js": {
       "backendHash": "49ac3bb8c5a63a35d538e9cbd798bd1af1789ef9f121770b8e2d25659efd6496",
@@ -887,7 +884,7 @@
     },
     "services/brandScriptExecutor.js": {
       "backendHash": "2aae3041e3c3c3e7f554f1135879f6f2005a17e8a371d9dea52cec58911bd4c4",
-      "adgenHash": "15c7045b2965a9f34bc2ecac16832a073044a949688621f38aa7ae137a51ba54",
+      "adgenHash": "af9dd873705357969ca8ec3bce4852ed2922442f8714df931aba6652d70b15ba",
       "backendSha": "2b58cf31766b6ecf9fde711770c87dc2174cbd29",
       "status": "unported",
       "reason": "2026-09-03: adgen-ONLY doc-comment update on renderBrandScriptAndSave's retitleMode header -- runVideoFull no longer passes retitleMode (that expansion was reverted); recascadeDerivativeSibling still always-true. No functional change to this file. Pre-existing debt UNCHANGED: backend's manual retitle path still lacks stampTitlingFailureAndThrow/TITLING_ATTEMPTS_MAX. owedSince carries forward for the titling-attempts gap only.",
@@ -1518,11 +1515,13 @@
       "reason": "2026-09-03 packshot-protected ranking + faceVisible consumer + remove-by-index fix. PORTED to backend in PR #382 (services/referenceDefaultsService.js); both copies execute identically over the same inputs, verified by running orderByPackshotProtectedRanking in both repos over 8 shapes incl. duplicate-object. Not a fork."
     },
     "services/reframeStrategyChooser.js": {
-      "backendHash": "693141d99726dbfeaf512bb38af68515a30116a25af3df87c779faafdb460398",
-      "adgenHash": "7dc0388eccd5abbf907b9ec452c3a4bd3ac7a83102f2d573001a8bae540b16a3",
-      "backendSha": "da22486fe91d99e1ab90a7c654744faba175da12",
-      "status": "fork",
-      "reason": "Sync backend da22486 (tolerance + composite-mask): overfitTolerancePct + computeCropRect tolerancePct param + chooseStrategy returns 'composite-mask' when subject over-fit exceeds tolerance. Ported wholesale from backend since chooser is pure and had no adgen-specific divergence."
+      "backendHash": "d96732f5136b00717893c966c80ed9404f2836a1d73e78d022194f4f157e5ae2",
+      "adgenHash": "693141d99726dbfeaf512bb38af68515a30116a25af3df87c779faafdb460398",
+      "backendSha": "a0781ace9a1db1eaf1492cfac2e3b1bfdb5c2c25",
+      "status": "unported",
+      "reason": "CORRECTED 2026-09-03: prior entry said 'ported wholesale, no adgen-specific divergence' but backend's origin/main has since added COMPOSITE_MASK_METHOD (force-crop default, dated 2026-09-03) plus computeForceCropRect -- a live-evidence fix (Pelagic run 6a98d63a) routing the beyond-tolerance case away from Nano Banana composite-outpaint hallucination. Adgen's copy does not have this yet. This is a real gap adgen owes itself, discovered during benefits-to-directors vendor-drift reconciliation -- out of scope for this PR to port, tracked here instead of mis-labeled as an intentional fork.",
+      "portTo": "adgen",
+      "owedSince": "2026-09-03T16:37:29.765Z"
     },
     "services/remotionRenderService.js": {
       "backendHash": "d31da9813ceeff6ff78ca396c609c2e1f19c4e8628d8e09a447028d2384f9891",
@@ -1814,19 +1813,17 @@
     },
     "services/titleSpecService.js": {
       "backendHash": "8a917f9e8acec42c94bca8db1f13effe9fab96e464d051c8d2ab308a0b60286d",
-      "adgenHash": "8a917f9e8acec42c94bca8db1f13effe9fab96e464d051c8d2ab308a0b60286d",
+      "adgenHash": "df5e154caaf47627d828f48b06c92bde8d9b1b06fefd7f22bda7eda42b216e28",
       "backendSha": "d646c2fde5ef64ccb83ea0c464dbd893a041228e",
-      "status": "synced",
-      "portTo": null,
-      "owedSince": null
+      "status": "fork",
+      "reason": "2026-09-03: ported backend's TITLE_SPEC_IGNORE_PERSISTED removal (always-honour persisted specs — 0 persisted specs found in prod audit, so the flag guarded an empty population). Byte-identical to backend."
     },
     "services/titleSpecValidator.js": {
       "backendHash": "a5115a6bea073308c780d5cd3cdeb51dbdd948272d34af780f2365dc1c40b122",
-      "adgenHash": "a5115a6bea073308c780d5cd3cdeb51dbdd948272d34af780f2365dc1c40b122",
+      "adgenHash": "c08f8d2c8c4b67ca79b781827ea758cf5cb35db8e12cfd3cd77089ad3d6be7af",
       "backendSha": "45403d733434bb216d5ec8ea3a09756e9803c97b",
-      "status": "synced",
-      "portTo": null,
-      "owedSince": null
+      "status": "fork",
+      "reason": "2026-09-03: ported backend's multi-slot live-field-before-literal bind rule (a literal-only benefits/badges bind would freeze one SKU's strings into a brand spec). Deliberately NOT applied to text slots — verifyBrandTaglineNoInversion group F proves an operator-authored text literal is a supported feature. Byte-identical to backend."
     },
     "services/ugcVideoPipeline.js": {
       "backendHash": "2a7c1390a0bd0c46f2f361fb6eb445a9b55bbb225ada35adb6fdc84b5601d78e",
@@ -1838,11 +1835,11 @@
       "owedSince": null
     },
     "services/veoPromptBuilder.js": {
-      "backendHash": "027d0d46214b7303f0a1c83793ea4d280eaf6fe840fe82d2771a39dbe44b752a",
-      "adgenHash": "6b08869e0011151eaaa6b312c7d00d1a2bdbb249d6ef238ee676ef2b99933e6c",
-      "backendSha": "8bd9eebd549fe5384bef79648688462eace907ed",
+      "backendHash": "86cf32181d02df4531254d731a782e596078c70b3968aee39da021d3375208c5",
+      "adgenHash": "a3ae7681095b3464f3e1da133d272de8e6521eaa92acc303f8f05bdef176188b",
+      "backendSha": "45f5e3c05b472f319a78fdc53e19229cd2001434",
       "status": "fork",
-      "reason": "Prior fork stands: 2026-08-28 owner directive that backend prompt-building is not first-class; 2026-09-02 frozen-else Scene 2 is adgen-only. 2026-09-03 STRIP: overlay/sticker SEED_BURNED_IN_TEXT_GUARD_LINE and on-product lock line removed from buildVeoPrompt (contradicted OMNI_DIRECTIVES.noText; keyed on untrustworthy Media.text[].type). Same strip landed on liquidretail_backend working tree. seedHasText param retired. Not --unported."
+      "reason": "Prior fork stands: 2026-08-28 owner directive that backend prompt-building is not first-class; 2026-09-02 frozen-else Scene 2 is adgen-only. 2026-09-03 STRIP: overlay/sticker SEED_BURNED_IN_TEXT_GUARD_LINE and on-product lock line removed from buildVeoPrompt (contradicted OMNI_DIRECTIVES.noText; keyed on untrustworthy Media.text[].type). Same strip landed on liquidretail_backend working tree. seedHasText param retired. Not --unported. Re-attested 2026-09-03 during benefits-to-directors vendor-drift reconciliation -- no new divergence found beyond what was already recorded."
     },
     "services/veoStoryboardService.js": {
       "backendHash": "4e3d420b3a6219b72f25dc95aac6afa679ea5c23a7c3627d1abcb9ba9f5bf344",

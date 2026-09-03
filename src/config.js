@@ -95,6 +95,18 @@ function isTitlerEnabled() {
 // concurrent). Fits on Standard-Plus (8 GB); Standard (4 GB) OOMs.
 // Cap on statics + video-polls at MAX_INFLIGHT is loose intentionally
 // — they're I/O and cheap. Remotion self-limits.
+//
+// ⚠️ CORRECTED 2026-09-03 — the "×4 concurrent" above and the "32 concurrent
+// Remotion fleet-wide" sizing math two paragraphs up assumed
+// REMOTION_QUEUE_CONCURRENCY=4 per instance. The live default is **2**
+// (`remotionRenderService.js` reads `REMOTION_QUEUE_CONCURRENCY || 2`), and
+// that file's own boot warning plus `render.yaml`'s adgen-titler comments
+// name 4 as the exact concurrency that OOM-killed adgen-titler three times
+// in 44h (2026-08-26) — it was tried and reverted, not left in place. At the
+// live value of 2, autoscale max:8 gives fleet Remotion capacity of **16**,
+// not 32, and the "2.8x derive target" line above is stale by the same
+// factor. This comment does not change MAX_INFLIGHT or any env default —
+// see `render.yaml`'s adgen-titler section for the actual dashboard history.
 const MAX_INFLIGHT = Number(process.env.ADGEN_MAX_INFLIGHT || 32);
 
 // Phase 1a knob — how long the mock renderer pretends work takes.

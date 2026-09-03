@@ -125,16 +125,24 @@ export function estimateTextLines(text, { usableWidthPx, fontPx, maxLines = 1 } 
  *
  * Image slots (`productImage`/`brandLogo`) are sized by `sizePct` of the
  * canvas's short side (slotRenderers.jsx `renderImage`) — needs `dims`.
- * Multi-value slots (`badges`/`benefits`) are approximated by their own
- * authored `maxLines` at a single row's height; they are not part of the
- * incident this module closes, and the estimate errs toward "keep the box
- * honest" rather than exactness (see file header).
+ *
+ * Multi-value slots (`badges`/`benefits`) are LAYOUT-DEPENDENT. Joining the
+ * array into one string at maxLines 1 is honest for itemLayout:'row' (one
+ * flex line of chips) and FALSE for 'stack' — the validator default for
+ * benefits. A 4-item stack became one line, planGroupFit never shrank, and
+ * overflow:hidden clipped through items (the Vuori mid-star defect this
+ * module exists to prevent). Layout math lives HERE, not in Canonical.jsx:
+ * this file is vendor-synced with adgen; Canonical is not, so a fork that
+ * only grows estCtx still gets the right estimate via the slotKey defaults.
  *
  * @returns {number} px, never negative; 0 for empty/unrenderable content.
  */
 export function estimateSlotHeightPx(slotKey, content, ctx = {}) {
   if (content == null) return 0;
-  const { fontPx, usableWidthPx, maxLines, dims, sizePct, dropReviews = false } = ctx;
+  const {
+    fontPx, usableWidthPx, maxLines, dims, sizePct, dropReviews = false,
+    itemLayout, itemStyle, itemGap, maxItems,
+  } = ctx;
 
   if (slotKey === 'rating') {
     if (!Number.isFinite(fontPx) || fontPx <= 0) return 0;
@@ -156,9 +164,175 @@ export function estimateSlotHeightPx(slotKey, content, ctx = {}) {
   }
 
   if (!Number.isFinite(fontPx) || fontPx <= 0) return 0;
+
+  if (slotKey === 'badges' || slotKey === 'benefits') {
+    return estimateMultiSlotHeightPx(content, {
+      fontPx, usableWidthPx, maxLines, dims, itemLayout, itemStyle, itemGap, maxItems, slotKey,
+    });
+  }
+
   const text = Array.isArray(content) ? content.join(' ') : String(content ?? '');
   const lines = estimateTextLines(text, { usableWidthPx, fontPx, maxLines: maxLines || 1 });
   return lines * fontPx * TEXT_LINE_HEIGHT;
+}
+
+/**
+ * Height of a badges/benefits slot from its resolved item array.
+ *
+ *   stack — n rows, each item wraps on its own, plus (n-1) × gap.
+ *   row   — historical joined-text model (one flex line). wrap-to-next-line
+ *           via flexWrap is possible but the original "keep the box honest"
+ *           claim was true for this layout; we do not inflate it.
+ *   grid  — slotRenderers.jsx hardcodes 2 columns (`repeat(2, minmax(0,1fr))`),
+ *           so row count is ceil(n/2). Each cell wraps at ~half usable width;
+ *           a row's height is the taller of its two cells.
+ *
+ * maxItems (validator default 4) caps n — slotContent.js already slices the
+ * resolved array to that cap before paint. n=0 / empty array → 0.
+ *
+ * When itemLayout is omitted, use the validator default for the slot key
+ * (benefits→stack, badges→row) so a Canonical.jsx fork that has not yet
+ * grown estCtx still estimates benefits honestly.
+ *
+ * THE GRID UNDER-ESTIMATE (2026-09-03, adversarial review — reproduced BY
+ * EXECUTION: measured up to ~1.9x low with a realistic maxWidthPct + sizeScale
+ * combo). The cell-width arithmetic below (usable width minus one inter-
+ * column gap, split across 2 columns) was already correct — that part is
+ * literally what `slotRenderers.jsx`'s `gridTemplateColumns:
+ * repeat(2,minmax(0,1fr))` does. The bug was downstream of it: each item's
+ * wrapped-line count was capped at the SLOT's authored `maxLines`
+ * (`treatment.maxLines`, titleSpecValidator default 2) — but that cap is a
+ * `-webkit-line-clamp` concept, and `-webkit-line-clamp` is applied ONLY by
+ * `textCoreStyle` (single-value text slots: headline/quote/reviewer/…).
+ * `renderMultiValue` (badges/benefits — slotRenderers.jsx, the `bullet`/
+ * `plain`/`pill`/`chip` item spans, ~:790-836) sets no such clamp: a real
+ * benefit string wraps to as many lines as it needs, unbounded, in the real
+ * DOM. Reusing `maxLines` as the per-item cap here silently discarded any
+ * line past the 2nd, which is exactly how a ~29-45 char benefit in a
+ * halved-width cell (narrower still once `maxWidthPct`/`sizeScale` shrink the
+ * group or grow the type) came out shorter than it really renders.
+ * `estimateTextLines`'s own missing-width fallback still returns `maxLines`
+ * unchanged — that path is genuinely "no signal, assume the worst
+ * single-line-clamp case" and is untouched.
+ * Fix: for GRID ONLY, the per-item cap is `maxLines * cols` (`cols` fixed at
+ * 2, matching the renderer), not bare `maxLines`. This is not "uncapped" —
+ * literal Infinity would let one degenerate item (or an extreme
+ * maxWidthPct/sizeScale combo) balloon the estimate arbitrarily, which is
+ * safe in direction (over-count only costs an earlier shrink/drop) but not
+ * bounded. `cols×` keeps the SAME total "reading budget"
+ * (fontPx × maxLines × lineHeight, the author's real intent at full width) at
+ * the cell's own aspect: a cell that's ~1/cols as wide may fairly need up to
+ * ~cols× as many lines to show the same amount of text. 'stack'/'row' are
+ * UNTOUCHED — they are already fixed/pinned (2026-09-03, the join-fallthrough
+ * defect), this is additive to 'grid' only, and 'stack' items sit at the
+ * FULL usable width so the same defect is far less likely to bind there
+ * (not zero-risk, just out of THIS PR's scope).
+ *
+ * THE BULLET-WIDTH GAP (same review, `itemStyle:'bullet'`). slotRenderers.jsx
+ * (`renderMultiValue`, ~:822-825) reserves `size*0.4` for the bullet dot PLUS
+ * a `size*0.4` flex gap before the label starts — real horizontal room the
+ * estimator was not charging for, so every wrapped line was estimated with
+ * ~1 character more space than it actually has. Subtracted from the usable
+ * width fed to `estimateTextLines` for BOTH 'stack' and 'grid' (both do
+ * per-item width measurement; 'row' joins into one blob and was already
+ * documented as a coarser, deliberately-uninflated model — not touched).
+ * `itemStyle` is a NEW ctx field this file did not read before; Canonical.jsx
+ * (out of this file's scope) does not thread `rawSlot.treatment?.itemStyle`
+ * into `estCtx` yet, so on the live render path this is INERT today — it
+ * only takes effect for a caller (or this file's own harness) that passes
+ * `itemStyle` explicitly. Correct now rather than wrong-and-unexercised.
+ */
+function estimateMultiSlotHeightPx(content, ctx) {
+  const rawItems = Array.isArray(content)
+    ? content
+    : (content == null ? [] : [content]);
+  const items = rawItems.map((x) => String(x ?? '')).filter((s) => s.length > 0);
+  if (!items.length) return 0;
+
+  const cap = Number.isInteger(ctx.maxItems) && ctx.maxItems > 0 ? ctx.maxItems : 4;
+  const shown = items.slice(0, cap);
+  const n = shown.length;
+  if (n === 0) return 0;
+
+  const layout = ctx.itemLayout
+    || (ctx.slotKey === 'benefits' ? 'stack' : 'row');
+  const itemStyle = ctx.itemStyle
+    || (ctx.slotKey === 'benefits' ? 'bullet' : 'pill');
+  const gapPx = multiItemGapPx(ctx);
+  const lineH = ctx.fontPx * TEXT_LINE_HEIGHT;
+  const maxLines = Math.max(1, Math.floor(ctx.maxLines) || 1);
+
+  // Dot (size*0.4) + the flex gap before the label (another size*0.4) —
+  // matches slotRenderers.jsx's two `Math.round(size * 0.4)` calls exactly
+  // (summed as two independently-rounded values, not one rounded sum, so
+  // this cannot drift from the renderer by a stray rounding px). Zero for
+  // every other itemStyle — pill/chip/plain reserve no such fixed dead space
+  // ahead of the label.
+  const bulletInsetPx = itemStyle === 'bullet' ? 2 * Math.round(ctx.fontPx * 0.4) : 0;
+  const withBulletInset = (w) => (Number.isFinite(w) ? Math.max(1, w - bulletInsetPx) : w);
+
+  if (layout === 'stack') {
+    let total = 0;
+    for (const item of shown) {
+      const lines = estimateTextLines(item, {
+        usableWidthPx: withBulletInset(ctx.usableWidthPx),
+        fontPx: ctx.fontPx,
+        maxLines,
+      });
+      total += lines * lineH;
+    }
+    return total + gapPx * Math.max(0, n - 1);
+  }
+
+  if (layout === 'grid') {
+    const cols = 2;
+    const rows = Math.ceil(n / cols);
+    const cellWidth = Number.isFinite(ctx.usableWidthPx) && ctx.usableWidthPx > 0
+      ? Math.max(1, (ctx.usableWidthPx - gapPx) / cols)
+      : ctx.usableWidthPx;
+    const cellUsableWidthPx = withBulletInset(cellWidth);
+    // See the file-level comment above: a grid cell has no -webkit-line-clamp
+    // in the real DOM, so the per-item cap must not be the single-text-slot
+    // `maxLines` value — it is `maxLines * cols`, preserving the same total
+    // reading budget at the cell's own (narrower) width.
+    const gridItemMaxLines = maxLines * cols;
+    let total = 0;
+    for (let r = 0; r < rows; r++) {
+      let rowH = 0;
+      for (let c = 0; c < cols; c++) {
+        const item = shown[r * cols + c];
+        if (item == null) continue;
+        const lines = estimateTextLines(item, {
+          usableWidthPx: cellUsableWidthPx,
+          fontPx: ctx.fontPx,
+          maxLines: gridItemMaxLines,
+        });
+        rowH = Math.max(rowH, lines * lineH);
+      }
+      total += rowH;
+    }
+    return total + gapPx * Math.max(0, rows - 1);
+  }
+
+  // 'row' and unknown: joined-text, historical model.
+  const text = shown.join(' ');
+  const lines = estimateTextLines(text, {
+    usableWidthPx: ctx.usableWidthPx,
+    fontPx: ctx.fontPx,
+    maxLines,
+  });
+  return lines * lineH;
+}
+
+function multiItemGapPx(ctx) {
+  const frac = Number.isFinite(ctx.itemGap) ? ctx.itemGap : 0.012;
+  if (ctx.dims && Number.isFinite(ctx.dims.width) && Number.isFinite(ctx.dims.height)) {
+    return Math.round(Math.min(ctx.dims.width, ctx.dims.height) * Math.max(0, frac));
+  }
+  // No canvas size: treat gap as 0 rather than inventing pixels. Stack
+  // still sums per-item text heights, so the under-estimate this module
+  // exists to prevent cannot come from a missing gap.
+  return 0;
 }
 
 /**

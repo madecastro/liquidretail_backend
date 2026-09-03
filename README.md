@@ -32,7 +32,9 @@ Selected in `src/entrypoint.js`. One process runs one role:
 `ADGEN_RENDERER_ENABLED` (read at call time in both repos):
 
 - `true` — backend `runRenderLoop` returns; this renderer claims and renders.
-- anything else (committed default `false` in `config/defaults.env`) — renderer sleeps; backend's in-process loop still runs.
+  Committed default in `config/defaults.env` (and `render.yaml` on renderer +
+  titler) is `true` — adgen owns rendering in production.
+- anything else — renderer sleeps; backend's in-process loop still runs.
 
 There is no `ADGEN_SERVICE_ENABLED` in this tree.
 

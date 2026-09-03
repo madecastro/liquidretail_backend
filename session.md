@@ -26,33 +26,49 @@ production-route Atlas gens (9:16 and 16:9 raw squares, ~$2).
 *(Prior 2026-09-02 night. Worktree `/Volumes/Sayulita/Projects/RS/.wt-pad-source-scale`,
 branch `fix/pad-at-source-scale`, rebased onto `origin/master` `b4edfc2`.)*
 
-**This branch is the pad-at-source-scale + refinedProducts + Scene 2 landing for the
-Pelagic fidelity experiment. Not pushed.**
+*(Replaced 2026-09-03. Worktree `/Volumes/Sayulita/Projects/RS/.wt-adgen-benefits`,
+branch `feat/benefits-to-directors` off `origin/master` `8242275`. **Do not touch
+the main `liquidretail_adgen` checkout** — it is dirty on master with in-flight
+video-reference work.)*
 
-- `1473950` — pad at source scale (`padCanvasDims`, method-gated `pad-src-v1`, `$in`
-  claim fence, passthrough arm in code). Judged not shippable as-is.
-- Follow-up commits on top: (1) `refinedProducts` on both catalog `.select()`s so
-  cold siblings can crop-first; (2) byte-pad + composite-pad also use `padCanvasDims`
-  (else composite-pad invalidation freezes 720-short under `pad-src-v1`); drop
-  `REGENERATE_DAILY_CAP=1000` (no-op, does not belong here); document
-  `REFRAME_PASSTHROUGH_BRAND_IDS=` empty; (3) Scene 2 else-branch only — "on the
-  product as already shown". Designed extra "Do not search for a logo…" clause was
-  dropped: +48 bytes overflowed Grok 4096 on a 1000-char operator regenerate.
+**2026-09-03: committed config matches production.** `ADGEN_RENDERER_ENABLED=true`
+in `config/defaults.env`; `render.yaml` renderer + titler both ship
+`ADGEN_RENDERER_ENABLED=true` and `ADGEN_TITLER_ENABLED=true`. Overlay-zone
+catalog skip is backend-only. Write-up:
+`session.d/2026-09-03_overlay-skip-catalog-and-config-truth.md`.
 
-**Suite:** 90/92. Reds are pre-existing, not this diff:
-- `verifyVendorDrift` — backend moved on ~20 vendored files since the last
-  look (same red on origin/master). This branch's three files
-  (atlasVideoService, veoPromptBuilder, videoRefPrewarm) are reconciled.
-- `verifyRegenerateInFlightGate` E1 — merge-order gate reading
-  `origin/master:scripts/vendor-manifest.json` for the phrase `OWES PORTS IN BOTH
-  DIRECTIONS` on `adRegenerateService.js`. That phrase is not on trunk. This
-  branch does not touch that file. Fails on origin/master itself.
+*(Prior this day: adgen port of backend benefits-to-directors Part B+D.)*
 
-**Do not npm ci / NODE_PATH in this worktree.**
+**Adgen port of backend benefits-to-directors Part B+D. Not committed, not pushed.**
+Source of truth was `/Volumes/Sayulita/Projects/RS/.wt-benefits-directors`
+(backend, also uncommitted). Live renderer now honours persisted title specs
+and estimates stacked benefits as n rows.
 
-**Experiment still not run.** Deploy order is in the 2026-09-02 design: code with
-passthrough empty → canary `6a985882` → control 14 → flip passthrough → canary →
-arm 1 14 → restore env. Prewarm off during the window.
+Ported: `titleSpecService.js` (always-honour cascade; `ignoresPersistedTitleSpecs`
+/ `honourPersistedOverrides` deleted — **zero adgen call sites** for that
+param), `titleSpecValidator.js` (multi-bind rule), `src/remotion/lib/stackFit.js`
+(`estimateMultiSlotHeightPx`, benefits default `itemLayout:'stack'`), Canonical
+estCtx 6-line growth only (stroke-clip fork preserved), `brandScriptExecutor.js`
+comments, `TITLE_SPEC_IGNORE_PERSISTED` deleted from `config/defaults.env`.
+Added `scripts/verifyMultiSlotStackFit.mjs` (12/12) — adgen is the live painter.
+
+**Suite:** 91/93. `verifyMultiSlotStackFit.mjs` green. Reds are not this diff's
+logic:
+- `verifyVendorDrift` — 27 backend-drift vs sibling `origin/main` (backend PR
+  not landed; 3 of those are this port's synced files recorded at the
+  worktree hash). Plus 2 pre-existing adgen-drift files this branch did not
+  touch (`adVisionQcService.js`, `reframeStrategyChooser.js`).
+- `verifyRegenerateInFlightGate` E1 — pre-existing trunk merge-order gate
+  (`OWES PORTS IN BOTH DIRECTIONS` not on `origin/master`).
+
+**Do not npm ci / NODE_PATH in this worktree.** No `node_modules` here; lint
+could not run (`eslint` missing). `node --check` passed on the JS files;
+Canonical.jsx is not a node syntax-check target.
+
+When the backend PR lands on `origin/main`, `--reconcile` the three synced
+files (`titleSpecService.js`, `titleSpecValidator.js`, `stackFit.js`) — hashes
+already match the backend worktree, so that reconcile should go `synced`
+without a content change.
 
 ---
 

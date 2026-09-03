@@ -60,11 +60,12 @@ services:
     # dashboard override, and standard_plus is no longer a valid worker
     # plan on blueprint sync — this rename catches the file up to reality).
     #
-    # When ADGEN_TITLER_ENABLED=true (dashboard override), this role stops
-    # doing Remotion in-process and simply stamps titlingNeeded=true after
-    # the master's veoVideoUrl lands. The titler service (below) picks it
-    # up. In that mode this instance stops being memory-bound by Remotion
-    # and can raise ADGEN_MAX_INFLIGHT — but that's a separate tuning PR.
+    # When ADGEN_TITLER_ENABLED=true (this service — matches live dashboard),
+    # this role stops doing Remotion in-process and simply stamps
+    # titlingNeeded=true after the master's veoVideoUrl lands. The titler
+    # service (below) picks it up. In that mode this instance stops being
+    # memory-bound by Remotion and can raise ADGEN_MAX_INFLIGHT — but that's
+    # a separate tuning PR.
     plan: pro_plus
     dockerfilePath: ./Dockerfile
     autoDeploy: true
@@ -74,6 +75,10 @@ services:
     envVars:
       - key: ADGEN_ROLE
         value: renderer
+      - key: ADGEN_RENDERER_ENABLED
+        value: "true"
+      - key: ADGEN_TITLER_ENABLED
+        value: "true"   # live: renderer stamps titlingNeeded, stands down Remotion
       - key: ADGEN_MAX_INFLIGHT
         value: 32
       - key: MONGODB_URI
@@ -104,8 +109,10 @@ services:
     envVars:
       - key: ADGEN_ROLE
         value: titler
+      - key: ADGEN_RENDERER_ENABLED
+        value: "true"
       - key: ADGEN_TITLER_ENABLED
-        value: "false"   # flip to true in dashboard after validating deploy
+        value: "true"    # live since 2026-08-26; titling is production
       - key: ADGEN_MAX_INFLIGHT
         value: 16        # I/O ceiling; Remotion queue self-limits below this
       - key: MONGODB_URI
