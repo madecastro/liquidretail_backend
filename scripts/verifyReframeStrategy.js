@@ -21,8 +21,9 @@ require('dotenv').config({ path: path.join(__dirname, '..', 'config', 'defaults.
 const chooser = require('../src/services/reframeStrategyChooser');
 const { chooseStrategy, isCropFirstEnabled, __test } = chooser;
 const {
-  parseAspect, subjectUnionBbox, computeCropRect, buildCloudinaryCropUrl,
-  overfitTolerancePct, OVERFIT_TOLERANCE_PCT_DEFAULT
+  parseAspect, subjectUnionBbox, computeCropRect, computeForceCropRect,
+  buildCloudinaryCropUrl, overfitTolerancePct, compositeMaskMethod,
+  OVERFIT_TOLERANCE_PCT_DEFAULT
 } = __test;
 
 const results = [];
@@ -312,10 +313,14 @@ try {
     assert.ok(s.rect.w > 0 && s.rect.h > 0);
   });
 
-  check('b13 fixture (4 people, union 1370px wide) → composite-mask', () => {
-    // At default 10% tolerance this now returns 'composite-mask' (was
-    // 'defer' before this file gained the tolerance + composite path).
-    // Over-fit ~22% > 10% — composite branch takes it.
+  check('b13 fixture (4 people, union 1370px wide) — force-crop default routes to yolo-crop-forced', () => {
+    // Historical arc (this file ports backend a0781ace):
+    //   pre-tolerance     → 'defer' (subject union bigger than crop window)
+    //   +tolerance/mask   → 'composite-mask' (over-fit ~22% > 10% → nano-banana)
+    //   +force-crop (now) → 'crop' with method 'yolo-crop-forced'
+    //                       (COMPOSITE_MASK_METHOD=force-crop, ported to adgen
+    //                       so cache reads from either service are servable
+    //                       by the other without a re-derive).
     const s = chooseStrategy({
       media: {
         width: 1692, height: 2018,
@@ -329,12 +334,71 @@ try {
       aspectRatio: '9:16',
       sourceUrl: 'https://res.cloudinary.com/reach-social-prod/image/upload/v1785944632/catalog-product/x/y.jpg'
     });
-    assert.strictEqual(s.action, 'composite-mask', `expected composite-mask, got ${s.action} (${s.reason})`);
-    assert.match(s.reason, /exceeds target-aspect crop window beyond \d+% tolerance/);
-    assert.ok(s.subjectUnion, 'subjectUnion should be surfaced on composite-mask');
-    assert.ok(s.sourceDims && s.sourceDims.width === 1692 && s.sourceDims.height === 2018,
-      'sourceDims should be surfaced on composite-mask');
+    assert.strictEqual(s.action, 'crop', `expected crop, got ${s.action} (${s.reason})`);
+    assert.strictEqual(s.method, 'yolo-crop-forced');
+    assert.match(s.reason, /bbox-forced crop/);
+    assert.match(s.reason, /edges clipped instead of outpainted/);
+    assert.match(s.url, /c_crop,w_1135/);
     assert.strictEqual(typeof s.tolerancePct, 'number');
+  });
+
+  check('b13 fixture with COMPOSITE_MASK_METHOD=composite-outpaint restores legacy composite-mask', () => {
+    const prior = process.env.COMPOSITE_MASK_METHOD;
+    try {
+      process.env.COMPOSITE_MASK_METHOD = 'composite-outpaint';
+      const s = chooseStrategy({
+        media: {
+          width: 1692, height: 2018,
+          refinedProducts: [
+            { x1: 1344, y1: 674, x2: 1672, y2: 1381 },
+            { x1: 1344, y1: 315, x2: 1667, y2: 958 },
+            { x1: 302,  y1: 0,   x2: 588,  y2: 883 },
+            { x1: 675,  y1: 1345, x2: 1269, y2: 2007 }
+          ]
+        },
+        aspectRatio: '9:16',
+        sourceUrl: 'https://res.cloudinary.com/reach-social-prod/image/upload/v1785944632/catalog-product/x/y.jpg'
+      });
+      assert.strictEqual(s.action, 'composite-mask',
+        `expected composite-mask under COMPOSITE_MASK_METHOD=composite-outpaint; got ${s.action}`);
+      assert.match(s.reason, /exceeds target-aspect crop window beyond \d+% tolerance/);
+      assert.ok(s.subjectUnion);
+      assert.ok(s.sourceDims && s.sourceDims.width === 1692 && s.sourceDims.height === 2018);
+      assert.strictEqual(typeof s.tolerancePct, 'number');
+    } finally {
+      if (prior === undefined) delete process.env.COMPOSITE_MASK_METHOD;
+      else process.env.COMPOSITE_MASK_METHOD = prior;
+    }
+  });
+
+  check('COMPOSITE_MASK_METHOD env parser: default force-crop, "composite-outpaint" honoured, unknown → force-crop', () => {
+    const prior = process.env.COMPOSITE_MASK_METHOD;
+    try {
+      delete process.env.COMPOSITE_MASK_METHOD;
+      assert.strictEqual(compositeMaskMethod(), 'force-crop');
+      process.env.COMPOSITE_MASK_METHOD = 'composite-outpaint';
+      assert.strictEqual(compositeMaskMethod(), 'composite-outpaint');
+      process.env.COMPOSITE_MASK_METHOD = 'FORCE-CROP';
+      assert.strictEqual(compositeMaskMethod(), 'force-crop');
+      process.env.COMPOSITE_MASK_METHOD = 'chunky-monkey';
+      assert.strictEqual(compositeMaskMethod(), 'force-crop');
+    } finally {
+      if (prior === undefined) delete process.env.COMPOSITE_MASK_METHOD;
+      else process.env.COMPOSITE_MASK_METHOD = prior;
+    }
+  });
+
+  check('computeForceCropRect — 9-bbox near-full-frame subject produces a clean 9:16 rect', () => {
+    // Real bboxes from backend's Lure Flag alt on Pelagic 2026-09-03 run
+    // (media 6a98302271bb20a6b41362ea, 9 person bboxes union 1995×1710
+    // exceeding 10% tolerance on a 2000×2000 source going to 9:16).
+    const subject = { x1: 0, y1: 0, x2: 2000, y2: 1877, count: 9 };
+    const rect = computeForceCropRect({ sourceW: 2000, sourceH: 2000, targetAspect: 9 / 16, subject });
+    assert.ok(rect);
+    assert.strictEqual(rect.w, 1125);
+    assert.strictEqual(rect.h, 2000);
+    assert.strictEqual(rect.x, 438);
+    assert.strictEqual(rect.y, 0);
   });
 
   check('marginal fixture (subject 5% oversized) → crop with default tolerance', () => {
