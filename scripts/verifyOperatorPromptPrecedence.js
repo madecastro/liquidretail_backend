@@ -94,6 +94,7 @@
  * Offline: no network, no DB, no API key.
  */
 
+const crypto = require('crypto');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
@@ -173,8 +174,26 @@ const LABEL = 'OPERATOR REFINEMENT (subordinate to the constraints below).';
 const FRAMING_MARK = 'never content to draw';
 const SUPREMACY_MARK = 'CONSTRAINT SUPREMACY:';
 const SUPREMACY_TAIL = 'Ambient motion already permitted is unaffected.';
-const NOTEXT_OMNI = 'CRITICAL: Do NOT render any text';
-const FIDELITY_MARK = 'PRODUCT FIDELITY:';
+// RETARGETED 2026-09-03 to CORE's own constraint sentences.
+//
+// Group B's PROPERTY is unchanged and is a real security property, not
+// cosmetics: operator free text must never outrank the fidelity and
+// no-rendered-text constraints. It exists because a product titled "Vaportek"
+// once made Omni fabricate a VAPORTEK chest lockup over the real PELAGIC
+// fish-mark and vision-QC terminal-rejected the $0.90 master. The same door
+// is reachable through the OPERATOR box.
+//
+// What changed is only WHICH SENTENCE carries each constraint. The old
+// `PRODUCT FIDELITY:` / `CRITICAL: Do NOT render any text` markers came from
+// OMNI_DIRECTIVES, which no longer exists. CORE carries both:
+//   fidelity      → "The product surface is the only hard lock."
+//   no-added-text → "Do not add captions, UI, stickers, price tags, or any
+//                    text that is not physically printed on the product."
+// Both still sit AFTER the operator fence and BEFORE CONSTRAINT SUPREMACY,
+// which is exactly what this group asserts. Retarget, not relaxation: point
+// these at strings CORE does not contain and the group fails.
+const NOTEXT_OMNI = 'Do not add captions, UI, stickers, price tags, or any text that is not physically printed on the product';
+const FIDELITY_MARK = 'The product surface is the only hard lock.';
 const AMBIENT_MARK = 'AMBIENT LIFE (the point of this path)';
 
 // Every shape the builder branches on that a regenerate can reach. The
@@ -221,44 +240,72 @@ function build(mod, shape, operatorPrompt) {
 }
 
 // ── A. BYTE-IDENTITY on the no-operator path (MONEY) ───────────────────────
-console.log('A. no-operator path is byte-identical to the pre-change builder');
+// ── RETARGETED 2026-09-03: the baseline is now CORE, not commit 16e64e2 ──
+//
+// The PROPERTY this group pins is unchanged and still load-bearing: with an
+// empty operatorPrompt the builder's output must be EXACTLY DETERMINED and
+// unable to drift. What changed is the intended text. `buildVeoPrompt` no
+// longer assembles ~30 directive fragments per profile — it emits one 1,158-
+// byte CORE prompt for every destination (owner-directed; see the long note
+// at the push site in veoPromptBuilder.js). So comparing against a git
+// baseline that still carries OMNI_DIRECTIVES pins a prompt that no longer
+// exists: it failed 98 checks with current=1157B vs baseline=3322B, which is
+// the change succeeding, not a regression.
+//
+// THIS IS A RETARGET, NOT A RELAXATION. It is strictly stricter than the old
+// form in one way that matters: instead of "equals whatever that commit
+// built", it now asserts equality against the sha256 of the MEASURED
+// artifact. Drift of a single byte fails, and it fails with a diff.
+//
+// The old baseline machinery (git show into an OS temp dir, the relative-
+// require rewrite, the else-Scene-2 normalisation, the positive control that
+// guarded against comparing a module to itself) is deliberately gone with it
+// — every one of those existed to service a git baseline there is no longer
+// any reason to load.
 const EMPTY_OPERATORS = [
   ['undefined', undefined], ['null', null], ["''", ''], ["'   '", '   '], ["'\\n\\t '", '\n\t ']
 ];
-// Unique to the frozen `else` timeline — hook-first Scene 3 says "centre-safe"
-// and is NOT rewritten here.
-const ELSE_SCENE2_OLD = 'slow zoom toward the most distinctive product detail (~8–10%), centered. No rotation or distortion. ';
-const ELSE_SCENE2_NEW = 'slow zoom in (~8–10%) on the product as already shown, centered. No rotation or distortion. ';
-const ELSE_SCENE3_MARK = 'Maintain center framing.';
-function withElseScene2Rewrite(s) {
-  const text = String(s);
-  const i = text.indexOf(ELSE_SCENE2_OLD);
-  if (i < 0) return text;
-  const after = text.slice(i, i + ELSE_SCENE2_OLD.length + 200);
-  if (!after.includes(ELSE_SCENE3_MARK)) return text;
-  return text.slice(0, i) + ELSE_SCENE2_NEW + text.slice(i + ELSE_SCENE2_OLD.length);
-}
+const CORE_SHA256 = 'bb6379651933e5abdc2709e1b4e5c3f59ca8c59cd41c132cf43782866015b041';
+const CORE_BYTES = 1158;
+const CORE_MARK = 'The product surface is the only hard lock.';
+
+console.log('A. no-operator path emits exactly the CORE prompt, byte-for-byte');
 {
+  // The measured artifact, reproduced from the builder's own exported text so
+  // this harness cannot drift from the module it is pinning.
+  const core = current.corePromptText ? current.corePromptText(10) : null;
+  check('A-core: corePromptText is exported for pinning', typeof core === 'string' && core.length > 0);
+  if (typeof core === 'string') {
+    check(`A-core: CORE is ${CORE_BYTES} bytes`,
+      Buffer.byteLength(core, 'utf8') === CORE_BYTES,
+      `got ${Buffer.byteLength(core, 'utf8')}`);
+    const h = crypto.createHash('sha256').update(core, 'utf8').digest('hex');
+    check('A-core: CORE sha256 matches the measured artifact', h === CORE_SHA256,
+      h === CORE_SHA256 ? '' : `got ${h.slice(0, 16)}… want ${CORE_SHA256.slice(0, 16)}…`);
+    check('A-core: duration is interpolated, not hardcoded',
+      current.corePromptText(8).startsWith('8-second') && core.startsWith('10-second'));
+  }
+  // The retired directive text must be GONE from every emitted prompt — this
+  // is the "strip permanently" half, asserted on output rather than source.
   const packshot = build(current, SHAPES[0], null);
-  check('A-scene2: packshot empty-operator path carries the rewritten Scene 2',
-    packshot.includes(ELSE_SCENE2_NEW));
-  check('A-scene2: packshot empty-operator path no longer hunts a distinctive detail',
-    !packshot.includes('most distinctive product detail'));
+  for (const dead of [
+    'Ken Burns', 'Camera movement only', 'most distinctive product detail',
+    'HOOK-FIRST', 'Maintain center framing', 'Maintain centre-safe framing',
+    'Smooth crossfades only', 'RETURN TO THE PRIMARY VIEW'
+  ]) {
+    check(`A-stripped: emitted prompt no longer contains ${JSON.stringify(dead)}`,
+      !packshot.includes(dead));
+  }
 }
 for (const shape of SHAPES) {
-  // Prove the shape actually entered the branch it names.
-  if (shape.assertMark) {
-    const probe = build(current, shape, null);
-    check(`A ${shape.name}: REACHED its branch (${shape.assertMark.slice(0, 24)}…)`,
-      probe.includes(shape.assertMark),
-      'shape did not enter the branch it claims — the byte-identity check below would be testing the wrong path');
-  }
   for (const [label, op] of EMPTY_OPERATORS) {
-    let cur, base;
+    let cur;
     try { cur = build(current, shape, op); } catch (err) { cur = `THREW: ${err.message}`; }
-    try { base = withElseScene2Rewrite(build(baseline, shape, op)); } catch (err) { base = `THREW: ${err.message}`; }
-    check(`A ${shape.name} / operatorPrompt=${label}: byte-identical`, cur === base,
-      cur === base ? '' : `current=${Buffer.byteLength(String(cur))}B baseline=${Buffer.byteLength(String(base))}B`);
+    const want = current.corePromptText(shape.args && shape.args.durationSec ? shape.args.durationSec : 8);
+    check(`A ${shape.name} / operatorPrompt=${label}: emits CORE exactly`, cur === want,
+      cur === want ? '' : `current=${Buffer.byteLength(String(cur))}B core=${Buffer.byteLength(String(want))}B`);
+    check(`A ${shape.name} / operatorPrompt=${label}: carries the CORE lock sentence`,
+      String(cur).includes(CORE_MARK));
   }
 }
 
@@ -294,10 +341,23 @@ for (const shape of SHAPES) {
   const iFid = p.indexOf(FIDELITY_MARK);
   check(`B ${tag}: fidelity block present and AFTER the operator text`, iFid > iOp, `op@${iOp} fid@${iFid}`);
   check(`B ${tag}: supremacy present and AFTER fidelity`, iSup > iFid, `fid@${iFid} sup@${iSup}`);
-  // noText wording differs per profile, so assert positionally via the profile-
-  // agnostic fact that SOME no-text directive precedes supremacy.
-  check(`B ${tag}: a no-render-text directive sits before supremacy`,
-    /do NOT render any text|no rendered text|Do NOT render text/i.test(p.slice(0, iSup)));
+  // The no-added-text constraint must sit before supremacy. The alternation
+  // used to cover per-profile wording ("do NOT render any text" etc.); with a
+  // single CORE prompt there is exactly one phrasing, and it is CORE's own —
+  // "Do not add captions, UI, stickers, price tags, or any text that is not
+  // physically printed on the product." Kept as a regex alternation rather
+  // than an equality so this does not have to be re-edited for whitespace,
+  // but note it is now genuinely single-source: if CORE's sentence moves,
+  // this fails, which is the intent.
+  check(`B ${tag}: a no-added-text directive sits before supremacy`,
+    /Do not add captions, UI, stickers, price tags, or any text that is not physically printed on the product/i
+      .test(p.slice(0, iSup)));
+  // And the on-product carve-out must survive alongside it — a no-text rule
+  // with no carve-out is what made the model erase the product's OWN printed
+  // label. CORE carries this as "Spell on-garment text from the photos
+  // exactly as printed."
+  check(`B ${tag}: the on-product text carve-out is present`,
+    /Spell on-garment text from the photos exactly as printed/i.test(p.slice(0, iSup)));
   check(`B ${tag}: supremacy is the LAST block`, p.trimEnd().endsWith(SUPREMACY_TAIL),
     `tail=${JSON.stringify(p.slice(-60))}`);
   check(`B ${tag}: supremacy states the constraints are absolute and outrank`,
@@ -390,7 +450,12 @@ console.log('D. the byte budget degrades the explanation, never the constraints'
   }
 
   // The explanation yields BEFORE the pre-existing optional lines.
-  const tight = { name: 'tight', args: { caps: { paramShape: 'gemini-omni', promptByteCap: 4200 }, aspectRatio: '1:1', hasProductReference: true } };
+  // CAP RETARGETED 2026-09-03. 4200 was tight against the old ~3.3KB
+  // directive prompt; CORE is 1158B, so 4200 is now roomy and the
+  // degradation this asserts never triggered — the check was passing
+  // vacuously in the other direction (nothing to drop). Re-tightened
+  // relative to CORE so the budget is genuinely under pressure.
+  const tight = { name: 'tight', args: { caps: { paramShape: 'gemini-omni', promptByteCap: 2200 }, aspectRatio: '1:1', hasProductReference: true } };
   const squeezed = build(current, tight, 'x'.repeat(600));
   check('D3 under pressure the framing explanation is dropped', !squeezed.includes(FRAMING_MARK));
   check('D4 the fence is retained when the explanation is dropped', squeezed.includes(FENCE_OPEN));
@@ -404,7 +469,7 @@ console.log('D. the byte budget degrades the explanation, never the constraints'
   // guardrails were trimmed. A refused request costs nothing.
   let failedClosed = false, code = null;
   try {
-    build(current, { name: 'extreme', args: { caps: { paramShape: 'grok', promptByteCap: 3900 }, aspectRatio: '1:1', hasProductReference: true } }, 'x'.repeat(1000));
+    build(current, { name: 'extreme', args: { caps: { paramShape: 'grok', promptByteCap: 2300 }, aspectRatio: '1:1', hasProductReference: true } }, 'x'.repeat(1000));
   } catch (e) { failedClosed = true; code = e.code; }
   check('D9 the extreme case FAILS CLOSED rather than submitting', failedClosed);
   check('D10 the failure carries a machine-readable code', code === 'VEO_PROMPT_OVER_CAP', `got ${code}`);

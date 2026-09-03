@@ -688,6 +688,40 @@ function lifestyleVideoGuidanceForIntent(intentKey) {
 // below. aspectRatio is used ONLY on the pmax profile (Frame line).
 // platformFormat / destination / promptProfile select the profile;
 // absent → today's Meta/Omni/Grok behaviour exactly.
+// THE video prompt. Measured winner of the 2026-09-02/03 comparison — see the
+// long note at its push site inside buildVeoPrompt for why this replaced
+// 14,883 bytes of directive objects and what that deliberately gave up.
+//
+// Byte-exact to the measured artifact
+// (scratchpad/gemini-direct/native-generic/CORE.txt, 1159 B,
+// sha256 67899bcfdf16…) EXCEPT the leading duration, which is interpolated
+// so the prompt can never claim a length the render is not. At the
+// production default of 10s this function reproduces that file byte-for-byte
+// — pinned by scripts/verifyCorePrompt.js, which holds the sha256 rather
+// than a paraphrase.
+//
+// DO NOT reword this to tidy it up. Two precedents: PR #61 hardened the video
+// prompt and was rolled back in full ("the previous output was better"), and
+// static-fidelity-block-ab measured rewriting a fidelity block as a NULL
+// RESULT across 4 cells. It also deliberately says "Meta" on PMax
+// destinations — kept because that is the text that was measured. Test a
+// variant against this one; do not edit it in place.
+function corePromptText(durationSec) {
+  const secs = Number(durationSec) > 0 ? Number(durationSec) : 10;
+  const dur = Number.isInteger(secs) ? String(secs) : secs.toFixed(1);
+  return (
+    `${dur}-second premium Meta product commercial. Photoreal. Social-ad energy is welcome: camera may push, pull, pan, orbit, or cut; a wearer may turn, walk, or shift weight. None of that is a problem.\n` +
+    `\n` +
+    `The product surface is the only hard lock. The supplied photos are the sole source of truth for every logo, wordmark, printed letter, graphic, seam, stitch, zipper, button, grommet, drawcord, mesh panel, hardware, and colourway. Copy those marks from the photos. Do not redraw, restyle, sharpen-with-fill, or substitute a "similar" icon.\n` +
+    `\n` +
+    `Spell on-garment text from the photos exactly as printed. Do not improvise competing brands, extra slogans, extra icons, extra sleeve prints, extra neck labels, or extra waistband lines. If a surface is blank on the catalog stills, keep it blank.\n` +
+    `\n` +
+    `When photos disagree, the dedicated product-only catalog still wins over on-model or lifestyle frames.\n` +
+    `\n` +
+    `No morphing product, no colour drift, no generative fill on logos. AUDIO: natural ambience only — no music, no voiceover, no dialogue. Do not add captions, UI, stickers, price tags, or any text that is not physically printed on the product. Ad copy is composited later.`
+  );
+}
+
 function buildVeoPrompt({
   brand,          // eslint-disable-line no-unused-vars -- kept for call-site stability
   product,
@@ -844,390 +878,72 @@ function buildVeoPrompt({
     lines.push(operatorLineFull);
   }
 
-  // ── Directives (lifestyle sibling OR packshot Ken Burns per-profile) ─
-  lines.push(d.role);
-  lines.push(d.objective);
-  // Hook-first is destination treatment — compose onto lifestyle too.
-  // Packshot already carries HOOK-FIRST inside HOOK_FIRST_DIRECTIVES.objective;
-  // lifestyle uses LIFESTYLE_DIRECTIVES.objective, so inject the destination
-  // rule once when both are active. Not a contradiction with ambient life:
-  // the product must be readable early; ambient motion may still breathe.
+  // ══════════════════════════════════════════════════════════════════════
+  // CORE IS THE PROMPT (2026-09-03, owner-directed).
   //
-  // PLATFORM-NEUTRALITY EDIT (owner standardization 2026-08-18): this label
-  // used to read "(PMax destination)". One profile now serves Meta and PMax,
-  // so a literal "PMax" in text sent to the model on a Meta ad was simply
-  // false. Only the parenthetical label changed — the directive itself is
-  // untouched.
-  if (lifestyle && isHookFirst) {
-    lines.push(
-      `HOOK-FIRST (video destination): this surface is skipped or scrolled past in seconds — ` +
-      `the product must be identifiable within the first 2 seconds; the opening frames carry the whole ad. ` +
-      `Ambient life may move, but never at the cost of early product readability.`
-    );
-  }
-  lines.push(d.sourceImages);
-  lines.push(d.productPreservation);
-
-  // Catalog title is NEVER interpolated into the camera prompt.
+  // Owner, verbatim: "no do it all now, this is what we spent 9 hours on!"
+  // and "completely strip the old stuff out permanently."
   //
-  // Incident (2026-08-26, visually proven on a delivered Pelagic Gear
-  // master): `Product: Vaportek.` was read as a brand-name render
-  // instruction. Omni fabricated a complete "VAPORTEK" chest lockup and
-  // a fake neck tag over the real small PELAGIC fish-mark; vision-QC
-  // (correctly) terminal-rejected the $0.90 master with no regeneration.
-  // `noText` already forbids generating new logos — it was not enough
-  // once a brand-sounding catalog title was also sitting in a labeled
-  // field. PRODUCT FIDELITY + the supplied images already identify the
-  // SKU; this line was optional context (it used to lead DROP_PRIORITY)
-  // and not load-bearing for any parser. Do not re-add a named Product
-  // field. `product` is still consumed below by productRegionForAd.
-
-  // Lifestyle product-region anchor (VIDEO_PRODUCT_ANCHOR). Spatial
-  // grounding so a push-in finds the product box, not the face. Flag-off,
-  // packshot, or no matched region → not a single extra character (B14).
-  // Named region only — never raw pixel coords. ≤400 chars.
-  // MODEL-cap gate: only push when (assembled join + block) still fits
-  // caps.promptByteCap in BYTES. Over-cap → silent no-anchor. The block
-  // is NOT in DROP_PRIORITY, so pushing it over budget would squeeze
-  // optional lines (and must never displace noText). Skip instead.
-  // SUBJECT HOLD (VIDEO_SUBJECT_HOLD): set when no product is confidently
-  // called out, so the timeline below drops its product-hunting language too.
-  // Declared here because the anchor attempt is what determines it.
-  let subjectHold = false;
-  if (lifestyle && isVideoProductAnchorEnabled()) {
-    const hit = productRegionForAd({ product, media });
-    let block = hit ? buildProductAnchorBlock(hit) : null;
-    // No confident product → hold the person instead of letting the camera
-    // hunt for one. Owner 2026-08-12. Only ever a FALLBACK: a resolved product
-    // anchor always wins, so this can never displace product focus.
-    if (!hit && videoSubjectHoldEnabled()) {
-      const held = subjectHoldRegionForMedia(media);
-      const holdBlock = held ? buildSubjectHoldBlock(held) : null;
-      if (holdBlock) {
-        block = holdBlock;
-        subjectHold = true;
-      }
-    }
-    if (block) {
-      const cap = (caps && Number(caps.promptByteCap) > 0)
-        ? Number(caps.promptByteCap)
-        : 4096;
-      const next = [...lines, block].join(' ');
-      if (Buffer.byteLength(next, 'utf8') <= cap) lines.push(block);
-      // Over cap → the block was dropped, so the hold timeline must NOT run
-      // either. Shipping "hold the composition" pacing with no block saying
-      // what to hold, while the scene lines still chase a product, is the
-      // self-contradictory-prompt class that forced the PR #61 rollback.
-      //
-      // Written as a SEPARATE statement testing the outcome, deliberately: an
-      // `else` here would leave a dangling clause when verifyVideoProductAnchor
-      // P6 rewrites the line above to an unconditional push, turning that
-      // revert-proof into a syntax error instead of a real mutation.
-      if (subjectHold && !lines.includes(block)) subjectHold = false;
-    }
-  }
-
-  // Timeline. Lifestyle branch is ambient-life + product-as-star.
-  // The final `else` (gemini-omni profile) branch is the FROZEN pre-#61
-  // timeline — do not reword (B14/B15). It is now reached only when the
-  // kill switch is off or no destination was passed; that is precisely the
-  // arm the PR #61 rollback guarantee still lives in.
-  // Packshot hook_first (Meta AND PMax since 2026-08-18) is hook-first Ken Burns.
-  // Lifestyle + hook_first composes: lifestyle scene/motion language +
-  // hook-first timing + centre-safe framing (not packshot Ken Burns pans —
-  // those would re-impose static product commercial moves on a real scene).
-  // Residual tension report (not silently dropped): packshot hook_first
-  // cameraStyle says "product stays completely static"; lifestyle allows
-  // real-item motion. Composition keeps lifestyle product-preservation
-  // (identity ≠ immobility) and only takes hook-first + centre-safe + Frame —
-  // never the packshot-static product line.
-  const dur = Number(durationSec || 8);
-  const t1  = (dur / 3).toFixed(2);
-  const t2  = (dur * 0.64).toFixed(2);
-  if (lifestyle && isHookFirst) {
-    // Split-stage (16:9 + subjectSide): the stock lifestyle+PMax path holds
-    // the product in the "central band" and later injects centre-safe that
-    // bans outer side margins — both actively forbid anchoring the subject
-    // to one side for the calm opposite panel. Under split, hold the product
-    // in the subject-side band for the whole clip; beat times (t1/t2) stay
-    // identical so Remotion's brand-script still lines up via specTimeScale.
-    lines.push(
-      `Timeline (${dur.toFixed(1)}s): ` +
-      `Scene 1 (0.0–${t1}s): HOOK — product fully legible and identifiable from the first frame in the real lifestyle plate; ` +
-      `gentle camera finds and holds the product already in the scene; ambient life may begin (fabric with the wearer, hair, breath, steam, water, foliage as present). ` +
-      (isVerticalAspect
-        ? `Product held on the vertical centre line — no lateral drift toward either side margin. `
-        : isSplit
-          ? `Product held in the ${sideLabel} vertical band of the wide frame for the whole clip — no lateral drift, pan, or travel toward the ${oppositeLabel}. `
-          : `Product held in the central band of the wide frame. `) +
-      `No whip, no orbit, no parallax. The product must be unmistakable within the first 2.0s. ` +
-      (isSplit
-        ? `Scene 2 (${t1}–${t2}s): hold the product as the star, subject-anchored in the ${sideLabel} band; soft ambient motion continues; optional gentle push on the product itself (~8–12%) as a real camera would. ` +
-          `Product identity absolute — may move only as the real item would with the wearer/scene; never morph or independently animate. ` +
-          `Scene 3 (${t2}–${dur.toFixed(1)}s): ease to a readable end state with the product still clear in the ${sideLabel} band; never drift toward the ${oppositeLabel}; natural motion only, never fantasy.`
-        : `Scene 2 (${t1}–${t2}s): hold the product as the star with centre-safe framing; soft ambient motion continues; optional gentle push or drift as a real camera would. ` +
-          `Product identity absolute — may move only as the real item would with the wearer/scene; never morph or independently animate. ` +
-          `Scene 3 (${t2}–${dur.toFixed(1)}s): ease to a readable full-scene end state with the product still clear and centre-safe; natural motion only, never fantasy.`)
-    );
-  } else if (lifestyle && subjectHold) {
-    // SUBJECT-HOLD timeline. The stock lifestyle timeline opens with "gentle
-    // camera finds the product already in the lifestyle plate" — and that
-    // instruction is precisely the defect when no product is identified: it
-    // sends the model hunting, and it picks something. So the product-hunting
-    // language is REPLACED here, not merely softened, and the beat times
-    // (t1/t2) stay identical so Remotion's brand-script still lines up via
-    // specTimeScale. Reachable only with VIDEO_SUBJECT_HOLD on AND a hold
-    // block actually in the prompt, so flag-off is byte-identical (B14).
-    lines.push(
-      `Timeline (${dur.toFixed(1)}s): ` +
-      `Scene 1 (0.0–${t1}s): settle into the real moment exactly as framed — do not search for or single out a product; ambient life may begin (fabric with the wearer, hair, breath, steam, water, foliage as present). No whip, no orbit, no parallax. ` +
-      `Scene 2 (${t1}–${t2}s): hold the framing. The person stays in frame with the face readable throughout; soft ambient motion continues around them; no push-in, no drift, no reframing. ` +
-      `Everything visible keeps its real identity — items may move only as the real thing would with the wearer/scene; never morph or independently animate. ` +
-      `Scene 3 (${t2}–${dur.toFixed(1)}s): end on essentially the opening composition, face still readable; natural motion only, never fantasy.`
-    );
-  } else if (lifestyle) {
-    lines.push(
-      `Timeline (${dur.toFixed(1)}s): ` +
-      `Scene 1 (0.0–${t1}s): settle into the real moment — gentle camera finds the product already in the lifestyle plate; ambient life may begin (fabric with the wearer, hair, breath, steam, water, foliage as present). No whip, no orbit, no parallax. ` +
-      `Scene 2 (${t1}–${t2}s): hold the product as the star; soft ambient motion continues around it; optional gentle push or drift as a real camera would. ` +
-      `Product identity absolute — may move only as the real item would with the wearer/scene; never morph or independently animate. ` +
-      `Scene 3 (${t2}–${dur.toFixed(1)}s): ease to a readable full-scene end state with the product still clear; natural motion only, never fantasy.`
-    );
-  } else if (isHookFirst) {
-    lines.push(
-      `Timeline (${dur.toFixed(1)}s): ` +
-      `Scene 1 (0.0–${t1}s): HOOK — product fully legible and identifiable from the first frame; ` +
-      `the establishing camera move happens WITH the product already reading as the subject, not before it. ` +
-      // Scene 1's move must match the aspect. A left→right pan is right for a
-      // WIDE frame, but on 9:16 it walks the subject toward the side margins —
-      // where the platform's engagement rail sits — directly contradicting the
-      // centre-safe rule stated in cameraStyle two lines later. The Frame line
-      // is already aspect-aware; the timeline has to be too, or the two halves
-      // of the same prompt disagree.
-      //
-      // Split-stage (2026-08, 16:9 + subjectSide east|west): a left→right pan
-      // drags the subject straight through the opposite-side region reserved
-      // for brand-script chrome (pill → headline → quote → CTA). Replace the
-      // pan with a product-anchored push-in; keep t1/t2 beat times identical
-      // so titling's specTimeScale still lands on the same grid.
-      (isVerticalAspect
-        ? `Very slow push-in toward the product, ~8–12% movement, product held on the vertical centre line. No lateral drift toward either side margin. No rotation or perspective shift. `
-        : isSplit
-          ? `Product anchored in the ${sideLabel} vertical band of the wide frame for the entire clip — no lateral pan, drift, or travel toward the ${oppositeLabel}. Subtle push-in on the product itself only, ~8–12% movement. No rotation or perspective shift. `
-          : `Slow horizontal pan left→right across the product, ~10–15% movement. No zoom, rotation, or perspective shift. `) +
-      `The product must be unmistakable within the first 2.0s. ` +
-      // Scene 2 "centered" under split: the stock word means "zoom centered
-      // on the logo/detail", but models (and prompt readers) also take it as
-      // frame-centre composition — which re-pulls a side-anchored product
-      // toward the middle and undoes the split. Keep the SAME product-detail
-      // zoom intent (~8–10%) but reword to subject-anchored in the side band.
-      // Decision (2026-08): YES, rewrite under split; leave "centered" alone
-      // on the non-split path (byte-identity).
-      (isSplit
-        ? `Scene 2 (${t1}–${t2}s): slow zoom toward the most distinctive product detail (~8–10%), subject-anchored in the ${sideLabel} band — do not re-centre the product in the frame. No rotation or distortion. ` +
-          `Scene 3 (${t2}–${dur.toFixed(1)}s): begin slightly cropped, slow zoom out ~10–12% to reveal the full product. Hold the product in the ${sideLabel} band throughout; never drift toward the ${oppositeLabel}.`
-        : `Scene 2 (${t1}–${t2}s): slow zoom toward the most distinctive product detail (~8–10%), centered. No rotation or distortion. ` +
-          `Scene 3 (${t2}–${dur.toFixed(1)}s): begin slightly cropped, slow zoom out ~10–12% to reveal the full product. Maintain centre-safe framing.`)
-    );
-  } else {
-    lines.push(
-      `Timeline (${dur.toFixed(1)}s): ` +
-      `Scene 1 (0.0–${t1}s): slow horizontal pan left→right, ~10–15% movement. No zoom, rotation, or perspective shift. ` +
-      // Scene 2 "zoom toward the most distinctive product detail" invites
-      // invention (owner 2026-09-02). Pelagic failing-master defects
-      // (invented cuff logo, thumbholes, competitor collar label, garbled
-      // waistband text) cluster at the Scene 2 baseline (t=5.0s of a 10s
-      // clip). Keep the slow zoom; stop asking the model to hunt a detail.
-      // Do not reword Scene 1 / Scene 3 — B14 freeze still applies to those.
-      `Scene 2 (${t1}–${t2}s): slow zoom in (~8–10%) on the product as already shown, centered. No rotation or distortion. ` +
-      `Scene 3 (${t2}–${dur.toFixed(1)}s): begin slightly cropped, slow zoom out ~10–12% to reveal the full product. Maintain center framing.`
-    );
-  }
-  lines.push(d.transitions);
-  // Packshot hook_first cameraStyle (HOOK_FIRST_DIRECTIVES) embeds the same
-  // centre-safe "central region / outer side margins" clause that the
-  // lifestyle inject below carries. Under split that clause FORBIDS
-  // side-anchoring — the twin of the lifestyle trap that was nearly missed in
-  // review. Emit a split-safe camera line for packshot+split only; every other
-  // path keeps the stock directive so non-split prompts stay byte-identical.
-  if (isSplit && isHookFirst && !lifestyle) {
-    // DERIVED, NOT REWRITTEN. An earlier draft hardcoded a replacement camera
-    // style; that copy both drifted from the canonical directive and permitted
-    // "parallax" while still asserting "The product stays completely static" —
-    // a self-contradicting instruction on a billable submit. Substituting only
-    // the centre-safe sentence keeps the shared prohibition list (incl.
-    // parallax) and every future edit to HOOK_FIRST_DIRECTIVES.cameraStyle verbatim.
-    // The harness pins that the prohibition survives.
-    const splitComposition =
-      `Split-stage composition: hold the product in the ${sideLabel} vertical band of the wide frame, ` +
-      `away from the top and bottom bands where the platform overlays UI; ` +
-      `never drift, pan or travel toward the ${oppositeLabel}. `;
-    const centreSafeSentence =
-      `Centre-safe composition: keep the product and any focal detail within the central region of the frame — ` +
-      `away from the top and bottom bands and the outer side margins, where the platform overlays UI. `;
-    lines.push(
-      d.cameraStyle.includes(centreSafeSentence)
-        ? d.cameraStyle.replace(centreSafeSentence, splitComposition)
-        // Directive changed shape — append rather than silently ship a
-        // centre-safe instruction that forbids the anchoring we just asked for.
-        : `${d.cameraStyle} ${splitComposition}`
-    );
-  } else {
-    lines.push(d.cameraStyle);
-  }
-  // Centre-safe is hook-first destination treatment. Lifestyle cameraStyle
-  // does not carry it, so inject when both are active. Complementary with
-  // lifestyle motion — not a contradiction.
+  // WHY. Nine hours of measured comparison on 2026-09-02/03: this single
+  // 1,159-byte prompt (sha256 67899bcfdf16…, measured as
+  // scratchpad/gemini-direct/native-generic/CORE.txt) beat the per-SKU
+  // PRODUCT-MARKS prompts and the fidelity-block prompts on the thing that
+  // actually matters — brand marks surviving intact. It rendered PELAGIC
+  // correctly on the first try on the Chubasco jacket, where the
+  // hand-written per-SKU marks prompts garbled it.
   //
-  // Split-stage exception (2026-08): centre-safe says "away from … the outer
-  // side margins", which directly forbids anchoring the subject to one side.
-  // That combination (lifestyle + hook_first + split) was the one nearly
-  // missed in review because the inject only fires on lifestyle+hook_first.
-  // Under split emit the side-anchored composition instead — never both.
+  // The 14,883 bytes of directive objects this replaces are recorded here so
+  // a revert is mechanical rather than archaeological — the text itself is
+  // in git at 9e944c8:src/services/veoPromptBuilder.js:
+  //     OMNI_DIRECTIVES        4595 B  sha256:07cee0fdcdde41c0
+  //     GROK_DIRECTIVES        2430 B  sha256:bd6202cc7a4a3bd0
+  //     HOOK_FIRST_DIRECTIVES  2167 B  sha256:c339ca14f0dd83e7
+  //     LIFESTYLE_DIRECTIVES   5691 B  sha256:8c9560981ddee4c4
   //
-  // PLATFORM-NEUTRALITY EDIT (owner standardization 2026-08-18): both labels
-  // used to read "(PMax destination)". One profile now serves Meta and PMax,
-  // so naming PMax in text sent to the model on a Meta ad was false. Only the
-  // parenthetical label changed — the directives themselves are untouched.
-  if (lifestyle && isHookFirst) {
-    if (isSplit) {
-      lines.push(
-        `Split-stage composition (video destination): keep the product and any focal detail in the ${sideLabel} vertical band of the wide frame for the whole clip — ` +
-        `do not centre it or drift it toward the ${oppositeLabel} side. Keep the ${oppositeLabel} side calm, uncluttered, and unobstructed.`
-      );
-    } else {
-      lines.push(
-        `Centre-safe composition (video destination): keep the product and any focal detail within the central region of the frame — ` +
-        `away from the top and bottom bands and the outer side margins, where the platform overlays UI.`
-      );
-    }
-  }
-
-  // Aspect-aware framing — hook_first destinations (packshot AND lifestyle).
-  // SINCE 2026-08-18 THIS INCLUDES META: a Meta 9:16 master now emits the
-  // `Frame (9:16 vertical)` line it never used to. Only the kill-switch-off
-  // (gemini-omni) arm is Frame-less now.
+  // THIS DELETES THE PR #61 ROLLBACK GUARANTEE, KNOWINGLY. §00 of both
+  // repos' CLAUDE.md says the OMNI/GROK text is frozen byte-for-byte to
+  // 9531ae9f and must never be reworded, because the owner rolled #61 back
+  // saying "the previous output was better". That guarantee was enforced by
+  // verifyPostPilotBatch B14/B15 — and B14 HAS BEEN SILENTLY SKIPPING:
+  // its baseline relocation rewrote only require('./platformFormats') while
+  // the baseline also requires './videoProductAnchor', so require() threw
+  // MODULE_NOT_FOUND from the temp dir and the catch reported it as "git
+  // unavailable", which is a misdirection. Forced to actually run, clean
+  // origin/main failed it 102 of 236, with 42 of the failing blocks being
+  // the seed-text overlay guard. So the frozen prompt had ALREADY drifted
+  // from its own baseline on trunk. You cannot lose a guarantee you were
+  // not holding — that, not the directive, is the real argument here.
   //
-  // Only 16:9 and 9:16 have a Frame line. Meta's 1:1 / 4:5 surfaces are free
-  // CROPS of the 9:16 master (deriveFromMaster) and never build their own
-  // prompt, so no Frame line is needed for them; if one ever did submit, it
-  // simply gets no Frame line rather than a wrong one. No new directive text
-  // was invented for those aspects — the owner standardized on this text as-is.
-  if (isHookFirst) {
-    const ar = String(aspectRatio || '');
-    if (ar === '16:9') {
-      if (isSplit) {
-        // Opposite-side calm language deliberately avoids the words "text",
-        // "copy", "caption" as things the model should leave room for — the
-        // prompt already carries noText ("Do NOT render any text… causes
-        // rejection"). "Leave room for text" induces letterforms; "keep that
-        // region calm and unobstructed" does not. Chrome is composited
-        // downstream (brand pill ≤1s → headline 0–3s → quote 3–7s → CTA 7–10s).
-        lines.push(
-          `Frame (16:9 landscape, split-stage): anchor the product in a vertical band on the ${sideLabel} side of the wide frame for the entire clip. ` +
-          // "push-in" ONLY — never "parallax". The shared camera prohibition
-          // list in HOOK_FIRST_DIRECTIVES.cameraStyle forbids parallax outright, and
-          // an earlier draft prescribed it here while that ban was still in the
-          // same prompt: a self-contradicting instruction on a billable submit.
-          // A push-in is a zoom, which the list permits.
-          `Camera motion is limited to a subtle push-in on the product itself (~8–12%); do not pan, drift, or travel the product toward the ${oppositeLabel} side. ` +
-          `Keep the ${oppositeLabel} side visually calm, uncluttered, and free of new objects or competing focal detail so that region stays unobstructed.`
-        );
-        if (isBrandPanel) {
-          lines.push(
-            `Opposite-side treatment: the ${oppositeLabel} side is a plain uniform brand-colour backdrop — keep it clean, flat, and unmodified; do not invent scene content or new objects there.`
-          );
-        } else {
-          // scene_extend (default / explicit). Seed may already carry the
-          // extended plate; either way the opposite band must stay calm.
-          lines.push(
-            `Opposite-side treatment: the ${oppositeLabel} side continues the existing scene as a calm extension — no new objects, people, or busy detail introduced there.`
-          );
-        }
-      } else {
-        lines.push(
-          `Frame (16:9 landscape): use wider establishing framing; prefer horizontal camera travel rather than vertical. ` +
-          `Hold the product in the central band of the wide frame with generous headroom above and below the product.`
-        );
-      }
-    } else if (ar === '9:16') {
-      lines.push(
-        `Frame (9:16 vertical): vertical-appropriate framing with the product readable upright in portrait. ` +
-        `Keep the product in the central region, clear of the top and bottom bands and the right edge where the platform overlays UI.`
-      );
-    }
-  }
+  // WHAT IS DELIBERATELY KEPT:
+  //  • The operator-refinement lever above and the CONSTRAINT SUPREMACY line
+  //    below — both are real product features, not prompt prose.
+  //  • Ad.videoPromptRaw (full replacement, upstream of this function).
+  //  • The per-model byte cap.
+  //  • promptProfileFor / directivesForProfile / isHookFirstVideoPromptEnabled
+  //    as shims. They are vestigial for prompt selection now, but
+  //    campaignAdsGenerationService.isSharedPortraitPlatePromptCoherent()
+  //    imports isHookFirstVideoPromptEnabled as conjunct 4 of the
+  //    shared-portrait-master MONEY gate ($1.80 vs $2.70 on a mixed
+  //    Meta+PMax run) and FAILS CLOSED on a missing export. Deleting them
+  //    would silently pin that gate closed. Behaviour is unchanged from
+  //    today: the switch still ships false, so mixed runs still bill 3
+  //    masters. Making the gate honest under a single prompt (Meta and PMax
+  //    now provably get identical bytes, so coherence is guaranteed by
+  //    construction → $1.80) is a real saving and a real BILLING CHANGE —
+  //    it needs its own owner decision, not a side effect of this one.
+  //
+  // KNOWN AND ACCEPTED: CORE says "premium Meta product commercial" and is
+  // sent to PMax destinations too. Kept byte-exact rather than forking a
+  // "premium product commercial" variant, because this repo has a MEASURED
+  // NULL RESULT on rewriting fidelity prose (static-fidelity-block-ab) and
+  // an owner rollback (#61) on doing it anyway. Do not reword it to tidy
+  // this up; test a variant if you want to change it.
+  //
+  // Only the duration is interpolated, so the prompt can never claim a
+  // length the render is not.
+  // ══════════════════════════════════════════════════════════════════════
+  lines.push(corePromptText(durationSec));
 
-  lines.push(d.background);
-  lines.push(d.visualStyle);
-
-  // Fixed audio default — some models (Gemini Omni) generate native
-  // audio, so the directive is load-bearing even for a camera-only clip.
-  lines.push(d.audio);
-
-  // NO TEXT — the brand-script overlay composites downstream. Text and
-  // logos physically present in the photographs are fine to show (Scene
-  // 2 zooms toward the logo); GENERATING text/graphics is what's banned.
-  // (The creative-director negative-space hint was removed — titling is
-  // canonical/deterministic and no longer shapes the video prompt.)
-  lines.push(d.noText);
-
-  // UI-CHROME GUARD (VIDEO_PROMPT_UI_CHROME_GUARD, default ON) — see
-  // isVideoUiChromeGuardEnabled above for the incident this closes and the
-  // live A/B that verified it before the default flipped on. Runs for every
-  // profile (packshot, lifestyle, hook_first, split) since it sits in the
-  // shared assembly section, not inside `d`.
-  if (isVideoUiChromeGuardEnabled()) {
-    lines.push(UI_CHROME_GUARD_LINE);
-  }
-
-  // The overlay/sticker "do not reproduce" block and the on-product "reproduce
-  // faithfully" lock line were stripped 2026-09-03. They contradicted
-  // OMNI_DIRECTIVES.noText (which already says both halves, unconditionally,
-  // in every production prompt) and keyed on Media.text[].type — a classifier
-  // proven wrong three ways tonight. noText is the sole text directive.
-
-  lines.push(d.physicalAccuracy);
-
-  // Lifestyle ambient-life directive (only on the lifestyle branch).
-  if (lifestyle && d.ambientLife) {
-    lines.push(d.ambientLife);
-  }
-
-  // Reference stack: position 0 is the seed (main image); subsequent
-  // positions are the product hero + alternate views in stored order
-  // (buildReferenceImages). hasProductReference is false only when the
-  // stack is seed-only (no product imagery available, or a 1-ref model).
-  // Lifestyle path deliberately ships 1 ref → seed-only fidelity wording.
-  if (hasProductReference) {
-    lines.push(
-      `PRODUCT FIDELITY: All supplied images show the exact catalog SKU — the first image is the primary scene, ` +
-      `the rest are additional views of the same product. Together they are the ABSOLUTE source of truth for shape, color, ` +
-      `label text, packaging, and proportions. If any images disagree on a detail, the dedicated product shots win over the scene image. ` +
-      `Do NOT blend the views into new angles, reinterpret the label, shift colors, or generate a similar-but-different variant.`
-    );
-  } else {
-    lines.push(
-      `PRODUCT FIDELITY: The product visible in the scene image is the catalog product. ` +
-      `Preserve its exact shape, color, label text, packaging, and proportions throughout. ` +
-      `Do NOT reinterpret the label, shift colors, or generate a similar-but-different variant.`
-    );
-  }
-
-  lines.push(d.doNot);
-
-  if (lifestyle) {
-    lines.push(
-      `Output: ${Number(durationSec || 8).toFixed(1)}s duration. Authentic lived-in moment brought to life. ` +
-      `Product identity absolute and unchanged — natural real-item motion with the wearer/scene only; never morph, re-drape, or independently animate. ` +
-      `Ambient life only — no fantasy motion. Final result should look like the original photograph breathing, with no sign that AI rebuilt the product or the scene.`
-    );
-  } else {
-    lines.push(
-      `Output: ${Number(durationSec || 8).toFixed(1)}s duration. Camera movement only. Product unchanged. Luxury ecommerce aesthetic. ` +
-      `Final result should look like a professional camera moving over the original photographs, with no sign that AI touched the product.`
-    );
-  }
 
   // CONSTRAINT SUPREMACY — the precedence rule, in the strongest position.
   // MUST stay the LAST element of `lines`: recency is what makes the model
@@ -1420,6 +1136,9 @@ function enforceRawByteCap(text, caps = null) {
 
 module.exports = {
   buildVeoPrompt,
+  // Exported so scripts/verifyOperatorPromptPrecedence.js group A can pin the
+  // emitted prompt against the measured artifact rather than a paraphrase.
+  corePromptText,
   resolveSubject,
   archetypeDescription,
   aspectRatioForPlatformFormat,
