@@ -52,6 +52,7 @@ const {
   buildReferenceImages,
   sortCatalogMediasForReferenceStack
 } = require('./atlasVideoService');
+const { resolveVideoReferenceForMedia } = require('./videoReferenceResolver');
 const referenceDefaultsService = require('./referenceDefaultsService');
 
 // Gemini's reference_to_video max image count is NOT PUBLISHED. Measured 3-4;
@@ -181,6 +182,18 @@ async function assembleReferences({ ad, aspectRatioOverride = null }) {
         })
     : null;
 
+  // Per-identity URL resolver. reframeReferenceForAspect (Atlas path) is
+  // gated on VIDEO_PROVIDER=atlas — the direct-Gemini path (this file's
+  // reason for existing) fails that gate and short-circuits to
+  // cropImageUrlForAspect BEFORE the DINO cache-read, throwing away every
+  // yolo-crop / yolo-crop-forced / product-only-pad URL that
+  // reframeStrategyChooser already persisted at $0. resolveVideoReferenceForMedia
+  // is provider-agnostic: it reads the cache first, then falls back to the
+  // same c-fill URL the reframe path returns on cache miss. Same ordering,
+  // same cap, same dedupe — buildReferenceImages still owns those.
+  // See session.d/2026-09-03_video-ref-resolver-adgen-port.md.
+  const cacheHits = [];
+  const cacheMisses = [];
   const urls = await buildReferenceImages({
     media,
     product,
@@ -196,8 +209,25 @@ async function assembleReferences({ ad, aspectRatioOverride = null }) {
     brandId: media.brandId || null,
     productId: ad.productId || null,
     adId: ad._id,
-    campaignRunId: null
+    campaignRunId: null,
+    resolveUrlForIdentity: (id) => {
+      const { url, source, method } = resolveVideoReferenceForMedia({
+        media: id.mediaDoc,
+        aspectRatio,
+        brand
+      });
+      const mid = id.mediaDoc?._id ? String(id.mediaDoc._id) : id.sourceUrl;
+      if (source === 'reframe-cache') cacheHits.push(`${mid}(${method || 'cache'})`);
+      else cacheMisses.push(mid);
+      return url || id.sourceUrl;
+    }
   });
+  console.log(
+    `📎 gemini refs[ad=${ad._id}][${aspectRatio}]: ` +
+    `${cacheHits.length} cache-hit${cacheHits.length !== 1 ? 's' : ''}, ` +
+    `${cacheMisses.length} c-fill fallback${cacheMisses.length !== 1 ? 's' : ''}` +
+    (cacheHits.length ? ` — hits: ${cacheHits.join(', ')}` : '')
+  );
 
   if (!Array.isArray(urls) || urls.length === 0) {
     const err = new Error('gemini refs: buildReferenceImages returned no references');
@@ -228,16 +258,20 @@ async function assembleReferences({ ad, aspectRatioOverride = null }) {
     images.push({ buffer: got.buffer, mimeType: got.mimeType, sourceUrl: url });
   }
 
-  // A transform on the raw path means the reframe ladder leaked back in.
-  // Cheap to assert, and it is the whole owner directive in one line.
-  const transformed = images
+  // Outpaint-leak canary. The resolver's two outputs are intentional: a
+  // cached deterministic Cloudinary crop (c_crop / c_pad, DINO-derived) or a
+  // c_fill / g_auto fallback. Both are $0. What is NOT intentional is a
+  // /liquidretail/reframes/ upload — that path only exists for BILLED
+  // nano-banana outpaint results, and the resolver has no route to reach
+  // it. If one shows up here, the reframe ladder leaked in through some
+  // other seam and needs investigating.
+  const outpaintLeak = images
     .map((i) => i.sourceUrl)
-    .filter((u) => /\/c_(pad|crop|fill|limit)[,/]|\/liquidretail\/reframes\//.test(String(u)));
-  if (transformed.length) {
+    .filter((u) => /\/liquidretail\/reframes\//.test(String(u)));
+  if (outpaintLeak.length) {
     console.warn(
-      `⚠️  gemini refs[ad=${ad._id}]: ${transformed.length} reference(s) carry a Cloudinary ` +
-      `transform or a /reframes/ path — VIDEO_RAW_CATALOG_REFERENCES may be off. ` +
-      `Raw catalog images are the directive; this generation will use reshaped inputs.`
+      `⚠️  gemini refs[ad=${ad._id}]: ${outpaintLeak.length} reference(s) came from the paid ` +
+      `/liquidretail/reframes/ upload path — the resolver should never trigger outpaint. Investigate.`
     );
   }
 

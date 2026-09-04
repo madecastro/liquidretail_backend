@@ -3678,7 +3678,17 @@ async function buildReferenceImages({
   // ordered Media-doc array (operator pick order). Position 0 = primary
   // seed. Skips seed+catalogMedias+fallback assembly entirely.
   orderedReferenceMedia = null,
-  brandId = null, productId = null, adId = null, campaignRunId = null
+  brandId = null, productId = null, adId = null, campaignRunId = null,
+  // Opt-in URL resolver. When a function is provided, it REPLACES the
+  // reframeReferenceForAspect call per identity — same ordering, same cap,
+  // same dedupe, different URL derivation. Used by the direct-Gemini path
+  // (services/geminiReferenceAssembly.js) to route every ref through
+  // resolveVideoReferenceForMedia, whose cache-read is not gated on
+  // VIDEO_PROVIDER=atlas the way reframeReferenceForAspect's is.
+  // Signature: (id) => string | Promise<string>, where id is
+  // { mediaDoc, sourceUrl }. Any thrown/rejected error drops that ref, same
+  // per-item catch discipline as the Atlas path.
+  resolveUrlForIdentity = null
 }) {
   const requested = Number.isFinite(referenceCount) && referenceCount >= 1
     ? Math.min(referenceCount, MAX_REFERENCE_IMAGE_COUNT)
@@ -3884,24 +3894,36 @@ async function buildReferenceImages({
   // to lean on, so it is now enforced here instead of assumed. null is already
   // handled: the dedupe loop below skips falsy entries, so a failed reframe
   // simply drops out of the reference stack and the remaining refs still ship.
-  const reframed = await Promise.all(
-    capped.map(id => reframeReferenceForAspect({
-      media: id.mediaDoc,
-      sourceUrl: id.sourceUrl,
-      aspectRatio,
-      brand,
-      brandId,
-      productId,
-      adId,
-      campaignRunId
-    }).catch((err) => {
-      console.warn(
-        `⚠️  buildReferenceImages: reframe failed for ${id.mediaDoc?._id || id.sourceUrl} ` +
-        `[${aspectRatio}] — dropping this reference, run continues: ${err?.message || err}`
-      );
-      return null;
-    }))
-  );
+  const reframed = typeof resolveUrlForIdentity === 'function'
+    ? await Promise.all(capped.map(async (id) => {
+        try {
+          return await resolveUrlForIdentity(id);
+        } catch (err) {
+          console.warn(
+            `⚠️  buildReferenceImages: resolveUrlForIdentity failed for ${id.mediaDoc?._id || id.sourceUrl} ` +
+            `[${aspectRatio}] — dropping this reference, run continues: ${err?.message || err}`
+          );
+          return null;
+        }
+      }))
+    : await Promise.all(
+      capped.map(id => reframeReferenceForAspect({
+        media: id.mediaDoc,
+        sourceUrl: id.sourceUrl,
+        aspectRatio,
+        brand,
+        brandId,
+        productId,
+        adId,
+        campaignRunId
+      }).catch((err) => {
+        console.warn(
+          `⚠️  buildReferenceImages: reframe failed for ${id.mediaDoc?._id || id.sourceUrl} ` +
+          `[${aspectRatio}] — dropping this reference, run continues: ${err?.message || err}`
+        );
+        return null;
+      }))
+    );
 
   // Dedup identical final URLs, keep order.
   const out = [];
