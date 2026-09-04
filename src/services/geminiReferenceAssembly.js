@@ -188,12 +188,21 @@ async function assembleReferences({ ad, aspectRatioOverride = null }) {
   // cropImageUrlForAspect BEFORE the DINO cache-read, throwing away every
   // yolo-crop / yolo-crop-forced / product-only-pad URL that
   // reframeStrategyChooser already persisted at $0. resolveVideoReferenceForMedia
-  // is provider-agnostic: it reads the cache first, then falls back to the
-  // same c-fill URL the reframe path returns on cache miss. Same ordering,
-  // same cap, same dedupe — buildReferenceImages still owns those.
+  // is provider-agnostic and has three tiers: cache → on-demand DINO crop
+  // → c_fill saliency. Same ordering, same cap, same dedupe as
+  // buildReferenceImages, which still owns those.
   // See session.d/2026-09-03_video-ref-resolver-adgen-port.md.
-  const cacheHits = [];
-  const cacheMisses = [];
+  //
+  // Three per-source buckets — greppable in production. `cache=N` counts
+  // reframe-cache hits (prewarm did its job), `on-demand=K` counts crops
+  // computed live because the cache missed but DINO bboxes were present
+  // (indicates a prewarm↔render seed-selection divergence, worth
+  // investigating), `c-fill=M` counts pure Cloudinary saliency fallbacks
+  // (DINO signal genuinely absent — fresh ingest, non-Cloudinary source,
+  // or a shot the pipeline hasn't detected on). `c-fill` on a Media that
+  // has refinedProducts is the load-bearing anomaly to grep for.
+  const refDetails = [];
+  const counts = { cache: 0, 'on-demand': 0, 'c-fill': 0 };
   const urls = await buildReferenceImages({
     media,
     product,
@@ -216,17 +225,19 @@ async function assembleReferences({ ad, aspectRatioOverride = null }) {
         aspectRatio,
         brand
       });
-      const mid = id.mediaDoc?._id ? String(id.mediaDoc._id) : id.sourceUrl;
-      if (source === 'reframe-cache') cacheHits.push(`${mid}(${method || 'cache'})`);
-      else cacheMisses.push(mid);
+      const mid = id.mediaDoc?._id ? String(id.mediaDoc._id).slice(-6) : String(id.sourceUrl).slice(0, 20);
+      const bucket = source === 'reframe-cache' ? 'cache'
+                    : source === 'on-demand-yolo' ? 'on-demand'
+                    : 'c-fill';
+      counts[bucket] += 1;
+      refDetails.push(`${mid}(${bucket}:${method || 'saliency'})`);
       return url || id.sourceUrl;
     }
   });
   console.log(
     `📎 gemini refs[ad=${ad._id}][${aspectRatio}]: ` +
-    `${cacheHits.length} cache-hit${cacheHits.length !== 1 ? 's' : ''}, ` +
-    `${cacheMisses.length} c-fill fallback${cacheMisses.length !== 1 ? 's' : ''}` +
-    (cacheHits.length ? ` — hits: ${cacheHits.join(', ')}` : '')
+    `cache=${counts.cache} on-demand=${counts['on-demand']} c-fill=${counts['c-fill']}` +
+    (refDetails.length ? ` — ${refDetails.join(' ')}` : '')
   );
 
   if (!Array.isArray(urls) || urls.length === 0) {
