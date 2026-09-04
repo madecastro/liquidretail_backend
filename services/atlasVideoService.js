@@ -4567,6 +4567,60 @@ async function refreshStaleLayoutInput({ layoutInput, ad, media, brand, product,
   return layoutInput;
 }
 
+// Provider-agnostic layoutInput warming. Extracted from prepareStoryboard
+// so non-Atlas video paths (direct-Gemini gemini-omni-1.1-flash, Veo 3.1
+// preview, and any future reference-to-video endpoint) can warm the same
+// LayoutInputArtifact the titler reads downstream via buildMetaForAd.
+//
+// Before this existed, videoRouter.prepareStoryboard short-circuited on
+// non-Atlas providers (`if (activeProvider() !== 'atlas') return {storyboard:null}`)
+// which skipped refreshStaleLayoutInput entirely. Every video ad on the
+// direct-Gemini path since the 2026-09-03 cutover shipped with the
+// titler's "no layoutInput for ... — degrading to ad.copy" fallback,
+// throwing away the funnel-stage-aware quote pick, provenance-stamped
+// primary_quote, palette-bound style resolution, and copy cascade.
+// Diagnosed 2026-09-04 — first missed-warm was ~19:13 CT Sep 3, aligned
+// with the last Atlas-path video render.
+//
+// Signature intentionally minimal — takes just `ad`, does its own loads.
+// Returns the resolved layoutInput (or null on failure). Fail-safe: on
+// any load / derivation error, logs and returns null rather than
+// throwing — the titler downstream still falls back to ad.copy on null,
+// so a bad warm degrades gracefully instead of killing the render.
+//
+// Does NOT run model + aspect resolution (that's Atlas-specific,
+// consumed only by the Atlas `generateForAd` path). Uses the platform
+// aspect directly for the derivation, same as prepareStoryboard's
+// documented "derivation runs at the platform aspect, NOT the render
+// aspect" invariant.
+async function warmLayoutInputForVideoAd({ ad }) {
+  if (!ad || !ad.mediaId) return null;
+  try {
+    const media = await Media.findById(ad.mediaId).lean();
+    if (!media) {
+      console.warn(`⚠️  warmLayoutInputForVideoAd: Media ${ad.mediaId} not found for ad=${ad._id}`);
+      return null;
+    }
+    const [brand, product, layoutInputInitial, campaign] = await Promise.all([
+      media.brandId ? Brand.findById(media.brandId).lean() : null,
+      ad.productId ? CatalogProduct.findById(ad.productId).lean() : null,
+      LayoutInputArtifact.findOne({ mediaId: media._id, productId: ad.productId || null })
+        .sort({ createdAt: -1 }).lean(),
+      ad.campaignId ? Campaign.findById(ad.campaignId).select('kind').lean() : null
+    ]);
+    const categories = product ? await loadCategoryChainForProduct(product) : [];
+    const targetAspect = aspectRatioForPlatformFormat(ad.platformFormat) || ad.aspectRatio || '9:16';
+    return await refreshStaleLayoutInput({
+      layoutInput: layoutInputInitial, ad, media, brand, product, categories, campaign, targetAspect
+    });
+  } catch (err) {
+    console.warn(
+      `⚠️  warmLayoutInputForVideoAd: failed for ad=${ad._id} — titler will use ad.copy fallback: ${err.message}`
+    );
+    return null;
+  }
+}
+
 // Prepare the storyboard for an ad — context load + GPT storyboard
 // generation, no video generation. Used by the orchestrator to produce
 // the storyboard once before dispatching Grok and chrome in parallel.
@@ -5359,6 +5413,7 @@ module.exports = {
   TERMINAL_OK_STATUSES,
 
   prepareStoryboard,
+  warmLayoutInputForVideoAd,
   enabled,
   MODEL_CAPS,
   BUILT_IN_DEFAULT_MODEL,

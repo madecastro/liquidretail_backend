@@ -35,8 +35,27 @@ function activeProvider() {
 // Burns prompt fully directs motion). Only the Atlas provider exposes
 // this hook; on Vertex the caller should pass null and accept
 // sequential execution.
+//
+// NON-ATLAS BRANCH — the direct-Gemini path (VIDEO_PROVIDER=gemini) and
+// any future non-Atlas provider still needs layoutInput warming. Before
+// this branch called warmLayoutInputForVideoAd, the non-Atlas short-
+// circuit skipped Atlas's prepareStoryboard entirely — and with it,
+// refreshStaleLayoutInput → buildLayoutInput → LayoutInputArtifact
+// creation. Diagnosed 2026-09-04: every video ad since the direct-Gemini
+// cutover shipped with the titler's "no layoutInput ... — degrading to
+// ad.copy" fallback, silently throwing away the funnel-stage-aware quote
+// pick, provenance-stamped primary_quote, palette-bound style resolution,
+// and copy cascade the titler was designed to consume. Model + aspect
+// resolution stays skipped here — that's Atlas-consumer-only.
 async function prepareStoryboard({ ad, operatorPrompt = null, modelOverride = null }) {
-  if (activeProvider() !== 'atlas') return { storyboard: null };
+  if (activeProvider() !== 'atlas') {
+    // warmLayoutInputForVideoAd is fail-safe (logs + returns null on any
+    // load / derivation error). We do NOT await-then-throw — a bad warm
+    // still lets the render proceed with the ad.copy fallback the titler
+    // already handles gracefully.
+    await atlasVideoService.warmLayoutInputForVideoAd({ ad });
+    return { storyboard: null };
+  }
   return atlasVideoService.prepareStoryboard({ ad, operatorPrompt, modelOverride });
 }
 
