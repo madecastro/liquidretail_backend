@@ -1856,6 +1856,12 @@ async function runVideoVisionQcForAd({ ad, deliveredUrl, brandName = null }) {
     });
 
     adStage(ad._id, 'vision QC (video)');
+    // Derive-only ads (Ad.deriveFromMaster) share the master's paid video
+    // pixels — product_fidelity and competitor_marks defects are inherited
+    // from the master and cannot be fixed here. Ship gate on titling
+    // categories only; category scores stay full (see runVideoPostRenderQc
+    // + TITLING_CATEGORIES for the observability argument).
+    const titlingOnlyGate = !!ad.deriveFromMaster;
     const qcResult = await adVisionQc.runVideoPostRenderQc({
       enabled: true,
       originalProductUrls,
@@ -1865,7 +1871,8 @@ async function runVideoVisionQcForAd({ ad, deliveredUrl, brandName = null }) {
       productId: ad.productId || null,
       adId: ad._id || null,
       campaignRunId,
-      deliveredUrl
+      deliveredUrl,
+      titlingOnlyGate
     });
 
     if (qcResult.skipped || qcResult.uninspected) {

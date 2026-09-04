@@ -87,6 +87,21 @@ const CATEGORIES = Object.freeze([
   'layout_safe_box'
 ]);
 
+// Video derive-only ads (Ad.deriveFromMaster) are basePlateCropService
+// face-safe crops of a sibling master's already-paid video pixels + Remotion
+// titling on top. They CANNOT fix a fidelity defect that is baked into the
+// master — a derive that fails product_fidelity or competitor_marks is
+// re-litigating the master's verdict, and the derive would have to be
+// discarded even though its own contribution (the titling) is fine. So on a
+// derive we still ASK the judge for all four scores (kept on Ad.visionQc for
+// observability — the derive-side signal is what catches master QC false-
+// positives), but the ship gate only considers the two categories the derive
+// actually owns.
+const TITLING_CATEGORIES = Object.freeze([
+  'text_defects',
+  'layout_safe_box'
+]);
+
 // Per-category minimum to pass (0–10 integer scores from the model).
 const PASS_FLOOR = 7;
 
@@ -1428,15 +1443,26 @@ function reportQcVerdict({
   attempt = null,
   verdict = null,
   willRegenerate = false,
-  terminal = false
+  terminal = false,
+  titlingOnlyGate = false
 } = {}) {
   const pass = !!verdict?.pass;
   const cats = verdict?.categories || {};
+  // Category set the ship gate is evaluating. Log lines still print all four
+  // scores — the derive-side product_fidelity signal is what catches master
+  // QC false-positives, so an operator reading the log needs to see it — but
+  // the failing/summary lists are scoped to the gate.
+  const gatedCategories = titlingOnlyGate ? TITLING_CATEGORIES : CATEGORIES;
   const scoreParts = CATEGORIES.map((k) => {
     const c = cats[k];
-    return `${k}=${c ? c.score : '?'}${c && !c.pass ? '!' : ''}`;
+    const inGate = gatedCategories.includes(k);
+    // Categories outside the gate still print their score, but the `!`
+    // failure marker is scoped to the gate. A `~` marker on a below-floor
+    // ungated score keeps it visible without implying a ship blocker.
+    const flag = c && !c.pass ? (inGate ? '!' : '~') : '';
+    return `${k}=${c ? c.score : '?'}${flag}`;
   });
-  const failing = CATEGORIES
+  const failing = gatedCategories
     .filter((k) => cats[k] && !cats[k].pass)
     .map((k) => {
       const c = cats[k];
@@ -1452,8 +1478,9 @@ function reportQcVerdict({
   // genuinely lives. Console is free; Slack is not.
   console.log(
     `   🔍 adVisionQc: ad=${adId || '-'} attempt=${attempt ?? '?'} ` +
-    `${pass ? 'PASS' : 'FAIL'} floor=${PASS_FLOOR} ` +
-    `[${scoreParts.join(' ')}]${regenNote}` +
+    `${pass ? 'PASS' : 'FAIL'} floor=${PASS_FLOOR}` +
+    (titlingOnlyGate ? ' gate=titling-only(derive)' : '') +
+    ` [${scoreParts.join(' ')}]${regenNote}` +
     (verdict?.summary ? ` summary=${verdict.summary}` : '')
   );
   if (failing.length) {
@@ -2062,7 +2089,13 @@ async function runVideoPostRenderQc({
   campaignId = null,
   campaignRunId = null,
   deliveredUrl = null,
-  judgeFn = null
+  judgeFn = null,
+  // When true, the ship gate considers ONLY TITLING_CATEGORIES
+  // (text_defects, layout_safe_box). Set by callers on derive-only ads
+  // (Ad.deriveFromMaster) — see the TITLING_CATEGORIES constant for the
+  // full argument. All four category scores still come back from the
+  // judge and are persisted on Ad.visionQc; only pass/fail is re-scoped.
+  titlingOnlyGate = false
 } = {}) {
   // VIDEO pipeline — resolves the video-specific gate. Was resolveEnabled()
   // (the legacy, undifferentiated gate) before the 2026-08-21 split.
@@ -2126,7 +2159,25 @@ async function runVideoPostRenderQc({
     };
   }
 
-  reportQcVerdict({ adId, attempt: 1, verdict, willRegenerate: false, terminal: true });
+  // Re-scope pass on a derive: titling categories only, findings filtered to
+  // the same set so downstream alerts describe what actually caused the fail.
+  // Category records are UNCHANGED — full four scores stay on Ad.visionQc,
+  // which is where the derive-side signal for master QC false-positives lives.
+  if (titlingOnlyGate && verdict && verdict.categories) {
+    const cats = verdict.categories;
+    const titlingPass = TITLING_CATEGORIES.every((k) => cats[k] && cats[k].pass);
+    const gatedFindings = TITLING_CATEGORIES.reduce((acc, k) => {
+      const c = cats[k];
+      if (c && !c.pass && Array.isArray(c.findings)) {
+        for (const f of c.findings) acc.push(`[${k}] ${f}`);
+      }
+      return acc;
+    }, []);
+    verdict.pass = titlingPass;
+    verdict.findings = gatedFindings;
+  }
+
+  reportQcVerdict({ adId, attempt: 1, verdict, willRegenerate: false, terminal: true, titlingOnlyGate });
 
   const attempts = [{
     attempt: 1,
