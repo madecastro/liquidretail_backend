@@ -69,9 +69,23 @@ services:
     plan: pro_plus
     dockerfilePath: ./Dockerfile
     autoDeploy: true
-    # Set autoscale in the Render dashboard: min=2 (survives one instance
-    # replacement), max=8 (capacity for 2000 static/hr + 450 video/hr with
-    # margin — see src/config.js MAX_INFLIGHT comment for the math).
+    # Autoscale MUST live in this file, not just the dashboard. A blueprint
+    # sync without a scaling: stanza wipes the dashboard config — measured
+    # 2026-09-03 16:45 UTC: PR #109's deploy fired an
+    # autoscaling_config_changed event that flipped enabled true→false and
+    # dropped titler from 6 instances to 1, mid-run. Render treats a missing
+    # scaling: block as "disable autoscale", not "leave it alone." Same for
+    # adgen-titler below.
+    # min=2 (survives one instance replacement), max=4 (capacity for 2000
+    # static/hr + 450 video/hr with margin — see src/config.js MAX_INFLIGHT
+    # comment for the math). 60% thresholds match the previously-live
+    # dashboard values and clear the ~50% single-instance floor with
+    # REMOTION_QUEUE_CONCURRENCY=2 so autoscale only fires under real load.
+    scaling:
+      minInstances: 2
+      maxInstances: 4
+      targetMemoryPercent: 60
+      targetCPUPercent: 60
     envVars:
       - key: ADGEN_ROLE
         value: renderer
@@ -98,14 +112,20 @@ services:
     plan: pro_plus
     dockerfilePath: ./Dockerfile
     autoDeploy: true
-    # Dashboard autoscale documented here (min=1/max=8) has drifted from the
-    # live dashboard (min=4/max=12, raised 2026-08-25 in two steps) without
-    # this file being updated — the same drift class that let the
-    # concurrency regression above go unnoticed. All 3 OOM kills happened
-    # AFTER this widening: more instances didn't relieve the per-instance
-    # ceiling, just multiplied how many could hit it independently. Fix
-    # concurrency first; revisit max-instance count separately once that
-    # holds under real load.
+    # Autoscale MUST live in this file — see the adgen-renderer note above
+    # for the blueprint-sync-wipes-dashboard mechanism. min=4/max=12 is
+    # what was live on the dashboard until PR #109's deploy silently
+    # disabled it 2026-09-03 16:45 UTC; landing it here prevents the next
+    # PR from doing the same thing again. All 3 August OOM kills happened
+    # AFTER a similar widening: more instances didn't relieve the
+    # per-instance ceiling, just multiplied how many could hit it
+    # independently. Fix concurrency first; revisit max separately once
+    # that holds under real load.
+    scaling:
+      minInstances: 4
+      maxInstances: 12
+      targetMemoryPercent: 60
+      targetCPUPercent: 60
     envVars:
       - key: ADGEN_ROLE
         value: titler
