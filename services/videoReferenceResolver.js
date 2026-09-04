@@ -101,6 +101,35 @@ function mediaAspectKey(aspectRatio) {
   return String(aspectRatio || '').replace(/[^a-z0-9]+/gi, '_');
 }
 
+// Compute source-native target dims for the tier-3 c_fill fallback: the
+// largest crop rectangle at the requested aspect that FITS INSIDE the
+// source without upscaling. Preserves source pixel density on the
+// fallback path so tier-3 doesn't downscale to the video model's output
+// resolution (720×1280 for 9:16). Matches the dim shape chooseStrategy's
+// tier-2 crop path emits, so tiers 2 and 3 sit on the same pixel-density
+// plane.
+//
+// Returns null when we don't know source dims or aspect is malformed —
+// cropImageUrlForAspect then falls back to imageDimsForAspect defaults.
+// Never upscales: a 400×400 source at 9:16 yields 225×400, not 720×1280
+// (fewer pixels beats an upscale blur).
+function sourceNativeCropDims(media, aspectRatio) {
+  const sourceW = Number(media && media.width);
+  const sourceH = Number(media && media.height);
+  if (!(sourceW > 0 && sourceH > 0)) return null;
+  const parts = String(aspectRatio || '').split(':').map(Number);
+  const [wr, hr] = parts;
+  if (!(wr > 0 && hr > 0)) return null;
+  const targetAspect = wr / hr;
+  const sourceAspect = sourceW / sourceH;
+  // Fit within source: the abundant dimension gets cropped, the
+  // constrained dimension is preserved at source resolution.
+  if (sourceAspect > targetAspect) {
+    return { w: Math.round(sourceH * targetAspect), h: sourceH };
+  }
+  return { w: sourceW, h: Math.round(sourceW / targetAspect) };
+}
+
 // Resolve a single Media doc + target aspect to a public HTTP URL suitable
 // for any video model's reference-image parameter. Returns:
 //   { url, source, aspectKey, method, ladderVersion }
@@ -175,17 +204,24 @@ function resolveVideoReferenceForMedia({ media, aspectRatio, brand, preferRefram
   }
 
   // Tier 3: c_fill,g_auto fallback. No cache, no bboxes we can crop from,
-  // no source dims. Subject-blind saliency crop from Cloudinary — better
-  // than nothing but throws away the fidelity guarantee. If this fires on
-  // a seed that has refinedProducts populated, that's a bug in the tier-2
-  // guard (e.g. missing width/height on the Media doc); the operator sees
-  // it in the `on-demand-yolo` vs `c-fill-fallback` split logged by
-  // assembleReferences.
-  const url = cropImageUrlForAspect(media && media.fileUrl, aspectRatio, brand);
+  // no source dims for a subject-centred rect. Subject-blind saliency crop
+  // from Cloudinary — better than nothing but throws away the fidelity
+  // guarantee. If this fires on a seed that has refinedProducts populated,
+  // that's a bug in the tier-2 guard (e.g. missing width/height on the
+  // Media doc); the operator sees it in the `on-demand-yolo` vs
+  // `c-fill-fallback` split logged by assembleReferences.
+  //
+  // Dims: source-native when we know width/height, so the fallback ref
+  // ships at the same pixel density as tier-1 / tier-2 (1125×2000 for a
+  // 2000-tall source at 9:16). Falls back to 720×1280 output-native when
+  // dims are unknown — same as pre-source-native behaviour, no upscaling.
+  const dims = sourceNativeCropDims(media, aspectRatio);
+  const url = cropImageUrlForAspect(media && media.fileUrl, aspectRatio, brand, dims);
   return { url, source: 'c-fill-fallback', aspectKey, method: null, ladderVersion: null };
 }
 
 module.exports = {
   resolveVideoReferenceForMedia,
-  mediaAspectKey
+  mediaAspectKey,
+  sourceNativeCropDims
 };

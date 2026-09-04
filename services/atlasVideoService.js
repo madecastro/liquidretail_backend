@@ -883,10 +883,23 @@ function buildVideoSegmentUrl(originalUrl, aspectRatio, durationSec = 8) {
 // f_jpg forces that flatten so b_rgb actually applies (URL extension can
 // stay as-is; f_jpg wins). brandOrHex is Brand-like or raw color; defaults
 // white. Video-source branch is unchanged (no alpha).
-function cropImageUrlForAspect(originalUrl, aspectRatio, brandOrHex = null) {
+//
+// targetDims (optional 4th arg): { w, h } object that overrides the default
+// imageDimsForAspect output dims (720×1280 for 9:16, etc.). Used by
+// videoReferenceResolver's tier-3 fallback to ship a source-native crop
+// (e.g. 1125×2000 for a 2000×2000 source at 9:16) rather than downscaling
+// to the video model's output resolution. When null / invalid, the
+// existing output-native dims are used — byte-identical to pre-change.
+// Callers that don't need source-native (Atlas reframe fallback,
+// unchanged callers) can omit this and behaviour is unchanged.
+function cropImageUrlForAspect(originalUrl, aspectRatio, brandOrHex = null, targetDims = null) {
   if (!originalUrl) return null;
+  const override = targetDims && Number.isFinite(targetDims.w) && Number.isFinite(targetDims.h)
+    && targetDims.w > 0 && targetDims.h > 0
+    ? { w: Math.round(targetDims.w), h: Math.round(targetDims.h) }
+    : null;
   if (originalUrl.includes('/image/upload/')) {
-    const { w, h } = imageDimsForAspect(aspectRatio);
+    const { w, h } = override || imageDimsForAspect(aspectRatio);
     const { websiteBackgroundHex } = require('../utils/websiteBackground');
     const bg = websiteBackgroundHex(brandOrHex);
     return originalUrl.replace(
@@ -901,7 +914,7 @@ function cropImageUrlForAspect(originalUrl, aspectRatio, brandOrHex = null) {
   // defaults to center — g_auto on video-source transforms also needs
   // the AI add-on. f_jpg forces JPEG output.
   if (originalUrl.includes('/video/upload/')) {
-    const { w, h } = imageDimsForAspect(aspectRatio);
+    const { w, h } = override || imageDimsForAspect(aspectRatio);
     return originalUrl
       .replace('/video/upload/', `/video/upload/${VIDEO_START_OFFSET},c_fill,w_${w},h_${h},f_jpg,q_auto:good/`)
       .replace(/\.(mp4|mov|webm|m4v)(\?.*)?$/i, '.jpg$2');

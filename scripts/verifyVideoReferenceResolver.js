@@ -22,7 +22,8 @@ require('dotenv').config({ path: path.join(__dirname, '..', 'config', 'defaults.
 
 const {
   resolveVideoReferenceForMedia,
-  mediaAspectKey
+  mediaAspectKey,
+  sourceNativeCropDims
 } = require('../services/videoReferenceResolver');
 
 const results = [];
@@ -274,7 +275,10 @@ check('E3 cache miss + wide subject → yolo-crop-forced (edges clipped, still $
   assert.match(r.url, /\/image\/upload\/c_crop,w_1125,h_2000,/);
 });
 
-check('E4 cache miss + NO refinedProducts → c_fill (no bboxes to work with)', () => {
+check('E4 cache miss + NO refinedProducts → c_fill (no bboxes to work with; source-native dims when width/height known)', () => {
+  // No refinedProducts → tier-2 defers → tier-3 fires. This fixture has
+  // width/height, so tier-3 now emits source-native dims (Section F);
+  // tier-3 without dims is F8's concern.
   const media = {
     _id: 'fixture-no-bboxes',
     fileUrl: CATALOG_URL_SMALL,
@@ -286,7 +290,7 @@ check('E4 cache miss + NO refinedProducts → c_fill (no bboxes to work with)', 
   const r = resolveVideoReferenceForMedia({ media, aspectRatio: '9:16', brand: null });
   assert.strictEqual(r.source, 'c-fill-fallback');
   assert.strictEqual(r.method, null);
-  assert.match(r.url, /c_fill,w_720,h_1280,g_auto/);
+  assert.match(r.url, /c_fill,w_1125,h_2000,g_auto/);
 });
 
 check('E5 cache miss + bboxes but NO width/height → c_fill (chooseStrategy defers "source dims unknown")', () => {
@@ -346,6 +350,114 @@ check('E8 cache HIT takes precedence over on-demand (tier order is 1 → 2 → 3
   assert.strictEqual(r.source, 'reframe-cache', 'cache must win over on-demand');
   assert.strictEqual(r.url, CACHED);
   assert.strictEqual(r.method, 'pad-product-only');
+});
+
+// ── Section F — tier-3 c_fill ships source-native dims ───────────────
+//
+// Before: every c-fill-fallback URL used `imageDimsForAspect` output-
+// native dims (720×1280 for 9:16). For a 2000×2000 source that's a
+// double-lossy downscale from source to output resolution. The video
+// model gets refs at ⅕ the pixel density they could have had.
+//
+// After: when media.width/height are known, tier-3 computes the largest
+// c_fill rectangle that fits INSIDE the source at the target aspect and
+// ships that. 2000×2000 → 9:16 becomes 1125×2000 (same shape as tier-2's
+// yolo-crop). When source dims are unknown, falls back to output-native
+// — no upscaling of small sources, no regression on media that lacks
+// dims.
+
+console.log('\n== F. tier-3 c_fill ships source-native dims when source is known ==');
+
+check('F1 sourceNativeCropDims: 2000×2000 source at 9:16 → 1125×2000 (keep height, crop width)', () => {
+  const dims = sourceNativeCropDims({ width: 2000, height: 2000 }, '9:16');
+  assert.deepStrictEqual(dims, { w: 1125, h: 2000 });
+});
+
+check('F2 sourceNativeCropDims: 2000×2000 source at 16:9 → 2000×1125 (keep width, crop height)', () => {
+  const dims = sourceNativeCropDims({ width: 2000, height: 2000 }, '16:9');
+  assert.deepStrictEqual(dims, { w: 2000, h: 1125 });
+});
+
+check('F3 sourceNativeCropDims: 4000×3000 (landscape) at 9:16 → 1688×3000 (keep height)', () => {
+  const dims = sourceNativeCropDims({ width: 4000, height: 3000 }, '9:16');
+  assert.deepStrictEqual(dims, { w: 1688, h: 3000 });
+});
+
+check('F4 sourceNativeCropDims: 400×400 tiny source at 9:16 → 225×400 (fits inside, never upscales)', () => {
+  const dims = sourceNativeCropDims({ width: 400, height: 400 }, '9:16');
+  assert.deepStrictEqual(dims, { w: 225, h: 400 });
+});
+
+check('F5 sourceNativeCropDims: no dims on media → null (caller falls to output-native default)', () => {
+  assert.strictEqual(sourceNativeCropDims({}, '9:16'), null);
+  assert.strictEqual(sourceNativeCropDims({ width: 2000 }, '9:16'), null); // missing height
+  assert.strictEqual(sourceNativeCropDims(null, '9:16'), null);
+});
+
+check('F6 sourceNativeCropDims: malformed aspect → null', () => {
+  assert.strictEqual(sourceNativeCropDims({ width: 2000, height: 2000 }, 'garbage'), null);
+  assert.strictEqual(sourceNativeCropDims({ width: 2000, height: 2000 }, ''), null);
+  assert.strictEqual(sourceNativeCropDims({ width: 2000, height: 2000 }, null), null);
+});
+
+check('F7 tier-3 fallback with known source dims → c_fill at source-native dims', () => {
+  // Media has bboxes only in metadata but no width/height would fall to c-fill
+  // — but here we give width/height so tier-3 gets source-native dims. No
+  // refinedProducts so tier-2 defers.
+  const media = {
+    _id: 'fixture-known-dims',
+    fileUrl: 'https://res.cloudinary.com/reach-social-prod/image/upload/v1/catalog-product/x/y.jpg',
+    width: 2000,
+    height: 2000,
+    metadata: { reframes: {} }
+    // no refinedProducts → tier-2 defers → tier-3 fires
+  };
+  const r = resolveVideoReferenceForMedia({ media, aspectRatio: '9:16', brand: null });
+  assert.strictEqual(r.source, 'c-fill-fallback');
+  assert.match(r.url, /c_fill,w_1125,h_2000,g_auto/, `url: ${r.url}`);
+  assert.doesNotMatch(r.url, /w_720,h_1280/, 'must not fall back to output-native 720×1280');
+});
+
+check('F8 tier-3 fallback WITHOUT source dims → output-native (720×1280) — no regression on dim-less media', () => {
+  const media = {
+    _id: 'fixture-no-dims',
+    fileUrl: 'https://res.cloudinary.com/reach-social-prod/image/upload/v1/catalog-product/x/y.jpg',
+    metadata: { reframes: {} }
+    // no width, no height, no refinedProducts
+  };
+  const r = resolveVideoReferenceForMedia({ media, aspectRatio: '9:16', brand: null });
+  assert.strictEqual(r.source, 'c-fill-fallback');
+  assert.match(r.url, /c_fill,w_720,h_1280,g_auto/, `url: ${r.url}`);
+});
+
+check('F9 tier-3 fallback with 16:9 aspect + known dims → source-native for landscape', () => {
+  const media = {
+    _id: 'fixture-landscape',
+    fileUrl: 'https://res.cloudinary.com/reach-social-prod/image/upload/v1/catalog-product/x/y.jpg',
+    width: 2000,
+    height: 2000,
+    metadata: { reframes: {} }
+  };
+  const r = resolveVideoReferenceForMedia({ media, aspectRatio: '16:9', brand: null });
+  assert.strictEqual(r.source, 'c-fill-fallback');
+  assert.match(r.url, /c_fill,w_2000,h_1125,g_auto/, `url: ${r.url}`);
+});
+
+check('F10 preferReframe:false with known dims → source-native (debug arm still gets the good dims)', () => {
+  // The debug arm skips tiers 1+2 but still hits tier 3 — should get
+  // source-native there so an A/B against tier-1/2 is comparing pixel-
+  // density-equivalent references, not output-vs-source.
+  const media = {
+    _id: 'fixture-debug',
+    fileUrl: 'https://res.cloudinary.com/reach-social-prod/image/upload/v1/x/y.jpg',
+    width: 2000,
+    height: 2000,
+    metadata: { reframes: { '9_16': { url: 'https://x/should-be-skipped.jpg', method: 'yolo-crop', ladderVersion: 'reframe-v2' } } },
+    refinedProducts: [{ x1: 100, y1: 100, x2: 900, y2: 1900 }]
+  };
+  const r = resolveVideoReferenceForMedia({ media, aspectRatio: '9:16', brand: null, preferReframe: false });
+  assert.strictEqual(r.source, 'c-fill-fallback');
+  assert.match(r.url, /c_fill,w_1125,h_2000/);
 });
 
 // ── Summary ──────────────────────────────────────────────────────────
