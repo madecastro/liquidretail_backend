@@ -397,8 +397,20 @@ async function runAsyncChecks() {
       path.join(__dirname, '..', 'config', 'defaults.env'),
       'utf8'
     );
-    assert.ok(/CATALOG_IMAGE_UPGRADE_ENABLED=true/.test(src));
-    assert.ok(/CATALOG_IMAGE_UPGRADE_MAX_CHECKS=500/.test(src));
+    const env = src
+      .replace(/^[ \t]*#.*$/gm, '')
+      .replace(/[ \t]+#.*$/gm, '')
+      .replace(/[ \t]+$/gm, '');
+    // Line-anchored after stripping `#` comments — a leftover `# …=true`
+    // comment used to satisfy the flag, and `=500` is a prefix of `=5000`.
+    // Same shape as verifyRegeneration.js R6a / verifyNoStrandedQueued.js F13.
+    assert.ok(/^CATALOG_IMAGE_UPGRADE_ENABLED=true$/m.test(env),
+      'CATALOG_IMAGE_UPGRADE_ENABLED must ship true (a comment documenting the old value does not count)');
+    assert.ok(!/^CATALOG_IMAGE_UPGRADE_ENABLED=false$/m.test(env),
+      'CATALOG_IMAGE_UPGRADE_ENABLED must not also ship false');
+    const maxChecks = env.match(/^CATALOG_IMAGE_UPGRADE_MAX_CHECKS=(\d+)$/m);
+    assert.ok(maxChecks, 'CATALOG_IMAGE_UPGRADE_MAX_CHECKS assignment missing from defaults.env');
+    assert.equal(Number(maxChecks[1]), 500);
     // Measured pair cited in the comment (defence against a drive-by rewrite)
     assert.ok(/3,?820/.test(src) || /3820/.test(src));
     assert.ok(/757,?341/.test(src) || /757341/.test(src));

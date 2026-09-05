@@ -55,6 +55,28 @@ function checkTrue(label, cond) {
 
 function oid(n) { return new mongoose.Types.ObjectId(`68fc${String(n).padStart(20, '0')}`); }
 
+function stripComments(src) {
+  return src
+    .replace(/\/\*[\s\S]*?\*\//g, '')
+    .replace(/^[ \t]*\/\/.*$/gm, '');
+}
+
+function braceBlockFrom(src, anchorLiteral) {
+  const anchorIdx = src.indexOf(anchorLiteral);
+  if (anchorIdx < 0) return '';
+  const open = src.indexOf('{', anchorIdx);
+  if (open < 0) return '';
+  let depth = 0;
+  for (let i = open; i < src.length; i++) {
+    if (src[i] === '{') depth++;
+    else if (src[i] === '}') {
+      depth--;
+      if (depth === 0) return src.slice(open, i + 1);
+    }
+  }
+  return '';
+}
+
 function withEnv(vars, fn) {
   const prev = {};
   for (const k of Object.keys(vars)) prev[k] = process.env[k];
@@ -236,9 +258,13 @@ async function withEnvAsync(vars, fn) {
   // D5 — ugcPassthroughSkip short-circuits into a terminal failed state
   // BEFORE the Omni submit line. The order matters: falling out of the
   // if-block into the veoGenerateForAd call would double-spend.
-  const skipTerminal = /if\s*\(ugcPassthroughSkip\)[\s\S]{0,600}status:\s*['"]failed['"][\s\S]{0,400}return;/m;
+  // Brace-walk the if-body after stripping comments — a `// status: 'failed'`
+  // leftover next to a real `'draft'` write used to satisfy the `{0,600}`
+  // window on its own.
+  const skipBlock = braceBlockFrom(stripComments(src), 'if (ugcPassthroughSkip)');
   checkTrue('D5 ugcPassthroughSkip → terminal failed state (before any Omni submit)',
-    skipTerminal.test(src));
+    /\$set:\s*\{[\s\S]*\bstatus:\s*['"]failed['"]/.test(skipBlock)
+      && /\breturn;/.test(skipBlock));
 
   // D6 — order-of-operations: the ugcPassthroughSkip handler MUST sit
   // BEFORE any call to veoGenerateForAd() in the same function. This

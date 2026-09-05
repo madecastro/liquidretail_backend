@@ -185,7 +185,14 @@ check('A5 trackedGenerate resolves the response BODY, not the axios envelope', (
   assert.ok(!/return r;/.test(HELPER_FN));
 });
 check('A6 trackedGenerate pins maxRedirects:0 on the billable POST (CLAUDE.md §2)', () => {
-  assert.ok(/maxRedirects:\s*0/.test(HELPER_FN),
+  // Strip comments first — the call already documents the pin in a
+  // `// maxRedirects:0 per CLAUDE.md §2` comment, which used to satisfy
+  // this check after the real `{ timeout, maxRedirects: 0 }` was deleted.
+  // Same recipe as verifyLlmErrorCodes.js D5.
+  const HELPER_FN_CODE = HELPER_FN
+    .replace(/\/\*[\s\S]*?\*\//g, '')
+    .replace(/^[ \t]*\/\/.*$/gm, '');
+  assert.ok(/maxRedirects:\s*0\b/.test(HELPER_FN_CODE),
     'axios defaults to 21 redirects and re-sends the body on 307/308 — a silent double charge');
 });
 check('A7 trackedGenerate ledgers the model actually configured, not a literal', () => {

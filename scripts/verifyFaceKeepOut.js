@@ -398,8 +398,17 @@ check('W3 Canonical uses decideInkOnLight for the global ink vote', () => {
 });
 
 check('W4 defaults.env ships TITLE_FACE_KEEPOUT=true', () => {
-  const env = fs.readFileSync(path.join(ROOT, 'config/defaults.env'), 'utf8');
-  assert.ok(/TITLE_FACE_KEEPOUT=true/.test(env));
+  const env = fs.readFileSync(path.join(ROOT, 'config/defaults.env'), 'utf8')
+    .replace(/^[ \t]*#.*$/gm, '')
+    .replace(/[ \t]+#.*$/gm, '')
+    .replace(/[ \t]+$/gm, '');
+  // Line-anchored after stripping `#` comments — a leftover
+  // `# TITLE_FACE_KEEPOUT=true` comment used to satisfy this while the
+  // assignment was `false`. Same shape as verifyRegeneration.js R6a.
+  assert.ok(/^TITLE_FACE_KEEPOUT=true$/m.test(env),
+    'TITLE_FACE_KEEPOUT must ship true (a comment documenting the old value does not count)');
+  assert.ok(!/^TITLE_FACE_KEEPOUT=false$/m.test(env),
+    'TITLE_FACE_KEEPOUT must not also ship false');
 });
 
 check('W5 detectClipBoxes returns faceSamples (source-text)', () => {

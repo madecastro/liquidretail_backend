@@ -482,10 +482,27 @@ ok('F9 worker.js wires the sweep (WORKER, not web — no Remotion / no submit)',
     'archive sweep must not be wired on the web process (it does not render)');
 });
 ok('F10 env knobs exist in config/defaults.env with sane defaults', () => {
-  assert.ok(/QUEUED_ARCHIVE_ENABLED=true/.test(defaultsSrc));
-  assert.ok(/QUEUED_ARCHIVE_AFTER_H=24/.test(defaultsSrc));
-  assert.ok(/QUEUED_ARCHIVE_MAX_ADS=200/.test(defaultsSrc));
-  assert.ok(/QUEUED_ARCHIVE_INTERVAL_MIN=15/.test(defaultsSrc));
+  // Strip `#` comments then line-anchor — an unanchored `=24` / `=200` /
+  // `=15` is a prefix of `=240` / `=2000` / `=150`, and a leftover
+  // `# KEY=true` comment used to satisfy the flag while the assignment
+  // was `false`. Same shape as F13 and verifyRegeneration.js R6a.
+  const env = defaultsSrc
+    .replace(/^[ \t]*#.*$/gm, '')
+    .replace(/[ \t]+#.*$/gm, '')
+    .replace(/[ \t]+$/gm, '');
+  assert.ok(/^QUEUED_ARCHIVE_ENABLED=true$/m.test(env),
+    'QUEUED_ARCHIVE_ENABLED must ship true (a comment documenting the old value does not count)');
+  assert.ok(!/^QUEUED_ARCHIVE_ENABLED=false$/m.test(env),
+    'QUEUED_ARCHIVE_ENABLED must not also ship false');
+  const afterH = env.match(/^QUEUED_ARCHIVE_AFTER_H=(\d+)$/m);
+  assert.ok(afterH, 'QUEUED_ARCHIVE_AFTER_H assignment missing from defaults.env');
+  assert.strictEqual(Number(afterH[1]), 24);
+  const maxAdsM = env.match(/^QUEUED_ARCHIVE_MAX_ADS=(\d+)$/m);
+  assert.ok(maxAdsM, 'QUEUED_ARCHIVE_MAX_ADS assignment missing from defaults.env');
+  assert.strictEqual(Number(maxAdsM[1]), 200);
+  const interval = env.match(/^QUEUED_ARCHIVE_INTERVAL_MIN=(\d+)$/m);
+  assert.ok(interval, 'QUEUED_ARCHIVE_INTERVAL_MIN assignment missing from defaults.env');
+  assert.strictEqual(Number(interval[1]), 15);
 });
 ok('F11 blank / 0 / negative AFTER_H falls back to 24 (Number("") === 0 trap)', () => {
   const prev = process.env.QUEUED_ARCHIVE_AFTER_H;

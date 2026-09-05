@@ -398,7 +398,27 @@ check('E2 [MONEY] the derive gate is evaluated BEFORE the first Omni submit',
   `gate=${gateIdx} submit=${submitIdx}`);
 
 check('E3 the derive gate returns instead of falling through to the master path',
-  /if\s*\(deriveFromFmt\)\s*\{[\s\S]{0,400}?return;/.test(adsSrc),
+  (() => {
+    // Brace-walk the if-body; last statement must be `return;`. A `{0,400}`
+    // window was satisfied by a later return inside 400 chars if this one
+    // was deleted, and comment growth would CI-red a still-correct gate.
+    const code = stripComments(adsSrc);
+    const idx = code.search(/if\s*\(deriveFromFmt\)\s*\{/);
+    if (idx === -1) return false;
+    const open = code.indexOf('{', idx);
+    let depth = 0;
+    let close = -1;
+    for (let i = open; i < code.length; i++) {
+      if (code[i] === '{') depth++;
+      else if (code[i] === '}') {
+        depth--;
+        if (depth === 0) { close = i; break; }
+      }
+    }
+    if (close === -1) return false;
+    const body = code.slice(open + 1, close).trim();
+    return /return;\s*$/.test(body);
+  })(),
   'without the early return a derive ad would ALSO run the billable master path');
 
 // ── F. Holes found by adversarial review — pinned so they cannot reopen ─
