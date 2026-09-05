@@ -2,7 +2,13 @@
 
 ## 0) READ FIRST — the canvas engine is DISABLED (verified 2026-07-29)
 
-**Remotion is the only titling engine that runs.** `resolveTitlingEngine`
+**Within backend's own in-process titling code, Remotion is the only engine
+that would run — but that code is a dormant fallback.**
+`ADGEN_RENDERER_ENABLED=true` in production means backend's render loop
+never dispatches; `liquidretail_adgen` performs all titling today. The rest
+of this section, and this whole document, describes which engine wins
+INSIDE that dormant code, not what currently executes in production —
+`resolveTitlingEngine`
 (`services/brandScriptExecutor.js:797-806`) returns `{ engine: 'remotion', source:
 'canvas-disabled' }` **unconditionally**. The cascade described in §1 below is the
 code at `:808-823`, which sits inside a `/* … */` block.
@@ -42,9 +48,12 @@ Dual-engine dispatch in `services/brandScriptExecutor.js`:
 
 - `resolveTitlingEngine(brand, ad)`: custom per-format script (styleScript*/styleScriptVertical etc.) forces 'canvas'; else Brand.videoSettings.titlingEngine > TITLING_ENGINE env > default **'remotion'**. **← NOT LIVE, see §0.**
 - 'canvas' path: `renderBrandScriptAndSave` → `resolveBrandRenderer` → `renderBrandScript` (child process) → upload + Ad.renderUrl. **← unreachable except via preview-script.**
-- 'remotion' path: `renderWithRemotionAndSave` → `resolveSpecForBrand` + `buildBrandTokens` → `renderTitles` (services/remotionRenderService.js) → upload + Ad.renderUrl. **← the only live path.**
+- 'remotion' path: `renderWithRemotionAndSave` → `resolveSpecForBrand` + `buildBrandTokens` → `renderTitles` (services/remotionRenderService.js) → upload + Ad.renderUrl. **← the only reachable path inside this engine cascade — but the whole cascade is backend's dormant in-process fallback; in production today all titling runs in `liquidretail_adgen`, not here.**
 
-Remotion render pipeline (ad.veoVideoUrl → Ad.renderUrl):
+Remotion render pipeline (ad.veoVideoUrl → Ad.renderUrl) — backend's own
+in-process fallback, live only when `ADGEN_RENDERER_ENABLED` is not the
+string `'true'`; in production today this pipeline is dormant and adgen
+renders titling instead:
 
 - `warmup()` at boot: `getServeUrl()` (bundle once via @remotion/bundler on remotion/index.jsx), `ensureBrowserReady()`, `getAssetServer()`.
 - `renderTitles({videoUrl, meta, spec, tokens, format, placementMode?, brand?})`: enqueue (concurrency-1 queue), per-job dir under os.tmpdir()/remotion_assets.
@@ -118,11 +127,13 @@ CTA default: every shipped preset ships its `cta` slot `visible: false` — all 
 
 Validation (`validateTitleSpec`, `validateTitleStyleSpecDoc`): normalizes optionals to defaults; rejects unknowns/duplicates/out-of-range; phases 1..4, slots <= SLOT_KEYS, times 0..MAX_CLIP_SEC (15). Treatment fallbacks: `scrim ?? 'none'`, `shadow ?? 'layered'` (no-scrim standard).
 
-Resolution (`services/titleSpecService.js` `resolveSpec` / `resolveSpecForBrand`) — one cascade, Title Studio and render share it (plain always-honour as of 2026-09-03; `TITLE_SPEC_IGNORE_PERSISTED` deleted — prod audit found 0 persisted specs):
-- `presetOverride` arg (explicit, never persisted) → `override:<name>`
-- else ad/product/category(leaf→root)/brand `titleStyleSpec[format]` (validated) → that tier
-- else brand.titleStylePreset → loadPresetFile(name) → byFormat[format] (validated) → 'preset:<name>'
-- else canonical (remotion/presets/canonical.json) → 'canonical'
+Resolution (`services/titleSpecService.js` `resolveSpec` / `resolveSpecForBrand`) — one cascade, Title Studio and render share it (plain always-honour as of 2026-09-03; `TITLE_SPEC_IGNORE_PERSISTED` deleted — prod audit found 0 persisted specs). Funnel stage is a **fallback floor**, not a TIER-0 wipe (`fba81588` — passing `canonical-{stage}` as `presetOverride` hid Title Studio specs on staged ads):
+- `presetOverride` arg (explicit CLI `--preset=` only, never persisted, never auto-filled from `Ad.funnelStage`) → `override:<name>`  [TIER 0]
+- else ad/product/category(leaf→root)/brand `titleStyleSpec[format]` (validated) → that tier  [TIER 1]
+- else brand.titleStylePreset → loadPresetFile(name) → byFormat[format] (validated) → 'preset:<name>'  [TIER 2]
+- else `intentPreset` (`resolveFunnelPresetOverride` → `canonical-{stage}` / `-pmax10`) → `intent:<name>`  [TIER 2.5]
+- else canonical (remotion/presets/canonical.json) → 'canonical'  [TIER 3]
+- After resolve, `applyBenefitsPlacement` (`services/videoBenefitsDirector.js`) may splice a `benefits` slot from `Ad.videoTitleDirection` (mint-time Director stamp). Live titling in adgen ports this apply half only.
 - Throws only on canonical failure. `loadPresetFile` + `clearPresetCache`.
 - Multi slots (`benefits`/`badges`) must bind at least one of `BINDABLE_MULTI_META_FIELDS`; a `{literal:[...]}` is only a fallback AFTER that field. See `session.d/2026-09-03_benefits-to-directors-part-b-d.md`.
 
@@ -459,10 +470,10 @@ hand-picked keys and never through the real call site.
 ## 5) Operator flows (routes/brand.js, all under /api/brand/:id, Bearer + tenant-scoped)
 
 - `GET /title-spec` — full titling state: saved titleStyleSpec/titleStylePreset, resolved spec + source + per-format fonts (each resolved with that spec's own tokenOverrides.fonts), available presets, tokens, customFonts.
-- `POST /title-still` — the FAST refinement loop: body {format, spec?, frames? (≤4 sec marks), scale?, meta? (text fields only), adId?, placementMode? ('canonical'|'content')}; synchronous, ~1-3s warm via the stills fast lane (enqueueStill — never waits behind a production render). With `adId` (must belong to the brand), stills render over the ad's REAL base video (ad.veoVideoUrl, cached per ad) — renderStill + OffthreadVideo extracts the exact frame at each timestamp, meta comes from the ad's own layout artifact (buildMetaForAd). Response: {frames, plateSource, fps, plateDurationSec, plateHints, placementMode, scanSampleTimes}. Powers `GET /title-playground` (public/titlePlayground.html).
-- `POST /preview-script` (+ `GET /preview-script/:jobId`) — async full-motion preview (202+poll, base64 mp4); honors the engine dispatch, body.spec previews unsaved specs, body.engine and body.placementMode overrides (enum-validated, 400 on garbage).
-- `POST /render-script` — body `{adId}`: re-title one ad over `ad.veoVideoUrl` via `renderBrandScriptAndSave` (ad→media→brand ownership check).
-- `POST /retitle-videos` (+ `GET /retitle-videos/:jobId`) — batch re-title. Body `{adIds?: string[], dryRun?: boolean=false, concurrency?: number=2}` (concurrency clamped 1..4). Selects brand ads with `kind='video'` and non-null `veoVideoUrl`; optional `adIds` restricts (unknown/foreign ids reported in `errors`, not fatal). `dryRun` stays **synchronous** → `{count, ads:[{id, createdAt, renderUrl, veoVideoUrl}], errors?}`. Live is **async** (Netlify ~26s proxy cap; tens of seconds per ad): POST returns `202 {ok, jobId, status:'pending', count}`; poll `GET /:id/retitle-videos/:jobId` until `status` is `done` or `failed` (404 unknown/expired/wrong-brand; reaped 5 min after finish, same TTL as preview-script). Job transitions: `pending` → `running` with `progress:{done,total}` + accumulating `results`/`errors` → `done` (or `failed` + `error` for a catastrophic runner throw). Pool is concurrency-capped; per-ad try/catch calling `renderBrandScriptAndSave` (one failure never aborts the batch). Done payload fields: `{status, count, progress, results:[{id, ok, renderUrl?, skipped?, error?}], errors?, elapsedMs}`.
+- `POST /title-still` — the FAST refinement loop: body {format, spec?, frames? (≤4 sec marks), scale?, meta? (text fields only), adId?, placementMode? ('canonical'|'content')}; synchronous, ~1-3s warm via the stills fast lane (enqueueStill — never waits behind a production render). With `adId` (must belong to the brand), stills render over the ad's REAL base video (ad.veoVideoUrl, cached per ad) — renderStill + OffthreadVideo extracts the exact frame at each timestamp, meta comes from the ad's own layout artifact (buildMetaForAd). This is a preview-only render for the Title Studio editing loop, distinct from production titling of delivered ads, which runs in adgen today. Response: {frames, plateSource, fps, plateDurationSec, plateHints, placementMode, scanSampleTimes}. Powers `GET /title-playground` (public/titlePlayground.html).
+- `POST /preview-script` (+ `GET /preview-script/:jobId`) — async full-motion preview (202+poll, base64 mp4) rendered via backend's own in-process Remotion pipeline (a dormant fallback, gated on `ADGEN_RENDERER_ENABLED`); honors the engine dispatch, body.spec previews unsaved specs, body.engine and body.placementMode overrides (enum-validated, 400 on garbage).
+- `POST /render-script` — body `{adId}`: re-title one ad over `ad.veoVideoUrl` via `renderBrandScriptAndSave` (ad→media→brand ownership check). This calls backend's own in-process Remotion titling, a dormant fallback live only when `ADGEN_RENDERER_ENABLED` is not `'true'`; production retitling today runs through adgen.
+- `POST /retitle-videos` (+ `GET /retitle-videos/:jobId`) — batch re-title. Body `{adIds?: string[], dryRun?: boolean=false, concurrency?: number=2}` (concurrency clamped 1..4). Selects brand ads with `kind='video'` and non-null `veoVideoUrl`; optional `adIds` restricts (unknown/foreign ids reported in `errors`, not fatal). `dryRun` stays **synchronous** → `{count, ads:[{id, createdAt, renderUrl, veoVideoUrl}], errors?}`. Live is **async** (Netlify ~26s proxy cap; tens of seconds per ad): POST returns `202 {ok, jobId, status:'pending', count}`; poll `GET /:id/retitle-videos/:jobId` until `status` is `done` or `failed` (404 unknown/expired/wrong-brand; reaped 5 min after finish, same TTL as preview-script). Job transitions: `pending` → `running` with `progress:{done,total}` + accumulating `results`/`errors` → `done` (or `failed` + `error` for a catastrophic runner throw). Pool is concurrency-capped; per-ad try/catch calling `renderBrandScriptAndSave` — backend's own in-process Remotion titling, a dormant fallback gated on `ADGEN_RENDERER_ENABLED` (one failure never aborts the batch). In production today, retitling runs through adgen, not this in-process call. Done payload fields: `{status, count, progress, results:[{id, ok, renderUrl?, skipped?, error?}], errors?, elapsedMs}`.
 - `POST /title-spec/modify` (+ poll) — natural-language spec editing: LLM (atlasTextService) gets schema + current spec + tokens, returns the full updated spec; validated with one repair retry; NOT persisted — operator previews then saves via `PATCH {titleStyleSpec}` (schema-validated again at write).
 - `POST /ingest-fonts` — website font scan → customFonts (merge by family/weight/style).
 - `POST /ingest-meta-fonts` — vision identification of the typefaces in the brand's own
@@ -483,7 +494,9 @@ Env vars:
 - TITLE_PLATE_SCAN=basic|gemini|off (plateIntelService.js) — scan depth in **content** placement mode; `off` is a global kill switch forcing canonical placement.
 - GEMINI_API_KEY (for gemini mode).
 
-Memory sizing: renders are memory-heavy (~1.5-3GB peak with headless Chrome; concurrency-1 main queue) — size Render.com instances ≥4GB; stills lane is much lighter. Browser resolution: requires a chrome-headless-shell binary (resolveBrowserExecutable checks /opt/pw-browsers, .cache/puppeteer/chrome-headless-shell; else ensureBrowser() downloads Remotion's own). Modern full Chrome (≥132) removed old-headless and cannot be used.
+Memory sizing (applies to backend's own in-process fallback path, dormant
+while `ADGEN_RENDERER_ENABLED='true'`; in production today the heavy
+rendering runs in adgen, not on this repo's instances): renders are memory-heavy (~1.5-3GB peak with headless Chrome; concurrency-1 main queue) — size Render.com instances ≥4GB if that fallback is ever activated; stills lane is much lighter. Browser resolution: requires a chrome-headless-shell binary (resolveBrowserExecutable checks /opt/pw-browsers, .cache/puppeteer/chrome-headless-shell; else ensureBrowser() downloads Remotion's own). Modern full Chrome (≥132) removed old-headless and cannot be used.
 
 Remotion licensing: Remotion 4 is commercially licensed for companies >3 people (remotion.pro — company license + per-render seats). Default engine is remotion — confirm license before production use. (`acknowledgeRemotionLicense` flags in code silence the console notice; they are not the license.)
 

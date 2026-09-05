@@ -13,14 +13,24 @@ worker boot log reads `🔔 alerts: Slack configured`
 
 ## Why this exists — the failure it was built to expose
 
+**This section describes backend's dormant in-process fallback — true only
+when `ADGEN_RENDERER_ENABLED` is not the string `'true'`.** In production
+today (since 2026-08-24) that flag is `'true'`, `runRenderLoop` flips the
+`CampaignRun` to `running` and returns immediately without dispatching, and
+`liquidretail_adgen`'s renderer does all video generation and titling
+instead, in its own process. See `CLAUDE.md`'s Render ownership note.
+
 Ad rendering, **including every paid video generation**, does not run on a
 durable queue. `POST /api/ads/generate` and `POST /api/ads/runs` flush a
 `202 Accepted` and then run `runRenderLoop` in a `setImmediate` **inside the
-web service process** (`routes/ads.js`). Video ads run at
-`VEO_CONCURRENCY` concurrent Omni submits, and every finished master is then
+web service process** (`routes/ads.js`) — true only on that dormant fallback
+path. Video ads would run at
+`VEO_CONCURRENCY` concurrent Omni submits, and every finished master would then be
 titled in that same process behind `REMOTION_QUEUE_CONCURRENCY` simultaneous
-Remotion renders (headless Chrome + ffmpeg), so a large batch occupies that
-process for a long time.
+Remotion renders (headless Chrome + ffmpeg), so a large batch would occupy that
+process for a long time — on that fallback path only. In production,
+`liquidretail_adgen`'s renderer does this generation and titling work instead,
+in its own process.
 
 That process does not survive that long reliably:
 
@@ -102,8 +112,9 @@ Same failed-send semantics (slot released, tally kept).
 
 Implemented in `services/runFeedService.js`. Hooked at the single choke point
 `services/adStage.js` (every stage write) plus `runRenderLoop` start/finish in
-`routes/ads.js`. **Not** an alert — a live operator feed of every generation,
-titling run, upload, etc.
+`routes/ads.js`. **Not** an alert — a live operator feed of run progress
+(generation, titling, upload, etc.) — in production this reports on work
+`liquidretail_adgen`'s renderer performs, not this backend process.
 
 | Shape | Behaviour |
 |---|---|
@@ -261,7 +272,7 @@ including that a non-string or blank label never prints `by undefined`.
 | `N campaign run(s) not progressing` | error | watchdog | `running` past `ALERT_RUN_STALE_MIN` |
 | `Detect queue backing up — N queued` | warn | watchdog | The worker's own queue is growing → worker wedged |
 | `Spend $X in the last hour` | warn | watchdog | Trailing-hour `CostLog` total over `ALERT_HOURLY_SPEND_USD` |
-| `Video generation failed` | error | `routes/ads.js` | Atlas prediction failed or timed out. `by:` = requester label, read off `job.requesterLabel` |
+| `Video generation failed` | error | `routes/ads.js` (fallback path only — adgen owns live video generation) | Atlas prediction failed or timed out. `by:` = requester label, read off `job.requesterLabel` |
 | `Campaign run finished with N failed ad(s)` | warn/error | `runRenderLoop` | Escalates to error when **every** ad failed. `by:` = requester label |
 | `Campaign run crashed …` | error | `routes/ads.js` | The loop itself threw. `by:` = requester **id** (fires outside `runRenderLoop`) |
 | `Claim anomaly — run … released` | **fatal** | `routes/ads.js` `/generate` | `claimAdsForRun`'s updateMany reported a write but the ownership re-read came back empty (should never fire). Ads released to `queued`, run marked `failed`. Sent to the fatal/alert channel, **never** the per-run status feed. See *Claim-anomaly alert* below |
@@ -744,8 +755,8 @@ Video dominates cost. The live default model is Omni
 supports **16:9 and 9:16 only**. **An older claim that 4:5 (and 1:1)
 force-route to Grok Imagine was false** — and is still wrong in some
 header comments (`backlogWatchdog.js:12-15`, `defaults.env:233-235`).
-What the code actually does (`atlasVideoService.js:508-522`,
-`:579-597`):
+What this logic does on the backend's fallback copy (`atlasVideoService.js:508-522`,
+`:579-597` — the live path runs the equivalent routing inside `liquidretail_adgen`'s renderer):
 
 - Portrait (including **4:5**) → Omni at **9:16**, then face-anchored crop
   (`basePlateCropService` / compositor) to the platform canvas.
@@ -948,8 +959,10 @@ STATIC path — `runPostRenderQc` had exactly one call site
 and read as "clean" to every surface in the row above. Closed the same day:
 `adVisionQcService.js` gained `runVideoPostRenderQc` / `judgeVideoRender` /
 `buildVideoVisionUserContent`, wired at `brandScriptExecutor.js`
-`uploadRenderAndStamp` (via `runVideoVisionQcForAd`) — the single choke point
-every video ad's `renderUrl` gets stamped through, for both titling engines
+`uploadRenderAndStamp` (via `runVideoVisionQcForAd`) — the choke point every
+video ad's `renderUrl` gets stamped through **on the in-process fallback path**
+(`ADGEN_RENDERER_ENABLED` not `'true'`); in production every live video ad goes
+through adgen's own titling/QC path instead, for both titling engines
 (remotion + canvas) and the no-chrome skip path. Compares the seed product
 photo against 3 frames sampled from the delivered clip (quartile sampling —
 25/50/75% of `Ad.videoDurationSec`, via the previously-unused
@@ -1245,21 +1258,27 @@ items 21-22).
 
 ## Known gap this does not close
 
-Alerting tells you work was dropped; it does not resume it. The underlying
-fix is to make ad rendering a **durable worker-drained queue** instead of an
+Alerting tells you work was dropped; it does not resume it. **On the in-process
+fallback path** (`ADGEN_RENDERER_ENABLED` not `'true'`), the underlying fix
+would be to make ad rendering a **durable worker-drained queue** instead of an
 in-process loop on an autoscaling web service — i.e. let `worker.js` claim
 `Ad{status:'queued'}` the way it already claims `DetectRun`, so an instance
 replacement costs one ad instead of a whole batch. That is a real change to
 a money-spending path (claim/lease semantics, no double-submit of a billable
-POST) and is deliberately not bundled here.
+POST) and is deliberately not bundled here. In production today this whole
+class of gap is moot for rendering — `liquidretail_adgen`'s renderer already
+is a durable, worker-claimed process, separate from this backend's web
+service.
 
 Interim mitigations, cheapest first:
 
 1. **Watch request size, not a run cap.** `MAX_CREATIVES_PER_RUN` is 1000
    (effectively removed, owner 2026-08-18), so batch size is governed by the
    request itself; `ALERT_HOURLY_SPEND_USD=25` is the operator's tripwire for
-   oversized runs. Concurrent Omni still leaves a long exposure window on the
-   web process — request smaller batches and each loss is smaller.
+   oversized runs. On the fallback path, concurrent Omni submits leave a long
+   exposure window on the web process; in production that exposure now lives in
+   `liquidretail_adgen`'s renderer process instead — request smaller batches and
+   each loss is smaller regardless of which process is exposed.
 2. **Pin the web service to one instance** (autoscaling `max: 1`) so
    scale-in stops being a cause. Deploys still are.
 3. Deploy when nothing is rendering — now observable, because SIGTERM alerts

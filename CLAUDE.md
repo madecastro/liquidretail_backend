@@ -21,6 +21,19 @@ the pre-cutover architecture). Titling resume being "web-only"
 (`index.js` warms Remotion; `worker.js` has zero remotion refs) is still
 true **inside this repo**; live titling of new work runs in adgen.
 
+**Video-title Director split (PR #386 `fba81588`, as of this branch):**
+backend **mints and stamps** `Ad.videoTitleDirection` inside
+`expandDeterministicVideo` (`services/campaignAdsGenerationService.js:3744-3767`
+→ `getVideoTitleDirection`). Adgen **only reads the stamp** and applies it at
+titling (`applyBenefitsPlacement`) — it does not own expansion and does not
+re-call the LLM. Backend still has the apply half on the in-process fallback
+(`brandScriptExecutor.js:2182-2188`). Adgen port of apply:
+`liquidretail_adgen@2c4b0b9`. The stamp is **not** in
+`services/handoffContract.js` `CONTRACT_FIELDS` (still v1.1.0) — it is a
+declared Mixed field on `models/Ad.js:591` that both repos' Mongoose
+schemas must keep or the write/read is silently dropped. Full contract
+below, §00 *Video-title Director*.
+
 **Read `session.md` for live state. Read `ARCHITECTURE_REVIEW.md` before touching
 security, money, or the render queue** — it carries verified P0s with `path:line`.
 
@@ -60,7 +73,13 @@ output are unaffected — they don't depend on the same import-resolution path.
 
 Live prod (2026-08-11) = **`5d02debe`** (both services — WEB
 `srv-d1vuktqli9vc73ft07ng`, WORKER `srv-d8128c1o3t8c73e8kb30`). Offline verify
-suite = **184 scripts** (174 `.js` + 10 `.mjs`).
+suite glob on this branch (2026-09-04): **242 scripts** (230 `.js` + 12 `.mjs`)
+under `scripts/verify*.{js,mjs}`. **`npm test` reports its own count** — do
+not treat the glob as a pass/fail. New pins that belong on this branch:
+`scripts/verifyVideoBenefitsDirector.js`,
+`scripts/verifyVideoReferenceResolver.js`,
+`scripts/verifyDirectorBenefits.js`, `scripts/verifyProductBenefits.js`,
+`scripts/verifyVideoRefPrewarm.js`.
 **Run it with `npm test`.** That is `node scripts/runVerifySuite.js` — a parallel
 aggregate runner that globs `scripts/verify*.{js,mjs}` and takes
 `--concurrency=` / `--timeout=` flags.
@@ -294,10 +313,12 @@ is unchanged at two.
    AUTHORITY FOR TITLING. `platformFormats.safeArea` IS NOT — Remotion never
    reads it. CORRECTED 2026-08-18; this line previously cited "Reels (204) and
    Stories (250)", which are `safeArea` pixels and have nothing to do with
-   where a title lands.** The live path is: `brandScriptExecutor` passes the
+   where a title lands.** The titling chain is: `brandScriptExecutor` passes the
    row's `platformFormat` **string** → `remotionRenderService` puts it on
    `inputProps` → `Canonical.jsx` calls `resolveSafeZoneKey({format,
-   platformFormat})` → `SAFE_ZONES[key]`. Those fractions were hand-measured
+   platformFormat})` → `SAFE_ZONES[key]` — **live titling runs this chain
+   inside adgen's ported copy; this backend chain is the dormant
+   `ADGEN_RENDERER_ENABLED`-off fallback.** Those fractions were hand-measured
    and are **not computed from `safeArea` at runtime**; they have visibly
    drifted from it (Reels `safeArea` is 204/1778 = 11.5%/11.5%, its Remotion
    zone is 14%/35%). **So editing `safeArea` to fix a titling defect changes
@@ -341,14 +362,49 @@ is unchanged at two.
    tight-box exposure and go through the identical code path. Pinned by
    `scripts/verifyReelsOverflowSafety.mjs`. Title-spec cascade is always-honour
    as of 2026-09-03 (`TITLE_SPEC_IGNORE_PERSISTED` deleted; prod audit: 0
-   persisted specs). Write-up: `session.d/2026-09-03_benefits-to-directors-part-b-d.md`.
+   persisted specs). **Funnel stage is a FALLBACK FLOOR, not a TIER-0 wipe**
+   (`fba81588`): explicit `presetOverride` (CLI `--preset=` only) → persisted
+   ad/product/category/brand `titleStyleSpec` → `brand.titleStylePreset` →
+   `intentPreset` (TIER 2.5, `canonical-{stage}` / `-pmax10` from
+   `resolveFunnelPresetOverride`) → canonical. Passing funnel as
+   `presetOverride` was the staged-funnel hole that hid Title Studio specs
+   on consideration/conversion ads. Live generate threads `intentPreset`,
+   never auto-fills TIER 0 (`titleSpecService.js:109-241`,
+   `brandScriptExecutor.js:2143-2181`). Pinned by
+   `scripts/verifyTitleSpecResolution.js`. Write-up:
+   `session.d/2026-09-03_benefits-to-directors-part-b-d.md`.
    Titling director gets a live benefits+attributes sample (Part A); static
    Director gets optional `product_signal.benefits` from
    `CatalogProduct.shortBenefits` (Part C, `DIRECTOR_PRODUCT_BENEFITS`;
    already in memory on the bare findById, never an artifact read, never
-   a derivation). Ingest derives the field once via gemini-2.5-flash
+   a derivation). Video `meta.benefits` reads the same catalog field first
+   (`metaCascadeConfig.js:154-161`; `brandScriptExecutor.js:1060-1064`
+   must `.select('shortBenefits')` or the cascade is permanently empty).
+   Ingest derives the field once via gemini-2.5-flash
    (`PRODUCT_BENEFITS_DERIVATION`, CostLog `product_benefits`). Write-up:
    `session.d/2026-09-03_catalog-product-shortbenefits.md`.
+   **Video-title Director (PR #386, `fba81588`)** — two halves, one stamp.
+   Mint: `getVideoTitleDirection` (`services/videoBenefitsDirector.js:247-264`)
+   runs **inside** `expandDeterministicVideo` (`campaignAdsGenerationService.js:3744-3767`)
+   and writes `Ad.videoTitleDirection` (`models/Ad.js:586-591`, Mixed;
+   shape `{ include, maxItems, phase, reason, size, profile, source }`).
+   One LLM call per `(product × content-profile × master-size)`, memoized
+   in-process (a mixed 21-ad kit → 6 calls, not 21; 1:1/4:5/Reels/PMax 9:16
+   inherit the 9:16 plate's decision). Role `director` via
+   `atlasLlmService.chatCompletion` (`stage:'video_title_director'`). Empty
+   `CatalogProduct.shortBenefits` short-circuits with **zero** LLM calls.
+   Fail-closed: any LLM/parse throw still mints the Ad with
+   `{include:false, source:'director-failed'}`. Flag
+   `VIDEO_BENEFITS_PLACEMENT` parser is strictly `=== 'true'`
+   (`config/defaults.env` file default `true`; unset = OFF).
+   Render/titling: `applyBenefitsPlacement` (`videoBenefitsDirector.js:310-364`)
+   runs **after** `resolveSpec` (`brandScriptExecutor.js:2182-2188`), reads
+   the stamp, and may splice a `benefits` slot into proof/close (never hook).
+   An already-visible benefits slot (Title Studio) is honoured and not
+   overwritten. Invalid splice keeps the unresolved spec. **Live titling is
+   adgen** — adgen ported `applyBenefitsPlacement` only
+   (`liquidretail_adgen@2c4b0b9`); it does not re-run the mint-time LLM.
+   Pinned by `scripts/verifyVideoBenefitsDirector.js`.
    **What `safeArea` IS for, so nobody deletes it as dead:** it is live on the
    **static image** path — `staticAdIntents.computeSurface` turns it into the
    geometry box in the billable gpt-image-2 prompt and into Sharp logomark
@@ -365,7 +421,9 @@ is unchanged at two.
    ad is stamped `status:'draft'` (reaper-safe money guard), then titling runs;
    if Remotion throws, status flips to **`failed`** with
    `master rendered; titling failed`, the run is charged a failure, and the
-   **raw master is kept** (`routes/ads.js:1258-1343`). Leaving the ad
+   **raw master is kept** (`routes/ads.js:1258-1343`, backend's dormant
+   in-process fallback — adgen's own renderer enforces the same rule on the
+   live path). Leaving the ad
    `rendering` mid-titling is a double-bill hole (reaper requeues → second Omni).
 5. **Preview** the result inside the matching **Meta surface overlay**
    (preview chrome only — known-open: placeholder "Lorem ipsum" copy).
@@ -453,14 +511,18 @@ selected. Verified live (no generation): `promptProfileFor` returns
 `gemini-omni` for both `meta_stories_9_16` and `pmax_video_9_16` after loading
 the real `config/defaults.env`, and their built prompts are byte-identical to
 each other and to the `134db56~1` baseline at `durationSec=10`.
-**One real cost consequence, not a bug:** the mixed-run shared-9:16-master
-saving below (§2, "MIXED Meta+PMax") requires this switch ON as its 4th
-conjunct — with it OFF by default, a mixed Meta+PMax run fails that conjunct
-closed and bills **3 masters / $2.70 again**, not 2 / $1.80. Pinned (both
-arms) by `verifySharedPortraitMaster` F1/F6/C1 — nothing there changed; only
-which arm is the boot default did. Flip either switch name back to `true` to
-restore the 2026-08-18 hook-first standardization (both platforms, and the
-$1.80 shared-master saving) with no code change.
+⚠️ **SUPERSEDED 2026-09-03 (`fba81588`) — the mixed-run $1.80 saving no
+longer requires this switch.** Sharing used to fail closed on
+`isHookFirstVideoPromptEnabled()` as conjunct 4 of
+`resolvePortraitMasterFormat`, so the 2026-08-20 FILE default of `false`
+billed **3 / $2.70** on every mixed run. That conjunct is **gone**: mixed
+Meta+PMax now shares the 9:16 plate **regardless of hook-first ON or OFF**.
+The switch still picks camera-prompt *text* (this table, B15 vs B16); it
+does **not** gate whether sharing happens. Flip either name back to `true`
+to restore the 2026-08-18 hook-first *prompt*, not the sharing decision.
+Pinned by `verifySharedPortraitMaster` F1/F1b/F2/F6 (both switch states
+and genuinely-different profile names all share mixed at 2 billable). See
+§2 *MIXED Meta+PMax*.
 
 | | Status |
 |---|---|
@@ -502,7 +564,9 @@ byte-for-byte. Other services must gate on the exported
 **`isHookFirstVideoPromptEnabled()`**, never on an inline `process.env` read
 (the two-name OR is not reproducible by `process.env.X !== 'false'`), and never
 on the two profiles merely *matching* — with the switch off they also match, on
-the frozen Ken Burns pan that PMax Phase B rejected.
+the frozen Ken Burns pan that PMax Phase B rejected. **Do not use this switch
+to gate 9:16 plate sharing** — that conjunct was removed in `fba81588`
+(`resolvePortraitMasterFormat` does not call it; see §2 MIXED).
 
 One text edit was required for platform-neutrality and is called out here
 because it changes bytes the model sees: the lifestyle branch's two destination
@@ -520,6 +584,38 @@ removed the only clamp on that branch (`REPEAT_PRIMARY_TOTAL_CAP=4` applies
 "too many images hallucinated" finding — so **`MAX_DISTINCT_REFERENCES=5`**
 (`atlasVideoService.js:813`) is the new hard ceiling on the default branch.
 `REPEAT_PRIMARY_TOTAL_CAP=4` still applies only when the flag is explicitly on.
+
+**DINO video-reference resolver (`d8ad7285` / `5e521dd3` / `326fb270`)** —
+`services/videoReferenceResolver.js` `resolveVideoReferenceForMedia`. Shared
+cache-first helper so **every video model's ref builder** consumes the
+DINO-preserved crop instead of a silent `c_fill,g_auto`. Three $0 tiers, in
+order: (1) `Media.metadata.reframes[<aspectKey>].url` (`source:'reframe-cache'`);
+(2) on-demand `chooseStrategy` crop when `refinedProducts` + dims allow
+(`source:'on-demand-yolo'`, read-only — persist still belongs to
+`reframeReferenceForAspect`); (3) `cropImageUrlForAspect` at **source-native**
+dims (`source:'c-fill-fallback'`, 4th `targetDims` arg at
+`atlasVideoService.js:895-900` — a 2000×2000 source at 9:16 ships 1125×2000,
+not 720×1280). Aspect key is the same `[^a-z0-9]+ → _` normalisation
+`persistReframe` uses (`mediaAspectKey`). Fail-closed, never throws.
+**What "every model consumes DINO" means here:** this is the contract adgen's
+direct-Gemini (`gemini-omni-1.1-flash`) path must call; that path was measured
+shipping `c_fill,g_auto,w_720,h_1280` refs while the same Media docs held
+ladder-v2 DINO crops. **Backend's Atlas Omni path still goes through
+`reframeReferenceForAspect`** (its own cache + compute + persist) — it does
+not yet call this helper. Pinned by `scripts/verifyVideoReferenceResolver.js`
+(40 checks, sections A–F). Write-up:
+`session.d/2026-09-03_video-ref-resolver-adgen-port.md`.
+**Reframe ladder tag is `reframe-v2`, not v3** (`6fcd5e55`).
+`REFRAME_LADDER_VERSION` (`atlasVideoService.js:195`) bumped to `reframe-v3`
+the same day (source-native pad) and was reverted because live adgen still
+ships `reframe-v2` and treats `!==` as stale — it then re-derived with
+composite-outpaint and overwrote $0 force-crops. Source-native pad +
+force-crop **code stayed**; only the tag reverted. Re-bump only after adgen
+matches the v3-shape / stale predicate.
+**Prewarm covers both masters** (`01a62e86`):
+`PREWARM_PLATFORM_FORMATS = [META_VIDEO_MASTER, 'pmax_video_16_9']`
+(`videoRefPrewarmService.js:74`). 16:9 cannot be derived from the 9:16 warm.
+Pinned by `scripts/verifyVideoRefPrewarm.js`.
 
 **STATIC** — direct to **gpt-image-2/edit**, one call returns the finished ad
 (`directImageRenderService`). No HTML, no Puppeteer, no SVG overlay compositing.
@@ -579,8 +675,10 @@ key, and is **not** what makes the flip work. Pinned by
 
 Two different things, repeatedly confused, so state both:
 
-- **Titling / "chrome"** in `brandScriptExecutor` → `remotionRenderService` **is
-  burned into the video**. Correct and intended.
+- **Titling / "chrome"** — burned into the video via the `brandScriptExecutor`
+  → `remotionRenderService` chain (**live titling runs adgen's ported copy of
+  this chain; backend's own copy is the dormant `ADGEN_RENDERER_ENABLED`-off
+  fallback**). Correct and intended.
 - **The Meta surface overlay** — the simulated IG/FB furniture *including Meta's
   current CTA treatment for that surface* — is **PREVIEW ONLY and MUST NOT be
   burned in**. Owner: *"the meta overlays should include the current meta
@@ -635,9 +733,9 @@ returns**:
 
 | Question | Where the answer really is |
 |---|---|
-| Which titling engine runs? | `brandScriptExecutor.js:913-922` — returns `'remotion'` **unconditionally**; the cascade below it is inside `/* … */` |
+| Which titling engine runs? | `brandScriptExecutor.js:913-922` — returns `'remotion'` **unconditionally**; the cascade below it is inside `/* … */`. **This is backend's dormant fallback code — live titling runs in adgen's ported copy.** |
 | Which render path runs? | `renderService.js:485-520` (`ai_*` static → `renderDirectImage`, return) vs `:895` `renderViaSpec` fallthrough |
-| Which video overlay runs? | `routes/ads.js:1156` `if (ad.renderRoute === 'veo')` → master + `renderBrandScriptAndSave`, then **returns**. Never reaches `renderCreative` |
+| Which video overlay runs? | `routes/ads.js:1156` `if (ad.renderRoute === 'veo')` → master + `renderBrandScriptAndSave`, then **returns**. Never reaches `renderCreative`. **This backend code path is the dormant `ADGEN_RENDERER_ENABLED`-off fallback — in production today adgen generates the master and titles it.** |
 | Which models can a user pick? | `selectable: true` in `MODEL_CAPS`, filtered at `routes/ads.js:1979` |
 | Concept field (v2 flat vs v3 `routing`)? | **Only** `services/conceptProjection.js` — `conceptField()` / `conceptMediaPicks()` |
 | Is a feature on? | grep `config/defaults.env` — it is `dotenv`-loaded at boot by `index.js:5` and `worker.js:20` |
@@ -841,32 +939,26 @@ Video never launches a browser.
   2026-08-18) — the wizard's posted `8` no longer wins; see the duration
   bullet below. **On a mixed Meta+PMax run this same master also serves
   PMax's portrait surfaces** — see the shared-portrait bullet below.
-- **Video (MIXED Meta+PMax): ONE shared 9:16 master, not two, WHEN the
-  hook-first switch is ON. TWO billable Omni masters per product then, not
-  three — $1.80, was $2.70 (owner directive 2026-08-18).** ⚠️ **CONDITIONAL,
-  and the condition is not cosmetic** — the share only happens when all five
-  conjuncts below hold, and the load-bearing one is that the hook-first camera
-  standardization is ON. With it off a mixed run still bills **3 / $2.70**, by
-  design. **As of the 2026-08-20 owner revert (§00), OFF is the shipped
-  `config/defaults.env` default** — so a mixed run bills **3 / $2.70 today**,
-  not 2 / $1.80, absent an explicit re-enable of `VIDEO_HOOK_FIRST_PROMPT` /
-  `PMAX_VIDEO_DIRECTIVES`. Do not quote $1.80 as the unconditional
-  present-tense cost without checking
-  `isHookFirstVideoPromptEnabled()`. A mixed run measured 21 video Ads / 3 distinct
-  `veoPredictionId`s. Two of those three were the same portrait plate at
-  byte-identical `deliveryDims` (`meta_stories_9_16` and `pmax_video_9_16`
-  are both 1080×1920; they differ only in their **safe ZONE**, which is a
-  TITLING input resolved per row from the row's own `platformFormat` through
-  `remotion/lib/safeZones.js`, so one plate serves both surfaces while each
-  keeps its own burned-in treatment. ⚠️ **Not `platformFormats.safeArea`** —
-  this line used to say that and it was wrong; Remotion never reads that
-  field. See §00 step 4.) Now
-  `pmax_video_9_16` keeps its own Ad row and its own `platformFormat` but is
-  minted as a FREE derive of the Meta plate. **Delivered count is unchanged
-  at 21.** The 16:9 master stays billable — nothing can derive a landscape
-  frame from a portrait plate without cropping up.
+- **Video (MIXED Meta+PMax): ONE shared 9:16 master, UNCONDITIONALLY as of
+  `fba81588` / 2026-09-03. TWO billable Omni masters per product, not three
+  — $1.80, was $2.70 (owner 2026-08-18, sharing-gate removed 2026-09-03).**
+  `pmax_video_9_16` keeps its own Ad row and `platformFormat` but is minted
+  as a FREE derive of `meta_stories_9_16`. Delivered count is unchanged at
+  21. The 16:9 master stays billable — nothing can derive a landscape frame
+  from a portrait plate without cropping up. The two 9:16 formats declare
+  byte-identical `deliveryDims` (1080×1920) and differ only in their
+  **safe ZONE** (titling input from `remotion/lib/safeZones.js` per row —
+  not `platformFormats.safeArea`; Remotion never reads that field).
+  ⚠️ **SUPERSEDED — the hook-first 4th conjunct.** From 2026-08-18 until
+  `fba81588`, sharing also required `isHookFirstVideoPromptEnabled() === true`,
+  and the 2026-08-20 FILE default of `false` therefore billed **3 / $2.70**
+  on every mixed run. That conjunct is **deleted**. Owner 2026-09-03: mint
+  one 9:16 regardless of `VIDEO_HOOK_FIRST_PROMPT` / `PMAX_VIDEO_DIRECTIVES`;
+  the live (non-hook-first) prompt **is** the shared camera; PMax vs Meta
+  differences stay in TITLING. Do **not** quote $2.70 as today's mixed cost
+  without the kill switch or the Meta 10s floor being off.
   - **The decision is `resolvePortraitMasterFormat(masterFormats)`
-    (`campaignAdsGenerationService.js`), computed ONCE inside
+    (`campaignAdsGenerationService.js:717-746`), computed ONCE inside
     `planDeterministicVideoAds` and STAMPED onto every affected row as
     `deriveFromMaster`.** The render loop and the regenerate preflight read
     that stamp back through `resolveDeriveFromMaster`; neither re-derives the
@@ -874,14 +966,15 @@ Video never launches a browser.
     never ask "is there a Meta sibling on this campaign?"** — a previous
     Meta-only run would let a later PMax-only 9:16 adopt that old plate and
     skip its Omni submit. Only the mint knows the run.
-  - **FAILS CLOSED ON FIVE CONJUNCTS**, all required: the
+  - **FAILS CLOSED ON FOUR CONJUNCTS** (`:702-710`), all required: the
     `UNIFIED_VIDEO_9_16_MASTER` kill switch; the Meta master minted IN THIS
-    RUN; the PMax portrait master requested IN THIS RUN; the hook-first camera
-    standardization being ON; and the Meta 10s floor being active. **On a
-    PMax-only run
-    `pmax_video_9_16` stays BILLABLE** — a derive whose master never exists
-    fails honestly and the run would ship NO 9:16 video at all, which is
-    worse than paying $0.90. When in doubt, bill.
+    RUN; the PMax portrait master requested IN THIS RUN; the Meta 10s floor
+    being active. Camera-prompt / hook-first is **not** a conjunct.
+    `isSharedPortraitPlatePromptCoherent` still exists and is exported
+    (`:638-679`) but `resolvePortraitMasterFormat` does **not** call it
+    (pinned F2). **On a PMax-only run `pmax_video_9_16` stays BILLABLE** —
+    a derive whose master never exists fails honestly and the run would ship
+    NO 9:16 video at all, which is worse than paying $0.90. When in doubt, bill.
   - ⚠️ **DO NOT add a `platformFormat === 'pmax_video_9_16'` branch to
     `resolveDeriveFromMaster`.** It looks like the `pmax_video_1_1` pattern
     and is not: the square was never a legitimate billable master, the 9:16
@@ -909,25 +1002,17 @@ Video never launches a browser.
     failure: if the shared master fails, 15 of the 21 rows fail with it (was
     6 under three masters). That is inherent in "a single minting for 9x16"
     and is owner-directed, not an oversight.
-  - ⚠️ **CONJUNCT 4 IS THE CAMERA SWITCH, NOT "DO THE TWO PROFILES MATCH".**
-    This was got wrong once and the wrong version is seductive. MEASURED
-    against the merged prompt lane: with the standardization OFF both
-    destinations fall through to the SAME `gemini-omni` profile, so a profile
-    -equality test is **TRUE IN BOTH SWITCH STATES** — a dead conjunct that
-    gates nothing, and the state it admits is the worst one (a shared plate
-    shot with Meta's pan, delivered to YouTube Shorts, while the operator
-    believes they rolled the camera back). The gate therefore calls
-    **`veoPromptBuilder.isHookFirstVideoPromptEnabled()`** — imported, never
-    re-implemented, because that switch reads TWO env names
-    (`VIDEO_HOOK_FIRST_PROMPT` + legacy `PMAX_VIDEO_DIRECTIVES`) with a
-    deliberate fail-safe OR. Profile equality is retained only as a SECOND,
-    belt-and-braces conjunct. Pinned by `verifySharedPortraitMaster` F6.
+  - ⚠️ **DO NOT restore hook-first / camera-coherence as a sharing conjunct.**
+    The old "conjunct 4 is the camera switch, not profile equality" warning
+    was load-bearing *while sharing was gated on the switch*. It is now
+    historical: F6 pins that genuinely-different profile names still SHARE
+    on a mixed run. `VIDEO_HOOK_FIRST_PROMPT` still selects prompt *text*
+    (§00); putting it back on `resolvePortraitMasterFormat` re-opens the
+    $2.70 mixed bill the moment the FILE default is `false`.
   - Flag off (`UNIFIED_VIDEO_9_16_MASTER=false`) restores the three-master
     mint byte-for-byte, same 21 ads. Pinned by
-    `scripts/verifySharedPortraitMaster.js` (86 checks, revert-proven on
-    twelve mutations — including the equality-only gate above, and two
-    checks that were themselves found VACUOUS by revert-proof because they
-    never reached the conjunct they claimed to test).
+    `scripts/verifySharedPortraitMaster.js` (F1/F1b/F2/F6 share in both
+    switch states; F3 kill-switch restores 3; E3 Meta-floor coupling).
 - **Video (Google PMax, Phase A 2026-08-10): TWO billable Omni masters per
   product — 9:16 + 16:9 — not one, and not three. Delivered: NINE Ads
   (3 surfaces × 3 intent stages), not 12.** (Standalone `google_video` /
@@ -1150,7 +1235,9 @@ Video never launches a browser.
   `scripts/verifyReframeHoldBounded.js` (28 checks, revert-proven on 7 mutations).
   Full write-up: `session.d/2026-08-27_reframe-hold-bounded.md`.
 - **Never leave a paid Omni master in `status:'rendering'`.** Stamp `draft`
-  with `veoVideoUrl` before titling (`routes/ads.js:1258-1294`). Titling failure
+  with `veoVideoUrl` before titling (`routes/ads.js:1258-1294`, backend's
+  dormant in-process fallback — adgen's own renderer enforces the same rule
+  live). Titling failure
   → `failed` + keep master; success/no-chrome → finished. Counting an untitled
   master as success is forbidden.
 - **"veo" IS A LEGACY NAME — the video model is Omni.** Corrected 2026-08-02.
@@ -1802,8 +1889,9 @@ Video never launches a browser.
   dropped (this repo already lost `renderError.predictionId` that way).
   Adversarial review killed it: **`renderStage` is OWNED by
   `services/adStage.js`**, which `$set`s it unconditionally (`adStage.js:82-85`)
-  and is called throughout titling (`brandScriptExecutor.js:1200`, `:1306`,
-  `:1332`). The sentinel was therefore clobbered seconds into the render, so an
+  and is called throughout titling on backend's dormant in-process fallback
+  (`brandScriptExecutor.js:1200`, `:1306`, `:1332`) — live titling runs in
+  adgen. The sentinel was therefore clobbered seconds into the render, so an
   ad whose render crashed could never be re-swept — the exact leak the resume
   exists to close. The trap is about *undeclared* paths; **declaring** the field
   (`models/Ad.js`, `enum:['pending','claimed',null]`) removes it. `renderStage`
@@ -1814,10 +1902,11 @@ Video never launches a browser.
   about `renderStage` being owned by `services/adStage.js` — but nothing
   enforces it any more. Treat this bullet as a design note, not a guarantee.
   **Corollary worth knowing:** the same mid-titling crash leaves the identical
-  orphan on the NORMAL render path today (`routes/ads.js:1437-1460` stamps
-  `draft` + `renderUrl` *before* titling at `:1477`), and no sweeper catches that
-  either, because they all key on `status:'rendering'`. Pre-existing, still open,
-  not introduced here.
+  orphan on backend's dormant in-process fallback render path
+  (`routes/ads.js:1437-1460` stamps `draft` + `renderUrl` *before* titling at
+  `:1477`) — not what runs in production today, where adgen owns generation
+  and titling — and no sweeper catches that either, because they all key on
+  `status:'rendering'`. Pre-existing, still open, not introduced here.
 - Meta preview chrome can show placeholder **"Lorem ipsum dolor sit amet"**.
 
 ---
@@ -1894,6 +1983,7 @@ Full detail in `docs/ATLAS.md` §7 and `docs/CLOUDINARY-VIDEO.md`. Headlines:
   hierarchy; `3.0.0→3.1.0` starved-brief (`summary` / `logoUrl`);
   `3.1.0→3.2.0` social-proof menu. Any future signal-shape change needs the
   same bump. Write-up: `session.d/2026-09-03_catalog-product-shortbenefits.md`.
+- **`Ad.videoTitleDirection` is Mixed; `Ad.veoProvider` / `Ad.veoResolution` must stay declared.** The video-title Director stamp (`models/Ad.js:586-591`) is Mixed → callers that mutate in place MUST `markModified('videoTitleDirection')`. Mint currently assigns a fresh object onto the insert payload, so that trap is latent. `veoProvider` / `veoResolution` (`:545/:549`, `81b93a3e`) shipped **undeclared** in adgen #108: Mongoose strict dropped them with no error, so a Gemini `v1_…` interaction id was handed to the Atlas prediction GET forever. Values `'atlas' | 'gemini'`; do **not** default `veoProvider` to `'atlas'` — null = unknown (pre-cutover) must stay distinguishable from an asserted Atlas row.
 - **`OVERLAY_ZONES_SKIP_CATALOG` default true.** Catalog ingest skips overlay-zone analysis (no `OverlayZoneArtifact` — missing is honest; `zones:{}` would look like analysis ran and found nothing). Gate is `catalogOverlayChainCtx` at the catalog call site, not a `media.source` sniff. Parser `!== 'false'` only. UGC (`runImagePipeline`) is untouched. Pinned by `scripts/verifyOverlayZonesSkipCatalog.js`. Write-up: `session.d/2026-09-03_overlay-skip-catalog-and-config-truth.md`.
 - **PMax Director hierarchy PRECEDENCE SENTENCE — do not delete or "harmonise".**
   The shared DR block still says "≥4.5 from ≥50" (Meta-tuned, deliberately
@@ -2613,11 +2703,11 @@ not as a separate tuning decision. Re-measure before going higher
   without explicit permission.
 - Before pushing non-trivial changes: run **`npm run lint`**, `node --check` the
   touched files, and run the relevant `scripts/verify*.{js,mjs}` harness
-  (**174 `.js` scripts / 184 including the 10 `.mjs`** — recounted 2026-08-21;
-  run them with `npm test`, NOT the `verify*.js` shell loop, which skips every
-  `.mjs`. Was "143 / 152 including the 9" as of the CampaignRun
-  heartbeat, 2026-08-18 — the "101" the header still carries is stale by ~42,
-  and the "138" this line carried counted only part of the tree). Add a
+  (**glob on this branch 2026-09-04: 230 `.js` + 12 `.mjs` = 242** — `npm test`
+  reports its own count; do not hardcode a pass total here. Recounted 2026-08-21
+  as 174/184, which is the previous stale pin. Run them with `npm test`, NOT the
+  `verify*.js` shell loop, which skips every `.mjs`. Was "143 / 152 including
+  the 9" as of the CampaignRun heartbeat, 2026-08-18). Add a
   harness for money/security-critical logic, and **revert-prove it** — back
   the fix out and confirm the test fails. A test that cannot fail is not a
   test.
