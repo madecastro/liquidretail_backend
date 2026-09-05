@@ -620,48 +620,60 @@ async function syncBrandShopify(brand, run = null) {
       break;
     }
     try {
+      const nextTitle = p.title || '(untitled)';
+      const nextDescription = p.description || null;
+      const benefits = require('./productBenefitsService');
+      const prevDoc = await benefits.loadPrevForBenefits(brand._id, p.externalId);
+      const { changed: benefitsStale } = benefits.markBenefitsStaleIfTextChanged(
+        prevDoc,
+        { title: nextTitle, description: nextDescription }
+      );
       // Upsert only — no await on classify (image network work).
+      const set = {
+        advertiserId:    brand.advertiserId,
+        brandId:         brand._id,
+        source:          'apify-shopify',
+        externalId:      p.externalId,
+        title:           nextTitle,
+        description:     nextDescription,
+        brand:           p.brand || brand.name || null,
+        price:           p.price,
+        // Prefer the INDEPENDENTLY VERIFIED store currency over the
+        // actor's own per-product field once we've confirmed it above —
+        // the actor is not a reliable reporter of currency (it returned
+        // "USD" for the ZAR Pelagic incident store). When the check was
+        // inconclusive (currencyCheck.verified === false, mismatch ===
+        // false), fall back to whatever the actor reported, same as
+        // before this fix.
+        currency:        currencyCheck.verified ? currencyCheck.currency : p.currency,
+        availability:    p.availability,
+        // p.additionalImageUrls is ALREADY the alt list (hero is
+        // p.imageUrl), so slice from 0 — not the hero-offset form used
+        // on Shopify/JSON-LD combined arrays. Cap = MAX_ADDITIONAL_IMAGES
+        // (shared; see catalogImageLimits). Upstream apifyPullService
+        // returns images.slice(1) uncapped; this writer is the bound.
+        additionalImages: Array.isArray(p.additionalImageUrls)
+          ? p.additionalImageUrls.slice(0, MAX_ADDITIONAL_IMAGES)
+          : [],
+        productUrl:      p.productUrl || null,
+        // Merchant-authored category string (Shopify product_type)
+        // captured by the Apify normalizer. Feeds the categoryRef
+        // stamp below and drives the /api/catalog list's raw-string
+        // filter dropdown.
+        category:        p.category || null,
+        rawData:         p,
+        lastSyncedAt:    new Date()
+      };
+      // null → url heals; url → null must not clobber. See catalogImageUrlGuard.
+      require('./catalogImageUrlGuard').assignImageUrl(set, p.imageUrl);
+      const upsertUpdate = {
+        $set: set,
+        $setOnInsert: { firstSeenAt: new Date() }
+      };
+      benefits.applyBenefitsStaleToUpdate(upsertUpdate, benefitsStale);
       const result = await CatalogProduct.findOneAndUpdate(
         { brandId: brand._id, externalId: p.externalId },
-        {
-          $set: {
-            advertiserId:    brand.advertiserId,
-            brandId:         brand._id,
-            source:          'apify-shopify',
-            externalId:      p.externalId,
-            title:           p.title || '(untitled)',
-            description:     p.description || null,
-            brand:           p.brand || brand.name || null,
-            price:           p.price,
-            // Prefer the INDEPENDENTLY VERIFIED store currency over the
-            // actor's own per-product field once we've confirmed it above —
-            // the actor is not a reliable reporter of currency (it returned
-            // "USD" for the ZAR Pelagic incident store). When the check was
-            // inconclusive (currencyCheck.verified === false, mismatch ===
-            // false), fall back to whatever the actor reported, same as
-            // before this fix.
-            currency:        currencyCheck.verified ? currencyCheck.currency : p.currency,
-            availability:    p.availability,
-            imageUrl:        p.imageUrl || null,
-            // p.additionalImageUrls is ALREADY the alt list (hero is
-            // p.imageUrl), so slice from 0 — not the hero-offset form used
-            // on Shopify/JSON-LD combined arrays. Cap = MAX_ADDITIONAL_IMAGES
-            // (shared; see catalogImageLimits). Upstream apifyPullService
-            // returns images.slice(1) uncapped; this writer is the bound.
-            additionalImages: Array.isArray(p.additionalImageUrls)
-              ? p.additionalImageUrls.slice(0, MAX_ADDITIONAL_IMAGES)
-              : [],
-            productUrl:      p.productUrl || null,
-            // Merchant-authored category string (Shopify product_type)
-            // captured by the Apify normalizer. Feeds the categoryRef
-            // stamp below and drives the /api/catalog list's raw-string
-            // filter dropdown.
-            category:        p.category || null,
-            rawData:         p,
-            lastSyncedAt:    new Date()
-          },
-          $setOnInsert: { firstSeenAt: new Date() }
-        },
+        upsertUpdate,
         { upsert: true, new: true, rawResult: true }
       );
       if (result?.lastErrorObject?.updatedExisting) summary.updated++;
@@ -669,7 +681,7 @@ async function syncBrandShopify(brand, run = null) {
       catalogPersisted++;
       // Defer classify to post-loop pass — never block remaining upserts.
       const row = result?.value || result;
-      require('./productBenefitsService').collectIfNew(result, pendingBenefits);
+      benefits.collectAfterCatalogUpsert(result, pendingBenefits, { changed: benefitsStale });
 
       // Stamp / restamp categoryRef via applyFeedTruthStamp — handles
       // insert (fresh row), noop (ref matches), and rename (merchant

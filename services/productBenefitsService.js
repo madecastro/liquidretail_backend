@@ -1,16 +1,19 @@
 'use strict';
-// Persist buyer-facing shortBenefits onto CatalogProduct ONCE, at ingest
+// Persist buyer-facing shortBenefits onto CatalogProduct at ingest
 // (or via scripts/backfillProductBenefits.js). Billable: one
 // gemini-2.5-flash chatCompletion per product that does not already have
-// them, ledgered to CostLog under stage `product_benefits`.
+// them (or whose title/description later changed), ledgered to CostLog
+// under stage `product_benefits`.
 //
 // MONEY — all of these are load-bearing:
 //   * Kill switch PRODUCT_BENEFITS_DERIVATION, strictly === 'true'
 //     (file default true). Unset / "false" / "TRUE" are OFF.
-//   * Idempotent: callers skip when shortBenefits is already non-empty;
-//     this module also refuses cheaply (no LLM) if handed such a product,
-//     and refuses a second attempt once shortBenefitsDerivedAt is set
-//     (covers "derived, genuinely nothing" — empty array).
+//   * Idempotent on UNCHANGED text: callers skip when shortBenefits is
+//     already non-empty; this module also refuses cheaply (no LLM) if
+//     handed such a product, and refuses a second attempt once
+//     shortBenefitsDerivedAt is set (covers "derived, genuinely nothing"
+//     — empty array). A NORMALISED title/description change clears the
+//     stamp and re-enqueues (~$0.002, bounded by the ingest cap).
 //   * No retry loop around the billable call. atlasLlmService owns retries.
 //   * Return [] on failure. NEVER throw into an ingest path.
 //   * Callable ONLY from catalog ingest writers + the backfill script.
@@ -93,6 +96,82 @@ function collectIfNew(result, pending) {
   if (!upsertWasInsert(result)) return;
   const product = productFromUpsert(result);
   if (product) pending.push(product);
+}
+
+// Normalise title/description for freshness comparison: trim, collapse
+// interior whitespace, case-fold. Null/undefined/non-string → ''.
+// Price / image / URL are NOT part of this fingerprint — a merchant
+// fixing a photo must not re-bill gemini-2.5-flash.
+function normalizeProductText(value) {
+  if (typeof value !== 'string') return '';
+  return value.replace(/\s+/g, ' ').trim().toLowerCase();
+}
+
+function productTextChanged(prevDoc, nextFields) {
+  if (!prevDoc) return false;
+  const next = nextFields || {};
+  return normalizeProductText(prevDoc.title) !== normalizeProductText(next.title)
+      || normalizeProductText(prevDoc.description) !== normalizeProductText(next.description);
+}
+
+// Shared helper for every catalog writer's upsert path (and manual/detect
+// $set of title/description). Compare NORMALISED title+description.
+//
+// If different: caller must $unset shortBenefitsDerivedAt on the same
+// write (applyBenefitsStaleToUpdate) and enqueue through collectIfStale.
+// shortBenefits is KEPT on the Mongo doc so a generate during the
+// derive window still has the old list; collectIfStale hands derive
+// an in-memory view with the list cleared so already-has-benefits
+// does not refuse. If identical: no write, no enqueue.
+//
+// prevDoc = the PRE-upsert row (or null on insert). nextFields = the
+// title/description that will actually be $set (not the raw feed).
+function markBenefitsStaleIfTextChanged(prevDoc, nextFields) {
+  const changed = productTextChanged(prevDoc, nextFields);
+  return { changed };
+}
+
+function applyBenefitsStaleToUpdate(update, changed) {
+  if (!changed || !update) return update;
+  update.$unset = { ...(update.$unset || {}), shortBenefitsDerivedAt: 1 };
+  return update;
+}
+
+// In-memory view that lets deriveShortBenefits run even though Mongo
+// still holds the previous list. Never persisted as-is — persistBenefits
+// overwrites both fields on a stampable verdict.
+function redriveView(product) {
+  if (!product) return product;
+  const plain = typeof product.toObject === 'function' ? product.toObject() : { ...product };
+  return { ...plain, shortBenefits: [], shortBenefitsDerivedAt: null };
+}
+
+function collectIfStale(result, pending, changed) {
+  if (!changed) return;
+  if (!Array.isArray(pending)) return;
+  if (upsertWasInsert(result)) return; // collectIfNew already kept the insert
+  const product = productFromUpsert(result);
+  if (product) pending.push(redriveView(product));
+}
+
+// One extra indexed read per upsert so we can compare against the
+// PRE-write title/description. Fail-closed: a throw here looks like
+// "no prev" → no stale write, no extra bill. Inserts still go through
+// collectIfNew.
+async function loadPrevForBenefits(brandId, externalId) {
+  if (!brandId || externalId == null || externalId === '') return null;
+  try {
+    return await CatalogProduct.findOne({ brandId, externalId })
+      .select('title description shortBenefits shortBenefitsDerivedAt')
+      .lean();
+  } catch (_) {
+    return null;
+  }
+}
+
+function collectAfterCatalogUpsert(result, pending, { changed } = {}) {
+  collectIfNew(result, pending);
+  collectIfStale(result, pending, changed);
 }
 
 function normalizeDerivedBenefits(raw) {
@@ -399,6 +478,14 @@ module.exports = {
   upsertWasInsert,
   productFromUpsert,
   collectIfNew,
+  normalizeProductText,
+  productTextChanged,
+  markBenefitsStaleIfTextChanged,
+  applyBenefitsStaleToUpdate,
+  redriveView,
+  collectIfStale,
+  loadPrevForBenefits,
+  collectAfterCatalogUpsert,
   normalizeDerivedBenefits,
   buildPrompt,
   deriveShortBenefits,

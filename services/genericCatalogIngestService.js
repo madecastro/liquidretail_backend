@@ -306,6 +306,15 @@ async function syncBrandGenericCatalog(brand, run, { isBrandAborted, categories 
         }
       }
 
+      const nextTitle = p.title || '(untitled)';
+      const nextDescription = p.description || null;
+      const benefits = require('./productBenefitsService');
+      const prevDoc = await benefits.loadPrevForBenefits(brand._id, externalId);
+      const { changed: benefitsStale } = benefits.markBenefitsStaleIfTextChanged(
+        prevDoc,
+        { title: nextTitle, description: nextDescription }
+      );
+
       const set = {
         advertiserId:     brand.advertiserId,
         brandId:          brand._id,
@@ -314,13 +323,12 @@ async function syncBrandGenericCatalog(brand, run, { isBrandAborted, categories 
         source:           catalogSource,
         externalId,
         itemGroupId:      externalId,
-        title:            p.title || '(untitled)',
-        description:      p.description || null,
+        title:            nextTitle,
+        description:      nextDescription,
         brand:            p.brand || brand.name || null,
         price:            Number.isFinite(p.price) ? p.price : null,
         currency:         p.currency || null,
         availability:     p.availability || null,
-        imageUrl:         p.imageUrl || null,
         // p.additionalImages is ALREADY the alt list (hero is p.imageUrl),
         // so slice from 0 — not the hero-offset form used in the resolver.
         // Cap = MAX_ADDITIONAL_IMAGES (shared; see catalogImageLimits).
@@ -334,6 +342,8 @@ async function syncBrandGenericCatalog(brand, run, { isBrandAborted, categories 
         rawData:          p.rawData,
         lastSyncedAt:     new Date()
       };
+      // null → url heals; url → null must not clobber. See catalogImageUrlGuard.
+      require('./catalogImageUrlGuard').assignImageUrl(set, p.imageUrl);
       // Conditionally attach rating / productReviews so Mongoose does not
       // persist explicit undefined → null and wipe prior values.
       if (Number.isFinite(p.rating)) set.rating = p.rating;
@@ -352,16 +362,18 @@ async function syncBrandGenericCatalog(brand, run, { isBrandAborted, categories 
       // every re-sync.
 
       // Upsert only — no await on classify (image network work).
+      const upsertUpdate = {
+        $set: set,
+        $setOnInsert: { firstSeenAt: new Date() }
+      };
+      benefits.applyBenefitsStaleToUpdate(upsertUpdate, benefitsStale);
       const upsertResult = await CatalogProduct.findOneAndUpdate(
         { brandId: brand._id, externalId },
-        {
-          $set: set,
-          $setOnInsert: { firstSeenAt: new Date() }
-        },
+        upsertUpdate,
         { upsert: true, new: true, rawResult: true }
       );
       const doc = upsertResult?.value || upsertResult;
-      require('./productBenefitsService').collectIfNew(upsertResult, pendingBenefits);
+      benefits.collectAfterCatalogUpsert(upsertResult, pendingBenefits, { changed: benefitsStale });
       productsUpserted += 1;
       persistedCount += 1;
 

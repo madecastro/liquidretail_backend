@@ -20,6 +20,213 @@ const { syncPosts }   = require('./postSyncService');
 const { syncCampaigns } = require('./campaignSyncService');
 const { concurrency: CONC } = require('./concurrency');
 
+const CATALOG_RESYNC_PRODUCT_SOURCES = ['shopify-direct', 'sitemap-jsonld', 'apify-shopify'];
+const CATALOG_RESYNC_IN_PROGRESS_KINDS = ['catalog-sync', 'demo-sync'];
+const DEFAULT_RESYNC_INTERVAL_H = 24;
+const DEFAULT_RESYNC_SPACING_MS = 3 * 60 * 1000;
+
+function isCatalogScheduledResyncEnabled() {
+  return process.env.CATALOG_SCHEDULED_RESYNC_ENABLED === 'true';
+}
+
+function catalogResyncIntervalMs() {
+  const n = Number(process.env.CATALOG_RESYNC_INTERVAL_H);
+  if (!Number.isFinite(n) || n <= 0) return DEFAULT_RESYNC_INTERVAL_H * 3600 * 1000;
+  return n * 3600 * 1000;
+}
+
+function catalogResyncSpacingMs() {
+  const n = Number(process.env.CATALOG_RESYNC_SPACING_MS);
+  if (!Number.isFinite(n) || n < 0) return DEFAULT_RESYNC_SPACING_MS;
+  return n;
+}
+
+function isCatalogResyncDue(brand, now, intervalMs) {
+  if (!brand) return false;
+  const last = brand.lastCatalogResyncAt;
+  if (!last) return true;
+  const t = new Date(last).getTime();
+  if (!Number.isFinite(t)) return true;
+  const window = Number.isFinite(intervalMs) && intervalMs > 0
+    ? intervalMs
+    : catalogResyncIntervalMs();
+  return (now - t) >= window;
+}
+
+// Which catalog method a scheduled tick should run. Reuses
+// apifyIngestService.resolveCatalogMethod for demo brands (the same
+// ternary the live orchestrator uses). Non-demo brands are classified
+// from CatalogProduct.source, then apifyDemo.method, then a store
+// origin (onboarding default = shopify-direct). Returns null if this
+// brand has no non-IG catalog to refresh.
+function resolveScheduledCatalogMethod(brand, sourceSet) {
+  const sources = sourceSet instanceof Set
+    ? sourceSet
+    : new Set(Array.isArray(sourceSet) ? sourceSet : []);
+  const cfg = (brand && brand.apifyDemo) || {};
+  if (brand && brand.isDemo && cfg.shopifyUrl) {
+    return require('./apifyIngestService').resolveCatalogMethod(cfg);
+  }
+  if (sources.has('shopify-direct')) return 'shopify-direct';
+  if (sources.has('sitemap-jsonld')) return 'generic-sitemap';
+  if (sources.has('apify-shopify')) return 'apify';
+  if (cfg.method && ['apify', 'generic-sitemap', 'shopify-direct'].includes(cfg.method)) {
+    return require('./apifyIngestService').resolveCatalogMethod(cfg);
+  }
+  const origin = require('./shopifyAccessResolver').resolveStoreOrigin(brand);
+  if (origin) return 'shopify-direct';
+  return null;
+}
+
+function selectDueCatalogResyncCandidate(brands, sourceByBrand, now, intervalMs) {
+  const due = [];
+  for (const b of brands || []) {
+    if (!isCatalogResyncDue(b, now, intervalMs)) continue;
+    const key = String(b._id);
+    const sources = sourceByBrand instanceof Map
+      ? sourceByBrand.get(key)
+      : (sourceByBrand && sourceByBrand[key]);
+    const method = resolveScheduledCatalogMethod(b, sources);
+    if (!method) continue;
+    due.push({ brand: b, method });
+  }
+  due.sort((a, b) => {
+    const ta = a.brand.lastCatalogResyncAt ? new Date(a.brand.lastCatalogResyncAt).getTime() : 0;
+    const tb = b.brand.lastCatalogResyncAt ? new Date(b.brand.lastCatalogResyncAt).getTime() : 0;
+    return ta - tb;
+  });
+  return due[0] || null;
+}
+
+let lastCatalogResyncTickAt = 0;
+
+function _resetCatalogResyncSpacingForTest() {
+  lastCatalogResyncTickAt = 0;
+}
+
+async function hasCatalogSyncInProgress(brandId) {
+  if (!brandId) return false;
+  const OperationRun = require('../models/OperationRun');
+  const found = await OperationRun.findOne({
+    brandId,
+    status: { $in: ['running', 'cancelling'] },
+    kind: { $in: CATALOG_RESYNC_IN_PROGRESS_KINDS }
+  }).select('_id').lean();
+  return !!found;
+}
+
+async function dispatchCatalogResync(brand, method) {
+  if (brand.isDemo) {
+    // Existing orchestrator — routes shopify-direct / generic / apify.
+    // skipInstagram is the money guard: a catalog-only re-sync must not
+    // fire the paid Apify IG actor as a side effect of a stamped igHandle.
+    return require('./apifyIngestService').syncBrandApify(brand._id, { skipInstagram: true });
+  }
+  const { startRun } = require('./progressService');
+  const run = await startRun({
+    kind: 'catalog-sync',
+    advertiserId: brand.advertiserId,
+    brandId: brand._id,
+    label: `Catalog re-sync (scheduled, ${method})`
+  });
+  try {
+    let result;
+    if (method === 'generic-sitemap') {
+      if (process.env.GENERIC_CATALOG_ENABLED === 'false') {
+        const skipped = { ok: false, skipped: true, reason: 'generic-sitemap method is disabled (GENERIC_CATALOG_ENABLED=false)' };
+        await run.fail(new Error(skipped.reason));
+        return skipped;
+      }
+      result = await require('./genericCatalogIngestService')
+        .syncBrandGenericCatalog(brand, run, { isBrandAborted: async () => false });
+    } else {
+      result = await require('./shopifyPublicIngestService')
+        .syncBrandShopifyDirect(brand, run, { isBrandAborted: async () => false });
+    }
+    if (result && result.ok === false) {
+      await run.fail(new Error(result.reason || 'catalog resync failed'));
+      return result;
+    }
+    await run.succeed({
+      productsUpserted: result && result.productsUpserted || 0,
+      method
+    });
+    return result;
+  } catch (err) {
+    await run.fail(err);
+    throw err;
+  }
+}
+
+async function runDueCatalogResyncs(summary, now) {
+  if (!isCatalogScheduledResyncEnabled()) return summary;
+  const spacingMs = catalogResyncSpacingMs();
+  if (lastCatalogResyncTickAt && (now - lastCatalogResyncTickAt) < spacingMs) {
+    return summary;
+  }
+  const intervalMs = catalogResyncIntervalMs();
+  const brands = await Brand.find({
+    $or: [
+      { 'syncSettings.autoSyncEnabled': true },
+      { isDemo: true }
+    ]
+  }).select('_id advertiserId isDemo websiteUrl apifyDemo syncSettings lastCatalogResyncAt').lean();
+  if (!brands.length) return summary;
+
+  const CatalogProduct = require('../models/CatalogProduct');
+  const grouped = await CatalogProduct.aggregate([
+    {
+      $match: {
+        brandId: { $in: brands.map((b) => b._id) },
+        deletedAt: null,
+        source: { $in: CATALOG_RESYNC_PRODUCT_SOURCES }
+      }
+    },
+    { $group: { _id: '$brandId', sources: { $addToSet: '$source' } } }
+  ]);
+  const sourceByBrand = new Map(grouped.map((g) => [String(g._id), new Set(g.sources)]));
+  const picked = selectDueCatalogResyncCandidate(brands, sourceByBrand, now, intervalMs);
+  if (!picked) return summary;
+
+  if (await hasCatalogSyncInProgress(picked.brand._id)) {
+    return summary;
+  }
+
+  lastCatalogResyncTickAt = now;
+  const hydrated = await Brand.findById(picked.brand._id);
+  if (!hydrated) return summary;
+  try {
+    const result = await dispatchCatalogResync(hydrated, picked.method);
+    const ok = !!(result
+      && result.ok !== false
+      && !result.skipped
+      && !result.cancelled
+      && !(hydrated.isDemo && result.shopify && result.shopify.ok === false));
+    if (ok) {
+      await Brand.updateOne(
+        { _id: hydrated._id },
+        { $set: { lastCatalogResyncAt: new Date() } }
+      );
+      summary.catalogsResynced = (summary.catalogsResynced || 0) + 1;
+    } else if (result && result.reason) {
+      summary.errors.push({
+        brandId: hydrated._id,
+        kind: 'catalog_resync',
+        method: picked.method,
+        reason: result.reason
+      });
+    }
+  } catch (err) {
+    summary.errors.push({
+      brandId: hydrated._id,
+      kind: 'catalog_resync',
+      method: picked.method,
+      reason: err.message
+    });
+  }
+  return summary;
+}
+
 const AD_PLATFORMS = ['meta-ads', 'google-ads'];
 
 const TICK_INTERVAL_MS = 60 * 1000; // 1 minute — cadence checks are
@@ -49,7 +256,15 @@ async function runDueSyncs() {
     const brands = await Brand.find({ 'syncSettings.autoSyncEnabled': true })
       .select('_id syncSettings')
       .lean();
-    if (!brands.length) { inFlight = false; return summary; }
+    if (!brands.length) {
+      // No IG-auto-sync brands — still consider Shopify/generic/Apify
+      // catalogs (demo brands, etc.). Flag-off is a no-op inside.
+      try { await runDueCatalogResyncs(summary, Date.now()); } catch (err) {
+        summary.errors.push({ kind: 'catalog_resync', reason: err.message });
+      }
+      inFlight = false;
+      return summary;
+    }
 
     const brandsById = new Map(brands.map(b => [String(b._id), b]));
     const creds = await IntegrationCredential.find({
@@ -135,6 +350,16 @@ async function runDueSyncs() {
         summary.errors.push({ brandId: cred.brandId, credentialId: String(cred._id), kind: 'campaigns', reason: err.message });
       }
     }
+    // ── Non-IG catalog re-sync (Shopify-direct / generic / Apify) ──
+    // Flag-off is a no-op so the IG loops above stay today's behaviour.
+    // Serial: one brand per tick, spaced by CATALOG_RESYNC_SPACING_MS.
+    // Deploy-killed runs are not resumed — the next tick re-evaluates due-ness.
+    try {
+      await runDueCatalogResyncs(summary, now);
+    } catch (err) {
+      summary.errors.push({ kind: 'catalog_resync', reason: err.message });
+    }
+
     // ── Brand-voice refresh sweep ──
     // Once every VOICE_SWEEP_INTERVAL_MS, walk brands whose derivedVoice
     // is stale (older than the service's own TTL) AND that have at
@@ -153,8 +378,8 @@ async function runDueSyncs() {
     inFlight = false;
   }
 
-  if (summary.catalogsSynced || summary.postsSynced || summary.campaignsSynced || summary.voiceProfilesRefreshed || summary.errors.length) {
-    console.log(`⏱  scheduled-sync tick: catalogs=${summary.catalogsSynced} posts=${summary.postsSynced} campaigns=${summary.campaignsSynced} voiceRefreshed=${summary.voiceProfilesRefreshed || 0} errors=${summary.errors.length} in ${Date.now() - t0}ms`);
+  if (summary.catalogsSynced || summary.postsSynced || summary.campaignsSynced || summary.catalogsResynced || summary.voiceProfilesRefreshed || summary.errors.length) {
+    console.log(`⏱  scheduled-sync tick: catalogs=${summary.catalogsSynced} posts=${summary.postsSynced} campaigns=${summary.campaignsSynced} catalogResync=${summary.catalogsResynced || 0} voiceRefreshed=${summary.voiceProfilesRefreshed || 0} errors=${summary.errors.length} in ${Date.now() - t0}ms`);
   }
   return summary;
 }
@@ -219,4 +444,19 @@ function startScheduler() {
   }, TICK_INTERVAL_MS);
 }
 
-module.exports = { runDueSyncs, startScheduler };
+module.exports = {
+  runDueSyncs,
+  startScheduler,
+  runDueCatalogResyncs,
+  isCatalogScheduledResyncEnabled,
+  catalogResyncIntervalMs,
+  catalogResyncSpacingMs,
+  isCatalogResyncDue,
+  resolveScheduledCatalogMethod,
+  selectDueCatalogResyncCandidate,
+  hasCatalogSyncInProgress,
+  dispatchCatalogResync,
+  CATALOG_RESYNC_PRODUCT_SOURCES,
+  CATALOG_RESYNC_IN_PROGRESS_KINDS,
+  _resetCatalogResyncSpacingForTest
+};

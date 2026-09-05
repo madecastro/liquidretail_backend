@@ -213,6 +213,13 @@ const brandSchema = new mongoose.Schema({
     campaignCadenceHours: { type: Number,  default: 6 }
   },
 
+  // Scheduled re-sync of Shopify-direct / generic-sitemap / Apify catalogs
+  // (scheduledSyncService.runDueCatalogResyncs). Distinct from
+  // IntegrationCredential.lastCatalogSyncAt (IG/Meta catalog). Strict
+  // schema — undeclared paths are dropped. Stamped on SUCCESS only so a
+  // deploy-killed in-flight run is retried on the next due tick (no resume).
+  lastCatalogResyncAt: { type: Date, default: null },
+
   // V3 #3 — auto-reply with a comment on IG-sourced posts when detect
   // produces a confident product_match. Per-brand opt-in. Phase 1.7c
   // expanded to support three comment types matching the three review

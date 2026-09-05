@@ -15,6 +15,9 @@
  *          silently change the cartesian fallback).
  *   C. Ingest insert-only: upsertWasInsert is false on updatedExisting.
  *   D. Revert-prove the money guards.
+ *   F. Text-change freshness (DATA-PATH-AUDIT §9 item 11):
+ *        changed title → stamp cleared + enqueue; identical → no write;
+ *        price-only → no write.
  *
  * Run: node scripts/verifyProductBenefits.js
  */
@@ -342,6 +345,85 @@ async function runBehavioral() {
       });
       return /3–5 items, each ≤ 6 words, concrete buyer benefits \(not specs\)/.test(system);
     })());
+
+  // ── F. title/description freshness ────────────────────────────────
+  check('F1 normalizeProductText trims, collapses whitespace, case-folds',
+    svc.normalizeProductText('  Foo   BAR\n') === 'foo bar'
+      && svc.normalizeProductText(null) === ''
+      && svc.normalizeProductText(undefined) === '');
+
+  const prev = {
+    title: 'Trail Jacket',
+    description: 'Keeps you dry.',
+    shortBenefits: ['Stays dry', 'Packs small', 'Broken in day one'],
+    shortBenefitsDerivedAt: new Date(),
+  };
+  check('F2 changed title → markBenefitsStaleIfTextChanged.changed',
+    svc.markBenefitsStaleIfTextChanged(prev, {
+      title: 'Trail Jacket V2',
+      description: 'Keeps you dry.',
+    }).changed === true);
+  check('F3 identical (whitespace/case) → not changed',
+    svc.markBenefitsStaleIfTextChanged(prev, {
+      title: '  TRAIL   JACKET ',
+      description: 'Keeps you dry.',
+    }).changed === false);
+  check('F4 price-only nextFields (same title/desc) → not changed',
+    svc.markBenefitsStaleIfTextChanged(prev, {
+      title: 'Trail Jacket',
+      description: 'Keeps you dry.',
+      price: 199,
+    }).changed === false);
+  check('F4b description change → changed; insert (no prev) → not changed',
+    svc.markBenefitsStaleIfTextChanged(prev, {
+      title: 'Trail Jacket',
+      description: 'A new write-up.',
+    }).changed === true
+      && svc.markBenefitsStaleIfTextChanged(null, {
+        title: 'Brand New',
+        description: 'Hello',
+      }).changed === false);
+
+  const update = { $set: { title: 'Trail Jacket V2', price: 10 } };
+  svc.applyBenefitsStaleToUpdate(update, true);
+  check('F5 changed → $unset shortBenefitsDerivedAt (keep shortBenefits)',
+    update.$unset
+      && update.$unset.shortBenefitsDerivedAt === 1
+      && update.$set.shortBenefits === undefined);
+  const updateSame = { $set: { title: 'Trail Jacket', price: 11 } };
+  svc.applyBenefitsStaleToUpdate(updateSame, false);
+  check('F6 identical → applyBenefitsStaleToUpdate is a no-write',
+    updateSame.$unset === undefined
+      && updateSame.$set.shortBenefits === undefined);
+
+  const stalePending = [];
+  svc.collectIfStale(
+    { value: { _id: 'old', shortBenefits: ['a', 'b', 'c'], shortBenefitsDerivedAt: new Date() }, lastErrorObject: { updatedExisting: true } },
+    stalePending,
+    true
+  );
+  check('F7 collectIfStale on a text-changed update enqueues a redrive view (empty list, no stamp)',
+    stalePending.length === 1
+      && stalePending[0]._id === 'old'
+      && Array.isArray(stalePending[0].shortBenefits)
+      && stalePending[0].shortBenefits.length === 0
+      && stalePending[0].shortBenefitsDerivedAt == null);
+  const skipPending = [];
+  svc.collectIfStale(
+    { value: { _id: 'old' }, lastErrorObject: { updatedExisting: true } },
+    skipPending,
+    false
+  );
+  check('F8 collectIfStale identical → no enqueue',
+    skipPending.length === 0);
+  const insertPending = [];
+  svc.collectAfterCatalogUpsert(
+    { value: { _id: 'new' }, lastErrorObject: { updatedExisting: false } },
+    insertPending,
+    { changed: false }
+  );
+  check('F9 collectAfterCatalogUpsert still keeps an insert',
+    insertPending.length === 1 && insertPending[0]._id === 'new');
 }
 
 function runStructural() {
@@ -547,6 +629,25 @@ function runStructural() {
       failedAsExpected);
   }
 
+  const WRITERS = [
+    'services/shopifyPublicIngestService.js',
+    'services/apifyIngestService.js',
+    'services/genericCatalogIngestService.js',
+    'services/catalogSyncService.js',
+  ];
+  for (const rel of WRITERS) {
+    const src = fs.readFileSync(path.join(ROOT, rel), 'utf8');
+    const code = stripCommentsAndStrings(src);
+    check(`F10 ${rel} calls markBenefitsStaleIfTextChanged`,
+      /markBenefitsStaleIfTextChanged/.test(code));
+    check(`F11 ${rel} calls collectAfterCatalogUpsert or collectIfStale`,
+      /collectAfterCatalogUpsert/.test(code) || /collectIfStale/.test(code));
+    check(`F12 ${rel} uses assignImageUrl (no imageUrl clobber)`,
+      /assignImageUrl/.test(code));
+    check(`F13 ${rel} does not $set imageUrl via || null`,
+      !/imageUrl:\s*[^,\n]+\|\|\s*null/.test(code));
+  }
+
   {
     let failedAsExpected = false;
     withTempMutation(
@@ -558,6 +659,38 @@ function runStructural() {
       }
     );
     check('RP6 [REVERT-PROOF] restoring derivation.short_benefits assemble fails L9',
+      failedAsExpected);
+  }
+
+  {
+    let failedAsExpected = false;
+    withTempMutation(
+      SVC_PATH,
+      '  const changed = productTextChanged(prevDoc, nextFields);\n  return { changed };',
+      '  const changed = false;\n  return { changed };',
+      (mutSrc) => {
+        failedAsExpected = /const changed = false/.test(mutSrc)
+          && !/const changed = productTextChanged\(prevDoc, nextFields\)/.test(mutSrc);
+      }
+    );
+    check('RP7 [REVERT-PROOF] hardcoding changed=false is detectable (would skip every re-derive)',
+      failedAsExpected);
+  }
+
+  {
+    let failedAsExpected = false;
+    const shopifyPath = path.join(ROOT, 'services/shopifyPublicIngestService.js');
+    withTempMutation(
+      shopifyPath,
+      '      require(\'./catalogImageUrlGuard\').assignImageUrl(set, flat.imageUrl);',
+      '      set.imageUrl = flat.imageUrl || null;',
+      (mutSrc) => {
+        const code = stripCommentsAndStrings(mutSrc);
+        failedAsExpected = /imageUrl:\s*[^,\n]+\|\|\s*null/.test(code)
+          || /imageUrl = .*\|\|\s*null/.test(code);
+      }
+    );
+    check('RP8 [REVERT-PROOF] restoring imageUrl || null on Shopify-direct fails F13',
       failedAsExpected);
   }
 }

@@ -224,35 +224,45 @@ async function tryCreate({ media, productMatch, sceneImageUrl, yoloProducts, for
   // Re-runs on the same Media land on the same externalId so they
   // refresh fields without creating duplicates. The (brandId,
   // externalId) unique index guarantees one row per natural key.
+  const benefits = require('./productBenefitsService');
+  const prevDoc = await benefits.loadPrevForBenefits(media.brandId, externalId);
+  const { changed: benefitsStale } = benefits.markBenefitsStaleIfTextChanged(
+    prevDoc,
+    { title: productName, description }
+  );
+
   let result;
   try {
+    const upsertUpdate = {
+      $set: {
+        title:        productName,
+        description,
+        category,
+        brand:        brand.name || null,
+        lastSyncedAt: new Date()
+      },
+      $setOnInsert: {
+        advertiserId:        media.advertiserId,
+        brandId:             media.brandId,
+        source:              'detect-identified',
+        externalId,
+        draft:               true,
+        // Detect-identified drafts are by definition single SKUs, not
+        // variant siblings of an item-group. Without this, the schema
+        // default (false) makes them invisible to the catalog list's
+        // primary-variants-only filter — which the detect review page
+        // hits to surface the queue.
+        isPrimaryVariant:    true,
+        detectedFromMediaId: media._id,
+        firstSeenAt:         new Date()
+      }
+    };
+    // null → url heals; a missing detect image must not clobber a good URL.
+    require('./catalogImageUrlGuard').assignImageUrl(upsertUpdate.$set, imageUrl);
+    benefits.applyBenefitsStaleToUpdate(upsertUpdate, benefitsStale);
     result = await CatalogProduct.findOneAndUpdate(
       { brandId: media.brandId, externalId },
-      {
-        $set: {
-          title:        productName,
-          description,
-          category,
-          brand:        brand.name || null,
-          imageUrl,
-          lastSyncedAt: new Date()
-        },
-        $setOnInsert: {
-          advertiserId:        media.advertiserId,
-          brandId:             media.brandId,
-          source:              'detect-identified',
-          externalId,
-          draft:               true,
-          // Detect-identified drafts are by definition single SKUs, not
-          // variant siblings of an item-group. Without this, the schema
-          // default (false) makes them invisible to the catalog list's
-          // primary-variants-only filter — which the detect review page
-          // hits to surface the queue.
-          isPrimaryVariant:    true,
-          detectedFromMediaId: media._id,
-          firstSeenAt:         new Date()
-        }
-      },
+      upsertUpdate,
       { upsert: true, new: true, rawResult: true }
     );
   } catch (err) {
@@ -263,10 +273,13 @@ async function tryCreate({ media, productMatch, sceneImageUrl, yoloProducts, for
   const draftId = result?.value?._id;
   if (isNew) {
     if (result?.value) {
-      require('./productBenefitsService').scheduleForProduct({ product: result.value, brand });
+      benefits.scheduleForProduct({ product: result.value, brand });
     }
     console.log(`📝 draft product auto-created: "${productName}" brand=${brand.name} cred=${draftId}`);
     return { created: true, draftId, productName, externalId };
+  }
+  if (benefitsStale && result?.value) {
+    benefits.scheduleForProduct({ product: benefits.redriveView(result.value), brand });
   }
   return { created: false, reason: 'already exists (refreshed)', draftId, externalId };
 }

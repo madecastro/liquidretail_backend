@@ -245,6 +245,15 @@ async function syncCatalogForCred(cred, run = null) {
       const externalId = String(item.id || '').trim();
       if (!externalId) { errors++; continue; }
 
+      const nextTitle = item.name || '(untitled)';
+      const nextDescription = item.description || null;
+      const benefits = require('./productBenefitsService');
+      const prevDoc = await benefits.loadPrevForBenefits(cred.brandId, externalId);
+      const { changed: benefitsStale } = benefits.markBenefitsStaleIfTextChanged(
+        prevDoc,
+        { title: nextTitle, description: nextDescription }
+      );
+
       const update = {
         advertiserId:    cred.advertiserId,
         brandId:         cred.brandId,
@@ -257,14 +266,13 @@ async function syncCatalogForCred(cred, run = null) {
         // in whitespace or pads with leading zeros).
         gtin:            normalizeGtin(item.gtin),
         mpn:             item.mpn ? String(item.mpn).trim() || null : null,
-        title:           item.name || '(untitled)',
-        description:     item.description || null,
+        title:           nextTitle,
+        description:     nextDescription,
         brand:           item.brand || null,
         category:        item.category || null,
         price:           parsePrice(item.price),
         currency:        parseCurrency(item.price, item.currency),
         availability:    item.availability || null,
-        imageUrl:        item.image_url || null,
         // Meta's additional_image_urls is ALREADY the alt list (hero is
         // image_url), so slice from 0 — not the hero-offset form used on
         // Shopify/JSON-LD combined arrays. Cap = MAX_ADDITIONAL_IMAGES
@@ -276,12 +284,19 @@ async function syncCatalogForCred(cred, run = null) {
         rawData:         item,
         lastSyncedAt:    new Date()
       };
+      // null → url heals; url → null must not clobber. See catalogImageUrlGuard.
+      require('./catalogImageUrlGuard').assignImageUrl(update, item.image_url);
 
       try {
         // Upsert only — no await on classify (image network work).
+        const upsertUpdate = {
+          $set: update,
+          $setOnInsert: { firstSeenAt: new Date() }
+        };
+        benefits.applyBenefitsStaleToUpdate(upsertUpdate, benefitsStale);
         const result = await CatalogProduct.findOneAndUpdate(
           { brandId: cred.brandId, externalId },
-          { $set: update, $setOnInsert: { firstSeenAt: new Date() } },
+          upsertUpdate,
           { upsert: true, new: true, rawResult: true }
         );
         // updatedExisting=false means this was an insert.
@@ -297,7 +312,7 @@ async function syncCatalogForCred(cred, run = null) {
         // Rename is what makes a merchant category rename propagate
         // through re-sync without a separate backfill.
         const row = result.value || result;
-        require('./productBenefitsService').collectIfNew(result, pendingBenefits);
+        benefits.collectAfterCatalogUpsert(result, pendingBenefits, { changed: benefitsStale });
         if (row) {
           try {
             const stamp = await stampFeedTruthCategoryRef({
