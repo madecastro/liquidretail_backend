@@ -75,6 +75,14 @@ const brandSchema = new mongoose.Schema({
   // 'website'     — promoted from a face brandFontIngestService actually
   //                 ingested and mirrored (the strongest signal: we hold the
   //                 file). Set by brandFontPersistenceService.
+  // 'shopify-theme'— promoted from a face shopifyThemeFontService ingested
+  //                 from the brand's Shopify THEME (added 2026-08-31) —
+  //                 also a real mirrored file, just sourced from the
+  //                 storefront's theme CSS/Admin API instead of a marketing
+  //                 homepage. Set by
+  //                 brandFontPersistenceService.applyShopifyFontIngestResult,
+  //                 which deliberately never overrides an existing
+  //                 'website' fontSource — see that function's header.
   // 'meta-ads'    — identified by a vision model in the brand's own Meta ad
   //                 creatives (metaAdsFontService). A NAME, not a file.
   // 'suggested'   — GPT-4.1 derived from brand tone/summary (best-effort)
@@ -85,7 +93,7 @@ const brandSchema = new mongoose.Schema({
   // validation. Mongoose's enum check rejects null even on non-
   // required fields when a default isn't matched, so we explicitly
   // allow it here.
-  fontSource:     { type: String, enum: ['tailwind', 'website', 'meta-ads', 'brandfetch', 'scraped', 'suggested', 'tone-default', 'curated', null], default: null },
+  fontSource:     { type: String, enum: ['tailwind', 'website', 'shopify-theme', 'meta-ads', 'brandfetch', 'scraped', 'suggested', 'tone-default', 'curated', null], default: null },
   tone:           [String],                          // single-word voice descriptors ('rugged','technical','playful')
   hashtags:       [String],                          // commonly used social hashtags WITH the # ('#pelagic','#offshore')
   tags:           [String],                          // lowercase keyword tags WITHOUT the # ('fishing','performance')
@@ -438,7 +446,11 @@ const brandSchema = new mongoose.Schema({
   websiteFontUsage: { type: mongoose.Schema.Types.Mixed, default: null },
   // Successful or attempted automatic website-font scan. A timestamp is
   // recorded even when the site exposes no reusable faces so render-time
-  // resolution does not repeatedly crawl the storefront.
+  // resolution does not repeatedly crawl the storefront. CORRECTED
+  // 2026-08-31: it is NOT recorded on a fetch/parse EXCEPTION (see
+  // brandEnrichmentService.js's website-fonts catch) — this scan is a plain
+  // free HTTP fetch, so a transient 404/DNS blip must stay retryable rather
+  // than permanently disabling the scan for that brand.
   fontIngestedAt: { type: Date, default: null },
   fontIngestError: { type: String, default: null },
 
@@ -453,11 +465,41 @@ const brandSchema = new mongoose.Schema({
   // 'high'-confidence entry may outrank a curated theme, and then only when the
   // name resolves to an actual file; see buildFontLadders.
   metaAdsFontUsage: { type: mongoose.Schema.Types.Mixed, default: null },
-  // Attempted, not necessarily successful — stamped even when no creative was
-  // found, so a coverage backfill does not re-pay the vision call every run.
-  // Mirrors the fontIngestedAt / fontIngestError pair above.
+  // A MONEY-GATED attempt stamp, not a plain "we looked" mark — CORRECTED
+  // 2026-08-31, this comment previously said it was set even when no
+  // creative was found, full stop, which was true and also the bug: it
+  // stamped on a config-absence non-run (no Meta Ads credential connected,
+  // APIFY_ADLIB_ACTOR unset) exactly the same as on a genuine paid miss,
+  // permanently disabling the scan for a brand that had never actually been
+  // looked at. It is set only when a billable call actually ran (a vision
+  // call, or an Apify actor submit) — see
+  // metaAdsFontService.identifyBrandAdFonts's `billableAttempted` and
+  // brandFontPersistenceService.applyMetaFontsResult. All 9 production
+  // brands were found stamped from the config-absence branch on
+  // 2026-08-31; scripts/clearConfigAbsentMetaFontStamps.js is the one-off
+  // remediation for rows stamped before this fix.
   metaFontsIngestedAt: { type: Date, default: null },
   metaFontsIngestError: { type: String, default: null },
+
+  // Successful or attempted automatic SHOPIFY THEME font scan
+  // (services/shopifyThemeFontService.js, added 2026-08-31) — a SIBLING
+  // stamp to fontIngestedAt above, not a reuse of it: this scans the
+  // brand's Shopify storefront theme (with its own myshopify-headless
+  // discovery ladder and an optional Admin-API path), which is a genuinely
+  // different origin/mechanism from the marketing-homepage scan and needs
+  // its own independent retry gate — see
+  // brandFontPersistenceService.applyShopifyFontIngestResult's header for
+  // why conflating the two stamps would be wrong. Faces it finds land in
+  // the SAME Brand.customFonts / websiteFontUsage fields as the website
+  // scan (tagged `source:'shopify-theme'` per-entry for audit), so
+  // fontResolverService needs no changes.
+  // Like fontIngestedAt, this is FREE (plain HTTP, or an Admin API call
+  // billed to the merchant's own Shopify plan, never to us) — a fetch/parse
+  // failure must stay retryable, so this is NEVER stamped on failure (see
+  // brandEnrichmentService.js's shopify-theme-fonts tier: only the success
+  // branch calls applyShopifyFontIngestResult).
+  shopifyFontsIngestedAt: { type: Date, default: null },
+  shopifyFontsIngestError: { type: String, default: null },
 
   // Derived voice — structured profile extracted by
   // brandVoiceDerivationService from the brand's existing Meta/Google

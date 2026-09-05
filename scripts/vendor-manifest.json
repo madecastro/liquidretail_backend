@@ -2,7 +2,7 @@
   "version": 2,
   "backendRef": "origin/main",
   "backendHead": "10ab21ab310080a2b3002e7b72fce3e6bede53f1",
-  "generatedAt": "2026-09-05T03:02:53.640Z",
+  "generatedAt": "2026-09-05T03:08:43.502Z",
   "files": {
     "models/Ad.js": {
       "backendHash": "812961d1ad30f5f87891dcace58fbe44ce5e07a5789f34b927fe8208dc2db966",
@@ -71,12 +71,9 @@
     },
     "models/Brand.js": {
       "backendHash": "867bc01e144a7d8d77ee6bc822abf61e5b7a9ebb46ebda913162fc4de7683104",
-      "adgenHash": "307f9c5c76993e45fb7a2c5b0c183f4a80e7ca6ec03aeac51478c6917b36ade4",
+      "adgenHash": "867bc01e144a7d8d77ee6bc822abf61e5b7a9ebb46ebda913162fc4de7683104",
       "backendSha": "c30302df9f838e9770a80297a23ac67f47b0f9db",
-      "status": "unported",
-      "reason": "Backend origin/main c30302df (#363, Shopify theme font ingest) and 078dc078 (#362, Meta-ads font scan retry-safety fix) both touch models/Brand.js and are unreflected in adgen's src/models/Brand.js: adgen's fontSource enum (line 88) lacks the 'shopify-theme' value backend added (line 96), adgen has neither shopifyFontsIngestedAt nor shopifyFontsIngestError (backend lines 501-502) backing backend's new services/shopifyThemeFontService.js (adgen has no such service), and adgen's metaFontsIngestedAt/metaFontsIngestError comment (lines 456-460) still documents the pre-#362 stamp-on-any-attempt behavior that permanently disabled retry for brands never actually billable-scanned (backend needed clearConfigAbsentMetaFontStamps.js to remediate rows stamped under that bug). Real risk on the shared Mongo collection: adgen's stricter enum would throw full-document validation on any adgen .save() of a Brand doc backend has set fontSource:'shopify-theme' on (same class of issue this file already documents for apifyDemo.method's null-enum case).",
-      "portTo": "adgen",
-      "owedSince": "2026-09-05T00:19:13.868Z"
+      "status": "synced"
     },
     "models/Campaign.js": {
       "backendHash": "079065a6d9dff95e04f8136469d847cb6f3703452e6553492ea35e26291df6ae",
@@ -853,49 +850,6 @@
       "portTo": null,
       "owedSince": null
     },
-    "services/brandCatalogService.js": {
-      "backendHash": "d7b9a4558ffaeffe30d0f4708ffb0800896465e12b5ce881e2278a681a837616",
-      "adgenHash": "d7b9a4558ffaeffe30d0f4708ffb0800896465e12b5ce881e2278a681a837616",
-      "backendSha": "4a08a2907d7e220fbd105e72aa2af17612c015bd",
-      "status": "synced",
-      "portTo": null,
-      "owedSince": null
-    },
-    "services/brandEnrichmentService.js": {
-      "backendHash": "ccb4074ae927bf433186b929638ead6792b592146ec14cc1483fef2da5d707a1",
-      "adgenHash": "d87ae2c5e4dfef9c772c305d050b7a364baf320c3168c70cfeca829ee7260e5a",
-      "backendSha": "c30302df9f838e9770a80297a23ac67f47b0f9db",
-      "status": "unported",
-      "reason": "Backend c30302df (2026-08-31) added Shopify theme font tier (shopifyThemeFontService.js + applyShopifyFontIngestResult, gated on apifyDemo.shopifyUrl && !shopifyFontsIngestedAt) plus two retry-stamp bugfixes adgen lacks: website-font catch no longer stamps fontIngestedAt on transient errors (was permanently disabling free retry -- measured: Reach Social 404 stuck forever); meta-ads-font catch only stamps metaFontsIngestedAt when metaResult.billableAttempted===true (was permanently disabling retry on non-billable failures). adgen unchanged since last sync (adgenHash matches recorded); real gap, not a fork.",
-      "portTo": "adgen",
-      "owedSince": "2026-09-05T00:19:27.906Z"
-    },
-    "services/brandFontIngestService.js": {
-      "backendHash": "0681d098edeaba947f1ae1b8912bcc6413ab27cb49995cbc1b3e75ef1a8b0386",
-      "adgenHash": "cb2824e212503cf998463f1b715accd55af880bd31de6d567348a5092ec77dba",
-      "backendSha": "c30302df9f838e9770a80297a23ac67f47b0f9db",
-      "status": "fork",
-      "reason": "RE-ATTESTED 2026-09-04 (backend HEAD c30302df, was 9dd98b85): reviewed 078dc078 (#362) and c30302df (#363) in range, neither changes the substance of the prior 2026-08-24 PORTED verdict for backend #323. 078dc078 adds one cosmetic console.warn for an already-captured non-commercial mirror-failure case (no behavior/data change). c30302df is a pure extraction of the existing per-face mirror logic into an exported mirrorDiscoveredFace helper so the brand-new services/shopifyThemeFontService.js can reuse it -- website-ingest behavior is explicitly unchanged. Deliberate, still-out-of-scope fork remains: adgen lacks (a) probeVariableWeightAxis/variable-weight-axis support and (b) the new Shopify-theme-file font source entirely, both separate unported features out of scope for #323.",
-      "portTo": null,
-      "owedSince": null
-    },
-    "services/brandFontPersistenceService.js": {
-      "backendHash": "f1507c1ce6e9b6d9205b0c5b7e1a0beb79892fda54b15c73066642e7468cd913",
-      "adgenHash": "fe345657337521a31c052dfb9c871825d0846210424777de35118b0646bd65fb",
-      "backendSha": "c30302df9f838e9770a80297a23ac67f47b0f9db",
-      "status": "unported",
-      "reason": "Backend's applyMetaFontsResult (services/brandFontPersistenceService.js) now gates metaFontsIngestedAt on result.billableAttempted (fixes 2026-08-31 incident: all 9 brands permanently stamped done despite zero vision calls, blocking re-scan after Meta Ads/Apify config) -- adgen still stamps unconditionally AND adgen's metaAdsFontService.js has zero billableAttempted occurrences, so this is a two-file port. Confirmed live: adgen brandEnrichmentService.js:733 calls applyMetaFontsResult via brandCatalogService.js, not dead code. Backend also added a whole new capability, applyShopifyFontIngestResult + services/shopifyThemeFontService.js (wired via brandEnrichmentService.js shopify-theme-fonts tier, verifyShopifyThemeFontIngest.js), entirely absent from adgen.",
-      "portTo": "adgen",
-      "owedSince": "2026-09-05T00:19:34.953Z"
-    },
-    "services/brandLogoIngestService.js": {
-      "backendHash": "d24c07f2be54d99a3c852c915758a7b5ddfb9dd688e4665000cc75efdd67af2e",
-      "adgenHash": "d24c07f2be54d99a3c852c915758a7b5ddfb9dd688e4665000cc75efdd67af2e",
-      "backendSha": "4a08a2907d7e220fbd105e72aa2af17612c015bd",
-      "status": "synced",
-      "portTo": null,
-      "owedSince": null
-    },
     "services/brandScriptExecutor.js": {
       "backendHash": "4ca8f1429054d0783488a89f44ef2dcad0f9b7f2a7f85087836133d7c8ab691c",
       "adgenHash": "edca114b5f40100d223de7f81e8f6a0f608e86f0ed2b35a3217f870d397e7522",
@@ -986,14 +940,6 @@
       "backendSha": "629fae867955690b1c2925ece0d004e702be5a30",
       "status": "unused",
       "reason": "backend brand-style module; adgen does not load the registry",
-      "portTo": null,
-      "owedSince": null
-    },
-    "services/brandfetchService.js": {
-      "backendHash": "c0bc62b0d11413dd7d9947acaf3359a3f8bfb5e4bb08f5d021dec4aa38665479",
-      "adgenHash": "c0bc62b0d11413dd7d9947acaf3359a3f8bfb5e4bb08f5d021dec4aa38665479",
-      "backendSha": "42d129517f73939f2905e67a98d45df2b089a065",
-      "status": "synced",
       "portTo": null,
       "owedSince": null
     },
@@ -1290,12 +1236,10 @@
     },
     "services/layoutInputService.js": {
       "backendHash": "fdaebc5c5f917353b6dd8f78aa6d3d3c4bf67f29bbc025648dc41797b785dc28",
-      "adgenHash": "7fce0d0c19792d823fc1ec2e5142ad8c265cc4be1741e16f539d43dc95c1b5b3",
+      "adgenHash": "b72f89371b19e3fdecec8abd3d361a97fee421947d39e425e4f0e264fb521091",
       "backendSha": "47be257c468e85c3f1d1c562abd087ea8625e98c",
       "status": "fork",
-      "reason": "Backend #383 LAYOUT_DERIVATION_MODEL split is now ported (GEMINI_MODEL reads process.env.LAYOUT_DERIVATION_MODEL || 'gemini-2.5-pro'; geminiSearchProvider.js keeps GEMINI_SEARCH_MODEL || 'gemini-2.5-flash'). Remaining divergence is adgen-owned: startStageTimer/layoutInputMs wrapping runDerivation, plus four-field brandId/productId/adId/campaignRunId as top-level buildLayoutInput args (adgen #43) equivalent to backend's options.* fields -- re-attested.",
-      "portTo": null,
-      "owedSince": null
+      "reason": "adgen-owned divergence: findBrandByName inlined (Brand.normalizeBrandName + findOne) so adgen no longer requires brandCatalogService — that module fire-and-forgets brand enrichment (backend-owned ingest) and its require edge was the only thing keeping the dead ingest cluster in adgen's graph. Backend keeps the catalog-service require. LAYOUT_DERIVATION_MODEL split already ported (#122). Also adgen-only: startStageTimer/layoutInputMs wrapping runDerivation; four-field brandId/productId/adId/campaignRunId top-level args (adgen #43) equivalent to backend's options.*. Nothing owed either way."
     },
     "services/llmError.js": {
       "backendHash": "589fd87ece50784d1620ac2db054d92911c880d21d2a34be4db3f4df8aaf7f8f",
@@ -1322,22 +1266,12 @@
       "portTo": null,
       "owedSince": null
     },
-    "services/metaAdsFontService.js": {
-      "backendHash": "50c50a309982bce8f2beb796e5f1010646f1931566906a684286aede99ecf7ab",
-      "adgenHash": "3c8376a0b76d0d7a6bc14e4ae98255fd22cf8bba9d60a6e60de2954685fa8012",
-      "backendSha": "078dc0785499dbcdeb17c0568859bd24773dbd30",
-      "status": "unported",
-      "reason": "2026-08-31 backend PR #362 (078dc0785499dbcdeb17c0568859bd24773dbd30): identifyBrandAdFonts gained a typed billableAttempted field (true iff the vision call ran or an Apify run was submitted, regardless of outcome) so applyMetaFontsResult stops stamping Brand.metaFontsIngestedAt unconditionally -- fixes a measured prod bug where all 9 brands were permanently stuck un-retryable. Same commit added the owner-directed connected-account rule: gatherFromConnected reports state.credentialed via a mutated-in-place out-param, and identifyBrandAdFonts now skips the billable Apify Ad Library scrape whenever a Meta Ads credential resolved for that brand, even with zero tier-2 images (reading their own creatives free over Graph API is authoritative; paying Apify for the same brand is waste). gatherFromAdLibrary's return changed from a bare array to {images, billed}. adgen's copy is still byte-identical to backendSha 218c8beb (2026-08-11) and has none of this. Covered by backend scripts/verifyMetaAdsFonts.js 49/49, revert-proven. Companion services/brandFontPersistenceService.js shares this exact gap in adgen (unconditional stamp) -- needs its own reconcile, out of scope here.",
-      "portTo": "adgen",
-      "owedSince": "2026-09-05T00:20:20.290Z"
-    },
     "services/metaAdsPushService.js": {
       "backendHash": "95f5c3486f73d01b233162d3a62900a59c8cee5d49aecf7c96332fca1beee81f",
       "adgenHash": "95f5c3486f73d01b233162d3a62900a59c8cee5d49aecf7c96332fca1beee81f",
       "backendSha": "9d6322978bc28b080da3db6aaf510d113b0ea216",
-      "status": "synced",
-      "portTo": null,
-      "owedSince": null
+      "status": "unused",
+      "reason": "Meta ads PUSH (backend-owned publish path); only adgen requirer was the deleted metaAdsFontService. Kept on disk like pushToShopify.js; not on any live role path."
     },
     "services/metaApiVersion.js": {
       "backendHash": "92c4f74b95184b3c1d089c32e9194ebf738ae7ac598fd7491fb781f336745562",
@@ -1447,15 +1381,6 @@
       "reason": "Backend added ingestStatusFeed Slack wiring (not applicable to adgen, no ingest kinds run here) AND a stage-transition reset + stages[] history fix (closeOpenStagePush) that IS a live gap: adgen's vendored adRegenerateService.js (kind:'ad-regenerate', started via regenerateConsumer.js from renderer.js:2716) calls progressRun.stage() 3x per run ('generating video'->'compositing'->'generating image', lines 1586/1716/2246) and currently carries stale itemsDone/itemsTotal/note across those transitions -- the exact bug backend's reset fixes. Port only the stage-reset/stages[]-history mechanism (+ matching stages field on models/OperationRun.js), not the ingestStatusFeedService integration.",
       "portTo": "adgen",
       "owedSince": "2026-09-05T00:20:34.638Z"
-    },
-    "services/providers/geminiSearchProvider.js": {
-      "backendHash": "d8ca3f192657d412af0d6c2d28a17c0bd56c6237106e03754212e2f0c5f565ec",
-      "adgenHash": "f32d8c0d68f0463651d0f94bb331693912adad5997e870a5127b59385a4801bb",
-      "backendSha": "55c17096f3668779cb11fccacb812f02305cc269",
-      "status": "fork",
-      "reason": "Re-attested at backend 55c17096: sole commit in range is the SCOPE -- BRAND, NOT PRODUCT prompt paragraph already recorded as ported same-day (2026-08-31); verified byte-identical to adgen's current copy. Fork remains limited to pre-existing match() brandId cost-ledger threading (PR #331); adgen's copy is unwired/not live-firing.",
-      "portTo": null,
-      "owedSince": null
     },
     "services/pushToShopify.js": {
       "backendHash": "96cbcabfb6b4172eab832b7d94d6154e38160a567537f67bb3c9f3af6f59b151",
@@ -1802,14 +1727,6 @@
       "backendSha": "aff3488d494ee7484d27971920a2b96e438e60fd",
       "status": "fork",
       "reason": "adgen QC resolvers still fall through to env; backend does not",
-      "portTo": null,
-      "owedSince": null
-    },
-    "services/tailwindTokenExtractor.js": {
-      "backendHash": "b82e5e5ee6b147e9b98340d108513270fc645d291824bd388cd4dfd4e09e8d22",
-      "adgenHash": "b82e5e5ee6b147e9b98340d108513270fc645d291824bd388cd4dfd4e09e8d22",
-      "backendSha": "4eddd59c3066e0525c3bf29a4bb78d108f430c53",
-      "status": "synced",
       "portTo": null,
       "owedSince": null
     },

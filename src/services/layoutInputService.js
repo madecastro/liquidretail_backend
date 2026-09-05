@@ -59,13 +59,16 @@ const ProductMatchArtifact   = require('../models/ProductMatchArtifact');
 const OverlayZoneArtifact    = require('../models/OverlayZoneArtifact');
 const LayoutInputArtifact    = require('../models/LayoutInputArtifact');
 const CatalogProduct         = require('../models/CatalogProduct');
-// Brand is resolved by NAME first (findBrandByName); this is for the brandId
-// FK fallback in loadContext, which rescues brands whose scraped name carries
-// a tagline and therefore never matches nameNormalized.
+// Brand is resolved by NAME first (normalizeBrandName + findOne); this is
+// for the brandId FK fallback in loadContext, which rescues brands whose
+// scraped name carries a tagline and therefore never matches nameNormalized.
+// Name lookup lives here — do not require brandCatalogService for it. That
+// module also fire-and-forgets brand enrichment (catalog/brand ingest,
+// backend-owned) and a require edge would keep the ingest cluster in
+// adgen's live vendor-drift graph.
 const Brand                  = require('../models/Brand');
 const Category               = require('../models/Category');
 const Comment                = require('../models/Comment');
-const { findBrandByName }    = require('./brandCatalogService');
 const { placeOverlays }      = require('./overlayPlacementService');
 const registry               = require('./templateRegistry');
 const { hydrateMatch }       = require('./productMatchHydration');
@@ -513,6 +516,15 @@ function stubDerivationFromCtx(ctx) {
 // ──────────────────────────────────────────────────────────────
 //  Context loader
 // ──────────────────────────────────────────────────────────────
+// Read-only name lookup. Same query brandCatalogService.findBrandByName
+// ran; inlined so this file does not require the ingest module.
+function findBrandByName(name) {
+  if (!name) return null;
+  const normalized = Brand.normalizeBrandName(name);
+  if (!normalized) return null;
+  return Brand.findOne({ nameNormalized: normalized });
+}
+
 async function loadContext(mediaId, options = {}) {
   const media = await Media.findById(mediaId).lean();
   if (!media) return null;
