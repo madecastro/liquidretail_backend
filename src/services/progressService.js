@@ -88,9 +88,37 @@ function makeHandle(doc) {
   let cancelCached = !!doc.cancelRequested;
   let cancelCheckedAt = 0;
   let lastStage = null;
+  // Start of whatever stage is currently "open" — the implicit pre-first-
+  // stage period counts too, so a run whose very first .stage() call closes
+  // immediately still gets a real durationMs instead of 0.
+  let currentStageStartedAt = openedAt;
   let itemsDone = doc.itemsDone || 0;
   let itemsTotal = doc.itemsTotal != null ? doc.itemsTotal : null;
+  let lastNote = doc.note || null;
   let warned = false;
+
+  // Close whatever stage is currently open (if any) into a {name, startedAt,
+  // endedAt, durationMs, itemsDone, itemsTotal, note} record for OperationRun
+  // .stages[]. Returns null when no stage was ever opened (kinds that only
+  // use tick()/label, never .stage() — unaffected by this addition). Called
+  // from BOTH a normal stage() transition and every terminal write, so the
+  // very last stage a run was in always gets its own timed, counted entry
+  // instead of being left open forever.
+  function closeOpenStagePush() {
+    if (lastStage == null) return null;
+    const now = Date.now();
+    const push = {
+      name: lastStage,
+      startedAt: new Date(currentStageStartedAt),
+      endedAt: new Date(now),
+      durationMs: now - currentStageStartedAt,
+      itemsDone,
+      itemsTotal,
+      note: lastNote
+    };
+    lastStage = null; // closed — guards against a double-push if called twice
+    return push;
+  }
 
   function warnOnce(err, where) {
     if (warned) return;
@@ -110,11 +138,14 @@ function makeHandle(doc) {
     if (writeTimer.unref) writeTimer.unref();
   }
 
-  async function flush(extra = {}, { force = false } = {}) {
+  async function flush(extra = {}, { force = false, push = null } = {}) {
     if (closed && !force) return;
 
     if (!force && Date.now() - lastWriteAt < THROTTLE_MS) {
       pending = Object.assign(pending || {}, extra);
+      // `push` is only ever passed alongside force:true call sites (a stage
+      // transition or a terminal write), so there is no batched-push case to
+      // handle here — nothing is lost by not merging it into `pending`.
       scheduleFlush();
       return;
     }
@@ -131,10 +162,31 @@ function makeHandle(doc) {
     payload.updatedAt = ts;
     payload.heartbeatAt = ts;
 
+    const update = { $set: payload };
+    if (push) update.$push = { stages: push };
+
     try {
-      await OperationRun.updateOne({ _id: id }, { $set: payload });
+      await OperationRun.updateOne({ _id: id }, update);
     } catch (err) {
       warnOnce(err, 'flush');
+      // A $push + $set combined in one updateOne is one atomic write — if
+      // it throws (a bad value, a transient Mongo error), the WHOLE write
+      // is lost, not just the stage-history push. That is fine for a
+      // regular tick()/note() flush (no push involved, unchanged from
+      // before this feature). But `push` only ever accompanies a stage
+      // transition or a TERMINAL write (succeed/fail/markCancelled/cancel)
+      // — losing one of those is worse than losing a stages[] entry: the
+      // reaper would otherwise fail the run later with a generic "process
+      // restarted" instead of its real status/error. Retry once WITHOUT
+      // the push so the terminal status still lands even if the stage
+      // history entry does not.
+      if (push) {
+        try {
+          await OperationRun.updateOne({ _id: id }, { $set: payload });
+        } catch (err2) {
+          warnOnce(err2, 'flush (retry without push)');
+        }
+      }
     }
   }
 
@@ -167,9 +219,47 @@ function makeHandle(doc) {
     stage(name) {
       if (closed) return handle;
       const firstOfStage = lastStage !== name;
+      // Close the PREVIOUS stage (if this is a real transition, not a
+      // repeat of the same name) before opening the new one, so its own
+      // elapsed time + final counts land in stages[] rather than being
+      // silently overwritten by the next stage's progress.
+      const push = firstOfStage ? closeOpenStagePush() : null;
+      const resetUpdate = {};
+      if (firstOfStage) {
+        currentStageStartedAt = Date.now();
+        // Some real call chains open a stage that is itself immediately
+        // superseded by a NESTED call's own .stage() (e.g. apifyIngestService
+        // .syncBrandApify's 'shopify catalog' dispatch stage, closed almost
+        // instantly by shopifyPublicIngestService.syncBrandShopifyDirect's
+        // first 'resolving catalog access' stage on the SAME handle) —
+        // without progress of its own in between, that dispatch-only stage
+        // would otherwise inherit whatever note/counts the PREVIOUS,
+        // unrelated stage last left behind (e.g. an Instagram tally showing
+        // up against a "shopify catalog" entry, or a first empty credential
+        // in postSyncService.js inheriting a prior credential's count).
+        // Reset ALL THREE here — note AND the counts — so a stage that
+        // never calls tick()/note() of its own closes (and, until its own
+        // first tick(), currently DISPLAYS) as empty rather than stale and
+        // misattributed. Included in the SAME $set as `stage` below, not
+        // just the in-memory closure, so a live "current stage" reader
+        // never shows carried-over numbers either, not only the closed
+        // stages[] history. adgen's live hit of this bug is
+        // adRegenerateService.js calling .stage() three times per run
+        // ('generating video' → 'compositing' → 'generating image') and
+        // carrying stale itemsDone/itemsTotal/note across those transitions.
+        lastNote = null;
+        itemsDone = 0;
+        itemsTotal = null;
+        resetUpdate.note = null;
+        resetUpdate.itemsDone = 0;
+        resetUpdate.itemsTotal = null;
+        // pct is meaningless without itemsTotal — same convention tick()
+        // already uses (only sets pct when itemsTotal is a positive number).
+        resetUpdate.pct = null;
+      }
       lastStage = name;
       // First call of each stage always flushes; later updates throttle.
-      flush({ stage: name }, { force: firstOfStage }).catch(() => {});
+      flush({ stage: name, ...resetUpdate }, { force: firstOfStage, push }).catch(() => {});
       return handle;
     },
 
@@ -177,6 +267,7 @@ function makeHandle(doc) {
       if (closed) return handle;
       itemsDone = done;
       if (total != null) itemsTotal = total;
+      if (note != null) lastNote = note;
       const update = { itemsDone: done };
       if (total != null) update.itemsTotal = total;
       if (note != null) update.note = note;
@@ -189,6 +280,7 @@ function makeHandle(doc) {
 
     note(text) {
       if (closed) return handle;
+      lastNote = text;
       flush({ note: text }).catch(() => {});
       return handle;
     },
@@ -202,6 +294,7 @@ function makeHandle(doc) {
     // Terminal — always flush immediately; never reject to the caller.
     succeed(summary) {
       closeTimers();
+      const push = closeOpenStagePush();
       const update = { status: 'succeeded', endedAt: new Date() };
       if (itemsTotal != null) {
         update.itemsDone = itemsTotal;
@@ -211,7 +304,7 @@ function makeHandle(doc) {
         if (typeof summary === 'string') update.note = summary;
         else if (typeof summary === 'object') update.meta = summary;
       }
-      return flush(update, { force: true }).catch(() => {});
+      return flush(update, { force: true, push }).catch(() => {});
     },
 
     // Optional second `meta` arg mirrors succeed(summary): object →
@@ -220,10 +313,11 @@ function makeHandle(doc) {
     // per-source diagnostics (the case operators most need them).
     fail(err, meta) {
       closeTimers();
+      const push = closeOpenStagePush();
       const message = err && err.message ? err.message : String(err || 'failed');
       const update = { status: 'failed', endedAt: new Date(), error: message, note: message };
       if (meta != null && typeof meta === 'object') update.meta = meta;
-      return flush(update, { force: true }).catch(() => {});
+      return flush(update, { force: true, push }).catch(() => {});
     },
 
     // Refresh cancelRequested from Mongo at most 1/s (cached in between).
@@ -244,9 +338,10 @@ function makeHandle(doc) {
 
       if (cancelCached) {
         closeTimers();
+        const push = closeOpenStagePush();
         await flush(
           { status: 'cancelled', endedAt: new Date(), note: 'Cancelled — partial results kept' },
-          { force: true }
+          { force: true, push }
         );
         throw new CancelledError();
       }
@@ -262,9 +357,10 @@ function makeHandle(doc) {
     // break-style abort flow (e.g. apify demo sync's legacy /abort flag).
     markCancelled(note) {
       closeTimers();
+      const push = closeOpenStagePush();
       return flush(
         { status: 'cancelled', endedAt: new Date(), note: note || 'Cancelled — partial results kept' },
-        { force: true }
+        { force: true, push }
       ).catch(() => {});
     }
   };

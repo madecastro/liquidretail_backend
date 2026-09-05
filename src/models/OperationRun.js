@@ -44,6 +44,29 @@ const operationRunSchema = new mongoose.Schema({
   stage: { type: String, default: null },
   note:  { type: String, default: null },
 
+  // Closed-stage history. progressService.stage() pushes one entry here
+  // the moment it transitions AWAY from a named stage (and the terminal
+  // succeed()/fail()/markCancelled() close whatever stage was still open),
+  // capturing that stage's own elapsed time + its last itemsDone/itemsTotal/
+  // note — the values `stage`/`note`/`itemsDone`/`itemsTotal` above are about
+  // to be overwritten by the next stage's own progress. Additive: nothing
+  // else reads or requires this array, so it is safe to add without a
+  // migration. slackFeed (backend ingest Slack projector) is intentionally
+  // omitted — adgen never creates ingest-kind OperationRuns.
+  stages: {
+    type: [{
+      name:        { type: String },
+      startedAt:   { type: Date },
+      endedAt:     { type: Date },
+      durationMs:  { type: Number },
+      itemsDone:   { type: Number },
+      itemsTotal:  { type: Number },
+      note:        { type: String },
+      _id: false
+    }],
+    default: []
+  },
+
   // 0..1 when known; null when indeterminate (no total yet).
   pct:        { type: Number, default: null },
   itemsDone:  { type: Number, default: 0 },

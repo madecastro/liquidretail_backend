@@ -315,7 +315,32 @@ function buildParentText(state, live) {
   const parts = [];
   for (const k of ['draft', 'rendering', 'queued', 'failed', 'live', 'archived', 'succeeded', 'skipped']) {
     const n = Number(counts[k]) || 0;
-    if (n > 0) parts.push(`${n} ${k}`);
+    if (n <= 0) continue;
+    // RETROFITTED 2026-08-31 (services/adPhase.js parity pass — that file's
+    // own header names this "N draft" line as one of three independent
+    // "what state is this ad in" derivations: a video ad sits raw
+    // status:'draft' from the instant its paid master lands through the
+    // ENTIRE titling pass (services/adTitlingTruth.js), so this count used
+    // to read as "N delivered" even when some of those N were still
+    // mid-flight — the exact 29/39-vs-16/39 undercount that motivated
+    // adTitlingTruth.js in the first place, just re-surfacing here in
+    // Slack's own count line instead of the run-finalization path.
+    // `live.titlingIncomplete` is produced by THE canonical
+    // services/campaignRunGuards.js classifyRunAdOutcome over this same ad
+    // set (itself now retrofitted onto deriveAdPhase), so this reuses one
+    // shared answer rather than a second re-derivation.
+    // Only the 'draft' bucket is annotated: a titling-incomplete ad's raw
+    // status is draft/live/archived in principle, but in production a video
+    // ad is never pushed 'live' or 'archived' before its titling settles
+    // (see adTitlingTruth.js's own header on when renderUrl===veoVideoUrl
+    // persists), so attributing the whole count to 'draft' matches every
+    // real case without needing to split live.titlingIncomplete across
+    // buckets it cannot itself name.
+    if (k === 'draft' && live?.titlingIncomplete > 0) {
+      parts.push(`${n} draft (${live.titlingIncomplete} still titling)`);
+    } else {
+      parts.push(`${n} ${k}`);
+    }
   }
   // Prefer CampaignRun counters when Ad aggregation is empty (early run).
   if (!parts.length && live?.runCounters) {
@@ -801,11 +826,33 @@ function finishRun(opts = {}) {
  * Deliberately truncates at the first ` (`, ` [` or `:` AFTER the label: the tail
  * is prediction ids and provider JSON, which is what the Render Activity board is
  * for. Slack gets the headline.
+ *
+ * RETROFITTED 2026-08-31 (services/adPhase.js parity pass — that file's own
+ * header names this function as one of three independent "what state is
+ * this ad in" derivations it exists to unify). The detailed reason text
+ * above is UNCHANGED (owner requirement 2026-08-05: "10✓ / 2✗" alone was not
+ * actionable, the specific cause is what matters) — this only adds the SAME
+ * canonical `describeAdFailure` label routes/ads.js's per-ad `failure.isQc`
+ * badge uses (owner requirement 2026-08-26: "for QC failures it should
+ * specifically be noted as a QC Fail, not just Failed"). Only QC failures
+ * get the prefix: every other stage's message already names itself (e.g.
+ * "Model Moderation Error…") and prefixing a generic "Render Failed" on top
+ * would just be noise on every non-QC line. QC is the one category whose
+ * raw message text happens to say "vision QC" today at both call sites
+ * (services/brandScriptExecutor.js, services/adVisionQcService.js) but
+ * nothing enforces that staying true for a future one — describeAdFailure
+ * is the structural signal, not a substring match on prose.
  */
 async function summariseFailures(runId) {
-  const Ad = require('../models/Ad');
+  // AdModel() (not a direct require('../models/Ad')) — the same injectable
+  // seam loadLiveSnapshot already uses, so an offline harness can drive this
+  // with _setDeps({ Ad: fakeAd }) instead of monkeypatching module
+  // resolution. Behaviourally identical in production (AdModel() falls
+  // through to the same require when _Ad is unset).
+  const Ad = AdModel();
+  const { deriveAdPhase, describeAdFailure } = require('./adPhase');
   const rows = await Ad.find({ campaignRunIds: runId, status: 'failed' })
-    .select('renderError.message renderError.chargeState')
+    .select('renderError.message renderError.chargeState renderError.stage renderUrl visionQc')
     .limit(50)
     .lean();
   const counts = new Map();
@@ -815,8 +862,18 @@ async function summariseFailures(runId) {
       .replace(/^master rendered;\s*/i, '');
     // Keep the label plus its immediate cause, drop ids/JSON/policy prose.
     const m = raw.match(/^([^([]{0,80}?)(?:\s*[([]|$)/);
-    let reason = (m ? m[1] : raw).trim();
-    if (reason.length > 90) reason = `${reason.slice(0, 87)}…`;
+    let detail = (m ? m[1] : raw).trim();
+    if (detail.length > 90) detail = `${detail.slice(0, 87)}…`;
+    // Fields selected above are exactly what deriveAdPhase/describeAdFailure
+    // need for a status:'failed' ad (see adPhase.js's own doc comment) — the
+    // phase is always 'failed-terminal' or 'qc-failed-kept' here since the
+    // query itself filters on status:'failed'.
+    const ad = { status: 'failed', renderUrl: r.renderUrl, visionQc: r.visionQc, renderError: r.renderError };
+    const phase = deriveAdPhase(ad);
+    const failure = describeAdFailure(ad, phase);
+    const reason = (failure && failure.isQc && !/qc/i.test(detail))
+      ? `QC Fail — ${detail}`
+      : detail;
     counts.set(reason, (counts.get(reason) || 0) + 1);
   }
   return [...counts.entries()]
@@ -1119,20 +1176,35 @@ async function loadLiveSnapshot(st) {
     total: st.total,
     counts: {},
     stages: new Map(),
-    runCounters: null
+    runCounters: null,
+    // Video ads sitting on a delivered-LOOKING raw status (draft/live/
+    // archived) whose titling has not genuinely settled — see the parity
+    // note on the count-line loop in buildParentText for why this exists.
+    // Populated from the SAME classifyRunAdOutcome the run-finalization
+    // path uses (services/campaignRunGuards.js), never re-derived here.
+    titlingIncomplete: 0
   };
   try {
     const Ad = AdModel();
     const CampaignRun = CampaignRunModel();
     const rid = st.runId;
+    // Lazy require (matches this file's existing lazy-model convention) —
+    // avoids a hard dependency at module-load time on campaignRunGuards.js.
+    // eslint-disable-next-line global-require
+    const { classifyRunAdOutcome } = require('./campaignRunGuards');
 
-    const [agg, rendering, runDoc] = await Promise.all([
-      Ad.aggregate([
-        { $match: { campaignRunIds: rid } },
-        { $group: { _id: '$status', n: { $sum: 1 } } }
-      ]).catch(() => []),
-      Ad.find({ campaignRunIds: rid, status: 'rendering' })
-        .select('renderStage')
+    // RETROFITTED 2026-08-31 (services/adPhase.js parity pass — that
+    // file's own header names this aggregate as one of three independent
+    // "what state is this ad in" derivations it exists to unify). This used
+    // to be a `$group by $status` aggregate PLUS a separate `status:
+    // 'rendering'` find for stage breadcrumbs — two round trips computing
+    // two views of the same run. One `.find()` over the whole run, with the
+    // fields classifyRunAdOutcome needs, now serves the raw per-status
+    // tally, the rendering-stage map, AND the titling-debt count in a
+    // single query.
+    const [adRows, runDoc] = await Promise.all([
+      Ad.find({ campaignRunIds: rid })
+        .select('status kind renderUrl veoVideoUrl titlingResumeState renderStage')
         .lean()
         .catch(() => []),
       CampaignRun.findOne({ runId: rid })
@@ -1141,12 +1213,12 @@ async function loadLiveSnapshot(st) {
         .catch(() => null)
     ]);
 
-    for (const row of agg || []) {
-      if (row && row._id) out.counts[String(row._id)] = Number(row.n) || 0;
+    for (const a of adRows || []) {
+      if (!a) continue;
+      if (a.status) out.counts[String(a.status)] = (out.counts[String(a.status)] || 0) + 1;
+      if (a.status === 'rendering' && a.renderStage) out.stages.set(String(a._id), String(a.renderStage));
     }
-    for (const a of rendering || []) {
-      if (a && a.renderStage) out.stages.set(String(a._id), String(a.renderStage));
-    }
+    out.titlingIncomplete = classifyRunAdOutcome(adRows || []).titlingIncomplete;
     // Fall back to local lastStageByAd for ads this instance knows about
     // that may not have flushed renderStage yet.
     for (const [adId, stage] of st.lastStageByAd) {

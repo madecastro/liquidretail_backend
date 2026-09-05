@@ -57,12 +57,20 @@ const {
   REAP_STALE_MIN_DEFAULT,
   PREPARE_STALE_MIN_DEFAULT
 } = require('./staleness');
-// The one place that knows whether a video Ad's titling actually settled —
-// see its header. classifyRunAdOutcome below used to count `draft` as
-// unconditionally "succeeded", which is the same renderUrl-means-delivered
-// heuristic that stranded 13 untitled masters as "delivered" on 2026-08-20;
-// this is the run-rollup half of that fix.
-const { isVideoTitlingSettled } = require('./adTitlingTruth');
+// THE canonical "where is this ad right now" derivation — services/adPhase.js.
+// classifyRunAdOutcome below used to count `draft` as unconditionally
+// "succeeded" (the renderUrl-means-delivered heuristic that stranded 13
+// untitled masters as "delivered" on 2026-08-20; the fix landed here first,
+// direct on isVideoTitlingSettled/adTitlingTruth.js), then independently
+// bucketed `failed` from a bare `status === 'failed'` with no notion of a
+// QC-failed-but-kept-asset ad. adPhase.js is the file that now owns BOTH of
+// those distinctions in one place — see its header for the three-way drift
+// (this function, the Product Ads tile, Slack's run feed) that motivated
+// it — so classifyRunAdOutcome is retrofitted below to read deriveAdPhase()'s
+// answer instead of re-deriving isAdHonestlyDelivered / isQc itself.
+// isVideoTitlingSettled/adTitlingTruth.js is still the ultimate source of
+// truth; it is just reached through adPhase.js now, not directly.
+const { deriveAdPhase } = require('./adPhase');
 
 const DONE_ELIGIBLE_STATUSES = Object.freeze(['preparing', 'running']);
 
@@ -341,22 +349,74 @@ function buildStaleRunningReapUpdate(staleMin) {
  * `'done'` run with an honest-looking succeeded count. `isVideoTitlingSettled`
  * is the one function in this repo that tells a real composite apart from a
  * raw master parked on `renderUrl`; see services/adTitlingTruth.js.
+ *
+ * RETROFITTED 2026-08-31 (services/adPhase.js parity pass — that file's own
+ * header names this function as one of three independent "what state is
+ * this ad in" derivations it exists to unify). succeeded/failed are now read
+ * off THE canonical `deriveAdPhase()` phase for each ad instead of
+ * re-deriving "is this delivered" from `isVideoTitlingSettled` directly and
+ * "is this a failure" from a bare `status === 'failed'`. Every case this
+ * function has ever needed to get right is unchanged, and the mapping below
+ * is provably equivalent to the pre-adPhase switch, not just similar:
+ *
+ *   - phase `'complete'` is returned ONLY for status ∈ {draft,live,archived}
+ *     with `isAdHonestlyDelivered(ad)` true, which for exactly those three
+ *     statuses IS `isVideoTitlingSettled(ad)` (adTitlingTruth.js) — the same
+ *     boolean the old switch computed, reached through one more named layer.
+ *   - phase `'failed-terminal'` / `'qc-failed-kept'` are returned ONLY when
+ *     `status === 'failed'` (adPhase.js's own unconditional guard at the top
+ *     of `deriveAdPhase`), so folding either into `failed++` is exactly the
+ *     old `case 'failed': failed++` — this function does not need to (and
+ *     does not) distinguish a QC-failed-but-kept-asset ad from any other
+ *     failure; both settle the run's `failed` counter identically.
+ *   - every OTHER phase `deriveAdPhase` can return for a draft/live/archived
+ *     ad — `awaiting-master`, `titling`, `awaiting-titler`, `quality-check`,
+ *     `claimed`, `generating-master`, `deferred-retrying`,
+ *     `skipped-derivative`, `stalled` — is reachable ONLY when
+ *     `isAdHonestlyDelivered(ad)` is false, which for a draft/live/archived
+ *     ad means ONLY a video ad whose titling has not settled: an image ad's
+ *     `isVideoTitlingSettled` is unconditionally `true` (no titling step
+ *     exists for statics — adTitlingTruth.js), so an image ad on one of
+ *     those three statuses ALWAYS resolves to `'complete'` and never reaches
+ *     this branch. So bucketing every non-`'complete'` draft/live/archived
+ *     ad into `titlingIncomplete` is exactly the old behaviour too.
+ *   - `stillRendering` vs `requeuedAway` are NOT determinable from phase
+ *     alone and are deliberately NOT retrofitted onto it: the identical
+ *     phase (e.g. `'awaiting-master'`, a free derive waiting on its sibling
+ *     master) can arise from either `status:'rendering'` (claim still held,
+ *     actively polling) or `status:'queued'` (claim released back to the
+ *     pool after `DERIVE_MASTER_WAIT_MS` expired) — and the OLD switch's
+ *     bucket for those two statuses was decided purely by `ad.status`,
+ *     never by any finer distinction. Reading raw `ad.status` for exactly
+ *     this one split is therefore not "re-deriving" anything adPhase.js
+ *     already owns — it is the same read the pre-adPhase code made, kept
+ *     because deriveAdPhase's phase vocabulary genuinely cannot disambiguate
+ *     it.
+ *
+ * Proven equivalent by scripts/verifyClassifyRunAdOutcomeParity.js against
+ * a frozen copy of the pre-adPhase switch.
  */
 function classifyRunAdOutcome(adDocs) {
   let succeeded = 0, failed = 0, stillRendering = 0, requeuedAway = 0, titlingIncomplete = 0;
   for (const ad of (adDocs || [])) {
-    switch (ad && ad.status) {
+    if (!ad) continue;
+    const phase = deriveAdPhase(ad);
+    if (phase === 'complete') { succeeded++; continue; }
+    if (phase === 'failed-terminal' || phase === 'qc-failed-kept') { failed++; continue; }
+    // Not yet settled. WHICH counter this hits stays keyed on the raw
+    // Ad.status the reaper/gate itself cares about — see the header above
+    // for why that split cannot move onto deriveAdPhase's finer vocabulary.
+    switch (ad.status) {
+      case 'rendering': stillRendering++; break;
+      case 'queued':    requeuedAway++; break;
       case 'draft':
       case 'live':
       case 'archived':
-        // Same delivered-status bucket as before; now gated on titling
-        // truth for video Ads (a no-op check for images — see the function).
-        if (isVideoTitlingSettled(ad)) succeeded++;
-        else titlingIncomplete++;
+        // Reaching here means deriveAdPhase did NOT return 'complete' for a
+        // delivered-shaped status, which (see header) is possible only for
+        // a video ad whose titling has not genuinely settled.
+        titlingIncomplete++;
         break;
-      case 'failed':   failed++; break;
-      case 'rendering': stillRendering++; break;
-      case 'queued':    requeuedAway++; break;
       // Anything else (missing/unrecognised) is not counted either way —
       // the same posture the render loop's own $inc sites already take.
       default: break;

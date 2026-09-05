@@ -7,10 +7,11 @@
 // recognises. That second half matters more than it looks: the reaper's
 // cross-service reconciliation (classifyRunAdOutcome, vendored from the
 // backend — wired from renderer.js maybeFinalizeRun; see
-// verifyRunFinalizesOnSettle.js) switches on Ad.status to decide
-// succeeded/failed/stillRendering/requeuedAway. A renderer that ever writes
-// a status value outside that switch's case labels would have its ads
-// silently fall into the `default: break` branch — counted as NEITHER
+// verifyRunFinalizesOnSettle.js) buckets succeeded/failed off deriveAdPhase
+// and stillRendering/requeuedAway/titlingIncomplete off a residual
+// Ad.status switch. A renderer that ever writes a status value neither
+// phase-handled (`failed`) nor in that switch's case labels would have its
+// ads silently fall into the `default: break` branch — counted as NEITHER
 // succeeded nor failed, invisible to reconciliation. A drift here would
 // undercount a finalized CampaignRun.
 //
@@ -139,36 +140,54 @@ check('B4 the only terminal outcomes renderer.js writes are draft (success) and 
 });
 
 // ═════════════════════════════════════════════════════════════════════════
-// C — cross-check every value renderer.js writes against the REAL switch
-// case labels inside classifyRunAdOutcome (campaignRunGuards.js), so a
-// value renderer.js writes can never silently fall into that switch's
-// `default: break` (uncounted, invisible to reconciliation).
+// C — cross-check every value renderer.js writes against classifyRunAdOutcome.
+// RETROFITTED with campaignRunGuards.js's deriveAdPhase port: succeeded/failed
+// are read off phase `'complete'` / `'failed-terminal'`/`'qc-failed-kept'`
+// (the last two ONLY when status==='failed'), and the remaining switch on
+// raw `ad.status` covers rendering/queued/draft/live/archived. A status
+// renderer.js writes must land in one of those two arms — never the
+// uncounted `default: break`.
 // ═════════════════════════════════════════════════════════════════════════
-const switchMatch = /switch\s*\(\s*ad\s*&&\s*ad\.status\s*\)\s*\{/.exec(GUARDS_SRC);
-assert.ok(switchMatch, 'classifyRunAdOutcome\'s switch shape changed — re-derive this harness');
-const switchBody = balanced(GUARDS_SRC, GUARDS_SRC.indexOf('{', switchMatch.index + switchMatch[0].length - 1), '{', '}');
-const recognisedCases = [...switchBody.matchAll(/case\s+['"]([\w-]+)['"]\s*:/g)].map((mm) => mm[1]);
+const classifyStart = GUARDS_SRC.indexOf('function classifyRunAdOutcome');
+assert.ok(classifyStart !== -1, 'classifyRunAdOutcome not found — re-derive this harness');
+const classifyEnd = GUARDS_SRC.indexOf('\nfunction ', classifyStart + 10);
+const classifyBody = GUARDS_SRC.slice(classifyStart, classifyEnd === -1 ? undefined : classifyEnd);
 
-check('C1 the switch actually has case labels (a zero-result scan proves nothing)', () => {
+check('C0 classifyRunAdOutcome calls deriveAdPhase (not a raw-status-only switch)', () => {
+  assert.match(classifyBody, /deriveAdPhase\(ad\)/);
+  assert.match(classifyBody, /phase === 'complete'/);
+  assert.match(classifyBody, /phase === 'failed-terminal'/);
+  assert.match(classifyBody, /phase === 'qc-failed-kept'/);
+});
+
+const switchMatch = /switch\s*\(\s*ad\.status\s*\)\s*\{/.exec(classifyBody);
+assert.ok(switchMatch, 'classifyRunAdOutcome\'s residual status switch shape changed — re-derive this harness');
+const switchAbs = classifyStart + switchMatch.index;
+const switchBody = balanced(GUARDS_SRC, GUARDS_SRC.indexOf('{', switchAbs + switchMatch[0].length - 1), '{', '}');
+const recognisedCases = [...switchBody.matchAll(/case\s+['"]([\w-]+)['"]\s*:/g)].map((mm) => mm[1]);
+// `failed` is handled by the phase arm above the switch, not a case label.
+const recognisedStatuses = new Set([...recognisedCases, 'failed']);
+
+check('C1 the residual switch actually has case labels (a zero-result scan proves nothing)', () => {
   assert.ok(recognisedCases.length >= 4, `expected several case labels, found ${recognisedCases.length}`);
 });
 
-console.log(`  (classifyRunAdOutcome recognises: ${recognisedCases.sort().join(', ')})`);
+console.log(`  (classifyRunAdOutcome switch cases: ${recognisedCases.sort().join(', ')}; plus phase-arm 'failed')`);
 
-check('C2 every status value renderer.js writes is a case classifyRunAdOutcome recognises', () => {
-  const invisible = [...writtenStatusValues].filter((v) => !recognisedCases.includes(v));
+check('C2 every status value renderer.js writes is recognised (switch case OR failed phase-arm)', () => {
+  const invisible = [...writtenStatusValues].filter((v) => !recognisedStatuses.has(v));
   assert.strictEqual(invisible.length, 0,
-    `renderer.js writes status value(s) invisible to classifyRunAdOutcome's switch (would fall into ` +
-    `the uncounted default branch): ${invisible.join(', ')}`);
+    `renderer.js writes status value(s) invisible to classifyRunAdOutcome ` +
+    `(would fall into the uncounted default branch): ${invisible.join(', ')}`);
 });
 
-check('C3 the declared Ad.status enum and classifyRunAdOutcome\'s recognised cases are the SAME SET', () => {
+check('C3 the declared Ad.status enum and classifyRunAdOutcome\'s recognised statuses are the SAME SET', () => {
   // Not just "renderer.js's writes are covered" — the whole enum should be,
   // since any OTHER writer (adRegenerateService, titlingResumeService,
   // bootRecoveryService, ...) can also produce any of these six values and
   // classifyRunAdOutcome has to make sense of ALL of them, not just this
   // file's slice.
-  assert.deepStrictEqual([...recognisedCases].sort(), [...declaredEnum].sort());
+  assert.deepStrictEqual([...recognisedStatuses].sort(), [...declaredEnum].sort());
 });
 
 // ── report ───────────────────────────────────────────────────────────────
@@ -187,8 +206,9 @@ console.log(`✅ verifyRendererAdStatusEnum: ${total}/${total} checks passed`);
  *        → B1/B2/B3 fail
  *   2. renderer.js writes a status value not in Ad.js's enum (e.g. a typo
  *      like 'complete')                                → B1 fails
- *   3. campaignRunGuards.js's switch drops a case label that renderer.js
- *      still writes (e.g. removes `case 'failed':`)     → C2/C3 fail
- *   4. models/Ad.js's enum gains a value the switch doesn't handle, or
- *      vice versa                                        → C3 fails
+ *   3. campaignRunGuards.js drops the failed-terminal/qc-failed-kept phase
+ *      arm, or the residual switch drops a case renderer.js still writes
+ *                                                     → C0/C2/C3 fail
+ *   4. models/Ad.js's enum gains a value neither the phase-arm nor the
+ *      residual switch handles, or vice versa            → C3 fails
  */
