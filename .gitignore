@@ -35,3 +35,8 @@ title-preview-output/
 # scripts/rpd/ run output (manifests, downloaded media, gallery builds) —
 # local/experimental, never committed (same pattern as probe-results/ above).
 rpd-runs/
+# fontResolverService.js's FONT_CACHE_DIR — webfonts it downloads on demand
+# (e.g. a brand's titleStylePreset font) and caches locally. Runtime cache,
+# not source; the sibling assets/fonts/ directory of committed .ttf files is
+# unaffected (same pattern as probe-results/ / rpd-runs/ above).
+src/services/brandScripts/assets/webfonts/
