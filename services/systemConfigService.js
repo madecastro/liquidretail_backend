@@ -1,36 +1,17 @@
 // Thin accessor around the SystemConfig singleton. Encapsulates the
-// "load canonical script — DB first, file fallback" pattern so
-// callers don't reimplement it. Also lazy-creates the singleton on
-// first access.
+// "load canonical canvas script — DB only" pattern so callers don't
+// reimplement it. Also lazy-creates the singleton on first access.
+//
+// File fallback of the deleted canvas scripts was removed with the
+// canvas island (STRIP-INVENTORY PR-B2). No live Remotion / Title
+// Studio / /style path reads these getters — they return DB or null.
 
-const fs   = require('fs');
-const path = require('path');
 const SystemConfig = require('../models/SystemConfig');
 
-const CANONICAL_FEED_FILE            = path.join(__dirname, 'brandScripts', 'canonical.script.js');
-const CANONICAL_VERTICAL_FILE        = path.join(__dirname, 'brandScripts', 'top_scrim_editorial.script.js');
-const CANONICAL_VERTICAL_DR_V1_FILE  = path.join(__dirname, 'brandScripts', 'canonical_dr_v1_vertical.script.js');
-const CANONICAL_LANDSCAPE_FILE       = path.join(__dirname, 'brandScripts', 'local_scrim_landscape.script.js');
-
-// Which file backs the vertical canonical. The DR-v1 template is the
-// new default when CANONICAL_DR_V1=true — a three-phase overlay (hook
-// / proof / product endcard) that pairs with the fixed lifestyle beat
-// template Grok now generates. The legacy top_scrim_editorial file
-// stays on disk so the operator can revert via DB override without a
-// redeploy.
-function verticalCanonicalFile() {
-  return String(process.env.CANONICAL_DR_V1 || '').toLowerCase() === 'true'
-    ? CANONICAL_VERTICAL_DR_V1_FILE
-    : CANONICAL_VERTICAL_FILE;
-}
-
-// One row per format: which DB field holds the override, which file
-// backs the fallback. `file` may be a resolver function when the file
-// picked depends on runtime state (env flag for vertical).
 const CANONICAL_TABLE = {
-  feed:      { dbField: 'canonicalScript',          file: CANONICAL_FEED_FILE },
-  vertical:  { dbField: 'canonicalScriptVertical',  file: verticalCanonicalFile },
-  landscape: { dbField: 'canonicalScriptLandscape', file: CANONICAL_LANDSCAPE_FILE }
+  feed:      { dbField: 'canonicalScript' },
+  vertical:  { dbField: 'canonicalScriptVertical' },
+  landscape: { dbField: 'canonicalScriptLandscape' }
 };
 
 async function ensureSingleton() {
@@ -40,8 +21,8 @@ async function ensureSingleton() {
   return doc;
 }
 
-// Load one canonical variant by format. DB value wins when set;
-// otherwise falls back to the bundled file.
+// Load one canonical variant by format. DB value when set; otherwise
+// null — the bundled .script.js files are deleted.
 async function loadCanonical(format) {
   const entry = CANONICAL_TABLE[format];
   if (!entry) {
@@ -54,14 +35,7 @@ async function loadCanonical(format) {
   if (dbValue && String(dbValue).trim()) {
     return { source: 'db', script: dbValue };
   }
-  const filePath = typeof entry.file === 'function' ? entry.file() : entry.file;
-  try {
-    return { source: 'file', script: fs.readFileSync(filePath, 'utf8') };
-  } catch (err) {
-    const e = new Error(`canonical script (${format}) not found in DB or at ${filePath}: ${err.message}`);
-    e.status = 500;
-    throw e;
-  }
+  return { source: 'none', script: null };
 }
 
 // Feed canonical (4:5 / 1:1). Preserves the legacy signature so existing
@@ -440,13 +414,5 @@ module.exports = {
   setVideoVisionQcEnabled,
   peekVideoVisionQcEnabled,
   refreshVideoVisionQcEnabledCache,
-  resetVideoVisionQcEnabledCache,
-  CANONICAL_FEED_FILE,
-  CANONICAL_VERTICAL_FILE,
-  CANONICAL_VERTICAL_DR_V1_FILE,
-  CANONICAL_LANDSCAPE_FILE,
-  verticalCanonicalFile,
-  // Deprecated alias for the feed-only constant — kept for callers that
-  // still reference it. New code should use CANONICAL_FEED_FILE.
-  CANONICAL_FILE: CANONICAL_FEED_FILE
+  resetVideoVisionQcEnabledCache
 };

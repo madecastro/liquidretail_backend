@@ -29,15 +29,16 @@ Consequences that have already cost real time:
     **actively misreported**. Fix the badge or the resolver together — not one alone.
 - A brand's custom `styleScript*` fields do **not** take effect. `:804` logs a line
   saying so per render.
-- Everything under `services/brandScripts/*.script.js`, `brandScriptRunner.child.js`,
-  and the `sharp.resize(fit:'cover')` calls at `brandScriptExecutor.js:387-388` and
-  `:488-489` is on the dead path. Do not plan framing/crop work against them —
-  video framing lives in `remotion/components/BasePlate.jsx:18,28` (`objectFit:
-  'cover'`).
-- **Security:** `POST /api/brand/:id/preview-script` forces `engine='canvas'` and so
-  bypasses this kill-switch — that is the only route reaching the
-  `vm.compileFunction` sandbox-escape in `brandScriptRunner.child.js:139`. See
-  `ARCHITECTURE_REVIEW.md` GEN-1.
+- **Canvas island DELETED (STRIP-INVENTORY PR-B2).**
+  `services/brandScriptRunner.child.js`, `services/brandScripts/*.script.js`, and
+  `scripts/testBrandScript.js` are gone. Remotion presets live in
+  `remotion/presets/*.json`, not those scripts. Video framing is
+  `remotion/components/BasePlate.jsx` (`objectFit: 'cover'`). The
+  `engine !== 'remotion'` → 400 guard on `POST /api/brand/:id/preview-script`
+  (`SECURITY (GEN-1)`) remains. `POST/GET /generate-script` return 410;
+  `systemConfigService` no longer `readFileSync`s a `.script.js` fallback.
+  `brandStyles/*` kept (live Brand `/style` require).
+  See `ARCHITECTURE_REVIEW.md` GEN-1.
 
 §1 is retained as a description of the cascade to restore *if* canvas is re-enabled.
 Treat it as design intent, not current behaviour.

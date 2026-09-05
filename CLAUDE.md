@@ -749,30 +749,19 @@ Cheap habit: `grep -n "function resolve<Thing>" -A 20` and read the **first**
 
 Verified 2026-07-29; line anchors re-checked 2026-08-03. Each looks live; none is.
 
-- **Canvas titling engine.** `resolveTitlingEngine` is hard-wired to remotion, so
-  `TITLING_ENGINE` and `Brand.videoSettings.titlingEngine` are **not read by the render
-  path** — and worse than inert: they are still validated, still persisted, still
-  returned by brand routes, and **badged in the UI**. A brand set to `'canvas'`
-  displays "engine: canvas" while rendering with remotion. All of
-  `services/brandScripts/*.script.js`, `brandScriptRunner.child.js`, and the
-  canvas `sharp.resize(fit:'cover')` paths are dead. See `docs/TITLING.md` §0.
-  **The former exception is now CLOSED (2026-08-03).**
-  `POST /api/brand/:id/preview-script` used to reach the `vm.compileFunction` escape
-  via **three** doors, not one: `body.script` (forces `'canvas'`), the
-  `body.engine:'canvas'` hatch (which short-circuits *before* `resolveTitlingEngine`
-  is consulted), and a `styleScript*` persisted earlier through the unvalidated
-  `PATCH /api/brand/:id` allow-list and then previewed with `{engine:'canvas'}` and no
-  `body.script` at all. An `engine !== 'remotion'` → 400 guard immediately after the
-  engine resolution (`routes/brand.js`, search `SECURITY (GEN-1)`) closes all three
-  and stays closed if `resolveTitlingEngine` is ever un-hardwired. **No HTTP route
-  reaches `runChild` now**; `scripts/testBrandScript.js` still does by design, which
-  is why `brandScriptRunner.child.js` cannot simply be deleted. Pinned by
-  `scripts/verifyPreviewScriptGuard.js` (8 checks; removing the guard fails 3).
-  Note the original prescribed fix — delete the `bodyScript` branch — was
-  **insufficient**, leaving a two-request exploit; and `parsingContext` would not have
-  helped either, because the injected params are parent-realm objects
-  (`helpers.clamp.constructor("return process")()` escapes a fresh context).
-  See `ARCHITECTURE_REVIEW.md` GEN-1.
+- **Canvas titling engine — island DELETED (STRIP-INVENTORY PR-B2).**
+  `resolveTitlingEngine` stays hard-wired to remotion. Deleted:
+  `services/brandScriptRunner.child.js`, `services/brandScripts/*.script.js`
+  (`canonical`, `canonical_dr_v1_vertical`, `local_scrim_landscape`,
+  `top_scrim_editorial`, `u_beauty`), `scripts/testBrandScript.js`.
+  `services/brandStyles/*` KEPT — live `require` from `GET /api/brand/:id/style`.
+  `TITLING_ENGINE` / `Brand.videoSettings.titlingEngine` still persist and badge
+  in the UI (shared-Mongo; do not drop). The `engine !== 'remotion'` → 400 guard
+  on `POST /api/brand/:id/preview-script` (`SECURITY (GEN-1)`) remains verbatim.
+  Pinned by `scripts/verifyPreviewScriptGuard.js` (7 + R1–R3).
+  `POST/GET /generate-script` return 410; `systemConfigService` file-fallback
+  of the deleted `.script.js` files is gone (DB or null). See `docs/TITLING.md`
+  §0 and `ARCHITECTURE_REVIEW.md` GEN-1.
 - **`renderViaSpec` + the whole `frontend/client/` tree.** `renderViaSpec`
   (`renderService.js:895`) fetches `${FRONTEND_URL}/ads.html`, but the frontend's
   `netlify.toml` publishes only `frontend/app/dist` and its `/*` fallback

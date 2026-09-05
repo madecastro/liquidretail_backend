@@ -241,18 +241,14 @@ async function loadCanonicalScript(format) {
       vertical:  sysCfg.getCanonicalScriptVertical,
       landscape: sysCfg.getCanonicalScriptLandscape,
     }[format];
-    const { script, source } = await getter();
-    console.log(`🔤 canvas canonical (${format}): source=${source}`);
-    return script;
+    const got = await getter();
+    if (!got?.script) {
+      die('canvas canonical retired (no DB script; file fallback removed) — use --engine remotion');
+    }
+    console.log(`🔤 canvas canonical (${format}): source=${got.source}`);
+    return got.script;
   }
-  const filePath = {
-    feed:      sysCfg.CANONICAL_FEED_FILE,
-    vertical:  sysCfg.verticalCanonicalFile(),
-    landscape: sysCfg.CANONICAL_LANDSCAPE_FILE,
-  }[format];
-  const script = await fsp.readFile(filePath, 'utf8');
-  console.log(`🔤 canvas canonical (${format}): source=file (${path.basename(filePath)}, no mongo connection)`);
-  return script;
+  die('canvas canonical file fallback removed — connect Mongo with a DB script or use --engine remotion');
 }
 
 // ── Engine runners ─────────────────────────────────────────────────
