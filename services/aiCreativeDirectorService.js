@@ -61,10 +61,16 @@ function directorProofMenuEnabled() {
   return String(process.env.DIRECTOR_PROOF_MENU_ENABLED ?? 'false').toLowerCase() === 'true';
 }
 
-// DIRECTOR_QUOTE_POOL_ALIGNED (default false). Independent of
-// QUOTE_STAGE_AWARE so the two levers can flip separately.
+// DIRECTOR_QUOTE_POOL_ALIGNED. Independent of QUOTE_STAGE_AWARE so
+// the two levers can flip separately.
+// Code fallback when unset is false (harnesses that don't load
+// defaults.env keep the Immersive reviews[] source). FILE default in
+// config/defaults.env is true as of 2026-09-04 — a real boot aligns
+// Director primary_quote with the productReviews.quotes pool render
+// prints. ⚠️ PRODUCTION BEHAVIOUR FLIP on first deploy that ships
+// the file default.
 // Flag-off: primary_quote is product.reviews[0] (SerpAPI arrival
-// order) — today's assembleSignals source.
+// order).
 // Flag-on: productReviews.quotes through the SAME pipeline render
 // uses (stamp → printable → star gate → pickStrongestQuote).
 function directorQuotePoolAlignedEnabled() {
@@ -90,6 +96,17 @@ function directorFunnelStageAllEnabled() {
 // buildPromptRound output.
 function directorProductBenefitsEnabled() {
   return process.env.DIRECTOR_PRODUCT_BENEFITS === 'true';
+}
+
+// DIRECTOR_BRAND_PERSONAS (default true in config/defaults.env).
+// Parser is strictly === 'true'. Unset (no file, no dashboard) is OFF,
+// so existing harnesses that don't load defaults.env keep the pre-change
+// inputSummary + round prompt byte-identical. File default is true.
+// Flag-off OMITS brand_signal.personas (the key itself, not []) AND
+// omits the PERSONAS rule — byte-identical to the pre-change
+// buildPromptRound output.
+function directorBrandPersonasEnabled() {
+  return process.env.DIRECTOR_BRAND_PERSONAS === 'true';
 }
 
 function shouldEmitFunnelStage(platformFormat) {
@@ -408,7 +425,8 @@ const MAX_TOKENS  = 3500;         // bumped from 2000 — each concept ~300-400 
 // invalidates existing CreativeDirectionArtifact rows so the Director
 // re-runs and emits the new count / shape. Mirrors aiCanvasSpec-
 // Service.SPEC_SCHEMA_VERSION.
-const DIRECTOR_SIGNALS_VERSION = '3.5.0';   // BUMPED 2026-09-03: product_signal.benefits from CatalogProduct.shortBenefits (DIRECTOR_PRODUCT_BENEFITS). Same product → same brief on first generate and every regenerate; empty until ingest/backfill has derived. Never a derivation, never an artifact read.
+const DIRECTOR_SIGNALS_VERSION = '3.6.0';   // BUMPED 2026-09-04: brand_signal.personas from Brand.demographics (DIRECTOR_BRAND_PERSONAS). Voice/objection framing only — never quote authors. Flag-off omits the key and the PERSONAS rule so inputSummary + round prompt stay byte-identical. Live path re-assembles every round; the bump is the SHADOW directConcepts cache-hit gate (one paid re-derive per cached product).
+// 3.5: product_signal.benefits from CatalogProduct.shortBenefits (DIRECTOR_PRODUCT_BENEFITS). Same product → same brief on first generate and every regenerate; empty until ingest/backfill has derived. Never a derivation, never an artifact read.
 // 3.4: aligned proof_options pool + quotes_by_stage (QUOTE_STAGE_AWARE).
 // 3.3: PMax-only round brief adds FUNNEL SPREAD (one concept each of awareness /
 // consideration / conversion via routing.funnel_stage) and SOCIAL-PROOF HIERARCHY
@@ -688,7 +706,7 @@ async function assembleSignals({ brandId, productId, campaignKind, seededUnivers
   let medias = [];
   if (matchedMediaIds.length) {
     medias = await Media.find({ _id: { $in: matchedMediaIds } })
-      .select('source platformStats metadata classification primarySubjectLabel adSuitability fileType')
+      .select('source platformStats metadata classification primarySubjectLabel adSuitability fileType rights')
       .lean();
   }
 
@@ -725,6 +743,15 @@ async function assembleSignals({ brandId, productId, campaignKind, seededUnivers
     brand_reviews_summary: snippetText(brand?.brandReviews?.summary, 240),
     has_logo:    !!brand?.logoUrl  // field is logoUrl; brand.logo never existed → permanently false
   };
+  // OPTIONAL brand personas from Brand.demographics (real demographicSchema
+  // fields — name/description/interests/painPoints/toneHint). Flag-off omits
+  // the key entirely so JSON.stringify of the signal is byte-identical to
+  // the pre-change shape. Flag-on always sets an array (never null).
+  // Voice / objection framing ONLY — the round prompt forbids using these
+  // as quote authors (layout derivation already tempts that; do not copy it).
+  if (directorBrandPersonasEnabled()) {
+    brandSignal.personas = normalizeBrandPersonas(brand?.demographics);
+  }
 
   // ── Product signal ──
   const productSignal = {
@@ -790,7 +817,7 @@ async function assembleSignals({ brandId, productId, campaignKind, seededUnivers
   const mediaStrength= ugcMediaCount >= 3 ? 'high' :
                         ugcMediaCount >= 1 ? 'medium' :
                         'absent';
-  const rightsApproved = ugcMedias.some(m => m.platformStats?.rights_approved) || null;
+  const rightsApproved = ugcMedias.some(m => m.rights?.approved) || null;
 
   // Shot-type + content-nature distributions: tells the Director whether
   // the matched media is lifestyle vs product-only, evergreen vs
@@ -1123,6 +1150,27 @@ async function assembleSignals({ brandId, productId, campaignKind, seededUnivers
   };
 }
 
+/**
+ * Generate-scoped memo for assembleSignals. Product-scoped runs share one
+ * brief across the static Director round and the video-title Director's
+ * (size × profile) keys. Brand-mode (no productId) is not cached —
+ * seededUniverse is a quote-scope input there.
+ *
+ * Used at mint so assembleSignals is not re-run per product.
+ */
+function makeAssembleSignalsOnce(fn) {
+  const impl = typeof fn === 'function' ? fn : assembleSignals;
+  const cache = new Map();
+  return async function assembleSignalsOnce(args = {}) {
+    if (!args.productId) return impl(args);
+    const key = `${args.brandId || ''}|${args.productId}|${args.campaignKind || ''}`;
+    if (cache.has(key)) return cache.get(key);
+    const pending = Promise.resolve().then(() => impl(args));
+    cache.set(key, pending);
+    return pending;
+  };
+}
+
 // Compact text → null/empty/length-capped clean snippet. Used to keep
 // the Director's inputSummary tight while still passing actual content.
 // Word-boundary truncation. The old slice(maxLen - 1) cut mid-word, which
@@ -1153,6 +1201,47 @@ async function assembleSignals({ brandId, productId, campaignKind, seededUnivers
 const MAX_SPEC_ROWS = 8;
 const MAX_SPEC_LABEL = 40;
 const MAX_SPEC_VALUE = 90;
+const MAX_PERSONAS = 4;
+const MAX_PERSONA_INTERESTS = 6;
+const MAX_PERSONA_PAIN_POINTS = 6;
+
+/**
+ * Brand.demographics → Director brand_signal.personas.
+ * Real demographicSchema fields only (models/Brand.js): name, description,
+ * interests, painPoints, toneHint. avatarUrl is unused (not voice).
+ * Cap 4 entries. Drop rows with no name.
+ */
+function normalizeBrandPersonas(raw) {
+  if (!Array.isArray(raw)) return [];
+  const out = [];
+  for (const d of raw) {
+    if (out.length >= MAX_PERSONAS) break;
+    if (!d || typeof d !== 'object') continue;
+    const name = typeof d.name === 'string' ? d.name.trim() : '';
+    if (!name) continue;
+    const entry = { name };
+    const description = snippetText(d.description, 160);
+    if (description) entry.description = description;
+    if (Array.isArray(d.interests) && d.interests.length) {
+      const interests = d.interests
+        .filter((x) => typeof x === 'string' && x.trim())
+        .map((x) => x.trim())
+        .slice(0, MAX_PERSONA_INTERESTS);
+      if (interests.length) entry.interests = interests;
+    }
+    if (Array.isArray(d.painPoints) && d.painPoints.length) {
+      const painPoints = d.painPoints
+        .filter((x) => typeof x === 'string' && x.trim())
+        .map((x) => x.trim())
+        .slice(0, MAX_PERSONA_PAIN_POINTS);
+      if (painPoints.length) entry.painPoints = painPoints;
+    }
+    const toneHint = snippetText(d.toneHint, 80);
+    if (toneHint) entry.toneHint = toneHint;
+    out.push(entry);
+  }
+  return out;
+}
 
 function normalizeProductSpecs(raw) {
   const rows = [];
@@ -2272,7 +2361,8 @@ async function directConceptsRound({
   seededUniverse,           // [{ mediaId, url, fileType, role, metadata }]
   seedUniverseHash = null,  // from seededUniverseService; persisted on the artifact
   roundIndex      = null,   // computed from prior rows when omitted
-  avoidList       = null    // computed from prior rows when omitted
+  avoidList       = null,   // computed from prior rows when omitted
+  assembleSignals: assembleSignalsDep = null  // generate-scoped memo (item 9) — default is this module's assembleSignals
 }) {
   if (!brandId) throw badRequest('brandId required');
   if (!Array.isArray(seededUniverse) || !seededUniverse.length) {
@@ -2325,7 +2415,8 @@ async function directConceptsRound({
   // it's emitting strategy-only (V1) or full concept rows (V2).
   // seededUniverse is THIS run's seed — quote-scope must use it, not
   // the brand PMA union of 10.
-  const signals = await assembleSignals({ brandId, productId, campaignKind, seededUniverse });
+  const assemble = typeof assembleSignalsDep === 'function' ? assembleSignalsDep : assembleSignals;
+  const signals = await assemble({ brandId, productId, campaignKind, seededUniverse });
   const inputSummary = { ...signals, platform_format: platformFormat };
 
   // Phase 2 — load derived brand voice + campaign brief if present.
@@ -3033,6 +3124,9 @@ function buildPromptRound({ inputSummary, creativeIntent, platformFormat, univer
       ? `    editorial         → product_signal.specs. Name ONE concrete fact (fabric, construction, weight, dimension, care) and build the line on it. A specific verb about a real property beats two adjectives. This is the style that should read as reported, not sold. product_signal.benefits MAY colour a line — they are DERIVED buyer-facing phrases (derived once at catalog ingest from this product's own title/description/specs), NOT verified catalog facts. Specs remain the fact source.`
       : `    editorial         → product_signal.specs. Name ONE concrete fact (fabric, construction, weight, dimension, care) and build the line on it. A specific verb about a real property beats two adjectives. This is the style that should read as reported, not sold.`,
     `    brand_led         → brand_signal (tone, summary, tagline). This is the ONLY style that should lean on brand voice — it is the fallback of last resort for every other style, not their first move.`,
+    ...(directorBrandPersonasEnabled() ? [
+      `- PERSONAS: brand_signal.personas (when present) inform voice and objection framing ONLY. Never use a persona as a quote author, never invent a testimonial, never attribute a persona name to social_proof_signal.primary_quote or copy. A persona is who the ad is FOR, not who is speaking.`
+    ] : []),
     ...(allowedStyles.includes(PROMOTIONAL_STYLE) ? [
       `    promotional       → urgency or scarcity grounded in the PRODUCT — a limited colourway, a seasonal window, a use-case moment — plus one hard fact from product_signal (a spec, a material, availability). Verbs first. NOT a price and NOT a discount: this style is subject to the pricing ban below exactly like every other.`
     ] : []),
@@ -3693,6 +3787,7 @@ module.exports = {
   directConcepts,
   directConceptsRound,
   assembleSignals,
+  makeAssembleSignalsOnce,
   directorQuotePoolAlignedEnabled,
   directorFunnelStageAllEnabled,
   shouldEmitFunnelStage,
@@ -3730,6 +3825,8 @@ module.exports = {
   // functions, so it cannot drift from what the Director actually receives.
   normalizeProductSpecs,
   directorProductBenefitsEnabled,
+  directorBrandPersonasEnabled,
+  normalizeBrandPersonas,
   scoreQuoteSafe,
   buildDirectorProofOptions,
   directorProofMenuEnabled,

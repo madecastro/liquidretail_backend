@@ -73,8 +73,43 @@ function directionMemoKey({ productId, size, profile }) {
 }
 
 const memo = new Map();
+const signalsMemo = new Map();
 function resetVideoTitleDirectionMemo() {
   memo.clear();
+  signalsMemo.clear();
+}
+
+function signalsMemoKey({ brandId, productId, campaignKind } = {}) {
+  return `${brandId || ''}|${productId || 'none'}|${campaignKind || ''}`;
+}
+
+/**
+ * Compact printable social_proof_signal for the video-title prompt.
+ * assembleSignals already ran quotes through toPrintableCustomerQuote —
+ * never re-read raw bylines here.
+ */
+function printableSocialProofForVideo(signal) {
+  if (!signal || typeof signal !== 'object') return null;
+  const out = {};
+  if (signal.rating && typeof signal.rating.value === 'number') {
+    out.rating = signal.rating;
+  }
+  if (signal.primary_quote && typeof signal.primary_quote.text === 'string'
+      && signal.primary_quote.text.trim()) {
+    out.primary_quote = {
+      text: signal.primary_quote.text,
+      author: signal.primary_quote.author || null
+    };
+  }
+  if (Array.isArray(signal.top_comments) && signal.top_comments.length) {
+    out.top_comments = signal.top_comments.slice(0, 2).map((c) => ({
+      text: c && c.text,
+      author: (c && c.author) || null
+    })).filter((c) => c.text);
+    if (!out.top_comments.length) delete out.top_comments;
+  }
+  if (signal.strongest_signal) out.strongest_signal = signal.strongest_signal;
+  return Object.keys(out).length ? out : null;
 }
 
 function visibleBenefitsSlot(spec) {
@@ -122,7 +157,9 @@ function occupancyBrief({ size, profile }) {
   };
 }
 
-function buildDirectorMessages({ size, profile, occupancy, benefits, productSignal, brandSignal }) {
+function buildDirectorMessages({
+  size, profile, occupancy, benefits, productSignal, brandSignal, socialProofSignal
+} = {}) {
   const system = [
     'You are the video-titling Director. You decide whether a benefits slot belongs on THIS video content profile × size, given the product, the intent, and how much of the title stack is already committed.',
     'OUTPUT CONTRACT: reply with ONE JSON object, no prose, no markdown fences.',
@@ -136,24 +173,39 @@ function buildDirectorMessages({ size, profile, occupancy, benefits, productSign
     '- 9:16 is a tight portrait box (Reels/Stories/Shorts family). 16:9 is looser landscape.',
     '- max_items is 3 on 9:16, 4 on 16:9, and never more than the available list.',
     '- Do not invent benefits. If the list is empty, include_benefits must be false.',
+    '- Product description, specs, and printable social proof (when present) ground the include/phase call. They are not extra slots.',
     '- Thin data is not a stop: decide with what you have.',
   ].join('\n');
 
-  const user = [
+  const userLines = [
     `SIZE: ${size} (all delivered surfaces cropped/retitled from this Omni master inherit this decision)`,
     `CONTENT PROFILE: ${profile}`,
     `BRAND: ${brandSignal?.name || 'unknown'}`,
     `PRODUCT: ${productSignal?.name || 'unknown'}`,
-    `BENEFITS AVAILABLE: ${JSON.stringify(benefits)}`,
+  ];
+  if (brandSignal?.tagline) userLines.push(`BRAND TAGLINE: ${brandSignal.tagline}`);
+  if (Array.isArray(brandSignal?.tone) && brandSignal.tone.length) {
+    userLines.push(`BRAND TONE: ${JSON.stringify(brandSignal.tone)}`);
+  }
+  if (productSignal?.description) {
+    userLines.push(`PRODUCT DESCRIPTION: ${productSignal.description}`);
+  }
+  if (Array.isArray(productSignal?.specs) && productSignal.specs.length) {
+    userLines.push(`PRODUCT SPECS: ${JSON.stringify(productSignal.specs)}`);
+  }
+  userLines.push(`BENEFITS AVAILABLE: ${JSON.stringify(benefits)}`);
+  const proof = printableSocialProofForVideo(socialProofSignal);
+  if (proof) userLines.push(`SOCIAL PROOF: ${JSON.stringify(proof)}`);
+  userLines.push(
     `BASE LAYOUT: ${occupancy.intentPreset} format=${occupancy.format} target_phase=${occupancy.phase}`,
     `SLOTS ALREADY IN TARGET PHASE: ${occupancy.slots.join(', ') || '(none)'}`,
     `SURFACE KEEP-OUT KEY: ${occupancy.surface}`,
     'Decide include_benefits / max_items / phase now.',
-  ].join('\n');
+  );
 
   return [
     { role: 'system', content: system },
-    { role: 'user', content: user },
+    { role: 'user', content: userLines.join('\n') },
   ];
 }
 
@@ -200,9 +252,20 @@ async function runVideoTitleDirector({
   const chatCompletion = deps.chatCompletion
     || require('./atlasLlmService').chatCompletion;
 
-  const signals = await assembleSignals({
+  // One assembleSignals per product — the 6 unique (size × profile) keys
+  // of a mixed kit share the same brief. Callers can pass a generate-scoped
+  // memo via deps.assembleSignals so the static Director round reuses it.
+  const sKey = signalsMemoKey({
     brandId, productId, campaignKind: campaignKind || 'product',
   });
+  let signalsP = signalsMemo.get(sKey);
+  if (!signalsP) {
+    signalsP = Promise.resolve().then(() => assembleSignals({
+      brandId, productId, campaignKind: campaignKind || 'product',
+    }));
+    signalsMemo.set(sKey, signalsP);
+  }
+  const signals = await signalsP;
   const benefits = normalizeBenefitList(signals?.product_signal?.benefits);
   if (!benefits.length) {
     return { include: false, reason: 'no-content', size, profile, source: 'short-circuit' };
@@ -213,6 +276,7 @@ async function runVideoTitleDirector({
     size, profile, occupancy, benefits,
     productSignal: signals.product_signal,
     brandSignal: signals.brand_signal,
+    socialProofSignal: signals.social_proof_signal,
   });
 
   const completion = await chatCompletion(
@@ -375,4 +439,6 @@ module.exports = {
   parseDirectorDecision,
   applyBenefitsPlacement,
   buildBenefitsSlot,
+  buildDirectorMessages,
+  printableSocialProofForVideo,
 };

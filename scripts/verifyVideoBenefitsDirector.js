@@ -19,6 +19,8 @@
  * Run: node scripts/verifyVideoBenefitsDirector.js
  */
 const assert = require('assert');
+const fs = require('fs');
+const os = require('os');
 const path = require('path');
 
 const ROOT = path.join(__dirname, '..');
@@ -43,7 +45,10 @@ const {
   applyBenefitsPlacement,
   parseDirectorDecision,
   isBenefitsPlacementEnabled,
+  occupancyBrief,
+  buildDirectorMessages,
 } = require('../services/videoBenefitsDirector');
+const { makeAssembleSignalsOnce } = require('../services/aiCreativeDirectorService');
 
 let pass = 0;
 const failures = [];
@@ -121,12 +126,29 @@ check('S8 consideration/conversion stay themselves',
     `got ${portraitAwareness.length} — Stories/Reels/1:1/4:5/PMax 9:16/1:1 unstaged`);
 }
 
-function stubDeps({ benefits = ['Keeps you dry', 'Packs flat', 'Taped seams'], onChat } = {}) {
+function stubDeps({
+  benefits = ['Keeps you dry', 'Packs flat', 'Taped seams'],
+  onChat,
+  onAssemble,
+  extraSignals = {},
+} = {}) {
   return {
-    assembleSignals: async () => ({
-      brand_signal: { name: 'Acme' },
-      product_signal: { name: 'Rain Shell', benefits },
-    }),
+    assembleSignals: async () => {
+      if (onAssemble) onAssemble();
+      return {
+        brand_signal: { name: 'Acme', tagline: 'Stay out longer', tone: ['rugged', 'calm'] },
+        product_signal: {
+          name: 'Rain Shell',
+          benefits,
+          description: extraSignals.description || 'A packable shell for wet weather.',
+          specs: extraSignals.specs || [{ label: 'Material', value: '3L nylon' }],
+        },
+        social_proof_signal: extraSignals.social_proof_signal || {
+          primary_quote: { text: 'Kept me dry on a 12-mile ridge walk.', author: null },
+          rating: { value: 4.8, count: 120 },
+        },
+      };
+    },
     chatCompletion: async () => {
       if (onChat) onChat();
       return {
@@ -285,6 +307,146 @@ async function runAsync() {
     check('F1 flag=false → no LLM, include=false',
       chats === 0 && d.include === false && d.reason === 'flag-off');
     process.env.VIDEO_BENEFITS_PLACEMENT = 'true';
+  }
+
+  // ── Item 1: rest of assembleSignals lands in the video-title prompt ──
+  {
+    const occupancy = occupancyBrief({ size: '9:16', profile: 'consideration' });
+    const rich = buildDirectorMessages({
+      size: '9:16',
+      profile: 'consideration',
+      occupancy,
+      benefits: ['Keeps you dry', 'Packs flat'],
+      productSignal: {
+        name: 'Rain Shell',
+        description: 'A packable shell for wet weather.',
+        specs: [{ label: 'Material', value: '3L nylon' }],
+      },
+      brandSignal: { name: 'Acme', tagline: 'Stay out longer', tone: ['rugged'] },
+      socialProofSignal: {
+        primary_quote: { text: 'Kept me dry on a 12-mile ridge walk.', author: null },
+        rating: { value: 4.8, count: 120 },
+      },
+    });
+    const user = rich[1].content;
+    check('I1 prompt contains PRODUCT DESCRIPTION when present',
+      user.includes('PRODUCT DESCRIPTION:') && user.includes('A packable shell for wet weather.'));
+    check('I1b prompt contains PRODUCT SPECS when present',
+      user.includes('PRODUCT SPECS:') && user.includes('3L nylon'));
+    check('I1c prompt contains printable SOCIAL PROOF quote when present',
+      user.includes('SOCIAL PROOF:') && user.includes('Kept me dry on a 12-mile ridge walk.'));
+    check('I1d prompt contains BRAND TONE + TAGLINE when present',
+      user.includes('BRAND TONE:') && user.includes('rugged')
+        && user.includes('BRAND TAGLINE:') && user.includes('Stay out longer'));
+    check('I1e occupancy / slots / keep-out still present',
+      user.includes('SLOTS ALREADY IN TARGET PHASE:')
+        && user.includes('SURFACE KEEP-OUT KEY:'));
+    check('I1f printable quote has no invented byline',
+      !user.includes('vertexaisearch') && !user.includes('Verified buyer'));
+
+    const thin = buildDirectorMessages({
+      size: '9:16',
+      profile: 'consideration',
+      occupancy,
+      benefits: ['Keeps you dry'],
+      productSignal: { name: 'Rain Shell' },
+      brandSignal: { name: 'Acme' },
+    });
+    const thinUser = thin[1].content;
+    check('I1g absent fields omit their lines (not empty keys)',
+      !thinUser.includes('PRODUCT DESCRIPTION:')
+        && !thinUser.includes('PRODUCT SPECS:')
+        && !thinUser.includes('SOCIAL PROOF:')
+        && !thinUser.includes('BRAND TONE:')
+        && !thinUser.includes('BRAND TAGLINE:'));
+  }
+
+  // ── Item 9: assembleSignals once per product ──
+  resetVideoTitleDirectionMemo();
+  let assembles = 0;
+  await driveKit(['p1'], stubDeps({ onAssemble: () => { assembles += 1; } }));
+  check('N1 21 ads × 1 product ⇒ 1 assembleSignals (not 6)',
+    assembles === 1,
+    `got ${assembles}`);
+
+  resetVideoTitleDirectionMemo();
+  assembles = 0;
+  const once = makeAssembleSignalsOnce(async () => {
+    assembles += 1;
+    return {
+      brand_signal: { name: 'Acme' },
+      product_signal: { name: 'Rain Shell', benefits: ['Keeps you dry'] },
+      social_proof_signal: null,
+    };
+  });
+  await driveKit(['p1'], {
+    assembleSignals: once,
+    chatCompletion: stubDeps().chatCompletion,
+  });
+  await once({ brandId: '000000000000000000000001', productId: 'p1', campaignKind: 'product' });
+  check('N2 static + video-title still 1 assembleSignals per product',
+    assembles === 1,
+    `got ${assembles}`);
+
+  resetVideoTitleDirectionMemo();
+  assembles = 0;
+  await driveKit(['p1', 'p2'], stubDeps({ onAssemble: () => { assembles += 1; } }));
+  check('N3 2 products ⇒ 2 assembleSignals (one each)',
+    assembles === 2,
+    `got ${assembles}`);
+
+  // ── wiring + mutation proofs ──
+  const vbdSrc = fs.readFileSync(path.join(ROOT, 'services/videoBenefitsDirector.js'), 'utf8');
+  const genSrc = fs.readFileSync(path.join(ROOT, 'services/campaignAdsGenerationService.js'), 'utf8');
+  check('N4 expandDeterministicVideo passes deps.assembleSignals',
+    /assembleSignalsDep \? \{ assembleSignals: assembleSignalsDep \}/.test(genSrc));
+  check('N5 expandWizardJob creates makeAssembleSignalsOnce and shares it',
+    /makeAssembleSignalsOnce\(assembleSignals\)/.test(genSrc)
+      && /assembleSignals: assembleSignalsOnce/.test(genSrc));
+  check('N6 runVideoTitleDirector memoizes assembleSignals per product',
+    /signalsMemo\.set\(sKey, signalsP\)/.test(vbdSrc));
+  check('I1s source emits PRODUCT DESCRIPTION / SPECS / SOCIAL PROOF lines',
+    /PRODUCT DESCRIPTION:/.test(vbdSrc)
+      && /PRODUCT SPECS:/.test(vbdSrc)
+      && /SOCIAL PROOF:/.test(vbdSrc));
+
+  function withTempMutation(filePath, find, replace, runCheck) {
+    const original = fs.readFileSync(filePath, 'utf8');
+    assert.ok(original.includes(find), `mutate target not found: ${find.slice(0, 80)}`);
+    const mutated = original.replace(find, replace);
+    const tmp = path.join(os.tmpdir(), `verifyVBD-${process.pid}-${Date.now()}.js`);
+    fs.writeFileSync(tmp, mutated);
+    try { runCheck(fs.readFileSync(tmp, 'utf8')); }
+    finally { try { fs.unlinkSync(tmp); } catch (_) { /* tmp */ } }
+    assert.strictEqual(fs.readFileSync(filePath, 'utf8'), original, 'real file was modified');
+  }
+
+  {
+    let failedAsExpected = false;
+    withTempMutation(
+      path.join(ROOT, 'services/videoBenefitsDirector.js'),
+      'PRODUCT DESCRIPTION:',
+      'PRODUCT_DESC_REMOVED:',
+      (mutSrc) => {
+        failedAsExpected = !/PRODUCT DESCRIPTION:/.test(mutSrc)
+          && /PRODUCT SPECS:/.test(mutSrc);
+      }
+    );
+    check('RP-I1 [REVERT-PROOF] dropping PRODUCT DESCRIPTION fails I1s',
+      failedAsExpected);
+  }
+  {
+    let failedAsExpected = false;
+    withTempMutation(
+      path.join(ROOT, 'services/videoBenefitsDirector.js'),
+      'signalsMemo.set(sKey, signalsP);',
+      '/* signals-memo-set-removed */',
+      (mutSrc) => {
+        failedAsExpected = !/signalsMemo\.set\(sKey, signalsP\)/.test(mutSrc);
+      }
+    );
+    check('RP-N6 [REVERT-PROOF] dropping product signals memo fails N6',
+      failedAsExpected);
   }
 }
 

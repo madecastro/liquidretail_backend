@@ -1547,6 +1547,12 @@ async function expandWizardJob({
   if (!dryRun && (deterministicVideo || conceptImage || conceptVideo)) {
     let detResult = null;
     let conceptResult = null;
+    // One assembleSignals per product across static Director + video-title
+    // Director. Video mint runs first and fills the memo; the static round
+    // reuses it via deps.assembleSignals. Brand-mode (no productId) is not
+    // cached — see makeAssembleSignalsOnce.
+    const { makeAssembleSignalsOnce, assembleSignals } = require('./aiCreativeDirectorService');
+    const assembleSignalsOnce = makeAssembleSignalsOnce(assembleSignals);
 
     if (deterministicVideo) {
       // MONEY — billable Omni submit decisions live here:
@@ -1599,7 +1605,8 @@ async function expandWizardJob({
           excludePairings,
           generationRunId,
           deriveFromMaster: item.deriveFromMaster,
-          funnelStage: item.funnelStage
+          funnelStage: item.funnelStage,
+          assembleSignals: assembleSignalsOnce
         }));
       }
       detResult = detParts.reduce(
@@ -1640,7 +1647,8 @@ async function expandWizardJob({
         videoDurationSec,
         videoPromptGuidance, videoPromptRaw,
         generationRunId,
-        preferUgcMediaId
+        preferUgcMediaId,
+        assembleSignals: assembleSignalsOnce
       });
     }
 
@@ -3328,7 +3336,10 @@ async function expandDeterministicVideo({
   // Mint-ownership only — NOT mixed into the video identity digest (that
   // omission is load-bearing; see computeDeterministicVideoDigest). Needed
   // so leftover video rows can be archived after this run goes terminal.
-  generationRunId = null
+  generationRunId = null,
+  // Generate-scoped assembleSignals memo (item 9). Shared with the static
+  // Director round so a mixed generate loads signals once per product.
+  assembleSignals: assembleSignalsDep = null
 }) {
   if (!productIds || !productIds.length) {
     return {
@@ -3756,7 +3767,7 @@ async function expandDeterministicVideo({
           campaignKind,
           platformFormat,
           funnelStage: normalizedFunnelStage,
-        });
+        }, assembleSignalsDep ? { assembleSignals: assembleSignalsDep } : {});
       }
     } catch (err) {
       payload.videoTitleDirection = {
@@ -3887,7 +3898,9 @@ async function runConceptDrivenExpansion({
   // so it must be bound here even when no caller supplies it. Default null is
   // byte-identical to the pre-Phase-3 call — buildSeededUniverse coerces it and
   // gates it behind isUgcFirstSeedingEnabled().
-  preferUgcMediaId = null
+  preferUgcMediaId = null,
+  // Generate-scoped assembleSignals memo shared with video-title mint.
+  assembleSignals: assembleSignalsDep = null
 }) {
   const { resolveKinds, renderRouteForKind } = require('./platformFormats');
   const resolvedKinds = (Array.isArray(kinds) && kinds.length)
@@ -4001,7 +4014,8 @@ async function runConceptDrivenExpansion({
       const { artifact, concepts, roundIndex, warnings: dirWarnings, contractWarnings: directorContractWarnings } =
         await director.directConceptsRound({
           brandId, productId, platformFormat, campaignKind, campaignId,
-          creativeIntent, seededUniverse: filtered, seedUniverseHash
+          creativeIntent, seededUniverse: filtered, seedUniverseHash,
+          assembleSignals: assembleSignalsDep || undefined
         });
       if (!concepts.length) {
         console.warn(`📦 conceptDriven[${productTag}]: Director returned no concepts — skipping`);
