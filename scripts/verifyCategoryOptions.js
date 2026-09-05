@@ -321,14 +321,31 @@ function buildFanaticsCorpus() {
       /discoverOnly[\s\S]{0,200}CATEGORY_OPTIONS_ENABLED/.test(resolverSrc)
   );
 
-  const defaults = fs.readFileSync(
+  const defaultsRaw = fs.readFileSync(
     path.join(__dirname, '..', 'config', 'defaults.env'),
     'utf8'
   );
-  check('G4 defaults.env sets CATEGORY_OPTIONS=true', /GENERIC_CATALOG_CATEGORY_OPTIONS=true/.test(defaults));
-  check('G5 defaults.env sets PROMPT_MIN=500', /GENERIC_CATALOG_CATEGORY_PROMPT_MIN=500/.test(defaults));
-  check('G6 defaults.env sets MIN_COUNT=25', /GENERIC_CATALOG_CATEGORY_MIN_COUNT=25/.test(defaults));
-  check('G7 defaults.env sets MAX_OPTIONS=40', /GENERIC_CATALOG_CATEGORY_MAX_OPTIONS=40/.test(defaults));
+  // Strip `#` comments (full-line leftover AND trailing on the assignment)
+  // then line-anchor. An unanchored `=true` is satisfied by a leftover
+  // comment, and `=500` is a prefix of `=5000`. Same shape as
+  // verifyRegeneration.js R6a / verifyNoStrandedQueued.js F13, plus the
+  // comment-strip these four keys need because they carry inline `# …`.
+  const defaults = defaultsRaw
+    .replace(/^[ \t]*#.*$/gm, '')
+    .replace(/[ \t]+#.*$/gm, '')
+    .replace(/[ \t]+$/gm, '');
+  check('G4 defaults.env sets CATEGORY_OPTIONS=true',
+    /^GENERIC_CATALOG_CATEGORY_OPTIONS=true$/m.test(defaults)
+      && !/^GENERIC_CATALOG_CATEGORY_OPTIONS=false$/m.test(defaults));
+  const promptMin = defaults.match(/^GENERIC_CATALOG_CATEGORY_PROMPT_MIN=(\d+)$/m);
+  check('G5 defaults.env sets PROMPT_MIN=500',
+    !!promptMin && Number(promptMin[1]) === 500);
+  const minCount = defaults.match(/^GENERIC_CATALOG_CATEGORY_MIN_COUNT=(\d+)$/m);
+  check('G6 defaults.env sets MIN_COUNT=25',
+    !!minCount && Number(minCount[1]) === 25);
+  const maxOpts = defaults.match(/^GENERIC_CATALOG_CATEGORY_MAX_OPTIONS=(\d+)$/m);
+  check('G7 defaults.env sets MAX_OPTIONS=40',
+    !!maxOpts && Number(maxOpts[1]) === 40);
 
   // Env-example documents the four knobs
   const envEx = fs.readFileSync(path.join(__dirname, '..', '.env.example'), 'utf8');

@@ -631,8 +631,31 @@ await check('F5 Director transport failure alerts FATAL and the fallback notice 
   // Must be USED at the call site, not merely declared — the revert-proof
   // showed a bare /DIRECTOR_TRANSPORT_ALERT_KEY/ scan is satisfied by the
   // const declaration while the alert quietly uses some other key.
-  assert.ok(/notifyAsync\(\{[\s\S]{0,4000}?key:[^\n]*DIRECTOR_TRANSPORT_ALERT_KEY/.test(camp),
-    'the per-product catch must fire the alert under the shared, stable key');
+  // Brace-walk the notifyAsync argument: a `{0,4000}` window from the call
+  // to `key:` is satisfied by a second notifyAsync whose key line mentions
+  // the constant, or by a comment.
+  const campCode = camp
+    .replace(/\/\*[\s\S]*?\*\//g, '')
+    .replace(/^[ \t]*\/\/.*$/gm, '');
+  const callIdx = campCode.indexOf('alertService.notifyAsync(');
+  assert.notStrictEqual(callIdx, -1, 'the per-product catch must call alertService.notifyAsync');
+  const argOpen = campCode.indexOf('{', callIdx);
+  assert.notStrictEqual(argOpen, -1, 'notifyAsync argument object not found');
+  let depth = 0;
+  let argClose = -1;
+  for (let i = argOpen; i < campCode.length; i++) {
+    if (campCode[i] === '{') depth++;
+    else if (campCode[i] === '}') {
+      depth--;
+      if (depth === 0) { argClose = i; break; }
+    }
+  }
+  assert.notStrictEqual(argClose, -1, 'could not brace-match the notifyAsync argument');
+  const notifyArg = campCode.slice(argOpen, argClose + 1);
+  assert.ok(
+    /key:\s*isContentFailure\s*\?\s*DIRECTOR_CONTENT_ALERT_KEY\s*:\s*DIRECTOR_TRANSPORT_ALERT_KEY/.test(notifyArg),
+    'the per-product catch must fire under the content/transport ternary of the two stable keys'
+  );
   assert.ok(/const DIRECTOR_TRANSPORT_ALERT_KEY = 'director:transport-failure'/.test(camp),
     'the key value is the dedupe identity — changing it silently re-arms every suppressed alert');
   // The CONTENT class is the other half of the same zero-ads outage and must
@@ -640,16 +663,34 @@ await check('F5 Director transport failure alerts FATAL and the fallback notice 
   // away behind an unrelated transport page and hand over the wrong remedy.
   assert.ok(/const DIRECTOR_CONTENT_ALERT_KEY = 'director:content-failure'/.test(camp),
     'a content failure must have its own dedupe identity');
-  assert.ok(/notifyAsync\(\{[\s\S]{0,4000}?key:[^\n]*DIRECTOR_CONTENT_ALERT_KEY/.test(camp),
-    'the content class must actually be routed to its own key at the call site');
-  assert.ok(/CONTENT_CODES\.has\(llmFail\.code\)/.test(camp),
+  assert.ok(/CONTENT_CODES\.has\(llmFail\.code\)/.test(campCode),
     'the split must be driven by the shared CONTENT_CODES set, not a hand-copied code list');
-  assert.ok(/level:\s*'fatal'/.test(camp), 'a total static outage is fatal-channel material');
-  assert.ok(/minCount:\s*2/.test(camp), 'the owner asked for a "more than once" threshold');
-  assert.ok(/ZERO ads/.test(camp), 'the alert must state the consequence in plain words');
-  assert.ok(/video is unaffected/i.test(camp), 'the alert must say what is NOT broken');
+  assert.ok(/level:\s*'fatal'/.test(notifyArg), 'a total static outage is fatal-channel material');
+  assert.ok(/minCount:\s*2/.test(notifyArg), 'the owner asked for a "more than once" threshold');
+  assert.ok(/ZERO ads/.test(notifyArg), 'the alert must state the consequence in plain words');
+  assert.ok(/video is unaffected/i.test(notifyArg), 'the alert must say what is NOT broken');
   assert.ok(/director:fallback-served/.test(dir), 'a degraded-but-working Director must announce itself');
-  assert.ok(!/level:\s*'fatal'[\s\S]{0,400}fallback-served/.test(dir), 'the fallback notice must not use the fatal channel');
+  const dirCode = dir
+    .replace(/\/\*[\s\S]*?\*\//g, '')
+    .replace(/^[ \t]*\/\/.*$/gm, '');
+  const fallbackIdx = dirCode.indexOf('alerts.notifyAsync(');
+  assert.notStrictEqual(fallbackIdx, -1, 'the degraded-Director notice must call alerts.notifyAsync');
+  const fallbackOpen = dirCode.indexOf('{', fallbackIdx);
+  let fallbackClose = -1;
+  depth = 0;
+  for (let i = fallbackOpen; i < dirCode.length; i++) {
+    if (dirCode[i] === '{') depth++;
+    else if (dirCode[i] === '}') {
+      depth--;
+      if (depth === 0) { fallbackClose = i; break; }
+    }
+  }
+  assert.notStrictEqual(fallbackClose, -1, 'could not brace-match the fallback notifyAsync argument');
+  const fallbackArg = dirCode.slice(fallbackOpen, fallbackClose + 1);
+  assert.ok(/director:fallback-served/.test(fallbackArg),
+    'the degraded-Director notice must page under director:fallback-served');
+  assert.ok(!/level:\s*'fatal'/.test(fallbackArg),
+    'the fallback notice must not use the fatal channel');
 });
 
 await check('F6 NOTHING alerting is awaited on the render/billable path', () => {

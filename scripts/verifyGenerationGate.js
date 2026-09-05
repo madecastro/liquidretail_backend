@@ -1005,7 +1005,58 @@ check('14.9a superseded run aborts BEFORE the expansion (no spend)', (() => {
   return supIdx > 0 && expandIdx > supIdx;
 })());
 check('14.9b superseded run is marked failed, not left in preparing (would zombie-lock its products for the stale window)',
-  /if \(superseding\)[\s\S]{0,1400}status: 'failed'/.test(adsSrc));
+  (() => {
+    // Brace-walk the if (superseding) body, then the CampaignRun.updateOne
+    // operand that carries `stage: 'gate'`. A `{0,1400}` window from the
+    // if-test to any `status: 'failed'` (or a comment) used to satisfy this.
+    const code = adsSrc
+      .replace(/\/\*[\s\S]*?\*\//g, '')
+      .replace(/^[ \t]*\/\/.*$/gm, '');
+    const ifIdx = code.indexOf('if (superseding)');
+    if (ifIdx < 0) return false;
+    const ifOpen = code.indexOf('{', ifIdx);
+    if (ifOpen < 0) return false;
+    let depth = 0;
+    let ifClose = -1;
+    for (let i = ifOpen; i < code.length; i++) {
+      if (code[i] === '{') depth++;
+      else if (code[i] === '}') {
+        depth--;
+        if (depth === 0) { ifClose = i; break; }
+      }
+    }
+    if (ifClose < 0) return false;
+    const ifBody = code.slice(ifOpen, ifClose + 1);
+    const callIdx = ifBody.indexOf('CampaignRun.updateOne(');
+    if (callIdx < 0) return false;
+    const paren = ifBody.indexOf('(', callIdx);
+    const filterOpen = ifBody.indexOf('{', paren);
+    if (filterOpen < 0) return false;
+    depth = 0;
+    let filterClose = -1;
+    for (let i = filterOpen; i < ifBody.length; i++) {
+      if (ifBody[i] === '{') depth++;
+      else if (ifBody[i] === '}') {
+        depth--;
+        if (depth === 0) { filterClose = i; break; }
+      }
+    }
+    if (filterClose < 0) return false;
+    const updateOpen = ifBody.indexOf('{', filterClose + 1);
+    if (updateOpen < 0) return false;
+    depth = 0;
+    let updateClose = -1;
+    for (let i = updateOpen; i < ifBody.length; i++) {
+      if (ifBody[i] === '{') depth++;
+      else if (ifBody[i] === '}') {
+        depth--;
+        if (depth === 0) { updateClose = i; break; }
+      }
+    }
+    if (updateClose < 0) return false;
+    const update = ifBody.slice(updateOpen, updateClose + 1);
+    return /status:\s*'failed'/.test(update) && /stage:\s*'gate'/.test(update);
+  })());
 check('14.9c superseded loser deletes its row if the failed-status write itself fails',
   /could not mark superseded run failed[\s\S]{0,300}CampaignRun\.deleteOne/.test(adsSrc));
 check('14.9d superseded response uses reason raced-concurrent-run',

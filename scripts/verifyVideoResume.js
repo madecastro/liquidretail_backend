@@ -80,6 +80,48 @@ function bodyOf(src, decl) {
   return '';
 }
 
+function stripComments(src) {
+  return src
+    .replace(/\/\*[\s\S]*?\*\//g, '')
+    .replace(/^[ \t]*\/\/.*$/gm, '');
+}
+
+function braceSlice(src, openIdx) {
+  if (openIdx < 0 || src[openIdx] !== '{') return '';
+  let depth = 0;
+  for (let i = openIdx; i < src.length; i++) {
+    if (src[i] === '{') depth++;
+    else if (src[i] === '}') {
+      depth--;
+      if (depth === 0) return src.slice(openIdx, i + 1);
+    }
+  }
+  return '';
+}
+
+// Three Ad.updateOne sites share the identical `{ _id, status:'rendering' }`
+// filter. A `{0,N}` window from that filter to `status: 'failed'` is
+// satisfied by the IMAGE failure write (~74 chars), so the VIDEO failure
+// write can change and the pin stays green. Classify each write by unique
+// neighbouring fields in its $set operand and assert THAT write's status.
+function adUpdateOnes(src) {
+  const code = stripComments(src);
+  const out = [];
+  let from = 0;
+  while (true) {
+    const idx = code.indexOf('Ad.updateOne(', from);
+    if (idx < 0) break;
+    const paren = code.indexOf('(', idx);
+    const filterOpen = code.indexOf('{', paren);
+    const filter = braceSlice(code, filterOpen);
+    const updateOpen = filter ? code.indexOf('{', filterOpen + filter.length) : -1;
+    const update = braceSlice(code, updateOpen);
+    out.push({ filter, update });
+    from = idx + 1;
+  }
+  return out;
+}
+
 // ── N: the money guarantee ───────────────────────────────────────────
 // Every way this file can spend money. If any appears in a resume body, a
 // restart re-buys an asset we already own.
@@ -153,10 +195,21 @@ checkTrue('N4 resumeForAd delegates to peekPrediction rather than its own reques
     /updatedAt: \{ \$lt: cutoff \}/.test(REC) && /RESUME_STALE_MIN/.test(REC));
   // Lease-free: safety comes from the status filter on every write, so two
   // instances booting together cannot conflict.
+  const recWrites = adUpdateOnes(REC).filter((w) =>
+    /status:\s*'rendering'/.test(w.filter)
+  );
+  const recoveredMaster = recWrites.find((w) => /veoVideoUrl/.test(w.update));
+  const videoFailure = recWrites.find((w) =>
+    /renderError\.charged/.test(w.update) && /veoPredictionId/.test(w.update)
+  );
   checkTrue('O3 the recovered-master write is status-filtered (idempotent, no lease needed)',
-    /\{ _id: ad\._id, status: 'rendering' \}[\s\S]{0,200}status: 'draft'/.test(REC));
+    !!recoveredMaster
+      && /status:\s*'rendering'/.test(recoveredMaster.filter)
+      && /status:\s*'draft'/.test(recoveredMaster.update));
   checkTrue('O4 the failure write is status-filtered too',
-    /\{ _id: ad\._id, status: 'rendering' \}[\s\S]{0,240}status: 'failed'/.test(REC));
+    !!videoFailure
+      && /status:\s*'rendering'/.test(videoFailure.filter)
+      && /status:\s*'failed'/.test(videoFailure.update));
   // O5 REWRITTEN AGAIN 2026-08-19 — the previous version of this check itself
   // pinned a bug, and its own comment said why it would one day need to.
   //

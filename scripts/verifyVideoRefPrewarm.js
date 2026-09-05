@@ -105,18 +105,47 @@ check('POST /video-ref-prewarm is registered in routes/ads.js',
 check('POST /video-ref-prewarm sits ABOVE the first /:id handler',
   prewarmIdx > 0 && firstIdIdx > 0 && prewarmIdx < firstIdIdx,
   `prewarm@${prewarmIdx} firstId@${firstIdIdx}`);
+
+function stripComments(src) {
+  return src
+    .replace(/\/\*[\s\S]*?\*\//g, '')
+    .replace(/^[ \t]*\/\/.*$/gm, '');
+}
+
+function braceBlockFrom(src, anchorLiteral) {
+  const anchorIdx = src.indexOf(anchorLiteral);
+  if (anchorIdx < 0) return '';
+  const open = src.indexOf('{', anchorIdx);
+  if (open < 0) return '';
+  let depth = 0;
+  for (let i = open; i < src.length; i++) {
+    if (src[i] === '{') depth++;
+    else if (src[i] === '}') {
+      depth--;
+      if (depth === 0) return src.slice(open, i + 1);
+    }
+  }
+  return '';
+}
+
+// Slice the POST handler itself. A `{0,3000}` window from the first
+// `video-ref-prewarm` (the comment above the route) to `status(202)` was
+// 2209/3000 chars — comment growth CI-reds a still-correct handler, and a
+// 202 belonging to a different handler inside 3000 chars would silently miss.
+const adsCode = stripComments(adsSrc);
+const prewarmHandler = braceBlockFrom(adsCode, "router.post('/video-ref-prewarm'");
 check('route responds 202 on accept',
-  /video-ref-prewarm[\s\S]{0,3000}status\(202\)/.test(adsSrc));
+  /res\.status\(202\)/.test(prewarmHandler));
 check('route fire-and-forget has .catch (no unhandled rejection)',
-  /prewarmVideoRefsForProducts\(\{[\s\S]{0,200}\}\)\s*\n?\s*\.catch\(/.test(adsSrc));
+  /prewarmVideoRefsForProducts\(\{[\s\S]*\}\)\s*\n?\s*\.catch\(/.test(prewarmHandler));
 check('route asserts brand tenancy',
-  /video-ref-prewarm[\s\S]{0,2000}assertBrandInTenant\(brandId, req\)/.test(adsSrc));
+  /assertBrandInTenant\(brandId, req\)/.test(prewarmHandler));
 
 // ── 4. Cap of 12 ────────────────────────────────────────────────────
 check('PREWARM_MAX_PRODUCTS = 12 in service',
   /PREWARM_MAX_PRODUCTS\s*=\s*12\b/.test(svcSrc));
 check('route enforces PREWARM_MAX_PRODUCTS',
-  /video-ref-prewarm[\s\S]{0,3000}PREWARM_MAX_PRODUCTS/.test(adsSrc));
+  /PREWARM_MAX_PRODUCTS/.test(prewarmHandler));
 
 // ── 5. Kill-switch VIDEO_REF_PREWARM_ENABLED ────────────────────────
 check('VIDEO_REF_PREWARM_ENABLED read present in route',
