@@ -38,6 +38,7 @@ Deterministic, cheap product ingest: discover product URLs from sitemaps, fetch 
 - Sales-demo / catalog sync path that selects the **generic-sitemap** method (via `services/apifyIngestService.js` orchestration; kill-switch `GENERIC_CATALOG_ENABLED`).
 - Resolve: `services/genericCatalogResolver.js` → `resolveGenericCatalog`.
 - Persist: `services/genericCatalogIngestService.js` → `syncBrandGenericCatalog`.
+- **Scheduled re-sync (2026-09-04, `feat/ingest-freshness`):** `scheduledSyncService.runDueCatalogResyncs` also ticks Shopify-direct / generic-sitemap / Apify catalogs (not only IG). Flag `CATALOG_SCHEDULED_RESYNC_ENABLED` (file default `true`, parser `=== 'true'`); interval `CATALOG_RESYNC_INTERVAL_H=24`; one brand per tick, spaced by `CATALOG_RESYNC_SPACING_MS=180000`. Reuses the live entry points (`syncBrandShopifyDirect` / `syncBrandGenericCatalog` / `syncBrandApify({ skipInstagram: true })`) so enrichment hooks match a manual sync. Flag-off = today's IG-only scheduler. Deploy-killed runs are not resumed — the next tick re-evaluates due-ness. `CATALOG_INGEST_LIMIT` still applies at persist. Pinned by `scripts/verifyScheduledCatalogResync.js`.
 
 ### Stages
 
@@ -51,7 +52,7 @@ Deterministic, cheap product ingest: discover product URLs from sitemaps, fetch 
    - Primary: JSON-LD Product → `mapJsonLdProduct` (`genericCatalogResolver.js`)
    - Fallback: Open Graph → `mapOgProduct`
    - **Entity decode** — every human-readable field goes through `utils/htmlEntities.js` `cleanScrapedText`. A `<script type="application/ld+json">` is a raw-text element, so the HTML parser never decodes character references inside it: sites that escape their JSON-LD ship `Austen Black 74&quot; TV Stand` and `Table &#x2B; Buffet Lamps` straight through `JSON.parse`. Same for `<meta content="…">` values, which are entity-encoded by definition. Decoding is a **single pass**, so a double-escaped `&amp;quot;` becomes the literal `&quot;` rather than a bare quote. Descriptions additionally get tag-stripped on both sides of the decode (`stripHtml`) because escaped markup (`&lt;div&gt;…`) is only strippable once decoded. Rows synced before this landed are repaired by `scripts/backfillHtmlEntities.js`.
-6. **Validate** → **sku-dedup** → **CatalogProduct upsert**.
+6. **Validate** → **sku-dedup** → **CatalogProduct upsert**. `imageUrl` is omit-if-empty (`catalogImageUrlGuard`): a merchant filling a previously-null hero heals; a feed transiently returning null does **not** clobber a stored URL. On a NORMALISED title/description change, `markBenefitsStaleIfTextChanged` clears `shortBenefitsDerivedAt` (keeps the old `shortBenefits` list until the new derive lands) and re-enqueues through the existing cap (~$0.002/changed SKU). Price/image/URL-only changes do not re-derive. Pinned by `scripts/verifyProductBenefits.js` F-group.
 7. **In-scan breadcrumb (NEW)** — reuses `services/breadcrumbParser.js` `extractBreadcrumb` → persisted as `inferredBreadcrumb` + `inferredCategoryAt` + Category tree via `Category.findOrCreateCategoryTree`, so post-sync category inference **skips** these products (no second crawl). See [§2](#2-post-sync-trio).
 
 **On-page fields captured:** title, description, price/currency/availability, primary + additional images, brand, gtin/mpn/sku, category, aggregate rating, review quotes, **and category breadcrumb**.
@@ -74,6 +75,9 @@ Deterministic, cheap product ingest: discover product URLs from sitemaps, fetch 
 | `GENERIC_CATALOG_PDP_CONCURRENCY` | `5` | Parallel PDP fetches (when no crawl-delay) |
 | `HTTP_SCRAPE_MIN_GAP_MS` | `250` | Per-host minimum gap between requests |
 | `HTTP_SCRAPE_DOMAIN_CONCURRENCY` | `3` | Concurrent in-flight per domain (`httpScrapeClient`) |
+| `CATALOG_SCHEDULED_RESYNC_ENABLED` | `true` | Parser `=== 'true'`. Flag-off = IG-only scheduler |
+| `CATALOG_RESYNC_INTERVAL_H` | `24` | Hours between Shopify/generic/Apify re-syncs |
+| `CATALOG_RESYNC_SPACING_MS` | `180000` | Min gap between brands (one brand per tick) |
 
 See `config/defaults.env` and `services/genericCatalogResolver.js` / `httpScrapeClient.js`.
 
@@ -1682,7 +1686,7 @@ Deeper instrumentation notes: `docs/PROGRESS.md`.
 
 ### Scheduler
 
-- `services/scheduledSyncService.js` — **60s** `setInterval`, per-brand catalog/posts cadence; labels spawned syncs `(scheduled)`; kind `scheduled-sync`.
+- `services/scheduledSyncService.js` — **60s** `setInterval`, per-brand catalog/posts cadence; labels spawned syncs `(scheduled)`; kind `scheduled-sync`. When `CATALOG_SCHEDULED_RESYNC_ENABLED=true`, also due-checks Shopify-direct / generic-sitemap / Apify catalogs (`Brand.lastCatalogResyncAt`, serial, spaced). Flag-off leaves the IG/posts/campaigns loops unchanged.
 
 ---
 

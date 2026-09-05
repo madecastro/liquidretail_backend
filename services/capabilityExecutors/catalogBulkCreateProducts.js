@@ -152,34 +152,43 @@ async function run({ req, args }) {
       }
     }
 
+    const benefits = require('../productBenefitsService');
+    const prevDoc = await benefits.loadPrevForBenefits(brand._id, externalId);
+    const { changed: benefitsStale } = benefits.markBenefitsStaleIfTextChanged(
+      prevDoc,
+      { title: row.title, description: row.description }
+    );
+
     let result;
     try {
+      const upsertUpdate = {
+        $set: {
+          title:       row.title,
+          description: row.description,
+          category:    row.category,
+          brand:       brand.name || null,
+          price:       row.price,
+          currency:    row.currency,
+          availability: row.price != null ? 'in stock' : null,
+          imageUrl:    mirroredImageUrl,
+          productUrl:  row.productUrl,
+          gtin:        row.gtin,
+          mpn:         row.mpn,
+          draft,
+          lastSyncedAt: new Date()
+        },
+        $setOnInsert: {
+          advertiserId: req.advertiserId,
+          brandId:      brand._id,
+          source:       'manual-upload',
+          externalId,
+          firstSeenAt:  new Date()
+        }
+      };
+      benefits.applyBenefitsStaleToUpdate(upsertUpdate, benefitsStale);
       result = await CatalogProduct.findOneAndUpdate(
         { brandId: brand._id, externalId },
-        {
-          $set: {
-            title:       row.title,
-            description: row.description,
-            category:    row.category,
-            brand:       brand.name || null,
-            price:       row.price,
-            currency:    row.currency,
-            availability: row.price != null ? 'in stock' : null,
-            imageUrl:    mirroredImageUrl,
-            productUrl:  row.productUrl,
-            gtin:        row.gtin,
-            mpn:         row.mpn,
-            draft,
-            lastSyncedAt: new Date()
-          },
-          $setOnInsert: {
-            advertiserId: req.advertiserId,
-            brandId:      brand._id,
-            source:       'manual-upload',
-            externalId,
-            firstSeenAt:  new Date()
-          }
-        },
+        upsertUpdate,
         { upsert: true, new: true, rawResult: true }
       );
     } catch (err) {
@@ -192,6 +201,7 @@ async function run({ req, args }) {
     succeeded++;
     if (isNew) created++; else updated++;
     if (isNew && product) pendingBenefits.push(product);
+    else if (benefitsStale && product) pendingBenefits.push(benefits.redriveView(product));
 
     // Category stamp — applyFeedTruthStamp handles insert / noop /
     // rename uniformly. Never fatal.

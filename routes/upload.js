@@ -124,30 +124,39 @@ router.post('/product', upload.single('image'), async (req, res) => {
     // drafts UI later (Upload-5).
     const draft = !(price != null && productUrl);
 
+    const benefits = require('../services/productBenefitsService');
+    const prevDoc = await benefits.loadPrevForBenefits(brandId, externalId);
+    const { changed: benefitsStale } = benefits.markBenefitsStaleIfTextChanged(
+      prevDoc,
+      { title, description }
+    );
+
     let result;
     try {
+      const upsertUpdate = {
+        $set: {
+          title, description, category,
+          brand:        brand.name || null,
+          price, currency,
+          availability: price != null ? 'in stock' : null,
+          imageUrl:     uploaded.secure_url,
+          productUrl,
+          gtin, mpn,
+          draft,
+          lastSyncedAt: new Date()
+        },
+        $setOnInsert: {
+          advertiserId: req.advertiserId,
+          brandId,
+          source:       'manual-upload',
+          externalId,
+          firstSeenAt:  new Date()
+        }
+      };
+      benefits.applyBenefitsStaleToUpdate(upsertUpdate, benefitsStale);
       result = await CatalogProduct.findOneAndUpdate(
         { brandId, externalId },
-        {
-          $set: {
-            title, description, category,
-            brand:        brand.name || null,
-            price, currency,
-            availability: price != null ? 'in stock' : null,
-            imageUrl:     uploaded.secure_url,
-            productUrl,
-            gtin, mpn,
-            draft,
-            lastSyncedAt: new Date()
-          },
-          $setOnInsert: {
-            advertiserId: req.advertiserId,
-            brandId,
-            source:       'manual-upload',
-            externalId,
-            firstSeenAt:  new Date()
-          }
-        },
+        upsertUpdate,
         { upsert: true, new: true, rawResult: true }
       );
     } catch (err) {
@@ -157,7 +166,9 @@ router.post('/product', upload.single('image'), async (req, res) => {
     const product = result.value;
     const isNew   = !result.lastErrorObject?.updatedExisting;
     if (isNew && product) {
-      require('../services/productBenefitsService').scheduleForProduct({ product, brand });
+      benefits.scheduleForProduct({ product, brand });
+    } else if (benefitsStale && product) {
+      benefits.scheduleForProduct({ product: benefits.redriveView(product), brand });
     }
     console.log(`📦 manual product ${isNew ? 'created' : 'updated'}: brand=${brand.name} title="${title}" draft=${draft}`);
 

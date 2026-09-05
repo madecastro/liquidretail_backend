@@ -485,45 +485,57 @@ async function syncBrandShopifyDirect(brand, run, { isBrandAborted } = {}) {
         continue;
       }
       const externalId = flat.externalId;
+      const nextTitle = flat.title || '(untitled)';
+      const nextDescription = flat.description;
+      const benefits = require('./productBenefitsService');
+      const prevDoc = await benefits.loadPrevForBenefits(brand._id, externalId);
+      const { changed: benefitsStale } = benefits.markBenefitsStaleIfTextChanged(
+        prevDoc,
+        { title: nextTitle, description: nextDescription }
+      );
 
       // Upsert only — no await on classify (image network work).
+      const set = {
+        advertiserId:     brand.advertiserId,
+        brandId:          brand._id,
+        source:           'shopify-direct',
+        externalId,
+        itemGroupId:      externalId,
+        // Decoded for the same reason as the generic path: the headless
+        // fallback feeds this shape from JSON-LD, and merchants
+        // sometimes type entities straight into a Shopify title.
+        title:            nextTitle,
+        description:      nextDescription,
+        brand:            flat.brand || brand.name || null,
+        price:            flat.price,
+        // flat.currency is always null on this path (products.json /
+        // .js expose no currency field — see file header). Once we've
+        // independently verified the store via /meta.json above, store
+        // the TRUE currency rather than leaving it null/defaulted.
+        currency:         currencyCheck.verified ? currencyCheck.currency : flat.currency,
+        availability:     flat.availability,
+        additionalImages: flat.additionalImages,
+        productUrl:       flat.productUrl,
+        gtin:             flat.gtin,
+        mpn:              flat.mpn,
+        category:         flat.category,
+        rawData:          flat.rawData || p,
+        lastSyncedAt:     new Date()
+      };
+      // null → url heals; url → null must not clobber. See catalogImageUrlGuard.
+      require('./catalogImageUrlGuard').assignImageUrl(set, flat.imageUrl);
+      const upsertUpdate = {
+        $set: set,
+        $setOnInsert: { firstSeenAt: new Date() }
+      };
+      benefits.applyBenefitsStaleToUpdate(upsertUpdate, benefitsStale);
       const upsertResult = await CatalogProduct.findOneAndUpdate(
         { brandId: brand._id, externalId },
-        {
-          $set: {
-            advertiserId:     brand.advertiserId,
-            brandId:          brand._id,
-            source:           'shopify-direct',
-            externalId,
-            itemGroupId:      externalId,
-            // Decoded for the same reason as the generic path: the headless
-            // fallback feeds this shape from JSON-LD, and merchants
-            // sometimes type entities straight into a Shopify title.
-            title:            flat.title || '(untitled)',
-            description:      flat.description,
-            brand:            flat.brand || brand.name || null,
-            price:            flat.price,
-            // flat.currency is always null on this path (products.json /
-            // .js expose no currency field — see file header). Once we've
-            // independently verified the store via /meta.json above, store
-            // the TRUE currency rather than leaving it null/defaulted.
-            currency:         currencyCheck.verified ? currencyCheck.currency : flat.currency,
-            availability:     flat.availability,
-            imageUrl:         flat.imageUrl,
-            additionalImages: flat.additionalImages,
-            productUrl:       flat.productUrl,
-            gtin:             flat.gtin,
-            mpn:              flat.mpn,
-            category:         flat.category,
-            rawData:          flat.rawData || p,
-            lastSyncedAt:     new Date()
-          },
-          $setOnInsert: { firstSeenAt: new Date() }
-        },
+        upsertUpdate,
         { upsert: true, new: true, rawResult: true }
       );
       const doc = upsertResult?.value || upsertResult;
-      require('./productBenefitsService').collectIfNew(upsertResult, pendingBenefits);
+      benefits.collectAfterCatalogUpsert(upsertResult, pendingBenefits, { changed: benefitsStale });
       productsUpserted += 1;
       persistedCount += 1;
 

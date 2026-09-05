@@ -96,30 +96,39 @@ async function run({ req, args }) {
 
   const draft = !(price != null && productUrl);
 
+  const benefits = require('../productBenefitsService');
+  const prevDoc = await benefits.loadPrevForBenefits(brand._id, externalId);
+  const { changed: benefitsStale } = benefits.markBenefitsStaleIfTextChanged(
+    prevDoc,
+    { title, description }
+  );
+
   let result;
   try {
+    const upsertUpdate = {
+      $set: {
+        title, description, category,
+        brand:        brand.name || null,
+        price, currency,
+        availability: price != null ? 'in stock' : null,
+        imageUrl:     uploaded.secure_url,
+        productUrl,
+        gtin, mpn,
+        draft,
+        lastSyncedAt: new Date()
+      },
+      $setOnInsert: {
+        advertiserId: req.advertiserId,
+        brandId:      brand._id,
+        source:       'manual-upload',
+        externalId,
+        firstSeenAt:  new Date()
+      }
+    };
+    benefits.applyBenefitsStaleToUpdate(upsertUpdate, benefitsStale);
     result = await CatalogProduct.findOneAndUpdate(
       { brandId: brand._id, externalId },
-      {
-        $set: {
-          title, description, category,
-          brand:        brand.name || null,
-          price, currency,
-          availability: price != null ? 'in stock' : null,
-          imageUrl:     uploaded.secure_url,
-          productUrl,
-          gtin, mpn,
-          draft,
-          lastSyncedAt: new Date()
-        },
-        $setOnInsert: {
-          advertiserId: req.advertiserId,
-          brandId:      brand._id,
-          source:       'manual-upload',
-          externalId,
-          firstSeenAt:  new Date()
-        }
-      },
+      upsertUpdate,
       { upsert: true, new: true, rawResult: true }
     );
   } catch (err) {
@@ -129,7 +138,9 @@ async function run({ req, args }) {
   const product = result.value;
   const isNew = !result.lastErrorObject?.updatedExisting;
   if (isNew && product) {
-    require('../productBenefitsService').scheduleForProduct({ product, brand });
+    benefits.scheduleForProduct({ product, brand });
+  } else if (benefitsStale && product) {
+    benefits.scheduleForProduct({ product: benefits.redriveView(product), brand });
   }
 
   // Stamp / restamp categoryRef via applyFeedTruthStamp — same
