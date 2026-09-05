@@ -2,14 +2,16 @@
   "version": 2,
   "backendRef": "origin/main",
   "backendHead": "10ab21ab310080a2b3002e7b72fce3e6bede53f1",
-  "generatedAt": "2026-09-05T02:16:15.127Z",
+  "generatedAt": "2026-09-05T03:02:53.640Z",
   "files": {
     "models/Ad.js": {
       "backendHash": "812961d1ad30f5f87891dcace58fbe44ce5e07a5789f34b927fe8208dc2db966",
       "adgenHash": "aca8e06a9d335d1ba97de600bdabc1dae8430c750f2b988d4b5b64b31cf7ccf6",
       "backendSha": "fba815887c3240d617c9c3a1bbfd6daecd791215",
       "status": "fork",
-      "reason": "PR #386: added Ad.videoTitleDirection (mint stamp, Mixed). Remaining differences are legitimate ongoing fork divergence (adgen-only titling/QC comments and fields backend does not need)."
+      "reason": "PR #386: added Ad.videoTitleDirection (mint stamp, Mixed). Remaining differences are legitimate ongoing fork divergence (adgen-only titling/QC comments and fields backend does not need).",
+      "portTo": null,
+      "owedSince": null
     },
     "models/Advertiser.js": {
       "backendHash": "0a7e1bb9ca5e0fbbfc6972f9c96d87f839b0a86175831b5446ae27095137ba3f",
@@ -97,7 +99,9 @@
       "backendHash": "53ddad6046cb0de67a74ab33bbf045b82c2a8e9371d398a3554b71ccdc475fc1",
       "adgenHash": "53ddad6046cb0de67a74ab33bbf045b82c2a8e9371d398a3554b71ccdc475fc1",
       "backendSha": "47be257c468e85c3f1d1c562abd087ea8625e98c",
-      "status": "synced"
+      "status": "synced",
+      "portTo": null,
+      "owedSince": null
     },
     "models/Category.js": {
       "backendHash": "58e0c5c2b9b4bae826ef12adf04425b52d527818b2968191633c4bf4b2218583",
@@ -200,14 +204,18 @@
       "adgenHash": "c8c2189c3810dc2950686779d18829f1962f23561fcf6df7350ee0620f8a72de",
       "backendSha": "45f5e3c05b472f319a78fdc53e19229cd2001434",
       "status": "fork",
-      "reason": "2026-09-04: backend a1d03573..45f5e3c0 (PR #382) landed classification.faceVisible (Boolean, default null) on Media schema as ingest writer work -- exactly the change the prior 2026-09-03 entry anticipated. Adgen's schema already has this field with matching semantics (null=not assessed, false=no face, true=face visible, never default false). Re-attesting as fork, no new divergence."
+      "reason": "2026-09-04: backend a1d03573..45f5e3c0 (PR #382) landed classification.faceVisible (Boolean, default null) on Media schema as ingest writer work -- exactly the change the prior 2026-09-03 entry anticipated. Adgen's schema already has this field with matching semantics (null=not assessed, false=no face, true=face visible, never default false). Re-attesting as fork, no new divergence.",
+      "portTo": null,
+      "owedSince": null
     },
     "models/OperationRun.js": {
       "backendHash": "031c4cdaf2f4b903381a3a138673b474221bec4ee797ab9fe6a0220e64eb06f0",
       "adgenHash": "cf5078a88a5e6eba12dba7b5a0a31a64a3e4a512f6b1430a87754f73ca4a8352",
       "backendSha": "f9efb439b58f2bc5e8936868a1dd4308d58e84f5",
       "status": "fork",
-      "reason": "deliberate fork: backend's stages[]/slackFeed additions (commit f9efb439, PR #364, 2026-08-31) feed services/ingestStatusFeedService.js, a Slack projector gated on ingest-only kinds (demo-sync/catalog-sync/social-ingest/enrichment). adgen's OperationRun rows use kind:'ad-regenerate'/'video' (adRegenerateService.js) and kind:'detect' (catalogProductDetectService.js) only -- it never creates ingest-kind runs and does not own catalog ingest (CLAUDE.md). Porting stages[]/slackFeed alone would be dead schema without also vendoring progressService.js's stage-closing rewrites and ingestStatusFeedService.js itself, which adgen has no use for. Permanent domain-boundary divergence."
+      "reason": "deliberate fork: backend's stages[]/slackFeed additions (commit f9efb439, PR #364, 2026-08-31) feed services/ingestStatusFeedService.js, a Slack projector gated on ingest-only kinds (demo-sync/catalog-sync/social-ingest/enrichment). adgen's OperationRun rows use kind:'ad-regenerate'/'video' (adRegenerateService.js) and kind:'detect' (catalogProductDetectService.js) only -- it never creates ingest-kind runs and does not own catalog ingest (CLAUDE.md). Porting stages[]/slackFeed alone would be dead schema without also vendoring progressService.js's stage-closing rewrites and ingestStatusFeedService.js itself, which adgen has no use for. Permanent domain-boundary divergence.",
+      "portTo": null,
+      "owedSince": null
     },
     "models/OverlayZoneArtifact.js": {
       "backendHash": "91c942a031aacd86910287390041d8b4f3b04d9490fc2edd36c334b48cac3208",
@@ -271,7 +279,9 @@
       "adgenHash": "f709596c388158f1fb6fca019f66ad278dd6887aef1f09705eae4bda679c9de1",
       "backendSha": "47be257c468e85c3f1d1c562abd087ea8625e98c",
       "status": "fork",
-      "reason": "2026-09-04: backend 47be257c made the identical comment-citation fix on its own side (stale SPEC_FORMAT_ALIAS -> real SIZE_FORMAT_ALIAS), pointing to backend's own remotion/components/slotRenderers.jsx. Adgen's file already carries the equivalent correct citation (src/remotion/components/slotRenderers.jsx) from adgen's own prior fix. Comment-only in both repos, legitimately per-repo path difference. Re-attest as-is."
+      "reason": "2026-09-04: backend 47be257c made the identical comment-citation fix on its own side (stale SPEC_FORMAT_ALIAS -> real SIZE_FORMAT_ALIAS), pointing to backend's own remotion/components/slotRenderers.jsx. Adgen's file already carries the equivalent correct citation (src/remotion/components/slotRenderers.jsx) from adgen's own prior fix. Comment-only in both repos, legitimately per-repo path difference. Re-attest as-is.",
+      "portTo": null,
+      "owedSince": null
     },
     "remotion/components/BasePlate.jsx": {
       "backendHash": "3ffa4ecaf488c8d560d87659da8384e660120f7a41f18a34ad1b2bee03847e92",
@@ -328,7 +338,9 @@
       "adgenHash": "3f66f84618c6175de506719e4da07340528f65668126e93e91ab9ea3ef03316b",
       "backendSha": "616d4c28c562d96145ab56547455f2a281789756",
       "status": "fork",
-      "reason": "2026-09-03: comment-only fix — a citation of services/shopifyAccessResolver.js needed a backend/ prefix since that file is backend-only and adgen has no local copy. The prefix is meaningful only from adgen's side (backend's own copy references itself with no prefix), so this is legitimately adgen-local text even though the underlying file is otherwise synced."
+      "reason": "2026-09-03: comment-only fix — a citation of services/shopifyAccessResolver.js needed a backend/ prefix since that file is backend-only and adgen has no local copy. The prefix is meaningful only from adgen's side (backend's own copy references itself with no prefix), so this is legitimately adgen-local text even though the underlying file is otherwise synced.",
+      "portTo": null,
+      "owedSince": null
     },
     "remotion/lib/ratingMotion.js": {
       "backendHash": "b5229a6a763ac59fcb917c07e589586431e7a30bf872b73bdf56b2ae28116f42",
@@ -359,7 +371,9 @@
       "backendHash": "9a747dfd9cdda3cd13218f299c60d39ae63c97b782124f774ff3ea1d47cb9ce4",
       "adgenHash": "9a747dfd9cdda3cd13218f299c60d39ae63c97b782124f774ff3ea1d47cb9ce4",
       "backendSha": "47be257c468e85c3f1d1c562abd087ea8625e98c",
-      "status": "synced"
+      "status": "synced",
+      "portTo": null,
+      "owedSince": null
     },
     "remotion/lib/timing.js": {
       "backendHash": "0cabab5ca97492b2c1a5d648c54ac5fe651a1d8b64ddd89102b31e10301690c1",
@@ -680,7 +694,9 @@
       "adgenHash": "4aafee2c1d7cc90487d59d1983df38c0e6b7fb872315cc980161818486decc22",
       "backendSha": "fba815887c3240d617c9c3a1bbfd6daecd791215",
       "status": "fork",
-      "reason": "2026-09-03: deliberately did not port backend PR #386's static COPY prompt tightening (product_signal.benefits 'never invent' clause). Adgen does not mint static ads / does not run the Director round — expansion stays backend. Remaining fork is the pre-existing comment-only reserved-proof-slot annotation (PR #34 ADGEN-ONLY eligibility widening) plus that static-prompt delta."
+      "reason": "2026-09-03: deliberately did not port backend PR #386's static COPY prompt tightening (product_signal.benefits 'never invent' clause). Adgen does not mint static ads / does not run the Director round — expansion stays backend. Remaining fork is the pre-existing comment-only reserved-proof-slot annotation (PR #34 ADGEN-ONLY eligibility widening) plus that static-prompt delta.",
+      "portTo": null,
+      "owedSince": null
     },
     "services/aiCreativeV2Helpers.js": {
       "backendHash": "52130701af3ed3c383e084355cf898e48bd170e072fc3df193b9948416e2c013",
@@ -719,7 +735,9 @@
       "backendHash": "865688405806741ce0550bdd2eef36413384cf6fdc9dbc0d408374a0854f92d5",
       "adgenHash": "865688405806741ce0550bdd2eef36413384cf6fdc9dbc0d408374a0854f92d5",
       "backendSha": "45f5e3c05b472f319a78fdc53e19229cd2001434",
-      "status": "synced"
+      "status": "synced",
+      "portTo": null,
+      "owedSince": null
     },
     "services/aiVocabulary.js": {
       "backendHash": "1bb6e7268c8431326d6091df1e41d4be9f0c183c442575e9fa8f30785a9561a4",
@@ -786,7 +804,9 @@
       "adgenHash": "0dc008f35e1f1e4c3eb95c8744e7ab9293082d4e4a85ead90f49dae1be8ce48c",
       "backendSha": "90418773ab5f26a2fca3e90bbce7860c7694ab71",
       "status": "fork",
-      "reason": "Re-looked after backend 90418773 (#373): backend reverted its 2026-08-25 null-out of director's Anthropic direct twins back to the direct:{...} shape (the null had silently un-recorded the LLM_AUTH_MISSING skip). Adgen's file was never nulled and already carries this shape; adgen's atlasLlmService DIRECT_KEYS still has no anthropic entry, so this remains a named, non-billable skip in both codebases. No functional gap; standing fork reason (narrower routing extract) still holds."
+      "reason": "Re-looked after backend 90418773 (#373): backend reverted its 2026-08-25 null-out of director's Anthropic direct twins back to the direct:{...} shape (the null had silently un-recorded the LLM_AUTH_MISSING skip). Adgen's file was never nulled and already carries this shape; adgen's atlasLlmService DIRECT_KEYS still has no anthropic entry, so this remains a named, non-billable skip in both codebases. No functional gap; standing fork reason (narrower routing extract) still holds.",
+      "portTo": null,
+      "owedSince": null
     },
     "services/atlasTextService.js": {
       "backendHash": "55704dd5ac0061595e5b03840e1b972ac8509ae96d5875c88c7b32c7e954651c",
@@ -829,7 +849,9 @@
       "adgenHash": "2fe1cda386f2cbb87b359ef97ac3bbb022387f30ae22bece1b6253b5b42b0e16",
       "backendSha": "abf7e0c2053d9e2d633cc3b3a62bad48531e3271",
       "status": "fork",
-      "reason": "PR #110 (2026-09-03): Gemini completed-master recovery Cloudinary-mirrors (not the raw Files API URI), CAS-guards the download+upload on renderStage='boot-recovery-gemini-mirror', and sets unsettledAtTimeout on mirror failure so recoverableNotCollected alerts. Second fix round: folder keys off ad.veoModel (the model this ad was generated with) not the bare MODEL constant; a thrown mirror failure restores the prior renderStage+updatedAt so the next sweep can retry (the CAS updatedAt write is a one-shot clock, not a heartbeat). Backend has no Gemini-provider recovery branch (Atlas-only) -- adgen-only fork, not a port debt."
+      "reason": "PR #110 (2026-09-03): Gemini completed-master recovery Cloudinary-mirrors (not the raw Files API URI), CAS-guards the download+upload on renderStage='boot-recovery-gemini-mirror', and sets unsettledAtTimeout on mirror failure so recoverableNotCollected alerts. Second fix round: folder keys off ad.veoModel (the model this ad was generated with) not the bare MODEL constant; a thrown mirror failure restores the prior renderStage+updatedAt so the next sweep can retry (the CAS updatedAt write is a one-shot clock, not a heartbeat). Backend has no Gemini-provider recovery branch (Atlas-only) -- adgen-only fork, not a port debt.",
+      "portTo": null,
+      "owedSince": null
     },
     "services/brandCatalogService.js": {
       "backendHash": "d7b9a4558ffaeffe30d0f4708ffb0800896465e12b5ce881e2278a681a837616",
@@ -853,7 +875,9 @@
       "adgenHash": "cb2824e212503cf998463f1b715accd55af880bd31de6d567348a5092ec77dba",
       "backendSha": "c30302df9f838e9770a80297a23ac67f47b0f9db",
       "status": "fork",
-      "reason": "RE-ATTESTED 2026-09-04 (backend HEAD c30302df, was 9dd98b85): reviewed 078dc078 (#362) and c30302df (#363) in range, neither changes the substance of the prior 2026-08-24 PORTED verdict for backend #323. 078dc078 adds one cosmetic console.warn for an already-captured non-commercial mirror-failure case (no behavior/data change). c30302df is a pure extraction of the existing per-face mirror logic into an exported mirrorDiscoveredFace helper so the brand-new services/shopifyThemeFontService.js can reuse it -- website-ingest behavior is explicitly unchanged. Deliberate, still-out-of-scope fork remains: adgen lacks (a) probeVariableWeightAxis/variable-weight-axis support and (b) the new Shopify-theme-file font source entirely, both separate unported features out of scope for #323."
+      "reason": "RE-ATTESTED 2026-09-04 (backend HEAD c30302df, was 9dd98b85): reviewed 078dc078 (#362) and c30302df (#363) in range, neither changes the substance of the prior 2026-08-24 PORTED verdict for backend #323. 078dc078 adds one cosmetic console.warn for an already-captured non-commercial mirror-failure case (no behavior/data change). c30302df is a pure extraction of the existing per-face mirror logic into an exported mirrorDiscoveredFace helper so the brand-new services/shopifyThemeFontService.js can reuse it -- website-ingest behavior is explicitly unchanged. Deliberate, still-out-of-scope fork remains: adgen lacks (a) probeVariableWeightAxis/variable-weight-axis support and (b) the new Shopify-theme-file font source entirely, both separate unported features out of scope for #323.",
+      "portTo": null,
+      "owedSince": null
     },
     "services/brandFontPersistenceService.js": {
       "backendHash": "f1507c1ce6e9b6d9205b0c5b7e1a0beb79892fda54b15c73066642e7468cd913",
@@ -995,7 +1019,9 @@
       "adgenHash": "891af0dcbd31ff71427f4444f52a6c002f193c76e6f6f5cfb9e6998a8c35f345",
       "backendSha": "4b95403dad957b0dd735987ff6ca2e1ba08c832f",
       "status": "fork",
-      "reason": "Backend origin/main advanced to 4b95403d (#368). Re-diffed: this is NOT the comment-only change the prior entry described (that was a separate earlier commit) - #368 actually rewires classifyRunAdOutcome to read succeeded/failed off the new services/adPhase.js deriveAdPhase() instead of switching on raw ad.status + isVideoTitlingSettled() directly, folding backend's new 'failed-terminal'/'qc-failed-kept' phase split into the same failed++ bucket. Backend's own commit message proves this produces identical succeeded/failed/rendering/titlingIncomplete counts to the pre-adPhase code for every reachable ad shape - a pure internal refactor, no new externally observable behavior. adgen has no services/adPhase.js and no deriveAdPhase/describeAdFailure anywhere in src/ - its classifyRunAdOutcome still calls isVideoTitlingSettled directly, which is the pattern backend itself confirms is behaviorally equivalent to the new indirection. Nothing to port; re-attesting as still synced against 4b95403d. NOTE: adgen QC-failed-but-kept ads stay status:draft while backend's new model gives them status:failed+phase qc-failed-kept -- pre-existing Ad-status model difference, not introduced by this commit, out of scope here."
+      "reason": "Backend origin/main advanced to 4b95403d (#368). Re-diffed: this is NOT the comment-only change the prior entry described (that was a separate earlier commit) - #368 actually rewires classifyRunAdOutcome to read succeeded/failed off the new services/adPhase.js deriveAdPhase() instead of switching on raw ad.status + isVideoTitlingSettled() directly, folding backend's new 'failed-terminal'/'qc-failed-kept' phase split into the same failed++ bucket. Backend's own commit message proves this produces identical succeeded/failed/rendering/titlingIncomplete counts to the pre-adPhase code for every reachable ad shape - a pure internal refactor, no new externally observable behavior. adgen has no services/adPhase.js and no deriveAdPhase/describeAdFailure anywhere in src/ - its classifyRunAdOutcome still calls isVideoTitlingSettled directly, which is the pattern backend itself confirms is behaviorally equivalent to the new indirection. Nothing to port; re-attesting as still synced against 4b95403d. NOTE: adgen QC-failed-but-kept ads stay status:draft while backend's new model gives them status:failed+phase qc-failed-kept -- pre-existing Ad-status model difference, not introduced by this commit, out of scope here.",
+      "portTo": null,
+      "owedSince": null
     },
     "services/campaignRunHeartbeat.js": {
       "backendHash": "6afcd696fa4b20916b535ade7c3d3cfc87362e51f5f2f46b63a0f3d90e39c0de",
@@ -1035,7 +1061,9 @@
       "backendHash": "c515e16cd07710d3df1ec860689c892bfdcbcb1f0d37d36f70cb0a8ac2918fb0",
       "adgenHash": "c515e16cd07710d3df1ec860689c892bfdcbcb1f0d37d36f70cb0a8ac2918fb0",
       "backendSha": "df6cbdb49a7773eff721bf343f83b15e5f91233a",
-      "status": "synced"
+      "status": "synced",
+      "portTo": null,
+      "owedSince": null
     },
     "services/categoryChainService.js": {
       "backendHash": "070c8bbf09383221027431902efc20cb60a8ba3c4efe8615565c1bf46e104f09",
@@ -1074,14 +1102,18 @@
       "adgenHash": "e3ea6e93a9f0310ce31c422a8ada44e4033f126a4222507da8da1df6174f6a7e",
       "backendSha": "bb91303c91f8a0367869542014f540c35386af0b",
       "status": "fork",
-      "reason": "Backend origin/main advanced to bb91303c (catalog YOLO ingest-detection feature). Re-diffed: only change is a new backend-only SPEC entry CATALOG_YOLO_CONCURRENCY for backend's new ingest-time YOLO detection service -- no adgen analog needed, VEO_TITLING_CONCURRENCY untouched. Prior fork reason (adgen-only SPEC fallback 4->2, tuned operating value 3) still holds."
+      "reason": "Backend origin/main advanced to bb91303c (catalog YOLO ingest-detection feature). Re-diffed: only change is a new backend-only SPEC entry CATALOG_YOLO_CONCURRENCY for backend's new ingest-time YOLO detection service -- no adgen analog needed, VEO_TITLING_CONCURRENCY untouched. Prior fork reason (adgen-only SPEC fallback 4->2, tuned operating value 3) still holds.",
+      "portTo": null,
+      "owedSince": null
     },
     "services/copyDerivationService.js": {
       "backendHash": "1636ad6105c90e3439ff8afa4948ebdbbcc90bfe3854848ef3479ebf9b9f20b3",
       "adgenHash": "d7e3d8dfd47fbbd22443452c542dba8f71d800ddcf5b914d8f6848b4f8401669",
       "backendSha": "47be257c468e85c3f1d1c562abd087ea8625e98c",
       "status": "fork",
-      "reason": "Deliberate, permanent fork: adgen keeps short_benefits:[] in buildPrompt() because deriveCopy is only reached from the legacy cartesian fallback in vendored campaignAdsGenerationService.js (eager call at :2789, below the AI_CONCEPT_DRIVEN early-return at ~:2069) -- that path is still reachable and has never seen real short_benefits data. Backend's copyDerivationService.js:208 now reads the real, populated CatalogProduct.shortBenefits (ingest-time derivation, models/CatalogProduct.js:245-248, shortBenefitsDerivedAt). Porting the read would silently change copy output on a still-live fallback with no product decision behind it. Only functional diff between the two files."
+      "reason": "Deliberate, permanent fork: adgen keeps short_benefits:[] in buildPrompt() because deriveCopy is only reached from the legacy cartesian fallback in vendored campaignAdsGenerationService.js (eager call at :2789, below the AI_CONCEPT_DRIVEN early-return at ~:2069) -- that path is still reachable and has never seen real short_benefits data. Backend's copyDerivationService.js:208 now reads the real, populated CatalogProduct.shortBenefits (ingest-time derivation, models/CatalogProduct.js:245-248, shortBenefitsDerivedAt). Porting the read would silently change copy output on a still-live fallback with no product decision behind it. Only functional diff between the two files.",
+      "portTo": null,
+      "owedSince": null
     },
     "services/costTracker.js": {
       "backendHash": "c0431a1082ceaf42c9e62043f8c527372f74e8c6c01f17fc059ef828b090e2da",
@@ -1183,7 +1215,9 @@
       "adgenHash": "464942baee1c9c250686dd584454ee3bcc6237106608f15d7861d0ec8508ae03",
       "backendSha": "5d1cfc74cbc6ccd77e88f2eb70ee348d9e123700",
       "status": "unused",
-      "reason": "The versioned Ad-document handoff contract (v1.1.0, backend PR #359 + companion adgen PR). Deliberately not require()'d by any runtime src/ code -- consumers are scripts/verifyHandoffContract.js and doc comments. Byte-identical to backend's copy as of this reconciliation (confirmed via diff against backend origin/main@5d1cfc74) -- the v1.0.0->v1.1.0 bump (4 new retitle-deferral fields: retitleRequest/retitleClaimedByWorker/retitleClaimedAt/retitleResult, plus a regenerating:{$ne:true} stamp-filter guard) already landed identically in this repo."
+      "reason": "The versioned Ad-document handoff contract (v1.1.0, backend PR #359 + companion adgen PR). Deliberately not require()'d by any runtime src/ code -- consumers are scripts/verifyHandoffContract.js and doc comments. Byte-identical to backend's copy as of this reconciliation (confirmed via diff against backend origin/main@5d1cfc74) -- the v1.0.0->v1.1.0 bump (4 new retitle-deferral fields: retitleRequest/retitleClaimedByWorker/retitleClaimedAt/retitleResult, plus a regenerating:{$ne:true} stamp-filter guard) already landed identically in this repo.",
+      "portTo": null,
+      "owedSince": null
     },
     "services/httpScrapeClient.js": {
       "backendHash": "5c6a39f31715b90374ef2fc5783b66a0604783fb9585c3d44a23618f4f3f0242",
@@ -1256,12 +1290,12 @@
     },
     "services/layoutInputService.js": {
       "backendHash": "fdaebc5c5f917353b6dd8f78aa6d3d3c4bf67f29bbc025648dc41797b785dc28",
-      "adgenHash": "a49b1ddad6bb11bc41cf117fa1bf5982772ef1f1295595c2e293c3640cfb229b",
+      "adgenHash": "7fce0d0c19792d823fc1ec2e5142ad8c265cc4be1741e16f539d43dc95c1b5b3",
       "backendSha": "47be257c468e85c3f1d1c562abd087ea8625e98c",
-      "status": "unported",
-      "reason": "Backend #383 split GEMINI_MODEL's env var to LAYOUT_DERIVATION_MODEL to avoid colliding with geminiSearchProvider's GEMINI_SEARCH_MODEL (different defaults: gemini-2.5-pro vs gemini-2.5-flash). Adgen's layoutInputService.js:94 and providers/geminiSearchProvider.js:619 still share the same GEMINI_SEARCH_MODEL var with the same differing defaults -- identical unfixed collision. Four-field brandId/productId/adId/campaignRunId equivalence (adgen #43) remains verified and unaffected -- re-attested at backend SHA 47be257c.",
-      "portTo": "adgen",
-      "owedSince": "2026-09-05T00:27:30.671Z"
+      "status": "fork",
+      "reason": "Backend #383 LAYOUT_DERIVATION_MODEL split is now ported (GEMINI_MODEL reads process.env.LAYOUT_DERIVATION_MODEL || 'gemini-2.5-pro'; geminiSearchProvider.js keeps GEMINI_SEARCH_MODEL || 'gemini-2.5-flash'). Remaining divergence is adgen-owned: startStageTimer/layoutInputMs wrapping runDerivation, plus four-field brandId/productId/adId/campaignRunId as top-level buildLayoutInput args (adgen #43) equivalent to backend's options.* fields -- re-attested.",
+      "portTo": null,
+      "owedSince": null
     },
     "services/llmError.js": {
       "backendHash": "589fd87ece50784d1620ac2db054d92911c880d21d2a34be4db3f4df8aaf7f8f",
@@ -1317,7 +1351,9 @@
       "backendHash": "5605fea3914ab15d6b5783cd8d1db29b51d9ab870de098133a5d5bf5a228b9e5",
       "adgenHash": "5605fea3914ab15d6b5783cd8d1db29b51d9ab870de098133a5d5bf5a228b9e5",
       "backendSha": "fba815887c3240d617c9c3a1bbfd6daecd791215",
-      "status": "synced"
+      "status": "synced",
+      "portTo": null,
+      "owedSince": null
     },
     "services/metaCascadeResolver.js": {
       "backendHash": "5eb1c61fd3c9d19b79c832f93a31153b4597f7fedc0d4a06c800a7186573063c",
@@ -1357,7 +1393,9 @@
       "adgenHash": "804039cce95310cedb4d1585cfad98aad991e99aafe895df50ee23562c50ac30",
       "backendSha": "de379fa905ef5e7841708ba8d84b8651e7e11f39",
       "status": "fork",
-      "reason": "Backend added computeBrightnessGridFromUrl (2026-09-02) solely for its new dinoOverlayZoneService.js DINO-based ingest cost-optimization (pipelines/detect.js::runOverlayZoneAnalysis) -- catalog ingest is backend-only per adgen's CLAUDE.md. adgen has no dinoOverlayZoneService.js/pipelines/detect.js and zero references to this function anywhere in src/; adgen's callers (pmaxSplitStrategy.js, adVisionQcService.js, atlasVideoService.js) only use analyzeOverlayZones/isEnabled/constants in the render path, unchanged. Rest of file is byte-identical."
+      "reason": "Backend added computeBrightnessGridFromUrl (2026-09-02) solely for its new dinoOverlayZoneService.js DINO-based ingest cost-optimization (pipelines/detect.js::runOverlayZoneAnalysis) -- catalog ingest is backend-only per adgen's CLAUDE.md. adgen has no dinoOverlayZoneService.js/pipelines/detect.js and zero references to this function anywhere in src/; adgen's callers (pmaxSplitStrategy.js, adVisionQcService.js, atlasVideoService.js) only use analyzeOverlayZones/isEnabled/constants in the render path, unchanged. Rest of file is byte-identical.",
+      "portTo": null,
+      "owedSince": null
     },
     "services/perProductReasons.js": {
       "backendHash": "4a528d2d7c3d57d3787e531be79521c5000e20fe9b322ef0231917903b49df10",
@@ -1415,7 +1453,9 @@
       "adgenHash": "f32d8c0d68f0463651d0f94bb331693912adad5997e870a5127b59385a4801bb",
       "backendSha": "55c17096f3668779cb11fccacb812f02305cc269",
       "status": "fork",
-      "reason": "Re-attested at backend 55c17096: sole commit in range is the SCOPE -- BRAND, NOT PRODUCT prompt paragraph already recorded as ported same-day (2026-08-31); verified byte-identical to adgen's current copy. Fork remains limited to pre-existing match() brandId cost-ledger threading (PR #331); adgen's copy is unwired/not live-firing."
+      "reason": "Re-attested at backend 55c17096: sole commit in range is the SCOPE -- BRAND, NOT PRODUCT prompt paragraph already recorded as ported same-day (2026-08-31); verified byte-identical to adgen's current copy. Fork remains limited to pre-existing match() brandId cost-ledger threading (PR #331); adgen's copy is unwired/not live-firing.",
+      "portTo": null,
+      "owedSince": null
     },
     "services/pushToShopify.js": {
       "backendHash": "96cbcabfb6b4172eab832b7d94d6154e38160a567537f67bb3c9f3af6f59b151",
@@ -1448,7 +1488,9 @@
       "adgenHash": "b6b2c790ba35e1e35e90aec42af1c04d0348c22c1d27fcd3a73a1aa7c523ff5f",
       "backendSha": "55c17096f3668779cb11fccacb812f02305cc269",
       "status": "fork",
-      "reason": "Re-attest: only commit in range (55c17096, backend HEAD) is the same 2026-08-31 pair-reference/short-sleeve fix already recorded as ported same-day. Adgen file confirmed identical (PAIR_REFERENCE_RE, impliesPairSoldItem, SHORT_NOT_SLEEVE_RE all present, match backend). No new material change."
+      "reason": "Re-attest: only commit in range (55c17096, backend HEAD) is the same 2026-08-31 pair-reference/short-sleeve fix already recorded as ported same-day. Adgen file confirmed identical (PAIR_REFERENCE_RE, impliesPairSoldItem, SHORT_NOT_SLEEVE_RE all present, match backend). No new material change.",
+      "portTo": null,
+      "owedSince": null
     },
     "services/quoteRotationService.js": {
       "backendHash": "6f6f4e1c5a767e472bdbe3793eede2eb8518cb2ac0e915d559eb9db12c5c7469",
@@ -1487,14 +1529,18 @@
       "backendHash": "ecebff431415f819c7780215c09e9181c5c8612554cdc8428516afb313614577",
       "adgenHash": "ecebff431415f819c7780215c09e9181c5c8612554cdc8428516afb313614577",
       "backendSha": "45f5e3c05b472f319a78fdc53e19229cd2001434",
-      "status": "synced"
+      "status": "synced",
+      "portTo": null,
+      "owedSince": null
     },
     "services/reframeStrategyChooser.js": {
       "backendHash": "d96732f5136b00717893c966c80ed9404f2836a1d73e78d022194f4f157e5ae2",
       "adgenHash": "91923c9881489f66f54f078eae4f73b077d907797189f1a9c421ef17deadfd28",
       "backendSha": "a0781ace9a1db1eaf1492cfac2e3b1bfdb5c2c25",
       "status": "fork",
-      "reason": "CLOSED 2026-09-04: prior entry tracked adgen owing backend's COMPOSITE_MASK_METHOD/computeForceCropRect force-crop port (commit a0781ace, Pelagic run 6a98d63a). Diff against backend origin/main shows the port already landed byte-for-byte identical in code; the only remaining divergence is comment prose backend expanded afterward (atlasVideoService.reframePromptForCompositeCanvas cross-reference, computeForceCropRect null-return note) -- zero executable-line differences. Not a real fork and no longer a real debt; recorded fork only because the tool's identical-check is byte-level and comments differ, nothing owed either direction."
+      "reason": "CLOSED 2026-09-04: prior entry tracked adgen owing backend's COMPOSITE_MASK_METHOD/computeForceCropRect force-crop port (commit a0781ace, Pelagic run 6a98d63a). Diff against backend origin/main shows the port already landed byte-for-byte identical in code; the only remaining divergence is comment prose backend expanded afterward (atlasVideoService.reframePromptForCompositeCanvas cross-reference, computeForceCropRect null-return note) -- zero executable-line differences. Not a real fork and no longer a real debt; recorded fork only because the tool's identical-check is byte-level and comments differ, nothing owed either direction.",
+      "portTo": null,
+      "owedSince": null
     },
     "services/remotionRenderService.js": {
       "backendHash": "d31da9813ceeff6ff78ca396c609c2e1f19c4e8628d8e09a447028d2384f9891",
@@ -1788,19 +1834,25 @@
       "backendHash": "328b969d654c1e128ac5800c2c45088f8bb553b75bf0736f006fafb8cc17decc",
       "adgenHash": "328b969d654c1e128ac5800c2c45088f8bb553b75bf0736f006fafb8cc17decc",
       "backendSha": "fba815887c3240d617c9c3a1bbfd6daecd791215",
-      "status": "synced"
+      "status": "synced",
+      "portTo": null,
+      "owedSince": null
     },
     "services/titleSpecService.js": {
       "backendHash": "fb96be0a835499e35fb0d725163fc07dac7b8708499af46fc5ec960e53f0be80",
       "adgenHash": "fb96be0a835499e35fb0d725163fc07dac7b8708499af46fc5ec960e53f0be80",
       "backendSha": "fba815887c3240d617c9c3a1bbfd6daecd791215",
-      "status": "synced"
+      "status": "synced",
+      "portTo": null,
+      "owedSince": null
     },
     "services/titleSpecValidator.js": {
       "backendHash": "c08f8d2c8c4b67ca79b781827ea758cf5cb35db8e12cfd3cd77089ad3d6be7af",
       "adgenHash": "c08f8d2c8c4b67ca79b781827ea758cf5cb35db8e12cfd3cd77089ad3d6be7af",
       "backendSha": "47be257c468e85c3f1d1c562abd087ea8625e98c",
-      "status": "synced"
+      "status": "synced",
+      "portTo": null,
+      "owedSince": null
     },
     "services/ugcVideoPipeline.js": {
       "backendHash": "2a7c1390a0bd0c46f2f361fb6eb445a9b55bbb225ada35adb6fdc84b5601d78e",
@@ -1816,7 +1868,9 @@
       "adgenHash": "a3ae7681095b3464f3e1da133d272de8e6521eaa92acc303f8f05bdef176188b",
       "backendSha": "45f5e3c05b472f319a78fdc53e19229cd2001434",
       "status": "fork",
-      "reason": "Prior fork stands: 2026-08-28 owner directive that backend prompt-building is not first-class; 2026-09-02 frozen-else Scene 2 is adgen-only. 2026-09-03 STRIP: overlay/sticker SEED_BURNED_IN_TEXT_GUARD_LINE and on-product lock line removed from buildVeoPrompt (contradicted OMNI_DIRECTIVES.noText; keyed on untrustworthy Media.text[].type). Same strip landed on liquidretail_backend working tree. seedHasText param retired. Not --unported. Re-attested 2026-09-03 during benefits-to-directors vendor-drift reconciliation -- no new divergence found beyond what was already recorded."
+      "reason": "Prior fork stands: 2026-08-28 owner directive that backend prompt-building is not first-class; 2026-09-02 frozen-else Scene 2 is adgen-only. 2026-09-03 STRIP: overlay/sticker SEED_BURNED_IN_TEXT_GUARD_LINE and on-product lock line removed from buildVeoPrompt (contradicted OMNI_DIRECTIVES.noText; keyed on untrustworthy Media.text[].type). Same strip landed on liquidretail_backend working tree. seedHasText param retired. Not --unported. Re-attested 2026-09-03 during benefits-to-directors vendor-drift reconciliation -- no new divergence found beyond what was already recorded.",
+      "portTo": null,
+      "owedSince": null
     },
     "services/veoStoryboardService.js": {
       "backendHash": "4e3d420b3a6219b72f25dc95aac6afa679ea5c23a7c3627d1abcb9ba9f5bf344",
@@ -1830,7 +1884,9 @@
       "backendHash": "c7bababe519779b52488a8f22c793188cfd90c37eb67d1f2efc52b7fc6ba7758",
       "adgenHash": "c7bababe519779b52488a8f22c793188cfd90c37eb67d1f2efc52b7fc6ba7758",
       "backendSha": "fba815887c3240d617c9c3a1bbfd6daecd791215",
-      "status": "synced"
+      "status": "synced",
+      "portTo": null,
+      "owedSince": null
     },
     "services/videoCompositeService.js": {
       "backendHash": "5f146c94b3f93c548e34d50fe1a7d2be725e17975c0094669f92030e484d6625",
@@ -1896,14 +1952,18 @@
       "adgenHash": "7927ee374dbca7a604a509d68fbda2c637470f867a6f43099f11e084dcc598fc",
       "backendSha": "01a62e865a69d1d9e7fb21f0b0e9f23283c04bc7",
       "status": "unused",
-      "reason": "backend ref-prewarm; no adgen caller. 2026-09-04: backend 01a62e86 expanded prewarm to also warm pmax_video_16_9 alongside META_VIDEO_MASTER (closes PMax-landscape outpaint spend on backend side only). Still unused in adgen -- no route/service calls prewarmVideoRefsForProducts here; the only two references (geminiReferenceAssembly.js, atlasVideoService.js) are comments. Re-attested at backend SHA 01a62e86; the commit's own note confirms the real adgen force-crop port stays a separate, already-open item."
+      "reason": "backend ref-prewarm; no adgen caller. 2026-09-04: backend 01a62e86 expanded prewarm to also warm pmax_video_16_9 alongside META_VIDEO_MASTER (closes PMax-landscape outpaint spend on backend side only). Still unused in adgen -- no route/service calls prewarmVideoRefsForProducts here; the only two references (geminiReferenceAssembly.js, atlasVideoService.js) are comments. Re-attested at backend SHA 01a62e86; the commit's own note confirms the real adgen force-crop port stays a separate, already-open item.",
+      "portTo": null,
+      "owedSince": null
     },
     "services/videoReferenceResolver.js": {
       "backendHash": "04922fd8510685ca870bd8c5b60df025ce738a81afc79fdc025ff3b4cb448c80",
       "adgenHash": "b5afb9899e9e5bae15524516dbe786bfa69478654522005113012815f81e514b",
       "backendSha": "326fb2705dad948c41a1570d5ea42e83fcc98763",
       "status": "fork",
-      "reason": "Hand-synced pair, first manifest entry (file never seeded — this repo's own copy of the shared DINO cache-first video reference resolver, built 2026-09-03/04 alongside backend's). Diffed against backend origin/main: functionally byte-identical, only the file-path header comment differs (this repo says src/services/..., backend says services/...) plus one paragraph where backend's comment describes the port obligation FROM backend's perspective (\"adgen's ref builder MUST import this helper\") vs adgen's comment describing the hand-sync obligation FROM this side (\"do not diverge without also updating backend\"). Same Mongo doc field (Media.metadata.reframes) read/written by both. Not a fork of substance — just each side's comment framed from its own vantage."
+      "reason": "Hand-synced pair, first manifest entry (file never seeded — this repo's own copy of the shared DINO cache-first video reference resolver, built 2026-09-03/04 alongside backend's). Diffed against backend origin/main: functionally byte-identical, only the file-path header comment differs (this repo says src/services/..., backend says services/...) plus one paragraph where backend's comment describes the port obligation FROM backend's perspective (\"adgen's ref builder MUST import this helper\") vs adgen's comment describing the hand-sync obligation FROM this side (\"do not diverge without also updating backend\"). Same Mongo doc field (Media.metadata.reframes) read/written by both. Not a fork of substance — just each side's comment framed from its own vantage.",
+      "portTo": null,
+      "owedSince": null
     },
     "services/videoRouter.js": {
       "backendHash": "1781950b14280cda1b8ec2db2f5ae446e4fb78899e4db79d293b55b3a1ae3483",
@@ -1919,7 +1979,9 @@
       "adgenHash": "af1180cc6933c63795970897f4c4534405124b1eea4d839416c5f02a809c2222",
       "backendSha": "a1d03573e0dffb495cf20eceb683de4d880fef0f",
       "status": "unused",
-      "reason": "Re-attested at backend a1d03573: 3 new commits (open-vocab prompt threading, detectBatch for /detect-batch, permanent-vs-transient error classification for backfill) are all backend-only catalog-ingest features layered onto detectMultipleProducts/new detectBatch export. Adgen's yoloService.js has no callers anywhere in src (only a stray comment reference) and is unaffected."
+      "reason": "Re-attested at backend a1d03573: 3 new commits (open-vocab prompt threading, detectBatch for /detect-batch, permanent-vs-transient error classification for backfill) are all backend-only catalog-ingest features layered onto detectMultipleProducts/new detectBatch export. Adgen's yoloService.js has no callers anywhere in src (only a stray comment reference) and is unaffected.",
+      "portTo": null,
+      "owedSince": null
     },
     "utils/colorContrast.js": {
       "backendHash": "0592b22f7bb40d089c11157ea75252b3060d87c80cf1b119df88e8c639986eb3",
@@ -1958,7 +2020,9 @@
       "adgenHash": "aeee8dcf9739044a69dd0b1730a421443c6c444305097b6ed8d9cd25ecb7decd",
       "backendSha": "cc95cb53ef5486613d5cb67a6a185ece45c2fa08",
       "status": "fork",
-      "reason": "Backend commits 8142028e (2026-09-01, retro-link MIN=2 + brand-stopwords) and cc95cb53 (2026-09-01, pre-mint catalog-subset collapse) added optional opts.extraStop to titleSimilarity(a,b,opts) and exported tokens() -- solely to support catalogRetroLinkService.js MIN_SHARED_TOKENS 3->2 + brandStopTokens and catalogProductDraftService's pre-mint subset collapse -- neither vendored to adgen (zero titleSimilarity call sites in adgen src/scripts; neither service exists under adgen or in vendor-manifest.json). adgen's actual consumers (CatalogProduct.normalizeTitle, layoutInputService.displayNormalizeTitle) are byte-identical and unaffected. Catalog ingest/retro-link/mint is backend-only scope per adgen CLAUDE.md. No functional gap for adgen -- fork, re-attesting hashes."
+      "reason": "Backend commits 8142028e (2026-09-01, retro-link MIN=2 + brand-stopwords) and cc95cb53 (2026-09-01, pre-mint catalog-subset collapse) added optional opts.extraStop to titleSimilarity(a,b,opts) and exported tokens() -- solely to support catalogRetroLinkService.js MIN_SHARED_TOKENS 3->2 + brandStopTokens and catalogProductDraftService's pre-mint subset collapse -- neither vendored to adgen (zero titleSimilarity call sites in adgen src/scripts; neither service exists under adgen or in vendor-manifest.json). adgen's actual consumers (CatalogProduct.normalizeTitle, layoutInputService.displayNormalizeTitle) are byte-identical and unaffected. Catalog ingest/retro-link/mint is backend-only scope per adgen CLAUDE.md. No functional gap for adgen -- fork, re-attesting hashes.",
+      "portTo": null,
+      "owedSince": null
     },
     "utils/websiteBackground.js": {
       "backendHash": "96be00c95efb057fe9bf81ddfb5febda8d4a00f977ac25271f5ea0287fee0b97",

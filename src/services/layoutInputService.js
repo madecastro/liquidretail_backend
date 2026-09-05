@@ -91,7 +91,7 @@ const { chatCompletion, isConfigured: atlasConfigured } = require('./atlasLlmSer
 // options.adId must be present; when it is not, the timer is a no-op.
 const { startStageTimer } = require('./stageTiming');
 
-const GEMINI_MODEL = process.env.GEMINI_SEARCH_MODEL || 'gemini-2.5-pro';
+const GEMINI_MODEL = process.env.LAYOUT_DERIVATION_MODEL || 'gemini-2.5-pro';
 
 // Bump when the canonical input shape changes — cached LayoutInputArtifact
 // docs with a mismatching version are treated as cache misses and forced
