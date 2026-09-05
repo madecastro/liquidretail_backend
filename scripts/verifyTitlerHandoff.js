@@ -166,21 +166,60 @@ check('F2 shutdown drains up to 25s then force-releases',
   /force-releasing[\s\S]{0,80}Promise\.all\(remaining\.map/.test(titler));
 
 // G. render.yaml.
+//
+// Each service's checks run against a STRUCTURALLY bounded slice — from its
+// `name:` line to the next `- type:` service boundary (or EOF) — never a
+// magic character count. A fixed-width lookahead silently breaks the moment
+// someone adds an explanatory comment paragraph above a service's envVars:
+// that is exactly what happened here. G5/G6 started failing 2026-09-04 when
+// the renderer's OOM-history + "autoscale must live in this file" comment
+// blocks (added over several PRs, real and worth keeping) pushed its real
+// ADGEN_RENDERER_ENABLED/ADGEN_TITLER_ENABLED keys to ~2880 chars past the
+// `name:` line — past the old {0,2500} window, which had no structural
+// reason to be 2500 rather than any other number. Bounding by the next
+// service boundary instead means this can never regress from comment growth
+// again, on this service or any other.
+function serviceBlock(yamlText, serviceName) {
+  const anchor = new RegExp(`name:\\s*${serviceName}\\b`);
+  const m = anchor.exec(yamlText);
+  if (!m) return null;
+  const rest = yamlText.slice(m.index);
+  const nextBoundary = /\n\s*-\s*type:\s*\w+/.exec(rest);
+  return nextBoundary ? rest.slice(0, nextBoundary.index) : rest;
+}
+
+// A proximity check ("is there a quoted true within N chars of this KEY
+// NAME") is unsound regardless of window size: ADGEN_RENDERER_ENABLED and
+// ADGEN_TITLER_ENABLED sit right next to each other in every service's
+// envVars list, so a check for one key can be silently satisfied by the
+// OTHER key's value. (Caught by mutation-testing this exact fix: setting
+// the renderer's own ADGEN_RENDERER_ENABLED to "false" still passed,
+// because the very next line is ADGEN_TITLER_ENABLED: "true".) Extract each
+// key's OWN value line instead of searching for any nearby quoted literal.
+function envValue(block, key) {
+  const re = new RegExp(`key:\\s*${key}\\b[\\s\\S]{0,60}?value:\\s*["']?([^"'\\n]+)["']?`);
+  const m = re.exec(block);
+  return m ? m[1].trim() : null;
+}
+
 const renderYaml = fs.readFileSync(path.join(REPO, 'render.yaml'), 'utf8');
+const rendererBlock = serviceBlock(renderYaml, 'adgen-renderer') || '';
+const titlerBlock = serviceBlock(renderYaml, 'adgen-titler') || '';
+
 check('G1 render.yaml declares adgen-titler service',
   /name:\s*adgen-titler/.test(renderYaml));
 check('G2 render.yaml titler runs on an 8GB plan (pro_plus)',
-  /name:\s*adgen-titler[\s\S]{0,900}?plan:\s*pro_plus/.test(renderYaml),
+  /plan:\s*pro_plus/.test(titlerBlock),
   'Chrome needs the RAM — Standard OOMs. Renamed from standard_plus 2026-08-24 (blueprint sync rejected the old name).');
 check('G3 render.yaml titler sets ADGEN_ROLE=titler',
-  /name:\s*adgen-titler[\s\S]{0,1600}?ADGEN_ROLE[\s\S]{0,40}?titler/.test(renderYaml));
+  envValue(titlerBlock, 'ADGEN_ROLE') === 'titler');
 check('G4 render.yaml titler ships ADGEN_TITLER_ENABLED=true (production; live since 2026-08-26)',
-  /name:\s*adgen-titler[\s\S]{0,2500}?ADGEN_TITLER_ENABLED[\s\S]{0,80}?["']true["']/.test(renderYaml));
+  envValue(titlerBlock, 'ADGEN_TITLER_ENABLED') === 'true');
 check('G5 render.yaml renderer also ships ADGEN_TITLER_ENABLED=true (dashboard had it on both; renderer must stamp titlingNeeded)',
-  /name:\s*adgen-renderer[\s\S]{0,2500}?ADGEN_TITLER_ENABLED[\s\S]{0,80}?["']true["']/.test(renderYaml));
+  envValue(rendererBlock, 'ADGEN_TITLER_ENABLED') === 'true');
 check('G6 render.yaml renderer + titler ship ADGEN_RENDERER_ENABLED=true',
-  /name:\s*adgen-renderer[\s\S]{0,2500}?ADGEN_RENDERER_ENABLED[\s\S]{0,80}?["']true["']/.test(renderYaml) &&
-  /name:\s*adgen-titler[\s\S]{0,2500}?ADGEN_RENDERER_ENABLED[\s\S]{0,80}?["']true["']/.test(renderYaml));
+  envValue(rendererBlock, 'ADGEN_RENDERER_ENABLED') === 'true' &&
+  envValue(titlerBlock, 'ADGEN_RENDERER_ENABLED') === 'true');
 
 // ── report
 console.log(`\nverifyTitlerHandoff: ${passes.length} pass, ${failures.length} fail`);
