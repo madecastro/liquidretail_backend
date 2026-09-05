@@ -52,3 +52,15 @@ copy in the same session.
 `scripts/verifyHandoffContract.js` fails if the version above and
 `HANDOFF_CONTRACT_VERSION` disagree, which is what keeps this pointer from
 going stale.
+
+## Related stamp, not in `CONTRACT_FIELDS`
+
+`Ad.videoTitleDirection` (Mixed, `models/Ad.js`) is the mint-time video-title
+Director decision (`fba81588`). Backend writes it in
+`expandDeterministicVideo`; adgen reads it at titling via
+`applyBenefitsPlacement` (adgen `2c4b0b9`). It is **not** currently listed in
+`services/handoffContract.js` `CONTRACT_FIELDS` (still v1.1.0). Adding it is a
+contract bump (canonical doc in adgen, both copies of `handoffContract.js`) —
+do not do that from this pointer file. Until then both schemas must keep the
+field declared or Mongoose strict drops the stamp and adgen titles without
+benefits. See CLAUDE.md §00 *Video-title Director*.
