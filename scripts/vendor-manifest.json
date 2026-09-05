@@ -1,8 +1,8 @@
 {
   "version": 2,
   "backendRef": "origin/main",
-  "backendHead": "5c36b81b6a574aa8e0812fc2239d3499979331b0",
-  "generatedAt": "2026-09-05T20:57:23.729Z",
+  "backendHead": "326fb2705dad948c41a1570d5ea42e83fcc98763",
+  "generatedAt": "2026-09-05T22:33:28.452Z",
   "files": {
     "models/Ad.js": {
       "backendHash": "812961d1ad30f5f87891dcace58fbe44ce5e07a5789f34b927fe8208dc2db966",
@@ -336,7 +336,7 @@
       "adgenHash": "3f66f84618c6175de506719e4da07340528f65668126e93e91ab9ea3ef03316b",
       "backendSha": "616d4c28c562d96145ab56547455f2a281789756",
       "status": "fork",
-      "reason": "2026-09-03: comment-only fix \u2014 a citation of services/shopifyAccessResolver.js needed a backend/ prefix since that file is backend-only and adgen has no local copy. The prefix is meaningful only from adgen's side (backend's own copy references itself with no prefix), so this is legitimately adgen-local text even though the underlying file is otherwise synced.",
+      "reason": "2026-09-03: comment-only fix — a citation of services/shopifyAccessResolver.js needed a backend/ prefix since that file is backend-only and adgen has no local copy. The prefix is meaningful only from adgen's side (backend's own copy references itself with no prefix), so this is legitimately adgen-local text even though the underlying file is otherwise synced.",
       "portTo": null,
       "owedSince": null
     },
@@ -386,7 +386,7 @@
       "adgenHash": "b17b5a35eef24d6ba7635083f09418cf2c2ca3c90c853430f4e0018b67a4d388",
       "backendSha": "4a408819daea8628ae476fd1cbe1bc73fd042cca",
       "status": "unported",
-      "reason": "PR #98 follow-up hotfix: adds containerStrokeBleedGuard (new export) alongside textStrokeStyle/strokeClipGuard \u2014 reserves horizontal padding on the group container so the contour stroke's outward bleed is not clipped by stackContainerStyle's own overflow:hidden. Backend needs the same helper for its title-still preview path.",
+      "reason": "PR #98 follow-up hotfix: adds containerStrokeBleedGuard (new export) alongside textStrokeStyle/strokeClipGuard — reserves horizontal padding on the group container so the contour stroke's outward bleed is not clipped by stackContainerStyle's own overflow:hidden. Backend needs the same helper for its title-still preview path.",
       "portTo": "backend",
       "owedSince": "2026-08-31T23:20:10.681Z"
     },
@@ -663,7 +663,7 @@
       "adgenHash": "d794f7197e119ee7422dadd09a8411d753ba2635fc99a5855788c073c6b46b0a",
       "backendSha": "2b58cf31766b6ecf9fde711770c87dc2174cbd29",
       "status": "unported",
-      "reason": "COMPETITOR_MARKS_CAVEAT (backend c1d1dc42) is now ported into renderCategoryBlock + summarizeVisionQc + module.exports. Remaining divergence is adgen\u2192backend: TITLING_CATEGORIES/titlingOnlyGate derive ship-gate (adgen fcf3709), occlusion-aware corrective notes, regenerationCount/visionQcMs instrumentation. Adgen deliberately lacks backend's isStaticEnabled/isVideoEnabled sync gates (SystemConfig-only resolvers).",
+      "reason": "COMPETITOR_MARKS_CAVEAT (backend c1d1dc42) is now ported into renderCategoryBlock + summarizeVisionQc + module.exports. Remaining divergence is adgen→backend: TITLING_CATEGORIES/titlingOnlyGate derive ship-gate (adgen fcf3709), occlusion-aware corrective notes, regenerationCount/visionQcMs instrumentation. Adgen deliberately lacks backend's isStaticEnabled/isVideoEnabled sync gates (SystemConfig-only resolvers).",
       "portTo": "backend",
       "owedSince": "2026-09-05T00:18:02.460Z"
     },
@@ -672,7 +672,7 @@
       "adgenHash": "4aafee2c1d7cc90487d59d1983df38c0e6b7fb872315cc980161818486decc22",
       "backendSha": "fba815887c3240d617c9c3a1bbfd6daecd791215",
       "status": "fork",
-      "reason": "2026-09-03: deliberately did not port backend PR #386's static COPY prompt tightening (product_signal.benefits 'never invent' clause). Adgen does not mint static ads / does not run the Director round \u2014 expansion stays backend. Remaining fork is the pre-existing comment-only reserved-proof-slot annotation (PR #34 ADGEN-ONLY eligibility widening) plus that static-prompt delta.",
+      "reason": "2026-09-03: deliberately did not port backend PR #386's static COPY prompt tightening (product_signal.benefits 'never invent' clause). Adgen does not mint static ads / does not run the Director round — expansion stays backend. Remaining fork is the pre-existing comment-only reserved-proof-slot annotation (PR #34 ADGEN-ONLY eligibility widening) plus that static-prompt delta.",
       "portTo": null,
       "owedSince": null
     },
@@ -761,10 +761,10 @@
     },
     "services/atlasVideoService.js": {
       "backendHash": "321f237d23bbedbd4dbc89948be20ce612703db7b7964ab4b1da5ab24faff1b9",
-      "adgenHash": "ad4afd920bf3cce2d9d7cbe4d5d731d199374c9f37fea545a8906966f1ab4906",
+      "adgenHash": "1b276bfc051911c340b209c21f42ace2f7553ac30943d7c8a33934d810cd852a",
       "backendSha": "295541f797f9b0effb719e21e4ac07bf26cc784a",
       "status": "unported",
-      "reason": "RE-ATTESTED 2026-09-04 against backend origin/main HEAD 295541f7 (previously be56edfd). THREAD 3 (MAX_POLL_MS 900000 vs backend 600000) STILL OWED, unchanged. THREADS 4/5/6 confirmed unchanged/now-committed on backend origin/main (ranking/raw-refs and the seedHasText strip landed via 45f5e3c0; REFRAME_PASSTHROUGH_BRAND_IDS remains adgen-only by design). New backend commit 295541f7 hand-syncs adgen's warmLayoutInputForVideoAd byte-for-byte (adgen->backend direction, closes a gap, creates none). owedSince carried at 2026-08-27.",
+      "reason": "PARTIALLY RESOLVED - prior threads stand. THREAD 1 CLOSED. THREAD 2 CLOSED. THREAD 3 (MAX_POLL_MS 900000 vs backend 600000) STILL OWED, unchanged. THREAD 4 pad-at-source-scale / REFRAME_PASSTHROUGH is adgen-only, do not port. THREADS 5/6 confirmed unchanged/now-committed on backend origin/main (ranking/raw-refs and the seedHasText strip landed via 45f5e3c0; REFRAME_PASSTHROUGH_BRAND_IDS remains adgen-only by design). THREAD 7 (2026-09-04): added an optional seed passthrough (buildSubmissionBody/submitGeneration, gemini-omni paramShape only) for the RPD test harness repeatable-comparison feature (scripts/rpd, spec.rngSeed) - additive/backward-compatible, no existing caller passes it. Adgen-only on purpose, do NOT port: the harness that uses it now lives only in this repo, and backends copy of this file is the non-live fallback path with no need for it. THREAD 7b (2026-09-04): re-attested after trimming the submitGeneration export comment from 6 lines to 1 - the longer comment pushed releaseAllActiveReframeClaims past verifyReframeClaimShutdown.js check A6s hardcoded 5000-char lookahead window (CI caught this, harness now passes 14/14). No behavior change, hash-only re-look. RE-ATTESTED again 2026-09-04 against backend origin/main HEAD 295541f7 (previously be56edfd): new backend commit 295541f7 hand-syncs adgens warmLayoutInputForVideoAd byte-for-byte (adgen->backend direction, closes a gap, creates none). owedSince carried at 2026-08-27 (THREAD 3 is the still-real debt).",
       "portTo": "backend",
       "owedSince": "2026-08-27T16:49:12.296Z"
     },
@@ -848,7 +848,7 @@
       "adgenHash": "6104d41ec534afd0c2c45fd6502413a5d35a0a8d1343f7ed58dcc202191ae4b2",
       "backendSha": "fba815887c3240d617c9c3a1bbfd6daecd791215",
       "status": "fork",
-      "reason": "isMasterVideoAd is backend HTTP-only (routes/ads.js:6121); isSharedPortraitPlatePromptCoherent has ZERO production callers on both sides and resolvePortraitMasterFormat already dropped the hook-first conjunct (#386) \u2014 DO NOT port adgen's hook-first body to backend, it would re-open the $2.70 mixed-run bill",
+      "reason": "isMasterVideoAd is backend HTTP-only (routes/ads.js:6121); isSharedPortraitPlatePromptCoherent has ZERO production callers on both sides and resolvePortraitMasterFormat already dropped the hook-first conjunct (#386) — DO NOT port adgen's hook-first body to backend, it would re-open the $2.70 mixed-run bill",
       "portTo": null,
       "owedSince": null
     },
@@ -955,7 +955,7 @@
       "adgenHash": "613ec2c8dc556bf9df8116cb39abc28a4fdeb2fb467dea3067a7ec1c73a78712",
       "backendSha": "e955b04891fcb861bbf64a5bc8642aa2fbe7a0bc",
       "status": "fork",
-      "reason": "Fork, not a copy \u2014 adgen owns the live static renderer. This change ports only the segment-override plumbing on top of that fork: buildPrompt({segment}) with categoryPath from resolvedProduct.category || inferredBreadcrumb, CatalogProduct selects now include those two fields (otherwise categoryPath is always null on the DB path), and intentResolution.promptFlags.segmentOverrides stamps built.appliedOverrides. Remaining adgen-owned hunks, deliberately not flattened: logo LRU (optionalImageCached); ai_ugc_led \u2192 objection_resolved; product.category threaded for the apparel role preamble; usableAttribution; composeCorrectiveOverride / buildQcRetryArgs; submitEditImageWithSeedFallback; resume-from-receipt (existingPredictionId / allowResume \u2014 a money guard backend does not have). Backend-only hunks left unported on purpose: promptSha256 / seedStyle on intentResolution (not segment plumbing). Previously status=unported for the resume guard; that guard is adgen-owned live-renderer policy, not a debt backend still owes, so this is a fork.",
+      "reason": "Fork, not a copy — adgen owns the live static renderer. This change ports only the segment-override plumbing on top of that fork: buildPrompt({segment}) with categoryPath from resolvedProduct.category || inferredBreadcrumb, CatalogProduct selects now include those two fields (otherwise categoryPath is always null on the DB path), and intentResolution.promptFlags.segmentOverrides stamps built.appliedOverrides. Remaining adgen-owned hunks, deliberately not flattened: logo LRU (optionalImageCached); ai_ugc_led → objection_resolved; product.category threaded for the apparel role preamble; usableAttribution; composeCorrectiveOverride / buildQcRetryArgs; submitEditImageWithSeedFallback; resume-from-receipt (existingPredictionId / allowResume — a money guard backend does not have). Backend-only hunks left unported on purpose: promptSha256 / seedStyle on intentResolution (not segment plumbing). Previously status=unported for the resume guard; that guard is adgen-owned live-renderer policy, not a debt backend still owes, so this is a fork.",
       "portTo": null,
       "owedSince": null
     },
@@ -1039,7 +1039,7 @@
       "adgenHash": "b72f89371b19e3fdecec8abd3d361a97fee421947d39e425e4f0e264fb521091",
       "backendSha": "47be257c468e85c3f1d1c562abd087ea8625e98c",
       "status": "fork",
-      "reason": "adgen-owned divergence: findBrandByName inlined (Brand.normalizeBrandName + findOne) so adgen no longer requires brandCatalogService \u2014 that module fire-and-forgets brand enrichment (backend-owned ingest) and its require edge was the only thing keeping the dead ingest cluster in adgen's graph. Backend keeps the catalog-service require. LAYOUT_DERIVATION_MODEL split already ported (#122). Also adgen-only: startStageTimer/layoutInputMs wrapping runDerivation; four-field brandId/productId/adId/campaignRunId top-level args (adgen #43) equivalent to backend's options.*. Nothing owed either way.",
+      "reason": "adgen-owned divergence: findBrandByName inlined (Brand.normalizeBrandName + findOne) so adgen no longer requires brandCatalogService — that module fire-and-forgets brand enrichment (backend-owned ingest) and its require edge was the only thing keeping the dead ingest cluster in adgen's graph. Backend keeps the catalog-service require. LAYOUT_DERIVATION_MODEL split already ported (#122). Also adgen-only: startStageTimer/layoutInputMs wrapping runDerivation; four-field brandId/productId/adId/campaignRunId top-level args (adgen #43) equivalent to backend's options.*. Nothing owed either way.",
       "portTo": null,
       "owedSince": null
     },
@@ -1130,7 +1130,7 @@
       "adgenHash": "97bf9b67e94b5fc96ba4c987ac9e2756bd1fda435dbb972d0a93e7276283dc89",
       "backendSha": "2d93ace1f79a7d91c7aede75667fb4d8c4e48a23",
       "status": "fork",
-      "reason": "Backend #329 added an ids={} third param to semanticScan but never wires it into the title_plate_scan chatCompletion call (verified: zero 'ids.' reads anywhere in backend's function body) \u2014 a scaffold-only change on backend's side. adgen's semanticScan/analyzePlate already fully destructure and thread brandId/productId/adId/campaignRunId into the same call (plateIntelService.js:175,238, adgen #43); adgen is ahead of backend on this specific hunk. PORTED 2026-08-24: backend #307 (dabceaf4) surface-aware keep-out bands \u2014 SURFACE_INSETS, LOWER_THIRD_TOP/BAND_LEAD_IN, bandsFor(safeZoneKey), REFERENCE_BAND_H rescale in applyFaceKeepOut, bandRect(bandKey, safeZoneKey), analyzeFrameBands reading bandsFor(opts.safeZoneKey) \u2014 with adgen's brandId/productId/adId/campaignRunId params on analyzePlate preserved alongside the new safeZoneKey param. Verified via scripts/verifyKeepOutBandGeometry.mjs (25 checks incl. cross-module pin against src/remotion/lib/safeZones.js). Prior reason unchanged: adgen extract is smaller than backend (backend grew after the copy). FOLLOW-UP FIX 2026-08-24 (same day): the port above was itself inert \u2014 nothing ever called this file's bandsFor with a real safeZoneKey, because neither renderTitles call site in brandScriptExecutor.js computed one. Added resolveSafeZoneKeyCjs({format, platformFormat}) next to SURFACE_INSETS, a CJS mirror of remotion/lib/safeZones.js's resolveSafeZoneKey (same mirror-not-import pattern as SURFACE_INSETS itself), pinned against drift by new harness groups I/J/K. bandsFor/bandRect/SURFACE_INSETS themselves are unchanged by this follow-up.",
+      "reason": "Backend #329 added an ids={} third param to semanticScan but never wires it into the title_plate_scan chatCompletion call (verified: zero 'ids.' reads anywhere in backend's function body) — a scaffold-only change on backend's side. adgen's semanticScan/analyzePlate already fully destructure and thread brandId/productId/adId/campaignRunId into the same call (plateIntelService.js:175,238, adgen #43); adgen is ahead of backend on this specific hunk. PORTED 2026-08-24: backend #307 (dabceaf4) surface-aware keep-out bands — SURFACE_INSETS, LOWER_THIRD_TOP/BAND_LEAD_IN, bandsFor(safeZoneKey), REFERENCE_BAND_H rescale in applyFaceKeepOut, bandRect(bandKey, safeZoneKey), analyzeFrameBands reading bandsFor(opts.safeZoneKey) — with adgen's brandId/productId/adId/campaignRunId params on analyzePlate preserved alongside the new safeZoneKey param. Verified via scripts/verifyKeepOutBandGeometry.mjs (25 checks incl. cross-module pin against src/remotion/lib/safeZones.js). Prior reason unchanged: adgen extract is smaller than backend (backend grew after the copy). FOLLOW-UP FIX 2026-08-24 (same day): the port above was itself inert — nothing ever called this file's bandsFor with a real safeZoneKey, because neither renderTitles call site in brandScriptExecutor.js computed one. Added resolveSafeZoneKeyCjs({format, platformFormat}) next to SURFACE_INSETS, a CJS mirror of remotion/lib/safeZones.js's resolveSafeZoneKey (same mirror-not-import pattern as SURFACE_INSETS itself), pinned against drift by new harness groups I/J/K. bandsFor/bandRect/SURFACE_INSETS themselves are unchanged by this follow-up.",
       "portTo": null,
       "owedSince": null
     },
@@ -1237,7 +1237,7 @@
       "adgenHash": "1565a91d4f8cbedd3aae46ccbe41abd4f8283ad9dc4cd7cd12cc325ca15a9e0b",
       "backendSha": "e7aa605e688ca93a0b29f8447321d38ad9a1ac27",
       "status": "fork",
-      "reason": "The specific debt is PAID: the plateHintsOverride param landed in backend via PR #361 (merged e7aa605) \u2014 verified present at backend services/remotionRenderService.js:620 and :683. Returning this file to 'fork', which is what it was before 2026-08-31; labelling the WHOLE file 'unported' that day was too broad, since only the small plateHintsOverride addition was ever owed. The residual ~336-line divergence is adgen's DELIBERATE child-process render architecture (remotionChildSupervisor.js / remotionRender.child.js / prebuilt .remotion-bundle, for Chrome+ffmpeg OOM isolation per adgen CLAUDE.md) which backend does not have and is not expected to adopt.",
+      "reason": "The specific debt is PAID: the plateHintsOverride param landed in backend via PR #361 (merged e7aa605) — verified present at backend services/remotionRenderService.js:620 and :683. Returning this file to 'fork', which is what it was before 2026-08-31; labelling the WHOLE file 'unported' that day was too broad, since only the small plateHintsOverride addition was ever owed. The residual ~336-line divergence is adgen's DELIBERATE child-process render architecture (remotionChildSupervisor.js / remotionRender.child.js / prebuilt .remotion-bundle, for Chrome+ffmpeg OOM isolation per adgen CLAUDE.md) which backend does not have and is not expected to adopt.",
       "portTo": null,
       "owedSince": null
     },
@@ -1287,7 +1287,7 @@
       "adgenHash": "392d03a90dede955a61b0768b2a60d287d0a2e886c1d39ad0301b7ef24012603",
       "backendSha": "6c59c64ee0c353c3121beaa0e9738b96241fbf08",
       "status": "fork",
-      "reason": "Fresh diff (no prior context): adgen added APPAREL_SHOT_TYPE_RANK + rankOf/rankByShotType's apparelSafe option (e24b182, feat/apparel category-aware safety hardening) \u2014 backend has neither. Deliberate adgen-only addition, not accidental drift: it exists to mitigate OpenAI gpt-image-2/edit's safety-classifier false positives on apparel/swimwear catalog photography (measured 2026-08-25, run_1787684512013_e5feaf12, 4/9 Pelagic swimwear statics flagged safety_violations=[sexual]), and adgen is the repo that actually renders images against OpenAI in production today (backend no longer renders \u2014 see backend session.md). Backend does not need this: it never calls directImageRenderService/gpt-image-2 in production, so there is nothing for it to mitigate. Noted in passing, not part of this reconcile: the reference-side half of the mitigation (apparelSafe:true / APPAREL_SHOT_TYPE_RANK) is defined but its one call site (campaignAdsGenerationService.js:2625) still calls rankByShotType(medias) with the default apparelSafe:false \u2014 only the prompt-side half (staticAdIntents.js isApparelCategory clause) is actually wired today. Not a reconcile question (wiring, not vendor drift); flagging for whoever owns that feature.",
+      "reason": "Fresh diff (no prior context): adgen added APPAREL_SHOT_TYPE_RANK + rankOf/rankByShotType's apparelSafe option (e24b182, feat/apparel category-aware safety hardening) — backend has neither. Deliberate adgen-only addition, not accidental drift: it exists to mitigate OpenAI gpt-image-2/edit's safety-classifier false positives on apparel/swimwear catalog photography (measured 2026-08-25, run_1787684512013_e5feaf12, 4/9 Pelagic swimwear statics flagged safety_violations=[sexual]), and adgen is the repo that actually renders images against OpenAI in production today (backend no longer renders — see backend session.md). Backend does not need this: it never calls directImageRenderService/gpt-image-2 in production, so there is nothing for it to mitigate. Noted in passing, not part of this reconcile: the reference-side half of the mitigation (apparelSafe:true / APPAREL_SHOT_TYPE_RANK) is defined but its one call site (campaignAdsGenerationService.js:2625) still calls rankByShotType(medias) with the default apparelSafe:false — only the prompt-side half (staticAdIntents.js isApparelCategory clause) is actually wired today. Not a reconcile question (wiring, not vendor drift); flagging for whoever owns that feature.",
       "portTo": null,
       "owedSince": null
     },
@@ -1296,7 +1296,7 @@
       "adgenHash": "5be1ed86115ddb3cd712c74ad9cb78777cf8cdc8c1c097e5a1c38d702ffc7254",
       "backendSha": "279061d84d65aa5f19f93bc74e3e617eac41cae3",
       "status": "fork",
-      "reason": "Deliberate fork, not a port \u2014 PR #79 (feat/distributed-lease, merged 2026-08-27). Adgen's version solves a different problem (orchestrator-side expansion singleton across N instances) than backend's (worker housekeeping singleton for scheduledSyncService/backlogWatchdog); file's own header says 'modelled on backend services/singletonLease.js but NOT a port of it.' Shares the collection name (singleton_leases) with backend by design but uses different lease NAMES, so no cross-service collision. Required from src/services/orchestrator.js:34 (createSingletonLease) \u2014 not dead. First-seen in the manifest; was never seeded when PR #79 landed.",
+      "reason": "Deliberate fork, not a port — PR #79 (feat/distributed-lease, merged 2026-08-27). Adgen's version solves a different problem (orchestrator-side expansion singleton across N instances) than backend's (worker housekeeping singleton for scheduledSyncService/backlogWatchdog); file's own header says 'modelled on backend services/singletonLease.js but NOT a port of it.' Shares the collection name (singleton_leases) with backend by design but uses different lease NAMES, so no cross-service collision. Required from src/services/orchestrator.js:34 (createSingletonLease) — not dead. First-seen in the manifest; was never seeded when PR #79 landed.",
       "portTo": null,
       "owedSince": null
     },
@@ -1321,7 +1321,7 @@
       "adgenHash": "41a857ecdee5e887c184191e3b7e1787841fcba0aebf4cd894370806b51bac46",
       "backendSha": "b5a42717c4a15f800224e374bcbe11cae7046398",
       "status": "fork",
-      "reason": "STATUS LABEL WAS WRONG, fixed in this pass: prior entry said status=unused ('only reached from unused spendGuard') \u2014 VERIFIED FALSE by grep. This file is live-wired into money-critical code: renderer.js requires and calls resolveUnsettledTimeoutAction (:1944,1959, the video-master-timeout-livelock fix, PR #82) and receiptFree (:2744,2746, the requeue-guard composer), and bootRecoveryService.js requires and uses HAS_RECEIPT (:96,194, the boot-recovery selector). Re-diffed fresh: adgen added resolveUnsettledTimeoutAction (the hold/terminal/release decision for an unsettled poll timeout against adgen's OWN atomic multi-worker claim) since the last look; backend separately added adSpendReceipts/receiptId (2026-08-27, a READ-SIDE helper so routes/ads.js projectAd and routes/catalog.js's ads-detail allowlist expose the receipt over HTTP without disagreeing on field shape). Neither needs porting to the other: adgen has no HTTP API (GET /health only, per CLAUDE.md) so has no consumer for the read-side helper; backend's OWN unsettled-timeout handling (routes/ads.js:3266, err.unsettledAtTimeout) is structurally different from adgen's \u2014 it never releases the claim or flips status in the first place, so it does not obviously have the release-then-immediate-reclaim race PR #82 fixed on adgen's atomic-claim architecture, though a full audit of backend's own claim semantics is out of scope for this reconcile pass and is NOT asserted safe with confidence \u2014 flagging as a possible follow-up rather than a verified non-issue. Recorded as fork (not unported): porting adgen's hold/cap state machine into backend's differently-shaped, currently-inert (ADGEN_RENDERER_ENABLED=true in prod) render loop is real design work, not a mechanical port.",
+      "reason": "STATUS LABEL WAS WRONG, fixed in this pass: prior entry said status=unused ('only reached from unused spendGuard') — VERIFIED FALSE by grep. This file is live-wired into money-critical code: renderer.js requires and calls resolveUnsettledTimeoutAction (:1944,1959, the video-master-timeout-livelock fix, PR #82) and receiptFree (:2744,2746, the requeue-guard composer), and bootRecoveryService.js requires and uses HAS_RECEIPT (:96,194, the boot-recovery selector). Re-diffed fresh: adgen added resolveUnsettledTimeoutAction (the hold/terminal/release decision for an unsettled poll timeout against adgen's OWN atomic multi-worker claim) since the last look; backend separately added adSpendReceipts/receiptId (2026-08-27, a READ-SIDE helper so routes/ads.js projectAd and routes/catalog.js's ads-detail allowlist expose the receipt over HTTP without disagreeing on field shape). Neither needs porting to the other: adgen has no HTTP API (GET /health only, per CLAUDE.md) so has no consumer for the read-side helper; backend's OWN unsettled-timeout handling (routes/ads.js:3266, err.unsettledAtTimeout) is structurally different from adgen's — it never releases the claim or flips status in the first place, so it does not obviously have the release-then-immediate-reclaim race PR #82 fixed on adgen's atomic-claim architecture, though a full audit of backend's own claim semantics is out of scope for this reconcile pass and is NOT asserted safe with confidence — flagging as a possible follow-up rather than a verified non-issue. Recorded as fork (not unported): porting adgen's hold/cap state machine into backend's differently-shaped, currently-inert (ADGEN_RENDERER_ENABLED=true in prod) render loop is real design work, not a mechanical port.",
       "portTo": null,
       "owedSince": null
     },
@@ -1338,7 +1338,7 @@
       "adgenHash": "b25c1490a1b3b820564cc629446df9cf71ce2f053d8d6657cb01405f5e4b4a30",
       "backendSha": "7cc2c7dfbada49e800d3fd0cc1899e9735c425cb",
       "status": "fork",
-      "reason": "Fork, not a copy. This change ports the segment-override CONSUMER (loadSegmentOverrides / matchSegmentOverride / applySegmentOverrides / buildPrompt({segment}) / appliedOverrides / promptFlagsSnapshot) so an adopted qc-insights row in config/segmentPromptOverrides.js actually appends at render instead of silently no-op'ing. Require path is ../../config/segmentPromptOverrides (adgen config/ is at repo root; ../config resolves to the FILE src/config.js) \u2014 backend uses ../config/ because its services/ sits at repo root. Remaining adgen-owned policy hunks, not this port: APPAREL EXTENSION on the role preamble (isApparelCategory \u2014 measured gpt-image-2 safety false-positives on Pelagic swimwear); SOCIAL_PROOF_QUOTE_ELIGIBLE (quote-only eligibility + function-shaped core); PMAX_DRAWCTA_QUOTE_ONLY_SOCIAL_PROOF; resolveDrawCta/applyDensity taking `data` so those flags can see the quote-only shape. Empty table is a byte-identical no-op vs the pre-port SHA matrix (verifyStaticIntentChanges.js G).",
+      "reason": "Fork, not a copy. This change ports the segment-override CONSUMER (loadSegmentOverrides / matchSegmentOverride / applySegmentOverrides / buildPrompt({segment}) / appliedOverrides / promptFlagsSnapshot) so an adopted qc-insights row in config/segmentPromptOverrides.js actually appends at render instead of silently no-op'ing. Require path is ../../config/segmentPromptOverrides (adgen config/ is at repo root; ../config resolves to the FILE src/config.js) — backend uses ../config/ because its services/ sits at repo root. Remaining adgen-owned policy hunks, not this port: APPAREL EXTENSION on the role preamble (isApparelCategory — measured gpt-image-2 safety false-positives on Pelagic swimwear); SOCIAL_PROOF_QUOTE_ELIGIBLE (quote-only eligibility + function-shaped core); PMAX_DRAWCTA_QUOTE_ONLY_SOCIAL_PROOF; resolveDrawCta/applyDensity taking `data` so those flags can see the quote-only shape. Empty table is a byte-identical no-op vs the pre-port SHA matrix (verifyStaticIntentChanges.js G).",
       "portTo": null,
       "owedSince": null
     },

@@ -5043,18 +5043,31 @@ function submittedImageUrls(imageUrls, caps) {
   }
 }
 
-function buildSubmissionBody({ model, prompt, imageUrls, aspectRatio, caps, videoClipUrl = null, durationSec = null }) {
+function buildSubmissionBody({ model, prompt, imageUrls, aspectRatio, caps, videoClipUrl = null, durationSec = null, seed = null }) {
   switch (caps.paramShape) {
     case 'gemini-omni':
       // duration MUST be sent explicitly (Atlas enum 4|6|8|10) — the 8s
       // output is a downstream contract (brand scripts assume 8s @ 24fps).
+      //
+      // seed — schema-confirmed field (live-fetched 2026-09-04:
+      // static.atlascloud.ai/model/schema/google-gemini-omni-flash-image-to-
+      // video-developer.json, Input.properties.seed, integer, default -1 =
+      // random). NO production caller has ever set this — every render to
+      // date used Atlas's own random seed. Omitted by default (undefined),
+      // so every existing call site is byte-identical to before this change.
+      // Only set for callers that explicitly ask (the RPD harness's
+      // rngSeed lever), to hold the model's own randomness fixed while
+      // A/B'ing prompt text. NOT verified for any other paramShape
+      // (grok/veo/r2v) — do not copy this into those branches without
+      // fetching and checking their own schemas first.
       return {
         model,
         prompt,
         images: submittedImageUrls(imageUrls, caps),
         duration: durationSec || caps.defaultDuration || 8,
         aspect_ratio: aspectRatio,
-        resolution: process.env.ATLAS_VIDEO_RESOLUTION || caps.defaultResolution || '720p'
+        resolution: process.env.ATLAS_VIDEO_RESOLUTION || caps.defaultResolution || '720p',
+        ...(Number.isInteger(seed) ? { seed } : {})
       };
     case 'gemini-omni-r2v': {
       // Schema requires video_clips: [{url, start, ends}] with a ≤10s
@@ -5111,8 +5124,8 @@ function buildSubmissionBody({ model, prompt, imageUrls, aspectRatio, caps, vide
   }
 }
 
-async function submitGeneration({ model, prompt, imageUrls, aspectRatio, caps, videoClipUrl = null, durationSec = null }) {
-  const body = buildSubmissionBody({ model, prompt, imageUrls, aspectRatio, caps, videoClipUrl, durationSec });
+async function submitGeneration({ model, prompt, imageUrls, aspectRatio, caps, videoClipUrl = null, durationSec = null, seed = null }) {
+  const body = buildSubmissionBody({ model, prompt, imageUrls, aspectRatio, caps, videoClipUrl, durationSec, seed });
 
   // refs= reports what the model RECEIVES, and names the assembled count too
   // when the shape takes fewer. Reading "refs=3" for a 1-reference model was
@@ -6194,6 +6207,8 @@ module.exports = {
   // respected by running the loop. A source-text check passes against any
   // reimplementation that keeps the name; only executing it proves the clamp.
   pollPrediction,
+  // Submit primitive (pacedModelSubmit + 429-only retry + maxRedirects:0 built in) — for scripts/rpd/lib/runner.js.
+  submitGeneration,
   // exposed for verify harnesses (Claude-5-era provider-fault retry gate)
   mayRetryAfterFailure,
   // Slack payload for the not-chargeable auto-retry path — pure, so

@@ -12,6 +12,12 @@ dist/
 # blanket rule above.
 !.claude/settings.json
 !.claude/hooks/
+# Skills are shared, load-bearing docs (mirrors liquidretail_backend, which
+# tracks .claude/skills/ with no ignore rule at all) — un-ignored so
+# .claude/skills/rpd-experiments/ (added 2026-09-04 alongside scripts/rpd/)
+# actually reaches every clone instead of existing only in whichever
+# checkout happened to write it locally.
+!.claude/skills/
 .codegraph/
 .codemap/
 # Remotion webpack bundle — built at Docker build time by
@@ -26,3 +32,6 @@ probe-results/
 # scripts/renderTitlePreview.js default output dir — local debug PNGs/MP4s,
 # never committed (same pattern as probe-results/ above).
 title-preview-output/
+# scripts/rpd/ run output (manifests, downloaded media, gallery builds) —
+# local/experimental, never committed (same pattern as probe-results/ above).
+rpd-runs/
