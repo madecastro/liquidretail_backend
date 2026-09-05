@@ -348,7 +348,10 @@ One atomic lock, filter `{_id: adId, regenerating: {$ne: true}}`
 ```
 then **return** — no local execution.
 
-**Local** (`:634-637` + `:658-660`):
+**Local** (`:634-637` + `:658-660`) — taken only when `ADGEN_RENDERER_ENABLED`
+is not `'true'`; in production today, where the flag is `true`, every
+regenerate takes the Deferred path above instead, and this branch is
+backend's dormant fallback:
 ```js
 { regenerating: true, regenerationStage: 'pending', updatedAt: <Date>,
   regenerationRequest: null,
@@ -667,15 +670,18 @@ Landed 2026-08-28, backend `services/handoffContract.js` v1.1.0. Backend's
 other half.
 
 **Origin.** An owner ask to confirm whether backend's manual retitle route
-— which runs Remotion in-process on the web server, the exact CPU-isolation
+— which, absent this protocol (i.e. when `ADGEN_RENDERER_ENABLED` is off),
+runs Remotion in-process on the web server, the exact CPU-isolation
 problem adgen's titler role exists to solve for the automatic
 post-generation path — would genuinely become more scalable by routing
-through adgen. Investigation found the claim held for `retitle-videos` but
-NOT for the OTHER two manual-titling routes: `title-still` is a synchronous
+through adgen. Investigation found the claim held for `retitle-videos`,
+which in production today defers to adgen per this protocol, but NOT for
+the OTHER two manual-titling routes: `title-still` is a synchronous
 ~1-3s interactive preview loop ("Powers /title-playground") that an async
 claim-based worker would make unpredictably slower, and `title-spec/modify`
 is an LLM spec-editing call with no Remotion render in it at all. Neither is
-part of this protocol; both stay local-only.
+part of this protocol; both stay local-only, unconditionally, regardless of
+the flag.
 
 ### Why this is a FOURTH claim namespace, not a reuse of the titler's
 
@@ -794,8 +800,10 @@ is not the only place these two files must agree):
 Backend's LOCAL retitle-videos runner (`runRetitleJob`, the dormant
 fallback when the handoff flag is off) also now passes `retitleMode:true`
 — **this half of the fix applies whether or not `ADGEN_RENDERER_ENABLED` is
-ever flipped on**, because it closes a defect in the CURRENT, already-live
-in-process path.
+ever flipped on**, because it closes a defect in the shared
+`brandScriptExecutor` Remotion-render code itself, which IS live today —
+currently executed by adgen's retitle consumer in production, not by this
+dormant backend runner.
 
 Pinned, and revert-proven against the exact mutations above, by
 `backend/scripts/verifyRetitleAdgenHandoff.js` and
@@ -960,10 +968,11 @@ the flag on with no adgen deployed strands ads until the 15-minute reaper.
 
 The one genuine correctness hazard found while writing this document.
 
-Backend renders in-process with `claimedByWorker` left `null` for the whole
-render (`backend/models/Ad.js:48-51`). Adgen's claim filter is
-`{status:'rendering', claimedByWorker:null, …}`. **Those are the same
-shape.**
+Backend's dormant fallback renders in-process (only when
+`ADGEN_RENDERER_ENABLED` is not `'true'`) with `claimedByWorker` left
+`null` for the whole render (`backend/models/Ad.js:48-51`). Adgen's claim
+filter is `{status:'rendering', claimedByWorker:null, …}`. **Those are the
+same shape.**
 
 So if the flag flips `false → true` while a backend `runRenderLoop` is
 already past its gate at `backend/routes/ads.js:1861`, that loop keeps
@@ -1141,7 +1150,7 @@ in whichever copy someone had open.
 > bug would fire.
 >
 > What actually makes it unreachable is the **provider router**:
-> - `adgen/src/services/videoRouter.js:29` — `activeProvider()` defaults to `'atlas'`, and `VIDEO_PROVIDER=atlas` is committed at `config/defaults.env:394`.
+> - `adgen/src/services/videoRouter.js:42-44` — `activeProvider()` defaults to `'atlas'`, and `VIDEO_PROVIDER=atlas` is committed at `config/defaults.env:394`. (`render.yaml` does not override it.)
 > - On the atlas path, `prepareStoryboard` returns `{storyboard: null}` — "Storyboard retired on the Atlas path" (`adgen/src/services/atlasVideoService.js:4344`).
 > - `generateStoryboard` has exactly **one** production caller, `adgen/src/services/aiVideoReferenceService.js:320`, reached only from `videoRouter`'s non-atlas `else` branch.
 >
@@ -1167,27 +1176,89 @@ diff and deciding whether to port, which is a judgement call per file, not
 a documentation change. They do not affect CI (the backend-side checks skip
 there).
 
+### Direct-Gemini video provider — built, and LIVE (verified 2026-09-04)
+
+As of adgen `origin/master` @ `fde6003` (2026-09-03), a full
+`geminiVideoService` path exists (PRs #108/#110/#113 plus follow-ups).
+Committed default is still `VIDEO_PROVIDER=atlas` (`config/defaults.env:394`,
+`render.yaml` doesn't set it, code default in `videoRouter.activeProvider`
+and `renderer.js`'s seam is `'atlas'`) — PR #108 landed explicitly dark.
+
+**But production is not on the repo default.** Queried the live Render
+API directly (`GET /v1/services/srv-da4bh9rbc2fs73cff2rg/env-vars`,
+`adgen-renderer`) on 2026-09-04: **`VIDEO_PROVIDER=gemini` is set as a
+dashboard override on the live renderer service.** This is exactly the
+blind spot flagged below in §9 as "still overridable... this document
+did not query" — it has now been queried, and the answer is yes, it's
+overridden. So everything below is **current production behavior**,
+not a future "when flipped" scenario:
+
+- **Charge point.** Atlas treats a structured pre-work 429 as unbilled
+  and replayable. Gemini treats an accepted `interaction_id` as
+  possibly billed even when the first poll is `too_many_requests`.
+  Porting `isDefinite429` onto Gemini is a double-bill.
+- **Receipt field is reused.** `Ad.veoPredictionId` still holds the
+  provider id; `Ad.veoProvider` (`'gemini'`) is what lets
+  `bootRecoveryService` GET the Gemini Interactions API instead of
+  Atlas-GET-ing a Gemini id. A null `veoProvider` still means Atlas
+  (pre-cutover rows).
+- **Two dispatch points.** Renderer mint uses its own seam
+  (`renderer.js:1460-1489`, atlas|gemini only — `vertex` throws).
+  Regenerates go through `videoRouter.generateForAd`
+  (`adRegenerateService.js:43` aliased as `veoService`). The router's
+  gemini branch (added "WITH THE DIRECT-GEMINI CUTOVER") is what stops
+  regenerate from falling through onto deprecated Vertex Veo now that
+  the env is actually set to `gemini` in production.
+- **Rollback** is flipping the one dashboard var back to `VIDEO_PROVIDER=atlas`
+  (or deleting the override) — no code change, no deploy required either
+  direction. Atlas path was not deleted; both remain fully wired.
+- Also checked live in the same pass: `VIDEO_RAW_CATALOG_REFERENCES=false`
+  on `adgen-renderer` (explicit, matches file default — **not** live), and
+  `VIDEO_BENEFITS_PLACEMENT` has **no** dashboard override anywhere (runs
+  on the file's `true` default, so it's live by default, not override).
+
+**Re-verify before trusting this indefinitely** — a dashboard override
+can be flipped back without any commit, so this document has no way to
+detect a future reversal on its own. Re-run the same `env-vars` query
+against `srv-da4bh9rbc2fs73cff2rg` to check current truth.
+
+Director-benefits (adgen #115 / backend #386) does **not** change the
+billable submit regardless of provider. Backend mint stamps
+`Ad.videoTitleDirection`; adgen titling
+(`brandScriptExecutor.applyBenefitsPlacement`) splices a benefits slot
+at Remotion time. Fail-closed on director errors — mint still happens.
+Gated on `VIDEO_BENEFITS_PLACEMENT=true` (`config/defaults.env:1882`),
+confirmed live (no override, runs on that default).
+
 ---
 
 ## 9. Not verified
 
 Stated as unknown rather than guessed.
 
-1. **Live Render dashboard values.** `ADGEN_RENDERER_ENABLED`,
-   `VIDEO_PROVIDER`, `VEO_USE_GPT_STORYBOARD`, `ADGEN_TITLER_ENABLED`. This
-   document read only committed files; **no dashboard or Render API was
-   queried.** Provenance of the production claims, stated so nobody mistakes an
+1. **Live Render dashboard values — partially closed 2026-09-04.**
+   `ADGEN_RENDERER_ENABLED`, `VEO_USE_GPT_STORYBOARD`, `ADGEN_TITLER_ENABLED`
+   remain unverified — this document still reads only committed files for
+   those three, no dashboard or Render API query was made for them.
+   **`VIDEO_PROVIDER`, `VIDEO_RAW_CATALOG_REFERENCES`, and
+   `VIDEO_BENEFITS_PLACEMENT` are no longer in this category** — queried
+   directly via `GET /v1/services/srv-da4bh9rbc2fs73cff2rg/env-vars`
+   (`adgen-renderer`) using the Render API key in `~/.render/cli.yaml`.
+   Provenance of the production claims, stated so nobody mistakes an
    assertion for a measurement:
 
    | Claim | Rests on | Strength |
    |---|---|---|
-   | `ADGEN_RENDERER_ENABLED=true` in prod | committed `defaults.env` in both repos (aligned 2026-09-03) plus live dashboard | Code-visible. Dashboard copy is a redundant duplicate. |
-   | `ADGEN_TITLER_ENABLED=true` in prod | `adgen/render.yaml` renderer + titler both `"true"` (aligned 2026-09-03) plus live dashboard | Code-visible. Dashboard copies are redundant duplicates of render.yaml. |
-   | `VIDEO_PROVIDER=atlas` in prod | committed `defaults.env:394` **and** the code default at `videoRouter.js:29` | Strongest of the four — two independent code-visible sources. Still overridable. |
+   | `ADGEN_RENDERER_ENABLED=true` in prod | committed `defaults.env` in both repos (aligned 2026-09-03) plus live dashboard | Code-visible. Dashboard copy is a redundant duplicate. **Not independently re-queried in this pass** — carried over from the prior write-up. |
+   | `ADGEN_TITLER_ENABLED=true` in prod | `adgen/render.yaml` renderer + titler both `"true"` (aligned 2026-09-03) plus live dashboard | Code-visible. Dashboard copies are redundant duplicates of render.yaml. **Not independently re-queried in this pass.** |
+   | `VIDEO_PROVIDER=gemini` in prod (repo/code default is `atlas`) | **Directly queried, 2026-09-04**, live `adgen-renderer` env-vars via the Render API. `gemini` is an explicit dashboard override; `config/defaults.env:394` and both code defaults (`videoRouter.js:42-44`, `renderer.js:1460`) still say `atlas`, and `render.yaml` sets neither. | **Measured, not inferred** — the strongest possible evidence: a direct read of the live service's actual environment. Direct-Gemini is not dark; it is the routed provider in production today. |
+   | `VIDEO_RAW_CATALOG_REFERENCES=false` in prod | **Directly queried, 2026-09-04**, same service/method. Matches file default (`defaults.env`, added 2026-09-03, DEFAULT OFF). | Measured. Not live. |
+   | `VIDEO_BENEFITS_PLACEMENT=true` in prod | **Directly queried, 2026-09-04**, same service/method — no override present on `adgen-renderer` or `adgen-titler`, so it runs on the file default (`config/defaults.env:1882`, `true`). | Measured. Live by default, no override needed. |
 
-   **Every "both paths are live" statement in this document rests on the first
-   row, which is prose.** If that is wrong, the flag-off branch is dead code and
-   several hazards described here cannot occur.
+   **"Both paths are live" for `VIDEO_PROVIDER` is now measured, not
+   prose** — production is on Gemini. The Atlas branch is not dead code:
+   it's the fallback/rollback path and still the default for any fresh
+   service or local run that doesn't carry the dashboard override.
 2. **Whether a Render env edit changes a running process's `process.env`
    without a restart.** Several code comments claim a dashboard flip takes
    effect "without a redeploy". The *code* genuinely re-reads `process.env`

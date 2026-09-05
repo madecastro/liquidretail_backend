@@ -1,13 +1,16 @@
 # CLAUDE.md — liquidretail_adgen
 
 Ad-generation **renderer** microservice for Reach Social. Forked from
-`liquidretail_backend`. Deploys to Render as three services from one Docker
-image (`Dockerfile`, `render.yaml`). Shares the **same MongoDB** as the
-backend. Trunk is `master`.
+`liquidretail_backend`. Deploys to Render as **four** services from one Docker
+image (`Dockerfile`, `render.yaml`: api / orchestrator / renderer / titler).
+Shares the **same MongoDB** as the backend. Trunk is `master`.
 
-**Citations in this file are against `origin/master` @ `881dabd` (2026-08-24,
-PR #4), not a detached local checkout.** If a line number does not match the
-tree you have open, `git fetch && git log -1 --oneline origin/master` first.
+**Citations.** Older architecture sections were written against
+`origin/master` @ `881dabd` (2026-08-24, PR #4) and their `file:line` pins
+have drifted. Video-provider / Gemini / DINO-ref / autoscale-pin /
+vision-QC-derive-gate / director-benefits material is against
+`origin/master` @ `fde6003` (2026-09-03). If a line number does not match
+the tree you have open, `git log -1 --oneline origin/master` first.
 
 **Read `session.md` for live branch/PR state.** This file is architecture, not
 handoff.
@@ -53,10 +56,14 @@ repos:
 - Backend `services/adgenBridge.js:13-15` and `routes/ads.js:1715-1723`: when
   the flag is the string `'true'` (case-insensitive), `runRenderLoop` flips
   the `CampaignRun` to `running` and **returns without dispatching**.
-- Adgen `src/config.js:37-39` and `src/services/renderer.js:652-655`: when
+- Adgen `src/config.js:64-66` (`isAdgenRendererEnabled`) and
+  `src/services/renderer.js:709` (`claimOne` re-reads at call time): when
   the flag is **not** `'true'`, the renderer poll loop sleeps (does not
   claim). When it **is** `'true'`, this process atomically claims ads and
-  does the Atlas / Remotion / Cloudinary work.
+  does the Atlas-image / provider-routed-video / Remotion / Cloudinary
+  work. Video **generation** provider is a separate env (`VIDEO_PROVIDER`,
+  currently `atlas` — see Direct-Gemini section below); this flag is
+  ownership of the collection, not Atlas-vs-Gemini.
 
 Committed default in `config/defaults.env` is `ADGEN_RENDERER_ENABLED=true`
 — adgen owns rendering in production (matches the live dashboard). Parser
@@ -95,8 +102,8 @@ Mongo → start the matching role → install SIGTERM/SIGINT.
 |---|---|---|
 | `api` | `adgen-api` (web, starter, `:3100/health`) | Express app with **only** `GET /health`. 200 if mongoose `readyState === 1`, else 503. No inspect endpoints, no generate API. |
 | `orchestrator` | `adgen-orchestrator` (worker, starter, singleton) | Polls `CampaignRun.countDocuments({ status: 'preparing' })` and logs. **No writes, no lease, no expansion**. Phase 2 is still a comment. |
-| `renderer` | `adgen-renderer` (worker, autoscale) | The live path. `renderer.run()` → `poll()` burst-claims up to `ADGEN_MAX_INFLIGHT` ads and fires `processAd` as unawaited promises. |
-| `titler` | `adgen-titler` (worker, autoscale) | Out-of-process Remotion titling — polls for `{status:'rendering', veoVideoUrl:{$ne:null}, titlingNeeded:true, claimedByWorker:null}` when `ADGEN_TITLER_ENABLED=true`. Live in production (`render.yaml` ships `"true"` on renderer and titler). |
+| `renderer` | `adgen-renderer` (worker, autoscale **pinned in file**) | The live path. `renderer.run()` → `poll()` burst-claims up to `ADGEN_MAX_INFLIGHT` ads and fires `processAd` as unawaited promises. `render.yaml` `scaling:` is min 2 / max 4 (see autoscale pin below). |
+| `titler` | `adgen-titler` (worker, autoscale **pinned in file**) | Out-of-process Remotion titling — polls for `{status:'rendering', veoVideoUrl:{$ne:null}, titlingNeeded:true, claimedByWorker:null}` when `ADGEN_TITLER_ENABLED=true`. Live in production (`render.yaml` ships `"true"` on renderer and titler). `scaling:` is min 4 / max 12. |
 
 Worker identity: `ADGEN_WORKER_ID` or auto `${ROLE}-${random}`. Stamped onto
 `Ad.claimedByWorker`.
@@ -179,9 +186,428 @@ on the claim-safety and status-preservation guards).
 
 ---
 
+## Direct-Gemini video provider — LIVE IN PRODUCTION via dashboard override (repo default is still `atlas`)
+
+Pinned to `origin/master` @ `fde6003` (2026-09-03). Landed across PRs
+#108 (`3178c69`, "merges dark"), #110 (`035913e`), #113 (`b1e3a10`)
+plus follow-ups `7935e93` / `00ba9d1` / `bb6e01a` / `fde6003`.
+(`#114` is a vendor-manifest merge-order gate, not Gemini behaviour.
+`#115` is director-benefits — separate section below.)
+
+**VERIFIED LIVE 2026-09-04 — read this before the "committed default"
+section below, which is about the repo, not production.** Queried the
+Render API directly (`GET /v1/services/{id}/env-vars` against
+`adgen-renderer` = `srv-da4bh9rbc2fs73cff2rg`, using the API key in
+`~/.render/cli.yaml`, workspace `tea-d1ved76mcj7s73fad3og`) rather than
+inferring from committed code — this is the same class of blind spot
+that made the `pro_plus` plan bump invisible to the repo until the file
+caught up, so it needed a direct query, not a grep. Result:
+**`VIDEO_PROVIDER=gemini` is explicitly set on the live `adgen-renderer`
+service**, overriding the file default below. `adgen-titler` /
+`adgen-api` / `adgen-orchestrator` and both `liquidretail_backend`
+services do **not** override it (irrelevant anyway — only the renderer
+dispatches generation). Checked in the same pass:
+**`VIDEO_RAW_CATALOG_REFERENCES=false`** is also explicit on
+`adgen-renderer` (matches the file default — **not** live), and
+**`VIDEO_BENEFITS_PLACEMENT` has no override anywhere** (runs on the
+file's `true` default, so director-benefits placement — section below —
+**is** live).
+
+**Practical effect of the "no `override:true`" dotenv behavior below:**
+production traffic is on Gemini, not Atlas. Everything in the "Two
+dispatch points" / "Charge point" / "Error classes" / "Lease" / "Key
+resolution" / "Reference assembly" sections after this point is **live
+production behavior today**, not a "when (if) flipped" hypothetical —
+read it that way. A fresh checkout, a local `npm start`, or a brand-new
+Render service without the dashboard var copied onto it will still run
+Atlas, because that override lives only on this one service's Render
+dashboard config, not in git. Re-verify with the same API query
+(`env-vars` endpoint, service id above) before trusting this if it's
+been a while — a dashboard override can be flipped back without a
+commit, and this file cannot detect that on its own.
+
+### The committed default is Atlas. Gemini is not the live provider *in this repo's own config* — production overrides it.
+
+**`config/defaults.env:394` is `VIDEO_PROVIDER=atlas`.** Code default in
+both dispatch sites is the same string:
+
+- `src/services/videoRouter.js:42-44` `activeProvider()` →
+  `String(process.env.VIDEO_PROVIDER || 'atlas').toLowerCase()`
+- `src/services/renderer.js:1460` same expression, inlined
+- `src/services/geminiVideoService.js:93-95` `isEnabled()` is
+  `=== 'gemini'` against that same read
+
+**`render.yaml` does not set `VIDEO_PROVIDER` on any of the four
+services.** Confirmed by reading the file: renderer/titler envVars are
+`ADGEN_ROLE`, `ADGEN_RENDERER_ENABLED`, `ADGEN_TITLER_ENABLED`,
+`ADGEN_MAX_INFLIGHT`, `MONGODB_URI` only.
+
+PR #108's own subject is `(merges dark)`. session.md's 2026-09-03
+landing note for #110 records the same: the path was deployed dormant
+and `VIDEO_PROVIDER` was not touched.
+
+**Render-dashboard override — CHECKED, not a blind spot anymore.**
+`src/config.js:10-13` loads dotenv **without** `override:true`, so a
+dashboard env var wins over `config/defaults.env`. That means this
+*file* cannot see a manual Render override by reading source — but the
+live Render API can, and was queried (see the VERIFIED LIVE callout at
+the top of this section): **`VIDEO_PROVIDER=gemini` is set on
+production `adgen-renderer`, overriding the `atlas` default below.**
+Same class of override as the historical `pro_plus` plan bump. If this
+gets re-flipped later without a commit (it can — dashboard changes
+don't touch git), this file will not reflect that on its own; re-query
+`GET /v1/services/srv-da4bh9rbc2fs73cff2rg/env-vars` to check current
+truth rather than trusting this doc indefinitely.
+
+### Two dispatch points, not one
+
+A grep for `videoRouter.generateForAd` finds nothing. That is not
+absence — regenerate aliases the module.
+
+| Caller | File | What it does |
+|---|---|---|
+| **First-time mint / claim** | `renderer.js:1460-1489` | Own seam. `atlas` → `atlasVideo.generateForAd`; `gemini` → `geminiVideo.generateForAd` (**no `prompt` argument** — provider owns prompt + refs). Anything else **throws** before a billable submit. Does **not** accept `vertex`. |
+| **Regenerate** | `adRegenerateService.js:43` requires `./videoRouter` as `veoService`; `:1669` calls `veoService.generateForAd({…, allowResume:false})` | Goes through `videoRouter.generateForAd`. |
+| **Storyboard prep only** | `renderer.js:159` `prepareStoryboard: veoPrepareStoryboard` | `videoRouter.prepareStoryboard` (`:52-55`) no-ops to `{storyboard:null}` for every non-atlas provider. |
+
+`videoRouter.js:73-158` `generateForAd`:
+
+- `atlas` → `atlasVideoService.generateForAd`
+- `gemini` → `geminiVideoService.generateForAd` (the block at `:76-140`
+  commented `ADDED 2026-09-03 WITH THE DIRECT-GEMINI CUTOVER`). This
+  branch exists because **before it**, `VIDEO_PROVIDER=gemini` fell
+  through regenerate into the deprecated Vertex Veo path (catalog-title
+  interpolation — the Vaportek class of bug). Renderer never called
+  this function for mint, so a router-only Gemini branch would have
+  been a no-op on first render while Atlas kept billing.
+- `vertex` → `aiVideoReferenceService.generateForAd` (reachable **only
+  by naming it**; no longer the fall-through)
+- anything else → throw, same fail-closed shape as renderer
+
+**Asymmetry worth not losing:** renderer refuses `vertex`; the router
+still accepts it. Flipping `VIDEO_PROVIDER=vertex` would throw on mint
+and still bill Vertex on regenerate.
+
+**Rollback** is the same shape as `ADGEN_TITLER_ENABLED`: flip
+`VIDEO_PROVIDER` back to `atlas` (or unset it — both code defaults are
+`atlas`). The Atlas path was not deleted. Gemini code is required at
+renderer boot (`renderer.js:150-152`) so a missing module fails at
+start, not on the first billable Gemini render, but with the flag at
+`atlas` that require is a load-only cost. Whether a Render dashboard
+edit mutates a **running** process's `process.env` without a restart is
+unverified (CONTRACT §9.2); the code re-reads `process.env` at call
+time.
+
+**Stale comments in source — do not trust these as current:**
+
+- `videoRouter.js:28-36` still says Gemini "IS NOT YET SWITCHABLE"
+  because it has no reference assembly. That was true at #108; **#110
+  closed it** (`geminiReferenceAssembly.js`, provider owns refs). The
+  remaining reason it is not live is the env default, not missing refs.
+- `renderer.js:1454-1458` still says the router's non-atlas arm is
+  Vertex fall-through. **#110 made that fail-closed.**
+- `geminiVideoKey.js:12-16` still says "no production Gemini video path
+  yet" / "forthcoming". The service exists; it is not the routed
+  default.
+- `renderer.js:18-23` file header still claims the video path is unwired
+  Phase 1c. It has been the live path for weeks.
+
+### Charge point is an accepted `interaction_id`, not HTTP status
+
+This is the opposite of Atlas and is why Atlas's
+`isDefinite429` / `submitRetryDecision` must not be ported here.
+
+Measured 2026-09-03: exceeding Google's cap did **not** return HTTP 429
+on POST. POST returned **200 with an `interaction_id`**; the first poll
+returned `too_many_requests`. An id is possibly billed. `background:false`
+bills **synchronously** (a stray $0.36 during a validation pass).
+`buildRequestBody` is exported so a dry run can inspect bytes without
+POSTing. Gemini **never** returns `price`; Atlas's "no price ⇒ unbilled"
+inference would mark every completion unbilled and resubmit forever.
+
+`geminiVideoService.generateForAd` (`:507+`) order of operations (do
+not reorder):
+
+1. Assemble refs (`assembleReferences`) unless the caller injected a
+   non-empty `images` array (harness / dry-run only).
+2. Resume from `Ad.veoPredictionId` when `allowResume` and a non-empty
+   id exist — GET only, never a second POST.
+3. Build prompt (provider-owned; see below).
+4. `lease.acquire()` **before** POST. Null after bounded internal
+   backoff → `{skipped:true, retryable:true, code:'GEMINI_LEASE_EXHAUSTED'}`.
+   Renderer holds the Ad claim through that loop; it does **not** persist
+   a counter (`renderer.js:170-174`).
+5. POST once. Stamp `veoPredictionId` + `veoProvider:'gemini'` +
+   `veoPrompt` / `veoModel` / `veoAspectRatio` / `veoResolution`
+   **before** the first poll (`:672-683`).
+6. Ledger at the charge point (`recordFlatCost` with
+   `providerRequestId`, not a non-schema `predictionId`).
+7. Poll. Heartbeat the lease every tick. Classify. Settle cost from
+   `usage.output_tokens_by_modality` video tokens (not a fictional
+   `usage.video_tokens` top-level field).
+8. Download Files-API URI → Cloudinary overwrite-by-identity
+   (`gemini_${interactionId}`). Return the **Cloudinary** URL as
+   `videoUrl` — the Google URI is credentialed and expires.
+9. `finally` release the lease.
+
+Prompt precedence (`:558-604`): (1) explicit `prompt` arg (harness
+only — real router/renderer call sites pass none), (2) non-empty
+`operatorPrompt`, (3) `ad.veoPrompt` **only when `isResuming`**, (4)
+`buildVeoPrompt` CORE. Ungated use of `ad.veoPrompt` is how a
+regenerate (`allowResume:false`) silently resubmitted the previous
+prompt.
+
+### Error classes (recovery vs terminal)
+
+`classifyPoll` (`geminiVideoService.js:344-378`):
+
+- `error.code === 'too_many_requests'` → `rate_rejected` (possibly billed, not a free replay)
+- `status` completed/succeeded → `completed` (billed)
+- `status` failed/error → `failed` (possibly billed)
+- **any top-level `error` object** that missed the above → `failed`,
+  **not** `pending`. #113 (`b1e3a10`) — a content-policy body is
+  `{error:{message,code}}` with **no** top-level `status`, so it used
+  to fall through to `pending`, poll until `MAX_POLL_MS`, and get
+  treated as a timeout instead of the rejection it already was.
+
+Then `generateForAd` maps those onto thrown / returned codes:
+
+| Code | When | `billed` | What recovery does |
+|---|---|---|---|
+| `GEMINI_AUTH_MISSING` | no key after fallback | `no` | never reached the network |
+| `GEMINI_NO_PROMPT` / `GEMINI_NO_REFERENCES` | refuse empty submit | `no` | throw before POST |
+| `GEMINI_SUBMIT_REJECTED` | POST, no id | `no` only on 4xx + structured `error`; else `possible` | only structured pre-work rejection licenses a replay |
+| `GEMINI_TRANSPORT` | socket/timeout on POST | `possible` | recover by GET, never POST again |
+| `GEMINI_LEASE_EXHAUSTED` | cap full after internal backoff | nothing billed | `{skipped, retryable:true}`. Renderer throws after that budget (unbilled fail). Regenerate parks on its claim instead of `markComplete('failed')` (`adRegenerateService.js:1676-1688`). |
+| `GEMINI_RATE_REJECTED_AFTER_ACCEPT` | poll `too_many_requests` after an accepted id | `possible` | receipt stays; later free GET can still collect |
+| `GEMINI_UNSETTLED_AT_TIMEOUT` | poll still pending at `MAX_POLL_MS` | `possible` | `unsettledAtTimeout:true` → leave `status:'rendering'` so bootRecovery can collect |
+| `GEMINI_CONTENT_POLICY_BLOCKED` | failed + message/code matches `/prohibited\|content polic\|filtered out\|violat.*polic/` | `possible` | **terminal** for this attempt (`retryable:false`). Own Slack path vs generic "Video generation failed". |
+| `GEMINI_GENERATION_FAILED` | any other failed poll | `possible` | terminal for this attempt |
+| `GEMINI_NO_OUTPUT_URI` | completed but no `steps[].content[].type==='video'` uri (file still PROCESSING) | billed | `unsettledAtTimeout` — same recoverability as poll timeout |
+| `GEMINI_OUTPUT_DOWNLOAD_FAILED` / `GEMINI_OUTPUT_MIRROR_FAILED` | billed + delivered at Google, local mirror failed | billed (`makeUnsettledMirrorError`) | **must not** write `status:'failed'` — that is invisible to bootRecovery's `status:'rendering'` selector and a later regenerate would double-bill |
+
+`bootRecoveryService.js:448-580` routes by `Ad.veoProvider` (null
+defaults to atlas). Gemini arm is GET-only (`resumeForAd` /
+`downloadOutputToBuffer` / `uploadMirroredMaster`); CAS on
+`renderStage:'boot-recovery-gemini-mirror'` so two autoscaled sweepers
+do not both pull the same master.
+
+### Lease (`geminiVideoLease.js`)
+
+Not a semaphore. Google's cap is **per project per model** (measured:
+`limit: 8` on `gemini-omni-1.1-flash`). adgen-renderer autoscales and
+is double-instanced during deploy drain, so an in-process limiter
+hands each instance the full budget.
+
+Mongo collections `geminivideoleases` (occupancy, unique `(scope,slot)`)
+and `geminivideoleaseevents` (append-only rate ledger). Holds **both**
+constraints because occupancy-vs-RPM was never settled by a two-wave
+probe:
+
+- (a) at most `GEMINI_VIDEO_MAX_SLOTS` (default **8**) leases held
+- (b) at most that many **acquisitions** per `GEMINI_VIDEO_RATE_WINDOW_MS`
+  (default 60s)
+
+Counting occupancy rows for (b) is structurally incapable of firing
+(there are only MAX_SLOTS rows; a recycled slot overwrites
+`acquiredAt`). The ledger is one INSERT per acquire. Unique index
+failure → fail closed (`acquire()` returns null). Live holders
+`heartbeat()` so TTL is abandon-of-dead-holder, not a wall-clock the
+generation must finish inside (`GEMINI_VIDEO_LEASE_TTL_MS` default
+600s, floor 120s). Independent of poll budget — same lesson as
+`REFRAME_CLAIM_TTL_FLOOR_MS`.
+
+**Sweeper-collision invariant** (`scripts/verifyGeminiLeaseSweeperCollision.js`):
+do **not** persist `Ad.deriveWaitAttempts` (or `renderAttempts`) as a
+Gemini lease-retry counter. `strandedRunSweeper` bounds
+`deriveWaitAttempts < 3`; `queuedArchiveSweeper` never reads it. A
+SIGTERM-queued receipt-free Gemini master that had cycled that counter
+became invisible to stranded recovery and looked like 24h mint leftover
+to the archive sweeper — silent loss of an **unbilled** creative. Fix:
+hold the renderer claim through `generateForAd`'s internal
+`LEASE_ACQUIRE_ATTEMPTS` (default 21 × 30s, floor 2) backoff.
+
+### Key resolution (`geminiVideoKey.js`)
+
+`GEMINI_VIDEO_API_KEY` if set and non-empty after trim/quote-strip,
+else `GEMINI_API_KEY`. Empty video key is a true no-op (same credential
+as grounded search) until a distinct key is supplied. Purpose: quota
+isolation — grounded-search (~1,526 `gemini-2.5-flash`
+`generate_content_paid_tier_2_requests`/24h) stays on `GEMINI_API_KEY`
+and cannot move to Atlas (see `geminiSearchProvider.js` ATLAS GROUNDING
+PROBE). Secret lives in the Render dashboard, never in
+`config/defaults.env` (`GEMINI_VIDEO_API_KEY=` at `:405`). Never log
+the key; fingerprint is last 4 chars. Pinned by
+`scripts/verifyGeminiVideoKey.js`.
+
+`src/config.js` does **not** require a Gemini key at renderer boot
+(renderer still requires `ATLAS_API_KEY`). A `VIDEO_PROVIDER=gemini`
+cutover without a key fails at submit (`GEMINI_AUTH_MISSING`), not at
+boot.
+
+### Reference assembly + shared DINO resolver
+
+`geminiReferenceAssembly.js` exists because #108's provider took
+`images` as a parameter and both callers passed `storyboard?.images`,
+always `[]` on the gemini path. The provider now **owns** assembly.
+Owner directive: **raw images, no reframe ladder, no paid nano-banana
+outpaint.** Reuses Atlas's `buildReferenceImages` /
+`sortCatalogMediasForReferenceStack` for packshot-protected ranking
+(never a second copy). Gemini takes **base64 bytes** (Atlas takes
+URLs); fetch validates `content-type` starts with `image/` (HTML 200s
+must not become paid garbage refs). Throws rather than returning a
+short stack (`GEMINI_REFS_NO_SEED` / `SEED_UNUSABLE` / `EMPTY`). Cap
+`GEMINI_VIDEO_MAX_REFERENCES` default **3**; total base64 ceiling
+`GEMINI_VIDEO_MAX_PAYLOAD_BYTES` default 20 MB is a **refusal**, not a
+truncation.
+
+Per-identity URL goes through `resolveVideoReferenceForMedia`
+(`videoReferenceResolver.js`) via `buildReferenceImages`'s
+`resolveUrlForIdentity` hook (`atlasVideoService.js:3695-3704`).
+
+**Three $0 tiers, strict order:**
+
+| Tier | `source` | What |
+|---|---|---|
+| 1 | `reframe-cache` | `Media.metadata.reframes[<aspectKey>].url` already persisted (prewarm / earlier Atlas `reframeReferenceForAspect`). |
+| 2 | `on-demand-yolo` | Cache miss, but DINO bboxes on `refinedProducts[]`. `chooseStrategy` crop URL, **read-only** (does not persist — persist belongs to the reframe writer). Exists because prewarm's rank-based top-3 can diverge from render's operator picks. Only `action:'crop'` resolves; skip/defer/composite-mask fall through. |
+| 3 | `c-fill-fallback` | No cache, no usable bboxes. Cloudinary `c_fill,g_auto`. |
+
+Aspect key normalisation is bytewise-identical to
+`reframeReferenceForAspect` (`':'` / `'.'` → `_`) so a mismatch cannot
+silently miss every cache entry.
+
+**`fde6003` "tier-3 c_fill ships source-native dims":**
+`cropImageUrlForAspect` gained an optional 4th `targetDims` argument
+(`atlasVideoService.js:1371-1384`). Tier 3 now computes
+`sourceNativeCropDims` — largest crop rectangle at the requested
+aspect that **fits inside the source without upscaling** (a 2000×2000
+source at 9:16 → 1125×2000, not 720×1280). Unknown dims still use
+output-native `imageDimsForAspect` (byte-identical to pre-change).
+Never upscales.
+
+**Does Atlas consume this resolver?** **Not today.** Atlas's default
+`buildReferenceImages` path still calls `reframeReferenceForAspect`,
+which is gated on `VIDEO_PROVIDER=atlas`. The shared resolver is
+**opt-in** via `resolveUrlForIdentity`; only
+`geminiReferenceAssembly.js` passes that hook. Atlas callers of
+`cropImageUrlForAspect` omit `targetDims`. The helper is written as
+the contract every video-model path *should* call
+(`videoReferenceResolver.js:1-11`); only Gemini assembly actually does.
+Hand-synced with `liquidretail_backend/services/videoReferenceResolver.js`
+— the cache field is the same Mongo doc.
+
+### Gemini knobs (code defaults; most are **not** in `defaults.env`)
+
+| Knob | Default | Where |
+|---|---|---|
+| `VIDEO_PROVIDER` | **`atlas`** (file + code) | `config/defaults.env:394` |
+| `GEMINI_VIDEO_API_KEY` | empty → fall back to `GEMINI_API_KEY` | `defaults.env:405`, `geminiVideoKey.js` |
+| `GEMINI_VIDEO_MODEL` | `gemini-omni-1.1-flash` | `geminiVideoService.js:61` |
+| `GEMINI_VIDEO_RESOLUTION` | `1080p` (measured same token count as 720p) | `:85` |
+| `GEMINI_VIDEO_POLL_MS` | 600000 | `:104-107` |
+| `GEMINI_VIDEO_POLL_INTERVAL_MS` | 5000 | `:109-112` |
+| `GEMINI_LEASE_ACQUIRE_ATTEMPTS` | 21, **floor 2** | `:129-133` |
+| `GEMINI_LEASE_ACQUIRE_BACKOFF_MS` | 30000 | `:134-137` |
+| `GEMINI_VIDEO_MAX_SLOTS` | 8 | `geminiVideoLease.js:75-78` |
+| `GEMINI_VIDEO_RATE_WINDOW_MS` | 60000 | `:82-85` |
+| `GEMINI_VIDEO_LEASE_TTL_MS` | 600000, floor 120000 | `:116-120` |
+| `GEMINI_VIDEO_MAX_REFERENCES` | 3 | `geminiReferenceAssembly.js:63-66` |
+| `GEMINI_VIDEO_MAX_PAYLOAD_BYTES` | 20 MiB | `:79-82` |
+
+None of these are in `src/services/concurrency.js`. Measured Gemini
+cost at matched 1080p is **$1.0351**/master vs Atlas settle **$0.90**
+(~15% more). Operator `modelOverride` is honored **only** when it
+already looks like `gemini-*`; Atlas dropdown slugs are ignored
+(`resolveGeminiModel`, `:157-161`). There is no Atlas-slug → Gemini
+mapping.
+
+---
+
+## Director-benefits placement on live titling (PR #115 / backend #386)
+
+`2c4b0b9`. Not a video-**generation** change.
+
+- **Mint (still backend's job in prod; vendored copy here):**
+  `campaignAdsGenerationService.js:3694-3716` stamps
+  `Ad.videoTitleDirection` via `getVideoTitleDirection` when
+  `VIDEO_BENEFITS_PLACEMENT === 'true'` (`config/defaults.env:1882`
+  ships `true`). Failure fail-closes to `{include:false,
+  reason:'director-failed:…'}` — expansion still mints (Omni is the
+  money). One LLM call per `(product × profile × size)`, memoized
+  across the 21-ad mixed kit (6 calls, not 21).
+- **Live titling consumer:** `brandScriptExecutor.js:2416-2422`
+  `applyBenefitsPlacement({ spec, meta, format, direction: ad.videoTitleDirection })`
+  inside `renderWithRemotionAndSave`, **after** `resolveSpec` and
+  **before** Remotion. Honours an already-visible benefits slot;
+  splices a benefits slot into `proof` (never `hook`) when
+  `direction.include === true` and `meta.benefits` is non-empty;
+  validates via `validateTitleSpec` and skips the splice if invalid.
+- **Not called from** `renderer.js`, `titler.js`, or
+  `retitleConsumer.js` directly — those all go through
+  `renderWithRemotionAndSave` / `renderBrandScriptAndSave`, so first
+  title, titler handoff, and retitle all see it.
+  `scripts/verifyVideoBenefitsDirector.js` W1 pins that wiring.
+
+`render.yaml` does not set `VIDEO_BENEFITS_PLACEMENT` (inherits the
+file default). **Checked live 2026-09-04 (Render API, `adgen-renderer`
+env-vars): no dashboard override exists**, so it runs on the file's
+`true` default — director-benefits placement is live in production,
+unlike `VIDEO_PROVIDER` (which *is* overridden — see the Direct-Gemini
+section above).
+
+---
+
+## Vision-QC derive ship gate is titling-only (`fcf3709`)
+
+`adVisionQcService.js:83-103`. Four judge categories:
+`competitor_marks`, `product_fidelity`, `text_defects`,
+`layout_safe_box`. Pass floor 7.
+
+A derive (`Ad.deriveFromMaster`) is a face-safe crop of a sibling
+master's **already-paid** video pixels plus Remotion titling. It cannot
+fix a fidelity / competitor-mark defect baked into the master.
+`runVideoPostRenderQc({ titlingOnlyGate })` (`:2093-2178`) still **asks
+the judge for all four scores** (persisted on `Ad.visionQc` —
+derive-side `product_fidelity` is how master-QC false-positives get
+caught), but `verdict.pass` is re-scoped to
+`TITLING_CATEGORIES = ['text_defects','layout_safe_box']` only.
+
+Caller: `brandScriptExecutor.js:1864-1875`
+`titlingOnlyGate = !!ad.deriveFromMaster`. Log lines still print all
+four scores; ungated below-floor scores get a `~` marker, gated
+failures get `!`.
+
+---
+
+## Autoscale must live in `render.yaml` (`401e54f`)
+
+Same footgun class as the `pro_plus` plan-name drift. Measured
+2026-09-03 16:45 UTC: PR #109's deploy fired an
+`autoscaling_config_changed` event that flipped enabled `true→false`
+and dropped titler from 6 instances to 1, mid-run. **Render treats a
+missing `scaling:` block as "disable autoscale", not "leave the
+dashboard alone."**
+
+Pinned in `render.yaml` as of `401e54f`:
+
+| Service | min | max | targets |
+|---|---|---|---|
+| `adgen-renderer` | 2 | **4** (not 8) | 60% memory / 60% CPU |
+| `adgen-titler` | 4 | 12 | 60% / 60% |
+
+An older comment in the renderer `plan:` block still says "autoscaling
+is currently DISABLED on this service" (`render.yaml:54-56`). That
+sentence is leftover from before the pin; the `scaling:` stanza
+immediately below it is the authority. `geminiVideoLease.js:11` still
+says "min=2/max=8, currently disabled" — also stale relative to the
+file.
+
+---
+
 ## Render lifecycle (`src/services/renderer.js`)
 
-Dispatch (`processAd`, `:618-624`):
+Dispatch (`processAd`, `:2174-2179` as of `fde6003`):
 
 - `renderRoute === 'html_gen'` → `renderStatic`
 - `renderRoute === 'veo'` → `renderVideo`
@@ -229,25 +655,37 @@ Skip (`result.skipped`) stamps `status:'failed'` and bumps `skipped`
 
 ### 3. Video master path (`renderVideo` when `resolveDeriveFromMaster(ad)` is falsy)
 
-Money-critical: this is the **only** path that may call
-`atlasVideo.generateForAd`.
+Money-critical: this is the **only** renderer path that may call a
+billable video submit (`atlasVideo.generateForAd` **or**
+`geminiVideo.generateForAd`). Derives still must not. Provider choice
+is `VIDEO_PROVIDER` at `renderer.js:1460-1489` — see Direct-Gemini
+section. As of `fde6003` the committed value is **`atlas`**, so the
+live submit is still Atlas Omni.
 
 1. `prepareStoryboard` via a **local alias**
-   (`:94-99`, call at `:548`).
-   `src/services/videoRouter.js:75` exports `prepareStoryboard`.
-   Backend `routes/ads.js:81` binds it as
+   (`renderer.js:159`, call at `:1435`).
+   `src/services/videoRouter.js:52-55` exports `prepareStoryboard`.
+   Backend `routes/ads.js` binds it as
    `prepareStoryboard: veoPrepareStoryboard`. Phase 1c copied the **call**
    but destructured the alias name; that was `undefined` and **every
    first-time video master** threw `veoPrepareStoryboard is not a function`.
-   Fixed on `origin/master` by aliasing explicitly:
+   Fixed by aliasing explicitly:
    `const { prepareStoryboard: veoPrepareStoryboard } = require('./videoRouter')`.
-2. `atlasVideo.generateForAd` (`:553`) — billable Omni submit+poll. Stamps
-   `veoPredictionId` before polling.
-3. Persist master + `titlingResumeState:'claimed'` in one write (`:560-580`).
-4. **Remotion titling in-process** (`:582-586`):
-   `renderBrandScriptAndSave({ ad, brand })`. This is the RAM-bound step.
-5. Terminal stamp: `status:'draft'`, clear `titlingResumeState` and claim
-   (`:592-603`). `bumpRunCounter(..., 'succeeded')`.
+   On Atlas this returns `{storyboard:null}` (Ken Burns / CORE prompt
+   directs motion). On Gemini it no-ops the same way.
+2. Provider seam (`:1460-1489`) — `atlas` or `gemini` only; unknown
+   values throw. Each provider stamps `veoPredictionId` before polling.
+   `veoResult.skipped` (including `GEMINI_LEASE_EXHAUSTED`) throws after
+   the provider's internal budget; nothing billed.
+3. Persist master + `titlingNeeded` (handoff) or in-process titling,
+   **one** `$set` with `veoVideoUrl` + `veoReferenceImages` together
+   (`:1536+`).
+4. When `isTitlerEnabled()` is false: **Remotion titling in-process**
+   via `renderBrandScriptAndSave` (RAM-bound). When true: stamp
+   `titlingNeeded:true`, clear claim, return — titler picks it up.
+   `applyBenefitsPlacement` runs inside that titling call, not here.
+5. Terminal stamp: `status:'draft'`, clear claim,
+   `bumpRunCounter(..., 'succeeded')`.
 
 ### 4. Video derive path (`if (deriveFromFmt)` is the **first** branch)
 
@@ -286,9 +724,9 @@ on the backend `runRenderLoop` happy path when the handoff flag is on
 
 ## Vendored services — the maintenance hazard
 
-This repo copies backend modules under `src/`. As of `881dabd` there are
-**134** top-level `src/services/*.js` files (plus `brandScripts/`,
-`brandStyles/`, `reviewAdapters/`) and **33** Mongoose models under
+This repo copies backend modules under `src/`. As of `fde6003` there are
+**155** top-level `src/services/*.js` files (plus `brandScripts/`,
+`brandStyles/`, `reviewAdapters/`) and **35** Mongoose models under
 `src/models/`. They write the **same production collections**.
 
 **A fix in `liquidretail_backend` is not live here until it is ported.**
@@ -377,6 +815,61 @@ Sibling backend location for cross-repo checks:
 | `verifyCampaignRunHeartbeatWired.js` | **Now passing — this was fixed on 2026-08-24 and the harness was renamed (the `_KNOWN_OPEN` suffix is gone).** It previously pinned an expected-fail: `startRunHeartbeat` was exported from `campaignRunHeartbeat.js` with **zero** call sites in `src/`. `startRunHeartbeat` now appears 4× in `renderer.js` on `origin/master`. Why it mattered: without the beat, `CampaignRun.updatedAt` only moves when an ad *settles*, so a long video-titling gap could drop the backend duplicate-generation gate's running arm. |
 | `verifyTitlingRecoverability.js` | Titling-failure recoverability (2026-08-25): (A) `brandScriptExecutor.stampTitlingFailureAndThrow` decides resumable-vs-terminal correctly for OOM/timeout/generic, bounded by a shared `TITLING_ATTEMPTS_MAX` ceiling (execution, real function, stubbed `Ad`). (B) the resume sweep is wired from `renderer.js` (not the RAM-inadequate `orchestrator.js` — see CLAUDE.md's titlingResumeService note), gated on `isAdgenRendererEnabled()`, `orchestrator.js` does NOT run it, and `titler.js`'s own titling call site was mirrored to the same gate (structural). (C) two REAL concurrent `resumeUntitledMasters()` passes racing the same ad — only one titles it (execution, in-memory Mongo-like stub, `scripts/lib/miniMongoStub.js`, whose `findOneAndUpdate` correctly models Mongoose's `{new:true/false}` pre/post-image semantics — an earlier version of the stub ignored `opts` and would have hidden a real sign/timing bug in the attempt-cap read-back). (D) a cap-exceeded titling failure keeps its detailed `renderError` — `processAd`'s unscoped `noteRenderIssue` no longer clobbers the stamp's message/code with a generic one. |
 | `verifyTitlingResumeNeverResubmits.js` | THE MONEY CHECK: a resumed titling attempt can never re-submit a paid Atlas Omni generation. `atlasVideoService.submitGeneration` has exactly one call site, structurally inside the `else` of `if (isResuming)`; a real require-graph BFS (Node's own `require.resolve`) proves `atlasVideoService.js` is unreachable from `titlingResumeService.js`'s or `brandScriptExecutor.js`'s entire transitive require graph, with a positive control (same BFS from `renderer.js`, which DOES require it) ruling out a vacuous pass. |
+| `verifyGeminiVideoProvider.js` | **THE GEMINI MONEY HARNESS.** Offline (source-extracted pures, no axios/mongoose). Pins measured request shape (`input` not `inputs`, duration `"10s"`, `background:true`, `task:reference_to_video`); never `$0` on a real charge; `classifyPoll` content-policy / no-status `error` is terminal not pending; `too_many_requests` after accept is not a free replay; Gemini never infers unbilled from missing `price`; lease is Mongo not `semaphore.js`; output URI is walked from `steps[].content[]` not inferred `output.uri`; download/mirror failures set `unsettledAtTimeout`; auth header reads `.apiKey` not the key object (the live 403). |
+| `verifyGeminiReferenceAssembly.js` | Provider owns refs + prompt so a caller cannot forget. Pins `GEMINI_NO_REFERENCES` / `GEMINI_NO_PROMPT` refuse-before-submit; renderer and videoRouter gemini branches pass **no** `prompt:` / `images:` from `storyboard`; assembly throws rather than returning a short stack; `resolveUrlForIdentity` is wired to `resolveVideoReferenceForMedia`. |
+| `verifyGeminiLeaseSweeperCollision.js` | A Gemini cap-miss must never `$inc` `deriveWaitAttempts` / `renderAttempts`. Execution against real `buildStrandedAdFilter` / `buildQueuedArchiveFilter`: after N lease-wait cycles + SIGTERM `rendering→queued`, stranded sweeper still matches and queued-archive does not treat a fresh `queuedAt` as mint leftover. |
+| `verifyGeminiVideoLease.js` | Execution against fake Mongo occupancy + rate-event collections: stolen-slot release by the evicted holder is a no-op (B5); sequential single-slot recycle cannot defeat the rate window (B6); every Mongo error fails closed (B7). Complements the provider harness's structural lease scan. |
+| `verifyGeminiVideoKey.js` | `GEMINI_VIDEO_API_KEY` empty in `defaults.env`; trim/quote-strip; fallback to `GEMINI_API_KEY` when unset/empty; no key material in logs (last-4 fingerprint only). |
+| `verifyVideoReferenceResolver.js` | Cache-first URL resolver: aspect-key normalisation cannot silently miss `metadata.reframes`; tier-1 cache / tier-2 on-demand crop / tier-3 `c_fill`; source-native dims on tier 3; `preferReframe:false` skips to c_fill. |
+| `verifyVideoBenefitsDirector.js` | Port of backend #386 harness. Mint stamps `Ad.videoTitleDirection`; `applyBenefitsPlacement` is wired in `renderWithRemotionAndSave` (not renderer/titler/retitle directly); include/skip/already-present; flag-off is identity. |
+
+The runner globs every `scripts/verify*.{js,mjs}` — **101 files** as of
+`fde6003`. The table above is the money / lifecycle / Gemini subset, not
+the whole suite. Also in `scripts/` and **not** given a row here (do not
+treat absence from this table as "not a real check"):
+
+`verifyAdgenClaimRespectsRendererFlag.js`,
+`verifyAdgenRunFeedWired.js`, `verifyAdgenRunHeartbeat.js`,
+`verifyApparelSafetyHardening.js`, `verifyAttributionViability.js`,
+`verifyBasePlateCrop.js`, `verifyBootRecoveryClaimAware.js`,
+`verifyBootRecoveryWired.js`, `verifyBrandConsistency.js`,
+`verifyBrandTaglineNoInversion.js`,
+`verifyCleanupMergedBranchesSafety.js`, `verifyCloudinaryMirror.js`,
+`verifyCorrectiveNoteRegen.js`, `verifyDurableCostReconcile.js`,
+`verifyFaceKeepOut.js`, `verifyFaceSafeCrop.js`,
+`verifyHandoffContract.js`, `verifyIconFontAndCrossSheetGenerics.js`,
+`verifyKeepOutBandGeometry.mjs`, `verifyLadderWallclockBounded.js`,
+`verifyLogoBufferCache.js`, `verifyLogoColorPreservation.js`,
+`verifyLogoSafeBox.js`, `verifyModerationFastFail.js`,
+`verifyMultiSlotStackFit.mjs`, `verifyNotChargeableRetryAlert.js`,
+`verifyOperatorPromptPrecedence.js`, `verifyPmaxCtaAllIntents.js`,
+`verifyPmaxDrawCtaSocialProof.js`, `verifyProofReservationGate.js`,
+`verifyQcTrustsLogoGeometry.js`, `verifyQuoteColourway.js`,
+`verifyQuoteScopeImplicitPairs.js`, `verifyQuoteSnippetL2Cache.js`,
+`verifyQuoteSnippetProofBarGate.js`, `verifyRatingFurniture.js`,
+`verifyReframeClaimShutdown.js`, `verifyReframeHoldBounded.js`,
+`verifyReframeStrategy.js`, `verifyRegenCountPersisted.js`,
+`verifyRegenerateConsumerClaim.js`, `verifyRegenerateInFlightGate.js`,
+`verifyRegenerateLeaseExpiry.js`, `verifyRegenerateShutdownDrain.js`,
+`verifyRegenerateStatusPromotionAndCascade.js`,
+`verifyRemotionBrowserPrewarm.js`, `verifyRemotionChildIsolation.js`,
+`verifyRemotionMemoryBudget.js`, `verifyRemotionPrebuild.js`,
+`verifyRemotionTitlingPayloadIds.js`, `verifyRenderErrorTails.js`,
+`verifyRenderStageTerminal.js`, `verifyRendererSlackAlerts.js`,
+`verifyRendererTitlerClaimPartition.js`,
+`verifyRetitleConsumerClaim.js`, `verifySharedInvariants.js`,
+`verifySharpConcurrency.js`, `verifyShutdownReleaseReceiptAware.js`,
+`verifySingletonLease.js`, `verifySocialProofGoalFraming.js`,
+`verifyStageTiming.js`, `verifyStaticCtaDeterminism.js`,
+`verifyStaticIntentChanges.js`, `verifyStaticReceiptResume.js`,
+`verifyTimeoutCoherence.js`, `verifyTitleGroupsNeverOverlap.js`,
+`verifyTitlerBackpressure.js`, `verifyTitlerClaimReclaim.js`,
+`verifyTitlerHandoff.js`, `verifyTitlingDualClaim.js`,
+`verifyTitlingHeartbeat.js`, `verifyUnsettledTimeoutBounded.js`,
+`verifyVendorDrift.js`, `verifyVideoMasterCloudinaryPublicId.js`,
+`verifyVideoQcVerdictSurvives.js`, `verifyVideoReferencePath.js`,
+`verifyVideoResumeFromReceipt.js`,
+`verifyVisionQcPersistedVerdictInvariant.js`.
 
 ---
 
@@ -395,12 +888,14 @@ Two layers:
 
 | Knob | Where | Default | What it bounds |
 |---|---|---|---|
-| `ADGEN_MAX_INFLIGHT` | `src/config.js:58`, `render.yaml` renderer env `32` | 32 | Burst-claim ceiling per renderer instance (`poll` while `inFlight < MAX_INFLIGHT`). I/O-bound statics+video polls. |
-| `ADGEN_POLL_MS` | `src/config.js:68` | 500 | Claim poll interval (ms). |
-| `ADGEN_RENDERER_ENABLED` | `src/config.js:37-39`, `config/defaults.env` | `true` in file | Sleep vs claim. |
-| `DERIVE_MASTER_WAIT_MS` | `renderer.js:106` | 60000 | How long a derive holds a slot waiting for the sibling master. |
-| `DERIVE_MASTER_POLL_MS` | `renderer.js:107` | 5000 | Poll interval inside that wait. |
-| `MAX_DERIVE_WAIT_ATTEMPTS` | `renderer.js:108` | 60 | Requeue ceiling (~60 min). |
+| `ADGEN_MAX_INFLIGHT` | `src/config.js:110`, `render.yaml` renderer env `32` | 32 | Burst-claim ceiling per renderer instance (`poll` while `inFlight < MAX_INFLIGHT`). I/O-bound statics+video polls. |
+| `ADGEN_POLL_MS` | `src/config.js:120` | 500 | Claim poll interval (ms). |
+| `ADGEN_RENDERER_ENABLED` | `src/config.js:64-66`, `config/defaults.env` | `true` in file | Sleep vs claim. |
+| `VIDEO_PROVIDER` | `config/defaults.env:394`; **not** in `render.yaml`; **overridden to `gemini` on live `adgen-renderer`'s Render dashboard** (verified 2026-09-04) | File/code default `atlas`; **live value is `gemini`** | Atlas vs Gemini vs Vertex. See Direct-Gemini section — production is on Gemini today. |
+| `DERIVE_MASTER_WAIT_MS` | `renderer.js:166` | 60000 | How long a derive holds a slot waiting for the sibling master. Comment at `:718` still says 12 min — stale; the constant is 60s. |
+| `DERIVE_MASTER_POLL_MS` | `renderer.js:167` | 5000 | Poll interval inside that wait. |
+| `MAX_DERIVE_WAIT_ATTEMPTS` | `renderer.js:168` | 60 | Requeue ceiling (~60 min). |
+| `GEMINI_VIDEO_MAX_SLOTS` | `geminiVideoLease.js:75-78` (not in `concurrency.js` / `defaults.env`) | 8 | Global Gemini occupancy + rate cap. Mongo lease, not in-process. |
 
 Remotion RAM, not `MAX_INFLIGHT`, is the binding constraint
 (`src/config.js:54-57`). `REMOTION_QUEUE_CONCURRENCY` self-limits the
@@ -458,10 +953,16 @@ Budget against **1.97 GiB/slot**: 1 → ~2.1 GiB (26%), **2 → ~4.0 GiB (50%)**
 3 → ~6.0 GiB (75%), 4 → ~8.0 GiB (OOM). Set to 2 (PR #5), which also stays
 under the 60% autoscale trigger.
 
-Autoscale min 2 / max 8 does not rescue a single process whose RSS is over the
-cap — during the incident it scaled 2 → 3 → 4 instances and made things worse,
-because each new instance runs its **own** slots into the same per-instance
-ceiling. Instance SIZE or this number are the only real levers.
+Autoscale does not rescue a single process whose RSS is over the cap —
+during the 2026-08-21 incident it scaled 2 → 3 → 4 instances and made
+things worse, because each new instance runs its **own** slots into the
+same per-instance ceiling. Instance SIZE or `REMOTION_QUEUE_CONCURRENCY`
+are the only real levers.
+
+**Committed autoscale as of `401e54f` / `fde6003` is not max 8.**
+`render.yaml` pins renderer **min 2 / max 4** and titler **min 4 / max 12**.
+A missing `scaling:` stanza on blueprint sync **disables** dashboard
+autoscale (measured 2026-09-03, PR #109). See Autoscale section above.
 
 ---
 
@@ -716,10 +1217,22 @@ revert-proven). Full write-up: `session.d/2026-08-27_reframe-hold-bounded.md`.
 
 ## What this repo does not do (yet)
 
-- Expansion / Director / Judge / Ad mint — still backend.
+- Expansion / Director / Judge / Ad mint — still backend. (The vendored
+  `campaignAdsGenerationService` **does** stamp `Ad.videoTitleDirection`
+  at mint in this tree, and live titling **does** apply it — but the
+  production mint still runs on the backend process.)
 - Orchestrator work (the container boots; it does not expand).
 - HTTP generate, auth, catalog, publish.
 - `GET /health` is the entire public HTTP surface.
+- ~~Direct-Gemini is not the routed default~~ — **it is, as of 2026-09-04.**
+  `VIDEO_PROVIDER=atlas` is still the repo/code default
+  (`config/defaults.env:394`), but production `adgen-renderer` carries
+  a Render-dashboard override to `gemini`, confirmed via a direct query
+  of the live service's env vars (see the Direct-Gemini section above
+  for the exact method — re-query before trusting this if it's been a
+  while, since a dashboard flip leaves no commit trail). Rollback, if
+  ever needed, is flipping that one dashboard var back to `atlas` (or
+  deleting it) — no code change required either direction.
 - ~~`startRunHeartbeat` is vendored and **unwired**~~ — **WIRED as of 2026-08-24.**
   It is now called from `renderer.js` (4 sites) and
   `scripts/verifyCampaignRunHeartbeatWired.js` passes. Left visible rather
@@ -728,9 +1241,10 @@ revert-proven). Full write-up: `session.d/2026-08-27_reframe-hold-bounded.md`.
   is started~~ — **`titlingResumeService.resumeUntitledMasters()` is WIRED
   as of the video-titling-recoverability PR (2026-08-25)**, started from
   `renderer.js` (`pro_plus`, 8 GB), on a 90s-delay/5-min interval modeled on
-  backend's own wiring, gated on `isAdgenRendererEnabled()` so it cannot
+  backend's own wiring (since deleted — see the "RESOLVED — SUPERSEDED" note
+  below), gated on `isAdgenRendererEnabled()` so it could not
   race backend's own render/resume path over the shared collection when
-  the flag is off. **NOT run from `orchestrator.js`** — that was the first
+  the flag was off. **NOT run from `orchestrator.js`** — that was the first
   draft, on the reasoning that it's the one adgen role Render keeps
   singleton, but adversarial review (Grok, xhigh) caught that
   `orchestrator`'s Render plan is `starter` (~512 MB) while
