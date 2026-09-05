@@ -310,10 +310,11 @@ check('D1: syncBrandGenericCatalog\'s end-of-run triggers contain no setImmediat
   );
   assert.ok(!stripComments(r).includes('setImmediate('), 'the end-of-run triggers must not defer via setImmediate — see the ROBUSTNESS comment');
   assert.equal(
-    (r.match(/backgroundWork\.push\(/g) || []).length, 3,
-    'expected exactly 3 collected triggers (enrichment + materialize/YOLO-detect chain + category inference)'
+    (r.match(/backgroundWork\.push\(/g) || []).length, 4,
+    'expected exactly 4 collected triggers (product enrichment + materialize/YOLO-detect chain + category inference + brand font ingest)'
   );
   assert.ok(r.includes("require('./catalogProductEnrichmentService')"), 'enrichment trigger missing from the collected region');
+  assert.ok(r.includes("require('./brandEnrichmentService')"), 'brand font ingest trigger missing from the collected region');
   assert.ok(
     hasMaterializeYoloChain(r),
     'materialize+YOLO-detect chain missing from the collected region — expected either the inline catalogMediaMaterializeService + catalogYoloDetectionService requires (bb91303c) or catalogPostSyncOrchestrator.runPostSyncChain (31469b82)'
@@ -351,10 +352,11 @@ check('E1: legacy syncBrandShopify\'s background triggers contain no setImmediat
   );
   assert.ok(!stripComments(r).includes('setImmediate('), 'the legacy path\'s background triggers must not defer via setImmediate — see the ROBUSTNESS comment');
   assert.equal(
-    (r.match(/backgroundWork\.push\(/g) || []).length, 2,
-    'expected exactly 2 collected triggers (catalog enrichment + materialize/YOLO-detect chain)'
+    (r.match(/backgroundWork\.push\(/g) || []).length, 3,
+    'expected exactly 3 collected triggers (catalog enrichment + materialize/YOLO-detect chain + brand font ingest)'
   );
   assert.ok(r.includes("require('./catalogProductEnrichmentService')"), 'enrichment trigger missing from the collected region');
+  assert.ok(r.includes("require('./brandEnrichmentService')"), 'brand font ingest trigger missing from the collected region');
   assert.ok(
     hasMaterializeYoloChain(r),
     'materialize+YOLO-detect chain missing from the collected region — expected either the inline catalogMediaMaterializeService + catalogYoloDetectionService requires (bb91303c) or catalogPostSyncOrchestrator.runPostSyncChain (31469b82) — this legacy path has no category-inference trigger'

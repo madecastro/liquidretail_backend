@@ -159,6 +159,12 @@ async function handleMediaChange({ cred, value }) {
     enqueueRun,
     trigger: 'webhook'
   });
+  try {
+    require('./brandEnrichmentService')
+      .queueBrandEnrichment(cred.brandId, 'ig-webhook', brandName);
+  } catch (err) {
+    console.warn(`   ⚠️  enrichment enqueue failed for webhook brand=${cred.brandId}: ${err.message}`);
+  }
   return { mediaId, ...(ingested || {}) };
 }
 

@@ -210,6 +210,13 @@ async function syncBrandApify(brandId, { skipInstagram = false } = {}) {
     out.shopify = { ok: false, reason: 'aborted before Shopify sync started' };
   }
 
+  try {
+    require('./brandEnrichmentService')
+      .queueBrandEnrichment(brand._id, 'apify-orchestrator', brand.name);
+  } catch (err) {
+    console.warn(`   ⚠️  enrichment enqueue failed for apify-orchestrator brand=${brand._id}: ${err.message}`);
+  }
+
   // lastSyncedAt stamp must not be able to strand the progress row —
   // a transient save failure would otherwise skip markCancelled/succeed
   // below and leave the run "in progress" forever in the dock.
@@ -356,11 +363,15 @@ async function syncBrandInstagram(brand, run = null) {
   // to show it. Call directly (no setImmediate needed — an async function
   // already yields at its first await) and expose the promise so a caller
   // that owns its own connection lifecycle can await it before disconnecting.
-  summary.backgroundWork = [
-    require('./brandEnrichmentService')
-      .enrichBrandFromUrl(brand._id)
-      .catch(err => console.warn(`   ⚠️  brand enrichment enqueue failed: ${err.message}`))
-  ];
+  try {
+    summary.backgroundWork = [
+      require('./brandEnrichmentService')
+        .queueBrandEnrichment(brand._id, 'apify-ig', brand.name)
+    ];
+  } catch (err) {
+    console.warn(`   ⚠️  brand enrichment enqueue failed: ${err.message}`);
+    summary.backgroundWork = [];
+  }
 
   summary.durationMs = Date.now() - t0;
   console.log(`📸 Apify IG sync done: brand=${brand._id} fetched=${summary.fetched} ingested=${summary.ingested} skipped=${summary.skipped} errors=${summary.errors} in ${summary.durationMs}ms`);
@@ -793,6 +804,15 @@ async function syncBrandShopify(brand, run = null) {
         .enqueueBrandProductEnrichment(brand._id)
         .catch(err => console.warn(`   ⚠️  catalog enrichment enqueue failed: ${err.message}`))
     );
+
+    try {
+      backgroundWork.push(
+        require('./brandEnrichmentService')
+          .queueBrandEnrichment(brand._id, 'apify-shopify', brand.name)
+      );
+    } catch (err) {
+      console.warn(`   ⚠️  enrichment enqueue failed for apify-shopify brand=${brand._id}: ${err.message}`);
+    }
 
     // Materialize + YOLO detect chain via the resilient orchestrator.
     // See services/catalogPostSyncOrchestrator.js header for the failure

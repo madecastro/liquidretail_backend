@@ -104,14 +104,24 @@ async function run({ req, args }) {
   brand.curatedFields = [...curatedFields];
   await brand.save();
 
-  // If websiteUrl changed to a non-empty value, retrigger enrichment.
+  // If websiteUrl changed, reset website-font stamps (the old domain's
+  // faces must not leak) and retrigger enrichment. Meta-ads stamps stay
+  // — those are not tied to the marketing site. Mirrors routes/brand.js.
   let enrichmentQueued = false;
   if (changed.websiteUrl && changed.websiteUrl !== priorWebsite) {
+    brand.enrichmentSources = [];
+    brand.customFonts = [];
+    brand.websiteFontUsage = null;
+    brand.fontIngestedAt = null;
+    brand.fontIngestError = null;
+    brand.fontIngestAttempts = 0;
+    brand.fontIngestNextRetryAt = null;
+    brand.markModified('customFonts');
+    brand.markModified('websiteFontUsage');
+    await brand.save();
     try {
-      const { enrichBrandFromUrl } = require('../brandEnrichmentService');
-      enrichBrandFromUrl(brand._id).catch((err) =>
-        console.warn(`brand.patch: enrichment fire-and-forget failed for "${brand.name}": ${err.message}`)
-      );
+      require('../brandEnrichmentService')
+        .queueBrandEnrichment(brand._id, 'website-url changed', brand.name);
       enrichmentQueued = true;
     } catch (_) { /* non-fatal */ }
   }

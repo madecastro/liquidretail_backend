@@ -28,7 +28,17 @@ const {
 
 const { chatCompletion, isConfigured: atlasLlmConfigured } = require('./atlasLlmService');
 const { inspectTailwindTheme } = require('./tailwindTokenExtractor');
-const { metaAdsFontsEnabled } = require('./metaAdsFontService');
+const { metaAdsFontsEnabled, metaAdsScanConfigured } = require('./metaAdsFontService');
+
+// Apify runActorSync timeout is 5*60*1000+15_000 = 315s
+// (metaAdsFontService.runActorSync). Vision chatCompletion uses the
+// LLM transport's 120s budget. 10 minutes = 315s + 120s + 165s slack
+// for Mongo/save so a crashed holder is released only after a healthy
+// scan would have finished. Do NOT derive this from REFRAME_POLL_MS
+// or any other poll ceiling — those drift independently.
+const META_FONTS_CLAIM_STALE_MS = 10 * 60 * 1000;
+const FONT_RETRY_BASE_MS = 15 * 60 * 1000;
+const FONT_RETRY_CAP_MS = 24 * 60 * 60 * 1000;
 const MAX_HTML_CHARS = 25000;
 
 const ENRICHMENT_SCHEMA = {
@@ -109,28 +119,381 @@ async function clearEnrichmentSkipped(brandId) {
   }
 }
 
-async function enrichBrandFromUrl(brandId) {
-  const brand = await Brand.findById(brandId);
+function isCoolingDown(nextRetryAt, now = Date.now()) {
+  return !!(nextRetryAt && new Date(nextRetryAt).getTime() > now);
+}
+
+function computeNextRetryAt(attempts, now = Date.now()) {
+  const n = Math.max(1, Number(attempts) || 1);
+  const delay = Math.min(FONT_RETRY_CAP_MS, FONT_RETRY_BASE_MS * (2 ** (n - 1)));
+  return new Date(now + delay);
+}
+
+function scheduleRetry(brand, prefix) {
+  const attemptsKey = `${prefix}Attempts`;
+  const retryKey = `${prefix}NextRetryAt`;
+  const attempts = (Number(brand[attemptsKey]) || 0) + 1;
+  brand[attemptsKey] = attempts;
+  brand[retryKey] = computeNextRetryAt(attempts);
+}
+
+function planFontTiers(brand, deps = {}) {
+  const enabled = deps.metaAdsFontsEnabled || metaAdsFontsEnabled;
+  const wantFontIngest = !brand.fontIngestedAt && !isCoolingDown(brand.fontIngestNextRetryAt);
+  // Second font source, for the common premium-DTC case where the website
+  // scan cannot get the file (foundry CDN 403, or a JS-injected stack with no
+  // @font-face in the fetched HTML). Gated on its own stamp so the billable
+  // vision call is paid at most once per brand. Cooldown bounds config-absence
+  // retries (hourly posts-sync must not re-walk Graph forever).
+  const wantMetaFonts = enabled() && !brand.metaFontsIngestedAt && !isCoolingDown(brand.metaFontsIngestNextRetryAt);
+  // Shopify theme font scan (added 2026-08-31) — a THIRD, independent font
+  // source alongside the website scan above and the meta-ads vision scan
+  // below. Gated purely on "does this brand have a Shopify URL configured"
+  // (the same apifyDemo.shopifyUrl field resolveStoreOrigin reads), NOT on
+  // Brand.apifyDemo.method or Brand.isDemo — owner directive: this must run
+  // for any brand with a Shopify connection regardless of which catalog-
+  // ingest method (if any) that brand uses. Own retry stamp
+  // (shopifyFontsIngestedAt), independent of fontIngestedAt — see
+  // brandFontPersistenceService.applyShopifyFontIngestResult's header.
+  const wantShopifyFonts = !!(brand.apifyDemo?.shopifyUrl) && !brand.shopifyFontsIngestedAt
+    && !isCoolingDown(brand.shopifyFontsIngestNextRetryAt);
+  return {
+    wantFontIngest,
+    wantMetaFonts,
+    wantShopifyFonts,
+    any: wantFontIngest || wantMetaFonts || wantShopifyFonts,
+    // Website fonts cannot run without a URL; Meta-ads and Shopify-theme can.
+    anyWithoutWebsite: wantMetaFonts || wantShopifyFonts
+  };
+}
+
+/**
+ * THE font choke point. Three independent tiers:
+ *   1. website files (free, needs websiteUrl, stamp fontIngestedAt on success)
+ *   2. Shopify theme files (free, needs apifyDemo.shopifyUrl, stamp on success)
+ *   3. Meta-ads names (BILLABLE, stamp metaFontsIngestedAt only on real spend
+ *      — #362 billableAttempted semantics)
+ *
+ * Safe to call from every brand-create/import path. A path that cannot run
+ * a tier yet RECORDS why (fontIngestError / metaFontsIngestError) rather
+ * than silently skipping. Callers that already went through enrichBrandFromUrl
+ * hit this too — runEnrichment delegates here so there is one implementation.
+ *
+ * `deps` is an injection seam for scripts/verifyFontIngestEveryImportPath.js.
+ */
+async function ensureBrandFontsIngested(brand, run = null, deps = {}) {
+  if (!brand) return { ok: false, reason: 'brand not found' };
+  const plan = planFontTiers(brand, deps);
+  const { wantFontIngest, wantMetaFonts, wantShopifyFonts } = plan;
+  const ran = [];
+
+  if (wantFontIngest && !brand.websiteUrl) {
+    brand.fontIngestError = 'no websiteUrl';
+    await brand.save().catch(() => {});
+  }
+
+  const startedWebsiteUrl = brand.websiteUrl || '';
+
+  // Initial brand ingest now includes the customer's real website font
+  // files. This remains best-effort: a blocked stylesheet or commercial
+  // foundry must not fail the rest of brand enrichment.
+  if (wantFontIngest && brand.websiteUrl) {
+    if (run) { await run.checkpoint(); run.stage('website fonts'); }
+    try {
+      const ingestBrandFonts = deps.ingestBrandFonts
+        || require('./brandFontIngestService').ingestBrandFonts;
+      const applyFontIngestResult = deps.applyFontIngestResult
+        || require('./brandFontPersistenceService').applyFontIngestResult;
+      const fontResult = await ingestBrandFonts(brand, { trackProgress: false });
+      const BrandModel = deps.Brand || Brand;
+      const fresh = await findByIdMaybeLean(BrandModel, brand._id, 'websiteUrl');
+      if ((fresh?.websiteUrl || '') !== startedWebsiteUrl) {
+        console.warn(`   ⚠️  website font ingest discarded for "${brand.name}" — websiteUrl changed mid-run`);
+      } else {
+        applyFontIngestResult(brand, fontResult);
+        await brand.save();
+        ran.push('website-fonts');
+        console.log(
+          `   · website fonts: ${fontResult.ingested.length} usable, ` +
+          `${fontResult.flagged.length} flagged, heading=${fontResult.usage?.heading || 'unknown'}, ` +
+          `body=${fontResult.usage?.body || 'unknown'}`
+        );
+      }
+    } catch (err) {
+      // CORRECTED 2026-08-31 — this used to also set
+      // `brand.fontIngestedAt = new Date()`, permanently disabling retry.
+      // Unlike the meta-ads path below, this path is entirely FREE (a plain
+      // HTTP fetch + CSS parse + font downloads — no billable call anywhere
+      // in it), so there is no cost-avoidance reason to ever give up on it
+      // for good. A transient 404/DNS blip/server hiccup fetching the
+      // homepage must not turn into a lifetime ban on ever scanning that
+      // brand's website fonts again. Measured: brand "Reach Social"
+      // (https://reach-social.io) failed once with a plain
+      // "Request failed with status code 404" and was stuck forever.
+      // Record the error for visibility; leave fontIngestedAt untouched so
+      // the next enrichment run retries for free. Cooldown (not the stamp)
+      // bounds how often we re-hit a 404ing merchant.
+      brand.fontIngestError = String(err.message || err).slice(0, 2000);
+      scheduleRetry(brand, 'fontIngest');
+      await brand.save().catch(() => {});
+      console.warn(`   ⚠️  website font ingest failed for "${brand.name}": ${err.message}`);
+    }
+  }
+
+  // Fonts from the brand's Shopify THEME (added 2026-08-31) — a second real-
+  // FILE source, independent of the marketing-homepage scan above. Runs
+  // right after it (both yield files; neither is a weaker fallback for the
+  // other) and before the meta-ads vision tier below (a NAME-only source
+  // should never be tried ahead of a source that can hand back an actual
+  // file). FREE (plain HTTP, or Admin API billed to the merchant's own
+  // Shopify plan — see shopifyThemeFontService.js's header) — like the
+  // website scan above, a failure must NEVER permanently disable retry, so
+  // applyShopifyFontIngestResult (which stamps shopifyFontsIngestedAt) is
+  // only called on success; the catch below records the error and nothing
+  // else.
+  if (wantShopifyFonts) {
+    if (run) { await run.checkpoint(); run.stage('shopify theme fonts'); }
+    try {
+      const ingestShopifyThemeFonts = deps.ingestShopifyThemeFonts
+        || require('./shopifyThemeFontService').ingestShopifyThemeFonts;
+      const applyShopifyFontIngestResult = deps.applyShopifyFontIngestResult
+        || require('./brandFontPersistenceService').applyShopifyFontIngestResult;
+      const shopifyFontResult = await ingestShopifyThemeFonts(brand);
+      applyShopifyFontIngestResult(brand, shopifyFontResult);
+      await brand.save();
+      ran.push('shopify-theme-fonts');
+      console.log(
+        `   · shopify theme fonts: via=${shopifyFontResult.via} ${shopifyFontResult.ingested.length} usable, ` +
+        `${shopifyFontResult.flagged.length} flagged, heading=${shopifyFontResult.usage?.heading || 'unknown'}, ` +
+        `body=${shopifyFontResult.usage?.body || 'unknown'}`
+      );
+    } catch (err) {
+      brand.shopifyFontsIngestError = String(err.message || err).slice(0, 2000);
+      scheduleRetry(brand, 'shopifyFontsIngest');
+      await brand.save().catch(() => {});
+      console.warn(`   ⚠️  shopify theme font ingest failed for "${brand.name}": ${err.message}`);
+    }
+  }
+
+  // Fonts identified in the brand's OWN Meta ads. Runs after the website scan on
+  // purpose: the website can yield real FILES, and this only yields a NAME, so
+  // there is no point paying for the weaker signal first. It still runs even when
+  // the website scan succeeded — a site commonly serves only its body face while
+  // the ads show the display face.
+  // BILLABLE (~$0.02-0.03). Best-effort: never fail the rest of enrichment.
+  if (wantMetaFonts) {
+    const configured = deps.metaAdsScanConfigured
+      ? await deps.metaAdsScanConfigured(brand)
+      : await metaAdsScanConfigured(brand, deps);
+    if (!configured) {
+      brand.metaFontsIngestError = brand.metaFontsIngestError || 'meta-ads scan not configured';
+      scheduleRetry(brand, 'metaFontsIngest');
+      await brand.save().catch(() => {});
+    } else {
+    if (run) { await run.checkpoint(); run.stage('meta-ads fonts'); }
+    // Cross-process claim BEFORE any billable work. The in-process Map
+    // does not gate web vs worker. Losing this CAS skips the Meta tier
+    // this run; free website/Shopify tiers above have already run.
+    // Do NOT reuse apifyDemo.enrichInFlight (different paid path).
+    const BrandModel = deps.Brand || Brand;
+    const now = new Date();
+    const staleBefore = new Date(now.getTime() - META_FONTS_CLAIM_STALE_MS);
+    let claimed = null;
+    try {
+      claimed = await BrandModel.findOneAndUpdate(
+        {
+          _id: brand._id,
+          metaFontsIngestedAt: null,
+          $or: [
+            { metaFontsIngestStartedAt: null },
+            { metaFontsIngestStartedAt: { $lt: staleBefore } }
+          ]
+        },
+        { $set: { metaFontsIngestStartedAt: now } },
+        { new: true }
+      );
+    } catch (err) {
+      console.warn(`   ⚠️  meta-ads font claim failed for "${brand.name}": ${err.message}`);
+    }
+    if (!claimed) {
+      console.log(`   · meta-ads fonts: skipped (claim held by another process) for "${brand.name}"`);
+    } else {
+    // Hoisted so the catch below can see whether identifyBrandAdFonts
+    // actually completed (and if so, whether it spent money) before
+    // deciding whether this exception may permanently disable retry.
+    let metaResult = null;
+    try {
+      const identifyBrandAdFonts = deps.identifyBrandAdFonts
+        || require('./metaAdsFontService').identifyBrandAdFonts;
+      const applyMetaFontsResult = deps.applyMetaFontsResult
+        || require('./brandFontPersistenceService').applyMetaFontsResult;
+      const maxImages = Number(process.env.META_ADS_FONTS_MAX_IMAGES) || 4;
+      metaResult = await identifyBrandAdFonts(brand, { maxImages });
+      applyMetaFontsResult(brand, metaResult);
+      if (!metaResult.billableAttempted) scheduleRetry(brand, 'metaFontsIngest');
+      await brand.save();
+      ran.push('meta-ads-fonts');
+      console.log(
+        `   · meta-ads fonts: via=${metaResult.via} images=${metaResult.imagesUsed} ` +
+        `heading=${metaResult.usage.heading?.family || 'none'}` +
+        `${metaResult.usage.heading ? `(${metaResult.usage.heading.confidence})` : ''} ` +
+        `body=${metaResult.usage.body?.family || 'none'}`
+      );
+    } catch (err) {
+      // CORRECTED 2026-08-31 — this used to stamp unconditionally. The
+      // billable-cost reasoning ("a brand whose ads cannot be read must not
+      // re-pay the vision call every run") is real but only applies when
+      // money was actually put at risk. `identifyBrandAdFonts` itself never
+      // throws in normal operation (every step that can fail is caught
+      // internally and folded into a normal return with `billableAttempted`
+      // set correctly) — so if we get here WITH a metaResult, the exception
+      // came from applyMetaFontsResult/brand.save() *after* identification
+      // already completed, and metaResult.billableAttempted tells us
+      // truthfully whether a billable call happened. Stamping on a bare
+      // save() failure for a config-absence (nothing-attempted) result would
+      // silently reintroduce the exact bug this fix closes. If metaResult is
+      // still null, identifyBrandAdFonts threw before returning at all —
+      // an unexpected code fault, not the documented config-absence path —
+      // so fall back to the old conservative behaviour and stamp.
+      const billableAttempted = !metaResult || metaResult.billableAttempted === true;
+      if (billableAttempted) {
+        brand.metaFontsIngestedAt = new Date();
+      } else {
+        scheduleRetry(brand, 'metaFontsIngest');
+      }
+      brand.metaFontsIngestError = String(err.message || err).slice(0, 2000);
+      brand.metaFontsIngestStartedAt = null;
+      await brand.save().catch(() => {});
+      console.warn(`   ⚠️  meta-ads font identification failed for "${brand.name}": ${err.message}`);
+    }
+    }
+    }
+  }
+
+  if (!plan.any) {
+    return { ok: true, reason: 'fonts already ingested', ran };
+  }
+  return { ok: true, ran };
+}
+
+// In-process coalescing wraps enrichBrandFromUrl ITSELF — every caller
+// (queueBrandEnrichment, agent refresh, onboarding workflow) shares one
+// Map. Keyed on (brandId, websiteUrl) so a PATCH URL-reset cannot be
+// handed the in-flight promise started against the old domain.
+// Cross-process overlap is gated by the DB claim on
+// metaFontsIngestStartedAt, NOT by this map and NOT by the post-spend
+// metaFontsIngestedAt stamp.
+const _queuedEnrichment = new Map();
+
+async function findByIdMaybeLean(BrandModel, id, fields) {
+  const q = BrandModel.findById(id);
+  if (q && typeof q.select === 'function') {
+    return fields ? q.select(fields).lean() : (typeof q.lean === 'function' ? q.lean() : q);
+  }
+  return q;
+}
+
+async function coalesceKey(brandId, deps = {}) {
+  const BrandModel = deps.Brand || Brand;
+  try {
+    const b = await findByIdMaybeLean(BrandModel, brandId, 'websiteUrl');
+    return `${String(brandId)}|${(b && b.websiteUrl) || ''}`;
+  } catch (_) {
+    return `${String(brandId)}|`;
+  }
+}
+
+async function startCoalescedEnrichment(brandId, reason, name, opts = {}) {
+  if (!brandId) return Promise.resolve({ ok: false, reason: 'no brandId' });
+  const key = await coalesceKey(brandId, opts);
+  const existing = _queuedEnrichment.get(key);
+  if (existing) {
+    console.log(`🌐 enrichment coalesced for "${name || key}" (${reason}) — already in flight`);
+    return existing;
+  }
+  console.log(`🌐 enrichment queued for "${name || key}" (${reason})`);
+  // Insert the placeholder BEFORE starting inner — inner's first await
+  // would otherwise let a concurrent caller miss the Map and double-run.
+  let resolveP, rejectP;
+  const p = new Promise((res, rej) => { resolveP = res; rejectP = rej; });
+  _queuedEnrichment.set(key, p);
+  enrichBrandFromUrlInner(brandId, opts)
+    .then(resolveP, rejectP)
+    .finally(() => {
+      if (_queuedEnrichment.get(key) === p) _queuedEnrichment.delete(key);
+    });
+  return p;
+}
+
+function queueBrandEnrichment(brandId, reason, name, opts = {}) {
+  if (!brandId) return Promise.resolve();
+  return startCoalescedEnrichment(brandId, reason, name, opts)
+    .catch(err => console.warn(`   ⚠️  enrichment fire-and-forget failed for "${name || brandId}": ${err.message}`));
+}
+
+async function enrichBrandFromUrl(brandId, opts = {}) {
+  return startCoalescedEnrichment(brandId, opts.reason || 'enrichBrandFromUrl', opts.name, opts);
+}
+
+async function enrichBrandFromUrlInner(brandId, opts = {}) {
+  const BrandModel = opts.Brand || Brand;
+  const brand = await BrandModel.findById(brandId);
   if (!brand) return { ok: false, reason: 'brand not found' };
   if (!brand.websiteUrl) {
-    await markEnrichmentSkipped(brandId, 'no websiteUrl');
-    return { ok: false, reason: 'no websiteUrl' };
+    const plan = planFontTiers(brand, opts);
+    if (!plan.anyWithoutWebsite) {
+      await markEnrichmentSkipped(brandId, 'no websiteUrl');
+      // Nothing else can run — record the website-font skip too so a
+      // social-first brand is queryable rather than indistinguishable
+      // from "never tried".
+      if (plan.wantFontIngest) {
+        try {
+          await BrandModel.updateOne(
+            { _id: brandId },
+            { $set: { fontIngestError: 'no websiteUrl' } }
+          );
+        } catch (e) {
+          console.warn(`   ⚠️  fontIngestError skip write failed for ${brandId}: ${e.message}`);
+        }
+      }
+      return { ok: false, reason: 'no websiteUrl' };
+    }
+    // Font-only path: Meta-ads / Shopify-theme do not need websiteUrl.
+    // Do NOT markEnrichmentSkipped — fonts will still run (#7).
+    const { startRun, CancelledError } = opts.progressService || require('./progressService');
+    const run = await startRun({
+      kind: 'enrichment',
+      advertiserId: brand.advertiserId,
+      brandId,
+      label: 'Brand font ingest'
+    });
+    try {
+      const result = await ensureBrandFontsIngested(brand, run, opts);
+      await run.succeed({ ok: result.ok !== false, fontOnly: true });
+      return { ok: result.ok !== false, fontOnly: true, websiteSkipped: 'no websiteUrl', ran: result.ran };
+    } catch (err) {
+      if (err instanceof CancelledError) {
+        console.log(`🧠 enrichment cancelled by operator: brand=${brandId}`);
+        return { ok: false, cancelled: true, reason: 'cancelled by operator' };
+      }
+      await run.fail(err);
+      throw err;
+    } finally {
+      await setStage(brandId, null);
+    }
   }
-  // We're proceeding — any previously-recorded skip no longer describes
-  // current reality. Clear before the run starts so a crash mid-run still
-  // leaves the doc in a truthful "attempted, not skipped" state (a thrown
-  // error is visible via run.fail() / CampaignRun-style plumbing, not via
-  // this field — this field is specifically for "declined to even try").
-  await clearEnrichmentSkipped(brandId);
 
   // Belt-and-suspenders: clear stage at the end of EVERY exit path
   // (success, early return, thrown error). The final brand.save() also
   // writes null because the in-memory `brand.enrichmentStage` is
   // never mutated, but the explicit clear covers thrown errors.
-  const { startRun, CancelledError } = require('./progressService');
+  // Do NOT clearEnrichmentSkipped here — a fonts-only/no-op pass must
+  // not wipe a real skip reason (#7). runEnrichment clears only when a
+  // website-dependent tier actually runs.
+  const { startRun, CancelledError } = opts.progressService || require('./progressService');
   const run = await startRun({ kind: 'enrichment', advertiserId: brand.advertiserId, brandId, label: 'Brand enrichment' });
   try {
-    const result = await runEnrichment(brand, brandId, run);
+    const result = await runEnrichment(brand, brandId, run, opts);
     await run.succeed(result && typeof result === 'object' ? { ok: result.ok !== false } : undefined);
     return result;
   } catch (err) {
@@ -238,7 +601,7 @@ function preserveBrandReviewNumbers(fresh, prior) {
   return fresh;
 }
 
-async function runEnrichment(brand, brandId, run = null) {
+async function runEnrichment(brand, brandId, run = null, opts = {}) {
 
   // Per-field protection (curatedFields) replaces the old wholesale
   // 'curated' / 'enriched' bail-outs. We re-run enrichment whenever an
@@ -274,28 +637,19 @@ async function runEnrichment(brand, brandId, run = null) {
   const wantGpt          = (atlasLlmConfigured() || !!process.env.OPENAI_API_KEY)
                              && !sourcesAttempted.has('gpt');
   const wantBrandReviews = !!process.env.GEMINI_API_KEY && !sourcesAttempted.has('brand-reviews');
-  const wantFontIngest   = !brand.fontIngestedAt;
-  // Second font source, for the common premium-DTC case where the website
-  // scan cannot get the file (foundry CDN 403, or a JS-injected stack with no
-  // @font-face in the fetched HTML). Gated on its own stamp so the billable
-  // vision call is paid at most once per brand.
-  const wantMetaFonts    = metaAdsFontsEnabled() && !brand.metaFontsIngestedAt;
-  // Shopify theme font scan (added 2026-08-31) — a THIRD, independent font
-  // source alongside the website scan above and the meta-ads vision scan
-  // below. Gated purely on "does this brand have a Shopify URL configured"
-  // (the same apifyDemo.shopifyUrl field resolveStoreOrigin reads), NOT on
-  // Brand.apifyDemo.method or Brand.isDemo — owner directive: this must run
-  // for any brand with a Shopify connection regardless of which catalog-
-  // ingest method (if any) that brand uses. Own retry stamp
-  // (shopifyFontsIngestedAt), independent of fontIngestedAt — see
-  // brandFontPersistenceService.applyShopifyFontIngestResult's header.
-  const wantShopifyFonts = !!(brand.apifyDemo?.shopifyUrl) && !brand.shopifyFontsIngestedAt;
+  const fontPlan         = planFontTiers(brand, opts);
+  const wantFontIngest   = fontPlan.wantFontIngest;
+  const wantMetaFonts    = fontPlan.wantMetaFonts;
+  const wantShopifyFonts = fontPlan.wantShopifyFonts;
   const logoIsCurated    = Array.isArray(brand.curatedFields) && brand.curatedFields.includes('logoUrl');
   const wantLogoIngest   = !logoIsCurated && !brand.logoIngestedAt;
 
   if (!wantBrandfetch && !wantTailwind && !wantScraped && !wantGpt && !wantBrandReviews && !wantFontIngest && !wantLogoIngest && !wantMetaFonts && !wantShopifyFonts) {
     return { ok: false, reason: `nothing to add — sources already attempted: ${[...sourcesAttempted].join(', ') || 'none'}` };
   }
+
+  const wantWebsiteTiers = wantBrandfetch || wantTailwind || wantScraped || wantGpt || wantBrandReviews || wantLogoIngest || wantFontIngest;
+  if (wantWebsiteTiers) await clearEnrichmentSkipped(brandId);
 
   const t0 = Date.now();
   const planParts = [];
@@ -326,31 +680,40 @@ async function runEnrichment(brand, brandId, run = null) {
   }
 
   // ── Tier 2: Homepage HTML ──
+  // Do NOT GET the homepage when the only remaining work is Meta-ads /
+  // Shopify-theme fonts — ingestBrandFonts does its own fetch, and the
+  // billable Meta path does not read this HTML. Hourly posts-sync on a
+  // fully-enriched brand with unstamped Meta must not hammer the merchant.
+  const wantHomepage = wantScraped || wantTailwind || wantGpt || wantLogoIngest;
   if (run && wantScraped) { await run.checkpoint(); run.stage('website scrape'); }
   if (wantScraped) await setStage(brandId, 'scraped');
   let html = '';
   let pageUrl = brand.websiteUrl;
   let metaThemeColor = null;
-  try {
-    const res = await axios.get(brand.websiteUrl, {
-      timeout: 20000,
-      maxContentLength: 4 * 1024 * 1024,
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (compatible; LiquidRetailBot/1.0)',
-        'Accept': 'text/html,application/xhtml+xml'
-      },
-      validateStatus: () => true
-    });
-    html = typeof res.data === 'string' ? res.data : String(res.data || '');
-    pageUrl = res.request?.res?.responseUrl || brand.websiteUrl;
-    const themeMatch = html.match(/<meta[^>]+name=["']theme-color["'][^>]+content=["']([^"']+)["']/i);
-    if (themeMatch) metaThemeColor = themeMatch[1];
-  } catch (err) {
-    console.warn(`   ⚠️  brand enrichment fetch failed for ${brand.websiteUrl}: ${err.message}`);
-    // If Brandfetch already gave us the visual identity, the GPT step still
-    // adds value (tagline/tone/personas need text). Without HTML we can't
-    // do GPT so we have to bail unless Brandfetch gave us enough.
-    if (!bf && !wantLogoIngest) return { ok: false, reason: `fetch failed: ${err.message}` };
+  if (wantHomepage) {
+    try {
+      const res = await axios.get(brand.websiteUrl, {
+        timeout: 20000,
+        maxContentLength: 4 * 1024 * 1024,
+        headers: {
+          'User-Agent': 'Mozilla/5.0 (compatible; LiquidRetailBot/1.0)',
+          'Accept': 'text/html,application/xhtml+xml'
+        },
+        validateStatus: () => true
+      });
+      html = typeof res.data === 'string' ? res.data : String(res.data || '');
+      pageUrl = res.request?.res?.responseUrl || brand.websiteUrl;
+      const themeMatch = html.match(/<meta[^>]+name=["']theme-color["'][^>]+content=["']([^"']+)["']/i);
+      if (themeMatch) metaThemeColor = themeMatch[1];
+    } catch (err) {
+      console.warn(`   ⚠️  brand enrichment fetch failed for ${brand.websiteUrl}: ${err.message}`);
+      // If Brandfetch already gave us the visual identity, the GPT step still
+      // adds value (tagline/tone/personas need text). Without HTML we can't
+      // do GPT so we have to bail unless Brandfetch gave us enough.
+      if (!bf && !wantLogoIngest && !wantFontIngest && !wantMetaFonts && !wantShopifyFonts) {
+        return { ok: false, reason: `fetch failed: ${err.message}` };
+      }
+    }
   }
 
   // Tier 2 helpers — run on whatever HTML we got (may be empty).
@@ -419,7 +782,9 @@ async function runEnrichment(brand, brandId, run = null) {
     // Font stylesheets may still be public even when readable page text is
     // sparse (Shopify/Next storefronts), so continue when the automatic
     // website-font scan has not run yet.
-    if (!wantFontIngest && !wantLogoIngest) return { ok: false, reason: 'too little text and no Brandfetch data' };
+    if (!wantFontIngest && !wantLogoIngest && !wantMetaFonts && !wantShopifyFonts) {
+      return { ok: false, reason: 'too little text and no Brandfetch data' };
+    }
   }
 
   // ── Tier 3: GPT-4.1 text extraction ──
@@ -468,7 +833,7 @@ async function runEnrichment(brand, brandId, run = null) {
     } catch (err) {
       console.warn(`   ⚠️  brand enrichment LLM failed for "${brand.name}": ${err.message}`);
       // If LLM fails but Brandfetch worked, still ship the visual identity.
-      if (!bf && !websiteLogo?.logoUrl && !wantFontIngest && !wantLogoIngest) {
+      if (!bf && !websiteLogo?.logoUrl && !wantFontIngest && !wantLogoIngest && !wantMetaFonts && !wantShopifyFonts) {
         return { ok: false, reason: `LLM failed: ${err.message}` };
       }
     }
@@ -704,122 +1069,8 @@ async function runEnrichment(brand, brandId, run = null) {
   brand.enrichedAt = new Date();
   await brand.save();
 
-  // Initial brand ingest now includes the customer's real website font
-  // files. This remains best-effort: a blocked stylesheet or commercial
-  // foundry must not fail the rest of brand enrichment.
-  if (wantFontIngest && brand.websiteUrl) {
-    if (run) { await run.checkpoint(); run.stage('website fonts'); }
-    try {
-      const { ingestBrandFonts } = require('./brandFontIngestService');
-      const { applyFontIngestResult } = require('./brandFontPersistenceService');
-      const fontResult = await ingestBrandFonts(brand, { trackProgress: false });
-      applyFontIngestResult(brand, fontResult);
-      await brand.save();
-      console.log(
-        `   · website fonts: ${fontResult.ingested.length} usable, ` +
-        `${fontResult.flagged.length} flagged, heading=${fontResult.usage?.heading || 'unknown'}, ` +
-        `body=${fontResult.usage?.body || 'unknown'}`
-      );
-    } catch (err) {
-      // CORRECTED 2026-08-31 — this used to also set
-      // `brand.fontIngestedAt = new Date()`, permanently disabling retry.
-      // Unlike the meta-ads path below, this path is entirely FREE (a plain
-      // HTTP fetch + CSS parse + font downloads — no billable call anywhere
-      // in it), so there is no cost-avoidance reason to ever give up on it
-      // for good. A transient 404/DNS blip/server hiccup fetching the
-      // homepage must not turn into a lifetime ban on ever scanning that
-      // brand's website fonts again. Measured: brand "Reach Social"
-      // (https://reach-social.io) failed once with a plain
-      // "Request failed with status code 404" and was stuck forever.
-      // Record the error for visibility; leave fontIngestedAt untouched so
-      // the next enrichment run retries for free.
-      brand.fontIngestError = String(err.message || err).slice(0, 2000);
-      await brand.save().catch(() => {});
-      console.warn(`   ⚠️  website font ingest failed for "${brand.name}": ${err.message}`);
-    }
-  }
-
-  // Fonts from the brand's Shopify THEME (added 2026-08-31) — a second real-
-  // FILE source, independent of the marketing-homepage scan above. Runs
-  // right after it (both yield files; neither is a weaker fallback for the
-  // other) and before the meta-ads vision tier below (a NAME-only source
-  // should never be tried ahead of a source that can hand back an actual
-  // file). FREE (plain HTTP, or Admin API billed to the merchant's own
-  // Shopify plan — see shopifyThemeFontService.js's header) — like the
-  // website scan above, a failure must NEVER permanently disable retry, so
-  // applyShopifyFontIngestResult (which stamps shopifyFontsIngestedAt) is
-  // only called on success; the catch below records the error and nothing
-  // else.
-  if (wantShopifyFonts) {
-    if (run) { await run.checkpoint(); run.stage('shopify theme fonts'); }
-    try {
-      const { ingestShopifyThemeFonts } = require('./shopifyThemeFontService');
-      const { applyShopifyFontIngestResult } = require('./brandFontPersistenceService');
-      const shopifyFontResult = await ingestShopifyThemeFonts(brand);
-      applyShopifyFontIngestResult(brand, shopifyFontResult);
-      await brand.save();
-      console.log(
-        `   · shopify theme fonts: via=${shopifyFontResult.via} ${shopifyFontResult.ingested.length} usable, ` +
-        `${shopifyFontResult.flagged.length} flagged, heading=${shopifyFontResult.usage?.heading || 'unknown'}, ` +
-        `body=${shopifyFontResult.usage?.body || 'unknown'}`
-      );
-    } catch (err) {
-      brand.shopifyFontsIngestError = String(err.message || err).slice(0, 2000);
-      await brand.save().catch(() => {});
-      console.warn(`   ⚠️  shopify theme font ingest failed for "${brand.name}": ${err.message}`);
-    }
-  }
-
-  // Fonts identified in the brand's OWN Meta ads. Runs after the website scan on
-  // purpose: the website can yield real FILES, and this only yields a NAME, so
-  // there is no point paying for the weaker signal first. It still runs even when
-  // the website scan succeeded — a site commonly serves only its body face while
-  // the ads show the display face.
-  // BILLABLE (~$0.02-0.03). Best-effort: never fail the rest of enrichment.
-  if (wantMetaFonts) {
-    if (run) { await run.checkpoint(); run.stage('meta-ads fonts'); }
-    // Hoisted so the catch below can see whether identifyBrandAdFonts
-    // actually completed (and if so, whether it spent money) before
-    // deciding whether this exception may permanently disable retry.
-    let metaResult = null;
-    try {
-      const { identifyBrandAdFonts } = require('./metaAdsFontService');
-      const { applyMetaFontsResult } = require('./brandFontPersistenceService');
-      const maxImages = Number(process.env.META_ADS_FONTS_MAX_IMAGES) || 4;
-      metaResult = await identifyBrandAdFonts(brand, { maxImages });
-      applyMetaFontsResult(brand, metaResult);
-      await brand.save();
-      console.log(
-        `   · meta-ads fonts: via=${metaResult.via} images=${metaResult.imagesUsed} ` +
-        `heading=${metaResult.usage.heading?.family || 'none'}` +
-        `${metaResult.usage.heading ? `(${metaResult.usage.heading.confidence})` : ''} ` +
-        `body=${metaResult.usage.body?.family || 'none'}`
-      );
-    } catch (err) {
-      // CORRECTED 2026-08-31 — this used to stamp unconditionally. The
-      // billable-cost reasoning ("a brand whose ads cannot be read must not
-      // re-pay the vision call every run") is real but only applies when
-      // money was actually put at risk. `identifyBrandAdFonts` itself never
-      // throws in normal operation (every step that can fail is caught
-      // internally and folded into a normal return with `billableAttempted`
-      // set correctly) — so if we get here WITH a metaResult, the exception
-      // came from applyMetaFontsResult/brand.save() *after* identification
-      // already completed, and metaResult.billableAttempted tells us
-      // truthfully whether a billable call happened. Stamping on a bare
-      // save() failure for a config-absent (nothing-attempted) result would
-      // silently reintroduce the exact bug this fix closes. If metaResult is
-      // still null, identifyBrandAdFonts threw before returning at all —
-      // an unexpected code fault, not the documented config-absence path —
-      // so fall back to the old conservative behaviour and stamp.
-      const billableAttempted = !metaResult || metaResult.billableAttempted === true;
-      if (billableAttempted) {
-        brand.metaFontsIngestedAt = new Date();
-      }
-      brand.metaFontsIngestError = String(err.message || err).slice(0, 2000);
-      await brand.save().catch(() => {});
-      console.warn(`   ⚠️  meta-ads font identification failed for "${brand.name}": ${err.message}`);
-    }
-  }
+  const fontResult = await ensureBrandFontsIngested(brand, run, opts);
+  const fontRan = new Set(fontResult.ran || []);
 
   // Per-field override log — fire-and-forget calls go to the same
   // server log stream, so this is the only visibility into what the
@@ -840,9 +1091,10 @@ async function runEnrichment(brand, brandId, run = null) {
     wantScraped    ? 'scraped'    : null,
     (wantGpt && !skipLLM) ? 'gpt'  : null,
     wantBrandReviews ? 'brand-reviews' : null,
-    wantFontIngest ? 'website-fonts' : null,
+    fontRan.has('website-fonts') ? 'website-fonts' : null,
     wantLogoIngest ? 'website-logo' : null,
-    wantShopifyFonts ? 'shopify-theme-fonts' : null
+    fontRan.has('shopify-theme-fonts') ? 'shopify-theme-fonts' : null,
+    fontRan.has('meta-ads-fonts') ? 'meta-ads-fonts' : null
   ].filter(Boolean).join('+');
   console.log(`   ✓ brand enrichment done for "${brand.name}" via ${ranThisTime || 'no-op'} — ${overrides.length} field change(s), ${brand.demographics?.length || 0} demographic(s), ${brand.brandReviews?.quotes?.length || 0} brand review(s), all-time sources: [${brand.enrichmentSources.join(', ')}] in ${Date.now() - t0}ms`);
   return { ok: true, brand, overrides };
@@ -1022,6 +1274,11 @@ function dedupe(arr) {
 
 module.exports = {
   enrichBrandFromUrl,
+  ensureBrandFontsIngested,
+  queueBrandEnrichment,
+  planFontTiers,
+  META_FONTS_CLAIM_STALE_MS,
+  computeNextRetryAt,
   preserveBrandReviewNumbers,
   // Exported so scripts/verifyBrandWebsiteBackfill.js exercises the real
   // skip-recording functions rather than a source-text regex.

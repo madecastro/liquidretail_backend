@@ -51,6 +51,40 @@ function metaAdsFontsEnabled() {
   return String(process.env.META_ADS_FONTS_ENABLED ?? 'true').toLowerCase() !== 'false';
 }
 
+/**
+ * metaAdsScanConfigured(brand) — ONE predicate for wantMetaFonts.
+ *
+ * Kill-switch AND at least one source that can feed identifyBrandAdFonts:
+ *   1. persisted Campaign.adSets.ads.creative.imageUrl (tier 1 — gather is
+ *      free, but vision over those images IS a paid first run; that is the
+ *      product feature, gated by ensureBrandFontsIngested's DB claim and
+ *      stamped via billableAttempted)
+ *   2. a connected `meta-ads` IntegrationCredential
+ *   3. APIFY_ADLIB_ACTOR AND APIFY_TOKEN both set
+ *
+ * A connected cred with zero creatives still counts as configured (Graph
+ * is the right next step); an unbilled gather then hits the cooldown, not
+ * an infinite hourly retry.
+ */
+async function metaAdsScanConfigured(brand, deps = {}) {
+  const enabled = deps.metaAdsFontsEnabled || metaAdsFontsEnabled;
+  if (!enabled()) return false;
+  const actor = process.env.APIFY_ADLIB_ACTOR;
+  const token = process.env.APIFY_TOKEN;
+  if (actor && token) return true;
+  try {
+    const resolve = deps.resolveMetaAdsCred || resolveMetaAdsCred;
+    const cred = await resolve(brand && (brand._id || brand.id));
+    if (cred) return true;
+  } catch (_) { /* no-meta-ads-cred / no-ad-account / decrypt */ }
+  try {
+    const read = deps.readCampaignAds || readCampaignAds;
+    const { images } = await read(brand, deps);
+    if (Array.isArray(images) && images.length > 0) return true;
+  } catch (_) { /* Campaign query failed — treat as no docs */ }
+  return false;
+}
+
 function isHttpUrl(u) {
   return typeof u === 'string' && /^https?:\/\//i.test(u.trim());
 }
@@ -439,11 +473,13 @@ async function gatherFromAdLibrary(brand, cap, errors, deps) {
   try {
     items = await runSync(actorId, input);
   } catch (err) {
-    // 'error' rather than 'ok': the charge is real but no asset came back, which
-    // is the distinction CostLog.COST_STATUSES exists to record.
-    await ledgerApifyRun('error');
+    // Pre-POST throws (missing APIFY_TOKEN) never reached Apify — do NOT
+    // mark billed. A false billed:true stamps metaFontsIngestedAt and a
+    // later-configured token is never retried.
+    const prePost = /APIFY_TOKEN is not set/.test(String(err && err.message));
+    if (!prePost) await ledgerApifyRun('error');
     errors.push(`adlibrary: ${err.message}`);
-    return { images: [], billed: true };
+    return { images: [], billed: !prePost };
   }
 
   await ledgerApifyRun('ok');
@@ -645,6 +681,8 @@ async function identifyBrandAdFonts(brand, { maxImages = DEFAULT_MAX_IMAGES } = 
 module.exports = {
   identifyBrandAdFonts,
   metaAdsFontsEnabled,
+  metaAdsScanConfigured,
+  readCampaignAds,
   // Pure helpers, exported for scripts/verifyMetaAdsFonts.js
   parseFontIdentification,
   parseFaceRole,

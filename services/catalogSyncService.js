@@ -143,7 +143,7 @@ async function syncCatalog(brandId, options = {}) {
       }
       aggregated.durationMs = Date.now() - t0;
       if (ownRun) await run.succeed({ fetched: aggregated.fetched, added: aggregated.added, updated: aggregated.updated });
-      return aggregated;
+      return attachBrandFontIngest(brandId, aggregated);
     }
 
     // Single-credential path.
@@ -154,7 +154,7 @@ async function syncCatalog(brandId, options = {}) {
       if (result.ok) await run.succeed({ fetched: result.fetched, added: result.added, updated: result.updated });
       else await run.fail(new Error(result.reason || 'sync failed'));
     }
-    return result;
+    return attachBrandFontIngest(brandId, result);
   } catch (err) {
     if (err instanceof CancelledError) {
       // Graceful stop: everything upserted so far stays; the run row is
@@ -166,6 +166,19 @@ async function syncCatalog(brandId, options = {}) {
     if (ownRun) await run.fail(err);
     throw err;
   }
+}
+
+function attachBrandFontIngest(brandId, result) {
+  if (!result) return result;
+  result.backgroundWork = result.backgroundWork || [];
+  try {
+    result.backgroundWork.push(
+      require('./brandEnrichmentService').queueBrandEnrichment(brandId, 'ig-catalog-sync')
+    );
+  } catch (err) {
+    console.warn(`   ⚠️  enrichment enqueue failed for catalog-sync brand=${brandId}: ${err.message}`);
+  }
+  return result;
 }
 
 async function syncCatalogForCred(cred, run = null) {

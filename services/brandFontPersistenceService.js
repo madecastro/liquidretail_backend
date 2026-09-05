@@ -57,6 +57,8 @@ function applyFontIngestResult(brand, result, { error = null } = {}) {
   brand.websiteFontUsage = result?.usage || brand.websiteFontUsage || null;
   brand.fontIngestedAt = new Date();
   brand.fontIngestError = error || (result?.errors?.length ? result.errors.join('; ').slice(0, 2000) : null);
+  brand.fontIngestAttempts = 0;
+  brand.fontIngestNextRetryAt = null;
   brand.markModified?.('customFonts');
   brand.markModified?.('websiteFontUsage');
 
@@ -116,7 +118,14 @@ function applyMetaFontsResult(brand, result, { error = null } = {}) {
   brand.metaFontsIngestError = error || priorErrors;
   if (error || result?.billableAttempted) {
     brand.metaFontsIngestedAt = new Date();
+    brand.metaFontsIngestAttempts = 0;
+    brand.metaFontsIngestNextRetryAt = null;
   }
+  // Always release the cross-process claim. A billed stamp is the
+  // permanent gate; a config-absence result must not hold
+  // metaFontsIngestStartedAt until STALE or the next process cannot
+  // retry until then. Crash-without-this-write is what STALE is for.
+  brand.metaFontsIngestStartedAt = null;
   // else: nothing billable was attempted — leave metaFontsIngestedAt as-is
   // (unset, or whatever it already was) so the NEXT enrichment run retries
   // for free the moment config changes. The error string above still records
@@ -177,6 +186,8 @@ function applyShopifyFontIngestResult(brand, result) {
 
   brand.shopifyFontsIngestedAt = new Date();
   brand.shopifyFontsIngestError = result?.errors?.length ? result.errors.join('; ').slice(0, 2000) : null;
+  brand.shopifyFontsIngestAttempts = 0;
+  brand.shopifyFontsIngestNextRetryAt = null;
 
   const assumeLicensed = String(process.env.BRAND_FONT_ASSUME_LICENSED ?? 'true').toLowerCase() !== 'false';
   const curated = Array.isArray(brand.curatedFields) && brand.curatedFields.includes('fontFamily');

@@ -122,6 +122,12 @@ async function createDemoBrand({ name, igHandle, shopifyUrl, method }) {
     update,
     { upsert: true, new: true, setDefaultsOnInsert: true }
   );
+  try {
+    require('./brandEnrichmentService')
+      .queueBrandEnrichment(brand._id, 'sales-demo-create', brand.name);
+  } catch (err) {
+    console.warn(`   ⚠️  enrichment enqueue failed for "${brand.name}": ${err.message}`);
+  }
   return brand;
 }
 

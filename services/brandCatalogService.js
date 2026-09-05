@@ -63,29 +63,15 @@ async function upsertBrandStub({ name, paletteSeed, firstSeenMediaId, websiteUrl
     }
   }
 
-  // Trigger enrichment when (a) the brand is still a stub, OR (b) the
-  // Brandfetch source hasn't been attempted yet on this brand. The
-  // second condition lets us backfill brands that were enriched before
-  // Brandfetch was wired up (or before BRANDFETCH_API_KEY was set).
-  const sourcesAttempted = new Set(doc.enrichmentSources || []);
-  const needsBrandfetch  = !!process.env.BRANDFETCH_API_KEY && !sourcesAttempted.has('brandfetch');
-  const needsFontIngest  = !doc.fontIngestedAt;
-  const logoIsCurated    = Array.isArray(doc.curatedFields) && doc.curatedFields.includes('logoUrl');
-  const needsLogoIngest  = !logoIsCurated && !doc.logoIngestedAt;
-  const shouldEnrich     = !!doc.websiteUrl && (doc.source === 'stub' || needsBrandfetch || needsFontIngest || needsLogoIngest);
-  if (shouldEnrich) {
-    // Fire-and-forget. Require here to avoid a circular-require at module
-    // load time (enrichment service does NOT import brandCatalogService).
-    const { enrichBrandFromUrl } = require('./brandEnrichmentService');
-    const reason = doc.source === 'stub'
-      ? 'stub'
-      : needsLogoIngest
-        ? 'backfill website logo'
-        : needsFontIngest ? 'backfill website fonts' : 'backfill brandfetch';
-    console.log(`🌐 brand enrichment queued for "${name}" (${reason})`);
-    enrichBrandFromUrl(doc._id).catch(err =>
-      console.warn(`   ⚠️  brand enrichment fire-and-forget failed for "${name}": ${err.message}`)
-    );
+  // Always queue the shared choke point. enrichBrandFromUrl records
+  // enrichmentSkipReason when websiteUrl is missing and still runs
+  // Meta-ads / Shopify-theme font tiers — a detect-created stub with
+  // no site yet must not silently skip font ingest.
+  try {
+    require('./brandEnrichmentService')
+      .queueBrandEnrichment(doc._id, doc.source === 'stub' ? 'stub' : 'brand-catalog-upsert', name);
+  } catch (err) {
+    console.warn(`   ⚠️  enrichment enqueue failed for "${name}": ${err.message}`);
   }
 
   return doc;

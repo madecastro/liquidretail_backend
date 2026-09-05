@@ -499,6 +499,15 @@ async function syncBrandGenericCatalog(brand, run, { isBrandAborted, categories 
         .catch(err => console.warn(`   ⚠️  ${LOG}  catalog enrichment enqueue failed: ${err.message}`))
     );
 
+    try {
+      backgroundWork.push(
+        require('./brandEnrichmentService')
+          .queueBrandEnrichment(brand._id, 'generic-catalog', brand.name)
+      );
+    } catch (err) {
+      console.warn(`   ⚠️  ${LOG}  enrichment enqueue failed for brand=${brand._id}: ${err.message}`);
+    }
+
     // Materialize + YOLO detect chain via the resilient orchestrator.
     // Wraps both phases in OperationRun(kind='catalog-post-sync') so a
     // transient failure (SIGTERM mid-work, yolo microservice outage,

@@ -240,8 +240,7 @@ async function backfillBrandWebsiteUrl(brand, candidateUrl, { ingestSource = 'un
   if (triggerEnrichment) {
     try {
       require('./brandEnrichmentService')
-        .enrichBrandFromUrl(updated._id)
-        .catch(err => console.warn(`   ⚠️  post-backfill enrichment enqueue failed for "${updated.name}": ${err.message}`));
+        .queueBrandEnrichment(updated._id, `websiteUrl-backfill:${ingestSource}`, updated.name);
     } catch (err) {
       console.warn(`   ⚠️  post-backfill enrichment require failed: ${err.message}`);
     }

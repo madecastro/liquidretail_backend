@@ -216,7 +216,10 @@ function installEnrichStub() {
   let called = 0;
   require.cache[modPath] = {
     id: modPath, filename: modPath, loaded: true,
-    exports: { enrichBrandFromUrl: async (id) => { called++; return { ok: true }; } }
+    exports: {
+      enrichBrandFromUrl: async (id) => { called++; return { ok: true }; },
+      queueBrandEnrichment: (id) => { called++; return Promise.resolve({ ok: true }); }
+    }
   };
   return {
     callCount: () => called,
@@ -319,23 +322,30 @@ checkAsync('C1: brand not found — no skip is recorded (nothing to record it ON
   } finally { findStub.restore(); updateStub.restore(); }
 });
 
-checkAsync('C2: missing websiteUrl — enrichBrandFromUrl RECORDS the skip reason on the brand doc', async () => {
-  // This is the load-bearing fix: before it, {ok:false, reason:'no
-  // websiteUrl'} was returned to a fire-and-forget caller that discards
-  // it — nothing was ever written anywhere, which is exactly how Marine
-  // Layer (2446 products) sat starved with zero diagnostic trail.
+checkAsync('C2: missing websiteUrl AND fonts cannot run — skip is recorded with named writes', async () => {
+  // Kill-switch off so wantMetaFonts is false and anyWithoutWebsite is
+  // false without planting a Meta stamp (that hid the font-only path).
+  const prev = process.env.META_ADS_FONTS_ENABLED;
+  process.env.META_ADS_FONTS_ENABLED = 'false';
   const { enrichBrandFromUrl } = require('../services/brandEnrichmentService');
-  const findStub = installFindByIdStub({ _id: 'brand1', websiteUrl: null });
+  const findStub = installFindByIdStub({ _id: 'brand1', websiteUrl: null, apifyDemo: {} });
   const updateStub = installUpdateOneStub();
   try {
     const result = await enrichBrandFromUrl('brand1');
     assert.deepEqual(result, { ok: false, reason: 'no websiteUrl' });
-    assert.equal(updateStub.calls.length, 1, 'the skip must be persisted, not just returned');
-    const { filter, update } = updateStub.calls[0];
-    assert.equal(String(filter._id), 'brand1');
-    assert.equal(update.$set.enrichmentSkipReason, 'no websiteUrl');
-    assert.ok(update.$set.enrichmentSkippedAt instanceof Date);
-  } finally { findStub.restore(); updateStub.restore(); }
+    assert.equal(updateStub.calls.length, 2, 'exactly skip-reason + fontIngestError, named below');
+    const skipCall = updateStub.calls[0];
+    assert.equal(String(skipCall.filter._id), 'brand1');
+    assert.equal(skipCall.update.$set.enrichmentSkipReason, 'no websiteUrl');
+    assert.ok(skipCall.update.$set.enrichmentSkippedAt instanceof Date);
+    const fontCall = updateStub.calls[1];
+    assert.equal(fontCall.update.$set.fontIngestError, 'no websiteUrl');
+  } finally {
+    findStub.restore();
+    updateStub.restore();
+    if (prev === undefined) delete process.env.META_ADS_FONTS_ENABLED;
+    else process.env.META_ADS_FONTS_ENABLED = prev;
+  }
 });
 
 checkAsync('C3: markEnrichmentSkipped / clearEnrichmentSkipped write the exact expected $set shape', async () => {

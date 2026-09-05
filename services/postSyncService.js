@@ -153,6 +153,8 @@ async function syncPosts(brandId, options = {}) {
     }
     aggregated.durationMs = Date.now() - t0;
     if (ownRun) await run.succeed({ fetched: aggregated.fetched, ingested: aggregated.ingested, skipped: aggregated.skipped });
+    try { require('./brandEnrichmentService').queueBrandEnrichment(brandId, 'posts-sync'); }
+    catch (err) { console.warn(`   ⚠️  enrichment enqueue failed for posts-sync brand=${brandId}: ${err.message}`); }
     return aggregated;
   }
 
@@ -163,6 +165,8 @@ async function syncPosts(brandId, options = {}) {
     if (result.ok !== false) await run.succeed({ fetched: result.fetched, ingested: result.ingested, skipped: result.skipped });
     else await run.fail(new Error(result.reason || 'sync failed'));
   }
+  try { require('./brandEnrichmentService').queueBrandEnrichment(brandId, 'posts-sync'); }
+  catch (err) { console.warn(`   ⚠️  enrichment enqueue failed for posts-sync brand=${brandId}: ${err.message}`); }
   return result;
   } catch (err) {
     if (err instanceof CancelledError) {

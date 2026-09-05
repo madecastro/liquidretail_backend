@@ -134,11 +134,12 @@ async function ensureSamplePlate(format) {
 // brandEnrichmentService.js / apifyIngestService.js.
 function triggerEnrichment(brand, reason) {
   if (!brand?._id) return;
-  console.log(`🌐 enrichment queued for "${brand.name}" (${reason})`);
-  const { enrichBrandFromUrl } = require('../services/brandEnrichmentService');
-  enrichBrandFromUrl(brand._id).catch(err =>
-    console.warn(`   ⚠️  enrichment fire-and-forget failed for "${brand.name}": ${err.message}`)
-  );
+  try {
+    require('../services/brandEnrichmentService')
+      .queueBrandEnrichment(brand._id, reason, brand.name);
+  } catch (err) {
+    console.warn(`   ⚠️  enrichment enqueue failed for "${brand.name}": ${err.message}`);
+  }
 }
 
 // GET /api/brand/by-name/:name
@@ -454,6 +455,8 @@ router.patch('/:id', express.json(), async (req, res) => {
       brand.websiteFontUsage = null;
       brand.fontIngestedAt = null;
       brand.fontIngestError = null;
+      brand.fontIngestAttempts = 0;
+      brand.fontIngestNextRetryAt = null;
       brand.logoIngestedAt = null;
       brand.logoIngestError = null;
       brand.logoOriginalUrl = null;
@@ -2923,9 +2926,6 @@ router.post('/:id/refresh-enrichment', async (req, res) => {
   try {
     const brand = await Brand.findOne(tenantFilter(req, { _id: req.params.id }));
     if (!brand) return res.status(404).json({ error: 'brand not found' });
-    if (!brand.websiteUrl) {
-      return res.status(400).json({ error: 'brand has no websiteUrl — set one via PATCH first' });
-    }
     brand.enrichmentSources = [];
     if (!(brand.curatedFields || []).includes('logoUrl')) {
       brand.logoIngestedAt = null;

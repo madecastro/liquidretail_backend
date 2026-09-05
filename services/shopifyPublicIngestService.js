@@ -942,6 +942,15 @@ async function syncBrandShopifyDirect(brand, run, { isBrandAborted } = {}) {
         .catch(err => console.warn(`   ⚠️  🛍  catalog enrichment enqueue failed: ${err.message}`))
     );
 
+    try {
+      backgroundWork.push(
+        require('./brandEnrichmentService')
+          .queueBrandEnrichment(brand._id, 'shopify-direct', brand.name)
+      );
+    } catch (err) {
+      console.warn(`   ⚠️  enrichment enqueue failed for shopify-direct brand=${brand._id}: ${err.message}`);
+    }
+
     // Materialize + YOLO detect chain via the resilient orchestrator.
     // See services/catalogPostSyncOrchestrator.js header for the failure
     // modes the old inline try/try version silently absorbed.

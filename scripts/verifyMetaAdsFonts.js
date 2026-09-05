@@ -333,6 +333,91 @@ check('L1 an Apify run is LEDGERED, even when it yields no usable images', async
     else process.env.APIFY_ADLIB_ACTOR = prev;
   }
 });
+check('CFG1 metaAdsScanConfigured: kill-switch off is false even with images+cred', async () => {
+  const prev = process.env.META_ADS_FONTS_ENABLED;
+  process.env.META_ADS_FONTS_ENABLED = 'false';
+  try {
+    const ok = await svc.metaAdsScanConfigured({ _id: 'cfg1' }, {
+      resolveMetaAdsCred: async () => ({ token: 'x' }),
+      readCampaignAds: async () => ({ images: ['https://cdn.example/ad.jpg'] }),
+    });
+    assert.strictEqual(ok, false);
+  } finally {
+    if (prev === undefined) delete process.env.META_ADS_FONTS_ENABLED;
+    else process.env.META_ADS_FONTS_ENABLED = prev;
+  }
+});
+check('CFG2 campaign-doc images with no cred/actor IS configured (paid first run, gated by DB claim)', async () => {
+  const prevActor = process.env.APIFY_ADLIB_ACTOR;
+  const prevToken = process.env.APIFY_TOKEN;
+  const prevEn = process.env.META_ADS_FONTS_ENABLED;
+  delete process.env.APIFY_ADLIB_ACTOR;
+  delete process.env.APIFY_TOKEN;
+  process.env.META_ADS_FONTS_ENABLED = 'true';
+  try {
+    const ok = await svc.metaAdsScanConfigured({ _id: 'cfg2' }, {
+      resolveMetaAdsCred: async () => {
+        const e = new Error('no cred');
+        e.code = 'no-meta-ads-cred';
+        throw e;
+      },
+      readCampaignAds: async () => ({ images: ['https://cdn.example/ad.jpg'] }),
+    });
+    assert.strictEqual(ok, true, 'vision over Campaign images is the product feature — configured, then claimed+stamped');
+  } finally {
+    if (prevActor === undefined) delete process.env.APIFY_ADLIB_ACTOR;
+    else process.env.APIFY_ADLIB_ACTOR = prevActor;
+    if (prevToken === undefined) delete process.env.APIFY_TOKEN;
+    else process.env.APIFY_TOKEN = prevToken;
+    if (prevEn === undefined) delete process.env.META_ADS_FONTS_ENABLED;
+    else process.env.META_ADS_FONTS_ENABLED = prevEn;
+  }
+});
+check('CFG3 nothing (no actor/token, no cred, no images) is not configured', async () => {
+  const prevActor = process.env.APIFY_ADLIB_ACTOR;
+  const prevToken = process.env.APIFY_TOKEN;
+  delete process.env.APIFY_ADLIB_ACTOR;
+  delete process.env.APIFY_TOKEN;
+  try {
+    const ok = await svc.metaAdsScanConfigured({ _id: 'cfg3' }, {
+      resolveMetaAdsCred: async () => {
+        const e = new Error('no cred');
+        e.code = 'no-meta-ads-cred';
+        throw e;
+      },
+      readCampaignAds: async () => ({ images: [] }),
+    });
+    assert.strictEqual(ok, false);
+  } finally {
+    if (prevActor === undefined) delete process.env.APIFY_ADLIB_ACTOR;
+    else process.env.APIFY_ADLIB_ACTOR = prevActor;
+    if (prevToken === undefined) delete process.env.APIFY_TOKEN;
+    else process.env.APIFY_TOKEN = prevToken;
+  }
+});
+check('L1c APIFY_TOKEN missing throws BEFORE POST — billed must be false', async () => {
+  const prevActor = process.env.APIFY_ADLIB_ACTOR;
+  const prevToken = process.env.APIFY_TOKEN;
+  process.env.APIFY_ADLIB_ACTOR = 'someone/ad-library';
+  delete process.env.APIFY_TOKEN;
+  try {
+    const res = await identifyBrandAdFonts(
+      { _id: 'b-token', name: 'NoToken' }, {},
+      {
+        Campaign: { find: () => ({ select: () => ({ lean: async () => [] }) }) },
+        resolveMetaAdsCred: async () => { const e = new Error('no cred'); e.code = 'no-meta-ads-cred'; throw e; },
+        recordFlatCost: async () => { throw new Error('must not ledger a pre-POST throw'); },
+      }
+    );
+    assert.strictEqual(res.billableAttempted, false,
+      'missing APIFY_TOKEN never reached Apify — a true billed stamp would block a later-configured token forever');
+  } finally {
+    if (prevActor === undefined) delete process.env.APIFY_ADLIB_ACTOR;
+    else process.env.APIFY_ADLIB_ACTOR = prevActor;
+    if (prevToken === undefined) delete process.env.APIFY_TOKEN;
+    else process.env.APIFY_TOKEN = prevToken;
+  }
+});
 check('L1b Apify billed but yielded nothing usable → billableAttempted must STILL be true (8)', async () => {
   const prev = process.env.APIFY_ADLIB_ACTOR;
   process.env.APIFY_ADLIB_ACTOR = 'someone/ad-library';

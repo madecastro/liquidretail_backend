@@ -102,6 +102,12 @@ router.post('/advertiser', requireUserOnly, express.json(), async (req, res) => 
         source:          'stub',
         firstSeenMediaId: null
       });
+      try {
+        require('../services/brandEnrichmentService')
+          .queueBrandEnrichment(brand._id, 'onboarding-create', brand.name);
+      } catch (err) {
+        console.warn(`   ⚠️  enrichment enqueue failed for "${brand.name}": ${err.message}`);
+      }
     }
 
     // Attach the advertiser to the user's record (Phase 1 backward

@@ -11,7 +11,9 @@
 // synchronously here rather than fire-and-forget so the agent can
 // report back what was actually updated.
 //
-// Requires brand.websiteUrl — no URL, no enrichment.
+// Website-dependent tiers still need brand.websiteUrl; missing URL is
+// recorded as enrichmentSkipReason and Meta-ads / Shopify-theme font
+// ingest still run.
 
 'use strict';
 
@@ -30,10 +32,6 @@ async function run({ req, args }) {
 
   const brand = await Brand.findOne({ _id: rawBrandId, advertiserId: req.advertiserId });
   if (!brand) return { ok: false, error: `brand ${rawBrandId} not found` };
-  if (!brand.websiteUrl) {
-    return { ok: false, error: 'brand has no websiteUrl — set one via brand.patch first' };
-  }
-
   // Reset enrichment sources + unlock empty curated fields — mirrors
   // the route handler at routes/brand.js:2518.
   const isEmpty = (v) => v == null || v === '' || (Array.isArray(v) && v.length === 0);

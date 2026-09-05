@@ -453,6 +453,12 @@ const brandSchema = new mongoose.Schema({
   // than permanently disabling the scan for that brand.
   fontIngestedAt: { type: Date, default: null },
   fontIngestError: { type: String, default: null },
+  // Bounded retry for the free website-font scan. Errors stay visibility
+  // (`fontIngestError`); this pair is the GATE. Exponential cooldown
+  // (15m → 24h cap) so hourly posts-sync cannot hammer a merchant that
+  // 404s forever. Cleared on a successful ingest.
+  fontIngestAttempts: { type: Number, default: 0 },
+  fontIngestNextRetryAt: { type: Date, default: null },
 
   // Typefaces IDENTIFIED (not downloaded) in the brand's own Meta ad creatives
   // by metaAdsFontService — the second source for brands whose website hides
@@ -480,6 +486,17 @@ const brandSchema = new mongoose.Schema({
   // remediation for rows stamped before this fix.
   metaFontsIngestedAt: { type: Date, default: null },
   metaFontsIngestError: { type: String, default: null },
+  // Cross-process claim for the billable Meta-ads scan. Written BEFORE
+  // identifyBrandAdFonts (Apify + vision). A second process that loses
+  // this findOneAndUpdate skips the Meta tier this run. Stale after
+  // META_FONTS_CLAIM_STALE_MS (see brandEnrichmentService) so a crash
+  // cannot hold the lock forever. Do NOT reuse apifyDemo.enrichInFlight
+  // (that lock is the paid catalog-details path).
+  metaFontsIngestStartedAt: { type: Date, default: null },
+  // Bounded retry for config-absence / unbilled gather. Same 15m→24h
+  // exponential as the free website scan. Cleared on a billed stamp.
+  metaFontsIngestAttempts: { type: Number, default: 0 },
+  metaFontsIngestNextRetryAt: { type: Date, default: null },
 
   // Successful or attempted automatic SHOPIFY THEME font scan
   // (services/shopifyThemeFontService.js, added 2026-08-31) — a SIBLING
@@ -500,6 +517,8 @@ const brandSchema = new mongoose.Schema({
   // branch calls applyShopifyFontIngestResult).
   shopifyFontsIngestedAt: { type: Date, default: null },
   shopifyFontsIngestError: { type: String, default: null },
+  shopifyFontsIngestAttempts: { type: Number, default: 0 },
+  shopifyFontsIngestNextRetryAt: { type: Date, default: null },
 
   // Derived voice — structured profile extracted by
   // brandVoiceDerivationService from the brand's existing Meta/Google

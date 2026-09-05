@@ -40,8 +40,28 @@ async function run({ req, args }) {
     const m = normalizeMethod(updates.method);
     if (m) brand.apifyDemo.method = m;
   }
+  const shopifyUrlChanged = 'shopifyUrl' in updates
+    && (brand.apifyDemo?.shopifyUrl || null) !== (prior.shopifyUrl || null);
+  if (shopifyUrlChanged) {
+    brand.shopifyFontsIngestedAt = null;
+    brand.shopifyFontsIngestError = null;
+    brand.shopifyFontsIngestAttempts = 0;
+    brand.shopifyFontsIngestNextRetryAt = null;
+    brand.customFonts = (Array.isArray(brand.customFonts) ? brand.customFonts : [])
+      .filter((f) => f && f.source !== 'shopify-theme');
+    brand.markModified('customFonts');
+  }
   brand.markModified('apifyDemo');
   await brand.save();
+
+  if (shopifyUrlChanged && brand.apifyDemo?.shopifyUrl) {
+    try {
+      require('../brandEnrichmentService')
+        .queueBrandEnrichment(brand._id, 'sales-brand-patch-shopifyUrl', brand.name);
+    } catch (err) {
+      console.warn(`sales.brand.patch: enrichment enqueue failed for "${brand.name}": ${err.message}`);
+    }
+  }
 
   return {
     ok: true,
