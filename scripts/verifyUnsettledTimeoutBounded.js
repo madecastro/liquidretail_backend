@@ -47,12 +47,12 @@
 //
 // ── NOT A BLINDED CEILING — NO CEILING WAS IN SCOPE ───────────────────────
 // First triage assumed a frozen renderAttempts had blinded an existing cap.
-// It had not. strandedRunSweeper's `renderAttempts < STRANDED_SWEEP_MAX_ATTEMPTS`
+// It had not. Backend strandedRunSweeper's `renderAttempts < STRANDED_SWEEP_MAX_ATTEMPTS`
 // lives inside buildStrandedAdFilter, which ALSO requires `status:'queued'` and
 // membership in a FAILED run — a 'rendering' ad on a 'running' run is outside
 // that filter at any counter value. queuedArchiveSweeper's renderAttempts:0
-// guard is likewise 'queued'-scoped. Group D below pins that, so nobody
-// re-derives the wrong conclusion from the counter fix alone.
+// guard is likewise 'queued'-scoped. Those sweepers are not vendored here
+// (backend-owned); the pin that remains is the renderer-side bound.
 //
 // Offline only: no DB, no network, no Atlas key, no mongoose. Group A executes
 // the real decision function; Groups B/C drive stubs from the REAL source text.
@@ -63,7 +63,6 @@ const path = require('path');
 
 const REPO = path.resolve(__dirname, '..');
 const rendererSrc = fs.readFileSync(path.join(REPO, 'src', 'services', 'renderer.js'), 'utf8');
-const strandedSrc = fs.readFileSync(path.join(REPO, 'src', 'services', 'strandedRunSweeper.js'), 'utf8');
 const bootSrc = fs.readFileSync(path.join(REPO, 'src', 'services', 'bootRecoveryService.js'), 'utf8');
 
 const { resolveUnsettledTimeoutAction, HAS_RECEIPT } = require(
@@ -481,18 +480,6 @@ check('C6: holding does not restart bootRecovery\'s staleness clock', () => {
     'Ad schema no longer sets timestamps:false — the $inc may now bump updatedAt and re-starve bootRecovery');
   const incWrite = settleBody.slice(settleBody.indexOf('$inc'), settleBody.indexOf('$inc') + 200);
   assert.ok(!/updatedAt/.test(incWrite), 'the counter write bumps updatedAt, restarting the staleness clock');
-});
-
-console.log('\nD. The ceiling that was never in scope (pins the corrected diagnosis)');
-
-check('D1: strandedRunSweeper\'s attempt ceiling is gated on status:queued, so it never covered this', () => {
-  const filterBody = functionBody(strandedSrc, 'function buildStrandedAdFilter');
-  assert.ok(/renderAttempts:\s*\{\s*\$lt:\s*MAX_ATTEMPTS\s*\}/.test(filterBody),
-    'the renderAttempts ceiling left buildStrandedAdFilter');
-  assert.ok(/status:\s*'queued'/.test(filterBody),
-    "buildStrandedAdFilter no longer requires status:'queued' — re-check whether it now covers 'rendering'");
-  assert.ok(!/status:\s*'rendering'/.test(filterBody),
-    'buildStrandedAdFilter now mentions rendering — the scope claim in this harness needs revisiting');
 });
 
 console.log('\nE. The poll ceiling — sized from the measured distribution');

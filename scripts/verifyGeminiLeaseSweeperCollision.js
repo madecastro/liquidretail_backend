@@ -24,8 +24,12 @@
 // unbilled render failure.
 //
 // EXECUTION, not source-text. This harness:
-//   1. Loads the REAL buildStrandedAdFilter / buildQueuedArchiveFilter
-//      (function bodies eval'd with the REAL receiptFree helper).
+//   1. Evaluates the REAL buildStrandedAdFilter / buildQueuedArchiveFilter
+//      from the sibling backend checkout (those sweepers run on backend
+//      against the shared Mongo; adgen's unused copies were deleted).
+//      GitHub Actions has no sibling — fall back to an inline snapshot
+//      with an INFO line; CI must not fail. Laptop runs also pin that
+//      the snapshot still matches the sibling's exported filter (E1).
 //   2. Builds a synthetic Ad the way N Gemini lease-cap-miss cycles
 //      PLUS a SIGTERM rendering→queued transition would leave it,
 //      applying whatever $inc the live renderer source still issues
@@ -37,17 +41,17 @@
 //
 // OFFLINE. No DB, no network. Mongo matching is scripts/lib/miniMongoStub.
 
+const assert = require('assert');
 const fs = require('fs');
 const path = require('path');
 const { matches } = require('./lib/miniMongoStub');
 const { receiptFree } = require('../src/services/spendReceipt');
+const { resolveBackendRoot } = require('./lib/siblingBackend');
 
 const ROOT = path.join(__dirname, '..');
 const SVC = path.join(ROOT, 'src', 'services');
 
 const rendererSrc = fs.readFileSync(path.join(SVC, 'renderer.js'), 'utf8');
-const strandedSrc = fs.readFileSync(path.join(SVC, 'strandedRunSweeper.js'), 'utf8');
-const queuedSrc = fs.readFileSync(path.join(SVC, 'queuedArchiveSweeper.js'), 'utf8');
 const providerSrc = fs.readFileSync(path.join(SVC, 'geminiVideoService.js'), 'utf8');
 
 let pass = 0;
@@ -65,19 +69,71 @@ function extractFn(src, name) {
   return m[0];
 }
 
-// REAL filter functions. buildStrandedAdFilter closes over MAX_ATTEMPTS
-// (the same `|| 3` default the file uses). buildQueuedArchiveFilter
-// closes over the REAL receiptFree.
-const buildStrandedAdFilter = new Function(
-  extractFn(strandedSrc, 'buildStrandedAdFilter').replace(
-    'function buildStrandedAdFilter',
-    'const MAX_ATTEMPTS = Number(process.env.STRANDED_SWEEP_MAX_ATTEMPTS || 3);\nfunction buildStrandedAdFilter'
-  ) + '\nreturn buildStrandedAdFilter;'
-)();
-const buildQueuedArchiveFilter = new Function(
-  'receiptFree',
-  extractFn(queuedSrc, 'buildQueuedArchiveFilter') + '\nreturn buildQueuedArchiveFilter;'
-)(receiptFree);
+function loadStrandedBuilder(src) {
+  return new Function(
+    extractFn(src, 'buildStrandedAdFilter').replace(
+      'function buildStrandedAdFilter',
+      'const MAX_ATTEMPTS = Number(process.env.STRANDED_SWEEP_MAX_ATTEMPTS || 3);\nfunction buildStrandedAdFilter'
+    ) + '\nreturn buildStrandedAdFilter;'
+  )();
+}
+
+function loadQueuedBuilder(src, receiptFreeFn) {
+  return new Function(
+    'receiptFree',
+    extractFn(src, 'buildQueuedArchiveFilter') + '\nreturn buildQueuedArchiveFilter;'
+  )(receiptFreeFn);
+}
+
+// CI fallback when sibling liquidretail_backend is absent. E1 (laptop)
+// fails if this drifts from backend's exported builders.
+function snapshotBuildStrandedAdFilter({ failedRunIds } = {}) {
+  const MAX_ATTEMPTS = Number(process.env.STRANDED_SWEEP_MAX_ATTEMPTS || 3);
+  const ids = (Array.isArray(failedRunIds) ? failedRunIds : []).filter(Boolean);
+  return {
+    status: 'queued',
+    campaignRunIds: { $in: ids },
+    renderStage: { $nin: [null, ''] },
+    $and: [
+      { $or: [{ renderAttempts: { $lt: MAX_ATTEMPTS } }, { renderAttempts: { $exists: false } }] },
+      { $or: [{ deriveWaitAttempts: { $lt: MAX_ATTEMPTS } }, { deriveWaitAttempts: { $exists: false } }] }
+    ]
+  };
+}
+function snapshotBuildQueuedArchiveFilter({ terminalRunIds, olderThan } = {}) {
+  const ids = (Array.isArray(terminalRunIds) ? terminalRunIds : [])
+    .filter((id) => id != null && id !== '')
+    .map(String);
+  return receiptFree({
+    status: 'queued',
+    campaignRunIds: {
+      $in: ids,
+      $not: { $elemMatch: { $nin: ids } }
+    },
+    queuedAt: { $lt: olderThan },
+    $and: [
+      { $or: [{ renderUrl: null }, { renderUrl: '' }] },
+      { $or: [{ renderAttempts: 0 }, { renderAttempts: null }] }
+    ]
+  });
+}
+
+const backendRoot = resolveBackendRoot(ROOT);
+let buildStrandedAdFilter = snapshotBuildStrandedAdFilter;
+let buildQueuedArchiveFilter = snapshotBuildQueuedArchiveFilter;
+let siblingBuildStrandedAdFilter = null;
+let siblingBuildQueuedArchiveFilter = null;
+if (backendRoot) {
+  const strandedSrc = fs.readFileSync(path.join(backendRoot, 'services', 'strandedRunSweeper.js'), 'utf8');
+  const queuedSrc = fs.readFileSync(path.join(backendRoot, 'services', 'queuedArchiveSweeper.js'), 'utf8');
+  const { receiptFree: backendReceiptFree } = require(path.join(backendRoot, 'services', 'spendReceipt.js'));
+  siblingBuildStrandedAdFilter = loadStrandedBuilder(strandedSrc);
+  siblingBuildQueuedArchiveFilter = loadQueuedBuilder(queuedSrc, backendReceiptFree);
+  buildStrandedAdFilter = siblingBuildStrandedAdFilter;
+  buildQueuedArchiveFilter = siblingBuildQueuedArchiveFilter;
+} else {
+  console.log('INFO: sibling liquidretail_backend not checked out — using inline sweeper-filter snapshot (CI fallback)');
+}
 
 const FAILED_RUN = 'run_sigterm_failed';
 const strandedFilter = buildStrandedAdFilter({ failedRunIds: [FAILED_RUN] });
@@ -242,7 +298,7 @@ console.log('\nC. N Gemini lease cycles then SIGTERM-queued — stranded owns it
   // has closed. Not asserted as forbidden — just that a FRESH one is not
   // archived (C4). Pin the 24h gate itself still exists.
   check('C7 archive filter still requires queuedAt older than the cutoff (the 24h gate)',
-    /queuedAt:\s*\{\s*\$lt:\s*olderThan\s*\}/.test(extractFn(queuedSrc, 'buildQueuedArchiveFilter')));
+    archiveFilterFresh.queuedAt && archiveFilterFresh.queuedAt.$lt instanceof Date);
 }
 
 // ── D. generateForAd's internal backoff IS the retry budget ──
@@ -282,6 +338,44 @@ console.log('\nD. internal lease backoff is the full budget (held claim, no pers
   check('D5 generateForAd still returns skipped/retryable/GEMINI_LEASE_EXHAUSTED (regenerate parks on that)',
     /code:\s*['"]GEMINI_LEASE_EXHAUSTED['"]/.test(providerSrc) &&
     /retryable:\s*true/.test(providerSrc));
+}
+
+// ── E. snapshot must not silently drift from backend's real filters ──
+console.log('\nE. inline snapshot matches sibling exported filters (laptop pin; CI skips)');
+{
+  const fixtureStranded = { failedRunIds: [FAILED_RUN] };
+  const fixtureQueued = {
+    terminalRunIds: [FAILED_RUN],
+    olderThan: new Date(now - 24 * 3600 * 1000)
+  };
+  if (backendRoot && siblingBuildStrandedAdFilter && siblingBuildQueuedArchiveFilter) {
+    let strandedMatch = false;
+    let queuedMatch = false;
+    let detail = '';
+    try {
+      assert.deepStrictEqual(
+        snapshotBuildStrandedAdFilter(fixtureStranded),
+        siblingBuildStrandedAdFilter(fixtureStranded)
+      );
+      strandedMatch = true;
+    } catch (err) {
+      detail = `stranded: ${err.message}`;
+    }
+    try {
+      assert.deepStrictEqual(
+        snapshotBuildQueuedArchiveFilter(fixtureQueued),
+        siblingBuildQueuedArchiveFilter(fixtureQueued)
+      );
+      queuedMatch = true;
+    } catch (err) {
+      detail = detail ? `${detail}; queued: ${err.message}` : `queued: ${err.message}`;
+    }
+    check('E1 snapshot matches sibling exported filters for the fixture inputs',
+      strandedMatch && queuedMatch,
+      detail);
+  } else {
+    console.log('INFO: skipping E1 (no sibling backend checkout)');
+  }
 }
 
 console.log('');

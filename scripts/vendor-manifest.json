@@ -2,7 +2,7 @@
   "version": 2,
   "backendRef": "origin/main",
   "backendHead": "5c36b81b6a574aa8e0812fc2239d3499979331b0",
-  "generatedAt": "2026-09-05T20:22:39.710Z",
+  "generatedAt": "2026-09-05T20:57:23.729Z",
   "files": {
     "models/Ad.js": {
       "backendHash": "812961d1ad30f5f87891dcace58fbe44ce5e07a5789f34b927fe8208dc2db966",
@@ -212,7 +212,9 @@
       "adgenHash": "13f1aa3db0c994342e9f0d7c8d719e3ce15e2f635856d55e1654f1bfd641b0d3",
       "backendSha": "f9efb439b58f2bc5e8936868a1dd4308d58e84f5",
       "status": "fork",
-      "reason": "Ported backend f9efb439 stages[] closed-stage history (consumed by progressService.stage() transitions). Deliberately omitted slackFeed: that field is only written/read by ingestStatusFeedService, which adgen does not vendor and never runs. Shared-collection extra fields from backend-written ingest rows are preserved by $set-only updates."
+      "reason": "Ported backend f9efb439 stages[] closed-stage history (consumed by progressService.stage() transitions). Deliberately omitted slackFeed: that field is only written/read by ingestStatusFeedService, which adgen does not vendor and never runs. Shared-collection extra fields from backend-written ingest rows are preserved by $set-only updates.",
+      "portTo": null,
+      "owedSince": null
     },
     "models/OverlayZoneArtifact.js": {
       "backendHash": "91c942a031aacd86910287390041d8b4f3b04d9490fc2edd36c334b48cac3208",
@@ -614,15 +616,6 @@
       "portTo": null,
       "owedSince": null
     },
-    "services/adArchiveDigest.js": {
-      "backendHash": "4f20f9aabe9e50333db07e492f858dc2c3b3333f406658212ab42fa3f72ec0a6",
-      "adgenHash": "4f20f9aabe9e50333db07e492f858dc2c3b3333f406658212ab42fa3f72ec0a6",
-      "backendSha": "408216753775677e48b634ac080bfe936adae20b",
-      "status": "unused",
-      "reason": "only reached from queuedArchiveSweeper, which adgen does not boot",
-      "portTo": null,
-      "owedSince": null
-    },
     "services/adCopyGuards.js": {
       "backendHash": "32775cff5d6e65046a0c1f08672470160c993889efa56cffdd1163212822845e",
       "adgenHash": "32775cff5d6e65046a0c1f08672470160c993889efa56cffdd1163212822845e",
@@ -631,12 +624,11 @@
       "portTo": null,
       "owedSince": null
     },
-    "services/adReadinessService.js": {
-      "backendHash": "22e736dcd7e48c5492c0e5b775ec609a3f067f7cf0c81c37a084f6064a7e0270",
-      "adgenHash": "8de31b15b0fe0cda65ce6195dbdbd30490f543ebd0d06064711b4a8e29fa2779",
-      "backendSha": "9bad6b803b1d2ed72b10ae2388e1bbcbec688a28",
-      "status": "unused",
-      "reason": "unused in adgen \u2014 the readiness gate runs on backend routes (campaigns create / ads generate), nothing under adgen/src requires it. Re-attested after backend #340, which REMOVED the catalog-detect-not-started blocker: catalog detect is deferred (CATALOG_DETECT_PRECOMPUTE=false) and the only creator of a catalog DetectRun runs inside the request the gate was refusing, so it deadlocked every brand onboarded after deferral. If this copy is ever wired up in adgen, port that fix first \u2014 this vendored copy predates it.",
+    "services/adPhase.js": {
+      "backendHash": "49aa82bcc7e60a0d6b9a263f8502b47995349871229c3649ab756599d4210ee9",
+      "adgenHash": "49aa82bcc7e60a0d6b9a263f8502b47995349871229c3649ab756599d4210ee9",
+      "backendSha": "be8ea6b53f544ec5a07f1f5d859805cd42eb38a6",
+      "status": "synced",
       "portTo": null,
       "owedSince": null
     },
@@ -675,15 +667,6 @@
       "portTo": "backend",
       "owedSince": "2026-09-05T00:18:02.460Z"
     },
-    "services/adgenBridge.js": {
-      "backendHash": "49ac3bb8c5a63a35d538e9cbd798bd1af1789ef9f121770b8e2d25659efd6496",
-      "adgenHash": "49ac3bb8c5a63a35d538e9cbd798bd1af1789ef9f121770b8e2d25659efd6496",
-      "backendSha": "f7ede19dd4ae13fcd118859c4dae9bff453a4a83",
-      "status": "unused",
-      "reason": "backend\u2192adgen handshake copy; adgen is the callee, not the caller",
-      "portTo": null,
-      "owedSince": null
-    },
     "services/aiCreativeDirectorService.js": {
       "backendHash": "8fe6c33a1a2690393ec7e80aa903f052a25334c5a4833eb10b86b292435a270c",
       "adgenHash": "4aafee2c1d7cc90487d59d1983df38c0e6b7fb872315cc980161818486decc22",
@@ -717,15 +700,6 @@
       "portTo": null,
       "owedSince": null
     },
-    "services/aiVideoPosterService.js": {
-      "backendHash": "344743defecabaab6b3d833ddd9df6c9dcbc9547239bab8556236b15cb7d1f32",
-      "adgenHash": "0b344689d2de630ac41a63737497720c5ed730eaa003a53224e6e26e47c24cb3",
-      "backendSha": "ba99a59f10619bbd940be9442c8852dc32ae278a",
-      "status": "unused",
-      "reason": "Backend #329 added adId to the vision-QC cost meta inside generatePosterForAd; irrelevant here \u2014 reconfirmed zero require()/mentions of this file anywhere in adgen src/ (backend poster path; adgen does not invoke it).",
-      "portTo": null,
-      "owedSince": null
-    },
     "services/aiVideoReferenceService.js": {
       "backendHash": "865688405806741ce0550bdd2eef36413384cf6fdc9dbc0d408374a0854f92d5",
       "adgenHash": "865688405806741ce0550bdd2eef36413384cf6fdc9dbc0d408374a0854f92d5",
@@ -748,15 +722,6 @@
       "backendSha": "aff3488d494ee7484d27971920a2b96e438e60fd",
       "status": "fork",
       "reason": "adgen dropped notify() channel override; backend still has it",
-      "portTo": null,
-      "owedSince": null
-    },
-    "services/amazonService.js": {
-      "backendHash": "65baffc2ddc09b5fcf9068a9776647d9c29e6f1daa2b7a90e0154f053e707110",
-      "adgenHash": "65baffc2ddc09b5fcf9068a9776647d9c29e6f1daa2b7a90e0154f053e707110",
-      "backendSha": "3d40302869e08ff2dc4d8a5a09cd76b57b0acffa",
-      "status": "unused",
-      "reason": "Amazon marketplace scrape is backend-owned",
       "portTo": null,
       "owedSince": null
     },
@@ -785,30 +750,12 @@
       "portTo": null,
       "owedSince": null
     },
-    "services/atlasLlmStreamService.js": {
-      "backendHash": "b68072f20d51eddc609e303893fba81bc86c143e40b2fa0a87fa23b317759a2a",
-      "adgenHash": "b68072f20d51eddc609e303893fba81bc86c143e40b2fa0a87fa23b317759a2a",
-      "backendSha": "d3bcf5c160b7e3126967724afb516925c7f831a0",
-      "status": "unused",
-      "reason": "streaming LLM path not used by the renderer",
-      "portTo": null,
-      "owedSince": null
-    },
     "services/atlasModelMap.js": {
       "backendHash": "fe280de91bf9cc4a1ae69d21b03b200f865a3f7f14403ebbb05cd4200c0d130c",
       "adgenHash": "0dc008f35e1f1e4c3eb95c8744e7ab9293082d4e4a85ead90f49dae1be8ce48c",
       "backendSha": "90418773ab5f26a2fca3e90bbce7860c7694ab71",
       "status": "fork",
       "reason": "Re-looked after backend 90418773 (#373): backend reverted its 2026-08-25 null-out of director's Anthropic direct twins back to the direct:{...} shape (the null had silently un-recorded the LLM_AUTH_MISSING skip). Adgen's file was never nulled and already carries this shape; adgen's atlasLlmService DIRECT_KEYS still has no anthropic entry, so this remains a named, non-billable skip in both codebases. No functional gap; standing fork reason (narrower routing extract) still holds.",
-      "portTo": null,
-      "owedSince": null
-    },
-    "services/atlasTextService.js": {
-      "backendHash": "55704dd5ac0061595e5b03840e1b972ac8509ae96d5875c88c7b32c7e954651c",
-      "adgenHash": "55704dd5ac0061595e5b03840e1b972ac8509ae96d5875c88c7b32c7e954651c",
-      "backendSha": "d3bcf5c160b7e3126967724afb516925c7f831a0",
-      "status": "unused",
-      "reason": "backend text helper; renderer uses atlasLlmService / atlasImageService",
       "portTo": null,
       "owedSince": null
     },
@@ -829,15 +776,6 @@
       "reason": "adgen-side change 2026-08-28: added a one-shot face-quorum-retry (detectClipBoxes samples FACE_QUORUM_RETRY_FRAMES=2 new gap-midpoint timestamps exactly once when head===null && initialHits===1, closing the measured 56/625 boundary-miss face-clip bug). Confirmed via traced call path (routes/brand.js runRetitleJob -> renderBrandScriptAndSave -> renderWithRemotionAndSave -> basePlateCropService.resolveBasePlateVideoUrl/ensureFaceDetectionForKeepOut) that backend's manual /retitle-videos admin flow still calls this exact code and DOES recompute a fresh crop on an Ad.basePlate cache miss (different format or source video) -- so backend's un-retried copy can still exhibit the same face-clip bug on that path, just at lower (manual-trigger-only) frequency than the primary adgen-generated volume this was measured against. Not ported in this PR -- flagged to the owner as a separate follow-up decision, not assumed out of scope.",
       "portTo": "backend",
       "owedSince": "2026-08-28T19:52:53.994Z"
-    },
-    "services/blockClassifier.js": {
-      "backendHash": "505108cca42df8bb500c620f032f1455f9023fa6cd7b5e554672a4fe1cb5d893",
-      "adgenHash": "505108cca42df8bb500c620f032f1455f9023fa6cd7b5e554672a4fe1cb5d893",
-      "backendSha": "fa2d397fc16f685ac38522d034dcebc59b3f9419",
-      "status": "unused",
-      "reason": "scrape bot-classifier; only reached from unused http scrape path",
-      "portTo": null,
-      "owedSince": null
     },
     "services/bootRecoveryService.js": {
       "backendHash": "23c6c84aed1a3cc6ec0e3ae4cd003f5de614c14e4670f376e35fa71a2bf716cb",
@@ -905,42 +843,6 @@
       "portTo": null,
       "owedSince": null
     },
-    "services/brandScripts/u_beauty.script.js": {
-      "backendHash": "965655a7851bbebc1bfa748a45e7e7dc0b2e95a1eee29b8a82bebac38d837fbb",
-      "adgenHash": "965655a7851bbebc1bfa748a45e7e7dc0b2e95a1eee29b8a82bebac38d837fbb",
-      "backendSha": "4f1cac288e4db8b1318a6a0d6c4fc915b7e28672",
-      "status": "unused",
-      "reason": "brand-specific script, not in adgen's canonical set",
-      "portTo": null,
-      "owedSince": null
-    },
-    "services/brandStyles/camelback_flowers.js": {
-      "backendHash": "e9584e3db8859a98ad72a773718dae375c8ce89442478de3c552ec7e2af40668",
-      "adgenHash": "e9584e3db8859a98ad72a773718dae375c8ce89442478de3c552ec7e2af40668",
-      "backendSha": "07aa33e2095d6d74c0d3b7b17755d6d67291b4d6",
-      "status": "unused",
-      "reason": "backend brand-style module; adgen does not load the registry",
-      "portTo": null,
-      "owedSince": null
-    },
-    "services/brandStyles/index.js": {
-      "backendHash": "22dc4ba3685329007495a3dc8721d9e273760e258e4217b6017fec3dc22c4654",
-      "adgenHash": "22dc4ba3685329007495a3dc8721d9e273760e258e4217b6017fec3dc22c4654",
-      "backendSha": "45659e487a7fd8ed448f7393d4280fd5b57b71e2",
-      "status": "unused",
-      "reason": "backend brand-style registry; adgen does not load it",
-      "portTo": null,
-      "owedSince": null
-    },
-    "services/brandStyles/u_beauty.js": {
-      "backendHash": "75cc4a4ae07fb5278b15392198d1df5aa84c8f24bf7740bacf4ea64e6aedd7ab",
-      "adgenHash": "75cc4a4ae07fb5278b15392198d1df5aa84c8f24bf7740bacf4ea64e6aedd7ab",
-      "backendSha": "629fae867955690b1c2925ece0d004e702be5a30",
-      "status": "unused",
-      "reason": "backend brand-style module; adgen does not load the registry",
-      "portTo": null,
-      "owedSince": null
-    },
     "services/campaignAdsGenerationService.js": {
       "backendHash": "56f4e86e8ee520eee292f2d83e7f111a3d492a44033e94b79fcb62418299a79d",
       "adgenHash": "6104d41ec534afd0c2c45fd6502413a5d35a0a8d1343f7ed58dcc202191ae4b2",
@@ -963,31 +865,15 @@
       "adgenHash": "535623ac04331d272722fe7f41967c54b3a8fadafe05e4c05bc2f3109fd3961d",
       "backendSha": "4b95403dad957b0dd735987ff6ca2e1ba08c832f",
       "status": "fork",
-      "reason": "Ported backend 4b95403d classifyRunAdOutcome onto deriveAdPhase (succeeded=complete, failed=failed-terminal|qc-failed-kept, stillRendering/requeuedAway still keyed on raw ad.status). Residual fork is comment-only: adgen still names titlingResumeService as a live stamper of draft+untitled masters (that service exists here); backend's copy says it was removed. buildStaleRunningFilter/exports unchanged. Count-equivalence pinned by scripts/verifyClassifyRunAdOutcomeParity.js."
+      "reason": "Ported backend 4b95403d classifyRunAdOutcome onto deriveAdPhase (succeeded=complete, failed=failed-terminal|qc-failed-kept, stillRendering/requeuedAway still keyed on raw ad.status). Residual fork is comment-only: adgen still names titlingResumeService as a live stamper of draft+untitled masters (that service exists here); backend's copy says it was removed. buildStaleRunningFilter/exports unchanged. Count-equivalence pinned by scripts/verifyClassifyRunAdOutcomeParity.js.",
+      "portTo": null,
+      "owedSince": null
     },
     "services/campaignRunHeartbeat.js": {
       "backendHash": "6afcd696fa4b20916b535ade7c3d3cfc87362e51f5f2f46b63a0f3d90e39c0de",
       "adgenHash": "6afcd696fa4b20916b535ade7c3d3cfc87362e51f5f2f46b63a0f3d90e39c0de",
       "backendSha": "9fb14705b0bdc7fba68af4424423be11bca39d5f",
       "status": "synced",
-      "portTo": null,
-      "owedSince": null
-    },
-    "services/capabilityExecutors/adRegenerate.js": {
-      "backendHash": "960b19e0bdf0f112e8a3ac7247faf7f3424c2372bb063feb4c3516c50f7069ab",
-      "adgenHash": "960b19e0bdf0f112e8a3ac7247faf7f3424c2372bb063feb4c3516c50f7069ab",
-      "backendSha": "5624d4fa8ed437823d5d5eb9303eec8246bf6dfe",
-      "status": "unused",
-      "reason": "only required from unused capabilityRegistry",
-      "portTo": null,
-      "owedSince": null
-    },
-    "services/capabilityRegistry.js": {
-      "backendHash": "b662a945c8dbfd30af1e85073ebf00ab8efd2214c7f028e041d42bb8ab109ea9",
-      "adgenHash": "45a390721c131c3f43f3772e9f8d4778f1df95b74720e213047ddadfbf3ec036",
-      "backendSha": "9bad6b803b1d2ed72b10ae2388e1bbcbec688a28",
-      "status": "unused",
-      "reason": "unused in adgen \u2014 operator-agent capability surface is backend-owned. Re-attested after backend #340 corrected campaign.create's describe text, which had been telling the agent layer the old deadlocked readiness rule ('every connected integration must have >=1 completed DetectRun').",
       "portTo": null,
       "owedSince": null
     },
@@ -1064,30 +950,12 @@
       "portTo": null,
       "owedSince": null
     },
-    "services/creativeMatcherCore.js": {
-      "backendHash": "8ce8c7b76624d3dcc94e50cb1d18eb21db4fd29814f8c188ff2fdf95034f91b8",
-      "adgenHash": "8ce8c7b76624d3dcc94e50cb1d18eb21db4fd29814f8c188ff2fdf95034f91b8",
-      "backendSha": "7b28a3477731953373906f5eaa29b218245f13e1",
-      "status": "unused",
-      "reason": "backend matcher; adgen does not call it",
-      "portTo": null,
-      "owedSince": null
-    },
     "services/directImageRenderService.js": {
       "backendHash": "f08b826fce868dac48bab3e037b736a338f07859df885533034ec2ad1a621e4f",
       "adgenHash": "613ec2c8dc556bf9df8116cb39abc28a4fdeb2fb467dea3067a7ec1c73a78712",
       "backendSha": "e955b04891fcb861bbf64a5bc8642aa2fbe7a0bc",
       "status": "fork",
       "reason": "Fork, not a copy \u2014 adgen owns the live static renderer. This change ports only the segment-override plumbing on top of that fork: buildPrompt({segment}) with categoryPath from resolvedProduct.category || inferredBreadcrumb, CatalogProduct selects now include those two fields (otherwise categoryPath is always null on the DB path), and intentResolution.promptFlags.segmentOverrides stamps built.appliedOverrides. Remaining adgen-owned hunks, deliberately not flattened: logo LRU (optionalImageCached); ai_ugc_led \u2192 objection_resolved; product.category threaded for the apparel role preamble; usableAttribution; composeCorrectiveOverride / buildQcRetryArgs; submitEditImageWithSeedFallback; resume-from-receipt (existingPredictionId / allowResume \u2014 a money guard backend does not have). Backend-only hunks left unported on purpose: promptSha256 / seedStyle on intentResolution (not segment plumbing). Previously status=unported for the resume guard; that guard is adgen-owned live-renderer policy, not a debt backend still owes, so this is a fork.",
-      "portTo": null,
-      "owedSince": null
-    },
-    "services/enrichmentReconciler.js": {
-      "backendHash": "18319b9414c7c67c332f03cbb7870c42048dace067a55523f54b7ea16c071649",
-      "adgenHash": "18319b9414c7c67c332f03cbb7870c42048dace067a55523f54b7ea16c071649",
-      "backendSha": "bb98fe38d252833cdf4e68305fb34c1bfdfb3561",
-      "status": "unused",
-      "reason": "backend catalog enrichment; adgen does not call it",
       "portTo": null,
       "owedSince": null
     },
@@ -1124,33 +992,6 @@
       "portTo": null,
       "owedSince": null
     },
-    "services/frontendOriginValidator.js": {
-      "backendHash": "d7930cc9294706772bead17f378264f6ec01d92fc00fb1a688dc0de8c71e6e2a",
-      "adgenHash": "d7930cc9294706772bead17f378264f6ec01d92fc00fb1a688dc0de8c71e6e2a",
-      "backendSha": "b331e2def8d9a14164372957affd18eb776424d5",
-      "status": "unused",
-      "reason": "HTTP origin check for backend API routes",
-      "portTo": null,
-      "owedSince": null
-    },
-    "services/geminiImageService.js": {
-      "backendHash": "acf8a176a577e4584dc127e2be171fa09e807143cfdeb491a1bf25cdbef63ce2",
-      "adgenHash": "9000d37c901eb4401b3949a30f9b8168f0e3eb2f2ae7e95f86e735d11edc2d86",
-      "backendSha": "1acb49bd9775eb79848fcb05d9a7289bbd3efa6b",
-      "status": "unused",
-      "reason": "unused in adgen \u2014 Gemini image generation is backend-owned. Re-looked after backend #331, which threaded brandId/productId through four more unledgered cost producers so their CostLog rows attribute correctly.",
-      "portTo": null,
-      "owedSince": null
-    },
-    "services/generationGate.js": {
-      "backendHash": "8e1e414c11e2c0560db6e9dbb872096c25d0e89f12e83d102d2700970ab68202",
-      "adgenHash": "8e1e414c11e2c0560db6e9dbb872096c25d0e89f12e83d102d2700970ab68202",
-      "backendSha": "2284f8ecd2384a2df3aa2ac45f54c49a74b00bf8",
-      "status": "unused",
-      "reason": "backend /generate 409 gate; adgen is downstream of the mint (look before wiring)",
-      "portTo": null,
-      "owedSince": null
-    },
     "services/handoffContract.js": {
       "backendHash": "464942baee1c9c250686dd584454ee3bcc6237106608f15d7861d0ec8508ae03",
       "adgenHash": "464942baee1c9c250686dd584454ee3bcc6237106608f15d7861d0ec8508ae03",
@@ -1160,30 +1001,12 @@
       "portTo": null,
       "owedSince": null
     },
-    "services/httpScrapeClient.js": {
-      "backendHash": "5c6a39f31715b90374ef2fc5783b66a0604783fb9585c3d44a23618f4f3f0242",
-      "adgenHash": "5c6a39f31715b90374ef2fc5783b66a0604783fb9585c3d44a23618f4f3f0242",
-      "backendSha": "388ed3b3058ec25c20688976c3df0d3981f61294",
-      "status": "unused",
-      "reason": "only reached from unused vendor adapters / scrape services",
-      "portTo": null,
-      "owedSince": null
-    },
-    "services/imagePreviewUrl.js": {
-      "backendHash": "1e350ca6d6b7eb2fcf4ef4ea8e7cf5c46d431b90f2b2a1543d1ef93dd9a45e1d",
-      "adgenHash": "1e350ca6d6b7eb2fcf4ef4ea8e7cf5c46d431b90f2b2a1543d1ef93dd9a45e1d",
-      "backendSha": "110837dff668c1485c4e4f4906f9c6db2f836a58",
-      "status": "unused",
-      "reason": "backend preview helper; no adgen caller",
-      "portTo": null,
-      "owedSince": null
-    },
     "services/imageRecoveryService.js": {
       "backendHash": "adfabcf2dce9caf82e332cca557cb22c014b618b65452087c9b07ce194c56b1d",
       "adgenHash": "f69e5278c31b3212cba07f7877b6bb14099447069f48994325f4a987483e9cef",
       "backendSha": "e955b04891fcb861bbf64a5bc8642aa2fbe7a0bc",
-      "status": "unused",
-      "reason": "Backend #329 added productId to the CostLog objects in recoverImageAd and settleChargeState; irrelevant \u2014 reconfirmed both callers (strandedRunSweeper.js, bootRecoveryService.js) have zero requirers anywhere in adgen src/ (entrypoint.js only requires ./config, ./db, ./routes/api, ./services/orchestrator, ./services/renderer), so this file stays unreachable. Same reason as before: only reached from unwired bootRecovery / strandedRunSweeper.",
+      "status": "fork",
+      "reason": "LIVE: bootRecoveryService.js:121 require('./imageRecoveryService') and recoverImageAd used at bootRecoveryService.js:322,350,375 (static-image receipt peek / finishPlate). Manifest unused was a lie.",
       "portTo": null,
       "owedSince": null
     },
@@ -1192,15 +1015,6 @@
       "adgenHash": "3a9a4ea1b7ad95437b0374f1d4844c2c20c28c651c0a2d517b52f3171d17111b",
       "backendSha": "9b482775e2f75324ca0dec26c9bb405bd1899093",
       "status": "synced",
-      "portTo": null,
-      "owedSince": null
-    },
-    "services/inFlight.js": {
-      "backendHash": "e00c6715822195ba500e8e91124a9016f6944c647e3f35de49e719974e90990d",
-      "adgenHash": "e00c6715822195ba500e8e91124a9016f6944c647e3f35de49e719974e90990d",
-      "backendSha": "d3ed8d5638418bf913b165bf42614daea2c4da39",
-      "status": "unused",
-      "reason": "backend process-wide inflight counter; adgen uses a per-run map in renderer.js (look before wiring)",
       "portTo": null,
       "owedSince": null
     },
@@ -1220,15 +1034,6 @@
       "portTo": null,
       "owedSince": null
     },
-    "services/judgeService.js": {
-      "backendHash": "1d0e37eaa893b54bb6ebacd5b7e875a56dcb4e5c1600c2d5565303ee797b4ff9",
-      "adgenHash": "a2cdad874e664abf625240caed606b2367ee1e32dd6f1787697309c762b8fec4",
-      "backendSha": "ba99a59f10619bbd940be9442c8852dc32ae278a",
-      "status": "unused",
-      "reason": "Backend #329 threads brandId/productId/adId/campaignRunId through judgeDetections, judgeExtendedCrops, and callOpenAIWithCloudinaryRetry; irrelevant here \u2014 reconfirmed zero require() sites in adgen src/ (only two doc-comment mentions in llmError.js:708,781). adgen uses aiJudgeService, unchanged.",
-      "portTo": null,
-      "owedSince": null
-    },
     "services/layoutInputService.js": {
       "backendHash": "fdaebc5c5f917353b6dd8f78aa6d3d3c4bf67f29bbc025648dc41797b785dc28",
       "adgenHash": "b72f89371b19e3fdecec8abd3d361a97fee421947d39e425e4f0e264fb521091",
@@ -1243,15 +1048,6 @@
       "adgenHash": "589fd87ece50784d1620ac2db054d92911c880d21d2a34be4db3f4df8aaf7f8f",
       "backendSha": "17ed63e3fedb3d93a36fd7a8248dc720774ce72a",
       "status": "synced",
-      "portTo": null,
-      "owedSince": null
-    },
-    "services/mediaAssignmentService.js": {
-      "backendHash": "0926f85e226144dbcf8da19e0abaf0717e58ca2e28e60974d64397efae0be065",
-      "adgenHash": "0926f85e226144dbcf8da19e0abaf0717e58ca2e28e60974d64397efae0be065",
-      "backendSha": "de243f43d8df02695afb326017966a7dd366e2ed",
-      "status": "unused",
-      "reason": "backend media assignment; adgen does not call it",
       "portTo": null,
       "owedSince": null
     },
@@ -1301,15 +1097,6 @@
       "adgenHash": "a84aaa641292abeaa3a553c85f0aaa0f856a0ccd7d279d6999432d5a31a8005e",
       "backendSha": "149862fdcde316f7d22a706bf627d7ca9f9f091e",
       "status": "synced",
-      "portTo": null,
-      "owedSince": null
-    },
-    "services/openaiService.js": {
-      "backendHash": "81669aad712ccf6e38a8de49ce3dbcea380c861fa275d492ccbc8f64753cf6d6",
-      "adgenHash": "81669aad712ccf6e38a8de49ce3dbcea380c861fa275d492ccbc8f64753cf6d6",
-      "backendSha": "9c6e1147d53cf16c59c0cf8ddde49e8908f67569",
-      "status": "unused",
-      "reason": "backend OpenAI wrapper; adgen spends via Atlas",
       "portTo": null,
       "owedSince": null
     },
@@ -1376,23 +1163,7 @@
       "adgenHash": "679977eab82be6a0a5acd394233dd738d35b8dea6f09f181a204df65f8a7fe46",
       "backendSha": "f9efb439b58f2bc5e8936868a1dd4308d58e84f5",
       "status": "fork",
-      "reason": "Ported backend f9efb439 stage-transition reset + closeOpenStagePush stages[] history + flush $set+$push retry. Deliberately omitted ingestStatusFeedService require/touch() wiring and sweepStaleRuns reaped-run snapshot: adgen has no ingestStatusFeedService.js and never runs ingest-kind jobs (ad-regenerate/detect/video only). Residual fork is the missing ingest Slack projector, not remaining stage-reset debt."
-    },
-    "services/pushToShopify.js": {
-      "backendHash": "96cbcabfb6b4172eab832b7d94d6154e38160a567537f67bb3c9f3af6f59b151",
-      "adgenHash": "96cbcabfb6b4172eab832b7d94d6154e38160a567537f67bb3c9f3af6f59b151",
-      "backendSha": "f48648fc045cef0c2b5ee44e32217078932db612",
-      "status": "unused",
-      "reason": "Shopify push is backend-owned",
-      "portTo": null,
-      "owedSince": null
-    },
-    "services/queuedArchiveSweeper.js": {
-      "backendHash": "2c117638c9123043f1b12ce6e0e10ff633d4a35456976bb24f9429f9c0859c56",
-      "adgenHash": "2c117638c9123043f1b12ce6e0e10ff633d4a35456976bb24f9429f9c0859c56",
-      "backendSha": "a1cdd39c497856a82e126aac835fcbe9f6e76d8c",
-      "status": "unused",
-      "reason": "backend archive sweeper; not wired into adgen entrypoint",
+      "reason": "Ported backend f9efb439 stage-transition reset + closeOpenStagePush stages[] history + flush $set+$push retry. Deliberately omitted ingestStatusFeedService require/touch() wiring and sweepStaleRuns reaped-run snapshot: adgen has no ingestStatusFeedService.js and never runs ingest-kind jobs (ad-regenerate/detect/video only). Residual fork is the missing ingest Slack projector, not remaining stage-reset debt.",
       "portTo": null,
       "owedSince": null
     },
@@ -1478,110 +1249,11 @@
       "portTo": null,
       "owedSince": null
     },
-    "services/reviewAdapters/bazaarvoice.js": {
-      "backendHash": "5edbca2aaf5780b76337f2ba281a80ce28ba2a50a64462330cfd941ce67d02b9",
-      "adgenHash": "5edbca2aaf5780b76337f2ba281a80ce28ba2a50a64462330cfd941ce67d02b9",
-      "backendSha": "c317d0803180b30aea22e8c88ea03ec48fce9534",
-      "status": "unused",
-      "reason": "only required from unused reviewAdapters/index.js; adgen uses helpers.js only",
-      "portTo": null,
-      "owedSince": null
-    },
-    "services/reviewAdapters/fera.js": {
-      "backendHash": "980df71c29b9c5f577b0da5c0aed4bcf16a861bba96df2ae0a662fee6fcbbc4b",
-      "adgenHash": "980df71c29b9c5f577b0da5c0aed4bcf16a861bba96df2ae0a662fee6fcbbc4b",
-      "backendSha": "c317d0803180b30aea22e8c88ea03ec48fce9534",
-      "status": "unused",
-      "reason": "only required from unused reviewAdapters/index.js; adgen uses helpers.js only",
-      "portTo": null,
-      "owedSince": null
-    },
     "services/reviewAdapters/helpers.js": {
       "backendHash": "4d2e1abc587285f931ad34fa0cd4488695100036561b9a6427ecdd48ae9435d1",
       "adgenHash": "4d2e1abc587285f931ad34fa0cd4488695100036561b9a6427ecdd48ae9435d1",
       "backendSha": "c317d0803180b30aea22e8c88ea03ec48fce9534",
       "status": "synced",
-      "portTo": null,
-      "owedSince": null
-    },
-    "services/reviewAdapters/index.js": {
-      "backendHash": "7dbf954e67a57afc9293b2bee446f70bebd24fab4b93302945b7dbe83d56b549",
-      "adgenHash": "7dbf954e67a57afc9293b2bee446f70bebd24fab4b93302945b7dbe83d56b549",
-      "backendSha": "c317d0803180b30aea22e8c88ea03ec48fce9534",
-      "status": "unused",
-      "reason": "adapter fan-out is backend scrape; adgen only requires helpers.js via quoteRotationService",
-      "portTo": null,
-      "owedSince": null
-    },
-    "services/reviewAdapters/judgeme.js": {
-      "backendHash": "5a7ec447d01513296630bcd46a93a1d27aa27195ed22e9a8917490763fca7bfa",
-      "adgenHash": "5a7ec447d01513296630bcd46a93a1d27aa27195ed22e9a8917490763fca7bfa",
-      "backendSha": "c317d0803180b30aea22e8c88ea03ec48fce9534",
-      "status": "unused",
-      "reason": "only required from unused reviewAdapters/index.js; adgen uses helpers.js only",
-      "portTo": null,
-      "owedSince": null
-    },
-    "services/reviewAdapters/junip.js": {
-      "backendHash": "d1fce186396fad2b999771cbef58869222e424436249b9b00343c310cf486787",
-      "adgenHash": "d1fce186396fad2b999771cbef58869222e424436249b9b00343c310cf486787",
-      "backendSha": "c317d0803180b30aea22e8c88ea03ec48fce9534",
-      "status": "unused",
-      "reason": "only required from unused reviewAdapters/index.js; adgen uses helpers.js only",
-      "portTo": null,
-      "owedSince": null
-    },
-    "services/reviewAdapters/okendo.js": {
-      "backendHash": "f41c6ee6207f965ae878ec7966aad643040e0f690c64fba2783b125dbc9621ba",
-      "adgenHash": "f41c6ee6207f965ae878ec7966aad643040e0f690c64fba2783b125dbc9621ba",
-      "backendSha": "c317d0803180b30aea22e8c88ea03ec48fce9534",
-      "status": "unused",
-      "reason": "only required from unused reviewAdapters/index.js; adgen uses helpers.js only",
-      "portTo": null,
-      "owedSince": null
-    },
-    "services/reviewAdapters/powerreviews.js": {
-      "backendHash": "ab82c2bd0c39b38c6efa99bb74cda3e7a6bf9110af3e2ac5634929ea5da282d9",
-      "adgenHash": "ab82c2bd0c39b38c6efa99bb74cda3e7a6bf9110af3e2ac5634929ea5da282d9",
-      "backendSha": "c317d0803180b30aea22e8c88ea03ec48fce9534",
-      "status": "unused",
-      "reason": "only required from unused reviewAdapters/index.js; adgen uses helpers.js only",
-      "portTo": null,
-      "owedSince": null
-    },
-    "services/reviewAdapters/reviewsio.js": {
-      "backendHash": "847627e58904b873971958fae1f3882e89e1fa60b7182c480beb4c46072b7dd9",
-      "adgenHash": "847627e58904b873971958fae1f3882e89e1fa60b7182c480beb4c46072b7dd9",
-      "backendSha": "c317d0803180b30aea22e8c88ea03ec48fce9534",
-      "status": "unused",
-      "reason": "only required from unused reviewAdapters/index.js; adgen uses helpers.js only",
-      "portTo": null,
-      "owedSince": null
-    },
-    "services/reviewAdapters/stamped.js": {
-      "backendHash": "8d9668da3a73f8af44ca48c95f1b928a7f03e3f4e8e17151157dcd33ccf7bf1b",
-      "adgenHash": "8d9668da3a73f8af44ca48c95f1b928a7f03e3f4e8e17151157dcd33ccf7bf1b",
-      "backendSha": "c317d0803180b30aea22e8c88ea03ec48fce9534",
-      "status": "unused",
-      "reason": "only required from unused reviewAdapters/index.js; adgen uses helpers.js only",
-      "portTo": null,
-      "owedSince": null
-    },
-    "services/reviewAdapters/yotpo.js": {
-      "backendHash": "2d00b525ceefc9583167ac363d0b01259c05bb454c556105b2420d87b9c35d1a",
-      "adgenHash": "2d00b525ceefc9583167ac363d0b01259c05bb454c556105b2420d87b9c35d1a",
-      "backendSha": "c317d0803180b30aea22e8c88ea03ec48fce9534",
-      "status": "unused",
-      "reason": "only required from unused reviewAdapters/index.js; adgen uses helpers.js only",
-      "portTo": null,
-      "owedSince": null
-    },
-    "services/reviewSiteProfileService.js": {
-      "backendHash": "a51b54a019353d6fee7b31859ef23a34f16cc6f15510f79590a18eee82cd1cc9",
-      "adgenHash": "a51b54a019353d6fee7b31859ef23a34f16cc6f15510f79590a18eee82cd1cc9",
-      "backendSha": "d26d32bae585507c5f1c3a681ee2eb602ce979c4",
-      "status": "unused",
-      "reason": "backend review-site admin; adgen does not call it",
       "portTo": null,
       "owedSince": null
     },
@@ -1598,14 +1270,7 @@
       "adgenHash": "3ae131718342fd1557e06251d1ef9cb74083df17d7aabbfb0ec12ed4b118122d",
       "backendSha": "4b95403dad957b0dd735987ff6ca2e1ba08c832f",
       "status": "fork",
-      "reason": "Ported backend 4b95403d (#368) titlingIncomplete-aware 'N draft (M still titling)' count line, loadLiveSnapshot single-find + classifyRunAdOutcome (now itself on deriveAdPhase), and summariseFailures QC-Fail prefix via adPhase.js + AdModel() DI. Residual fork is adgen's own attachAd (reads CampaignRun.slackFeed from Mongo, never creates a parent) and the additive source tag on formatThreadLine/onStage/noteEvent."
-    },
-    "services/salesDemosService.js": {
-      "backendHash": "eaea9fa1bed266f7c8abb885aaa649c12165efb5d8744398134e7793ba3a226e",
-      "adgenHash": "eaea9fa1bed266f7c8abb885aaa649c12165efb5d8744398134e7793ba3a226e",
-      "backendSha": "f78e8b5691b3465e2275ea0d71d9f2ff8aef87d2",
-      "status": "unused",
-      "reason": "sales-demo admin is backend-owned",
+      "reason": "Ported backend 4b95403d (#368) titlingIncomplete-aware 'N draft (M still titling)' count line, loadLiveSnapshot single-find + classifyRunAdOutcome (now itself on deriveAdPhase), and summariseFailures QC-Fail prefix via adPhase.js + AdModel() DI. Residual fork is adgen's own attachAd (reads CampaignRun.slackFeed from Mongo, never creates a parent) and the additive source tag on formatThreadLine/onStage/noteEvent.",
       "portTo": null,
       "owedSince": null
     },
@@ -1651,15 +1316,6 @@
       "portTo": null,
       "owedSince": null
     },
-    "services/spendGuard.js": {
-      "backendHash": "e587076ebfe7e0199643a05db828c82c82bf487b83246952b590db2cbdf71e64",
-      "adgenHash": "e587076ebfe7e0199643a05db828c82c82bf487b83246952b590db2cbdf71e64",
-      "backendSha": "e724b8ba96564abdc69b77729833b6b9e2e0e201",
-      "status": "unused",
-      "reason": "backend spend cap; adgen has costTracker but does not require spendGuard (look before wiring \u2014 money-adjacent)",
-      "portTo": null,
-      "owedSince": null
-    },
     "services/spendReceipt.js": {
       "backendHash": "1fb921cb24e9f159fb268909b495f185b73b8d9d4548aaec5fed6160cc40bd9a",
       "adgenHash": "41a857ecdee5e887c184191e3b7e1787841fcba0aebf4cd894370806b51bac46",
@@ -1694,24 +1350,6 @@
       "portTo": null,
       "owedSince": null
     },
-    "services/strandedRunSweeper.js": {
-      "backendHash": "d549c622db3c730cf8307f9065f1060f34f630b41d5903eacc93c25dcf12b014",
-      "adgenHash": "d549c622db3c730cf8307f9065f1060f34f630b41d5903eacc93c25dcf12b014",
-      "backendSha": "d4de65a7f0ad153cefd84839db4eb6225d7ae3fd",
-      "status": "unused",
-      "reason": "backend stranded-run sweeper; not wired into adgen entrypoint (look before wiring)",
-      "portTo": null,
-      "owedSince": null
-    },
-    "services/superAdminService.js": {
-      "backendHash": "bd66c9adc0c29a8b23d57474d94acf0811684ec8c2c160425274c756edcba573",
-      "adgenHash": "bd66c9adc0c29a8b23d57474d94acf0811684ec8c2c160425274c756edcba573",
-      "backendSha": "53fcee2171b7f7d6439223de3623a09f338f36c7",
-      "status": "unused",
-      "reason": "backend super-admin surface; adgen does not call it",
-      "portTo": null,
-      "owedSince": null
-    },
     "services/systemConfigService.js": {
       "backendHash": "c6786774ace53c6456ff56f7a749cd926725de34a8f2de9608fb24b8ecb81995",
       "adgenHash": "c6786774ace53c6456ff56f7a749cd926725de34a8f2de9608fb24b8ecb81995",
@@ -1725,15 +1363,6 @@
       "adgenHash": "35b42275fc3f2cd340454902e2ac0d2f12db4e4cd9d2350ae400ce5f9197138a",
       "backendSha": "29be84b4b51006f18e512aea8727d2eff383dc93",
       "status": "synced",
-      "portTo": null,
-      "owedSince": null
-    },
-    "services/textEmbeddingService.js": {
-      "backendHash": "86ef2b68438c3ff4d0f3a71b5949d4fbd4a5048a3b111818e633e5e399bb3c3c",
-      "adgenHash": "89fd121615f484cd06c5abfa308867c91764b77329c0b99e3e525104756749fa",
-      "backendSha": "ba99a59f10619bbd940be9442c8852dc32ae278a",
-      "status": "unused",
-      "reason": "Backend #329 added brandId/productId/adId/campaignRunId to both trackLlmCall meta objects in embed() (atlas + direct-openai-fallback paths); irrelevant \u2014 reconfirmed zero require() sites in adgen src/ (one doc-comment mention in models/CatalogProduct.js:105). Backend embeddings; adgen does not call it.",
       "portTo": null,
       "owedSince": null
     },
@@ -1765,8 +1394,7 @@
       "backendHash": "2a7c1390a0bd0c46f2f361fb6eb445a9b55bbb225ada35adb6fdc84b5601d78e",
       "adgenHash": "2a7c1390a0bd0c46f2f361fb6eb445a9b55bbb225ada35adb6fdc84b5601d78e",
       "backendSha": "d162f48d5e77f2231268a03cdac9e74bff614575",
-      "status": "unused",
-      "reason": "backend UGC pipeline; adgen renderer does not call it",
+      "status": "synced",
       "portTo": null,
       "owedSince": null
     },
@@ -1796,15 +1424,6 @@
       "portTo": null,
       "owedSince": null
     },
-    "services/videoCompositeService.js": {
-      "backendHash": "5f146c94b3f93c548e34d50fe1a7d2be725e17975c0094669f92030e484d6625",
-      "adgenHash": "5f146c94b3f93c548e34d50fe1a7d2be725e17975c0094669f92030e484d6625",
-      "backendSha": "e283b6cf7be494ca4aade2a1514cff2c047d8d03",
-      "status": "unused",
-      "reason": "backend composite helper; no adgen caller",
-      "portTo": null,
-      "owedSince": null
-    },
     "services/videoCropUrl.js": {
       "backendHash": "bab907c0a8b60ac8b06a8a0c93b962d30a248fff4c5bf8ca46db2990342b6b34",
       "adgenHash": "bab907c0a8b60ac8b06a8a0c93b962d30a248fff4c5bf8ca46db2990342b6b34",
@@ -1830,15 +1449,6 @@
       "portTo": null,
       "owedSince": null
     },
-    "services/videoPreviewUrl.js": {
-      "backendHash": "e4b0d8586e05fdef53f11952d3c95c7b40549f1aec10e3fa54e63d622bb7c2cf",
-      "adgenHash": "e4b0d8586e05fdef53f11952d3c95c7b40549f1aec10e3fa54e63d622bb7c2cf",
-      "backendSha": "64371b975ee4033273b1b33288f84ccdc6a32e65",
-      "status": "unused",
-      "reason": "backend preview helper; no adgen caller",
-      "portTo": null,
-      "owedSince": null
-    },
     "services/videoProductAnchor.js": {
       "backendHash": "a4624bd2eb4fa3641e356a5e9276faf27e2987889c186080b6332e5926308e3e",
       "adgenHash": "a4624bd2eb4fa3641e356a5e9276faf27e2987889c186080b6332e5926308e3e",
@@ -1852,15 +1462,6 @@
       "adgenHash": "610e1947487419a4e5a76dfe261fbc88690dc3c0d580bc7b815ffa15061d8668",
       "backendSha": "b06248af38a4e88139c5c0fd438b997ff7084b55",
       "status": "synced",
-      "portTo": null,
-      "owedSince": null
-    },
-    "services/videoRefPrewarmService.js": {
-      "backendHash": "7fb57345f846f4ecc017fecd6c7ae8824fc6df20f04341263486f67f6d2a5c28",
-      "adgenHash": "7927ee374dbca7a604a509d68fbda2c637470f867a6f43099f11e084dcc598fc",
-      "backendSha": "01a62e865a69d1d9e7fb21f0b0e9f23283c04bc7",
-      "status": "unused",
-      "reason": "backend ref-prewarm; no adgen caller. 2026-09-04: backend 01a62e86 expanded prewarm to also warm pmax_video_16_9 alongside META_VIDEO_MASTER (closes PMax-landscape outpaint spend on backend side only). Still unused in adgen -- no route/service calls prewarmVideoRefsForProducts here; the only two references (geminiReferenceAssembly.js, atlasVideoService.js) are comments. Re-attested at backend SHA 01a62e86; the commit's own note confirms the real adgen force-crop port stays a separate, already-open item.",
       "portTo": null,
       "owedSince": null
     },
@@ -1881,15 +1482,6 @@
       "reason": "Gemini branch (geminiVideoService require + else-if arm, incl. modelOverride threading via resolveGeminiModel and the no-prompt-argument fix) stays a legitimate adgen-only fork -- backend has no geminiVideoService.js. But two NEW pieces since the 2026-09-03 PR #110 reason are real backend debt: (A) MONEY -- generateForAd's new allowResume=true param, threaded into the atlas-branch atlasVideoService.generateForAd call, is the plumbing for the shouldResumeAttempt/resume-from-receipt guard (PR #40 / commit 2f99218) that vendor-manifest.json already tracks as unported/owed-to-backend on services/atlasVideoService.js and services/adRegenerateService.js -- backend's committed videoRouter.js atlas-branch call and adRegenerateService.js call site (git show origin/main) both still call generateForAd with zero allowResume, so this router's plumbing will also be missing once those sibling ports land. (B) SAFETY -- backend's committed generateForAd still falls through any unrecognized VIDEO_PROVIDER value to the deprecated, billable Vertex/aiVideoReferenceService path via a bare else; adgen now requires provider===vertex explicitly and throws fail-closed on anything else (comment: previously this silently generated on a third provider believing a cutover had happened). That fail-closed restructuring is independent of Gemini and backend should adopt it regardless of Gemini-port timing.",
       "portTo": "backend",
       "owedSince": "2026-09-05T00:18:50.152Z"
-    },
-    "services/yoloService.js": {
-      "backendHash": "c88ddc01a238be52a9c69cc6bb69444b1a267a8a019d1ac8c10fd8218851d525",
-      "adgenHash": "af1180cc6933c63795970897f4c4534405124b1eea4d839416c5f02a809c2222",
-      "backendSha": "a1d03573e0dffb495cf20eceb683de4d880fef0f",
-      "status": "unused",
-      "reason": "Re-attested at backend a1d03573: 3 new commits (open-vocab prompt threading, detectBatch for /detect-batch, permanent-vs-transient error classification for backfill) are all backend-only catalog-ingest features layered onto detectMultipleProducts/new detectBatch export. Adgen's yoloService.js has no callers anywhere in src (only a stray comment reference) and is unaffected.",
-      "portTo": null,
-      "owedSince": null
     },
     "utils/colorContrast.js": {
       "backendHash": "0592b22f7bb40d089c11157ea75252b3060d87c80cf1b119df88e8c639986eb3",
@@ -1939,12 +1531,6 @@
       "status": "synced",
       "portTo": null,
       "owedSince": null
-    },
-    "services/adPhase.js": {
-      "backendHash": "49aa82bcc7e60a0d6b9a263f8502b47995349871229c3649ab756599d4210ee9",
-      "adgenHash": "49aa82bcc7e60a0d6b9a263f8502b47995349871229c3649ab756599d4210ee9",
-      "backendSha": "be8ea6b53f544ec5a07f1f5d859805cd42eb38a6",
-      "status": "synced"
     }
   }
 }
