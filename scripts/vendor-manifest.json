@@ -1,15 +1,15 @@
 {
   "version": 2,
   "backendRef": "origin/main",
-  "backendHead": "10ab21ab310080a2b3002e7b72fce3e6bede53f1",
-  "generatedAt": "2026-09-05T03:08:43.502Z",
+  "backendHead": "5c36b81b6a574aa8e0812fc2239d3499979331b0",
+  "generatedAt": "2026-09-05T20:16:04.445Z",
   "files": {
     "models/Ad.js": {
       "backendHash": "812961d1ad30f5f87891dcace58fbe44ce5e07a5789f34b927fe8208dc2db966",
-      "adgenHash": "aca8e06a9d335d1ba97de600bdabc1dae8430c750f2b988d4b5b64b31cf7ccf6",
+      "adgenHash": "1e60a8bcc3908b1fea99698b34bc6cd3e5e4654a7aac30662eedd8577175d582",
       "backendSha": "fba815887c3240d617c9c3a1bbfd6daecd791215",
       "status": "fork",
-      "reason": "PR #386: added Ad.videoTitleDirection (mint stamp, Mixed). Remaining differences are legitimate ongoing fork divergence (adgen-only titling/QC comments and fields backend does not need).",
+      "reason": "declare-only schema defense: copied backend qcOverridden/qcOverriddenAt/qcOverriddenBy/qcOverrideReason (writer is backend POST /:id/override-qc; adgen metaAdsPushService ad.save() would strip them). Remaining diffs are legitimate ongoing fork (adgen-only titling/QC comments and regenerate-consumer claim comments).",
       "portTo": null,
       "owedSince": null
     },
@@ -73,7 +73,9 @@
       "backendHash": "867bc01e144a7d8d77ee6bc822abf61e5b7a9ebb46ebda913162fc4de7683104",
       "adgenHash": "867bc01e144a7d8d77ee6bc822abf61e5b7a9ebb46ebda913162fc4de7683104",
       "backendSha": "c30302df9f838e9770a80297a23ac67f47b0f9db",
-      "status": "synced"
+      "status": "synced",
+      "portTo": null,
+      "owedSince": null
     },
     "models/Campaign.js": {
       "backendHash": "079065a6d9dff95e04f8136469d847cb6f3703452e6553492ea35e26291df6ae",
@@ -198,10 +200,10 @@
     },
     "models/Media.js": {
       "backendHash": "0ccdd2c860852e0bc5159a5771f88f15fa6df486a69a5cf6dfd2d920eed8107a",
-      "adgenHash": "c8c2189c3810dc2950686779d18829f1962f23561fcf6df7350ee0620f8a72de",
+      "adgenHash": "31de82b4281f4a5cb7f600188700c6284ce79ae487b8ad03e4151553da6fdeb7",
       "backendSha": "45f5e3c05b472f319a78fdc53e19229cd2001434",
       "status": "fork",
-      "reason": "2026-09-04: backend a1d03573..45f5e3c0 (PR #382) landed classification.faceVisible (Boolean, default null) on Media schema as ingest writer work -- exactly the change the prior 2026-09-03 entry anticipated. Adgen's schema already has this field with matching semantics (null=not assessed, false=no face, true=face visible, never default false). Re-attesting as fork, no new divergence.",
+      "reason": "declare-only schema defense: copied backend yoloDetectedAt/yoloFailReason (writer is backend mediaYoloRefine.js; adgen mediaInsightsService.js media.save() from Media post-save would strip them). Remaining diff is adgen's faceVisible comment (renderer lean-read note); field shape already matched.",
       "portTo": null,
       "owedSince": null
     },
@@ -256,10 +258,9 @@
     },
     "models/SystemConfig.js": {
       "backendHash": "387d6a7769fe1a13fc4d6ebd5115bec65d1f91178a933c1febc0623aba3f69c8",
-      "adgenHash": "d1603d78fd85f9fa3bc0a08919c246865a85a7ab28054c493e5f0f575d439eaa",
+      "adgenHash": "387d6a7769fe1a13fc4d6ebd5115bec65d1f91178a933c1febc0623aba3f69c8",
       "backendSha": "aff3488d494ee7484d27971920a2b96e438e60fd",
-      "status": "fork",
-      "reason": "adgen keeps the env-fallback bridge on the QC split fields; backend reads SystemConfig only",
+      "status": "synced",
       "portTo": null,
       "owedSince": null
     },
@@ -360,7 +361,7 @@
       "adgenHash": "a2e8d71c983876e47cc12f73eb8d8ca28f403589c3665c2afd8dfaf287ff1804",
       "backendSha": "d3a8fe74ae1f6e704efb326c33c76a946e703b88",
       "status": "fork",
-      "reason": "adgen-only fork: fitProductNameToCap dispatch now gated on the resolved bind FIELD (entry==='productName'), not slot.key alone — closes a defect where DEFAULT_BRAND_MODE_BIND's brand-tagline substitution into the productName slot got the noun-preserving front-word-dropping fitter meant for catalog titles, which can invert negation-led taglines (e.g. 'Not for everyone...' -> 'for everyone...'). Not yet ported to backend.",
+      "reason": "Backend counterpart is dormant generation code slated for REMOVAL (owner 2026-09-04: adgen is the only generator; strip backend's copy, don't sync it). adgen's copy is the live one; nothing is owed to backend.",
       "portTo": null,
       "owedSince": null
     },
@@ -661,10 +662,9 @@
     },
     "services/adTitlingTruth.js": {
       "backendHash": "fda9f5e21fd1d510848bb6a52c870fa47e26f02441a8ea356bd6f0302df12837",
-      "adgenHash": "217adb4910d27b03e7fdffc57c43e70df0ec153094d21d48db58286c630078f0",
+      "adgenHash": "fda9f5e21fd1d510848bb6a52c870fa47e26f02441a8ea356bd6f0302df12837",
       "backendSha": "abf7e0c2053d9e2d633cc3b3a62bad48531e3271",
-      "status": "fork",
-      "reason": "Backend origin/main advanced to abf7e0c2 (#360, in-process titling removal) while this PR was in progress. Re-diffed: comment-only (drops a reference to the now-deleted scripts/backfillUntitledOrphans.js). No functional change; still synced.",
+      "status": "synced",
       "portTo": null,
       "owedSince": null
     },
@@ -947,10 +947,10 @@
       "backendHash": "56f4e86e8ee520eee292f2d83e7f111a3d492a44033e94b79fcb62418299a79d",
       "adgenHash": "6104d41ec534afd0c2c45fd6502413a5d35a0a8d1343f7ed58dcc202191ae4b2",
       "backendSha": "fba815887c3240d617c9c3a1bbfd6daecd791215",
-      "status": "unported",
-      "reason": "2026-09-03: ported backend PR #386 sharing (removed hook-first conjunct from resolvePortraitMasterFormat) + mint-time videoTitleDirection stamp. Remaining debt UNCHANGED: backend-only isMasterVideoAd (frontend Master badge, not used by adgen) and isSharedPortraitPlatePromptCoherent body still on the pre-2026-08-26 hook-first-inside-function shape (dead for sharing — the decision no longer calls it). owedSince carries forward.",
-      "portTo": "backend",
-      "owedSince": "2026-08-28T17:44:28.333Z"
+      "status": "fork",
+      "reason": "isMasterVideoAd is backend HTTP-only (routes/ads.js:6121); isSharedPortraitPlatePromptCoherent has ZERO production callers on both sides and resolvePortraitMasterFormat already dropped the hook-first conjunct (#386) — DO NOT port adgen's hook-first body to backend, it would re-open the $2.70 mixed-run bill",
+      "portTo": null,
+      "owedSince": null
     },
     "services/campaignBriefDerivationService.js": {
       "backendHash": "f08c591b1cfeb0c971d43afa316ebca613570e483654cebd9bd7655d6c69230e",
@@ -1054,10 +1054,9 @@
     },
     "services/copyDerivationService.js": {
       "backendHash": "1636ad6105c90e3439ff8afa4948ebdbbcc90bfe3854848ef3479ebf9b9f20b3",
-      "adgenHash": "d7e3d8dfd47fbbd22443452c542dba8f71d800ddcf5b914d8f6848b4f8401669",
+      "adgenHash": "1636ad6105c90e3439ff8afa4948ebdbbcc90bfe3854848ef3479ebf9b9f20b3",
       "backendSha": "47be257c468e85c3f1d1c562abd087ea8625e98c",
-      "status": "fork",
-      "reason": "Deliberate, permanent fork: adgen keeps short_benefits:[] in buildPrompt() because deriveCopy is only reached from the legacy cartesian fallback in vendored campaignAdsGenerationService.js (eager call at :2789, below the AI_CONCEPT_DRIVEN early-return at ~:2069) -- that path is still reachable and has never seen real short_benefits data. Backend's copyDerivationService.js:208 now reads the real, populated CatalogProduct.shortBenefits (ingest-time derivation, models/CatalogProduct.js:245-248, shortBenefitsDerivedAt). Porting the read would silently change copy output on a still-live fallback with no product decision behind it. Only functional diff between the two files.",
+      "status": "synced",
       "portTo": null,
       "owedSince": null
     },
@@ -1239,7 +1238,9 @@
       "adgenHash": "b72f89371b19e3fdecec8abd3d361a97fee421947d39e425e4f0e264fb521091",
       "backendSha": "47be257c468e85c3f1d1c562abd087ea8625e98c",
       "status": "fork",
-      "reason": "adgen-owned divergence: findBrandByName inlined (Brand.normalizeBrandName + findOne) so adgen no longer requires brandCatalogService — that module fire-and-forgets brand enrichment (backend-owned ingest) and its require edge was the only thing keeping the dead ingest cluster in adgen's graph. Backend keeps the catalog-service require. LAYOUT_DERIVATION_MODEL split already ported (#122). Also adgen-only: startStageTimer/layoutInputMs wrapping runDerivation; four-field brandId/productId/adId/campaignRunId top-level args (adgen #43) equivalent to backend's options.*. Nothing owed either way."
+      "reason": "adgen-owned divergence: findBrandByName inlined (Brand.normalizeBrandName + findOne) so adgen no longer requires brandCatalogService — that module fire-and-forgets brand enrichment (backend-owned ingest) and its require edge was the only thing keeping the dead ingest cluster in adgen's graph. Backend keeps the catalog-service require. LAYOUT_DERIVATION_MODEL split already ported (#122). Also adgen-only: startStageTimer/layoutInputMs wrapping runDerivation; four-field brandId/productId/adId/campaignRunId top-level args (adgen #43) equivalent to backend's options.*. Nothing owed either way.",
+      "portTo": null,
+      "owedSince": null
     },
     "services/llmError.js": {
       "backendHash": "589fd87ece50784d1620ac2db054d92911c880d21d2a34be4db3f4df8aaf7f8f",
@@ -1271,7 +1272,9 @@
       "adgenHash": "95f5c3486f73d01b233162d3a62900a59c8cee5d49aecf7c96332fca1beee81f",
       "backendSha": "9d6322978bc28b080da3db6aaf510d113b0ea216",
       "status": "unused",
-      "reason": "Meta ads PUSH (backend-owned publish path); only adgen requirer was the deleted metaAdsFontService. Kept on disk like pushToShopify.js; not on any live role path."
+      "reason": "Meta ads PUSH (backend-owned publish path); only adgen requirer was the deleted metaAdsFontService. Kept on disk like pushToShopify.js; not on any live role path.",
+      "portTo": null,
+      "owedSince": null
     },
     "services/metaApiVersion.js": {
       "backendHash": "92c4f74b95184b3c1d089c32e9194ebf738ae7ac598fd7491fb781f336745562",
@@ -1350,10 +1353,9 @@
     },
     "services/platformFormats.js": {
       "backendHash": "1bcafb97fca91a099e62446a50fc31b51d0596ad3a3b5b1f58376cd786578ee5",
-      "adgenHash": "6e0a24cbf76a019e1425599a2c6411d8012962f80915fb474a699c3e003a8cde",
+      "adgenHash": "1bcafb97fca91a099e62446a50fc31b51d0596ad3a3b5b1f58376cd786578ee5",
       "backendSha": "b557b492ad1373340831316bb21610c9bb6b1557",
-      "status": "fork",
-      "reason": "Backend origin/main advanced to abf7e0c2/#358 while this PR was in progress. Re-diffed: backend deleted the already-dead 'companions' field (zero consumers, per its own comment) and updated surrounding prose accordingly. Adgen's copy still carries that same dead field (harmless, matches adgen's own no-action-needed convention for confirmed-dead data elsewhere in this manifest). No functional change; still synced.",
+      "status": "synced",
       "portTo": null,
       "owedSince": null
     },
@@ -1410,10 +1412,9 @@
     },
     "services/quoteProvenance.js": {
       "backendHash": "3b8eb72df1c0f7904104fcb1bc876fb14dfc5f879862b04305573cb438d6d5e3",
-      "adgenHash": "b6b2c790ba35e1e35e90aec42af1c04d0348c22c1d27fcd3a73a1aa7c523ff5f",
+      "adgenHash": "3b8eb72df1c0f7904104fcb1bc876fb14dfc5f879862b04305573cb438d6d5e3",
       "backendSha": "55c17096f3668779cb11fccacb812f02305cc269",
-      "status": "fork",
-      "reason": "Re-attest: only commit in range (55c17096, backend HEAD) is the same 2026-08-31 pair-reference/short-sleeve fix already recorded as ported same-day. Adgen file confirmed identical (PAIR_REFERENCE_RE, impliesPairSoldItem, SHORT_NOT_SLEEVE_RE all present, match backend). No new material change.",
+      "status": "synced",
       "portTo": null,
       "owedSince": null
     },
@@ -1430,7 +1431,7 @@
       "adgenHash": "74a05ea0e3a56b4b3dcd9af15775f98ac612bb9687b63b3b906fe4d368015273",
       "backendSha": "3a3c06bd217ac36e4fa23c19ac9934a226256764",
       "status": "fork",
-      "reason": "adgen-only per-process LRU cache added in a391de8 (kills duplicate extractSnippet LLM calls: 9 ads, identical review text, one ~15s call each). NOT a permanent fork — backend's copy still has the duplicating behaviour (services/quoteSnippetService.js cacheKey:null at :524/:710, no LRU), so backend is paying the same bill. PORT PENDING to backend; re-reconcile as synced once ported.",
+      "reason": "Backend counterpart is dormant generation code slated for REMOVAL (owner 2026-09-04: adgen is the only generator; strip backend's copy, don't sync it). adgen's copy is the live one; nothing is owed to backend.",
       "portTo": null,
       "owedSince": null
     },
@@ -1460,10 +1461,9 @@
     },
     "services/reframeStrategyChooser.js": {
       "backendHash": "d96732f5136b00717893c966c80ed9404f2836a1d73e78d022194f4f157e5ae2",
-      "adgenHash": "91923c9881489f66f54f078eae4f73b077d907797189f1a9c421ef17deadfd28",
+      "adgenHash": "d96732f5136b00717893c966c80ed9404f2836a1d73e78d022194f4f157e5ae2",
       "backendSha": "a0781ace9a1db1eaf1492cfac2e3b1bfdb5c2c25",
-      "status": "fork",
-      "reason": "CLOSED 2026-09-04: prior entry tracked adgen owing backend's COMPOSITE_MASK_METHOD/computeForceCropRect force-crop port (commit a0781ace, Pelagic run 6a98d63a). Diff against backend origin/main shows the port already landed byte-for-byte identical in code; the only remaining divergence is comment prose backend expanded afterward (atlasVideoService.reframePromptForCompositeCanvas cross-reference, computeForceCropRect null-return note) -- zero executable-line differences. Not a real fork and no longer a real debt; recorded fork only because the tool's identical-check is byte-level and comments differ, nothing owed either direction.",
+      "status": "synced",
       "portTo": null,
       "owedSince": null
     },
@@ -1478,10 +1478,9 @@
     },
     "services/renderErrorFields.js": {
       "backendHash": "0efda9eab3d25ab7f1a1efa8f8ca3cc8f5f2ca93a9a56319f0ecb3de0aa0d748",
-      "adgenHash": "42ab12d84c721b4d6dde9fab255af64a9046c137d25d7fb8017a7f121e7977fb",
+      "adgenHash": "0efda9eab3d25ab7f1a1efa8f8ca3cc8f5f2ca93a9a56319f0ecb3de0aa0d748",
       "backendSha": "36aedfa35e671da580d3e1d323431f431752b576",
-      "status": "fork",
-      "reason": "comment-only: adgen header omits the (adgen) parenthetical; clip/NUL contract matches backend #326 (adgen #19 twin).",
+      "status": "synced",
       "portTo": null,
       "owedSince": null
     },
@@ -1723,10 +1722,9 @@
     },
     "services/systemConfigService.js": {
       "backendHash": "c6786774ace53c6456ff56f7a749cd926725de34a8f2de9608fb24b8ecb81995",
-      "adgenHash": "2e34c2f2ae3aa74c77d8b9386fc07163c42fe2476ecafd61a405437318d533d1",
+      "adgenHash": "c6786774ace53c6456ff56f7a749cd926725de34a8f2de9608fb24b8ecb81995",
       "backendSha": "aff3488d494ee7484d27971920a2b96e438e60fd",
-      "status": "fork",
-      "reason": "adgen QC resolvers still fall through to env; backend does not",
+      "status": "synced",
       "portTo": null,
       "owedSince": null
     },
@@ -1785,15 +1783,16 @@
       "adgenHash": "a3ae7681095b3464f3e1da133d272de8e6521eaa92acc303f8f05bdef176188b",
       "backendSha": "45f5e3c05b472f319a78fdc53e19229cd2001434",
       "status": "fork",
-      "reason": "Prior fork stands: 2026-08-28 owner directive that backend prompt-building is not first-class; 2026-09-02 frozen-else Scene 2 is adgen-only. 2026-09-03 STRIP: overlay/sticker SEED_BURNED_IN_TEXT_GUARD_LINE and on-product lock line removed from buildVeoPrompt (contradicted OMNI_DIRECTIVES.noText; keyed on untrustworthy Media.text[].type). Same strip landed on liquidretail_backend working tree. seedHasText param retired. Not --unported. Re-attested 2026-09-03 during benefits-to-directors vendor-drift reconciliation -- no new divergence found beyond what was already recorded.",
+      "reason": "Backend counterpart is dormant generation code slated for REMOVAL (owner 2026-09-04: adgen is the only generator; strip backend's copy, don't sync it). adgen's copy is the live one; nothing is owed to backend.",
       "portTo": null,
       "owedSince": null
     },
     "services/veoStoryboardService.js": {
       "backendHash": "4e3d420b3a6219b72f25dc95aac6afa679ea5c23a7c3627d1abcb9ba9f5bf344",
-      "adgenHash": "4e3d420b3a6219b72f25dc95aac6afa679ea5c23a7c3627d1abcb9ba9f5bf344",
+      "adgenHash": "2da578a97078bda3c83934afd3a21e90d9c25c430afb951a80115c8fa9f18963",
       "backendSha": "29285f2a4fa18b57b87ef0821276fcaea8527470",
-      "status": "synced",
+      "status": "fork",
+      "reason": "Backend counterpart is dormant generation code slated for REMOVAL (owner 2026-09-04: adgen is the only generator; strip backend's copy, don't sync it). adgen's copy is the live one; nothing is owed to backend.",
       "portTo": null,
       "owedSince": null
     },
@@ -1875,10 +1874,10 @@
     },
     "services/videoReferenceResolver.js": {
       "backendHash": "04922fd8510685ca870bd8c5b60df025ce738a81afc79fdc025ff3b4cb448c80",
-      "adgenHash": "b5afb9899e9e5bae15524516dbe786bfa69478654522005113012815f81e514b",
+      "adgenHash": "cbfda90ed0f726c651df094bb1ded148948c1a5519ce5686fd8377caff8daa32",
       "backendSha": "326fb2705dad948c41a1570d5ea42e83fcc98763",
       "status": "fork",
-      "reason": "Hand-synced pair, first manifest entry (file never seeded — this repo's own copy of the shared DINO cache-first video reference resolver, built 2026-09-03/04 alongside backend's). Diffed against backend origin/main: functionally byte-identical, only the file-path header comment differs (this repo says src/services/..., backend says services/...) plus one paragraph where backend's comment describes the port obligation FROM backend's perspective (\"adgen's ref builder MUST import this helper\") vs adgen's comment describing the hand-sync obligation FROM this side (\"do not diverge without also updating backend\"). Same Mongo doc field (Media.metadata.reframes) read/written by both. Not a fork of substance — just each side's comment framed from its own vantage.",
+      "reason": "per-repo header path only (adgen src/services/... vs backend services/...); executable body byte-identical",
       "portTo": null,
       "owedSince": null
     },

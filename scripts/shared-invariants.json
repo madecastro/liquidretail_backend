@@ -76,12 +76,6 @@
       ],
       "acknowledged": [
         {
-          "repo": "adgen",
-          "path": "services/veoStoryboardService.js",
-          "reason": "DORMANT, BUT NOT FOR THE REASON IT LOOKS LIKE — and one env var from live. Same catalog-title interpolation the Vaportek incident proved harmful, in the GPT-storyboard path. It is NOT gated by VEO_USE_GPT_STORYBOARD: config/defaults.env:395 ships that flag `true` in BOTH repos and no render.yaml, Dockerfile, src/config.js, or SystemConfig overrides it, so enabled() returns true. What actually makes it unreachable is the provider router: videoRouter.activeProvider() defaults to 'atlas' (videoRouter.js:29, VIDEO_PROVIDER=atlas committed at defaults.env:394), and on the atlas path prepareStoryboard returns {storyboard:null} ('Storyboard retired on the Atlas path', atlasVideoService.js:4344). generateStoryboard has exactly ONE production caller, aiVideoReferenceService.js:320, reached only from videoRouter's non-atlas else branch. Set VIDEO_PROVIDER=vertex and this line composes a paid Vertex Veo prompt. The module's own header comment ('Off by default', veoStoryboardService.js:10) describes a gate that is not the real one. Acknowledged rather than fixed here because this PR is documentation + enforcement scope: editing a generative video prompt is a behavioural money-path change needing its own PR and owner sign-off, and bundling it silently would hide it.",
-          "removeWhen": "the `Product: ${title}` interpolation is removed from adgen/src/services/veoStoryboardService.js, matching the veoPromptBuilder fix — then delete this entry in the same commit"
-        },
-        {
           "repo": "backend",
           "path": "services/veoStoryboardService.js",
           "reason": "The backend twin of the entry above — byte-identical to adgen's copy, which is why the vendor manifest correctly calls it 'synced' and why no hash check can ever flag it. Both copies agree and both are wrong.",

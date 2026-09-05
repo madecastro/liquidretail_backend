@@ -205,7 +205,15 @@ function buildPrompt({ brand, product, creativeStyle }) {
     description:    typeof product.description === 'string'
       ? product.description.slice(0, 400)
       : null,
-    short_benefits: Array.isArray(product.shortBenefits) ? product.shortBenefits.slice(0, 5) : [],
+    // CatalogProduct.shortBenefits is a real persisted field as of
+    // 2026-09-03 (ingest-time flash derivation). This reader used to
+    // always send [] because the field was undeclared. KEEP sending []
+    // here: deriveCopy is the legacy cartesian path — expandWizardJob
+    // returns at the concept-driven branch when AI_CONCEPT_DRIVEN=true
+    // (:1636-1647); this eager call sits below that return (:2069).
+    // Feeding the new field would silently change copy on a still-
+    // reachable fallback (empty concept expansion fallthrough).
+    short_benefits: [],
     price:          product.price?.display || product.price?.value || null,
     rating:         typeof product.rating === 'number' ? product.rating : null
   } : null;

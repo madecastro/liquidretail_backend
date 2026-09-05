@@ -65,7 +65,11 @@ function buildSystemPrompt() {
 
 function buildUserPrompt({ concept, brand, product, scene, lighting, mood, subject, aspectRatio, operatorPrompt }) {
   const lines = [];
-  lines.push(`Product: ${product?.title || '(untitled product)'}`);
+  // Do not interpolate catalog title into a labelled `Product:` field.
+  // INCIDENT (2026-08-26): `Product: Vaportek.` was read as a brand-name
+  // render instruction and painted a fake chest lockup over the real mark
+  // ($0.90 master, vision-QC terminal reject). Product description is
+  // enough SKU context; PRODUCT FIDELITY + reference images identify it.
   if (product?.description) lines.push(`Product description: ${product.description}`);
 
   if (brand?.name)          lines.push(`Brand: ${brand.name}`);

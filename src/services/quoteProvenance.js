@@ -599,7 +599,7 @@ async function loadQuoteScopeMediaByIds(ids) {
 // one, and would be a silent editorial change to shipped creative.
 //
 // ONE definition, imported by both render paths — same rule as
-// resolveDeriveFromMaster. A per-caller copy is exactly how the
+// resolveDeriveFromMaster (CLAUDE.md §4). A per-caller copy is exactly how the
 // static and video quote gates would drift apart.
 
 /** Count Unicode letters, so this works outside Latin script. */

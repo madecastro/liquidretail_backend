@@ -35,19 +35,15 @@ const systemConfigSchema = new mongoose.Schema({
   canonicalScriptLandscape: { type: String, default: null },
 
   // Post-render vision QC — LEGACY single gate, split 2026-08-21 into
-  // staticVisionQcEnabled / videoVisionQcEnabled below. KEPT, NOT REMOVED:
-  // this field is `true` in production right now and is the ONLY thing
-  // keeping QC on for both pipelines. It stays a live read-time fallback
-  // — see systemConfigService.getStaticVisionQcEnabled /
-  // getVideoVisionQcEnabled — so a deploy that adds the two new fields
-  // (both starting `null`, unset) does not silently drop to env/false and
-  // stop inspecting ads. Do not remove this field until both new fields
-  // have been deliberately populated (e.g. via a future admin settings
-  // screen) — removing it before then IS the "ships uninspected ads" bug
-  // this comment exists to prevent.
-  //   true  → force QC on  (wins over process.env.AD_VISION_QC_ENABLED)
-  //   false → force QC off (wins over env — explicit kill-switch)
-  //   null  → not set; fall through to env, then default false
+  // staticVisionQcEnabled / videoVisionQcEnabled below. This field is a
+  // backward-compat BRIDGE to the two split fields, not a separate lever:
+  // getStatic/getVideoVisionQcEnabled still read it when their own field
+  // is unset. Env fallback never existed after this point (the
+  // AD_VISION_QC_ENABLED / STATIC_VISION_QC_ENABLED / VIDEO_VISION_QC_ENABLED
+  // env vars are retired and must not be reintroduced).
+  //   true  → force QC on
+  //   false → force QC off (explicit kill-switch)
+  //   null  → not set; split getters fall through to this field, then false
   adVisionQcEnabled: { type: Boolean, default: null },
 
   // Post-render vision QC — STATIC pipeline gate (directImageRenderService,
@@ -56,14 +52,13 @@ const systemConfigSchema = new mongoose.Schema({
   // systemConfigService.getStaticVisionQcEnabled / setStaticVisionQcEnabled.
   // Precedence when reading (see systemConfigService for the full cascade):
   //   this field (if boolean) → legacy adVisionQcEnabled (if boolean,
-  //   backward-compat bridge) → STATIC_VISION_QC_ENABLED env (or legacy
-  //   AD_VISION_QC_ENABLED) → false.
+  //   backward-compat bridge) → false. No env fallback.
   staticVisionQcEnabled: { type: Boolean, default: null },
 
   // Post-render vision QC — VIDEO pipeline gate (brandScriptExecutor). Same
   // tri-state contract and precedence shape as staticVisionQcEnabled above,
   // independent value. Access only via systemConfigService
-  // .getVideoVisionQcEnabled / setVideoVisionQcEnabled.
+  // .getVideoVisionQcEnabled / setVideoVisionQcEnabled. No env fallback.
   videoVisionQcEnabled: { type: Boolean, default: null },
 
   updatedAt: { type: Date, default: Date.now },

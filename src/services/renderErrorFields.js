@@ -2,10 +2,10 @@
 //
 // Child-process diagnostic tails for Ad.renderError.
 //
-// remotionChildSupervisor attaches stderrTail / stdoutTail onto the thrown
-// Error. Those keys were being assembled onto renderError and then SILENTLY
-// DROPPED: renderError is a strict mongoose subdocument and the fields were
-// not declared. Tonight's production failures persisted only
+// remotionChildSupervisor (adgen) attaches stderrTail / stdoutTail onto the
+// thrown Error. Those keys were being assembled onto renderError and then
+// SILENTLY DROPPED: renderError is a strict mongoose subdocument and the
+// fields were not declared. Tonight's production failures persisted only
 // `remotion child exited code=1 signal=none` — the child's real error was
 // captured and thrown away.
 //

@@ -31,8 +31,9 @@
 //     `null` is ambiguous between "titled", "shipped bare on purpose", and
 //     (pre-this-fix) "titling never finished and nobody will ever know".
 //   - There is no `titledAt`/`chromeComposited` boolean anywhere on the
-//     schema (confirmed absent — see scripts/backfillUntitledOrphans.js,
-//     which exists only because this gap has no honest field to query).
+//     schema (confirmed absent — this gap has no honest field to query,
+//     which is the whole reason this module exists as a derived function
+//     instead).
 //
 // So the only two things that are ALWAYS true together are:
 //   1. titling is genuinely settled (not mid-flight / not abandoned

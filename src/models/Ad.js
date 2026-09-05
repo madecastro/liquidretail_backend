@@ -190,6 +190,28 @@ const adSchema = new mongoose.Schema({
   approvedAt:  { type: Date,    default: null },
   approvedBy:  { type: String,  default: null },
 
+  // Operator override of a vision-QC rejection — orthogonal to BOTH `status`
+  // (the render lifecycle) and `approved` above (a separate, pre-existing
+  // publish gate). Flipped via POST /api/ads/:id/override-qc
+  // (routes/ads.js), which requires the ad to currently be status:'failed'
+  // AND its failure to be QC-related (services/adPhase.js describeAdFailure
+  // .isQc) — refuses outright for any other failure kind (render error,
+  // timeout, crop failure, etc.), since this endpoint's entire purpose is
+  // reviving a QC rejection a human is deliberately vouching for, not a
+  // general status editor (PATCH /api/ads/:id already exists for that).
+  // Mirrors the approved/approvedAt/approvedBy triple's naming convention
+  // (flag + At + By) plus a required free-text reason — this is a
+  // brand-safety-relevant action and needs its own durable trail distinct
+  // from "someone PATCHed the status", so a later reviewer can tell a
+  // real regenerate-fixed-it outcome apart from a human-overrode-QC one.
+  // Never cleared once set (even if the ad later fails again for a
+  // different reason) — it is a historical fact about this ad's past, not
+  // a live state flag.
+  qcOverridden:     { type: Boolean, default: false, index: true },
+  qcOverriddenAt:   { type: Date,    default: null },
+  qcOverriddenBy:   { type: String,  default: null },
+  qcOverrideReason: { type: String,  default: null },
+
   // ── Regenerate-with-prompt (Phase 2.5) ───────────────────────────
   // regenerating: true while a regen worker is running on this ad.
   //               The endpoint refuses to start a second regen until

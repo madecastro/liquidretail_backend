@@ -72,12 +72,13 @@
 // never a rejection. The reference stack must not crash the render loop.
 //
 // ── ADGEN PORT ────────────────────────────────────────────────────────────
-// Hand-synced with the backend copy at
-// liquidretail_backend/services/videoReferenceResolver.js. Do not diverge
-// without also updating the backend — the two file-name pointer field
-// (Media.metadata.reframes[<aspectKey>]) is the SAME Mongo doc for both
-// sides, and a key-normalisation mismatch on ONE side silently misses
-// every cache entry the OTHER side wrote.
+// The live direct-Gemini path is in liquidretail_adgen's renderer, not
+// this repo. Adgen's ref builder MUST import this helper (or an identical
+// port) and route every reference through it. Backend cannot force this
+// from here — but the harness at scripts/verifyVideoReferenceResolver.js
+// pins the contract so a port has a fixture to test against, and the
+// method+ladderVersion returned on cache hit gives adgen a way to log
+// which path served each ref for post-run tracing.
 //
 // ── NOT THIS FILE'S JOB ───────────────────────────────────────────────────
 //   - Computing new reframes. `reframeReferenceForAspect` owns writes.

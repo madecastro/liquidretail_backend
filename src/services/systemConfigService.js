@@ -141,8 +141,8 @@ function resetAdVisionQcEnabledCache() {
  *                           once in this process (possibly stale past its
  *                           TTL — see below for why that is fine).
  *   undefined             — no SystemConfig read has EVER completed in this
- *                            process (true cold start). Caller falls through
- *                            to the env default, same as "no override set".
+ *                            process (true cold start). Caller resolves
+ *                            false (no env fallback; unset/unreadable → false).
  *
  * FIXED 2026-08-20 — this used to also return `undefined` once `expiresAt`
  * elapsed, i.e. on almost every call in production: real renders are spaced
@@ -169,8 +169,8 @@ function resetAdVisionQcEnabledCache() {
  * staleness at all.
  *
  * FAIL-SAFE DIRECTION, decided deliberately: serving the last known real
- * value (even stale) is preferred over collapsing to the env default,
- * because QC existing to catch is a documented ~1-in-3 competitor-logo /
+ * value (even stale) is preferred over collapsing to false, because QC
+ * existing to catch is a documented ~1-in-3 competitor-logo /
  * product-fidelity defect rate (CLAUDE.md §"Known open"), and an operator
  * who just turned the flag ON is trusting that decision to take effect —
  * silently failing OFF defeats the switch they just flipped. The ~$0.05/ad
@@ -179,11 +179,8 @@ function resetAdVisionQcEnabledCache() {
  * had just been flipped OFF) is bounded and small next to that. This
  * reasoning does NOT extend to a truly cold cache (never loaded at all,
  * e.g. the first call after a process boot) — there we have no signal
- * whatsoever, not even a stale one, so `undefined` still falls through to
- * the pre-existing "no override configured" → env → default-false
- * precedence. That is not a staleness failure, it is genuine absence of
- * data, and the existing default-OFF-when-unconfigured contract is correct
- * for it.
+ * whatsoever, not even a stale one, so `undefined` resolves false.
+ * No env fallback; unset/unreadable resolves to false.
  */
 function peekAdVisionQcEnabled() {
   if (!_adVisionQcCache.loaded) return undefined;
@@ -200,8 +197,8 @@ function _storeAdVisionQcCache(value) {
 
 /**
  * Read SystemConfig.adVisionQcEnabled with a short TTL cache.
- * Returns true | false | null. Does not interpret env — that is the
- * caller's job (adVisionQcService.resolveEnabled).
+ * Returns true | false | null. No env fallback; unset/unreadable
+ * resolves to false at the caller's resolver.
  */
 async function getAdVisionQcEnabled() {
   const now = Date.now();
@@ -232,8 +229,9 @@ function refreshAdVisionQcEnabledCache() {
 }
 
 /**
- * Persist the tri-state override. Pass null to clear (fall back to env).
- * Invalidates the TTL cache immediately so the next read sees the flip.
+ * Persist the tri-state override. Pass null to clear (unset; resolvers
+ * then return false — no env fallback). Invalidates the TTL cache
+ * immediately so the next read sees the flip.
  */
 async function setAdVisionQcEnabled(enabled, updatedBy = null) {
   if (enabled !== null && enabled !== true && enabled !== false) {
@@ -262,10 +260,10 @@ async function setAdVisionQcEnabled(enabled, updatedBy = null) {
 // MIGRATION BRIDGE — the load-bearing part. Each new field starts `null`
 // (unset) the moment this deploys. Without a bridge, `getStaticVisionQc
 // Enabled()`/`getVideoVisionQcEnabled()` would read null, adVisionQcService's
-// resolvers would fall through past SystemConfig straight to env (which is
-// `false` in `config/defaults.env`), and QC would go dark in production
-// between this deploy landing and someone explicitly setting either new
-// field — exactly the regression the orchestrator flagged as unacceptable.
+// resolvers would fall through past SystemConfig straight to false, and QC
+// would go dark in production between this deploy landing and someone
+// explicitly setting either new field — exactly the regression the
+// orchestrator flagged as unacceptable.
 // So: when the new field is unset, each accessor falls back to the LEGACY
 // `adVisionQcEnabled` field (currently `true` in prod) before ever reaching
 // null. Once an operator (or a future admin settings screen) sets either
@@ -330,7 +328,8 @@ function refreshStaticVisionQcEnabledCache() {
 
 /**
  * Persist the STATIC tri-state override. Pass null to clear (fall back to
- * the legacy field, then env). Invalidates the TTL cache immediately.
+ * the legacy field, then false — no env fallback). Invalidates the TTL
+ * cache immediately.
  */
 async function setStaticVisionQcEnabled(enabled, updatedBy = null) {
   if (enabled !== null && enabled !== true && enabled !== false) {
@@ -400,7 +399,8 @@ function refreshVideoVisionQcEnabledCache() {
 
 /**
  * Persist the VIDEO tri-state override. Pass null to clear (fall back to
- * the legacy field, then env). Invalidates the TTL cache immediately.
+ * the legacy field, then false — no env fallback). Invalidates the TTL
+ * cache immediately.
  */
 async function setVideoVisionQcEnabled(enabled, updatedBy = null) {
   if (enabled !== null && enabled !== true && enabled !== false) {
