@@ -1966,12 +1966,13 @@ Full detail in `docs/ATLAS.md` §7 and `docs/CLOUDINARY-VIDEO.md`. Headlines:
   (`aiCreativeDirectorService.js:149`). A code fix that feeds better brand /
   product signal **without** bumping the version leaves every product that
   already has a `CreativeDirectionArtifact` serving concepts built from the old
-  brief — the fix looks deployed and is a no-op. Current value **`3.5.0`**
-  (`product_signal.benefits` from `CatalogProduct.shortBenefits`, 2026-09-03).
-  Prior bumps: `3.4.0` quote-stage alignment; `3.3.0` PMax funnel + proof
-  hierarchy; `3.0.0→3.1.0` starved-brief (`summary` / `logoUrl`);
-  `3.1.0→3.2.0` social-proof menu. Any future signal-shape change needs the
-  same bump. Write-up: `session.d/2026-09-03_catalog-product-shortbenefits.md`.
+  brief — the fix looks deployed and is a no-op. Current value **`3.6.0`**
+  (`brand_signal.personas` from `Brand.demographics`, 2026-09-04). Prior
+  bumps: `3.5.0` product_signal.benefits; `3.4.0` quote-stage alignment;
+  `3.3.0` PMax funnel + proof hierarchy; `3.0.0→3.1.0` starved-brief
+  (`summary` / `logoUrl`); `3.1.0→3.2.0` social-proof menu. Any future
+  signal-shape change needs the same bump. Write-up:
+  `session.d/2026-09-03_catalog-product-shortbenefits.md`.
 - **`Ad.videoTitleDirection` is Mixed; `Ad.veoProvider` / `Ad.veoResolution` must stay declared.** The video-title Director stamp (`models/Ad.js:586-591`) is Mixed → callers that mutate in place MUST `markModified('videoTitleDirection')`. Mint currently assigns a fresh object onto the insert payload, so that trap is latent. `veoProvider` / `veoResolution` (`:545/:549`, `81b93a3e`) shipped **undeclared** in adgen #108: Mongoose strict dropped them with no error, so a Gemini `v1_…` interaction id was handed to the Atlas prediction GET forever. Values `'atlas' | 'gemini'`; do **not** default `veoProvider` to `'atlas'` — null = unknown (pre-cutover) must stay distinguishable from an asserted Atlas row.
 - **`OVERLAY_ZONES_SKIP_CATALOG` default true.** Catalog ingest skips overlay-zone analysis (no `OverlayZoneArtifact` — missing is honest; `zones:{}` would look like analysis ran and found nothing). Gate is `catalogOverlayChainCtx` at the catalog call site, not a `media.source` sniff. Parser `!== 'false'` only. UGC (`runImagePipeline`) is untouched. Pinned by `scripts/verifyOverlayZonesSkipCatalog.js`. Write-up: `session.d/2026-09-03_overlay-skip-catalog-and-config-truth.md`.
 - **PMax Director hierarchy PRECEDENCE SENTENCE — do not delete or "harmonise".**

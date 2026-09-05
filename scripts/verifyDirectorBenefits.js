@@ -33,15 +33,19 @@ const DEFAULTS_ENV = path.join(ROOT, 'config/defaults.env');
 
 const ORIG_FLAG = process.env.DIRECTOR_PRODUCT_BENEFITS;
 const ORIG_MENU = process.env.DIRECTOR_PROOF_MENU_ENABLED;
+const ORIG_PERSONAS = process.env.DIRECTOR_BRAND_PERSONAS;
 
 function restoreEnv() {
   if (ORIG_FLAG === undefined) delete process.env.DIRECTOR_PRODUCT_BENEFITS;
   else process.env.DIRECTOR_PRODUCT_BENEFITS = ORIG_FLAG;
   if (ORIG_MENU === undefined) delete process.env.DIRECTOR_PROOF_MENU_ENABLED;
   else process.env.DIRECTOR_PROOF_MENU_ENABLED = ORIG_MENU;
+  if (ORIG_PERSONAS === undefined) delete process.env.DIRECTOR_BRAND_PERSONAS;
+  else process.env.DIRECTOR_BRAND_PERSONAS = ORIG_PERSONAS;
 }
 
 process.env.DIRECTOR_PROOF_MENU_ENABLED = 'false';
+process.env.DIRECTOR_BRAND_PERSONAS = 'false';
 
 const director = require('../services/aiCreativeDirectorService');
 const helper = require('../services/titleSpecContentSample');
@@ -411,8 +415,13 @@ function runStructural() {
   check('B7 DIRECTOR_PRODUCT_BENEFITS=true in defaults.env',
     /^DIRECTOR_PRODUCT_BENEFITS=true$/m.test(envSrc));
 
-  check('B8 DIRECTOR_SIGNALS_VERSION is 3.5.0',
-    /const DIRECTOR_SIGNALS_VERSION = '3\.5\.0'/.test(directorSrc));
+  check('B8 DIRECTOR_SIGNALS_VERSION is 3.6.0',
+    /const DIRECTOR_SIGNALS_VERSION = '3\.6\.0'/.test(directorSrc));
+  check('B8b PERSONAS rule forbids quote authors',
+    /Never use a persona as a quote author/.test(directorSrc));
+  check('B8c assembleSignals assigns personas only inside directorBrandPersonasEnabled()',
+    /if \(directorBrandPersonasEnabled\(\)\)/.test(assembleSrc || '')
+      && /brandSignal\.personas =/.test(assembleSrc || ''));
 
   check('B9 parser is strictly === \'true\' (no truthy check, no toLowerCase)',
     /process\.env\.DIRECTOR_PRODUCT_BENEFITS === 'true'/.test(directorSrc));
@@ -445,6 +454,21 @@ function runStructural() {
       }
     );
     check('RP1 [REVERT-PROOF] injecting buildLayoutInput into assembleSignals trips the money guard',
+      failedAsExpected);
+  }
+
+  {
+    let failedAsExpected = false;
+    withTempMutation(
+      DIRECTOR_PATH,
+      "const DIRECTOR_SIGNALS_VERSION = '3.6.0';",
+      "const DIRECTOR_SIGNALS_VERSION = '3.5.0';",
+      (mutSrc) => {
+        failedAsExpected = /const DIRECTOR_SIGNALS_VERSION = '3\.5\.0'/.test(mutSrc)
+          && !/const DIRECTOR_SIGNALS_VERSION = '3\.6\.0'/.test(mutSrc);
+      }
+    );
+    check('RP-B8 [REVERT-PROOF] leaving version at 3.5.0 fails B8',
       failedAsExpected);
   }
 

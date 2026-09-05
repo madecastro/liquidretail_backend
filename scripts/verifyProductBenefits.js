@@ -28,6 +28,7 @@ const SVC_PATH = path.join(ROOT, 'services/productBenefitsService.js');
 const DIRECTOR_PATH = path.join(ROOT, 'services/aiCreativeDirectorService.js');
 const EXPAND_PATH = path.join(ROOT, 'services/campaignAdsGenerationService.js');
 const COPY_PATH = path.join(ROOT, 'services/copyDerivationService.js');
+const LIS_PATH = path.join(ROOT, 'services/layoutInputService.js');
 const DEFAULTS_ENV = path.join(ROOT, 'config/defaults.env');
 const SCHEMA_PATH = path.join(ROOT, 'models/CatalogProduct.js');
 
@@ -421,6 +422,54 @@ function runStructural() {
     /layoutInputService\.js:1276/.test(svcSrc) ||
       /3–5 items, each ≤ 6 words, concrete buyer benefits/.test(svcSrc));
 
+  // ── Item 8: layout does not re-invent catalog shortBenefits ────────
+  const lis = require('../services/layoutInputService');
+  const EMIT_LINE = '"short_benefits" 3–5 items, each ≤ 6 words, concrete buyer benefits (not specs).';
+  const emptyCtx = {
+    media: { metadata: { brand: 'Acme' } },
+    detection: {},
+    match: {
+      outcome: 'product_match',
+      identification: { brand: 'Acme', productName: 'Rain Shell', details: {} }
+    },
+    brand: { name: 'Acme' },
+    catalogShortBenefits: []
+  };
+  const catalogCtx = {
+    ...emptyCtx,
+    match: {
+      outcome: 'product_match',
+      identification: {
+        brand: 'Acme',
+        productName: 'Rain Shell',
+        details: { shortBenefits: ['Keeps you dry', 'Packs flat', 'Taped seams'] }
+      }
+    }
+  };
+  const emptyPrompt = lis.buildDerivationPrompt(emptyCtx, 'ai_brand_led', '1:1', { variantKind: 'product_image' });
+  const catalogPrompt = lis.buildDerivationPrompt(catalogCtx, 'ai_brand_led', '1:1', { variantKind: 'product_image' });
+  check('L1 empty catalog prompt still emits short_benefits instruction (byte-identical class)',
+    emptyPrompt.includes(EMIT_LINE));
+  check('L2 catalog-non-empty prompt DROPS the emit instruction',
+    !catalogPrompt.includes(EMIT_LINE));
+  check('L3 empty vs catalog prompts otherwise keep the badges instruction',
+    emptyPrompt.includes('"badges" 0–4 items') && catalogPrompt.includes('"badges" 0–4 items'));
+  check('L4 catalogShortBenefitsOf reads details.shortBenefits',
+    JSON.stringify(lis.catalogShortBenefitsOf(catalogCtx)) === JSON.stringify(['Keeps you dry', 'Packs flat', 'Taped seams']));
+  check('L5 empty catalogShortBenefitsOf is []',
+    Array.isArray(lis.catalogShortBenefitsOf(emptyCtx)) && lis.catalogShortBenefitsOf(emptyCtx).length === 0);
+  check('L6 resolveLayoutShortBenefits prefers catalog list over derivation',
+    JSON.stringify(lis.resolveLayoutShortBenefits(catalogCtx, { short_benefits: ['invented'] }))
+      === JSON.stringify(['Keeps you dry', 'Packs flat', 'Taped seams']));
+  check('L7 empty catalog falls through to derivation.short_benefits (byte-identical assemble)',
+    JSON.stringify(lis.resolveLayoutShortBenefits(emptyCtx, { short_benefits: ['invented', 'two'] }))
+      === JSON.stringify(['invented', 'two']));
+  check('L8 INPUT_SCHEMA_VERSION stays 4.2 (do not bump — cascade already prefers catalog)',
+    lis.INPUT_SCHEMA_VERSION === '4.2'
+      && /const INPUT_SCHEMA_VERSION = '4\.2'/.test(fs.readFileSync(LIS_PATH, 'utf8')));
+  check('L9 assembleInput source uses resolveLayoutShortBenefits',
+    /short_benefits:\s*resolveLayoutShortBenefits\(ctx, derivation\)/.test(fs.readFileSync(LIS_PATH, 'utf8')));
+
   // ── RP. revert-prove ─────────────────────────────────────────────
   {
     let failedAsExpected = false;
@@ -481,6 +530,34 @@ function runStructural() {
       }
     );
     check('RP4 [REVERT-PROOF] default: [] on shortBenefits fails B2 (would collapse never-derived vs empty)',
+      failedAsExpected);
+  }
+
+  {
+    let failedAsExpected = false;
+    withTempMutation(
+      LIS_PATH,
+      '    if (!catalogShortBenefitsOf(ctx).length) {\n      lines.push(`- "short_benefits" 3–5 items, each ≤ 6 words, concrete buyer benefits (not specs).`);\n    }',
+      '    lines.push(`- "short_benefits" 3–5 items, each ≤ 6 words, concrete buyer benefits (not specs).`);',
+      (mutSrc) => {
+        failedAsExpected = !/if \(!catalogShortBenefitsOf\(ctx\)\.length\)/.test(mutSrc);
+      }
+    );
+    check('RP5 [REVERT-PROOF] always-emitting short_benefits instruction fails L2 gate',
+      failedAsExpected);
+  }
+
+  {
+    let failedAsExpected = false;
+    withTempMutation(
+      LIS_PATH,
+      '      short_benefits: resolveLayoutShortBenefits(ctx, derivation),',
+      '      short_benefits: limitArray(derivation.short_benefits, 5),',
+      (mutSrc) => {
+        failedAsExpected = !/short_benefits:\s*resolveLayoutShortBenefits\(ctx, derivation\)/.test(mutSrc);
+      }
+    );
+    check('RP6 [REVERT-PROOF] restoring derivation.short_benefits assemble fails L9',
       failedAsExpected);
   }
 }

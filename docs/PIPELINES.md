@@ -552,6 +552,8 @@ The string `social_proof_led` appeared **once** in `aiCreativeDirectorService.js
 
 **Later bump (2026-09-03): `3.4.0` → `3.5.0`.** `product_signal.benefits` from `CatalogProduct.shortBenefits` (`DIRECTOR_PRODUCT_BENEFITS`). Already in memory on the Director's bare `findById().lean()` — zero added I/O, never an artifact read, never a derivation. Ingest persists the field once (`PRODUCT_BENEFITS_DERIVATION`, gemini-2.5-flash, CostLog `product_benefits`). Write-up: `session.d/2026-09-03_catalog-product-shortbenefits.md`.
 
+**Later bump (2026-09-04): `3.5.0` → `3.6.0`.** Director data-forwarding (`feat/director-data-forwarding`): (1) video-title prompt adds description/specs/printable social proof/tone/tagline; (4) `brand_signal.personas` from `Brand.demographics` (`DIRECTOR_BRAND_PERSONAS`, voice/objection only); (5) `DIRECTOR_QUOTE_POOL_ALIGNED=true` file default; (7) `ugc_signal.rights_approved` reads `media.rights.approved`; (8) layout seeds `short_benefits` from catalog when non-empty — `INPUT_SCHEMA_VERSION` stays `4.2`; (9) `assembleSignals` once per product via `deps.assembleSignals`. No new model calls.
+
 ### Proof coherence — a LABELLED brand rating may sit beside a product/comment quote (static only)
 
 `resolveCoherentSocialProof` (`services/ratingDisplay.js`) is the single chokepoint pairing quote tier ↔ number tier, shared by static (`buildIntentData`) **and video** (`brandScriptExecutor.buildMetaForAd`). Its invariant #4 forbade *product/comment quote + brand numbers*, because a brand-wide count beside one SKU's testimonial reads as that SKU's volume.

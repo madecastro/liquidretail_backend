@@ -719,10 +719,12 @@ console.log('G. concept mint stamps IMAGE only; Director flag; money guard');
     !/funnel_stage/.test(metaPromptOff.system));
   setAllFlag(undefined);
 
-  check('G18 defaults.env was NOT edited in this lane',
-    !/QUOTE_STAGE_AWARE=/.test(fs.readFileSync(path.join(ROOT, 'config/defaults.env'), 'utf8'))
-    && !/DIRECTOR_QUOTE_POOL_ALIGNED=/.test(fs.readFileSync(path.join(ROOT, 'config/defaults.env'), 'utf8'))
-    && !/DIRECTOR_FUNNEL_STAGE_ALL=/.test(fs.readFileSync(path.join(ROOT, 'config/defaults.env'), 'utf8')));
+  const defaultsEnv = fs.readFileSync(path.join(ROOT, 'config/defaults.env'), 'utf8');
+  check('G18 QUOTE_STAGE_AWARE and DIRECTOR_FUNNEL_STAGE_ALL stay out of defaults.env',
+    !/QUOTE_STAGE_AWARE=/.test(defaultsEnv)
+    && !/DIRECTOR_FUNNEL_STAGE_ALL=/.test(defaultsEnv));
+  check('G18b DIRECTOR_QUOTE_POOL_ALIGNED=true is the file default (PRODUCTION BEHAVIOUR FLIP)',
+    /^DIRECTOR_QUOTE_POOL_ALIGNED=true$/m.test(defaultsEnv));
 }
 
 // ══════════════════════════════════════════════════════════════════
@@ -754,8 +756,8 @@ console.log('H. callers invoke applyStagedQuotePick (the live pick)');
     /pickPrimaryProductQuote\(product\?\.productReviews, opts/.test(ads));
   check('H8 productQuotesForDirector is the shared pool helper',
     /function productQuotesForDirector/.test(ads));
-  check('H9 DIRECTOR_SIGNALS_VERSION bumped past 3.4.0 (3.5.0 product_signal.benefits)',
-    /const DIRECTOR_SIGNALS_VERSION = '3\.5\.0'/.test(ads));
+  check('H9 DIRECTOR_SIGNALS_VERSION bumped past 3.4.0 (3.6.0 brand_signal.personas)',
+    /const DIRECTOR_SIGNALS_VERSION = '3\.6\.0'/.test(ads));
 }
 
 // ══════════════════════════════════════════════════════════════════
@@ -841,6 +843,20 @@ console.log('RP. revert-proofs (broken twin fails; live still holds)');
   // RP6: the schemaVersion is pinned exactly, so a drifting edit fails C5.
   check('RP6 live schemaVersion is 4.2 (a drift fails C5)',
     INPUT_SCHEMA_VERSION === '4.2');
+
+  {
+    const envPath = path.join(ROOT, 'config/defaults.env');
+    const original = fs.readFileSync(envPath, 'utf8');
+    const mutated = original.replace(
+      /^DIRECTOR_QUOTE_POOL_ALIGNED=true$/m,
+      'DIRECTOR_QUOTE_POOL_ALIGNED=false'
+    );
+    check('RP7 [REVERT-PROOF] flipping file default off would fail G18b',
+      !/^DIRECTOR_QUOTE_POOL_ALIGNED=true$/m.test(mutated)
+        && /^DIRECTOR_QUOTE_POOL_ALIGNED=false$/m.test(mutated));
+    check('RP7b live file was not modified by RP7',
+      fs.readFileSync(envPath, 'utf8') === original);
+  }
 
   setStageFlag(undefined);
   setAlignFlag(undefined);

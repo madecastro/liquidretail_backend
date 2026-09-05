@@ -304,8 +304,8 @@ check(
   // Without the bump, the cache-hit test (cached.signalsVersion ===
   // DIRECTOR_SIGNALS_VERSION) keeps serving concepts derived from the starved
   // brief, and the fix above is a no-op on every existing artifact.
-  'E6 DIRECTOR_SIGNALS_VERSION is 3.5.0 (product_signal.benefits)',
-  /const DIRECTOR_SIGNALS_VERSION = '3\.5\.0'/.test(fileSrc),
+  'E6 DIRECTOR_SIGNALS_VERSION is 3.6.0 (brand_signal.personas)',
+  /const DIRECTOR_SIGNALS_VERSION = '3\.6\.0'/.test(fileSrc),
   'signals version must be bumped so existing CreativeDirectionArtifacts re-derive'
 );
 check(
@@ -421,10 +421,259 @@ function roundFor(flag, inputSummary) {
     `on=${proofOn && proofOn.slice(0, 100)}`);
 }
 
-if (failures.length) {
-  console.error(`\n❌ director prompt: ${failures.length} FAILED, ${pass} passed\n`);
-  failures.forEach((f) => console.error(`   • ${f}`));
-  process.exit(1);
+// ── G. DIRECTOR_BRAND_PERSONAS (item 4) ────────────────────────────────
+const ORIG_PERSONAS = process.env.DIRECTOR_BRAND_PERSONAS;
+function withPersonasFlag(val, fn) {
+  if (val === undefined) delete process.env.DIRECTOR_BRAND_PERSONAS;
+  else process.env.DIRECTOR_BRAND_PERSONAS = val;
+  try { return fn(); }
+  finally {
+    if (ORIG_PERSONAS === undefined) delete process.env.DIRECTOR_BRAND_PERSONAS;
+    else process.env.DIRECTOR_BRAND_PERSONAS = ORIG_PERSONAS;
+  }
 }
-console.log(`✅ director prompt: ${pass} checks passed`);
-console.log('   scope: runtime calls across every universe size; free vars on non-executed branches are NOT covered (see header)');
+
+{
+  const summary = { product_signal: { name: 'Test Tee' }, brand_signal: { name: 'Acme' } };
+  const offPrompt = withPersonasFlag('false', () => director.buildPromptRound({
+    inputSummary: summary,
+    creativeIntent: null,
+    platformFormat: 'meta_feed_1_1',
+    universe: universeOf(1),
+    roundIndex: 0,
+    avoidList: []
+  }));
+  const unsetPrompt = withPersonasFlag(undefined, () => director.buildPromptRound({
+    inputSummary: summary,
+    creativeIntent: null,
+    platformFormat: 'meta_feed_1_1',
+    universe: universeOf(1),
+    roundIndex: 0,
+    avoidList: []
+  }));
+  const onPrompt = withPersonasFlag('true', () => director.buildPromptRound({
+    inputSummary: {
+      ...summary,
+      brand_signal: {
+        name: 'Acme',
+        personas: [{ name: 'Saltwater Joe', description: 'weekend angler', painPoints: ['sunburn'] }]
+      }
+    },
+    creativeIntent: null,
+    platformFormat: 'meta_feed_1_1',
+    universe: universeOf(1),
+    roundIndex: 0,
+    avoidList: []
+  }));
+
+  check('G0 flag-off round prompt is byte-identical to unset (pre-change)',
+    offPrompt.system === unsetPrompt.system && offPrompt.user === unsetPrompt.user);
+  check('G1 flag-off omits PERSONAS rule',
+    !offPrompt.system.includes('PERSONAS:') && !offPrompt.system.includes('quote author'));
+  check('G2 flag-on PERSONAS rule forbids quote authors / invented testimonials',
+    onPrompt.system.includes('PERSONAS:')
+      && onPrompt.system.includes('quote author')
+      && onPrompt.system.includes('never invent a testimonial')
+      && onPrompt.system.includes('who the ad is FOR, not who is speaking'));
+  check('G3 flag-on inputSummary can carry personas (user JSON)',
+    onPrompt.user.includes('"personas"') && onPrompt.user.includes('Saltwater Joe'));
+  check('G4 parser is strictly === \'true\'',
+    /process\.env\.DIRECTOR_BRAND_PERSONAS === 'true'/.test(fileSrc));
+  check('G5 defaults.env file default is true',
+    /^DIRECTOR_BRAND_PERSONAS=true$/m.test(
+      fs.readFileSync(path.join(__dirname, '..', 'config', 'defaults.env'), 'utf8')
+    ));
+  check('G6 normalizeBrandPersonas uses real demographicSchema fields',
+    /function normalizeBrandPersonas/.test(fileSrc)
+      && /d\.painPoints/.test(fileSrc)
+      && /d\.toneHint/.test(fileSrc)
+      && /d\.interests/.test(fileSrc)
+      && !/avatarUrl/.test(extractFunctionSource(fileSrc, 'normalizeBrandPersonas') || ''));
+
+  const personas = director.normalizeBrandPersonas([
+    { name: 'Saltwater Joe', description: 'weekend angler', painPoints: ['sunburn'], interests: ['inshore'], toneHint: 'dry', avatarUrl: 'http://x' },
+    { name: '  ' },
+    { name: 'Second' },
+    { name: 'Third' },
+    { name: 'Fourth' },
+    { name: 'Fifth dropped' }
+  ]);
+  check('G7 cap is 4 named personas; nameless dropped; avatarUrl omitted',
+    personas.length === 4
+      && personas[0].name === 'Saltwater Joe'
+      && personas[0].painPoints[0] === 'sunburn'
+      && personas[0].toneHint === 'dry'
+      && personas[0].avatarUrl === undefined
+      && personas[3].name === 'Fourth');
+}
+
+// ── H. ugc_signal.rights_approved (item 7) ───────────────────────────────
+check('H0 source reads media.rights.approved (not platformStats.rights_approved)',
+  /m\.rights\?\.approved/.test(fileSrc)
+    && !/platformStats\?\.rights_approved/.test(fileSrc));
+check('H1 Media.select includes rights',
+  /\.select\('[^']*\brights\b/.test(fileSrc));
+
+{
+  const os = require('os');
+  function withTempMutation(filePath, find, replace, runCheck) {
+    const original = fs.readFileSync(filePath, 'utf8');
+    if (!original.includes(find)) {
+      check(`RP mutate target found: ${find.slice(0, 40)}`, false);
+      return;
+    }
+    const mutated = original.replace(find, replace);
+    const tmp = path.join(os.tmpdir(), `verifyDirectorPrompt-${process.pid}-${Date.now()}.js`);
+    fs.writeFileSync(tmp, mutated);
+    try { runCheck(fs.readFileSync(tmp, 'utf8')); }
+    finally { try { fs.unlinkSync(tmp); } catch (_) { /* tmp */ } }
+  }
+  let failedPersonas = false;
+  withTempMutation(
+    SERVICE_PATH,
+    '- PERSONAS: brand_signal.personas (when present) inform voice and objection framing ONLY.',
+    '- PERSONAS_REMOVED: brand_signal.personas (when present) inform voice and objection framing ONLY.',
+    (mutSrc) => {
+      failedPersonas = !/- PERSONAS:/.test(mutSrc);
+    }
+  );
+  check('RP-G2 [REVERT-PROOF] dropping PERSONAS rule fails G2 source', failedPersonas);
+
+  let failedRights = false;
+  withTempMutation(
+    SERVICE_PATH,
+    'm.rights?.approved',
+    'm.platformStats?.rights_approved',
+    (mutSrc) => {
+      failedRights = /platformStats\?\.rights_approved/.test(mutSrc)
+        && !/m\.rights\?\.approved/.test(mutSrc);
+    }
+  );
+  check('RP-H0 [REVERT-PROOF] restoring platformStats.rights_approved fails H0', failedRights);
+}
+
+function query(value) {
+  const chain = {
+    sort() { return chain; },
+    limit() { return chain; },
+    select() { return chain; },
+    lean() { return Promise.resolve(value); },
+  };
+  return chain;
+}
+
+async function runAsyncDirectorDataForward() {
+  const Brand = require('../models/Brand');
+  const CatalogProduct = require('../models/CatalogProduct');
+  const ProductMatchArtifact = require('../models/ProductMatchArtifact');
+  const Media = require('../models/Media');
+  const Comment = require('../models/Comment');
+  const orig = {
+    brand: Brand.findById,
+    product: CatalogProduct.findById,
+    pma: ProductMatchArtifact.find,
+    media: Media.find,
+    comment: Comment.find
+  };
+  function restore() {
+    Brand.findById = orig.brand;
+    CatalogProduct.findById = orig.product;
+    ProductMatchArtifact.find = orig.pma;
+    Media.find = orig.media;
+    Comment.find = orig.comment;
+    if (ORIG_PERSONAS === undefined) delete process.env.DIRECTOR_BRAND_PERSONAS;
+    else process.env.DIRECTOR_BRAND_PERSONAS = ORIG_PERSONAS;
+  }
+
+  try {
+    process.env.DIRECTOR_BRAND_PERSONAS = 'true';
+    Brand.findById = () => query({
+      name: 'Acme',
+      summary: 'A test brand',
+      tagline: 'Go forth',
+      tone: ['calm'],
+      logoUrl: null,
+      demographics: [
+        { name: 'Saltwater Joe', description: 'weekend angler', painPoints: ['sunburn'] }
+      ]
+    });
+    CatalogProduct.findById = () => query({ title: 'Test Tee' });
+    ProductMatchArtifact.find = () => query([]);
+    Media.find = () => query([]);
+    Comment.find = () => query([]);
+    const on = await director.assembleSignals({
+      brandId: '000000000000000000000001',
+      productId: '000000000000000000000002',
+      campaignKind: 'product',
+      seededUniverse: []
+    });
+    check('G8 assembleSignals flag-on attaches brand_signal.personas',
+      Array.isArray(on.brand_signal.personas)
+        && on.brand_signal.personas[0]
+        && on.brand_signal.personas[0].name === 'Saltwater Joe');
+
+    process.env.DIRECTOR_BRAND_PERSONAS = 'false';
+    const off = await director.assembleSignals({
+      brandId: '000000000000000000000001',
+      productId: '000000000000000000000002',
+      campaignKind: 'product',
+      seededUniverse: []
+    });
+    check('G9 assembleSignals flag-off OMITS brand_signal.personas key',
+      !Object.prototype.hasOwnProperty.call(off.brand_signal, 'personas'));
+
+    process.env.DIRECTOR_BRAND_PERSONAS = 'false';
+    Brand.findById = () => query({ name: 'Acme', summary: 's', tagline: 't', tone: [], logoUrl: null });
+    ProductMatchArtifact.find = () => query([{ mediaId: '0000000000000000000000aa' }]);
+    Media.find = () => query([{
+      source: 'instagram',
+      rights: { approved: true },
+      platformStats: { rights_approved: null },
+      classification: {},
+      fileType: 'image'
+    }]);
+    const rights = await director.assembleSignals({
+      brandId: '000000000000000000000001',
+      productId: '000000000000000000000002',
+      campaignKind: 'product',
+      seededUniverse: []
+    });
+    check('H2 stub Media.rights.approved=true → ugc_signal.rights_approved is true',
+      rights.ugc_signal.rights_approved === true,
+      `got ${rights.ugc_signal && rights.ugc_signal.rights_approved}`);
+
+    Media.find = () => query([{
+      source: 'instagram',
+      rights: { approved: false },
+      platformStats: { rights_approved: true },
+      classification: {},
+      fileType: 'image'
+    }]);
+    const rightsOff = await director.assembleSignals({
+      brandId: '000000000000000000000001',
+      productId: '000000000000000000000002',
+      campaignKind: 'product',
+      seededUniverse: []
+    });
+    check('H3 platformStats.rights_approved is ignored (still null/falsey)',
+      rightsOff.ugc_signal.rights_approved == null,
+      `got ${rightsOff.ugc_signal && rightsOff.ugc_signal.rights_approved}`);
+  } finally {
+    restore();
+  }
+}
+
+runAsyncDirectorDataForward()
+  .then(() => {
+    if (failures.length) {
+      console.error(`\n❌ director prompt: ${failures.length} FAILED, ${pass} passed\n`);
+      failures.forEach((f) => console.error(`   • ${f}`));
+      process.exit(1);
+    }
+    console.log(`✅ director prompt: ${pass} checks passed`);
+    console.log('   scope: runtime calls across every universe size; free vars on non-executed branches are NOT covered (see header)');
+  })
+  .catch((err) => {
+    console.error(err);
+    process.exit(1);
+  });

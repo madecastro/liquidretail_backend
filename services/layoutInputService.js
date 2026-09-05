@@ -532,9 +532,11 @@ async function loadContext(mediaId, options = {}) {
   //       keep categoryId / brandReviews / recommendedProducts as-is
   //       (those are scene-context, not product-identity)
   let productHero = null;
+  let catalogShortBenefits = [];
   if (options.productId) {
     const cp = await CatalogProduct.findById(options.productId).lean();
     if (cp) {
+      catalogShortBenefits = Array.isArray(cp.shortBenefits) ? cp.shortBenefits : [];
       if (!match) {
         match = synthesizeMatchFromCatalogProduct(cp);
       } else {
@@ -821,7 +823,7 @@ async function loadContext(mediaId, options = {}) {
     .lean()
     .catch(err => { console.warn(`   ⚠️  top comments fetch failed: ${err.message}`); return []; });
 
-  return { media, detection, crops, extended, match, overlayZones, brand, runId, categoryPool, productHero, raffle, topComments };
+  return { media, detection, crops, extended, match, overlayZones, brand, runId, categoryPool, productHero, raffle, topComments, catalogShortBenefits };
 }
 
 // Identification block built from a CatalogProduct. Mirrors the
@@ -848,7 +850,11 @@ function buildIdentificationFromCatalogProduct(cp) {
       reviewCount:   cp.reviewCount   ?? null,
       reviewSummary: cp.reviewSummary || null,
       productReviews: cp.productReviews || null,
-      description:   cp.description   || null
+      description:   cp.description   || null,
+      // Catalog-first benefits. When non-empty, runDerivation skips the
+      // emit-short_benefits instruction and assembleInput seeds the list
+      // from here instead of asking Gemini to re-invent it.
+      shortBenefits: Array.isArray(cp.shortBenefits) ? cp.shortBenefits : []
     }
   };
 }
@@ -895,11 +901,49 @@ function productReviewsOf(match) {
   return seeded || hydrated || null;
 }
 
+// CatalogProduct.shortBenefits already derived at ingest. When non-empty,
+// layout derivation must not ask Gemini to emit short_benefits, and
+// assembleInput must seed the list from the catalog (single source).
+// Empty → byte-identical to the pre-change prompt + assemble.
+// INPUT_SCHEMA_VERSION stays 4.2: existing artifacts remain valid; titling
+// already prefers catalog benefits via DEFAULT_META_CASCADES.benefits.
+const LAYOUT_CATALOG_BENEFITS_CAP = 5;
+
+function catalogShortBenefitsOf(ctx) {
+  const details = ctx?.match?.identification?.details || {};
+  const raw = (Array.isArray(details.shortBenefits) && details.shortBenefits.length)
+    ? details.shortBenefits
+    : (Array.isArray(ctx?.catalogShortBenefits) ? ctx.catalogShortBenefits : []);
+  if (!raw.length) return [];
+  const out = [];
+  for (const item of raw) {
+    if (out.length >= LAYOUT_CATALOG_BENEFITS_CAP) break;
+    if (typeof item !== 'string') continue;
+    const t = item.replace(/\s+/g, ' ').trim();
+    if (t) out.push(t);
+  }
+  return out;
+}
+
+function resolveLayoutShortBenefits(ctx, derivation) {
+  const catalog = catalogShortBenefitsOf(ctx);
+  if (catalog.length) return catalog;
+  return limitArray(derivation && derivation.short_benefits, LAYOUT_CATALOG_BENEFITS_CAP);
+}
+
+function seedCatalogShortBenefits(ctx, derivation) {
+  const catalog = catalogShortBenefitsOf(ctx);
+  if (!catalog.length || !derivation || typeof derivation !== 'object') return derivation;
+  return { ...derivation, short_benefits: catalog };
+}
+
 // ──────────────────────────────────────────────────────────────
 //  Derivation LLM
 // ──────────────────────────────────────────────────────────────
 async function runDerivation(ctx, template, aspectRatio, options) {
-  if (!atlasConfigured() && !process.env.GEMINI_API_KEY) return fallbackDerivation(ctx, aspectRatio, options);
+  if (!atlasConfigured() && !process.env.GEMINI_API_KEY) {
+    return seedCatalogShortBenefits(ctx, await fallbackDerivation(ctx, aspectRatio, options));
+  }
 
   const prompt = buildDerivationPrompt(ctx, template, aspectRatio, options);
 
@@ -928,12 +972,12 @@ async function runDerivation(ctx, template, aspectRatio, options) {
     const text = res.choices?.[0]?.message?.content;
     if (!text) {
       console.warn(`   ⚠️  layout-derivation: empty response (finishReason=${res.choices?.[0]?.finish_reason})`);
-      return fallbackDerivation(ctx, aspectRatio, options);
+      return seedCatalogShortBenefits(ctx, await fallbackDerivation(ctx, aspectRatio, options));
     }
-    return JSON.parse(text);
+    return seedCatalogShortBenefits(ctx, JSON.parse(text));
   } catch (err) {
     console.warn(`   ⚠️  layout-derivation failed: ${err.response?.data?.error?.message || err.message}`);
-    return fallbackDerivation(ctx, aspectRatio, options);
+    return seedCatalogShortBenefits(ctx, await fallbackDerivation(ctx, aspectRatio, options));
   }
 }
 
@@ -1273,7 +1317,12 @@ function buildDerivationPrompt(ctx, template, aspectRatio, options) {
     } else {
       lines.push(`- "subheadline" ≤ 15 words. "eyebrow" ≤ 3 words. "highlight_text" ≤ 5 words.`);
     }
-    lines.push(`- "short_benefits" 3–5 items, each ≤ 6 words, concrete buyer benefits (not specs).`);
+    // Catalog already derived shortBenefits at ingest. Asking Gemini to
+    // emit them again is a paid paraphrase of a field we will overwrite.
+    // Empty catalog field → keep the emit instruction (byte-identical).
+    if (!catalogShortBenefitsOf(ctx).length) {
+      lines.push(`- "short_benefits" 3–5 items, each ≤ 6 words, concrete buyer benefits (not specs).`);
+    }
     // Rewritten 2026-08-19 (compliance): the prior wording listed "Top
     // rated" / "Editor's pick" / "Best seller" as bare examples with no
     // "if" condition attached to them — unlike the two lines right before
@@ -3002,7 +3051,7 @@ async function assembleInput(ctx, template, aspectRatio, options, derivation, pr
       price:         details.price?.value ?? details.price?.display ?? undefined,
       currency:      details.price?.currency || undefined,
       description:   details.description || detection?.primarySubjectDesc || undefined,
-      short_benefits: limitArray(derivation.short_benefits, 5),
+      short_benefits: resolveLayoutShortBenefits(ctx, derivation),
       badges:         limitArray(derivedBadges, 4),
       hero_media:      mediaPair(heroMedia),
       secondary_media: mediaPair(secondaryMedia),
@@ -4204,6 +4253,8 @@ module.exports = {
   // carries pre-provenance UNSTAMPED quotes that the printability gate
   // then withholds wholesale.
   INPUT_SCHEMA_VERSION,
+  catalogShortBenefitsOf,
+  resolveLayoutShortBenefits,
   MAX_LAYOUT_SECONDARY_QUOTES,
   // Exported so scripts/verifyClaimSubstantiation.js can pin the
   // reviewCount sample-floor fix BEHAVIOURALLY (drive the shipped
