@@ -1,8 +1,8 @@
 {
   "version": 2,
   "backendRef": "origin/main",
-  "backendHead": "295541f797f9b0effb719e21e4ac07bf26cc784a",
-  "generatedAt": "2026-09-05T00:28:13.722Z",
+  "backendHead": "10ab21ab310080a2b3002e7b72fce3e6bede53f1",
+  "generatedAt": "2026-09-05T02:16:15.127Z",
   "files": {
     "models/Ad.js": {
       "backendHash": "812961d1ad30f5f87891dcace58fbe44ce5e07a5789f34b927fe8208dc2db966",
@@ -659,11 +659,11 @@
     },
     "services/adVisionQcService.js": {
       "backendHash": "0458e60a40b7ef253e7e933efd13b041e3535f10bd9251e31ea227e9d3bcb9b0",
-      "adgenHash": "4b316f972a78f1a375188558290ef857b0283c095f68ce1e250f1dae3e010903",
+      "adgenHash": "d794f7197e119ee7422dadd09a8411d753ba2635fc99a5855788c073c6b46b0a",
       "backendSha": "2b58cf31766b6ecf9fde711770c87dc2174cbd29",
       "status": "unported",
-      "reason": "Backend c1d1dc42 (2026-08-26) added COMPETITOR_MARKS_CAVEAT (known false-positive note on failing competitor_marks, wired into renderCategoryBlock + summarizeVisionQc) that adgen -- the LIVE renderer -- still lacks; adgen residual isStaticEnabled/isVideoEnabled + DISABLED_REASON_STATIC/VIDEO exports unchanged. Reverse-direction debt also real and NOT covered by this entry: adgen fcf3709 (2026-09-04) added TITLING_CATEGORIES/titlingOnlyGate derive ship-gate scoping, plus occlusion corrective-note/regenerationCount/visionQcMs instrumentation (Aug24-26 commits) backend never got -- needs its own --port-to backend follow-up.",
-      "portTo": "adgen",
+      "reason": "COMPETITOR_MARKS_CAVEAT (backend c1d1dc42) is now ported into renderCategoryBlock + summarizeVisionQc + module.exports. Remaining divergence is adgen→backend: TITLING_CATEGORIES/titlingOnlyGate derive ship-gate (adgen fcf3709), occlusion-aware corrective notes, regenerationCount/visionQcMs instrumentation. Adgen deliberately lacks backend's isStaticEnabled/isVideoEnabled sync gates (SystemConfig-only resolvers).",
+      "portTo": "backend",
       "owedSince": "2026-09-05T00:18:02.460Z"
     },
     "services/adgenBridge.js": {
@@ -1033,12 +1033,9 @@
     },
     "services/catalogProductDetectService.js": {
       "backendHash": "c515e16cd07710d3df1ec860689c892bfdcbcb1f0d37d36f70cb0a8ac2918fb0",
-      "adgenHash": "e28bfd4feb79e30b4213ff8d1e6523bb48d3d98b44aa3838fe1a81cc161d604b",
+      "adgenHash": "c515e16cd07710d3df1ec860689c892bfdcbcb1f0d37d36f70cb0a8ac2918fb0",
       "backendSha": "df6cbdb49a7773eff721bf343f83b15e5f91233a",
-      "status": "unported",
-      "reason": "Backend added probeImageDims() (axios+sharp, catalogProductDetectService.js:18-19,27-43) and wired it into materializeImage's Cloudinary-mirror-failure catch path (2026-09-01, diagnosed via the Pelagic Gear 981-asset bulk recovery hitting Cloudinary rate limits): a failed mirror used to leave Media.width/height undefined, which reframeStrategyChooser reads as 'source dims unknown' and defers to 100% paid nano-banana outpaint even when the source image's own aspect would have skipped it. The fix sniffs dims directly from the source URL (bounded 12MB/15s fetch, header-only sharp.metadata() read) so the fallback Media doc still carries usable geometry when Cloudinary is down. adgen's copy has no axios/sharp requires, no probeImageDims, and its catch-block fallback (mirroredUrl = sourceUrl) still stamps a Media doc with no width/height on a Cloudinary failure - identical to backend's pre-fix, cost-losing behavior. adgen vendors its own reframeStrategyChooser and is the service that actually runs the reframe/outpaint pipeline in production, so this is a real cost-relevant gap, not cosmetic drift. Everything else in the file is byte-identical. owedSince=2026-09-01.",
-      "portTo": "adgen",
-      "owedSince": "2026-09-05T00:20:06.162Z"
+      "status": "synced"
     },
     "services/categoryChainService.js": {
       "backendHash": "070c8bbf09383221027431902efc20cb60a8ba3c4efe8615565c1bf46e104f09",
