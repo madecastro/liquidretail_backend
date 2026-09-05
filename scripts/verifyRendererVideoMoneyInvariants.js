@@ -118,28 +118,53 @@ check('A2 [CONTROL-FLOW PROOF] every path inside the derive if-block ends in thr
     `expected the derive if-block's final top-level statement to be a bare 'return;' — got: ...${tail.slice(-80)}`);
 });
 
+function stripJsComments(text) {
+  return String(text || '')
+    .replace(/\/\*[\s\S]*?\*\//g, ' ')
+    .replace(/(^|[^:])\/\/[^\n]*/g, '$1');
+}
+
+// Any of these inside a derive/unknown-provider arm is a billable submit,
+// including the `require('./atlasVideoService').generateForAd(...)` form
+// that evades an `atlasVideo.generateForAd(` count (MUT8b).
+const FORBIDDEN_SUBMIT_RE =
+  /\.generateForAd\s*\(|submitGeneration\s*\(|require\(\s*['"]\.\/(?:atlasVideoService|geminiVideoService)['"]\s*\)/;
+
+function innerIf(blockText, re) {
+  const m = re.exec(blockText);
+  assert.ok(m, `inner if not found: ${re}`);
+  const braceIdx = blockText.indexOf('{', m.index + m[0].length - 1);
+  const branch = balanced(blockText, braceIdx, '{', '}');
+  assert.ok(branch, `unterminated inner if: ${re}`);
+  return branch;
+}
+
+const waitCeiling = innerIf(ifBlock.text,
+  /if\s*\(\s*\(ad\.deriveWaitAttempts\s*\|\|\s*0\)\s*>=\s*MAX_DERIVE_WAIT_ATTEMPTS\s*\)\s*\{/);
+const failedSibling = innerIf(ifBlock.text,
+  /if\s*\(\s*master\?\.status === 'failed'\s*\)\s*\{/);
+const notReady = innerIf(ifBlock.text,
+  /if\s*\(\s*!master\?\.veoVideoUrl\s*\)\s*\{/);
+
 check('A3 the two internal escape hatches inside the derive block are throw, not a billable fallback', () => {
-  // (i) exceeding the wait-attempt ceiling
-  assert.match(ifBlock.text, /deriveWaitAttempts[\s\S]{0,40}>=\s*MAX_DERIVE_WAIT_ATTEMPTS[\s\S]{0,60}\{\s*\n\s*throw new Error/,
+  assert.match(stripJsComments(waitCeiling.text), /throw new Error/,
     'exceeding MAX_DERIVE_WAIT_ATTEMPTS must throw, not silently proceed to a submit');
-  // (ii) sibling master already failed
-  assert.match(ifBlock.text, /master\?\.status === 'failed'[\s\S]{0,60}\{\s*\n\s*throw new Error/,
+  assert.match(stripJsComments(failedSibling.text), /throw new Error/,
     '[INVARIANT 2] a failed sibling master must throw — never fall back to this ad submitting its own Omni master');
 });
 
 check('A4 the "sibling master failed" branch contains no submit call of any kind', () => {
-  const failedBranchMatch = /if\s*\(\s*master\?\.status === 'failed'\s*\)\s*\{/.exec(ifBlock.text);
-  assert.ok(failedBranchMatch, 'failed-sibling branch not found');
-  const braceIdx = ifBlock.text.indexOf('{', failedBranchMatch.index + failedBranchMatch[0].length - 1);
-  const branch = balanced(ifBlock.text, braceIdx, '{', '}');
-  assert.ok(branch);
-  assert.ok(!/generateForAd|atlasVideo\./.test(branch.text),
+  assert.ok(!FORBIDDEN_SUBMIT_RE.test(stripJsComments(failedSibling.text)),
     'the failed-sibling-master branch must not contain any Omni submit call');
 });
 
 check('A5 the not-ready-yet branch requeues and returns — it does not submit either', () => {
-  assert.match(ifBlock.text, /if\s*\(\s*!master\?\.veoVideoUrl\s*\)\s*\{[\s\S]{0,120}requeueDeriveForRetry[\s\S]{0,60}return;[^\n]*\n\s*\}/,
+  const code = stripJsComments(notReady.text);
+  assert.match(code, /requeueDeriveForRetry/,
     'expected the wait-timeout branch to call requeueDeriveForRetry then return, with no submit in between');
+  assert.match(code, /return\s*;/);
+  assert.ok(!FORBIDDEN_SUBMIT_RE.test(code),
+    'the wait-timeout branch must not contain any Omni submit call');
 });
 
 // ═════════════════════════════════════════════════════════════════════════
@@ -199,10 +224,25 @@ check('B3 the providers are EXCLUSIVE branches, not a fallback chain, and a skip
     'the gemini submit must be an else-if branch of the atlas one — a sequential second call would buy two masters for one ad');
 
   // FAIL CLOSED. An unknown provider throws before any submit.
-  assert.match(seam, /\}\s*else \{[\s\S]{0,400}throw new Error\(/,
+  // Brace-match the `else {` that follows the gemini `else if` — a `{0,200}`
+  // negative window missed `require('./atlasVideoService').generateForAd(...)`
+  // sitting 220 chars into the arm (MUT8b).
+  const elseIfGemini = /else if \(videoProvider === 'gemini'\)\s*\{/.exec(afterIfBlock);
+  assert.ok(elseIfGemini, 'gemini else-if branch not found after the derive gate');
+  const geminiBrace = afterIfBlock.indexOf('{', elseIfGemini.index + elseIfGemini[0].length - 1);
+  const geminiBlock = balanced(afterIfBlock, geminiBrace, '{', '}');
+  assert.ok(geminiBlock, 'gemini else-if unterminated');
+  const afterGemini = afterIfBlock.slice(geminiBlock.endIdx);
+  const elseMatch = /^\s*else\s*\{/.exec(afterGemini);
+  assert.ok(elseMatch, 'unknown-provider else arm not found after the gemini branch');
+  const elseBrace = afterGemini.indexOf('{', elseMatch.index);
+  const elseBlock = balanced(afterGemini, elseBrace, '{', '}');
+  assert.ok(elseBlock, 'unknown-provider else arm unterminated');
+  const elseCode = stripJsComments(elseBlock.text);
+  assert.match(elseCode, /throw new Error\(/,
     'an unrecognised VIDEO_PROVIDER must throw, never fall through to a billable default');
-  assert.ok(!/else\s*\{[\s\S]{0,200}(atlasVideo|geminiVideo)\.generateForAd\(/.test(seam),
-    'the else arm must not submit to anything');
+  assert.ok(!FORBIDDEN_SUBMIT_RE.test(elseCode),
+    'the else arm must not submit to anything (including require(...).generateForAd / submitGeneration)');
 
   // A skipped result must not be treated as success AND must not fall
   // through to a second provider. generateForAd holds the claim through

@@ -30,6 +30,7 @@
 const fs = require('fs');
 const path = require('path');
 const assert = require('assert');
+const { extractTopLevelKeysAfter } = require('./lib/sourceLiteralScan');
 
 const ROOT = path.join(__dirname, '..');
 const RENDERER_SRC = fs.readFileSync(path.join(ROOT, 'src', 'services', 'renderer.js'), 'utf8');
@@ -55,7 +56,11 @@ function stripComments(src) {
 // ═════════════════════════════════════════════════════════════════════════
 // A — extract the DECLARED Ad.status enum from models/Ad.js
 // ═════════════════════════════════════════════════════════════════════════
-const enumMatch = /status:\s*\{[\s\S]{0,20}type:\s*String,\s*enum:\s*\[([^\]]+)\]/.exec(stripComments(AD_MODEL_SRC));
+const statusNode = extractTopLevelKeysAfter(stripComments(AD_MODEL_SRC), /(?:^|\n)\s*status:\s*\{/);
+assert.ok(statusNode, 'could not find Ad.status schema node — models/Ad.js shape changed, re-derive this harness');
+const enumIdx = statusNode.keys.indexOf('enum');
+assert.ok(enumIdx >= 0, 'Ad.status schema node has no enum member');
+const enumMatch = /\[([^\]]+)\]/.exec(statusNode.members[enumIdx]);
 assert.ok(enumMatch, 'could not find Ad.status enum declaration — models/Ad.js shape changed, re-derive this harness');
 const declaredEnum = enumMatch[1].split(',').map((s) => s.trim().replace(/^['"]|['"]$/g, '')).filter(Boolean);
 

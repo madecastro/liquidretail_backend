@@ -84,6 +84,38 @@ function stripComments(src) {
 const PROVIDER_CODE = stripComments(PROVIDER_SRC);
 const LEASE_CODE = stripComments(LEASE_SRC);
 
+// Brace-match a `{ ... }` whose opening brace is the last char of `re`'s match
+// (or the first `{` after `signature` for fnBody). Copied from
+// verifyShutdownReleaseReceiptAware.js:103-126 so a `{0,N}` span cannot
+// satisfy — or miss — a call that lives inside the function.
+function matchingBrace(src, startIdx) {
+  if (src[startIdx] !== '{') return -1;
+  let depth = 0;
+  for (let i = startIdx; i < src.length; i++) {
+    if (src[i] === '{') depth++;
+    else if (src[i] === '}') { depth--; if (depth === 0) return i; }
+  }
+  return -1;
+}
+function fnBody(src, signature) {
+  const start = src.indexOf(signature);
+  if (start < 0) return '';
+  const open = src.indexOf('{', start);
+  if (open < 0) return '';
+  const close = matchingBrace(src, open);
+  if (close < 0) return '';
+  return src.slice(open, close + 1);
+}
+function blockAt(src, re) {
+  const m = re.exec(src);
+  if (!m) return '';
+  const open = m.index + m[0].length - 1;
+  if (src[open] !== '{') return '';
+  const close = matchingBrace(src, open);
+  if (close < 0) return '';
+  return src.slice(open, close + 1);
+}
+
 let pass = 0;
 const failures = [];
 function check(label, cond, detail = '') {
@@ -234,7 +266,7 @@ console.log('\nE. charge point — an accepted id is possibly billed');
       v.billed !== 'no', JSON.stringify(v));
   }
   check('E7 submit returns an id whenever one exists, regardless of HTTP status',
-    /if \(id\) \{[\s\S]{0,200}interactionId/.test(PROVIDER_SRC));
+    /interactionId/.test(blockAt(PROVIDER_CODE, /if \(id\) \{/)));
   check('E8 only a 4xx WITH a structured error body is marked provably unbilled',
     /billed = \(res\.status >= 400 && res\.status < 500 && res\.data\?\.error\) \? 'no' : 'possible'/.test(PROVIDER_SRC));
   check('E9 a transport throw is marked possibly billed',
@@ -290,10 +322,16 @@ console.log('\nF. Atlas inferences that must NOT appear here');
     /maxRedirects:\s*0/.test(peekGetCall));
   check('F6 the POST is the ONLY axios.post in the file',
     (PROVIDER_SRC.match(/axios\.post\(/g) || []).length === 1);
+  const resumeBody = fnBody(PROVIDER_CODE, 'async function resumeForAd(');
   check('F7 resume/peek use GET only',
-    /axios\.get\(/.test(PROVIDER_SRC) && !/axios\.post[\s\S]{0,400}resumeForAd/.test(PROVIDER_SRC));
+    /axios\.get\(/.test(PROVIDER_CODE) &&
+    !!resumeBody &&
+    !/axios\.post\s*\(/.test(resumeBody));
   check('F8 resumeForAd contains no submit call',
-    !/function resumeForAd[\s\S]*?\n\}/.exec(PROVIDER_SRC)[0].includes('submitGeneration'));
+    !!resumeBody &&
+    !/submitGeneration\s*\(/.test(resumeBody) &&
+    !/axios\.post\s*\(/.test(resumeBody) &&
+    !/require\(\s*['"]\.\/(?:atlasVideoService|geminiVideoService)['"]\s*\)/.test(resumeBody));
 }
 
 // ── G. THE LEASE IS GLOBAL AND FAILS CLOSED ───────────────────────────────
@@ -308,7 +346,10 @@ console.log('\nG. concurrency lease — global, fails closed, safe under both re
     /if \(!c \|\| !events\) return null;/.test(LEASE_SRC));
   check('G3 holds BOTH an occupancy and a rate constraint (occupancy-vs-RPM unproven)',
     /acquiredInWindow >= MAX_SLOTS/.test(LEASE_SRC) && /slot < MAX_SLOTS/.test(LEASE_SRC));
-  check('G4 default cap is 8 (the measured limit)', /:\s*8;/.test(LEASE_SRC));
+  const maxSlotsIife = fnBody(LEASE_CODE, 'const MAX_SLOTS =');
+  check('G4 default cap is 8 (the measured limit)',
+    /Number\(process\.env\.GEMINI_VIDEO_MAX_SLOTS\)/.test(maxSlotsIife) &&
+    /Math\.floor\(raw\)\s*:\s*8\s*;/.test(maxSlotsIife));
   check('G5 duplicate-key on a contended slot is handled, not fatal',
     /11000/.test(LEASE_SRC));
   check('G6 a unique (scope, slot) index makes the race decidable',
@@ -329,8 +370,9 @@ console.log('\nG. concurrency lease — global, fails closed, safe under both re
   check('G7 release is scoped by a per-acquisition claim token, not just scope+slot (a stolen-then-reacquired slot is not released late)',
     /claimToken/.test(LEASE_SRC) &&
     /\{ scope, slot, claimToken, releasedAt: null \}/.test(LEASE_SRC));
+  const slotLoop = blockAt(LEASE_CODE, /for \(let slot = 0; slot < MAX_SLOTS; slot \+= 1\) \{/);
   check('G7b the claim token is minted fresh per acquisition attempt (inside the slot loop), not once per acquire() call',
-    /for \(let slot = 0; slot < MAX_SLOTS; slot \+= 1\) \{[\s\S]{0,200}const claimToken/.test(LEASE_SRC));
+    /const claimToken/.test(slotLoop));
   check('G7c the claim token is written into the SAME $set that wins the slot (so the filter and the stored value can never diverge)',
     /claimToken\s*\n(\s*)\}\s*\},\s*\n\s*\{ upsert: true, returnDocument: 'after' \}/.test(LEASE_SRC));
   check('G8 the TTL is NOT derived from any poll ceiling (the REFRAME_CLAIM drift lesson)',

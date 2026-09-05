@@ -28,6 +28,7 @@
 
 const fs = require('fs');
 const path = require('path');
+const { extractTopLevelKeysAfter, findMatchingBrace } = require('./lib/sourceLiteralScan');
 
 const REPO = path.resolve(__dirname, '..');
 const failures = [];
@@ -74,36 +75,126 @@ check('D2 renderer video paths read isTitlerEnabled() at least twice',
   (renderer.match(/isTitlerEnabled\(\)/g) || []).length >= 2,
   'one call each for master + derive branches');
 
-// Master path — extract the persist-write block and check its handoff arm.
-const masterBlock = renderer.match(/const \$setMaster[\s\S]{0,4000}?await Ad\.updateOne\(\s*\{[\s\S]{0,300}?\}\s*\);/);
+// Master/derive persist writes — brace-matched object literals, not a
+// `{0,N}` span from `const $setMaster` to the next `updateOne`. Member-
+// scoped keys via sourceLiteralScan (same shape as
+// verifyVideoMasterCloudinaryPublicId.js): a later `titlingNeeded: true`
+// inside a 1200-char window cannot satisfy the handoff arm, and a comment
+// cannot either. The true-arm of `...(handoffMode ? { ... } : { ... })`
+// is its own object literal; that is where titlingNeeded / claim-clear live.
+
+function stripJsComments(text) {
+  return String(text || '')
+    .replace(/\/\*[\s\S]*?\*\//g, ' ')
+    .replace(/(^|[^:])\/\/[^\n]*/g, '$1');
+}
+
+function matchingParen(src, openIdx) {
+  if (src[openIdx] !== '(') return -1;
+  let depth = 0;
+  for (let i = openIdx; i < src.length; i++) {
+    const ch = src[i];
+    if (ch === '(') depth++;
+    else if (ch === ')') { depth--; if (depth === 0) return i; }
+    else if (ch === "'" || ch === '"' || ch === '`') {
+      const q = ch;
+      i++;
+      while (i < src.length) {
+        if (src[i] === '\\') { i += 2; continue; }
+        if (src[i] === q) break;
+        i++;
+      }
+    }
+  }
+  return -1;
+}
+
+function objectAfter(src, declRe) {
+  const extracted = extractTopLevelKeysAfter(src, declRe);
+  if (!extracted) return null;
+  return {
+    extracted,
+    text: src.slice(extracted.bodyStart, extracted.bodyEnd + 1),
+    after: src.slice(extracted.bodyEnd + 1)
+  };
+}
+
+function handoffTrueArm(objText) {
+  return extractTopLevelKeysAfter(objText, /\.\.\.\s*\(\s*handoffMode\s*\?\s*\{/);
+}
+
+function memberSrc(extracted, key) {
+  if (!extracted) return '';
+  const i = extracted.keys.indexOf(key);
+  return i < 0 ? '' : extracted.members[i];
+}
+
+function firstCall(src, callee) {
+  const idx = src.indexOf(callee + '(');
+  if (idx < 0) return null;
+  const open = idx + callee.length;
+  const close = matchingParen(src, open);
+  if (close < 0) return null;
+  return { text: src.slice(open, close + 1), end: close + 1, rest: src.slice(close + 1) };
+}
+
+function blockStartingAt(src, re) {
+  const m = re.exec(src);
+  if (!m) return null;
+  const open = m.index + m[0].length - 1;
+  if (src[open] !== '{') return null;
+  const close = findMatchingBrace(src, open);
+  if (close < 0) return null;
+  return src.slice(open, close + 1);
+}
+
+const masterObj = objectAfter(renderer, /const \$setMaster\s*=\s*\{/);
+const masterArm = masterObj ? handoffTrueArm(masterObj.text) : null;
+const masterUpdate = masterObj ? firstCall(masterObj.after, 'Ad.updateOne') : null;
+const masterHandoffIf = masterUpdate
+  ? blockStartingAt(masterUpdate.rest, /if\s*\(\s*handoffMode\s*\)\s*\{/)
+  : null;
+const masterHandoffIfCode = stripJsComments(masterHandoffIf || '');
+
 check('D3 master path builds handoff-mode $set',
-  !!masterBlock && /handoffMode/.test(masterBlock[0]),
+  !!masterObj && /handoffMode/.test(masterObj.text),
   'must branch based on isTitlerEnabled() before the persist write');
 check('D4 master path persist-write is owner-scoped',
-  !!masterBlock && /\{\s*_id:\s*ad\._id,\s*claimedByWorker:\s*WORKER_ID\s*\}/.test(masterBlock[0]),
+  !!masterUpdate && /\{\s*_id:\s*ad\._id,\s*claimedByWorker:\s*WORKER_ID\s*\}/.test(masterUpdate.text),
   'without this a stale claim could still land the write');
 check('D5 master handoff arm stamps veoVideoUrl + titlingNeeded together',
-  /veoVideoUrl:\s*veoResult\.videoUrl[\s\S]{0,1200}?handoffMode[\s\S]{0,400}?titlingNeeded:\s*true/.test(renderer),
+  /veoVideoUrl\s*:\s*veoResult\.videoUrl/.test(memberSrc(masterObj && masterObj.extracted, 'veoVideoUrl')) &&
+  /titlingNeeded\s*:\s*true/.test(memberSrc(masterArm, 'titlingNeeded')),
   'MONEY: co-persist so a titler cannot observe titlingNeeded without the URL');
 check('D6 master handoff arm clears claim in the same $set',
-  /const \$setMaster[\s\S]{0,1200}?handoffMode[\s\S]{0,600}?titlingNeeded:\s*true[\s\S]{0,300}?claimedByWorker:\s*null[\s\S]{0,80}claimedAt:\s*null/.test(renderer),
-  'must anchor on $setMaster so a missing claim-clear in master path isn\'t masked by derive\'s');
+  /claimedByWorker\s*:\s*null/.test(memberSrc(masterArm, 'claimedByWorker')) &&
+  /claimedAt\s*:\s*null/.test(memberSrc(masterArm, 'claimedAt')),
+  'must read the handoff true-arm of $setMaster so a missing claim-clear in master path isn\'t masked by derive\'s');
 check('D7 master handoff returns without bumpRunCounter',
-  /VIDEO MASTER handoff[\s\S]{0,400}?return;/.test(renderer),
+  !!masterHandoffIf && /VIDEO MASTER handoff/.test(masterHandoffIf) &&
+  /return\s*;/.test(masterHandoffIfCode) && !/bumpRunCounter/.test(masterHandoffIfCode),
   'ad has not settled — the titler owns the counter bump');
 
-// Derive path — same shape.
-const deriveBlock = renderer.match(/const \$setDerive[\s\S]{0,3000}?await Ad\.updateOne\(\s*\{[\s\S]{0,300}?\}\s*\);/);
+const deriveObj = objectAfter(renderer, /const \$setDerive\s*=\s*\{/);
+const deriveArm = deriveObj ? handoffTrueArm(deriveObj.text) : null;
+const deriveUpdate = deriveObj ? firstCall(deriveObj.after, 'Ad.updateOne') : null;
+const deriveHandoffIf = deriveUpdate
+  ? blockStartingAt(deriveUpdate.rest, /if\s*\(\s*handoffMode\s*\)\s*\{/)
+  : null;
+const deriveHandoffIfCode = stripJsComments(deriveHandoffIf || '');
+
 check('D8 derive path builds handoff-mode $set',
-  !!deriveBlock && /handoffMode/.test(deriveBlock[0]));
+  !!deriveObj && /handoffMode/.test(deriveObj.text));
 check('D9 derive path persist-write is owner-scoped',
-  !!deriveBlock && /\{\s*_id:\s*ad\._id,\s*claimedByWorker:\s*WORKER_ID\s*\}/.test(deriveBlock[0]));
+  !!deriveUpdate && /\{\s*_id:\s*ad\._id,\s*claimedByWorker:\s*WORKER_ID\s*\}/.test(deriveUpdate.text));
 check('D10 derive handoff arm stamps titlingNeeded=true',
-  /const \$setDerive[\s\S]{0,1000}?handoffMode[\s\S]{0,400}?titlingNeeded:\s*true/.test(renderer));
+  /titlingNeeded\s*:\s*true/.test(memberSrc(deriveArm, 'titlingNeeded')));
 check('D11 derive handoff arm clears claim in the same $set',
-  /const \$setDerive[\s\S]{0,1200}?handoffMode[\s\S]{0,600}?titlingNeeded:\s*true[\s\S]{0,300}?claimedByWorker:\s*null[\s\S]{0,80}claimedAt:\s*null/.test(renderer));
+  /claimedByWorker\s*:\s*null/.test(memberSrc(deriveArm, 'claimedByWorker')) &&
+  /claimedAt\s*:\s*null/.test(memberSrc(deriveArm, 'claimedAt')));
 check('D12 derive handoff returns without bumpRunCounter',
-  /VIDEO DERIVE handoff[\s\S]{0,400}?return;/.test(renderer));
+  !!deriveHandoffIf && /VIDEO DERIVE handoff/.test(deriveHandoffIf) &&
+  /return\s*;/.test(deriveHandoffIfCode) && !/bumpRunCounter/.test(deriveHandoffIfCode));
 
 // E. Titler role.
 const titlerPath = path.join(REPO, 'src', 'services', 'titler.js');
@@ -196,9 +287,16 @@ function serviceBlock(yamlText, serviceName) {
 // the renderer's own ADGEN_RENDERER_ENABLED to "false" still passed,
 // because the very next line is ADGEN_TITLER_ENABLED: "true".) Extract each
 // key's OWN value line instead of searching for any nearby quoted literal.
+//
+// STRIP FULL-LINE YAML COMMENTS FIRST. A non-greedy `key:…value:` window
+// matches `# value: "true"` sitting between `key:` and the real
+// `value: "false"` — mutation-tested 2026-09-04, the neighbor-key fix
+// still passed that comment decoy. After comments are gone, take the
+// `value:` on the line immediately following this key.
 function envValue(block, key) {
-  const re = new RegExp(`key:\\s*${key}\\b[\\s\\S]{0,60}?value:\\s*["']?([^"'\\n]+)["']?`);
-  const m = re.exec(block);
+  const clean = String(block || '').replace(/^\s*#.*$/gm, '');
+  const re = new RegExp(`-\\s*key:\\s*${key}\\b[^\\n]*\\n\\s*value:\\s*["']?([^"'\\n#]+)["']?`);
+  const m = re.exec(clean);
   return m ? m[1].trim() : null;
 }
 

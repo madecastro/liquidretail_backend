@@ -377,7 +377,7 @@ check('W3 Canonical uses decideInkOnLight for the global ink vote', () => {
 
 check('W4 defaults.env ships TITLE_FACE_KEEPOUT=true', () => {
   const env = fs.readFileSync(path.join(ROOT, 'config/defaults.env'), 'utf8');
-  assert.ok(/TITLE_FACE_KEEPOUT=true/.test(env));
+  assert.ok(/^TITLE_FACE_KEEPOUT=true$/m.test(env));
 });
 
 check('W5 detectClipBoxes returns faceSamples (source-text)', () => {

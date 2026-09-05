@@ -97,10 +97,29 @@ check('C7: a misconfigured REMOTION_INSTANCE_MEMORY_MB=0 override does not crash
   !atZeroInstanceMb.threw, atZeroInstanceMb.message);
 
 // ── D. render.yaml comments brought back in line with the live dashboards ──
+//
+// STRUCTURALLY bounded to each service (same serviceBlock() as
+// verifyTitlerHandoff G1–G6), then an exact comment LINE — never
+// `adgen-renderer[\s\S]{0,800}REMOTION_QUEUE_CONCURRENCY=2`. That window
+// was satisfied by "Do not restore REMOTION_QUEUE_CONCURRENCY=2" while the
+// live-value line said 4, and went CI-red when ~700 comment chars landed
+// between `name:` and the first `=2`.
+function serviceBlock(yamlText, serviceName) {
+  const anchor = new RegExp(`name:\\s*${serviceName}\\b`);
+  const m = anchor.exec(yamlText);
+  if (!m) return null;
+  const rest = yamlText.slice(m.index);
+  const nextBoundary = /\n\s*-\s*type:\s*\w+/.exec(rest);
+  return nextBoundary ? rest.slice(0, nextBoundary.index) : rest;
+}
+const rendererYamlBlock = serviceBlock(renderYaml, 'adgen-renderer') || '';
+const titlerYamlBlock = serviceBlock(renderYaml, 'adgen-titler') || '';
+
 check('D1: render.yaml renderer block states its ACTUAL live value is 2 (was describing 3, which the dashboard never ran)',
-  /adgen-renderer[\s\S]{0,800}REMOTION_QUEUE_CONCURRENCY=2/.test(renderYaml));
+  /^\s*# REMOTION_QUEUE_CONCURRENCY=2 \(≈3\.9 GB peak/m.test(rendererYamlBlock));
 check('D2: render.yaml titler block documents the 2026-08-26 OOM incident and the 4 -> 2 orchestrator action item',
-  /adgen-titler[\s\S]{0,3000}2026-08-26[\s\S]{0,500}4 -> 2/.test(renderYaml));
+  /2026-08-26/.test(titlerYamlBlock) &&
+  /^\s*# Orchestrator action item: dashboard 4 -> 2\.\s*$/m.test(titlerYamlBlock));
 
 // ── report ───────────────────────────────────────────────────────────────
 console.log(`\nverifyRemotionMemoryBudget: ${passes.length} pass, ${failures.length} fail`);

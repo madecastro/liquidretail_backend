@@ -34,8 +34,44 @@ const failures = [];
 const passes = [];
 
 function check(name, cond, detail) {
+  if (typeof cond === 'function') {
+    try { cond = cond(); } catch (err) { cond = false; detail = detail || err.message; }
+  }
   if (cond) passes.push(name);
   else failures.push(`${name}${detail ? ` — ${detail}` : ''}`);
+}
+
+function matchingBrace(src, startIdx) {
+  if (src[startIdx] !== '{') return -1;
+  let depth = 0;
+  for (let i = startIdx; i < src.length; i++) {
+    if (src[i] === '{') depth++;
+    else if (src[i] === '}') { depth--; if (depth === 0) return i; }
+  }
+  return -1;
+}
+function fnBody(src, signature) {
+  const start = src.indexOf(signature);
+  if (start < 0) return '';
+  const open = src.indexOf('{', start);
+  if (open < 0) return '';
+  const close = matchingBrace(src, open);
+  if (close < 0) return '';
+  return src.slice(open, close + 1);
+}
+function stripJsComments(text) {
+  return String(text || '')
+    .replace(/\/\*[\s\S]*?\*\//g, ' ')
+    .replace(/(^|[^:])\/\/[^\n]*/g, '$1');
+}
+function blockAt(src, re) {
+  const m = re.exec(src);
+  if (!m) return '';
+  const open = m.index + m[0].length - 1;
+  if (src[open] !== '{') return '';
+  const close = matchingBrace(src, open);
+  if (close < 0) return '';
+  return src.slice(open, close + 1);
 }
 
 // ── A. atlasVideoService structural checks ────────────────────────────────
@@ -46,46 +82,60 @@ check('A1 active-claim registry is declared as a Set',
   /const\s+_activeReframeClaims\s*=\s*new Set\(\)/.test(svc),
   'a Set keyed on {mediaId,aspectKey,claimBy} — cannot be recomputed on the fly');
 
-// STRENGTHENED 2026-08-27. The previous regex was
-//   _activeReframeClaims.add(...)  ;? \n? return true;
-// i.e. it required the add to be IMMEDIATELY followed by `return true`, which
-// broke the moment an acquire log line was inserted between them — a false
-// failure on a change that did not touch the property at all. It also never
-// actually proved the ONLY half of its own name: it said nothing about the
-// non-win path. This version proves both: the add sits inside the `if (doc)`
-// win branch that returns true, and the fall-through returns false.
+// Brace-match each function (verifyShutdownReleaseReceiptAware.js:103-126)
+// and strip comments so a commented-out add/delete cannot satisfy a positive
+// check, and a 1200-char window cannot swallow a neighbor helper.
+const tryClaimBody = stripJsComments(fnBody(svc, 'async function tryClaimReframe('));
+const ifDocBody = blockAt(tryClaimBody, /if \(doc\) \{/);
+const tryClaimWithoutWin = ifDocBody ? tryClaimBody.replace(ifDocBody, '') : tryClaimBody;
 check('A2 tryClaimReframe adds to the registry ONLY on win',
-  /if \(doc\) \{[\s\S]{0,1200}?_activeReframeClaims\.add\([\s\S]{0,1200}?return true;[\s\S]{0,80}?\}\s*\n\s*return false;/.test(svc),
+  /_activeReframeClaims\.add\(/.test(ifDocBody) &&
+  /return true;/.test(ifDocBody) &&
+  /return false;/.test(tryClaimWithoutWin) &&
+  !/_activeReframeClaims\.add\(/.test(tryClaimWithoutWin),
   'adding on a failed claim would leak forever');
 
+const releaseBody = stripJsComments(fnBody(svc, 'async function releaseReframeClaim('));
 check('A3 releaseReframeClaim removes from registry BEFORE the Mongo write',
-  /async function releaseReframeClaim[\s\S]{0,400}?_activeReframeClaims\.delete\([\s\S]{0,180}?\)[\s\S]{0,400}?Media\.updateOne/.test(svc),
+  () => {
+    const delIdx = releaseBody.indexOf('_activeReframeClaims.delete');
+    const updIdx = releaseBody.indexOf('Media.updateOne');
+    return delIdx >= 0 && updIdx >= 0 && delIdx < updIdx;
+  },
   'ordering matters: if delete came after the write, a concurrent shutdown sweep could try to release twice');
 
+const sweepBody = stripJsComments(fnBody(svc, 'async function releaseAllActiveReframeClaims('));
 check('A4 releaseAllActiveReframeClaims is defined and iterates the registry',
-  /async function releaseAllActiveReframeClaims\(\)\s*\{[\s\S]{0,600}?_activeReframeClaims[\s\S]{0,200}?releaseReframeClaim\(/.test(svc));
+  !!sweepBody && /_activeReframeClaims/.test(sweepBody) && /releaseReframeClaim\(/.test(sweepBody));
 
+const sweepFinally = blockAt(sweepBody, /finally\s*\{/);
 check('A5 releaseAllActiveReframeClaims never throws (drains registry in finally)',
-  /async function releaseAllActiveReframeClaims[\s\S]{0,1200}?try\s*\{[\s\S]{0,300}?releaseReframeClaim\([\s\S]{0,50}?\)[\s\S]{0,300}?\}\s*catch[\s\S]{0,150}?\}\s*finally\s*\{[\s\S]{0,200}?_activeReframeClaims\.delete/.test(svc),
+  /try\s*\{/.test(sweepBody) && /catch\s*\(/.test(sweepBody) &&
+  /_activeReframeClaims\.delete/.test(sweepFinally),
   'shutdown must proceed even if a single release throws');
 
+const exportsDecl = /module\.exports\s*=\s*\{/.exec(svc);
+const exportsClose = exportsDecl ? matchingBrace(svc, exportsDecl.index + exportsDecl[0].length - 1) : -1;
+const exportsCode = (exportsDecl && exportsClose >= 0)
+  ? stripJsComments(svc.slice(exportsDecl.index + exportsDecl[0].length - 1, exportsClose + 1))
+  : '';
 check('A6 releaseAllActiveReframeClaims is exported',
-  /module\.exports\s*=\s*\{[\s\S]{0,5000}releaseAllActiveReframeClaims[\s\S]{0,50}?\};/.test(svc));
+  /(?:^|[{\n,])\s*releaseAllActiveReframeClaims\s*[,}\s]/.test(exportsCode));
 
 // ── B. renderer.js hookup ─────────────────────────────────────────────────
 const renderer = fs.readFileSync(path.join(REPO, 'src', 'services', 'renderer.js'), 'utf8');
+const shutdownBody = fnBody(renderer, 'async function shutdown(');
+const shutdownCode = stripJsComments(shutdownBody);
 
 check('B1 renderer.shutdown() awaits releaseAllActiveReframeClaims',
-  /async function shutdown\(\)[\s\S]{0,10000}?await\s+atlasVideo\.releaseAllActiveReframeClaims\(\)/.test(renderer),
+  /await\s+atlasVideo\.releaseAllActiveReframeClaims\(\)/.test(shutdownCode),
   'without await, a SIGKILL could interrupt the release write');
 
 check('B2 renderer.shutdown() calls it AFTER the ad-claim release block',
   () => {
-    const shutdownBody = renderer.match(/async function shutdown\(\)[\s\S]*?^}/m);
     if (!shutdownBody) return false;
-    const s = shutdownBody[0];
-    const adReleaseIdx = s.search(/released\s+\$?\{?res\.modifiedCount/);
-    const reframeReleaseIdx = s.search(/releaseAllActiveReframeClaims/);
+    const adReleaseIdx = shutdownBody.search(/released\s+\$?\{?res\.modifiedCount/);
+    const reframeReleaseIdx = shutdownBody.search(/releaseAllActiveReframeClaims/);
     // Ad claim release is in the drain-exhausted branch; reframe release is
     // unconditional after. Reframe idx must come AFTER ad release idx or be
     // the only present idx (ad release only shows on exhausted drain).
@@ -93,8 +143,24 @@ check('B2 renderer.shutdown() calls it AFTER the ad-claim release block',
   },
   'wrong order = a peer could observe the reframe release before the ad-claim clear');
 
+// The reframe release is the try whose body contains releaseAllActiveReframeClaims.
+// Walk try blocks in shutdown by scanning stripped source.
+function tryBlockContaining(src, needle) {
+  const re = /try\s*\{/g;
+  let m;
+  while ((m = re.exec(src))) {
+    const open = m.index + m[0].length - 1;
+    const close = matchingBrace(src, open);
+    if (close < 0) continue;
+    const body = src.slice(open, close + 1);
+    if (body.includes(needle)) return { tryBody: body, after: src.slice(close + 1) };
+  }
+  return null;
+}
+const reframeTryHit = tryBlockContaining(shutdownCode, 'releaseAllActiveReframeClaims');
+const reframeCatch = reframeTryHit ? blockAt(reframeTryHit.after, /^\s*catch\s*\([^)]*\)\s*\{/) : '';
 check('B3 renderer.shutdown() wraps the call in try/catch',
-  /try\s*\{[\s\S]{0,300}?releaseAllActiveReframeClaims\(\)[\s\S]{0,300}?\}\s*catch\s*\([\s\S]{0,60}?\)\s*\{[\s\S]{0,300}?reframe-claim release-on-shutdown failed/.test(renderer),
+  !!(reframeTryHit && /reframe-claim release-on-shutdown failed/.test(reframeCatch)),
   'a shutdown must never crash on a stale claim');
 
 // ── C. behavioral proof against real code ─────────────────────────────────
@@ -104,16 +170,16 @@ check('B3 renderer.shutdown() wraps the call in try/catch',
 // each registered claim.
 const behavioral = (async () => {
   // Sandbox: replace the module-level Set + releaseReframeClaim with stubs.
-  const bodyMatch = svc.match(/async function releaseAllActiveReframeClaims\(\)\s*\{[\s\S]*?\n\}/);
-  if (!bodyMatch) { check('C0 releaseAllActiveReframeClaims parses', false); return; }
-  const body = bodyMatch[0];
+  const body = fnBody(svc, 'async function releaseAllActiveReframeClaims(');
+  if (!body) { check('C0 releaseAllActiveReframeClaims parses', false); return; }
+  check('C0 releaseAllActiveReframeClaims parses', true);
   const stubbedCalls = [];
   const stubReleaseReframeClaim = async (m, a, b) => { stubbedCalls.push({ m, a, b }); };
   const _activeReframeClaims = new Set([
     JSON.stringify({ m: 'media-1', a: '9_16', b: 'pid-1:xyz' }),
     JSON.stringify({ m: 'media-2', a: '1_1',  b: 'pid-1:abc' }),
   ]);
-  const inner = body.replace(/^async function releaseAllActiveReframeClaims\(\)\s*\{/, '').replace(/\}\s*$/, '');
+  const inner = body.slice(1, -1);
   // eslint-disable-next-line no-new-func
   const fn = new (Object.getPrototypeOf(async function () {}).constructor)(
     '_activeReframeClaims', 'releaseReframeClaim', inner

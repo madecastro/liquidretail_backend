@@ -57,11 +57,32 @@ check('A4 apiMsg filters empty strings before join',
 // ── B. moderationBlocked policy stays terminal ────────────────────────────
 const policyPath = path.join(REPO, 'src', 'services', 'atlasErrorPolicy.js');
 const policy = fs.readFileSync(policyPath, 'utf8');
+
+function matchingBrace(src, startIdx) {
+  if (src[startIdx] !== '{') return -1;
+  let depth = 0;
+  for (let i = startIdx; i < src.length; i++) {
+    if (src[i] === '{') depth++;
+    else if (src[i] === '}') { depth--; if (depth === 0) return i; }
+  }
+  return -1;
+}
+function stripJsComments(text) {
+  return String(text || '')
+    .replace(/\/\*[\s\S]*?\*\//g, ' ')
+    .replace(/(^|[^:])\/\/[^\n]*/g, '$1');
+}
+const mbDecl = /moderationBlocked:\s*\{/.exec(policy);
+const mbClose = mbDecl ? matchingBrace(policy, mbDecl.index + mbDecl[0].length - 1) : -1;
+const mbCode = (mbDecl && mbClose >= 0)
+  ? stripJsComments(policy.slice(mbDecl.index + mbDecl[0].length - 1, mbClose + 1))
+  : '';
+
 check('B1 moderationBlocked has action:give-up (no retries)',
-  /moderationBlocked:\s*\{[\s\S]{0,3500}?action:\s*['"]give-up['"]/.test(policy),
+  /(?:^|[,\n])\s*action:\s*['"]give-up['"]/.test(mbCode),
   'a retryable action would negate the fast-fail — the whole point is no retry');
 check('B2 moderationBlocked maxAttempts:1',
-  /moderationBlocked:\s*\{[\s\S]{0,3500}?maxAttempts:\s*1/.test(policy));
+  /(?:^|[,\n])\s*maxAttempts:\s*1\b/.test(mbCode));
 check('B3 moderationBlocked outranks predictionFailed in PRECEDENCE',
   () => {
     const arr = policy.match(/PRECEDENCE\s*=\s*Object\.freeze\(\[([\s\S]*?)\]\)/);

@@ -71,6 +71,39 @@ const ALERTS_SRC = path.join(ROOT, 'src/services/renderer.js');
 const atlasSrc  = fs.readFileSync(ATLAS_SRC, 'utf8');
 const alertsSrc = fs.readFileSync(ALERTS_SRC, 'utf8');   // renderer.js: adgen's shutdown host
 
+function matchingBrace(src, startIdx) {
+  if (src[startIdx] !== '{') return -1;
+  let depth = 0;
+  for (let i = startIdx; i < src.length; i++) {
+    if (src[i] === '{') depth++;
+    else if (src[i] === '}') { depth--; if (depth === 0) return i; }
+  }
+  return -1;
+}
+function fnBody(src, signature) {
+  const start = src.indexOf(signature);
+  if (start < 0) return '';
+  const open = src.indexOf('{', start);
+  if (open < 0) return '';
+  const close = matchingBrace(src, open);
+  if (close < 0) return '';
+  return src.slice(open, close + 1);
+}
+function stripJsComments(text) {
+  return String(text || '')
+    .replace(/\/\*[\s\S]*?\*\//g, ' ')
+    .replace(/(^|[^:])\/\/[^\n]*/g, '$1');
+}
+function blockAt(src, re) {
+  const m = re.exec(src);
+  if (!m) return '';
+  const open = m.index + m[0].length - 1;
+  if (src[open] !== '{') return '';
+  const close = matchingBrace(src, open);
+  if (close < 0) return '';
+  return src.slice(open, close + 1);
+}
+
 let failures = 0;
 let passes   = 0;
 
@@ -387,17 +420,33 @@ async function main() {
   await check('D3 releaseReframeClaim deregisters', () =>
     /_activeReframeClaims\.delete\(JSON\.stringify\(\{ m: String\(mediaId\), a: aspectKey, b: claimBy \}\)\)/.test(atlasSrc));
 
+  const sweepBody = stripJsComments(fnBody(atlasSrc, 'async function releaseAllActiveReframeClaims('));
   await check('D4 releaseAllActiveReframeClaims iterates the registry and releases', () =>
-    /async function releaseAllActiveReframeClaims\(\)\s*\{[\s\S]{0,800}?_activeReframeClaims[\s\S]{0,400}?releaseReframeClaim\(/.test(atlasSrc));
+    !!sweepBody && /_activeReframeClaims/.test(sweepBody) && /releaseReframeClaim\(/.test(sweepBody));
 
+  const sweepFinally = blockAt(sweepBody, /finally\s*\{/);
   await check('D5 the sweep drains the registry in a finally (one bad claim cannot wedge it)', () =>
-    /async function releaseAllActiveReframeClaims[\s\S]{0,1400}?try\s*\{[\s\S]{0,400}?releaseReframeClaim\([\s\S]{0,80}?\)[\s\S]{0,400}?\}\s*catch[\s\S]{0,200}?\}\s*finally\s*\{[\s\S]{0,300}?_activeReframeClaims\.delete/.test(atlasSrc));
+    /try\s*\{/.test(sweepBody) && /_activeReframeClaims\.delete/.test(sweepFinally));
 
+  const shutdownCode = stripJsComments(fnBody(alertsSrc, 'async function shutdown('));
   await check('D6 renderer.shutdown() awaits the sweep', () =>
-    /async function shutdown\(\)[\s\S]{0,12000}?await\s+atlasVideo\.releaseAllActiveReframeClaims\(\)/.test(alertsSrc));
+    /await\s+atlasVideo\.releaseAllActiveReframeClaims\(\)/.test(shutdownCode));
 
-  await check('D7 the shutdown call cannot throw out of shutdown()', () =>
-    /try\s*\{[\s\S]{0,400}?releaseAllActiveReframeClaims\(\)[\s\S]{0,400}?\}\s*catch[\s\S]{0,300}?reframe-claim release-on-shutdown failed/.test(alertsSrc));
+  await check('D7 the shutdown call cannot throw out of shutdown()', () => {
+    const re = /try\s*\{/g;
+    let m;
+    while ((m = re.exec(shutdownCode))) {
+      const open = m.index + m[0].length - 1;
+      const close = matchingBrace(shutdownCode, open);
+      if (close < 0) continue;
+      const tryBody = shutdownCode.slice(open, close + 1);
+      if (!tryBody.includes('releaseAllActiveReframeClaims')) continue;
+      const after = shutdownCode.slice(close + 1);
+      const catchBody = blockAt(after, /^\s*catch\s*\([^)]*\)\s*\{/);
+      return /reframe-claim release-on-shutdown failed/.test(catchBody);
+    }
+    return false;
+  });
 
   if (DEPS_OK) await check('D9 the registry no-ops cleanly when empty (BEHAVIOURAL)', async () => {
     const cleared = await svc.releaseAllActiveReframeClaims();

@@ -26,14 +26,37 @@ function check(name, cond, detail) {
 
 const defaultsEnv = fs.readFileSync(DEFAULTS_ENV, 'utf8');
 
+// Comments that document THIS key live in the blank/comment run immediately
+// above `GEMINI_VIDEO_API_KEY=` and end at the next `KEY=` assignment.
+// Scanning the whole file lets "quota isolation" satisfy A3 from the
+// TITLE_FACE_KEEPOUT section (mutation-tested).
+function envKeyBlock(text, key) {
+  const lines = String(text || '').split('\n');
+  const idx = lines.findIndex((l) => l === `${key}=` || l.startsWith(`${key}=`));
+  if (idx < 0) return '';
+  let start = idx;
+  while (start > 0) {
+    const prev = lines[start - 1];
+    if (/^[A-Z][A-Z0-9_]*=/.test(prev)) break;
+    start -= 1;
+  }
+  let end = idx + 1;
+  while (end < lines.length) {
+    if (/^[A-Z][A-Z0-9_]*=/.test(lines[end])) break;
+    end += 1;
+  }
+  return lines.slice(start, end).join('\n');
+}
+const geminiVideoKeyBlock = envKeyBlock(defaultsEnv, 'GEMINI_VIDEO_API_KEY');
+
 check('A1: config/defaults.env declares GEMINI_VIDEO_API_KEY= (empty)',
   /^GEMINI_VIDEO_API_KEY=$/m.test(defaultsEnv));
 check('A2: comment states fallback to GEMINI_API_KEY',
-  /GEMINI_VIDEO_API_KEY[\s\S]{0,1200}falls?\s+back to GEMINI_API_KEY/.test(defaultsEnv));
+  /falls?\s+back to GEMINI_API_KEY/.test(geminiVideoKeyBlock));
 check('A3: comment states quota isolation from grounded-search traffic',
-  /quota isolation/i.test(defaultsEnv) && /grounded-search/i.test(defaultsEnv));
+  /quota isolation/i.test(geminiVideoKeyBlock) && /grounded-search/i.test(geminiVideoKeyBlock));
 check('A4: comment states the secret lives in the Render dashboard, never this file',
-  /Render dashboard/i.test(defaultsEnv) && /never in this file/i.test(defaultsEnv));
+  /Render dashboard/i.test(geminiVideoKeyBlock) && /never in this file/i.test(geminiVideoKeyBlock));
 check('A5: GEMINI_VIDEO_API_KEY is not given a committed secret value',
   !/^GEMINI_VIDEO_API_KEY=./m.test(defaultsEnv));
 
