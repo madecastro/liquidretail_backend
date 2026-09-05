@@ -1,0 +1,492 @@
+{
+  "captured": "pre-port-2026-09-04",
+  "note": "SHA-256 of staticAdIntents.buildPrompt().prompt for every (dataShape, static surface, intent) cell, captured BEFORE the segment-override consumer was ported. Empty-table post-port output (flag on or off) must match byte-for-byte.",
+  "product": {
+    "title": "Cruiser Tee",
+    "desc": "a mens cruiser tee",
+    "logoCorner": "bottom-right",
+    "look": "sun-bleached coastal"
+  },
+  "fixtures": {
+    "quoteOnly": {
+      "quote": "Held up through three washes with zero fading.",
+      "attribution": "Dana R.",
+      "badge": "Best Seller",
+      "headline": "Built to last",
+      "subhead": "Everyday cotton",
+      "cta": "Shop the Tee"
+    },
+    "ratingQuote": {
+      "quote": "Held up through three washes with zero fading.",
+      "attribution": "Dana R.",
+      "badge": "Best Seller",
+      "rating": "4.8",
+      "reviewCount": 523,
+      "headline": "Built to last",
+      "subhead": "Everyday cotton",
+      "cta": "Shop the Tee"
+    },
+    "ratingOnly": {
+      "rating": "4.8",
+      "reviewCount": 523,
+      "badge": "Best Seller",
+      "headline": "Built to last",
+      "subhead": "Everyday cotton",
+      "cta": "Shop the Tee"
+    },
+    "bare": {
+      "headline": "Built to last",
+      "cta": "Shop the Tee"
+    }
+  },
+  "cells": {
+    "quoteOnly|meta_feed_1_1|social_proof_led": {
+      "sha": "a9d40451bdd185d48c01367008c565401d39e6ce3d60d93ad3f4ad050550717c",
+      "resolved": "social_proof_led"
+    },
+    "quoteOnly|meta_feed_1_1|product_first_lifestyle": {
+      "sha": "b8bac50a3696f78f921b14ddbc5298db672019eb0754f02fe4c939c4d45779f9",
+      "resolved": "product_first_lifestyle"
+    },
+    "quoteOnly|meta_feed_1_1|objection_resolved": {
+      "sha": "e9999e88e4862ef9cc5d90e9a98302c3d9172b27133046db7d4e9fa5f558f4ca",
+      "resolved": "objection_resolved"
+    },
+    "quoteOnly|meta_feed_1_1|brand_led": {
+      "sha": "fd6fc6dc15d5f4ca8e6354cea47a80e80f8770e630500aecdacb8ab7e927bbbf",
+      "resolved": "brand_led"
+    },
+    "quoteOnly|meta_feed_4_5|social_proof_led": {
+      "sha": "2b8d4a5d87185b8d8aa06305cc4f25d7249ef99e8511e13440ce1eef6e0bca45",
+      "resolved": "social_proof_led"
+    },
+    "quoteOnly|meta_feed_4_5|product_first_lifestyle": {
+      "sha": "9f4d66a40d7a6053e3a26d522f3577728412f6c11c2cb40fc2793276d144565d",
+      "resolved": "product_first_lifestyle"
+    },
+    "quoteOnly|meta_feed_4_5|objection_resolved": {
+      "sha": "61974e47e7db602c2b60f7ab021a88176ecad16995cb9cb703fb6fbf74f48a2a",
+      "resolved": "objection_resolved"
+    },
+    "quoteOnly|meta_feed_4_5|brand_led": {
+      "sha": "0e52d79380f9414611c183b843afa02ede23738fe2cea87a3061c1bbc9a39064",
+      "resolved": "brand_led"
+    },
+    "quoteOnly|meta_stories_9_16|social_proof_led": {
+      "sha": "4e89a83b245896454f355bae7a92bfcabfd2c44418bbdcffcef6b61f5631957c",
+      "resolved": "social_proof_led"
+    },
+    "quoteOnly|meta_stories_9_16|product_first_lifestyle": {
+      "sha": "4687b32b63e192bbdc4c595f65bb82f09437e1dba54248bd434bfde6e6c3eff0",
+      "resolved": "product_first_lifestyle"
+    },
+    "quoteOnly|meta_stories_9_16|objection_resolved": {
+      "sha": "f163878d39eb853488c07ef0d5f652b624d6e63805ee4cf24eece9d39fc462c1",
+      "resolved": "objection_resolved"
+    },
+    "quoteOnly|meta_stories_9_16|brand_led": {
+      "sha": "77c5fd900abe6a019f9cd19a01c81dbef2c2137f804356c783499a0a76c43c84",
+      "resolved": "brand_led"
+    },
+    "quoteOnly|pmax_16_9|social_proof_led": {
+      "sha": "2643c2d7c42fe8b1c85109151af829b50583ffde589e98747a90f757ed1d83d3",
+      "resolved": "social_proof_led"
+    },
+    "quoteOnly|pmax_16_9|product_first_lifestyle": {
+      "sha": "07d7b95107375349b2e78c6f0f269e02142d1600b0bce93336935c95ef6b1410",
+      "resolved": "product_first_lifestyle"
+    },
+    "quoteOnly|pmax_16_9|objection_resolved": {
+      "sha": "5258e43f616e12e3df88d8deb3a7a32d4d3650b72ea2b3be4e2e64732ed5418e",
+      "resolved": "objection_resolved"
+    },
+    "quoteOnly|pmax_16_9|brand_led": {
+      "sha": "9e3a279f2d60c06d0d5e13c11db3cf14e6838a7174333a50c4490ec2017eb7c6",
+      "resolved": "brand_led"
+    },
+    "quoteOnly|pmax_landscape_1_91_1|social_proof_led": {
+      "sha": "570ab4531bf97338088c33ea71e239dd4d77cdb02f9514faf3335cb3623f7556",
+      "resolved": "social_proof_led"
+    },
+    "quoteOnly|pmax_landscape_1_91_1|product_first_lifestyle": {
+      "sha": "bc1a5b653bea7030aece6caeab89b0dd59236c3113e1b46a70f298138b096b2f",
+      "resolved": "product_first_lifestyle"
+    },
+    "quoteOnly|pmax_landscape_1_91_1|objection_resolved": {
+      "sha": "6c95385290ac30e164b07a195a20259f20c2d9b52f21e9fd7c2d2df5f929ead5",
+      "resolved": "objection_resolved"
+    },
+    "quoteOnly|pmax_landscape_1_91_1|brand_led": {
+      "sha": "1df70d199fc0e0f54b230a51893f321586a75193890ddc8c6f70dcf3db1158ad",
+      "resolved": "brand_led"
+    },
+    "quoteOnly|pmax_square_1_1|social_proof_led": {
+      "sha": "daf12d85e58a53566b97e9e685c2fbd72c1c38c58083598343002ca1ad1566f5",
+      "resolved": "social_proof_led"
+    },
+    "quoteOnly|pmax_square_1_1|product_first_lifestyle": {
+      "sha": "16fccba2f1c4e942a98c901ca466cb7ad67f97c391e03f29cb9dd9cb88622519",
+      "resolved": "product_first_lifestyle"
+    },
+    "quoteOnly|pmax_square_1_1|objection_resolved": {
+      "sha": "00c59dd34394c88b7c442bc33711af926437a7016c0b5aca7c1551380176a550",
+      "resolved": "objection_resolved"
+    },
+    "quoteOnly|pmax_square_1_1|brand_led": {
+      "sha": "f9fdfe19c26c9c0ec6d09159f732b230b1ba8a215574441761ebc6788ddd0c9e",
+      "resolved": "brand_led"
+    },
+    "quoteOnly|pmax_portrait_4_5|social_proof_led": {
+      "sha": "2bd9448855354fa570cb9d2b6a4ab618f2babd831e9db623aee454247cce225f",
+      "resolved": "social_proof_led"
+    },
+    "quoteOnly|pmax_portrait_4_5|product_first_lifestyle": {
+      "sha": "49015617187b1072c7058d409b821d42a353e387729146db5c0b0bb6e0054326",
+      "resolved": "product_first_lifestyle"
+    },
+    "quoteOnly|pmax_portrait_4_5|objection_resolved": {
+      "sha": "3ec4ce551f5065aaf4f7a77bf97ba8c53ce5db42884ccd77135c80a8becc45fb",
+      "resolved": "objection_resolved"
+    },
+    "quoteOnly|pmax_portrait_4_5|brand_led": {
+      "sha": "c93e01cbd75dbaf05a60dd2e381246677b3c7ac4149027aaed8a8661efa192f1",
+      "resolved": "brand_led"
+    },
+    "ratingQuote|meta_feed_1_1|social_proof_led": {
+      "sha": "8c6141312fb0b9fdc8e2806eb29a6842cc88ec8aeb00650bed73c48c9edf7ff0",
+      "resolved": "social_proof_led"
+    },
+    "ratingQuote|meta_feed_1_1|product_first_lifestyle": {
+      "sha": "ab2fc273b0450b859dd604c799a516aa1afb213fd487e46a4a51678bfa5cc102",
+      "resolved": "product_first_lifestyle"
+    },
+    "ratingQuote|meta_feed_1_1|objection_resolved": {
+      "sha": "e9999e88e4862ef9cc5d90e9a98302c3d9172b27133046db7d4e9fa5f558f4ca",
+      "resolved": "objection_resolved"
+    },
+    "ratingQuote|meta_feed_1_1|brand_led": {
+      "sha": "890f95083926d0289268afdcfc7e9fd4e7047db2758a7f9bff3a0c846677c272",
+      "resolved": "brand_led"
+    },
+    "ratingQuote|meta_feed_4_5|social_proof_led": {
+      "sha": "a343e284f3fce8920a12cd00f5cc3e9700c6e349755dbd7f887bd631543c84ea",
+      "resolved": "social_proof_led"
+    },
+    "ratingQuote|meta_feed_4_5|product_first_lifestyle": {
+      "sha": "e17bcfd338459a92c2086f38165702067a65abf39689b503d0d43a75a1c9b550",
+      "resolved": "product_first_lifestyle"
+    },
+    "ratingQuote|meta_feed_4_5|objection_resolved": {
+      "sha": "61974e47e7db602c2b60f7ab021a88176ecad16995cb9cb703fb6fbf74f48a2a",
+      "resolved": "objection_resolved"
+    },
+    "ratingQuote|meta_feed_4_5|brand_led": {
+      "sha": "269d5a2daae4004519aca13def5b66d0787ebd9923208b1de911bb666a470448",
+      "resolved": "brand_led"
+    },
+    "ratingQuote|meta_stories_9_16|social_proof_led": {
+      "sha": "902f6b508cc847b98021d7ab0d5a416ff8a959a1ee66c322ef17b0d9982fc6e6",
+      "resolved": "social_proof_led"
+    },
+    "ratingQuote|meta_stories_9_16|product_first_lifestyle": {
+      "sha": "39247675ac6857ad39beeafc72b5f86390bf5279cb39c1f68f795002186c6c5c",
+      "resolved": "product_first_lifestyle"
+    },
+    "ratingQuote|meta_stories_9_16|objection_resolved": {
+      "sha": "f163878d39eb853488c07ef0d5f652b624d6e63805ee4cf24eece9d39fc462c1",
+      "resolved": "objection_resolved"
+    },
+    "ratingQuote|meta_stories_9_16|brand_led": {
+      "sha": "af5d526da4648357186040042062a9842361ed2469a814d862c20fba84b82f94",
+      "resolved": "brand_led"
+    },
+    "ratingQuote|pmax_16_9|social_proof_led": {
+      "sha": "bf4b23a5bd34db6585257de3d3c34c20f5e1247a5c3f1fc2bdfbfd54be259963",
+      "resolved": "social_proof_led"
+    },
+    "ratingQuote|pmax_16_9|product_first_lifestyle": {
+      "sha": "b0cc37230c5522d3f00fa45c39a889a784407aa6417b3a431d2cfc0a8afa63f4",
+      "resolved": "product_first_lifestyle"
+    },
+    "ratingQuote|pmax_16_9|objection_resolved": {
+      "sha": "5258e43f616e12e3df88d8deb3a7a32d4d3650b72ea2b3be4e2e64732ed5418e",
+      "resolved": "objection_resolved"
+    },
+    "ratingQuote|pmax_16_9|brand_led": {
+      "sha": "ee8084b42f5d0b51c4b4ba125afeda060c9c945987985c8be38789ea36a4052e",
+      "resolved": "brand_led"
+    },
+    "ratingQuote|pmax_landscape_1_91_1|social_proof_led": {
+      "sha": "526067244e1637c50260b6063f1c266e692aae4da9d03d04205e8a7affbdf7b4",
+      "resolved": "social_proof_led"
+    },
+    "ratingQuote|pmax_landscape_1_91_1|product_first_lifestyle": {
+      "sha": "d029f4569e53c6ef6e0e98b2c6e9828b4d892d0182caeb29748bc4d7fde8ccf5",
+      "resolved": "product_first_lifestyle"
+    },
+    "ratingQuote|pmax_landscape_1_91_1|objection_resolved": {
+      "sha": "6c95385290ac30e164b07a195a20259f20c2d9b52f21e9fd7c2d2df5f929ead5",
+      "resolved": "objection_resolved"
+    },
+    "ratingQuote|pmax_landscape_1_91_1|brand_led": {
+      "sha": "5702d46553edc748e20e2aa8b7e5b2db8c4f57750d4c3cf4341b50ee27c28f09",
+      "resolved": "brand_led"
+    },
+    "ratingQuote|pmax_square_1_1|social_proof_led": {
+      "sha": "e9ae1c692ed1916f218c00830815f3b7fc19f1723207324440af19d9155d1620",
+      "resolved": "social_proof_led"
+    },
+    "ratingQuote|pmax_square_1_1|product_first_lifestyle": {
+      "sha": "750ef0bc598cbbaa5d7f0bbdaadd69b5c36cfdde66eba7e65b1a13e7e486310a",
+      "resolved": "product_first_lifestyle"
+    },
+    "ratingQuote|pmax_square_1_1|objection_resolved": {
+      "sha": "00c59dd34394c88b7c442bc33711af926437a7016c0b5aca7c1551380176a550",
+      "resolved": "objection_resolved"
+    },
+    "ratingQuote|pmax_square_1_1|brand_led": {
+      "sha": "453e8ab9b1a8ec83a6af5597065cf7de0a3786d60b45122c8f36efa397fefba9",
+      "resolved": "brand_led"
+    },
+    "ratingQuote|pmax_portrait_4_5|social_proof_led": {
+      "sha": "759d54aaacfffea688ab1d79ff5c72cf2187703a9d30f816ac5f76af7f32283b",
+      "resolved": "social_proof_led"
+    },
+    "ratingQuote|pmax_portrait_4_5|product_first_lifestyle": {
+      "sha": "851aabde8f791495c81d34096f01188687b0571c4a3d649b0d95526e10456950",
+      "resolved": "product_first_lifestyle"
+    },
+    "ratingQuote|pmax_portrait_4_5|objection_resolved": {
+      "sha": "3ec4ce551f5065aaf4f7a77bf97ba8c53ce5db42884ccd77135c80a8becc45fb",
+      "resolved": "objection_resolved"
+    },
+    "ratingQuote|pmax_portrait_4_5|brand_led": {
+      "sha": "1db37c2e83edbd43f012d7afe70e317582ecd8d83c74212571e12460ba060587",
+      "resolved": "brand_led"
+    },
+    "ratingOnly|meta_feed_1_1|social_proof_led": {
+      "sha": "932ba6ca87e8cc86c64ca5a5db6f50674932710348a4251478406f62e10451fb",
+      "resolved": "social_proof_led"
+    },
+    "ratingOnly|meta_feed_1_1|product_first_lifestyle": {
+      "sha": "ab2fc273b0450b859dd604c799a516aa1afb213fd487e46a4a51678bfa5cc102",
+      "resolved": "product_first_lifestyle"
+    },
+    "ratingOnly|meta_feed_1_1|objection_resolved": {
+      "sha": "932ba6ca87e8cc86c64ca5a5db6f50674932710348a4251478406f62e10451fb",
+      "resolved": "social_proof_led"
+    },
+    "ratingOnly|meta_feed_1_1|brand_led": {
+      "sha": "890f95083926d0289268afdcfc7e9fd4e7047db2758a7f9bff3a0c846677c272",
+      "resolved": "brand_led"
+    },
+    "ratingOnly|meta_feed_4_5|social_proof_led": {
+      "sha": "44d8805fb4e1a2d0ba477d95577e6d3a19e23289a1d54b48f534c9235923ed9f",
+      "resolved": "social_proof_led"
+    },
+    "ratingOnly|meta_feed_4_5|product_first_lifestyle": {
+      "sha": "e17bcfd338459a92c2086f38165702067a65abf39689b503d0d43a75a1c9b550",
+      "resolved": "product_first_lifestyle"
+    },
+    "ratingOnly|meta_feed_4_5|objection_resolved": {
+      "sha": "44d8805fb4e1a2d0ba477d95577e6d3a19e23289a1d54b48f534c9235923ed9f",
+      "resolved": "social_proof_led"
+    },
+    "ratingOnly|meta_feed_4_5|brand_led": {
+      "sha": "269d5a2daae4004519aca13def5b66d0787ebd9923208b1de911bb666a470448",
+      "resolved": "brand_led"
+    },
+    "ratingOnly|meta_stories_9_16|social_proof_led": {
+      "sha": "90b1af86cf0704ede13fe9b6d7972c4aecd5e878c229de7c8e388e9e375b5f87",
+      "resolved": "social_proof_led"
+    },
+    "ratingOnly|meta_stories_9_16|product_first_lifestyle": {
+      "sha": "39247675ac6857ad39beeafc72b5f86390bf5279cb39c1f68f795002186c6c5c",
+      "resolved": "product_first_lifestyle"
+    },
+    "ratingOnly|meta_stories_9_16|objection_resolved": {
+      "sha": "90b1af86cf0704ede13fe9b6d7972c4aecd5e878c229de7c8e388e9e375b5f87",
+      "resolved": "social_proof_led"
+    },
+    "ratingOnly|meta_stories_9_16|brand_led": {
+      "sha": "af5d526da4648357186040042062a9842361ed2469a814d862c20fba84b82f94",
+      "resolved": "brand_led"
+    },
+    "ratingOnly|pmax_16_9|social_proof_led": {
+      "sha": "267fd1a98e37ecfb602463137583d9add263a79631dea3ab71409a4bef23651a",
+      "resolved": "social_proof_led"
+    },
+    "ratingOnly|pmax_16_9|product_first_lifestyle": {
+      "sha": "b0cc37230c5522d3f00fa45c39a889a784407aa6417b3a431d2cfc0a8afa63f4",
+      "resolved": "product_first_lifestyle"
+    },
+    "ratingOnly|pmax_16_9|objection_resolved": {
+      "sha": "267fd1a98e37ecfb602463137583d9add263a79631dea3ab71409a4bef23651a",
+      "resolved": "social_proof_led"
+    },
+    "ratingOnly|pmax_16_9|brand_led": {
+      "sha": "ee8084b42f5d0b51c4b4ba125afeda060c9c945987985c8be38789ea36a4052e",
+      "resolved": "brand_led"
+    },
+    "ratingOnly|pmax_landscape_1_91_1|social_proof_led": {
+      "sha": "79bb6cd9a0ed938f07b7fc375b0ebab5a75a7b36e83529ce30836fcb68ad3261",
+      "resolved": "social_proof_led"
+    },
+    "ratingOnly|pmax_landscape_1_91_1|product_first_lifestyle": {
+      "sha": "d029f4569e53c6ef6e0e98b2c6e9828b4d892d0182caeb29748bc4d7fde8ccf5",
+      "resolved": "product_first_lifestyle"
+    },
+    "ratingOnly|pmax_landscape_1_91_1|objection_resolved": {
+      "sha": "79bb6cd9a0ed938f07b7fc375b0ebab5a75a7b36e83529ce30836fcb68ad3261",
+      "resolved": "social_proof_led"
+    },
+    "ratingOnly|pmax_landscape_1_91_1|brand_led": {
+      "sha": "5702d46553edc748e20e2aa8b7e5b2db8c4f57750d4c3cf4341b50ee27c28f09",
+      "resolved": "brand_led"
+    },
+    "ratingOnly|pmax_square_1_1|social_proof_led": {
+      "sha": "2985ef7f4c1ea9f12558bdfd06a2accf450ad43fb44a30a8d259de710c7ad145",
+      "resolved": "social_proof_led"
+    },
+    "ratingOnly|pmax_square_1_1|product_first_lifestyle": {
+      "sha": "750ef0bc598cbbaa5d7f0bbdaadd69b5c36cfdde66eba7e65b1a13e7e486310a",
+      "resolved": "product_first_lifestyle"
+    },
+    "ratingOnly|pmax_square_1_1|objection_resolved": {
+      "sha": "2985ef7f4c1ea9f12558bdfd06a2accf450ad43fb44a30a8d259de710c7ad145",
+      "resolved": "social_proof_led"
+    },
+    "ratingOnly|pmax_square_1_1|brand_led": {
+      "sha": "453e8ab9b1a8ec83a6af5597065cf7de0a3786d60b45122c8f36efa397fefba9",
+      "resolved": "brand_led"
+    },
+    "ratingOnly|pmax_portrait_4_5|social_proof_led": {
+      "sha": "684bd4b6a958a05005c85f4d94ad016dbbcf29283859dda6eebef00a0582eb0d",
+      "resolved": "social_proof_led"
+    },
+    "ratingOnly|pmax_portrait_4_5|product_first_lifestyle": {
+      "sha": "851aabde8f791495c81d34096f01188687b0571c4a3d649b0d95526e10456950",
+      "resolved": "product_first_lifestyle"
+    },
+    "ratingOnly|pmax_portrait_4_5|objection_resolved": {
+      "sha": "684bd4b6a958a05005c85f4d94ad016dbbcf29283859dda6eebef00a0582eb0d",
+      "resolved": "social_proof_led"
+    },
+    "ratingOnly|pmax_portrait_4_5|brand_led": {
+      "sha": "1db37c2e83edbd43f012d7afe70e317582ecd8d83c74212571e12460ba060587",
+      "resolved": "brand_led"
+    },
+    "bare|meta_feed_1_1|social_proof_led": {
+      "sha": "b8bac50a3696f78f921b14ddbc5298db672019eb0754f02fe4c939c4d45779f9",
+      "resolved": "product_first_lifestyle"
+    },
+    "bare|meta_feed_1_1|product_first_lifestyle": {
+      "sha": "b8bac50a3696f78f921b14ddbc5298db672019eb0754f02fe4c939c4d45779f9",
+      "resolved": "product_first_lifestyle"
+    },
+    "bare|meta_feed_1_1|objection_resolved": {
+      "sha": "b8bac50a3696f78f921b14ddbc5298db672019eb0754f02fe4c939c4d45779f9",
+      "resolved": "product_first_lifestyle"
+    },
+    "bare|meta_feed_1_1|brand_led": {
+      "sha": "15f71e2015bcb5e15326e025e1ca2b570e94d28327cdb44fd33a77baed89b6b0",
+      "resolved": "brand_led"
+    },
+    "bare|meta_feed_4_5|social_proof_led": {
+      "sha": "9f4d66a40d7a6053e3a26d522f3577728412f6c11c2cb40fc2793276d144565d",
+      "resolved": "product_first_lifestyle"
+    },
+    "bare|meta_feed_4_5|product_first_lifestyle": {
+      "sha": "9f4d66a40d7a6053e3a26d522f3577728412f6c11c2cb40fc2793276d144565d",
+      "resolved": "product_first_lifestyle"
+    },
+    "bare|meta_feed_4_5|objection_resolved": {
+      "sha": "9f4d66a40d7a6053e3a26d522f3577728412f6c11c2cb40fc2793276d144565d",
+      "resolved": "product_first_lifestyle"
+    },
+    "bare|meta_feed_4_5|brand_led": {
+      "sha": "54dda91b892189c3abccc09ee470ba54144de76d8ae9a3fe7f8a5824872409a9",
+      "resolved": "brand_led"
+    },
+    "bare|meta_stories_9_16|social_proof_led": {
+      "sha": "4687b32b63e192bbdc4c595f65bb82f09437e1dba54248bd434bfde6e6c3eff0",
+      "resolved": "product_first_lifestyle"
+    },
+    "bare|meta_stories_9_16|product_first_lifestyle": {
+      "sha": "4687b32b63e192bbdc4c595f65bb82f09437e1dba54248bd434bfde6e6c3eff0",
+      "resolved": "product_first_lifestyle"
+    },
+    "bare|meta_stories_9_16|objection_resolved": {
+      "sha": "4687b32b63e192bbdc4c595f65bb82f09437e1dba54248bd434bfde6e6c3eff0",
+      "resolved": "product_first_lifestyle"
+    },
+    "bare|meta_stories_9_16|brand_led": {
+      "sha": "af51e3e29d111941490324d4ec02d6dc87d3c8ef62d92af211100af43b7ee50e",
+      "resolved": "brand_led"
+    },
+    "bare|pmax_16_9|social_proof_led": {
+      "sha": "07d7b95107375349b2e78c6f0f269e02142d1600b0bce93336935c95ef6b1410",
+      "resolved": "product_first_lifestyle"
+    },
+    "bare|pmax_16_9|product_first_lifestyle": {
+      "sha": "07d7b95107375349b2e78c6f0f269e02142d1600b0bce93336935c95ef6b1410",
+      "resolved": "product_first_lifestyle"
+    },
+    "bare|pmax_16_9|objection_resolved": {
+      "sha": "07d7b95107375349b2e78c6f0f269e02142d1600b0bce93336935c95ef6b1410",
+      "resolved": "product_first_lifestyle"
+    },
+    "bare|pmax_16_9|brand_led": {
+      "sha": "7ae2f431a10d1db46e759c5cbe80ad6997890bae18802057bb98688feda3d974",
+      "resolved": "brand_led"
+    },
+    "bare|pmax_landscape_1_91_1|social_proof_led": {
+      "sha": "bc1a5b653bea7030aece6caeab89b0dd59236c3113e1b46a70f298138b096b2f",
+      "resolved": "product_first_lifestyle"
+    },
+    "bare|pmax_landscape_1_91_1|product_first_lifestyle": {
+      "sha": "bc1a5b653bea7030aece6caeab89b0dd59236c3113e1b46a70f298138b096b2f",
+      "resolved": "product_first_lifestyle"
+    },
+    "bare|pmax_landscape_1_91_1|objection_resolved": {
+      "sha": "bc1a5b653bea7030aece6caeab89b0dd59236c3113e1b46a70f298138b096b2f",
+      "resolved": "product_first_lifestyle"
+    },
+    "bare|pmax_landscape_1_91_1|brand_led": {
+      "sha": "f83ec69feb3d1385ba593f21b1922b5fa2a7084ee67fa16f2e2535f242efe087",
+      "resolved": "brand_led"
+    },
+    "bare|pmax_square_1_1|social_proof_led": {
+      "sha": "16fccba2f1c4e942a98c901ca466cb7ad67f97c391e03f29cb9dd9cb88622519",
+      "resolved": "product_first_lifestyle"
+    },
+    "bare|pmax_square_1_1|product_first_lifestyle": {
+      "sha": "16fccba2f1c4e942a98c901ca466cb7ad67f97c391e03f29cb9dd9cb88622519",
+      "resolved": "product_first_lifestyle"
+    },
+    "bare|pmax_square_1_1|objection_resolved": {
+      "sha": "16fccba2f1c4e942a98c901ca466cb7ad67f97c391e03f29cb9dd9cb88622519",
+      "resolved": "product_first_lifestyle"
+    },
+    "bare|pmax_square_1_1|brand_led": {
+      "sha": "a17a58d406a1ea7b90e96cde37ef261efbfe0bc40dda4292e9de5498040ffa21",
+      "resolved": "brand_led"
+    },
+    "bare|pmax_portrait_4_5|social_proof_led": {
+      "sha": "49015617187b1072c7058d409b821d42a353e387729146db5c0b0bb6e0054326",
+      "resolved": "product_first_lifestyle"
+    },
+    "bare|pmax_portrait_4_5|product_first_lifestyle": {
+      "sha": "49015617187b1072c7058d409b821d42a353e387729146db5c0b0bb6e0054326",
+      "resolved": "product_first_lifestyle"
+    },
+    "bare|pmax_portrait_4_5|objection_resolved": {
+      "sha": "49015617187b1072c7058d409b821d42a353e387729146db5c0b0bb6e0054326",
+      "resolved": "product_first_lifestyle"
+    },
+    "bare|pmax_portrait_4_5|brand_led": {
+      "sha": "5a6bd5d8ac0e81a851d98de2094e59e14fcf84d5adefd52fe73c2c69c301ad4c",
+      "resolved": "brand_led"
+    }
+  }
+}

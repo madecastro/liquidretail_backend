@@ -29,8 +29,18 @@
  * (flag on vs off) and asserts the intent key flips and quantifies exactly
  * what differs (slots rendered, emphasis order, goal text, absences).
  *
+ * CHANGE 3 — segment prompt-override CONSUMER (port of backend's
+ * loadSegmentOverrides / applySegmentOverrides / buildPrompt({segment})).
+ * Empty table (the committed default) is a byte-identical no-op vs the
+ * pre-port SHA matrix in scripts/fixtures/staticIntentPromptBaseline.json,
+ * with the flag both ON (default) and OFF. A synthetic matching row is a
+ * positive proof the consumer actually appends ADDITIONAL DIRECTIVES and
+ * stamps appliedOverrides. Pinned in section G.
+ *
  * Calls the REAL exported functions (intentForTemplate, resolveIntent,
- * buildPrompt, applyDensity) — no source-text scan of either change.
+ * buildPrompt, applyDensity) — no source-text scan of either change
+ * (section G's require-path / renderer-stamp pins are the exception:
+ * those are wiring, not behaviour).
  *
  * Offline: no DB, no network, no API key.
  *   node scripts/verifyStaticIntentChanges.js
@@ -38,6 +48,16 @@
 
 const fs = require('fs');
 const path = require('path');
+
+// Bare worktree affordance — same shared loader verifyModelParity.js /
+// verifyRetitleConsumerClaim.js use. Must run BEFORE requiring
+// src/services/directImageRenderService (it pulls CostLog → mongoose).
+const { resolveBackendRoot } = require('./lib/siblingBackend');
+const { loadMongooseWithFallback } = require('./lib/mongooseLoader');
+loadMongooseWithFallback({
+  harnessName: 'verifyStaticIntentChanges',
+  backendRoot: resolveBackendRoot(path.join(__dirname, '..')),
+});
 
 let pass = 0;
 const failures = [];
@@ -49,10 +69,13 @@ function check(name, cond, detail) {
 const DEFAULTS_ENV = path.join(__dirname, '..', 'config/defaults.env');
 
 const ORIGINAL_QUOTE_ELIGIBLE = process.env.STATIC_SOCIAL_PROOF_QUOTE_ELIGIBLE;
+const ORIGINAL_SEGMENT_OVERRIDES = process.env.STATIC_SEGMENT_PROMPT_OVERRIDES;
 
 function restoreEnv() {
   if (ORIGINAL_QUOTE_ELIGIBLE === undefined) delete process.env.STATIC_SOCIAL_PROOF_QUOTE_ELIGIBLE;
   else process.env.STATIC_SOCIAL_PROOF_QUOTE_ELIGIBLE = ORIGINAL_QUOTE_ELIGIBLE;
+  if (ORIGINAL_SEGMENT_OVERRIDES === undefined) delete process.env.STATIC_SEGMENT_PROMPT_OVERRIDES;
+  else process.env.STATIC_SEGMENT_PROMPT_OVERRIDES = ORIGINAL_SEGMENT_OVERRIDES;
   try {
     delete require.cache[require.resolve('../src/services/staticAdIntents')];
     delete require.cache[require.resolve('../src/services/directImageRenderService')];
@@ -282,6 +305,236 @@ try {
     check('F2 comment documents the FALLBACK_ORDER re-routing consequence',
       flagIdx >= 0 && commentWindow.includes('FALLBACK_ORDER'),
       `flagIdx=${flagIdx}`);
+  }
+
+  // ── G. Segment prompt-override consumer ────────────────────────────────
+  console.log('G. segment prompt-override consumer: empty-table byte-identity + positive row');
+  {
+    const crypto = require('crypto');
+    const BASELINE_PATH = path.join(__dirname, 'fixtures/staticIntentPromptBaseline.json');
+    const baseline = JSON.parse(fs.readFileSync(BASELINE_PATH, 'utf8'));
+    const { product: PRODUCT_G, fixtures: FIXTURES_G, cells: CELLS_G } = baseline;
+
+    function shaOf(prompt) {
+      return crypto.createHash('sha256').update(String(prompt || '')).digest('hex');
+    }
+    function matrixKey(dk, surface, intentKey) {
+      return `${dk}|${surface}|${intentKey}`;
+    }
+    function collectMatrix(mod, extra = {}) {
+      const out = {};
+      for (const [dk, data] of Object.entries(FIXTURES_G)) {
+        for (const surface of Object.keys(mod.SURFACE_POLICY).filter((k) => mod.SURFACE_POLICY[k].static)) {
+          for (const intentKey of Object.keys(mod.INTENTS)) {
+            const r = mod.buildPrompt({ intentKey, data, product: PRODUCT_G, surface, ...extra });
+            const key = matrixKey(dk, surface, intentKey);
+            if (r.error || r.skipped) {
+              out[key] = { skipped: String(r.error || r.skipped), appliedOverrides: r.appliedOverrides || [] };
+            } else {
+              out[key] = {
+                sha: shaOf(r.prompt),
+                resolved: r.resolved && r.resolved.key,
+                appliedOverrides: r.appliedOverrides || [],
+                prompt: r.prompt
+              };
+            }
+          }
+        }
+      }
+      return out;
+    }
+    function assertMatchesBaseline(label, out) {
+      const produced = Object.keys(out).sort();
+      const expected = Object.keys(CELLS_G).sort();
+      check(`${label}: produced cell set equals pre-port matrix`,
+        JSON.stringify(produced) === JSON.stringify(expected),
+        `produced=${produced.length} expected=${expected.length}`);
+      let mismatches = 0;
+      const first = [];
+      for (const key of expected) {
+        const exp = CELLS_G[key];
+        const got = out[key];
+        if (!got) { mismatches++; if (first.length < 3) first.push(`${key}: missing`); continue; }
+        if (exp.skipped) {
+          if (got.skipped !== exp.skipped) {
+            mismatches++;
+            if (first.length < 3) first.push(`${key}: skipped ${JSON.stringify(got.skipped)} != ${JSON.stringify(exp.skipped)}`);
+          }
+          continue;
+        }
+        if (got.sha !== exp.sha) {
+          mismatches++;
+          if (first.length < 3) first.push(`${key}: sha ${got.sha} != ${exp.sha}`);
+        }
+      }
+      check(`${label}: every prompt SHA is BYTE-IDENTICAL to the pre-port fixture`,
+        mismatches === 0,
+        `${mismatches} mismatched; first: ${first.join('; ')}`);
+    }
+
+    const intentsSrc = fs.readFileSync(path.join(__dirname, '..', 'src/services/staticAdIntents.js'), 'utf8');
+    check('G0 require path is ../../config/segmentPromptOverrides (adgen config/ is at repo root)',
+      intentsSrc.includes("require('../../config/segmentPromptOverrides')"));
+    check('G0b does NOT use backend\'s ../config/segmentPromptOverrides (that resolves to missing src/config/)',
+      !intentsSrc.includes("require('../config/segmentPromptOverrides')"));
+
+    const envTextG = fs.readFileSync(DEFAULTS_ENV, 'utf8');
+    check('G0c STATIC_SEGMENT_PROMPT_OVERRIDES=true is committed',
+      /^STATIC_SEGMENT_PROMPT_OVERRIDES=true$/m.test(envTextG));
+    const segFlagIdx = envTextG.indexOf('STATIC_SEGMENT_PROMPT_OVERRIDES=true');
+    const segComment = segFlagIdx >= 0 ? envTextG.slice(Math.max(0, segFlagIdx - 500), segFlagIdx) : '';
+    check('G0d comment documents empty-table byte-identical no-op',
+      segFlagIdx >= 0 && /byte-identical no-op/i.test(segComment));
+
+    // G1 — empty table, flag ON (default). Must match pre-port bytes.
+    // Do NOT call _setSegmentOverridesForTests here: loadSegmentOverrides must
+    // actually require() the committed config/segmentPromptOverrides.js ([]).
+    const on = loadIntents(undefined);
+    check('G1 flag defaults ON (unset !== \'false\')', on.SEGMENT_OVERRIDES_ENABLED === true);
+    check('G1-load committed table is the empty array (real require, not the test setter)',
+      Array.isArray(on.loadSegmentOverrides()) && on.loadSegmentOverrides().length === 0);
+    const onEmpty = collectMatrix(on);
+    assertMatchesBaseline('G1 empty table, flag ON', onEmpty);
+    const emptyOverrideMismatch = Object.values(onEmpty).filter((c) => JSON.stringify(c.appliedOverrides) !== '[]');
+    check('G1b empty table stamps appliedOverrides: [] on every cell',
+      emptyOverrideMismatch.length === 0,
+      `${emptyOverrideMismatch.length} cells stamped a non-empty list`);
+
+    // G1c — passing segment:{categoryPath} with an empty table is still a no-op
+    // (the extra arg must not change prompt bytes when nothing matches).
+    const onEmptyWithSegment = collectMatrix(on, { segment: { categoryPath: 'Apparel > Outerwear' } });
+    assertMatchesBaseline('G1c empty table + segment.categoryPath, flag ON', onEmptyWithSegment);
+
+    // G2 — flag OFF even with a matching synthetic row is still pre-port bytes.
+    const pfKey = require.resolve('../src/services/platformFormats');
+    const intentsKey = require.resolve('../src/services/staticAdIntents');
+    const savedIntents = require.cache[intentsKey];
+    const savedPf = require.cache[pfKey];
+    delete require.cache[intentsKey];
+    delete require.cache[pfKey];
+    process.env.STATIC_SEGMENT_PROMPT_OVERRIDES = 'false';
+    let offMod;
+    try {
+      offMod = require('../src/services/staticAdIntents');
+      check('G2 flag off ships SEGMENT_OVERRIDES_ENABLED=false',
+        offMod.SEGMENT_OVERRIDES_ENABLED === false);
+      offMod._setSegmentOverridesForTests([
+        { id: 'should-not-apply', enabled: true, match: {}, appendText: 'NEVER APPEAR IN ANY PROMPT' }
+      ]);
+      const offOut = collectMatrix(offMod);
+      assertMatchesBaseline('G2 flag OFF + matching synthetic row', offOut);
+      const leaked = Object.entries(offOut).filter(([, c]) => (c.prompt || '').includes('NEVER APPEAR IN ANY PROMPT'));
+      check('G2b flag off never appends ADDITIONAL DIRECTIVES even when a row matches',
+        leaked.length === 0 && Object.values(offOut).every((c) => JSON.stringify(c.appliedOverrides) === '[]'),
+        `${leaked.length} cells leaked the synthetic row`);
+    } finally {
+      if (ORIGINAL_SEGMENT_OVERRIDES === undefined) delete process.env.STATIC_SEGMENT_PROMPT_OVERRIDES;
+      else process.env.STATIC_SEGMENT_PROMPT_OVERRIDES = ORIGINAL_SEGMENT_OVERRIDES;
+      if (savedIntents) require.cache[intentsKey] = savedIntents;
+      else delete require.cache[intentsKey];
+      if (savedPf) require.cache[pfKey] = savedPf;
+      else delete require.cache[pfKey];
+    }
+
+    // G3 — matchSegmentOverride AND semantics, skip rules.
+    {
+      const { matchSegmentOverride } = on;
+      const ctx = {
+        seedStyle: 'lifestyle',
+        variantKind: 'product_image',
+        surface: 'meta_feed_1_1',
+        intent: 'brand_led',
+        categoryPath: 'Apparel > Outerwear'
+      };
+      check('G3 match: surface hits',
+        matchSegmentOverride({ id: 'ok', enabled: true, match: { surface: 'meta_feed_1_1' }, appendText: 'x' }, ctx) === true);
+      check('G3b match: wrong intent misses',
+        matchSegmentOverride({ id: 'ok', enabled: true, match: { intent: 'social_proof_led' }, appendText: 'x' }, ctx) === false);
+      check('G3c match: seedStyle AND variantKind hit',
+        matchSegmentOverride({ id: 'ok', enabled: true, match: { seedStyle: 'lifestyle', variantKind: 'product_image' }, appendText: 'x' }, ctx) === true);
+      check('G3d match: categoryPrefix is case-insensitive',
+        matchSegmentOverride({ id: 'ok', enabled: true, match: { categoryPrefix: 'apparel' }, appendText: 'x' }, ctx) === true);
+      check('G3e match: wrong categoryPrefix misses',
+        matchSegmentOverride({ id: 'ok', enabled: true, match: { categoryPrefix: 'Shoes' }, appendText: 'x' }, ctx) === false);
+      check('G3f disabled entry skips',
+        matchSegmentOverride({ id: 'ok', enabled: false, match: {}, appendText: 'x' }, ctx) === false);
+      check('G3g missing id cannot apply',
+        matchSegmentOverride({ enabled: true, match: {}, appendText: 'x' }, ctx) === false);
+      check('G3h empty appendText cannot apply',
+        matchSegmentOverride({ id: 'ok', enabled: true, match: {}, appendText: '' }, ctx) === false);
+      check('G3i empty categoryPath fails prefix',
+        matchSegmentOverride({ id: 'ok', enabled: true, match: { categoryPrefix: 'Apparel' }, appendText: 'x' }, { ...ctx, categoryPath: '' }) === false);
+    }
+
+    // G4 — positive row: consumer actually appends and stamps appliedOverrides.
+    {
+      const cellKey = 'ratingQuote|meta_feed_1_1|brand_led';
+      const unmodified = onEmpty[cellKey] && onEmpty[cellKey].prompt;
+      check('G4 baseline cell exists for the positive-row proof',
+        typeof unmodified === 'string' && unmodified.length > 0);
+
+      on._setSegmentOverridesForTests([
+        { id: 'add-1', enabled: true, match: { surface: 'meta_feed_1_1' }, appendText: 'Keep the knit texture.' },
+        { id: 'no-hit', enabled: true, match: { surface: 'pmax_square_1_1' }, appendText: 'SHOULD NOT APPEAR' }
+      ]);
+      const r = on.buildPrompt({
+        intentKey: 'brand_led',
+        data: FIXTURES_G.ratingQuote,
+        product: PRODUCT_G,
+        surface: 'meta_feed_1_1',
+        segment: { categoryPath: 'Apparel > Outerwear' }
+      });
+      check('G4b appended prompt starts with the unmodified baseline (append-only)',
+        typeof r.prompt === 'string' && r.prompt.startsWith(unmodified));
+      check('G4c prompt contains ADDITIONAL DIRECTIVES',
+        (r.prompt || '').includes('ADDITIONAL DIRECTIVES'));
+      check('G4d prompt contains the matched appendText',
+        (r.prompt || '').includes('Keep the knit texture.'));
+      check('G4e non-matching row is not applied',
+        !(r.prompt || '').includes('SHOULD NOT APPEAR'));
+      check('G4f appliedOverrides stamps the matched id only',
+        JSON.stringify(r.appliedOverrides) === JSON.stringify(['add-1']),
+        `got ${JSON.stringify(r.appliedOverrides)}`);
+      check('G4g prompt is NOT byte-identical to the empty-table baseline (the consumer actually fired)',
+        r.prompt !== unmodified);
+
+      on._setSegmentOverridesForTests([]);
+      const r2 = on.buildPrompt({
+        intentKey: 'brand_led',
+        data: FIXTURES_G.ratingQuote,
+        product: PRODUCT_G,
+        surface: 'meta_feed_1_1'
+      });
+      check('G4h empty table is a no-op again after the synthetic row is cleared',
+        r2.prompt === unmodified && JSON.stringify(r2.appliedOverrides) === '[]');
+    }
+
+    // G5 — promptFlagsSnapshot includes the five flags (incl. the new one).
+    {
+      const snap = on.promptFlagsSnapshot();
+      check('G5 fidelityHardening is boolean', typeof snap.fidelityHardening === 'boolean');
+      check('G5b lifestylePreserve is boolean', typeof snap.lifestylePreserve === 'boolean');
+      check('G5c brandLedCopy is boolean', typeof snap.brandLedCopy === 'boolean');
+      check('G5d segmentOverridesEnabled is boolean', typeof snap.segmentOverridesEnabled === 'boolean');
+      check('G5e ratingFurniture is boolean', typeof snap.ratingFurniture === 'boolean');
+    }
+
+    // G6 — live renderer threads segment: and stamps promptFlags.segmentOverrides.
+    {
+      const src = fs.readFileSync(path.join(__dirname, '..', 'src/services/directImageRenderService.js'), 'utf8');
+      check('G6 buildPrompt call threads segment:',
+        /intents\.buildPrompt\(\{[\s\S]*?segment:\s*\{/.test(src));
+      check('G6b segment.categoryPath reads resolvedProduct.category (backend-faithful)',
+        /segment:\s*\{[\s\S]*?categoryPath:\s*resolvedProduct\?\.category/.test(src));
+      check('G6c CatalogProduct selects include category + inferredBreadcrumb (else categoryPath is always null on the DB path)',
+        (src.match(/CatalogProduct\.findById\([^)]+\)\.select\('([^']+)'\)/g) || [])
+          .every((call) => /category/.test(call) && /inferredBreadcrumb/.test(call))
+        && (src.match(/CatalogProduct\.findById\([^)]+\)\.select\('([^']+)'\)/g) || []).length >= 2);
+      check('G6d intentResolution stamps promptFlags.segmentOverrides from built.appliedOverrides',
+        /promptFlags:\s*\{[\s\S]*?segmentOverrides:\s*built\.appliedOverrides/.test(src));
+      check('G6e promptFlags spreads promptFlagsSnapshot()',
+        /promptFlags:\s*\{[\s\S]*?\.\.\.intents\.promptFlagsSnapshot\(\)/.test(src));
+    }
   }
 
 } catch (err) {

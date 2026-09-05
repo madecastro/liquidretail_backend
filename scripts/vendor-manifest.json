@@ -2,7 +2,7 @@
   "version": 2,
   "backendRef": "origin/main",
   "backendHead": "5c36b81b6a574aa8e0812fc2239d3499979331b0",
-  "generatedAt": "2026-09-05T20:16:04.445Z",
+  "generatedAt": "2026-09-05T20:22:39.710Z",
   "files": {
     "models/Ad.js": {
       "backendHash": "812961d1ad30f5f87891dcace58fbe44ce5e07a5789f34b927fe8208dc2db966",
@@ -1079,12 +1079,12 @@
     },
     "services/directImageRenderService.js": {
       "backendHash": "f08b826fce868dac48bab3e037b736a338f07859df885533034ec2ad1a621e4f",
-      "adgenHash": "4d683dd781b14545da23a8f850a71aa20eb6450468f8a89c99466757b5b34d1a",
+      "adgenHash": "613ec2c8dc556bf9df8116cb39abc28a4fdeb2fb467dea3067a7ec1c73a78712",
       "backendSha": "e955b04891fcb861bbf64a5bc8642aa2fbe7a0bc",
-      "status": "unported",
-      "reason": "Was a deliberate fork (adgen owns usableAttribution, composeCorrectiveOverride, buildQcRetryArgs, submitEditImageWithSeedFallback; colourway + logo-safe-box hunks ported from backend). #74 (945f8cb) added a NEW obligation on top: this file is where the static resume-from-receipt guard is wired in, and that guard is absent from backend (see services/atlasImageService.js). Recorded as unported rather than fork because the fork was pre-existing and benign while THIS hunk is an unshipped money fix -- the debt is the actionable fact. Do not reconcile back to fork without porting the resume wiring.",
-      "portTo": "backend",
-      "owedSince": "2026-08-27T10:28:43.817Z"
+      "status": "fork",
+      "reason": "Fork, not a copy — adgen owns the live static renderer. This change ports only the segment-override plumbing on top of that fork: buildPrompt({segment}) with categoryPath from resolvedProduct.category || inferredBreadcrumb, CatalogProduct selects now include those two fields (otherwise categoryPath is always null on the DB path), and intentResolution.promptFlags.segmentOverrides stamps built.appliedOverrides. Remaining adgen-owned hunks, deliberately not flattened: logo LRU (optionalImageCached); ai_ugc_led → objection_resolved; product.category threaded for the apparel role preamble; usableAttribution; composeCorrectiveOverride / buildQcRetryArgs; submitEditImageWithSeedFallback; resume-from-receipt (existingPredictionId / allowResume — a money guard backend does not have). Backend-only hunks left unported on purpose: promptSha256 / seedStyle on intentResolution (not segment plumbing). Previously status=unported for the resume guard; that guard is adgen-owned live-renderer policy, not a debt backend still owes, so this is a fork.",
+      "portTo": null,
+      "owedSince": null
     },
     "services/enrichmentReconciler.js": {
       "backendHash": "18319b9414c7c67c332f03cbb7870c42048dace067a55523f54b7ea16c071649",
@@ -1687,10 +1687,10 @@
     },
     "services/staticAdIntents.js": {
       "backendHash": "b1e1763ef7482c536ffd2a5a5e2e4a9361e0951977a7c57e247ec4c6be02ecdf",
-      "adgenHash": "303634652afbf87d9bb2967a42b7b3e4ac3d914e7a1cb54e0cfd1dedb08f4e65",
+      "adgenHash": "b25c1490a1b3b820564cc629446df9cf71ce2f053d8d6657cb01405f5e4b4a30",
       "backendSha": "7cc2c7dfbada49e800d3fd0cc1899e9735c425cb",
       "status": "fork",
-      "reason": "hunk-ported backend #325 (adgen #18); remaining divergence is not a wholesale copy",
+      "reason": "Fork, not a copy. This change ports the segment-override CONSUMER (loadSegmentOverrides / matchSegmentOverride / applySegmentOverrides / buildPrompt({segment}) / appliedOverrides / promptFlagsSnapshot) so an adopted qc-insights row in config/segmentPromptOverrides.js actually appends at render instead of silently no-op'ing. Require path is ../../config/segmentPromptOverrides (adgen config/ is at repo root; ../config resolves to the FILE src/config.js) — backend uses ../config/ because its services/ sits at repo root. Remaining adgen-owned policy hunks, not this port: APPAREL EXTENSION on the role preamble (isApparelCategory — measured gpt-image-2 safety false-positives on Pelagic swimwear); SOCIAL_PROOF_QUOTE_ELIGIBLE (quote-only eligibility + function-shaped core); PMAX_DRAWCTA_QUOTE_ONLY_SOCIAL_PROOF; resolveDrawCta/applyDensity taking `data` so those flags can see the quote-only shape. Empty table is a byte-identical no-op vs the pre-port SHA matrix (verifyStaticIntentChanges.js G).",
       "portTo": null,
       "owedSince": null
     },

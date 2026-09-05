@@ -1838,7 +1838,7 @@ function buildIntentData({ concept, layoutInput, brand, product = null, cta, cam
   // headline only; subhead undefined). Flag-on: cascade through layoutInput
   // then brand.tagline so ai_brand_led still has a brand line when Director
   // nulls the headline. Do NOT cascade product name/title or description —
-  // resolvedProduct is .select('title imageUrl imageMediaId additionalImageMediaIds rating productReviews recentQuoteKeys lastQuoteRunId lastQuoteFingerprint') so description is not loaded,
+  // resolvedProduct is .select('title imageUrl imageMediaId additionalImageMediaIds rating productReviews recentQuoteKeys lastQuoteRunId lastQuoteFingerprint category inferredBreadcrumb') so description is not loaded,
   // and the product name is forbidden as ad copy by owner directive and
   // fenced in absences.
   //
@@ -2584,7 +2584,7 @@ async function renderDirectImage(callArgs = {}) {
     LayoutInputArtifact.findById(layoutInputArtifactId).select('input brandId productId').lean(),
     resolveConcept({ adConceptArtifactId, adConceptId, expectedProductId: productId }),
     brandId ? Brand.findById(brandId).lean() : null,
-    productId ? CatalogProduct.findById(productId).select('title imageUrl imageMediaId additionalImageMediaIds rating productReviews recentQuoteKeys lastQuoteRunId lastQuoteFingerprint').lean() : null,
+    productId ? CatalogProduct.findById(productId).select('title imageUrl imageMediaId additionalImageMediaIds rating productReviews recentQuoteKeys lastQuoteRunId lastQuoteFingerprint category inferredBreadcrumb').lean() : null,
     // classification + technicalInsights feed resolveSeedStyle for the
     // lifestyle scene-preserve branch (STATIC_LIFESTYLE_PRESERVE).
     // width + height feed seedAspectFromDims → resolveAspectTreatment's
@@ -2641,7 +2641,7 @@ async function renderDirectImage(callArgs = {}) {
       { alertLevel: 'fatal', alertKey: 'direct-image:no-credentials' }
     );
   }
-  const resolvedProduct = product || (effectiveLayout.productId ? await CatalogProduct.findById(effectiveLayout.productId).select('title imageUrl imageMediaId additionalImageMediaIds rating productReviews recentQuoteKeys lastQuoteRunId lastQuoteFingerprint').lean() : null);
+  const resolvedProduct = product || (effectiveLayout.productId ? await CatalogProduct.findById(effectiveLayout.productId).select('title imageUrl imageMediaId additionalImageMediaIds rating productReviews recentQuoteKeys lastQuoteRunId lastQuoteFingerprint category inferredBreadcrumb').lean() : null);
   // Delivery dims are NOT derived here any more: they come from the surface the
   // prompt is built from, a few lines below, so the size Sharp writes and the
   // size the geometry block promised the model cannot disagree.
@@ -2769,7 +2769,17 @@ async function renderDirectImage(callArgs = {}) {
     surface,
     seedStyle,
     variantKind,
-    seedAspect
+    seedAspect,
+    // Per-segment prompt-override consumer (staticAdIntents.applySegmentOverrides).
+    // Empty table (config/segmentPromptOverrides.js) is a byte-identical no-op.
+    // categoryPath is the match key for match.categoryPrefix; same construction
+    // as backend's live renderer so an adopted qc-insights row matches here.
+    segment: {
+      categoryPath: resolvedProduct?.category
+        || (Array.isArray(resolvedProduct?.inferredBreadcrumb) && resolvedProduct.inferredBreadcrumb.length
+          ? resolvedProduct.inferredBreadcrumb.join(' > ')
+          : null)
+    }
   });
   // A surface that takes no static image is a routing fact, not a failure —
   // meta_reels_9_16 is declared kinds:['video'] in platformFormats.
@@ -2982,7 +2992,13 @@ async function renderDirectImage(callArgs = {}) {
       renderedRoles: built.text.map(([role]) => role),
       droppedRoles: built.dropped,
       generateSize: genSize,
-      logoComposited: plate.logoComposited
+      logoComposited: plate.logoComposited,
+      promptFlags: {
+        ...intents.promptFlagsSnapshot(),
+        segmentOverrides: built.appliedOverrides || [],
+        operatorOverride: !!overrideText,
+        operatorNote: !!(operatorPrompt && String(operatorPrompt).trim())
+      }
     },
     // TRUTHFUL COPY SNAPSHOT — what this specific render actually asked the
     // model to typeset, read back from built.text (the post-density-budget
