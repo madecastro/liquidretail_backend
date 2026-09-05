@@ -4,17 +4,11 @@
  * verifyPreviewScriptGuard — no HTTP route may reach the brand-script VM escape (GEN-1).
  *
  * THE HOLE THIS PINS SHUT. POST /api/brand/:id/preview-script could render a "canvas" preview,
- * which hands a brand script to brandScriptRunner.child.js:130-143:
- *
- *     vm.compileFunction(source, ['module','exports','canvas','sharp','helpers','colors'],
- *                        { filename: 'brand-script.js' })
- *
- * with NO parsingContext, so the compiled body resolves free identifiers against the LIVE V8
- * global — `globalThis.process.mainModule.require('child_process')` is one expression away. The
- * child is spawned same-uid with a shallow env scrub (brandScriptExecutor.js:285-293), so
- * /proc/<ppid>/environ still yields MONGODB_URI, ATLAS_API_KEY, JWT_SECRET and the Cloudinary
- * credentials (GEN-2). Authentication does not mitigate it: the attacker supplies the script for
- * a brand they own.
+ * which used to hand a brand script to brandScriptRunner.child.js (deleted, STRIP-INVENTORY
+ * PR-B2) `vm.compileFunction` with NO parsingContext, so the compiled body resolved free
+ * identifiers against the LIVE V8 global. The route guard remains: restoring a canvas runner
+ * without it would reopen GEN-1. Authentication does not mitigate it: the attacker supplies
+ * the script for a brand they own.
  *
  * Adding `parsingContext` would NOT fix it — the injected params are parent-realm objects, so
  * `helpers.clamp.constructor("return process")()` escapes a fresh context anyway. The engine guard
@@ -47,7 +41,6 @@ const path   = require('path');
 
 const ROOT = path.join(__dirname, '..');
 const brandSrc = fs.readFileSync(path.join(ROOT, 'routes/brand.js'), 'utf8');
-const childSrc = fs.readFileSync(path.join(ROOT, 'services/brandScriptRunner.child.js'), 'utf8');
 
 // The preview-script handler only, so a guard elsewhere in the file cannot satisfy these.
 const handler = brandSrc.split("router.post('/:id/preview-script'")[1].split('\nrouter.')[0];
@@ -132,22 +125,55 @@ check('S4 door 2 (the body.engine escape hatch) still short-circuits the hard-wi
     'before trusting the guard comment');
 });
 
-// ── V. the sink is still dangerous, so the guard still matters ──────────────
-check('V1 brandScriptRunner still compiles with no parsingContext (the sink is unchanged)', () => {
-  assert.ok(/vm\.compileFunction\(/.test(childSrc),
-    'vm.compileFunction is gone — if the VM escape was removed at the sink, this guard may be ' +
-    'redundant and the GEN-1 notes need rewriting');
-  const call = childSrc.split('vm.compileFunction(')[1].slice(0, 400);
-  assert.ok(!/parsingContext/.test(call),
-    'a parsingContext appeared — note it does NOT close the escape (injected params are ' +
-    'parent-realm objects), so do not relax the route guard on the strength of it');
-});
-
+// ── V. door 3 at the PATCH allow-list (the VM runner itself is deleted) ────
 check('V2 the PATCH allow-list still persists styleScript unvalidated (door 3 stays open at the sink)', () => {
   // Documents the other half of door 3. The route guard is what makes it harmless; if someone
   // removes the guard believing the field is validated, this check tells them it is not.
   assert.ok(/'styleScript'/.test(brandSrc) && /'styleScriptVertical'/.test(brandSrc),
     'the styleScript* allow-list changed — re-check whether door 3 still exists');
+});
+
+function stripComments(src) {
+  // Line comments first: a `//` line that mentions `/*.script.js` must not
+  // be parsed as the start of a block comment (that swallowed R2's mutation).
+  return src
+    .replace(/(^|[^:\\])\/\/.*$/gm, '$1')
+    .replace(/\/\*[\s\S]*?\*\//g, '');
+}
+
+const RETIRED_410 = /return\s+res\s*\.\s*status\(\s*410\s*\)\s*\.json\(\s*\{\s*error:\s*'canvas script generation retired/;
+
+check('R1 generate-script POST and GET return 410 before any runGenerateFullScript/LLM call', () => {
+  const postH = brandSrc.split("router.post('/:id/generate-script'")[1]?.split('\nrouter.')[0] || '';
+  const getH  = brandSrc.split("router.get('/:id/generate-script/:jobId'")[1]?.split('\nrouter.')[0] || '';
+  assert.ok(postH.length > 40 && getH.length > 40, 'could not slice generate-script POST/GET handlers');
+  assert.ok(RETIRED_410.test(postH), 'POST /generate-script does not 410 with the retired error before any work');
+  assert.ok(RETIRED_410.test(getH), 'GET /generate-script/:jobId does not 410 with the retired error before any work');
+  const postAt = postH.search(RETIRED_410);
+  const getAt  = getH.search(RETIRED_410);
+  for (const [name, h, at] of [['POST', postH, postAt], ['GET', getH, getAt]]) {
+    const before = h.slice(0, at);
+    assert.ok(!/runGenerateFullScript/.test(before), `${name} calls runGenerateFullScript before the 410`);
+    assert.ok(!/atlasTextService/.test(before) && !/\.generate\s*\(/.test(before),
+      `${name} reaches an LLM call before the 410`);
+  }
+});
+
+check('R2 systemConfigService.js contains no readFileSync of a .script.js path', () => {
+  const sysSrc = stripComments(fs.readFileSync(path.join(ROOT, 'services/systemConfigService.js'), 'utf8'));
+  assert.ok(!/readFileSync[\s\S]{0,300}\.script\.js/.test(sysSrc),
+    'systemConfigService still readFileSyncs a .script.js path — file fallback was supposed to be gone');
+});
+
+check('R3 brandScriptExecutor.js has no spawn of a brandScriptRunner path and no previewBrandScriptAsVideo export', () => {
+  const bseSrc = stripComments(fs.readFileSync(path.join(ROOT, 'services/brandScriptExecutor.js'), 'utf8'));
+  assert.ok(!/spawn\s*\([^;]*brandScriptRunner/.test(bseSrc),
+    'brandScriptExecutor still spawn()s brandScriptRunner');
+  assert.ok(!/RUNNER_PATH/.test(bseSrc),
+    'brandScriptExecutor still declares RUNNER_PATH');
+  const exportsBlock = bseSrc.split('module.exports')[1] || '';
+  assert.ok(!/previewBrandScriptAsVideo/.test(exportsBlock),
+    'previewBrandScriptAsVideo is still exported');
 });
 
 if (failures.length) {
@@ -156,4 +182,4 @@ if (failures.length) {
   process.exit(1);
 }
 console.log(`✅ verifyPreviewScriptGuard: ${pass}/${pass} checks passed`);
-console.log('   no HTTP route reaches vm.compileFunction (scripts/testBrandScript.js still does, by design)');
+console.log('   no HTTP route reaches a canvas VM (runner deleted; guard remains)');

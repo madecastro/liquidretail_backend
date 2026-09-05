@@ -1173,19 +1173,10 @@ async function runPreviewRender(jobId, brand, opts) {
         brand,
       });
     } else {
-      const { previewBrandScriptAsVideo } = require('../services/brandScriptExecutor');
-      result = await previewBrandScriptAsVideo({
-        styleScript,
-        useCanonical,
-        canonicalFormat,
-        meta,
-        width:           dims.width,
-        height:          dims.height,
-        totalFrames,
-        plateImagePath,
-        plateBackground: brand.primaryColor || '#3D3D3D',
-        brandName:       brand.name
-      });
+      // Canvas runner deleted (STRIP-INVENTORY PR-B2). The GEN-1 guard
+      // above already 400s non-remotion engines; this is fail-closed if
+      // that return is ever bypassed.
+      throw new Error('canvas script previews are disabled');
     }
 
     const prev = previewJobs.get(jobId) || {};
@@ -1545,8 +1536,8 @@ router.post('/:id/preview-script', express.json(), async (req, res) => {
     // Nothing live loses a feature: canvas titling is already dead on the render path
     // (resolveTitlingEngine returns 'remotion' unconditionally), and the only UI
     // caller of this route — StyleOverridesCard.tsx — is commented out of
-    // Brand/index.tsx at both its import and its usage. scripts/testBrandScript.js
-    // still reaches runChild by design, which is why the child cannot just be deleted.
+    // Brand/index.tsx at both its import and its usage. The canvas VM runner
+    // (brandScriptRunner.child.js) was deleted (STRIP-INVENTORY PR-B2).
     if (engine !== 'remotion') {
       return res.status(400).json({
         error: 'canvas script previews are disabled — brand script source is not executable'
@@ -2417,344 +2408,6 @@ async function runGenerateScript(jobId, brand, direction) {
   }
 }
 
-// ── Script-mode generator ──────────────────────────────────────────
-//
-// Alternate to the theme-mode generator above. Instead of picking
-// colors + fonts (JSON), Claude authors a FULL canvas overlay script
-// matching the runtime interface — a per-brand replacement for the
-// shipped canonical scripts. Reuses the same scriptJobs map + polling
-// route; job.script holds the JS string when done.
-//
-// Iteration model:
-//   - No baseScript in body  → fresh generation from the format's
-//                              shipped canonical as few-shot reference.
-//   - baseScript in body     → tweak mode. Claude gets the current
-//                              script + a change directive and returns
-//                              a revised full module.
-
-const CANONICAL_FILE_BY_FORMAT = {
-  feed:      'canonical.script.js',
-  vertical:  'canonical_dr_v1_vertical.script.js',
-  landscape: 'local_scrim_landscape.script.js'
-};
-
-// Fed to the script-generation LLM prompt, so these strings are load-bearing:
-// feed's aspect used to read '4:5 (also serves 1:1)', which was true only because
-// 1:1 was mis-bucketed into feed. Square now has its own composition and canonical.
-const DIMS_BY_FORMAT = {
-  feed:      { width: 1080, height: 1350, aspect: '4:5' },
-  square:    { width: 1080, height: 1080, aspect: '1:1' },
-  vertical:  { width: 1080, height: 1920, aspect: '9:16' },
-  landscape: { width: 1920, height: 1080, aspect: '16:9' }
-};
-
-// Google Fonts registered at server boot (services/fontLoader.js).
-// Kept as a string constant so the prompt stays in sync when the
-// loader's font list changes.
-const REGISTERED_FONTS_LIST =
-  'Inter, Playfair Display, Lora, Cormorant, Cormorant Garamond, Antonio, ' +
-  'Montserrat, Great Vibes, DM Sans, Bebas Neue, Anton, Oswald, IBM Plex Sans, ' +
-  'Poppins, Nunito, Quicksand';
-
-async function runGenerateFullScript(jobId, brand, direction, format, baseScript, history = []) {
-  try {
-    const fs   = require('fs');
-    const path = require('path');
-    const canonicalFile = CANONICAL_FILE_BY_FORMAT[format];
-    if (!canonicalFile) throw new Error(`unknown format "${format}" — expected feed|vertical|landscape`);
-    const canonicalPath   = path.join(__dirname, '..', 'services', 'brandScripts', canonicalFile);
-    const canonicalSource = fs.readFileSync(canonicalPath, 'utf8');
-    const dims = DIMS_BY_FORMAT[format];
-
-    const system = [
-      'You author custom canvas overlay scripts for a video ad rendering pipeline built on @napi-rs/canvas.',
-      'Your script runs in a sandboxed child process — no `require`, no `fs`, no `process`, no globals besides what is passed in.',
-      '',
-      'INTERFACE (must match exactly):',
-      '',
-      '  module.exports = {',
-      '    renderFrame: async (frameIndex, ctx, plate, meta, h) => {',
-      '      // Draw base plate then overlays for THIS frame only.',
-      '    }',
-      '  };',
-      '',
-      'PARAMETERS:',
-      '  frameIndex — integer 0..191 (24fps, 8-second video).',
-      '  ctx        — CanvasRenderingContext2D. Full 2D API.',
-      '  plate      — @napi-rs/canvas Image (base lifestyle frame at this time).',
-      '  meta       — object with text + theme data (shape below).',
-      '  h          — helpers: { clamp, t01, eoc, eob, smooth, rgba }.',
-      '',
-      'META SHAPE (all fields optional — always guard for null/undefined):',
-      '  brandName, badgeText, productName, productDescription, price,',
-      '  headline, quote, quoteSnippet, reviewer, deliveryLine,',
-      '  ctaText / cta,',
-      '  rating (float), reviewCount (int), reviewsText, likes (number),',
-      '  promoText (nullable — skip pill when null),',
-      '  endcardMode ("product" | "brand"),',
-      '  brandTagline, brandWebsiteUrl,',
-      '  // Multi-value arrays — iterate to render pills / bullets / cascades.',
-      '  //   Any empty/missing → skip that section entirely.',
-      '  badges: string[]     — trust signals (e.g. "Bestseller", "Free shipping"). Typical usage: pill row with per-item stagger, e.g. cascade in 4 across 0.6s.',
-      '  benefits: string[]   — short product benefit phrases (e.g. "Vegan formula", "SPF 30"). Typical usage: bullet stack on the endcard.',
-      '  // Local image file paths — call canvas.loadImage(path) to draw.',
-      '  //   Cache the returned promise across frames; both are undefined',
-      '  //   for brands without imagery, so always null-guard.',
-      '  productOnlyImagePath  — the product-only catalog image (product endcard hero),',
-      '  brandLogoPath         — the brand logo (brand endcard hero, footer marks),',
-      '  theme: {',
-      '    textPrimary [R,G,B], textSecondary [R,G,B], textMuted [R,G,B],',
-      '    scrimColor [R,G,B], endcardBgColor [R,G,B],',
-      '    accentColor [R,G,B], starColor [R,G,B],',
-      '    badgeBgColor [R,G,B], badgeTextColor [R,G,B],',
-      '    ctaBgColor [R,G,B], ctaTextColor [R,G,B],',
-      '    promoBgColor [R,G,B], promoTextColor [R,G,B],',
-      '    headingFontFamily, bodyFontFamily, quoteFontFamily, productFontFamily',
-      '  }',
-      '',
-      `CANVAS DIMENSIONS: ${dims.width}×${dims.height} (${dims.aspect}).`,
-      '',
-      'TIMING: 24fps. t (seconds) = frameIndex / 24. Video length: 8s (192 frames).',
-      '',
-      'COMPOSITION RULES:',
-      '- ALWAYS draw the base plate first: ctx.drawImage(plate, 0, 0, W, H).',
-      '- Wrap each draw sequence in ctx.save() / ctx.restore().',
-      '- Prefer LOCAL scrims (rounded rectangles behind text blocks) over full-frame gradient washes — the lifestyle plate should breathe through.',
-      '- 9:16 (Reels/Shorts/Stories): ~10.6% top + ~10.6% bottom is reserved for IG chrome. Keep text out of those bands.',
-      '- 16:9: anchor content to the lower half (letterbox-style overlays work well).',
-      '- 4:5 / 1:1: bottom-anchored composition is the shipped convention.',
-      `- Available fonts (registered at boot): ${REGISTERED_FONTS_LIST}.`,
-      '- Fall back to "Inter" / "PlayfairDisplay" / "Lora" if a font name might be missing.',
-      '',
-      'ENDCARD (last 2 seconds, t >= 6): dispatch on meta.endcardMode:',
-      '- "product": product image dominant + product name + ★★★★★ proof bar + optional promo pill.',
-      '- "brand":   brand logo dominant + tagline + website footer.',
-      '',
-      'IMAGE LOADING: to draw meta.productOnlyImagePath or meta.brandLogoPath, use `canvas.loadImage(path)` — the `canvas` namespace is in closure scope. Cache the promise across frames (see the reference implementation).',
-      '',
-      'OUTPUT LENGTH BUDGET: Target 200-350 lines total. Skip verbose comment blocks — one short line max per function is enough. Do NOT restate the interface spec in comments. Skip defensive fallbacks for meta fields that already have safe defaults in the sample. Prefer inline expressions over separate helper functions where a helper is only called once. The reference below is intentionally long for coverage; your output should be TIGHTER.',
-      '',
-      'SUMMARY HEADER: begin your response with exactly one comment line in this shape (≤160 chars, one plain English sentence describing what you changed vs the current script):',
-      '  // SUMMARY: <one sentence>',
-      'That line is parsed off the response and shown to the operator as your chat reply. The rest of the file is the module.',
-      '',
-      'OUTPUT: return ONLY the raw JavaScript module beginning with the SUMMARY comment. No markdown fences, no commentary outside the file. The second character onwards should form a valid JavaScript module.'
-    ].join('\n');
-
-    // Compact prior chat turns into a CONVERSATION HISTORY block prefixed
-    // to the user message. Same shape as the title-spec chat: role +
-    // content, capped at the last 10 turns for token budget. Empty when
-    // history is [] — the block is filtered out by filter(Boolean) below.
-    const historyBlock = (Array.isArray(history) && history.length > 0)
-      ? [
-          'CONVERSATION HISTORY (oldest first, most recent last):',
-          ...history.slice(-10).map((t) => {
-            const role = t?.role === 'user' ? 'Operator' : 'You';
-            const content = String(t?.content || '').replace(/\s+/g, ' ').trim().slice(0, 500);
-            return content ? `- ${role}: ${content}` : null;
-          }).filter(Boolean),
-        ].join('\n')
-      : '';
-
-    const brandContextLines = [
-      `Brand name: ${brand.name}`,
-      brand.tagline           ? `Tagline: ${brand.tagline}` : null,
-      brand.summary           ? `Summary: ${brand.summary}` : null,
-      brand.tone?.length      ? `Tone: ${brand.tone.join(', ')}` : null,
-      brand.primaryColor      ? `Primary color: ${brand.primaryColor}` : null,
-      brand.secondaryColor    ? `Secondary color: ${brand.secondaryColor}` : null,
-      brand.accentColor       ? `Accent color: ${brand.accentColor}` : null,
-      brand.fontFamily        ? `Preferred font: ${brand.fontFamily}` : null
-    ].filter(Boolean).join('\n');
-
-    // Concrete sample meta blob — matches the preview endpoint's meta
-    // shape so what Claude designs against is what previewBrandScript
-    // renders. If these two drift, previews stop reflecting what the
-    // script will see at real ad-render time.
-    const sampleMeta = {
-      brandName: brand.name || 'Sample Brand',
-      badgeText: 'Customer Favorite',
-      productName: 'Signature Product',
-      productDescription: 'Crafted for daily wear. Made with premium materials that last.',
-      price: '$48',
-      headline: brand.tagline || 'Made better.',
-      quote: 'Highly rated for comfort, durability, and standout style.',
-      quoteSnippet: 'Highly rated for comfort.',
-      reviewer: 'Verified customer',
-      deliveryLine: 'Ships free — arrives in 2-3 days',
-      ctaText: 'SHOP NOW',
-      cta: 'SHOP NOW',
-      rating: 4.6,
-      reviewCount: 128,
-      reviewsText: '128 reviews',
-      likes: 572,
-      promoText: 'FREE SHIPPING',
-      endcardMode: 'product',
-      brandTagline: brand.tagline || 'Made better.',
-      brandWebsiteUrl: brand.websiteUrl || 'brand.com',
-      // Realistic array values so scripts referencing meta.badges / meta.benefits
-      // demonstrate correctly in preview. Runtime arrays are typically 3-4 items;
-      // scripts should cap their own item count (Math.min(meta.badges.length, 4)).
-      badges: ['Bestseller', 'Free shipping', 'New arrival', 'Editor\'s pick'],
-      benefits: ['Premium materials', 'Made to last', 'Fits true to size', 'Machine washable'],
-      // Present as sample paths (won't exist on disk in preview — the
-      // preview endpoint fills real paths in when it can). Scripts must
-      // null-guard before calling canvas.loadImage.
-      productOnlyImagePath: null,
-      brandLogoPath: null,
-      theme: {
-        textPrimary: [255, 255, 255],
-        textSecondary: [220, 220, 220],
-        scrimColor: [0, 0, 0],
-        endcardBgColor: [8, 8, 10],
-        starColor: [245, 183, 10],
-        headingFontFamily: 'Playfair Display',
-        bodyFontFamily: 'Inter',
-        quoteFontFamily: 'Lora'
-      }
-    };
-
-    // Two user-prompt shapes: fresh generate (start from shipped
-    // canonical as reference) vs tweak (start from operator's current
-    // script and apply the directive). Both interleave chat history
-    // (optional) so multi-turn requests build on each other.
-    let user;
-    if (baseScript && String(baseScript).trim()) {
-      user = [
-        `Modify the ${format} (${dims.aspect}) overlay script below for brand "${brand.name}".`,
-        'Apply the operator direction carefully. Preserve the interface, the general structure, and any working composition patterns — change ONLY what the direction requires.',
-        '',
-        brandContextLines,
-        '',
-        historyBlock,
-        direction
-          ? `OPERATOR REQUEST: ${direction}`
-          : 'OPERATOR REQUEST: (none — polish typography and composition without shifting the overall design)',
-        '',
-        '── Sample meta blob that will be passed to renderFrame at runtime:',
-        '```json',
-        JSON.stringify(sampleMeta, null, 2),
-        '```',
-        '',
-        '── Current script to modify:',
-        '```javascript',
-        String(baseScript),
-        '```',
-        '',
-        'Output: begin with the SUMMARY comment header, then the FULL revised JS module. Raw JS only — no fences.'
-      ].filter(Boolean).join('\n');
-    } else {
-      user = [
-        `Write a ${format} (${dims.aspect}) canvas overlay script tailored to this brand:`,
-        '',
-        brandContextLines,
-        '',
-        historyBlock,
-        direction
-          ? `OPERATOR REQUEST: ${direction}`
-          : 'OPERATOR REQUEST: (none — pick a strong editorial composition that fits the brand)',
-        '',
-        '── Sample meta blob that will be passed to renderFrame at runtime:',
-        '```json',
-        JSON.stringify(sampleMeta, null, 2),
-        '```',
-        '',
-        '── Reference implementation (the currently shipped canonical for this format). Study its structure and interface conventions, then write a DIFFERENT composition that fits the brand above. Do NOT copy verbatim — vary layout, typography, timing, or endcard treatment based on brand personality.',
-        '',
-        '```javascript',
-        canonicalSource,
-        '```',
-        '',
-        `Now write the ${brand.name} ${format} script. Begin with the SUMMARY comment header, then raw JS.`
-      ].filter(Boolean).join('\n');
-    }
-
-    // Output budget — sized for compact scripts (200-350 lines, per
-    // system prompt). 8192 was truncating on the fatter drafts; 32000
-    // was inviting Claude to keep going past the Atlas gateway's ~120s
-    // Cloudflare timeout. 12000 hits the sweet spot: enough headroom
-    // for tight canonical replacements, not so much that verbosity
-    // wanders past the timeout.
-    const { generate } = require('../services/atlasTextService');
-    const result = await generate({ system, user, temperature: 0.5, maxTokens: 12000 });
-
-    // Truncation guard — if the model stopped because it hit the token
-    // budget (not a natural end), the tail of the script is missing and
-    // the sandbox will fail to parse. Surface a clear error instead of
-    // shipping broken JS to Preview.
-    const finish = String(result.finishReason || '').toLowerCase();
-    const truncated = finish === 'length' || finish === 'max_tokens';
-    if (truncated) {
-      throw new Error(
-        `Generation was cut off by the token budget (finishReason=${result.finishReason}). ` +
-        `Ask Claude for a more compact composition (e.g. add "keep the script under 400 lines" ` +
-        `to the direction) and try again.`
-      );
-    }
-
-    // Strip markdown fences if Claude wrapped despite the instruction.
-    let cleaned = result.text
-      .replace(/^```(?:javascript|js)?\s*\n?/i, '')
-      .replace(/\n?```\s*$/i, '')
-      .trim();
-
-    // Extract the SUMMARY header (first line, `// SUMMARY: <text>`)
-    // as the chat-panel reply. The comment stays in the script — it's
-    // harmless and documents the change for future readers. Falls back
-    // to null when the LLM skipped the header; the chat UI shows a
-    // generic "Applied your requested changes" in that case.
-    let summary = null;
-    const summaryMatch = cleaned.match(/^\/\/\s*SUMMARY:\s*(.+?)\s*$/im);
-    if (summaryMatch) summary = summaryMatch[1].slice(0, 400);
-
-    // Structural validation. Cheap — catches most malformed responses
-    // before the operator hits Preview.
-    if (!/module\.exports\s*=/.test(cleaned)) {
-      throw new Error(`Generated script is missing "module.exports". First 300 chars:\n${cleaned.slice(0, 300)}`);
-    }
-    if (!/renderFrame\s*[:=]/.test(cleaned)) {
-      throw new Error(`Generated script is missing "renderFrame". First 300 chars:\n${cleaned.slice(0, 300)}`);
-    }
-    // Balanced-brace sanity check — a truncated tail can still pass the
-    // structural regex above if the cutoff happened after `module.exports
-    // = { renderFrame: ...`. Compare braces and parens; mismatches mean
-    // the script is incomplete even if finishReason wasn't 'length'.
-    const braceDelta = (cleaned.match(/\{/g)?.length || 0) - (cleaned.match(/\}/g)?.length || 0);
-    const parenDelta = (cleaned.match(/\(/g)?.length || 0) - (cleaned.match(/\)/g)?.length || 0);
-    if (braceDelta !== 0 || parenDelta !== 0) {
-      throw new Error(
-        `Generated script is unbalanced (braces off by ${braceDelta}, parens off by ${parenDelta}). ` +
-        `Likely truncated mid-body — try again.`
-      );
-    }
-
-    const job = scriptJobs.get(jobId) || {};
-    scriptJobs.set(jobId, {
-      ...job,
-      status:       'done',
-      script:       cleaned,
-      summary,                    // one-sentence chat-panel reply (null if the LLM skipped the header)
-      format,
-      model:        result.model,
-      usage:        result.usage,
-      finishReason: result.finishReason,
-      completedAt:  Date.now()
-    });
-    reapJob(jobId);
-    console.log(`🧠 generate-script[full]: job=${jobId} DONE in ${Date.now() - (job.startedAt || Date.now())}ms format=${format} chars=${cleaned.length} summary="${(summary || '').slice(0, 60)}"`);
-  } catch (err) {
-    console.error(`🧠 generate-script[full]: job=${jobId} FAILED — ${err.message}`);
-    const job = scriptJobs.get(jobId) || {};
-    scriptJobs.set(jobId, {
-      ...job,
-      status:      'failed',
-      error:       err.message || 'generate failed',
-      completedAt: Date.now()
-    });
-    reapJob(jobId);
-  }
-}
-
 // POST /api/brand/:id/generate-script
 // Kicks off a Claude-via-Atlas script generation in the background
 // and returns a jobId. Poll GET /generate-script/:jobId for status.
@@ -2765,56 +2418,9 @@ async function runGenerateFullScript(jobId, brand, direction, format, baseScript
 //     baseScript?: string        // script mode only — tweak instead of fresh
 //   }
 router.post('/:id/generate-script', express.json(), async (req, res) => {
-  console.log(`🧠 generate-script: entry brandId=${req.params.id}`);
-  try {
-    const brand = await Brand.findOne(tenantFilter(req, { _id: req.params.id })).lean();
-    if (!brand) return res.status(404).json({ error: 'brand not found' });
-
-    const direction   = String(req.body?.direction || '').trim();
-    const rawMode     = String(req.body?.mode || 'theme').toLowerCase();
-    const mode        = rawMode === 'script' ? 'script' : 'theme';
-    const rawFormat   = String(req.body?.format || '').toLowerCase();
-    const format      = ['feed', 'vertical', 'landscape'].includes(rawFormat) ? rawFormat : 'feed';
-    const baseScript  = req.body?.baseScript ? String(req.body.baseScript) : null;
-    // Optional chat history for multi-turn script authoring. Same shape
-    // as the title-spec chat path: sanitized to { role: 'user'|'assistant',
-    // content: string }[], capped and role-filtered before the runner
-    // sees it.
-    const rawHistory = Array.isArray(req.body?.history) ? req.body.history : [];
-    const history = rawHistory
-      .filter((t) => t && typeof t === 'object' && (t.role === 'user' || t.role === 'assistant'))
-      .map((t) => ({ role: t.role, content: String(t.content || '').slice(0, 1000) }))
-      .filter((t) => t.content);
-
-    const crypto = require('crypto');
-    const jobId = crypto.randomBytes(6).toString('hex');
-    console.log(`🧠 generate-script: brand="${brand.name}" mode=${mode}${mode === 'script' ? ` format=${format}${baseScript ? ' (tweak)' : ' (fresh)'} history=${history.length}` : ''} directionChars=${direction.length} job=${jobId}`);
-
-    scriptJobs.set(jobId, {
-      status:      'pending',
-      startedAt:   Date.now(),
-      brand:       String(brand._id),
-      mode
-    });
-    // Fire-and-forget. The runner flips the job to done/failed when
-    // Atlas returns; errors are logged and never crash the process.
-    if (mode === 'script') {
-      runGenerateFullScript(jobId, brand, direction, format, baseScript, history);
-    } else {
-      runGenerateScript(jobId, brand, direction);
-    }
-
-    res.status(202).json({
-      ok:    true,
-      jobId,
-      mode,
-      format: mode === 'script' ? format : undefined,
-      status: 'pending'
-    });
-  } catch (err) {
-    console.error('generate-script failed:', err);
-    res.status(err.status || 500).json({ error: err.message || 'generate-script failed' });
-  }
+  return res.status(410).json({
+    error: 'canvas script generation retired — titling is Remotion (Title Studio)'
+  });
 });
 
 // GET /api/brand/:id/generate-script/:jobId — poll target for the
@@ -2823,29 +2429,9 @@ router.post('/:id/generate-script', express.json(), async (req, res) => {
 //     model?, usage?, finishReason?, elapsedMs }
 // 404 when the job doesn't exist OR was reaped after 5 min.
 router.get('/:id/generate-script/:jobId', async (req, res) => {
-  try {
-    const job = scriptJobs.get(req.params.jobId);
-    if (!job) return res.status(404).json({ error: 'job not found or expired' });
-    // Cross-brand safety: reject reads for the wrong brand id.
-    if (job.brand && String(job.brand) !== String(req.params.id)) {
-      return res.status(404).json({ error: 'job not found' });
-    }
-    res.json({
-      status:       job.status,
-      mode:         job.mode || 'theme',
-      format:       job.format,      // set for mode='script' only
-      theme:        job.theme,       // set for mode='theme'
-      script:       job.script,      // set for mode='script'
-      summary:      job.summary,     // chat-panel reply for mode='script' (parsed from // SUMMARY: header)
-      error:        job.error,
-      model:        job.model,
-      usage:        job.usage,
-      finishReason: job.finishReason,
-      elapsedMs:    Date.now() - (job.startedAt || Date.now())
-    });
-  } catch (err) {
-    res.status(500).json({ error: err.message || 'status lookup failed' });
-  }
+  return res.status(410).json({
+    error: 'canvas script generation retired — titling is Remotion (Title Studio)'
+  });
 });
 
 // GET /api/brand/:id/style
@@ -2857,30 +2443,14 @@ router.get('/:id/generate-script/:jobId', async (req, res) => {
 //   - scriptVertical   — Brand.styleScriptVertical (vertical / 9:16 Reels/Shorts/Stories)
 //   - scriptLandscape  — Brand.styleScriptLandscape (landscape / 16:9 pmax/YouTube)
 //   - theme            — Brand.styleTheme (shared palette + fonts for canonicals)
-//   - scriptTemplates  — { <name>: <source> } seed scripts from
-//                         services/brandScripts/*.script.js so the UI
-//                         can offer "Load template" without a second
-//                         round-trip.
+//   - scriptTemplates  — always {} (canvas templates removed)
 router.get('/:id/style', async (req, res) => {
   try {
     const brand = await Brand.findOne(tenantFilter(req, { _id: req.params.id })).lean();
     if (!brand) return res.status(404).json({ error: 'brand not found' });
     const { getFileStyle } = require('../services/brandStyles');
 
-    // Read shipped script templates. Cheap; only ~5 files max and the
-    // Brand page is not a hot path. Falls through to empty map when
-    // the dir doesn't exist (in-progress deployments).
-    const fs   = require('fs');
-    const path = require('path');
-    const scriptsDir = path.join(__dirname, '..', 'services', 'brandScripts');
-    const scriptTemplates = {};
-    try {
-      for (const name of fs.readdirSync(scriptsDir)) {
-        if (!name.endsWith('.script.js')) continue;
-        const key = name.replace(/\.script\.js$/, '');
-        scriptTemplates[key] = fs.readFileSync(path.join(scriptsDir, name), 'utf8');
-      }
-    } catch { /* dir missing — no templates */ }
+    const scriptTemplates = {}; // canvas templates removed (STRIP-INVENTORY PR-B2)
 
     // Preview plate — brand's own lifestyle image (or on_model, or
     // any image) so the phone-chrome mockup on the frontend can render
