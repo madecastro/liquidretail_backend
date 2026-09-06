@@ -279,25 +279,44 @@ function serviceBlock(yamlText, serviceName) {
   return nextBoundary ? rest.slice(0, nextBoundary.index) : rest;
 }
 
-// A proximity check ("is there a quoted true within N chars of this KEY
-// NAME") is unsound regardless of window size: ADGEN_RENDERER_ENABLED and
-// ADGEN_TITLER_ENABLED sit right next to each other in every service's
-// envVars list, so a check for one key can be silently satisfied by the
-// OTHER key's value. (Caught by mutation-testing this exact fix: setting
-// the renderer's own ADGEN_RENDERER_ENABLED to "false" still passed,
-// because the very next line is ADGEN_TITLER_ENABLED: "true".) Extract each
-// key's OWN value line instead of searching for any nearby quoted literal.
+// A proximity check ("is there a quoted true/false within N chars of this
+// KEY NAME") is unsound regardless of window size. Two independent failures:
+// (1) ADGEN_RENDERER_ENABLED and ADGEN_TITLER_ENABLED sit next to each other,
+// so a check for one key can be satisfied by the OTHER key's value.
+// (2) After the graft, ADGEN_TITLER_ENABLED is `sync: false` with NO value
+// line (dashboard-owned). A /['"]false['"]/ match within ~40 chars of the
+// key name false-greens on the `sync: false` token itself — the G4 hole
+// the monorepo design called out. Extract this key's own entry body
+// (until the next `- key:`), then read `value:` / `sync:` as distinct
+// fields. `sync: false` is NOT a value.
 //
 // STRIP FULL-LINE YAML COMMENTS FIRST. A non-greedy `key:…value:` window
 // matches `# value: "true"` sitting between `key:` and the real
 // `value: "false"` — mutation-tested 2026-09-04, the neighbor-key fix
-// still passed that comment decoy. After comments are gone, take the
-// `value:` on the line immediately following this key.
-function envValue(block, key) {
+// still passed that comment decoy.
+function envEntry(block, key) {
   const clean = String(block || '').replace(/^\s*#.*$/gm, '');
-  const re = new RegExp(`-\\s*key:\\s*${key}\\b[^\\n]*\\n\\s*value:\\s*["']?([^"'\\n#]+)["']?`);
+  const re = new RegExp(`-\\s*key:\\s*${key}\\b\\s*\\n([\\s\\S]*?)(?=\\n\\s*-\\s*key:|$)`);
   const m = re.exec(clean);
-  return m ? m[1].trim() : null;
+  if (!m) return null;
+  const body = m[1];
+  const valueM = /^\s*value:\s*["']?([^"'\n#]+?)["']?\s*$/m.exec(body);
+  const syncM = /^\s*sync:\s*(\S+)/m.exec(body);
+  return {
+    hasValue: !!valueM,
+    value: valueM ? valueM[1].trim() : null,
+    sync: syncM ? syncM[1].trim() : null,
+    body
+  };
+}
+
+function envValue(block, key) {
+  const entry = envEntry(block, key);
+  return entry && entry.hasValue ? entry.value : null;
+}
+
+function isDashboardOwned(entry) {
+  return !!entry && entry.sync === 'false' && entry.hasValue === false;
 }
 
 const renderYaml = fs.readFileSync(path.join(REPO, 'render.yaml'), 'utf8');
@@ -311,10 +330,15 @@ check('G2 render.yaml titler runs on an 8GB plan (pro_plus)',
   'Chrome needs the RAM — Standard OOMs. Renamed from standard_plus 2026-08-24 (blueprint sync rejected the old name).');
 check('G3 render.yaml titler sets ADGEN_ROLE=titler',
   envValue(titlerBlock, 'ADGEN_ROLE') === 'titler');
-check('G4 render.yaml titler ships ADGEN_TITLER_ENABLED=true (production; live since 2026-08-26)',
-  envValue(titlerBlock, 'ADGEN_TITLER_ENABLED') === 'true');
-check('G5 render.yaml renderer also ships ADGEN_TITLER_ENABLED=true (dashboard had it on both; renderer must stamp titlingNeeded)',
-  envValue(rendererBlock, 'ADGEN_TITLER_ENABLED') === 'true');
+check('G4 render.yaml titler ADGEN_TITLER_ENABLED is sync:false with no value (dashboard-owned; yaml must not overwrite live true)',
+  isDashboardOwned(envEntry(titlerBlock, 'ADGEN_TITLER_ENABLED')));
+check('G5 render.yaml renderer ADGEN_TITLER_ENABLED is sync:false with no value (dashboard-owned; renderer must keep stamping titlingNeeded from live true)',
+  isDashboardOwned(envEntry(rendererBlock, 'ADGEN_TITLER_ENABLED')));
+check('G4b ADGEN_TITLER_ENABLED sync:false is not mistaken for value false (the old 40-char proximity hole)',
+  envValue(titlerBlock, 'ADGEN_TITLER_ENABLED') !== 'false' &&
+  envValue(rendererBlock, 'ADGEN_TITLER_ENABLED') !== 'false' &&
+  !isDashboardOwned({ sync: 'false', hasValue: true, value: 'false' }) &&
+  !isDashboardOwned({ sync: 'false', hasValue: true, value: 'true' }));
 check('G6 render.yaml renderer + titler ship ADGEN_RENDERER_ENABLED=true',
   envValue(rendererBlock, 'ADGEN_RENDERER_ENABLED') === 'true' &&
   envValue(titlerBlock, 'ADGEN_RENDERER_ENABLED') === 'true');

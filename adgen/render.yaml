@@ -12,9 +12,10 @@ services:
     name: adgen-api
     env: docker
     plan: starter
-    dockerfilePath: ./Dockerfile
+    dockerContext: ./adgen
+    dockerfilePath: ./adgen/Dockerfile
     healthCheckPath: /health
-    autoDeploy: true
+    autoDeploy: false
     envVars:
       - key: ADGEN_ROLE
         value: api
@@ -27,8 +28,9 @@ services:
     name: adgen-orchestrator
     env: docker
     plan: starter
-    dockerfilePath: ./Dockerfile
-    autoDeploy: true
+    dockerContext: ./adgen
+    dockerfilePath: ./adgen/Dockerfile
+    autoDeploy: false
     # Singleton by design; distributed lease keeps a 2nd instance from
     # duplicating expansion work. numInstances stays 1 in dashboard.
     envVars:
@@ -67,8 +69,9 @@ services:
     # memory-bound by Remotion and can raise ADGEN_MAX_INFLIGHT — but that's
     # a separate tuning PR.
     plan: pro_plus
-    dockerfilePath: ./Dockerfile
-    autoDeploy: true
+    dockerContext: ./adgen
+    dockerfilePath: ./adgen/Dockerfile
+    autoDeploy: false
     # Autoscale MUST live in this file, not just the dashboard. A blueprint
     # sync without a scaling: stanza wipes the dashboard config — measured
     # 2026-09-03 16:45 UTC: PR #109's deploy fired an
@@ -92,7 +95,7 @@ services:
       - key: ADGEN_RENDERER_ENABLED
         value: "true"
       - key: ADGEN_TITLER_ENABLED
-        value: "true"   # live: renderer stamps titlingNeeded, stands down Remotion
+        sync: false   # dashboard-owned; yaml must not overwrite live true
       - key: ADGEN_MAX_INFLIGHT
         value: 32
       - key: MONGODB_URI
@@ -110,8 +113,9 @@ services:
     # raised to 4 without validation and OOM-killed 3 instances in 44h.
     # Orchestrator action item: dashboard 4 -> 2.
     plan: pro_plus
-    dockerfilePath: ./Dockerfile
-    autoDeploy: true
+    dockerContext: ./adgen
+    dockerfilePath: ./adgen/Dockerfile
+    autoDeploy: false
     # Autoscale MUST live in this file — see the adgen-renderer note above
     # for the blueprint-sync-wipes-dashboard mechanism. min=4/max=12 is
     # what was live on the dashboard until PR #109's deploy silently
@@ -132,7 +136,7 @@ services:
       - key: ADGEN_RENDERER_ENABLED
         value: "true"
       - key: ADGEN_TITLER_ENABLED
-        value: "true"    # live since 2026-08-26; titling is production
+        sync: false    # dashboard-owned; yaml must not overwrite live true
       - key: ADGEN_MAX_INFLIGHT
         value: 16        # I/O ceiling; Remotion queue self-limits below this
       - key: MONGODB_URI
