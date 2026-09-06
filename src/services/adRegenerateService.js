@@ -52,6 +52,7 @@ const directImage           = require('./directImageRenderService');
 const { resolveDeriveFromMaster, isGooglePmaxVideoFormat } = require('./campaignAdsGenerationService');
 const { isUgcFirstSeedingEnabled } = require('./seededUniverseService');
 const ugcVideoPipeline             = require('./ugcVideoPipeline');
+const { resolveAdVideoDurationSec } = require('./videoDurationPolicy');
 // Receipt peek for the reclaim path ONLY (runClaimedRegeneration's receipt
 // gate) — resumeForAd / reconcileVideoCostFromTerminal / resolveFailureCostReconcile.
 // DELIBERATELY LAZY-REQUIRED, not top-level: see the require() inside
@@ -1612,7 +1613,7 @@ async function runVideoFull(adId, prompt, progressRun = null, videoModel = null,
     ? await ugcVideoPipeline.preparePassthroughMaster({
         media:       ugcSourceMedia,
         aspectRatio: ad1?.aspectRatio || '9:16',
-        durationSec: 8
+        durationSec: resolveAdVideoDurationSec(ad1)
       })
     : { passthrough: false, reason: 'no source Media' };
 

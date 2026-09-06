@@ -90,7 +90,8 @@ const adSchema = new mongoose.Schema({
     index:   true
   },
 
-  // requested video length in seconds (wizard format-selection stage); null = standard 8s
+  // requested video length in seconds (wizard format-selection stage);
+  // null = META_VIDEO_DURATION_SEC (10s after the 8s→10s standardization)
   videoDurationSec: { type: Number, default: null },
 
   // Which match outcome produced this Ad. brand_only is the no-pick

@@ -46,7 +46,8 @@
  *
  * COST: 3-4 vision calls per ad that ACTUALLY NEEDS a crop (~$0.02, ledgered automatically via
  * chatCompletion -> trackLlmCall). planTimestamps({isReel:true}) yields 1 still (tiny ≤4s), 3
- * (typical 8s reel; the default durationSec), or at most 4 (long reel). Boundary-miss retry
+ * (typical 10s reel after the 8s→10s standardization — META_VIDEO_DURATION_SEC,
+ * the default durationSec), or at most 4 (long reel). Boundary-miss retry
  * (head===null AND faceHits===1, measured ~9% of crop-eligible ads): +FACE_QUORUM_RETRY_FRAMES
  * (2) extra vision calls, ONCE, on new timestamps — worst case 4+2=6 calls (~$0.03). 0-hit ads
  * and already-quorum ads do not pay the retry. $0 for cached re-titles (Ad.basePlate). $0 for
@@ -71,6 +72,7 @@ const {
   buildVideoCropUrl, isTransformableVideoUrl, hasExistingCropTransform,
 } = require('./videoCropUrl');
 const { noteRenderIssue } = require('./adStage');
+const { resolveAdVideoDurationSec } = require('./videoDurationPolicy');
 
 const ENABLED = () => String(process.env.BASE_PLATE_CROP_ENABLED ?? 'true').toLowerCase() !== 'false';
 // Face keep-out for titling (plateHints band avoid flags). Off → behaviour
@@ -623,7 +625,7 @@ async function resolveBasePlateVideoUrl({ ad, format }) {
       }
     }
 
-    const durationSec = Number(ad.videoDurationSec) > 0 ? Number(ad.videoDurationSec) : 8;
+    const durationSec = resolveAdVideoDurationSec(ad);
     const det = await internals.detectClipBoxes(ad.veoVideoUrl, durationSec, {
       brandId: ad.brandId, campaignId: ad.campaignId, adId: ad._id, mediaId: ad.mediaId,
       productId: ad.productId || null,
@@ -843,7 +845,7 @@ async function ensureFaceDetectionForKeepOut({ ad, format }) {
   }
 
   try {
-    const durationSec = Number(ad.videoDurationSec) > 0 ? Number(ad.videoDurationSec) : 8;
+    const durationSec = resolveAdVideoDurationSec(ad);
     const dims = await internals.measureDeliveryDims(ad.veoVideoUrl);
     const det = await internals.detectClipBoxes(ad.veoVideoUrl, durationSec, {
       brandId: ad.brandId, campaignId: ad.campaignId, adId: ad._id, mediaId: ad.mediaId,

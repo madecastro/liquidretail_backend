@@ -138,7 +138,7 @@ check('B2b [KILL SWITCH] META_VIDEO_DURATION_SEC=0 restores the provider default
     const prev = process.env.META_VIDEO_DURATION_SEC;
     process.env.META_VIDEO_DURATION_SEC = '0';
     for (const k of Object.keys(require.cache)) {
-      if (k.includes('campaignAdsGenerationService')) delete require.cache[k];
+      if (k.includes('campaignAdsGenerationService') || k.includes('videoDurationPolicy')) delete require.cache[k];
     }
     const reloaded = require(path.join(ROOT, 'src/services/campaignAdsGenerationService'));
     const off = reloaded.resolveVideoDurationForFormat('meta_stories_9_16', null);
@@ -146,7 +146,7 @@ check('B2b [KILL SWITCH] META_VIDEO_DURATION_SEC=0 restores the provider default
     if (prev === undefined) delete process.env.META_VIDEO_DURATION_SEC;
     else process.env.META_VIDEO_DURATION_SEC = prev;
     for (const k of Object.keys(require.cache)) {
-      if (k.includes('campaignAdsGenerationService')) delete require.cache[k];
+      if (k.includes('campaignAdsGenerationService') || k.includes('videoDurationPolicy')) delete require.cache[k];
     }
     return off === null && googleStill10;
   })(),
@@ -178,7 +178,7 @@ check('B3e META_VIDEO_DURATION_SEC=0 still restores the provider default',
     const prev = process.env.META_VIDEO_DURATION_SEC;
     process.env.META_VIDEO_DURATION_SEC = '0';
     for (const k of Object.keys(require.cache)) {
-      if (k.includes('campaignAdsGenerationService')) delete require.cache[k];
+      if (k.includes('campaignAdsGenerationService') || k.includes('videoDurationPolicy')) delete require.cache[k];
     }
     const reloaded = require(path.join(ROOT, 'src/services/campaignAdsGenerationService'));
     const off = reloaded.resolveVideoDurationForFormat('meta_stories_9_16', 8);
@@ -186,7 +186,7 @@ check('B3e META_VIDEO_DURATION_SEC=0 still restores the provider default',
     if (prev == null) delete process.env.META_VIDEO_DURATION_SEC;
     else process.env.META_VIDEO_DURATION_SEC = prev;
     for (const k of Object.keys(require.cache)) {
-      if (k.includes('campaignAdsGenerationService')) delete require.cache[k];
+      if (k.includes('campaignAdsGenerationService') || k.includes('videoDurationPolicy')) delete require.cache[k];
     }
     return off === 8 && googleStill10;
   })(),

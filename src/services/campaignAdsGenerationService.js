@@ -58,6 +58,7 @@ const {
   summarizeEmptyExpansion
 } = require('./perProductReasons');
 const { conceptField, conceptMediaPicks } = require('./conceptProjection');
+const { metaVideoDurationSec } = require('./videoDurationPolicy');
 const alertService = require('./alertService');
 // ONE shared LLM error taxonomy — see services/llmError.js. Imported, never
 // re-implemented (CLAUDE.md §4: a harness proving a call is WRITTEN does not
@@ -203,10 +204,9 @@ const GOOGLE_PMAX_VIDEO_DURATION_SEC = 10;
 // as META_VIDEO_MASTER_KEY / META_VIDEO_DERIVE_KEYS below. Local copies of
 // both used to exist here and drove a SECOND, ungated mint block — see the
 // dry-run comment for what that cost. One source, one list, one mint, one flag.
-// Meta's default clip length, owner decision 2026-08-11 (was the provider
-// default of 8s). See resolveVideoDurationForFormat for why this is NOT a
-// re-mint and how to revert it without a deploy.
-const DEFAULT_META_VIDEO_DURATION_SEC = 10;
+// Meta's default clip length lives in videoDurationPolicy.js (owner
+// 2026-08-11/18 8s→10s standardization). See resolveVideoDurationForFormat
+// for why this is NOT a re-mint and how to revert it without a deploy.
 // ── Meta video master / derive-only (restores the Phase 3 intent) ─────
 // BILLABLE: META_VIDEO_MASTER_KEY only — ONE Omni submit per product.
 // FREE:     every key in META_VIDEO_DERIVE_MAP is crop+retitle from that
@@ -952,20 +952,6 @@ function isMetaVideoFormat(platformFormat) {
   return typeof platformFormat === 'string' && platformFormat.startsWith('meta_');
 }
 
-/**
- * Meta's default clip length when the wizard didn't specify one.
- * Blank / 0 / negative / unparseable → null → provider default (today's 8s),
- * which is the documented kill switch. Same blank-is-not-zero care as the
- * PMax proof thresholds: `Number('')` is 0, not NaN.
- */
-function metaVideoDurationSec() {
-  const raw = process.env.META_VIDEO_DURATION_SEC;
-  if (typeof raw !== 'string' || raw.trim() === '') return DEFAULT_META_VIDEO_DURATION_SEC;
-  const n = Number(raw.trim());
-  if (!Number.isFinite(n) || n <= 0) return null;
-  return n;
-}
-
 // Brand-only inventory cap. Without picks, this limits how many of
 // the brand's brand_match media get pulled into the queue.
 const BRAND_ONLY_MEDIA_LIMIT = 25;
@@ -1235,8 +1221,9 @@ async function expandWizardJob({
   // Reels falls back to 'video'. null defers to campaign.adKinds.
   kinds = null,
   // Wizard format-selection stage: requested video length in seconds
-  // (integer 1–15). null = standard 8s. Stamped on video Ad payloads
-  // only; not part of identityDigest.
+  // (integer 1–15). null = META_VIDEO_DURATION_SEC (10s after the 8s→10s
+  // standardization; kill switch 0 restores the provider 8s default).
+  // Stamped on video Ad payloads only; not part of identityDigest.
   videoDurationSec = null,
   // Phase 3 — deterministic video + optional director variants.
   // directorVariants: when true, ALSO queue concept-driven video variants
@@ -2882,9 +2869,10 @@ function computeV2IdentityDigest({
 // duration-unset case. So the duration part is appended ONLY for the
 // Google PMax video formats, which have zero history and therefore cannot
 // collide with anything. Meta digests stay byte-identical to pre-Phase-A.
-// If the Meta 8s→10s standardization later wants duration identity there
-// too, that is a deliberate one-time re-mint and must be costed and
-// flagged explicitly — do not fold it in silently here.
+// The Meta 8s→10s standardization already landed as a render-length change
+// (META_VIDEO_DURATION_SEC=10); duration is STILL omitted from Meta digests
+// on purpose. Folding it in would be a one-time re-mint of every existing
+// Meta master and must be costed and flagged explicitly — do not do it here.
 function computeDeterministicVideoDigest({
   campaignId, productId, referenceMediaIds, mediaId,
   platformFormat, ctaText, ctaUrl, ctaUrlParams,
@@ -3660,7 +3648,9 @@ async function expandDeterministicVideo({
       videoPromptGuidance: videoPromptGuidance || null,
       videoPromptRaw:      videoPromptRaw || null,
       // platformFormat differentiates masters + derive-only on the unique
-      // index; duration is identity so an 8s→10s re-run mints a new ad;
+      // index; duration is identity for Google PMax only (an 8s→10s re-run
+      // mints a new PMax ad). Meta digests omit duration — the 8s→10s
+      // standardization already landed as a render-length change, not a re-mint.
       // funnelStage (when set) differentiates the 3 free retitles.
       identityDigest: computeDeterministicVideoDigest({
         campaignId,
@@ -3826,7 +3816,7 @@ async function runConceptDrivenExpansion({
   kinds,                                            // [] of 'image'|'video' — what pipelines to emit per concept
   includeCategoryMatched, includeBrandMatched,
   excludePairings, creativeIntent,
-  videoDurationSec = null,                          // wizard-requested video length (sec); null = standard 8s
+  videoDurationSec = null,                          // wizard-requested video length (sec); null = META_VIDEO_DURATION_SEC (10s)
   videoPromptGuidance = null,                       // run-level guidance — stamped on video Ad rows
   videoPromptRaw = null,                            // run-level raw override — stamped on video Ad rows
   // The CampaignRun this expansion belongs to. Mixed into the STATIC V2 digest

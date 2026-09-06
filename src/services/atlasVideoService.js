@@ -2,8 +2,9 @@
 //
 // Default model (today): Gemini Omni Flash image-to-video
 // (google/gemini-omni-flash/image-to-video-developer). Accepts 1–7
-// reference images, renders a fixed-duration clip (8s requested) at
-// 720p/1080p/4K, ~$1.00 per 8s/720p render. The default prompt is a
+// reference images, renders a fixed-duration clip (META_VIDEO_DURATION_SEC,
+// 10s after the 8s→10s standardization; Omni enum 4|6|8|10) at
+// 720p/1080p/4K, ~$1.20 per 10s/720p render ($0.20 + $0.10/sec). The default prompt is a
 // camera-only "Ken Burns" product-commercial spec — the model animates
 // a virtual camera over the supplied photographs and must not alter
 // the imagery. All text overlays (headline, CTA, quote, brand mark)
@@ -40,6 +41,11 @@ const CatalogProduct            = require('../models/CatalogProduct');
 const LayoutInputArtifact       = require('../models/LayoutInputArtifact');
 const { uploadBufferToCloudinary, deleteFromCloudinary } = require('./cloudinaryService');
 const { recordFlatCost, finalizeFlatCost, reconcileCost } = require('./costTracker');
+const {
+  fallbackVideoDurationSec,
+  resolveAdVideoDurationSec,
+  PROVIDER_DEFAULT_DURATION_SEC,
+} = require('./videoDurationPolicy');
 const referenceDefaultsService  = require('./referenceDefaultsService');
 const { adStage, formatElapsed, noteRenderIssue } = require('./adStage');
 // Slack visibility ONLY for the existing not-chargeable auto-retry in
@@ -796,8 +802,10 @@ function enabled() {
 // — flagged in the same trailing comment rather than silently expanded.
 const MODEL_CAPS = {
   // Default. Duration is an ENUM (4|6|8|10), not a free range — the
-  // request must send it explicitly so the output matches the 8s @ 24fps
-  // assumption baked into the brand scripts. Aspect support is narrow
+  // request must send it explicitly. Brand-script timing is still authored
+  // for a nominal 8s @ 24fps grid and remotion/lib/timing.js timeScale
+  // stretches it onto the real plate (10s standard → 1.25). Do not confuse
+  // that authored 8s grid with the request duration. Aspect support is narrow
   // (16:9 / 9:16 only): every other canvas format routes to the Grok
   // aspect-fallback model (ASPECT_FALLBACK_MODEL below) via
   // resolveModelAndAspect, riding the existing reference pre-crop.
@@ -1066,11 +1074,15 @@ function capsFor(model) {
 // entry. Null when the model has no pricing data — callers should log
 // 0-cost rather than guess. Not authoritative for billing (same caveat
 // as costTracker.MODEL_RATES); refresh alongside Atlas price changes.
-function estimateRenderCostUsd({ model, durationSec = 8, resolution = null } = {}) {
+function estimateRenderCostUsd({ model, durationSec, resolution = null } = {}) {
   const caps = capsFor(model);
   const p = caps.pricing;
   if (!p) return null;
-  const dur = Number(durationSec) || 8;
+  // Missing duration is the Meta 10s standard (META_VIDEO_DURATION_SEC), not
+  // the provider 8s default — a $0.20 delta on Omni 720p. Callers with an ad
+  // in scope should pass resolveDurationSec / resolveAdVideoDurationSec.
+  const parsedDur = Number(durationSec);
+  const dur = Number.isFinite(parsedDur) && parsedDur > 0 ? parsedDur : fallbackVideoDurationSec();
   if (p.kind === 'per-second') {
     return Number((p.perSecond * dur).toFixed(4));
   }
@@ -1344,21 +1356,25 @@ function imageDimsForAspect(aspectRatio) {
 // without needing an add-on. Works on any Cloudinary plan.
 const VIDEO_START_OFFSET = 'so_2';
 
-// Build a Cloudinary 8-second segment URL for a video source. Grok
-// is skipped for video-seeded video ads — Cloudinary extracts an
-// 8-second clip starting at VIDEO_START_OFFSET (2s in). Aspect crop
-// lands the clip at the target canvas aspect via c_fill; gravity
-// defaults to center. (Saliency-aware g_auto requires the AI add-on
-// for video transforms — accounts without it 400 on every g_auto
-// video URL. Same pattern as the so_auto add-on gate.)
+// Build a Cloudinary segment URL for a video source. Grok is skipped
+// for video-seeded video ads — Cloudinary extracts a clip of
+// durationSec starting at VIDEO_START_OFFSET (2s in). Omitted duration
+// uses META_VIDEO_DURATION_SEC (10s after the 8s→10s standardization;
+// kill switch 0 → provider 8s). Aspect crop lands the clip at the
+// target canvas aspect via c_fill; gravity defaults to center.
+// (Saliency-aware g_auto requires the AI add-on for video transforms —
+// accounts without it 400 on every g_auto video URL. Same pattern as
+// the so_auto add-on gate.)
 //
 // Returns null when the URL isn't a Cloudinary /video/upload/ asset
 // we can transform.
-function buildVideoSegmentUrl(originalUrl, aspectRatio, durationSec = 8) {
+function buildVideoSegmentUrl(originalUrl, aspectRatio, durationSec) {
   if (!originalUrl || typeof originalUrl !== 'string') return null;
   if (!originalUrl.includes('/video/upload/')) return null;
   const ar = String(aspectRatio || '').trim() || '1:1';
-  const du = Math.max(1, Math.min(30, Number(durationSec) || 8));
+  const parsedDu = Number(durationSec);
+  const du = Math.max(1, Math.min(30,
+    Number.isFinite(parsedDu) && parsedDu > 0 ? parsedDu : fallbackVideoDurationSec()));
   const chain = `${VIDEO_START_OFFSET},du_${du.toFixed(1)},c_fill,ar_${ar},q_auto:good`;
   return originalUrl.replace('/video/upload/', `/video/upload/${chain}/`);
 }
@@ -3550,14 +3566,18 @@ async function persistReframe(media, aspectKey, aspectRatio, finalUrl, method, {
 }
 
 // Resolve per-ad render duration. Operators may set Ad.videoDurationSec
-// (1–15); null/undefined/invalid falls back to caps.defaultDuration || 8,
-// then clamps to [minDuration, maxDuration]. When caps.durationEnum is a
-// non-empty array (Gemini Omni accepts only 4|6|8|10), snap to the
-// NEAREST enum value — ties go to the smaller value — so the request
-// body always carries a provider-legal duration.
+// (1–15). null/undefined/invalid falls back to caps.defaultDuration
+// (Omni/Grok registry default is 8 — the Atlas provider default and the
+// META_VIDEO_DURATION_SEC=0 kill-switch target), then clamps to
+// [minDuration, maxDuration]. This is NOT the Meta 10s standard; mint
+// stamps that via resolveVideoDurationForFormat, and generateForAd
+// threads resolveAdVideoDurationSec before calling here.
+// When caps.durationEnum is a non-empty array (Gemini Omni accepts only
+// 4|6|8|10), snap to the NEAREST enum value — ties go to the smaller
+// value — so the request body always carries a provider-legal duration.
 function resolveDurationSec(requested, caps) {
   let n = parseInt(requested, 10);
-  if (!Number.isFinite(n) || n < 1) n = caps?.defaultDuration || 8;
+  if (!Number.isFinite(n) || n < 1) n = caps?.defaultDuration || PROVIDER_DEFAULT_DURATION_SEC;
   const min = caps?.minDuration || 1;
   const max = caps?.maxDuration || 15;
   n = Math.max(min, Math.min(max, n));
@@ -4944,8 +4964,9 @@ function submittedImageUrls(imageUrls, caps) {
 function buildSubmissionBody({ model, prompt, imageUrls, aspectRatio, caps, videoClipUrl = null, durationSec = null, seed = null }) {
   switch (caps.paramShape) {
     case 'gemini-omni':
-      // duration MUST be sent explicitly (Atlas enum 4|6|8|10) — the 8s
-      // output is a downstream contract (brand scripts assume 8s @ 24fps).
+      // duration MUST be sent explicitly (Atlas enum 4|6|8|10). Brand-script
+      // timing is authored for 8s and timeScaled onto the real plate; that
+      // is not this request duration (typically META_VIDEO_DURATION_SEC=10).
       //
       // seed — schema-confirmed field (live-fetched 2026-09-04:
       // static.atlascloud.ai/model/schema/google-gemini-omni-flash-image-to-
@@ -4962,7 +4983,7 @@ function buildSubmissionBody({ model, prompt, imageUrls, aspectRatio, caps, vide
         model,
         prompt,
         images: submittedImageUrls(imageUrls, caps),
-        duration: durationSec || caps.defaultDuration || 8,
+        duration: durationSec || caps.defaultDuration || PROVIDER_DEFAULT_DURATION_SEC,
         aspect_ratio: aspectRatio,
         resolution: process.env.ATLAS_VIDEO_RESOLUTION || caps.defaultResolution || '720p',
         ...(Number.isInteger(seed) ? { seed } : {})
@@ -4973,7 +4994,7 @@ function buildSubmissionBody({ model, prompt, imageUrls, aspectRatio, caps, vide
       // (du_N), so start/ends restate the same window for the API;
       // when the seed isn't a Cloudinary asset we send the raw URL and
       // let start/ends do the trim server-side.
-      const duration = durationSec || caps.defaultDuration || 8;
+      const duration = durationSec || caps.defaultDuration || PROVIDER_DEFAULT_DURATION_SEC;
       return {
         model,
         prompt,
@@ -4989,7 +5010,7 @@ function buildSubmissionBody({ model, prompt, imageUrls, aspectRatio, caps, vide
         model,
         prompt,
         image_urls: submittedImageUrls(imageUrls, caps),
-        duration: Math.min(caps.maxDuration, durationSec || 8),
+        duration: Math.min(caps.maxDuration, durationSec || PROVIDER_DEFAULT_DURATION_SEC),
         resolution: '720p',
         aspect_ratio: aspectRatio
       };
@@ -5002,7 +5023,7 @@ function buildSubmissionBody({ model, prompt, imageUrls, aspectRatio, caps, vide
         model,
         prompt,
         image_url: submittedImageUrls(imageUrls, caps)[0],
-        duration: durationSec || caps.defaultDuration || 8,
+        duration: durationSec || caps.defaultDuration || PROVIDER_DEFAULT_DURATION_SEC,
         resolution: caps.defaultResolution || '720p',
         aspect_ratio: aspectRatio
       };
@@ -5376,9 +5397,10 @@ async function generateForAd({
     platformAspect, modelOverride, hasVideoSeed: media.fileType === 'video'
   });
   logResolution(ad._id, model, renderAspect, targetAspect, fallback);
-  // Per-ad render length — wizard-stamped Ad.videoDurationSec (or the
-  // standard 8s), clamped/enum-snapped to the resolved model's caps.
-  const durationSec = resolveDurationSec(ad.videoDurationSec, caps);
+  // Per-ad render length — wizard-stamped Ad.videoDurationSec, else
+  // META_VIDEO_DURATION_SEC (10s standard; kill switch → provider 8s),
+  // then clamped/enum-snapped to the resolved model's caps.
+  const durationSec = resolveDurationSec(resolveAdVideoDurationSec(ad), caps);
 
   // Video pipeline previously skipped layoutInput derivation, so
   // products that hadn't been through the image-gen pipeline arrived

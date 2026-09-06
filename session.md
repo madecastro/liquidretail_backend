@@ -19,6 +19,11 @@ commands used this session) to find the actual cause.
 
 ## CURRENT STATE
 
+**2026-09-05: stale 8s video-duration fallbacks, unpushed.** Sibling worktrees
+`.wt-fix-stale-video-duration-backend` / `-adgen` on `fix/stale-video-duration`
+(off current origin trunks). Dirty main checkouts were not touched. Full
+write-up: `session.d/2026-09-05_stale-video-duration-8s-fallback.md`.
+
 **2026-09-04/05, written for cross-account handoff (work2 session `8ab4de8d`).**
 Also check `mcp__gbrain_work__recall` (entity `liquidretail_adgen`) — two facts
 saved there (#98 owner directives, #99 detailed in-flight state) should still be
