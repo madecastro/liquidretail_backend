@@ -1,0 +1,27 @@
+{
+  "pelagic": {
+    "heading": [[null, false], [null, true], ["Oswald", true], [null, true], ["Montserrat", false], [null, false], [null, false], [null, false], [null, false], ["Montserrat", false]],
+    "body": [[null, false], [null, true], ["Oswald", true], [null, true], ["Montserrat", false], [null, false], [null, false], [null, false], [null, false], ["Montserrat", false]],
+    "quote": [[null, false], [null, false], [null, false], ["Montserrat", false]]
+  },
+  "camelback": {
+    "heading": [[null, false], [null, true], [null, true], [null, true], ["DM Sans", false], [null, false], [null, false], [null, false], [null, false], ["DM Sans", false]],
+    "body": [[null, false], [null, true], [null, true], [null, true], ["DM Sans", false], [null, false], [null, false], [null, false], [null, false], ["DM Sans", false]],
+    "quote": [[null, false], ["Lora", false], [null, false], ["DM Sans", false]]
+  },
+  "soludosStored": {
+    "heading": [[null, false], ["Newsreader", true], ["Newsreader", true], [null, true], [null, false], [null, false], [null, false], [null, false], [null, false], ["Newsreader", false]],
+    "body": [[null, false], ["Newsreader", true], ["Newsreader", true], [null, true], [null, false], [null, false], [null, false], [null, false], [null, false], ["Newsreader", false]],
+    "quote": [[null, false], [null, false], [null, false], ["Newsreader", false]]
+  },
+  "gymshark": {
+    "heading": [[null, false], ["Montserrat", true], ["Montserrat", true], [null, true], [null, false], [null, false], [null, false], ["Montserrat", false], [null, false], ["Montserrat", false]],
+    "body": [[null, false], ["Montserrat", true], ["Montserrat", true], [null, true], [null, false], [null, false], [null, false], ["Roboto", false], [null, false], ["Montserrat", false]],
+    "quote": [[null, false], [null, false], [null, false], ["Montserrat", false]]
+  },
+  "pairingShape": {
+    "heading": [[null, false], ["Newsreader", true], ["Newsreader", true], [null, true], [null, false], [null, false], [null, false], ["Newsreader", false], [null, false], ["Newsreader", false]],
+    "body": [[null, false], ["Newsreader", true], ["Newsreader", true], [null, true], [null, false], [null, false], [null, false], ["DM Sans", false], [null, false], ["Newsreader", false]],
+    "quote": [[null, false], [null, false], [null, false], ["Newsreader", false]]
+  }
+}

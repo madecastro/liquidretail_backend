@@ -55,7 +55,12 @@ const DEFAULT_ROLE_FONTS = {
 // it stays deliberately NAME-ONLY, because it answers a narrower question than
 // that module's classifyTypeface — which CSS generic to emit as this face's
 // fallback — and verifyFontFallback.js pins its naive answers on purpose.
-const { SERIF_HINTS } = require('./fontClassification');
+const {
+  SERIF_HINTS,
+  isIconFontFamily,
+  classifyTypeface,
+  storedGenericForFamily,
+} = require('./fontClassification');
 
 const memoryCache = new Map(); // family|weight -> resolved entry or null
 const inFlight = new Map();    // key -> Promise; prevents same-font download races
@@ -185,6 +190,67 @@ function normalizeFontFamily(value) {
 
 function familyKey(value) {
   return String(normalizeFontFamily(value) || '').toLowerCase().replace(/[^a-z0-9]+/g, '');
+}
+
+/**
+ * CSS FontFace `weight` descriptor string. Range form (`"100 900"`) when
+ * both axis endpoints are finite so one variable file covers every CSS
+ * weight the slot may request; otherwise today's single-value string.
+ * Mirrored in remotion/components/FontLoader.jsx — keep the two bodies
+ * identical; verifyFontServing pins the string shape of both.
+ */
+function fontFaceWeightDescriptor({ weight, weightMin, weightMax } = {}) {
+  // Do not Number()-coerce first: Number(null) is 0, which isFinite, and
+  // would register the illegal range "0 0" for every static-cut token.
+  const min = weightMin == null || weightMin === '' ? NaN : Number(weightMin);
+  const max = weightMax == null || weightMax === '' ? NaN : Number(weightMax);
+  if (Number.isFinite(min) && Number.isFinite(max)) return `${min} ${max}`;
+  if (weight != null && weight !== '') return String(weight);
+  return undefined;
+}
+
+/** Website-usage family after icon/junk filter. Null if missing or dingbat. */
+function usableWebsiteFamily(raw) {
+  const family = normalizeFontFamily(raw);
+  if (!family || isIconFontFamily(family)) return null;
+  return family;
+}
+
+/**
+ * Proven serif+sans pairing from first-party CSS roles. All six conditions
+ * in the font-quality audit must hold; otherwise null (callers leave the
+ * ladder byte-identical to the flag-off path).
+ */
+function websiteRolePairing(brand, headingFam, bodyFam) {
+  if (!headingFam || !bodyFam) return null;
+  if (familyKey(headingFam) === familyKey(bodyFam)) return null;
+  if (!matchCustomFont(brand, headingFam) || !matchCustomFont(brand, bodyFam)) return null;
+  const headingClass = classifyTypeface({
+    family: headingFam,
+    generic: storedGenericForFamily(brand, headingFam),
+  });
+  const bodyClass = classifyTypeface({
+    family: bodyFam,
+    generic: storedGenericForFamily(brand, bodyFam),
+  });
+  if (headingClass === bodyClass) return null;
+  const evidence = Array.isArray(brand?.websiteFontUsage?.evidence)
+    ? brand.websiteFontUsage.evidence
+    : [];
+  const headingOk = evidence.some((row) =>
+    row
+    && row.role === 'heading'
+    && familyKey(row.family) === familyKey(headingFam)
+    && Number(row.score) >= 4
+  );
+  const bodyOk = evidence.some((row) =>
+    row
+    && row.role === 'body'
+    && familyKey(row.family) === familyKey(bodyFam)
+    && Number(row.score) >= 3
+  );
+  if (!headingOk || !bodyOk) return null;
+  return { heading: headingFam, body: bodyFam };
 }
 
 /**
@@ -352,6 +418,8 @@ async function resolveCustomFont(brand, custom, requestedWeight = custom.weight 
       exact: true,
       requestedFamily: custom.family,
       resolvedFamily: custom.family,
+      weightMin: Number.isFinite(custom.weightMin) ? custom.weightMin : null,
+      weightMax: Number.isFinite(custom.weightMax) ? custom.weightMax : null,
     };
     memoryCache.set(cacheKey, entry);
     return entry;
@@ -845,6 +913,18 @@ async function resolveFamily(family, { brand = null, weight = 400, role = null, 
   family = normalizeFontFamily(family);
   if (!family) return null;
 
+  // Quote is the only slot that requests italic (slotRenderers.jsx). Prefer
+  // an ingested italic file when one exists; fall back to roman + CSS
+  // font-style:italic (today's synthetic italic) when it does not.
+  // Heading/body stay roman — do not change their lookup.
+  if (roleKey(role) === 'quote') {
+    const italicCustom = matchCustomFont(brand, family, { weight, style: 'italic' });
+    if (italicCustom) {
+      const italicEntry = await resolveCustomFont(brand, italicCustom, weight);
+      if (italicEntry) return italicEntry;
+    }
+  }
+
   const custom = matchCustomFont(brand, family, { weight });
   if (custom) {
     const entry = await resolveCustomFont(brand, custom, weight);
@@ -890,6 +970,13 @@ function buildFontLadders(brand, { overrides = {}, layoutInputBrand = null } = {
   const theme = styleThemeIsCurated ? (brand?.styleTheme || {}) : {};
   const tailwind = brand?.tailwindTheme || {};
   const websiteUsage = brand?.websiteFontUsage || {};
+  // Icon/junk families are dropped at the READ site, not inside
+  // matchCustomFont — changing match would not be byte-identical for
+  // Remotion if a stored role still names an icon. Filtering here is the
+  // safe point (Gymshark digital-7, Soludos oke-widget-icons).
+  const usageHeading = usableWebsiteFamily(websiteUsage.heading);
+  const usageBody = usableWebsiteFamily(websiteUsage.body);
+  const usageQuote = usableWebsiteFamily(websiteUsage.quote);
   const scanned = brand?.fontFamily || layoutInputBrand?.font_family || null;
   const fontIsCurated = Array.isArray(brand?.curatedFields) && brand.curatedFields.includes('fontFamily');
 
@@ -934,7 +1021,7 @@ function buildFontLadders(brand, { overrides = {}, layoutInputBrand = null } = {
   const sharedFamily = normalizeFontFamily(
     (fontIsCurated ? scanned : null) ||
     ownFace ||
-    tailwind?.fonts?.body || websiteUsage.body ||
+    tailwind?.fonts?.body || usageBody ||
     themeBody || themeHeading ||
     scanned || null
   );
@@ -1023,38 +1110,47 @@ function buildFontLadders(brand, { overrides = {}, layoutInputBrand = null } = {
   // ownFace is exact-only too: we only claim it because matchCustomFont found a
   // usable file, so if that file will not actually load, a curated theme beats a
   // tone-matched guess.
+  // FONT_ROLE_PAIRING_ENABLED — default false. Off path must not even
+  // compute the gate, so JSON.stringify(ladders) stays byte-identical to
+  // today for every brand. On path: a proven serif+sans website pairing
+  // (all six conditions) drops ownFace/scannedPromoted from the role that
+  // already has its own distinct usable family and puts exact-only
+  // [usage[role], true] above theme. Quote ladder is never paired.
+  const pairingEnabled = String(process.env.FONT_ROLE_PAIRING_ENABLED ?? 'false').toLowerCase() === 'true';
+  const pairing = pairingEnabled ? websiteRolePairing(brand, usageHeading, usageBody) : null;
+
   const ladders = {
     heading: [
       [overrides.heading?.family, false],
-      [ownFace, true],
-      [scannedPromoted, true],
+      [pairing ? pairing.heading : ownFace, true],
+      [scannedPromoted && !pairing ? scannedPromoted : null, true],
       [metaHeading.exactOnly, true],
       [themeHeading, false],
       [fontIsCurated ? scanned : null, false],
       [tailwind?.fonts?.heading, false],
-      [websiteUsage.heading, false],
+      [usageHeading, false],
       [metaHeading.weak, false],
       [sharedFamily, false],
     ],
     body: [
       [overrides.body?.family, false],
-      [ownFace, true],
-      [scannedPromoted, true],
+      [pairing ? pairing.body : ownFace, true],
+      [scannedPromoted && !pairing ? scannedPromoted : null, true],
       [metaBody.exactOnly, true],
       [themeBody, false],
       [fontIsCurated ? scanned : null, false],
       [tailwind?.fonts?.body, false],
-      [websiteUsage.body, false],
+      [usageBody, false],
       [metaBody.weak, false],
       [sharedFamily, false],
     ],
     // Quote keeps theme priority: serifFontFamily is a deliberate pairing choice
     // (it is why AllBirds' Lora held steady), and a sans brand face must not
-    // silently replace a curated serif quote voice.
+    // silently replace a curated serif quote voice. Pairing never touches quote.
     quote: [
       [overrides.quote?.family, false],
       [themeQuote, false],
-      [websiteUsage.quote, false],
+      [usageQuote, false],
       [sharedFamily, false],
     ],
   };
@@ -1144,13 +1240,17 @@ async function resolveBrandFonts(brand, { overrides = {}, layoutInputBrand = nul
           exact: entry.exact !== false,
           requestedFamily: entry.requestedFamily || wanted[role],
           resolvedFamily: entry.resolvedFamily || entry.family,
-          matchReason: entry.matchReason || null
+          matchReason: entry.matchReason || null,
+          weightMin: Number.isFinite(entry.weightMin) ? entry.weightMin : null,
+          weightMax: Number.isFinite(entry.weightMax) ? entry.weightMax : null,
         }
       : {
           family: def.family, weight: def.weight, style: 'normal', url: null,
           remoteUrl: null, fallback: def.fallback, source: 'default',
           exact: false, requestedFamily: wanted[role], resolvedFamily: def.family,
-          matchReason: 'role default'
+          matchReason: 'role default',
+          weightMin: null,
+          weightMax: null,
         };
   }
   return out;
@@ -1174,4 +1274,6 @@ module.exports = {
   LIBRARY_SERIF_FACES,
   FONT_CACHE_DIR,
   DEFAULT_ROLE_FONTS,
+  fontFaceWeightDescriptor,
+  familyKey,
 };

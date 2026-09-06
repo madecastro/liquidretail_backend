@@ -557,8 +557,24 @@ function typefaceDirectiveForBrand(brand) {
   const heading = headingRaw && !isIconFontFamily(headingRaw) ? headingRaw : null;
   const fonts = (Array.isArray(brand?.customFonts) ? brand.customFonts : [])
     .filter((f) => f?.family && !isIconFontFamily(f.family));
-  const ingested = (heading && fonts.find((f) => f?.family === heading)) || fonts[0] || null;
-  const family = ingested?.family || heading || null;
+  // Same alphanumeric collapse fontResolverService.familyKey uses, so
+  // "Aktiv Grotesk" vs a hyphen-slug customFonts row still match. Must
+  // not require fontResolverService (that fetches files).
+  const familyKeyOf = (value) => String(value || '').toLowerCase().replace(/[^a-z0-9]+/g, '');
+  const headingKey = familyKeyOf(heading);
+  const matchHeading = headingKey
+    ? fonts.find((f) => familyKeyOf(f.family) === headingKey)
+    : null;
+  // Heading-null: prefer Brand.fontFamily (the same source resolveBrandFonts
+  // would pick as ownFace) over blind customFonts[0] insertion order.
+  const scannedRaw = brand?.fontFamily || null;
+  const scanned = scannedRaw && !isIconFontFamily(scannedRaw) ? scannedRaw : null;
+  const scannedKey = familyKeyOf(scanned);
+  const matchScanned = !matchHeading && scannedKey
+    ? fonts.find((f) => familyKeyOf(f.family) === scannedKey)
+    : null;
+  const ingested = matchHeading || matchScanned || fonts[0] || null;
+  const family = ingested?.family || heading || scanned || null;
 
   if (family) {
     const readable = humanizeFontFamily(family);
