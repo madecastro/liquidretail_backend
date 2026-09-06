@@ -47,6 +47,9 @@ const {
   isBenefitsPlacementEnabled,
   occupancyBrief,
   buildDirectorMessages,
+  printableSocialProofForVideo,
+  compactPerformanceForVideo,
+  compactUgcForVideo,
 } = require('../services/videoBenefitsDirector');
 const { makeAssembleSignalsOnce } = require('../services/aiCreativeDirectorService');
 
@@ -358,7 +361,277 @@ async function runAsync() {
         && !thinUser.includes('PRODUCT SPECS:')
         && !thinUser.includes('SOCIAL PROOF:')
         && !thinUser.includes('BRAND TONE:')
-        && !thinUser.includes('BRAND TAGLINE:'));
+        && !thinUser.includes('BRAND TAGLINE:')
+        && !thinUser.includes('BRAND DESCRIPTION:')
+        && !thinUser.includes('BRAND REVIEWS SUMMARY:')
+        && !thinUser.includes('BRAND PERSONAS:')
+        && !thinUser.includes('PRODUCT REVIEW SUMMARY:')
+        && !thinUser.includes('PRODUCT PRICE:')
+        && !thinUser.includes('\nUGC:'));
+  }
+
+  // ── Signal parity: static-assembled fields now consumed by video-title ──
+  {
+    const occupancy = occupancyBrief({ size: '9:16', profile: 'consideration' });
+    const richSignals = {
+      size: '9:16',
+      profile: 'consideration',
+      occupancy,
+      benefits: ['Keeps you dry'],
+      productSignal: {
+        name: 'Rain Shell',
+        description: 'A packable shell.',
+        specs: [{ label: 'Material', value: '3L nylon' }],
+        review_summary: 'Reviewers praise the taped seams.',
+        price: 189,
+        currency: 'USD',
+      },
+      brandSignal: {
+        name: 'Acme',
+        tagline: 'Stay out longer',
+        description: 'Outdoor kit for long days in the rain.',
+        tone: ['rugged'],
+        brand_reviews_summary: 'Trusted for waterproof shells.',
+        personas: [{
+          name: 'Weekend backpacker',
+          painPoints: ['worried about fit', 'will it keep me dry'],
+        }],
+      },
+      socialProofSignal: {
+        primary_quote: {
+          text: 'Kept me dry on a 12-mile ridge walk.',
+          author: 'Sam',
+          source: 'vertexaisearch.cloud.google.com',
+          verified: true,
+        },
+        rating: { value: 4.8, count: 120 },
+        top_comments: [
+          {
+            text: 'This thing packed flat in my bag.',
+            author: '@hiker',
+            likes: 42,
+            source: 'instagram',
+            verified: true,
+          },
+          { text: 'Quiet praise.', author: null, likes: 0 },
+        ],
+        strongest_signal: 'testimonial',
+        proof_options: [
+          {
+            tier: 'product',
+            rating: 4.8,
+            review_count: 120,
+            reviews_text: '120 reviews',
+            quotes: [{ text: 'Kept me dry on a 12-mile ridge walk.', author: 'Sam' }],
+          },
+          {
+            tier: 'brand',
+            rating: 4.6,
+            review_count: 41000,
+            reviews_text: '41000 brand reviews',
+            quotes: [{ text: 'Love this brand.', author: 'Pat' }],
+          },
+        ],
+        quotes_by_stage: {
+          awareness: { text: 'Looks great on the trail.', author: 'A' },
+          conversion: { text: 'Worth every penny.', author: 'C' },
+        },
+      },
+      ugcSignal: {
+        platform: 'instagram',
+        media_count: 4,
+        media_strength: 'high',
+        rights_approved: true,
+        shot_type_distribution: { lifestyle: 3, product_only: 1 },
+        content_nature_distribution: { evergreen: 4 },
+        file_type_distribution: { image: 4 },
+        avg_ad_readiness: 0.82,
+        primary_subjects: ['red shell on a ridge'],
+        top_creator: { handle: '@trailcam', followers: null, platform: 'instagram' },
+      },
+      performanceSignal: {
+        likes: 12000,
+        comments: 340,
+        saves: 800,
+        shares: 55,
+        avg_engagement_rate: 847.2,
+        strength: 'high',
+        top_post: { likes: 9000, comments: 200, saves: 600, caption: 'Summit day.' },
+      },
+    };
+    const rich = buildDirectorMessages(richSignals);
+    const sys = rich[0].content;
+    const user = rich[1].content;
+
+    check('P1 BRAND DESCRIPTION + REVIEWS SUMMARY + PERSONAS when present',
+      user.includes('BRAND DESCRIPTION:') && user.includes('Outdoor kit for long days in the rain.')
+        && user.includes('BRAND REVIEWS SUMMARY:') && user.includes('Trusted for waterproof shells.')
+        && user.includes('BRAND PERSONAS:') && user.includes('Weekend backpacker')
+        && user.includes('worried about fit'));
+    check('P2 PRODUCT REVIEW SUMMARY + PRICE when present',
+      user.includes('PRODUCT REVIEW SUMMARY:') && user.includes('Reviewers praise the taped seams.')
+        && user.includes('PRODUCT PRICE:') && user.includes('189') && user.includes('USD'));
+    check('P3 top_comments[].likes restored',
+      user.includes('SOCIAL PROOF:') && user.includes('"likes":42'));
+    check('P4 likes:0 is kept (finite number)',
+      user.includes('"likes":0'));
+    check('P5 proof_options forwarded with scoped reviews_text',
+      user.includes('"tier":"brand"') && user.includes('41000 brand reviews')
+        && user.includes('"tier":"product"'));
+    check('P6 quotes_by_stage forwarded when assembled (flag-on shape)',
+      user.includes('quotes_by_stage') && user.includes('Worth every penny'));
+    check('P7 performance counts + top_post forwarded',
+      user.includes('"likes":12000') && user.includes('"saves":800')
+        && user.includes('"strength":"high"') && user.includes('Summit day.'));
+    check('P8 assembled mean-engagement figure is NOT forwarded (wrong unit)',
+      !user.includes('avg_engagement_rate') && !user.includes('847.2'));
+    check('P9 UGC shot mix / media_count / rights / top_creator',
+      user.includes('\nUGC:') && user.includes('"media_count":4')
+        && user.includes('"rights_approved":true')
+        && user.includes('lifestyle') && user.includes('@trailcam'));
+    check('P10 top_creator.followers omitted when null (ingest never writes it)',
+      !/"followers"\s*:/.test(user));
+    check('P11 quote provenance extras stripped (source/verified not in prompt)',
+      !user.includes('vertexaisearch') && !user.includes('"verified"'));
+    check('P12 system mirrors static honesty + 4.5-from-50 + personas + proof-menu + price-ban',
+      sys.includes('HONESTY RULE')
+        && sys.includes('≥4.5 from ≥50')
+        && sys.includes('PERSONAS:')
+        && sys.includes('Never use a persona as a quote author')
+        && sys.includes('PROOF MENU:')
+        && sys.includes('NEVER phrase a category or brand number')
+        && sys.includes('PRICE is positioning')
+        && sys.includes('Do not invent a rate'));
+
+    const thinProof = printableSocialProofForVideo(null, null);
+    check('P13 printableSocialProofForVideo(null) → null (no throw)',
+      thinProof === null);
+    check('P14 printableSocialProofForVideo(non-object) → null',
+      printableSocialProofForVideo('nope') === null
+        && printableSocialProofForVideo(12) === null);
+
+    const likesOnly = printableSocialProofForVideo(
+      { top_comments: [{ text: 'Packed flat.', likes: 'not-a-number' }] },
+      { likes: 'x', avg_engagement_rate: 99, strength: 'absent' }
+    );
+    check('P15 malformed likes/performance degrade; rate still omitted',
+      likesOnly && likesOnly.top_comments[0].text === 'Packed flat.'
+        && likesOnly.top_comments[0].likes === undefined
+        && !likesOnly.performance
+        && JSON.stringify(likesOnly).indexOf('avg_engagement_rate') === -1);
+
+    const perfOnly = printableSocialProofForVideo(undefined, {
+      likes: 5000, comments: 20, saves: 0, shares: 0,
+      avg_engagement_rate: 12, strength: 'medium',
+    });
+    check('P16 performance-only signal still emits (engagement without reviews)',
+      perfOnly && perfOnly.performance && perfOnly.performance.likes === 5000
+        && perfOnly.performance.saves === undefined
+        && !('avg_engagement_rate' in (perfOnly.performance || {})));
+
+    const ugcEmpty = compactUgcForVideo(null);
+    const ugcBad = compactUgcForVideo('nope');
+    const ugcZero = compactUgcForVideo({ media_count: 0, media_strength: 'absent' });
+    check('P17 compactUgcForVideo fail-closed on missing/malformed',
+      ugcEmpty === null && ugcBad === null);
+    check('P18 ugc media_count 0 still forwarded (absent-strength is honest)',
+      ugcZero && ugcZero.media_count === 0 && ugcZero.media_strength === 'absent');
+
+    const perfOmitRate = compactPerformanceForVideo({
+      likes: 10, avg_engagement_rate: 0.9, strength: 'low',
+    });
+    check('P19 compactPerformanceForVideo drops the assembled rate field',
+      perfOmitRate && perfOmitRate.likes === 10
+        && !('avg_engagement_rate' in perfOmitRate));
+
+    const noQuotesByStage = printableSocialProofForVideo({
+      rating: { value: 4.8, count: 120 },
+    });
+    check('P20 quotes_by_stage omitted when not on the assembled object',
+      noQuotesByStage && !noQuotesByStage.quotes_by_stage);
+
+    const priceObj = buildDirectorMessages({
+      ...richSignals,
+      productSignal: { name: 'Rain Shell', price: { amount: 189 } },
+    });
+    check('P21 object-shaped price is omitted (not stringified as [object Object])',
+      !priceObj[1].content.includes('PRODUCT PRICE:'));
+
+    const sysMustNot = [
+      'buildVeoPrompt', 'camera prompt', 'Omni',
+    ];
+    check('P22 video-title system prompt does not mention the camera/Omni path',
+      sysMustNot.every((s) => !sys.includes(s)));
+  }
+
+  {
+    resetVideoTitleDirectionMemo();
+    let captured = null;
+    const d = await getVideoTitleDirection({
+      brandId: '000000000000000000000001',
+      productId: 'p-parity',
+      campaignKind: 'product',
+      platformFormat: 'meta_stories_9_16',
+      funnelStage: 'consideration',
+    }, {
+      assembleSignals: async () => ({
+        brand_signal: {
+          name: 'Acme',
+          description: 'Outdoor kit.',
+          personas: [{ name: 'Weekend backpacker', painPoints: ['fit'] }],
+          brand_reviews_summary: 'Trusted shells.',
+        },
+        product_signal: {
+          name: 'Rain Shell',
+          benefits: ['Keeps you dry'],
+          review_summary: 'Taped seams praised.',
+          price: 189,
+          currency: 'USD',
+        },
+        social_proof_signal: {
+          primary_quote: { text: 'Kept me dry.', author: null },
+          rating: { value: 4.8, count: 120 },
+          top_comments: [{ text: 'Packed flat.', author: '@hiker', likes: 42 }],
+          proof_options: [{
+            tier: 'brand', rating: 4.6, review_count: 41000,
+            reviews_text: '41000 brand reviews', quotes: [],
+          }],
+        },
+        ugc_signal: {
+          media_count: 3, media_strength: 'high', rights_approved: true,
+          shot_type_distribution: { lifestyle: 3 },
+          top_creator: { handle: '@trailcam', followers: null, platform: 'instagram' },
+        },
+        performance_signal: {
+          likes: 12000, comments: 10, saves: 800, shares: 1,
+          avg_engagement_rate: 999, strength: 'high',
+          top_post: { likes: 9000, caption: 'Summit day.' },
+        },
+      }),
+      chatCompletion: async (_meta, body) => {
+        captured = body && body.messages;
+        return {
+          choices: [{
+            message: {
+              content: JSON.stringify({
+                include_benefits: true, max_items: 3, phase: 'proof', reason: 'test',
+              }),
+            },
+          }],
+        };
+      },
+    });
+    const user = (captured && captured[1] && captured[1].content) || '';
+    check('P23 runVideoTitleDirector threads assembleSignals ugc + performance into the LLM prompt',
+      d && d.include === true
+        && user.includes('\nUGC:') && user.includes('"likes":12000')
+        && user.includes('"likes":42')
+        && user.includes('BRAND PERSONAS:')
+        && user.includes('PRODUCT PRICE:')
+        && user.includes('41000 brand reviews')
+        && !user.includes('avg_engagement_rate')
+        && !user.includes('derivedVoice')
+        && !user.includes('999'));
   }
 
   // ── Item 9: assembleSignals once per product ──
@@ -409,6 +682,30 @@ async function runAsync() {
     /PRODUCT DESCRIPTION:/.test(vbdSrc)
       && /PRODUCT SPECS:/.test(vbdSrc)
       && /SOCIAL PROOF:/.test(vbdSrc));
+  check('P-src consumption emits PERSONAS / DESCRIPTION / PRICE / UGC / REVIEW SUMMARY',
+    /BRAND PERSONAS:/.test(vbdSrc)
+      && /BRAND DESCRIPTION:/.test(vbdSrc)
+      && /BRAND REVIEWS SUMMARY:/.test(vbdSrc)
+      && /PRODUCT PRICE:/.test(vbdSrc)
+      && /PRODUCT REVIEW SUMMARY:/.test(vbdSrc)
+      && /UGC: \$\{JSON\.stringify\(ugc\)\}/.test(vbdSrc)
+      && /performanceSignal: signals\.performance_signal/.test(vbdSrc)
+      && /ugcSignal: signals\.ugc_signal/.test(vbdSrc));
+  check('P-src never mentions the assembled rate field (do not spread the unit bug)',
+    !/avg_engagement_rate/.test(vbdSrc));
+  check('P-src does not load derivedVoice (separate static-only Brand.findById block)',
+    !/derivedVoice/.test(vbdSrc));
+  check('P-src top_comments compact copies likes from the assembled field',
+    /finiteNumber\(c\.likes\)/.test(vbdSrc) && /row\.likes = c\.likes/.test(vbdSrc));
+  check('P-src proof_options compact keeps reviews_text (scoped disclosure)',
+    /row\.reviews_text = opt\.reviews_text/.test(vbdSrc));
+  check('P-src compactQuote is text+author only (no source / site-as-author extras)',
+    /return \{ text: q\.text, author: q\.author \|\| null \}/.test(vbdSrc)
+      && !/q\.verified/.test(vbdSrc) && !/q\.source/.test(vbdSrc));
+  const directorSrc = fs.readFileSync(
+    path.join(ROOT, 'services/aiCreativeDirectorService.js'), 'utf8');
+  check('P-src DIRECTOR_SIGNALS_VERSION unchanged (consumption-only; no assembleSignals shape change)',
+    /const DIRECTOR_SIGNALS_VERSION = '3\.6\.0'/.test(directorSrc));
 
   function withTempMutation(filePath, find, replace, runCheck) {
     const original = fs.readFileSync(filePath, 'utf8');
@@ -446,6 +743,32 @@ async function runAsync() {
       }
     );
     check('RP-N6 [REVERT-PROOF] dropping product signals memo fails N6',
+      failedAsExpected);
+  }
+  {
+    let failedAsExpected = false;
+    withTempMutation(
+      path.join(ROOT, 'services/videoBenefitsDirector.js'),
+      'row.likes = c.likes;',
+      '/* likes-stripped */',
+      (mutSrc) => {
+        failedAsExpected = !/row\.likes = c\.likes/.test(mutSrc);
+      }
+    );
+    check('RP-P3 [REVERT-PROOF] dropping top_comments likes copy fails P-src likes pin',
+      failedAsExpected);
+  }
+  {
+    let failedAsExpected = false;
+    withTempMutation(
+      path.join(ROOT, 'services/videoBenefitsDirector.js'),
+      'if (perf) out.performance = perf;',
+      '/* performance-stripped */',
+      (mutSrc) => {
+        failedAsExpected = !/if \(perf\) out\.performance = perf/.test(mutSrc);
+      }
+    );
+    check('RP-P7 [REVERT-PROOF] dropping performance attach fails P-src performance pin',
       failedAsExpected);
   }
 }
