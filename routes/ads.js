@@ -101,6 +101,7 @@ const {
 const { buildGridPreviewVideoUrl } = require('../services/videoPreviewUrl');
 const { buildGridPreviewImageUrl } = require('../services/imagePreviewUrl');
 const ugcVideoPipeline = require('../services/ugcVideoPipeline');
+const { resolveAdVideoDurationSec } = require('../services/videoDurationPolicy');
 
 // Derive-only 1:1 ads requeue while their 9:16 master is still in flight.
 // Each claim→wait→requeue cycle counts as one attempt on `deriveWaitAttempts`
@@ -468,7 +469,7 @@ router.post('/generate', async (req, res) => {
       includeCategoryMatched = false,
       includeBrandMatched    = false,
       refresh     = false,  // wizard checkbox / smoke-test override; bypasses de-dupe + LayoutInputArtifact cache
-      videoDurationSec = null,  // wizard format-selection stage; integer 1–15, null = standard 8s
+      videoDurationSec = null,  // wizard format-selection stage; integer 1–15, null = META_VIDEO_DURATION_SEC (10s)
       // "All static formats" wizard button — fans each image concept out to
       // every Meta static surface (staticFanoutForPlatformFormat) instead of
       // just platformFormat. EACH SIZE IS A SEPARATE BILLABLE GENERATION.
@@ -551,7 +552,7 @@ router.post('/generate', async (req, res) => {
     }
 
     // Per-ad video duration from the wizard. Optional; when present must
-    // be an integer 1..15. null/''/absent → service default (standard 8s).
+    // be an integer 1..15. null/''/absent → META_VIDEO_DURATION_SEC (10s).
     let parsedVideoDurationSec = null;
     if (videoDurationSec !== undefined && videoDurationSec !== null && videoDurationSec !== '') {
       const n = Number(videoDurationSec);
@@ -3015,7 +3016,7 @@ async function renderOneInner(run, job, adId, index, renderToken) {
         const ugcResult = await ugcVideoPipeline.preparePassthroughMaster({
           media:         sourceMedia,
           aspectRatio:   ad.aspectRatio || '9:16',
-          durationSec:   8
+          durationSec:   resolveAdVideoDurationSec(ad)
         });
         if (ugcResult.passthrough) {
           veoVideoUrl    = ugcResult.videoUrl;
@@ -3047,7 +3048,8 @@ async function renderOneInner(run, job, adId, index, renderToken) {
       // warns + falls through to Grok — that is the pre-Phase-5 behaviour
       // for non-UGC video seeds and is not something Phase 5 rewrites.
       if (!veoVideoUrl && !ugcPassthroughSkip && isVideoSeed) {
-        const segmentUrl = buildVideoSegmentUrl(sourceMedia.fileUrl, ad.aspectRatio || '9:16', 8);
+        const seedDurationSec = resolveAdVideoDurationSec(ad);
+        const segmentUrl = buildVideoSegmentUrl(sourceMedia.fileUrl, ad.aspectRatio || '9:16', seedDurationSec);
         if (!segmentUrl) {
           console.warn(
             `⚠️  [veo] ad=${adId} seed is video but not Cloudinary-hosted (${sourceMedia.fileUrl?.slice(0, 80)}…) — ` +
@@ -3058,7 +3060,7 @@ async function renderOneInner(run, job, adId, index, renderToken) {
           veoAspectRatio = ad.aspectRatio || '9:16';
           adStage(adId, 'reusing video seed segment (no generation)');
           console.log(
-            `🎬 [veo] ad=${adId} seed=video → skip Grok, 8s Cloudinary segment ` +
+            `🎬 [veo] ad=${adId} seed=video → skip Grok, ${seedDurationSec}s Cloudinary segment ` +
             `(aspect=${veoAspectRatio}) → ${segmentUrl.slice(0, 120)}…`
           );
         }

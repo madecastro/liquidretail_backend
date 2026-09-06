@@ -66,15 +66,10 @@ it clears it back to this placeholder in the same commit that closes it out.)_
 
 ## CURRENT STATE
 
-**2026-09-03: benefits-to-directors LANDED — backend #383 + adgen #109 merged,
-both deployed and confirmed live.** Full detail:
-`session.d/2026-09-03_benefits-to-directors-landed-and-deployed.md`. One
-finding worth surfacing here directly: a stray "REVERT-PROVE INJECTION" test
-comment (citing a fictitious module, zero functional effect) was found
-appended to `services/bootRecoveryService.js` in this worktree and was
-stripped before landing — not committed. An untracked, unreviewed
-`scripts/verifyDocCitations.js` was also found (currently fails when run) and
-was deliberately left uncommitted, out of scope for this landing.
+**2026-09-05: stale 8s video-duration fallbacks, unpushed.** Sibling worktrees
+`.wt-fix-stale-video-duration-backend` / `-adgen` on `fix/stale-video-duration`
+(off current origin trunks). Dirty main checkouts were not touched. Full
+write-up: `session.d/2026-09-05_stale-video-duration-8s-fallback.md`.
 
 *(Prior 2026-09-03 night, superseded by the landing above.)*
 

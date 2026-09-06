@@ -65,6 +65,7 @@ const {
   buildVideoCropUrl, isTransformableVideoUrl, hasExistingCropTransform,
 } = require('./videoCropUrl');
 const { noteRenderIssue } = require('./adStage');
+const { resolveAdVideoDurationSec } = require('./videoDurationPolicy');
 
 const ENABLED = () => String(process.env.BASE_PLATE_CROP_ENABLED ?? 'true').toLowerCase() !== 'false';
 // Face keep-out for titling (plateHints band avoid flags). Off → behaviour
@@ -580,7 +581,7 @@ async function resolveBasePlateVideoUrl({ ad, format }) {
       }
     }
 
-    const durationSec = Number(ad.videoDurationSec) > 0 ? Number(ad.videoDurationSec) : 8;
+    const durationSec = resolveAdVideoDurationSec(ad);
     const det = await internals.detectClipBoxes(ad.veoVideoUrl, durationSec, {
       brandId: ad.brandId, campaignId: ad.campaignId, adId: ad._id, mediaId: ad.mediaId,
       productId: ad.productId || null,
@@ -797,7 +798,7 @@ async function ensureFaceDetectionForKeepOut({ ad, format }) {
   }
 
   try {
-    const durationSec = Number(ad.videoDurationSec) > 0 ? Number(ad.videoDurationSec) : 8;
+    const durationSec = resolveAdVideoDurationSec(ad);
     const dims = await internals.measureDeliveryDims(ad.veoVideoUrl);
     const det = await internals.detectClipBoxes(ad.veoVideoUrl, durationSec, {
       brandId: ad.brandId, campaignId: ad.campaignId, adId: ad._id, mediaId: ad.mediaId,

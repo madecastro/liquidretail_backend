@@ -33,6 +33,7 @@
 const Media                = require('../models/Media');
 const { uploadUrlToCloudinary } = require('./cloudinaryService');
 const { buildVideoSegmentUrl }  = require('./atlasVideoService');
+const { fallbackVideoDurationSec } = require('./videoDurationPolicy');
 
 // Sources that indicate a Media doc originated from UGC ingestion.
 // Kept in one place so the picker (Phase 2), the /api/media?ugc=true
@@ -154,7 +155,10 @@ async function mirrorUgcVideoToCloudinary(media) {
 // The three-way return is deliberate: the dispatcher must never
 // silently promote a skip into an Omni submit. Callers case-split
 // on `passthrough` vs `skip` explicitly.
-async function preparePassthroughMaster({ media, aspectRatio, durationSec = 8 }) {
+async function preparePassthroughMaster({ media, aspectRatio, durationSec } = {}) {
+  if (!(Number.isFinite(Number(durationSec)) && Number(durationSec) > 0)) {
+    durationSec = fallbackVideoDurationSec();
+  }
   if (!isUgcVideoPassthroughEnabled()) {
     return { passthrough: false, reason: 'UGC_VIDEO_PASSTHROUGH=false' };
   }
