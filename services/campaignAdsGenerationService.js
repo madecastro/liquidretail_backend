@@ -2853,11 +2853,6 @@ const CREATIVE_STYLE_TO_TEMPLATE = {
   editorial:        'ai_editorial',
   promotional:      'ai_promotional'
 };
-// Unrecognised creative_style used to fall through to ai_brand_led — the
-// same silent default that made 100% of deterministic video ads brand_led.
-// Editorial is the floor of intentForTemplate (product_first_lifestyle) and
-// is always eligible. Explicit `brand_led` from the Director still maps.
-const CONCEPT_TEMPLATE_FALLBACK = 'ai_editorial';
 
 // Per-concept identity. campaignId scopes uniqueness; conceptId +
 // productId + platformFormat distinguish within campaign. Independent
@@ -4111,7 +4106,7 @@ async function runConceptDrivenExpansion({
 
         const score = scoreByConcept.get(concept.concept_id) || {};
         const creativeStyle = conceptField(concept, 'creative_style');
-        const template = CREATIVE_STYLE_TO_TEMPLATE[creativeStyle] || CONCEPT_TEMPLATE_FALLBACK;
+        const template = CREATIVE_STYLE_TO_TEMPLATE[creativeStyle] || 'ai_brand_led';
         const role = primaryUniverseEntry.role;
         // Director already emits routing.funnel_stage on PMax rounds
         // (and on every destination when DIRECTOR_FUNNEL_STAGE_ALL is

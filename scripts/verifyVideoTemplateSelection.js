@@ -269,12 +269,20 @@ check('E expandDeterministicVideo payload calls selectVideoTemplate',
   }
 }
 
-check('E CONCEPT_TEMPLATE_FALLBACK is ai_editorial',
-  /const CONCEPT_TEMPLATE_FALLBACK = 'ai_editorial'/.test(cagSrc));
-check('E concept-driven unrecognised style uses CONCEPT_TEMPLATE_FALLBACK',
-  /CREATIVE_STYLE_TO_TEMPLATE\[creativeStyle\] \|\| CONCEPT_TEMPLATE_FALLBACK/.test(cagSrc));
-check('E concept-driven no longer falls through to ai_brand_led',
-  !/CREATIVE_STYLE_TO_TEMPLATE\[creativeStyle\] \|\| 'ai_brand_led'/.test(cagSrc));
+// SCOPE FENCE. This feature changes the DETERMINISTIC-VIDEO mint only.
+// An earlier draft also repointed the CONCEPT-DRIVEN (static) fallback for an
+// unrecognised creative_style from 'ai_brand_led' to 'ai_editorial'. That was
+// reverted deliberately: CLAUDE.md documents ai_brand_led as the Director's
+// "default of last resort", and the owner-approved remedy for brand_led
+// over-representation was per-style prompt guidance (buildPromptRound), NOT
+// changing this fallback. ai_editorial is also unmapped in TEMPLATE_INTENT and
+// silently descends to product_first_lifestyle, so the swap would have changed
+// static intent selection as a side effect of a video-only change.
+// These two checks keep that fence standing.
+check('E concept-driven (static) fallback still ai_brand_led — video change must not touch it',
+  /CREATIVE_STYLE_TO_TEMPLATE\[creativeStyle\] \|\| 'ai_brand_led'/.test(cagSrc));
+check('E no CONCEPT_TEMPLATE_FALLBACK indirection reintroduced',
+  !/CONCEPT_TEMPLATE_FALLBACK/.test(cagSrc));
 
 {
   const digestFn = cagSrc.match(/function computeDeterministicVideoDigest\([\s\S]*?return crypto\.createHash/);
