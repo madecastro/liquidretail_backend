@@ -104,10 +104,16 @@ function resetAll() {
 resetAll();
 
 const workerSrc = read('worker.js');
-check('A2 worker wiring — post-sync-reconcile guard',
-  /createTickGuard\(\s*['"]post-sync-reconcile['"]\s*\)/.test(workerSrc)
-    && /postSyncReconcileTick/.test(workerSrc),
-  'postSyncReconcileTick must be wrapped in createTickGuard(\'post-sync-reconcile\')');
+{
+  const tickBlock = workerSrc.match(
+    /const postSyncGuard = createTickGuard\(\s*['"]post-sync-reconcile['"]\s*\);[\s\S]*?setInterval\(postSyncReconcileTick/
+  );
+  check('A2 worker wiring — post-sync-reconcile guard',
+    tickBlock
+      && /postSyncGuard\(\s*async\s*\(\)\s*=>/.test(tickBlock[0])
+      && /sweepIncompleteBrands\(/.test(tickBlock[0]),
+    'postSyncReconcileTick must invoke the guard around a function that calls sweepIncompleteBrands');
+}
 check('A2b worker wiring — yolo-backfill guard',
   /createTickGuard\(\s*['"]yolo-backfill['"]\s*\)/.test(workerSrc)
     && /yoloBackfillTick/.test(workerSrc),
@@ -158,7 +164,10 @@ console.log('\nB. in-process skip + sweep predicate');
     materialize: async () => { materializeCalls++; await hang; },
     yolo: async () => ({ ok: true }),
     applyBackoff: async () => ({ failures: 1, delayMs: 1800000 }),
-    backoffAfterSuccess: async () => {}
+    backoffAfterSuccess: async () => {},
+    claimChainHeartbeat: async () => true,
+    touchChainHeartbeat: async () => {},
+    clearChainHeartbeat: async () => {}
   });
   const p1 = orch.runPostSyncChain('brand-b1');
   await delay(30);
@@ -230,6 +239,47 @@ console.log('\nB. in-process skip + sweep predicate');
     b3.length === 0,
     `a brand whose LATEST run succeeded must not be selected (got ${JSON.stringify(b3)})`);
 
+  const sweepSrc = read('services/catalogPostSyncOrchestrator.js');
+  const sweepFn = (sweepSrc.match(/async function sweepIncompleteBrands[\s\S]*?function inFlightCount/) || [''])[0];
+  check('B2s sweepIncompleteBrands calls filterSweepCandidates',
+    /filterSweepCandidates\(/.test(sweepFn) && /allowDiskUse:\s*true/.test(sweepFn),
+    'production sweep must call the helper and pass allowDiskUse:true');
+
+  resetAll();
+  const sweepStarted = [];
+  orch.__test.setOverrides({
+    aggregateLatestRuns: async () => [
+      { _id: 'healed', lastStatus: 'succeeded', lastHeartbeatAt: new Date() },
+      { _id: 'needs', lastStatus: 'failed', lastHeartbeatAt: new Date(0) }
+    ],
+    distinctLiveBrandIds: async () => [],
+    distinctPendingBrandIds: async () => [],
+    loadBrandState: async () => [],
+    runChain: async (id) => { sweepStarted.push(id); return { status: 'ok' }; }
+  });
+  await orch.sweepIncompleteBrands({ batchSize: 5, staleMinutes: 30 });
+  check('B3s sweepIncompleteBrands itself skips a newer-succeeded brand',
+    !sweepStarted.includes('healed') && sweepStarted.includes('needs'),
+    `started ${sweepStarted.join(', ') || '(none)'} — healed must not start`);
+  orch.__test.setOverrides({});
+
+  resetAll();
+  const liveStarted = [];
+  orch.__test.setOverrides({
+    aggregateLatestRuns: async () => [
+      { _id: 'sib', lastStatus: 'failed', lastHeartbeatAt: new Date() }
+    ],
+    distinctLiveBrandIds: async () => ['sib'],
+    distinctPendingBrandIds: async () => [],
+    loadBrandState: async () => [],
+    runChain: async (id) => { liveStarted.push(id); return { status: 'ok' }; }
+  });
+  await orch.sweepIncompleteBrands({ batchSize: 5, staleMinutes: 30 });
+  check('B2b sweepIncompleteBrands skips failed latest with a live sibling',
+    liveStarted.length === 0,
+    `started ${liveStarted.join(', ') || '(none)'}`);
+  orch.__test.setOverrides({});
+
   // ══════════════════════════════════════════════════════════════════════════
   console.log('\nC. shared limiter');
   // ══════════════════════════════════════════════════════════════════════════
@@ -300,6 +350,11 @@ console.log('\nB. in-process skip + sweep predicate');
   check('D1 breaker opens and runYoloDetection returns yolo-circuit-open',
     d1.ok === false && d1.reason === 'yolo-circuit-open' && limiter.isOpen() === true,
     `got ${JSON.stringify(d1)} isOpen=${limiter.isOpen()}`);
+  check('D1b aborted skips are not counted as detected',
+    typeof d1.detected === 'number' && typeof d1.remaining === 'number'
+      && d1.detected + d1.remaining === d1targets.length
+      && d1.detected < d1targets.length,
+    `detected=${d1.detected} remaining=${d1.remaining} total=${d1targets.length}`);
 
   resetAll();
   const d2fail = [];
@@ -315,7 +370,10 @@ console.log('\nB. in-process skip + sweep predicate');
     materialize: async () => {},
     yolo: async () => ({ ok: false, reason: 'yolo-circuit-open', remaining: 8274 }),
     applyBackoff: async () => ({ failures: 1, delayMs: 1_800_000 }),
-    backoffAfterSuccess: async () => {}
+    backoffAfterSuccess: async () => {},
+    claimChainHeartbeat: async () => true,
+    touchChainHeartbeat: async () => {},
+    clearChainHeartbeat: async () => {}
   });
   const d2 = await orch.runPostSyncChain('brand-d2');
   check('D2 parent fail reason yolo-circuit-open (succeed not called)',
@@ -334,6 +392,11 @@ console.log('\nB. in-process skip + sweep predicate');
       && limiter.isTransientForBreaker('conn-reset') === true
       && limiter.isTransientForBreaker('unidentified-image') === false,
     'http-503 must count as transient for the breaker even though isTransientYoloError is conn-only');
+  check('D3b econnrefused/enotfound are breaker-transient; unknown is not',
+    limiter.isTransientForBreaker('econnrefused') === true
+      && limiter.isTransientForBreaker('enotfound') === true
+      && limiter.isTransientForBreaker('unknown') === false,
+    'setup-down kinds must trip the breaker; unknown must not');
 
   resetAll();
   limiter.__test.reset({ limit: 6, threshold: 5, cooldownMs: 1_800_000 });
@@ -448,12 +511,14 @@ console.log('\nB. in-process skip + sweep predicate');
   const untilPath = Brand.schema.path('catalogYoloBackoffUntil');
   const failPath = Brand.schema.path('catalogYoloBackoffFailures');
   const reasonPath = Brand.schema.path('catalogYoloBackoffReason');
+  const hbPath = Brand.schema.path('catalogPostSyncHeartbeatAt');
   check('H1 Brand paths declared',
     untilPath && untilPath.instance === 'Date'
       && failPath && failPath.instance === 'Number'
       && reasonPath && reasonPath.instance === 'String'
+      && hbPath && hbPath.instance === 'Date'
       && Brand.schema.options.strict !== false,
-    'catalogYoloBackoffUntil/Failures/Reason must be declared on the strict Brand schema');
+    'catalogYoloBackoffUntil/Failures/Reason and catalogPostSyncHeartbeatAt must be declared on the strict Brand schema');
 
   const at = new Date('2026-09-06T00:00:00Z');
   const doc = new Brand({
@@ -479,8 +544,10 @@ console.log('\nB. in-process skip + sweep predicate');
       && envHas('YOLO_TIMEOUT_MS', '120000')
       && envHas('YOLO_RETRY_ATTEMPTS', '1')
       && envHas('YOLO_RETRY_DELAY_MS', '1000')
+      && envHas('POST_SYNC_CHAIN_HEARTBEAT_STALE_MIN', '15')
       && envHas('CATALOG_YOLO_MAX_PER_RUN', '0')
       && orch.MAX_INFLIGHT_CHAINS === 1
+      && orch.CHAIN_HEARTBEAT_STALE_MIN === 15
       && limiter.threshold() === 5
       && yoloService.YOLO_TIMEOUT_MS === 120000
       && detection.parseMaxPerRun(0) === Infinity
@@ -509,6 +576,140 @@ console.log('\nB. in-process skip + sweep predicate');
     moneyRequires.length === 0
       && !fs.existsSync(path.join(ROOT, 'adgen', 'src', 'services', 'yoloLoadLimiter.js')),
     `unexpected money-path requires: ${moneyRequires.join(', ') || '(none)'}`);
+
+  // ══════════════════════════════════════════════════════════════════════════
+  console.log('\nJ. round-2 adversarial findings');
+  // ══════════════════════════════════════════════════════════════════════════
+
+  resetAll();
+  const claimedAt = new Map();
+  orch.__test.setOverrides({
+    findBrand: async () => ({ advertiserId: 'adv' }),
+    startRun: async () => ({
+      tick() {},
+      succeed: async () => {},
+      fail: async () => {},
+      id: 'j1'
+    }),
+    materialize: async () => { await new Promise((r) => setTimeout(r, 200)); },
+    yolo: async () => ({ ok: true }),
+    applyBackoff: async () => ({ failures: 1, delayMs: 1800000 }),
+    backoffAfterSuccess: async () => {},
+    claimChainHeartbeat: async (id) => {
+      const prev = claimedAt.get(String(id));
+      if (prev && Date.now() - prev < orch.CHAIN_HEARTBEAT_STALE_MS) return false;
+      claimedAt.set(String(id), Date.now());
+      return true;
+    },
+    touchChainHeartbeat: async () => {},
+    clearChainHeartbeat: async () => {}
+  });
+  const j1hang = new Promise(() => {});
+  orch.__test.setOverrides({
+    ...orch.__test.getOverrides(),
+    materialize: async () => { await j1hang; }
+  });
+  const j1p = orch.runPostSyncChain('cross-proc');
+  await delay(30);
+  orch.__test.resetInFlight();
+  const j1b = await Promise.race([
+    orch.runPostSyncChain('cross-proc'),
+    delay(80).then(() => ({ status: 'timeout', reason: 'hung' }))
+  ]);
+  check('J1 cross-process double-start skipped via Brand heartbeat (chain-alive)',
+    j1b.status === 'skipped' && j1b.reason === 'chain-alive',
+    `empty inFlightBrands must still refuse a second start (got ${JSON.stringify(j1b)})`);
+  orch.__test.setOverrides({});
+  orch.__test.resetInFlight();
+
+  const j2now = Date.now();
+  const j2 = orch.filterSweepCandidates({
+    latestRuns: [{ brandId: 'gymshark', lastStatus: 'failed' }],
+    liveBrandIds: [],
+    inFlight: [],
+    backoffUntil: {},
+    chainHeartbeatAt: { gymshark: j2now - 10_000 },
+    now: j2now,
+    staleMs: 2 * 60 * 1000,
+    chainStaleMs: orch.CHAIN_HEARTBEAT_STALE_MS
+  });
+  const j2stale = orch.filterSweepCandidates({
+    latestRuns: [{ brandId: 'dead-holder', lastStatus: 'failed' }],
+    liveBrandIds: [],
+    inFlight: [],
+    backoffUntil: {},
+    chainHeartbeatAt: { 'dead-holder': j2now - orch.CHAIN_HEARTBEAT_STALE_MS - 1000 },
+    now: j2now,
+    staleMs: 2 * 60 * 1000,
+    chainStaleMs: orch.CHAIN_HEARTBEAT_STALE_MS
+  });
+  check('J2 failed OperationRun with fresh Brand heartbeat is skipped; stale heartbeat is retryable',
+    j2.length === 0 && j2stale.length === 1 && j2stale[0] === 'dead-holder',
+    `fresh=${JSON.stringify(j2)} stale=${JSON.stringify(j2stale)}`);
+
+  resetAll();
+  limiter.__test.reset({ limit: 6, threshold: 5, cooldownMs: 1_800_000 });
+  const j3fail = [];
+  const j3ok = [];
+  detection.__test.setStartRun(async () => ({
+    tick() {},
+    checkpoint: async () => {},
+    succeed: async (m) => { j3ok.push(m); },
+    fail: async (err, meta) => { j3fail.push({ message: err && err.message, meta }); },
+    markCancelled() {},
+    id: 'j3'
+  }));
+  const j3 = await detection.runYoloDetectionOnTargets(
+    Array.from({ length: 10 }, (_, i) => ({ _id: `j3${i}` })),
+    {
+      brandId: 'brand-j3',
+      worker: async () => ({ failed: 3, transient: limiter.isTransientForBreaker('econnrefused'), yoloKind: 'econnrefused' })
+    }
+  );
+  check('J3 econnrefused trips breaker and does NOT succeed',
+    j3.ok === false && j3.reason === 'yolo-circuit-open' && limiter.isOpen() === true && j3ok.length === 0,
+    `got ${JSON.stringify(j3)} succeed=${j3ok.length} fail=${j3fail.length}`);
+
+  const orchJ = read('services/catalogPostSyncOrchestrator.js');
+  check('J4 latest-run aggregate uses allowDiskUse and alerts on catch',
+    /allowDiskUse:\s*true/.test(orchJ)
+      && /post-sync:sweep-aggregate-failed/.test(orchJ),
+    'signal (a) must not silently swallow a 100MB sort cap');
+
+  resetAll();
+  let callYoloPosts = 0;
+  yoloService.__test.setCallYoloPost(async () => {
+    callYoloPosts++;
+    const err = new Error('timeout of 120000ms exceeded');
+    err.code = 'ECONNABORTED';
+    throw err;
+  });
+  let j5threw = false;
+  let j5kind = null;
+  try {
+    await yoloService.detectMultipleProducts(Buffer.from('x'));
+  } catch (err) {
+    j5threw = true;
+    j5kind = err.yoloKind;
+  }
+  check('J5 _callYolo /detect does not retry in-flight timeout',
+    j5threw && callYoloPosts === 1 && j5kind === 'client-timeout'
+      && /function isInFlightYoloKind/.test(read('services/yoloService.js'))
+      && (read('services/yoloService.js').match(/isInFlightYoloKind\(/g) || []).length >= 3,
+    `calls=${callYoloPosts} threw=${j5threw} kind=${j5kind}`);
+  yoloService.__test.setCallYoloPost(null);
+
+  const applyFn = (orchJ.match(/async function applyBackoff[\s\S]*?async function backoffAfterSuccess/) || [''])[0];
+  check('J6 applyBackoff is a single atomic findOneAndUpdate (no findById increment)',
+    /findOneAndUpdate/.test(applyFn)
+      && /\$add/.test(applyFn)
+      && !/findById/.test(applyFn),
+    'lost-update read-modify-write must not remain');
+
+  check('J8 first-wave log does not claim threshold is exact',
+    /is a floor/.test(read('services/catalogYoloDetectionService.js'))
+      && /first wave may run up to concurrency/.test(read('services/catalogYoloDetectionService.js')),
+    'log must not imply consecutive count equals THRESHOLD exactly');
 
   // ══════════════════════════════════════════════════════════════════════════
   console.log('\nI. gap predicate (legit-empty exclusion)');

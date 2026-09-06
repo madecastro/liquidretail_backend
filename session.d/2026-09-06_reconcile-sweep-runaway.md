@@ -69,13 +69,32 @@ revert-proved), group E extension on `verifyPostSyncOrchestrator.js`.
 
 ## Still open
 
-- Per-kind `MAX_RUN_MS` override on `startRun` (4h parent zombie after
-  `closeTimers`; same-process registry covers it; do not change
-  `progressService` globally).
+- Per-kind `MAX_RUN_MS` override on `startRun` is still not done (do not
+  change `progressService` globally). The 4h OperationRun zombie that
+  used to re-fire a live chain is closed by `Brand.catalogPostSyncHeartbeatAt`
+  (round 2) instead.
 - Gunicorn 300s / edge 100s / 3×4=12 slot cluster: UNVERIFIED in this
   repo (cited from the incident brief + existing comment). Limiter sized
   6 against the reported 12; do not raise 6 in this PR.
 - `scheduledSyncService` 60s interval still has no tick guard (out of
-  scope; chains are covered by the in-process registry).
+  scope; chains are now covered by the Brand-level heartbeat across
+  processes, not only the in-process registry).
 - First deploy has no stored Brand backoff, so it tries immediately
   (owner Q2). Later deploys honor leftover `catalogYoloBackoffUntil`.
+
+## Round 2 (adversarial close)
+
+Fresh-session review found F1–F8. Closed without touching `progressService.MAX_RUN_MS`:
+
+- **F1/F2:** `Brand.catalogPostSyncHeartbeatAt` atomic claim + per-product
+  touch; stale after `POST_SYNC_CHAIN_HEARTBEAT_STALE_MIN=15`. Dead holder
+  becomes retryable; live Gymshark drain is not. Gated in `runPostSyncChain`
+  AND `filterSweepCandidates`.
+- **F3:** `econnrefused`/`enotfound` are breaker-transient; `unknown` is not.
+- **F4:** `allowDiskUse: true` + Slack `post-sync:sweep-aggregate-failed`.
+- **F5:** `_callYolo` same no-retry-on-in-flight as `detectBatch`.
+- **F6:** one `findOneAndUpdate` aggregation pipeline for backoff.
+- **F7:** comment only — `inFlightBrands.size` is conservative and correct.
+- **F8:** log says threshold is a floor; aborted skips are not `detected`.
+- Harness: A2 wraps the tick body; B2s/B3s drive `sweepIncompleteBrands`
+  with stubbed aggregate; J1–J6/J8 revert-proved.
