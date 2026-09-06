@@ -281,6 +281,7 @@ including that a non-string or blank label never prints `by undefined`.
 | `Director served by a FALLBACK model — the primary is unavailable` | warn | `aiCreativeDirectorService.directConceptsRound` | Ads ARE being produced, but by a fallback chain link. Fires on the first occurrence per serving model |
 | `YOLO microservice degraded — catalog detection paused` | error | `yoloLoadLimiter.recordOutcome` | Process-wide catalog YOLO circuit opened after `CATALOG_YOLO_BREAKER_THRESHOLD` consecutive whole-batch transients. Catalog detection paused; resumes automatically after `CATALOG_YOLO_BREAKER_COOLDOWN_MS`. Dedupe key `yolo:circuit-open` (cooldown-gated so a 30m open window does not re-page every tick). Live/UGC DetectRun is uncapped and not paused. |
 | `Catalog YOLO chain aborted — brand …` | error | `catalogPostSyncOrchestrator` | A brand's post-sync chain aborted with `reason:'yolo-circuit-open'`. Carries brand, consecutive transients, remaining targets, backoff applied. Dedupe key `yolo:circuit-open:brand:<id>`. Operator action: YOLO microservice degraded; catalog detection paused; resumes automatically after cooldown. |
+| `Post-sync reconcile latest-run query failed` | error | `catalogPostSyncOrchestrator` sweep | Signal (a) `$sort+$group` latest-run aggregation threw (e.g. Mongo 100MB sort cap). Distinct from “reconcile found nothing to do”. Dedupe key `post-sync:sweep-aggregate-failed`. |
 
 ### Director alerts — added 2026-08-18 after a 20-hour silent outage
 
