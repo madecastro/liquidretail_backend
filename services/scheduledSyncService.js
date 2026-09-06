@@ -22,35 +22,134 @@ const { concurrency: CONC } = require('./concurrency');
 
 const CATALOG_RESYNC_PRODUCT_SOURCES = ['shopify-direct', 'sitemap-jsonld', 'apify-shopify'];
 const CATALOG_RESYNC_IN_PROGRESS_KINDS = ['catalog-sync', 'demo-sync'];
-const DEFAULT_RESYNC_INTERVAL_H = 24;
-const DEFAULT_RESYNC_SPACING_MS = 3 * 60 * 1000;
+const NIGHTLY_TZ = 'America/Los_Angeles';
+const DEFAULT_NIGHTLY_HOUR = 2;
+const DEFAULT_NIGHTLY_WINDOW_H = 8;
+// 3 concurrent brands: enough to drain a typical fleet overnight without
+// opening dozens of simultaneous storefront scrapes from one worker.
+// Shopify-direct paces ≥400ms/request per brand; 3 parallel brands hit
+// different merchant hosts, ~7.5 rps total. Hard ceiling 8 (parser).
+const DEFAULT_NIGHTLY_CONCURRENCY = 3;
+const NIGHTLY_CONCURRENCY_MAX = 8;
 
 function isCatalogScheduledResyncEnabled() {
   return process.env.CATALOG_SCHEDULED_RESYNC_ENABLED === 'true';
 }
 
-function catalogResyncIntervalMs() {
-  const n = Number(process.env.CATALOG_RESYNC_INTERVAL_H);
-  if (!Number.isFinite(n) || n <= 0) return DEFAULT_RESYNC_INTERVAL_H * 3600 * 1000;
-  return n * 3600 * 1000;
-}
-
-function catalogResyncSpacingMs() {
-  const n = Number(process.env.CATALOG_RESYNC_SPACING_MS);
-  if (!Number.isFinite(n) || n < 0) return DEFAULT_RESYNC_SPACING_MS;
+function catalogNightlyHour() {
+  const raw = process.env.CATALOG_NIGHTLY_HOUR;
+  if (raw == null || String(raw).trim() === '') return DEFAULT_NIGHTLY_HOUR;
+  const n = Number(raw);
+  if (!Number.isInteger(n) || n < 0 || n > 23) return DEFAULT_NIGHTLY_HOUR;
   return n;
 }
 
-function isCatalogResyncDue(brand, now, intervalMs) {
+function catalogNightlyWindowMs() {
+  const raw = process.env.CATALOG_NIGHTLY_WINDOW_H;
+  if (raw == null || String(raw).trim() === '') return DEFAULT_NIGHTLY_WINDOW_H * 3600 * 1000;
+  const n = Number(raw);
+  if (!Number.isFinite(n) || n <= 0) return DEFAULT_NIGHTLY_WINDOW_H * 3600 * 1000;
+  if (n > 24) return 24 * 3600 * 1000;
+  return n * 3600 * 1000;
+}
+
+function catalogNightlyConcurrency() {
+  const raw = process.env.CATALOG_NIGHTLY_CONCURRENCY;
+  if (raw == null || String(raw).trim() === '') return DEFAULT_NIGHTLY_CONCURRENCY;
+  const n = Number(raw);
+  if (!Number.isInteger(n) || n < 1) return DEFAULT_NIGHTLY_CONCURRENCY;
+  return Math.min(n, NIGHTLY_CONCURRENCY_MAX);
+}
+
+function pacificParts(date, timeZone) {
+  const tz = timeZone || NIGHTLY_TZ;
+  const dtf = new Intl.DateTimeFormat('en-US', {
+    timeZone: tz,
+    hourCycle: 'h23',
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit'
+  });
+  const parts = dtf.formatToParts(date instanceof Date ? date : new Date(date));
+  const get = (type) => Number(parts.find((p) => p.type === type).value);
+  return {
+    year: get('year'),
+    month: get('month'),
+    day: get('day'),
+    hour: get('hour'),
+    minute: get('minute'),
+    second: get('second')
+  };
+}
+
+function tzOffsetMs(ms, timeZone) {
+  const p = pacificParts(new Date(ms), timeZone);
+  const asUtc = Date.UTC(p.year, p.month - 1, p.day, p.hour, p.minute, p.second);
+  return asUtc - ms;
+}
+
+// Civil wall-clock in `timeZone` → UTC ms. Two-pass offset correction
+// (Intl, no extra dep). Spring-forward 2am Pacific is skipped; requesting
+// 02:00 that night lands on 03:00 PDT, which is the first valid instant
+// ≥ 2am and is the window start we want. Fall-back 2am exists once (PST).
+function zonedUtcMs(timeZone, year, month, day, hour, minute, second) {
+  const tz = timeZone || NIGHTLY_TZ;
+  const utcGuess = Date.UTC(year, month - 1, day, hour, minute || 0, second || 0);
+  let instant = utcGuess;
+  for (let i = 0; i < 3; i += 1) {
+    instant = utcGuess - tzOffsetMs(instant, tz);
+  }
+  return instant;
+}
+
+function addCivilDays(year, month, day, deltaDays) {
+  const utc = Date.UTC(year, month - 1, day) + deltaDays * 24 * 3600 * 1000;
+  const d = new Date(utc);
+  return { year: d.getUTCFullYear(), month: d.getUTCMonth() + 1, day: d.getUTCDate() };
+}
+
+function nightlyWindowStartOnPacificDate(year, month, day, hour, timeZone) {
+  return zonedUtcMs(timeZone || NIGHTLY_TZ, year, month, day, hour, 0, 0);
+}
+
+function currentNightlyWindowStartMs(now, opts) {
+  const o = opts && typeof opts === 'object' ? opts : {};
+  const timeZone = o.timeZone || NIGHTLY_TZ;
+  const hour = Number.isInteger(o.hour) ? o.hour : catalogNightlyHour();
+  const t = Number(now);
+  const parts = pacificParts(new Date(t), timeZone);
+  let start = nightlyWindowStartOnPacificDate(parts.year, parts.month, parts.day, hour, timeZone);
+  if (t < start) {
+    const y = addCivilDays(parts.year, parts.month, parts.day, -1);
+    start = nightlyWindowStartOnPacificDate(y.year, y.month, y.day, hour, timeZone);
+  }
+  return start;
+}
+
+function isInCatalogNightlyWindow(now, opts) {
+  const o = opts && typeof opts === 'object' ? opts : {};
+  const t = Number(now);
+  if (!Number.isFinite(t)) return false;
+  const start = currentNightlyWindowStartMs(t, o);
+  const windowMs = Number.isFinite(o.windowMs) && o.windowMs > 0
+    ? o.windowMs
+    : catalogNightlyWindowMs();
+  return t >= start && t < start + windowMs;
+}
+
+function isCatalogResyncDue(brand, now, windowStartMs) {
   if (!brand) return false;
   const last = brand.lastCatalogResyncAt;
   if (!last) return true;
   const t = new Date(last).getTime();
   if (!Number.isFinite(t)) return true;
-  const window = Number.isFinite(intervalMs) && intervalMs > 0
-    ? intervalMs
-    : catalogResyncIntervalMs();
-  return (now - t) >= window;
+  const start = Number.isFinite(windowStartMs)
+    ? windowStartMs
+    : currentNightlyWindowStartMs(now);
+  return t < start;
 }
 
 // Which catalog method a scheduled tick should run. Reuses
@@ -78,10 +177,10 @@ function resolveScheduledCatalogMethod(brand, sourceSet) {
   return null;
 }
 
-function selectDueCatalogResyncCandidate(brands, sourceByBrand, now, intervalMs) {
+function selectDueCatalogResyncCandidates(brands, sourceByBrand, now, windowStartMs) {
   const due = [];
   for (const b of brands || []) {
-    if (!isCatalogResyncDue(b, now, intervalMs)) continue;
+    if (!isCatalogResyncDue(b, now, windowStartMs)) continue;
     const key = String(b._id);
     const sources = sourceByBrand instanceof Map
       ? sourceByBrand.get(key)
@@ -95,13 +194,7 @@ function selectDueCatalogResyncCandidate(brands, sourceByBrand, now, intervalMs)
     const tb = b.brand.lastCatalogResyncAt ? new Date(b.brand.lastCatalogResyncAt).getTime() : 0;
     return ta - tb;
   });
-  return due[0] || null;
-}
-
-let lastCatalogResyncTickAt = 0;
-
-function _resetCatalogResyncSpacingForTest() {
-  lastCatalogResyncTickAt = 0;
+  return due;
 }
 
 async function hasCatalogSyncInProgress(brandId) {
@@ -120,7 +213,7 @@ async function dispatchCatalogResync(brand, method) {
     // Existing orchestrator — routes shopify-direct / generic / apify.
     // skipInstagram is the money guard: a catalog-only re-sync must not
     // fire the paid Apify IG actor as a side effect of a stamped igHandle.
-    return require('./apifyIngestService').syncBrandApify(brand._id, { skipInstagram: true });
+    return require('./apifyIngestService').syncBrandApify(brand._id, { skipInstagram: true, uncapped: true });
   }
   const { startRun } = require('./progressService');
   const run = await startRun({
@@ -138,10 +231,10 @@ async function dispatchCatalogResync(brand, method) {
         return skipped;
       }
       result = await require('./genericCatalogIngestService')
-        .syncBrandGenericCatalog(brand, run, { isBrandAborted: async () => false });
+        .syncBrandGenericCatalog(brand, run, { isBrandAborted: async () => false, uncapped: true });
     } else {
       result = await require('./shopifyPublicIngestService')
-        .syncBrandShopifyDirect(brand, run, { isBrandAborted: async () => false });
+        .syncBrandShopifyDirect(brand, run, { isBrandAborted: async () => false, uncapped: true });
     }
     if (result && result.ok === false) {
       await run.fail(new Error(result.reason || 'catalog resync failed'));
@@ -158,19 +251,35 @@ async function dispatchCatalogResync(brand, method) {
   }
 }
 
+function catalogResyncProductDelta(result, isDemo) {
+  if (!result) return 0;
+  if (isDemo) {
+    const shopify = result.shopify || {};
+    return Number(shopify.added || shopify.productsUpserted || 0) || 0;
+  }
+  return Number(result.productsUpserted || 0) || 0;
+}
+
+function catalogResyncSucceeded(result, isDemo) {
+  return !!(result
+    && result.ok !== false
+    && !result.skipped
+    && !result.cancelled
+    && !(isDemo && result.shopify && result.shopify.ok === false));
+}
+
 async function runDueCatalogResyncs(summary, now) {
   if (!isCatalogScheduledResyncEnabled()) return summary;
-  const spacingMs = catalogResyncSpacingMs();
-  if (lastCatalogResyncTickAt && (now - lastCatalogResyncTickAt) < spacingMs) {
-    return summary;
-  }
-  const intervalMs = catalogResyncIntervalMs();
-  const brands = await Brand.find({
-    $or: [
-      { 'syncSettings.autoSyncEnabled': true },
-      { isDemo: true }
-    ]
-  }).select('_id advertiserId isDemo websiteUrl apifyDemo syncSettings lastCatalogResyncAt').lean();
+  if (!isInCatalogNightlyWindow(now)) return summary;
+
+  const windowStartMs = currentNightlyWindowStartMs(now);
+  // All brands — eligibility is the catalog-source aggregation + method
+  // resolver, not the IG opt-in or demo-only gate. A brand with neither
+  // an eligible CatalogProduct.source nor a store origin still resolves
+  // method=null and is skipped.
+  const brands = await Brand.find({})
+    .select('_id advertiserId isDemo websiteUrl apifyDemo lastCatalogResyncAt')
+    .lean();
   if (!brands.length) return summary;
 
   const CatalogProduct = require('../models/CatalogProduct');
@@ -185,44 +294,81 @@ async function runDueCatalogResyncs(summary, now) {
     { $group: { _id: '$brandId', sources: { $addToSet: '$source' } } }
   ]);
   const sourceByBrand = new Map(grouped.map((g) => [String(g._id), new Set(g.sources)]));
-  const picked = selectDueCatalogResyncCandidate(brands, sourceByBrand, now, intervalMs);
-  if (!picked) return summary;
+  const due = selectDueCatalogResyncCandidates(brands, sourceByBrand, now, windowStartMs);
+  if (!due.length) return summary;
 
-  if (await hasCatalogSyncInProgress(picked.brand._id)) {
-    return summary;
+  const concurrency = catalogNightlyConcurrency();
+  const dispatching = [];
+  for (const picked of due) {
+    if (dispatching.length >= concurrency) break;
+    if (await hasCatalogSyncInProgress(picked.brand._id)) continue;
+    dispatching.push(picked);
   }
+  if (!dispatching.length) return summary;
 
-  lastCatalogResyncTickAt = now;
-  const hydrated = await Brand.findById(picked.brand._id);
-  if (!hydrated) return summary;
-  try {
-    const result = await dispatchCatalogResync(hydrated, picked.method);
-    const ok = !!(result
-      && result.ok !== false
-      && !result.skipped
-      && !result.cancelled
-      && !(hydrated.isDemo && result.shopify && result.shopify.ok === false));
-    if (ok) {
-      await Brand.updateOne(
-        { _id: hydrated._id },
-        { $set: { lastCatalogResyncAt: new Date() } }
-      );
+  // MONEY: first nights drain whatever historical "never fully synced"
+  // backlog exists, persist-uncapped, across every eligible brand. No
+  // extra approval gate — this is the asked behaviour — but the log
+  // is the operator's view of the exposure (brand count + per-brand
+  // product delta). YOLO / review-sentiment gap-fill on newly written
+  // rows is unchanged and still idempotent.
+  console.log(
+    `⏱  catalog-nightly: windowStart=${new Date(windowStartMs).toISOString()} ` +
+    `due=${due.length} dispatching=${dispatching.length} concurrency=${concurrency} ` +
+    `UNCAPPED persist (CATALOG_INGEST_LIMIT bypassed this path only)`
+  );
+
+  const settled = await Promise.all(dispatching.map(async (picked) => {
+    const hydrated = await Brand.findById(picked.brand._id);
+    if (!hydrated) {
+      return { picked, ok: false, reason: 'brand disappeared', delta: 0 };
+    }
+    try {
+      const result = await dispatchCatalogResync(hydrated, picked.method);
+      const ok = catalogResyncSucceeded(result, hydrated.isDemo);
+      const delta = catalogResyncProductDelta(result, hydrated.isDemo);
+      if (ok) {
+        await Brand.updateOne(
+          { _id: hydrated._id },
+          { $set: { lastCatalogResyncAt: new Date() } }
+        );
+      }
+      return {
+        picked,
+        ok,
+        skipped: !!(result && result.skipped),
+        reason: result && result.reason,
+        delta,
+        brandId: hydrated._id
+      };
+    } catch (err) {
+      return {
+        picked,
+        ok: false,
+        reason: err.message,
+        delta: 0,
+        brandId: hydrated._id
+      };
+    }
+  }));
+
+  for (const row of settled) {
+    console.log(
+      `⏱  catalog-nightly: brand=${row.brandId || row.picked.brand._id} ` +
+      `method=${row.picked.method} ok=${!!row.ok} upserted=${row.delta}` +
+      (row.reason ? ` reason=${row.reason}` : '')
+    );
+    if (row.ok) {
       summary.catalogsResynced = (summary.catalogsResynced || 0) + 1;
-    } else if (result && result.reason) {
+      summary.catalogResyncProducts = (summary.catalogResyncProducts || 0) + row.delta;
+    } else if (row.reason && !row.skipped) {
       summary.errors.push({
-        brandId: hydrated._id,
+        brandId: row.brandId || row.picked.brand._id,
         kind: 'catalog_resync',
-        method: picked.method,
-        reason: result.reason
+        method: row.picked.method,
+        reason: row.reason
       });
     }
-  } catch (err) {
-    summary.errors.push({
-      brandId: hydrated._id,
-      kind: 'catalog_resync',
-      method: picked.method,
-      reason: err.message
-    });
   }
   return summary;
 }
@@ -352,8 +498,10 @@ async function runDueSyncs() {
     }
     // ── Non-IG catalog re-sync (Shopify-direct / generic / Apify) ──
     // Flag-off is a no-op so the IG loops above stay today's behaviour.
-    // Serial: one brand per tick, spaced by CATALOG_RESYNC_SPACING_MS.
-    // Deploy-killed runs are not resumed — the next tick re-evaluates due-ness.
+    // Nightly window (2am Pacific, 8h default): up to N brands per tick,
+    // persist-uncapped, all brands with an eligible catalog source.
+    // lastCatalogResyncAt is the per-window "already swept" marker so a
+    // restart mid-window resumes remaining brands, not the whole fleet.
     try {
       await runDueCatalogResyncs(summary, now);
     } catch (err) {
@@ -449,14 +597,22 @@ module.exports = {
   startScheduler,
   runDueCatalogResyncs,
   isCatalogScheduledResyncEnabled,
-  catalogResyncIntervalMs,
-  catalogResyncSpacingMs,
+  catalogNightlyHour,
+  catalogNightlyWindowMs,
+  catalogNightlyConcurrency,
+  pacificParts,
+  zonedUtcMs,
+  currentNightlyWindowStartMs,
+  isInCatalogNightlyWindow,
   isCatalogResyncDue,
   resolveScheduledCatalogMethod,
-  selectDueCatalogResyncCandidate,
+  selectDueCatalogResyncCandidates,
   hasCatalogSyncInProgress,
   dispatchCatalogResync,
   CATALOG_RESYNC_PRODUCT_SOURCES,
   CATALOG_RESYNC_IN_PROGRESS_KINDS,
-  _resetCatalogResyncSpacingForTest
+  NIGHTLY_TZ,
+  DEFAULT_NIGHTLY_HOUR,
+  DEFAULT_NIGHTLY_WINDOW_H,
+  DEFAULT_NIGHTLY_CONCURRENCY
 };

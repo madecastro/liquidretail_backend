@@ -54,7 +54,7 @@ const LOG = '🗺';
 const UPSERT_BUDGET_MS = parseInt(process.env.GENERIC_CATALOG_UPSERT_BUDGET_MS, 10);
 
 /**
- * syncBrandGenericCatalog(brand, run, { isBrandAborted, categories })
+ * syncBrandGenericCatalog(brand, run, { isBrandAborted, categories, uncapped })
  *
  * brand  – hydrated Brand doc (_id, advertiserId, name, catalog URL fields)
  * run    – progressService run handle (stage/tick/checkpoint)
@@ -68,7 +68,7 @@ const UPSERT_BUDGET_MS = parseInt(process.env.GENERIC_CATALOG_UPSERT_BUDGET_MS, 
  *   categoryOptions?, categoryPromptSuggested?
  * }
  */
-async function syncBrandGenericCatalog(brand, run, { isBrandAborted, categories } = {}) {
+async function syncBrandGenericCatalog(brand, run, { isBrandAborted, categories, uncapped } = {}) {
   const t0 = Date.now();
   const errors = [];
   let productsUpserted = 0;
@@ -94,6 +94,7 @@ async function syncBrandGenericCatalog(brand, run, { isBrandAborted, categories 
     };
   }
 
+  const uncappedRun = uncapped === true;
   const CAP = Math.max(1, parseInt(process.env.GENERIC_CATALOG_LIMIT, 10) || DEFAULT_CAP);
 
   console.log(`${LOG}  Generic-catalog sync starting: brand=${brand._id} store=${origin} cap=${CAP}`);
@@ -232,7 +233,7 @@ async function syncBrandGenericCatalog(brand, run, { isBrandAborted, categories 
   // default 10. Stops the loop at the cap without changing what the
   // upstream fetch returned.
   const { catalogIngestLimit } = require('./ingestLimits');
-  const ingestCap = catalogIngestLimit();
+  const ingestCap = catalogIngestLimit({ uncapped: uncappedRun });
   let persistedCount = 0;
   try {
   for (const p of products) {

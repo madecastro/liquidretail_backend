@@ -96,7 +96,7 @@ function resolveCatalogMethod(cfg = {}) {
 // function re-reads the brand from Mongo, so a caller-side clear only works
 // if it is guaranteed to have committed and nothing else re-sets it first)
 // and it does not touch the brand's stored IG configuration at all.
-async function syncBrandApify(brandId, { skipInstagram = false } = {}) {
+async function syncBrandApify(brandId, { skipInstagram = false, uncapped = false } = {}) {
   const brand = await Brand.findById(brandId);
   if (!brand) {
     const e = new Error(`Brand ${brandId} not found`);
@@ -152,7 +152,7 @@ async function syncBrandApify(brandId, { skipInstagram = false } = {}) {
           out.shopify = { ok: false, reason: 'generic-sitemap method is disabled (GENERIC_CATALOG_ENABLED=false)' };
         } else {
           const r = await require('./genericCatalogIngestService')
-            .syncBrandGenericCatalog(brand, run, { isBrandAborted });
+            .syncBrandGenericCatalog(brand, run, { isBrandAborted, uncapped: uncapped === true });
           out.shopify = {
             added:   r.productsUpserted,
             videos:  r.videosIngested || 0,
@@ -178,7 +178,7 @@ async function syncBrandApify(brandId, { skipInstagram = false } = {}) {
         }
       } else if (method === 'shopify-direct') {
         const r = await require('./shopifyPublicIngestService')
-          .syncBrandShopifyDirect(brand, run, { isBrandAborted });
+          .syncBrandShopifyDirect(brand, run, { isBrandAborted, uncapped: uncapped === true });
         out.shopify = {
           added:   r.productsUpserted,
           videos:  r.videosIngested,
@@ -203,7 +203,7 @@ async function syncBrandApify(brandId, { skipInstagram = false } = {}) {
         // markCancelled still stamp exactly as today.
         if (r.cancelled) stillAborted = true;
       } else {
-        out.shopify = await syncBrandShopify(brand, run);
+        out.shopify = await syncBrandShopify(brand, run, { uncapped: uncapped === true });
       }
     } catch (err) { out.shopify = { ok: false, reason: err.message }; }
   } else if (cfg.shopifyUrl && stillAborted) {
@@ -551,7 +551,7 @@ async function ingestIgPost(brand, post) {
 }
 
 // ── Shopify side ───────────────────────────────────────────────────
-async function syncBrandShopify(brand, run = null) {
+async function syncBrandShopify(brand, run = null, { uncapped } = {}) {
   const t0 = Date.now();
   const shopifyUrl = brand.apifyDemo?.shopifyUrl;
   if (!shopifyUrl) return { ok: false, reason: 'no Shopify URL configured' };
@@ -600,7 +600,7 @@ async function syncBrandShopify(brand, run = null) {
   // CATALOG_INGEST_LIMIT bounds how many rows this pass persists;
   // default 10.
   const { catalogIngestLimit } = require('./ingestLimits');
-  const catalogCap = catalogIngestLimit();
+  const catalogCap = catalogIngestLimit({ uncapped: uncapped === true });
   let catalogPersisted = 0;
   // ARCHITECTURE: upsert NEVER awaits image classify. Post-loop pass only.
   const shotSession = ingestShotClassify.createSession();

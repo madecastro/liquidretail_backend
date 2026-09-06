@@ -148,7 +148,7 @@ check('C1: syncBrandApify accepts a second options argument carrying skipInstagr
   // assert against the real signature text instead of arity.
   const src = fs.readFileSync(path.join(__dirname, '../services/apifyIngestService.js'), 'utf8');
   assert.ok(
-    /async function syncBrandApify\(brandId,\s*\{\s*skipInstagram = false\s*\}\s*=\s*\{\}\)/.test(src),
+    /async function syncBrandApify\(brandId,\s*\{\s*skipInstagram = false[\s\S]*?\}\s*=\s*\{\}\)/.test(src),
     'syncBrandApify signature must accept { skipInstagram } as its second argument'
   );
 });

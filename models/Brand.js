@@ -216,8 +216,9 @@ const brandSchema = new mongoose.Schema({
   // Scheduled re-sync of Shopify-direct / generic-sitemap / Apify catalogs
   // (scheduledSyncService.runDueCatalogResyncs). Distinct from
   // IntegrationCredential.lastCatalogSyncAt (IG/Meta catalog). Strict
-  // schema — undeclared paths are dropped. Stamped on SUCCESS only so a
-  // deploy-killed in-flight run is retried on the next due tick (no resume).
+  // schema — undeclared paths are dropped. Stamped on SUCCESS only; the
+  // nightly window treats last >= windowStart as "already swept tonight"
+  // so a restart mid-window resumes remaining brands, not the whole fleet.
   lastCatalogResyncAt: { type: Date, default: null },
 
   // V3 #3 — auto-reply with a comment on IG-sourced posts when detect

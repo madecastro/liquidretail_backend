@@ -1,19 +1,21 @@
 #!/usr/bin/env node
 'use strict';
 /**
- * verifyScheduledCatalogResync — DATA-PATH-AUDIT §9 item 12.
+ * verifyScheduledCatalogResync — nightly uncapped all-brands catalog re-sync.
  *
- *   A. Flag parser === 'true' + file default true; flag-off is IG-only.
- *   B. Interval / spacing parsers (blank/negative → shipped default).
- *   C. Due-check: null last → due; recent → skip; aged → due.
+ *   A. Flag parser === 'true' + file default true; nightly knobs.
+ *   B. Nightly hour / window / concurrency parsers (blank/garbage → shipped default).
+ *   C. Due-check is per-window: last < windowStart → due; last >= start → skip.
  *   D. Each non-IG method has a resolver arm (shopify-direct, generic,
  *      apify) plus demo brands reuse resolveCatalogMethod.
- *   E. Serial: selectDueCatalogResyncCandidate returns ONE brand;
- *      spacing skip; in-progress skip.
+ *   E. Multi-brand: selectDueCatalogResyncCandidates returns ALL due,
+ *      oldest first; in-window / out-of-window; DST boundaries.
  *   F. imageUrl null-heal / no-clobber (catalogImageUrlGuard).
- *   G. Structural: lastCatalogResyncAt declared; skipInstagram on demo
- *      dispatch; IG loop still type:'instagram'; writers use assignImageUrl.
- *   RP. Mutation-prove the load-bearing pins.
+ *   G. Behavioral: flag-off and outside-window are no-ops (no Brand.find).
+ *   H. Structural: lastCatalogResyncAt; skipInstagram+uncapped on demo
+ *      dispatch; all-brands pool; persist-cap override wiring.
+ *   I. Uncapped override actually uncaps and does not leak to other callers.
+ *   RP. Mutation-prove the load-bearing (money) pins.
  *
  * Run: node scripts/verifyScheduledCatalogResync.js
  */
@@ -27,18 +29,27 @@ const SVC_PATH = path.join(ROOT, 'services/scheduledSyncService.js');
 const GUARD_PATH = path.join(ROOT, 'services/catalogImageUrlGuard.js');
 const BRAND_PATH = path.join(ROOT, 'models/Brand.js');
 const DEFAULTS_ENV = path.join(ROOT, 'config/defaults.env');
+const INGEST_LIMITS_PATH = path.join(ROOT, 'services/ingestLimits.js');
+const SHOPIFY_PATH = path.join(ROOT, 'services/shopifyPublicIngestService.js');
+const GENERIC_PATH = path.join(ROOT, 'services/genericCatalogIngestService.js');
+const APIFY_PATH = path.join(ROOT, 'services/apifyIngestService.js');
+const CATALOG_SYNC_PATH = path.join(ROOT, 'services/catalogSyncService.js');
 
 const ORIG = {
   enabled: process.env.CATALOG_SCHEDULED_RESYNC_ENABLED,
-  interval: process.env.CATALOG_RESYNC_INTERVAL_H,
-  spacing: process.env.CATALOG_RESYNC_SPACING_MS,
+  hour: process.env.CATALOG_NIGHTLY_HOUR,
+  windowH: process.env.CATALOG_NIGHTLY_WINDOW_H,
+  concurrency: process.env.CATALOG_NIGHTLY_CONCURRENCY,
+  ingestLimit: process.env.CATALOG_INGEST_LIMIT,
 };
 
 function restoreEnv() {
   for (const [key, val] of [
     ['CATALOG_SCHEDULED_RESYNC_ENABLED', ORIG.enabled],
-    ['CATALOG_RESYNC_INTERVAL_H', ORIG.interval],
-    ['CATALOG_RESYNC_SPACING_MS', ORIG.spacing],
+    ['CATALOG_NIGHTLY_HOUR', ORIG.hour],
+    ['CATALOG_NIGHTLY_WINDOW_H', ORIG.windowH],
+    ['CATALOG_NIGHTLY_CONCURRENCY', ORIG.concurrency],
+    ['CATALOG_INGEST_LIMIT', ORIG.ingestLimit],
   ]) {
     if (val === undefined) delete process.env[key];
     else process.env[key] = val;
@@ -80,14 +91,16 @@ function withTempMutation(filePath, find, replace, runCheck) {
 }
 
 process.env.CATALOG_SCHEDULED_RESYNC_ENABLED = 'true';
-process.env.CATALOG_RESYNC_INTERVAL_H = '24';
-process.env.CATALOG_RESYNC_SPACING_MS = '180000';
+process.env.CATALOG_NIGHTLY_HOUR = '2';
+process.env.CATALOG_NIGHTLY_WINDOW_H = '8';
+process.env.CATALOG_NIGHTLY_CONCURRENCY = '3';
 
 const svc = require('../services/scheduledSyncService');
+const { catalogIngestLimit } = require('../services/ingestLimits');
 const { imageUrlPatch, assignImageUrl } = require('../services/catalogImageUrlGuard');
 
 const HOUR = 3600 * 1000;
-const now = Date.UTC(2026, 8, 4, 12, 0, 0);
+const WINDOW_MS = 8 * HOUR;
 
 function runParsers() {
   const envSrc = fs.readFileSync(DEFAULTS_ENV, 'utf8');
@@ -95,12 +108,16 @@ function runParsers() {
 
   check('A1 CATALOG_SCHEDULED_RESYNC_ENABLED=true in defaults.env',
     /^CATALOG_SCHEDULED_RESYNC_ENABLED=true$/m.test(envSrc));
-  check('A2 CATALOG_RESYNC_INTERVAL_H=24 in defaults.env',
-    /^CATALOG_RESYNC_INTERVAL_H=24$/m.test(envSrc));
-  check('A3 CATALOG_RESYNC_SPACING_MS=180000 in defaults.env',
-    /^CATALOG_RESYNC_SPACING_MS=180000$/m.test(envSrc));
+  check('A2 CATALOG_NIGHTLY_HOUR=2 in defaults.env',
+    /^CATALOG_NIGHTLY_HOUR=2$/m.test(envSrc));
+  check('A3 CATALOG_NIGHTLY_WINDOW_H=8 in defaults.env',
+    /^CATALOG_NIGHTLY_WINDOW_H=8$/m.test(envSrc));
+  check('A3b CATALOG_NIGHTLY_CONCURRENCY=3 in defaults.env',
+    /^CATALOG_NIGHTLY_CONCURRENCY=3$/m.test(envSrc));
   check('A4 parser is strictly === \'true\'',
     /process\.env\.CATALOG_SCHEDULED_RESYNC_ENABLED === 'true'/.test(svcSrc));
+  check('A4b TZ is America/Los_Angeles (IANA, not a UTC offset)',
+    /America\/Los_Angeles/.test(svcSrc) && svc.NIGHTLY_TZ === 'America/Los_Angeles');
 
   process.env.CATALOG_SCHEDULED_RESYNC_ENABLED = 'true';
   check('A5 === true → enabled', svc.isCatalogScheduledResyncEnabled() === true);
@@ -111,47 +128,115 @@ function runParsers() {
   delete process.env.CATALOG_SCHEDULED_RESYNC_ENABLED;
   check('A8 unset → disabled', svc.isCatalogScheduledResyncEnabled() === false);
   process.env.CATALOG_SCHEDULED_RESYNC_ENABLED = 'true';
+}
 
-  process.env.CATALOG_RESYNC_INTERVAL_H = '24';
-  check('B1 interval 24h → 24 hours in ms',
-    svc.catalogResyncIntervalMs() === 24 * HOUR);
-  process.env.CATALOG_RESYNC_INTERVAL_H = '0';
-  check('B2 interval 0 → default 24h',
-    svc.catalogResyncIntervalMs() === 24 * HOUR);
-  process.env.CATALOG_RESYNC_INTERVAL_H = '-3';
-  check('B3 interval negative → default 24h',
-    svc.catalogResyncIntervalMs() === 24 * HOUR);
-  delete process.env.CATALOG_RESYNC_INTERVAL_H;
-  check('B4 interval unset → default 24h',
-    svc.catalogResyncIntervalMs() === 24 * HOUR);
-  process.env.CATALOG_RESYNC_INTERVAL_H = '24';
+function runNightlyParsers() {
+  process.env.CATALOG_NIGHTLY_HOUR = '2';
+  check('B1 hour 2 → 2', svc.catalogNightlyHour() === 2);
+  process.env.CATALOG_NIGHTLY_HOUR = '0';
+  check('B2 hour 0 (midnight) is valid', svc.catalogNightlyHour() === 0);
+  process.env.CATALOG_NIGHTLY_HOUR = '24';
+  check('B3 hour 24 → default 2', svc.catalogNightlyHour() === 2);
+  process.env.CATALOG_NIGHTLY_HOUR = '-1';
+  check('B4 hour negative → default 2', svc.catalogNightlyHour() === 2);
+  process.env.CATALOG_NIGHTLY_HOUR = '2.5';
+  check('B5 hour fractional → default 2', svc.catalogNightlyHour() === 2);
+  delete process.env.CATALOG_NIGHTLY_HOUR;
+  check('B6 hour unset → default 2', svc.catalogNightlyHour() === 2);
+  process.env.CATALOG_NIGHTLY_HOUR = '';
+  check('B6b hour blank → default 2 (not midnight)', svc.catalogNightlyHour() === 2);
+  process.env.CATALOG_NIGHTLY_HOUR = '2';
 
-  process.env.CATALOG_RESYNC_SPACING_MS = '180000';
-  check('B5 spacing 180000 → 3 minutes',
-    svc.catalogResyncSpacingMs() === 180000);
-  process.env.CATALOG_RESYNC_SPACING_MS = '-1';
-  check('B6 spacing negative → default 180000',
-    svc.catalogResyncSpacingMs() === 180000);
-  delete process.env.CATALOG_RESYNC_SPACING_MS;
-  check('B7 spacing unset → default 180000',
-    svc.catalogResyncSpacingMs() === 180000);
-  process.env.CATALOG_RESYNC_SPACING_MS = '180000';
+  process.env.CATALOG_NIGHTLY_WINDOW_H = '8';
+  check('B7 window 8h → 8 hours in ms', svc.catalogNightlyWindowMs() === 8 * HOUR);
+  process.env.CATALOG_NIGHTLY_WINDOW_H = '0';
+  check('B8 window 0 → default 8h', svc.catalogNightlyWindowMs() === 8 * HOUR);
+  process.env.CATALOG_NIGHTLY_WINDOW_H = '-3';
+  check('B9 window negative → default 8h', svc.catalogNightlyWindowMs() === 8 * HOUR);
+  process.env.CATALOG_NIGHTLY_WINDOW_H = '30';
+  check('B10 window >24 → clamp 24h', svc.catalogNightlyWindowMs() === 24 * HOUR);
+  delete process.env.CATALOG_NIGHTLY_WINDOW_H;
+  check('B11 window unset → default 8h', svc.catalogNightlyWindowMs() === 8 * HOUR);
+  process.env.CATALOG_NIGHTLY_WINDOW_H = '8';
+
+  process.env.CATALOG_NIGHTLY_CONCURRENCY = '3';
+  check('B12 concurrency 3 → 3', svc.catalogNightlyConcurrency() === 3);
+  process.env.CATALOG_NIGHTLY_CONCURRENCY = '1';
+  check('B13 concurrency 1 is valid', svc.catalogNightlyConcurrency() === 1);
+  process.env.CATALOG_NIGHTLY_CONCURRENCY = '0';
+  check('B14 concurrency 0 → default 3', svc.catalogNightlyConcurrency() === 3);
+  process.env.CATALOG_NIGHTLY_CONCURRENCY = '99';
+  check('B15 concurrency 99 → ceiling 8', svc.catalogNightlyConcurrency() === 8);
+  delete process.env.CATALOG_NIGHTLY_CONCURRENCY;
+  check('B16 concurrency unset → default 3', svc.catalogNightlyConcurrency() === 3);
+  process.env.CATALOG_NIGHTLY_CONCURRENCY = '3';
+}
+
+function runPacificWindow() {
+  // PST: 2026-01-15 02:00 = 10:00Z. Window 8h → 10:00Z–18:00Z.
+  const jan2am = Date.UTC(2026, 0, 15, 10, 0, 0);
+  check('C-TZ1 Jan 15 2am PST window start is 10:00Z',
+    svc.zonedUtcMs('America/Los_Angeles', 2026, 1, 15, 2) === jan2am);
+  check('C-TZ2 Jan 15 10:00Z is in window',
+    svc.isInCatalogNightlyWindow(jan2am, { windowMs: WINDOW_MS }) === true);
+  check('C-TZ3 Jan 15 09:59Z (1:59am PST) is NOT in window',
+    svc.isInCatalogNightlyWindow(jan2am - 1000, { windowMs: WINDOW_MS }) === false);
+  check('C-TZ4 Jan 15 17:59Z (9:59am PST) is in window',
+    svc.isInCatalogNightlyWindow(jan2am + 8 * HOUR - 1000, { windowMs: WINDOW_MS }) === true);
+  check('C-TZ5 Jan 15 18:00Z (10:00am PST) is NOT in window',
+    svc.isInCatalogNightlyWindow(jan2am + 8 * HOUR, { windowMs: WINDOW_MS }) === false);
+  check('C-TZ6 Jan 15 window start at 5am PST is still today 2am',
+    svc.currentNightlyWindowStartMs(jan2am + 3 * HOUR) === jan2am);
+
+  // PDT: 2026-07-15 02:00 = 09:00Z.
+  const jul2am = Date.UTC(2026, 6, 15, 9, 0, 0);
+  check('C-TZ7 Jul 15 2am PDT window start is 09:00Z',
+    svc.zonedUtcMs('America/Los_Angeles', 2026, 7, 15, 2) === jul2am);
+  check('C-TZ8 Jul 15 09:00Z is in window',
+    svc.isInCatalogNightlyWindow(jul2am, { windowMs: WINDOW_MS }) === true);
+  check('C-TZ9 Jul 15 08:59Z is NOT in window',
+    svc.isInCatalogNightlyWindow(jul2am - 1000, { windowMs: WINDOW_MS }) === false);
+
+  // Spring-forward 2026-03-08: 2:00 AM Pacific is skipped (01:59 PST → 03:00 PDT).
+  // Requesting 02:00 lands on 03:00 PDT = 10:00Z — first valid instant ≥ 2am.
+  const marStart = Date.UTC(2026, 2, 8, 10, 0, 0);
+  check('C-DST-spring: 2am on 2026-03-08 maps to 03:00 PDT (10:00Z)',
+    svc.zonedUtcMs('America/Los_Angeles', 2026, 3, 8, 2) === marStart);
+  check('C-DST-spring: 09:59Z (1:59am PST) is NOT in the new window',
+    svc.isInCatalogNightlyWindow(marStart - 1000, { windowMs: WINDOW_MS }) === false);
+  check('C-DST-spring: 10:00Z (3:00am PDT) IS in window',
+    svc.isInCatalogNightlyWindow(marStart, { windowMs: WINDOW_MS }) === true);
+  const marParts = svc.pacificParts(new Date(marStart));
+  check('C-DST-spring: wall clock at window start is hour=3 (skipped 2)',
+    marParts.hour === 3 && marParts.day === 8 && marParts.month === 3);
+
+  // Fall-back 2026-11-01: 2:00 AM exists once (PST) = 10:00Z.
+  const novStart = Date.UTC(2026, 10, 1, 10, 0, 0);
+  check('C-DST-fall: 2am on 2026-11-01 is 10:00Z (PST, unique)',
+    svc.zonedUtcMs('America/Los_Angeles', 2026, 11, 1, 2) === novStart);
+  check('C-DST-fall: 09:59Z is NOT in window',
+    svc.isInCatalogNightlyWindow(novStart - 1000, { windowMs: WINDOW_MS }) === false);
+  check('C-DST-fall: 10:00Z IS in window',
+    svc.isInCatalogNightlyWindow(novStart, { windowMs: WINDOW_MS }) === true);
 }
 
 function runDueCheck() {
-  const interval = 24 * HOUR;
+  const windowStart = Date.UTC(2026, 0, 15, 10, 0, 0); // 2am PST
+  const now = windowStart + 3 * HOUR; // 5am PST, in window
   check('C1 null lastCatalogResyncAt → due',
-    svc.isCatalogResyncDue({ lastCatalogResyncAt: null }, now, interval) === true);
+    svc.isCatalogResyncDue({ lastCatalogResyncAt: null }, now, windowStart) === true);
   check('C2 missing field → due',
-    svc.isCatalogResyncDue({}, now, interval) === true);
-  check('C3 recent (1h ago) → not due',
-    svc.isCatalogResyncDue({ lastCatalogResyncAt: new Date(now - HOUR) }, now, interval) === false);
-  check('C4 aged (25h ago) → due',
-    svc.isCatalogResyncDue({ lastCatalogResyncAt: new Date(now - 25 * HOUR) }, now, interval) === true);
-  check('C5 exact interval boundary → due',
-    svc.isCatalogResyncDue({ lastCatalogResyncAt: new Date(now - interval) }, now, interval) === true);
+    svc.isCatalogResyncDue({}, now, windowStart) === true);
+  check('C3 stamped this window (1h after start) → not due',
+    svc.isCatalogResyncDue({ lastCatalogResyncAt: new Date(windowStart + HOUR) }, now, windowStart) === false);
+  check('C4 stamped before this window (25h ago) → due',
+    svc.isCatalogResyncDue({ lastCatalogResyncAt: new Date(windowStart - HOUR) }, now, windowStart) === true);
+  check('C5 stamped exactly at window start → not due (already swept)',
+    svc.isCatalogResyncDue({ lastCatalogResyncAt: new Date(windowStart) }, now, windowStart) === false);
   check('C6 null brand → not due',
-    svc.isCatalogResyncDue(null, now, interval) === false);
+    svc.isCatalogResyncDue(null, now, windowStart) === false);
+  check('C7 restart mid-window: last just before now but after start → skip (no re-trigger)',
+    svc.isCatalogResyncDue({ lastCatalogResyncAt: new Date(now - 60 * 1000) }, now, windowStart) === false);
 }
 
 function runMethodResolver() {
@@ -199,41 +284,47 @@ function runMethodResolver() {
     ) === 'shopify-direct');
 }
 
-function runSerialAndSkip() {
-  const interval = 24 * HOUR;
+function runMultiBrand() {
+  const windowStart = Date.UTC(2026, 0, 15, 10, 0, 0);
+  const now = windowStart + 3 * HOUR;
   const a = {
     _id: 'aaaaaaaaaaaaaaaaaaaaaaaa',
-    lastCatalogResyncAt: new Date(now - 48 * HOUR),
+    lastCatalogResyncAt: new Date(windowStart - 48 * HOUR),
     websiteUrl: 'https://a.example.com',
   };
   const b = {
     _id: 'bbbbbbbbbbbbbbbbbbbbbbbb',
-    lastCatalogResyncAt: new Date(now - 36 * HOUR),
+    lastCatalogResyncAt: new Date(windowStart - 36 * HOUR),
     websiteUrl: 'https://b.example.com',
+  };
+  const alreadySwept = {
+    _id: 'cccccccccccccccccccccccc',
+    lastCatalogResyncAt: new Date(windowStart + HOUR),
+    websiteUrl: 'https://c.example.com',
   };
   const sources = new Map([
     [String(a._id), new Set(['shopify-direct'])],
     [String(b._id), new Set(['sitemap-jsonld'])],
+    [String(alreadySwept._id), new Set(['shopify-direct'])],
   ]);
-  const picked = svc.selectDueCatalogResyncCandidate([a, b], sources, now, interval);
-  check('E1 serial: one candidate from two due brands',
-    !!picked && String(picked.brand._id) === String(a._id),
-    picked ? `got ${picked.brand._id} method=${picked.method}` : 'null');
-  check('E2 oldest lastCatalogResyncAt wins (a is older)',
-    picked && picked.method === 'shopify-direct');
-
-  const recent = {
-    _id: 'cccccccccccccccccccccccc',
-    lastCatalogResyncAt: new Date(now - HOUR),
-    websiteUrl: 'https://c.example.com',
-  };
-  const recentMap = new Map([[String(recent._id), new Set(['shopify-direct'])]]);
-  check('E3 recent lastCatalogResyncAt → no candidate',
-    svc.selectDueCatalogResyncCandidate([recent], recentMap, now, interval) === null);
+  const due = svc.selectDueCatalogResyncCandidates([a, b, alreadySwept], sources, now, windowStart);
+  check('E1 multi: two due brands (not one)', due.length === 2,
+    `got ${due.length}`);
+  check('E2 oldest lastCatalogResyncAt first (a then b)',
+    due.length === 2
+      && String(due[0].brand._id) === String(a._id)
+      && String(due[1].brand._id) === String(b._id)
+      && due[0].method === 'shopify-direct'
+      && due[1].method === 'generic-sitemap');
+  check('E3 already-swept this window is excluded',
+    !due.some((d) => String(d.brand._id) === String(alreadySwept._id)));
 
   const noMethod = { _id: 'dddddddddddddddddddddddd', lastCatalogResyncAt: null };
-  check('E4 due but no catalog method → no candidate',
-    svc.selectDueCatalogResyncCandidate([noMethod], new Map(), now, interval) === null);
+  check('E4 due but no catalog method → empty list',
+    svc.selectDueCatalogResyncCandidates([noMethod], new Map(), now, windowStart).length === 0);
+
+  check('E5 concurrency default is 3 (more than one brand per tick)',
+    svc.DEFAULT_NIGHTLY_CONCURRENCY === 3 && svc.catalogNightlyConcurrency() === 3);
 }
 
 function runImageUrl() {
@@ -258,28 +349,84 @@ function runImageUrl() {
     !Object.prototype.hasOwnProperty.call(keep, 'imageUrl'));
 }
 
-async function runFlagOffBehavioral() {
+async function runFlagAndWindowBehavioral() {
   const Brand = require('../models/Brand');
   const origFind = Brand.find;
   let findCalls = 0;
   Brand.find = function catalogResyncMustNotQuery() {
     findCalls += 1;
-    throw new Error('Brand.find must not run when flag is off');
+    throw new Error('Brand.find must not run when gated off');
   };
+
   process.env.CATALOG_SCHEDULED_RESYNC_ENABLED = 'false';
-  svc._resetCatalogResyncSpacingForTest();
   try {
     const summary = { errors: [] };
-    const out = await svc.runDueCatalogResyncs(summary, now);
+    const out = await svc.runDueCatalogResyncs(summary, Date.UTC(2026, 0, 15, 10, 0, 0));
     check('G1 flag-off runDueCatalogResyncs is a no-op (no Brand.find)',
       findCalls === 0 && out === summary && !out.catalogsResynced);
   } catch (err) {
     check('G1 flag-off runDueCatalogResyncs is a no-op (no Brand.find)',
       false, err.message);
   } finally {
-    Brand.find = origFind;
     process.env.CATALOG_SCHEDULED_RESYNC_ENABLED = 'true';
   }
+
+  findCalls = 0;
+  try {
+    // 1:00 PM Pacific Jan 15 2026 = 21:00Z — outside the 2am–10am window.
+    const summary = { errors: [] };
+    const out = await svc.runDueCatalogResyncs(summary, Date.UTC(2026, 0, 15, 21, 0, 0));
+    check('G2 outside nightly window is a no-op (no Brand.find)',
+      findCalls === 0 && out === summary && !out.catalogsResynced);
+  } catch (err) {
+    check('G2 outside nightly window is a no-op (no Brand.find)',
+      false, err.message);
+  } finally {
+    Brand.find = origFind;
+  }
+}
+
+function runUncappedOverride() {
+  const prior = process.env.CATALOG_INGEST_LIMIT;
+  try {
+    process.env.CATALOG_INGEST_LIMIT = '10';
+    check('I1 catalogIngestLimit() with no opts still returns env 10',
+      catalogIngestLimit() === 10);
+    check('I2 catalogIngestLimit({uncapped:true}) returns null (no persist cap)',
+      catalogIngestLimit({ uncapped: true }) === null);
+    check('I3 catalogIngestLimit({uncapped:false}) still 10',
+      catalogIngestLimit({ uncapped: false }) === 10);
+    check('I4 catalogIngestLimit({uncapped:\'true\'}) does NOT uncap',
+      catalogIngestLimit({ uncapped: 'true' }) === 10);
+  } finally {
+    if (prior === undefined) delete process.env.CATALOG_INGEST_LIMIT;
+    else process.env.CATALOG_INGEST_LIMIT = prior;
+  }
+
+  const shopifySrc = fs.readFileSync(SHOPIFY_PATH, 'utf8');
+  const genericSrc = fs.readFileSync(GENERIC_PATH, 'utf8');
+  const apifySrc = fs.readFileSync(APIFY_PATH, 'utf8');
+  const catalogSyncSrc = fs.readFileSync(CATALOG_SYNC_PATH, 'utf8');
+  const svcSrc = fs.readFileSync(SVC_PATH, 'utf8');
+
+  check('I5 shopify-direct persist cap honors uncapped override',
+    /catalogIngestLimit\(\s*\{\s*uncapped:\s*uncappedRun\s*\}\s*\)/.test(shopifySrc));
+  check('I6 generic persist cap honors uncapped override',
+    /catalogIngestLimit\(\s*\{\s*uncapped:\s*uncappedRun\s*\}\s*\)/.test(genericSrc));
+  check('I7 apify-shopify persist cap honors uncapped override',
+    /catalogIngestLimit\(\s*\{\s*uncapped:\s*uncapped\s*===\s*true\s*\}\s*\)/.test(apifySrc));
+  check('I8 IG catalogSyncService still calls catalogIngestLimit() with no override',
+    /catalogIngestLimit\(\s*\)/.test(catalogSyncSrc)
+      && !/catalogIngestLimit\(\s*\{/.test(catalogSyncSrc));
+  check('I9 dispatch passes uncapped:true to syncBrandApify with skipInstagram',
+    /syncBrandApify\(\s*brand\._id\s*,\s*\{\s*skipInstagram:\s*true\s*,\s*uncapped:\s*true\s*\}\s*\)/.test(svcSrc));
+  check('I10 dispatch passes uncapped:true to generic + shopify-direct',
+    /syncBrandGenericCatalog\([\s\S]{0,220}?uncapped:\s*true/.test(svcSrc)
+      && /syncBrandShopifyDirect\([\s\S]{0,220}?uncapped:\s*true/.test(svcSrc));
+  check('I11 apify forwards uncapped onto nested generic/shopify-direct/apify-shopify',
+    /syncBrandGenericCatalog\(brand,\s*run,\s*\{\s*isBrandAborted,\s*uncapped:\s*uncapped\s*===\s*true\s*\}\)/.test(apifySrc)
+      && /syncBrandShopifyDirect\(brand,\s*run,\s*\{\s*isBrandAborted,\s*uncapped:\s*uncapped\s*===\s*true\s*\}\)/.test(apifySrc)
+      && /syncBrandShopify\(brand,\s*run,\s*\{\s*uncapped:\s*uncapped\s*===\s*true\s*\}\)/.test(apifySrc));
 }
 
 function runStructural() {
@@ -290,8 +437,8 @@ function runStructural() {
 
   check('H1 Brand schema declares lastCatalogResyncAt',
     /lastCatalogResyncAt:\s*\{\s*type:\s*Date,\s*default:\s*null\s*\}/.test(brandSrc));
-  check('H2 demo dispatch passes skipInstagram: true',
-    /syncBrandApify\(\s*brand\._id\s*,\s*\{\s*skipInstagram:\s*true\s*\}\s*\)/.test(svcSrc));
+  check('H2 demo dispatch passes skipInstagram: true AND uncapped: true',
+    /syncBrandApify\(\s*brand\._id\s*,\s*\{\s*skipInstagram:\s*true\s*,\s*uncapped:\s*true\s*\}\s*\)/.test(svcSrc));
   check('H3 IG loop still queries type:\'instagram\'',
     /type:\s*'instagram'/.test(svcSrc));
   check('H4 flag-off gate is first statement of runDueCatalogResyncs',
@@ -300,10 +447,11 @@ function runStructural() {
     Array.isArray(svc.CATALOG_RESYNC_IN_PROGRESS_KINDS)
       && svc.CATALOG_RESYNC_IN_PROGRESS_KINDS.includes('catalog-sync')
       && svc.CATALOG_RESYNC_IN_PROGRESS_KINDS.includes('demo-sync'));
-  check('H6 one brand per tick: selectDueCatalogResyncCandidate returns due[0]',
-    /return due\[0\] \|\| null/.test(svcSrc));
-  check('H7 spacing compared against lastCatalogResyncTickAt',
-    /lastCatalogResyncTickAt/.test(code) && /catalogResyncSpacingMs\(/.test(code));
+  check('H6 candidates helper returns the full due list (not due[0])',
+    /function selectDueCatalogResyncCandidates[\s\S]*?return due;/.test(svcSrc)
+      && !/return due\[0\] \|\| null/.test(svcSrc));
+  check('H7 nightly window gate sits before Brand.find',
+    /if\s*\(\s*!isInCatalogNightlyWindow\(\s*now\s*\)\s*\)\s*return/.test(svcSrc));
   check('H8 success-only stamp of lastCatalogResyncAt',
     /\$set:\s*\{\s*lastCatalogResyncAt:/.test(svcSrc));
   check('H9 catalogImageUrlGuard omits null (no `{ imageUrl: null }`)',
@@ -331,10 +479,20 @@ function runStructural() {
       && /syncBrandGenericCatalog/.test(code)
       && /syncBrandApify/.test(code));
   check('H14 in-progress skip is before dispatch',
-    /if \(await hasCatalogSyncInProgress\(picked\.brand\._id\)\)/.test(svcSrc));
+    /hasCatalogSyncInProgress\(picked\.brand\._id\)/.test(svcSrc)
+      && svcSrc.indexOf('hasCatalogSyncInProgress') < svcSrc.indexOf('dispatchCatalogResync(hydrated'));
   check('H15 in-progress query uses running/cancelling',
     /status:\s*\{\s*\$in:\s*\['running',\s*'cancelling'\]\s*\}/.test(svcSrc)
       || /status:\s*\{\s*\$in:\s*\[\s*'running'\s*,\s*'cancelling'\s*\]/.test(svcSrc));
+  check('H16 all-brands pool: runDueCatalogResyncs Brand.find is unfiltered',
+    /Brand\.find\(\s*\{\s*\}\s*\)/.test(svcSrc));
+  {
+    const fn = stripCommentsAndStrings(svcSrc).match(/async function runDueCatalogResyncs[\s\S]*?const AD_PLATFORMS/);
+    check('H17 all-brands pool does not re-gate on autoSyncEnabled / isDemo',
+      !!fn && !/autoSyncEnabled/.test(fn[0]) && !/isDemo:\s*true/.test(fn[0]));
+  }
+  check('H18 IG auto-sync Brand.find still keys on autoSyncEnabled',
+    /Brand\.find\(\s*\{\s*'syncSettings\.autoSyncEnabled':\s*true\s*\}\s*\)/.test(svcSrc));
 }
 
 function runMutations() {
@@ -370,27 +528,13 @@ function runMutations() {
     let failedAsExpected = false;
     withTempMutation(
       SVC_PATH,
-      '  return due[0] || null;',
-      '  return due;',
-      (mutSrc) => {
-        failedAsExpected = !/return due\[0\] \|\| null/.test(mutSrc);
-      }
-    );
-    check('RP3 [REVERT-PROOF] returning the whole due list (not one brand) is detectable (H6)',
-      failedAsExpected);
-  }
-
-  {
-    let failedAsExpected = false;
-    withTempMutation(
-      SVC_PATH,
-      '    return require(\'./apifyIngestService\').syncBrandApify(brand._id, { skipInstagram: true });',
+      '    return require(\'./apifyIngestService\').syncBrandApify(brand._id, { skipInstagram: true, uncapped: true });',
       '    return require(\'./apifyIngestService\').syncBrandApify(brand._id);',
       (mutSrc) => {
         failedAsExpected = !/skipInstagram:\s*true/.test(mutSrc);
       }
     );
-    check('RP4 [REVERT-PROOF] dropping skipInstagram on demo dispatch is detectable (H2)',
+    check('RP3 [REVERT-PROOF] dropping skipInstagram on demo dispatch is detectable (H2)',
       failedAsExpected);
   }
 
@@ -404,7 +548,63 @@ function runMutations() {
         failedAsExpected = !/lastCatalogResyncAt:\s*\{\s*type:\s*Date,\s*default:\s*null\s*\}/.test(mutSrc);
       }
     );
-    check('RP5 [REVERT-PROOF] undeclaring lastCatalogResyncAt fails H1 (strict mode would drop the stamp)',
+    check('RP4 [REVERT-PROOF] undeclaring lastCatalogResyncAt fails H1 (strict mode would drop the stamp)',
+      failedAsExpected);
+  }
+
+  {
+    let failedAsExpected = false;
+    withTempMutation(
+      INGEST_LIMITS_PATH,
+      '  if (opts && typeof opts === \'object\' && opts.uncapped === true) return null;',
+      '  if (opts && typeof opts === \'object\' && opts.uncapped === true) return readLimit(\'CATALOG_INGEST_LIMIT\');',
+      (mutSrc) => {
+        failedAsExpected = !/opts\.uncapped === true\) return null/.test(mutSrc);
+      }
+    );
+    check('RP5 [REVERT-PROOF] ignoring uncapped (still reading env) is detectable (I2)',
+      failedAsExpected);
+  }
+
+  {
+    let failedAsExpected = false;
+    withTempMutation(
+      SVC_PATH,
+      '    return require(\'./apifyIngestService\').syncBrandApify(brand._id, { skipInstagram: true, uncapped: true });',
+      '    return require(\'./apifyIngestService\').syncBrandApify(brand._id, { skipInstagram: true });',
+      (mutSrc) => {
+        failedAsExpected = !/skipInstagram:\s*true\s*,\s*uncapped:\s*true/.test(mutSrc);
+      }
+    );
+    check('RP6 [REVERT-PROOF] dropping uncapped:true on demo dispatch is detectable (I9)',
+      failedAsExpected);
+  }
+
+  {
+    let failedAsExpected = false;
+    withTempMutation(
+      SHOPIFY_PATH,
+      '  const ingestCap = catalogIngestLimit({ uncapped: uncappedRun });',
+      '  const ingestCap = catalogIngestLimit();',
+      (mutSrc) => {
+        failedAsExpected = !/catalogIngestLimit\(\s*\{\s*uncapped:\s*uncappedRun\s*\}\s*\)/.test(mutSrc);
+      }
+    );
+    check('RP7 [REVERT-PROOF] shopify-direct calling catalogIngestLimit() without override is detectable (I5)',
+      failedAsExpected);
+  }
+
+  {
+    let failedAsExpected = false;
+    withTempMutation(
+      SVC_PATH,
+      "  const brands = await Brand.find({})",
+      "  const brands = await Brand.find({ $or: [{ 'syncSettings.autoSyncEnabled': true }, { isDemo: true }] })",
+      (mutSrc) => {
+        failedAsExpected = !/Brand\.find\(\s*\{\s*\}\s*\)/.test(mutSrc);
+      }
+    );
+    check('RP8 [REVERT-PROOF] restoring autoSyncEnabled/isDemo brand-pool gate is detectable (H16)',
       failedAsExpected);
   }
 }
@@ -412,18 +612,20 @@ function runMutations() {
 (async () => {
   try {
     runParsers();
+    runNightlyParsers();
+    runPacificWindow();
     runDueCheck();
     runMethodResolver();
-    runSerialAndSkip();
+    runMultiBrand();
     runImageUrl();
-    await runFlagOffBehavioral();
+    await runFlagAndWindowBehavioral();
+    runUncappedOverride();
     runStructural();
     runMutations();
   } catch (err) {
     failures.push(`THREW: ${err && err.stack ? err.stack : err}`);
   } finally {
     restoreEnv();
-    try { svc._resetCatalogResyncSpacingForTest(); } catch (_) { /* ignore */ }
   }
 
   if (failures.length) {

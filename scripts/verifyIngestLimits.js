@@ -152,6 +152,40 @@ check('C3 catalogIngestLimit + socialIngestLimit are independent', () => {
   }
 });
 
+check('C4 catalogIngestLimit({uncapped:true}) returns null even when env is 10', () => {
+  const priorCat = process.env.CATALOG_INGEST_LIMIT;
+  try {
+    process.env.CATALOG_INGEST_LIMIT = '10';
+    assert.strictEqual(catalogIngestLimit({ uncapped: true }), null);
+    assert.strictEqual(catalogIngestLimit(), 10);
+  } finally {
+    if (priorCat === undefined) delete process.env.CATALOG_INGEST_LIMIT;
+    else process.env.CATALOG_INGEST_LIMIT = priorCat;
+  }
+});
+
+check('C5 catalogIngestLimit({uncapped:false}) still reads env', () => {
+  const priorCat = process.env.CATALOG_INGEST_LIMIT;
+  try {
+    process.env.CATALOG_INGEST_LIMIT = '7';
+    assert.strictEqual(catalogIngestLimit({ uncapped: false }), 7);
+  } finally {
+    if (priorCat === undefined) delete process.env.CATALOG_INGEST_LIMIT;
+    else process.env.CATALOG_INGEST_LIMIT = priorCat;
+  }
+});
+
+check('C6 catalogIngestLimit({uncapped:\'true\'}) does NOT uncap (strict === true)', () => {
+  const priorCat = process.env.CATALOG_INGEST_LIMIT;
+  try {
+    process.env.CATALOG_INGEST_LIMIT = '10';
+    assert.strictEqual(catalogIngestLimit({ uncapped: 'true' }), 10);
+  } finally {
+    if (priorCat === undefined) delete process.env.CATALOG_INGEST_LIMIT;
+    else process.env.CATALOG_INGEST_LIMIT = priorCat;
+  }
+});
+
 // ── Section D — every ingest service applies the cap ─────────────────
 //
 // Structural pins on each ingest file — if a future refactor drops the
