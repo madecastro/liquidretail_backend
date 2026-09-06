@@ -20,6 +20,23 @@
 const mongoose = require('mongoose');
 const { MONGODB_URI } = require('./config');
 
+// Fail closed if a parent node_modules (mongoose 7, once it exists at the
+// monorepo root) silently shadows adgen's own mongoose 8. Node's walk-up
+// after the graft is adgen/src/services → adgen/src → adgen → <monorepo>.
+// Bare require('mongoose') is invisible to verifyRequireGraph. npm ci
+// belongs inside adgen/, never at the monorepo root, for this reason.
+(function assertMongooseMajor8() {
+  const pkg = require('mongoose/package.json');
+  const version = String(pkg.version || '');
+  if (!version.startsWith('8')) {
+    const resolved = require.resolve('mongoose/package.json');
+    throw new Error(
+      `adgen requires mongoose major 8; resolved ${version} from ${resolved}. ` +
+      'A parent node_modules is shadowing adgen\'s own install — npm ci inside adgen/, never at the monorepo root.'
+    );
+  }
+})();
+
 const MAX_RECONNECT_ATTEMPTS = 5;
 let reconnectAttempts = 0;
 let reconnecting = false;

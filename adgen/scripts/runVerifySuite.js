@@ -50,8 +50,6 @@ const fs = require('fs');
 const path = require('path');
 const os = require('os');
 const { spawn } = require('child_process');
-const { resolveBackendRoot } = require('./lib/siblingBackend');
-
 const ROOT = path.join(__dirname, '..');
 const SCRIPTS_DIR = path.join(ROOT, 'scripts');
 const VERIFY_RE = /^verify.*\.(js|mjs)$/;
@@ -85,22 +83,23 @@ function discoverScripts() {
   return fs.readdirSync(SCRIPTS_DIR).filter((f) => VERIFY_RE.test(f)).sort();
 }
 
-// Convenience only, not a requirement: if this dev machine has the sibling
-// liquidretail_backend checked out and NODE_PATH is not already set, point
-// child processes at its node_modules so verifyModelParity.js (which needs
-// mongoose) "just works" under `npm test` without every contributor having
-// to remember to export NODE_PATH by hand. Harmless when it doesn't apply —
-// verifyModelParity.js has its own fallback for when this repo's own
-// node_modules is what should win (a real `npm install` here always takes
-// priority; Node resolves a bare specifier from the requiring file's own
-// node_modules tree before ever consulting NODE_PATH).
+// Never point NODE_PATH at the parent monorepo's node_modules (mongoose 7
+// would shadow adgen's mongoose 8). If this package has its own
+// node_modules, pin there; otherwise leave unset so Node's walk-up from
+// adgen/src hits adgen/node_modules first after `npm ci` inside adgen/.
 function childEnv() {
-  if (process.env.NODE_PATH) return process.env;
-  const backendRoot = resolveBackendRoot(ROOT);
-  if (!backendRoot) return process.env;
-  const candidate = path.join(backendRoot, 'node_modules');
-  if (!fs.existsSync(candidate)) return process.env;
-  return Object.assign({}, process.env, { NODE_PATH: candidate });
+  const env = Object.assign({}, process.env);
+  const parentNm = path.resolve(ROOT, '..', 'node_modules');
+  const ownNm = path.join(ROOT, 'node_modules');
+  if (env.NODE_PATH) {
+    const parts = String(env.NODE_PATH)
+      .split(path.delimiter)
+      .filter((p) => p && path.resolve(p) !== parentNm);
+    if (parts.length) env.NODE_PATH = parts.join(path.delimiter);
+    else delete env.NODE_PATH;
+  }
+  if (!env.NODE_PATH && fs.existsSync(ownNm)) env.NODE_PATH = ownNm;
+  return env;
 }
 
 function runOne(script, timeoutMs, env) {

@@ -13,6 +13,7 @@
 // builtins only.
 
 const { spawn } = require('child_process');
+const fs = require('fs');
 const path = require('path');
 const os = require('os');
 
@@ -64,7 +65,7 @@ const RENDER_TIMEOUT_MS = Number(process.env.REMOTION_TIMEOUT_MS || 180_000);
 const CHILD_TIMEOUT_MS = Number(process.env.REMOTION_CHILD_TIMEOUT_MS || 480_000);
 
 const KEEP_ENV = [
-  'PATH', 'NODE_PATH', 'HOME', 'TMPDIR', 'TMP', 'TEMP',
+  'PATH', 'HOME', 'TMPDIR', 'TMP', 'TEMP',
   'USER', 'LOGNAME',
   'REMOTION_CONCURRENCY', 'REMOTION_TIMEOUT_MS', 'REMOTION_BROWSER_EXECUTABLE',
   'TITLE_PLATE_SCAN', 'TITLE_FACE_KEEPOUT',
@@ -82,6 +83,13 @@ function defaultChildEnv() {
   for (const k of KEEP_ENV) {
     if (process.env[k] != null) env[k] = process.env[k];
   }
+  // NODE_PATH is NOT inherited. Post-graft the parent monorepo may have
+  // mongoose 7 at <backend>/node_modules; copying that into Remotion
+  // children would shadow adgen's mongoose 8. Pin at adgen/node_modules
+  // when present, otherwise leave unset so Node walks from the child's
+  // own tree (Docker WORKDIR /app).
+  const ownNm = path.join(REPO_ROOT, 'node_modules');
+  if (fs.existsSync(ownNm)) env.NODE_PATH = ownNm;
   // Any other REMOTION_* / TITLE_* dashboard knobs (concurrency, browser
   // executable, plate-scan) must reach the child; they are not secrets.
   for (const k of Object.keys(process.env)) {
