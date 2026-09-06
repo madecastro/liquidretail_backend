@@ -102,6 +102,7 @@ module.exports = [
       '.cache/**',
       '.drafts/**',
       'remotion/**',        // separate bundler + JSX toolchain
+      'adgen/**',           // own eslint.config.js; src/remotion/lib uses ESM export
       'frontend/**',
       'public/**',
       '**/*.min.js',
