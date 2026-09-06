@@ -1,0 +1,37 @@
+name: PR file-collision watch
+
+# Warns when two open PRs touch the same file, before that turns into a
+# conflict. Recomputes every open PR's overlap set on every relevant event
+# (see .github/scripts/prCollisionWatch.js) so a resolved collision also
+# clears its own warning instead of going stale.
+
+on:
+  pull_request:
+    types: [opened, reopened, synchronize, ready_for_review, converted_to_draft, closed]
+    branches: [master]
+  push:
+    branches: [master]
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+  pull-requests: write
+
+concurrency:
+  group: pr-collision-watch
+  cancel-in-progress: false
+
+jobs:
+  watch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Recompute file-overlap warnings across all open PRs
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: node .github/scripts/prCollisionWatch.js

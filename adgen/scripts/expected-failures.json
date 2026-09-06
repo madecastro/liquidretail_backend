@@ -1,0 +1,16 @@
+{
+  "_README": [
+    "Scripts that are KNOWN to fail on master right now. runVerifySuite treats a",
+    "listed script's failure as EXPECTED and does not fail the run — which is what",
+    "makes a zero-red CI gate landable on a tree that has a deliberately-red harness.",
+    "",
+    "THIS LIST IS NOT A MUTE BUTTON. A listed script that PASSES fails the suite,",
+    "loudly, as a STALE entry. That is the property that stops an allowlist rotting",
+    "into a rug: you cannot fix a bug and leave its harness suppressed, and you",
+    "cannot park a flaky script here and forget it. Removing the entry is part of",
+    "the fix, in the same commit.",
+    "",
+    "Every entry needs a reason someone can act on. 'flaky' is not a reason."
+  ],
+  "expectedFailures": {}
+}

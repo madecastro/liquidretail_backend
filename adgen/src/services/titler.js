@@ -1,0 +1,914 @@
+'use strict';
+// titler role — out-of-process Remotion titling for adgen.
+//
+// LIFECYCLE. The adgen renderer's video path, when ADGEN_TITLER_ENABLED is
+// true, atomically stamps `titlingNeeded: true` + releases its claim
+// immediately after the master's veoVideoUrl lands. The row stays
+// status:'rendering' (receipt-holding, reaper-safe). This role's poll loop
+// then claims those rows and does Remotion titling out-of-process, where
+// Chrome gets all 8 GiB of memory without contending with the renderer's
+// poll loop, Atlas HTTP work, or static submits on the same instance.
+//
+// CLAIM FILTER (money-safe):
+//   { status: 'rendering',
+//     veoVideoUrl:   { $ne: null },    // Omni master delivered — has receipt
+//     titlingNeeded: true,             // renderer explicitly handed off
+//     claimedByWorker: null }          // idle
+//   sort: { createdAt: 1 }             // FIFO, matches renderer.claimOne
+//
+// SUCCESSFUL TERMINAL WRITE clears titlingNeeded, stamps renderUrl (via
+// brandScriptExecutor.uploadRenderAndStamp), and releases the claim. Failed
+// vision QC (buildVideoQcFailureFields inside titling) already stamps
+// status:'failed' — the guarded terminal write here MUST NOT overwrite that
+// (see settleNonDraftTerminal).
+//
+// ── DUPLICATION NOTICE ──
+// This file duplicates several helpers currently defined in
+// src/services/renderer.js: startAdHeartbeat, bumpRunCounter,
+// maybeFinalizeRun, settleNonDraftTerminal, notifyRunFinalized, and the
+// per-run heartbeat plumbing (runInflight/runHeartbeats/acquireRunHeartbeat).
+// This is DELIBERATE — Phase 4 deletes the renderer's video titling path
+// entirely (once ADGEN_TITLER_ENABLED has been on in prod for a stable
+// window), at which point the helpers move here permanently and the
+// renderer's copies vanish with the code that uses them. Extracting a
+// shared module NOW would enlarge the blast radius of this PR unnecessarily.
+// If you edit one copy, edit the other, until Phase 4 lands.
+
+const { POLL_MS, WORKER_ID, MAX_INFLIGHT, isTitlerEnabled, isAdgenRendererEnabled } = require('../config');
+const {
+  isStaleTopologyError,
+  reconnectAfterStaleTopology,
+  resetReconnectAttempts
+} = require('../db');
+const Ad          = require('../models/Ad');
+const Brand       = require('../models/Brand');
+const Media       = require('../models/Media');
+const CampaignRun = require('../models/CampaignRun');
+const alerts      = require('./alertService');
+const { adStage } = require('./adStage');
+const { renderBrandScriptAndSave, qcAndStampVideoAd } = require('./brandScriptExecutor');
+const { classifyRunAdOutcome, buildRunReconciliationUpdate } = require('./campaignRunGuards');
+const { startRunHeartbeat } = require('./campaignRunHeartbeat');
+const { renderQueueStats } = require('./remotionRenderService');
+
+const HEARTBEAT_MS = 30_000;
+const SHUTDOWN_DRAIN_MS = 25_000;
+
+// AD_HEARTBEAT — see renderer.js's long block for the full reasoning.
+// Duplicated intentionally (see header). Same clamp, same 90s ceiling.
+const AD_HEARTBEAT_MS_RAW  = Number(process.env.AD_HEARTBEAT_MS || 60_000);
+const AD_HEARTBEAT_SAFE_MAX_MS = 90_000;
+const AD_HEARTBEAT_MS = Math.min(AD_HEARTBEAT_MS_RAW, AD_HEARTBEAT_SAFE_MAX_MS);
+if (AD_HEARTBEAT_MS_RAW > AD_HEARTBEAT_SAFE_MAX_MS) {
+  console.error(
+    `titler[${WORKER_ID}]: AD_HEARTBEAT_MS=${AD_HEARTBEAT_MS_RAW}ms > safe max ` +
+    `${AD_HEARTBEAT_SAFE_MAX_MS}ms — clamping (see renderer.js for reasoning).`
+  );
+}
+// Max lifetime for the per-ad titling heartbeat. Remotion queue wait +
+// render + upload + QC has a p99 well under this cap.
+const AD_HEARTBEAT_MAX_MS = 60 * 60 * 1000; // 60 min
+
+const state = {
+  running: false,
+  shuttingDown: false,
+  inFlight: new Set(),                 // ad._id strings currently being titled
+  heartbeatTimer: null,
+  pollTimer: null,
+  polling: false,                      // pollTick mutex — see pollTick header
+  startedAt: null,
+};
+
+function log(msg) { console.log(`titler[${WORKER_ID}]: ${msg}`); }
+function warn(msg) { console.warn(`titler[${WORKER_ID}]: ${msg}`); }
+
+// Per-run Slack thread. Same contract as renderer.js's noteFeed: attach to
+// the backend-created CampaignRun.slackFeed parent, never create one,
+// never throw into a billed path.
+const FEED_SOURCE_TITLER = 'adgen-titler';
+function noteFeed(ad, stage) {
+  try {
+    const runFeed = require('./runFeedService');
+    runFeed.attachAd(ad, { source: FEED_SOURCE_TITLER });
+    if (stage) adStage(ad && ad._id, stage);
+  } catch (err) {
+    try { warn(`runFeed note failed: ${err && err.message}`); }
+    catch (_) { /* alerting must never fail titling */ }
+  }
+}
+function noteFeedEvent(ad, stage, extra) {
+  try {
+    const runFeed = require('./runFeedService');
+    runFeed.attachAd(ad, { source: FEED_SOURCE_TITLER });
+    const runId = Array.isArray(ad && ad.campaignRunIds) && ad.campaignRunIds.length
+      ? ad.campaignRunIds[ad.campaignRunIds.length - 1]
+      : null;
+    if (!runId || !stage) return;
+    runFeed.noteEvent(runId, stage, {
+      adId: ad && ad._id != null ? String(ad._id) : null,
+      source: FEED_SOURCE_TITLER,
+      template: ad && ad.template,
+      aspectRatio: ad && ad.aspectRatio,
+      platformFormat: ad && ad.platformFormat,
+      mediaId: ad && ad.mediaId,
+      ...(extra || {})
+    });
+  } catch (err) {
+    try { warn(`runFeed event failed: ${err && err.message}`); }
+    catch (_) { /* alerting must never fail titling */ }
+  }
+}
+
+function heartbeatOnce() {
+  const uptime = state.startedAt ? Math.floor((Date.now() - state.startedAt) / 1000) : 0;
+  const gate = isTitlerEnabled() ? 'ON' : 'OFF';
+  log(`alive — uptime ${uptime}s, inflight ${state.inFlight.size}/${MAX_INFLIGHT}, handoff ${gate}`);
+}
+
+// ── atomic claim ───────────────────────────────────────────────────────────
+async function claimOne() {
+  // GATED ON ADGEN_RENDERER_ENABLED — the SAME cutover flag the renderer's
+  // claimOne consults — in addition to ADGEN_TITLER_ENABLED (checked by
+  // pollTick() before this is ever called). Two reasons this second gate
+  // exists, on top of pollTick()'s own:
+  //   1. Defense in depth, same as the renderer — safe for any future call
+  //      site, not just today's single caller.
+  //   2. ADGEN_RENDERER_ENABLED is the single switch documented to decide
+  //      whether adgen or backend is doing ANY rendering work right now.
+  //      Titling-in-progress video is part of that work. Without this, an
+  //      operator reverting to backend by flipping ADGEN_RENDERER_ENABLED
+  //      off — while forgetting ADGEN_TITLER_ENABLED, a separate flag —
+  //      would leave this role still claiming and titling fresh masters.
+  // Read at CALL TIME, same fail-safe direction as the renderer: unreadable
+  // or malformed reads as OFF, so this stands down rather than claims. A
+  // row already claimed by THIS worker is unaffected either way — the gate
+  // only guards acquiring a NEW claim, never an in-flight one.
+  if (!isAdgenRendererEnabled()) return null;
+
+  // status: masters emerge from atlasVideoService.generateForAd already
+  // stamped 'draft' (pre-existing money-safety rule: never leave a paid
+  // Omni master in status:'rendering'). Derives stay 'rendering' through
+  // the renderer's handoff. Accept both — same $in shape the terminal
+  // write uses. titlingNeeded=true is the actual handoff signal; a
+  // completed ad has titlingNeeded=false so is filtered out regardless.
+  return await Ad.findOneAndUpdate(
+    {
+      status:          { $in: ['rendering', 'draft'] },
+      veoVideoUrl:     { $ne: null },
+      titlingNeeded:   true,
+      claimedByWorker: null,
+    },
+    { $set: { claimedByWorker: WORKER_ID, claimedAt: new Date() } },
+    { new: true, sort: { createdAt: 1 } }
+  );
+}
+
+async function releaseClaim(adId, reason = null) {
+  try {
+    await Ad.updateOne(
+      { _id: adId, claimedByWorker: WORKER_ID },
+      { $set: { claimedByWorker: null, claimedAt: null } }
+    );
+    if (reason) log(`released claim on ${String(adId).slice(-6)} — ${reason}`);
+  } catch (err) {
+    warn(`release claim failed for ${adId}: ${err.message}`);
+  }
+}
+
+// ── per-ad titling heartbeat (DUPLICATE OF renderer.js, see header) ────────
+function startAdHeartbeat(adId) {
+  const openedAt = Date.now();
+  let stopped = false;
+  const timer = setInterval(() => {
+    if (Date.now() - openedAt > AD_HEARTBEAT_MAX_MS) {
+      clearInterval(timer);
+      stopped = true;
+      warn(
+        `titling heartbeat for ad=${String(adId).slice(-6)} hit the ` +
+        `${Math.round(AD_HEARTBEAT_MAX_MS / 60000)}m cap — stopping liveness updates`
+      );
+      return;
+    }
+    Ad.updateOne(
+      { _id: adId, claimedByWorker: WORKER_ID, status: 'rendering' },
+      { $set: { updatedAt: new Date() } }
+    ).catch(() => {});
+  }, AD_HEARTBEAT_MS);
+  if (typeof timer.unref === 'function') timer.unref();
+  return {
+    stop() { if (!stopped) { stopped = true; clearInterval(timer); } }
+  };
+}
+
+// ── run counter + finalize (DUPLICATE OF renderer.js) ──────────────────────
+async function bumpRunCounter(campaignRunIds, field) {
+  if (!Array.isArray(campaignRunIds) || !campaignRunIds.length) return;
+  const runId = campaignRunIds[campaignRunIds.length - 1];
+  try {
+    await CampaignRun.updateOne(
+      { runId },
+      { $inc: { [field]: 1 }, $set: { updatedAt: new Date(), lastHeartbeatAt: new Date() } }
+    );
+  } catch (err) {
+    warn(`bumpRunCounter(${field}) failed for ${runId}: ${err.message}`);
+  }
+  await maybeFinalizeRun(runId);
+}
+
+async function maybeFinalizeRun(runId) {
+  if (!runId) return;
+  try {
+    const claimedAds = await Ad.find({ campaignRunIds: runId })
+      .select('status kind renderUrl veoVideoUrl titlingResumeState renderStage titlingNeeded')
+      .lean();
+    if (!claimedAds.length) return;
+
+    const outcome = classifyRunAdOutcome(claimedAds);
+    if (!outcome.isSettled) return;
+    if (outcome.needsRetry) return;
+
+    const update = buildRunReconciliationUpdate(outcome, { now: new Date() });
+    const res = await CampaignRun.updateOne({ runId, status: 'running' }, update);
+    if (res && (res.modifiedCount || res.nModified)) {
+      log(`run ${runId} finalized -> done (succeeded=${outcome.succeeded} failed=${outcome.failed})`);
+      notifyRunFinalized(runId, outcome);
+      try {
+        require('./runFeedService').finishRun({
+          runId,
+          succeeded: outcome.succeeded,
+          failed: outcome.failed,
+          skipped: outcome.skipped || 0
+        });
+      } catch (_) { /* feed must never fail finalization */ }
+    }
+  } catch (err) {
+    warn(`maybeFinalizeRun(${runId}) failed: ${err.message}`);
+  }
+}
+
+function notifyRunFinalized(runId, outcome) {
+  if (!outcome || !outcome.failed) return;
+  try {
+    const nOk = outcome.succeeded || 0;
+    const nFailed = outcome.failed;
+    alerts.notifyAsync({
+      level: nOk === 0 ? 'error' : 'warn',
+      title: nOk === 0
+        ? `Campaign run failed entirely — ${nFailed} ad(s)`
+        : `Campaign run finished with ${nFailed} failed ad(s)`,
+      key: `run-failed:${nOk === 0 ? 'total' : 'partial'}`,
+      fields: { run: runId, outcome: `${nOk}✓ / ${nFailed}✗ of ${nOk + nFailed}` }
+    });
+  } catch (_) { /* alerting must never block finalization */ }
+}
+
+// ── settle guard (DUPLICATE OF renderer.js) ────────────────────────────────
+// Vision QC already stamped status:'failed' — do NOT resurrect to 'draft'.
+// This is the SAME safety property renderer.js documents at length (46
+// lines of comment). Read that file's copy before touching this one.
+async function settleNonDraftTerminal(ad, label) {
+  const shortId = String(ad._id).slice(-6);
+  // renderStage:'done' unconditionally — DUPLICATE OF renderer.js's copy,
+  // same reasoning: renderStage is progress telemetry, not a pass/fail
+  // verdict (status, left alone here, already carries that). Closes the
+  // "stuck in quality check forever" frontend bug for the titler-owned path
+  // the same way renderer.js's copy does — see that file's comment.
+  const after = await Ad.findOneAndUpdate(
+    { _id: ad._id },
+    {
+      $set: {
+        titlingResumeState: null,
+        titlingNeeded:      false,           // titler owns clearing this
+        claimedByWorker:    null,
+        claimedAt:          null,
+        renderStage:        'done',
+        renderStageAt:      new Date(),
+        updatedAt:          new Date()
+      }
+    },
+    { new: true, projection: { status: 1 } }
+  ).lean();
+  const kept = (after && after.status) || 'failed';
+  warn(
+    `${label} ad=${shortId} kept terminal status='${kept}' ` +
+    `(NOT overwritten with draft) — claim released, titling debt cleared`
+  );
+  return { status: kept, counter: kept === 'failed' ? 'failed' : 'succeeded' };
+}
+
+// ── run heartbeat plumbing (DUPLICATE OF renderer.js) ──────────────────────
+const runInflight   = new Map();
+const runHeartbeats = new Map();
+const runDocIdCache = new Map();
+
+function runIdOf(ad) {
+  return Array.isArray(ad.campaignRunIds) && ad.campaignRunIds.length
+    ? ad.campaignRunIds[ad.campaignRunIds.length - 1]
+    : null;
+}
+function runIsWorking(runId) { return (runInflight.get(runId) || 0) > 0; }
+
+async function acquireRunHeartbeat(runId) {
+  const noop = { stop() {} };
+  if (!runId) return noop;
+
+  runInflight.set(runId, (runInflight.get(runId) || 0) + 1);
+  let released = false;
+  const release = () => {
+    if (released) return;
+    released = true;
+    const n = (runInflight.get(runId) || 1) - 1;
+    if (n <= 0) {
+      runInflight.delete(runId);
+      const handle = runHeartbeats.get(runId);
+      runHeartbeats.delete(runId);
+      runDocIdCache.delete(runId);
+      if (handle) handle.stop();
+    } else {
+      runInflight.set(runId, n);
+    }
+  };
+
+  try {
+    if (!runHeartbeats.has(runId)) {
+      let docId = runDocIdCache.get(runId);
+      if (!docId) {
+        const doc = await CampaignRun.findOne({ runId }).select('_id').lean();
+        docId = doc && doc._id;
+        if (docId) runDocIdCache.set(runId, docId);
+      }
+      if (docId && !runHeartbeats.has(runId)) {
+        let adIds = [];
+        try {
+          const claimed = await Ad.find({ campaignRunIds: runId }).select('_id').lean();
+          adIds = Array.isArray(claimed) ? claimed.map((a) => a._id) : [];
+        } catch (_) {}
+        runHeartbeats.set(runId, startRunHeartbeat({
+          runDocId:  docId,
+          adIds,
+          isWorking: () => runIsWorking(runId)
+        }));
+      }
+    }
+  } catch (err) {
+    warn(`startRunHeartbeat failed for ${runId}: ${err.message}`);
+  }
+
+  return { stop: release };
+}
+
+// ── titling core ───────────────────────────────────────────────────────────
+async function titleAd(ad) {
+  const adId = String(ad._id);
+  const shortId = adId.slice(-6);
+  const t0 = Date.now();
+  const isDerive = !!(ad.deriveFromMaster);
+  const label = isDerive ? 'DERIVE' : 'MASTER';
+  log(`VIDEO ${label} titling start ad=${shortId} format=${ad.platformFormat}`);
+  noteFeed(ad, `claimed for titling (${label.toLowerCase()})`);
+
+  // Load brand (via ad.mediaId → Media.brandId, else ad.brandId).
+  const sourceMedia = ad.mediaId ? await Media.findById(ad.mediaId).select('brandId').lean() : null;
+  const brandDoc = sourceMedia?.brandId
+    ? await Brand.findById(sourceMedia.brandId).lean()
+    : (ad.brandId ? await Brand.findById(ad.brandId).lean() : null);
+
+  // For derives, veoReferenceImages must come from the master (not the
+  // derive's own record — the inherit-write on renderer.js copies only
+  // what's needed to ship/title, not the seed list). See renderer.js's
+  // long comment for the full reasoning.
+  let masterForQc = null;
+  if (isDerive) {
+    masterForQc = await Ad.findOne({
+      campaignId:     ad.campaignId,
+      productId:      ad.productId,
+      platformFormat: ad.deriveFromMaster,
+      kind:           'video',
+      _id:            { $ne: ad._id },
+      $and: [
+        { $or: [{ deriveFromMaster: null }, { deriveFromMaster: { $exists: false } }] },
+        { $or: [{ funnelStage: null },       { funnelStage: { $exists: false } }] }
+      ]
+    }).sort({ generatedAt: -1 }).lean();
+  }
+
+  // Re-read the ad after any potential renderer stamps landed.
+  const adFinal = await Ad.findById(adId).lean();
+
+  if (brandDoc) {
+    adStage(adId, `titling ${ad.aspectRatio || '9:16'} (${label.toLowerCase()})`);
+    const beat = startAdHeartbeat(adId);
+    try {
+      try {
+        noteFeed(ad, `titling remotion start (${ad.aspectRatio || '9:16'})`);
+        const chromeOut = await renderBrandScriptAndSave({ ad: adFinal, brand: brandDoc });
+        if (chromeOut?.skipped) {
+          log(`VIDEO ${label} no-chrome ad=${shortId} — shipping master`);
+        }
+        noteFeed(ad, 'titling remotion done');
+      } catch (scriptErr) {
+        // scriptErr.titlingResumable is stamped by brandScriptExecutor's
+        // stampTitlingFailureAndThrow for OOM, timeout, AND a generic child
+        // failure/exception (bounded by TITLING_ATTEMPTS_MAX) — was OOM-only
+        // (isRemotionChildOomError). This file duplicates renderer.js's
+        // titling call site (see this file's own header: "If you edit one
+        // copy, edit the other") — renderer.js's video derive/master arms
+        // were updated to the same flag; this arm had been missed, which
+        // meant a resumable timeout/generic titling failure on the titler
+        // role fell through to processAd's catch below and got
+        // double-counted as a genuine 'failed' (bumpRunCounter) even though
+        // the Ad row itself stays recoverable (its write is owner-scoped and
+        // no-ops once the stamp has cleared claimedByWorker).
+        if (scriptErr && scriptErr.titlingResumable) {
+          // brandScriptExecutor's stampTitlingFailureAndThrow has already
+          // written the ENTIRE ownership handover in ONE $set: status:'draft',
+          // titlingResumeState:'pending', titlingNeeded:false, claim cleared.
+          // titlingResumeService owns the row from here.
+          //
+          // `titlingNeeded:false` USED TO BE THIS WRITE'S JOB, and it could
+          // never do it: the filter below is scoped to
+          // `claimedByWorker: WORKER_ID`, which the stamp nulls in the same
+          // $set that leaves titlingNeeded alone — so this write could not
+          // match, titlingNeeded stayed true next to
+          // titlingResumeState:'pending', and BOTH titler.claimOne (keys on
+          // titlingNeeded) and titlingResumeService (keys on
+          // titlingResumeState) could claim the row. Two Remotion renders on
+          // one already-paid Omni master. The clear now lives in the stamp's
+          // own $set, where it is atomic with the claim release.
+          //
+          // THIS WRITE IS KEPT EXACTLY AS IT WAS. Every field it sets is now
+          // byte-identical to what the stamp sets for the same key
+          // (titlingNeeded:false, claimedByWorker:null, claimedAt:null), so
+          // the two writes CANNOT DISAGREE, and its no-op in the normal case
+          // is the correct outcome rather than a silent failure.
+          //
+          // It still has one job: the stamp's updateOne is wrapped in a
+          // try/catch that only warns, so a transient Mongo error there leaves
+          // the row claimed with titlingNeeded:true — exactly the shape this
+          // filter matches.
+          //
+          // BE PRECISE ABOUT WHAT THAT REPAIR DOES AND DOES NOT DO (pre-existing
+          // either way — this branch is unchanged by the dual-claim fix):
+          //   - stamp write failed AND this one also lost → row keeps its claim
+          //     and titlingNeeded:true, and reclaimStaleTitlerClaims' 20-minute
+          //     claimedAt TTL below recovers it: it releases the claim, after
+          //     which claimOne is the ONLY filter that matches (titlingNeeded
+          //     is true, but titlingResumeState is still null and status is
+          //     still 'rendering', so titlingResumeService cannot see the row).
+          //     Free rework on a paid master, bounded by TITLING_ATTEMPTS_MAX.
+          //
+          //     THIS DEPENDS ON PR #75 (bootRecoveryService, commit c02c7ff),
+          //     WHICH IS AN ANCESTOR OF THIS COMMIT — and it is spelled out
+          //     because it is not obvious and a rebase could silently undo it.
+          //     Before #75, the sentence above was FALSE in the dangerous
+          //     direction: boot recovery sweeps on RESUME_STALE_MIN (5 min) and
+          //     so always reached this row before reclaim's 20, stamping
+          //     status:'draft' + titlingResumeState:'pending' while clearing
+          //     NEITHER titlingNeeded NOR claimedByWorker. titlingResumeService
+          //     then matched immediately, and reclaim releasing the claim did
+          //     not rescue the row — it COMPLETED a dual claim. #75 closes that
+          //     by (a) excluding the titler-handoff shape from the sweep
+          //     entirely (`NOT (titlingNeeded===true AND a real veoVideoUrl)`,
+          //     bootRecoveryService.js ~:221-230) and (b) clearing
+          //     titlingNeeded on its own pending write (~:498).
+          //     ⇒ IF #75 IS EVER REVERTED, OR THIS BRANCH IS REBASED ONTO
+          //     ANYTHING PREDATING c02c7ff, THIS PARAGRAPH GOES BACK TO BEING
+          //     WRONG AND THE DUAL CLAIM REOPENS. Section E of
+          //     scripts/verifyTitlingDualClaim.js runs the REAL exported
+          //     buildRecoverySweepFilter against this exact row so that
+          //     regression is a red test, not a stale comment.
+          //   - stamp write failed but THIS one lands → the row ends up
+          //     status:'rendering', unclaimed, titlingNeeded:false and with NO
+          //     titlingResumeState, so no titling-path owner: not claimOne
+          //     (needs titlingNeeded), not reclaimStaleTitlerClaims (needs a
+          //     claim), not titlingResumeService (needs status:'draft'). It is
+          //     recovered instead by bootRecoveryService's rendering+receipt
+          //     sweep, or re-claimed by renderer.claimOne, whose Atlas re-entry
+          //     is receipt-guarded (shouldResumeAttempt) so it cannot re-bill.
+          //     Widening this $set to stamp status:'draft' +
+          //     titlingResumeState:'pending' would hand it to the titling path
+          //     directly, but doing that safely needs the same
+          //     status:{$in:['rendering','draft']} guard every other terminal
+          //     write here carries — deliberately left out of scope rather than
+          //     shipped unguarded on a money path.
+          // WARN-ONLY, mirroring the stamp's own try/catch. This write was
+          // previously unwrapped, and that asymmetry was harmful precisely
+          // because it sits on the failure path: a Mongo blip here escaped the
+          // inner `catch (scriptErr)`, became titleAd's throw, and processAd's
+          // catch below then stamped status:'failed' + bumpRunCounter('failed')
+          // — converting a RESUMABLE OOM, whose paid master is sitting right
+          // there on renderUrl, into a terminally failed ad and a wrong run
+          // counter. A safety net must not be able to fail the thing it is
+          // protecting. Swallowing here leaves the row claimed with
+          // titlingNeeded:true, which is a recoverable shape (see below);
+          // throwing left it written off, which is not.
+          try {
+            await Ad.updateOne(
+              { _id: ad._id, claimedByWorker: WORKER_ID },
+              { $set: { titlingNeeded: false, claimedByWorker: null, claimedAt: null } }
+            );
+          } catch (netErr) {
+            warn(`titling-failure follow-up write failed for ${shortId} (${netErr.message}) — row left claimed for recovery`);
+          }
+          warn(`VIDEO ${label} titling ${scriptErr.titlingFailureKind || 'failed'} ad=${shortId} — paid asset kept, titling left pending`);
+          return { earlyReturn: true };
+        }
+        throw scriptErr;
+      }
+    } finally {
+      beat.stop();
+    }
+  } else {
+    // NO BRAND RESOLVED — same fallback the renderer uses. Vision QC only,
+    // no titling. See renderer.js's long comments for the reasoning
+    // (veoReferenceImages must come from `master` for derives).
+    const beat = startAdHeartbeat(adId);
+    try {
+      const qcAd = isDerive && masterForQc
+        ? {
+            ...adFinal,
+            veoReferenceImages: masterForQc.veoReferenceImages || [],
+            videoDurationSec:   masterForQc.videoDurationSec || adFinal.videoDurationSec || null
+          }
+        : adFinal;
+      const deliveredUrl = adFinal.renderUrl || adFinal.veoVideoUrl;
+      await qcAndStampVideoAd({ ad: qcAd, deliveredUrl });
+    } finally {
+      beat.stop();
+    }
+  }
+
+  // Terminal — clear titling debt + claim + titlingNeeded. GUARDED: titling
+  // may have already stamped status:'failed' (vision QC).
+  const promoted = await Ad.updateOne(
+    { _id: ad._id, status: { $in: ['rendering', 'draft'] } },
+    {
+      $set: {
+        status:             'draft',
+        titlingResumeState: null,
+        titlingNeeded:      false,
+        claimedByWorker:    null,
+        claimedAt:          null,
+        // Terminal stage — see settleNonDraftTerminal's comment.
+        renderStage:        'done',
+        renderStageAt:      new Date(),
+        updatedAt:          new Date()
+      }
+    }
+  );
+  const settled = promoted.matchedCount
+    ? { status: 'draft', counter: 'succeeded' }
+    : await settleNonDraftTerminal(ad, `VIDEO ${label}`);
+  const wallSec = ((Date.now() - t0) / 1000).toFixed(1);
+  log(`VIDEO ${label} done ad=${shortId} wall=${wallSec}s status=${settled.status}`);
+  noteFeedEvent(ad, settled.status === 'draft' ? 'done' : `failed — ${settled.status}`);
+  await bumpRunCounter(ad.campaignRunIds, settled.counter);
+  return { settled };
+}
+
+// End-to-end for one claimed ad.
+async function processAd(ad) {
+  const runHeartbeat = await acquireRunHeartbeat(runIdOf(ad));
+  const adKey = String(ad._id);
+  state.inFlight.add(adKey);
+  try {
+    try {
+      noteFeed(ad, `claimed by ${WORKER_ID}`);
+      await titleAd(ad);
+    } catch (err) {
+      const shortId = adKey.slice(-6);
+      warn(`titling failed ad=${shortId}: ${err.message}`);
+      // Terminal-fail with owner-scoped write. If claim already lost, no-op.
+      try {
+        await Ad.updateOne(
+          { _id: ad._id, claimedByWorker: WORKER_ID },
+          {
+            $set: {
+              status:             'failed',
+              // Clear BOTH titling markers on terminal failure so
+              // backlogWatchdog[titling-stuck] can't page forever on this
+              // row. Same fix as renderer.js's own catch (paired PR).
+              titlingResumeState: null,
+              titlingNeeded:      false,
+              claimedByWorker:    null,
+              claimedAt:          null,
+              // Terminal stage — this row is done (definitively failed, not
+              // still in-flight); status already carries the failure. Same
+              // "stuck in [stage] forever" bug settleNonDraftTerminal fixes,
+              // for the unrecovered-exception path instead of the
+              // caught-inside-titleAd QC-fail path.
+              renderStage:        'done',
+              renderStageAt:      new Date(),
+              updatedAt:          new Date(),
+              renderError: {
+                message: (err && err.message) ? String(err.message).slice(0, 500) : 'titler processAd threw',
+                stage:   'titler',
+                at:      new Date()
+              }
+            }
+          }
+        );
+      } catch (writeErr) {
+        warn(`terminal-fail write failed for ${adKey.slice(-6)}: ${writeErr.message}`);
+      }
+      try {
+        await bumpRunCounter(ad.campaignRunIds, 'failed');
+      } catch (bumpErr) {
+        warn(`bump-fail write failed for ${adKey.slice(-6)}: ${bumpErr.message}`);
+      }
+      noteFeedEvent(ad, `failed — ${String((err && err.message) || err).slice(0, 80)}`);
+      try {
+        alerts.notifyAsync({
+          level: 'error',
+          title: `titler render failure`,
+          key:   `titler-render-failure:${ad.platformFormat || 'unknown'}`,
+          fields: {
+            ad:     String(ad._id),
+            format: ad.platformFormat,
+            error:  err && err.message ? String(err.message).slice(0, 200) : String(err)
+          }
+        });
+      } catch (_) {}
+    }
+  } finally {
+    state.inFlight.delete(adKey);
+    try { runHeartbeat.stop(); } catch (_) {}
+  }
+}
+
+// ── Remotion backpressure ─────────────────────────────────────────────────
+// The Remotion queue in remotionRenderService.js caps ACTIVE Chrome renders
+// at REMOTION_QUEUE_CONCURRENCY (default 2 on 8 GB). Claims that arrive
+// beyond that ceiling sit in an IN-PROCESS waiter — and while they wait,
+// they are pinned to THIS titler instance's state.inFlight, so sibling
+// instances (which have their own idle Chrome slots) cannot claim them.
+//
+// Head-of-line pin, measured 2026-08-25 on run_1787697069901: one titler
+// held 4/16 while three others sat at 0/16 for 5+ minutes on a queue of
+// ~15 handed-off ads. MAX_INFLIGHT=4 (env change, same run) narrows the
+// hoard but does not eliminate it; this check is the precise gate.
+//
+// The rule: pause claiming when (active + waiting) is already at
+// concurrency + SLACK. SLACK=1 permits ONE local pipeline waiter so that
+// fetch/prep on the next ad can overlap with the current renders — a
+// slot freeing then hands off to the waiter instantly, no wasted Chrome
+// idle. Anything more than SLACK=1 is head-of-line waste that a sibling
+// could pick up.
+//
+// Fail-open: any exception reading the queue means DON'T backpressure.
+// A telemetry failure must never block productive claim work.
+const REMOTION_BACKPRESSURE_SLACK = 1;
+
+function shouldSkipForBackpressure() {
+  try {
+    const stats = renderQueueStats();
+    if (!stats || !Number.isFinite(stats.concurrency)) return false;
+    const active = Number(stats.active) || 0;
+    const waiting = Number(stats.waiting) || 0;
+    const cap = stats.concurrency + REMOTION_BACKPRESSURE_SLACK;
+    // Two lenses, and BOTH must be checked. Measured 2026-08-25 on
+    // run_1787699708xxx (Pelagic apparel): the Remotion-queue lens alone
+    // missed the setup-latency gap. When burst-claim fires, the newly-
+    // claimed ads spend ~1s in synchronous setup (funnelCopy → coherentProof
+    // → brandScript → templateRegistry → face detection) BEFORE enqueue()
+    // is called. During that window they are pinned to state.inFlight but
+    // INVISIBLE to renderQueueStats, so this instance's poll loop happily
+    // claims more — 4 ads captured before active ever moved off 1.
+    //
+    //   1. Remotion queue (active+waiting) — catches steady-state
+    //      pipeline utilization. This alone is what the original fix used.
+    //   2. state.inFlight — catches the setup-latency gap where ads are
+    //      claim-committed but not yet enqueued into Remotion. Post-Remotion
+    //      QC ads also count here, which is conservative but correct: they
+    //      still occupy the pipeline slot and a slot freeing on the sibling
+    //      instance is preferable to holding here.
+    if ((active + waiting) >= cap) return true;
+    if (state.inFlight.size >= cap) return true;
+    return false;
+  } catch (err) {
+    // Fail-open — a broken stats getter must NEVER stop the titler.
+    return false;
+  }
+}
+
+// ── poll ──────────────────────────────────────────────────────────────────
+// MUTEX. setInterval does not serialize its callbacks — if one pollTick's
+// awaited claimOne(s) take longer than POLL_MS, the next firing runs
+// concurrently. Measured 2026-08-25: two overlapping pollTicks each observed
+// state.inFlight.size=3, each passed the `< MAX_INFLIGHT` gate, each
+// claimed an ad — result was 5/4 inFlight on one instance (a MAX_INFLIGHT
+// violation). The `state.polling` gate makes overlapping fires no-op.
+async function pollTick() {
+  if (state.shuttingDown) return;
+  if (!isTitlerEnabled()) return;
+  if (state.polling) return;         // another pollTick is already inside the loop
+  if (state.inFlight.size >= MAX_INFLIGHT) return;
+
+  state.polling = true;
+  try {
+    while (!state.shuttingDown && state.inFlight.size < MAX_INFLIGHT) {
+      // Backpressure: stop claiming if THIS instance's Remotion queue is
+      // already saturated OR its state.inFlight is already at the effective
+      // cap. The check must run INSIDE the loop, not just at entry — during
+      // a burst-claim tick, each successful claim mutates the queue state
+      // (its enqueue() increments active or waiting), so a once-per-tick
+      // check would still overshoot.
+      if (shouldSkipForBackpressure()) break;
+      const ad = await claimOne();
+      if (!ad) break;
+      // Unawaited — burst-claim, process concurrently.
+      processAd(ad).catch((err) => warn(`unhandled processAd error: ${err.message}`));
+    }
+    resetReconnectAttempts();
+  } catch (err) {
+    if (isStaleTopologyError(err)) {
+      warn(`stale topology (${err.message}) — reconnecting`);
+      await reconnectAfterStaleTopology().catch((e) => warn(`reconnect failed: ${e.message}`));
+      return;
+    }
+    warn(`poll error: ${err.message}`);
+  } finally {
+    state.polling = false;
+  }
+}
+
+// ── dead-titler claim reclaim (2026-08-26) ──────────────────────────────────
+// Reclaims a claim held by a titler worker that died without running
+// shutdown() — an OOM SIGKILL, the exact failure mode that killed three
+// titler instances in 44h (config/defaults.env's 2026-08-26 section). A
+// clean SIGTERM/SIGINT already reaches shutdown()'s drain-and-release path
+// above; SIGKILL bypasses it entirely, so the claim just sits there.
+//
+// NOTHING ELSE COVERS THIS. Audited before writing it, not assumed:
+//   - titlingResumeService.buildResumeFilter's staleness clock only ages
+//     `updatedAt` on rows with titlingResumeState:'claimed' — titler NEVER
+//     stamps that (the renderer's handoff clears it to null before titler
+//     ever sees the row), so that arm never matches a titler-claimed row.
+//   - bootRecoveryService.resumeInFlightAds never reads claimedByWorker or
+//     claimedAt at all (by its own header, deliberately no claim/lease) and
+//     its recovery write does not touch claimedByWorker either — a dead
+//     titler's stamp survives a boot-recovery pass untouched.
+//   - renderer.alertOrphanedClaimsOnBoot DOES read both clocks, but is
+//     READ-ONLY (an alert, never a release) and filters status:'rendering'
+//     only — titler's own claimOne also claims status:'draft' rows (masters
+//     land pre-drafted), which that alert would miss even if it did write.
+//   - claimOne() itself requires claimedByWorker:null — a dead worker's
+//     stamp blocks every live titler (including this one) from ever
+//     touching that row again.
+//
+// MONEY SAFETY — this function ONLY clears claimedByWorker/claimedAt back to
+// null. It never touches status, titlingNeeded, veoVideoUrl, or renderUrl.
+// The reclaimed row is picked up by the SAME claimOne() filter any live
+// titler already uses (this one on its next poll, or a peer instance
+// first — whichever polls next), re-entering titleAd() ->
+// renderBrandScriptAndSave(), which never requires('./atlasVideoService')
+// — proven by verifyTitlingResumeNeverResubmits.js's require-graph BFS from
+// brandScriptExecutor.js; titler.js's own require graph (line ~37-52 above)
+// is a strict subset of that (brandScriptExecutor + remotionRenderService,
+// no atlasVideoService anywhere in it). Re-titling a reclaimed row is free
+// rework on an already-paid master, exactly like titlingResumeService's own
+// resume path — this cannot cause a second billable Atlas submission.
+//
+// STALENESS SIGNAL — claimedAt age alone, not the two-clock (claimedAt +
+// updatedAt) pattern renderer's orphan alert uses. Reason: the per-ad
+// heartbeat (startAdHeartbeat) only refreshes `updatedAt` when the row's
+// status is 'rendering' (its own filter). A titler-claimed row already at
+// status:'draft' — the common case for masters, which atlasVideoService
+// lands pre-drafted — never gets a heartbeat at all, so ALSO requiring
+// updatedAt staleness would under-detect precisely the rows most likely to
+// need reclaiming. claimedAt is stamped exactly once, at claim time, by
+// claimOne — a simple clock that needs no heartbeat cooperation.
+//
+// TTL SIZING — 20 minutes by default, comfortably above any legitimate
+// attempt: REMOTION_CHILD_TIMEOUT_MS (480s parent-side SIGKILL) bounds one
+// Remotion child, renderWithRemotionAndSave retries at most once more on a
+// cropped-plate failure (its own catch, brandScriptExecutor.js), so
+// 2 x 480s = 960s (16 min) is the worst-case Remotion time even if BOTH
+// attempts hang to their full timeout — plus modest queue-wait and prep
+// overhead, still under 20 min. The 8 ads measured genuinely stuck in
+// production were stale 27 minutes to 14.7 hours, so this TTL recovers all
+// of them well inside one sweep interval without risking a false reclaim of
+// a slow-but-alive attempt.
+const TITLER_CLAIM_STALE_MIN = Math.max(1, parseInt(process.env.TITLER_CLAIM_STALE_MIN, 10) || 20);
+
+async function reclaimStaleTitlerClaims() {
+  const cutoff = new Date(Date.now() - TITLER_CLAIM_STALE_MIN * 60 * 1000);
+  const result = await Ad.updateMany(
+    {
+      status:          { $in: ['rendering', 'draft'] },
+      titlingNeeded:   true,
+      claimedByWorker: { $ne: null },
+      claimedAt:       { $lt: cutoff },
+    },
+    { $set: { claimedByWorker: null, claimedAt: null } }
+  );
+  return { reclaimed: result.modifiedCount || 0 };
+}
+
+function startTitlerClaimReclaimSweep() {
+  const intervalMin = Math.max(1, parseInt(process.env.TITLER_CLAIM_RECLAIM_INTERVAL_MIN, 10) || 5);
+  let inFlightPass = false;
+  let timeoutHandle = null;
+  let intervalHandle = null;
+
+  const tick = () => {
+    if (state.shuttingDown || inFlightPass) return;
+    if (!isAdgenRendererEnabled()) return; // backend owns this collection right now
+    inFlightPass = true;
+    reclaimStaleTitlerClaims()
+      .then((out) => {
+        if (out && out.reclaimed) {
+          log(`claim reclaim — released ${out.reclaimed} stale titler claim(s) (>${TITLER_CLAIM_STALE_MIN}min old) for peer pickup`);
+        }
+      })
+      .catch((err) => warn(`claim reclaim failed — ${err.message}`))
+      .finally(() => { inFlightPass = false; });
+  };
+
+  // Same 90s-delay/N-min-interval shape as renderer.js's titling resume /
+  // boot recovery sweeps — mongoose fully connected and this instance's own
+  // first heartbeat has fired before the first pass.
+  timeoutHandle = setTimeout(tick, 90 * 1000);
+  intervalHandle = setInterval(tick, intervalMin * 60 * 1000);
+  timeoutHandle.unref?.();
+  intervalHandle.unref?.();
+
+  return {
+    stop() {
+      clearTimeout(timeoutHandle);
+      clearInterval(intervalHandle);
+    }
+  };
+}
+
+let claimReclaimSweep = null;
+
+// ── lifecycle ─────────────────────────────────────────────────────────────
+async function run() {
+  if (state.running) throw new Error('titler.run called twice');
+  state.running = true;
+  state.startedAt = Date.now();
+  log(`starting — poll interval ${POLL_MS}ms, max-inflight ${MAX_INFLIGHT}, handoff gate ${isTitlerEnabled() ? 'ON (claiming)' : 'OFF (idle)'}`);
+
+  heartbeatOnce();
+  state.heartbeatTimer = setInterval(heartbeatOnce, HEARTBEAT_MS);
+  state.heartbeatTimer.unref?.();
+
+  claimReclaimSweep = startTitlerClaimReclaimSweep();
+
+  await pollTick();
+  state.pollTimer = setInterval(pollTick, POLL_MS);
+  state.pollTimer.unref?.();
+}
+
+async function shutdown() {
+  if (state.shuttingDown) return;
+  state.shuttingDown = true;
+  log(`shutting down — inflight=${state.inFlight.size}, drain up to ${SHUTDOWN_DRAIN_MS}ms`);
+
+  if (state.pollTimer) clearInterval(state.pollTimer);
+  if (state.heartbeatTimer) clearInterval(state.heartbeatTimer);
+  if (claimReclaimSweep) claimReclaimSweep.stop();
+
+  const drainDeadline = Date.now() + SHUTDOWN_DRAIN_MS;
+  while (state.inFlight.size > 0 && Date.now() < drainDeadline) {
+    await new Promise((r) => setTimeout(r, 250));
+  }
+
+  if (state.inFlight.size === 0) {
+    log('clean drain in 0ms — no forced release needed');
+    return;
+  }
+
+  // Force-release remaining claims so a peer titler picks them up.
+  const remaining = [...state.inFlight];
+  log(`drain window exhausted — force-releasing ${remaining.length} claim(s) for peer pickup`);
+  await Promise.all(remaining.map((id) => releaseClaim(id, 'sigterm-drain-timeout')));
+}
+
+module.exports = {
+  run,
+  shutdown,
+  // Exported for scripts/verifyTitlerBackpressure.js — the harness stubs
+  // renderQueueStats + mutates _state.inFlight and asserts skip vs claim
+  // behavior across BOTH lenses (Remotion queue AND setup-latency).
+  shouldSkipForBackpressure,
+  REMOTION_BACKPRESSURE_SLACK,
+  _state: state,
+  // Exported for scripts/verifyTitlerClaimReclaim.js — execution-based
+  // proof against a real Mongo-like stub (mirrors
+  // scripts/lib/miniMongoStub.js's use in verifyTitlingRecoverability.js),
+  // not just a regex over the source.
+  reclaimStaleTitlerClaims,
+  TITLER_CLAIM_STALE_MIN,
+  // Exported for scripts/verifyTitlingDualClaim.js — same reason
+  // reclaimStaleTitlerClaims is exported above. That harness has to prove
+  // that after a resumable titling failure EXACTLY ONE of the two claimants
+  // (this filter, and titlingResumeService's) can select the row. Asserting
+  // that against a filter the harness re-typed from source would prove
+  // nothing about the filter this file actually sends, so the harness
+  // executes claimOne() against a Mongo-like stub and reads the REAL
+  // recorded filter off the audit trail. Read-only from the harness's point
+  // of view: with an empty stub collection there is nothing to claim.
+  claimOne
+};

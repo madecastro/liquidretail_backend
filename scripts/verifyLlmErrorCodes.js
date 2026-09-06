@@ -18,7 +18,8 @@
 // spot reports green: CLAUDE.md §4 records `receiptFree` shipping broken to
 // production because a harness proved a call was WRITTEN, not that it
 // RESOLVED, and a sibling scan that walked only services/ + routes/ silently
-// missed worker.js at the repo root. This walks the whole tree.
+// missed worker.js at the repo root. This walks the backend tree. adgen/ is
+// skipped: it is a grafted second package with its own suite.
 //
 // Offline: no network, no DB connection, no keys. The CampaignRun check uses
 // the REAL mongoose schema (not a stub) because the thing being verified is
@@ -44,7 +45,7 @@ function check(name, fn) {
 }
 
 // ── repo scan ────────────────────────────────────────────────────────────
-const SKIP_DIRS = new Set(['node_modules', '.git', 'frontend', 'coverage', 'dist', '.claude']);
+const SKIP_DIRS = new Set(['node_modules', '.git', 'frontend', 'coverage', 'dist', '.claude', 'adgen']); // adgen: own package + own suite
 function walk(dir, out = []) {
   for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
     if (entry.name.startsWith('.') && entry.name !== '.') continue;

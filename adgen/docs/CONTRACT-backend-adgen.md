@@ -1,0 +1,1282 @@
+# The backend ↔ adgen handoff contract
+
+**Contract version: 1.1.0** (`HANDOFF_CONTRACT_VERSION`, declared in
+`src/services/handoffContract.js`)
+
+Verified against **`liquidretail_backend` `origin/main` @ `6042073c`** and
+**`liquidretail_adgen` `origin/master` @ `c02c7ff`**, read on 2026-08-27.
+Protocol D (§4a, the manual-retitle deferral) added 2026-08-28 against
+branches `fix/retitle-adgen-handoff-be` / `fix/retitle-adgen-handoff-ag`,
+not yet merged to either trunk as of this version bump.
+
+> ⚠️ **Both trunks move fast — treat the SHAs above as this document's expiry
+> date, not decoration.** While it was being written, backend `origin/main`
+> advanced twice (`a1df77e9 → f8b3d6b1 → 6042073c`) and adgen `master` three
+> times, and **two of those commits closed defects this document had just
+> finished describing as live** (§4 and §5.1, both now marked CLOSED with the
+> fixing commit). That is a good outcome and it is also the standing hazard of a
+> document like this one: the failure mode is not being wrong on the day it is
+> written, it is being *right* then and unmaintained after.
+>
+> Before trusting a claim here, check whether its file has moved:
+> `git -C <repo> log --oneline <sha-above>..origin/main -- <path>`.
+> `scripts/verifyVendorDrift.js` answers that question mechanically for every
+> vendored file at once, which is a large part of why it exists.
+>
+> **A related trap, because this contract is spread across two repos and several
+> in-flight branches: a fix's completeness can be a property of its BASE rather
+> than of its diff.** Reviewing the diff alone will not show it, and a rebase
+> onto an older base silently reopens the defect with no conflict and no signal.
+> Verified live example at the time of writing: adgen #75 (`c02c7ff`) is an
+> ancestor of adgen #81's head (`b1a603d3`), and #81's own change does not
+> stand alone without it. When a claim here says a defect is CLOSED, it is
+> closed *on the trunk named above* — not necessarily on a branch that predates
+> the fixing commit.
+
+---
+
+## How to read this document
+
+Every factual claim below carries a `file:line` citation to code that was
+actually read while writing it. Citations are prefixed:
+
+- `backend/…` → `liquidretail_backend` (services/, models/, routes/ at repo root)
+- `adgen/…` → `liquidretail_adgen` (everything under `src/`, plus `config/` at root)
+
+**Anything this document could not establish from code is in
+[§9 Not verified](#9-not-verified), stated as unknown rather than guessed.**
+A contract document that describes what someone assumed becomes the reference
+future work trusts, so an admitted gap is strictly better than a confident
+guess. If you extend this document, keep that rule.
+
+> ### A trap this document was itself caught by
+> The shared `liquidretail_backend` checkout at
+> `/Volumes/Sayulita/Projects/RS/liquidretail_backend` is routinely parked
+> **behind** `origin/main` and carries other sessions' uncommitted edits. An
+> early pass of this analysis read that tree and concluded the three
+> `regenerate*` contract fields did not exist in backend at all. They do —
+> the checkout was at `f31b1caf`, before `a1df77e9` (PR #345) landed.
+>
+> **Verify cross-repo claims against `origin/main`, not against whatever the
+> sibling working tree happens to be sitting at.** Both
+> `scripts/lib/vendorDrift.js` and `scripts/verifySharedInvariants.js` read
+> backend through `git show origin/main:<path>` for exactly this reason.
+
+---
+
+## 1. The shape of the handoff
+
+There is **no synchronous call between the two services in either
+direction.** Confirmed by searching both trees: adgen's entire public HTTP
+surface is `GET /health` (`adgen/src/routes/api.js`), and no backend code
+constructs a URL for adgen.
+
+The handoff is a **Mongo document state**, and it works like a job queue with
+no queue:
+
+1. Backend mints an `Ad` and atomically moves it `queued → rendering`
+   (`backend/routes/ads.js:1423-1429`). It does **not** set
+   `claimedByWorker`, so the row lands in the claimable shape
+   `{status:'rendering', claimedByWorker:null}`.
+2. Backend's `runRenderLoop` checks the ownership flag and **returns**
+   (`backend/routes/ads.js:1861-1870`).
+3. An adgen renderer polls, wins the row with a single atomic
+   `findOneAndUpdate`, renders it, and writes the terminal state back
+   (`adgen/src/services/renderer.js:687-696`).
+
+This is genuinely good design for restart-resilience: there is no
+synchronous call to fail, no retry policy to get wrong, and a dead worker
+loses a lease rather than a request. The cost is that the interface is an
+**implicit document shape that neither service declares** — which is what
+`src/services/handoffContract.js` now fixes, and what this document
+describes.
+
+### The claim is the mutual-exclusion primitive
+
+`claimedByWorker` carries more meaning than "which worker owns this":
+
+| `claimedByWorker` | Meaning |
+|---|---|
+| `null` + `status:'rendering'` | Claimable by adgen **or** being rendered in-process by backend. **These two states are indistinguishable in the document.** See §6.1 — this is the sharpest edge in the contract. |
+| set | An adgen worker owns it. Backend's reaper explicitly skips these rows (`backend/worker.js:399-405`). |
+
+---
+
+## 2. The ownership flag: `ADGEN_RENDERER_ENABLED`
+
+### The predicate
+
+Byte-identical in both repos:
+
+```js
+String(process.env.ADGEN_RENDERER_ENABLED || '').toLowerCase() === 'true'
+```
+
+- `backend/services/adgenBridge.js:13-15`
+- `adgen/src/config.js:64-65`
+- `adgen/src/services/adgenBridge.js:13-14` — **a third, dead copy.** Nothing
+  in adgen requires it; the vendor manifest records it as `unused` ("backend→adgen
+  handshake copy; adgen is the callee, not the caller"). Flagged because a
+  future edit to one of the two live copies will not reach it.
+
+Properties, asserted by **execution** over a fixture table in
+`scripts/verifyHandoffContract.js` rather than by reading the source. (Those
+fixtures cover `isOwnershipFlagOn` in the shared contract module — they do
+**not** pin the three production readers above, which each re-implement the
+same expression. A loosened reader would not fail that check.)
+
+- Case-insensitive: `'TRUE'`, `'True'` → on.
+- **Only** the exact string `true`. `'yes'`, `'1'`, `'on'`, `''`, unset,
+  malformed → **off**.
+- **Read at call time, never cached at boot**, at every site — the code
+  genuinely re-reads `process.env` on every call, and that much is verified.
+  Whether a Render dashboard edit mutates a *running* process's environment is
+  **not** verified here (§9.2). Several code comments assert it takes effect
+  "without a redeploy"; this document does not confirm that half.
+
+### Fail-safe direction
+
+Off is the safe default, and the reasoning is asymmetric — it is worth
+understanding rather than memorising. Backend renders **unconditionally**
+whenever the flag is not `'true'`. So:
+
+- adgen misreading the flag as **off** → it stands down, and backend already
+  handles the work. Harmless.
+- adgen misreading it as **on** → it races backend for the same rows.
+  Billable.
+
+`adgen/src/services/renderer.js:660-668` states this explicitly, and
+`adgen/src/services/renderer.js:669` returns `null` from `claimOne()` on the
+off branch as defence in depth, even though `poll()` already checked
+(`adgen/src/services/renderer.js:1872`).
+
+### Where it is configured
+
+| Source | Value |
+|---|---|
+| `backend/config/defaults.env` | `ADGEN_RENDERER_ENABLED=true` |
+| `adgen/config/defaults.env` | `ADGEN_RENDERER_ENABLED=true` |
+| `backend/render.yaml` | **file does not exist** |
+| `adgen/render.yaml` | flag **not declared** |
+| SystemConfig (either repo) | **no override path exists** — checked `models/SystemConfig.js` and `services/systemConfigService.js` in both trees. Unlike the vision-QC flags, this one is env-only. |
+
+**So `config/defaults.env` ships `true` in both repos, matching production.**
+The `false` branch is backend's in-process renderer, which is still present
+and still works as the fallback when the flag is not the string `'true'`.
+Dashboard copies of this key are now redundant duplicates of the committed
+file.
+
+`dotenv` is called **without** `override: true` (`adgen/src/config.js:12-13`),
+so a dashboard/process env value always wins over `defaults.env`. The
+committed `false` is a floor, not the effective value.
+
+> The production value being `true` is **asserted by `backend/README.md`, not
+> by anything in either repo's committed config.** This document did not read
+> the Render dashboard. See §9.
+
+### What each read site switches
+
+**Backend** — two production readers. ⚠️ **A third row used to sit here for
+`backend/services/titlingResumeService.js:141` — that file was deleted
+2026-08-28 in backend `abf7e0c2` (#360, "remove(titling): delete backend's
+in-process titling function (MONEY)"), along with its wiring in
+`backend/index.js`. Backend no longer titles video in-process at all, flag on
+or off — it only ever ships an untitled master and adgen's own
+`adgen/src/services/titlingResumeService.js` is the sole resume path.
+Corrected 2026-09-03; do not re-add this row.**
+
+| Site | Flag on | Flag off |
+|---|---|---|
+| `backend/routes/ads.js:1861-1870` (`runRenderLoop`) | Flip `CampaignRun` `preparing→running`, log, **return**. Adgen claims. | Render in-process. `claimedByWorker` stays `null` throughout. |
+| `backend/services/adRegenerateService.js:625` (`regenerateAd`, via `shouldDeferToAdgen()` at `:476`) | Win the `regenerating` lock, stamp `regenerationRequest`, **return**. | Win the same lock, **null** the three regenerate fields, execute locally. |
+
+**Adgen** — every production read site, all call-time. (Deliberately not
+prefaced with a count: this repo's own `runVerifySuite.js` header documents
+three separate stale hardcoded counts that a later PR made false. Get the
+current list with
+`grep -rn 'isAdgenRendererEnabled' src/`.)
+
+- `renderer.js:669` (`claimOne` — the gate that matters), `:1872` (`poll`),
+  `:1977` (boot-recovery tick), `:2022` (titling-resume tick),
+  `:2051`/`:2082` (log lines only)
+- `titler.js:146` (`claimOne`), `:733` (reclaim sweep)
+- `regenerateConsumer.js:101` (`claimOne`), `:143` (`tick`), `:249` (`start`)
+
+Two deliberate non-readers, both correct:
+`releaseClaim` and `shutdown` do **not** consult the flag — an in-flight
+claim is drained and released regardless of a mid-run flip (pinned by
+`adgen/scripts/verifyAdgenClaimRespectsRendererFlag.js`). `processAd` does
+not re-read it either: once a row is claimed, the work finishes.
+
+---
+
+## 3. Protocol A — the mint-time render claim
+
+### Fields
+
+| Field | Type / default | Writer | Notes |
+|---|---|---|---|
+| `status` | enum, `'queued'` | **both** | `['queued','rendering','draft','live','archived','failed']` (`adgen/src/models/Ad.js:178`) |
+| `renderRoute` | `'html_gen'`\|`'veo'`\|`null` | backend | Set at mint (`adgen/src/models/Ad.js:168-173`) |
+| `claimedByWorker` | `String`, `null`, indexed | **adgen only** | `adgen/src/models/Ad.js:52`, `backend/models/Ad.js:52` |
+| `claimedAt` | `Date`, `null`, indexed | **adgen only** | `adgen/src/models/Ad.js:53` |
+| `updatedAt` | `Date` | **both** | `timestamps:false` in both schemas (`adgen/src/models/Ad.js:738`, `backend/models/Ad.js:739`) — **maintained by hand** |
+
+### The claim query (the atomicity guarantee)
+
+Verbatim from `adgen/src/services/renderer.js:687-696`:
+
+```js
+return Ad.findOneAndUpdate(
+  {
+    status:          'rendering',
+    claimedByWorker: null,
+    renderRoute:     { $in: ['html_gen', 'veo'] },
+    ...(isTitlerEnabled() ? { titlingNeeded: { $ne: true } } : {}),
+  },
+  { $set: { claimedByWorker: WORKER_ID, claimedAt: new Date() } },
+  { new: true, sort: { createdAt: 1 } }
+);
+```
+
+`claimedByWorker: null` is the whole lock — one `findOneAndUpdate`, so
+exactly one worker's `$set` lands. FIFO by `createdAt`.
+
+Two details that are load-bearing and easy to get wrong:
+
+- `renderRoute: {$in:[…]}` means a row with `renderRoute: null` is **never
+  claimable**. Backend must set it at mint or the ad sits forever.
+- `titlingNeeded: {$ne: true}` — not `: false` — so rows predating the field
+  stay claimable. Without this term the renderer re-claims rows it just
+  handed to the titler, which is a livelock
+  (`adgen/src/services/renderer.js:681-686`).
+
+### Write ownership, checked rather than assumed
+
+**`claimedByWorker` and `claimedAt` are written by adgen and never by
+backend.** Verified by grepping every occurrence in
+`backend/services/`, `backend/routes/`, `backend/worker.js`,
+`backend/index.js`: the only non-comment hit is a **filter**,
+`claimedByWorker: null`, at `backend/worker.js:403`.
+
+This is the field the whole partition rests on, so it is the one worth
+re-checking after any backend change to the render or reaper paths.
+
+### Transitions
+
+| From → To | Service | Site | Meaning |
+|---|---|---|---|
+| *(insert)* → `queued` | backend | `campaignAdsGenerationService` mint | Ad exists, not yet in a run. |
+| `queued` → `rendering` | backend | `routes/ads.js:1423-1429` | A run owns it. `claimedByWorker` still `null`. **This is the handoff.** |
+| `rendering`, `claimedByWorker:null` → claimed | adgen | `renderer.js:687-696` | Worker lease taken. |
+| `rendering` → `draft` | adgen (flag on) / backend (flag off) | renderer success stamp | Success. Claim cleared in the **same** `$set`. |
+| `rendering` → `failed` | adgen / backend | `renderer.js` `processAd` catch | Terminal failure. Claim cleared. |
+| `rendering` → `rendering`, claim released | adgen | timeout / derive-requeue | Left claimable so resume-from-receipt can re-enter. **No status change.** |
+| `rendering` → `queued` | backend reaper | `worker.js:399` | Receipt-free, **unclaimed**, `updatedAt` stale > `REAP_STALE_MIN` (default **15**, `backend/services/staleness.js:66`). |
+| `rendering` + receipt + stale → `draft`/`failed` | **both** boot recoveries | `bootRecoveryService.js` | Free GET of an already-paid prediction. `RESUME_STALE_MIN` default **5** (`backend/services/bootRecoveryService.js:65`). |
+| `rendering` → `queued` | backend SIGTERM | `processAlerts.js:124-130` | Receipt-free rows of in-flight runs. **No `claimedByWorker` term** — see §6.3. |
+| `rendering` → `queued` | backend crash/CAS paths | `routes/ads.js:1333`, `:1359`, `:1674`, `:1699` | Same shape, same missing term. |
+| `queued` → `archived` | backend sweeper | `worker.js:287` (`queuedArchiveSweeper`) | Stale mint leftovers, **live today**. |
+| `rendering` → `archived` | backend Stop | `routes/ads.js` (undispatched tail) | Operator Stop, pre-dispatch rows only. |
+| `archived` → `draft`/`live` | backend restore | `PATCH`, `ad.restore` | Un-archive. |
+| `draft`/`live`/`archived` | backend HTTP only | `PATCH /api/ads/:id` | Operator lifecycle. Adgen exposes no such route. |
+
+**Adgen's *renderer* writes only `draft`, `failed`, and `rendering`** —
+pinned by `adgen/scripts/verifyRendererAdStatusEnum.js`, whose scope is
+`renderer.js` specifically, not the whole repo. Two precise caveats, because
+the broader claim "adgen never writes `archived`" would be wrong:
+
+- `adgen/src/services/queuedArchiveSweeper.js` is **vendored and would write
+  `status:'archived'`**, but nothing in `src/` requires it and no adgen role
+  starts it. The vendor manifest records it `unused` ("backend archive
+  sweeper; not wired into adgen entrypoint"), and
+  `verifyVendorDrift.js`'s dead-module check is what keeps that true. If it
+  is ever wired, this table needs a new row.
+- `status: 'live'` appears many times in `adgen/src/services/platformFormats.js`
+  — that is a **different field** (a platform-surface status), not `Ad.status`.
+  Do not grep for `status: 'live'` and conclude adgen publishes ads.
+
+`live` is an operator action, reachable only through backend's
+`PATCH /api/ads/:id` (which accepts only `draft|live|archived`).
+
+**`archived` is NOT operator-only.** Backend's `queuedArchiveSweeper` is started
+from `backend/worker.js:287` and auto-archives stale `queued` leftovers; every
+archive write funnels through `backend/services/adArchiveDigest.js:503`. Restore
+then moves `archived → draft|live`. Full set of `archived` writers: operator
+PATCH, that live backend sweeper, and Stop.
+
+### Why `updatedAt` is a contract field
+
+`timestamps: false` in both schemas, so Mongoose never touches `updatedAt` —
+**every writer sets it by hand.** Both the backend reaper and both boot
+recoveries use it as their staleness signal. Without a heartbeat it only
+moves when an ad settles, so a long video-titling gap is indistinguishable
+from a dead worker. That is why adgen heartbeats it while holding a claim.
+
+---
+
+## 4. Protocol B — the regenerate deferral
+
+Landed as backend PR #345 (`a1df77e9`) and adgen PR #72. Backend's
+`POST /api/ads/:id/regenerate` and both agent capabilities funnel into
+`adRegenerateService.regenerateAd()`.
+
+### Fields
+
+| Field | Type / default | Writer | Notes |
+|---|---|---|---|
+| `regenerating` | `Boolean`, `false`, indexed | **both** | `adgen/src/models/Ad.js:210`, `backend/models/Ad.js:210`. Shared by both paths — **not** the deferral bit. |
+| `regenerationRequest` | `Mixed`, `null` | **backend only** | `adgen/src/models/Ad.js:252`, `backend/models/Ad.js:265`. **This** is the deferral bit. |
+| `regenerateClaimedByWorker` | `String`, `null`, indexed | adgen | `adgen/src/models/Ad.js:261`, `backend/models/Ad.js:273` |
+| `regenerateClaimedAt` | `Date`, `null` | adgen | `adgen/src/models/Ad.js:262`, `backend/models/Ad.js:274` |
+
+### Backend's lock write
+
+The flag is read **once, synchronously, before any `await`**
+(`backend/services/adRegenerateService.js:625`, calling `shouldDeferToAdgen()`
+at `:476`). The decision is therefore **frozen for that request** — a later
+env flip cannot change who owns it.
+
+One atomic lock, filter `{_id: adId, regenerating: {$ne: true}}`
+(`backend/services/adRegenerateService.js:662-663`), with two different
+`$set` payloads:
+
+**Deferred** (`:634-643`):
+```js
+{ regenerating: true, regenerationStage: 'pending', updatedAt: <Date>,
+  regenerationRequest: buildRegenerationRequest({ … }) }
+```
+then **return** — no local execution.
+
+**Local** (`:634-637` + `:658-660`) — taken only when `ADGEN_RENDERER_ENABLED`
+is not `'true'`; in production today, where the flag is `true`, every
+regenerate takes the Deferred path above instead, and this branch is
+backend's dormant fallback:
+```js
+{ regenerating: true, regenerationStage: 'pending', updatedAt: <Date>,
+  regenerationRequest: null,
+  regenerateClaimedByWorker: null,
+  regenerateClaimedAt: null }
+```
+then execute in-process.
+
+`buildRegenerationRequest` (`:484-498`) has exactly nine keys: `kind`,
+`prompt`, `mode`, `requestedBy`, `videoModel`, `promptOverride`,
+`videoPromptRaw`, `videoPromptGuidance`, `imagePromptRaw`.
+
+**Why the local path nulls the fields rather than leaving them alone**
+(`:645-657`): a stale `regenerationRequest` object left over from a crashed
+deferred attempt, sitting next to `regenerateClaimedByWorker: null`, is
+*claimable*. Without this null-out, a new local regenerate winning the lock
+would leave adgen free to claim the stale payload in the same instant —
+a double submit with different arguments.
+
+### Adgen's claim query, and the `$ne` / `$type` distinction
+
+Verbatim from `adgen/src/services/regenerateConsumer.js:100-110`:
+
+```js
+return Ad.findOneAndUpdate(
+  {
+    regenerating:              true,
+    regenerationRequest:       { $type: 'object' },
+    regenerateClaimedByWorker: null
+  },
+  { $set: { regenerateClaimedByWorker: WORKER_ID, regenerateClaimedAt: new Date() } },
+  { new: true, sort: { updatedAt: 1 } }
+);
+```
+
+**`$type: 'object'`, deliberately not `$ne: null`.** MongoDB's `$ne` is
+documented to match documents that **do not contain the field at all** —
+which is the shape of every pre-migration ad and every locally-executed
+regenerate. An earlier version using `{$ne: null}` therefore collapsed to
+matching *any* `regenerating: true` row, including ones backend was
+executing in-process. That was a real double-submit bug; the regression is
+pinned by `adgen/scripts/verifyRegenerateConsumerClaim.js` (cases A3/B7).
+
+### ⚠️ The three claims are NOT mutually exclusive
+
+An earlier draft of this document said this claim is "on a filter **disjoint**
+from the mint-time claim and from the titler's, so the three can never contend
+for one document." **That was wrong, and correcting it is the most important
+change in this document.**
+
+The three claims use **different lease fields**, so they do not serialize
+against each other at all:
+
+| Claim | Lease field | Filter |
+|---|---|---|
+| Renderer | `claimedByWorker` | `{status:'rendering', claimedByWorker:null, renderRoute:{$in:[…]}}` |
+| Titler | `claimedByWorker` | `{status:{$in:['rendering','draft']}, veoVideoUrl:{$ne:null}, titlingNeeded:true, claimedByWorker:null}` |
+| Regenerate | `regenerateClaimedByWorker` | `{regenerating:true, regenerationRequest:{$type:'object'}, regenerateClaimedByWorker:null}` |
+
+Renderer and titler *are* mutually exclusive — they share `claimedByWorker`,
+and the `titlingNeeded` term partitions them. **Regenerate is exclusive with
+neither**, because it holds a different field. As of backend `a1df77e9`,
+regenerate preflight refused only four things — derive-only (`:536`),
+meta-synced (`:540`), already-regenerating (`:544`) and the daily cap (`:552`) —
+and refused **neither** `status:'rendering'` **nor** `titlingNeeded`.
+
+> #### ✅ CLOSED by backend #349 (`6042073c`), 2026-08-26 — but read why
+>
+> This was a live money defect when first written up here, and #349
+> independently reached the same conclusion in its own words: *"the two filters
+> are disjoint and both match the same document — a Regenerate pressed during a
+> first render submits a second real generation for one ad."*
+>
+> **The lease fields are still different** — that part of the analysis above
+> stands and always will. What changed is that contention is now *refused*
+> rather than merely unlikely, in **both** places, which is the part worth
+> copying if you ever add a fourth claimant:
+> - `inFlightRefusal(ad)` (`backend/services/adRegenerateService.js:550`) — the
+>   read-side predicate preflight turns into a 409 (`:635`);
+> - `notInFlight(filter)` (`:583`) — the write-side Mongo filter ANDed into the
+>   atomic lock: `notInFlight({_id: adId, regenerating: {$ne: true}})` (`:758`).
+>
+> Both were needed. Preflight is a `.lean()` read, and every caller answers 202
+> then runs `regenerateAd` from `setImmediate`, so the row can change in
+> between — `titlingResumeService` can claim a draft master inside that window.
+>
+> Three arms are refused: `rendering`, `queued`, and *titling*. The titling arm
+> is the subtle one and matches §6.4 — a paid video master still owed titling
+> already has `status:'draft'`, so a status-only guard would miss it.
+>
+> **Do not read this as "the claims are disjoint after all."** They are not. A
+> future change to regenerate preflight or to that lock filter can reopen this,
+> and nothing about the lease fields will warn you.
+
+#### ⚠️ …and it is closed on ONE side only — the two halves now disagree
+
+`#349` landed in **backend**. Adgen's vendored copy of the same service **did
+not get it**, and the difference is verified, not inferred:
+
+| | `inFlightRefusal` | `notInFlight` | Preflight refuses an in-flight render? |
+|---|---|---|---|
+| `backend/services/adRegenerateService.js` @ `origin/main` | 5 occurrences | 4 | **yes** |
+| `adgen/src/services/adRegenerateService.js` @ `origin/master` | **0** | **0** | **no** — still only the original four (derive-only, meta-synced, already-regenerating, daily cap) |
+
+Adgen's copy says so **in its own source**, verbatim, at
+`adgen/src/services/adRegenerateService.js:979-980`:
+
+> *"…it must never resume the ad's existing `imageGeneration.predictionId`,
+> which may still belong to a DIFFERENT, currently in-flight mint-time render of
+> the same Ad (`preflight()` does not gate on `ad.status`)."*
+
+**Adgen's protection is therefore not a gate at all — it is an obligation on the
+caller.** The defence lives at the call site (`:986-987`), which forces
+`existingPredictionId: null` and `allowResume: false` on the image path,
+mirroring what `runVideoFull` already did for video.
+
+This is the framing that matters, and getting it wrong is expensive in both
+directions:
+
+- A future reader of adgen's ungated `preflight()` concludes the path is
+  **unprotected**. Wrong — it is protected, just not there.
+- A future *caller* omits `existingPredictionId: null` and silently breaks the
+  protection. Worse — nothing fails, and a regenerate can resume a prediction
+  belonging to a concurrent mint-time render of the same Ad.
+
+**A documented gap plus a call-site defence is not a fixed gap.** It holds only
+while every caller cooperates, and it cannot be verified by reading the
+preflight. Which path is live matters here: backend's preflight runs
+synchronously before the 202 on the HTTP route and adgen's consumer deliberately
+does not re-run it, so the HTTP path *is* covered by `#349`. Adgen's ungated
+copy governs anything that reaches `regenerateAd` inside adgen — and the
+call-site invariant is the only thing holding it.
+
+`scripts/vendor-manifest.json` records this path as owing ports in **both**
+directions; see the note there on why a single `portTo` cannot express that.
+
+#### What a COMPLETE port looks like in each direction
+
+Recorded here because both directions have been **attempted and abandoned
+half-finished**, and in both cases the partial state is more dangerous than the
+untouched state. Anyone picking either up should treat "the hard part is already
+done" as false until they have checked the specific items below.
+
+**(a) backend owes adgen — the #74 static resume.** Threading `allowResume` down
+through `atlasImageService` / `directImageRenderService` is the *easy* two-thirds.
+A complete port also needs, and an attempt that stopped after the threading did
+not have:
+
+1. **The mint-path opt-in.** `renderService.renderCreative` must actually pass
+   `existingPredictionId: ad.imageGeneration?.predictionId || null` and
+   `allowResume: true` into `renderDirectImage` (adgen does this in
+   `renderStatic`). Selecting `imageGeneration` in the `Ad.findById(...).select(...)`
+   without reading it leaves `allowResume` at its default `false`, so
+   `shouldResumeImageAttempt` is *always* false and the whole resume path is dead
+   code that still bills a fresh prediction on every re-entry.
+2. **A consumer for `err.unsettledAtResume`** — and this is the part that makes a
+   partial port worse than none. adgen releases the claim and leaves the ad
+   `status:'rendering'` (its `processAd` catch). Backend's static failure path
+   writes `status:'failed'`. If the opt-in above is added *without* this, an
+   ambiguous resumed poll terminal-fails an ad **whose prediction has already been
+   paid for**, and `bootRecoveryService` — which keys on `status:'rendering'` plus
+   a receipt — can no longer recover it for free. The money loss is larger after
+   the "fix" than before it.
+3. **Flag propagation through the wrap.** Backend's static error wrap copies
+   `predictionId` / `charged` / `atlasCode` / `alertLevel` / `code` / `retryable`
+   onto a new `Error`, and `failed()` builds the result object the route sees.
+   Neither carries `unsettledAtResume` today, so a consumer added only at the
+   route cannot see a flag the wrap discarded. Thread it, or handle it before the
+   wrap.
+4. **The explicit pin on the regenerate call site** (`buildDirectImageArgsFromAd`:
+   `existingPredictionId: null, allowResume: false`). Backend's defaults already
+   refuse resume, so this is not a live hole — but it is the grep-able invariant
+   adgen's harness exists to protect, and it is the same function in both repos.
+
+**(b) adgen owes backend — the #349 in-flight gate.** The read half
+(`inFlightRefusal`, called from `preflight`) is the visible half and is *not*
+sufficient. A complete port also needs:
+
+1. **The write half.** Backend ANDs `notInFlight()` into `regenerateAd`'s atomic
+   `Ad.updateOne` lock. `preflight` is a `.lean()` read, and callers 202 then
+   `setImmediate(regenerateAd)`, so the row can enter an in-flight state inside
+   that window. Without the write half, a regenerate and a first-time render hold
+   **disjoint** locks (`regenerating` vs `status`), both filters match the same
+   document, and both bill. Note the correct lock is `regenerateAd`'s `updateOne`
+   — *not* the consumer's `claimOne`, which is a different write with a different
+   filter.
+2. **A harness that drives the real `regenerateAd`.** Backend's own harness header
+   records that an earlier revision of it asserted only the exported helper, and
+   that a mutation removing `notInFlight()` from the lock entirely **left it fully
+   green**. Helper-level checks cannot see a missing call site. Any adgen harness
+   for this must include the equivalent of backend's group **D** (drive
+   `regenerateAd`, inspect the filter it genuinely hands to `Ad.updateOne`), or it
+   will pass while the money guard is absent.
+3. **A decision on non-`draft` titling states.** Backend's read half tests
+   `titlingResumeState` in `('pending','claimed')` *without* requiring
+   `status:'draft'`. A port that only consults titling state on `draft` rows
+   classifies `failed`/`live`/`archived` + `titlingResumeState:'claimed'`
+   differently from backend. No writer stamping that combination has been
+   identified, so this is a classification divergence rather than a proven live
+   hole — but the two copies should agree deliberately, not by accident.
+4. **Keeping the call-site obligation.** `existingPredictionId: null,
+   allowResume: false` guards a *different* thing (resume-from-receipt on an
+   allowed regenerate) than the gate does (status/titling). The gate does not
+   subsume it. Removing the flags while adding the gate trades one money bug for
+   another.
+
+Both exclusion/inclusion lists are **fail-open on an unknown status value** in
+both repos: a new `Ad.status` is simply absent from `$nin` (backend) and matches
+no `===` arm (adgen), so it is permitted by default. Backend's harness now pins
+its own enum against an explicit classification for exactly this reason; adgen's
+should too when (b) lands.
+
+> #### ⚠️ A documentation divergence on this exact operator — fixed by this change set
+>
+> **This is the one thing that required editing the backend repo**, so it is
+> worth stating precisely, including the fact that the citations below are
+> *historical*.
+>
+> On `backend/origin/main` @ `a1df77e9` — i.e. **before** this change set —
+> `models/Ad.js` documented the adgen claim filter with the **old, buggy**
+> operator in two places:
+> - `git show a1df77e9:models/Ad.js`, line **244** — "a poller keying its claim query on `regenerationRequest: {$ne: null}`"
+> - line **253** — `findOneAndUpdate({regenerating:true, regenerationRequest:{$ne:null}, …})`
+>
+> Meanwhile `adgen/src/models/Ad.js:245-257` documented `$type:'object'`,
+> matching the live consumer. The two halves of one contract disagreed, on the
+> operator whose misuse had already caused a double-claim.
+>
+> **Nothing was broken at runtime.** Backend's executable code never *queries*
+> this field — all three non-comment occurrences are writes
+> (`adRegenerateService.js:640` object, `:658` null, `:1163` null), verified by
+> exhaustive grep. The divergence was documentation-only.
+>
+> It still mattered, because backend's schema comment is exactly where the next
+> person implementing or reviewing a poller against this field would look, and
+> it taught them the operator that caused the bug. **The backend PR in this
+> change set rewrites both comments** to `$type:'object'` with the money
+> reasoning inline.
+>
+> Because that edit inserts lines, the field declarations below it moved:
+> `regenerationRequest` `:249 → :265`, `regenerateClaimedByWorker` `:256 → :273`,
+> `regenerateClaimedAt` `:257 → :274`, `timestamps:false` `:722 → :739`. The
+> tables in this document cite the **post-change** line numbers, so they are
+> correct once both PRs land.
+
+### Lease release, and what a crash leaves behind
+
+**There is deliberately no retry or release sweep for a regenerate claim.**
+`regenerateClaimedByWorker` stays set until an operator clears it by hand
+(`adgen/src/services/regenerateConsumer.js:41-54`).
+
+This is intentional, and the reasoning is a money argument worth preserving:
+**adgen's** `adRegenerateService.runVideoFull` passes `allowResume: false`
+explicitly (`adgen/src/services/adRegenerateService.js:879`) — an operator
+regenerate always wants a *fresh* video, never a resumed one — so a naive
+retry would be a **second billable Omni submit**.
+
+> #### ✅ CORRECTION (supersedes the paragraph this replaces)
+>
+> **An earlier version of this section claimed backend's `generateForAd`
+> "defaults `allowResume` to `true`", so that a flag-off backend regenerate
+> would RESUME a paid prediction where adgen submits fresh. That is FALSE, and
+> it was wrong when it landed.** It is corrected here rather than deleted,
+> because it was a money claim and anyone who read it should see it withdrawn.
+>
+> Measured on `liquidretail_backend` `origin/main` (`services/atlasVideoService.js`,
+> 244,367 bytes): **`allowResume` occurs ZERO times in the entire file**, as do
+> `shouldResumeAttempt`, `existingPredictionId` and `resumeFrom`.
+> `generateForAd` destructures exactly
+> `{ ad, operatorPrompt, storyboard, modelOverride, campaignRunId }` — there is
+> no such parameter, so there is no default to inherit.
+>
+> **The two repos behave the SAME on this path: both submit fresh.** Backend's
+> regenerate omitting `allowResume` is not a latent resume; it is a call to a
+> function that has no resume behaviour at all.
+>
+> What actually differs is **structural, not behavioural**, and it is worth
+> knowing for the opposite reason to the one originally given:
+>
+> | | how resume is reached | what omitting the flag does |
+> |---|---|---|
+> | **backend** | a separate `resumeForAd({ ad })`, whose header states it **MUST NEVER SUBMIT** | nothing — `generateForAd` cannot resume |
+> | **adgen** | folded into `generateForAd` behind `allowResume`, which **defaults `true`** | **resumes** |
+>
+> So the risk sits on **adgen's** side, not backend's: adgen's shape means a
+> caller who forgets the flag resumes a paid prediction, which is precisely why
+> `runVideoFull`'s explicit `allowResume: false` (above) must never be dropped.
+> Backend is safe here by construction rather than by convention.
+>
+> Cite these by **symbol** (`generateForAd`, `resumeForAd`, `allowResume`), not
+> by line: the superseded paragraph pointed at
+> `backend/services/adRegenerateService.js:867-872` for a call that is actually
+> at **`:988`** — roughly 120 lines stale, and that staleness is part of why the
+> claim went unchecked.
+
+The retry/release reasoning below still stands unchanged. It also matches the
+pre-existing backend-only behaviour exactly: a backend crash mid-`regenerateAd`
+today also leaves `regenerating: true` forever with no retry. Adding a retry
+here would be a regression unless the retry is itself resume-aware.
+
+On shutdown, adgen waits up to the same drain budget as mint-time work and
+then fires a **loud alert naming the ad** rather than releasing the claim
+(`adgen/src/services/regenerateConsumer.js:169-183`).
+
+`markComplete` clears `regenerating` and all three regenerate fields, on
+whichever side executed (`backend/services/adRegenerateService.js:1163`;
+adgen's vendored copy does the same).
+
+---
+
+## 4a. Protocol D — the manual retitle deferral
+
+Landed 2026-08-28, backend `services/handoffContract.js` v1.1.0. Backend's
+`POST /:id/retitle-videos` (`routes/brand.js`) funnels into
+`runRetitleJobViaAdgen()`; adgen's `src/services/retitleConsumer.js` is the
+other half.
+
+**Origin.** An owner ask to confirm whether backend's manual retitle route
+— which, absent this protocol (i.e. when `ADGEN_RENDERER_ENABLED` is off),
+runs Remotion in-process on the web server, the exact CPU-isolation
+problem adgen's titler role exists to solve for the automatic
+post-generation path — would genuinely become more scalable by routing
+through adgen. Investigation found the claim held for `retitle-videos`,
+which in production today defers to adgen per this protocol, but NOT for
+the OTHER two manual-titling routes: `title-still` is a synchronous
+~1-3s interactive preview loop ("Powers /title-playground") that an async
+claim-based worker would make unpredictably slower, and `title-spec/modify`
+is an LLM spec-editing call with no Remotion render in it at all. Neither is
+part of this protocol; both stay local-only, unconditionally, regardless of
+the flag.
+
+### Why this is a FOURTH claim namespace, not a reuse of the titler's
+
+adgen's existing titler claim (`titlingNeeded` / `claimedByWorker`, Protocol
+A) exists exclusively for "a master just landed and has never been titled"
+— its filter requires `status:{$in:['rendering','draft']}`. A manual
+retitle's real-world target is commonly `status:'live'`, delivered days or
+weeks earlier, which that claim can never match. Reusing `titlingNeeded`
+would also risk colliding with `titlingResumeService`'s automatic sweep and
+with `adRegenerateService`'s `matchesTitlingResumeArm` in-flight guard
+(Protocol B), both of which read that field for unrelated purposes.
+
+### Fields
+
+| Field | Type / default | Writer | Notes |
+|---|---|---|---|
+| `retitleRequest` | `Mixed`, `null` | backend only | THE deferral bit. `backend/models/Ad.js:321`, `adgen/src/models/Ad.js:279`. |
+| `retitleClaimedByWorker` | `String`, `null`, indexed | adgen | `adgen/src/models/Ad.js:~283` |
+| `retitleClaimedAt` | `Date`, `null` | adgen | Companion timestamp. |
+| `retitleResult` | `Mixed`, `null` | both | Result readout — see "why renderUrl cannot signal success" below. |
+
+### Backend's stamp write (`routes/brand.js:677` `runRetitleJobViaAdgen`)
+
+One `Ad.updateOne` per ad, filter:
+
+```js
+{
+  _id: adDoc._id,
+  titlingNeeded: { $ne: true },
+  regenerating:  { $ne: true },
+  retitleRequest: null,
+}
+```
+
+`titlingNeeded:{$ne:true}` is the safety boundary that makes the fourth
+claim namespace safe WITHOUT adgen's claim query itself needing to exclude
+it — a row mid-first-titling can never be stamped, full stop.
+`regenerating:{$ne:true}` was **added after adversarial review** (two
+independent Grok xhigh passes, one per repo, both found the same gap): a
+retitle stamped on an ad a regenerate is currently rewriting wastes a
+Remotion slot, a Cloudinary upload, and a real vision-QC/face-detection
+Atlas LLM call on a result the regenerate is about to supersede — and
+risks a last-writer-wins clobber. `retitleRequest:null` stops a stray
+double-POST from overwriting a payload a live consumer is currently
+reading. On a refusal (`stamp.modifiedCount===0`) the ad is reported
+per-ad in the job's `errors`/`results`, never silently dropped from the
+batch.
+
+⚠️ **This is directional, not mutual.** `regenerating:{$ne:true}` stops a
+retitle from being stamped while a regenerate is in flight. It does
+**not** stop the reverse: `adRegenerateService`'s existing in-flight lock
+does not check `retitleRequest`/`retitleClaimedByWorker`, so a regenerate
+CAN start while a retitle is already claimed and rendering. See the known
+residual near the end of this section.
+
+**Backend's local (non-deferred) runner also defends against this SAME
+class of collision, one level down** — `runRetitleJob`'s worker loop now
+opens with an atomic `Ad.updateOne({_id, retitleClaimedByWorker: null},
+{$set: {retitleRequest: null, retitleClaimedByWorker: null,
+retitleClaimedAt: null, retitleResult: null}})` before every local render.
+A `modifiedCount:0` means adgen currently holds an ACTIVE claim on this
+ad, and the local path refuses to also render it rather than risking a
+concurrent dual-render (found by adversarial review — the first draft of
+this handoff cleared no stale state on the local path at all, so a
+flag-off flip mid-flight could let the in-process path race a still-
+rendering deferred claim). A `modifiedCount:1` clears any merely STALE,
+unclaimed leftover so a later deferred attempt on this ad can't collide
+with the local render about to run.
+
+### Adgen's claim query (`src/services/retitleConsumer.js:94` `claimOne`)
+
+```js
+Ad.findOneAndUpdate(
+  { retitleRequest: { $type: 'object' }, retitleClaimedByWorker: null },
+  { $set: { retitleClaimedByWorker: WORKER_ID, retitleClaimedAt: new Date() } },
+  { new: true, sort: { updatedAt: 1 } }
+);
+```
+
+Same `$type:'object'`, not `$ne:null`, discipline as Protocol B, same
+reason. Gated on `isAdgenRendererEnabled()`, read at call time.
+
+### ⚠️ retitleMode:true is not optional — the severest defect found in this whole investigation
+
+`brandScriptExecutor.uploadRenderAndStamp` forces `status:'draft'` on
+**every** call by default — correct for the first titling pass right after
+generation, and a **live production bug, independent of this protocol or
+of `ADGEN_RENDERER_ENABLED`**, for a manual retitle of an already-delivered
+ad: it would silently un-publish a `status:'live'` ad on every single
+retitle, success or a QC fail, because the function was written for a
+lifecycle a manual retitle is not in. Found while building this protocol,
+fixed in **both** repos' `brandScriptExecutor.js` (same bug, same fix,
+independently applied to each vendored copy — `services/handoffContract.js`
+is not the only place these two files must agree):
+
+- `uploadRenderAndStamp({..., preserveAdStatus = false})` — skips forcing
+  `status:'draft'`, and skips the QC-failure `status:'failed'` override,
+  when `true`.
+- `renderWithRemotionAndSave({..., retitleMode = false})` threads
+  `preserveAdStatus: retitleMode` into that call, AND routes a Remotion
+  child failure to a plain `throw` instead of
+  `stampTitlingFailureAndThrow` at all three of its call sites — that
+  function's whole job (bound FIRST-titling retries via the shared
+  `Ad.titlingAttempts` cap, hand an unfinished master to
+  `titlingResumeState:'pending'`) describes a lifecycle a retitle of an
+  already-titled ad is not in. Reusing it would burn the automatic path's
+  retry budget for an unrelated reason and could still force
+  `status:'draft'`/`'failed'` on a `'live'` ad on a capExceeded write.
+- `renderBrandScriptAndSave({..., retitleMode = false})` threads it through.
+- `retitleConsumer.processClaimed()` is the only caller that ever passes
+  `retitleMode:true`. Every existing caller (first-pass titling, the
+  render-script debug route, backend's OWN local retitle-videos fallback)
+  omits it and is unaffected — this is opt-in, not a behavior change to the
+  automatic path.
+
+Backend's LOCAL retitle-videos runner (`runRetitleJob`, the dormant
+fallback when the handoff flag is off) also now passes `retitleMode:true`
+— **this half of the fix applies whether or not `ADGEN_RENDERER_ENABLED` is
+ever flipped on**, because it closes a defect in the shared
+`brandScriptExecutor` Remotion-render code itself, which IS live today —
+currently executed by adgen's retitle consumer in production, not by this
+dormant backend runner.
+
+Pinned, and revert-proven against the exact mutations above, by
+`backend/scripts/verifyRetitleAdgenHandoff.js` and
+`adgen/scripts/verifyRetitleConsumerClaim.js`.
+
+### Why `renderUrl` alone cannot report success
+
+A retitle overwrites the SAME Cloudinary `public_id` in place
+(`overwrite:true`), so the delivered URL string is frequently unchanged on
+a *successful* retitle too. `retitleResult` (`{status, renderUrl, error,
+completedAt}`) is the readout backend's poll loop reads once
+`retitleRequest` clears; backend nulls it in the SAME `$set` that stamps a
+new request, so a stale prior outcome can never be misread as the new
+request's result.
+
+### Claim-safety, mostly not money-safety — CORRECTED after adversarial review
+
+The first draft of this section claimed retitle is "confirmed FREE".
+That overclaimed. `brandScriptExecutor.js` never requires
+`atlasVideoService` in either repo (grep-verified) — manual retitle makes
+NO NEW Atlas VIDEO-GENERATION submit, and recomposites chrome onto an
+already-paid master. But `uploadRenderAndStamp`'s success path
+unconditionally calls `runVideoVisionQcForAd` (→ `adVisionQcService` →
+`atlasLlmService.chatCompletion`, a real billed LLM call) and the earlier
+face-safe-crop step calls `basePlateCropService` (same
+`atlasLlmService.chatCompletion` dependency) — **both fire on every
+titling render, retitle included, and always have; this protocol neither
+adds nor removes that cost.**
+
+So the accurate statement: the hazard a dual claim guards against here is
+DOUBLE EXECUTION of one operator-requested retitle — wasted Remotion
+compute, a duplicate Cloudinary upload, AND a duplicate (small, but real)
+vision-QC/face-detection LLM call for the SAME request — not a double
+charge for two different things. That is still meaningfully lower-stakes
+than regenerate's double-Omni-submit hazard, which is why, **unlike** the
+regenerate consumer (Protocol B, which deliberately has no reclaim
+sweep), this consumer runs `reclaimStaleRetitleClaims()`
+(`retitleConsumer.js:197`) on a 20-minute default TTL, mirroring the
+titler's own `reclaimStaleTitlerClaims` — a stuck claim is safe to release
+automatically because a re-run costs only time, a render slot, and a
+repeat of an already-inherent small LLM cost, not a second video charge.
+
+### Known, narrow, accepted residual — NOT fixed here
+
+The "no chrome configured for this format" skip branch inside
+`renderBrandScriptAndSave` calls the SHARED `qcAndStampVideoAd` helper
+(five call sites across both repos: two backend mint paths, the regenerate
+titling-throw fallback, the titling-resume give-up branch, and this one),
+whose QC-failure `status:'failed'` flip is an explicit 2026-08-20 owner
+decision and was NOT threaded with `preserveAdStatus` — doing so would
+touch four unrelated call sites for a narrow edge case (retitling a brand
+with no titling chrome configured at all, which has no titling to redo in
+the first place). A manual retitle hitting exactly this edge case could
+still flip a `'live'` ad to `'failed'` on a QC fail. Flagged, not silently
+worked around.
+
+**Second residual, found by adversarial review (2026-08-28): a regenerate
+CAN start while a retitle is already claimed and rendering (the reverse
+of the `regenerating:{$ne:true}` stamp guard above).**
+`adRegenerateService`'s existing in-flight lock checks `status`,
+`titlingResumeState`, and `regenerating` — it does not check
+`retitleRequest` / `retitleClaimedByWorker`, because that pair did not
+exist when the lock was written and reasonably-scoped adversarial review
+of THIS change did not extend into modifying regenerate's own already-
+adversarially-reviewed, money-critical lock. Worst case: a last-writer-
+wins clobber between the retitle's stale-master titled output and the
+regenerate's fresh (paid) master's own titling — not a double bill,
+because regenerate still submits exactly one Omni generation regardless
+of a concurrent retitle. Lower frequency than the forward direction (it
+needs an operator or automation to fire regenerate WHILE a retitle this
+same ad is mid-render), and recoverable (another retitle re-fixes the
+regenerated master's chrome). Flagged rather than silently left
+undocumented; closing it would mean adding a fifth field read to
+regenerate's `notInFlight`/`inFlightRefusal` pair, which is out of scope
+for this protocol.
+
+---
+
+## 5. Protocol C — recovery and reaping (shared writers, by design)
+
+These are the paths where **both** services write the same fields on
+purpose. They are the least obvious part of the contract.
+
+| Sweeper | Started at | Gated on the flag? | Mutates | Thresholds |
+|---|---|---|---|---|
+| Backend reaper | `backend/worker.js` | **No.** Skips rows with `claimedByWorker` set. | receipt-free `rendering` → `queued` (`worker.js:399`) | `REAP_STALE_MIN` 15 |
+| Backend boot recovery | `backend/worker.js:222-224` | **No — ungated.** | `rendering` + receipt + stale → `draft`/`failed` | `RESUME_STALE_MIN` 5 |
+| Adgen boot recovery | `adgen/src/services/renderer.js:1977` | **Yes** — stands down when off | same | same |
+| Adgen titling resume | `adgen/src/services/renderer.js:2022` | **Yes** | titles recovered masters; CAS on `titlingResumeState` | interval 5 min |
+| Adgen regenerate consumer | `adgen/src/services/renderer.js` | **Yes** | regenerate claim | poll 2s |
+
+⚠️ **There is no "Backend titling resume" row any more.** `backend/index.js`'s
+90s-delay interval and `backend/services/titlingResumeService.js` (the whole
+file) were both deleted 2026-08-28, backend #360 (`abf7e0c2`) — see the note
+above §4's flag-read table for the same removal. Titling resume is now
+adgen-only, unconditionally (backend ships every video master untitled).
+Corrected 2026-09-03.
+
+Two consequences that follow from the table and are not obvious:
+
+> #### ✅ §5.1 PARTLY CLOSED by backend #346 (`f8b3d6b1`) — scope matters
+>
+> #346 added **both** a claim-awareness term and an `isAdgenRendererEnabled()`
+> stand-down to backend's boot sweep — but **scoped to VIDEO recovery only**.
+> Static-image recovery (`recoverImageAd`) stays unconditional and claim-blind,
+> deliberately: a recovered image is one atomic peek-then-write with no hand-off
+> to a second process, so two peekers racing it is the harmless case.
+>
+> adgen's own copy was fixed separately and **differently** by adgen #75
+> (`c02c7ff`) — on adgen's side the dangerous row has *no claim at all*, so
+> claim-awareness alone would not have caught it. The vendor manifest now
+> records this path as a deliberate `fork` for exactly that reason; neither side
+> should take the other's patch verbatim.
+>
+> **New consequence, from #346's own comment — a real trade, not a pure win.**
+> adgen's per-ad heartbeat deliberately stops refreshing `updatedAt` past
+> `AD_HEARTBEAT_MAX_MS` *while keeping the claim held*, on the reasoning that
+> backend recovery should be able to take a genuinely-stuck row from there. With
+> #346's gate on, backend now **declines** that handoff for as long as the flag
+> reads true. Failover for a claim stuck past the cap therefore depends entirely
+> on adgen's own sweep; if that sweep is not running, nothing recovers the row.
+>
+> The paragraph below describes the pre-#346 mechanism, which still applies to
+> the **static-image** path and to the flag-off case.
+
+**5.1 Backend boot recovery can write a terminal status under adgen's live
+claim.** Its filter is `{status:'rendering', updatedAt: {$lt: cutoff},
+…HAS_RECEIPT}` (`backend/services/bootRecoveryService.js:138`) — there is
+**no `claimedByWorker` term**, and the sweep is not gated on the flag. Its
+own writes are individually guarded by `status:'rendering'` in the filter,
+so they are safe against a *concurrent settle*, but nothing stops them
+firing while an adgen worker still holds the lease.
+
+**The adgen render heartbeat is the main thing preventing this.** It exists
+specifically to keep `updatedAt` moving so backend recovery does not judge a
+live titling job to be dead. If the heartbeat lapses — its own duration cap, or
+a missed-beat streak — backend will collect the receipt under adgen's still-set
+claim. Treat the heartbeat as a contract obligation, not an optimisation.
+
+⚠️ **But the heartbeat is not a complete answer, because there is a window where
+nothing is holding the claim at all.** The renderer→titler handoff *clears*
+`claimedByWorker` while leaving `status:'rendering'` and the receipt in place
+(that is deliberate — it is how the titler becomes eligible to claim). The
+heartbeat is owner-scoped (`{_id, claimedByWorker: WORKER_ID, …}`), so in that
+gap it matches nothing and no-ops. Backend's recovery has no `claimedByWorker`
+term, so during the handoff window it can collect a paid master that adgen is
+about to title. Narrow, but not covered by the heartbeat argument.
+
+**5.2 Backend can take an unclaimed row back even with the flag on.** The
+reaper requeues `rendering` → `queued` after 15 minutes when
+`claimedByWorker` is `null`. If adgen is slow to claim — not deployed, not
+scaled up, sleeping on a misread flag — backend reclaims the work. It cannot
+steal an *already-claimed* row, because `claimedByWorker: null` is in the
+filter. `backend/config/defaults.env:1166`'s own comment notes this: flipping
+the flag on with no adgen deployed strands ads until the 15-minute reaper.
+
+---
+
+## 6. Sharp edges
+
+### 6.1 `false → true` mid-flight can double-render (and double-bill)
+
+The one genuine correctness hazard found while writing this document.
+
+Backend's dormant fallback renders in-process (only when
+`ADGEN_RENDERER_ENABLED` is not `'true'`) with `claimedByWorker` left
+`null` for the whole render (`backend/models/Ad.js:48-51`). Adgen's claim
+filter is `{status:'rendering', claimedByWorker:null, …}`. **Those are the
+same shape.**
+
+So if the flag flips `false → true` while a backend `runRenderLoop` is
+already past its gate at `backend/routes/ads.js:1861`, that loop keeps
+rendering rows adgen is now free to claim. Atlas bills on submit.
+
+Bounded by: the window is one in-flight backend render loop, and new
+`runRenderLoop` calls take the handoff path. Not observed in production —
+this is a by-construction finding, not an incident. **Mitigation for now:
+flip this flag when no run is in flight.** A real fix would mean backend
+marking its own in-process ownership, which is a behavioural change and out
+of scope here.
+
+### 6.2 A stamped-but-unclaimed regenerate is orphaned by a `true → false` flip
+
+Backend has already returned; adgen's consumer stands down on the next tick.
+The row keeps `regenerating: true` and its payload **forever** — there is no
+regenerate reaper (§4), and boot recovery does not look at `regenerating`
+rows because regenerate never sets `Ad.status`. Not a double-submit; a
+permanent stall needing operator action.
+
+### 6.3 A fragile ordering keeps SIGTERM off handed-off rows
+
+Backend's SIGTERM handler requeues in-flight rows with
+`receiptFree({campaignRunIds: {$in: s.runIds}, status:'rendering'})`
+(`backend/services/processAlerts.js:124-129`) — **no `claimedByWorker`
+term.** On its face that can requeue adgen-claimed work.
+
+It does not, because `runRenderLoop` **returns at `:1869`, before
+`inFlight.track(...)` at `:1888`** — so a handed-off run is never registered
+as in-flight and never appears in `s.runIds`.
+
+That safety property is an accident of statement order in one function. Moving
+`inFlight.track` above the handoff return would silently make backend requeue
+rows adgen owns. Worth a comment at the call site.
+
+**And it only covers SIGTERM.** Do not generalise it to "backend never requeues
+adgen-owned rows" — several other backend requeue paths have no
+`claimedByWorker` term either:
+
+| Site | `backend/routes/ads.js` |
+|---|---|
+| CAS-loss release | `:1333-1335` |
+| `/generate` crash handler | `:1359-1361` |
+| `/runs` crash handlers | `:1674-1676`, `:1699-1701` |
+
+`runRenderLoop` performs several `await`s *above* the handoff return (route
+partition, brand/user lookup, `runFeed.startRun`). A throw in that prologue, or
+a lost `preparing→running` CAS, can requeue rows adgen has already claimed.
+
+Worse, the requeue pipeline (`backend/services/adArchiveDigest.js`) **does not
+clear `claimedByWorker`** — verified: the identifier does not appear in that
+file. So such a row can land `status:'queued'` **with the lease still set**,
+which makes it invisible to adgen's `claimOne` (it requires
+`claimedByWorker:null`) *and* to backend's reaper (same term). A permanently
+stuck row with no owner.
+
+### 6.4 One lease field, two protocols
+
+`claimedByWorker`/`claimedAt` are also the **titler's** lease
+(`adgen/src/services/titler.js:146-162`). The partition is not only
+`titlingNeeded`: the titler additionally requires `status ∈ {rendering, draft}`
+and `veoVideoUrl ≠ null`, and it can claim a **`draft`** row, which the renderer
+never does.
+
+`ADGEN_TITLER_ENABLED` is committed `"true"` on both `adgen-renderer` and
+`adgen-titler` in `adgen/render.yaml` (live since 2026-08-26).
+`adgen/config/defaults.env` ships `false` as the local / api / orchestrator
+fallback so a renderer without render.yaml still titles in-process.
+
+---
+
+## 7. Enforcement
+
+Three harnesses, all in `npm test` (`scripts/runVerifySuite.js` globs
+`scripts/verify*.js`), so all three run in CI.
+
+| Harness | Answers | Needs the backend checkout? |
+|---|---|---|
+| `verifyHandoffContract.js` | Does the contract declaration still match this repo's live `models/Ad.js`, and was the version bumped when the field list changed? | Checks A-D: no. **Check E (cross-repo byte-identity) does** — it INFO-skips without the sibling, so CI never runs it. |
+| `verifyVendorDrift.js` | Has anyone *looked* at each vendored file since either side moved on it? Is any owed port overdue? | Partly — see below |
+| `verifySharedInvariants.js` | Do named semantic invariants hold in **every** copy, across both repos? | Partly |
+
+### What a green CI does and does not mean
+
+`.github/workflows/ci.yml` checks out **this repo only** and sets no
+`ADGEN_BACKEND_PATH`, so `scripts/lib/siblingBackend.js` resolves to `null`
+on every pull request.
+
+Before manifest v2 that meant every cross-repo check in
+`verifyVendorDrift.js` skipped with an INFO and the harness exited 0. **The
+manifest had teeth on a developer's laptop and was a structural no-op on the
+one surface that gates a merge.** That is how the `veoPromptBuilder.js` fix
+landed in adgen with no CI signal.
+
+Manifest v2 adds two checks that need **only this repo**, and therefore work
+in CI:
+
+- **`adgenHash`** — adgen's own bytes per vendored file. If they change
+  without a reconcile, CI fails and the author must state whether backend
+  needs the same edit.
+- **`unported`** — a first-class status carrying `portTo` (which repo owes
+  the port) and `owedSince`, failing once past `ADGEN_UNPORTED_GRACE_DAYS`
+  (default 14). Re-reconciling **carries `owedSince` forward** so the window
+  cannot be extended by rerunning the command.
+
+**Read a green CI as "adgen's own copies are unchanged since someone
+attested them, and no obligation is overdue" — not as "the two repos
+agree."** The full cross-repo comparison runs when a human runs `npm test`
+with both repos checked out side by side. Wiring the backend into CI needs a
+PAT for a private repo; that is a separate change.
+
+### Changing the contract
+
+1. Edit `CONTRACT_FIELDS` in `src/services/handoffContract.js`.
+2. `node scripts/verifyHandoffContract.js --print-digest` → paste into `CONTRACT_DIGEST`.
+3. Bump `HANDOFF_CONTRACT_VERSION` (MAJOR = field removed/retyped or a writer changed).
+4. Update this document — the harness checks it names the current version.
+5. **Apply 1-4 to the other repo in the same session.** The module is
+   vendored at the same relative path, so `verifyVendorDrift.js` fails on it
+   until you do.
+
+The digest covers `field`, `type`, `writer`, `enum` only. `note` and `role`
+are excluded on purpose: if a wording fix forced a version bump, the version
+would stop meaning anything and people would stop bumping it.
+
+**Known limits of the shape check, stated so nobody over-trusts it.**
+`assertContractShape` verifies that each contract field is *declared* and that
+its Mongoose `instance` matches the declared type. It does **not** compare the
+live schema's `enum`, defaults, or indexes against the contract. So editing
+`models/Ad.js`'s `status` enum without touching `CONTRACT_FIELDS` stays green —
+the digest pins the *declaration*, not the schema. Widening a contract enum is
+therefore a change a human still has to notice.
+
+---
+
+## 8. Known divergence between the two repos
+
+### `veoPromptBuilder.js` — an unported fix (tracked, now with a clock)
+
+adgen removed a catalog-title interpolation from the Omni camera prompt on
+2026-08-26 after Atlas Omni rendered the catalog title `Vaportek` as a
+fabricated on-garment brand lockup over the real PELAGIC mark; vision-QC
+terminal-rejected the $0.90 master. **The backend copy is still the pre-fix
+blob.**
+
+The vendor manifest recorded this as `status: fork` with the obligation in
+prose — "a human must apply the same edit in `liquidretail_backend`". True,
+unactioned, and permanently green, because a `fork` is a valid end state. It
+is now `status: unported`, `portTo: backend`, with a start date and a
+14-day grace window.
+
+### `veoStoryboardService.js` — the same bug in both repos, byte-identical
+
+The identical construct survives at `:68` in **both** repos:
+
+```js
+lines.push(`Product: ${product?.title || '(untitled product)'}`);
+```
+
+**No hash-based drift check can ever flag this.** The two copies agree, so
+the manifest correctly calls the file `synced` — byte-equality actively
+certifies the bug. This is precisely why
+`scripts/verifySharedInvariants.js` exists: it checks a named invariant
+across every copy, so a fix is provably a fix everywhere rather than a fix
+in whichever copy someone had open.
+
+> #### Correcting a widely-repeated claim about why this is dormant
+>
+> This bug is commonly described as "dormant behind
+> `VEO_USE_GPT_STORYBOARD`". **That is wrong, and the real answer matters.**
+>
+> `config/defaults.env:395` ships `VEO_USE_GPT_STORYBOARD=true` in **both**
+> repos, and no `render.yaml`, `Dockerfile`, `src/config.js`, or SystemConfig
+> overrides it. `enabled()` returns **true**. If the module were reached, the
+> bug would fire.
+>
+> What actually makes it unreachable is the **provider router**:
+> - `adgen/src/services/videoRouter.js:42-44` — `activeProvider()` defaults to `'atlas'`, and `VIDEO_PROVIDER=atlas` is committed at `config/defaults.env:394`. (`render.yaml` does not override it.)
+> - On the atlas path, `prepareStoryboard` returns `{storyboard: null}` — "Storyboard retired on the Atlas path" (`adgen/src/services/atlasVideoService.js:4344`).
+> - `generateStoryboard` has exactly **one** production caller, `adgen/src/services/aiVideoReferenceService.js:320`, reached only from `videoRouter`'s non-atlas `else` branch.
+>
+> **Set `VIDEO_PROVIDER=vertex` and this line composes a paid Vertex Veo
+> prompt.** The module's own header comment ("Off by default",
+> `veoStoryboardService.js:10`) describes a gate that is not the real one.
+>
+> Both copies are recorded in `scripts/shared-invariants.json` with this
+> reasoning, so the next person does not have to re-derive it.
+
+### Pre-existing drift, not introduced here
+
+Running `verifyVendorDrift.js` locally with a backend checkout reports two
+failures that are **present on unmodified `origin/master`** (confirmed by
+running the pre-change harness against the same trees):
+
+- `services/atlasModelMap.js` — backend moved since the recorded look.
+- `services/campaignAdsGenerationService.js` — backend moved, and adgen also differs from a `synced` record.
+- `services/shotTypeRank.js` — recorded `synced`, adgen now differs.
+
+They are untouched here deliberately. Resolving them means reading a backend
+diff and deciding whether to port, which is a judgement call per file, not
+a documentation change. They do not affect CI (the backend-side checks skip
+there).
+
+### Direct-Gemini video provider — built, and LIVE (verified 2026-09-04)
+
+As of adgen `origin/master` @ `fde6003` (2026-09-03), a full
+`geminiVideoService` path exists (PRs #108/#110/#113 plus follow-ups).
+Committed default is still `VIDEO_PROVIDER=atlas` (`config/defaults.env:394`,
+`render.yaml` doesn't set it, code default in `videoRouter.activeProvider`
+and `renderer.js`'s seam is `'atlas'`) — PR #108 landed explicitly dark.
+
+**But production is not on the repo default.** Queried the live Render
+API directly (`GET /v1/services/srv-da4bh9rbc2fs73cff2rg/env-vars`,
+`adgen-renderer`) on 2026-09-04: **`VIDEO_PROVIDER=gemini` is set as a
+dashboard override on the live renderer service.** This is exactly the
+blind spot flagged below in §9 as "still overridable... this document
+did not query" — it has now been queried, and the answer is yes, it's
+overridden. So everything below is **current production behavior**,
+not a future "when flipped" scenario:
+
+- **Charge point.** Atlas treats a structured pre-work 429 as unbilled
+  and replayable. Gemini treats an accepted `interaction_id` as
+  possibly billed even when the first poll is `too_many_requests`.
+  Porting `isDefinite429` onto Gemini is a double-bill.
+- **Receipt field is reused.** `Ad.veoPredictionId` still holds the
+  provider id; `Ad.veoProvider` (`'gemini'`) is what lets
+  `bootRecoveryService` GET the Gemini Interactions API instead of
+  Atlas-GET-ing a Gemini id. A null `veoProvider` still means Atlas
+  (pre-cutover rows).
+- **Two dispatch points.** Renderer mint uses its own seam
+  (`renderer.js:1460-1489`, atlas|gemini only — `vertex` throws).
+  Regenerates go through `videoRouter.generateForAd`
+  (`adRegenerateService.js:43` aliased as `veoService`). The router's
+  gemini branch (added "WITH THE DIRECT-GEMINI CUTOVER") is what stops
+  regenerate from falling through onto deprecated Vertex Veo now that
+  the env is actually set to `gemini` in production.
+- **Rollback** is flipping the one dashboard var back to `VIDEO_PROVIDER=atlas`
+  (or deleting the override) — no code change, no deploy required either
+  direction. Atlas path was not deleted; both remain fully wired.
+- Also checked live in the same pass: `VIDEO_RAW_CATALOG_REFERENCES=false`
+  on `adgen-renderer` (explicit, matches file default — **not** live), and
+  `VIDEO_BENEFITS_PLACEMENT` has **no** dashboard override anywhere (runs
+  on the file's `true` default, so it's live by default, not override).
+
+**Re-verify before trusting this indefinitely** — a dashboard override
+can be flipped back without any commit, so this document has no way to
+detect a future reversal on its own. Re-run the same `env-vars` query
+against `srv-da4bh9rbc2fs73cff2rg` to check current truth.
+
+Director-benefits (adgen #115 / backend #386) does **not** change the
+billable submit regardless of provider. Backend mint stamps
+`Ad.videoTitleDirection`; adgen titling
+(`brandScriptExecutor.applyBenefitsPlacement`) splices a benefits slot
+at Remotion time. Fail-closed on director errors — mint still happens.
+Gated on `VIDEO_BENEFITS_PLACEMENT=true` (`config/defaults.env:1882`),
+confirmed live (no override, runs on that default).
+
+---
+
+## 9. Not verified
+
+Stated as unknown rather than guessed.
+
+1. **Live Render dashboard values — partially closed 2026-09-04.**
+   `ADGEN_RENDERER_ENABLED`, `VEO_USE_GPT_STORYBOARD`, `ADGEN_TITLER_ENABLED`
+   remain unverified — this document still reads only committed files for
+   those three, no dashboard or Render API query was made for them.
+   **`VIDEO_PROVIDER`, `VIDEO_RAW_CATALOG_REFERENCES`, and
+   `VIDEO_BENEFITS_PLACEMENT` are no longer in this category** — queried
+   directly via `GET /v1/services/srv-da4bh9rbc2fs73cff2rg/env-vars`
+   (`adgen-renderer`) using the Render API key in `~/.render/cli.yaml`.
+   Provenance of the production claims, stated so nobody mistakes an
+   assertion for a measurement:
+
+   | Claim | Rests on | Strength |
+   |---|---|---|
+   | `ADGEN_RENDERER_ENABLED=true` in prod | committed `defaults.env` in both repos (aligned 2026-09-03) plus live dashboard | Code-visible. Dashboard copy is a redundant duplicate. **Not independently re-queried in this pass** — carried over from the prior write-up. |
+   | `ADGEN_TITLER_ENABLED=true` in prod | `adgen/render.yaml` renderer + titler both `"true"` (aligned 2026-09-03) plus live dashboard | Code-visible. Dashboard copies are redundant duplicates of render.yaml. **Not independently re-queried in this pass.** |
+   | `VIDEO_PROVIDER=gemini` in prod (repo/code default is `atlas`) | **Directly queried, 2026-09-04**, live `adgen-renderer` env-vars via the Render API. `gemini` is an explicit dashboard override; `config/defaults.env:394` and both code defaults (`videoRouter.js:42-44`, `renderer.js:1460`) still say `atlas`, and `render.yaml` sets neither. | **Measured, not inferred** — the strongest possible evidence: a direct read of the live service's actual environment. Direct-Gemini is not dark; it is the routed provider in production today. |
+   | `VIDEO_RAW_CATALOG_REFERENCES=false` in prod | **Directly queried, 2026-09-04**, same service/method. Matches file default (`defaults.env`, added 2026-09-03, DEFAULT OFF). | Measured. Not live. |
+   | `VIDEO_BENEFITS_PLACEMENT=true` in prod | **Directly queried, 2026-09-04**, same service/method — no override present on `adgen-renderer` or `adgen-titler`, so it runs on the file default (`config/defaults.env:1882`, `true`). | Measured. Live by default, no override needed. |
+
+   **"Both paths are live" for `VIDEO_PROVIDER` is now measured, not
+   prose** — production is on Gemini. The Atlas branch is not dead code:
+   it's the fallback/rollback path and still the default for any fresh
+   service or local run that doesn't carry the dashboard override.
+2. **Whether a Render env edit changes a running process's `process.env`
+   without a restart.** Several code comments claim a dashboard flip takes
+   effect "without a redeploy". The *code* genuinely re-reads `process.env`
+   at call time — that much is verified — but whether Render mutates a live
+   process's environment was not tested.
+3. **§6.1's double-render window has not been observed in production.** It
+   follows from the claim filter and backend's null `claimedByWorker`; no log
+   or delivery record was examined to confirm it has occurred.
+4. ~~**`generationOrder`**~~ — **CLOSED by grep, not left hedged.** An earlier
+   draft called this unresolved; it is not. Every write in
+   `backend/services/` and `backend/routes/` sets it to `null`
+   (`campaignAdsGenerationService.js:3647` and `:4056`, both at mint). **No
+   writer anywhere sets a non-null value**, so the schema comment at
+   `backend/models/Ad.js:153-154` ("populated when the renderer claims it") is
+   stale prose describing behaviour that does not exist. Correctly excluded from
+   `CONTRACT_FIELDS` — it is not part of the handoff.
+5. **Collections beyond `ads` are enumerated but not fully traced.** Both
+   services write `campaignruns`, `costlogs`, `layoutinputartifacts`, and
+   `quotesnippetcaches`. Only the `ads` handoff is documented to the standard
+   of this document; the others are named so the next reader knows they are
+   coupling surfaces, not because their protocols were verified.
