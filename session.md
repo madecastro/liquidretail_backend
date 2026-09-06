@@ -19,6 +19,215 @@ commands used this session) to find the actual cause.
 
 ## CURRENT STATE
 
+**2026-09-04/05, written for cross-account handoff (work2 session `8ab4de8d`).**
+Also check `mcp__gbrain_work__recall` (entity `liquidretail_adgen`) — two facts
+saved there (#98 owner directives, #99 detailed in-flight state) should still be
+fresher than whatever staled here first.
+
+### Owner directives active right now (all from chat today, verbatim in gbrain fact #98)
+1. **adgen is the ONLY generator in prod. Strip backend's dormant generation
+   stack, don't keep syncing it.** "the actual video generation lives in adgen
+   and can spawn workers? we don't need to be updating redundant architecture we
+   should in fact strip it out." Confirmed via Render API: `ADGEN_RENDERER_ENABLED=true`
+   on backend web+worker, `VIDEO_PROVIDER=gemini` override on `adgen-renderer`
+   (repo default is `atlas`).
+2. **Preserve every provider arm (atlas/gemini/vertex); the fork may go only as
+   deep as the model call.** "we want to preserve the entire atlas path also,
+   the generation code should only fork as far as the model — every other part
+   of the code should be common regardless of image model." Saved as memory
+   `provider-fork-only-at-the-model.md` (Claude Code memory, not gbrain).
+3. **Scope: active code, code that must port to become active / benefit from
+   adgen's scale, and code to remove.** Owner: "only look at what is active
+   code right now and things that must be ported to become active or benefit
+   from the adgen structure" + "also determine code we should remove."
+4. **Data path ingest→Directors: maximal data, minimal AI calls, quality
+   paramount.** Never cut a Director/Judge round or drop a model tier.
+
+Three read-only decision documents exist on disk (NOT committed — they're
+report artifacts, not source):
+- `/Volumes/Sayulita/Projects/RS/.wt-strip-backend/STRIP-INVENTORY.md` — full
+  active/dormant-keep/remove/move classification of every backend + adgen file.
+- `/Volumes/Sayulita/Projects/RS/.wt-strip-backend/DATA-PATH-AUDIT.md` —
+  ingest→Director→render data-flow gaps, wasted AI calls, a quality-first fix
+  plan with a DO-NOT-DO list.
+- `/Volumes/Sayulita/Projects/RS/.wt-strip-adgen/PROVIDER-FORK.md` — stage×arm
+  matrix of the video-provider fork (atlas/gemini/vertex), 12 drift findings
+  (F1–F12), target thin-adapter shape, a 10-PR sequenced collapse plan.
+Read these before starting new work in this area — they're the source of
+truth for what's ACTIVE/DORMANT-KEEP/REMOVE and were built by a dedicated
+Grok pass tracing real entrypoints, not require-graphs.
+
+### Merged today (adgen master, newest first)
+- `8ce8b47` #123 — delete adgen's dead vendored brand-ingest cluster (−5,271
+  lines: brandCatalogService, brandEnrichmentService, brandFontIngestService,
+  brandFontPersistenceService, metaAdsFontService, brandfetchService,
+  brandLogoIngestService, tailwindTokenExtractor, providers/geminiSearchProvider).
+  Kept `models/Brand.js` schema parity (shared Mongo).
+- `ca572af` #122 — split `LAYOUT_DERIVATION_MODEL` from `GEMINI_SEARCH_MODEL`
+  (env-var collision fix, zero prod behaviour change).
+- `300b6fd` #121 — port backend's `COMPETITOR_MARKS_CAVEAT` (QC display-only)
+  + `probeImageDims()` (fixes 100%-paid-outpaint-on-Cloudinary-failure bug).
+- `59c8eb6` #119, `78ea048` #120 — from the prior (pre-compaction) session:
+  docs correction + harness magic-window fix + 34-file vendor-drift reconcile.
+
+### Open adgen PRs — needs a fresh session's attention, in this order
+1. **#124** `port/schema-defense-manifest-hygiene` — **CONFLICTING/DIRTY.**
+   Declares `Ad.qcOverridden*` / `Media.yoloDetectedAt/yoloFailReason` schema
+   fields (shared-Mongo safety), converges `copyDerivationService.js` to
+   backend (last week's manifest reason was inverted — fixed), removes
+   `Product: ${title}` from `veoStoryboardService.js` (Vaportek-class bug),
+   manifest honesty (8 comment-only forks re-synced). **Needs**: rebase onto
+   current master (#123 landed after this was pushed), re-verify, re-push.
+2. **#125** `fix/harness-fragility-adgen` — **UNSTABLE (CI still running last
+   check).** 8 vacuous harnesses made structural + 6 money-adjacent pins
+   hardened, all mutation-proven. Harness-only, no prod file touched. Just
+   needs CI to finish and squash-merge if green.
+3. **#126** `port/progress-observability` — **UNSTABLE.** Ports backend #368 /
+   `4b95403d`: `OperationRun.stages[]` closed-stage history, stale-count reset
+   on stage transition, new `adPhase.js` (canonical ad-phase derivation),
+   `classifyRunAdOutcome` retrofit proven count-equivalent to the old switch
+   (18/18 parity harness). Watch CI, merge when green.
+4. **#127** `port/static-segment-override-consumer` — **CONFLICTING/DIRTY**
+   (rebase needed, same #123 collision). Ports the segment-prompt-override
+   consumer onto adgen's live static render path (backend's copy was on the
+   dormant fallback, never reachable). 112-cell byte-identity fixture proves
+   flag-on-empty-table is a no-op.
+5. **#118** `claude/dazzling-darwin-bv5fni` — **NOT MINE**, pre-existing,
+   CONFLICTING. RPD prompt-testing harness resurrection. Leave alone unless
+   asked.
+
+Pattern: every PR built on `origin/master` before #123 merged will show
+CONFLICTING now (#123 deleted ~34 manifest entries + changed
+`layoutInputService.js`) — this is a rebase-and-reverify job, not a real
+conflict in the substance. Do it PR by PR, oldest-authored first, so each
+rebase sees the previous one already merged.
+
+### Uncommitted work in worktrees (git state exactly as left; nothing lost, all still on disk)
+
+**Strip/removal builds (owner directive 1 — "strip the redundant stack"):**
+- `.wt-strip-adgen` (branch `chore/strip-dead-vendored`, 53 files changed
+  /−14,710 lines) — deletes the 50 vendor-`unused` dead modules the inventory
+  proved unreached (kept `imageRecoveryService.js` and `ugcVideoPipeline.js`
+  live via a require-graph proof; kept `spendReceipt.js`/`handoffContract.js`).
+  A follow-up pass fixed two manifest lies (those two live modules were marked
+  `unused`) and pointed `verifyGeminiLeaseSweeperCollision.js` at the sibling
+  backend's real sweeper filters instead of an inline snapshot. **Status
+  unclear post-compaction — the scratchpad report is gone (was under
+  `/private/tmp`, not persistent); re-run `npm test` in this worktree before
+  trusting it, then commit/PR.** `PROVIDER-FORK.md` (untracked) is the
+  decision doc, not part of the diff — leave it or delete before committing.
+- `.wt-strip-backend` (branch `chore/strip-dormant-generation`, 14 files
+  changed /−4,424 lines) — deletes the dead canvas-titling island
+  (`brandScriptRunner.child.js`, `brandScripts/*.script.js` except
+  `brandStyles/*` which is live via `GET /:id/style`). A follow-up pass was
+  sent to close 4 ENOENT loose ends it flagged (systemConfigService's file
+  fallback to deleted scripts, `/generate-script` route needs a 410,
+  `/style`'s `scriptTemplates` needs to stop readdir'ing the deleted dir,
+  `brandScriptExecutor`'s dead child-spawn code). **Same as above — verify
+  before trusting, `npm run lint` + full `npm test` first.**
+  `STRIP-INVENTORY.md` + `DATA-PATH-AUDIT.md` (untracked) are the decision
+  docs, not part of the diff.
+
+**Provider-fork collapse (owner directive 2 — PR 0–3 of the PROVIDER-FORK.md plan):**
+- ~~`.wt-fork-collapse-1`~~ — **MERGED as PR #128 (`2c67699a`, 2026-09-06T02:01Z)
+  and LIVE on all four Render services** (adgen-api/orchestrator/renderer/
+  titler all confirmed deployed at that commit; `adgen-api` `/health` 200).
+  Worktree removed, local + remote branch deleted (squash-merge, `-D` per
+  this file's own documented squash-equivalence gotcha).
+  Fixes the F1 MONEY bug (Gemini's resume path fetched reference images
+  BEFORE checking if it was resuming a paid receipt); extracts ONE
+  `shouldResumeAttempt` predicate shared by Atlas/Gemini/image; collapses
+  mint's dispatch to go through `videoRouter.generateForAd` (single seam)
+  with Vertex quarantined (throws, arm preserved on disk) until it has
+  receipt+CostLog+`maxRedirects:0`. New `scripts/verifyProviderDispatchParity.js`.
+  **Went through two full adversarial passes before merge** (Opus +
+  independent Grok xhigh, then a second scoped Opus pass on the follow-up
+  fix): first pass found a real latent gap (F2 — a resume whose receipt
+  predates this PR's charge-point `veoReferenceImages` write would report
+  an empty reference stack, risking a false-positive vision-QC rejection
+  on an already-paid master); fixed by backfilling the same stack a fresh
+  submit would use (`assembleReferences`, honors both default ranking and
+  an operator's explicit pick). Second pass found no money-loss defect;
+  three cheap hardening items folded in (non-Error rejection safety in the
+  backfill catch, a missing lease-isolation test oracle, a doc-comment
+  overclaim in `Ad.js`/`renderer.js`). One low-severity, explicitly
+  non-blocking finding is a real follow-up, not fixed: **F-A — the backfill
+  fails closed on ANY single bad reference URL (inherited from
+  `assembleReferences`'s billable-submit-safety design), which throws away
+  a URL list it already had in hand and falls back to `[]` more often than
+  it needs to. Fix shape: give `assembleReferences` (or
+  `geminiReferenceAssembly.js`) a URL-only mode that skips the byte-fetch
+  entirely for a reporting-only backfill — cheaper AND strictly more
+  complete, not a tradeoff.**
+  `npm test` 103/104 both before and after (the one failure is 4 unrelated
+  files, confirmed pre-existing on `origin/master` itself via a throwaway
+  worktree, nothing to do with this PR).
+  **PR 4+ (prompt/ref parity F4, shared charge-point stamp F7/F9/F10,
+  Cloudinary identity F8, full adapter) can now start** — sequence per
+  `PROVIDER-FORK.md` §5. F-A above is a good candidate to fold into
+  whichever PR next touches `geminiReferenceAssembly.js`.
+
+**Other pre-compaction ports, not yet re-verified/committed after rebase:**
+`.wt-port-vaportek-title`, `.wt-port-remotion-look`, `.wt-port-quote-snippet-cache`,
+`.wt-port-image-live-hunks` — backend-side ports (see backend session.md,
+these are actually backend worktrees despite living in this list from the
+original wave-2 launch; check branch name to confirm repo).
+
+### What a fresh session should do, in order
+1. `mcp__gbrain_work__recall` entity `liquidretail_adgen` for anything saved
+   after this file was written.
+2. Re-run `npm test` in `.wt-strip-adgen` (never `npm ci` / `NODE_PATH` in an
+   adgen worktree) — confirm green, then commit + push + open PR + wait for
+   CI + squash-merge, same pattern as #121-123/#128.
+   (`.wt-fork-collapse-1` is DONE — merged as #128, deployed live, worktree
+   removed. See the Provider-fork collapse bullet above.)
+3. Rebase #124 and #127 onto current master, re-verify, re-push.
+4. Watch #125 and #126 CI, merge when green.
+5. Once `.wt-strip-adgen` lands, sequence backend's
+   PR-B1 (the ~8k-LOC in-process render-loop deletion, `STRIP-INVENTORY.md`
+   §4.1) — but only AFTER the manifest entries for
+   `videoRouter.js`/`aiVideoReferenceService.js`/`ugcVideoPipeline.js`/
+   `videoCompositeService.js`/`campaignRunHeartbeat.js` are dropped or
+   reconciled on the adgen side, and UGC passthrough is ported into adgen's
+   `renderer.js` (adgen has no passthrough call today — `STRIP-INVENTORY.md`
+   §3 "Must be ported to become active" item 1) — or backend CI goes red on
+   a missing counterpart (`verifyVendorDrift` `adgenMissing`).
+6. **Start `PROVIDER-FORK.md` PR 4–8** (prompt/ref parity, shared charge-point,
+   Cloudinary identity, full adapter) — PR 0–3 is merged (#128), this is
+   unblocked now. Do NOT skip ahead within 4-8, each depends on the previous
+   one's harnesses. Good first candidate: fold in F-A above
+   (`geminiReferenceAssembly.js` URL-only mode) while already in that file.
+7. Decide (owner input needed, flagged not built): playground routes
+   (`render-script`→proxy to adgen's retitle stamp vs 409; `preview-script`→409;
+   `title-still`→409 after `/title-playground` retirement — see
+   `STRIP-INVENTORY.md` §4.3), whether to MOVE `videoRefPrewarmService` from
+   backend web to adgen (recommended, not built), Vertex quarantine-vs-complete
+   (§5 PR 10).
+
+**Do not `npm ci` / set `NODE_PATH` in any adgen worktree** (breaks
+`verifyModelParity.js`'s mongoose fallback patch — see `CLAUDE.md`).
+
+---
+
+*(Everything below this line is the PRIOR — 2026-09-02/03 — state, superseded
+by the above but kept for continuity if any of it is still relevant.)*
+
+**2026-09-03: VIDEO refs implementation, UNCOMMITTED, no push.** Packshot-protected
+ranking + raw catalog refs, both flag-off. Seed-text prompt machinery **stripped
+entirely** (not flag-gated): `OMNI_DIRECTIVES.noText` is the sole text directive;
+the overlay guard contradicted it live at flag-off. Strip report:
+`/Volumes/Sayulita/Projects/RS/scratchpad/SEEDTEXT-STRIPPED.md`. Ranking/raw-refs:
+`/Volumes/Sayulita/Projects/RS/scratchpad/IMPLEMENT-VIDEO-REFS-GROK.md`. Claude
+reviews the diff next. Do not flip `VIDEO_RAW_CATALOG_REFERENCES` until two
+production-route Atlas gens (9:16 and 16:9 raw squares, ~$2).
+
+*(Prior 2026-09-02 night. Worktree `/Volumes/Sayulita/Projects/RS/.wt-pad-source-scale`,
+branch `fix/pad-at-source-scale`, rebased onto `origin/master` `b4edfc2`.)*
+
+---
+
+*(Everything below this line is PRIOR state, superseded by the above — kept for continuity, not because it's still current.)*
+
 **2026-09-03: Gemini reference-assembly LANDED — PR #110 merged to `master`, deployed. `VIDEO_PROVIDER` stays `atlas`.**
 `https://github.com/Emami-RS-Project/liquidretail_adgen/pull/110` merged
 (squash `035913e`). This is the adgen half of the Gemini-direct video
