@@ -127,7 +127,7 @@
 //
 const fs = require('fs');
 const path = require('path');
-const { resolveBackendRoot } = require('./lib/siblingBackend');
+const { assertBackendRoot } = require('./lib/siblingBackend');
 const {
   MANIFEST_VERSION,
   PORT_TARGETS,
@@ -143,7 +143,7 @@ const {
 
 const ROOT = path.join(__dirname, '..');
 const MANIFEST_PATH = path.join(__dirname, 'vendor-manifest.json');
-const BACKEND_ROOT = resolveBackendRoot(ROOT);
+const BACKEND_ROOT = assertBackendRoot(ROOT);
 
 // Known reasons applied at --seed for files that already differ. These
 // are the 2026-08-24 snapshot; --reconcile is how they get updated.

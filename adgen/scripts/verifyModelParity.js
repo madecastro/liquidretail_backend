@@ -115,12 +115,12 @@ const os = require('os');
 const path = require('path');
 const Module = require('module');
 const { spawnSync } = require('child_process');
-const { resolveBackendRoot } = require('./lib/siblingBackend');
+const { assertBackendRoot } = require('./lib/siblingBackend');
 const { isGitRepo, resolveRefSha } = require('./lib/vendorDrift');
 
 const ROOT = path.join(__dirname, '..');
 const ADGEN_MODELS_DIR = path.join(ROOT, 'src', 'models');
-const BACKEND_ROOT = resolveBackendRoot(ROOT);
+const BACKEND_ROOT = assertBackendRoot(ROOT);
 
 let pass = 0;
 const failures = [];

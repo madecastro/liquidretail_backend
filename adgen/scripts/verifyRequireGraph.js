@@ -72,7 +72,7 @@
 //   node scripts/verifyRequireGraph.js                              → pass again
 
 const path = require('path');
-const { resolveBackendRoot } = require('./lib/siblingBackend');
+const { assertBackendRoot } = require('./lib/siblingBackend');
 const {
   fileExists,
   dirExists,
@@ -83,7 +83,7 @@ const {
 const ROOT = path.join(__dirname, '..');
 const SRC_DIR = path.join(ROOT, 'src');
 const SERVICES_DIR = path.join(SRC_DIR, 'services');
-const BACKEND_ROOT = resolveBackendRoot(ROOT);
+const BACKEND_ROOT = assertBackendRoot(ROOT);
 
 let pass = 0;
 const failures = [];

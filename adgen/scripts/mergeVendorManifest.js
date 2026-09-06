@@ -112,7 +112,7 @@ function main() {
 
   const ROOT = repoRoot();
   const vendorDrift = require(path.join(ROOT, 'scripts', 'lib', 'vendorDrift.js'));
-  const { resolveBackendRoot } = require(path.join(ROOT, 'scripts', 'lib', 'siblingBackend.js'));
+  const { assertBackendRoot } = require(path.join(ROOT, 'scripts', 'lib', 'siblingBackend.js'));
   const {
     MANIFEST_VERSION,
     normalizeEntry,
@@ -214,7 +214,7 @@ function main() {
   // working tree (which, by the time this driver runs, already reflects
   // the merge for every other path) to pick up anything newly vendored
   // that neither side's manifest recorded yet, and to verify the result.
-  const backendRoot = resolveBackendRoot(ROOT);
+  const backendRoot = assertBackendRoot(ROOT);
   let info = [];
   let blocking = [];
 

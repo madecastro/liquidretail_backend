@@ -46,7 +46,7 @@ const fs = require('fs');
 const path = require('path');
 const { matches } = require('./lib/miniMongoStub');
 const { receiptFree } = require('../src/services/spendReceipt');
-const { resolveBackendRoot } = require('./lib/siblingBackend');
+const { assertBackendRoot } = require('./lib/siblingBackend');
 
 const ROOT = path.join(__dirname, '..');
 const SVC = path.join(ROOT, 'src', 'services');
@@ -118,7 +118,7 @@ function snapshotBuildQueuedArchiveFilter({ terminalRunIds, olderThan } = {}) {
   });
 }
 
-const backendRoot = resolveBackendRoot(ROOT);
+const backendRoot = assertBackendRoot(ROOT);
 let buildStrandedAdFilter = snapshotBuildStrandedAdFilter;
 let buildQueuedArchiveFilter = snapshotBuildQueuedArchiveFilter;
 let siblingBuildStrandedAdFilter = null;

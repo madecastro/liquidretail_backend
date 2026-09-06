@@ -12,7 +12,7 @@
 
 const fs = require('fs');
 const path = require('path');
-const { resolveBackendRoot } = require('./lib/siblingBackend');
+const { assertBackendRoot } = require('./lib/siblingBackend');
 
 const ROOT = path.resolve(__dirname, '..');
 const DEFAULTS_ENV = path.join(ROOT, 'config', 'defaults.env');
@@ -176,7 +176,7 @@ function logsLeak(logs, ...secrets) {
     !logsLeak(logs, FALLBACK));
 }
 
-const backendRoot = resolveBackendRoot(ROOT);
+const backendRoot = assertBackendRoot(ROOT);
 if (backendRoot) {
   const backendDefaults = fs.readFileSync(path.join(backendRoot, 'config', 'defaults.env'), 'utf8');
   check('D1: sibling backend config/defaults.env also declares GEMINI_VIDEO_API_KEY= (empty)',

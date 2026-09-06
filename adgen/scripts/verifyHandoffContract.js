@@ -83,7 +83,7 @@
 //
 const fs = require('fs');
 const path = require('path');
-const { resolveBackendRoot } = require('./lib/siblingBackend');
+const { assertBackendRoot, siblingRequired } = require('./lib/siblingBackend');
 const { loadMongooseWithFallback } = require('./lib/mongooseLoader');
 const { resolveBackendRef, readBackendBlob } = require('./lib/vendorDrift');
 
@@ -166,9 +166,10 @@ check('contract declares a plausible field set', () => {
 // throw MODULE_NOT_FOUND. Unlike verifyModelParity we do NOT exit on a
 // missing mongoose: checks A, C, D and E need none, and failing the whole
 // suite over a dev dependency would train people to ignore this harness.
+const BACKEND_ROOT = assertBackendRoot(ROOT);
 const mongoose = loadMongooseWithFallback({
   harnessName: 'verifyHandoffContract',
-  backendRoot: resolveBackendRoot(ROOT),
+  backendRoot: BACKEND_ROOT,
   onUnavailable: () => null,
 });
 if (!mongoose) {
@@ -255,12 +256,15 @@ check(`${OWNERSHIP_FLAG} predicate accepts only case-insensitive 'true'`, () => 
 });
 
 // ── E. the two repos' contract modules agree ───────────────────────────
+// Skip OUTSIDE check() when the sibling is absent. A skip inside check()
+// increments `pass` and the suite stays green — the exact false-green this
+// graft exists to close. Monorepo / ADGEN_REQUIRE_SIBLING already threw
+// via assertBackendRoot above, so a null here is a genuine split-repo miss.
+if (!BACKEND_ROOT) {
+  infos.push('sibling backend absent — cross-repo contract-module comparison SKIPPED');
+} else {
 check('contract module is identical in both repos', () => {
-  const backendRoot = resolveBackendRoot(ROOT);
-  if (!backendRoot) {
-    infos.push('sibling backend absent — cross-repo contract-module comparison SKIPPED');
-    return;
-  }
+  const backendRoot = BACKEND_ROOT;
   // Read the backend copy from the REMOTE-TRACKING REF, not the sibling
   // working tree. The sibling siblingBackend.js resolves is a shared,
   // long-lived checkout that other sessions have live edits in and that is
@@ -273,6 +277,12 @@ check('contract module is identical in both repos', () => {
   const ref = resolveBackendRef(backendRoot);
   const blob = readBackendBlob(backendRoot, ref, BACKEND_CONTRACT_REL);
   if (!blob) {
+    if (siblingRequired(ROOT)) {
+      throw new Error(
+        `${BACKEND_CONTRACT_REL} is unreadable in the sibling backend at ${ref || '(no ref)'} — ` +
+        `sibling is required in this layout, so this is a failure, not a skip.`
+      );
+    }
     infos.push(
       `${BACKEND_CONTRACT_REL} does not exist in the sibling backend at ${ref || '(no ref)'} — the ` +
       `backend half of this contract has not landed there yet. Comparison SKIPPED. Once it lands, ` +
@@ -291,6 +301,7 @@ check('contract module is identical in both repos', () => {
   }
   infos.push('cross-repo: contract module is byte-identical in both repos');
 });
+}
 
 console.log(`verifyHandoffContract: ${describeContract()}`);
 for (const line of infos) console.log(`  info: ${line}`);

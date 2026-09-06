@@ -76,6 +76,7 @@ const AD_MODEL_REL = 'models/Ad.js';
 const THIS_REPO = 'backend';
 const SIBLING_ENV = 'BACKEND_ADGEN_PATH';
 const SIBLING_DEFAULT = '../liquidretail_adgen';
+const SIBLING_MONOREPO = 'adgen';
 const SIBLING_CONTRACT_REL = 'src/services/handoffContract.js';
 // ──────────────────────────────────────────────────────────────────────
 const CONTRACT_DOC_REL = 'docs/CONTRACT-backend-adgen.md';
@@ -113,15 +114,46 @@ function check(label, fn) {
 // Mirrors adgen's scripts/lib/siblingBackend.js, pointing the other way. A
 // candidate counts only if it has the src/services directory — cheap proof
 // it really is the adgen repo and not an empty or unrelated directory.
+function isRealAdgenCheckout(candidate) {
+  try {
+    return fs.statSync(path.join(candidate, 'src', 'services')).isDirectory();
+  } catch (e) {
+    return false;
+  }
+}
+
+function isMonorepoLayout() {
+  return isRealAdgenCheckout(path.join(ROOT, SIBLING_MONOREPO));
+}
+
+function siblingRequired() {
+  if (String(process.env.BACKEND_REQUIRE_SIBLING || '').toLowerCase() === 'true') return true;
+  return isMonorepoLayout();
+}
+
 function resolveAdgenRoot() {
   const candidates = [];
   if (process.env[SIBLING_ENV]) candidates.push(process.env[SIBLING_ENV]);
+  // Post-graft: adgen lives at <backend>/adgen. Split-repo checkouts still
+  // need ../liquidretail_adgen; do not delete that candidate.
+  candidates.push(path.join(ROOT, SIBLING_MONOREPO));
   candidates.push(path.join(ROOT, SIBLING_DEFAULT));
   for (const c of candidates) {
     const resolved = path.resolve(c);
-    try {
-      if (fs.statSync(path.join(resolved, 'src', 'services')).isDirectory()) return resolved;
-    } catch (e) { /* next */ }
+    if (isRealAdgenCheckout(resolved)) return resolved;
+  }
+  return null;
+}
+
+function assertAdgenRoot() {
+  const resolved = resolveAdgenRoot();
+  if (resolved) return resolved;
+  if (siblingRequired()) {
+    throw new Error(
+      'sibling liquidretail_adgen is required in this layout (monorepo adgen/ ' +
+      'prefix, or BACKEND_REQUIRE_SIBLING=true) but resolveAdgenRoot returned null. ' +
+      `Checked ${SIBLING_ENV}, ${SIBLING_MONOREPO}/, and ${SIBLING_DEFAULT}.`
+    );
   }
   return null;
 }
@@ -256,29 +288,46 @@ check(`${OWNERSHIP_FLAG} predicate accepts only case-insensitive 'true'`, () => 
 });
 
 // ── E. the two repos' contract modules agree ───────────────────────────
+// Skip OUTSIDE check() when the sibling is absent. A skip inside check()
+// increments `pass` and the suite stays green. Monorepo /
+// BACKEND_REQUIRE_SIBLING already threw via assertAdgenRoot, so a null
+// here is a genuine split-repo miss.
+const adgenRoot = assertAdgenRoot();
+if (!adgenRoot) {
+  infos.push(
+    `sibling liquidretail_adgen not found (${SIBLING_ENV} or ${SIBLING_DEFAULT}) — cross-repo ` +
+    `contract-module comparison SKIPPED. Not a failure: a narrow CI clone genuinely cannot do it.`
+  );
+} else {
 check('contract module is identical in both repos', () => {
-  const adgenRoot = resolveAdgenRoot();
-  if (!adgenRoot) {
-    infos.push(
-      `sibling liquidretail_adgen not found (${SIBLING_ENV} or ${SIBLING_DEFAULT}) — cross-repo ` +
-      `contract-module comparison SKIPPED. Not a failure: a narrow CI clone genuinely cannot do it.`
-    );
-    return;
+  const mine = fs.readFileSync(path.join(ROOT, CONTRACT_MODULE_REL), 'utf8');
+  let other;
+  // Post-graft both copies live in this working tree. git show of
+  // origin/master:src/services/handoffContract.js from adgen/ walks up to
+  // THIS repo's .git and looks at backend trunk, which has no such path.
+  // The working-tree file is the grafted copy under review.
+  const localAdgen = path.join(adgenRoot, SIBLING_CONTRACT_REL);
+  if (isMonorepoLayout() && fs.existsSync(localAdgen)) {
+    other = fs.readFileSync(localAdgen, 'utf8');
+  } else {
+    // Split-repo: read adgen's copy from its REMOTE-TRACKING TRUNK, not its
+    // working tree. A sibling checkout is shared, long-lived, and routinely
+    // dirty or behind; reading it would let a stale tree answer "do the two
+    // copies agree?" and be confidently wrong.
+    other = readSiblingBlob(adgenRoot, SIBLING_CONTRACT_REL);
   }
-  // Read adgen's copy from its REMOTE-TRACKING TRUNK, not its working tree.
-  // A sibling checkout is shared, long-lived, and routinely dirty or behind;
-  // reading it would let a stale tree answer "do the two copies agree?" and be
-  // confidently wrong. adgen's own harnesses make the same choice about THIS
-  // repo, so the two must not disagree about the same file.
-  const other = readSiblingBlob(adgenRoot, SIBLING_CONTRACT_REL);
   if (other == null) {
+    if (siblingRequired()) {
+      throw new Error(
+        `${SIBLING_CONTRACT_REL} not readable in the adgen sibling — sibling is required in this layout, so this is a failure, not a skip.`
+      );
+    }
     infos.push(
       `${SIBLING_CONTRACT_REL} not readable in the adgen sibling at its trunk — the adgen half ` +
       `has not landed there yet. Comparison SKIPPED.`
     );
     return;
   }
-  const mine = fs.readFileSync(path.join(ROOT, CONTRACT_MODULE_REL), 'utf8');
   if (mine !== other) {
     throw new Error(
       `${CONTRACT_MODULE_REL} differs from adgen's ${SIBLING_CONTRACT_REL}. This module is the ` +
@@ -288,6 +337,7 @@ check('contract module is identical in both repos', () => {
   }
   infos.push('cross-repo: contract module is byte-identical in both repos');
 });
+}
 
 console.log(`verifyHandoffContract: ${describeContract()}`);
 for (const line of infos) console.log(`  info: ${line}`);

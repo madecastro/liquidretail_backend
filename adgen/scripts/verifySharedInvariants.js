@@ -69,12 +69,12 @@
 //
 const fs = require('fs');
 const path = require('path');
-const { resolveBackendRoot } = require('./lib/siblingBackend');
+const { assertBackendRoot } = require('./lib/siblingBackend');
 const { resolveBackendRef, readBackendBlob } = require('./lib/vendorDrift');
 
 const ROOT = path.join(__dirname, '..');
 const INVARIANTS_PATH = path.join(__dirname, 'shared-invariants.json');
-const BACKEND_ROOT = resolveBackendRoot(ROOT);
+const BACKEND_ROOT = assertBackendRoot(ROOT);
 const INVARIANTS_VERSION = 1;
 
 // ⚠️ The BACKEND side is read from a REMOTE-TRACKING REF, not from the
