@@ -10,7 +10,7 @@ const CatalogProduct = require('../../../src/models/CatalogProduct');
 const Brand = require('../../../src/models/Brand');
 const Media = require('../../../src/models/Media');
 const { sortCatalogMediasForReferenceStack } = require('../../../src/services/atlasVideoService');
-const { websiteBackgroundHex } = require('../../../utils/websiteBackground');
+const { websiteBackgroundHex } = require('../../../src/utils/websiteBackground');
 
 // Union of the live seed + reference-stack projections.
 const MEDIA_SELECT = '_id fileUrl fileType metadata createdAt source brandId';
