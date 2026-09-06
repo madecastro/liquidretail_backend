@@ -6,33 +6,66 @@ on:
   pull_request:
     branches: [main]
 
+# Never on.*.paths on a required workflow. Path filters live at job `if:`
+# so the aggregator named `ci` can still see skipped vs failure.
+
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
-  ci:
+  changes:
+    runs-on: ubuntu-latest
+    outputs:
+      backend: ${{ steps.filter.outputs.backend }}
+      adgen: ${{ steps.filter.outputs.adgen }}
+      shared: ${{ steps.filter.outputs.shared }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            backend:
+              - '**'
+              - '!adgen/**'
+            adgen:
+              - 'adgen/**'
+            shared:
+              - 'models/**'
+              - 'schemas/**'
+              - 'services/handoffContract.js'
+              - 'adgen/src/models/**'
+              - 'adgen/src/services/handoffContract.js'
+
+  backend:
+    needs: changes
+    # shared is READ. A PR that touches models/Ad.js (or the other shared
+    # paths) must run this job even if the naive backend/adgen split would
+    # have skipped the other side. Also run when either tree changed so
+    # an adgen-only PR still exercises backend handoff/parity against the
+    # grafted sibling.
+    if: >
+      needs.changes.outputs.backend == 'true' ||
+      needs.changes.outputs.adgen == 'true' ||
+      needs.changes.outputs.shared == 'true'
     runs-on: ubuntu-latest
     steps:
-      # fetch-depth: 0 is LOAD-BEARING, not a default worth trimming — same
-      # reasoning as liquidretail_adgen's CI (see that repo's ci.yml comment).
-      # Several harnesses here pin a baseline SHA and extract the pre-change
-      # source with `git show` to compare old vs new behaviour (grep for
-      # BASELINE_SHA / execFileSync('git', ['show', ...]) across scripts/verify*
-      # — currently verifyPostPilotBatch.js, verifyQuoteProvenanceStamp.js,
-      # verifyQuoteStageAware.js, verifyLifestylePreserve.js,
-      # verifyPmaxPromptOverlay.js). actions/checkout defaults to fetch-depth: 1
-      # (tip commit only), which makes `git show <pinned SHA>` fail with "fatal:
-      # invalid object name" and those harnesses exit 1 without running a single
-      # check — the same failure mode adgen already hit and fixed this way.
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+
+      - name: Ancestry gates for baseline SHA pins
+        run: |
+          set -euo pipefail
+          git cat-file -e 9531ae9f73d5ad9773bddff9c87d19890873ea59
+          git cat-file -e 16e64e211daa1e7864ba2261adc39783f09f51bc
 
       - uses: actions/setup-node@v4
         with:
           node-version: '20'
           cache: npm
+          cache-dependency-path: package-lock.json
 
       - run: npm ci
 
@@ -40,20 +73,135 @@ jobs:
 
       - run: npm test
 
-  # No Mongo service container and no boot smoke-test here (unlike adgen's
-  # ci.yml, which boots ADGEN_ROLE=api and curls /health). Two reasons:
-  #   1. scripts/runVerifySuite.js's own header confirms no verify* script
-  #      talks to a live DB or network — the 218-script suite above needs
-  #      neither Mongo nor real secrets to be a meaningful gate.
-  #   2. Booting this repo's actual index.js is a heavier lift than adgen's
-  #      single-route ADGEN_ROLE=api process: it wires Express sessions,
-  #      passport Google OAuth (GoogleStrategy throws synchronously without a
-  #      clientID/clientSecret), Cloudinary, and ~15 route modules, several of
-  #      which read provider keys (Atlas/OpenAI/Gemini) at require time. Doing
-  #      this safely needs its own investigation into which of those envs are
-  #      load-bearing at boot vs. only at request time, which is out of scope
-  #      for the CI gate this PR exists to add. Recommended as a fast-follow —
-  #      see the PR description / session notes for the specific risk items
-  #      found while scoping it (GOOGLE_CLIENT_ID has a public, non-secret
-  #      default in config/defaults.env; GOOGLE_CLIENT_SECRET and
-  #      SESSION_SECRET do not and would need CI-only dummy values).
+  adgen:
+    needs: changes
+    if: >
+      needs.changes.outputs.adgen == 'true' ||
+      needs.changes.outputs.backend == 'true' ||
+      needs.changes.outputs.shared == 'true'
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: adgen
+    env:
+      ADGEN_BACKEND_PATH: ${{ github.workspace }}
+      ADGEN_REQUIRE_SIBLING: 'true'
+    services:
+      mongo:
+        image: mongo:7
+        ports:
+          - 27017:27017
+        options: >-
+          --health-cmd "mongosh --eval 'db.adminCommand({ ping: 1 })'"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Ancestry gates for baseline SHA pins
+        working-directory: .
+        run: |
+          set -euo pipefail
+          git cat-file -e 9531ae9f73d5ad9773bddff9c87d19890873ea59
+          git cat-file -e 16e64e211daa1e7864ba2261adc39783f09f51bc
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+          cache-dependency-path: adgen/package-lock.json
+
+      - run: npm ci
+
+      - run: npm run lint
+
+      - run: npm test
+
+      - name: Boot smoke-test
+        env:
+          ADGEN_ROLE: api
+          MONGODB_URI: mongodb://localhost:27017/adgen_ci
+          PORT: '4000'
+        run: |
+          set -euo pipefail
+          LOG_FILE="${RUNNER_TEMP}/adgen-boot.log"
+          PID_FILE="${RUNNER_TEMP}/adgen.pid"
+
+          node src/entrypoint.js >"${LOG_FILE}" 2>&1 &
+          echo $! >"${PID_FILE}"
+          PID="$(cat "${PID_FILE}")"
+
+          cleanup() {
+            kill "${PID}" 2>/dev/null || true
+            wait "${PID}" 2>/dev/null || true
+          }
+          trap cleanup EXIT
+
+          ok=0
+          delay=1
+          elapsed=0
+          while [ "${elapsed}" -lt 20 ]; do
+            if curl -fsS --max-time 2 "http://localhost:4000/health"; then
+              ok=1
+              break
+            fi
+            sleep "${delay}"
+            elapsed=$((elapsed + delay))
+            if [ "${delay}" -lt 4 ]; then
+              delay=$((delay * 2))
+            fi
+          done
+
+          if [ "${ok}" -ne 1 ]; then
+            echo "Health check did not succeed within ~20s"
+            cat "${LOG_FILE}"
+            exit 1
+          fi
+
+      - name: Stop API
+        if: always()
+        run: |
+          PID_FILE="${RUNNER_TEMP}/adgen.pid"
+          if [ -f "${PID_FILE}" ]; then
+            kill "$(cat "${PID_FILE}")" 2>/dev/null || true
+          fi
+
+  # Required check id remains `ci`. Skipped is not success: any underlying
+  # job that is not success fails this aggregator, including skipped
+  # (the 2026-09-02 YAML treated skipped as green, so a models/Ad.js PR
+  # skipped adgen's parity/drift/handoff and the required check passed).
+  ci:
+    if: always()
+    needs: [changes, backend, adgen]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require every check job succeeded
+        run: |
+          set -euo pipefail
+          echo "changes=${{ needs.changes.result }}"
+          echo "backend=${{ needs.backend.result }}"
+          echo "adgen=${{ needs.adgen.result }}"
+          echo "shared=${{ needs.changes.outputs.shared }}"
+          fail=0
+          if [ "${{ needs.changes.result }}" = "failure" ]; then
+            echo "FAIL: changes job failed"
+            fail=1
+          fi
+          if [ "${{ needs.backend.result }}" != "success" ]; then
+            echo "FAIL: backend result is ${{ needs.backend.result }} (skipped is not success)"
+            fail=1
+          fi
+          if [ "${{ needs.adgen.result }}" != "success" ]; then
+            echo "FAIL: adgen result is ${{ needs.adgen.result }} (skipped is not success)"
+            fail=1
+          fi
+          if [ "${{ needs.changes.outputs.shared }}" = "true" ]; then
+            if [ "${{ needs.backend.result }}" != "success" ] || [ "${{ needs.adgen.result }}" != "success" ]; then
+              echo "FAIL: shared paths changed but both check jobs did not succeed"
+              fail=1
+            fi
+          fi
+          exit "$fail"
