@@ -1,8 +1,8 @@
 {
   "version": 2,
   "backendRef": "origin/main",
-  "backendHead": "982a554f017558527465c25c1995752eba13dc15",
-  "generatedAt": "2026-09-06T06:25:12.948Z",
+  "backendHead": "ec64a9a586ae8fd9736d6d44952e70c9afaaa09f",
+  "generatedAt": "2026-09-06T07:42:35.740Z",
   "files": {
     "models/Ad.js": {
       "backendHash": "812961d1ad30f5f87891dcace58fbe44ce5e07a5789f34b927fe8208dc2db966",
@@ -1422,6 +1422,12 @@
       "status": "synced",
       "portTo": null,
       "owedSince": null
+    },
+    "services/videoDurationPolicy.js": {
+      "backendHash": "5c69134cf475796eed6d55fa3232d847c1290ca5e0ee939d6b9ca1094dc97133",
+      "adgenHash": "5c69134cf475796eed6d55fa3232d847c1290ca5e0ee939d6b9ca1094dc97133",
+      "backendSha": "ec64a9a586ae8fd9736d6d44952e70c9afaaa09f",
+      "status": "synced"
     },
     "services/videoFrameService.js": {
       "backendHash": "de07c2f311c16c97b9fd08103a5fdf1165999ad2f9a9b8a2ba407cc5da95607c",
