@@ -5,15 +5,38 @@ Express + Mongoose backend for Reach Social's ad-generation product. Deploys to
 (`Emami-RS-Project/liquidretail`, trunk `master`) deployed to **Netlify**
 (`staging.reach-social.io`). Trunk here is `main`.
 
+## Monorepo (2026-09-06)
+
+`adgen/` is grafted into this repo (merge `e6393912`, PR #402) and is the
+**live renderer**. Four Render services (api / orchestrator / renderer /
+titler) build from Docker context `./adgen`. The GitHub repo
+`Emami-RS-Project/liquidretail_adgen` is archive/rollback-only and deploys
+nothing. Adgen architecture: `adgen/CLAUDE.md`.
+
+- Adgen suite: `cd adgen && npm test` (106 scripts). Root `npm test` is
+  the backend glob only — two invocations, forever.
+- **mongoose majors must not mix.** Adgen `src/db.js` fails closed unless
+  `require('mongoose/package.json').version` starts with `8`. Never `npm ci`
+  at the repo root then run adgen; never set `NODE_PATH` to the parent.
+  Always `npm ci` inside `adgen/`.
+- `verifyRequireGraph` freeze-N = **512** (`adgen/scripts/verifyRequireGraph.js`).
+- Sibling resolution: `adgen/scripts/lib/siblingBackend.js` now treats the
+  **parent as backend** (`path.join(repoRoot, '..')`).
+- CI: both jobs run on any `models/**` / `schemas/**` /
+  `services/handoffContract.js` (or the adgen copies) change. Aggregator
+  job `ci` treats skipped as failure.
+- Root `.claude/` hooks cover the grafted tree (git-repo-wide
+  `auditStrandedWork.js`). `adgen/.claude/` is inert.
+
 **Render ownership (2026-08-24, file default aligned 2026-09-03):**
 `ADGEN_RENDERER_ENABLED=true` in `config/defaults.env` — **adgen owns
 rendering in production.** `runRenderLoop` (`routes/ads.js:1715-1723`)
-flips the CampaignRun to `running` and returns; `liquidretail_adgen`'s
+flips the CampaignRun to `running` and returns; `adgen/`'s
 renderer claims `Ad.status='rendering'` rows and runs Atlas + Remotion.
 This repo still owns HTTP generate, expansion, mint, and claim. The
 in-process loop below this gate is the **fallback** for when the flag
 is not the string `'true'`. See `services/adgenBridge.js` and
-`../liquidretail_adgen/CLAUDE.md`. Write-up:
+`adgen/CLAUDE.md`. Write-up:
 `session.d/2026-09-03_overlay-skip-catalog-and-config-truth.md`. Older
 docs in `docs/PIPELINES.md` / `docs/ALERTING.md` / `docs/TITLING.md` that
 say the **web process** runs `runRenderLoop` describe that fallback (and
@@ -28,9 +51,9 @@ backend **mints and stamps** `Ad.videoTitleDirection` inside
 titling (`applyBenefitsPlacement`) — it does not own expansion and does not
 re-call the LLM. Backend still has the apply half on the in-process fallback
 (`brandScriptExecutor.js:2182-2188`). Adgen port of apply:
-`liquidretail_adgen@2c4b0b9`. The stamp is **not** in
+`adgen/` (grafted history `2c4b0b9`). The stamp is **not** in
 `services/handoffContract.js` `CONTRACT_FIELDS` (still v1.1.0) — it is a
-declared Mixed field on `models/Ad.js:591` that both repos' Mongoose
+declared Mixed field on `models/Ad.js:591` that both trees' Mongoose
 schemas must keep or the write/read is silently dropped. Full contract
 below, §00 *Video-title Director*.
 
@@ -175,7 +198,7 @@ decision, not an oversight; §7 is the safe slice that shipped instead.
 ### Stranded-work tooling (2026-08-31) — complements, does not replace, the five checks above
 
 Built after three real incidents in one night, across this repo and
-`liquidretail_adgen`: a branch sat **5 days** with 9 commits never pushed to
+what is now `adgen/`: a branch sat **5 days** with 9 commits never pushed to
 any remote, inside a nested worktree locked by a dead PID — nearly lost a
 live production bug fix, and would have gone undetected by the checks above
 too, since none of them look at worktree location or lock state. An agent
@@ -198,8 +221,9 @@ below. It also re-derives "commits on no remote" directly from git
 `findOrphanedBranches.js`'s `gh pr list`-based ORPHANED/PUSHED_NO_PR/STALE
 classification, not a duplicate of it: that tool answers "does a PR exist
 for this branch name," this one answers "does this branch/worktree exist
-safely anywhere outside this one disk," and it works identically in
-`liquidretail_adgen`, which has no `gh`-aware equivalent at all. Exit code 1
+safely anywhere outside this one disk," and it works identically against
+`adgen/` (same script at `adgen/scripts/auditStrandedWork.js`; adgen has no
+`gh`-aware equivalent). Exit code 1
 iff a genuinely at-risk category was found (unpushed-anywhere branch, dirty
 worktree, nested worktree); 0 for mere tidiness (prunable / merged-lingering)
 — `--json`, `--fast` (skips the full-branch-list merged-lingering scan —
@@ -245,13 +269,13 @@ manifest-style files). All ten properties are now pinned by
 fixture repo — added to `npm test`.
 
 **Duplication, deliberate:** `scripts/lib/gitAudit.js` plus these two
-callers are hand-synced, byte-identical, with `liquidretail_adgen`'s
-copies — NOT routed through that repo's `scripts/vendor-manifest.json`
+callers are hand-synced, byte-identical, with `adgen/scripts/` copies —
+NOT routed through adgen's `scripts/vendor-manifest.json`
 (there is no equivalent manifest here either). That system, where it exists,
 hashes backend↔adgen **production** modules under `models/`/`services/`
 against a debt-tracking grace period built for code that writes the shared
 Mongo collections; a git-ops utility with zero Mongo/business-logic coupling
-doesn't fit that shape. Diff the three files against the sibling repo before
+doesn't fit that shape. Diff the three files against `adgen/scripts/` before
 editing either copy.
 
 **Wired into the habit via the SessionEnd hook** in the `.claude/settings.json`
@@ -403,7 +427,7 @@ is unchanged at two.
    An already-visible benefits slot (Title Studio) is honoured and not
    overwritten. Invalid splice keeps the unresolved spec. **Live titling is
    adgen** — adgen ported `applyBenefitsPlacement` only
-   (`liquidretail_adgen@2c4b0b9`); it does not re-run the mint-time LLM.
+   (`adgen/`, grafted history `2c4b0b9`); it does not re-run the mint-time LLM.
    Pinned by `scripts/verifyVideoBenefitsDirector.js`.
    **What `safeArea` IS for, so nobody deletes it as dead:** it is live on the
    **static image** path — `staticAdIntents.computeSurface` turns it into the
