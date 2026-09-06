@@ -646,6 +646,11 @@ const adSchema = new mongoose.Schema({
   // Null when vision QC is off (or the ad predates this field). Gate-off
   // now stamps a disabled verdict rather than leaving this null.
   visionQc:           { type: mongoose.Schema.Types.Mixed, default: null },
+  // Dense per-video inspector + documentation record (Loop 1/2). Sibling to
+  // basePlate and visionQc. Written by adgen adVisionQcService.runVideoPostRenderQc
+  // in the SAME $set as visionQc. Declared here so a backend save() cannot
+  // silently strip it (Mongoose strict mode). Shape is adgen-owned.
+  videoAnalysis:      { type: mongoose.Schema.Types.Mixed, default: null },
   // Per-stage wall time in ms for THIS render, whichever pipeline ran:
   // { deriveMs, renderMs, uploadMs }. Answers "why is this ad slow" without a
   // log-diving session — direct_image's renderMs is the Atlas submit+poll

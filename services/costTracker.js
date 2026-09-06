@@ -69,6 +69,11 @@ const MODEL_RATES = Object.freeze({
   // the audit report — just don't chase the surcharge, it cannot be the cause.
   'google/gemini-2.5-flash':     { input: 0.30,  output: 2.50,  cachedInput: 0.03 },
   'google/gemini-2.5-pro':       { input: 1.25,  output: 10.00, cachedInput: 0.125 },
+  // Dense video inspector/docs primary (adgen atlasModelMap 'ad-vision-qc'
+  // chain head). Live Atlas catalog 2026-09-06: input $1.50 / output $9 /
+  // cache $0.15. Declared here so a CostLog row written from either service
+  // ledgers dollars instead of unknown.
+  'google/gemini-3.5-flash':     { input: 1.50,  output: 9.00,  cachedInput: 0.15 },
   // Director role as of 2026-07-31. Rates read from the live Atlas catalog
   // (price.actual input_price/output_price), not the vendor list price. Without an
   // entry here every director call ledgers $0 — the role would be invisible in
