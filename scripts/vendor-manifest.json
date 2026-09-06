@@ -1,17 +1,15 @@
 {
   "version": 2,
   "backendRef": "origin/main",
-  "backendHead": "326fb2705dad948c41a1570d5ea42e83fcc98763",
-  "generatedAt": "2026-09-05T22:33:28.452Z",
+  "backendHead": "802f662e1e16df3c5dc946744716b9f909cc2633",
+  "generatedAt": "2026-09-06T01:58:04.705Z",
   "files": {
     "models/Ad.js": {
       "backendHash": "812961d1ad30f5f87891dcace58fbe44ce5e07a5789f34b927fe8208dc2db966",
-      "adgenHash": "1e60a8bcc3908b1fea99698b34bc6cd3e5e4654a7aac30662eedd8577175d582",
+      "adgenHash": "4848e0b1c3b665c15ecdf7ae2f23951271b688e82ba35ec666adbbd3c29d64cf",
       "backendSha": "fba815887c3240d617c9c3a1bbfd6daecd791215",
       "status": "fork",
-      "reason": "declare-only schema defense: copied backend qcOverridden/qcOverriddenAt/qcOverriddenBy/qcOverrideReason (writer is backend POST /:id/override-qc; adgen metaAdsPushService ad.save() would strip them). Remaining diffs are legitimate ongoing fork (adgen-only titling/QC comments and regenerate-consumer claim comments).",
-      "portTo": null,
-      "owedSince": null
+      "reason": "declare-only schema defense: copied backend qcOverridden/qcOverriddenAt/qcOverriddenBy/qcOverrideReason (writer is backend POST /:id/override-qc; adgen metaAdsPushService ad.save() would strip them). Remaining diffs are legitimate ongoing fork (adgen-only titling/QC comments and regenerate-consumer claim comments). Latest change is comment-only, no functional diff: the veoReferenceImages field comment now notes a Gemini resume backfill (video-provider-collapse PR 0-3, F2 fix) can re-derive this field from the ad's current reference state rather than the exact stack originally submitted, so callers (e.g. renderer.js's vision-QC re-read) should not assume byte-for-byte exactness on a resumed ad. Nothing here is owed to backend — comment only."
     },
     "models/Advertiser.js": {
       "backendHash": "0a7e1bb9ca5e0fbbfc6972f9c96d87f839b0a86175831b5446ae27095137ba3f",
@@ -735,10 +733,10 @@
     },
     "services/atlasImageService.js": {
       "backendHash": "b24b691e1c18843ca9c73d3ade7f686a3c9f354833be39b7ccdf07ae733318ca",
-      "adgenHash": "ddf91227da01f956b6051211f667b828c4b115e77162cfaa9cdbc57560e2c7e9",
+      "adgenHash": "140a13461f65c7f494389db5fbbeee23bb255b6266afcdeda5033378c2ac2a14",
       "backendSha": "b557b492ad1373340831316bb21610c9bb6b1557",
       "status": "unported",
-      "reason": "Backend origin/main advanced to abf7e0c2/#358 while this PR was in progress. Re-diffed: comment-only (notes services/openaiImageService.js, an unrelated dead mask-inpainting fallback, was deleted as confirmed-dead code). Does not touch the resume-from-receipt gap this entry tracks. Prior unported reason (PR #74/945f8cb: shouldResumeImageAttempt + submitAndPollWithResume, confirmed absent from backend, 0 vs 7 occurrences) still holds and owedSince carries forward.",
+      "reason": "Debt substance unchanged from the 2026-08-27 look (backend still has no resume-from-receipt guard on the static/image charge point). Re-shaped by video-provider-collapse PR 0-3: the local shouldResumeImageAttempt predicate (duplicated from atlasVideoService) now delegates to the single shared spendReceipt.shouldResumeAttempt() instead of re-implementing the 3-clause allowResume/attempt/existingPredictionId check inline. Wrapper, not a copy. owedSince carries forward — this consolidation does not resolve the port; backend still owes an equivalent resume guard, now against spendReceipt.shouldResumeAttempt's shape rather than the old local mirror.",
       "portTo": "backend",
       "owedSince": "2026-08-27T10:28:36.278Z"
     },
@@ -761,12 +759,10 @@
     },
     "services/atlasVideoService.js": {
       "backendHash": "321f237d23bbedbd4dbc89948be20ce612703db7b7964ab4b1da5ab24faff1b9",
-      "adgenHash": "1b276bfc051911c340b209c21f42ace2f7553ac30943d7c8a33934d810cd852a",
+      "adgenHash": "4e5e1351ee418a1fb8b31b25a43e297d4bc8042176a34bcb3a88e05bac7f331e",
       "backendSha": "295541f797f9b0effb719e21e4ac07bf26cc784a",
-      "status": "unported",
-      "reason": "PARTIALLY RESOLVED - prior threads stand. THREAD 1 CLOSED. THREAD 2 CLOSED. THREAD 3 (MAX_POLL_MS 900000 vs backend 600000) STILL OWED, unchanged. THREAD 4 pad-at-source-scale / REFRAME_PASSTHROUGH is adgen-only, do not port. THREADS 5/6 confirmed unchanged/now-committed on backend origin/main (ranking/raw-refs and the seedHasText strip landed via 45f5e3c0; REFRAME_PASSTHROUGH_BRAND_IDS remains adgen-only by design). THREAD 7 (2026-09-04): added an optional seed passthrough (buildSubmissionBody/submitGeneration, gemini-omni paramShape only) for the RPD test harness repeatable-comparison feature (scripts/rpd, spec.rngSeed) - additive/backward-compatible, no existing caller passes it. Adgen-only on purpose, do NOT port: the harness that uses it now lives only in this repo, and backends copy of this file is the non-live fallback path with no need for it. THREAD 7b (2026-09-04): re-attested after trimming the submitGeneration export comment from 6 lines to 1 - the longer comment pushed releaseAllActiveReframeClaims past verifyReframeClaimShutdown.js check A6s hardcoded 5000-char lookahead window (CI caught this, harness now passes 14/14). No behavior change, hash-only re-look. RE-ATTESTED again 2026-09-04 against backend origin/main HEAD 295541f7 (previously be56edfd): new backend commit 295541f7 hand-syncs adgens warmLayoutInputForVideoAd byte-for-byte (adgen->backend direction, closes a gap, creates none). owedSince carried at 2026-08-27 (THREAD 3 is the still-real debt).",
-      "portTo": "backend",
-      "owedSince": "2026-08-27T16:49:12.296Z"
+      "status": "fork",
+      "reason": "adgen-owned live-path change for video-provider collapse PR 0-3: one shouldResumeAttempt in spendReceipt (called from atlas video, gemini video, atlas image); renderer mint goes through videoRouter.generateForAd only; Vertex arm throws until receipt+CostLog+maxRedirects:0. Backend copies are dormant and slated for removal — nothing is owed to backend for this PR. Remaining known fork (not this PR, not a new debt): THREAD 3 MAX_POLL_MS 900000 vs backend 600000 still differs. Re-attested after rebase onto origin/master 9d57123/cf7a904 (vendor-manifest reconciliation only, no further code delta on this file)."
     },
     "services/basePlateCropService.js": {
       "backendHash": "03d13d046489c24734fc54a97edb158ed9abc4f7ad03e2ec4a84c8b0ad3b6aeb",
@@ -1318,12 +1314,10 @@
     },
     "services/spendReceipt.js": {
       "backendHash": "1fb921cb24e9f159fb268909b495f185b73b8d9d4548aaec5fed6160cc40bd9a",
-      "adgenHash": "41a857ecdee5e887c184191e3b7e1787841fcba0aebf4cd894370806b51bac46",
+      "adgenHash": "7c0b0d739a026dfd7c2538adc39d528e336881afd26842871b8e820a1315c68d",
       "backendSha": "b5a42717c4a15f800224e374bcbe11cae7046398",
       "status": "fork",
-      "reason": "STATUS LABEL WAS WRONG, fixed in this pass: prior entry said status=unused ('only reached from unused spendGuard') — VERIFIED FALSE by grep. This file is live-wired into money-critical code: renderer.js requires and calls resolveUnsettledTimeoutAction (:1944,1959, the video-master-timeout-livelock fix, PR #82) and receiptFree (:2744,2746, the requeue-guard composer), and bootRecoveryService.js requires and uses HAS_RECEIPT (:96,194, the boot-recovery selector). Re-diffed fresh: adgen added resolveUnsettledTimeoutAction (the hold/terminal/release decision for an unsettled poll timeout against adgen's OWN atomic multi-worker claim) since the last look; backend separately added adSpendReceipts/receiptId (2026-08-27, a READ-SIDE helper so routes/ads.js projectAd and routes/catalog.js's ads-detail allowlist expose the receipt over HTTP without disagreeing on field shape). Neither needs porting to the other: adgen has no HTTP API (GET /health only, per CLAUDE.md) so has no consumer for the read-side helper; backend's OWN unsettled-timeout handling (routes/ads.js:3266, err.unsettledAtTimeout) is structurally different from adgen's — it never releases the claim or flips status in the first place, so it does not obviously have the release-then-immediate-reclaim race PR #82 fixed on adgen's atomic-claim architecture, though a full audit of backend's own claim semantics is out of scope for this reconcile pass and is NOT asserted safe with confidence — flagging as a possible follow-up rather than a verified non-issue. Recorded as fork (not unported): porting adgen's hold/cap state machine into backend's differently-shaped, currently-inert (ADGEN_RENDERER_ENABLED=true in prod) render loop is real design work, not a mechanical port.",
-      "portTo": null,
-      "owedSince": null
+      "reason": "Prior fork reason (live-wiring of resolveUnsettledTimeoutAction/receiptFree/HAS_RECEIPT into renderer.js and bootRecoveryService.js) still holds, nothing in it changed. New in video-provider-collapse PR 0-3: this file now also exports shouldResumeAttempt(), the single 3-clause resume predicate (allowResume===true && attempt===1 && existingPredictionId non-empty string) that atlasVideoService.js, geminiVideoService.js, and atlasImageService.js (via its shouldResumeImageAttempt wrapper) all now call instead of each keeping its own copy. Chosen to live here rather than a new module because this file already owns the receipt-aware resume/requeue predicates for this codebase."
     },
     "services/staleness.js": {
       "backendHash": "136732eeb99b3d46f9d39910319803759bd45fd58d6eb810ec1492a41c8a1aa6",
@@ -1476,10 +1470,10 @@
     },
     "services/videoRouter.js": {
       "backendHash": "1781950b14280cda1b8ec2db2f5ae446e4fb78899e4db79d293b55b3a1ae3483",
-      "adgenHash": "0ad484e247697e2afcc7f1618ad3de8b87c99c423a12024feb12acc372e79206",
+      "adgenHash": "fb00e7bd22a1d9541d6bf18ac98bc6113931b52844e5bdf6dc5bc8f6560734ba",
       "backendSha": "295541f797f9b0effb719e21e4ac07bf26cc784a",
       "status": "unported",
-      "reason": "Gemini branch (geminiVideoService require + else-if arm, incl. modelOverride threading via resolveGeminiModel and the no-prompt-argument fix) stays a legitimate adgen-only fork -- backend has no geminiVideoService.js. But two NEW pieces since the 2026-09-03 PR #110 reason are real backend debt: (A) MONEY -- generateForAd's new allowResume=true param, threaded into the atlas-branch atlasVideoService.generateForAd call, is the plumbing for the shouldResumeAttempt/resume-from-receipt guard (PR #40 / commit 2f99218) that vendor-manifest.json already tracks as unported/owed-to-backend on services/atlasVideoService.js and services/adRegenerateService.js -- backend's committed videoRouter.js atlas-branch call and adRegenerateService.js call site (git show origin/main) both still call generateForAd with zero allowResume, so this router's plumbing will also be missing once those sibling ports land. (B) SAFETY -- backend's committed generateForAd still falls through any unrecognized VIDEO_PROVIDER value to the deprecated, billable Vertex/aiVideoReferenceService path via a bare else; adgen now requires provider===vertex explicitly and throws fail-closed on anything else (comment: previously this silently generated on a third provider believing a cutover had happened). That fail-closed restructuring is independent of Gemini and backend should adopt it regardless of Gemini-port timing.",
+      "reason": "Both debts from the prior look still stand, unresolved by this PR: (A) backend's atlas-branch generateForAd call and adRegenerateService.js still pass zero allowResume — tracked on atlasVideoService.js/adRegenerateService.js, unaffected here. (B) backend's own router still falls through an unrecognized VIDEO_PROVIDER to the deprecated Vertex path via a bare else. Video-provider-collapse PR 0-3 makes adgen's OWN asymmetry with backend WIDER, not narrower: the vertex arm here no longer executes even when explicitly named — it now unconditionally throws until receipt stamp + CostLog + maxRedirects:0 exist on that path (aiVideoReferenceService is required only to keep its boot IIFE running; DORMANT-KEEP). Backend's vertex arm still executes a real (deprecated, under-guarded) submit when named. owedSince carries forward — this is the same still-open debt, now with a larger gap to close.",
       "portTo": "backend",
       "owedSince": "2026-09-05T00:18:50.152Z"
     },

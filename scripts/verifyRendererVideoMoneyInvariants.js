@@ -23,9 +23,9 @@
 // would need a full NODE_PATH + mongoose install just to read one pure
 // function's return value):
 //
-//   renderVideo(ad) has exactly ONE call to atlasVideo.generateForAd in the
-//   whole file. This harness proves that call is STRUCTURALLY UNREACHABLE
-//   whenever `resolveDeriveFromMaster(ad)` is truthy, by showing:
+//   renderVideo(ad) has exactly ONE billable submit: videoRouter.generateForAd
+//   (the only provider switch). This harness proves that call is STRUCTURALLY
+//   UNREACHABLE whenever `resolveDeriveFromMaster(ad)` is truthy, by showing:
 //     a. `if (deriveFromFmt) { ... }` is the FIRST statement in renderVideo
 //        after computing deriveFromFmt.
 //     b. EVERY control-flow path inside that if-block ends in `throw` or
@@ -168,87 +168,49 @@ check('A5 the not-ready-yet branch requeues and returns — it does not submit e
 });
 
 // ═════════════════════════════════════════════════════════════════════════
-// B — the billable submit call site: there is exactly one, and it sits
-// textually AFTER the derive if-block's closing brace.
+// B — the billable submit call site: ZERO provider-named generateForAd
+// calls in renderer.js, exactly one videoRouter.generateForAd AFTER the
+// derive if-block. The router is the only switch; its vertex arm throws.
 // ═════════════════════════════════════════════════════════════════════════
 const ifBlockEndIdx = fnBody.text.indexOf(ifBlock.text) + ifBlock.text.length;
 const afterIfBlock = fnBody.text.slice(ifBlockEndIdx);
 
-// ── RETARGETED 2026-09-03 for the provider seam. STRICTER, NOT LOOSER ─────
-//
-// There are now TWO billable submit call sites — atlasVideo.generateForAd and
-// geminiVideo.generateForAd — because production is cutting over to the direct
-// Gemini API. B1 used to assert "exactly one call in the file", which is the
-// right shape for one provider and the WRONG shape for two: it would force
-// whoever adds a provider to delete the check rather than extend it.
-//
-// So the invariant is restated at the level it actually lives: EVERY billable
-// submit, whichever provider, must sit after the derive gate and outside it —
-// and the providers must be MUTUALLY EXCLUSIVE BRANCHES, never a fallback
-// chain. A fallback would mean a failed Atlas submit silently buys a Gemini
-// one, i.e. two masters for one ad. That is a new failure mode this seam
-// could have introduced and B3 below now rules out explicitly.
-//
-// This is strictly more than the old form proved, because it additionally
-// pins that an UNRECOGNISED provider throws instead of falling through to a
-// billable default. videoRouter's own dispatch sends anything-not-'atlas' to
-// the deprecated Vertex path, so a typo (VIDEO_PROVIDER=gemeni) would
-// otherwise generate on a third provider entirely.
-const SUBMIT_RE = /(?:atlasVideo|geminiVideo)\.generateForAd\(/g;
+const PROVIDER_NAMED_RE = /(?:atlasVideo|geminiVideo|aiVideoReferenceService)\.generateForAd\(/g;
+const ROUTER_SUBMIT_RE = /videoRouter\.generateForAd\(/g;
 
-check('B1 [INVARIANT 1] every billable submit call site is accounted for', () => {
-  const all = [...SRC.matchAll(SUBMIT_RE)];
-  assert.strictEqual(all.length, 2,
-    `expected exactly 2 provider submit call sites (atlas + gemini), found ${all.length} — ` +
-    'a new one needs its own derive-gate proof or it can bill a derive-only row');
-  assert.strictEqual((SRC.match(/atlasVideo\.generateForAd\(/g) || []).length, 1);
-  assert.strictEqual((SRC.match(/geminiVideo\.generateForAd\(/g) || []).length, 1);
+check('B1 [INVARIANT 1] renderer.js has ZERO provider-named generateForAd calls and exactly one videoRouter.generateForAd', () => {
+  const named = [...SRC.matchAll(PROVIDER_NAMED_RE)];
+  assert.strictEqual(named.length, 0,
+    `expected 0 provider-named generateForAd calls in renderer.js, found ${named.length}: ` +
+    named.map((m) => m[0]).join(', '));
+  const router = [...SRC.matchAll(ROUTER_SUBMIT_RE)];
+  assert.strictEqual(router.length, 1,
+    `expected exactly 1 videoRouter.generateForAd call, found ${router.length} — ` +
+    'a second one needs its own derive-gate proof or it can bill a derive-only row');
 });
 
-check('B2 [INVARIANT 1] BOTH call sites sit AFTER (never inside) the derive if-block', () => {
-  for (const p of ['atlasVideo', 'geminiVideo']) {
-    assert.ok(new RegExp(`${p}\\.generateForAd\\(`).test(afterIfBlock),
-      `${p}.generateForAd must be reachable only via the fall-through path after the derive gate`);
-    assert.ok(!new RegExp(`${p}\\.generateForAd\\(`).test(ifBlock.text),
-      `${p}.generateForAd must not appear inside the derive if-block itself`);
-  }
+check('B2 [INVARIANT 1] the videoRouter.generateForAd call sits AFTER (never inside) the derive if-block', () => {
+  assert.ok(ROUTER_SUBMIT_RE.test(afterIfBlock),
+    'videoRouter.generateForAd must be reachable only via the fall-through path after the derive gate');
+  assert.ok(!/videoRouter\.generateForAd\(/.test(ifBlock.text),
+    'videoRouter.generateForAd must not appear inside the derive if-block itself');
 });
 
-check('B3 the providers are EXCLUSIVE branches, not a fallback chain, and a skip still throws', () => {
-  const seamIdx = afterIfBlock.search(SUBMIT_RE);
-  const seam = afterIfBlock.slice(seamIdx, seamIdx + 4500);
+check('B3 the mint call passes allowResume:true, no prompt:/images:, and a skip still throws', () => {
+  const seamIdx = afterIfBlock.search(/videoRouter\.generateForAd\(/);
+  assert.ok(seamIdx >= 0, 'videoRouter.generateForAd not found after the derive gate');
+  const openParen = afterIfBlock.indexOf('(', seamIdx);
+  const args = balanced(afterIfBlock, openParen, '(', ')');
+  assert.ok(args, 'could not balance videoRouter.generateForAd(...) args');
+  const seam = afterIfBlock.slice(seamIdx, seamIdx + 2500);
 
-  // EXCLUSIVITY. The gemini call must be in an `else if`, so a completed
-  // Atlas submit can never be followed by a Gemini one for the same ad.
-  assert.match(seam, /\}\s*else if \(videoProvider === 'gemini'\)/,
-    'the gemini submit must be an else-if branch of the atlas one — a sequential second call would buy two masters for one ad');
+  assert.match(args.text, /allowResume:\s*true/,
+    'mint must pass allowResume: true explicitly');
+  assert.ok(!/\bprompt\s*:/.test(args.text),
+    'renderer must not pass prompt: — the provider owns prompt construction');
+  assert.ok(!/\bimages\s*:/.test(args.text),
+    'renderer must not pass images: — the provider owns reference assembly');
 
-  // FAIL CLOSED. An unknown provider throws before any submit.
-  // Brace-match the `else {` that follows the gemini `else if` — a `{0,200}`
-  // negative window missed `require('./atlasVideoService').generateForAd(...)`
-  // sitting 220 chars into the arm (MUT8b).
-  const elseIfGemini = /else if \(videoProvider === 'gemini'\)\s*\{/.exec(afterIfBlock);
-  assert.ok(elseIfGemini, 'gemini else-if branch not found after the derive gate');
-  const geminiBrace = afterIfBlock.indexOf('{', elseIfGemini.index + elseIfGemini[0].length - 1);
-  const geminiBlock = balanced(afterIfBlock, geminiBrace, '{', '}');
-  assert.ok(geminiBlock, 'gemini else-if unterminated');
-  const afterGemini = afterIfBlock.slice(geminiBlock.endIdx);
-  const elseMatch = /^\s*else\s*\{/.exec(afterGemini);
-  assert.ok(elseMatch, 'unknown-provider else arm not found after the gemini branch');
-  const elseBrace = afterGemini.indexOf('{', elseMatch.index);
-  const elseBlock = balanced(afterGemini, elseBrace, '{', '}');
-  assert.ok(elseBlock, 'unknown-provider else arm unterminated');
-  const elseCode = stripJsComments(elseBlock.text);
-  assert.match(elseCode, /throw new Error\(/,
-    'an unrecognised VIDEO_PROVIDER must throw, never fall through to a billable default');
-  assert.ok(!FORBIDDEN_SUBMIT_RE.test(elseCode),
-    'the else arm must not submit to anything (including require(...).generateForAd / submitGeneration)');
-
-  // A skipped result must not be treated as success AND must not fall
-  // through to a second provider. generateForAd holds the claim through
-  // its internal lease backoff; after that budget ANY skip — including
-  // GEMINI_LEASE_EXHAUSTED — throws. A renderer-level requeue that
-  // persisted deriveWaitAttempts is what collided with strandedRunSweeper.
   assert.match(seam, /if \(veoResult\.skipped\) \{/,
     'a skipped submission must be inspected, not treated as success');
   assert.match(seam, /throw new Error\(veoResult\.reason/,
@@ -256,10 +218,26 @@ check('B3 the providers are EXCLUSIVE branches, not a fallback chain, and a skip
   assert.ok(!/requeueGeminiLeaseForRetry/.test(seam),
     'a Gemini cap-miss must not requeue at the renderer — that persisted a sweeper-bound counter');
 
-  // No second submit-shaped call after the seam on either provider.
-  const tail = afterIfBlock.slice(seamIdx).replace(SUBMIT_RE, '');
-  const second = tail.match(/(?:atlasVideo|geminiVideo)\.\w*(generate|submit)\w*\(/i);
-  assert.ok(!second, `found a second submit-shaped call after the seam: ${second && second[0]}`);
+  const tail = afterIfBlock.slice(seamIdx).replace(/videoRouter\.generateForAd\(/, '');
+  const second = tail.match(/videoRouter\.generateForAd\(/);
+  assert.ok(!second, 'found a second videoRouter.generateForAd after the seam');
+});
+
+const ROUTER_SRC = fs.readFileSync(path.join(__dirname, '..', 'src', 'services', 'videoRouter.js'), 'utf8');
+
+check('B4 [F2/F3] videoRouter vertex arm throws; it does not call generateForAd(', () => {
+  const vertexIf = /else if\s*\(\s*provider\s*===\s*['"]vertex['"]\s*\)\s*\{/.exec(ROUTER_SRC);
+  assert.ok(vertexIf, 'videoRouter generateForAd has no `else if (provider === \'vertex\')` arm');
+  const braceIdx = ROUTER_SRC.indexOf('{', vertexIf.index + vertexIf[0].length - 1);
+  const arm = balanced(ROUTER_SRC, braceIdx, '{', '}');
+  assert.ok(arm, 'vertex arm unterminated');
+  const armCode = stripJsComments(arm.text);
+  assert.match(armCode, /throw new Error\(/,
+    'vertex arm must throw (quarantined until receipt stamp + CostLog + maxRedirects:0)');
+  assert.ok(!/generateForAd\s*\(/.test(armCode),
+    'vertex arm must not call generateForAd( — that is the regen Vertex hole');
+  assert.match(arm.text, /quarantined|receipt stamp|CostLog|maxRedirects/,
+    'vertex throw must name the missing money guards');
 });
 
 // ── report ───────────────────────────────────────────────────────────────
@@ -278,12 +256,13 @@ console.log(`✅ verifyRendererVideoMoneyInvariants: ${total}/${total} checks pa
  *      path (letting control fall through to the master path)
  *        → A2 fails
  *   2. Replace the "sibling master failed" throw with a fallback call to
- *      atlasVideo.generateForAd                          → A3/A4/B1 fail
- *   3. Add a second call to atlasVideo.generateForAd anywhere in the file
- *      (e.g. a "retry via a different provider" branch)  → B1 fails
- *   4. Move the generateForAd call INSIDE the derive if-block
+ *      videoRouter.generateForAd                         → A3/A4/B1 fail
+ *   3. Add a provider-named generateForAd (atlasVideo/geminiVideo) to
+ *      renderer.js                                       → B1 fails
+ *   4. Move videoRouter.generateForAd INSIDE the derive if-block
  *        → B2 fails
- *   5. Drop the `if (veoResult.skipped)` guard on the master path, or
- *      add a second submit call after it, or treat a Gemini cap-miss
- *      as a throw (status:failed) / as success                → B3 fails
+ *   5. Drop the `if (veoResult.skipped)` guard on the master path
+ *        → B3 fails
+ *   6. Restore aiVideoReferenceService.generateForAd in the vertex arm
+ *        → B4 fails
  */

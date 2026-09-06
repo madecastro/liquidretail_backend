@@ -105,8 +105,16 @@ console.log('A. the provider owns references and prompt — a caller cannot forg
   // to pass `prompt: storyboard?.prompt || ad.veoPrompt`, which reduced to
   // ad.veoPrompt (storyboard is always null on gemini) and bypassed the
   // isResuming gate. Dropped so the provider owns precedence on every path.
-  check('A9 renderer gemini call does not pass a prompt argument',
-    !/geminiVideo\.generateForAd\(\{[^}]*\bprompt:/.test(RENDERER));
+  check('A9 renderer mint does not pass a prompt argument',
+    !/generateForAd\(\{[^}]*\bprompt:/.test(RENDERER));
+  check('A9b renderer mint does not pass an images argument',
+    !/generateForAd\(\{[^}]*\bimages:/.test(RENDERER));
+  check('A9c renderer mint goes through videoRouter.generateForAd, not a provider-named call',
+    /videoRouter\.generateForAd\(/.test(RENDERER) &&
+    !/(?:atlasVideo|geminiVideo)\.generateForAd\(/.test(RENDERER));
+  check('A9d videoRouter gemini branch does not pass prompt: or images:',
+    !/geminiVideoService\.generateForAd\(\{[\s\S]{0,800}\bprompt\s*:/.test(ROUTER) &&
+    !/geminiVideoService\.generateForAd\(\{[\s\S]{0,800}\bimages\s*:/.test(ROUTER));
 }
 
 // ── B. RAW IMAGES ONLY — the owner directive, asserted ───────────────────

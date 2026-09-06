@@ -176,4 +176,51 @@ function resolveUnsettledTimeoutAction({ receipt, attempts, cap, freePollerEnabl
   return { action: 'release', reason: 'no-receipt', ...base };
 }
 
-module.exports = { RECEIPT_FREE, HAS_RECEIPT, receiptFree, resolveUnsettledTimeoutAction };
+/**
+ * MAY WE SKIP THE SUBMIT AND RESUME INSTEAD?
+ *
+ * One 3-clause predicate for Atlas video, Gemini video, and Atlas image.
+ * Lives here (not a new spendResume.js) because this module already owns
+ * the receipt-aware resume/requeue predicates; splitting the same money
+ * rule across two files is how the three copies drifted (F5).
+ *
+ * True only when ALL THREE hold (strict equality, fail-closed):
+ *   allowResume === true
+ *   attempt === 1
+ *   existingPredictionId is a non-empty string
+ *
+ * WHY attempt === 1. A receipt can only mean "the FIRST attempt of THIS
+ * call already ran and something crashed after it, before this call
+ * returned". Every later attempt (2+) is this same call's own retry
+ * loop, which has already decided the prior attempt is safe to resubmit
+ * (Atlas mayRetryAfterFailure) or is a new billed submit. Gemini has no
+ * billed-retry ladder today — callers pass attempt: 1 until one exists.
+ * Extracting the clause BEFORE adding retries is what stops attempt 2
+ * from silently resuming the first receipt.
+ *
+ * WHY allowResume is the caller's choice. Default true for mint
+ * (renderer.js). Explicit false for regenerate (adRegenerateService) —
+ * a regenerate is an operator-requested NEW generation on the same Ad
+ * doc, which never clears the previous receipt. A blind resume there
+ * would serve the OLD asset back. Image renderDirectImage defaults
+ * false (the inverse of video) — mint opts in, regen stays out. Do not
+ * invert those defaults here.
+ *
+ * Strict `attempt === 1`, not Number(attempt) === 1: failing closed on
+ * a numeric string is the safer choice for a gate that decides whether
+ * to spend real money.
+ */
+function shouldResumeAttempt({ allowResume, attempt, existingPredictionId } = {}) {
+  return allowResume === true
+    && attempt === 1
+    && typeof existingPredictionId === 'string'
+    && existingPredictionId.length > 0;
+}
+
+module.exports = {
+  RECEIPT_FREE,
+  HAS_RECEIPT,
+  receiptFree,
+  resolveUnsettledTimeoutAction,
+  shouldResumeAttempt
+};

@@ -9,11 +9,10 @@
 // strip, else GEMINI_API_KEY. Unset or empty video key is a true no-op —
 // same credential as today until a distinct key is supplied.
 //
-// There is no production Gemini video path yet (production video is Atlas
-// `google/gemini-omni-flash/image-to-video-developer`). This helper exists
-// so the forthcoming geminiVideoService consumes it rather than
-// re-inventing fallback + logging. Not required at boot on purpose: wiring
-// it into config.js would change renderer log output with no video caller.
+// Production adgen-renderer overrides VIDEO_PROVIDER=gemini (repo/file
+// default remains atlas). This helper is the live key slot for
+// geminiVideoService. Not required at renderer boot: a missing key fails
+// at submit (GEMINI_AUTH_MISSING), not at start.
 //
 // NEVER log, throw, Slack, or write the key itself into an artifact.
 // Fingerprint is the last 4 characters of the trimmed key (operators can

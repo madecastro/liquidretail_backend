@@ -707,6 +707,18 @@ function findRealMatches(text, regex) {
 
 console.log('\n── C: caller sites ──');
 
+check('C0 shouldResumeImageAttempt calls spendReceipt.shouldResumeAttempt (not an inline && copy)', () => {
+  const src = stripComments(fs.readFileSync(atlasImagePath, 'utf8'));
+  const body = fnBody(src, 'function shouldResumeImageAttempt(');
+  assert.ok(body, 'shouldResumeImageAttempt not found');
+  assert.match(src, /require\(['"]\.\/spendReceipt['"]\)/,
+    'atlasImageService must require ./spendReceipt');
+  assert.ok(/shouldResumeAttempt\s*\(/.test(body),
+    'shouldResumeImageAttempt must call shouldResumeAttempt(');
+  assert.ok(!/allowResume\s*===\s*true\s*&&/.test(body),
+    'shouldResumeImageAttempt still inlines the 3-clause && — that is the copy that drifted');
+});
+
 check('C1 renderer.js (renderStatic, the mint-time path) passes allowResume: true explicitly and sources existingPredictionId from ad.imageGeneration.predictionId', () => {
   const src = stripComments(fs.readFileSync(path.join(ROOT, 'src/services/renderer.js'), 'utf8'));
   const body = fnBody(src, 'async function renderStatic(');

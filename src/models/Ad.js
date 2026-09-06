@@ -512,7 +512,7 @@ const adSchema = new mongoose.Schema({
   // this; anything that rewrites veoVideoUrl can leave this stale without harm, but SHOULD clear
   // it to save a wasted lookup.
   basePlate:          { type: mongoose.Schema.Types.Mixed, default: null },
-  veoReferenceImages: { type: [String], default: [] },  // exact reference-image stack sent to the model (pos 0 = seed, then product hero + alts) — for the generation inspector
+  veoReferenceImages: { type: [String], default: [] },  // reference-image stack sent to the model (pos 0 = seed, then product hero + alts) — for the generation inspector. Exact for a fresh submit; a Gemini resume whose receipt predates this field re-derives the stack from the ad's CURRENT reference state (see geminiVideoService.js's resume backfill), which may differ from what the master was actually generated from if the underlying media/reframe cache changed since
   // GPT-composed structured storyboard. Null when VEO_USE_GPT_STORYBOARD
   // is off or the GPT call failed (Veo prompt then carries the legacy
   // hardcoded storyboard instead). Stored as Mixed so the shape can

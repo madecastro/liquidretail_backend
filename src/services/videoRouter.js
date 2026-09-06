@@ -19,21 +19,17 @@
 // CatalogProduct.videoSettings). A per-brand PROVIDER override
 // (videoSettings.provider, vertex-vs-atlas) is the natural future
 // extension of that same settings block.
-//   VIDEO_PROVIDER=atlas   → atlasVideoService (default — Atlas migration)
-//   VIDEO_PROVIDER=gemini  → geminiVideoService (direct Gemini Developer API)
-//   VIDEO_PROVIDER=vertex  → aiVideoReferenceService (deprecated direct-Veo; now
-//                            reachable ONLY by naming it, never as a fall-through)
+//   VIDEO_PROVIDER=atlas   → atlasVideoService (file default)
+//   VIDEO_PROVIDER=gemini  → geminiVideoService (live on adgen-renderer)
+//   VIDEO_PROVIDER=vertex  → THROWS (quarantined until receipt + CostLog +
+//                            maxRedirects:0). Module stays on disk (DORMANT-KEEP).
 //   anything else          → THROWS. See the else arm in generateForAd.
 //
-// ⚠️ VIDEO_PROVIDER=gemini IS NOT YET SWITCHABLE IN PRODUCTION. geminiVideoService
-// has no reference-image assembly: it takes `images` as a parameter, and both
-// callers pass storyboard?.images, which is ALWAYS [] on the gemini path because
-// prepareStoryboard returns {storyboard:null} for every non-atlas provider. So a
-// flip today submits ZERO references — text-to-video, not reference-to-video —
-// and bills ~$1 per useless master. The missing piece is the loading that
-// atlasVideoService.generateForAd does before buildReferenceImages (media,
-// product, catalogMedias, caps, brand); that wants extracting into something
-// both providers call, not duplicating.
+// VIDEO_PROVIDER=gemini is the live production override on adgen-renderer
+// (repo/file default remains atlas). The provider owns reference assembly
+// and prompt construction; callers must not pass prompt: or images:.
+// Vertex is quarantined (throw) until receipt stamp + CostLog +
+// maxRedirects:0 exist. Unknown values throw. This file is the ONLY switch.
 
 const aiVideoReferenceService = require('./aiVideoReferenceService');
 const atlasVideoService       = require('./atlasVideoService');
@@ -93,27 +89,10 @@ async function generateForAd({
   if (provider === 'atlas') {
     result = await atlasVideoService.generateForAd({ ad, operatorPrompt, storyboard, modelOverride, campaignRunId, allowResume });
   } else if (provider === 'gemini') {
-    // ── ADDED 2026-09-03 WITH THE DIRECT-GEMINI CUTOVER ──────────────────
-    //
-    // THIS BRANCH IS WHY THE CUTOVER COULD NOT JUST BE AN ENV FLIP.
-    //
-    // renderer.js dispatches providers at its own seam and never calls this
-    // function — but REGENERATE does: adRegenerateService.js:43 requires this
-    // module aliased as `veoService` and calls veoService.generateForAd at
-    // :1636. That alias is why a grep for "videoRouter.generateForAd" finds
-    // nothing and the call site looks absent.
-    //
-    // So before this branch existed, VIDEO_PROVIDER=gemini sent every
-    // regenerate into the `else` below — the deprecated Vertex Veo path,
-    // whose prompt composer interpolates the catalog TITLE. That is the exact
-    // mechanism behind the Vaportek incident (a product named "Vaportek" made
-    // Omni fabricate a VAPORTEK chest lockup over the real PELAGIC fish-mark,
-    // and vision-QC terminal-rejected the paid master). It is documented as
-    // dormant-but-one-env-var-from-live in scripts/shared-invariants.json.
-    //
-    // Flipping the provider without this branch would have activated it on a
-    // real user action, on a different provider, billing differently.
-    // NO `prompt` ARGUMENT. This is deliberate and it is load-bearing.
+    // Mint (renderer.js) and regenerate (adRegenerateService, aliased as
+    // veoService) both call this function. NO `prompt` ARGUMENT — the
+    // provider owns prompt construction. Passing storyboard?.prompt ||
+    // ad.veoPrompt is the stale-receipt / empty-first-render bug.
     //
     // It used to pass `prompt: storyboard?.prompt || ad.veoPrompt`, which is
     // the SAME always-wrong-caller bug twice over:
@@ -158,21 +137,26 @@ async function generateForAd({
       campaignRunId
     });
   } else if (provider === 'vertex') {
-    // Vertex is now reachable ONLY by naming it explicitly. It used to be the
-    // fall-through, which meant every typo and every new provider name landed
-    // on a deprecated paid path by default.
-    result = await aiVideoReferenceService.generateForAd({ ad, operatorPrompt });
-    if (result && result.model == null) result.model = 'google/veo-3.1';
+    // DORMANT-KEEP: aiVideoReferenceService stays required so its boot IIFE
+    // still runs. The arm is preserved; its missing money guards are not.
+    // Follow-up (PR 10): kill the IIFE once Vertex is an adapter or gone.
+    if (!aiVideoReferenceService) {
+      throw new Error('VIDEO_PROVIDER=vertex: aiVideoReferenceService missing');
+    }
+    throw new Error(
+      `VIDEO_PROVIDER=vertex is quarantined until it implements receipt stamp ` +
+      `(veoPredictionId) + CostLog + maxRedirects:0. Refusing to submit.`
+    );
   } else {
     // FAIL CLOSED. Previously this was the Vertex arm, so VIDEO_PROVIDER=gemeni
     // (or any future value) silently generated on a third provider while the
     // operator believed they had cut over. Refusing to render costs nothing;
     // generating on the wrong provider costs a master and produces an asset
-    // nobody asked for. Mirrors the same guard at renderer.js's seam.
+    // nobody asked for.
     throw new Error(
       `VIDEO_PROVIDER=${JSON.stringify(provider)} is not a recognised video provider ` +
-      `(expected 'atlas', 'gemini' or 'vertex'). Refusing to submit — an unknown ` +
-      `provider must never fall through to a billable default.`
+      `(expected 'atlas' or 'gemini'; vertex is quarantined). Refusing to submit — ` +
+      `an unknown provider must never fall through to a billable default.`
     );
   }
 

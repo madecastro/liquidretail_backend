@@ -26,6 +26,7 @@ const axios = require('axios');
 const { recordFlatCost, finalizeFlatCost, reconcileCost } = require('./costTracker');
 const { classify, mayResubmit, retryAfterFrom, isPollTransportFailure } = require('./atlasErrorPolicy');
 const { adStage, formatElapsed } = require('./adStage');
+const { shouldResumeAttempt } = require('./spendReceipt');
 
 const BASE = process.env.ATLAS_BASE_URL || 'https://api.atlascloud.ai/api/v1';
 const KEY = () => process.env.ATLAS_API_KEY;
@@ -185,18 +186,11 @@ function scheduleCostReconcile(predictionId, attempt = 0) {
 }
 
 /**
- * Mirror of atlasVideoService.shouldResumeAttempt for the static/image
- * charge point. Closes the gap named in commit 2f99218 (PR #40): "the
- * static/image charge point still has no resume guard at all."
- *
- * True only when ALL THREE hold (strict equality, fail-closed):
- *   allowResume === true, attempt === 1, existingPredictionId a non-empty string.
+ * Mirror of spendReceipt.shouldResumeAttempt for the static/image charge
+ * point. Wrapper, not a copy — the 3-clause predicate is defined once.
  */
 function shouldResumeImageAttempt({ allowResume, attempt, existingPredictionId }) {
-  return allowResume === true
-    && attempt === 1
-    && typeof existingPredictionId === 'string'
-    && existingPredictionId.length > 0;
+  return shouldResumeAttempt({ allowResume, attempt, existingPredictionId });
 }
 
 // ── submit + poll ──────────────────────────────────────────────────────────

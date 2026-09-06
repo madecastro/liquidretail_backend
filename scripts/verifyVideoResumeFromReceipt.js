@@ -35,8 +35,9 @@
 //      own money gate (mayRetryAfterFailure) has already decided is safe to
 //      resubmit.
 //
-// THE ACTUAL FIX. shouldResumeAttempt (atlasVideoService.js) is a pure,
-// exported decision — allowResume (caller's choice, default true) AND
+// THE ACTUAL FIX. shouldResumeAttempt (spendReceipt.js — one function for
+// Atlas video, Gemini video, and Atlas image) is a pure, exported
+// decision — allowResume (caller's choice, default true) AND
 // attempt===1 AND an existing veoPredictionId. When true, generateForAd's
 // retry loop skips submitGeneration() entirely on that one iteration and
 // hands the EXISTING predictionId to the SAME pollPrediction() call the
@@ -74,7 +75,7 @@ console.log('verifyVideoResumeFromReceipt\n');
 // ── A. shouldResumeAttempt — exhaustive behavioural matrix ────────────────
 console.log('── A: shouldResumeAttempt (pure decision) ──');
 
-const { shouldResumeAttempt } = require(path.join(ROOT, 'src/services/atlasVideoService'));
+const { shouldResumeAttempt } = require(path.join(ROOT, 'src/services/spendReceipt'));
 
 const MATRIX = [
   // [label, args, expected]
@@ -370,11 +371,13 @@ check('B6 the isResuming branch does NOT write a NEW veoPredictionId or a second
     '($1.50 booked for one delivered video, the exact shape the charge-point comment already warns about)');
 });
 
-check('B7 shouldResumeAttempt is exported (so this harness — and any future one — can test it directly)', () => {
-  assert.match(atlasSrc, /shouldResumeAttempt\s*,?\s*\n/,
-    'shouldResumeAttempt must appear in module.exports');
+check('B7 shouldResumeAttempt is re-exported from atlasVideoService (callers/harnesses that still resolve it here)', () => {
+  assert.match(atlasSrc, /require\(['"]\.\/spendReceipt['"]\)/,
+    'atlasVideoService must require ./spendReceipt for shouldResumeAttempt — not keep a local copy');
   const exportsBlock = atlasSrc.slice(atlasSrc.indexOf('module.exports'));
-  assert.match(exportsBlock, /\bshouldResumeAttempt\b/, 'shouldResumeAttempt not found inside module.exports');
+  assert.match(exportsBlock, /\bshouldResumeAttempt\b/, 'shouldResumeAttempt not found inside atlasVideoService module.exports');
+  assert.ok(!/function shouldResumeAttempt\s*\(/.test(atlasSrc),
+    'atlasVideoService must not define its own shouldResumeAttempt — that is the copy that drifted');
 });
 
 // ── C. every caller makes an explicit, auditable choice ───────────────────
@@ -436,6 +439,14 @@ check('C2 [THE REGENERATE CARVE-OUT] [DECOY-RESISTANT] adRegenerateService.js pa
     'no REAL (non-string-decoy) generateForAd({ allowResume: false }) on the live regenerate path');
 });
 
+check('C0 [F6] spendReceipt.shouldResumeAttempt is the ONE extracted predicate (not an inline &&)', () => {
+  const src = fs.readFileSync(path.join(ROOT, 'src/services/spendReceipt.js'), 'utf8');
+  assert.match(src, /function shouldResumeAttempt\s*\(/,
+    'shouldResumeAttempt must be defined in spendReceipt.js');
+  assert.match(src, /module\.exports[\s\S]*\bshouldResumeAttempt\b/,
+    'spendReceipt.js must export shouldResumeAttempt');
+});
+
 check('C3 [DECOY-RESISTANT] videoRouter.js threads allowResume through to atlasVideoService.generateForAd', () => {
   const src = stripComments(fs.readFileSync(path.join(ROOT, 'src/services/videoRouter.js'), 'utf8'));
   const fnBodyText = fnBody(src, 'async function generateForAd(');
@@ -459,6 +470,71 @@ check('C3 [DECOY-RESISTANT] videoRouter.js threads allowResume through to atlasV
       'videoRouter.js must thread the allowResume parameter through (shorthand or ' +
       `allowResume: allowResume), not a literal — got ${JSON.stringify(entries.allowResume)}`);
   }
+});
+
+// ── E. Atlas, Gemini, and image all CALL the one extracted predicate ────
+console.log('\n── E: one shouldResumeAttempt — require + call, not an inline && ──');
+
+function assertCallsExtractedPredicate(rel, { wrapperName, resumeAssign } = {}) {
+  const src = stripComments(fs.readFileSync(path.join(ROOT, rel), 'utf8'));
+  assert.match(src, /require\(['"]\.\/spendReceipt['"]\)/,
+    `${rel} must require('./spendReceipt') for shouldResumeAttempt`);
+  const calls = findRealMatches(src, /shouldResumeAttempt\s*\(/);
+  assert.ok(calls.length >= 1,
+    `${rel} must CALL shouldResumeAttempt( — a require without a call is the copy that drifted`);
+  if (wrapperName) {
+    const body = fnBody(src, `function ${wrapperName}(`);
+    assert.ok(body, `${wrapperName} not found in ${rel}`);
+    assert.ok(findRealMatches(body, /shouldResumeAttempt\s*\(/).length >= 1,
+      `${wrapperName} must call shouldResumeAttempt, not inline the 3-clause &&`);
+    assert.ok(!/allowResume\s*===\s*true\s*&&/.test(body),
+      `${wrapperName} still inlines allowResume === true && — that is the copy`);
+  }
+  if (resumeAssign) {
+    const assigns = findRealMatches(src, /isResuming\s*=\s*shouldResumeAttempt\s*\(/);
+    assert.ok(assigns.length >= 1,
+      `${rel} must assign isResuming = shouldResumeAttempt( — not \`allowResume === true && !!existing\``);
+    assert.ok(!/isResuming\s*=\s*allowResume\s*===\s*true\s*&&/.test(src),
+      `${rel} still has the inlined Gemini predicate \`allowResume === true && !!existing\``);
+  }
+}
+
+check('E1 atlasVideoService.js requires spendReceipt and calls shouldResumeAttempt', () => {
+  assertCallsExtractedPredicate('src/services/atlasVideoService.js', { resumeAssign: true });
+});
+
+check('E2 geminiVideoService.js requires spendReceipt and calls shouldResumeAttempt (not && !!existing)', () => {
+  assertCallsExtractedPredicate('src/services/geminiVideoService.js', { resumeAssign: true });
+  const src = stripComments(fs.readFileSync(path.join(ROOT, 'src/services/geminiVideoService.js'), 'utf8'));
+  const gen = fnBody(src, 'async function generateForAd(');
+  assert.ok(gen, 'gemini generateForAd not found');
+  const assigns = findRealMatches(gen, /isResuming\s*=\s*shouldResumeAttempt\s*\(/);
+  assert.ok(assigns.length >= 1, 'gemini generateForAd must assign isResuming = shouldResumeAttempt(');
+  const args = callArgsAt(gen, assigns[0]);
+  assert.ok(args, 'could not balance gemini shouldResumeAttempt(...) args');
+  const obj = firstObjectLiteral(args);
+  const entries = objectLiteralEntries(obj);
+  assert.strictEqual(entries.attempt, '1',
+    'Gemini has no billed-retry ladder yet — must pass attempt: 1 until one exists, got ' +
+    JSON.stringify(entries.attempt));
+  assert.strictEqual(entries.allowResume, 'allowResume',
+    'must pass the allowResume parameter through, not a boolean literal');
+});
+
+check('E3 atlasImageService.shouldResumeImageAttempt is a wrapper around the extracted predicate', () => {
+  assertCallsExtractedPredicate('src/services/atlasImageService.js', {
+    wrapperName: 'shouldResumeImageAttempt'
+  });
+});
+
+check('E4 [F6] allowResume defaults stay inverted: video generateForAd true, image renderDirectImage false', () => {
+  const geminiSrc = stripComments(fs.readFileSync(path.join(ROOT, 'src/services/geminiVideoService.js'), 'utf8'));
+  assert.match(geminiSrc, /async function generateForAd\(\{[\s\S]{0,500}allowResume\s*=\s*true/,
+    'gemini generateForAd must default allowResume = true');
+
+  const imgSrc = stripComments(fs.readFileSync(path.join(ROOT, 'src/services/directImageRenderService.js'), 'utf8'));
+  assert.match(imgSrc, /allowResume\s*=\s*false/,
+    'renderDirectImage must default allowResume = false (do not invert F6)');
 });
 
 // ── D. renderer.js: an unsettled-at-timeout Ad is released, never failed ──

@@ -15,12 +15,9 @@
 //   - CostLog rows written by atlasImageService (recordFlatCost, reconcileCost)
 //   - Atomic claim via findOneAndUpdate — same shape as backend claimAdsForRun
 //
-// Video path (renderRoute:'veo') is NOT wired here — Phase 1c. The claim
-// filter still permits video masters/derives to be claimed, but the
-// dispatch below throws "video not yet supported" and releases the claim.
-// A concurrent backend deploy with ADGEN_RENDERER_ENABLED=true would
-// therefore only cover the static half. Leave the flag off in prod until
-// Phase 1c ships.
+// Video path (renderRoute:'veo') is the live mint path. Provider choice
+// is the video router (atlas | gemini; vertex is quarantined).
+// Derives never reach that call.
 
 const { POLL_MS, WORKER_ID, MAX_INFLIGHT, isAdgenRendererEnabled, isTitlerEnabled } = require('../config');
 const { concurrency } = require('./concurrency');
@@ -147,16 +144,14 @@ const { classifyRunAdOutcome, buildRunReconciliationUpdate } = require('./campai
 // lastHeartbeatAt stays null until an ad settles.
 const { startRunHeartbeat } = require('./campaignRunHeartbeat');
 const atlasVideo = require('./atlasVideoService');
-// Provider seam — see the dispatch in renderVideo. Required unconditionally so
-// a missing module fails at boot, not on the first billable render.
-const geminiVideo = require('./geminiVideoService');
 const { renderBrandScriptAndSave } = require('./brandScriptExecutor');
-// videoRouter exports `prepareStoryboard`; the backend's routes/ads.js binds it
-// under the local alias `veoPrepareStoryboard`. Phase 1c ported the CALL from
-// there but kept the alias on the require(), destructuring a key that does not
-// exist — so this was `undefined` and every first-time video master threw
-// "veoPrepareStoryboard is not a function". Alias explicitly instead.
-const { prepareStoryboard: veoPrepareStoryboard } = require('./videoRouter');
+// videoRouter is the ONLY provider switch (mint + regenerate). Required
+// unconditionally so a missing module fails at boot, not on the first
+// billable render. `prepareStoryboard` is aliased to match backend's
+// routes/ads.js binding; Phase 1c ported the CALL but originally
+// destructured a key that does not exist.
+const videoRouter = require('./videoRouter');
+const { prepareStoryboard: veoPrepareStoryboard } = videoRouter;
 
 // Bounded wait for a derive-only ad's sibling master to complete. Kept
 // SHORT (60s default) so an unwaiting derive releases its worker slot
@@ -1445,49 +1440,17 @@ async function renderVideo(ad) {
   // or any other requeue path, makes the row claimable again), so this is
   // precisely where resume-instead-of-resubmit has to be on.
   adStage(adId, `master video generation (${ad.aspectRatio || '9:16'})`);
-  // ── PROVIDER SEAM. THIS is the live call — NOT videoRouter ────────────────
+  // ── SINGLE DISPATCH SEAM. videoRouter is the ONLY provider switch. ────
   //
-  // videoRouter is used in this file ONLY for prepareStoryboard. A `gemini`
-  // branch added there would be a NO-OP that ships a dark provider while
-  // Atlas keeps billing, and the operator would believe they had cut over.
-  //
-  // FAILS CLOSED on an unrecognised VIDEO_PROVIDER. The router's own dispatch
-  // sends anything-not-'atlas' to the deprecated Vertex path, so a typo like
-  // VIDEO_PROVIDER=gemeni would silently generate on a third provider. Here
-  // an unknown value throws before any billable submit: refusing to render
-  // costs nothing, generating on the wrong provider costs a master and
-  // produces an asset nobody asked for.
-  const videoProvider = String(process.env.VIDEO_PROVIDER || 'atlas').toLowerCase();
-  let veoResult;
-  if (videoProvider === 'atlas') {
-    veoResult = await atlasVideo.generateForAd({ ad, storyboard, campaignRunId: runId, allowResume: true });
-  } else if (videoProvider === 'gemini') {
-    // NO `prompt` ARGUMENT. Matches videoRouter.js's gemini branch.
-    // Passing `storyboard?.prompt || ad.veoPrompt` looks like a harmless
-    // default but is load-bearing in the wrong direction: storyboard is
-    // always null on the gemini path (prepareStoryboard no-ops for
-    // non-atlas), so this reduced to `ad.veoPrompt`. geminiVideoService's
-    // tier-1 "explicit prompt argument" then wins unconditionally over the
-    // isResuming gate — bypassing the stale-prompt fix this PR's design
-    // put inside the provider. veoPredictionId and veoPrompt are currently
-    // stamped together, so this is not observably wrong today, but any
-    // future path that clears the receipt without clearing veoPrompt
-    // would silently resubmit the old prompt. Let the provider own
-    // precedence on every call path, not just regenerate.
-    veoResult = await geminiVideo.generateForAd({
-      ad,
-      aspectRatio: ad.aspectRatio || '9:16',
-      durationSec: ad.videoDurationSec || 10,
-      allowResume: true,
-      campaignRunId: runId
-    });
-  } else {
-    throw new Error(
-      `VIDEO_PROVIDER=${JSON.stringify(videoProvider)} is not a recognised video provider ` +
-      `(expected 'atlas' or 'gemini'). Refusing to submit — an unknown provider must never ` +
-      `fall through to a billable default.`
-    );
-  }
+  // NO `prompt:` / `images:` ARGUMENTS. The provider owns refs + prompt.
+  // Passing `storyboard?.prompt || ad.veoPrompt` (or storyboard?.images)
+  // is the always-empty / stale-receipt class of bug.
+  let veoResult = await videoRouter.generateForAd({
+    ad,
+    storyboard,
+    campaignRunId: runId,
+    allowResume: true
+  });
   if (veoResult.skipped) {
     // Includes GEMINI_LEASE_EXHAUSTED. generateForAd already held this
     // claim through its internal backoff; a persisted requeue counter is
@@ -1576,11 +1539,13 @@ async function renderVideo(ad) {
 
   // Stage 3 — Remotion titling on the paid master.
   // Re-read AFTER the persist-write above, before either arm — that write
-  // just populated veoReferenceImages (the exact seed URLs actually sent to
-  // the model), which qcAndStampVideoAd's no-brand arm below needs just as
-  // much as renderBrandScriptAndSave does. Reading it off the in-memory `ad`
-  // param instead would silently fall through to a CatalogProduct hero photo
-  // that may not be the frame that generated this clip.
+  // just populated veoReferenceImages (the seed URLs sent to the model on a
+  // fresh submit; a Gemini resume backfills its best current re-derivation
+  // when the field predates that write — see geminiVideoService.js), which
+  // qcAndStampVideoAd's no-brand arm below needs just as much as
+  // renderBrandScriptAndSave does. Reading it off the in-memory `ad` param
+  // instead would silently fall through to a CatalogProduct hero photo that
+  // may not be the frame that generated this clip.
   const adFinal = await Ad.findById(adId).lean();
   if (brandDoc) {
     adStage(adId, `titling ${ad.aspectRatio || '9:16'}`);

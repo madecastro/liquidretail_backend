@@ -340,9 +340,11 @@ const baseAlertArgs = {
   const deriveIf = rendererSrc.indexOf('if (deriveFromFmt)');
   const deriveOpen = deriveIf === -1 ? -1 : rendererSrc.indexOf('{', deriveIf);
   const deriveClose = deriveOpen === -1 ? -1 : indexOfMatchingBrace(rendererSrc, deriveOpen);
-  const genCall = rendererSrc.indexOf('atlasVideo.generateForAd');
-  const genCount = (rendererSrc.match(/atlasVideo\.generateForAd/g) || []).length;
-  checkTrue('D1 renderer.js has exactly one atlasVideo.generateForAd call', genCount === 1);
+  const genCall = rendererSrc.indexOf('videoRouter.generateForAd(');
+  const genCount = (rendererSrc.match(/videoRouter\.generateForAd\(/g) || []).length;
+  const namedCount = (rendererSrc.match(/(?:atlasVideo|geminiVideo)\.generateForAd\(/g) || []).length;
+  checkTrue('D1 renderer.js has exactly one videoRouter.generateForAd call', genCount === 1);
+  checkTrue('D1a renderer.js has ZERO provider-named generateForAd calls', namedCount === 0);
   checkTrue('D1b that call sits AFTER the if (deriveFromFmt) block',
     deriveClose !== -1 && genCall > deriveClose);
 

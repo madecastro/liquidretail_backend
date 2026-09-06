@@ -675,10 +675,358 @@ console.log('\nO. download GET does not forward x-goog-api-key across hosts');
     mutatedOpts.headers['x-goog-api-key'] === 'secret-key');
 }
 
-console.log('');
-if (failures.length) {
-  console.log(`❌ geminiVideoProvider: ${failures.length} FAILED, ${pass} passed\n`);
-  for (const f of failures) console.log(`   • ${f}`);
-  process.exit(1);
+// ── P. RESUME BEFORE ASSEMBLY (F1) ────────────────────────────────────────
+console.log('\nP. resume-before-assembly — a receipt-holding re-entry must not fetch refs');
+{
+  const start = PROVIDER_CODE.indexOf('async function generateForAd(');
+  const end = PROVIDER_CODE.indexOf('\nmodule.exports', start);
+  const gen = start >= 0 && end > start ? PROVIDER_CODE.slice(start, end) : '';
+  check('P0 generateForAd body extracted', gen.length > 500);
+  const resumeIdx = gen.search(/shouldResumeAttempt\s*\(/);
+  const assembleIdx = gen.search(/assembleReferences\s*\(/);
+  check('P1 [SOURCE ORDER] shouldResumeAttempt appears before assembleReferences( in generateForAd',
+    resumeIdx >= 0 && assembleIdx >= 0 && resumeIdx < assembleIdx,
+    `resume@${resumeIdx} assemble@${assembleIdx}`);
+  check('P1b generateForAd does not inline allowResume === true && !!existing',
+    !/isResuming\s*=\s*allowResume\s*===\s*true\s*&&/.test(gen));
+  // Resume cannot re-fetch refs (P3). The charge-point $set must therefore
+  // carry the source URLs Atlas already stamps, or renderer persists [].
+  const receiptSet = (gen.match(/Ad\.updateOne\([\s\S]*?\$set:\s*\{([\s\S]*?)\n\s*\}/) || [])[1] || '';
+  check('P1c fresh-path receipt $set stamps veoReferenceImages (resume cannot re-assemble)',
+    /veoReferenceImages\s*:/.test(receiptSet));
+  check('P1d peek-failure catch sets unsettledAtTimeout (not status:failed)',
+    /body = await peekInteraction\(interactionId\);[\s\S]{0,120}catch \(err\) \{[\s\S]{0,800}err\.unsettledAtTimeout\s*=\s*true/.test(gen));
+  check('P1e resume return reads ad.veoReferenceImages, not refs.map',
+    /referenceImages:\s*isResuming\s*\?[\s\S]{0,160}ad\?\.veoReferenceImages/.test(gen));
 }
-console.log(`✅ geminiVideoProvider: ${pass} checks passed\n`);
+
+async function runResumeSkipsAssembly() {
+  const Module = require('module');
+  const origLoad = Module._load;
+  const calls = { assemble: 0, acquire: 0, post: 0, get: 0 };
+
+  const completedBody = {
+    status: 'completed',
+    steps: [{
+      type: 'model_output',
+      content: [{ type: 'video', uri: 'https://generativelanguage.googleapis.com/v1beta/files/abc' }]
+    }],
+    usage: {
+      total_input_tokens: 10,
+      total_output_tokens: 57920,
+      output_tokens_by_modality: [{ modality: 'video', tokens: 57920 }]
+    }
+  };
+
+  const fakeAxios = {
+    post: async () => {
+      calls.post += 1;
+      throw new Error('POST must not run on resume');
+    },
+    get: async (url) => {
+      calls.get += 1;
+      if (String(url).includes('/interactions/')) {
+        return { status: 200, data: completedBody };
+      }
+      return { status: 200, data: Buffer.from('fake-video') };
+    }
+  };
+
+  Module._load = function (request, parent, isMain) {
+    if (request === 'axios') return fakeAxios;
+    return origLoad.apply(this, arguments);
+  };
+
+  function stubLocal(rel, exports) {
+    const abs = require.resolve(path.join(SVC, rel));
+    require.cache[abs] = { id: abs, filename: abs, loaded: true, exports };
+  }
+
+  stubLocal('geminiReferenceAssembly.js', {
+    assembleReferences: async () => {
+      calls.assemble += 1;
+      const err = new Error('injected GEMINI_REFS_FETCH_FAILED');
+      err.code = 'GEMINI_REFS_FETCH_FAILED';
+      throw err;
+    }
+  });
+  stubLocal('geminiVideoLease.js', {
+    acquire: async () => {
+      calls.acquire += 1;
+      return { heartbeat: async () => {}, release: async () => {} };
+    },
+    MAX_SLOTS: 8
+  });
+  stubLocal('cloudinaryService.js', {
+    uploadBufferToCloudinary: async () => ({
+      secure_url: 'https://res.cloudinary.com/x/v.mp4',
+      public_id: 'gemini_v1_resume_me'
+    })
+  });
+  stubLocal('costTracker.js', { recordFlatCost: async () => {}, finalizeFlatCost: async () => {} });
+  stubLocal('adStage.js', { adStage: () => {} });
+  stubLocal('veoPromptBuilder.js', {
+    buildVeoPrompt: () => { throw new Error('must not rebuild prompt on resume'); }
+  });
+  stubLocal('geminiVideoKey.js', {
+    resolveGeminiVideoApiKey: () => ({ apiKey: 'test-key', slot: 'video', fingerprint: 'test', length: 8 })
+  });
+  const adPath = require.resolve(path.join(ROOT, 'src', 'models', 'Ad.js'));
+  require.cache[adPath] = {
+    id: adPath,
+    filename: adPath,
+    loaded: true,
+    exports: { updateOne: async () => { throw new Error('must not stamp a new receipt on resume'); } }
+  };
+
+  const svcPath = require.resolve(path.join(SVC, 'geminiVideoService.js'));
+  delete require.cache[svcPath];
+
+  try {
+    const { generateForAd } = require(svcPath);
+    const result = await generateForAd({
+      ad: {
+        _id: 'ad-resume-1',
+        veoPredictionId: 'v1_resume_me',
+        veoPrompt: 'stamped prompt',
+        veoReferenceImages: ['https://example.com/ref.jpg']
+      },
+      allowResume: true,
+      aspectRatio: '9:16',
+      durationSec: 10
+    });
+    return { result, calls, err: null };
+  } catch (err) {
+    return { result: null, calls, err };
+  } finally {
+    Module._load = origLoad;
+  }
+}
+
+// ── Q. RESUME REFERENCE BACKFILL WHEN THE RECEIPT PREDATES THE FIELD (F2) ──
+// A receipt stamped before this file's charge-point $set wrote
+// veoReferenceImages never had it. Resuming one of those ads must
+// re-derive the SAME stack a fresh submit would have used — default
+// ranking or the operator's own pick — not report an empty stack
+// (which pushes vision QC onto a single-hero fallback and can
+// false-positive-reject an already-paid master). Mirrors
+// runResumeSkipsAssembly's harness shape exactly; only the Ad fixture and
+// the assembleReferences stub differ.
+function stubResumeCommon(calls, assembleImpl, publicId) {
+  const Module = require('module');
+  const origLoad = Module._load;
+
+  const completedBody = {
+    status: 'completed',
+    steps: [{
+      type: 'model_output',
+      content: [{ type: 'video', uri: 'https://generativelanguage.googleapis.com/v1beta/files/abc' }]
+    }],
+    usage: {
+      total_input_tokens: 10,
+      total_output_tokens: 57920,
+      output_tokens_by_modality: [{ modality: 'video', tokens: 57920 }]
+    }
+  };
+
+  const fakeAxios = {
+    post: async () => {
+      calls.post += 1;
+      throw new Error('POST must not run on resume');
+    },
+    get: async (url) => {
+      calls.get += 1;
+      if (String(url).includes('/interactions/')) {
+        return { status: 200, data: completedBody };
+      }
+      return { status: 200, data: Buffer.from('fake-video') };
+    }
+  };
+
+  Module._load = function (request, parent, isMain) {
+    if (request === 'axios') return fakeAxios;
+    return origLoad.apply(this, arguments);
+  };
+
+  function stubLocal(rel, exports) {
+    const abs = require.resolve(path.join(SVC, rel));
+    require.cache[abs] = { id: abs, filename: abs, loaded: true, exports };
+  }
+
+  stubLocal('geminiReferenceAssembly.js', { assembleReferences: assembleImpl });
+  stubLocal('geminiVideoLease.js', {
+    acquire: async () => {
+      calls.acquire += 1;
+      return { heartbeat: async () => {}, release: async () => {} };
+    },
+    MAX_SLOTS: 8
+  });
+  stubLocal('cloudinaryService.js', {
+    uploadBufferToCloudinary: async () => ({
+      secure_url: 'https://res.cloudinary.com/x/v.mp4',
+      public_id: publicId
+    })
+  });
+  stubLocal('costTracker.js', { recordFlatCost: async () => {}, finalizeFlatCost: async () => {} });
+  stubLocal('adStage.js', { adStage: () => {} });
+  stubLocal('veoPromptBuilder.js', {
+    buildVeoPrompt: () => { throw new Error('must not rebuild prompt on resume'); }
+  });
+  stubLocal('geminiVideoKey.js', {
+    resolveGeminiVideoApiKey: () => ({ apiKey: 'test-key', slot: 'video', fingerprint: 'test', length: 8 })
+  });
+  const adPath = require.resolve(path.join(ROOT, 'src', 'models', 'Ad.js'));
+  require.cache[adPath] = {
+    id: adPath,
+    filename: adPath,
+    loaded: true,
+    exports: { updateOne: async () => { throw new Error('must not stamp a new receipt on resume'); } }
+  };
+
+  return { origLoad, Module };
+}
+
+async function runResumeBackfillsWhenEmpty() {
+  const calls = { assemble: 0, acquire: 0, post: 0, get: 0 };
+  const { origLoad, Module } = stubResumeCommon(calls, async () => {
+    calls.assemble += 1;
+    return {
+      images: [
+        { buffer: Buffer.from('a'), mimeType: 'image/jpeg', sourceUrl: 'https://cdn.example.com/ref1.jpg' },
+        { buffer: Buffer.from('b'), mimeType: 'image/jpeg', sourceUrl: 'https://cdn.example.com/ref2.jpg' }
+      ],
+      urls: ['https://cdn.example.com/ref1.jpg', 'https://cdn.example.com/ref2.jpg'],
+      aspectRatio: '9:16'
+    };
+  }, 'gemini_v1_resume_backfill');
+
+  const svcPath = require.resolve(path.join(SVC, 'geminiVideoService.js'));
+  delete require.cache[svcPath];
+
+  try {
+    const { generateForAd } = require(svcPath);
+    const result = await generateForAd({
+      ad: {
+        _id: 'ad-resume-2',
+        veoPredictionId: 'v1_resume_backfill',
+        veoPrompt: 'stamped prompt'
+        // veoReferenceImages deliberately ABSENT — the pre-collapse-receipt case
+      },
+      allowResume: true,
+      aspectRatio: '9:16',
+      durationSec: 10
+    });
+    return { result, calls, err: null };
+  } catch (err) {
+    return { result: null, calls, err };
+  } finally {
+    Module._load = origLoad;
+  }
+}
+
+// Same shape, but the backfill itself THROWS — this must never turn into a
+// thrown GEMINI_REFS_* out of a receipt-holding resume (that would recreate
+// the exact failure class F1 exists to close).
+async function runResumeBackfillFailsClosedWhenEmpty() {
+  const calls = { assemble: 0, acquire: 0, post: 0, get: 0 };
+  const { origLoad, Module } = stubResumeCommon(calls, async () => {
+    calls.assemble += 1;
+    const err = new Error('injected GEMINI_REFS_FETCH_FAILED (backfill)');
+    err.code = 'GEMINI_REFS_FETCH_FAILED';
+    throw err;
+  }, 'gemini_v1_resume_backfill_fail');
+
+  const svcPath = require.resolve(path.join(SVC, 'geminiVideoService.js'));
+  delete require.cache[svcPath];
+
+  try {
+    const { generateForAd } = require(svcPath);
+    const result = await generateForAd({
+      ad: {
+        _id: 'ad-resume-3',
+        veoPredictionId: 'v1_resume_backfill_fail',
+        veoPrompt: 'stamped prompt',
+        veoReferenceImages: [] // present but empty — same gap as absent
+      },
+      allowResume: true,
+      aspectRatio: '9:16',
+      durationSec: 10
+    });
+    return { result, calls, err: null };
+  } catch (err) {
+    return { result: null, calls, err };
+  } finally {
+    Module._load = origLoad;
+  }
+}
+
+(async () => {
+  {
+    const { result, calls, err } = await runResumeSkipsAssembly();
+    const refsCode = err && String(err.code || '').startsWith('GEMINI_REFS_');
+    check('P2 resume + throwing assembleReferences does not throw GEMINI_REFS_*',
+      !refsCode, err ? `${err.code}: ${err.message}` : '');
+    check('P3 assembleReferences was not called', calls.assemble === 0, String(calls.assemble));
+    check('P4 lease.acquire was not called', calls.acquire === 0, String(calls.acquire));
+    check('P5 axios.post was not called', calls.post === 0, String(calls.post));
+    check('P6 peek/download GET ran', calls.get >= 1, String(calls.get));
+    if (err && !refsCode) {
+      check('P7 generateForAd completed (or unsettled) without a refs throw',
+        false, `${err.code || err.name}: ${err.message}`);
+    } else {
+      check('P7 generateForAd returned a mirrored master',
+        !!(result && result.videoUrl && result.skipped === false),
+        result ? JSON.stringify({ skipped: result.skipped, url: result.videoUrl }) : 'no result');
+      check('P8 resume returns the stamped veoReferenceImages (not [] from skipped assemble)',
+        !!(result && Array.isArray(result.referenceImages) &&
+          result.referenceImages[0] === 'https://example.com/ref.jpg'),
+        result ? JSON.stringify(result.referenceImages) : 'no result');
+    }
+  }
+
+  {
+    const { result, calls, err } = await runResumeBackfillsWhenEmpty();
+    check('Q1 resume with no recorded veoReferenceImages calls assembleReferences to backfill',
+      calls.assemble === 1, String(calls.assemble));
+    check('Q2 resume backfill never submits (no billable POST)',
+      calls.post === 0, String(calls.post));
+    check('Q2b resume backfill never acquires the Gemini lease',
+      calls.acquire === 0, String(calls.acquire));
+    check('Q3 resume backfill does not throw', !err, err ? `${err.code}: ${err.message}` : '');
+    check('Q4 resume returns the BACKFILLED reference URLs, not []',
+      !!(result && Array.isArray(result.referenceImages) &&
+        result.referenceImages.length === 2 &&
+        result.referenceImages[0] === 'https://cdn.example.com/ref1.jpg' &&
+        result.referenceImages[1] === 'https://cdn.example.com/ref2.jpg'),
+      result ? JSON.stringify(result.referenceImages)
+        : (err ? `${err.code}: ${err.message}` : 'no result'));
+  }
+
+  {
+    const { result, calls, err } = await runResumeBackfillFailsClosedWhenEmpty();
+    const refsCode = err && String(err.code || '').startsWith('GEMINI_REFS_');
+    check('Q5 a THROWING backfill still does not throw GEMINI_REFS_* out of generateForAd',
+      !refsCode, err ? `${err.code}: ${err.message}` : '');
+    check('Q6 a throwing backfill still completes/mirrors the resume',
+      !!(result && result.videoUrl && result.skipped === false),
+      result ? JSON.stringify({ skipped: result.skipped, url: result.videoUrl })
+        : (err ? `${err.code}: ${err.message}` : 'no result'));
+    check('Q7 a throwing backfill reports an empty stack (pre-fix fallback), never throws',
+      !!(result && Array.isArray(result.referenceImages) && result.referenceImages.length === 0),
+      result ? JSON.stringify(result.referenceImages) : 'no result');
+    check('Q8 a throwing backfill still did not submit', calls.post === 0, String(calls.post));
+    check('Q8b a throwing backfill never acquires the Gemini lease',
+      calls.acquire === 0, String(calls.acquire));
+  }
+
+  console.log('');
+  if (failures.length) {
+    console.log(`❌ geminiVideoProvider: ${failures.length} FAILED, ${pass} passed\n`);
+    for (const f of failures) console.log(`   • ${f}`);
+    process.exit(1);
+  }
+  console.log(`✅ geminiVideoProvider: ${pass} checks passed\n`);
+})().catch((err) => {
+  console.error(err);
+  process.exit(1);
+});

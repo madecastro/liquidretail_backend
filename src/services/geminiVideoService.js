@@ -56,6 +56,7 @@ const { resolveGeminiVideoApiKey } = require('./geminiVideoKey');
 const lease = require('./geminiVideoLease');
 const { assembleReferences } = require('./geminiReferenceAssembly');
 const { buildVeoPrompt } = require('./veoPromptBuilder');
+const { shouldResumeAttempt } = require('./spendReceipt');
 
 const ENDPOINT = 'https://generativelanguage.googleapis.com/v1beta/interactions';
 const MODEL = process.env.GEMINI_VIDEO_MODEL || 'gemini-omni-1.1-flash';
@@ -491,16 +492,34 @@ function extractVideoUri(body) {
  * Generate one master. Mirrors atlasVideoService.generateForAd's contract so
  * renderer.js can dispatch to either without knowing the difference.
  *
- * ORDER OF OPERATIONS IS THE SAFETY ARGUMENT — do not reorder:
- *   1. acquire the GLOBAL lease (before the POST, never around it)
- *   2. resume instead of submitting if a receipt already exists
- *   3. POST
- *   4. stamp the receipt on Ad.veoPredictionId BEFORE the first poll
- *   5. ledger the submit at the charge point
- *   6. poll
- *   7. settle the cost from provider-reported usage
+ * ORDER OF OPERATIONS IS THE SAFETY ARGUMENT — do not reorder.
  *
- * Step 4 before step 6 is what makes a crash mid-poll recoverable instead of
+ * RESUME (shouldResumeAttempt true):
+ *   peek → download → mirror.
+ *   No ref fetch TO SUBMIT, no lease, no POST, no prompt rebuild (stamped
+ *   ad.veoPrompt). No new billable work is gated on reference assembly here.
+ *   If Ad.veoReferenceImages is empty (a receipt stamped before this file's
+ *   charge-point write existed), a best-effort backfill re-derives the same
+ *   stack assembleReferences would have used for a fresh submit — default
+ *   ranking or the operator's own pick, whichever the ad actually called
+ *   for — purely for reporting/co-persisting downstream (vision QC ground
+ *   truth). A GEMINI_REFS_* failure during that backfill is caught and
+ *   logged, never thrown: this path has already decided not to submit, and
+ *   turning bookkeeping into a thrown error would recreate the exact
+ *   failure class F1 exists to keep off a receipt-holding resume.
+ *
+ * FRESH:
+ *   1. assemble references
+ *   2. build prompt
+ *   3. acquire the GLOBAL lease (before the POST, never around it)
+ *   4. POST
+ *   5. stamp the receipt on Ad.veoPredictionId BEFORE the first poll
+ *   6. ledger the submit at the charge point
+ *   7. poll
+ *   8. settle the cost from provider-reported usage
+ *   9. download → Cloudinary mirror → release the lease
+ *
+ * Step 5 before step 7 is what makes a crash mid-poll recoverable instead of
  * a silent $1 loss: bootRecoveryService finds the receipt and collects the
  * master with a free GET.
  */
@@ -515,112 +534,158 @@ async function generateForAd({ ad, prompt = null, images = null, aspectRatio, du
     );
   }
 
-  // ── ASSEMBLE OUR OWN REFERENCES. Do not trust the caller to pass them. ──
+  // ── RESUME DECISION FIRST. Before any ref fetch, lease, POST, or prompt
+  // rebuild. A GEMINI_REFS_* throw on a receipt-holding re-entry used to
+  // reach processAd's generic catch, stamp status:'failed', and hide the
+  // paid master from bootRecovery (selector is status:'rendering').
   //
-  // This function originally took `images` as a required parameter, and BOTH
-  // callers passed `storyboard?.images` — which is ALWAYS [] on the gemini
-  // path, because videoRouter.prepareStoryboard returns {storyboard:null} for
-  // every non-atlas provider. So the merged version would have submitted ZERO
-  // references on every call: text-to-video instead of reference-to-video,
-  // ~$1 per useless master, with nothing in the response to indicate why.
-  //
-  // Owning assembly here removes the whole class of bug rather than fixing it
-  // at two call sites: a caller CANNOT forget. It also matches
-  // atlasVideoService, which likewise builds its own stack internally.
-  //
-  // An explicit non-empty `images` still wins, so a dry run or a harness can
-  // inject a known stack without touching Mongo.
+  // Gemini has no billed-retry ladder yet — pass attempt: 1 until one
+  // exists. The 3-clause predicate (allowResume === true && attempt === 1
+  // && non-empty string id) lives in spendReceipt.js so Atlas / Gemini /
+  // image cannot drift.
+  const isResuming = shouldResumeAttempt({
+    allowResume,
+    attempt: 1, // no Gemini retry ladder yet; always the first attempt of this call
+    existingPredictionId: ad?.veoPredictionId
+  });
+
   let refs = Array.isArray(images) && images.length ? images : null;
-  if (!refs) {
-    const assembled = await assembleReferences({ ad, aspectRatioOverride: aspectRatio });
-    refs = assembled.images;
-  }
-
-  // ── RESUME BEFORE SUBMIT. An ad that already holds a receipt must never
-  // buy a second generation. Same predicate as Atlas's shouldResumeAttempt:
-  // resume only on the FIRST attempt, and only with a non-empty string id.
-  // Computed HERE, before prompt-building below, because the prompt
-  // precedence fix needs to know whether this is a genuine resume.
-  const existing = typeof ad?.veoPredictionId === 'string' && ad.veoPredictionId.length > 0
-    ? ad.veoPredictionId
-    : null;
-  const isResuming = allowResume === true && !!existing;
-
-  // ── BUILD OUR OWN PROMPT TOO, for exactly the same reason. ─────────────
-  //
-  // Both callers passed `storyboard?.prompt || ad.veoPrompt`. On the gemini
-  // path storyboard is null (prepareStoryboard no-ops for non-atlas), and
-  // `ad.veoPrompt` is stamped as part of the RECEIPT — i.e. AFTER the submit.
-  // So on a first render it is null, and we would have submitted an EMPTY
-  // prompt alongside the (previously empty) reference list. Same bug class,
-  // one layer over: the caller cannot supply what does not exist yet.
-  //
-  // PRECEDENCE (B8 fix), matching atlasVideoService's opTrim rule
-  // (:5551-5570 there):
-  //   (1) an explicit `prompt` argument — dry-run / harness callers only;
-  //       the real videoRouter call site never supplies one (see that
-  //       file's "NO prompt ARGUMENT. This is deliberate" comment).
-  //   (2) a non-empty operatorPrompt ALWAYS wins, exactly like Atlas's
-  //       opTrim branch. Whitespace-only does not count as an override
-  //       (same trim-gate Atlas uses), so it falls through below.
-  //   (3) ad.veoPrompt ONLY when genuinely RESUMING (isResuming, computed
-  //       above) — that is the whole point of stamping it as part of the
-  //       receipt. The PREVIOUS version of this file checked ad.veoPrompt
-  //       unconditionally (whenever it happened to be non-empty, regardless
-  //       of isResuming), which silently discarded a fresh operatorPrompt on
-  //       every single regenerate — a regenerate ALWAYS has a stale
-  //       ad.veoPrompt from the render it is regenerating, and
-  //       adRegenerateService always calls this with allowResume:false (a
-  //       guaranteed new billable submit), so isResuming is false and the
-  //       operator's edit must win. This is the exact "Vaportek incident"
-  //       class of bug videoRouter.js's header comment documents as fixed by
-  //       moving prompt construction into this file — gating on isResuming
-  //       (not "ad.veoPrompt happens to be set") is what actually closes it.
-  //   (4) CORE, via the single builder, with the operator's text folded in.
-  const opTrim = typeof operatorPrompt === 'string' ? operatorPrompt.trim() : null;
   let effectivePrompt = typeof prompt === 'string' && prompt.trim() ? prompt : null;
-  if (!effectivePrompt && !opTrim && isResuming &&
-      typeof ad?.veoPrompt === 'string' && ad.veoPrompt.trim()) {
-    effectivePrompt = ad.veoPrompt;
-  }
-  if (!effectivePrompt) {
-    // CORE, via the single builder. Not a local copy of the text: the prompt
-    // is sha-pinned by scripts/verifyOperatorPromptPrecedence group A and a
-    // second copy here would drift the moment CORE is tuned.
-    effectivePrompt = buildVeoPrompt({
-      brand: null,
-      product: null,
-      media: null,
-      aspectRatio,
-      hasProductReference: refs.length > 1,
-      operatorPrompt: opTrim || null,
-      durationSec: secs,
-      platformFormat: ad?.platformFormat || null,
-      // Gemini publishes no prompt byte cap (Atlas's 20,000 is Atlas-only),
-      // and CORE is ~1.2 KB, so no cap is passed. enforceByteCap treats a
-      // null caps as the default ceiling, which CORE is nowhere near.
-      caps: null
-    });
-  }
-  if (!effectivePrompt || !effectivePrompt.trim()) {
-    const err = new Error('gemini video: refusing to submit with an empty prompt');
-    err.code = 'GEMINI_NO_PROMPT';
-    err.billed = 'no';
-    throw err;
-  }
-  if (!refs.length) {
-    // Belt and braces. assembleReferences throws rather than returning short,
-    // so reaching here means someone passed an empty array explicitly.
-    const err = new Error('gemini video: refusing to submit with zero reference images');
-    err.code = 'GEMINI_NO_REFERENCES';
-    err.billed = 'no';
-    throw err;
-  }
-
-  let interactionId = existing;
+  let interactionId = isResuming ? ad.veoPredictionId : null;
   let slot = null;
+  // Set ONLY by the resume backfill below. Never read by the submit call —
+  // that reads `refs`, which a resume never assigns.
+  let resumeBackfilledReferenceUrls = null;
+
+  if (isResuming) {
+    // Stamped prompt only — do not rebuild via buildVeoPrompt. Do not
+    // fetch refs TO SUBMIT. Do not acquire a lease. Do not POST.
+    if (typeof ad?.veoPrompt === 'string' && ad.veoPrompt.trim()) {
+      effectivePrompt = ad?.veoPrompt;
+    }
+
+    // ── RESUME REFERENCE BACKFILL — reporting only, never a submit input.
+    //
+    // The charge-point $set below is what FIRST persists
+    // Ad.veoReferenceImages. A receipt stamped by the pre-collapse code
+    // never wrote it, so resuming one of those ads used to report an
+    // empty stack: renderer.js co-persists whatever this function returns
+    // onto the Ad, and vision QC then falls back to a single
+    // CatalogProduct hero as ground truth — the pre-2026-09-02 M=1
+    // behaviour, which can false-positive-reject legitimate colorway or
+    // branding on an ALREADY-PAID master.
+    //
+    // Fix: re-derive the SAME stack a fresh submit would have used, via
+    // assembleReferences — the one function that already encodes both the
+    // default ranking (feed order, packshot-protected, distinctness cap)
+    // and an operator's own pick (ad.referenceMediaIds wins outright
+    // inside it). Nothing here re-implements that precedence.
+    //
+    // Best-effort and NON-FATAL: this is bookkeeping for a resume that has
+    // ALREADY decided not to submit anything, not a new billable step, so
+    // a failure here must never throw — that would turn a receipt-holding
+    // resume into exactly the GEMINI_REFS_* failure class F1 exists to
+    // keep off this path. A failure falls back to the pre-fix behaviour
+    // (empty array), not to a thrown error.
+    if (!(Array.isArray(ad?.veoReferenceImages) && ad.veoReferenceImages.length)) {
+      try {
+        const assembled = await assembleReferences({ ad, aspectRatioOverride: aspectRatio });
+        resumeBackfilledReferenceUrls = assembled.images.map((i) => i.sourceUrl).filter(Boolean);
+      } catch (err) {
+        // err?.message, not err.message: a non-Error rejection here must
+        // still log-and-continue, never throw a NEW error out of a catch
+        // whose whole job is to keep this resume alive (F1).
+        console.warn(
+          `⚠️  gemini video: resume reference backfill failed for ad=${ad._id}: ` +
+          `${err?.message || err} — reporting an empty stack rather than failing the resume`
+        );
+      }
+    }
+
+    console.log(
+      `gemini video[ad=${ad?._id}]: RESUMING existing interaction=${interactionId} — ` +
+      'receipt already on the Ad doc, not assembling refs to submit, not submitting'
+    );
+  } else {
+    // ── FRESH: ASSEMBLE OUR OWN REFERENCES. Do not trust the caller. ──
+    //
+    // This function originally took `images` as a required parameter, and BOTH
+    // callers passed `storyboard?.images` — which is ALWAYS [] on the gemini
+    // path, because videoRouter.prepareStoryboard returns {storyboard:null} for
+    // every non-atlas provider. So the merged version would have submitted ZERO
+    // references on every call: text-to-video instead of reference-to-video,
+    // ~$1 per useless master, with nothing in the response to indicate why.
+    //
+    // Owning assembly here removes the whole class of bug rather than fixing it
+    // at two call sites: a caller CANNOT forget. It also matches
+    // atlasVideoService, which likewise builds its own stack internally.
+    //
+    // An explicit non-empty `images` still wins, so a dry run or a harness can
+    // inject a known stack without touching Mongo.
+    if (!refs) {
+      const assembled = await assembleReferences({ ad, aspectRatioOverride: aspectRatio });
+      refs = assembled.images;
+    }
+  }
 
   if (!isResuming) {
+    // ── BUILD OUR OWN PROMPT TOO, for exactly the same reason. ─────────────
+    //
+    // Both callers passed `storyboard?.prompt || ad.veoPrompt`. On the gemini
+    // path storyboard is null (prepareStoryboard no-ops for non-atlas), and
+    // `ad.veoPrompt` is stamped as part of the RECEIPT — i.e. AFTER the submit.
+    // So on a first render it is null, and we would have submitted an EMPTY
+    // prompt alongside the (previously empty) reference list. Same bug class,
+    // one layer over: the caller cannot supply what does not exist yet.
+    //
+    // PRECEDENCE (B8 fix), matching atlasVideoService's opTrim rule
+    // (:5551-5570 there):
+    //   (1) an explicit `prompt` argument — dry-run / harness callers only;
+    //       the real videoRouter call site never supplies one (see that
+    //       file's "NO prompt ARGUMENT. This is deliberate" comment).
+    //   (2) a non-empty operatorPrompt ALWAYS wins, exactly like Atlas's
+    //       opTrim branch. Whitespace-only does not count as an override
+    //       (same trim-gate Atlas uses), so it falls through below.
+    //   (3) ad.veoPrompt is NOT consulted on the fresh path — that is the
+    //       stamped receipt prompt, used only on resume (above). Ungated
+    //       use of ad.veoPrompt is how a regenerate (allowResume:false)
+    //       silently resubmitted the previous prompt.
+    //   (4) CORE, via the single builder, with the operator's text folded in.
+    const opTrim = typeof operatorPrompt === 'string' ? operatorPrompt.trim() : null;
+    if (!effectivePrompt) {
+      // CORE, via the single builder. Not a local copy of the text: the prompt
+      // is sha-pinned by scripts/verifyOperatorPromptPrecedence group A and a
+      // second copy here would drift the moment CORE is tuned.
+      effectivePrompt = buildVeoPrompt({
+        brand: null,
+        product: null,
+        media: null,
+        aspectRatio,
+        hasProductReference: refs.length > 1,
+        operatorPrompt: opTrim || null,
+        durationSec: secs,
+        platformFormat: ad?.platformFormat || null,
+        // Gemini publishes no prompt byte cap (Atlas's 20,000 is Atlas-only),
+        // and CORE is ~1.2 KB, so no cap is passed. enforceByteCap treats a
+        // null caps as the default ceiling, which CORE is nowhere near.
+        caps: null
+      });
+    }
+    if (!effectivePrompt || !effectivePrompt.trim()) {
+      const err = new Error('gemini video: refusing to submit with an empty prompt');
+      err.code = 'GEMINI_NO_PROMPT';
+      err.billed = 'no';
+      throw err;
+    }
+    if (!refs.length) {
+      // Belt and braces. assembleReferences throws rather than returning short,
+      // so reaching here means someone passed an empty array explicitly.
+      const err = new Error('gemini video: refusing to submit with zero reference images');
+      err.code = 'GEMINI_NO_REFERENCES';
+      err.billed = 'no';
+      throw err;
+    }
+
     // ── THE LEASE. Acquired BEFORE the POST. A null slot means we cannot
     // prove we are under the provider cap, and the cost of guessing wrong is
     // a possibly-billed dead id — so this is a refusal, not a delay-and-send.
@@ -678,6 +743,11 @@ async function generateForAd({ ad, prompt = null, images = null, aspectRatio, du
             veoModel: resolvedModel,
             veoAspectRatio: aspectRatio,
             veoResolution: resolution,
+            // F1 resume skips assembleReferences, so these URLs must already
+            // be on the Ad or the later renderer co-persist writes []. Atlas
+            // stamps the same field at its charge point. Does NOT split the
+            // renderer veoVideoUrl+veoReferenceImages write.
+            veoReferenceImages: refs.map((i) => i.sourceUrl).filter(Boolean),
             updatedAt: new Date()
           }
         });
@@ -721,7 +791,19 @@ async function generateForAd({ ad, prompt = null, images = null, aspectRatio, du
       if (slot && typeof slot.heartbeat === 'function') {
         try { await slot.heartbeat(); } catch { /* TTL is the backstop; keep polling */ }
       }
-      body = await peekInteraction(interactionId);
+      try {
+        body = await peekInteraction(interactionId);
+      } catch (err) {
+        // Receipt already exists (fresh POST returned an id, or we are
+        // resuming). A GET transport failure must not stamp status:'failed'
+        // — that is invisible to bootRecovery and a later regenerate
+        // double-bills. Same flag as poll timeout / download-mirror failure.
+        err.unsettledAtTimeout = true;
+        err.billed = err.billed || 'possible';
+        err.predictionId = interactionId;
+        err.code = err.code || 'GEMINI_PEEK_FAILED';
+        throw err;
+      }
       verdict = classifyPoll(body);
       if (verdict.state !== 'pending') break;
       await sleep(POLL_INTERVAL_MS);
@@ -889,7 +971,11 @@ async function generateForAd({ ad, prompt = null, images = null, aspectRatio, du
       model: resolvedModel,
       aspectRatio,
       resolution,
-      referenceImages: refs.map((i) => i.sourceUrl).filter(Boolean),
+      referenceImages: isResuming
+        ? (Array.isArray(ad?.veoReferenceImages) && ad.veoReferenceImages.length
+            ? ad.veoReferenceImages
+            : (resumeBackfilledReferenceUrls || []))
+        : refs.map((i) => i.sourceUrl).filter(Boolean),
       costUsd: settled.costUsd,
       costSource: settled.costSource
     };
