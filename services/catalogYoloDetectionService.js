@@ -194,8 +194,18 @@ async function processQueue(products, { onDone = null, isCancelled = null, worke
   let next = 0, inflight = 0, processed = 0, stopped = false;
   let abortReason = null;
   await new Promise((resolve) => {
+    // The resolve check runs AFTER the while loop (not as an early-return
+    // guard before it) so that a `break` taken on the loop's very first
+    // iteration — e.g. the circuit breaker is already open when pump()
+    // is first called, before anything has been dispatched — still hits
+    // it. Guarding only at the top left that case with `stopped=true` and
+    // `inflight===0` but nothing left to invoke pump() again: no async work
+    // had started, so no `.finally()` callback existed to re-enter here and
+    // resolve. Placing the same check unconditionally at the end covers
+    // every exit from the loop (natural exhaustion, concurrency-full,
+    // breaker-open) the same way the old top-of-function re-entry guard
+    // did for repeated calls from completion callbacks.
     const pump = () => {
-      if ((next >= products.length || stopped) && inflight === 0) { resolve(); return; }
       while (!stopped && inflight < CONCURRENCY && next < products.length) {
         if (yoloLoadLimiter.isOpen()) {
           stopped = true;
@@ -247,6 +257,7 @@ async function processQueue(products, { onDone = null, isCancelled = null, worke
             pump();
           });
       }
+      if ((next >= products.length || stopped) && inflight === 0) { resolve(); }
     };
     pump();
   });
