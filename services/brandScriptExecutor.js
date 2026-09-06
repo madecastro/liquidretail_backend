@@ -1311,10 +1311,11 @@ async function runVideoVisionQcForAd({ ad, deliveredUrl, brandName = null }) {
       } catch { /* non-fatal — QC still runs, just with a generic brand label */ }
     }
 
-    // durationSec: SAME field + fallback basePlateCropService.js already
-    // relies on for the identical buildFrameUrls call (detectClipBoxes) —
-    // do not re-derive with a second convention (e.g. ffprobe).
-    const durationSec = Number(ad.videoDurationSec) > 0 ? Number(ad.videoDurationSec) : 8;
+    // durationSec: SAME helper basePlateCropService.js uses for detectClipBoxes
+    // (videoDurationPolicy.resolveAdVideoDurationSec) — do not re-derive with
+    // a second convention (e.g. ffprobe).
+    const { resolveAdVideoDurationSec } = require('./videoDurationPolicy');
+    const durationSec = resolveAdVideoDurationSec(ad);
     // Quartile sampling ALONE (25/50/75%, videoFrameService.planTimestamps)
     // is a good evidence set for a PERSISTENT defect — verified 2026-08-19
     // against a real delivered ad (run run_1787136860887_654ed621, Vuori

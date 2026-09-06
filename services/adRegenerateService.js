@@ -51,6 +51,7 @@ const directImage           = require('./directImageRenderService');
 const { resolveDeriveFromMaster, isGooglePmaxVideoFormat } = require('./campaignAdsGenerationService');
 const { isUgcFirstSeedingEnabled } = require('./seededUniverseService');
 const ugcVideoPipeline             = require('./ugcVideoPipeline');
+const { resolveAdVideoDurationSec } = require('./videoDurationPolicy');
 // Ad-gen microservice handoff (routing fix, 2026-08-26). Same call-time-read
 // helper the render loop's runRenderLoop gate uses (routes/ads.js:1856) and
 // titlingResumeService uses — read at call time, not at boot, so a dashboard
@@ -938,7 +939,7 @@ async function runVideoFull(adId, prompt, progressRun = null, videoModel = null,
     ? await ugcVideoPipeline.preparePassthroughMaster({
         media:       ugcSourceMedia,
         aspectRatio: ad1?.aspectRatio || '9:16',
-        durationSec: 8
+        durationSec: resolveAdVideoDurationSec(ad1)
       })
     : { passthrough: false, reason: 'no source Media' };
 
