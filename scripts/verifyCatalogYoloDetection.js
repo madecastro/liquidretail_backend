@@ -65,6 +65,12 @@ for (const [i, key] of needsEnv.entries()) {
   if (envSrc.split('\n').some((line) => line.startsWith(key))) pass(`B${2 + i}`, `${key} present in defaults.env`);
   else fail(`B${2 + i}`, `${key} missing from defaults.env`);
 }
+{
+  const maxLine = envSrc.split('\n').find((line) => line.startsWith('CATALOG_YOLO_MAX_PER_RUN='));
+  const maxVal = maxLine ? maxLine.slice('CATALOG_YOLO_MAX_PER_RUN='.length).trim() : null;
+  if (maxVal === '0' || maxVal === '') pass('B8', 'CATALOG_YOLO_MAX_PER_RUN file default is 0/empty (uncapped)');
+  else fail('B8', `CATALOG_YOLO_MAX_PER_RUN file default must be uncapped 0, got ${JSON.stringify(maxVal)}`);
+}
 
 // ── C: sync-path hooks — 4 files ──
 const syncFiles = [
@@ -404,6 +410,27 @@ try {
   }
 } catch (e) {
   info('N7', `cross-repo scan failed: ${e.message}`);
+}
+
+// ── O: per-run cap is genuinely uncapped by default ──
+// Behavioral pin: 600 candidates must all survive applyRunCap under the
+// default parser. A silent return of slice(0, 500) is the bug this
+// group exists to catch. Positive override still truncates.
+try {
+  const yoloMod = require('../services/catalogYoloDetectionService');
+  if (typeof yoloMod.parseMaxPerRun === 'function' && typeof yoloMod.applyRunCap === 'function') {
+    const sixHundred = Array.from({ length: 600 }, (_, i) => i);
+    const uncapped = yoloMod.applyRunCap(sixHundred, yoloMod.parseMaxPerRun(undefined));
+    if (uncapped.length === 600) pass('O1', 'applyRunCap keeps all 600 candidates when uncapped (not truncated to 500)');
+    else fail('O1', `applyRunCap truncated 600 → ${uncapped.length} under default (must keep 600)`);
+    const recapped = yoloMod.applyRunCap(sixHundred, yoloMod.parseMaxPerRun('500'));
+    if (recapped.length === 500) pass('O2', 'applyRunCap still honours a positive CATALOG_YOLO_MAX_PER_RUN override');
+    else fail('O2', `positive override should cap at 500, got ${recapped.length}`);
+  } else {
+    fail('O1', 'parseMaxPerRun / applyRunCap not exported on catalogYoloDetectionService');
+  }
+} catch (e) {
+  fail('O1', `require catalogYoloDetectionService for O-group threw: ${e.message}`);
 }
 
 // ── Summary ──

@@ -40,13 +40,26 @@ const { detectYoloForMediaBatch } = require('./mediaYoloRefine');
 
 const { concurrency: CONC } = require('./concurrency');
 const CONCURRENCY = CONC.CATALOG_YOLO_CONCURRENCY;
-const MAX_PER_RUN = Math.max(1, parseInt(process.env.CATALOG_YOLO_MAX_PER_RUN, 10) || 500);
+// Per-run ceiling. Unset / 0 / negative / NaN → uncapped. A positive
+// integer re-caps one brand run. Default is uncapped so an operator who
+// does nothing gets no ceiling (owner 2026-09-05). Shared with
+// catalogMediaMaterializeService via the same env name and parser.
+function parseMaxPerRun(raw) {
+  const n = Number(raw);
+  return n > 0 ? n : Infinity;
+}
+const MAX_PER_RUN = parseMaxPerRun(process.env.CATALOG_YOLO_MAX_PER_RUN);
+function applyRunCap(candidates, cap = MAX_PER_RUN) {
+  if (!Array.isArray(candidates)) return [];
+  return Number.isFinite(cap) ? candidates.slice(0, cap) : candidates;
+}
 const ALT_LIMIT = Math.max(0, parseInt(process.env.CATALOG_YOLO_ALT_LIMIT, 10) || 7);
 
 (function logConfig() {
+  const maxLabel = Number.isFinite(MAX_PER_RUN) ? MAX_PER_RUN : 'uncapped';
   console.log(
     `🎯 catalogYoloDetectionService config — ` +
-    `concurrency=${CONCURRENCY} maxPerRun=${MAX_PER_RUN} altLimit=${ALT_LIMIT}`
+    `concurrency=${CONCURRENCY} maxPerRun=${maxLabel} altLimit=${ALT_LIMIT}`
   );
 })();
 
@@ -190,12 +203,12 @@ async function runYoloDetection(brandId, { onlyGaps, label }) {
     const missingSet = new Set(missingProductIds.map(String));
     candidates = rows.filter((r) => missingSet.has(String(r._id)));
   }
-  const targets = candidates.slice(0, MAX_PER_RUN);
+  const targets = applyRunCap(candidates);
 
   console.log(
     `🎯 catalogYoloDetection[brand=${brandId}]: ${label} — ` +
     `${rows.length} products, ${targets.length} target(s) ` +
-    `(onlyGaps=${!!onlyGaps} cap=${MAX_PER_RUN}, concurrency=${CONCURRENCY}, altLimit=${ALT_LIMIT})`
+    `(onlyGaps=${!!onlyGaps} cap=${Number.isFinite(MAX_PER_RUN) ? MAX_PER_RUN : 'uncapped'}, concurrency=${CONCURRENCY}, altLimit=${ALT_LIMIT})`
   );
   if (!targets.length) {
     return { ok: true, total: rows.length, detected: 0, skipped: rows.length, durationMs: Date.now() - t0 };
@@ -264,5 +277,7 @@ module.exports = {
   detectBrandYolo,
   // Exported for tests + one-off scripts.
   detectYoloForOne,
-  needsYoloDetection
+  needsYoloDetection,
+  parseMaxPerRun,
+  applyRunCap
 };

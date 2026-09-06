@@ -36,9 +36,10 @@
 //     data a single product page can't provide; it's opt-in because it
 //     costs ~$0.05–0.12/product and most catalog products never become ads.
 //
-// Both paths are capped, concurrency-limited, and surfaced as a
-// cancellable OperationRun (kind 'enrichment') so the work is visible in
-// the ActivityBar dock and can be stopped mid-flight (partials kept).
+// Both paths are concurrency-limited and surfaced as a cancellable
+// OperationRun (kind 'enrichment') so the work is visible in the
+// ActivityBar dock and can be stopped mid-flight (partials kept).
+// Per-run product count is uncapped by default (see parseMaxPerRun).
 //
 // Idempotent: the underlying reviews/details services check their 30-day
 // caches (+ gtin/mpn sibling dedup) first, so re-running is cheap.
@@ -48,8 +49,9 @@
 //                     + 1 Gemini grounded-search → ~$0.05–0.12
 //   - productReviews: 1 Gemini grounded-search → ~$0.02–0.05
 //   - Sibling-hit on gtin/mpn (V3 dedup) → $0
-// Cap brand-wide spend by tuning CATALOG_ENRICHMENT_CONCURRENCY and the
-// max-per-brand limit below.
+// Cap in-flight spend by tuning CATALOG_ENRICHMENT_CONCURRENCY. An optional
+// per-run ceiling still exists (CATALOG_ENRICHMENT_MAX_PER_RUN) but defaults
+// to uncapped — a positive integer re-caps one run if ever needed.
 
 const CatalogProduct        = require('../models/CatalogProduct');
 const productDetailsService = require('./productDetailsService');
@@ -63,18 +65,24 @@ const {
 
 const { concurrency: CONC } = require('./concurrency');
 const CONCURRENCY = CONC.CATALOG_ENRICHMENT_CONCURRENCY;
-// Hard cap on how many products we'll enrich per run. Large catalogs
-// (5000+ items) shouldn't dump $500 of API spend in one go; the rest
-// lazy-fetch on first match or on the next "Enrich" click.
-const MAX_PER_RUN = Math.max(
-  1,
-  parseInt(process.env.CATALOG_ENRICHMENT_MAX_PER_RUN, 10) || 500
-);
+// Per-run ceiling. Unset / 0 / negative / NaN → uncapped. A positive
+// integer re-caps one brand run. Default is uncapped so an operator who
+// does nothing gets no ceiling (owner 2026-09-05).
+function parseMaxPerRun(raw) {
+  const n = Number(raw);
+  return n > 0 ? n : Infinity;
+}
+const MAX_PER_RUN = parseMaxPerRun(process.env.CATALOG_ENRICHMENT_MAX_PER_RUN);
+function applyRunCap(candidates, cap = MAX_PER_RUN) {
+  if (!Array.isArray(candidates)) return [];
+  return Number.isFinite(cap) ? candidates.slice(0, cap) : candidates;
+}
 
 (function logConfig() {
+  const maxLabel = Number.isFinite(MAX_PER_RUN) ? MAX_PER_RUN : 'uncapped';
   console.log(
     `🛒 catalogProductEnrichmentService config — ` +
-    `concurrency=${CONCURRENCY} maxPerRun=${MAX_PER_RUN} ` +
+    `concurrency=${CONCURRENCY} maxPerRun=${maxLabel} ` +
     `productDetailsEnabled=${productDetailsService.isEnabled()}`
   );
 })();
@@ -239,12 +247,12 @@ async function runEnrichment(brandId, { includeDetails, onlyGaps, label }) {
     .lean();
 
   const candidates = onlyGaps ? rows.filter(needsEnrichment) : rows;
-  const targets = candidates.slice(0, MAX_PER_RUN);
+  const targets = applyRunCap(candidates);
 
   console.log(
     `🛒 catalogProductEnrichment[brand=${brandId}]: ${label} — ` +
     `${rows.length} products, ${targets.length} target(s) ` +
-    `(onlyGaps=${!!onlyGaps} includeDetails=${!!includeDetails} cap=${MAX_PER_RUN}, concurrency=${CONCURRENCY})` +
+    `(onlyGaps=${!!onlyGaps} includeDetails=${!!includeDetails} cap=${Number.isFinite(MAX_PER_RUN) ? MAX_PER_RUN : 'uncapped'}, concurrency=${CONCURRENCY})` +
     (reviewScrape
       ? ` · on-site reviews: ${reviewScrape.captured}/${reviewScrape.candidates} captured, ${reviewScrape.withQuotes} with quotes`
       : '')
@@ -311,7 +319,7 @@ async function enqueueBrandProductEnrichment(brandId) {
 
 // USER-ACTUATED path — called from POST /api/sales-demos/brands/:id/enrich.
 // Full cross-seller details + web-wide reviews for every non-draft
-// product (capped). This is where the SerpAPI/Gemini spend lives now.
+// product. This is where the SerpAPI/Gemini spend lives now.
 async function enrichBrandDetails(brandId) {
   return runEnrichment(brandId, {
     includeDetails: true,
@@ -325,5 +333,7 @@ module.exports = {
   enrichBrandDetails,
   // exported for tests / one-off scripts
   enrichOne,
-  needsEnrichment
+  needsEnrichment,
+  parseMaxPerRun,
+  applyRunCap
 };

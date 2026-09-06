@@ -361,7 +361,7 @@ genuinely beats a heuristic:
 | `quoteSnippetService` | pull a ≤50-char extractive phrase out of the winning quote for a video overlay | per ad, only when the quote exceeds 50 chars | **`review-text` role** |
 | `layoutInputService` derivation | writes ad copy with review quotes/rating as one input among many | per (media × template × ratio), cached on `LayoutInputArtifact` | `gemini-2.5-pro` |
 | `categoryReviewsService` | grounded search → category-level review narrative | per (brand, category), cached 30 days | `gemini-2.5-flash` |
-| `geminiSearchProvider.lookup{Brand,Product}Reviews` | grounded web search when the free scrape found **nothing** | gap-fill only, capped `CATALOG_ENRICHMENT_MAX_PER_RUN` (500), cached 30 days | `gemini-2.5-flash` |
+| `geminiSearchProvider.lookup{Brand,Product}Reviews` | grounded web search when the free scrape found **nothing** | gap-fill only, optional `CATALOG_ENRICHMENT_MAX_PER_RUN` (default uncapped), cached 30 days | `gemini-2.5-flash` |
 | `productDetailsService.fetchReviewSummary` | narrative review summary | user-actuated "Enrich" only (~$0.05-0.12/product) | `gemini-2.5-flash` |
 
 #### What a grounded review lookup actually costs — and where it lands
