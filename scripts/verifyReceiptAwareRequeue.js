@@ -38,10 +38,13 @@
 //   (b) In processAlerts persistOrphans, drop them there -> P* fail.
 //   (c) Add a THIRD unconditional `status: 'rendering'` -> `queued` write
 //       anywhere in worker.js / services/ -> X1 fails (the exhaustive scan).
+//   (d) In worker.js reapOrphans, drop `claimedByWorker: null` from the
+//       receiptFree filter -> W5 fails (an adgen-claimed row is reaped).
 //   Report the failing output verbatim when proving.
 //
 // Covered:
-//   W*  worker.js reapOrphans excludes both receipt fields
+//   W*  worker.js reapOrphans excludes both receipt fields AND does not
+//       reap rows already claimed by an adgen worker (claimedByWorker set)
 //   P*  processAlerts persistOrphans excludes both receipt fields
 //   R*  receipt-free ads are still requeued (the fix did not strand work)
 //   X*  exhaustive: no OTHER site requeues rendering -> queued unguarded
@@ -159,6 +162,118 @@ checkTrue('W2 worker reaper still filters on status rendering + a staleness cuto
 // Visibility: an ad left in `rendering` on purpose must not look like a bug.
 checkTrue('W3 the worker logs the ads it deliberately did NOT requeue',
   /hold a spend receipt/.test(WORKER) && /NOT requeued/.test(WORKER));
+
+// ── W4–W7: claimedByWorker:null is a MONEY conjunct, not decoration ────
+// Adgen claims rows via findOneAndUpdate({status:'rendering',
+// claimedByWorker:null}, {$set:{claimedByWorker, claimedAt}}). Without this
+// conjunct the backend reaper would $set status:'queued' on ads adgen is
+// currently rendering, stealing the claim (observed 2026-08-22: derive
+// b431a9 accumulated 15 runIds in ~5 hours while adgen was mid-wait for a
+// sibling master). A source-text "the words are still there" pin would stay
+// green if the conjunct were moved into a comment; these checks evaluate
+// the REAL worker.js reaper filter against a constructed document.
+//
+// Matcher supports exactly what receiptFree(reaper-inner) emits: $and, $or,
+// $lt, $in, $exists, dotted paths, and plain equality (incl. Mongo's
+// missing===null). Unsupported operators throw — extend on purpose.
+function getPath(doc, dotted) {
+  return dotted.split('.').reduce((o, k) => (o == null ? undefined : o[k]), doc);
+}
+function mongoNullEquals(actual, operand) {
+  if (operand === null) return actual === null || actual === undefined;
+  return actual === operand;
+}
+function matchesCondition(actual, cond) {
+  if (cond !== null && typeof cond === 'object' && !Array.isArray(cond) && !(cond instanceof Date)) {
+    for (const [op, operand] of Object.entries(cond)) {
+      if (op === '$lt') {
+        if (actual == null) return false;
+        const a = actual instanceof Date ? actual.getTime() : actual;
+        const b = operand instanceof Date ? operand.getTime() : operand;
+        if (!(a < b)) return false;
+      } else if (op === '$in') {
+        if (!operand.some((v) => mongoNullEquals(actual, v))) return false;
+      } else if (op === '$nin') {
+        if (operand.some((v) => mongoNullEquals(actual, v))) return false;
+      } else if (op === '$exists') {
+        const exists = actual !== undefined;
+        if (operand ? !exists : exists) return false;
+      } else {
+        throw new Error(`matchesCondition: unsupported operator ${op} — extend deliberately`);
+      }
+    }
+    return true;
+  }
+  return mongoNullEquals(actual, cond);
+}
+function matchesFilter(doc, filter) {
+  for (const [key, cond] of Object.entries(filter)) {
+    if (key === '$and') {
+      if (!cond.every((sub) => matchesFilter(doc, sub))) return false;
+      continue;
+    }
+    if (key === '$or') {
+      if (!cond.some((sub) => matchesFilter(doc, sub))) return false;
+      continue;
+    }
+    if (!matchesCondition(getPath(doc, key), cond)) return false;
+  }
+  return true;
+}
+function extractReceiptFreeArg(block) {
+  const start = block.indexOf('receiptFree(');
+  if (start < 0) return null;
+  let i = start + 'receiptFree('.length;
+  while (i < block.length && /\s/.test(block[i])) i++;
+  if (block[i] !== '{') return null;
+  const objStart = i;
+  let depth = 0;
+  for (; i < block.length; i++) {
+    const c = block[i];
+    if (c === '{') depth++;
+    else if (c === '}') {
+      depth--;
+      if (depth === 0) return block.slice(objStart, i + 1);
+    }
+  }
+  return null;
+}
+
+const objSrc = extractReceiptFreeArg(wBlock);
+checkTrue('W4 worker reaper filter is extractable (receiptFree arg)', !!objSrc,
+  'adRequeueBlock did not contain a receiptFree({...}) object literal');
+
+const REAP_CUTOFF = new Date('2026-09-06T00:00:00Z');
+let reaperFilter = null;
+if (objSrc) {
+  try {
+    reaperFilter = receiptFree(Function('cutoff', `"use strict"; return (${objSrc});`)(REAP_CUTOFF));
+  } catch (err) {
+    checkTrue('W4b extracted reaper filter evaluates', false, err && err.message);
+  }
+}
+
+const STALE = new Date(REAP_CUTOFF.getTime() - 20 * 60 * 1000);
+const claimedAdgenRow = {
+  status: 'rendering',
+  updatedAt: STALE,
+  claimedByWorker: 'some-adgen-worker-id',
+  veoPredictionId: null,
+  imageGeneration: { predictionId: null }
+};
+
+checkTrue('W5 a stale receipt-free rendering ad claimed by adgen is NOT reaped',
+  !!reaperFilter && matchesFilter(claimedAdgenRow, reaperFilter) === false);
+
+checkTrue('W6 the same row with claimedByWorker:null IS reaped (conjunct is the only reason W5 holds)',
+  !!reaperFilter && matchesFilter({ ...claimedAdgenRow, claimedByWorker: null }, reaperFilter) === true);
+
+{
+  const withoutClaimConjunct = reaperFilter ? { ...reaperFilter } : null;
+  if (withoutClaimConjunct) delete withoutClaimConjunct.claimedByWorker;
+  checkTrue('W7 dropping claimedByWorker:null WOULD match the adgen-claimed row (W5 is not vacuous)',
+    !!withoutClaimConjunct && matchesFilter(claimedAdgenRow, withoutClaimConjunct) === true);
+}
 
 // ── P: processAlerts persistOrphans (fires on EVERY deploy) ───────────
 const pBlock = adRequeueBlock(ALERTS);
