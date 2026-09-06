@@ -171,7 +171,21 @@ function applyShopifyFontIngestResult(brand, result) {
   const incomingHasSignal = !!(incoming && (incoming.heading || incoming.body || incoming.button));
   const existingHasSignal = !!(existing && (existing.heading || existing.body || existing.button));
   if (incomingHasSignal || !existingHasSignal) {
-    brand.websiteFontUsage = incoming || existing || null;
+    // A Shopify result with only body+button must never wipe a prior
+    // website-scan heading. Filling heading is the whole point of the
+    // website path for static + future pairing; a weaker later scan
+    // cannot downgrade a non-null heading to null.
+    const existingHeading = existing?.heading || null;
+    const incomingHeading = incoming?.heading || null;
+    if (incoming && existingHeading && !incomingHeading) {
+      brand.websiteFontUsage = {
+        ...incoming,
+        heading: existingHeading,
+        headingGeneric: incoming.headingGeneric || existing.headingGeneric || null,
+      };
+    } else {
+      brand.websiteFontUsage = incoming || existing || null;
+    }
     brand.markModified?.('websiteFontUsage');
   }
 

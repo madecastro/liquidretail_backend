@@ -670,6 +670,14 @@ const AKTIV_BRAND = {
     && !fc.isIconFontFamily('Playfair Display')
     && !fc.isIconFontFamily('aktiv-grotesk')
     && !fc.isIconFontFamily('Iconic'));
+  check('C9 (a) isIconFontFamily matches digital-7 / led / 7seg junk',
+    fc.isIconFontFamily('digital-7_monomono')
+    && fc.isIconFontFamily('Digital-7')
+    && fc.isIconFontFamily('7seg')
+    && fc.isIconFontFamily('led'));
+  check('C9 (a) isIconFontFamily does not treat ledger/oled as junk',
+    !fc.isIconFontFamily('Ledger')
+    && !fc.isIconFontFamily('oled-sans'));
   check('C9 (a) a :before icon-font rule yields no button evidence',
     ingest.extractFontUsageFromCss(
       '.oke-button.oke-is-loading:before{font-family:oke-widget-icons!important}'

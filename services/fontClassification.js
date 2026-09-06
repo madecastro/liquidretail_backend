@@ -276,7 +276,14 @@ function storedGenericForFamily(brand, family) {
 function isIconFontFamily(family) {
   const lower = String(family || '').trim().toLowerCase();
   if (!lower) return false;
-  return /(?:^|[^a-z0-9])(?:icons?|glyphicons?|font[-\s]?awesome|material[-\s]?icons?|icomoon)(?:[^a-z0-9]|$)/i
+  if (/(?:^|[^a-z0-9])(?:icons?|glyphicons?|font[-\s]?awesome|material[-\s]?icons?|icomoon)(?:[^a-z0-9]|$)/i
+    .test(lower)) {
+    return true;
+  }
+  // Dingbat / LED-display junk that is not a brand typeface. Gymshark's
+  // ingested `digital-7_monomono` otherwise wins customFonts[0] and gets
+  // named to gpt-image-2 as the headline face.
+  return /(?:^|[^a-z0-9])(?:digital-?7|7seg(?:ment)?|seven-?seg(?:ment)?|led)(?:[^a-z0-9]|$)/i
     .test(lower);
 }
 

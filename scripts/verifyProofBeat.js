@@ -1124,6 +1124,60 @@ check('F3 the scraped face wins only when it can actually be served', () => {
   });
 });
 
+check('F3 pairing flag-off is a no-op; flag-on splits only a proven serif+sans pair', () => {
+  const { buildFontLadders } = require('../services/fontResolverService');
+  const prev = process.env.FONT_ROLE_PAIRING_ENABLED;
+  const pairingBrand = {
+    name: 'SoludosReingest',
+    fontFamily: 'Newsreader',
+    customFonts: [
+      { family: 'Newsreader', url: 'https://x/n.woff2' },
+      { family: 'DM Sans', url: 'https://x/d.woff2' },
+    ],
+    websiteFontUsage: {
+      heading: 'Newsreader', body: 'DM Sans',
+      headingGeneric: 'serif', bodyGeneric: 'sans-serif',
+      evidence: [
+        { family: 'Newsreader', role: 'heading', selector: 'h1', score: 4 },
+        { family: 'DM Sans', role: 'body', selector: 'body', score: 3 },
+      ],
+    },
+  };
+  const gymshark = {
+    name: 'Gymshark',
+    fontFamily: 'Montserrat',
+    customFonts: [
+      { family: 'Montserrat', url: 'https://x/m.woff2' },
+      { family: 'Roboto', url: 'https://x/r.woff2' },
+    ],
+    websiteFontUsage: {
+      heading: 'Montserrat', body: 'Roboto',
+      headingGeneric: 'sans-serif', bodyGeneric: 'sans-serif',
+      evidence: [
+        { family: 'Montserrat', role: 'heading', selector: 'h1', score: 4 },
+        { family: 'Roboto', role: 'body', selector: 'body', score: 3 },
+      ],
+    },
+  };
+  try {
+    delete process.env.FONT_ROLE_PAIRING_ENABLED;
+    const offPair = JSON.stringify(buildFontLadders(pairingBrand).ladders);
+    const offGym = JSON.stringify(buildFontLadders(gymshark).ladders);
+    process.env.FONT_ROLE_PAIRING_ENABLED = 'false';
+    assert.strictEqual(JSON.stringify(buildFontLadders(pairingBrand).ladders), offPair);
+    assert.strictEqual(JSON.stringify(buildFontLadders(gymshark).ladders), offGym);
+    process.env.FONT_ROLE_PAIRING_ENABLED = 'true';
+    const onPair = buildFontLadders(pairingBrand).ladders;
+    const onGym = JSON.stringify(buildFontLadders(gymshark).ladders);
+    assert.notStrictEqual(JSON.stringify(onPair), offPair, 'proven serif+sans must change under flag-on');
+    assert.strictEqual(onPair.body.filter(([f]) => f)[0][0], 'DM Sans');
+    assert.strictEqual(onGym, offGym, 'two-sans Gymshark stays collapsed with flag on');
+  } finally {
+    if (prev === undefined) delete process.env.FONT_ROLE_PAIRING_ENABLED;
+    else process.env.FONT_ROLE_PAIRING_ENABLED = prev;
+  }
+});
+
 check('K6 ink is chosen for the band the type lands on, not the whole plate', () => {
   // THE DELIVERED DEFECT: an AllBirds 4:5 whose plate is mostly light (cream shoe,
   // pale ground) flipped ink DARK by the global vote, while the band the type

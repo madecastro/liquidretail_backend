@@ -275,6 +275,60 @@ check('R2 fontsToUrls uses fontRouteForLocalPath', () => {
   assert.ok(/fontRouteForLocalPath\s*\(\s*f\.url\s*\)/.test(src));
 });
 
+// ── D. FontFace weight descriptor STRING shape ────────────────────────────
+// A variable file must register as `"min max"` so one face covers 400–900.
+// Static-cut brands (no min/max) keep today's single-value string. Pin the
+// shape, not merely that a weight value is present — `"700"` and `"100 900"`
+// are different CSS descriptors and Chromium synthesises anything the
+// registered descriptor does not cover.
+{
+  const { fontFaceWeightDescriptor } = require('../services/fontResolverService');
+  check('D1 single-weight descriptor is the numeric string (static-cut brands)', () => {
+    assert.strictEqual(fontFaceWeightDescriptor({ weight: 700 }), '700');
+    assert.strictEqual(fontFaceWeightDescriptor({ weight: 400 }), '400');
+    assert.strictEqual(fontFaceWeightDescriptor({ weight: '500' }), '500');
+  });
+  check('D2 range descriptor is "min max" when both endpoints are finite', () => {
+    assert.strictEqual(
+      fontFaceWeightDescriptor({ weight: 700, weightMin: 100, weightMax: 900 }),
+      '100 900'
+    );
+    assert.strictEqual(
+      fontFaceWeightDescriptor({ weight: 600, weightMin: 100, weightMax: 900 }),
+      '100 900'
+    );
+  });
+  check('D3 missing/NaN min or max falls back to the single-value string', () => {
+    assert.strictEqual(fontFaceWeightDescriptor({ weight: 700, weightMin: 100 }), '700');
+    assert.strictEqual(fontFaceWeightDescriptor({ weight: 700, weightMax: 900 }), '700');
+    assert.strictEqual(fontFaceWeightDescriptor({ weight: 700, weightMin: null, weightMax: null }), '700');
+  });
+  check('D4 FontLoader.jsx uses the range form, not String(weight) alone', () => {
+    const src = fs.readFileSync(path.join(ROOT, 'remotion/components/FontLoader.jsx'), 'utf8');
+    const codeOnly = stripComments(src);
+    assert.ok(
+      /function\s+fontFaceWeightDescriptor\s*\(/.test(codeOnly),
+      'FontLoader must compute the descriptor (not pass weight through raw)'
+    );
+    assert.ok(
+      /Number\.isFinite\(\s*min\s*\)\s*&&\s*Number\.isFinite\(\s*max\s*\)/.test(codeOnly),
+      'range form requires both endpoints finite'
+    );
+    assert.ok(
+      /weightMin == null \|\| weightMin === ''/.test(codeOnly),
+      'null min/max must not Number()-coerce to 0 (which isFinite)'
+    );
+    assert.ok(
+      /`\$\{min\} \$\{max\}`/.test(codeOnly),
+      'range descriptor must be the two-number string "min max"'
+    );
+    assert.ok(
+      /weight:\s*fontFaceWeightDescriptor\s*\(/.test(codeOnly),
+      'new FontFace must receive the computed descriptor, not String(weight)'
+    );
+  });
+}
+
 // ── summary ───────────────────────────────────────────────────────────────
 console.log(`\n${pass} passed, ${failures.length} failed`);
 if (failures.length) {

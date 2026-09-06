@@ -49,14 +49,32 @@ function getFontFormat(url) {
   }
 }
 
+/**
+ * CSS FontFace `weight` descriptor. A variable file with a finite
+ * weightMin/weightMax must register as a RANGE (`"100 900"`) so one face
+ * covers heading 700, body 500, quote 400, Pelagic 600/800 slots, and the
+ * Canonical +100 bump. Static-cut brands (no min/max) keep today's single
+ * value. Shape is load-bearing — Chromium synthesises any CSS weight the
+ * registered descriptor does not cover.
+ */
+function fontFaceWeightDescriptor({ weight, weightMin, weightMax } = {}) {
+  // Do not Number()-coerce first: Number(null) is 0, which isFinite, and
+  // would register the illegal range "0 0" for every static-cut token.
+  const min = weightMin == null || weightMin === '' ? NaN : Number(weightMin);
+  const max = weightMax == null || weightMax === '' ? NaN : Number(weightMax);
+  if (Number.isFinite(min) && Number.isFinite(max)) return `${min} ${max}`;
+  if (weight != null && weight !== '') return String(weight);
+  return undefined;
+}
+
 /** Load one face without ever calling cancelRender. */
-async function loadFontSafe({ family, url, weight, style }) {
+async function loadFontSafe({ family, url, weight, style, weightMin, weightMax }) {
   const fmt = getFontFormat(url);
   const source = fmt
     ? `url('${url}') format('${fmt}')`
     : `url('${url}')`;
   const font = new FontFace(family, source, {
-    weight: weight != null && weight !== '' ? String(weight) : undefined,
+    weight: fontFaceWeightDescriptor({ weight, weightMin, weightMax }),
     style: style || 'normal',
   });
   await font.load();
@@ -78,10 +96,11 @@ export function useBrandFonts(fonts) {
     };
 
     const entries = Object.values(fonts || {}).filter((f) => f && f.family && f.url);
-    // dedupe by family+weight+url
+    // dedupe by family+descriptor+url so a variable range registers once
     const seen = new Set();
     const unique = entries.filter((f) => {
-      const k = `${f.family}|${f.weight || ''}|${f.url}`;
+      const desc = fontFaceWeightDescriptor(f);
+      const k = `${f.family}|${desc || ''}|${f.url}`;
       if (seen.has(k)) return false;
       seen.add(k);
       return true;
@@ -97,6 +116,8 @@ export function useBrandFonts(fonts) {
           url: f.url,
           weight: f.weight,
           style: f.style || 'normal',
+          weightMin: f.weightMin,
+          weightMax: f.weightMax,
         }).catch((e) => {
           // Soft-fail only — never cancelRender. Role CSS keeps its generic stack.
           // eslint-disable-next-line no-console

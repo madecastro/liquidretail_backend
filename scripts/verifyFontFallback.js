@@ -521,6 +521,44 @@ check('L6 default (unset) assume-licensed is true', () => {
   });
 });
 
+// ── Q. Quote uses the ingested italic file when present ──────────────────
+const brandWithItalic = {
+  customFonts: [
+    { family: 'DM Sans', weight: 400, style: 'normal', url: 'https://res.cloudinary.com/x/dm-sans-400.woff2' },
+    { family: 'DM Sans', weight: 400, style: 'italic', url: 'https://res.cloudinary.com/x/dm-sans-400-italic.woff2' },
+  ],
+};
+check('Q1 matchCustomFont({style:italic}) returns the italic file', () => {
+  const hit = matchCustomFont(brandWithItalic, 'DM Sans', { weight: 400, style: 'italic' });
+  assert.ok(hit, 'expected italic match');
+  assert.strictEqual(hit.style, 'italic');
+  assert.ok(/italic/.test(hit.url), hit.url);
+});
+check('Q2 default matchCustomFont (heading/body) still returns roman', () => {
+  const hit = matchCustomFont(brandWithItalic, 'DM Sans', { weight: 400 });
+  assert.ok(hit);
+  assert.strictEqual(hit.style || 'normal', 'normal');
+  assert.ok(!/italic/.test(hit.url), hit.url);
+});
+check('Q3 resolveFamily quote path requests italic first, heading/body do not', () => {
+  const src = require('fs').readFileSync(require('path').join(ROOT, 'services', 'fontResolverService.js'), 'utf8');
+  assert.ok(
+    /roleKey\(role\) === 'quote'/.test(src),
+    'italic lookup must be scoped to the quote role'
+  );
+  assert.ok(
+    /style:\s*'italic'/.test(src),
+    'quote lookup must request style italic'
+  );
+  const quoteBlock = src.slice(src.indexOf("roleKey(role) === 'quote'"));
+  const headingLookup = src.match(/async function resolveFamily[\s\S]*?const custom = matchCustomFont\(brand, family, \{ weight \}\)/);
+  assert.ok(headingLookup, 'roman matchCustomFont(brand, family, { weight }) must still exist for heading/body');
+  assert.ok(
+    /matchCustomFont\(brand, family, \{ weight, style: 'italic' \}\)/.test(quoteBlock),
+    'quote must call matchCustomFont with style italic before the roman fallback'
+  );
+});
+
 // ── summary ───────────────────────────────────────────────────────────────
 console.log(`\n${pass} passed, ${failures.length} failed`);
 if (failures.length) {

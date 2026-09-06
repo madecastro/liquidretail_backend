@@ -382,6 +382,47 @@ check('E3 does not clobber a better existing websiteFontUsage with an empty Shop
   assert.ok(brand.shopifyFontsIngestedAt instanceof Date, 'the attempt itself is still recorded (this brand genuinely has no theme fonts to add)');
 });
 
+check('E4 Pelagic-shaped: Shopify body+button must not wipe a prior website heading', () => {
+  // Live pelagicgear.com (fetched 2026-09-06): the real heading selector is
+  // `.headline` (h1.headline.headline--s). That token is ALREADY in the
+  // heading-role regex (`headline`). The `.headline` rule sets size/weight/
+  // variation-settings but NOT font-family — headings inherit ArchivoV from
+  // `body { font-family: "ArchivoV", sans-serif }`. Expanding the regex
+  // cannot fill a missing heading when the heading rule has no family. The
+  // persist bug still can: a later Shopify scan with only body+button used
+  // to replace the entire usage object and null out a prior heading.
+  const brand = {
+    customFonts: [{ family: 'ArchivoV', url: 'https://res.cloudinary.com/x/archivo.woff2', license: 'unknown', needsLicense: false }],
+    websiteFontUsage: { heading: 'ArchivoV', body: 'ArchivoV', headingGeneric: 'sans-serif', bodyGeneric: 'sans-serif' },
+    fontFamily: 'ArchivoV',
+    fontSource: 'website',
+    curatedFields: [],
+  };
+  applyShopifyFontIngestResult(brand, {
+    ingested: [],
+    flagged: [],
+    usage: { heading: null, body: 'ArchivoV', button: 'ArchivoV', evidence: [] },
+    errors: [],
+  });
+  assert.strictEqual(brand.websiteFontUsage.heading, 'ArchivoV',
+    'Shopify persist must not downgrade an existing non-null heading to null');
+  assert.strictEqual(brand.websiteFontUsage.body, 'ArchivoV');
+  assert.strictEqual(brand.fontSource, 'website');
+});
+
+check('E4b live Pelagic .headline selector is already a heading-role hit when it names a family', () => {
+  const { extractFontUsageFromCss } = require('../services/brandFontIngestService');
+  const withFamily = extractFontUsageFromCss('.headline{font-family:"ArchivoV",sans-serif}');
+  assert.strictEqual(withFamily.heading, 'ArchivoV',
+    '.headline is the live Pelagic heading class and must already score as heading');
+  const pelagicLive = extractFontUsageFromCss(
+    '.headline{font-size:72px;font-weight:500}body{font-family:"ArchivoV",sans-serif}'
+  );
+  assert.strictEqual(pelagicLive.heading, null,
+    'Pelagic live CSS: .headline has no font-family, so heading stays null (do not invent selectors)');
+  assert.strictEqual(pelagicLive.body, 'ArchivoV');
+});
+
 (async () => {
   for (const run of queue) await run();
   console.log(`\n  ${pass} passed, ${failures.length} failed\n`);

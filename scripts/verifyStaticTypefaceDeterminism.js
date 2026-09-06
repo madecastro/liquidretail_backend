@@ -162,6 +162,26 @@ check('U6 empty/null -> empty string, never throws',
   });
   check('U falls back to the first customFonts entry when heading names nothing ingested',
     /Shop Sans/.test(customFontsOnlyNoHeadingMatch), customFontsOnlyNoHeadingMatch);
+
+  const hyphenVsSpace = direct.typefaceDirectiveForBrand({
+    websiteFontUsage: { heading: 'Aktiv Grotesk' },
+    customFonts: [{ family: 'aktiv-grotesk', weight: 400 }]
+  });
+  check('U familyKey match: "Aktiv Grotesk" heading hits aktiv-grotesk customFonts row',
+    /Aktiv Grotesk/.test(hyphenVsSpace) && !/Shop Sans/.test(hyphenVsSpace), hyphenVsSpace);
+
+  const resolvedHeadingOverInsertOrder = direct.typefaceDirectiveForBrand({
+    websiteFontUsage: { heading: null },
+    fontFamily: 'Newsreader',
+    customFonts: [
+      { family: 'DM Sans', weight: 400 },
+      { family: 'Newsreader', weight: 400 }
+    ]
+  });
+  check('U heading-null prefers Brand.fontFamily over customFonts[0]',
+    /Newsreader/.test(resolvedHeadingOverInsertOrder) && !/Dm Sans/.test(resolvedHeadingOverInsertOrder)
+      && !/DM Sans/.test(resolvedHeadingOverInsertOrder),
+    resolvedHeadingOverInsertOrder);
 }
 
 // ── U7: live integration inside renderDirectImage's prompt assembly ──────

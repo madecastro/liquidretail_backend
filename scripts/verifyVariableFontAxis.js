@@ -255,6 +255,22 @@ check('C3 it only fills a GAP — an explicit CSS range still wins', () => {
   );
 });
 
+check('C4b resolveCustomFont copies weightMin/weightMax onto the resolved token', () => {
+  const resolverSrc = fs.readFileSync(path.join(__dirname, '..', 'services', 'fontResolverService.js'), 'utf8');
+  assert.ok(
+    /weightMin:\s*Number\.isFinite\(custom\.weightMin\)\s*\?\s*custom\.weightMin\s*:\s*null/.test(resolverSrc),
+    'resolveCustomFont must pass weightMin through onto the entry'
+  );
+  assert.ok(
+    /weightMax:\s*Number\.isFinite\(custom\.weightMax\)\s*\?\s*custom\.weightMax\s*:\s*null/.test(resolverSrc),
+    'resolveCustomFont must pass weightMax through onto the entry'
+  );
+  assert.ok(
+    /weightMin:\s*Number\.isFinite\(entry\.weightMin\)\s*\?\s*entry\.weightMin\s*:\s*null/.test(resolverSrc),
+    'resolveBrandFonts must copy weightMin onto the role token FontLoader sees'
+  );
+});
+
 check('C4 THE REGRESSION: resolveCustomFont\'s gate is satisfied by the probe output', () => {
   // This is the whole point. Reproduce fontResolverService.resolveCustomFont's
   // variable-weight gate verbatim and drive it with both records.

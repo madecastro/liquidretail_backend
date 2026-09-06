@@ -297,6 +297,145 @@ check('S1 resolveFamily accepts a `quiet` option and gates the substitution warn
     'resolveBrandFonts must pass quiet=requireExact so rejected tiers stay silent');
 });
 
+// ── RP. FONT_ROLE_PAIRING_ENABLED (default false, serif+sans only) ────────
+function withPairingFlag(value, fn) {
+  const prev = process.env.FONT_ROLE_PAIRING_ENABLED;
+  if (value === undefined) delete process.env.FONT_ROLE_PAIRING_ENABLED;
+  else process.env.FONT_ROLE_PAIRING_ENABLED = value;
+  try { return fn(); }
+  finally {
+    if (prev === undefined) delete process.env.FONT_ROLE_PAIRING_ENABLED;
+    else process.env.FONT_ROLE_PAIRING_ENABLED = prev;
+  }
+}
+
+const PAIRING_BRANDS = {
+  pelagic: PELAGIC,
+  camelback: CAMELBACK,
+  soludosStored: {
+    name: 'Soludos',
+    fontFamily: 'Newsreader',
+    customFonts: [
+      { family: 'Newsreader', url: 'https://x/n.woff2', weight: 400, style: 'normal' },
+      { family: 'DM Sans', url: 'https://x/d.woff2', weight: 400, style: 'normal' },
+      { family: 'oke-widget-icons', url: 'https://x/i.woff2', weight: 400, style: 'normal' },
+    ],
+    websiteFontUsage: { heading: null, body: null, button: 'oke-widget-icons' },
+  },
+  gymshark: {
+    name: 'Gymshark',
+    fontFamily: 'Montserrat',
+    customFonts: [
+      { family: 'Montserrat', url: 'https://x/m.woff2', weight: 400, style: 'normal' },
+      { family: 'Roboto', url: 'https://x/r.woff2', weight: 400, style: 'normal' },
+      { family: 'digital-7_monomono', url: 'https://x/d7.woff2', weight: 400, style: 'normal' },
+    ],
+    websiteFontUsage: {
+      heading: 'Montserrat', body: 'Roboto',
+      headingGeneric: 'sans-serif', bodyGeneric: 'sans-serif',
+      evidence: [
+        { family: 'Montserrat', role: 'heading', selector: 'h1', score: 4 },
+        { family: 'Roboto', role: 'body', selector: 'body', score: 3 },
+      ],
+    },
+  },
+  pairingShape: {
+    name: 'SoludosReingest',
+    fontFamily: 'Newsreader',
+    customFonts: [
+      { family: 'Newsreader', url: 'https://x/n.woff2', weight: 400, style: 'normal' },
+      { family: 'DM Sans', url: 'https://x/d.woff2', weight: 400, style: 'normal' },
+    ],
+    websiteFontUsage: {
+      heading: 'Newsreader', body: 'DM Sans',
+      headingGeneric: 'serif', bodyGeneric: 'sans-serif',
+      evidence: [
+        { family: 'Newsreader', role: 'heading', selector: 'h1', score: 4 },
+        { family: 'DM Sans', role: 'body', selector: 'body', score: 3 },
+      ],
+    },
+  },
+};
+
+const LADDERS_BEFORE = require('./fixtures/font-ladders-pairing-off-before.json');
+
+check('RP0 flag defaults OFF (unset and "false" and "FALSE")', () => {
+  const src = require('fs').readFileSync(require('path').join(__dirname, '..', 'services', 'fontResolverService.js'), 'utf8');
+  assert.ok(
+    /String\(process\.env\.FONT_ROLE_PAIRING_ENABLED \?\? 'false'\)\.toLowerCase\(\) === 'true'/.test(src),
+    'flag must default false via ?? \'false\' then === \'true\''
+  );
+});
+
+check('PAIRING_OFF ladders are byte-identical to the origin/main snapshot', () => {
+  withPairingFlag(undefined, () => {
+    for (const [name, brand] of Object.entries(PAIRING_BRANDS)) {
+      const got = JSON.stringify(buildFontLadders(brand).ladders);
+      const expected = JSON.stringify(LADDERS_BEFORE[name]);
+      assert.strictEqual(got, expected, `${name} flag-off drifted from origin/main snapshot`);
+    }
+  });
+  withPairingFlag('false', () => {
+    for (const [name, brand] of Object.entries(PAIRING_BRANDS)) {
+      const got = JSON.stringify(buildFontLadders(brand).ladders);
+      const expected = JSON.stringify(LADDERS_BEFORE[name]);
+      assert.strictEqual(got, expected, `${name} FONT_ROLE_PAIRING_ENABLED=false drifted`);
+    }
+  });
+});
+
+check('PAIRING_ON two-sans-identical (Gymshark-shaped) stays collapsed', () => {
+  withPairingFlag('true', () => {
+    const got = JSON.stringify(buildFontLadders(PAIRING_BRANDS.gymshark).ladders);
+    const expected = JSON.stringify(LADDERS_BEFORE.gymshark);
+    assert.strictEqual(got, expected,
+      'Gymshark two-sans must stay collapsed even with the flag on');
+  });
+});
+
+check('PAIRING_ON proven serif+sans splits heading/body (Soludos-shaped)', () => {
+  withPairingFlag('true', () => {
+    const { ladders } = buildFontLadders(PAIRING_BRANDS.pairingShape);
+    const heading = ladders.heading.filter(([f]) => f);
+    const body = ladders.body.filter(([f]) => f);
+    assert.strictEqual(heading[0][0], 'Newsreader', 'heading exact-only usage must lead');
+    assert.strictEqual(heading[0][1], true, 'pairing heading tier is exact-only');
+    assert.strictEqual(body[0][0], 'DM Sans', 'body exact-only usage must lead (not ownFace Newsreader)');
+    assert.strictEqual(body[0][1], true, 'pairing body tier is exact-only');
+    assert.notStrictEqual(
+      JSON.stringify(ladders.body),
+      JSON.stringify(LADDERS_BEFORE.pairingShape.body),
+      'pairing-on body ladder must differ from flag-off (ownFace Newsreader no longer leads)'
+    );
+    const dmIdx = body.findIndex(([f]) => f === 'DM Sans');
+    assert.ok(dmIdx === 0, 'DM Sans must be first live body tier when pairing fires');
+    // Quote unchanged vs flag-off
+    assert.strictEqual(
+      JSON.stringify(ladders.quote),
+      JSON.stringify(LADDERS_BEFORE.pairingShape.quote),
+      'quote ladder must be untouched by pairing'
+    );
+  });
+});
+
+check('PAIRING_ON Pelagic (one family) is a no-op', () => {
+  withPairingFlag('true', () => {
+    assert.strictEqual(
+      JSON.stringify(buildFontLadders(PAIRING_BRANDS.pelagic).ladders),
+      JSON.stringify(LADDERS_BEFORE.pelagic)
+    );
+  });
+});
+
+check('PAIRING_ON stored Soludos (heading/body null) is a no-op until re-ingest', () => {
+  withPairingFlag('true', () => {
+    assert.strictEqual(
+      JSON.stringify(buildFontLadders(PAIRING_BRANDS.soludosStored).ladders),
+      JSON.stringify(LADDERS_BEFORE.soludosStored)
+    );
+  });
+});
+
 (async () => {
   await Promise.all(pending);
   console.log(`\n  ${pass} passed, ${failures.length} failed\n`);
