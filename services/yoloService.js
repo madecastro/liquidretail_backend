@@ -112,10 +112,7 @@ async function detectBatch(items) {
     } catch (err) {
       lastErr = err;
       const kind = classifyYoloError(err);
-      // In-flight timeout/reset: the server may still be holding the first
-      // request. Retrying is a second request against work it has not
-      // finished — do not retry.
-      if (kind === 'client-timeout' || kind === 'conn-reset' || kind === 'conn-timeout') {
+      if (isInFlightYoloKind(kind)) {
         console.warn(`⚠️  YOLO batch in-flight failure (${kind}) — not retrying: ${err.message}`);
         const e = new Error(`yolo-batch:${kind}: ${err.message || 'call failed'}`);
         e.yoloKind = kind;
@@ -165,6 +162,12 @@ function isTransientYoloError(err) {
 function isSetupTransient(err) {
   const code = err?.code;
   return code === 'ECONNREFUSED' || code === 'ENOTFOUND';
+}
+
+// In-flight timeout/reset: the server may still be holding the first
+// request. Shared by detectBatch and _callYolo — do not retry either.
+function isInFlightYoloKind(kind) {
+  return kind === 'client-timeout' || kind === 'conn-reset' || kind === 'conn-timeout';
 }
 
 // Classify an axios failure into a short kind so run.flags.yoloError
@@ -228,6 +231,8 @@ function isPermanentYoloError(err) {
   return !!(bodyCode && PERMANENT_YOLO_CODES.has(bodyCode));
 }
 
+let _callYoloPost = null;
+
 async function _callYolo(url, form) {
   let lastErr = null;
   for (let attempt = 0; attempt <= YOLO_RETRY_ATTEMPTS; attempt++) {
@@ -237,7 +242,8 @@ async function _callYolo(url, form) {
     }
     try {
       console.log(`➡️  Sending to YOLO${attempt > 0 ? ` (retry ${attempt})` : ''}: ${url}`);
-      const res = await axios.post(url, form, {
+      const post = _callYoloPost || ((u, d, o) => axios.post(u, d, o));
+      const res = await post(url, form, {
         headers: form.getHeaders(),
         responseType: 'json',
         timeout: YOLO_TIMEOUT_MS
@@ -268,9 +274,16 @@ async function _callYolo(url, form) {
     } catch (err) {
       lastErr = err;
       const detail = err.response?.data || err.message;
+      const kind = classifyYoloError(err);
+      if (isInFlightYoloKind(kind)) {
+        console.warn(`⚠️  YOLO in-flight failure (${kind}) — not retrying: ${err.message}`);
+        const e = new Error(`yolo:${kind}: ${err.message || 'call failed'}`);
+        e.yoloKind = kind;
+        e.yoloCode = readYoloBodyCode(err);
+        throw e;
+      }
       // Non-transient failures (4xx, parse errors, etc.) → fail fast
-      if (!isTransientYoloError(err)) {
-        const kind = classifyYoloError(err);
+      if (!isTransientYoloError(err) && !isSetupTransient(err)) {
         const permanent = isPermanentYoloError(err);
         console.error(`❌ YOLO detection failed (non-transient${permanent ? ', PERMANENT' : ''}, ${kind}):`, detail);
         const e = new Error(`yolo:${kind}: ${err.message || 'call failed'}`);
@@ -279,8 +292,7 @@ async function _callYolo(url, form) {
         e.permanent = permanent;
         throw e;
       }
-      console.warn(`⚠️  YOLO transient failure (attempt ${attempt + 1}): ${err.code || err.message}`);
-      // Loop to retry; if attempts exhausted, fall through to throw below.
+      console.warn(`⚠️  YOLO setup-transient failure (attempt ${attempt + 1}): ${err.code || err.message}`);
     }
   }
   const kind = classifyYoloError(lastErr);
@@ -298,10 +310,12 @@ module.exports = {
   isTransientYoloError,
   isPermanentYoloError,
   isSetupTransient,
+  isInFlightYoloKind,
   YOLO_TIMEOUT_MS,
   YOLO_RETRY_ATTEMPTS,
   YOLO_RETRY_DELAY_MS,
   __test: {
-    setDetectBatchPost(fn) { _detectBatchPost = fn || null; }
+    setDetectBatchPost(fn) { _detectBatchPost = fn || null; },
+    setCallYoloPost(fn) { _callYoloPost = fn || null; }
   }
 };

@@ -67,7 +67,13 @@ function isTransientForBreaker(kind) {
   if (!kind) return false;
   const k = String(kind);
   if (k === 'client-timeout' || k === 'conn-reset' || k === 'conn-timeout') return true;
+  // Setup failures (microservice fully down / DNS). yoloKind is
+  // String(err.code).toLowerCase() → 'econnrefused' / 'enotfound'.
+  if (k === 'econnrefused' || k === 'enotfound') return true;
   if (/^http-5\d\d$/.test(k)) return true;
+  // 'unknown' is NOT transient: unclassified is more likely a bug or
+  // 4xx than a down service. Opening the breaker on it would pause
+  // catalog detection on a single weird error.
   return false;
 }
 
