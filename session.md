@@ -66,6 +66,16 @@ it clears it back to this placeholder in the same commit that closes it out.)_
 
 ## CURRENT STATE
 
+**2026-09-06: Ad.videoAnalysis schema + 3.5-flash rate, review-fix,
+unpushed.** Worktree `.wt-backend-video-analysis-swap` on
+`feat/video-analysis-schema`. Schema declaration itself unchanged. Comment
+corrected: the field is declared so a backend-authored write (`new Ad`,
+`castObject`, `updateOne $set`) cannot omit it under strict mode — a
+hydrate-then-save of an existing value does **not** strip it. Paired
+adgen review-fixes (plate-scan revert, timestamp planner, parse hardening)
+live in `.wt-video-analysis-swap`. Do not push. Detail:
+`session.d/2026-09-06_video-analysis-schema-review-fixes.md`.
+
 **2026-09-05: stale 8s video-duration fallbacks, unpushed.** Sibling worktrees
 `.wt-fix-stale-video-duration-backend` / `-adgen` on `fix/stale-video-duration`
 (off current origin trunks). Dirty main checkouts were not touched. Full
