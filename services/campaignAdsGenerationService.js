@@ -59,6 +59,7 @@ const {
 } = require('./perProductReasons');
 const { conceptField, conceptMediaPicks } = require('./conceptProjection');
 const { metaVideoDurationSec } = require('./videoDurationPolicy');
+const { selectVideoTemplate } = require('./videoTemplateSelection');
 const alertService = require('./alertService');
 // ONE shared LLM error taxonomy — see services/llmError.js. Imported, never
 // re-implemented (CLAUDE.md §4: a harness proving a call is WRITTEN does not
@@ -2852,6 +2853,11 @@ const CREATIVE_STYLE_TO_TEMPLATE = {
   editorial:        'ai_editorial',
   promotional:      'ai_promotional'
 };
+// Unrecognised creative_style used to fall through to ai_brand_led — the
+// same silent default that made 100% of deterministic video ads brand_led.
+// Editorial is the floor of intentForTemplate (product_first_lifestyle) and
+// is always eligible. Explicit `brand_led` from the Director still maps.
+const CONCEPT_TEMPLATE_FALLBACK = 'ai_editorial';
 
 // Per-concept identity. campaignId scopes uniqueness; conceptId +
 // productId + platformFormat distinguish within campaign. Independent
@@ -3529,6 +3535,25 @@ async function expandDeterministicVideo({
   const deriveFrom = deriveFromMaster
     || (platformFormat === PMAX_VIDEO_DERIVE_ONLY ? PMAX_VIDEO_DERIVE_SOURCE : null)
     || (normalizedFunnelStage ? funnelDeriveSource(platformFormat) : null);
+
+  // LLM-free template pick. CatalogProduct is not otherwise loaded on
+  // this path (the lazy-materialize findById below selects imageUrl
+  // only). One indexed `$in` of the same ids this function already
+  // iterates — PK lookup, not a collection scan, zero billable calls.
+  // The planner invokes this function once per (format × funnelStage),
+  // so the same N docs are re-read ~9–12 times per Generate; still
+  // cheap relative to the Omni submit each master represents.
+  const catalogById = new Map();
+  {
+    const oids = [...productIdSet].map(toObjectId).filter(Boolean);
+    if (oids.length) {
+      const docs = await CatalogProduct.find({ _id: { $in: oids } })
+        .select('_id title rating productReviews')
+        .lean();
+      for (const d of docs) catalogById.set(String(d._id), d);
+    }
+  }
+
   const payloads = [];
   const perProduct = [];
 
@@ -3695,7 +3720,7 @@ async function expandDeterministicVideo({
       generationOrder:     null,
       renderRoute:         'veo',
       kind:                'video',
-      template:            'ai_brand_led',
+      template:            selectVideoTemplate({ product: catalogById.get(pidStr) || null }),
       aspectRatio,
       campaignKind,
       platformFormat,
@@ -4086,7 +4111,7 @@ async function runConceptDrivenExpansion({
 
         const score = scoreByConcept.get(concept.concept_id) || {};
         const creativeStyle = conceptField(concept, 'creative_style');
-        const template = CREATIVE_STYLE_TO_TEMPLATE[creativeStyle] || 'ai_brand_led';
+        const template = CREATIVE_STYLE_TO_TEMPLATE[creativeStyle] || CONCEPT_TEMPLATE_FALLBACK;
         const role = primaryUniverseEntry.role;
         // Director already emits routing.funnel_stage on PMax rounds
         // (and on every destination when DIRECTOR_FUNNEL_STAGE_ALL is
