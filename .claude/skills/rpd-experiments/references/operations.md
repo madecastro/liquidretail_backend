@@ -7,7 +7,19 @@
 | `ATLAS_API_KEY` | `run --live` on any Atlas model (`google/…`, `xai/…`) | Render dashboard → WEB `srv-d1vuktqli9vc73ft07ng` env (secret), or their own local `.env`. Never print or commit |
 | `GEMINI_VIDEO_API_KEY` (falls back to `GEMINI_API_KEY`) | `run --live` on any `gemini-*` model — **the current live path** | Render dashboard (adgen services) or local `.env`. `services/geminiVideoKey.js` resolves it and logs only a 4-char fingerprint — never the key. Never print or commit |
 | `CLOUDFLARE_API_TOKEN` (+ `CLOUDFLARE_ACCOUNT_ID`) | `publish` | Cloudflare account with Pages write; the team project is `rs-rpd` |
-| `MONGODB_URI` | not needed | the harness never touches Mongo |
+| `MONGODB_URI` | **DB seed mode** — `spec.seed.productId`. Required for it; `lib/dbSeed.js:60` throws `MONGODB_URI is required for DB seed mode` without it, then connects and reads `CatalogProduct` + `Media` + `Brand`. Not needed when you paste a `spec.seed.url` by hand. | Same place as the other secrets; staging, never prod |
+
+⚠️ **This row previously read "not needed — the harness never touches Mongo."
+That was false and it cost a colleague real time.** The harness has TWO seeding
+modes and only the first is Mongo-free:
+
+| mode | Mongo | what you get |
+|---|---|---|
+| `seed.url` | no | one hand-sourced image; **fixture** brand styling in titling |
+| `seed.productId` | **yes** | merchant-feed primary + the real reference stack (`sortCatalogMediasForReferenceStack`) + the product's REAL brand identity (logo, colours, font, preset) so a titled test looks like the real ad |
+
+`seed.productId` is the mode worth using — a prompt A/B seeded from a
+hand-picked URL is not testing what production actually sends.
 
 `config/defaults.env` is dotenv-loaded automatically (process env wins). Fresh
 checkout/worktree: run `npm install` first (the committed `node_modules` is incomplete).

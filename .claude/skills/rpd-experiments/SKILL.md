@@ -24,6 +24,80 @@ now — don't spend refinement effort chasing titling quality/regressions
 (`references/titling-regression.md` documents real gaps, but they're future
 work, not this release's job).
 
+## NEWBIE MODE — when the operator is not a programmer
+
+Trigger this the moment someone says they are not technical, asks you not to
+give them commands, or simply seems to be following a handoff doc. When in
+doubt, assume it. Nothing here is optional in that mode.
+
+**1. Fix the environment yourself before answering anything else.** Do not
+report a broken environment as an error and stop — diagnose and repair it,
+then say what you fixed in one sentence. Check, in order:
+- On `master` and up to date (`git checkout master && git pull`). Skill and
+  harness both live there; an old PR branch is a common wrong turn.
+- Node **≥ 20** (`package.json` engines). Install via Homebrew if missing.
+- `npm install` has run in this checkout. The committed `node_modules` is
+  incomplete — a fresh clone WILL fail without it.
+- Keys: `GEMINI_VIDEO_API_KEY` (or `GEMINI_API_KEY`) for `gemini-*` models —
+  **this is the live production path**; `ATLAS_API_KEY` only for `google/…` /
+  `xai/…` models; **`MONGODB_URI` for DB seed mode** (`spec.seed.productId`),
+  which is how you get a real product's merchant-feed photos, its real
+  reference stack, and its real brand identity in titling. Ask for whatever is
+  missing; never print a key back.
+  ⚠️ Prefer `seed.productId` over a hand-pasted `seed.url`: a prompt A/B
+  seeded from an image someone picked by hand is not testing what production
+  actually sends. (An older version of `references/operations.md` claimed the
+  harness never touches Mongo — that was wrong; `lib/dbSeed.js` connects and
+  reads `CatalogProduct` + `Media` + `Brand`.)
+Prove it works with the free commands (`rpd.js models`, `rpd.js prompt`) before
+claiming the environment is ready.
+
+**2. One video, unless they asked for a comparison.** A spec that produces N
+cells costs N × ~$1.00. Default to a single cell. Build a matrix only when they
+explicitly ask to compare something — different prompts (the main use), a
+different model, or several products. Never quietly add arms.
+
+**2a. The baseline IS production.** When they do ask for a comparison, the
+control cell must be what we ship today: model `gemini-omni-1.1-flash` on the
+direct Gemini path (`VIDEO_PROVIDER=gemini` on `adgen-renderer`), with no
+prompt lever applied. Otherwise "better" is measured against something we do
+not run. `specs/example-prompt-ab.json` is already pinned this way — copy it
+rather than hand-rolling a spec.
+
+**2b. Atlas models only on specific request.** Default every spec to the
+production Gemini model. If they *do* ask for Atlas (`google/…`, `xai/…`),
+that is fine and fully supported — and they will often want a model that is
+**not** in production, which is a legitimate thing to test. In that case:
+run `node scripts/rpd/rpd.js models` to show the live catalog, and help them
+choose — walk through aspect support, duration/resolution enums, reference-image
+count, prompt byte cap, and the floor-grade price per model, then say which
+looks right for what they described and why. A spec's `models[]` may mix Atlas
+and Gemini ids in one run, so a production-vs-candidate comparison is one spec.
+Atlas cells need `ATLAS_API_KEY`; Gemini cells need `GEMINI_VIDEO_API_KEY`. The
+runner now checks only the keys the run actually needs, so a Gemini-only
+experiment does not require an Atlas key.
+
+**3. Always dry-run first, and say the price out loud.** `rpd.js run <spec>` is
+free and writes every prompt to `manifest.json`. Show them the number and get a
+yes before adding `--live --max-usd <cap>`. Never spend without an explicit ok.
+
+**4. Show seed images as numbered thumbnails and ask for the order** — every
+time, without being asked. (Same rule as the workflow below; in newbie mode it
+fires automatically.)
+
+**5. Explain in plain English.** No stack traces, no raw command output as an
+answer, no jargon. "The test came back — the new wording made the camera move
+less, here are both videos" beats anything with a file path in it.
+
+**6. Prompt levers: only three of the four work.** The video prompt is now ONE
+frozen CORE paragraph, so **`directives` (per-element overrides) is inert** —
+it silently produces a prompt identical to baseline and still bills. Use
+`guidance` (prepend), `raw` (full replace), or `patch` (find/replace on the
+CORE text). The harness now refuses a live run whose cells would submit
+identical requests, and warns in the dry run; if you see that warning, the
+lever did not apply — do not override it with `--allow-duplicate-prompts`
+unless the duplicate is deliberate.
+
 Deep guides in this skill:
 - **`references/prompt-elements.md`** — every prompt lever, what it CONTROLS, and whether to
   recommend changing it. **READ THIS BEFORE DISCUSSING ANY PROMPT CHANGE.**

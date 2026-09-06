@@ -89,14 +89,18 @@ async function main() {
 
   if (cmd === 'run') {
     const specPath = args[0];
-    if (!specPath || specPath.startsWith('--')) throw new Error('usage: rpd run <spec.json> [--live --max-usd N] [--out dir]');
+    if (!specPath || specPath.startsWith('--')) throw new Error('usage: rpd run <spec.json> [--live --max-usd N] [--out dir] [--allow-duplicate-prompts]');
     const { runSpec } = require('./lib/runner');
     const { buildGallery } = require('./lib/gallery');
     const live = flag(args, '--live');
     const maxUsd = flagValue(args, '--max-usd') != null ? Number(flagValue(args, '--max-usd')) : null;
     const outRoot = flagValue(args, '--out') || 'rpd-runs';
     const upload = flag(args, '--upload');
-    const { runDir, manifest } = await runSpec(specPath, { live, maxUsd, outRoot, upload });
+    // Escape hatch for a DELIBERATE duplicate — e.g. submitting one fixed
+    // input twice to measure generation variance. Off by default because the
+    // common case is a prompt lever that silently stopped applying.
+    const allowDuplicates = flag(args, '--allow-duplicate-prompts');
+    const { runDir, manifest } = await runSpec(specPath, { live, maxUsd, outRoot, upload, allowDuplicates });
 
     // Optional titling pass over settled masters (spec.titling.enabled).
     if (live) await titlePass(runDir, manifest);
@@ -164,6 +168,20 @@ async function main() {
       return;
     }
 
+    // --core: print the prompt that is ACTUALLY submitted. Without this there
+    // was no CLI way to see it (only manifest.json after a dry run), so anyone
+    // told "use `patch`" would copy a find-string out of the LEGACY element
+    // listing below and hard-error with "patch.find not present in prompt".
+    if (flag(args, '--core')) {
+      const { corePromptText } = require('../../src/services/veoPromptBuilder');
+      const dur = flagValue(args, '--duration') != null ? Number(flagValue(args, '--duration')) : 8;
+      console.log(`\n=== LIVE VIDEO PROMPT (CORE, durationSec=${dur}) — this is what gets submitted ===\n`);
+      console.log(corePromptText(dur));
+      console.log('\nCopy a `patch.find` string from THIS text, not from the element listing.');
+      console.log('Only guidance / raw / patch change what is submitted; `directives` is inert.\n');
+      return;
+    }
+
     const profile = flagValue(args, '--profile') || 'gemini-omni';
     if (!cat.videoProfiles().includes(profile)) {
       throw new Error(`rpd: unknown profile "${profile}" (have: ${cat.videoProfiles().join(', ')})`);
@@ -175,11 +193,26 @@ async function main() {
       if (hit.meaning) console.log(`\nWHAT IT DOES: ${hit.meaning}`);
       console.log(`\n=== ${hit.key} (video, ${profile}) — CURRENT TEXT ===\n`);
       console.log(hit.text);
-      console.log(`\n=== to test a replacement, add this variant to spec.variants ===\n`);
+      // ⚠️ These per-element texts are the LEGACY assembled prompt. The live
+      // video prompt is one frozen CORE paragraph, so a `directives` override
+      // of this element does NOT change what is submitted — it builds a prompt
+      // byte-identical to baseline and still bills ~$1.00. Measured 2026-09-06
+      // on specs/example-prompt-ab.json. Point people at the levers that work.
+      console.log(`\n=== to test a replacement ===\n`);
+      console.log('⚠️  `directives` no longer changes the video prompt (it is now ONE frozen');
+      console.log('    CORE paragraph). A directives-only variant bills full price for a');
+      console.log('    prompt identical to baseline — the runner will refuse it on --live.');
+      console.log('    Use one of these instead:');
+      console.log('      guidance — prepend your text to the CORE prompt');
+      console.log('      raw      — replace the whole prompt');
+      console.log('      patch    — find/replace against the CORE text (see `rpd prompt --core`)');
+      console.log('\n(legacy shape, kept for reference only:)\n');
       console.log(cat.exampleVariant('video', hit.key));
       return;
     }
-    console.log(`\nVIDEO prompt elements you can replace — profile "${profile}" (spec.variants[].directives):\n`);
+    console.log(`\nVIDEO prompt elements — profile "${profile}".`);
+    console.log('⚠️  LEGACY VIEW: the live prompt is one frozen CORE paragraph; overriding these');
+    console.log('    via spec.variants[].directives is INERT and still bills. Use guidance / raw / patch.\n');
     for (const e of els) {
       console.log(`  ${e.key}`);
       if (e.meaning) console.log(`      WHAT IT DOES: ${e.meaning}`);

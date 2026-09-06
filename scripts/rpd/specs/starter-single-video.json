@@ -1,0 +1,24 @@
+{
+  "name": "starter-single-video",
+  "notes": "START HERE. Makes exactly ONE video (~$1.00 live) on the current production provider. No comparison, no matrix. Copy this file and edit the seed to test your own product; add variants only when you actually want to compare two prompts. Seed either by pasting an image URL below, or replace the whole `seed` block with { \"productId\": \"<CatalogProduct _id>\" } to pull the real merchant-feed images (needs MONGODB_URI).",
+  "seed": {
+    "url": "https://res.cloudinary.com/reach-social-prod/image/upload/REPLACE_ME.jpg",
+    "productTitle": "Example Product",
+    "refs": [],
+    "brandHex": "#101418"
+  },
+  "aspectRatio": "9:16",
+  "durationSec": 8,
+  "resolution": "1080p",
+  "models": ["gemini-omni-1.1-flash"],
+  "variants": [
+    { "id": "baseline" }
+  ],
+  "titling": {
+    "enabled": false,
+    "preset": "canonical",
+    "platformFormat": "meta_stories_9_16",
+    "brandName": "RPD Test",
+    "copy": { "headline": "Example headline", "ctaText": "Shop now" }
+  }
+}

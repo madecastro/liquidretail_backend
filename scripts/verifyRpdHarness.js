@@ -906,6 +906,76 @@ const codeOnly = (src) => src
     assert(/29%/.test(elements), 'the fidelity ceiling must be documented');
   });
 
+  // ── L. the duplicate-cell money gate ───────────────────────────────────
+  // WHY: measured 2026-09-06 — the shipped example-prompt-ab spec had a
+  // `directives` variant whose built prompt was byte-identical to baseline,
+  // so a --live run paid ~$1.00 for a second copy of the control and showed
+  // it as a variant. The gate must catch that class generically.
+  console.log('\nL. duplicate-cell money gate');
+  const RUNNER = require(path.join(RPD, 'lib', 'runner'));
+  const mkDupCell = (id, lever, prompt, over = {}) => ({
+    id, status: 'planned', prompt, promptMeta: { lever },
+    imageUrls: ['https://x/seed.jpg'], aspectRatio: '9:16',
+    durationSec: 8, resolution: '1080p', body: { model: 'gemini-omni-1.1-flash' }, ...over
+  });
+
+  check('L1 identical prompts on identical seeds REFUSE a live run', () => {
+    const cells = [mkDupCell('baseline', 'baseline', 'SAME'), mkDupCell('rewrite', 'directives', 'SAME')];
+    let threw = null;
+    try { RUNNER.assertNoDuplicateCells(cells); } catch (e) { threw = e; }
+    assert(threw, 'two byte-identical cells must refuse');
+    assert(/IDENTICAL/.test(threw.message), 'the refusal must say the cells are identical');
+  });
+
+  check('L2 the refusal NAMES the lever that failed to apply', () => {
+    // Regression pin: an earlier draft read a `variantLevers` field that is
+    // never assigned, so this line always printed "(baseline)" — the one
+    // diagnostic identifying the broken arm was a constant.
+    const cells = [mkDupCell('baseline', 'baseline', 'SAME'), mkDupCell('rewrite', 'directives', 'SAME')];
+    try { RUNNER.assertNoDuplicateCells(cells); assert(false, 'should have thrown'); }
+    catch (e) { assert(/directives/.test(e.message), `refusal must name the lever, got: ${e.message}`); }
+  });
+
+  check('L3 a DIFFERENT prompt is not a duplicate', () => {
+    const cells = [mkDupCell('baseline', 'baseline', 'A'), mkDupCell('guided', 'guidance', 'B')];
+    RUNNER.assertNoDuplicateCells(cells); // must not throw
+    assert(RUNNER.findDuplicateCells(cells).length === 0, 'distinct prompts are not duplicates');
+  });
+
+  check('L4 same prompt on DIFFERENT products is NOT a duplicate', () => {
+    // A matrix over several products legitimately shares one prompt. Keying
+    // the fingerprint on the prompt alone would refuse a valid experiment.
+    const a = mkDupCell('p1', 'baseline', 'SAME', { imageUrls: ['https://x/one.jpg'] });
+    const b = mkDupCell('p2', 'baseline', 'SAME', { imageUrls: ['https://x/two.jpg'] });
+    RUNNER.assertNoDuplicateCells([a, b]);
+    assert(RUNNER.cellFingerprint(a) !== RUNNER.cellFingerprint(b), 'seed images must be in the fingerprint');
+  });
+
+  check('L5 --allow-duplicate-prompts is an explicit opt-in, not the default', () => {
+    const cells = [mkDupCell('a', 'baseline', 'SAME'), mkDupCell('b', 'baseline', 'SAME')];
+    RUNNER.assertNoDuplicateCells(cells, { allowDuplicates: true }); // must not throw
+    let threw = null;
+    try { RUNNER.assertNoDuplicateCells(cells); } catch (e) { threw = e; }
+    assert(threw, 'default must still refuse');
+  });
+
+  check('L6 only PLANNED cells are compared', () => {
+    // A skipped cell never submits, so it cannot be a duplicate of anything.
+    const cells = [mkDupCell('a', 'baseline', 'SAME'), mkDupCell('b', 'directives', 'SAME', { status: 'skipped' })];
+    RUNNER.assertNoDuplicateCells(cells);
+  });
+
+  check('L7 an accepted receipt marks the cell CHARGED', () => {
+    // The gallery renders `charged:false` as an "uncharged" chip. A submitted
+    // cell holds a live spend receipt; showing it as free invites a re-run
+    // that pays twice. Pins the assignment beside status='submitted'.
+    const src = read(path.join(RPD, 'lib', 'runner.js'));
+    const i = src.indexOf("cell.status = 'submitted'");
+    assert(i > 0, "expected a cell.status='submitted' assignment");
+    assert(/cell\.charged\s*=\s*true/.test(src.slice(i, i + 900)),
+      'a successful submit must set cell.charged = true');
+  });
+
   console.log(`\n${passed} passed, ${failed} failed`);
   process.exit(failed ? 1 : 0);
 })().catch((err) => {

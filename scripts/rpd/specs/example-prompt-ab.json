@@ -1,6 +1,6 @@
 {
   "name": "example-prompt-ab",
-  "notes": "Template: one model, four prompt levers vs baseline. Each lever maps to a production mechanism — see scripts/rpd/README.md.",
+  "notes": "Template: BASELINE IS PRODUCTION. models[] is pinned to the live production model (gemini-omni-1.1-flash, direct Gemini — VIDEO_PROVIDER=gemini on adgen-renderer), so the baseline cell is literally what we ship today and each variant is measured against it. Change the model only when the experiment IS about the model. The 'directives' lever is deliberately absent — the live video prompt is one frozen CORE paragraph, so per-element directives are inert (identical prompt, still bills ~$1.00). Only guidance / raw / patch change what is submitted. For a single video with no comparison, use starter-single-video.json.",
   "seed": {
     "url": "https://res.cloudinary.com/reach-social-prod/image/upload/REPLACE_ME.jpg",
     "productTitle": "Example Product",
@@ -10,25 +10,23 @@
   "aspectRatio": "9:16",
   "durationSec": 8,
   "resolution": "1080p",
-  "models": ["google/gemini-omni-flash/image-to-video-developer"],
+  "models": [
+    "gemini-omni-1.1-flash"
+  ],
   "variants": [
-    { "id": "baseline" },
+    {
+      "id": "baseline"
+    },
     {
       "id": "hook-first",
       "guidance": "HOOK-FIRST: the product must be unmistakably identifiable within the first second; the opening frames carry the whole ad."
     },
     {
-      "id": "objective-rewrite",
-      "directives": {
-        "objective": "Objective: Create a premium product commercial using subtle Ken Burns camera moves. Open on the tightest compelling detail and pull back to reveal. Must feel luxury while keeping 100% fidelity to the original product."
-      }
-    },
-    {
-      "id": "no-crossfades",
+      "id": "no-cuts",
       "patch": [
         {
-          "find": "Transitions: Smooth crossfades only, ~0.25s. No wipes, flashes, or animated transitions.",
-          "replace": "Transitions: Hard cuts only. No crossfades, wipes, flashes, or animated transitions."
+          "find": "camera may push, pull, pan, orbit, or cut",
+          "replace": "camera may push, pull, or pan — one continuous take, no cuts and no orbit"
         }
       ]
     }
@@ -38,6 +36,9 @@
     "preset": "canonical",
     "platformFormat": "meta_stories_9_16",
     "brandName": "RPD Test",
-    "copy": { "headline": "Example headline", "ctaText": "Shop now" }
+    "copy": {
+      "headline": "Example headline",
+      "ctaText": "Shop now"
+    }
   }
 }

@@ -371,6 +371,85 @@ function newRunDir(outRoot, spec) {
 
 function fmtUsd(n) { return n == null || !Number.isFinite(n) ? 'n/a' : `$${n.toFixed(2)}`; }
 
+// A cell's SUBMISSION IDENTITY — everything that decides what the provider
+// actually renders. Two cells sharing this fingerprint produce the same video
+// and the second one is money burned for a duplicate.
+//
+// Deliberately NOT just the prompt: a matrix over several PRODUCTS is a
+// legitimate experiment, and those cells share a prompt while seeding from
+// different images. Seed images are part of the identity for that reason.
+function cellFingerprint(cell) {
+  const crypto = require('crypto');
+  const identity = {
+    model: (cell.body && cell.body.model) || cell.model || null,
+    prompt: cell.prompt || '',
+    imageUrls: Array.isArray(cell.imageUrls) ? cell.imageUrls : [],
+    aspectRatio: cell.aspectRatio || null,
+    durationSec: cell.durationSec ?? null,
+    resolution: cell.resolution || null
+  };
+  return crypto.createHash('sha256').update(JSON.stringify(identity)).digest('hex');
+}
+
+// Group planned cells that would submit the SAME thing. Pure — returns groups
+// of 2+ cell ids keyed by fingerprint; empty array when every cell is distinct.
+function findDuplicateCells(cells) {
+  const byPrint = new Map();
+  for (const c of cells) {
+    if (c.status !== 'planned') continue;
+    const fp = cellFingerprint(c);
+    if (!byPrint.has(fp)) byPrint.set(fp, []);
+    byPrint.get(fp).push(c);
+  }
+  return [...byPrint.values()].filter((g) => g.length > 1);
+}
+
+// WHY THIS GATE EXISTS — measured 2026-09-06 on the shipped
+// specs/example-prompt-ab.json: the `objective-rewrite` variant used the
+// `directives` lever, which the frozen-CORE prompt no longer reads, so its
+// built prompt was BYTE-IDENTICAL to `baseline`. A --live run would have paid
+// ~$1.00 to generate a second copy of the control and presented it as a
+// variant — a wasted generation AND a misleading A/B result.
+//
+// A lever that silently stops working is not a hypothetical: the video prompt
+// became one frozen CORE paragraph on 2026-09-03/04 and `directives` went
+// inert without any caller changing. This gate catches that class generically
+// — it does not know or care WHICH lever failed, only that two cells would
+// bill twice for one video.
+//
+// Refuses rather than skipping the duplicate, for the same reason the budget
+// gate refuses: the operator believes they are running an A/B. Silently
+// dropping an arm would hand them a result that looks like "no difference"
+// when the truth is "your variant never applied". Deliberate duplicates (a
+// generation-variance test) opt in with allowDuplicates.
+function assertNoDuplicateCells(cells, { allowDuplicates = false } = {}) {
+  if (allowDuplicates) return;
+  const groups = findDuplicateCells(cells);
+  if (!groups.length) return;
+  const lines = groups.map((g) => {
+    const ids = g.map((c) => `    - ${c.id}`).join('\n');
+    // Read the lever off promptMeta, which buildForCell always attaches.
+    // (An earlier draft read a `variantLevers` field that is never assigned
+    // anywhere, so this line always printed "(baseline)" — i.e. the one
+    // diagnostic naming the broken arm was a constant. Caught in review.)
+    const levers = [...new Set(g.map((c) => (c.promptMeta && c.promptMeta.lever) || 'baseline'))];
+    return `  These ${g.length} cells would submit an IDENTICAL video:\n${ids}\n` +
+           `    levers used: ${levers.join(' vs ')}`;
+  }).join('\n\n');
+  throw new Error(
+    'rpd: refusing to submit — some cells build the exact same request, so you would pay\n' +
+    'once per copy and the comparison would be meaningless.\n\n' +
+    `${lines}\n\n` +
+    'Most likely cause: a prompt lever that no longer changes the built prompt. The video\n' +
+    'prompt is now ONE frozen CORE paragraph, so `directives` (per-element overrides) is\n' +
+    'inert — use `guidance` (prepend), `raw` (full replace), or `patch` (find/replace against\n' +
+    'the CORE text) instead. Check what actually differs with:\n' +
+    '  node scripts/rpd/rpd.js run <spec> ' + '  # dry run, then diff the prompts in manifest.json\n' +
+    'If the duplication is deliberate (testing generation variance on one fixed input),\n' +
+    're-run with --allow-duplicate-prompts.'
+  );
+}
+
 // The budget gate. Refuses rather than trims: a silently smaller experiment
 // is worse than a refused one (the operator sized the matrix deliberately).
 // NaN is not a price: any non-finite estimate is treated exactly like a
@@ -464,6 +543,14 @@ async function submitCells(submittable, {
     // silently reclassified.
     cell.predictionId = predictionId;
     cell.status = 'submitted';
+    // An ACCEPTED RECEIPT IS THE CHARGE POINT — explicitly so on Gemini (a
+    // 200 with an interaction_id is billable even if the poll never settles)
+    // and effectively so on Atlas. Leaving `charged` at its initial false
+    // here made gallery.js render a grey "uncharged" chip on every cell whose
+    // poll timed out — a live spend receipt displayed as costing nothing,
+    // which invites exactly the re-run that pays for the same cell twice.
+    // settleCell still refines this to null on a terminal failure.
+    cell.charged = true;
     cell.submittedAt = new Date().toISOString();
     cell.timings = cell.timings || {};
     cell.timings.submitMs = Date.now() - sub0; // includes pacing wait + any structured-429 backoff
@@ -489,7 +576,7 @@ async function submitCells(submittable, {
   }
 }
 
-async function runSpec(specPath, { live = false, maxUsd = null, outRoot = 'rpd-runs', upload = false } = {}) {
+async function runSpec(specPath, { live = false, maxUsd = null, outRoot = 'rpd-runs', upload = false, allowDuplicates = false } = {}) {
   const spec = loadSpec(specPath);
 
   // DB seed mode: resolve the merchant-feed primary + refs from a productId and
@@ -573,11 +660,35 @@ async function runSpec(specPath, { live = false, maxUsd = null, outRoot = 'rpd-r
     const planned = cells.filter((c) => c.status === 'planned');
     const wouldSpend = planned.reduce((s, c) => s + (Number.isFinite(c.estUsd) ? c.estUsd : 0), 0);
     console.log(`\nDry run only. A --live run would submit ${planned.length} cells, estimated ~${fmtUsd(wouldSpend)} (floor-grade).`);
+    // Surface duplicates HERE, for free, rather than only at the live gate —
+    // the dry run is where someone checks their spec before spending.
+    const dupGroups = findDuplicateCells(cells);
+    if (dupGroups.length && !allowDuplicates) {
+      console.log('\n⚠️  DUPLICATE CELLS — these would each bill for the SAME video:');
+      for (const g of dupGroups) {
+        console.log(`     ${g.map((c) => c.id).join('\n     ')}`);
+      }
+      console.log('   A --live run will REFUSE until the spec is fixed (or --allow-duplicate-prompts).');
+      console.log('   Usual cause: `directives` no longer changes the prompt — use guidance / raw / patch.');
+    }
     console.log('Prompts + exact request bodies are in manifest.json. Nothing was sent.');
     return { runDir, manifest };
   }
 
-  if (!process.env.ATLAS_API_KEY) throw new Error('rpd: ATLAS_API_KEY is not set — required for --live');
+  // Provider-aware credential check. Requiring ATLAS_API_KEY unconditionally
+  // refused a Gemini-only run — and Gemini IS the live production provider
+  // (VIDEO_PROVIDER=gemini on adgen-renderer), so the most realistic
+  // experiment was the one that could not start without an unrelated key.
+  const plannedNow = cells.filter((c) => c.status === 'planned');
+  const needsAtlas = plannedNow.some((c) => !isGeminiModel((c.body && c.body.model) || c.model || ''));
+  const needsGemini = plannedNow.some((c) => isGeminiModel((c.body && c.body.model) || c.model || ''));
+  if (needsAtlas && !process.env.ATLAS_API_KEY) {
+    throw new Error('rpd: ATLAS_API_KEY is not set — required for --live on Atlas models (google/…, xai/…)');
+  }
+  if (needsGemini && !process.env.GEMINI_VIDEO_API_KEY && !process.env.GEMINI_API_KEY) {
+    throw new Error('rpd: GEMINI_VIDEO_API_KEY (or GEMINI_API_KEY) is not set — required for --live on gemini-* models');
+  }
+  assertNoDuplicateCells(cells, { allowDuplicates });
   const { live: submittable, total } = assertBudget(cells, maxUsd);
   writeManifest(runDir, manifest);
   console.log(`\nBudget: ${submittable.length} cells, estimated ~${fmtUsd(total)} ≤ cap ${fmtUsd(maxUsd)}. Submitting…`);
@@ -658,4 +769,8 @@ async function runSpec(specPath, { live = false, maxUsd = null, outRoot = 'rpd-r
   return { runDir, manifest };
 }
 
-module.exports = { loadSpec, expandCells, runSpec, assertBudget, prepareImageUrls, submitCells, UNVERIFIED_PRICING_SLUGS };
+module.exports = {
+  loadSpec, expandCells, runSpec, assertBudget, prepareImageUrls, submitCells,
+  cellFingerprint, findDuplicateCells, assertNoDuplicateCells,
+  UNVERIFIED_PRICING_SLUGS
+};
