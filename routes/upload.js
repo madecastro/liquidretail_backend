@@ -157,7 +157,7 @@ router.post('/product', upload.single('image'), async (req, res) => {
       result = await CatalogProduct.findOneAndUpdate(
         { brandId, externalId },
         upsertUpdate,
-        { upsert: true, new: true, rawResult: true }
+        { upsert: true, new: true, includeResultMetadata: true }
       );
     } catch (err) {
       return res.status(500).json({ error: `CatalogProduct upsert failed: ${err.message}` });

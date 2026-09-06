@@ -538,7 +538,7 @@ async function syncBrandShopifyDirect(brand, run, { isBrandAborted, uncapped } =
       const upsertResult = await CatalogProduct.findOneAndUpdate(
         { brandId: brand._id, externalId },
         upsertUpdate,
-        { upsert: true, new: true, rawResult: true }
+        { upsert: true, new: true, includeResultMetadata: true }
       );
       const doc = upsertResult?.value || upsertResult;
       benefits.collectAfterCatalogUpsert(upsertResult, pendingBenefits, { changed: benefitsStale });

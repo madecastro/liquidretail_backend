@@ -297,7 +297,7 @@ async function syncCatalogForCred(cred, run = null) {
         const result = await CatalogProduct.findOneAndUpdate(
           { brandId: cred.brandId, externalId },
           upsertUpdate,
-          { upsert: true, new: true, rawResult: true }
+          { upsert: true, new: true, includeResultMetadata: true }
         );
         // updatedExisting=false means this was an insert.
         if (result?.lastErrorObject?.updatedExisting) updated++;

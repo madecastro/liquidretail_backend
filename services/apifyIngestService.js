@@ -674,7 +674,7 @@ async function syncBrandShopify(brand, run = null, { uncapped } = {}) {
       const result = await CatalogProduct.findOneAndUpdate(
         { brandId: brand._id, externalId: p.externalId },
         upsertUpdate,
-        { upsert: true, new: true, rawResult: true }
+        { upsert: true, new: true, includeResultMetadata: true }
       );
       if (result?.lastErrorObject?.updatedExisting) summary.updated++;
       else                                           summary.added++;
