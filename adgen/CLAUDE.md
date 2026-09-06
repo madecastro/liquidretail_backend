@@ -1,18 +1,26 @@
 # CLAUDE.md — liquidretail_adgen
 
+> **Monorepo (2026-09-06).** This tree now lives at `adgen/` inside
+> `liquidretail_backend` (GitHub survivor, trunk `main`, merge `e6393912`).
+> The parent **is** the backend. `Emami-RS-Project/liquidretail_adgen` is
+> archive/rollback-only and deploys nothing. Monorepo rules (mongoose 8
+> fail-closed, freeze-N 512, CI, hooks) live in the root `CLAUDE.md`.
+> Paths below are relative to `adgen/`. Live state: root `session.md`.
+
 Ad-generation **renderer** microservice for Reach Social. Forked from
 `liquidretail_backend`. Deploys to Render as **four** services from one Docker
 image (`Dockerfile`, `render.yaml`: api / orchestrator / renderer / titler).
-Shares the **same MongoDB** as the backend. Trunk is `master`.
+Shares the **same MongoDB** as the backend. Survivor trunk is `main`
+(this prefix used to be `master` on the split repo).
 
 **Citations.** Older architecture sections were written against
-`origin/master` @ `881dabd` (2026-08-24, PR #4) and their `file:line` pins
+the then-`origin/master` @ `881dabd` (2026-08-24, PR #4) and their `file:line` pins
 have drifted. Video-provider / Gemini / DINO-ref / autoscale-pin /
 vision-QC-derive-gate / director-benefits material is against
-`origin/master` @ `fde6003` (2026-09-03). If a line number does not match
-the tree you have open, `git log -1 --oneline origin/master` first.
+then-`origin/master` @ `fde6003` (2026-09-03). If a line number does not match
+the tree you have open, `git log -1 --oneline` first (survivor trunk is `main`).
 
-**Read `session.md` for live branch/PR state.** This file is architecture, not
+**Read the root `session.md` for live branch/PR state.** This file is architecture, not
 handoff.
 
 ---
@@ -77,16 +85,16 @@ invent them.
 
 ---
 
-## How the four repos relate
+## How the trees relate
 
-| Repo | Role |
+| Tree | Role |
 |---|---|
-| `liquidretail` | React SPA. Trunk **`master`**. Netlify `staging.reach-social.io`. Talks to the **backend** HTTP API only. |
-| `liquidretail_backend` | Express + Mongo. Trunk **`main`**. Render `liquidretail-backend.onrender.com`. Auth, catalog, wizard `/api/ads/generate`, expansion, mint, claim. When the flag is on, it **stops** at claim. |
-| `liquidretail_adgen` | **This repo.** Render workers actually generate static plates and video masters/derives. |
+| `liquidretail` | React SPA. Separate GitHub repo, trunk **`master`**. Netlify `staging.reach-social.io`. Talks to the **backend** HTTP API only. |
+| `liquidretail_backend` (this GitHub repo, trunk **`main`**) | Express + Mongo. Render `liquidretail-backend.onrender.com`. Auth, catalog, wizard `/api/ads/generate`, expansion, mint, claim. When the flag is on, it **stops** at claim. |
+| `adgen/` (this prefix) | **Live renderer.** Four Render services from Docker context `./adgen`. The old `liquidretail_adgen` GitHub repo is archive/rollback-only. |
 | `rs-ai-backend` | Older/parallel backend fork. **Reference only** — not the live API, not the live renderer. |
 
-All four sit as siblings under `/Volumes/Sayulita/Projects/RS/`.
+The SPA (and `claude-org-brain`) stay separate GitHub repos under `/Volumes/Sayulita/Projects/RS/`.
 
 ---
 
@@ -742,7 +750,7 @@ at runtime until PR #2: `seededUniverseService`, `reframeStrategyChooser`,
 
 ### Layout difference (this has already caused bugs)
 
-| | `liquidretail_backend` | `liquidretail_adgen` |
+| | backend (repo root) | `adgen/` |
 |---|---|---|
 | Services | `services/` at **repo root** | `src/services/` |
 | Models | `models/` at repo root | `src/models/` |
@@ -765,8 +773,8 @@ dotenv load in `src/config.js:12-13` is cwd-relative
 in production.
 
 `INPUT_SCHEMA_VERSION` must match the backend
-(`src/services/layoutInputService.js` = `'4.2'` on `origin/master`,
-same as `liquidretail_backend/services/layoutInputService.js:211`). A
+(`src/services/layoutInputService.js` = `'4.2'`,
+same as `../services/layoutInputService.js`). A
 mismatch split-brains the `layoutinputartifacts` cache: one service
 rebuilds, the other treats the row as fresh.
 
@@ -774,7 +782,7 @@ rebuilds, the other treats the row as fresh.
 
 ## Verify harness
 
-On `origin/master` (not on a checkout parked at `81e3ae0`):
+On the grafted tree (survivor trunk `main`; not on a checkout parked at `81e3ae0`):
 
 ```
 npm test
@@ -793,14 +801,16 @@ concurrency `min(8, cpus)`. Exit 0 iff every selected script exits 0.
 Files named `*_KNOWN_OPEN.js` are **expected to fail** until the defect is
 wired. Do not "fix" them by relaxing assertions. There are currently none.
 
-Sibling backend location for cross-repo checks:
-`ADGEN_BACKEND_PATH` or `../liquidretail_backend`
-(`scripts/lib/siblingBackend.js`). Missing sibling = INFO skip, not fail.
+Backend location for cross-tree checks:
+`ADGEN_BACKEND_PATH`, else the **parent** of `adgen/` (the parent IS the
+backend), else `../liquidretail_backend` for leftover split-repo
+checkouts (`scripts/lib/siblingBackend.js`). After the graft, a miss
+throws (`assertBackendRoot`) rather than INFO-skip.
 
 | Script | What it actually asserts |
 |---|---|
 | `verifyRequireGraph.js` | Every static `require('./…')` / `require('../…')` under `src/` resolves to a real file. Reports vendored-but-unreferenced files as INFO. Would have caught the deleted `reviewAdapters/helpers` production crash. |
-| `verifyModelParity.js` | For every model that exists in both trees, adgen top-level schema paths ⊆ backend paths. Backend-only fields are INFO. Needs `mongoose` (falls back to the sibling backend's `node_modules`). |
+| `verifyModelParity.js` | For every model that exists in both trees, adgen top-level schema paths ⊆ backend paths. Backend-only fields are INFO. Needs `mongoose` (falls back to the parent backend's `node_modules`). |
 | `verifyRendererAtomicClaim.js` | `claimOne` filter requires `claimedByWorker:null`; two concurrent claims cannot both win (offline stub driven by the **real** filter text); claim is released on failure and derive-requeue; every terminal write clears `claimedByWorker`. |
 | `verifyRendererVideoMoneyInvariants.js` | Structural: the single `atlasVideo.generateForAd` call is unreachable from the `if (deriveFromFmt)` block (every path throws or returns); a failed sibling master throws rather than submitting. |
 | `verifyRendererAdStatusEnum.js` | Every `status:` value renderer **writes** is in `models/Ad.js`'s enum `queued/rendering/draft/live/archived/failed` and is a case `campaignRunGuards.classifyRunAdOutcome` recognises. Pins that renderer only writes `draft` / `failed` / `rendering`. |
@@ -810,9 +820,9 @@ Sibling backend location for cross-repo checks:
 | `verifyArchiveDigestRelease.js` | Pure exported archive/requeue pipeline helpers (groups A–D). Group E (backend caller scan) is mostly skipped — adgen has no `routes/ads.js` / `worker.js`. |
 | `verifyPmaxVideoExpansion.js` | PMax video minting money rules against vendored `campaignAdsGenerationService` / `platformFormats`; derive branch extracted from `renderer.js` instead of backend `routes/ads.js`. |
 | `verifySharedPortraitMaster.js` | Mixed Meta+PMax shares one 9:16 master (one billable portrait plate). |
-| `verifyQuoteProvenanceStamp.js` | `stampQuoteOrigins` reads `container.quotesOrigin`; flag-off baseline is an embedded snapshot of backend commit `3e4561e2` (that SHA is not in this repo's history). |
+| `verifyQuoteProvenanceStamp.js` | `stampQuoteOrigins` reads `container.quotesOrigin`; flag-off baseline is an embedded snapshot of backend commit `3e4561e2`. |
 | `verifyRunFinalizesOnSettle.js` | CampaignRun reaches `done` once every claimed ad has settled. Replays source-extracted `bumpRunCounter` (including its `maybeFinalizeRun` call at `renderer.js:744`) against the measured incident shape (succeeded=2, failed=1, total=3). Pins that `classifyRunAdOutcome` + `buildRunReconciliationUpdate` are called from `renderer.js`, and that a run does **not** finalize while a claimed ad is still `rendering`. |
-| `verifyCampaignRunHeartbeatWired.js` | **Now passing — this was fixed on 2026-08-24 and the harness was renamed (the `_KNOWN_OPEN` suffix is gone).** It previously pinned an expected-fail: `startRunHeartbeat` was exported from `campaignRunHeartbeat.js` with **zero** call sites in `src/`. `startRunHeartbeat` now appears 4× in `renderer.js` on `origin/master`. Why it mattered: without the beat, `CampaignRun.updatedAt` only moves when an ad *settles*, so a long video-titling gap could drop the backend duplicate-generation gate's running arm. |
+| `verifyCampaignRunHeartbeatWired.js` | **Now passing — this was fixed on 2026-08-24 and the harness was renamed (the `_KNOWN_OPEN` suffix is gone).** It previously pinned an expected-fail: `startRunHeartbeat` was exported from `campaignRunHeartbeat.js` with **zero** call sites in `src/`. `startRunHeartbeat` now appears 4× in `renderer.js`. Why it mattered: without the beat, `CampaignRun.updatedAt` only moves when an ad *settles*, so a long video-titling gap could drop the backend duplicate-generation gate's running arm. |
 | `verifyTitlingRecoverability.js` | Titling-failure recoverability (2026-08-25): (A) `brandScriptExecutor.stampTitlingFailureAndThrow` decides resumable-vs-terminal correctly for OOM/timeout/generic, bounded by a shared `TITLING_ATTEMPTS_MAX` ceiling (execution, real function, stubbed `Ad`). (B) the resume sweep is wired from `renderer.js` (not the RAM-inadequate `orchestrator.js` — see CLAUDE.md's titlingResumeService note), gated on `isAdgenRendererEnabled()`, `orchestrator.js` does NOT run it, and `titler.js`'s own titling call site was mirrored to the same gate (structural). (C) two REAL concurrent `resumeUntitledMasters()` passes racing the same ad — only one titles it (execution, in-memory Mongo-like stub, `scripts/lib/miniMongoStub.js`, whose `findOneAndUpdate` correctly models Mongoose's `{new:true/false}` pre/post-image semantics — an earlier version of the stub ignored `opts` and would have hidden a real sign/timing bug in the attempt-cap read-back). (D) a cap-exceeded titling failure keeps its detailed `renderError` — `processAd`'s unscoped `noteRenderIssue` no longer clobbers the stamp's message/code with a generic one. |
 | `verifyTitlingResumeNeverResubmits.js` | THE MONEY CHECK: a resumed titling attempt can never re-submit a paid Atlas Omni generation. `atlasVideoService.submitGeneration` has exactly one call site, structurally inside the `else` of `if (isResuming)`; a real require-graph BFS (Node's own `require.resolve`) proves `atlasVideoService.js` is unreachable from `titlingResumeService.js`'s or `brandScriptExecutor.js`'s entire transitive require graph, with a positive control (same BFS from `renderer.js`, which DOES require it) ruling out a vacuous pass. |
 | `verifyGeminiVideoProvider.js` | **THE GEMINI MONEY HARNESS.** Offline (source-extracted pures, no axios/mongoose). Pins measured request shape (`input` not `inputs`, duration `"10s"`, `background:true`, `task:reference_to_video`); never `$0` on a real charge; `classifyPoll` content-policy / no-status `error` is terminal not pending; `too_many_requests` after accept is not a free replay; Gemini never infers unbilled from missing `price`; lease is Mongo not `semaphore.js`; output URI is walked from `steps[].content[]` not inferred `output.uri`; download/mirror failures set `unsettledAtTimeout`; auth header reads `.apiKey` not the key object (the live 403). |
@@ -974,7 +984,7 @@ npm install
 ADGEN_ROLE=api npm start                 # :3100/health
 ADGEN_ROLE=orchestrator npm start        # read-only poll
 ADGEN_RENDERER_ENABLED=true ADGEN_ROLE=renderer npm start
-npm test                                 # origin/master only; needs scripts/
+npm test                                 # 106 scripts; run from adgen/, never via parent NODE_PATH
 ```
 
 `.env.example` does not list `ADGEN_RENDERER_ENABLED`; without it the
@@ -988,9 +998,9 @@ itself: `liquidretail_adgen/.worktrees/pr34-measure`. The three-line version
 of this warning that used to live here evidently was not enough to stop it —
 hence the longer version below.
 
-**Rule: worktrees go as SIBLINGS of the repo**
+**Rule: worktrees go as SIBLINGS of the monorepo**
 (`/Volumes/Sayulita/Projects/RS/.wt-<name>`), **never nested under
-`liquidretail_adgen/`** — not `.worktrees/`, not `.claude/worktrees/`, not
+`adgen/` or the backend checkout** — not `.worktrees/`, not `.claude/worktrees/`, not
 anywhere inside the repo tree. `.gitignore` does **not** protect against
 this: the hazard below is raw filesystem walks, not git status, so an
 ignored directory gets scanned exactly like a tracked one.
@@ -1030,27 +1040,17 @@ out, with no red flag at all.
 
 ### Two more tooling traps that have cost real time
 
-**Never `npm ci` an adgen worktree, and never set `NODE_PATH` here.**
-`verifyModelParity.js` needs its own `require('mongoose')` to FAIL first —
-only then does its `Module._load` fallback patch install
-(`loadMongooseWithFallback`, `scripts/verifyModelParity.js:124-173`), which
-is what lets it read both adgen's and the sibling backend's 33 model files
-through one shared mongoose instance (`captureSchema`,
-`scripts/verifyModelParity.js:188-201`, patches `mongoose.model` once and
-relies on every later `require('mongoose')` in the process resolving to
-that same instance). Give the worktree its own `mongoose` — via `npm ci` or
-via `NODE_PATH` pointing at any `node_modules` that has it — and the
-fallback patch never installs, the shared-instance assumption breaks, and
-every one of the 33 adgen models reports "never called mongoose.model(...)
-— cannot extract a schema." Measured: a bare worktree passes 33/33; an
-`npm ci`'d or `NODE_PATH`-set one fails 33/33 with that exact message, which
-reads exactly like a real schema-parity defect and is not one. Run this
-harness from a bare worktree with the sibling `liquidretail_backend`
-checkout present alongside it.
+**Never `npm ci` at the monorepo root then run adgen, and never set
+`NODE_PATH` to the parent.** Adgen `src/db.js` fails closed unless mongoose
+major is 8. `npm ci` **inside** `adgen/` is required. Pointing `NODE_PATH`
+at the parent's mongoose 7 is the silent-shadow bug the boot assert exists
+to catch.
 
-**Backend is the opposite** — its worktrees need `npm run setup:worktree`
-first, because its committed `node_modules` subset is incomplete. Don't
-carry either repo's rule over to the other.
+The older `verifyModelParity.js` loader (`loadMongooseWithFallback`) still
+exists for leftover bare-worktree / split-repo checkouts — do not "fix" it
+by setting `NODE_PATH` at the parent. Backend worktrees still need
+`npm run setup:worktree` (incomplete committed `node_modules`). Don't
+carry either package's install rule over to the other.
 
 **Parallel agents running mutation-style revert-proves in the same repo
 interfere with each other's suite runs.** Observed twice in one night as a
@@ -1148,15 +1148,15 @@ original refusal-path proofs, are now pinned by
 fixture repo — added to `npm test`, not just asserted in a PR description.
 
 **Duplication, deliberate:** `scripts/lib/gitAudit.js` plus these two callers
-are hand-synced, byte-identical, with `liquidretail_backend`'s copies — NOT
-routed through `scripts/vendor-manifest.json`/`verifyVendorDrift.js`. That
+are hand-synced, byte-identical, with the backend copies at repo-root
+`scripts/` — NOT routed through `scripts/vendor-manifest.json`/`verifyVendorDrift.js`. That
 system hashes backend↔adgen **production** modules under `models/`/`services/`
 with a debt-tracking grace period (`UNPORTED_GRACE_DAYS_DEFAULT`) built for
 code that writes the shared Mongo collections; a git-ops utility with zero
 Mongo/business-logic coupling doesn't fit that shape, and forcing it through
 a system built around "these two sides may legitimately drift for up to N
 days" would be actively misleading for a file that has no reason to ever
-drift. Diff the three files against the sibling repo before editing either
+drift. Diff the three files against the parent `scripts/` before editing either
 copy.
 
 **Backend also has `scripts/findOrphanedBranches.js` / `findStaleUncommittedWork.js`
@@ -1168,25 +1168,14 @@ GitHub-PR-aware equivalent and isn't getting one here — `gh` cross-referencing
 stays a backend-only tool as of this writing.
 
 **Wired into the habit via a committed SessionEnd hook**, not left as a
-script nobody runs: `.claude/settings.json` (committed — note `.gitignore`
-now reads `.claude/*` with explicit `!.claude/settings.json` /
-`!.claude/hooks/` re-includes, not a blanket `.claude/` ignore, so
-`.claude/settings.local.json` and Claude Code's own `.claude/worktrees/`
-scratch dir stay ignored) runs `.claude/hooks/session-end-audit.sh` at the
-end of every session. That wrapper always exits 0 (`|| true`) and delegates
-to `auditStrandedWork.js --hook`, which independently guarantees the same
-(try/catch around everything, always `process.exit(0)`) and prints exactly
-one `{"systemMessage": "..."}` line — a terse one-liner, not the full
-report, by design: the hook's job is to make the finding impossible to miss
-at the one moment a human is guaranteed to glance at the terminal, not to
-replace `npm run check:stranded-work` for a full read. Chosen over "just
-document the manual command" because the exact incidents this tool exists
-for are ones where nobody thought to run a manual command — `docs/PARALLEL_WORK.md`
-§7 tooling existed on `main` in the sibling backend repo, unused, for the
-same reason. This mirrors backend's own pre-existing committed
-`.claude/settings.json` + `.claude/hooks/session-start.sh` pattern, so
-`liquidretail_adgen` gains a shared, git-tracked hook precedent rather than
-diverging on one.
+script nobody runs. In the monorepo Claude Code only loads `.claude/` at
+the **repo root**; `adgen/.claude/` is inert. The live wrapper is
+`.claude/hooks/session-end-audit.sh` (one git-repo-wide
+`auditStrandedWork.js --hook` run covers `adgen/` too). That wrapper
+always exits 0 and prints exactly one `{"systemMessage": "..."}` line.
+`adgen/.claude/` is kept on disk so a checkout that still opens `adgen/`
+as its own Claude project does not lose the wrapper; do not add a second
+audit invocation there.
 
 ---
 
@@ -1204,15 +1193,15 @@ the **shared** `Media` doc that `liquidretail_backend` also steals from with its
 copy of the formula, so #82 raising `ATLAS_TIMEOUT_MS` here and not there put the
 two sides 5 minutes apart on when a holder is dead (25 min here, 20 there). Its
 "+10 min" was also already spent — 602.5s of bounded non-poll work meant **−2.5s**
-of real margin. The floor is now a flat 20 min in both repos; this repo's value
+of real margin. The floor is now a flat 20 min in both trees; this prefix's value
 dropped 25→20, which costs nothing because backend always stole at 20 anyway.
 Poll budget is a latency choice; the floor is a money guard. The **upper** clamp on
 `REFRAME_POLL_MS` is lease-derived, not `MAX_POLL_MS` — that direction is fine
 (money guard bounds latency knob), and a sweep found the reverse permits a
 1364.5s hold against a 1200s lease.
 
-Cross-repo enforcement is `scripts/shared-invariants.json` (read from backend's
-`origin/main`); per-repo, `scripts/verifyReframeHoldBounded.js` (27 checks,
+Cross-tree enforcement is `scripts/shared-invariants.json` (read from the
+parent); per-package, `scripts/verifyReframeHoldBounded.js` (27 checks,
 revert-proven). Full write-up: `session.d/2026-08-27_reframe-hold-bounded.md`.
 
 ## What this repo does not do (yet)
@@ -1342,7 +1331,7 @@ context. Do not read any of this as settled fact from two data points.
      verbatim, with its own "DO NOT FIX" comment
      (`src/services/veoPromptBuilder.js:314-320`, `transitions` at line
      286, the `doNot` dissolves clause at line 327). **Confirmed still
-     present on `origin/master` as of this writing** — this is not a
+     present on the grafted tree as of this writing** — this is not a
      historical note, the identical contradiction is live in production
      today.
    - Separately, the harness ran a **measured A/B** (`rpd-validation-crossfade-ab`,
