@@ -1031,30 +1031,46 @@ async function main() {
   // from the remote trunk ref, not from a working tree, so it is red while the
   // prerequisite is unmerged and goes green the moment it lands — with no
   // further commit on this branch.
-  await check('E1 [MERGE-ORDER] the vendor-manifest correction has landed on origin/master', () => {
+  await check('E1 [MERGE-ORDER] the vendor-manifest correction has landed on the survivor trunk', () => {
     const { execFileSync } = require('child_process');
-    let raw;
-    try {
-      raw = execFileSync('git', ['show', 'origin/master:scripts/vendor-manifest.json'],
-        { cwd: ROOT, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
-    } catch (err) {
-      // Fail CLOSED. A merge gate that disappears when a ref is unreadable is
-      // not a gate. If this fires in an environment with no origin, fetch it
-      // rather than deleting the check.
+    // Split-repo CI used origin/master:scripts/vendor-manifest.json. After
+    // the graft the survivor trunk is origin/main, the file lives under
+    // adgen/, and origin/master does not exist. Try the old path first so
+    // a still-split checkout stays green, then the grafted paths. Fail
+    // closed if none of them are readable — do not skip.
+    const candidates = [
+      'origin/master:scripts/vendor-manifest.json',
+      'HEAD:adgen/scripts/vendor-manifest.json',
+      'origin/main:adgen/scripts/vendor-manifest.json'
+    ];
+    let raw = null;
+    let used = null;
+    const errors = [];
+    for (const spec of candidates) {
+      try {
+        raw = execFileSync('git', ['show', spec],
+          { cwd: ROOT, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
+        used = spec;
+        break;
+      } catch (err) {
+        errors.push(`${spec}: ${(err && err.message || '').split('\n')[0]}`);
+      }
+    }
+    if (!raw) {
       assert.fail(
-        'could not read origin/master:scripts/vendor-manifest.json — run `git fetch origin`. '
-        + `This check fails closed on purpose. (${err && err.message})`);
+        'could not read vendor-manifest.json from any trunk candidate '
+        + `(${candidates.join(', ')}) — fail closed. ${errors.join(' | ')}`
+      );
     }
     const entry = JSON.parse(raw).files['services/adRegenerateService.js'];
-    assert.ok(entry, 'services/adRegenerateService.js is missing from the manifest on origin/master');
+    assert.ok(entry, `services/adRegenerateService.js is missing from the manifest at ${used}`);
     assert.ok(
       String(entry.reason).includes('OWES PORTS IN BOTH DIRECTIONS'),
       'PREREQUISITE NOT MERGED — this is the merge-order gate, not a defect in this PR.\n'
       + '  This branch changes services/adRegenerateService.js, which moves its adgenHash.\n'
       + '  The manifest-correction PR reconciles that same entry and must land FIRST, or it\n'
       + '  records a hash that is stale on arrival.\n'
-      + '  Merge that PR, then re-run this suite. No commit is needed here — this check reads\n'
-      + '  origin/master live and will go green on its own.');
+      + `  Read ${used}. Merge that PR, then re-run this suite.`);
   });
 
   if (failures.length) {
