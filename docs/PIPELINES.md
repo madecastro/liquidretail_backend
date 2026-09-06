@@ -433,7 +433,7 @@ For stores with neither snippets nor a readable API. **Opt-in** (`REVIEW_HEADLES
 | Var | Default | Role |
 |---|---|---|
 | `CATALOG_ENRICHMENT_CONCURRENCY` | `6` | Parallel enrich workers |
-| `CATALOG_ENRICHMENT_MAX_PER_RUN` | `500` | Hard cap per brand run |
+| `CATALOG_ENRICHMENT_MAX_PER_RUN` | `0` (uncapped) | Optional per-run cap; 0/unset/negative = no ceiling |
 | `PRODUCT_REVIEWS_MAX_QUOTES` | `10` | Quotes **stored** per product (ranked positive-first before truncation) |
 | `PRODUCT_REVIEWS_TTL_DAYS` | `30` | Re-scrape cadence for on-site reviews |
 | `PRODUCT_REVIEWS_CONCURRENCY` | `4` | Parallel PDP fetches in the review sweep |

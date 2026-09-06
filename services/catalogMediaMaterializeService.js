@@ -45,12 +45,25 @@ const { concurrency: CONC } = require('./concurrency');
 const CONCURRENCY = CONC.CATALOG_YOLO_CONCURRENCY;  // reuse the same knob — same bandwidth ceiling
 
 const DEFAULT_ALT_LIMIT = Math.max(0, parseInt(process.env.CATALOG_YOLO_ALT_LIMIT, 10) || 7);
-const MAX_PER_RUN = Math.max(1, parseInt(process.env.CATALOG_YOLO_MAX_PER_RUN, 10) || 500);
+// Per-run ceiling. Unset / 0 / negative / NaN → uncapped. Shares
+// CATALOG_YOLO_MAX_PER_RUN with catalogYoloDetectionService so the two
+// peer phases in catalogPostSyncOrchestrator cannot disagree. A positive
+// integer re-caps one brand run. Default is uncapped (owner 2026-09-05).
+function parseMaxPerRun(raw) {
+  const n = Number(raw);
+  return n > 0 ? n : Infinity;
+}
+const MAX_PER_RUN = parseMaxPerRun(process.env.CATALOG_YOLO_MAX_PER_RUN);
+function applyRunCap(candidates, cap = MAX_PER_RUN) {
+  if (!Array.isArray(candidates)) return [];
+  return Number.isFinite(cap) ? candidates.slice(0, cap) : candidates;
+}
 
 (function logConfig() {
+  const maxLabel = Number.isFinite(MAX_PER_RUN) ? MAX_PER_RUN : 'uncapped';
   console.log(
     `🖼️  catalogMediaMaterializeService config — ` +
-    `concurrency=${CONCURRENCY} maxPerRun=${MAX_PER_RUN} altLimit=${DEFAULT_ALT_LIMIT}`
+    `concurrency=${CONCURRENCY} maxPerRun=${maxLabel} altLimit=${DEFAULT_ALT_LIMIT}`
   );
 })();
 
@@ -191,11 +204,11 @@ async function ensureBrandCatalogMediaMaterialized(brandId, opts = {}) {
     .select('_id brandId advertiserId title imageUrl additionalImages imageMediaId additionalImageMediaIds')
     .lean();
 
-  const targets = rows.slice(0, MAX_PER_RUN);
+  const targets = applyRunCap(rows);
   console.log(
     `🖼️  catalogMediaMaterialize[brand=${brandId}]: ` +
     `${rows.length} products, ${targets.length} target(s) (altLimit=${altLimit}, ` +
-    `cap=${MAX_PER_RUN}, concurrency=${CONCURRENCY})`
+    `cap=${Number.isFinite(MAX_PER_RUN) ? MAX_PER_RUN : 'uncapped'}, concurrency=${CONCURRENCY})`
   );
   if (!targets.length) {
     return { ok: true, total: rows.length, materialized: 0, durationMs: Date.now() - t0 };
@@ -244,5 +257,7 @@ async function ensureBrandCatalogMediaMaterialized(brandId, opts = {}) {
 module.exports = {
   ensureBrandCatalogMediaMaterialized,
   // Exported for tests / verify harness / one-off scripts.
-  materializeOne
+  materializeOne,
+  parseMaxPerRun,
+  applyRunCap
 };
