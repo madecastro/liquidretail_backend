@@ -129,7 +129,7 @@ async function run({ req, args }) {
     result = await CatalogProduct.findOneAndUpdate(
       { brandId: brand._id, externalId },
       upsertUpdate,
-      { upsert: true, new: true, rawResult: true }
+      { upsert: true, new: true, includeResultMetadata: true }
     );
   } catch (err) {
     return { ok: false, error: `CatalogProduct upsert failed: ${err.message}` };

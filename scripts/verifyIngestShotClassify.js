@@ -1259,7 +1259,7 @@ async function main() {
           fetchesSoFar: fetchOrder.length,
           beginsSoFar: beginOrder.length
         });
-        // Meta writer uses rawResult:true and reads result.value / lastErrorObject.
+        // Meta writer uses includeResultMetadata:true and reads result.value / lastErrorObject.
         return {
           value: doc,
           lastErrorObject: { updatedExisting: false },

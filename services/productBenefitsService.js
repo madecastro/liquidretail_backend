@@ -77,7 +77,7 @@ function alreadyAttempted(product) {
   return product?.shortBenefitsDerivedAt != null;
 }
 
-// mongoose findOneAndUpdate({ upsert, new, rawResult: true }) — the same
+// mongoose findOneAndUpdate({ upsert, new, includeResultMetadata: true }) — the same
 // shape apifyIngestService / catalogSyncService already use. A missing
 // lastErrorObject fails CLOSED (treat as update, do not derive): over-
 // skipping a new product is a backfill, under-skipping is a resync bill.

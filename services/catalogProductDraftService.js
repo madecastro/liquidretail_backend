@@ -263,7 +263,7 @@ async function tryCreate({ media, productMatch, sceneImageUrl, yoloProducts, for
     result = await CatalogProduct.findOneAndUpdate(
       { brandId: media.brandId, externalId },
       upsertUpdate,
-      { upsert: true, new: true, rawResult: true }
+      { upsert: true, new: true, includeResultMetadata: true }
     );
   } catch (err) {
     return { created: false, reason: `upsert failed: ${err.message}` };
