@@ -228,6 +228,13 @@ const brandSchema = new mongoose.Schema({
   catalogYoloBackoffUntil:    { type: Date,   default: null },
   catalogYoloBackoffFailures: { type: Number, default: 0 },
   catalogYoloBackoffReason:   { type: String, default: null },
+  // Cross-process "chain is alive" heartbeat. Independent of OperationRun
+  // heartbeatAt, which progressService stops at MAX_RUN_MS (4h). A live
+  // Gymshark drain is 7–22h; without this, sweepStaleRuns flips the
+  // parent to failed at 4h+2min and reconcile starts a second chain.
+  // Goes stale on its own after POST_SYNC_CHAIN_HEARTBEAT_STALE_MIN so a
+  // dead holder does not stall the brand forever.
+  catalogPostSyncHeartbeatAt: { type: Date, default: null },
 
   // V3 #3 — auto-reply with a comment on IG-sourced posts when detect
   // produces a confident product_match. Per-brand opt-in. Phase 1.7c

@@ -77,6 +77,10 @@ function parsePositiveInt(raw, fallback) {
 const MAX_INFLIGHT_CHAINS = parsePositiveInt(process.env.POST_SYNC_MAX_INFLIGHT_CHAINS, 1);
 const BACKOFF_BASE_MS = parsePositiveInt(process.env.CATALOG_YOLO_BACKOFF_BASE_MS, 1_800_000);
 const BACKOFF_CAP_MS = parsePositiveInt(process.env.CATALOG_YOLO_BACKOFF_CAP_MS, 28_800_000);
+// Brand-level chain heartbeat stale window (minutes → ms). Independent of
+// OperationRun.heartbeatAt / MAX_RUN_MS. Default 15.
+const CHAIN_HEARTBEAT_STALE_MIN = parsePositiveInt(process.env.POST_SYNC_CHAIN_HEARTBEAT_STALE_MIN, 15);
+const CHAIN_HEARTBEAT_STALE_MS = CHAIN_HEARTBEAT_STALE_MIN * 60 * 1000;
 
 // Same-process registry. Empty on boot is correct (old process died).
 const inFlightBrands = new Set();
@@ -112,13 +116,106 @@ function backoffOnAbortUpdate(failures, now = Date.now()) {
   };
 }
 
+function isChainHeartbeatFresh(at, now = Date.now(), staleMs = CHAIN_HEARTBEAT_STALE_MS) {
+  if (!at) return false;
+  const ms = at instanceof Date ? at.getTime() : Number(at);
+  return Number.isFinite(ms) && ms > now - staleMs;
+}
+
+function mongoReady() {
+  return !!(Brand.db && Brand.db.readyState === 1);
+}
+
+async function claimChainHeartbeat(brandId) {
+  if (_testOverrides.claimChainHeartbeat) return _testOverrides.claimChainHeartbeat(brandId);
+  if (!mongoReady()) return true;
+  const staleBefore = new Date(Date.now() - CHAIN_HEARTBEAT_STALE_MS);
+  const doc = await Brand.findOneAndUpdate(
+    {
+      _id: brandId,
+      $or: [
+        { catalogPostSyncHeartbeatAt: null },
+        { catalogPostSyncHeartbeatAt: { $exists: false } },
+        { catalogPostSyncHeartbeatAt: { $lt: staleBefore } }
+      ]
+    },
+    { $set: { catalogPostSyncHeartbeatAt: new Date() } },
+    { new: true }
+  );
+  return !!doc;
+}
+
+async function touchChainHeartbeat(brandId) {
+  if (!brandId) return;
+  if (_testOverrides.touchChainHeartbeat) return _testOverrides.touchChainHeartbeat(brandId);
+  if (!mongoReady()) return;
+  try {
+    await Brand.updateOne(
+      { _id: brandId },
+      { $set: { catalogPostSyncHeartbeatAt: new Date() } }
+    );
+  } catch (err) {
+    console.warn(`${LOG} chain heartbeat touch failed: ${err.message}`);
+  }
+}
+
+async function clearChainHeartbeat(brandId) {
+  if (!brandId) return;
+  if (_testOverrides.clearChainHeartbeat) return _testOverrides.clearChainHeartbeat(brandId);
+  if (!mongoReady()) return;
+  try {
+    await Brand.updateOne(
+      { _id: brandId },
+      { $set: { catalogPostSyncHeartbeatAt: null } }
+    );
+  } catch (err) {
+    console.warn(`${LOG} chain heartbeat clear failed: ${err.message}`);
+  }
+}
+
 async function applyBackoff(brandId, reason = 'yolo-circuit-open') {
   if (_testOverrides.applyBackoff) return _testOverrides.applyBackoff(brandId, reason);
-  const row = await Brand.findById(brandId).select('catalogYoloBackoffFailures').lean();
-  const failures = (row && row.catalogYoloBackoffFailures ? row.catalogYoloBackoffFailures : 0) + 1;
-  const { delayMs, update } = backoffOnAbortUpdate(failures);
-  await Brand.updateOne({ _id: brandId }, update);
-  return { failures, delayMs, reason };
+  if (!mongoReady()) return { failures: 1, delayMs: nextBackoffMs(1), reason };
+  const now = Date.now();
+  // Single atomic pipeline: $inc-equivalent $add on failures, then derive
+  // until from the NEW count. Two aborting processes cannot both write
+  // failures=1 (the previous read-modify-write lost-update).
+  const doc = await Brand.findOneAndUpdate(
+    { _id: brandId },
+    [
+      {
+        $set: {
+          catalogYoloBackoffFailures: { $add: [{ $ifNull: ['$catalogYoloBackoffFailures', 0] }, 1] },
+          catalogYoloBackoffReason: reason
+        }
+      },
+      {
+        $set: {
+          catalogYoloBackoffUntil: {
+            $toDate: {
+              $add: [
+                now,
+                {
+                  $min: [
+                    BACKOFF_CAP_MS,
+                    {
+                      $multiply: [
+                        BACKOFF_BASE_MS,
+                        { $pow: [2, { $max: [0, { $subtract: ['$catalogYoloBackoffFailures', 1] }] }] }
+                      ]
+                    }
+                  ]
+                }
+              ]
+            }
+          }
+        }
+      }
+    ],
+    { new: true }
+  );
+  const failures = (doc && doc.catalogYoloBackoffFailures) || 1;
+  return { failures, delayMs: nextBackoffMs(failures), reason };
 }
 
 async function backoffAfterSuccess(brandId) {
@@ -156,8 +253,10 @@ function filterSweepCandidates({
   liveBrandIds = [],
   inFlight = [],
   backoffUntil = {},
+  chainHeartbeatAt = {},
   now = Date.now(),
-  staleMs = STALE_HEARTBEAT_MS
+  staleMs = STALE_HEARTBEAT_MS,
+  chainStaleMs = CHAIN_HEARTBEAT_STALE_MS
 } = {}) {
   const live = new Set([...liveBrandIds].map(String));
   const flying = new Set(inFlight instanceof Set
@@ -170,6 +269,7 @@ function filterSweepCandidates({
     if (!id || seen.has(id)) continue;
     seen.add(id);
     if (flying.has(id) || live.has(id)) continue;
+    if (isChainHeartbeatFresh(chainHeartbeatAt[id], now, chainStaleMs)) continue;
     const until = backoffUntil[id];
     const untilMs = until instanceof Date ? until.getTime() : until;
     if (untilMs && untilMs > now) continue;
@@ -213,11 +313,20 @@ async function runPostSyncChain(brandId, { trigger = 'sync' } = {}) {
     console.log(`${LOG}[brand=${id}] skipped (in-process chain already running)`);
     return { status: 'skipped', reason: 'in-flight', phases: {}, runId: null };
   }
+  // Cross-process gate (F1/F2): Brand heartbeat is independent of
+  // OperationRun.heartbeatAt (voided at MAX_RUN_MS=4h). Atomic claim so
+  // web ingest + worker reconcile cannot both start.
+  const claimed = await claimChainHeartbeat(id);
+  if (!claimed) {
+    console.log(`${LOG}[brand=${id}] skipped (chain-alive heartbeat still fresh)`);
+    return { status: 'skipped', reason: 'chain-alive', phases: {}, runId: null };
+  }
   inFlightBrands.add(id);
   try {
     return await runPostSyncChainUnlocked(brandId, { trigger });
   } finally {
     inFlightBrands.delete(id);
+    await clearChainHeartbeat(id);
   }
 }
 
@@ -259,6 +368,7 @@ async function runPostSyncChainUnlocked(brandId, { trigger = 'sync' } = {}) {
     await doMaterialize(brandId);
     phases.materialize = 'ok';
     run.tick(1, 2, 'materialize ok');
+    try { await touchChainHeartbeat(brandId); } catch { /* ignore */ }
   } catch (err) {
     phases.materialize = `failed: ${err.message?.slice(0, 200) || 'unknown'}`;
     failures++;
@@ -360,7 +470,12 @@ async function runPostSyncChainUnlocked(brandId, { trigger = 'sync' } = {}) {
 }
 
 /**
- * Start at most POST_SYNC_MAX_INFLIGHT_CHAINS new chains this tick.
+ * Start at most POST_SYNC_MAX_INFLIGHT_CHAINS chains while this process
+ * already holds fewer than that many in-flight (sync OR reconcile —
+ * conservative: a sync-triggered chain blocks reconcile from starting
+ * another brand). stats.started caps new starts this tick;
+ * inFlightBrands.size counts every live holder in this process, not
+ * only ones this tick started.
  * Stops the rest of the tick if a chain aborts with yolo-circuit-open
  * (process-wide circuit is open; more brands would only burn cooldown).
  */
@@ -423,7 +538,9 @@ async function sweepIncompleteBrands({ batchSize = 5, staleMinutes = 30 } = {}) 
 
   let liveBrandIds = [];
   try {
-    liveBrandIds = (await OperationRun.distinct('brandId', {
+    const distinctLive = _testOverrides.distinctLiveBrandIds
+      || ((q) => OperationRun.distinct('brandId', q));
+    liveBrandIds = (await distinctLive({
       kind: { $in: LIVE_KINDS },
       status: 'running',
       heartbeatAt: { $gt: new Date(now - STALE_HEARTBEAT_MS) }
@@ -434,7 +551,9 @@ async function sweepIncompleteBrands({ batchSize = 5, staleMinutes = 30 } = {}) 
 
   // Signal (a) — latest catalog-post-sync per brand.
   try {
-    const latest = await OperationRun.aggregate([
+    const aggregateLatest = _testOverrides.aggregateLatestRuns
+      || ((pipeline, opts) => OperationRun.aggregate(pipeline, opts));
+    const latest = await aggregateLatest([
       { $match: { kind: 'catalog-post-sync', brandId: { $ne: null } } },
       { $sort: { updatedAt: -1 } },
       { $group: {
@@ -445,10 +564,10 @@ async function sweepIncompleteBrands({ batchSize = 5, staleMinutes = 30 } = {}) 
         lastId: { $first: '$_id' },
         lastUpdatedAt: { $first: '$updatedAt' }
       } }
-    ]);
+    ], { allowDiskUse: true });
     for (const r of latest) {
       latestRuns.push({
-        brandId: r._id,
+        brandId: r._id || r.brandId,
         lastStatus: r.lastStatus,
         lastHeartbeatAt: r.lastHeartbeatAt,
         lastEndedAt: r.lastEndedAt,
@@ -457,13 +576,22 @@ async function sweepIncompleteBrands({ batchSize = 5, staleMinutes = 30 } = {}) 
     }
   } catch (err) {
     console.warn(`${LOG} sweep signal-a failed: ${err.message}`);
+    alerts.notifyAsync({
+      level: 'error',
+      title: 'Post-sync reconcile latest-run query failed',
+      key: 'post-sync:sweep-aggregate-failed',
+      fields: { error: String(err.message || err).slice(0, 200) },
+      detail: 'Reconcile signal (a) could not load latest catalog-post-sync runs. YOLO-failed brands may be skipped this tick — not the same as “nothing to do”.'
+    });
   }
 
   // Signal (b) — brands with CatalogProducts needing materialize AND
   // no successful/live post-sync run. Cheap distinct, bounded.
   if (latestRuns.length < batchSize * 4) {
     try {
-      const pendingBrandIds = await CatalogProduct.distinct('brandId', {
+      const distinctPending = _testOverrides.distinctPendingBrandIds
+        || ((q) => CatalogProduct.distinct('brandId', q));
+      const pendingBrandIds = await distinctPending({
         imageUrl: { $nin: [null, ''] },
         imageMediaId: null,
         deletedAt: null
@@ -482,13 +610,18 @@ async function sweepIncompleteBrands({ batchSize = 5, staleMinutes = 30 } = {}) 
 
   const candidateIds = latestRuns.map((r) => r.brandId).filter(Boolean);
   const backoffUntil = {};
+  const chainHeartbeatAt = {};
   if (candidateIds.length) {
     try {
-      const rows = await Brand.find({ _id: { $in: candidateIds } })
-        .select('catalogYoloBackoffUntil')
-        .lean();
+      const loadBrands = _testOverrides.loadBrandState
+        || ((ids) => Brand.find({ _id: { $in: ids } })
+          .select('catalogYoloBackoffUntil catalogPostSyncHeartbeatAt')
+          .lean());
+      const rows = await loadBrands(candidateIds);
       for (const b of rows) {
-        if (b.catalogYoloBackoffUntil) backoffUntil[String(b._id)] = b.catalogYoloBackoffUntil;
+        const bid = String(b._id || b.brandId);
+        if (b.catalogYoloBackoffUntil) backoffUntil[bid] = b.catalogYoloBackoffUntil;
+        if (b.catalogPostSyncHeartbeatAt) chainHeartbeatAt[bid] = b.catalogPostSyncHeartbeatAt;
       }
     } catch (err) {
       console.warn(`${LOG} sweep backoff load failed: ${err.message}`);
@@ -500,8 +633,10 @@ async function sweepIncompleteBrands({ batchSize = 5, staleMinutes = 30 } = {}) 
     liveBrandIds,
     inFlight: inFlightBrands,
     backoffUntil,
+    chainHeartbeatAt,
     now,
-    staleMs
+    staleMs,
+    chainStaleMs: CHAIN_HEARTBEAT_STALE_MS
   });
   const skippedBackoff = filtered.length === 0 && Object.keys(backoffUntil).length
     ? candidateIds.filter((id) => backoffUntil[String(id)] && backoffUntil[String(id)] > now).length
@@ -516,7 +651,9 @@ async function sweepIncompleteBrands({ batchSize = 5, staleMinutes = 30 } = {}) 
   }
 
   console.log(`${LOG} reconcile sweep: ${targets.length} brand(s) — ${targets.join(', ')}`);
-  const stats = await reconcileSelectedBrands(targets);
+  const stats = await reconcileSelectedBrands(targets, {
+    runChain: _testOverrides.runChain
+  });
   stats.skippedBackoff = skippedBackoff;
   stats.inFlightChains = inFlightBrands.size;
   console.log(`${LOG} reconcile sweep done: reconciled=${stats.reconciled} skipped=${stats.skipped} started=${stats.started}`);
@@ -541,6 +678,12 @@ module.exports = {
   MAX_INFLIGHT_CHAINS,
   BACKOFF_BASE_MS,
   BACKOFF_CAP_MS,
+  CHAIN_HEARTBEAT_STALE_MS,
+  CHAIN_HEARTBEAT_STALE_MIN,
+  isChainHeartbeatFresh,
+  claimChainHeartbeat,
+  touchChainHeartbeat,
+  clearChainHeartbeat,
   __test: {
     LOG,
     inFlightBrands,

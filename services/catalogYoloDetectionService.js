@@ -204,6 +204,7 @@ async function processQueue(products, { onDone = null, isCancelled = null, worke
         }
         const p = products[next++];
         inflight++;
+        let outcome = null;
         (async () => {
           await yoloLoadLimiter.acquire();
           try {
@@ -220,6 +221,7 @@ async function processQueue(products, { onDone = null, isCancelled = null, worke
             return { failed: 1, transient: yoloLoadLimiter.isTransientForBreaker(err && err.yoloKind) };
           })
           .then((result) => {
+            outcome = result;
             if (result && result.aborted) return result;
             if (result && result.transient) {
               yoloLoadLimiter.recordOutcome({
@@ -238,7 +240,8 @@ async function processQueue(products, { onDone = null, isCancelled = null, worke
           })
           .finally(async () => {
             inflight--;
-            processed++;
+            // Aborted/skipped-due-to-breaker-open must NOT count as detected.
+            if (!(outcome && outcome.aborted)) processed++;
             if (onDone) { try { await onDone(processed, products.length); } catch { /* ignore */ } }
             if (isCancelled && !stopped) { try { if (await isCancelled()) { stopped = true; abortReason = abortReason || 'cancelled'; } } catch { /* ignore */ } }
             pump();
@@ -336,6 +339,12 @@ async function runYoloDetectionOnTargets(targets, {
     brandId,
     onDone: async (n, total) => {
       run.tick(n, total, `detected ${n}/${total}`);
+      if (brandId) {
+        try {
+          const { touchChainHeartbeat } = require('./catalogPostSyncOrchestrator');
+          await touchChainHeartbeat(brandId);
+        } catch { /* never fail the queue on a heartbeat write */ }
+      }
       if (!cancelledByRun) {
         try { await run.checkpoint(); } catch { cancelledByRun = true; }
       }
@@ -349,6 +358,7 @@ async function runYoloDetectionOnTargets(targets, {
     console.log(
       `🛑 catalogYoloDetection[brand=${brandId}]: circuit open after ` +
       `${yoloLoadLimiter.consecutiveTransientNow()} consecutive transient batches ` +
+      `(threshold ${yoloLoadLimiter.threshold()} is a floor; first wave may run up to concurrency=${CONCURRENCY}) ` +
       `— aborting remaining ${remaining} target(s)`
     );
     try {
