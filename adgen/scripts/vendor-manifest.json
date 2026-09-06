@@ -1,8 +1,8 @@
 {
   "version": 2,
   "backendRef": "origin/main",
-  "backendHead": "ec64a9a586ae8fd9736d6d44952e70c9afaaa09f",
-  "generatedAt": "2026-09-06T07:54:59.065Z",
+  "backendHead": "99253fd70f87b758e804370a4a85e46421da8170",
+  "generatedAt": "2026-09-06T11:00:45.793Z",
   "files": {
     "models/Ad.js": {
       "backendHash": "a8d6f60ecc8e0ca4f5bfe8d7a09a242efd5c3c93d603204820cee72a06c19240",
@@ -70,12 +70,11 @@
       "owedSince": null
     },
     "models/Brand.js": {
-      "backendHash": "867bc01e144a7d8d77ee6bc822abf61e5b7a9ebb46ebda913162fc4de7683104",
+      "backendHash": "fa4bd6423d89f204e51b4d5c254f4b4908c423fd36bff38a6c80f2ba9a588077",
       "adgenHash": "867bc01e144a7d8d77ee6bc822abf61e5b7a9ebb46ebda913162fc4de7683104",
-      "backendSha": "c30302df9f838e9770a80297a23ac67f47b0f9db",
-      "status": "synced",
-      "portTo": null,
-      "owedSince": null
+      "backendSha": "34922c5dc2b56313581c353597247970c1216596",
+      "status": "fork",
+      "reason": "2026-09-06: backend #391/#392 added Brand.lastCatalogResyncAt (Date, default null) for scheduled Shopify-direct/generic/Apify catalog re-sync (scheduledSyncService.runDueCatalogResyncs). Writer is backend-only ingest; adgen has zero Brand.create/update/save sites. verifyModelParity is adgen-fields SUBSET backend-fields, so a backend-only field is fine (same pattern as CampaignRun.automation). Adgen copy unchanged since the last synced look — not an independent fork. Not porting the field: adgen does not run catalog re-sync and would never stamp it."
     },
     "models/Campaign.js": {
       "backendHash": "079065a6d9dff95e04f8136469d847cb6f3703452e6553492ea35e26291df6ae",
@@ -633,11 +632,11 @@
       "owedSince": null
     },
     "services/adRegenerateService.js": {
-      "backendHash": "b3da0931e6758c18cafe0b7686d75a98693b3323c07077c7bd2d57b1aba3ad3c",
+      "backendHash": "8d95c20f742ab40b43b8ab8271f1849ca5bac2e43f6195a173717f299314511e",
       "adgenHash": "f92e2e05144fd8dcaf00beaa791aa6d89cd99c8a18dd4584a4ff0208dea9c6cb",
-      "backendSha": "b4eb6435c7d9717aaafe191c28d5bdf8b22a2691",
+      "backendSha": "ec64a9a586ae8fd9736d6d44952e70c9afaaa09f",
       "status": "unported",
-      "reason": "2026-09-05: leftover 8s duration fallbacks now read META_VIDEO_DURATION_SEC via videoDurationPolicy.js (paired backend fix/stale-video-duration). OWES PORTS IN BOTH DIRECTIONS -- adgen has Gemini-lease-exhausted-skip handling (PR #110), the MAX_RECLAIMS reclaim ceiling, and titlingResumeService/costTracker requires backend's copy lacks (adgen-only, no Gemini video path on backend). Backend has its own additions adgen lacks: the isAdgenRendererEnabled/adgenBridge call-time handoff gate (2026-08-26 routing fix) and its accompanying doc comments. Neither side is a strict superset of the other -- each owes the other a port of what it's missing, tracked here rather than reconciled blind since the two files solve genuinely different problems (adgen renders for real, backend is provenance-only, no Remotion).",
+      "reason": "2026-09-06: backend #396 (ec64a9a5) is the leftover-8s→videoDurationPolicy change this entry already recorded as paired. Adgen already calls resolveAdVideoDurationSec(ad1) at the ugc passthrough durationSec site; the backend hunk is +1 require and durationSec: 8 → resolveAdVideoDurationSec(ad1). No submit/resume/claim/billing logic in that diff. Remaining bidirectional unported debt unchanged: adgen has Gemini-lease-exhausted-skip (PR #110), MAX_RECLAIMS, titlingResumeService/costTracker requires backend lacks; backend has isAdgenRendererEnabled/adgenBridge call-time handoff gate adgen lacks. Neither is a strict superset. Re-attesting the debt (owedSince carried).",
       "portTo": "backend",
       "owedSince": "2026-08-27T10:28:51.314Z"
     },
@@ -668,13 +667,11 @@
       "owedSince": "2026-09-05T00:18:02.460Z"
     },
     "services/aiCreativeDirectorService.js": {
-      "backendHash": "8fe6c33a1a2690393ec7e80aa903f052a25334c5a4833eb10b86b292435a270c",
+      "backendHash": "1690dafafcb828b14c7e3bf457c069f92a5746326705d78116cf188a2a81643b",
       "adgenHash": "4aafee2c1d7cc90487d59d1983df38c0e6b7fb872315cc980161818486decc22",
-      "backendSha": "fba815887c3240d617c9c3a1bbfd6daecd791215",
+      "backendSha": "d994c2433fe047f91d68d5ca48afe3bd411f1307",
       "status": "fork",
-      "reason": "2026-09-03: deliberately did not port backend PR #386's static COPY prompt tightening (product_signal.benefits 'never invent' clause). Adgen does not mint static ads / does not run the Director round — expansion stays backend. Remaining fork is the pre-existing comment-only reserved-proof-slot annotation (PR #34 ADGEN-ONLY eligibility widening) plus that static-prompt delta.",
-      "portTo": null,
-      "owedSince": null
+      "reason": "2026-09-06: backend #390 (d994c243) forwards catalog/brand data into the static Director: DIRECTOR_SIGNALS_VERSION 3.5.0→3.6.0, brand_signal.personas from Brand.demographics (DIRECTOR_BRAND_PERSONAS), Media.rights.approved (was platformStats.rights_approved), makeAssembleSignalsOnce generate-scoped memo, PERSONAS rule in buildPromptRound. Adgen does not mint static ads / does not run the Director round — expansion stays backend. Deliberately not porting (same as the recorded #386 static COPY 'never invent' skip). Remaining fork: comment-only reserved-proof-slot annotation (PR #34) plus those static-prompt/signal deltas. Adgen still at DIRECTOR_SIGNALS_VERSION 3.4.0."
     },
     "services/aiCreativeV2Helpers.js": {
       "backendHash": "52130701af3ed3c383e084355cf898e48bd170e072fc3df193b9948416e2c013",
@@ -760,13 +757,11 @@
       "owedSince": null
     },
     "services/atlasVideoService.js": {
-      "backendHash": "321f237d23bbedbd4dbc89948be20ce612703db7b7964ab4b1da5ab24faff1b9",
+      "backendHash": "6e29f079196b3819cb0929cfaf7f96ae3b590231a56b305a52805a3d84262b60",
       "adgenHash": "95c15d8a42d62424bc769f9384b76f5b88e74ed32a3763002ada6ca507ead6e4",
-      "backendSha": "295541f797f9b0effb719e21e4ac07bf26cc784a",
+      "backendSha": "ec64a9a586ae8fd9736d6d44952e70c9afaaa09f",
       "status": "fork",
-      "reason": "2026-09-05: leftover 8s duration fallbacks now read META_VIDEO_DURATION_SEC via videoDurationPolicy.js (paired backend fix/stale-video-duration). adgen-owned live-path change for video-provider collapse PR 0-3: one shouldResumeAttempt in spendReceipt (called from atlas video, gemini video, atlas image); renderer mint goes through videoRouter.generateForAd only; Vertex arm throws until receipt+CostLog+maxRedirects:0. Backend copies are dormant and slated for removal — nothing is owed to backend for this PR. Remaining known fork (not this PR, not a new debt): THREAD 3 MAX_POLL_MS 900000 vs backend 600000 still differs. Re-attested after rebase onto origin/master 9d57123/cf7a904 (vendor-manifest reconciliation only, no further code delta on this file).",
-      "portTo": null,
-      "owedSince": null
+      "reason": "2026-09-06: backend #396 (ec64a9a5) leftover 8s fallbacks → videoDurationPolicy. FULL DIFF READ: estimateRenderCostUsd/buildVideoSegmentUrl missing duration now uses fallbackVideoDurationSec() (Meta 10s) not hardcoded 8; resolveDurationSec/buildSubmissionBody last-resort 8 → PROVIDER_DEFAULT_DURATION_SEC (still 8, named); generateForAd now resolveDurationSec(resolveAdVideoDurationSec(ad), caps) so an unset Ad.videoDurationSec submits META_VIDEO_DURATION_SEC (10) not caps.defaultDuration (8). No submit/resume/claim/retry/receipt changes. Adgen already has this exact generateForAd thread (atlasVideoService.js:5403) plus the helpers — it was the paired port this entry recorded on 2026-09-05. Remaining fork unchanged: video-provider collapse (shouldResumeAttempt in spendReceipt, videoRouter.generateForAd, Vertex arm throws) and MAX_POLL_MS 900000 vs backend 600000. Backend copies dormant. Nothing new owed."
     },
     "services/basePlateCropService.js": {
       "backendHash": "ae8b89e98f69160f27b8faad175a2fdfe16f53122098dd5dd8a11d0e4fc48443",
@@ -804,13 +799,11 @@
       "owedSince": null
     },
     "services/campaignAdsGenerationService.js": {
-      "backendHash": "3508d97d674886a95b480aeb860667d8ae2fb3a5ad46968210eebca4bce9f04f",
+      "backendHash": "1081586e18614109e17101f55d233d51bceb9279f2d5233d9d73af4d03ab9c9f",
       "adgenHash": "1889f65bb0db2fd56cd481261937ead437502d8ed4bf368e0bcc98fcfef81232",
-      "backendSha": "d994c2433fe047f91d68d5ca48afe3bd411f1307",
+      "backendSha": "ec64a9a586ae8fd9736d6d44952e70c9afaaa09f",
       "status": "fork",
-      "reason": "2026-09-05: leftover 8s duration fallbacks now read META_VIDEO_DURATION_SEC via videoDurationPolicy.js (paired backend fix/stale-video-duration). isMasterVideoAd is backend HTTP-only (routes/ads.js:6121); isSharedPortraitPlatePromptCoherent has ZERO production callers on both sides and resolvePortraitMasterFormat already dropped the hook-first conjunct (#386) — DO NOT port adgen's hook-first body to backend, it would re-open the $2.70 mixed-run bill",
-      "portTo": null,
-      "owedSince": null
+      "reason": "2026-09-06: backend #396 (ec64a9a5) extracts local metaVideoDurationSec()/DEFAULT_META_VIDEO_DURATION_SEC into videoDurationPolicy.js and restates comments that Meta 8s→10s is a render-length change NOT a digest re-key (computeDeterministicVideoDigest still omits duration for Meta). No submit/resume/claim/billing control-flow change. Adgen already imports metaVideoDurationSec from videoDurationPolicy and uses it at the three floor/default sites. Remaining fork unchanged: isMasterVideoAd is backend HTTP-only (routes/ads.js); isSharedPortraitPlatePromptCoherent has zero production callers and resolvePortraitMasterFormat already dropped the hook-first conjunct (#386) — DO NOT port adgen's hook-first body to backend, it would re-open the $2.70 mixed-run bill."
     },
     "services/campaignBriefDerivationService.js": {
       "backendHash": "f08c591b1cfeb0c971d43afa316ebca613570e483654cebd9bd7655d6c69230e",
@@ -995,13 +988,11 @@
       "owedSince": null
     },
     "services/layoutInputService.js": {
-      "backendHash": "fdaebc5c5f917353b6dd8f78aa6d3d3c4bf67f29bbc025648dc41797b785dc28",
+      "backendHash": "06c2670a907b52ef2b01885b0b5e225c238b2f9f1791e761ff634d3e84a7e805",
       "adgenHash": "b72f89371b19e3fdecec8abd3d361a97fee421947d39e425e4f0e264fb521091",
-      "backendSha": "47be257c468e85c3f1d1c562abd087ea8625e98c",
+      "backendSha": "d994c2433fe047f91d68d5ca48afe3bd411f1307",
       "status": "fork",
-      "reason": "adgen-owned divergence: findBrandByName inlined (Brand.normalizeBrandName + findOne) so adgen no longer requires brandCatalogService — that module fire-and-forgets brand enrichment (backend-owned ingest) and its require edge was the only thing keeping the dead ingest cluster in adgen's graph. Backend keeps the catalog-service require. LAYOUT_DERIVATION_MODEL split already ported (#122). Also adgen-only: startStageTimer/layoutInputMs wrapping runDerivation; four-field brandId/productId/adId/campaignRunId top-level args (adgen #43) equivalent to backend's options.*. Nothing owed either way.",
-      "portTo": null,
-      "owedSince": null
+      "reason": "2026-09-06: backend #390 (d994c243) seeds layout derivation from CatalogProduct.shortBenefits when non-empty (catalogShortBenefitsOf / resolveLayoutShortBenefits / seedCatalogShortBenefits; skips the Gemini emit-short_benefits instruction; INPUT_SCHEMA_VERSION stays 4.2). Backend's own comment: existing artifacts remain valid; titling already prefers catalog benefits via DEFAULT_META_CASCADES.benefits. Adgen live titling already catalog-first on that cascade — this is a derivation-cost optimization of a field the cascade overwrites, not a missing burned-in-title fix. Remaining adgen-owned fork unchanged: findBrandByName inlined so adgen no longer requires brandCatalogService; startStageTimer/layoutInputMs; four-field top-level args. Nothing owed either way."
     },
     "services/llmError.js": {
       "backendHash": "589fd87ece50784d1620ac2db054d92911c880d21d2a34be4db3f4df8aaf7f8f",
@@ -1311,12 +1302,11 @@
       "owedSince": null
     },
     "services/systemConfigService.js": {
-      "backendHash": "c6786774ace53c6456ff56f7a749cd926725de34a8f2de9608fb24b8ecb81995",
+      "backendHash": "0c62ac5d20f9e311315b8c4e62399495a542fdbdcf3bb10ee8235f2e7c0f2bb7",
       "adgenHash": "c6786774ace53c6456ff56f7a749cd926725de34a8f2de9608fb24b8ecb81995",
-      "backendSha": "aff3488d494ee7484d27971920a2b96e438e60fd",
-      "status": "synced",
-      "portTo": null,
-      "owedSince": null
+      "backendSha": "626b426e6bd5238ce25da1f8aea6f2398aae6e54",
+      "status": "fork",
+      "reason": "2026-09-06: backend #389 (626b426e, STRIP-INVENTORY PR-B2) deleted the canvas-script file fallback (fs/path, CANONICAL_*_FILE, verticalCanonicalFile, loadCanonical file-read → return {source:'none', script:null}). Adgen copy unchanged since the last synced look and STILL HAS services/brandScripts/*.script.js plus previewBrandScript/previewBrandScriptAsVideo callers of getCanonicalScript*. Live titling is Remotion (resolveTitlingEngine hard-returns remotion; canvas cascade is inside a comment). Porting the deletion would 400 those preview helpers when DB has no script. New fork is backend-deleted dormant island vs adgen keeping the bundled files for preview. QC getters were already identical at last look and are not in this diff."
     },
     "services/templateRegistry.js": {
       "backendHash": "35b42275fc3f2cd340454902e2ac0d2f12db4e4cd9d2350ae400ce5f9197138a",
@@ -1351,13 +1341,10 @@
       "owedSince": null
     },
     "services/ugcVideoPipeline.js": {
-      "backendHash": "2a7c1390a0bd0c46f2f361fb6eb445a9b55bbb225ada35adb6fdc84b5601d78e",
+      "backendHash": "28db621e0a4211e41aa13841bd934bc8443be52f0d517e077a53020e9aef0fd4",
       "adgenHash": "28db621e0a4211e41aa13841bd934bc8443be52f0d517e077a53020e9aef0fd4",
-      "backendSha": "d162f48d5e77f2231268a03cdac9e74bff614575",
-      "status": "fork",
-      "reason": "2026-09-05: leftover 8s duration fallbacks now read META_VIDEO_DURATION_SEC via videoDurationPolicy.js (paired backend fix/stale-video-duration).",
-      "portTo": null,
-      "owedSince": null
+      "backendSha": "ec64a9a586ae8fd9736d6d44952e70c9afaaa09f",
+      "status": "synced"
     },
     "services/veoPromptBuilder.js": {
       "backendHash": "86cf32181d02df4531254d731a782e596078c70b3968aee39da021d3375208c5",
@@ -1378,12 +1365,11 @@
       "owedSince": null
     },
     "services/videoBenefitsDirector.js": {
-      "backendHash": "c7bababe519779b52488a8f22c793188cfd90c37eb67d1f2efc52b7fc6ba7758",
+      "backendHash": "44126589e6050046b3292ade06b22fc1b08012e703f1a9656e5919c9f80c29de",
       "adgenHash": "c7bababe519779b52488a8f22c793188cfd90c37eb67d1f2efc52b7fc6ba7758",
-      "backendSha": "fba815887c3240d617c9c3a1bbfd6daecd791215",
-      "status": "synced",
-      "portTo": null,
-      "owedSince": null
+      "backendSha": "982a554f017558527465c25c1995752eba13dc15",
+      "status": "fork",
+      "reason": "2026-09-06: was byte-identical; backend #390 (d994c243) + #395 (982a554f) enrich the MINT-TIME video-title Director prompt with catalog/brand/UGC/proof/performance/personas (printableSocialProofForVideo, compactUgcForVideo, compactPerformanceForVideo, signalsMemo, extra buildDirectorMessages args). applyBenefitsPlacement is UNCHANGED in that diff — that is the only live adgen consumer (brandScriptExecutor.js renderWithRemotionAndSave). Backend still mints and stamps Ad.videoTitleDirection; adgen only applies the stamp and does not re-call the LLM. Adgen copy has not independently changed. New fork is a stale mint-side twin, not a missing titling apply-half. Not porting the mint-time prompt into adgen: expansion stays backend."
     },
     "services/videoCropUrl.js": {
       "backendHash": "bab907c0a8b60ac8b06a8a0c93b962d30a248fff4c5bf8ca46db2990342b6b34",
