@@ -2,14 +2,16 @@
   "version": 2,
   "backendRef": "origin/main",
   "backendHead": "ec64a9a586ae8fd9736d6d44952e70c9afaaa09f",
-  "generatedAt": "2026-09-06T07:42:35.740Z",
+  "generatedAt": "2026-09-06T07:54:59.065Z",
   "files": {
     "models/Ad.js": {
-      "backendHash": "812961d1ad30f5f87891dcace58fbe44ce5e07a5789f34b927fe8208dc2db966",
-      "adgenHash": "a82356ceb6add5e3641b95f51a29b8ccc9a9c5323ba3e969522451b43b3bf66f",
-      "backendSha": "fba815887c3240d617c9c3a1bbfd6daecd791215",
+      "backendHash": "a8d6f60ecc8e0ca4f5bfe8d7a09a242efd5c3c93d603204820cee72a06c19240",
+      "adgenHash": "f334d3928e5fda6db814d49609519860fcade686e3d02f96e00fbbd50fe25216",
+      "backendSha": "ec64a9a586ae8fd9736d6d44952e70c9afaaa09f",
       "status": "fork",
-      "reason": "2026-09-05: leftover 8s duration fallbacks now read META_VIDEO_DURATION_SEC via videoDurationPolicy.js (paired backend fix/stale-video-duration). declare-only schema defense: copied backend qcOverridden/qcOverriddenAt/qcOverriddenBy/qcOverrideReason (writer is backend POST /:id/override-qc; adgen metaAdsPushService ad.save() would strip them). Remaining diffs are legitimate ongoing fork (adgen-only titling/QC comments and regenerate-consumer claim comments). Latest change is comment-only, no functional diff: the veoReferenceImages field comment now notes a Gemini resume backfill (video-provider-collapse PR 0-3, F2 fix) can re-derive this field from the ad's current reference state rather than the exact stack originally submitted, so callers (e.g. renderer.js's vision-QC re-read) should not assume byte-for-byte exactness on a resumed ad. Nothing here is owed to backend — comment only."
+      "reason": "2026-09-06: persist per-frame subject boxes on Ad.basePlate.faceSamples[i].subject (comment-only Mixed-schema note; no new Mongo keys, CURRENT_VERSION stays 1). Live renderer is adgen; nothing owed to backend for this persist. Prior: leftover 8s duration fallbacks now read META_VIDEO_DURATION_SEC via videoDurationPolicy.js (paired backend fix/stale-video-duration). declare-only schema defense: copied backend qcOverridden/qcOverriddenAt/qcOverriddenBy/qcOverrideReason (writer is backend POST /:id/override-qc; adgen metaAdsPushService ad.save() would strip them). Remaining diffs are legitimate ongoing fork (adgen-only titling/QC comments and regenerate-consumer claim comments). veoReferenceImages field comment notes a Gemini resume backfill can re-derive this field from the ad's current reference state rather than the exact stack originally submitted.",
+      "portTo": null,
+      "owedSince": null
     },
     "models/Advertiser.js": {
       "backendHash": "0a7e1bb9ca5e0fbbfc6972f9c96d87f839b0a86175831b5446ae27095137ba3f",
@@ -762,14 +764,16 @@
       "adgenHash": "95c15d8a42d62424bc769f9384b76f5b88e74ed32a3763002ada6ca507ead6e4",
       "backendSha": "295541f797f9b0effb719e21e4ac07bf26cc784a",
       "status": "fork",
-      "reason": "2026-09-05: leftover 8s duration fallbacks now read META_VIDEO_DURATION_SEC via videoDurationPolicy.js (paired backend fix/stale-video-duration). adgen-owned live-path change for video-provider collapse PR 0-3: one shouldResumeAttempt in spendReceipt (called from atlas video, gemini video, atlas image); renderer mint goes through videoRouter.generateForAd only; Vertex arm throws until receipt+CostLog+maxRedirects:0. Backend copies are dormant and slated for removal — nothing is owed to backend for this PR. Remaining known fork (not this PR, not a new debt): THREAD 3 MAX_POLL_MS 900000 vs backend 600000 still differs. Re-attested after rebase onto origin/master 9d57123/cf7a904 (vendor-manifest reconciliation only, no further code delta on this file)."
+      "reason": "2026-09-05: leftover 8s duration fallbacks now read META_VIDEO_DURATION_SEC via videoDurationPolicy.js (paired backend fix/stale-video-duration). adgen-owned live-path change for video-provider collapse PR 0-3: one shouldResumeAttempt in spendReceipt (called from atlas video, gemini video, atlas image); renderer mint goes through videoRouter.generateForAd only; Vertex arm throws until receipt+CostLog+maxRedirects:0. Backend copies are dormant and slated for removal — nothing is owed to backend for this PR. Remaining known fork (not this PR, not a new debt): THREAD 3 MAX_POLL_MS 900000 vs backend 600000 still differs. Re-attested after rebase onto origin/master 9d57123/cf7a904 (vendor-manifest reconciliation only, no further code delta on this file).",
+      "portTo": null,
+      "owedSince": null
     },
     "services/basePlateCropService.js": {
-      "backendHash": "03d13d046489c24734fc54a97edb158ed9abc4f7ad03e2ec4a84c8b0ad3b6aeb",
-      "adgenHash": "df243fbc70315200e7a4ba72d44fd4b5f3f1cdd2eedbf67fd0949775013b16c8",
-      "backendSha": "ba99a59f10619bbd940be9442c8852dc32ae278a",
+      "backendHash": "ae8b89e98f69160f27b8faad175a2fdfe16f53122098dd5dd8a11d0e4fc48443",
+      "adgenHash": "7533e3cb07d57bf4e586335203830bdfd3ad3c269bbaa8f48bed72241058b368",
+      "backendSha": "ec64a9a586ae8fd9736d6d44952e70c9afaaa09f",
       "status": "unported",
-      "reason": "2026-09-05: leftover 8s duration fallbacks now read META_VIDEO_DURATION_SEC via videoDurationPolicy.js (paired backend fix/stale-video-duration). adgen-side change 2026-08-28: added a one-shot face-quorum-retry (detectClipBoxes samples FACE_QUORUM_RETRY_FRAMES=2 new gap-midpoint timestamps exactly once when head===null && initialHits===1, closing the measured 56/625 boundary-miss face-clip bug). Confirmed via traced call path (routes/brand.js runRetitleJob -> renderBrandScriptAndSave -> renderWithRemotionAndSave -> basePlateCropService.resolveBasePlateVideoUrl/ensureFaceDetectionForKeepOut) that backend's manual /retitle-videos admin flow still calls this exact code and DOES recompute a fresh crop on an Ad.basePlate cache miss (different format or source video) -- so backend's un-retried copy can still exhibit the same face-clip bug on that path, just at lower (manual-trigger-only) frequency than the primary adgen-generated volume this was measured against. Not ported in this PR -- flagged to the owner as a separate follow-up decision, not assumed out of scope.",
+      "reason": "2026-09-06: persist per-frame subject boxes (full LTRB) on faceSamples[i].subject from the already-paid detectClipBoxes JSON; thread through Ad.basePlate and faceKeepOut. No new vision call, CURRENT_VERSION stays 1, TITLE_FACE_KEEPOUT=false remains a no-op. Live path is adgen. Prior unported debt UNCHANGED: leftover 8s duration fallbacks now read META_VIDEO_DURATION_SEC via videoDurationPolicy.js (paired backend fix/stale-video-duration). adgen-side change 2026-08-28: one-shot face-quorum-retry (detectClipBoxes samples FACE_QUORUM_RETRY_FRAMES=2 new gap-midpoint timestamps exactly once when head===null && initialHits===1). Backend's manual /retitle-videos admin flow still calls this exact code on an Ad.basePlate cache miss -- backend's un-retried copy can still exhibit the face-clip bug on that path. Not ported in this PR.",
       "portTo": "backend",
       "owedSince": "2026-08-28T19:52:53.994Z"
     },
@@ -783,11 +787,11 @@
       "owedSince": null
     },
     "services/brandScriptExecutor.js": {
-      "backendHash": "9840d82eb1855185f2a579028448c07b8590572b910c4dd412d8bf1f5018b1a1",
-      "adgenHash": "b01606a887e412cb352f2761d7684ffee3a9b80939daf6ff02b70d9c79dc7ff0",
-      "backendSha": "626b426e6bd5238ce25da1f8aea6f2398aae6e54",
+      "backendHash": "d554b02b6e203edb0e4921e9237dcdefd94ceacc9f4f942a279945d3ac75ee9f",
+      "adgenHash": "e04d522d1de961e26394cc71d43712c2182d4deb2b8d2f3d75d6974ce913a587",
+      "backendSha": "ec64a9a586ae8fd9736d6d44952e70c9afaaa09f",
       "status": "unported",
-      "reason": "2026-09-05: leftover 8s duration fallbacks now read META_VIDEO_DURATION_SEC via videoDurationPolicy.js (paired backend fix/stale-video-duration). 2026-09-04: adgen commit fcf3709 (feat(vision-qc): scope derive ship gate to titling categories only) added titlingOnlyGate=!!ad.deriveFromMaster in runVideoVisionQcForAd, passed to adVisionQcService.runVideoPostRenderQc, which now gates derive-only ads on TITLING_CATEGORIES (text_defects+layout_safe_box) only instead of the full 4-category gate, so a product_fidelity/competitor_marks defect inherited from the already-paid sibling master no longer terminal-fails a shippable derive (measured on run_1788496261770_105ee9dc: 8/9 false-positive derive fails would now ship). Backend's adVisionQcService.js has no titlingOnlyGate/TITLING_CATEGORIES concept, yet backend's own Ad.js still declares deriveFromMaster and campaignAdsGenerationService.js still exports resolveDeriveFromMaster, so backend's video vision-QC path still re-litigates the master's verdict on every derive if it ever runs one. Pre-existing debt UNCHANGED: backend still lacks stampTitlingFailureAndThrow/TITLING_ATTEMPTS_MAX; applyBenefitsPlacement/intentPreset TIER 2.5/CatalogProduct.shortBenefits .select() remain byte-identical on both sides. owedSince carries forward at 2026-08-28 for the titling-attempts gap; the derive-ship-gate gap is newly owed 2026-09-04.",
+      "reason": "2026-09-06: faceKeepOut spread now documents that faceSamples[i].subject (full LTRB) rides the existing object; no placement behaviour change, no parallel path. Live path is adgen. Prior unported debt UNCHANGED: leftover 8s duration fallbacks now read META_VIDEO_DURATION_SEC via videoDurationPolicy.js. 2026-09-04: adgen commit fcf3709 added titlingOnlyGate=!!ad.deriveFromMaster so derive-only ads gate on TITLING_CATEGORIES only. Backend's adVisionQcService.js has no titlingOnlyGate. Pre-existing: backend still lacks stampTitlingFailureAndThrow/TITLING_ATTEMPTS_MAX. owedSince carries forward at 2026-08-28 for the titling-attempts gap.",
       "portTo": "backend",
       "owedSince": "2026-08-28T17:47:48.113Z"
     },
@@ -804,7 +808,9 @@
       "adgenHash": "1889f65bb0db2fd56cd481261937ead437502d8ed4bf368e0bcc98fcfef81232",
       "backendSha": "d994c2433fe047f91d68d5ca48afe3bd411f1307",
       "status": "fork",
-      "reason": "2026-09-05: leftover 8s duration fallbacks now read META_VIDEO_DURATION_SEC via videoDurationPolicy.js (paired backend fix/stale-video-duration). isMasterVideoAd is backend HTTP-only (routes/ads.js:6121); isSharedPortraitPlatePromptCoherent has ZERO production callers on both sides and resolvePortraitMasterFormat already dropped the hook-first conjunct (#386) — DO NOT port adgen's hook-first body to backend, it would re-open the $2.70 mixed-run bill"
+      "reason": "2026-09-05: leftover 8s duration fallbacks now read META_VIDEO_DURATION_SEC via videoDurationPolicy.js (paired backend fix/stale-video-duration). isMasterVideoAd is backend HTTP-only (routes/ads.js:6121); isSharedPortraitPlatePromptCoherent has ZERO production callers on both sides and resolvePortraitMasterFormat already dropped the hook-first conjunct (#386) — DO NOT port adgen's hook-first body to backend, it would re-open the $2.70 mixed-run bill",
+      "portTo": null,
+      "owedSince": null
     },
     "services/campaignBriefDerivationService.js": {
       "backendHash": "f08c591b1cfeb0c971d43afa316ebca613570e483654cebd9bd7655d6c69230e",
@@ -1275,7 +1281,9 @@
       "adgenHash": "7c0b0d739a026dfd7c2538adc39d528e336881afd26842871b8e820a1315c68d",
       "backendSha": "b5a42717c4a15f800224e374bcbe11cae7046398",
       "status": "fork",
-      "reason": "Prior fork reason (live-wiring of resolveUnsettledTimeoutAction/receiptFree/HAS_RECEIPT into renderer.js and bootRecoveryService.js) still holds, nothing in it changed. New in video-provider-collapse PR 0-3: this file now also exports shouldResumeAttempt(), the single 3-clause resume predicate (allowResume===true && attempt===1 && existingPredictionId non-empty string) that atlasVideoService.js, geminiVideoService.js, and atlasImageService.js (via its shouldResumeImageAttempt wrapper) all now call instead of each keeping its own copy. Chosen to live here rather than a new module because this file already owns the receipt-aware resume/requeue predicates for this codebase."
+      "reason": "Prior fork reason (live-wiring of resolveUnsettledTimeoutAction/receiptFree/HAS_RECEIPT into renderer.js and bootRecoveryService.js) still holds, nothing in it changed. New in video-provider-collapse PR 0-3: this file now also exports shouldResumeAttempt(), the single 3-clause resume predicate (allowResume===true && attempt===1 && existingPredictionId non-empty string) that atlasVideoService.js, geminiVideoService.js, and atlasImageService.js (via its shouldResumeImageAttempt wrapper) all now call instead of each keeping its own copy. Chosen to live here rather than a new module because this file already owns the receipt-aware resume/requeue predicates for this codebase.",
+      "portTo": null,
+      "owedSince": null
     },
     "services/staleness.js": {
       "backendHash": "136732eeb99b3d46f9d39910319803759bd45fd58d6eb810ec1492a41c8a1aa6",
@@ -1347,7 +1355,9 @@
       "adgenHash": "28db621e0a4211e41aa13841bd934bc8443be52f0d517e077a53020e9aef0fd4",
       "backendSha": "d162f48d5e77f2231268a03cdac9e74bff614575",
       "status": "fork",
-      "reason": "2026-09-05: leftover 8s duration fallbacks now read META_VIDEO_DURATION_SEC via videoDurationPolicy.js (paired backend fix/stale-video-duration)."
+      "reason": "2026-09-05: leftover 8s duration fallbacks now read META_VIDEO_DURATION_SEC via videoDurationPolicy.js (paired backend fix/stale-video-duration).",
+      "portTo": null,
+      "owedSince": null
     },
     "services/veoPromptBuilder.js": {
       "backendHash": "86cf32181d02df4531254d731a782e596078c70b3968aee39da021d3375208c5",
@@ -1387,7 +1397,9 @@
       "backendHash": "5c69134cf475796eed6d55fa3232d847c1290ca5e0ee939d6b9ca1094dc97133",
       "adgenHash": "5c69134cf475796eed6d55fa3232d847c1290ca5e0ee939d6b9ca1094dc97133",
       "backendSha": "ec64a9a586ae8fd9736d6d44952e70c9afaaa09f",
-      "status": "synced"
+      "status": "synced",
+      "portTo": null,
+      "owedSince": null
     },
     "services/videoFrameService.js": {
       "backendHash": "de07c2f311c16c97b9fd08103a5fdf1165999ad2f9a9b8a2ba407cc5da95607c",

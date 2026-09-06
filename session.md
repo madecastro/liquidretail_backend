@@ -19,6 +19,21 @@ commands used this session) to find the actual cause.
 
 ## CURRENT STATE
 
+**2026-09-06: persist per-frame subject boxes (Step 0, unpushed).** Sibling
+worktree `/Volumes/Sayulita/Projects/RS/.wt-persist-subject-boxes` on
+`persist/subject-boxes` off `origin/master` `98be56b`. detectClipBoxes already
+returns per-frame subject LTRB; they now ride `faceSamples[i].subject` through
+the existing `Ad.basePlate` `$set` and `faceKeepOut` object. No placement
+change, no new vision call, `CURRENT_VERSION` stays 1, `TITLE_FACE_KEEPOUT=false`
+is still a no-op. Q2: 9:16→9:16 does **not** run detectClipBoxes on the crop
+path (full-frame skip); keep-out (`TITLE_FACE_KEEPOUT` default on) already
+pays ~$0.02 once and caches on `Ad.basePlate`. DETECT_SYSTEM_PROMPT was **not**
+extended with logo/text (face path is load-bearing). Harness:
+`scripts/verifySubjectBoxPersist.js` (21/21). Full suite 105/106; remaining
+`verifyVendorDrift` red is pre-existing on origin/master (untracked
+`videoDurationPolicy.js`, stale brandScripts, ambient backend drift). Do not
+push.
+
 **2026-09-05: stale 8s video-duration fallbacks, unpushed.** Sibling worktrees
 `.wt-fix-stale-video-duration-backend` / `-adgen` on `fix/stale-video-duration`
 (off current origin trunks). Dirty main checkouts were not touched. Full

@@ -2528,6 +2528,8 @@ async function renderWithRemotionAndSave({ ad, brand, format, presetOverride = n
       brand,
       placementMode: placement,
       // Cropped plate: face boxes must be mapped through cropRect (source→plate).
+      // faceKeepOut.faceSamples[i].subject (full LTRB) rides this same object;
+      // nothing consumes it yet.
       faceKeepOut: faceKeepOut
         ? {
             ...faceKeepOut,

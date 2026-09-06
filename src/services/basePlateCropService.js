@@ -54,8 +54,14 @@
  * every gated-out ad. $0 on the crop path when cropCouldBeNeeded is false (full-frame 9:16→9:16
  * / 16:9→16:9). Title keep-out may still pay detectClipBoxes ONCE if facesComputed is not
  * already on the ad — that answers "where are the heads", not "do we need a crop", and is not a
- * second crop-decision submit. No ffmpeg, no video download — frames are Cloudinary so_<sec>
- * stills at the CDN edge.
+ * second crop-decision submit. That keep-out call IS how a 9:16→9:16 Reels ad pays today
+ * (TITLE_FACE_KEEPOUT defaults on): persistSkip writes no extras, then
+ * ensureFaceDetectionForKeepOut runs detectClipBoxes once and caches on Ad.basePlate.
+ * Per-frame `subject` boxes are in that already-paid JSON; they ride on faceSamples so a
+ * later titling step can place copy relative to the subject without a second vision call.
+ * TITLE_FACE_KEEPOUT=false still skips the keep-out detect (byte-identical to pre-keep-out);
+ * this file does not add a second vision path. No ffmpeg, no video download — frames are
+ * Cloudinary so_<sec> stills at the CDN edge.
  */
 
 const axios = require('axios');
@@ -213,11 +219,11 @@ function cropCouldBeNeeded({ format, platformFormat, sourceUrl, sourceW, sourceH
 // full-frame ad (16:9→16:9 split master, 9:16→9:16) no longer runs detectClipBoxes in
 // resolveBasePlateVideoUrl; a future split-drift caller cannot assume boxes are already paid for
 // on that path (keep-out may have paid, via ensureFaceDetectionForKeepOut, or nothing has).
-// Its per-frame subject boxes carry the FULL box (left/top/right/bottom), but every consumer today
-// — decideBasePlateCrop, computeGravityCropRect, the face keep-out path — reduces them to their
-// VERTICAL extent only (head/subject top-bottom) because every existing target is a portrait or
-// square crop, where the horizontal extent never mattered. The horizontal signal has been sitting
-// in already-paid-for detection output, unused. This function is the first consumer of it.
+// Its per-frame subject boxes carry the FULL box (left/top/right/bottom). Crop/keep-out
+// consumers still read VERTICAL extent only (portrait/square crop gravity, band avoid).
+// The horizontal edges now also persist on faceSamples[i].subject — same paid output,
+// previously discarded after the union. This function is the first consumer of the
+// horizontal extent (split-drift). Titling does not read it yet.
 
 /**
  * Valid values for `panelSide`. Exported so the harness enumerates the real vocabulary instead of
@@ -447,11 +453,14 @@ async function detectFrameBoxes(frameUrl, { campaignRunId = null, brandId = null
  * / .faceHits persist, so production diagnostics see the actual vision-call
  * count (not first-pass-only). faceSamples is the same combined set.
  *
- * faceSamples: [{ atSec, face }] per sampled still (face may be null).
- * Coordinate space: face boxes are NORMALIZED FRACTIONS 0..1 of the
- * SOURCE frame (see DETECT_SYSTEM_PROMPT) — not pixel rects. Stills are
- * 640-wide for bandwidth; the model still returns fractions of the full
- * frame, so no pixel conversion is needed for keep-out mapping.
+ * faceSamples: [{ atSec, face, subject }] per sampled still (either box may
+ * be null). `face` is the head (keep-out / crop quorum). `subject` is the
+ * FULL content box (left/top/right/bottom) — not vertical extent only —
+ * already returned by detectFrameBoxes and previously dropped here.
+ * Coordinate space: boxes are NORMALIZED FRACTIONS 0..1 of the SOURCE
+ * frame (see DETECT_SYSTEM_PROMPT) — not pixel rects. Stills are 640-wide
+ * for bandwidth; the model still returns fractions of the full frame, so
+ * no pixel conversion is needed for keep-out mapping.
  */
 async function detectClipBoxes(sourceUrl, durationSec, { campaignRunId = null, brandId = null, productId = null, adId = null, ...meta } = {}) {
   const frameOpts = { width: 640, isReel: true };
@@ -501,6 +510,9 @@ async function detectClipBoxes(sourceUrl, durationSec, { campaignRunId = null, b
   const faceSamples = frames.map((f, i) => ({
     atSec: f.timestampSec,
     face: frameFaces[i] || null,
+    // Full LTRB, re-validated independently of detectFrameBoxes (same
+    // defensive shape decideSplitPanelDrift uses on per-frame subject boxes).
+    subject: usableSplitFrameBox(frameBoxes[i]),
   }));
   return {
     subject,
@@ -692,11 +704,8 @@ async function resolveBasePlateVideoUrl({ ad, format }) {
       sourceUrl: ad.veoVideoUrl,
       videoUrl: url,
       rect: decision.rect,
-      sourceW: dims.sourceW, sourceH: dims.sourceH,
-      frames: det.frames, faceHits: det.faceHits, envelope: det.envelope,
-      faceSamples: det.faceSamples || [],
-      facesComputed: true,
       computedAt: new Date(),
+      ...detectionExtras(det, dims),
     };
     await Ad.updateOne({ _id: ad._id }, {
       $set: { basePlate: next, updatedAt: new Date() },
@@ -717,7 +726,7 @@ function detectionExtras(det, dims) {
     frames: det.frames,
     faceHits: det.faceHits,
     envelope: det.envelope || null,
-    faceSamples: Array.isArray(det.faceSamples) ? det.faceSamples : [],
+    faceSamples: attachSubjectBoxes(Array.isArray(det.faceSamples) ? det.faceSamples : []),
     facesComputed: true,
     sourceW: dims?.sourceW || null,
     sourceH: dims?.sourceH || null,
@@ -799,52 +808,52 @@ async function ensureFaceDetectionForKeepOut({ ad, format }) {
   if (!FACE_KEEPOUT_ENABLED()) return null;
   if (!ad?.veoVideoUrl) return null;
 
-  const cached = ad.basePlate;
-  // Reuse detection bound to this source video. Face boxes are in SOURCE
-  // fraction space — independent of titling format — so any same-source
-  // facesComputed entry is usable. cropRect only applies when THIS format's
-  // crop is the plate Remotion will composite onto.
-  if (
-    cached
-    && cached.version === CURRENT_VERSION
-    && cached.sourceUrl === ad.veoVideoUrl
-    && cached.facesComputed
-  ) {
-    return {
-      faceSamples: faceSamplesFromCache(cached),
-      envelope: cached.envelope || null,
-      sourceW: cached.sourceW || null,
-      sourceH: cached.sourceH || null,
-      cropRect: (cached.format === format && cached.videoUrl && cached.rect) ? cached.rect : null,
-      fromCache: true,
-    };
-  }
-
-  // Older crop caches stored envelope without facesComputed / faceSamples —
-  // still free to reuse (envelope covers all sample times, conservative).
-  if (
-    cached
-    && cached.version === CURRENT_VERSION
-    && cached.sourceUrl === ad.veoVideoUrl
-    && cached.envelope
-  ) {
-    return {
-      faceSamples: faceSamplesFromCache(cached),
-      envelope: cached.envelope,
-      sourceW: cached.sourceW || null,
-      sourceH: cached.sourceH || null,
-      cropRect: (cached.format === format && cached.videoUrl && cached.rect) ? cached.rect : null,
-      fromCache: true,
-    };
-  }
-
-  // Need a fresh detection. Frame stills require a Cloudinary /upload/ URL.
-  if (!isTransformableVideoUrl(ad.veoVideoUrl)) {
-    console.warn(`   ⚠️  faceKeepOut[ad=${ad._id}]: source not transformable — keep-out skipped`);
-    return null;
-  }
-
   try {
+    const cached = ad.basePlate;
+    // Reuse detection bound to this source video. Face boxes are in SOURCE
+    // fraction space — independent of titling format — so any same-source
+    // facesComputed entry is usable. cropRect only applies when THIS format's
+    // crop is the plate Remotion will composite onto.
+    if (
+      cached
+      && cached.version === CURRENT_VERSION
+      && cached.sourceUrl === ad.veoVideoUrl
+      && cached.facesComputed
+    ) {
+      return {
+        faceSamples: attachSubjectBoxes(faceSamplesFromCache(cached)),
+        envelope: cached.envelope || null,
+        sourceW: cached.sourceW || null,
+        sourceH: cached.sourceH || null,
+        cropRect: (cached.format === format && cached.videoUrl && cached.rect) ? cached.rect : null,
+        fromCache: true,
+      };
+    }
+
+    // Older crop caches stored envelope without facesComputed / faceSamples —
+    // still free to reuse (envelope covers all sample times, conservative).
+    if (
+      cached
+      && cached.version === CURRENT_VERSION
+      && cached.sourceUrl === ad.veoVideoUrl
+      && cached.envelope
+    ) {
+      return {
+        faceSamples: attachSubjectBoxes(faceSamplesFromCache(cached)),
+        envelope: cached.envelope,
+        sourceW: cached.sourceW || null,
+        sourceH: cached.sourceH || null,
+        cropRect: (cached.format === format && cached.videoUrl && cached.rect) ? cached.rect : null,
+        fromCache: true,
+      };
+    }
+
+    // Need a fresh detection. Frame stills require a Cloudinary /upload/ URL.
+    if (!isTransformableVideoUrl(ad.veoVideoUrl)) {
+      console.warn(`   ⚠️  faceKeepOut[ad=${ad._id}]: source not transformable — keep-out skipped`);
+      return null;
+    }
+
     const durationSec = resolveAdVideoDurationSec(ad);
     const dims = await internals.measureDeliveryDims(ad.veoVideoUrl);
     const det = await internals.detectClipBoxes(ad.veoVideoUrl, durationSec, {
@@ -882,7 +891,7 @@ async function ensureFaceDetectionForKeepOut({ ad, format }) {
     );
 
     return {
-      faceSamples: det.faceSamples || [],
+      faceSamples: extras.faceSamples || [],
       envelope: det.envelope || null,
       sourceW: next.sourceW,
       sourceH: next.sourceH,
@@ -902,6 +911,42 @@ function faceSamplesFromCache(cached) {
   return [];
 }
 
+/**
+ * Stamp a sanitized `subject` (full LTRB or null) onto each keep-out sample.
+ * Never throws: garbage in → subject null. Face/atSec pass through unchanged
+ * so the keep-out path stays identical to pre-subject-persist.
+ */
+function attachSubjectBoxes(samples) {
+  if (!Array.isArray(samples)) return [];
+  return samples.map((s) => {
+    try {
+      if (!s || typeof s !== 'object' || Array.isArray(s)) {
+        return { atSec: null, face: null, subject: null };
+      }
+      return { ...s, subject: usableSplitFrameBox(s.subject) };
+    } catch {
+      return {
+        atSec: (s && typeof s === 'object') ? s.atSec : null,
+        face: (s && typeof s === 'object') ? s.face : null,
+        subject: null,
+      };
+    }
+  });
+}
+
+/**
+ * Per-frame subject box from a keep-out sample, or null. Full box
+ * (left/top/right/bottom). Never throws — malformed / missing → null.
+ * Later titling placement should call this rather than reading `.subject` raw.
+ */
+function subjectBoxFromSample(sample) {
+  try {
+    return usableSplitFrameBox(sample && sample.subject);
+  } catch {
+    return null;
+  }
+}
+
 module.exports = {
   resolveBasePlateVideoUrl,
   ensureFaceDetectionForKeepOut,
@@ -914,5 +959,8 @@ module.exports = {
   TARGET_BY_FORMAT,
   DETECT_SYSTEM_PROMPT,      // for the harness (headwear sentence asserted)
   FACE_KEEPOUT_ENABLED,      // for the harness
-  _internal: Object.assign(internals, { parseBox, faceSamplesFromCache, detectionExtras }),
+  subjectBoxFromSample,      // full LTRB or null; never throws
+  _internal: Object.assign(internals, {
+    parseBox, faceSamplesFromCache, detectionExtras, attachSubjectBoxes, usableSplitFrameBox,
+  }),
 };

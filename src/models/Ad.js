@@ -507,6 +507,9 @@ const adSchema = new mongoose.Schema({
   //   videoUrl null     -> a persisted SKIP (reason says why) so re-titles don't re-pay detection
   //   faceSamples/envelope/facesComputed -> vision boxes (SOURCE fractions 0..1) reused by
   //     title keep-out (applyFaceKeepOut) so a second detect is never paid for the same master
+  //   faceSamples[i] = { atSec, face, subject }: `face` is the head; `subject` is the full
+  //     LTRB content box from the same paid detectClipBoxes call (null if missing/malformed).
+  //     Binding stays version===1 — adding subject must not invalidate cached crops.
   // BINDING INVARIANT: only honoured when sourceUrl === the ad's CURRENT veoVideoUrl — a
   // regenerated base video must never ship a crop of footage the operator replaced. The consumer
   // (basePlateCropService.resolveBasePlateVideoUrl / ensureFaceDetectionForKeepOut) enforces
