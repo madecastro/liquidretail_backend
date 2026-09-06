@@ -648,8 +648,12 @@ const adSchema = new mongoose.Schema({
   visionQc:           { type: mongoose.Schema.Types.Mixed, default: null },
   // Dense per-video inspector + documentation record (Loop 1/2). Sibling to
   // basePlate and visionQc. Written by adgen adVisionQcService.runVideoPostRenderQc
-  // in the SAME $set as visionQc. Declared here so a backend save() cannot
-  // silently strip it (Mongoose strict mode). Shape is adgen-owned.
+  // in the SAME $set as visionQc. Declared here so a backend-authored write
+  // (`new Ad(...)`, `Model.castObject(...)`, an `updateOne` `$set`) cannot
+  // silently omit it under Mongoose strict mode. A hydrate-then-save of an
+  // already-present value does NOT strip it — that was measured; the
+  // declaration is still required for writes that construct or $set the
+  // document. Shape is adgen-owned.
   videoAnalysis:      { type: mongoose.Schema.Types.Mixed, default: null },
   // Per-stage wall time in ms for THIS render, whichever pipeline ran:
   // { deriveMs, renderMs, uploadMs }. Answers "why is this ad slow" without a
