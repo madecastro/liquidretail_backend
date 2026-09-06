@@ -545,8 +545,13 @@ const VEO_ARGS_PMAX_169 = {
 }
 
 // V3 — destination-less path byte-identical to the pre-#61 baseline
-// Mirror verifyPostPilotBatch.js B14: git show → temp file with absolute
-// require rewrite. If git is unavailable, SKIP loudly rather than false-pass.
+// Mirror verifyPostPilotBatch.js B14: git show → temp file with EVERY local
+// relative require rewritten to an absolute path. A single hardcoded
+// `require('./platformFormats')` rewrite left `./videoProductAnchor` relative,
+// so `require()` from the tmpdir threw MODULE_NOT_FOUND and the catch
+// MISREPORTED it as "git unavailable or not in this clone". Git show and
+// require are now separate, so a relocate/load failure cannot impersonate a
+// missing blob. If git itself is unavailable, SKIP loudly rather than false-pass.
 //
 // BASELINE CHANGED 2026-08-18: was `HEAD:services/veoPromptBuilder.js`, which
 // only ever compared the working tree against the last commit — so the moment
@@ -557,34 +562,47 @@ const VEO_ARGS_PMAX_169 = {
 console.log('\nV3. destination-less prompt byte-identical to the 9531ae9f baseline (both video arms)');
 {
   const BASELINE = '9531ae9f:services/veoPromptBuilder.js';
-  const REL_REQUIRE = "require('./platformFormats')";
+  const REL_REQUIRE_RE = /require\(['"](\.\/[A-Za-z0-9_-]+)['"]\)/g;
   let oldMod = null;
   let skipReason = null;
   let tmpDir = null;
+  let src = null;
 
   try {
-    const src = cp.execFileSync('git', ['-C', REPO, 'show', BASELINE], {
+    src = cp.execFileSync('git', ['-C', REPO, 'show', BASELINE], {
       encoding: 'utf8',
       maxBuffer: 16 * 1024 * 1024,
       stdio: ['ignore', 'pipe', 'ignore']
     });
-    if (!src.includes(REL_REQUIRE)) {
-      skipReason = `baseline source does not contain ${REL_REQUIRE}`;
-    } else {
-      tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pmaxVeoBaseline-'));
-      const tmpFile = path.join(tmpDir, 'veoPromptBuilder.baseline.js');
-      fs.writeFileSync(tmpFile, src.replace(
-        REL_REQUIRE,
-        `require(${JSON.stringify(path.join(REPO, 'services', 'platformFormats'))})`
-      ));
-      oldMod = require(tmpFile);
-      if (typeof oldMod.buildVeoPrompt !== 'function') {
-        oldMod = null;
-        skipReason = 'baseline module does not export buildVeoPrompt';
-      }
-    }
   } catch (e) {
     skipReason = `git unavailable or ${BASELINE} not in this clone (${e.code || e.message})`;
+  }
+
+  if (src) {
+    const relRequires = [...new Set([...src.matchAll(REL_REQUIRE_RE)].map((m) => m[1]))];
+    if (!relRequires.length) {
+      skipReason = 'baseline has no local relative requires to relocate — unexpected shape';
+    } else {
+      try {
+        tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pmaxVeoBaseline-'));
+        const tmpFile = path.join(tmpDir, 'veoPromptBuilder.baseline.js');
+        let patched = src;
+        for (const rel of relRequires) {
+          const abs = JSON.stringify(path.join(REPO, 'services', rel.slice(2)));
+          patched = patched.split(`require('${rel}')`).join(`require(${abs})`);
+          patched = patched.split(`require("${rel}")`).join(`require(${abs})`);
+        }
+        fs.writeFileSync(tmpFile, patched);
+        oldMod = require(tmpFile);
+        if (typeof oldMod.buildVeoPrompt !== 'function') {
+          oldMod = null;
+          skipReason = 'baseline module does not export buildVeoPrompt';
+        }
+      } catch (e) {
+        oldMod = null;
+        skipReason = `baseline require failed after relocate: ${e.code || e.message}`;
+      }
+    }
   }
 
   if (!oldMod) {

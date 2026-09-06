@@ -371,42 +371,60 @@ let b14SkipReason = null;
 // the pin SKIPs loudly instead of failing — a missing baseline is an
 // environment fact, not a regression. Every SKIP is printed and counted.
 //
-// The one mutation applied to the old source is rewriting its single relative
-// require('./platformFormats') to an absolute path so the temp copy can live
-// outside services/. If that rewrite does not apply, we SKIP rather than guess.
+// Mutation applied to the old source: rewrite EVERY local relative
+// `require('./…')` to an absolute path so the temp copy can live outside
+// services/. A single hardcoded `require('./platformFormats')` rewrite was
+// enough when that was the only local require; 9531ae9f also requires
+// `./videoProductAnchor`, and leaving that one relative made `require()` from
+// the tmpdir throw MODULE_NOT_FOUND — which the catch then MISREPORTED as
+// "git unavailable or not in this clone". Git show and require are now
+// separate, so a relocate/load failure cannot impersonate a missing blob.
 {
   const fs   = require('fs');
   const os   = require('os');
   const cp   = require('child_process');
   const REPO = path.join(__dirname, '..');
   const BASELINE = '9531ae9f:services/veoPromptBuilder.js';
-  const REL_REQUIRE = "require('./platformFormats')";
+  const REL_REQUIRE_RE = /require\(['"](\.\/[A-Za-z0-9_-]+)['"]\)/g;
 
   let oldMod = null;
   let skipReason = null;
   let tmpDir = null;
+  let src = null;
 
   try {
-    const src = cp.execFileSync('git', ['-C', REPO, 'show', BASELINE], {
+    src = cp.execFileSync('git', ['-C', REPO, 'show', BASELINE], {
       encoding: 'utf8', maxBuffer: 16 * 1024 * 1024, stdio: ['ignore', 'pipe', 'ignore'],
     });
-    if (!src.includes(REL_REQUIRE)) {
-      skipReason = `baseline source does not contain ${REL_REQUIRE} — cannot relocate it safely`;
-    } else {
-      tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'veoRevertPin-'));
-      const tmpFile = path.join(tmpDir, 'veoPromptBuilder.baseline.js');
-      fs.writeFileSync(tmpFile, src.replace(
-        REL_REQUIRE,
-        `require(${JSON.stringify(path.join(REPO, 'services', 'platformFormats'))})`
-      ));
-      oldMod = require(tmpFile);
-      if (typeof oldMod.buildVeoPrompt !== 'function') {
-        oldMod = null;
-        skipReason = 'baseline module does not export buildVeoPrompt';
-      }
-    }
   } catch (e) {
     skipReason = `git unavailable or ${BASELINE} not in this clone (${e.code || e.message})`;
+  }
+
+  if (src) {
+    const relRequires = [...new Set([...src.matchAll(REL_REQUIRE_RE)].map((m) => m[1]))];
+    if (!relRequires.length) {
+      skipReason = 'baseline has no local relative requires to relocate — unexpected shape';
+    } else {
+      try {
+        tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'veoRevertPin-'));
+        const tmpFile = path.join(tmpDir, 'veoPromptBuilder.baseline.js');
+        let patched = src;
+        for (const rel of relRequires) {
+          const abs = JSON.stringify(path.join(REPO, 'services', rel.slice(2)));
+          patched = patched.split(`require('${rel}')`).join(`require(${abs})`);
+          patched = patched.split(`require("${rel}")`).join(`require(${abs})`);
+        }
+        fs.writeFileSync(tmpFile, patched);
+        oldMod = require(tmpFile);
+        if (typeof oldMod.buildVeoPrompt !== 'function') {
+          oldMod = null;
+          skipReason = 'baseline module does not export buildVeoPrompt';
+        }
+      } catch (e) {
+        oldMod = null;
+        skipReason = `baseline require failed after relocate: ${e.code || e.message}`;
+      }
+    }
   }
 
   if (!oldMod) {
@@ -522,9 +540,13 @@ let b14SkipReason = null;
             caps: OMNI_CAPS, aspectRatio: '9:16', platformFormat: dest,
           };
           const label = `dest=${dest} productRef=${hasProductReference} dur=${durationSec}`;
+          // 9531ae9f's source already contains the hook_first path + the same
+          // call-time kill switch. oldMod.buildVeoPrompt MUST see switch=OFF
+          // too, or this compares frozen current against hook-first baseline
+          // (the skip used to hide that). Both calls go through withSwitch.
           check(`B15 switch=OFF Meta prompt is STILL byte-identical to 9531ae9f — the surviving PR #61 rollback guarantee (${label} seedText=false)`,
             withSwitch('false', () => buildVeoPrompt({ ...argsOff })),
-            oldMod.buildVeoPrompt({ ...argsOff }));
+            withSwitch('false', () => oldMod.buildVeoPrompt({ ...argsOff })));
           const on = withSwitch('false', () => buildVeoPrompt({ ...argsOff, seedHasText: true }));
           const off = withSwitch('false', () => buildVeoPrompt({ ...argsOff }));
           check(`B15 seedHasText is a retired no-op (${label})`, on, off);
@@ -595,7 +617,13 @@ let b14SkipReason = null;
           platformFormat: 'meta_stories_9_16',
         };
         const label = `productRef=${hasProductReference} dur=${durationSec}`;
-        const frozen = oldMod.buildVeoPrompt({ ...args });
+        // Frozen base = 9531ae9f with the switch OFF. The baseline blob's
+        // buildVeoPrompt also reads the kill switch at call time; calling it
+        // with the process default (code fallback true) would hand
+        // applyHookFirstDelta an already-hook-first string, so every anchor
+        // would miss and this pin would be a skip-shaped lie of a different
+        // kind.
+        const frozen = withSwitch('false', () => oldMod.buildVeoPrompt({ ...args }));
         const { out: expected, notApplied } = applyHookFirstDelta(frozen, durationSec);
         check(`B16 all five documented hook-first edits still apply to the frozen base (${label})`,
           notApplied, []);
