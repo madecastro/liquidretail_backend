@@ -1,0 +1,6 @@
+{
+  "name": "liquidretail-remotion",
+  "private": true,
+  "type": "module",
+  "description": "ESM island: Remotion compositions for the video titling engine. Bundled by @remotion/bundler at boot; the CJS app never requires these files directly."
+}

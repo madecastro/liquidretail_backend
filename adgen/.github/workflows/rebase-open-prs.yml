@@ -1,0 +1,39 @@
+name: Rebase open PRs onto master
+
+# Every open PR goes stale within roughly one merge cycle on this repo
+# (median gap between merges measured at 12.5 minutes). Cheaper than a
+# GitHub merge queue (no admin action / branch-protection changes needed)
+# and works today; see session.md for the merge-queue trade-off writeup.
+# Logic lives in .github/scripts/rebaseOpenPrs.js — see that file for the
+# safety rules (drafts / forks / the no-auto-rebase label are skipped).
+
+on:
+  push:
+    branches: [master]
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write   # gh label create (the no-auto-rebase opt-out label) lives on the Issues API
+
+concurrency:
+  group: rebase-open-prs
+  cancel-in-progress: false
+
+jobs:
+  rebase:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Rebase every eligible open PR onto master
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: node .github/scripts/rebaseOpenPrs.js

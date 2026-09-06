@@ -1,0 +1,1086 @@
+{
+  "name": "canonical-conversion-pmax10",
+  "description": "PMax 10s re-time of canonical-conversion (phases ×1.25 for 10s Omni plates; enter/exit durations absolute). Funnel variant — CONVERSION (static social_proof_led twin). productName + rating + deliveryLine + CTA from ~1.5s, CTA persistent to end. Quote/reviewer proof mid-clip. Social proof led, clear shop intent. Camera-beat alignment (Fable direction 2026-08-04): the canonical Omni prompt shoots pan 0-2.67, logo zoom 2.67-5.12, full-product reveal 5.12-8 (buildVeoPrompt scene marks dur/3, 0.64*dur). Text phases cut ON the camera cuts (2.7/5.1) so transitions feel intentional and the close (productName+CTA) rides the reveal shot. Text motion (2026-08-12): short enters (≤0.35s) so hold is the beat; role-based transitions (fade=chrome/support, slide-up=primary reading, pop=CTA); landscape is sequential timed beats on the camera grid — not a uniform fade stack. No scrim.",
+  "byFormat": {
+    "vertical": {
+      "version": 1,
+      "phases": [
+        {
+          "key": "hook",
+          "startSec": 0,
+          "endSec": 3.125
+        },
+        {
+          "key": "proof",
+          "startSec": 3.125,
+          "endSec": 6.375
+        },
+        {
+          "key": "close",
+          "startSec": 6.375,
+          "endSec": 10
+        }
+      ],
+      "stack": {
+        "rowGapPct": 0.022
+      },
+      "slots": [
+        {
+          "key": "brandPill",
+          "phase": "hook",
+          "position": {
+            "anchor": "top",
+            "align": "center"
+          },
+          "timing": {
+            "enterAtSec": 0.375,
+            "exitAtSec": null,
+            "enterDurationSec": 0.25
+          },
+          "transition": {
+            "type": "fade",
+            "direction": "up"
+          },
+          "treatment": {
+            "scrim": "none",
+            "shadow": "soft",
+            "casing": "upper",
+            "fontRole": "body",
+            "weight": 600,
+            "maxLines": 1,
+            "trackingPx": 2.2
+          },
+          "visible": false,
+          "_note": "hidden 2026-08-04 (owner): Meta draws page name/avatar in its own chrome; in-creative wordmark is redundant double-branding. Flip visible:true per-brand if wanted.",
+          "_motion": "Persistent identity chrome: short fade. Not a reading beat — quiet presence so it never steals the 2–3s hold from headline/quote."
+        },
+        {
+          "key": "badge",
+          "phase": "hook",
+          "position": {
+            "anchor": "upperThird",
+            "align": "left",
+            "maxWidthPct": 0.9,
+            "offsetY": 0.105
+          },
+          "timing": {
+            "enterAtSec": 0.5,
+            "exitAtSec": 2.75,
+            "enterDurationSec": 0.25,
+            "exitDurationSec": 0.25
+          },
+          "transition": {
+            "type": "fade",
+            "direction": "up"
+          },
+          "treatment": {
+            "scrim": "none",
+            "shadow": "soft",
+            "casing": "upper",
+            "fontRole": "body",
+            "weight": 600,
+            "maxLines": 1,
+            "trackingPx": 1.5
+          },
+          "_motion": "Supporting chip: short fade. No slide — motion would compete with the headline it sits under."
+        },
+        {
+          "key": "headline",
+          "phase": "hook",
+          "position": {
+            "anchor": "upperThird",
+            "align": "left",
+            "maxWidthPct": 0.9,
+            "offsetY": 0.105
+          },
+          "timing": {
+            "enterAtSec": 0.25,
+            "exitAtSec": 2.75,
+            "enterDurationSec": 0.3,
+            "exitDurationSec": 0.25
+          },
+          "transition": {
+            "type": "slide",
+            "direction": "up"
+          },
+          "treatment": {
+            "scrim": "none",
+            "shadow": "layered",
+            "casing": "none",
+            "fontRole": "heading",
+            "weight": 700,
+            "maxLines": 2,
+            "sizeScale": 1.2
+          },
+          "_motion": "Primary reading line: short slide-up. Direction up = settle into reading order (top→rest), side-agnostic for dynamic panelSide. Enter ≤0.30s so hold is almost the whole beat."
+        },
+        {
+          "key": "productName",
+          "phase": "close",
+          "position": {
+            "anchor": "lowerThird",
+            "align": "left",
+            "maxWidthPct": 0.9
+          },
+          "timing": {
+            "enterAtSec": 6.375,
+            "exitAtSec": null,
+            "enterDurationSec": 0.3
+          },
+          "transition": {
+            "type": "slide",
+            "direction": "up"
+          },
+          "treatment": {
+            "scrim": "none",
+            "shadow": "layered",
+            "casing": "none",
+            "fontRole": "heading",
+            "weight": 600,
+            "maxLines": 2,
+            "sizeScale": 1.2
+          },
+          "_motion": "Close/identity line: short slide-up into the lower stack. Still before the CTA asks."
+        },
+        {
+          "key": "rating",
+          "phase": "close",
+          "position": {
+            "anchor": "lowerThird",
+            "align": "left"
+          },
+          "timing": {
+            "enterAtSec": 6.375,
+            "exitAtSec": null,
+            "enterDurationSec": 0.25
+          },
+          "transition": {
+            "type": "fade",
+            "direction": "up"
+          },
+          "treatment": {
+            "scrim": "none",
+            "shadow": "soft",
+            "casing": "none",
+            "fontRole": "body",
+            "weight": 700,
+            "maxLines": 1,
+            "sizeScale": 1.25
+          },
+          "_motion": "Trust mark: short fade. Supporting, not a kinetic beat."
+        },
+        {
+          "key": "deliveryLine",
+          "phase": "close",
+          "position": {
+            "anchor": "lowerThird",
+            "align": "left",
+            "row": "ctaRow"
+          },
+          "timing": {
+            "enterAtSec": 6.5,
+            "exitAtSec": null,
+            "enterDurationSec": 0.25
+          },
+          "transition": {
+            "type": "fade",
+            "direction": "up"
+          },
+          "treatment": {
+            "scrim": "none",
+            "shadow": "soft",
+            "casing": "none",
+            "fontRole": "body",
+            "weight": 600,
+            "maxLines": 1,
+            "sizeScale": 1.265
+          },
+          "_motion": "Fulfillment line beside CTA: short fade. Supporting copy, no emphasis motion."
+        },
+        {
+          "key": "cta",
+          "phase": "close",
+          "position": {
+            "anchor": "lowerThird",
+            "align": "right",
+            "row": "ctaRow"
+          },
+          "timing": {
+            "enterAtSec": 6.375,
+            "exitAtSec": null,
+            "enterDurationSec": 0.35
+          },
+          "transition": {
+            "type": "pop",
+            "direction": "up"
+          },
+          "treatment": {
+            "scrim": "none",
+            "shadow": "soft",
+            "casing": "upper",
+            "fontRole": "body",
+            "weight": 800,
+            "maxLines": 1,
+            "colorToken": "ctaText",
+            "trackingPx": 1.2,
+            "sizeScale": 1.15
+          },
+          "visible": false,
+          "_motion": "The ask: short pop for emphasis (only slot that pops). Enter ≤0.35s so the whole remaining hold is fully readable — never still scaling while the viewer should act."
+        },
+        {
+          "key": "quote",
+          "phase": "proof",
+          "position": {
+            "anchor": "upperThird",
+            "align": "left",
+            "maxWidthPct": 0.92,
+            "offsetY": 0.105
+          },
+          "timing": {
+            "enterAtSec": 3.375,
+            "exitAtSec": 6,
+            "enterDurationSec": 0.3,
+            "exitDurationSec": 0.25
+          },
+          "transition": {
+            "type": "slide",
+            "direction": "up"
+          },
+          "treatment": {
+            "scrim": "none",
+            "shadow": "layered",
+            "casing": "none",
+            "fontRole": "quote",
+            "weight": 500,
+            "maxLines": 3,
+            "sizeScale": 1.15
+          },
+          "_motion": "Transient proof sentence: short slide-up (same settle as headline). Must be fully still for most of its 3–4s window — long fades steal comprehension on muted autoplay."
+        },
+        {
+          "key": "headline",
+          "phase": "proof",
+          "position": {
+            "anchor": "upperThird",
+            "align": "left",
+            "maxWidthPct": 0.92,
+            "offsetY": 0.105
+          },
+          "timing": {
+            "enterAtSec": 3.375,
+            "exitAtSec": 6,
+            "enterDurationSec": 0.3,
+            "exitDurationSec": 0.25
+          },
+          "transition": {
+            "type": "slide",
+            "direction": "up"
+          },
+          "treatment": {
+            "scrim": "none",
+            "shadow": "layered",
+            "casing": "none",
+            "fontRole": "heading",
+            "weight": 700,
+            "maxLines": 3,
+            "sizeScale": 1.02
+          },
+          "bind": [
+            "headline"
+          ],
+          "visibleWhenEmpty": "quote",
+          "_note": "Proof claim restatement when quote is gated empty — sits above rating lockup (owner 2026-08-05).",
+          "_motion": "Primary reading line: short slide-up. Direction up = settle into reading order (top→rest), side-agnostic for dynamic panelSide. Enter ≤0.30s so hold is almost the whole beat."
+        },
+        {
+          "key": "reviewer",
+          "phase": "proof",
+          "position": {
+            "anchor": "upperThird",
+            "align": "left",
+            "maxWidthPct": 0.9,
+            "offsetY": 0.105
+          },
+          "timing": {
+            "enterAtSec": 3.75,
+            "exitAtSec": 6,
+            "enterDurationSec": 0.25,
+            "exitDurationSec": 0.25
+          },
+          "transition": {
+            "type": "fade",
+            "direction": "up"
+          },
+          "treatment": {
+            "scrim": "none",
+            "shadow": "soft",
+            "casing": "upper",
+            "fontRole": "body",
+            "weight": 600,
+            "maxLines": 1,
+            "colorToken": "textSecondary",
+            "trackingPx": 1.5
+          },
+          "_motion": "Attribution under quote: short fade, staggered slightly after quote is already readable."
+        }
+      ],
+      "_layoutInvariant": "VERTICAL IS STRICTLY SEQUENTIAL — at no instant may two (phase,anchor) groups both be on screen. Windows incl. exit fade: hook|upperThird 0.25-3.0, proof|upperThird 3.375-6.25, close|lowerThird 6.375-end. Same defect and same reasoning as canonical-conversion.json byFormat.vertical._layoutInvariant — read that one; this is its 10s PMax twin and it carried the identical overlapping close-stack. Pinned by scripts/verifyTitleGroupsNeverOverlap.js."
+    },
+    "feed": {
+      "version": 1,
+      "phases": [
+        {
+          "key": "main",
+          "startSec": 0,
+          "endSec": 10
+        }
+      ],
+      "stack": {
+        "rowGapPct": 0.02
+      },
+      "slots": [
+        {
+          "key": "brandPill",
+          "phase": "main",
+          "position": {
+            "anchor": "top",
+            "align": "center"
+          },
+          "timing": {
+            "enterAtSec": 0.375,
+            "exitAtSec": null,
+            "enterDurationSec": 0.25
+          },
+          "transition": {
+            "type": "fade",
+            "direction": "up"
+          },
+          "treatment": {
+            "scrim": "none",
+            "shadow": "soft",
+            "casing": "upper",
+            "fontRole": "body",
+            "weight": 600,
+            "maxLines": 1,
+            "trackingPx": 2.2
+          },
+          "visible": false,
+          "_note": "hidden 2026-08-04 (owner): Meta draws page name/avatar in its own chrome; in-creative wordmark is redundant double-branding. Flip visible:true per-brand if wanted.",
+          "_motion": "Persistent identity chrome: short fade. Not a reading beat — quiet presence so it never steals the 2–3s hold from headline/quote."
+        },
+        {
+          "key": "badge",
+          "phase": "main",
+          "position": {
+            "anchor": "lowerThird",
+            "align": "left"
+          },
+          "timing": {
+            "enterAtSec": 0.625,
+            "exitAtSec": null,
+            "enterDurationSec": 0.25
+          },
+          "transition": {
+            "type": "fade",
+            "direction": "up"
+          },
+          "treatment": {
+            "scrim": "none",
+            "shadow": "soft",
+            "casing": "upper",
+            "fontRole": "body",
+            "weight": 600,
+            "maxLines": 1,
+            "trackingPx": 1.5
+          },
+          "_motion": "Supporting chip: short fade. No slide — motion would compete with the headline it sits under."
+        },
+        {
+          "key": "productName",
+          "phase": "main",
+          "position": {
+            "anchor": "lowerThird",
+            "align": "left",
+            "maxWidthPct": 0.9
+          },
+          "timing": {
+            "enterAtSec": 1,
+            "exitAtSec": null,
+            "enterDurationSec": 0.3
+          },
+          "transition": {
+            "type": "slide",
+            "direction": "up"
+          },
+          "treatment": {
+            "scrim": "none",
+            "shadow": "layered",
+            "casing": "none",
+            "fontRole": "heading",
+            "weight": 600,
+            "maxLines": 2,
+            "sizeScale": 1.2
+          },
+          "_motion": "Close/identity line: short slide-up into the lower stack. Still before the CTA asks."
+        },
+        {
+          "key": "rating",
+          "phase": "main",
+          "position": {
+            "anchor": "lowerThird",
+            "align": "left"
+          },
+          "timing": {
+            "enterAtSec": 1.375,
+            "exitAtSec": null,
+            "enterDurationSec": 0.25
+          },
+          "transition": {
+            "type": "fade",
+            "direction": "up"
+          },
+          "treatment": {
+            "scrim": "none",
+            "shadow": "soft",
+            "casing": "none",
+            "fontRole": "body",
+            "weight": 700,
+            "maxLines": 1,
+            "sizeScale": 1.25
+          },
+          "_motion": "Trust mark: short fade. Supporting, not a kinetic beat."
+        },
+        {
+          "key": "deliveryLine",
+          "phase": "main",
+          "position": {
+            "anchor": "lowerThird",
+            "align": "left",
+            "row": "ctaRow"
+          },
+          "timing": {
+            "enterAtSec": 1.75,
+            "exitAtSec": null,
+            "enterDurationSec": 0.25
+          },
+          "transition": {
+            "type": "fade",
+            "direction": "up"
+          },
+          "treatment": {
+            "scrim": "none",
+            "shadow": "soft",
+            "casing": "none",
+            "fontRole": "body",
+            "weight": 600,
+            "maxLines": 1,
+            "sizeScale": 1.265
+          },
+          "_motion": "Fulfillment line beside CTA: short fade. Supporting copy, no emphasis motion."
+        },
+        {
+          "key": "cta",
+          "phase": "main",
+          "position": {
+            "anchor": "lowerThird",
+            "align": "right",
+            "row": "ctaRow"
+          },
+          "timing": {
+            "enterAtSec": 1.75,
+            "exitAtSec": null,
+            "enterDurationSec": 0.35
+          },
+          "transition": {
+            "type": "pop",
+            "direction": "up"
+          },
+          "treatment": {
+            "scrim": "none",
+            "shadow": "soft",
+            "casing": "upper",
+            "fontRole": "body",
+            "weight": 800,
+            "maxLines": 1,
+            "colorToken": "ctaText",
+            "trackingPx": 1.2,
+            "sizeScale": 1.15
+          },
+          "visible": false,
+          "_motion": "The ask: short pop for emphasis (only slot that pops). Enter ≤0.35s so the whole remaining hold is fully readable — never still scaling while the viewer should act."
+        },
+        {
+          "key": "quote",
+          "phase": "main",
+          "position": {
+            "anchor": "lowerThird",
+            "align": "left",
+            "maxWidthPct": 0.9
+          },
+          "timing": {
+            "enterAtSec": 2.5,
+            "exitAtSec": null,
+            "enterDurationSec": 0.3
+          },
+          "transition": {
+            "type": "slide",
+            "direction": "up"
+          },
+          "treatment": {
+            "scrim": "none",
+            "shadow": "layered",
+            "casing": "none",
+            "fontRole": "quote",
+            "weight": 500,
+            "maxLines": 2,
+            "sizeScale": 1.15
+          },
+          "_motion": "Transient proof sentence: short slide-up (same settle as headline). Must be fully still for most of its 3–4s window — long fades steal comprehension on muted autoplay."
+        },
+        {
+          "key": "reviewer",
+          "phase": "main",
+          "position": {
+            "anchor": "lowerThird",
+            "align": "left"
+          },
+          "timing": {
+            "enterAtSec": 2.5,
+            "exitAtSec": null,
+            "enterDurationSec": 0.25
+          },
+          "transition": {
+            "type": "fade",
+            "direction": "up"
+          },
+          "treatment": {
+            "scrim": "none",
+            "shadow": "soft",
+            "casing": "upper",
+            "fontRole": "body",
+            "weight": 500,
+            "maxLines": 1,
+            "colorToken": "textSecondary",
+            "trackingPx": 1.5
+          },
+          "_motion": "Attribution under quote: short fade, staggered slightly after quote is already readable."
+        }
+      ]
+    },
+    "square": {
+      "version": 1,
+      "phases": [
+        {
+          "key": "main",
+          "startSec": 0,
+          "endSec": 10
+        }
+      ],
+      "stack": {
+        "rowGapPct": 0.02
+      },
+      "slots": [
+        {
+          "key": "brandPill",
+          "phase": "main",
+          "position": {
+            "anchor": "top",
+            "align": "center"
+          },
+          "timing": {
+            "enterAtSec": 0.375,
+            "exitAtSec": null,
+            "enterDurationSec": 0.25
+          },
+          "transition": {
+            "type": "fade",
+            "direction": "up"
+          },
+          "treatment": {
+            "scrim": "none",
+            "shadow": "soft",
+            "casing": "upper",
+            "fontRole": "body",
+            "weight": 600,
+            "maxLines": 1,
+            "trackingPx": 2.2
+          },
+          "visible": false,
+          "_note": "hidden 2026-08-04 (owner): Meta draws page name/avatar in its own chrome; in-creative wordmark is redundant double-branding. Flip visible:true per-brand if wanted.",
+          "_motion": "Persistent identity chrome: short fade. Not a reading beat — quiet presence so it never steals the 2–3s hold from headline/quote."
+        },
+        {
+          "key": "badge",
+          "phase": "main",
+          "position": {
+            "anchor": "lowerThird",
+            "align": "left"
+          },
+          "timing": {
+            "enterAtSec": 0.625,
+            "exitAtSec": null,
+            "enterDurationSec": 0.25
+          },
+          "transition": {
+            "type": "fade",
+            "direction": "up"
+          },
+          "treatment": {
+            "scrim": "none",
+            "shadow": "soft",
+            "casing": "upper",
+            "fontRole": "body",
+            "weight": 600,
+            "maxLines": 1,
+            "trackingPx": 1.5
+          },
+          "_motion": "Supporting chip: short fade. No slide — motion would compete with the headline it sits under."
+        },
+        {
+          "key": "productName",
+          "phase": "main",
+          "position": {
+            "anchor": "lowerThird",
+            "align": "left",
+            "maxWidthPct": 0.9
+          },
+          "timing": {
+            "enterAtSec": 1,
+            "exitAtSec": null,
+            "enterDurationSec": 0.3
+          },
+          "transition": {
+            "type": "slide",
+            "direction": "up"
+          },
+          "treatment": {
+            "scrim": "none",
+            "shadow": "layered",
+            "casing": "none",
+            "fontRole": "heading",
+            "weight": 600,
+            "maxLines": 1,
+            "sizeScale": 1.2
+          },
+          "_motion": "Close/identity line: short slide-up into the lower stack. Still before the CTA asks."
+        },
+        {
+          "key": "rating",
+          "phase": "main",
+          "position": {
+            "anchor": "lowerThird",
+            "align": "left"
+          },
+          "timing": {
+            "enterAtSec": 1.375,
+            "exitAtSec": null,
+            "enterDurationSec": 0.25
+          },
+          "transition": {
+            "type": "fade",
+            "direction": "up"
+          },
+          "treatment": {
+            "scrim": "none",
+            "shadow": "soft",
+            "casing": "none",
+            "fontRole": "body",
+            "weight": 700,
+            "maxLines": 1,
+            "sizeScale": 1.25
+          },
+          "_motion": "Trust mark: short fade. Supporting, not a kinetic beat."
+        },
+        {
+          "key": "deliveryLine",
+          "phase": "main",
+          "position": {
+            "anchor": "lowerThird",
+            "align": "left",
+            "row": "ctaRow"
+          },
+          "timing": {
+            "enterAtSec": 1.75,
+            "exitAtSec": null,
+            "enterDurationSec": 0.25
+          },
+          "transition": {
+            "type": "fade",
+            "direction": "up"
+          },
+          "treatment": {
+            "scrim": "none",
+            "shadow": "soft",
+            "casing": "none",
+            "fontRole": "body",
+            "weight": 600,
+            "maxLines": 1,
+            "sizeScale": 1.265
+          },
+          "_motion": "Fulfillment line beside CTA: short fade. Supporting copy, no emphasis motion."
+        },
+        {
+          "key": "cta",
+          "phase": "main",
+          "position": {
+            "anchor": "lowerThird",
+            "align": "right",
+            "row": "ctaRow"
+          },
+          "timing": {
+            "enterAtSec": 1.75,
+            "exitAtSec": null,
+            "enterDurationSec": 0.35
+          },
+          "transition": {
+            "type": "pop",
+            "direction": "up"
+          },
+          "treatment": {
+            "scrim": "none",
+            "shadow": "soft",
+            "casing": "upper",
+            "fontRole": "body",
+            "weight": 800,
+            "maxLines": 1,
+            "colorToken": "ctaText",
+            "trackingPx": 1.2,
+            "sizeScale": 1.15
+          },
+          "visible": false,
+          "_motion": "The ask: short pop for emphasis (only slot that pops). Enter ≤0.35s so the whole remaining hold is fully readable — never still scaling while the viewer should act."
+        },
+        {
+          "key": "quote",
+          "phase": "main",
+          "position": {
+            "anchor": "lowerThird",
+            "align": "left",
+            "maxWidthPct": 0.9
+          },
+          "timing": {
+            "enterAtSec": 2.5,
+            "exitAtSec": null,
+            "enterDurationSec": 0.3
+          },
+          "transition": {
+            "type": "slide",
+            "direction": "up"
+          },
+          "treatment": {
+            "scrim": "none",
+            "shadow": "layered",
+            "casing": "none",
+            "fontRole": "quote",
+            "weight": 500,
+            "maxLines": 1,
+            "sizeScale": 1.15
+          },
+          "_motion": "Transient proof sentence: short slide-up (same settle as headline). Must be fully still for most of its 3–4s window — long fades steal comprehension on muted autoplay."
+        },
+        {
+          "key": "reviewer",
+          "phase": "main",
+          "position": {
+            "anchor": "lowerThird",
+            "align": "left"
+          },
+          "timing": {
+            "enterAtSec": 2.5,
+            "exitAtSec": null,
+            "enterDurationSec": 0.25
+          },
+          "transition": {
+            "type": "fade",
+            "direction": "up"
+          },
+          "treatment": {
+            "scrim": "none",
+            "shadow": "soft",
+            "casing": "upper",
+            "fontRole": "body",
+            "weight": 500,
+            "maxLines": 1,
+            "colorToken": "textSecondary",
+            "trackingPx": 1.5
+          },
+          "_motion": "Attribution under quote: short fade, staggered slightly after quote is already readable."
+        }
+      ]
+    },
+    "landscape": {
+      "version": 1,
+      "phases": [
+        {
+          "key": "hook",
+          "startSec": 0,
+          "endSec": 3.125
+        },
+        {
+          "key": "proof",
+          "startSec": 3.125,
+          "endSec": 6.375
+        },
+        {
+          "key": "close",
+          "startSec": 6.375,
+          "endSec": 10
+        }
+      ],
+      "stack": {
+        "rowGapPct": 0.024
+      },
+      "slots": [
+        {
+          "key": "brandPill",
+          "visible": false,
+          "treatment": {
+            "scrim": "none",
+            "shadow": "soft",
+            "casing": "upper",
+            "fontRole": "body",
+            "weight": 600,
+            "maxLines": 1,
+            "trackingPx": 2.2
+          },
+          "_note": "hidden 2026-08-04 (owner): Meta draws page name/avatar in its own chrome; in-creative wordmark is redundant double-branding. Flip visible:true per-brand if wanted.",
+          "phase": "hook",
+          "position": {
+            "anchor": "top",
+            "align": "left",
+            "maxWidthPct": 0.46
+          },
+          "timing": {
+            "enterAtSec": 0.15,
+            "exitAtSec": null,
+            "enterDurationSec": 0.25
+          },
+          "transition": {
+            "type": "fade",
+            "direction": "up"
+          },
+          "_motion": "Persistent identity chrome: short fade. Not a reading beat — quiet presence so it never steals the 2–3s hold from headline/quote. Landscape: enters in the first ≤1s focus window; holds (persistent), does not re-animate."
+        },
+        {
+          "key": "badge",
+          "visible": true,
+          "treatment": {
+            "scrim": "none",
+            "shadow": "soft",
+            "casing": "upper",
+            "fontRole": "body",
+            "weight": 600,
+            "maxLines": 1,
+            "trackingPx": 1.5
+          },
+          "phase": "hook",
+          "position": {
+            "anchor": "upperThird",
+            "align": "left",
+            "offsetY": 0.07,
+            "maxWidthPct": 0.46
+          },
+          "timing": {
+            "enterAtSec": 0.18,
+            "exitAtSec": 2.85,
+            "enterDurationSec": 0.25,
+            "exitDurationSec": 0.25
+          },
+          "transition": {
+            "type": "fade",
+            "direction": "up"
+          },
+          "_motion": "Supporting chip: short fade. No slide — motion would compete with the headline it sits under."
+        },
+        {
+          "key": "productName",
+          "visible": true,
+          "treatment": {
+            "scrim": "none",
+            "shadow": "layered",
+            "casing": "none",
+            "fontRole": "heading",
+            "weight": 600,
+            "maxLines": 1,
+            "sizeScale": 1.2
+          },
+          "phase": "hook",
+          "position": {
+            "anchor": "upperThird",
+            "align": "left",
+            "offsetY": 0.07,
+            "maxWidthPct": 0.46
+          },
+          "timing": {
+            "enterAtSec": 0.2,
+            "exitAtSec": 3.05,
+            "enterDurationSec": 0.3,
+            "exitDurationSec": 0.15
+          },
+          "transition": {
+            "type": "slide",
+            "direction": "up"
+          },
+          "_motion": "Close/identity line: short slide-up into the lower stack. Still before the CTA asks. Conversion: product identity early and persistent (shop intent)."
+        },
+        {
+          "key": "rating",
+          "visible": true,
+          "treatment": {
+            "scrim": "none",
+            "shadow": "soft",
+            "casing": "none",
+            "fontRole": "body",
+            "weight": 700,
+            "maxLines": 1,
+            "sizeScale": 1.25
+          },
+          "phase": "hook",
+          "position": {
+            "anchor": "upperThird",
+            "align": "left",
+            "offsetY": 0.07,
+            "maxWidthPct": 0.46
+          },
+          "timing": {
+            "enterAtSec": 0.45,
+            "exitAtSec": 3.05,
+            "enterDurationSec": 0.25,
+            "exitDurationSec": 0.15
+          },
+          "transition": {
+            "type": "fade",
+            "direction": "up"
+          },
+          "_motion": "Trust mark: short fade. Supporting, not a kinetic beat. Conversion: trust mark early with productName."
+        },
+        {
+          "key": "deliveryLine",
+          "visible": true,
+          "treatment": {
+            "scrim": "none",
+            "shadow": "soft",
+            "casing": "none",
+            "fontRole": "body",
+            "weight": 600,
+            "maxLines": 1,
+            "sizeScale": 1.265
+          },
+          "phase": "hook",
+          "position": {
+            "anchor": "lowerThird",
+            "align": "left",
+            "maxWidthPct": 0.46,
+            "row": "ctaRow"
+          },
+          "timing": {
+            "enterAtSec": 0.7,
+            "exitAtSec": null,
+            "enterDurationSec": 0.25
+          },
+          "transition": {
+            "type": "fade",
+            "direction": "up"
+          },
+          "_motion": "Fulfillment line beside CTA: short fade. Supporting copy, no emphasis motion."
+        },
+        {
+          "key": "cta",
+          "visible": true,
+          "treatment": {
+            "scrim": "none",
+            "shadow": "soft",
+            "casing": "upper",
+            "fontRole": "body",
+            "weight": 800,
+            "maxLines": 1,
+            "colorToken": "ctaText",
+            "trackingPx": 1.2,
+            "sizeScale": 1.15
+          },
+          "phase": "hook",
+          "position": {
+            "anchor": "lowerThird",
+            "align": "left",
+            "maxWidthPct": 0.46,
+            "row": "ctaRow"
+          },
+          "timing": {
+            "enterAtSec": 0.7,
+            "exitAtSec": null,
+            "enterDurationSec": 0.35
+          },
+          "transition": {
+            "type": "pop",
+            "direction": "up"
+          },
+          "_motion": "The ask: short pop for emphasis (only slot that pops). Enter ≤0.35s so the whole remaining hold is fully readable — never still scaling while the viewer should act. Conversion: ask early and hold to end. Pop settles in 0.35s; never re-animates."
+        },
+        {
+          "key": "quote",
+          "visible": true,
+          "treatment": {
+            "scrim": "none",
+            "shadow": "layered",
+            "casing": "none",
+            "fontRole": "quote",
+            "weight": 500,
+            "maxLines": 2,
+            "sizeScale": 1.15
+          },
+          "phase": "proof",
+          "position": {
+            "anchor": "upperThird",
+            "align": "left",
+            "offsetY": 0.07,
+            "maxWidthPct": 0.46
+          },
+          "timing": {
+            "enterAtSec": 3.25,
+            "exitAtSec": 6.1,
+            "enterDurationSec": 0.3,
+            "exitDurationSec": 0.25
+          },
+          "transition": {
+            "type": "slide",
+            "direction": "up"
+          },
+          "_motion": "Transient proof sentence: short slide-up (same settle as headline). Must be fully still for most of its 3–4s window — long fades steal comprehension on muted autoplay. Conversion mid-clip proof; exits before close (t2)."
+        },
+        {
+          "key": "reviewer",
+          "visible": true,
+          "treatment": {
+            "scrim": "none",
+            "shadow": "soft",
+            "casing": "upper",
+            "fontRole": "body",
+            "weight": 600,
+            "maxLines": 1,
+            "colorToken": "textSecondary",
+            "trackingPx": 1.5
+          },
+          "phase": "proof",
+          "position": {
+            "anchor": "upperThird",
+            "align": "left",
+            "offsetY": 0.07,
+            "maxWidthPct": 0.46
+          },
+          "timing": {
+            "enterAtSec": 3.5,
+            "exitAtSec": 6.1,
+            "enterDurationSec": 0.25,
+            "exitDurationSec": 0.25
+          },
+          "transition": {
+            "type": "fade",
+            "direction": "up"
+          },
+          "_motion": "Attribution under quote: short fade, staggered slightly after quote is already readable."
+        }
+      ]
+    }
+  }
+}

@@ -1,0 +1,139 @@
+# Render deployment for liquidretail_adgen.
+#
+# Three services from one Docker image. Env var ADGEN_ROLE selects the role.
+# Autoscale on the renderer only — orchestrator is singleton (distributed lease
+# handles failover), api scales on HTTP RPS if needed later.
+#
+# MONGODB_URI + SLACK_* live in the Render dashboard as secrets. Everything
+# else lives here or in .env.example (non-secret defaults).
+
+services:
+  - type: web
+    name: adgen-api
+    env: docker
+    plan: starter
+    dockerfilePath: ./Dockerfile
+    healthCheckPath: /health
+    autoDeploy: true
+    envVars:
+      - key: ADGEN_ROLE
+        value: api
+      - key: PORT
+        value: 3100
+      - key: MONGODB_URI
+        sync: false   # dashboard-only secret
+
+  - type: worker
+    name: adgen-orchestrator
+    env: docker
+    plan: starter
+    dockerfilePath: ./Dockerfile
+    autoDeploy: true
+    # Singleton by design; distributed lease keeps a 2nd instance from
+    # duplicating expansion work. numInstances stays 1 in dashboard.
+    envVars:
+      - key: ADGEN_ROLE
+        value: orchestrator
+      - key: MONGODB_URI
+        sync: false
+
+  - type: worker
+    name: adgen-renderer
+    env: docker
+    # Pro-Plus: 4 vCPU / 8 GB. The RAM ceiling is set by Remotion —
+    # MEASURED ~1.97 GB per concurrent render. Live dashboard value is
+    # REMOTION_QUEUE_CONCURRENCY=2 (≈3.9 GB peak, 49%, ~4 GB headroom) — NOT
+    # 3 as an earlier version of this comment described; config/defaults.env
+    # reasoned 3 was safe here (74%, ~2 GB headroom) given autoscaling is
+    # disabled on this service, but that was never actually rolled out to
+    # this dashboard, and adgen-titler's 2026-08-26 triple-OOM at a
+    # similarly-reasoned-but-unmeasured value (4) is a live argument for not
+    # doing so without a real measurement first — see that file's 2026-08-26
+    # section. 4 concurrent ≈ 7.9 GB and is the configuration that was
+    # OOM-killed on 2026-08-21 while holding a paid master — do not restore
+    # it here. Standard (4 GB) OOMs under real video load. NOTE: autoscaling
+    # is currently DISABLED on this service, so the 60% memory trigger is not
+    # a live constraint on the concurrency choice — unlike adgen-titler
+    # below, where it is. Was
+    # standard_plus in this file until 2026-08-24 (Render's plan naming
+    # shifted mid-year; the live service was already on pro_plus via
+    # dashboard override, and standard_plus is no longer a valid worker
+    # plan on blueprint sync — this rename catches the file up to reality).
+    #
+    # When ADGEN_TITLER_ENABLED=true (this service — matches live dashboard),
+    # this role stops doing Remotion in-process and simply stamps
+    # titlingNeeded=true after the master's veoVideoUrl lands. The titler
+    # service (below) picks it up. In that mode this instance stops being
+    # memory-bound by Remotion and can raise ADGEN_MAX_INFLIGHT — but that's
+    # a separate tuning PR.
+    plan: pro_plus
+    dockerfilePath: ./Dockerfile
+    autoDeploy: true
+    # Autoscale MUST live in this file, not just the dashboard. A blueprint
+    # sync without a scaling: stanza wipes the dashboard config — measured
+    # 2026-09-03 16:45 UTC: PR #109's deploy fired an
+    # autoscaling_config_changed event that flipped enabled true→false and
+    # dropped titler from 6 instances to 1, mid-run. Render treats a missing
+    # scaling: block as "disable autoscale", not "leave it alone." Same for
+    # adgen-titler below.
+    # min=2 (survives one instance replacement), max=4 (capacity for 2000
+    # static/hr + 450 video/hr with margin — see src/config.js MAX_INFLIGHT
+    # comment for the math). 60% thresholds match the previously-live
+    # dashboard values and clear the ~50% single-instance floor with
+    # REMOTION_QUEUE_CONCURRENCY=2 so autoscale only fires under real load.
+    scaling:
+      minInstances: 2
+      maxInstances: 4
+      targetMemoryPercent: 60
+      targetCPUPercent: 60
+    envVars:
+      - key: ADGEN_ROLE
+        value: renderer
+      - key: ADGEN_RENDERER_ENABLED
+        value: "true"
+      - key: ADGEN_TITLER_ENABLED
+        value: "true"   # live: renderer stamps titlingNeeded, stands down Remotion
+      - key: ADGEN_MAX_INFLIGHT
+        value: 32
+      - key: MONGODB_URI
+        sync: false
+
+  - type: worker
+    name: adgen-titler
+    env: docker
+    # Same plan as adgen-renderer (8 GB — Chrome needs it). Titler has no
+    # competing work here, but measured 2026-08-26 that does NOT mean higher
+    # safe concurrency: ~1.91 GiB/slot, statistically the same as the
+    # renderer's ~1.97. REMOTION_QUEUE_CONCURRENCY inherits config/defaults.env
+    # (=2); DO NOT duplicate the value here (one source of truth for a memory
+    # ceiling). See that file's 2026-08-26 section: the live dashboard was
+    # raised to 4 without validation and OOM-killed 3 instances in 44h.
+    # Orchestrator action item: dashboard 4 -> 2.
+    plan: pro_plus
+    dockerfilePath: ./Dockerfile
+    autoDeploy: true
+    # Autoscale MUST live in this file — see the adgen-renderer note above
+    # for the blueprint-sync-wipes-dashboard mechanism. min=4/max=12 is
+    # what was live on the dashboard until PR #109's deploy silently
+    # disabled it 2026-09-03 16:45 UTC; landing it here prevents the next
+    # PR from doing the same thing again. All 3 August OOM kills happened
+    # AFTER a similar widening: more instances didn't relieve the
+    # per-instance ceiling, just multiplied how many could hit it
+    # independently. Fix concurrency first; revisit max separately once
+    # that holds under real load.
+    scaling:
+      minInstances: 4
+      maxInstances: 12
+      targetMemoryPercent: 60
+      targetCPUPercent: 60
+    envVars:
+      - key: ADGEN_ROLE
+        value: titler
+      - key: ADGEN_RENDERER_ENABLED
+        value: "true"
+      - key: ADGEN_TITLER_ENABLED
+        value: "true"    # live since 2026-08-26; titling is production
+      - key: ADGEN_MAX_INFLIGHT
+        value: 16        # I/O ceiling; Remotion queue self-limits below this
+      - key: MONGODB_URI
+        sync: false

@@ -1,0 +1,998 @@
+{
+  "name": "canonical-conversion",
+  "description": "Funnel variant — CONVERSION (static social_proof_led twin). Social proof led, clear shop intent: hook claim, then quote/reviewer proof, then the productName + rating + deliveryLine + CTA close. Camera-beat alignment (Fable direction 2026-08-04): the canonical Omni prompt shoots pan 0-2.67, logo zoom 2.67-5.12, full-product reveal 5.12-8 (buildVeoPrompt scene marks dur/3, 0.64*dur). Text phases cut ON the camera cuts (2.67/5.12) so transitions feel intentional and the close (productName+rating+CTA) rides the reveal shot. VERTICAL IS STRICTLY SEQUENTIAL — read byFormat.vertical._layoutInvariant before re-timing it.",
+  "byFormat": {
+    "vertical": {
+      "version": 1,
+      "phases": [
+        {
+          "key": "hook",
+          "startSec": 0,
+          "endSec": 2.67
+        },
+        {
+          "key": "proof",
+          "startSec": 2.67,
+          "endSec": 5.12
+        },
+        {
+          "key": "close",
+          "startSec": 5.12,
+          "endSec": 8
+        }
+      ],
+      "stack": {
+        "rowGapPct": 0.022
+      },
+      "slots": [
+        {
+          "key": "brandPill",
+          "phase": "hook",
+          "position": {
+            "anchor": "top",
+            "align": "center"
+          },
+          "timing": {
+            "enterAtSec": 0.3,
+            "exitAtSec": null,
+            "enterDurationSec": 0.5
+          },
+          "transition": {
+            "type": "fade"
+          },
+          "treatment": {
+            "scrim": "none",
+            "shadow": "soft",
+            "casing": "upper",
+            "fontRole": "body",
+            "weight": 600,
+            "maxLines": 1,
+            "trackingPx": 2.2
+          },
+          "visible": false,
+          "_note": "hidden 2026-08-04 (owner): Meta draws page name/avatar in its own chrome; in-creative wordmark is redundant double-branding. Flip visible:true per-brand if wanted."
+        },
+        {
+          "key": "badge",
+          "phase": "hook",
+          "position": {
+            "anchor": "upperThird",
+            "align": "left",
+            "maxWidthPct": 0.9,
+            "offsetY": 0.105
+          },
+          "timing": {
+            "enterAtSec": 0.4,
+            "exitAtSec": 2.2,
+            "enterDurationSec": 0.5,
+            "exitDurationSec": 0.25
+          },
+          "transition": {
+            "type": "fade"
+          },
+          "treatment": {
+            "scrim": "none",
+            "shadow": "soft",
+            "casing": "upper",
+            "fontRole": "body",
+            "weight": 600,
+            "maxLines": 1,
+            "trackingPx": 1.5
+          }
+        },
+        {
+          "key": "headline",
+          "phase": "hook",
+          "position": {
+            "anchor": "upperThird",
+            "align": "left",
+            "maxWidthPct": 0.9,
+            "offsetY": 0.105
+          },
+          "timing": {
+            "enterAtSec": 0.2,
+            "exitAtSec": 2.2,
+            "enterDurationSec": 0.5,
+            "exitDurationSec": 0.25
+          },
+          "transition": {
+            "type": "fade"
+          },
+          "treatment": {
+            "scrim": "none",
+            "shadow": "layered",
+            "casing": "none",
+            "fontRole": "heading",
+            "weight": 700,
+            "maxLines": 2,
+            "sizeScale": 1.2
+          }
+        },
+        {
+          "key": "productName",
+          "phase": "close",
+          "position": {
+            "anchor": "lowerThird",
+            "align": "left",
+            "maxWidthPct": 0.9
+          },
+          "timing": {
+            "enterAtSec": 5.12,
+            "exitAtSec": null,
+            "enterDurationSec": 0.6
+          },
+          "transition": {
+            "type": "fade"
+          },
+          "treatment": {
+            "scrim": "none",
+            "shadow": "layered",
+            "casing": "none",
+            "fontRole": "heading",
+            "weight": 600,
+            "maxLines": 2,
+            "sizeScale": 1.2
+          }
+        },
+        {
+          "key": "rating",
+          "phase": "close",
+          "position": {
+            "anchor": "lowerThird",
+            "align": "left"
+          },
+          "timing": {
+            "enterAtSec": 5.12,
+            "exitAtSec": null,
+            "enterDurationSec": 0.6
+          },
+          "transition": {
+            "type": "fade"
+          },
+          "treatment": {
+            "scrim": "none",
+            "shadow": "soft",
+            "casing": "none",
+            "fontRole": "body",
+            "weight": 700,
+            "maxLines": 1,
+            "sizeScale": 1.6
+          }
+        },
+        {
+          "key": "deliveryLine",
+          "phase": "close",
+          "position": {
+            "anchor": "lowerThird",
+            "align": "left",
+            "row": "ctaRow"
+          },
+          "timing": {
+            "enterAtSec": 5.22,
+            "exitAtSec": null,
+            "enterDurationSec": 0.5
+          },
+          "transition": {
+            "type": "fade"
+          },
+          "treatment": {
+            "scrim": "none",
+            "shadow": "soft",
+            "casing": "none",
+            "fontRole": "body",
+            "weight": 600,
+            "maxLines": 1,
+            "sizeScale": 1.265
+          }
+        },
+        {
+          "key": "cta",
+          "phase": "close",
+          "position": {
+            "anchor": "lowerThird",
+            "align": "right",
+            "row": "ctaRow"
+          },
+          "timing": {
+            "enterAtSec": 5.12,
+            "exitAtSec": null,
+            "enterDurationSec": 0.5
+          },
+          "transition": {
+            "type": "fade"
+          },
+          "treatment": {
+            "scrim": "none",
+            "shadow": "soft",
+            "casing": "upper",
+            "fontRole": "body",
+            "weight": 800,
+            "maxLines": 1,
+            "colorToken": "ctaText",
+            "trackingPx": 1.2,
+            "sizeScale": 1.15
+          },
+          "visible": false
+        },
+        {
+          "key": "quote",
+          "phase": "proof",
+          "position": {
+            "anchor": "upperThird",
+            "align": "left",
+            "maxWidthPct": 0.92,
+            "offsetY": 0.105
+          },
+          "timing": {
+            "enterAtSec": 2.67,
+            "exitAtSec": 4.85,
+            "enterDurationSec": 0.7,
+            "exitDurationSec": 0.25
+          },
+          "transition": {
+            "type": "fade"
+          },
+          "treatment": {
+            "scrim": "none",
+            "shadow": "layered",
+            "casing": "none",
+            "fontRole": "quote",
+            "weight": 500,
+            "maxLines": 3,
+            "sizeScale": 1.3
+          }
+        },
+        {
+          "key": "headline",
+          "phase": "proof",
+          "position": {
+            "anchor": "upperThird",
+            "align": "left",
+            "maxWidthPct": 0.92,
+            "offsetY": 0.105
+          },
+          "timing": {
+            "enterAtSec": 2.67,
+            "exitAtSec": 4.85,
+            "enterDurationSec": 0.7,
+            "exitDurationSec": 0.25
+          },
+          "transition": {
+            "type": "fade"
+          },
+          "treatment": {
+            "scrim": "none",
+            "shadow": "layered",
+            "casing": "none",
+            "fontRole": "heading",
+            "weight": 700,
+            "maxLines": 3,
+            "sizeScale": 1.02
+          },
+          "bind": [
+            "headline"
+          ],
+          "visibleWhenEmpty": "quote",
+          "_note": "Proof claim restatement when quote is gated empty — sits above rating lockup (owner 2026-08-05)."
+        },
+        {
+          "key": "reviewer",
+          "phase": "proof",
+          "position": {
+            "anchor": "upperThird",
+            "align": "left",
+            "maxWidthPct": 0.9,
+            "offsetY": 0.105
+          },
+          "timing": {
+            "enterAtSec": 2.95,
+            "exitAtSec": 4.85,
+            "enterDurationSec": 0.6,
+            "exitDurationSec": 0.25
+          },
+          "transition": {
+            "type": "fade"
+          },
+          "treatment": {
+            "scrim": "none",
+            "shadow": "soft",
+            "casing": "upper",
+            "fontRole": "body",
+            "weight": 600,
+            "maxLines": 1,
+            "colorToken": "textSecondary",
+            "trackingPx": 1.5,
+            "sizeScale": 1.25
+          }
+        }
+      ],
+      "_layoutInvariant": "VERTICAL IS STRICTLY SEQUENTIAL — at no instant may two (phase,anchor) groups both be on screen. Windows incl. exit fade: hook|upperThird 0.2-2.45, proof|upperThird 2.67-5.10, close|lowerThird 5.12-end. WHY: Canonical.jsx resolveGroupAnchor shifts each group off a face/product band INDEPENDENTLY, with no knowledge of where other groups landed, and stackContainerStyle then positions purely from the resolved anchor — so two simultaneous groups whose keep-out chains converge paint on top of each other. Overlapping windows were the cause of the delivered text-on-text defect on ads 6a93ade2e4f1d02784398630 / 6a93ade1e4f1d02784398626 (2026-08-30), where the close stack (then authored in `hook` from 1.5s with no exit) was pushed onto upperThird through the live headline. Pinned by scripts/verifyTitleGroupsNeverOverlap.js — if you re-time this preset and that harness goes red, the collision is back; do not relax it."
+    },
+    "feed": {
+      "version": 1,
+      "phases": [
+        {
+          "key": "main",
+          "startSec": 0,
+          "endSec": 8
+        }
+      ],
+      "stack": {
+        "rowGapPct": 0.02
+      },
+      "slots": [
+        {
+          "key": "brandPill",
+          "phase": "main",
+          "position": {
+            "anchor": "top",
+            "align": "center"
+          },
+          "timing": {
+            "enterAtSec": 0.3,
+            "exitAtSec": null,
+            "enterDurationSec": 0.5
+          },
+          "transition": {
+            "type": "fade"
+          },
+          "treatment": {
+            "scrim": "none",
+            "shadow": "soft",
+            "casing": "upper",
+            "fontRole": "body",
+            "weight": 600,
+            "maxLines": 1,
+            "trackingPx": 2.2
+          },
+          "visible": false,
+          "_note": "hidden 2026-08-04 (owner): Meta draws page name/avatar in its own chrome; in-creative wordmark is redundant double-branding. Flip visible:true per-brand if wanted."
+        },
+        {
+          "key": "badge",
+          "phase": "main",
+          "position": {
+            "anchor": "lowerThird",
+            "align": "left"
+          },
+          "timing": {
+            "enterAtSec": 0.5,
+            "exitAtSec": null,
+            "enterDurationSec": 0.5
+          },
+          "transition": {
+            "type": "fade"
+          },
+          "treatment": {
+            "scrim": "none",
+            "shadow": "soft",
+            "casing": "upper",
+            "fontRole": "body",
+            "weight": 600,
+            "maxLines": 1,
+            "trackingPx": 1.5
+          }
+        },
+        {
+          "key": "productName",
+          "phase": "main",
+          "position": {
+            "anchor": "lowerThird",
+            "align": "left",
+            "maxWidthPct": 0.9
+          },
+          "timing": {
+            "enterAtSec": 0.8,
+            "exitAtSec": null,
+            "enterDurationSec": 0.6
+          },
+          "transition": {
+            "type": "fade"
+          },
+          "treatment": {
+            "scrim": "none",
+            "shadow": "layered",
+            "casing": "none",
+            "fontRole": "heading",
+            "weight": 600,
+            "maxLines": 2,
+            "sizeScale": 1.2
+          }
+        },
+        {
+          "key": "rating",
+          "phase": "main",
+          "position": {
+            "anchor": "lowerThird",
+            "align": "left"
+          },
+          "timing": {
+            "enterAtSec": 1.1,
+            "exitAtSec": null,
+            "enterDurationSec": 0.5
+          },
+          "transition": {
+            "type": "fade"
+          },
+          "treatment": {
+            "scrim": "none",
+            "shadow": "soft",
+            "casing": "none",
+            "fontRole": "body",
+            "weight": 700,
+            "maxLines": 1,
+            "sizeScale": 1.25
+          }
+        },
+        {
+          "key": "deliveryLine",
+          "phase": "main",
+          "position": {
+            "anchor": "lowerThird",
+            "align": "left",
+            "row": "ctaRow"
+          },
+          "timing": {
+            "enterAtSec": 1.4,
+            "exitAtSec": null,
+            "enterDurationSec": 0.5
+          },
+          "transition": {
+            "type": "fade"
+          },
+          "treatment": {
+            "scrim": "none",
+            "shadow": "soft",
+            "casing": "none",
+            "fontRole": "body",
+            "weight": 600,
+            "maxLines": 1,
+            "sizeScale": 1.265
+          }
+        },
+        {
+          "key": "cta",
+          "phase": "main",
+          "position": {
+            "anchor": "lowerThird",
+            "align": "right",
+            "row": "ctaRow"
+          },
+          "timing": {
+            "enterAtSec": 1.4,
+            "exitAtSec": null,
+            "enterDurationSec": 0.5
+          },
+          "transition": {
+            "type": "fade"
+          },
+          "treatment": {
+            "scrim": "none",
+            "shadow": "soft",
+            "casing": "upper",
+            "fontRole": "body",
+            "weight": 800,
+            "maxLines": 1,
+            "colorToken": "ctaText",
+            "trackingPx": 1.2,
+            "sizeScale": 1.15
+          },
+          "visible": false
+        },
+        {
+          "key": "quote",
+          "phase": "main",
+          "position": {
+            "anchor": "lowerThird",
+            "align": "left",
+            "maxWidthPct": 0.9
+          },
+          "timing": {
+            "enterAtSec": 2,
+            "exitAtSec": null,
+            "enterDurationSec": 0.7
+          },
+          "transition": {
+            "type": "fade"
+          },
+          "treatment": {
+            "scrim": "none",
+            "shadow": "layered",
+            "casing": "none",
+            "fontRole": "quote",
+            "weight": 500,
+            "maxLines": 2,
+            "sizeScale": 1.15
+          }
+        },
+        {
+          "key": "reviewer",
+          "phase": "main",
+          "position": {
+            "anchor": "lowerThird",
+            "align": "left"
+          },
+          "timing": {
+            "enterAtSec": 2,
+            "exitAtSec": null,
+            "enterDurationSec": 0.7
+          },
+          "transition": {
+            "type": "fade"
+          },
+          "treatment": {
+            "scrim": "none",
+            "shadow": "soft",
+            "casing": "upper",
+            "fontRole": "body",
+            "weight": 500,
+            "maxLines": 1,
+            "colorToken": "textSecondary",
+            "trackingPx": 1.5
+          }
+        }
+      ]
+    },
+    "square": {
+      "version": 1,
+      "phases": [
+        {
+          "key": "main",
+          "startSec": 0,
+          "endSec": 8
+        }
+      ],
+      "stack": {
+        "rowGapPct": 0.02
+      },
+      "slots": [
+        {
+          "key": "brandPill",
+          "phase": "main",
+          "position": {
+            "anchor": "top",
+            "align": "center"
+          },
+          "timing": {
+            "enterAtSec": 0.3,
+            "exitAtSec": null,
+            "enterDurationSec": 0.5
+          },
+          "transition": {
+            "type": "fade"
+          },
+          "treatment": {
+            "scrim": "none",
+            "shadow": "soft",
+            "casing": "upper",
+            "fontRole": "body",
+            "weight": 600,
+            "maxLines": 1,
+            "trackingPx": 2.2
+          },
+          "visible": false,
+          "_note": "hidden 2026-08-04 (owner): Meta draws page name/avatar in its own chrome; in-creative wordmark is redundant double-branding. Flip visible:true per-brand if wanted."
+        },
+        {
+          "key": "badge",
+          "phase": "main",
+          "position": {
+            "anchor": "lowerThird",
+            "align": "left"
+          },
+          "timing": {
+            "enterAtSec": 0.5,
+            "exitAtSec": null,
+            "enterDurationSec": 0.5
+          },
+          "transition": {
+            "type": "fade"
+          },
+          "treatment": {
+            "scrim": "none",
+            "shadow": "soft",
+            "casing": "upper",
+            "fontRole": "body",
+            "weight": 600,
+            "maxLines": 1,
+            "trackingPx": 1.5
+          }
+        },
+        {
+          "key": "productName",
+          "phase": "main",
+          "position": {
+            "anchor": "lowerThird",
+            "align": "left",
+            "maxWidthPct": 0.9
+          },
+          "timing": {
+            "enterAtSec": 0.8,
+            "exitAtSec": null,
+            "enterDurationSec": 0.6
+          },
+          "transition": {
+            "type": "fade"
+          },
+          "treatment": {
+            "scrim": "none",
+            "shadow": "layered",
+            "casing": "none",
+            "fontRole": "heading",
+            "weight": 600,
+            "maxLines": 1,
+            "sizeScale": 1.2
+          }
+        },
+        {
+          "key": "rating",
+          "phase": "main",
+          "position": {
+            "anchor": "lowerThird",
+            "align": "left"
+          },
+          "timing": {
+            "enterAtSec": 1.1,
+            "exitAtSec": null,
+            "enterDurationSec": 0.5
+          },
+          "transition": {
+            "type": "fade"
+          },
+          "treatment": {
+            "scrim": "none",
+            "shadow": "soft",
+            "casing": "none",
+            "fontRole": "body",
+            "weight": 700,
+            "maxLines": 1,
+            "sizeScale": 1.25
+          }
+        },
+        {
+          "key": "deliveryLine",
+          "phase": "main",
+          "position": {
+            "anchor": "lowerThird",
+            "align": "left",
+            "row": "ctaRow"
+          },
+          "timing": {
+            "enterAtSec": 1.4,
+            "exitAtSec": null,
+            "enterDurationSec": 0.5
+          },
+          "transition": {
+            "type": "fade"
+          },
+          "treatment": {
+            "scrim": "none",
+            "shadow": "soft",
+            "casing": "none",
+            "fontRole": "body",
+            "weight": 600,
+            "maxLines": 1,
+            "sizeScale": 1.265
+          }
+        },
+        {
+          "key": "cta",
+          "phase": "main",
+          "position": {
+            "anchor": "lowerThird",
+            "align": "right",
+            "row": "ctaRow"
+          },
+          "timing": {
+            "enterAtSec": 1.4,
+            "exitAtSec": null,
+            "enterDurationSec": 0.5
+          },
+          "transition": {
+            "type": "fade"
+          },
+          "treatment": {
+            "scrim": "none",
+            "shadow": "soft",
+            "casing": "upper",
+            "fontRole": "body",
+            "weight": 800,
+            "maxLines": 1,
+            "colorToken": "ctaText",
+            "trackingPx": 1.2,
+            "sizeScale": 1.15
+          },
+          "visible": false
+        },
+        {
+          "key": "quote",
+          "phase": "main",
+          "position": {
+            "anchor": "lowerThird",
+            "align": "left",
+            "maxWidthPct": 0.9
+          },
+          "timing": {
+            "enterAtSec": 2,
+            "exitAtSec": null,
+            "enterDurationSec": 0.7
+          },
+          "transition": {
+            "type": "fade"
+          },
+          "treatment": {
+            "scrim": "none",
+            "shadow": "layered",
+            "casing": "none",
+            "fontRole": "quote",
+            "weight": 500,
+            "maxLines": 1,
+            "sizeScale": 1.15
+          }
+        },
+        {
+          "key": "reviewer",
+          "phase": "main",
+          "position": {
+            "anchor": "lowerThird",
+            "align": "left"
+          },
+          "timing": {
+            "enterAtSec": 2,
+            "exitAtSec": null,
+            "enterDurationSec": 0.7
+          },
+          "transition": {
+            "type": "fade"
+          },
+          "treatment": {
+            "scrim": "none",
+            "shadow": "soft",
+            "casing": "upper",
+            "fontRole": "body",
+            "weight": 500,
+            "maxLines": 1,
+            "colorToken": "textSecondary",
+            "trackingPx": 1.5
+          }
+        }
+      ]
+    },
+    "landscape": {
+      "version": 1,
+      "phases": [
+        {
+          "key": "main",
+          "startSec": 0,
+          "endSec": 8
+        }
+      ],
+      "stack": {
+        "rowGapPct": 0.024
+      },
+      "slots": [
+        {
+          "key": "brandPill",
+          "phase": "main",
+          "position": {
+            "anchor": "top",
+            "align": "left",
+            "maxWidthPct": 0.46
+          },
+          "timing": {
+            "enterAtSec": 0.3,
+            "exitAtSec": null,
+            "enterDurationSec": 0.5
+          },
+          "transition": {
+            "type": "fade"
+          },
+          "treatment": {
+            "scrim": "none",
+            "shadow": "soft",
+            "casing": "upper",
+            "fontRole": "body",
+            "weight": 600,
+            "maxLines": 1,
+            "trackingPx": 2.2
+          },
+          "visible": false,
+          "_note": "hidden 2026-08-04 (owner): Meta draws page name/avatar in its own chrome; in-creative wordmark is redundant double-branding. Flip visible:true per-brand if wanted."
+        },
+        {
+          "key": "badge",
+          "phase": "main",
+          "position": {
+            "anchor": "upperThird",
+            "align": "left",
+            "offsetY": 0.07,
+            "maxWidthPct": 0.46
+          },
+          "timing": {
+            "enterAtSec": 0.4,
+            "exitAtSec": null,
+            "enterDurationSec": 0.5
+          },
+          "transition": {
+            "type": "fade"
+          },
+          "treatment": {
+            "scrim": "none",
+            "shadow": "soft",
+            "casing": "upper",
+            "fontRole": "body",
+            "weight": 600,
+            "maxLines": 1,
+            "trackingPx": 1.5
+          }
+        },
+        {
+          "key": "productName",
+          "phase": "main",
+          "position": {
+            "anchor": "upperThird",
+            "align": "left",
+            "offsetY": 0.07,
+            "maxWidthPct": 0.46
+          },
+          "timing": {
+            "enterAtSec": 0.7,
+            "exitAtSec": null,
+            "enterDurationSec": 0.6
+          },
+          "transition": {
+            "type": "fade"
+          },
+          "treatment": {
+            "scrim": "none",
+            "shadow": "layered",
+            "casing": "none",
+            "fontRole": "heading",
+            "weight": 600,
+            "maxLines": 1,
+            "sizeScale": 1.2
+          }
+        },
+        {
+          "key": "rating",
+          "phase": "main",
+          "position": {
+            "anchor": "upperThird",
+            "align": "left",
+            "offsetY": 0.07,
+            "maxWidthPct": 0.46
+          },
+          "timing": {
+            "enterAtSec": 1,
+            "exitAtSec": null,
+            "enterDurationSec": 0.5
+          },
+          "transition": {
+            "type": "fade"
+          },
+          "treatment": {
+            "scrim": "none",
+            "shadow": "soft",
+            "casing": "none",
+            "fontRole": "body",
+            "weight": 700,
+            "maxLines": 1,
+            "sizeScale": 1.25
+          }
+        },
+        {
+          "key": "deliveryLine",
+          "phase": "main",
+          "position": {
+            "anchor": "lowerThird",
+            "align": "left",
+            "maxWidthPct": 0.46,
+            "row": "ctaRow"
+          },
+          "timing": {
+            "enterAtSec": 1.3,
+            "exitAtSec": null,
+            "enterDurationSec": 0.5
+          },
+          "transition": {
+            "type": "fade"
+          },
+          "treatment": {
+            "scrim": "none",
+            "shadow": "soft",
+            "casing": "none",
+            "fontRole": "body",
+            "weight": 600,
+            "maxLines": 1,
+            "sizeScale": 1.265
+          }
+        },
+        {
+          "key": "cta",
+          "phase": "main",
+          "position": {
+            "anchor": "lowerThird",
+            "align": "left",
+            "maxWidthPct": 0.46,
+            "row": "ctaRow"
+          },
+          "timing": {
+            "enterAtSec": 1.3,
+            "exitAtSec": null,
+            "enterDurationSec": 0.5
+          },
+          "transition": {
+            "type": "fade"
+          },
+          "treatment": {
+            "scrim": "none",
+            "shadow": "soft",
+            "casing": "upper",
+            "fontRole": "body",
+            "weight": 800,
+            "maxLines": 1,
+            "colorToken": "ctaText",
+            "trackingPx": 1.2,
+            "sizeScale": 1.15
+          },
+          "visible": true
+        },
+        {
+          "key": "quote",
+          "phase": "main",
+          "position": {
+            "anchor": "upperThird",
+            "align": "left",
+            "offsetY": 0.07,
+            "maxWidthPct": 0.46
+          },
+          "timing": {
+            "enterAtSec": 1.8,
+            "exitAtSec": null,
+            "enterDurationSec": 0.7
+          },
+          "transition": {
+            "type": "fade"
+          },
+          "treatment": {
+            "scrim": "none",
+            "shadow": "layered",
+            "casing": "none",
+            "fontRole": "quote",
+            "weight": 500,
+            "maxLines": 2,
+            "sizeScale": 1.15
+          }
+        },
+        {
+          "key": "reviewer",
+          "phase": "main",
+          "position": {
+            "anchor": "upperThird",
+            "align": "left",
+            "offsetY": 0.07,
+            "maxWidthPct": 0.46
+          },
+          "timing": {
+            "enterAtSec": 1.8,
+            "exitAtSec": null,
+            "enterDurationSec": 0.7
+          },
+          "transition": {
+            "type": "fade"
+          },
+          "treatment": {
+            "scrim": "none",
+            "shadow": "soft",
+            "casing": "upper",
+            "fontRole": "body",
+            "weight": 600,
+            "maxLines": 1,
+            "colorToken": "textSecondary",
+            "trackingPx": 1.5
+          }
+        }
+      ]
+    }
+  }
+}

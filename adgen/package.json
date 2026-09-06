@@ -1,0 +1,52 @@
+{
+  "name": "liquidretail_adgen",
+  "version": "0.0.1",
+  "private": true,
+  "description": "Ad-generation microservice — extracted from liquidretail_backend",
+  "main": "src/entrypoint.js",
+  "scripts": {
+    "start": "node src/entrypoint.js",
+    "dev": "node src/entrypoint.js",
+    "lint": "eslint .",
+    "test": "node scripts/runVerifySuite.js",
+    "setup:worktree": "node scripts/setupMergeDrivers.js",
+    "check:stranded-work": "node scripts/auditStrandedWork.js",
+    "cleanup:merged-branches": "node scripts/cleanupMergedBranches.js"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "devDependencies": {
+    "eslint": "^9.39.5"
+  },
+  "dependencies": {
+    "@google/generative-ai": "^0.21.0",
+    "@napi-rs/canvas": "^1.0.2",
+    "@remotion/animation-utils": "4.0.495",
+    "@remotion/bundler": "4.0.495",
+    "@remotion/fonts": "4.0.495",
+    "@remotion/google-fonts": "4.0.495",
+    "@remotion/layout-utils": "4.0.495",
+    "@remotion/media": "4.0.495",
+    "@remotion/media-parser": "4.0.495",
+    "@remotion/motion-blur": "4.0.495",
+    "@remotion/noise": "4.0.495",
+    "@remotion/paths": "4.0.495",
+    "@remotion/renderer": "4.0.495",
+    "@remotion/transitions": "4.0.495",
+    "axios": "^1.18.1",
+    "cloudinary": "^2.7.0",
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2",
+    "ffmpeg-static": "^5.3.0",
+    "json5": "^2.2.3",
+    "mongoose": "^8.5.1",
+    "openai": "^5.10.2",
+    "puppeteer": "^24.43.0",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "remotion": "4.0.495",
+    "sharp": "^0.33.5",
+    "streamifier": "^0.1.1"
+  }
+}

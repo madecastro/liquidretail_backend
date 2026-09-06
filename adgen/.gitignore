@@ -1,0 +1,42 @@
+node_modules/
+.env
+.env.local
+*.log
+.DS_Store
+dist/
+.claude/*
+# Committed hook wiring for the stranded-work audit (see CLAUDE.md's
+# "Stranded-work tooling" section) — un-ignore just these two paths.
+# settings.local.json (per-developer overrides) and .claude/worktrees
+# (Claude Code's own scratch worktrees) stay ignored via the .claude/*
+# blanket rule above.
+!.claude/settings.json
+!.claude/hooks/
+# Skills are shared, load-bearing docs (mirrors liquidretail_backend, which
+# tracks .claude/skills/ with no ignore rule at all) — un-ignored so
+# .claude/skills/rpd-experiments/ (added 2026-09-04 alongside scripts/rpd/)
+# actually reaches every clone instead of existing only in whichever
+# checkout happened to write it locally.
+!.claude/skills/
+.codegraph/
+.codemap/
+# Remotion webpack bundle — built at Docker build time by
+# scripts/prebuildRemotionBundle.js. Local runs are for smoke-testing
+# only and should never commit their output.
+.remotion-bundle/
+# Build-time browser prewarm hint — written by scripts/ensureRemotionBrowser.js.
+# Not consumed by the Dockerfile (the ENV there is a literal, checked against
+# this by scripts/verifyRemotionBrowserPrewarm.js) or by runtime; local-only.
+.remotion-browser-path
+probe-results/
+# scripts/renderTitlePreview.js default output dir — local debug PNGs/MP4s,
+# never committed (same pattern as probe-results/ above).
+title-preview-output/
+# scripts/rpd/ run output (manifests, downloaded media, gallery builds) —
+# local/experimental, never committed (same pattern as probe-results/ above).
+rpd-runs/
+# fontResolverService.js's FONT_CACHE_DIR — webfonts it downloads on demand
+# (e.g. a brand's titleStylePreset font) and caches locally. Runtime cache,
+# not source; the sibling assets/fonts/ directory of committed .ttf files is
+# unaffected (same pattern as probe-results/ / rpd-runs/ above).
+src/services/brandScripts/assets/webfonts/

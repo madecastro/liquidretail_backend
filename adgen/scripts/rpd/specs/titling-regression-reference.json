@@ -1,0 +1,18 @@
+{
+  "name": "titling-regression-reference",
+  "notes": "TEMPLATE, not a ready-to-run spec. Fill in seed.productId with a real hard-logo/label product (needs MONGODB_URI) and keep using the SAME product across comparisons over time — see .claude/skills/rpd-experiments/references/titling-regression.md for what to actually check. This spec is deliberately NOT wired into the nightly loop; running it is a manual/on-demand check unless someone later decides to automate it (see that same doc's last section).",
+  "seed": {
+    "productId": "REPLACE_ME_WITH_A_REAL_CATALOG_PRODUCT_ID"
+  },
+  "durationSec": 8,
+  "resolution": "1080p",
+  "models": ["gemini-omni-1.1-flash"],
+  "variants": [
+    { "id": "baseline" }
+  ],
+  "titling": {
+    "enabled": true,
+    "preset": "canonical",
+    "platformFormat": "meta_stories_9_16"
+  }
+}

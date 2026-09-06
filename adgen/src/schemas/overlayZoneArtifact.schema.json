@@ -1,0 +1,107 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://liquidretail.internal/schemas/overlayZoneArtifact-v3.json",
+  "title": "Overlay Zone Artifact",
+  "description": "Output of the layout-preprocessing stage of the liquidretail detect pipeline. One document per DetectRun (see `mediaId` + `runId` fields) consumed by downstream ad-layout generators.",
+  "type": "object",
+  "required": ["zones"],
+  "properties": {
+    "_id":       { "type": "string", "description": "MongoDB ObjectId" },
+    "mediaId":   { "type": "string", "description": "MongoDB ObjectId of the Media this artifact describes" },
+    "runId":     { "type": "string", "description": "MongoDB ObjectId of the DetectRun that produced it" },
+    "createdAt": { "type": "string", "format": "date-time" },
+    "zones": {
+      "type": "object",
+      "description": "Map of aspect-ratio label to array of variant analyses. Ratio labels are human-readable (e.g. '5:4', '1:1', '4:5', '9:16', '1.91:1'). Each ratio holds one or more variants — a 'base' variant is a crop of the source image chosen by the judge; other variants pair with an AI provider (e.g. provider='gemini', variant='extension').",
+      "additionalProperties": {
+        "type": "array",
+        "items": { "$ref": "#/$defs/variantEntry" }
+      }
+    }
+  },
+  "$defs": {
+    "variantEntry": {
+      "type": "object",
+      "required": ["provider", "variant", "candidateId", "imageUrl", "analysis"],
+      "properties": {
+        "provider":    { "type": ["string", "null"], "description": "AI provider that produced this image, or null for a 'base' variant (source-image crop)." },
+        "variant":     { "type": "string", "description": "Variant name. 'base' = judge-picked crop. For AI variants, examples: 'extension' (outpaint), 'generation' (fresh background)." },
+        "candidateId": { "type": "string", "description": "Stable id for this candidate within the run (e.g. '9:16-ext-gemini')." },
+        "imageUrl":    { "type": "string", "format": "uri", "description": "Cloudinary URL of the image analyzed." },
+        "analysis": {
+          "oneOf": [
+            { "$ref": "#/$defs/analysis" },
+            { "type": "null", "description": "null when analysis failed for this image (non-fatal; other variants on the same run can still be populated)." }
+          ]
+        }
+      }
+    },
+    "analysis": {
+      "type": "object",
+      "required": ["schemaVersion", "restrictions"],
+      "properties": {
+        "schemaVersion":         { "type": "string", "description": "SemVer-ish. Consumers should refuse or warn on unknown majors.", "pattern": "^\\d+\\.\\d+$" },
+        "imageWidth":            { "type": ["integer", "null"], "minimum": 1, "description": "Pixel width of the analyzed image. Null if probing failed." },
+        "imageHeight":           { "type": ["integer", "null"], "minimum": 1, "description": "Pixel height of the analyzed image." },
+        "primarySubjectRectPct": {
+          "description": "Top-level pointer at the hard-rule product rect. Always derivable from restrictions[] but lifted here to save every consumer from writing the same filter. Null if no product-classification restriction was emitted.",
+          "oneOf": [ { "$ref": "#/$defs/rectPct" }, { "type": "null" } ]
+        },
+        "densityGrid":    { "$ref": "#/$defs/grid", "description": "Gemini-emitted visual busy-ness heatmap. 0 = empty/uniform, 1 = busy/subject." },
+        "brightnessGrid": { "$ref": "#/$defs/grid", "description": "Server-computed luminance per cell at matching dimensions. 0 = black, 1 = white. Used to pick overlay text color." },
+        "restrictions": {
+          "type": "array",
+          "description": "Regions overlays must avoid. A restriction is 'active' at conservation level S iff strictness >= (1 - S). The hard rule is that classification='product' has strictness=1.0 and is always active.",
+          "items": { "$ref": "#/$defs/restriction" }
+        }
+      }
+    },
+    "restriction": {
+      "type": "object",
+      "required": ["id", "rectPct", "classification", "strictness", "reason"],
+      "properties": {
+        "id":             { "type": "string", "description": "Stable id within the analysis (e.g. 'r1')." },
+        "rectPct":        { "$ref": "#/$defs/rectPct" },
+        "classification": {
+          "type": "string",
+          "enum": ["product", "face", "secondary_subject", "text", "object", "other"],
+          "description": "Kind of region. Drives default strictness band."
+        },
+        "strictness": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1,
+          "description": "1.0 = always excluded. Default bands: product=1.0, face=0.9, secondary_subject=0.6-0.8, text=0.4-0.6, object=0.2-0.3."
+        },
+        "reason": { "type": "string", "description": "Short sentence explaining what's in the rect." }
+      }
+    },
+    "rectPct": {
+      "type": "object",
+      "description": "Rectangle in normalized [0,1] coordinates. (0,0) = top-left, (1,1) = bottom-right. x2 > x1 and y2 > y1.",
+      "required": ["x1", "y1", "x2", "y2"],
+      "properties": {
+        "x1": { "type": "number", "minimum": 0, "maximum": 1 },
+        "y1": { "type": "number", "minimum": 0, "maximum": 1 },
+        "x2": { "type": "number", "minimum": 0, "maximum": 1 },
+        "y2": { "type": "number", "minimum": 0, "maximum": 1 }
+      }
+    },
+    "grid": {
+      "type": "object",
+      "required": ["cols", "rows", "cells"],
+      "properties": {
+        "cols":  { "type": "integer", "minimum": 0 },
+        "rows":  { "type": "integer", "minimum": 0 },
+        "cells": {
+          "type": "array",
+          "description": "2D array [rows][cols] of numbers in [0,1].",
+          "items": {
+            "type": "array",
+            "items": { "type": "number", "minimum": 0, "maximum": 1 }
+          }
+        }
+      }
+    }
+  }
+}
