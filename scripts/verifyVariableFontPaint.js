@@ -96,6 +96,11 @@ async function paintWithPuppeteer(buf, chrome) {
   try {
     const page = await browser.newPage();
     await page.setViewport({ width: 900, height: 260, deviceScaleFactor: 1 });
+    /* global FontFace, document */
+    // The callback below is stringified by Puppeteer and executed inside the
+    // headless Chrome page, not this Node process — FontFace/document are
+    // real globals THERE, not here. ESLint's no-undef can't see across that
+    // boundary, hence the directive above (narrowly scoped to this function).
     return await page.evaluate(async (dataUrl) => {
       async function render(cssWeight, family) {
         const face = new FontFace(family, `url(${JSON.stringify(dataUrl)})`, {
