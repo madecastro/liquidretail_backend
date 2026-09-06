@@ -193,6 +193,17 @@ async function processQueue(products, { onDone = null, isCancelled = null, worke
   const runOne = worker || _workerOverride || detectYoloForOne;
   let next = 0, inflight = 0, processed = 0, stopped = false;
   let abortReason = null;
+  // Tracked independently of `abortReason` so `cancelled` and `aborted` can
+  // both be true at once: a cancelled run whose OWN work also hit a real
+  // circuit-open (recorded via this run's own transient outcomes, below)
+  // still deserves the backoff/paging that `aborted` drives, and still
+  // deserves an honest `cancelled:true` alongside it. NOT airtight: if the
+  // isCancelled check (below, in .finally) runs AFTER `stopped` has already
+  // been set true by a circuit-related stop, the cancel is never recorded
+  // and `cancelled` reads false for that run — same as the pre-fix
+  // behaviour, and inconsequential downstream since
+  // runYoloDetectionOnTargets checks `aborted` first regardless.
+  let cancelRequested = false;
   await new Promise((resolve) => {
     // The resolve check runs AFTER the while loop (not as an early-return
     // guard before it) so that a `break` taken on the loop's very first
@@ -232,19 +243,78 @@ async function processQueue(products, { onDone = null, isCancelled = null, worke
           })
           .then((result) => {
             outcome = result;
-            if (result && result.aborted) return result;
+            if (result && result.aborted) {
+              // This product was refused at the front door (acquired its
+              // semaphore slot only to find the breaker already open) —
+              // that is an in-band, this-run stop just as much as a
+              // transient-failure trip is, and it must stamp abortReason
+              // for the same reason: if EVERY product in the run takes
+              // this path (all parked as waiters when the breaker opened,
+              // none ever actually ran), nothing else in this function
+              // would ever set abortReason, and the run would silently
+              // report a false SUCCESS with zero detections — clearing
+              // any earned backoff and firing the paid post-detect
+              // rematch against a catalog that was never actually
+              // scanned. Confirmed reachable: worker.js's yoloBackfillTick
+              // records its own outcome (and can trip the breaker) BEFORE
+              // releasing its semaphore slot, so a sibling chain's whole
+              // target set can be sitting in yoloLoadLimiter's waiters
+              // queue when that happens.
+              // Unconditional (no `!abortReason` guard) for the same reason
+              // the transient branch below is unconditional: a genuine
+              // in-band stop must win over an already-stamped 'cancelled'.
+              stopped = true;
+              abortReason = 'yolo-circuit-open';
+              return result;
+            }
             if (result && result.transient) {
-              yoloLoadLimiter.recordOutcome({
+              // Read the breaker's own verdict on THIS call, rather than
+              // independently re-polling isOpen() afterward (see why that
+              // second read is unsafe, below). `opened` is true exactly
+              // when THIS product's own transient outcome pushed the
+              // shared counter over threshold, OR the breaker was already
+              // open for any reason at the moment this genuinely-failed
+              // outcome was recorded — either way, THIS run's own work
+              // really did fail, so treating the breaker's current state
+              // as in-band here is legitimate.
+              const { opened } = yoloLoadLimiter.recordOutcome({
                 transient: true,
                 brandId,
                 remaining: Math.max(0, products.length - next)
               });
+              if (opened) {
+                // Unconditional overwrite (no `!abortReason` guard): this
+                // run's own genuine failure + a real circuit-open must win
+                // over an already-stamped 'cancelled'. runYoloDetectionOnTargets
+                // downstream checks `aborted` BEFORE `cancelled` for exactly
+                // this reason — a real circuit-open is money-relevant
+                // (backoff/paging) and cancelled is not, so aborted must
+                // never lose that race by being blocked from overwriting.
+                // The `cancelled` field (tracked independently via
+                // `cancelRequested`, above) is what still tells an operator
+                // a cancel ALSO happened.
+                stopped = true;
+                abortReason = 'yolo-circuit-open';
+              }
             } else if (result) {
               yoloLoadLimiter.recordOutcome({ transient: false });
-            }
-            if (yoloLoadLimiter.isOpen()) {
-              stopped = true;
-              abortReason = 'yolo-circuit-open';
+              // Deliberately NO isOpen() re-check here. A clean success
+              // carries zero information suggesting THIS run should abort
+              // — independently re-polling the shared, process-wide breaker
+              // after an outcome that had nothing to do with it is exactly
+              // the false-positive class this whole fix exists to close,
+              // just moved from processQueue's return statement into this
+              // handler (confirmed by adversarial review: a 100%-successful
+              // run whose completions merely happen to overlap an UNRELATED
+              // chain's trip — before, not after, the run's own last
+              // completion — reproduced the identical {aborted:true,
+              // abortReason:null-turned-'yolo-circuit-open'} false positive
+              // in 231/900 randomized trials). The pump loop's own
+              // top-of-loop isOpen() check (above) is the correct, separate
+              // mechanism for halting DISPATCH of any still-undispatched
+              // work if the breaker is or becomes open — that is legitimate
+              // self-protection for real remaining work, and this change
+              // does not touch it.
             }
             return result;
           })
@@ -253,7 +323,7 @@ async function processQueue(products, { onDone = null, isCancelled = null, worke
             // Aborted/skipped-due-to-breaker-open must NOT count as detected.
             if (!(outcome && outcome.aborted)) processed++;
             if (onDone) { try { await onDone(processed, products.length); } catch { /* ignore */ } }
-            if (isCancelled && !stopped) { try { if (await isCancelled()) { stopped = true; abortReason = abortReason || 'cancelled'; } } catch { /* ignore */ } }
+            if (isCancelled && !stopped) { try { if (await isCancelled()) { stopped = true; cancelRequested = true; if (!abortReason) abortReason = 'cancelled'; } } catch { /* ignore */ } }
             pump();
           });
       }
@@ -263,8 +333,22 @@ async function processQueue(products, { onDone = null, isCancelled = null, worke
   });
   return {
     processed,
-    cancelled: abortReason === 'cancelled',
-    aborted: abortReason === 'yolo-circuit-open' || yoloLoadLimiter.isOpen(),
+    // Independent of abortReason on purpose — see cancelRequested's own
+    // comment above. A cancel that's later joined by a real circuit-open
+    // must still read cancelled:true, even though abortReason has by then
+    // moved to 'yolo-circuit-open' for the (separate) aborted determination.
+    cancelled: cancelRequested,
+    // Depend ONLY on this run's own in-band abortReason — NOT a fresh
+    // re-check of the process-wide breaker. yoloLoadLimiter is shared by
+    // every concurrent catalog-YOLO chain (worker.js's yoloBackfillTick
+    // included), so re-sampling isOpen() here means an unrelated chain
+    // tripping the breaker at the exact moment THIS run's own products all
+    // finished successfully would mislabel a clean run as aborted, with an
+    // internally-incoherent abortReason:null alongside it. abortReason is
+    // already stamped in-band, above, whenever THIS run's own work
+    // (breaker-open-at-entry, or this run's own transient outcomes tripping
+    // it) is what caused the stop.
+    aborted: abortReason === 'yolo-circuit-open',
     abortReason
   };
 }
@@ -365,7 +449,17 @@ async function runYoloDetectionOnTargets(targets, {
 
   const durationMs = Date.now() - t0;
   const remaining = Math.max(0, targets.length - processed);
-  if (aborted || yoloLoadLimiter.isOpen()) {
+  // Same rule as processQueue's own return above: trust the in-band
+  // `aborted` flag processQueue already derived from ITS abortReason, don't
+  // re-sample the shared process-wide breaker here. Before this fix, this
+  // line reintroduced the exact same false-abort race one call-frame up —
+  // even a properly-scoped `aborted` from processQueue would be overridden
+  // back to true by a coincident unrelated chain via `yoloLoadLimiter.isOpen()`
+  // — which is what actually produces the {ok:false, reason:'yolo-circuit-open'}
+  // translation that drives applyBackoff/Slack paging in
+  // catalogPostSyncOrchestrator. Fixing only processQueue's return value
+  // without this line would have left the reported bug live.
+  if (aborted) {
     console.log(
       `🛑 catalogYoloDetection[brand=${brandId}]: circuit open after ` +
       `${yoloLoadLimiter.consecutiveTransientNow()} consecutive transient batches ` +
