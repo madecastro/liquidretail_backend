@@ -293,7 +293,7 @@ console.log('\nE. campaignRunId threading to the charge-point CostLog writes');
 
   check('E3 routes/ads.js passes campaignRunId: run.runId into veoGenerateForAd', () => {
     assert.ok(
-      /veoGenerateForAd\(\{\s*ad,\s*storyboard,\s*campaignRunId:\s*run\.runId\s*\}\)/.test(adsSrc),
+      /veoGenerateForAd\(\{\s*ad,\s*storyboard,\s*campaignRunId:\s*run\.runId,\s*allowResume:\s*true\s*\}\)/.test(adsSrc),
       'the master-video call site does not thread run.runId through as campaignRunId'
     );
   });

@@ -378,7 +378,45 @@ function lifestyleIntentFromTemplate(template) {
 const BASE_URL     = process.env.ATLAS_BASE_URL || 'https://api.atlascloud.ai/api/v1';
 const BUILT_IN_DEFAULT_MODEL = 'google/gemini-omni-flash/image-to-video-developer';
 const POLL_INTERVAL = parseInt(process.env.ATLAS_POLL_INTERVAL_MS, 10) || 5000;
-const MAX_POLL_MS   = parseInt(process.env.ATLAS_TIMEOUT_MS, 10)       || 600000; // 10 min
+// POLL CEILING — SIZED FROM THE MEASURED PROVIDER LATENCY DISTRIBUTION,
+// raised 600000 -> 900000 on 2026-08-27 (adgen PR #82; ported here 2026-09-04).
+//
+// The old 10-minute value was not derived from anything. Characterised properly
+// (n=68 delivered videos, at FIXED parameters — production is 100% 1080p and
+// 100% exactly 10.000s, so neither resolution nor duration is a variable):
+//
+//     mean 229.7s   sd 124.5s   range 120-760s   CV 54%
+//
+// The variance is PROVIDER-SIDE, not self-inflicted. Three pairs submitted ~1s
+// apart with byte-identical reference stacks returned 465.9 vs 145.5, 760.3 vs
+// 205.9, and 456.0 vs 171.2 — up to 3.7x apart on identical inputs in the same
+// second. Correlation between submit-burst size and latency is 0.02-0.06, so
+// our own concurrency is ruled out.
+//
+// Against that distribution 600s sat at mean + 2.97sd — a fitted-lognormal
+// p98.4, i.e. roughly 1 in 60 masters abandoned mid-flight — and the OBSERVED
+// MAXIMUM (760.3s) was already beyond it. That is a mis-sized ceiling, not a
+// pathological provider, so raising it is the correct fix rather than a
+// workaround.
+//
+// 900s = mean + 5.4sd, a fitted p99.84, and 1.18x the observed maximum.
+//
+// WHY NOT HIGHER. Beyond this the right mechanism is no longer a longer
+// BLOCKING poll — it is the spend receipt. pollPrediction's
+// resolveTimeoutOutcome + bootRecoveryService's free GET collect a late
+// completion for $0 without occupying a VEO_CONCURRENCY slot. Each extra
+// minute of ceiling therefore buys progressively less while costing real
+// concurrency. This moves the longest legitimate flight from ~15-17 min to
+// ~20-22 min (poll budget + backoffs + download + Cloudinary mirror).
+//
+// ⚠️ THE REFRAME LEASE IS NOT DERIVED FROM THIS CONSTANT. It used to be
+// `MAX_POLL_MS + 10 min`, and that arithmetic link was the defect: adgen
+// raising this ceiling widened ITS stale-claim line and not this repo's,
+// over a claim they share on the Media document. REFRAME_CLAIM_TTL_FLOOR_MS
+// above is now an independent 20 min floor that does not read MAX_POLL_MS
+// at all. Raising this ceiling does NOT widen the reframe billing-claim
+// lease. Pinned by scripts/verifyReframeHoldBounded.js B6.
+const MAX_POLL_MS   = parseInt(process.env.ATLAS_TIMEOUT_MS, 10)       || 900000; // 15 min
 
 // ── Reframe poll ceiling — DELIBERATELY NOT MAX_POLL_MS ──────────────────
 //
@@ -3644,7 +3682,7 @@ function pacedModelSubmit(model, fn) {
 /**
  * SINGLE-SHOT prediction status check. Free — a GET, never a submit.
  *
- * pollPrediction blocks up to MAX_POLL_MS (10 min), which is right inside a
+ * pollPrediction blocks up to MAX_POLL_MS (15 min), which is right inside a
  * render and wrong at boot: recovery must not hold startup open, and an ad that
  * is still processing simply gets checked again on the next sweep.
  *
@@ -3750,6 +3788,120 @@ function mayRetryAfterFailure({ policyRetryable, chargeConfirmed, attempt, maxAt
   return policyRetryable === true
     && chargeConfirmed === false
     && Number(attempt) < Number(maxAttempts || 1);
+}
+
+/**
+ * MAY WE SKIP THE SUBMIT AND RESUME INSTEAD? Isolated from the render flow
+ * for the same reason mayRetryAfterFailure is: this one boolean is the
+ * difference between collecting a paid master for free and double-billing it.
+ *
+ * WHY generateForAd NEEDS THIS AT ALL. generateForAd used to submit
+ * unconditionally on every call, with no check of an existing
+ * ad.veoPredictionId. That is fine the FIRST time an ad is rendered, but it
+ * means re-entering generateForAd on an ad that already holds a receipt —
+ * because its claim was released while status stayed 'rendering' — submits
+ * AGAIN and pays twice for one video. NOT a SIGKILL/OOM story: an
+ * ungracefully killed worker leaves the in-flight status SET (nothing runs
+ * to clear it), and the graceful shutdown drain deliberately EXCLUDES
+ * receipt-holding ads from its requeue (services/spendReceipt.js
+ * receiptFree() filter) for exactly this reason — so neither path re-exposes
+ * a receipt-holding claim today. The live path is the unsettledAtTimeout
+ * branch (routes/ads.js on this repo's in-process fallback; adgen's
+ * renderer.js on the live path) leaving status:'rendering' so a later
+ * re-entry can pick this ad back up; a future claim-TTL sweeper would be
+ * the same shape.
+ * atlasVideoService already has a resume primitive
+ * (resumeForAd/peekPrediction) but it is a ONE-SHOT peek built for the
+ * out-of-band bootRecoveryService sweep, not a drop-in replacement for a
+ * submit: it does not poll a still-running job to completion, does not
+ * Cloudinary-mirror the result, and returns a shape no caller of
+ * generateForAd understands. Wiring resume in here instead means: on the
+ * FIRST attempt only, if a receipt already exists, skip submitGeneration()
+ * and hand the EXISTING predictionId to the SAME pollPrediction() call the
+ * fresh-submit path already uses — every downstream step (retry-on-failure,
+ * cost reconcile, download, Cloudinary mirror, the return shape) then runs
+ * completely unchanged, because none of it cares whether predictionId came
+ * from a fresh submit or an existing receipt.
+ *
+ * ALL THREE must hold:
+ *   allowResume === true         the CALLER's own choice. Default true for
+ *                                the normal render path (routes/ads.js
+ *                                in-process fallback; live production is
+ *                                adgen's renderer); an explicit false at
+ *                                adRegenerateService.js, because a
+ *                                regenerate is an OPERATOR-REQUESTED new
+ *                                video on the same Ad doc, which never
+ *                                clears the previous veoPredictionId — a
+ *                                blind resume there would silently serve
+ *                                the OLD video back instead of the new one
+ *                                asked for and would look like the
+ *                                regenerate never ran. This is a real
+ *                                behavioural bug an adversarial pass found
+ *                                in the naive version of this fix, not a
+ *                                hypothetical.
+ *   attempt === 1                a receipt can only mean "the FIRST attempt
+ *                                of THIS call already ran and something
+ *                                crashed after it, before this call
+ *                                returned" — every later attempt (2+) is this
+ *                                SAME call's own retry loop, which has
+ *                                already decided via mayRetryAfterFailure
+ *                                that the prior attempt's charge was
+ *                                confirmed-unbilled, so it must submit fresh
+ *                                exactly as it always has. Scoping to
+ *                                attempt===1 is what keeps this change from
+ *                                touching the retry loop's existing,
+ *                                separately-verified money gate at all.
+ *   existingPredictionId truthy  nothing to resume otherwise — Ad.veoPredictionId
+ *                                defaults to null (models/Ad.js), so this is
+ *                                the ordinary "first-ever render" case.
+ *
+ * ONE ACCEPTED, PRE-EXISTING GAP, not introduced or widened here:
+ * services/spendReceipt.js already documents that the window between a
+ * submit returning and the veoPredictionId $set landing is genuinely
+ * unrecoverable without a pre-submit intent record — a crash in that exact
+ * window leaves the Ad pointing at the PREVIOUS attempt's id (or none), and
+ * resuming from that stale id cannot see the truly in-flight, already-billed
+ * new one. That gap is documented there as irreducible and is unchanged by
+ * this function; it is not something a resume check can close.
+ *
+ * WHAT HAPPENS IF THE RESUMED RECEIPT NO LONGER RESOLVES — traced against
+ * pollPrediction's real branches, not assumed, because "reuse a dead
+ * receipt and silently report success" would be worse than a fresh submit:
+ *   - Atlas HAS a settled record and it is a real failure: pollPrediction
+ *     throws via buildClassifiedFailureError with Atlas's OWN confirmed
+ *     charge/retryable fields — mayRetryAfterFailure then decides
+ *     retry-or-give-up exactly as it would for a fresh submission's own
+ *     failure. Cannot fabricate success; cannot double-bill.
+ *   - Atlas can no longer resolve the id at all (purged/expired/bad id,
+ *     a 4xx on the GET): pollPrediction's own "4xx is a hard failure"
+ *     branch throws a BARE, deliberately unclassified Error — no
+ *     chargeConfirmed/policyRetryable at all. mayRetryAfterFailure reads
+ *     policyRetryable !== true and refuses to retry; generateForAd throws
+ *     and the caller marks the ad failed. A disclosed failure, never a
+ *     silent success, and never a resubmit.
+ *   - still genuinely processing: polled exactly like a fresh submission,
+ *     same MAX_POLL_MS budget; if still unsettled at the deadline, the
+ *     existing final-peek logic either confirms a real completion or
+ *     throws with policyRetryable deliberately undefined (its own doc
+ *     comment: "mayRetryAfterFailure already refuses to resubmit this
+ *     shape") — same fail-closed outcome as the line above.
+ * In every branch, pollPrediction's success path requires a real settled
+ * record with a real output URL — a dead receipt structurally cannot
+ * produce one, so there is no route from "the receipt no longer resolves"
+ * to "generateForAd reports success anyway."
+ */
+function shouldResumeAttempt({ allowResume, attempt, existingPredictionId }) {
+  // Strict, not Number(attempt) === 1 — unlike mayRetryAfterFailure's
+  // Number() coercion on a policy-supplied maxAttempts, this attempt value
+  // always originates from generateForAd's own `for (let attempt = 1; ;
+  // attempt++)` loop variable, a real number by construction. There is no
+  // legitimate caller that would ever pass a numeric string here, so failing
+  // closed on one (rather than silently coercing) is the safer choice for a
+  // gate that decides whether to spend real money.
+  return allowResume === true
+    && attempt === 1
+    && typeof existingPredictionId === 'string'
+    && existingPredictionId.length > 0;
 }
 
 /**
@@ -4683,7 +4835,13 @@ async function generateForAd({
   // life; the caller knows which one is spending money right now). Passed
   // straight through to the charge-point CostLog row so spend is
   // attributable per run instead of reconstructed from a time window.
-  campaignRunId = null
+  campaignRunId = null,
+  // See shouldResumeAttempt's doc comment for the full reasoning. Default
+  // true is the SAFE default for the normal render path — a caller that
+  // genuinely wants a fresh submit regardless of any existing receipt
+  // (adRegenerateService.js: an operator explicitly asked for a new video)
+  // must say so explicitly.
+  allowResume = true
 }) {
   if (!enabled()) return { skipped: true, reason: 'VIDEO_PROVIDER != atlas or ATLAS_API_KEY missing' };
 
@@ -4998,67 +5156,86 @@ async function generateForAd({
   // moderationBlocked is `action:'give-up'`, so `policyRetryable` is false and
   // the same prompt is never resubmitted to be blocked a second time.
   for (let attempt = 1; ; attempt++) {
-    const submitT0 = Date.now();
-    // Fire-and-forget stage: never awaited on this billable path.
-    adStage(ad._id, `master video submit (${aspectRatio})${attempt > 1 ? ` — retry ${attempt - 1}` : ''}`);
-    predictionId = await submitGeneration({ model, prompt, imageUrls, aspectRatio, caps, videoClipUrl, durationSec });
-    const submitMs = Date.now() - submitT0;
-    console.log(`🎬 atlasVideo[ad=${ad._id}]: prediction=${predictionId} polling...`);
+    const isResuming = shouldResumeAttempt({
+      allowResume, attempt, existingPredictionId: ad.veoPredictionId
+    });
 
-    // ── CHARGE POINT ──────────────────────────────────────────────────────────
-    // The submit returned an id, so the provider has accepted a billable job. Money is
-    // committed HERE, whatever happens to the poll, the download, or the Cloudinary
-    // mirror. Both writes below therefore happen now rather than at the end:
-    //
-    //   1. veoPredictionId — the spend receipt. Without it a crash mid-poll loses the
-    //      only handle to work we have paid for, and the reaper re-queues the ad into a
-    //      second submit. See models/Ad.js for the full reasoning.
-    //   2. the CostLog row — previously written only after poll + download + upload
-    //      succeeded, so a timeout or a failed upload spent ~$1.00 and recorded $0.
-    //
-    // ONE row per billable submit, deliberately. Outcome lives on the Ad (status,
-    // renderUrl); CostLog records SPEND, and spend happened. The trade-off is that
-    // durationMs here is submit latency rather than end-to-end render time — the full
-    // elapsed time is logged on completion below instead of creating a second row that
-    // would double-count the charge.
-    //
-    // Both are non-fatal: a telemetry or bookkeeping failure must never fail a
-    // generation post-payment, because the caller would then never store videoUrl and a
-    // retry would double-bill.
-    try {
-      await Ad.updateOne({ _id: ad._id }, { $set: { veoPredictionId: predictionId, updatedAt: new Date() } });
-    } catch (err) {
-      console.warn(`   ⚠️  atlasVideo: could not persist veoPredictionId=${predictionId} (${err.message}) — orphan would be unreconcilable`);
-    }
-    try {
-      await recordFlatCost({
-        stage:      'atlas_video_render',
-        provider:   'atlas',
-        model,
-        // THE KEY THAT MAKES THIS ROW CORRECTABLE. Without it, the retry path's
-        // finalizeFlatCost({providerRequestId}) matches nothing, falls back to
-        // an INSERT, and the failed attempt's ~$0.75 estimate survives beside
-        // the retry's — $1.50 booked for one delivered video. It also lets
-        // reconcileCost swap the estimate for Atlas's confirmed price later.
-        providerRequestId: predictionId,
-        purposeTag: caps.paramShape,
-        brandId:    media.brandId || null,
-        campaignId: ad.campaignId || null,
-        // Set at INSERT time only. finalizeFlatCost/reconcileCost below and in
-        // bootRecoveryService all UPDATE this same row keyed on
-        // providerRequestId, so campaignRunId does not need repeating there —
-        // it would be a no-op ($set only overwrites fields it's given, and none
-        // of those call sites pass this one).
-        campaignRunId: campaignRunId || null,
-        adId:       ad._id || null,
-        mediaId:    media._id || null,
-        productId:  ad.productId || null,
-        costUsd:    costUsd || 0,
-        durationMs: submitMs,
-        status:     'submitted'
-      });
-    } catch (err) {
-      console.warn(`   ⚠️  atlasVideo: charge-point cost record failed (${err.message}) — spend of ~$${(costUsd ?? 0).toFixed(2)} is UNLEDGERED`);
+    if (isResuming) {
+      // RESUME, NOT SUBMIT. See shouldResumeAttempt's doc comment for the
+      // full reasoning. predictionId is already on the Ad doc from a PRIOR
+      // call that crashed after paying — reuse it and go straight to the
+      // SAME poll this loop always uses. No submitGeneration(), no new
+      // veoPredictionId $set (it is already correct), no new "submitted"
+      // CostLog row (the original submit's row already exists and would be
+      // duplicated).
+      predictionId = ad.veoPredictionId;
+      console.log(
+        `🎬 atlasVideo[ad=${ad._id}]: RESUMING existing prediction=${predictionId} — ` +
+        'receipt already on the Ad doc, not submitting again'
+      );
+    } else {
+      const submitT0 = Date.now();
+      // Fire-and-forget stage: never awaited on this billable path.
+      adStage(ad._id, `master video submit (${aspectRatio})${attempt > 1 ? ` — retry ${attempt - 1}` : ''}`);
+      predictionId = await submitGeneration({ model, prompt, imageUrls, aspectRatio, caps, videoClipUrl, durationSec });
+      const submitMs = Date.now() - submitT0;
+      console.log(`🎬 atlasVideo[ad=${ad._id}]: prediction=${predictionId} polling...`);
+
+      // ── CHARGE POINT ──────────────────────────────────────────────────────────
+      // The submit returned an id, so the provider has accepted a billable job. Money is
+      // committed HERE, whatever happens to the poll, the download, or the Cloudinary
+      // mirror. Both writes below therefore happen now rather than at the end:
+      //
+      //   1. veoPredictionId — the spend receipt. Without it a crash mid-poll loses the
+      //      only handle to work we have paid for, and the reaper re-queues the ad into a
+      //      second submit. See models/Ad.js for the full reasoning.
+      //   2. the CostLog row — previously written only after poll + download + upload
+      //      succeeded, so a timeout or a failed upload spent ~$1.00 and recorded $0.
+      //
+      // ONE row per billable submit, deliberately. Outcome lives on the Ad (status,
+      // renderUrl); CostLog records SPEND, and spend happened. The trade-off is that
+      // durationMs here is submit latency rather than end-to-end render time — the full
+      // elapsed time is logged on completion below instead of creating a second row that
+      // would double-count the charge.
+      //
+      // Both are non-fatal: a telemetry or bookkeeping failure must never fail a
+      // generation post-payment, because the caller would then never store videoUrl and a
+      // retry would double-bill.
+      try {
+        await Ad.updateOne({ _id: ad._id }, { $set: { veoPredictionId: predictionId, updatedAt: new Date() } });
+      } catch (err) {
+        console.warn(`   ⚠️  atlasVideo: could not persist veoPredictionId=${predictionId} (${err.message}) — orphan would be unreconcilable`);
+      }
+      try {
+        await recordFlatCost({
+          stage:      'atlas_video_render',
+          provider:   'atlas',
+          model,
+          // THE KEY THAT MAKES THIS ROW CORRECTABLE. Without it, the retry path's
+          // finalizeFlatCost({providerRequestId}) matches nothing, falls back to
+          // an INSERT, and the failed attempt's ~$0.75 estimate survives beside
+          // the retry's — $1.50 booked for one delivered video. It also lets
+          // reconcileCost swap the estimate for Atlas's confirmed price later.
+          providerRequestId: predictionId,
+          purposeTag: caps.paramShape,
+          brandId:    media.brandId || null,
+          campaignId: ad.campaignId || null,
+          // Set at INSERT time only. finalizeFlatCost/reconcileCost below and in
+          // bootRecoveryService all UPDATE this same row keyed on
+          // providerRequestId, so campaignRunId does not need repeating there —
+          // it would be a no-op ($set only overwrites fields it's given, and none
+          // of those call sites pass this one).
+          campaignRunId: campaignRunId || null,
+          adId:       ad._id || null,
+          mediaId:    media._id || null,
+          productId:  ad.productId || null,
+          costUsd:    costUsd || 0,
+          durationMs: submitMs,
+          status:     'submitted'
+        });
+      } catch (err) {
+        console.warn(`   ⚠️  atlasVideo: charge-point cost record failed (${err.message}) — spend of ~$${(costUsd ?? 0).toFixed(2)} is UNLEDGERED`);
+      }
     }
 
     try {
@@ -5403,6 +5580,9 @@ module.exports = {
   pollPrediction,
   // exposed for verify harnesses (Claude-5-era provider-fault retry gate)
   mayRetryAfterFailure,
+  // Resume-from-receipt gate (adgen PR #40 / 2f99218). MONEY: this is the
+  // difference between collecting a paid master for free and double-billing it.
+  shouldResumeAttempt,
   confirmedCharge,
   isPublishedPrice,
   // Shared tri-state cost-reconcile decision for a FINAL video failure — used

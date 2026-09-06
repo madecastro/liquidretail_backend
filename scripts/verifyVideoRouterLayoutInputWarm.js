@@ -40,6 +40,7 @@ function check(name, fn) {
 const stubAtlas = {
   callsWarm: [],
   callsPrepare: [],
+  callsGenerate: [],
   warmLayoutInputForVideoAd: async ({ ad }) => {
     stubAtlas.callsWarm.push(ad);
     return { input: { synthetic: true } };
@@ -47,6 +48,10 @@ const stubAtlas = {
   prepareStoryboard: async ({ ad }) => {
     stubAtlas.callsPrepare.push(ad);
     return { storyboard: null, aspectRatio: '9:16', model: 'stub-model' };
+  },
+  generateForAd: async (args) => {
+    stubAtlas.callsGenerate.push(args);
+    return { model: 'atlas-stub', skipped: false };
   }
 };
 
@@ -55,13 +60,19 @@ require.cache[atlasPath] = { id: atlasPath, filename: atlasPath, loaded: true, e
 
 // Also stub aiVideoReferenceService because backend's videoRouter loads it
 // eagerly and its real load boots the whole video import graph.
-const veoStub = { generateForAd: async () => ({}) };
+const veoStub = {
+  callsGenerate: [],
+  generateForAd: async (args) => {
+    veoStub.callsGenerate.push(args);
+    return { model: null };
+  }
+};
 try {
   const veoPath = require.resolve('../services/aiVideoReferenceService');
   require.cache[veoPath] = { id: veoPath, filename: veoPath, loaded: true, exports: veoStub };
 } catch { /* not required on this branch */ }
 
-const { prepareStoryboard } = require('../services/videoRouter');
+const { prepareStoryboard, generateForAd } = require('../services/videoRouter');
 
 // ── Section A — the wiring ─────────────────────────────────────────
 
@@ -144,6 +155,72 @@ async function run() {
     // written. Pin that we're awaiting.
     assert.ok(/await\s+atlasVideoService\.warmLayoutInputForVideoAd/.test(routerSrc),
       'the non-atlas branch must AWAIT warmLayoutInputForVideoAd (not fire-and-forget)');
+  });
+
+  // ── Section C — fail-closed VIDEO_PROVIDER dispatch (MONEY/SAFETY) ──
+  // Previously a bare `else` sent ANY unrecognised value (typo, unset edge,
+  // future name, VIDEO_PROVIDER=gemini) to the deprecated billable Vertex
+  // path. Vertex is now reachable ONLY by naming it.
+  console.log('\n== C. generateForAd fail-closed VIDEO_PROVIDER ==');
+
+  await check('C1 VIDEO_PROVIDER=atlas calls atlasVideoService.generateForAd and threads allowResume', async () => {
+    stubAtlas.callsGenerate.length = 0;
+    veoStub.callsGenerate.length = 0;
+    process.env.VIDEO_PROVIDER = 'atlas';
+    const fakeAd = { _id: 'ad-gen-atlas' };
+    await generateForAd({ ad: fakeAd, allowResume: false, campaignRunId: 'run_x' });
+    assert.strictEqual(stubAtlas.callsGenerate.length, 1, 'atlas generateForAd should run once');
+    assert.strictEqual(veoStub.callsGenerate.length, 0, 'vertex must not run on atlas');
+    assert.strictEqual(stubAtlas.callsGenerate[0].allowResume, false,
+      'allowResume must be threaded through, not swallowed (regenerate passes false)');
+    assert.strictEqual(stubAtlas.callsGenerate[0].campaignRunId, 'run_x');
+  });
+
+  await check('C2 VIDEO_PROVIDER=vertex calls aiVideoReferenceService, not atlas', async () => {
+    stubAtlas.callsGenerate.length = 0;
+    veoStub.callsGenerate.length = 0;
+    process.env.VIDEO_PROVIDER = 'vertex';
+    const fakeAd = { _id: 'ad-gen-vertex' };
+    const result = await generateForAd({ ad: fakeAd });
+    assert.strictEqual(veoStub.callsGenerate.length, 1, 'vertex generateForAd should run once');
+    assert.strictEqual(stubAtlas.callsGenerate.length, 0, 'atlas must not run on vertex');
+    assert.strictEqual(result.model, 'google/veo-3.1', 'vertex result gets the veo-3.1 model default');
+  });
+
+  await check('C3 VIDEO_PROVIDER=gemeni (typo) THROWS — never falls through to Vertex', async () => {
+    stubAtlas.callsGenerate.length = 0;
+    veoStub.callsGenerate.length = 0;
+    process.env.VIDEO_PROVIDER = 'gemeni';
+    let threw = null;
+    try { await generateForAd({ ad: { _id: 'ad-gen-typo' } }); }
+    catch (err) { threw = err; }
+    assert.ok(threw, 'unrecognised VIDEO_PROVIDER must throw');
+    assert.match(String(threw.message), /not a recognised video provider/,
+      `throw message should name the refusal, got: ${threw && threw.message}`);
+    assert.strictEqual(stubAtlas.callsGenerate.length, 0, 'typo must not bill atlas');
+    assert.strictEqual(veoStub.callsGenerate.length, 0, 'typo must not bill vertex');
+  });
+
+  await check('C4 VIDEO_PROVIDER=gemini THROWS on backend (no geminiVideoService.js)', async () => {
+    stubAtlas.callsGenerate.length = 0;
+    veoStub.callsGenerate.length = 0;
+    process.env.VIDEO_PROVIDER = 'gemini';
+    let threw = null;
+    try { await generateForAd({ ad: { _id: 'ad-gen-gemini' } }); }
+    catch (err) { threw = err; }
+    assert.ok(threw, 'gemini is not a backend provider — must throw, not silently Vertex');
+    assert.strictEqual(veoStub.callsGenerate.length, 0, 'gemini must not fall through to vertex');
+    assert.strictEqual(stubAtlas.callsGenerate.length, 0);
+  });
+
+  check('C5 source: vertex is an explicit else-if, not a bare else', () => {
+    assert.ok(/else if\s*\(\s*provider\s*===\s*'vertex'\s*\)/.test(routerSrc),
+      "expected `else if (provider === 'vertex')` — a bare else is the silent-Vertex hole");
+  });
+
+  check('C6 source: does not require a gemini video module', () => {
+    assert.ok(!/require\(['"]\.\/geminiVideoService['"]\)/.test(routerSrc),
+      'backend must not require a gemini video module (that file does not exist here)');
   });
 
   // ── Summary ──────────────────────────────────────────────────────

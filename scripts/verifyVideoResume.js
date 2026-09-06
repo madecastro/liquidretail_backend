@@ -13,7 +13,7 @@
 //   generations" had to be built as RESUME rather than RESTART.
 //
 //   peekPrediction is a single GET on purpose. pollPrediction blocks up to
-//   MAX_POLL_MS (10 min), which is correct inside a render and wrong at boot:
+//   MAX_POLL_MS (15 min), which is correct inside a render and wrong at boot:
 //   recovery must not hold startup open, and an ad still processing is simply
 //   re-checked on the next sweep.
 //

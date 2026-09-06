@@ -978,11 +978,21 @@ async function runVideoFull(adId, prompt, progressRun = null, videoModel = null,
     // Stage 2 — new base video (model per override → settings → default).
     // ONE billable submit inside generateForAd; prompt overrides do not
     // add or remove submits.
+    //
+    // allowResume: false — EXPLICIT, not the default. A regenerate is an
+    // operator-requested NEW video on the SAME Ad doc, and this path never
+    // clears the previous veoPredictionId (adForGen still carries it). If
+    // generateForAd's resume-from-receipt gate ran here with its default
+    // (true), it would silently serve the OLD master back instead of
+    // submitting the new one the operator asked for and paid for — the
+    // regenerate would appear to do nothing. See atlasVideoService.js's
+    // shouldResumeAttempt doc comment for the full reasoning.
     veoResult = await veoService.generateForAd({
       ad: adForGen,
       operatorPrompt,
       storyboard,
-      modelOverride: videoModel
+      modelOverride: videoModel,
+      allowResume: false
     });
     if (veoResult.skipped) throw new Error(`Veo skipped: ${veoResult.reason}`);
     veoResult.storyboard = veoResult.storyboard || storyboard || null;

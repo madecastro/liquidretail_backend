@@ -199,7 +199,7 @@ check('waitForReframeUrl exits early when the claim aged past the lease',
   const atlas = require(atlasPath);
   // Not exported — recompute the documented default to pin the arithmetic.
   const span = (26 * 27) / 2;            // seconds slept across 26 attempts
-  const ttlFloorSec = (10 * 60 + 10 * 60); // MAX_POLL_MS default + 10m slack
+  const ttlFloorSec = 20 * 60; // independent REFRAME_CLAIM_TTL_FLOOR_MS (20 min)
   check('default 26 attempts (351s) stays under the ≥20m lease floor',
     span < ttlFloorSec, `span=${span}s floor=${ttlFloorSec}s`);
   check('atlasVideoService still loads after the edit', typeof atlas === 'object');
