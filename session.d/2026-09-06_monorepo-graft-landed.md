@@ -46,11 +46,28 @@ The old Blueprint stays `paused` on the dead adgen repo meanwhile — a
 latent hazard (one sync would rewrite all four back to the old repo with
 `autoDeploy: true`) but inert while paused.
 
-**Stage 6 — not started.** Re-arm `autoDeploy` only after Stage 5 is
-settled (or after accepting dashboard-managed as the steady state).
-`max-shutdown-delay` is still unset; future renderer deploys must stay
-gated on `inflight 0` until it is, or a mid-Atlas-hold worker gets 25s
-drain against a 15 min hold.
+**Stage 6 — not started, and it splits in two.** Re-arm `autoDeploy` only
+after Stage 5 is settled (or after accepting dashboard-managed as the
+steady state). `max-shutdown-delay` is still unset; future renderer deploys
+must stay gated on `inflight 0` until it is, or a mid-Atlas-hold worker gets
+25s drain against a 15 min hold.
+
+- **6a — the four adgen services** can be re-armed as soon as Stage 5 is
+  decided: what is deployed IS `main` (`e6393912`), so re-arming changes
+  nothing until the next merge.
+- **6b — backend web + worker** have NEVER deployed from a tree that
+  contains `adgen/`. Their live image predates the graft. Do one manual,
+  gated deploy of each from `main` first (worker only when idle — no
+  catalog job, no DetectRun in flight) and confirm boot + health, THEN
+  re-arm. Re-arming first would make the next unrelated merge the first
+  monorepo deploy of the backend, unattended.
+
+**Unrelated but observed the same night:** the YOLO detection service
+(`srv-d2251qbe5dus73999u6g`, not part of the graft) degrades to a gunicorn
+WORKER TIMEOUT → SIGKILL loop under the nightly catalog resync's detect
+batches (~27 req/min against ~3 req/min of capacity). Pre-existing, not
+caused by the graft or the YOLO repo cutover — timeline and evidence in the
+snapshot's YOLO section. Capacity / rate-limit fix is a product decision.
 
 **Freeze still in effect:** `autoDeploy: no` on all six services.
 
