@@ -9,9 +9,13 @@
 // provides non-secret defaults for every knob the copied services read.
 // dotenv is called without `override:true` so process.env stays highest
 // precedence (Render secrets shadow the file).
-require('dotenv').config();                                    // .env
-require('dotenv').config({ path: 'config/defaults.env' });     // committed defaults
+const path = require('path');
 const crypto = require('crypto');
+// Paths are anchored to this module, not process.cwd(). Docker WORKDIR /app
+// + this file at /app/src/config.js resolve to the same absolute files as
+// the previous cwd-relative loads (`/app/.env`, `/app/config/defaults.env`).
+require('dotenv').config({ path: path.join(__dirname, '..', '.env') });                    // .env
+require('dotenv').config({ path: path.join(__dirname, '..', 'config', 'defaults.env') });  // committed defaults
 
 const ROLE = String(process.env.ADGEN_ROLE || '').toLowerCase();
 if (!['api', 'orchestrator', 'renderer', 'titler'].includes(ROLE)) {

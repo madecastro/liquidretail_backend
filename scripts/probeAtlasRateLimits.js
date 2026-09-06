@@ -9,10 +9,10 @@
 // atlasImageService.submitAndPoll (URL, headers, maxRedirects:0,
 // validateStatus:()=>true) so any limit prod would hit shows up here.
 
-require('dotenv').config();
+const path = require('path');
+require('dotenv').config({ path: path.join(__dirname, '..', '.env') });
 const axios = require('axios');
 const fs = require('fs');
-const path = require('path');
 const zlib = require('zlib');
 
 const BASE = process.env.ATLAS_BASE_URL || 'https://api.atlascloud.ai/api/v1';

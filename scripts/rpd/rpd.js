@@ -15,7 +15,7 @@
 // Dry-run is the default; --live is the only billable door and requires
 // --max-usd. Money invariants pinned by scripts/verifyRpdHarness.js.
 
-require('dotenv').config();
+require('dotenv').config({ path: require('path').join(__dirname, '..', '..', '.env') });
 require('dotenv').config({ path: require('path').join(__dirname, '..', '..', 'config', 'defaults.env') });
 
 const path = require('path');
