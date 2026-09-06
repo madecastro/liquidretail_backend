@@ -41,11 +41,15 @@
 //   - The four sync services collapse to one function call each — the
 //     chain shape lives in ONE place, not four copies drifting apart.
 //
+// Overlap guard (2026-09-06): an in-process Set of brandIds plus the
+// reconcile sweep consulting heartbeatAt (not "any failed ever") stop
+// N overlapping chains from stacking CATALOG_YOLO_CONCURRENCY each.
+//
 // IDEMPOTENT. Both underlying services are gap-fillers by construction:
 //   - ensureBrandCatalogMediaMaterialized skips products whose pointers
 //     already exist (materializeImage's own idempotency).
 //   - enqueueBrandProductYoloDetection with onlyGaps:true only picks up
-//     products with empty refinedProducts.
+//     products with empty refinedProducts (and yoloDetectedAt:null).
 // So re-running on a fully-done brand is a cheap DB read pair.
 
 'use strict';
@@ -53,35 +57,190 @@
 const OperationRun = require('../models/OperationRun');
 const Brand = require('../models/Brand');
 const CatalogProduct = require('../models/CatalogProduct');
-const Media = require('../models/Media');
 const progressService = require('./progressService');
+const yoloLoadLimiter = require('./yoloLoadLimiter');
+const alerts = require('./alertService');
+
+const { STALE_HEARTBEAT_MS } = progressService;
 
 // One log prefix so post-sync chain lines are grep-able across the 4
 // sync callers plus the reconcile tick.
 const LOG = '🔗 post-sync';
 
+const LIVE_KINDS = ['catalog-post-sync', 'yolo-detect', 'materialize'];
+
+function parsePositiveInt(raw, fallback) {
+  const n = parseInt(raw, 10);
+  return Number.isFinite(n) && n > 0 ? n : fallback;
+}
+
+const MAX_INFLIGHT_CHAINS = parsePositiveInt(process.env.POST_SYNC_MAX_INFLIGHT_CHAINS, 1);
+const BACKOFF_BASE_MS = parsePositiveInt(process.env.CATALOG_YOLO_BACKOFF_BASE_MS, 1_800_000);
+const BACKOFF_CAP_MS = parsePositiveInt(process.env.CATALOG_YOLO_BACKOFF_CAP_MS, 28_800_000);
+
+// Same-process registry. Empty on boot is correct (old process died).
+const inFlightBrands = new Set();
+
+let _testOverrides = {};
+
+function nextBackoffMs(failures) {
+  const n = Math.max(1, Number(failures) || 1);
+  return Math.min(BACKOFF_CAP_MS, BACKOFF_BASE_MS * (2 ** (n - 1)));
+}
+
+function backoffAfterSuccessUpdate() {
+  return {
+    $set: {
+      catalogYoloBackoffUntil: null,
+      catalogYoloBackoffFailures: 0,
+      catalogYoloBackoffReason: null
+    }
+  };
+}
+
+function backoffOnAbortUpdate(failures, now = Date.now()) {
+  const delayMs = nextBackoffMs(failures);
+  return {
+    delayMs,
+    update: {
+      $set: {
+        catalogYoloBackoffUntil: new Date(now + delayMs),
+        catalogYoloBackoffFailures: failures,
+        catalogYoloBackoffReason: 'yolo-circuit-open'
+      }
+    }
+  };
+}
+
+async function applyBackoff(brandId, reason = 'yolo-circuit-open') {
+  if (_testOverrides.applyBackoff) return _testOverrides.applyBackoff(brandId, reason);
+  const row = await Brand.findById(brandId).select('catalogYoloBackoffFailures').lean();
+  const failures = (row && row.catalogYoloBackoffFailures ? row.catalogYoloBackoffFailures : 0) + 1;
+  const { delayMs, update } = backoffOnAbortUpdate(failures);
+  await Brand.updateOne({ _id: brandId }, update);
+  return { failures, delayMs, reason };
+}
+
+async function backoffAfterSuccess(brandId) {
+  if (_testOverrides.backoffAfterSuccess) return _testOverrides.backoffAfterSuccess(brandId);
+  const update = backoffAfterSuccessUpdate();
+  await Brand.updateOne({ _id: brandId }, update);
+  return update;
+}
+
+function alertBrandChainAbort({ brandId, remaining, consecutive, backoffMs } = {}) {
+  const backoffMin = Math.round((backoffMs || yoloLoadLimiter.cooldownMs()) / 60000);
+  alerts.notifyAsync({
+    level: 'error',
+    title: `Catalog YOLO chain aborted — brand ${brandId}`,
+    key: `yolo:circuit-open:brand:${brandId}`,
+    fields: {
+      brand: String(brandId || '-'),
+      'consecutive transients': consecutive == null ? yoloLoadLimiter.consecutiveTransientNow() : consecutive,
+      'remaining targets': remaining == null ? '-' : remaining,
+      'backoff applied': `${backoffMin}m`,
+      'operator action': 'YOLO microservice degraded; catalog detection paused; resumes automatically after cooldown'
+    },
+    detail: 'YOLO microservice degraded; catalog detection paused; resumes automatically after cooldown'
+  });
+}
+
+/**
+ * Pure sweep predicate. latestRuns is one row per brand (already unique).
+ * liveBrandIds / inFlight / backoffUntil skip a brand even if its latest
+ * run is failed. Running with a fresh heartbeatAt is not selected;
+ * running with heartbeatAt older than staleMs is (dead holder).
+ */
+function filterSweepCandidates({
+  latestRuns = [],
+  liveBrandIds = [],
+  inFlight = [],
+  backoffUntil = {},
+  now = Date.now(),
+  staleMs = STALE_HEARTBEAT_MS
+} = {}) {
+  const live = new Set([...liveBrandIds].map(String));
+  const flying = new Set(inFlight instanceof Set
+    ? [...inFlight].map(String)
+    : [...inFlight].map(String));
+  const selected = [];
+  const seen = new Set();
+  for (const run of latestRuns) {
+    const id = String(run.brandId || run._id || '');
+    if (!id || seen.has(id)) continue;
+    seen.add(id);
+    if (flying.has(id) || live.has(id)) continue;
+    const until = backoffUntil[id];
+    const untilMs = until instanceof Date ? until.getTime() : until;
+    if (untilMs && untilMs > now) continue;
+
+    const status = run.lastStatus || run.status || 'none';
+    if (status === 'succeeded') continue;
+    if (status === 'running') {
+      const hb = run.lastHeartbeatAt || run.heartbeatAt;
+      const hbMs = hb instanceof Date ? hb.getTime() : Number(hb);
+      if (hbMs && hbMs > now - staleMs) continue;
+      selected.push(id);
+      continue;
+    }
+    // failed / none / missing / cancelled — retry targets
+    selected.push(id);
+  }
+  return selected;
+}
+
 /**
  * Run the materialize + yolo-detect chain for one brand.
  *
  * NEVER throws — the whole point is to absorb transient failure into a
- * persistent OperationRun and let the reconcile tick retry. Every caller
- * (4 sync services + worker.js tick) fires this without awaiting; a
- * throw would poison the surrounding backgroundWork.push semantics.
+ * persistent OperationRun and let the reconcile tick retry. The four
+ * sync callers fire this without awaiting (backgroundWork.push); the
+ * reconcile sweep DOES await (sweepIncompleteBrands). A throw would
+ * poison the surrounding backgroundWork.push semantics.
  *
  * @param {ObjectId|string} brandId
  * @param {object} opts
  * @param {'sync'|'reconcile'|'manual'} [opts.trigger='sync']
  *   — labels the OperationRun.meta.trigger so a post-hoc audit can tell
  *   sync-triggered runs (normal) from reconcile-triggered ones (recovery).
- * @returns {Promise<{status:'ok'|'partial'|'failed'|'skipped', phases:{materialize:string, yoloDetect:string}, runId:string|null}>}
+ * @returns {Promise<{status:'ok'|'partial'|'failed'|'skipped', reason?:string, phases:{materialize:string, yoloDetect:string}, runId:string|null}>}
  */
 async function runPostSyncChain(brandId, { trigger = 'sync' } = {}) {
   if (!brandId) return { status: 'skipped', reason: 'no brandId', phases: {}, runId: null };
+  const id = String(brandId);
+  // in-process-registry-skip (B1)
+  if (inFlightBrands.has(id)) {
+    console.log(`${LOG}[brand=${id}] skipped (in-process chain already running)`);
+    return { status: 'skipped', reason: 'in-flight', phases: {}, runId: null };
+  }
+  inFlightBrands.add(id);
+  try {
+    return await runPostSyncChainUnlocked(brandId, { trigger });
+  } finally {
+    inFlightBrands.delete(id);
+  }
+}
 
-  const brand = await Brand.findById(brandId).select('advertiserId').lean();
+async function runPostSyncChainUnlocked(brandId, { trigger = 'sync' } = {}) {
+  const findBrand = _testOverrides.findBrand
+    || ((id) => Brand.findById(id).select('advertiserId').lean());
+  const startRun = _testOverrides.startRun
+    || ((args) => progressService.startRun(args));
+  const doMaterialize = _testOverrides.materialize
+    || (async (id) => {
+      const { ensureBrandCatalogMediaMaterialized } = require('./catalogMediaMaterializeService');
+      return ensureBrandCatalogMediaMaterialized(id);
+    });
+  const doYolo = _testOverrides.yolo
+    || (async (id) => {
+      const { enqueueBrandProductYoloDetection } = require('./catalogYoloDetectionService');
+      return enqueueBrandProductYoloDetection(id);
+    });
+
+  const brand = await findBrand(brandId);
   if (!brand) return { status: 'skipped', reason: 'brand not found', phases: {}, runId: null };
 
-  const run = await progressService.startRun({
+  const run = await startRun({
     kind:        'catalog-post-sync',
     advertiserId: brand.advertiserId || null,
     brandId,
@@ -97,8 +256,7 @@ async function runPostSyncChain(brandId, { trigger = 'sync' } = {}) {
   // Phase 1 — materialize hero + top-N alts. Idempotent; running on a
   // fully-materialized brand is one lean query and returns immediately.
   try {
-    const { ensureBrandCatalogMediaMaterialized } = require('./catalogMediaMaterializeService');
-    await ensureBrandCatalogMediaMaterialized(brandId);
+    await doMaterialize(brandId);
     phases.materialize = 'ok';
     run.tick(1, 2, 'materialize ok');
   } catch (err) {
@@ -108,12 +266,42 @@ async function runPostSyncChain(brandId, { trigger = 'sync' } = {}) {
   }
 
   // Phase 2 — Grounding DINO detection on any Media with empty
-  // refinedProducts. Idempotent via onlyGaps:true.
+  // refinedProducts AND yoloDetectedAt:null. Idempotent via onlyGaps:true.
+  // Phase 2 can run for hours; liveness is heartbeatAt + in-process
+  // registry, not phase ticks.
   try {
-    const { enqueueBrandProductYoloDetection } = require('./catalogYoloDetectionService');
-    await enqueueBrandProductYoloDetection(brandId);
+    const yolo = await doYolo(brandId);
+    if (yolo && yolo.ok === false && yolo.reason === 'yolo-circuit-open') {
+      phases.yoloDetect = 'failed: yolo-circuit-open';
+      failures++;
+      const backoff = await applyBackoff(brandId, 'yolo-circuit-open');
+      alertBrandChainAbort({
+        brandId,
+        remaining: yolo.remaining,
+        consecutive: yoloLoadLimiter.consecutiveTransientNow(),
+        backoffMs: backoff && backoff.delayMs
+      });
+      try {
+        await run.fail(new Error('failed: yolo-circuit-open'), {
+          phases,
+          status: 'failed',
+          reason: 'yolo-circuit-open'
+        });
+      } catch (err) {
+        console.warn(`${LOG}[brand=${brandId}] OperationRun close failed: ${err.message}`);
+      }
+      return {
+        status: 'failed',
+        reason: 'yolo-circuit-open',
+        phases,
+        runId: String(run.id || run._id || '')
+      };
+    }
     phases.yoloDetect = 'ok';
     run.tick(2, 2, 'yolo-detect ok');
+    try { await backoffAfterSuccess(brandId); } catch (err) {
+      console.warn(`${LOG}[brand=${brandId}] backoff clear failed: ${err.message}`);
+    }
   } catch (err) {
     phases.yoloDetect = `failed: ${err.message?.slice(0, 200) || 'unknown'}`;
     failures++;
@@ -143,12 +331,12 @@ async function runPostSyncChain(brandId, { trigger = 'sync' } = {}) {
   //
   // Runs OUTSIDE this OperationRun's lifecycle by design: rematch's own
   // poll waits up to POST_REMATCH_POLL_MAX_MS (60 min default) for the
-  // detect queue to drain, well past this OperationRun's ~seconds-long
-  // window. Extending phase 2's total from 2→3 and holding the
-  // OperationRun open through the poll would break the reconcile
-  // tick's `updatedAt > STALE_MIN` heuristic. Rematch has its own
-  // failure logging and no retry — a one-shot post-catalog rematch is
-  // the semantic, and a re-fire would only happen on the next catalog
+  // detect queue to drain. Phase 2 can run for hours; liveness is
+  // heartbeatAt + in-process registry, not phase ticks. Extending
+  // phase 2's total from 2→3 and holding the OperationRun open through
+  // the poll is the wrong liveness signal. Rematch has its own failure
+  // logging and no retry — a one-shot post-catalog rematch is the
+  // semantic, and a re-fire would only happen on the next catalog
   // sync of this brand.
   //
   // full=<POST_DETECT_DEFER_TO_CATALOG>: deferred design skipped the
@@ -156,7 +344,7 @@ async function runPostSyncChain(brandId, { trigger = 'sync' } = {}) {
   // enqueue every UGC media (full=true). Legacy immediate-detect mode
   // already matched at ingest, so rematch only touches UNMATCHED posts
   // (full=false) — avoids paying twice for the same vision-match.
-  if (phases.yoloDetect === 'ok') {
+  if (phases.yoloDetect === 'ok' && Object.keys(_testOverrides).length === 0) {
     setImmediate(async () => {
       try {
         const { rematchAfterCatalogDetect, isDeferPostDetectEnabled } = require('./postRematchAfterCatalogService');
@@ -172,101 +360,192 @@ async function runPostSyncChain(brandId, { trigger = 'sync' } = {}) {
 }
 
 /**
+ * Start at most POST_SYNC_MAX_INFLIGHT_CHAINS new chains this tick.
+ * Stops the rest of the tick if a chain aborts with yolo-circuit-open
+ * (process-wide circuit is open; more brands would only burn cooldown).
+ */
+async function reconcileSelectedBrands(targets, { runChain, maxNew = MAX_INFLIGHT_CHAINS } = {}) {
+  const run = runChain || ((id) => runPostSyncChain(id, { trigger: 'reconcile' }));
+  const stats = {
+    scanned: targets.length,
+    started: 0,
+    skippedInFlight: 0,
+    skippedBackoff: 0,
+    reconciled: 0,
+    skipped: 0
+  };
+  for (const bid of targets) {
+    const id = String(bid);
+    if (inFlightBrands.has(id)) {
+      stats.skippedInFlight++;
+      continue;
+    }
+    if (inFlightBrands.size >= maxNew || stats.started >= maxNew) break;
+    const r = await run(id);
+    stats.started++;
+    if (r.status === 'ok' || r.status === 'partial') stats.reconciled++;
+    else stats.skipped++;
+    // circuit-open-stops-tick (F2)
+    if (r.status === 'failed' && r.reason === 'yolo-circuit-open') break;
+  }
+  return stats;
+}
+
+/**
  * Sweep Brands with catalog products where the post-sync chain hasn't
  * fully landed. This is the RECONCILE side — called from worker.js on
  * an interval so a transient outage doesn't strand a brand.
  *
  * TWO signals of incomplete state, ANY of which triggers a re-fire:
- *   (a) A `catalog-post-sync` OperationRun in status 'failed' or
- *       'running' older than STALE_MIN. `failed` is a retry target;
- *       `running` older than STALE_MIN means the process holding it
- *       died mid-work.
+ *   (a) The LATEST `catalog-post-sync` OperationRun per brand is
+ *       `failed`, or `running` with heartbeatAt older than the shared
+ *       STALE_HEARTBEAT_MS. Unbounded `{status:'failed'}` (any failed
+ *       ever) is what stacked overlapping chains.
  *   (b) NO recent `catalog-post-sync` run at all for a brand that has
  *       CatalogProducts with imageUrl but null imageMediaId. This
  *       catches brands whose sync fired BEFORE this orchestrator
  *       shipped — they never had a run written.
  *
- * Bounded per tick (BATCH default 5) so a big backlog of stranded
- * brands doesn't monopolize the worker's housekeeping window.
+ * Skips in-process registry, live heartbeatAt rows, and Brand backoff.
+ * BATCH is a SCAN bound; POST_SYNC_MAX_INFLIGHT_CHAINS (default 1) is
+ * the start bound.
  *
  * @param {object} opts
- * @param {number} [opts.batchSize]  — max brands to reconcile in one call
- * @param {number} [opts.staleMinutes]  — how long a running/failed run
- *   must sit before it's a retry target (default 30 min)
- * @returns {Promise<{scanned:number, reconciled:number, skipped:number}>}
+ * @param {number} [opts.batchSize]  — max brands to scan in one call
+ * @param {number} [opts.staleMinutes]  — how long a running run must
+ *   sit with a stale heartbeat before it's a retry target
+ * @returns {Promise<object>}
  */
 async function sweepIncompleteBrands({ batchSize = 5, staleMinutes = 30 } = {}) {
-  const staleBefore = new Date(Date.now() - staleMinutes * 60 * 1000);
-  const brandIds = new Set();
+  const now = Date.now();
+  const staleMs = Math.max(STALE_HEARTBEAT_MS, staleMinutes * 60 * 1000);
+  const latestRuns = [];
 
-  // Signal (a) — failed or long-running post-sync operations.
+  let liveBrandIds = [];
   try {
-    const stale = await OperationRun.find({
-      kind: 'catalog-post-sync',
-      $or: [
-        { status: 'failed' },
-        { status: 'running', updatedAt: { $lt: staleBefore } }
-      ]
-    })
-      .sort({ updatedAt: 1 })
-      .select('brandId')
-      .limit(batchSize * 2)
-      .lean();
-    for (const r of stale) {
-      if (r.brandId) brandIds.add(String(r.brandId));
-      if (brandIds.size >= batchSize) break;
+    liveBrandIds = (await OperationRun.distinct('brandId', {
+      kind: { $in: LIVE_KINDS },
+      status: 'running',
+      heartbeatAt: { $gt: new Date(now - STALE_HEARTBEAT_MS) }
+    })).filter(Boolean).map(String);
+  } catch (err) {
+    console.warn(`${LOG} sweep live-heartbeat query failed: ${err.message}`);
+  }
+
+  // Signal (a) — latest catalog-post-sync per brand.
+  try {
+    const latest = await OperationRun.aggregate([
+      { $match: { kind: 'catalog-post-sync', brandId: { $ne: null } } },
+      { $sort: { updatedAt: -1 } },
+      { $group: {
+        _id: '$brandId',
+        lastStatus: { $first: '$status' },
+        lastHeartbeatAt: { $first: '$heartbeatAt' },
+        lastEndedAt: { $first: '$endedAt' },
+        lastId: { $first: '$_id' },
+        lastUpdatedAt: { $first: '$updatedAt' }
+      } }
+    ]);
+    for (const r of latest) {
+      latestRuns.push({
+        brandId: r._id,
+        lastStatus: r.lastStatus,
+        lastHeartbeatAt: r.lastHeartbeatAt,
+        lastEndedAt: r.lastEndedAt,
+        lastId: r.lastId
+      });
     }
   } catch (err) {
     console.warn(`${LOG} sweep signal-a failed: ${err.message}`);
   }
 
   // Signal (b) — brands with CatalogProducts needing materialize AND
-  // no successful post-sync run recorded. Cheap distinct query, bounded.
-  if (brandIds.size < batchSize) {
+  // no successful/live post-sync run. Cheap distinct, bounded.
+  if (latestRuns.length < batchSize * 4) {
     try {
       const pendingBrandIds = await CatalogProduct.distinct('brandId', {
         imageUrl: { $nin: [null, ''] },
         imageMediaId: null,
         deletedAt: null
       });
+      const have = new Set(latestRuns.map((r) => String(r.brandId)));
       for (const bid of pendingBrandIds) {
-        if (brandIds.size >= batchSize) break;
-        // Skip brands that already have a recent successful run — they
-        // might have new products since the last sync but the periodic
-        // tick's job is recovery, not routine backfill (that's the yolo
-        // backfill tick's job for Media-level gaps).
-        const recentOk = await OperationRun.findOne({
-          kind: 'catalog-post-sync',
-          brandId: bid,
-          status: 'succeeded',
-          updatedAt: { $gt: staleBefore }
-        }).select('_id').lean();
-        if (!recentOk) brandIds.add(String(bid));
+        const id = String(bid);
+        if (have.has(id)) continue;
+        latestRuns.push({ brandId: id, lastStatus: 'none' });
+        have.add(id);
       }
     } catch (err) {
       console.warn(`${LOG} sweep signal-b failed: ${err.message}`);
     }
   }
 
-  const targets = [...brandIds].slice(0, batchSize);
-  if (!targets.length) return { scanned: 0, reconciled: 0, skipped: 0 };
+  const candidateIds = latestRuns.map((r) => r.brandId).filter(Boolean);
+  const backoffUntil = {};
+  if (candidateIds.length) {
+    try {
+      const rows = await Brand.find({ _id: { $in: candidateIds } })
+        .select('catalogYoloBackoffUntil')
+        .lean();
+      for (const b of rows) {
+        if (b.catalogYoloBackoffUntil) backoffUntil[String(b._id)] = b.catalogYoloBackoffUntil;
+      }
+    } catch (err) {
+      console.warn(`${LOG} sweep backoff load failed: ${err.message}`);
+    }
+  }
+
+  const filtered = filterSweepCandidates({
+    latestRuns,
+    liveBrandIds,
+    inFlight: inFlightBrands,
+    backoffUntil,
+    now,
+    staleMs
+  });
+  const skippedBackoff = filtered.length === 0 && Object.keys(backoffUntil).length
+    ? candidateIds.filter((id) => backoffUntil[String(id)] && backoffUntil[String(id)] > now).length
+    : 0;
+  const targets = filtered.slice(0, batchSize);
+  if (!targets.length) {
+    return {
+      scanned: 0, reconciled: 0, skipped: 0, started: 0,
+      skippedInFlight: 0, skippedBackoff,
+      inFlightChains: inFlightBrands.size
+    };
+  }
 
   console.log(`${LOG} reconcile sweep: ${targets.length} brand(s) — ${targets.join(', ')}`);
-  let reconciled = 0;
-  let skipped = 0;
-  for (const bid of targets) {
-    const r = await runPostSyncChain(bid, { trigger: 'reconcile' });
-    if (r.status === 'ok' || r.status === 'partial') reconciled++;
-    else skipped++;
-  }
-  console.log(`${LOG} reconcile sweep done: reconciled=${reconciled} skipped=${skipped}`);
-  return { scanned: targets.length, reconciled, skipped };
+  const stats = await reconcileSelectedBrands(targets);
+  stats.skippedBackoff = skippedBackoff;
+  stats.inFlightChains = inFlightBrands.size;
+  console.log(`${LOG} reconcile sweep done: reconciled=${stats.reconciled} skipped=${stats.skipped} started=${stats.started}`);
+  return stats;
+}
+
+function inFlightCount() {
+  return inFlightBrands.size;
 }
 
 module.exports = {
   runPostSyncChain,
   sweepIncompleteBrands,
+  filterSweepCandidates,
+  reconcileSelectedBrands,
+  nextBackoffMs,
+  backoffAfterSuccess,
+  backoffAfterSuccessUpdate,
+  backoffOnAbortUpdate,
+  applyBackoff,
+  inFlightCount,
+  MAX_INFLIGHT_CHAINS,
+  BACKOFF_BASE_MS,
+  BACKOFF_CAP_MS,
   __test: {
-    LOG
+    LOG,
+    inFlightBrands,
+    resetInFlight() { inFlightBrands.clear(); },
+    setOverrides(o) { _testOverrides = o || {}; },
+    getOverrides() { return _testOverrides; }
   }
 };
