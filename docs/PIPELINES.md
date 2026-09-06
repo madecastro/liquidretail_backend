@@ -38,7 +38,7 @@ Deterministic, cheap product ingest: discover product URLs from sitemaps, fetch 
 - Sales-demo / catalog sync path that selects the **generic-sitemap** method (via `services/apifyIngestService.js` orchestration; kill-switch `GENERIC_CATALOG_ENABLED`).
 - Resolve: `services/genericCatalogResolver.js` → `resolveGenericCatalog`.
 - Persist: `services/genericCatalogIngestService.js` → `syncBrandGenericCatalog`.
-- **Scheduled re-sync (2026-09-04, `feat/ingest-freshness`):** `scheduledSyncService.runDueCatalogResyncs` also ticks Shopify-direct / generic-sitemap / Apify catalogs (not only IG). Flag `CATALOG_SCHEDULED_RESYNC_ENABLED` (file default `true`, parser `=== 'true'`); interval `CATALOG_RESYNC_INTERVAL_H=24`; one brand per tick, spaced by `CATALOG_RESYNC_SPACING_MS=180000`. Reuses the live entry points (`syncBrandShopifyDirect` / `syncBrandGenericCatalog` / `syncBrandApify({ skipInstagram: true })`) so enrichment hooks match a manual sync. Flag-off = today's IG-only scheduler. Deploy-killed runs are not resumed — the next tick re-evaluates due-ness. `CATALOG_INGEST_LIMIT` still applies at persist. Pinned by `scripts/verifyScheduledCatalogResync.js`.
+- **Scheduled re-sync (2026-09-05, nightly window):** `scheduledSyncService.runDueCatalogResyncs` ticks Shopify-direct / generic-sitemap / Apify catalogs (not only IG). Flag `CATALOG_SCHEDULED_RESYNC_ENABLED` (file default `true`, parser `=== 'true'`). Nightly window starts at 2:00 AM `America/Los_Angeles` (DST-aware via `Intl`) and stays open `CATALOG_NIGHTLY_WINDOW_H=8` hours; each tick dispatches up to `CATALOG_NIGHTLY_CONCURRENCY=3` brands that have not been stamped `lastCatalogResyncAt` since this window's start. **All brands** with an eligible non-IG catalog source (not just `autoSyncEnabled` / demo). Persist is **uncapped on this path only** (`catalogIngestLimit({ uncapped: true })`); manual Sync Now / IG auto-sync keep `CATALOG_INGEST_LIMIT=10`. Demo dispatch still passes `skipInstagram: true`. Pinned by `scripts/verifyScheduledCatalogResync.js`.
 
 ### Stages
 
@@ -76,8 +76,9 @@ Deterministic, cheap product ingest: discover product URLs from sitemaps, fetch 
 | `HTTP_SCRAPE_MIN_GAP_MS` | `250` | Per-host minimum gap between requests |
 | `HTTP_SCRAPE_DOMAIN_CONCURRENCY` | `3` | Concurrent in-flight per domain (`httpScrapeClient`) |
 | `CATALOG_SCHEDULED_RESYNC_ENABLED` | `true` | Parser `=== 'true'`. Flag-off = IG-only scheduler |
-| `CATALOG_RESYNC_INTERVAL_H` | `24` | Hours between Shopify/generic/Apify re-syncs |
-| `CATALOG_RESYNC_SPACING_MS` | `180000` | Min gap between brands (one brand per tick) |
+| `CATALOG_NIGHTLY_HOUR` | `2` | Window start hour in `America/Los_Angeles` (DST-aware) |
+| `CATALOG_NIGHTLY_WINDOW_H` | `8` | Hours the window stays open after start (2am–10am PT) |
+| `CATALOG_NIGHTLY_CONCURRENCY` | `3` | Brands dispatched per tick (parser ceiling 8) |
 
 See `config/defaults.env` and `services/genericCatalogResolver.js` / `httpScrapeClient.js`.
 
@@ -1686,7 +1687,7 @@ Deeper instrumentation notes: `docs/PROGRESS.md`.
 
 ### Scheduler
 
-- `services/scheduledSyncService.js` — **60s** `setInterval`, per-brand catalog/posts cadence; labels spawned syncs `(scheduled)`; kind `scheduled-sync`. When `CATALOG_SCHEDULED_RESYNC_ENABLED=true`, also due-checks Shopify-direct / generic-sitemap / Apify catalogs (`Brand.lastCatalogResyncAt`, serial, spaced). Flag-off leaves the IG/posts/campaigns loops unchanged.
+- `services/scheduledSyncService.js` — **60s** `setInterval`, per-brand catalog/posts cadence; labels spawned syncs `(scheduled)`; kind `scheduled-sync`. When `CATALOG_SCHEDULED_RESYNC_ENABLED=true`, also due-checks Shopify-direct / generic-sitemap / Apify catalogs in a 2am Pacific nightly window (`Brand.lastCatalogResyncAt` per-window stamp, up to 3 brands/tick, persist-uncapped). Flag-off leaves the IG/posts/campaigns loops unchanged.
 
 ---
 

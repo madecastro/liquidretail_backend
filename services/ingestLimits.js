@@ -49,7 +49,11 @@ function readLimit(envName) {
   return parsed;
 }
 
-function catalogIngestLimit() {
+function catalogIngestLimit(opts) {
+  // Nightly catalog re-sync is persist-uncapped. Manual Sync Now / IG
+  // auto-sync omit this flag and keep the env default (10). Strict
+  // `=== true` so a forwarded env string cannot accidentally uncap.
+  if (opts && typeof opts === 'object' && opts.uncapped === true) return null;
   return readLimit('CATALOG_INGEST_LIMIT');
 }
 

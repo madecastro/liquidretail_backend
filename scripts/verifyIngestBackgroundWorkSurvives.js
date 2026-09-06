@@ -374,7 +374,7 @@ check('E3: syncBrandApify forwards the legacy summary (and thus backgroundWork) 
   // refactor to a field-by-field literal would silently drop it, exactly
   // like the generic-sitemap branch would have (see D4).
   assert.ok(
-    /\} else \{\n\s*out\.shopify = await syncBrandShopify\(brand, run\);\n\s*\}/.test(apifySrc),
+    /\} else \{\n\s*out\.shopify = await syncBrandShopify\(brand, run(?:,\s*[^;]+)?\);\n\s*\}/.test(apifySrc),
     'the legacy branch must assign the whole summary to out.shopify (field-by-field would drop backgroundWork)'
   );
 });

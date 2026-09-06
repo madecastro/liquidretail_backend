@@ -312,7 +312,7 @@ async function pace() {
 // ── main export ────────────────────────────────────────────────────
 
 /**
- * syncBrandShopifyDirect(brand, run, { isBrandAborted })
+ * syncBrandShopifyDirect(brand, run, { isBrandAborted, uncapped })
  *
  * brand  – hydrated Brand doc (needs _id, advertiserId, name, apifyDemo.shopifyUrl)
  * run    – progressService run handle (stage/tick/checkpoint)
@@ -321,7 +321,7 @@ async function pace() {
  *
  * Returns { productsUpserted, videosIngested, reviewsCaptured, errors: [], cancelled?: true }
  */
-async function syncBrandShopifyDirect(brand, run, { isBrandAborted } = {}) {
+async function syncBrandShopifyDirect(brand, run, { isBrandAborted, uncapped } = {}) {
   const t0 = Date.now();
   const errors = [];
   let productsUpserted = 0;
@@ -355,7 +355,13 @@ async function syncBrandShopifyDirect(brand, run, { isBrandAborted } = {}) {
     };
   }
 
-  const CAP = Math.max(1, parseInt(process.env.SHOPIFY_DIRECT_LIMIT, 10) || DEFAULT_PRODUCT_CAP);
+  // Nightly scheduled resync is persist-uncapped AND lifts the 200-product
+  // fetch ceiling so "whole catalog" is real. Manual Sync Now keeps both
+  // SHOPIFY_DIRECT_LIMIT (default 200) and CATALOG_INGEST_LIMIT (default 10).
+  const uncappedRun = uncapped === true;
+  const CAP = uncappedRun
+    ? 100000
+    : Math.max(1, parseInt(process.env.SHOPIFY_DIRECT_LIMIT, 10) || DEFAULT_PRODUCT_CAP);
 
   // Same money+correctness guard as apifyIngestService.syncBrandShopify (see
   // its comment and shopifyAccessResolver.verifyStoreCurrencyUsd's header) —
@@ -459,7 +465,7 @@ async function syncBrandShopifyDirect(brand, run, { isBrandAborted } = {}) {
   // upstream — the fetch may have returned a full page, we simply choose
   // to write only N.
   const { catalogIngestLimit } = require('./ingestLimits');
-  const ingestCap = catalogIngestLimit();
+  const ingestCap = catalogIngestLimit({ uncapped: uncappedRun });
   let persistedCount = 0;
   try {
   let idx = 0;
