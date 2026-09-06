@@ -350,18 +350,14 @@ section('B. veo-prompt-scaffold declares itself an approximation');
   check('B3b hasProductReference is a REAL byte delta too',
     refDelta > 100, `delta=${refDelta}`);
 
-  // B4 — THE MECHANISM BEHIND THE OBSERVED `Product:` DIVERGENCE.
-  // At a 4096-byte cap the guard block pushes the prompt over target, and
-  // enforceByteCap drops `Product: ` FIRST (it heads DROP_PRIORITY). So the
-  // preview can show a Product line the real submission dropped — SAME builder,
-  // different budget. This is what refutes "the preview carries a pattern
-  // deliberately removed from the real builder".
-  // The axis that ACTUALLY moves this is the destination profile plus the
-  // model's cap — NOT the product description, which was the first fixture
-  // tried here and turned out to be inert (it never reaches the camera prompt,
-  // so the sweep passed over 65 lengths while testing nothing). Recorded
-  // because a vacuous fixture is the failure mode this whole harness exists to
-  // avoid.
+  // B4 — SUPERSEDED 2026-09-04 (Vaportek). This used to pin a 4096-vs-20000
+  // DROP_PRIORITY divergence (`Product:` present at Omni cap, dropped at
+  // Grok cap). That labelled catalog-title line is gone from the builder
+  // entirely: Omni treated `Product: Vaportek.` as a brand-name render
+  // instruction and painted a fake lockup over a PELAGIC product (QC killed
+  // the $0.90 master). Pin ABSENCE at both caps, and pin that a titled
+  // product does not leak its title into the camera prompt. The over-cap
+  // measurement in B4d is unchanged.
   const hasProd = s => /(^|\s)Product: /.test(s);
   const destArgs = { ...scaffoldArgs, platformFormat: 'meta_stories_9_16' };
 
@@ -369,23 +365,25 @@ section('B. veo-prompt-scaffold declares itself an approximation');
   const omniDest  = buildVeoPrompt({ ...destArgs, caps: { promptByteCap: 20000 }, seedHasText: false });
   const grokDestOn = buildVeoPrompt({ ...destArgs, caps: { promptByteCap: 4096 } });
 
-  // The two halves of the claim, each asserted on its own so neither can carry
-  // the other: the line IS in the builder (Omni keeps it), and the 4096-byte
-  // cap is what removes it (Grok drops it).
-  check('B4 `Product:` IS still emitted by the builder — the 20000-byte Omni cap keeps it',
-    hasProd(omniDest),
+  check('B4 `Product:` is ABSENT at the 20000-byte Omni cap (Vaportek: catalog title is never interpolated)',
+    !hasProd(omniDest),
     `omni(dest) ${Buffer.byteLength(omniDest)}b hasProduct=${hasProd(omniDest)}`);
-  check('B4b at the 4096-byte cap the SAME builder DROPS it (enforceByteCap, /^Product: / heads DROP_PRIORITY)',
+  check('B4b `Product:` is ABSENT at the 4096-byte cap too (not a budget drop — the line is gone)',
     !hasProd(grokDest),
     `grok(dest) ${Buffer.byteLength(grokDest)}b hasProduct=${hasProd(grokDest)}`);
-  check('B4c so a `Product:` line present in one prompt and absent from another is a BUDGET difference, not two builders',
-    hasProd(omniDest) && !hasProd(grokDest));
+  check('B4c a catalog title of Vaportek does not appear in the assembled camera prompt',
+    !/vaportek/i.test(buildVeoPrompt({
+      ...destArgs,
+      product: { title: 'Vaportek Hooded Fishing Shirt' },
+      caps: { promptByteCap: 20000 }
+    })));
 
-  // OVER-CAP FINDING, worth pinning in its own right: with a destination
-  // profile AND the burned-in-text guard, a 4096-capped model's prompt still
-  // exceeds its HARD cap after every droppable line is gone — enforceByteCap
-  // logs "Atlas will reject" — and RETURNS THE OVER-CAP PROMPT ANYWAY rather
-  // than truncating it, so the over-cap body is what gets submitted.
+  // OVER-CAP FINDING, worth pinning in its own right: a 4096-capped model's
+  // prompt can still exceed its HARD cap after every droppable line is gone —
+  // enforceByteCap logs "Atlas will reject" — and RETURNS THE OVER-CAP PROMPT
+  // ANYWAY rather than truncating it, so the over-cap body is what gets
+  // submitted. If this check ever goes green-by-shrinking, the over-cap
+  // exposure closed and that is worth knowing.
   //
   // ⚠️ SCOPE CORRECTION (peer evidence, 2026-08-27). This is a LATENT defect for
   // the THREE registered 4096-capped models (grok-imagine-video-v1.5/i2v,
@@ -394,15 +392,11 @@ section('B. veo-prompt-scaffold declares itself an approximation');
   // master ran `paramShape: 'gemini-omni'`, and its own persisted
   // renderStages.videoSubmission records `promptBytes: 4170, promptByteCap:
   // 20000` — 21% of budget, nothing dropped. The 4168-vs-4170 closeness is a
-  // coincidence of prompt SIZE, not evidence of the drop mechanism, and I had
-  // inferred the wrong cap from the missing `Product:` line. At cap 20000
-  // nothing is dropped, so that line's absence on the real ad needs a different
-  // explanation (most likely a falsy `product.title`) which I have NOT verified
-  // and am not going to assert.
+  // coincidence of prompt SIZE, not evidence of the drop mechanism.
   //
-  // What IS measured and stands: at a 4096 cap this builder drops `Product:`
-  // first and still returns an over-cap prompt. If this check ever goes
-  // green-by-shrinking, the over-cap exposure closed and that is worth knowing.
+  // 2026-09-04: the missing `Product:` line is no longer a budget mystery.
+  // The line was removed entirely (Vaportek). Do not restore it to explain
+  // an old prompt-size observation.
   const onBytes = Buffer.byteLength(grokDestOn, 'utf8');
   // 2026-09-03: overlay guard stripped. This used to pin dest+guard > 4096.
   // Pin the current over-cap (or under-cap) honestly rather than keeping a

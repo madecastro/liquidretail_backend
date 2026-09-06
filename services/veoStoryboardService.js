@@ -65,7 +65,14 @@ function buildSystemPrompt() {
 
 function buildUserPrompt({ concept, brand, product, scene, lighting, mood, subject, aspectRatio, operatorPrompt }) {
   const lines = [];
-  lines.push(`Product: ${product?.title || '(untitled product)'}`);
+  // Catalog title is NEVER interpolated into a generative prompt.
+  // Same incident as veoPromptBuilder (2026-08-26): Omni painted a fake
+  // VAPORTEK lockup from a labelled `Product: {title}` line over a
+  // PELAGIC product. This GPT-storyboard user prompt is only reached
+  // when VIDEO_PROVIDER is vertex (atlas/gemini prepareStoryboard
+  // returns {storyboard:null}), but it is the same $0.90 hallucination
+  // door. Identity comes from product description + brand + scene,
+  // not a labelled title field.
   if (product?.description) lines.push(`Product description: ${product.description}`);
 
   if (brand?.name)          lines.push(`Brand: ${brand.name}`);

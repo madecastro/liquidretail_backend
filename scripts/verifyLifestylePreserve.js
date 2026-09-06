@@ -46,6 +46,21 @@ function check(name, cond, detail) {
   return false;
 }
 
+// 2026-09-04 Vaportek: catalog title is no longer interpolated. 9531ae9f
+// still emits `Product: {title}.`; current does not. Strip that one line
+// from a frozen assembled prompt so V2 keeps guarding OMNI/GROK text.
+function dropFrozenCatalogTitleLine(prompt, title) {
+  const needle = `Product: ${String(title)}.`;
+  const idx = String(prompt).indexOf(needle);
+  if (idx < 0) return prompt;
+  const before = prompt.slice(0, idx);
+  const after = prompt.slice(idx + needle.length);
+  if (before.endsWith(' ') && after.startsWith(' ')) return before + after.slice(1);
+  if (before.endsWith(' ')) return before.slice(0, -1) + after;
+  if (after.startsWith(' ')) return before + after.slice(1);
+  return before + after;
+}
+
 const REPO = path.join(__dirname, '..');
 const INTENTS_KEY = require.resolve('../services/staticAdIntents');
 const VEO_KEY = require.resolve('../services/veoPromptBuilder');
@@ -889,8 +904,8 @@ console.log('\n=== VIDEO lifestyle directives ===\n');
             hasProductReference, durationSec, seedHasText: false, caps
           };
           check(
-            `V2 prompt byte-identical to 9531ae9f (ref=${hasProductReference} dur=${durationSec} text=false caps=${caps ? 'omni' : 'def'})`,
-            mod.buildVeoPrompt(argsOff) === oldMod.buildVeoPrompt(argsOff)
+            `V2 prompt byte-identical to 9531ae9f minus the catalog-title line (ref=${hasProductReference} dur=${durationSec} text=false caps=${caps ? 'omni' : 'def'})`,
+            mod.buildVeoPrompt(argsOff) === dropFrozenCatalogTitleLine(oldMod.buildVeoPrompt(argsOff), argsOff.product.title)
           );
           check(
             `V2 seedHasText is a retired no-op (ref=${hasProductReference} dur=${durationSec} caps=${caps ? 'omni' : 'def'})`,

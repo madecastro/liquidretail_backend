@@ -105,6 +105,23 @@ function falsy(label, v) {
   check(label, !!v, false);
 }
 
+// 2026-09-04 Vaportek: catalog title is no longer interpolated into the
+// camera prompt. 9531ae9f still emits `Product: {title}.`; current does
+// not. Strip that one optional line from a frozen assembled prompt so
+// B14/B15/B16 keep guarding OMNI_DIRECTIVES / camera text, not the
+// removed door. Identity if the baseline already dropped it (4096 cap).
+function dropFrozenCatalogTitleLine(prompt, title) {
+  const needle = `Product: ${String(title)}.`;
+  const idx = String(prompt).indexOf(needle);
+  if (idx < 0) return prompt;
+  const before = prompt.slice(0, idx);
+  const after = prompt.slice(idx + needle.length);
+  if (before.endsWith(' ') && after.startsWith(' ')) return before + after.slice(1);
+  if (before.endsWith(' ')) return before.slice(0, -1) + after;
+  if (after.startsWith(' ')) return before + after.slice(1);
+  return before + after;
+}
+
 console.log('\nverifyPostPilotBatch\n');
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -443,8 +460,9 @@ let b14SkipReason = null;
             hasProductReference, durationSec, seedHasText: false, caps,
           };
           const label = `caps=${capName} productRef=${hasProductReference} dur=${durationSec}`;
-          check(`B14 dest=none built prompt is byte-identical to the 9531ae9f prompt (${label} seedText=false)`,
-            buildVeoPrompt({ ...argsOff }), oldMod.buildVeoPrompt({ ...argsOff }));
+          check(`B14 dest=none built prompt is byte-identical to 9531ae9f minus the catalog-title line (${label} seedText=false)`,
+            buildVeoPrompt({ ...argsOff }),
+            dropFrozenCatalogTitleLine(oldMod.buildVeoPrompt({ ...argsOff }), argsOff.product.title));
           const on = buildVeoPrompt({ ...argsOff, seedHasText: true });
           const off = buildVeoPrompt({ ...argsOff });
           check(`B14 seedHasText is a retired no-op (${label})`, on, off);
@@ -522,9 +540,9 @@ let b14SkipReason = null;
             caps: OMNI_CAPS, aspectRatio: '9:16', platformFormat: dest,
           };
           const label = `dest=${dest} productRef=${hasProductReference} dur=${durationSec}`;
-          check(`B15 switch=OFF Meta prompt is STILL byte-identical to 9531ae9f — the surviving PR #61 rollback guarantee (${label} seedText=false)`,
+          check(`B15 switch=OFF Meta prompt is STILL byte-identical to 9531ae9f minus the catalog-title line — the surviving PR #61 rollback guarantee (${label} seedText=false)`,
             withSwitch('false', () => buildVeoPrompt({ ...argsOff })),
-            oldMod.buildVeoPrompt({ ...argsOff }));
+            dropFrozenCatalogTitleLine(oldMod.buildVeoPrompt({ ...argsOff }), argsOff.product.title));
           const on = withSwitch('false', () => buildVeoPrompt({ ...argsOff, seedHasText: true }));
           const off = withSwitch('false', () => buildVeoPrompt({ ...argsOff }));
           check(`B15 seedHasText is a retired no-op (${label})`, on, off);
@@ -595,7 +613,7 @@ let b14SkipReason = null;
           platformFormat: 'meta_stories_9_16',
         };
         const label = `productRef=${hasProductReference} dur=${durationSec}`;
-        const frozen = oldMod.buildVeoPrompt({ ...args });
+        const frozen = dropFrozenCatalogTitleLine(oldMod.buildVeoPrompt({ ...args }), args.product.title);
         const { out: expected, notApplied } = applyHookFirstDelta(frozen, durationSec);
         check(`B16 all five documented hook-first edits still apply to the frozen base (${label})`,
           notApplied, []);

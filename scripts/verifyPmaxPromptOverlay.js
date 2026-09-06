@@ -91,6 +91,21 @@ let pass = 0;
 let fail = 0;
 const failures = [];
 
+// 2026-09-04 Vaportek: catalog title is no longer interpolated. 9531ae9f
+// still emits `Product: {title}.`; current does not. Strip that one line
+// from a frozen assembled prompt so V3 keeps guarding camera text.
+function dropFrozenCatalogTitleLine(prompt, title) {
+  const needle = `Product: ${String(title)}.`;
+  const idx = String(prompt).indexOf(needle);
+  if (idx < 0) return prompt;
+  const before = prompt.slice(0, idx);
+  const after = prompt.slice(idx + needle.length);
+  if (before.endsWith(' ') && after.startsWith(' ')) return before + after.slice(1);
+  if (before.endsWith(' ')) return before.slice(0, -1) + after;
+  if (after.startsWith(' ')) return before + after.slice(1);
+  return before + after;
+}
+
 function check(label, actual, expected) {
   const ok = arguments.length === 2
     ? !!actual
@@ -592,7 +607,10 @@ console.log('\nV3. destination-less prompt byte-identical to the 9531ae9f baseli
     console.log(`  ⏭  V3 SKIP (baseline unavailable): ${skipReason}`);
     console.log('      ⚠️  byte-identity to 9531ae9f was NOT verified in this run.');
   } else {
-    const baselineNoDest = oldMod.buildVeoPrompt({ ...VEO_ARGS_NO_DEST });
+    const baselineNoDest = dropFrozenCatalogTitleLine(
+      oldMod.buildVeoPrompt({ ...VEO_ARGS_NO_DEST }),
+      VEO_ARGS_NO_DEST.product.title
+    );
     for (const [arm, flag] of [['ON', 'true'], ['OFF', 'false']]) {
       const mod = loadVeoArm(flag);
       check(`V3 arm=${arm}: destination-less prompt byte-identical to the 9531ae9f baseline`,
