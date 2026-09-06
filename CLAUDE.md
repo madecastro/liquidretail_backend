@@ -886,13 +886,24 @@ Video never launches a browser.
   settles, then reconciles via the SAME confirmed-price read the image path
   uses (`resolveRecoveredVideoFailureCharge`, tri-state: confirmed-unbilled →
   zero the estimate; confirmed-billed with a real price → correct to it;
-  unknown → leave untouched). `MAX_POLL_MS` itself is UNCHANGED (600000) —
-  fresh Omni-only completion data (n=28, Aug 14-19) measures p99=215s/max=215s,
-  so 600s already carries ~2.8x headroom; the incident's two predictions were
-  still unresolved well past any plausible cap, so a bigger number would not
-  have helped and would have held a render slot open longer. Pinned by
-  `scripts/verifyVideoTimeoutReconcile.js`. Full write-up: `session.md`
-  2026-08-19.
+  unknown → leave untouched). `MAX_POLL_MS` was left at 600000 in that fix —
+  the then-available Omni-only completion data (n=28, Aug 14-19) measured
+  p99=215s/max=215s, so 600s looked like ~2.8x headroom; the incident's two
+  predictions were still unresolved well past any plausible cap, so a bigger
+  number would not have helped them and would have held a render slot open
+  longer. **SUPERSEDED 2026-09-04 (port of adgen PR #82):** a larger sample
+  (n=68, mean 229.7s / sd 124.5s / max 760.3s) put the OBSERVED maximum past
+  600s — that ceiling sat at a fitted p98.4, abandoning ~1 in 60 paid masters
+  mid-flight. `MAX_POLL_MS` is now **900000** (fitted p99.84, 1.18x the observed
+  max; `config/defaults.env` `ATLAS_TIMEOUT_MS=900000`) with the derivation in
+  `atlasVideoService.js` above the constant. Deliberately not higher: past this
+  the spend receipt + `bootRecoveryService` is the right mechanism, not a longer
+  blocking poll. The reframe lease floor is independent of this constant
+  (`verifyReframeHoldBounded.js` B6). Same port also landed the
+  resume-from-receipt gate (`shouldResumeAttempt`, `allowResume`) — see the
+  `veoPredictionId` bullet below and `scripts/verifyVideoResumeFromReceipt.js`.
+  Pinned by `scripts/verifyVideoTimeoutReconcile.js`. Full write-up:
+  `session.md` 2026-08-19.
 - **Ledger spend at the charge point, not the success point.** A billable submit that
   then fails still costs money. `atlasImageService.chargedError` records it and sets
   `err.charged`, which is the flag telling a caller that a direct-provider fallback

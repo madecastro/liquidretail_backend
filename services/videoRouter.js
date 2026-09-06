@@ -20,7 +20,9 @@
 // (videoSettings.provider, vertex-vs-atlas) is the natural future
 // extension of that same settings block.
 //   VIDEO_PROVIDER=atlas   → atlasVideoService (default — Atlas migration)
-//   VIDEO_PROVIDER=vertex  → aiVideoReferenceService (deprecated direct-Veo path, kept as fallback)
+//   VIDEO_PROVIDER=vertex  → aiVideoReferenceService (deprecated direct-Veo; now
+//                            reachable ONLY by naming it, never as a fall-through)
+//   anything else          → THROWS. See the else arm in generateForAd.
 
 const aiVideoReferenceService = require('./aiVideoReferenceService');
 const atlasVideoService       = require('./atlasVideoService');
@@ -65,18 +67,37 @@ async function prepareStoryboard({ ad, operatorPrompt = null, modelOverride = nu
 // same script.
 // modelOverride (optional) — per-run model slug from the operator's
 // regenerate dropdown; Atlas provider only (Vertex has a single model).
-async function generateForAd({ ad, operatorPrompt = null, storyboard = null, modelOverride = null, campaignRunId = null }) {
+async function generateForAd({
+  ad, operatorPrompt = null, storyboard = null, modelOverride = null, campaignRunId = null,
+  // Threaded through to atlasVideoService.generateForAd — see that
+  // function's shouldResumeAttempt doc comment. Default true matches the
+  // normal render path; adRegenerateService passes false explicitly.
+  allowResume = true
+}) {
   const provider = activeProvider();
   const t0 = Date.now();
 
   let result;
   if (provider === 'atlas') {
-    result = await atlasVideoService.generateForAd({ ad, operatorPrompt, storyboard, modelOverride, campaignRunId });
-  } else {
-    // Default: Vertex Veo direct. Backward compatible — no behavioral
-    // change for deployments that haven't set VIDEO_PROVIDER.
+    result = await atlasVideoService.generateForAd({ ad, operatorPrompt, storyboard, modelOverride, campaignRunId, allowResume });
+  } else if (provider === 'vertex') {
+    // Vertex is now reachable ONLY by naming it explicitly. It used to be the
+    // fall-through, which meant every typo and every new provider name landed
+    // on a deprecated paid path by default.
     result = await aiVideoReferenceService.generateForAd({ ad, operatorPrompt });
     if (result && result.model == null) result.model = 'google/veo-3.1';
+  } else {
+    // FAIL CLOSED. Previously this was the Vertex arm, so VIDEO_PROVIDER=gemeni
+    // (or any future value) silently generated on a third provider while the
+    // operator believed they had cut over. Refusing to render costs nothing;
+    // generating on the wrong provider costs a master and produces an asset
+    // nobody asked for. Backend has no gemini video module — atlas / vertex
+    // / throw-on-unknown only. Do not add a gemini arm here.
+    throw new Error(
+      `VIDEO_PROVIDER=${JSON.stringify(provider)} is not a recognised video provider ` +
+      `(expected 'atlas' or 'vertex'). Refusing to submit — an unknown ` +
+      `provider must never fall through to a billable default.`
+    );
   }
 
   if (result && !result.skipped) {

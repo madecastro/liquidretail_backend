@@ -3114,7 +3114,10 @@ async function renderOneInner(run, job, adId, index, renderToken) {
         // the existing poll tick). This outer label is the pre-enter marker
         // so a stall before the service even runs is still visible.
         adStage(adId, `master video generation (${ad.aspectRatio || '9:16'})`);
-        const veoResult = await veoGenerateForAd({ ad, storyboard, campaignRunId: run.runId });
+        // allowResume: true — EXPLICIT, matching the default, so a future
+        // reader of this call site cannot miss that a receipt-holding re-entry
+        // must resume rather than resubmit. adRegenerateService passes false.
+        const veoResult = await veoGenerateForAd({ ad, storyboard, campaignRunId: run.runId, allowResume: true });
         if (veoResult.skipped) {
           // Previously re-queued forever with no reason on the Ad — the board
           // showed "rendering" until the reaper, and the next Generate billed

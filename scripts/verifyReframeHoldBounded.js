@@ -256,7 +256,7 @@ async function main() {
     // decoupling is that the video knob cannot move the money guard.
     //
     // This MUST fork. MAX_POLL_MS is resolved ONCE at module load
-    // (`const MAX_POLL_MS = parseInt(process.env.ATLAS_TIMEOUT_MS, 10) || 600000`),
+    // (`const MAX_POLL_MS = parseInt(process.env.ATLAS_TIMEOUT_MS, 10) || 900000`),
     // so mutating process.env in-process and re-calling REFRAME_CLAIM_TTL_MS()
     // cannot observe the coupling at all — an earlier draft of this check did
     // exactly that and PASSED with the defect deliberately reinstated. It

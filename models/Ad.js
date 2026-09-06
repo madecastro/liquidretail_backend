@@ -515,14 +515,13 @@ const adSchema = new mongoose.Schema({
   // video we had paid for, with no handle to reclaim it, and the orphan reaper would
   // flip the ad back to 'queued' so the next run submitted AGAIN. That is a guaranteed
   // double charge, ~$1.00 a time. Not hypothetical here — Render's SIGKILL lands after
-  // a 300s drain window while MAX_POLL_MS is 10 minutes, so an in-flight poll cannot
+  // a 300s drain window while MAX_POLL_MS is 15 minutes, so an in-flight poll cannot
   // be drained cleanly.
   //
-  // Persisting it makes the orphan reconcilable: a restart can poll this id and finish
-  // the ad instead of re-submitting. Nothing consumes it that way YET — that resume
-  // path belongs with the render-queue move (ARCHITECTURE_REVIEW.md "The render-queue
-  // architecture problem"). Until then it is the audit trail that turns a silent
-  // double-bill into a visible orphan.
+  // Persisting it makes the orphan reconcilable: generateForAd's shouldResumeAttempt
+  // (allowResume && attempt===1 && a non-empty receipt) skips submitGeneration and
+  // polls THIS id instead of paying again. bootRecoveryService.peekPrediction is the
+  // out-of-band sweep of the same receipt.
   veoPredictionId:    { type: String, default: null },
   // MUST STAY DECLARED, and this pair shipped UNDECLARED in adgen #108 —
   // exactly the silent-drop this file warns about elsewhere.
