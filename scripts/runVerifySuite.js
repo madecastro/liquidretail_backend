@@ -534,7 +534,27 @@ function computeAffected(base) {
     else remaining.push(rel);
   }
 
-  // 2. Any other changed file: a verify script is affected if it genuinely,
+  // 2. Unknown first path segment (including `adgen/` after the graft) used
+  //    to select nothing and exit 0 — a silent false-green: CI would think
+  //    nothing needs testing when adgen code changed. Treat unknown as
+  //    "could not confidently resolve" and fall back to the FULL suite.
+  //    CORE_DIRS files still go through the graph + unresolved-core fallback
+  //    below; this is specifically the `adgen/src/services/foo.js` → `'adgen'`
+  //    ∉ CORE_DIRS → empty selection hole.
+  const unknownSeg = remaining.filter((rel) => {
+    const first = rel.split('/')[0];
+    return first && !CORE_DIRS.has(first);
+  });
+  if (unknownSeg.length) {
+    console.error(
+      `runVerifySuite: --affected saw unknown first path segment(s) ` +
+      `(${[...new Set(unknownSeg.map((r) => r.split('/')[0]))].join(', ')}) — ` +
+      `falling back to the FULL suite rather than selecting nothing.`
+    );
+    return null;
+  }
+
+  // 3. Any other changed file: a verify script is affected if it genuinely,
   //    statically references the changed file — checked by resolving each
   //    script's real dependency graph (transitive) and testing whether the
   //    changed file's own canonicalized absolute path appears in it. See the
@@ -557,7 +577,7 @@ function computeAffected(base) {
       }
     }
 
-    // 3. Fail loud, not silent: a changed file under a directory everything
+    // 4. Fail loud, not silent: a changed file under a directory everything
     //    else routinely depends on (CORE_DIRS) that still matched no real
     //    dependent is a signal the graph couldn't confidently resolve it —
     //    not proof it has zero dependents (e.g. models/Job.js today: a real,
