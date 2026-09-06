@@ -83,32 +83,166 @@ function signalsMemoKey({ brandId, productId, campaignKind } = {}) {
   return `${brandId || ''}|${productId || 'none'}|${campaignKind || ''}`;
 }
 
+function finiteNumber(v) {
+  return typeof v === 'number' && Number.isFinite(v);
+}
+
+function compactQuote(q) {
+  if (!q || typeof q !== 'object') return null;
+  if (typeof q.text !== 'string' || !q.text.trim()) return null;
+  // text + author only — never source / site-as-author extras.
+  // assembleSignals already ran quotes through toPrintableCustomerQuote.
+  return { text: q.text, author: q.author || null };
+}
+
+/**
+ * Compact performance_signal for the video-title prompt.
+ * Forwards raw likes/comments/saves/shares + strength + top_post.
+ * Omits the assembled mean-engagement figure: that field is an absolute
+ * IG interaction count documented as a 0–1 rate (audit R6). Copying it
+ * would spread the unit bug into titling.
+ */
+function compactPerformanceForVideo(perf) {
+  if (!perf || typeof perf !== 'object') return null;
+  const out = {};
+  for (const k of ['likes', 'comments', 'saves', 'shares']) {
+    if (finiteNumber(perf[k]) && perf[k] > 0) out[k] = perf[k];
+  }
+  if (typeof perf.strength === 'string' && perf.strength.trim()
+      && perf.strength !== 'absent') {
+    out.strength = perf.strength;
+  }
+  if (perf.top_post && typeof perf.top_post === 'object') {
+    const tp = {};
+    for (const k of ['likes', 'comments', 'saves']) {
+      if (finiteNumber(perf.top_post[k]) && perf.top_post[k] > 0) {
+        tp[k] = perf.top_post[k];
+      }
+    }
+    if (typeof perf.top_post.caption === 'string' && perf.top_post.caption.trim()) {
+      tp.caption = perf.top_post.caption;
+    }
+    if (Object.keys(tp).length) out.top_post = tp;
+  }
+  return Object.keys(out).length ? out : null;
+}
+
+/**
+ * Compact ugc_signal — shot mix / counts / rights / top_creator.
+ * followers is copied only when it is a real number; ingest never writes
+ * creatorFollowerCount, so the assembled value is almost always null.
+ */
+function compactUgcForVideo(signal) {
+  if (!signal || typeof signal !== 'object') return null;
+  const out = {};
+  if (typeof signal.platform === 'string' && signal.platform.trim()) {
+    out.platform = signal.platform;
+  }
+  if (finiteNumber(signal.media_count)) out.media_count = signal.media_count;
+  if (typeof signal.media_strength === 'string' && signal.media_strength.trim()) {
+    out.media_strength = signal.media_strength;
+  }
+  if (signal.rights_approved != null) out.rights_approved = !!signal.rights_approved;
+  for (const k of [
+    'shot_type_distribution',
+    'content_nature_distribution',
+    'file_type_distribution',
+  ]) {
+    if (signal[k] && typeof signal[k] === 'object' && !Array.isArray(signal[k])
+        && Object.keys(signal[k]).length) {
+      out[k] = signal[k];
+    }
+  }
+  if (finiteNumber(signal.avg_ad_readiness)) {
+    out.avg_ad_readiness = signal.avg_ad_readiness;
+  }
+  if (Array.isArray(signal.primary_subjects) && signal.primary_subjects.length) {
+    const subjects = signal.primary_subjects
+      .filter((s) => typeof s === 'string' && s.trim())
+      .slice(0, 5);
+    if (subjects.length) out.primary_subjects = subjects;
+  }
+  if (signal.top_creator && typeof signal.top_creator === 'object'
+      && typeof signal.top_creator.handle === 'string'
+      && signal.top_creator.handle.trim()) {
+    const tc = { handle: signal.top_creator.handle };
+    if (typeof signal.top_creator.platform === 'string'
+        && signal.top_creator.platform.trim()) {
+      tc.platform = signal.top_creator.platform;
+    }
+    if (finiteNumber(signal.top_creator.followers)) {
+      tc.followers = signal.top_creator.followers;
+    }
+    out.top_creator = tc;
+  }
+  return Object.keys(out).length ? out : null;
+}
+
+function compactProofOption(opt) {
+  if (!opt || typeof opt !== 'object') return null;
+  const row = {};
+  if (typeof opt.tier === 'string' && opt.tier.trim()) row.tier = opt.tier;
+  if (finiteNumber(opt.rating)) row.rating = opt.rating;
+  if (opt.review_count != null && finiteNumber(Number(opt.review_count))) {
+    row.review_count = opt.review_count;
+  }
+  if (typeof opt.reviews_text === 'string' && opt.reviews_text.trim()) {
+    row.reviews_text = opt.reviews_text;
+  }
+  if (Array.isArray(opt.quotes) && opt.quotes.length) {
+    const quotes = opt.quotes.map(compactQuote).filter(Boolean);
+    if (quotes.length) row.quotes = quotes;
+  }
+  return (row.tier || row.rating != null || row.review_count != null
+    || row.reviews_text || row.quotes) ? row : null;
+}
+
 /**
  * Compact printable social_proof_signal for the video-title prompt.
  * assembleSignals already ran quotes through toPrintableCustomerQuote —
- * never re-read raw bylines here.
+ * never re-read raw bylines here. Optional second arg is performance_signal
+ * from the same assembleSignals return (sibling key, not a child).
  */
-function printableSocialProofForVideo(signal) {
-  if (!signal || typeof signal !== 'object') return null;
+function printableSocialProofForVideo(signal, performanceSignal) {
+  if ((!signal || typeof signal !== 'object')
+      && (!performanceSignal || typeof performanceSignal !== 'object')) {
+    return null;
+  }
+  const src = (signal && typeof signal === 'object') ? signal : {};
   const out = {};
-  if (signal.rating && typeof signal.rating.value === 'number') {
-    out.rating = signal.rating;
+  if (src.rating && typeof src.rating.value === 'number') {
+    out.rating = src.rating;
   }
-  if (signal.primary_quote && typeof signal.primary_quote.text === 'string'
-      && signal.primary_quote.text.trim()) {
-    out.primary_quote = {
-      text: signal.primary_quote.text,
-      author: signal.primary_quote.author || null
-    };
-  }
-  if (Array.isArray(signal.top_comments) && signal.top_comments.length) {
-    out.top_comments = signal.top_comments.slice(0, 2).map((c) => ({
-      text: c && c.text,
-      author: (c && c.author) || null
-    })).filter((c) => c.text);
+  const primary = compactQuote(src.primary_quote);
+  if (primary) out.primary_quote = primary;
+  if (Array.isArray(src.top_comments) && src.top_comments.length) {
+    out.top_comments = src.top_comments.slice(0, 2).map((c) => {
+      const row = compactQuote(c);
+      if (!row) return null;
+      if (finiteNumber(c.likes)) row.likes = c.likes;
+      return row;
+    }).filter(Boolean);
     if (!out.top_comments.length) delete out.top_comments;
   }
-  if (signal.strongest_signal) out.strongest_signal = signal.strongest_signal;
+  if (src.strongest_signal) out.strongest_signal = src.strongest_signal;
+  if (Array.isArray(src.proof_options) && src.proof_options.length) {
+    const opts = src.proof_options.map(compactProofOption).filter(Boolean);
+    if (opts.length) out.proof_options = opts;
+  }
+  // Flag-gated in assembleSignals (QUOTE_STAGE_AWARE + quote-pool align).
+  // Absent on a default boot; copy through when present so a flag flip
+  // reaches video without a second assembly path.
+  if (src.quotes_by_stage && typeof src.quotes_by_stage === 'object'
+      && !Array.isArray(src.quotes_by_stage)) {
+    const by = {};
+    for (const [stage, q] of Object.entries(src.quotes_by_stage)) {
+      const compact = compactQuote(q);
+      if (compact) by[stage] = compact;
+    }
+    if (Object.keys(by).length) out.quotes_by_stage = by;
+  }
+  const perf = compactPerformanceForVideo(performanceSignal);
+  if (perf) out.performance = perf;
   return Object.keys(out).length ? out : null;
 }
 
@@ -158,7 +292,8 @@ function occupancyBrief({ size, profile }) {
 }
 
 function buildDirectorMessages({
-  size, profile, occupancy, benefits, productSignal, brandSignal, socialProofSignal
+  size, profile, occupancy, benefits, productSignal, brandSignal,
+  socialProofSignal, ugcSignal, performanceSignal,
 } = {}) {
   const system = [
     'You are the video-titling Director. You decide whether a benefits slot belongs on THIS video content profile × size, given the product, the intent, and how much of the title stack is already committed.',
@@ -173,7 +308,15 @@ function buildDirectorMessages({
     '- 9:16 is a tight portrait box (Reels/Stories/Shorts family). 16:9 is looser landscape.',
     '- max_items is 3 on 9:16, 4 on 16:9, and never more than the available list.',
     '- Do not invent benefits. If the list is empty, include_benefits must be false.',
-    '- Product description, specs, and printable social proof (when present) ground the include/phase call. They are not extra slots.',
+    '- Product description, specs, review summary, price, brand description / tagline / tone / brand_reviews_summary, personas, UGC, performance counts, and printable social proof (when present) ground the include/phase call. They are not extra slots.',
+    '- If a signal is absent / null / empty, do not treat it as present.',
+    '- HONESTY RULE: if primary_quote is null AND top_comments is empty AND rating is null AND proof_options is absent/empty, there is no proof to lean on — decide from benefits/specs/description only. Do not promise proof the data can\'t back. When proof_options IS present, proof can inform include/phase — but only in that option\'s own scope (see PROOF MENU), never as this product\'s own number.',
+    '- A high rating with a large count (≥4.5 from ≥50) is credible on its own. A high rating from a small count is not — lean on the quote instead of the number.',
+    '- PROOF MENU: proof_options (when present) lists product / category / brand tiers, each with a pre-scoped reviews_text. If you reason from a category or brand option, keep that option\'s own scope (e.g. "loved across our whole line" / "brand-wide") — NEVER phrase a category or brand number as if it belonged to this specific product. This menu does not change what the title renderer prints; it only grounds include/phase.',
+    '- PERSONAS: brand personas (when present) inform voice and objection framing ONLY. Never use a persona as a quote author, never invent a testimonial. A persona is who the title is FOR, not who is speaking.',
+    '- PERFORMANCE: likes/comments/saves/shares and top_post are engagement COUNTS. If a single post dramatically outperforms the others, a proof-phase include is justified. Do not invent a rate; do not treat a small absolute count as high engagement.',
+    '- UGC: shot mix / media_count / rights_approved / top_creator (when present) describe the matched social set. Lifestyle/on_model mix supports a proof/benefits include; product_only is not a stop. A top_creator handle is an authenticity cue, not a testimonial author. Do not invent follower counts.',
+    '- PRICE is positioning (aspirational vs accessible), never a slot or a discount claim. No currency amount, "% off", "discount", "sale", or "savings" belongs in a printed title.',
     '- Thin data is not a stop: decide with what you have.',
   ].join('\n');
 
@@ -184,8 +327,17 @@ function buildDirectorMessages({
     `PRODUCT: ${productSignal?.name || 'unknown'}`,
   ];
   if (brandSignal?.tagline) userLines.push(`BRAND TAGLINE: ${brandSignal.tagline}`);
+  if (brandSignal?.description) {
+    userLines.push(`BRAND DESCRIPTION: ${brandSignal.description}`);
+  }
   if (Array.isArray(brandSignal?.tone) && brandSignal.tone.length) {
     userLines.push(`BRAND TONE: ${JSON.stringify(brandSignal.tone)}`);
+  }
+  if (brandSignal?.brand_reviews_summary) {
+    userLines.push(`BRAND REVIEWS SUMMARY: ${brandSignal.brand_reviews_summary}`);
+  }
+  if (Array.isArray(brandSignal?.personas) && brandSignal.personas.length) {
+    userLines.push(`BRAND PERSONAS: ${JSON.stringify(brandSignal.personas)}`);
   }
   if (productSignal?.description) {
     userLines.push(`PRODUCT DESCRIPTION: ${productSignal.description}`);
@@ -193,9 +345,22 @@ function buildDirectorMessages({
   if (Array.isArray(productSignal?.specs) && productSignal.specs.length) {
     userLines.push(`PRODUCT SPECS: ${JSON.stringify(productSignal.specs)}`);
   }
+  if (productSignal?.review_summary) {
+    userLines.push(`PRODUCT REVIEW SUMMARY: ${productSignal.review_summary}`);
+  }
+  if (productSignal?.price != null && productSignal.price !== ''
+      && typeof productSignal.price !== 'object') {
+    const priceBits = [String(productSignal.price)];
+    if (typeof productSignal.currency === 'string' && productSignal.currency.trim()) {
+      priceBits.push(productSignal.currency.trim());
+    }
+    userLines.push(`PRODUCT PRICE: ${priceBits.join(' ')}`);
+  }
   userLines.push(`BENEFITS AVAILABLE: ${JSON.stringify(benefits)}`);
-  const proof = printableSocialProofForVideo(socialProofSignal);
+  const proof = printableSocialProofForVideo(socialProofSignal, performanceSignal);
   if (proof) userLines.push(`SOCIAL PROOF: ${JSON.stringify(proof)}`);
+  const ugc = compactUgcForVideo(ugcSignal);
+  if (ugc) userLines.push(`UGC: ${JSON.stringify(ugc)}`);
   userLines.push(
     `BASE LAYOUT: ${occupancy.intentPreset} format=${occupancy.format} target_phase=${occupancy.phase}`,
     `SLOTS ALREADY IN TARGET PHASE: ${occupancy.slots.join(', ') || '(none)'}`,
@@ -277,6 +442,8 @@ async function runVideoTitleDirector({
     productSignal: signals.product_signal,
     brandSignal: signals.brand_signal,
     socialProofSignal: signals.social_proof_signal,
+    ugcSignal: signals.ugc_signal,
+    performanceSignal: signals.performance_signal,
   });
 
   const completion = await chatCompletion(
@@ -441,4 +608,6 @@ module.exports = {
   buildBenefitsSlot,
   buildDirectorMessages,
   printableSocialProofForVideo,
+  compactPerformanceForVideo,
+  compactUgcForVideo,
 };
