@@ -71,8 +71,14 @@
 //   mv /tmp/helpers.js.bak src/services/reviewAdapters/helpers.js   → restore
 //   node scripts/verifyRequireGraph.js                              → pass again
 
+const assert = require('assert');
 const path = require('path');
 const { assertBackendRoot } = require('./lib/siblingBackend');
+
+// Freeze-N is the post-graft measured edge count (2026-09-06, this worktree).
+// Do not reuse 496 — that was a stale pre-graft number. A missing src/
+// used to print ✅ 0/0. Both asserts are load-bearing.
+const FREEZE_N = 512;
 const {
   fileExists,
   dirExists,
@@ -196,6 +202,12 @@ function main() {
     for (const f of failures) console.log(`   • ${f}`);
     process.exit(1);
   }
+  assert.ok(total > 0, 'verifyRequireGraph: total is 0 — src/ missing or scanner found nothing (a missing src/ used to print ✅ 0/0)');
+  assert.strictEqual(
+    total,
+    FREEZE_N,
+    `verifyRequireGraph: require-edge count drifted from freeze-N ${FREEZE_N} to ${total}. If this is a real graph change, update FREEZE_N in this file in the same commit.`
+  );
   console.log(`\n✅ verifyRequireGraph: ${total}/${total} require target(s) resolved`);
 }
 
