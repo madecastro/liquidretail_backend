@@ -1,6 +1,9 @@
 const axios = require('axios');
 const FormData = require('form-data');
 
+// Test seam for detectBatch only — live DetectRun `/detect` stays on axios.
+let _detectBatchPost = null;
+
 // Env-driven so prod + staging can each target their own YOLO Docker
 // service. Fallback matches the pre-2026-08-10-split hard-coded URL
 // so an env that never sets YOLO_SERVICE_URL (local dev, one-service
@@ -63,12 +66,15 @@ async function detectBatch(items) {
     }
     try {
       console.log(`➡️  Sending BATCH to YOLO (n=${list.length})${attempt > 0 ? ` (retry ${attempt})` : ''}: ${url}`);
-      const res = await axios.post(url, form, {
+      const post = _detectBatchPost || ((u, d, o) => axios.post(u, d, o));
+      const res = await post(url, form, {
         headers: form.getHeaders(),
         responseType: 'json',
-        // Batch is heavier than /detect — scale timeout with size so a
-        // 6-image batch on a cold Grounding DINO instance still finishes.
-        timeout: Math.max(YOLO_TIMEOUT_MS, YOLO_TIMEOUT_MS * Math.ceil(list.length / 2)),
+        // Cap at YOLO_TIMEOUT_MS (120s). Render's edge kills idle upstream
+        // at ~100s; waiting longer does not get a response. The previous
+        // ceil(n/2) multiplier made an 8-image batch wait 480s and then
+        // retried while gunicorn still held the first request.
+        timeout: YOLO_TIMEOUT_MS,
         maxContentLength: Infinity,
         maxBodyLength: Infinity
       });
@@ -105,8 +111,15 @@ async function detectBatch(items) {
       };
     } catch (err) {
       lastErr = err;
-      if (!isTransientYoloError(err)) {
-        const kind = classifyYoloError(err);
+      const kind = classifyYoloError(err);
+      if (isInFlightYoloKind(kind)) {
+        console.warn(`⚠️  YOLO batch in-flight failure (${kind}) — not retrying: ${err.message}`);
+        const e = new Error(`yolo-batch:${kind}: ${err.message || 'call failed'}`);
+        e.yoloKind = kind;
+        e.yoloCode = readYoloBodyCode(err);
+        throw e;
+      }
+      if (!isTransientYoloError(err) && !isSetupTransient(err)) {
         const permanent = isPermanentYoloError(err);
         console.error(`❌ YOLO batch failed (non-transient${permanent ? ', PERMANENT' : ''}, ${kind}):`, err.response?.data || err.message);
         const e = new Error(`yolo-batch:${kind}: ${err.message || 'call failed'}`);
@@ -115,7 +128,7 @@ async function detectBatch(items) {
         e.permanent = permanent;
         throw e;
       }
-      console.warn(`⚠️  YOLO batch transient failure (attempt ${attempt + 1}): ${err.code || err.message}`);
+      console.warn(`⚠️  YOLO batch setup-transient failure (attempt ${attempt + 1}): ${err.code || err.message}`);
     }
   }
   const kind = classifyYoloError(lastErr);
@@ -141,6 +154,20 @@ function isTransientYoloError(err) {
   // axios timeout returns ECONNABORTED OR err.message includes 'timeout'
   if (typeof err?.message === 'string' && /timeout|reset/i.test(err.message)) return true;
   return false;
+}
+
+// Connection-setup failures: the request likely never reached a worker,
+// so a retry is a first attempt, not a pile-on. Distinct from in-flight
+// timeout/reset, which detectBatch must NOT retry.
+function isSetupTransient(err) {
+  const code = err?.code;
+  return code === 'ECONNREFUSED' || code === 'ENOTFOUND';
+}
+
+// In-flight timeout/reset: the server may still be holding the first
+// request. Shared by detectBatch and _callYolo — do not retry either.
+function isInFlightYoloKind(kind) {
+  return kind === 'client-timeout' || kind === 'conn-reset' || kind === 'conn-timeout';
 }
 
 // Classify an axios failure into a short kind so run.flags.yoloError
@@ -204,6 +231,8 @@ function isPermanentYoloError(err) {
   return !!(bodyCode && PERMANENT_YOLO_CODES.has(bodyCode));
 }
 
+let _callYoloPost = null;
+
 async function _callYolo(url, form) {
   let lastErr = null;
   for (let attempt = 0; attempt <= YOLO_RETRY_ATTEMPTS; attempt++) {
@@ -213,7 +242,8 @@ async function _callYolo(url, form) {
     }
     try {
       console.log(`➡️  Sending to YOLO${attempt > 0 ? ` (retry ${attempt})` : ''}: ${url}`);
-      const res = await axios.post(url, form, {
+      const post = _callYoloPost || ((u, d, o) => axios.post(u, d, o));
+      const res = await post(url, form, {
         headers: form.getHeaders(),
         responseType: 'json',
         timeout: YOLO_TIMEOUT_MS
@@ -244,9 +274,16 @@ async function _callYolo(url, form) {
     } catch (err) {
       lastErr = err;
       const detail = err.response?.data || err.message;
+      const kind = classifyYoloError(err);
+      if (isInFlightYoloKind(kind)) {
+        console.warn(`⚠️  YOLO in-flight failure (${kind}) — not retrying: ${err.message}`);
+        const e = new Error(`yolo:${kind}: ${err.message || 'call failed'}`);
+        e.yoloKind = kind;
+        e.yoloCode = readYoloBodyCode(err);
+        throw e;
+      }
       // Non-transient failures (4xx, parse errors, etc.) → fail fast
-      if (!isTransientYoloError(err)) {
-        const kind = classifyYoloError(err);
+      if (!isTransientYoloError(err) && !isSetupTransient(err)) {
         const permanent = isPermanentYoloError(err);
         console.error(`❌ YOLO detection failed (non-transient${permanent ? ', PERMANENT' : ''}, ${kind}):`, detail);
         const e = new Error(`yolo:${kind}: ${err.message || 'call failed'}`);
@@ -255,8 +292,7 @@ async function _callYolo(url, form) {
         e.permanent = permanent;
         throw e;
       }
-      console.warn(`⚠️  YOLO transient failure (attempt ${attempt + 1}): ${err.code || err.message}`);
-      // Loop to retry; if attempts exhausted, fall through to throw below.
+      console.warn(`⚠️  YOLO setup-transient failure (attempt ${attempt + 1}): ${err.code || err.message}`);
     }
   }
   const kind = classifyYoloError(lastErr);
@@ -266,4 +302,20 @@ async function _callYolo(url, form) {
   throw e;
 }
 
-module.exports = { detectMultipleProducts, detectFromVideo, detectBatch };
+module.exports = {
+  detectMultipleProducts,
+  detectFromVideo,
+  detectBatch,
+  classifyYoloError,
+  isTransientYoloError,
+  isPermanentYoloError,
+  isSetupTransient,
+  isInFlightYoloKind,
+  YOLO_TIMEOUT_MS,
+  YOLO_RETRY_ATTEMPTS,
+  YOLO_RETRY_DELAY_MS,
+  __test: {
+    setDetectBatchPost(fn) { _detectBatchPost = fn || null; },
+    setCallYoloPost(fn) { _callYoloPost = fn || null; }
+  }
+};

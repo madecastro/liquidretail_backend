@@ -2622,6 +2622,11 @@ Full detail in `docs/ATLAS.md` §7 and `docs/CLOUDINARY-VIDEO.md`. Headlines:
 - **`GET /api/ads/formats`** returns `formatCatalog()` verbatim — display-only,
   brand-agnostic, no `brandId` (`routes/ads.js:1998-2000`). Must stay
   registered above `/:id`.
+- **Post-sync reconcile must not stack YOLO chains.** The 30-minute tick used
+  to re-fire any `failed` `catalog-post-sync` with no live-chain skip (6N YOLO
+  load). Guard + in-process registry + shared 6-slot limiter + breaker; do not
+  restore unbounded `{status:'failed'}` or put the limiter in `yoloService`
+  (live DetectRun stays uncapped). Write-up: `session.d/2026-09-06_reconcile-sweep-runaway.md`.
 
 ---
 

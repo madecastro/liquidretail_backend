@@ -131,7 +131,7 @@ const SPEC = Object.freeze({
     min: 1,
     max: 32,
     ceiling: 'SELF-IMPOSED',
-    why: 'Products in flight during catalog YOLO detection. Each product processes CATALOG_YOLO_ALT_LIMIT+1 Media serially, so effective HTTP load on yolo_microservice is CATALOG_YOLO_CONCURRENCY × (ALT_LIMIT+1) — with defaults 6 × 8 = 48 sequential calls per product wave. yolo_microservice today runs GUNICORN_WORKERS=2 so most requests queue there; raising here without raising there just moves the queue. YOLOv8x holds ~500MB RSS per worker — budget headroom before scaling the microservice.'
+    why: 'Products in flight during catalog YOLO detection. Each product submits ONE /detect-batch (hero + alts), so effective HTTP load is CATALOG_YOLO_CONCURRENCY concurrent /detect-batch calls — default 6, not 6×8=48 sequential /detect (batch shipped in 0e892463). Sized at 6 against a reported 12-slot cluster (3 instances × 4 gunicorn workers; UNVERIFIED in this repo). GUNICORN_WORKERS=2 + TIMEOUT=100 in defaults.env:866 is stale vs that 4×3 report. yoloLoadLimiter enforces the 6 process-wide so overlapping chains cannot stack. YOLOv8x holds ~500MB RSS per worker — budget headroom before scaling the microservice.'
   },
 
   // ── Hardcoded literals moved here (current behaviour as defaults) ───

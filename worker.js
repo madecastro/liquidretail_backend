@@ -142,6 +142,8 @@ const PREPARE_STALE_MIN  = prepareStaleMin();
 const WATCHDOG_INTERVAL_MIN = Math.max(1, parseInt(process.env.ALERT_WATCHDOG_INTERVAL_MIN, 10) || 5);
 
 const alerts = require('./services/alertService');
+const { createTickGuard } = require('./services/housekeepingTickGuard');
+const yoloLoadLimiter = require('./services/yoloLoadLimiter');
 // Receipt guard for every rendering->queued requeue — see services/spendReceipt.js.
 const { receiptFree, HAS_RECEIPT } = require('./services/spendReceipt');
 // Requeue pipeline — the reaper fires at an arbitrary point in a render, so a
@@ -262,9 +264,11 @@ mongoose.connect(process.env.MONGODB_URI, {
   console.log(`🎫 housekeeping lease: ${isLeader ? 'ACQUIRED' : 'held by another instance'} (id=${housekeepingLease.INSTANCE_ID})`);
 
   const { runWatchdog } = require('./services/backlogWatchdog');
+  const watchdogGuard = createTickGuard('watchdog');
   const watchdogTick = () => {
     if (!housekeepingLease.holds()) return;
-    return runWatchdog().catch(err => console.warn(`⚠️  watchdog failed: ${err.message}`));
+    return watchdogGuard(() => runWatchdog())
+      .catch(err => console.warn(`⚠️  watchdog failed: ${err.message}`));
   };
   setTimeout(watchdogTick, 90 * 1000);
   setInterval(watchdogTick, WATCHDOG_INTERVAL_MIN * 60 * 1000);
@@ -294,7 +298,8 @@ mongoose.connect(process.env.MONGODB_URI, {
     console.log('🗃️  queued archive: disabled (QUEUED_ARCHIVE_ENABLED=false)');
   } else {
     const archiveIntervalMin = Math.max(1, parseInt(process.env.QUEUED_ARCHIVE_INTERVAL_MIN, 10) || 15);
-    const archiveTick = () => sweepQueuedLeftovers()
+    const archiveGuard = createTickGuard('queued-archive');
+    const archiveTick = () => archiveGuard(() => sweepQueuedLeftovers())
       .catch(err => console.warn(`⚠️  queued archive failed: ${err.message}`));
     setTimeout(archiveTick, 90 * 1000);
     setInterval(archiveTick, archiveIntervalMin * 60 * 1000);
@@ -316,52 +321,70 @@ mongoose.connect(process.env.MONGODB_URI, {
   } else {
     const yoloBackfillIntervalMin = Math.max(1, parseInt(process.env.CATALOG_YOLO_BACKFILL_INTERVAL_MIN, 10) || 15);
     const yoloBackfillBatchSize   = Math.max(1, parseInt(process.env.CATALOG_YOLO_BACKFILL_BATCH_SIZE, 10) || 20);
+    const yoloBackfillGuard = createTickGuard('yolo-backfill');
     const yoloBackfillTick = async () => {
       if (!housekeepingLease.holds()) return;
-      try {
-        const Media = require('./models/Media');
-        const { detectYoloForMedia } = require('./services/mediaYoloRefine');
-        // Filter on yoloDetectedAt:null — NOT refinedProducts emptiness.
-        // A Media that fails PERMANENTLY (Cloudinary error page, bad
-        // bytes, decode failure) stamps yoloDetectedAt + yoloFailReason
-        // in mediaYoloRefine so it exits the queue after one attempt;
-        // a Media that succeeds also stamps yoloDetectedAt. The old
-        // query re-drove poisoned URLs every tick forever (Prod 500s
-        // 2026-08-31 traced to exactly that loop). Transient failures
-        // don't stamp anything and roll around next tick as intended.
-        //
-        // Legacy Media that pre-date yoloDetectedAt (pre-bb91303) may
-        // have non-empty refinedProducts + null yoloDetectedAt; those
-        // enter this query and short-circuit inside detectYoloForMedia
-        // via the already-refined check — cheap DB read, no HTTP call.
-        const stale = await Media.find({
-          source: 'catalog-product',
-          yoloDetectedAt: null,
-          $or: [
-            { refinedProducts: { $exists: false } },
-            { refinedProducts: { $size: 0 } }
-          ]
-        })
-          .sort({ createdAt: 1 })
-          .limit(yoloBackfillBatchSize)
-          .lean();
-        if (!stale.length) return;
-        console.log(`🎯 yolo backfill: draining ${stale.length} stale catalog Media`);
-        let ok = 0, failed = 0, skipped = 0;
-        for (const media of stale) {
-          try {
-            const r = await detectYoloForMedia(media, { trigger: 'backfill' });
-            if (r.status === 'ok') ok++;
-            else skipped++;
-          } catch (err) {
-            failed++;
-            console.warn(`   ⚠️  yolo backfill ${media._id}: ${err.message}`);
-          }
+      return yoloBackfillGuard(async () => {
+        if (yoloLoadLimiter.isOpen()) {
+          console.log('🎯 yolo backfill: skipped (circuit open)');
+          return { skipped: true, reason: 'circuit-open' };
         }
-        console.log(`🎯 yolo backfill done — ok=${ok} skipped=${skipped} failed=${failed}`);
-      } catch (err) {
-        console.warn(`⚠️  yolo backfill tick failed: ${err.message}`);
-      }
+        try {
+          const Media = require('./models/Media');
+          const { detectYoloForMedia } = require('./services/mediaYoloRefine');
+          const { classifyYoloError } = require('./services/yoloService');
+          // Filter on yoloDetectedAt:null — NOT refinedProducts emptiness.
+          // A Media that fails PERMANENTLY (Cloudinary error page, bad
+          // bytes, decode failure) stamps yoloDetectedAt + yoloFailReason
+          // in mediaYoloRefine so it exits the queue after one attempt;
+          // a Media that succeeds also stamps yoloDetectedAt. The old
+          // query re-drove poisoned URLs every tick forever (Prod 500s
+          // 2026-08-31 traced to exactly that loop). Transient failures
+          // don't stamp anything and roll around next tick as intended.
+          //
+          // Legacy Media that pre-date yoloDetectedAt (pre-bb91303) may
+          // have non-empty refinedProducts + null yoloDetectedAt; those
+          // enter this query and short-circuit inside detectYoloForMedia
+          // via the already-refined check — cheap DB read, no HTTP call.
+          const stale = await Media.find({
+            source: 'catalog-product',
+            yoloDetectedAt: null,
+            $or: [
+              { refinedProducts: { $exists: false } },
+              { refinedProducts: { $size: 0 } }
+            ]
+          })
+            .sort({ createdAt: 1 })
+            .limit(yoloBackfillBatchSize)
+            .lean();
+          if (!stale.length) return;
+          console.log(`🎯 yolo backfill: draining ${stale.length} stale catalog Media`);
+          let ok = 0, failed = 0, skipped = 0;
+          for (const media of stale) {
+            if (yoloLoadLimiter.isOpen()) break;
+            await yoloLoadLimiter.acquire();
+            try {
+              const r = await detectYoloForMedia(media, { trigger: 'backfill' });
+              yoloLoadLimiter.recordOutcome({ transient: false });
+              if (r.status === 'ok') ok++;
+              else skipped++;
+            } catch (err) {
+              failed++;
+              const kind = err.yoloKind || classifyYoloError(err);
+              yoloLoadLimiter.recordOutcome({
+                transient: yoloLoadLimiter.isTransientForBreaker(kind),
+                remaining: stale.length - ok - failed - skipped
+              });
+              console.warn(`   ⚠️  yolo backfill ${media._id}: ${err.message}`);
+            } finally {
+              yoloLoadLimiter.release();
+            }
+          }
+          console.log(`🎯 yolo backfill done — ok=${ok} skipped=${skipped} failed=${failed}`);
+        } catch (err) {
+          console.warn(`⚠️  yolo backfill tick failed: ${err.message}`);
+        }
+      });
     };
     setTimeout(yoloBackfillTick, 90 * 1000);
     setInterval(yoloBackfillTick, yoloBackfillIntervalMin * 60 * 1000);
@@ -391,17 +414,28 @@ mongoose.connect(process.env.MONGODB_URI, {
     const postSyncIntervalMin  = Math.max(1, parseInt(process.env.POST_SYNC_RECONCILE_INTERVAL_MIN, 10) || 30);
     const postSyncBatchSize    = Math.max(1, parseInt(process.env.POST_SYNC_RECONCILE_BATCH_SIZE, 10) || 5);
     const postSyncStaleMinutes = Math.max(1, parseInt(process.env.POST_SYNC_RECONCILE_STALE_MIN, 10) || 30);
+    const postSyncGuard = createTickGuard('post-sync-reconcile');
     const postSyncReconcileTick = async () => {
       if (!housekeepingLease.holds()) return;
-      try {
-        const { sweepIncompleteBrands } = require('./services/catalogPostSyncOrchestrator');
-        await sweepIncompleteBrands({
-          batchSize:    postSyncBatchSize,
-          staleMinutes: postSyncStaleMinutes
-        });
-      } catch (err) {
-        console.warn(`⚠️  post-sync reconcile tick failed: ${err.message}`);
-      }
+      return postSyncGuard(async () => {
+        try {
+          const orch = require('./services/catalogPostSyncOrchestrator');
+          const result = await orch.sweepIncompleteBrands({
+            batchSize:    postSyncBatchSize,
+            staleMinutes: postSyncStaleMinutes
+          }) || {};
+          const breaker = yoloLoadLimiter.isOpen() ? 'open' : 'closed';
+          console.log(
+            `🔗 post-sync reconcile tick: inFlightChains=${result.inFlightChains ?? orch.inFlightCount()} ` +
+            `limiter=${yoloLoadLimiter.occupancyNow()}/${yoloLoadLimiter.getLimit()} ` +
+            `breaker=${breaker} scanned=${result.scanned || 0} started=${result.started || 0} ` +
+            `skippedInFlight=${result.skippedInFlight || 0} skippedBackoff=${result.skippedBackoff || 0}`
+          );
+          return result;
+        } catch (err) {
+          console.warn(`⚠️  post-sync reconcile tick failed: ${err.message}`);
+        }
+      });
     };
     // First fire delayed 3min so a fresh boot doesn't race with in-flight
     // sync-triggered runs. Same shape as yoloBackfillTick's 90s delay,
