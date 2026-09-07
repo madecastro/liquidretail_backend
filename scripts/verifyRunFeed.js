@@ -16,8 +16,9 @@
 //   D. Unset channel / token → zero fetches
 //   E. Parent-ts claim is single-winner under a simulated race
 //   F. HTTP 429 does not sleep
-//   G. Structural: adStage hooks the feed; runRenderLoop start/finish;
-//      config knobs present; never-awaited on the call sites
+//   G. Structural: adStage hooks the feed; runRenderLoop startRun (kept
+//      above the handoff return); finishRun is gone with the in-process
+//      loop (adgen finalizes); config knobs present; never-awaited.
 //
 // Revert-prove recipe for (C):
 //   In services/runFeedService.js, temporarily replace onStage's body with
@@ -531,8 +532,10 @@ async function main() {
       /require\(['"]\.\.\/services\/runFeedService['"]\)/.test(adsSrc));
     checkTrue('G4 runRenderLoop calls startRun',
       /runFeed\.startRun\s*\(/.test(adsSrc));
-    checkTrue('G5 runRenderLoop calls finishRun',
-      /runFeed\.finishRun\s*\(/.test(adsSrc));
+    // finishRun lived in the deleted in-process loop close-out. runRenderLoop
+    // now returns after startRun + preparing→running; adgen finalizes the run.
+    checkTrue('G5 runRenderLoop no longer calls finishRun (adgen finalizes)',
+      !/runFeed\.finishRun\s*\(/.test(adsSrc));
     // Never awaited on call sites
     checkTrue('G6 no await runFeed. in routes',
       !/await\s+runFeed\./.test(adsSrc));

@@ -220,25 +220,23 @@ console.log('\nF. kill switch');
   delete require.cache[require.resolve(path.join(ROOT, 'services', 'campaignAdsGenerationService.js'))];
 }
 
-// ── G. The render path for these rows submits nothing ──────────────────
-console.log('\nG. derive render path is submit-free (source)');
+// ── G. REMOVED (dormant render fallback deletion) ──────────────────────
+// G1 located renderDeriveOnlyVideoAd; G2 scanned it for billable submits;
+// G3 pinned that the in-process render loop consulted resolveDeriveFromMaster
+// before the Omni submit. That function and the loop are gone. MONEY
+// invariant "a Meta derivative must never reach a billable Omni submit"
+// is still enforced by resolveDeriveFromMaster at mint/preflight — still
+// pinned in this file's C-group (fail-closed on platformFormat alone) —
+// plus adgen's renderer. The render-loop gate is gone because the loop
+// is gone.
+console.log('\nG. derive render path (ABSENCE — in-process derive renderer is gone)');
 {
   const adsSrc = fs.readFileSync(path.join(ROOT, 'routes', 'ads.js'), 'utf8');
-  const start = adsSrc.indexOf('async function renderDeriveOnlyVideoAd(');
-  const end = start > 0 ? adsSrc.indexOf('\nasync function ', start + 10) : -1;
-  const body = start > 0 ? adsSrc.slice(start, end > start ? end : start + 12000) : '';
-  check('G1 renderDeriveOnlyVideoAd was located', body.length > 2000);
-  // Strip comments so a mention in prose cannot fail (or pass) this.
-  const code = body.replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '');
-  for (const call of ['veoGenerateForAd', 'veoPrepareStoryboard', 'atlasVideoService', 'generateForAd']) {
-    check(`G2 [MONEY] no ${call}( in the derive render path`,
-      !new RegExp(`${call}\\s*\\(`).test(code),
-      'these rows are crop + retitle only; any submit here is a double charge');
-  }
-  check('G3 the gate is consulted before the billable branch',
-    adsSrc.indexOf('resolveDeriveFromMaster(ad)') > 0
-      && adsSrc.indexOf('resolveDeriveFromMaster(ad)') < adsSrc.indexOf('await veoGenerateForAd('));
+  check('G1 [ABSENCE] renderDeriveOnlyVideoAd is gone from routes/ads.js',
+    !/async function renderDeriveOnlyVideoAd\s*\(/.test(adsSrc),
+    'the in-process derive renderer came back — restore the G2 submit-free pins');
 }
+
 
 const total = pass + failures.length;
 console.log('');

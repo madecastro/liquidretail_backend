@@ -710,8 +710,11 @@ check('L1b seedClassForVideo is not referenced outside the service',
 }
 {
   const v = fs.readFileSync(path.join(__dirname, '..', 'services', 'directImageRenderService.js'), 'utf8');
-  check('L3 directImageRenderService still calls resolveSeedStyle(media)',
-    /resolveSeedStyle\(media\)/.test(v)
+  // renderDirectImage (the production resolveSeedStyle caller) is gone from
+  // this backend; adgen owns mint-time static. Pin that the leftover module
+  // still does not sneak-wire resolveSeedClass / seedClassForVideo.
+  check('L3 backend directImageRenderService no longer calls resolveSeedStyle (renderDirectImage gone)',
+    !/resolveSeedStyle\(media\)/.test(v)
     && !/\bresolveSeedClass\b/.test(v)
     && !/\bseedClassForVideo\b/.test(v));
 }

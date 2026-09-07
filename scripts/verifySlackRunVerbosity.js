@@ -20,8 +20,13 @@
 //       the claim-anomaly call from `alerts.notifyAsync` to
 //       `runFeed.noteEvent`, or drop `level: 'fatal'` → G7/G8 fail.
 //   (d) await added on a render-loop notify call — wrap the anomaly
-//       `alerts.notifyAsync(...)` or the `runFeed.finishRun(...)` /
-//       `runFeed.startRun(...)` calls in `await` → G4/G5/G6 fail.
+//       `alerts.notifyAsync(...)` or the `runFeed.startRun(...)` call
+//       in `await` → G11/G16 fail.
+//
+// REMOVED (dormant render fallback deletion): G4/G5/G6/G21 pinned
+// runRenderLoop's finishRun + buildRunCompletionSummaryLines close-out.
+// That write is gone; adgen finalizes. Converted to absence pins. Live
+// startRun (G17), claim-anomaly (G7–G11), preparing-reap (G12–G15) stay.
 //
 // Each of (a)-(d) was hand-verified to fail before being committed as a
 // passing baseline (see the session report for the actual before/after).
@@ -399,13 +404,13 @@ console.log('\nG. structural wiring — call sites, alert level, channel, never-
   checkTrue('G3 services/runFeedService.js requires services/slackRunVerbosity',
     /require\(['"]\.\/slackRunVerbosity['"]\)/.test(feedSrc));
 
-  checkTrue('G4 runRenderLoop calls runFeed.finishRun with summaryLines',
-    /runFeed\.finishRun\(\{[\s\S]{0,400}?summaryLines/.test(adsStripped));
-  checkTrue('G5 runRenderLoop builds the completion summary via buildRunCompletionSummaryLines',
-    /slackVerbosity\.buildRunCompletionSummaryLines\(/.test(adsStripped));
-  checkTrue('G6 the completion-summary block reuses persisted mintedTotal/unclaimedAtStart (does not recompute them)',
-    /mintedTotal:\s*final\?\.mintedTotal/.test(adsStripped) &&
-    /unclaimedAtStart:\s*final\?\.unclaimedAtStart/.test(adsStripped));
+  checkTrue('G4 runRenderLoop no longer calls runFeed.finishRun (adgen finalizes)',
+    !/runFeed\.finishRun\s*\(/.test(adsStripped));
+  checkTrue('G5 runRenderLoop no longer builds a completion summary via buildRunCompletionSummaryLines',
+    !/slackVerbosity\.buildRunCompletionSummaryLines\(/.test(adsStripped));
+  checkTrue('G6 runRenderLoop no longer reads mintedTotal/unclaimedAtStart for a local close-out',
+    !/mintedTotal:\s*final\?\.mintedTotal/.test(adsStripped) &&
+    !/unclaimedAtStart:\s*final\?\.unclaimedAtStart/.test(adsStripped));
 
   // ── the claim anomaly must go to alerts (fatal), NEVER to runFeed (the
   // per-run status feed) — this is the (c) revert-prove target.
@@ -464,8 +469,8 @@ console.log('\nG. structural wiring — call sites, alert level, channel, never-
   // ── the completion-summary computation in runRenderLoop must itself be
   // wrapped so it can never surface in the outer catch (which would
   // re-mark an already-'done' run as 'failed').
-  checkTrue('G21 completion-summary block is wrapped in its own try/catch',
-    /let summaryLines = \[\];\s*\n\s*try \{[\s\S]{0,900}?catch \(err\) \{/.test(adsStripped));
+  checkTrue('G21 runRenderLoop no longer has a local completion-summary try/catch (adgen finalizes)',
+    !/let summaryLines = \[\];/.test(adsStripped));
 
   // ── neither new code path introduces a raw HTTP call to Slack — must
   // route through the existing alertService/runFeedService plumbing.

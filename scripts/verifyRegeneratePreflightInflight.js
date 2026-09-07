@@ -63,10 +63,22 @@ const AD_ID    = 'aaaaaaaaaaaaaaaaaaaaaaaa';
 const BRAND_ID = 'bbbbbbbbbbbbbbbbbbbbbbbb';
 
 // Every module adRegenerateService require()s at load time. Stubbing them keeps
-// this harness free of Mongo, Atlas and Cloudinary — and the four DESTRUCTURED
+// this harness free of Mongo, Atlas and Cloudinary — and the three DESTRUCTURED
 // imports (uploadBufferToCloudinary, resolveDeriveFromMaster,
-// isUgcFirstSeedingEnabled, isAdgenRendererEnabled) must be present on their
-// stubs or the require itself throws.
+// isUgcFirstSeedingEnabled) must be present on their stubs or the require
+// itself throws.
+//
+// services/ugcVideoPipeline.js and services/adgenBridge.js (formerly stubbed
+// here as UGC / ADGEN, with an isAdgenRendererEnabled() stub) were DELETED
+// wholesale as part of removing the dormant in-process render fallback —
+// adgen owns rendering unconditionally now, and adRegenerateService.js no
+// longer requires either module (regenerateAd unconditionally defers to
+// adgen; there is no local-execution branch left to flag-gate). Requiring
+// their now-nonexistent paths would throw MODULE_NOT_FOUND, so both are
+// removed here rather than stubbed. Every remaining stub below (MEDIA, BRAND,
+// RUN, VEO, BSE, CLOUD, DI, SUS) still resolves to a real, un-deleted file —
+// some are no longer imported by the current adRegenerateService.js either,
+// but stubbing an unused module is inert, not broken, so they are left as-is.
 const SVC   = require.resolve('../services/adRegenerateService');
 const AD    = require.resolve('../models/Ad');
 const MEDIA = require.resolve('../models/Media');
@@ -78,8 +90,6 @@ const CLOUD = require.resolve('../services/cloudinaryService');
 const DI    = require.resolve('../services/directImageRenderService');
 const CAGS  = require.resolve('../services/campaignAdsGenerationService');
 const SUS   = require.resolve('../services/seededUniverseService');
-const UGC   = require.resolve('../services/ugcVideoPipeline');
-const ADGEN = require.resolve('../services/adgenBridge');
 
 let currentRow = null;
 
@@ -88,7 +98,7 @@ function stub(id, exports) {
 }
 
 function install() {
-  for (const m of [SVC, AD, MEDIA, BRAND, RUN, VEO, BSE, CLOUD, DI, CAGS, SUS, UGC, ADGEN]) {
+  for (const m of [SVC, AD, MEDIA, BRAND, RUN, VEO, BSE, CLOUD, DI, CAGS, SUS]) {
     delete require.cache[m];
   }
   // preflight's only DB read is Ad.findOne({_id, brandId}).lean().
@@ -104,8 +114,6 @@ function install() {
   // must return null so it never short-circuits the arms under test.
   stub(CAGS, { resolveDeriveFromMaster: () => null });
   stub(SUS, { isUgcFirstSeedingEnabled: () => false });
-  stub(UGC, {});
-  stub(ADGEN, { isAdgenRendererEnabled: () => false });
   return require(SVC);
 }
 
@@ -323,15 +331,14 @@ const SYNCED    = /exported to Meta/i;
   const CAGS = require.resolve('../services/campaignAdsGenerationService');
   const savedCags = require.cache[CAGS];
   const deriveOnly = await (async () => {
-    for (const m of [SVC, AD, MEDIA, BRAND, RUN, VEO, BSE, CLOUD, DI, CAGS, SUS, UGC, ADGEN]) {
+    for (const m of [SVC, AD, MEDIA, BRAND, RUN, VEO, BSE, CLOUD, DI, CAGS, SUS]) {
       delete require.cache[m];
     }
     stub(AD, { findOne() { return { lean: async () => currentRow }; } });
     stub(MEDIA, {}); stub(BRAND, {}); stub(RUN, {}); stub(VEO, {}); stub(BSE, {});
     stub(CLOUD, { uploadBufferToCloudinary: async () => {} }); stub(DI, {});
     stub(CAGS, { resolveDeriveFromMaster: () => 'meta_stories_9_16' });
-    stub(SUS, { isUgcFirstSeedingEnabled: () => false }); stub(UGC, {});
-    stub(ADGEN, { isAdgenRendererEnabled: () => false });
+    stub(SUS, { isUgcFirstSeedingEnabled: () => false });
     const r = require(SVC);
     currentRow = row({ status: 'rendering', platformFormat: 'pmax_video_1_1', kind: 'video' });
     try { return { ad: await r.preflight(AD_ID, BRAND_ID), err: null }; }
@@ -449,7 +456,7 @@ const SYNCED    = /exported to Meta/i;
   // regenerateAd and evaluate the filter it genuinely passes to Ad.updateOne.
   const lockCalls = [];
   function installLockProbe(dbRow) {
-    for (const m of [SVC, AD, MEDIA, BRAND, RUN, VEO, BSE, CLOUD, DI, CAGS, SUS, UGC, ADGEN]) {
+    for (const m of [SVC, AD, MEDIA, BRAND, RUN, VEO, BSE, CLOUD, DI, CAGS, SUS]) {
       delete require.cache[m];
     }
     stub(AD, {
@@ -465,8 +472,7 @@ const SYNCED    = /exported to Meta/i;
     stub(MEDIA, {}); stub(BRAND, {}); stub(RUN, {}); stub(VEO, {}); stub(BSE, {});
     stub(CLOUD, { uploadBufferToCloudinary: async () => {} }); stub(DI, {});
     stub(CAGS, { resolveDeriveFromMaster: () => null });
-    stub(SUS, { isUgcFirstSeedingEnabled: () => false }); stub(UGC, {});
-    stub(ADGEN, { isAdgenRendererEnabled: () => false });
+    stub(SUS, { isUgcFirstSeedingEnabled: () => false });
     return require(SVC);
   }
 

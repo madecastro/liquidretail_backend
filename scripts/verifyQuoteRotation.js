@@ -30,6 +30,16 @@
  *   - snapshot $set persist (no run-id filter)       → G2 / H8
  *   - drop secondary_quotes artifact cap             → A7 / H9
  *
+ * REMOVED (dormant render fallback deletion): D1/D2/D4/D5/D7 and F1/H6's
+ * static-wrapper half — they pinned `selectRotatedQuote` / `rotationHash`
+ * re-exports and CatalogProduct.select / persistQuoteChoice wiring on
+ * `services/directImageRenderService.js`. Those wrappers were deleted with
+ * `renderDirectImage`. Canonical implementations live in
+ * `quoteRotationService.js`; the VIDEO path (`brandScriptExecutor.js`) stays.
+ * D3 keeps the live `rotationHash` source pin on quoteRotationService.
+ * D6 keeps persistQuoteChoice's catch-and-warn on quoteRotationService.
+ * H6 keeps the video-path half.
+ *
  * Run: node scripts/verifyQuoteRotation.js
  */
 'use strict';
@@ -42,7 +52,6 @@ const path = require('path');
 const ROOT = path.join(__dirname, '..');
 const SRC_SCRAPE = path.join(ROOT, 'services/productReviewsScrapeService.js');
 const SRC_ROT    = path.join(ROOT, 'services/quoteRotationService.js');
-const SRC_STATIC = path.join(ROOT, 'services/directImageRenderService.js');
 const SRC_VIDEO  = path.join(ROOT, 'services/brandScriptExecutor.js');
 const SRC_CAT    = path.join(ROOT, 'models/CatalogProduct.js');
 const SRC_HELP   = path.join(ROOT, 'services/reviewAdapters/helpers.js');
@@ -117,7 +126,6 @@ function freshScrapeModule() {
 
 const rot = require('../services/quoteRotationService');
 const helpers = require('../services/reviewAdapters/helpers');
-const { selectRotatedQuote, rotationHash } = require('../services/directImageRenderService');
 const { gateLayoutInputQuotes } = require('../services/brandScriptExecutor');
 
 const rq = (text, tier) => ({
@@ -478,71 +486,28 @@ check('C8 wrap over 200 seeds never reprints the last-used quote', () => {
   assert.strictEqual(reprints, 0, `wrap reprinted last-used on ${reprints}/200 seeds`);
 });
 
-// ── D. static wrapper still serves verifyQuoteSurfaceLength ──────────────
-console.log('\nD. static path still exports the shipped helper');
+// ── D. shared helper (canonical implementations in quoteRotationService) ─
+console.log('\nD. quoteRotationService is the canonical rotation helper');
 
-check('D1 selectRotatedQuote from directImageRenderService matches the shared helper', () => {
-  withEnv({ STATIC_QUOTE_ROTATION: undefined, QUOTE_ROTATION_MEMORY: undefined }, () => {
-    const viaStatic = selectRotatedQuote(ROT_PROOF, 'run_A');
-    const viaShared = rot.selectRotatedQuote(ROT_PROOF, 'run_A', { enabled: true, memoryEnabled: false });
-    assert.strictEqual(viaStatic.text, viaShared.text);
-  });
-});
-
-check('D2 STATIC_QUOTE_ROTATION=false still returns the primary (existing kill switch)', () => {
-  withEnv({ STATIC_QUOTE_ROTATION: 'false' }, () => {
-    const picked = selectRotatedQuote(ROT_PROOF, 'run_A');
-    assert.strictEqual(picked.text, ROT_PROOF.primary_quote.text);
-  });
-});
+// D1/D2/D4/D5/D7 pinned the deleted directImageRenderService wrappers
+// (dormant render fallback deletion, 2026-09-07). D3/D6 below are the
+// live halves that test quoteRotationService itself.
 
 check('D3 rotationHash is the shared FNV-1a (no Date, no Math.random)', () => {
-  assert.strictEqual(rotationHash('run_A'), rot.rotationHash('run_A'));
   const src = read(SRC_ROT);
   const region = src.slice(src.indexOf('function rotationHash'), src.indexOf('function quoteFingerprint'));
+  assert.ok(region.length > 0, 'rotationHash not found in quoteRotationService');
   assert.ok(!/Math\.random|Date\.now|new Date/.test(region));
+  assert.strictEqual(rot.rotationHash('run_A'), rot.rotationHash('run_A'));
+  assert.ok(Number.isInteger(rot.rotationHash('run_A')) && rot.rotationHash('run_A') >= 0);
 });
 
-check('D4 static render selects recentQuoteKeys + lastQuoteRunId + lastQuoteFingerprint', () => {
-  const src = read(SRC_STATIC);
-  const selects = [...src.matchAll(/CatalogProduct\.findById\([^)]+\)\.select\('([^']+)'\)/g)]
-    .map((m) => m[1]);
-  assert.ok(selects.length >= 1, 'no CatalogProduct.select in static renderer');
-  for (const sel of selects) {
-    assert.ok(/\brecentQuoteKeys\b/.test(sel), `missing recentQuoteKeys: ${sel}`);
-    assert.ok(/\blastQuoteRunId\b/.test(sel), `missing lastQuoteRunId: ${sel}`);
-    assert.ok(/\blastQuoteFingerprint\b/.test(sel), `missing lastQuoteFingerprint: ${sel}`);
-  }
-});
-
-check('D5 static persist is fire-and-forget (no await persistQuoteChoice)', () => {
-  const src = read(SRC_STATIC);
-  assert.ok(/persistQuoteChoice/.test(src), 'static path never persists memory');
-  assert.ok(!/await\s+rot\.persistQuoteChoice/.test(src)
-    && !/await\s+.*persistQuoteChoice/.test(src),
-    'awaiting persist would stall a billed render on a memory write');
-});
-
-check('D6 static persist swallows errors (catch → warn, never throw)', () => {
+check('D6 persist swallows errors (catch → warn, never throw)', () => {
   const src = read(SRC_ROT);
   const fn = src.slice(src.indexOf('function persistQuoteChoice'), src.indexOf('module.exports'));
   assert.ok(/\.catch\s*\(/.test(fn), 'persist must catch Mongo errors');
   assert.ok(/console\.warn/.test(fn), 'persist must log the blip');
   assert.ok(/return false/.test(fn));
-});
-
-check('D7 static rotateQuote is passed scope so STRICT cannot be undone', () => {
-  const src = read(SRC_STATIC);
-  const region = src.slice(src.indexOf('function buildIntentData'), src.indexOf('async function resolveConcept'))
-    .split('\n')
-    .filter((l) => { const t = l.trim(); return !t.startsWith('//') && !t.startsWith('*') && !t.startsWith('/*'); })
-    .join('\n');
-  assert.ok(/scope:\s*strictScope/.test(region),
-    'static rotation must receive the same STRICT scope the gate uses');
-  const iScope = region.indexOf('const strictScope');
-  const iRot = region.indexOf('selectRotatedQuote');
-  assert.ok(iScope !== -1 && iRot !== -1 && iScope < iRot,
-    'scope must be built BEFORE rotation');
 });
 
 // ── E. video rotation ───────────────────────────────────────────────────
@@ -681,17 +646,12 @@ check('E10 video caller forwards scope into rotateLayoutInputQuote', () => {
     'video rotation must receive STRICT scope or it can reseat a failing brand-pool line');
 });
 
-// ── F. flag-off byte-identity, both paths ───────────────────────────────
-console.log('\nF. flag-off byte-identity for static + video');
+// ── F. flag-off byte-identity ───────────────────────────────────────────
+console.log('\nF. flag-off byte-identity');
 
-check('F1 STATIC_QUOTE_ROTATION=false + memory on still returns the primary', () => {
-  withEnv({ STATIC_QUOTE_ROTATION: 'false', QUOTE_ROTATION_MEMORY: 'true' }, () => {
-    const picked = selectRotatedQuote(ROT_PROOF, 'run_A', {
-      recentKeys: ['anything'], memoryEnabled: true
-    });
-    assert.strictEqual(picked.text, ROT_PROOF.primary_quote.text);
-  });
-});
+// F1 (STATIC_QUOTE_ROTATION=false on the deleted static wrapper) was
+// removed with `renderDirectImage` (dormant render fallback deletion,
+// 2026-09-07). Memory-off / persist no-op below still cover the live helper.
 
 check('F2 QUOTE_ROTATION_MEMORY defaults false', () => {
   withEnv({ QUOTE_ROTATION_MEMORY: undefined }, () => {
@@ -811,11 +771,9 @@ check('H5 [REVERT] deleting recentQuoteKeys from the schema fails G1', () => {
   assert.ok(failedAsExpected, 'schema-field deletion did not trip G1');
 });
 
-check('H6 [REVERT] static wrapper no longer calling the shared helper would desync video', () => {
-  const src = read(SRC_STATIC);
-  const region = src.slice(src.indexOf('function selectRotatedQuote'), src.indexOf('function buildIntentData'));
-  assert.ok(/quoteRotationService/.test(region),
-    'static selectRotatedQuote must delegate to the shared helper');
+check('H6 [REVERT] video path no longer calling the shared helper would desync rotation', () => {
+  // The static-wrapper half of this pin was removed with
+  // `renderDirectImage` (dormant render fallback deletion, 2026-09-07).
   const video = read(SRC_VIDEO);
   assert.ok(/quoteRotationService/.test(video) && /rotateLayoutInputQuote/.test(video),
     'video path must call the shared helper');

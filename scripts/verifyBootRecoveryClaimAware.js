@@ -18,20 +18,23 @@
 //      the claiming worker's own completion write relies on to know it still
 //      owns the row (the dual-render scenario).
 //   2. NOT GATED ON ADGEN OWNERSHIP AT ALL. Unlike its sibling
-//      services/titlingResumeService.js (which stands down entirely with
-//      `if (isAdgenRendererEnabled()) return out;`), this file had zero
-//      reference anywhere to ADGEN_RENDERER_ENABLED / isAdgenRendererEnabled
-//      — so it kept sweeping the exact collection adgen claims rows in,
-//      regardless of who currently owns rendering.
+//      services/titlingResumeService.js (which stood down entirely on that
+//      flag), this file had zero reference anywhere to adgen ownership — so
+//      it kept sweeping the exact collection adgen claims rows in.
 //
-// THE FIX has two parts, ownership-gating as PRIMARY, claim-awareness as
-// SECONDARY defense in depth (see the file's own header comments for the
-// full argument):
-//   Primary:   when adgen owns rendering (isAdgenRendererEnabled()), the
-//              per-ad loop stands down on VIDEO recovery specifically —
-//              image recovery and its cost-reconcile call stay
-//              unconditional, because a recovered image is a single
-//              synchronous peek-then-write with no titling hand-off to race.
+// THE FIX, UPDATED (removal of the dormant in-process render/titling
+// fallback — see session.d/): what used to be a runtime flag check
+// (isAdgenRendererEnabled(), services/adgenBridge.js — both deleted) is now
+// permanent and unconditional. Adgen always owns all video rendering; there
+// is no more in-process video-recovery fallback to gate. Ownership-gating is
+// now PRIMARY and PERMANENT, claim-awareness remains SECONDARY defense in
+// depth (see bootRecoveryService.js's own header comments for the full
+// argument):
+//   Primary:   video-receipt rows are excluded from this sweep's query
+//              unconditionally (receiptKinds:'image') — image recovery and
+//              its cost-reconcile call stay unconditional too, because a
+//              recovered image is a single synchronous peek-then-write with
+//              no titling hand-off to race.
 //   Secondary: buildRecoverySweepFilter is claim-aware. An unclaimed row
 //              still uses RESUME_STALE_MIN (5m). A claimed row
 //              (Ad.claimedByWorker set) gets a much longer allowance,
@@ -42,12 +45,13 @@
 //              once at claim time and never refreshed, so a brand-new claim
 //              (e.g. right after a titler handoff, which does not touch
 //              updatedAt) is protected from the moment it is taken, not only
-//              once something first heartbeats it.
+//              once something first heartbeats it. This still matters for
+//              IMAGE rows too, since adgen can claim and render those.
 //
 // THESE CHECKS evaluate the REAL exported buildRecoverySweepFilter against
 // REAL document shapes, and (Group G) drive the REAL resumeInFlightAds with
-// Ad.find/Ad.updateOne and atlasVideoService.resumeForAd mocked — not a
-// regex over the source, and not a hand-copied re-implementation. "A
+// Ad.find/Ad.countDocuments/Ad.updateOne mocked — not a regex over the
+// source, and not a hand-copied re-implementation. "A
 // source-text assertion cannot tell a working query from one that merely
 // still contains the right words" (see scripts/verifyNoStrandedQueued.js,
 // same discipline).
@@ -65,10 +69,9 @@
 //      the REAL live constants (not a re-derived default that never reads
 //      the file) AND on a direct source-text extraction of both literals, so
 //      neither check alone is the single point of failure.
-//   G. EXECUTION: with adgen owning rendering, a video-receipt candidate is
-//      never peeked and never written, while an image-receipt candidate in
-//      the SAME pass still recovers normally; with the flag off, video
-//      recovery resumes.
+//   G. EXECUTION: a video-receipt candidate is never peeked and never
+//      written (adgen always owns video rendering), while an image-receipt
+//      candidate in the SAME pass still recovers normally.
 //   H. The claimedAt race (adversarial finding): a claim taken SECONDS ago
 //      on a row whose updatedAt predates it (titler handoff / reclaim does
 //      not touch updatedAt) must not be swept just because updatedAt looks
@@ -89,8 +92,8 @@
 //        site → E1 fails (these checks would be testing a copy)
 //   6. Drop the `claimedAt: { $lt: claimCutoff }` clause from the claimed
 //        arm → H1 fails (a fresh claim on a stale-updatedAt row is swept)
-//   7. Remove the `!isImageReceipt && adgenOwnsRendering` gate, or move it
-//        to wrap the image branch too → G1/G2/G3 fail
+//   7. Remove the `!isImageReceipt` belt-and-braces gate, or move it to wrap
+//        the image branch too → G1/G2/G3 fail
 //   8. Revert the explicit `$or: [{claimedAt:null}, {claimedAt:{$lt:...}}]`
 //        back to a bare `claimedAt: { $lt: claimCutoff }` (the exact
 //        merge-gate-caught production bug: MongoDB's $lt does not match
@@ -488,36 +491,15 @@ ok('E5b claimedAt staleness is an EXPLICIT null-OR, not a bare $lt — productio
     'a bare `claimedAt: { $lt: claimCutoff }` with no null arm is the exact production bug this pins');
 });
 
-// ── Group E6-E8: recovered-branch viewability + no-requeue, ported from the
-// deleted scripts/verifyTitlingResume.js (2026-08-28, backend titling
-// removal). These three checks are about bootRecoveryService's OWN
-// recovered-branch $set, not the deleted titlingResumeService.js sweeper —
-// they stay valuable independent of that removal. See the STATE_PENDING /
-// TITLING_PENDING / fallbackPosterUrl comment near the top of
-// bootRecoveryService.js for why those three are now inlined there instead
-// of imported.
-function recoveredSetBlock(src) {
-  const marker = "r.state === 'done' && r.videoUrl";
-  const at = src.indexOf(marker);
-  if (at < 0) return '';
-  const setAt = src.indexOf('$set', at);
-  if (setAt < 0 || setAt - at > 2000) return '';
-  const stop = src.indexOf('continue;', setAt);
-  return src.slice(at, stop > setAt ? stop : at + 1500);
-}
-const recBlock = recoveredSetBlock(serviceSrc);
-ok('E6 recovered-branch $set writes renderUrl, posterUrl, kind, titlingResumeState (viewable + stamped)', () => {
-  assert.ok(recBlock.length > 0, 'could not locate the recovered branch');
-  assert.ok(/renderUrl:\s*r\.videoUrl/.test(recBlock)
-    && /posterUrl:\s*poster\s*\|\|\s*r\.videoUrl/.test(recBlock)
-    && /kind:\s*'video'/.test(recBlock)
-    && /titlingResumeState:\s*STATE_PENDING/.test(recBlock),
-    'a recovered ad without renderUrl is invisible (projectAd has no veoVideoUrl fallback)');
-});
-ok('E7 recovered-branch update still filters on status: \'rendering\' (no lease — filter IS the concurrency control)', () => {
-  assert.ok(/\{\s*_id:\s*ad\._id,\s*status:\s*'rendering'\s*\}/.test(recBlock));
-});
-ok('E8 MONEY: bootRecoveryService contains no status:\'queued\' — a recovered master must never be requeued', () => {
+// ── Group E6: no-requeue money invariant ──────────────────────────────────
+// The VIDEO recovered-branch $set this group used to also pin (renderUrl /
+// posterUrl / kind / titlingResumeState, ported from the deleted
+// scripts/verifyTitlingResume.js) is gone along with the rest of the
+// video-recovery arm this removal deleted — bootRecoveryService.js no
+// longer recovers video receipts at all (adgen's own vendored copy does).
+// This one check stays: it is a generic guard on the whole file, not
+// specific to the deleted branch.
+ok('E6 MONEY: bootRecoveryService contains no status:\'queued\' — a recovered master must never be requeued', () => {
   // routes/ads.js declares veoVideoUrl fresh and never reads ad.veoVideoUrl,
   // so a requeue re-submits to Omni (~$0.90) for a master already paid for.
   assert.ok(!/status:\s*['"]queued['"]/.test(serviceSrc),
@@ -583,16 +565,15 @@ ok('F2 recovering a dead claim never re-submits (bootRecoveryService.js has no s
     'bootRecoveryService must stay submit-free — recovering a dead claim must cost CPU at worst, never a second charge');
 });
 
-// ── Group G: EXECUTION — ownership gate, video deferred / image unaffected
+// ── Group G: EXECUTION — video permanently deferred / image unaffected
 // Drives the REAL resumeInFlightAds. Ad.find / Ad.countDocuments /
-// Ad.updateOne and atlasVideoService.resumeForAd are mocked so NOTHING here
-// ever reaches a database or the network — resumeForAd is not injectable
-// via resumeInFlightAds's own parameters (unlike recoverImage, which
-// already is), so it is mocked at the module level via require.cache, and a
-// FRESH copy of bootRecoveryService is required so its module-scope
-// destructured `resumeForAd` binds to the mock (destructuring captures a
-// value at require time, not a live reference — patching the export after
-// the original top-of-file require would not be seen by it).
+// Ad.updateOne are mocked so NOTHING here ever reaches a database. There is
+// no more flag to toggle — video recovery is unconditionally excluded now
+// (the in-process video-recovery fallback + its `isAdgenRendererEnabled()`
+// gate were both deleted), so this group drives ONE pass, not an ON/OFF
+// pair. atlasVideoService.resumeForAd is gone from bootRecoveryService.js
+// entirely (nothing left to mock — see F2 above, which already pins that
+// this file stays submit/peek-free for video).
 //
 // Ad.find AND Ad.countDocuments are mocked using the REAL matchesFilter
 // evaluator from Groups A-H above, run against a fixed 3-doc dataset — not
@@ -604,13 +585,10 @@ ok('F2 recovering a dead claim never re-submits (bootRecoveryService.js has no s
 // shows up here as a wrong candidate set, not just as a wrong boolean.
 async function runGroupG() {
   const AdModel = require('../models/Ad');
-  const atlasVideoService = require('../services/atlasVideoService');
 
   const savedAdFind = AdModel.find;
   const savedAdCountDocuments = AdModel.countDocuments;
   const savedAdUpdateOne = AdModel.updateOne;
-  const savedResumeForAd = atlasVideoService.resumeForAd;
-  const savedEnv = process.env.ADGEN_RENDERER_ENABLED;
 
   const videoCandidate = {
     _id: 'gate-video-1',
@@ -629,10 +607,10 @@ async function runGroupG() {
   };
   // BOTH receipts on one row — video must win the tie (this file's own
   // routing rule) and the row must therefore be excluded from the 'image'
-  // receiptKinds query too, or the ownership gate's query-level exclusion
-  // and the loop's tie-break rule would disagree with each other (second-
-  // round finding: 'image' receiptKinds must also require an ABSENT
-  // veoPredictionId, not just a present image one).
+  // receiptKinds query too, or the query-level exclusion and the loop's
+  // tie-break rule would disagree with each other (second-round finding:
+  // 'image' receiptKinds must also require an ABSENT veoPredictionId, not
+  // just a present image one).
   const dualReceiptCandidate = {
     _id: 'gate-dual-1',
     status: 'rendering',
@@ -644,7 +622,6 @@ async function runGroupG() {
   const dataset = [videoCandidate, imageCandidate, dualReceiptCandidate];
 
   let capturedFindFilter = null;
-  let resumeForAdCalls = 0;
   let updateOneCalls = [];
   let recoverImageCalls = [];
 
@@ -669,11 +646,6 @@ async function runGroupG() {
     updateOneCalls.push(queryFilter);
     return { modifiedCount: 0, matchedCount: 0 };
   };
-  atlasVideoService.resumeForAd = async function () {
-    resumeForAdCalls++;
-    // Would only matter if actually reached — flag-ON must never call this.
-    return { state: 'processing' };
-  };
   const stubRecoverImage = async function ({ ad }) {
     recoverImageCalls.push(ad._id);
     return { state: 'recovered', predictionId: ad.imageGeneration?.predictionId || null };
@@ -684,65 +656,40 @@ async function runGroupG() {
   const freshBootRecovery = require('../services/bootRecoveryService');
 
   try {
-    // ── flag ON: adgen owns rendering ──────────────────────────────────
-    process.env.ADGEN_RENDERER_ENABLED = 'true';
-    resumeForAdCalls = 0; updateOneCalls = []; recoverImageCalls = [];
-    const onResult = await freshBootRecovery.resumeInFlightAds({ recoverImage: stubRecoverImage });
+    const result = await freshBootRecovery.resumeInFlightAds({ recoverImage: stubRecoverImage });
 
-    ok('G1 flag ON: the video-receipt candidate is deferred, never peeked', () => {
-      assert.strictEqual(resumeForAdCalls, 0,
-        'resumeForAd must not even be called for a video row while adgen owns rendering');
-      assert.strictEqual(onResult.deferredToAdgen, 2,
+    ok('G1 the video-receipt candidate is deferred, never written', () => {
+      assert.strictEqual(result.deferredToAdgen, 2,
         'both the pure-video and the dual-receipt row must be counted deferred');
     });
-    ok('G2 flag ON: no video row is ever written to', () => {
+    ok('G2 no video row is ever written to', () => {
       assert.strictEqual(updateOneCalls.length, 0,
         `expected zero Ad.updateOne calls (image 'recovered' does not call it either) — got ${updateOneCalls.length}`);
     });
-    ok('G3 flag ON: image recovery is UNAFFECTED — still runs and still recovers', () => {
+    ok('G3 image recovery is UNAFFECTED — still runs and still recovers', () => {
       assert.deepStrictEqual(recoverImageCalls, ['gate-image-1'], 'only the true image candidate should reach recoverImage');
-      assert.strictEqual(onResult.recovered, 1, 'the image candidate must still be counted recovered');
+      assert.strictEqual(result.recovered, 1, 'the image candidate must still be counted recovered');
     });
-    ok('G4 flag ON: the FIND ITSELF excludes video rows — a deferred row cannot occupy a limit slot', () => {
+    ok('G4 the FIND ITSELF excludes video rows — a deferred row cannot occupy a limit slot', () => {
       // The second-round finding this closes: gating only inside the loop
       // left deferred video rows in the candidate set forever (never
       // written, so never falling out of the filter), able to saturate
       // RESUME_MAX_ADS and starve image recovery entirely. Proving
       // `considered === 1` (not 3) is what distinguishes "excluded at the
       // query" from "fetched then skipped".
-      assert.strictEqual(onResult.considered, 1, 'only the image candidate should ever be fetched into the loop');
+      assert.strictEqual(result.considered, 1, 'only the image candidate should ever be fetched into the loop');
       assert.ok(capturedFindFilter, 'Ad.find must still have been called with a real filter object');
     });
-    ok('G4b flag ON: the dual-receipt row is excluded from BOTH the image find and the video count double-booking', () => {
+    ok('G4b the dual-receipt row is excluded from BOTH the image find and the video count double-booking', () => {
       // Not double-counted: it is exactly one of the 2 in deferredToAdgen
       // (G1) and exactly absent from considered (G4) — never both fetched
       // for image work AND counted as deferred.
-      assert.strictEqual(onResult.considered, 1);
-    });
-
-    // ── flag OFF: backend owns rendering, video recovery resumes ───────
-    process.env.ADGEN_RENDERER_ENABLED = 'false';
-    resumeForAdCalls = 0; updateOneCalls = []; recoverImageCalls = [];
-    const offResult = await freshBootRecovery.resumeInFlightAds({ recoverImage: stubRecoverImage });
-
-    ok('G5 flag OFF: every candidate (video, image, dual) is fetched and video recovery resumes', () => {
-      assert.strictEqual(offResult.considered, 3, 'flag off must use the unrestricted receiptKinds:"both" query');
-      // dualReceiptCandidate routes as video (ties go to video) alongside
-      // videoCandidate, so resumeForAd is called twice.
-      assert.strictEqual(resumeForAdCalls, 2, 'resumeForAd must be called for both the pure-video and the dual-receipt row');
-      assert.strictEqual(offResult.deferredToAdgen, 0);
-    });
-    ok('G6 flag OFF: image recovery still runs unaffected', () => {
-      assert.deepStrictEqual(recoverImageCalls, ['gate-image-1']);
-      assert.strictEqual(offResult.recovered, 1);
+      assert.strictEqual(result.considered, 1);
     });
   } finally {
     AdModel.find = savedAdFind;
     AdModel.countDocuments = savedAdCountDocuments;
     AdModel.updateOne = savedAdUpdateOne;
-    atlasVideoService.resumeForAd = savedResumeForAd;
-    if (savedEnv === undefined) delete process.env.ADGEN_RENDERER_ENABLED;
-    else process.env.ADGEN_RENDERER_ENABLED = savedEnv;
     delete require.cache[svcPath];
   }
 }

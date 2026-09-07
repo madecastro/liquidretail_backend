@@ -34,8 +34,7 @@
 // This harness therefore:
 //   A. pins that every live Meta static REQUESTS a CTA (including 9:16)
 //      and that a CTA slot fits inside every live static safe box
-//   B. pins that an unsatisfiable core descends FALLBACK_ORDER, including
-//      the exact product-count residual from this run
+//   B. pins that an unsatisfiable core descends FALLBACK_ORDER
 //   C. pins the three ratingDisplay constraints that LOOK optional and
 //      are not (=== true, brand count required, allowBrandCountWithoutStars
 //      stays false)
@@ -44,7 +43,7 @@
 //   - drawCta:false on meta_stories_9_16                         → A1 / A2
 //   - put 'CTA BUTTON' into SACRIFICE_ORDER                      → A3
 //   - social_proof_led.eligible always returns null              → B1
-//   - skip FALLBACK_ORDER and stay on the requested intent       → B2 / B5
+//   - skip FALLBACK_ORDER and stay on the requested intent       → B2
 //   - allowLabeledBrandNumbers truthy-gate (`if (flag)`)         → C1
 //   - drop the brand-count requirement on the exception          → C2
 //   - allowBrandCountWithoutStars: true in the exception         → C8
@@ -53,8 +52,23 @@
 //     `exPair.source === 'brand' && exPair.rating` discards
 //     brand-count. C8 is the unique pin of constraint (c).)
 //
+// REMOVED 2026-09-07: group B used to include B5 ("THE RUN") and B6, which
+// built their `data` fixture via `buildIntentData` (the cascade that turned
+// raw layoutInput/brand/product social-proof fields into the plain
+// `{rating, quote, ...}` shape `resolveIntent` reads) to reconstruct the
+// exact product-count residual from run_1786555875841_2ddf9739 end-to-end.
+// `buildIntentData` lived in services/directImageRenderService.js and was
+// deleted along with `renderDirectImage` (the mint-time static-ad render
+// entry point) as part of removing the dormant in-process render fallback —
+// adgen owns rendering unconditionally now, and neither name is exported
+// any more. B1-B4 and B7 below still cover the FALLBACK_ORDER descent logic
+// itself (`resolveIntent` in services/staticAdIntents.js, still live) by
+// constructing the already-cascaded `data` shape directly, so that coverage
+// is intact; only the buildIntentData-cascade reconstruction of the real
+// run's raw inputs is gone.
+//
 // Calls the REAL functions (resolveIntent / computeSurface / buildPrompt /
-// buildIntentData / resolveCoherentSocialProof) against synthetic inputs.
+// resolveCoherentSocialProof) against synthetic inputs.
 // No DB, no network, no API key.
 //
 // Run: node scripts/verifyStaticCtaAndProof.js
@@ -77,7 +91,6 @@ const {
   resolveDrawCta,
   applyDensity
 } = require('../services/staticAdIntents');
-const { buildIntentData } = require('../services/directImageRenderService');
 const rd = require('../services/ratingDisplay');
 
 let checks = 0;
@@ -370,62 +383,6 @@ ok('B3 no rating + no quote lands on product_first_lifestyle (the floor)', () =>
 ok('B4 FALLBACK_ORDER is social_proof → objection → product_first', () => {
   assert.deepStrictEqual(FALLBACK_ORDER,
     ['social_proof_led', 'objection_resolved', 'product_first_lifestyle']);
-});
-
-ok('B5 [THE RUN] buildIntentData + product-count residual does not stay social_proof_led', () => {
-  // Exact shape logged for this run:
-  //   source=product-count rating=none count=11 quoteTier=product
-  const data = buildIntentData({
-    concept: { copy: {} },
-    layoutInput: {
-      social_proof: {
-        primary_quote: {
-          text: 'The Cruiser is the most comfortable shoe I own.',
-          tier: 'product',
-          origin: 'store-import'
-        },
-        rating_source: 'product',
-        rating_value: 3.2,
-        review_count: 11
-      },
-      cta: { text: CTA }
-    },
-    brand: { brandReviews: { rating: 3.8, reviewCount: 2667 } },
-    product: { productReviews: { rating: 3.2, reviewCount: 11 } },
-    cta: CTA
-  });
-  assert.strictEqual(data.rating, undefined,
-    `expected no displayable rating, got ${JSON.stringify(data.rating)}`);
-  assert.ok(data.quote, 'the product-tier quote must still print');
-  const resolved = resolveIntent('social_proof_led', data);
-  assert.strictEqual(resolved.key, 'objection_resolved',
-    `expected descent to objection_resolved, got ${resolved.key}`);
-  assert.strictEqual(resolved.fellBackFrom, 'social_proof_led');
-});
-
-ok('B6 a real product rating still keeps social_proof_led (descent is not over-eager)', () => {
-  const data = buildIntentData({
-    concept: { copy: {} },
-    layoutInput: {
-      social_proof: {
-        primary_quote: {
-          text: 'The Cruiser is the most comfortable shoe I own.',
-          tier: 'product',
-          origin: 'store-import'
-        },
-        rating_source: 'product',
-        rating_value: 4.8,
-        review_count: 240
-      }
-    },
-    brand: { brandReviews: { rating: 3.8, reviewCount: 2667 } },
-    product: { productReviews: { rating: 4.8, reviewCount: 240 } },
-    cta: CTA
-  });
-  assert.strictEqual(data.rating, '4.8', `got rating=${data.rating}`);
-  const resolved = resolveIntent('social_proof_led', data);
-  assert.strictEqual(resolved.key, 'social_proof_led');
-  assert.strictEqual(resolved.fellBackFrom, null);
 });
 
 ok('B7 brand_led with no headline also descends rather than rendering hollow', () => {

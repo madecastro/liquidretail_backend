@@ -18,7 +18,7 @@
  *   and permanently-null visual_style were concatenated in too.
  *
  * WHAT IS COVERED:
- *   Q1  conceptLook / artDirectionLook return null for rationale-only /
+ *   Q1  artDirectionLook returns null for rationale-only /
  *       emotional_hook-only concepts (the exact live shape).
  *   Q2  A v3 concept with real art_direction.look DOES surface it.
  *   Q3  renderableCopy dual-reads v2 copy_picks and v3 copy.
@@ -29,8 +29,15 @@
  *       rationale/reasoning (allowlist: aiJudgeService, Director itself,
  *       conceptProjection comments that cite the defect).
  *
- * REVERT-PROVABLE: restoring `|| concept?.rationale` in conceptLook must
- * fail Q1 and Q5. Verified under /tmp during the land of this harness.
+ * REVERT-PROVABLE: restoring a rationale fallthrough in artDirectionLook
+ * must fail Q1 and Q5. Verified under /tmp during the land of this harness.
+ *
+ * REMOVED (dormant render fallback deletion): every check that drove
+ * `conceptLook` / `buildIntentData` on
+ * `services/directImageRenderService.js`. Those functions were deleted
+ * with `renderDirectImage`; adgen owns static rendering unconditionally
+ * now. Q1/Q2/Q5 keep the live half via `conceptProjection.artDirectionLook`
+ * and `staticAdIntents.buildPrompt` with a hand-built data fixture.
  *
  * Run: node scripts/verifyDirectorQuarantine.js
  */
@@ -40,7 +47,6 @@ const fs = require('fs');
 const path = require('path');
 
 const projection = require('../services/conceptProjection');
-const direct = require('../services/directImageRenderService');
 const intents = require('../services/staticAdIntents');
 
 let pass = 0;
@@ -75,9 +81,9 @@ const LIVE_CONCEPT = {
 
 // ── Q1: reasoning-only concepts yield null look ─────────────────────────
 {
-  const lookLive = direct.conceptLook(LIVE_CONCEPT);
+  const lookLive = projection.artDirectionLook(LIVE_CONCEPT);
   check(
-    'Q1 conceptLook returns null for live rationale+emotional_hook shape',
+    'Q1 artDirectionLook returns null for live rationale+emotional_hook shape',
     lookLive === null,
     `got ${JSON.stringify(lookLive)}`
   );
@@ -94,17 +100,6 @@ const LIVE_CONCEPT = {
     'Q1 artDirectionLook returns null for emotional_hook-only concept',
     lookHookOnly === null,
     `got ${JSON.stringify(lookHookOnly)}`
-  );
-
-  // conceptLook must not reintroduce the fallthrough by calling something else.
-  const lookWithVisualStyle = direct.conceptLook(
-    { rationale: LIVE_RATIONALE, emotional_hook: 'trust' },
-    { brand: { visual_style: 'editorial muted concrete' } }
-  );
-  check(
-    'Q1 conceptLook ignores layoutInput.brand.visual_style (never assembled; not a fallback)',
-    lookWithVisualStyle === null,
-    `got ${JSON.stringify(lookWithVisualStyle)}`
   );
 }
 
@@ -141,12 +136,6 @@ const LIVE_CONCEPT = {
   check(
     'Q2 explicit null art_direction stays null even with rationale present',
     projection.artDirectionLook(nullArt) === null
-  );
-
-  // conceptLook must match artDirectionLook for a real look.
-  check(
-    'Q2 conceptLook equals artDirectionLook for nested art_direction',
-    direct.conceptLook(nested) === projection.artDirectionLook(nested)
   );
 }
 
@@ -190,23 +179,10 @@ const LIVE_CONCEPT = {
     projection.renderableCopy(both).headline === 'V3',
     `got ${JSON.stringify(projection.renderableCopy(both))}`
   );
-
-  // buildIntentData dual-reads via renderableCopy.
-  const intentV2 = direct.buildIntentData({
-    concept: v2,
-    layoutInput: {},
-    brand: {},
-    cta: 'SHOP NOW'
-  });
-  check('Q3 buildIntentData reads v2 headline', intentV2.headline === 'V2 HEADLINE');
-
-  const intentV3 = direct.buildIntentData({
-    concept: v3,
-    layoutInput: {},
-    brand: {},
-    cta: 'SHOP NOW'
-  });
-  check('Q3 buildIntentData reads v3 headline', intentV3.headline === 'V3 HEADLINE');
+  // The former "buildIntentData dual-reads via renderableCopy" pin was
+  // removed with `renderDirectImage`/`buildIntentData` (dormant render
+  // fallback deletion, 2026-09-07). renderableCopy itself (above) is the
+  // remaining dual-read coverage.
 }
 
 // ── Q4: conceptForRender never exposes reasoning ─────────────────────────
@@ -289,15 +265,13 @@ const LIVE_CONCEPT = {
 
 // ── Q5: live string never appears in a built image prompt ────────────────
 {
-  const look = direct.conceptLook(LIVE_CONCEPT);
+  const look = projection.artDirectionLook(LIVE_CONCEPT);
   check('Q5 look is null for live concept (precondition for prompt omit)', look === null);
 
-  const intentData = direct.buildIntentData({
-    concept: LIVE_CONCEPT,
-    layoutInput: { social_proof: {} },
-    brand: {},
-    cta: 'SHOP NOW'
-  });
+  const intentData = {
+    headline: LIVE_CONCEPT.copy_picks.headline,
+    cta: LIVE_CONCEPT.copy_picks.cta
+  };
   const built = intents.buildPrompt({
     intentKey: 'product_first_lifestyle',
     data: intentData,
@@ -347,7 +321,7 @@ const LIVE_CONCEPT = {
     surface: 'meta_feed_1_1'
   });
   check(
-    'Q5 (control) when look is forced to rationale, prompt WOULD contain it — so Q5 depends on conceptLook null',
+    'Q5 (control) when look is forced to rationale, prompt WOULD contain it — so Q5 depends on artDirectionLook null',
     !!(withForcedLook.prompt && withForcedLook.prompt.includes('No proof signal exists')),
     'control failed — cannot prove quarantine is at the look source'
   );
@@ -411,28 +385,15 @@ const LIVE_CONCEPT = {
     }
   }
 
-  // conceptLook body must not contain the fallthrough arm.
+  // conceptLook was deleted with renderDirectImage (dormant render fallback
+  // deletion, 2026-09-07). Pin the absence so a reintroduction of the
+  // 2026-08-01 fallthrough cannot hide as a new helper in this file.
   const directSrc = fs.readFileSync(
     path.join(ROOT, 'services/directImageRenderService.js'),
     'utf8'
   );
-  const conceptLookStart = directSrc.indexOf('function conceptLook');
-  check('Q6 conceptLook source located', conceptLookStart >= 0);
-  if (conceptLookStart >= 0) {
-    // Body through next top-level-ish function after conceptLook.
-    const body = directSrc.slice(conceptLookStart, conceptLookStart + 1200);
-    check(
-      'Q6 conceptLook source does not contain || concept?.rationale fallthrough',
-      !/\|\|\s*concept\s*\?\.\s*rationale/.test(body) &&
-        !/\|\|\s*concept\s*\.\s*rationale/.test(body),
-      'the exact 2026-08-01 fallthrough arm is back'
-    );
-    check(
-      'Q6 conceptLook delegates to artDirectionLook',
-      /artDirectionLook\s*\(/.test(body),
-      'conceptLook no longer calls artDirectionLook'
-    );
-  }
+  check('Q6 conceptLook is absent from directImageRenderService (deleted with renderDirectImage)',
+    directSrc.indexOf('function conceptLook') < 0);
 
   // Allowlist sanity: Judge and Director DO reference rationale — if they
   // stopped, something else is wrong, but we do not fail the quarantine.
@@ -505,4 +466,4 @@ if (failures.length) {
   process.exit(1);
 }
 console.log(`✅ director quarantine: ${pass} checks passed`);
-console.log('   scope: conceptLook null-on-reasoning, dual-read copy, conceptForRender strip, prompt omit, source scan, Director v3 schema');
+console.log('   scope: artDirectionLook null-on-reasoning, dual-read copy, conceptForRender strip, prompt omit, source scan, Director v3 schema');

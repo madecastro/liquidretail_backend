@@ -36,10 +36,12 @@
  * So the resolution is the other one: the PROMISE is corrected to match the
  * BEHAVIOUR. Billing behaviour is deliberately UNCHANGED by this PR.
  *
- * That is precisely why group B asserts the billing side. The justification for
- * correcting copy instead of code is that a 'light' request really does buy a
- * video generation. If that ever stops being true, the copy shipped here
- * becomes wrong in the other direction and both must be revisited together.
+ * Group B used to drive the deleted performRegeneration work function to
+ * prove a 'light' request still bought one Omni submit. That local-execution
+ * path is gone: regenerateAd now unconditionally stamps regenerationRequest
+ * and returns; adgen's regenerate consumer claims and runs it. The honesty
+ * invariant is still live on the stamp/handoff path — resolveEffectiveRegenMode
+ * always returns 'full', and the stamp carries that billed mode.
  *
  * Run: node scripts/verifyRegenerateModeHonesty.js
  */
@@ -150,8 +152,10 @@ function loadServiceWithStubs() {
   need('./directImageRenderService', { renderDirectImage: async () => { calls.renderDirectImage++; return { url: 'https://cdn/i.png' }; } });
   need('./campaignAdsGenerationService', { resolveDeriveFromMaster: () => null });
   need('./seededUniverseService',        { isUgcFirstSeedingEnabled: () => false });
-  need('./ugcVideoPipeline',             { preparePassthroughMaster: async () => ({ passthrough: false, skip: false, reason: 'harness' }) });
-  need('./adgenBridge',                  { isAdgenRendererEnabled: () => false });
+  // ugcVideoPipeline / adgenBridge stubs DROPPED 2026-09-07: both files
+  // were deleted with the dormant fallback. stub() returns false on a
+  // missing module, which would fail A0 for a module the service no
+  // longer requires.
   need('./adStage',                      { adStage: () => {} });
 
   class CancelledError extends Error {}
@@ -203,61 +207,30 @@ function groupA() {
     svc.resolveEffectiveRegenMode({ kind: 'video', requestedMode: 'light' }) === 'full');
 }
 
-// ── B — EXECUTION: a "light" video request bills one video generation ─────
-// Runs the real performRegeneration (the shared work function both the local
-// path and adgen's consumer drive) with the caller asking for 'light', and
-// counts provider submits.
-async function groupB() {
-  const { svc, calls } = loadServiceWithStubs();
+// ── B — EXECUTION: performRegeneration is gone; honesty lives on the stamp ─
+// The local-execution work function was deleted with the dormant fallback.
+// regenerateAd now unconditionally stamps Ad.regenerationRequest (adgen's
+// regenerate consumer claims and runs it). The honesty invariant is still
+// live: resolveEffectiveRegenMode always returns 'full', and the stamp
+// carries that billed mode (never 'light' while running full).
+function groupB() {
+  const { svc } = loadServiceWithStubs();
 
-  check('B0 performRegeneration is exported', typeof svc.performRegeneration === 'function');
-  if (typeof svc.performRegeneration !== 'function') return;
+  check('B0 performRegeneration no longer exists (local-execution work function was deleted)',
+    typeof svc.performRegeneration === 'undefined');
 
-  let threw = null;
-  try {
-    await svc.performRegeneration({
-      adId: AD_ID, kind: 'video', prompt: 'warmer light',
-      mode: 'light',                    // ← the operator left the checkbox unchecked
-      requestedBy: 'harness', videoModel: null, promptOverride: null,
-      videoPromptRaw: null, videoPromptGuidance: null, imagePromptRaw: null,
-      startedAt: Date.now()
-    });
-  } catch (e) {
-    threw = e;
-  }
-
-  // performRegeneration funnels its own errors into markComplete, so a throw
-  // reaching here is harness plumbing, not a product failure.
-  check('B1 performRegeneration ran without a plumbing throw', !threw, threw && threw.message);
-
-  // ASSERT THE BRANCH WAS ACTUALLY REACHED — a count of 1 only means something
-  // if the video worker really executed. Two independent witnesses: the
-  // storyboard prep only runVideoFull calls, and the stages it pushes.
-  check('B2 the VIDEO worker branch was reached (storyboard prep ran)',
-    calls.prepareStoryboard === 1, `prepareStoryboard=${calls.prepareStoryboard}`);
-  check('B3 the video worker pushed its own progress stage',
-    calls.stages.includes('generating video'), `stages=[${calls.stages.join(',')}]`);
-  check('B4 the static worker was NOT reached',
-    calls.renderDirectImage === 0, `renderDirectImage=${calls.renderDirectImage}`);
-
-  // THE MONEY ASSERTION. mode:'light' still buys exactly one Omni master —
-  // never zero (that would mean light silently became real and the shipped
-  // copy is now wrong) and never two (a double-bill).
-  check('B5 mode:light on a video ad submits EXACTLY ONE billable video generation',
-    calls.generateForAd === 1, `generateForAd=${calls.generateForAd}`);
-
-  // CORRECTED 2026-08-28 (backend titling removal, owner directive: "remove
-  // and disable the backend titling function"). This used to assert chrome
-  // (renderBrandScriptAndSave) ran once, so "otherwise only the chrome
-  // regenerates" never even described a cheaper subset — it described a
-  // strict subset of what ran. runVideoFull no longer calls
-  // renderBrandScriptAndSave at all (brand or no brand); it always ships
-  // the raw regenerated master through qcAndStampVideoAd instead. The money
-  // point survives unchanged: mode:'light' still buys a full video worth of
-  // work (Omni submit above, plus this vision-QC pass), not a cheaper
-  // subset.
-  check('B6 chrome/titling never runs any more (backend titling removed) — qcAndStampVideoAd ran instead',
-    calls.chrome === 0 && calls.qc === 1, `chrome=${calls.chrome} qc=${calls.qc}`);
+  const src = fs.readFileSync(path.join(SERVICES, 'adRegenerateService.js'), 'utf8');
+  const fnIdx = src.indexOf('async function regenerateAd(');
+  const fnEndIdx = src.indexOf('\nmodule.exports', fnIdx);
+  const fnBody = fnIdx >= 0
+    ? src.slice(fnIdx, fnEndIdx > fnIdx ? fnEndIdx : fnIdx + 8000)
+    : '';
+  check('B1 regenerateAd unconditionally stamps regenerationRequest via buildRegenerationRequest',
+    /regenerationRequest:\s*buildRegenerationRequest\(/.test(fnBody));
+  check('B2 the stamp carries mode: effMode (the billed mode from resolveEffectiveRegenMode, never the caller\'s request)',
+    /mode:\s*effMode/.test(fnBody));
+  check('B3 resolveEffectiveRegenMode always returns full (the billed mode on the stamp)',
+    svc.resolveEffectiveRegenMode({ kind: 'video', requestedMode: 'light' }) === 'full');
 }
 
 // ── C — the route reports the mode it will RUN, never the one asked for ───

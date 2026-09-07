@@ -26,6 +26,13 @@
  * asserts it. Every check below fails against the code as it shipped.
  *
  * No network, no database.
+ *
+ * REMOVED (dormant render fallback deletion): C-group source pins of
+ * renderService's direct-image wrap and routes/ads.js renderOneInner crash
+ * persist (predictionId / err.cause), plus D-group renderOne heartbeat.
+ * Those writers lived in the deleted in-process render loop. Kept: schema
+ * persistence (A), wrapper-shape (B), atlasImageService.carryProviderTags
+ * (still the live image-submit wrap), claimAdsForRun atomicity.
  */
 
 const path = require('path');
@@ -98,10 +105,11 @@ const fs    = require('fs');
 const srcOf = (f) => fs.readFileSync(path.join(__dirname, '..', f), 'utf8');
 
 const renderSrc = srcOf('services/renderService.js');
-truthy('renderService: the direct-image wrap sets predictionId',
-  /wrapped\.predictionId\s*=/.test(renderSrc));
-truthy('renderService: the direct-image wrap sets charged',
-  /wrapped\.charged\s*=/.test(renderSrc));
+// renderService's direct-image wrap lived inside renderDirectImage, deleted
+// with the dormant fallback. Absence pin: do not resurrect a wrap that
+// drops tags. Live image-submit wrapping is atlasImageService below.
+truthy('renderService no longer wraps a direct-image provider error (renderDirectImage gone)',
+  !/wrapped\.predictionId\s*=/.test(renderSrc) && !/function renderDirectImage/.test(renderSrc));
 
 const atlasSrc = srcOf('services/atlasImageService.js');
 truthy('atlasImageService: carryProviderTags exists', /function carryProviderTags/.test(atlasSrc));
@@ -111,10 +119,13 @@ check('atlasImageService: both fallback re-wraps carry tags',
   (atlasSrc.match(/carryProviderTags\(new Error\(`\$\{err\.message\}; fallback/g) || []).length, 2);
 
 const adsSrc = srcOf('routes/ads.js');
-truthy('routes/ads: the crash path records predictionId',
-  /stage:\s*'crash'[\s\S]{0,400}predictionId/.test(adsSrc));
-truthy('routes/ads: the crash path reads err.cause too',
-  /err\.cause\?\.predictionId/.test(adsSrc));
+// renderOneInner's crash persist (stage:'crash' + predictionId / err.cause)
+// is gone with the loop. Live failure recording on this backend is
+// brandScriptExecutor titling (noteRenderIssue) and bootRecovery's image arm.
+truthy('routes/ads: no renderOneInner crash persist of predictionId (loop gone)',
+  !/stage:\s*'crash'[\s\S]{0,400}predictionId/.test(adsSrc));
+truthy('routes/ads: no renderOneInner err.cause?.predictionId read (loop gone)',
+  !/err\.cause\?\.predictionId/.test(adsSrc));
 
 // ── D. the claim is a claim ───────────────────────────────────────────
 console.log('\nD. the render claim is atomic, and ads heartbeat while rendering');
@@ -153,8 +164,11 @@ truthy("routes/ads: /generate itself has no resurrected inline claim (no Ad.upda
   !/Ad\.updateMany\([\s\S]{0,300}?\$set:\s*\{[^}]*status:\s*'rendering'/.test(generateBody));
 truthy('routes/ads: the run re-reads which ads it actually won',
   /claimedIds/.test(adsSrc));
-truthy('routes/ads: renderOne heartbeats updatedAt while rendering',
-  /setInterval\([\s\S]{0,200}status:\s*'rendering'[\s\S]{0,120}updatedAt/.test(adsSrc));
+// renderOne's per-ad heartbeat lived inside the deleted loop. runRenderLoop
+// now returns after flipping the CampaignRun to 'running'; adgen heartbeats
+// claimed ads. Absence pin so a resurrected in-process heartbeat is noticed.
+truthy('routes/ads: runRenderLoop no longer heartbeats ads (renderOne gone)',
+  !/setInterval\([\s\S]{0,200}status:\s*'rendering'[\s\S]{0,120}updatedAt/.test(adsSrc));
 
 console.log(`\n${fail === 0 ? '✅' : '❌'} verifyRenderFailureRecord: ${pass}/${pass + fail} checks passed\n`);
 process.exit(fail === 0 ? 0 : 1);

@@ -36,8 +36,11 @@
 //   B*  behaviour reachable offline: no receipt, no key, no id
 //   U*  'unknown' is distinct from 'failed' — a transport error is NOT a failure
 //   C*  completed-without-output is a classified failure, not still-running
-//   O*  the boot ORCHESTRATION: receipt-scoped, staleness-windowed, lease-free
-//       via status-filtered idempotent writes, and wired before the reaper
+//   O*  the boot ORCHESTRATION: IMAGE-receipt recovery only (video-receipt
+//       arm including resolveRecoveredVideoFailureCharge is deleted; adgen
+//       owns collecting a stranded Omni master). Receipt-scoped, staleness-
+//       windowed, lease-free via status-filtered idempotent writes, wired
+//       before the reaper.
 
 const fs   = require('fs');
 const path = require('path');
@@ -202,54 +205,39 @@ checkTrue('N4 resumeForAd delegates to peekPrediction rather than its own reques
   const videoFailure = recWrites.find((w) =>
     /renderError\.charged/.test(w.update) && /veoPredictionId/.test(w.update)
   );
-  checkTrue('O3 the recovered-master write is status-filtered (idempotent, no lease needed)',
-    !!recoveredMaster
-      && /status:\s*'rendering'/.test(recoveredMaster.filter)
-      && /status:\s*'draft'/.test(recoveredMaster.update));
-  checkTrue('O4 the failure write is status-filtered too',
-    !!videoFailure
-      && /status:\s*'rendering'/.test(videoFailure.filter)
-      && /status:\s*'failed'/.test(videoFailure.update));
-  // O5 REWRITTEN AGAIN 2026-08-19 — the previous version of this check itself
-  // pinned a bug, and its own comment said why it would one day need to.
-  //
-  // History: originally asserted the literal `'renderError.charged': true`
-  // ("a receipt means we were billed"). Rewritten 2026-08-05 to assert video
-  // was UNCONDITIONALLY charged=true via a hardcoded ternary, on the stated
-  // premise that "atlasVideoService.peekPrediction does not read price back,
-  // so there is nothing to confirm against". That premise stopped being true
-  // (peekPrediction's failed branch already spread confirmedCharge(data) into
-  // its return — the video path simply never consulted it), and CLAUDE.md §2
-  // measured 5/5 real failed video predictions carry NO price field, i.e. the
-  // hardcoded true permanently overstated spend on every recovered failure.
-  //
-  // Fixed 2026-08-19: the derivation is now `resolveRecoveredVideoFailureCharge`,
-  // a tri-state read of the SAME confirmed-price field the image path already
-  // uses — imported and called directly here rather than pattern-matched from
-  // source text, because the whole point is to catch a hardcoded regression
-  // that a text scan (as the O5 above was) cannot always tell from the
-  // real thing.
-  checkTrue('O5a resumed video failure derives confirmedCharge from the settled price, not a hardcoded true',
-    rec.resolveRecoveredVideoFailureCharge({ charged: false, priceUsd: 0 }).confirmedCharge === false);
-  checkTrue('O5b a confirmed-charged failure with a real settled price corrects the ledger to it',
-    JSON.stringify(rec.resolveRecoveredVideoFailureCharge({ charged: true, priceUsd: 0.9 }).reconcile) === JSON.stringify({ costUsd: 0.9 }));
-  checkTrue('O5c an UNKNOWN charge state never invents a correction (never guess)',
-    rec.resolveRecoveredVideoFailureCharge({ charged: null, priceUsd: null }).reconcile === null);
-  checkTrue('O5d the failure write reads its charged flag from the derivation, not a literal',
-    /const \{ confirmedCharge, reconcile \} = resolveRecoveredVideoFailureCharge\(r\)/.test(REC)
+  // O3/O4 VIDEO recovered-master / video-failure writes are gone. This
+  // backend's bootRecovery is IMAGE-receipt only; adgen recovers video.
+  checkTrue('O3 bootRecovery no longer writes a recovered video master (veoVideoUrl stamp gone)',
+    !recoveredMaster);
+  const imageFailure = recWrites.find((w) =>
+    /renderError\.charged/.test(w.update) && /imageGeneration/.test(w.update)
+  );
+  checkTrue('O4 the IMAGE failure write is status-filtered (idempotent, no lease needed)',
+    !!imageFailure
+      && /status:\s*'rendering'/.test(imageFailure.filter)
+      && /status:\s*'failed'/.test(imageFailure.update));
+  void videoFailure;
+  // O5 resolveRecoveredVideoFailureCharge was the VIDEO-receipt charge
+  // derivation. Deleted with the video arm. IMAGE failure uses
+  // ir.priceConfirmed === true && Number(ir.price) > 0 inline.
+  checkTrue('O5 resolveRecoveredVideoFailureCharge is no longer exported (video-receipt recovery is adgen)',
+    typeof rec.resolveRecoveredVideoFailureCharge !== 'function');
+  checkTrue('O5d IMAGE failure charged flag is derived from peek price, not a hardcoded true',
+    /const confirmedCharge = ir\.priceConfirmed === true && Number\(ir\.price\) > 0/.test(REC)
     && /'renderError\.charged':\s*confirmedCharge/.test(REC));
-  checkTrue('O6 the recovered master rests at draft (the reaper-safe money guard)',
-    /status: 'draft'/.test(REC));
+  checkTrue('O6 IMAGE recovery delegates to recoverImage / recoverImageAd (not a video draft stamp)',
+    /recoverImage\(\s*\{\s*ad\s*\}\)/.test(REC) || /recoverImageAd/.test(REC));
   // processing/unknown must be left alone — acting on ignorance writes off a
-  // paid asset.
+  // paid asset. IMAGE arm still has this.
   checkTrue('O7 processing and unknown are left untouched for the next pass',
-    /LEAVE IT ALONE/.test(REC) && /stillRunning\+\+/.test(REC));
+    /stillRunning\+\+/.test(REC));
   checkTrue('O8 recovery has a kill switch', /RESUME_IN_FLIGHT_ON_BOOT/.test(REC)
     && rec.enabled() === true);
   checkTrue('O9 recovery is bounded per pass so boot cannot hang', /RESUME_MAX_ADS/.test(REC)
     && /\.limit\(limit\)/.test(REC));
-  checkTrue('O10 recovery cannot submit (it delegates to resumeForAd)',
-    /resumeForAd/.test(REC) && !/pacedModelSubmit|axios\.post|submitImageGeneration/.test(REC));
+  checkTrue('O10 recovery cannot submit (it delegates to recoverImageAd)',
+    /recoverImageAd|recoverImage/.test(REC)
+    && !/pacedModelSubmit|axios\.post|submitImageGeneration/.test(REC));
   // Wiring: recovery must run BEFORE the reaper, and must not be able to crash
   // boot — an unhandled rejection in fire-and-forget work is the crash class
   // this whole effort came from.

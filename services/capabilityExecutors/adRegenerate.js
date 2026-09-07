@@ -3,9 +3,9 @@
 // Retry a failed (or otherwise re-generable) ad AS-IS — no prompt
 // override, no model swap. Wraps adRegenerateService.regenerateAd,
 // same service the POST /api/ads/:id/regenerate route uses. Works for
-// BOTH image and video ads (video-only regen uses runVideoFull inside
-// the service; image regen uses runImage). Contrast with
-// ad.regenerateWithPrompt which is image-only + requires a new
+// BOTH image and video ads — regenerateAd always defers execution to the
+// adgen renderer service (adgen owns rendering unconditionally). Contrast
+// with ad.regenerateWithPrompt which is image-only + requires a new
 // {system, user} prompt pair.
 //
 // COST: variable by kind. Static estimate lives on the registry entry

@@ -21,10 +21,17 @@
  *        2026-08-24, bumped for PR #312's provenance fix, which is a
  *        different and genuine rebuild case. Still 4.1-era reasoning here.)
  *
- * This harness DRIVES the live readers (buildMetaForAd, deriveStage,
- * buildIntentData) with model stubs, the same pattern as
- * verifyShopifyLadderBlocks.js. Cache-key assertions are BYTE
- * identity against the HEAD payload, not "a hash changed".
+ * This harness DRIVES the live readers (buildMetaForAd, applyStagedQuotePick
+ * via brandScriptExecutor + atlasVideoService.refreshStaleLayoutInput) with
+ * model stubs, the same pattern as verifyShopifyLadderBlocks.js. Cache-key
+ * assertions are BYTE identity against the HEAD payload, not "a hash changed".
+ *
+ * REMOVED (dormant render fallback deletion): F1/F2/F4 live-reader drives of
+ * `directImageRenderService.buildIntentData` and `renderService.deriveStage`
+ * (both gone with the in-process static renderer), plus H4/H5 source pins of
+ * those same deleted callers. Kept: E-group applyStagedQuotePick itself,
+ * F3 buildMetaForAd (live titling), H3/H6 live callers, G-group funnelStage
+ * mint + resolveDeriveFromMaster money guard.
  *
  * Every behaviour has a named broken twin that FAILS the same
  * assertion the live function must pass (revert-proven).
@@ -93,7 +100,8 @@ installModels();
 const layout = require('../services/layoutInputService');
 const director = require('../services/aiCreativeDirectorService');
 const gen = require('../services/campaignAdsGenerationService');
-const direct = require('../services/directImageRenderService');
+// directImageRenderService.buildIntentData is gone (dormant render fallback
+// deletion). F1/F2/H5 that drove it are removed; do not re-require it here.
 
 const {
   scoreQuote,
@@ -482,48 +490,13 @@ console.log('E. applyStagedQuotePick reseats the stored pool');
 }
 
 // ══════════════════════════════════════════════════════════════════
-// F. LIVE READERS — buildIntentData + buildMetaForAd + deriveStage
+// F. LIVE READERS — buildMetaForAd (titling). buildIntentData / deriveStage
+//    were the static paid printer + renderService derive path; both are
+//    gone with the dormant in-process renderer. F1/F2/F4 removed.
 // ══════════════════════════════════════════════════════════════════
 console.log('F. live readers honour the stage from the stored pool');
 
 async function runLiveReaders() {
-  setStageFlag('true');
-
-  // F1. buildIntentData is the static paid printer.
-  const concept = {
-    concept_id: 'c1',
-    routing: { funnel_stage: 'conversion', creative_style: 'brand_led', emotional_hook: 'worth the price' },
-    copy: { headline: 'H', subheadline: null, eyebrow: null, cta: 'Shop' }
-  };
-  const intentConv = quiet(() => direct.buildIntentData({
-    concept,
-    layoutInput: cannedInput(0),
-    brand: { name: 'Test' },
-    product: { title: 'Test Shoe', _id: 'p1' },
-    cta: 'Shop',
-    funnelStage: 'conversion'
-  }));
-  check('F1 buildIntentData + conversion prints the repurchase quote',
-    intentConv && typeof intentConv.quote === 'string'
-      ? intentConv.quote.includes('Worth every penny') || intentConv.quote.includes('second pair')
-      : !!(intentConv && (intentConv.quote?.text === CONVERSION_TEXT
-        || String(intentConv.quote || '').includes('Worth every penny'))),
-    `quote=${JSON.stringify(intentConv && (intentConv.quote || intentConv.primary_quote || Object.keys(intentConv)))}`);
-
-  setStageFlag('false');
-  const intentOff = quiet(() => direct.buildIntentData({
-    concept,
-    layoutInput: cannedInput(0),
-    brand: { name: 'Test' },
-    product: { title: 'Test Shoe', _id: 'p1' },
-    cta: 'Shop',
-    funnelStage: 'conversion'
-  }));
-  const offQuote = intentOff && (intentOff.quote?.text || intentOff.quote || '');
-  check('F2 flag-off buildIntentData keeps the stored (awareness) primary',
-    String(offQuote).includes('obsessed') || String(offQuote).includes('gorgeous')
-    || String(offQuote) === AWARENESS_TEXT);
-
   setStageFlag('true');
 
   // F3. buildMetaForAd is the titling printer (funnel retitles land here).
@@ -567,48 +540,9 @@ async function runLiveReaders() {
       `quote=${JSON.stringify(q).slice(0, 120)}`);
   }
 
-  // F4. deriveStage — stub buildLayoutInput, drive the live function.
-  const LIS = require.resolve('../services/layoutInputService');
-  const realLis = require('../services/layoutInputService');
-  const builtArgs = [];
-  require.cache[LIS] = {
-    id: LIS, filename: LIS, loaded: true,
-    exports: {
-      ...realLis,
-      buildLayoutInput: async (args) => {
-        builtArgs.push(args);
-        return cannedInput(0);
-      },
-      resolveQuoteAssemblyOptions: async (adOrReq) => ({
-        funnelStage: adOrReq.funnelStage || null,
-        conceptAngle: null
-      })
-    }
-  };
-  delete require.cache[require.resolve('../services/renderService')];
-  const render = require('../services/renderService');
-  installModels({ layoutDoc: { _id: 'art-1', ...cannedArtifact(0) } });
-  let derived = null;
-  try {
-    derived = await quietAsync(() => render.deriveStage({
-      creative: { mediaId: 'media-1', template: 'ai_brand_led', aspectRatio: '1:1' },
-      funnelStage: 'conversion',
-      productId: 'prod-1',
-      variantKind: 'product_image',
-      campaignKind: 'product'
-    }));
-  } catch (err) {
-    check('F4 deriveStage threw', false, err.message);
-  }
-  if (derived) {
-    check('F4 deriveStage reseats the conversion quote on the returned input',
-      derived.input?.social_proof?.primary_quote?.text === CONVERSION_TEXT,
-      `got ${JSON.stringify(derived.input?.social_proof?.primary_quote?.text)}`);
-  }
+  // F4 deriveStage was renderService's static derive path — deleted with
+  // the in-process renderer. Quote reseat at titling is F3 + H3/H6.
 
-  // Restore real layoutInputService for later checks.
-  delete require.cache[LIS];
-  require.cache[LIS] = { id: LIS, filename: LIS, loaded: true, exports: realLis };
   setStageFlag(undefined);
 }
 
@@ -746,10 +680,15 @@ console.log('H. callers invoke applyStagedQuotePick (the live pick)');
     !/stageKey/.test(lis.match(/function computeCampaignContextHash[\s\S]{0,800}/)?.[0] || 'stageKey'));
   check('H3 buildMetaForAd calls applyStagedQuotePick',
     /applyStagedQuotePick/.test(bse));
-  check('H4 deriveStage calls applyStagedQuotePick',
-    /applyStagedQuotePick/.test(render));
-  check('H5 buildIntentData calls applyStagedQuotePick',
-    /applyStagedQuotePick/.test(dir));
+  // H4/H5 were source pins of renderService.deriveStage and
+  // directImageRenderService.buildIntentData. Both functions are gone with
+  // the in-process renderer; adgen owns those callers now. Absence pin so
+  // a resurrection of either dead path fails this harness instead of
+  // silently drifting.
+  check('H4 renderService.deriveStage no longer calls applyStagedQuotePick (function deleted)',
+    !/function\s+deriveStage/.test(render) && !/applyStagedQuotePick/.test(render));
+  check('H5 directImageRenderService.buildIntentData no longer calls applyStagedQuotePick (function deleted)',
+    !/function\s+buildIntentData/.test(dir) && !/applyStagedQuotePick/.test(dir));
   check('H6 atlas refresh calls applyStagedQuotePick',
     /applyStagedQuotePick/.test(veo));
   check('H7 pickDirectorPrimaryQuote forwards opts (not hardcoded {})',

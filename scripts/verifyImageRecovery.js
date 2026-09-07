@@ -19,7 +19,8 @@
  *      successful render, which is worse than not recovering at all.
  *
  * AND the structural one that keeps 2 true over time: finishPlate has exactly ONE
- * implementation, called by both the render path and recovery. Two copies of the
+ * implementation, called by recovery (the remaining live backend caller —
+ * mint-time renderDirectImage was deleted 2026-09-07). Two copies of the
  * delivery crop would drift, and the failure is silent — a mis-cropped ad still
  * looks plausible while cutting through typeset copy.
  *
@@ -100,9 +101,11 @@ check('B3 the buffer uploaded is the FINISHED plate, not the fetched frame',
 // ── C. ONE IMPLEMENTATION OF THE DELIVERY CROP ───────────────────────────
 check('C1 finishPlate is exported from directImageRenderService',
   /^\s*finishPlate,/m.test(dirSrc));
-check('C2 the NORMAL render path calls it too — so there is one implementation, '
-    + 'not a copy that can drift',
-  /const plate = await finishPlate\(\{/.test(dirSrc));
+// C2 REMOVED 2026-09-07: the mint-time renderDirectImage caller
+// (`const plate = await finishPlate({`) was deleted with the dormant
+// fallback. Recovery is now the sole remaining backend caller of
+// finishPlate — C3 already pins that import. Adgen's renderer owns
+// mint-time compositing.
 check('C3 recovery imports it rather than reimplementing the crop',
   /require\('\.\/directImageRenderService'\)/.test(recSrc)
   && /finishPlate/.test(recSrc)

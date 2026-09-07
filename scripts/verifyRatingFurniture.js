@@ -24,7 +24,15 @@
  *   B. Director copy contract — validateDirectorPayload rejects the same
  *      language, stated in the round prompt so the validator is not silent.
  *
- * Calls the REAL buildPrompt / buildIntentData / validateDirectorPayload /
+ * REMOVED (dormant render fallback deletion): E4 (`buildIntentData` still
+ * hands over scoped reviewsText). That function was deleted with
+ * `renderDirectImage`; adgen owns static rendering unconditionally now.
+ * Surviving coverage is the live `staticAdIntents` rating-furniture prompt
+ * text, `resolveIntent` descent, and Director validation. The scoped
+ * `reviewsText` itself is still authored by `ratingDisplay.js` (C-group of
+ * verifySocialProofRestoration / verifyStaticCtaAndProof).
+ *
+ * Calls the REAL buildPrompt / validateDirectorPayload /
  * copyFailsCompliance / resolveIntent. No source scan of a constraint that
  * can be asserted by calling.
  *
@@ -452,26 +460,25 @@ try {
     check('E3 social_proof_led.core is [RATING]',
       JSON.stringify(on.INTENTS.social_proof_led.core) === JSON.stringify(['RATING']));
 
-    // E4 — buildIntentData still hands over scoped reviewsText. Do not
-    // remove the scope label; relocate how it is drawn.
-    const dirKey = require.resolve('../services/directImageRenderService');
-    delete require.cache[dirKey];
-    const { buildIntentData } = require('../services/directImageRenderService');
-    const data = buildIntentData({
-      concept: { copy: { headline: MUST_KEEP[0] } },
-      layoutInput: {
-        social_proof: { rating_value: 5, review_count: 41000, rating_source: 'brand' }
+    // E4 (`buildIntentData` still hands over scoped reviewsText) was removed
+    // with `renderDirectImage`/`buildIntentData` (dormant render fallback
+    // deletion, 2026-09-07). The prompt still consumes a scoped reviewsText
+    // when one is supplied — pin that consumption, not the deleted cascade.
+    const scoped = on.buildPrompt({
+      intentKey: 'social_proof_led',
+      data: {
+        rating: '5.0',
+        reviewCount: 41000,
+        reviewsText: '41000 brand reviews',
+        headline: MUST_KEEP[0],
+        cta: 'SHOP NOW'
       },
-      brand: { brandReviews: { rating: 5, reviewCount: 41000 }, tagline: 'Walk lighter.' },
-      product: { rating: 4.2, productReviews: { rating: 4.2, reviewCount: 3 } },
-      cta: 'SHOP NOW'
+      product: PRODUCT,
+      surface: 'meta_feed_4_5'
     });
-    check('E4 reviewsText still carries BRAND_SCOPE_LABEL',
-      typeof data.reviewsText === 'string' && /brand reviews/.test(data.reviewsText),
-      `reviewsText=${JSON.stringify(data.reviewsText)}`);
-    check('E4 rating numeral still present',
-      data.rating != null,
-      `rating=${JSON.stringify(data.rating)}`);
+    check('E4 prompt still carries BRAND_SCOPE_LABEL from reviewsText',
+      (scoped.prompt || '').includes('brand reviews'),
+      `prompt missing scoped reviewsText`);
   }
 
   // ── F. kill switch is committed ────────────────────────────────────────

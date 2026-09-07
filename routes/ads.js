@@ -27,18 +27,31 @@ const { receiptFree, adSpendReceipts } = require('../services/spendReceipt');
 // identity stops squatting its slot on the (campaignId, identityDigest) unique
 // index. Never hand-roll a $set for these. See services/adArchiveDigest.js.
 const {
-  archiveAdsReleasingDigest,
   archiveOneReleasingDigest,
   restoreOneRestoringDigest,
   isDigestCollisionError,
   DIGEST_COLLISION_MESSAGE,
   restoreTookEffect,
   UNRESTORABLE_TOMBSTONE_MESSAGE,
-  // The two Stop-handler archive filters. Pure + exported so
-  // scripts/verifyArchiveDigestRelease.js evaluates the REAL query against
-  // real document shapes instead of regexing this closure.
-  buildStopUndispatchedArchiveFilter,
-  buildStopBacklogArchiveFilter,
+  // archiveAdsReleasingDigest (bulk) and the two Stop-handler archive filters
+  // (buildStopUndispatchedArchiveFilter / buildStopBacklogArchiveFilter) used
+  // to be imported here for the render loop's Stop-cancellation cleanup
+  // ("cancelled mid-batch: archive the undispatched tail + this run's queued
+  // backlog, releasing their never-billed identity digest"). That whole
+  // cancellation-detection path lived inside the in-process render loop's
+  // pool dispatch cycle (progressRun.checkpoint() throwing on
+  // cancelRequested), which is deleted along with the rest of the dormant
+  // in-process render fallback — adgen now claims and renders every ad, and
+  // does not (yet) check CampaignRun/OperationRun.cancelRequested itself, so
+  // pressing Stop on an ad-generation run currently sets the cooperative flag
+  // (routes/progress.js) but nothing consumes it for this operation kind. Not
+  // a regression from this deletion — the flag has gone uncooperated-with
+  // since ADGEN_RENDERER_ENABLED shipped true in production (the same dead
+  // branch this removal deletes), just newly visible now that the code
+  // admits it. Flagged for the owner; wiring real Stop support into adgen's
+  // renderer is out of scope here. archiveOneReleasingDigest (singular,
+  // above) is unrelated and still live (PATCH /:id).
+  //
   // Requeue markers/builders. Every rendering→queued write below uses EXACTLY
   // one: PRE_DISPATCH (spread bare — control flow PROVES no submit can have
   // happened) or buildRequeuePipeline (a billable submit MAY sit behind this
@@ -59,10 +72,6 @@ const CatalogProduct = require('../models/CatalogProduct');
 const CropArtifact = require('../models/CropArtifact');
 const Campaign     = require('../models/Campaign');
 const CampaignRun  = require('../models/CampaignRun');
-// Read-only here — reconciled per-run spend for the completion summary
-// (slackVerbosity.buildRunCompletionSummaryLines). Never written from this
-// route; costTracker.js owns all CostLog writes.
-const CostLog      = require('../models/CostLog');
 const {
   expandWizardJob,
   selectAdsForRun,
@@ -71,26 +80,18 @@ const {
   PMAX_VIDEO_DERIVE_ONLY,
   PMAX_VIDEO_DERIVE_SOURCE,
   DERIVE_FROM_MASTER_FIELD,
-  // Google's hard floor (video under 10s is rejected on that surface) —
-  // reused by findSiblingMasterAd's duration-compatibility guard so a
-  // sub-floor master can never be adopted as a shared plate, regardless of
-  // its age. One definition; do not re-derive the value here.
-  GOOGLE_PMAX_VIDEO_DURATION_SEC,
   // THE shared derive-only gate (money) — one definition, imported by both
   // this render loop and services/adRegenerateService. Do not re-implement.
   resolveDeriveFromMaster,
   // THE canonical "is this ad a true video master" predicate — same four
-  // conditions findSiblingMasterAd's own query filter checks below, factored
-  // out so projectAd's isMaster badge field can reuse the identical
+  // conditions (kind, deriveFromMaster, funnelStage, videoDurationSec floor)
+  // factored out so projectAd's isMaster badge field can reuse the identical
   // definition instead of a second, driftable approximation.
   isMasterVideoAd
 } = require('../services/campaignAdsGenerationService');
 const { summarizeEmptyExpansion, REASON: PER_PRODUCT_REASON } = require('../services/perProductReasons');
 const { assertGeneratablePlatformFormat, resolveExplicitFormats } = require('../services/platformFormats');
-const { renderCreative }        = require('../services/renderService');
-const { childTailsFrom }        = require('../services/renderErrorFields');
-const { generateForAd: veoGenerateForAd, prepareStoryboard: veoPrepareStoryboard } = require('../services/videoRouter');
-const { buildVideoSegmentUrl, buildPromptScaffold } = require('../services/atlasVideoService');
+const { buildPromptScaffold } = require('../services/atlasVideoService');
 const { resolveSeedTextTruth } = require('../services/seedTextTruth');
 const {
   lookupUrlsFor,
@@ -100,38 +101,6 @@ const {
 } = require('../services/videoReferenceLineage');
 const { buildGridPreviewVideoUrl } = require('../services/videoPreviewUrl');
 const { buildGridPreviewImageUrl } = require('../services/imagePreviewUrl');
-const ugcVideoPipeline = require('../services/ugcVideoPipeline');
-const { resolveAdVideoDurationSec } = require('../services/videoDurationPolicy');
-
-// Derive-only 1:1 ads requeue while their 9:16 master is still in flight.
-// Each claim→wait→requeue cycle counts as one attempt on `deriveWaitAttempts`
-// — a SEPARATE counter from `renderAttempts` (models/Ad.js). Waiting never
-// submits or renders anything, so it must not inflate renderAttempts:
-// services/queuedArchiveSweeper's `renderAttempts:0` guard uses that field to
-// prove a queued leftover never started, and a wait-only requeue that bumped
-// renderAttempts made itself permanently unsweepable.
-//
-// RE-SCOPED 2026-08-20 (owner: "hitting the timeout shouldn't abandon, it
-// should just send a slack explaining the backup"). This USED to be a hard
-// cap: cycle 30 stamped the ad `failed` ("refusing Omni fallback"). It no
-// longer does — see handleDeriveMasterBackup below, the only place that
-// still reads this constant. A master still in flight (`queued`/`rendering`)
-// is NEVER a reason to give up; the only honest failure left in this
-// function is a master that is genuinely absent or terminal with no plate
-// (the `else` branch further down, unchanged). MAX_DERIVE_WAIT_ATTEMPTS now
-// marks ESCALATION — the point past which a Slack backup notice bumps from
-// 'warn' to 'error' because ~30 cycles (generous vs. a ~2–4 min Omni master)
-// is well beyond ordinary congestion — never abandonment. Raising
-// VEO_CONCURRENCY/REMOTION_QUEUE_CONCURRENCY (config/defaults.env) makes
-// masters queue longer behind titling, so this constant is crossed more
-// often now; that is the exact scenario this rewrite exists for.
-const MAX_DERIVE_WAIT_ATTEMPTS = 30;
-// In-render wait for the sibling master's plate. An Omni master settles in
-// roughly 2 minutes; 12 minutes leaves generous headroom for a slow poll
-// or a queued master behind a busy pool, while still bounding the slot.
-// Waiting costs nothing — the derive path never submits.
-const DERIVE_MASTER_WAIT_MS = Number(process.env.DERIVE_MASTER_WAIT_MS || 12 * 60 * 1000);
-const DERIVE_MASTER_POLL_MS = Number(process.env.DERIVE_MASTER_POLL_MS || 10 * 1000);
 const { loadCategoryChainForProduct } = require('../services/categoryChainService');
 const { deleteFromCloudinary } = require('../services/cloudinaryService');
 const { buildVideoCompositeUrl } = require('../services/videoCompositeService');
@@ -160,16 +129,9 @@ const {
   buildUnclaimedNotice
 } = require('../services/generationGate');
 const {
-  buildTerminalDoneFilter, buildRunningFlipFilter, buildActiveRunsFilter
+  buildRunningFlipFilter, buildActiveRunsFilter
 } = require('../services/campaignRunGuards');
 const { reapStaleMin, prepareStaleMin } = require('../services/staleness');
-// CampaignRun liveness heartbeat for the render loop. IMPORTED, never
-// re-implemented inline — CLAUDE.md §4 records three production ReferenceErrors
-// from call sites that used a helper the file never imported, and a source-text
-// harness cannot see an unbound identifier.
-const {
-  startRunHeartbeat, buildClaimedAdHeartbeatFilter, buildClaimedAdHeartbeatUpdate
-} = require('../services/campaignRunHeartbeat');
 
 // Operator-facing gate for a multi-select format list (preset 'explicit'),
 // shared by /preview + /generate.
@@ -292,11 +254,12 @@ function parsePhase3WizardFields(body = {}) {
 // manually drive those.
 const AD_STATUSES = ['draft', 'live', 'archived'];
 
-// Render / video pool sizes + per-run cap — resolved in services/concurrency.js
-// (env-tunable; defaults raised 2026-08-02: RENDER 4→8, VEO 1→4).
+// Per-run cap — resolved in services/concurrency.js (env-tunable). The
+// render pool sizes (RENDER_CONCURRENCY / VEO_CONCURRENCY) this file used to
+// also read here were the in-process render loop's own pool sizing; that
+// loop is gone (adgen owns rendering unconditionally now), so only the claim
+// cap remains a live consumer of this table.
 const { concurrency: CONC } = require('../services/concurrency');
-const RENDER_CONCURRENCY    = CONC.RENDER_CONCURRENCY;
-const VEO_CONCURRENCY       = CONC.VEO_CONCURRENCY;
 const MAX_CREATIVES_PER_RUN = CONC.MAX_CREATIVES_PER_RUN;
 
 // veoTitlingSemaphore / titlingQueueDepth() REMOVED 2026-08-28 along with
@@ -1642,7 +1605,11 @@ router.post('/runs', express.json(), async (req, res) => {
     });
 
     // Reuse the same runRenderLoop. job arg only carries the brand /
-    // campaign metadata renderOne needs to thread into renderCreative.
+    // campaign metadata runRenderLoop needs for the ADGEN handoff (Slack
+    // run-feed brandId/campaignId/campaignKind lookups) — it no longer
+    // threads into any in-process renderer; renderOne/renderCreative were
+    // deleted with the rest of the dormant in-process render fallback
+    // (2026-09-07).
     // Render ONLY claim.renderIds — never the pre-claim selection.
     // (Aliasing renderIds = selectedIds is a double-charge regression the
     // harness is designed to fail on.)
@@ -1724,30 +1691,30 @@ function automatedRunLabel(run) {
 // the CampaignRun doc as each render finishes so the frontend's
 // poller can show real-time progress.
 async function runRenderLoop(run, job, adIds, renderToken) {
-  // Ad-gen microservice handoff (Phase 1). When ADGEN_RENDERER_ENABLED
-  // is true, backend has completed its side of the flow (validate, gate,
-  // mint, claim → Ad.status='rendering') and the adgen renderer service
-  // picks up the actual work via its own atomic claim on
+  // Ad-gen microservice handoff. Backend has completed its side of the flow
+  // (validate, gate, mint, claim → Ad.status='rendering') and the adgen
+  // renderer service picks up the actual work via its own atomic claim on
   // {status:'rendering', claimedByWorker:null}. Backend returns here
-  // without dispatching. See services/adgenBridge.js + the
-  // ADGEN_RENDERER_ENABLED flag in config/defaults.env.
+  // without dispatching — unconditionally. This USED TO be gated behind
+  // `isAdgenRendererEnabled()` (services/adgenBridge.js, the
+  // ADGEN_RENDERER_ENABLED flag) with an in-process worker-pool fallback
+  // below the gate; both the flag and the fallback were removed
+  // (owner directive — see session.d/ for this removal). There is no other
+  // path left: this repo no longer renders ads in-process.
   //
   // Why this is the single gate: every render entry point (POST /generate,
-  // POST /runs, regenerate) funnels through runRenderLoop. Gating here
-  // instead of at each caller means the flip can never partially apply.
+  // POST /runs, regenerate) funnels through runRenderLoop. Doing the handoff
+  // here instead of at each caller means every caller sees identical
+  // behavior.
   //
   // CampaignRun status transition still needs to happen so the operator's
-  // UI shows 'running' rather than 'preparing' forever — one write, same
-  // shape as the (elided) status flip that lives further down this loop.
-  // Route partition, HOISTED ABOVE THE ADGEN HANDOFF RETURN. It used to sit
-  // below, next to the render pools that consume it — but the Slack run feed
-  // needs staticCount/veoCount too, and the feed has to start on BOTH paths.
-  // Cheap: one projected _id+renderRoute read.
+  // UI shows 'running' rather than 'preparing' forever.
+  // Route partition — needed for the Slack run feed's staticCount/veoCount
+  // below. Cheap: one projected _id+renderRoute read.
   const routes = await Ad.find({ _id: { $in: adIds } }).select('_id renderRoute').lean();
   const routeById = new Map(routes.map((r) => [String(r._id), r.renderRoute || null]));
   const veoIds   = adIds.filter((id) => routeById.get(String(id)) === 'veo');
   const otherIds = adIds.filter((id) => routeById.get(String(id)) !== 'veo');
-  const isVeoRun = veoIds.length > 0;
 
   // Who ordered this run — resolved ONCE, HOISTED ABOVE THE ADGEN HANDOFF
   // RETURN and above the (now single) runFeed.startRun call below.
@@ -1817,12 +1784,6 @@ async function runRenderLoop(run, job, adIds, renderToken) {
   // fabricated name.
   const requesterLabel = autoLabel || humanRequesterLabel;
 
-  // Stamp the label onto `job` so renderOneInner's video-failure alert can name
-  // the requester without a second lookup on a failure path. Safe to mutate:
-  // both call sites build `job` fresh per run (never a shared object), and it
-  // already flows unchanged into renderOne → renderOneInner.
-  if (requesterLabel) job.requesterLabel = requesterLabel;
-
   // Per-run Slack feed — fire-and-forget, never awaited. Registers adIds so
   // adStage can route events without a Mongo round-trip. Parent message +
   // thread posts are owned by runFeedService's detached interval.
@@ -1853,451 +1814,13 @@ async function runRenderLoop(run, job, adIds, renderToken) {
     requesterLabel
   });
 
-  const { isAdgenRendererEnabled } = require('../services/adgenBridge');
-  if (isAdgenRendererEnabled()) {
-    console.log(
-      `🔀 [campaignRun ${run.runId}] ADGEN handoff — ${adIds.length} ad(s) deferred to adgen renderer service`
-    );
-    await CampaignRun.updateOne(
-      { _id: run._id, status: 'preparing' },
-      { $set: { status: 'running', updatedAt: new Date() } }
-    ).catch((err) => console.error(`⚠️  [campaignRun ${run.runId}] ADGEN handoff: preparing→running flip failed: ${err.message}`));
-    return;
-  }
-
-  const t0 = Date.now();
-  // The renderRoute partition that feeds the two pools below (veo is
-  // quota-limited and serialized; image is cheap and parallel — a single mixed
-  // batch used to fall back to VEO_CONCURRENCY for ALL ads, so a 20-min Grok
-  // poll starved image ads that could have finished in <1 min) is computed
-  // ABOVE the adgen handoff return now, because the Slack run feed needs the
-  // same counts and has to start on both paths. See the hoist there.
   console.log(
-    `🚀 [campaignRun ${run.runId}] start — ${adIds.length} ad(s) ` +
-    `concurrency=veo:${VEO_CONCURRENCY}(${veoIds.length}) image:${RENDER_CONCURRENCY}(${otherIds.length}) ` +
-    `brand=${job.brandId} campaign=${job.campaignId} kind=${job.campaignKind || '-'}`
+    `🔀 [campaignRun ${run.runId}] ADGEN handoff — ${adIds.length} ad(s) deferred to adgen renderer service`
   );
-
-  // Register with the in-flight registry so the SIGTERM handler can report
-  // exactly how much work an instance replacement is about to orphan. This
-  // loop lives in the web process and dies with it — see services/inFlight.js.
-  inFlight.track(run.runId, { total: adIds.length, brandId: job.brandId, veo: isVeoRun });
-
-  // Brand name / requester label / job.requesterLabel were already resolved
-  // ABOVE the adgen handoff return (see there) — nothing left to do here.
-
-  // Unified progress row (ActivityDock) — mirrors the CampaignRun
-  // counters and adds cooperative cancel: the pool stops claiming new
-  // ads, in-flight renders finish, unclaimed ads flip to skipped.
-  const { startRun } = require('../services/progressService');
-  const progressRun = await startRun({
-    kind: 'ad-batch',
-    advertiserId: brandDoc?.advertiserId,
-    brandId: job.brandId,
-    total: adIds.length,
-    // Label reflects the mix — mostly for the ActivityDock header.
-    label: isVeoRun && otherIds.length ? 'Ad generation (mixed)'
-         : isVeoRun ? 'Video ad generation'
-         : 'Ad generation',
-  });
-  progressRun.stage('rendering');
-
-  // Preserve stable "position in batch" via the shared adIds order — the
-  // index gets stamped into CampaignRun.errors[] rows and log lines. Each
-  // pool consumes its own slice but keeps the original index.
-  const indexOf = new Map(adIds.map((id, i) => [String(id), i]));
-  let done      = 0;
-  let cancelled = false;
-  // Each pool tracks its own remaining-work cursor so the cancel path
-  // can requeue precisely what it didn't reach.
-  const pools = [
-    { name: 'veo',   concurrency: VEO_CONCURRENCY,    queue: veoIds.map((id) => ({ adId: id, index: indexOf.get(String(id)) })),   next: 0, inflight: 0 },
-    { name: 'image', concurrency: RENDER_CONCURRENCY, queue: otherIds.map((id) => ({ adId: id, index: indexOf.get(String(id)) })), next: 0, inflight: 0 }
-  ].filter((p) => p.queue.length > 0);
-
-  // ── CAMPAIGNRUN LIVENESS HEARTBEAT — a money/visibility guard, not telemetry.
-  //
-  // worker.js's reaper flips any CampaignRun sitting in 'running' with
-  // `updatedAt` older than REAP_STALE_MIN (15m) to 'failed'. Nothing was
-  // refreshing that clock during a render: the ONLY writes to the run row are
-  // the per-ad `$inc { succeeded | failed | skipped }` below, which fire when
-  // an ad SETTLES. So the reaper's predicate measured "no ad settled recently",
-  // not "this run is alive", and MEASURED IN PRODUCTION 2026-08-18
-  // (run_1787105727540_e8c94542) those diverged by 15 minutes: 18 statics
-  // settled by 02:21, video titling then ran silently, and at 02:36 the reaper
-  // stamped a working run 'failed' with `errors: []`, `failed: 0`. The Ad sweep
-  // stranded 9 of its ads 'queued' in the same tick. The operator paid for the
-  // masters and silently received 30 of 39 creatives.
-  //
-  // GATED ON REAL WORK, and that is the whole design. A heartbeat that ticked
-  // unconditionally would defeat the reaper and resurrect the class it exists
-  // to kill — a run wedged forever holding claimed ads. `isWorking` reads the
-  // pools' OWN inflight counters, i.e. the same numbers the loop uses to decide
-  // it is finished, so the beat stops the moment nothing is rendering. It also
-  // dies with the process, so a replaced instance cannot beat at all.
-  //
-  // The Ad arm inside the ticker is the timer form of the per-completion
-  // `Ad.updateMany` below — same filter, same update. It is what saves the
-  // claimed-but-undispatched tail (the 9 rows above), and it closes a real
-  // double-bill: an ad reaped to 'queued' while still sitting in this live
-  // in-memory pool is claimable by a concurrent selectAdsForRun, and
-  // renderOneInner has no status guard, so both runs would submit it.
-  //
-  // Fire-and-forget, never awaited, never throws into the loop — same
-  // discipline as adStage(). See services/campaignRunHeartbeat.js.
-  const runHeartbeat = startRunHeartbeat({
-    runDocId:  run._id,
-    adIds,
-    isWorking: () => pools.some((p) => p.inflight > 0)
-  });
-
-  try {
-    await Promise.all(pools.map((pool) => new Promise((resolve) => {
-      const dispatch = async () => {
-        // AWAITED, not fire-and-forget. checkpoint() is async (it reads
-        // cancelRequested from Mongo) and signals cancellation by THROWING, so
-        // `.catch(() => cancelled = true)` could only ever run on a later
-        // microtask. The synchronous while-loop below therefore ran first with a
-        // stale `cancelled === false` and claimed a whole extra wave of renders
-        // AFTER the operator pressed Stop — every one of them billable. Awaiting
-        // costs one already-throttled read (1/s cache in progressService) per
-        // dispatch cycle and makes Stop mean stop.
-        try {
-          await progressRun.checkpoint();
-        } catch {
-          cancelled = true;
-        }
-        if (cancelled && pool.inflight === 0) return resolve();
-        while (!cancelled && pool.inflight < pool.concurrency && pool.next < pool.queue.length) {
-          const { adId, index } = pool.queue[pool.next++];
-          pool.inflight++;
-          renderOne(run, job, adId, index, renderToken)
-            .catch(err => {
-              console.error(`❌ [campaignRun ${run.runId}] #${index} (${pool.name}) dispatch crash:`, err.message || err);
-            })
-            .finally(() => {
-              pool.inflight--;
-              progressRun.tick(++done, adIds.length);
-              inFlight.progress(run.runId, done);
-              // Liveness heartbeat for the reaper — see the comment on the
-              // pre-partition version for why we refresh updatedAt on every
-              // completion instead of just at claim time. Scoped to
-              // status:'rendering' so it never resurrects ads the cancel
-              // path already re-queued.
-              //
-              // SAME BUILDERS as the ticker above, imported not re-inlined: the
-              // completion-driven beat and the time-driven beat must touch one
-              // population. Drift between them is how the undispatched tail got
-              // reaped out from under a live run on 2026-08-18.
-              Ad.updateMany(
-                buildClaimedAdHeartbeatFilter(adIds),
-                buildClaimedAdHeartbeatUpdate(new Date())
-              ).catch(() => {});
-              if ((pool.next >= pool.queue.length || cancelled) && pool.inflight === 0) resolve();
-              else dispatch().catch(() => resolve());
-            });
-        }
-        if (cancelled && pool.inflight === 0) resolve();
-      };
-      dispatch().catch(() => resolve());
-    })));
-  } catch (err) {
-    // DEAD TODAY, AND DELIBERATELY KEPT — say so rather than implying it is
-    // load-bearing (adversarial review corrected an earlier comment here that
-    // did). The drain above cannot reject: each pool is
-    // `new Promise((resolve) => …)` whose `dispatch()` is `.catch(() =>
-    // resolve())`'d and whose renderOne is `.catch`'d, so `Promise.all` only
-    // ever fulfils. What this arm buys is that the invariant survives an edit —
-    // the moment anyone removes one of those catches, or adds an `await`
-    // between the drain and the finally, a rejection would otherwise skip
-    // straight past a still-beating timer and keep a crashed run out of the
-    // reaper's reach forever. `stop()` is idempotent, so the pair costs
-    // nothing, and `throw err` keeps the pre-existing contract with all three
-    // callers (both /generate and /runs already catch this loop's rejection).
-    runHeartbeat.stop();
-    throw err;
-  } finally {
-    // Every normal exit — completion AND operator cancel (the pools resolve
-    // once inflight hits 0 on the cancel path, so the drain is still covered
-    // above and the beat ends here). After this point the run's next write is
-    // its terminal 'done'/'failed' stamp, so there is nothing left to keep
-    // alive.
-    runHeartbeat.stop();
-  }
-
-  // Cancelled mid-batch: unclaimed ads (bulk-flipped to 'rendering' at claim
-  // time, before the loop) are ARCHIVED — see the block below for why.
-  //
-  // This comment used to say they "go BACK to the queue … we requeue the
-  // untouched tail", which is the OPPOSITE of what the code does and was left
-  // behind when the behaviour changed. It is money-adjacent — requeued ads get
-  // billed on the next Generate — so a reader who trusts the top of the block
-  // and stops there gets exactly the wrong model. Corrected 2026-08-03.
-  //
-  // Still true and still load-bearing: match on status:'rendering'. The
-  // original status:'queued' filter matched nothing post-claim and stranded
-  // unclaimed ads in 'rendering' forever (adversarial-review find).
-  if (cancelled) {
-    // ARCHIVE, do not re-queue. Putting cancelled ads back to 'queued' meant
-    // the work the operator just stopped reappeared on the next Generate and
-    // billed — Stop hid the button but bought the renders anyway. 'archived'
-    // is in the Ad status enum and selectAdsForRun only ever matches 'queued',
-    // so archived ads are invisible to every future run while staying
-    // inspectable, and reversible in bulk.
-    //
-    // Two scopes, and BOTH are scoped to THIS RUN — corrected 2026-08-18.
-    //
-    //   1. this run's claimed-but-never-dispatched tail (status:'rendering',
-    //      bulk-flipped at claim time), and
-    //   2. this run's OWN minted-but-unclaimed backlog (status:'queued').
-    //
-    // ⚠️ THIS COMMENT USED TO ASSERT THE OPPOSITE and the code matched it: the
-    // backlog write was `{ campaignId, status: 'queued' }` — EVERY queued ad on
-    // the campaign — justified as "no more generation happens". That was wrong.
-    // A campaign is not a run. Other runs mint their own rows and leave them
-    // queued while they wait for their own claim, and expandWizardJob
-    // deliberately mints more than a run claims so the operator can drain the
-    // rest with "Generate more" (POST /runs). Stopping run A therefore silently
-    // destroyed run B's pending work and every mint leftover on the campaign.
-    // Owner ruled this a bug 2026-08-18: Stop parks the stopping run's own
-    // tail, nothing else. Leftovers nobody claims are not orphaned by this —
-    // services/queuedArchiveSweeper parks them after QUEUED_ARCHIVE_AFTER_H.
-    //
-    // OWNERSHIP IS `campaignRunIds`, and one membership test covers both kinds
-    // of ownership. The minting run is stamped into campaignRunIds AT MINT
-    // (campaignAdsGenerationService.mintedCampaignRunIds(generationRunId)) and
-    // a claim $addToSet's the claiming run (claimAdsForRun). There is no
-    // separate persisted `generationRunId` path on Ad to test — it is a digest
-    // input and the source of campaignRunIds[0], never its own field. Pinned by
-    // scripts/verifyArchiveDigestRelease.js, which asserts the mint still
-    // stamps it, so this filter cannot quietly stop covering mint leftovers.
-    //
-    // MONEY GUARDS ON BOTH WRITES (defense in depth, same pattern as #189/#204,
-    // and required by the digest release the archive helper performs): both
-    // filters are built by receiptFree()-composing pure functions in
-    // services/adArchiveDigest.js, which the harness evaluates directly. A
-    // receipt-holding row is deliberately LEFT in 'rendering' rather than
-    // archived: honest (the outcome is unknown until the receipt is polled),
-    // still visible to ALERT_RENDERING_STALE_MIN, and still recoverable for
-    // free by bootRecoveryService instead of hidden in 'archived'.
-    //
-    // Renders already in flight cannot be recalled — a dispatched image or
-    // video call is already paid for — so those finish and are kept.
-    let archivedThisRun = 0;
-    const remaining = pools.flatMap((p) => p.queue.slice(p.next).map((q) => q.adId));
-    if (remaining.length) {
-      const r = await archiveAdsReleasingDigest(
-        Ad,
-        buildStopUndispatchedArchiveFilter({ adIds: remaining }),
-        // THE ONLY caller allowed to free the digest of a status:'rendering'
-        // row. `remaining` is `p.queue.slice(p.next)` — ads this loop provably
-        // never handed to a renderer — so no billable submit can be in flight
-        // and the receipt-free/receipt-not-yet-written window cannot apply.
-        // Every other archive site leaves a 'rendering' row's digest alone.
-        { allowRenderingRelease: true }
-      ).catch(() => null);
-      archivedThisRun = r?.modifiedCount || 0;
-      await CampaignRun.updateOne({ _id: run._id }, { $inc: { skipped: remaining.length } }).catch(() => {});
-    }
-    const backlog = await archiveAdsReleasingDigest(
-      Ad,
-      buildStopBacklogArchiveFilter({ runId: run.runId })
-    ).catch(() => null);
-    const archivedBacklog = backlog?.modifiedCount || 0;
-    // Recorded on the run's own error log rather than as new top-level
-    // fields: CampaignRun is strict, so unknown keys would be silently
-    // stripped and the record would simply not exist.
-    await CampaignRun.updateOne(
-      { _id: run._id },
-      { $push: { errors: {
-          index: -1,
-          stage: 'cancel',
-          message: `Stopped by operator — ${archivedThisRun + archivedBacklog} of THIS RUN's pending ad(s) archived, not re-queued. Other runs' queued work on this campaign is untouched.`
-      } } }
-    ).catch(() => {});
-    console.log(
-      `🛑 [campaignRun ${run.runId}] stopped by operator — archived ${archivedThisRun} undispatched + ${archivedBacklog} of this run's own queued backlog; other runs' queued ads untouched; in-flight renders finish`
-    );
-  }
-
-  // Status-guarded. The reaper (worker.js reapOrphans) flips a silent
-  // running run to 'failed' after REAP_STALE_MIN. Without a status
-  // predicate this write races that update and resurrects a reaped run
-  // as 'done'. Allow-list is the in-flight CampaignRun statuses
-  // (preparing, running) — the enum has no 'cancelled' (operator stop
-  // is OperationRun.status='cancelled' via progressService; this
-  // collection still lands on 'done').
   await CampaignRun.updateOne(
-    buildTerminalDoneFilter(run._id),
-    { status: 'done', completedAt: new Date() }
-  );
-  const totalMs = Date.now() - t0;
-  inFlight.untrack(run.runId);
-  const final = await CampaignRun.findById(run._id)
-    .select('succeeded skipped failed errors mintedTotal unclaimedAtStart')
-    .lean();
-  if (cancelled) await progressRun.markCancelled(`Stopped — ${final?.succeeded || 0} finished, rest skipped`);
-  else await progressRun.succeed({ succeeded: final?.succeeded || 0, skipped: final?.skipped || 0, failed: final?.failed || 0 });
-  console.log(
-    `🎉 [campaignRun ${run.runId}] done in ${totalMs}ms — ` +
-    `${final?.succeeded || 0} succeeded · ${final?.skipped || 0} skipped · ${final?.failed || 0} failed${cancelled ? ' (cancelled by operator)' : ''}`
-  );
-
-  // Per-kind completion summary for the run feed's final update — CLAUDE.md
-  // §00/§2 money-truthfulness rules apply: never quote base_price/the
-  // estimate formula as spend, and label an estimate as "est." explicitly.
-  // Reuses mintedTotal/unclaimedAtStart already persisted at claim time
-  // (does not recompute them) and derives kind from renderRoute +
-  // deriveFromMaster on the run's own claimed ads. Wrapped in its own
-  // try/catch — a reporting bug here must never surface in the outer
-  // catch, which would re-mark this already-'done' run as 'failed'.
-  let summaryLines = [];
-  try {
-    const [finalAds, costRows] = await Promise.all([
-      Ad.find({ _id: { $in: adIds } }).select('status renderRoute deriveFromMaster').lean(),
-      CostLog.aggregate([
-        { $match: { adId: { $in: adIds } } },
-        { $group: { _id: '$costSource', usd: { $sum: '$costUsd' } } }
-      ]).catch(() => [])
-    ]);
-    const kindCounts = slackVerbosity.summarizeClaimedAdKinds(finalAds);
-    const reconciledUsd = (costRows.find((r) => r._id === 'actual')?.usd) || 0;
-    const estimatedUsd  = (costRows.find((r) => r._id === 'estimated')?.usd) || 0;
-    summaryLines = slackVerbosity.buildRunCompletionSummaryLines({
-      mintedTotal:      final?.mintedTotal || 0,
-      claimedTotal:     adIds.length,
-      unclaimedAtStart: final?.unclaimedAtStart || 0,
-      kindCounts,
-      reconciledUsd,
-      estimatedUsd
-    });
-  } catch (err) {
-    console.warn(`⚠️  [campaignRun ${run.runId}] completion summary failed (non-fatal): ${err.message}`);
-  }
-
-  // Slack feed close-out — fire-and-forget. Detached interval posts the
-  // final parent update + any remaining thread events.
-  runFeed.finishRun({
-    runId:     run.runId,
-    succeeded: final?.succeeded || 0,
-    skipped:   final?.skipped || 0,
-    failed:    final?.failed || 0,
-    totalMs,
-    cancelled,
-    summaryLines
-  });
-
-  // Report batches that finished with losses. An operator-cancelled run is
-  // expected, so it stays quiet; a run that failed every ad is escalated.
-  const nFailed = final?.failed || 0;
-  if (!cancelled && nFailed > 0) {
-    const nOk = final?.succeeded || 0;
-    alerts.notifyAsync({
-      level: nOk === 0 ? 'error' : 'warn',
-      title: nOk === 0
-        ? `Campaign run failed entirely — ${nFailed} ad(s)`
-        : `Campaign run finished with ${nFailed} failed ad(s)`,
-      key:   `run-failed:${nOk === 0 ? 'total' : 'partial'}`,
-      fields: {
-        run:      run.runId,
-        brand:    job.brandId,
-        by:       requesterLabel || (run?.requestedBy ? String(run.requestedBy) : null),
-        outcome:  `${nOk}✓ / ${nFailed}✗ / ${final?.skipped || 0}⊘ of ${adIds.length}`,
-        route:    isVeoRun ? 'video' : 'static',
-        took:     `${Math.round(totalMs / 1000)}s`
-      },
-      // The per-ad errors array is the actual diagnosis; the run counters
-      // alone never say WHY. Defensive per-entry: this runs AFTER the run
-      // was persisted as 'done', still inside runRenderLoop — a throw here
-      // would surface in the caller's catch and falsely re-mark the run
-      // 'failed'.
-      detail: (Array.isArray(final?.errors) ? final.errors : []).slice(-6)
-        .map((e) => `#${e?.index ?? '?'} [${e?.stage ?? '?'}] ${String(e?.message ?? '').slice(0, 200)}`)
-        .join('\n') || null
-    });
-  }
-}
-
-/**
- * Look up the sibling master Ad for a derive-only crop / funnel retitle.
- * Prefer masters that share a campaignRunId with this ad (same run scope);
- * fall back to the newest matching master on the campaign+product.
- *
- * MUST exclude other derive-only / funnel-variant ads: funnel variants of
- * a 9:16 master share platformFormat with the master, so an unfiltered
- * query can return a sibling variant that never holds its own plate —
- * the waiter would then hang on a free surface that itself is waiting.
- * A true master has no deriveFromMaster and no funnelStage.
- *
- * The four per-ad conditions below (kind, deriveFromMaster, funnelStage,
- * videoDurationSec floor) are also available as a single-ad predicate —
- * services/campaignAdsGenerationService.js's isMasterVideoAd — for callers
- * that need to answer "is THIS ad a master" without a candidate search (see
- * projectAd's `isMaster` field below). Keep both in sync if this filter
- * shape ever changes.
- */
-async function findSiblingMasterAd(ad, masterPlatformFormat) {
-  const base = {
-    campaignId: ad.campaignId,
-    productId: ad.productId,
-    platformFormat: masterPlatformFormat,
-    kind: 'video',
-    _id: { $ne: ad._id },
-    // True master only — no derive marker, no funnel retitle.
-    $and: [
-      { $or: [{ deriveFromMaster: null }, { deriveFromMaster: { $exists: false } }] },
-      { $or: [{ funnelStage: null }, { funnelStage: { $exists: false } }] }
-    ]
-  };
-  // ⚠️ DURATION COMPATIBILITY, NOT CALENDAR DAY. History, because a same-day
-  // version of this guard shipped first and was reverted before merge:
-  //
-  // The owner directed (2026-08-26): "remove the sibling ad master pull
-  // unless the sibling was produced the same day as the request." A
-  // same-UTC-day bound was implemented, verified, and committed — then an
-  // adversarial review of THAT version found it created a WORSE defect than
-  // the one it closed: `expandDeterministicVideo`'s identity digest for a
-  // Meta master does not include duration or a run id (deliberately — see
-  // computeDeterministicVideoDigest's money-guard comment), so re-minting
-  // Meta for a product that already has a master from a PRIOR day collides
-  // on the unique index and is silently swallowed — the pre-existing
-  // master's campaignRunIds is never updated to include today's run. Because
-  // `planDeterministicVideoAds` decides "PMax derives from Meta" ONCE per
-  // RUN (from the requested surface list), not per product from live DB
-  // state, a PMax derive still gets stamped for that product — then, with a
-  // same-day-only sibling lookup, cannot find yesterday's master. It fails
-  // honestly (no second Omni submit) but permanently occupies the
-  // (campaignId, identityDigest) slot for that PMax format as `status:
-  // 'failed'` — so a customer generating on more than one day, the ordinary
-  // case for a running campaign, could silently and permanently lose PMax
-  // 9:16 delivery. That is a more likely and more damaging failure mode
-  // than the one same-day scoping was meant to prevent.
-  //
-  // The actual hazard was never "the sibling is old" — it was "the sibling
-  // is DURATION-INCOMPATIBLE" (Google rejects PMax video under 10s; a
-  // pre-2026-08-18 master could in principle be 8s). `Ad.videoDurationSec`
-  // is resolved and stamped at MINT time (resolveVideoDurationForFormat,
-  // campaignAdsGenerationService.js), independent of whether the video has
-  // finished generating — so it is safe to gate on immediately, including
-  // for a same-run master that is still rendering. Requiring it directly
-  // closes the true hazard regardless of the sibling's age, and does not
-  // regress ordinary multi-day campaign usage. (A live production census
-  // the same day found zero sub-floor masters currently in the database —
-  // this guard is deliberately belt-and-braces against a future one, not a
-  // response to an observed failure.)
-  base.videoDurationSec = { $gte: GOOGLE_PMAX_VIDEO_DURATION_SEC };
-
-  const runIds = Array.isArray(ad.campaignRunIds)
-    ? ad.campaignRunIds.map(String).filter(Boolean)
-    : [];
-  if (runIds.length) {
-    const inRun = await Ad.findOne({
-      ...base,
-      campaignRunIds: { $in: runIds }
-    }).sort({ generatedAt: -1 }).lean();
-    if (inRun) return inRun;
-  }
-  return Ad.findOne(base).sort({ generatedAt: -1 }).lean();
+    { _id: run._id, status: 'preparing' },
+    { $set: { status: 'running', updatedAt: new Date() } }
+  ).catch((err) => console.error(`⚠️  [campaignRun ${run.runId}] ADGEN handoff: preparing→running flip failed: ${err.message}`));
 }
 
 /**
@@ -2316,25 +1839,26 @@ function videoStillUrl(videoUrl) {
 /**
  * PURE. The Mongo filter locating the master Ad for DIAGNOSTIC display.
  *
- * ⚠️ THIS IS DELIBERATELY *NOT* `findSiblingMasterAd`'s FILTER, AND THE
- * DIFFERENCE IS THE WHOLE POINT. That function answers an ELIGIBILITY question —
- * "may this ad legally derive from that master?" — and so carries an
- * unconditional `videoDurationSec: { $gte: GOOGLE_PMAX_VIDEO_DURATION_SEC }`
- * clause (routes/ads.js, in findSiblingMasterAd) because Google rejects PMax
- * video under 10s. `$gte` matches neither null nor an absent field, so reusing
- * that filter here would report every legacy master — an 8s Meta master, or any
- * row minted before `videoDurationSec` was stamped — as NOT FOUND, i.e. would
- * tell an operator the master was deleted when it is sitting right there. On a
- * diagnostic that is a lie, and it would fire on exactly the older inventory an
- * operator is most likely to be investigating.
+ * ⚠️ THIS IS DELIBERATELY *NOT* AN ELIGIBILITY FILTER — the difference is the
+ * whole point. This repo used to also carry an in-process render-time sibling
+ * lookup (`findSiblingMasterAd`, deleted along with the rest of the dormant
+ * in-process renderer) that answered a stricter question — "may this ad
+ * legally derive from that master?" — and so carried an unconditional
+ * `videoDurationSec: { $gte: GOOGLE_PMAX_VIDEO_DURATION_SEC }` clause, because
+ * Google rejects PMax video under 10s. `$gte` matches neither null nor an
+ * absent field, so reusing that same clause here would report every legacy
+ * master — an 8s Meta master, or any row minted before `videoDurationSec` was
+ * stamped — as NOT FOUND, i.e. would tell an operator the master was deleted
+ * when it is sitting right there. On a diagnostic that is a lie, and it would
+ * fire on exactly the older inventory an operator is most likely to be
+ * investigating.
  *
  * This filter therefore answers the different, honest question: "WHICH ad is the
  * master of this derive?" — no duration gate, no status gate (an archived or
  * failed master must still be reported, with its status; "the master was
  * archived" IS the diagnosis).
  *
- * `brandId` is REQUIRED and is the tenancy boundary. findSiblingMasterAd omits
- * it — correct for the in-process renderer, never sufficient for an HTTP join
+ * `brandId` is REQUIRED and is the tenancy boundary — correct for an HTTP join
  * where a second document reaches a client. Pinned by
  * scripts/verifyMasterAdLinkSurfacing.js.
  */
@@ -2378,10 +1902,12 @@ function masterAdDiagnosticQuery({ ad, masterPlatformFormat, brandId }) {
  * (backend no longer titles in-process — see the TITLING REMOVED comments
  * on this function's render loop). The still-live mechanisms producing this
  * exact shape today are a real video vision-QC failure
- * (qcAndStampVideoAd/buildVideoQcFailureFields, still stamps `failed` +
- * keeps the URL) and adgen's own titling failure on its side of the
- * pipeline. `hasVideo` is computed from the URLs actually present and is
- * independent of `status`.
+ * (brandScriptExecutor.js's buildVideoQcFailureFields, still stamps `failed`
+ * + keeps the URL — its caller `qcAndStampVideoAd` was itself deleted
+ * 2026-09-07 along with the rest of the dormant in-process render fallback;
+ * buildVideoQcFailureFields survives because it also has a live caller) and
+ * adgen's own titling failure on its side of the pipeline. `hasVideo` is
+ * computed from the URLs actually present and is independent of `status`.
  */
 function buildMasterBlock({ deriveFmt, master }) {
   if (!deriveFmt) return null;
@@ -2415,1167 +1941,6 @@ function buildMasterBlock({ deriveFmt, master }) {
     failureStage:   str(master.renderError && master.renderError.stage),
     // Independent of `failed` ON PURPOSE — see the header note.
     hasVideo:       !!(previewUrl || rawVideoUrl)
-  };
-}
-
-/**
- * One Slack notice per derive-wait BACKUP EPISODE — not one per ad, not one
- * per poll (owner 2026-08-20: "send a slack explaining the backup").
- *
- * Fires every time handleDeriveMasterBackup hits the wait deadline with the
- * master still in flight. "Not one per poll" is enforced by alertService's
- * OWN key-based dedupe (ALERT_DEDUPE_WINDOW_MIN, default 15m), not by any
- * bookkeeping here: the key is keyed on the MASTER (`master._id`), so every
- * derivative ad backed up on the SAME master folds into ONE message, and a
- * still-unresolved episode simply re-surfaces every ~15m with "+N more
- * (suppressed)" folded in rather than going silent or spamming.
- *
- * Deliberately uses alertService (rate-limited), NOT runFeed.noteEvent —
- * the opposite choice from services/adVisionQcService.js's
- * noteQcPassToRunFeed, and deliberately so:
- *   - QC passes are HIGH VOLUME (~900/run) and belong in the run's own
- *     thread, uncapped, because ALERT_RATE_LIMIT_MAX would otherwise starve
- *     genuine error/fatal alerts (see that file's header comment).
- *   - A derive-wait backup is the opposite shape: LOW VOLUME (one episode
- *     can span many cycles but should read as one event), and — unlike a
- *     QC pass — it does not belong to a single run's thread. Every
- *     requeue+reclaim cycle mints a NEW CampaignRun (handleDeriveMasterBackup
- *     below), so there is no one run whose thread "owns" the whole episode.
- *     The rate-limited alert channel, keyed on the master, is the right home.
- *
- * "Stuck vs merely queued" (owner requirement — a backup notice must not
- * become the new silent failure): a master sitting `queued` is simply
- * undispatched — not broken. A master sitting `rendering` with no heartbeat
- * for longer than reapStaleMin() — the SAME staleness window the worker's
- * own orphan reaper uses to presume a claimed doc's holder died — is flagged
- * as looking STUCK, at 'error' instead of 'warn', so a real stall reads
- * differently from ordinary queue depth.
- */
-async function notifyDeriveWaitBackup({ ad, adId, master, deriveFromFmt, waitN, run }) {
-  try {
-    const masterAgeMs = master && master.updatedAt
-      ? Date.now() - new Date(master.updatedAt).getTime()
-      : null;
-    const staleMs = reapStaleMin() * 60 * 1000;
-    const masterLooksStuck = master.status === 'rendering' && masterAgeMs != null && masterAgeMs > staleMs;
-    const escalated = masterLooksStuck || waitN > MAX_DERIVE_WAIT_ATTEMPTS;
-
-    // Other ads waiting on THIS SAME master. Reuses the shared gate
-    // (resolveDeriveFromMaster) against a small, product-scoped candidate
-    // set instead of approximating the match with a second query that could
-    // drift from what actually decides "derives from this master".
-    let othersQueued = 0;
-    try {
-      const candidates = await Ad.find({
-        campaignId: ad.campaignId,
-        productId: ad.productId,
-        kind: 'video',
-        status: { $in: ['queued', 'rendering'] },
-        _id: { $ne: adId }
-      }).select('deriveFromMaster platformFormat funnelStage veoPredictionId').lean();
-      othersQueued = candidates.filter((c) => resolveDeriveFromMaster(c) === deriveFromFmt).length;
-    } catch (err) {
-      // Best-effort context only — never let this block the alert itself.
-      console.warn(`⚠️  [derive-only ad=${adId}] othersQueued lookup failed — ${err.message}`);
-    }
-
-    const waitedMs = ad && ad.queuedAt
-      ? Date.now() - new Date(ad.queuedAt).getTime()
-      : waitN * DERIVE_MASTER_WAIT_MS;
-    const fmtMin = (ms) => `${Math.max(1, Math.round(ms / 60000))}m`;
-
-    await alerts.notifyAsync({
-      level: escalated ? 'error' : 'warn',
-      title: masterLooksStuck
-        ? `Derive-wait: master looks STUCK, not just backed up (${deriveFromFmt})`
-        : `Derive-wait backup: ${deriveFromFmt} master still in flight`,
-      // Keyed on the MASTER, not the ad or the run — every derivative
-      // sharing this master folds into ONE message via alertService's own
-      // dedupe (see doc comment above).
-      key: `derive-wait-backup:${master._id}`,
-      fields: {
-        master:       String(master._id),
-        masterStatus: master.status,
-        masterAge:    masterAgeMs != null ? fmtMin(masterAgeMs) : 'unknown',
-        product:      ad && ad.productId ? String(ad.productId) : null,
-        waited:       `${fmtMin(waitedMs)} (attempt ${waitN})`,
-        othersQueued: othersQueued || undefined,
-        run:          run && run.runId ? run.runId : null
-      },
-      detail: masterLooksStuck
-        ? `Master ${master._id} (${deriveFromFmt}) has not heartbeat in ${fmtMin(masterAgeMs)} while ` +
-          `status=rendering — this looks like a stalled render, not ordinary queue depth. Ad ${adId} ` +
-          `remains queued and keeps auto-reclaiming; it has NOT been abandoned.`
-        : `Ad ${adId} is waiting on sibling master ${master._id} (${deriveFromFmt}), still ${master.status}. ` +
-          `This is congestion, not breakage — the ad auto-reclaims through the same atomic claim path ` +
-          `stranded ads use (requeueStrandedAds) and will derive as soon as the master lands.`
-    });
-  } catch (err) {
-    // Alerting must never block or fail the recovery path it is reporting on.
-    console.warn(`⚠️  [derive-only ad=${adId}] notifyDeriveWaitBackup failed — ${err.message}`);
-  }
-}
-
-/**
- * BACKED UP, NOT ABANDONED (owner 2026-08-20: "hitting the timeout shouldn't
- * abandon, it should just send a slack explaining the backup").
- *
- * Called from renderDeriveOnlyVideoAd when the in-render wait for a sibling
- * master (DERIVE_MASTER_WAIT_MS) expires with the master still `queued` or
- * `rendering` — i.e. still in flight, not dead. Until this change that state
- * was tolerated silently for MAX_DERIVE_WAIT_ATTEMPTS (30) cycles and then
- * the ad was stamped `failed` ("refusing Omni fallback"). That is exactly
- * the deliverability failure raising VEO_CONCURRENCY / REMOTION_QUEUE_
- * CONCURRENCY makes MORE likely: masters queue longer behind titling, so
- * this fires more often, and every ad that lands here is one the owner
- * ordered and paid nothing extra for — it must still be delivered.
- *
- * Three things happen, in order, and none of them is new money or a new
- * claim mechanism:
- *   1. Release the slot: status back to 'queued' (same fields the old
- *      polite-requeue used) + $inc deriveWaitAttempts (never renderAttempts
- *      — see models/Ad.js and scripts/verifyPmaxVideoExpansion.js's G-group).
- *      Zero submits, zero bills, exactly as before.
- *   2. RECLAIM IMMEDIATELY through the SAME atomic claim path stranded ads
- *      use — requeueStrandedAds() -> claimAdsForRun() — instead of leaving
- *      the ad for an operator click or a crash-triggered sweep to notice.
- *      That passive hand-off was the actual bug: services/strandedRunSweeper
- *      only scans ads whose run is 'failed', and the run a derive-wait ad
- *      backs out of normally finishes 'done' with its other ads succeeding
- *      — so a merely-requeued derivative was invisible to every automatic
- *      recovery path (see session.d/2026-08-19_two-omni-masters-timed-out-
- *      run_1787119100250_eef4d871-the-real-defect.md). `requeue` is
- *      INJECTABLE (defaults to the real requeueStrandedAds) purely so a
- *      harness can assert the call shape without exercising Mongo.
- *   3. Notify once per episode via notifyDeriveWaitBackup (also injectable).
- *      Never blocks step 1/2 on Slack's network round trip failing.
- *
- * `attempts` no longer bounds anything here — see MAX_DERIVE_WAIT_ATTEMPTS's
- * comment above. It only decides alert SEVERITY inside notifyDeriveWaitBackup.
- *
- * @returns {Promise<{ requeuedToQueued: boolean, reclaimed: number, notified: boolean }>}
- */
-async function handleDeriveMasterBackup({
-  ad, adId, master, deriveFromFmt, attempts, index, run,
-  requeue = requeueStrandedAds, notify = notifyDeriveWaitBackup
-}) {
-  const waitN = (Number(attempts) || 0) + 1;
-  const stageNote =
-    `derive-only: waiting for master ${deriveFromFmt} ` +
-    `(attempt ${waitN}, backed up — auto-reclaiming, not abandoned)`;
-  console.log(`⏳ [derive-only ad=${adId}] ${stageNote}`);
-
-  // Release claim → queued so the reclaim below (or, failing that, a later
-  // selectAdsForRun /runs claim) can retry once the master lands. Do NOT
-  // leave status:'rendering' (reaper / stranded paths) and do NOT submit
-  // Omni — unchanged from the old polite requeue.
-  await Ad.updateOne(
-    { _id: adId },
-    {
-      $set: {
-        status: 'queued',
-        ...PRE_DISPATCH,
-        renderStage: stageNote.slice(0, 200),
-        renderStageAt: new Date(),
-        updatedAt: new Date()
-      },
-      // deriveWaitAttempts, NOT renderAttempts — see models/Ad.js and the
-      // G-group pins in scripts/verifyPmaxVideoExpansion.js. Exactly ONE
-      // $inc site now that the exhausted-terminal branch is gone.
-      $inc: { deriveWaitAttempts: 1 }
-    }
-  );
-  // Count as skipped for THIS run (it reappears under the reclaimed run below).
-  await CampaignRun.updateOne(
-    { _id: run._id },
-    {
-      $inc: { skipped: 1 },
-      $push: { errors: { index, stage: 'derive-wait', message: stageNote } }
-    }
-  );
-
-  // Reclaim NOW rather than hoping something notices. Same adapter, same
-  // CAS as /runs and the stranded sweeper — never a second claim path
-  // (CLAUDE.md §2). `ad` is the lean doc already fetched for this render;
-  // requeueStrandedAds only needs _id/productId off it and does its own
-  // atomic status:'queued' match against the DB, so the stale in-memory
-  // status on `ad` is harmless.
-  let reclaimed = 0;
-  try {
-    reclaimed = await requeue({ ads: [ad], run });
-    if (!reclaimed) {
-      console.log(`   ↪ [derive-only ad=${adId}] reclaim found nothing to claim (raced/claimed elsewhere) — left 'queued'`);
-    }
-  } catch (err) {
-    console.warn(`⚠️  [derive-only ad=${adId}] requeue threw — ${err.message} — left 'queued' for the next claim`);
-  }
-
-  let notified = false;
-  try {
-    await notify({ ad, adId, master, deriveFromFmt, waitN, run });
-    notified = true;
-  } catch (err) {
-    console.warn(`⚠️  [derive-only ad=${adId}] backup notify threw — ${err.message}`);
-  }
-
-  return { requeuedToQueued: true, reclaimed: Number(reclaimed) || 0, notified };
-}
-
-/**
- * Google PMax derive-only / funnel-variant render.
- *
- * Covers:
- *   - pmax_video_1_1 free crop of the settled 9:16 master
- *   - funnel-stage retitles of any already-paid master plate (and of the
- *     free crops) — consideration / conversion; the unstaged master IS
- *     awareness. Covers PMax and Meta.
- *
- * MONEY: zero Omni / atlasVideoService submits in this function. The base
- * plate is the sibling master's already-paid veoVideoUrl; face-safe crop
- * (only when aspect differs) + Remotion titling run against that URL.
- * Cost ledger: no video cost row for this ad (it spends nothing at Omni);
- * face-detect costs stay whatever basePlateCropService already records.
- *
- * Sequencing: do NOT rely on FIFO claim order. Concurrent VEO_CONCURRENCY
- * means the derive ad can start before the master. If master is still
- * queued/rendering without a veoVideoUrl → handleDeriveMasterBackup requeues
- * it AND actively re-claims it (never abandons — 2026-08-20). If master
- * failed/absent → fail honestly. NEVER fall back to a local Omni submit.
- *
- * Funnel preset selection is owned by brandScriptExecutor
- * (resolveFunnelPresetOverride from ad.funnelStage) so buildMetaForAd
- * and resolveSpec receive the SAME override — do not pass a second path.
- */
-async function renderDeriveOnlyVideoAd({
-  run, job, ad, adId, index, creative, deriveFromFmt
-}) {
-  // ASSERT (money): this function must not call veoGenerateForAd,
-  // veoPrepareStoryboard, atlasVideoService.generateForAd, or any
-  // billable video submit helper. Crop + titling only. Funnel variants
-  // share this function — a separate path is how a regenerate hole
-  // previously opened.
-  const funnelNote = ad.funnelStage ? ` funnel=${ad.funnelStage}` : '';
-  adStage(adId, `derive-only wait for master (${deriveFromFmt})${funnelNote}`);
-
-  // ── Wait IN-RENDER for the master, don't bounce straight to 'queued' ──
-  // The whole run is dispatched in one wave (VEO_CONCURRENCY defaults to
-  // 12), so on EVERY first Google run the master is still 'rendering' with
-  // no plate when the derive ad starts — an immediate requeue therefore
-  // fired every time. And nothing drains a 'queued' ad afterwards: the
-  // reaper and the stranded sweeper only look at 'rendering' ads / failed
-  // runs, and pressing Generate again short-circuits ("Nothing to render")
-  // because the deterministic video digest is run-independent by design.
-  // The 1:1 stranded, and both operator work-arounds cost money.
-  //
-  // So poll here instead. This burns no billable work — it holds a render
-  // slot while an already-paid master finishes (~2min typical) — and the
-  // requeue below survives as the safety valve for the pathological case.
-  let master = await findSiblingMasterAd(ad, deriveFromFmt);
-  if (!master?.veoVideoUrl && master
-      && (master.status === 'queued' || master.status === 'rendering')) {
-    const deadline = Date.now() + DERIVE_MASTER_WAIT_MS;
-    while (Date.now() < deadline) {
-      await new Promise((r) => setTimeout(r, DERIVE_MASTER_POLL_MS));
-      master = await findSiblingMasterAd(ad, deriveFromFmt);
-      if (master?.veoVideoUrl) break;
-      // Master reached a terminal state with no plate — stop waiting and
-      // let the honest-failure branch below report it.
-      if (!master || (master.status !== 'queued' && master.status !== 'rendering')) break;
-      adStage(adId, `derive-only: waiting for master ${deriveFromFmt} plate`);
-    }
-  }
-  // deriveWaitAttempts, NOT renderAttempts — waiting never submits or
-  // renders anything (see MAX_DERIVE_WAIT_ATTEMPTS comment above).
-  const attempts = Number(ad.deriveWaitAttempts) || 0;
-
-  // Master settled = holds a paid plate URL. status may be draft (post-
-  // master, pre/post-titling), live, or even failed-after-titling with
-  // the master kept — any of those with veoVideoUrl is usable.
-  if (master?.veoVideoUrl) {
-    // fall through to derive below
-  } else if (
-    master &&
-    (master.status === 'queued' || master.status === 'rendering')
-  ) {
-    // BACKED UP, NOT ABANDONED (owner 2026-08-20). Master is still in
-    // flight after the full in-render wait. See handleDeriveMasterBackup's
-    // own doc comment for the full contract; this used to fail the ad
-    // outright at MAX_DERIVE_WAIT_ATTEMPTS ("refusing Omni fallback") — that
-    // branch is gone. Raising VEO_CONCURRENCY/REMOTION_QUEUE_CONCURRENCY
-    // makes masters queue longer behind titling, so this fires more often;
-    // every ad that lands here is one the owner ordered and must still be
-    // delivered, not written off.
-    await handleDeriveMasterBackup({ ad, adId, master, deriveFromFmt, attempts, index, run });
-    return;
-  } else {
-    // Master absent, failed without a plate, or archived — fail honestly.
-    // WHY no Omni fallback: that would be a hidden billable submit the
-    // operator never asked for on a surface marketed as free derivation.
-    const why = !master
-      ? `no sibling master ad (${deriveFromFmt}) for product`
-      : `master status=${master.status} has no veoVideoUrl`;
-    const msg = `derive-only failed: ${why} — not submitting Omni`;
-    console.warn(`⚠️  [derive-only ad=${adId}] ${msg}`);
-    await Ad.updateOne(
-      { _id: adId },
-      {
-        $set: {
-          status: 'failed',
-          renderError: { message: msg, stage: 'derive-no-master', at: new Date() },
-          renderStage: 'derive-only: master missing/failed (no Omni fallback)',
-          renderStageAt: new Date(),
-          updatedAt: new Date()
-        },
-        $inc: { renderAttempts: 1 }
-      }
-    );
-    await CampaignRun.updateOne(
-      { _id: run._id },
-      {
-        $inc: { failed: 1 },
-        $push: { errors: buildErrorEntry(creative, index, 'derive-no-master', new Error(msg)) }
-      }
-    );
-    return;
-  }
-
-  // ── Derive from settled master plate ──────────────────────────────
-  // Copy the master's paid URL as THIS ad's base plate. Titling
-  // (brandScriptExecutor → basePlateCropService) face-crops 9:16 → 1:1
-  // because classifyFormat(pmax_video_1_1 / aspect 1:1) → 'square'.
-  const veoVideoUrl = master.veoVideoUrl;
-  const veoAspectRatio = master.veoAspectRatio || '9:16';
-  const fallbackPosterUrl = veoVideoUrl?.includes('/video/upload/')
-    ? veoVideoUrl
-        .replace('/video/upload/', '/video/upload/so_2,f_jpg,q_auto:good/')
-        .replace(/\.(mp4|mov|webm|m4v)(\?.*)?$/i, '.jpg$2')
-    : null;
-
-  // INHERIT THE MASTER'S FACE DETECTION (2026-08-12). Every derive-only ad —
-  // the free 1:1 crop and all three funnel retitles — points at the master's
-  // exact veoVideoUrl, yet each was starting with basePlate:null and paying
-  // basePlateCropService for a fresh vision pass (~$0.02) on footage the
-  // master had already analysed. On a PMax run that is 4x the same detection
-  // per master, for identical boxes.
-  //
-  // Sharing is safe BY THE CACHE'S OWN CONTRACT, not by assumption:
-  //   - ensureFaceDetectionForKeepOut accepts any entry whose sourceUrl equals
-  //     the ad's current veoVideoUrl — and we assign that same URL below — and
-  //     its comment states face boxes are "in SOURCE fraction space —
-  //     independent of titling format".
-  //   - the format-SPECIFIC part cannot leak: cropRect is only honoured when
-  //     cached.format === the format being titled, so a 9:16 master's rect is
-  //     ignored by a 1:1 derive, which recomputes its own crop as today.
-  // Guarded on the master's entry actually being bound to this URL, so a
-  // regenerated master with a stale plate is never inherited.
-  const inheritedBasePlate =
-    master.basePlate && master.basePlate.sourceUrl === veoVideoUrl
-      ? master.basePlate
-      : null;
-
-  // Brand/media lookup REMOVED 2026-08-28 — it existed solely to resolve
-  // brandDoc for the (now-removed) titling call below. See the TITLING
-  // REMOVED comment further down this function.
-
-  // Stamp draft + plate BEFORE titling — same money discipline as the
-  // master path: untitled is not success; reaper must not requeue a
-  // mid-titling ad into a path that could bill (derive path still won't
-  // bill, but draft is the shared invariant).
-  await Ad.updateOne(
-    { _id: adId },
-    {
-      $set: {
-        status:             'draft',
-        kind:               'video',
-        veoVideoUrl,
-        veoAspectRatio,
-        // Audit: no model ran for this ad. Marker is explicit so cost
-        // reconcilers / inspectors never attribute an Omni charge here.
-        veoModel:           `derive-from:${deriveFromFmt}`,
-        veoPrompt:          null,
-        veoStoryboard:      null,
-        veoReferenceImages: [],
-        renderUrl:          veoVideoUrl,
-        posterUrl:          fallbackPosterUrl || veoVideoUrl,
-        sourceFileType:     'video',
-        renderedAt:         new Date(),
-        updatedAt:          new Date(),
-        renderStage:        `derive-only plate from ${deriveFromFmt}`,
-        renderStageAt:      new Date(),
-        // Same titling debt as the master path. This ad is FREE (no Omni), so
-        // the risk it closes is not double-spend but a silent untitled ship:
-        // a derived plate stranded mid-titling is indistinguishable from a
-        // finished one without this marker.
-        titlingResumeState: 'claimed',
-        // Only written when the master's entry is bound to this same URL; a
-        // spread of {} leaves the field untouched (null) and titling detects
-        // exactly as it does today.
-        ...(inheritedBasePlate ? { basePlate: inheritedBasePlate } : {})
-      },
-      $inc: { renderAttempts: 1 }
-    }
-  );
-
-  const adFinal = await Ad.findById(adId).lean();
-  // TITLING REMOVED 2026-08-28 (owner directive: "remove and disable the
-  // backend titling function, we are not going to go back to it"). This
-  // branch used to call brandScriptExecutor.renderBrandScriptAndSave when a
-  // brand resolved (Remotion chrome) and qcAndStampVideoAd only on the
-  // no-brand fallback. adgen now titles every master exclusively — backend
-  // no longer attempts Remotion compositing in-process at all, brand or no
-  // brand, so this branch is unconditional. This whole function is already
-  // unreachable in production (gated behind isAdgenRendererEnabled() at the
-  // top of runRenderLoop), but if it is ever reached the derived plate ships
-  // untitled — exactly the pre-existing "no brand resolved" behavior below,
-  // now the only behavior. Vision QC still runs so the ad is never delivered
-  // with zero visibility.
-  //
-  // The renderStage write below matters even though this whole function is
-  // dead: services/adTitlingTruth.js's isVideoTitlingSettled treats
-  // `renderUrl === veoVideoUrl` as settled ONLY when renderStage matches
-  // `/^no titling \(/i` (every other intentional-ship call site in this
-  // repo writes that exact prefix). Without it, an ad shipped by this path
-  // would read as a stuck/abandoned titling debt, not a deliberate bare
-  // ship — closing a gap the pre-existing no-brand branch already had.
-  adStage(adId, 'no titling (backend titling removed) — shipping derived plate');
-  const { qcAndStampVideoAd } = require('../services/brandScriptExecutor');
-  await qcAndStampVideoAd({ ad: adFinal, deliveredUrl: veoVideoUrl });
-
-  {
-    // GUARDED — vision QC does not throw, so this write used to be able to
-    // race a status:'failed' that buildVideoQcFailureFields just stamped.
-    // Allowlist, not denylist, so an unknown status is left alone rather
-    // than resurrected.
-    const promoted = await Ad.updateOne(
-      { _id: adId, status: { $in: ['rendering', 'draft'] } },
-      {
-        $set: {
-          status:     'draft',
-          renderedAt: new Date(),
-          updatedAt:  new Date(),
-          titlingResumeState: null
-        }
-      }
-    );
-    if (promoted.matchedCount) {
-      await CampaignRun.updateOne({ _id: run._id }, { $inc: { succeeded: 1 } });
-      adStage(adId, 'done');
-    } else {
-      const kept = await Ad.findOneAndUpdate(
-        { _id: adId },
-        { $set: { titlingResumeState: null, updatedAt: new Date() } },
-        { new: true, projection: { status: 1 } }
-      ).lean();
-      const keptStatus = (kept && kept.status) || 'failed';
-      const counter = keptStatus === 'failed' ? 'failed' : 'succeeded';
-      await CampaignRun.updateOne({ _id: run._id }, { $inc: { [counter]: 1 } });
-      adStage(adId, `done (kept terminal status '${keptStatus}')`);
-    }
-  }
-}
-
-async function renderOne(run, job, adId, index, renderToken) {
-  // HEARTBEAT — this is a money guard, not telemetry.
-  //
-  // worker.js's reaper flips any Ad sitting in 'rendering' with
-  // updatedAt older than REAP_STALE_MIN (15m) back to 'queued', on the
-  // reasoning that a process died holding it. But nothing was refreshing
-  // updatedAt during a render: it was stamped once at claim time, so the
-  // clock ran against the ad's TOTAL render duration rather than against
-  // its silence. A legitimately slow render — the image plate alone is
-  // allowed 600s, and the Director, canvas spec and proof judge all run
-  // before it — could cross 15 minutes, get reaped while its Atlas call
-  // was still in flight, and be re-submitted by the next Generate.
-  // Atlas bills on submit, so that is a second charge for an image we had
-  // already paid for and then discarded.
-  //
-  // Touching updatedAt every 60s makes the reaper's "hasn't moved in 15
-  // minutes" mean what it says: still claimed, still alive.
-  // The 'draft' + titlingResumeState:'claimed' arm is NOT symmetry for its own
-  // sake — without it this fix would cause the bug it is meant to prevent.
-  //
-  // The instant the paid master lands the ad flips to 'draft', so the
-  // rendering-only filter above went dead for the entire titling phase. Titling
-  // then queues behind VEO_TITLING_CONCURRENCY (4), and the MEASURED drain on a
-  // 20-ad run was 926s — longer than titlingResumeService's CLAIM_STALE_MIN
-  // (15 min). So an ad that is merely WAITING ITS TURN would look abandoned,
-  // and the sweeper would start a second Remotion render of an ad already being
-  // titled. Beating here makes "hasn't moved in 15 minutes" mean the process is
-  // gone, which is the only thing the sweeper should act on.
-  //
-  // Costs nothing when there is no debt: once titling settles, the terminal
-  // writes clear titlingResumeState and this filter stops matching.
-  const heartbeat = setInterval(() => {
-    Ad.updateOne(
-      {
-        _id: adId,
-        $or: [
-          { status: 'rendering' },
-          { status: 'draft', titlingResumeState: 'claimed' }
-        ]
-      },
-      { $set: { updatedAt: new Date() } }
-    ).catch(() => {});   // a missed beat is survivable; the next one lands
-  }, 60_000);
-  if (typeof heartbeat.unref === 'function') heartbeat.unref();
-  try {
-    return await renderOneInner(run, job, adId, index, renderToken);
-  } finally {
-    clearInterval(heartbeat);
-  }
-}
-
-async function renderOneInner(run, job, adId, index, renderToken) {
-  // Fetch the queued Ad doc and shape it into the request the
-  // render service expects. The doc carries everything the old
-  // in-memory creative descriptor used to provide.
-  const ad = await Ad.findById(adId).lean();
-  if (!ad) {
-    await CampaignRun.updateOne(
-      { _id: run._id },
-      { $inc: { failed: 1 }, $push: { errors: { index, stage: 'fetch', message: `Ad ${adId} not found` } } }
-    );
-    return;
-  }
-  const creative = {
-    mediaId:       String(ad.mediaId),
-    productId:     ad.productId ? String(ad.productId) : null,
-    template:      ad.template,
-    aspectRatio:   ad.aspectRatio,
-    matchTier:     ad.matchTier,
-    variantKind:   ad.variantKind,
-    paletteSource: ad.paletteSource || 'media'
-  };
-  // ── Veo render path ────────────────────────────────────────────────
-  if (ad.renderRoute === 'veo') {
-    try {
-      // ── DERIVE-ONLY (Google PMax 1:1) ────────────────────────────────
-      // MONEY-CRITICAL: this branch must NEVER call veoGenerateForAd /
-      // atlasVideoService.generateForAd / any Omni submit. A fall-through
-      // to the master path below is a hidden ~$0.75–$1.20 per product.
-      // ASSERT: zero atlasVideoService submit calls in this block.
-      //
-      // Detection (either is sufficient — belt and braces):
-      //   1. platformFormat === pmax_video_1_1 (always derive-only by design)
-      //   2. ad[deriveFromMaster] set at mint time (needs models/Ad.js field;
-      //      until then Mongoose strict may drop it — (1) is the fail-closed gate)
-      const deriveFromFmt = resolveDeriveFromMaster(ad);
-      if (deriveFromFmt) {
-        await renderDeriveOnlyVideoAd({
-          run, job, ad, adId, index, creative, deriveFromFmt
-        });
-        return;
-      }
-
-      // Load source media up front — the Grok-skip check needs
-      // sourceMedia.fileType.
-      //
-      // The brand lookup that used to sit here (brandDoc, projected for the
-      // brand-script overlay's proof beat — brandReviews etc.) is REMOVED
-      // 2026-08-28 along with the titling call it existed to serve; see the
-      // TITLING REMOVED comment further down this function. Nothing else in
-      // this function reads a brand doc. adRegenerateService.loadBrand keeps
-      // its own equivalent projection for its own (also-dead, adgen-deferred)
-      // titling call — no longer "kept in sync" with anything here.
-      const sourceMedia = await Media.findById(ad.mediaId)
-        .select('fileType fileUrl brandId').lean();
-
-      // Grok-skip branch — when the seed is already a video, we keep
-      // its real motion instead of asking Grok to invent new motion
-      // from a still. Cloudinary picks an 8-second segment starting at
-      // its saliency-derived poster frame, aspect-cropped to the ad's
-      // canvas. Downstream (renderBrandScriptAndSave) doesn't need to
-      // know or care whether ad.veoVideoUrl came from Grok or from a
-      // Cloudinary extract — it just composites the canonical overlay
-      // on top.
-      const isVideoSeed = sourceMedia?.fileType === 'video';
-      let veoVideoUrl, veoAspectRatio, veoPrompt = null, veoStoryboard = null, veoCloudinaryPublicId = null;
-      let veoModel = null;   // stays null on the Cloudinary-segment path — no model ran
-      let veoReferenceImages = [];
-      // UGC-ads Phase 5 — passthrough skip signal. Set when the ugcVideo
-      // pipeline determined the ad should be skipped (mirror failed,
-      // segment build failed). The dispatcher HANDLES the skip explicitly
-      // below rather than falling through to Omni, because a fall-through
-      // is exactly the surprise-$3-charge scenario the phase exists to
-      // close. Null when passthrough succeeded OR was declined for a
-      // non-fatal reason (flag off, not a UGC video, etc.) — the flag-off
-      // + not-eligible cases proceed to the existing branch below.
-      let ugcPassthroughSkip = null;
-
-      // UGC-ads Phase 5 — before the existing isVideoSeed branch, ask the
-      // ugcVideoPipeline whether this ad qualifies for the mirror-and-
-      // passthrough short-path. The service handles:
-      //   • kill switch check (UGC_VIDEO_PASSTHROUGH, default OFF)
-      //   • UGC-video eligibility (fileType='video' + UGC source or
-      //     operator/branding/promotional assignment)
-      //   • Cloudinary mirror if URL isn't already hosted there
-      //   • segment URL construction
-      // Only takes effect when passthrough succeeds; otherwise flow
-      // continues into the existing isVideoSeed / Grok branches below.
-      if (isVideoSeed) {
-        const ugcResult = await ugcVideoPipeline.preparePassthroughMaster({
-          media:         sourceMedia,
-          aspectRatio:   ad.aspectRatio || '9:16',
-          durationSec:   resolveAdVideoDurationSec(ad)
-        });
-        if (ugcResult.passthrough) {
-          veoVideoUrl    = ugcResult.videoUrl;
-          veoAspectRatio = ugcResult.aspectRatio;
-          adStage(adId, ugcResult.mirrored
-            ? 'ugc-video mirrored + passthrough (no generation)'
-            : 'ugc-video passthrough (no generation)');
-          console.log(
-            `🎬 [ugc-video] ad=${adId} passthrough → skip Omni ` +
-            `(mirrored=${ugcResult.mirrored}, aspect=${veoAspectRatio})`
-          );
-        } else if (ugcResult.skip) {
-          // Mirror failed or segment build failed — do NOT silently fall
-          // through to Omni (would be a surprise ~$3 charge). Skip the
-          // ad, let the operator retry.
-          ugcPassthroughSkip = ugcResult;
-          console.warn(
-            `⚠️  [ugc-video] ad=${adId} passthrough SKIP: ${ugcResult.code} — ${ugcResult.reason}`
-          );
-        }
-        // else: not eligible / flag off — fall through to the existing
-        // Cloudinary-segment or Grok branch below.
-      }
-
-      // Existing Cloudinary-segment branch — kept as the second attempt
-      // when Phase 5 declined (flag off or not a UGC video). Fires for
-      // catalog-product videos and for any video-seed path that isn't
-      // routed through the ugcVideoPipeline. Non-Cloudinary URL still
-      // warns + falls through to Grok — that is the pre-Phase-5 behaviour
-      // for non-UGC video seeds and is not something Phase 5 rewrites.
-      if (!veoVideoUrl && !ugcPassthroughSkip && isVideoSeed) {
-        const seedDurationSec = resolveAdVideoDurationSec(ad);
-        const segmentUrl = buildVideoSegmentUrl(sourceMedia.fileUrl, ad.aspectRatio || '9:16', seedDurationSec);
-        if (!segmentUrl) {
-          console.warn(
-            `⚠️  [veo] ad=${adId} seed is video but not Cloudinary-hosted (${sourceMedia.fileUrl?.slice(0, 80)}…) — ` +
-            `Grok-skip requires Cloudinary /video/upload/. Falling through to Grok with picked-frame reference.`
-          );
-        } else {
-          veoVideoUrl    = segmentUrl;
-          veoAspectRatio = ad.aspectRatio || '9:16';
-          adStage(adId, 'reusing video seed segment (no generation)');
-          console.log(
-            `🎬 [veo] ad=${adId} seed=video → skip Grok, ${seedDurationSec}s Cloudinary segment ` +
-            `(aspect=${veoAspectRatio}) → ${segmentUrl.slice(0, 120)}…`
-          );
-        }
-      }
-
-      // UGC passthrough skip — terminal short-circuit. Mirrors the
-      // veoResult.skipped handling below (Omni provider disabled) so
-      // status/renderError/renderStage are all consistent and the poller
-      // sees the same shape.
-      if (ugcPassthroughSkip) {
-        const skipMsg = ugcPassthroughSkip.reason || 'ugc video passthrough skipped';
-        await CampaignRun.updateOne({ _id: run._id }, { $inc: { skipped: 1 } });
-        await Ad.updateOne(
-          { _id: adId },
-          {
-            $set: {
-              status: 'failed',
-              renderError: { message: skipMsg, stage: 'ugc-passthrough-skipped', at: new Date() },
-              renderStage: `skipped: ${skipMsg}`.slice(0, 200),
-              renderStageAt: new Date(),
-              updatedAt: new Date()
-            }
-          }
-        );
-        return;
-      }
-
-      // Grok path — fires when the seed is an image OR when the video
-      // Grok-skip couldn't build a Cloudinary segment (non-Cloudinary
-      // video host — rare but possible).
-      if (!veoVideoUrl) {
-        // Stage 1 — prepare context: resolves the per-ad model + aspect
-        // and warms the layoutInput cache for the brand-script overlay.
-        // storyboard is always null on the Atlas path now (the Ken Burns
-        // prompt directs motion; the GPT storyboard stage is retired) —
-        // the stamp below only fires for legacy/vertex storyboards.
-        adStage(adId, 'preparing video context');
-        const { storyboard } = await veoPrepareStoryboard({ ad });
-        veoStoryboard = storyboard || null;
-
-        // Stamp the storyboard early so chrome can read it from ad.veoStoryboard
-        // if the in-memory pass somehow drops, and downstream debug tools see it.
-        if (storyboard) {
-          await Ad.updateOne({ _id: adId }, { $set: { veoStoryboard: storyboard, updatedAt: new Date() } });
-        }
-
-        // Stage 2 — generate the base video via Grok. Chrome (if any)
-        // runs after Grok completes in Stage 3.
-        // The billable one. Named so the status screen says exactly what is
-        // being paid for, and so a stall here is distinguishable from a stall in
-        // titling or upload.
-        // Submit/poll stages are owned by atlasVideoService (piggybacked on
-        // the existing poll tick). This outer label is the pre-enter marker
-        // so a stall before the service even runs is still visible.
-        adStage(adId, `master video generation (${ad.aspectRatio || '9:16'})`);
-        const veoResult = await veoGenerateForAd({ ad, storyboard, campaignRunId: run.runId });
-        if (veoResult.skipped) {
-          // Previously re-queued forever with no reason on the Ad — the board
-          // showed "rendering" until the reaper, and the next Generate billed
-          // again for a provider that is still off. Terminal + reason so the
-          // operator can fix the key/config and regen deliberately.
-          const skipMsg = veoResult.reason || 'video generation skipped (provider disabled or unconfigured)';
-          await CampaignRun.updateOne({ _id: run._id }, { $inc: { skipped: 1 } });
-          await Ad.updateOne(
-            { _id: adId },
-            {
-              $set: {
-                status: 'failed',
-                renderError: { message: skipMsg, stage: 'veo-skipped', at: new Date() },
-                renderStage: `skipped: ${skipMsg}`.slice(0, 200),
-                renderStageAt: new Date(),
-                updatedAt: new Date()
-              },
-              $inc: { renderAttempts: 1 }
-            }
-          );
-          return;
-        }
-        veoVideoUrl           = veoResult.videoUrl;
-        veoAspectRatio        = veoResult.aspectRatio || null;
-        veoPrompt             = veoResult.prompt || null;
-        veoStoryboard         = veoResult.storyboard || veoStoryboard;
-        veoCloudinaryPublicId = veoResult.cloudinaryPublicId || null;
-        veoModel              = veoResult.model || null;
-        veoReferenceImages    = veoResult.referenceImages || [];
-      }
-
-      // Stamp the master video URL BEFORE titling so a titling failure still
-      // leaves a viewable, paid-for asset. status:'draft' here is a MONEY
-      // guard (the reaper only requeues status:'rendering' — leaving the ad
-      // in rendering after a paid Omni submit is a double-bill hole if the
-      // process dies mid-titling). It is NOT a success claim: the run's
-      // succeeded counter and the clean "done" stage only move after
-      // titling finishes (or no-chrome ships the master deliberately).
-      // CLAUDE.md §00 step 4: title each surface is required of the pipeline.
-      const fallbackPosterUrl = veoVideoUrl?.includes('/video/upload/')
-        ? veoVideoUrl
-            .replace('/video/upload/', '/video/upload/so_2,f_jpg,q_auto:good/')
-            .replace(/\.(mp4|mov|webm|m4v)(\?.*)?$/i, '.jpg$2')
-        : null;
-      await Ad.updateOne(
-        { _id: adId },
-        {
-          $set: {
-            // draft = asset exists and is not requeueable. Titling still pending
-            // is visible via renderStage; failure flips status to 'failed'.
-            status:             'draft',
-            kind:               'video',
-            veoVideoUrl,
-            veoAspectRatio,
-            veoPrompt,
-            veoStoryboard,
-            veoModel,
-            veoReferenceImages,
-            renderUrl:          veoVideoUrl,
-            posterUrl:          fallbackPosterUrl || veoVideoUrl,
-            cloudinaryPublicId: veoCloudinaryPublicId,
-            sourceFileType:     'video',
-            renderedAt:         new Date(),
-            updatedAt:          new Date(),
-            // TITLING DEBT — the ad now owes a title, and this is what makes
-            // that debt VISIBLE to a sweeper. Without it a process death here
-            // leaves {status:'draft', renderUrl === veoVideoUrl} and NOTHING
-            // reclaims it: six sweepers key on 'rendering'/'queued', and
-            // titlingResumeService's three arms need this field set or
-            // renderUrl null — and the write above sets renderUrl.
-            //
-            // 'claimed' rather than 'pending' on purpose. 'pending' has no
-            // staleness bound in the sweeper, so a concurrent tick would grab
-            // an ad THIS process is actively titling. 'claimed' routes to the
-            // arm that also requires updatedAt older than CLAIM_STALE_MIN, so
-            // a live render is protected and only a dead one is reclaimed.
-            titlingResumeState: 'claimed'
-          },
-          $inc: { renderAttempts: 1 }
-        }
-      );
-
-      // TITLING REMOVED 2026-08-28 (owner directive: "remove and disable the
-      // backend titling function, we are not going to go back to it"). This
-      // stage used to call brandScriptExecutor.renderBrandScriptAndSave when
-      // a brand resolved (Remotion chrome, behind its own concurrency
-      // permit — VEO_TITLING_CONCURRENCY / veoTitlingSemaphore, both removed
-      // in the same change) and qcAndStampVideoAd only on the no-brand
-      // fallback. adgen now titles every master exclusively — backend no
-      // longer attempts Remotion compositing in-process at all, brand or no
-      // brand, so this stage is unconditional. This whole function is
-      // already unreachable in production (gated behind
-      // isAdgenRendererEnabled() at the top of runRenderLoop), but if it is
-      // ever reached the master ships untitled — exactly the pre-existing
-      // "no brand resolved" behavior below, now the only behavior. Vision QC
-      // still runs so the ad is never delivered with zero visibility.
-      //
-      // The renderStage write below matters even though this whole function
-      // is dead: services/adTitlingTruth.js's isVideoTitlingSettled treats
-      // `renderUrl === veoVideoUrl` as settled ONLY when renderStage matches
-      // `/^no titling \(/i` (every other intentional-ship call site in this
-      // repo writes that exact prefix). Without it, an ad shipped by this
-      // path would read as a stuck/abandoned titling debt, not a deliberate
-      // bare ship — closing a gap the pre-existing no-brand branch already had.
-      adStage(adId, 'no titling (backend titling removed) — shipping master');
-      const adFinal = await Ad.findById(adId).lean();
-      const { qcAndStampVideoAd } = require('../services/brandScriptExecutor');
-      await qcAndStampVideoAd({ ad: adFinal, deliveredUrl: veoVideoUrl });
-
-      {
-        // GUARDED ON status — vision QC does not throw, but
-        // brandScriptExecutor.buildVideoQcFailureFields stamps
-        // status:'failed' inside qcAndStampVideoAd on a real QC failure (PR
-        // #282, "deliver a QC-failed ad as failed with the exact Slack
-        // reason"). A bare { _id } write would overwrite that verdict with
-        // 'draft' and count the ad succeeded. MEASURED in prod 2026-08-24:
-        // 47 video ads with visionQc.passed:false sitting in 'draft', ZERO
-        // in 'failed' — the verdict never survived once. "Counting an
-        // untitled master as success is forbidden" (§2) has always been the
-        // rule; this closes the QC arm of it.
-        //
-        // ALLOWLIST, NOT DENYLIST — the direction is the safety property. A
-        // $nin:['failed','archived'] fails OPEN: any status nobody enumerated
-        // gets overwritten with 'draft'. That resurrects a row a requeue just
-        // moved to 'queued' (processAlerts SIGTERM, the /generate and /runs
-        // crash catches) and DEMOTES an ad an operator promoted to 'live'.
-        // $in admits only the two states this point legitimately owns:
-        // 'rendering' (titling never ran — always true now) and 'draft'
-        // (already promoted, e.g. by a concurrent write). Unknown state =>
-        // the settle-only arm, which clears the debt without touching status.
-        const promoted = await Ad.updateOne(
-          { _id: adId, status: { $in: ['rendering', 'draft'] } },
-          {
-            $set: {
-              status:     'draft',
-              renderedAt: new Date(),
-              updatedAt:  new Date(),
-              // Debt settled: shipped bare (no titling ever runs now). Clearing
-              // here is what keeps this ad — whose renderUrl legitimately stays
-              // equal to veoVideoUrl forever — from being re-swept for the
-              // rest of its life (moot in practice: the sweeper that used to
-              // read this field, titlingResumeService, is also removed).
-              titlingResumeState: null
-            }
-          }
-        );
-        if (promoted.matchedCount) {
-          await CampaignRun.updateOne({ _id: run._id }, { $inc: { succeeded: 1 } });
-          adStage(adId, 'done');
-        } else {
-          // A terminal verdict is already on the row. Do NOT resurrect it —
-          // but the titling-debt field is still ours to settle so no other
-          // reader mistakes this row for one still owing a title.
-          const kept = await Ad.findOneAndUpdate(
-            { _id: adId },
-            { $set: { titlingResumeState: null, updatedAt: new Date() } },
-            { new: true, projection: { status: 1 } }
-          ).lean();
-          const keptStatus = (kept && kept.status) || 'failed';
-          // 'archived' is an operator action, not a render failure.
-          const counter = keptStatus === 'failed' ? 'failed' : 'succeeded';
-          await CampaignRun.updateOne({ _id: run._id }, { $inc: { [counter]: 1 } });
-          adStage(adId, `done (kept terminal status '${keptStatus}')`);
-        }
-      }
-    } catch (err) {
-      console.error(`❌ veoReference[ad=${adId}]:`, err.message || err);
-      // Video is the expensive, slow, vendor-dependent stage — the one
-      // worth a push. Deduped on the message shape, not the ad id, so a
-      // vendor outage that fails 20 ads sends one alert with a count
-      // rather than 20 separate ones. String() the message defensively:
-      // a vendor error like {message: 429} has a truthy non-string
-      // .message, and a synchronous throw HERE would skip the CampaignRun/
-      // Ad failure bookkeeping below, wedging the ad in 'rendering'.
-      const vmsg = String((err && err.message) || err);
-
-      // ── UNSETTLED AT TIMEOUT — NOT a confirmed failure (2026-08-19) ──────
-      // atlasVideoService.pollPrediction sets err.unsettledAtTimeout when our
-      // poll budget ran out and a final free peek STILL could not confirm
-      // whether Atlas ever finished the job (incident run_1787119100250_eef4d871:
-      // two predictions still 'processing' 14-25+ min after submit — raising
-      // the poll budget would not have helped and would only have held a
-      // render slot longer). Money is already spent (veoPredictionId was
-      // stamped at the charge point before polling began), so this must NOT
-      // be marked 'failed' — that would sever the ad from
-      // services/bootRecoveryService's periodic sweep (worker.js recoverTick),
-      // which keys on status:'rendering' + a spend receipt. Leaving status
-      // untouched (it is still 'rendering' from the claim) keeps the receipt
-      // discoverable: the sweep will keep polling this same free GET until
-      // Atlas settles, then either collect the asset for $0 (recovered) or
-      // reconcile the ledger to a confirmed non-charge — never both write it
-      // off AND leave the estimate standing, which is what happened before.
-      // $inc skipped (not failed) on the run for the same reason the derive-
-      // wait path does: the outcome is deferred, not decided.
-      if (err.unsettledAtTimeout) {
-        alerts.notifyAsync({
-          level:  'warn',
-          title:  'Video master unsettled at poll timeout — awaiting reconciliation',
-          key:    `video-unsettled:${vmsg.slice(0, 60)}`,
-          fields: {
-            ad: String(adId), run: run.runId, brand: job.brandId,
-            predictionId: err.predictionId || null, error: vmsg.slice(0, 300)
-          }
-        });
-        await CampaignRun.updateOne(
-          { _id: run._id },
-          {
-            $inc:  { skipped: 1 },
-            $push: { errors: buildErrorEntry(creative, index, 'veo-unsettled', err) }
-          }
-        );
-        await Ad.updateOne(
-          { _id: adId, status: 'rendering' },
-          {
-            $set: {
-              // status intentionally NOT set — stays 'rendering' so the
-              // already-stamped veoPredictionId receipt stays visible to
-              // bootRecoveryService. Do not flip status to the failed value here.
-              renderStage:            `veo unsettled at timeout — awaiting reconciliation (pred=${err.predictionId || '?'})`.slice(0, 200),
-              renderStageAt:          new Date(),
-              'renderError.message':  vmsg,
-              'renderError.stage':    'veo-unsettled',
-              'renderError.at':       new Date(),
-              updatedAt:              new Date()
-            },
-            $inc: { renderAttempts: 1 }
-          }
-        );
-        return;
-      }
-
-      alerts.notifyAsync({
-        level:  'error',
-        title:  'Video generation failed',
-        key:    `video-failed:${vmsg.slice(0, 60)}`,
-        fields: { ad: String(adId), run: run.runId, brand: job.brandId, by: job?.requesterLabel || (run?.requestedBy ? String(run.requestedBy) : null), error: vmsg.slice(0, 300) }
-      });
-      await CampaignRun.updateOne(
-        { _id: run._id },
-        {
-          $inc:  { failed: 1 },
-          $push: { errors: buildErrorEntry(creative, index, 'veo', err) }
-        }
-      );
-      await Ad.updateOne(
-        { _id: adId },
-        {
-          $set: {
-            status:      'failed',
-            // code: threaded 2026-08-19 alongside the static path — atlasVideoService's
-            // buildClassifiedFailureError now stamps err.code from the same
-            // atlasErrorPolicy.js taxonomy (e.g. IMAGE_MODERATION_BLOCKED), so a
-            // video master rejected for the same reason as its sibling statics
-            // (one flagged catalog photo) is no longer invisible to this field.
-            renderError: { message: err.message || String(err), stage: 'veo', code: err.code || null, at: new Date(), ...childTailsFrom(err) },
-            updatedAt:   new Date()
-          },
-          $inc: { renderAttempts: 1 }
-        }
-      );
-    }
-    return;
-  }
-
-  // ── HTML Gen render path (Feed) ─────────────────────────────────────
-  try {
-    adStage(adId, `static image generation (${ad.platformFormat || 'meta_feed_1_1'})`);
-    const result = await renderCreative({
-      jobId:         crypto.randomBytes(8).toString('hex'),
-      adId:          String(ad._id),
-      campaignId:    job.campaignId,
-      campaignRunId: run.runId,
-      brandId:       job.brandId,
-      campaignKind:  job.campaignKind,
-      // Promotional details ride alongside campaignKind so the
-      // derivation prompt can compose offer-aware headlines for
-      // kind='promotional' campaigns. Snapshot from the campaign at
-      // run-start time; in-flight edits won't take effect until the
-      // operator re-renders (cache key includes a hash of this).
-      promotionalDetails: job.promotionalDetails || null,
-      // variantKind + productId thread through so buildLayoutInput
-      // can swap the product source (UGC match vs catalog product
-      // direct) and gate UGC-only slots (creator, ugc, engagement).
-      variantKind:   ad.variantKind,
-      productId:     ad.productId ? String(ad.productId) : null,
-      // paletteSource flips style bindings between hero-media palette
-      // and brand colors. assembleInput reads it and overrides the
-      // media.palette_* paths the templates bind to.
-      paletteSource: ad.paletteSource || 'media',
-      // Platform-format-aware ad generation (Phase 3). Carried from
-      // the Ad row through the render pipeline so the eager-prime call
-      // chain (ensureCanvasAndHtml → getOrGenerate → HTML Gen) all
-      // see the same format and prompt their LLMs accordingly.
-      platformFormat: ad.platformFormat || 'meta_feed_1_1',
-      // Per-ad raffle prize media — set when the campaign has multiple
-      // prize media (Option B per-prize variants). Null on non-raffle
-      // ads + single-prize raffle ads (loadContext falls back to the
-      // campaign's first prize id in those cases).
-      rafflePrizeMediaId: ad.rafflePrizeMediaId ? String(ad.rafflePrizeMediaId) : null,
-      // Phase A5b — concept-driven Ads carry the Director round +
-      // concept id. When present, ensureCanvasAndHtml uses them
-      // directly instead of running pickConceptForCell against the
-      // legacy Director artifact. Null on legacy Ads — falls through
-      // to the existing path.
-      adConceptArtifactId: ad.conceptArtifactId ? String(ad.conceptArtifactId) : null,
-      adConceptId:         ad.conceptId || null,
-      // QUOTE_STAGE_AWARE: Ad.funnelStage reaches assembleInput via
-      // deriveStage → quoteOpts. Flag-off the scorer ignores it.
-      funnelStage:         ad.funnelStage || null,
-      creative,
-      cta:           { text: ad.ctaText, url: ad.ctaUrl, params: ad.ctaUrlParams },
-      authToken:     renderToken,
-      options:       {}
-    });
-
-    if (result.status === 'success') {
-      await CampaignRun.updateOne({ _id: run._id }, { $inc: { succeeded: 1 } });
-      adStage(adId, 'done');
-    } else if (result.status === 'skipped') {
-      // Template validation (and similar) used to leave the Ad in
-      // status:'rendering' with no renderError — the run's skipped counter
-      // moved but the board / reaper saw a still-in-flight asset. Terminal
-      // state + reason so a human can decide what to change before a regen.
-      const skipMsg = result.skipReason || 'skipped';
-      await CampaignRun.updateOne({ _id: run._id }, { $inc: { skipped: 1 } });
-      await Ad.updateOne(
-        { _id: adId },
-        {
-          $set: {
-            status: 'failed',
-            renderError: { message: skipMsg, stage: 'validate', at: new Date() },
-            renderStage: `skipped: ${skipMsg}`.slice(0, 200),
-            renderStageAt: new Date(),
-            updatedAt: new Date()
-          },
-          $inc: { renderAttempts: 1 }
-        }
-      );
-    } else {
-      await CampaignRun.updateOne(
-        { _id: run._id },
-        {
-          $inc: { failed: 1 },
-          $push: { errors: buildErrorEntry(creative, index, result.stage, result.error) }
-        }
-      );
-      // Mark the Ad failed with diagnostic context.
-      const errMsg = typeof result.error === 'object' ? (result.error.message || JSON.stringify(result.error)) : String(result.error || 'unknown');
-      await Ad.updateOne(
-        { _id: adId },
-        {
-          $set: {
-            status:      'failed',
-            // predictionId makes an abandoned-but-paid-for render recoverable:
-            // Atlas retains the asset for days, so a reclaim pass can fetch it
-            // instead of re-submitting and paying twice.
-            renderError: {
-              message:      errMsg,
-              stage:        result.stage || result.error?.stage || 'unknown',
-              predictionId: result.error?.predictionId || null,
-              atlasCode:    result.error?.atlasCode ?? null,
-              charged:      result.error?.charged === true,
-              // Stable IMAGE_* classification (atlasErrorPolicy.js), when the
-              // failure carried one — e.g. 'IMAGE_MODERATION_BLOCKED'. Lets
-              // the ads UI/API tell a content-policy rejection apart from a
-              // bug or an outage without parsing renderError.message text.
-              code:         result.error?.code || null,
-              at:           new Date(),
-              ...childTailsFrom(result.error)
-            },
-            // Keep vision QC verdict (incl. discarded paid URLs) on failure.
-            ...(result.error?.visionQc ? { visionQc: result.error.visionQc } : {}),
-            // Surface the last attempt's pixels when QC kept a URL.
-            ...(() => {
-              const attempts = result.error?.visionQc?.attempts || [];
-              const lastUrl = [...attempts].reverse().find(a => a?.renderUrl)?.renderUrl;
-              return lastUrl ? { renderUrl: lastUrl } : {};
-            })(),
-            updatedAt:   new Date()
-          },
-          $inc: { renderAttempts: 1 }
-        }
-      );
-    }
-  } catch (err) {
-    await CampaignRun.updateOne(
-      { _id: run._id },
-      {
-        $inc: { failed: 1 },
-        $push: { errors: buildErrorEntry(creative, index, 'crash', err) }
-      }
-    );
-    await Ad.updateOne(
-      { _id: adId },
-      {
-        $set: {
-          status:      'failed',
-          // Carry the billing tags. An unexpected throw AFTER a charged Atlas
-          // submit is exactly the case where the recovery handle matters most,
-          // and this path recorded only the message — so the one crash that
-          // cost money looked identical to one that cost nothing.
-          // `err.cause` is read too: wrappers put the tags there.
-          renderError: {
-            message:      err.message || String(err),
-            stage:        'crash',
-            at:           new Date(),
-            predictionId: err.predictionId || err.cause?.predictionId || null,
-            charged:      err.charged === true || err.cause?.charged === true,
-            atlasCode:    err.atlasCode ?? err.cause?.atlasCode ?? null,
-            code:         err.code || err.cause?.code || null,
-            ...childTailsFrom(err)
-          },
-          updatedAt:   new Date()
-        },
-        $inc: { renderAttempts: 1 }
-      }
-    );
-  }
-}
-
-// Normalize an error (string | Error | {stage, message, retryable}) into a
-// flat row that fits CampaignRun.errors[]. The renderService surfaces
-// per-stage errors as objects, so we have to extract .message rather
-// than letting Mongoose stringify the whole object (which fails the
-// String cast on errors[].message).
-function buildErrorEntry(creative, index, stageHint, errLike) {
-  const errStage = (errLike && typeof errLike === 'object' && errLike.stage)
-    ? errLike.stage
-    : (stageHint || 'unknown');
-  let message;
-  if (errLike instanceof Error) {
-    message = errLike.message || String(errLike);
-  } else if (errLike && typeof errLike === 'object') {
-    message = errLike.message || JSON.stringify(errLike);
-  } else {
-    message = errLike ? String(errLike) : 'unknown';
-  }
-  // Stable classification, when the failure carried one (renderService's
-  // failed() puts services/atlasErrorPolicy.js's IMAGE_* code here for a
-  // render-stage failure — e.g. IMAGE_MODERATION_BLOCKED). Added 2026-08-19
-  // so an operator (or the run-level moderationBlocked rollup below) can
-  // tell "content-policy rejection, identical retry is futile" apart from a
-  // bug or an outage without parsing free text. `code`/`action` are already
-  // declared, unconstrained String fields on CampaignRun.errors[] (added for
-  // the LLM taxonomy) — reused here rather than adding new ones.
-  const code = (errLike && typeof errLike === 'object' && errLike.code) ? String(errLike.code) : null;
-  const action = (errLike && typeof errLike === 'object' && typeof errLike.retryable === 'boolean')
-    ? (errLike.retryable ? 'FAILED_RETRYABLE' : 'GAVE_UP_NO_RETRY')
-    : null;
-  return {
-    index,
-    stage:       errStage,
-    template:    creative.template,
-    aspectRatio: creative.aspectRatio,
-    mediaId:     creative.mediaId   ? String(creative.mediaId)   : null,
-    productId:   creative.productId ? String(creative.productId) : null,
-    message,
-    code,
-    action
   };
 }
 
@@ -4914,7 +3279,7 @@ router.post('/:id/override-qc', express.json(), async (req, res) => {
 //            modal; this text replaces the auto-composed prompt
 //            verbatim instead of being appended as a refinement note.
 //            Image models have one flat prompt channel — system+user
-//            are concatenated (see resolveImagePromptOverride).
+//            are concatenated (adgen-side, once it claims the regenerate).
 //   videoPromptRaw: string ≤4000 — video only. FULL replacement of the
 //            canonical camera prompt for THIS regenerate call. Reuses
 //            the existing generateForAd raw branch (logs "canonical
@@ -4938,7 +3303,8 @@ router.post('/:id/override-qc', express.json(), async (req, res) => {
 //            and the safe-box geometry prose unless the operator keeps them;
 //            gen size, delivery crop, reference stack and logo compositing
 //            still come from the surface. When set, `prompt` is ignored (the
-//            override wins inside renderDirectImage).
+//            override wins on adgen's render path, which claims the stamped
+//            regenerationRequest).
 //            PASS-THROUGH — not written to the Ad, so the next regenerate
 //            with an empty field reverts to the auto-composed prompt.
 // Returns 202 with a poll target. Frontend polls
@@ -4987,9 +3353,9 @@ router.post('/:id/regenerate', express.json(), async (req, res) => {
     const { imagePromptRaw } = imageFields;
 
     // Both imagePromptRaw and promptOverride land in the SAME full-replace slot
-    // (runImage's promptOverride argument → resolveImagePromptOverride). Sending
-    // both is a client bug: silently picking a winner would hide which text the
-    // billable submit actually used.
+    // on adgen's render path once it claims the stamped regenerationRequest.
+    // Sending both is a client bug: silently picking a winner would hide which
+    // text the billable submit actually used.
     if (imagePromptRaw && promptOverride) {
       return res.status(400).json({
         error: 'send either imagePromptRaw or promptOverride, not both — they both replace the whole image prompt'
@@ -6418,12 +4784,6 @@ module.exports.requeueStrandedAds = requeueStrandedAds;
 // check alone would pass against a reimplementation that kept the name,
 // so the harness calls the real function.
 module.exports.resolveDeriveFromMaster = resolveDeriveFromMaster;
-// Exported so scripts/verifyPmaxFunnelVariants.js can drive the real function
-// against a stubbed Ad model and inspect the literal query object Mongo
-// receives, rather than pattern-matching the source text — the class of gap
-// an adversarial review flagged in this exact function (a regex proving an
-// assignment exists proves nothing about what the query actually excludes).
-module.exports.findSiblingMasterAd = findSiblingMasterAd;
 // PURE shaper for the generation-inspector's `master` block. Exported so
 // scripts/verifyMasterAdLinkSurfacing.js drives the REAL function rather than
 // regexing the route — a source check would pass against a reimplementation
@@ -6447,17 +4807,8 @@ module.exports.resolveOwnedProductIds = resolveOwnedProductIds;
 // MODERATION SURFACING (2026-08-19), exported for behavioural pinning by
 // scripts/verifyModerationSeedFallback.js — a source-text check alone would
 // pass against a reimplementation that kept the name, so the harness calls
-// the real functions.
-module.exports.buildErrorEntry = buildErrorEntry;
+// the real function.
 module.exports.buildModerationRollup = buildModerationRollup;
-// DERIVE-WAIT BACKUP (2026-08-20), exported for behavioural pinning by
-// scripts/verifyDeriveWaitBackup.js. A source-text check alone would pass
-// against a reimplementation that kept the name but re-introduced the old
-// "fail after N attempts" branch; the harness drives the real function
-// (with requeue/notify injected) so the never-abandon contract is proven,
-// not assumed.
-module.exports.handleDeriveMasterBackup = handleDeriveMasterBackup;
-module.exports.notifyDeriveWaitBackup = notifyDeriveWaitBackup;
 // QC OVERRIDE (2026-09-02) — exported for behavioural pinning by
 // scripts/verifyOverrideQcGuard.js. Same rationale as every other pair above:
 // a source-text regex cannot tell a working guard from a comment describing

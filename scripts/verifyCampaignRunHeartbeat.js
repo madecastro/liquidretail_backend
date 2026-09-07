@@ -38,15 +38,16 @@
 //   1. services/campaignRunHeartbeat.js — a ~60s ticker that writes
 //      `{ $set: { updatedAt, lastHeartbeatAt } }` to `{ _id, status:'running' }`
 //      and NOTHING else, plus the Ad arm that beats the run's still-'rendering'
-//      rows with the same filter/update the render loop already used on every
-//      completion.
-//   2. It is GATED on real in-flight work (`pools.some(p => p.inflight > 0)`).
-//      An unconditional beat would defeat the reaper and resurrect the wedged-
-//      run-lives-forever class the reaper exists to kill. Group E.
-//   3. It stops on EVERY exit path — the `catch` AND the `finally` around the
-//      pool drain, and `unref()` so it can never hold the process open.
-//      Group D, structurally (comment lines stripped first, so a commented-out
-//      `runHeartbeat.stop()` cannot satisfy the check).
+//      rows. worker.js's reaper uses the exported builders; adgen's renderer
+//      now starts the ticker (backend's in-process renderOne wiring is gone).
+//   2. It is GATED on real in-flight work. An unconditional beat would defeat
+//      the reaper and resurrect the wedged-run-lives-forever class the reaper
+//      exists to kill. Group E (behavioural, against the MODULE).
+//   3. REMOVED (dormant render fallback deletion): Group D used to pin
+//      startRunHeartbeat import/start/stop inside routes/ads.js
+//      runRenderLoop. That wiring was deleted with the in-process render
+//      loop (runRenderLoop now flips CampaignRun to 'running' and returns).
+//      Adgen's renderer now heartbeats. Group D is an ABSENCE pin.
 //   4. `lastHeartbeatAt` is DECLARED on models/CampaignRun.js. This schema is
 //      strict; an undeclared path is silently DROPPED (the trap that lost
 //      `renderError.predictionId`). Group C asserts through the REAL compiled
@@ -64,20 +65,15 @@
 // counterfactual proves the fix does something.
 //
 // ── REVERT-PROVE (each mutation must fail the NAMED check) ────────────────
-//    1. Delete the `runHeartbeat.stop()` in the CATCH arm (routes/ads.js)
-//         → D4 fails
-//    2. Delete the `runHeartbeat.stop()` in the FINALLY arm
-//         → D5 fails
-//    3. Comment out BOTH stop() calls (leaving the words in a comment)
-//         → D4 + D5 fail (comment lines are stripped before the scan)
-//    4. Change `isWorking` to `() => true` at the call site
-//         → D3 fails
+//    1–4 / 11–12. REMOVED. Those mutations targeted routes/ads.js
+//         runRenderLoop's startRunHeartbeat wiring (D1–D7). That wiring
+//         was deleted with the in-process render loop. Group D is now an
+//         ABSENCE pin: re-importing / re-calling startRunHeartbeat from
+//         ads.js fails D-abs (backend must not hold ads in-process).
 //    5. Make the ticker beat regardless of isWorking (drop the gate in
 //       startRunHeartbeat)
 //         → E1 + E3 fail — the wedged-run resurrection
 //
-//   (All fourteen were run against this harness on 2026-08-18; the check names
-//   above are the OBSERVED failures, not predicted ones.)
 //    6a. Add `total: 0` to buildRunHeartbeatUpdate
 //         → B1 + B3 + E2 fail
 //    6b. Add `$inc: { succeeded: 1 }` to it
@@ -86,21 +82,17 @@
 //         → B5 + E2 + F5 fail (a beat could resurrect a reaped run)
 //    8. Remove `lastHeartbeatAt` from models/CampaignRun.js
 //         → C1 + C2 + C4 fail (C4 shows the write would be silently dropped)
-//    9a. Raise HEARTBEAT_CAP_MS above the Ad beat's 60s
+//    9a. Raise HEARTBEAT_CAP_MS above 60s
 //         → A3 fails. (NOT A2 — the MIN_BEATS_PER_WINDOW divisor still binds,
 //           which is the derivation doing its job. The cap is pinned separately
-//           because it is a cadence claim, not a safety one.)
+//           because it is a cadence claim, not a safety one. The ads.js
+//           renderOne `}, 60_000);` pin that used to justify this cadence
+//           is gone — adgen's renderer now heartbeats.)
 //    9b. Drop the MIN_BEATS_PER_WINDOW divisor from runHeartbeatMs()
 //         → A2 fails (asserted as a relationship, at 13 REAP_STALE_MIN values)
 //   10. Re-parse REAP_STALE_MIN inline in campaignRunHeartbeat.js instead of
 //       importing reapStaleMin
 //         → A4 fails (the third-parser ban)
-//   11. Drop the import of startRunHeartbeat from routes/ads.js while keeping
-//       the call (the unbound-identifier production class, CLAUDE.md §5)
-//         → D1 fails
-//   12. Re-inline `{ _id: {$in: adIds}, status:'rendering' }` at the
-//       per-completion write instead of the shared builder
-//         → D7 fails (the timer beat and the completion beat would drift)
 //   13. Hand-roll the running-reap filter back inline in worker.js
 //         → G2 fails (and verifyPreparingReap G5d)
 //   14. Restore docs/ALERTING.md's "CampaignRun has no periodic heartbeat of
@@ -296,9 +288,10 @@ ok('A2b the floor/divisor conflict below a ~25s window is EXACTLY where the code
   // can drift back into a comfortable falsehood.
   //
   // The degradation is accepted, not fixed: at a sub-25-second reap window the
-  // pre-existing hard-60s Ad heartbeat in routes/ads.js is already hopeless and
-  // the reaper would be requeuing live renders seconds after they claim, so
-  // this is not the binding failure at that setting.
+  // hard-60s Ad heartbeat (now in adgen's renderer; used to live in
+  // routes/ads.js renderOne) is already hopeless and the reaper would be
+  // requeuing live renders seconds after they claim, so this is not the
+  // binding failure at that setting.
   const boundaryMin = FLOOR_BINDS_BELOW_MS / 60000;
   // Just ABOVE the boundary the invariant still holds exactly.
   withReapMin(String(boundaryMin), () => {
@@ -323,11 +316,13 @@ ok('A2b the floor/divisor conflict below a ~25s window is EXACTLY where the code
     'the floor does not make the margin hold — it is what breaks it below the boundary');
 });
 
-ok('A3 the cap matches the Ad heartbeat cadence already in production (60s), and is the binding value at the default', () => {
+ok('A3 the cap is 60s, and is the binding value at the default', () => {
+  // HEARTBEAT_CAP_MS is a LIVE module constant on campaignRunHeartbeat.js.
+  // The second half of this check used to pin routes/ads.js renderOne's
+  // `}, 60_000);` Ad heartbeat — that wiring was deleted with the
+  // in-process render loop. Adgen's renderer now heartbeats.
   assert.strictEqual(HEARTBEAT_CAP_MS, 60_000,
-    'the run beat must share the Ad beat\'s cadence — there is no reason for a run to beat on a different clock than the ads inside it');
-  assert.ok(/\}, 60_000\);/.test(adsCode),
-    'routes/ads.js renderOne() must still carry its own 60s Ad heartbeat — this cap is justified by that precedent');
+    'the run beat must stay on a 60s cadence — there is no reason for a run to beat on a different clock than the ads inside it');
   withReapMin(undefined, () => {
     assert.strictEqual(runHeartbeatMs(), HEARTBEAT_CAP_MS,
       'at the documented REAP_STALE_MIN the cap (not the divisor) must be what binds — 15 beats per window');
@@ -466,101 +461,22 @@ ok('C4 demonstrated: a declared heartbeat field survives casting, an undeclared 
 });
 
 // ══════════════════════════════════════════════════════════════════════════
-// Group D — WIRING into the render loop, and STOP on every exit path.
-// Structural, over comment-stripped source.
+// Group D — ABSENCE. The in-process render loop no longer holds ads, so it
+// no longer imports or starts startRunHeartbeat. Adgen's renderer now
+// heartbeats. The MODULE itself is still pinned by groups A/B/C/E/F.
 // ══════════════════════════════════════════════════════════════════════════
-ok('D1 routes/ads.js IMPORTS startRunHeartbeat (a call without an import is a ReferenceError)', () => {
-  // CLAUDE.md §5: this repo has shipped that exact ReferenceError to prod three
-  // times, and neither a source-text harness nor `node --check` can see it.
+ok('D-abs [ABSENCE] routes/ads.js no longer imports or calls startRunHeartbeat', () => {
+  // runRenderLoop used to start the ticker (and stop it in catch+finally)
+  // because it held the in-flight pools. It now flips CampaignRun to
+  // 'running' and returns; adgen's renderer claims the ads and heartbeats.
   assert.ok(
-    /const\s*\{[^}]*startRunHeartbeat[^}]*\}\s*=\s*require\(\s*['"]\.\.\/services\/campaignRunHeartbeat['"]\s*\)/s
-      .test(adsCode),
-    'routes/ads.js must destructure startRunHeartbeat from ../services/campaignRunHeartbeat');
-  for (const name of ['buildClaimedAdHeartbeatFilter', 'buildClaimedAdHeartbeatUpdate']) {
-    assert.ok(new RegExp(`const\\s*\\{[^}]*${name}[^}]*\\}\\s*=\\s*require\\(\\s*['"]\\.\\./services/campaignRunHeartbeat['"]\\s*\\)`, 's').test(adsCode),
-      `routes/ads.js uses ${name} at the per-completion write and must import it`);
-  }
+    !/require\(\s*['"]\.\.\/services\/campaignRunHeartbeat['"]\s*\)/.test(adsCode),
+    'routes/ads.js re-imported campaignRunHeartbeat — backend must not hold ads in-process');
+  assert.ok(
+    !/startRunHeartbeat\s*\(/.test(adsCode),
+    'routes/ads.js re-called startRunHeartbeat — that wiring belonged to the deleted render loop');
 });
 
-// One structural read of runRenderLoop, shared by D2-D6.
-const LOOP_START = adsCode.indexOf('async function runRenderLoop(');
-const LOOP_SRC = LOOP_START === -1 ? '' : adsCode.slice(LOOP_START, adsCode.indexOf('\nasync function ', LOOP_START + 10));
-const I_START   = LOOP_SRC.indexOf('const runHeartbeat = startRunHeartbeat({');
-const I_TRY     = LOOP_SRC.indexOf('\n  try {', I_START);
-const I_POOLS   = LOOP_SRC.indexOf('await Promise.all(pools.map(', I_TRY);
-const I_CATCH   = LOOP_SRC.indexOf('\n  } catch (', I_POOLS);
-const I_FINALLY = LOOP_SRC.indexOf('\n  } finally {', I_CATCH);
-const I_ENDBLK  = LOOP_SRC.indexOf('\n  }\n', I_FINALLY);
-
-ok('D2 the heartbeat is STARTED inside runRenderLoop, before the pool drain', () => {
-  assert.notStrictEqual(LOOP_START, -1, 'runRenderLoop must exist in routes/ads.js');
-  assert.notStrictEqual(I_START, -1, 'runRenderLoop must start a CampaignRun heartbeat');
-  assert.notStrictEqual(I_POOLS, -1, 'the pool drain must still be `await Promise.all(pools.map(`');
-  assert.ok(I_START < I_POOLS, 'the heartbeat must start BEFORE the drain it is protecting');
-  assert.ok(/runDocId:\s*run\._id/.test(LOOP_SRC.slice(I_START, I_START + 400)),
-    'the heartbeat must be pointed at THIS run\'s _id');
-  assert.ok(/\n\s*adIds,/.test(LOOP_SRC.slice(I_START, I_START + 400)),
-    'the heartbeat must be handed this run\'s claimed adIds — without them the ' +
-    'claimed-but-undispatched tail is still reaped out from under a live run (the 9 stranded rows)');
-});
-
-ok('D3 the beat is GATED on the render loop\'s REAL in-flight count — not a constant', () => {
-  const call = LOOP_SRC.slice(I_START, I_START + 400);
-  const m = call.match(/isWorking:\s*\(\)\s*=>\s*([^\n]+)/);
-  assert.ok(m, 'the heartbeat call must pass an isWorking predicate');
-  const expr = m[1].trim();
-  assert.ok(/pools\b/.test(expr) && /inflight/.test(expr),
-    `isWorking must read the pools' own inflight counters, got: ${expr}`);
-  assert.ok(!/^\s*(true|1|!!1)\b/.test(expr),
-    'a truthy constant would beat unconditionally and defeat the reaper entirely — ' +
-    'resurrecting the wedged-run-lives-forever class the reaper exists to kill');
-  // The gate must read the SAME counters the loop uses to decide it is done.
-  assert.ok(/pool\.inflight\s*===\s*0/.test(LOOP_SRC),
-    'sanity: the loop still resolves on pool.inflight === 0, so gating on inflight > 0 really does ' +
-    'mean "a render is in flight"');
-});
-
-ok('D4 the heartbeat is cleared in the CATCH arm, and the error is re-thrown', () => {
-  assert.notStrictEqual(I_CATCH, -1, 'the pool drain must be wrapped in try/catch');
-  assert.ok(I_TRY !== -1 && I_TRY < I_POOLS && I_POOLS < I_CATCH,
-    'the drain must sit INSIDE the try, or the catch cannot cover it');
-  const catchArm = LOOP_SRC.slice(I_CATCH, I_FINALLY === -1 ? I_CATCH + 800 : I_FINALLY);
-  assert.ok(/runHeartbeat\.stop\(\)/.test(catchArm),
-    'the catch arm must stop the heartbeat — a crashed run whose timer keeps beating would be ' +
-    'kept out of the reaper\'s reach forever');
-  assert.ok(/throw\s+/.test(catchArm),
-    'the catch must re-throw — swallowing here would turn a crashed run into a silent success');
-});
-
-ok('D5 the heartbeat is cleared in the FINALLY arm too — completion and operator cancel', () => {
-  assert.notStrictEqual(I_FINALLY, -1, 'the pool drain must have a finally arm');
-  assert.notStrictEqual(I_ENDBLK, -1, 'could not find the end of the finally block');
-  const finallyArm = LOOP_SRC.slice(I_FINALLY, I_ENDBLK);
-  assert.ok(/runHeartbeat\.stop\(\)/.test(finallyArm),
-    'the finally arm must stop the heartbeat');
-});
-
-ok('D6 exactly two runHeartbeat.stop() calls exist in CODE (a comment cannot satisfy D4/D5)', () => {
-  const codeStops = (LOOP_SRC.match(/runHeartbeat\.stop\(\)/g) || []).length;
-  assert.strictEqual(codeStops, 2,
-    `expected exactly 2 runHeartbeat.stop() calls in comment-stripped runRenderLoop, found ${codeStops}`);
-  // Prove the stripper is actually doing something — otherwise D4/D5 are the
-  // regex-a-comment-satisfies check they claim not to be.
-  const rawStops = ((adsSrc.slice(adsSrc.indexOf('async function runRenderLoop(')).match(/runHeartbeat\.stop\(\)/g)) || []).length;
-  assert.ok(rawStops >= codeStops,
-    'sanity: the comment-stripped view cannot contain more occurrences than the raw source');
-});
-
-ok('D7 the per-completion Ad beat uses the SHARED builders — the timer and the completion path cannot drift', () => {
-  assert.ok(/Ad\.updateMany\(\s*\n\s*buildClaimedAdHeartbeatFilter\(adIds\),\s*\n\s*buildClaimedAdHeartbeatUpdate\(/.test(adsCode),
-    'the render loop\'s per-completion Ad heartbeat must call the shared builders, not an inlined copy — ' +
-    'two populations is how the undispatched tail got reaped out from under a live run');
-  // Scoped to the HEARTBEAT call shape specifically. The same literal appears
-  // legitimately inside receiptFree(...) at the crash-release sites (routes/ads.js
-  // ~1220/1241), which are a different concern and must not be caught here.
-  assert.ok(!/Ad\.updateMany\(\s*\n\s*\{\s*_id:\s*\{\s*\$in:\s*adIds\s*\},\s*status:\s*'rendering'\s*\}/.test(adsCode),
-    'the old inlined heartbeat literal `Ad.updateMany({ _id: { $in: adIds }, status: \'rendering\' }, …)` must not come back');
-});
 
 // ══════════════════════════════════════════════════════════════════════════
 // Group E — the ticker BEHAVES: beats when working, silent when not, stops.

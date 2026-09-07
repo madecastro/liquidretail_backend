@@ -1,33 +1,29 @@
-// verifyTitlingOrphanResume — routes/ads.js's own titling-debt bookkeeping
-// around the (now-removed) in-process titling call.
+// verifyTitlingOrphanResume — routes/ads.js no longer ships video masters
+// in-process, so it no longer keeps titling-debt bookkeeping of its own.
 //
 // REWRITTEN 2026-08-28 (backend titling removal, owner directive: "remove
 // and disable the backend titling function, we are not going to go back to
 // it"). This file used to be ~300 lines pinning services/titlingResumeService.js's
-// buildResumeFilter (Groups A-D: the matcher, the orphan/live/derive-orphan
-// selection, everything that must NOT be swept, the two pre-existing filter
-// arms) plus routes/ads.js's own stamp/clear/heartbeat bookkeeping (Group E).
-// That service is DELETED — it could still race adgen's own titling-resume
-// path with no lease between the two processes. Groups A-D tested nothing
-// that exists any more and are gone with it.
+// buildResumeFilter (Groups A-D) plus routes/ads.js's stamp/clear/heartbeat
+// bookkeeping (Group E). That service is DELETED.
 //
-// What survives (renumbered E1-E5, was E1-E6 minus E6): routes/ads.js's OWN
-// money-guard bookkeeping around shipping a video master is UNCHANGED by the
-// titling removal — the ad still needs to be stamped `draft` +
-// `titlingResumeState:'claimed'` BEFORE anything else runs (so a process
-// death mid-shipment does not leave an invisible orphan), and the debt still
-// needs to be cleared on every terminal outcome. The removal deleted the
-// SWEEPER that used to read this field when something went wrong, and
-// deleted the "titling failed" terminal outcome (there is no titling to
-// fail any more) — E3's expected count drops from 6 to 4 accordingly (2
-// paths x {success-clear, kept-verdict-clear}, not x{titled-clear,
-// failed-clear} + 2 kept-verdict clears). E5 now anchors on
-// `qcAndStampVideoAd`, the call that replaced `renderBrandScriptAndSave` on
-// this path.
+// REWRITTEN AGAIN (dormant in-process render-loop deletion): the remaining
+// E1/E3/E4/E5 pins targeted renderOneInner — pre-shipment
+// `renderUrl: veoVideoUrl` + `titlingResumeState:'claimed'`, terminal
+// `titlingResumeState:null` clears, the in-loop Ad heartbeat covering a
+// claimed draft, and `qcAndStampVideoAd` as the draft-before-shipment
+// anchor. That whole function is gone: `runRenderLoop` now flips
+// CampaignRun to 'running' and returns; adgen's renderer stamps the
+// paid master `draft` and owns titling-resume. Backend's live titling
+// chain (`brandScriptExecutor.renderBrandScriptAndSave`, called from
+// `POST /:id/render-script`, `scripts/retitleDriver.js`, and the ads
+// debug path) does not mint paid Omni masters and is not this file's
+// subject.
 //
-// These are still source-level checks (not filter-object checks, since
-// there is no more filter object to test) against the real routes/ads.js —
-// not a regex over a comment, since comments are stripped first.
+// What survives: E2, the anti-reintroduction guard that ads.js must not
+// stamp `titlingResumeState:'pending'` (that sweeper arm had no staleness
+// bound). E1/E3/E4/E5 are now absence pins of the deleted in-process
+// shipment bookkeeping.
 const assert = require('node:assert');
 const fs = require('node:fs');
 const path = require('node:path');
@@ -40,39 +36,17 @@ const ok = (label, fn) => {
 
 console.log('verifyTitlingOrphanResume\n');
 
-// ── The render path's own stamp/clear bookkeeping. Source-level, because
-// these are literal object keys in a 6000-line route handler with no
-// callable seam. Comments are STRIPPED before matching: a check that passes
-// because it found its own explanatory prose teaches the next reader to
-// ignore it.
 const adsSrc = fs.readFileSync(path.join(__dirname, '..', 'routes', 'ads.js'), 'utf8')
   .replace(/\/\*[\s\S]*?\*\//g, '')
   .split('\n').map(l => l.replace(/\/\/.*$/, '')).join('\n');
 
-ok('E1 both pre-shipment stamps declare the titling debt', () => {
-  // Located PER SITE rather than counted file-wide. A whole-file count of
-  // "claimed" also catches the heartbeat's filter (E4), so it would pass while
-  // a stamp was missing — the count would just be satisfied by the wrong line.
-  const stampIdxs = [];
-  const re = /renderUrl:\s*veoVideoUrl/g;
-  for (let m = re.exec(adsSrc); m; m = re.exec(adsSrc)) stampIdxs.push(m.index);
-  assert.strictEqual(stampIdxs.length, 2,
-    `expected 2 pre-shipment stamps (master + derive-only), found ${stampIdxs.length}`);
-
-  for (const idx of stampIdxs) {
-    // Scope to the remainder of this $set object literal — up to its $inc
-    // sibling or the update's close, whichever comes first.
-    const rest = adsSrc.slice(idx);
-    const end = Math.min(
-      ...['$inc:', '\n      );', '\n  );'].map(t => {
-        const i = rest.indexOf(t);
-        return i === -1 ? Infinity : i;
-      })
-    );
-    const block = rest.slice(0, Number.isFinite(end) ? end : 1200);
-    assert.ok(/titlingResumeState:\s*'claimed'/.test(block),
-      `the pre-shipment stamp at offset ${idx} does not declare the titling debt`);
-  }
+ok('E1 [ABSENCE] ads.js no longer stamps renderUrl:veoVideoUrl (in-process master shipment is gone)', () => {
+  // The two pre-shipment $sets (master + derive-only) lived in renderOneInner.
+  // Adgen's renderer now writes the paid master. A new write here would mean
+  // backend is shipping video again.
+  const stamps = adsSrc.match(/renderUrl:\s*veoVideoUrl/g) || [];
+  assert.strictEqual(stamps.length, 0,
+    `expected 0 in-process shipment stamps, found ${stamps.length}`);
 });
 
 ok('E2 [ANTI-DOUBLE-RENDER] the stamp is claimed, never pending', () => {
@@ -82,41 +56,30 @@ ok('E2 [ANTI-DOUBLE-RENDER] the stamp is claimed, never pending', () => {
     "routes/ads.js must not stamp 'pending' — that arm had no staleness bound");
 });
 
-ok('E3 every terminal outcome clears the debt', () => {
+ok('E3 [ABSENCE] ads.js no longer clears titlingResumeState on a terminal in-process outcome', () => {
+  // The four terminal clears (2 paths x {settle-and-succeed, kept-verdict})
+  // lived in renderOneInner. Clearing from ads.js again would mean backend
+  // is settling titling debt it no longer owns.
   const cleared = adsSrc.match(/titlingResumeState:\s*null/g) || [];
-  // 4, not 6: since the titling removal there is no more "titling failed"
-  // terminal outcome (there is nothing left to fail) — each of the 2 paths
-  // (master, derive-only) now clears the debt on exactly ONE remaining
-  // terminal branch (settle-and-succeed) PLUS the "a terminal verdict is
-  // already on the row, still settle the debt" kept-verdict arm. That is
-  // 2 paths x 2 clears = 4. Deliberately still strictEqual: this pins the
-  // exact number of terminal outcomes, so a NEW unguarded one fails here.
-  assert.strictEqual(cleared.length, 4,
-    `expected 4 terminal clears (2 paths x {settle-and-succeed, kept-verdict}), found ${cleared.length}`);
+  assert.strictEqual(cleared.length, 0,
+    `expected 0 in-process titlingResumeState:null clears, found ${cleared.length}`);
 });
 
-ok('E4 the heartbeat covers a claimed draft, not just rendering', () => {
-  // Without this the sweeper cannot distinguish "waiting behind
-  // REMOTION_QUEUE_CONCURRENCY" from "process died" — moot for titling now
-  // that nothing waits behind it here, but the heartbeat still protects the
-  // SAME draft+claimed window against the reaper for other reasons (a slow
-  // vision QC call, a slow Cloudinary poster derivation) so this must not
-  // silently narrow back to rendering-only.
-  const hb = adsSrc.slice(adsSrc.indexOf('const heartbeat = setInterval'));
-  const body = hb.slice(0, hb.indexOf('}, 60_000)'));
-  assert.ok(/status:\s*'rendering'/.test(body), 'heartbeat lost its rendering arm');
-  assert.ok(/status:\s*'draft'/.test(body) && /titlingResumeState:\s*'claimed'/.test(body),
-    'heartbeat must also refresh a draft ad that still owes a title');
+ok('E4 [ABSENCE] ads.js no longer heartbeats claimed ads from the render loop', () => {
+  // The in-loop `setInterval(..., 60_000)` Ad heartbeat lived next to the
+  // worker pools. runRenderLoop no longer holds ads, so it must not beat them.
+  assert.ok(!/const heartbeat = setInterval/.test(adsSrc),
+    'in-process Ad heartbeat setInterval returned — the render loop no longer holds ads');
 });
 
-ok('E5 the money guard is intact — draft is still stamped before shipment', () => {
-  // Was: draft stamped BEFORE renderBrandScriptAndSave (Remotion titling).
-  // That call is deleted; the equivalent anchor now is qcAndStampVideoAd,
-  // which is the only thing this path still does before settling the ad.
-  const stampIdx = adsSrc.indexOf("status:             'draft'");
-  const shipIdx  = adsSrc.indexOf('qcAndStampVideoAd({ ad: adFinal');
-  assert.ok(stampIdx > 0 && shipIdx > 0 && stampIdx < shipIdx,
-    'draft must still be stamped BEFORE shipping — reverting that reopens the double-bill hole');
+ok('E5 [ABSENCE] qcAndStampVideoAd is gone — ads.js no longer ships a video master in-process', () => {
+  // Was: draft stamped BEFORE renderBrandScriptAndSave, then before
+  // qcAndStampVideoAd. Both call sites lived in renderOneInner. The money
+  // invariant "draft before shipment" now lives in adgen's renderer.
+  assert.ok(!/qcAndStampVideoAd\s*\(/.test(adsSrc),
+    'qcAndStampVideoAd returned — that was the last in-process video-shipment anchor');
+  assert.ok(!/async function renderOneInner\s*\(/.test(adsSrc),
+    'renderOneInner returned — backend must not ship video masters in-process');
 });
 
 if (process.exitCode) {

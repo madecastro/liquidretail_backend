@@ -26,12 +26,21 @@
  * The binding invariant is also pinned: a stale entry (master regenerated, so
  * its plate points at replaced footage) must NOT be inherited — that would ship
  * keep-out boxes measured on a video the operator no longer has.
+ *
+ * REMOVED (dormant render fallback deletion): the B-group extract of
+ * `routes/ads.js` `renderDeriveOnlyVideoAd` (the inherit `$set` lived there).
+ * That function is gone with the in-process render loop; adgen's renderer
+ * owns derive rendering now. The LIVE consumer of the sharing contract is
+ * `services/basePlateCropService.js` `ensureFaceDetectionForKeepOut`, still
+ * called from `brandScriptExecutor.js` titling. Group B now pins that
+ * helper's sourceUrl + cropRect format gate, plus the absence of the
+ * deleted derive function.
+ *
+ * Run: node scripts/verifyDeriveInheritsBasePlate.js
  */
 const assert = require('assert');
 const fs = require('fs');
 const path = require('path');
-
-// (basePlateCropService is required by the wiring assertions below via source read only.)
 
 let checks = 0;
 const ok = (label, fn) => { fn(); checks += 1; void label; };
@@ -86,51 +95,40 @@ ok('cropRect stays format-scoped — a 9:16 rect is not usable by a 1:1 derive',
   assert.ok(!!(cached.format === 'vertical' && cached.videoUrl && cached.rect));
 });
 
-// ── B. wiring: the derive path actually copies it, and only when bound ────────
+// ── B. LIVE consumer (basePlateCropService) + ABSENCE of the deleted derive ──
+// The inherit write used to live in routes/ads.js renderDeriveOnlyVideoAd
+// (deleted with the in-process render loop). Adgen's renderer copies the
+// plate at derive time. Backend titling still consumes Ad.basePlate through
+// ensureFaceDetectionForKeepOut — that helper's format gate is what makes
+// "share faces, never share crop" load-bearing.
 
-const SRC = fs.readFileSync(path.join(__dirname, '..', 'routes', 'ads.js'), 'utf8');
-const deriveFn = SRC.slice(
-  SRC.indexOf('async function renderDeriveOnlyVideoAd'),
-  SRC.indexOf('\nasync function ', SRC.indexOf('async function renderDeriveOnlyVideoAd') + 40)
+const CROP_SRC = fs.readFileSync(
+  path.join(__dirname, '..', 'services', 'basePlateCropService.js'), 'utf8'
+);
+const ADS_SRC = fs.readFileSync(
+  path.join(__dirname, '..', 'routes', 'ads.js'), 'utf8'
 );
 
-ok('the derive path computes an inherited plate guarded on the source URL', () => {
-  // Wiring check (labelled): the write sits behind Mongo I/O this offline
-  // harness cannot drive. The guard is the load-bearing half — without it a
-  // regenerated master's stale boxes would ride onto every sibling.
-  assert.ok(deriveFn.length > 500, 'renderDeriveOnlyVideoAd not found — harness is stale');
+ok('ensureFaceDetectionForKeepOut still accepts a plate whose sourceUrl matches the ad', () => {
   assert.ok(
-    /master\.basePlate && master\.basePlate\.sourceUrl === veoVideoUrl/.test(deriveFn),
-    'inherited plate is no longer guarded on the master pointing at this URL'
+    /cached\.sourceUrl === ad\.veoVideoUrl/.test(CROP_SRC)
+      && /cached\.facesComputed/.test(CROP_SRC),
+    'the live keep-out helper no longer reuses a same-source plate'
   );
 });
 
-ok('it is written into the derive $set, conditionally', () => {
+ok('ensureFaceDetectionForKeepOut still gates cropRect on cached.format === format', () => {
   assert.ok(
-    /\.\.\.\(inheritedBasePlate \? \{ basePlate: inheritedBasePlate \} : \{\}\)/.test(deriveFn),
-    'derive no longer copies the master plate — every sibling re-pays detection'
+    /cropRect:\s*\(cached\.format === format && cached\.videoUrl && cached\.rect\)/.test(CROP_SRC),
+    'the live keep-out helper no longer format-scopes cropRect — a 9:16 rect would leak onto a 1:1 derive'
   );
 });
 
-ok('the derive path still bills nothing', () => {
-  // Guard the surrounding money invariant while we are in here: this function
-  // must never reach a paid video submit.
-  //
-  // Comments are stripped first. The function opens with its own written
-  // assertion — "this function must not call veoGenerateForAd" — which a naive
-  // source match reads as the very call it is forbidding. A money check that
-  // fires on prose is worse than no check: it trains the next person to
-  // dismiss it.
-  const code = deriveFn
-    .replace(/\/\*[\s\S]*?\*\//g, '')
-    .replace(/(^|[^:])\/\/.*$/gm, '$1');
+ok('renderDeriveOnlyVideoAd is gone from routes/ads.js (adgen owns derive rendering)', () => {
   assert.ok(
-    !/veoGenerateForAd\s*\(|\bgenerateForAd\s*\(/.test(code),
-    'a paid generation call appeared on the free derive path'
+    !/async function renderDeriveOnlyVideoAd\s*\(/.test(ADS_SRC),
+    'the in-process derive renderer came back — this harness would need its wiring pins restored'
   );
-  // ...and the prose assertion itself is still present, so the intent stays
-  // documented for the next reader even though the regex ignores it.
-  assert.ok(/must not call veoGenerateForAd/.test(deriveFn));
 });
 
 console.log(`\n✅ verifyDeriveInheritsBasePlate: ${checks}/${checks} checks passed`);

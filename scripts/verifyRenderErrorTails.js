@@ -24,7 +24,9 @@
 //   remove renderError.stderrTail from models/Ad.js          → A2/A3 red
 //   clone the schema without the two paths (in-process)      → A4 still
 //     proves the drop, so A2 is not a tautology
-//   childTailsFrom not spread at the persist site            → C pins red
+//   childTailsFrom not spread at the persist site            → C4 pins red
+//     (C3 is now an absence pin: ads.js must NOT regain a
+//      renderOneInner veo/crash persist of childTailsFrom)
 //   clipTail no longer truncates                             → B2 red
 
 const fs = require('fs');
@@ -182,10 +184,17 @@ function stripComments(src) {
 // disable the backend titling function"). titlingResumeService.js is
 // deleted; routes/ads.js no longer has a titlingFailed terminal outcome to
 // persist a renderError for (there is no more in-process titling to fail).
-check('C3 routes/ads.js crash and veo persists spread childTailsFrom(err)', () => {
+//
+// C3 (routes/ads.js crash + veo persist spreading childTailsFrom) REMOVED
+// 2026-09-07 — those persist sites lived inside renderOneInner, which was
+// deleted with the dormant in-process render fallback. Live remotion
+// child-tail forwarding on this backend is noteRenderIssue (C4) plus the
+// schema round-trip (A/C5); mint-time video failure persist is adgen's.
+check('C3 routes/ads.js no longer persists a veo/crash renderError with childTailsFrom (renderOneInner gone)', () => {
   const src = stripComments(srcOf('routes/ads.js'));
-  assert.match(src, /stage:\s*'veo'[\s\S]{0,200}childTailsFrom\(err\)/);
-  assert.match(src, /stage:\s*'crash'[\s\S]{0,400}childTailsFrom\(err\)/);
+  assert.doesNotMatch(src, /stage:\s*'veo'[\s\S]{0,200}childTailsFrom\(err\)/);
+  assert.doesNotMatch(src, /stage:\s*'crash'[\s\S]{0,400}childTailsFrom\(err\)/);
+  assert.doesNotMatch(src, /childTailsFrom\s*\(/);
 });
 check('C4 noteRenderIssue forwards tails from the thrown err', () => {
   const src = stripComments(srcOf('services/adStage.js'));

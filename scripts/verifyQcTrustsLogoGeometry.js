@@ -44,6 +44,13 @@
  *      persisted attempt shape                                  → W3b
  *   6. finishPlate stops returning logoRect                     → F1-F2
  *
+ * REMOVED (dormant render fallback deletion, 2026-09-07): F3 pinned the
+ * mint-time renderDirectImage `firstOutput` threading of plate.logoRect.
+ * That caller is gone. finishPlate STILL returns logoRect (F1-F2 stay);
+ * recovery is the remaining live backend caller and is already pinned
+ * by R1. This is not a finishPlate regression — finishPlate never
+ * called QC; QC was the caller's job.
+ *
  * Run: node scripts/verifyQcTrustsLogoGeometry.js
  */
 'use strict';
@@ -334,8 +341,10 @@ function promptText(userContent) {
     /let composedLogoRect = null/.test(src) && /logoRect: composedLogoRect/.test(src));
   check('F2 finishPlate sets composedLogoRect at the same site it pushes the composite layer',
     /layers\.push\(\{ input: toPlace, top: place\.top, left: place\.left \}\);\s*\n\s*composedLogoRect = /.test(src));
-  check('F3 the live render call site (firstOutput) threads plate.logoRect through',
-    /logoRect: plate\.logoRect \|\| null/.test(src));
+  // F3 REMOVED 2026-09-07: the mint-time renderDirectImage firstOutput
+  // `logoRect: plate.logoRect || null` caller is gone. finishPlate still
+  // RETURNS logoRect (F1-F2); recovery is the remaining live backend
+  // caller and is already pinned by R1. Not a finishPlate regression.
 
   const recSrc = fs.readFileSync(path.join(__dirname, '..', 'services', 'imageRecoveryService.js'), 'utf8');
   check('R1 the recovery path passes the recovered plate\'s logoRect into maybeQcRecoveredPlate',

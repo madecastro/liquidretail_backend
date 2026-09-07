@@ -234,8 +234,10 @@ function normalizeTemplate(raw) {
 
 /**
  * The brand's own finished statics, approved ones first. Every `ai_*` static goes
- * through renderDirectImage -> gpt-image-2 (CLAUDE.md §00), so an ai_ template
- * with a renderUrl IS a gpt-image-2 render. Approval is preferred but not
+ * direct to gpt-image-2 (CLAUDE.md §00 — historically via this repo's own
+ * `renderDirectImage`, deleted with the dormant in-process render fallback;
+ * adgen owns rendering unconditionally now), so an ai_ template with a
+ * renderUrl IS a gpt-image-2 render. Approval is preferred but not
  * required — most rows predate the approve flow.
  */
 async function staticsForBrand(brandId, want) {

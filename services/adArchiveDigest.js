@@ -275,14 +275,15 @@ const REQUEUE_SITES = Object.freeze([
   { file: 'routes/ads.js', site: 'runs:post-claim-throw', verdict: 'PRE_DISPATCH',
     proof: 'the outer catch; `setImmediate(runRenderLoop)` is the LAST statement of the try, so no '
          + 'await follows it and the catch cannot run after the loop began. Pinned by E15c.' },
-  // 2026-08-20: this site moved out of renderDeriveOnlyVideoAd into the
-  // extracted handleDeriveMasterBackup, which now ALSO actively reclaims
-  // the ad (requeueStrandedAds -> claimAdsForRun) instead of merely
-  // hoping something notices — see scripts/verifyDeriveWaitBackup.js for
-  // the never-abandon behavioural proof. Still zero submits either way.
-  { file: 'routes/ads.js', site: 'handleDeriveMasterBackup:wait-requeue', verdict: 'PRE_DISPATCH',
-    proof: 'the derive path is submit-free by contract (crop + titling only). Pinned by E15d/E15e here '
-         + 'and by verifyPmaxVideoExpansion E1.' },
+  // REMOVED 2026-09-07 (dormant render fallback deletion — see session.d/):
+  // 'handleDeriveMasterBackup:wait-requeue' (was PRE_DISPATCH — the in-process
+  // derive-wait poll's requeue-and-reclaim path, submit-free by contract).
+  // handleDeriveMasterBackup and renderDeriveOnlyVideoAd, the whole
+  // in-process "wait for the sibling master, don't abandon" mechanism, are
+  // deleted along with the rest of the in-process render loop — adgen's
+  // renderer now owns deriving a portrait crop from a shared master and
+  // whatever wait/backoff it needs while doing so. There is no remaining
+  // rendering→queued requeue site for this row to describe.
   { file: 'services/processAlerts.js', site: 'sigterm:orphan-persist', verdict: 'REQUEUE_MARK',
     proof: 'fires at an arbitrary point in a render; a submit may be in flight.' },
   { file: 'worker.js', site: 'reaper:stale-rendering', verdict: 'REQUEUE_MARK',

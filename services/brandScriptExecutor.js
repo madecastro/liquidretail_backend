@@ -1257,9 +1257,9 @@ async function runVideoVisionQcForAd({ ad, deliveredUrl, brandName = null }) {
     // SystemConfig.adVisionQcEnabled is genuinely true.
     // VIDEO pipeline — reads the video-specific gate: resolveVideoEnabled()
     // (2026-08-21 split; was the single resolveEnabled() gate before then).
-    // This is the ONE gate check for this file: qcAndStampVideoAd (below)
-    // calls THIS function rather than checking the gate itself, so there is
-    // no second call site here to update.
+    // This is the ONE gate check for this file — every caller of this
+    // function relies on it rather than checking the gate itself, so there
+    // is no second call site here to update.
     const qcEnabledNow = await adVisionQc.resolveVideoEnabled();
     if (!qcEnabledNow) {
       adVisionQc.warnQcDisabledOnce('video ad');
@@ -1443,57 +1443,6 @@ async function runVideoVisionQcForAd({ ad, deliveredUrl, brandName = null }) {
       // lines up in the try) but this function must still never throw.
       return null;
     }
-  }
-}
-
-/**
- * Run video vision QC and merge the verdict onto Ad.visionQc — the shared
- * two-step (call runVideoVisionQcForAd, then $set the result) every path
- * that ships a video ad WITHOUT ever calling renderBrandScript needs.
- *
- * DEFINED ONCE, IMPORTED EVERYWHERE — same convention this repo already
- * uses for resolveDeriveFromMaster / receiptFree / adArchiveDigest (see
- * CLAUDE.md §4 "repo traps"): a duplicated copy at each call site is exactly
- * how this class of gap opens, because it is easy to copy the QC call and
- * forget the `if (videoVisionQc)` write, or to copy the write and forget the
- * `brandName` fallback. Callers today: this file's own "no chrome
- * configured" branch (below), and the "no brand resolved" branches in
- * routes/ads.js (master + derive-only video mint), services/
- * adRegenerateService.js (video regenerate), and
- * services/titlingResumeService.js (the give-up-on-brand branch) — all four
- * of which ship a delivered video ad's raw master with no titling step and,
- * before this helper existed, with NO Ad.visionQc field at all: not even
- * the {skipped:true, disabled:true} stub PR #260 added for exactly this
- * visibility. `runVideoVisionQcForAd` never throws and resolves `brandName`
- * from `ad.brandId` itself when none is passed, so a caller that never
- * managed to resolve a Brand doc (that is the whole reason it is calling
- * this) can still call it with nothing but the ad and a URL.
- *
- * Never throws — belt-and-braces around the Ad.updateOne write, since
- * runVideoVisionQcForAd already guarantees it does not.
- */
-async function qcAndStampVideoAd({ ad, deliveredUrl, brandName = null }) {
-  try {
-    const Ad = require('../models/Ad');
-    const videoVisionQc = await runVideoVisionQcForAd({ ad, deliveredUrl, brandName });
-    if (videoVisionQc) {
-      // Same status flip uploadRenderAndStamp's titled path applies (owner
-      // decision 2026-08-20: a real QC failure delivers 'failed', not a
-      // normal draft) — baked in HERE so all five callers of this shared
-      // helper (routes/ads.js's two no-brand mints, adRegenerateService's
-      // titling-throw/no-brand fallbacks, titlingResumeService's
-      // give-up-on-brand branch, and this file's own no-chrome branch)
-      // get it for free instead of five independent call sites having to
-      // remember it. See buildVideoQcFailureFields's docstring.
-      await Ad.updateOne(
-        { _id: ad._id },
-        { $set: { visionQc: videoVisionQc, ...buildVideoQcFailureFields(videoVisionQc) } }
-      );
-    }
-    return videoVisionQc || null;
-  } catch (err) {
-    console.warn(`   ⚠️  brandScript[ad=${ad && ad._id}]: qcAndStampVideoAd failed: ${err.message}`);
-    return null;
   }
 }
 
@@ -1890,20 +1839,11 @@ module.exports = {
   // ACTUAL Ad.updateOne payload instead — immune to all of the above and to
   // any future shape, because it never reads source.
   uploadRenderAndStamp,
-  // Shared helper for every "ships a video ad with no titling step" branch
-  // outside this file — routes/ads.js (master + derive-only mint),
-  // adRegenerateService.js (video regenerate), titlingResumeService.js (the
-  // give-up-on-brand branch), and this file's own no-chrome branch. See its
-  // own doc comment for why this must stay ONE function, imported, not
-  // reimplemented per caller — now including the status:'failed' flip via
-  // buildVideoQcFailureFields below.
-  qcAndStampVideoAd,
   // Pure — exported for the same harness. A real (non-skipped/disabled) QC
   // failure now delivers status:'failed' instead of a normal draft (owner
   // decision 2026-08-20); this is the ONE function every terminal video-ad
-  // write path (uploadRenderAndStamp's titled path AND qcAndStampVideoAd's
-  // five callers) goes through, so none of them can drift on what "failed
-  // vision QC" means.
+  // write path (uploadRenderAndStamp's titled path) goes through, so none
+  // of them can drift on what "failed vision QC" means.
   buildVideoQcFailureFields,
   // Re-export for harnesses that pin funnel-preset threading without
   // pulling the whole generation service.

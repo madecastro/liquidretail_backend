@@ -11,7 +11,8 @@
 //      (Grok stays <=1 RPS; GROK_MAX_RPS=99 clamps to 1).
 //   4. Grok min spacing survives ATLAS_SUBMIT_SPACING_MS=0.
 //   5. pacedModelSubmit is per-model-slug (Omni and Grok do not share a
-//      gate) so raising VEO_CONCURRENCY cannot break Grok's 1 RPS.
+//      gate) so a wide self-imposed concurrency setting cannot break
+//      Grok's 1 RPS.
 //   6. logConcurrencyConfig runs cleanly.
 //
 // Pure + offline: no DB, no network, no API key.
@@ -70,55 +71,28 @@ for (const k of ENV_KEYS) {
 // Re-apply defaults.env so subsequent checks see file defaults.
 require('dotenv').config({ path: path.join(__dirname, '..', 'config', 'defaults.env') });
 const fromDefaults = resolveAll();
-// 8 -> 24 on 2026-08-04 (owner: renders should all go to Atlas at once).
-// Then MAX_CREATIVES_PER_RUN was 20, so 24 made this gate non-binding.
-// 2026-08-18 uncap: MAX_CREATIVES_PER_RUN is 1000 (effectively uncapped), so
-// 24 is a WAVE SIZE under the run cap — a full claim renders in waves.
-// Pinned so the file and the code default cannot drift apart: a disagreement
-// between them is the exact "silent config lie" CLAUDE.md 4a warns about.
-check('A defaults.env RENDER_CONCURRENCY is 24', fromDefaults.RENDER_CONCURRENCY, 24);
-check('A RENDER_CONCURRENCY is a wave size under the run cap (claim renders in waves)',
-  fromDefaults.RENDER_CONCURRENCY <= fromDefaults.MAX_CREATIVES_PER_RUN, true);
 check('A defaults.env MAX_CREATIVES_PER_RUN is 1000 (effectively uncapped, owner 2026-08-18)',
   fromDefaults.MAX_CREATIVES_PER_RUN, 1000);
-// VEO_CONCURRENCY 4 -> 12 on 2026-08-05, when the veo lane's two halves were
-// split. It now gates the SUBMIT+POLL half only (remote, idle — an Omni poll is
-// ~2min of waiting, measured p50 117s / p99 247s). The Remotion titling half —
-// headless Chrome + ffmpeg in-process, which is what the old 4 was really
-// protecting — moved behind VEO_TITLING_CONCURRENCY and is deliberately still 4.
-// Kept <= MAX_CREATIVES_PER_RUN unlike RENDER_CONCURRENCY: going non-binding
-// here is a separate, measured decision. See scripts/verifyTitlingPermit.js.
-// 12 -> 24 on 2026-08-20, owner-approved: still submit+poll only, no Omni 429
-// ever recorded, Grok paced independently via pacedModelSubmit/GROK_MAX_RPS —
-// see config/defaults.env and services/concurrency.js for the full rationale.
-check('A defaults.env VEO_CONCURRENCY is 24', fromDefaults.VEO_CONCURRENCY, 24);
 // VEO_TITLING_CONCURRENCY (and its two checks that used to sit here) REMOVED
 // 2026-08-28 along with the in-process titling call it gated
 // (routes/ads.js's veoTitlingSemaphore, services/semaphore.js) — backend no
 // longer titles in-process at all; adgen owns titling exclusively.
-// 4 -> 8 on 2026-08-20, owner-approved, moved together with VEO_CONCURRENCY
-// above (raising one without the other makes titling a harder bottleneck).
-// One doubling, not the 16 originally floated — 4 was never an RSS
-// measurement and the failure mode strands an already-paid Omni master;
-// 8 needs validation against the web-service memory graph before any
-// further raise. See config/defaults.env and services/concurrency.js.
+// VEO_CONCURRENCY / RENDER_CONCURRENCY (and the defaults.env=24 / wave-size
+// / "narrowest video knob" checks that used to sit here) REMOVED 2026-09-07
+// with the dormant in-process render-loop pools they sized.
+// 4 -> 8 on 2026-08-20, owner-approved, then REVERTED 8→4 on 2026-08-21
+// (OOM). One doubling, not the 16 originally floated — 4 was never an RSS
+// measurement and the failure mode strands an already-paid Omni master.
+// See config/defaults.env and services/concurrency.js.
 check('A defaults.env REMOTION_QUEUE_CONCURRENCY is 4 (the real memory guard)',
   fromDefaults.REMOTION_QUEUE_CONCURRENCY, 4);
-check('A the memory-bound render pool is the narrowest video knob',
-  fromDefaults.REMOTION_QUEUE_CONCURRENCY <= fromDefaults.VEO_CONCURRENCY, true);
 check('A defaults.env ATLAS_SUBMIT_SPACING_MS is 1200', fromDefaults.ATLAS_SUBMIT_SPACING_MS, 1200);
 check('A defaults.env GROK_MAX_RPS is 1', fromDefaults.GROK_MAX_RPS, 1);
 
 // ── B. Env overrides work for SELF-IMPOSED ────────────────────────────
-process.env.RENDER_CONCURRENCY = '12';
-process.env.VEO_CONCURRENCY = '6';
 process.env.CAMPAIGN_BRIEF_CONCURRENCY = '5';
 const overridden = resolveAll();
-check('B RENDER_CONCURRENCY env override', overridden.RENDER_CONCURRENCY, 12);
-check('B VEO_CONCURRENCY env override', overridden.VEO_CONCURRENCY, 6);
 check('B CAMPAIGN_BRIEF_CONCURRENCY env override', overridden.CAMPAIGN_BRIEF_CONCURRENCY, 5);
-delete process.env.RENDER_CONCURRENCY;
-delete process.env.VEO_CONCURRENCY;
 delete process.env.CAMPAIGN_BRIEF_CONCURRENCY;
 require('dotenv').config({ path: path.join(__dirname, '..', 'config', 'defaults.env') });
 
@@ -270,7 +244,6 @@ try {
   console.log = origLog;
 }
 checkTrue('F logConcurrencyConfig emitted a line', logs.length >= 1);
-checkTrue('F log contains RENDER_CONCURRENCY', /RENDER_CONCURRENCY=/.test(logs.join('\n')));
 checkTrue('F log tags PROVIDER for GROK_MAX_RPS', /GROK_MAX_RPS=\d+(?:\.\d+)?\[PROVIDER\]/.test(logs.join('\n')));
 
 // ── G. SPEC completeness — every entry has ceiling + why ──────────────

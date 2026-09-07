@@ -23,15 +23,23 @@
 // those are review-UI conventions, not a correctness bug. Does NOT change
 // what counts as a PRINTABLE quote (toPrintableCustomerQuote).
 //
+// REMOVED (dormant render fallback deletion): every check that drove
+// `services/directImageRenderService.js`'s `buildIntentData` (group B, the
+// static-path integration) and the C-static source pins against that file's
+// now-deleted `usableAttribution(quote?.author_name)` assignment. Those
+// lived only on the mint-time static render entry point, which is gone;
+// adgen owns static rendering unconditionally now. Surviving coverage is
+// the helper itself (`usableAttribution` / `letterCount` in
+// quoteProvenance.js) and the VIDEO call site in brandScriptExecutor.js.
+//
 // Offline: no DB, no network, no API key.
 //   node scripts/verifyAttributionViability.js
 //
 // Revert-prove (each mutation must fail this harness):
 //   1. Helper neutered to identity (`return raw`)            → A (D kept)
 //   2. Video site unwired (reviewer: cascaded.reviewer)      → C video call
-//   3. Static site unwired (String(author_name).trim())      → B / C static
-//   4. Letter threshold lowered to 1 (`letterCount(s) < 1`)  → A (D kept)
-//   5. Video wraps then falls back (`|| cascaded.reviewer`)  → C video call
+//   3. Letter threshold lowered to 1 (`letterCount(s) < 1`)  → A (D kept)
+//   4. Video wraps then falls back (`|| cascaded.reviewer`)  → C video call
 //      (prefix-only regex was green on this; it restores "— D")
 
 const fs = require('fs');
@@ -64,12 +72,10 @@ const {
   letterCount,
   toPrintableCustomerQuote
 } = require('../services/quoteProvenance');
-const direct = require('../services/directImageRenderService');
 
 const ROOT = path.join(__dirname, '..');
 const SRC_QP = path.join(ROOT, 'services', 'quoteProvenance.js');
 const SRC_VIDEO = path.join(ROOT, 'services', 'brandScriptExecutor.js');
-const SRC_STATIC = path.join(ROOT, 'services', 'directImageRenderService.js');
 
 // Comment-stripped source for every assertion. A check a COMMENT can satisfy
 // is worthless — verifyReceiptAwareRequeue shipped exactly that (a commented
@@ -103,10 +109,8 @@ function stripComments(src) {
 
 const qpSrc = fs.readFileSync(SRC_QP, 'utf8');
 const videoSrc = fs.readFileSync(SRC_VIDEO, 'utf8');
-const staticSrc = fs.readFileSync(SRC_STATIC, 'utf8');
 const qpCode = stripComments(qpSrc);
 const videoCode = stripComments(videoSrc);
-const staticCode = stripComments(staticSrc);
 
 let pass = 0;
 const failures = [];
@@ -121,24 +125,6 @@ console.log = () => {};
 console.warn = () => {};
 
 const REAL_TEXT = 'The fabric held up through a whole season of training.';
-
-function intentFor(author_name) {
-  return direct.buildIntentData({
-    concept: { copy_picks: { headline: 'Built for the long season' } },
-    layoutInput: {
-      social_proof: {
-        primary_quote: {
-          text: REAL_TEXT,
-          origin: 'scraped',
-          verbatim: true,
-          author_name
-        }
-      }
-    },
-    brand: {},
-    cta: 'SHOP NOW'
-  });
-}
 
 function importsUsableAttribution(code) {
   return /\{[^}]*\busableAttribution\b[^}]*\}\s*=\s*require\s*\(\s*['"]\.\/quoteProvenance['"]\s*\)/.test(code);
@@ -196,44 +182,17 @@ check('A never throws on object', usableAttribution({ author: 'D' }) === null);
 check('A never throws on array', usableAttribution(['D']) === null);
 check('A collapses internal whitespace', usableAttribution('Connor   H.') === 'Connor H.');
 
-// ── B. Static path: drive the REAL buildIntentData, not a source mirror ──
-{
-  const dDrop = intentFor('D');
-  check('B static quote still prints when byline is a bare initial',
-    dDrop.quote === REAL_TEXT, `got ${JSON.stringify(dDrop.quote)}`);
-  check('B static drops bare initial (undefined, not null)',
-    dDrop.attribution === undefined, `got ${JSON.stringify(dDrop.attribution)}`);
+// Group B (static buildIntentData integration) was removed with
+// `renderDirectImage`/`buildIntentData` (dormant render fallback deletion,
+// 2026-09-07). The helper assertions above and the VIDEO call-site pins
+// below are the remaining coverage.
 
-  const dDot = intentFor('D.');
-  check('B static drops D.', dDot.attribution === undefined,
-    `got ${JSON.stringify(dDot.attribution)}`);
-
-  const dKeep = intentFor('Jessica L.');
-  check('B static keeps a real byline', dKeep.attribution === 'Jessica L.',
-    `got ${JSON.stringify(dKeep.attribution)}`);
-
-  const dCjk = intentFor('祐子');
-  check('B static keeps CJK byline', dCjk.attribution === '祐子',
-    `got ${JSON.stringify(dCjk.attribution)}`);
-
-  const dAnon = intentFor('Verified Buyer');
-  check('B static does not filter Verified Buyer',
-    dAnon.attribution === 'Verified Buyer',
-    `got ${JSON.stringify(dAnon.attribution)}`);
-
-  const dNone = intentFor(undefined);
-  check('B static absent author stays undefined',
-    dNone.attribution === undefined, `got ${JSON.stringify(dNone.attribution)}`);
-}
-
-// ── C. Both call sites IMPORT the helper (the processAlerts class) ───────
+// ── C. Video call site IMPORTS the helper (the processAlerts class) ──────
 // A regex proving the call is WRITTEN does not prove it RESOLVES. Assert
 // the destructure from './quoteProvenance' on comment-stripped source, then
 // assert the call sits on the assignment the defect actually used.
 check('C video imports usableAttribution from ./quoteProvenance',
   importsUsableAttribution(videoCode));
-check('C static imports usableAttribution from ./quoteProvenance',
-  importsUsableAttribution(staticCode));
 
 // The WHOLE assignment, including the fail-closed `?? null`. A prefix-only
 // regex (usableAttribution(cascaded.reviewer) with no rest) stays green on
@@ -243,16 +202,9 @@ check('C video reviewer assignment is usableAttribution(cascaded.reviewer) ?? nu
   /\breviewer\s*:\s*usableAttribution\s*\(\s*cascaded\.reviewer\s*\)\s*\?\?\s*null\s*,/.test(videoCode),
   'buildMetaForAd must wrap cascaded.reviewer and must NOT fall back to the raw value');
 
-check('C static attribution assignment calls usableAttribution(quote?.author_name) ?? undefined',
-  /\battribution\s*:\s*quoteText\s*\?\s*\(\s*usableAttribution\s*\(\s*quote\?\.author_name\s*\)\s*\?\?\s*undefined\s*\)/.test(staticCode),
-  'buildIntentData must wrap author_name and keep absent as undefined');
-
 check('C video does not reimplement or rebind the helper',
   !/function\s+usableAttribution\s*\(/.test(videoCode)
     && !/\busableAttribution\s*=/.test(videoCode));
-check('C static does not reimplement or rebind the helper',
-  !/function\s+usableAttribution\s*\(/.test(staticCode)
-    && !/\busableAttribution\s*=/.test(staticCode));
 
 check('C video reviewer line has no raw cascaded.reviewer fallback',
   !/\breviewer\s*:[^,\n]*cascaded\.reviewer[^,\n]*(?:\|\||\?\?)\s*cascaded\.reviewer/.test(videoCode));
@@ -304,4 +256,4 @@ if (failures.length) {
   process.exit(1);
 }
 console.log(`✅ verifyAttributionViability: ${pass} checks passed`);
-console.log('   helper + static buildIntentData driven for real; both call sites import the one definition');
+console.log('   helper + video call site driven for real; video imports the one definition');

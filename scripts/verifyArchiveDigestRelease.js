@@ -1055,33 +1055,29 @@ ok('E5 [SCAN] every surface that un-archives restores the digest AND handles the
     'adRestore must not bare-flip the status — a restored queued row would carry a fake identity');
 });
 
-ok('E6 routes/ads.js Stop uses the exported filter builders, not an inline query', () => {
-  const adsSrc = STRIPPED.get('routes/ads.js');
-  // Scope to runRenderLoop. A campaign-wide `{ campaignId, status:'queued' }`
-  // READ is legitimate elsewhere (GET /runs/:runId counts queuedRemaining for
-  // the "Generate more" affordance); it is only the Stop ARCHIVE that must
-  // never be campaign-scoped again.
-  const a = adsSrc.indexOf('async function runRenderLoop');
-  const b = adsSrc.indexOf('async function renderOne');
-  assert.ok(a > 0 && b > a, 'runRenderLoop / renderOne not found');
-  const loopSrc = adsSrc.slice(a, b);
-  // Assert the FULL call, not just that the builder name appears: a builder
-  // whose result is never handed to the archive helper archives nothing, and
-  // Stop would silently stop parking its own tail.
-  assert.ok(
-    /archiveAdsReleasingDigest\(\s*\n?\s*Ad,\s*\n?\s*buildStopUndispatchedArchiveFilter\(\{\s*adIds:\s*remaining\s*\}\)/.test(loopSrc),
-    'the undispatched tail must be passed to archiveAdsReleasingDigest');
-  assert.ok(
-    /archiveAdsReleasingDigest\(\s*\n?\s*Ad,\s*\n?\s*buildStopBacklogArchiveFilter\(\{\s*runId:\s*run\.runId\s*\}\)/.test(loopSrc),
-    'the run-scoped backlog must be passed to archiveAdsReleasingDigest');
-  // …and both writes must still be there. Two archive calls, no more, no less.
-  assert.strictEqual((loopSrc.match(/archiveAdsReleasingDigest\(/g) || []).length, 2,
-    'Stop has exactly two archive writes: the undispatched tail and this run\'s queued backlog');
-  assert.ok(!/campaignId:\s*(?:run|job)\.campaignId,?\s*status:\s*['"]queued['"]/.test(loopSrc),
-    'the campaign-wide backlog archive is DEFECT 1 — it must not come back');
-  assert.ok(!/Ad\.updateMany\(/.test(loopSrc.slice(loopSrc.indexOf('if (cancelled) {'))),
-    'the Stop block must not hand-roll an Ad.updateMany — it bypasses the digest release');
-});
+// E6 REMOVED 2026-09-07 (dormant render fallback deletion — see session.d/).
+// Used to assert runRenderLoop's Stop-cancellation cleanup (detected via
+// progressRun.checkpoint() throwing on cancelRequested, inside the pool
+// dispatch loop) archived the undispatched tail + this run's queued backlog
+// through archiveAdsReleasingDigest/buildStopUndispatchedArchiveFilter/
+// buildStopBacklogArchiveFilter. That whole in-process dispatch loop is
+// deleted; routes/ads.js no longer has a runRenderLoop cancellation branch
+// to guard, and no longer imports any of the three (confirmed: zero call
+// sites, imports removed). NOT REPLACED — adgen's renderer does not
+// currently check CampaignRun/OperationRun.cancelRequested for ad-generation
+// runs either (confirmed: zero references in adgen/src/services/renderer.js
+// or progressService.js's ad-batch path), so pressing Stop on a run adgen
+// has already claimed no longer stops anything; it only sets the
+// cooperative flag (routes/progress.js). This is not a regression from this
+// deletion — the in-process watcher has been unreached in production since
+// ADGEN_RENDERER_ENABLED shipped true (the same dead branch this removal
+// deletes), so the behavior is unchanged, just no longer masked by dead
+// code that looked like it handled it. Flagged for the owner as a real gap;
+// implementing Stop support in adgen's renderer is out of scope here. The
+// buildStopUndispatchedArchiveFilter/buildStopBacklogArchiveFilter/
+// archiveAdsReleasingDigest functions THEMSELVES are untouched in
+// services/adArchiveDigest.js and still exercised directly below (E1-E5,
+// E12) against synthetic documents — only their one caller is gone.
 
 ok('E7 PATCH /api/ads/:id answers a digest collision with 409, not 500', () => {
   const adsSrc = STRIPPED.get('routes/ads.js');
@@ -1184,8 +1180,12 @@ ok('E14 [SCAN][MONEY] EVERY rendering→queued requeue site stamps the durable m
     .map((s) => ({ ...s, text: siteTextWithPayloads(s) }))
     .filter(({ text }) => /status:\s*['"]queued['"]/.test(text));
   // A scan that finds nothing would pass everything.
-  assert.ok(sites.length >= 8,
-    `expected ≥8 Ad rendering→queued requeue writes, scan found ${sites.length} — the scan is broken`);
+  // Was ≥8: 'handleDeriveMasterBackup:wait-requeue' (routes/ads.js) is
+  // deleted along with the rest of the in-process render loop, and the
+  // matching REQUEUE_SITES ledger row in services/adArchiveDigest.js is
+  // removed with it (2026-09-07) — the ledger and the scan agree again.
+  assert.ok(sites.length >= 7,
+    `expected ≥7 Ad rendering→queued requeue writes, scan found ${sites.length} — the scan is broken`);
 
   // EVERY site must make its verdict EXPLICIT. Stamping by omission is
   // indistinguishable from forgetting, which is the ambiguity the two markers
@@ -1332,11 +1332,12 @@ const SUBMIT_TOKENS = [
 /**
  * The BODY of a named function.
  *
- * Must skip the parameter list first: both of these functions destructure
- * their arguments (`claimAdsForRun(ads, { selectedIds, runId })`,
- * `renderDeriveOnlyVideoAd({ run, job, ad, … })`), so a naive "first `{` after
- * the name" returns the PARAM object — a few dozen characters that contain no
- * submit token and would make every absence check below vacuously pass.
+ * Must skip the parameter list first: claimAdsForRun destructures its
+ * arguments (`claimAdsForRun(ads, { selectedIds, runId })`), so a naive
+ * "first `{` after the name" returns the PARAM object — a few dozen
+ * characters that contain no submit token and would make every absence
+ * check below vacuously pass. (renderDeriveOnlyVideoAd used to be the
+ * other example; that function is deleted with the in-process render loop.)
  */
 const namedFn = (src, decl) => {
   const i = src.indexOf(decl);
@@ -1396,38 +1397,22 @@ ok('E15c [PROOF] /runs post-claim throw cannot fire after the render loop starts
     'this site must then stamp REQUEUE_MARK');
 });
 
-ok('E15d [PROOF] renderDeriveOnlyVideoAd is submit-free (crop + titling only)', () => {
+// E15d/E15e ABSENCE pins (dormant in-process render-loop deletion).
+// `renderDeriveOnlyVideoAd` and `handleDeriveMasterBackup` no longer exist
+// in routes/ads.js — adgen owns derive rendering, so backend never waits
+// in-process for a sibling master and never requeues a derive-only ad from
+// that wait. The PRE_DISPATCH exemption those two functions justified is
+// gone with them (the matching REQUEUE_SITES ledger row is gone too).
+// Remaining PRE_DISPATCH proofs are E15a/E15b/E15c.
+ok('E15d [ABSENCE] renderDeriveOnlyVideoAd no longer exists in routes/ads.js', () => {
   const s = STRIPPED_LATE('routes/ads.js');
-  const body = namedFn(s, 'async function renderDeriveOnlyVideoAd(');
-  assert.ok(body && body.length > 1500, 'renderDeriveOnlyVideoAd body not found');
-  for (const t of SUBMIT_TOKENS) {
-    assert.ok(!t.test(body),
-      `renderDeriveOnlyVideoAd now reaches ${t} — a submit on the FREE derive surface, and its ` +
-      'wait-requeue must stamp REQUEUE_MARK');
-  }
-  // Prove the comment-strip left real code, or the absence check is vacuous.
-  assert.ok(/findSiblingMasterAd\s*\(/.test(body), 'stripping erased the body — absence proves nothing');
+  assert.strictEqual(namedFn(s, 'async function renderDeriveOnlyVideoAd('), null,
+    'renderDeriveOnlyVideoAd returned — the in-process derive path was deleted');
 });
-
-// 2026-08-20: the wait-requeue's PRE_DISPATCH declaration moved OUT of
-// renderDeriveOnlyVideoAd and into the extracted handleDeriveMasterBackup
-// (owner: "hitting the timeout shouldn't abandon" — see
-// scripts/verifyDeriveWaitBackup.js for the full behavioural proof of the
-// never-abandon contract; this check only re-proves the money invariant
-// E15 exists for: the exemption still declares PRE_DISPATCH and the
-// function it now lives in is STILL submit-free).
-ok('E15e [PROOF] handleDeriveMasterBackup (the timeout/backup branch) is submit-free and still declares PRE_DISPATCH', () => {
+ok('E15e [ABSENCE] handleDeriveMasterBackup no longer exists in routes/ads.js', () => {
   const s = STRIPPED_LATE('routes/ads.js');
-  const body = namedFn(s, 'async function handleDeriveMasterBackup(');
-  assert.ok(body && body.length > 800, 'handleDeriveMasterBackup body not found');
-  assert.ok(/\.\.\.PRE_DISPATCH/.test(body), 'the derive-wait backup requeue no longer declares PRE_DISPATCH');
-  for (const t of SUBMIT_TOKENS) {
-    assert.ok(!t.test(body),
-      `handleDeriveMasterBackup now reaches ${t} — a submit on the FREE derive surface`);
-  }
-  // Recovery must route through the existing atomic claim (requeueStrandedAds
-  // -> claimAdsForRun), never a submit and never a second claim path.
-  assert.ok(/await\s+requeue\s*\(/.test(body), 'stripping erased the body — absence proves nothing');
+  assert.strictEqual(namedFn(s, 'async function handleDeriveMasterBackup('), null,
+    'handleDeriveMasterBackup returned — the in-process derive-wait backup was deleted');
 });
 
 // ═════════════════════════════════════════════════════════════════════════
@@ -1555,21 +1540,32 @@ ok('E16a [PROOF] all four REQUEUE_MARK sites use buildRequeuePipeline, not a bar
     'update this check (and the count above) if a site was legitimately added or removed');
 });
 
-ok('E13 [SCAN][MONEY] exactly ONE call site opts in to releasing a rendering row\'s digest', () => {
+ok('E13 [SCAN][MONEY] the digest-release opt-in has zero call sites, not a second one', () => {
+  // Was "exactly ONE call site" (routes/ads.js, on Stop's undispatched-tail
+  // archive — the only place this repo could PROVE, by construction, that a
+  // 'rendering' row was never dispatched: p.queue.slice(p.next), the pool
+  // cursor's own boundary). REMOVED 2026-09-07 (dormant render fallback
+  // deletion): that whole in-process pool/cursor mechanism is gone, and with
+  // it the only site that could safely make this proof. Backend no longer
+  // tracks per-ad dispatch state at all once a run is handed to adgen, so it
+  // can no longer distinguish "provably never touched" from "may already be
+  // rendering" for any 'rendering'-status row — the SAFE default (never
+  // release early; let the normal receipt-free + renderUrl-empty archive
+  // path handle it, same as any other row) is what's left, and that is
+  // exactly zero opt-in sites. The invariant this check protects — a second
+  // opt-in must never appear — still holds and is still worth pinning: it
+  // would silently reopen the submit-in-flight window (billed but receipt
+  // not yet written) that Stop's now-deleted proof used to close.
   const hits = [];
   for (const [rel, s] of STRIPPED) {
     if (rel === HELPER_REL) continue;
     const m = s.match(/allowRenderingRelease:\s*true/g);
     if (m) hits.push([rel, m.length]);
   }
-  assert.deepStrictEqual(hits, [['routes/ads.js', 1]],
-    'a second opt-in re-opens the submit-in-flight window (billed but receipt not yet written) — ' +
-    'it needs the same by-construction proof Stop\'s undispatched tail has');
-  const loop = STRIPPED.get('routes/ads.js');
-  // lastIndexOf: the first occurrence is the import destructure at the top.
-  const i = loop.lastIndexOf('buildStopUndispatchedArchiveFilter');
-  assert.ok(i > 0 && /allowRenderingRelease:\s*true/.test(loop.slice(i, i + 400)),
-    'the opt-in must sit on the undispatched-tail archive, nowhere else');
+  assert.deepStrictEqual(hits, [],
+    'a call site now opts in to releasing a rendering row\'s digest with no by-construction proof ' +
+    'behind it (the old undispatched-tail proof was deleted, not replaced) — this reopens the ' +
+    'submit-in-flight window (billed but receipt not yet written)');
 });
 
 ok('E12 the tombstone prefix cannot collide with a real digest', () => {

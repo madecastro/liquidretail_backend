@@ -1,28 +1,27 @@
 #!/usr/bin/env node
 /**
- * Offline harness for brand-led copy cascades + STATIC_BRAND_LED_COPY kill switch.
+ * Offline harness for brand-led copy + STATIC_BRAND_LED_COPY kill switch.
  * No DB, no network, no API key.
- *
- * Requires both `services/staticAdIntents` and `services/directImageRenderService`
- * under a cleared require cache so both arms of the kill switch can be exercised
- * in one process. CRITICAL: invalidate BOTH modules — `BRAND_LED_COPY` is defined
- * in staticAdIntents and destructured by directImageRenderService at module load.
- * Invalidating only one leaves the stale arm in place and the test silently
- * passes against the wrong build.
- *
- * Flag semantics (mirrors STATIC_PROMPT_FIDELITY_HARDENING):
- *   unset / anything other than exact 'false' → ON (cascades + ai_brand_led map)
- *   'false' → OFF (Director-only headline; subhead always undefined; ai_brand_led
- *             unmapped → DEFAULT_INTENT product_first_lifestyle)
  *
  * Why this harness exists:
  *
- *   B1  Flag-on maps ai_brand_led → brand_led; ai_ugc_led stays out of scope.
- *   B2  Headline cascade: director → layoutInput.copy.headline → brand.tagline.
- *   B3  Subhead cascade: director → layoutInput.copy.subheadline.
- *   B4  Whitespace-only tiers are ABSENT; product name is never a cascade source.
- *   B5  Dedupe (case-insensitive, trimmed): matching subhead is dropped; headline wins.
- *   B6  Flag-off is a COMPLETE revert of map + cascades + subhead (not partial).
+ *   B1  Flag-on ships BRAND_LED_COPY true; exact 'false' ships false.
+ *   B2  INTENTS.brand_led is the live intent: BRAND LINE core, quote off,
+ *       subhead on, rating as a scoped TRUST MARK — reachable only as an
+ *       explicit request (not in FALLBACK_ORDER).
+ *   B3  buildPrompt consumes already-cascaded headline/subhead as BRAND LINE
+ *       / SUBHEAD roles. Product name is never a copy source on this intent.
+ *   B4  Flag-off still leaves INTENTS.brand_led itself intact (the flag
+ *       only gated the deleted TEMPLATE_INTENT map + copy cascade).
+ *
+ * REMOVED (dormant render fallback deletion): every check that drove
+ * `intentForTemplate` / `buildIntentData` on
+ * `services/directImageRenderService.js` — the mint-time static-ad render
+ * entry point's template map (`ai_brand_led` → `brand_led`) and the
+ * director → layoutInput.copy → brand.tagline headline/subhead cascade.
+ * Those functions were deleted with `renderDirectImage`; adgen owns static
+ * rendering unconditionally now. Surviving coverage is the live
+ * `services/staticAdIntents.js` surface (flag, INTENTS.brand_led, buildPrompt).
  *
  * Run: node scripts/verifyBrandLedCopy.js
  */
@@ -38,204 +37,131 @@ function check(name, cond, detail) {
 const ORIGINAL_FLAG = process.env.STATIC_BRAND_LED_COPY;
 
 /**
- * Re-require directImageRenderService (+ staticAdIntents) under a specific
- * kill-switch value. `undefined` unsets the env var (default-ON path).
- * Invalidates BOTH module cache entries — see header.
+ * Re-require staticAdIntents under a specific kill-switch value.
+ * `undefined` unsets the env var (default-ON path).
  */
-function loadServices(flag) {
+function loadIntents(flag) {
   const intentsKey = require.resolve('../services/staticAdIntents');
-  const dirKey = require.resolve('../services/directImageRenderService');
   delete require.cache[intentsKey];
-  delete require.cache[dirKey];
   if (flag === undefined) delete process.env.STATIC_BRAND_LED_COPY;
   else process.env.STATIC_BRAND_LED_COPY = flag;
-  // Require direct first so it re-requires a fresh staticAdIntents and
-  // destructures the live BRAND_LED_COPY into TEMPLATE_INTENT / buildIntentData.
-  const dir = require('../services/directImageRenderService');
-  const intents = require('../services/staticAdIntents');
-  return {
-    intentForTemplate: dir.intentForTemplate,
-    buildIntentData: dir.buildIntentData,
-    BRAND_LED_COPY: intents.BRAND_LED_COPY
-  };
+  return require('../services/staticAdIntents');
 }
 
 function restoreEnv() {
   if (ORIGINAL_FLAG === undefined) delete process.env.STATIC_BRAND_LED_COPY;
   else process.env.STATIC_BRAND_LED_COPY = ORIGINAL_FLAG;
-  // Drop cached modules so a subsequent require in the same process sees
-  // the restored env (not required for exit, but keeps the harness tidy).
   try {
     delete require.cache[require.resolve('../services/staticAdIntents')];
-    delete require.cache[require.resolve('../services/directImageRenderService')];
   } catch (_) { /* ignore */ }
 }
 
-// ── Sanity: loadServices actually flips the const ───────────────────────
+const PRODUCT = {
+  desc: 'organic cotton tee',
+  look: null,
+  logoCorner: 'bottom-right'
+};
+
+// ── Sanity: loadIntents actually flips the const ────────────────────────
 {
   let on, off;
   try {
-    on = loadServices(undefined);
-    off = loadServices('false');
+    on = loadIntents(undefined);
+    off = loadIntents('false');
   } catch (err) {
-    console.error('FATAL: require(directImageRenderService) failed — not stubbing.');
+    console.error('FATAL: require(staticAdIntents) failed — not stubbing.');
     console.error(err && err.stack ? err.stack : err);
     restoreEnv();
     process.exit(2);
   }
-  check('loadServices: unset ships BRAND_LED_COPY true', on.BRAND_LED_COPY === true);
-  check('loadServices: "false" ships BRAND_LED_COPY false', off.BRAND_LED_COPY === false);
-  check('loadServices: on and off BRAND_LED_COPY differ', on.BRAND_LED_COPY !== off.BRAND_LED_COPY);
+  check('loadIntents: unset ships BRAND_LED_COPY true', on.BRAND_LED_COPY === true);
+  check('loadIntents: "false" ships BRAND_LED_COPY false', off.BRAND_LED_COPY === false);
+  check('loadIntents: on and off BRAND_LED_COPY differ', on.BRAND_LED_COPY !== off.BRAND_LED_COPY);
 }
 
 // ── FLAG ON ─────────────────────────────────────────────────────────────
 {
   let mod;
   try {
-    mod = loadServices(undefined);
+    mod = loadIntents(undefined);
   } catch (err) {
-    console.error('FATAL: require(directImageRenderService) failed on flag-on arm.');
+    console.error('FATAL: require(staticAdIntents) failed on flag-on arm.');
     console.error(err && err.stack ? err.stack : err);
     restoreEnv();
     process.exit(2);
   }
 
   check('ON: BRAND_LED_COPY is true', mod.BRAND_LED_COPY === true);
-  check("ON: intentForTemplate('ai_brand_led') === 'brand_led'",
-    mod.intentForTemplate('ai_brand_led') === 'brand_led');
-  check("ON: intentForTemplate('ai_ugc_led') === 'product_first_lifestyle' (out of scope)",
-    mod.intentForTemplate('ai_ugc_led') === 'product_first_lifestyle');
+  check('ON: INTENTS.brand_led exists', !!(mod.INTENTS && mod.INTENTS.brand_led));
+  check('ON: brand_led.core is [BRAND LINE]',
+    JSON.stringify(mod.INTENTS.brand_led.core) === JSON.stringify(['BRAND LINE']));
+  check('ON: brand_led rendersQuote is false (rating trust mark only)',
+    mod.INTENTS.brand_led.renders.rendersQuote === false);
+  check('ON: brand_led rendersSubhead is true',
+    mod.INTENTS.brand_led.renders.rendersSubhead === true);
+  check('ON: brand_led rendersRating is true',
+    mod.INTENTS.brand_led.renders.rendersRating === true);
+  check('ON: brand_led is NOT in FALLBACK_ORDER (explicit request only)',
+    !mod.FALLBACK_ORDER.includes('brand_led'));
+  check('ON: brand_led.eligible refuses a missing headline',
+    typeof mod.INTENTS.brand_led.eligible({ cta: 'SHOP NOW' }) === 'string');
+  check('ON: brand_led.eligible accepts a headline',
+    mod.INTENTS.brand_led.eligible({ headline: 'Brand line', cta: 'SHOP NOW' }) === null);
 
-  // Headline cascade
   {
-    const d = mod.buildIntentData({
-      concept: { copy: { headline: 'Director line' } },
-      layoutInput: { copy: { headline: 'Layout line' } },
-      brand: { tagline: 'Tagline here' },
-      cta: 'SHOP NOW'
+    const built = mod.buildPrompt({
+      intentKey: 'brand_led',
+      data: { headline: 'Director line', subhead: 'Director sub', cta: 'SHOP NOW' },
+      product: PRODUCT,
+      surface: 'meta_feed_1_1'
     });
-    check('ON headline tier 1: director wins', d.headline === 'Director line',
-      `got ${JSON.stringify(d.headline)}`);
-  }
-  {
-    const d = mod.buildIntentData({
-      concept: { copy: { headline: null } },
-      layoutInput: { copy: { headline: 'Layout line' } },
-      brand: { tagline: 'Tagline here' },
-      cta: 'SHOP NOW'
-    });
-    check('ON headline tier 2: layout when director null', d.headline === 'Layout line',
-      `got ${JSON.stringify(d.headline)}`);
-  }
-  {
-    const d = mod.buildIntentData({
-      concept: { copy: { headline: null } },
-      layoutInput: { copy: { headline: null } },
-      brand: { tagline: 'Tagline here' },
-      cta: 'SHOP NOW'
-    });
-    check('ON headline tier 3: brand.tagline', d.headline === 'Tagline here',
-      `got ${JSON.stringify(d.headline)}`);
-  }
-  {
-    const d = mod.buildIntentData({
-      concept: { copy: {} },
-      layoutInput: { copy: {} },
-      brand: {},
-      cta: 'SHOP NOW'
-    });
-    check('ON headline: no source → undefined', d.headline === undefined,
-      `got ${JSON.stringify(d.headline)}`);
+    check('ON buildPrompt: brand_led resolves without fallback',
+      built.resolved && built.resolved.key === 'brand_led',
+      `got ${JSON.stringify(built.resolved && built.resolved.key)}`);
+    const roles = (built.text || []).map((row) => row[0]);
+    const byRole = Object.fromEntries(built.text || []);
+    check('ON buildPrompt: BRAND LINE is the headline',
+      byRole['BRAND LINE'] === 'Director line',
+      `got ${JSON.stringify(byRole['BRAND LINE'])}`);
+    check('ON buildPrompt: SUBHEAD is the subhead',
+      byRole.SUBHEAD === 'Director sub',
+      `got ${JSON.stringify(byRole.SUBHEAD)}`);
+    check('ON buildPrompt: no CUSTOMER QUOTE role (rendersQuote false)',
+      !roles.includes('CUSTOMER QUOTE'));
+    check('ON buildPrompt: prompt still carries the brand line',
+      !!(built.prompt && built.prompt.includes('Director line')));
   }
 
-  // Subhead cascade
   {
-    const d = mod.buildIntentData({
-      concept: { copy: { headline: 'H', subheadline: 'Director sub' } },
-      layoutInput: { copy: { subheadline: 'Layout sub' } },
-      brand: {},
-      cta: 'SHOP NOW'
+    const built = mod.buildPrompt({
+      intentKey: 'brand_led',
+      data: { headline: 'Brand line', cta: 'SHOP NOW' },
+      product: PRODUCT,
+      surface: 'meta_feed_1_1'
     });
-    check('ON subhead tier 1: concept.subheadline', d.subhead === 'Director sub',
-      `got ${JSON.stringify(d.subhead)}`);
-  }
-  {
-    const d = mod.buildIntentData({
-      concept: { copy: { headline: 'H' } },
-      layoutInput: { copy: { subheadline: 'Layout sub' } },
-      brand: {},
-      cta: 'SHOP NOW'
-    });
-    check('ON subhead tier 2: layoutInput.copy.subheadline', d.subhead === 'Layout sub',
-      `got ${JSON.stringify(d.subhead)}`);
+    const roles = (built.text || []).map((row) => row[0]);
+    check('ON buildPrompt: absent subhead does not mint a SUBHEAD role',
+      !roles.includes('SUBHEAD'));
   }
 
-  // Whitespace-only headline is ABSENT (falls to next tier)
   {
-    const d = mod.buildIntentData({
-      concept: { copy: { headline: '   ' } },
-      layoutInput: { copy: { headline: 'Layout line' } },
-      brand: { tagline: 'Tagline here' },
-      cta: 'SHOP NOW'
-    });
-    check('ON whitespace-only director headline treated as absent → layout',
-      d.headline === 'Layout line', `got ${JSON.stringify(d.headline)}`);
+    const resolved = mod.resolveIntent('brand_led', { cta: 'SHOP NOW' });
+    check('ON no headline: brand_led is not delivered (eligible fails closed)',
+      resolved.key !== 'brand_led',
+      `got ${JSON.stringify(resolved.key)}`);
   }
 
-  // Dedupe: headline wins; matching subhead dropped (case/whitespace insensitive)
   {
-    const d = mod.buildIntentData({
-      concept: { copy: {} },
-      layoutInput: { copy: { subheadline: 'Tagline here' } },
-      brand: { tagline: 'Tagline here' },
-      cta: 'SHOP NOW'
+    const built = mod.buildPrompt({
+      intentKey: 'brand_led',
+      data: { headline: 'Brand line', cta: 'SHOP NOW' },
+      product: { ...PRODUCT, name: 'Some Product' },
+      surface: 'meta_feed_1_1'
     });
-    check('ON dedupe: matching subhead dropped', d.subhead === undefined,
-      `got subhead=${JSON.stringify(d.subhead)} headline=${JSON.stringify(d.headline)}`);
-    check('ON dedupe: headline from tagline survives', d.headline === 'Tagline here',
-      `got ${JSON.stringify(d.headline)}`);
-  }
-  {
-    const d = mod.buildIntentData({
-      concept: { copy: {} },
-      layoutInput: { copy: { subheadline: '  TAGLINE HERE ' } },
-      brand: { tagline: 'Tagline here' },
-      cta: 'SHOP NOW'
-    });
-    check('ON dedupe: case/whitespace-insensitive match drops subhead',
-      d.subhead === undefined,
-      `got subhead=${JSON.stringify(d.subhead)} headline=${JSON.stringify(d.headline)}`);
-    check('ON dedupe case: headline still Tagline here', d.headline === 'Tagline here',
-      `got ${JSON.stringify(d.headline)}`);
-  }
-  {
-    const d = mod.buildIntentData({
-      concept: { copy: { headline: 'Brand line' } },
-      layoutInput: { copy: { subheadline: 'Supporting line' } },
-      brand: {},
-      cta: 'SHOP NOW'
-    });
-    check('ON not deduped when genuinely different — headline',
-      d.headline === 'Brand line', `got ${JSON.stringify(d.headline)}`);
-    check('ON not deduped when genuinely different — subhead',
-      d.subhead === 'Supporting line', `got ${JSON.stringify(d.subhead)}`);
-  }
-
-  // Product name is never a cascade source
-  {
-    const d = mod.buildIntentData({
-      concept: { copy: {} },
-      layoutInput: {
-        copy: {},
-        product: { name: 'Some Product' }
-      },
-      brand: {},
-      cta: 'SHOP NOW'
-    });
-    check('ON product name never becomes headline', d.headline === undefined,
-      `got ${JSON.stringify(d.headline)}`);
-    check('ON product name never becomes subhead', d.subhead === undefined,
-      `got ${JSON.stringify(d.subhead)}`);
+    const values = (built.text || []).map((row) => row[1]);
+    check('ON product name never becomes a copy role',
+      !values.includes('Some Product'),
+      `got ${JSON.stringify(values)}`);
   }
 }
 
@@ -243,76 +169,32 @@ function restoreEnv() {
 {
   let mod;
   try {
-    mod = loadServices('false');
+    mod = loadIntents('false');
   } catch (err) {
-    console.error('FATAL: require(directImageRenderService) failed on flag-off arm.');
+    console.error('FATAL: require(staticAdIntents) failed on flag-off arm.');
     console.error(err && err.stack ? err.stack : err);
     restoreEnv();
     process.exit(2);
   }
 
   check('OFF: BRAND_LED_COPY is false', mod.BRAND_LED_COPY === false);
-  check("OFF: intentForTemplate('ai_brand_led') === 'product_first_lifestyle'",
-    mod.intentForTemplate('ai_brand_led') === 'product_first_lifestyle',
-    `got ${JSON.stringify(mod.intentForTemplate('ai_brand_led'))}`);
-
-  // Headline is Director-only — tier-2 / tier-3 yield undefined
+  // The deleted TEMPLATE_INTENT map is what the flag used to revert; the
+  // intent spec itself stays so an explicit brand_led request still works.
+  check('OFF: INTENTS.brand_led still exists (flag does not delete the intent)',
+    !!(mod.INTENTS && mod.INTENTS.brand_led));
+  check('OFF: brand_led.core is still [BRAND LINE]',
+    JSON.stringify(mod.INTENTS.brand_led.core) === JSON.stringify(['BRAND LINE']));
   {
-    const d = mod.buildIntentData({
-      concept: { copy: { headline: null } },
-      layoutInput: { copy: { headline: 'Layout line' } },
-      brand: { tagline: 'Tagline here' },
-      cta: 'SHOP NOW'
-    });
-    check('OFF headline tier-2 inputs → undefined (no layout cascade)',
-      d.headline === undefined, `got ${JSON.stringify(d.headline)}`);
-  }
-  {
-    const d = mod.buildIntentData({
-      concept: { copy: {} },
-      layoutInput: { copy: {} },
-      brand: { tagline: 'Tagline here' },
-      cta: 'SHOP NOW'
-    });
-    check('OFF headline tier-3 inputs → undefined (no tagline cascade)',
-      d.headline === undefined, `got ${JSON.stringify(d.headline)}`);
-  }
-  {
-    // Director-only still works when present
-    const d = mod.buildIntentData({
-      concept: { copy: { headline: 'Director only' } },
-      layoutInput: { copy: { headline: 'Layout line' } },
-      brand: { tagline: 'Tagline here' },
-      cta: 'SHOP NOW'
+    const built = mod.buildPrompt({
+      intentKey: 'brand_led',
+      data: { headline: 'Director only', subhead: 'Director sub', cta: 'SHOP NOW' },
+      product: PRODUCT,
+      surface: 'meta_feed_1_1'
     });
     check('OFF director headline still used when present',
-      d.headline === 'Director only', `got ${JSON.stringify(d.headline)}`);
-  }
-
-  // subhead ALWAYS undefined, including when concept.copy.subheadline is set
-  {
-    const d = mod.buildIntentData({
-      concept: { copy: { headline: 'H', subheadline: 'Director sub' } },
-      layoutInput: { copy: { subheadline: 'Layout sub' } },
-      brand: {},
-      cta: 'SHOP NOW'
-    });
-    check('OFF subhead always undefined even when concept.subheadline set',
-      d.subhead === undefined, `got ${JSON.stringify(d.subhead)}`);
-  }
-
-  // Dedupe case under flag-off: no cascade → both undefined
-  {
-    const d = mod.buildIntentData({
-      concept: { copy: {} },
-      layoutInput: { copy: { subheadline: 'Tagline here' } },
-      brand: { tagline: 'Tagline here' },
-      cta: 'SHOP NOW'
-    });
-    check('OFF dedupe case: headline undefined', d.headline === undefined,
-      `got ${JSON.stringify(d.headline)}`);
-    check('OFF dedupe case: subhead undefined', d.subhead === undefined,
-      `got ${JSON.stringify(d.subhead)}`);
+      built.resolved && built.resolved.key === 'brand_led'
+      && Object.fromEntries(built.text || [])['BRAND LINE'] === 'Director only',
+      `got ${JSON.stringify(built.resolved && built.resolved.key)}`);
   }
 }
 

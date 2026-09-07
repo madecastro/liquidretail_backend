@@ -27,9 +27,11 @@
  *      generated, fails, and the run ships NO 9:16 video at all. This is
  *      the single most important group here (B).
  *   2. HANG — the 1:1 crop and the staged 9:16 retitles keep pointing at
- *      pmax_video_9_16 after it became a derive. findSiblingMasterAd
- *      matches TRUE masters only, so they find nothing: a derivative of a
- *      derivative (group D).
+ *      pmax_video_9_16 after it became a derive. Backend used to look that
+ *      up at render time via findSiblingMasterAd (true masters only). That
+ *      lookup was deleted with the in-process render loop; adgen's renderer
+ *      owns it now. The mint-time stamp is still the planner's job (group D):
+ *      no row may derive from a non-master.
  *   3. INVALID ASSET — the shared plate is minted at 8s. Google REJECTS
  *      PMax video under 10s, so the free 9:16 is a paid-for asset that
  *      cannot be used. Nothing offline can see this; only this harness can
@@ -273,9 +275,11 @@ check('A4 [MONEY] resolvePortraitMasterFormat is DEFINED once and CALLED once',
 }
 
 // ── D. The WHOLE PMax portrait family is retargeted ────────────────────
-// findSiblingMasterAd matches TRUE masters only (no deriveFromMaster, no
-// funnelStage). Any row still pointing at pmax_video_9_16 once that row is
-// a derive will never resolve.
+// findSiblingMasterAd (deleted with the in-process render loop) used to
+// match TRUE masters only (no deriveFromMaster, no funnelStage) at render
+// time. That lookup moved to adgen's renderer. Backend still stamps
+// deriveFromMaster at mint; any row still pointing at pmax_video_9_16
+// once that row is a derive is a derivative of a derivative.
 {
   const p = shared(() => plan(MIXED));
   const trueMasters = new Set(p.filter((r) => !r.deriveFromMaster)
@@ -466,77 +470,27 @@ check('A4 [MONEY] resolvePortraitMasterFormat is DEFINED once and CALLED once',
     (pf.resolvePreset('google_video').videoFormats || []).length === 2);
 }
 
-// ── H. [MONEY] the derive render path still cannot submit ──────────────
+// ── H. REMOVED (dormant render fallback deletion) ──────────────────────
+// H0 extracted renderDeriveOnlyVideoAd; H1b/H2/H3/H3a extracted
+// findSiblingMasterAd from routes/ads.js; H4 pinned that the in-process
+// render loop reads the mint-time STAMP. findSiblingMasterAd was the
+// render-time sibling lookup and is deleted with the in-process render
+// loop (comment at routes/ads.js ~1834 confirms). The money invariant
+// "true masters only, platformFormat bound once" now lives in adgen's
+// renderer. Backend still stamps deriveFromMaster at mint via
+// resolvePortraitMasterFormat / resolveDeriveFromMaster — pinned in this
+// file's C3 / D-group / I-group. Do not silently drop this section
+// without that explanation: the lookup moved, the mint-time stamp did not.
 {
   const adsSrc = fs.readFileSync(path.join(ROOT, 'routes/ads.js'), 'utf8');
-  const start = adsSrc.indexOf('async function renderDeriveOnlyVideoAd');
-  let body = null;
-  if (start !== -1) {
-    const open = adsSrc.indexOf('{', adsSrc.indexOf(')', start));
-    let depth = 0;
-    for (let i = open; i < adsSrc.length; i++) {
-      if (adsSrc[i] === '{') depth++;
-      else if (adsSrc[i] === '}') { depth--; if (depth === 0) { body = adsSrc.slice(open, i + 1); break; } }
-    }
-  }
-  check('H0 renderDeriveOnlyVideoAd body extracted (not the param list)',
-    !!body && body.length > 2000 && /findSiblingMasterAd\s*\(/.test(body),
-    `extracted ${body ? body.length : 0} chars`);
-  if (body) {
-    const code = body
-      .replace(/\/\*[\s\S]*?\*\//g, '')
-      .replace(/(^|[^:])\/\/.*$/gm, '$1');
-    check('H1 [MONEY] ZERO billable submits reachable for a derive row',
-      !/veoGenerateForAd\s*\(/.test(code)
-        && !/atlasVideoService/.test(code)
-        && !/generateForAd\s*\(/.test(code),
-      'the shared 9:16 makes FIVE more rows per mixed run take this path; a '
-      + 'submit here is now a 5x hidden charge, not 1x');
-    check('H1a comment-stripping left real code to assert against',
-      /findSiblingMasterAd\s*\(/.test(code) && code.length > 1500);
-  }
-  // findSiblingMasterAd must keep matching TRUE masters only, and must NOT
-  // have learned to roam across formats — a cross-format search would let a
-  // PMax-only run silently adopt an old Meta plate instead of billing.
-  const sibStart = adsSrc.indexOf('async function findSiblingMasterAd');
-  let sibBody = null;
-  if (sibStart !== -1) {
-    const open = adsSrc.indexOf('{', adsSrc.indexOf(')', sibStart));
-    let depth = 0;
-    for (let i = open; i < adsSrc.length; i++) {
-      if (adsSrc[i] === '{') depth++;
-      else if (adsSrc[i] === '}') { depth--; if (depth === 0) { sibBody = adsSrc.slice(open, i + 1); break; } }
-    }
-  }
-  check('H1b findSiblingMasterAd body extracted (not the param list)',
-    !!sibBody && /platformFormat/.test(sibBody),
-    `extracted ${sibBody ? sibBody.length : 0} chars`);
-  // H2 used to regex the WHOLE routes/ads.js for these substrings, which is
-  // individually vacuous: it passes on any occurrence anywhere in a
-  // 4000-line file, so weakening the real clause while some unrelated
-  // occurrence existed would not register. Scoped to the extracted function
-  // body below (adversarial-review finding, folded in).
-  check('H2 [MONEY] findSiblingMasterAd itself excludes derives and funnel rows',
-    !!sibBody
-      && /deriveFromMaster: null/.test(sibBody)
-      && /funnelStage: null/.test(sibBody),
-    'a master lookup that can return a derive or a funnel retitle hands the '
-    + 'waiter a row that holds no plate of its own');
-  check('H3 [MONEY] findSiblingMasterAd binds platformFormat EXACTLY ONCE',
-    !!sibBody && (sibBody.match(/platformFormat/g) || []).length === 1,
-    'a second platformFormat binding means a cross-format / fallback lookup. '
-    + 'That would let a later PMax-only 9:16 adopt an OLDER Meta plate from a '
-    + 'previous run and skip its Omni submit — the run silently ships a plate '
-    + 'the operator never generated. Sharing is decided at MINT, per run; the '
-    + 'renderer must never go looking for a substitute. '
-    + `found ${sibBody ? (sibBody.match(/platformFormat/g) || []).length : 'no body'}`);
-  check('H3a and it still takes the wanted format as its parameter',
-    !!sibBody && /platformFormat: masterPlatformFormat/.test(sibBody));
-  check('H4 the render loop reads the STAMP, not a re-derived condition',
-    /const deriveFromFmt = resolveDeriveFromMaster\(ad\)/.test(adsSrc)
-      && !/resolvePortraitMasterFormat/.test(adsSrc),
-    'the renderer must never re-decide sharing; it reads what the mint wrote');
+  check('H-abs [ABSENCE] routes/ads.js no longer defines renderDeriveOnlyVideoAd',
+    !/async function renderDeriveOnlyVideoAd\s*\(/.test(adsSrc),
+    'the in-process derive renderer came back — restore the H0/H1 money pins');
+  check('H-abs2 [ABSENCE] routes/ads.js no longer defines findSiblingMasterAd',
+    !/async function findSiblingMasterAd\s*\(/.test(adsSrc),
+    'the in-process sibling lookup came back — that lookup moved to adgen');
 }
+
 
 // ── I. Regenerate stays safe and names the right master ────────────────
 {

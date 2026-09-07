@@ -25,19 +25,18 @@
  *   B. mayRetryAfterFailure structurally refuses to resubmit for the
  *      unsettled shape (policyRetryable is undefined) — the fix cannot
  *      reopen the double-charge the charge-point receipt guards against.
- *   C. resolveRecoveredVideoFailureCharge (bootRecoveryService) — the
- *      tri-state charge-confirmation decision for a video prediction
- *      recovered as FAILED: charged:false → zero the estimate;
- *      charged:true + a real settled price → correct the estimate to it;
- *      charged:null (unknown) → leave the ledger untouched.
+ *   C. REMOVED 2026-09-07 — resolveRecoveredVideoFailureCharge lived on
+ *      bootRecoveryService's video-receipt arm, now deleted. Video-receipt
+ *      recovery is adgen's job. Backend still recovers static image receipts.
  *   D. models/CostLog.js — campaignRunId is a String path (matches
  *      Ad.campaignRunIds / CampaignRun.runId), not an ObjectId ref.
- *   E. campaignRunId actually reaches the charge-point write on both the
- *      video and static-image paths (source-scan + revert-proof).
- *   F. routes/ads.js's video catch block checks err.unsettledAtTimeout
- *      BEFORE the generic failure write, and that branch never sets
- *      status:'failed' — the entire point is to leave the receipt
- *      discoverable to bootRecoveryService.
+ *   E. campaignRunId actually reaches the video charge-point write
+ *      (atlasVideoService + videoRouter). E3 (ads.js veoGenerateForAd) and
+ *      E5 (directImageRenderService charge-point meta) lived on the deleted
+ *      in-process renderer and are gone.
+ *   F. REMOVED 2026-09-07 — routes/ads.js renderOneInner video catch is
+ *      gone. Timeout-outcome handling is atlasVideoService.pollPrediction
+ *      (resolveTimeoutOutcome, groups A/B).
  *
  * No DB, no network, no API key. Run: node scripts/verifyVideoTimeoutReconcile.js
  *
@@ -50,16 +49,10 @@
  *     of `null` → B1/A5 fail (a genuinely unknown outcome would be asserted
  *     as a confirmed non-charge, which is the exact "guessing" rule violates
  *     CLAUDE.md §2 forbids).
- *  2. In routes/ads.js's video catch block, delete the
- *     `if (err.unsettledAtTimeout) { ... return; }` branch (or move it AFTER
- *     the generic failure write) → F1/F2 fail, because every timeout would
- *     go back to being marked 'failed' and the receipt would stop being
- *     discoverable to bootRecoveryService.
- *  3. In bootRecoveryService.js, hardcode
- *     `resolveRecoveredVideoFailureCharge` to always return
- *     `{confirmedCharge:true, reconcile:null}` → C2 fails (a confirmed-unbilled
- *     failure would permanently keep the submit-time estimate instead of
- *     being zeroed).
+ *  2. (former F-group: ads.js video catch) — deleted with renderOneInner.
+ *     Timeout handling is now atlasVideoService.resolveTimeoutOutcome (A/B).
+ *  3. (former C-group: resolveRecoveredVideoFailureCharge) — deleted with
+ *     the video-receipt arm of bootRecoveryService. Adgen owns that.
  * ─────────────────────────────────────────────────────────────────────────
  */
 
@@ -217,37 +210,16 @@ console.log('A. resolveTimeoutOutcome (atlasVideoService)');
   });
 }
 
-// ── C. resolveRecoveredVideoFailureCharge — bootRecoveryService ─────────
-console.log('\nC. resolveRecoveredVideoFailureCharge (bootRecoveryService)');
+// ── C. resolveRecoveredVideoFailureCharge — ABSENCE (video arm deleted) ─
+console.log('\nC. resolveRecoveredVideoFailureCharge is gone (video-receipt recovery is adgen)');
 {
-  const { resolveRecoveredVideoFailureCharge } = require('../services/bootRecoveryService');
-
-  check('C1 exported and is a function', () => {
-    assert.strictEqual(typeof resolveRecoveredVideoFailureCharge, 'function');
+  const rec = require('../services/bootRecoveryService');
+  check('C1 resolveRecoveredVideoFailureCharge is no longer exported', () => {
+    assert.strictEqual(typeof rec.resolveRecoveredVideoFailureCharge, 'undefined');
   });
-
-  check('C2 confirmed NOT charged (charged:false) → zero the ledger estimate', () => {
-    const r = resolveRecoveredVideoFailureCharge({ charged: false, priceUsd: 0, predictionId: 'p1' });
-    assert.strictEqual(r.confirmedCharge, false);
-    assert.deepStrictEqual(r.reconcile, { costUsd: 0 });
-  });
-
-  check('C3 confirmed CHARGED with a real settled price → correct estimate to the real figure', () => {
-    const r = resolveRecoveredVideoFailureCharge({ charged: true, priceUsd: 0.9, predictionId: 'p1' });
-    assert.strictEqual(r.confirmedCharge, true);
-    assert.deepStrictEqual(r.reconcile, { costUsd: 0.9 });
-  });
-
-  check('C4 UNKNOWN (charged:null) → leave the ledger untouched, never guess', () => {
-    const r = resolveRecoveredVideoFailureCharge({ charged: null, priceUsd: null, predictionId: 'p1' });
-    assert.strictEqual(r.confirmedCharge, false); // renderError.charged is a plain Boolean field — cannot be tri-state
-    assert.strictEqual(r.reconcile, null, 'an unknown charge state must not trigger any CostLog write');
-  });
-
-  check('C5 charged:true but no usable priceUsd → confirmedCharge true, no reconcile (nothing to correct to)', () => {
-    const r = resolveRecoveredVideoFailureCharge({ charged: true, priceUsd: null, predictionId: 'p1' });
-    assert.strictEqual(r.confirmedCharge, true);
-    assert.strictEqual(r.reconcile, null);
+  check('C2 bootRecoveryService source no longer defines the video-charge helper', () => {
+    const bootSrc = fs.readFileSync(BOOT_PATH, 'utf8');
+    assert.ok(!/function resolveRecoveredVideoFailureCharge/.test(bootSrc));
   });
 }
 
@@ -291,10 +263,10 @@ console.log('\nE. campaignRunId threading to the charge-point CostLog writes');
     assert.ok(/campaignRunId:\s*campaignRunId \|\| null/.test(block), 'charge-point cost record does not include campaignRunId');
   });
 
-  check('E3 routes/ads.js passes campaignRunId: run.runId into veoGenerateForAd', () => {
+  check('E3 routes/ads.js no longer calls veoGenerateForAd (renderOneInner gone; adgen submits)', () => {
     assert.ok(
-      /veoGenerateForAd\(\{\s*ad,\s*storyboard,\s*campaignRunId:\s*run\.runId\s*\}\)/.test(adsSrc),
-      'the master-video call site does not thread run.runId through as campaignRunId'
+      !/veoGenerateForAd\s*\(/.test(adsSrc),
+      'a resurrected in-process veoGenerateForAd call site would re-open mint-time video submit on this backend'
     );
   });
 
@@ -305,12 +277,9 @@ console.log('\nE. campaignRunId threading to the charge-point CostLog writes');
     assert.ok(/campaignRunId/.test(block), 'videoRouter.generateForAd does not accept/forward campaignRunId');
   });
 
-  check('E5 directImageRenderService includes campaignRunId + campaignId in the static-image charge-point meta', () => {
-    const i = directSrc.indexOf("stage: 'direct_image'");
-    assert.ok(i >= 0, 'static-image meta object not found');
-    const block = directSrc.slice(i, i + 900);
-    assert.ok(/campaignRunId:\s*campaignRunId \|\| null/.test(block), 'static-image meta is missing campaignRunId');
-    assert.ok(/campaignId:\s*campaignId \|\| null/.test(block), 'static-image meta is missing campaignId');
+  check('E5 backend directImageRenderService no longer has a mint-time charge-point (renderDirectImage gone)', () => {
+    assert.ok(!/stage:\s*'direct_image'/.test(directSrc),
+      'static-image charge-point meta must not reappear here — adgen owns mint-time static submit');
   });
 
   console.log('\n  [REVERT-PROOF]');
@@ -328,43 +297,19 @@ console.log('\nE. campaignRunId threading to the charge-point CostLog writes');
   });
 }
 
-// ── F. routes/ads.js — unsettled-at-timeout never becomes status:'failed' ─
-console.log('\nF. routes/ads.js video catch block ordering');
+// ── F. routes/ads.js video catch — ABSENCE (renderOneInner gone) ──────
+console.log('\nF. routes/ads.js no longer has an in-process video catch (timeout lives in atlasVideoService.pollPrediction)');
 {
   const adsSrc = fs.readFileSync(ADS_PATH, 'utf8');
-  const catchIdx = adsSrc.indexOf('} catch (err) {\n      console.error(`❌ veoReference[ad=${adId}]:`');
-  assert.ok(catchIdx >= 0, 'video catch block not found — has it moved or been renamed?');
-  const block = adsSrc.slice(catchIdx, catchIdx + 5000);
-  const unsettledIdx = block.indexOf('err.unsettledAtTimeout');
-  const genericFailIdx = block.indexOf("title:  'Video generation failed'");
-
-  check('F1 the catch block checks err.unsettledAtTimeout', () => {
-    assert.ok(unsettledIdx >= 0);
+  check('F1 ads.js no longer has the renderOneInner veoReference catch', () => {
+    assert.ok(!/console\.error\(`❌ veoReference\[ad=\$\{adId\}\]:`/.test(adsSrc));
   });
-  check('F2 the unsettledAtTimeout branch is checked BEFORE the generic failure write', () => {
-    assert.ok(genericFailIdx >= 0);
-    assert.ok(unsettledIdx < genericFailIdx, 'generic failure write appears before (or the unsettled branch is missing) — a timeout would always be marked failed');
+  check('F2 ads.js no longer branches on err.unsettledAtTimeout (pollPrediction owns that)', () => {
+    assert.ok(!/err\.unsettledAtTimeout/.test(adsSrc));
   });
-  check('F3 the unsettledAtTimeout branch does not set status:\'failed\' on the Ad', () => {
-    const branchEnd = block.indexOf('return;', unsettledIdx);
-    const branch = block.slice(unsettledIdx, branchEnd > 0 ? branchEnd : unsettledIdx + 1200);
-    assert.ok(!/status:\s*'failed'/.test(branch), 'unsettled branch sets status:\'failed\' — this would sever the receipt from bootRecoveryService');
-  });
-  check('F4 the unsettledAtTimeout branch increments CampaignRun.skipped, not failed', () => {
-    const branchEnd = block.indexOf('return;', unsettledIdx);
-    const branch = block.slice(unsettledIdx, branchEnd > 0 ? branchEnd : unsettledIdx + 1200);
-    assert.ok(/\$inc:\s*\{\s*skipped:\s*1\s*\}/.test(branch));
-    assert.ok(!/\$inc:\s*\{\s*failed:\s*1\s*\}/.test(branch));
-  });
-
-  console.log('\n  [REVERT-PROOF]');
-  check('F5 [REVERT-PROOF] deleting the unsettled branch is detected', () => {
-    // Simulate the branch being removed by truncating the check window used
-    // above — re-derive genericFailIdx relative to a version of the block
-    // with the branch spliced out, and confirm F2-style logic would then fail.
-    const withoutBranch = block.slice(0, unsettledIdx) + block.slice(block.indexOf('return;', unsettledIdx) + 'return;'.length);
-    const wouldStillFindUnsettled = withoutBranch.indexOf('err.unsettledAtTimeout') >= 0;
-    assert.ok(!wouldStillFindUnsettled, 'branch removal was not actually detected by the F1-style scan — mutation harness is unreliable');
+  check('F3 atlasVideoService still sets err.unsettledAtTimeout on the live poll path', () => {
+    const vidSrc = fs.readFileSync(VID_PATH, 'utf8');
+    assert.ok(/err\.unsettledAtTimeout\s*=\s*true/.test(vidSrc));
   });
 }
 

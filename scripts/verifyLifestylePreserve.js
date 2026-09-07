@@ -29,6 +29,18 @@
  * Revert-prove: each behaviour has a named check that fails when that
  * behaviour is removed. See the REVERT-PROVE table printed at the end.
  *
+ * REMOVED (dormant render fallback deletion): C-group source pins of
+ * `renderService.renderDirectImage` / `adRegenerateService.buildDirectImageArgsFromAd`
+ * / `directImageRenderService.buildQcRetryArgs` threading `variantKind` into
+ * the deleted mint-time static renderer, plus the CALLERS / B1 production
+ * chokepoint pins that required `intents.buildPrompt` to live inside
+ * `renderDirectImage`. Adgen owns that renderer now. Kept: every S-group
+ * `staticAdIntents.buildPrompt` / `shouldPreserveScene` check (the module is
+ * still live; adgen uses it), the C1 behavioural gate that `variantKind:'ugc'`
+ * reaches `shouldPreserveScene` via that live helper, the B1 behavioural
+ * `seedAspectFromDims` → `buildPrompt` native/extend path, and the entire
+ * V-group (veoPromptBuilder / atlasVideoService lifestyle directives).
+ *
  * Run: node scripts/verifyLifestylePreserve.js
  */
 'use strict';
@@ -1231,219 +1243,44 @@ console.log('\n=== VIDEO lifestyle directives ===\n');
 }
 
 // ═══════════════════════════════════════════════════════════════════════
-// BLOCKER 3 — variantKind reaches the prompt builder on EVERY caller
-// Behavioural: pure arg builders → shouldPreserveScene / buildPrompt.
-// Complete caller list of renderDirectImage (production):
-//   1. renderService.renderStage (first render) — selects Ad.variantKind,
-//      threads into args, spreads into renderDirectImage
-//   2. adRegenerateService.runImage (paid regen) — buildDirectImageArgsFromAd
-//   3. directImageRenderService QC re-entry (paid retry) — buildQcRetryArgs
-//
-// C1 is NOT a tautology over a literal we just wrote — it asserts the REAL
-// renderService source selects and threads adDoc?.variantKind.
-// C2 degrades gracefully when adRegenerateService cannot load (incomplete
-// worktree / missing deps) with a loud named SKIP — non-zero only on real fails.
+// C — variantKind still reaches the LIVE preserve gate (staticAdIntents).
+// The production fan-in used to be renderService.renderDirectImage /
+// adRegenerateService.buildDirectImageArgsFromAd /
+// directImageRenderService.buildQcRetryArgs. Those callers were deleted
+// with the dormant in-process renderer (adgen owns mint-time static
+// render). What this backend still owns is the helper: shouldPreserveScene
+// / buildPrompt must honour variantKind:'ugc' even on a packshot seed.
+// C2/C3/C* wiring checks of the deleted renderer are gone; C1 behavioural
+// gate stays. Absence pins catch a resurrection of renderDirectImage here.
 // ═══════════════════════════════════════════════════════════════════════
-console.log('\n=== BLOCKER 3: variantKind on all renderDirectImage callers ===\n');
+console.log('\n=== C: variantKind reaches the live staticAdIntents preserve gate ===\n');
 {
   const intentsOn = loadIntents({ preserve: 'true', hardening: 'true' });
 
-  // ── Caller 1 — renderService first-render path (SOURCE-level, not tautology) ──
   {
-    const renderSrc = fs.readFileSync(
-      path.join(REPO, 'services/renderService.js'), 'utf8'
-    );
-    // Ad.findById(...).select(...) must include variantKind
-    check(
-      'C1 renderService selects variantKind from Ad',
-      /\.select\(\s*['`][^'`]*\bvariantKind\b[^'`]*['`]/.test(renderSrc),
-      'Ad.findById().select must include variantKind'
-    );
-    // Args object must thread adDoc?.variantKind (the real first-render path)
-    check(
-      'C1 renderService threads adDoc?.variantKind into renderDirectImage args',
-      /variantKind\s*:\s*adDoc\s*\?\.\s*variantKind/.test(renderSrc)
-    );
-    // The call site spreads args into renderDirectImage
-    check(
-      'C1 renderService spreads args into renderDirectImage(',
-      /renderDirectImage\s*\(\s*\{\s*\.\.\.\s*args/.test(renderSrc)
-    );
-    // REVERT-PROVE: if the thread line used only req.variantKind (dropping
-    // adDoc), the adDoc?.variantKind pattern would fail above. Also prove
-    // behavioural gate still needs the value.
-    {
-      const built = intentsOn.buildPrompt({
-        intentKey: 'product_first_lifestyle',
-        data: DATA, product: PRODUCT, surface: SURFACE,
-        seedStyle: 'packshot',
-        variantKind: 'ugc'
-      });
-      check('C1 ugc variantKind reaches preserve gate (ugc+packshot seed)',
-        built.preserveScene === true &&
-        built.prompt.includes('SCENE PRESERVE — HIGHEST PRIORITY'));
-    }
-    {
-      const dropped = intentsOn.buildPrompt({
-        intentKey: 'product_first_lifestyle',
-        data: DATA, product: PRODUCT, surface: SURFACE,
-        seedStyle: 'packshot',
-        variantKind: null
-      });
-      check('C1 REVERT-PROVE: dropping variantKind kills ugc preserve on packshot seed',
-        dropped.preserveScene === false);
-    }
-    // Proof C1 can fail: a synthetic source WITHOUT the thread must not match
-    const fakeMissing = 'const args = { template, platformFormat }; // no variantKind';
-    check(
-      'C1 REVERT-PROVE: synthetic missing thread fails adDoc?.variantKind pattern',
-      !/variantKind\s*:\s*adDoc\s*\?\.\s*variantKind/.test(fakeMissing)
-    );
+    const built = intentsOn.buildPrompt({
+      intentKey: 'product_first_lifestyle',
+      data: DATA, product: PRODUCT, surface: SURFACE,
+      seedStyle: 'packshot',
+      variantKind: 'ugc'
+    });
+    check('C1 ugc variantKind reaches preserve gate (ugc+packshot seed)',
+      built.preserveScene === true &&
+      built.prompt.includes('SCENE PRESERVE — HIGHEST PRIORITY'));
   }
-
-  // ── Caller 2 — adRegenerateService paid regen (graceful skip) ──
   {
-    let regen = null;
-    let regenLoadErr = null;
-    try {
-      regen = require('../services/adRegenerateService');
-    } catch (e) {
-      regenLoadErr = e;
-    }
-    if (!regen || typeof regen.buildDirectImageArgsFromAd !== 'function') {
-      const reason = regenLoadErr
-        ? (regenLoadErr.message || String(regenLoadErr))
-        : 'buildDirectImageArgsFromAd not exported';
-      console.log(
-        `SKIP C2 adRegenerateService unavailable (incomplete worktree / missing dep): ${reason}`
-      );
-      // Named skip — does NOT count as pass or fail. Suite stays green when
-      // only this heavy require is broken.
-    } else {
-      const fakeAd = {
-        _id: 'aaaaaaaaaaaaaaaaaaaaaaaa',
-        layoutInputArtifactId: 'bbbbbbbbbbbbbbbbbbbbbbbb',
-        aspectRatio: '1:1',
-        mediaId: 'cccccccccccccccccccccccc',
-        productId: 'dddddddddddddddddddddddd',
-        brandId: 'eeeeeeeeeeeeeeeeeeeeeeee',
-        campaignId: 'ffffffffffffffffffffffff',
-        campaignRunIds: ['run_1'],
-        conceptArtifactId: null,
-        conceptId: null,
-        template: 'ai_product_first_lifestyle',
-        platformFormat: 'meta_feed_1_1',
-        variantKind: 'ugc'
-      };
-      const regenArgs = regen.buildDirectImageArgsFromAd(fakeAd, {
-        adId: fakeAd._id,
-        referenceMediaIds: [fakeAd.mediaId],
-        referenceSource: 'operator',
-        prompt: null,
-        promptOverride: null
-      });
-      check('C2 adRegenerateService args include variantKind=ugc',
-        regenArgs.variantKind === 'ugc');
-      {
-        const built = intentsOn.buildPrompt({
-          intentKey: 'product_first_lifestyle',
-          data: DATA, product: PRODUCT, surface: SURFACE,
-          seedStyle: 'packshot',
-          variantKind: regenArgs.variantKind
-        });
-        check('C2 regen variantKind reaches preserve gate',
-          built.preserveScene === true);
-      }
-      // Revert-prove: omit variantKind from a mutated builder result
-      {
-        const { variantKind: _drop, ...without } = regenArgs;
-        void _drop;
-        check('C2 REVERT-PROVE: args without variantKind field',
-          !Object.prototype.hasOwnProperty.call(without, 'variantKind'));
-        const built = intentsOn.buildPrompt({
-          intentKey: 'product_first_lifestyle',
-          data: DATA, product: PRODUCT, surface: SURFACE,
-          seedStyle: 'packshot',
-          variantKind: without.variantKind // undefined
-        });
-        check('C2 REVERT-PROVE: dropped variantKind → no preserve on packshot seed',
-          built.preserveScene === false);
-      }
-    }
+    const dropped = intentsOn.buildPrompt({
+      intentKey: 'product_first_lifestyle',
+      data: DATA, product: PRODUCT, surface: SURFACE,
+      seedStyle: 'packshot',
+      variantKind: null
+    });
+    check('C1 REVERT-PROVE: dropping variantKind kills ugc preserve on packshot seed',
+      dropped.preserveScene === false);
   }
+  check('C1 shouldPreserveScene({variantKind:ugc}) is true when flag on',
+    intentsOn.shouldPreserveScene({ variantKind: 'ugc' }) === true);
 
-  // ── Caller 3 — vision QC corrective re-entry (spread original args) ──
-  {
-    let direct = null;
-    let directLoadErr = null;
-    try {
-      direct = require('../services/directImageRenderService');
-    } catch (e) {
-      directLoadErr = e;
-    }
-    if (!direct || typeof direct.buildQcRetryArgs !== 'function') {
-      const reason = directLoadErr
-        ? (directLoadErr.message || String(directLoadErr))
-        : 'buildQcRetryArgs not exported';
-      console.log(
-        `SKIP C3 directImageRenderService unavailable: ${reason}`
-      );
-    } else {
-      const originalCall = {
-        layoutInputArtifactId: 'bbbbbbbbbbbbbbbbbbbbbbbb',
-        aspectRatio: '1:1',
-        mediaId: 'cccccccccccccccccccccccc',
-        productId: 'dddddddddddddddddddddddd',
-        brandId: 'eeeeeeeeeeeeeeeeeeeeeeee',
-        adId: 'aaaaaaaaaaaaaaaaaaaaaaaa',
-        template: 'ai_product_first_lifestyle',
-        platformFormat: 'meta_feed_1_1',
-        variantKind: 'ugc',
-        referenceMediaIds: ['cccccccccccccccccccccccc'],
-        operatorPrompt: null,
-        rawPromptOverride: null
-      };
-      const qcArgs = direct.buildQcRetryArgs(originalCall, {
-        correctiveNote: 'fix the safe box',
-        overrideText: null
-      });
-      check('C3 QC retry spreads variantKind=ugc from original call',
-        qcArgs.variantKind === 'ugc');
-      check('C3 QC retry sets skipVisionQc true',
-        qcArgs.skipVisionQc === true);
-      {
-        const built = intentsOn.buildPrompt({
-          intentKey: 'product_first_lifestyle',
-          data: DATA, product: PRODUCT, surface: SURFACE,
-          seedStyle: 'packshot',
-          variantKind: qcArgs.variantKind
-        });
-        check('C3 QC retry variantKind reaches preserve gate',
-          built.preserveScene === true);
-      }
-      // Revert-prove: buildQcRetryArgs from an original that omitted variantKind
-      {
-        const { variantKind: _d, ...noVk } = originalCall;
-        void _d;
-        const broken = direct.buildQcRetryArgs(noVk, {
-          correctiveNote: 'fix',
-          overrideText: null
-        });
-        check('C3 REVERT-PROVE: original without variantKind → retry also lacks it',
-          broken.variantKind == null);
-        const built = intentsOn.buildPrompt({
-          intentKey: 'product_first_lifestyle',
-          data: DATA, product: PRODUCT, surface: SURFACE,
-          seedStyle: 'packshot',
-          variantKind: broken.variantKind
-        });
-        check('C3 REVERT-PROVE: missing variantKind on QC retry → no preserve',
-          built.preserveScene === false);
-      }
-    }
-  }
-
-  // Caller sweep: assert renderService threads the field (not mere call count)
   {
     const renderSrc = fs.readFileSync(
       path.join(REPO, 'services/renderService.js'), 'utf8'
@@ -1451,51 +1288,32 @@ console.log('\n=== BLOCKER 3: variantKind on all renderDirectImage callers ===\n
     const directSrc = fs.readFileSync(
       path.join(REPO, 'services/directImageRenderService.js'), 'utf8'
     );
-    // renderService must have at least one renderDirectImage( and the thread
-    const renderCalls = (renderSrc.match(/renderDirectImage\s*\(/g) || []).length;
-    check('C* renderService has renderDirectImage( call',
-      renderCalls >= 1, `count=${renderCalls}`);
-    check('C* renderService call site is preceded by variantKind thread in file',
-      /variantKind\s*:\s*adDoc\s*\?\.\s*variantKind/.test(renderSrc) &&
-      renderCalls >= 1);
-    // directImageRenderService has definition + QC re-call
-    const directCalls = (directSrc.match(/renderDirectImage\s*\(/g) || []).length;
-    check('C* directImageRenderService has renderDirectImage( sites',
-      directCalls >= 1, `count=${directCalls}`);
-    console.log(
-      `  renderDirectImage sites: renderService=${renderCalls}, directImageRenderService=${directCalls}`
-    );
+    check('C* backend renderService no longer calls renderDirectImage (adgen owns mint-time static)',
+      (renderSrc.match(/renderDirectImage\s*\(/g) || []).length === 0);
+    check('C* backend directImageRenderService no longer defines renderDirectImage',
+      (directSrc.match(/function\s+renderDirectImage\s*\(/g) || []).length === 0);
   }
 }
 
 // ═══════════════════════════════════════════════════════════════════════
-// BLOCKER 1 (R4) — 'native' reachable via REAL production path
-// Production computes seedAspect from Media.width/height inside
-// renderDirectImage — not a hand-passed seedAspect:'1:1' harness arg.
+// BLOCKER 1 (R4) — 'native' reachable via the LIVE helper, not a
+// hand-passed seedAspect:'1:1' harness arg. The production chokepoint
+// used to be renderDirectImage computing seedAspect from Media dims;
+// that function is gone from this backend (adgen owns it). What stays
+// is seedAspectFromDims itself on staticAdIntents, which adgen still
+// calls. Source pins of Media.select / intents.buildPrompt inside
+// backend directImageRenderService are now absence pins.
 // ═══════════════════════════════════════════════════════════════════════
-console.log('\n=== BLOCKER 1 R4: seedAspect production path (native arm live) ===\n');
+console.log('\n=== BLOCKER 1 R4: seedAspect helper path (native arm live) ===\n');
 {
   const mod = loadIntents({ preserve: 'true', hardening: 'true', pmaxNotes: 'false' });
   const directSrc = fs.readFileSync(
     path.join(REPO, 'services/directImageRenderService.js'), 'utf8'
   );
 
-  // Source: Media select loads width + height
   check(
-    'B1 Media.select includes width and height',
-    /\.select\(\s*['`][^'`]*\bwidth\b[^'`]*\bheight\b[^'`]*['`]/.test(directSrc)
-    || /\.select\(\s*['`][^'`]*\bheight\b[^'`]*\bwidth\b[^'`]*['`]/.test(directSrc),
-    'Media.findById().select must include width and height'
-  );
-  // Source: seedAspectFromDims called from media dims
-  check(
-    'B1 production calls seedAspectFromDims(media?.width, media?.height)',
-    /seedAspectFromDims\s*\(\s*media\s*\?\.\s*width\s*,\s*media\s*\?\.\s*height\s*\)/.test(directSrc)
-  );
-  // Source: seedAspect threaded into buildPrompt
-  check(
-    'B1 production threads seedAspect into intents.buildPrompt',
-    /intents\.buildPrompt\s*\(\s*\{[\s\S]{0,800}\bseedAspect\b/.test(directSrc)
+    'B1 backend directImageRenderService no longer is the mint-time buildPrompt chokepoint',
+    !/intents\.buildPrompt\s*\(/.test(directSrc)
   );
   check(
     'B1 seedAspectFromDims is exported',
@@ -1600,13 +1418,6 @@ console.log('\n=== BLOCKER 1 R4: seedAspect production path (native arm live) ==
       r.aspectTreatment === 'extend');
   }
 
-  // Source REVERT-PROVE: synthetic source without width fails select pattern
-  {
-    const fake = "Media.findById(mediaId).select('fileUrl classification technicalInsights').lean()";
-    const pattern = /\.select\(\s*['`][^'`]*\bwidth\b[^'`]*\bheight\b[^'`]*['`]/;
-    check('B1 REVERT-PROVE: select without width/height fails pattern',
-      !pattern.test(fake));
-  }
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -1916,7 +1727,9 @@ console.log('\n=== buildPrompt caller enumeration (staticAdIntents) ===\n');
       const hasBuildPromptCall =
         /\.buildPrompt\s*\(/.test(src) ||
         (label === 'scripts' && /(?:^|[^\w.])buildPrompt\s*\(/.test(src) && /staticAdIntents/.test(src));
-      // services/directImageRenderService is the production chokepoint
+      // Mint-time static render used to be services/directImageRenderService.
+      // That function is gone from this backend; any remaining buildPrompt
+      // call here is a harness or a leftover, not production.
       const isProd = f === 'directImageRenderService.js' && /intents\.buildPrompt\s*\(/.test(src);
       if (!hasBuildPromptCall && !isProd) continue;
       // Skip pure re-export / require-only files that never call buildPrompt
@@ -1936,13 +1749,12 @@ console.log('\n=== buildPrompt caller enumeration (staticAdIntents) ===\n');
   scanDir(servicesDir, 'services');
   scanDir(scriptsDir, 'scripts');
 
-  // Hard pin: the ONLY production caller must be directImageRenderService
+  // Absence pin: backend no longer has a mint-time buildPrompt production
+  // caller. Adgen owns renderDirectImage. Harness/test callers are fine.
   const prodCallers = callers.filter((c) => c.production);
-  check('CALLERS only production buildPrompt site is directImageRenderService',
-    prodCallers.length === 1 && /directImageRenderService/.test(prodCallers[0].file),
+  check('CALLERS no production backend buildPrompt site (adgen owns renderDirectImage)',
+    prodCallers.length === 0,
     `prod=${JSON.stringify(prodCallers.map((c) => c.file))}`);
-  check('CALLERS production site threads seedAspect',
-    prodCallers[0] && prodCallers[0].threadsSeedAspect === true);
 
   console.log('  Complete staticAdIntents.buildPrompt callers:');
   for (const c of callers) {
@@ -1950,12 +1762,7 @@ console.log('\n=== buildPrompt caller enumeration (staticAdIntents) ===\n');
       `  · ${c.file.padEnd(48)} role=${c.role.padEnd(16)} seedAspect=${c.threadsSeedAspect}`
     );
   }
-  // Also list renderDirectImage entry points (the real production fan-in)
-  console.log('\n  Production fan-in to renderDirectImage (computes seedAspect once):');
-  console.log('  · services/renderService.js          first render (Ad.variantKind thread; Media dims loaded inside renderDirectImage)');
-  console.log('  · services/adRegenerateService.js    paid regen via buildDirectImageArgsFromAd');
-  console.log('  · services/directImageRenderService  vision-QC re-entry via buildQcRetryArgs spread');
-  console.log('  All three re-enter renderDirectImage → Media width/height → seedAspectFromDims → buildPrompt.');
+  console.log('\n  Mint-time static render (renderDirectImage + seedAspectFromDims) now lives in adgen.');
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -1994,12 +1801,8 @@ const REVERT_MAP = [
   ['Lifestyle plan returns base count 3', 'V6 plan lifestyle: referenceCount===1 (effective)'],
   ['Call resolveLifestyleVideoRefCount but pass baseReferenceCount', 'V6 generateForAd uses plan.referenceCount / does NOT pass baseReferenceCount'],
   ['Lifestyle suppresses PMax (isPmax = !lifestyle && …)', 'V9 lifestyle+PMax keeps HOOK-FIRST / Frame'],
-  ['Drop adDoc?.variantKind thread in renderService', 'C1 renderService threads adDoc?.variantKind'],
-  ['Drop variantKind from Ad.select in renderService', 'C1 renderService selects variantKind from Ad'],
-  ['Drop variantKind on regen args', 'C2 REVERT-PROVE: dropped variantKind → no preserve'],
-  ['Drop variantKind on QC retry (hand-list fields)', 'C3 REVERT-PROVE: missing variantKind on QC retry'],
-  ['Drop Media width/height from select', 'B1 Media.select includes width and height'],
-  ['Drop seedAspectFromDims call / seedAspect thread', 'B1 production threads seedAspect / B1 REAL path native'],
+  ['Drop variantKind on ugc+packshot buildPrompt', 'C1 ugc variantKind reaches preserve gate'],
+  ['Resurrect renderDirectImage in backend renderService', 'C* backend renderService no longer calls renderDirectImage'],
   ['Hand-pass only seedAspect:\'1:1\' without dims path', 'B1 REAL path uses seedAspectFromDims'],
   ['Missing dims throw instead of extend', 'B1 missing/bad dims → null, never throw'],
   ['PMax notes ignore preserve (scene-build under preserve)', 'B2 pmax_square preserve-ON notes lack recompose'],
