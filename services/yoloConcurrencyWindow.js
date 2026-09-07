@@ -5,6 +5,31 @@
 // defined low-live-traffic nightly windows (Pacific time), and to the
 // normal CATALOG_YOLO_CONCURRENCY value at every other moment.
 //
+// ── ADVERSARIAL REVIEW FIXES, 2026-09-06 (read before editing) ────────────
+// This PR's first cut had three real, production-relevant defects, closed
+// here:
+//   #2 KILL SWITCH — `CATALOG_YOLO_NIGHT_BOOST_ENABLED` (default true).
+//      Disabled ⇒ currentYoloConcurrency() returns flat baseConcurrency()
+//      at every hour and never even calls isNightlyBoostWindow() — the
+//      whole feature is byte-identical-inert, not just "boosted == base".
+//   #1 NIGHT MUST BE DERIVED FROM BASE (BLOCKING) — nightConcurrency() used
+//      to be its own independent parsePositiveInt(env, 9) call. An operator
+//      lowering CATALOG_YOLO_CONCURRENCY as a live-incident emergency lever
+//      got silently overridden back UP the next boost window, since
+//      CATALOG_YOLO_NIGHT_CONCURRENCY has its own unrelated default. Fixed:
+//      night is now base * CATALOG_YOLO_NIGHT_MULTIPLIER (default 1.5),
+//      computed at the point of use — lowering base always lowers or holds
+//      the boosted value, never raises it independent of base.
+//   #3 0/NEGATIVE MULTIPLIER FAILS SAFE (BLOCKING) — a bare positive-int
+//      parse resolves 0 through to the FALLBACK'S OWN inner floor (measured
+//      pre-fix on the old absolute var: 0 -> 1, a 6x THROTTLE). The
+//      multiplier parser now treats 0/blank/negative/NaN identically —
+//      falls back to the documented default (1.5x), with a loud one-time
+//      boot warning, never a silent inversion into a throttle.
+// See services/yoloLoadLimiter.js for fix #4 (breaker-threshold-bounded
+// dispatch concurrency) and fix #6 (the single shared accessor both
+// enforcement points now call).
+//
 // ── WHY THIS FILE EXISTS: the "two knobs must agree" trap ─────────────────
 // Catalog-YOLO concurrency is enforced in TWO independent places:
 //   1. yoloLoadLimiter.js       — the process-wide semaphore ceiling
@@ -54,7 +79,7 @@
 // has already rolled over to Saturday, so the weekend window is live from
 // that very first instant without needing to still be "on Friday".
 
-const { concurrency: CONC } = require('./concurrency');
+const { concurrency: CONC, SPEC } = require('./concurrency');
 
 const YOLO_TZ = 'America/Los_Angeles';
 
@@ -84,21 +109,155 @@ function baseConcurrency() {
   return parsePositiveInt(process.env.CATALOG_YOLO_CONCURRENCY, CONC.CATALOG_YOLO_CONCURRENCY || 6);
 }
 
-// NIGHT (boosted) concurrency. File default 9 (config/defaults.env) — a
-// conservative ~50% bump off the base default of 6, deliberately NOT the
-// assumed-but-UNVERIFIED 12-slot cluster ceiling documented in
-// services/concurrency.js's CATALOG_YOLO_CONCURRENCY `why` field (3
-// instances x 4 gunicorn workers — never confirmed against the
-// microservice itself; GUNICORN_WORKERS=2 in defaults.env even disagrees
-// with the "4 workers" half of that assumption). 9 leaves real headroom
-// under that unverified ceiling in case it is wrong, while still
-// meaningfully accelerating backlog drain overnight when live /detect
-// traffic (which does NOT share this limiter — see yoloLoadLimiter.js's
-// header) is low. Do not casually raise this again without first
-// confirming the microservice holds up cleanly above 6 concurrent
-// /detect-batch calls — nobody has measured that yet.
+// ── KILL SWITCH (adversarial review fix #2, 2026-09-06) ────────────────────
+// Parser matches the sibling flags in this repo (grepped:
+// isCatalogFeedOrderSeedingEnabled / isUnifiedNineSixteenMasterEnabled in
+// campaignAdsGenerationService.js) EXACTLY — default ON (unset/blank ⇒
+// true), disabled only by an explicit falsy-looking string. When disabled,
+// currentYoloConcurrency() below returns flat baseConcurrency() at every
+// hour WITHOUT ever calling isNightlyBoostWindow() — i.e. byte-identical to
+// the pre-boost code, not merely "boosted value forced equal to base".
+function isNightBoostEnabled() {
+  const raw = process.env.CATALOG_YOLO_NIGHT_BOOST_ENABLED;
+  if (raw == null || raw === '') return true;
+  return !/^(0|false|no|off)$/i.test(String(raw).trim());
+}
+
+// ── NIGHT (boosted) concurrency — DERIVED from base, never independent ────
+// (adversarial review fix #1, 2026-09-06, BLOCKING.) Before this fix,
+// nightConcurrency() was its own parsePositiveInt(process.env.X, fallback)
+// call with an INDEPENDENT default (9) — so an operator lowering
+// CATALOG_YOLO_CONCURRENCY on the dashboard as a zero-deploy emergency
+// lever during a live incident got silently overridden back UP the next
+// time a boost window opened, since CATALOG_YOLO_NIGHT_CONCURRENCY is
+// almost never set explicitly and falls through to its own default of 9
+// regardless of how low base was just set.
+//
+// Fixed by expressing the boost as a MULTIPLIER on top of whatever base
+// currently resolves to, applied AT THE POINT OF USE (never cached) —
+// exactly the same "never independent, never cached" discipline this
+// file's header already documents for the two concurrency-enforcement call
+// sites. night = ceil(baseConcurrency() * multiplier), so lowering base
+// always lowers or holds equal the boosted value; it can never exceed it
+// independent of base. Default multiplier 1.5 preserves the original PR's
+// intended ~50% bump at the default base of 6 (6 * 1.5 = 9 — the same
+// number this file used to hardcode as an independent default). Clamped to
+// [1, 32] — the same [min,max] the old, now-retired CATALOG_YOLO_NIGHT_CONCURRENCY
+// SPEC entry in services/concurrency.js carried; see that file for the
+// updated (documentation-only; this parse does not consume it — see fix #3
+// below for why) SPEC entry.
+// Derived from concurrency.js's own SPEC entry — NOT a second hardcoded
+// literal — so the default/min/max an operator reads in that table's `why`
+// text is mechanically the same number this parser enforces, never a
+// second copy that can silently drift from it (lower-severity finding,
+// adversarial review round 2, 2026-09-07).
+const NIGHT_MULTIPLIER_DEFAULT = SPEC.CATALOG_YOLO_NIGHT_MULTIPLIER.default; // 1.5
+const NIGHT_MULTIPLIER_MIN = SPEC.CATALOG_YOLO_NIGHT_MULTIPLIER.min; // 1 (raised from 0.1 — see concurrency.js)
+const NIGHT_MULTIPLIER_MAX = SPEC.CATALOG_YOLO_NIGHT_MULTIPLIER.max; // 4
+const NIGHT_CONCURRENCY_MIN = 1;
+const NIGHT_CONCURRENCY_MAX = 32;
+
+// (adversarial review fix #3, 2026-09-06, BLOCKING.) A bare
+// parsePositiveInt(raw, fallback)-style parse resolves 0 (and blank/
+// negative/NaN) through to the FALLBACK'S OWN inner floor rather than to
+// the fallback value itself when the fallback is itself run through a
+// positive-int guard — measured pre-fix: CATALOG_YOLO_NIGHT_CONCURRENCY=0
+// resolved to 1 (a 6x THROTTLE, not "no boost"). Fixed by treating
+// null/blank the same as "unset" (⇒ default multiplier) and treating any
+// OTHER non-positive or non-finite value as a boot-time-logged
+// misconfiguration that ALSO falls back to the documented default,
+// instead of silently coercing to some other number. Logs once per
+// process (not once per call — this can be read on every processQueue
+// pump() tick) so a bad env value is loud without spamming.
+let _warnedBadMultiplier = false;
+// (adversarial review BLOCKER #2, round 2, 2026-09-07, BLOCKING.) A value
+// strictly between 0 and 1 is genuinely positive and finite — it passes
+// the guard below — but applying it AS-IS silently INVERTS the boost into
+// a THROTTLE: night = ceil(base * 0.1) is below base, exactly the failure
+// mode this whole feature exists to prevent, just reached through
+// CATALOG_YOLO_NIGHT_MULTIPLIER instead of the old, retired
+// CATALOG_YOLO_NIGHT_CONCURRENCY. And a value above the documented ceiling
+// (an operator typo like "15" meaning "1.5") would otherwise ride through
+// to the SEPARATE [1,32] clamp on the final RESOLVED concurrency below,
+// rather than being caught at the actual knob that has the typo. Both
+// directions are now clamped to [NIGHT_MULTIPLIER_MIN, NIGHT_MULTIPLIER_MAX]
+// — derived from concurrency.js's SPEC entry, see above — with a loud,
+// once-per-process warning whenever a value outside that range is
+// rejected/clamped.
+let _warnedOutOfRangeMultiplier = false;
+function parseNightMultiplier(raw) {
+  if (raw == null || String(raw).trim() === '') return NIGHT_MULTIPLIER_DEFAULT;
+  const n = Number(raw);
+  if (!Number.isFinite(n) || n <= 0) {
+    if (!_warnedBadMultiplier) {
+      _warnedBadMultiplier = true;
+      console.warn(
+        `⚠️  CATALOG_YOLO_NIGHT_MULTIPLIER="${raw}" is not a positive number — ` +
+        `falling back to the documented default (${NIGHT_MULTIPLIER_DEFAULT}x base). ` +
+        `A value of 0 or negative would otherwise silently invert the nightly ` +
+        `boost into a throttle.`
+      );
+    }
+    return NIGHT_MULTIPLIER_DEFAULT;
+  }
+  if (n < NIGHT_MULTIPLIER_MIN || n > NIGHT_MULTIPLIER_MAX) {
+    const clamped = Math.min(NIGHT_MULTIPLIER_MAX, Math.max(NIGHT_MULTIPLIER_MIN, n));
+    if (!_warnedOutOfRangeMultiplier) {
+      _warnedOutOfRangeMultiplier = true;
+      console.warn(
+        `⚠️  CATALOG_YOLO_NIGHT_MULTIPLIER=${n} is outside the documented safe range ` +
+        `[${NIGHT_MULTIPLIER_MIN}, ${NIGHT_MULTIPLIER_MAX}] — clamping to ${clamped}x. ` +
+        `Below ${NIGHT_MULTIPLIER_MIN}x would silently invert the nightly boost into a ` +
+        `throttle (night concurrency below base); above ${NIGHT_MULTIPLIER_MAX}x exceeds ` +
+        `the operator ceiling documented in services/concurrency.js (a common typo shape: ` +
+        `"15" meant as "1.5").`
+      );
+    }
+    return clamped;
+  }
+  return n;
+}
+
+function nightMultiplier() {
+  return parseNightMultiplier(process.env.CATALOG_YOLO_NIGHT_MULTIPLIER);
+}
+
+// ── RETIRED ENV VAR (adversarial review BLOCKER #3, 2026-09-07) ───────────
+// CATALOG_YOLO_NIGHT_CONCURRENCY was the OLD absolute-value knob this file
+// carried before fix #1 (2026-09-06) replaced it with the DERIVED
+// CATALOG_YOLO_NIGHT_MULTIPLIER above. It is now read by NOTHING — an
+// operator (or a stale Render dashboard override left over from before the
+// rename) who still has it set gets total, silent inertia: no error, no
+// effect, and nothing telling them their setting is being ignored. Checked
+// — and warned on, once — at REQUIRE time (this file is pulled in by both
+// yoloLoadLimiter.js and catalogYoloDetectionService.js, both loaded at
+// process boot), rather than waiting for a nightly window to make the
+// drift observable.
+let _warnedRetiredNightConcurrency = false;
+function isRetiredNightConcurrencyEnvSet() {
+  const raw = process.env.CATALOG_YOLO_NIGHT_CONCURRENCY;
+  return raw != null && String(raw).trim() !== '';
+}
+function warnIfRetiredNightConcurrencySet() {
+  if (!isRetiredNightConcurrencyEnvSet()) return;
+  if (_warnedRetiredNightConcurrency) return;
+  _warnedRetiredNightConcurrency = true;
+  console.warn(
+    `⚠️  CATALOG_YOLO_NIGHT_CONCURRENCY="${process.env.CATALOG_YOLO_NIGHT_CONCURRENCY}" is set but ` +
+    `RETIRED — it is read by nothing. Use CATALOG_YOLO_NIGHT_MULTIPLIER (a multiplier on ` +
+    `CATALOG_YOLO_CONCURRENCY, default ${NIGHT_MULTIPLIER_DEFAULT}) instead, or ` +
+    `CATALOG_YOLO_NIGHT_BOOST_ENABLED=false to disable the nightly boost entirely.`
+  );
+}
+warnIfRetiredNightConcurrencySet();
+
+// NIGHT (boosted) concurrency, DERIVED from the CURRENT baseConcurrency() —
+// never an independent absolute value, never cached. See the header comment
+// above for the incident this closes.
 function nightConcurrency() {
-  return parsePositiveInt(process.env.CATALOG_YOLO_NIGHT_CONCURRENCY, CONC.CATALOG_YOLO_NIGHT_CONCURRENCY || 9);
+  const base = baseConcurrency();
+  const raw = Math.ceil(base * nightMultiplier());
+  return Math.min(NIGHT_CONCURRENCY_MAX, Math.max(NIGHT_CONCURRENCY_MIN, raw));
 }
 
 const PACIFIC_PARTS_FORMATTER = new Intl.DateTimeFormat('en-US', {
@@ -137,27 +296,45 @@ function isNightlyBoostWindow(instant) {
   return secondsSinceMidnight >= startHour * 3600 && secondsSinceMidnight < endHour * 3600;
 }
 
-// THE resolver. Both yoloLoadLimiter.js (semaphore ceiling) and
-// catalogYoloDetectionService.js (dispatch-loop courtesy cap) call this at
-// the point of use — never cache the result — so a window transition
-// mid-run is reflected identically on both sides on their very next check.
+// THE resolver. yoloLoadLimiter.js's getLimit()/effectiveLimit() (the ONE
+// shared accessor both the semaphore ceiling AND
+// catalogYoloDetectionService.js's dispatch-loop courtesy cap now call —
+// see that file's header for fix #6) reads this at the point of use — never
+// cache the result — so a window transition mid-run is reflected
+// identically on both sides on their very next check.
 // `instant` is exposed for tests only; production callers omit it and get
 // live wall-clock time.
+//
+// Kill-switch check comes FIRST and short-circuits before even calling
+// isNightlyBoostWindow() — "no window logic invoked at all" per fix #2,
+// not merely "boosted value forced equal to base".
 function currentYoloConcurrency(instant) {
+  if (!isNightBoostEnabled()) return baseConcurrency();
   return isNightlyBoostWindow(instant) ? nightConcurrency() : baseConcurrency();
 }
 
 module.exports = {
   currentYoloConcurrency,
   isNightlyBoostWindow,
+  isNightBoostEnabled,
   baseConcurrency,
   nightConcurrency,
+  nightMultiplier,
   YOLO_TZ,
   __test: {
     pacificWallClock,
+    parseNightMultiplier,
+    NIGHT_MULTIPLIER_DEFAULT,
+    NIGHT_MULTIPLIER_MIN,
+    NIGHT_MULTIPLIER_MAX,
+    NIGHT_CONCURRENCY_MIN,
+    NIGHT_CONCURRENCY_MAX,
     WEEKNIGHT_START_HOUR,
     WEEKNIGHT_END_HOUR,
     WEEKEND_START_HOUR,
-    WEEKEND_END_HOUR
+    WEEKEND_END_HOUR,
+    isRetiredNightConcurrencyEnvSet,
+    warnIfRetiredNightConcurrencySet,
+    resetRetiredNightConcurrencyWarning() { _warnedRetiredNightConcurrency = false; }
   }
 };

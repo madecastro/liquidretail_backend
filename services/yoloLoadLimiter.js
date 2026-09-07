@@ -28,8 +28,87 @@ function parsePositiveInt(raw, fallback) {
 // wakeNext() and getLimit() must all read.
 let LIMIT_OVERRIDE = null;
 
+// ── ADVERSARIAL REVIEW FIX #4 — CORRECTED 2026-09-07 (owner directive) ─────
+// The breaker must not let a higher window concurrency dispatch a full
+// extra wave before it can react to a fully-down microservice — that part
+// of the finding is real. But the FIRST cut of this fix (binding
+// effectiveLimit() to `Math.min(windowLimit, THRESHOLD)`, see git history)
+// was REJECTED by the owner and reverted: with this repo's shipped defaults
+// (THRESHOLD=5 < base=6 < night=9), that bound collapsed BOTH day and night
+// dispatch to 5 — regressing today's real daytime throughput 6→5 and
+// zeroing out the entire point of the nightly boost (9 collapses to 5 too,
+// so day and night become identical). Do not reintroduce a THRESHOLD bound
+// here; that trade-off was explicitly declined.
+//
+// Corrected approach (owner directive, 2026-09-07): leave the concurrency
+// ceiling alone — effectiveLimit() below is back to the plain window value,
+// so steady-state concurrency (day 6, boosted night 9) is exactly what the
+// nightly-boost feature intends, unaffected while the YOLO microservice is
+// healthy. Rely instead on catalogYoloDetectionService.js's dispatch pump
+// re-checking isOpen() before EVERY individual dispatch, not just once when
+// a wave starts — that check already existed in processQueue()'s pump()
+// before this fix was ever attempted (it predates the nightly-boost work
+// entirely), and pump() is re-invoked from its own per-request `.finally()`
+// handler after EVERY completion, success or failure. So the instant the
+// breaker actually trips (mid-wave — e.g. after the THRESHOLD'th consecutive
+// transient failure lands), no further REPLACEMENT dispatch is ever issued:
+// the next time pump() re-enters its while-loop, isOpen() reads true and it
+// stops immediately, regardless of how many slots the window concurrency
+// nominally allows.
+//
+// What this does NOT close to zero, and that is an accepted, bounded
+// trade-off rather than an oversight: pump()'s INITIAL burst for a wave —
+// up to getLimit() items — still dispatches synchronously, in one JS turn,
+// before any single one of those requests can possibly have completed (a
+// doomed request against a down service still costs a real ~120s client
+// timeout before it can report failure). isOpen() cannot turn true until a
+// completion actually lands, so every iteration of that FIRST burst sees the
+// SAME pre-outage isOpen()===false — a higher window concurrency still
+// dispatches a proportionally bigger initial burst than a lower one would.
+//
+// ── WHAT ACTUALLY BOUNDS THIS, CORRECTED (adversarial review round 2,
+// 2026-09-07) — this PR did not build the bound below and does not change
+// it; it only had to verify the bound still holds at a higher night value.
+// The excess is kept small by TWO mechanisms that PREDATE the nightly-boost
+// feature entirely and that this PR neither created nor meaningfully
+// changed: (1) pump()'s per-dispatch isOpen() check
+// (services/catalogYoloDetectionService.js), re-evaluated on every re-entry
+// — i.e. before every individual dispatch, not merely once when a wave
+// starts, because pump() is re-invoked from each request's own
+// `.finally()` handler after every completion; and (2) that same pump
+// loop's `.then()` result handler, which already halts further dispatch the
+// instant THIS run's own transient outcome trips the breaker (or the
+// breaker is found already open at acquire-time). Both shipped in this
+// repo's pre-existing breaker (PR #408, before this feature existed) and
+// are not "fighting" the rejected THRESHOLD-cap idea above, nor is removing
+// that idea what "enabled" this to work — they were already sufficient on
+// their own. Measured (scripts/verifyYoloNightlyConcurrency.js section M):
+// at this repo's default settings the bound is day 10 / night 13 doomed
+// dispatches, and that bound is IDENTICAL with or without the rejected
+// THRESHOLD-cap idea ever having existed — NOT the unbounded "outruns the
+// whole catalog" failure mode a dispatcher with no per-dispatch check at
+// all would have (which would keep replacing failed slots with new doomed
+// work until the entire target list drained through the breaker), and NOT
+// reduced to an exact zero delta the way the rejected THRESHOLD-wide bound
+// would have. The stable invariant across catalog size and across
+// CATALOG_YOLO_BREAKER_THRESHOLD values is an ABSOLUTE count, not a
+// percentage: exactly (nightLimit - dayLimit) extra doomed dispatches (3 at
+// today's defaults, 9-6) — see section M13.
+//
+// This is also NOT a one-time event, an earlier draft of this comment's
+// claim. It recurs every time the breaker re-opens on a fresh run of
+// consecutive transient failures — once per COOLDOWN_MS cycle (default 30
+// min): the breaker opens, blocks new dispatch for the cooldown, a
+// subsequent pump() retries once it lapses, and can immediately re-trip on
+// a microservice that is still down. A service genuinely down for a full
+// 5-hour weekend boost window can see on the order of ten such cycles, each
+// paying the same small excess again — not "once at the start of the
+// outage".
+// LIMIT_OVERRIDE (test-only) is unaffected by any of this — a harness
+// pinning an exact limit for deterministic testing gets exactly that value.
 function effectiveLimit(instant) {
-  return LIMIT_OVERRIDE != null ? LIMIT_OVERRIDE : yoloConcurrencyWindow.currentYoloConcurrency(instant);
+  if (LIMIT_OVERRIDE != null) return LIMIT_OVERRIDE;
+  return yoloConcurrencyWindow.currentYoloConcurrency(instant);
 }
 
 let THRESHOLD = parsePositiveInt(process.env.CATALOG_YOLO_BREAKER_THRESHOLD, 5);
