@@ -118,7 +118,9 @@ function tripBreakerExternally(limiter) {
 
 async function testProcessQueueFalseAbort(mod, limiter) {
   console.log('\n[A] processQueue(): unrelated external breaker trip at the exact moment the last product finishes');
-  limiter.__test.reset({ threshold: 5, cooldownMs: 1_800_000 });
+  // Explicit limit — deterministic regardless of wall-clock time (whether
+  // this happens to run inside a nightly boost window or not).
+  limiter.__test.reset({ limit: 6, threshold: 5, cooldownMs: 1_800_000 });
 
   const products = fakeProducts(5);
   let calls = 0;
@@ -171,7 +173,8 @@ async function testProcessQueueFalseAbort(mod, limiter) {
 
 async function testRunYoloDetectionOnTargetsFalseAbort(mod, limiter) {
   console.log('\n[B] runYoloDetectionOnTargets(): the same race one call-frame up (the actual production consequence — backoff/paging)');
-  limiter.__test.reset({ threshold: 5, cooldownMs: 1_800_000 });
+  // Explicit limit — deterministic regardless of wall-clock time.
+  limiter.__test.reset({ limit: 6, threshold: 5, cooldownMs: 1_800_000 });
 
   const succeedCalls = [];
   const failCalls = [];
@@ -228,7 +231,8 @@ async function testRunYoloDetectionOnTargetsFalseAbort(mod, limiter) {
 
 async function testCancelVsCircuitOrdering(mod, limiter) {
   console.log('\n[C] Secondary finding: operator cancel racing a GENUINE self-caused circuit trip must report BOTH — cancelled:true AND aborted:true');
-  limiter.__test.reset({ threshold: 5, cooldownMs: 1_800_000 });
+  // Explicit limit — deterministic regardless of wall-clock time.
+  limiter.__test.reset({ limit: 6, threshold: 5, cooldownMs: 1_800_000 });
 
   // Pre-load the shared counter to threshold-2 via OTHER (unrelated) work,
   // so THIS run's own two products are what finish crossing it — i.e. the
@@ -405,16 +409,16 @@ async function main() {
   const limiter = require(path.join(__dirname, '..', 'services', 'yoloLoadLimiter'));
 
   await testProcessQueueFalseAbort(mod, limiter);
-  limiter.__test.reset();
+  limiter.__test.reset({ limit: 6 });
   await testRunYoloDetectionOnTargetsFalseAbort(mod, limiter);
-  limiter.__test.reset();
+  limiter.__test.reset({ limit: 6 });
   await testCancelVsCircuitOrdering(mod, limiter);
-  limiter.__test.reset();
+  limiter.__test.reset({ limit: 6 });
   await testAllProductsRefusedAtEntry(mod, limiter);
-  limiter.__test.reset();
+  limiter.__test.reset({ limit: 6 });
   await testUnrelatedTripDuringOwnSuccessMidRun(mod, limiter);
 
-  limiter.__test.reset();
+  limiter.__test.reset({ limit: 6 });
   mod.__test.reset();
 
   console.log(`\n${checks - failures}/${checks} checks passed`);

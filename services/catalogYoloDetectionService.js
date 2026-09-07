@@ -47,12 +47,27 @@ const yoloConcurrencyWindow = require('./yoloConcurrencyWindow');
 // for why. This "courtesy cap" (the dispatch while-loop's own
 // `inflight < CONCURRENCY`) and yoloLoadLimiter's process-wide semaphore
 // used to read CATALOG_YOLO_CONCURRENCY independently, ONCE, at
-// require-time — so they only agreed by coincidence. Both now call
-// yoloConcurrencyWindow.currentYoloConcurrency() AT THE POINT OF USE
-// (never cached in a module-level const) so a nightly boost — or any
-// future retune — cannot desync the two. currentConcurrencyLabel() below
-// is for logging only.
-function currentConcurrencyLabel() { return yoloConcurrencyWindow.currentYoloConcurrency(); }
+// require-time — so they only agreed by coincidence.
+//
+// FIX #6 (adversarial review, 2026-09-06): they ALSO used to both call
+// yoloConcurrencyWindow.currentYoloConcurrency() independently — which
+// agreed with each other only because both happened to call the same
+// underlying function, not because they were structurally forced to. Both
+// enforcement points now call `yoloLoadLimiter.getLimit()` — the ONE
+// shared accessor — so there is no way for a future edit to re-split them
+// without an obviously duplicated implementation. Fix #4 (see
+// yoloLoadLimiter.js) does NOT bind getLimit() to the breaker threshold —
+// that first cut was rejected by the owner (it regressed daytime throughput
+// and defeated the night boost); getLimit() still returns the plain window
+// value, and the breaker-reaction fix lives entirely in the per-dispatch
+// isOpen() check inside the pump() while-loop below. Only
+// currentConcurrencyLabel() below reads `yoloLoadLimiter.getLimit()` for
+// this dispatch's own boot-log line; the boot log's *other* number
+// (yoloConcurrencyWindow.nightConcurrency(), a couple of lines down) is
+// deliberately still read straight from the window resolver — it is
+// purely informational ("what the boost target IS"), never a dispatch
+// decision, so it is not subject to the "one shared accessor" rule.
+function currentConcurrencyLabel() { return yoloLoadLimiter.getLimit(); }
 // Per-run ceiling. Unset / 0 / negative / NaN → uncapped. A positive
 // integer re-caps one brand run. Default is uncapped so an operator who
 // does nothing gets no ceiling (owner 2026-09-05). Shared with
@@ -77,9 +92,21 @@ let _workerOverride = null;
   // dispatch loop below re-checks currentConcurrencyLabel() live on every
   // iteration, so this line can read differently than a run that actually
   // straddles a nightly boost window.
+  //
+  // (Lower-severity fix, adversarial review round 2, 2026-09-07.) This used
+  // to print the "(boosts to N in nightly windows)" clause unconditionally,
+  // reading yoloConcurrencyWindow.nightConcurrency() regardless of whether
+  // CATALOG_YOLO_NIGHT_BOOST_ENABLED is actually on — so the boot log
+  // advertised a boost that the kill switch had switched off. Gated on the
+  // SAME isNightBoostEnabled() check currentYoloConcurrency() itself
+  // short-circuits on (fix #2), so the log can never claim a boost the code
+  // will not apply.
+  const boostLabel = yoloConcurrencyWindow.isNightBoostEnabled()
+    ? ` (boosts to ${yoloConcurrencyWindow.nightConcurrency()} in nightly windows)`
+    : ' (nightly boost DISABLED — CATALOG_YOLO_NIGHT_BOOST_ENABLED=false)';
   console.log(
     `🎯 catalogYoloDetectionService config — ` +
-    `concurrency=${currentConcurrencyLabel()} (boosts to ${yoloConcurrencyWindow.nightConcurrency()} in nightly windows) ` +
+    `concurrency=${currentConcurrencyLabel()}${boostLabel} ` +
     `maxPerRun=${maxLabel} altLimit=${ALT_LIMIT}`
   );
 })();
@@ -209,11 +236,18 @@ async function detectYoloForOne(product) {
   };
 }
 
-// Concurrency-capped queue. Per-chain `inflight < currentYoloConcurrency()`
+// Concurrency-capped queue. Per-chain `inflight < yoloLoadLimiter.getLimit()`
 // is a courtesy cap; yoloLoadLimiter.acquire() is the process-wide bound.
-// Both resolve through the SAME yoloConcurrencyWindow.currentYoloConcurrency()
-// call (not independent reads) so they cannot disagree — see that module's
-// header for why this matters (the nightly-boost "two knobs" trap).
+// Both resolve through the SAME yoloLoadLimiter.getLimit() call (not
+// independent reads of the window resolver) so they cannot disagree — see
+// that module's header for why this matters (the nightly-boost "two knobs"
+// trap). getLimit() itself is NOT bounded by the breaker threshold (fix #4
+// was corrected 2026-09-07 to drop that bound — see yoloLoadLimiter.js) —
+// the breaker-reaction mechanism lives entirely below, in the while-loop's
+// own `isOpen()` check, which re-runs on EVERY pump() re-entry (i.e. before
+// every individual dispatch, not just once when a wave starts), because
+// pump() is re-invoked from each request's own `.finally()` handler after
+// every completion.
 async function processQueue(products, { onDone = null, isCancelled = null, worker = null, brandId = null } = {}) {
   const runOne = worker || _workerOverride || detectYoloForOne;
   let next = 0, inflight = 0, processed = 0, stopped = false;
@@ -242,7 +276,7 @@ async function processQueue(products, { onDone = null, isCancelled = null, worke
     // breaker-open) the same way the old top-of-function re-entry guard
     // did for repeated calls from completion callbacks.
     const pump = () => {
-      while (!stopped && inflight < yoloConcurrencyWindow.currentYoloConcurrency() && next < products.length) {
+      while (!stopped && inflight < yoloLoadLimiter.getLimit() && next < products.length) {
         if (yoloLoadLimiter.isOpen()) {
           stopped = true;
           abortReason = 'yolo-circuit-open';

@@ -60,7 +60,11 @@ function withTimeout(promise, ms, label) {
 
 async function testBreakerAlreadyOpenAtEntry(mod, limiter) {
   console.log('\n[A] Breaker already open when processQueue() starts (the deadlock case)');
-  limiter.__test.reset();
+  // Explicit limit — deterministic regardless of wall-clock time (whether
+  // this happens to run inside a nightly boost window or not). See
+  // scripts/verifyYoloNightlyConcurrency.js item 5 for the same class of
+  // fix.
+  limiter.__test.reset({ limit: 6 });
   // Force isOpen() === true from the very first call, before anything is
   // dispatched -- exactly today's live production scenario.
   limiter.__test.setOpenUntil(Date.now() + 60_000);
@@ -91,7 +95,8 @@ async function testBreakerAlreadyOpenAtEntry(mod, limiter) {
 
 async function testBreakerOpensMidRun(mod, limiter) {
   console.log('\n[B] Breaker starts closed, opens mid-run (must still resolve + report correctly)');
-  limiter.__test.reset();
+  // Explicit limit — deterministic regardless of wall-clock time.
+  limiter.__test.reset({ limit: 6 });
 
   const products = fakeProducts(10);
   let calls = 0;
@@ -130,7 +135,8 @@ async function testBreakerOpensMidRun(mod, limiter) {
 
 async function testHappyPathNoBreaker(mod, limiter) {
   console.log('\n[C] Ordinary run: breaker never opens, all products settle');
-  limiter.__test.reset();
+  // Explicit limit — deterministic regardless of wall-clock time.
+  limiter.__test.reset({ limit: 6 });
 
   const products = fakeProducts(8);
   let calls = 0;
@@ -165,7 +171,7 @@ async function main() {
   await testBreakerOpensMidRun(mod, limiter);
   await testHappyPathNoBreaker(mod, limiter);
 
-  limiter.__test.reset();
+  limiter.__test.reset({ limit: 6 });
 
   console.log(`\n${checks - failures}/${checks} checks passed`);
   if (failures > 0) {

@@ -76,14 +76,35 @@
 
 const path = require('path');
 
-// Forces per-chain courtesy dispatch (processQueue's CONCURRENCY constant,
-// CATALOG_YOLO_CONCURRENCY) to serial (1 in flight at a time) BEFORE the
-// service module is first required in this process, so every scenario
-// below is driven by fixed millisecond delays instead of racing against
-// however many products a default concurrency of 6 would dispatch at
-// once. Does not touch yoloLoadLimiter's own semaphore LIMIT (reset per
-// section below) or THRESHOLD. Scoped to this one child process — each
-// verify*.js script runs via its own `spawn`, per scripts/runVerifySuite.js.
+// Forces per-chain courtesy dispatch to serial (1 in flight at a time) so
+// every scenario below is driven by fixed millisecond delays instead of
+// racing against however many products a default concurrency would
+// dispatch at once.
+//
+// ⚠️ CORRECTED 2026-09-07: this used to be done via the
+// CATALOG_YOLO_CONCURRENCY env var alone (set below, BEFORE the service
+// module is first required), back when processQueue()'s courtesy cap and
+// yoloLoadLimiter's semaphore LIMIT were two independent knobs — so the env
+// var could force the courtesy cap to 1 while each section's own
+// `limiter.__test.reset({limit: 20/50/10, ...})` left the SEMAPHORE
+// generously high, and the two never fought each other.
+// catalogYoloDetectionService.js's fix #6 (2026-09-06, this same feature
+// branch) deliberately UNIFIED both enforcement points onto the ONE shared
+// `yoloLoadLimiter.getLimit()` accessor — so as of that fix, whatever
+// `limit` a test pins via `__test.reset()` is now BOTH the semaphore AND
+// the per-chain courtesy cap. Pinning a big number here (20/50/10) now lets
+// the courtesy cap dispatch a WHOLE run's products in one synchronous
+// burst, defeating the "force serial" intent this comment describes — the
+// env var below no longer has that effect on its own. Every section now
+// pins `limit: 1` instead, which correctly serializes BOTH knobs together
+// (verified: with limit:1, section [B]'s two concurrent chains still each
+// process several products and correctly interleave through the shared
+// semaphore before the breaker trips — see that section's own comment).
+// The CATALOG_YOLO_CONCURRENCY env var below is now redundant with the
+// explicit `limit:1` pins, kept only as a defensive floor for the brief
+// window (if any) before the first `__test.reset()` call in each test runs.
+// Scoped to this one child process — each verify*.js script runs via its
+// own `spawn`, per scripts/runVerifySuite.js.
 process.env.CATALOG_YOLO_CONCURRENCY = '1';
 
 let failures = 0;
@@ -128,7 +149,11 @@ function transientFailResult(kind = 'client-timeout') {
 
 async function testSingleChainAlternating(mod, limiter) {
   console.log('\n[A] Bug 2 — single chain alternating no-op / real-transient-failure (20 targets, threshold 5)');
-  limiter.__test.reset({ limit: 20, threshold: 5, cooldownMs: 1_800_000 });
+  // limit:1 — see the file header's CORRECTED note: post fix #6, this value
+  // is BOTH the semaphore and the courtesy cap, so it must stay small to
+  // force serial dispatch (a big number here would let the whole run
+  // dispatch in one synchronous burst, defeating A4 below).
+  limiter.__test.reset({ limit: 1, threshold: 5, cooldownMs: 1_800_000 });
 
   const products = fakeProducts(20, 'alt');
   let calls = 0;
@@ -159,7 +184,13 @@ async function testSingleChainAlternating(mod, limiter) {
 
 async function testConcurrentChainsHealthyMasksSick(mod, limiter) {
   console.log('\n[B] Bug 2 CONCURRENT — healthy (all no-op) chain interleaved with a sick (100%-transient-failing) chain, sharing one yoloLoadLimiter');
-  limiter.__test.reset({ limit: 50, threshold: 5, cooldownMs: 1_800_000 });
+  // limit:1 — same CORRECTED reasoning as [A]. Verified this does not
+  // break the "two independently-progressing concurrent chains" intent:
+  // both chains still interleave through the shared semaphore (each one
+  // item at a time, taking turns) and both still process several of their
+  // own products before the sick chain's real failures trip the breaker —
+  // see B2/B5 below, which pin exactly that.
+  limiter.__test.reset({ limit: 1, threshold: 5, cooldownMs: 1_800_000 });
 
   const SICK_N = 12;
   const HEALTHY_N = 12;
@@ -210,7 +241,9 @@ async function testConcurrentChainsHealthyMasksSick(mod, limiter) {
 
 async function testSmallRunFullFailureNowTrips(mod, limiter, orchStub) {
   console.log('\n[C] Bug 1 — a run smaller than THRESHOLD, 100% transient failure, now correctly aborts instead of a false success');
-  limiter.__test.reset({ limit: 10, threshold: 5, cooldownMs: 1_800_000, minRunSample: 3 });
+  // limit:1 — CORRECTED (see file header); keeps dispatch serial so C6
+  // ("calls < targets") is meaningful post fix #6.
+  limiter.__test.reset({ limit: 1, threshold: 5, cooldownMs: 1_800_000, minRunSample: 3 });
 
   const { fail, succeed } = orchStub();
   const targets = fakeProducts(4, 'small');
@@ -245,7 +278,8 @@ async function testBoundaryNoOverreach(mod, limiter, orchStub) {
   // documented residual (see docs/ALERTING.md / this file's own header) —
   // NOT asserted as a bug fix, just pinned so a future change to
   // MIN_RUN_SAMPLE's default is a deliberate, visible decision.
-  limiter.__test.reset({ limit: 10, threshold: 5, cooldownMs: 1_800_000, minRunSample: 3 });
+  // limit:1 — CORRECTED (see file header).
+  limiter.__test.reset({ limit: 1, threshold: 5, cooldownMs: 1_800_000, minRunSample: 3 });
   {
     const { fail, succeed } = orchStub();
     const targets = fakeProducts(2, 'tiny');
@@ -263,7 +297,8 @@ async function testBoundaryNoOverreach(mod, limiter, orchStub) {
   // D2 — 4 targets, MIXED outcome (one genuine success among three
   // failures) — must NOT trip. Only a run with EVERY attempt failing
   // qualifies; one real success is a positive health signal.
-  limiter.__test.reset({ limit: 10, threshold: 5, cooldownMs: 1_800_000, minRunSample: 3 });
+  // limit:1 — CORRECTED (see file header).
+  limiter.__test.reset({ limit: 1, threshold: 5, cooldownMs: 1_800_000, minRunSample: 3 });
   {
     const { fail, succeed } = orchStub();
     const targets = fakeProducts(4, 'mixed');
@@ -288,7 +323,8 @@ async function testBoundaryNoOverreach(mod, limiter, orchStub) {
   // NOT new behavior — sibling harnesses already pin it — this is just a
   // quick contrast check that the new supplemental path did not disable
   // or duplicate the existing one for runs it should never apply to).
-  limiter.__test.reset({ limit: 10, threshold: 5, cooldownMs: 1_800_000, minRunSample: 3 });
+  // limit:1 — CORRECTED (see file header).
+  limiter.__test.reset({ limit: 1, threshold: 5, cooldownMs: 1_800_000, minRunSample: 3 });
   {
     const { fail, succeed } = orchStub();
     const targets = fakeProducts(10, 'large');

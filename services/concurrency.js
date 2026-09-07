@@ -131,23 +131,43 @@ const SPEC = Object.freeze({
     min: 1,
     max: 32,
     ceiling: 'SELF-IMPOSED',
-    why: 'Products in flight during catalog YOLO detection. Each product submits ONE /detect-batch (hero + alts), so effective HTTP load is CATALOG_YOLO_CONCURRENCY concurrent /detect-batch calls — default 6, not 6×8=48 sequential /detect (batch shipped in 0e892463). Sized at 6 against a reported 12-slot cluster (3 instances × 4 gunicorn workers; UNVERIFIED in this repo). GUNICORN_WORKERS=2 + TIMEOUT=100 in defaults.env:866 is stale vs that 4×3 report. yoloLoadLimiter enforces the 6 process-wide so overlapping chains cannot stack. YOLOv8x holds ~500MB RSS per worker — budget headroom before scaling the microservice. THIS IS THE OUTSIDE-WINDOW VALUE ONLY as of services/yoloConcurrencyWindow.js (2026-09-06) — see CATALOG_YOLO_NIGHT_CONCURRENCY below for the nightly-window boost; both yoloLoadLimiter.js and catalogYoloDetectionService.js resolve through that one shared function now, not this value directly.'
+    why: 'Products in flight during catalog YOLO detection. Each product submits ONE /detect-batch (hero + alts), so effective HTTP load is CATALOG_YOLO_CONCURRENCY concurrent /detect-batch calls — default 6, not 6×8=48 sequential /detect (batch shipped in 0e892463). Sized at 6 against a reported 12-slot cluster (3 instances × 4 gunicorn workers; UNVERIFIED in this repo). GUNICORN_WORKERS=2 + TIMEOUT=100 in defaults.env:866 is stale vs that 4×3 report. yoloLoadLimiter enforces the 6 process-wide so overlapping chains cannot stack. YOLOv8x holds ~500MB RSS per worker — budget headroom before scaling the microservice. THIS IS THE OUTSIDE-WINDOW VALUE ONLY as of services/yoloConcurrencyWindow.js (2026-09-06) — see CATALOG_YOLO_NIGHT_MULTIPLIER below for the nightly-window boost; both yoloLoadLimiter.js and catalogYoloDetectionService.js resolve the EFFECTIVE limit through yoloLoadLimiter.getLimit() (the one shared accessor, adversarial-review fix #6), never this value directly.'
   },
-  // Nightly-window BOOST on top of CATALOG_YOLO_CONCURRENCY above — resolved
-  // per-instant by services/yoloConcurrencyWindow.js, never read directly by
-  // either concurrency enforcement point (yoloLoadLimiter.js's semaphore,
-  // catalogYoloDetectionService.js's dispatch-loop cap). Windows (Pacific
-  // time, DST-aware): weeknights [01:00,04:00) PT (Mon-Fri mornings),
-  // weekend nights [00:00,05:00) PT (Sat/Sun mornings) — chosen because
-  // live /detect traffic (which does NOT share this limiter) is lowest
-  // then, per owner direction.
-  CATALOG_YOLO_NIGHT_CONCURRENCY: {
-    env: 'CATALOG_YOLO_NIGHT_CONCURRENCY',
-    default: 9,
+  // Nightly-window BOOST on top of CATALOG_YOLO_CONCURRENCY above.
+  // DOCUMENTATION ENTRY ONLY as of the 2026-09-06 adversarial review fix —
+  // NOT actually consumed via resolveAll()/CONC by services/
+  // yoloConcurrencyWindow.js. That file's own parseNightMultiplier() must
+  // fail 0/blank/negative SAFE to the documented default (1.5), which is a
+  // different contract than this table's generic resolveKnob() (which
+  // floors an out-of-range value to `min`, not to `default`) — using the
+  // shared resolver here would have silently reintroduced exactly the
+  // "0 resolves to a throttle, not the default" bug that fix closed. Kept
+  // in this table purely so an operator scanning "every concurrency knob in
+  // one place" still finds it; see services/yoloConcurrencyWindow.js for
+  // the actual parser. Resolved per-instant as
+  // ceil(CATALOG_YOLO_CONCURRENCY * this multiplier) — DERIVED from base,
+  // never an independent absolute value (that was adversarial-review fix
+  // #1, BLOCKING — the prior CATALOG_YOLO_NIGHT_CONCURRENCY absolute-value
+  // design let an operator's emergency lowering of CATALOG_YOLO_CONCURRENCY
+  // get silently overridden back up by the boost). Windows (Pacific time,
+  // DST-aware): weeknights [01:00,04:00) PT (Mon-Fri mornings), weekend
+  // nights [00:00,05:00) PT (Sat/Sun mornings) — chosen because live
+  // /detect traffic (which does NOT share this limiter) is lowest then,
+  // per owner direction. Fix #4's first cut additionally bounded the
+  // REALIZED concurrency at CATALOG_YOLO_BREAKER_THRESHOLD — that bound was
+  // REJECTED by the owner (2026-09-07: it collapsed day AND night to
+  // THRESHOLD under this repo's shipped defaults, regressing daytime
+  // throughput and defeating the boost) and reverted. The realized value is
+  // simply this multiplier applied to base; the breaker instead reacts by
+  // halting NEW dispatch mid-wave (yoloLoadLimiter.js's corrected fix #4
+  // comment, and catalogYoloDetectionService.js's pump()).
+  CATALOG_YOLO_NIGHT_MULTIPLIER: {
+    env: 'CATALOG_YOLO_NIGHT_MULTIPLIER',
+    default: 1.5,
     min: 1,
-    max: 32,
+    max: 4,
     ceiling: 'SELF-IMPOSED',
-    why: 'Boosted catalog-YOLO concurrency during defined nightly low-live-traffic windows only (services/yoloConcurrencyWindow.js). 9 is a deliberately conservative ~50% bump off the base default of 6 — NOT the assumed-but-UNVERIFIED 12-slot cluster ceiling CATALOG_YOLO_CONCURRENCY documents above (3 instances × 4 gunicorn workers, never confirmed against the microservice itself). Chosen to leave real headroom under that unverified ceiling in case it is wrong, while still meaningfully accelerating the overnight backlog. Do not raise this again without first measuring that the microservice holds up cleanly above 6 concurrent /detect-batch calls — nobody has, as of 2026-09-06.'
+    why: 'Boosted catalog-YOLO concurrency during defined nightly low-live-traffic windows only (services/yoloConcurrencyWindow.js), expressed as a multiplier on the CURRENT base concurrency rather than an independent absolute value (see the block comment above). Default 1.5 preserves the original ~50% bump at the default base of 6 (6 * 1.5 = 9) — NOT the assumed-but-UNVERIFIED 12-slot cluster ceiling CATALOG_YOLO_CONCURRENCY documents above (3 instances × 4 gunicorn workers, never confirmed against the microservice itself). Do not raise this again without first measuring that the microservice holds up cleanly above 6 concurrent /detect-batch calls — nobody has, as of 2026-09-06. FLOOR RAISED 0.1→1 (adversarial review blocker #2, 2026-09-07): a multiplier strictly between 0 and 1 was previously "in range" by this SPEC entry yet is a THROTTLE, not a boost — it silently inverts the feature (night concurrency below base), the exact failure mode this whole PR exists to prevent. services/yoloConcurrencyWindow.js\'s own parser now clamps to EXACTLY this entry\'s [min,max] (imported, not a second hardcoded pair) and warns loudly, once, on any value outside it — including the upper bound, which catches an operator typo like "15" meaning "1.5" at the multiplier itself rather than letting it ride through to the separate [1,32] clamp on the final resolved concurrency.'
   },
 
   // ── Hardcoded literals moved here (current behaviour as defaults) ───
@@ -231,8 +251,10 @@ function resolveKnob(spec) {
   // PROVIDER-IMPOSED: hard ceiling — env cannot raise above max.
   // SELF-IMPOSED: soft cap for sanity (typos like 99999).
   if (typeof spec.max === 'number') v = Math.min(spec.max, v);
-  // Integers for concurrency counts; GROK_MAX_RPS and spacing keep floats/ints as resolved.
-  if (spec.env !== 'GROK_MAX_RPS' && spec.env !== 'ATLAS_SUBMIT_SPACING_MS') {
+  // Integers for concurrency counts; GROK_MAX_RPS, spacing, and the night
+  // multiplier (documentation entry only — see its own SPEC comment) keep
+  // floats/ints as resolved.
+  if (spec.env !== 'GROK_MAX_RPS' && spec.env !== 'ATLAS_SUBMIT_SPACING_MS' && spec.env !== 'CATALOG_YOLO_NIGHT_MULTIPLIER') {
     v = Math.floor(v);
   }
   return v;
