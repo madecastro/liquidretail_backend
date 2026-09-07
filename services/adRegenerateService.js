@@ -19,7 +19,8 @@
 //   surface area. Chrome-only tweaks now happen at the template level
 //   via the Brand page video card).
 //     1. Storyboard regenerated with operatorPrompt threaded in.
-//     2. New Grok video via videoRouter.generateForAd.
+//     2. New video via adgen's videoRouter.generateForAd (this file stamps
+//        regenerationRequest and returns; it does not call a local router).
 //     3. Brand-script canvas overlay via brandScriptExecutor.
 //        renderBrandScriptAndSave — resolver picks the right script by
 //        format; no chrome when brand has neither styleScript* nor

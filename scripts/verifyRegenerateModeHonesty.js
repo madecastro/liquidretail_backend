@@ -128,18 +128,11 @@ function loadServiceWithStubs() {
   need('../models/Brand',       makeModel({ _id: 'b1', name: 'Test', advertiserId: 'a1', styleTheme: 'x' }, calls.log, 'Brand'));
   need('../models/CampaignRun', makeModel(null, calls.log, 'CampaignRun'));
 
-  need('./videoRouter', {
-    prepareStoryboard: async () => { calls.prepareStoryboard++; return { storyboard: null }; },
-    // THE BILLABLE CALL. One invocation = one Omni submit = real money.
-    generateForAd: async () => {
-      calls.generateForAd++;
-      return {
-        videoUrl: 'https://cdn/new-master.mp4', aspectRatio: '9:16',
-        prompt: 'p', storyboard: null, model: 'omni', referenceImages: []
-      };
-    },
-    MODEL_CAPS: {}
-  });
+  // videoRouter stub DROPPED 2026-09-07: services/videoRouter.js was
+  // deleted with the dormant fallback (the only remaining production
+  // caller was performRegeneration/runVideoFull). stub() would now
+  // return false (MODULE_NOT_FOUND) and fail A0 for a module the
+  // service no longer requires.
   need('./brandScriptExecutor', {
     // renderBrandScriptAndSave is kept on the stub (never expected to be
     // called after the 2026-08-28 titling removal — see B6) so a stray

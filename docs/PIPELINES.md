@@ -2,18 +2,17 @@
 
 This is the engineer reference for every background and creative pipeline in the LiquidRetail backend (Node/Express + Mongoose). For each pipeline: what triggers it, its stages, which models/APIs it calls (and rough cost), which env knobs tune it, how progress/cancel works, and what consumes its output. Facts are code-verified as of **2026-08-03** (prod `13cf679`) with **Phase A + Phase B PMax (2026-08-10/11)** documented against branch `feat/pmax-surfaces-phase-a2`, plus a **post-Phase-B addendum** (video cost reconciliation + adversarial corrections; offline suite **78** scripts green). Prefer this doc over tribal memory; when in doubt, open the cited files. Claims written against pre-`13cf679` binaries (including the long-running `a80ae0b` prod window) are suspect.
 
-> **Render cutover (2026-08-24) — read this before §5 / §6 / §8.**
-> When `ADGEN_RENDERER_ENABLED=true` (committed default, matches live
-> dashboard), the **backend does not
-> execute** `runRenderLoop`'s Atlas / Remotion work. `routes/ads.js:1715-1723`
-> returns after flipping `CampaignRun` to `running`;
-> `liquidretail_adgen` `src/services/renderer.js` claims each ad and runs
+> **Render cutover (2026-08-24, fallback deleted 2026-09-07) — read this before §5 / §6 / §8.**
+> Adgen owns rendering/titling **unconditionally**. `runRenderLoop`
+> (`routes/ads.js:1693`) flips the CampaignRun to `running` and returns;
+> `adgen/src/services/renderer.js` claims each ad and runs
 > static / video-master / derive / Remotion. Expansion + mint + the
-> `claimAdsForRun` write still happen **here**. Sections below that say
-> "all in the **web** process" or "`runRenderLoop` → `renderCreative`"
-> describe the **flag-off fallback** (and the architecture as of 2026-08-03).
-> Remotion memory now belongs to the adgen renderer instance, not this
-> web service. Details: `../liquidretail_adgen/CLAUDE.md`.
+> `claimAdsForRun` write still happen **here**. There is no
+> `ADGEN_RENDERER_ENABLED` gate and no in-process fallback left —
+> sections below that still say "all in the **web** process" or
+> "`runRenderLoop` → `renderCreative`" describe the **deleted**
+> architecture as of 2026-08-03. Remotion memory belongs to the adgen
+> renderer instance, not this web service. Details: `adgen/CLAUDE.md`.
 
 > **Cost hot-spots (read first)**
 >
@@ -22,7 +21,7 @@ This is the engineer reference for every background and creative pipeline in the
 > | **Overlay zones** (`overlayZoneService.analyzeOverlayZones`, Gemini-2.5 vision) | Per catalog-product image after detect | ~**13–26s / image** Gemini vision | **Deferred** to ad time (`CATALOG_DETECT_PRECOMPUTE=false`); only products a campaign will use |
 > | **User-actuated product enrichment** (SerpAPI shopping + immersive + Gemini grounded-search) | Sales Demos **Enrich** button | ~**$0.05–0.12 / product** | Opt-in only; auto path is reviews gap-fill |
 > | **Static ad plate** (`openai/gpt-image-2/edit` via `directImageRenderService`) | Every static `ai_*` ad (default pipeline) | Dominant static-ad $ | One billable edit submit per ad; stages on poll ticks (`ATLAS_IMAGE_POLL_MS` 3s). **Was falsely documented** as "GPT-4.1 HTML → Puppeteer → gpt-image-2 photoreal polish" — that chain is **not** the live default |
-> | **Omni / Atlas video** (legacy name `veo`) | Video ad generation | **MEASURED** 10s @ 1080p on the **developer** model (`google/gemini-omni-flash/image-to-video-developer`, production default): **$0.90** settled. The `MODEL_CAPS` formula (`base 0.20 + 0.10/s` → $1.20 @ 10s) **overstates** the developer variant by ~33% — do not quote $1.20 for it. Ledger now **reconciles** settled price (was estimate-forever — see [*Video cost reconciliation*](#video-cost-reconciliation-post-phase-b)). 720p same list tier as 1080p. | `VEO_CONCURRENCY=24` — the **submit+poll half only** since the 2026-08-05 split (raised 1→4 2026-08-02 probe, 4→12 2026-08-05, 12→24 2026-08-20). Omni RPS still unpublished, but no Omni 429 was ever recorded and a poll is ~2min of idle waiting, so widening this half is low-risk; Grok stays ≤1 RPS via `GROK_MAX_RPS` regardless. **Was falsely documented** as "must stay at 1 — provider 429s"; that belonged to retired direct-Veo / Grok 1 RPS, not Omni. The cap that still needs care is `REMOTION_QUEUE_CONCURRENCY=4` (8 OOM-killed the 8 GiB web box on 2026-08-21; reverted). **When `ADGEN_RENDERER_ENABLED=true` this work runs in `liquidretail_adgen`, not this web process** |
+> | **Omni / Atlas video** (legacy name `veo`) | Video ad generation | **MEASURED** 10s @ 1080p on the **developer** model (`google/gemini-omni-flash/image-to-video-developer`, production default): **$0.90** settled. The `MODEL_CAPS` formula (`base 0.20 + 0.10/s` → $1.20 @ 10s) **overstates** the developer variant by ~33% — do not quote $1.20 for it. Ledger now **reconciles** settled price (was estimate-forever — see [*Video cost reconciliation*](#video-cost-reconciliation-post-phase-b)). 720p same list tier as 1080p. | `VEO_CONCURRENCY=24` — the **submit+poll half only** since the 2026-08-05 split (raised 1→4 2026-08-02 probe, 4→12 2026-08-05, 12→24 2026-08-20). Omni RPS still unpublished, but no Omni 429 was ever recorded and a poll is ~2min of idle waiting, so widening this half is low-risk; Grok stays ≤1 RPS via `GROK_MAX_RPS` regardless. **Was falsely documented** as "must stay at 1 — provider 429s"; that belonged to retired direct-Veo / Grok 1 RPS, not Omni. The cap that still needs care is `REMOTION_QUEUE_CONCURRENCY=4` (8 OOM-killed the 8 GiB web box on 2026-08-21; reverted). **This work runs in adgen, not this web process** |
 > | **Catalog scan (sitemap + JSON-LD)** | Demo / catalog sync | Deterministic HTTP only — **no LLM** | Caps + per-host min-gap; bounded PDP concurrency |
 
 Non-secret defaults live in `config/defaults.env` (versioned). The Render dashboard holds **secrets only** (plus one deliberate non-secret exception, `JIRA_PROJECT_KEY`) — migration complete 2026-08-03; see [§9](#9-configuration--secrets) and CLAUDE.md §4a.
@@ -509,11 +508,11 @@ there is no lexical fallback. Full rationale, failure policy and consumer list:
 
 ## 5. Static-image ad generation (THE default ad path)
 
-> **Critical (corrected 2026-07-31 / re-verified 2026-08-03):** the default static ad is **one billable `openai/gpt-image-2/edit` call** that returns the finished ad (`services/directImageRenderService.js` `renderDirectImage`). **Was false:** "GPT-4.1 authors HTML → Puppeteer rasterizes → optional gpt-image-2 photoreal polish." That chain is **legacy HTML** only — reached solely when `Brand.staticImagePipeline === 'html'`. `resolveStaticPipeline` (`services/staticPipeline.js:69-70`) maps every other stored value (including `null`, `direct_overlay`, typos) to `direct_image`. Clients may only **write** `'direct_image'`; writing `'html'` is rejected.
+> **Critical (corrected 2026-07-31 / re-verified 2026-08-03; live path is adgen as of 2026-09-07):** the default static ad is **one billable `openai/gpt-image-2/edit` call** that returns the finished ad (`adgen/src/services/directImageRenderService.js` `renderDirectImage` `:2523`). **Was false:** "GPT-4.1 authors HTML → Puppeteer rasterizes → optional gpt-image-2 photoreal polish." That chain is **legacy HTML** only — reached solely when `Brand.staticImagePipeline === 'html'`. `resolveStaticPipeline` (`services/staticPipeline.js:69-70`) maps every other stored value (including `null`, `direct_overlay`, typos) to `direct_image`. Clients may only **write** `'direct_image'`; writing `'html'` is rejected.
 
 ### Trigger
 
-- `routes/ads.js` `POST /generate` → **202** + `setImmediate` → `campaignAdsGenerationService.expandWizardJob` → `selectAdsForRun` → `claimAdsForRun` → `runRenderLoop`. Expansion + mint + claim stay in this **web** process. **When `ADGEN_RENDERER_ENABLED=true`, `runRenderLoop` returns immediately** (`routes/ads.js:1715-1723`) and `liquidretail_adgen` renders. Flag off: the in-process loop in this file still runs.
+- `routes/ads.js` `POST /generate` → **202** + `setImmediate` → `campaignAdsGenerationService.expandWizardJob` → `selectAdsForRun` → `claimAdsForRun` → `runRenderLoop`. Expansion + mint + claim stay in this **web** process. `runRenderLoop` returns immediately (`routes/ads.js:1693`) and `adgen/src/services/renderer.js` renders. There is no in-process loop left.
 - `POST /api/ads/runs` drains already-queued inventory: `selectAdsForRun` then **`claimAdsForRun()`** (`routes/ads.js:645-750`) — atomic `updateMany` with `status:'queued'`, ownership re-read (`status:'rendering'` + `campaignRunIds: runId`), `modifiedCount` cross-check, post-claim requeue on throw. **Was false:** `/runs` lacked the claim `/generate` already had (double-bill hole on concurrent "render next batch").
 - `CampaignRun` tracks batch status; ad-batch progress via OperationRun kind `ad-batch`.
 - `GET /api/ads/runs/:runId` returns `perProduct` (machine codes + messages from `services/perProductReasons.js`). New code `concepts_no_usable_media` distinguishes "Director returned nothing" from "returned concepts but none usable". Run-level empty message uses `summarizeEmptyExpansion`, not the old generic "check imagery and templates".
@@ -638,13 +637,13 @@ Applied at `:504`, on the ranked wrappers, **before** `projectEntry()` and **bef
 
 ### Static regenerate — catalog-first reseed (`REGEN_RESEED_CATALOG_FIRST`)
 
-Shipped in `be5b83f` (2026-08-03). **Default ON** (`config/defaults.env`; unset/empty also ON — only `0`/`false`/`no`/`off` turns it off; `isRegenReseedCatalogFirstEnabled`, `adRegenerateService.js:110-114`).
+Shipped in `be5b83f` (2026-08-03). **Live in adgen** (`adgen/src/services/adRegenerateService.js`). Backend's copy of this subtree was deleted with the dormant in-process regenerate worker (2026-09-07); backend `regenerateAd()` stamps `Ad.regenerationRequest` and returns. **Default ON** (`adgen/config/defaults.env`; unset/empty also ON — only `0`/`false`/`no`/`off` turns it off; `isRegenReseedCatalogFirstEnabled`, `adgen/src/services/adRegenerateService.js:323-327`).
 
-**Why it exists.** `runImage` used to **replay** the stored stack (`Ad.referenceMediaIds` if non-empty, else `Ad.mediaIds`) and never re-derive (`adRegenerateService.js:477-482` is still that path when the reseed is skipped). Ads queued while `DIRECTOR_UNIVERSE_TOP_N` was 10 still hold 3+ entries in `mediaIds`, so every future regen re-sent that stack forever.
+**Why it exists.** `runImage` used to **replay** the stored stack (`Ad.referenceMediaIds` if non-empty, else `Ad.mediaIds`) and never re-derive (that skip-path is still `adgen/src/services/adRegenerateService.js` `runImage` around `:2246-2339` when the reseed is skipped). Ads queued while `DIRECTOR_UNIVERSE_TOP_N` was 10 still hold 3+ entries in `mediaIds`, so every future regen re-sent that stack forever.
 
 **NOT a trim.** Historical stacks were shotType-ranked **LIFESTYLE-FIRST** over a pool that **merges catalog with `product_match` UGC** (`shotTypeRank.js`). So `mediaIds[0]` is often a UGC post; trimming to `[0]` would permanently lock a social image as the seed. The fix **re-derives** the first catalog image instead.
 
-**Cascade** (`deriveFirstCatalogMediaId` / pure `pickFirstCatalogMediaId`, mirrors `campaignAdsGenerationService.js:2085` and `promoteFirstCatalogImage`):
+**Cascade** (`deriveFirstCatalogMediaId` `:428-475` / pure `pickFirstCatalogMediaId` `:393-410`, both in `adgen/src/services/adRegenerateService.js`; mirrors `campaignAdsGenerationService.js:2085` and `promoteFirstCatalogImage`):
 
 | Tier | Selects |
 |---|---|
@@ -652,9 +651,9 @@ Shipped in `be5b83f` (2026-08-03). **Default ON** (`config/defaults.env`; unset/
 | **2** | else same scope, earliest `createdAt` |
 | **3** | nothing — leave existing behaviour untouched (`NO_CATALOG_MEDIA`) |
 
-Every query pins `source:'catalog-product'` **and** the ad's own `metadata.catalogProductId` **and** `Media.brandId`. `isCatalogMediaForProduct` re-checks every candidate (`adRegenerateService.js:150-172`). A catalog **VIDEO** can never win (`fileType === 'video'` and `metadata.imageRole === 'video'` both reject — `source:'catalog-product'` includes videos from Shopify ingest). An unusable/missing `fileUrl` is an **honest skip**, not a silent fallback to the ad's original seed (that would re-lock the UGC seed under a success log).
+Every query pins `source:'catalog-product'` **and** the ad's own `metadata.catalogProductId` **and** `Media.brandId`. `isCatalogMediaForProduct` re-checks every candidate (`adgen/src/services/adRegenerateService.js:363-385`). A catalog **VIDEO** can never win (`fileType === 'video'` and `metadata.imageRole === 'video'` both reject — `source:'catalog-product'` includes videos from Shopify ingest). An unusable/missing `fileUrl` is an **honest skip**, not a silent fallback to the ad's original seed (that would re-lock the UGC seed under a success log).
 
-**Gates** (`reseedDecision`, all four required):
+**Gates** (`reseedDecision` `:334-354`, all four required):
 
 1. Flag on.
 2. `ad.kind !== 'video'` (static only).
@@ -662,13 +661,13 @@ Every query pins `source:'catalog-product'` **and** the ad's own `metadata.catal
 4. `Ad.referenceMediaIds` empty — a non-empty operator pick **always wins**.
 5. `ad.productId` present.
 
-**NOT persisted.** The derived stack is computed at regenerate time and passed into `renderDirectImage` only (`referenceSource: 'catalog-first'`). Writing it back onto `Ad.mediaIds` would rewrite historical rows and make the kill switch useless after one regen. Flipping `REGEN_RESEED_CATALOG_FIRST=false` restores the old output on the next regen with no code deploy. **Not a money knob** — still exactly one `gpt-image-2/edit` per regen; reference count does not move price (`atlasImageService.js:75-104`).
+**NOT persisted.** The derived stack is computed at regenerate time and passed into `renderDirectImage` only (`referenceSource: 'catalog-first'`; applied at `adgen/src/services/adRegenerateService.js:2310-2338`, consumed by `adgen/src/services/directImageRenderService.js` `renderDirectImage` `:2523`). Writing it back onto `Ad.mediaIds` would rewrite historical rows and make the kill switch useless after one regen. Flipping `REGEN_RESEED_CATALOG_FIRST=false` restores the old output on the next regen with no code deploy. **Not a money knob** — still exactly one `gpt-image-2/edit` per regen; reference count does not move price (`atlasImageService.js:75-104`).
 
-**Pinned by** `scripts/verifyRegeneration.js` (R3 gate matrix, R3b cascade tiers, R3c fileUrl/video/cross-tenant).
+**Pinned by** backend `scripts/verifyRegeneration.js` R3/R3b/R3c were **removed** with the backend subtree (2026-09-07).
 
 ### Stages (live direct-image path)
 
-Entry: `runRenderLoop` → `renderCreative` → outer `adStage(…, static image generation (surface))` (`routes/ads.js:1403`) → `renderStage` (`renderService.js:482-511`) for every static `ai_*` template → `directImage.renderDirectImage`. Stages are fire-and-forget via `services/adStage.js` (NEVER awaited — sits where Atlas is already billed; `AD_STAGE_MIN_MS` floor default ~3s). Poll progress piggybacks the **existing** image poll tick (`ATLAS_IMAGE_POLL_MS` default 3s), e.g. `plate generation (meta_feed_1_1) — polling 20s (7)`.
+Entry (live, in adgen): `adgen/src/services/renderer.js` `renderStatic` `:843` → `directImage.renderDirectImage` (`adgen/src/services/directImageRenderService.js:2523`) for every static `ai_*` template. Backend's `renderCreative` / `renderService.js` mint-time path was deleted 2026-09-07. Stages are fire-and-forget via `services/adStage.js` (NEVER awaited — sits where Atlas is already billed; `AD_STAGE_MIN_MS` floor default ~3s). Poll progress piggybacks the **existing** image poll tick (`ATLAS_IMAGE_POLL_MS` default 3s), e.g. `plate generation (meta_feed_1_1) — polling 20s (7)`.
 
 1. **Ensure product imagery** — `ensureDetectForProducts` for campaign products ([§3](#3-per-product-detect--overlay-zones--ad-readiness-deferred-to-ad-time)).
 2. **Concept expansion** — when `AI_CONCEPT_DRIVEN=true` (default): Director + Judge → Ad rows with `renderRoute: 'html_gen'` (**misnomer** — means "static", not "the HTML renderer"; real path is chosen inside `renderService`). Reads of `media_picks` / `creative_style` / `output_shape` go through `conceptProjection` only.
@@ -979,7 +978,7 @@ output shape.
 
 - Wizard / API: `POST /api/ads/preview` (dry-run) or `POST /api/ads/generate` → `campaignAdsGenerationService.expandWizardJob` when resolved kinds include `video` and format flags allow (`AI_VEO_FEED` / `AI_VEO_REELS`).
 - Phase-3 body fields (also on preview): `directorVariants`, `seedMediaIds`, `videoPromptGuidance`, `videoPromptRaw` (`routes/ads.js` `parsePhase3WizardFields`).
-- Render: `selectAdsForRun` → `runRenderLoop`. **Flag on:** adgen renderer (`src/services/renderer.js` `renderVideo`) calls `videoRouter.prepareStoryboard` then `atlasVideoService.generateForAd`. **Flag off:** this repo's `runRenderLoop` does the same via `routes/ads.js`. `VIDEO_PROVIDER=atlas` is the default in both.
+- Render: `selectAdsForRun` → `runRenderLoop` (handoff only). Adgen renderer (`adgen/src/services/renderer.js` `renderVideo` `:1172`) calls `videoRouter.prepareStoryboard` then `videoRouter.generateForAd`. Backend's in-process `runRenderLoop` worker-pool was deleted 2026-09-07. `VIDEO_PROVIDER=atlas` is the committed default; production currently overrides to `gemini` on the adgen-renderer dashboard.
 
 ### Expansion routing (`expandWizardJob`)
 
@@ -1030,11 +1029,9 @@ Duration pin: Google PMax video floors to **10s** when the wizard leaves duratio
 
 `pmax_video_1_1` is **never** an Omni submit. On Google master runs, expansion mints one extra Ad per product with `deriveFromMaster: 'pmax_video_9_16'` (`Ad.deriveFromMaster` schema field, default null).
 
-**THE SHARED GATE:** `resolveDeriveFromMaster(ad)` lives in `services/campaignAdsGenerationService.js` and is **imported** by both `routes/ads.js` (render loop) and `services/adRegenerateService.js` (regenerate). It is **fail-closed on platformFormat** — `pmax_video_1_1` alone is sufficient, so a dropped/absent `deriveFromMaster` field can never turn a free surface into a paid one. **Do not re-implement it per caller** — a per-caller copy is exactly how the regenerate hole (below, defect 2) opened.
+**THE SHARED GATE:** `resolveDeriveFromMaster(ad)` lives in `services/campaignAdsGenerationService.js` (and the hand-synced adgen copy) and is **imported** by `services/adRegenerateService.js` (regenerate preflight) and by adgen's renderer. It is **fail-closed on platformFormat** — `pmax_video_1_1` alone is sufficient, so a dropped/absent `deriveFromMaster` field can never turn a free surface into a paid one. **Do not re-implement it per caller** — a per-caller copy is exactly how the regenerate hole (below, defect 2) opened.
 
-**Render path (dormant fallback only — in production this crop+titling runs inside `liquidretail_adgen`'s renderer, not here; see the Render cutover note at the top of this file):** `renderDeriveOnlyVideoAd` in `routes/ads.js`. When `ADGEN_RENDERER_ENABLED` is not `'true'`, the gate is evaluated **before** the first Omni submit and returns. It **waits in-render** for the master's plate (`DERIVE_MASTER_WAIT_MS` default 12 min, poll `DERIVE_MASTER_POLL_MS` default 10s) rather than requeueing, then crops + titles. Master failed/absent → honest failure, **never** an Omni fallback. Same draft → titling → done money discipline as the master path (untitled is not success).
-
-**When the in-render wait itself expires (master still `queued`/`rendering`, 2026-08-20, dormant fallback path only — `ADGEN_RENDERER_ENABLED` not `'true'`):** `handleDeriveMasterBackup` (extracted from `renderDeriveOnlyVideoAd`) — **never abandons the ad.** It requeues to `queued` (same zero-submit write as before) and immediately reclaims through the SAME atomic claim path stranded ads use (`requeueStrandedAds` → `claimAdsForRun`), instead of leaving the ad for an operator click or a crash-triggered sweep to notice — that passive hand-off was the actual bug (`services/strandedRunSweeper` only scans ads whose run is `failed`, and the run a derive-wait ad backs out of normally finishes `done`). It also fires one Slack notice per backup **episode** (keyed on the master, via `alertService`'s own dedupe — not one per ad, not one per poll), distinguishing a merely-queued master from one that looks genuinely stuck (`rendering` with no heartbeat past `reapStaleMin()`). The old hard cap (`MAX_DERIVE_WAIT_ATTEMPTS`, 30 cycles) no longer fails the ad — it only escalates the alert from `warn` to `error`. See `scripts/verifyDeriveWaitBackup.js`.
+**Render path (live, in adgen):** `adgen/src/services/renderer.js` `renderVideo` `:1172` — the derive arm starts at `:1182`. The gate is evaluated **before** any Omni submit. Master failed/absent → honest failure, **never** an Omni fallback. Same draft → titling → done money discipline as the master path (untitled is not success). Backend's `renderDeriveOnlyVideoAd` / `handleDeriveMasterBackup` in `routes/ads.js` were deleted 2026-09-07.
 
 **Why wait-in-render (not requeue):** the whole run dispatches in one wave (`VEO_CONCURRENCY`), so the master is almost always still `rendering` when the derive Ad starts. Immediate requeue left the free 1:1 stranded in `queued` forever — reaper + stranded sweeper only look at `rendering` ads / failed runs, and a second Generate short-circuits with "Nothing to render" because the deterministic video digest is run-independent by design. Both operator work-arounds cost money.
 
@@ -1055,7 +1052,7 @@ An earlier draft appended `videoDurationSec` to the video identity digests **unc
 Record these — they are the expensive lessons. Pinned by `scripts/verifyPmaxVideoExpansion.js` section F (54 checks total; revert-proven against 9 mutations):
 
 1. **Digest re-mint (money, caught pre-merge)** — see above.
-2. **Regenerate billed a derive-only ad (CRITICAL).** `adRegenerateService.runVideoFull` called `veoService.generateForAd` unconditionally; nothing in the regenerate route/preflight looked at platformFormat — so Regenerate on a PMax 1:1 billed a brand-new Omni generation (**planning figure was $1.20** at the pinned 10s from the `MODEL_CAPS` formula; **MEASURED Phase B: $0.90** on the developer model — see [*Measured PMax unit costs*](#measured-pmax-unit-costs-phase-b-live-submits-2026-08-1011); up to $5.00 if the square routes to the per-second aspect-fallback model), up to the daily cap per ad. **FIX:** `preflight()` refuses derive-only ads with a **409** (before the 202 and before any provider call), using the **shared** gate.
+2. **Regenerate billed a derive-only ad (CRITICAL).** Backend's deleted `adRegenerateService.runVideoFull` called `veoService.generateForAd` unconditionally; nothing in the regenerate route/preflight looked at platformFormat — so Regenerate on a PMax 1:1 billed a brand-new Omni generation (**planning figure was $1.20** at the pinned 10s from the `MODEL_CAPS` formula; **MEASURED Phase B: $0.90** on the developer model — see [*Measured PMax unit costs*](#measured-pmax-unit-costs-phase-b-live-submits-2026-08-1011); up to $5.00 if the square routes to the per-second aspect-fallback model), up to the daily cap per ad. **FIX (still live on backend):** `preflight()` refuses derive-only ads with a **409** (before the 202 and before any provider call), using the **shared** gate. Live `runVideoFull` is `adgen/src/services/adRegenerateService.js:1580`.
 3. **Derive mint without its source master** — `isGoogleVideoMasterRun` fixed (above).
 4. **Fallback reinstate of derive-only as billable** — strip on live + dry-run (above).
 5. **Free 1:1 stranded on every first run** — wait-in-render (above).
@@ -1063,7 +1060,7 @@ Record these — they are the expensive lessons. Pinned by `scripts/verifyPmaxVi
 
 #### Titling + composition mapping
 
-On the dormant fallback path (`ADGEN_RENDERER_ENABLED` not `'true'`), `classifyFormat` (`brandScriptExecutor.js:89-94`) checks **SQUARE BEFORE LANDSCAPE**, and `isLandscapeFormat` matches `/pmax_landscape|preroll|youtube|16_9/` instead of bare `/pmax/`. Without this, `pmax_video_1_1` and `pmax_square_1_1` were swallowed by a landscape rule that matched every `pmax_*` id and would have titled on the 1920×1080 composition. (In production, adgen's own ported `brandScriptExecutor` does this instead.) Verified mapping: 9:16 → `CanonicalVertical` 1080×1920, 1:1 → `CanonicalSquare` 1080×1080, 16:9 → `CanonicalLandscape` 1920×1080.
+`classifyFormat` (`adgen/src/services/brandScriptExecutor.js:110-115`; backend's copy at `services/brandScriptExecutor.js:77` is still used by debug/preview routes, not mint-time render) checks **SQUARE BEFORE LANDSCAPE**, and `isLandscapeFormat` matches `/pmax_landscape|preroll|youtube|16_9/` instead of bare `/pmax/`. Without this, `pmax_video_1_1` and `pmax_square_1_1` were swallowed by a landscape rule that matched every `pmax_*` id and would have titled on the 1920×1080 composition. Verified mapping: 9:16 → `CanonicalVertical` 1080×1920, 1:1 → `CanonicalSquare` 1080×1080, 16:9 → `CanonicalLandscape` 1920×1080.
 
 **`classifyFormat` MUST keep returning the four CANVAS formats**
 (`vertical|square|landscape|feed`) — that string is also the **composition id**
@@ -1296,9 +1293,9 @@ the STATIC-surface entries + the funnel/proof hierarchy above.
   still resolves to exactly ONE master (submit count unchanged); duration
   pinned to 10s for Google and left null for Meta; duration does **not** alter
   any pre-existing format's digest but **does** for Google; the derive gate is
-  fail-closed and defined **once**; `renderDeriveOnlyVideoAd` contains **zero**
-  billable submit calls (comment-stripped so a money-ASSERT comment cannot
-  false-pass); the gate precedes the first submit; section F pins all six
+  fail-closed and defined **once**; backend `renderDeriveOnlyVideoAd` is
+  **gone** (adgen's `renderVideo` derive arm contains **zero** billable
+  submit calls); the gate precedes the first submit; section F pins all six
   defects above.
 - **NEW** `scripts/verifyPmaxPromptOverlay.js` — **314 checks**, Phase B
   prompt harness: Meta byte-identity in **both** flag arms (require-cache
@@ -1499,18 +1496,16 @@ Non-Cloudinary sources can't be transformed by URL, so they pad locally via `pad
 
 ### Titling composite
 
-- **Dormant fallback only** (production titling runs via adgen's own ported `brandScriptExecutor`, not this repo's copy): downstream of base video: `brandScriptExecutor` → **Remotion only**. There is no working canvas override — `resolveTitlingEngine` returns `{ engine: 'remotion' }` **unconditionally** (`brandScriptExecutor.js:913-922`); the cascade below it is inside `/* … */`. `TITLING_ENGINE` and `videoSettings.titlingEngine` are inert. See `docs/TITLING.md` §0. **Was falsely cited at `:806`** — that line region is now `deriveTheme`.
+- Live mint-time titling is adgen (`adgen/src/services/brandScriptExecutor.js` → Remotion). Backend's copy is still used by debug/preview / `routes/brand.js` retitle, not mint-time render. There is no working canvas override — `resolveTitlingEngine` returns `{ engine: 'remotion' }` **unconditionally**. `TITLING_ENGINE` and `videoSettings.titlingEngine` are inert. See `docs/TITLING.md` §0.
 - Title template for layoutInput derivation is **canonical `ai_brand_led`** unless cascaded `titleTemplate` override.
 - Placement mode / engine: see `docs/TITLING.md` (`titlePlacementMode`, `titleStyleSpec` cascade including category).
 - **Does not use overlay zones** — text is scripted, not zone-driven product overlay.
 - **Quote gate on video:** `buildMetaForAd` runs `gateLayoutInputQuotes` → `toPrintableCustomerQuote` on `primary_quote` before Remotion chrome typesets it (`brandScriptExecutor.js` ~588-646, call at ~679). Same allowlist as static. **Was false:** video path did not dual-gate.
-- **Video-title Director stamp (`fba81588`):** mint writes `Ad.videoTitleDirection` inside `expandDeterministicVideo`; titling reads it via `applyBenefitsPlacement` after `resolveSpec` (`brandScriptExecutor.js:2182-2188`). Live titling is adgen, which ported **apply only** (`liquidretail_adgen@2c4b0b9`) — it does not re-call the LLM. Funnel stage is `resolveSpec`'s TIER 2.5 `intentPreset` floor, not a TIER-0 wipe. See CLAUDE.md §00 *Video-title Director*.
+- **Video-title Director stamp (`fba81588`):** mint writes `Ad.videoTitleDirection` inside `expandDeterministicVideo`; titling reads it via `applyBenefitsPlacement` after `resolveSpec` (`adgen/src/services/brandScriptExecutor.js:2417-2418`). Adgen ported **apply only** — it does not re-call the LLM. Funnel stage is `resolveSpec`'s TIER 2.5 `intentPreset` floor, not a TIER-0 wipe. See CLAUDE.md §00 *Video-title Director*.
 
 ### Master → titling outcome (money + status)
 
-**Untitled video is no longer a success** (`routes/ads.js:1258-1361`, backend's
-dormant in-process fallback — `ADGEN_RENDERER_ENABLED` not `'true'`; in
-production this sequence runs inside adgen's renderer instead):
+**Untitled video is no longer a success** (live in `adgen/src/services/renderer.js` `renderVideo`; backend's in-process copy in `routes/ads.js` was deleted 2026-09-07):
 
 1. Omni master lands → stamp `veoVideoUrl` / `renderUrl` and set `status:'draft'` **before** titling. Intermediate draft is deliberate: without it a crash mid-titling leaves `rendering`, the reaper requeues, and the next drain **pays Omni again**.
 2. Remotion titling runs (`adStage` `titling <aspect>`). No-chrome is intentional success (raw master ships).
@@ -1547,25 +1542,13 @@ production this sequence runs inside adgen's renderer instead):
 | Camera prompt builder | `services/veoPromptBuilder.js` | `buildVeoPrompt`, `enforceRawByteCap` |
 | Title style cascade | `services/titleSpecService.js` | `resolveSpec` (ad > product > category > brand) |
 | Brand title/script composite | `services/brandScriptExecutor.js` | Titling over base video + video quote gate |
-| Provider router | `services/videoRouter.js` | `VIDEO_PROVIDER` → atlas / vertex |
+| Provider router | `adgen/src/services/videoRouter.js` | `VIDEO_PROVIDER` → atlas / gemini / vertex. Backend's copy was deleted 2026-09-07 (orphaned once the in-process fallback went). |
 | Storyboard text (Vertex / legacy) | `services/veoStoryboardService.js` | GPT storyboard when that path uses it; **Atlas path retired storyboard** (Ken Burns prompt is complete) |
 | Direct Veo fallback (deprecated) | `services/aiVideoReferenceService.js` | `VIDEO_PROVIDER=vertex` |
 
-**This repo's `videoRouter.js` has only two arms (`atlas` / `vertex`) — it
-does not carry a `gemini` branch, and there is no `geminiVideoService.js` in
-this tree at all.** `liquidretail_adgen` added a third `VIDEO_PROVIDER=gemini`
-option directly in its own copy (PRs #108/#110/#113, `origin/master` @
-`fde6003`) without porting it back here — a one-way divergence from the usual
-vendoring direction. Confirmed live 2026-09-04 (Render API query,
-`adgen-renderer` env-vars): production video generation is dispatched from
-adgen (`ADGEN_RENDERER_ENABLED=true`), where `VIDEO_PROVIDER` is currently
-overridden to `gemini` on the dashboard. This backend router is the
-**dormant fallback path** (used only when `ADGEN_RENDERER_ENABLED` is not
-`'true'`) and would still run Atlas or Vertex only — it has no way to reach
-Gemini even if that fallback ever activated. Don't assume the two repos'
-`videoRouter.js` files are symmetric; they aren't, as of this divergence.
+Adgen's `videoRouter.js` is the live provider switch (atlas / gemini / vertex). Production video generation is dispatched from adgen, where `VIDEO_PROVIDER` is currently overridden to `gemini` on the adgen-renderer dashboard. Backend's `services/videoRouter.js` was the dormant fallback and is gone.
 
-**Render-loop stage map (video), dormant fallback only** — `routes/ads.js` + `atlasVideoService` + `brandScriptExecutor` piggyback existing poll ticks (`ATLAS_POLL_INTERVAL_MS` 15s) when `ADGEN_RENDERER_ENABLED` is not `'true'`; in production adgen's renderer emits its own stage telemetry. No new timers.
+**Render-loop stage map (video)** — adgen's renderer emits stage telemetry; backend's in-process loop was deleted 2026-09-07. No new timers.
 
 | Stage string (examples) | When |
 |---|---|
@@ -1652,12 +1635,10 @@ Secret: `ATLAS_API_KEY`.
 > - **CRITICAL API trap:** Slack returns HTTP 200 with `{ok:false,error:…}` on logical failure (bad token, `channel_not_found`, `not_in_channel`, …). Checking `res.ok` alone reports success while nothing was delivered (`alertService.js:220-240`). Always require `body.ok === true`.
 > - Boot: worker logs `🔔 alerts: Slack configured` when the token is present (`worker.js`).
 >
-> That doc also records *why* video batches stall. Pre-cutover /
-> flag-off: `runRenderLoop` executes in the **web** process, which Render
-> replaces on deploy **and** on autoscale, and reaped ads land in `queued`
-> where nothing drains them automatically. Flag-on: the loop lives in
-> `liquidretail_adgen`'s renderer; this reaper skips `claimedByWorker != null`
-> rows (`worker.js:387-405`).
+> That doc also records *why* video batches stall. The loop lives in
+> adgen's renderer; this reaper skips `claimedByWorker != null`
+> rows (`worker.js:387-405`). Backend's in-process `runRenderLoop` worker-pool
+> was deleted 2026-09-07.
 
 ### Core
 
@@ -1711,7 +1692,7 @@ Single resolver: `services/concurrency.js` (frozen `concurrency` object; boot lo
 | `HTTP_SCRAPE_DOMAIN_CONCURRENCY` | 3 | In-flight HTTP per host |
 | `DIRECTOR_UNIVERSE_TOP_N` | **1** | Not a render pool — Director seed window (see §5) |
 
-`runRenderLoop` runs **two pools in parallel** (`routes/ads.js:1805-1806`): `veo` at `VEO_CONCURRENCY` and `image` at `RENDER_CONCURRENCY`. Mixed batches no longer collapse both kinds onto one knob. Since the 2026-08-05 split the `veo` pool covers **submit+poll only**; `VEO_CONCURRENCY` is not what bounds memory. **CORRECTED 2026-08-28** — this paragraph used to also credit `VEO_TITLING_CONCURRENCY` with bounding the (now-removed) in-process Remotion titling prep half; that knob and the code it gated are both deleted. `REMOTION_QUEUE_CONCURRENCY` is unaffected — it still bounds `remotionRenderService.js`'s own render queue, now reached only via `routes/brand.js`'s manual retitle endpoints.
+`runRenderLoop` no longer runs in-process worker pools — it flips the CampaignRun to `running` and returns (`routes/ads.js:1693`). Adgen's renderer owns submit+poll and titling. `VEO_CONCURRENCY` / `RENDER_CONCURRENCY` on this web process are leftover knobs from the deleted fallback. **CORRECTED 2026-08-28** — this paragraph used to also credit `VEO_TITLING_CONCURRENCY` with bounding the (now-removed) in-process Remotion titling prep half; that knob and the code it gated are both deleted. `REMOTION_QUEUE_CONCURRENCY` is unaffected — it still bounds `remotionRenderService.js`'s own render queue, now reached only via `routes/brand.js`'s manual retitle endpoints.
 
 ---
 
@@ -1737,7 +1718,7 @@ Versioned with the repo. Feature flags, tuning knobs, public IDs/URLs, Slack cha
 |---|---|
 | AI creative feature flags | `AI_CONCEPT_DRIVEN`, `AI_HTML_LAYOUT_ENABLED`, `AI_LAYOUT_DIRECT_HTML`, `CANONICAL_DR_V1`, `RENDER_USE_HTML`, `RENDER_USE_RESOLVED` |
 | Director seed window | `DIRECTOR_UNIVERSE_TOP_N=1` |
-| Static regenerate reseed | `REGEN_RESEED_CATALOG_FIRST=true` (default ON; kill switch for catalog-first reseed on regenerate — see §5) |
+| Static regenerate reseed | `REGEN_RESEED_CATALOG_FIRST=true` (default ON in `adgen/config/defaults.env`; kill switch for catalog-first reseed on regenerate — live at `adgen/src/services/adRegenerateService.js:323-327`, see §5). Removed from this repo's `config/defaults.env` 2026-09-07. |
 | Static direct-image path | `AI_DIRECT_IMAGE_*` (edit model / quality / timeout). `AI_IMAGE_REFERENCE_*` kept **inert** (no live consumer) |
 | PMax Phase B creative knobs | `PMAX_STATIC_PLATFORM_NOTES=true`, `VIDEO_HOOK_FIRST_PROMPT=false` (legacy alias `PMAX_VIDEO_DIRECTIVES=false` — flipped from `true` by the 2026-08-20 owner revert, CLAUDE.md §00), `PMAX_PROOF_STRONG_RATING=4.5`, `PMAX_PROOF_MIN_REVIEW_COUNT=100` (prompt text only — not money knobs). ⚠️ The Meta-byte-identity claim now holds for the **static** flag always, and for the video flag's shipped **OFF arm** — which, as of 2026-08-20, means BOTH Meta and PMax **video** default to the frozen camera prompt; the 2026-08-18 hook-first standardization is preserved as the explicit opt-in (`=true`) |
 | Video (Omni under `veo*` names) | `AI_VEO_FEED`, `AI_VEO_REELS`, `AI_VIDEO_POSTER_ENABLED`, `VIDEO_PROVIDER`, `VEO_USE_GPT_STORYBOARD`, `ATLAS_*`, `VEO_CONCURRENCY=24`, `REPEAT_PRIMARY_REFERENCE=false` |
@@ -1792,7 +1773,7 @@ No Telegram secrets remain. Alerts stay disabled until `SLACK_BOT_TOKEN` is set.
 
 **The trap (production incident 2026-08-05).** `Ad.generatedAt` (`models/Ad.js`) is stamped **once**
 when the row is created and is **never updated again** — not by a fresh render
-(`services/renderService.js` `persistStage`, which writes `status`/`renderedAt`/`renderUrl`) and not
+(adgen's renderer stamps `status`/`renderedAt`/`renderUrl`; backend `renderService.persistStage` was deleted 2026-09-07) and not
 by dedupe-reuse (`routes/ads.js` `claimAdsForRun`, which only `$addToSet`s `campaignRunIds` and flips
 status). `renderedAt` **is** written on every real render, including a re-render of a reused row.
 
@@ -1920,9 +1901,9 @@ naming sites, because the campaigns mirror is exactly what a named-site-only har
 | Quote provenance | `quoteProvenance.js` (`toPrintableCustomerQuote`), `layoutInputService.js` (pool), `brandScriptExecutor.js` (video gate) |
 | Concept dual-read (v2/v3) | `conceptProjection.js` — **only** sanctioned reader of Director routing fields |
 | Per-product expand reasons | `perProductReasons.js`, stamped on `CampaignRun.perProduct` |
-| Static ads (default direct-image) | `routes/ads.js`, `campaignAdsGenerationService.js`, `directImageRenderService.js`, `staticPipeline.js`, `renderService.js`, `atlasImageService.js`, `adStage.js` |
-| Static ads (legacy HTML only) | `aiCanvasHtmlGeneratorService.js`, Puppeteer arm of `renderService.js` — only `Brand.staticImagePipeline==='html'` |
-| Video (deterministic-first + director opt-in; Omni under `veo*`) | `campaignAdsGenerationService.js` (expand/select + `resolveDeriveFromMaster` / `GOOGLE_VIDEO_MASTERS`), `atlasVideoService.js`, `veoPromptBuilder.js`, `categoryChainService.js`, `titleSpecService.js`, `brandScriptExecutor.js`, `videoRouter.js`, `adStage.js`, `routes/ads.js` (`/preview`, `/generate`, `/runs` + `claimAdsForRun`, `/formats`, `/veo-prompt-scaffold`, `renderDeriveOnlyVideoAd`), `adRegenerateService.js` (shared derive gate in preflight), `routes/catalog.js` (`PATCH .../categories/:id`) |
+| Static ads (default direct-image) | mint here: `routes/ads.js`, `campaignAdsGenerationService.js`; live render in `adgen/src/services/renderer.js` `renderStatic` + `adgen/src/services/directImageRenderService.js` `renderDirectImage` `:2523`; `staticPipeline.js`, `atlasImageService.js`, `adStage.js`. Backend `renderService.js` mint-time path deleted 2026-09-07. |
+| Static ads (legacy HTML only) | `aiCanvasHtmlGeneratorService.js` — only `Brand.staticImagePipeline==='html'`; backend `renderViaSpec` / Puppeteer arm of `renderService.js` is the dead path CLAUDE.md §1 already documents |
+| Video (deterministic-first + director opt-in; Omni under `veo*`) | mint here: `campaignAdsGenerationService.js` (expand/select + `resolveDeriveFromMaster` / `GOOGLE_VIDEO_MASTERS`); live render in `adgen/src/services/renderer.js` `renderVideo` `:1172` + `adgen/src/services/videoRouter.js`; `atlasVideoService.js`, `veoPromptBuilder.js`, `categoryChainService.js`, `titleSpecService.js`, `brandScriptExecutor.js`, `adStage.js`, `routes/ads.js` (`/preview`, `/generate`, `/runs` + `claimAdsForRun`, `/formats`, `/veo-prompt-scaffold`), `adRegenerateService.js` (shared derive gate in preflight). Backend `renderDeriveOnlyVideoAd` deleted 2026-09-07. |
 | Google PMax surfaces (Phase A + B + post-B addendum) | `platformFormats.js` (`GOOGLE_*_FANOUT`, `GOOGLE_VIDEO_MASTERS`), `staticAdIntents.js` (`GEN_SIZES` + `SURFACE_EDGE_MARGIN_PCT` + `PLATFORM_NOTES` / `resolveDrawCta`), `veoPromptBuilder.js` (`PMAX_DIRECTIVES`), `aiCreativeDirectorService.js` (funnel + proof hierarchy; `DIRECTOR_SIGNALS_VERSION` 3.3.0), `brandScriptExecutor.js` / `remotionRenderService.js` / `remotion/lib/safeZones.js` (Yt zone wiring; funnel presets remain **8s** — 10s re-time reverted), `atlasVideoService.js` (video cost reconcile), `campaignAdsGenerationService.js`, `routes/ads.js` derive path, `scripts/verifyPmaxVideoExpansion.js`, `scripts/verifyPmaxPromptOverlay.js`, `scripts/verifyVideoCostReconcile.js` |
 | Concurrency table | `services/concurrency.js`, `config/defaults.env` |
 | Alerting | `alertService.js` (Slack), `processAlerts.js` (worker watchdog) |
