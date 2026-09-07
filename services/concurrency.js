@@ -131,7 +131,23 @@ const SPEC = Object.freeze({
     min: 1,
     max: 32,
     ceiling: 'SELF-IMPOSED',
-    why: 'Products in flight during catalog YOLO detection. Each product submits ONE /detect-batch (hero + alts), so effective HTTP load is CATALOG_YOLO_CONCURRENCY concurrent /detect-batch calls — default 6, not 6×8=48 sequential /detect (batch shipped in 0e892463). Sized at 6 against a reported 12-slot cluster (3 instances × 4 gunicorn workers; UNVERIFIED in this repo). GUNICORN_WORKERS=2 + TIMEOUT=100 in defaults.env:866 is stale vs that 4×3 report. yoloLoadLimiter enforces the 6 process-wide so overlapping chains cannot stack. YOLOv8x holds ~500MB RSS per worker — budget headroom before scaling the microservice.'
+    why: 'Products in flight during catalog YOLO detection. Each product submits ONE /detect-batch (hero + alts), so effective HTTP load is CATALOG_YOLO_CONCURRENCY concurrent /detect-batch calls — default 6, not 6×8=48 sequential /detect (batch shipped in 0e892463). Sized at 6 against a reported 12-slot cluster (3 instances × 4 gunicorn workers; UNVERIFIED in this repo). GUNICORN_WORKERS=2 + TIMEOUT=100 in defaults.env:866 is stale vs that 4×3 report. yoloLoadLimiter enforces the 6 process-wide so overlapping chains cannot stack. YOLOv8x holds ~500MB RSS per worker — budget headroom before scaling the microservice. THIS IS THE OUTSIDE-WINDOW VALUE ONLY as of services/yoloConcurrencyWindow.js (2026-09-06) — see CATALOG_YOLO_NIGHT_CONCURRENCY below for the nightly-window boost; both yoloLoadLimiter.js and catalogYoloDetectionService.js resolve through that one shared function now, not this value directly.'
+  },
+  // Nightly-window BOOST on top of CATALOG_YOLO_CONCURRENCY above — resolved
+  // per-instant by services/yoloConcurrencyWindow.js, never read directly by
+  // either concurrency enforcement point (yoloLoadLimiter.js's semaphore,
+  // catalogYoloDetectionService.js's dispatch-loop cap). Windows (Pacific
+  // time, DST-aware): weeknights [01:00,04:00) PT (Mon-Fri mornings),
+  // weekend nights [00:00,05:00) PT (Sat/Sun mornings) — chosen because
+  // live /detect traffic (which does NOT share this limiter) is lowest
+  // then, per owner direction.
+  CATALOG_YOLO_NIGHT_CONCURRENCY: {
+    env: 'CATALOG_YOLO_NIGHT_CONCURRENCY',
+    default: 9,
+    min: 1,
+    max: 32,
+    ceiling: 'SELF-IMPOSED',
+    why: 'Boosted catalog-YOLO concurrency during defined nightly low-live-traffic windows only (services/yoloConcurrencyWindow.js). 9 is a deliberately conservative ~50% bump off the base default of 6 — NOT the assumed-but-UNVERIFIED 12-slot cluster ceiling CATALOG_YOLO_CONCURRENCY documents above (3 instances × 4 gunicorn workers, never confirmed against the microservice itself). Chosen to leave real headroom under that unverified ceiling in case it is wrong, while still meaningfully accelerating the overnight backlog. Do not raise this again without first measuring that the microservice holds up cleanly above 6 concurrent /detect-batch calls — nobody has, as of 2026-09-06.'
   },
 
   // ── Hardcoded literals moved here (current behaviour as defaults) ───
