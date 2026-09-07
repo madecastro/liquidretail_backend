@@ -1,23 +1,21 @@
-// Brand-script executor. Parent-side orchestrator that composites a
-// brand's canvas overlay script over a Grok base video and produces a
-// final MP4. Alternative to the HTML/Puppeteer chrome pipeline for
-// brands that opt in via Brand.styleScript.
+// ⚠️ MINT-TIME / REGENERATE TITLING OF NEW ADS RUNS IN ADGEN, NOT HERE.
 //
-// Flow (per ad):
-//   1. Download Grok video to tempDir/base.mp4
-//   2. ffmpeg extract plates:  base.mp4 → plates/p%04d.png
-//   3. Spawn brandScriptRunner.child.js with clean env; write config
-//      JSON to stdin. Child loops frames, draws overlays, writes
-//      outFrames/f%04d.png.
-//   4. ffmpeg encode outFrames + base.mp4 audio → final.mp4
-//   5. Return { finalPath, tempDir } — caller uploads + cleans up.
+// This backend copy is LIVE only for preview / debug / ops:
+//   - POST /api/brand/:id/render-script   (routes/brand.js)
+//   - POST /api/brand/:id/title-still
+//   - POST /api/brand/:id/preview-script
+//   - scripts/retitleDriver.js (SSH-invoked ops)
+//   - GET ads generation-inspector reconstruction (buildMetaForAd only)
 //
-// Isolation model: the brand's styleScript is untrusted user input.
-// Running it in a child process with a scrubbed env (only PATH +
-// NODE_PATH) means a hostile script can only draw pixels — it never
-// sees Mongo URIs, API keys, or the parent's filesystem outside
-// tempDir. The child dies on any uncaught exception; parent surfaces
-// stderr in the thrown error so operators can debug.
+// Batch retitle (POST /:id/retitle-videos) stamps Ad.retitleRequest and
+// returns; adgen/src/services/retitleConsumer.js executes via adgen's
+// own copy of this file. New-generate and regenerate titling:
+// adgen/src/services/brandScriptExecutor.js (renderer + titler +
+// regenerateConsumer). Do not "fix regenerate Cloudinary cleanup" here
+// — that lives in adgen's uploadRenderAndStamp.
+//
+// Canvas VM runner (brandScriptRunner.child.js) is deleted.
+// resolveTitlingEngine returns 'remotion' unconditionally.
 
 const path = require('path');
 const { usableAttribution } = require('./quoteProvenance');
@@ -1497,6 +1495,9 @@ function buildVideoQcFailureFields(videoVisionQc) {
 // independent of ADGEN_RENDERER_ENABLED. See
 // services/handoffContract.js's retitleRequest entry and
 // docs/CONTRACT-backend-adgen.md Protocol D.
+// LIVE for preview/ops routes in THIS repo (render-script, retitleDriver).
+// Mint-time / regenerate / batch-retitle Cloudinary stamp lives in adgen's
+// copy. Do not "fix regenerate Cloudinary cleanup" here.
 async function uploadRenderAndStamp({ ad, finalPath, tempDir, timings, titlingSnapshot = null, brandName = null, preserveAdStatus = false }) {
   const fs = require('fs');
   const { uploadFileToCloudinary } = require('./cloudinaryService');

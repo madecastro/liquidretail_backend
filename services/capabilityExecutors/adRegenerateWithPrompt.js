@@ -5,12 +5,12 @@
 // (routes/agent.js + services/spendGuard) prevents dispatch until BOTH
 // the operator confirms AND the advertiser's daily cap has room.
 //
-// This executor kicks the regenerate job via setImmediate and returns
-// early with `regenerationStarted:true` — the actual render happens
-// asynchronously and takes 30-90s. The agent tells the operator to
-// poll ad.inspect for progress. Same pattern as the existing
-// POST /api/ads/:id/regenerate route (routes/ads.js) — we call the
-// preflight + service directly instead of self-HTTP.
+// This executor kicks the regenerate STAMP via setImmediate and returns
+// early with `regenerationStarted:true`. regenerateAd() does not render;
+// adgen's regenerate consumer claims Ad.regenerationRequest and executes
+// (30-90s). The agent tells the operator to poll ad.inspect for progress.
+// Same pattern as POST /api/ads/:id/regenerate — we call preflight +
+// the stamp helper directly instead of self-HTTP.
 
 'use strict';
 

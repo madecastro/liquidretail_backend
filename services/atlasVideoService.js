@@ -1,5 +1,11 @@
 // Atlas Cloud video generation — multi-model image-to-video service.
 //
+// ⚠️ generateForAd / prepareStoryboard are NOT called from this repo's
+// render or regenerate path (backend videoRouter deleted). Live submit
+// is adgen/src/services/atlasVideoService.js. This file's still-live
+// jobs here are reframe, scaffold, MODEL_CAPS, validateVideoSettings,
+// cost-reconcile helpers, and reference-stack policy.
+//
 // Default model (today): Gemini Omni Flash image-to-video
 // (google/gemini-omni-flash/image-to-video-developer). Accepts 1–7
 // reference images, renders a fixed-duration clip (META_VIDEO_DURATION_SEC,
@@ -3979,6 +3985,10 @@ function reconcileVideoCostFromTerminal(predictionId, terminalData = {}, deps = 
  * collect what we paid for. A submit here would double-bill, which is precisely
  * the hole services/spendReceipt.js documents. scripts/verifyVideoResume.js
  * asserts on this function's source that it contains no submit call.
+ *
+ * Backend bootRecoveryService no longer calls this (video-receipt recovery
+ * is excluded; image-only). Live caller is adgen's bootRecoveryService /
+ * regenerateConsumer reclaim path, against adgen's own copy of this file.
  */
 async function resumeForAd({ ad } = {}) {
   const predictionId = ad?.veoPredictionId || null;
@@ -4642,11 +4652,11 @@ async function warmLayoutInputForVideoAd({ ad }) {
   }
 }
 
-// Prepare the storyboard for an ad — context load + GPT storyboard
-// generation, no video generation. Used by the orchestrator to produce
-// the storyboard once before dispatching Grok and chrome in parallel.
-// Returns { storyboard, aspectRatio } so the caller can stamp it on
-// the Ad doc and pass it to both renderers.
+// Prepare the storyboard for an ad — context load + layoutInput warm,
+// no video generation. Atlas path returns { storyboard: null } (Ken Burns
+// prompt fully specifies camera). ⚠️ NOT CALLED FROM THIS REPO'S RENDER
+// PATH — same as generateForAd; the production caller was backend's
+// deleted videoRouter.js. Live copy: adgen/src/services/atlasVideoService.js.
 async function prepareStoryboard({ ad, operatorPrompt = null, modelOverride = null }) {
   const media = await Media.findById(ad.mediaId).lean();
   if (!media) throw new Error(`Media ${ad.mediaId} not found`);
@@ -4697,6 +4707,14 @@ async function prepareStoryboard({ ad, operatorPrompt = null, modelOverride = nu
   return { storyboard: null, aspectRatio, model };
 }
 
+// ⚠️ NOT CALLED FROM THIS REPO'S RENDER / REGENERATE PATH.
+// Backend's videoRouter.js (the only production caller) was deleted with
+// the dormant in-process fallback. Mint-time and regenerate video submit
+// live in adgen/src/services/atlasVideoService.js, reached via adgen's
+// videoRouter.generateForAd. This function remains because many
+// scripts/verify*.js harnesses pin its body by source-text, and helpers
+// it shares with the still-live reframe / prewarm / scaffold paths live
+// in this same file. Do not add a caller here.
 async function generateForAd({
   ad, operatorPrompt = null, storyboard: precomputedStoryboard = null, modelOverride = null,
   // The string CampaignRun.runId driving THIS render pass — NOT read off
