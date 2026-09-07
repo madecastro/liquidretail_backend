@@ -1,0 +1,35 @@
+{
+  "name": "aquatek-sailfish-9x16",
+  "notes": "Reproduction test for production incident on Ad 6a9ee4bd5bae0868d6622027 (derive) / master 6a9ee4a75bae0868d6621f57. Master failed vision QC: hallucinated PELAGIC logo on chest not present in reference photos, plus corrupted back-graphic text. Pelagic Gear 'Aquatek Sailfish Mind', Slate (https://pelagicgear.com/products/aquatek-sailfish-mind-slate). Guidance: cap cuts at 3, forbid added logos/graphics beyond reference photos. Raw catalog images, native resolution. 9:16, 10s.",
+  "seed": {
+    "url": "https://cdn.shopify.com/s/files/1/0230/8793/9662/files/1015233014-SLT-1_bc936269-8ff6-45bb-ac06-6b0f4ffe4aab.jpg?v=1784569876",
+    "refs": [
+      "https://cdn.shopify.com/s/files/1/0230/8793/9662/files/1015233014-SLT-3_17584955-c231-4072-b3c9-a1c1f6448afe.jpg?v=1784569876",
+      "https://cdn.shopify.com/s/files/1/0230/8793/9662/files/1015233014-SLT-4.jpg?v=1784569876"
+    ],
+    "productTitle": "Aquatek Sailfish Mind",
+    "brandHex": "#4d92b6"
+  },
+  "aspectRatio": "9:16",
+  "durationSec": 10,
+  "resolution": "720p",
+  "models": ["gemini-omni-1.1-flash"],
+  "variants": [
+    {
+      "id": "cuts-capped",
+      "guidance": "Structure this commercial with no more than 3 cuts/scenes total. Prefer fewer, longer shots over rapid cutting. Do not add, invent, or introduce any logo, wordmark, badge, or graphic that is not already visible in the supplied reference photos. If a region of the garment is blank or plain in the reference photos, keep it blank and plain in every frame of the video — do not fill it in with a new design."
+    }
+  ],
+  "titling": {
+    "enabled": true,
+    "preset": "canonical",
+    "platformFormat": "pmax_video_9_16",
+    "brandName": "Pelagic Gear",
+    "brand": {
+      "name": "Pelagic Gear",
+      "logoUrl": "https://res.cloudinary.com/reach-social-prod/image/upload/v1788358127/liquidretail/brand_logos/6a982d6bce057530d979e611-website-logo.svg",
+      "primaryColor": "#4d92b6"
+    },
+    "copy": { "headline": "Aquatek Sailfish Mind", "ctaText": "Shop Now" }
+  }
+}

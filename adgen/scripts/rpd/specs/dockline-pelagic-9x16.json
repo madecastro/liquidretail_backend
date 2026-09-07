@@ -1,0 +1,31 @@
+{
+  "name": "dockline-pelagic-9x16",
+  "notes": "Same as dockline-pelagic-16x9 but 9:16, 10s. Pelagic Gear 'Dockline' shirt, navy/honey colorway. Raw catalog (Shopify CDN) images, unresized per operator request. Titled with Pelagic Gear's real brand look.",
+  "seed": {
+    "url": "https://cdn.shopify.com/s/files/1/0230/8793/9662/files/11712263001-HNY-2.jpg?v=1787256250",
+    "refs": [
+      "https://cdn.shopify.com/s/files/1/0230/8793/9662/files/1172263001-NVY-29.jpg?v=1784579617",
+      "https://cdn.shopify.com/s/files/1/0230/8793/9662/files/1172263001-NVY-38.jpg?v=1784579615"
+    ],
+    "productTitle": "Dockline",
+    "brandHex": "#4d92b6"
+  },
+  "aspectRatio": "9:16",
+  "durationSec": 10,
+  "models": ["gemini-omni-1.1-flash"],
+  "variants": [
+    { "id": "baseline" }
+  ],
+  "titling": {
+    "enabled": true,
+    "preset": "canonical",
+    "platformFormat": "pmax_video_9_16",
+    "brandName": "Pelagic Gear",
+    "brand": {
+      "name": "Pelagic Gear",
+      "logoUrl": "https://res.cloudinary.com/reach-social-prod/image/upload/v1788358127/liquidretail/brand_logos/6a982d6bce057530d979e611-website-logo.svg",
+      "primaryColor": "#4d92b6"
+    },
+    "copy": { "headline": "Dockline", "ctaText": "Shop Now" }
+  }
+}
