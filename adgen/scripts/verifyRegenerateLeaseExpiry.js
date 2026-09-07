@@ -811,6 +811,10 @@ function claimedRow(ageMin, over = {}) {
     dSeed('src/services/alertService.js', {
       notifyAsync: () => {}
     });
+    dSeed('src/services/adCloudinaryCleanup.js', {
+      snapshotAdCloudinaryState: (ad) => ad,
+      destroyReplacedAdAssets: async () => []
+    });
 
     const trsPath = require.resolve(path.join(ROOT, 'src/services/titlingResumeService.js'));
     delete require.cache[trsPath];

@@ -405,25 +405,29 @@ check('F5 [ABSENCE] routes/ads.js no longer waits in-process for a derive master
   'the in-process derive wait came back — that wait moved to adgen');
 
 
-// F6: a derive-only ad's renderUrl IS its master's plate until it uploads
-// its own titled file — deleting it destroyed the video the master paid for.
-check('F6 DELETE does not destroy an inherited master plate (child side)',
-  /derive-from:/.test(adsSrc) && /stillInheritedPlate/.test(adsSrc),
-  'destroying the shared asset breaks the paid master ad too');
+// F6: DELETE used to gate shared-plate protection on PMax format names
+// (`stillInheritedPlate` / `masterOfLiveDerive` / PMAX_VIDEO_DERIVE_SOURCE).
+// That missed Meta masters and mixed-run shared-portrait plates. The route
+// now routes through destroyUnsharedAdAssets, whose shared-ref check is
+// format-agnostic (exact renderUrl OR veoVideoUrl on any other Ad).
+check('F6 DELETE routes Cloudinary destroy through destroyUnsharedAdAssets',
+  /destroyUnsharedAdAssets/.test(adsSrc) && /adCloudinaryCleanup/.test(adsSrc),
+  'inline destroy of renderUrl re-opens the shared-plate hole');
 
-// F6b: the SAME relationship from the master's side. The first fix was
-// asymmetric — a master carries no `derive-from:` marker, so deleting it fell
-// through and destroyed the plate its derive-only sibling still points at,
-// and that sibling cannot self-heal (regenerate is refused for derive-only).
-check('F6b [MONEY] DELETE checks for a dependent derive-only sibling before destroying a master plate',
-  /masterOfLiveDerive/.test(adsSrc)
-    && /platformFormat:\s*PMAX_VIDEO_DERIVE_ONLY/.test(adsSrc)
-    && /renderUrl:\s*ad\.renderUrl/.test(adsSrc),
-  'deleting the 9:16 master would destroy the plate the free 1:1 is still using');
+check('F6b [MONEY] DELETE no longer gates shared-plate protection on PMax format names',
+  !/stillInheritedPlate/.test(adsSrc)
+    && !/masterOfLiveDerive/.test(adsSrc)
+    && !/PMAX_VIDEO_DERIVE_SOURCE/.test(adsSrc),
+  'a PMax-only check misses Meta derive-children and mixed-run shared plates');
 
-check('F6c the dependent lookup fails CLOSED (keeps the asset when it cannot prove disuse)',
-  /masterOfLiveDerive = true;/.test(adsSrc),
-  'a failed lookup must keep a paid plate, not destroy it');
+{
+  const cleanupSrc = fs.readFileSync(path.join(ROOT, 'services/adCloudinaryCleanup.js'), 'utf8');
+  check('F6c [MONEY] the shared-ref lookup fails CLOSED (keeps the asset when it cannot prove disuse)',
+    /async function urlStillReferencedByOtherAd/.test(cleanupSrc)
+      && /return true;/.test(cleanupSrc.slice(cleanupSrc.indexOf('async function urlStillReferencedByOtherAd')))
+      && /\$or:\s*\[\s*\{\s*renderUrl:\s*url\s*\}\s*,\s*\{\s*veoVideoUrl:\s*url\s*\}\s*\]/.test(cleanupSrc),
+    'a failed lookup must keep a paid plate, not destroy it; the check must cover renderUrl OR veoVideoUrl');
+}
 
 // ── G. deriveWaitAttempts FIELD (still live — the sweeper uses it) ──
 //

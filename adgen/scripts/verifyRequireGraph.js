@@ -78,7 +78,11 @@ const { assertBackendRoot } = require('./lib/siblingBackend');
 // Freeze-N is the post-graft measured edge count (2026-09-06, this worktree).
 // Do not reuse 496 — that was a stale pre-graft number. A missing src/
 // used to print ✅ 0/0. Both asserts are load-bearing.
-const FREEZE_N = 512;
+// Bumped 512 -> 515 (ad Cloudinary hygiene): adRegenerateService requires
+// ./adCloudinaryCleanup; that file requires ../models/Ad and
+// ./cloudinaryService (lazy, still counted). Measured via this harness
+// itself: 515/515 resolved.
+const FREEZE_N = 515;
 const {
   fileExists,
   dirExists,

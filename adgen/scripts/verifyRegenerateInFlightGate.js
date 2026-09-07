@@ -279,6 +279,10 @@ seed('src/services/atlasVideoService.js', {
 seed('src/services/costTracker.js', {
   reconcileCost: () => { throw new Error('costTracker.reconcileCost must not run in the in-flight-gate matrix'); }
 });
+seed('src/services/adCloudinaryCleanup.js', {
+  snapshotAdCloudinaryState: (ad) => ad,
+  destroyReplacedAdAssets: async () => []
+});
 
 const trsPath = require.resolve(path.join(ROOT, 'src/services/titlingResumeService.js'));
 const regenPath = require.resolve(path.join(ROOT, 'src/services/adRegenerateService.js'));

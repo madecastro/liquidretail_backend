@@ -26,6 +26,7 @@ const Campaign              = require('../models/Campaign');
 const Ad                    = require('../models/Ad');
 const CampaignRun           = require('../models/CampaignRun');
 const { deleteManyFromCloudinary } = require('./cloudinaryService');
+const { collectAdCloudinaryUrls } = require('./adCloudinaryCleanup');
 
 // ── Brand cascade ─────────────────────────────────────────────────────
 //
@@ -240,10 +241,12 @@ function collectMediaCloudUrls(media) {
 //   1. Load Campaign for tenant verification (route is expected to have
 //      already authorized; this is just an existence check + name for the
 //      log line).
-//   2. Collect Cloudinary URLs from Ad.renderUrl + Ad.posterUrl. Only
-//      the rendered PNG/posters belong to the campaign — the source media
-//      (Cloudinary-hosted UGC photos, catalog product images) belongs to
-//      the brand and survives.
+//   2. Collect Cloudinary URLs from each Ad (renderUrl, veoVideoUrl,
+//      visionQc.attempts[].renderUrl/discardedRenderUrl, and posterUrl
+//      only when it is NOT a transform of this ad's own video). Source
+//      media belongs to the brand and survives. No shared-plate check:
+//      masters AND their derive-only children are deleted together
+//      (derive relationships are campaign-scoped).
 //   3. Delete Ads + CampaignRuns in parallel.
 //   4. Delete the Campaign itself.
 //   5. Fire-and-forget Cloudinary cleanup.
@@ -257,11 +260,13 @@ async function cascadeDeleteCampaign(campaignId) {
   // Step 2 — collect Cloudinary URLs. Only the Cloudinary-hosted ones
   // (filter on host) so video composites built from external CDNs don't
   // get fed to the cleanup queue.
-  const ads = await Ad.find({ campaignId }, { renderUrl: 1, posterUrl: 1, cloudinaryPublicId: 1 }).lean();
+  const ads = await Ad.find(
+    { campaignId },
+    { renderUrl: 1, veoVideoUrl: 1, visionQc: 1, posterUrl: 1 }
+  ).lean();
   const cloudUrls = new Set();
   for (const ad of ads) {
-    if (ad.renderUrl && /res\.cloudinary\.com/.test(ad.renderUrl)) cloudUrls.add(ad.renderUrl);
-    if (ad.posterUrl && /res\.cloudinary\.com/.test(ad.posterUrl)) cloudUrls.add(ad.posterUrl);
+    for (const url of collectAdCloudinaryUrls(ad)) cloudUrls.add(url);
   }
   const cloudUrlList = [...cloudUrls];
 
