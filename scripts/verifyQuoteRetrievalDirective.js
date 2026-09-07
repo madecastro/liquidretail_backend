@@ -24,6 +24,12 @@
  * hard requirements, not style preferences. If a future edit strengthens the
  * positivity ask and drops that counterweight, this suite must fail.
  *
+ * REMOVED (dormant render fallback deletion): X3 (`selectStaticQuoteText`
+ * refused a bare sensory fragment). That function was deleted with
+ * `renderDirectImage`; adgen owns static rendering unconditionally now.
+ * X1/X2/X4–X7 (intake positivity, layoutInput hasPositiveSignal /
+ * pickStrongestQuote) stay.
+ *
  * Run: node scripts/verifyQuoteRetrievalDirective.js
  */
 const assert = require('assert');
@@ -946,16 +952,10 @@ check('X2 bare FIT DESCRIPTORS still do not count as praise', () => {
     assert.strictEqual(hasPositiveSignal(t), false, `must not be an endorsement: ${t}`);
   }
 });
-check('X3 a bare sensory word cannot become a testimonial', () => {
-  // "soft" now opens the positivity gate, so the substance floor is what stops a
-  // one-word fragment reaching a frame.
-  const direct = require('../services/directImageRenderService');
-  for (const snip of ['Soft.', 'so soft', 'very soft']) {
-    assert.strictEqual(
-      direct.selectStaticQuoteText({ text: 'q'.repeat(200), snippet: snip }, { cap: 140 }), '',
-      `a bare fragment must not be typeset: ${snip}`);
-  }
-});
+// X3 (`selectStaticQuoteText` refused a bare sensory fragment) was removed
+// with `renderDirectImage`/`selectStaticQuoteText` (dormant render fallback
+// deletion, 2026-09-07). The intake positivity floor (X1/X2/X4) and the
+// layoutInput pickStrongestQuote last-resort (X6/X7) stay.
 check('X4 mediocre and limiter cases are UNAFFECTED by the wider lexicon', () => {
   for (const t of MEDIOCRE_REAL) {
     const out = quiet(() => keepVerbatimQuotes([{ text: t }], `narrative: ${t}`, 'x4'));

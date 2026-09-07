@@ -1,25 +1,35 @@
 'use strict';
 //
-// verifyRunFeedStartsUnderHandoff — the Slack run feed must start on BOTH the
-// adgen-handoff path and the local-render path.
+// verifyRunFeedStartsUnderHandoff — the Slack run feed must start before the
+// adgen handoff.
 //
-// WHAT BROKE. routes/ads.js's render loop ends with an early `return` when
-// ADGEN_RENDERER_ENABLED is true — backend has minted and claimed the ads and
-// adgen's renderer takes it from there. `runFeed.startRun(...)` used to sit
-// BELOW that return, next to the render pools. So from the moment the flag went
-// true, startRun was never called at all: no parent Slack message, so
-// CampaignRun.slackFeed.ts stayed null forever, and every stage event adgen
-// emitted had no thread to post into.
+// WHAT BROKE. routes/ads.js's render loop used to end with an early `return`
+// when ADGEN_RENDERER_ENABLED was true — backend had minted and claimed the
+// ads and adgen's renderer took it from there. `runFeed.startRun(...)` used
+// to sit BELOW that return, next to the render pools. So from the moment the
+// flag went true, startRun was never called at all: no parent Slack message,
+// so CampaignRun.slackFeed.ts stayed null forever, and every stage event
+// adgen emitted had no thread to post into.
 //
 // It failed silently and completely. Nothing errored, nothing logged, because
 // nothing was ever attempted. Measured from the database: the feed's last
 // working run started 2026-08-22T04:09Z — minutes before the handoff commits —
 // and ALL 21 runs on 2026-08-24 have slackFeed.ts = null. Two days.
 //
+// UPDATED (removal of the dormant in-process render/titling fallback — see
+// session.d/): the handoff is now UNCONDITIONAL and permanent — there is no
+// more flag, no more early `return` inside an `if`, and no more render-pool
+// code after it at all. runRenderLoop now does the label/brand resolution,
+// starts the run feed, logs the handoff, flips CampaignRun to 'running', and
+// ends — full stop. The ordering invariant this file exists to pin still
+// applies in a simpler form: startRun must fire before the handoff's
+// CampaignRun status flip, and nothing resembling the deleted render pools
+// may reappear after it.
+//
 // adgen cannot cover for this: it has no startRun call site of its own. Its only
 // feed touchpoints are adStage.onStage and adVisionQcService.noteEvent, both of
 // which need a parent that only backend creates. Backend owns the run lifecycle,
-// so backend owns starting the feed — handoff or not.
+// so backend owns starting the feed.
 //
 // WHY AN ORDERING CHECK. The defect was pure statement order: the right call,
 // with the right arguments, in the wrong place. A check that only asserts
@@ -48,9 +58,15 @@ const code = stripComments(src);
 
 console.log('verifyRunFeedStartsUnderHandoff\n');
 
-const handoffIdx = code.indexOf('isAdgenRendererEnabled()');
-ok('handoff gate found', handoffIdx >= 0,
-   'could not find isAdgenRendererEnabled() — this harness is stale, fix the harness');
+// Anchor on the still-present handoff log line (the flag/gate function name
+// itself is deleted) and the CampaignRun status flip that follows it.
+const handoffIdx = code.indexOf('ADGEN handoff');
+ok('handoff log line found', handoffIdx >= 0,
+   'could not find the "ADGEN handoff" log line — this harness is stale, fix the harness');
+
+const handoffFlipIdx = code.indexOf("status: 'running'", handoffIdx);
+ok('the handoff still flips CampaignRun to running', handoffIdx >= 0 && handoffFlipIdx > handoffIdx,
+   'could not find the preparing→running status flip after the handoff log line');
 
 const startIdxs = [...code.matchAll(/runFeed\.startRun\s*\(/g)].map((m) => m.index);
 ok('at least one runFeed.startRun call exists', startIdxs.length > 0,
@@ -60,27 +76,26 @@ if (handoffIdx >= 0 && startIdxs.length) {
   const firstStart = Math.min(...startIdxs);
 
   // THE CHECK THIS FILE EXISTS FOR.
-  ok('runFeed.startRun fires BEFORE the adgen handoff gate',
+  ok('runFeed.startRun fires BEFORE the adgen handoff',
      firstStart < handoffIdx,
-     'startRun is positioned after the handoff early-return, so it never runs when ' +
-     'ADGEN_RENDERER_ENABLED is true — the feed silently never starts');
+     'startRun is positioned after the handoff, so a failure resolving brandName/requesterLabel ' +
+     'before the handoff could still leave the feed unstarted');
 
-  // The counts startRun sends must be in scope where it is called. If the
-  // partition were left below the return, this file would not even parse — but
-  // a future edit could reintroduce the split by recomputing them, so pin that
-  // the partition precedes the call rather than trusting parse success.
+  // The counts startRun sends must be in scope where it is called.
   const partIdx = code.indexOf('const veoIds');
   ok('the renderRoute partition is computed before startRun uses it',
      partIdx >= 0 && partIdx < firstStart,
      'veoIds/otherIds are defined after the startRun that sends them as staticCount/veoCount');
 
-  // The handoff branch must still return — if that return were removed, backend
-  // would double-render every ad adgen is already rendering. Guard the fix from
-  // being "solved" by deleting the early return.
-  const afterHandoff = code.slice(handoffIdx, handoffIdx + 1200);
-  ok('the handoff branch still early-returns',
-     /\breturn\s*;/.test(afterHandoff),
-     'the handoff no longer returns — backend would render ads adgen is already rendering');
+  // NOTHING resembling the deleted render pools may follow the handoff —
+  // the whole point of this removal is that runRenderLoop now ends right
+  // after the handoff, not that it falls through to an in-process render
+  // loop. `runOne(` /`renderOneInner(` /`VEO_CONCURRENCY` are dead names
+  // that must never reappear after this point.
+  const afterHandoff = code.slice(handoffFlipIdx, handoffFlipIdx + 2000);
+  ok('no in-process render-pool code follows the handoff',
+     !/renderOneInner\s*\(|VEO_CONCURRENCY|RENDER_CONCURRENCY/.test(afterHandoff),
+     'render-pool code reappeared after the handoff — the in-process fallback must stay deleted, not merely unreachable');
 }
 
 // startRun must carry the fields the parent message is built from. A call that

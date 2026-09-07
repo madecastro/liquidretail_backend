@@ -18,12 +18,20 @@
 // Offline: no DB, no network, no API key.
 //   node scripts/verifyQuoteColourway.js
 //
+// REMOVED (dormant render fallback deletion): group B (static
+// `buildIntentData` integration), the E-static source pins against
+// `services/directImageRenderService.js`, and R4 (unwiring that deleted
+// static call site). Those lived only on the mint-time static render
+// entry point, which is gone; adgen owns static rendering unconditionally
+// now. Surviving coverage is `usableColourwayQuote` /
+// `toPrintableCustomerQuote` plus the VIDEO path (`gateLayoutInputQuotes`),
+// layout pool, Director, and quoteRotationService.
+//
 // Revert-prove (each mutation must fail this harness — section R runs
 // them as sibling copies, it does not edit the tree):
 //   R1  usableColourwayQuote always returns quote            → A measured KEEP
 //   R2  maskIdioms is identity                               → A idiom KEEP
 //   R3  unparseable colourway returns quote                  → A unparseable KEEP
-//   R4  static site skips applyQuoteColourway                → B measured KEEP
 //   R5  video site skips applyQuoteColourway                 → C measured KEEP
 //   R6  dash parse last-segment-only                         → M white-sole display KEEP
 //   R7  hyphenated adj tails skipped again                   → M green-accented DROP
@@ -63,12 +71,10 @@ const {
 const { toPrintableCustomerQuote } = require('../services/quoteProvenance');
 const { prepareQuotePool, pickPrimaryProductQuote } = require('../services/layoutInputService');
 const { displayNormalizeTitle } = require('../utils/titleNormalize');
-const direct = require('../services/directImageRenderService');
 const { gateLayoutInputQuotes } = require('../services/brandScriptExecutor');
 
 const ROOT = path.join(__dirname, '..');
 const SRC_QC = path.join(ROOT, 'services', 'quoteColourway.js');
-const SRC_STATIC = path.join(ROOT, 'services', 'directImageRenderService.js');
 const SRC_VIDEO = path.join(ROOT, 'services', 'brandScriptExecutor.js');
 const SRC_ROT = path.join(ROOT, 'services', 'quoteRotationService.js');
 const SRC_LIS = path.join(ROOT, 'services', 'layoutInputService.js');
@@ -101,13 +107,11 @@ function stripComments(src) {
 }
 
 const qcSrc = fs.readFileSync(SRC_QC, 'utf8');
-const staticSrc = fs.readFileSync(SRC_STATIC, 'utf8');
 const videoSrc = fs.readFileSync(SRC_VIDEO, 'utf8');
 const rotSrc = fs.readFileSync(SRC_ROT, 'utf8');
 const lisSrc = fs.readFileSync(SRC_LIS, 'utf8');
 const dirSrc = fs.readFileSync(SRC_DIR, 'utf8');
 const qcCode = stripComments(qcSrc);
-const staticCode = stripComments(staticSrc);
 const videoCode = stripComments(videoSrc);
 const rotCode = stripComments(rotSrc);
 const lisCode = stripComments(lisSrc);
@@ -399,73 +403,10 @@ check('A never throws on null quote', usableColourwayQuote(null, SOLUDOS_TITLE) 
     !!(printable && printable.text === GREEN_TEXT));
 }
 
-// ── B. Static path: drive the REAL buildIntentData ────────────────────
-function intentFor(text, product, extraProof) {
-  return direct.buildIntentData({
-    concept: { copy_picks: { headline: 'Made to be worn' } },
-    layoutInput: {
-      social_proof: {
-        primary_quote: q(text),
-        ...(extraProof || {})
-      }
-    },
-    brand: {},
-    product: product || null,
-    cta: 'SHOP NOW'
-  });
-}
-
-{
-  const d = intentFor(GREEN_TEXT, { title: SOLUDOS_TITLE });
-  check('B static measured: green accent on White-Wine does not print',
-    d.quote == null || d.quote === undefined,
-    `got ${JSON.stringify(d.quote)}`);
-}
-
-{
-  const d = intentFor(NONE_TEXT, { title: SOLUDOS_TITLE });
-  check('B static no-op: colour-free quote still prints',
-    d.quote === NONE_TEXT, `got ${JSON.stringify(d.quote)}`);
-}
-
-{
-  const d = intentFor(MATCH_TEXT, { title: SOLUDOS_TITLE });
-  check('B static match: burgundy on White-Wine still prints',
-    d.quote === MATCH_TEXT, `got ${JSON.stringify(d.quote)}`);
-}
-
-{
-  const d = intentFor(GREEN_TEXT, { title: 'Roma Retro Sneaker' });
-  check('B static fail-closed: unparseable title drops colour quote',
-    d.quote == null || d.quote === undefined,
-    `got ${JSON.stringify(d.quote)}`);
-}
-
-{
-  const d = intentFor(GREEN_TEXT, null);
-  check('B static no-product: colour quote still prints (no-op)',
-    d.quote === GREEN_TEXT, `got ${JSON.stringify(d.quote)}`);
-}
-
-{
-  const d = intentFor(BLUECHIP_TEXT, { title: SOLUDOS_TITLE });
-  check('B static idiom MUST-KEEP: blue-chip still prints',
-    d.quote === BLUECHIP_TEXT, `got ${JSON.stringify(d.quote)}`);
-}
-
-{
-  const d = intentFor(ROSE_TEXT, { title: SOLUDOS_TITLE });
-  check('B static idiom MUST-KEEP: rose to the occasion still prints',
-    d.quote === ROSE_TEXT, `got ${JSON.stringify(d.quote)}`);
-}
-
-{
-  const d = intentFor(GREEN_TEXT, { title: SOLUDOS_TITLE }, {
-    secondary_quotes: [q(NONE_TEXT, { tier: null })]
-  });
-  check('B static rescue: colour-free secondary prints when primary is green',
-    d.quote === NONE_TEXT, `got ${JSON.stringify(d.quote)}`);
-}
+// Group B (static buildIntentData integration) was removed with
+// `renderDirectImage`/`buildIntentData` (dormant render fallback deletion,
+// 2026-09-07). The helper assertions above and the VIDEO call-site pins
+// below are the remaining coverage.
 
 // ── C. Video path: drive the REAL gateLayoutInputQuotes ───────────────
 function videoArtifact(text, extra) {
@@ -601,8 +542,6 @@ function importsApplyQuoteColourway(code) {
     && /\bapplyQuoteColourway\b/.test(code);
 }
 
-check('E static imports applyQuoteColourway from ./quoteColourway',
-  importsApplyQuoteColourway(staticCode));
 check('E video imports applyQuoteColourway from ./quoteColourway',
   importsApplyQuoteColourway(videoCode));
 check('E rotation requires quoteColourway and calls applyQuoteColourway',
@@ -620,14 +559,8 @@ check('E Director flag-off arrival path colour-filters via usableColourwayQuote'
   /function colourSafeArrivalReviews/.test(dirCode)
   && /usableColourwayQuote/.test(dirCode));
 
-check('E static does not reimplement usableColourwayQuote',
-  !/function\s+usableColourwayQuote\s*\(/.test(staticCode));
 check('E video does not reimplement usableColourwayQuote',
   !/function\s+usableColourwayQuote\s*\(/.test(videoCode));
-
-check('E static colour assignment calls applyQuoteColourway(quote, strictScope)',
-  /const\s+colourOk\s*=\s*applyQuoteColourway\s*\(\s*quote\s*,\s*strictScope\s*\)/.test(staticCode),
-  'buildIntentData must wrap the post-strict quote; a prefix-only regex would stay green on a later identity fallback');
 
 check('E video colour assignment calls applyQuoteColourway(printable, scope)',
   /const\s+colourOk\s*=\s*applyQuoteColourway\s*\(\s*printable\s*,\s*scope\s*\)/.test(videoCode));
@@ -743,27 +676,9 @@ function withMutatedSibling(realAbsPath, mutatedSrc, fn) {
   });
 }
 
-{
-  // R4: static site skips the colour call → measured green PRINTS.
-  const mutated = mutateOrThrow(
-    staticSrc,
-    'const colourOk = applyQuoteColourway(quote, strictScope);',
-    'const colourOk = quote;',
-    'R4'
-  );
-  withMutatedSibling(SRC_STATIC, mutated, (mod) => {
-    const d = mod.buildIntentData({
-      concept: { copy_picks: { headline: 'Made to be worn' } },
-      layoutInput: { social_proof: { primary_quote: q(GREEN_TEXT) } },
-      brand: {},
-      product: { title: SOLUDOS_TITLE },
-      cta: 'SHOP NOW'
-    });
-    check('R4 unwired static PRINTS the measured green quote (B would go red)',
-      d.quote === GREEN_TEXT,
-      `got ${JSON.stringify(d.quote)}`);
-  });
-}
+// R4 (unwired static buildIntentData) was removed with
+// `renderDirectImage`/`buildIntentData` (dormant render fallback deletion,
+// 2026-09-07). R5 below still revert-proves the live VIDEO call site.
 
 {
   // R5: video site skips the colour call → measured green is reseated.
@@ -874,4 +789,4 @@ if (failures.length) {
   process.exit(1);
 }
 console.log(`✅ verifyQuoteColourway: ${pass} checks passed`);
-console.log('   helper + static + video + Director driven for real; revert-proven on 9 mutations');
+console.log('   helper + video + Director driven for real; revert-proven on 8 mutations');

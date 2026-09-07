@@ -43,8 +43,8 @@
  *      revert-proof below now mutates the REAL text captured from disk this
  *      run and confirms the SAME check function then fails.
  *   2. The whole harness only opened the six PRODUCER files. Reverting the
- *      CALLER-side threading (pipelines/detect.js, atlasVideoService.js,
- *      renderService.js) leaves producers still accepting
+ *      CALLER-side threading (pipelines/detect.js, atlasVideoService.js)
+ *      leaves producers still accepting
  *      `{ brandId = null, … }` and still mentioning those names in their own
  *      chatCompletion meta — every producer check stays green while every
  *      CostLog row goes back to all-null, because the callers simply stopped
@@ -382,13 +382,19 @@ console.log('\nCOST ATTRIBUTION — six 2026-08-24 stages carry brand/product/ad
 }
 
 {
-  const render = read('services/renderService.js');
-  const ci = render.indexOf("variantKind:        req.variantKind         || 'ugc',");
-  const block = ci >= 0 ? render.slice(ci, ci + 300) : '';
-  check('7m renderService.js\'s buildLayoutInput options thread req.brandId/req.adId/req.campaignRunId',
-    /brandId:\s*req\.brandId\s*\|\| null/.test(block)
-      && /adId:\s*req\.adId\s*\|\| null/.test(block)
-      && /campaignRunId:\s*req\.campaignRunId\s*\|\| null/.test(block));
+  // RETARGETED 2026-09-07: renderService.js's mint-time buildLayoutInput
+  // call site (inside deleted renderCreative) is gone. The remaining live
+  // backend caller that threads brandId/adId/campaignRunId into
+  // buildLayoutInput is atlasVideoService.refreshStaleLayoutInput.
+  const vid = read('services/atlasVideoService.js');
+  const fnIdx = vid.indexOf('async function refreshStaleLayoutInput(');
+  const fnBlock = fnIdx >= 0 ? sliceToNextFn(vid, fnIdx) : '';
+  const call = captureCallArgs(fnBlock, 'buildLayoutInput({');
+  check('7m refreshStaleLayoutInput\'s buildLayoutInput options thread brandId/adId/campaignRunId',
+    !!call
+      && /brandId:\s*ad\.brandId \|\| media\.brandId \|\| null/.test(call)
+      && /adId:\s*ad\._id \|\| null/.test(call)
+      && /campaignRunId/.test(call));
 }
 
 console.log('\nCOST ATTRIBUTION FOLLOW-UP — four 2026-08-24 gaps the six-stage fix never touched\n');

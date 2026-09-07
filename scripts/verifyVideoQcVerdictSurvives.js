@@ -2,8 +2,7 @@
 'use strict';
 //
 // verifyVideoQcVerdictSurvives (backend) — mirror of the adgen harness of the
-// same name. A vision-QC 'failed' verdict must survive every terminal write
-// in THIS repo too: routes/ads.js (master + derive).
+// same name.
 //
 // Used to also pin services/titlingResumeService.js (titled + no-brand
 // arms) — that file is DELETED 2026-08-28 (backend titling removal, owner
@@ -11,14 +10,21 @@
 // in this repo runs Remotion titling in-process any more, so there is no
 // second writer left to guard.
 //
-// WHY THIS FILE EXISTS SEPARATELY FROM E3 (verifyTitlingOrphanResume.js).
-// E3 counts `titlingResumeState: null` occurrences — that pins "every
-// terminal outcome clears the debt", which is a DIFFERENT invariant from
-// "every draft-promoting write is guarded against a stamped verdict". An
-// adversarial pass proved the gap is real: reverting every $in guard back to
-// a bare filter still leaves the same six `titlingResumeState: null` sites in
-// the file (the keep-arms exist as dead code, never taken), so E3 stays green
-// while 47/0 reproduces. This file pins the guard itself.
+// REMOVED 2026-09-07 (dormant render fallback deletion — see session.d/):
+// the "routes/ads.js (master + derive terminal writes)" section, which
+// scanned routes/ads.js for exactly 2 terminal `status:'draft'` +
+// `titlingResumeState: null` writes guarded by a status $in allowlist. Those
+// 2 writes lived at the end of the in-process render loop's video path
+// (renderOneInner, both the master and derive-only arms), which is deleted
+// along with the rest of the fallback — routes/ads.js has ZERO such writes
+// left (confirmed: the scan's own `terminalDraftWrites` pattern now matches
+// nothing there), the same "no second writer left to guard" situation the
+// paragraph above already describes for titlingResumeService.js. The
+// SECTION E behavioural test below is what remains, and it was already the
+// load-bearing guard even before this deletion — see verifyTitlingOrphanResume's
+// former E3/E5 write-up (that file was retired the same day, its whole
+// premise having moved with routes/ads.js's render loop) for why a
+// source-text scan of the write site was never sufficient on its own.
 //
 // Comments are stripped before scanning — the file's own header and inline
 // reasoning quote nearly every string these checks search for.
@@ -75,14 +81,6 @@ function stripComments(src) {
   return out;
 }
 
-const ADS_SRC = stripComments(ADS_RAW);
-
-let failures = 0, passes = 0;
-function check(name, fn) {
-  try { fn(); passes++; console.log(`  ✓ ${name}`); }
-  catch (err) { failures++; console.log(`  ✗ ${name}\n     ${err.message}`); }
-}
-
 function balanced(text, openIdx, open, close) {
   if (openIdx < 0 || text[openIdx] !== open) return null;
   let depth = 0;
@@ -93,8 +91,7 @@ function balanced(text, openIdx, open, close) {
   return null;
 }
 
-/** Every Ad.updateOne/findOneAndUpdate call in `src`, as {filter, update}. */
-function scanWrites(src) {
+function terminalDraftWrites(src) {
   const out = [];
   const CALL = /Ad\.(updateOne|findOneAndUpdate)\s*\(/g;
   let m;
@@ -107,53 +104,33 @@ function scanWrites(src) {
     const afterFilter = firstBrace + filter.length;
     const updBrace = args.indexOf('{', afterFilter);
     const update = balanced(args, updBrace, '{', '}') || '';
-    out.push({ filter, update });
+    if (/status:\s*['"]draft['"]/.test(update) && /titlingResumeState:\s*null/.test(update)) {
+      out.push({ filter, update });
+    }
     CALL.lastIndex = m.index + args.length;
   }
   return out;
 }
 
-/** The subset of writes that promote status to 'draft' AND clear the titling
- *  debt in the same update — the signature of a TERMINAL video-titling write,
- *  as opposed to the pre-titling money stamp (routes/ads.js:2547/2966), which
- *  legitimately runs before any QC verdict exists and must stay unguarded. */
-function terminalDraftWrites(src) {
-  return scanWrites(src).filter((w) =>
-    /status:\s*['"]draft['"]/.test(w.update) &&
-    /titlingResumeState:\s*null/.test(w.update));
-}
-
-function assertGuarded(writes, label) {
-  check(`${label}: found the expected 2 terminal draft-promoting writes`, () => {
-    assert.strictEqual(writes.length, 2,
-      `expected exactly 2 (titled-success + no-brand-success), found ${writes.length}`);
-  });
-  check(`${label}: every one is guarded with a status $in allowlist`, () => {
-    const unguarded = writes.filter((w) => !/status:\s*\{[^}]*\$in[^}]*\}/.test(w.filter));
-    assert.strictEqual(unguarded.length, 0,
-      `${unguarded.length} unguarded — will overwrite a vision-QC 'failed' verdict: ` +
-      unguarded.map((w) => w.filter.replace(/\s+/g, ' ')).join(' | '));
-  });
-  check(`${label}: no $nin denylist, no duplicate status key`, () => {
-    for (const w of writes) {
-      assert.ok(!/\$nin/.test(w.filter), 'a $nin denylist fails open — use $in');
-      const occurrences = (w.filter.match(/(?<![\w$])status\s*:/g) || []).length;
-      assert.strictEqual(occurrences, 1, `status declared ${occurrences} times in one filter`);
-    }
-  });
-  check(`${label}: the allowlist is exactly rendering+draft`, () => {
-    for (const w of writes) {
-      const g = /status:\s*\{\s*\$in:\s*\[([^\]]*)\]/.exec(w.filter);
-      assert.ok(g, 'no $in allowlist found');
-      const allowed = (g[1].match(/'([a-z]+)'/g) || []).sort();
-      assert.deepStrictEqual(allowed, ["'draft'", "'rendering'"], `got ${g[1].trim()}`);
-    }
-  });
+let failures = 0, passes = 0;
+function check(name, fn) {
+  try { fn(); passes++; console.log(`  ✓ ${name}`); }
+  catch (err) { failures++; console.log(`  ✗ ${name}\n     ${err.message}`); }
 }
 
 (async () => {
-  console.log('\n── routes/ads.js (master + derive terminal writes) ──');
-  assertGuarded(terminalDraftWrites(ADS_SRC), 'ads.js');
+  console.log('\n── routes/ads.js (ABSENCE: in-process video titling/QC writes are gone) ──');
+  // titled-success + no-brand-success draft-promoting writes lived in
+  // deleted renderOneInner. Backend no longer titles or QCs video
+  // in-process; adgen's renderer/titler owns those terminal writes.
+  // The invariant "a vision-QC failed verdict must survive draft promotion"
+  // now lives in adgen. This pin fails if the writes come back here.
+  check('ads.js no longer contains terminal draft-promoting writes (titled-success + no-brand-success)', () => {
+    const writes = terminalDraftWrites(stripComments(ADS_RAW));
+    assert.strictEqual(writes.length, 0,
+      `expected 0 (adgen renderer/titler owns those writes now), found ${writes.length}`);
+  });
+
 
   console.log('\n── the upstream QC-verdict writer cannot be silently defeated (behavioural) ──');
 

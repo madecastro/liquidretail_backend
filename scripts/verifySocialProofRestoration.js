@@ -33,7 +33,8 @@
  *   - remove the honesty-rule proof_options clause      → A7
  *   - leave DIRECTOR_SIGNALS_VERSION at 3.1.0           → B1
  *   - default allowLabeledBrandNumbers to true          → C1 (video blast radius)
- *   - unwire the static opt-in                          → D1/D3
+ *   - unwire the static opt-in                          → D1/D3 (D1 removed
+ *     with buildIntentData; D3 keeps the video-must-never-opt-in half)
  *   round 2 (hardening, after two independent adversarial passes)
  *   - truthy gate instead of `=== true`                 → C7d (string "false" opted IN)
  *   - drop the brand-count requirement                  → C7b (unscoped "4.7 ★" printed)
@@ -54,6 +55,15 @@
  *   MED   the reserved slot treated a quote alone as proof, which would MINT
  *         ai_social_proof_led on products that then fall back at render — the very
  *         collapse this change exists to stop.
+ *
+ * REMOVED (dormant render fallback deletion): D1 (static path passes
+ * `allowLabeledBrandNumbers: STATIC_BRAND_STARS_WITH_QUOTE` through
+ * `buildIntentData`) and D2 (that kill switch's code default in
+ * `directImageRenderService.js`). Those lived only on the mint-time static
+ * render entry point, which is gone; adgen owns static rendering
+ * unconditionally now. D3 is rewritten to keep the live half: the VIDEO
+ * path / brandScriptExecutor must NEVER pass allowLabeledBrandNumbers:true.
+ * D6 (the env key in config/defaults.env) stays — adgen still reads it.
  *
  * Run: node scripts/verifySocialProofRestoration.js   (no DB, no network, no key)
  */
@@ -410,21 +420,21 @@ check('C10 no-quote rating-only path unchanged by the exception', () => {
 });
 
 // ═══════════════ D. Wiring + kill switch ═══════════════
-console.log('D. Static wiring + kill switch');
-const directImgSrc = fs.readFileSync(path.join(SERVICE_DIR, 'directImageRenderService.js'), 'utf8');
+console.log('D. Video must never opt in; kill switch stays in defaults.env');
 const ratingSrc = fs.readFileSync(path.join(SERVICE_DIR, 'ratingDisplay.js'), 'utf8');
 
-check('D1 static path passes the opt-in', () => {
-  assert.ok(/allowLabeledBrandNumbers:\s*STATIC_BRAND_STARS_WITH_QUOTE/.test(directImgSrc),
-    'directImageRenderService does not wire the opt-in through the kill switch');
-});
-check('D2 kill switch defaults ON but is env-revertible without a deploy', () => {
-  assert.ok(/STATIC_BRAND_STARS_WITH_QUOTE\s*=\s*\n?\s*String\(process\.env\.STATIC_BRAND_STARS_WITH_QUOTE\s*\?\?\s*'true'\)/.test(directImgSrc),
-    'kill switch missing or not defaulted to true');
-});
-check('D3 ONLY the static path opts in — recursive over services/ AND routes/', () => {
-  // Was a non-recursive readdir over services/ only, so a routes/ or nested
-  // opt-in would never have been seen.
+// D1 (static path passes the opt-in through buildIntentData) and D2 (that
+// kill switch's code default in directImageRenderService.js) were removed
+// with `renderDirectImage`/`buildIntentData` (dormant render fallback
+// deletion, 2026-09-07). The env key itself is still live in adgen and is
+// pinned by D6. D3 keeps the VIDEO half of the original scan.
+
+check('D3 video/brandScriptExecutor must NEVER pass allowLabeledBrandNumbers:true', () => {
+  // Was "ONLY the static path opts in". The static opt-in half is dead
+  // (buildIntentData deleted). The live invariant is: no backend
+  // services/ or routes/ caller may pass the opt-in — especially
+  // brandScriptExecutor, whose default-off is the video blast-radius
+  // guard (C1).
   const roots = [SERVICE_DIR, path.join(__dirname, '..', 'routes')];
   const hits = [];
   const walk = (dir) => {
@@ -438,12 +448,19 @@ check('D3 ONLY the static path opts in — recursive over services/ AND routes/'
       if (e.isDirectory()) { if (e.name !== 'node_modules') walk(full); continue; }
       if (!e.name.endsWith('.js')) continue;
       if (full === path.join(SERVICE_DIR, 'ratingDisplay.js')) continue;   // the definition itself
-      if (/allowLabeledBrandNumbers/.test(fs.readFileSync(full, 'utf8'))) hits.push(path.relative(path.join(__dirname, '..'), full));
+      const src = fs.readFileSync(full, 'utf8');
+      if (/allowLabeledBrandNumbers\s*:\s*true/.test(src)
+        || /allowLabeledBrandNumbers\s*:\s*STATIC_BRAND_STARS_WITH_QUOTE/.test(src)) {
+        hits.push(path.relative(path.join(__dirname, '..'), full));
+      }
     }
   };
   for (const r of roots) if (fs.existsSync(r)) walk(r);
-  assert.deepStrictEqual(hits, ['services/directImageRenderService.js'],
+  assert.deepStrictEqual(hits, [],
     `unexpected opt-in caller(s): ${hits.join(', ')} — video must never opt in`);
+  const videoSrc = fs.readFileSync(path.join(SERVICE_DIR, 'brandScriptExecutor.js'), 'utf8');
+  assert.ok(!/allowLabeledBrandNumbers/.test(videoSrc),
+    'brandScriptExecutor must not mention allowLabeledBrandNumbers at all');
 });
 check('D6 the kill switch is COMMITTED to defaults.env, not just a code default', () => {
   // Adversarial finding: D2/D5 advertised a no-deploy revert while the key existed

@@ -25,6 +25,7 @@ const fs = require('fs');
 const path = require('path');
 const gen = require('../services/campaignAdsGenerationService');
 const pf = require('../services/platformFormats');
+const regen = require('../services/adRegenerateService');
 
 let pass = 0;
 const failures = [];
@@ -165,233 +166,20 @@ check('R2 a static request never yields a billable video kind',
   ['meta_feed_1_1', 'meta_feed_4_5', 'meta_stories_9_16', 'pmax_16_9', 'meta_reels_9_16']  // pmax included on purpose: frozen must still never yield video
     .every((f) => !pf.resolveKinds(f, 'image').includes('video')));
 
-// ── R3: catalog-first reseed on STATIC regenerate ───────────────────────
-// Regenerate used to REPLAY the stored Ad.mediaIds stack, so an ad queued while
-// DIRECTOR_UNIVERSE_TOP_N was 10 still sent 3+ references on every regen — for
-// ever. It now RE-DERIVES the seed. It must NOT be a trim to mediaIds[0]: those
-// stacks were shotType-ranked LIFESTYLE-FIRST (services/shotTypeRank.js) over a
-// pool merging catalog media with product_match UGC, so [0] is frequently a UGC
-// post and trimming would lock a social image in as the seed permanently.
-//
-// Everything below is the PURE decision + PURE tier selection — no DB, no
-// network, no API key. The money shape is untouched: this changes WHICH image
-// seeds the ad, never how many billable submits happen (still exactly one
-// gpt-image-2/edit per regenerate, and reference count does not move the price).
-const regen = require('../services/adRegenerateService');
-
-const PRODUCT = '6a6a4d58054561c15f3ff8a2';
-const BRAND   = '6a6a4d58054561c15f3ff800';
-const AD = (over) => ({
-  kind: 'image',
-  variantKind: 'product_image',
-  referenceMediaIds: [],
-  productId: PRODUCT,
-  brandId: BRAND,
-  mediaIds: ['aaaaaaaaaaaaaaaaaaaaaaa1', 'aaaaaaaaaaaaaaaaaaaaaaa2', 'aaaaaaaaaaaaaaaaaaaaaaa3'],
-  ...over
-});
-const decide = (over, flagEnabled = true) =>
-  regen.reseedDecision({ ad: AD(over), flagEnabled });
-
-// (b) THE OWNER GATE, verbatim: "UGC ads shouldn't be affected by this change,
-// we haven't optimized that path yet." A variantKind:'ugc' ad is SUPPOSED to
-// seed from a social image.
-check('R3 variantKind ugc is NEVER re-seeded (owner: UGC path is unoptimized)',
-  decide({ variantKind: 'ugc' }).reseed === false,
-  'a ugc ad would be re-derived to a catalog photo, breaking it by design');
-check('R3 variantKind ugc skip reason names variantKind',
-  decide({ variantKind: 'ugc' }).reason === regen.RESEED_SKIP.NOT_PRODUCT_IMAGE);
-check('R3 a missing variantKind is NOT treated as product_image',
-  decide({ variantKind: undefined }).reseed === false);
-
-// The whole point of the change.
-check('R3 product_image with empty referenceMediaIds IS re-seeded',
-  decide({}).reseed === true, 'the stale 3-ref Director stack would replay for ever');
-check('R3 re-seeding returns no skip reason',
-  decide({}).reason === null);
-
-// (c) owner: "unless the user overrides it".
-check('R3 non-empty referenceMediaIds is NEVER re-seeded (operator pick wins)',
-  decide({ referenceMediaIds: ['bbbbbbbbbbbbbbbbbbbbbbb1'] }).reseed === false);
-check('R3 operator-override skip reason names referenceMediaIds',
-  decide({ referenceMediaIds: ['bbbbbbbbbbbbbbbbbbbbbbb1'] }).reason === regen.RESEED_SKIP.OPERATOR_REFS);
-
-// (d) nothing to derive from.
-check('R3 no productId is NEVER re-seeded',
-  decide({ productId: null }).reseed === false);
-check('R3 no-productId skip reason names productId',
-  decide({ productId: null }).reason === regen.RESEED_SKIP.NO_PRODUCT);
-
-// (a) static only.
-check('R3 a video regenerate is NEVER re-seeded',
-  decide({ kind: 'video' }).reseed === false,
-  'video reference assembly is a different pipeline and is out of scope');
-check('R3 video skip reason names video',
-  decide({ kind: 'video' }).reason === regen.RESEED_SKIP.VIDEO);
-
-// Kill switch.
-check('R3 flag off -> NEVER re-seeded',
-  decide({}, false).reseed === false);
-check('R3 flag-off skip reason names REGEN_RESEED_CATALOG_FIRST',
-  decide({}, false).reason === regen.RESEED_SKIP.FLAG_OFF);
-
-const savedFlag = process.env.REGEN_RESEED_CATALOG_FIRST;
-try {
-  delete process.env.REGEN_RESEED_CATALOG_FIRST;
-  check('R3 flag UNSET means ON (the owner asked for this behaviour)',
-    regen.isRegenReseedCatalogFirstEnabled() === true);
-  process.env.REGEN_RESEED_CATALOG_FIRST = '';
-  check('R3 flag EMPTY means ON',
-    regen.isRegenReseedCatalogFirstEnabled() === true);
-  for (const off of ['false', 'FALSE', '0', 'no', 'off', ' off ']) {
-    process.env.REGEN_RESEED_CATALOG_FIRST = off;
-    check(`R3 flag ${JSON.stringify(off)} means OFF`,
-      regen.isRegenReseedCatalogFirstEnabled() === false);
-  }
-  for (const on of ['true', '1', 'yes', 'on']) {
-    process.env.REGEN_RESEED_CATALOG_FIRST = on;
-    check(`R3 flag ${JSON.stringify(on)} means ON`,
-      regen.isRegenReseedCatalogFirstEnabled() === true);
-  }
-  // End-to-end through the gate with the real env read, flag unset.
-  delete process.env.REGEN_RESEED_CATALOG_FIRST;
-  check('R3 flag unset + product_image + no operator refs -> re-seeded (default ON)',
-    regen.shouldReseedFromCatalog({
-      ad: AD({}), flagEnabled: regen.isRegenReseedCatalogFirstEnabled()
-    }) === true);
-  process.env.REGEN_RESEED_CATALOG_FIRST = 'false';
-  check('R3 flag false + product_image + no operator refs -> NOT re-seeded',
-    regen.shouldReseedFromCatalog({
-      ad: AD({}), flagEnabled: regen.isRegenReseedCatalogFirstEnabled()
-    }) === false);
-} finally {
-  if (savedFlag === undefined) delete process.env.REGEN_RESEED_CATALOG_FIRST;
-  else process.env.REGEN_RESEED_CATALOG_FIRST = savedFlag;
-}
-
-// ── R3b: the tier cascade. Mirrors campaignAdsGenerationService.js:2085. ──
-const SCOPE = { productId: PRODUCT, brandId: BRAND };
-// fileUrl is part of the fixture because it is part of the CONTRACT: a derived id
-// is only usable if it resolves to an image the renderer can fetch. Omitting it
-// (as this fixture originally did) made four checks pass for the wrong reason once
-// the fileUrl guard landed. `over.fileUrl === null` builds the unusable case on
-// purpose; pass fileUrl:'' for the empty-string variant.
-const cat = (id, over = {}) => ({
-  _id: id,
-  source: 'catalog-product',
-  brandId: BRAND,
-  fileType: over.fileType || 'image',
-  fileUrl: 'fileUrl' in over ? over.fileUrl : `https://cdn.example/${id}.jpg`,
-  createdAt: over.createdAt || '2026-01-01T00:00:00Z',
-  metadata: { catalogProductId: PRODUCT, ...(over.metadata || {}) }
-});
-const pick = (list) => regen.pickFirstCatalogMediaId(list, SCOPE);
-
-// ── R3c: a derived id must be USABLE, not merely well-scoped. ─────────────
-// Found by adversarial review of the finished diff, agreed independently by two
-// reviewers. The derivation returns only an id; renderDirectImage then loads it
-// and, on finding ZERO resolvable references, silently falls back to
-// media.fileUrl — the ad's ORIGINAL seed, which on exactly the historical rows
-// this feature exists to fix is frequently the UGC/lifestyle image. Combined with
-// the "catalog reseed — stack N → 1" log already emitted, that produced a false
-// success over a silent UGC seed AND a real billable submit. So an unusable doc
-// must be rejected here and become an honest tier-3 skip.
-{
-  const noUrl    = cat('no_url',    { fileUrl: null, metadata: { imageRole: 'hero' } });
-  const blankUrl = cat('blank_url', { fileUrl: '   ', metadata: { imageRole: 'hero' } });
-  const good     = cat('good_alt',  { createdAt: '2026-09-01T00:00:00Z' });
-
-  check('R3c a hero doc with a NULL fileUrl is not selectable',
-    pick([noUrl]) === null);
-  check('R3c a hero doc with a whitespace-only fileUrl is not selectable',
-    pick([blankUrl]) === null);
-  check('R3c an unusable hero does not shadow a usable catalog image — tier 2 still wins',
-    pick([noUrl, good])?.mediaId === 'good_alt');
-  check('R3c a catalog VIDEO is never selectable as the first catalog IMAGE',
-    pick([cat('vid', { fileType: 'video', metadata: { imageRole: 'video' } })]) === null);
-  check('R3c the imageRole video stamp alone also disqualifies',
-    pick([cat('vid2', { metadata: { imageRole: 'video' } })]) === null);
-  check('R3c a video does not shadow a usable image',
-    pick([cat('vid3', { fileType: 'video', createdAt: '2020-01-01T00:00:00Z' }), good])?.mediaId === 'good_alt');
-}
-
-// TIER 1 beats TIER 2 even when the hero doc is the NEWEST in the list — that
-// ordering is the whole difference between "hero stamp" and "earliest".
-const heroLate  = cat('hero_late',  { createdAt: '2026-06-01T00:00:00Z', metadata: { imageRole: 'hero' } });
-const altEarly  = cat('alt_early',  { createdAt: '2026-01-01T00:00:00Z', metadata: { imageRole: 'alt' } });
-check('R3b tier 1 (imageRole hero) beats tier 2 even when it is the newest doc',
-  pick([altEarly, heroLate])?.mediaId === 'hero_late');
-check('R3b tier 1 reports tier "hero"',
-  pick([altEarly, heroLate])?.tier === 'hero');
-
-// TIER 2 — no hero stamp anywhere: earliest createdAt wins, regardless of the
-// order the docs arrive in.
-const a2 = cat('alt_2026_03', { createdAt: '2026-03-01T00:00:00Z', metadata: { imageRole: 'alt' } });
-const a1 = cat('alt_2026_01', { createdAt: '2026-01-15T00:00:00Z', metadata: { imageRole: 'alt' } });
-const a3 = cat('alt_2026_09', { createdAt: '2026-09-01T00:00:00Z', metadata: { imageRole: 'alt' } });
-check('R3b tier 2 is used when no doc carries the hero stamp',
-  pick([a2, a1, a3])?.mediaId === 'alt_2026_01');
-check('R3b tier 2 is order-independent (reversed input, same winner)',
-  pick([a3, a2, a1])?.mediaId === 'alt_2026_01');
-check('R3b tier 2 reports tier "earliest-createdAt"',
-  pick([a2, a1, a3])?.tier === 'earliest-createdAt');
-
-// TIER 3 — no catalog media at all: derive NOTHING so the ad's existing
-// behaviour is left completely untouched.
-check('R3b tier 3: an empty candidate list derives NOTHING',
-  pick([]) === null);
-check('R3b tier 3: a list with no catalog media derives NOTHING',
-  pick([{ _id: 'ugc_1', source: 'instagram', brandId: BRAND, metadata: { catalogProductId: PRODUCT } }]) === null);
-
-// THE CENTRAL SAFETY PROPERTY. A UGC doc must be unselectable no matter what
-// metadata it carries — including the hero stamp, which is exactly the trap that
-// querying imageRole alone would fall into. This is the case that makes the
-// cascade structurally incapable of seeding an ad from a social post.
-const ugcHero = {
-  _id: 'ugc_hero', source: 'instagram', brandId: BRAND,
-  createdAt: '2020-01-01T00:00:00Z',                       // earliest of everything
-  metadata: { catalogProductId: PRODUCT, imageRole: 'hero' } // and stamped hero
-};
-check('R3b a UGC doc stamped imageRole:hero can NEVER be selected',
-  pick([ugcHero, a2])?.mediaId === 'alt_2026_03',
-  'querying imageRole without pinning source:catalog-product would pick the social post');
-check('R3b a UGC doc is not selected even when it is the ONLY candidate',
-  pick([ugcHero]) === null);
-check('R3b every non-catalog source is rejected',
-  ['instagram', 'tiktok', 'upload', 'brand-site', 'competitor', null, undefined]
-    .every((src) => pick([{ ...ugcHero, source: src }]) === null));
-check('R3b the guard rejects any non-catalog source directly',
-  !regen.isCatalogMediaForProduct(ugcHero, SCOPE));
-
-// Cross-product and cross-tenant leaks. Either one would put another product's
-// (or another advertiser's) photograph into this ad.
-check('R3b a catalog doc for a DIFFERENT product is rejected',
-  pick([cat('other_product', { metadata: { catalogProductId: 'ffffffffffffffffffffffff', imageRole: 'hero' } })]) === null);
-check('R3b a catalog doc for a DIFFERENT brand is rejected (cross-tenant)',
-  pick([{ ...cat('other_brand', { metadata: { imageRole: 'hero' } }), brandId: 'ffffffffffffffffffffffff' }]) === null);
-check('R3b a catalog doc with no catalogProductId is rejected',
-  pick([cat('no_product', { metadata: { catalogProductId: null, imageRole: 'hero' } })]) === null);
-check('R3b a catalog doc with no brandId is rejected',
-  pick([{ ...cat('no_brand', { metadata: { imageRole: 'hero' } }), brandId: null }]) === null);
-check('R3b ids compare by string, so ObjectId-vs-string never causes a miss',
-  regen.isCatalogMediaForProduct(cat('str_ok'), { productId: { toString: () => PRODUCT }, brandId: { toString: () => BRAND } }));
-
-// A missing createdAt must never beat a stamped doc. Built literally, NOT via
-// cat(), because cat()'s `||` default would coerce a null createdAt back to a
-// real date and silently defeat the assertion.
-const noTs = {
-  _id: 'no_ts', source: 'catalog-product', brandId: BRAND,
-  // fileType/fileUrl carried explicitly: this fixture is built as a literal
-  // rather than via cat(), so it does not inherit the helper's defaults. It is
-  // testing the MISSING-createdAt path, not the unusable-media path — leaving
-  // fileUrl off would have made it fail the usability guard for the wrong reason.
-  fileType: 'image', fileUrl: 'https://cdn.example/no_ts.jpg',
-  createdAt: null, metadata: { catalogProductId: PRODUCT, imageRole: 'alt' }
-};
-check('R3b a doc with no createdAt loses tier 2 to a stamped doc',
-  pick([noTs, a3])?.mediaId === 'alt_2026_09');
-check('R3b a doc with no createdAt is still selectable when it is the only one',
-  pick([noTs])?.mediaId === 'no_ts');
+// ── R3/R3b/R3c: catalog-first reseed on STATIC regenerate — REMOVED
+// 2026-09-07 (dormant render fallback deletion, see session.d/) ──────────
+// Regenerate used to REPLAY the stored Ad.mediaIds stack forever, so this
+// feature re-derived a catalog-first seed (imageRole=hero → earliest
+// catalog entry → nothing) and passed it into the local-execution static
+// worker's render call. That whole subtree — isRegenReseedCatalogFirstEnabled,
+// reseedDecision, shouldReseedFromCatalog, isCatalogMediaForProduct,
+// pickFirstCatalogMediaId, deriveFirstCatalogMediaId, RESEED_SKIP, and the
+// REGEN_RESEED_CATALOG_FIRST env var — is deleted from
+// services/adRegenerateService.js / config/defaults.env: it was reachable
+// only from the deleted local-execution worker (formerly `runImage`, called
+// from the deleted `performRegeneration`). regenerateAd() now unconditionally
+// defers every regenerate to adgen; whatever seed-reselection adgen's own
+// consumer does on re-render is adgen's concern, not this repo's.
 
 // ── R4: video regenerate camera-prompt overrides ────────────────────────
 // The gap this pins (owner 2026-08-03): runVideoFull took NO prompt override,
@@ -683,19 +471,23 @@ const atRaw        = 'r'.repeat(4000);
 // in the renderer (rawPromptOverride, which already accepted a bare string)
 // but was unreachable from the regenerate API — the route's only door was
 // promptOverride {system,user}, which 400s unless BOTH halves are non-empty.
-// R5 pins:
+// R5 pins (the REQUEST-side validation, still all in this repo):
 //   - the cap is 40000, NOT the video 4000 (the prompt it replaces is ~8k)
 //   - imagePromptRaw alone is enough intent
 //   - whitespace-only collapses to null (a blank textarea is not intent)
-//   - a raw string reaches the model VERBATIM — no {system,user} wrapping and
-//     no OPERATOR REFINEMENT header
-//   - MONEY: the vision-QC retry carries its corrective note INSIDE the
-//     override, so the single allowed regeneration cannot re-submit a
-//     byte-identical prompt for a second charge
-// Offline: pure helpers + the real directImageRenderService exports.
+// Offline: pure helpers from adRegenerateService.js.
+//
+// REMOVED (dormant render fallback deletion, 2026-09-07): R5c (verbatim
+// delivery to the image model — directImageRenderService.resolveImagePromptOverride)
+// and R5d (the vision-QC retry's corrective-note composition —
+// directImageRenderService.composeCorrectiveOverride) tested the RENDER-TIME
+// mapping of this request into an actual model prompt. That mapping lived
+// exclusively inside `renderDirectImage`, which no longer exists — adgen's
+// own regenerate consumer claims `Ad.regenerationRequest` and does this
+// mapping (and the same MONEY-critical no-identical-resubmit rule) on its
+// side now. Nothing in this repo maps imagePromptRaw into a model prompt any
+// more, so there is nothing left here for R5c/R5d to call.
 {
-  const directImage = require('../services/directImageRenderService');
-
   // ── R5a: cap ──────────────────────────────────────────────────────────
   // Deliberately asserted as a VALUE, not just ">= video". Harmonising this
   // down to 4000 for symmetry would truncate every loaded prompt.
@@ -732,72 +524,40 @@ const atRaw        = 'r'.repeat(4000);
   check('R5b whitespace-only imagePromptRaw has NO intent',
     regen.regenerateHasIntent({ imagePromptRaw: '   ' }) === false);
 
-  // ── R5c: verbatim delivery to the image model ─────────────────────────
-  // resolveImagePromptOverride is the production mapper. A bare string must
-  // survive untouched: no system/user concatenation, no refinement header.
-  const RAW = 'EDITORIAL STILL LIFE. Product centred. No added text.';
-  check('R5c a bare raw string resolves verbatim',
-    directImage.resolveImagePromptOverride(RAW) === RAW);
-  check('R5c raw resolution adds no OPERATOR REFINEMENT header',
-    !/OPERATOR REFINEMENT/.test(directImage.resolveImagePromptOverride(RAW)));
-  check('R5c whitespace-only override resolves to null (falls back to auto prompt)',
-    directImage.resolveImagePromptOverride('   ') === null);
-  // The {system,user} shape must keep working — the legacy Generation Details
-  // modal still speaks it and shares this one slot.
-  check('R5c {system,user} still concatenates (legacy modal unbroken)',
-    directImage.resolveImagePromptOverride({ system: 'S', user: 'U' }) === 'S\n\nU');
-
-  // ── R5d: MONEY — the vision-QC retry must not repeat itself ───────────
-  // Without composeCorrectiveOverride the QC retry re-enters renderDirectImage
-  // with operatorPrompt=correctiveNote AND the override still set; the override
-  // wins, the note-appending branch is never reached, and the one allowed
-  // regeneration pays for a byte-identical prompt and an identical verdict.
-  const NOTE = 'Remove the competitor emblem from the midfoot panel.';
-  const composed = directImage.composeCorrectiveOverride(RAW, NOTE);
-  check('R5d QC retry keeps the operator override text',
-    composed.includes(RAW));
-  check('R5d QC retry actually carries the corrective note',
-    composed.includes(NOTE));
-  check('R5d QC retry prompt DIFFERS from the first attempt (no identical re-submit)',
-    composed !== RAW);
-  check('R5d no note is a no-op (non-QC renders are untouched)',
-    directImage.composeCorrectiveOverride(RAW, null) === RAW
-    && directImage.composeCorrectiveOverride(RAW, '   ') === RAW);
-  check('R5d no override is a no-op (auto-prompt path keeps its own note handling)',
-    directImage.composeCorrectiveOverride(null, NOTE) === null);
+  // R5c/R5d removed — see the header note above this block.
 }
 
-// ── R6: ad-gen handoff (routing fix, 2026-08-26) ─────────────────────────
+// ── R6: ad-gen handoff (made UNCONDITIONAL as part of removing the dormant
+// in-process render/titling fallback — see session.d/) ───────────────────
 // Owner directive: "regenerate ... should absolutely be running through
-// adgen." When ADGEN_RENDERER_ENABLED is true the backend must not submit
-// the regeneration itself — it stamps Ad.regenerationRequest and returns;
-// adgen's regenerate consumer claims and runs it. R6 pins the pure decision
-// + payload-shape helpers regenerateAd() calls internally (no DB — the
-// atomic lock write itself is exercised by production, not this harness).
+// adgen. We are not going back to that infrastructure." Backend never
+// executes a regenerate in-process any more — every regenerate stamps
+// Ad.regenerationRequest and returns; adgen's regenerate consumer claims
+// and runs it. R6 pins the pure payload-shape helper regenerateAd() calls
+// internally (no DB — the atomic lock write itself is exercised by
+// production, not this harness).
 {
-  const savedAdgenFlag = process.env.ADGEN_RENDERER_ENABLED;
-
-  // ── R6a: the decision reads the SAME call-time flag as the render loop
-  // and titling resume gates (adgenBridge.isAdgenRendererEnabled) ────────
-  // Parser fail-safe: UNSET is OFF (backend renders). Distinct from the
-  // committed file default, which is true (adgen owns production rendering;
-  // dotenv-loaded at boot). Do not conflate the two.
-  check('R6a unset ADGEN_RENDERER_ENABLED -> local execution (parser fail-safe OFF; file default is true)',
-    (() => { delete process.env.ADGEN_RENDERER_ENABLED; return regen.shouldDeferToAdgen() === false; })());
-  check('R6a ADGEN_RENDERER_ENABLED=true -> defer to adgen',
-    (() => { process.env.ADGEN_RENDERER_ENABLED = 'true'; return regen.shouldDeferToAdgen() === true; })());
-  check('R6a ADGEN_RENDERER_ENABLED=false -> local execution',
-    (() => { process.env.ADGEN_RENDERER_ENABLED = 'false'; return regen.shouldDeferToAdgen() === false; })());
-  check('R6a ADGEN_RENDERER_ENABLED=TRUE (any case) -> defer to adgen',
-    (() => { process.env.ADGEN_RENDERER_ENABLED = 'TRUE'; return regen.shouldDeferToAdgen() === true; })());
-  check('R6a garbage value -> local execution (fail-safe OFF, same as adgenBridge)',
-    (() => { process.env.ADGEN_RENDERER_ENABLED = 'yes-please'; return regen.shouldDeferToAdgen() === false; })());
-
-  if (savedAdgenFlag === undefined) delete process.env.ADGEN_RENDERER_ENABLED;
-  else process.env.ADGEN_RENDERER_ENABLED = savedAdgenFlag;
-
-  check('R6a config/defaults.env ships ADGEN_RENDERER_ENABLED=true (production; dashboard copy is redundant)',
-    /^ADGEN_RENDERER_ENABLED=true$/m.test(fs.readFileSync(path.join(__dirname, '..', 'config', 'defaults.env'), 'utf8')));
+  // ── R6a: the flag-based decision (shouldDeferToAdgen /
+  // ADGEN_RENDERER_ENABLED / services/adgenBridge.js) is GONE — the handoff
+  // is unconditional now. Pin the absence, and pin that regenerateAd's own
+  // source no longer branches on it.
+  check('R6a shouldDeferToAdgen no longer exists (the flag-based decision was deleted)',
+    typeof regen.shouldDeferToAdgen === 'undefined');
+  {
+    const src = fs.readFileSync(path.join(__dirname, '../services/adRegenerateService.js'), 'utf8');
+    check('R6a adRegenerateService.js no longer references the deleted ADGEN_RENDERER_ENABLED flag',
+      !/ADGEN_RENDERER_ENABLED|isAdgenRendererEnabled|shouldDeferToAdgen/.test(src));
+    const fnIdx = src.indexOf('async function regenerateAd(');
+    if (fnIdx < 0) throw new Error('regenerateAd not found in source');
+    const fnEndIdx = src.indexOf('\nmodule.exports', fnIdx);
+    const fnBody = src.slice(fnIdx, fnEndIdx > fnIdx ? fnEndIdx : fnIdx + 4000);
+    check('R6a regenerateAd unconditionally builds regenerationRequest via buildRegenerationRequest (no if/else defer decision)',
+      /regenerationRequest:\s*buildRegenerationRequest\(/.test(fnBody));
+    check('R6a regenerateAd never calls performRegeneration (the deleted local-execution work function)',
+      !/performRegeneration\(/.test(fnBody));
+  }
+  check('R6a config/defaults.env no longer ships ADGEN_RENDERER_ENABLED (the switch is gone, not just defaulted true)',
+    !/^ADGEN_RENDERER_ENABLED=/m.test(fs.readFileSync(path.join(__dirname, '..', 'config', 'defaults.env'), 'utf8')));
 
   // ── R6b: regenerationRequest payload shape — one definition, both sides
   // trust it (regenerateAd stamps it; the adgen consumer's
@@ -833,49 +593,18 @@ const atRaw        = 'r'.repeat(4000);
   check('R6b mode defaults to full when omitted (matches regenerateAd\'s effMode)',
     regen.buildRegenerationRequest({ kind: 'image' }).mode === 'full');
 
-  // ── R6c: performRegeneration is exported for the adgen consumer to reuse
-  // (and for this harness to assert it exists with the right arity) ──────
-  // NOTE: adgen's runClaimedRegeneration does NOT call this — it has its
-  // own self-contained duplicate (see that repo's adRegenerateService.js
-  // header for why: scripts/verifyVideoResumeFromReceipt.js there
-  // statically extracts regenerateAd's own body and expects it to reach
-  // runVideoFull directly, so a shared cross-repo helper isn't reachable
-  // there anyway; this export exists for THIS repo's own regenerateAd to
-  // reuse, and so this harness can assert it exists with the right arity).
-  check('R6c performRegeneration is exported and reused by this repo\'s own local-execution path',
-    typeof regen.performRegeneration === 'function');
-  check('R6c performRegeneration takes one options object (not positional args)',
-    regen.performRegeneration.length === 1);
-
-  // ── R6d: MONEY — the local-execution lock unconditionally nulls the
-  // adgen handoff markers, not just on success at markComplete ───────────
-  // Defense in depth against a stale leftover from a prior stuck deferred
-  // attempt: if regenerationRequest / regenerateClaimedByWorker survive
-  // past markComplete (e.g. an operator manually reset only
-  // `regenerating:false` to unstick a row), a NEW local regenerate winning
-  // the SAME atomic lock write must null them in that SAME write — not a
-  // separate one — or an adgen consumer could claim the stale object and
-  // run in parallel with this call using different (stale) arguments.
-  // Source-checked (not just import-checked) because this is a Mongo
-  // update-document shape, not something callable offline without a DB.
-  {
-    const fs = require('fs');
-    const path = require('path');
-    const src = fs.readFileSync(path.join(__dirname, '../services/adRegenerateService.js'), 'utf8');
-    const fnIdx = src.indexOf('async function regenerateAd(');
-    if (fnIdx < 0) throw new Error('regenerateAd not found in source');
-    const lockSetIdx = src.indexOf('} else {', fnIdx);
-    if (lockSetIdx < 0) throw new Error('the deferToAdgen else-branch not found in regenerateAd');
-    const elseBodyEndIdx = src.indexOf('const lockResult = await Ad.updateOne(', lockSetIdx);
-    if (elseBodyEndIdx < 0) throw new Error('could not bound the else-branch (lockResult write not found after it)');
-    const body = src.slice(lockSetIdx, elseBodyEndIdx);
-    check('R6d local-execution branch (else, not deferToAdgen) explicitly nulls regenerationRequest',
-      /lockSet\.regenerationRequest\s*=\s*null/.test(body));
-    check('R6d local-execution branch explicitly nulls regenerateClaimedByWorker',
-      /lockSet\.regenerateClaimedByWorker\s*=\s*null/.test(body));
-    check('R6d local-execution branch explicitly nulls regenerateClaimedAt',
-      /lockSet\.regenerateClaimedAt\s*=\s*null/.test(body));
-  }
+  // ── R6c/R6d REMOVED — both tested the local-execution path, which is
+  // deleted along with the flag. performRegeneration (R6c: "exported for
+  // this repo's own local-execution path to reuse") no longer exists —
+  // there is no local-execution path left to reuse it. R6d pinned that the
+  // LOCAL-EXECUTION (else) branch of regenerateAd's atomic lock write
+  // explicitly nulled regenerateClaimedByWorker/regenerateClaimedAt as
+  // defense in depth against a local run racing a stuck adgen claim — that
+  // race requires a local run to exist, and it no longer can. See R6a above
+  // for what replaced both: proof the flag/branch/local-execution function
+  // are all actually gone, not just untested.
+  check('R6c/R6d performRegeneration no longer exists (the local-execution work function was deleted)',
+    typeof regen.performRegeneration === 'undefined');
 }
 
 if (failures.length) {

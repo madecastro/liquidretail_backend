@@ -4,12 +4,18 @@
 // verifyRunAlertsAndDoneGuard — two small correctness pins on CampaignRun
 // state. Pure + offline: no DB, no network, no API key.
 //
-// FIX 1. routes/ads.js stamped terminal `done` with no status guard, so a
-//        run the reaper had already marked `failed` could flip back to
-//        `done`. The write now goes through buildTerminalDoneFilter, whose
-//        allow-list is the in-flight CampaignRun statuses
-//        (preparing, running). CampaignRun has no 'cancelled' — operator
-//        stop is OperationRun.status='cancelled' via progressService.
+// FIX 1. routes/ads.js used to stamp terminal `done` with no status guard, so
+//        a run the reaper had already marked `failed` could flip back to
+//        `done`. The write went through buildTerminalDoneFilter, whose
+//        allow-list is the in-flight CampaignRun statuses (preparing,
+//        running). CampaignRun has no 'cancelled' — operator stop is
+//        OperationRun.status='cancelled' via progressService.
+//        UPDATED 2026-09-07 (dormant render fallback deletion): routes/ads.js
+//        no longer renders in-process at all, so it no longer has a
+//        render-loop `done` write to guard (E1/E2/E5, removed below — see
+//        their site). adgen now drives CampaignRun to 'done' itself, using
+//        the same buildTerminalDoneFilter shape. Group D below still pins
+//        buildTerminalDoneFilter's OWN logic directly and is unaffected.
 //
 // FIX 2. services/backlogWatchdog.js arm 2 keyed "not progressing" on
 //        startedAt (AGE). That is a false-positive generator: a healthy
@@ -29,16 +35,15 @@
 // Revert-prove (each mutation must fail this harness):
 //   1. Drop `status` from buildTerminalDoneFilter
 //        → D3 fails (a reaped `failed` run becomes `done`)
-//   2. Stop calling buildTerminalDoneFilter at the render-loop write
-//        → E1 fails (these checks would be testing a copy)
-//   3. Drop the import of buildTerminalDoneFilter from ads.js
-//        → E2 fails (the unbound-identifier production incident)
-//   4. Revert arm 2 to `{ status:'running', startedAt: { $lt: age } }`
+//   2. Revert arm 2 to `{ status:'running', startedAt: { $lt: age } }`
 //        → B1 fails (a progressing old run alerts — the false positive)
-//   5. Drop `updatedAt` from buildStalledRunFilter / stop calling it
+//   3. Drop `updatedAt` from buildStalledRunFilter / stop calling it
 //        → B1 or E3 fails
-//   6. Raise ALERT_RUN_SILENCE_MIN's default to >= REAP_STALE_MIN
+//   4. Raise ALERT_RUN_SILENCE_MIN's default to >= REAP_STALE_MIN
 //        → C1 fails (the empty-set boundary)
+//   (former mutations 2/3, "stop calling / stop importing
+//   buildTerminalDoneFilter at the render-loop write", no longer apply —
+//   that write was deleted along with the render loop itself, 2026-09-07.)
 //
 //   node scripts/verifyRunAlertsAndDoneGuard.js
 
@@ -364,8 +369,6 @@ ok('D8 a hypothetical CampaignRun.status=\'cancelled\' would stay cancelled', ()
 
 // ── Group E — live wiring. Comments STRIPPED so a check cannot pass on
 // its own explanatory prose (same lesson as verifyTitlingOrphanResume E*).
-const adsSrc = stripComments(fs.readFileSync(path.join(ROOT, 'routes', 'ads.js'), 'utf8'));
-const adsRaw = fs.readFileSync(path.join(ROOT, 'routes', 'ads.js'), 'utf8');
 const wdSrc = stripComments(wdRaw);
 const guardsSrc = stripComments(
   fs.readFileSync(path.join(ROOT, 'services', 'campaignRunGuards.js'), 'utf8')
@@ -373,32 +376,33 @@ const guardsSrc = stripComments(
 const modelSrc = fs.readFileSync(path.join(ROOT, 'models', 'CampaignRun.js'), 'utf8');
 const opSrc = fs.readFileSync(path.join(ROOT, 'models', 'OperationRun.js'), 'utf8');
 
-ok('E1 the render-loop done write uses buildTerminalDoneFilter', () => {
-  // Scope to the end-of-loop write, not any other done stamp. The
-  // surrounding progressRun.succeed / 'done in' log is unique to this site.
-  const i = adsSrc.indexOf('progressRun.succeed');
-  assert.ok(i > 0, 'could not locate the render-loop close-out');
-  const block = adsSrc.slice(Math.max(0, i - 800), i);
-  assert.ok(/CampaignRun\.updateOne\(/.test(block), 'no CampaignRun.updateOne before progressRun.succeed');
-  assert.ok(/buildTerminalDoneFilter\(\s*run\._id\s*\)/.test(block),
-    'the live write must use buildTerminalDoneFilter, or these checks test a copy');
+// E1/E2/E5 used to pin routes/ads.js's OWN end-of-render-loop `done`
+// write (right before the `progressRun.succeed` close-out log) using
+// buildTerminalDoneFilter. That write is gone with the loop; adgen
+// CAS-writes done via the vendored helper. Converted to absence pins.
+// Do NOT retarget at the empty-claim / empty-expansion `{_id}` done
+// writes (~1054/1111/1189) — those are a different, pre-existing,
+// unguarded shape.
+const adsSrc = stripComments(fs.readFileSync(path.join(ROOT, 'routes', 'ads.js'), 'utf8'));
+const adsRaw = fs.readFileSync(path.join(ROOT, 'routes', 'ads.js'), 'utf8');
+
+ok('E1 runRenderLoop does not write CampaignRun status:\'done\' (adgen finalizes)', () => {
+  assert.ok(!/progressRun\.succeed/.test(adsSrc),
+    'progressRun.succeed (render-loop close-out) must not reappear in ads.js');
+  const loopStart = adsSrc.indexOf('async function runRenderLoop');
+  assert.ok(loopStart >= 0, 'could not locate runRenderLoop');
+  const loopBody = adsSrc.slice(loopStart, loopStart + 8000);
+  assert.ok(!/status:\s*'done'/.test(loopBody),
+    'runRenderLoop must not stamp status:\'done\' — adgen owns the terminal write');
 });
 
-ok('E2 ads.js IMPORTS buildTerminalDoneFilter (a call without an import is a ReferenceError)', () => {
+ok('E2 ads.js no longer binds buildTerminalDoneFilter (render-loop write is gone)', () => {
   assert.ok(
     /require\(\s*['"]\.\.\/services\/campaignRunGuards['"]\s*\)/.test(adsRaw),
-    'routes/ads.js must require services/campaignRunGuards'
+    'routes/ads.js must still require services/campaignRunGuards'
   );
-  assert.ok(/buildTerminalDoneFilter/.test(adsRaw.match(/require\(\s*['"]\.\.\/services\/campaignRunGuards['"]\s*\)/)
-    ? adsRaw.slice(0, adsRaw.indexOf("require('../services/campaignRunGuards')") + 80)
-    : adsRaw));
-  // Destructure pin — the unbound-identifier incident: a call without
-  // the binding shipped to prod with a green source-text harness. Matches
-  // buildTerminalDoneFilter destructured alone OR alongside sibling names
-  // from the same require (e.g. buildRunningFlipFilter) — the invariant is
-  // "this identifier is bound", not "this is the only identifier bound".
-  assert.ok(/\{[^}]*\bbuildTerminalDoneFilter\b[^}]*\}\s*=\s*require\(\s*['"]\.\.\/services\/campaignRunGuards['"]\s*\)/.test(adsRaw),
-    'buildTerminalDoneFilter must be destructured from that require');
+  assert.ok(!/\bbuildTerminalDoneFilter\b/.test(adsRaw),
+    'buildTerminalDoneFilter must not be bound in ads.js — the loop write that needed it is gone');
 });
 
 ok('E3 the live watchdog query uses buildStalledRunFilter', () => {
@@ -414,14 +418,12 @@ ok('E4 buildStalledRunFilter is defined in backlogWatchdog and lists both timest
     'the helper itself must carry AGE ∧ SILENCE — not just the comment');
 });
 
-ok('E5 the render-loop done write is no longer an unguarded `{ _id: run._id }` + status:done', () => {
-  // The defect: updateOne({ _id: run._id }, { status: 'done', ... }).
-  // After the fix the filter is the helper. Pin that THIS site no longer
-  // has the unguarded shape; other early-exit done writes are out of scope.
-  const i = adsSrc.indexOf('progressRun.succeed');
-  const block = adsSrc.slice(Math.max(0, i - 800), i);
-  assert.ok(!/updateOne\(\s*\{\s*_id:\s*run\._id\s*\}/.test(block),
-    'the render-loop done write is still unguarded');
+ok('E5 runRenderLoop has no unguarded `{ _id: run._id }` + status:done write', () => {
+  const loopStart = adsSrc.indexOf('async function runRenderLoop');
+  assert.ok(loopStart >= 0);
+  const loopBody = adsSrc.slice(loopStart, loopStart + 8000);
+  assert.ok(!/updateOne\(\s*\{\s*_id:\s*run\._id\s*\}[\s\S]{0,400}status:\s*'done'/.test(loopBody),
+    'runRenderLoop must not regain an unguarded done write');
 });
 
 ok('E6 campaignRunGuards exports the same allow-list the filter uses', () => {

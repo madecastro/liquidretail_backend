@@ -35,9 +35,35 @@
  *       Canonical failing input: Vuori bomber-jacket review over a
  *       track-pants + sneakers scene. Flag-off is byte-identical.
  *
+ * REMOVED (dormant render fallback deletion): every check that drove
+ * `services/directImageRenderService.js`'s `buildIntentData` (the mint-time
+ * static-ad render entry point's prompt-building, reached only from the now-
+ * deleted `renderDirectImage`) has been removed — that function and
+ * everything reachable only from it no longer exist; adgen owns static
+ * rendering unconditionally now. This cost: P1's buildIntentData-through-
+ * the-renderer checks (the isolated-gate checks against
+ * `isPrintableCustomerQuote` stay), P2's "the renderer must not resurrect it
+ * either" static check (the `normalizeQuote`-level check stays), P3's
+ * rating-via-buildIntentData half (`formatDisplayRating`'s own pure-function
+ * assertion stays and is now the sole rating pin), the P3 reviewCount-
+ * suppression checks (incl. the STATIC_PROOF_COHERENCE flag-off restore),
+ * all of P3b (brand-vs-product rating/reviewsText scoping), P6's four
+ * static-intent (`intentFor`) assertions (its `isPrintableCustomerQuote` /
+ * `toPrintableCustomerQuote` / video-gate assertions all stay), the
+ * flag-off byte-identity re-run at the end of P8, the buildIntentData half
+ * of the P8 "render-time defence" block (its gateLayoutInputQuotes /
+ * video-path half is untouched), the P8-revert source pins against
+ * directImageRenderService.js's now-nonexistent Media.select /
+ * toPrintableCustomerQuote / applyStrictQuoteScope call sites, and the whole
+ * "Live static projection" block. Everything testing
+ * `services/quoteProvenance.js` directly (isPrintableCustomerQuote,
+ * toPrintableCustomerQuote, the P8 noun-scope selectors) and everything
+ * testing the VIDEO path (gateLayoutInputQuotes / buildMetaForAd / the
+ * metaCascadeResolver chain, still live in `services/brandScriptExecutor.js`)
+ * is unaffected and stays.
+ *
  * Run: node scripts/verifyQuoteProvenance.js
  */
-const direct = require('../services/directImageRenderService');
 const intents = require('../services/staticAdIntents');
 const layout = require('../services/layoutInputService');
 const provenance = require('../services/quoteProvenance');
@@ -108,25 +134,6 @@ for (const [label, q] of WITHHELD) {
   check(`P1 withholds: ${label}`, provenance.isPrintableCustomerQuote(q) === false);
 }
 
-// The gate has to hold through buildIntentData, not just in isolation.
-function intentFor(quote, extra = {}) {
-  return direct.buildIntentData({
-    concept: { copy_picks: { headline: 'Built for the long season' } },
-    layoutInput: { social_proof: { primary_quote: quote, ...extra } },
-    brand: {}, cta: 'SHOP NOW'
-  });
-}
-for (const [label, q] of WITHHELD) {
-  const d = intentFor(q);
-  check(`P1 buildIntentData emits no quote for: ${label}`, d.quote === undefined, `got ${JSON.stringify(d.quote)}`);
-  check(`P1 buildIntentData emits no attribution for: ${label}`, d.attribution === undefined, `got ${JSON.stringify(d.attribution)}`);
-}
-{
-  const d = intentFor({ text: REAL_TEXT, origin: 'scraped', verbatim: true, author_name: 'Jessica L.' });
-  check('P1 a legitimate quote still prints', d.quote === REAL_TEXT, `got ${JSON.stringify(d.quote)}`);
-  check('P1 a legitimate byline still prints', d.attribution === 'Jessica L.', `got ${JSON.stringify(d.attribution)}`);
-}
-
 // ── P1b: 'unknown' is a real value, and it is not printable ─────────────
 // The first cut of the producer-side stamp treated "not gemini-search" as
 // "storefront import", which stamped every legacy CATEGORY row — LLM web-search
@@ -153,10 +160,6 @@ for (const [label, raw] of NOT_A_PERSON) {
   const n = layout.normalizeQuote(raw);
   check(`P2 no byline invented from ${label}`, n && n.author_name === undefined,
     `author_name=${JSON.stringify(n && n.author_name)}`);
-  // The renderer must not resurrect it either.
-  const d = intentFor({ ...n, origin: 'scraped', verbatim: true });
-  check(`P2 renderer prints no byline for ${label}`, d.attribution === undefined,
-    `attribution=${JSON.stringify(d.attribution)}`);
 }
 for (const [label, raw, expected] of [
   ['author_name', { text: REAL_TEXT, author_name: 'Jessica L.' }, 'Jessica L.'],
@@ -202,15 +205,8 @@ const RATINGS = [
 ];
 check('P3 RATING_STAR_MIN is 4.39', RATING_STAR_MIN === 4.39);
 for (const [value, expected, why] of RATINGS) {
-  const d = direct.buildIntentData({
-    concept: {}, layoutInput: { social_proof: { rating_value: value } }, brand: {}, cta: 'X'
-  });
-  check(`P3 rating ${JSON.stringify(value)} -> ${JSON.stringify(expected)} (${why})`,
-    d.rating === expected, `got ${JSON.stringify(d.rating)}`);
-  // Shared pure helper must agree with the static intent path (one rule).
-  check(`P3 formatDisplayRating(${JSON.stringify(value)}) matches intent`,
-    formatDisplayRating(value) === expected,
-    `helper=${JSON.stringify(formatDisplayRating(value))} intent=${JSON.stringify(d.rating)}`);
+  check(`P3 formatDisplayRating(${JSON.stringify(value)}) -> ${JSON.stringify(expected)} (${why})`,
+    formatDisplayRating(value) === expected, `got ${JSON.stringify(formatDisplayRating(value))}`);
 }
 // Video chrome source pin: buildMetaForAd must gate ratings so a 3.2 catalog
 // rating cannot reach Remotion. Atomic pair resolver (resolveAtomicRatingPair)
@@ -231,194 +227,6 @@ for (const [value, expected, why] of RATINGS) {
     'buildMetaForAd must gate numbers through resolveCoherentSocialProof (which gates via '
     + 'resolveAtomicRatingPair -> formatDisplayRating and adds tier coherence)');
 }
-// `12 -> 12` CHANGED TO `12 -> undefined` (2026-08-04), deliberately, when the
-// static path started sharing the video path's coherence chokepoint.
-// resolveCoherentSocialProof withholds a count that has no star rating beside it
-// when no quote prints ("product-count and brand-count both require a coherent
-// quote", plus allowBrandCountWithoutStars:false in its rating-only branch).
-//
-// NO PROOF IS LOST, and that is why this expectation could move: `d.reviewCount`
-// is only ever rendered as a parenthetical NEXT TO the rating
-// (staticAdIntents.js:454,460 — `${d.rating} ★ (${d.reviewCount} reviews)`), so a
-// count with no rating never reached an ad. Its only other effect was at :403,
-// where a truthy count SUPPRESSES the "no review count, and not the words
-// review, reviews, ratings or customers" absence line — so the old behaviour
-// dropped that instruction from the prompt while supplying no count for the
-// model to use, which is the wrong way round. Withholding is strictly safer.
-for (const [value, expected] of [[0, undefined], [-5, undefined], [12, undefined], [null, undefined]]) {
-  const d = direct.buildIntentData({
-    concept: {}, layoutInput: { social_proof: { review_count: value } }, brand: {}, cta: 'X'
-  });
-  check(`P3 reviewCount ${JSON.stringify(value)} -> ${JSON.stringify(expected)}`,
-    d.reviewCount === expected, `got ${JSON.stringify(d.reviewCount)}`);
-}
-
-// The counterpart that proves the above is coherence and not a blanket drop: a
-// count PAIRED with a qualifying rating from the same tier still comes through.
-{
-  const d = direct.buildIntentData({
-    concept: {},
-    layoutInput: { social_proof: { rating_value: 4.6, review_count: 12, rating_source: 'product' } },
-    brand: {}, cta: 'X'
-  });
-  check('P3 a product-stamped rating+count pair still prints both',
-    d.rating === '4.6' && d.reviewCount === 12,
-    `got rating=${JSON.stringify(d.rating)} count=${JSON.stringify(d.reviewCount)}`);
-}
-
-// ── P3b: the two holes an adversarial pass found, pinned so they stay shut ──
-
-// SUPERSEDED (2026-08-05): brand.brandReviews is now a sanctioned static number
-// source (BRAND_PROOF_ON_PRODUCT_ADS, owner-requested) — the fix landed the
-// OTHER way round from what this check originally required. Reopening the
-// number source was only safe once the RENDERED STRING carries its own scope,
-// so the contract this check must hold is now "the string names its tier",
-// not "brand numbers never arrive". Testing d.rating/d.reviewCount directly
-// (as the original version did) tests the wrong layer — those are correctly
-// unscoped by design; `d.reviewsText` is the disclosure, and staticAdIntents
-// renders THAT, not a re-derived template. See services/staticAdIntents.js
-// social_proof_led.text() — it now prefers d.reviewsText over building
-// `(${d.reviewCount} reviews)` itself.
-// This calls the REAL rendering path (intents.buildPrompt, same as production),
-// not a re-derivation of the ternary — a check that recomputes the string it is
-// supposed to verify cannot fail when the real code regresses. An earlier draft
-// of this check did exactly that and was caught reverting staticAdIntents.js
-// with the check still green.
-{
-  const d = direct.buildIntentData({
-    concept: {},
-    layoutInput: { social_proof: {} },                       // no stamped pair at all
-    brand: { brandReviews: { rating: 4.8, reviewCount: 41000 } },
-    cta: 'X'
-  });
-  const built = intents.buildPrompt({
-    intentKey: 'social_proof_led', data: d,
-    product: {}, surface: 'meta_feed_1_1'
-  });
-  const prompt = built && built.prompt || '';
-  check('P3b a brand aggregate wins with SCOPED copy — the REAL rendered prompt names "brand"',
-    d.rating === '4.8' && d.reviewCount === 41000 && d.reviewsText === '41000 brand reviews'
-    && prompt.includes('41000 brand reviews') && !prompt.includes('(41000 reviews)'),
-    `got rating=${JSON.stringify(d.rating)} count=${JSON.stringify(d.reviewCount)} `
-    + `reviewsText=${JSON.stringify(d.reviewsText)}; prompt contains "41000 brand reviews"=`
-    + `${prompt.includes('41000 brand reviews')} contains unscoped "(41000 reviews)"=`
-    + `${prompt.includes('(41000 reviews)')} — without the scope word this reads as that SKU's own volume`);
-}
-// The flag closes the door completely, for a brand that wants it off.
-{
-  const prev = process.env.BRAND_PROOF_ON_PRODUCT_ADS;
-  process.env.BRAND_PROOF_ON_PRODUCT_ADS = 'false';
-  const d = direct.buildIntentData({
-    concept: {},
-    layoutInput: { social_proof: {} },
-    brand: { brandReviews: { rating: 4.8, reviewCount: 41000 } },
-    cta: 'X'
-  });
-  check('P3b BRAND_PROOF_ON_PRODUCT_ADS=false withholds the brand aggregate entirely',
-    d.rating === undefined && d.reviewCount === undefined && d.reviewsText === undefined,
-    `got rating=${JSON.stringify(d.rating)} count=${JSON.stringify(d.reviewCount)}`);
-  if (prev === undefined) delete process.env.BRAND_PROOF_ON_PRODUCT_ADS;
-  else process.env.BRAND_PROOF_ON_PRODUCT_ADS = prev;
-}
-// The pre-existing sanctioned path (layoutInput itself stamping 'brand', the
-// no-SKU / branding outcome) still works and is still scoped IN THE REAL PROMPT.
-{
-  const d = direct.buildIntentData({
-    concept: {},
-    layoutInput: { social_proof: { rating_value: 4.8, review_count: 41000, rating_source: 'brand' } },
-    brand: {},
-    cta: 'X'
-  });
-  const built = intents.buildPrompt({
-    intentKey: 'social_proof_led', data: d,
-    product: {}, surface: 'meta_feed_1_1'
-  });
-  const prompt = built && built.prompt || '';
-  check('P3b a layoutInput-stamped BRAND pair still prints, scoped, in the real prompt',
-    d.rating === '4.8' && d.reviewCount === 41000 && d.reviewsText === '41000 brand reviews'
-    && prompt.includes('41000 brand reviews'),
-    `got rating=${JSON.stringify(d.rating)} reviewsText=${JSON.stringify(d.reviewsText)}`);
-}
-// The one thing that must NEVER be true regardless of source or flag: a
-// PRODUCT-tier win must never carry the word "brand" in its disclosure string,
-// verified against the real prompt.
-{
-  const d = direct.buildIntentData({
-    concept: {},
-    layoutInput: { social_proof: { rating_value: 4.7, review_count: 523, rating_source: 'product' } },
-    brand: { brandReviews: { rating: 4.8, reviewCount: 41000 } },
-    cta: 'X'
-  });
-  const built = intents.buildPrompt({
-    intentKey: 'social_proof_led', data: d,
-    product: {}, surface: 'meta_feed_1_1'
-  });
-  const prompt = built && built.prompt || '';
-  // "brand" legitimately appears elsewhere in this prompt (the shared
-  // PRODUCT_FIDELITY block: "do not infer it from the brand", branding-on-item
-  // carve-outs) — those are unrelated to the rating disclosure, so the real
-  // assertion is scoped to the RATING line itself, not the whole prompt.
-  const ratingLine = prompt.split('\n').find((l) => l.includes('523 reviews'));
-  check('P3b a product-tier win is never mislabelled "brand" on its own rating line',
-    d.reviewsText === '523 reviews' && !!ratingLine && !ratingLine.toLowerCase().includes('brand'),
-    `got reviewsText=${JSON.stringify(d.reviewsText)} ratingLine=${JSON.stringify(ratingLine)}`);
-}
-
-// SECOND BLOCKER an adversarial pass caught, same root cause as #1 above but a
-// different rendered slot: TRUST MARK (product_first_lifestyle — the FLOOR
-// intent, always eligible — and brand_led) rendered a bare, unscoped
-// `${d.rating} ★` with no count at all, so widening the brand number source
-// (BRAND_PROOF_ON_PRODUCT_ADS) made a brand-wide rating print as though it
-// were this product's own star on the MOST FREQUENTLY reached intent in the
-// file. Both TRUST MARK sites now prefer d.reviewsText the same way the
-// RATING slot does. Tested against the REAL rendered prompt via
-// intents.buildPrompt, not a re-derived string — the P3b lesson from earlier
-// in this file (a check that recomputes what it verifies cannot catch a
-// reverted fix).
-for (const intentKey of ['product_first_lifestyle', 'brand_led']) {
-  const d = direct.buildIntentData({
-    concept: { copy: { headline: 'H' } },  // brand_led requires a headline to be eligible
-    layoutInput: { social_proof: {} },
-    brand: { brandReviews: { rating: 4.8, reviewCount: 41000 } },
-    cta: 'X'
-  });
-  const built = intents.buildPrompt({ intentKey, data: d, product: {}, surface: 'meta_feed_1_1' });
-  const prompt = built && built.prompt || '';
-  const markLine = prompt.split('\n').find((l) => l.includes('TRUST MARK') || l.includes('★'));
-  check(`P3b ${intentKey} TRUST MARK: a brand aggregate is SCOPED, not a bare star`,
-    d.reviewsText === '41000 brand reviews' && !!markLine && markLine.toLowerCase().includes('brand'),
-    `got reviewsText=${JSON.stringify(d.reviewsText)} markLine=${JSON.stringify(markLine)} built.error=${built && built.error}`);
-}
-
-// SERIOUS that was caught before merge: productReviews winning on a COUNT alone
-// would hand back {rating:null, count:N} and erase a good top-level rating.
-{
-  const d = direct.buildIntentData({
-    concept: {},
-    layoutInput: { social_proof: {} },
-    brand: {},
-    product: { rating: 4.7, productReviews: { rating: null, reviewCount: 500 } },
-    cta: 'X'
-  });
-  check('P3b a count-only productReviews does not erase the top-level rating',
-    d.rating === '4.7',
-    `got rating=${JSON.stringify(d.rating)} — productReviews must carry a rating to win`);
-}
-
-// And the flag restores the pre-change pass-through exactly, so the behaviour
-// change above is revertible without a deploy.
-{
-  const prev = process.env.STATIC_PROOF_COHERENCE;
-  process.env.STATIC_PROOF_COHERENCE = 'false';
-  const d = direct.buildIntentData({
-    concept: {}, layoutInput: { social_proof: { review_count: 12 } }, brand: {}, cta: 'X'
-  });
-  check('P3 STATIC_PROOF_COHERENCE=false restores the bare-count pass-through',
-    d.reviewCount === 12, `got ${JSON.stringify(d.reviewCount)}`);
-  if (prev === undefined) delete process.env.STATIC_PROOF_COHERENCE;
-  else process.env.STATIC_PROOF_COHERENCE = prev;
-}
-
 // ── P5: shortening must not invert the review ───────────────────────────
 // The snippet is what the model typesets, so a shortening that flips a
 // complaint into praise puts words in a named customer's mouth. The old check
@@ -492,13 +300,6 @@ const GROUNDED = {
   check('P6 original author_name still present on input (no mutation)',
     GROUNDED.author_name === 'vertexaisearch.cloud.google.com');
 
-  // Static renderer (buildIntentData): text yes, attribution no.
-  const d = intentFor(GROUNDED);
-  check('P6 static intent prints the grounded text',
-    d.quote === REAL_TEXT, `got ${JSON.stringify(d.quote)}`);
-  check('P6 static intent prints NO attribution for grounded',
-    d.attribution === undefined, `got ${JSON.stringify(d.attribution)}`);
-
   // A caller that somehow re-attaches a byline on an llm-web quote and re-runs
   // the gate still cannot get it through — the gate re-strips.
   const reattached = { ...printable, author_name: 'Resurrected Name', author: 'Also Resurrected' };
@@ -506,9 +307,6 @@ const GROUNDED = {
   check('P6 re-attached author_name cannot survive a second gate pass',
     restripped && !('author_name' in restripped) && restripped.author_name == null,
     `got ${JSON.stringify(restripped && restripped.author_name)}`);
-  const d2 = intentFor(reattached);
-  check('P6 static intent still has no attribution after re-attach attempt',
-    d2.attribution === undefined, `got ${JSON.stringify(d2.attribution)}`);
 
   // Video path: gateLayoutInputQuotes reseats primary_quote with the stripped
   // copy; cascade's reviewer arms (author_name / author) resolve to nothing.
@@ -537,8 +335,6 @@ const GROUNDED = {
   const synth = { text: REAL_TEXT, origin: 'synthesized', verbatim: false, author_name: 'Bot' };
   check('P6 synthesized still withheld by predicate',
     provenance.isPrintableCustomerQuote(synth) === false);
-  const dSynth = intentFor(synth);
-  check('P6 static emits no quote for synthesized', dSynth.quote === undefined);
   const gatedSynth = gateLayoutInputQuotes({
     input: { social_proof: { primary_quote: synth } }
   });
@@ -557,9 +353,6 @@ const GROUNDED = {
   check('P6 scraped toPrintable keeps author_name',
     scrapedPrintable && scrapedPrintable.author_name === 'Jessica L.',
     `got ${JSON.stringify(scrapedPrintable && scrapedPrintable.author_name)}`);
-  const dScraped = intentFor(scraped);
-  check('P6 scraped static still prints byline',
-    dScraped.attribution === 'Jessica L.', `got ${JSON.stringify(dScraped.attribution)}`);
   const gatedScraped = gateLayoutInputQuotes({
     input: { social_proof: { primary_quote: scraped } }
   });
@@ -586,15 +379,12 @@ const GROUNDED = {
     /ANONYMOUS_PRINT_ORIGINS[\s\S]*?llm-web/.test(src));
   check('P6-revert surface: toPrintable deletes byline fields (not just a comment)',
     /delete out\[f\]/.test(src) || /for\s*\(.*BYLINE_FIELDS/.test(src));
-  // The GUARANTEE is that directImage uses the gate's RETURN VALUE — a sanitized copy —
-  // rather than testing a boolean and then printing the original object, which is how a
-  // stripped byline could re-surface. It was pinned by matching the ARGUMENT spelling
-  // (`proof.primary_quote`), which broke the moment the argument legitimately became the
-  // rotation's choice. Pin the assignment, which is the thing that actually matters.
-  check('P6-revert surface: directImage uses toPrintable return value',
-    /(?:const|let)\s+quote\s*=\s*toPrintableCustomerQuote\s*\(/.test(
-      fs.readFileSync(path.join(__dirname, '../services/directImageRenderService.js'), 'utf8')
-    ));
+  // The former "directImage uses toPrintable return value" pin was removed
+  // with `renderDirectImage`/`buildIntentData` (dormant render fallback
+  // deletion, 2026-09-07) — directImageRenderService.js no longer calls
+  // toPrintableCustomerQuote at all. The same GUARANTEE (a caller uses the
+  // gate's sanitized RETURN VALUE, never the original object) still holds on
+  // the two live callers pinned below and in quoteRotationService.js.
   check('P6-revert surface: layout pool maps toPrintable (not boolean filter alone)',
     /\.map\s*\(\s*toPrintableCustomerQuote\s*\)/.test(
       fs.readFileSync(path.join(__dirname, '../services/layoutInputService.js'), 'utf8')
@@ -767,7 +557,6 @@ const GROUNDED = {
 // only — quote TEXT is never edited.
 const {
   PRODUCT_NOUNS,
-  QUOTE_SCOPE_MEDIA_SELECT,
   quoteProvenanceStrictEnabled,
   productNounsIn,
   collectScopeLabelText,
@@ -1029,91 +818,10 @@ withStrictFlag(true, () => {
     }) === GENERIC_Q);
 });
 
-// Render-time defence: buildIntentData + gateLayoutInputQuotes.
+// Render-time defence: gateLayoutInputQuotes (the video path — the static
+// buildIntentData half of this block was removed with `renderDirectImage`;
+// see the header note).
 withStrictFlag(true, () => {
-  // MEDIA-ONLY fixtures — do not encode the noun in product.name. The
-  // live static caller often has no CatalogProduct on a media-driven ad;
-  // the seed labels are the entire rule.
-  const dReject = direct.buildIntentData({
-    concept: { copy_picks: { headline: 'Move freely' } },
-    layoutInput: {
-      social_proof: { primary_quote: BOMBER_Q }
-    },
-    brand: {}, cta: 'SHOP NOW',
-    media: PANTS_SNEAKER_MEDIA
-  });
-  check('P8 static intent DROPS bomber quote over pants/sneaker seed (media only)',
-    dReject.quote === undefined, `got ${JSON.stringify(dReject.quote)}`);
-
-  const dAccept = direct.buildIntentData({
-    concept: { copy_picks: { headline: 'Move freely' } },
-    layoutInput: {
-      social_proof: { primary_quote: BOMBER_Q }
-    },
-    brand: {}, cta: 'SHOP NOW',
-    media: JACKET_MEDIA
-  });
-  check('P8 static intent KEEPS bomber quote over a jacket seed (media only)',
-    !!dAccept.quote && BOMBER_JACKET_QUOTE.includes(String(dAccept.quote).replace(/[….]+\s*$/, '')),
-    `got ${JSON.stringify(dAccept.quote)}`);
-
-  const dGeneric = direct.buildIntentData({
-    concept: { copy_picks: { headline: 'Move freely' } },
-    layoutInput: { social_proof: { primary_quote: GENERIC_Q } },
-    brand: {}, cta: 'SHOP NOW'
-  });
-  check('P8 static intent KEEPS a generic quote with no product',
-    dGeneric.quote === GENERIC_QUOTE, `got ${JSON.stringify(dGeneric.quote)}`);
-
-  const dAttached = direct.buildIntentData({
-    concept: { copy_picks: { headline: 'Move freely' } },
-    layoutInput: { social_proof: { primary_quote: { ...GENERIC_Q, tier: 'brand' } } },
-    brand: {},
-    product: { _id: 'sku1', title: 'Kore Short' },
-    cta: 'SHOP NOW'
-  });
-  check('P8 static intent KEEPS a brand-tier quote when a product is attached (last-resort)',
-    dAttached.quote === GENERIC_QUOTE, `got ${JSON.stringify(dAttached.quote)}`);
-
-  // THE REAL DEFECT, at the buildIntentData level: product-attached AND
-  // the cached primary_quote names a garment that is NOT this product.
-  // This is the exact live shape (a Vuori tee ad whose LayoutInputArtifact
-  // had cached the bomber-jacket line as primary_quote) — must not reach
-  // the prompt as this product's testimonial.
-  const dAttachedMismatch = direct.buildIntentData({
-    concept: { copy_picks: { headline: 'Move freely' } },
-    layoutInput: { social_proof: { primary_quote: BOMBER_Q } },
-    brand: {},
-    product: { _id: 'sku2', title: 'Vuori Heavyweight Tee' },
-    cta: 'SHOP NOW'
-  });
-  check('P8 [THE 2026-08-19 DEFECT] static intent DROPS a bomber quote on a product-attached TEE ad',
-    dAttachedMismatch.quote === undefined, `got ${JSON.stringify(dAttachedMismatch.quote)}`);
-
-  // Next-candidate rescue: bomber primary, generic secondary. Media only.
-  const dRescue = direct.buildIntentData({
-    concept: { copy_picks: { headline: 'Move freely' } },
-    layoutInput: {
-      social_proof: { primary_quote: BOMBER_Q, secondary_quotes: [GENERIC_Q] }
-    },
-    brand: {}, cta: 'SHOP NOW',
-    media: PANTS_SNEAKER_MEDIA
-  });
-  check('P8 static intent rescues the next allowed brand-pool quote',
-    dRescue.quote === GENERIC_QUOTE, `got ${JSON.stringify(dRescue.quote)}`);
-
-  // Absence handling: dropped quote degrades like a missing one.
-  const built = intents.buildPrompt({
-    intentKey: 'social_proof_led',
-    data: dReject,
-    product: {},
-    surface: 'meta_feed_1_1'
-  });
-  const prompt = (built && built.prompt) || '';
-  check('P8 absence: social_proof_led prompt states no customer quote when quote is null',
-    /no customer quote/i.test(prompt),
-    `prompt excerpt: ${JSON.stringify(prompt.slice(0, 240))}`);
-
   const gated = gateLayoutInputQuotes({
     input: { social_proof: { primary_quote: BOMBER_Q } }
   }, { productAttached: false, media: PANTS_SNEAKER_MEDIA });
@@ -1154,21 +862,6 @@ withStrictFlag(true, () => {
     gatedRescue?.input?.social_proof?.primary_quote?.text === GENERIC_QUOTE);
 });
 
-// Flag-off byte-identity of the EXISTING fixtures (re-run P1 legitimate
-// quote + P6 scraped path with the flag explicitly off AND on — generic
-// REAL_TEXT names no product noun, so both arms must agree).
-{
-  const prev = process.env.QUOTE_PROVENANCE_STRICT;
-  delete process.env.QUOTE_PROVENANCE_STRICT;
-  const off = intentFor({ text: REAL_TEXT, origin: 'scraped', verbatim: true, author_name: 'Jessica L.' });
-  process.env.QUOTE_PROVENANCE_STRICT = 'true';
-  const on = intentFor({ text: REAL_TEXT, origin: 'scraped', verbatim: true, author_name: 'Jessica L.' });
-  check('P8 flag-on does not change a generic existing P1 quote',
-    off.quote === REAL_TEXT && on.quote === REAL_TEXT && off.attribution === on.attribution);
-  if (prev === undefined) delete process.env.QUOTE_PROVENANCE_STRICT;
-  else process.env.QUOTE_PROVENANCE_STRICT = prev;
-}
-
 // ── P8-revert-prove ─────────────────────────────────────────────────
 // Each rule is pinned two ways: a behavioural check above that fails if
 // the shipped function is loosened, and a source pin so a caller can
@@ -1184,9 +877,6 @@ withStrictFlag(true, () => {
   );
   const dirSrc = fs.readFileSync(
     path.join(__dirname, '../services/aiCreativeDirectorService.js'), 'utf8'
-  );
-  const directSrc = fs.readFileSync(
-    path.join(__dirname, '../services/directImageRenderService.js'), 'utf8'
   );
   const bseSrc = fs.readFileSync(
     path.join(__dirname, '../services/brandScriptExecutor.js'), 'utf8'
@@ -1223,14 +913,12 @@ withStrictFlag(true, () => {
     && /seededUniverse/.test(dirSrc));
   check('P8-revert: assembleSignals live caller threads seededUniverse',
     /assembleSignals\(\s*\{\s*brandId,\s*productId,\s*campaignKind,\s*seededUniverse\s*\}/.test(dirSrc));
-  check('P8-revert: buildIntentData calls applyStrictQuoteScope',
-    /applyStrictQuoteScope\s*\(/.test(directSrc));
-  check('P8-revert: live static Media.select includes seed label fields',
-    /Media\.findById\(mediaId\)\.select\('[^']*\bsubjects\b[^']*\brefinedProducts\b[^']*\bprimarySubjectLabel\b[^']*\bprimarySubjectDesc\b[^']*'\)/.test(directSrc)
-    || /Media\.findById\(mediaId\)\.select\('[^']*\bprimarySubjectLabel\b[^']*\bprimarySubjectDesc\b[^']*\bsubjects\b[^']*\brefinedProducts\b[^']*'\)/.test(directSrc)
-    || (/Media\.findById\(mediaId\)\.select\('([^']+)'\)/.test(directSrc)
-      && ['subjects', 'refinedProducts', 'primarySubjectLabel', 'primarySubjectDesc']
-        .every((f) => new RegExp(`Media\\.findById\\(mediaId\\)\\.select\\('[^']*\\b${f}\\b`).test(directSrc))));
+  // The former "buildIntentData calls applyStrictQuoteScope" / "live static
+  // Media.select includes seed label fields" pins were removed with
+  // `renderDirectImage`/`buildIntentData` (dormant render fallback deletion,
+  // 2026-09-07) — directImageRenderService.js no longer builds a prompt or
+  // loads seed Media at all. The VIDEO path's equivalent guarantee (below)
+  // is what stays live.
   check('P8-revert: gateLayoutInputQuotes calls applyStrictQuoteScope',
     /applyStrictQuoteScope\s*\(/.test(bseSrc));
   check('P8-revert: buildMetaForAd loads seed media and passes it as scope.media',
@@ -1293,44 +981,6 @@ withStrictFlag(true, () => {
       productNounsIn('short delivery time').length === 0);
     check('P8-revert-prove tee/shirt: unaliased tee would reject a t-shirt title',
       quoteAllowedForScope('love this tee', 'Classic T-Shirt') === true);
-  });
-}
-
-// Live static projection: take the REAL Media.findById select string from
-// renderDirectImage, project the pants seed through it, and prove the
-// bomber drops with NO product.name crutch.
-{
-  const fs = require('fs');
-  const path = require('path');
-  const directSrc = fs.readFileSync(
-    path.join(__dirname, '../services/directImageRenderService.js'), 'utf8'
-  );
-  const sel = (directSrc.match(/Media\.findById\(mediaId\)\.select\('([^']+)'\)/) || [])[1] || '';
-  check('P8 live static select string includes seed labels',
-    /\bsubjects\b/.test(sel) && /\brefinedProducts\b/.test(sel)
-    && /\bprimarySubjectLabel\b/.test(sel) && /\bprimarySubjectDesc\b/.test(sel),
-    `select=${JSON.stringify(sel)}`);
-  check('P8 QUOTE_SCOPE_MEDIA_SELECT lists the same label fields',
-    /\bsubjects\b/.test(QUOTE_SCOPE_MEDIA_SELECT)
-    && /\brefinedProducts\b/.test(QUOTE_SCOPE_MEDIA_SELECT)
-    && /\bprimarySubjectLabel\b/.test(QUOTE_SCOPE_MEDIA_SELECT)
-    && /\bprimarySubjectDesc\b/.test(QUOTE_SCOPE_MEDIA_SELECT));
-  const projected = {};
-  for (const f of sel.split(/\s+/).filter(Boolean)) {
-    const top = f.split('.')[0];
-    if (PANTS_SNEAKER_MEDIA[top] !== undefined) projected[top] = PANTS_SNEAKER_MEDIA[top];
-  }
-  check('P8 live static projection has subjects and no product name to lean on',
-    Array.isArray(projected.subjects) && projected.product == null);
-  withStrictFlag(true, () => {
-    const d = direct.buildIntentData({
-      concept: { copy_picks: { headline: 'Move freely' } },
-      layoutInput: { social_proof: { primary_quote: BOMBER_Q } },
-      brand: {}, cta: 'SHOP NOW',
-      media: projected
-    });
-    check('P8 live static projection DROPS bomber with no product.name',
-      d.quote === undefined, `got ${JSON.stringify(d.quote)}`);
   });
 }
 

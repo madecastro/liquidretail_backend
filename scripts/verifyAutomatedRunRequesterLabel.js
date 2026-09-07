@@ -8,11 +8,12 @@
 //    `runRenderLoop` (routes/ads.js), but left the ENRICHMENT that resolves a
 //    human `User.displayName` (and used to fire a SECOND, "upgrade" startRun
 //    call) below that same return — still reasoning in terms of the OLD
-//    two-call design. On the handoff path (ADGEN_RENDERER_ENABLED=true, 100%
-//    of production runs) that enrichment was dead code: the parent posted
-//    once, to a raw short id or nothing, and was NEVER refreshed.
+//    two-call design. On the handoff path (the ONLY path now — the flag and
+//    its in-process fallback are both deleted, see session.d/) that
+//    enrichment was dead code: the parent posted once, to a raw short id or
+//    nothing, and was NEVER refreshed.
 //    `scripts/verifyRunFeedStartsUnderHandoff.js` already pins "startRun
-//    fires before the handoff gate" — this file's job is the part THAT
+//    fires before the handoff" — this file's job is the part THAT
 //    harness does not cover: that the brand/requester RESOLUTION itself (the
 //    `Promise.all`) also precedes both the call and the gate, and that there
 //    is now exactly ONE `runFeed.startRun` call in the whole file (a second
@@ -171,10 +172,10 @@ ok('C5 real Google-login claims (id/userId/email/name/photo) are still present �
 // ── D. routes/ads.js: the ordering fix ─────────────────────────────────────
 console.log('\nD. runRenderLoop resolves automation/requester BEFORE startRun and the handoff gate\n');
 
-const handoffIdx  = adsStripped.indexOf('isAdgenRendererEnabled()');
+const handoffIdx  = adsStripped.indexOf('ADGEN handoff');
 const startRunIdxs = [...adsStripped.matchAll(/runFeed\.startRun\s*\(/g)].map((m) => m.index);
-ok('D1 handoff gate found', handoffIdx >= 0,
-   'could not find isAdgenRendererEnabled() — this harness is stale, fix the harness');
+ok('D1 handoff log line found', handoffIdx >= 0,
+   'could not find the "ADGEN handoff" log line — this harness is stale, fix the harness');
 ok('D2 exactly ONE runFeed.startRun call exists in the whole file',
    startRunIdxs.length === 1,
    `found ${startRunIdxs.length} — a second call reappearing means the "post fast, upgrade ` +
@@ -200,10 +201,10 @@ if (handoffIdx >= 0 && startRunIdxs.length === 1 && promiseAllIdx >= 0 && autoLa
      promiseAllIdx < firstStart,
      `promiseAll@${promiseAllIdx} startRun@${firstStart} — this is the exact gap PR #328 left open: ` +
      `hoisting the CALL without hoisting the RESOLUTION it depends on`);
-  ok('D7 runFeed.startRun fires BEFORE the adgen handoff gate',
+  ok('D7 runFeed.startRun fires BEFORE the adgen handoff',
      firstStart < handoffIdx,
-     `startRun@${firstStart} handoff@${handoffIdx} — startRun positioned after the handoff early-return ` +
-     `means it never runs when ADGEN_RENDERER_ENABLED is true (the original #328 defect)`);
+     `startRun@${firstStart} handoff@${handoffIdx} — startRun positioned after the handoff ` +
+     `means the original #328 defect (posted once, to a raw id, never refreshed) has crept back in`);
 
   // The single call's payload must actually carry the resolved label, or the
   // ordering fix is cosmetic — the field has to reach the Slack feed.

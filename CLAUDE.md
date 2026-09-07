@@ -28,21 +28,29 @@ nothing. Adgen architecture: `adgen/CLAUDE.md`.
 - Root `.claude/` hooks cover the grafted tree (git-repo-wide
   `auditStrandedWork.js`). `adgen/.claude/` is inert.
 
-**Render ownership (2026-08-24, file default aligned 2026-09-03):**
-`ADGEN_RENDERER_ENABLED=true` in `config/defaults.env` — **adgen owns
-rendering in production.** `runRenderLoop` (`routes/ads.js:1715-1723`)
-flips the CampaignRun to `running` and returns; `adgen/`'s
-renderer claims `Ad.status='rendering'` rows and runs Atlas + Remotion.
-This repo still owns HTTP generate, expansion, mint, and claim. The
-in-process loop below this gate is the **fallback** for when the flag
-is not the string `'true'`. See `services/adgenBridge.js` and
-`adgen/CLAUDE.md`. Write-up:
-`session.d/2026-09-03_overlay-skip-catalog-and-config-truth.md`. Older
-docs in `docs/PIPELINES.md` / `docs/ALERTING.md` / `docs/TITLING.md` that
-say the **web process** runs `runRenderLoop` describe that fallback (and
-the pre-cutover architecture). Titling resume being "web-only"
-(`index.js` warms Remotion; `worker.js` has zero remotion refs) is still
-true **inside this repo**; live titling of new work runs in adgen.
+**Render ownership (2026-08-24, file default aligned 2026-09-03; the switch
+and its in-process fallback DELETED 2026-09-07 — owner directive, "we are not
+going back to that infrastructure"):** **adgen owns rendering in production,
+unconditionally.** `runRenderLoop` (`routes/ads.js:1676`) flips the
+CampaignRun to `running` and returns; `adgen/`'s renderer claims
+`Ad.status='rendering'` rows and runs Atlas + Remotion. This repo still owns
+HTTP generate, expansion, mint, and claim. **There is no more flag and no
+more in-process fallback to gate** — `ADGEN_RENDERER_ENABLED`,
+`services/adgenBridge.js`, and the entire in-process render/titling/regenerate
+code path it used to gate (`routes/ads.js`'s render loop internals,
+`services/adRegenerateService.js`'s local-execution path,
+`services/renderService.js`'s mint-time pipeline,
+`services/directImageRenderService.js`'s `renderDirectImage`,
+`services/ugcVideoPipeline.js`) were all deleted, not merely disabled. See
+`adgen/CLAUDE.md` for adgen's own architecture. Write-up:
+`session.d/2026-09-03_overlay-skip-catalog-and-config-truth.md` (the cutover)
+and the dated `session.d/` entry for this removal. Older docs in
+`docs/PIPELINES.md` / `docs/ALERTING.md` / `docs/TITLING.md` that say the
+**web process** runs `runRenderLoop` describe the pre-cutover architecture,
+now fully retired — treat any doc still describing an in-process render
+fallback as stale. Titling resume being "web-only" (`index.js` warms
+Remotion; `worker.js` has zero remotion refs) is still true **inside this
+repo**; live titling of new work runs in adgen.
 
 **Video-title Director split (PR #386 `fba81588`, as of this branch):**
 backend **mints and stamps** `Ad.videoTitleDirection` inside
@@ -340,9 +348,14 @@ is unchanged at two.
    where a title lands.** The titling chain is: `brandScriptExecutor` passes the
    row's `platformFormat` **string** → `remotionRenderService` puts it on
    `inputProps` → `Canonical.jsx` calls `resolveSafeZoneKey({format,
-   platformFormat})` → `SAFE_ZONES[key]` — **live titling runs this chain
-   inside adgen's ported copy; this backend chain is the dormant
-   `ADGEN_RENDERER_ENABLED`-off fallback.** Those fractions were hand-measured
+   platformFormat})` → `SAFE_ZONES[key]` — **live titling for new mint-time
+   renders runs this chain inside adgen's ported copy. This backend's own
+   copy of the chain is NOT dead code** — it is not dormant, and there is no
+   more flag/fallback framing for it to be dormant under (the
+   `ADGEN_RENDERER_ENABLED`-off in-process render/titling fallback was
+   deleted entirely, 2026-09-07) — it is still actively called from
+   `routes/brand.js:505` `POST /:id/render-script`, `scripts/retitleDriver.js`,
+   and `routes/ads.js`'s ad-debug reconstruction path. Those fractions were hand-measured
    and are **not computed from `safeArea` at runtime**; they have visibly
    drifted from it (Reels `safeArea` is 204/1778 = 11.5%/11.5%, its Remotion
    zone is 14%/35%). **So editing `safeArea` to fix a titling defect changes
@@ -445,9 +458,10 @@ is unchanged at two.
    ad is stamped `status:'draft'` (reaper-safe money guard), then titling runs;
    if Remotion throws, status flips to **`failed`** with
    `master rendered; titling failed`, the run is charged a failure, and the
-   **raw master is kept** (`routes/ads.js:1258-1343`, backend's dormant
-   in-process fallback — adgen's own renderer enforces the same rule on the
-   live path). Leaving the ad
+   **raw master is kept** — enforced by adgen's own renderer, the only place
+   this rule runs now (backend's in-process copy of it, formerly
+   `routes/ads.js`'s `renderOneInner`, was deleted 2026-09-07 along with the
+   rest of the dormant fallback). Leaving the ad
    `rendering` mid-titling is a double-bill hole (reaper requeues → second Omni).
 5. **Preview** the result inside the matching **Meta surface overlay**
    (preview chrome only — known-open: placeholder "Lorem ipsum" copy).
@@ -700,9 +714,11 @@ key, and is **not** what makes the flip work. Pinned by
 Two different things, repeatedly confused, so state both:
 
 - **Titling / "chrome"** — burned into the video via the `brandScriptExecutor`
-  → `remotionRenderService` chain (**live titling runs adgen's ported copy of
-  this chain; backend's own copy is the dormant `ADGEN_RENDERER_ENABLED`-off
-  fallback**). Correct and intended.
+  → `remotionRenderService` chain (**live titling for new mint-time renders
+  runs adgen's ported copy of this chain; backend's own copy is not dead
+  code — it is called from the debug/preview routes and
+  `scripts/retitleDriver.js`, not from mint-time rendering, which has no
+  in-process fallback left at all as of 2026-09-07**). Correct and intended.
 - **The Meta surface overlay** — the simulated IG/FB furniture *including Meta's
   current CTA treatment for that surface* — is **PREVIEW ONLY and MUST NOT be
   burned in**. Owner: *"the meta overlays should include the current meta

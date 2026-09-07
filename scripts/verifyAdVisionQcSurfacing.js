@@ -42,8 +42,9 @@
  * 39/39 ads delivered, visionQc:null on all 39 — static AND video). Root
  * cause: SystemConfig vision QC was unset and no override existed
  * (a real, working gate), but every live caller of adVisionQc.isEnabled()
- * (directImageRenderService.renderDirectImage, brandScriptExecutor
- * .runVideoVisionQcForAd, imageRecoveryService.maybeQcRecoveredPlate) used
+ * (brandScriptExecutor.runVideoVisionQcForAd,
+ * imageRecoveryService.maybeQcRecoveredPlate; mint-time
+ * renderDirectImage is gone) used
  * to `return null`/`return firstOutput` on the gate being off — so
  * Ad.visionQc stayed at its schema default `null`, reading identically to
  * "inspected and passed" everywhere, AND the run-level shippedWithoutQc
@@ -51,7 +52,7 @@
  * ads as zero. Two bugs, one root cause; sections D and the rewritten C
  * pin the fix for both:
  *
- *   D. The three gate-off early returns now stamp the SAME disabled-verdict
+ *   D. The remaining gate-off early returns now stamp the SAME disabled-verdict
  *      shape runPostRenderQc's/runVideoPostRenderQc's own "Flag off" branch
  *      builds (buildPersistedVerdict with skipped:true, disabled:true,
  *      reason:'vision QC disabled (SystemConfig.…)') instead of a bare null, and warn
@@ -117,10 +118,9 @@
  *      `return null` → D2/D3 fails (drives the REAL exported function with
  *      adVisionQcService stubbed at the require layer, same convention as
  *      verifyGenerateProductTenancy.js).
- *   7. Remove the disabled-verdict stamp from directImageRenderService.js's
- *      early return → D4 fails (structural — that function's "attempt 1"
- *      generation makes it too expensive/billable to drive end-to-end here,
- *      same posture as this file's own C-section for GET /runs/:runId).
+ *   7. REMOVED 2026-09-07: D4 used to pin directImageRenderService.js's
+ *      mint-time gate-off stamp. renderDirectImage is gone; the recovery
+ *      path's gate-off is already pinned behaviourally by D3/D3b.
  *   8. Have alertQcFailure stop returning `detail` (back to void) → E1/E2
  *      fail (confirmed live, 2026-08-20: reverting adVisionQcService.js
  *      alone dropped E1 through E4 to failing while every other check,
@@ -592,7 +592,7 @@ check('C9 [2026-08-19] qcUnavailable counts skipped-but-not-disabled verdicts on
 });
 
 // ── D. Gate-off early returns stamp a disabled verdict, never a bare null ─
-// The actual production bug: three call sites short-circuit on
+// The actual production bug: the live call sites short-circuit on
 // adVisionQc.isEnabled() === false BEFORE ever reaching runPostRenderQc's /
 // runVideoPostRenderQc's own "Flag off" branch (which builds the nice
 // {skipped:true, disabled:true, reason:...} shape and is consequently DEAD
@@ -601,10 +601,10 @@ check('C9 [2026-08-19] qcUnavailable counts skipped-but-not-disabled verdicts on
 // same convention as verifyGenerateProductTenancy.js's adReadinessService
 // stub — so `isEnabled` is deterministically false regardless of ambient
 // env, and assert the actual returned object, not a source-text guess.
-// D4 is a structural pin: directImageRenderService.renderDirectImage's
-// "attempt 1" generation makes it too expensive (and billable) to drive
-// end-to-end here, same posture as this file's own C-section for GET
-// /runs/:runId.
+// D4 REMOVED 2026-09-07: it was a structural pin of
+// directImageRenderService.renderDirectImage's mint-time gate-off. That
+// function is gone; maybeQcRecoveredPlate's gate-off is already pinned
+// behaviourally by D3/D3b (drives the REAL exported function).
 
 function withStubbedAdVisionQc(modulePath, extra = {}) {
   const qcPath = require.resolve(path.join(__dirname, '..', 'services', 'adVisionQcService.js'));
@@ -621,8 +621,8 @@ function withStubbedAdVisionQc(modulePath, extra = {}) {
       // caller missing this would throw `TypeError: ... is not a function`
       // rather than exercising the gate-off branch under test.
       resolveEnabled: async () => false,
-      // SPLIT 2026-08-21 — directImageRenderService/imageRecoveryService now
-      // call resolveStaticEnabled(), brandScriptExecutor.runVideoVisionQcForAd
+      // SPLIT 2026-08-21 — imageRecoveryService now
+      // calls resolveStaticEnabled(), brandScriptExecutor.runVideoVisionQcForAd
       // now calls resolveVideoEnabled(), NEITHER calls the legacy
       // resolveEnabled() above anymore. This helper is shared by callers of
       // both pipelines (D2 = video, D3 = static), so both new resolvers must
@@ -709,31 +709,14 @@ await (async () => {
   }
 })();
 
-check('D4 directImageRenderService\'s gate-off early return stamps a disabled verdict, not a bare `return firstOutput`', () => {
-  const src = fs.readFileSync(path.join(__dirname, '..', 'services', 'directImageRenderService.js'), 'utf8');
-  // FIXED 2026-08-20 — the gate is now `await adVisionQc.resolveEnabled()`
-  // (assigned to qcEnabledNow), not the racy sync `isEnabled()` peek. Locate
-  // via the resolved-boolean guard, which is what actually gates the branch
-  // now; a literal `adVisionQc.isEnabled()` search would silently stop
-  // finding anything the day that sync path is fully retired.
-  // SPLIT 2026-08-21 — this is the STATIC pipeline, so the call is now
-  // `resolveStaticEnabled()`, not the legacy shared `resolveEnabled()`.
-  const idx = src.indexOf('if (!qcEnabledNow) {');
-  assert.ok(idx !== -1, 'could not locate the gate-off early return in directImageRenderService.js');
-  // The gate must be resolved via the async, non-racy, STATIC-specific path.
-  const gateSetup = src.slice(Math.max(0, idx - 400), idx);
-  assert.match(gateSetup, /await\s+adVisionQc\.resolveStaticEnabled\(\)/,
-    'the gate must be resolved via awaited resolveStaticEnabled(), not the synchronous isEnabled() TTL-cache peek nor the legacy undifferentiated resolveEnabled()');
-  const closeIdx = src.indexOf('\n  }\n', idx); // this branch's own closing brace, one indent level in
-  const branch = src.slice(idx, closeIdx !== -1 ? closeIdx : idx + 800);
-  assert.doesNotMatch(branch, /return firstOutput;\s*\}/,
-    'must not return firstOutput bare — Ad.visionQc would stay null, indistinguishable from "passed"');
-  assert.match(branch, /buildPersistedVerdict\(/, 'must stamp the same disabled-verdict shape runPostRenderQc\'s own "Flag off" branch builds');
-  assert.match(branch, /disabled:\s*true/, 'the stamped verdict must mark disabled:true (gate off, not an infra skip)');
-  assert.match(branch, /warnQcDisabledOnce\(/, 'must warn — a flag left off for weeks must be loud in logs, not silent');
-});
+// D4 REMOVED 2026-09-07: mint-time renderDirectImage's `if (!qcEnabledNow)`
+// gate-off (the structural pin of a disabled-verdict stamp vs a bare
+// `return firstOutput`) is gone with that function. The recovery path's
+// gate-off is already pinned by D3/D3b — retargeting D4 there would
+// duplicate them. finishPlate never called the gate (it is a compositor;
+// QC is the caller's job), so this is not a finishPlate regression.
 
-check('D6 [2026-08-20, resolver names updated 2026-08-21] the three real callers await their OWN pipeline-specific resolver, not the racy sync isEnabled() peek nor the legacy shared resolveEnabled()', () => {
+check('D6 [2026-08-20, resolver names updated 2026-08-21; finishPlate site dropped 2026-09-07] the two remaining real callers await their OWN pipeline-specific resolver, not the racy sync isEnabled() peek nor the legacy shared resolveEnabled()', () => {
   // Structural regression guard for the TTL-cache-race fix AND the
   // static/video gate split. A future edit that quietly reintroduces a bare
   // `adVisionQc.isEnabled()` call, OR that calls the WRONG pipeline's
@@ -741,11 +724,16 @@ check('D6 [2026-08-20, resolver names updated 2026-08-21] the three real callers
   // that reverts to the legacy undifferentiated resolveEnabled(), would
   // reopen either the original cache-race incident or silently merge the
   // two gates back into one. Each site now names its OWN expected resolver
-  // — this is deliberately three separate expectations, not one shared
-  // regex, because "all three callers use resolveEnabled()" stopped being
+  // — this is deliberately two separate expectations, not one shared
+  // regex, because "all callers use resolveEnabled()" stopped being
   // true the moment the gate split.
+  //
+  // directImageRenderService.finishPlate DROPPED 2026-09-07: finishPlate
+  // is a compositor (crop+logo) and does not, and should not, call
+  // resolveStaticEnabled — QC is the caller's job. That site was never
+  // a finishPlate regression; it was a pin of the deleted
+  // renderDirectImage mint-time caller.
   const sites = [
-    { file: 'directImageRenderService.js', label: 'directImageRenderService.finishPlate', resolver: 'resolveStaticEnabled' },
     { file: 'brandScriptExecutor.js', label: 'brandScriptExecutor.runVideoVisionQcForAd', resolver: 'resolveVideoEnabled' },
     { file: 'imageRecoveryService.js', label: 'imageRecoveryService.maybeQcRecoveredPlate', resolver: 'resolveStaticEnabled' }
   ];
@@ -767,7 +755,7 @@ check('D6 [2026-08-20, resolver names updated 2026-08-21] the three real callers
   // isEnabled() itself may still exist as a documented legacy sync fallback
   // (adVisionQcService.js exports it, and this harness's own I1/I2 checks
   // above still exercise it directly) — the assertion is narrower than "the
-  // string never appears": it is that none of these three FILES calls
+  // string never appears": it is that none of these two remaining FILES calls
   // `adVisionQc.isEnabled(` on the hot path.
   for (const { file, label } of sites) {
     const src = fs.readFileSync(path.join(__dirname, '..', 'services', file), 'utf8');

@@ -102,24 +102,22 @@ check('C5 an unknown status is coerced against COST_STATUSES before the write, '
 
 // ── E. [MONEY] THE LEDGER CAN SAY "UNKNOWN" ──────────────────────────────
 // atlasErrorPolicy's FALLBACK carries charged:null (UNKNOWN) for any shape it
-// cannot classify — a bare Cloudflare 502 mid-poll is exactly that. renderService
-// collapsed that null to `false`, so two ads on 2026-08-05 are on record as
-// costing nothing when Atlas may well have billed them. Understating the ledger
-// is the one direction it can never be corrected in.
+// cannot classify — a bare Cloudflare 502 mid-poll is exactly that. The
+// deleted renderCreative used to collapse that null to `false`; the remaining
+// backend writer (settleChargeState) must never do that. Understating the
+// ledger is the one direction it can never be corrected in.
 const adModelSrc  = fs.readFileSync(path.join(ROOT, 'models/Ad.js'), 'utf8');
-const renderSrc   = fs.readFileSync(path.join(ROOT, 'services/renderService.js'), 'utf8');
 const recoverySrc = fs.readFileSync(path.join(ROOT, 'services/imageRecoveryService.js'), 'utf8');
 
 check('E1 renderError.chargeState is declared — an UNDECLARED path is silently '
     + 'dropped by mongoose strict mode, which this repo has already lost a field to',
   /chargeState:\s*\{\s*type:\s*String,\s*enum:\s*\['charged', 'not-charged', 'unknown', null\]/.test(adModelSrc));
-check('E2 [MONEY] renderService no longer collapses an UNKNOWN charge to false — '
-    + 'it records the tri-state answer',
-  /chargeState:\s*err\.charged === true \? 'charged'/.test(renderSrc)
-  && /: 'unknown'/.test(renderSrc));
-check('E3 `charged` stays strictly "we KNOW it was billed" and was NOT widened — '
-    + 'every existing reader keeps its meaning',
-  /charged:\s*err\.charged === true,/.test(renderSrc));
+// E2/E3 REMOVED 2026-09-07: the tri-state `chargeState: err.charged === true
+// ? 'charged' : 'unknown'` / `charged: err.charged === true` write lived in
+// deleted renderCreative. renderService now only exports composeVideoOutput
+// and no longer records render failures. The tri-state write now lives in
+// adgen's renderer; the remaining backend writer of chargeState is
+// imageRecoveryService.settleChargeState (already pinned by E4–E6).
 check('E4 unknown is RESOLVED from the provider, not left to rot — settleChargeState '
     + 'reads the settled price back',
   /async function settleChargeState/.test(recoverySrc) && /priceConfirmed/.test(recoverySrc));

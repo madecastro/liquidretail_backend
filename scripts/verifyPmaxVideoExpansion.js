@@ -34,8 +34,15 @@
  *      formats)                                                 → C1
  *   5. Make resolveDeriveFromMaster ignore platformFormat and read only
  *      the (droppable) deriveFromMaster field                   → D2
- *   6. Add a veoGenerateForAd(...) call inside renderDeriveOnlyVideoAd → E1
- *   7. Move the derive gate below the master submit             → E2
+ *
+ * REMOVED (dormant render fallback deletion): recipe items 6/7 used to
+ * mutate `renderDeriveOnlyVideoAd` (add a veoGenerateForAd call → E1;
+ * move the derive gate below the master submit → E2). That function and
+ * the in-process render loop are gone. MONEY invariant "a derive-only ad
+ * must never reach a billable Omni submit" is still enforced by
+ * `resolveDeriveFromMaster` (campaignAdsGenerationService.js) at
+ * mint/preflight time — still pinned in this file's D-group and F1/F2
+ * regenerate preflight. Adgen's renderer owns actual derive rendering.
  */
 
 const fs   = require('fs');
@@ -314,112 +321,23 @@ if (typeof resolveDeriveFromMaster === 'function') {
     resolveDeriveFromMaster(null) === null && resolveDeriveFromMaster(undefined) === null);
 }
 
-// ── E. The derive render path contains ZERO billable submits (source) ──
-// Source-level by necessity: this asserts the ABSENCE of a call, which no
-// behavioural probe can establish without actually spending money.
+// ── E. REMOVED (dormant render fallback deletion) ────────────────────
+// E0/E0b/E1/E1a/E1b/E2/E3 used to extract `renderDeriveOnlyVideoAd` from
+// routes/ads.js and assert ZERO billable submits + the derive gate sitting
+// BEFORE the Omni submit in the in-process render loop. That function and
+// the loop are gone. MONEY invariant "a derive-only ad must never reach a
+// billable Omni submit" is still enforced by resolveDeriveFromMaster
+// (campaignAdsGenerationService.js) at mint/preflight time — still pinned
+// in this file's D-group and F1/F2 regenerate preflight. Adgen's renderer
+// owns actual derive rendering now. The render-loop gate is gone because
+// the loop is gone.
 const adsSrc = fs.readFileSync(path.join(ROOT, 'routes/ads.js'), 'utf8');
-
-// Extract a function's REAL body. Load-bearing subtlety: these functions
-// take a DESTRUCTURED parameter object, so the first '{' after the name is
-// the parameter pattern, not the body — brace-matching from there returns
-// the parameter list and every "absence" assertion below would pass
-// vacuously against a two-line string. Skip past the closing ')' of the
-// parameter list first, then take the next '{'.
-function functionBody(src, name) {
-  const start = src.indexOf(`async function ${name}(`);
-  if (start === -1) return null;
-  const parenOpen = src.indexOf('(', start);
-  if (parenOpen === -1) return null;
-  let pdepth = 0;
-  let parenClose = -1;
-  for (let i = parenOpen; i < src.length; i++) {
-    if (src[i] === '(') pdepth++;
-    else if (src[i] === ')') {
-      pdepth--;
-      if (pdepth === 0) { parenClose = i; break; }
-    }
-  }
-  if (parenClose === -1) return null;
-  const open = src.indexOf('{', parenClose);
-  if (open === -1) return null;
-  let depth = 0;
-  for (let i = open; i < src.length; i++) {
-    if (src[i] === '{') depth++;
-    else if (src[i] === '}') {
-      depth--;
-      if (depth === 0) return src.slice(open, i + 1);
-    }
-  }
-  return null;
-}
-
-const deriveBody = functionBody(adsSrc, 'renderDeriveOnlyVideoAd');
-check('E0 renderDeriveOnlyVideoAd exists and is parseable', !!deriveBody);
-// Guard against the extractor silently returning the parameter list (which
-// would make every absence check below pass vacuously — this exact false
-// pass occurred while writing this harness).
-check('E0b the extracted body is the real function body, not the param list',
-  !!deriveBody && deriveBody.length > 2000 && /findSiblingMasterAd\s*\(/.test(deriveBody),
-  `extracted ${deriveBody ? deriveBody.length : 0} chars`);
-// Strip comments before asserting the ABSENCE of a call — the function
-// deliberately NAMES the forbidden helpers in its money-ASSERT comment, so
-// a raw text scan reports a call that does not exist.
-function stripComments(src) {
-  return src
-    .replace(/\/\*[\s\S]*?\*\//g, '')
-    .replace(/(^|[^:])\/\/.*$/gm, '$1');
-}
-
-if (deriveBody) {
-  const deriveCode = stripComments(deriveBody);
-  check('E1 [MONEY] renderDeriveOnlyVideoAd makes ZERO billable video submits',
-    !/veoGenerateForAd\s*\(/.test(deriveCode)
-      && !/veoPrepareStoryboard\s*\(/.test(deriveCode)
-      && !/atlasVideoService/.test(deriveCode)
-      && !/generateForAd\s*\(/.test(deriveCode),
-    'any submit here is a hidden ~$1.20 per product on a free surface');
-
-  // Prove the stripper did not simply erase the body (which would make the
-  // absence check vacuous a second way).
-  check('E1a comment-stripping left real code to assert against',
-    deriveCode.length > 1500 && /findSiblingMasterAd\s*\(/.test(deriveCode),
-    `code length after stripping = ${deriveCode.length}`);
-
-  check('E1b the derive path still enforces the untitled-is-not-success discipline',
-    /status:\s*'draft'/.test(deriveBody) && /titling/i.test(deriveBody),
-    'a derived plate must be stamped draft before titling, like the master path');
-}
-
-// The gate must sit BEFORE the first billable submit in the veo branch.
-const gateIdx   = adsSrc.indexOf('const deriveFromFmt = resolveDeriveFromMaster(ad)');
-const submitIdx = adsSrc.search(/await\s+veoGenerateForAd\s*\(/);
-check('E2 [MONEY] the derive gate is evaluated BEFORE the first Omni submit',
-  gateIdx !== -1 && submitIdx !== -1 && gateIdx < submitIdx,
-  `gate=${gateIdx} submit=${submitIdx}`);
-
-check('E3 the derive gate returns instead of falling through to the master path',
-  (() => {
-    // Brace-walk the if-body; last statement must be `return;`. A `{0,400}`
-    // window was satisfied by a later return inside 400 chars if this one
-    // was deleted, and comment growth would CI-red a still-correct gate.
-    const code = stripComments(adsSrc);
-    const idx = code.search(/if\s*\(deriveFromFmt\)\s*\{/);
-    if (idx === -1) return false;
-    const open = code.indexOf('{', idx);
-    let depth = 0;
-    let close = -1;
-    for (let i = open; i < code.length; i++) {
-      if (code[i] === '{') depth++;
-      else if (code[i] === '}') {
-        depth--;
-        if (depth === 0) { close = i; break; }
-      }
-    }
-    if (close === -1) return false;
-    const body = code.slice(open + 1, close).trim();
-    return /return;\s*$/.test(body);
-  })(),
-  'without the early return a derive ad would ALSO run the billable master path');
+check('E-abs [ABSENCE] routes/ads.js no longer defines renderDeriveOnlyVideoAd',
+  !/async function renderDeriveOnlyVideoAd\s*\(/.test(adsSrc),
+  'the in-process derive renderer came back — restore the E-group money pins');
+check('E-abs2 [ABSENCE] routes/ads.js no longer defines findSiblingMasterAd',
+  !/async function findSiblingMasterAd\s*\(/.test(adsSrc),
+  'the in-process sibling lookup came back — that lookup moved to adgen');
 
 // ── F. Holes found by adversarial review — pinned so they cannot reopen ─
 // Every check here corresponds to a defect that was CONFIRMED against the
@@ -477,14 +395,15 @@ check('F4b the dry-run estimate applies the same strip',
   (svcSrc.match(/\[videoPlatformFormat\]\.filter\(\(f\) => f && f !== PMAX_VIDEO_DERIVE_ONLY\)/g) || []).length >= 2,
   'the preview must not advertise a master the live path refuses to queue');
 
-// F5: the derive ad requeued on EVERY first run (whole run dispatches in
-// one wave) and nothing drains 'queued' — it stranded, and both operator
-// work-arounds cost money. It now waits in-render for the master.
-if (deriveBody) {
-  check('F5 the derive path waits in-render for the master plate',
-    /DERIVE_MASTER_WAIT_MS/.test(deriveBody) && /findSiblingMasterAd/.test(deriveBody),
-    'an immediate requeue strands the free 1:1 on every first Google run');
-}
+// F5 used to pin DERIVE_MASTER_WAIT_MS / findSiblingMasterAd inside
+// renderDeriveOnlyVideoAd. Both the wait loop and the sibling lookup were
+// deleted with the in-process render loop; adgen owns derive rendering
+// (and waiting for the master) now.
+check('F5 [ABSENCE] routes/ads.js no longer waits in-process for a derive master',
+  !/async function renderDeriveOnlyVideoAd\s*\(/.test(adsSrc)
+    && !/async function findSiblingMasterAd\s*\(/.test(adsSrc),
+  'the in-process derive wait came back — that wait moved to adgen');
+
 
 // F6: a derive-only ad's renderUrl IS its master's plate until it uploads
 // its own titled file — deleting it destroyed the video the master paid for.
@@ -506,39 +425,23 @@ check('F6c the dependent lookup fails CLOSED (keeps the asset when it cannot pro
   /masterOfLiveDerive = true;/.test(adsSrc),
   'a failed lookup must keep a paid plate, not destroy it');
 
-// ── G. deriveWaitAttempts: the wait/requeue loop must not pollute
-//      renderAttempts (2026-08-18 fix) ──────────────────────────────────
+// ── G. deriveWaitAttempts FIELD (still live — the sweeper uses it) ──
 //
-// WHY. A FREE derive-only video ad that waits in-render for its master and
-// requeues on expiry (F5 above) used to $inc renderAttempts on that requeue.
-// services/queuedArchiveSweeper's `renderAttempts:0` guard exists to prove a
-// leftover queued ad NEVER STARTED before archiving it — so a wait-only ad
-// that had inflated renderAttempts became permanently invisible to that
-// sweeper, even though it never submitted or billed anything. The fix moves
-// the wait loop's own bookkeeping onto a dedicated `deriveWaitAttempts`
-// field; renderAttempts stays 0 for an ad that only ever waited.
+// WHY THE FIELD STILL MATTERS. A FREE derive-only video ad that used to
+// wait in-render for its master and requeue on expiry used to $inc
+// renderAttempts on that requeue. services/queuedArchiveSweeper's
+// `renderAttempts:0` guard exists to prove a leftover queued ad NEVER
+// STARTED before archiving it — so a wait-only ad that had inflated
+// renderAttempts became permanently invisible to that sweeper. The
+// dedicated `deriveWaitAttempts` field is still declared on Ad; historical
+// rows may carry it, and the sweeper must still ignore it (fix is
+// upstream, never a loosened guard).
 //
-// REVERT-PROOF RECIPE (each must fail this section):
-//   8. Change handleDeriveMasterBackup's requeue $inc back to renderAttempts → G2
-//   9. Re-introduce a wait-exhausted terminal branch (status:'failed') that
-//      also $incs deriveWaitAttempts, inside OR outside that function → G2b
-//   10. Repoint the `attempts` bound-check read back to renderAttempts → G4
-//   11. Drop the deriveWaitAttempts field declaration from models/Ad.js → G1
-//
-// 2026-08-20: the wait-exhausted terminal branch that used to live inside
-// renderDeriveOnlyVideoAd is GONE (owner: "hitting the timeout shouldn't
-// abandon"). Its ONE remaining $inc deriveWaitAttempts site now lives in the
-// extracted handleDeriveMasterBackup (see scripts/verifyDeriveWaitBackup.js
-// for the behavioural proof that it never abandons); renderDeriveOnlyVideoAd
-// itself no longer touches deriveWaitAttempts directly at all — it delegates.
-if (deriveBody) {
-  // Behavioural, not source-text: require the REAL Mongoose model and read
-  // its compiled schema paths. A commented-out declaration still matches a
-  // naive `deriveWaitAttempts:\s*\{...\}` regex against the raw source —
-  // caught while writing this check (it false-passed against `//
-  // deriveWaitAttempts: { type: Number, default: 0 },`). Asking the schema
-  // itself is the only way to prove the field is actually declared, not
-  // merely mentioned.
+// REMOVED (dormant render fallback deletion): G2–G4 extracted
+// renderDeriveOnlyVideoAd / handleDeriveMasterBackup bodies and counted
+// their $inc sites. Both functions are gone; adgen owns derive rendering.
+// Dropping the field declaration is still a silent-drop trap → G1.
+{
   const Ad = require(path.join(ROOT, 'models/Ad'));
   const waitPath = Ad.schema.path('deriveWaitAttempts');
   check('G1 models/Ad.js declares deriveWaitAttempts (Mongoose strict silently drops undeclared writes)',
@@ -546,52 +449,8 @@ if (deriveBody) {
     'an undeclared field is silently dropped on save — the counter would never actually persist');
   check('G1b deriveWaitAttempts defaults to 0 (matches renderAttempts convention)',
     !!waitPath && waitPath.defaultValue === 0);
-
-  const deriveCodeG = stripComments(deriveBody);
-  const waitIncs = (deriveCodeG.match(/\$inc:\s*\{\s*deriveWaitAttempts:\s*1\s*\}/g) || []).length;
-  const renderIncs = (deriveCodeG.match(/\$inc:\s*\{\s*renderAttempts:\s*1\s*\}/g) || []).length;
-
-  check('G2 renderDeriveOnlyVideoAd itself no longer increments deriveWaitAttempts (delegates to handleDeriveMasterBackup)',
-    waitIncs === 0,
-    `found ${waitIncs} — the backup branch should call out, not $inc deriveWaitAttempts inline`);
-
-  const backupBody = functionBody(adsSrc, 'handleDeriveMasterBackup');
-  check('G2b handleDeriveMasterBackup exists and is parseable', !!backupBody);
-  if (backupBody) {
-    const backupCode = stripComments(backupBody);
-    const backupWaitIncs = (backupCode.match(/\$inc:\s*\{\s*deriveWaitAttempts:\s*1\s*\}/g) || []).length;
-    check('G2c handleDeriveMasterBackup increments deriveWaitAttempts exactly once (never renderAttempts)',
-      backupWaitIncs === 1,
-      `found ${backupWaitIncs} — exactly one requeue-and-reclaim cycle, no separate exhausted-terminal $inc left`);
-    check('G2d [MONEY] handleDeriveMasterBackup never stamps the ad failed — it must not abandon',
-      !/status:\s*'failed'/.test(backupCode),
-      'a status:\'failed\' write here would reintroduce the exact abandonment this function exists to remove — see scripts/verifyDeriveWaitBackup.js for the full behavioural proof');
-    // The default-parameter value (`requeue = requeueStrandedAds`) lives in
-    // the PARAMETER LIST, which functionBody() deliberately excludes (E0b
-    // guards against the extractor returning the param list instead of the
-    // body) — so this reads the declaration line straight from adsSrc.
-    const backupDeclIdx = adsSrc.indexOf('async function handleDeriveMasterBackup(');
-    const backupDecl = backupDeclIdx === -1 ? '' : adsSrc.slice(backupDeclIdx, backupDeclIdx + 400);
-    check('G2e handleDeriveMasterBackup routes recovery through requeueStrandedAds, not a new claim',
-      /requeue\s*=\s*requeueStrandedAds/.test(backupDecl) && /await\s+requeue\s*\(/.test(backupCode),
-      'CLAUDE.md §2 — do not inline a second claim path');
-  }
-
-  check('G3b renderAttempts is untouched by the wait loop — only the honest-failure (no master) and success branches still use it',
-    renderIncs === 2,
-    `found ${renderIncs} $inc renderAttempts sites in renderDeriveOnlyVideoAd — expected exactly 2 ` +
-    '(master-absent/failed honest failure, and the settled-derive success stamp); a 3rd or 4th means the ' +
-    'wait loop is inflating renderAttempts again');
-
-  check('G4 [MONEY] the MAX_DERIVE_WAIT_ATTEMPTS bound reads deriveWaitAttempts, not renderAttempts',
-    /const\s+attempts\s*=\s*Number\(\s*ad\.deriveWaitAttempts\s*\)\s*\|\|\s*0/.test(deriveBody),
-    'reading renderAttempts here means a genuinely-rendered-and-failed ad and a merely-waiting ad share ' +
-    'one exhaustion budget, and the bound stops matching what MAX_DERIVE_WAIT_ATTEMPTS documents');
-
-  check('G4b the bound-check variable is never re-derived from renderAttempts elsewhere in the function',
-    !/Number\(\s*ad\.renderAttempts\s*\)/.test(deriveCodeG),
-    'a second, un-migrated read of renderAttempts would make G4 pass while the real bound still uses the old field');
 }
+
 
 // G5: the sweeper's own guard must stay untouched — the fix is upstream
 // (stop polluting the counter), never a loosened guard. The sweeper must

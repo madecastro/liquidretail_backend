@@ -532,150 +532,12 @@ function reapRetitleJob(jobId) {
   setTimeout(() => retitleJobs.delete(jobId), RETITLE_JOB_TTL_MS);
 }
 
-// Concurrency-capped pool runner. Writes progress into retitleJobs so
-// the poller sees {done,total} and accumulating results/errors. Per-ad
-// failures never abort the batch; only a thrown outer error → failed.
-async function runRetitleJob(jobId, brand, eligible, concurrency, seedErrors) {
-  const Ad = require('../models/Ad');
-  const { renderBrandScriptAndSave } = require('../services/brandScriptExecutor');
-  const results = [];
-  const errors = seedErrors ? seedErrors.slice() : [];
-  let cursor = 0;
-  let done = 0;
-  const total = eligible.length;
-
-  const prev0 = retitleJobs.get(jobId) || {};
-  retitleJobs.set(jobId, {
-    ...prev0,
-    status:   'running',
-    progress: { done: 0, total },
-    results,
-    errors: errors.length ? errors : undefined,
-  });
-
-  try {
-    async function worker() {
-      while (cursor < eligible.length) {
-        const i = cursor++;
-        const adDoc = eligible[i];
-        const id = String(adDoc._id);
-        console.log(`🎬 retitle-videos[brand=${brand._id}]: (${i + 1}/${eligible.length}) ad=${id} starting`);
-        try {
-          // Defense-in-depth against a stale OR live deferred request on
-          // this SAME ad (adversarial Grok review, 2026-08-28 — real
-          // finding, independently reproduced from both repos). Atomic:
-          // only proceeds when adgen does NOT currently hold a claim on
-          // this ad (retitleClaimedByWorker:null). Two shapes this
-          // guards against:
-          //   (a) a STALE retitleRequest sitting unclaimed (e.g. it was
-          //       stamped while the flag was on, then the flag flipped
-          //       off before adgen's consumer picked it up) — nulled
-          //       here so a LATER deferred stamp/claim on this ad cannot
-          //       collide with the local render this call is about to
-          //       run.
-          //   (b) an ACTIVE claim (retitleClaimedByWorker set — adgen is
-          //       right now mid-render on this ad, e.g. the flag flipped
-          //       off in the middle of an in-flight deferred retitle).
-          //       modifiedCount===0 in that case, and the local path
-          //       MUST NOT also render it — same principle as
-          //       adRegenerateService's notInFlight lock, applied here.
-          const localLockResult = await Ad.updateOne(
-            { _id: adDoc._id, retitleClaimedByWorker: null },
-            { $set: { retitleRequest: null, retitleClaimedByWorker: null, retitleClaimedAt: null, retitleResult: null } }
-          );
-          if (localLockResult.modifiedCount === 0) {
-            results.push({ id, ok: false, error: 'adgen currently holds an active claim on this ad — try again once it completes' });
-            done += 1;
-            const prevSkip = retitleJobs.get(jobId) || {};
-            retitleJobs.set(jobId, {
-              ...prevSkip,
-              status:   'running',
-              progress: { done, total },
-              results:  results.slice(),
-              errors:   errors.length ? errors : undefined,
-            });
-            continue;
-          }
-          // Re-load as a Mongoose doc so updateOne in the save path works
-          // cleanly, and renderBrandScriptAndSave can read fields.
-          const ad = await Ad.findById(adDoc._id);
-          if (!ad) {
-            results.push({ id, ok: false, error: 'ad disappeared' });
-          } else {
-            // retitleMode:true — this ad is commonly already status:'live'
-            // (delivered); without this the terminal write in
-            // brandScriptExecutor would silently force it back to 'draft'
-            // on every retitle. Pre-existing bug in this exact call,
-            // independent of the adgen handoff added alongside it — see
-            // brandScriptExecutor.uploadRenderAndStamp's preserveAdStatus
-            // header.
-            const result = await renderBrandScriptAndSave({ ad, brand, retitleMode: true });
-            if (result?.skipped) {
-              results.push({ id, ok: true, skipped: true, renderUrl: ad.renderUrl || null });
-              console.log(`🎬 retitle-videos[brand=${brand._id}]: ad=${id} skipped (${result.reason || 'no-chrome'})`);
-            } else {
-              results.push({ id, ok: true, renderUrl: result.renderUrl || null });
-              console.log(`🎬 retitle-videos[brand=${brand._id}]: ad=${id} ok`);
-            }
-          }
-        } catch (err) {
-          results.push({ id, ok: false, error: err.message || String(err) });
-          console.warn(`🎬 retitle-videos[brand=${brand._id}]: ad=${id} failed (${err.message})`);
-        }
-        done += 1;
-        const prev = retitleJobs.get(jobId) || {};
-        retitleJobs.set(jobId, {
-          ...prev,
-          status:   'running',
-          progress: { done, total },
-          results:  results.slice(),
-          errors:   errors.length ? errors : undefined,
-        });
-      }
-    }
-
-    const poolSize = Math.min(concurrency, Math.max(1, eligible.length));
-    // Empty eligible: still mark done (count=0) without spinning workers.
-    if (eligible.length > 0) {
-      await Promise.all(Array.from({ length: poolSize }, () => worker()));
-    }
-
-    const prev = retitleJobs.get(jobId) || {};
-    retitleJobs.set(jobId, {
-      ...prev,
-      status:      'done',
-      progress:    { done: total, total },
-      results,
-      errors:      errors.length ? errors : undefined,
-      completedAt: Date.now(),
-    });
-    reapRetitleJob(jobId);
-    console.log(`🎬 retitle-videos[${jobId}]: DONE brand=${brand._id} ${done}/${total}`);
-  } catch (err) {
-    console.error(`🎬 retitle-videos[${jobId}]: FAILED — ${err.message}`);
-    const prev = retitleJobs.get(jobId) || {};
-    retitleJobs.set(jobId, {
-      ...prev,
-      status:      'failed',
-      error:       err.message || 'retitle-videos failed',
-      progress:    { done, total },
-      results,
-      errors:      errors.length ? errors : undefined,
-      completedAt: Date.now(),
-    });
-    reapRetitleJob(jobId);
-  }
-}
-
-// Ad-gen handoff (2026-08-28) — the deferred sibling of runRetitleJob
-// above. When adgen owns rendering (isAdgenRendererEnabled()), this
-// repo's own in-process Remotion render competes with HTTP request
-// handling on the SAME process — the CPU-bound-Remotion finding this
-// codebase already established for the mint-time render loop (see
-// CLAUDE.md's Remotion memory-budget notes) applies identically here,
-// because retitle calls the exact same renderBrandScriptAndSave() the
-// render loop calls, just against an already-delivered ad instead of a
-// freshly-minted one.
+// Ad-gen handoff (2026-08-28, made unconditional as part of removing the
+// dormant in-process render/titling fallback — see session.d/). Backend no
+// longer renders titling in-process at all — this repo's own worker-pool
+// runner (formerly `runRetitleJob`, a per-ad concurrency-capped local
+// renderer) has been deleted along with the runtime flag that used to
+// choose between it and this function. This is now the only path.
 //
 // Mechanism mirrors services/adRegenerateService.regenerateAd's
 // stamp-then-return pattern (see services/handoffContract.js for the
@@ -690,14 +552,10 @@ async function runRetitleJob(jobId, brand, eligible, concurrency, seedErrors) {
 // have been unsafe), and runs it through ITS OWN copy of
 // brandScriptExecutor.renderBrandScriptAndSave.
 //
-// WHY A SEPARATE FUNCTION rather than branching inside runRetitleJob:
-// runRetitleJob above is the dormant fallback per this repo's convention
-// for every other migrated handoff (generate, regenerate) — it must stay
-// exactly as it was. Reusing its worker-pool/cursor machinery for a
-// claim-and-poll flow would risk changing local-path behavior too. This
-// function writes the SAME job-store shape
-// ({status,progress,results,errors,completedAt}) so the existing GET
-// /:id/retitle-videos/:jobId poll endpoint needs no change either way.
+// This function writes the SAME job-store shape
+// ({status,progress,results,errors,completedAt}) the deleted local runner
+// used, so the existing GET /:id/retitle-videos/:jobId poll endpoint needed
+// no change when this became the only path.
 //
 // CORRECTED 2026-08-28 (adversarial Grok review): this triggers NO NEW
 // Atlas VIDEO-GENERATION submit (brandScriptExecutor.js never requires
@@ -1053,21 +911,17 @@ router.post('/:id/retitle-videos', express.json(), async (req, res) => {
     });
     console.log(`🎬 retitle-videos[${jobId}]: brand=${brand._id} count=${eligible.length} concurrency=${concurrency}${truncated ? ` truncated from ${totalMatched}` : ''}`);
 
-    // Ad-gen handoff (2026-08-28) — read once, synchronously, before
-    // kicking off the job, same call-time convention every other
-    // adgen-handoff gate in this repo uses (adgenBridge.js). See
-    // runRetitleJobViaAdgen's header for the full argument.
-    const { isAdgenRendererEnabled } = require('../services/adgenBridge');
+    // Ad-gen handoff — unconditional. See runRetitleJobViaAdgen's header for
+    // the full argument. This USED to be a runtime flag check (the flag
+    // accessor and its module have both been deleted, same call-time
+    // convention every other adgen-handoff gate in this repo used) with an
+    // in-process fallback below it; adgen now owns retitling
+    // unconditionally, so this is the only path left.
     const requestedBy = req.user?.userId || req.user?.email || null;
 
     // Fire-and-forget. Runner flips the job to done/failed; per-ad errors
     // land in results, never crash the process.
-    if (isAdgenRendererEnabled()) {
-      console.log(`🎬 retitle-videos[${jobId}]: deferring to adgen (ADGEN_RENDERER_ENABLED=true)`);
-      runRetitleJobViaAdgen(jobId, brand, eligible, errors, requestedBy);
-    } else {
-      runRetitleJob(jobId, brand, eligible, concurrency, errors);
-    }
+    runRetitleJobViaAdgen(jobId, brand, eligible, errors, requestedBy);
 
     res.status(202).json({
       ok: true,

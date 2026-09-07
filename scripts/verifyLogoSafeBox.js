@@ -37,7 +37,9 @@
  *   4. Place the logo in the centre of the box (margins
  *      stay positive, but it is no longer the reserved
  *      corner)                                             → L5
- *   5. Stop handing safeBoxInDeliveredPx to vision QC      → Q1
+ *   5. Stop handing safeBoxInDeliveredPx to vision QC
+ *      (recovery maybeQcRecoveredPlate is the remaining live
+ *      backend caller; mint-time renderDirectImage is gone) → Q1
  *   6. finishPlate stops calling logoPlacementFor, OR
  *      keeps the call but pastes at the frame edge         → Q2
  *
@@ -307,17 +309,32 @@ for (const key of SURFACES) {
     path.join(__dirname, '..', 'services', 'directImageRenderService.js'),
     'utf8'
   );
-  // Pin the CALL, not a comment that mentions the function (indexOf('runPostRenderQc')
-  // hits "already awaits runPostRenderQc below" ~75 lines earlier).
-  const qcCallIdx = src.indexOf('await adVisionQc.runPostRenderQc');
+  // RETARGETED 2026-09-07: the mint-time renderDirectImage
+  // `await adVisionQc.runPostRenderQc` + `safeBoxInDeliveredPx(built.surface, dims)`
+  // call site is gone. maybeQcRecoveredPlate is the remaining live backend
+  // caller that hands safeBoxInDeliveredPx to vision QC (via judgeRender).
+  // Pin the CALL, not a comment that mentions the function.
+  const recSrc = fs.readFileSync(
+    path.join(__dirname, '..', 'services', 'imageRecoveryService.js'),
+    'utf8'
+  );
+  // Bound to maybeQcRecoveredPlate: recovery has comments between the
+  // assignment and the judge call, so a 400-char window (the old mint-time
+  // proximity pin) is the wrong shape here.
+  const fnIdx = recSrc.indexOf('async function maybeQcRecoveredPlate');
+  const fnEnd = recSrc.indexOf('\nfunction surfaceForAd', fnIdx);
+  const fnSlice = fnIdx >= 0
+    ? recSrc.slice(fnIdx, fnEnd > fnIdx ? fnEnd : fnIdx + 20000)
+    : '';
+  const qcCallIdx = fnSlice.indexOf('await adVisionQc.judgeRender');
   const qcAssignIdx = qcCallIdx >= 0
-    ? src.lastIndexOf('const safeBox = safeBoxInDeliveredPx', qcCallIdx)
+    ? fnSlice.lastIndexOf('safeBox = safeBoxInDeliveredPx', qcCallIdx)
     : -1;
-  const qcCallSlice = qcCallIdx >= 0 ? src.slice(qcCallIdx, qcCallIdx + 600) : '';
+  const qcCallSlice = qcCallIdx >= 0 ? fnSlice.slice(qcCallIdx, qcCallIdx + 600) : '';
   check('Q1 vision QC is handed safeBoxInDeliveredPx (the box this harness checks against)',
     qcAssignIdx >= 0
-      && qcCallIdx - qcAssignIdx < 400
-      && /safeBoxInDeliveredPx\(built\.surface,\s*dims\)/.test(src.slice(qcAssignIdx, qcCallIdx))
+      && qcCallIdx > qcAssignIdx
+      && /safeBoxInDeliveredPx\(\s*surface,\s*dims\s*\)/.test(fnSlice.slice(qcAssignIdx, qcCallIdx))
       && /^\s*safeBox,/m.test(qcCallSlice),
     'QC must inspect the same delivered-px box the compositor places into');
 

@@ -160,6 +160,21 @@ ok('B1 every ads-detail $project includes renderStage and renderStageAt', () => 
 // ── Group C — the stage vocabulary the SPA keys on, pinned HERE.
 // The mapping table is in the other repo. Renaming a stage string is a silent
 // UI regression unless something in THIS repo fails, so this is the contract.
+//
+// REMOVED 2026-09-07 (dormant render fallback deletion — see session.d/):
+// 'no titling (' (bare-master ship), 'preparing video context', 'deriving
+// layout', 'plate submit', 'static image generation', 'uploading static'.
+// All six were emitted ONLY from the in-process render loop / renderDirectImage
+// (routes/ads.js's renderOneInner and services/directImageRenderService.js's
+// renderDirectImage), both deleted along with the rest of the fallback —
+// adgen now submits and polls every render, and ported the identical stage
+// strings to its own adPhase.js/renderer.js/directImageRenderService.js
+// (confirmed: grep for each fragment under adgen/ finds it there). The SPA
+// contract these fragments protect is unbroken, just no longer testable from
+// THIS repo's source — adgen's own verify suite (e.g.
+// adgen/scripts/verifyAdgenRunFeedWired.js) is where a rename of any of them
+// would now be caught. Do not re-add any of the six here without re-adding
+// the backend code that actually produces it.
 const STAGE_CONTRACT = [
   // [literal fragment that must survive, why the UI needs it]
   //
@@ -175,23 +190,19 @@ const STAGE_CONTRACT = [
   // bootRecoveryService.js console.log, not in the scanned list and not an
   // adStage/renderStage write). Do not re-add either fragment without
   // re-adding the code that produced it.
-  ['titling ',                  'the active titling label'],
+  ['titling ',                  'the active titling label (brandScriptExecutor live titling)'],
   ['face-safe crop',            'distinguishes cropping from titling in the tail'],
   ['uploading titled video',    'the last video step before done'],
-  ['no titling (',              'deliberate bare-master ship — must not read as failure'],
-  ['master video generation',   'the paid, slow step'],
-  ['preparing video context',   'pre-master, otherwise a bare Queued'],
-  ['deriving layout',           'first static step'],
-  ['plate submit',              'the billable static submit'],
-  ['vision QC',                 'static quality gate'],
-  ['static image generation',   'the paid static step'],
-  ['uploading static',          'last static step before done']
+  ['master video generation',   'the paid, slow step (atlasVideoService stagePrefix)'],
+  ['vision QC',                 'quality gate (brandScriptExecutor live titling)']
 ];
 
 ok('C1 every stage string the UI maps still exists in the backend', () => {
-  const sources = ['routes/ads.js', 'services/atlasImageService.js', 'services/atlasVideoService.js',
-    'services/brandScriptExecutor.js', 'services/directImageRenderService.js',
-    'services/renderService.js']
+  // renderService.js / directImageRenderService.js no longer emit stages
+  // (finishPlate does not adStage; mint-time static is adgen). Scan the
+  // live writers only.
+  const sources = ['services/atlasImageService.js', 'services/atlasVideoService.js',
+    'services/brandScriptExecutor.js']
     .map(read).join('\n');
   const missing = STAGE_CONTRACT.filter(([frag]) => !sources.includes(frag));
   assert.strictEqual(missing.length, 0,
@@ -199,16 +210,26 @@ ok('C1 every stage string the UI maps still exists in the backend', () => {
     + missing.map(([f, why]) => `"${f}"  (${why})`).join('\n     '));
 });
 
-ok('C2 "done" remains the exact terminal sentinel', () => {
-  // The UI treats `renderStage === 'done'` as "not in progress". Any drift here
-  // makes every finished ad render as still working. Used to also assert
-  // services/titlingResumeService.js stamped the same literal on its own
-  // success path — that file is deleted (backend titling removal,
-  // 2026-08-28); routes/ads.js is now the only writer of this sentinel on
-  // the video path.
-  const src = stripComments(read('routes/ads.js'));
-  assert.ok(/adStage\(adId,\s*'done'\)/.test(src),
-    "routes/ads.js must still stamp the literal 'done'");
+ok('C2 "done" remains an accepted terminal sentinel (no backend writer; UI still keys on it)', () => {
+  // The UI treats `renderStage === 'done'` as "not in progress". Backend's
+  // in-process render loop no longer stamps it (ZERO adStage(adId, 'done')
+  // matches); adgen does. Pin that (1) this backend does not write it,
+  // (2) adStage still ACCEPTS any string (no enum that would reject 'done'
+  // when adgen's write lands on the shared Ad doc), and (3) projectAd still
+  // serialises renderStage verbatim so a 'done' payload reaches the SPA.
+  const adsJs = stripComments(read('routes/ads.js'));
+  assert.ok(!/adStage\([^,]+,\s*'done'\)/.test(adsJs),
+    'routes/ads.js must not regain an in-process adStage(..., \'done\') write — adgen stamps it');
+  const stageSrc = stripComments(read('services/adStage.js'));
+  assert.ok(/function adStage\s*\(\s*adId,\s*stage\s*\)/.test(stageSrc),
+    'adStage signature must still take a free-text stage');
+  assert.ok(!/enum|allowlist|ALLOWED_STAGES/.test(stageSrc),
+    'adStage must not grow an enum that would reject adgen\'s literal \'done\'');
+  const out = projectAd({
+    _id: 'c'.repeat(24), kind: 'video', status: 'draft', renderStage: 'done'
+  }, false);
+  assert.strictEqual(out.renderStage, 'done',
+    'projectAd must pass renderStage===\'done\' through verbatim — the SPA keys on it');
 });
 
 ok('C3 adStage still writes renderStageAt beside renderStage', () => {

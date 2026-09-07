@@ -28,6 +28,12 @@
  *
  * Revert-prove: back out the precedence logic, confirm this fails, restore,
  * confirm it passes.
+ *
+ * REMOVED (dormant render fallback deletion, 2026-09-07): M5 static
+ * (directImageRenderService) scanned renderDirectImage's `if (!qcEnabledNow)`
+ * gate-off. That function is gone; the remaining live static caller is
+ * imageRecoveryService.maybeQcRecoveredPlate, already in the same M5 list
+ * as the recovery site. Video (brandScriptExecutor) M5 stays.
  */
 
 const assert = require('assert');
@@ -1622,12 +1628,16 @@ installStub();
       }
     });
 
-    // Source pins on the three hot-path callers: each must, in its
+    // Source pins on the remaining live hot-path callers: each must, in its
     // if(!qcEnabledNow)-shaped branch, build a stamped verdict with
     // disabled:true and passed:false — never a bare `return firstOutput`/
     // `return null` (the exact shape docs/ALERTING.md's incident describes).
+    //
+    // M5 static (directImageRenderService) DROPPED 2026-09-07: the mint-time
+    // renderDirectImage `if (!qcEnabledNow)` gate-off is gone with that
+    // function. Recovery is the remaining live static caller and is already
+    // in this list; retargeting the deleted site here would duplicate it.
     const callerFiles = [
-      { path: 'services/directImageRenderService.js', label: 'static (directImageRenderService)' },
       { path: 'services/brandScriptExecutor.js',       label: 'video (brandScriptExecutor)' },
       { path: 'services/imageRecoveryService.js',       label: 'recovery (imageRecoveryService)' }
     ];

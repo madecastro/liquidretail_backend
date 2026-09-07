@@ -20,6 +20,13 @@
  *
  * Revert-proof notes live next to each group: if that production code is
  * backed out, the named check fails.
+ *
+ * REMOVED (dormant render fallback deletion, 2026-09-07): H1/H2/H3/H4
+ * originally scanned directImageRenderService.js for the four QC-helper
+ * call sites inside the deleted `renderDirectImage`. That mint-time
+ * static-QC caller is gone; the remaining live backend static-QC caller
+ * of the same four helpers is imageRecoveryService.maybeQcRecoveredPlate.
+ * H1b (the noteQcPassToRunFeed body in adVisionQcService.js) is unchanged.
  */
 
 const assert = require('assert');
@@ -1500,12 +1507,18 @@ check('B4 judgeRender payload carries visionImages:2 meta (ledger)', async () =>
   // ── H. Wiring: pass → run feed; fail → alertService (+ run feed) ───
   // Revert: pass path calling alertQcAccepted / alertService fails H1/H1b;
   // removing fail alert fails H3; removing run-feed pass note fails H1.
-  const directImageSrc = () => require('fs').readFileSync(
-    path.join(__dirname, '..', 'services', 'directImageRenderService.js'), 'utf8'
-  );
+  //
+  // RETARGETED 2026-09-07: the mint-time renderDirectImage call sites for
+  // these four helpers were deleted with the dormant in-process fallback.
+  // imageRecoveryService.maybeQcRecoveredPlate is the remaining live
+  // backend static-QC caller of the same four helpers. H1b (the
+  // noteQcPassToRunFeed body in adVisionQcService.js) is unchanged.
   const fs = require('fs');
-  check('H1 directImageRenderService pass path uses noteQcPassToRunFeed (not alert channel)', () => {
-    const src = directImageSrc();
+  const recoverySrc = () => fs.readFileSync(
+    path.join(__dirname, '..', 'services', 'imageRecoveryService.js'), 'utf8'
+  );
+  check('H1 imageRecoveryService pass path uses noteQcPassToRunFeed (not alert channel)', () => {
+    const src = recoverySrc();
     assert.match(src, /adVisionQc\.noteQcPassToRunFeed\(/, 'run-feed pass note call site missing');
     // Must NOT call alertQcAccepted on the live pass path (exported helper
     // may still appear in comments; the call form is what matters).
@@ -1525,13 +1538,13 @@ check('B4 judgeRender payload carries visionImages:2 meta (ledger)', async () =>
       'noteQcPassToRunFeed must not touch alertService');
   });
   check('H2 skipped path calls alertQcSkipped (uninspected is an error, not silence)', () => {
-    assert.match(directImageSrc(), /adVisionQc\.alertQcSkipped\(/, 'alertQcSkipped call site missing');
+    assert.match(recoverySrc(), /adVisionQc\.alertQcSkipped\(/, 'alertQcSkipped call site missing');
   });
-  check('H3 directImageRenderService still calls alertQcFailure on the reject path', () => {
-    assert.match(directImageSrc(), /adVisionQc\.alertQcFailure\(/, 'reject-alert call site missing');
+  check('H3 imageRecoveryService still calls alertQcFailure on the reject path', () => {
+    assert.match(recoverySrc(), /adVisionQc\.alertQcFailure\(/, 'reject-alert call site missing');
   });
   check('H4 fail path ALSO posts a run-feed event', () => {
-    assert.match(directImageSrc(), /adVisionQc\.noteQcFailToRunFeed\(/, 'run-feed fail note missing');
+    assert.match(recoverySrc(), /adVisionQc\.noteQcFailToRunFeed\(/, 'run-feed fail note missing');
   });
 
   // ── I. Judge throw does NOT consume regeneration budget ────────────

@@ -50,8 +50,9 @@
  *       per (role, family) rather than per role.
  *   C4  storedGenericForFamily only trusts a role's generic for that role's
  *       OWN family.
- *   C5  end-to-end: the static directive for Marine Layer 2 now says serif,
- *       and brands with no captured generic are byte-identical to before.
+ *   C5  (removed) end-to-end static directive — `typefaceDirectiveForBrand`
+ *       was deleted with `renderDirectImage`. C5b/C5c (classifier blast
+ *       radius + video library pick) stay.
  *   C6  the multi-sheet re-serialisation round-trip preserves the generic.
  *   C8  parser hardening for shapes that ship on real storefronts: Shopify
  *       Dawn's `var(--f), serif`, chained custom properties, `!important`
@@ -59,13 +60,22 @@
  *       family keys with internal whitespace.
  *   C9  Soludos GS (2026-08-24): icon-font ::before/::after rules are not
  *       role evidence, and CSS custom properties defined on one sheet are
- *       visible to `font-family: var(--token)` usage on another. End-to-end
- *       the static directive names Newsreader as a serif. Keyword-matched
- *       serif and genuine-sans brands stay byte-identical.
+ *       visible to `font-family: var(--token)` usage on another. The
+ *       ingest/aggregate half stays; the static-directive end-to-end
+ *       (`typefaceDirectiveForBrand`) was deleted with `renderDirectImage`.
  *   C7  REVERT-PROOF: mutations of the real shipped source, each compiled
  *       IN MEMORY and re-run, each asserted to break a specific check above.
  *       A check that cannot fail is not a test. Nothing is written to disk
  *       — see loadMutated's header and #259.
+ *
+ * REMOVED (dormant render fallback deletion): every check that drove
+ * `typefaceDirectiveForBrand` / `humanizeFontFamily` on
+ * `services/directImageRenderService.js` (C5 end-to-end static prompt
+ * directive, C8 "static directive therefore says serif", C9 static
+ * directive byte-identity). Those functions were deleted with
+ * `renderDirectImage`; adgen owns static rendering unconditionally now.
+ * Surviving coverage is `fontClassification.js`, `brandFontIngestService.js`,
+ * and the VIDEO path (`fontResolverService.fallbackFor` / pickLibraryFamily).
  *
  * Run: node scripts/verifyTypefaceClassification.js
  */
@@ -76,7 +86,6 @@ const os = require('os');
 
 const fc = require('../services/fontClassification');
 const ingest = require('../services/brandFontIngestService');
-const direct = require('../services/directImageRenderService');
 const fontResolver = require('../services/fontResolverService');
 
 const SERVICES = path.join(__dirname, '..', 'services');
@@ -195,9 +204,10 @@ const MIXED_CSS = mixedRoleCss();
 
 // ── C2: the module really is shared, not re-copied ───────────────────────
 {
-  check('C2 the static path exports the SAME regex object as fontClassification',
-    direct.FONT_SERIF_HINTS === fc.SERIF_HINTS,
-    'static FONT_SERIF_HINTS is a copy again, not the shared constant');
+  // The former "static path exports the SAME regex object" pin
+  // (`direct.FONT_SERIF_HINTS === fc.SERIF_HINTS`) was removed with
+  // `typefaceDirectiveForBrand` (dormant render fallback deletion,
+  // 2026-09-07). The VIDEO path still consumes the shared classifier.
 
   // The video path must keep its deliberately-naive name-only semantics:
   // verifyFontFallback.js pins fallbackFor('Self Modern') === 'sans-serif'.
@@ -303,51 +313,9 @@ const MIXED_CSS = mixedRoleCss();
     fc.storedGenericForFamily({ websiteFontUsage: { heading: 'X' } }, 'X') === null);
 }
 
-// ── C5: end-to-end through the real static prompt directive ─────────────
-const ML_BRAND = {
-  websiteFontUsage: {
-    heading: 'Seriously Nostalgic', headingGeneric: 'serif',
-    body: 'Outfit', bodyGeneric: 'sans-serif',
-  },
-  customFonts: [{ family: 'Seriously Nostalgic', weight: 400, source: 'website' }],
-};
-// Same brand as it exists in the DB TODAY — ingested before generics were
-// captured, so no *Generic fields. Pins that such brands are untouched.
-const ML_BRAND_PRE_BACKFILL = {
-  websiteFontUsage: { heading: 'Seriously Nostalgic', body: 'Outfit' },
-  customFonts: [{ family: 'Seriously Nostalgic', weight: 400, source: 'website' }],
-};
-{
-  const withGeneric = direct.typefaceDirectiveForBrand(ML_BRAND);
-  const without = direct.typefaceDirectiveForBrand(ML_BRAND_PRE_BACKFILL);
-
-  check('C5 [THE FIX, end to end] Marine Layer 2 is instructed SERIF',
-    /\ba serif\b/.test(withGeneric) && !/sans-serif/.test(withGeneric), withGeneric);
-  check('C5 it still names the brand\'s own family',
-    /Seriously Nostalgic/.test(withGeneric));
-  check('C5 it keeps the determinism rhetoric verifyStaticTypefaceDeterminism pins',
-    /FIXED, NOT A STYLE CHOICE/.test(withGeneric) && /SAME typeface family/.test(withGeneric));
-  check('C5 serif brands get the editorial character clause',
-    /refined editorial serif proportions/.test(withGeneric));
-
-  check('C5 [NO SILENT BLAST RADIUS] a brand with no captured generic is unchanged (still sans)',
-    /a sans-serif/.test(without) && !/\ba serif\b/.test(without), without);
-  check('C5 an ingested SANS brand is unaffected by the new tier',
-    /a sans-serif/.test(direct.typefaceDirectiveForBrand({
-      websiteFontUsage: { heading: 'aktiv-grotesk', headingGeneric: 'sans-serif' },
-      customFonts: [{ family: 'aktiv-grotesk', weight: 400 }],
-    })));
-  check('C5 a keyword-recognised serif brand still classifies serif with no generic at all',
-    /\ba serif\b/.test(direct.typefaceDirectiveForBrand({
-      customFonts: [{ family: 'Playfair Display', weight: 700 }],
-    })));
-  check('C5 still deterministic: same brand in -> byte-identical out',
-    direct.typefaceDirectiveForBrand(ML_BRAND) === direct.typefaceDirectiveForBrand(ML_BRAND));
-  check('C5 still brand-level by construction (arity 1, no surface/concept arg)',
-    direct.typefaceDirectiveForBrand.length === 1);
-  check('C5 no-font-data brands are untouched by all of this',
-    /sans-serif/.test(direct.typefaceDirectiveForBrand({})));
-}
+// C5 end-to-end through typefaceDirectiveForBrand was removed with
+// `renderDirectImage` (dormant render fallback deletion, 2026-09-07).
+// C5b (classifier blast-radius) and C5c (video library pick) below stay.
 
 // ── C5b: THE blast-radius invariant, stated as a property ───────────────
 // No brand that classifies today via a positive keyword match may change
@@ -526,11 +494,8 @@ const ML_BRAND_PRE_BACKFILL = {
   check('C8 [KEY MISMATCH] a double-spaced declaration is still looked up by the @font-face name',
     fc.storedGenericForFamily({ websiteFontUsage: doubleSpaced }, 'Seriously Nostalgic') === 'serif',
     'ingest captured the generic under a key the consumer could not find');
-  check('C8 ...and the static directive therefore says serif',
-    /\ba serif\b/.test(direct.typefaceDirectiveForBrand({
-      websiteFontUsage: doubleSpaced,
-      customFonts: [{ family: 'Seriously Nostalgic', weight: 400 }],
-    })));
+  // The former "static directive therefore says serif" pin was removed with
+  // `typefaceDirectiveForBrand` (dormant render fallback deletion, 2026-09-07).
 
   // ---- a family used in several roles: take the role that HAS a generic.
   check('C8 a later role\'s generic is used when the earlier role recorded none',
@@ -619,46 +584,6 @@ const SOLUDOS_THEME_CSS = [
 const SOLUDOS_SWIPER_CSS =
   '.swiper-button-next:after,.swiper-button-prev:after{font-family:swiper-icons;font-size:var(--swiper-navigation-size)}';
 
-// customFonts families, in stored order, measured on the production doc.
-const SOLUDOS_CUSTOM_FONTS = [
-  { family: 'Newsreader' }, { family: 'DM Sans' }, { family: 'Newsreader' },
-  { family: 'DM Sans' }, { family: 'DM Sans' }, { family: 'DM Sans' },
-  { family: 'DM Sans' }, { family: 'oke-widget-icons' },
-];
-// The REAL stored websiteFontUsage, measured. Used to pin the defect's
-// consume-time shape and to prove a keyword-list change is not how we fix it.
-const SOLUDOS_GS_STORED = {
-  fontFamily: 'Newsreader',
-  customFonts: SOLUDOS_CUSTOM_FONTS,
-  websiteFontUsage: {
-    heading: null, body: null, button: 'oke-widget-icons',
-    headingGeneric: null, bodyGeneric: null, buttonGeneric: null,
-    evidence: [
-      {
-        family: 'oke-widget-icons', role: 'button', generic: null, score: 3,
-        selector: '.okeReviews[data-oke-container] .oke-button.oke-is-loading:before,div.okeReviews .oke-button.oke-is-loading:before',
-      },
-      {
-        family: 'swiper-icons', role: 'button', generic: null, score: 3,
-        selector: '.swiper-button-next:after,.swiper-button-prev:after',
-      },
-    ],
-  },
-};
-
-// Byte-identical pins for brands that already classified correctly. Hardcoded
-// from the pre-change function so a silent rewrite of the directive is a
-// failure, not a tautology against the post-change function.
-const PLAYFAIR_BEFORE =
-  'HEADLINE TYPEFACE — FIXED, NOT A STYLE CHOICE. This brand\'s own typeface is Playfair Display, a serif. Set the headline, subheadline and eyebrow copy in a serif with refined editorial serif proportions, in the spirit of Playfair Display. Do not switch to the opposite family (serif vs sans) for stylistic reasons — every surface of this brand\'s campaign must render the SAME typeface family; only the composition should vary.';
-const AKTIV_BEFORE =
-  'HEADLINE TYPEFACE — FIXED, NOT A STYLE CHOICE. This brand\'s own typeface is Aktiv Grotesk, a sans-serif. Set the headline, subheadline and eyebrow copy in a sans-serif with clean grotesque/humanist proportions, in the spirit of Aktiv Grotesk. Do not switch to the opposite family (serif vs sans) for stylistic reasons — every surface of this brand\'s campaign must render the SAME typeface family; only the composition should vary.';
-const PLAYFAIR_BRAND = { customFonts: [{ family: 'Playfair Display', weight: 700 }] };
-const AKTIV_BRAND = {
-  websiteFontUsage: { heading: 'aktiv-grotesk', headingGeneric: 'sans-serif' },
-  customFonts: [{ family: 'aktiv-grotesk', weight: 400 }],
-};
-
 {
   // (a) icon fonts / pseudo-elements are not role evidence.
   check('C9 (a) isIconFontFamily matches the two production dingbats',
@@ -719,50 +644,15 @@ const AKTIV_BRAND = {
     ingest.extractFontUsageFromCss(SOLUDOS_INLINE_CSS + '\n' + SOLUDOS_THEME_CSS)
       .headingGeneric === 'serif');
 
-  // End-to-end through the real static directive. Fixture = the production
-  // customFonts order + the usage ingest NOW produces from the live CSS.
-  const soludosUsage = ingest.aggregateFontUsageAcrossSheets([
-    SOLUDOS_SWIPER_CSS, SOLUDOS_INLINE_CSS, SOLUDOS_THEME_CSS,
-  ]);
-  const soludosBrand = {
-    fontFamily: 'Newsreader',
-    customFonts: SOLUDOS_CUSTOM_FONTS,
-    websiteFontUsage: soludosUsage,
-  };
-  const soludosLine = direct.typefaceDirectiveForBrand(soludosBrand);
-  check('C9 [THE FIX, end to end] Soludos GS is instructed SERIF',
-    /\ba serif\b/.test(soludosLine) && !/sans-serif/.test(soludosLine), soludosLine);
-  check('C9 it names Newsreader', /Newsreader/.test(soludosLine), soludosLine);
-  check('C9 serif character clause, not grotesque',
-    /refined editorial serif proportions/.test(soludosLine)
-    && !/grotesque/.test(soludosLine), soludosLine);
-
-  // The stored production shape (heading null, no generic) still NAMES
-  // Newsreader via customFonts[0], and still classifies SANS — the generic
-  // is captured at ingest, and we deliberately did not put "Newsreader" on
-  // the keyword list. Re-ingest (or a backfill that fills a NULL heading)
-  // is what repairs already-stored docs.
-  check('C9 stored production shape still names Newsreader',
-    /Newsreader/.test(direct.typefaceDirectiveForBrand(SOLUDOS_GS_STORED)));
-  check('C9 stored production shape is still sans without a captured generic (not a keyword-list fix)',
-    /a sans-serif/.test(direct.typefaceDirectiveForBrand(SOLUDOS_GS_STORED)));
-
-  // NO-OP for brands that already classified correctly. Byte-identical to
-  // the pre-change strings, not merely "still serif" / "still sans".
-  check('C9 [NO-OP] keyword-matched serif directive is byte-identical to pre-change',
-    direct.typefaceDirectiveForBrand(PLAYFAIR_BRAND) === PLAYFAIR_BEFORE,
-    direct.typefaceDirectiveForBrand(PLAYFAIR_BRAND));
-  check('C9 [NO-OP] genuine sans directive is byte-identical to pre-change',
-    direct.typefaceDirectiveForBrand(AKTIV_BRAND) === AKTIV_BEFORE,
-    direct.typefaceDirectiveForBrand(AKTIV_BRAND));
-  check('C9 [NO-OP] icon-font button evidence does not change a correct heading',
-    direct.typefaceDirectiveForBrand({
-      websiteFontUsage: {
-        heading: 'Playfair Display', headingGeneric: 'serif',
-        button: 'oke-widget-icons',
-      },
-      customFonts: [{ family: 'Playfair Display', weight: 700 }],
-    }) === PLAYFAIR_BEFORE);
+  // End-to-end through typefaceDirectiveForBrand (Soludos GS instructed
+  // SERIF / Newsreader / byte-identical Playfair+Aktiv pins) was removed
+  // with `renderDirectImage` (dormant render fallback deletion, 2026-09-07).
+  // The ingest/aggregate half above is the remaining C9 coverage. The
+  // classifier still refuses a keyword-list "Newsreader" fix:
+  check('C9 stored production shape still classifies Newsreader as sans without a captured generic (not a keyword-list fix)',
+    fc.classifyTypeface({ family: 'Newsreader' }) === 'sans-serif');
+  check('C9 a captured serif generic on Newsreader DOES classify serif (the ingest fix)',
+    fc.classifyTypeface({ family: 'Newsreader', generic: 'serif' }) === 'serif');
 }
 
 // ─────────────────────────────────────────────────────────────────────────

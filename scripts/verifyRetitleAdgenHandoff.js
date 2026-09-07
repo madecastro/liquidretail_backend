@@ -2,11 +2,19 @@
 'use strict';
 //
 // verifyRetitleAdgenHandoff — pins the backend half of the ad-gen manual
-// RE-TITLE handoff (2026-08-28): routes/brand.js's POST /:id/retitle-videos,
-// when ADGEN_RENDERER_ENABLED is true, stamps Ad.retitleRequest per ad and
-// polls for completion instead of running renderBrandScriptAndSave
-// in-process. liquidretail_adgen's src/services/retitleConsumer.js is the
-// other half (see that repo's scripts/verifyRetitleConsumerClaim.js).
+// RE-TITLE handoff (2026-08-28): routes/brand.js's POST /:id/retitle-videos
+// stamps Ad.retitleRequest per ad and polls for completion instead of
+// running renderBrandScriptAndSave in-process. liquidretail_adgen's
+// src/services/retitleConsumer.js is the other half (see that repo's
+// scripts/verifyRetitleConsumerClaim.js).
+//
+// UPDATED (removal of the dormant in-process render/titling fallback — see
+// session.d/): the handoff is now UNCONDITIONAL. What used to be a runtime
+// flag check (ADGEN_RENDERER_ENABLED / isAdgenRendererEnabled,
+// services/adgenBridge.js) with an in-process local fallback (runRetitleJob)
+// below it has been deleted — both the flag and the local runner. Group A
+// now pins the absence of the flag/branch; Group C (which pinned the local
+// runner's continued existence) is gone along with that runner.
 //
 // Full field contract lives in services/handoffContract.js
 // (retitleRequest / retitleClaimedByWorker / retitleClaimedAt /
@@ -14,19 +22,18 @@
 // are declared on the live models/Ad.js schema with the right types; this
 // harness does not repeat that check.
 //
-// THIS FILE ALSO PINS A SEVERE PRE-EXISTING BUG FOUND DURING THE SAME
-// INVESTIGATION, independent of ADGEN_RENDERER_ENABLED: brandScriptExecutor
+// GROUP D PINS A SEVERE PRE-EXISTING BUG FOUND DURING THE ORIGINAL
+// INVESTIGATION, independent of the flag: brandScriptExecutor
 // .uploadRenderAndStamp forces status:'draft' on EVERY call — correct for
 // the first titling pass right after generation, and a LIVE PRODUCTION BUG
 // for a manual retitle of an already-delivered ad (commonly status:'live')
-// — every retitle-videos call today silently un-publishes the ad, success
-// or a QC fail, because this function was written for a lifecycle a manual
-// retitle is not in. Fixed here (preserveAdStatus / retitleMode) alongside
-// the adgen-handoff work, in BOTH repos (same bug, same fix, both copies of
-// brandScriptExecutor.js) — this repo's LOCAL retitle-videos path
-// (runRetitleJob, the dormant fallback when the flag is off) now also
-// passes retitleMode:true, so the fix applies whether or not the handoff
-// flag is ever flipped on.
+// — every retitle-videos call would otherwise silently un-publish the ad.
+// Fixed (preserveAdStatus / retitleMode), in BOTH repos (same bug, same fix,
+// both copies of brandScriptExecutor.js). This part of the fix is untouched
+// by the dormant-fallback removal — uploadRenderAndStamp is part of the
+// still-live Remotion titling chain (routes/brand.js's own
+// POST /:id/render-script, scripts/retitleDriver.js, and routes/ads.js's
+// ad-debug reconstruction path all call it).
 //
 // SOURCE EXTRACTION (balanced-brace parse + isolated condition eval), same
 // discipline as this repo's own scripts/verifyTitlingResumeAdgenGate.js and
@@ -39,8 +46,7 @@
 // Revert-prove:
 //   drop titlingNeeded:{$ne:true} from the stamp filter        → B1
 //   drop retitleRequest:null from the stamp filter             → B2
-//   drop the isAdgenRendererEnabled() branch in the route       → A1
-//   remove `retitleMode: true` from the local runRetitleJob call → C1
+//   reintroduce a flag/branch before runRetitleJobViaAdgen      → A1
 //   remove the `if (!preserveAdStatus)` guard on set.status      → D1/D2
 //   remove the `if (preserveAdStatus) delete qcFailureFields.status` → D3
 
@@ -102,20 +108,21 @@ const BSE_SRC  = fs.readFileSync(BSE_PATH, 'utf8');
 console.log('verifyRetitleAdgenHandoff\n');
 
 // ═════════════════════════════════════════════════════════════════════════
-// A — the route reads isAdgenRendererEnabled() once and branches to the
-// deferred vs local runner. Structural: the actual dispatch decision.
+// A — the route calls runRetitleJobViaAdgen UNCONDITIONALLY now. The flag
+// check and the local-runner branch are both gone.
 // ═════════════════════════════════════════════════════════════════════════
-check('A1 POST /:id/retitle-videos branches on isAdgenRendererEnabled() between runRetitleJobViaAdgen and runRetitleJob', () => {
+check('A1 POST /:id/retitle-videos calls runRetitleJobViaAdgen unconditionally (no flag, no branch)', () => {
   const routeArgs = routeRegistration(BRAND_ROUTE_SRC, "router.post('/:id/retitle-videos', express.json()");
-  assert.ok(/isAdgenRendererEnabled\s*\(\s*\)/.test(routeArgs), 'route handler does not read the handoff flag at all');
-  assert.ok(/runRetitleJobViaAdgen\s*\(/.test(routeArgs), 'route handler never calls the deferred runner');
-  assert.ok(/runRetitleJob\s*\(\s*jobId,\s*brand,\s*eligible,\s*concurrency,\s*errors\s*\)/.test(routeArgs), 'route handler no longer calls the ORIGINAL local runner — the dormant fallback must stay reachable');
+  assert.ok(/runRetitleJobViaAdgen\s*\(/.test(routeArgs), 'route handler must still call the deferred runner');
+  assert.ok(!/isAdgenRendererEnabled|ADGEN_RENDERER_ENABLED|adgenBridge/.test(routeArgs),
+    'the flag-based decision was deleted — a reference here means a stray branch or dead read survived');
 });
 
-check("A2 the flag is read from services/adgenBridge (the SAME helper runRenderLoop / titlingResumeService use), not re-implemented", () => {
-  const routeArgs = routeRegistration(BRAND_ROUTE_SRC, "router.post('/:id/retitle-videos', express.json()");
-  assert.ok(/require\(\s*['"]\.\.\/services\/adgenBridge['"]\s*\)/.test(routeArgs),
-    'a second reader of ADGEN_RENDERER_ENABLED will drift from the shared predicate (case-insensitive exact "true", fail-safe OFF)');
+check('A2 runRetitleJob (the local in-process fallback) no longer exists anywhere in routes/brand.js', () => {
+  assert.ok(!/function\s+runRetitleJob\s*\(/.test(BRAND_ROUTE_SRC),
+    'the dormant fallback must be deleted, not merely unreachable — its worker-pool signature should be gone entirely');
+  assert.ok(!/\brunRetitleJob\s*\(\s*jobId/.test(BRAND_ROUTE_SRC),
+    'no call site should still invoke the deleted local runner');
 });
 
 // ═════════════════════════════════════════════════════════════════════════
@@ -176,29 +183,11 @@ check('B6 the poll loop does NOT treat retitleRequest:null with no retitleResult
     'this shape is something ELSE clearing the field (the local path\'s own defensive re-stamp guard)');
 });
 
-check('B7 the LOCAL runRetitleJob refuses to render an ad adgen currently holds an active claim on', () => {
-  const fnBody = functionBody(BRAND_ROUTE_SRC, /async function runRetitleJob\s*\([^)]*\)\s*\{/);
-  assert.ok(/retitleClaimedByWorker:\s*null\s*\}/.test(fnBody) && /localLockResult\.modifiedCount\s*===\s*0/.test(fnBody),
-    'without this, a flag flip mid-flight (ADGEN_RENDERER_ENABLED true->false) can let the local in-process ' +
-    'path render an ad while adgen\'s retitleConsumer is still actively rendering the SAME ad — a genuine ' +
-    'concurrent-Remotion dual-render, adversarial review finding 2026-08-28');
-});
-
-// ═════════════════════════════════════════════════════════════════════════
-// C — the LOCAL (dormant fallback) runner must still exist unmodified in
-// shape, and must ALSO carry the status-preservation fix — this bug is
-// independent of ADGEN_RENDERER_ENABLED and is live in production today.
-// ═════════════════════════════════════════════════════════════════════════
-check('C1 the LOCAL runRetitleJob passes retitleMode:true to renderBrandScriptAndSave', () => {
-  const fnBody = functionBody(BRAND_ROUTE_SRC, /async function runRetitleJob\s*\([^)]*\)\s*\{/);
-  assert.ok(/renderBrandScriptAndSave\s*\(\s*\{[^}]*retitleMode:\s*true/.test(fnBody),
-    'without this, EVERY manual retitle via the in-process fallback (today\'s only live path, since this ' +
-    'endpoint has zero adgen awareness before this change) silently un-publishes a status:\'live\' ad');
-});
-
-check('C2 runRetitleJob (local) still exists with its original worker-pool signature — the dormant fallback was not deleted', () => {
-  assert.ok(/async function runRetitleJob\s*\(\s*jobId,\s*brand,\s*eligible,\s*concurrency,\s*seedErrors\s*\)/.test(BRAND_ROUTE_SRC));
-});
+// Group C REMOVED — it pinned the LOCAL (dormant fallback) runRetitleJob's
+// claim-awareness (retitleClaimedByWorker) and status-preservation
+// (retitleMode:true) behavior. That function is deleted, not merely
+// unreachable; there is nothing left to pin. See A2 above for the proof
+// it's actually gone.
 
 // ═════════════════════════════════════════════════════════════════════════
 // D — THE STATUS-PRESERVATION FIX in THIS repo's OWN brandScriptExecutor.js

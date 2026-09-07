@@ -26,6 +26,11 @@
 // Offline: no DB, no network, no key. Uses the exported promoteUgcFirst
 // helper directly for unit-level checks and constructs entry wrappers
 // by hand for buildSeededUniverse-shaped input.
+//
+// REMOVED (dormant render fallback deletion): R-group source pins of
+// adRegenerateService.performRegeneration / runImage UGC reseed. That
+// execution path is gone; adgen owns regenerate. Mint-time seeding
+// (K/P/C, V video rail, G /generate, S schema) stays.
 
 const mongoose = require('mongoose');
 const {
@@ -307,46 +312,23 @@ function e(id, { role = 'ugc_brand_match', feedIndex = null, imageRole = null, f
     /if\s*\(\s*!opts\.preferUgcMediaId\s*\|\|\s*!isUgcFirstSeedingEnabled\(\)\s*\)\s*return\s+sorted/m.test(src));
 })();
 
-// ── 6. Regen path (adRegenerateService.runImage) ───────────────────────
-// Contract check — regenerate reads CampaignRun.seedUgcIds and applies
-// the UGC as the sole reference, ONLY when:
-//   - the UGC-first kill switch is on
-//   - ad has no operator refs (a manual pick always wins)
-//   - ad.variantKind === 'product_image' (matches the catalog-reseed gate)
-// AND — critically — the catalog-reseed step is SKIPPED when UGC-first
-// already reseeded. That skip is what stops the catalog cascade from
-// overwriting the UGC ref, mirroring the seededUniverseService ordering
-// this harness proves above.
-(function testRegenContract() {
+// ── 6. Regen path — ABSENCE. performRegeneration / runImage's UGC reseed
+// lived on the deleted in-process static renderer. Mint-time UGC-first
+// (seededUniverse + /generate G-group, video rail V-group) is still live.
+// Adgen owns regenerate execution. Absence pins so a resurrected
+// backend render-time reseed is noticed.
+(function testRegenContractAbsent() {
   const fs = require('fs');
   const src = fs.readFileSync(require('path').join(__dirname, '..', 'services', 'adRegenerateService.js'), 'utf8');
 
-  // R1 — CampaignRun is required (used to load seedUgcIds).
-  checkTrue('R1 CampaignRun model required', /require\(['"]\.\.\/models\/CampaignRun['"]\)/m.test(src));
-
-  // R2 — isUgcFirstSeedingEnabled is imported from seededUniverseService.
-  checkTrue('R2 kill-switch reader imported from seededUniverseService',
-    /isUgcFirstSeedingEnabled\s*\}\s*=\s*require\(['"]\.\/seededUniverseService['"]\)/m.test(src));
-
-  // R3 — the UGC reseed gate: kill switch ON + no operator refs +
-  // variantKind product_image + campaignRunIds populated.
-  checkTrue('R3 UGC reseed gate assembles all four required conditions',
-    /!hasOperatorRefs[\s\S]{0,100}isUgcFirstSeedingEnabled\(\)[\s\S]{0,120}variantKind[\s\S]{0,80}product_image[\s\S]{0,120}campaignRunIds/m.test(src));
-
-  // R4 — catalog reseed is SKIPPED when ugcReseeded — this is what keeps
-  // the UGC ref intact instead of being clobbered by catalog-first.
-  checkTrue('R4 catalog reseed short-circuits when ugcReseeded is true',
-    /ugcReseeded\s*\?\s*\{\s*reseed:\s*false/m.test(src));
-
-  // R5 — the UGC latest-run wins (Ad might belong to multiple runs; the
-  // most recent one's seed context is the right context to replay).
-  checkTrue('R5 UGC seed is read from the LATEST run on the ad',
-    /ad\.campaignRunIds\[\s*ad\.campaignRunIds\.length\s*-\s*1\s*\]/m.test(src));
-
-  // R6 — brand-scope safety check on the seed before use — a hard-deleted
-  // or cross-tenant UGC id must not crash the render.
-  checkTrue('R6 UGC seed is verified to still exist under the ad\'s brandId before use',
-    /Media\.exists\(\s*\{\s*_id:\s*ugcId[\s\S]{0,60}brandId:\s*ad\.brandId/m.test(src));
+  checkTrue('R1 backend adRegenerateService no longer requires CampaignRun for render-time UGC reseed',
+    !/require\(['"]\.\.\/models\/CampaignRun['"]\)/m.test(src));
+  checkTrue('R2 backend adRegenerateService no longer imports isUgcFirstSeedingEnabled',
+    !/isUgcFirstSeedingEnabled/.test(src));
+  checkTrue('R3 backend adRegenerateService no longer has a UGC reseed gate',
+    !/ugcReseeded/.test(src) && !/preferUgcMediaId/.test(src));
+  checkTrue('R4 backend adRegenerateService no longer short-circuits catalog reseed on ugcReseeded',
+    !/ugcReseeded\s*\?\s*\{\s*reseed:\s*false/.test(src));
 })();
 
 // ── 7. CampaignRun schema — seedUgcIds field exists ────────────────────

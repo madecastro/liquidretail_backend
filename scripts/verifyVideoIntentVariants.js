@@ -307,17 +307,20 @@ ok('D6 a legacy paid Meta 1:1 (receipt present, no stage) stays billable', () =>
   );
 });
 
-ok('D7 renderDeriveOnlyVideoAd still contains ZERO billable submits', () => {
+ok('D7 [ABSENCE] renderDeriveOnlyVideoAd is gone (adgen owns derive rendering)', () => {
+  // D7 used to extract that function from routes/ads.js and assert ZERO
+  // billable submits inside it. The function was deleted with the
+  // in-process render loop. MONEY invariant "a derive-only ad must never
+  // reach a billable Omni submit" is still enforced by
+  // resolveDeriveFromMaster at mint/preflight (D1–D6 above) + adgen's
+  // renderer. The render-loop gate is gone because the loop is gone.
   const adsSrc = fs.readFileSync(path.join(ROOT, 'routes/ads.js'), 'utf8');
-  const start = adsSrc.indexOf('async function renderDeriveOnlyVideoAd(');
-  assert.ok(start > 0, 'renderDeriveOnlyVideoAd not found');
-  const end = adsSrc.indexOf('\nasync function ', start + 10);
-  const body = adsSrc.slice(start, end > start ? end : start + 16000);
-  const code = body.replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '');
-  assert.ok(!/veoGenerateForAd\s*\(/.test(code), 'derive path calls veoGenerateForAd');
-  assert.ok(!/veoPrepareStoryboard\s*\(/.test(code), 'derive path calls veoPrepareStoryboard');
-  assert.ok(!/atlasVideoService/.test(code), 'derive path mentions atlasVideoService');
+  assert.ok(
+    !/async function renderDeriveOnlyVideoAd\s*\(/.test(adsSrc),
+    'renderDeriveOnlyVideoAd came back — restore the submit-free body pin'
+  );
 });
+
 
 // ── N. Counts: PMax = 9, Meta = 4×3 with exactly one master ──────────
 console.log('N. per-product counts');

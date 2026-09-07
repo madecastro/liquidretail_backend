@@ -4,15 +4,23 @@
  * verifyCatalogPipelineExclusive — Stage 1 fence for the catalog product-ad
  * pipeline exclusivity work (CLAUDE.md §00).
  *
- * Asserts the three doors that kept Puppeteer reachable are closed on WRITE
+ * Asserts the two doors that kept Puppeteer reachable are closed on WRITE
  * (without deleting any renderer code yet):
  *
  *   1. Brand.staticImagePipeline cannot be set to 'html' — normalize rejects
  *      it, and every value a write can produce resolves to direct_image.
  *   2. SUPPORTED_TEMPLATES is only ai_* templates (cartesian cannot queue
- *      the 7 dead legacy templates that route to renderViaSpec).
- *   3. adRegenerateService.runImage no longer requires aiCanvasArtifactId
- *      and routes through directImageRenderService.
+ *      the 7 dead legacy templates that used to route to the now-deleted
+ *      renderViaSpec).
+ *
+ * A former "Door 3" here asserted that adRegenerateService.runImage routed
+ * through directImageRenderService.renderDirectImage (and that
+ * resolveImagePromptOverride worked). Removed: renderDirectImage,
+ * resolveImagePromptOverride, and runImage itself are all gone — deleted
+ * along with routes/ads.js's in-process render loop when the dormant
+ * ADGEN_RENDERER_ENABLED-off fallback was removed. adgen owns rendering
+ * unconditionally now; there is no in-process direct-image regenerate path
+ * left to fence.
  *
  * Also asserts that EXISTING Ads referencing a legacy template still resolve
  * labels (and canvas geometry where the registry has it) without throwing —
@@ -40,8 +48,6 @@ const {
 
 const gen = require(path.join(ROOT, 'services', 'campaignAdsGenerationService.js'));
 const registry = require(path.join(ROOT, 'services', 'templateRegistry.js'));
-const direct = require(path.join(ROOT, 'services', 'directImageRenderService.js'));
-const regen = require(path.join(ROOT, 'services', 'adRegenerateService.js'));
 
 let pass = 0;
 const failures = [];
@@ -160,60 +166,6 @@ for (const t of supportedList) {
   check(`queueable ${t} routes to direct-image branch (startsWith ai_)`,
     String(t).startsWith('ai_'));
 }
-
-// ── Door 3: image regenerate no longer requires aiCanvasArtifactId ──────
-console.log('\nDoor 3 — adRegenerateService.runImage on direct_image path');
-check('runImage is exported (harness can inspect)',
-  typeof regen.runImage === 'function');
-
-{
-  const regenSrc = fs.readFileSync(
-    path.join(ROOT, 'services', 'adRegenerateService.js'),
-    'utf8'
-  );
-  // Extract runImage body (brace-match from function declaration).
-  const start = regenSrc.indexOf('async function runImage');
-  check('runImage source located', start >= 0);
-  if (start >= 0) {
-    let i = regenSrc.indexOf('{', start);
-    let depth = 0;
-    let end = i;
-    for (; end < regenSrc.length; end++) {
-      const ch = regenSrc[end];
-      if (ch === '{') depth++;
-      else if (ch === '}') {
-        depth--;
-        if (depth === 0) { end++; break; }
-      }
-    }
-    const body = regenSrc.slice(start, end);
-    // The exact precondition that broke every current-pipeline ad.
-    check('runImage body does not require aiCanvasArtifactId',
-      !/if\s*\(\s*!ad\.aiCanvasArtifactId\s*\)/.test(body) &&
-      !/Ad has no aiCanvasArtifactId/.test(body));
-    check('runImage does not call htmlGen / generateForArtifact',
-      !/htmlGen\.|generateForArtifact|aiCanvasHtmlGeneratorService/.test(body));
-    check('runImage does not call screenshotHtml / puppeteer',
-      !/screenshotHtml|require\(['"]puppeteer['"]\)/.test(body));
-    check('runImage calls directImage.renderDirectImage (or directImageRenderService)',
-      /renderDirectImage\s*\(/.test(body));
-    // Money: no retry loop around the billable call.
-    check('runImage has no retry loop around the image submit',
-      !/for\s*\([^)]*retr/i.test(body) &&
-      !/while\s*\([^)]*retr/i.test(body) &&
-      !/\.retry\s*\(/.test(body));
-  }
-}
-
-// Prompt override hook exists on the direct path.
-check('resolveImagePromptOverride is exported',
-  typeof direct.resolveImagePromptOverride === 'function');
-check('resolveImagePromptOverride joins {system,user} into one channel',
-  direct.resolveImagePromptOverride({ system: 'SYS', user: 'USR' }) === 'SYS\n\nUSR');
-check('resolveImagePromptOverride accepts a bare string',
-  direct.resolveImagePromptOverride('  flat prompt  ') === 'flat prompt');
-check('resolveImagePromptOverride(null) → null',
-  direct.resolveImagePromptOverride(null) === null);
 
 // ── Existing Ad with legacy template: labels/geometry still resolve ─────
 console.log('\nRead-safety — existing Ads with legacy templates');
