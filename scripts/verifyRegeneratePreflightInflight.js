@@ -75,16 +75,18 @@ const BRAND_ID = 'bbbbbbbbbbbbbbbbbbbbbbbb';
 // longer requires either module (regenerateAd unconditionally defers to
 // adgen; there is no local-execution branch left to flag-gate). Requiring
 // their now-nonexistent paths would throw MODULE_NOT_FOUND, so both are
-// removed here rather than stubbed. Every remaining stub below (MEDIA, BRAND,
-// RUN, VEO, BSE, CLOUD, DI, SUS) still resolves to a real, un-deleted file —
-// some are no longer imported by the current adRegenerateService.js either,
-// but stubbing an unused module is inert, not broken, so they are left as-is.
+// removed here rather than stubbed. services/videoRouter.js was the same
+// class (deleted 2026-09-07; the VEO stub used to resolve it) — requiring
+// its now-nonexistent path would throw MODULE_NOT_FOUND, so it is removed
+// rather than stubbed. Every remaining stub below (MEDIA, BRAND, RUN, BSE,
+// CLOUD, DI, SUS) still resolves to a real, un-deleted file — some are no
+// longer imported by the current adRegenerateService.js either, but
+// stubbing an unused module is inert, not broken, so they are left as-is.
 const SVC   = require.resolve('../services/adRegenerateService');
 const AD    = require.resolve('../models/Ad');
 const MEDIA = require.resolve('../models/Media');
 const BRAND = require.resolve('../models/Brand');
 const RUN   = require.resolve('../models/CampaignRun');
-const VEO   = require.resolve('../services/videoRouter');
 const BSE   = require.resolve('../services/brandScriptExecutor');
 const CLOUD = require.resolve('../services/cloudinaryService');
 const DI    = require.resolve('../services/directImageRenderService');
@@ -98,7 +100,7 @@ function stub(id, exports) {
 }
 
 function install() {
-  for (const m of [SVC, AD, MEDIA, BRAND, RUN, VEO, BSE, CLOUD, DI, CAGS, SUS]) {
+  for (const m of [SVC, AD, MEDIA, BRAND, RUN, BSE, CLOUD, DI, CAGS, SUS]) {
     delete require.cache[m];
   }
   // preflight's only DB read is Ad.findOne({_id, brandId}).lean().
@@ -106,7 +108,6 @@ function install() {
   stub(MEDIA, {});
   stub(BRAND, {});
   stub(RUN, {});
-  stub(VEO, {});
   stub(BSE, {});
   stub(CLOUD, { uploadBufferToCloudinary: async () => {} });
   stub(DI, {});
@@ -331,11 +332,11 @@ const SYNCED    = /exported to Meta/i;
   const CAGS = require.resolve('../services/campaignAdsGenerationService');
   const savedCags = require.cache[CAGS];
   const deriveOnly = await (async () => {
-    for (const m of [SVC, AD, MEDIA, BRAND, RUN, VEO, BSE, CLOUD, DI, CAGS, SUS]) {
+    for (const m of [SVC, AD, MEDIA, BRAND, RUN, BSE, CLOUD, DI, CAGS, SUS]) {
       delete require.cache[m];
     }
     stub(AD, { findOne() { return { lean: async () => currentRow }; } });
-    stub(MEDIA, {}); stub(BRAND, {}); stub(RUN, {}); stub(VEO, {}); stub(BSE, {});
+    stub(MEDIA, {}); stub(BRAND, {}); stub(RUN, {}); stub(BSE, {});
     stub(CLOUD, { uploadBufferToCloudinary: async () => {} }); stub(DI, {});
     stub(CAGS, { resolveDeriveFromMaster: () => 'meta_stories_9_16' });
     stub(SUS, { isUgcFirstSeedingEnabled: () => false });
@@ -456,7 +457,7 @@ const SYNCED    = /exported to Meta/i;
   // regenerateAd and evaluate the filter it genuinely passes to Ad.updateOne.
   const lockCalls = [];
   function installLockProbe(dbRow) {
-    for (const m of [SVC, AD, MEDIA, BRAND, RUN, VEO, BSE, CLOUD, DI, CAGS, SUS]) {
+    for (const m of [SVC, AD, MEDIA, BRAND, RUN, BSE, CLOUD, DI, CAGS, SUS]) {
       delete require.cache[m];
     }
     stub(AD, {
@@ -469,7 +470,7 @@ const SYNCED    = /exported to Meta/i;
         return { modifiedCount: matched ? 1 : 0 };
       }
     });
-    stub(MEDIA, {}); stub(BRAND, {}); stub(RUN, {}); stub(VEO, {}); stub(BSE, {});
+    stub(MEDIA, {}); stub(BRAND, {}); stub(RUN, {}); stub(BSE, {});
     stub(CLOUD, { uploadBufferToCloudinary: async () => {} }); stub(DI, {});
     stub(CAGS, { resolveDeriveFromMaster: () => null });
     stub(SUS, { isUgcFirstSeedingEnabled: () => false });

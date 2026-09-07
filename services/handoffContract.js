@@ -143,7 +143,7 @@ const CONTRACT_FIELDS = [
       'The mint-time render lease. Adgen sets it in the atomic claim and clears it on every ' +
       'terminal write and on requeue. Backend NEVER writes this field — it only reads it as ' +
       'a filter exclusion (claimedByWorker:null) so its reaper cannot requeue adgen-owned ' +
-      'work. Null is therefore both "unclaimed" and "backend is doing this in-process".',
+      'work. Null means unclaimed: adgen may take the row. Backend no longer renders in-process.',
   },
   {
     field: 'claimedAt',
@@ -175,10 +175,10 @@ const CONTRACT_FIELDS = [
     enum: ['pending', 'claimed', null],
     role: 'recovery',
     note:
-      'Titling-resume lease. BOTH services run a titlingResumeService against this field. ' +
-      'Backend\'s copy is ungated on ADGEN_RENDERER_ENABLED at the setInterval level (the ' +
-      'flag is read inside resumeUntitledMasters at call time), so both sweeps can be live ' +
-      'simultaneously; the per-document atomic claim is what prevents double-titling.',
+      'Titling-resume lease. Live writer is adgen\'s titlingResumeService; backend\'s ' +
+      'in-process copy was deleted 2026-09-07 with the dormant render fallback. Backend still ' +
+      'declares the field (Mongoose-strict) and reads it as a regenerate preflight exclusion. ' +
+      'Writer remains BOTH on the contract because backend historically wrote it.',
   },
   {
     field: 'renderStage',
@@ -203,9 +203,9 @@ const CONTRACT_FIELDS = [
     writer: 'both',
     role: 'render output',
     note:
-      'The raw model video, before brand-script chrome. Writer is BOTH, not adgen-only: ' +
-      "backend's boot recovery writes it when it collects an already-paid prediction " +
-      '(bootRecoveryService.js:266), and backend writes it on the flag-off in-process render. ' +
+      'The raw model video, before brand-script chrome. Writer is BOTH on the contract: ' +
+      "adgen's renderer and boot recovery write it on the live path. Backend's in-process " +
+      'render write was deleted 2026-09-07; backend no longer collects video receipts. ' +
       'Load-bearing for the contract because ' +
       'a video DERIVE inherits it from its sibling master during render, and because its ' +
       'presence on a stale claim is what distinguishes a stranded PAID master from an ' +
@@ -217,9 +217,10 @@ const CONTRACT_FIELDS = [
     writer: 'both',
     role: 'regenerate',
     note:
-      'The regenerate lock, shared by BOTH the local-execution path (flag off) and the ' +
-      'deferred path (flag on). Because it is shared it is NOT the bit that decides who ' +
-      'executes — regenerationRequest is. Backend wins this lock on both paths.',
+      'The regenerate lock. Backend wins this lock on every regenerate (stamps ' +
+      'regenerating:true + regenerationRequest in one write and returns). Adgen\'s regenerate ' +
+      'consumer claims and executes. regenerationRequest, not this bit, is what decides who ' +
+      'executes. There is no local-execution path left on backend.',
   },
   {
     field: 'regenerationRequest',
@@ -227,14 +228,10 @@ const CONTRACT_FIELDS = [
     writer: 'backend',
     role: 'regenerate',
     note:
-      'THE deferral bit. Backend stamps the full pass-through call here ONLY when it decided ' +
-      'to defer (isAdgenRendererEnabled() true, read once synchronously at request time). The ' +
-      'local path DOES write this field — it sets an explicit null in the same lock write, to ' +
-      'clear any stale payload left by a crashed deferred attempt. So the invariant is NOT ' +
-      '"the local path never writes it" (that is false and was corrected here); it is that the ' +
-      'local path never writes an OBJECT. Adgen claims on {$type:"object"} and NOT {$ne:null} — ' +
-      'Mongo $ne:null also matches documents where the field is ABSENT, which is every ' +
-      'pre-migration row and every locally-executed regenerate, and that collapse was a real ' +
+      'THE deferral bit. Backend unconditionally stamps the full pass-through call here on ' +
+      'every regenerate (adgen owns execution; there is no local-execution path). Adgen claims ' +
+      'on {$type:"object"} and NOT {$ne:null} — Mongo $ne:null also matches documents where ' +
+      'the field is ABSENT, which is every pre-migration row, and that collapse was a real ' +
       'double-claim bug. Cleared by markComplete alongside regenerating.',
   },
   {
@@ -246,8 +243,8 @@ const CONTRACT_FIELDS = [
       'The regenerate lease. Held on a DIFFERENT field from the mint-time claim, which means ' +
       'the two are NOT mutually exclusive — see the contract doc section 6.5: a row can match ' +
       'the renderer claim and the regenerate claim at the same time, because backend regenerate ' +
-      'preflight does not refuse status:rendering. Backend also nulls this pair on its ' +
-      'local-execution path. There is ' +
+      'preflight does not refuse status:rendering. Backend no longer nulls this pair — there is ' +
+      'no local-execution path. There is ' +
       'deliberately NO release sweep: a crash mid-regenerate leaves this set until an ' +
       'operator clears it, because an automatic retry would be a second billable submit.',
   },
@@ -257,9 +254,9 @@ const CONTRACT_FIELDS = [
     writer: 'both',
     role: 'regenerate',
     note:
-      'Stamped in the same $set as regenerateClaimedByWorker. Writer is BOTH for the same ' +
-      'reason: only adgen ever sets a worker id, but backend nulls the pair on its ' +
-      'local-execution lock write (adRegenerateService.js:658-660).',
+      'Stamped in the same $set as regenerateClaimedByWorker. Writer is BOTH on the contract: ' +
+      'only adgen ever sets a worker id. Backend\'s former local-execution null of the pair ' +
+      'was deleted with the dormant fallback (2026-09-07).',
   },
   {
     field: 'updatedAt',
@@ -283,11 +280,9 @@ const CONTRACT_FIELDS = [
       'regenerate claim — deliberately NOT a reuse of titlingNeeded, because that claim ' +
       '(adgen titler.js claimOne, status:{$in:[rendering,draft]}) exists only for the ' +
       'immediately-post-generation handoff and can never match the common manual-retitle ' +
-      'target (status:live, delivered days or weeks earlier). Backend stamps the full ' +
-      'pass-through call here ONLY when it decided to defer (isAdgenRendererEnabled() true, ' +
-      'read once synchronously). The local path DOES write this field — an explicit null in ' +
-      'the same stamp write, to clear a stale payload left by a crashed deferred attempt. ' +
-      'Same $type:"object" discipline as regenerationRequest and the same reason: {$ne:null} ' +
+      'target (status:live, delivered days or weeks earlier). Backend unconditionally stamps ' +
+      'the full pass-through call here (adgen owns execution; there is no local-execution ' +
+      'path). Same $type:"object" discipline as regenerationRequest and the same reason: {$ne:null} ' +
       'also matches every ad where the field is simply ABSENT. Cleared by the retitle ' +
       'consumer alongside retitleResult, retitleClaimedByWorker, retitleClaimedAt. The stamp ' +
       'filter ALSO requires regenerating:{$ne:true} (added 2026-08-28 after adversarial review ' +
@@ -320,9 +315,8 @@ const CONTRACT_FIELDS = [
       'calls every titling render already makes. Not a new cost; the guard here is against ' +
       'DOUBLE EXECUTION of one request, which is why — unlike the regenerate claim — this one ' +
       'is safe to let a stale-claim reclaim sweep clear (adgen retitleConsumer.js ' +
-      'reclaimStaleRetitleClaims, modeled on titler.js reclaimStaleTitlerClaims). Backend also ' +
-      'nulls this on its local-execution stamp write, same defense-in-depth reason as ' +
-      'regenerateClaimedByWorker.',
+      'reclaimStaleRetitleClaims, modeled on titler.js reclaimStaleTitlerClaims). Backend no ' +
+      'longer nulls this on a local-execution stamp write — that path is gone.',
   },
   {
     field: 'retitleClaimedAt',
@@ -347,18 +341,21 @@ const CONTRACT_FIELDS = [
   },
 ];
 
-// The env flag that decides which service owns the collection. Named here
-// so both repos agree on the spelling and the comparison, and so the
-// harness can assert the comparison has not been loosened.
+// Historical env flag name, kept so both repos agree on the spelling and
+// the comparison, and so the harness can assert the comparison has not
+// been loosened. Production rendering/titling is unconditionally adgen
+// as of 2026-09-07 (backend's in-process fallback was deleted). Adgen
+// still reads this flag at claim time as a stand-down switch; backend
+// no longer has a render path to fall back to.
 const OWNERSHIP_FLAG = 'ADGEN_RENDERER_ENABLED';
 
 // Both repos implement this identically. Duplicated as a pure function so
 // the harness can assert the semantics rather than trusting a grep:
 // case-insensitive, exact 'true', and EVERYTHING else (unset, malformed,
-// 'yes', '1') reads as OFF. Off is the safe direction because backend
-// renders unconditionally whenever the flag is not 'true' — so adgen
-// standing down leaves work where backend already handles it, while adgen
-// claiming on a misread would race backend for the same row.
+// 'yes', '1') reads as OFF. The predicate is unchanged. Off now means
+// adgen stands down with no backend in-process replacement — a stall,
+// not a fallback. Do not loosen the comparison: a widened truthiness
+// test would still be a claim-safety bug on the adgen side.
 function isOwnershipFlagOn(rawValue) {
   return String(rawValue || '').toLowerCase() === 'true';
 }

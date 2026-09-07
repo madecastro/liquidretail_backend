@@ -31,9 +31,10 @@
  *   D. models/CostLog.js — campaignRunId is a String path (matches
  *      Ad.campaignRunIds / CampaignRun.runId), not an ObjectId ref.
  *   E. campaignRunId actually reaches the video charge-point write
- *      (atlasVideoService + videoRouter). E3 (ads.js veoGenerateForAd) and
- *      E5 (directImageRenderService charge-point meta) lived on the deleted
- *      in-process renderer and are gone.
+ *      (atlasVideoService). E3 (ads.js veoGenerateForAd), former E4
+ *      (videoRouter.generateForAd — that file was deleted 2026-09-07 with
+ *      the dormant fallback) and E5 (directImageRenderService charge-point
+ *      meta) lived on the deleted in-process renderer and are gone.
  *   F. REMOVED 2026-09-07 — routes/ads.js renderOneInner video catch is
  *      gone. Timeout-outcome handling is atlasVideoService.pollPrediction
  *      (resolveTimeoutOutcome, groups A/B).
@@ -247,7 +248,6 @@ console.log('\nE. campaignRunId threading to the charge-point CostLog writes');
   const vidSrc = fs.readFileSync(VID_PATH, 'utf8');
   const directSrc = fs.readFileSync(DIRECT_PATH, 'utf8');
   const adsSrc = fs.readFileSync(ADS_PATH, 'utf8');
-  const routerSrc = fs.readFileSync(path.join(ROOT, 'services/videoRouter.js'), 'utf8');
 
   check('E1 generateForAd accepts campaignRunId as a parameter', () => {
     const i = vidSrc.indexOf('async function generateForAd({');
@@ -268,13 +268,6 @@ console.log('\nE. campaignRunId threading to the charge-point CostLog writes');
       !/veoGenerateForAd\s*\(/.test(adsSrc),
       'a resurrected in-process veoGenerateForAd call site would re-open mint-time video submit on this backend'
     );
-  });
-
-  check('E4 videoRouter.generateForAd forwards campaignRunId to atlasVideoService', () => {
-    const i = routerSrc.indexOf('async function generateForAd({');
-    assert.ok(i >= 0);
-    const block = routerSrc.slice(i, i + 400);
-    assert.ok(/campaignRunId/.test(block), 'videoRouter.generateForAd does not accept/forward campaignRunId');
   });
 
   check('E5 backend directImageRenderService no longer has a mint-time charge-point (renderDirectImage gone)', () => {
