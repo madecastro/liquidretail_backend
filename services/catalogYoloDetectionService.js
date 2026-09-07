@@ -41,9 +41,18 @@ const progressService = require('./progressService');
 const { detectYoloForMediaBatch } = require('./mediaYoloRefine');
 const { classifyYoloError } = require('./yoloService');
 const yoloLoadLimiter = require('./yoloLoadLimiter');
+const yoloConcurrencyWindow = require('./yoloConcurrencyWindow');
 
-const { concurrency: CONC } = require('./concurrency');
-const CONCURRENCY = CONC.CATALOG_YOLO_CONCURRENCY;
+// NOT a one-time constant — see services/yoloConcurrencyWindow.js's header
+// for why. This "courtesy cap" (the dispatch while-loop's own
+// `inflight < CONCURRENCY`) and yoloLoadLimiter's process-wide semaphore
+// used to read CATALOG_YOLO_CONCURRENCY independently, ONCE, at
+// require-time — so they only agreed by coincidence. Both now call
+// yoloConcurrencyWindow.currentYoloConcurrency() AT THE POINT OF USE
+// (never cached in a module-level const) so a nightly boost — or any
+// future retune — cannot desync the two. currentConcurrencyLabel() below
+// is for logging only.
+function currentConcurrencyLabel() { return yoloConcurrencyWindow.currentYoloConcurrency(); }
 // Per-run ceiling. Unset / 0 / negative / NaN → uncapped. A positive
 // integer re-caps one brand run. Default is uncapped so an operator who
 // does nothing gets no ceiling (owner 2026-09-05). Shared with
@@ -64,9 +73,14 @@ let _workerOverride = null;
 
 (function logConfig() {
   const maxLabel = Number.isFinite(MAX_PER_RUN) ? MAX_PER_RUN : 'uncapped';
+  // Snapshot at require-time only — logging, not a cached limit. The real
+  // dispatch loop below re-checks currentConcurrencyLabel() live on every
+  // iteration, so this line can read differently than a run that actually
+  // straddles a nightly boost window.
   console.log(
     `🎯 catalogYoloDetectionService config — ` +
-    `concurrency=${CONCURRENCY} maxPerRun=${maxLabel} altLimit=${ALT_LIMIT}`
+    `concurrency=${currentConcurrencyLabel()} (boosts to ${yoloConcurrencyWindow.nightConcurrency()} in nightly windows) ` +
+    `maxPerRun=${maxLabel} altLimit=${ALT_LIMIT}`
   );
 })();
 
@@ -195,9 +209,11 @@ async function detectYoloForOne(product) {
   };
 }
 
-// Concurrency-capped queue. Per-chain `inflight < CONCURRENCY` is a
-// courtesy cap; yoloLoadLimiter.acquire() is the process-wide bound so
-// two chains at 6 each cannot exceed occupancy 6.
+// Concurrency-capped queue. Per-chain `inflight < currentYoloConcurrency()`
+// is a courtesy cap; yoloLoadLimiter.acquire() is the process-wide bound.
+// Both resolve through the SAME yoloConcurrencyWindow.currentYoloConcurrency()
+// call (not independent reads) so they cannot disagree — see that module's
+// header for why this matters (the nightly-boost "two knobs" trap).
 async function processQueue(products, { onDone = null, isCancelled = null, worker = null, brandId = null } = {}) {
   const runOne = worker || _workerOverride || detectYoloForOne;
   let next = 0, inflight = 0, processed = 0, stopped = false;
@@ -226,7 +242,7 @@ async function processQueue(products, { onDone = null, isCancelled = null, worke
     // breaker-open) the same way the old top-of-function re-entry guard
     // did for repeated calls from completion callbacks.
     const pump = () => {
-      while (!stopped && inflight < CONCURRENCY && next < products.length) {
+      while (!stopped && inflight < yoloConcurrencyWindow.currentYoloConcurrency() && next < products.length) {
         if (yoloLoadLimiter.isOpen()) {
           stopped = true;
           abortReason = 'yolo-circuit-open';
@@ -416,7 +432,7 @@ async function runYoloDetection(brandId, { onlyGaps, label }) {
     `${rows.length} products, ${targets.length} target(s) ` +
     `(onlyGaps=${!!onlyGaps} cap=${Number.isFinite(MAX_PER_RUN) ? MAX_PER_RUN : 'uncapped'} ` +
     `occupancy=${occ}/${lim} breaker=${breaker} consecutiveTransient=${yoloLoadLimiter.consecutiveTransientNow()}, ` +
-    `concurrency=${CONCURRENCY}, altLimit=${ALT_LIMIT})`
+    `concurrency=${currentConcurrencyLabel()}, altLimit=${ALT_LIMIT})`
   );
   if (!targets.length) {
     return { ok: true, total: rows.length, detected: 0, skipped: rows.length, durationMs: Date.now() - t0 };
@@ -523,7 +539,7 @@ async function runYoloDetectionOnTargets(targets, {
     console.log(
       `🛑 catalogYoloDetection[brand=${brandId}]: circuit open after ` +
       `${yoloLoadLimiter.consecutiveTransientNow()} consecutive transient batches ` +
-      `(threshold ${yoloLoadLimiter.threshold()} is a floor; first wave may run up to concurrency=${CONCURRENCY}) ` +
+      `(threshold ${yoloLoadLimiter.threshold()} is a floor; first wave may run up to concurrency=${currentConcurrencyLabel()}) ` +
       `— aborting remaining ${remaining} target(s)`
     );
     try {

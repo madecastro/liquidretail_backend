@@ -9,15 +9,29 @@
 // Circuit is in-memory: empty on boot → try YOLO again immediately
 // (owner 2026-09-06). Per-brand backoff lives on Brand and survives deploys.
 
-const { concurrency: CONC } = require('./concurrency');
 const alerts = require('./alertService');
+const yoloConcurrencyWindow = require('./yoloConcurrencyWindow');
 
 function parsePositiveInt(raw, fallback) {
   const n = parseInt(raw, 10);
   return Number.isFinite(n) && n > 0 ? n : fallback;
 }
 
-let LIMIT = parsePositiveInt(process.env.CATALOG_YOLO_CONCURRENCY, CONC.CATALOG_YOLO_CONCURRENCY || 6);
+// LIMIT is no longer a one-time value computed at require-time — the
+// nightly boost (services/yoloConcurrencyWindow.js) must reflect the
+// CURRENT wall-clock instant on every check, not whatever was true when
+// this module first loaded. `LIMIT_OVERRIDE` is a TEST-ONLY pin (set via
+// __test.reset({limit})), which every existing verify* harness relies on
+// for deterministic, time-of-day-independent assertions; production code
+// never sets it, so production always resolves through the live window
+// resolver. `effectiveLimit()` — not a raw variable — is what acquire(),
+// wakeNext() and getLimit() must all read.
+let LIMIT_OVERRIDE = null;
+
+function effectiveLimit(instant) {
+  return LIMIT_OVERRIDE != null ? LIMIT_OVERRIDE : yoloConcurrencyWindow.currentYoloConcurrency(instant);
+}
+
 let THRESHOLD = parsePositiveInt(process.env.CATALOG_YOLO_BREAKER_THRESHOLD, 5);
 let COOLDOWN_MS = parsePositiveInt(process.env.CATALOG_YOLO_BREAKER_COOLDOWN_MS, 1_800_000);
 // Supplementary trip condition (2026-09-06) — an ADDITION alongside
@@ -38,7 +52,11 @@ let consecutiveTransient = 0;
 let openUntil = 0; // epoch ms
 let lastCircuitAlertAt = 0;
 
-function getLimit() { return LIMIT; }
+// `instant` is optional and TEST-ONLY (lets a harness ask "what would the
+// limit be at this specific moment" without waiting for real wall-clock
+// time or mocking Date.now() globally). Every production call site keeps
+// calling getLimit() with zero arguments, unchanged.
+function getLimit(instant) { return effectiveLimit(instant); }
 function occupancyNow() { return occupancy; }
 function consecutiveTransientNow() { return consecutiveTransient; }
 function cooldownMs() { return COOLDOWN_MS; }
@@ -51,14 +69,14 @@ function isOpen() {
 
 function wakeNext() {
   if (!waiters.length) return;
-  if (occupancy >= LIMIT) return;
+  if (occupancy >= effectiveLimit()) return;
   const next = waiters.shift();
   occupancy++;
   next();
 }
 
 async function acquire() {
-  if (occupancy < LIMIT) {
+  if (occupancy < effectiveLimit()) {
     occupancy++;
     return;
   }
@@ -183,7 +201,7 @@ function resetForTest(opts = {}) {
   consecutiveTransient = 0;
   openUntil = 0;
   lastCircuitAlertAt = 0;
-  if (opts.limit != null) LIMIT = Math.max(1, Number(opts.limit) || LIMIT);
+  if (opts.limit != null) LIMIT_OVERRIDE = Math.max(1, Number(opts.limit) || LIMIT_OVERRIDE || 1);
   if (opts.threshold != null) THRESHOLD = Math.max(1, Number(opts.threshold) || THRESHOLD);
   if (opts.cooldownMs != null) COOLDOWN_MS = Math.max(1, Number(opts.cooldownMs) || COOLDOWN_MS);
   if (opts.minRunSample != null) MIN_RUN_SAMPLE = Math.max(1, Number(opts.minRunSample) || MIN_RUN_SAMPLE);
@@ -207,6 +225,11 @@ module.exports = {
     reset: resetForTest,
     get openUntil() { return openUntil; },
     setOpenUntil(ms) { openUntil = ms; },
-    get waiters() { return waiters.length; }
+    get waiters() { return waiters.length; },
+    // Clears the test-only LIMIT pin so getLimit()/acquire() fall back to
+    // yoloConcurrencyWindow's live, time-of-day-dependent resolution —
+    // needed by harnesses that specifically want to exercise the nightly
+    // boost (resetForTest({limit}) would otherwise shadow it forever).
+    clearLimitOverride() { LIMIT_OVERRIDE = null; }
   }
 };
