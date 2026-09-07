@@ -1,40 +1,25 @@
-// Ad regenerate-with-prompt — re-runs the render pipeline for a single
-// existing Ad with an operator-supplied refinement prompt threaded into
-// the relevant LLM(s).
+// ⚠️ THIS FILE DOES NOT RENDER, TITLE, OR SUBMIT TO ANY PROVIDER.
 //
-// Two modes (chosen by routes/ads.js based on ad.kind):
+// regenerateAd() wins an atomic lock, stamps Ad.regenerationRequest, and
+// RETURNS. The billable work (Omni / gpt-image-2 / Remotion / Cloudinary)
+// runs in adgen: regenerateConsumer.js claims the stamp and executes
+// adgen/src/services/adRegenerateService.js (runClaimedRegeneration →
+// runVideoFull / runImage). Do not add a local-execution path here. Do
+// not "fix regenerate rendering / Cloudinary cleanup" in this file —
+// that work lives in adgen.
 //
-//   image (2026-08-02 — Stage 1 catalog pipeline exclusive):
-//     1. Re-run the LIVE static renderer (directImageRenderService /
-//        gpt-image-2/edit) from the Ad's own fields — layoutInput, concept,
-//        media, platformFormat. No aiCanvasArtifactId, no HTML Gen, no
-//        Puppeteer. Exactly ONE billable image submit per invocation.
-//     2. Upload the finished PNG to Cloudinary (overwrite publicId so
-//        Ad.renderUrl stays stable across regens).
-//     3. Stamp renderUrl + imageGeneration + intentResolution.
+// What this file still owns, and must keep:
+//   - HTTP/agent request validation (preflight, parse helpers, daily cap,
+//     derive-only 409, in-flight guard)
+//   - The billed-mode gate (resolveEffectiveRegenMode — always 'full')
+//   - The payload-shape helper (buildRegenerationRequest) that adgen reads
 //
-//   video (always "full" — LIGHT mode was retired with the HTML/Puppeteer
-//   chrome pipeline; brand-script chrome is deterministic and cheap
-//   enough that separating chrome-only from video-only isn't worth the
-//   surface area. Chrome-only tweaks now happen at the template level
-//   via the Brand page video card).
-//     1. Storyboard regenerated with operatorPrompt threaded in.
-//     2. New video via adgen's videoRouter.generateForAd (this file stamps
-//        regenerationRequest and returns; it does not call a local router).
-//     3. Brand-script canvas overlay via brandScriptExecutor.
-//        renderBrandScriptAndSave — resolver picks the right script by
-//        format; no chrome when brand has neither styleScript* nor
-//        styleTheme.
+// Callers: routes/ads.js POST /:id/regenerate, capabilityExecutors
+// ad.regenerate / ad.regenerateWithPrompt. All three 202 then setImmediate
+// regenerateAd — that is a STAMP, not a render.
 //
-// State updates throughout: Ad.regenerationStage tracks progress so the
-// frontend's 5s poll can show stage labels ("Re-rolling video…",
-// "Compositing…"). On completion, regenerating flips false, stage
-// clears, history gets the appended entry.
-//
-// The `mode` param on the API route is now advisory only for video
-// (always full); it's preserved for image ads (always full anyway) and
-// backward-compat with the current frontend UI that may still send
-// mode='light'.
+// `mode` on the API is advisory (always full). Older clients still send
+// 'light'; the 202 reports resolveEffectiveRegenMode, never the request.
 
 const mongoose              = require('mongoose');
 const Ad                    = require('../models/Ad');
@@ -165,7 +150,9 @@ function parseRegenImagePromptField(body = {}) {
   return { ok: true, imagePromptRaw };
 }
 
-// Resolve what runVideoFull will pass into generateForAd / prepareStoryboard.
+// Resolve what adgen's runVideoFull will pass into generateForAd /
+// prepareStoryboard. This helper only shapes the stamped request; it
+// does not call a provider.
 //
 // PASS-THROUGH ONLY — never write these back onto the Ad row. The wizard
 // PERSISTS videoPromptRaw / videoPromptGuidance on mint so a later Generate
@@ -376,7 +363,7 @@ async function preflight(adId, brandId) {
   // ⚠️ MONEY — DERIVE-ONLY ADS MUST NEVER REGENERATE.
   // A derive-only surface (Google PMax 1:1) holds a CROP of its sibling
   // 9:16 master's already-paid plate; it has no generation of its own.
-  // runVideoFull() calls veoService.generateForAd unconditionally, so
+  // adgen's runVideoFull() calls generateForAd unconditionally, so
   // without this gate a Regenerate press bills a brand-new Omni video
   // ($1.20 at the pinned 10s, up to $5.00 if the square routes to the
   // per-second aspect-fallback model) — up to DAILY_CAP presses per ad,
@@ -451,9 +438,10 @@ function resolveEffectiveRegenMode({ requestedMode, kind } = {}) {
   return 'full';
 }
 
-// Entry point. Spawned via setImmediate from the route handler — the
-// route responds 202 with { regenerating: true } and the worker runs
-// in the background. The frontend polls /api/catalog/:id/ads-detail
+// Entry point — A STAMP, NOT A RENDER. Spawned via setImmediate from
+// the route handler: the route 202s { regenerating: true }, this function
+// writes Ad.regenerationRequest, and RETURNS. adgen's regenerate consumer
+// is what actually submits. The frontend polls /api/catalog/:id/ads-detail
 // every 5s watching Ad.regenerating.
 async function regenerateAd({
   ad,

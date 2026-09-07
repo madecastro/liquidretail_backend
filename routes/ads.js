@@ -3249,8 +3249,10 @@ router.post('/:id/override-qc', express.json(), async (req, res) => {
   }
 });
 
-// POST /api/ads/:id/regenerate — re-run the render pipeline for this
-// ad with an operator refinement prompt, OR a verbatim prompt override.
+// POST /api/ads/:id/regenerate — VALIDATE + STAMP, then return 202.
+// This route does not render. regenerateAd() writes Ad.regenerationRequest
+// and returns; adgen/src/services/regenerateConsumer.js claims and executes.
+// Operator refinement prompt, OR a verbatim prompt override.
 // Body: { prompt?, mode?, promptOverride?, videoPromptRaw?,
 //          videoPromptGuidance?, imagePromptRaw? }.
 //   prompt:  a refinement note PREPENDED to the auto-composed prompt
