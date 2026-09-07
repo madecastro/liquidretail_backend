@@ -134,9 +134,162 @@ for (const key of [
     'without a defaults.env row, a fresh Render service with no dashboard override runs with a code-path default and drift is invisible');
 }
 
-if (failures.length) {
-  console.log(`\n${pass} passed, ${failures.length} failed`);
+// ── F: local 'partial'/'failed' chain-outcome alert (added 2026-09-06) ──
+// Distinct from the yolo-circuit-open EARLY RETURN's own
+// alertBrandChainAbort (key yolo:circuit-open:brand:<id>, PR #403/#404,
+// untouched here). This covers the OTHER way runPostSyncChainUnlocked ends
+// unhappy: materialize and/or yolo-detect threw a plain (non-circuit-open)
+// error, resolved locally to status 'partial'/'failed' right before the
+// run.fail(...) call. Behavioral: drives the REAL orchestrator with a
+// stubbed alertService.notifyAsync (module-singleton monkeypatch — same
+// pattern verifyIngestStatusFeed.js uses for OperationRun, since
+// alertService has no other injectable seam).
+(async () => {
+  console.log('\nF. local partial/failed chain-outcome alert');
+
+  const alertsModule = require('../services/alertService');
+  const originalNotifyAsync = alertsModule.notifyAsync;
+  let notifyCalls = [];
+  alertsModule.notifyAsync = (opts) => { notifyCalls.push(opts); };
+
+  const limiter = require('../services/yoloLoadLimiter');
+  const orch = require('../services/catalogPostSyncOrchestrator');
+
+  function resetAll() {
+    limiter.__test.reset({ limit: 6, threshold: 5, cooldownMs: 1_800_000 });
+    orch.__test.resetInFlight();
+    orch.__test.setOverrides({});
+    notifyCalls = [];
+  }
+
+  try {
+    // F1 — materialize throws a plain error (not circuit-open); yolo-detect
+    // succeeds. failures=1 → status='partial'. Must alert with level warn,
+    // the per-brand-per-status key, and phase detail naming materialize.
+    resetAll();
+    orch.__test.setOverrides({
+      findBrand: async () => ({ advertiserId: 'adv-f1' }),
+      startRun: async () => ({
+        tick() {},
+        succeed: async () => {},
+        fail: async () => {},
+        id: 'f1'
+      }),
+      materialize: async () => { throw new Error('cloudinary rate-limit'); },
+      yolo: async () => ({ ok: true }),
+      applyBackoff: async () => ({ failures: 1, delayMs: 1800000 }),
+      backoffAfterSuccess: async () => {},
+      claimChainHeartbeat: async () => true,
+      touchChainHeartbeat: async () => {},
+      clearChainHeartbeat: async () => {}
+    });
+    const f1 = await orch.runPostSyncChain('brand-f1', { trigger: 'sync' });
+    check('F1 chain resolves status=partial (materialize failed, yolo ok)',
+      f1.status === 'partial',
+      `got ${JSON.stringify(f1)}`);
+    check('F1b notifyAsync fired exactly once', notifyCalls.length === 1, `calls=${notifyCalls.length}`);
+    const f1call = notifyCalls[0] || {};
+    check('F1c level=warn', f1call.level === 'warn');
+    check('F1d key is per-brand-per-status (catalog-post-sync:partial:brand-f1)',
+      f1call.key === 'catalog-post-sync:partial:brand-f1', `got ${f1call.key}`);
+    check('F1e fields name the failed phase (materialize)',
+      f1call.fields && /cloudinary rate-limit/.test(f1call.fields.materialize || ''),
+      JSON.stringify(f1call.fields));
+    check('F1f fields name the OK phase too (yolo detect)',
+      f1call.fields && f1call.fields['yolo detect'] === 'ok',
+      JSON.stringify(f1call.fields));
+    check('F1g trigger is carried on the alert', f1call.fields && f1call.fields.trigger === 'sync',
+      JSON.stringify(f1call.fields));
+
+    // F2 — both phases throw → failures=2 → status='failed'. Different
+    // brand AND different status must produce a DIFFERENT dedupe key than
+    // F1's (per-brand-PER-STATUS dedup, not one shared key for everything).
+    resetAll();
+    orch.__test.setOverrides({
+      findBrand: async () => ({ advertiserId: 'adv-f2' }),
+      startRun: async () => ({
+        tick() {},
+        succeed: async () => {},
+        fail: async () => {},
+        id: 'f2'
+      }),
+      materialize: async () => { throw new Error('boom-materialize'); },
+      yolo: async () => { throw new Error('boom-yolo'); },
+      applyBackoff: async () => ({ failures: 1, delayMs: 1800000 }),
+      backoffAfterSuccess: async () => {},
+      claimChainHeartbeat: async () => true,
+      touchChainHeartbeat: async () => {},
+      clearChainHeartbeat: async () => {}
+    });
+    const f2 = await orch.runPostSyncChain('brand-f2', { trigger: 'reconcile' });
+    check('F2 chain resolves status=failed (both phases threw)', f2.status === 'failed', `got ${JSON.stringify(f2)}`);
+    check('F2b key differs from F1 (per-brand-per-status, not one shared key)',
+      notifyCalls.length === 1 && notifyCalls[0].key === 'catalog-post-sync:failed:brand-f2'
+        && notifyCalls[0].key !== f1call.key,
+      `got ${notifyCalls.map((c) => c.key).join(', ')}`);
+
+    // F3 — the ALREADY-SHIPPED yolo-circuit-open path (PR #403/#404) must
+    // be UNCHANGED by this addition: it still uses its own key/level and
+    // does NOT also fire the new catalog-post-sync:<status>:<brand> alert.
+    resetAll();
+    orch.__test.setOverrides({
+      findBrand: async () => ({ advertiserId: 'adv-f3' }),
+      startRun: async () => ({
+        tick() {},
+        succeed: async () => {},
+        fail: async () => {},
+        id: 'f3'
+      }),
+      materialize: async () => {},
+      yolo: async () => ({ ok: false, reason: 'yolo-circuit-open', remaining: 12 }),
+      applyBackoff: async () => ({ failures: 1, delayMs: 1_800_000 }),
+      backoffAfterSuccess: async () => {},
+      claimChainHeartbeat: async () => true,
+      touchChainHeartbeat: async () => {},
+      clearChainHeartbeat: async () => {}
+    });
+    const f3 = await orch.runPostSyncChain('brand-f3');
+    check('F3 yolo-circuit-open path still resolves status=failed/reason=yolo-circuit-open',
+      f3.status === 'failed' && f3.reason === 'yolo-circuit-open', `got ${JSON.stringify(f3)}`);
+    check('F3b exactly ONE alert fires (the pre-existing circuit-open alert), not also the new one',
+      notifyCalls.length === 1 && notifyCalls[0].key === 'yolo:circuit-open:brand:brand-f3',
+      `got ${notifyCalls.map((c) => c.key).join(', ')}`);
+
+    // F4 — a fully-successful chain must NOT alert at all.
+    resetAll();
+    orch.__test.setOverrides({
+      findBrand: async () => ({ advertiserId: 'adv-f4' }),
+      startRun: async () => ({
+        tick() {},
+        succeed: async () => {},
+        fail: async () => {},
+        id: 'f4'
+      }),
+      materialize: async () => {},
+      yolo: async () => ({ ok: true }),
+      applyBackoff: async () => ({ failures: 1, delayMs: 1_800_000 }),
+      backoffAfterSuccess: async () => {},
+      claimChainHeartbeat: async () => true,
+      touchChainHeartbeat: async () => {},
+      clearChainHeartbeat: async () => {}
+    });
+    const f4 = await orch.runPostSyncChain('brand-f4');
+    check('F4 a healthy chain (status=ok) does not alert', f4.status === 'ok' && notifyCalls.length === 0,
+      `status=${f4.status} calls=${notifyCalls.length}`);
+  } finally {
+    alertsModule.notifyAsync = originalNotifyAsync;
+    orch.__test.setOverrides({});
+    orch.__test.resetInFlight();
+  }
+
+  if (failures.length) {
+    console.log(`\n${pass} passed, ${failures.length} failed`);
+    for (const f of failures) console.log(`  - ${f}`);
+    process.exit(1);
+  }
+  console.log(`\n${pass} passed, 0 failed`);
+  process.exit(0);
+})().catch((err) => {
+  console.error('harness crashed:', err);
   process.exit(1);
-}
-console.log(`\n${pass} passed, 0 failed`);
-process.exit(0);
+});

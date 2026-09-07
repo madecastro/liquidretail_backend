@@ -242,6 +242,33 @@ function alertBrandChainAbort({ brandId, remaining, consecutive, backoffMs } = {
   });
 }
 
+// Local (non-circuit-open) chain outcome — materialize and/or yolo-detect
+// threw a plain error, or both completed but at least one failed. Distinct
+// from alertBrandChainAbort above (that one is the yolo-circuit-open EARLY
+// RETURN, already covered by tonight's PR #403/#404). This covers the
+// OTHER way the chain can end unhappy: a generic phase failure (Cloudinary
+// hiccup, materialize throw, a non-transient yolo-detect error the breaker
+// never opens on) that previously left the reconcile tick's own retry as
+// the only signal anyone would ever see. Dedupe key is per-brand PER-STATUS
+// (`catalog-post-sync:${status}:${brandId}`) so a 'partial' and a later
+// 'failed' for the same brand do not fold into one dedupe slot, and two
+// different brands never share one.
+function alertPostSyncOutcome({ brandId, status, phases, trigger } = {}) {
+  alerts.notifyAsync({
+    level: 'warn',
+    title: `Catalog post-sync chain ${status} — brand ${brandId}`,
+    key: `catalog-post-sync:${status}:${brandId}`,
+    fields: {
+      brand: String(brandId || '-'),
+      status,
+      trigger: trigger || '-',
+      materialize: (phases && phases.materialize) || '-',
+      'yolo detect': (phases && phases.yoloDetect) || '-'
+    },
+    detail: `Catalog post-sync chain for brand ${brandId} finished '${status}'. materialize=${(phases && phases.materialize) || '-'} yoloDetect=${(phases && phases.yoloDetect) || '-'}`
+  });
+}
+
 /**
  * Pure sweep predicate. latestRuns is one row per brand (already unique).
  * liveBrandIds / inFlight / backoffUntil skip a brand even if its latest
@@ -392,10 +419,18 @@ async function runPostSyncChainUnlocked(brandId, { trigger = 'sync' } = {}) {
         backoffMs: backoff && backoff.delayMs
       });
       try {
+        // trigger is carried in the terminal meta (not just at startRun)
+        // because progressService's fail()/succeed() REPLACE doc.meta
+        // wholesale rather than merging — ingestStatusFeedService's
+        // reconcile-trigger guard (config/defaults.env's
+        // INGEST_STATUS_SLACK_KINDS comment) reads doc.meta.trigger off
+        // whatever the doc looks like AT FLUSH TIME, which can be after
+        // this terminal write.
         await run.fail(new Error('failed: yolo-circuit-open'), {
           phases,
           status: 'failed',
-          reason: 'yolo-circuit-open'
+          reason: 'yolo-circuit-open',
+          trigger
         });
       } catch (err) {
         console.warn(`${LOG}[brand=${brandId}] OperationRun close failed: ${err.message}`);
@@ -421,12 +456,16 @@ async function runPostSyncChainUnlocked(brandId, { trigger = 'sync' } = {}) {
   const status = failures === 0 ? 'ok' : (failures === 2 ? 'failed' : 'partial');
   try {
     if (status === 'ok') {
-      await run.succeed({ phases });
+      // trigger carried through (see the circuit-open branch's comment
+      // above) so ingestStatusFeedService's reconcile-trigger guard can
+      // still see it after this terminal write.
+      await run.succeed({ phases, trigger });
     } else {
       // Marking as failed with the phase map lets the reconcile tick
       // surface WHICH phase to focus on (or whether both need retry).
       // Not throwing — the fail() call is the persistent signal.
-      await run.fail(new Error(`${status}: ${JSON.stringify(phases)}`), { phases, status });
+      alertPostSyncOutcome({ brandId, status, phases, trigger });
+      await run.fail(new Error(`${status}: ${JSON.stringify(phases)}`), { phases, status, trigger });
     }
   } catch (err) {
     // OperationRun bookkeeping failed — log but don't compound the
