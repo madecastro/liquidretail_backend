@@ -1,0 +1,23 @@
+{
+  "name": "prem-lure-flag-9x16-timeline-anchor",
+  "notes": "Timeline-ref-anchor guidance test (Mark De Castro's hypothesis) applied to Lure Flag Tee. Binds each of the 3 reference photos to a specific time segment instead of letting the model blend all refs freely across 10s. Pelagic Gear 'Lure Flag' tee, white. Production-representative refs (useReframeCache). 9:16, 10s.",
+  "seed": {
+    "productId": "6a982e1dce057530d979e87a",
+    "useReframeCache": true
+  },
+  "aspectRatio": "9:16",
+  "durationSec": 10,
+  "resolution": "720p",
+  "models": ["gemini-omni-1.1-flash"],
+  "variants": [
+    {
+      "id": "timeline-anchor",
+      "guidance": "Timeline (10s):\n- 0.0-3.0s: Anchor to IMAGE 1 (the product-only hero). Camera holds on the product as shown in IMAGE 1. Match its framing, lighting, and every printed mark, wordmark, and label exactly as they appear in IMAGE 1. On-garment text remains spelled as in IMAGE 1 for this entire segment.\n- 3.0-7.0s: Transition to IMAGE 2's staging. Framing matches IMAGE 2. On-garment text remains as spelled in IMAGE 2 — do not re-render or resubstitute letters, wordmarks, or tags. Motion may include a slow push; text region stays stable.\n- 7.0-10.0s: Close-up detail matching IMAGE 3's framing. Text and prints on the product remain as spelled in IMAGE 3 for this segment; do not introduce any letter, digit, or logo not visible in IMAGE 3."
+    }
+  ],
+  "titling": {
+    "enabled": true,
+    "preset": "canonical",
+    "platformFormat": "pmax_video_9_16"
+  }
+}

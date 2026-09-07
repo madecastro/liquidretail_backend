@@ -1,0 +1,27 @@
+{
+  "name": "aquatek-sailfish-16x9-packshot-only",
+  "notes": "Hypothesis: removing the on-figure/lifestyle photo (media index 1) from the reference stack and replacing with a second packshot (media index 5) reduces hallucination/text-corruption. Stack: [0 packshot-hero, 5 packshot-front (new), 2 macro-detail]. Same model + timeline-anchor guidance as aquatek-sailfish-16x9-timeline-anchor. Note: image 5 was not part of the auto-picked ref pair, so it falls back to the standard Cloudinary crop rather than the full DINO-tier resolver; the seed and image 2 still get full resolver treatment via useReframeCache.",
+  "seed": {
+    "productId": "6a9d336008b6f63100dc5870",
+    "useReframeCache": true,
+    "refs": [
+      "https://res.cloudinary.com/reach-social-prod/image/upload/v1788687810/catalog-product/6a982d6bce057530d979e611/product-1788687810510-6696-h2kv0jt1.jpg",
+      "https://res.cloudinary.com/reach-social-prod/image/upload/v1788687807/catalog-product/6a982d6bce057530d979e611/product-1788687807565-6623-oz259jah.jpg"
+    ]
+  },
+  "aspectRatio": "16:9",
+  "durationSec": 10,
+  "resolution": "720p",
+  "models": ["gemini-omni-1.1-flash"],
+  "variants": [
+    {
+      "id": "packshot-only-timeline-anchor",
+      "guidance": "Timeline (10s):\n- 0.0-3.0s: Anchor to IMAGE 1 (the product-only hero). Camera holds on the product as shown in IMAGE 1. Match its framing, lighting, and every printed mark, wordmark, and label exactly as they appear in IMAGE 1. On-garment text remains spelled as in IMAGE 1 for this entire segment.\n- 3.0-7.0s: Transition to IMAGE 2's staging. Framing matches IMAGE 2. On-garment text remains as spelled in IMAGE 2 — do not re-render or resubstitute letters, wordmarks, or tags. Motion may include a slow push; text region stays stable.\n- 7.0-10.0s: Close-up detail matching IMAGE 3's framing. Text and prints on the product remain as spelled in IMAGE 3 for this segment; do not introduce any letter, digit, or logo not visible in IMAGE 3."
+    }
+  ],
+  "titling": {
+    "enabled": true,
+    "preset": "canonical",
+    "platformFormat": "pmax_video_16_9"
+  }
+}

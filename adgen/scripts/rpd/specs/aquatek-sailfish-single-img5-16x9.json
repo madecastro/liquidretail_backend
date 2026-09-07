@@ -1,0 +1,21 @@
+{
+  "name": "aquatek-sailfish-single-img5-16x9",
+  "notes": "Single-image test: image 5 (packshot, front view) only, no refs, no guidance (baseline prompt).",
+  "seed": {
+    "url": "https://res.cloudinary.com/reach-social-prod/image/upload/v1788687810/catalog-product/6a982d6bce057530d979e611/product-1788687810510-6696-h2kv0jt1.jpg",
+    "productTitle": "Aquatek Sailfish Mind"
+  },
+  "aspectRatio": "16:9",
+  "durationSec": 10,
+  "resolution": "720p",
+  "models": ["gemini-omni-1.1-flash"],
+  "variants": [
+    { "id": "single-image-baseline" }
+  ],
+  "titling": {
+    "enabled": true,
+    "preset": "canonical",
+    "platformFormat": "pmax_video_16_9",
+    "brandName": "Pelagic Gear"
+  }
+}
