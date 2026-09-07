@@ -43,6 +43,10 @@ const CampaignRun           = require('../models/CampaignRun');
 const veoService            = require('./videoRouter');
 const brandScriptExecutor   = require('./brandScriptExecutor');
 const { uploadBufferToCloudinary } = require('./cloudinaryService');
+const {
+  snapshotAdCloudinaryState,
+  destroyReplacedAdAssets
+} = require('./adCloudinaryCleanup');
 const directImage           = require('./directImageRenderService');
 // THE shared derive-only gate (money). Imported, never re-implemented —
 // see its doc comment in campaignAdsGenerationService.
@@ -1344,6 +1348,14 @@ async function runClaimedRegeneration(ad, req = {}) {
     return;
   }
 
+  // Snapshot CURRENT Cloudinary URLs before this attempt can replace them.
+  // Cleanup runs in `finally` after success OR failure: if the new render
+  // never stamped, keepPublicIds still holds the old public_ids and nothing
+  // is destroyed. If it did stamp, previous URLs no longer on this ad (and
+  // not on any sibling) are destroyed. Never reached on the early-return
+  // gates above (synced / derive-only / in-flight / receipt).
+  const previousAd = snapshotAdCloudinaryState(ad);
+
   const { startRun, CancelledError } = require('./progressService');
   const brandDoc = ad.brandId
     ? await require('../models/Brand').findById(ad.brandId).select('advertiserId').lean().catch(() => null)
@@ -1547,6 +1559,36 @@ async function runClaimedRegeneration(ad, req = {}) {
     console.error(`❌ regenerate[ad=${adId}]: failed after ${Math.round(durationMs / 1000)}s — ${err.message}`);
     await markComplete(adId, { status: 'failed', durationMs, error: err.message || String(err) });
     await progressRun.fail(err);
+  } finally {
+    // MONEY-CRITICAL Cloudinary hygiene. Runs after cascade so siblings
+    // that adopted the new plate no longer hold the old URL; a sibling
+    // the cascade skipped still holds it and the shared-ref check keeps
+    // the asset. Non-fatal: a cleanup throw must not flip a successful
+    // regenerate into a failure.
+    try {
+      const current = await Ad.findById(adId)
+        .select('renderUrl veoVideoUrl posterUrl cloudinaryPublicId visionQc kind campaignId brandId')
+        .lean();
+      const results = await destroyReplacedAdAssets({
+        previousAd,
+        currentAd: current,
+        Ad,
+        excludeAdId: ad._id,
+        campaignId: ad.campaignId,
+        brandId: ad.brandId
+      });
+      const nDestroyed = (results || []).filter((r) => r.result !== 'skipped' && r.result !== 'error').length;
+      const nShared = (results || []).filter((r) => r.reason === 'still-referenced').length;
+      if (nDestroyed || nShared) {
+        console.log(
+          `🔁 regenerate[ad=${adId}]: cloudinary cleanup destroyed=${nDestroyed} skipped-shared=${nShared}`
+        );
+      }
+    } catch (cleanErr) {
+      console.warn(
+        `🔁 regenerate[ad=${adId}]: cloudinary cleanup failed (non-fatal) — ${cleanErr.message}`
+      );
+    }
   }
 }
 
@@ -2083,33 +2125,57 @@ async function recascadeDerivativeSibling(sibling, masterAd) {
       console.log(`🔁 regenerate-cascade[master=${masterAd._id}]: sibling=${siblingId} claimed/changed by another process — skipped this pass`);
       return;
     }
-    const brand = await loadBrand(siblingId);
-    const adFinal = await Ad.findById(sibling._id).lean();
-    if (brand) {
-      try {
-        // retitleMode:true — original contract (already-shipped sibling,
-        // commonly 'live'). Without it uploadRenderAndStamp would force
-        // status:'draft' and un-publish. This is NOT the reverted
-        // runVideoFull retitleMode expansion: a background cascade must
-        // never flip a sibling's status except through the explicit,
-        // filter-scoped promoteFailedToDraft below. Known residual: a
-        // QC-rejected recascade of a live sibling stays 'live' with the
-        // new composite as renderUrl (preserveAdStatus deletes the
-        // status:'failed' stamp). Same class of bug as a manual retitle
-        // QC fail, accepted here rather than un-publishing the sibling.
-        await brandScriptExecutor.renderBrandScriptAndSave({ ad: adFinal, brand, retitleMode: true });
-        const settledSibling = await Ad.findById(sibling._id).select('status visionQc').lean();
-        const qcJustFailed = !!brandScriptExecutor.buildVideoQcFailureFields(settledSibling?.visionQc).status;
-        if (!qcJustFailed) await promoteFailedToDraft(siblingId);
-        console.log(`🔁 regenerate-cascade[master=${masterAd._id}]: sibling=${siblingId} re-composited from the new master plate`);
-      } catch (scriptErr) {
-        // No safe composite this pass (see this function's own header) —
-        // provenance updated above, delivered renderUrl/posterUrl/status
-        // deliberately left untouched.
-        console.warn(`🔁 regenerate-cascade[master=${masterAd._id} sibling=${siblingId}]: brand-script failed (non-fatal, renderUrl left untouched) — ${scriptErr.message}`);
+    try {
+      const brand = await loadBrand(siblingId);
+      const adFinal = await Ad.findById(sibling._id).lean();
+      if (brand) {
+        try {
+          // retitleMode:true — original contract (already-shipped sibling,
+          // commonly 'live'). Without it uploadRenderAndStamp would force
+          // status:'draft' and un-publish. This is NOT the reverted
+          // runVideoFull retitleMode expansion: a background cascade must
+          // never flip a sibling's status except through the explicit,
+          // filter-scoped promoteFailedToDraft below. Known residual: a
+          // QC-rejected recascade of a live sibling stays 'live' with the
+          // new composite as renderUrl (preserveAdStatus deletes the
+          // status:'failed' stamp). Same class of bug as a manual retitle
+          // QC fail, accepted here rather than un-publishing the sibling.
+          await brandScriptExecutor.renderBrandScriptAndSave({ ad: adFinal, brand, retitleMode: true });
+          const settledSibling = await Ad.findById(sibling._id).select('status visionQc').lean();
+          const qcJustFailed = !!brandScriptExecutor.buildVideoQcFailureFields(settledSibling?.visionQc).status;
+          if (!qcJustFailed) await promoteFailedToDraft(siblingId);
+          console.log(`🔁 regenerate-cascade[master=${masterAd._id}]: sibling=${siblingId} re-composited from the new master plate`);
+        } catch (scriptErr) {
+          // No safe composite this pass (see this function's own header) —
+          // provenance updated above, delivered renderUrl/posterUrl/status
+          // deliberately left untouched.
+          console.warn(`🔁 regenerate-cascade[master=${masterAd._id} sibling=${siblingId}]: brand-script failed (non-fatal, renderUrl left untouched) — ${scriptErr.message}`);
+        }
+      } else {
+        console.log(`🔁 regenerate-cascade[master=${masterAd._id}]: sibling=${siblingId} has no brand/chrome configured — provenance updated, renderUrl left untouched`);
       }
-    } else {
-      console.log(`🔁 regenerate-cascade[master=${masterAd._id}]: sibling=${siblingId} has no brand/chrome configured — provenance updated, renderUrl left untouched`);
+    } finally {
+      // Sibling's old titled renderUrl is now unreferenced if chrome
+      // succeeded; old veoVideoUrl (previous master plate) is unreferenced
+      // if no other sibling still holds it. keepPublicIds from the current
+      // sibling doc protects anything this row still plays (chrome-failed
+      // titled URL, new master plate). Non-fatal.
+      try {
+        const current = await Ad.findById(sibling._id).lean();
+        await destroyReplacedAdAssets({
+          previousAd: sibling,
+          currentAd: current,
+          Ad,
+          excludeAdId: sibling._id,
+          campaignId: sibling.campaignId,
+          brandId: sibling.brandId
+        });
+      } catch (cleanErr) {
+        console.warn(
+          `🔁 regenerate-cascade[master=${masterAd._id} sibling=${siblingId}]: ` +
+          `cloudinary cleanup failed (non-fatal) — ${cleanErr.message}`
+        );
+      }
     }
   } catch (err) {
     console.warn(`🔁 regenerate-cascade[master=${masterAd._id}]: sibling=${siblingId} failed (non-fatal, master regenerate unaffected) — ${err.message}`);

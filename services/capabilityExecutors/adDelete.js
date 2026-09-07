@@ -14,7 +14,10 @@
 const mongoose = require('mongoose');
 const Ad = require('../../models/Ad');
 const Brand = require('../../models/Brand');
-const { deleteFromCloudinary } = require('../cloudinaryService');
+const {
+  destroyUnsharedAdAssets,
+  summarizeCloudinaryCleanup
+} = require('../adCloudinaryCleanup');
 
 async function run({ req, args }) {
   if (!req?.advertiserId) {
@@ -27,7 +30,7 @@ async function run({ req, args }) {
   }
 
   const ad = await Ad.findById(rawAdId)
-    .select('_id brandId renderUrl metaSyncStatus template aspectRatio').lean();
+    .select('_id brandId campaignId renderUrl veoVideoUrl visionQc cloudinaryPublicId kind metaSyncStatus template aspectRatio').lean();
   if (!ad) return { ok: false, error: `ad ${rawAdId} not found` };
   const brand = await Brand.findOne({ _id: ad.brandId, advertiserId: req.advertiserId })
     .select('_id name').lean();
@@ -40,16 +43,24 @@ async function run({ req, args }) {
   const deleted = await Ad.findOneAndDelete({ _id: ad._id, brandId: ad.brandId }).lean();
   if (!deleted) return { ok: false, error: `ad ${rawAdId} not found (concurrent delete?)` };
 
+  // MONEY-CRITICAL: same generic shared-URL check as DELETE /api/ads/:id.
+  // The HTTP route and this executor must not drift — a capability
+  // delete that skipped the shared-plate check would destroy a paid
+  // master still referenced by a surviving sibling.
   let cloudinary = null;
-  if (ad.renderUrl) {
-    try {
-      cloudinary = await deleteFromCloudinary(ad.renderUrl);
-    } catch (err) {
-      // Cloudinary errors are warnings — the Ad doc is gone, and an
-      // orphaned Cloudinary asset is easier to clean up later than an
-      // orphaned Ad doc pointing at a dead URL.
-      cloudinary = { ok: false, error: err?.message || 'cloudinary destroy failed' };
-    }
+  try {
+    const results = await destroyUnsharedAdAssets(deleted, {
+      Ad,
+      excludeAdId: deleted._id,
+      campaignId: deleted.campaignId,
+      brandId: deleted.brandId
+    });
+    cloudinary = summarizeCloudinaryCleanup(results);
+  } catch (err) {
+    // Cloudinary errors are warnings — the Ad doc is gone, and an
+    // orphaned Cloudinary asset is easier to clean up later than an
+    // orphaned Ad doc pointing at a dead URL.
+    cloudinary = { ok: false, error: err?.message || 'cloudinary destroy failed' };
   }
 
   return {

@@ -141,6 +141,7 @@ const RUN   = path.join(ROOT, 'src', 'models', 'CampaignRun.js');
 const VEO   = path.join(ROOT, 'src', 'services', 'videoRouter.js');
 const BSE   = path.join(ROOT, 'src', 'services', 'brandScriptExecutor.js');
 const CLOUD = path.join(ROOT, 'src', 'services', 'cloudinaryService.js');
+const CLEAN = path.join(ROOT, 'src', 'services', 'adCloudinaryCleanup.js');
 const DI    = path.join(ROOT, 'src', 'services', 'directImageRenderService.js');
 const SUS   = path.join(ROOT, 'src', 'services', 'seededUniverseService.js');
 const UGC   = path.join(ROOT, 'src', 'services', 'ugcVideoPipeline.js');
@@ -284,6 +285,10 @@ function install() {
     }
   });
   stub(CLOUD, { uploadBufferToCloudinary: async () => ({}) });
+  stub(CLEAN, {
+    snapshotAdCloudinaryState: (ad) => ad,
+    destroyReplacedAdAssets: async () => []
+  });
   stub(DI, {});
   stub(SUS, { isUgcFirstSeedingEnabled: () => false });
   stub(UGC, { preparePassthroughMaster: async () => ({ passthrough: false, reason: 'stub' }) });

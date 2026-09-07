@@ -75,11 +75,6 @@ const CampaignRun  = require('../models/CampaignRun');
 const {
   expandWizardJob,
   selectAdsForRun,
-  // Google PMax derive-only constants (Phase A). Shared with expansion so
-  // the mint marker and the render gate cannot drift.
-  PMAX_VIDEO_DERIVE_ONLY,
-  PMAX_VIDEO_DERIVE_SOURCE,
-  DERIVE_FROM_MASTER_FIELD,
   // THE shared derive-only gate (money) — one definition, imported by both
   // this render loop and services/adRegenerateService. Do not re-implement.
   resolveDeriveFromMaster,
@@ -102,7 +97,10 @@ const {
 const { buildGridPreviewVideoUrl } = require('../services/videoPreviewUrl');
 const { buildGridPreviewImageUrl } = require('../services/imagePreviewUrl');
 const { loadCategoryChainForProduct } = require('../services/categoryChainService');
-const { deleteFromCloudinary } = require('../services/cloudinaryService');
+const {
+  destroyUnsharedAdAssets,
+  summarizeCloudinaryCleanup
+} = require('../services/adCloudinaryCleanup');
 const { buildVideoCompositeUrl } = require('../services/videoCompositeService');
 const { buildPreviewHtmlForAd }  = require('../services/adPreviewPageService');
 const registry = require('../services/templateRegistry');
@@ -3635,58 +3633,30 @@ router.delete('/:id', async (req, res) => {
     }
     const ad = await Ad.findOneAndDelete({ _id: req.params.id, brandId }).lean();
     if (!ad) return res.status(404).json({ error: 'ad not found' });
+    // MONEY-CRITICAL: destroy renderUrl, veoVideoUrl, visionQc attempt
+    // URLs, and a posterUrl that is NOT a transform of this ad's own
+    // video. Skip any exact URL still held as renderUrl/veoVideoUrl on
+    // another Ad (generic shared-plate check — Meta, PMax, mixed, future
+    // platforms). Lookup failure keeps the asset.
     let cloudinary = null;
-    if (ad.renderUrl) {
-      // ⚠️ A derive-only ad (Google PMax 1:1) does NOT own its asset. Until
-      // its own titled video is uploaded, its renderUrl IS the sibling 9:16
-      // master's plate URL — destroying it here would delete the video the
-      // master paid for and break that ad too. Only destroy the asset once
-      // this ad has its own upload (its renderUrl no longer points at the
-      // inherited plate). `veoModel` is stamped `derive-from:<fmt>` at mint
-      // and is the durable marker; renderUrl === veoVideoUrl means the
-      // inherited plate is still what is on the row.
-      const isDerived = typeof ad.veoModel === 'string'
-        && ad.veoModel.startsWith('derive-from:');
-      const stillInheritedPlate = isDerived && ad.renderUrl === ad.veoVideoUrl;
-
-      // …and the SAME relationship has to be honoured from the OTHER side.
-      // The check above only asks "is the ad being deleted the child?". A
-      // MASTER never carries the `derive-from:` marker, so deleting the
-      // master fell straight through and destroyed the very asset its
-      // derive-only sibling is still pointing at — the plate the master was
-      // paid for, and the sibling's only source. That sibling cannot heal
-      // itself either: regenerate is refused for derive-only ads by design.
-      // Reachable whenever the 1:1 is mid-titling, or is parked in a
-      // titling-failed state (that branch never rewrites renderUrl, so it
-      // holds the inherited URL indefinitely).
-      let masterOfLiveDerive = false;
-      if (!stillInheritedPlate && ad.platformFormat === PMAX_VIDEO_DERIVE_SOURCE) {
-        try {
-          const dependent = await Ad.findOne({
-            _id:            { $ne: ad._id },
-            brandId,
-            campaignId:     ad.campaignId,
-            productId:      ad.productId,
-            platformFormat: PMAX_VIDEO_DERIVE_ONLY,
-            // Still on the inherited plate: its renderUrl is this master's asset.
-            renderUrl:      ad.renderUrl
-          }).select('_id').lean();
-          masterOfLiveDerive = !!dependent;
-        } catch (err) {
-          // Cannot prove the asset is unused → keep it. An orphaned Cloudinary
-          // file is cheap; destroying a paid plate another ad depends on is not.
-          console.warn(`   ⚠️  ads DELETE: dependent-derive lookup failed (${err.message}) — keeping asset`);
-          masterOfLiveDerive = true;
+    try {
+      const results = await destroyUnsharedAdAssets(ad, {
+        Ad,
+        excludeAdId: ad._id,
+        campaignId: ad.campaignId,
+        brandId
+      });
+      cloudinary = summarizeCloudinaryCleanup(results);
+      for (const r of results) {
+        if (r.reason === 'still-referenced') {
+          console.log(`   · ads DELETE: kept shared Cloudinary url on ad=${ad._id} — ${r.url}`);
         }
       }
-
-      if (stillInheritedPlate) {
-        cloudinary = { skipped: 'derive-only ad shares its master\'s plate — asset kept' };
-      } else if (masterOfLiveDerive) {
-        cloudinary = { skipped: 'a derive-only sibling still points at this plate — asset kept' };
-      } else {
-        cloudinary = await deleteFromCloudinary(ad.renderUrl);
-      }
+    } catch (err) {
+      // Mongo delete already committed. Orphaned Cloudinary is cheaper than
+      // rolling back; surface the failure as a warning on the response.
+      console.warn(`   ⚠️  ads DELETE: cloudinary cleanup failed (${err.message})`);
+      cloudinary = { error: err.message };
     }
     res.json({ ok: true, id: String(ad._id), cloudinary });
   } catch (err) {

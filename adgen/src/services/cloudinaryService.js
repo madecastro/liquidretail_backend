@@ -137,6 +137,21 @@ async function deleteFromCloudinary(url) {
   }
 }
 
+// Sibling of deleteFromCloudinary when the caller already holds a
+// public_id (Ad.cloudinaryPublicId) and the URL failed to parse.
+// Same never-throw contract.
+async function deletePublicIdFromCloudinary(publicId, { resourceType = 'image' } = {}) {
+  if (!publicId || typeof publicId !== 'string') {
+    return { result: 'skipped', reason: 'no public_id' };
+  }
+  try {
+    const out = await cloudinary.uploader.destroy(publicId, { resource_type: resourceType, invalidate: true });
+    return { ...out, publicId, resourceType };
+  } catch (err) {
+    return { result: 'error', error: err.message, publicId, resourceType };
+  }
+}
+
 // Bulk delete with a small concurrency limiter. Cloudinary's free
 // tier rate-limits at 500 ops/hr; keep concurrency modest so cascade
 // deletes for big brands don't trip it. Override via CLOUDINARY_DELETE_CONCURRENCY.
@@ -158,6 +173,7 @@ module.exports = {
   uploadFileToCloudinary,
   uploadUrlToCloudinary,
   deleteFromCloudinary,
+  deletePublicIdFromCloudinary,
   deleteManyFromCloudinary,
   publicIdFromUrl
 };
