@@ -619,6 +619,71 @@ async function main() {
     restoreFetch();
   });
 
+  // ── J. catalog-post-sync reconcile-trigger guard (added 2026-09-06,
+  // alongside widening INGEST_STATUS_SLACK_KINDS to include catalog-post-
+  // sync). catalogPostSyncOrchestrator.js's 30-min reconcile sweep retries
+  // a still-failing brand with NO backoff on a generic (non yolo-circuit-
+  // open) failure, and EVERY retry mints a brand-new OperationRun — this
+  // module keys one Slack message per OperationRun _id, so an unguarded
+  // whitelist entry would post a fresh message every ~30 minutes for a
+  // stuck brand. Only sync/manual-triggered catalog-post-sync runs (real
+  // syncs, naturally rate-limited) are projected; reconcile-triggered ones
+  // are silently skipped here (they still page via alertService's own
+  // dedup'd catalog-post-sync:<status>:<brandId> alert — see
+  // catalogPostSyncOrchestrator.js's alertPostSyncOutcome). ──
+  console.log('\nJ. catalog-post-sync: reconcile-triggered runs are NOT projected to Slack; sync-triggered ones are');
+  const CFG_WITH_POST_SYNC = { ...CFG, INGEST_STATUS_SLACK_KINDS: 'demo-sync,catalog-sync,social-ingest,enrichment,catalog-post-sync' };
+  await withEnv(CFG_WITH_POST_SYNC, async () => {
+    opRunStore.reset();
+    feed._resetState();
+    feed._setDeps({ OperationRun: opRunStore, Brand: makeBrandStub(new Map()) });
+    installFetch(async (url) => {
+      if (String(url).includes('chat.postMessage')) return jsonRes(200, { ok: true, ts: '444.ddd', channel: 'C_INGEST_VERIFY' });
+      return jsonRes(200, { ok: true });
+    });
+
+    // A reconcile-triggered run: touch()-tracked (kind is watched) but
+    // flushOne must skip it before any Slack call. trigger is repeated in
+    // the fail() meta (not just startRun's) because progressService's
+    // fail()/succeed() REPLACE doc.meta wholesale rather than merging —
+    // matches the real catalogPostSyncOrchestrator.js call shape exactly
+    // (see its run.fail(...) calls, all of which now carry trigger too).
+    const reconcileRun = await progressService.startRun({
+      kind: 'catalog-post-sync', advertiserId: 'adv_1', brandId: 'brand_stuck_j',
+      meta: { trigger: 'reconcile' }, label: 'Catalog materialize + YOLO detect'
+    });
+    await reconcileRun.fail(new Error('partial: {}'), { phases: {}, status: 'partial', trigger: 'reconcile' });
+    await feed._flushOnce();
+    checkTrue('J1 reconcile-triggered catalog-post-sync run: ZERO Slack calls', fetchCalls.length === 0);
+    check('J1b the run is dropped from tracking (not left to retry forever)', feed._trackedCount(), 0);
+
+    // A sync-triggered run for a DIFFERENT brand: must post normally.
+    const syncRun = await progressService.startRun({
+      kind: 'catalog-post-sync', advertiserId: 'adv_1', brandId: 'brand_ok_j',
+      meta: { trigger: 'sync' }, label: 'Catalog materialize + YOLO detect'
+    });
+    await syncRun.succeed({ phases: { materialize: 'ok', yoloDetect: 'ok' }, trigger: 'sync' });
+    await feed._flushOnce();
+    checkTrue('J2 sync-triggered catalog-post-sync run DOES post to Slack', fetchCalls.length >= 1);
+    const postCalls = fetchCalls.filter((c) => c.url.includes('chat.postMessage'));
+    checkTrue('J2b at least one chat.postMessage fired for the sync-triggered run', postCalls.length >= 1);
+
+    // A manual-triggered run (operator action, not the automatic sweep):
+    // treated the same as sync — only 'reconcile' is excluded.
+    fetchCalls.length = 0;
+    feed._resetState();
+    opRunStore.reset();
+    const manualRun = await progressService.startRun({
+      kind: 'catalog-post-sync', advertiserId: 'adv_1', brandId: 'brand_manual_j',
+      meta: { trigger: 'manual' }, label: 'Catalog materialize + YOLO detect'
+    });
+    await manualRun.succeed({ phases: { materialize: 'ok', yoloDetect: 'ok' }, trigger: 'manual' });
+    await feed._flushOnce();
+    checkTrue('J3 manual-triggered catalog-post-sync run DOES post to Slack (only reconcile is excluded)', fetchCalls.length >= 1);
+
+    restoreFetch();
+  });
+
   // ── I. structural wiring ───────────────────────────────────────────────
   console.log('\nI. structural wiring (progressService hooks, kind gating, method resolver)');
   {
@@ -644,8 +709,24 @@ async function main() {
     checkTrue('I13 syncBrandApify actually calls the shared resolver (no re-inlined ternary)',
       /const method = resolveCatalogMethod\(cfg\);/.test(apifySrc));
 
-    checkTrue('I14 config/defaults.env documents the new knobs, channel left blank',
-      /SLACK_INGEST_STATUS_CHANNEL=\s*$/m.test(src('config/defaults.env')));
+    // I14 — CORRECTED 2026-09-06: the feed was deliberately inert (channel
+    // left blank) until this date; it is now flipped ON, reusing
+    // SLACK_ALERT_CHANNEL_STATUS's #rs-status channel id. A future revert
+    // of the flip-on decision should update this assertion, not just the
+    // env file.
+    const envSrc = src('config/defaults.env');
+    checkTrue('I14 config/defaults.env sets SLACK_INGEST_STATUS_CHANNEL (feature flipped on 2026-09-06)',
+      /^SLACK_INGEST_STATUS_CHANNEL=C0BMMD5AN84\s*$/m.test(envSrc));
+    checkTrue('I14b reuses the SAME channel id as SLACK_ALERT_CHANNEL_STATUS (the reviewed default choice)',
+      /^SLACK_ALERT_CHANNEL_STATUS=C0BMMD5AN84\s*$/m.test(envSrc));
+    checkTrue('I15 INGEST_STATUS_SLACK_KINDS widened to include catalog-post-sync',
+      /^INGEST_STATUS_SLACK_KINDS=demo-sync,catalog-sync,social-ingest,enrichment,catalog-post-sync\s*$/m.test(envSrc));
+    checkTrue('I16 yolo-detect is deliberately NOT in the whitelist (same reconcile-retry exposure, no cheap trigger guard available)',
+      !/^INGEST_STATUS_SLACK_KINDS=.*yolo-detect/m.test(envSrc));
+    checkTrue('I17 materialize is deliberately NOT in the whitelist (fires on every chain invocation, gap or no gap — worse than catalog-post-sync)',
+      !/^INGEST_STATUS_SLACK_KINDS=.*[,=]materialize/m.test(envSrc));
+    checkTrue('I18 the reconcile-trigger guard exists and is scoped to catalog-post-sync only',
+      /doc\.kind === 'catalog-post-sync' && doc\.meta && doc\.meta\.trigger === 'reconcile'/.test(feedSrc));
   }
 
   // ── restore ────────────────────────────────────────────────────────────

@@ -360,6 +360,7 @@ mongoose.connect(process.env.MONGODB_URI, {
           if (!stale.length) return;
           console.log(`🎯 yolo backfill: draining ${stale.length} stale catalog Media`);
           let ok = 0, failed = 0, skipped = 0;
+          let lastError = null;
           for (const media of stale) {
             if (yoloLoadLimiter.isOpen()) break;
             await yoloLoadLimiter.acquire();
@@ -371,6 +372,7 @@ mongoose.connect(process.env.MONGODB_URI, {
             } catch (err) {
               failed++;
               const kind = err.yoloKind || classifyYoloError(err);
+              lastError = { kind, message: err.message };
               yoloLoadLimiter.recordOutcome({
                 transient: yoloLoadLimiter.isTransientForBreaker(kind),
                 remaining: stale.length - ok - failed - skipped
@@ -381,6 +383,12 @@ mongoose.connect(process.env.MONGODB_URI, {
             }
           }
           console.log(`🎯 yolo backfill done — ok=${ok} skipped=${skipped} failed=${failed}`);
+          // Zero-success-batch alert — fires on the SECOND consecutive
+          // all-fail batch (~30min of continuous zero-success at the
+          // default 15m interval), not the first, to avoid paging on a
+          // single transient blip. See services/yoloBackfillAlerter.js.
+          const yoloBackfillAlerter = require('./services/yoloBackfillAlerter');
+          yoloBackfillAlerter.recordBatchOutcome({ ok, failed, batchSize: stale.length, lastError });
         } catch (err) {
           console.warn(`⚠️  yolo backfill tick failed: ${err.message}`);
         }

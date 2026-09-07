@@ -485,6 +485,23 @@ async function flushOne(rid, st) {
     return;
   }
 
+  // catalog-post-sync is retried by worker.js's 30-min reconcile sweep
+  // with NO backoff on a generic (non yolo-circuit-open) failure — see
+  // catalogPostSyncOrchestrator.js's filterSweepCandidates/applyBackoff.
+  // Every such retry mints a BRAND NEW OperationRun (progressService.
+  // startRun inside runPostSyncChainUnlocked), and this module keys one
+  // Slack message per OperationRun _id (never chat.update-ing a prior
+  // brand's message) — so an unguarded reconcile-triggered run would post
+  // a fresh Slack message roughly every 30 minutes for as long as one
+  // brand stays stuck, with no dedup. Sync/manual-triggered runs are
+  // naturally rate-limited by how often a real catalog sync or operator
+  // action happens, so only those are projected here. See
+  // config/defaults.env's INGEST_STATUS_SLACK_KINDS comment.
+  if (doc.kind === 'catalog-post-sync' && doc.meta && doc.meta.trigger === 'reconcile') {
+    tracked.delete(rid);
+    return;
+  }
+
   if (doc.brandId && !st.brandTried) {
     await enrichBrand(st, doc.brandId);
   }

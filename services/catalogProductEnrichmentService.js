@@ -102,10 +102,18 @@ function needsEnrichment(row) {
 
 // Reviews (+ optionally full details) for a single product. Errors are
 // caught + logged so one bad product doesn't poison the whole queue.
+//
+// Returns { enriched: boolean } — did this product actually GAIN review/
+// detail signal this pass, as opposed to merely being iterated over. This
+// is distinct from "did not throw": every branch below already swallows
+// its own errors, so a product with e.g. a fully-down review-scrape source
+// completes "successfully" with zero real signal. runEnrichment aggregates
+// this to decide succeed() vs fail() (see the zero-enrichment gap fix).
 async function enrichOne(product, { includeDetails = false } = {}) {
   const id    = String(product._id);
   const label = `"${product.title || '(untitled)'}"`;
   const t0    = Date.now();
+  let enriched = false;
 
   // FIRST-PARTY REVIEWS FIRST. The merchant's own product page carries the
   // reviews their review app publishes as rich snippets — free, verbatim,
@@ -119,6 +127,7 @@ async function enrichOne(product, { includeDetails = false } = {}) {
       const res = await reviewsEngine.captureForProduct(product);
       scraped = res.captured;
       if (res.captured) {
+        enriched = true;
         const pr = res.productReviews;
         console.log(
           `   ✓ enrich-reviews ${label}: on-page ${pr.quotes.length} quote(s) · ` +
@@ -134,14 +143,19 @@ async function enrichOne(product, { includeDetails = false } = {}) {
   try {
     // Web-wide review sentiment (Gemini) — only when the product page had
     // nothing structured. Cached/sibling data returns synchronously; a
-    // genuine miss kicks off a background fetch.
+    // genuine miss kicks off a background fetch (fire-and-forget — its
+    // return is null even when the background lookup later succeeds, so
+    // it can only ever mark THIS pass enriched on a cache/sibling hit,
+    // never on a still-pending background fetch — that is deliberate:
+    // this pass's own accomplishment is what run.succeed/fail is about).
     if (!scraped) {
-      await maybeFetchProductReviewsCached({
+      const webWide = await maybeFetchProductReviewsCached({
         catalogProductId: id,
         productName:      product.title || null,
         brandName:        product.brand || null,
         productUrl:       product.productUrl || null
       });
+      if (webWide) enriched = true;
     }
   } catch (err) {
     console.warn(`   ⚠️  enrich-reviews ${label}: ${err.message}`);
@@ -157,7 +171,7 @@ async function enrichOne(product, { includeDetails = false } = {}) {
       // (models/CatalogProduct.js) — previously not passed, so this path's
       // product_review_summary CostLog rows carried brandId:null despite the
       // brand being right there on the document being enriched.
-      await productDetailsService.fetchProductDetails(
+      const details = await productDetailsService.fetchProductDetails(
         {
           productName: product.title,
           brand:       product.brand || null,
@@ -166,6 +180,7 @@ async function enrichOne(product, { includeDetails = false } = {}) {
         id,
         product.brandId || null
       );
+      if (details) enriched = true;
     } catch (err) {
       console.warn(`   ⚠️  enrich-details ${label}: ${err.message}`);
     }
@@ -173,6 +188,7 @@ async function enrichOne(product, { includeDetails = false } = {}) {
 
   const ms = Date.now() - t0;
   console.log(`   ✓ enriched ${label} in ${ms}ms`);
+  return { enriched };
 }
 
 // Concurrency-capped queue — N workers pull from the same product list.
@@ -180,11 +196,20 @@ async function enrichOne(product, { includeDetails = false } = {}) {
 // opts.onDone(n, total) is awaited after each item (progress ticks +
 //   cooperative-cancel checkpoint live here).
 // opts.isCancelled() → truthy stops launching new work (in-flight items
-//   still finish). Returns { processed, cancelled }.
+//   still finish). Returns { processed, enrichedCount, cancelled }.
+//
+// processed counts items ITERATED (matches every existing caller's
+// progress-tick math); enrichedCount counts items that actually GAINED
+// signal (enrichOne's own { enriched } result) — the two diverge exactly
+// when a product completes without error but produces nothing, e.g. a
+// review-scrape source returning empty across the board. A crashed
+// enrichOne (the .catch below) counts toward processed but never
+// enrichedCount, which is the conservative/correct call.
 async function processQueue(products, { includeDetails = false, onDone = null, isCancelled = null } = {}) {
   let next = 0;
   let inflight = 0;
   let processed = 0;
+  let enrichedCount = 0;
   let stopped = false;
   await new Promise(resolve => {
     const pump = () => {
@@ -197,6 +222,7 @@ async function processQueue(products, { includeDetails = false, onDone = null, i
         const p = products[next++];
         inflight++;
         enrichOne(p, { includeDetails })
+          .then((result) => { if (result && result.enriched) enrichedCount++; })
           .catch(err => console.warn(`   ⚠️  enrich crash for ${p._id}: ${err.message}`))
           .finally(async () => {
             inflight--;
@@ -209,7 +235,7 @@ async function processQueue(products, { includeDetails = false, onDone = null, i
     };
     pump();
   });
-  return { processed, cancelled: stopped };
+  return { processed, enrichedCount, cancelled: stopped };
 }
 
 // Shared driver for both paths. Loads the brand's non-draft products,
@@ -276,7 +302,7 @@ async function runEnrichment(brandId, { includeDetails, onlyGaps, label }) {
 
   let cancelledByRun = false;
   const noun = includeDetails ? 'enriched' : 'reviews';
-  const { processed, cancelled } = await processQueue(targets, {
+  const { processed, enrichedCount, cancelled } = await processQueue(targets, {
     includeDetails,
     onDone: async (n, total) => {
       run.tick(n, total, `${noun} ${n}/${total}`);
@@ -299,12 +325,32 @@ async function runEnrichment(brandId, { includeDetails, onlyGaps, label }) {
     return { ok: true, cancelled: true, total: rows.length, enriched: processed, reviewScrape, durationMs };
   }
 
-  await run.succeed({ enriched: processed });
+  // Genuine gap, not a hypothetical: this queue attempted real work
+  // (targets.length > 0, guaranteed by the early-return above) and every
+  // single product came back with zero new review/detail signal — e.g. the
+  // review-scrape source is down across the board. Previously this always
+  // called succeed(), so an operator watching the ActivityBar / ingest
+  // Slack feed saw a normal-looking green run with nothing to show for it.
+  // Empty gap-fill (targets.length === 0) is untouched — that stays the
+  // existing no-op/skip path above.
+  if (enrichedCount === 0 && targets.length > 0) {
+    await run.fail(
+      new Error(`enrichment: 0 of ${targets.length} product(s) produced new review/detail signal`),
+      { total: rows.length, targets: targets.length, processed, enriched: enrichedCount }
+    );
+    console.log(
+      `🛒 catalogProductEnrichment[brand=${brandId}]: ${label} FAILED — ` +
+      `zero enrichments across ${targets.length} target(s) in ${Math.round(durationMs / 1000)}s`
+    );
+    return { ok: false, total: rows.length, enriched: 0, skipped: rows.length - targets.length, reviewScrape, durationMs };
+  }
+
+  await run.succeed({ enriched: enrichedCount });
   console.log(
     `🛒 catalogProductEnrichment[brand=${brandId}]: ${label} done — ` +
-    `enriched=${processed} skipped=${rows.length - targets.length} in ${Math.round(durationMs / 1000)}s`
+    `enriched=${enrichedCount}/${processed} skipped=${rows.length - targets.length} in ${Math.round(durationMs / 1000)}s`
   );
-  return { ok: true, total: rows.length, enriched: processed, skipped: rows.length - targets.length, reviewScrape, durationMs };
+  return { ok: true, total: rows.length, enriched: enrichedCount, skipped: rows.length - targets.length, reviewScrape, durationMs };
 }
 
 // AUTO path — called after catalog sync. Reviews-only gap-fill for
