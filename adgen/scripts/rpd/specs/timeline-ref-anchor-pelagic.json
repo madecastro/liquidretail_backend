@@ -1,0 +1,27 @@
+{
+  "name": "timeline-ref-anchor-pelagic",
+  "notes": "Hypothesis: anchoring each ref to a specific time segment (rather than the model composing across all 3 refs holistically for 10s) improves on-product text fidelity. Tests via `guidance` prepend — the CORE prompt is untouched. Seed: Pelagic Stick Figure product (Meta 9:16 masters have been failing text_defects=0-4 on this class of graphic-heavy tees, run cd17b963 and 949fbaed both fully failed on the same product). Two arms: baseline (production prompt as-is), timeline-anchor (production prompt + 3-scene ref-to-time schedule). NON-live cost per arm = $0; live cost per arm = ~$1.00 per master; 2 arms × 2 masters (9:16 and 16:9) × 3 runs each for signal = 12 masters ≈ $12. Kept small deliberately — this is a hypothesis test, not a production A/B.",
+  "seed": {
+    "productId": "6a982dface057530d979e78c",
+    "useReframeCache": true
+  },
+  "aspectRatio": "9:16",
+  "durationSec": 10,
+  "resolution": "1080p",
+  "models": ["gemini-omni-1.1-flash"],
+  "variants": [
+    {
+      "id": "baseline"
+    },
+    {
+      "id": "timeline-anchor",
+      "guidance": "Timeline (10s):\n- 0.0-3.0s: Anchor to IMAGE 1 (the product-only hero). Camera holds on the product as shown in IMAGE 1. Match its framing, lighting, and every printed mark, wordmark, and label exactly as they appear in IMAGE 1. On-garment text remains spelled as in IMAGE 1 for this entire segment.\n- 3.0-7.0s: Transition to IMAGE 2's staging. Wearer, pose, and camera framing match IMAGE 2. On-garment text remains as spelled in IMAGE 2 — do not re-render or resubstitute letters, wordmarks, or tags. Motion may include a slow push or wearer weight-shift; text region stays stable.\n- 7.0-10.0s: Close-up detail matching IMAGE 3's framing and pose. Text and prints on the product remain as spelled in IMAGE 3 for this segment; do not introduce any letter, digit, or logo not visible in IMAGE 3."
+    }
+  ],
+  "titling": {
+    "enabled": true,
+    "preset": "canonical",
+    "platformFormat": "meta_stories_9_16",
+    "brandName": "Pelagic Gear"
+  }
+}

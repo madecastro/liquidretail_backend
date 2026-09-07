@@ -46,6 +46,7 @@ const {
   PRICED_RESOLUTIONS: GEMINI_PRICED_RESOLUTIONS,
   PROVIDER: GEMINI_PROVIDER
 } = require('../../../src/services/geminiVideoService');
+const { resolveVideoReferenceForMedia } = require('../../../src/services/videoReferenceResolver');
 const { fetchImagesAsBase64 } = require('./geminiImages');
 const { buildForCell } = require('./promptVariants');
 const { settleCell, probeUrls } = require('./atlasPoll');
@@ -129,15 +130,50 @@ function shortModel(model) {
   return model.split('/').slice(-2).join('-').replace(/[^a-z0-9-]+/gi, '-');
 }
 
-// Seed prep — the production deterministic path (reframe/outpaint stays OFF
-// here: it is billable and DB-coupled). Cloudinary URLs get the exact
-// c_fill,g_auto crop production uses; anything else passes through unresized
-// (Atlas pulls the original) and is flagged so the operator knows.
+// Seed prep — the production deterministic path.
+//
+// DEFAULT: Cloudinary URLs get the exact c_fill,g_auto crop production's
+// URL-only callers use; anything else passes through unresized (Atlas pulls
+// the original) and is flagged so the operator knows.
+//
+// REFRAME-CACHE MODE (spec.seed.useReframeCache=true): routes every URL
+// through videoReferenceResolver, the same three-tier helper adgen's live
+// direct-Gemini path uses today (reframe-cache → on-demand chooseStrategy
+// → source-native c-fill fallback). Gives the harness production-representative
+// refs — the DINO-cached c_pad / c_crop URLs the real renderer sends, at
+// source-native resolution (e.g. 2000×3556 pad, 1125×2000 yolo-crop for a
+// 2000×2000 source at 9:16). Opt-in because the resolver requires Media docs
+// (attached by dbSeed on productId-seeded specs as a non-enumerable
+// _mediaDocsByUrl Map on spec.seed) — a URL-only spec cannot use this.
+//
+// The resolver is READ-ONLY across all three tiers; it never triggers a
+// billable outpaint. The original file-header concern ("reframe/outpaint stays
+// OFF here: billable and DB-coupled") was about `reframeReferenceForAspect`,
+// which the resolver deliberately does NOT call. Safe to opt into.
 function prepareImageUrls(spec, variant, aspectRatio) {
   const hex = spec.seed.brandHex || null;
   const urls = [spec.seed.url, ...(spec.seed.refs || [])];
   const warnings = [];
+  const useResolver = spec.seed.useReframeCache === true && spec.seed._mediaDocsByUrl;
   const prepared = urls.map((u) => {
+    if (useResolver) {
+      const media = spec.seed._mediaDocsByUrl.get(u);
+      if (media) {
+        const { url, source, method } = resolveVideoReferenceForMedia({
+          media, aspectRatio, brand: hex
+        });
+        if (url) return url;
+        // Resolver returned null (source URL falsy) — extremely unlikely
+        // with a real media doc, but fall through to the c-fill path
+        // rather than dropping the ref silently.
+        warnings.push(`resolver returned null for ${u} (source=${source}/${method || 'none'}) — falling back to c_fill`);
+      } else {
+        // URL not in the docs map. Happens when the operator manually adds
+        // refs to a productId-seeded spec (spec.seed.refs gets extended
+        // beyond what dbSeed populated). Fall back to c_fill for those refs.
+        warnings.push(`no Media doc for ${u} — resolver skipped, using c_fill fallback`);
+      }
+    }
     const cropped = cropImageUrlForAspect(u, aspectRatio, hex);
     if (cropped === u && !/res\.cloudinary\.com/.test(u)) {
       warnings.push(`not a Cloudinary URL — sent to the model UNRESIZED: ${u}`);
@@ -611,9 +647,24 @@ async function runSpec(specPath, { live = false, maxUsd = null, outRoot = 'rpd-r
       at: new Date().toISOString(),
       refCount: resolved.refs.length
     };
+    // Attach the Media docs as a URL→doc map for videoReferenceResolver
+    // (consumed by prepareImageUrls when spec.seed.useReframeCache=true).
+    // Non-enumerable so JSON.stringify (in manifest.js writeManifest) does
+    // not pick it up — Media docs are ~5-10KB each with reframes +
+    // refinedProducts, and the manifest is meant to stay portable.
+    if (Array.isArray(resolved.docs) && resolved.docs.length) {
+      const byUrl = new Map();
+      for (const d of resolved.docs) {
+        if (d && typeof d.fileUrl === 'string') byUrl.set(d.fileUrl.trim(), d);
+      }
+      Object.defineProperty(spec.seed, '_mediaDocsByUrl', {
+        value: byUrl, enumerable: false, writable: true, configurable: true
+      });
+    }
     console.log(
       `📦 DB seed: ${resolved.productTitle || '(untitled)'} — seed + ${resolved.refs.length} ref(s), ` +
-      `brandHex ${resolved.brandHex}`
+      `brandHex ${resolved.brandHex}` +
+      (spec.seed.useReframeCache ? ` — useReframeCache=true, ${resolved.docs?.length || 0} media doc(s) attached` : '')
     );
   }
 

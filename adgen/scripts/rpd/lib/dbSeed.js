@@ -13,7 +13,12 @@ const { sortCatalogMediasForReferenceStack } = require('../../../src/services/at
 const { websiteBackgroundHex } = require('../../../src/utils/websiteBackground');
 
 // Union of the live seed + reference-stack projections.
-const MEDIA_SELECT = '_id fileUrl fileType metadata createdAt source brandId';
+// refinedProducts + width + height are required by videoReferenceResolver's
+// tier-2 (on-demand chooseStrategy) and tier-3 (source-native c-fill dims).
+// metadata already carries `reframes` for the tier-1 cache hit. Dropping any
+// of these silently forces the resolver to fall through to the low-res c-fill
+// default — the exact behaviour the useReframeCache flag exists to fix.
+const MEDIA_SELECT = '_id fileUrl fileType width height refinedProducts metadata createdAt source brandId';
 
 function productOidFrom(productId) {
   try {
@@ -110,6 +115,14 @@ async function resolveSeedFromDb(productId) {
     // reference slot on an image the model already has.
     const seenUrls = new Set([seedUrl]);
     const refs = [];
+    // Media docs in the same order as [seedUrl, ...refs]. Enables
+    // prepareImageUrls to resolve URLs via videoReferenceResolver (cache-first
+    // DINO tier) when seed.useReframeCache is on. Same shape production's
+    // renderer sees. Fully-loaded (MEDIA_SELECT above) so the resolver can
+    // hit tier-1 (cached reframes), tier-2 (on-demand chooseStrategy from
+    // refinedProducts+dims), or tier-3 (source-native c-fill) without a
+    // second DB read.
+    const refDocs = [];
     for (const doc of sortCatalogMediasForReferenceStack(catalogMedias)) {
       if (String(doc._id) === seedId) continue;
       if (!isUsableStill(doc)) continue;
@@ -117,12 +130,17 @@ async function resolveSeedFromDb(productId) {
       if (seenUrls.has(url)) continue;
       seenUrls.add(url);
       refs.push(url);
+      refDocs.push(doc);
       if (refs.length === 2) break;
     }
 
     return {
       url: seedUrl,
       refs,
+      // Media docs in [seed, ...refs] order — same order as [url, ...refs] on
+      // this object. Consumed by runner.js as a non-enumerable Map on
+      // spec.seed so it never lands in manifest.json.
+      docs: [seedDoc, ...refDocs],
       productTitle: product.title || '',
       brandName: (brand && brand.name) || '',
       brandHex: websiteBackgroundHex(brand),
