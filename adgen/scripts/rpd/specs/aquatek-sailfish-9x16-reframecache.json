@@ -1,0 +1,23 @@
+{
+  "name": "aquatek-sailfish-9x16-reframecache",
+  "notes": "Same reproduction test as aquatek-sailfish-9x16, but using seed.productId + useReframeCache:true (new 2026-09-07 harness feature) instead of raw unresized catalog URLs. Sends the exact DINO-cached / source-native reference crops production's direct-Gemini path actually uses today, to test whether production-representative refs (vs raw uncropped stills) change the hallucinated-logo/corrupted-text outcome. Pelagic Gear 'Aquatek Sailfish Mind', Slate. Guidance: cap cuts at 3, forbid added logos/graphics beyond reference photos. 9:16, 10s.",
+  "seed": {
+    "productId": "6a9d336008b6f63100dc5870",
+    "useReframeCache": true
+  },
+  "aspectRatio": "9:16",
+  "durationSec": 10,
+  "resolution": "720p",
+  "models": ["gemini-omni-1.1-flash"],
+  "variants": [
+    {
+      "id": "cuts-capped-reframecache",
+      "guidance": "Structure this commercial with no more than 3 cuts/scenes total. Prefer fewer, longer shots over rapid cutting. Do not add, invent, or introduce any logo, wordmark, badge, or graphic that is not already visible in the supplied reference photos. If a region of the garment is blank or plain in the reference photos, keep it blank and plain in every frame of the video — do not fill it in with a new design."
+    }
+  ],
+  "titling": {
+    "enabled": true,
+    "preset": "canonical",
+    "platformFormat": "pmax_video_9_16"
+  }
+}

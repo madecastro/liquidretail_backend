@@ -1,0 +1,35 @@
+{
+  "name": "prem-lure-flag-9x16-720p",
+  "notes": "Same as prem-lure-flag-9x16 but 720p. Pelagic Gear 'Lure Flag' tee, white. Raw catalog (Shopify CDN) images, native resolution, no crop. 9:16, 10s. Guidance requests exactly 3 scenes, one per supplied photo.",
+  "seed": {
+    "url": "https://cdn.shopify.com/s/files/1/0230/8793/9662/files/1171262001-WHT-2.jpg?v=1784578433",
+    "refs": [
+      "https://cdn.shopify.com/s/files/1/0230/8793/9662/files/LureFlagTeePDP.jpg?v=1784578436",
+      "https://cdn.shopify.com/s/files/1/0230/8793/9662/files/1171262001-WHT-1.jpg?v=1784578436"
+    ],
+    "productTitle": "Lure Flag Tee",
+    "brandHex": "#4d92b6"
+  },
+  "aspectRatio": "9:16",
+  "durationSec": 10,
+  "resolution": "720p",
+  "models": ["gemini-omni-1.1-flash"],
+  "variants": [
+    {
+      "id": "baseline",
+      "guidance": "Structure this commercial as exactly three distinct scenes, one built around each of the three supplied product photos in the order given, connected by the specified crossfade transitions. Do not add additional scenes or camera setups beyond these three."
+    }
+  ],
+  "titling": {
+    "enabled": true,
+    "preset": "canonical",
+    "platformFormat": "pmax_video_9_16",
+    "brandName": "Pelagic Gear",
+    "brand": {
+      "name": "Pelagic Gear",
+      "logoUrl": "https://res.cloudinary.com/reach-social-prod/image/upload/v1788358127/liquidretail/brand_logos/6a982d6bce057530d979e611-website-logo.svg",
+      "primaryColor": "#4d92b6"
+    },
+    "copy": { "headline": "Lure Flag Tee", "ctaText": "Shop Now" }
+  }
+}

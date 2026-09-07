@@ -1,0 +1,31 @@
+{
+  "name": "faroe-petrol-1x1",
+  "notes": "Pelagic Gear 'Faroe Lightweight Flannel', Petrol colorway (https://pelagicgear.com/products/faroe-lightweight-flannel-petrol). Raw catalog (Shopify CDN) images, unresized. 1:1, 10s. Titled with Pelagic Gear's real brand look. NOTE: direct Gemini (production model) may not support 1:1 - check dry run.",
+  "seed": {
+    "url": "https://cdn.shopify.com/s/files/1/0230/8793/9662/files/1017253000-PET-1.jpg?v=1784574933",
+    "refs": [
+      "https://cdn.shopify.com/s/files/1/0230/8793/9662/files/1017253000-PET-04.jpg?v=1784574933",
+      "https://cdn.shopify.com/s/files/1/0230/8793/9662/files/1017253000-PET-3.jpg?v=1784574936"
+    ],
+    "productTitle": "Faroe Lightweight Flannel",
+    "brandHex": "#4d92b6"
+  },
+  "aspectRatio": "1:1",
+  "durationSec": 10,
+  "models": ["gemini-omni-1.1-flash"],
+  "variants": [
+    { "id": "baseline" }
+  ],
+  "titling": {
+    "enabled": true,
+    "preset": "canonical",
+    "platformFormat": "pmax_video_1_1",
+    "brandName": "Pelagic Gear",
+    "brand": {
+      "name": "Pelagic Gear",
+      "logoUrl": "https://res.cloudinary.com/reach-social-prod/image/upload/v1788358127/liquidretail/brand_logos/6a982d6bce057530d979e611-website-logo.svg",
+      "primaryColor": "#4d92b6"
+    },
+    "copy": { "headline": "Faroe Lightweight Flannel", "ctaText": "Shop Now" }
+  }
+}
