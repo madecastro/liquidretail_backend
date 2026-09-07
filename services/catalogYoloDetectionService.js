@@ -107,14 +107,23 @@ async function detectYoloForOne(product) {
     ...(Array.isArray(product.additionalImageMediaIds) ? product.additionalImageMediaIds : []).slice(0, ALT_LIMIT)
   ].filter(Boolean).map(String);
   if (!rawMediaIds.length) {
-    return { productId: id, mediaTotal: 0, detected: 0, skipped: 0, failed: 0, noMedia: true };
+    // noop: true — nothing was even attempted, so this carries ZERO
+    // information about yolo_microservice's health. Must NOT reach
+    // processQueue's recordOutcome({transient:false}) reset branch (see
+    // the noop guard there) — a no-op is not a "positive confirmation of
+    // health" the way a genuine success is.
+    return { productId: id, mediaTotal: 0, detected: 0, skipped: 0, failed: 0, noMedia: true, noop: true };
   }
 
   const mediaDocs = await Media.find({ _id: { $in: rawMediaIds } }).lean();
   const targets = mediaDocs.filter(needsYoloDetection);
 
   if (!targets.length) {
-    return { productId: id, mediaTotal: mediaDocs.length, detected: 0, skipped: mediaDocs.length, failed: 0 };
+    // Same rationale as the noMedia case above: every candidate Media was
+    // already detected (or legit-empty + stamped) — no batch was ever sent
+    // to yolo_microservice, so this outcome must not touch the breaker
+    // counter either way.
+    return { productId: id, mediaTotal: mediaDocs.length, detected: 0, skipped: mediaDocs.length, failed: 0, noop: true };
   }
 
   // Load the CatalogProduct once — the batch helper reuses it for every
@@ -296,7 +305,19 @@ async function processQueue(products, { onDone = null, isCancelled = null, worke
                 stopped = true;
                 abortReason = 'yolo-circuit-open';
               }
-            } else if (result) {
+            } else if (result && !result.noop) {
+              // result.noop (detectYoloForOne's noMedia / all-already-detected
+              // cases) means nothing was ever attempted — it carries ZERO
+              // information about yolo_microservice's health, unlike a
+              // genuine clean success (which DOES positively confirm the
+              // service is reachable and healthy, and must still reset the
+              // counter). Routing a no-op to neither this branch nor the
+              // transient branch above means it touches the breaker counter
+              // NOT AT ALL. Without this guard, a no-op result reset the
+              // shared consecutiveTransient counter exactly like a real
+              // success would, masking real failures interleaved with (or
+              // concurrent with) no-op products — see
+              // scripts/verifyYoloBreakerCounterGaps.js.
               yoloLoadLimiter.recordOutcome({ transient: false });
               // Deliberately NO isOpen() re-check here. A clean success
               // carries zero information suggesting THIS run should abort
@@ -428,9 +449,48 @@ async function runYoloDetectionOnTargets(targets, {
     label
   });
 
+  // Bug 1 supplementary trip (2026-09-06): recordOutcome's THRESHOLD is a
+  // count of CONSECUTIVE transient failures, so a run whose own target
+  // count is already smaller than THRESHOLD can never cross it on its own,
+  // however badly it fails — a brand's gap-fill run of, say, 4 products,
+  // ALL failing transiently, tops out at consecutiveTransient=4 and the
+  // breaker never opens (see yoloLoadLimiter.tripOnFullRunFailure's header).
+  // Only wrap the worker (and pay the extra per-product bookkeeping) when
+  // that structural gap actually applies — a run at or above THRESHOLD is
+  // left completely unwrapped, byte-for-byte on the existing, already
+  // three-rounds-reviewed processQueue path; this never touches
+  // processQueue's or this function's own abortReason/aborted/cancelled
+  // determination logic (below) — it only ever gets there by making
+  // yoloLoadLimiter.isOpen() true earlier, which that existing logic
+  // already reacts to correctly on its own.
+  const baseWorker = worker || _workerOverride || detectYoloForOne;
+  const belowThreshold = targets.length > 0 && targets.length < yoloLoadLimiter.threshold();
+  let runAttempted = 0;
+  let runTransientFailures = 0;
+  const trackedWorker = belowThreshold
+    ? async (p) => {
+        const result = await baseWorker(p);
+        // result.noop (detectYoloForOne's noMedia / all-already-detected
+        // cases) carries zero information about the microservice's health —
+        // must not count as an attempt here either, same as the
+        // recordOutcome no-op guard in processQueue above.
+        if (result && !result.noop) {
+          runAttempted++;
+          if (result.transient) runTransientFailures++;
+          yoloLoadLimiter.tripOnFullRunFailure({
+            attempted: runAttempted,
+            transientFailures: runTransientFailures,
+            brandId,
+            remaining: Math.max(0, targets.length - runAttempted)
+          });
+        }
+        return result;
+      }
+    : baseWorker;
+
   let cancelledByRun = false;
   const { processed, cancelled, aborted } = await processQueue(targets, {
-    worker,
+    worker: trackedWorker,
     brandId,
     onDone: async (n, total) => {
       run.tick(n, total, `detected ${n}/${total}`);
