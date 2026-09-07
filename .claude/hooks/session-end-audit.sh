@@ -34,4 +34,20 @@
 #
 # $CLAUDE_PROJECT_DIR is populated by the harness (same variable
 # session-start.sh already relies on in this directory).
-node "$CLAUDE_PROJECT_DIR/scripts/auditStrandedWork.js" --repo="$CLAUDE_PROJECT_DIR" --hook 2>/dev/null || true
+#
+# MONOREPO (2026-09-06): Claude Code only loads .claude/ at the project
+# root, so this is the only SessionEnd hook that runs. One invocation is
+# enough for the grafted tree: auditStrandedWork.js is git/filesystem-only
+# against --repo, and git worktree/branch enumeration is repo-wide, so
+# adgen/ branches, worktrees, and nested-inside-this-checkout paths are
+# already in the same scan. The two copies of the script (scripts/ and
+# adgen/scripts/) are byte-identical; adgen/ is not its own git repo, and
+# a second run of adgen/scripts/auditStrandedWork.js is not needed.
+# adgen/.claude/ is inert — see the comment in that hook.
+#
+# `|| echo` (not `2>/dev/null || true`): --hook already always-exits-0
+# when node actually runs the script. The fallback is for the miss the
+# graft created — CLAUDE_PROJECT_DIR pointing at a path with no script —
+# so a broken path still prints a systemMessage instead of going silent.
+AUDIT_SCRIPT="$CLAUDE_PROJECT_DIR/scripts/auditStrandedWork.js"
+node "$AUDIT_SCRIPT" --repo="$CLAUDE_PROJECT_DIR" --hook || echo '{"systemMessage":"session-end stranded-work audit failed to run — check .claude/hooks/session-end-audit.sh"}'

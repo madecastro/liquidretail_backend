@@ -1,5 +1,17 @@
 #!/bin/bash
 # ============================================================================
+# INERT IN THE MONOREPO (2026-09-06).
+#
+# Claude Code only loads .claude/ at the project root. This file is the
+# grafted copy of liquidretail_adgen's SessionEnd hook; it is not invoked
+# when the workspace is liquidretail_backend. The live hook is
+# .claude/hooks/session-end-audit.sh at the repo root, which already
+# audits the whole git repo (including adgen/ worktrees/branches) in one
+# run. Kept on disk so a checkout that still opens adgen/ as its own
+# Claude project does not silently lose the wrapper; do not add a second
+# audit invocation here — adgen/ is not a separate git repo.
+#
+# ============================================================================
 # DEVELOPER TOOLING — NOT PART OF THE REACH SOCIAL PRODUCT.
 #
 # This file exists ONLY to warn Claude Code sessions (and any human sitting
@@ -29,8 +41,6 @@
 #     --hook mode for the actual summary logic; this script is deliberately
 #     a thin, auditable wrapper around it, not a reimplementation.
 #
-# $CLAUDE_PROJECT_DIR is populated by the harness (same pattern already used
-# by this repo's own session-start hook, where one exists — see the sibling
-# liquidretail_backend repo's .claude/hooks/session-start.sh for that
-# precedent this file follows).
+# $CLAUDE_PROJECT_DIR is populated by the harness. In the monorepo this
+# nested copy is not loaded; the root hook is the one that runs.
 node "$CLAUDE_PROJECT_DIR/scripts/auditStrandedWork.js" --repo="$CLAUDE_PROJECT_DIR" --hook 2>/dev/null || true
